@@ -38,6 +38,7 @@ from seerdb.common.tns import (
     ScalarOutBind,
     TempLobRef,
     ddl_command_type,
+    decode_dalc,
     decode_ub4,
     encode_batch_errors_status,
     encode_challenge,
@@ -87,8 +88,11 @@ from seerdb.common.tns import (
 )
 from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
+    FIELD_VERSION_23_1,
     TNS_CONNECT,
     TNS_DATA,
+    TNS_FUNC_SESSION_STATE,
+    TNS_FUNC_SET_END_TO_END_ATTR,
     TNS_TYPE_BLOB,
     TNS_TYPE_CLOB,
     TNS_TYPE_LONG,
@@ -480,7 +484,7 @@ def serve_session(
         packet_type, body = received
         if packet_type != TNS_DATA:
             continue
-        body = _skip_piggybacks(body)  # e.g. CLOSE_CURSORS after a drained fetch
+        body = _skip_piggybacks(body, backend)  # CLOSE_CURSORS, tracing, …
         if len(body) < 2 or body[0] != TTI_FUN:
             continue
         if body[1] == TTI_ALL8:
@@ -853,23 +857,78 @@ def _answer_describe_oci(
     stream.write_packet(TNS_DATA, reply)
 
 
-def _skip_piggybacks(body: bytes) -> bytes:
-    # A call can be preceded by piggybacks — most commonly CLOSE_CURSORS, which
-    # a client sends to free the cursors it drained on the previous fetch. The
-    # Mirror keeps no cursor/session state, so it skips them and processes the
-    # trailing function. Only the shapes clients actually send are handled; an
-    # unknown piggyback is left in place (the caller then ignores the message
-    # rather than mis-parsing it).
+def _skip_piggybacks(body: bytes, backend: Backend | None = None) -> bytes:
+    # A call can be preceded by piggybacks — CLOSE_CURSORS (105), which a client
+    # sends to free the cursors it drained on the previous fetch, and, from 12.1
+    # up, the end-to-end tracing attributes (135) and the request-boundary
+    # session state (176). Each is walked by its own layout (a piggyback carries
+    # no length) and the trailing function is served. The Mirror keeps no cursor
+    # or request state, so those two are simply skipped; the tracing attributes
+    # are handed to the backend (its optional set_end_to_end), so a session's
+    # module / action / client identifier reach the database behind the Mirror
+    # the way they would a real server. An unknown piggyback is left in place,
+    # so the caller ignores the message rather than mis-parsing it.
     while len(body) >= 3 and body[0] == TTI_MSG_TYPE_PIGGYBACK:
-        if body[1] != TTI_OCCA:  # CLOSE_CURSORS (105)
-            break
+        func = body[1]
         rest = body[3:]  # skip the piggyback token, function code, sequence
-        rest = rest[1:]  # pointer byte
-        count, rest = decode_ub4(rest)
-        for _ in range(count):
-            _, rest = decode_ub4(rest)  # each closed cursor id (ignored)
+        if _DECODE_FIELD_VERSION.get() > FIELD_VERSION_23_1:
+            _, rest = decode_ub4(rest)  # the fv24 ub8 token
+        if func == TTI_OCCA:  # CLOSE_CURSORS
+            rest = rest[1:]  # pointer byte
+            count, rest = decode_ub4(rest)
+            for _ in range(count):
+                _, rest = decode_ub4(rest)  # each closed cursor id (ignored)
+        elif func == TNS_FUNC_SET_END_TO_END_ATTR:
+            attrs, rest = _parse_end_to_end_piggyback(rest)
+            apply = getattr(backend, 'set_end_to_end', None) if backend else None
+            if apply is not None and attrs:
+                apply(attrs)
+        elif func == TNS_FUNC_SESSION_STATE:
+            _, rest = decode_ub4(rest)  # the requested state (ignored)
+        else:
+            break
         body = rest
     return body
+
+
+def _parse_end_to_end_piggyback(rest: bytes) -> tuple[dict[str, str | None], bytes]:
+    # The SET_END_TO_END_ATTR body (the inverse of the client's
+    # encode_end_to_end_piggyback): two pointer bytes and the flags word, then
+    # one (modified, length) header per attribute — client_identifier, module,
+    # action, client_info, dbop — with the unsupported fixed slots between them,
+    # then a length-prefixed value for every attribute that was set. Returns the
+    # modified attributes (a cleared one — modified flag, no value — as None)
+    # and the bytes after the piggyback.
+    rest = rest[2:]  # cidnam / cidser pointers
+    _, rest = decode_ub4(rest)  # flags
+    attrs: dict[str, str | None] = {}
+    with_value: list[str] = []
+    for slot in (
+        'client_identifier',
+        'module',
+        'action',
+        'cideci',
+        'cidcct',
+        'client_info',
+        'cidkstk',
+        'cidktgt',
+        'dbop',
+    ):
+        modified, rest = rest[0], rest[1:]
+        length, rest = decode_ub4(rest)
+        if modified and slot in _END_TO_END_ATTRS:
+            attrs[slot] = None
+            if length:
+                with_value.append(slot)
+    for slot in with_value:
+        raw, rest = decode_dalc(rest)
+        attrs[slot] = bytes(raw).decode('utf-8')
+    return attrs, rest
+
+
+_END_TO_END_ATTRS = frozenset(
+    {'client_identifier', 'module', 'action', 'client_info', 'dbop'}
+)
 
 
 class _OciSequence:
