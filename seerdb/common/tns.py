@@ -4058,7 +4058,9 @@ def _render_caps(spec: tuple[int, dict]) -> bytes:
     return bytes(caps)
 
 
-def capability_arrays(field_version: int = FIELD_VERSION_11_2) -> tuple[bytes, bytes]:
+def capability_arrays(
+    field_version: int = FIELD_VERSION_11_2, oall8: bool = False
+) -> tuple[bytes, bytes]:
     """Return (compile_caps, runtime_caps) for a target TTC field version.
 
     Two base vectors are modelled: the 11.2 vector for pre-12c field versions
@@ -4077,6 +4079,9 @@ def capability_arrays(field_version: int = FIELD_VERSION_11_2) -> tuple[bytes, b
         # verifier the account lacks and reject the login (ORA-01017); with the
         # minimal caps 9i falls back to the O3LOGON path. CCAP_FIELD_VERSION
         # stays 0 (9i negotiates the field version via TTI_PRO, not the caps).
+        # The OALL8 opt-in advertises the two extra bytes instead (#716).
+        if oall8:
+            return _O3_OALL8_COMPILE_CAPS, _O3_OALL8_RUNTIME_CAPS
         return _O3_COMPILE_CAPS, _O3_RUNTIME_CAPS
     Base = (
         FIELD_VERSION_21_1
@@ -4093,6 +4098,18 @@ def capability_arrays(field_version: int = FIELD_VERSION_11_2) -> tuple[bytes, b
 # (no O5LOGON), runtime caps = a single 0x02 byte.
 _O3_COMPILE_CAPS = bytes(17) + bytes([3]) + bytes(3)
 _O3_RUNTIME_CAPS = bytes([2])
+
+# The 9i OALL8 opt-in (#716, experimental): the same minimal 9i vector but with
+# the field version advertised at CCAP_FIELD_VERSION and a second runtime byte.
+# Together they tell the 9i server the client speaks the native 64-bit OALL8
+# request form (the one sqlplus / thick OCI sends), rather than the compact
+# TTI_ALL7 the default 9i path uses. Verified live: without the runtime byte the
+# server reads the 64-bit fields as 32-bit and raises ORA-03120 on every
+# statement; with both it accepts the 64-bit form.
+_O3_OALL8_COMPILE_CAPS = (
+    bytes(7) + bytes([FIELD_VERSION_9_2]) + bytes(9) + bytes([3]) + bytes(3)
+)
+_O3_OALL8_RUNTIME_CAPS = bytes([2, 1])
 
 
 # 12c+ datatype table. Where the 11g table (built inline in encode_dictionary_dty
@@ -6776,7 +6793,9 @@ def encode_dictionary_dty(Dictionary: dict) -> bytes:
     # Compile-time + runtime capability arrays, each emitted as a length byte
     # followed by the array (write_bytes_with_length in oracledb terms).
     FieldVersion = Dictionary.get('field_version', FIELD_VERSION_11_2)
-    CompileCaps, RuntimeCaps = capability_arrays(FieldVersion)
+    CompileCaps, RuntimeCaps = capability_arrays(
+        FieldVersion, oall8=Dictionary.get('oall8', False)
+    )
     # End-of-response opt-in (#155/#132): when the server advertised EOR support
     # in its accept, set CCAP_TTC4's 0x20 bit so the server delimits every
     # response with the EOR (29) marker — the prerequisite for pipelining. Only
@@ -8077,6 +8096,93 @@ def encode_8i_oall8_fetch(
     Msg[49:53] = Count.to_bytes(4, 'little')  # rows to fetch
     Msg[73] = 0x01
     return bytes(Msg)
+
+
+def _encode_9i_oall8(Seq: int, Sql: bytes, StmtType: int, Binds: list) -> bytes:
+    # The native 9i (9.2) OALL8 (TTI_ALL8, 0x5e) execute — the 64-bit form the
+    # server accepts once the OALL8 opt-in caps are negotiated (#716). It is the
+    # 8i request (`_encode_8i_oall8`) with every pointer / length field widened
+    # from 4 to 8 bytes and a present-pointer indicator (``oci.OCI_INDICATOR``)
+    # where the 8i form writes zeros; the SQL text and bind values are identical.
+    # Reverse-engineered from a live 9.2-client trace and verified byte-for-byte
+    # against it apart from the heap-pointer fields the server ignores. Scope so
+    # far: DML / DDL and transaction control with scalar binds; SELECT, PL/SQL
+    # blocks and RETURNING are separate increments.
+    P = oci.OCI_INDICATOR
+
+    def u8(n: int) -> bytes:
+        return n.to_bytes(8, 'little')
+
+    NumBinds = len(Binds)
+    IsBlock = StmtType in (O8I_STMT_BEGIN, O8I_STMT_DECLARE)
+    Option = (
+        TNS_EXEC_OPTION_PARSE
+        | TNS_EXEC_OPTION_EXECUTE
+        | (TNS_EXEC_OPTION_BIND if NumBinds else 0)
+    )
+    Byte4 = (
+        (0x05 if NumBinds else 0x81) if not IsBlock else (0x05 if NumBinds else 0x00)
+    )
+    Byte5 = 0x04 if (NumBinds and not IsBlock) or IsBlock else 0x00
+    Head = bytes([TTI_FUN, TTI_ALL8, Seq & 0xFF, Option, Byte4, Byte5, 0, 0, 0, 0, 0])
+    Mid = (
+        P
+        + u8(len(Sql))
+        + P
+        + u8(12)
+        + bytes(8)
+        + P
+        + bytes(4)
+        + (1).to_bytes(4, 'little')
+        + u8(0)
+        + (P if NumBinds else bytes(8))
+        + u8(NumBinds)
+        + bytes(8) * 4
+        + P
+        + P
+        + u8(0)
+    )
+    Tail = bytes([1, 0, 0, 0, 1]) + bytes(23) + bytes([StmtType]) + bytes(19)
+    Message = Head + Mid + bytes([len(Sql)]) + Sql + Tail
+    if NumBinds:
+        Token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_9_2)
+        try:
+            Message += b''.join(_encode_9i_bind_oac(V) for V in Binds)
+            Message += bytes([0x07])
+            for Value in Binds:
+                Message += _encode_8i_bind_value(Value)
+        finally:
+            _ENCODE_FIELD_VERSION.reset(Token)
+    return Message
+
+
+def _encode_9i_bind_oac(Value: object) -> bytes:
+    # The 64-bit OALL8 bind descriptor: ``01 <TNS type> <flag> 00 00``, an 8-byte
+    # little-endian max size, then 28 reserved bytes (41 bytes). The type and
+    # size mirror the 8i 32-bit descriptor (:func:`_encode_8i_bind_oac`); the
+    # flag is 0x05 for an OUT-capable Var, 0x01 otherwise.
+    from seerdb.common.datatypes import Var
+
+    if isinstance(Value, Var):
+        DType, Size, Flag = Value.dbtype.tns_type, max(Value.size or 22, 1), 0x05
+    elif isinstance(Value, (bool, int, float, Decimal)):
+        DType, Size, Flag = 2, 22, 0x01
+    elif isinstance(Value, (bytes, bytearray)):
+        DType, Size, Flag = 23, max(len(Value), 1), 0x01
+    elif isinstance(Value, (datetime.datetime, datetime.date)):
+        DType, Size, Flag = 12, 7, 0x01
+    else:
+        DType, Size, Flag = 1, max(len(str(Value).encode('latin-1')), 1), 0x01
+    return bytes([1, DType, Flag, 0, 0]) + Size.to_bytes(8, 'little') + bytes(28)
+
+
+def encode_9i_oall8_dml(
+    Seq: int, Sql: bytes, StmtType: int, Binds: list | None = None
+) -> bytes:
+    # 9i INSERT/UPDATE/DELETE/DDL and COMMIT/ROLLBACK over the native 64-bit
+    # OALL8 (#716); the affected-row count comes back in the response OER
+    # (decode_8i_dml_response, shared with 8i).
+    return _encode_9i_oall8(Seq, Sql, StmtType, Binds or [])
 
 
 def decode_8i_cursor_id(Terminal: bytes) -> int:

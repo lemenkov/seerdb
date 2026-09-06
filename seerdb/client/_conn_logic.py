@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from seerdb.client.dialect import Dialect, Fv2Dialect, O8iDialect
+from seerdb.client.dialect import Dialect, Fv2Dialect, Fv2Oall8Dialect, O8iDialect
 from seerdb.common.end_user_sec import EndUserSecurityContext
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
 from seerdb.common.tns import (
@@ -315,6 +315,7 @@ class _ConnectionLogic:
             'req': self.charset,
             'seq': self._next_seq(),
             'field_version': self.field_version,
+            'oall8': getattr(self, '_oall8', False),
             'max_string_size': max_string_size(self._server_runtime_caps),
             'supports_eor': self._supports_eor,
         }
@@ -391,7 +392,13 @@ class _ConnectionLogic:
         if is_8i:
             self._dialect = O8iDialect(self._next_seq)
         elif self.field_version < FIELD_VERSION_10_2:
-            self._dialect = Fv2Dialect()
+            # The 9i OALL8 opt-in (#716) speaks the native 64-bit request form;
+            # the default 9i path speaks the compact TTI_ALL7.
+            self._dialect = (
+                Fv2Oall8Dialect(self._next_seq)
+                if getattr(self, '_oall8', False)
+                else Fv2Dialect()
+            )
         else:
             self._dialect = None
 

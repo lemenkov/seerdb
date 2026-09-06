@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from typing import Callable, Protocol
 
+from seerdb.common.exceptions import NotSupportedError
 from seerdb.common.tns import (
     O8I_STMT_TXN,
     _scan_ora_message,
@@ -49,6 +50,7 @@ from seerdb.common.tns import (
     encode_8i_oall8_dml,
     encode_8i_oall8_fetch,
     encode_8i_oall8_query,
+    encode_9i_oall8_dml,
     encode_o7_bfile_close,
     encode_o7_bfile_open,
     encode_o7_block,
@@ -346,6 +348,11 @@ class O8iDialect:
     from the connection's sequence, so it takes the connection's ``next_seq``
     callable (colorless — a pure counter)."""
 
+    # Genuine 8i logs in the 8.1.7 way (the short _DTY_8I capability block and the
+    # O3LOGON OSESSKEY envelope); the 9i OALL8 subclass reuses the OALL8 *wire*
+    # methods but logs in as an ordinary 9i client, so it clears this.
+    login_is_8i = True
+
     def __init__(self, next_seq: Callable[[], int]) -> None:
         self._next_seq = next_seq
 
@@ -420,16 +427,17 @@ class O8iDialect:
                     return ([], b'', last_row)
             buf += received[1]
 
+    def _encode_dml(self, sql: bytes, stmt_type: int, bind: list | None):
+        # The DML / txn OALL8 request. Overridden by the 9i OALL8 dialect to send
+        # the 64-bit form; 8i sends the 32-bit one.
+        return encode_8i_oall8_dml(self._next_seq(), sql, stmt_type, bind)
+
     def execute_dml(self, sql: str, bind: list | None = None):
         # 8i INSERT/UPDATE/DELETE and DDL (#360, §19.12): the same OALL8 as a
         # SELECT but with the statement-type option word and no fetch. The
         # affected-row count comes back in the response OER. (Autocommit: caller.)
         stmt_type = o8i_stmt_type(sql.strip().upper())
-        yield Send(
-            encode_8i_oall8_dml(
-                self._next_seq(), sql.encode('latin-1'), stmt_type, bind
-            )
-        )
+        yield Send(self._encode_dml(sql.encode('latin-1'), stmt_type, bind))
         received = yield RECV
         if received is False:
             raise Exception('Connection closed during 8i DML')
@@ -448,11 +456,7 @@ class O8iDialect:
         bind = bind or []
         out_positions = [i for i, b in enumerate(bind) if isinstance(b, Var)]
         stmt_type = o8i_stmt_type(sql.strip().upper())
-        yield Send(
-            encode_8i_oall8_dml(
-                self._next_seq(), sql.encode('latin-1'), stmt_type, bind
-            )
-        )
+        yield Send(self._encode_dml(sql.encode('latin-1'), stmt_type, bind))
         received = yield RECV
         if received is False:
             raise Exception('Connection closed during 8i PL/SQL block')
@@ -470,14 +474,10 @@ class O8iDialect:
     def txn_control(self, statement: str):
         # 8i has no modern TTI_COMMIT / TTI_ROLLBACK: commit and rollback ride the
         # OALL8 as ordinary statements (§19.12, statement type 0).
-        yield Send(
-            encode_8i_oall8_dml(
-                self._next_seq(), statement.encode('latin-1'), O8I_STMT_TXN
-            )
-        )
+        yield Send(self._encode_dml(statement.encode('latin-1'), O8I_STMT_TXN, None))
         received = yield RECV
         if received is False:
-            raise Exception(f'Connection closed during 8i {statement}')
+            raise Exception(f'Connection closed during {statement}')
         (_row_count, err_code, message) = decode_8i_dml_response(received[1])
         _raise_ora(err_code, message)
 
@@ -561,3 +561,36 @@ class O8iDialect:
             (content, complete) = decode_fv2_lob_chunks(data)
             if complete:
                 return content
+
+
+class Fv2Oall8Dialect(O8iDialect):
+    """Oracle 9i over the native 64-bit OALL8 (0x5e), opt-in and experimental
+    (#716). Reuses the 8i dialect's response decoders — the 9i replies share the
+    8i reply shape — but sends the 64-bit request form the 9i server accepts once
+    the OALL8 capabilities are negotiated. This increment serves DML, DDL and
+    transaction control; SELECT, PL/SQL blocks and RETURNING are follow-ups, and
+    raise a clear error until then rather than desyncing the connection."""
+
+    # It is 9i, not 8i: log in the ordinary 9i way (§ _select_dialect keeps the
+    # login path identical to the default 9i dialect; only the execute wire form
+    # differs).
+    login_is_8i = False
+
+    def capabilities(self) -> frozenset[str]:
+        return frozenset({CAP_DML, CAP_OWN_TXN})
+
+    def _encode_dml(self, sql: bytes, stmt_type: int, bind: list | None):
+        return encode_9i_oall8_dml(self._next_seq(), sql, stmt_type, bind)
+
+    def execute_query(self, sql: str, bind: list | None = None, fetch: int = 15):
+        raise NotSupportedError(
+            'the experimental 9i OALL8 dialect does not serve SELECT yet '
+            '(use the default 9i path for queries)'
+        )
+        yield  # pragma: no cover - keeps this a generator like the base method
+
+    def execute_block(self, sql: str, bind: list | None = None):
+        raise NotSupportedError(
+            'the experimental 9i OALL8 dialect does not serve PL/SQL blocks yet'
+        )
+        yield  # pragma: no cover

@@ -19,7 +19,6 @@ from seerdb.client.dialect import (
     CAP_ARRAY_DML,
     CAP_OWN_TXN,
     Dialect,
-    O8iDialect,
 )
 from seerdb.common.crypto import validate
 from seerdb.common.exceptions import (
@@ -655,6 +654,7 @@ class OracleConnect(_ConnectionLogic):
         config_dir: str | None = None,
         dsn: str | None = None,
         negotiation_cache: bool = False,
+        oall8: bool = False,
         access_token: object = None,
         shardingkey: object = None,
         supershardingkey: object = None,
@@ -767,6 +767,8 @@ class OracleConnect(_ConnectionLogic):
         # records whether the current login took the cached (bare-PRO-skipping)
         # path, so connect() knows to invalidate + retry on a stale-cache failure.
         self.negotiation_cache = negotiation_cache
+        # Experimental 9i OALL8 opt-in (#716); ignored on non-9i tiers.
+        self._oall8 = oall8
         self._used_nego_cache = False
         self._skip_nego_cache = False  # forced true on the invalidate-and-retry
         self.server_version = 0
@@ -1039,7 +1041,7 @@ class OracleConnect(_ConnectionLogic):
                                 # the bundle. Only reached when the caller opts in
                                 # with field_version >= 18 (default stays 21.1).
                                 return self._fast_auth_login()
-                            if isinstance(self._dialect, O8iDialect):
+                            if getattr(self._dialect, 'login_is_8i', False):
                                 # 8i has no Unicode charset and predates ~37 data
                                 # types, so it needs its own shorter DTY — the
                                 # modern one draws ORA-03120 (§ _DTY_8I).
@@ -1051,7 +1053,7 @@ class OracleConnect(_ConnectionLogic):
                             self.send(TNS_DATA, Data)
                         case p if p == TTI_DTY:
                             logger.debug('handle_login: recv DTY')
-                            if isinstance(self._dialect, O8iDialect):
+                            if getattr(self._dialect, 'login_is_8i', False):
                                 # Oracle 8i: O3LOGON via the OSESSKEY envelope.
                                 self._o3_phase = 1
                                 self._send_8i_osesskey()
@@ -1080,7 +1082,7 @@ class OracleConnect(_ConnectionLogic):
                                 self.send(TNS_DATA, Data)
                         case p if p == TTI_RPA:
                             logger.debug('handle_login: recv RPA')
-                            if isinstance(self._dialect, O8iDialect):
+                            if getattr(self._dialect, 'login_is_8i', False):
                                 # 8i O3LOGON: phase-1 RPA carries AUTH_SESSKEY ->
                                 # send the proof; the phase-2 RPA (AUTH_VERSION_
                                 # STRING) means authenticated (no server proof to

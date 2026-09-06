@@ -45,7 +45,6 @@ from seerdb.client.dialect import (
     CAP_ARRAY_DML,
     CAP_OWN_TXN,
     Dialect,
-    O8iDialect,
 )
 from seerdb.common.crypto import validate
 from seerdb.common.exceptions import (
@@ -170,6 +169,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         config_dir: str | None = None,
         dsn: str | None = None,
         negotiation_cache: bool = False,
+        oall8: bool = False,
         access_token: object = None,
         shardingkey: object = None,
         supershardingkey: object = None,
@@ -182,6 +182,8 @@ class AsyncOracleConnect(_ConnectionLogic):
         # Negotiation cache (#438): opt-in reconnect optimization, sharing the
         # process-level cache with the sync connection.
         self.negotiation_cache = negotiation_cache
+        # Experimental 9i OALL8 opt-in (#716); ignored on non-9i tiers.
+        self._oall8 = oall8
         self._used_nego_cache = False
         self._skip_nego_cache = False
         self.host = host
@@ -557,7 +559,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                                 # (the legacy OSESSKEY is rejected). See the sync
                                 # OracleConnect._fast_auth_login.
                                 return await self._fast_auth_login()
-                            if isinstance(self._dialect, O8iDialect):
+                            if getattr(self._dialect, 'login_is_8i', False):
                                 # 8i needs its own shorter DTY (§ _DTY_8I).
                                 Data = _DTY_8I
                             else:
@@ -566,7 +568,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                                 )
                             await self.send(TNS_DATA, Data)
                         case p if p == TTI_DTY:
-                            if isinstance(self._dialect, O8iDialect):
+                            if getattr(self._dialect, 'login_is_8i', False):
                                 # Oracle 8i: O3LOGON via the OSESSKEY envelope.
                                 self._o3_phase = 1
                                 await self._send_8i_osesskey()
@@ -593,7 +595,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                                 )
                                 await self.send(TNS_DATA, Data)
                         case p if p == TTI_RPA:
-                            if isinstance(self._dialect, O8iDialect):
+                            if getattr(self._dialect, 'login_is_8i', False):
                                 # 8i O3LOGON: phase-1 RPA (AUTH_SESSKEY) -> send the
                                 # proof; the phase-2 RPA means authenticated.
                                 if self._o3_phase == 1:
