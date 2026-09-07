@@ -225,6 +225,26 @@ def test_translate_binds_wraps_interval_ym_as_make_interval() -> None:
     assert neg == {'b1': -14}
 
 
+def test_translate_binds_skips_colon_in_quoted_identifier() -> None:
+    # A ':' inside a double-quoted identifier (a column named "col:ons") is part of
+    # the name, not a bind; the scanner copies the quoted region verbatim so the
+    # real binds keep their values and positions (DifficultParametersTest).
+    sql, params = _translate_binds(
+        'INSERT INTO t (id, "col:ons") VALUES (:id, :v)', [1, 'x']
+    )
+    assert sql == 'INSERT INTO t (id, "col:ons") VALUES (%(id)s, %(v)s)'
+    assert params == {'id': 1, 'v': 'x'}
+
+
+def test_translate_binds_preserves_doubled_quotes() -> None:
+    # A doubled quote is an escaped quote that stays inside the region -- '' in a
+    # string literal and "" in an identifier -- so the copied SQL stays valid.
+    lit, _ = _translate_binds("SELECT 'a''b' FROM t WHERE x = :v", ['z'])
+    assert lit == "SELECT 'a''b' FROM t WHERE x = %(v)s"
+    ident, _ = _translate_binds('SELECT "a""b", :v FROM t', ['z'])
+    assert ident == 'SELECT "a""b", %(v)s FROM t'
+
+
 def test_translate_binds_escapes_literal_percent() -> None:
     # psycopg reads a bound query as a format string, so a literal % (a LIKE
     # pattern, or a column name) must be doubled or it looks like a broken

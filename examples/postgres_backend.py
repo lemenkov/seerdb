@@ -542,6 +542,29 @@ _NULL_CASTS = {
 }
 
 
+def _copy_quoted_region(sql: str, start: int, out: list[str]) -> int:
+    """Copy the quoted region at ``start`` (a ``'`` string literal or a ``\"``
+    identifier) into ``out`` verbatim and return the index just past it. A doubled
+    quote is an escaped quote that stays inside; a literal ``%`` is doubled so
+    psycopg does not read it as a placeholder."""
+    quote = sql[start]
+    out.append(quote)
+    i, n = start + 1, len(sql)
+    while i < n:
+        char = sql[i]
+        if char == quote:
+            if i + 1 < n and sql[i + 1] == quote:
+                out.append(quote)
+                out.append(quote)
+                i += 2
+                continue
+            out.append(quote)
+            return i + 1
+        out.append('%%' if char == '%' else char)
+        i += 1
+    return i  # unterminated region: copied to end of string
+
+
 def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
     """Rewrite Oracle bind references to psycopg named placeholders and build the
     parameter dict (#516). Oracle binds by name, so a bind repeated in the text
@@ -559,15 +582,13 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
     i, n = 0, len(sql)
     while i < n:
         char = sql[i]
-        if char == "'":  # copy a whole string literal verbatim ('' escapes a quote)
-            out.append(char)
-            i += 1
-            while i < n:
-                out.append(sql[i].replace('%', '%%'))
-                if sql[i] == "'" and not (i + 1 < n and sql[i + 1] == "'"):
-                    i += 1
-                    break
-                i += 2 if sql[i] == "'" else 1
+        if char == "'" or char == '"':
+            # Copy a whole quoted region verbatim -- a string literal ('...') or a
+            # quoted identifier ("...") -- so a ':' inside it (a column named
+            # "col:ons") is never mistaken for a bind. A doubled quote ('' or "")
+            # is an escaped quote that stays inside the region, and a literal % is
+            # doubled for psycopg's format-string parsing.
+            i = _copy_quoted_region(sql, i, out)
             continue
         match = _BIND_REF.match(sql, i)
         if match is not None and (i == 0 or sql[i - 1] != ':'):
