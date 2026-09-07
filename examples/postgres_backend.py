@@ -269,6 +269,29 @@ CREATE OR REPLACE FUNCTION utl_raw.bit_xor(bytea, bytea) RETURNS bytea
 """
 
 
+# DBMS_UTILITY — the commonly-called entry points orafce does not already ship
+# (it has GET_TIME and FORMAT_CALL_STACK) (#764). Installed into the same
+# dbms_utility schema. FORMAT_ERROR_STACK / FORMAT_ERROR_BACKTRACE return the
+# empty string a plain SQL context (no active exception) yields in Oracle too.
+# DB_VERSION is a procedure with OUT arguments, reached through the callproc
+# path; its release string tracks the demo's advertised server_identity (12.1).
+# COMMA_TO_TABLE / TABLE_TO_COMMA are left unimplemented: they exchange an Oracle
+# collection (DBMS_UTILITY.UNCL_ARRAY / LNAME_ARRAY), a PL/SQL table type the
+# Mirror does not model.
+_DBMS_UTILITY_DDL = """
+CREATE SCHEMA IF NOT EXISTS dbms_utility;
+CREATE OR REPLACE FUNCTION dbms_utility.format_error_stack() RETURNS text
+  LANGUAGE sql IMMUTABLE AS $$ SELECT ''::text $$;
+CREATE OR REPLACE FUNCTION dbms_utility.format_error_backtrace() RETURNS text
+  LANGUAGE sql IMMUTABLE AS $$ SELECT ''::text $$;
+CREATE OR REPLACE PROCEDURE dbms_utility.db_version(
+    INOUT version text, INOUT compatibility text)
+  LANGUAGE plpgsql AS $$ BEGIN
+    version := '12.1.0.2.0'; compatibility := '12.1.0.0.0';
+  END $$;
+"""
+
+
 # Oracle data-dictionary emulation (#759): the SYS_CONTEXT userenv function and a
 # minimal set of Oracle-shaped catalog views over pg_catalog / information_schema,
 # so a reflecting client (SQLAlchemy's Oracle dialect, ORMs) finds the metadata it
@@ -1558,6 +1581,11 @@ class PostgresBackend:
         # UTL_RAW as PostgreSQL functions (orafce ships no utl_raw) (#765).
         try:
             self._conn.execute(_UTL_RAW_DDL)
+        except psycopg.Error:
+            self._conn.rollback()
+        # DBMS_UTILITY entry points orafce does not ship (#764).
+        try:
+            self._conn.execute(_DBMS_UTILITY_DDL)
         except psycopg.Error:
             self._conn.rollback()
         # Oracle data-dictionary emulation (#759): SYS_CONTEXT + catalog views.

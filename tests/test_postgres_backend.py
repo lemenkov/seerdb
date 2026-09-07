@@ -1577,3 +1577,31 @@ def test_utl_raw_functions() -> None:
         )
     finally:
         backend.close()
+
+
+def test_dbms_utility_functions() -> None:
+    # The DBMS_UTILITY entry points orafce does not ship (#764): FORMAT_ERROR_STACK
+    # / FORMAT_ERROR_BACKTRACE return the empty string a no-active-error context
+    # yields in Oracle; DB_VERSION returns the demo's advertised release via the
+    # callproc OUT-bind path. (GET_TIME / FORMAT_CALL_STACK already come from orafce.)
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        assert backend.execute('SELECT dbms_utility.format_error_stack()').rows == [
+            ('',)
+        ]
+        assert backend.execute('SELECT dbms_utility.format_error_backtrace()').rows == [
+            ('',)
+        ]
+        from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
+        from seerdb.server.backend import BindVar
+
+        result = backend.execute(
+            'BEGIN DBMS_UTILITY.DB_VERSION(:1, :2); END;',
+            [
+                BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=64),
+                BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=64),
+            ],
+        )
+        assert result.out_binds == ['12.1.0.2.0', '12.1.0.0.0']
+    finally:
+        backend.close()
