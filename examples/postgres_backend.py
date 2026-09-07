@@ -379,20 +379,32 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE OR REPLACE VIEW sys.all_ind_columns AS SELECT ora_owner(n.nspname) AS index_owner, '
     'ora_name(ic.relname) AS index_name, ora_owner(tn.nspname) AS table_owner, '
     'ora_name(tc.relname) AS table_name, ora_name(a.attname) AS column_name, '
-    "k.n AS column_position, 'ASC' AS descend "
+    "k.n AS column_position, CASE WHEN (k.opt & 1) = 1 THEN 'DESC' ELSE 'ASC' END AS descend "
     'FROM pg_index ix JOIN pg_class ic ON ic.oid=ix.indexrelid '
     'JOIN pg_namespace n ON n.oid=ic.relnamespace '
     'JOIN pg_class tc ON tc.oid=ix.indrelid '
     'JOIN pg_namespace tn ON tn.oid=tc.relnamespace '
-    'CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, n) '
+    'CROSS JOIN LATERAL unnest(ix.indkey::int2[], ix.indoption::int2[]) WITH ORDINALITY AS k(attnum, opt, n) '
     'JOIN pg_attribute a ON a.attrelid=tc.oid AND a.attnum=k.attnum '
     "WHERE n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
-    # Function-based-index expressions — the Mirror has none, but reflection LEFT
-    # JOINs it, so an empty view of the right shape keeps the join valid.
+    # A DESC column in an index is a function-based index in Oracle: the column
+    # appears here as the quoted expression "COL" at its position, so reflection
+    # (which LEFT JOINs on column_position) renders it as an expression with DESC
+    # sorting. PostgreSQL stores it as a plain descending key column, so emit a row
+    # only for descending columns (indoption bit 0x01), matching Oracle's shape.
     'CREATE OR REPLACE VIEW sys.all_ind_expressions AS SELECT '
-    'NULL::text AS index_owner, NULL::text AS index_name, NULL::text AS table_owner, '
-    'NULL::text AS table_name, NULL::text AS column_expression, '
-    'NULL::int AS column_position WHERE false;'
+    'ora_owner(n.nspname) AS index_owner, ora_name(ic.relname) AS index_name, '
+    'ora_owner(tn.nspname) AS table_owner, ora_name(tc.relname) AS table_name, '
+    "'\"' || ora_name(a.attname) || '\"' AS column_expression, k.n AS column_position "
+    'FROM pg_index ix JOIN pg_class ic ON ic.oid=ix.indexrelid '
+    'JOIN pg_namespace n ON n.oid=ic.relnamespace '
+    'JOIN pg_class tc ON tc.oid=ix.indrelid '
+    'JOIN pg_namespace tn ON tn.oid=tc.relnamespace '
+    'CROSS JOIN LATERAL unnest(ix.indkey::int2[], ix.indoption::int2[]) '
+    'WITH ORDINALITY AS k(attnum, opt, n) '
+    'JOIN pg_attribute a ON a.attrelid=tc.oid AND a.attnum=k.attnum '
+    'WHERE (k.opt & 1) = 1 '
+    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
 )
 
 # The PostgreSQL `interval` OID (pg_type.oid) — the base type ora_intervalym is a

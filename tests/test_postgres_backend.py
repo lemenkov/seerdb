@@ -1308,3 +1308,42 @@ def test_dictionary_views_preserve_quoted_identifier_case() -> None:
         backend.commit()
     finally:
         backend.close()
+
+
+def test_dictionary_views_report_desc_index_as_expression() -> None:
+    # Oracle represents a descending index column as a function-based index: the
+    # column shows up in all_ind_expressions as the quoted expression "COL" and its
+    # all_ind_columns row is marked DESC, so the dialect reflects it with an
+    # expression and column_sorting rather than a plain column. PostgreSQL stores it
+    # as a plain descending key, so the views reconstruct Oracle's shape (#759).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('drop table if exists desc_idx')
+        backend.execute('CREATE TABLE desc_idx (id NUMBER, q NUMBER, b VARCHAR2(20))')
+        backend.execute('CREATE INDEX desc_ix ON desc_idx (q DESC)')
+        backend.execute('CREATE INDEX asc_ix ON desc_idx (b)')
+        backend.commit()
+        # The descending column is DESC in all_ind_columns and an expression "Q".
+        assert backend.execute(
+            'SELECT descend FROM all_ind_columns '
+            "WHERE index_name = 'DESC_IX' AND column_name = 'Q'"
+        ).rows == [('DESC',)]
+        assert backend.execute(
+            'SELECT column_expression FROM all_ind_expressions '
+            "WHERE index_name = 'DESC_IX'"
+        ).rows == [('"Q"',)]
+        # A plain ascending index carries no expression row and stays ASC.
+        assert backend.execute(
+            "SELECT descend FROM all_ind_columns WHERE index_name = 'ASC_IX'"
+        ).rows == [('ASC',)]
+        assert (
+            backend.execute(
+                'SELECT column_expression FROM all_ind_expressions '
+                "WHERE index_name = 'ASC_IX'"
+            ).rows
+            == []
+        )
+        backend.execute('drop table desc_idx')
+        backend.commit()
+    finally:
+        backend.close()
