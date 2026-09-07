@@ -259,6 +259,13 @@ def test_translate_idioms_rewrites_connect_by_level_row_generator() -> None:
     assert multi == 'SELECT 42 AS k, LEVEL AS n FROM generate_series(1, 200) AS level'
 
 
+def test_translate_idioms_rewrites_minus_to_except() -> None:
+    # Oracle's MINUS set operator is PostgreSQL's EXCEPT; the SQLAlchemy Oracle
+    # dialect's get_table_names query uses MINUS (#759).
+    out = _translate_idioms('SELECT a FROM t MINUS SELECT b FROM u')
+    assert out == 'SELECT a FROM t EXCEPT SELECT b FROM u'
+
+
 def test_translate_idioms_rewrites_offset_bearing_timestamp_literal() -> None:
     # TIMESTAMP '<ts> ±HH:MM' is a WITH TIME ZONE value — build the composite so
     # the offset survives, rather than PostgreSQL's WITHOUT-time-zone parse dropping
@@ -1208,3 +1215,40 @@ def test_distinct_bind_refs_first_appearance_order_skips_literals() -> None:
     assert _distinct_bind_refs(':a := :b; :c := :a') == ['a', 'b', 'c']
     # A colon inside a string literal is not a bind ref.
     assert _distinct_bind_refs("INSERT INTO t VALUES ('x :nope' || :v)") == ['v']
+
+
+def test_dictionary_views_reflect_a_created_table() -> None:
+    # The Oracle data-dictionary emulation (#759): SYS_CONTEXT + the catalog views
+    # let a reflecting client find a table's metadata. Create a table and read it
+    # back through the Oracle-shaped views, UPPER-cased and Oracle-typed.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('drop table if exists dict_reflect')
+        backend.execute(
+            'CREATE TABLE dict_reflect (id NUMBER PRIMARY KEY, name VARCHAR2(20))'
+        )
+        backend.commit()
+        assert (
+            backend.execute("SELECT sys_context('userenv', 'current_schema')").rows[0][
+                0
+            ]
+            == 'PUBLIC'
+        )
+        cols = backend.execute(
+            'SELECT column_name, data_type FROM all_tab_columns '
+            "WHERE table_name = 'DICT_REFLECT' ORDER BY column_id"
+        ).rows
+        typ = {c[0]: c[1] for c in cols}
+        assert typ.get('ID') == 'NUMBER'
+        assert typ.get('NAME') == 'VARCHAR2'
+        assert backend.execute(
+            "SELECT table_name FROM all_tables WHERE table_name = 'DICT_REFLECT'"
+        ).rows
+        assert backend.execute(
+            'SELECT constraint_type FROM all_constraints '
+            "WHERE table_name = 'DICT_REFLECT' AND constraint_type = 'P'"
+        ).rows
+        backend.execute('drop table dict_reflect')
+        backend.commit()
+    finally:
+        backend.close()
