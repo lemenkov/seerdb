@@ -37,6 +37,7 @@ from postgres_backend import (  # noqa: E402
     _parse_out_assignments,
     _reject_unsupported_ddl_types,
     _to_interval_ym,
+    _translate_admin,
     _translate_binds,
     _translate_ddl,
     _translate_idioms,
@@ -264,6 +265,35 @@ def test_translate_idioms_rewrites_minus_to_except() -> None:
     # dialect's get_table_names query uses MINUS (#759).
     out = _translate_idioms('SELECT a FROM t MINUS SELECT b FROM u')
     assert out == 'SELECT a FROM t EXCEPT SELECT b FROM u'
+
+
+def test_translate_ddl_strips_char_byte_length_semantics() -> None:
+    # Oracle's VARCHAR2(20 CHAR) / CHAR(1 BYTE) length semantics — the CHAR/BYTE
+    # qualifier PostgreSQL has no syntax for; dropped so it is a plain length (#759).
+    out = _translate_ddl('CREATE TABLE t (a VARCHAR2(20 CHAR), b CHAR(1 BYTE))')
+    assert '(20 CHAR)' not in out and '(1 BYTE)' not in out.upper()
+    assert 'varchar(20)' in out and 'char(1)' in out.lower()
+
+
+def test_translate_admin_maps_session_user_and_index() -> None:
+    # Oracle session/user admin → PostgreSQL: schema resolution is search_path, a
+    # user is a schema, and grants/tablespace admin no-op; a schema-qualified index
+    # name loses the qualifier (#759).
+    assert (
+        _translate_admin('ALTER SESSION SET CURRENT_SCHEMA = TEST_SCHEMA')
+        == 'SET search_path TO test_schema, public, oracle'
+    )
+    assert (
+        _translate_admin('CREATE USER test_schema IDENTIFIED BY secret')
+        == 'CREATE SCHEMA IF NOT EXISTS test_schema'
+    )
+    assert _translate_admin('GRANT CREATE SESSION TO test_schema') == 'SELECT 1'
+    assert (
+        _translate_admin('CREATE INDEX test_schema.ix1 ON test_schema.t (c)')
+        == 'CREATE INDEX ix1 ON test_schema.t (c)'
+    )
+    # An ordinary statement is passed through untouched.
+    assert _translate_admin('SELECT 1 FROM dual') == 'SELECT 1 FROM dual'
 
 
 def test_translate_idioms_rewrites_offset_bearing_timestamp_literal() -> None:

@@ -242,7 +242,8 @@ _ORACLE_DICTIONARY_DDL = (
     # get_pk_constraint / get_indexes).
     'CREATE OR REPLACE VIEW all_tables AS SELECT upper(table_schema) AS owner, '
     'upper(table_name) AS table_name, NULL::text AS tablespace_name, '
-    'NULL::text AS iot_name, NULL::text AS duration '
+    'NULL::text AS iot_name, NULL::text AS duration, '
+    'NULL::text AS compression, NULL::text AS compress_for '
     "FROM information_schema.tables WHERE table_type='BASE TABLE' "
     "AND table_schema NOT IN ('pg_catalog','information_schema','oracle');"
     'CREATE OR REPLACE VIEW user_tables AS SELECT table_name, tablespace_name, '
@@ -263,7 +264,7 @@ _ORACLE_DICTIONARY_DDL = (
     'max_value, increment_by, cycle_flag, order_flag, cache_size, last_number '
     'FROM all_sequences WHERE sequence_owner=upper(current_schema());'
     'CREATE OR REPLACE VIEW all_mviews AS SELECT upper(schemaname) AS owner, '
-    'upper(matviewname) AS mview_name FROM pg_matviews;'
+    'upper(matviewname) AS mview_name, definition AS query FROM pg_matviews;'
     'CREATE OR REPLACE VIEW all_mview_comments AS SELECT upper(schemaname) AS owner, '
     "upper(matviewname) AS mview_name, obj_description((quote_ident(schemaname)||'.'||"
     'quote_ident(matviewname))::regclass) AS comments FROM pg_matviews;'
@@ -310,7 +311,9 @@ _ORACLE_DICTIONARY_DDL = (
     "CASE c.relkind WHEN 'r' THEN 'TABLE' WHEN 'v' THEN 'VIEW' "
     "WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'i' THEN 'INDEX' "
     "WHEN 'S' THEN 'SEQUENCE' ELSE upper(c.relkind::text) END AS object_type, "
-    "'VALID' AS status "
+    "'VALID' AS status, "
+    "CASE WHEN c.relpersistence='t' THEN 'Y' ELSE 'N' END AS temporary, "
+    "'N' AS generated, 'N' AS secondary "
     'FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace '
     "WHERE c.relkind IN ('r','v','m','i','S') "
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle');"
@@ -570,6 +573,11 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
 # other tokens untouched; only CREATE TABLE is rewritten, so a type keyword used
 # as an identifier elsewhere is left alone.
 _DDL_TYPE_REWRITES = [
+    # Oracle character-length semantics: VARCHAR2(20 CHAR) / CHAR(1 BYTE) — the
+    # `CHAR` / `BYTE` length qualifier PostgreSQL has no syntax for; drop it so the
+    # length maps to a plain varchar(n) / char(n) (#759, the reflection fixtures
+    # declare columns this way).
+    (re.compile(r'\(\s*(\d+)\s+(?:CHAR|BYTE)\s*\)', re.IGNORECASE), r'(\1)'),
     # SYS_REFCURSOR (a REF CURSOR OUT param) → PostgreSQL's refcursor (#518).
     (re.compile(r'\bSYS_REFCURSOR\b', re.IGNORECASE), 'refcursor'),
     # A `REF <object type>` column (#139). PostgreSQL has no REF, but the REF-bind
@@ -697,6 +705,43 @@ _CREATE_TYPE_OBJECT = re.compile(
     r'(\s*CREATE\s+(?:OR\s+REPLACE\s+)?TYPE\b.*?\bAS)\s+OBJECT\b',
     re.IGNORECASE | re.DOTALL,
 )
+
+
+# Oracle session / user admin statements the provisioning issues, mapped to their
+# PostgreSQL equivalent or a no-op (#759). Oracle treats a user as a schema, so a
+# CREATE USER becomes a CREATE SCHEMA; ALTER SESSION SET CURRENT_SCHEMA points
+# unqualified name resolution at a schema, which is PostgreSQL's search_path; the
+# tablespace / grant / password admin has no PostgreSQL analogue and becomes a
+# harmless no-op so the statement succeeds.
+_ALTER_SESSION_SCHEMA = re.compile(
+    r'\s*ALTER\s+SESSION\s+SET\s+CURRENT_SCHEMA\s*=\s*"?(\w+)"?\s*$', re.IGNORECASE
+)
+_CREATE_USER = re.compile(r'\s*CREATE\s+USER\s+"?(\w+)"?\b', re.IGNORECASE)
+_CREATE_INDEX_QUALIFIED = re.compile(
+    r'(\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+)"?\w+"?\.("?\w+"?\s+ON\s+.*)$',
+    re.IGNORECASE | re.DOTALL,
+)
+_ADMIN_NOOP = re.compile(
+    r'\s*(ALTER\s+USER|GRANT|REVOKE|ALTER\s+SESSION|CREATE\s+ROLE|DROP\s+USER)\b',
+    re.IGNORECASE,
+)
+
+
+def _translate_admin(sql: str) -> str:
+    m = _ALTER_SESSION_SCHEMA.match(sql)
+    if m:
+        return f'SET search_path TO {m.group(1).lower()}, public, oracle'
+    m = _CREATE_USER.match(sql)
+    if m:
+        return f'CREATE SCHEMA IF NOT EXISTS {m.group(1).lower()}'
+    m = _CREATE_INDEX_QUALIFIED.match(sql)
+    if m:
+        # Oracle allows a schema-qualified index name (CREATE INDEX s.i ON s.t);
+        # PostgreSQL puts the index in the table's schema and rejects the prefix.
+        return m.group(1) + m.group(2)
+    if _ADMIN_NOOP.match(sql):
+        return 'SELECT 1'  # no PostgreSQL equivalent — succeed and do nothing
+    return sql
 
 
 def _translate_ddl(sql: str) -> str:
@@ -1354,7 +1399,9 @@ class PostgresBackend:
         # literal idioms. This is where dialect knowledge belongs, not in the
         # generic compat shim.
         sql = _translate_idioms(
-            _translate_plsql_block(_translate_routine_ddl(_translate_ddl(sql)))
+            _translate_plsql_block(
+                _translate_routine_ddl(_translate_ddl(_translate_admin(sql)))
+            )
         )
         params: dict | None = None
         if binds:
