@@ -18,7 +18,13 @@ import pytest
 
 import seerdb
 from seerdb.common.tns import ColumnMeta
-from seerdb.common.tns_consts import TNS_DATA, TNS_TYPE_VARCHAR, VERSION_11_2_0_2
+from seerdb.common.tns_consts import (
+    FIELD_VERSION_12_2,
+    TNS_DATA,
+    TNS_TYPE_VARCHAR,
+    VERSION_11_2_0_2,
+    VERSION_12_2_0_1,
+)
 from seerdb.server.backend import (
     Capability,
     Result,
@@ -1127,3 +1133,59 @@ def test_oci_banner_follows_the_advertised_release(
     _serve_oci_session(stream, backend, 'PYO', None, server_identity(version))
     assert stream.sent, 'the version call must be answered with a banner'
     assert expected in stream.sent[0]
+
+
+class _VersionedBackend(_DualBackend):
+    # A backend that declares the protocol version it presents, the way the
+    # PostgreSQL demo pins 11.2 and a passthrough presents its target's release.
+    field_version = FIELD_VERSION_12_2
+
+
+def _run_mirror_versioned_backend(listen: socket.socket, result: dict) -> None:
+    conn, _ = listen.accept()
+    try:
+        # No field_version argument: the backend's declaration must drive it.
+        result['user'] = serve_session(PacketStream(conn), _VersionedBackend())
+    except Exception as exc:  # noqa: BLE001 - surfaced to the test thread
+        result['error'] = exc
+    finally:
+        conn.close()
+
+
+def test_backend_declared_field_version_drives_the_session() -> None:
+    # The backend, not the serve() flag, chooses the advertised version: a
+    # _VersionedBackend pinning 12.2 makes a live client negotiate to 12.2 and
+    # read the 12.2 release, though serve_session was given no field_version.
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    port = listen.getsockname()[1]
+    result: dict = {}
+    server = threading.Thread(
+        target=_run_mirror_versioned_backend, args=(listen, result), daemon=True
+    )
+    server.start()
+    conn = seerdb.connect(
+        host='127.0.0.1',
+        port=port,
+        user='PYO',
+        password='pyo123',
+        service_name='XE',
+        timeout=5000,
+    )
+    try:
+        assert conn.field_version == FIELD_VERSION_12_2
+        assert conn.server_version == VERSION_12_2_0_1
+        cursor = conn.cursor()
+        cursor.execute('select * from dual')
+        assert cursor.fetchone() == ('X',)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        server.join(timeout=5)
+        listen.close()
+    assert result.get('error') is None, result.get('error')
+    assert result.get('user') == 'PYO'

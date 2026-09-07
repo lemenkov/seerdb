@@ -78,6 +78,7 @@ from seerdb.common.datatypes import IntervalYM
 from seerdb.common.dbobject import DbRef
 from seerdb.common.sqltext import is_plsql, strip_returning_into
 from seerdb.common.tns_consts import (
+    FIELD_VERSION_11_2,
     TNS_TYPE_BDOUBLE,
     TNS_TYPE_BFLOAT,
     TNS_TYPE_BLOB,
@@ -1044,6 +1045,10 @@ class PostgresBackend:
     """
 
     capabilities = frozenset({Capability.TRANSACTIONS})
+    # This demo presents 11.2: it cannot back the 12c+/23ai wire formats a higher
+    # advertised version would invite a client to request, so it pins the floor
+    # the whole conformance suite is baselined at (the Mirror honours this).
+    field_version = FIELD_VERSION_11_2
 
     def __init__(
         self, conninfo: str = '', *, credentials: Credentials | None = None

@@ -42,15 +42,18 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s'
     )
+    # The backend presents the version now (§ Backend.field_version): the
+    # passthrough advertises what its target speaks, so MIRROR_FIELD_VERSION
+    # flows through the backend rather than the serve() flag.
     seerdb.serve(
         '127.0.0.1',
         listen_port,
-        field_version=field_version,
         backend_factory=lambda: OraclePassthroughBackend(
             host=host,
             port=int(port),
             service=service,
             credentials=credentials,
+            field_version=field_version,
         ),
     )
 

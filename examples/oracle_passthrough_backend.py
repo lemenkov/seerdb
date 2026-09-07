@@ -51,7 +51,15 @@ class OraclePassthroughBackend:
         port: int,
         service: str,
         credentials: dict[str, str],
+        field_version: int | None = None,
+        tns_version: int | None = None,
     ) -> None:
+        # The Oracle release this passthrough presents to its own clients — set
+        # it to match the target so the Mirror advertises what the real server
+        # behind it speaks (the Mirror reads these off the backend). Left None,
+        # the Mirror falls back to its launch default.
+        self.field_version = field_version
+        self.tns_version = tns_version
         self._host = host
         self._port = port
         self._service = service

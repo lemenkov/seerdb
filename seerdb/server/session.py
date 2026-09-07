@@ -481,7 +481,18 @@ def serve_session(
     holds the undelivered rows). A logoff (or EOF) ends the session and returns
     the authenticated username. ``encryption`` is the Mirror's ANO stance,
     forwarded to :func:`handle_login` (§33 / #448).
+
+    The backend chooses the protocol version: if it declares ``field_version``
+    (and optionally ``tns_version``), that is what the Mirror advertises, and the
+    ``field_version`` argument here is only the fallback for a backend with no
+    opinion. Read off the raw backend before it is wrapped.
     """
+    declared_field_version = getattr(backend, 'field_version', None)
+    if declared_field_version is not None:
+        field_version = declared_field_version
+    declared_tns_version = getattr(backend, 'tns_version', None)
+    if declared_tns_version is not None:
+        tns_version = declared_tns_version
     backend = _IsolatedBackend(backend)
     user, sqlplus, conn_key = handle_login(
         stream,
