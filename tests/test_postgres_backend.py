@@ -1282,3 +1282,29 @@ def test_dictionary_views_reflect_a_created_table() -> None:
         backend.commit()
     finally:
         backend.close()
+
+
+def test_dictionary_views_preserve_quoted_identifier_case() -> None:
+    # Oracle stores an unquoted identifier upper-case and a quoted one verbatim;
+    # PostgreSQL folds unquoted names lower-case. sys.ora_name() reconstructs the
+    # Oracle-stored form so a reflecting client sees a plain name UPPER-cased and a
+    # quoted mixed-case name unchanged — the round trip the SQLAlchemy Oracle
+    # dialect's normalize/denormalize relies on for *_quoted_name reflection.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('drop table if exists quoted_ident')
+        backend.execute('CREATE TABLE quoted_ident (plain NUMBER, "mixedCase" NUMBER)')
+        backend.commit()
+        names = {
+            r[0]
+            for r in backend.execute(
+                'SELECT column_name FROM all_tab_columns '
+                "WHERE table_name = 'QUOTED_IDENT'"
+            ).rows
+        }
+        # A quoted mixed-case name survives byte-for-byte; a plain name is UPPER'd.
+        assert names == {'PLAIN', 'mixedCase'}
+        backend.execute('drop table quoted_ident')
+        backend.commit()
+    finally:
+        backend.close()
