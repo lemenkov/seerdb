@@ -922,6 +922,14 @@ _IDIOM_REWRITES = [
         re.compile(r'\b([A-Za-z_][\w$#.]*)\.currval\b', re.IGNORECASE),
         r"currval('\1')",
     ),
+    # A CAST to an Oracle string type in DML (CAST(x AS VARCHAR2(50 CHAR))): the
+    # column-type rewrites only fire on CREATE TABLE, so translate the string type
+    # and drop the CHAR/BYTE length qualifier here too. VARCHAR2 / NVARCHAR2 are
+    # never valid identifiers, and the qualifier shape is specific, so this is safe
+    # on any statement (a DDL CAST is already varchar by the time it reaches here).
+    (re.compile(r'\bNVARCHAR2\b', re.IGNORECASE), 'varchar'),
+    (re.compile(r'\bVARCHAR2\b', re.IGNORECASE), 'varchar'),
+    (re.compile(r'\(\s*(\d+)\s+(?:CHAR|BYTE)\s*\)', re.IGNORECASE), r'(\1)'),
 ]
 
 

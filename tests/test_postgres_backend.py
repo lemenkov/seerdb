@@ -322,6 +322,20 @@ def test_translate_idioms_rewrites_sequence_pseudocolumns() -> None:
     )
 
 
+def test_translate_idioms_rewrites_cast_string_type() -> None:
+    # A CAST to an Oracle string type in DML is translated like a column type: the
+    # VARCHAR2/NVARCHAR2 keyword becomes varchar and the CHAR/BYTE length qualifier
+    # is dropped (the column-type rewrites only fire on CREATE TABLE).
+    assert (
+        _translate_idioms('INSERT INTO t (x) VALUES (CAST(:v AS VARCHAR2(50 CHAR)))')
+        == 'INSERT INTO t (x) VALUES (CAST(:v AS varchar(50)))'
+    )
+    assert (
+        _translate_idioms('SELECT CAST(x AS NVARCHAR2(10)) FROM t')
+        == 'SELECT CAST(x AS varchar(10)) FROM t'
+    )
+
+
 def test_translate_admin_maps_session_user_and_index() -> None:
     # Oracle session/user admin → PostgreSQL: schema resolution is search_path, a
     # user is a schema, and grants/tablespace admin no-op; a schema-qualified index
