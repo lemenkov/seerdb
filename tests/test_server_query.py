@@ -252,7 +252,7 @@ def test_parse_tpc_switch_reads_sessionless_begin_resume_suspend(version: int) -
     assert op == TNS_TPC_TXN_DETACH and txn == b''
 
 
-@pytest.mark.parametrize('version', [8, 12, 16, 17])  # 12.2, 19c, 21c, 23ai
+@pytest.mark.parametrize('version', [8, 12, 16, 17, 24])  # 12.2, 19c, 21c, 23ai, fv24
 def test_parse_exec_reads_the_12c_request_layout(version: int) -> None:
     # From 12.2 the client's OALL8 replaces the marker + server-version slot with
     # a registration / array-DML / SQL-signature block, length-prefixes the SQL,
@@ -340,7 +340,7 @@ def test_returning_response_round_trips_to_the_client_decoder() -> None:
     assert [len(r['return_values'][0]) for r in records] == [2, 0, 1, 1]
 
 
-@pytest.mark.parametrize('version', [8, 17])
+@pytest.mark.parametrize('version', [8, 17, 24])
 def test_describe_decodes_back_at_a_12c_field_version(version: int) -> None:
     # The describe column gains a one-byte scale and an oaccolid at 12.2, and the
     # SQL-domain schema + name at 23ai; the client's own decoder at that version
