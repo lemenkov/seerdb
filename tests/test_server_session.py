@@ -20,10 +20,12 @@ import seerdb
 from seerdb.common.tns import ColumnMeta
 from seerdb.common.tns_consts import (
     FIELD_VERSION_12_2,
+    FIELD_VERSION_23_4,
     TNS_DATA,
     TNS_TYPE_VARCHAR,
     VERSION_11_2_0_2,
     VERSION_12_2_0_1,
+    VERSION_23_1_162_0,
 )
 from seerdb.server.backend import (
     Capability,
@@ -1180,6 +1182,60 @@ def test_backend_declared_field_version_drives_the_session() -> None:
         cursor = conn.cursor()
         cursor.execute('select * from dual')
         assert cursor.fetchone() == ('X',)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        server.join(timeout=5)
+        listen.close()
+    assert result.get('error') is None, result.get('error')
+    assert result.get('user') == 'PYO'
+
+
+class _FastAuthBackend(_DualBackend):
+    # Declares a 23ai field version, so a live client negotiates fv 24 and logs in
+    # through the 23ai FAST_AUTH bundle rather than the legacy three messages.
+    field_version = FIELD_VERSION_23_4
+
+
+def _run_mirror_fast_auth(listen: socket.socket, result: dict) -> None:
+    conn, _ = listen.accept()
+    try:
+        result['user'] = serve_session(PacketStream(conn), _FastAuthBackend())
+    except Exception as exc:  # noqa: BLE001 - surfaced to the test thread
+        result['error'] = exc
+    finally:
+        conn.close()
+
+
+def test_live_seerdb_fast_auth_login_at_23ai() -> None:
+    # 23ai server-side fast-auth (§20): a real client at field version 24 cannot
+    # use the legacy OSESSKEY handshake, so it sends one FAST_AUTH packet bundling
+    # PRO + DTY + OSESSKEY. The Mirror unbundles it, replies with the three
+    # responses concatenated, and finishes O5LOGON — the client logs in and reads
+    # the 23ai release. (The fv 24 query path is a separate increment.)
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    port = listen.getsockname()[1]
+    result: dict = {}
+    server = threading.Thread(
+        target=_run_mirror_fast_auth, args=(listen, result), daemon=True
+    )
+    server.start()
+    conn = seerdb.connect(
+        host='127.0.0.1',
+        port=port,
+        user='PYO',
+        password='pyo123',
+        service_name='XE',
+        timeout=5000,
+    )
+    try:
+        assert conn.field_version == FIELD_VERSION_23_4
+        assert conn.server_version == VERSION_23_1_162_0
     finally:
         try:
             conn.close()

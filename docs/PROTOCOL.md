@@ -3659,6 +3659,15 @@ whose decode yields a session key (the DTY datatype table contains `0x08` bytes,
 so a naive token scan mis-hits), then handed to the normal phase-two path. The
 23ai server tolerates the duplicate PRO that the bundle re-sends.
 
+**The Mirror serves this too** (server side): it advertises fv24 (from the
+backend, § `Backend.field_version`), and when the packet after its PRO reply is a
+FAST_AUTH (`0x22`) rather than a bare DTY it unbundles the OSESSKEY — the tail
+`03 76` message, located and validated by `find_fast_auth_osesskey` the same way
+the client finds the RPA — authenticates, and replies with the PRO + DTY replies
++ the auth challenge as one packet (`encode_fast_auth_reply`), then runs the
+existing phase-two AUTH. The fv24 OAUTH header (§20.3) is parsed in
+`_parse_fun_auth`. (The fv24 *query* path — §20.4 — is a separate increment.)
+
 Normally the client sends a bare PRO first (ACCEPT → PRO → PRO-reply → bundle)
 purely to learn whether the negotiated field version reaches the fast-auth
 threshold. With the opt-in **negotiation cache** (#438), a reconnect to a target
