@@ -102,6 +102,7 @@ from seerdb.common.tns_consts import (
     TNS_FUNC_TPC_TXN_SWITCH,
     TNS_MARKER,
     TNS_MARKER_TYPE_RESET,
+    TNS_MSG_TYPE_FAST_AUTH,
     TNS_TYPE_BLOB,
     TNS_TYPE_CLOB,
     TNS_TYPE_LONG,
@@ -124,6 +125,7 @@ from seerdb.server.auth import (
     derive_conn_key,
     encode_challenge_oci,
     encode_result_oci,
+    find_fast_auth_osesskey,
     is_token_auth,
     make_challenge,
     parse_auth_response,
@@ -149,6 +151,7 @@ from seerdb.server.handshake import (
     encode_accept,
     encode_ano_null_reply,
     encode_dty_reply,
+    encode_fast_auth_reply,
     encode_pro_reply,
     encode_type_reply_sqlplus,
     is_ano_negotiation,
@@ -331,21 +334,33 @@ def handle_login(
     # reply so both halves speak one dialect.
     sqlplus = pro_is_sqlplus(first)
     stream.send_raw(encode_pro_reply(sqlplus=sqlplus, field_version=field_version))
-    _expect(stream, TNS_DATA, 'DTY')
-    stream.send_raw(encode_dty_reply(sqlplus=sqlplus, field_version=field_version))
-    if sqlplus:
-        # sqlplus / thick OCI runs a third data-type negotiation round after DTY
-        # (a `ttc=02` request) before it sends OSESSKEY; a thin client skips it
-        # (#265).
-        _expect(stream, TNS_DATA, 'TYPE')
-        stream.send_raw(encode_type_reply_sqlplus())
+    after_pro = _expect(stream, TNS_DATA, 'DTY')
+    # 23ai fast-auth (§20): a client at field version >= 18 cannot use the legacy
+    # three-message handshake (the server rejects it with ORA-03146), so after the
+    # bare PRO it sends one FAST_AUTH packet bundling DTY + OSESSKEY. The DTY and
+    # OSESSKEY replies then ride back together (below), not as separate rounds.
+    fast_auth = after_pro[:1] == bytes([TNS_MSG_TYPE_FAST_AUTH])
+    if fast_auth:
+        offset = find_fast_auth_osesskey(after_pro, field_version)
+        if offset < 0:
+            raise InterfaceError('fast-auth bundle carried no OSESSKEY')
+        osesskey = after_pro[offset:]
+    else:
+        # Legacy: the packet just read is the DTY; answer it and read OSESSKEY next.
+        stream.send_raw(encode_dty_reply(sqlplus=sqlplus, field_version=field_version))
+        if sqlplus:
+            # sqlplus / thick OCI runs a third data-type negotiation round after
+            # DTY (a `ttc=02` request) before it sends OSESSKEY; a thin client
+            # skips it (#265).
+            _expect(stream, TNS_DATA, 'TYPE')
+            stream.send_raw(encode_type_reply_sqlplus())
+        osesskey = _expect(stream, TNS_DATA, 'OSESSKEY')
 
     # --- O5LOGON (§4) ---
     # The same mutual-auth crypto drives both dialects; only the wire marshalling
     # differs. The thin form carries each phase as an RPA payload
     # (write_packet); the deadbeef/OCI form (#265) exchanges full packets built
     # from captured 11g templates (send_raw), so sqlplus / thick OCI logs in too.
-    osesskey = _expect(stream, TNS_DATA, 'OSESSKEY')
     # Token auth (#125): a thin client with an access token sends a single token
     # AUTH here instead of OSESSKEY. When the Mirror is configured to accept
     # tokens, verify the OCI IAM signature (offline-checkable) and grant the
@@ -373,7 +388,17 @@ def handle_login(
         )
     else:
         challenge = make_challenge(secret.encode('utf-8'))
-        stream.write_packet(TNS_DATA, encode_challenge(challenge))
+        # Fast-auth expects the challenge bundled with the PRO + DTY replies it
+        # deferred; legacy sends the challenge on its own.
+        if fast_auth:
+            stream.write_packet(
+                TNS_DATA,
+                encode_fast_auth_reply(
+                    encode_challenge(challenge), field_version=field_version
+                ),
+            )
+        else:
+            stream.write_packet(TNS_DATA, encode_challenge(challenge))
         _, client_sesskey, auth_password = parse_auth_response(
             _expect(stream, TNS_DATA, 'AUTH'), field_version
         )

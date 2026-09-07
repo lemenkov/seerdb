@@ -418,6 +418,17 @@ def encode_ano_null_reply(*, sdu: int = DEFAULT_SDU) -> bytes:
     return packet
 
 
+def encode_fast_auth_reply(challenge: bytes, *, field_version: int) -> bytes:
+    """The bundled reply a client\'s 23ai FAST_AUTH packet expects (§20): the PRO
+    reply payload, the DTY reply payload, and the OSESSKEY auth challenge, in one
+    ``DATA`` body. The client scans it for the challenge RPA
+    (:func:`find_fast_auth_rpa`) and finishes O5LOGON exactly as the legacy
+    three-message handshake does. ``challenge`` is :func:`encode_challenge`\'s RPA
+    payload; the caller frames the whole thing with ``write_packet``.
+    """
+    return build_caps_block_reply(field_version) + build_dty_type_reply() + challenge
+
+
 def encode_pro_reply(
     *,
     sqlplus: bool = False,

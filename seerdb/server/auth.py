@@ -64,6 +64,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_12_2,
+    FIELD_VERSION_23_1,
     TTI_AUTH,
     TTI_FUN,
     TTI_RPA,
@@ -291,7 +292,16 @@ def _parse_fun_auth(
     if len(payload) < 4 or payload[0] != TTI_FUN:
         raise InterfaceError('not a TTI_FUN message')
     subtype = payload[1]
-    rest = payload[4:]  # skip TTI_FUN, subtype, seq, 0x01
+    rest = payload[3:]  # skip TTI_FUN, subtype, seq
+    # At fv > 17 the OAUTH (phase-two AUTH) header carries a `0` has-user pointer
+    # byte before the `0x01` marker (PROTOCOL.md §20.3), which the phase-one
+    # OSESSKEY does not — so detect it rather than assume by subtype: when the
+    # byte after the sequence is not the `0x01` marker, it is that extra pointer,
+    # consume it. Below fv 18 there is never one, so this reduces to the
+    # historical single-byte skip (payload[4:]).
+    if field_version > FIELD_VERSION_23_1 and rest[:1] != b'\x01':
+        _has_user, rest = decode_ub4(rest)
+    rest = rest[1:]  # skip the 0x01 marker
     userlen, rest = decode_ub4(rest)
     _mode, rest = decode_ub4(rest)
     rest = rest[1:]  # skip the 0x01 has-more byte
@@ -319,6 +329,28 @@ def parse_osesskey(payload: bytes, field_version: int = FIELD_VERSION_11_2) -> b
 # constant (confirmed against live sqlplus 11.2 for usernames of different
 # lengths), so the ub1-length-prefixed username sits at a fixed offset (#265):
 #   03(TTI_FUN) subtype seq | IND | ub4 ub4 | IND | ub4 ub4 | IND | IND | ub1+user
+
+
+def find_fast_auth_osesskey(body: bytes, field_version: int) -> int:
+    """Offset of the OSESSKEY (phase-one auth) message inside a client FAST_AUTH
+    bundle — the server counterpart of the client's ``find_fast_auth_rpa``. The
+    bundle is a ``0x22`` header, the PRO message, five bytes, a version byte, the
+    DTY message, then the OSESSKEY as the tail (§20). The OSESSKEY leads with
+    ``TTI_FUN TTI_SESS`` (``03 76``), but the DTY type table carries those bytes
+    too, so accept the first ``03 76`` whose :func:`parse_osesskey` yields a
+    plausible (printable, non-empty) username rather than trusting the position.
+    """
+    marker = bytes([TTI_FUN, TTI_SESS])
+    for off in range(len(body) - 1):
+        if body[off : off + 2] != marker:
+            continue
+        try:
+            user = parse_osesskey(body[off:], field_version)
+        except Exception:
+            continue
+        if user and all(0x20 <= b < 0x7F for b in user):
+            return off
+    return -1
 
 
 def _parse_oci_fun_username(payload: bytes, subtype: int, what: str) -> bytes:
