@@ -1526,3 +1526,54 @@ def test_dictionary_views_reflect_an_identity_column() -> None:
         backend.commit()
     finally:
         backend.close()
+
+
+def test_utl_raw_functions() -> None:
+    # UTL_RAW is installed as PostgreSQL functions in a utl_raw schema (orafce ships
+    # none), so a schema-qualified Oracle call round-trips RAW/bytea (#765).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+
+        def scalar(sql: str):
+            return backend.execute(sql).rows[0][0]
+
+        # CAST_TO_RAW / CAST_TO_VARCHAR2 round-trip a string through its bytes.
+        assert scalar("SELECT rawtohex(utl_raw.cast_to_raw('ABC'))") == '414243'
+        assert scalar("SELECT utl_raw.cast_to_varchar2(hextoraw('414243'))") == 'ABC'
+        # LENGTH, SUBSTR (1-based; negative counts from the end), CONCAT.
+        assert scalar("SELECT utl_raw.length(hextoraw('DEADBEEF'))") == 4
+        assert scalar(
+            "SELECT rawtohex(utl_raw.substr(hextoraw('DEADBEEF'), 2, 2))"
+        ) == ('ADBE')
+        assert (
+            scalar("SELECT rawtohex(utl_raw.substr(hextoraw('DEADBEEF'), -1))") == 'EF'
+        )
+        assert (
+            scalar(
+                "SELECT rawtohex(utl_raw.concat(hextoraw('DEAD'), hextoraw('BEEF')))"
+            )
+            == 'DEADBEEF'
+        )
+        # Bitwise ops; the tail of the longer operand is appended, like Oracle.
+        assert (
+            scalar(
+                "SELECT rawtohex(utl_raw.bit_and(hextoraw('F0F0'), hextoraw('FF00')))"
+            )
+            == 'F000'
+        )
+        assert (
+            scalar(
+                "SELECT rawtohex(utl_raw.bit_or(hextoraw('F000'), hextoraw('0F0F')))"
+            )
+            == 'FF0F'
+        )
+        assert (
+            scalar("SELECT rawtohex(utl_raw.bit_xor(hextoraw('FF'), hextoraw('0F')))")
+            == 'F0'
+        )
+        assert (
+            scalar("SELECT rawtohex(utl_raw.bit_and(hextoraw('FFFF'), hextoraw('F0')))")
+            == 'F0FF'
+        )
+    finally:
+        backend.close()

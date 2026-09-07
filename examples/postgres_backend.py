@@ -224,6 +224,51 @@ _HELPER_FUNCTIONS_DDL = (
 )
 
 
+# UTL_RAW — Oracle's RAW/bytea manipulation package (#765). orafce does not ship
+# it, so the backend installs it as PostgreSQL functions in a `utl_raw` schema, and
+# a schema-qualified Oracle call (UTL_RAW.CAST_TO_RAW(...)) resolves to it
+# case-insensitively. Bytes are the DB charset (UTF-8) for the varchar2/raw casts;
+# BIT_AND/OR/XOR follow Oracle's rule that the unprocessed tail of the longer
+# operand is appended after the shorter one runs out.
+_UTL_RAW_DDL = """
+CREATE SCHEMA IF NOT EXISTS utl_raw;
+CREATE OR REPLACE FUNCTION utl_raw.cast_to_raw(text) RETURNS bytea
+  LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT convert_to($1, 'UTF8') $$;
+CREATE OR REPLACE FUNCTION utl_raw.cast_to_varchar2(bytea) RETURNS text
+  LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT convert_from($1, 'UTF8') $$;
+CREATE OR REPLACE FUNCTION utl_raw.length(bytea) RETURNS integer
+  LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT length($1) $$;
+CREATE OR REPLACE FUNCTION utl_raw.substr(bytea, integer, integer DEFAULT NULL)
+  RETURNS bytea LANGUAGE sql IMMUTABLE AS $$
+    SELECT CASE WHEN $2 = 0 THEN NULL
+      WHEN $2 < 0 THEN substring($1 from length($1) + $2 + 1 for coalesce($3, length($1)))
+      ELSE substring($1 from $2 for coalesce($3, length($1))) END $$;
+CREATE OR REPLACE FUNCTION utl_raw.concat(VARIADIC bytea[]) RETURNS bytea
+  LANGUAGE sql IMMUTABLE AS $$
+    SELECT coalesce(string_agg(x, ''::bytea), ''::bytea) FROM unnest($1) AS x $$;
+CREATE OR REPLACE FUNCTION utl_raw._bitop(a bytea, b bytea, op char) RETURNS bytea
+  LANGUAGE plpgsql IMMUTABLE AS $$
+  DECLARE n int := least(length(a), length(b)); r bytea := ''::bytea; i int; v int;
+  BEGIN
+    FOR i IN 0 .. n - 1 LOOP
+      v := CASE op WHEN '&' THEN get_byte(a, i) & get_byte(b, i)
+                   WHEN '|' THEN get_byte(a, i) | get_byte(b, i)
+                   ELSE get_byte(a, i) # get_byte(b, i) END;
+      r := r || decode(lpad(to_hex(v), 2, '0'), 'hex');
+    END LOOP;
+    IF length(a) > n THEN r := r || substring(a from n + 1);
+    ELSIF length(b) > n THEN r := r || substring(b from n + 1); END IF;
+    RETURN r;
+  END $$;
+CREATE OR REPLACE FUNCTION utl_raw.bit_and(bytea, bytea) RETURNS bytea
+  LANGUAGE sql IMMUTABLE AS $$ SELECT utl_raw._bitop($1, $2, '&') $$;
+CREATE OR REPLACE FUNCTION utl_raw.bit_or(bytea, bytea) RETURNS bytea
+  LANGUAGE sql IMMUTABLE AS $$ SELECT utl_raw._bitop($1, $2, '|') $$;
+CREATE OR REPLACE FUNCTION utl_raw.bit_xor(bytea, bytea) RETURNS bytea
+  LANGUAGE sql IMMUTABLE AS $$ SELECT utl_raw._bitop($1, $2, '#') $$;
+"""
+
+
 # Oracle data-dictionary emulation (#759): the SYS_CONTEXT userenv function and a
 # minimal set of Oracle-shaped catalog views over pg_catalog / information_schema,
 # so a reflecting client (SQLAlchemy's Oracle dialect, ORMs) finds the metadata it
@@ -1508,6 +1553,11 @@ class PostgresBackend:
         # empty_blob return the LOB domains just created, so this runs after them.
         try:
             self._conn.execute(_HELPER_FUNCTIONS_DDL)
+        except psycopg.Error:
+            self._conn.rollback()
+        # UTL_RAW as PostgreSQL functions (orafce ships no utl_raw) (#765).
+        try:
+            self._conn.execute(_UTL_RAW_DDL)
         except psycopg.Error:
             self._conn.rollback()
         # Oracle data-dictionary emulation (#759): SYS_CONTEXT + catalog views.
