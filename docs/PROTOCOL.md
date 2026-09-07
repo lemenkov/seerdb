@@ -1499,10 +1499,16 @@ rest carried:
 - each non-last column carries a `1` **continuation flag** three bytes before its
   end and a **describe-timestamp entry** in its post-name region (the last column
   leaves both zero);
-- the describe **timestamp** and **object id** are instance-specific — and sqlplus
+- the describe **timestamp** and **object ids** are instance-specific — and sqlplus
   *rejects a describe reply whose timestamp / object id are zero* (it silently waits
   for more, unlike the query describe which tolerates a zeroed timestamp), so both
-  must be valid. The **object id** stays carried from the capture; the **timestamp**
+  must be valid. The **object ids** are the described object's dictionary identity —
+  its `DBA_OBJECTS` **object id** (`_OCI_DESC_OBJECT_ID`, 446 in the capture) and
+  **data-object id** (`_OCI_DESC_DATA_OBJECT_ID`, 116036), each a ub4 LE the header
+  carries. They are real identities the Mirror has no source for, so they stay
+  carried from the capture (a synthetic id would need live validation, like the DML
+  rowid); naming them is what turns the header's recurring `be010000` / `44c50100`
+  runs into fields rather than opaque bytes. The **timestamp**
   is **generated** — it is one 7-byte Oracle DATE (the moment the dictionary row was
   analyzed), and the Mirror reports the current time, the truthful analyze time,
   via `_oci_desc_timestamp()`. One generated value is threaded through every site it
