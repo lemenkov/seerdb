@@ -220,6 +220,22 @@ def test_translate_binds_wraps_interval_ym_as_make_interval() -> None:
     assert neg == {'b1': -14}
 
 
+def test_translate_binds_escapes_literal_percent() -> None:
+    # psycopg reads a bound query as a format string, so a literal % (a LIKE
+    # pattern, or a column name) must be doubled or it looks like a broken
+    # placeholder; the generated %(name)s placeholders stay single.
+    sql, params = _translate_binds(
+        "SELECT id FROM t WHERE data LIKE '%' || :d || '%' ESCAPE '/'", ['b/%cde']
+    )
+    assert sql == "SELECT id FROM t WHERE data LIKE '%%' || %(d)s || '%%' ESCAPE '/'"
+    assert params == {'d': 'b/%cde'}
+    # A % inside a (double-quoted) identifier is doubled too.
+    ident_sql, _ = _translate_binds(
+        'INSERT INTO t (id, "%pct") VALUES (:id, :v)', [1, 'n']
+    )
+    assert ident_sql == 'INSERT INTO t (id, "%%pct") VALUES (%(id)s, %(v)s)'
+
+
 def test_to_interval_ym_from_ora_interval() -> None:
     # An OraInterval (a timedelta carrying the whole-month count) → an IntervalYM;
     # IntervalYM normalises the split and shares the sign (#504). A None passes.

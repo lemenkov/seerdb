@@ -548,7 +548,9 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
     (``:x … :x``) is one value, and a ``:`` inside a string literal is not a bind
     — both of which a blind ``:name`` → ``%s`` substitution gets wrong. Distinct
     binds map to ``binds`` in first-appearance order (positional ``:1 :2`` and a
-    single dict/list of values both land correctly)."""
+    single dict/list of values both land correctly). A literal ``%`` in the text
+    (a LIKE pattern, a column name) is doubled: psycopg treats the bound query as
+    a format string, so a bare ``%`` would be read as a broken placeholder."""
     values = list(binds)
     names: list[str] = []  # distinct bind names, in first-appearance order
     out: list[str] = []
@@ -561,7 +563,7 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
             out.append(char)
             i += 1
             while i < n:
-                out.append(sql[i])
+                out.append(sql[i].replace('%', '%%'))
                 if sql[i] == "'" and not (i + 1 < n and sql[i + 1] == "'"):
                     i += 1
                     break
@@ -597,7 +599,7 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
                 out.append(f'%({key})s')
             i = match.end()
             continue
-        out.append(char)
+        out.append(char.replace('%', '%%'))
         i += 1
     params: dict = {}
     for idx, name in enumerate(names):
