@@ -4828,8 +4828,11 @@ _OCI_VERSION_TRAILER = _oci_version_trailer(11, 2, 0, 2)  # XE 11.2.0.2.0
 
 
 # A 3-byte marker in the describe-column trailer. Load-bearing by position — the
-# client draws ORA-03113 if it is zeroed (§36) — but its byte values' meaning is
-# unpinned: carried verbatim as capture ground truth, not decoded (§39.2).
+# client draws ORA-03113 if it is zeroed (§36). Its byte values' meaning stays
+# opaque, but differential capture (11g / 21c / 23ai, 2026-09-07) confirms it is
+# a FIXED marker: byte-identical in the describe reply of all three, with the
+# same preceding frame — a stable protocol constant, not version-specific, so it
+# is correctly carried (§39.2).
 _OCI_DCB_MARKER = bytes.fromhex('060122')
 
 
@@ -4869,11 +4872,15 @@ def _oci_exec_oer(sequence: int) -> bytes:
 # error OER, the LONG-row fetch status, and the LOB-row fetch status — are this
 # one envelope differing only in a handful of named fields, so build them rather
 # than storing three near-identical blobs. The bulk (SCN/rowid/instance region,
-# the fixed 0x20f6310a marker) is the same fixed frame; the fields below vary.
-# FIXME: the offset-56 ub2 (0x0136 = 310) looks like the session's negotiated
-# TTC protocol version (the 0x013x family; the Mirror pins 11g at 314) but is
-# emitted as the captured constant, unconfirmed. Offsets 7 and 52 (both 0x01)
-# are unnamed constants carried from the capture. See §36.1.
+# the 0x20f6310a marker at offset 72) is the same fixed frame; the fields below
+# vary. Differential capture settled the once-mysterious fields (sqlplus through
+# tools/capture_proxy.py against 11g, 21c and 23ai, 2026-09-07): the offset-56
+# ub2 0x0136 (310) and the offset-72 0x20f6310a marker are FIXED 11g OER-trailer
+# constants — byte-identical across every 11g reply (SELECT / DML / DDL / fetch)
+# and ABSENT from 21c / 23ai, which replace the whole trailer with a different
+# one. So 310 is NOT the negotiated TTC protocol version (the earlier guess): it
+# does not track the server, it is an 11g-format constant, correctly carried.
+# Offsets 7 and 52 (both 0x01) are likewise fixed 11g constants. See §36.1.
 _OCI_OER_ENVELOPE = bytes.fromhex(
     '04000000000000010000000000000000000002000000030000000000000000000000'
     '00000000000000000000000000000000000001000000360100000000000000000000'
@@ -4964,6 +4971,10 @@ def _oci_fetch_oer_header(sequence: int) -> bytes:
 # The one instance constant inside the end-of-fetch OER (§36) — the same
 # `f6 31 0a` marker that recurs as `20 f6 31 0a` in _OCI_OER_ENVELOPE. Carried
 # verbatim as capture ground truth; its meaning is unpinned, not decoded (§39.2).
+# The 3-byte marker in the 11g OER trailer (as 0x20f6310a at envelope offset 72,
+# and standalone in the end-of-fetch OER). A fixed 11g OER-format constant —
+# differential capture (2026-09-07) shows it byte-identical across every 11g
+# reply and absent from 21c / 23ai (§39.2); carried, meaning opaque.
 _OCI_FETCH_CONST = bytes.fromhex('f6310a')
 
 

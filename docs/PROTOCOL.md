@@ -4657,8 +4657,8 @@ to real 11g, varying one thing at a time. Offsets are from the `0x04` token:
 | `27..40` | | rowid of the touched row (DML only) | capture-specific; the Mirror reuses a fixed frame |
 | `49..51` | ub2 LE | echo of the sequence field | `sequence + 2` for row/return statuses; `0` in the outbind reply |
 | `52` | 1 | constant `0x01` | constant across captures |
-| `56..58` | ub2 LE | TTC protocol version — `0x0136` (310) | in the TNS-version family (the Mirror pins 11g at 314 = `0x013a`); carried from the 11.2 capture |
-| `72..76` | | fixed `20 f6 31 0a` instance marker | constant across captures |
+| `56..58` | ub2 LE | fixed 11g constant — `0x0136` (310) | **not** the TTC version (disproven by differential capture: absent from 21c/23ai, which replace the whole trailer); an 11g OER-format constant, carried |
+| `72..76` | | fixed `20 f6 31 0a` marker | an 11g OER-trailer constant; byte-identical across every 11g reply, absent from 21c/23ai |
 
 The rest of the 136-byte frame (SCN region, cursor/rowid slots) is a fixed
 zero-filled envelope. For an error, the `ORA-NNNNN: <message>` DALC follows the
@@ -4832,19 +4832,22 @@ because the Mirror pins 11.2, not because their meaning is unknown.
 | OCI describe column trailer | 13 B + 23 B | the zeroed post-name block (`_OCI_DCB_COL_POSTNAME`) and cursor-uuid preamble on `encode_describe_oci` | **computed** — every meaningful field (type/precision/scale/length/charset/csfrm/max_size/null_ok/name) is built; only the describe-timestamp / instance-id region the client skips is emitted as zeros |
 | OER return-status trailers | var | the execute / DML / DDL / fetch / commit / logoff status envelopes | **computed** — reduced to load-bearing structure (§36); meaningful fields parameterized. Opaque regions are mostly **zeroed** (a real reply's describe timestamp, SCN and counts, which the client skips), but a few are **carried verbatim** because zeroing them breaks the client — see below |
 
-Not every opaque byte can be zeroed. Three small markers are **carried verbatim
-as capture ground truth** — load-bearing by position but with their byte values'
-meaning unpinned (not decoded, not invented):
+Not every opaque byte can be zeroed. Three small markers are **carried** —
+load-bearing by position, their byte values' meaning still opaque, but their
+*nature* pinned by a differential capture (sqlplus through `tools/capture_proxy.py`
+against 11g, 21c and 23ai, 2026-09-07):
 
-| Marker | Where | Why carried |
-|--------|-------|-------------|
-| `06 01 22` (`_OCI_DCB_MARKER`) | describe-column trailer, offset 33 | client draws ORA-03113 if zeroed |
-| `f6 31 0a` (`_OCI_FETCH_CONST`) | end-of-fetch OER; recurs as `20 f6 31 0a` in `_OCI_OER_ENVELOPE` | fixed instance marker the client expects |
+| Marker | Where | Finding |
+|--------|-------|---------|
+| `06 01 22` (`_OCI_DCB_MARKER`) | describe-column trailer, offset 33 | client draws ORA-03113 if zeroed; **version-independent** — byte-identical in the describe reply of all three servers |
+| `f6 31 0a` (`_OCI_FETCH_CONST`) | end-of-fetch OER; recurs as `20 f6 31 0a` at `_OCI_OER_ENVELOPE` offset 72 | a **fixed 11g OER-trailer constant** — identical across every 11g reply, absent from 21c/23ai (which replace the whole trailer) |
 | touched-row **rowid** (`_OCI_DML_ROWID`) | DML status OER, offsets 27..40, echoed byte-swapped in the trailer | real physical row identity; a synthetic value is unvalidated |
 
-These are the residual undecoded bytes on the query path. Decoding them further
-needs real SCN/rowid/marker ground truth from a differential capture across
-servers, **not** guessed meanings.
+The capture also disproved a standing guess: the OER offset-56 `0x0136` (310) is
+**not** the negotiated TTC protocol version — it does not track the server (21c
+and 23ai lack it entirely), it is another fixed 11g OER-format constant. What
+stays undecoded is only the *meaning* of these fixed bytes, not their nature or
+their version-dependence; both are now settled.
 
 ### 39.3 The version-call trailer, decoded
 
