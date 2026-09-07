@@ -275,6 +275,32 @@ def test_translate_ddl_strips_char_byte_length_semantics() -> None:
     assert 'varchar(20)' in out and 'char(1)' in out.lower()
 
 
+def test_translate_ddl_rewrites_create_sequence_keywords() -> None:
+    # Oracle's NOMINVALUE / NOMAXVALUE / NOCYCLE are single words PostgreSQL spells
+    # as two; NOCACHE has no PostgreSQL equal (minimum cache is 1) and ORDER /
+    # NOORDER is a RAC hint with none, so it is dropped. Shared clauses pass through.
+    out = _translate_ddl(
+        'CREATE SEQUENCE s NOMINVALUE NOMAXVALUE NOCYCLE NOCACHE NOORDER'
+    )
+    assert out == 'CREATE SEQUENCE s NO MINVALUE NO MAXVALUE NO CYCLE CACHE 1'
+    assert (
+        _translate_ddl('CREATE SEQUENCE s START WITH 5 INCREMENT BY 2 CACHE 20')
+        == 'CREATE SEQUENCE s START WITH 5 INCREMENT BY 2 CACHE 20'
+    )
+
+
+def test_translate_idioms_rewrites_sequence_pseudocolumns() -> None:
+    # Oracle's seq.nextval / seq.currval are PostgreSQL nextval('seq') / currval('seq').
+    assert (
+        _translate_idioms('INSERT INTO t (id) VALUES (my_seq.nextval)')
+        == "INSERT INTO t (id) VALUES (nextval('my_seq'))"
+    )
+    assert (
+        _translate_idioms('SELECT my_seq.currval FROM dual')
+        == "SELECT currval('my_seq') FROM dual"
+    )
+
+
 def test_translate_admin_maps_session_user_and_index() -> None:
     # Oracle session/user admin → PostgreSQL: schema resolution is search_path, a
     # user is a schema, and grants/tablespace admin no-op; a schema-qualified index
