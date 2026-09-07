@@ -635,9 +635,10 @@ _DDL_TYPE_REWRITES = [
     # A `REF <object type>` column (#139). PostgreSQL has no REF, but the REF-bind
     # column is only exercised by the 12c+ path the suite skips on the 11g Mirror —
     # the CREATE just has to succeed — so the column becomes a bytea placeholder.
-    # Matched before the object type name is otherwise touched; `REF(` (a REF()
+    # The column name before REF is kept: it anchors the match to a REF *type*, so
+    # a column merely *named* `ref` (ref INTEGER) is left alone. `REF(` (a REF()
     # call) has no space and is not matched.
-    (re.compile(r'\bREF\s+\w+', re.IGNORECASE), 'bytea'),
+    (re.compile(r'\b(\w+)\s+REF\s+\w+', re.IGNORECASE), r'\1 bytea'),
     (re.compile(r'\bLONG\s+RAW\b', re.IGNORECASE), 'bytea'),
     (re.compile(r'\bRAW\s*\(\s*\d+\s*\)', re.IGNORECASE), 'bytea'),
     (re.compile(r'\bRAW\b', re.IGNORECASE), 'bytea'),

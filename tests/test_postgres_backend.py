@@ -180,6 +180,11 @@ def test_translate_ddl_maps_ref_column_to_bytea() -> None:
     assert _translate_ddl('CREATE TABLE people OF PYORACLE_REF_PERSON') == (
         'CREATE TABLE people OF PYORACLE_REF_PERSON'
     )
+    # A column merely NAMED `ref` (with an ordinary type) is not a REF type, so
+    # it is left alone — the match is anchored to a column name before REF, which
+    # a leading `ref INTEGER` has none of (BizarroCharacterTest, #10275).
+    named = _translate_ddl('CREATE TABLE other (id INTEGER, ref INTEGER)')
+    assert 'ref integer' in named.lower() and 'bytea' not in named
 
 
 def test_ref_select_matches_the_object_ref_fetch() -> None:
