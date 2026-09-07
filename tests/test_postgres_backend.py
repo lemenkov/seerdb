@@ -281,7 +281,7 @@ def test_translate_admin_maps_session_user_and_index() -> None:
     # name loses the qualifier (#759).
     assert (
         _translate_admin('ALTER SESSION SET CURRENT_SCHEMA = TEST_SCHEMA')
-        == 'SET search_path TO test_schema, public, oracle'
+        == 'SET search_path TO test_schema, public, oracle, sys'
     )
     assert (
         _translate_admin('CREATE USER test_schema IDENTIFIED BY secret')
