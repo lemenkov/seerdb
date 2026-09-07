@@ -107,6 +107,7 @@ from seerdb.server import (
     UnsupportedFeature,
     credential_lookup,
 )
+from seerdb.server.identity import IDENTITY_12_1
 
 # The PostgreSQL composite type that backs Oracle's TIMESTAMP WITH TIME ZONE
 # (#519). A native timestamptz stores UTC and hands the value back in the session
@@ -340,6 +341,11 @@ _ORACLE_DICTIONARY_DDL = (
     'oid::bigint AS user_id, NULL::timestamp AS created FROM pg_namespace '
     "WHERE nspname NOT LIKE 'pg\\_%' "
     "AND nspname NOT IN ('information_schema','oracle','sys');"
+    # all_tab_identity_cols: an identity column is a PostgreSQL identity column
+    # (pg_attribute.attidentity 'a'=ALWAYS, 'd'=BY DEFAULT). The dialect JOINs this
+    # on every get_columns once it believes the server is 12c, so it must exist or
+    # reflection raises ORA-00942. Options are reported as Oracle's defaults for now.
+    """CREATE OR REPLACE VIEW sys.all_tab_identity_cols AS SELECT ora_owner(n.nspname) AS owner, ora_name(c.relname) AS table_name, ora_name(a.attname) AS column_name, CASE a.attidentity WHEN 'a' THEN 'ALWAYS' ELSE 'BY DEFAULT' END AS generation_type, ora_name(c.relname || '_' || a.attname || '_seq') AS sequence_name, 'START WITH: 1, INCREMENT BY: 1, MAX_VALUE: 9999999999999999999999999999, MIN_VALUE: 1, CYCLE_FLAG: N, CACHE_SIZE: 20, ORDER_FLAG: N' AS identity_options FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE a.attidentity IN ('a','d') AND NOT a.attisdropped AND a.attnum>0 AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"""
     'CREATE OR REPLACE VIEW sys.all_objects AS SELECT '
     "CASE WHEN n.nspname LIKE 'pg_temp%' THEN upper(current_schema()) "
     'ELSE upper(n.nspname) END AS owner, '
@@ -943,6 +949,18 @@ _IDIOM_REWRITES = [
         re.compile(r'\b([A-Za-z_][\w$#.]*)\.currval\b', re.IGNORECASE),
         r"currval('\1')",
     ),
+    # The SQL-standard OFFSET/FETCH the 12c dialect emits: PostgreSQL accepts only a
+    # restricted expression before ROWS, so `OFFSET 1 + 2 ROWS` is a syntax error
+    # while `OFFSET (1 + 2) ROWS` is fine. Wrap the operand in parentheses (a bare
+    # literal or bind is already valid, and the extra parens are harmless there).
+    (
+        re.compile(r'\bOFFSET\s+(.+?)\s+ROWS\b', re.IGNORECASE),
+        r'OFFSET (\1) ROWS',
+    ),
+    (
+        re.compile(r'\bFETCH\s+(FIRST|NEXT)\s+(.+?)\s+ROWS\b', re.IGNORECASE),
+        r'FETCH \1 (\2) ROWS',
+    ),
     # A CAST to an Oracle string type in DML (CAST(x AS VARCHAR2(50 CHAR))): the
     # column-type rewrites only fire on CREATE TABLE, so translate the string type
     # and drop the CHAR/BYTE length qualifier here too. VARCHAR2 / NVARCHAR2 are
@@ -1364,10 +1382,15 @@ class PostgresBackend:
     """
 
     capabilities = frozenset({Capability.TRANSACTIONS})
-    # This demo presents 11.2: it cannot back the 12c+/23ai wire formats a higher
-    # advertised version would invite a client to request, so it pins the floor
-    # the whole conformance suite is baselined at (the Mirror honours this).
+    # This demo speaks the 11.2 WIRE protocol (field version): it cannot back the
+    # 12c+/23ai wire formats a higher field version would invite, so it pins the
+    # floor the whole conformance suite is baselined at. But it REPORTS release
+    # 12.1 (server_identity, read only from the login banner, never the wire), so
+    # the SQLAlchemy dialect uses native OFFSET/FETCH pagination and identity
+    # columns -- both of which PostgreSQL runs directly -- instead of Oracle's
+    # nested-ROWNUM pagination, which has no faithful PostgreSQL rewrite (#33).
     field_version = FIELD_VERSION_11_2
+    server_identity = IDENTITY_12_1
 
     def __init__(
         self, conninfo: str = '', *, credentials: Credentials | None = None
