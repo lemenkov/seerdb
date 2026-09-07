@@ -25,6 +25,7 @@ from seerdb.common.tns_consts import (
     TNS_DATA,
     TNS_TYPE_VARCHAR,
     VERSION_11_2_0_2,
+    VERSION_12_1_0_2,
     VERSION_12_2_0_1,
     VERSION_23_1_162_0,
 )
@@ -212,6 +213,65 @@ def test_live_seerdb_login_at_a_higher_field_version(version: int) -> None:
         assert cursor.fetchone() == ('X',)
         cursor.execute('select :b from dual', ['abc'])
         assert cursor.fetchone() == ('X',)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        server.join(timeout=5)
+        listen.close()
+
+    assert result.get('error') is None, result.get('error')
+    assert result.get('user') == 'PYO'
+
+
+class _Present12cBackend(_DualBackend):
+    # Declares a server identity (12.1) independent of its wire field version, which
+    # stays the 11.2 default -- the decoupling a PostgreSQL-backed Mirror uses to get
+    # the dialect's native OFFSET/FETCH without changing the wire (#33).
+    from seerdb.server.identity import IDENTITY_12_1
+
+    server_identity = IDENTITY_12_1
+
+
+def _run_present_12c_session(listen: socket.socket, result: dict) -> None:
+    conn, _ = listen.accept()
+    try:
+        result['user'] = serve_session(PacketStream(conn), _Present12cBackend())
+    except Exception as exc:  # noqa: BLE001 - surfaced to the test thread
+        result['error'] = exc
+    finally:
+        conn.close()
+
+
+def test_backend_presents_a_release_above_its_wire_version() -> None:
+    # A backend that declares server_identity is introduced at that release while the
+    # wire still negotiates its (lower) field version: the client reads the version
+    # from the login banner, so conn.version is 12.1 though the wire is 11.2 (fv 6).
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    port = listen.getsockname()[1]
+
+    result: dict = {}
+    server = threading.Thread(
+        target=_run_present_12c_session, args=(listen, result), daemon=True
+    )
+    server.start()
+
+    conn = seerdb.connect(
+        host='127.0.0.1',
+        port=port,
+        user='PYO',
+        password='pyo123',
+        service_name='XE',
+        timeout=5000,
+    )
+    try:
+        # Reported release is 12.1.0.2.0, but the negotiated wire is still 11.2 (fv 6).
+        assert conn.server_version == VERSION_12_1_0_2
+        assert conn.field_version == 6
     finally:
         try:
             conn.close()

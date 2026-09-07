@@ -452,6 +452,7 @@ DEFAULT_SID = ''
 # response. 12.2.0.1.0 is not captured: there is no 12.2 testbed, so it is the
 # release number of that line's first patch set.
 VERSION_11_2_0_2 = 0x0B200200
+VERSION_12_1_0_2 = 0x0C100200
 VERSION_12_2_0_1 = 0x0C200100
 VERSION_21_3_0_0 = 0x15030000  # which a client renders as 21.0.48.0.0
 VERSION_23_1_162_0 = 0x171A2000
