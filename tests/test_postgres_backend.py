@@ -68,6 +68,12 @@ def test_backend_error_uses_oracle_canonical_text_for_mapped_code() -> None:
     # An unmapped SQLSTATE falls back to ORA-00900 with PostgreSQL's message.
     other = _backend_error(_FakePgError('XX000', 'internal error'))
     assert other.ora_code == 900
+    # A foreign-key violation surfaces ORA-02291 (parent key not found), the code
+    # an app catches for referential integrity (#761).
+    fk = _backend_error(
+        _FakePgError('23503', 'insert or update violates foreign key constraint')
+    )
+    assert fk.ora_code == 2291
 
 
 # --- DDL type translation (#500) — a pure function, no live PostgreSQL needed ---
