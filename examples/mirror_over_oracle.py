@@ -29,9 +29,6 @@ def main() -> None:
     hostport, service = upstream.rsplit('/', 1)
     host, port = hostport.rsplit(':', 1)
 
-    # The field version the Mirror advertises (default 11.2); a 12c+/23ai value
-    # makes a thin client negotiate to it and exercises those wire formats.
-    field_version = int(os.environ.get('MIRROR_FIELD_VERSION', '6'))
     user = os.environ.get('SEERDB_TEST_USER', 'PYO')
     password = os.environ.get('SEERDB_TEST_PASSWORD', 'pyo123')
 
@@ -42,9 +39,25 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s'
     )
-    # The backend presents the version now (§ Backend.field_version): the
-    # passthrough advertises what its target speaks, so MIRROR_FIELD_VERSION
-    # flows through the backend rather than the serve() flag.
+    # The passthrough presents whatever its target speaks (§ Backend.field_version).
+    # By default that is auto-detected — probe the target once at startup and let
+    # the Mirror advertise the release it negotiates (11.2 -> fv6, 21c -> fv16,
+    # 23ai -> fv24). MIRROR_FIELD_VERSION overrides it (e.g. to force a lower
+    # version than the target, or when the target is not reachable at startup).
+    override = os.environ.get('MIRROR_FIELD_VERSION')
+    if override is not None:
+        field_version: int | None = int(override)
+    else:
+        field_version = OraclePassthroughBackend.detect_version(
+            host, int(port), service, user, password
+        )
+    logging.getLogger('seerdb.server').info(
+        'passthrough to %s:%s/%s presenting field version %s',
+        host,
+        port,
+        service,
+        field_version if field_version is not None else '(Mirror default)',
+    )
     seerdb.serve(
         '127.0.0.1',
         listen_port,
