@@ -44,6 +44,44 @@ class OraclePassthroughBackend:
 
     capabilities: frozenset[Capability] = frozenset()
 
+    @staticmethod
+    def detect_version(
+        host: str,
+        port: int,
+        service: str,
+        user: str,
+        password: str,
+        *,
+        timeout: int = 15000,
+    ) -> int | None:
+        """Probe the target once and return the field version it negotiates, so a
+        Mirror in front of it presents the same release (§ ``Backend.field_version``).
+
+        A session's own upstream connection opens in :meth:`authenticate`, which
+        runs mid-login — too late to drive the handshake the Mirror already sent.
+        So the version is learned once at startup instead, from one short-lived
+        connection. Returns ``None`` if the probe fails (the target is down, the
+        credentials are wrong); the caller then falls back to the Mirror's default.
+        """
+        try:
+            conn = seerdb.connect(
+                host=host,
+                port=port,
+                service_name=service,
+                user=user,
+                password=password,
+                timeout=timeout,
+            )
+        except Exception:
+            return None
+        try:
+            return conn.field_version
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def __init__(
         self,
         *,

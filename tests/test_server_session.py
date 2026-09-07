@@ -20,6 +20,7 @@ import seerdb
 from seerdb.common.tns import ColumnMeta
 from seerdb.common.tns_consts import (
     FIELD_VERSION_12_2,
+    FIELD_VERSION_21_1,
     FIELD_VERSION_23_4,
     TNS_DATA,
     TNS_TYPE_VARCHAR,
@@ -1245,3 +1246,53 @@ def test_live_seerdb_fast_auth_login_at_23ai() -> None:
         listen.close()
     assert result.get('error') is None, result.get('error')
     assert result.get('user') == 'PYO'
+
+
+class _Fv16Backend(_DualBackend):
+    field_version = FIELD_VERSION_21_1  # 21c
+
+
+def test_passthrough_detect_version_reads_the_negotiated_version() -> None:
+    # The passthrough auto-detects its target's release by probing it once
+    # (OraclePassthroughBackend.detect_version). Point it at a Mirror advertising
+    # 21c (fv 16) and it reads that back — the value it then presents to its own
+    # clients so a Mirror in front of a real 21c server is 21c.
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'examples'))
+    from oracle_passthrough_backend import OraclePassthroughBackend
+
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    port = listen.getsockname()[1]
+
+    def run() -> None:
+        conn, _ = listen.accept()
+        try:
+            serve_session(PacketStream(conn), _Fv16Backend())
+        except Exception:  # noqa: BLE001 - the probe just logs in and disconnects
+            pass
+        finally:
+            conn.close()
+
+    server = threading.Thread(target=run, daemon=True)
+    server.start()
+    try:
+        version = OraclePassthroughBackend.detect_version(
+            '127.0.0.1', port, 'XE', 'PYO', 'pyo123', timeout=5000
+        )
+        assert version == FIELD_VERSION_21_1
+    finally:
+        server.join(timeout=5)
+        listen.close()
+
+    # An unreachable target probes to None (the caller falls back to the default).
+    assert (
+        OraclePassthroughBackend.detect_version(
+            '127.0.0.1', 1, 'XE', 'PYO', 'pyo123', timeout=1000
+        )
+        is None
+    )
