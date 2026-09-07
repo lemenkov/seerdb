@@ -26,6 +26,7 @@ from decimal import Decimal
 _ORACLE_BIND = re.compile(r'(?<!:):\w+')
 
 from seerdb.common.tns_consts import (
+    FIELD_VERSION_11_2,
     TNS_TYPE_BLOB,
     TNS_TYPE_CLOB,
     TNS_TYPE_DATE,
@@ -162,6 +163,10 @@ class SqliteBackend:
     """
 
     capabilities = frozenset({Capability.TRANSACTIONS})
+    # This demo presents 11.2: it cannot back the 12c+/23ai wire formats a higher
+    # advertised version would invite a client to request, so it pins the floor
+    # the whole conformance suite is baselined at (the Mirror honours this).
+    field_version = FIELD_VERSION_11_2
 
     def __init__(
         self, database: str = ':memory:', *, credentials: Credentials | None = None

@@ -89,6 +89,15 @@ class OracleCompatBackend:
     def capabilities(self) -> frozenset[Capability]:
         return self._inner.capabilities
 
+    @property
+    def field_version(self) -> int | None:
+        # Present whatever the wrapped backend does (the PG/SQLite demos pin 11.2).
+        return getattr(self._inner, 'field_version', None)
+
+    @property
+    def tns_version(self) -> int | None:
+        return getattr(self._inner, 'tns_version', None)
+
     def authenticate(self, username: str) -> str | None:
         secret = self._inner.authenticate(username)
         if secret is not None:

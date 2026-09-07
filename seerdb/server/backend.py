@@ -170,6 +170,18 @@ class Backend(Protocol):
         fills. Those carry no value from the client, and the BindVar says what
         type is wanted there. Without it such a statement is refused with an ORA
         error rather than breaking the connection.
+
+    ``field_version`` (int) / ``tns_version`` (int)
+        The Oracle protocol version this backend presents. A backend that
+        declares ``field_version`` makes the Mirror advertise it -- its identity
+        (banner / release), the negotiated wire formats, and the auth parsers all
+        follow it -- so the version is the backend's to choose, not the server's
+        launch flag: the PostgreSQL / SQLite demos pin 11.2 (they cannot back the
+        12c+ formats a higher version invites), while a passthrough presents the
+        release its upstream speaks. ``tns_version`` overrides the framing version
+        derived from it (needed only above 12.2, where the derivation caps).
+        Absent (or ``None``), the Mirror uses the version it was launched with. A
+        plain class attribute satisfies these, like ``capabilities``.
     """
 
     @property
