@@ -1347,3 +1347,49 @@ def test_dictionary_views_report_desc_index_as_expression() -> None:
         backend.commit()
     finally:
         backend.close()
+
+
+def test_dictionary_views_keep_reserved_word_columns_lowercase() -> None:
+    # A reserved word (asc, desc, ...) can only be a column name when quoted, and a
+    # quoted identifier keeps its case in both Oracle and PostgreSQL. sys.ora_name()
+    # must therefore leave a reserved word lower-case rather than fold it upper the
+    # way it does a plain identifier, so reflection round-trips it (#759).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('drop table if exists reserved_cols')
+        backend.execute(
+            'CREATE TABLE reserved_cols (a NUMBER, "asc" NUMBER, "desc" NUMBER)'
+        )
+        backend.commit()
+        cols = {
+            r[0]
+            for r in backend.execute(
+                'SELECT column_name FROM all_tab_columns '
+                "WHERE table_name = 'RESERVED_COLS'"
+            ).rows
+        }
+        # A plain name folds upper; the reserved words stay exactly as stored.
+        assert cols == {'A', 'asc', 'desc'}
+        backend.execute('drop table reserved_cols')
+        backend.commit()
+    finally:
+        backend.close()
+
+
+def test_dictionary_views_list_schemas_as_users() -> None:
+    # get_schema_names()/has_schema() read all_users; every schema is an Oracle user
+    # under its upper-cased name, except the emulation layer (oracle, sys) and
+    # PostgreSQL's own schemas, which stay hidden (#759).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE SCHEMA IF NOT EXISTS unit_user_schema')
+        backend.commit()
+        users = {r[0] for r in backend.execute('SELECT username FROM all_users').rows}
+        assert 'UNIT_USER_SCHEMA' in users
+        assert 'PUBLIC' in users
+        assert 'SYS' not in users and 'ORACLE' not in users
+        assert not any(u.startswith('PG_') for u in users)
+        backend.execute('DROP SCHEMA unit_user_schema')
+        backend.commit()
+    finally:
+        backend.close()

@@ -245,10 +245,13 @@ _ORACLE_DICTIONARY_DDL = (
     # verbatim. A name that is a legal unquoted identifier (all lower-case, no
     # dots or other specials) came from an unquoted name, so upper-case it to
     # Oracle's canonical form; anything else (mixed case, dots) was quoted, so
-    # keep it exactly. This matches the dialect's normalize/denormalize round
-    # trip, so quoted mixed-case and dotted identifiers reflect back unchanged.
+    # keep it exactly. A reserved word (asc, key, ...) must be quoted in Oracle
+    # too, so it is also left as-is. This matches the dialect's normalize/
+    # denormalize round trip, so quoted mixed-case, dotted and reserved-word
+    # identifiers reflect back unchanged.
     'CREATE OR REPLACE FUNCTION sys.ora_name(text) RETURNS text LANGUAGE sql '
-    "IMMUTABLE AS $$ SELECT CASE WHEN $1 ~ '^[a-z][a-z0-9_$#]*$' THEN upper($1) "
+    "IMMUTABLE AS $$ SELECT CASE WHEN $1 ~ '^[a-z][a-z0-9_$#]*$' "
+    "AND upper($1) <> ALL (ARRAY['ALL','ALTER','AND','ANY','AS','ASC','BETWEEN','BY','CHAR','CHECK','CLUSTER','COMMENT','COMPRESS','CONNECT','CREATE','CURRENT','DATE','DECIMAL','DEFAULT','DELETE','DESC','DISTINCT','DROP','ELSE','EXCLUSIVE','EXISTS','FLOAT','FOR','FROM','GRANT','GROUP','HAVING','IDENTIFIED','IN','INDEX','INSERT','INTEGER','INTERSECT','INTO','IS','LEVEL','LIKE','LOCK','LONG','MINUS','MODE','NOCOMPRESS','NOT','NOWAIT','NULL','NUMBER','OF','ON','OPTION','OR','ORDER','PCTFREE','PRIOR','PUBLIC','RAW','RENAME','RESOURCE','REVOKE','SELECT','SET','SHARE','SIZE','SMALLINT','START','SYNONYM','TABLE','THEN','TO','TRIGGER','UID','UNION','UNIQUE','UPDATE','USER','VALUES','VARCHAR','VARCHAR2','VIEW','WHERE','WITH']) THEN upper($1) "
     'ELSE $1 END $$;'
     # Oracle-shaped catalog views over information_schema / pg_catalog. Oracle
     # treats the user as the schema and folds names upper-case, so `owner` and the
@@ -329,6 +332,14 @@ _ORACLE_DICTIONARY_DDL = (
     'FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace '
     "WHERE c.relkind IN ('r','v','m') "
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    # all_users: every schema is an Oracle user. get_schema_names()/has_schema()
+    # read username from here; the emulation schemas (oracle, sys) and PostgreSQL's
+    # own (pg_*, information_schema) are hidden, so a reflecting client sees the
+    # real schemas (public, test_schema, ...) under Oracle's upper-cased names.
+    'CREATE OR REPLACE VIEW sys.all_users AS SELECT upper(nspname) AS username, '
+    'oid::bigint AS user_id, NULL::timestamp AS created FROM pg_namespace '
+    "WHERE nspname NOT LIKE 'pg\\_%' "
+    "AND nspname NOT IN ('information_schema','oracle','sys');"
     'CREATE OR REPLACE VIEW sys.all_objects AS SELECT '
     "CASE WHEN n.nspname LIKE 'pg_temp%' THEN upper(current_schema()) "
     'ELSE upper(n.nspname) END AS owner, '
