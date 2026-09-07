@@ -5962,20 +5962,30 @@ def _oci_desc_timestamp() -> bytes:
     return _encode_temporal(datetime.datetime.now(), TNS_TYPE_DATE)
 
 
+# The dictionary identity of the described object, from the live capture: the
+# object id and the data-object (segment) id it reports, each a ub4 LE. They are
+# real DBA_OBJECTS identities the Mirror does not have, so they are carried from
+# the capture (a synthetic id would need live validation, like the DML rowid);
+# naming them turns the header's recurring `be010000` / `44c50100` runs into
+# "object id" / "data-object id" rather than opaque bytes (§39.2).
+_OCI_DESC_OBJECT_ID = struct.pack('<I', 446)  # be 01 00 00
+_OCI_DESC_DATA_OBJECT_ID = struct.pack('<I', 116036)  # 44 c5 01 00
+
 # The header's fixed framing, split around the three describe-time DALCs it carries
-# (`27 01` / `27 0b` / `27 00` — see below); the runs between are opaque
-# object-metadata framing (the `be010000` / `44c50100` object and version numbers).
+# (`27 01` / `27 0b` / `27 00` — see below) and the object numbers above; the runs
+# between are opaque object-metadata framing.
 _OCI_DESC_HDR_PRE_A = bytes.fromhex('0801000100000027010700000007')
 _OCI_DESC_HDR_PRE_B = bytes.fromhex('00000000')
 _OCI_DESC_HDR_POST_SEGMENTS = (
-    bytes.fromhex(
-        '44c50100000000000000000000010000007244c501000000000001000000be0100000027'
-        '0b0700000007'
-    ),
-    bytes.fromhex(
-        '000000000000000000000000000000000000000000010000000b0102000000be01000000'
-        '27000700000007'
-    ),
+    _OCI_DESC_DATA_OBJECT_ID
+    + bytes.fromhex('0000000000000000000100000072')
+    + _OCI_DESC_DATA_OBJECT_ID
+    + bytes.fromhex('0000000001000000')
+    + _OCI_DESC_OBJECT_ID
+    + bytes.fromhex('00270b0700000007'),
+    bytes.fromhex('000000000000000000000000000000000000000000010000000b0102000000')
+    + _OCI_DESC_OBJECT_ID
+    + bytes.fromhex('0027000700000007'),
     bytes.fromhex(
         '020000000000000000000000000000000000000000000000000000000000000000000000'
         '000000000000000000000000000000000000000000000000000000000000000000000000'
