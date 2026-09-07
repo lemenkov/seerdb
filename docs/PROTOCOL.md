@@ -1499,10 +1499,17 @@ rest carried:
 - each non-last column carries a `1` **continuation flag** three bytes before its
   end and a **describe-timestamp entry** in its post-name region (the last column
   leaves both zero);
-- the describe **timestamp** and **object id** are instance-specific — but sqlplus
-  *rejects a describe reply whose timestamp / object id are zero* (it silently
-  waits for more, unlike the query describe which tolerates a zeroed timestamp), so
-  the Mirror carries the non-zero captured values verbatim rather than zeroing them.
+- the describe **timestamp** and **object id** are instance-specific — and sqlplus
+  *rejects a describe reply whose timestamp / object id are zero* (it silently waits
+  for more, unlike the query describe which tolerates a zeroed timestamp), so both
+  must be valid. The **object id** stays carried from the capture; the **timestamp**
+  is **generated** — it is one 7-byte Oracle DATE (the moment the dictionary row was
+  analyzed), and the Mirror reports the current time, the truthful analyze time,
+  via `_oci_desc_timestamp()`. One generated value is threaded through every site it
+  appears — the header (three times) and each non-last column block — each behind a
+  `27 <field-id>` tag as a describe-time DALC (`ub4 len 7 | ub1 len 7 | date`). The
+  byte-for-byte capture test pins it to the capture's date so the rest is still
+  checked exactly.
 
 Two framing points matter: the reply body follows the 8-byte TNS header and the
 **2-byte data flags** (`00 00`) — a describe reply that folds the data flags into

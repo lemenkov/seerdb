@@ -1001,7 +1001,12 @@ def test_encode_describe_reply_oci_matches_live_11g() -> None:
         scale=2,
         null_ok=1,
     )
-    reply = encode_describe_reply_oci([col], schema=b'PYO', table=b'SEER_N')
+    # The describe timestamp is generated (the current time) in production; pin it
+    # to the capture's date here so the rest of the reply is checked byte-for-byte
+    # against the live 11g bytes.
+    reply = encode_describe_reply_oci(
+        [col], schema=b'PYO', table=b'SEER_N', timestamp=bytes.fromhex('787e09020c281b')
+    )
     assert reply == _OCI_DESCRIBE_SEER_N
 
 
@@ -1066,7 +1071,7 @@ def test_national_char_values_and_describe_ride_as_utf16be() -> None:
 
     # 3) the DESCRIBE reply carries the byte length + national flag + char length.
     def post(col: ColumnMeta) -> tuple[int, bytes]:
-        block = _oci_desc_block(col, last=True)
+        block = _oci_desc_block(col, last=True, timestamp=bytes(7))
         return block[2], block[6 + 4 + 1 + len(col.name) :]
 
     n_size, n_post = post(nchar)
@@ -1092,7 +1097,7 @@ def test_describe_reply_lays_out_interval_precisions() -> None:
     from seerdb.common.tns_consts import TNS_TYPE_INTERVALDS, TNS_TYPE_INTERVALYM
 
     def post(col: ColumnMeta) -> bytes:
-        block = _oci_desc_block(col, last=True)
+        block = _oci_desc_block(col, last=True, timestamp=bytes(7))
         return block[6 + 4 + 1 + len(col.name) :]
 
     # INTERVAL YEAR(3) TO MONTH: client carries the year precision in `precision`.
@@ -1154,7 +1159,7 @@ def test_describe_reply_puts_timestamp_precision_in_the_precision_field() -> Non
     )
 
     def post(col: ColumnMeta) -> bytes:
-        block = _oci_desc_block(col, last=True)
+        block = _oci_desc_block(col, last=True, timestamp=bytes(7))
         # The post-name region starts after the 6-byte pre + the name DALC
         # (a ub4 char length + a ub1 byte length + the name bytes).
         return block[6 + 4 + 1 + len(col.name) :]
