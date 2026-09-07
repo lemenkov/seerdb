@@ -224,6 +224,72 @@ def test_live_seerdb_login_at_a_higher_field_version(version: int) -> None:
     assert result.get('user') == 'PYO'
 
 
+class _RecordingArrayBackend(_DualBackend):
+    # Counts the INSERTs it is handed, so a test can see how many iterations of an
+    # array execute actually reached the backend.
+    def __init__(self) -> None:
+        self.inserts: list = []
+
+    def execute(self, sql: str, binds=()) -> Result:
+        if 'insert' in sql.lower():
+            self.inserts.append(list(binds))
+            return Result(rowcount=1)
+        return super().execute(sql, binds)
+
+
+def _run_recording_session(
+    listen: socket.socket, result: dict, backend: _RecordingArrayBackend
+) -> None:
+    conn, _ = listen.accept()
+    try:
+        result['user'] = serve_session(PacketStream(conn), backend)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the test thread
+        result['error'] = exc
+    finally:
+        conn.close()
+
+
+def test_empty_row_array_execute_runs_once_per_iteration() -> None:
+    # executemany of a no-bind INSERT ([[], [], []]) sends no TTI_RXD row data, only
+    # the al8i4 iteration count; the Mirror must still apply it once per iteration
+    # rather than collapsing it to a single execute (#33).
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    port = listen.getsockname()[1]
+
+    result: dict = {}
+    backend = _RecordingArrayBackend()
+    server = threading.Thread(
+        target=_run_recording_session, args=(listen, result, backend), daemon=True
+    )
+    server.start()
+
+    conn = seerdb.connect(
+        host='127.0.0.1',
+        port=port,
+        user='PYO',
+        password='pyo123',
+        service_name='XE',
+        timeout=5000,
+    )
+    try:
+        cursor = conn.cursor()
+        cursor.executemany('INSERT INTO t (id) VALUES (1)', [[], [], []])
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        server.join(timeout=5)
+        listen.close()
+
+    assert result.get('error') is None, result.get('error')
+    # All three empty iterations reached the backend, not just one.
+    assert len(backend.inserts) == 3
+
+
 def _exec_body() -> bytes:
     from seerdb.common.tns import encode_dictionary_exec
 

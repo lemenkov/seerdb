@@ -1293,7 +1293,12 @@ def _answer_query(
                 ),
             )
             return lobs
-        if len(request.bind_rows) > 1:
+        # An array execute whose every row is empty (executemany of a no-bind
+        # INSERT, [{}, {}, {}]) carries no TTI_RXD, so bind_rows is empty; its
+        # al8i4 iteration count still says how many rows to apply (#33). Stand in
+        # that many empty bind rows so the array path runs once per iteration.
+        iter_rows = request.bind_rows or [[] for _ in range(request.iterations)]
+        if len(iter_rows) > 1:
             # Array DML (executemany): apply each bind row and report the total
             # affected-row count — one execute message, one aggregated reply.
             execute_many = getattr(backend, 'execute_many', None)
@@ -1306,7 +1311,7 @@ def _answer_query(
                 # The client asked for the per-iteration affected-row counts
                 # (arraydmlrowcounts): get them from the backend and return them
                 # in front of the status (#18). Same one-round-trip array DML.
-                total, per_iter = rowcounts(sql, request.bind_rows)
+                total, per_iter = rowcounts(sql, iter_rows)
                 stream.write_packet(
                     TNS_DATA, encode_status_with_rowcounts(total, per_iter)
                 )
@@ -1319,14 +1324,14 @@ def _answer_query(
                 # its network latency once per row). A per-row failure aborts the
                 # batch — exactly Oracle's non-batcherrors behaviour. batcherrors
                 # keeps the per-row path below so each failure can be attributed.
-                result = Result(rowcount=execute_many(sql, request.bind_rows))
+                result = Result(rowcount=execute_many(sql, iter_rows))
             else:
                 # Per row: needed for batcherrors (the good rows still apply and a
                 # per-row failure is collected as (offset, code, message) rather
                 # than aborting the batch), and the fallback for a backend that
                 # offers no array path.
                 affected = 0
-                for offset, row in enumerate(request.bind_rows):
+                for offset, row in enumerate(iter_rows):
                     try:
                         affected += backend.execute(sql, row).rowcount
                     except BackendError as err:
