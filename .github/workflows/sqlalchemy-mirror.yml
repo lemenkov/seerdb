@@ -1,0 +1,137 @@
+# SPDX-FileCopyrightText: © 2026 Peter Lemenkov
+# SPDX-License-Identifier: CC0-1.0
+
+# The milestone guard for Mirror-over-PostgreSQL (mirror-pg-oracle-compat, #33):
+# does the SQLAlchemy Oracle dialect's compliance suite still pass when served
+# from PostgreSQL through the Mirror? sqlalchemy.yml runs that suite against a
+# real Oracle (the driver's release gate); this runs it against the PostgreSQL
+# backend the Mirror translates for. PostgreSQL comes from the repo's own
+# orafce image; the dialect is checked out at its master (the milestone ships
+# the two together); the Mirror runs in the background of the test step so it
+# is torn down with it.
+#
+# The whole suite runs except two classes that are inherent limits of a
+# PostgreSQL backend, not fixable gaps, and are documented as such in
+# examples/postgres_backend.py: TrueDivTest (Oracle's float `/` vs PostgreSQL's
+# integer `/`) and NormalizedNameTest (a quoted lower-case identifier is
+# indistinguishable from an unquoted one once PostgreSQL folds both to
+# lower-case). This is a two-class denylist over the full suite, not a curated
+# allowlist.
+name: SQLAlchemy (Mirror over PostgreSQL)
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'seerdb/**'
+      - 'examples/**'
+      - 'tools/**'
+      - 'pyproject.toml'
+      - '.github/workflows/sqlalchemy-mirror.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'seerdb/**'
+      - 'examples/**'
+      - 'tools/**'
+      - 'pyproject.toml'
+      - '.github/workflows/sqlalchemy-mirror.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mirror-compliance:
+    name: SQLAlchemy compliance (Mirror over PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build and start PostgreSQL with orafce
+        run: |
+          docker build -f examples/mirror-pg.Dockerfile -t mirror-pg .
+          docker run -d --name mirror-pg -p 5433:5432 \
+            -e POSTGRES_USER=pyo -e POSTGRES_PASSWORD=pyo123 -e POSTGRES_DB=mirror \
+            mirror-pg
+          # The image's first boot runs a temporary socket-only server for its
+          # init scripts and shuts it down before the real one starts, so probe
+          # over TCP, which only the real server answers. orafce is a hard
+          # requirement of the backend: prove it loads and its functions resolve
+          # as part of the readiness check, or fail here.
+          for i in $(seq 1 60); do
+            if docker exec mirror-pg psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U pyo -d mirror \
+                 -c "CREATE EXTENSION IF NOT EXISTS orafce" \
+                 -c "SELECT oracle.nvl(NULL::text, 'orafce ok'), oracle.add_months(DATE '2026-01-31', 1)"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL with orafce never became ready"; docker logs mirror-pg; exit 1
+      # The dialect ships with the milestone, so the guard tracks its master;
+      # the compliance harness (test/, conftest.py, the mandatory test.cfg) is
+      # in that checkout and pytest runs from there.
+      - name: Check out the dialect
+        uses: actions/checkout@v7
+        with:
+          repository: seerdb/sqlalchemy-seerdb
+          ref: master
+          path: dialect
+      - name: Install the dialect and this driver
+        run: |
+          pip install "./dialect[test]" "psycopg[binary]"
+          # This checkout's driver on top: master carries the last release's
+          # version string, so force the reinstall over the dialect's floor.
+          pip install --force-reinstall --no-deps .
+      - name: Which driver and dialect this run uses
+        run: |
+          python -c "import seerdb, inspect, pathlib; print('driver from:', pathlib.Path(inspect.getfile(seerdb)).parent)"
+          python -c "import sqlalchemy_seerdb, inspect, pathlib; print('dialect from:', pathlib.Path(inspect.getfile(sqlalchemy_seerdb)).parent)"
+      - name: Run the compliance suite through the Mirror
+        working-directory: dialect
+        env:
+          MIRROR_PG: "host=localhost port=5433 user=pyo password=pyo123 dbname=mirror"
+        run: |
+          # Run the Mirror from the repository checkout (the launcher lives in
+          # examples/, so without PYTHONPATH it would import the pip-installed
+          # wheel, which omits seerdb.server).
+          REPO="${GITHUB_WORKSPACE}"
+          PYTHONPATH="$REPO" python "$REPO/examples/mirror_over_postgres.py" "$MIRROR_PG" 1521 > "$REPO/mirror.log" 2>&1 &
+          MIRROR_PID=$!
+          for i in $(seq 1 30); do
+            python -c "import socket; socket.create_connection(('127.0.0.1', 1521), timeout=1).close()" 2>/dev/null && break
+            sleep 1
+          done
+          if ! kill -0 "$MIRROR_PID" 2>/dev/null; then
+            echo "the Mirror exited during startup"; cat "$REPO/mirror.log"; exit 1
+          fi
+          # SQLAlchemy's suite needs a second namespace, test_schema; through the
+          # Mirror a CREATE USER becomes a CREATE SCHEMA, so create it as PYO (the
+          # only account the demo backend knows). The grants translate to no-ops.
+          python - <<'PY'
+          import seerdb
+
+          conn = seerdb.connect(
+              host='127.0.0.1', port=1521, service_name='XE',
+              user='PYO', password='pyo123',
+          )
+          cur = conn.cursor()
+          cur.execute('CREATE USER test_schema IDENTIFIED BY test_schema')
+          conn.commit()
+          conn.close()
+          print('test_schema ready')
+          PY
+          status=0
+          # The full suite minus the two inherent-limit classes (see the header).
+          # A deterministic order keeps the guard reproducible across runs.
+          python -m pytest -q --tb=short -p no:randomly \
+            --dburi "oracle+seerdb://pyo:pyo123@localhost:1521/?service_name=XE" \
+            -k "not TrueDivTest and not NormalizedNameTest" \
+            test/test_suite.py || status=$?
+          kill "$MIRROR_PID" 2>/dev/null || true
+          if [ "$status" -ne 0 ]; then echo "--- mirror log ---"; tail -n 200 "$REPO/mirror.log"; fi
+          exit "$status"
