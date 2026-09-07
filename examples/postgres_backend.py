@@ -233,6 +233,12 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN 'lang' THEN 'US' "
     "WHEN 'language' THEN 'AMERICAN_AMERICA.AL32UTF8' "
     'ELSE NULL END $$;'
+    # ora_owner(schema): the Oracle owner for a PostgreSQL schema — the current
+    # schema for a session-local (pg_temp) object, so GLOBAL TEMPORARY tables and
+    # their indexes/constraints report under the user's schema like Oracle (#759).
+    'CREATE OR REPLACE FUNCTION sys.ora_owner(text) RETURNS text LANGUAGE sql '
+    "STABLE AS $$ SELECT CASE WHEN $1 LIKE 'pg_temp%' THEN upper(current_schema()) "
+    'ELSE upper($1) END $$;'
     # Oracle-shaped catalog views over information_schema / pg_catalog. Oracle
     # treats the user as the schema and folds names upper-case, so `owner` and the
     # object names are UPPER(pg schema/relation), and a client that filters
@@ -245,7 +251,12 @@ _ORACLE_DICTIONARY_DDL = (
     'NULL::text AS iot_name, NULL::text AS duration, '
     'NULL::text AS compression, NULL::text AS compress_for '
     "FROM information_schema.tables WHERE table_type='BASE TABLE' "
-    "AND table_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    "AND table_schema NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    # Oracle GLOBAL TEMPORARY tables are PostgreSQL temporary tables (session-local,
+    # in a pg_temp schema); report them under the current schema like Oracle does.
+    'UNION ALL SELECT upper(current_schema()), upper(table_name), NULL, NULL, '
+    "'SYS$SESSION', NULL, NULL FROM information_schema.tables "
+    "WHERE table_type='LOCAL TEMPORARY';"
     'CREATE OR REPLACE VIEW sys.user_tables AS SELECT table_name, tablespace_name, '
     'iot_name, duration FROM all_tables WHERE owner=upper(current_schema());'
     'CREATE OR REPLACE VIEW sys.all_views AS SELECT upper(table_schema) AS owner, '
@@ -268,7 +279,9 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE OR REPLACE VIEW sys.all_mview_comments AS SELECT upper(schemaname) AS owner, '
     "upper(matviewname) AS mview_name, obj_description((quote_ident(schemaname)||'.'||"
     'quote_ident(matviewname))::regclass) AS comments FROM pg_matviews;'
-    'CREATE OR REPLACE VIEW sys.all_tab_cols AS SELECT upper(c.table_schema) AS owner, '
+    'CREATE OR REPLACE VIEW sys.all_tab_cols AS SELECT '
+    "CASE WHEN c.table_schema LIKE 'pg_temp%' THEN upper(current_schema()) "
+    'ELSE upper(c.table_schema) END AS owner, '
     'upper(c.table_name) AS table_name, upper(c.column_name) AS column_name, '
     'c.ordinal_position AS column_id, '
     "CASE c.data_type WHEN 'numeric' THEN 'NUMBER' WHEN 'integer' THEN 'NUMBER' "
@@ -291,21 +304,23 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE OR REPLACE VIEW sys.all_tab_columns AS SELECT * FROM all_tab_cols;'
     'CREATE OR REPLACE VIEW sys.user_tab_columns AS SELECT * FROM all_tab_cols '
     'WHERE owner=upper(current_schema());'
-    'CREATE OR REPLACE VIEW sys.all_col_comments AS SELECT upper(n.nspname) AS owner, '
+    'CREATE OR REPLACE VIEW sys.all_col_comments AS SELECT ora_owner(n.nspname) AS owner, '
     'upper(c.relname) AS table_name, upper(a.attname) AS column_name, '
     'col_description(c.oid, a.attnum) AS comments '
     'FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace '
     'JOIN pg_attribute a ON a.attrelid=c.oid '
     "WHERE a.attnum>0 AND NOT a.attisdropped AND c.relkind IN ('r','v','m') "
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
-    'CREATE OR REPLACE VIEW sys.all_tab_comments AS SELECT upper(n.nspname) AS owner, '
+    'CREATE OR REPLACE VIEW sys.all_tab_comments AS SELECT ora_owner(n.nspname) AS owner, '
     'upper(c.relname) AS table_name, '
     "CASE c.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' "
     "ELSE 'TABLE' END AS table_type, obj_description(c.oid) AS comments "
     'FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace '
     "WHERE c.relkind IN ('r','v','m') "
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
-    'CREATE OR REPLACE VIEW sys.all_objects AS SELECT upper(n.nspname) AS owner, '
+    'CREATE OR REPLACE VIEW sys.all_objects AS SELECT '
+    "CASE WHEN n.nspname LIKE 'pg_temp%' THEN upper(current_schema()) "
+    'ELSE upper(n.nspname) END AS owner, '
     'upper(c.relname) AS object_name, NULL::text AS subobject_name, '
     'c.oid::bigint AS object_id, '
     "CASE c.relkind WHEN 'r' THEN 'TABLE' WHEN 'v' THEN 'VIEW' "
@@ -317,11 +332,11 @@ _ORACLE_DICTIONARY_DDL = (
     'FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace '
     "WHERE c.relkind IN ('r','v','m','i','S') "
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
-    'CREATE OR REPLACE VIEW sys.all_constraints AS SELECT upper(tc.constraint_schema) '
+    'CREATE OR REPLACE VIEW sys.all_constraints AS SELECT ora_owner(tc.constraint_schema) '
     'AS owner, upper(tc.constraint_name) AS constraint_name, '
     "CASE tc.constraint_type WHEN 'PRIMARY KEY' THEN 'P' WHEN 'FOREIGN KEY' THEN 'R' "
     "WHEN 'UNIQUE' THEN 'U' WHEN 'CHECK' THEN 'C' ELSE '?' END AS constraint_type, "
-    'upper(tc.table_schema) AS table_schema, upper(tc.table_name) AS table_name, '
+    'ora_owner(tc.table_schema) AS table_schema, upper(tc.table_name) AS table_name, '
     'NULL::text AS search_condition, '
     'upper(rc.unique_constraint_schema) AS r_owner, '
     'upper(rc.unique_constraint_name) AS r_constraint_name, '
@@ -331,14 +346,14 @@ _ORACLE_DICTIONARY_DDL = (
     'ON rc.constraint_schema=tc.constraint_schema '
     'AND rc.constraint_name=tc.constraint_name '
     "WHERE tc.constraint_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
-    'CREATE OR REPLACE VIEW sys.all_cons_columns AS SELECT upper(kcu.constraint_schema) '
+    'CREATE OR REPLACE VIEW sys.all_cons_columns AS SELECT ora_owner(kcu.constraint_schema) '
     'AS owner, upper(kcu.constraint_name) AS constraint_name, '
     'upper(kcu.table_name) AS table_name, upper(kcu.column_name) AS column_name, '
     'kcu.ordinal_position AS position '
     'FROM information_schema.key_column_usage kcu '
     "WHERE kcu.constraint_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
-    'CREATE OR REPLACE VIEW sys.all_indexes AS SELECT upper(n.nspname) AS owner, '
-    'upper(ic.relname) AS index_name, upper(tn.nspname) AS table_owner, '
+    'CREATE OR REPLACE VIEW sys.all_indexes AS SELECT ora_owner(n.nspname) AS owner, '
+    'upper(ic.relname) AS index_name, ora_owner(tn.nspname) AS table_owner, '
     'upper(tc.relname) AS table_name, '
     "CASE WHEN ix.indisunique THEN 'UNIQUE' ELSE 'NONUNIQUE' END AS uniqueness, "
     "'NORMAL' AS index_type, 'VALID' AS status, "
@@ -350,8 +365,8 @@ _ORACLE_DICTIONARY_DDL = (
     'JOIN pg_class tc ON tc.oid=ix.indrelid '
     'JOIN pg_namespace tn ON tn.oid=tc.relnamespace '
     "WHERE n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
-    'CREATE OR REPLACE VIEW sys.all_ind_columns AS SELECT upper(n.nspname) AS index_owner, '
-    'upper(ic.relname) AS index_name, upper(tn.nspname) AS table_owner, '
+    'CREATE OR REPLACE VIEW sys.all_ind_columns AS SELECT ora_owner(n.nspname) AS index_owner, '
+    'upper(ic.relname) AS index_name, ora_owner(tn.nspname) AS table_owner, '
     'upper(tc.relname) AS table_name, upper(a.attname) AS column_name, '
     "k.n AS column_position, 'ASC' AS descend "
     'FROM pg_index ix JOIN pg_class ic ON ic.oid=ix.indexrelid '
