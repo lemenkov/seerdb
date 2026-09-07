@@ -280,6 +280,7 @@ def handle_login(
     token_public_key: bytes | None = None,
     field_version: int = FIELD_VERSION_11_2,
     tns_version: int | None = None,
+    identity: 'ServerIdentity | None' = None,
 ) -> tuple[str, bool, bytes | None]:
     """Run the server side of the handshake + O5LOGON.
 
@@ -304,8 +305,13 @@ def handle_login(
     """
     # --- Handshake (§2, §4.1/§4.2) ---
     # The release this session introduces itself as, in the auth result and (for
-    # sqlplus) the banner — it follows the field version being advertised.
-    identity = server_identity(field_version)
+    # sqlplus) the banner. It follows the advertised field version unless the
+    # backend declares its own identity — a backend may present a higher release
+    # than its wire field version (e.g. report 12.1 to unlock the dialect's native
+    # OFFSET/FETCH while keeping the 11.2 wire layout), since the client reads the
+    # version only from this login banner, never the wire (#33).
+    if identity is None:
+        identity = server_identity(field_version)
     # The protocol version goes with the field version unless a caller pins it.
     if tns_version is None:
         tns_version = server_tns_version(field_version)
@@ -518,6 +524,10 @@ def serve_session(
     declared_tns_version = getattr(backend, 'tns_version', None)
     if declared_tns_version is not None:
         tns_version = declared_tns_version
+    # A backend may present a server release independent of its wire field
+    # version (read off the raw backend before it is wrapped).
+    declared_identity = getattr(backend, 'server_identity', None)
+    identity = declared_identity or server_identity(field_version)
     backend = _IsolatedBackend(backend)
     user, sqlplus, conn_key = handle_login(
         stream,
@@ -526,11 +536,10 @@ def serve_session(
         token_public_key=token_public_key,
         field_version=field_version,
         tns_version=tns_version,
+        identity=identity,
     )
     if sqlplus:
-        return _serve_oci_session(
-            stream, backend, user, conn_key, server_identity(field_version)
-        )
+        return _serve_oci_session(stream, backend, user, conn_key, identity)
     cursors = _Cursors()
     # LOB contents (wire bytes + is_clob) the current statement's rows carry, in
     # the order their locators went out; the thin client drains them with
