@@ -60,6 +60,21 @@ edge of this adapter:
   ``DEREF`` round-trip is a 12c+ feature the suite already skips on the 11g Mirror,
   and could not be served if it did not — the ctid locator is opaque and never
   dereferenced.
+- **Integer division semantics** — Oracle's ``/`` is always NUMBER (float)
+  division, so ``15 / 10`` is ``1.5``; PostgreSQL's integer ``/`` truncates to
+  ``1``. Matching Oracle would mean coercing every division to numeric, a broad
+  change to expression semantics the backend does not make, so an integer-operand
+  division reflects PostgreSQL's result (SQLAlchemy ``TrueDivTest``).
+- **A deliberately quoted lower-case identifier** — Oracle stores an unquoted
+  name upper-case and a quoted one verbatim, so a lower-case name is
+  unambiguously a quoted one; PostgreSQL folds *both* an unquoted name and a
+  quoted lower-case one to the same stored lower-case, so the two cannot be told
+  apart after the fact. ``sys.ora_name`` upper-cases a stored lower-case name to
+  Oracle's canonical form — required for the overwhelmingly common unquoted case —
+  which means a table or column created as a quoted lower-case ``"t1"`` does not
+  round-trip back as ``t1`` (SQLAlchemy ``NormalizedNameTest``). A quoted
+  mixed-case or reserved-word name, which PostgreSQL *does* store distinctly, is
+  preserved.
 """
 
 from __future__ import annotations
