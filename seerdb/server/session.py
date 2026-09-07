@@ -1182,6 +1182,14 @@ def _run_returning(backend: Backend, sql: str, request: ExecRequest) -> Result:
     if run is None:
         raise UnsupportedFeature('RETURNING is not supported by this backend')
     meta = request.bind_meta
+    # A RETURNING statement whose binds are ALL filled by the clause (an empty
+    # INSERT, a DELETE with no WHERE bind) carries no input row, so the client
+    # sends none — but its al8i4 iteration count still says how many times it
+    # runs (one for a plain execute, N for an array). Stand in that many all-None
+    # rows so each iteration happens and owes its set of returned values (#33).
+    source_rows = request.bind_rows or [
+        [None] * request.bind_count for _ in range(request.iterations)
+    ]
     rows = [
         [
             BindVar(value=None, tns_type=meta[i][0], max_size=meta[i][1])
@@ -1189,7 +1197,7 @@ def _run_returning(backend: Backend, sql: str, request: ExecRequest) -> Result:
             else value
             for i, value in enumerate(row)
         ]
-        for row in request.bind_rows
+        for row in source_rows
     ]
     result = run(sql, rows)
     # One record per iteration is what the client reads positionally, so a
@@ -1269,7 +1277,7 @@ def _answer_query(
     if sql is None:
         sql = request.sql
     try:
-        if request.return_binds and request.bind_rows:
+        if request.return_binds:
             # DML ... RETURNING col INTO :b (#689). The reply owes one set of
             # returned values per iteration, so this cannot go through the
             # ordinary DML paths below, which report only a row count.

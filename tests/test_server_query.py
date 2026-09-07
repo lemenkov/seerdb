@@ -317,6 +317,40 @@ def test_parse_exec_skips_the_returning_bind_in_every_iteration(version: int) ->
     assert request.bind_rows == [['a', None], ['bb', None], ['ccc', None]]
 
 
+@pytest.mark.parametrize('version', [6, 17])
+def test_parse_exec_reports_the_execute_iteration_count(version: int) -> None:
+    # A RETURNING statement whose only bind is filled by the clause (an empty
+    # INSERT) sends no RXD row, so bind_rows is empty -- but the al8i4 iteration
+    # count still says how many times it runs, which is the only record the server
+    # has (#33). A plain execute is 1; a 3-row array batch is 3.
+    receiver = Var(int)
+    with _at_field_version(version):
+        single = parse_exec(
+            _client_exec_request(
+                version,
+                'insert into t (id) values (s.nextval) returning id into :1',
+                [receiver],
+                return_binds=frozenset({0}),
+                kind='change',
+            )
+        )
+        array = parse_exec(
+            _client_exec_request(
+                version,
+                'insert into t (id) values (s.nextval) returning id into :1',
+                [receiver],
+                batch=[[receiver], [receiver]],
+                return_binds=frozenset({0}),
+                kind='change',
+            )
+        )
+    # No input value rides in either message, so the row data is empty...
+    assert single.bind_rows == [] and array.bind_rows == []
+    # ...but the iteration count survives: one, then three (1 + 2 batch rows).
+    assert single.iterations == 1
+    assert array.iterations == 3
+
+
 def test_returning_response_round_trips_to_the_client_decoder() -> None:
     # The reply carries one record per iteration, values grouped by bind. Decode
     # it with the client's own reader to prove the two agree (#689).
@@ -2883,3 +2917,44 @@ def test_ref_column_describe_and_value_roundtrip() -> None:
     got = rows[0][0]
     assert got.type_name == 'PERSON'
     assert got.bytes == b'\x00\x28\x02\x09'
+
+
+def test_run_returning_runs_once_per_iteration_when_no_input_row() -> None:
+    # A RETURNING statement whose binds are all clause-filled sends no input row,
+    # so bind_rows is empty; the server must still run it request.iterations times
+    # (one per array iteration) rather than skipping or under-running it (#33).
+    from typing import cast
+
+    from seerdb.common.tns import ExecRequest
+    from seerdb.server.backend import Backend, BindVar, Result
+    from seerdb.server.session import _run_returning
+
+    class _Backend:
+        def __init__(self) -> None:
+            self.calls: list = []
+
+        def execute_returning(self, sql: str, rows) -> Result:
+            self.calls.append(rows)
+            # One returned row per iteration, like a real INSERT ... RETURNING.
+            return Result(
+                rowcount=len(rows), returned_rows=[[(i,)] for i in range(len(rows))]
+            )
+
+    backend = _Backend()
+    request = ExecRequest(
+        sql='insert into t (id) values (s.nextval) returning id into :1',
+        cursor=0,
+        bind_count=1,
+        fetch=0,
+        bind_rows=[],
+        bind_meta=[(TNS_TYPE_NUMBER, 22)],
+        return_binds=frozenset({0}),
+        iterations=3,
+    )
+    result = _run_returning(cast(Backend, backend), request.sql, request)
+    # Three synthesized rows reached the backend, each a lone clause-filled bind.
+    assert len(backend.calls) == 1
+    sent = backend.calls[0]
+    assert len(sent) == 3
+    assert all(len(row) == 1 and isinstance(row[0], BindVar) for row in sent)
+    assert len(result.returned_rows) == 3

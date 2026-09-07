@@ -356,6 +356,10 @@ class ExecRequest:
     # described like any other bind but carry no value in the row data, and the
     # reply owes one set of values per iteration.
     return_binds: frozenset = frozenset()
+    # The execute iteration count from al8i4[1] (1 + array-DML batch length).
+    # A RETURNING statement whose binds are all clause-filled sends no RXD row,
+    # so bind_rows is empty; this still says how many times it runs (#33).
+    iterations: int = 1
 
 
 @dataclass(frozen=True)
@@ -1566,6 +1570,10 @@ def parse_exec(
     arraydmlrowcounts = len(al8) > 9 and bool(al8[9] & TNS_AL8I4_ARRAY_DML_ROWCOUNTS)
     scroll_orientation = al8[10] if len(al8) > 10 else 0
     scroll_position = al8[11] if len(al8) > 11 else 0
+    # al8i4[1] is the execute iteration count (1 + array-DML batch length); a
+    # plain execute is 1. It is the only record of how many iterations an
+    # all-clause-filled RETURNING runs, whose rows carry no values (#33).
+    iterations = al8[1] if len(al8) > 1 else 1
 
     binds: list = []
     bind_rows: list = []
@@ -1680,6 +1688,7 @@ def parse_exec(
         scroll_position=scroll_position,
         arraydmlrowcounts=arraydmlrowcounts,
         return_binds=return_binds,
+        iterations=iterations,
     )
 
 

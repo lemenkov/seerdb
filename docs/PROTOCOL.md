@@ -3975,7 +3975,11 @@ from the SQL. Two framing differences from a plain DML:
 1. **Request**: an OAC (bind descriptor) is written for **every** bind, but the
    `TTI_RXD` row carries values for the **input** binds only — the return (OUT)
    binds are skipped (if every bind is a return bind, the row is omitted). The
-   return-bind OAC is just the Var's declared type/size.
+   return-bind OAC is just the Var's declared type/size. When the row is
+   omitted, the execute's **iteration count still rides in `al8i4[1]`** (the same
+   field array DML uses, `1 + batch length`), so a parser reading the request
+   knows how many times the statement runs even though no `TTI_RXD` arrives —
+   an empty INSERT ... RETURNING or a WHERE-bind-less DELETE ... RETURNING.
 2. **Response**: the server sends a `TTI_RXD` (token 7) carrying the out-bind
    return data — **not** query rows. For each return bind, in bind order:
    ```
