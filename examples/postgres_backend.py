@@ -794,10 +794,30 @@ def _translate_admin(sql: str) -> str:
     return sql
 
 
+# Oracle's negative / unbounded / caching keywords in CREATE/ALTER SEQUENCE are
+# single words (NOMINVALUE, NOMAXVALUE, NOCYCLE, NOCACHE); PostgreSQL spells the
+# first three as two words and has no NOCACHE (its minimum cache is 1). ORDER /
+# NOORDER is an Oracle RAC ordering hint PostgreSQL has no equal for, so it is
+# dropped. MINVALUE/MAXVALUE/CYCLE/CACHE/START WITH/INCREMENT BY are shared.
+_IS_SEQUENCE_DDL = re.compile(r'\s*(?:CREATE|ALTER)\s+SEQUENCE\b', re.IGNORECASE)
+_SEQUENCE_KEYWORD_REWRITES = [
+    (re.compile(r'\bNOMINVALUE\b', re.IGNORECASE), 'NO MINVALUE'),
+    (re.compile(r'\bNOMAXVALUE\b', re.IGNORECASE), 'NO MAXVALUE'),
+    (re.compile(r'\bNOCYCLE\b', re.IGNORECASE), 'NO CYCLE'),
+    (re.compile(r'\bNOCACHE\b', re.IGNORECASE), 'CACHE 1'),
+    (re.compile(r'\bNOORDER\b', re.IGNORECASE), ''),
+    (re.compile(r'\bORDER\b', re.IGNORECASE), ''),
+]
+
+
 def _translate_ddl(sql: str) -> str:
     """Rewrite an Oracle ``CREATE TABLE`` / object ``CREATE TYPE`` to PostgreSQL:
     map the column/attribute types and drop the clauses PostgreSQL has no equal
     for (#500). Other SQL is returned unchanged."""
+    if _IS_SEQUENCE_DDL.match(sql):
+        for pattern, replacement in _SEQUENCE_KEYWORD_REWRITES:
+            sql = pattern.sub(replacement, sql)
+        return re.sub(r'\s{2,}', ' ', sql).rstrip()
     if _CREATE_TYPE_OBJECT.match(sql):
         # `... AS OBJECT (attrs)` → `... AS (attrs)`, then map the attribute types
         # (NUMBER → numeric, VARCHAR2(n) → varchar(n), …) the same way as a table.
@@ -887,6 +907,18 @@ _IDIOM_REWRITES = [
     ),
     # Oracle's MINUS set operator is PostgreSQL's EXCEPT (#759, reflection uses it).
     (re.compile(r'\bMINUS\b', re.IGNORECASE), 'EXCEPT'),
+    # Sequence pseudo-columns: Oracle's `seq.nextval` / `seq.currval` are
+    # PostgreSQL's `nextval('seq')` / `currval('seq')` function calls. The captured
+    # name (optionally schema-qualified) becomes the regclass argument; it is
+    # created and referenced lower-case, so an unquoted regclass literal resolves.
+    (
+        re.compile(r'\b([A-Za-z_][\w$#.]*)\.nextval\b', re.IGNORECASE),
+        r"nextval('\1')",
+    ),
+    (
+        re.compile(r'\b([A-Za-z_][\w$#.]*)\.currval\b', re.IGNORECASE),
+        r"currval('\1')",
+    ),
 ]
 
 
