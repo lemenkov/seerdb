@@ -3737,6 +3737,17 @@ codes as the value image's element type, §18) are kept and exposed on the
 `None` for a non-VECTOR column or a pre-23.4 server (which sends no descriptor).
 `vector_flags` bit `0x01` marks a flexible format and `0x02` a sparse column.
 
+**The Mirror serves the fv24 data path too** (§20.4–20.5): its function-message
+parsers (`parse_exec`, `parse_fetch`, `parse_lobops_request`, `peek_exec_cursor`)
+skip the extra token byte after the sequence at fv > 17 via `_skip_fun_header` —
+without it every field mis-aligns and binds are dropped (the backend then sees
+`:1` unbound → ORA-01009). Its describe (`_encode_dcb_column`) appends the
+per-column annotation count (0 — the Mirror emits none) and the vector descriptor
+(dimensions / format / flags, from the column's own vector metadata) at fv > 17,
+which the client consumes or the row stream desyncs. Validated end to end: the
+full integration suite passes through the Mirror in front of a live 23ai server
+at fv24.
+
 ### 20.6 Token auth — OAuth2 / OCI IAM (#125)
 
 Token auth (for Autonomous Database / OCI) **replaces** the O5LOGON

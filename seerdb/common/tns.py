@@ -313,6 +313,7 @@ class ColumnMeta:
     # type. None when unknown (a non-VECTOR column, or an upstream that does not
     # report it) — the encoder then falls back to FLOAT32 (#55).
     vector_format: int | None = None
+    vector_dimensions: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1015,6 +1016,18 @@ def _encode_dcb_column(col: ColumnMeta, position: int) -> bytes:
             if field_version >= FIELD_VERSION_23_1
             else b''
         )
+        + (
+            # fv > 17 (23ai fv24): each column also carries its annotation map and
+            # a vector descriptor after the domain fields (§20.5); the client
+            # consumes both or the row stream desyncs. The Mirror emits no
+            # annotations (count 0) and a descriptor from the column's own vector
+            # metadata (dimensions 0 = flexible / non-vector, flags 0).
+            encode_sb4(0)  # num_annotations
+            + encode_sb4(col.vector_dimensions or 0)  # vector_dimensions
+            + bytes([(col.vector_format or 0) & 0xFF, 0])  # vector_format, flags
+            if field_version > FIELD_VERSION_23_1
+            else b''
+        )
     )
 
 
@@ -1438,6 +1451,18 @@ def _decode_bind_value(data_type: int, csfrm: int, raw: bytes | list) -> object:
     return decode_value(column, bytes(raw))
 
 
+def _skip_fun_header(payload: bytes, header: int = 3) -> bytes:
+    # Bytes after a TTI function-message header (TTI_FUN, subtype, seq). At
+    # fv > 17 the header carries an extra ub8 token number (0 for an ordinary
+    # call) after the sequence — oracledb's _write_function_code / PROTOCOL.md
+    # §20.4 — present on every function message, so skip it too. Below fv 18
+    # there is none, so this is the historical `payload[header:]`.
+    rest = payload[header:]
+    if _DECODE_FIELD_VERSION.get() > FIELD_VERSION_23_1:
+        _token, rest = decode_ub4(rest)
+    return rest
+
+
 def peek_exec_cursor(payload: bytes) -> tuple[int, bool]:
     """The cursor id and whether SQL is present, read from an OALL8 header without
     a full parse (#80/#486). A cached re-execute (cursor set, no SQL) carries no
@@ -1445,7 +1470,7 @@ def peek_exec_cursor(payload: bytes) -> tuple[int, bool]:
     :func:`parse_exec`. Returns ``(0, True)`` for anything that isn't an OALL8."""
     if len(payload) < 3 or payload[0] != TTI_FUN or payload[1] != TTI_ALL8:
         return (0, True)
-    rest = payload[3:]
+    rest = _skip_fun_header(payload)
     _options, rest = decode_ub4(rest)
     cursor, rest = decode_ub4(rest)
     query_flag = rest[0] if rest else 0
@@ -1494,7 +1519,7 @@ def parse_exec(
     if len(payload) < 3 or payload[0] != TTI_FUN or payload[1] != TTI_ALL8:
         raise InterfaceError('not an OALL8 execute')
 
-    rest = payload[3:]  # skip TTI_FUN, TTI_ALL8, seq
+    rest = _skip_fun_header(payload)  # TTI_FUN, TTI_ALL8, seq (+ fv24 token)
     options, rest = decode_ub4(rest)
     autocommit = bool(options & _EXEC_OPTION_COMMIT)
     batcherrors = bool(options & TNS_EXEC_OPTION_BATCH_ERRORS)
@@ -1784,7 +1809,7 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
     temp LOB and the OPEN / CLOSE / TRIM / GET_CHUNK_SIZE state ops are
     acknowledged (#417); anything else (a READ of an emitted column locator) is
     served by the #413 read path."""
-    payload = body[3:]  # skip TTI_FUN, TTI_LOBOPS, seq
+    payload = _skip_fun_header(body)  # TTI_FUN, TTI_LOBOPS, seq (+ fv24 token)
     if payload[:3] == _CREATE_TEMP_PREFIX:
         # CLOB vs BLOB is the LOB type byte (0x70 / 0x71) in the fixed block.
         return LobOpsRequest(kind='create_temp', is_blob=0x71 in payload)
@@ -1988,7 +2013,7 @@ def parse_fetch(payload: bytes) -> FetchRequest:
     id + ub4 row count (the inverse of ``encode_dictionary_fetch``)."""
     if len(payload) < 3 or payload[0] != TTI_FUN or payload[1] != TTI_FETCH:
         raise InterfaceError('not a TTI_FETCH')
-    rest = payload[3:]  # skip TTI_FUN, TTI_FETCH, seq
+    rest = _skip_fun_header(payload)  # TTI_FUN, TTI_FETCH, seq (+ fv24 token)
     cursor, rest = decode_ub4(rest)
     fetch, _rest = decode_ub4(rest)
     return FetchRequest(cursor=cursor, fetch=fetch)
