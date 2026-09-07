@@ -98,6 +98,12 @@ class OracleCompatBackend:
     def tns_version(self) -> int | None:
         return getattr(self._inner, 'tns_version', None)
 
+    @property
+    def server_identity(self):
+        # A backend may present a server release independent of its wire field
+        # version (the PG demo reports 12.1 over the 11.2 wire); pass it through.
+        return getattr(self._inner, 'server_identity', None)
+
     def authenticate(self, username: str) -> str | None:
         secret = self._inner.authenticate(username)
         if secret is not None:
