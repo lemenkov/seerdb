@@ -4897,6 +4897,7 @@ def encode_oci_oer(
     error_pos: int = 0,
     error_code: int = 0,
     command_type: int = oci.OCI_CMD_SELECT,
+    category: int | None = None,
 ) -> bytes:
     """Build a 136-byte OCI OER return-status token (§36) over
     :data:`_OCI_OER_ENVELOPE`. ``status`` is SUCCESS (0x01) or ERROR (0x05);
@@ -4922,6 +4923,10 @@ def encode_oci_oer(
     # the last column it can express).
     oer[20] = min(max(error_pos, 0), 0xFF)
     oer[22] = command_type
+    if category is not None:
+        # The statement-category byte (offset 18; 2 row/value-producing, 1 DDL,
+        # 0 on the DESCRIBE status). Left at the envelope's value when not given.
+        oer[18] = category
     # FIXME: the offset-49 echo is only reliably `sequence + 2` for the row /
     # return statuses; the outbind reply carries 0 there instead, so this is not
     # a settled rule. Semantics of the field are unpinned (see §36.1).
@@ -6031,16 +6036,6 @@ _OCI_DESC_BLK = bytes.fromhex(
     '000000000000000000000000000000000000000000000000000000000000000000000000'
     '00000000000000000000000000000000000000'
 )
-_OCI_DESC_TRAILER = bytes.fromhex(
-    '0000010004000000ca140001000000000900000000000000000000000000000000000000'
-    '000000000000000000000000000000000000000000000000000000000000000000000000'
-    '000000000000000000000000000000000000000000000000000000000000000000000000'
-    '000000000000000000000000000405000000130001010000000000000000000000000000'
-    '000000000000000000000000000000000000000000000000000015000001000000360100'
-    '0000000000000000000000000020f6310a00000000000000000000000000000000000000'
-    '000000000000000000000000000000000000000000000000000000000000000000000000'
-    '0000000000'
-)
 # Meaningful-field offsets within the segments (differential-mapped).
 _OCI_DESC_COLCOUNT_OFF = 76  # HDR_POST: column count + 1
 _OCI_DESC_BLK_SIZE = 2  # BLK pre-name: data length (single byte)
@@ -6055,6 +6050,44 @@ _OCI_DESC_POST_CSFRM = 17
 _OCI_DESC_BLK_CONT = 3  # BLK: `1` at (len - 3) on a non-last column, else `0`
 _OCI_DESC_TR_COUNT = 2  # TRAILER: column count
 _OCI_DESC_TR_OPAQUE = 8  # TRAILER: a type-dependent opaque byte (carried)
+
+# The DESCRIBE reply's 257-byte trailer, decoded: a 121-byte describe-specific
+# frame, then a standard 136-byte OCI OER return status (the same envelope every
+# other reply ends with, built by encode_oci_oer — its offset-56 `36 01` and
+# offset-72 `20 f6 31 0a` are the fixed 11g OER constants, §36). The frame is
+# zero but for the column count and the type-dependent opaque byte (both patched
+# per reply) and four carried framing constants.
+_OCI_DESC_TRAILER_FRAME_LEN = 121
+# The OER's carried fields. The status byte is 0x05 — the value the execute
+# path names OCI_OER_STATUS_ERROR — yet this is a *successful* DESCRIBE with
+# error code 0, so it is carried as the describe's terminal status rather than
+# asserted to be an error; its meaning on this path is unpinned. The sequence is
+# the diagnostic counter the client discards (§36.1), left at its captured value
+# rather than threaded through the session counter.
+_OCI_DESC_STATUS = 0x05
+_OCI_DESC_OER_SEQUENCE = 19
+_OCI_DESC_OER_ROW_FIELD = 1  # offset 8, the dual row-kind / rowcount slot: one
+_OCI_DESC_OER_CATEGORY = 0
+
+
+def _oci_desc_trailer_frame() -> bytes:
+    frame = bytearray(_OCI_DESC_TRAILER_FRAME_LEN)
+    frame[_OCI_DESC_TR_COUNT] = 0x01
+    frame[4] = 0x04
+    frame[_OCI_DESC_TR_OPAQUE] = 0xCA
+    frame[9] = 0x14
+    frame[11] = 0x01
+    frame[16] = 0x09
+    return bytes(frame)
+
+
+_OCI_DESC_TRAILER = _oci_desc_trailer_frame() + encode_oci_oer(
+    _OCI_DESC_STATUS,
+    sequence=_OCI_DESC_OER_SEQUENCE,
+    row_kind=_OCI_DESC_OER_ROW_FIELD,
+    command_type=0,
+    category=_OCI_DESC_OER_CATEGORY,
+)
 # Fixed-size types report a constant wire length in the describe (a NUMBER is
 # always 22, a DATE 7, …) rather than the backend's display size; variable types
 # (VARCHAR / CHAR / RAW) report their declared length.

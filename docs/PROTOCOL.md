@@ -1517,6 +1517,17 @@ rest carried:
   byte-for-byte capture test pins it to the capture's date so the rest is still
   checked exactly.
 
+The **trailer** is not opaque either: its 257 bytes are a 121-byte describe-specific
+frame (zero but for the column count, the type-dependent opaque byte, and four
+carried framing constants) followed by a **standard 136-byte OER return status** —
+the same envelope every other reply ends with (§36), built by `encode_oci_oer`,
+whose offset-56 `36 01` and offset-72 `20 f6 31 0a` are the fixed 11g constants.
+Its carried fields are the statement category `0`, the offset-8 row slot `1`, a
+sequence of `19` (the diagnostic counter the client discards, left as captured)
+with its `sequence + 2` echo, and a status byte of `0x05` — the value the execute
+path names `OCI_OER_STATUS_ERROR`, on a *successful* describe with error code 0;
+carried as the describe's terminal status, its meaning on this path unpinned.
+
 Two framing points matter: the reply body follows the 8-byte TNS header and the
 **2-byte data flags** (`00 00`) — a describe reply that folds the data flags into
 its body desyncs sqlplus's parse by two bytes (it hangs). And the whole exchange is
