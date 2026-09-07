@@ -1220,6 +1220,9 @@ _SQLSTATE_TO_ORA = {
     '42883': 904,  # undefined_function
     '23505': 1,  # unique_violation        -> unique constraint violated
     '23502': 1400,  # not_null_violation      -> cannot insert NULL
+    '23503': 2291,  # foreign_key_violation   -> integrity constraint: parent
+    #                key not found (the insert/update direction; the delete
+    #                direction is ORA-02292, not distinguished by SQLSTATE alone)
     '23514': 2290,  # check_violation         -> check constraint violated
     '22P02': 1722,  # invalid_text_representation -> invalid number (TO_NUMBER)
 }
