@@ -39,6 +39,7 @@ from postgres_backend import (  # noqa: E402
     _to_interval_ym,
     _translate_admin,
     _translate_binds,
+    _translate_connect_by,
     _translate_ddl,
     _translate_idioms,
     _translate_plsql_block,
@@ -1603,5 +1604,69 @@ def test_dbms_utility_functions() -> None:
             ],
         )
         assert result.out_binds == ['12.1.0.2.0', '12.1.0.0.0']
+    finally:
+        backend.close()
+
+
+def test_translate_connect_by_rewrites_a_hierarchical_query() -> None:
+    # Oracle's CONNECT BY hierarchical query maps to a PostgreSQL WITH RECURSIVE
+    # CTE: START WITH is the anchor filter, CONNECT BY PRIOR the recursive join,
+    # and LEVEL / SYS_CONNECT_BY_PATH / CONNECT_BY_ROOT become computed columns
+    # (#760).
+    out = _translate_connect_by(
+        "SELECT id, LEVEL, SYS_CONNECT_BY_PATH(name, '/'), CONNECT_BY_ROOT name "
+        'FROM emp START WITH mgr IS NULL CONNECT BY PRIOR id = mgr'
+    )
+    assert out.startswith('WITH RECURSIVE __hcte AS (')
+    assert 'WHERE mgr IS NULL' in out  # START WITH → anchor filter
+    assert '__p.id = emp.mgr' in out  # PRIOR id = mgr → parent.id = child.mgr
+    assert '__level' in out and '__path' in out and '__root' in out
+
+
+def test_translate_connect_by_passes_through_unsupported_shapes() -> None:
+    # Correct-or-passthrough: anything but the recognised single-table shape is
+    # returned untouched (and then errors on PostgreSQL exactly as before) rather
+    # than mistranslated (#760).
+    passthrough = [
+        'SELECT id FROM emp WHERE mgr IS NULL',  # no CONNECT BY at all
+        'SELECT * FROM emp CONNECT BY PRIOR id = mgr',  # SELECT *
+        'SELECT a.id FROM emp a, emp b CONNECT BY PRIOR a.id = a.mgr',  # multi-table
+        'SELECT id FROM emp CONNECT BY PRIOR id = mgr AND id > 0',  # compound
+        'SELECT id FROM emp CONNECT BY PRIOR id = mgr ORDER SIBLINGS BY id',  # siblings
+    ]
+    for sql in passthrough:
+        assert _translate_connect_by(sql) == sql
+
+
+def test_connect_by_hierarchical_query_runs() -> None:
+    # End to end through the backend: a real employee/manager tree returns its rows
+    # with LEVEL, the root-to-node path, and the root value (#760).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('drop table if exists hier_emp')
+        backend.execute(
+            'CREATE TABLE hier_emp (id NUMBER, mgr NUMBER, name VARCHAR2(20))'
+        )
+        for id_, mgr, name in [
+            (1, None, 'KING'),
+            (2, 1, 'JONES'),
+            (3, 1, 'BLAKE'),
+            (4, 2, 'SCOTT'),
+        ]:
+            backend.execute(
+                'INSERT INTO hier_emp (id, mgr, name) VALUES (:1, :2, :3)',
+                [id_, mgr, name],
+            )
+        backend.commit()
+        rows = backend.execute(
+            "SELECT id, LEVEL, SYS_CONNECT_BY_PATH(name, '/'), CONNECT_BY_ROOT name "
+            'FROM hier_emp START WITH mgr IS NULL '
+            'CONNECT BY PRIOR id = mgr ORDER BY LEVEL'
+        ).rows
+        assert (1, 1, '/KING', 'KING') in rows
+        assert (4, 3, '/KING/JONES/SCOTT', 'KING') in rows
+        assert len(rows) == 4
+        backend.execute('drop table hier_emp')
+        backend.commit()
     finally:
         backend.close()
