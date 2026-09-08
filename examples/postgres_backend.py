@@ -229,7 +229,9 @@ _HELPER_FUNCTIONS_DDL = (
 # a schema-qualified Oracle call (UTL_RAW.CAST_TO_RAW(...)) resolves to it
 # case-insensitively. Bytes are the DB charset (UTF-8) for the varchar2/raw casts;
 # BIT_AND/OR/XOR follow Oracle's rule that the unprocessed tail of the longer
-# operand is appended after the shorter one runs out.
+# operand is appended after the shorter one runs out. The bodies qualify
+# pg_catalog.length so utl_raw.length does not recurse into itself when a
+# caller puts utl_raw on the search_path.
 _UTL_RAW_DDL = """
 CREATE SCHEMA IF NOT EXISTS utl_raw;
 CREATE OR REPLACE FUNCTION utl_raw.cast_to_raw(text) RETURNS bytea
@@ -237,18 +239,18 @@ CREATE OR REPLACE FUNCTION utl_raw.cast_to_raw(text) RETURNS bytea
 CREATE OR REPLACE FUNCTION utl_raw.cast_to_varchar2(bytea) RETURNS text
   LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT convert_from($1, 'UTF8') $$;
 CREATE OR REPLACE FUNCTION utl_raw.length(bytea) RETURNS integer
-  LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT length($1) $$;
+  LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT pg_catalog.length($1) $$;
 CREATE OR REPLACE FUNCTION utl_raw.substr(bytea, integer, integer DEFAULT NULL)
   RETURNS bytea LANGUAGE sql IMMUTABLE AS $$
     SELECT CASE WHEN $2 = 0 THEN NULL
-      WHEN $2 < 0 THEN substring($1 from length($1) + $2 + 1 for coalesce($3, length($1)))
-      ELSE substring($1 from $2 for coalesce($3, length($1))) END $$;
+      WHEN $2 < 0 THEN substring($1 from pg_catalog.length($1) + $2 + 1 for coalesce($3, pg_catalog.length($1)))
+      ELSE substring($1 from $2 for coalesce($3, pg_catalog.length($1))) END $$;
 CREATE OR REPLACE FUNCTION utl_raw.concat(VARIADIC bytea[]) RETURNS bytea
   LANGUAGE sql IMMUTABLE AS $$
     SELECT coalesce(string_agg(x, ''::bytea), ''::bytea) FROM unnest($1) AS x $$;
 CREATE OR REPLACE FUNCTION utl_raw._bitop(a bytea, b bytea, op char) RETURNS bytea
   LANGUAGE plpgsql IMMUTABLE AS $$
-  DECLARE n int := least(length(a), length(b)); r bytea := ''::bytea; i int; v int;
+  DECLARE n int := least(pg_catalog.length(a), pg_catalog.length(b)); r bytea := ''::bytea; i int; v int;
   BEGIN
     FOR i IN 0 .. n - 1 LOOP
       v := CASE op WHEN '&' THEN get_byte(a, i) & get_byte(b, i)
@@ -256,8 +258,8 @@ CREATE OR REPLACE FUNCTION utl_raw._bitop(a bytea, b bytea, op char) RETURNS byt
                    ELSE get_byte(a, i) # get_byte(b, i) END;
       r := r || decode(lpad(to_hex(v), 2, '0'), 'hex');
     END LOOP;
-    IF length(a) > n THEN r := r || substring(a from n + 1);
-    ELSIF length(b) > n THEN r := r || substring(b from n + 1); END IF;
+    IF pg_catalog.length(a) > n THEN r := r || substring(a from n + 1);
+    ELSIF pg_catalog.length(b) > n THEN r := r || substring(b from n + 1); END IF;
     RETURN r;
   END $$;
 CREATE OR REPLACE FUNCTION utl_raw.bit_and(bytea, bytea) RETURNS bytea
