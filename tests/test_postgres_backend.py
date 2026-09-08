@@ -1670,3 +1670,25 @@ def test_connect_by_hierarchical_query_runs() -> None:
         backend.commit()
     finally:
         backend.close()
+
+
+def test_utl_raw_length_does_not_recurse_with_schema_on_path() -> None:
+    # utl_raw.length()'s body must call pg_catalog.length, not a bare length():
+    # with utl_raw on the search path (and pg_catalog explicitly after it) a bare
+    # length() would bind to utl_raw.length itself and recurse until the stack
+    # overflows. Exercise exactly that path (the bug fixed upstream in orafce #317).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('SET search_path TO utl_raw, oracle, public, pg_catalog')
+        assert backend.execute("SELECT utl_raw.length(hextoraw('DEADBEEF'))").rows == [
+            (4,)
+        ]
+        # substr and the bit operators call length internally too.
+        assert backend.execute(
+            "SELECT rawtohex(utl_raw.substr(hextoraw('DEADBEEF'), 2, 2))"
+        ).rows == [('ADBE',)]
+        assert backend.execute(
+            "SELECT rawtohex(utl_raw.bit_and(hextoraw('FFFF'), hextoraw('F0')))"
+        ).rows == [('F0FF',)]
+    finally:
+        backend.close()
