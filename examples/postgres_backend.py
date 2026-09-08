@@ -1076,9 +1076,142 @@ def _tstz_literal_sub(match: 're.Match') -> str:
     return f"ROW(TIMESTAMPTZ '{content}', {seconds})::{_TSTZ_TYPE}"
 
 
+# CONNECT BY -> WITH RECURSIVE (#760). Oracle's hierarchical query has no
+# PostgreSQL keyword; the common single-table shape maps to a recursive CTE.
+# Correct-or-passthrough: this only fires on a query containing CONNECT BY, and
+# either produces a faithful WITH RECURSIVE for a shape it fully recognises or
+# returns the query untouched (which then errors on PostgreSQL exactly as before)
+# -- it never yields a wrong-but-successful result. The projection and FROM body
+# are reused verbatim; only the clause structure, the single table, and the
+# single-equality CONNECT BY are parsed. Unsupported and passed through: multiple
+# tables / joins, a compound or non-equality CONNECT BY, SELECT *, ORDER SIBLINGS
+# BY, and more than one distinct SYS_CONNECT_BY_PATH / CONNECT_BY_ROOT.
+_HAS_CONNECT_BY = re.compile(r'\bCONNECT\s+BY\b', re.IGNORECASE)
+_HIER_QUERY = re.compile(
+    r'(?is)^\s*SELECT\s+(?P<proj>.+?)\s+FROM\s+(?P<from>.+?)'
+    r'(?:\s+WHERE\s+(?P<where>.+?))?'
+    r'(?:'
+    r'\s+START\s+WITH\s+(?P<sw_a>.+?)\s+CONNECT\s+BY\s+(?P<cb_a>.+?)'
+    r'|\s+CONNECT\s+BY\s+(?P<cb_b>.+?)\s+START\s+WITH\s+(?P<sw_b>.+?)'
+    r'|\s+CONNECT\s+BY\s+(?P<cb_c>.+?)'
+    r')'
+    r'(?:\s+ORDER\s+(?P<siblings>SIBLINGS\s+)?BY\s+(?P<order>.+?))?'
+    r'\s*;?\s*$'
+)
+_HIER_SINGLE_TABLE = re.compile(
+    r'^\s*(?P<table>[A-Za-z_][\w$#]*)(?:\s+(?P<alias>[A-Za-z_][\w$#]*))?\s*$'
+)
+_HIER_CB_COND = re.compile(
+    r'^\s*(?:NOCYCLE\s+)?(?P<l>.+?)\s*=\s*(?P<r>.+?)\s*$', re.IGNORECASE
+)
+_HIER_PRIOR = re.compile(r'^\s*PRIOR\s+(?P<col>.+?)\s*$', re.IGNORECASE)
+_HIER_SIMPLE_COL = re.compile(r'^[A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)?$')
+_HIER_STAR = re.compile(r'(^|,)\s*(\w+\s*\.\s*)?\*\s*(,|$)')
+_HIER_LEVEL = re.compile(r'\bLEVEL\b', re.IGNORECASE)
+_HIER_PATH = re.compile(
+    r"\bSYS_CONNECT_BY_PATH\s*\(\s*(?P<col>[\w.]+)\s*,\s*'(?P<sep>[^']*)'\s*\)",
+    re.IGNORECASE,
+)
+_HIER_ROOT = re.compile(r'\bCONNECT_BY_ROOT\s+(?P<col>[\w.]+)', re.IGNORECASE)
+_HIER_COMPOUND = re.compile(r'\b(AND|OR)\b', re.IGNORECASE)
+
+
+def _hier_colname(ref: str) -> str:
+    return ref.split('.')[-1].strip()
+
+
+def _translate_connect_by(sql: str) -> str:
+    """Rewrite an Oracle CONNECT BY hierarchical query to a PostgreSQL WITH
+    RECURSIVE CTE, or return it unchanged when it is not a shape we translate."""
+    if _HAS_CONNECT_BY.search(sql) is None:
+        return sql
+    match = _HIER_QUERY.match(sql)
+    if match is None or match.group('siblings'):
+        return sql
+    proj = match.group('proj').strip()
+    from_clause = match.group('from').strip()
+    where = match.group('where')
+    start_with = match.group('sw_a') or match.group('sw_b')
+    connect_by = (
+        match.group('cb_a') or match.group('cb_b') or match.group('cb_c')
+    ).strip()
+    order = match.group('order')
+
+    table_match = _HIER_SINGLE_TABLE.match(from_clause)
+    if table_match is None:  # a join, subquery or comma-list is not a single table
+        return sql
+    table = table_match.group('table')
+    alias = table_match.group('alias') or table
+
+    if _HIER_COMPOUND.search(connect_by):  # a compound CONNECT BY is not modelled
+        return sql
+    cond = _HIER_CB_COND.match(connect_by)
+    if cond is None:
+        return sql
+    left, right = cond.group('l').strip(), cond.group('r').strip()
+    left_prior, right_prior = _HIER_PRIOR.match(left), _HIER_PRIOR.match(right)
+    # PRIOR must be on exactly one side.
+    if left_prior is not None and right_prior is None:
+        prior_side, child_side = left_prior.group('col'), right
+    elif right_prior is not None and left_prior is None:
+        prior_side, child_side = right_prior.group('col'), left
+    else:
+        return sql
+    if not (_HIER_SIMPLE_COL.match(prior_side) and _HIER_SIMPLE_COL.match(child_side)):
+        return sql  # both operands must be plain column references
+    parent_col, child_col = _hier_colname(prior_side), _hier_colname(child_side)
+
+    if _HIER_STAR.search(proj):  # SELECT * would leak the CTE's computed columns
+        return sql
+
+    scan = ' '.join(part for part in (proj, where, order) if part)
+    paths = {(col.lower(), sep) for col, sep in _HIER_PATH.findall(scan)}
+    roots = {col.lower() for col in _HIER_ROOT.findall(scan)}
+    if len(paths) > 1 or len(roots) > 1:  # v1 handles one distinct path / root
+        return sql
+
+    def rewrite(text: str) -> str:
+        text = _HIER_LEVEL.sub('__level', text)
+        text = _HIER_PATH.sub('__path', text)
+        return _HIER_ROOT.sub('__root', text)
+
+    anchor_cols = ['1 AS __level']
+    rec_cols = ['__p.__level + 1']
+    if paths:
+        path_match = _HIER_PATH.search(scan)
+        assert path_match is not None
+        pcol, sep = _hier_colname(path_match.group('col')), path_match.group('sep')
+        anchor_cols.append(f"'{sep}' || {alias}.{pcol} AS __path")
+        rec_cols.append(f"__p.__path || '{sep}' || {alias}.{pcol}")
+    if roots:
+        root_match = _HIER_ROOT.search(scan)
+        assert root_match is not None
+        anchor_cols.append(
+            f'{alias}.{_hier_colname(root_match.group("col"))} AS __root'
+        )
+        rec_cols.append('__p.__root')
+
+    anchor_where = f' WHERE {start_with.strip()}' if start_with else ''
+    join = f'__p.{parent_col} = {alias}.{child_col}'
+    outer_where = f' WHERE {rewrite(where).strip()}' if where else ''
+    outer_order = f' ORDER BY {rewrite(order).strip()}' if order else ''
+    return (
+        'WITH RECURSIVE __hcte AS ('
+        f'SELECT {alias}.*, '
+        + ', '.join(anchor_cols)
+        + f' FROM {table} {alias}{anchor_where}'
+        ' UNION ALL '
+        f'SELECT {alias}.*, '
+        + ', '.join(rec_cols)
+        + f' FROM {table} {alias} JOIN __hcte __p ON {join}'
+        f') SELECT {rewrite(proj)} FROM __hcte {alias}{outer_where}{outer_order}'
+    )
+
+
 def _translate_idioms(sql: str) -> str:
     """Rewrite the Oracle SQL functions / literal idioms the suite uses to their
     PostgreSQL equivalents (#502). Applied to every statement."""
+    sql = _translate_connect_by(sql)
     for pattern, replacement in _IDIOM_REWRITES:
         sql = pattern.sub(replacement, sql)
     return _TSTZ_LITERAL.sub(_tstz_literal_sub, sql)
