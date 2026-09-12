@@ -6675,5 +6675,69 @@ class TestFv2UnassignedOutBind(unittest.TestCase):
         self.assertEqual(out, [None])
 
 
+class TestFv2ChunkedErrorMessage(unittest.TestCase):
+    """A 9i/8i server error longer than 64 bytes arrives as a chunked string:
+    the 0xFE marker, then a length byte per 64-byte chunk, ending with a zero
+    length (#810).
+
+    Reading the length byte directly only ever found a message short enough to
+    be one chunk. A longer one came back with its chunk lengths spliced in as
+    characters -- 64 reads as '@', 13 as a carriage return -- truncated at the
+    front, or, when no single byte happened to fit, lost entirely so the caller
+    fell back to a bare "ORA-NNNNN". Captured live from 9.2.0.4.
+    """
+
+    # BEGIN nosuchthing_xyz; END; -- note the `40` chunk length sitting between
+    # NOSUCHTHING_ and XYZ, and the `0d` inside "Statement", both of which used
+    # to be read as text.
+    CHUNKED_OER = bytes.fromhex(
+        '04000219960000010101062f00000000000000000000000000000000000000'
+        'fe404f52412d30363535303a206c696e6520312c20636f6c756d6e20373a0a'
+        '504c532d30303230313a206964656e74696669657220274e4f535543485448'
+        '494e475f4058595a27206d757374206265206465636c617265640a4f52412d'
+        '30363535303a206c696e6520312c20636f6c756d6e20373a0a504c2f53514c'
+        '3a2053746174650d6d656e742069676e6f7265640a00'
+    )
+    EXPECTED = (
+        'ORA-06550: line 1, column 7:\n'
+        "PLS-00201: identifier 'NOSUCHTHING_XYZ' must be declared\n"
+        'ORA-06550: line 1, column 7:\n'
+        'PL/SQL: Statement ignored'
+    )
+
+    def test_chunked_message_decodes_whole(self):
+        from seerdb.common.tns import decode_fv2_oer_error
+
+        (Code, Message) = decode_fv2_oer_error(self.CHUNKED_OER)
+        self.assertEqual(Code, 6550)
+        self.assertEqual(Message, self.EXPECTED)
+
+    def test_chunk_lengths_do_not_leak_into_the_text(self):
+        from seerdb.common.tns import decode_fv2_oer_error
+
+        (_Code, Message) = decode_fv2_oer_error(self.CHUNKED_OER)
+        # The two that used to appear, at the chunk boundaries.
+        self.assertIn("'NOSUCHTHING_XYZ'", Message)
+        self.assertNotIn('@', Message)
+        self.assertIn('Statement ignored', Message)
+        self.assertNotIn('\r', Message)
+        # And the terminator is not part of the message.
+        self.assertNotIn('\x00', Message)
+
+    def test_a_short_single_chunk_message_still_decodes(self):
+        from seerdb.common.tns import decode_fv2_oer_error
+
+        # The pre-existing form: one length byte, message runs to the end.
+        Text = b'ORA-00942: table or view does not exist'
+        Packet = (
+            bytes.fromhex('04000219960000010101062f')
+            + bytes(19)
+            + bytes([len(Text)])
+            + Text
+        )
+        (_Code, Message) = decode_fv2_oer_error(Packet)
+        self.assertEqual(Message, 'ORA-00942: table or view does not exist')
+
+
 if __name__ == '__main__':
     unittest.main()
