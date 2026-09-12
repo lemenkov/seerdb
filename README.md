@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/seerdb-mark-paper.svg">
+  <img src="assets/seerdb-mark-ink.svg" alt="" width="76" align="right">
+</picture>
+
 # seerdb
 
 A pure-Python driver for a proprietary database, implementing the

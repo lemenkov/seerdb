@@ -40,3 +40,22 @@ path = ["tests/fixtures/ano_server_response.bin"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Peter Lemenkov <lemenkov@gmail.com>"
 SPDX-License-Identifier = "CC0-1.0"
+
+# The project mark. Image files cannot carry an inline SPDX header, so they are
+# annotated here. The mark is content rather than code and is licensed
+# CC-BY-ND-4.0: it may be redistributed freely to refer to the project, but not
+# altered into a variant brand. Note that CC-BY-ND is allowed for content in
+# Fedora but is not DFSG-free, so a Debian package would strip or repack these
+# files; revisit the licence if that request ever arrives.
+[[annotations]]
+path = ["assets/*.svg", "assets/*.png"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Peter Lemenkov <lemenkov@gmail.com>"
+SPDX-License-Identifier = "CC-BY-ND-4.0"
+
+# The accompanying documentation is ordinary prose, not the mark, so it stays MIT.
+[[annotations]]
+path = ["assets/README.md"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Peter Lemenkov <lemenkov@gmail.com>"
+SPDX-License-Identifier = "MIT"

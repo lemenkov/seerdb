@@ -9,6 +9,7 @@ on:
     # Docs-only changes have no code for CodeQL to analyse — skip them.
     paths-ignore:
       - '**.md'
+      - 'assets/**'
       - 'docs/**'
       - 'ChangeLog'
       - 'LICENSES/**'
@@ -21,6 +22,7 @@ on:
     branches: [master]
     paths-ignore:
       - '**.md'
+      - 'assets/**'
       - 'docs/**'
       - 'ChangeLog'
       - 'LICENSES/**'

@@ -12,6 +12,7 @@ on:
     # file matches. (CI budget, #7)
     paths-ignore:
       - '**.md'
+      - 'assets/**'
       - 'docs/**'
       - 'ChangeLog'
       - 'LICENSES/**'
@@ -24,6 +25,7 @@ on:
     branches: [master]
     paths-ignore:
       - '**.md'
+      - 'assets/**'
       - 'docs/**'
       - 'ChangeLog'
       - 'LICENSES/**'
