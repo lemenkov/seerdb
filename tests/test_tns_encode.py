@@ -7117,6 +7117,106 @@ class TestO8iQueryMessages(unittest.TestCase):
         )
 
 
+class TestO9iOall8Messages(unittest.TestCase):
+    # The native 9i (9.2) OALL8 write path (#716). Pinned against a live native
+    # 9.2-client trace (~/o8i/captures/ret_9i.pcap, extract ret9i_c2s.hex): the
+    # 64-bit form of the 8i OALL8 -- every pointer / length field widened to 8
+    # bytes, a present-pointer indicator (0xFE...) where the 8i form writes a 1
+    # byte flag. Same opcode (0x5e), same SQL text and bind values as 8i; only
+    # the field widths differ. See docs/PROTOCOL.md 19.14.
+
+    # The native client's head+mid (opcode..SQL) for its captured statement,
+    # `INSERT INTO ret716 (id) VALUES (:1) RETURNING id INTO :2`. Verbatim from
+    # the pcap: the pointer slots carry the client's real heap addresses (which
+    # the server ignores) and the bind count is 2 (an IN bind :1 and the
+    # RETURNING OUT bind :2).
+    NATIVE_RET9I_HEADMID = bytes.fromhex(
+        '035e072905040000000000d89b51000000000038000000000000006c56510000'
+        '0000000c0000000000000000000000000000009c565100000000000000000001'
+        '000000000000000000000018b051000000000002000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000009e56510000'
+        '00000018b0510000000000000000000000000038'
+    )
+    # The 8-byte pointer slots and the 8-byte bind-count slot within that
+    # head+mid: the only fields that legitimately differ between the encoder
+    # (0xFE sentinel, exact bind count) and a live client (real addresses, and
+    # here 2 binds for the RETURNING form). Everything else must match.
+    _PTR_OFFSETS = (11, 27, 51, 75, 123, 131)
+    _NBINDS_OFF = 83
+
+    def _mask(self, buf):
+        b = bytearray(buf)
+        for off in (*self._PTR_OFFSETS, self._NBINDS_OFF):
+            b[off : off + 8] = bytes(8)
+        return bytes(b)
+
+    def test_9i_oall8_matches_native_client(self):
+        # The encoder reproduces the native 9.2 client's OALL8 head+mid
+        # byte-for-byte apart from the ignored heap pointers and the bind count.
+        from seerdb.common.tns import (
+            O8I_STMT_INSERT,
+            encode_9i_oall8_dml,
+        )
+
+        sql = b'INSERT INTO ret716 (id) VALUES (:1) RETURNING id INTO :2'
+        msg = encode_9i_oall8_dml(0x07, sql, O8I_STMT_INSERT, [42])
+        head_mid = msg[: msg.find(sql)]
+        self.assertEqual(len(head_mid), len(self.NATIVE_RET9I_HEADMID))
+        self.assertEqual(self._mask(head_mid), self._mask(self.NATIVE_RET9I_HEADMID))
+
+    def test_9i_oall8_widths_are_ub8(self):
+        # The SQL length and the fixed `12` field ride as 8-byte little-endian
+        # counts (the 8i form writes them as ub4); the pointer indicator is the
+        # 8-byte 0xFE sentinel, present once per pointer slot.
+        from seerdb.common import oci
+        from seerdb.common.tns import O8I_STMT_INSERT, encode_9i_oall8_dml
+
+        sql = b'INSERT INTO t9 (id) VALUES (:1)'
+        msg = encode_9i_oall8_dml(0x06, sql, O8I_STMT_INSERT, [42])
+        head_mid = msg[: msg.find(sql)]
+        self.assertIn(len(sql).to_bytes(8, 'little'), head_mid)  # SQL len as ub8
+        self.assertIn((12).to_bytes(8, 'little'), head_mid)
+        self.assertEqual(head_mid.count(oci.OCI_INDICATOR), 6)  # 6 pointer slots
+
+    def test_9i_oall8_insert_byte_exact(self):
+        # A full byte-exact pin of a plain 1-bind INSERT (NUMBER 42): head+mid in
+        # the 64-bit layout, the SQL text, the trailer, then the ub8 bind OAC and
+        # the shared 8i bind value (`07 02 c1 2b`). Guards the whole write path.
+        from seerdb.common.tns import O8I_STMT_INSERT, encode_9i_oall8_dml
+
+        sql = b'INSERT INTO t9 (id) VALUES (:1)'
+        expected = bytes.fromhex(
+            '035e062905040000000000feffffffffffffff1f00000000000000feffffffff'
+            'ffffff0c000000000000000000000000000000feffffffffffffff0000000001'
+            '0000000000000000000000feffffffffffffff01000000000000000000000000'
+            '000000000000000000000000000000000000000000000000000000feffffffff'
+            'fffffffeffffffffffffff00000000000000001f494e5345525420494e544f20'
+            '743920286964292056414c55455320283a312901000000010000000000000000'
+            '0000000000000000000000000000000400000000000000000000000000000000'
+            '0000000102010000160000000000000000000000000000000000000000000000'
+            '0000000000000000000000000702c12b'
+        )
+        self.assertEqual(
+            encode_9i_oall8_dml(0x06, sql, O8I_STMT_INSERT, [42]), expected
+        )
+
+    def test_9i_oall8_ddl_no_binds_byte_exact(self):
+        # A no-bind DDL: bind option clear, byte4 0x81, no OAC / value section.
+        from seerdb.common.tns import O8I_STMT_CREATE, encode_9i_oall8_dml
+
+        sql = b'CREATE TABLE t9 (id NUMBER)'
+        expected = bytes.fromhex(
+            '035e052181000000000000feffffffffffffff1b00000000000000feffffffff'
+            'ffffff0c000000000000000000000000000000feffffffffffffff0000000001'
+            '0000000000000000000000000000000000000000000000000000000000000000'
+            '000000000000000000000000000000000000000000000000000000feffffffff'
+            'fffffffeffffffffffffff00000000000000001b435245415445205441424c45'
+            '20743920286964204e554d424552290100000001000000000000000000000000'
+            '00000000000000000000000500000000000000000000000000000000000000'
+        )
+        self.assertEqual(encode_9i_oall8_dml(0x05, sql, O8I_STMT_CREATE, []), expected)
+
+
 class TestShortLengthBoundary(unittest.TestCase):
     """A single length byte announces at most 252 bytes (#707).
 

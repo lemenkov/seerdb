@@ -3596,6 +3596,45 @@ shared `_encode_o8i_lobop` envelope. Driver: `_resolve_8i_lobs` →
 temp-BLOB helper, removing its `CREATE PROCEDURE` requirement and the stored
 function it left in the user's schema — the same win #46 brought to 10g+/21c.
 
+### 19.14 Oracle 9i native OALL8 — the 64-bit thick request form (#716)
+
+9i can speak the same OALL8 (`0x5e`) as 8i, but a native 9.2 OCI client marshals
+it in a **64-bit** form. seerdb's ordinary 9i path uses the compact minimal-caps
+request (the JDBC-thin form, §19.1–19.8); this native form is an opt-in
+(`oall8=True`) that a live capture shows the server accepts once two login bytes
+are negotiated — `compile_caps[CCAP_FIELD_VERSION]` (index 7) = 2 and a two-byte
+`runtime_caps` `02 01` (the added `01` is the word-size cap). Without the
+word-size cap the server reads the 64-bit fields as 32-bit and raises
+`ORA-03120` ("two-task conversion routine: integer overflow") on every statement.
+
+The request is the **same token stream** as the other tiers — same opcode, same
+SQL text, same bind values — differing only in two field widths. Measured across
+captures (`~/o8i/captures/phaseA_thick_vs_thin_11g.md`), the width ladder is:
+
+| form | pointer field | length field | source |
+| --- | --- | --- | --- |
+| thin (10g+ seerdb) | `01` (1 byte) | ub1 / ub2 compact | live |
+| 8i native (§19.9) | `01` (1 byte) | ub4 (4-byte LE) | `ret_8i.pcap` |
+| 11g thick (64-bit OCI) | 8-byte `0xFE` sentinel | ub4 (4-byte LE) | `capA_thick_11g.log` |
+| **9i native (64-bit)** | **8-byte `0xFE` sentinel** | **ub8 (8-byte LE)** | `ret_9i.pcap` |
+
+The two widths are independently negotiated (11g thick pairs 8-byte pointers with
+ub4 lengths); 9i native is the widest rung — both pointer and length are 64-bit.
+The pointer slots carry the client's heap addresses, which the **server ignores**,
+so the encoder writes the `0xFFFFFFFFFFFFFFFE` (`oci.OCI_INDICATOR`) sentinel
+instead. The SQL-length anchor makes this concrete: 56 rides as `38 00 00 00`
+(ub4) on 8i / 11g-thick and `38 00 00 00 00 00 00 00` (ub8) on 9i.
+
+So the 9i encoder is the 8i encoder (§19.9, §19.11–19.12) with every pointer and
+length field widened to 8 bytes and the `0xFE` present-pointer sentinel where the
+8i form writes a `01` flag; the SQL text and the bind values (`_encode_8i_bind_value`,
+e.g. `07 02 c1 2b` for NUMBER 42) are shared verbatim. Encoders:
+`_encode_9i_oall8` / `encode_9i_oall8_dml` / `_encode_9i_bind_oac`. Scope so far
+is DML / DDL and transaction control with scalar binds, byte-verified against a
+native 9.2 client (`test_tns_encode.TestO9iOall8Messages`); SELECT, PL/SQL blocks
+and the DML ... RETURNING reply are later increments. All of this is behind the
+`oall8` opt-in, so the default 9i path is byte-identical.
+
 ## 20. Oracle 23ai field version 24 — fast-auth + the fv24 framing (#89)
 
 Column **annotations** are only delivered when the client advertises a TTC
