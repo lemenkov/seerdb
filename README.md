@@ -25,6 +25,9 @@ scrollable cursors, 23ai types (JSON / `BOOLEAN` / `VECTOR`), and the SODA
 document store. It is usable for the features listed below; the feature matrix
 spells out what is and isn't supported.
 
+[`ROADMAP.md`](ROADMAP.md) covers what is being worked on next, what is parked
+and why, and the rule that decides when the next major release is reachable.
+
 The wire protocol is reverse-engineered and implemented incrementally as a
 clean-room effort — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the rules
 contributors are expected to follow (no Oracle proprietary sources, no
