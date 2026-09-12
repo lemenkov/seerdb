@@ -89,14 +89,17 @@ _FV2_UNSUPPORTED = (
     # real 200-row table returns all 200 — so this is a fixture limitation, not a
     # 9i bug. Already skipped on 8i for the same reason.
     ('bit_vector_reuse', 'CONNECT BY LEVEL returns few rows on Oracle 9i'),
-    # RETURNING ... INTO needs the 10g+ request form: 9i refuses the clause for
-    # this client type (ORA-00439) and 8i drops the connection on a failure, so
-    # the driver refuses it up front (#716). The var() read-back tests reach the
-    # server through that clause.
-    ('returning', 'RETURNING ... INTO needs a 10g+ server (#716)'),
-    ('var_float_reads_back', 'RETURNING ... INTO needs a 10g+ server (#716)'),
-    ('var_decimal_reads_back', 'RETURNING ... INTO needs a 10g+ server (#716)'),
-    ('var_asked_with_a_database_type', 'RETURNING ... INTO needs a 10g+ server (#716)'),
+    # RETURNING itself now works on pre-10g through the PL/SQL block rewrite
+    # (#801, #802), but an *array* RETURNING still cannot: executemany is array
+    # DML, which these tiers do not have at all.
+    ('array_returning', 'executemany (array DML) is a 10g+ feature'),
+    # The rewrite runs the statement as a PL/SQL block, and the server rejects
+    # a quoted placeholder inside one (ORA-01006) even though plain pre-10g DML
+    # accepts it. Measured on 9i; the driver refuses it with a clear message.
+    (
+        'quoted_bind_in_returning_into',
+        'a quoted bind cannot ride the pre-10g block rewrite',
+    ),
     # The pre-10 error reply carries the code and text but no position.
     ('error_offset', 'the 9i/8i error reply carries no offset (#719)'),
 )
@@ -1990,31 +1993,27 @@ class CursorCacheIntegration(_IntegrationBase):
         # ORA-00439), but the identical statement runs inside a PL/SQL block
         # where the INTO targets are ordinary OUT binds, so the driver rewrites
         # it there (#801). 8i keeps refusing (#802).
-        from seerdb.client.dialect import O8iDialect
-
         if self.conn.field_version >= FIELD_VERSION_10_2:
             self.skipTest('RETURNING ... INTO takes the native path from 10g')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
         Sql = f'INSERT INTO {self.TABLE} (id) VALUES (:1) RETURNING id INTO :2'
         Got = self.cur.var(int)
-        if isinstance(getattr(self.conn, '_dialect', None), O8iDialect):
-            with self.assertRaises(seerdb.NotSupportedError):
-                self.cur.execute(Sql, [1, Got])
-        else:
-            self.cur.execute(Sql, [1, Got])
-            self.assertEqual(Got.getvalue(), 1)
-            # The row count must come from SQL%ROWCOUNT, not from the block
-            # itself -- a block reports its own execution, always 1.
-            self.assertEqual(self.cur.rowcount, 1)
-            # A statement that matches nothing reports zero rows and no value,
-            # rather than failing to decode the reply.
-            Miss = self.cur.var(int)
-            self.cur.execute(
-                f'UPDATE {self.TABLE} SET id = 9 WHERE id = :1 RETURNING id INTO :2',
-                [12345, Miss],
-            )
-            self.assertIsNone(Miss.getvalue())
-            self.assertEqual(self.cur.rowcount, 0)
+        self.cur.execute(Sql, [1, Got])
+        # A RETURNING bind hands back one entry per affected row, exactly as it
+        # does on 10g+ -- the rewrite must not change the shape callers see.
+        self.assertEqual(Got.getvalue(), [1])
+        # The row count must come from SQL%ROWCOUNT, not from the block itself --
+        # a block reports its own execution, always 1.
+        self.assertEqual(self.cur.rowcount, 1)
+        # A statement that matches nothing reports zero rows and no value,
+        # rather than failing to decode the reply.
+        Miss = self.cur.var(int)
+        self.cur.execute(
+            f'UPDATE {self.TABLE} SET id = 9 WHERE id = :1 RETURNING id INTO :2',
+            [12345, Miss],
+        )
+        self.assertEqual(Miss.getvalue(), [])  # 10g+ reports [] for no rows
+        self.assertEqual(self.cur.rowcount, 0)
         # Either way the session stays usable.
         self.cur.execute(f'INSERT INTO {self.TABLE} (id) VALUES (:1)', [2])
         self.cur.execute(f'SELECT id FROM {self.TABLE} ORDER BY id')

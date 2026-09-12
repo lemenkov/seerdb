@@ -399,7 +399,7 @@ class TestPreTenReturningWrap(unittest.TestCase):
         )
         self.assertEqual(Name, 'seerdb_rowcount_')
 
-    def test_rowcount_is_lifted_out_of_the_out_record(self):
+    def test_rowcount_is_lifted_and_the_record_becomes_a_return_record(self):
         from seerdb.client._conn_logic import returning_block_result
 
         # Two user binds, so the appended rowcount bind sits at position 2.
@@ -410,35 +410,74 @@ class TestPreTenReturningWrap(unittest.TestCase):
         Result = (0, 0, 0, (None, None), [Record], None, None, [], None)
         Out = returning_block_result(Result, 2)
         self.assertEqual(Out[3][0], 1)  # SQL%ROWCOUNT, not the block's own count
-        # The appended bind is gone; the caller's OUT bind is untouched.
-        self.assertEqual(Out[4][0]['out_positions'], [1])
-        self.assertEqual(Out[4][0]['out_values'], [bytes.fromhex('c107')])
+        # Re-labelled as the record the native RETURNING path decodes, so the
+        # value reaches the caller as a list exactly as it does on 10g+.
+        self.assertEqual(Out[4][0]['return_positions'], [1])
+        self.assertEqual(Out[4][0]['return_values'], [[bytes.fromhex('c107')]])
+        self.assertNotIn('out_positions', Out[4][0])
 
-    def test_zero_rows_reports_zero_not_missing(self):
+    def test_zero_rows_is_an_empty_list_not_a_missing_value(self):
         from seerdb.client._conn_logic import returning_block_result
 
+        # A statement that matched nothing: the RETURNING bind is unassigned.
         Record = {'out_positions': [1, 2], 'out_values': [None, bytes.fromhex('80')]}
         Result = (0, 0, 0, (None, None), [Record], None, None, [], None)
         Out = returning_block_result(Result, 2)
         self.assertEqual(Out[3][0], 0)
-        self.assertEqual(Out[4][0]['out_values'], [None])
+        # 10g+ reports [] for a RETURNING that matched no rows; match it.
+        self.assertEqual(Out[4][0]['return_values'], [[]])
 
-    def test_9i_is_allowed_and_8i_is_refused(self):
+    def test_both_pre_10g_tiers_are_served(self):
         import types
 
         from seerdb.client.cursor import _check_returning_support
         from seerdb.client.dialect import Fv2Dialect, O8iDialect
-        from seerdb.common.exceptions import NotSupportedError
         from seerdb.common.tns_consts import FIELD_VERSION_9_2
 
         Binds = frozenset({1})
-        Nine = types.SimpleNamespace(
-            field_version=FIELD_VERSION_9_2, _dialect=Fv2Dialect()
-        )
-        _check_returning_support(Nine, Binds)  # 9i: served by the wrap
+        for Dialect in (Fv2Dialect(), O8iDialect(lambda: 0)):
+            Conn = types.SimpleNamespace(
+                field_version=FIELD_VERSION_9_2, _dialect=Dialect
+            )
+            _check_returning_support(Conn, Binds)  # served by the block rewrite
 
-        Eight = types.SimpleNamespace(
-            field_version=FIELD_VERSION_9_2, _dialect=O8iDialect(lambda: 0)
+    def test_a_dialect_without_blocks_is_refused(self):
+        import types
+
+        from seerdb.client.cursor import _check_returning_support
+        from seerdb.common.exceptions import NotSupportedError
+        from seerdb.common.tns_consts import FIELD_VERSION_9_2
+
+        class NoBlocks:
+            def capabilities(self):
+                return frozenset({'dml'})
+
+        Conn = types.SimpleNamespace(
+            field_version=FIELD_VERSION_9_2, _dialect=NoBlocks()
         )
         with self.assertRaises(NotSupportedError):
-            _check_returning_support(Eight, Binds)
+            _check_returning_support(Conn, frozenset({1}))
+
+    def test_a_quoted_bind_name_is_refused_below_10g(self):
+        import types
+
+        from seerdb.client.cursor import _check_returning_support
+        from seerdb.client.dialect import Fv2Dialect
+        from seerdb.common.exceptions import NotSupportedError
+        from seerdb.common.tns_consts import FIELD_VERSION_9_2
+
+        Conn = types.SimpleNamespace(
+            field_version=FIELD_VERSION_9_2, _dialect=Fv2Dialect()
+        )
+        # Plain names go through the rewrite.
+        _check_returning_support(
+            Conn, frozenset({1}), 'INSERT INTO t (a) VALUES (:a) RETURNING id INTO :o'
+        )
+        # A quoted one cannot: the server rejects it inside the block the rewrite
+        # needs, so say that rather than surfacing a bare ORA-01006.
+        with self.assertRaises(NotSupportedError):
+            _check_returning_support(
+                Conn,
+                frozenset({1}),
+                'INSERT INTO t (a) VALUES (:"desc") RETURNING id INTO :"out"',
+            )
