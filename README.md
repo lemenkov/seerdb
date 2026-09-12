@@ -229,14 +229,22 @@ profile with the benchmark harness (#166) and optimize the Python — or ship an
 The 9i server rejects the clause in the modern request form (`ORA-00439`), so
 the driver rewrites the statement into an anonymous PL/SQL block, where the
 `INTO` targets are ordinary OUT binds — a form 9i has always supported. This is
-transparent: pass a `var()` as you would anywhere else, and `cursor.rowcount`
-reports the rows the statement touched. Multi-row `RETURNING` into scalar binds
-raises `ORA-01422` exactly as it does on a current server; there is no
-`BULK COLLECT` and no `executemany()` support, because 9i has no array DML.
+transparent: pass a `var()` as you would anywhere else, `getvalue()` returns a
+list just as it does on 10g+ (`[]` when nothing matched), and `cursor.rowcount`
+reports the rows the statement touched.
 
-**Oracle 8i.** `RETURNING ... INTO` is refused with `NotSupportedError`: the
-server drops the connection when such a statement fails, and the block rewrite
-is unverified there.
+Two limits follow from running as a block. Multi-row `RETURNING` into scalar
+binds raises `ORA-01422`, exactly as on a current server, and there is no
+`BULK COLLECT` or `executemany()` support, because these tiers have no array
+DML. A *quoted* bind name (`:"my bind"`) is refused with `NotSupportedError`:
+the server rejects a quoted placeholder inside a PL/SQL block even though plain
+pre-10g DML accepts one. Use an unquoted name.
+
+**Oracle 8i.** The same rewrite serves `RETURNING ... INTO` here too. It also
+settles an older failure mode: sent in the native form, a *failing* RETURNING
+left 8i mid-protocol and the next statement died with `ORA-00600`. Inside a
+block the same failure is an ordinary PL/SQL error — the statement raises
+`ORA-00001` and the session stays usable.
 
 `DatabaseError.offset` is `None` on both servers, whose error reply carries no
 position.

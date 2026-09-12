@@ -125,7 +125,7 @@ class AsyncCursor(_CursorLogic):
             'ArrayDmlRowCounts': ArrayDmlRowCounts,
         }
         ReturnBinds = returning_bind_positions(operation, len(Bind or []))
-        _check_returning_support(self._connection, ReturnBinds)
+        _check_returning_support(self._connection, ReturnBinds, operation)
         if ReturnBinds:  # DML RETURNING ... INTO (#120)
             Kw['ReturnBinds'] = ReturnBinds
         # Server-side scrollable open (#181), 10g+ only; 9i (fv2) falls back to

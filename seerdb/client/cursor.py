@@ -146,7 +146,7 @@ class Cursor(_CursorLogic):
             'ArrayDmlRowCounts': ArrayDmlRowCounts,
         }
         ReturnBinds = returning_bind_positions(operation, len(Bind or []))
-        _check_returning_support(self._connection, ReturnBinds)
+        _check_returning_support(self._connection, ReturnBinds, operation)
         if ReturnBinds:  # DML RETURNING ... INTO (#120)
             Kw['ReturnBinds'] = ReturnBinds
         # Server-side scrollable open (#181): mark the cursor scrollable and cap
@@ -687,31 +687,43 @@ def _resolve_lobs(Connection, Row: list) -> list:
     return Out
 
 
-def _check_returning_support(Connection, ReturnBinds) -> None:
+def _check_returning_support(Connection, ReturnBinds, Operation: str = '') -> None:
     # RETURNING ... INTO needs the 10g+ request form, which the pre-10g servers
-    # refuse for this client type -- 9i answers ORA-00439. 9i runs the identical
-    # statement wrapped in a PL/SQL block, where the INTO targets are ordinary
-    # OUT binds, so the connection rewrites it there (#801) and it is allowed
-    # here. 8i is still refused: the same trick is unverified on that tier and a
-    # failing RETURNING makes the server drop the connection (#802, #716).
-    from seerdb.client.dialect import CAP_BLOCK, O8iDialect
+    # refuse for this client type -- 9i answers ORA-00439. Both 9i and 8i run the
+    # identical statement wrapped in a PL/SQL block, where the INTO targets are
+    # ordinary OUT binds, so the connection rewrites it there (#801, #802) and it
+    # is allowed here.
+    #
+    # The rewrite also settles the failure mode #716 reported: in the native
+    # form a failing RETURNING leaves 8i mid-protocol, but inside a block the
+    # same failure is an ordinary PL/SQL error -- verified live, the statement
+    # raises ORA-00001 and the session stays usable.
+    #
+    # Only a dialect with no block path is refused, because there is nothing to
+    # rewrite into.
+    from seerdb.client.dialect import CAP_BLOCK
 
     Version = getattr(Connection, 'field_version', None)
     if not ReturnBinds or Version is None or Version >= FIELD_VERSION_10_2:
         return
     Dialect = getattr(Connection, '_dialect', None)
     Caps = Dialect.capabilities() if Dialect is not None else frozenset()
-    if isinstance(Dialect, O8iDialect):
-        raise NotSupportedError(
-            'RETURNING ... INTO is not supported on Oracle 8i '
-            '(a failing RETURNING statement drops the connection)'
-        )
     if CAP_BLOCK not in Caps:
         # No PL/SQL block path to rewrite into, so there is nothing to fall back
         # on; refuse rather than send a form the server will reject.
         raise NotSupportedError(
             'RETURNING ... INTO requires an Oracle 10g+ server '
             'or a pre-10g dialect that supports PL/SQL blocks'
+        )
+    # A quoted placeholder survives plain pre-10g DML but not the block the
+    # rewrite needs: the server answers ORA-01006 for `:"name"` inside a block,
+    # measured on 9i. Say so, rather than let that surface as a bare ORA.
+    if Operation and any(Quoted for _Name, Quoted in bind_placeholders(Operation)):
+        raise NotSupportedError(
+            'RETURNING ... INTO with a quoted bind name is not supported below '
+            '10g: the statement has to run as a PL/SQL block there, and the '
+            'server rejects a quoted placeholder inside one (ORA-01006). '
+            'Use an unquoted bind name.'
         )
 
 

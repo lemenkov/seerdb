@@ -553,13 +553,24 @@ def returning_block_request(Query: str, Bind: list) -> tuple[str, list]:
 
 
 def returning_block_result(Result, NumBinds: int):
-    """Move the appended ``SQL%ROWCOUNT`` OUT value into the result's rowcount slot.
+    """Make the block's reply look like a native DML RETURNING reply.
 
-    A PL/SQL block reports its own execution as the row count -- measured as 1
+    Two things have to be corrected before the cursor sees it.
+
+    The row count: a PL/SQL block reports its own execution -- measured as 1
     however many rows the DML touched -- so the real figure rides in the extra
-    bind :func:`returning_block_request` appended. Lift it out of the OUT record,
-    which the caller's bind list has no slot for, and put it where every other
-    statement's row count lives.
+    bind :func:`returning_block_request` appended, and is lifted into the slot
+    every other statement's row count lives in.
+
+    The shape: a native RETURNING bind hands back **a list, one entry per
+    affected row** (``[2]``, or ``[]`` when nothing matched), which is what
+    python-oracledb does and what callers on 10g+ already see. Read as a PL/SQL
+    OUT bind it would arrive as a bare scalar instead, so the same code would
+    need writing twice to be portable across tiers. Re-label the record as the
+    return record the cursor's native path decodes, and the tiers agree.
+
+    The block form binds at most one row -- Oracle raises ORA-01422 for more, as
+    it does anywhere else -- so each list holds one value or none.
     """
     from decimal import Decimal
 
@@ -570,18 +581,20 @@ def returning_block_result(Result, NumBinds: int):
     Rows = Result[4]
     if not Rows or not isinstance(Rows[0], dict) or 'out_positions' not in Rows[0]:
         return Result
-    Record = dict(Rows[0])
-    Positions = list(Record.get('out_positions') or [])
-    Values = list(Record.get('out_values') or [])
+    Record = Rows[0]
     RowCount = None
-    if NumBinds in Positions:
-        Index = Positions.index(NumBinds)
-        Positions.pop(Index)
-        Raw = Values.pop(Index) if Index < len(Values) else None
-        Decoded = decode_value({'data_type': TNS_TYPE_NUMBER}, Raw or None)
-        if isinstance(Decoded, (int, float, Decimal)):
-            RowCount = int(Decoded)
-    Record['out_positions'] = Positions
-    Record['out_values'] = Values
+    ReturnPositions: list = []
+    ReturnValues: list = []
+    for Pos, Raw in zip(
+        Record.get('out_positions') or [], Record.get('out_values') or []
+    ):
+        if Pos == NumBinds:  # the appended SQL%ROWCOUNT bind
+            Decoded = decode_value({'data_type': TNS_TYPE_NUMBER}, Raw or None)
+            if isinstance(Decoded, (int, float, Decimal)):
+                RowCount = int(Decoded)
+            continue
+        ReturnPositions.append(Pos)
+        ReturnValues.append([Raw] if Raw else [])
+    NewRecord = {'return_positions': ReturnPositions, 'return_values': ReturnValues}
     Meta = Result[3][1] if isinstance(Result[3], tuple) and len(Result[3]) > 1 else None
-    return Result[:3] + ((RowCount, Meta), [Record]) + Result[5:]
+    return Result[:3] + ((RowCount, Meta), [NewRecord]) + Result[5:]
