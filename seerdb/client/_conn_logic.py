@@ -539,6 +539,17 @@ class _ConnectionLogic:
             raise from_ora_code(ErrCode)(Message or f'ORA-{ErrCode:05d}', code=ErrCode)
 
 
+def _pre10_tier_name_for(Dialect) -> str:
+    """``8i`` or ``9i`` for a pre-10g dialect, so a refusal names the real server.
+
+    Both tiers negotiate TTC field version 2, so the version alone cannot tell
+    them apart and a hard-coded "Oracle 9i" in a message is wrong half the time.
+    """
+    from seerdb.client.dialect import O8iDialect
+
+    return '8i' if isinstance(Dialect, O8iDialect) else '9i'
+
+
 def returning_block_request(Query: str, Bind: list) -> tuple[str, list]:
     """A pre-10g ``DML ... RETURNING ... INTO`` rewritten as a block request (#801).
 
@@ -598,3 +609,29 @@ def returning_block_result(Result, NumBinds: int):
     NewRecord = {'return_positions': ReturnPositions, 'return_values': ReturnValues}
     Meta = Result[3][1] if isinstance(Result[3], tuple) and len(Result[3]) > 1 else None
     return Result[:3] + ((RowCount, Meta), [NewRecord]) + Result[5:]
+
+
+# Oracle raises this when a SELECT ... INTO or a RETURNING ... INTO with scalar
+# targets matches more than one row.
+_ORA_TOO_MANY_ROWS = 1422
+
+
+def returning_block_error(Error):
+    """Explain a pre-10g RETURNING failure that is really a shape limitation.
+
+    A statement matching several rows is the one case where the block rewrite
+    and the native path genuinely differ: 10g+ hands back every returned row,
+    while the block binds scalars and Oracle answers ORA-01422. Left alone that
+    surfaces as a bare "ORA-01422" with nothing to connect it to the tier, so
+    translate it; any other error is returned untouched for the caller to raise.
+    """
+    from seerdb.common.exceptions import NotSupportedError
+
+    if getattr(Error, 'code', None) != _ORA_TOO_MANY_ROWS:
+        return Error
+    return NotSupportedError(
+        'a DML ... RETURNING ... INTO that affects more than one row needs an '
+        'Oracle 10g+ server: below 10g the statement runs as a PL/SQL block, '
+        'whose scalar INTO targets can take a single row (ORA-01422). Restrict '
+        'the statement to one row, or read the rows back with a SELECT.'
+    )

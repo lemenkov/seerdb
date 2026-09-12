@@ -16,6 +16,8 @@ import uuid
 
 from seerdb.client._conn_logic import (
     _ConnectionLogic,
+    _pre10_tier_name_for,
+    returning_block_error,
     returning_block_request,
     returning_block_result,
 )
@@ -1462,7 +1464,8 @@ class OracleConnect(_ConnectionLogic):
                 from seerdb.common.exceptions import NotSupportedError
 
                 raise NotSupportedError(
-                    'executemany (array DML) is not supported on Oracle 9i'
+                    'executemany (array DML) is not supported on Oracle '
+                    + _pre10_tier_name_for(self._dialect)
                 )
             if Head.startswith('SELECT'):
                 return self._drain_cursor(
@@ -1478,10 +1481,11 @@ class OracleConnect(_ConnectionLogic):
                 # they have always supported. So the clause costs no new wire
                 # format, only a rewrite.
                 Wrapped, BlockBind = returning_block_request(Query, Bind)
-                Result = returning_block_result(
-                    self._drive(self._dialect.execute_block(Wrapped, BlockBind)),
-                    len(Bind),
-                )
+                try:
+                    Raw = self._drive(self._dialect.execute_block(Wrapped, BlockBind))
+                except DatabaseError as Exc:
+                    raise returning_block_error(Exc) from None
+                Result = returning_block_result(Raw, len(Bind))
             else:  # DML (INSERT/UPDATE/DELETE)
                 Result = self._drive(self._dialect.execute_dml(Query, Bind))
             if self.autocommit:

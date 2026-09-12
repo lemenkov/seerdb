@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2019 Peter Lemenkov <lemenkov@gmail.com>
 # SPDX-License-Identifier: MIT
 
+import re
 from typing import Any
 
 from seerdb.client._cursor_logic import _CursorLogic
@@ -24,6 +25,7 @@ from seerdb.common.sqltext import (
     canonical_bind_key,
     is_plsql,
     returning_bind_positions,
+    strip_non_bind_text,
 )
 from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
@@ -38,6 +40,9 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_RAW,
     UTF8_CHARSET,
 )
+
+# `RETURNING col BULK COLLECT INTO :x` -- the bulk form of the clause.
+_BULK_COLLECT_RE = re.compile(r'\bBULK\s+COLLECT\b', re.I)
 
 
 class cursor(RefCursorBind):
@@ -714,6 +719,16 @@ def _check_returning_support(Connection, ReturnBinds, Operation: str = '') -> No
         raise NotSupportedError(
             'RETURNING ... INTO requires an Oracle 10g+ server '
             'or a pre-10g dialect that supports PL/SQL blocks'
+        )
+    # BULK COLLECT gathers every returned row into a collection, which the
+    # rewrite's scalar OUT binds cannot hold and these tiers have no array DML
+    # to fill anyway. Refuse before the server answers with a PL/SQL compile
+    # error whose text is itself unreliable here (#810).
+    if Operation and _BULK_COLLECT_RE.search(strip_non_bind_text(Operation)):
+        raise NotSupportedError(
+            'RETURNING ... BULK COLLECT INTO is not supported below 10g: the '
+            'statement runs as a PL/SQL block there and its INTO targets are '
+            'scalar binds. Return a single row, or read the rows with a SELECT.'
         )
     # A quoted placeholder survives plain pre-10g DML but not the block the
     # rewrite needs: the server answers ORA-01006 for `:"name"` inside a block,
