@@ -361,3 +361,84 @@ class TestReturningIsRefusedBelow10g(unittest.TestCase):
         _check_returning_support(
             types.SimpleNamespace(field_version=FIELD_VERSION_9_2), frozenset()
         )
+
+
+class TestPreTenReturningWrap(unittest.TestCase):
+    """Pre-10g `DML ... RETURNING ... INTO` is served by rewriting it into an
+    anonymous PL/SQL block, where the INTO targets are ordinary OUT binds (#801).
+    """
+
+    def test_wrap_shape(self):
+        from seerdb.common.sqltext import wrap_returning_in_block
+
+        SQL, Name = wrap_returning_in_block(
+            'INSERT INTO t (id) VALUES (:1) RETURNING id INTO :2'
+        )
+        self.assertEqual(Name, 'seerdb_rowcount')
+        self.assertEqual(
+            SQL,
+            'BEGIN INSERT INTO t (id) VALUES (:1) RETURNING id INTO :2; '
+            ':seerdb_rowcount := SQL%ROWCOUNT; END;',
+        )
+
+    def test_trailing_semicolon_would_close_the_block_early(self):
+        from seerdb.common.sqltext import wrap_returning_in_block
+
+        SQL, _ = wrap_returning_in_block('DELETE FROM t RETURNING id INTO :1 ;  ')
+        self.assertEqual(
+            SQL,
+            'BEGIN DELETE FROM t RETURNING id INTO :1; '
+            ':seerdb_rowcount := SQL%ROWCOUNT; END;',
+        )
+
+    def test_rowcount_placeholder_avoids_colliding_with_a_user_bind(self):
+        from seerdb.common.sqltext import wrap_returning_in_block
+
+        _, Name = wrap_returning_in_block(
+            'UPDATE t SET a = :seerdb_rowcount RETURNING id INTO :o'
+        )
+        self.assertEqual(Name, 'seerdb_rowcount_')
+
+    def test_rowcount_is_lifted_out_of_the_out_record(self):
+        from seerdb.client._conn_logic import returning_block_result
+
+        # Two user binds, so the appended rowcount bind sits at position 2.
+        Record = {
+            'out_positions': [1, 2],
+            'out_values': [bytes.fromhex('c107'), bytes.fromhex('c102')],
+        }
+        Result = (0, 0, 0, (None, None), [Record], None, None, [], None)
+        Out = returning_block_result(Result, 2)
+        self.assertEqual(Out[3][0], 1)  # SQL%ROWCOUNT, not the block's own count
+        # The appended bind is gone; the caller's OUT bind is untouched.
+        self.assertEqual(Out[4][0]['out_positions'], [1])
+        self.assertEqual(Out[4][0]['out_values'], [bytes.fromhex('c107')])
+
+    def test_zero_rows_reports_zero_not_missing(self):
+        from seerdb.client._conn_logic import returning_block_result
+
+        Record = {'out_positions': [1, 2], 'out_values': [None, bytes.fromhex('80')]}
+        Result = (0, 0, 0, (None, None), [Record], None, None, [], None)
+        Out = returning_block_result(Result, 2)
+        self.assertEqual(Out[3][0], 0)
+        self.assertEqual(Out[4][0]['out_values'], [None])
+
+    def test_9i_is_allowed_and_8i_is_refused(self):
+        import types
+
+        from seerdb.client.cursor import _check_returning_support
+        from seerdb.client.dialect import Fv2Dialect, O8iDialect
+        from seerdb.common.exceptions import NotSupportedError
+        from seerdb.common.tns_consts import FIELD_VERSION_9_2
+
+        Binds = frozenset({1})
+        Nine = types.SimpleNamespace(
+            field_version=FIELD_VERSION_9_2, _dialect=Fv2Dialect()
+        )
+        _check_returning_support(Nine, Binds)  # 9i: served by the wrap
+
+        Eight = types.SimpleNamespace(
+            field_version=FIELD_VERSION_9_2, _dialect=O8iDialect(lambda: 0)
+        )
+        with self.assertRaises(NotSupportedError):
+            _check_returning_support(Eight, Binds)

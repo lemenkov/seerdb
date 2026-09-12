@@ -8672,6 +8672,13 @@ def strip_fv2_bind_prompt(Data: bytes) -> bytes:
     return Data
 
 
+# A 9i PL/SQL block reply marks an OUT bind the block never assigned with these
+# four fixed bytes, in place of the usual DALC + indicator. Captured live: a
+# `RETURNING ... INTO` whose statement matched no rows produces one per such
+# bind, and two unassigned binds produce it twice in a row (#801).
+_FV2_OUT_UNASSIGNED = bytes.fromhex('ff020c21')
+
+
 def decode_fv2_block_out(Data: bytes, NumOut: int) -> tuple[list, int, int]:
     # Parse a 9i PL/SQL block reply that returns OUT / IN OUT values (#102,
     # PROTOCOL §19.7). After any bind prompt is stripped, the reply is an
@@ -8685,6 +8692,16 @@ def decode_fv2_block_out(Data: bytes, NumOut: int) -> tuple[list, int, int]:
     if NumOut > 0 and Rest and Rest[0] == TTI_RXD:
         Rest = Rest[1:]
         for _ in range(NumOut):
+            if Rest[:4] == _FV2_OUT_UNASSIGNED:
+                # The block never assigned this OUT bind, which is what a
+                # `RETURNING ... INTO` that matched no rows produces. It is a
+                # third form, distinct from a value (DALC + 00) and from an
+                # explicitly assigned NULL (empty DALC + 81 01), and it is not
+                # a DALC at all: reading it as one consumed the wrong number of
+                # bytes and desynced every OUT bind after it (#801).
+                Rest = Rest[4:]
+                OutValues.append(None)
+                continue
             (Val, Rest) = decode_dalc(Rest)
             if Rest and Rest[0] == 0x81:  # 81 01 NULL indicator
                 Rest = Rest[2:]

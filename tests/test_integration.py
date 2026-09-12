@@ -1985,20 +1985,40 @@ class CursorCacheIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id, d FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchall(), [(2, None)])
 
-    def test_pre_10g_refuses_the_into_clause_cleanly(self):
-        # Below 10g the clause cannot be sent (#716): the driver must say so
-        # before any I/O, and the session must stay usable afterwards.
+    def test_pre_10g_serves_the_into_clause_through_a_block(self):
+        # Below 10g the 10g+ request form is refused by the server (9i answers
+        # ORA-00439), but the identical statement runs inside a PL/SQL block
+        # where the INTO targets are ordinary OUT binds, so the driver rewrites
+        # it there (#801). 8i keeps refusing (#802).
+        from seerdb.client.dialect import O8iDialect
+
         if self.conn.field_version >= FIELD_VERSION_10_2:
-            self.skipTest('RETURNING ... INTO is supported from 10g')
+            self.skipTest('RETURNING ... INTO takes the native path from 10g')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
-        with self.assertRaises(seerdb.NotSupportedError):
+        Sql = f'INSERT INTO {self.TABLE} (id) VALUES (:1) RETURNING id INTO :2'
+        Got = self.cur.var(int)
+        if isinstance(getattr(self.conn, '_dialect', None), O8iDialect):
+            with self.assertRaises(seerdb.NotSupportedError):
+                self.cur.execute(Sql, [1, Got])
+        else:
+            self.cur.execute(Sql, [1, Got])
+            self.assertEqual(Got.getvalue(), 1)
+            # The row count must come from SQL%ROWCOUNT, not from the block
+            # itself -- a block reports its own execution, always 1.
+            self.assertEqual(self.cur.rowcount, 1)
+            # A statement that matches nothing reports zero rows and no value,
+            # rather than failing to decode the reply.
+            Miss = self.cur.var(int)
             self.cur.execute(
-                f'INSERT INTO {self.TABLE} (id) VALUES (:1) RETURNING id INTO :2',
-                [1, self.cur.var(int)],
+                f'UPDATE {self.TABLE} SET id = 9 WHERE id = :1 RETURNING id INTO :2',
+                [12345, Miss],
             )
+            self.assertIsNone(Miss.getvalue())
+            self.assertEqual(self.cur.rowcount, 0)
+        # Either way the session stays usable.
         self.cur.execute(f'INSERT INTO {self.TABLE} (id) VALUES (:1)', [2])
-        self.cur.execute(f'SELECT id FROM {self.TABLE}')
-        self.assertEqual(self.cur.fetchall(), [(2,)])
+        self.cur.execute(f'SELECT id FROM {self.TABLE} ORDER BY id')
+        self.assertIn((2,), self.cur.fetchall())
 
     def test_a_wide_bind_is_never_cached(self):
         # DDL from another session would leave the same stale buffer behind,

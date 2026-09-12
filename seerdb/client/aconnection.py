@@ -29,7 +29,11 @@ if TYPE_CHECKING:
     from seerdb.common.ano_session import AnoChannel
     from seerdb.common.dbobject import DbObjectType
 
-from seerdb.client._conn_logic import _ConnectionLogic
+from seerdb.client._conn_logic import (
+    _ConnectionLogic,
+    returning_block_request,
+    returning_block_result,
+)
 from seerdb.client.connection import (
     _MAX_REDIRECTS,
     _REDIRECT_CONNECT_ATTEMPTS,
@@ -940,6 +944,13 @@ class AsyncOracleConnect(_ConnectionLogic):
                 )
             if Head.startswith('BEGIN') or Head.startswith('DECLARE'):
                 Result = await self._drive(self._dialect.execute_block(Query, Bind))
+            elif ReturnBinds:
+                # Pre-10g DML ... RETURNING (#801) -- see the sync twin.
+                Wrapped, BlockBind = returning_block_request(Query, Bind)
+                Result = returning_block_result(
+                    await self._drive(self._dialect.execute_block(Wrapped, BlockBind)),
+                    len(Bind),
+                )
             else:  # DML (INSERT/UPDATE/DELETE)
                 Result = await self._drive(self._dialect.execute_dml(Query, Bind))
             if self.autocommit:

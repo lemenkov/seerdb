@@ -6620,5 +6620,60 @@ class TestZeroLengthColumn(unittest.TestCase):
         self.assertEqual(acc[2], [[5]])
 
 
+class TestFv2UnassignedOutBind(unittest.TestCase):
+    """A 9i block reply marks an OUT bind it never assigned with four fixed
+    bytes (`ff 02 0c 21`) instead of the usual DALC + indicator (#801).
+
+    This is what `DML ... RETURNING ... INTO` produces when the statement
+    matched no rows -- distinct from an explicitly assigned NULL, which is an
+    empty DALC plus the `81 01` indicator. Reading the marker as a DALC consumed
+    the wrong number of bytes and desynced every OUT bind after it, so a wrapped
+    RETURNING that matched nothing failed with a malformed-NUMBER error instead
+    of reporting zero rows. Captured live from 9.2.0.4.
+    """
+
+    # UPDATE ... RETURNING id INTO :2, matching one row, wrapped with a trailing
+    # `:3 := SQL%ROWCOUNT`: both OUT binds carry a value.
+    ONE_ROW = bytes.fromhex(
+        '0702c1070002c1020008010204014287c0000401010000000101002f'
+        '000000000002937d01010002b91a0000000000010100000000'
+    )
+    # The same statement matching no rows: the RETURNING bind is unassigned, the
+    # rowcount bind still carries Oracle NUMBER 0 (`80`).
+    NO_ROW = bytes.fromhex(
+        '07ff020c2101800008010204014287c2000401010000000101002f'
+        '000000000002937d01010002b91a0000000000010100000000'
+    )
+    # A single unassigned OUT bind and nothing after it.
+    ONLY_UNASSIGNED = bytes.fromhex(
+        '07ff020c210801020401428828000401010000000101002f'
+        '000000000002937e01010002b9220000000000010100000000'
+    )
+
+    def test_assigned_values_decode(self):
+        from seerdb.common.tns import decode_fv2_block_out
+
+        out, _rc, err = decode_fv2_block_out(self.ONE_ROW, 2)
+        self.assertEqual(err, 0)
+        # Oracle NUMBER 6 (the returned id) and NUMBER 1 (SQL%ROWCOUNT).
+        self.assertEqual(out, [bytes.fromhex('c107'), bytes.fromhex('c102')])
+
+    def test_unassigned_out_does_not_desync_the_next_bind(self):
+        from seerdb.common.tns import decode_fv2_block_out
+
+        out, _rc, err = decode_fv2_block_out(self.NO_ROW, 2)
+        self.assertEqual(err, 0)
+        # The unassigned bind reads as NULL, and -- the point of the fix -- the
+        # rowcount bind after it still decodes, as Oracle NUMBER 0.
+        self.assertEqual(out, [None, bytes.fromhex('80')])
+
+    def test_single_unassigned_out(self):
+        from seerdb.common.tns import decode_fv2_block_out
+
+        out, _rc, err = decode_fv2_block_out(self.ONLY_UNASSIGNED, 1)
+        self.assertEqual(err, 0)
+        self.assertEqual(out, [None])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -161,6 +161,36 @@ def strip_returning_into(SQL: str) -> str:
     return SQL[: Into.start()].rstrip() + Trailing
 
 
+def wrap_returning_in_block(SQL: str) -> tuple[str, str]:
+    """Wrap a ``DML ... RETURNING ... INTO`` in an anonymous PL/SQL block (#801).
+
+    Pre-10g servers refuse the 10g+ RETURNING request form -- 9i answers
+    ``ORA-00439`` for this client type -- but they run the identical statement
+    inside a PL/SQL block, where the INTO targets are ordinary OUT binds, a form
+    those tiers have always supported. So the clause needs no new wire protocol:
+    it needs the statement in a block.
+
+    The block also assigns ``SQL%ROWCOUNT`` to one appended bind, because a
+    block's own row count reports the *block* executing (measured: always 1)
+    rather than the rows the DML touched. Without it a wrapped statement would
+    report a plausible but wrong ``cursor.rowcount``.
+
+    Returns the wrapped SQL and the name of the appended rowcount placeholder;
+    the caller appends a matching OUT bind, and must strip both back out before
+    handing results to the user.
+    """
+    Statement = SQL.strip()
+    # A trailing `;` would close the statement early inside the block.
+    Statement = Statement.rstrip().rstrip(';').rstrip()
+    # The appended placeholder must not collide with one the statement already
+    # uses; bind names are matched case-insensitively.
+    Taken = {Name.lower() for Name in extract_bind_names(SQL)}
+    Name = 'seerdb_rowcount'
+    while Name in Taken:
+        Name += '_'
+    return f'BEGIN {Statement}; :{Name} := SQL%ROWCOUNT; END;', Name
+
+
 def is_plsql(SQL: str) -> bool:
     # PL/SQL blocks start with BEGIN or DECLARE after stripping leading
     # whitespace and SQL comments. Anonymous blocks, packaged calls
