@@ -8529,13 +8529,35 @@ def decode_fv2_oer_error(Packet: bytes) -> tuple[int, str | None]:
     if not Packet or Packet[0] != TTI_OER:
         return (0, None)
     (_Rows, ErrCode, Rest) = _decode_fv2_oer(Packet)
-    Message = None
+    # The message is the final DALC, so find the offset whose DALC consumes
+    # exactly the rest of the packet. Reading the length byte directly instead
+    # would only ever find a message short enough to be one chunk: anything
+    # longer is written in the 0xFE chunked form (encode_chr's mirror), where
+    # the per-chunk length bytes are not part of the text. That is why a long
+    # server message used to come back with stray characters spliced into it
+    # (a chunk length of 64 read as '@'), truncated at the front, or -- when no
+    # single byte happened to fit -- lost entirely, leaving only "ORA-NNNNN"
+    # from the caller's fallback. PL/SQL errors are routinely that long (#810).
+    Fallback = None
     for I in range(len(Rest)):
-        Length = Rest[I]
-        if Length and I + 1 + Length == len(Rest):
-            Message = bytes(Rest[I + 1 :]).decode('utf-8', errors='replace').rstrip()
-            break
-    return (ErrCode, Message)
+        if not Rest[I]:
+            continue
+        try:
+            (Value, Tail) = decode_dalc(Rest[I:])
+        except DataError:
+            continue
+        if Tail or not Value:
+            continue
+        Text = bytes(Value).decode('utf-8', errors='replace').rstrip('\x00').rstrip()
+        if not Text:
+            continue
+        # A server message opens with its own code, which makes for a decisive
+        # check; anything else is kept only as a fallback.
+        if Text.startswith(('ORA-', 'PLS-')):
+            return (ErrCode, Text)
+        if Fallback is None:
+            Fallback = Text
+    return (ErrCode, Fallback)
 
 
 def decode_fv2_exec_response(Data: bytes, Columns: list) -> tuple[list, int]:
