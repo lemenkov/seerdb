@@ -481,3 +481,40 @@ class TestPreTenReturningWrap(unittest.TestCase):
                 frozenset({1}),
                 'INSERT INTO t (a) VALUES (:"desc") RETURNING id INTO :"out"',
             )
+
+    def test_bulk_collect_is_refused_below_10g(self):
+        import types
+
+        from seerdb.client.cursor import _check_returning_support
+        from seerdb.client.dialect import Fv2Dialect
+        from seerdb.common.exceptions import NotSupportedError
+        from seerdb.common.tns_consts import FIELD_VERSION_9_2
+
+        Conn = types.SimpleNamespace(
+            field_version=FIELD_VERSION_9_2, _dialect=Fv2Dialect()
+        )
+        with self.assertRaises(NotSupportedError):
+            _check_returning_support(
+                Conn,
+                frozenset({0}),
+                'UPDATE t SET a = 1 RETURNING id BULK COLLECT INTO :o',
+            )
+
+    def test_too_many_rows_is_explained_not_left_as_ora_01422(self):
+        from seerdb.client._conn_logic import returning_block_error
+        from seerdb.common.exceptions import DatabaseError, NotSupportedError
+
+        Translated = returning_block_error(DatabaseError('ORA-01422', 1422))
+        self.assertIsInstance(Translated, NotSupportedError)
+        self.assertIn('more than one row', str(Translated))
+        # Anything else is handed back untouched for the caller to raise.
+        Other = DatabaseError('ORA-00001', 1)
+        self.assertIs(returning_block_error(Other), Other)
+
+    def test_the_array_dml_refusal_names_the_real_tier(self):
+        from seerdb.client._conn_logic import _pre10_tier_name_for
+        from seerdb.client.dialect import Fv2Dialect, O8iDialect
+
+        # Both tiers are field version 2, so the version cannot tell them apart.
+        self.assertEqual(_pre10_tier_name_for(Fv2Dialect()), '9i')
+        self.assertEqual(_pre10_tier_name_for(O8iDialect(lambda: 0)), '8i')
