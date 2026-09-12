@@ -688,16 +688,30 @@ def _resolve_lobs(Connection, Row: list) -> list:
 
 
 def _check_returning_support(Connection, ReturnBinds) -> None:
-    # RETURNING ... INTO needs the 10g+ request form. The 9i dialect drives DML
-    # through OALL7 and the server refuses the clause for that client type
-    # (ORA-00439); the 8i form returns no value and, when the statement fails,
-    # the server drops the connection. Refuse up front with a clear error
-    # instead (#716); the fix is a capture of a native 9.2 client's request.
+    # RETURNING ... INTO needs the 10g+ request form, which the pre-10g servers
+    # refuse for this client type -- 9i answers ORA-00439. 9i runs the identical
+    # statement wrapped in a PL/SQL block, where the INTO targets are ordinary
+    # OUT binds, so the connection rewrites it there (#801) and it is allowed
+    # here. 8i is still refused: the same trick is unverified on that tier and a
+    # failing RETURNING makes the server drop the connection (#802, #716).
+    from seerdb.client.dialect import CAP_BLOCK, O8iDialect
+
     Version = getattr(Connection, 'field_version', None)
-    if ReturnBinds and Version is not None and Version < FIELD_VERSION_10_2:
+    if not ReturnBinds or Version is None or Version >= FIELD_VERSION_10_2:
+        return
+    Dialect = getattr(Connection, '_dialect', None)
+    Caps = Dialect.capabilities() if Dialect is not None else frozenset()
+    if isinstance(Dialect, O8iDialect):
+        raise NotSupportedError(
+            'RETURNING ... INTO is not supported on Oracle 8i '
+            '(a failing RETURNING statement drops the connection)'
+        )
+    if CAP_BLOCK not in Caps:
+        # No PL/SQL block path to rewrite into, so there is nothing to fall back
+        # on; refuse rather than send a form the server will reject.
         raise NotSupportedError(
             'RETURNING ... INTO requires an Oracle 10g+ server '
-            '(9i refuses it for this client type, 8i drops the connection)'
+            'or a pre-10g dialect that supports PL/SQL blocks'
         )
 
 

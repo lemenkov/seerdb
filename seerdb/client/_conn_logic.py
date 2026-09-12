@@ -537,3 +537,51 @@ class _ConnectionLogic:
         (ErrCode, Message) = decode_lobops_oer(Packet, self.field_version)
         if ErrCode and ErrCode not in (0, 1403):
             raise from_ora_code(ErrCode)(Message or f'ORA-{ErrCode:05d}', code=ErrCode)
+
+
+def returning_block_request(Query: str, Bind: list) -> tuple[str, list]:
+    """A pre-10g ``DML ... RETURNING ... INTO`` rewritten as a block request (#801).
+
+    Returns the wrapped SQL and the bind list with one appended OUT bind that
+    receives ``SQL%ROWCOUNT``; :func:`returning_block_result` takes it back out.
+    """
+    from seerdb.common.datatypes import Var
+    from seerdb.common.sqltext import wrap_returning_in_block
+
+    Wrapped, _Name = wrap_returning_in_block(Query)
+    return Wrapped, list(Bind) + [Var(int)]
+
+
+def returning_block_result(Result, NumBinds: int):
+    """Move the appended ``SQL%ROWCOUNT`` OUT value into the result's rowcount slot.
+
+    A PL/SQL block reports its own execution as the row count -- measured as 1
+    however many rows the DML touched -- so the real figure rides in the extra
+    bind :func:`returning_block_request` appended. Lift it out of the OUT record,
+    which the caller's bind list has no slot for, and put it where every other
+    statement's row count lives.
+    """
+    from decimal import Decimal
+
+    from seerdb.common.types import TNS_TYPE_NUMBER, decode_value
+
+    if not isinstance(Result, tuple) or len(Result) < 5:
+        return Result
+    Rows = Result[4]
+    if not Rows or not isinstance(Rows[0], dict) or 'out_positions' not in Rows[0]:
+        return Result
+    Record = dict(Rows[0])
+    Positions = list(Record.get('out_positions') or [])
+    Values = list(Record.get('out_values') or [])
+    RowCount = None
+    if NumBinds in Positions:
+        Index = Positions.index(NumBinds)
+        Positions.pop(Index)
+        Raw = Values.pop(Index) if Index < len(Values) else None
+        Decoded = decode_value({'data_type': TNS_TYPE_NUMBER}, Raw or None)
+        if isinstance(Decoded, (int, float, Decimal)):
+            RowCount = int(Decoded)
+    Record['out_positions'] = Positions
+    Record['out_values'] = Values
+    Meta = Result[3][1] if isinstance(Result[3], tuple) and len(Result[3]) > 1 else None
+    return Result[:3] + ((RowCount, Meta), [Record]) + Result[5:]

@@ -14,7 +14,11 @@ import threading
 import time
 import uuid
 
-from seerdb.client._conn_logic import _ConnectionLogic
+from seerdb.client._conn_logic import (
+    _ConnectionLogic,
+    returning_block_request,
+    returning_block_result,
+)
 from seerdb.client.dialect import (
     CAP_ARRAY_DML,
     CAP_OWN_TXN,
@@ -1466,6 +1470,18 @@ class OracleConnect(_ConnectionLogic):
                 )
             if Head.startswith('BEGIN') or Head.startswith('DECLARE'):
                 Result = self._drive(self._dialect.execute_block(Query, Bind))
+            elif ReturnBinds:
+                # Pre-10g DML ... RETURNING (#801). These servers refuse the
+                # 10g+ request form -- 9i answers ORA-00439 for this client
+                # type -- but they run the identical statement inside a PL/SQL
+                # block, where the INTO targets are ordinary OUT binds, a form
+                # they have always supported. So the clause costs no new wire
+                # format, only a rewrite.
+                Wrapped, BlockBind = returning_block_request(Query, Bind)
+                Result = returning_block_result(
+                    self._drive(self._dialect.execute_block(Wrapped, BlockBind)),
+                    len(Bind),
+                )
             else:  # DML (INSERT/UPDATE/DELETE)
                 Result = self._drive(self._dialect.execute_dml(Query, Bind))
             if self.autocommit:

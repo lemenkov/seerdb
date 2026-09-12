@@ -225,11 +225,21 @@ profile with the benchmark harness (#166) and optimize the Python — or ship an
 
 ## Compatibility
 
-**Oracle 8i and 9i.** `RETURNING ... INTO` is refused with `NotSupportedError`
-below 10g: the 9i server rejects the clause for this client's request form
-(`ORA-00439`) and 8i drops the connection when such a statement fails, so the
-driver says so before sending anything. `DatabaseError.offset` is `None` on
-those servers, whose error reply carries no position.
+**Oracle 9i.** `RETURNING ... INTO` works, though not the way it does on 10g+.
+The 9i server rejects the clause in the modern request form (`ORA-00439`), so
+the driver rewrites the statement into an anonymous PL/SQL block, where the
+`INTO` targets are ordinary OUT binds — a form 9i has always supported. This is
+transparent: pass a `var()` as you would anywhere else, and `cursor.rowcount`
+reports the rows the statement touched. Multi-row `RETURNING` into scalar binds
+raises `ORA-01422` exactly as it does on a current server; there is no
+`BULK COLLECT` and no `executemany()` support, because 9i has no array DML.
+
+**Oracle 8i.** `RETURNING ... INTO` is refused with `NotSupportedError`: the
+server drops the connection when such a statement fails, and the block rewrite
+is unverified there.
+
+`DatabaseError.offset` is `None` on both servers, whose error reply carries no
+position.
 
 The driver negotiates the wire dialect per connection, so a single build speaks
 to every supported server — from Oracle **8i (8.1.7) through 26ai**:
