@@ -1457,10 +1457,11 @@ def test_unimplemented_ttc_function_is_refused_not_ignored() -> None:
         timeout=5000,
     )
     try:
-        # TNS_FUNC_REEXECUTE_AND_FETCH (78): a real client sends this once a
-        # statement is cached. The Mirror does not implement it, so it must say
-        # so rather than go quiet.
-        conn.send(TNS_DATA, bytes([TTI_FUN, 78]) + bytes(8))
+        # TNS_FUNC_REEXECUTE (4), the non-fetch re-execute a client sends for
+        # cached DML: real, and still unimplemented here. (This test used 78
+        # until #833 implemented it; the example has to be a function that is
+        # still unhandled, or the test quietly stops testing anything.)
+        conn.send(TNS_DATA, bytes([TTI_FUN, 4]) + bytes(8))
         received = conn._next_data_packet()
         assert received is not False, 'the Mirror answered nothing -- it hung'
         assert b'ORA-03115' in received[1]
@@ -1575,3 +1576,37 @@ def test_the_end_of_fetch_terminator_carries_the_cursor_id() -> None:
     assert _end_of_fetch(1) == _END_OF_FETCH
     assert _end_of_fetch(7) != _END_OF_FETCH
     assert len(_end_of_fetch(7)) == len(_END_OF_FETCH)
+
+
+def test_reexecute_runs_the_cursors_own_statement() -> None:
+    # A re-execute names a cursor and carries no SQL, so it can only be served if
+    # the cursor identifies one statement (#833, on top of #840). The danger this
+    # guards is not a crash but a WRONG ANSWER: re-executing cursor 2 must run
+    # cursor 2's query, not whatever ran most recently.
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, parse_reexecute
+    from seerdb.server.session import _Cursors
+
+    cursors = _Cursors()
+    first = cursors.open_query('select 7 from dual')
+    second = cursors.open_query('select 42 from dual')
+    assert cursors.query_sql(first) == 'select 7 from dual'
+    assert cursors.query_sql(second) == 'select 42 from dual'
+
+    # The request layout, byte-for-byte from a live 23ai capture: cursor 1,
+    # two iterations, options 0x20. It only decodes at the field version the
+    # session negotiated -- the fv24 token ahead of the fields shifts everything
+    # by one byte -- so the parse is version-sensitive and worth pinning.
+    raw = bytes.fromhex('034e040001010102012000')
+    _DECODE_FIELD_VERSION.set(24)
+    request = parse_reexecute(raw)
+    assert (request.cursor, request.fetch, request.options) == (1, 2, 0x20)
+
+    # Re-parking under the SAME id: the client is never told a new one, so its
+    # follow-up fetches would otherwise address a cursor it does not hold.
+    cursors.reopen(first, [], [(7,), (8,)], sql='select 7 from dual')
+    assert cursors.has(first)
+    assert cursors.query_sql(first) == 'select 7 from dual'
+    # Draining it leaves the statement resolvable, so a later re-execute still
+    # knows what to run.
+    cursors.take(first, 99)
+    assert cursors.query_sql(first) == 'select 7 from dual'
