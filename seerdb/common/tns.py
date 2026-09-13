@@ -1336,6 +1336,7 @@ from seerdb.common.tns_consts import (
     TNS_FETCH_ORIENTATION_FIRST,
     TNS_FETCH_ORIENTATION_LAST,
     TNS_LOB_OP_CLOSE,
+    TNS_LOB_OP_CREATE_TEMP,
     TNS_LOB_OP_FREE_TEMP,
     TNS_LOB_OP_GET_CHUNK_SIZE,
     TNS_LOB_OP_OPEN,
@@ -1774,23 +1775,26 @@ def _lob_data_thin(content: bytes) -> bytes:
     return bytes(out)
 
 
+# A temp LOB locator is 40 bytes on the wire: a ub2 length and 38 bytes. The
+# length is not the Mirror's choice. The client allocates the locator buffer
+# itself -- CREATE_TEMP asks for 0x28 = 40 -- and reads back exactly that many
+# bytes, so a shorter locator leaves it reading the next field as locator and
+# waiting on bytes that never come. A live 23ai returns 40.
+_TEMP_LOB_LOCATOR_LEN = 38
+
+
 def mint_temp_lob_locator(index: int, is_blob: bool) -> bytes:
     """A unique opaque locator for the ``index``-th temp LOB of a session (#412).
 
     The value is echoed back verbatim on WRITE and on the bind, so it only has to
-    be stable and distinct per temp LOB — the Mirror keys its buffer on it."""
+    be stable and distinct per temp LOB — the Mirror keys its buffer on it. It is
+    padded to the length a real server uses, which is what the client expects to
+    read (#846)."""
     return (
         _TEMP_LOB_LOCATOR_PREFIX
         + struct.pack('>I', index)
         + (b'\x01' if is_blob else b'\x00')
-    )
-
-
-# CREATE_TEMP sends a fixed field block (no source locator), captured from the
-# thin client: it opens 01 01 28 and CLOB / BLOB differ only in the LOB type byte
-# (0x70 / 0x71). That opener is unmistakable against the WRITE / READ layout,
-# whose second field is a locator length (~40-86), never 0x01.
-_CREATE_TEMP_PREFIX = b'\x01\x01\x28'
+    ).ljust(_TEMP_LOB_LOCATOR_LEN, b'\x00')
 
 
 _TEMP_LOB_LOCATOR_PREFIX = b'\x00seerdb-mirror-temp-lob-'
@@ -1846,11 +1850,9 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
     acknowledged (#417); anything else (a READ of an emitted column locator) is
     served by the #413 read path."""
     payload = _skip_fun_header(body)  # TTI_FUN, TTI_LOBOPS, seq (+ fv24 token)
-    if payload[:3] == _CREATE_TEMP_PREFIX:
-        # CLOB vs BLOB is the LOB type byte (0x70 / 0x71) in the fixed block.
-        return LobOpsRequest(kind='create_temp', is_blob=0x71 in payload)
     # The common request layout (§14.1); walk the fields to the operation, then to
-    # the ub2-prefixed locator (and, for a WRITE, the 0x0E payload).
+    # the ub2-prefixed locator (and, for a WRITE, the 0x0E payload). CREATE_TEMP
+    # shares the layout up to the operation, so it is classified there too.
     rest = payload[1:]  # source_pointer_flag
     _loc_len_plus2, rest = decode_ub4(rest)
     rest = rest[1:]  # dest_pointer_flag
@@ -1859,6 +1861,16 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
     _short_dst_off, rest = decode_ub4(rest)
     rest = rest[3:]  # charset / short-amount / null-lob pointer flags
     operation, rest = decode_ub4(rest)
+    if operation == TNS_LOB_OP_CREATE_TEMP:
+        # Classified by the OPERATION, not by the opening bytes. CREATE_TEMP used
+        # to be recognised by the prefix 01 01 28, on the belief that no other
+        # request could open that way. A WRITE can: it opens with a pointer flag
+        # and then the locator length plus two, and a real-size 38-byte locator
+        # makes that 01 01 28 exactly. The prefix only ever held because the
+        # Mirror's own locators were short; sized like a real server's, every
+        # WRITE became a second CREATE_TEMP and its bytes were lost (#846).
+        # CLOB vs BLOB is the LOB type byte (0x70 / 0x71) in the fixed block.
+        return LobOpsRequest(kind='create_temp', is_blob=0x71 in rest)
     if operation == TNS_LOB_OP_WRITE:
         rest = rest[2:]  # scn-array pointer + length
         _src_offset, rest = decode_ub4(rest)
@@ -1885,10 +1897,34 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
     return LobOpsRequest(kind='read')
 
 
+# The flags byte a live 23ai sends after the character set. Clients skip it.
+_CREATE_TEMP_FLAGS = 0x70
+
+
 def encode_create_temp_response(locator: bytes) -> bytes:
-    """The CREATE_TEMP reply (#412): a bare TTI_RPA carrying the minted locator —
-    0x08, ub2 length, then the locator bytes (what the client reads back)."""
-    return bytes([TTI_RPA]) + struct.pack('>H', len(locator)) + locator
+    """The CREATE_TEMP reply (#412): the minted locator, its character set and a
+    flags byte, closed by a status OER.
+
+    Shape read off a live 23ai::
+
+        08 | 00 26 <38 locator bytes> | 02 03 69 | 70 | 04 ... (OER)
+             ub2 len + locator          charset    flags
+
+    The reply used to stop after the locator. seerdb's own client reads the
+    length-prefixed locator and nothing further, so it never noticed; a client
+    that parses the whole reply reads the character set and flags, then keeps
+    reading messages until a status ends the response -- and waited forever for
+    one (#846). Same defect as the auth challenge that had no terminating OER
+    (#830).
+    """
+    return (
+        bytes([TTI_RPA])
+        + struct.pack('>H', len(locator))
+        + locator
+        + encode_sb4(AL32UTF8_CHARSET)
+        + bytes([_CREATE_TEMP_FLAGS])
+        + _encode_oer(1, 0, 0, b'')
+    )
 
 
 def encode_lobops_ack(locator: bytes) -> bytes:
