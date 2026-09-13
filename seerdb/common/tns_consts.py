@@ -70,8 +70,14 @@ TNS_NULL_LENGTH_INDICATOR = 0xFF
 TNS_EXEC_FLAGS_SCROLLABLE = 0x02
 TNS_EXEC_FLAGS_NO_CANCEL_ON_EOF = 0x80
 # al8i4[9] bit a query execute sets (oracledb-thin: implicit result sets); its
-# absence is what the DBMS_SQL.RETURN_RESULT path checks for (#121).
+# absence is what the DBMS_SQL.RETURN_RESULT path checks for (#121). The
+# reference thin client sets it on EVERY ordinary execute -- DDL, DML, array
+# DML alike -- so its presence says nothing about what the execute wants.
 TNS_EXEC_FLAGS_IMPLICIT_RESULTSET = 0x8000
+# al8i4[9] bit that asks for the per-iteration affected-row counts of an array
+# DML (arraydmlrowcounts, #18). THIS bit alone is the request; the two above
+# and below it are unrelated flags that happen to share the word (#859).
+TNS_EXEC_FLAGS_DML_ROWCOUNTS = 0x4000
 # Exec-options word bit for a re-execute that re-runs the statement. A scroll
 # re-execute must NOT set it: oracledb-thin's scroll re-execute uses FETCH-only
 # options (0x8040), and leaving EXECUTE (0x20) on makes the server re-run the
@@ -399,7 +405,15 @@ TNS_EXEC_OPTION_BATCH_ERRORS = 0x80000
 # seerdb's baseline is 0, so the whole 0xC000 is written when requested — the
 # server's kpoal8Check rejects the al8pidmlrc pointer (below) as malformed
 # (ORA-03137) without it. Reverse-engineered from an oracledb-thin capture (#18).
-TNS_AL8I4_ARRAY_DML_ROWCOUNTS = 0xC000
+# What seerdb's own client writes into al8i4[9] when asking for array-DML row
+# counts: the DML_ROWCOUNTS request bit together with IMPLICIT_RESULTSET, which
+# every modern execute carries anyway. A real server accepts the pair (verified
+# live on every 12c+ tier). It is a composite, not a flag: a server must test
+# for DML_ROWCOUNTS alone, because a plain execute from the reference client
+# carries IMPLICIT_RESULTSET on its own and is asking for nothing (#859).
+TNS_AL8I4_ARRAY_DML_ROWCOUNTS = (
+    TNS_EXEC_FLAGS_IMPLICIT_RESULTSET | TNS_EXEC_FLAGS_DML_ROWCOUNTS
+)
 
 TNS_LOB_OP_GET_LENGTH = 0x0001
 TNS_LOB_OP_READ = 0x0002

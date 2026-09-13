@@ -1003,19 +1003,49 @@ modes layer onto an array-DML execute, each oracledb-compatible:
 
 - **`arraydmlrowcounts`** — ask the server for the per-iteration affected-row
   count. Two coordinated request-side changes (no Options bit):
-  1. `al8i4[9]` (the 10th All8 element, normally `0`) is set to `0xC000`.
+  1. `al8i4[9]` — the exec-flags word — gains **`DML_ROWCOUNTS` = `0x4000`**.
+     That bit alone is the request. seerdb's client writes `0xC000`, which is
+     `DML_ROWCOUNTS | IMPLICIT_RESULTSET (0x8000)`; a real server accepts the
+     pair (verified on every 12c+ tier), but the two are unrelated flags that
+     share a word, and the reference thin client sets `IMPLICIT_RESULTSET` on
+     **every** ordinary execute — DDL, DML and array DML alike — so a server
+     that tests for the composite takes every such execute for a row-count
+     request. That is exactly what the Mirror did (#859, below).
   2. The 12c+ `al8pidmlrc` block — the three zero bytes that follow the
      register-id field in the post-11g OALL8 header — becomes
      `01 | iteration_count(SB4) | 01` (e.g. four iterations → `01 01 04 01`).
 
   Omitting either makes the server reject the execute as malformed
-  (`ORA-03137 [kpoal8Check-4]`). The counts come back in the response **RPA
-  region** (`TTI_RPA`, token 8) that precedes the trailing OER, as a
-  `count(UB4) | count × UB4` block sitting between the opaque RPA body and the
-  OER token. seerdb extracts it in `decode_token_rpa_piggyback` (armed for
-  the execute via a context flag) and surfaces it through
-  `cursor.getarraydmlrowcounts()`. The two modes combine: a failed iteration
-  reports a row count of `0`.
+  (`ORA-03137 [kpoal8Check-4]`). The counts come back in the response's
+  **return-parameters block** (`TTI_RPA`, token 8) that precedes the trailing
+  OER. That block is not opaque; by field it is
+
+  ```
+  08 | ub2 al8o4l count | count × ub4 | ub2 al8txl length (+ bytes) |
+       ub2 key/value pairs (+ pairs) | ub2 registration length (+ bytes) |
+       [ ub4 rows | rows × ub8 ]        ← only when DML_ROWCOUNTS was set
+  ```
+
+  (the reference client's `_process_return_parameters`, matched against a
+  live 23ai reply, `08 01 06 04 01 69 21 60 00 01 06 01 01 00 00 00 00 00 04 …`:
+  six `al8o4l` words, three empty words, then the OER). seerdb's
+  `decode_token_rpa_piggyback` walks it more loosely — a count, that many
+  fields, then any zero bytes — which lands in the same place for every block
+  seen live, and pulls the row-count tail out (armed for the execute via a
+  context flag) into `cursor.getarraydmlrowcounts()`. The two modes combine: a
+  failed iteration reports a row count of `0`.
+
+  **The Mirror's side of it (#859).** Two faults, and the reference client's
+  `executemany` needed both fixed. The Mirror detected the request with the
+  composite, so every array execute from that client was answered with a
+  row-count block it never asked for; and the block it sent framed the counts
+  as a private `ub4 zero | ub4 count | count × ub4` rather than the layout
+  above. seerdb's own decoder accepted both shapes, which is why the Mirror
+  passed its own suite; the reference client read the four words by name, took
+  the count for `al8txl`, skipped that many bytes, and parsed the values as
+  key/value pairs until a length byte of 4 sat where it expected a `ub2`
+  (`DPY-5002`). The Mirror now tests `DML_ROWCOUNTS` alone and, when it is set,
+  emits the block above with four empty words.
 
 ### 5.2 Fetch (TTI_FUN/TTI_FETCH)
 
@@ -1401,6 +1431,16 @@ cursor id and empty-query flag from the header (`peek_exec_cursor`), hands the
 remembered bind types to `parse_exec` so the OAC-less RXD decodes, runs the stored
 SQL with the new binds, and replies with the same cursor id. A PL/SQL block is
 never assigned an id (the client doesn't cache blocks).
+
+**An empty query does not imply absent OACs** (#859). That is seerdb's own
+client's convention, not the protocol's: the reference thin client also sends
+empty-SQL executes — its `executemany` after the first, on the same cursor — and
+those still carry a full set of bind descriptors. A server that infers "no SQL,
+therefore use the remembered types" then leaves its read position on an OAC where
+it expects a `TTI_RXD`, finds no bind rows at all, and hands the backend an
+execute with no values (`ORA-01008`). Decide from the wire instead: the
+descriptors are absent exactly when the bind area already sits on a `TTI_RXD`
+token, and the remembered types are the fallback for that case alone.
 
 **Only real DML may be cached** (#703). Reusing a cursor is a saved *parse*: the
 statement is parsed once and executed again per set of binds, which is exactly
