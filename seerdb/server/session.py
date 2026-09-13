@@ -99,6 +99,7 @@ from seerdb.common.tns_consts import (
     TNS_DATA,
     TNS_FUNC_SESSION_STATE,
     TNS_FUNC_SET_END_TO_END_ATTR,
+    TNS_FUNC_SET_SCHEMA,
     TNS_FUNC_TPC_TXN_SWITCH,
     TNS_MARKER,
     TNS_MARKER_TYPE_RESET,
@@ -1060,6 +1061,31 @@ def _answer_describe_oci(
     stream.write_packet(TNS_DATA, reply)
 
 
+def _apply_schema(backend: Backend | None, schema: bytes | list) -> None:
+    """Apply a SET_SCHEMA piggyback to the backend (#837).
+
+    Run as the statement rather than through a new backend method: every backend
+    already handles ``ALTER SESSION SET CURRENT_SCHEMA``, because a client that
+    cannot use the piggyback fast-path writes exactly that. The PostgreSQL
+    example translates it to a ``search_path`` change (#759) and the passthrough
+    forwards it upstream, so both work with no backend change at all.
+
+    A failure is logged and swallowed on purpose. The piggyback rides on somebody
+    else's call, and that call still deserves its answer -- turning a refused
+    schema change into a failure of the statement it happened to travel with
+    would be its own bug.
+    """
+    # decode_dalc reports both an empty and a null value as [], which is the
+    # one case with nothing to apply.
+    if backend is None or not isinstance(schema, bytes) or not schema:
+        return
+    name = schema.decode('utf-8', 'replace')
+    try:
+        backend.execute(f'ALTER SESSION SET CURRENT_SCHEMA = {name}')
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        logger.info('set current_schema %r refused by the backend: %s', name, exc)
+
+
 def _skip_piggybacks(body: bytes, backend: Backend | None = None) -> bytes:
     # A call can be preceded by piggybacks — CLOSE_CURSORS (105), which a client
     # sends to free the cursors it drained on the previous fetch, and, from 12.1
@@ -1086,6 +1112,21 @@ def _skip_piggybacks(body: bytes, backend: Backend | None = None) -> bytes:
             apply = getattr(backend, 'set_end_to_end', None) if backend else None
             if apply is not None and attrs:
                 apply(attrs)
+        elif func == TNS_FUNC_SET_SCHEMA:
+            # `connection.current_schema = x` (#837). A client does not send a
+            # statement for this -- it holds the value and rides it out as a
+            # piggyback on its next call, so the Mirror has to both consume the
+            # bytes and apply the change, or the call behind it is unreachable.
+            #
+            # Layout read off a live 23ai, varying the name to separate the
+            # fields: a constant flag byte, the length as a ub4, then the name as
+            # a DALC that repeats it. Two length fields look redundant and are,
+            # but both scale -- a 299-character name sends `02 01 2b` and then a
+            # chunked (0xFE) DALC -- so neither can be assumed single-byte.
+            rest = rest[1:]  # the constant flag
+            _, rest = decode_ub4(rest)  # declared length, restated by the DALC
+            schema, rest = decode_dalc(rest)
+            _apply_schema(backend, schema)
         elif func == TNS_FUNC_SESSION_STATE:
             _, rest = decode_ub4(rest)  # the requested state (ignored)
         else:
