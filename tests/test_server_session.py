@@ -1524,11 +1524,11 @@ def test_unimplemented_ttc_function_is_refused_not_ignored() -> None:
         timeout=5000,
     )
     try:
-        # TNS_FUNC_REEXECUTE (4), the non-fetch re-execute a client sends for
-        # cached DML: real, and still unimplemented here. (This test used 78
-        # until #833 implemented it; the example has to be a function that is
-        # still unhandled, or the test quietly stops testing anything.)
-        conn.send(TNS_DATA, bytes([TTI_FUN, 4]) + bytes(8))
+        # A function code no client sends, on purpose: this test used a real
+        # unimplemented function twice (78 until #833 implemented it, then 4
+        # until #854 did) and each time it quietly stopped testing anything
+        # until someone noticed. The refusal path is the same for any code.
+        conn.send(TNS_DATA, bytes([TTI_FUN, 250]) + bytes(8))
         received = conn._next_data_packet()
         assert received is not False, 'the Mirror answered nothing -- it hung'
         assert b'ORA-03115' in received[1]
@@ -1677,6 +1677,50 @@ def test_reexecute_runs_the_cursors_own_statement() -> None:
     # knows what to run.
     cursors.take(first, 99)
     assert cursors.query_sql(first) == 'select 7 from dual'
+
+
+def test_parse_reexecute_decodes_fresh_bind_rows_by_the_cached_types() -> None:
+    # The plain re-execute (func 4, #854) carries one RXD row per execution and
+    # no OACs: the values are typed by the execute that opened the cursor. Three
+    # requests byte-for-byte from a live 23ai (fv24, so the ub8 token follows
+    # the sequence byte), each with the bind types its opening execute declared.
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, parse_reexecute
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER, TNS_TYPE_VARCHAR
+
+    number = (TNS_TYPE_NUMBER, 1, 22, b'')
+    text = (TNS_TYPE_VARCHAR, 1, 20, b'')
+    insert = bytes.fromhex('03 04 08 00 01 03 01 01 00 00 07 02 c1 03 04 72 6f 77 32')
+    update = bytes.fromhex('03 04 0b 00 01 05 01 01 00 00 07 01 79 02 c1 06')
+    select = bytes.fromhex('03 04 0d 00 01 04 01 01 00 00 07 02 c1 04')
+    token = _DECODE_FIELD_VERSION.set(24)
+    try:
+        # INSERT ... VALUES (:1, :2) re-run with (2, 'row2') on cursor 3.
+        request = parse_reexecute(insert, bind_types=[number, text])
+        assert (request.cursor, request.fetch, request.autocommit) == (3, 1, False)
+        assert request.bind_rows == [[2, 'row2']]
+        # UPDATE ... SET s = :1 WHERE id > :2 with ('y', 5): the row follows the
+        # bind order, not the type.
+        request = parse_reexecute(update, bind_types=[text, number])
+        assert request.cursor == 5
+        assert request.bind_rows == [['y', 5]]
+        # A query re-executed with prefetching off is the same message.
+        request = parse_reexecute(select, bind_types=[number])
+        assert (request.cursor, request.bind_rows) == (4, [[3]])
+        # Without the types only the header is read -- what the dispatch does
+        # first, to learn which cursor's types to look up.
+        assert parse_reexecute(insert).cursor == 3
+        assert parse_reexecute(insert).bind_rows == []
+        # executemany's second run: `iterations` executions, one row each; and
+        # options_2 bit 0 is the client's autocommit.
+        two = insert[:6] + bytes.fromhex('01 02 00 01 01') + insert[10:] + insert[10:]
+        request = parse_reexecute(two, bind_types=[number, text])
+        assert (request.fetch, request.autocommit) == (2, True)
+        assert request.bind_rows == [[2, 'row2'], [2, 'row2']]
+        # A row cut short is reported, so the spanning reader fetches the rest.
+        with pytest.raises(Truncated):
+            parse_reexecute(insert[:-2], bind_types=[number, text])
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
 
 
 def test_a_break_episode_is_answered_with_reset_then_cancel() -> None:

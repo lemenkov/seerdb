@@ -661,3 +661,139 @@ def test_date_and_timestamp_round_trip() -> None:
     assert result.get('error') is None, result.get('error')
     # DATE decodes to a datetime at midnight; TIMESTAMP preserves microseconds.
     assert row == (datetime.datetime(2020, 12, 31, 0, 0), ts)
+
+
+def _reexecute(cursor_id: int, rows: list[bytes], *, autocommit: bool = False) -> bytes:
+    # The plain re-execute (func 4): header + one RXD row per execution, no
+    # OACs -- the values are typed by the execute that opened the cursor.
+    from seerdb.common.tns import encode_sb4
+    from seerdb.common.tns_consts import (
+        TNS_EXEC_OPTION_COMMIT_REEXECUTE,
+        TNS_FUNC_REEXECUTE,
+        TTI_FUN,
+        TTI_RXD,
+    )
+
+    options_2 = TNS_EXEC_OPTION_COMMIT_REEXECUTE if autocommit else 0
+    return (
+        bytes([TTI_FUN, TNS_FUNC_REEXECUTE, 9])
+        + encode_sb4(cursor_id)
+        + encode_sb4(len(rows))
+        + encode_sb4(0)
+        + encode_sb4(options_2)
+        + b''.join(bytes([TTI_RXD]) + row for row in rows)
+    )
+
+
+def test_reexecute_reruns_cached_dml_with_fresh_bind_rows() -> None:
+    # A client re-runs a statement it already executed on a cursor as func 4:
+    # the cursor id, the iteration count and the fresh values, no SQL and no
+    # OACs (#854). Through the Mirror only the FIRST execute of any statement
+    # used to work -- the second was refused as ORA-03115 -- so a loop of
+    # inserts died on its second iteration. The first execute here goes over
+    # the ordinary client path (which is what records the bind types on the
+    # Mirror's cursor); the re-executes are sent raw, the way a 12.1+ thin
+    # client sends them.
+    from seerdb.common.tns import encode_value
+    from seerdb.common.tns_consts import (
+        TNS_DATA,
+        TNS_TYPE_NUMBER,
+        TNS_TYPE_VARCHAR,
+        TTI_OER,
+    )
+
+    listen, server, result = _start_mirror()
+    conn = _connect(listen.getsockname()[1])
+    try:
+        cur = conn.cursor()
+        cur.execute('create table t854 (id number, s varchar2(20))')
+        cur.execute('insert into t854 (id, s) values (:1, :2)', [1, 'a'])
+        # The client cached the server cursor id it was handed for that DML.
+        cursor_id = next(iter(conn._cursor_cache.values()))
+        assert cursor_id
+        # One execution with new values.
+        conn.send(
+            TNS_DATA,
+            _reexecute(
+                cursor_id,
+                [
+                    encode_value(2, TNS_TYPE_NUMBER)
+                    + encode_value('b', TNS_TYPE_VARCHAR)
+                ],
+            ),
+        )
+        received = conn._next_data_packet()
+        assert received is not False, 'the Mirror answered nothing -- it hung'
+        assert received[1][0] == TTI_OER and b'ORA-' not in received[1]
+        # executemany's second run: two executions, one row each, autocommit.
+        conn.send(
+            TNS_DATA,
+            _reexecute(
+                cursor_id,
+                [
+                    encode_value(3, TNS_TYPE_NUMBER)
+                    + encode_value('c', TNS_TYPE_VARCHAR),
+                    encode_value(4, TNS_TYPE_NUMBER)
+                    + encode_value('d', TNS_TYPE_VARCHAR),
+                ],
+                autocommit=True,
+            ),
+        )
+        received = conn._next_data_packet()
+        assert received is not False
+        assert received[1][0] == TTI_OER and b'ORA-' not in received[1]
+        # A cursor the session never handed out is refused, not acknowledged:
+        # "done, 0 rows" would lose a write the client believes was made.
+        conn.send(TNS_DATA, _reexecute(cursor_id + 100, []))
+        received = conn._next_data_packet()
+        assert received is not False
+        assert b'ORA-01001' in received[1]
+        # Every row landed, and the session is in sync for ordinary work.
+        cur.execute('select id, s from t854 order by id')
+        rows = cur.fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        server.join(timeout=5)
+        listen.close()
+    assert rows == [(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')]
+
+
+def test_reexecute_of_a_query_cursor_parks_the_rows_for_fetch() -> None:
+    # A query re-executed with prefetching off is the same func 4 (#854): the
+    # server answers a bare status with rowcount 0 and the client drains the
+    # rows with TTI_FETCH against the same cursor id -- so every row is parked
+    # on that cursor, with the fresh bind applied.
+    from typing import Any
+
+    from seerdb.common.tns import ReexecuteRequest, encode_status
+    from seerdb.common.tns_consts import TNS_DATA, TNS_TYPE_NUMBER
+    from seerdb.server.session import _answer_reexecute_binds, _Cursors
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.sent: list[tuple[int, bytes]] = []
+
+        def write_packet(self, packet_type: int, body: bytes) -> None:
+            self.sent.append((packet_type, body))
+
+    backend = SqliteBackend(':memory:', credentials=_CREDS)
+    backend.execute('create table t (id number)')
+    for i in range(1, 6):
+        backend.execute('insert into t (id) values (:1)', [i])
+    cursors = _Cursors()
+    sql = 'select id from t where id > :1 order by id'
+    cursor_id = cursors.open_query(sql, [(TNS_TYPE_NUMBER, 1, 22, b'')])
+    stream: Any = _Stream()
+
+    request = ReexecuteRequest(cursor=cursor_id, fetch=1, options=0, bind_rows=[[3]])
+    assert _answer_reexecute_binds(stream, backend, request, cursors, {}) == []
+    assert stream.sent == [(TNS_DATA, encode_status(0, cursor_id=cursor_id))]
+    # The rows wait on the SAME cursor id the client holds, for its fetches.
+    _columns, rows = cursors.take(cursor_id, 10)
+    assert rows == [(4,), (5,)]
+    # ...and the statement stays resolvable for the next re-execute.
+    assert cursors.query_sql(cursor_id) == sql
+    assert cursors.bind_types(cursor_id) == [(TNS_TYPE_NUMBER, 1, 22, b'')]

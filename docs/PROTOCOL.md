@@ -1417,6 +1417,50 @@ never caches a statement that carries a LONG-class bind at all, since the DDL
 may come from another session. A plain string bind is sized to its value and
 is safe to cache.
 
+**The re-execute functions (the Mirror, #833/#854).** The 12.1+ thin client
+does not re-send an OALL8 for a statement it has already executed on a cursor.
+Once the cursor id is set, the statement executed, and nothing about it changed
+(bind *types* unchanged, not DDL, not scrollable / batch-errors / parse-only),
+the next execute goes out as a **re-execute** — one of two functions with the
+same body, `_write_reexecute_message` in the reference client:
+
+```
+03 <func> seq [ub8 token @fv24] | ub4 cursor | ub4 iterations | ub4 options_1 | ub4 options_2 | (07 <row>)*
+```
+
+- **`REEXECUTE_AND_FETCH` (78)** — a query with `prefetchrows > 0`:
+  `iterations` is the prefetch size and `options_1` carries `EXECUTE` (0x20).
+  The reply is a fetch: the first batch of rows and a terminator, no describe.
+- **`REEXECUTE` (4)** — everything else: every repeated DML / PL/SQL call, and a
+  query with prefetching off. `iterations` is the execution count (`num_execs`,
+  > 1 for an `executemany` whose batch size matched the first one), `options_2`
+  bit 0 is `COMMIT_REEXECUTE` (the client's autocommit). One `TTI_RXD` row per
+  iteration follows, **with no OACs**: the values are typed by the OACs of the
+  execute that opened the cursor, which the server remembers. Captured off 23ai:
+
+  ```
+  03 04 08 00 | 01 03 | 01 01 | 00 | 00 | 07 02 c1 03 04 72 6f 77 32      INSERT ... (:1, :2) with (2, 'row2')
+  03 04 0b 00 | 01 05 | 01 01 | 00 | 00 | 07 01 79 02 c1 06               UPDATE ... s = :1 WHERE id > :2 with ('y', 5)
+  03 04 0d 00 | 01 04 | 01 01 | 00 | 00 | 07 02 c1 04                     SELECT ... WHERE id > :1, prefetchrows = 0
+  ```
+
+  The reply is a bare **status OER** — `call_status 2 | seq | rowcount | 0 |
+  0 0 | cursor | 0 | sql_type…` — the same shape as the OALL8 cached
+  re-execute's, with the affected-row count for DML (`01 01` = 1, `00` = 0 for
+  the UPDATE that matched nothing) and **rowcount 0 for a query**, whose rows
+  the client then drains with `TTI_FETCH` against the same cursor id.
+
+The Mirror serves 4 by reshaping it into the OALL8 cached re-execute it already
+answers: the cursor supplies the SQL and bind types (kept for query cursors too),
+`parse_reexecute` decodes the rows with them, and a DML cursor runs through the
+ordinary execute path — array rows, autocommit, temp-LOB binds and all — while a
+query cursor runs with its fresh binds, parks every row, and answers
+`encode_status(0, cursor_id)`. A cursor id the session does not hold is refused
+as `ORA-01001` rather than acknowledged with a zero rowcount. Before #854 the
+function was refused outright as `ORA-03115 (TTC function 4)`, so through the
+Mirror only the *first* execute of any statement worked with the reference
+client — a loop of inserts died on its second iteration.
+
 **OUT-bind reply (the Mirror, OCI dialect).** The classic sqlplus `VARIABLE v
 NUMBER` / `EXEC :v := 42` flow sends a PL/SQL block that assigns literals to OUT
 binds; the client parks bind buffers and expects the values back. The Mirror

@@ -311,6 +311,9 @@ TNS_FUNC_DIRECT_PATH_PREPARE = 128
 TNS_FUNC_DIRECT_PATH_LOAD_STREAM = 129
 TNS_FUNC_DIRECT_PATH_OP = 130  # direct-path load (SQL*Loader path)
 TNS_FUNC_SET_SCHEMA = 152  # ALTER SESSION SET CURRENT_SCHEMA fast-path
+TNS_FUNC_REEXECUTE = 4  # re-run a cached cursor with fresh bind rows, no fetch
+# The options_2 bit of a re-execute: commit on success (the client's autocommit).
+TNS_EXEC_OPTION_COMMIT_REEXECUTE = 0x1
 TNS_FUNC_SESSION_GET = 162  # DRCP pooled-session acquire (#130)
 TNS_FUNC_SESSION_RELEASE = 163  # DRCP pooled-session release (#130)
 TNS_FUNC_NOTIFY = 187  # CQN / AQ notification delivery (#129)
