@@ -202,6 +202,7 @@ def test_lob_column_locator_carries_metadata_and_reads_back_either_form() -> Non
     # not byte-equal: they were captured on different sessions, and a locator
     # carries session-specific fields -- what matters is that the metadata in
     # front of one does not eat into it.
+    assert from_meta is not None and from_bare is not None
     assert len(from_meta) == len(from_bare) == 114
     assert from_meta[:17] == from_bare[:17]  # the stable structural prefix
     assert meta_tail == b'' and bare_tail == b''
@@ -211,14 +212,14 @@ def test_lob_column_locator_carries_metadata_and_reads_back_either_form() -> Non
     emitted = encode_lob_locator_thin(3000, with_metadata=True)
     assert emitted[:8].hex(' ') == '01 26 02 0b b8 02 1f 7c'  # len 38, size 3000
     locator, tail = _read_lob_column(emitted)
-    assert len(locator) == 38 and tail == b''
+    assert locator is not None and len(locator) == 38 and tail == b''
 
     # JSON and VECTOR are read by different client paths (read_oson /
     # read_vector), so they keep the bare form and must still decode.
     plain = encode_lob_locator_thin()
     assert plain[:2].hex(' ') == '01 26'
     locator, tail = _read_lob_column(plain)
-    assert len(locator) == 38 and tail == b''
+    assert locator is not None and len(locator) == 38 and tail == b''
 
 
 def test_encode_status_with_rowcounts_is_the_return_parameters_block() -> None:
