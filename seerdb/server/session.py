@@ -530,6 +530,12 @@ def _isolated(call: Callable[..., _T], *args: object, **kwargs: object) -> _T:
     return contextvars.copy_context().run(call, *args, **kwargs)
 
 
+# ORA-03115 is what a client already reads as "this server will not do that".
+# Used for a TTC function the Mirror does not implement, so the call is refused
+# rather than left unanswered (#832).
+_ORA_UNSUPPORTED_CALL = 3115
+
+
 def serve_session(
     stream: PacketStream,
     backend: Backend,
@@ -659,6 +665,29 @@ def serve_session(
             _answer_changepassword(stream, backend, body, conn_key, user, field_version)
         elif body[1] == TTI_LOGOFF:
             return user
+        else:
+            # A TTC function the Mirror does not implement. Answering is not
+            # optional: the client has sent a call and is blocked reading its
+            # reply, so falling through to the next read_packet() leaves it
+            # waiting for something that never arrives -- for as long as it is
+            # willing to wait, which for an ordinary client is forever. A real
+            # server always answers, even when the answer is a refusal.
+            #
+            # The cost of not doing this was not one hung call but an unusable
+            # conformance run: every gap presented as an indefinite stall
+            # instead of a failure, so the suite could not reach the next test
+            # (#832). ORA-03115 is the error a client already understands as
+            # "this server will not do that", and it leaves the session usable
+            # so the following statements still run.
+            logger.info('unimplemented TTC function %s; refusing', body[1])
+            stream.write_packet(
+                TNS_DATA,
+                encode_error(
+                    _ORA_UNSUPPORTED_CALL,
+                    f'ORA-{_ORA_UNSUPPORTED_CALL:05d}: unsupported network '
+                    f'datatype or representation (TTC function {body[1]})',
+                ),
+            )
 
 
 def _serve_oci_session(
