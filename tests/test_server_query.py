@@ -165,6 +165,62 @@ def _client_exec_request(
     )
 
 
+def test_lob_column_locator_carries_metadata_and_reads_back_either_form() -> None:
+    # A CLOB / BLOB column value is `ub4 locator length | ub8 size | ub4 chunk
+    # size | length-prefixed locator`. The Mirror used to emit only the length
+    # and the locator, so the reference thin client -- whose LOB reader reads
+    # those two middle fields unconditionally -- took the locator's own length
+    # prefix for the size and died with DPY-5002 (#853).
+    #
+    # A live 23ai sends the metadata form to that client and the BARE form to
+    # seerdb, for the same row on the same settings; the switch is not known
+    # (compile caps, runtime caps, DTY table, executes and prefetch were all
+    # compared and are identical). So the Mirror always sends the metadata form,
+    # which the stricter reader demands, and the reader below takes either.
+    from seerdb.common.tns import (
+        _read_lob_column,
+        encode_lob_locator_thin,
+    )
+
+    # Both captured live from 23ai, the same 3000-byte BLOB column, one per
+    # client. They must yield the same 114-byte locator.
+    meta = bytes.fromhex(
+        '0172020bb8021f7c7200700002010c02800001000000010000003eccc3000210'
+        '0700021006000200020000000016000000000000016aa7323e00000000000000'
+        '00000000001aab82f1000000000000deadbeef00010022000000000169b40b00'
+        '000000000000000000000000000000000000021298000472ae0000'
+    )
+    bare = bytes.fromhex(
+        '01727200700002010c02800001000000010000003eccc3000210070002100600'
+        '0200020000000016000000000000016aa732410000000000000000000000001a'
+        'ab82f1000000000000deadbeef00010022000000000169b40e00000000000000'
+        '000000000000000000000000021298000472ae0000'
+    )
+    from_meta, meta_tail = _read_lob_column(meta)
+    from_bare, bare_tail = _read_lob_column(bare)
+    # Each yields the whole locator and consumes its value exactly. The two are
+    # not byte-equal: they were captured on different sessions, and a locator
+    # carries session-specific fields -- what matters is that the metadata in
+    # front of one does not eat into it.
+    assert len(from_meta) == len(from_bare) == 114
+    assert from_meta[:17] == from_bare[:17]  # the stable structural prefix
+    assert meta_tail == b'' and bare_tail == b''
+
+    # What the Mirror emits for a CLOB / BLOB: the metadata form, with the
+    # value's own size, read back to the same locator.
+    emitted = encode_lob_locator_thin(3000, with_metadata=True)
+    assert emitted[:8].hex(' ') == '01 26 02 0b b8 02 1f 7c'  # len 38, size 3000
+    locator, tail = _read_lob_column(emitted)
+    assert len(locator) == 38 and tail == b''
+
+    # JSON and VECTOR are read by different client paths (read_oson /
+    # read_vector), so they keep the bare form and must still decode.
+    plain = encode_lob_locator_thin()
+    assert plain[:2].hex(' ') == '01 26'
+    locator, tail = _read_lob_column(plain)
+    assert len(locator) == 38 and tail == b''
+
+
 def test_encode_status_with_rowcounts_is_the_return_parameters_block() -> None:
     # The arraydmlrowcounts status carries the counts in the execute's
     # return-parameters block (TTI_RPA), laid out as a real server lays it out
@@ -1820,8 +1876,9 @@ def test_encode_value_emits_a_thin_lob_locator_for_lob_columns() -> None:
     from seerdb.common.tns_consts import TNS_TYPE_BLOB, TNS_TYPE_CLOB
 
     for lob_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
+        # A CLOB / BLOB carries the locator metadata, sized from the value (#853).
         locator = encode_value('anything', lob_type)
-        assert locator == encode_lob_locator_thin()
+        assert locator == encode_lob_locator_thin(len('anything'), with_metadata=True)
         # sb4 length prefix, then the length-led locator bytes the client keeps.
         assert _THIN_LOB_LOCATOR in locator
         assert encode_value(None, lob_type) == b'\x00'

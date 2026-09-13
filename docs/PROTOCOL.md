@@ -2805,6 +2805,48 @@ of the wrong shape.
   Instant Client), and the ack already keeps the wire in sync. `READ` (and any
   unrecognised op) still routes to the #413 read path, unchanged.
 
+### 14.5b LOB **column** value framing, and its two forms (#853)
+
+A CLOB / BLOB column value in an RXD row is
+
+```
+ub4 locator length | ub8 size | ub4 chunk size | <ub1 len> locator
+```
+
+captured from a live 23ai for a 3000-byte BLOB as
+`01 72 | 02 0b b8 | 02 1f 7c | 72 <114 locator bytes>` — length 114, size 3000,
+chunk size 8060. The reference thin client reads exactly this, and reads the two
+middle fields **unconditionally** for every CLOB / BLOB / BFILE column
+(`read_lob_with_length`); given only `ub4 length | locator` it takes the
+locator's own length prefix for the `ub8` size and fails with `DPY-5002`. JSON
+and VECTOR columns are *not* read by that path (`read_oson` / `read_vector`), so
+they carry no such metadata.
+
+**A real server sends two different forms, and the switch is not known.** A live
+23ai sends the framing above to the reference client and the bare
+`ub4 length | locator` to seerdb — same row, same connection settings, both
+reproducible back to back. Everything the two clients declare was compared and
+is identical: the 53-byte compile capability array (`CCAP_LOB = 0xcf`,
+`CCAP_LOB2 = 0x05`), the 11-byte runtime capabilities, the DTY type table (321
+entries, including CLOB/BLOB/BFILE), and the executes themselves (same options
+`0x8061`, no defines); prefetch size was tested and makes no difference. The
+handshakes differ only in `AUTH_PROGRAM_NM` / `AUTH_PID` / `AUTH_SID`. Whatever
+selects the form has not been found, and it is recorded here rather than
+guessed at.
+
+Consequences for seerdb:
+
+- **The Mirror always sends the metadata form** for CLOB / BLOB — the stricter
+  reader requires it, and the more tolerant one is ours to fix.
+- **`_read_lob_column` accepts either form**, so seerdb's client reads the Mirror
+  and a real server alike. The forms are told apart by the byte after the
+  length: in the bare form it is the locator's own length prefix and equals that
+  length (or `0xFE` for a chunked block); in the metadata form it is the size's
+  length marker, at most 4. They cannot collide for a real locator, which is 38
+  bytes at the smallest, so the test is only applied above a length of 8. This
+  is a heuristic and is written down as one; it becomes unnecessary the day the
+  switch above is identified.
+
 ### 14.6 Persistent-LOB locator field map (Mirror, deadbeef dialect)
 
 The Mirror hands sqlplus a **persistent-LOB locator** in the row value
