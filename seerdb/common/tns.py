@@ -3298,6 +3298,21 @@ def _read_lob_column(Rest: bytes) -> tuple[bytes | None, bytes]:
         # Defensive: malformed or unexpected layout. Surface what we have
         # rather than overrunning the buffer.
         return (bytes(Body), b'')
+    # A CLOB / BLOB column may carry the locator's metadata -- a ub8 size and a
+    # ub4 chunk size -- between the length and the locator itself (#853). A live
+    # 23ai sends that form to the reference thin client and the bare form to
+    # seerdb, for the same row; the Mirror always sends it (see
+    # encode_lob_locator_thin). Both have to be read here.
+    #
+    # They are told apart by the byte after the length. In the bare form that is
+    # the locator's own length prefix, which equals NumBytes (or 0xFE when the
+    # block is chunked); in the metadata form it is the size's ub4 length
+    # marker, at most 4. The two cannot collide for a real locator, which is 38
+    # bytes at the smallest -- so the test is only applied when NumBytes says so,
+    # and anything smaller keeps the bare reading.
+    if NumBytes > 8 and Body[0] <= 8 and Body[0] != NumBytes:
+        (_Size, Body) = decode_ub4(Body)
+        (_ChunkSize, Body) = decode_ub4(Body)
     (Locator, Tail) = decode_dalc(Body)
     if isinstance(Locator, list):  # 0x00 / 0xFF DALC → empty / null
         return (None, Tail)
@@ -9803,12 +9818,50 @@ def encode_long_value_thin(Value: object) -> bytes:
 # The RXD value the Mirror mints for a thin LOB column: an opaque locator the
 # client echoes back over TTI_LOBOPS, the content following in the read reply.
 _THIN_LOB_LOCATOR = b'\x00seerdb-mirror-lob-locator-0000000000\x00'
+# The chunk size a live 23ai reports alongside a LOB column locator. The client
+# keeps it for its own chunking (`lob.getchunksize()`); any sane value works.
+_THIN_LOB_CHUNK_SIZE = 8060
 
 
-def encode_lob_locator_thin() -> bytes:
+def _lob_value_size(Value: object) -> int:
+    # The size a LOB column's locator metadata reports: characters for a CLOB,
+    # bytes for a BLOB, matching what a live server reports for the same value.
+    if isinstance(Value, str):
+        return len(Value)
+    if isinstance(Value, (bytes, bytearray, memoryview)):
+        return len(bytes(Value))
+    return 0
+
+
+def encode_lob_locator_thin(size: int = 0, *, with_metadata: bool = False) -> bytes:
     """The RXD value for a thin LOB column (#413): a minted opaque locator the
-    client echoes back over TTI_LOBOPS. The content follows in the read reply."""
-    return encode_sb4(len(_THIN_LOB_LOCATOR)) + _bytes_with_length(_THIN_LOB_LOCATOR)
+    client echoes back over TTI_LOBOPS. The content follows in the read reply.
+
+    A CLOB / BLOB column carries the locator's **metadata** in front of it --
+    ``ub4 locator length | ub8 size | ub4 chunk size | length-prefixed
+    locator`` -- which is what the reference thin client reads, unconditionally,
+    for every CLOB / BLOB / BFILE column. Without the two middle fields it takes
+    the locator's own length prefix for the size and dies (`DPY-5002`, #853).
+    Captured from a live 23ai for a 3000-byte BLOB: ``01 72 | 02 0b b8 |
+    02 1f 7c | 72 <114 locator bytes>``.
+
+    ``with_metadata=False`` keeps the bare ``ub4 length | locator`` form for the
+    column types that are NOT read by that path -- JSON (`read_oson`) and VECTOR
+    (`read_vector`) -- which would mis-decode the extra fields.
+
+    Which form a real server sends is, as of #853, **not** something we can
+    predict: a live 23ai sends the bare form to seerdb and the metadata form to
+    the reference client, for the same row on the same connection settings, with
+    byte-identical compile capabilities, runtime capabilities and DTY type table
+    (321 entries), equivalent executes and the same prefetch. The switch was not
+    found. The Mirror therefore always sends the metadata form for CLOB / BLOB,
+    which is what the stricter reader demands, and :func:`_read_lob_column`
+    accepts either so seerdb's own client reads the Mirror and a real server
+    alike."""
+    head = encode_sb4(len(_THIN_LOB_LOCATOR))
+    if with_metadata:
+        head += encode_sb4(size) + encode_sb4(_THIN_LOB_CHUNK_SIZE)
+    return head + _bytes_with_length(_THIN_LOB_LOCATOR)
 
 
 def _encode_temporal(Value: datetime.date, DataType: int) -> bytes:
@@ -9871,6 +9924,12 @@ def encode_value(Value: object, DataType: int) -> bytes:
         # A thin CLOB / BLOB / JSON / VECTOR value is delivered as an opaque
         # locator; the content follows over TTI_LOBOPS (#413). JSON content is the
         # OSON image, VECTOR the binary image (see oci_lob_contents).
+        #
+        # Only CLOB / BLOB carry the locator metadata: those are the types the
+        # reference client reads with its LOB reader, while JSON and VECTOR go
+        # through read_oson / read_vector, which would mis-decode it (#853).
+        if DataType in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
+            return encode_lob_locator_thin(_lob_value_size(Value), with_metadata=True)
         return encode_lob_locator_thin()
     if DataType == TNS_TYPE_BOOLEAN:
         # Native SQL BOOLEAN (23ai): a one-byte value, 0x01 for TRUE and 0x00 for
