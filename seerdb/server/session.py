@@ -361,6 +361,15 @@ def handle_login(
         # client below the advertised version failed to authenticate at all
         # (ORA-01017) before it could reach a statement (#816).
         field_version = negotiated
+    # Pin the codec to the session's version for the rest of the handshake. The
+    # query loop does this per iteration, but login runs before it and builds
+    # version-shaped bytes of its own -- the challenge's status OER carries an
+    # extended error number and a ub8 rowcount from 12.1, and a SQL type and
+    # checksum from 20.1. Left at the default 6, those fields are simply absent,
+    # so a 12.1+ client reads past the end of the OER and waits for a
+    # continuation that never comes (#829).
+    _DECODE_FIELD_VERSION.set(field_version)
+    _ENCODE_FIELD_VERSION.set(field_version)
     # 23ai fast-auth (§20): a client at field version >= 18 cannot use the legacy
     # three-message handshake (the server rejects it with ORA-03146), so after the
     # bare PRO it sends one FAST_AUTH packet bundling DTY + OSESSKEY. The DTY and
@@ -418,7 +427,11 @@ def handle_login(
             _expect(stream, TNS_DATA, 'AUTH')
         )
     else:
-        challenge = make_challenge(secret.encode('utf-8'))
+        # The thin challenge follows the session's field version: 12.1+ gets the
+        # PBKDF2 shape and derivation, below that the 11g one (#829). The OCI
+        # branch above stays 11g -- its dialect is pinned to the captured 11.2
+        # identity.
+        challenge = make_challenge(secret.encode('utf-8'), field_version=field_version)
         # Fast-auth expects the challenge bundled with the PRO + DTY replies it
         # deferred; legacy sends the challenge on its own.
         if fast_auth:

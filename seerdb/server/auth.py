@@ -41,19 +41,21 @@ from Crypto.Cipher import AES
 from seerdb.common import oci
 from seerdb.common.crypto import (
     O5LOGON_IV,
-    SERVER_TO_CLIENT,
+    PBKDF2_SDER_COUNT,
     VFR_11G_SHA1,
     cat_key,
     conn_key,
     decrypt_password,
     key_sess_11g,
     pad2,
+    server_proof_padded,
 )
 from seerdb.common.exceptions import InterfaceError
 from seerdb.common.tns import (
     _CHALLENGE_TRAILER,
     _DECODE_FIELD_VERSION,
     _RESULT_TRAILER,
+    AUTH_GLOBALLY_UNIQUE_DBID,
     Challenge,
     _hexval,
     decode_dalc,
@@ -77,6 +79,16 @@ _BITS_11G = 192
 # A server session key is 40 random bytes + an 8-byte pad2 tail, so the client
 # recognises it and mints a matching 48-byte session key (see crypto.o5logon0).
 _SERVER_SESSION_LEN = 40
+# AUTH_PBKDF2_CSK_SALT is 16 bytes on a live 21c (32 hex on the wire).
+_DERIVED_SALT_LEN = 16
+# The modern session key is 32 bytes, and its LENGTH is what selects the
+# derivation -- not the presence of the salt. python-oracledb branches on
+# `len(session_key_part_a) == 48` and takes the 11g XOR+MD5 path when it matches,
+# ignoring AUTH_PBKDF2_CSK_SALT entirely; a live 21c sends 32. Sending 48
+# alongside a CSK salt therefore makes the client derive an 11g key while the
+# server derives a PBKDF2 one, and the login fails with both sides believing
+# they were right (#829).
+_MODERN_SESSION_LEN = 32
 
 
 def make_challenge(
@@ -84,32 +96,52 @@ def make_challenge(
     *,
     salt: bytes | None = None,
     server_session: bytes | None = None,
+    derived_salt: bytes | None = None,
+    field_version: int = FIELD_VERSION_11_2,
 ) -> Challenge:
     """Build the O5LOGON challenge for an account whose password is known.
 
-    ``salt`` / ``server_session`` are injectable for deterministic tests; both
-    default to fresh random values.
+    From field version 12.1 the challenge also carries ``AUTH_PBKDF2_CSK_SALT``
+    and the two iteration counts, and both sides derive the session key through
+    PBKDF2 instead of the 11g transform (#829). The *verifier* stays 11g SHA-1 —
+    the Mirror computes it from the plaintext secret and has no SHA-2 verifier to
+    offer — which is a combination a real server also produces, for an account
+    that predates SHA-2. ``AUTH_VFR_DATA``'s flag tells the client so.
+
+    ``salt`` / ``server_session`` / ``derived_salt`` are injectable for
+    deterministic tests; all default to fresh random values.
     """
     if salt is None:
         salt = token_bytes(16)
+    if derived_salt is None and field_version >= FIELD_VERSION_12_1:
+        derived_salt = token_bytes(_DERIVED_SALT_LEN)
     if server_session is None:
-        server_session = token_bytes(_SERVER_SESSION_LEN) + pad2(b'', 8)
+        server_session = (
+            token_bytes(_MODERN_SESSION_LEN)
+            if derived_salt is not None
+            else token_bytes(_SERVER_SESSION_LEN) + pad2(b'', 8)
+        )
     key_sess = key_sess_11g(password, salt)
     auth_sesskey = AES.new(key_sess, AES.MODE_CBC, O5LOGON_IV).encrypt(server_session)
-    return Challenge(salt, server_session, key_sess, auth_sesskey)
+    return Challenge(salt, server_session, key_sess, auth_sesskey, derived_salt)
 
 
 def derive_conn_key(challenge: Challenge, client_auth_sesskey: bytes) -> bytes:
     """Derive the session ConnKey from the client's AUTH_SESSKEY response.
 
     Recovers the client session key and combines it with the server's — the
-    result equals the ConnKey the client derived.
+    result equals the ConnKey the client derived. The challenge's
+    ``derived_salt`` decides which derivation is used, so this stays the exact
+    inverse of whatever :func:`make_challenge` advertised: absent, the 11g
+    transform; present, the PBKDF2 one the 12.1+ client ran (#829).
     """
     client_session = AES.new(challenge.key_sess, AES.MODE_CBC, O5LOGON_IV).decrypt(
         client_auth_sesskey
     )
-    combined = cat_key(challenge.server_session, client_session, None, _BITS_11G)
-    return conn_key(combined, None, _BITS_11G)
+    combined = cat_key(
+        challenge.server_session, client_session, challenge.derived_salt, _BITS_11G
+    )
+    return conn_key(combined, challenge.derived_salt, _BITS_11G, PBKDF2_SDER_COUNT)
 
 
 # The OCI dialect's AUTH_SVR_RESPONSE is 48 bytes, not the thin 16: the real 11g
@@ -128,12 +160,10 @@ def server_proof_oci(session_key: bytes, *, nonce: bytes | None = None) -> bytes
     for deterministic tests; it defaults to a fresh random value and the client
     does not check it.
     """
-    if nonce is None:
-        nonce = token_bytes(_PROOF_NONCE_LEN)
-    if len(nonce) != _PROOF_NONCE_LEN:
-        raise InterfaceError(f'proof nonce must be {_PROOF_NONCE_LEN} bytes')
-    plain = nonce + SERVER_TO_CLIENT + _PKCS7_FULL_BLOCK
-    return AES.new(session_key, AES.MODE_CBC, O5LOGON_IV).encrypt(plain)
+    try:
+        return server_proof_padded(session_key, nonce=nonce)
+    except ValueError as exc:
+        raise InterfaceError(str(exc)) from exc
 
 
 def verify_password(
@@ -195,7 +225,6 @@ _RESULT_PARAMS_TAIL: tuple[tuple[bytes, bytes], ...] = (
     (b'AUTH_NLS_LXCTTZNFM\x00', b'HH.MI.SSXFF AM TZR'),
     (b'AUTH_NLS_LXCSTZNFM\x00', b'DD-MON-RR HH.MI.SSXFF AM TZR'),
 )
-_AUTH_GLOBALLY_UNIQUE_DBID = b'2C55FD5F1FE1101DA2455B7A62312B1D'
 
 
 def _result_params(identity: ServerIdentity) -> tuple[tuple[bytes, bytes], ...]:
@@ -254,7 +283,7 @@ def encode_challenge_oci(challenge: Challenge) -> bytes:
     pairs = [
         (b'AUTH_SESSKEY', sesskey, 0),
         (b'AUTH_VFR_DATA', salt, VFR_11G_SHA1),
-        (b'AUTH_GLOBALLY_UNIQUE_DBID\x00', _AUTH_GLOBALLY_UNIQUE_DBID, 0),
+        (b'AUTH_GLOBALLY_UNIQUE_DBID\x00', AUTH_GLOBALLY_UNIQUE_DBID, 0),
     ]
     return _oci_auth_packet(pairs, _CHALLENGE_TRAILER)
 
