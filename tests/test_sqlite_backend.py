@@ -770,7 +770,7 @@ def test_reexecute_of_a_query_cursor_parks_the_rows_for_fetch() -> None:
 
     from seerdb.common.tns import ReexecuteRequest, encode_status
     from seerdb.common.tns_consts import TNS_DATA, TNS_TYPE_NUMBER
-    from seerdb.server.session import _answer_reexecute_binds, _Cursors
+    from seerdb.server.session import _answer_reexecute_binds, _Cursors, _TempLobs
 
     class _Stream:
         def __init__(self) -> None:
@@ -789,7 +789,7 @@ def test_reexecute_of_a_query_cursor_parks_the_rows_for_fetch() -> None:
     stream: Any = _Stream()
 
     request = ReexecuteRequest(cursor=cursor_id, fetch=1, options=0, bind_rows=[[3]])
-    assert _answer_reexecute_binds(stream, backend, request, cursors, {}) == []
+    assert _answer_reexecute_binds(stream, backend, request, cursors, _TempLobs()) == []
     assert stream.sent == [(TNS_DATA, encode_status(0, cursor_id=cursor_id))]
     # The rows wait on the SAME cursor id the client holds, for its fetches.
     _columns, rows = cursors.take(cursor_id, 10)

@@ -451,24 +451,25 @@ def test_skip_piggybacks_frees_the_closed_temp_lobs(field_version: int) -> None:
     from seerdb.common.tns import (
         _DECODE_FIELD_VERSION,
         encode_free_temp_lobs_piggyback,
-        mint_temp_lob_locator,
         parse_free_temp_lobs_piggyback,
     )
-    from seerdb.server.session import _skip_piggybacks
+    from seerdb.server.session import _skip_piggybacks, _TempLobs
 
     body = _exec_body()
-    first, second, kept = (mint_temp_lob_locator(i, True) for i in range(3))
-    temp_lobs = {first: bytearray(b'a'), second: bytearray(b'b'), kept: bytearray()}
+    temp_lobs = _TempLobs()
+    first, second, kept = (temp_lobs.mint(True) for _ in range(3))
+    temp_lobs.append(first, b'a')
+    temp_lobs.append(second, b'b')
     token = _DECODE_FIELD_VERSION.set(field_version)
     try:
         free = encode_free_temp_lobs_piggyback(4, field_version, [first, second])
         assert _skip_piggybacks(free + body, None, temp_lobs) == body
-        assert temp_lobs == {kept: bytearray()}
+        assert (temp_lobs.content(first), temp_lobs.content(second)) == (b'', b'')
         # A locator the Mirror never saw (a client can free what it never wrote)
         # is not an error, and nothing else is disturbed.
         stray = encode_free_temp_lobs_piggyback(4, field_version, [first])
         assert _skip_piggybacks(stray + body, None, temp_lobs) == body
-        assert temp_lobs == {kept: bytearray()}
+        assert temp_lobs.content(kept) == b''
         # An empty array walks too.
         assert (
             _skip_piggybacks(
@@ -804,19 +805,22 @@ def test_free_temp_drops_the_buffer_and_state_ops_ack() -> None:
             assert packet_type == TNS_DATA
             self.sent.append(body)
 
-    locator = b'\x00seerdb-mirror-temp-lob-\x00\x00\x00\x00\x01'
-    temp_lobs = {bytes(locator): bytearray(b'written-bytes')}
+    from seerdb.server.session import _TempLobs
+
+    temp_lobs = _TempLobs()
+    locator = temp_lobs.mint(is_blob=True)
+    temp_lobs.append(locator, b'written-bytes')
     stream: Any = _FakeStream()
 
     # FREE_TEMP drops the buffer and replies with a success ack.
     _answer_lobops(stream, op_request(TNS_LOB_OP_FREE_TEMP, locator), [], temp_lobs)
-    assert bytes(locator) not in temp_lobs
+    assert temp_lobs.content(locator) == b''
     assert decode_lobops_oer(stream.sent[-1], 6)[0] in (0, 1403)
 
     # A state op (OPEN) is acknowledged, buffer untouched, no desync.
-    temp_lobs[bytes(locator)] = bytearray(b'x')
+    temp_lobs.append(locator, b'x')
     _answer_lobops(stream, op_request(TNS_LOB_OP_OPEN, locator), [], temp_lobs)
-    assert bytes(locator) in temp_lobs  # OPEN doesn't free
+    assert temp_lobs.content(locator) == b'x'  # OPEN doesn't free
     assert decode_lobops_oer(stream.sent[-1], 6)[0] in (0, 1403)
 
 
@@ -1789,6 +1793,45 @@ def test_a_zero_prefetch_execute_sends_no_rows_but_parks_them() -> None:
     assert _prefetch_batch(0, 3) == 0
     assert _prefetch_batch(2, 3) == 2
     assert _prefetch_batch(99, 3) == 3
+
+
+def test_a_freed_temp_lob_never_hands_its_locator_to_the_next_one() -> None:
+    # Locators used to be numbered by the COUNT of live temp LOBs, so freeing one
+    # reissued its index and the next CREATE_TEMP collided with a locator still
+    # in use (#857). Replay of the live sequence that exposed it -- a third large
+    # LOB insert on one connection:
+    #
+    #   insert 1  mint L0
+    #   insert 2  mint L1, then the close-temp-LOBs piggyback frees L0
+    #   insert 3  mint ... -> handed back L1 under the count, overwriting the
+    #             buffer insert 2 was holding; the piggyback riding on insert 3
+    #             then freed the locator insert 3 was about to bind, and the
+    #             value reached the backend as NULL (ORA-01400).
+    from seerdb.server.session import _TempLobs
+
+    temp_lobs = _TempLobs()
+    first = temp_lobs.mint(is_blob=True)
+    second = temp_lobs.mint(is_blob=True)
+    temp_lobs.append(second, b'insert-2-payload')
+    temp_lobs.free(first)  # the piggyback riding on insert 2
+
+    third = temp_lobs.mint(is_blob=True)
+    assert third not in (first, second)
+    # The live buffer is untouched -- the collision used to reset it to empty.
+    assert temp_lobs.content(second) == b'insert-2-payload'
+    temp_lobs.append(third, b'insert-3-payload')
+    assert temp_lobs.content(third) == b'insert-3-payload'
+    assert temp_lobs.content(second) == b'insert-2-payload'
+
+    # The index keeps climbing however much is freed: reuse is what caused the
+    # collision, so nothing may bring it back, including freeing everything.
+    for locator in (second, third):
+        temp_lobs.free(locator)
+    minted = [temp_lobs.mint(is_blob=False) for _ in range(3)]
+    assert len(set(minted + [first, second, third])) == 6
+    # Freeing a locator the Mirror never saw is still not an error.
+    temp_lobs.free(b'never-minted')
+    assert temp_lobs.content(b'never-minted') == b''
 
 
 def test_a_break_episode_is_answered_with_reset_then_cancel() -> None:
