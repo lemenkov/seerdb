@@ -660,6 +660,9 @@ def serve_session(
         if received is None:
             return user
         packet_type, body = received
+        if packet_type == TNS_MARKER:
+            _answer_marker(stream, body)
+            continue
         if packet_type != TNS_DATA:
             continue
         body = _skip_piggybacks(body, backend)  # CLOSE_CURSORS, tracing, …
@@ -1089,6 +1092,51 @@ def _apply_schema(backend: Backend | None, schema: bytes | list) -> None:
         backend.execute(f'ALTER SESSION SET CURRENT_SCHEMA = {name}')
     except Exception as exc:  # noqa: BLE001 - see the docstring
         logger.info('set current_schema %r refused by the backend: %s', name, exc)
+
+
+_ORA_USER_CANCEL = 1013  # ORA-01013: user requested cancel of current operation
+
+
+def _answer_marker(stream: PacketStream, body: bytes) -> None:
+    """Answer a break episode the way a real server does (#844).
+
+    ``connection.cancel()`` does not interrupt anything the moment it is called.
+    Without out-of-band support it cannot reach the server while the client is
+    waiting on a reply, so it defers the break and sends it in-band once that
+    reply arrives. Measured through the Mirror: the call was sent at 1.40s, its
+    reply went out at 4.41s after a three-second sleep, and only THEN did the
+    client send its markers. So there is never anything in flight to abandon by
+    the time a marker arrives, and no need to try.
+
+    What the client does need is the rest of the exchange, captured from 23ai:
+
+        client -> MARKER 01 00 03   interrupt
+        client -> MARKER 01 00 02   reset
+        server -> MARKER 01 00 02   reset
+        server -> DATA   OER        ORA-01013
+
+    The thin loop used to drop every marker into its "not DATA, ignore it"
+    branch, so the client waited forever. #836 audited that branch and spared it
+    on the grounds that a marker needs no reply; that was wrong, and the OCI loop
+    in this file had already learned it. A break is answered with a reset, and the
+    client's own reset closes the episode with the cancel it asked for.
+    """
+    marker_type = body[2] if len(body) >= 3 else 0
+    if marker_type == TNS_MARKER_TYPE_RESET:
+        # The client's reset ends the episode: report the cancellation, which is
+        # what it is now waiting to read.
+        stream.write_packet(
+            TNS_DATA,
+            encode_error(
+                _ORA_USER_CANCEL,
+                # The text a live 23ai sends, capitalised and full-stopped.
+                f'ORA-{_ORA_USER_CANCEL:05d}: User requested cancel of current '
+                f'operation.',
+            ),
+        )
+    else:
+        # An interrupt or break opens it: answer with a single reset.
+        stream.write_packet(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
 
 
 def _skip_piggybacks(body: bytes, backend: Backend | None = None) -> bytes:
