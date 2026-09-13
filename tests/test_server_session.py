@@ -1512,15 +1512,18 @@ def test_unhandled_piggyback_is_refused_not_dropped() -> None:
         timeout=5000,
     )
     try:
-        # A SET_SCHEMA (152) piggyback, the shape a real client sends after
-        # `connection.current_schema = ...`, with no handler behind it.
-        conn.send(TNS_DATA, bytes([TTI_MSG_TYPE_PIGGYBACK, 152]) + bytes(8))
+        # 205 is the end-user security context piggyback: real, tcps-only, and
+        # deliberately not handled here -- so it stands in for "a piggyback the
+        # Mirror does not know". (This test used SET_SCHEMA until #837
+        # implemented it; the example has to be one that is still unhandled, or
+        # the test quietly stops testing anything.)
+        conn.send(TNS_DATA, bytes([TTI_MSG_TYPE_PIGGYBACK, 205]) + bytes(8))
         received = conn._next_data_packet()
         assert received is not False, 'the Mirror answered nothing -- it hung'
         assert b'ORA-03115' in received[1]
         # The refusal names the piggyback, so the gap is identifiable from the
         # error alone rather than needing a packet capture.
-        assert b'piggyback 152' in received[1]
+        assert b'piggyback 205' in received[1]
         # The stream is still in sync: an ordinary statement runs.
         cursor = conn.cursor()
         cursor.execute('select * from dual')
