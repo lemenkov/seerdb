@@ -1723,6 +1723,74 @@ def test_parse_reexecute_decodes_fresh_bind_rows_by_the_cached_types() -> None:
         _DECODE_FIELD_VERSION.reset(token)
 
 
+def test_a_zero_prefetch_execute_sends_no_rows_but_parks_them() -> None:
+    # An execute's fetch field is the client's PREFETCH, and a zero there means
+    # "send me no rows on the execute" -- the client has allocated no fetch
+    # buffer and will ask with TTI_FETCH. Reading it as "send everything"
+    # overran the reference thin client's define array and killed it inside its
+    # own row decoder (IndexError in _process_row_data), before the reply could
+    # become an error anyone could read (#856). A real 23ai answers a prefetch-0
+    # execute with describe + status and no row data at all.
+    from seerdb.common.tns import ExecRequest, encode_query_response
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+    from seerdb.server.session import _answer_query, _Cursors, _prefetch_batch
+
+    column = ColumnMeta(
+        name=b'ID', data_type=TNS_TYPE_NUMBER, data_length=22, max_size=22
+    )
+
+    class _Rows:
+        capabilities: frozenset = frozenset()
+
+        def execute(self, sql: str, binds=()) -> Result:
+            return Result(columns=[column], rows=[(1,), (2,), (3,)])
+
+        def commit(self) -> None:
+            pass
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.sent: list[tuple[int, bytes]] = []
+
+        def write_packet(self, packet_type: int, body: bytes) -> None:
+            self.sent.append((packet_type, body))
+
+    def run(fetch: int) -> tuple[Any, Any]:
+        stream: Any = _Stream()
+        cursors = _Cursors()
+        request = ExecRequest(
+            sql='select id from t', cursor=0, bind_count=0, fetch=fetch
+        )
+        _answer_query(stream, _Rows(), request, cursors)  # type: ignore[arg-type]
+        return stream, cursors
+
+    # Prefetch 0: describe and a "more rows on cursor 1" terminator, not one row.
+    stream, cursors = run(0)
+    assert stream.sent == [
+        (TNS_DATA, encode_query_response([column], [], cursor_id=1, more=True))
+    ]
+    # ...and every row waits on the cursor the terminator named, so the client's
+    # TTI_FETCH gets them. They are delivered, not dropped.
+    _columns, parked = cursors.take(1, 10)
+    assert parked == [(1,), (2,), (3,)]
+
+    # A positive prefetch is untouched: that many inline, the rest parked.
+    stream, cursors = run(2)
+    assert stream.sent == [
+        (
+            TNS_DATA,
+            encode_query_response([column], [(1,), (2,)], cursor_id=1, more=True),
+        )
+    ]
+    assert cursors.take(1, 10)[1] == [(3,)]
+
+    # The rule itself, at its edges: a zero keeps nothing back for later only
+    # because the caller parks it; a prefetch wider than the result is clamped.
+    assert _prefetch_batch(0, 3) == 0
+    assert _prefetch_batch(2, 3) == 2
+    assert _prefetch_batch(99, 3) == 3
+
+
 def test_a_break_episode_is_answered_with_reset_then_cancel() -> None:
     # connection.cancel() sends its break in-band AFTER the call's reply arrives
     # (no out-of-band support is advertised), then waits. The thin loop dropped
