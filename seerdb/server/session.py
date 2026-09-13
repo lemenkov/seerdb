@@ -86,6 +86,7 @@ from seerdb.common.tns import (
     parse_exec,
     parse_exec_oci,
     parse_fetch,
+    parse_free_temp_lobs_piggyback,
     parse_lobops_read,
     parse_lobops_request,
     parse_reexecute,
@@ -665,7 +666,7 @@ def serve_session(
             continue
         if packet_type != TNS_DATA:
             continue
-        body = _skip_piggybacks(body, backend)  # CLOSE_CURSORS, tracing, …
+        body = _skip_piggybacks(body, backend, temp_lobs)  # CLOSE_CURSORS, …
         if len(body) < 2 or body[0] != TTI_FUN:
             # Piggyback processing could not reach a call. That is what happens
             # when the message leads with a piggyback the Mirror does not know:
@@ -1184,7 +1185,11 @@ def _complete_message(
             body = body + cont_body
 
 
-def _skip_piggybacks(body: bytes, backend: Backend | None = None) -> bytes:
+def _skip_piggybacks(
+    body: bytes,
+    backend: Backend | None = None,
+    temp_lobs: dict[bytes, bytearray] | None = None,
+) -> bytes:
     # A call can be preceded by piggybacks — CLOSE_CURSORS (105), which a client
     # sends to free the cursors it drained on the previous fetch, and, from 12.1
     # up, the end-to-end tracing attributes (135) and the request-boundary
@@ -1193,7 +1198,8 @@ def _skip_piggybacks(body: bytes, backend: Backend | None = None) -> bytes:
     # or request state, so those two are simply skipped; the tracing attributes
     # are handed to the backend (its optional set_end_to_end), so a session's
     # module / action / client identifier reach the database behind the Mirror
-    # the way they would a real server. An unknown piggyback is left in place,
+    # the way they would a real server; the close-temp-LOBs piggyback (96) drops
+    # the named buffers from `temp_lobs`. An unknown piggyback is left in place,
     # so the caller ignores the message rather than mis-parsing it.
     while len(body) >= 3 and body[0] == TTI_MSG_TYPE_PIGGYBACK:
         func = body[1]
@@ -1227,6 +1233,17 @@ def _skip_piggybacks(body: bytes, backend: Backend | None = None) -> bytes:
             _apply_schema(backend, schema)
         elif func == TNS_FUNC_SESSION_STATE:
             _, rest = decode_ub4(rest)  # the requested state (ignored)
+        elif func == TTI_LOBOPS:
+            # Close-temp-LOBs (#852): a FREE_TEMP over an array of locators that
+            # a client rides out once the temp LOBs it created have gone out of
+            # scope -- on the call after any temp-LOB bind, in practice, so the
+            # second large LOB insert of a session was the one that broke. The
+            # counterpart of the FREE_TEMP call in _answer_lobops; a locator
+            # the Mirror never saw written is simply not there to drop.
+            freed, rest = parse_free_temp_lobs_piggyback(rest)
+            if temp_lobs is not None:
+                for locator in freed:
+                    temp_lobs.pop(bytes(locator), None)
         else:
             break
         body = rest

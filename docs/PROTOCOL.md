@@ -2672,6 +2672,23 @@ of the wrong shape.
 
 - **`FREE_TEMP`** (`0x0111`) — the Mirror drops the temp LOB's buffer (freeing it
   early rather than at session end) and acks.
+- **Close-temp-LOBs piggyback** (#852) — the *piggyback* form of `FREE_TEMP`.
+  A thin client does not send a `FREE_TEMP` call for temp LOBs whose objects
+  went out of scope; it collects their locators and rides them in front of its
+  next call as message type `0x11`, function `TTI_LOBOPS` (96): the piggyback
+  header (`11 60 seq`, plus the `ub8` token at fv24), then a `FREE_TEMP`
+  request block with the **`ARRAY` bit** (`0x80000`) on the operation —
+  `01` pointer, `ub4` total locator bytes, `00`, `ub4 0`, `ub4 0`, `ub4 0`,
+  three pointer bytes, `ub4 0x80111`, `00`, `ub4 0`, `ub8 0`, `ub8 0`, `00`,
+  three (pointer byte + `ub4 0`) array slots — and finally the locators
+  themselves, each in its `ub2`-length-prefixed 40-byte form, `total` bytes
+  with no count (captured off a live 23ai in front of the second large-LOB
+  insert of a session, where it rides on the `REEXECUTE` (func 4) of the first
+  insert's statement). The Mirror walks it in `_skip_piggybacks`, drops the
+  named buffers and serves the call behind it (`parse_free_temp_lobs_piggyback`
+  / `encode_free_temp_lobs_piggyback`). Before #852 it was refused as
+  `ORA-03115 (piggyback 96)`, so only the *first* temp-LOB write of a session
+  ever worked.
 - **`OPEN`** (`0x8000`) / **`CLOSE`** (`0x10000`) / **`TRIM`** (`0x0020`) /
   **`GET_CHUNK_SIZE`** (`0x4000`) — acked. Their *value-returning* forms (a real
   server-preferred chunk size, applying `TRIM`'s new length, `GET_LENGTH` /
