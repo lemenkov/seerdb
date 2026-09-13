@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 import seerdb
-from seerdb.common.exceptions import InterfaceError
+from seerdb.common.exceptions import InterfaceError, Truncated
 from seerdb.common.tns import ColumnMeta
 from seerdb.common.tns_consts import (
     FIELD_VERSION_12_2,
@@ -428,6 +428,72 @@ def test_skip_piggybacks_walks_the_12c_tracing_and_session_state(attrs: dict) ->
         )
     finally:
         _DECODE_FIELD_VERSION.reset(token)
+
+
+# The close-temp-LOBs piggyback a thin client sent a live 23ai in front of its
+# second large-LOB insert (fv24: the ub8 token follows the sequence byte): a
+# FREE_TEMP | ARRAY over one 40-byte (ub2-prefixed) locator, then `03 04 ...`, the
+# re-execute it rides on.
+_CLOSE_TEMP_LOBS_23AI = bytes.fromhex(
+    '11 60 0a 00 01 01 28 00 00 00 00 00 00 00 04 00 08 01 11 00 00 00 00 00'
+    '00 00 00 00 00 00 00 26 00 01 81 08 00 03 00 01 6a 51 00 00 00 67 00 00 00'
+    '01 00 00 00 0a 00 00 00 01 00 00 1a ab 82 f1 00 00 00 01 00 00'
+)
+
+
+@pytest.mark.parametrize('field_version', [17, 24])
+def test_skip_piggybacks_frees_the_closed_temp_lobs(field_version: int) -> None:
+    # A client that let its temp LOB objects go out of scope frees them on its
+    # next call as a piggyback (func 96, #852) rather than a FREE_TEMP call of
+    # their own. The Mirror has to walk it -- it used to stop there, and the
+    # second large-LOB insert of every session was refused -- and it drops the
+    # buffers, as the FREE_TEMP call does.
+    from seerdb.common.tns import (
+        _DECODE_FIELD_VERSION,
+        encode_free_temp_lobs_piggyback,
+        mint_temp_lob_locator,
+        parse_free_temp_lobs_piggyback,
+    )
+    from seerdb.server.session import _skip_piggybacks
+
+    body = _exec_body()
+    first, second, kept = (mint_temp_lob_locator(i, True) for i in range(3))
+    temp_lobs = {first: bytearray(b'a'), second: bytearray(b'b'), kept: bytearray()}
+    token = _DECODE_FIELD_VERSION.set(field_version)
+    try:
+        free = encode_free_temp_lobs_piggyback(4, field_version, [first, second])
+        assert _skip_piggybacks(free + body, None, temp_lobs) == body
+        assert temp_lobs == {kept: bytearray()}
+        # A locator the Mirror never saw (a client can free what it never wrote)
+        # is not an error, and nothing else is disturbed.
+        stray = encode_free_temp_lobs_piggyback(4, field_version, [first])
+        assert _skip_piggybacks(stray + body, None, temp_lobs) == body
+        assert temp_lobs == {kept: bytearray()}
+        # An empty array walks too.
+        assert (
+            _skip_piggybacks(
+                encode_free_temp_lobs_piggyback(4, field_version, []) + body
+            )
+            == body
+        )
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+
+    # The parser lands on the call behind the live 23ai bytes, and the encoder
+    # reproduces them from the captured locator -- to the byte, except that the
+    # client writes the operation ub4 at full width (04 00 08 01 11) where
+    # encode_sb4 compacts it (03 08 01 11); same value, so compare parsed.
+    locator = _CLOSE_TEMP_LOBS_23AI[-38:]
+    freed, rest = parse_free_temp_lobs_piggyback(_CLOSE_TEMP_LOBS_23AI[4:] + body)
+    assert freed == [locator]
+    assert rest == body
+    mine = encode_free_temp_lobs_piggyback(10, 24, [locator])
+    assert mine[:14] == _CLOSE_TEMP_LOBS_23AI[:14]
+    assert mine[-51:] == _CLOSE_TEMP_LOBS_23AI[-51:]
+    assert parse_free_temp_lobs_piggyback(mine[4:] + body) == (freed, body)
+    # …and a piggyback cut short is reported, not mis-read as a call.
+    with pytest.raises(Truncated):
+        parse_free_temp_lobs_piggyback(_CLOSE_TEMP_LOBS_23AI[4:-1])
 
 
 def test_live_seerdb_tracing_attributes_at_a_higher_field_version() -> None:
@@ -1655,7 +1721,6 @@ def test_complete_message_reassembles_a_spanning_request() -> None:
     # A TTC message can span several TNS packets with no continuation flag, so
     # read_packet hands back only the first and parsing it runs off the end. The
     # loop reads more packets until the parser stops reporting Truncated (#848).
-    from seerdb.common.exceptions import Truncated
     from seerdb.server.session import _complete_message
 
     # A stream that yields a message in three DATA packets.

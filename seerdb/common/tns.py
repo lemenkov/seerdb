@@ -1335,6 +1335,7 @@ from seerdb.common.tns_consts import (
     TNS_BIND_DIR_OUTPUT,
     TNS_FETCH_ORIENTATION_FIRST,
     TNS_FETCH_ORIENTATION_LAST,
+    TNS_LOB_OP_ARRAY,
     TNS_LOB_OP_CLOSE,
     TNS_LOB_OP_CREATE_TEMP,
     TNS_LOB_OP_FREE_TEMP,
@@ -3926,6 +3927,69 @@ def encode_session_state_piggyback(Seq: int, FieldVersion: int, State: int) -> b
     # ub8 (state | explicit-boundary); small values encode like ub4.
     Out += encode_sb4(State | TNS_SESSION_STATE_EXPLICIT_BOUNDARY)
     return Out
+
+
+def encode_free_temp_lobs_piggyback(
+    Seq: int, FieldVersion: int, Locators: list[bytes]
+) -> bytes:
+    """Build the close-temp-LOBs piggyback (func TTI_LOBOPS = 96, #852): a
+    FREE_TEMP over an ARRAY of locators, which a client rides in front of its
+    next call once temp LOBs it created have gone out of scope. Each locator is
+    the ub2-length-prefixed form CREATE_TEMP handed out (40 bytes for a real
+    server's 38). Mirrors oracledb's _write_close_temp_lobs_piggyback; byte
+    layout in docs/PROTOCOL.md §14.5."""
+    Out = bytes([TTI_MSG_TYPE_PIGGYBACK, TTI_LOBOPS, Seq])
+    if FieldVersion > FIELD_VERSION_23_1:
+        Out += encode_sb4(0)  # ub8 token (0)
+    Wire = b''.join(struct.pack('>H', len(L)) + L for L in Locators)
+    Out += bytes([1]) + encode_sb4(len(Wire))  # pointer + total locator bytes
+    Out += bytes([0]) + encode_sb4(0)  # dest locator pointer + length
+    Out += encode_sb4(0) + encode_sb4(0)  # source locator pointer + length
+    Out += bytes([0, 0, 0])  # source offset, dest offset, charset pointers
+    Out += encode_sb4(TNS_LOB_OP_FREE_TEMP | TNS_LOB_OP_ARRAY)
+    Out += bytes([0]) + encode_sb4(0)  # scn pointer + lobscn
+    Out += encode_sb4(0) + encode_sb4(0) + bytes([0])  # lobscnl (ub8 ×2), flag
+    Out += bytes([0]) + encode_sb4(0)  # the three array-LOB slots: a pointer
+    Out += bytes([0]) + encode_sb4(0)  # byte and a ub4 length each (none is
+    Out += bytes([0]) + encode_sb4(0)  # used; the locators just follow)
+    return Out + Wire
+
+
+def parse_free_temp_lobs_piggyback(rest: bytes) -> tuple[list[bytes], bytes]:
+    """Walk a close-temp-LOBs piggyback from just past its header (the inverse
+    of encode_free_temp_lobs_piggyback). Returns the freed locators, each
+    without its ub2 length prefix, and the bytes after the piggyback.
+
+    The layout is a FREE_TEMP request's fixed block with the ARRAY bit set on the
+    operation and the locators concatenated after the array slots, `total` bytes
+    of them; no count is sent, so the locators are split by their own length
+    prefixes. Every scalar is zero on the wire (the ub8 SCNs included, which is
+    why decode_ub4 can read them: a zero is a single byte in either width)."""
+    rest = rest[1:]  # pointer
+    total, rest = decode_ub4(rest)
+    rest = rest[1:]  # dest locator pointer
+    _, rest = decode_ub4(rest)  # dest locator length
+    _, rest = decode_ub4(rest)  # source locator pointer
+    _, rest = decode_ub4(rest)  # source locator length
+    rest = rest[3:]  # source offset, dest offset, charset pointers
+    _operation, rest = decode_ub4(rest)  # FREE_TEMP | ARRAY
+    rest = rest[1:]  # scn pointer
+    _, rest = decode_ub4(rest)  # lobscn
+    _, rest = decode_ub4(rest)  # lobscnl
+    _, rest = decode_ub4(rest)
+    rest = rest[1:]
+    for _ in range(3):  # the array-LOB slots: pointer byte + ub4 length
+        rest = rest[1:]
+        _, rest = decode_ub4(rest)
+    if len(rest) < total:
+        raise Truncated('close-temp-LOBs piggyback')
+    wire, rest = rest[:total], rest[total:]
+    locators = []
+    while len(wire) >= 2:
+        loc_len = struct.unpack('>H', wire[:2])[0]
+        locators.append(wire[2 : 2 + loc_len])
+        wire = wire[2 + loc_len :]
+    return locators, rest
 
 
 def encode_dictionary_close(Dictionary: dict) -> bytes:

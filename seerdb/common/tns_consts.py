@@ -409,6 +409,7 @@ TNS_LOB_OP_FILE_CLOSE = 0x0200
 TNS_LOB_OP_GET_CHUNK_SIZE = 0x4000
 TNS_LOB_OP_OPEN = 0x8000
 TNS_LOB_OP_CLOSE = 0x10000
+TNS_LOB_OP_ARRAY = 0x80000  # OR-ed onto an op that carries an array of locators
 
 # Bind OAC flag bits: every thin bind uses indicators; a PL/SQL associative-array
 # bind (#122) also sets ARRAY, in the flag byte of the 12.2+ layout and in the
