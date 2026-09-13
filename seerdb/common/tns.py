@@ -2661,7 +2661,16 @@ def decode_token_oer(Data: bytes, Acc: tuple) -> tuple:
     if ErrCode != 0 and Rest:
         try:
             (Bytes, _) = decode_dalc(Rest)
-        except IndexError:
+        except (IndexError, Truncated):
+            # Best-effort: the OER is the terminal token and its message is only
+            # read for display, so a tail that does not cleanly yield a DALC
+            # means "no message" rather than a failed response. This tolerance
+            # predates the Truncated signal (#849) -- decode_dalc used to return
+            # short bytes here silently, which the caller accepted -- and one
+            # ORA-01403 end-of-fetch terminator relies on it: an imprecise walk
+            # of the OER's padding/success-iters fields can leave the message
+            # DALC a few bytes short. The values that matter (rowcount, error
+            # code, cursor id, rowid) are all read above, before any drift.
             Bytes = None
         if Bytes:
             try:
