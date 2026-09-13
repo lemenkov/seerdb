@@ -165,12 +165,17 @@ def _client_exec_request(
     )
 
 
-def test_encode_status_with_rowcounts_frames_the_counts_before_the_status() -> None:
-    # The arraydmlrowcounts status leads with a server-side RPA piggyback (TTI_RPA,
-    # zero fields) carrying `count | count x ub4`, then the ordinary status OER —
-    # exactly where the client's decode_token_rpa_piggyback reads the counts when
-    # its own execute armed arraydmlrowcounts. (The live round-trip is covered by
-    # test_integration's arraydmlrowcounts cases through the Mirror.)
+def test_encode_status_with_rowcounts_is_the_return_parameters_block() -> None:
+    # The arraydmlrowcounts status carries the counts in the execute's
+    # return-parameters block (TTI_RPA), laid out as a real server lays it out
+    # and the reference client reads it (#859): four leading words -- al8o4l
+    # count, al8txl length, key/value pairs, registration length -- all empty,
+    # then `ub4 rows | rows x ub8`, then the ordinary status OER. A first cut
+    # framed the counts as a private `ub4 zero | ub4 count | count x ub4`.
+    # seerdb's own decoder accepted both shapes, which is how it passed its own
+    # suite; the reference client read the four words by name, took the count
+    # for the al8txl length, and parsed the values as key/value pairs until it
+    # died (DPY-5002).
     from seerdb.common.tns import (
         TTI_RPA,
         decode_ub4,
@@ -178,21 +183,32 @@ def test_encode_status_with_rowcounts_frames_the_counts_before_the_status() -> N
         encode_status_with_rowcounts,
     )
 
-    counts = [1, 1, 2, 1]
-    reply = encode_status_with_rowcounts(5, counts, cursor_id=9)
-    assert reply[0] == TTI_RPA
-    fields, rest = decode_ub4(reply[1:])
-    assert fields == 0  # the piggyback carries no fields, just the count block
-    count, rest = decode_ub4(rest)
-    assert count == len(counts)
+    counts = [1, 1, 2, 0]
+    reply = encode_status_with_rowcounts(4, counts, cursor_id=9)
+    # Byte-exact: four empty words, the row count, one value per iteration (a
+    # zero is a single 00 byte), then the status.
+    assert reply == bytes.fromhex(
+        '08 00 00 00 00 01 04 01 01 01 01 01 02 00'
+    ) + encode_status(4, cursor_id=9)
+    # Walked the way the reference reader walks it, field by field.
+    rest = reply[1:]
+    words = []
+    for _ in range(4):
+        word, rest = decode_ub4(rest)
+        words.append(word)
+    assert words == [0, 0, 0, 0]
+    rows, rest = decode_ub4(rest)
+    assert rows == len(counts)
     got = []
-    for _ in range(count):
+    for _ in range(rows):
         value, rest = decode_ub4(rest)
         got.append(value)
     assert got == counts
-    # The status OER (the ordinary DML status) follows the count block.
-    assert rest == encode_status(5, cursor_id=9)
-    # A bare status (no request) is unchanged — it does not lead with the RPA.
+    assert rest == encode_status(4, cursor_id=9)
+    # (seerdb's own client reading this block back is covered live: the
+    # arraydmlrowcounts cases of test_integration run through the passthrough
+    # Mirror on every 12c+ tier.)
+    # A bare status (no request) is unchanged -- it does not lead with the RPA.
     assert encode_status(5, cursor_id=9)[0] != TTI_RPA
 
 
@@ -2861,6 +2877,102 @@ def test_peek_exec_cursor_reads_cursor_and_query_presence() -> None:
     assert peek_exec_cursor(msg(0, 'INSERT INTO t VALUES (:1, :2)')) == (0, True)
     assert peek_exec_cursor(msg(5, '')) == (5, False)
     assert peek_exec_cursor(b'\x03\x05not an exec') == (0, True)
+
+
+def test_parse_exec_takes_array_rowcounts_from_the_dml_rowcounts_bit_alone() -> None:
+    # al8i4[9] is a word of unrelated flags. The reference thin client sets
+    # IMPLICIT_RESULTSET (0x8000) there on EVERY ordinary execute; the
+    # arraydmlrowcounts request is DML_ROWCOUNTS (0x4000). Testing for the
+    # composite seerdb's own client sends (both bits) took every executemany
+    # from the reference client for a row-count request, and answered it with a
+    # block it could not parse (#859).
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, encode_dictionary_exec
+    from seerdb.server.session import _skip_piggybacks
+
+    # A plain executemany from the reference client, byte-for-byte off a live
+    # capture (fv24): an OCCA piggyback, then the OALL8 -- two iterations, one
+    # bind, al8i4[9] = IMPLICIT_RESULTSET alone.
+    captured = bytes.fromhex(
+        '116905000101010101035e06000280290001012101010d0000000101047fffff'
+        'ff0101010000000000000000000100000000000000000000000000000021696e'
+        '7365727420696e746f20656d315f70726f62652076616c75657320283a312901'
+        '0101020000000000000002800000000002010000011600000000000000000702'
+        'c1020702c103'
+    )
+    token = _DECODE_FIELD_VERSION.set(24)
+    try:
+        request = parse_exec(_skip_piggybacks(captured))
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+    assert request.sql == 'insert into em1_probe values (:1)'
+    assert (request.iterations, request.bind_rows) == (2, [[1], [2]])
+    assert request.arraydmlrowcounts is False  # it asked for nothing
+    assert request.batcherrors is False
+
+    # seerdb's own client asking for the counts writes the composite
+    # (DML_ROWCOUNTS | IMPLICIT_RESULTSET); the request bit is in it, so it is
+    # still recognised.
+    asked = encode_dictionary_exec(
+        {
+            'seq': 3,
+            'field_version': 17,
+            'query': {
+                'type': 'change',
+                'auto': 0,
+                'fetch': 0,
+                'server_version': 0,
+                'cursor': 0,
+                'query': 'insert into t values (:1)',
+                'bind': [1],
+                'batch': [[2], [3]],
+                'def': [],
+                'arraydmlrowcounts': True,
+            },
+        }
+    )
+    token = _DECODE_FIELD_VERSION.set(17)
+    try:
+        request = parse_exec(asked)
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+    assert request.arraydmlrowcounts is True
+    assert (request.iterations, request.bind_rows) == (3, [[1], [2], [3]])
+
+
+def test_parse_exec_reads_oacs_of_an_empty_sql_execute_that_carries_them() -> None:
+    # "No SQL" does not imply "no OACs". seerdb's own cached re-execute omits the
+    # bind descriptors and relies on the server remembering them (#80/#486), but
+    # the reference thin client sends an empty-SQL execute that still carries
+    # them. Trusting the empty-query flag left the parser sitting on an OAC where
+    # it expected a TTI_RXD, so it found no bind rows at all and the backend was
+    # handed an execute with no values -- ORA-01008 on the second executemany of
+    # every session (#859).
+    #
+    # Captured live (fv24): the second `executemany` of
+    # `insert into em_probe values (:1, :2)`, three rows, no SQL, WITH OACs.
+    from seerdb.common.tns import _DECODE_FIELD_VERSION
+
+    captured = bytes.fromhex(
+        '035e08000280280103000001010d0000000101047fffffff0101020000000000'
+        '0000000001000000000000000000000000000000000103000000000000000280'
+        '0000000002010000011600000000000000000101000001040000000002036901'
+        '00000702c10401630702c10501640702c1060165'
+    )
+    remembered = [(TNS_TYPE_NUMBER, 1, 22, b''), (TNS_TYPE_VARCHAR, 1, 10, b'')]
+    token = _DECODE_FIELD_VERSION.set(24)
+    try:
+        # The session hands over the remembered types (it sees an empty query);
+        # the parser must notice the descriptors are present and read them.
+        request = parse_exec(captured, bind_types=remembered)
+        # ...and the same message parses identically with nothing remembered.
+        without = parse_exec(captured)
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+    assert request.sql == ''
+    assert request.cursor == 3
+    assert request.iterations == 3
+    assert request.bind_rows == [[3, 'c'], [4, 'd'], [5, 'e']]
+    assert without.bind_rows == request.bind_rows
 
 
 def test_parse_exec_cached_reexecute_decodes_binds_without_oacs() -> None:

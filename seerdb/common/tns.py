@@ -176,6 +176,7 @@ from seerdb.common.tns_consts import (
     TNS_END_TO_END_DBOP,
     TNS_END_TO_END_MODULE,
     TNS_ESCAPE_CHAR,
+    TNS_EXEC_FLAGS_DML_ROWCOUNTS,
     TNS_EXEC_FLAGS_IMPLICIT_RESULTSET,
     TNS_EXEC_FLAGS_NO_CANCEL_ON_EOF,
     TNS_EXEC_FLAGS_SCROLLABLE,
@@ -1262,15 +1263,33 @@ def encode_status_with_rowcounts(
     rowcount: int, counts: list[int], *, cursor_id: int = 0
 ) -> bytes:
     """The DML success status when the client requested arraydmlrowcounts (#18):
-    the per-iteration affected-row counts, then the ordinary status OER. The
-    counts ride in front of the OER as a minimal server-side session-state RPA
-    piggyback (`TTI_RPA`, zero fields) whose body is `ub4 count | count x ub4`,
-    exactly where the client's decode_token_rpa_piggyback reads them when its own
-    execute armed arraydmlrowcounts. Without the request the client never looks
-    for them, so this form is used only then."""
-    block = encode_sb4(len(counts)) + b''.join(encode_sb4(c) for c in counts)
-    piggyback = bytes([TTI_RPA]) + encode_sb4(0) + block
-    return piggyback + encode_status(rowcount, cursor_id=cursor_id)
+    the per-iteration affected-row counts, then the ordinary status OER.
+
+    The counts ride in the execute's **return-parameters block** (`TTI_RPA`,
+    token 8), laid out the way a real server lays it out and the reference
+    client reads it (#859)::
+
+        08 | ub2 al8o4l count | count x ub4 | ub2 al8txl length | ub2 key/value
+           pairs | ub2 registration length | ub4 rows | rows x ub8 | 04 ...
+
+    The four leading words are the block's ordinary fields, all empty here; the
+    row counts are the tail the server appends only when the execute set
+    DML_ROWCOUNTS. A first cut of this reply framed the counts as a private
+    `ub4 zero | ub4 count | count x ub4` shape instead. seerdb's own decoder
+    happened to accept both -- it reads the leading word as a field count and
+    skips zero bytes -- but the reference client reads the four words by name,
+    took the count for the al8txl length, skipped that many bytes and parsed the
+    values as key/value pairs until a length byte of 4 landed where it expected
+    a ub2. The counts are ub8 on the wire; small values encode as the same
+    length-prefixed bytes as a ub4, which is what encode_sb4 writes.
+
+    Without the request the client never looks for the block, and a plain
+    status is sent instead."""
+    fields = encode_sb4(0) * 4  # al8o4l, al8txl, key/value pairs, registration
+    rows = encode_sb4(len(counts)) + b''.join(encode_sb4(c) for c in counts)
+    return (
+        bytes([TTI_RPA]) + fields + rows + encode_status(rowcount, cursor_id=cursor_id)
+    )
 
 
 # ORA-24381: the array-DML summary code the server returns when a batcherrors
@@ -1606,7 +1625,12 @@ def parse_exec(
         al8_elem, after = decode_ub4(after)
         al8.append(al8_elem)
     scrollable = len(al8) > 9 and bool(al8[9] & TNS_EXEC_FLAGS_SCROLLABLE)
-    arraydmlrowcounts = len(al8) > 9 and bool(al8[9] & TNS_AL8I4_ARRAY_DML_ROWCOUNTS)
+    # The request is the DML_ROWCOUNTS bit alone. Testing the composite the
+    # client sends (which also carries IMPLICIT_RESULTSET) matched EVERY execute
+    # from the reference client, whose ordinary executes carry IMPLICIT_RESULTSET
+    # on their own -- so a plain executemany was answered with a row-count block
+    # it never asked for and could not parse (#859).
+    arraydmlrowcounts = len(al8) > 9 and bool(al8[9] & TNS_EXEC_FLAGS_DML_ROWCOUNTS)
     scroll_orientation = al8[10] if len(al8) > 10 else 0
     scroll_position = al8[11] if len(al8) > 11 else 0
     # al8i4[1] is the execute iteration count (1 + array-DML batch length); a
@@ -1620,13 +1644,22 @@ def parse_exec(
     if bind_count > 0:
         # After the al8 array (already consumed above): one OAC (type descriptor)
         # per bind column, then one RXD row of values per array-DML iteration
-        # (an ordinary single execute is just one row). A cached re-execute omits
-        # the OACs, so `after` already sits on the first RXD — use the remembered
-        # bind types instead of decoding OACs (#80/#486).
+        # (an ordinary single execute is just one row). A cached re-execute may
+        # omit the OACs -- seerdb's own client does (#80/#486) -- and then the
+        # remembered bind types are the only record of the format.
+        #
+        # "No SQL" does NOT imply "no OACs", though: the reference thin client
+        # sends an empty-SQL execute that still carries them. Taking the caller's
+        # remembered types on the strength of the empty-query flag left `after`
+        # sitting on an OAC, so not one RXD row was found and the backend was
+        # handed an execute with no bind values at all (ORA-01008, #859). Decide
+        # from the wire instead: the descriptors are absent exactly when the bind
+        # area already sits on a TTI_RXD row.
         # A cached re-execute carries no OACs and is DML only (#703), where no
         # bind is an array; a block is never cached.
         capacities: list[int] = []
-        if bind_types is not None:
+        omits_oacs = not after or after[0] == TTI_RXD
+        if bind_types is not None and omits_oacs:
             types = list(bind_types)
             capacities = [0] * len(types)
         else:
@@ -3034,10 +3067,14 @@ def decode_token_server_piggyback(Data: bytes, Acc: tuple) -> tuple:
 
 
 def decode_token_rpa_piggyback(Data: bytes, Acc: tuple) -> tuple:
-    # Walks past a server-side session-state piggyback so the next decode_packet
-    # call lands on the real status token (OER). The block layout is opaque
-    # enough that empirically what works is: read Num, consume that many
-    # ub4-encoded fields, skip trailing alignment zeros, then continue.
+    # Walks past the execute's return-parameters block so the next decode_packet
+    # call lands on the real status token (OER). Its fields, by name (#859):
+    # `ub2 al8o4l count | count x ub4 | ub2 al8txl length (+bytes) | ub2 key/value
+    # pairs (+pairs) | ub2 registration length (+bytes)`, then the optional
+    # row-count tail below. This walker predates that knowledge and reads it more
+    # loosely -- Num, then Num fields, then any zero bytes -- which lands in the
+    # same place for every block seen live, where the three trailing words are
+    # zero; it is left as is because it also copes with 9i's over-counting Num.
     Rest = Data[1:]
     try:
         (Num, Rest) = decode_ub4(Rest)
