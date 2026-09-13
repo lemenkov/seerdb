@@ -24,6 +24,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_23_4,
     TNS_DATA,
     TNS_TYPE_VARCHAR,
+    TTI_FUN,
     VERSION_11_2_0_2,
     VERSION_12_1_0_2,
     VERSION_12_2_0_1,
@@ -1424,3 +1425,54 @@ def test_passthrough_detect_version_reads_the_negotiated_version() -> None:
         )
         is None
     )
+
+
+def test_unimplemented_ttc_function_is_refused_not_ignored() -> None:
+    # The cardinal rule again, one layer down: a call the Mirror does not
+    # implement must be ANSWERED. The dispatch chain used to have no else, so an
+    # unknown TTC function fell through to the next read and the client blocked
+    # forever waiting for a reply that was never coming (#832). A hang is the
+    # worst possible failure here -- it stalls whatever is driving the session
+    # rather than failing one call -- so this asserts the refusal arrives, and
+    # arrives quickly.
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    port = listen.getsockname()[1]
+
+    result: dict = {}
+    server = threading.Thread(
+        target=_run_mirror_session, args=(listen, result), daemon=True
+    )
+    server.start()
+
+    conn = seerdb.connect(
+        host='127.0.0.1',
+        port=port,
+        user='PYO',
+        password='pyo123',
+        service_name='XE',
+        timeout=5000,
+    )
+    try:
+        # TNS_FUNC_REEXECUTE_AND_FETCH (78): a real client sends this once a
+        # statement is cached. The Mirror does not implement it, so it must say
+        # so rather than go quiet.
+        conn.send(TNS_DATA, bytes([TTI_FUN, 78]) + bytes(8))
+        received = conn._next_data_packet()
+        assert received is not False, 'the Mirror answered nothing -- it hung'
+        assert b'ORA-03115' in received[1]
+        # ... and the session is still usable, exactly as after any other error.
+        cursor = conn.cursor()
+        cursor.execute('select * from dual')
+        row = cursor.fetchone()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        server.join(timeout=5)
+        listen.close()
+
+    assert row == ('X',)
