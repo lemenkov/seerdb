@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 import seerdb
+from seerdb.common.exceptions import InterfaceError
 from seerdb.common.tns import ColumnMeta
 from seerdb.common.tns_consts import (
     FIELD_VERSION_12_2,
@@ -1648,3 +1649,66 @@ def test_a_break_episode_is_answered_with_reset_then_cancel() -> None:
     # Exactly one reset for the whole episode: echoing each marker would
     # ping-pong the two sides into a reset storm.
     assert sum(1 for t, _ in stream.sent if t == TNS_MARKER) == 1
+
+
+def test_complete_message_reassembles_a_spanning_request() -> None:
+    # A TTC message can span several TNS packets with no continuation flag, so
+    # read_packet hands back only the first and parsing it runs off the end. The
+    # loop reads more packets until the parser stops reporting Truncated (#848).
+    from seerdb.common.exceptions import Truncated
+    from seerdb.server.session import _complete_message
+
+    # A stream that yields a message in three DATA packets.
+    parts = [b'\x03\x60\x00\x01', b'aaaa', b'bbbb-END']
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def read_packet(self):
+            self.reads += 1
+            # parts[0] is the caller's `body`; hand out parts[1:] on demand.
+            return (TNS_DATA, parts[self.reads])
+
+    # parse() is truncated until the assembled body ends with the sentinel; it is
+    # pure, so the loop may call it repeatedly with no side effect.
+    def parse(b: bytes) -> object:
+        if not b.endswith(b'-END'):
+            raise Truncated('need the rest')
+        return b
+
+    stream: Any = _Stream()
+    full = _complete_message(stream, parts[0], parse)
+    assert full == b''.join(parts)
+    assert stream.reads == 2  # exactly the two continuation packets, no more
+
+
+def test_complete_message_returns_a_single_packet_untouched() -> None:
+    # The common case: the message fits one packet, parse succeeds first try, and
+    # the stream is never touched.
+    from seerdb.server.session import _complete_message
+
+    class _Stream:
+        def read_packet(self):  # pragma: no cover - must not be called
+            raise AssertionError('read_packet called for a complete message')
+
+    stream: Any = _Stream()
+    body = b'\x03\x60\x00\x01whole'
+    assert _complete_message(stream, body, lambda b: b) is body
+
+
+def test_complete_message_raises_when_the_client_vanishes_mid_message() -> None:
+    # A half-sent message whose rest never arrives must fail, not spin: read_packet
+    # returning None (EOF) becomes a clean InterfaceError.
+    from seerdb.common.exceptions import Truncated
+    from seerdb.server.session import _complete_message
+
+    class _Stream:
+        def read_packet(self):
+            return None
+
+    stream: Any = _Stream()
+    with pytest.raises(InterfaceError):
+        _complete_message(
+            stream, b'\x03\x60partial', lambda b: (_ for _ in ()).throw(Truncated('x'))
+        )

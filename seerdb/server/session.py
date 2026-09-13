@@ -26,7 +26,7 @@ from secrets import token_bytes
 from typing import NoReturn, TypeVar
 
 from seerdb.common.crypto import decrypt_password
-from seerdb.common.exceptions import InterfaceError
+from seerdb.common.exceptions import InterfaceError, Truncated
 from seerdb.common.oci import OCI_CMD_COMMIT, OCI_CMD_ROLLBACK
 from seerdb.common.tns import (
     _DECODE_FIELD_VERSION,
@@ -686,12 +686,16 @@ def serve_session(
                 if peek_cursor and not peek_has_query
                 else None
             )
-            request = _resolve_temp_lob_binds(
-                parse_exec(
-                    body,
-                    bind_types=cached_types,
-                    max_string_size=max_string_size(_SERVER_RUNTIME_CAPS),
+            max_size = max_string_size(_SERVER_RUNTIME_CAPS)
+            body = _complete_message(
+                stream,
+                body,
+                lambda b: parse_exec(
+                    b, bind_types=cached_types, max_string_size=max_size
                 ),
+            )
+            request = _resolve_temp_lob_binds(
+                parse_exec(body, bind_types=cached_types, max_string_size=max_size),
                 temp_lobs,
             )
             if request.scrollable:
@@ -699,6 +703,7 @@ def serve_session(
             else:
                 lobs = _answer_query(stream, backend, request, cursors)
         elif body[1] == TTI_LOBOPS:
+            body = _complete_message(stream, body, parse_lobops_request)
             lobs = _answer_lobops(stream, body, lobs, temp_lobs)
         elif body[1] == TNS_FUNC_REEXECUTE_AND_FETCH:
             lobs = _answer_reexecute(stream, backend, parse_reexecute(body), cursors)
@@ -1137,6 +1142,46 @@ def _answer_marker(stream: PacketStream, body: bytes) -> None:
     else:
         # An interrupt or break opens it: answer with a single reset.
         stream.write_packet(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
+
+
+def _complete_message(
+    stream: PacketStream, body: bytes, parse: Callable[[bytes], object]
+) -> bytes:
+    """Return ``body`` grown until ``parse`` no longer reports it truncated (#848).
+
+    A TTC message is a byte stream; TNS packets are only its transport, and a
+    large one -- an OALL8 with sizeable inline binds, a LOB WRITE -- spans several
+    DATA packets. python-oracledb sends those continuation packets with no MORE
+    flag, so ``read_packet`` hands back only the first, and parsing it reads off
+    the end. The primitives now say so by raising ``Truncated`` (#849) instead of
+    returning short data, which is what lets this loop tell "read more" from
+    "done".
+
+    ``parse`` must be pure and free of side effects up to the point it raises --
+    it is the request parser, called for its completeness check and then again by
+    the handler on the returned body. That is the whole reason parse is separated
+    from act here: a backend call must not run on half a message and then re-run
+    when the rest arrives.
+
+    A continuation packet is raw stream bytes with no TTC framing of its own, so
+    its body appends directly after the first packet's (whose piggybacks were
+    already stripped). Reads block until the message completes or the client goes
+    away, exactly as a real server waits on the rest of a call.
+    """
+    while True:
+        try:
+            parse(body)
+            return body
+        except Truncated:
+            received = stream.read_packet()
+            if received is None:
+                raise InterfaceError('client closed mid-message') from None
+            cont_type, cont_body = received
+            if cont_type != TNS_DATA:
+                raise InterfaceError(
+                    f'expected a continuation DATA packet, got type {cont_type}'
+                ) from None
+            body = body + cont_body
 
 
 def _skip_piggybacks(body: bytes, backend: Backend | None = None) -> bytes:
