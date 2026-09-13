@@ -2694,7 +2694,15 @@ inline bind. It is the inverse of §14.1/§14.2:
    the LOB type byte (`0x70` / `0x71`) in the block. The Mirror mints a unique
    opaque locator (it only has to be stable and distinct — the client keeps it
    opaque and echoes it back) and returns it in a bare `TTI_RPA`: `08`, `ub2`
-   length, then the locator bytes.
+   length, then the locator bytes. **Distinct means for the life of the session,
+   so the number in a locator comes from a counter, never from the count of live
+   temp LOBs** (#857): a count reissues an index as soon as anything is freed,
+   and the reissued locator collides with one still in use. That is not
+   theoretical — it broke the third large-LOB statement of every connection. The
+   third `CREATE_TEMP` was handed the locator the second was holding, resetting
+   its buffer, and the close-temp-LOBs piggyback (§14.5) riding on the third call
+   then freed the locator that same call was about to bind, so the bind resolved
+   to nothing and the column was written NULL (`ORA-01400`).
 2. **`WRITE`** (op `0x0040`). The Mirror walks the §14.1 field block to the
    operation, then to the `ub2`-length-prefixed locator and the `0x0E` chunked
    payload (`ub1` len ≤ `0xFC`, else `0xFE` + `sb4`-length chunks + a zero

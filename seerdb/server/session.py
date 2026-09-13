@@ -647,10 +647,7 @@ def serve_session(
     # the order their locators went out; the thin client drains them with
     # TTI_LOBOPS reads (it reads each LOB whole, row-major) (#413).
     lobs: list[tuple[bytes, bool]] = []
-    # Bytes streamed into each session temp LOB via TTI_LOBOPS WRITE, keyed by the
-    # locator the Mirror minted on CREATE_TEMP; resolved into the bind value on the
-    # following execute (#412).
-    temp_lobs: dict[bytes, bytearray] = {}
+    temp_lobs = _TempLobs()
     while True:
         # The codec's per-message state defaults to 11g (and token auth leaves it
         # at 12.2); pin it to the field version this session negotiated so each
@@ -1212,7 +1209,7 @@ def _complete_message(
 def _skip_piggybacks(
     body: bytes,
     backend: Backend | None = None,
-    temp_lobs: dict[bytes, bytearray] | None = None,
+    temp_lobs: _TempLobs | None = None,
 ) -> bytes:
     # A call can be preceded by piggybacks — CLOSE_CURSORS (105), which a client
     # sends to free the cursors it drained on the previous fetch, and, from 12.1
@@ -1267,7 +1264,7 @@ def _skip_piggybacks(
             freed, rest = parse_free_temp_lobs_piggyback(rest)
             if temp_lobs is not None:
                 for locator in freed:
-                    temp_lobs.pop(bytes(locator), None)
+                    temp_lobs.free(locator)
         else:
             break
         body = rest
@@ -1464,11 +1461,46 @@ class _Cursors:
         return cursor_id in self._open
 
 
+class _TempLobs:
+    # Bytes streamed into each session temp LOB via TTI_LOBOPS WRITE, keyed by the
+    # locator the Mirror minted on CREATE_TEMP; resolved into the bind value on
+    # the following execute (#412).
+    #
+    # Locators are numbered from a counter that only ever goes up -- NOT from the
+    # number of live temp LOBs. Numbering them by the count reissues an index the
+    # moment anything is freed, and the reissued locator collides with one still
+    # in use: a client's third large-LOB statement minted the locator its second
+    # was holding, overwrote that buffer, and then the close-temp-LOBs piggyback
+    # riding on the third call freed the locator the third call was about to
+    # bind, so the value arrived NULL (#857).
+    def __init__(self) -> None:
+        self._buffers: dict[bytes, bytearray] = {}
+        self._next = 0
+
+    def mint(self, is_blob: bool) -> bytes:
+        """A locator distinct from every other this session has handed out."""
+        locator = mint_temp_lob_locator(self._next, is_blob)
+        self._next += 1
+        self._buffers[bytes(locator)] = bytearray()
+        return locator
+
+    def append(self, locator: bytes, payload: bytes) -> None:
+        self._buffers.setdefault(bytes(locator), bytearray()).extend(payload)
+
+    def free(self, locator: bytes) -> None:
+        # A client may free a locator the Mirror never saw written; that is fine,
+        # and the index is still never reused.
+        self._buffers.pop(bytes(locator), None)
+
+    def content(self, locator: bytes) -> bytes:
+        return bytes(self._buffers.get(bytes(locator), b''))
+
+
 def _answer_lobops(
     stream: PacketStream,
     body: bytes,
     lobs: list[tuple[bytes, bool]],
-    temp_lobs: dict[bytes, bytearray],
+    temp_lobs: _TempLobs,
 ) -> list[tuple[bytes, bool]]:
     # Dispatch a thin TTI_LOBOPS message. CREATE_TEMP / WRITE drive the temp-LOB
     # write flow (#412); FREE_TEMP / OPEN / CLOSE / TRIM / GET_CHUNK_SIZE are
@@ -1477,22 +1509,18 @@ def _answer_lobops(
     # the (possibly shortened) read queue.
     request = parse_lobops_request(body)
     if request.kind == 'create_temp':
-        locator = mint_temp_lob_locator(len(temp_lobs), request.is_blob)
-        temp_lobs[bytes(locator)] = bytearray()
+        locator = temp_lobs.mint(request.is_blob)
         stream.write_packet(TNS_DATA, encode_create_temp_response(locator))
         return lobs
     if request.kind == 'write':
         # Append at the write offset the client streamed (it writes from the
         # start and appends, so a plain concat matches every real client).
-        temp_lobs.setdefault(bytes(request.locator), bytearray()).extend(
-            request.payload
-        )
+        temp_lobs.append(request.locator, request.payload)
         stream.write_packet(TNS_DATA, encode_lobops_ack(request.locator))
         return lobs
     if request.kind == 'free_temp':
-        # Release the temp LOB now rather than at session end; the buffer may not
-        # exist (a client can free a locator we never saw written) — that's fine.
-        temp_lobs.pop(bytes(request.locator), None)
+        # Release the temp LOB now rather than at session end.
+        temp_lobs.free(request.locator)
         stream.write_packet(TNS_DATA, encode_lobops_ack(request.locator))
         return lobs
     if request.kind == 'ack':
@@ -1508,15 +1536,13 @@ def _answer_lobops(
     return lobs
 
 
-def _resolve_temp_lob_binds(
-    request: ExecRequest, temp_lobs: dict[bytes, bytearray]
-) -> ExecRequest:
+def _resolve_temp_lob_binds(request: ExecRequest, temp_lobs: _TempLobs) -> ExecRequest:
     # Swap any temp-LOB locator bind for the bytes streamed into it over
     # TTI_LOBOPS WRITE, so the backend sees a plain str / bytes value (#412). A
     # CLOB's content is UTF-16BE on the wire; a BLOB's is raw.
     def resolve(value: object) -> object:
         if isinstance(value, TempLobRef):
-            data = bytes(temp_lobs.get(bytes(value.locator), b''))
+            data = temp_lobs.content(value.locator)
             return data if value.is_blob else data.decode('utf-16-be')
         return value
 
@@ -1903,7 +1929,7 @@ def _answer_reexecute_binds(
     backend: Backend,
     request: ReexecuteRequest,
     cursors: _Cursors,
-    temp_lobs: dict[bytes, bytearray],
+    temp_lobs: _TempLobs,
 ) -> list[tuple[bytes, bool]]:
     """Re-run the statement a cursor holds with fresh bind rows (func 4, #854).
 
