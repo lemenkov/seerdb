@@ -88,7 +88,7 @@ class TestOciAuthGeneration(unittest.TestCase):
         pairs = [
             (b'AUTH_SESSKEY', _CAP_SESSKEY.encode(), 0),
             (b'AUTH_VFR_DATA', _CAP_SALT.encode(), VFR_11G_SHA1),
-            (b'AUTH_GLOBALLY_UNIQUE_DBID\x00', auth._AUTH_GLOBALLY_UNIQUE_DBID, 0),
+            (b'AUTH_GLOBALLY_UNIQUE_DBID\x00', auth.AUTH_GLOBALLY_UNIQUE_DBID, 0),
         ]
         self.assertEqual(
             auth._oci_auth_packet(pairs, auth._CHALLENGE_TRAILER), CHALLENGE_GOLDEN

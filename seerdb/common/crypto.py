@@ -54,8 +54,8 @@ def des_verifier(User: bytes, Password: bytes) -> bytes:
 # AUTH_PBKDF2_SDER_COUNT (session-key derivation) in the challenge; a hardened
 # install raises them. These are the defaults when the fields are absent (10g /
 # 11g) and the floors below which a bogus value is ignored.
-_VGEN_COUNT_DEFAULT = 4096
-_SDER_COUNT_DEFAULT = 3
+PBKDF2_VGEN_COUNT = 4096
+PBKDF2_SDER_COUNT = 3
 _PBKDF2_COUNT_MAX = 100_000_000
 
 # Verifier-type flags carried on the AUTH_VFR_DATA challenge pair. These are
@@ -109,8 +109,8 @@ def o5logon(
     # AUTH_PBKDF2_SDER_COUNT (256-bit scheme). Hardcoding them broke auth
     # against servers with non-default counts (#309); fall back to the defaults
     # when absent.
-    VgenCount = _clamp_count(VgenCount, _VGEN_COUNT_DEFAULT)
-    SderCount = _clamp_count(SderCount, _SDER_COUNT_DEFAULT)
+    VgenCount = _clamp_count(VgenCount, PBKDF2_VGEN_COUNT)
+    SderCount = _clamp_count(SderCount, PBKDF2_SDER_COUNT)
     # #311: a modern server (it sent AUTH_PBKDF2_CSK_SALT, so DerivedSalt is set)
     # can still choose an 11g SHA-1 verifier for an account that has no SHA-2
     # verifier. It sends both salts, so the salt-presence heuristic below would
@@ -166,7 +166,7 @@ def o5logon0(
     DerivedKey: bytes | None,
     Password: bytes,
     Bits: int,
-    SderCount: int = _SDER_COUNT_DEFAULT,
+    SderCount: int = PBKDF2_SDER_COUNT,
 ) -> tuple[bytes, bytes, bytes, int, bytes]:
     IVec = O5LOGON_IV
 
@@ -236,6 +236,30 @@ def server_proof(SessionKey: bytes) -> bytes:
     return AES.new(SessionKey, AES.MODE_CBC, O5LOGON_IV).encrypt(SERVER_TO_CLIENT)
 
 
+# The padded proof puts the marker in the SECOND block, which is where a real
+# 11g listener puts it and where python-oracledb looks — it checks
+# ``response[16:32] == b"SERVER_TO_CLIENT"`` exactly, not a substring. seerdb's
+# own validate() searches the whole plaintext, so this form satisfies both while
+# the bare 16-byte one above only satisfies seerdb (#829).
+PROOF_NONCE_LEN = 16
+_PKCS7_FULL_BLOCK = bytes([16]) * 16
+
+
+def server_proof_padded(SessionKey: bytes, *, nonce: bytes | None = None) -> bytes:
+    """The 48-byte AUTH_SVR_RESPONSE: ``AES-CBC(nonce16 + SERVER_TO_CLIENT +
+    PKCS7pad)`` under the ConnKey.
+
+    ``nonce`` is injectable for deterministic tests; it defaults to a fresh
+    random value and no client checks it.
+    """
+    if nonce is None:
+        nonce = token_bytes(PROOF_NONCE_LEN)
+    if len(nonce) != PROOF_NONCE_LEN:
+        raise ValueError(f'proof nonce must be {PROOF_NONCE_LEN} bytes')
+    plain = nonce + SERVER_TO_CLIENT + _PKCS7_FULL_BLOCK
+    return AES.new(SessionKey, AES.MODE_CBC, O5LOGON_IV).encrypt(plain)
+
+
 ##
 ## Private funs
 ##
@@ -299,7 +323,7 @@ def conn_key(
     Data: bytes,
     DerivedSalt: bytes | None,
     Bits: int,
-    SderCount: int = _SDER_COUNT_DEFAULT,
+    SderCount: int = PBKDF2_SDER_COUNT,
 ) -> bytes:
     if Bits == 128:
         if DerivedSalt is None:

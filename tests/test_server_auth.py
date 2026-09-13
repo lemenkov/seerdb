@@ -14,7 +14,14 @@ from binascii import unhexlify
 
 import pytest
 
-from seerdb.common.crypto import o5logon, server_proof, validate
+from seerdb.common.crypto import (
+    PBKDF2_SDER_COUNT,
+    PBKDF2_VGEN_COUNT,
+    VFR_11G_SHA1,
+    o5logon,
+    server_proof,
+    validate,
+)
 from seerdb.common.exceptions import InterfaceError
 from seerdb.common.tns import (
     decode_token_rpa,
@@ -23,7 +30,14 @@ from seerdb.common.tns import (
     encode_dictionary_sess,
     encode_result,
 )
-from seerdb.common.tns_consts import TTI_AUTH, TTI_SESS, VERSION_11_2_0_2
+from seerdb.common.tns_consts import (
+    FIELD_VERSION_11_2,
+    FIELD_VERSION_12_1,
+    TTI_AUTH,
+    TTI_OER,
+    TTI_SESS,
+    VERSION_11_2_0_2,
+)
 from seerdb.server.auth import (
     derive_conn_key,
     make_challenge,
@@ -303,3 +317,80 @@ def test_parse_changepassword_and_decrypt_roundtrip() -> None:
     assert user == b'PYO'
     assert decrypt_password(conn_key, old_cipher) == b'pyo123'
     assert decrypt_password(conn_key, new_cipher) == b'pyo123_chg9'
+
+
+# --- the 12.1+ PBKDF2 challenge (#829) -----------------------------------------
+
+
+def _client_login_12c(challenge, user: bytes, password: bytes):
+    # The same client entry point, told what a 12.1+ challenge carries: the CSK
+    # salt, the two iteration counts, and the verifier type from AUTH_VFR_DATA's
+    # flag. seerdb's o5logon picks its scheme from exactly these.
+    auth_pass, auth_sess, _speedy, _ind, conn = o5logon(
+        challenge.auth_sesskey,
+        challenge.salt,
+        challenge.derived_salt,
+        user,
+        password,
+        PBKDF2_VGEN_COUNT,
+        PBKDF2_SDER_COUNT,
+        VFR_11G_SHA1,
+    )
+    return auth_sess, auth_pass, conn
+
+
+def test_12c_challenge_carries_the_pbkdf2_parameters() -> None:
+    # A 12.1+ client reads its whole scheme off the challenge, so all six pairs
+    # have to be there -- and AUTH_VFR_DATA's flag has to say SHA-1, or a client
+    # seeing both salts assumes the 256-bit scheme and derives a different key.
+    challenge = make_challenge(b'pyo123', field_version=FIELD_VERSION_12_1)
+    assert challenge.derived_salt is not None
+    payload = encode_challenge(challenge)
+    for key in (
+        b'AUTH_SESSKEY',
+        b'AUTH_VFR_DATA',
+        b'AUTH_PBKDF2_CSK_SALT',
+        b'AUTH_PBKDF2_VGEN_COUNT',
+        b'AUTH_PBKDF2_SDER_COUNT',
+        b'AUTH_GLOBALLY_UNIQUE_DBID',
+    ):
+        assert key in payload, key
+    assert str(PBKDF2_VGEN_COUNT).encode('ascii') in payload
+    assert str(PBKDF2_SDER_COUNT).encode('ascii') in payload
+
+
+def test_12c_session_key_is_32_bytes_not_48() -> None:
+    # The LENGTH selects the derivation for python-oracledb -- it takes the 11g
+    # path on 48 and ignores the CSK salt entirely, which would leave the two
+    # sides deriving different keys while both believed they were right.
+    modern = make_challenge(b'pyo123', field_version=FIELD_VERSION_12_1)
+    legacy = make_challenge(b'pyo123', field_version=FIELD_VERSION_11_2)
+    assert len(modern.server_session) == 32
+    assert len(legacy.server_session) == 48
+    assert legacy.derived_salt is None
+
+
+def test_both_sides_derive_the_same_key_under_pbkdf2() -> None:
+    password = b'pyo123'
+    challenge = make_challenge(password, field_version=FIELD_VERSION_12_1)
+    client_auth_sess, _pass, client_conn = _client_login_12c(
+        challenge, b'PYO', password
+    )
+    assert derive_conn_key(challenge, client_auth_sess) == client_conn
+
+
+def test_wrong_password_still_breaks_the_agreement_under_pbkdf2() -> None:
+    challenge = make_challenge(b'pyo123', field_version=FIELD_VERSION_12_1)
+    client_auth_sess, _pass, client_conn = _client_login_12c(
+        challenge, b'PYO', b'wrongpw'
+    )
+    assert derive_conn_key(challenge, client_auth_sess) != client_conn
+
+
+def test_the_11g_challenge_is_unchanged() -> None:
+    # Everything above is gated: below 12.1 the challenge is the two-pair 11g one
+    # and carries no status trailer, so the captured wire stays byte-identical.
+    challenge = make_challenge(b'pyo123', field_version=FIELD_VERSION_11_2)
+    payload = encode_challenge(challenge)
+    assert b'AUTH_PBKDF2_CSK_SALT' not in payload
+    assert payload.count(bytes([TTI_OER])) == 0

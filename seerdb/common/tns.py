@@ -14,7 +14,15 @@ if TYPE_CHECKING:
 from functools import reduce
 
 from seerdb.common import oci
-from seerdb.common.crypto import encrypt_password, o5logon, server_proof
+from seerdb.common.crypto import (
+    PBKDF2_SDER_COUNT,
+    PBKDF2_VGEN_COUNT,
+    VFR_11G_SHA1,
+    encrypt_password,
+    o5logon,
+    server_proof,
+    server_proof_padded,
+)
 from seerdb.common.datatypes import (
     JSON,
     BinaryDouble,
@@ -2149,14 +2157,23 @@ def encode_fetch_terminator_oci(sequence: int) -> bytes:
 # uppercase-hex ASCII; the version defaults to the captured 11.2 release.
 
 
-def encode_rpa_kv(pairs: list[tuple[bytes, bytes]]) -> bytes:
+def encode_rpa_kv(pairs: list[tuple[bytes, bytes]] | list[tuple]) -> bytes:
     """A TTI_RPA payload carrying key-value pairs — the shared framing of every
     auth challenge / result RPA: the RPA token, the pair count, then each pair as
-    a flag-1 key-value. Decodes back through :func:`decode_token_rpa`."""
+    a key-value. Decodes back through :func:`decode_token_rpa`.
+
+    A pair is ``(key, value)`` and carries flag 1, or ``(key, value, flag)`` when
+    the flag means something. The only pair whose flag a client reads is
+    ``AUTH_VFR_DATA``, where it is the verifier type (#829) — everything else has
+    always gone out as 1 and stays that way.
+    """
     return (
         bytes([TTI_RPA])
         + encode_sb4(len(pairs))
-        + b''.join(encode_kv(Key, Value, 1) for Key, Value in pairs)
+        + b''.join(
+            encode_kv(pair[0], pair[1], pair[2] if len(pair) > 2 else 1)
+            for pair in pairs
+        )
     )
 
 
@@ -2181,6 +2198,22 @@ class Challenge:
     server_session: bytes
     key_sess: bytes
     auth_sesskey: bytes  # the AUTH_SESSKEY value put on the wire
+    # AUTH_PBKDF2_CSK_SALT, present only for a 12.1+ client (#829). Its presence
+    # is what selects the modern key derivation on both sides, so it doubles as
+    # the flag for "this is a 12c-shaped challenge".
+    derived_salt: bytes | None = None
+
+
+# The database identifier a real server puts on the challenge. It is opaque to
+# the client -- nothing is checked against it -- so one captured constant serves
+# every session. Defined here beside the challenge builders; the sqlplus/OCI
+# challenge in seerdb/server/auth.py uses the same value.
+AUTH_GLOBALLY_UNIQUE_DBID = b'2C55FD5F1FE1101DA2455B7A62312B1D'
+
+# The session serial number a 12.1+ client reads out of the auth result. Like the
+# session id it is server bookkeeping the client only echoes back, so the value
+# captured from the live 11.2 server serves every session.
+AUTH_SERIAL_NUM = 2021
 
 
 def _hexval(raw: bytes) -> bytes:
@@ -2196,11 +2229,35 @@ def encode_challenge(challenge: Challenge) -> bytes:
     ``PacketStream.write_packet(TNS_DATA, …)``. Decodes back through the
     client's ``decode_token_rpa`` as a ``TTI_SESS`` challenge.
     """
-    return encode_rpa_kv(
-        [
-            (b'AUTH_SESSKEY', _hexval(challenge.auth_sesskey)),
-            (b'AUTH_VFR_DATA', _hexval(challenge.salt)),
-        ]
+    if challenge.derived_salt is None:
+        return encode_rpa_kv(
+            [
+                (b'AUTH_SESSKEY', _hexval(challenge.auth_sesskey)),
+                (b'AUTH_VFR_DATA', _hexval(challenge.salt)),
+            ]
+        )
+    # 12.1+ (#829): the client picks its key-derivation scheme from what the
+    # challenge carries, so the modern shape is six pairs, not two. The extra
+    # salt (AUTH_PBKDF2_CSK_SALT) plus the two iteration counts select the PBKDF2
+    # derivation; the counts go out as ASCII decimal, matching a live 21c.
+    #
+    # AUTH_VFR_DATA's flag is the verifier type and here it is decisive: the
+    # Mirror keeps the 11g SHA-1 verifier it computes from the plaintext secret,
+    # and a client seeing both salts would otherwise assume the 256-bit SHA-2
+    # scheme and derive a different key. Flagging it SHA-1 selects the 192-bit
+    # path that pairs an 11g verifier with the modern derivation.
+    return (
+        encode_rpa_kv(
+            [
+                (b'AUTH_SESSKEY', _hexval(challenge.auth_sesskey)),
+                (b'AUTH_VFR_DATA', _hexval(challenge.salt), VFR_11G_SHA1),
+                (b'AUTH_PBKDF2_CSK_SALT', _hexval(challenge.derived_salt)),
+                (b'AUTH_PBKDF2_VGEN_COUNT', str(PBKDF2_VGEN_COUNT).encode('ascii')),
+                (b'AUTH_PBKDF2_SDER_COUNT', str(PBKDF2_SDER_COUNT).encode('ascii')),
+                (b'AUTH_GLOBALLY_UNIQUE_DBID\x00', AUTH_GLOBALLY_UNIQUE_DBID),
+            ]
+        )
+        + encode_status()
     )
 
 
@@ -2227,20 +2284,38 @@ def encode_result(
     session_key: bytes,
     *,
     session_id: int = 0,
+    serial_num: int = AUTH_SERIAL_NUM,
     version_no: int = VERSION_11_2_0_2,
 ) -> bytes:
     """The auth-result RPA payload — the server proof, version, and session id.
 
     Decodes back through ``decode_token_rpa`` as a ``TTI_AUTH`` result whose
     ``AUTH_SVR_RESPONSE`` the client's ``validate()`` accepts.
+
+    From 12.1 three things change (#829), none of which a pre-12.1 reply gets, so
+    the 11g wire stays byte-identical:
+
+    - the proof is the 48-byte padded form, because a 12.1+ client checks for the
+      marker at a fixed offset rather than anywhere in the plaintext;
+    - ``AUTH_SERIAL_NUM`` joins the session identity — a 12.1+ client reads
+      session id, serial number and version number, and raises on a missing key
+      rather than defaulting;
+    - a status OER closes the reply, as it closes the challenge (see
+      :func:`encode_challenge` for why a client waits without one).
     """
-    return encode_rpa_kv(
-        [
-            (b'AUTH_SVR_RESPONSE', _hexval(server_proof(session_key))),
-            (b'AUTH_VERSION_NO', str(version_no).encode('ascii')),
-            (b'AUTH_SESSION_ID', str(session_id).encode('ascii')),
-        ]
-    )
+    modern = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+    proof = server_proof_padded(session_key) if modern else server_proof(session_key)
+    pairs = [
+        (b'AUTH_SVR_RESPONSE', _hexval(proof)),
+        (b'AUTH_VERSION_NO', str(version_no).encode('ascii')),
+        (b'AUTH_SESSION_ID', str(session_id).encode('ascii')),
+    ]
+    if modern:
+        pairs.append((b'AUTH_SERIAL_NUM', str(serial_num).encode('ascii')))
+    payload = encode_rpa_kv(pairs)
+    if modern:
+        payload += encode_status()
+    return payload
 
 
 def decode_token_iov(Data: bytes, Acc: tuple) -> tuple:
