@@ -1212,6 +1212,25 @@ class _Cursors:
         # empty query and no OACs (the 11g parse-once optimization, #80/#486).
         # Shares the `_next` id space.
         self._dml: dict[int, tuple[str, list]] = {}
+        # Query statement text keyed by the cursor id reported for it, so a
+        # client that re-executes a query by id gets that query (#840). Shares
+        # the `_next` id space.
+        self._query: dict[int, str] = {}
+
+    def open_query(self, sql: str) -> int:
+        # A cursor id for a query, minted even when the whole result fit and
+        # there is nothing parked. The client caches the id against the statement
+        # and re-executes by it, so every query needs one of its own -- sharing
+        # the captured 1 told every query it was the same cursor (#840). The SQL
+        # is kept because re-executing by id has to know what to run (#833).
+        cursor_id = self._next
+        self._next += 1
+        self._query[cursor_id] = sql
+        return cursor_id
+
+    def query_sql(self, cursor_id: int) -> str | None:
+        """The statement behind a query cursor id, or None if unknown."""
+        return self._query.get(cursor_id)
 
     def open_dml(self, sql: str, bind_types: list) -> int:
         cursor_id = self._next
@@ -1231,10 +1250,17 @@ class _Cursors:
         state = self._dml.get(cursor_id)
         return state[1] if state is not None else None
 
-    def open(self, columns: list[ColumnMeta], rows: list[tuple]) -> int:
+    def open(
+        self, columns: list[ColumnMeta], rows: list[tuple], *, sql: str | None = None
+    ) -> int:
+        # `sql` is the statement this cursor ran, recorded so a re-execute by id
+        # knows what to run (#840). A REF CURSOR has no statement of its own and
+        # passes None.
         cursor_id = self._next
         self._next += 1
         self._open[cursor_id] = (columns, rows)
+        if sql is not None:
+            self._query[cursor_id] = sql
         return cursor_id
 
     def open_scroll(self, columns: list[ColumnMeta], rows: list[tuple]) -> int:
@@ -1538,12 +1564,18 @@ def _answer_query(
             batch_size = request.fetch if request.fetch > 0 else len(rows)
             first, remaining = rows[:batch_size], rows[batch_size:]
             if remaining:
-                cursor_id = cursors.open(result.columns, remaining)
+                cursor_id = cursors.open(result.columns, remaining, sql=sql)
                 response = encode_query_response(
                     result.columns, first, cursor_id=cursor_id, more=True
                 )
             else:
-                response = encode_query_response(result.columns, first)
+                # Mint an id even though nothing is parked: the terminator
+                # reports it and the client caches it against this statement, so
+                # a query with no leftover rows still needs an identity of its
+                # own (#840).
+                response = encode_query_response(
+                    result.columns, first, cursor_id=cursors.open_query(sql)
+                )
         else:
             # DML / DDL success. Hand back a server cursor id (reused on a cached
             # re-execute, freshly minted otherwise) so the client's cursor cache

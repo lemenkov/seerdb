@@ -1278,7 +1278,13 @@ def encode_more_rows(cursor_id: int) -> bytes:
 
 
 def _terminator(cursor_id: int, more: bool) -> bytes:
-    return encode_more_rows(cursor_id) if more else _end_of_fetch()
+    # `more` reports an open cursor with rows still on it; the end-of-fetch
+    # reports the cursor the (now drained) statement ran on. Both carry the id
+    # so a client can re-execute the statement by it (#840). A zero id means the
+    # caller minted none, and the captured 1 stands in.
+    if more:
+        return encode_more_rows(cursor_id)
+    return _end_of_fetch(cursor_id or 1)
 
 
 def encode_query_response(
@@ -9406,17 +9412,22 @@ _END_OF_FETCH = _encode_oer(
 )
 
 
-def _end_of_fetch() -> bytes:
+def _end_of_fetch(cursor_id: int = 1) -> bytes:
     # The 11g terminator is the pinned constant; a 12.1+ client reads extra OER
     # fields, so re-encode it under the session's field version.
-    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_12_1:
+    #
+    # ``cursor_id`` is the one field that varies. A client reads the server's
+    # cursor id out of this OER and caches it against the statement, so a
+    # terminator that always says 1 tells every query it is cursor 1 (#840). The
+    # default keeps the captured value for callers with no cursor of their own.
+    if cursor_id == 1 and _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_12_1:
         return _END_OF_FETCH
     return _encode_oer(
         1,
         1403,
         1,
         b'ORA-01403: no data found\n',
-        cursor_id=1,
+        cursor_id=cursor_id,
         seq=4,
         error_pos=14,
         sql_type=3,
