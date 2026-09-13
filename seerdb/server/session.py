@@ -100,6 +100,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_23_1,
     TNS_CONNECT,
     TNS_DATA,
+    TNS_FUNC_REEXECUTE,
     TNS_FUNC_REEXECUTE_AND_FETCH,
     TNS_FUNC_SESSION_STATE,
     TNS_FUNC_SET_END_TO_END_ATTR,
@@ -708,6 +709,28 @@ def serve_session(
             lobs = _answer_lobops(stream, body, lobs, temp_lobs)
         elif body[1] == TNS_FUNC_REEXECUTE_AND_FETCH:
             lobs = _answer_reexecute(stream, backend, parse_reexecute(body), cursors)
+        elif body[1] == TNS_FUNC_REEXECUTE:
+            # The plain re-execute (#854): the cursor's statement again with
+            # fresh bind rows. The rows carry no OACs, so the types the cursor
+            # was opened with are looked up first (the header names the cursor)
+            # and then the whole message -- rows included, which can span
+            # packets like any other bind data -- is read with them.
+            body = _complete_message(stream, body, parse_reexecute)
+            cached_types = cursors.bind_types(parse_reexecute(body).cursor)
+            max_size = max_string_size(_SERVER_RUNTIME_CAPS)
+            body = _complete_message(
+                stream,
+                body,
+                lambda b: parse_reexecute(
+                    b, bind_types=cached_types, max_string_size=max_size
+                ),
+            )
+            reexecute = parse_reexecute(
+                body, bind_types=cached_types, max_string_size=max_size
+            )
+            lobs = _answer_reexecute_binds(
+                stream, backend, reexecute, cursors, temp_lobs
+            )
         elif body[1] == TTI_FETCH:
             _answer_fetch(stream, parse_fetch(body), cursors)
         elif body[1] == TTI_COMMIT:
@@ -1101,6 +1124,7 @@ def _apply_schema(backend: Backend | None, schema: bytes | list) -> None:
 
 
 _ORA_USER_CANCEL = 1013  # ORA-01013: user requested cancel of current operation
+_ORA_INVALID_CURSOR = 1001  # ORA-01001: a cursor id the session does not hold
 
 
 def _answer_marker(stream: PacketStream, body: bytes) -> None:
@@ -1327,12 +1351,12 @@ class _Cursors:
         # empty query and no OACs (the 11g parse-once optimization, #80/#486).
         # Shares the `_next` id space.
         self._dml: dict[int, tuple[str, list]] = {}
-        # Query statement text keyed by the cursor id reported for it, so a
-        # client that re-executes a query by id gets that query (#840). Shares
-        # the `_next` id space.
-        self._query: dict[int, str] = {}
+        # Query statement text + bind format keyed by the cursor id reported for
+        # it, so a client that re-executes a query by id gets that query (#840)
+        # and its fresh bind values decode (#854). Shares the `_next` id space.
+        self._query: dict[int, tuple[str, list]] = {}
 
-    def open_query(self, sql: str) -> int:
+    def open_query(self, sql: str, bind_types: Sequence = ()) -> int:
         # A cursor id for a query, minted even when the whole result fit and
         # there is nothing parked. The client caches the id against the statement
         # and re-executes by it, so every query needs one of its own -- sharing
@@ -1340,12 +1364,19 @@ class _Cursors:
         # is kept because re-executing by id has to know what to run (#833).
         cursor_id = self._next
         self._next += 1
-        self._query[cursor_id] = sql
+        self._query[cursor_id] = (sql, list(bind_types))
         return cursor_id
 
     def query_sql(self, cursor_id: int) -> str | None:
         """The statement behind a query cursor id, or None if unknown."""
-        return self._query.get(cursor_id)
+        state = self._query.get(cursor_id)
+        return state[0] if state is not None else None
+
+    def bind_types(self, cursor_id: int) -> list | None:
+        """The bind format a cursor -- DML or query -- was opened with, so a
+        re-execute's OAC-less rows decode (#854); None if the id is unknown."""
+        state = self._dml.get(cursor_id) or self._query.get(cursor_id)
+        return state[1] if state is not None else None
 
     def open_dml(self, sql: str, bind_types: list) -> int:
         cursor_id = self._next
@@ -1366,16 +1397,21 @@ class _Cursors:
         return state[1] if state is not None else None
 
     def open(
-        self, columns: list[ColumnMeta], rows: list[tuple], *, sql: str | None = None
+        self,
+        columns: list[ColumnMeta],
+        rows: list[tuple],
+        *,
+        sql: str | None = None,
+        bind_types: Sequence = (),
     ) -> int:
         # `sql` is the statement this cursor ran, recorded so a re-execute by id
-        # knows what to run (#840). A REF CURSOR has no statement of its own and
-        # passes None.
+        # knows what to run (#840), with the bind format its values came in (#854).
+        # A REF CURSOR has no statement of its own and passes None.
         cursor_id = self._next
         self._next += 1
         self._open[cursor_id] = (columns, rows)
         if sql is not None:
-            self._query[cursor_id] = sql
+            self._query[cursor_id] = (sql, list(bind_types))
         return cursor_id
 
     def reopen(
@@ -1389,7 +1425,9 @@ class _Cursors:
         # Re-park a re-executed cursor under the id the client already holds,
         # rather than minting a new one: the client is not told about a new id on
         # a re-execute, so its follow-up fetches would address the old one (#833).
-        self._query[cursor_id] = sql
+        # The bind format stays what the opening execute recorded.
+        previous = self._query.get(cursor_id)
+        self._query[cursor_id] = (sql, previous[1] if previous else [])
         if rows:
             self._open[cursor_id] = (columns, rows)
         else:
@@ -1696,7 +1734,9 @@ def _answer_query(
             batch_size = request.fetch if request.fetch > 0 else len(rows)
             first, remaining = rows[:batch_size], rows[batch_size:]
             if remaining:
-                cursor_id = cursors.open(result.columns, remaining, sql=sql)
+                cursor_id = cursors.open(
+                    result.columns, remaining, sql=sql, bind_types=request.bind_types
+                )
                 response = encode_query_response(
                     result.columns, first, cursor_id=cursor_id, more=True
                 )
@@ -1706,7 +1746,9 @@ def _answer_query(
                 # a query with no leftover rows still needs an identity of its
                 # own (#840).
                 response = encode_query_response(
-                    result.columns, first, cursor_id=cursors.open_query(sql)
+                    result.columns,
+                    first,
+                    cursor_id=cursors.open_query(sql, request.bind_types),
                 )
         else:
             # DML / DDL success. Hand back a server cursor id (reused on a cached
@@ -1853,6 +1895,79 @@ def _answer_reexecute(
         ),
     )
     return lobs
+
+
+def _answer_reexecute_binds(
+    stream: PacketStream,
+    backend: Backend,
+    request: ReexecuteRequest,
+    cursors: _Cursors,
+    temp_lobs: dict[bytes, bytearray],
+) -> list[tuple[bytes, bool]]:
+    """Re-run the statement a cursor holds with fresh bind rows (func 4, #854).
+
+    This is what a client sends for every repeated execute of a statement whose
+    bind types did not change -- the second iteration onward of a loop of
+    inserts -- and for a query re-executed with prefetching off. It is an
+    execute without a statement or OACs: the cursor supplies both, the message
+    only the values. Captured off a live 23ai:
+
+    - a DML cursor answers with the plain success status -- rowcount and the
+      same cursor id -- exactly the OALL8 cached re-execute's reply, so the
+      request is reshaped into that execute and served by its path (array rows,
+      autocommit, temp-LOB binds and all);
+    - a query cursor answers with the same status carrying rowcount 0 and no
+      rows: the client drains them with TTI_FETCH, so every row is parked on
+      the cursor.
+
+    A cursor id the session does not hold is refused as ORA-01001. Answering
+    "done, 0 rows" would lose a write the client believes was made.
+    """
+    types = cursors.bind_types(request.cursor) or []
+    rows = request.bind_rows
+    sql = cursors.dml_sql(request.cursor)
+    if sql is not None:
+        execute = ExecRequest(
+            sql='',
+            cursor=request.cursor,
+            bind_count=len(types),
+            fetch=0,
+            binds=rows[0] if rows else [],
+            bind_rows=rows,
+            bind_meta=[(data_type, maxlen) for data_type, _c, maxlen, _o in types],
+            bind_types=list(types),
+            autocommit=request.autocommit,
+            iterations=max(request.fetch, 1),
+        )
+        return _answer_query(
+            stream, backend, _resolve_temp_lob_binds(execute, temp_lobs), cursors
+        )
+    sql = cursors.query_sql(request.cursor)
+    if sql is None:
+        stream.write_packet(
+            TNS_DATA, encode_error(_ORA_INVALID_CURSOR, 'ORA-01001: invalid cursor')
+        )
+        return []
+    try:
+        result = backend.execute(sql, rows[0] if rows else [])
+    except BackendError as err:
+        logger.info('re-execute refused: %s', err.ora_message)
+        stream.write_packet(
+            TNS_DATA, encode_error(err.ora_code, err.ora_message, err.error_offset)
+        )
+        return []
+    except Exception as exc:  # noqa: BLE001 - never desync on a backend fault
+        logger.warning('backend raised a non-ORA error: %s', exc)
+        stream.write_packet(
+            TNS_DATA,
+            encode_error(_INTERNAL_ERROR, f'ORA-00600: backend error: {exc}'),
+        )
+        return []
+    columns = list(result.columns or [])
+    all_rows = list(result.rows)
+    cursors.reopen(request.cursor, columns, all_rows, sql=sql)
+    stream.write_packet(TNS_DATA, encode_status(0, cursor_id=request.cursor))
+    return oci_lob_contents(columns, all_rows) if columns else []
 
 
 def _answer_fetch(

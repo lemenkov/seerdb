@@ -181,6 +181,7 @@ from seerdb.common.tns_consts import (
     TNS_EXEC_FLAGS_SCROLLABLE,
     TNS_EXEC_OPTION_BATCH_ERRORS,
     TNS_EXEC_OPTION_BIND,
+    TNS_EXEC_OPTION_COMMIT_REEXECUTE,
     TNS_EXEC_OPTION_EXECUTE,
     TNS_EXEC_OPTION_FETCH,
     TNS_EXEC_OPTION_PARSE,
@@ -437,8 +438,17 @@ class ReexecuteRequest:
     """
 
     cursor: int
+    # The iteration count: the prefetch size for the fetch-carrying form (78),
+    # the number of executions -- and of bind rows -- for the plain form (4).
     fetch: int
     options: int
+    # One row of fresh values per execution, decoded with the bind types the
+    # cursor was first executed with -- the request carries no OACs (#854).
+    # Empty when the parser was given no types (a bind-less statement, or the
+    # caller only wanted the header).
+    bind_rows: list = field(default_factory=list)
+    # options_2's commit bit: the client's autocommit, applied on success.
+    autocommit: bool = False
 
 
 # The TTC field version negotiated for the connection whose response we are
@@ -1669,26 +1679,7 @@ def parse_exec(
         order = [index for index in carried if index not in long_binds] + [
             index for index in carried if index in long_binds
         ]
-        # Loop until the rows run out (executemany sends N, a plain execute
-        # sends 1).
-        while after and after[0] == TTI_RXD:
-            after = after[1:]
-            row: list = [None] * len(types)
-            for index in order:
-                data_type, csfrm, _maxlen, toid = types[index]
-                if capacities[index]:
-                    # An associative-array bind (#122/#743): a ub4 element
-                    # count, then each element as an ordinary value of the
-                    # bind's type. A pure-OUT array sends a count of 0.
-                    (count, after) = decode_ub4(after)
-                    elements = []
-                    for _ in range(count):
-                        element, after = _read_bind_value(data_type, csfrm, after, toid)
-                        elements.append(element)
-                    row[index] = elements
-                    continue
-                row[index], after = _read_bind_value(data_type, csfrm, after, toid)
-            bind_rows.append(row)
+        bind_rows, after = _read_bind_rows(after, types, capacities, order)
         if bind_rows:
             binds = bind_rows[0]
         # Per-bind (tns_type, max_size) — what a PL/SQL block's OUT binds need to
@@ -1719,6 +1710,36 @@ def parse_exec(
         return_binds=return_binds,
         iterations=iterations,
     )
+
+
+def _read_bind_rows(
+    after: bytes, types: list, capacities: list[int], order: list[int]
+) -> tuple[list, bytes]:
+    # The RXD rows of an execute: each a TTI_RXD token then one value per bind
+    # in `order` (the wire order -- LONG-class binds last, clause-filled
+    # RETURNING binds absent, so a row keeps None at any position `order`
+    # skips). Loops until the rows run out: executemany sends N, a plain
+    # execute 1. Returns the rows and the bytes past them.
+    bind_rows: list = []
+    while after and after[0] == TTI_RXD:
+        after = after[1:]
+        row: list = [None] * len(types)
+        for index in order:
+            data_type, csfrm, _maxlen, toid = types[index]
+            if capacities[index]:
+                # An associative-array bind (#122/#743): a ub4 element count,
+                # then each element as an ordinary value of the bind's type. A
+                # pure-OUT array sends a count of 0.
+                (count, after) = decode_ub4(after)
+                elements = []
+                for _ in range(count):
+                    element, after = _read_bind_value(data_type, csfrm, after, toid)
+                    elements.append(element)
+                row[index] = elements
+                continue
+            row[index], after = _read_bind_value(data_type, csfrm, after, toid)
+        bind_rows.append(row)
+    return bind_rows, after
 
 
 def _read_chunked_sql(data: bytes, total_len: int) -> bytes:
@@ -2099,27 +2120,64 @@ def parse_fetch(payload: bytes) -> FetchRequest:
     return FetchRequest(cursor=cursor, fetch=fetch)
 
 
-def parse_reexecute(payload: bytes) -> ReexecuteRequest:
+def parse_reexecute(
+    payload: bytes, bind_types: list | None = None, max_string_size: int = 4000
+) -> ReexecuteRequest:
     """Parse a re-execute message: ``[TTI_FUN, func, seq]`` + ub4 cursor id +
-    ub4 iterations + ub4 options + ub4 options.
+    ub4 iterations + ub4 options + ub4 options, then -- when the statement has
+    binds -- one ``TTI_RXD`` row of values per iteration.
 
     Layout taken from the reference thin client's writer rather than inferred,
-    and confirmed against a live 23ai capture, where the whole request is eleven
-    bytes::
+    and confirmed against live 23ai captures. The fetch-carrying form (78) of a
+    bind-less query is eleven bytes::
 
         03 4e 04 | 00 | 01 01 | 01 02 | 01 20 | 00
                  token  cursor  iters   opts_1  opts_2
 
+    and the plain form (4) re-running ``INSERT ... VALUES (:1, :2)`` with
+    ``(2, 'row2')`` is the same header and then the row (#854)::
+
+        03 04 08 | 00 | 01 03 | 01 01 | 00 | 00 | 07 02 c1 03 04 72 6f 77 32
+                 token  cursor  iters  opts   RXD  NUMBER 2   'row2'
+
+    The rows carry **no OACs**: the values are typed by the OACs of the
+    execute that opened the cursor, which the server is expected to remember.
+    Pass them as ``bind_types`` (the ``(data_type, csfrm, max_size, toid)`` list
+    :func:`parse_exec` exposes as ``ExecRequest.bind_types``) and the rows
+    decode into ``bind_rows``; without them the rows are left unread. A bind
+    declared wider than ``max_string_size`` is LONG-class and rides after the
+    row's other values, as on the opening execute.
+
     ``iterations`` is the client's prefetch size for the fetch-carrying form, so
-    it doubles as the batch size for the reply.
+    it doubles as the batch size for the reply; for the plain form it is the
+    number of executions, one bind row each.
     """
     if len(payload) < 3 or payload[0] != TTI_FUN:
         raise InterfaceError('not a re-execute')
     rest = _skip_fun_header(payload)  # TTI_FUN, func, seq (+ fv24 token)
     cursor, rest = decode_ub4(rest)
     iterations, rest = decode_ub4(rest)
-    options, _rest = decode_ub4(rest)
-    return ReexecuteRequest(cursor=cursor, fetch=iterations, options=options)
+    options, rest = decode_ub4(rest)
+    options_2, rest = decode_ub4(rest)
+    bind_rows: list = []
+    if bind_types:
+        types = list(bind_types)
+        # A cached cursor is DML only (#703): no array binds, no clause-filled
+        # positions to skip -- every bind carries a value, LONG-class ones last.
+        long_binds = [
+            i
+            for i, (_t, _c, maxlen, _o) in enumerate(types)
+            if maxlen > max_string_size
+        ]
+        order = [i for i in range(len(types)) if i not in long_binds] + long_binds
+        bind_rows, _rest = _read_bind_rows(rest, types, [0] * len(types), order)
+    return ReexecuteRequest(
+        cursor=cursor,
+        fetch=iterations,
+        options=options,
+        bind_rows=bind_rows,
+        autocommit=bool(options_2 & TNS_EXEC_OPTION_COMMIT_REEXECUTE),
+    )
 
 
 # --- Mirror deadbeef/OCI: version-call, piggyback, re-exec, fetch terminator ---
