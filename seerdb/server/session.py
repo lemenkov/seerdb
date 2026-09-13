@@ -36,6 +36,7 @@ from seerdb.common.tns import (
     ColumnMeta,
     ExecRequest,
     FetchRequest,
+    ReexecuteRequest,
     RefCursorOutBind,
     ScalarOutBind,
     TempLobRef,
@@ -87,6 +88,7 @@ from seerdb.common.tns import (
     parse_fetch,
     parse_lobops_read,
     parse_lobops_request,
+    parse_reexecute,
     parse_tpc_switch,
     peek_exec_cursor,
     scroll_start_row,
@@ -97,6 +99,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_23_1,
     TNS_CONNECT,
     TNS_DATA,
+    TNS_FUNC_REEXECUTE_AND_FETCH,
     TNS_FUNC_SESSION_STATE,
     TNS_FUNC_SET_END_TO_END_ATTR,
     TNS_FUNC_SET_SCHEMA,
@@ -694,6 +697,8 @@ def serve_session(
                 lobs = _answer_query(stream, backend, request, cursors)
         elif body[1] == TTI_LOBOPS:
             lobs = _answer_lobops(stream, body, lobs, temp_lobs)
+        elif body[1] == TNS_FUNC_REEXECUTE_AND_FETCH:
+            lobs = _answer_reexecute(stream, backend, parse_reexecute(body), cursors)
         elif body[1] == TTI_FETCH:
             _answer_fetch(stream, parse_fetch(body), cursors)
         elif body[1] == TTI_COMMIT:
@@ -1263,6 +1268,23 @@ class _Cursors:
             self._query[cursor_id] = sql
         return cursor_id
 
+    def reopen(
+        self,
+        cursor_id: int,
+        columns: list[ColumnMeta],
+        rows: list[tuple],
+        *,
+        sql: str,
+    ) -> None:
+        # Re-park a re-executed cursor under the id the client already holds,
+        # rather than minting a new one: the client is not told about a new id on
+        # a re-execute, so its follow-up fetches would address the old one (#833).
+        self._query[cursor_id] = sql
+        if rows:
+            self._open[cursor_id] = (columns, rows)
+        else:
+            self._open.pop(cursor_id, None)
+
     def open_scroll(self, columns: list[ColumnMeta], rows: list[tuple]) -> int:
         cursor_id = self._next
         self._next += 1
@@ -1663,6 +1685,64 @@ def _answer_scroll(
         ),
     )
     return oci_lob_contents(columns, batch)
+
+
+def _answer_reexecute(
+    stream: PacketStream,
+    backend: Backend,
+    request: ReexecuteRequest,
+    cursors: _Cursors,
+) -> list[tuple[bytes, bool]]:
+    """Re-run the statement a cursor already holds and return its first batch.
+
+    A client caches a statement against the cursor id the server reported and
+    then re-executes by that id alone -- the request carries no SQL (#833). So
+    this is an execute whose statement comes from the cursor, and a reply in the
+    shape of a fetch: rows and a terminator, no describe, because the client
+    established the column metadata on the first execute and does not expect it
+    again.
+
+    An id the Mirror does not know is answered with an empty batch rather than an
+    error. That is what a drained cursor looks like, and it keeps a client that
+    re-executes something the Mirror has forgotten moving instead of failing.
+    """
+    sql = cursors.query_sql(request.cursor)
+    if sql is None:
+        stream.write_packet(
+            TNS_DATA, encode_fetch_response([], [], cursor_id=request.cursor)
+        )
+        return []
+    try:
+        result = backend.execute(sql)
+    except BackendError as err:
+        logger.info('re-execute refused: %s', err.ora_message)
+        stream.write_packet(
+            TNS_DATA, encode_error(err.ora_code, err.ora_message, err.error_offset)
+        )
+        return []
+    except Exception as exc:  # noqa: BLE001 - never desync on a backend fault
+        logger.warning('backend raised a non-ORA error: %s', exc)
+        stream.write_packet(
+            TNS_DATA,
+            encode_error(_INTERNAL_ERROR, f'ORA-00600: backend error: {exc}'),
+        )
+        return []
+    columns = list(result.columns or [])
+    rows = list(result.rows)
+    lobs = oci_lob_contents(columns, rows) if columns else []
+    # The request's iteration count is the client's prefetch size, so it is also
+    # the batch size. Anything past it is parked on the SAME cursor id the client
+    # already holds, so its follow-up fetches address the statement it just ran.
+    batch_size = request.fetch if request.fetch > 0 else len(rows)
+    first, remaining = rows[:batch_size], rows[batch_size:]
+    cursors.reopen(request.cursor, columns, remaining, sql=sql)
+    stream.write_packet(
+        TNS_DATA,
+        encode_fetch_response(
+            columns, first, cursor_id=request.cursor, more=bool(remaining)
+        ),
+    )
+    return lobs
 
 
 def _answer_fetch(

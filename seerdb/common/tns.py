@@ -428,6 +428,19 @@ class FetchRequest:
     fetch: int
 
 
+@dataclass(frozen=True)
+class ReexecuteRequest:
+    """A parsed re-execute: run the statement a cursor already holds, again.
+
+    The request names the cursor and carries no SQL -- that is the point of it,
+    and why a cursor id has to identify one statement (#840).
+    """
+
+    cursor: int
+    fetch: int
+    options: int
+
+
 # The TTC field version negotiated for the connection whose response we are
 # currently decoding. Set by `decode_packet` at the top of each response and
 # read by the version-gated token decoders (e.g. the 12c+ DCB column format).
@@ -2040,6 +2053,29 @@ def parse_fetch(payload: bytes) -> FetchRequest:
     cursor, rest = decode_ub4(rest)
     fetch, _rest = decode_ub4(rest)
     return FetchRequest(cursor=cursor, fetch=fetch)
+
+
+def parse_reexecute(payload: bytes) -> ReexecuteRequest:
+    """Parse a re-execute message: ``[TTI_FUN, func, seq]`` + ub4 cursor id +
+    ub4 iterations + ub4 options + ub4 options.
+
+    Layout taken from the reference thin client's writer rather than inferred,
+    and confirmed against a live 23ai capture, where the whole request is eleven
+    bytes::
+
+        03 4e 04 | 00 | 01 01 | 01 02 | 01 20 | 00
+                 token  cursor  iters   opts_1  opts_2
+
+    ``iterations`` is the client's prefetch size for the fetch-carrying form, so
+    it doubles as the batch size for the reply.
+    """
+    if len(payload) < 3 or payload[0] != TTI_FUN:
+        raise InterfaceError('not a re-execute')
+    rest = _skip_fun_header(payload)  # TTI_FUN, func, seq (+ fv24 token)
+    cursor, rest = decode_ub4(rest)
+    iterations, rest = decode_ub4(rest)
+    options, _rest = decode_ub4(rest)
+    return ReexecuteRequest(cursor=cursor, fetch=iterations, options=options)
 
 
 # --- Mirror deadbeef/OCI: version-call, piggyback, re-exec, fetch terminator ---
