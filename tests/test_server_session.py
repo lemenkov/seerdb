@@ -1537,3 +1537,41 @@ def test_unhandled_piggyback_is_refused_not_dropped() -> None:
         listen.close()
 
     assert row == ('X',)
+
+
+def test_each_query_gets_its_own_cursor_id() -> None:
+    # A client reads the server's cursor id out of the reply terminator and
+    # caches it against the statement, then re-executes by that id. The
+    # terminator was a replayed 11g capture with cursor_id=1 baked in, so every
+    # query in a session claimed to be cursor 1 -- and a re-execute by id would
+    # have run whichever statement was most recently called 1 (#840).
+    #
+    # Asserted through _Cursors rather than the wire: the ids are what must
+    # differ, and the terminator merely carries them.
+    from seerdb.server.session import _Cursors
+
+    cursors = _Cursors()
+    first = cursors.open_query('select 7 from dual')
+    second = cursors.open_query('select 42 from dual')
+    assert first != second
+    assert cursors.query_sql(first) == 'select 7 from dual'
+    assert cursors.query_sql(second) == 'select 42 from dual'
+    # An id nobody minted resolves to nothing, rather than to a stale statement.
+    assert cursors.query_sql(9999) is None
+    # A parked result keeps its statement too, so draining it and re-executing
+    # by the same id stay consistent.
+    parked = cursors.open([], [(1,)], sql='select 99 from dual')
+    assert cursors.query_sql(parked) == 'select 99 from dual'
+    assert parked not in (first, second)
+
+
+def test_the_end_of_fetch_terminator_carries_the_cursor_id() -> None:
+    # The captured 11g terminator stays byte-identical when the caller has no
+    # cursor of its own, so nothing changes for the paths that never had one;
+    # a real id changes only that field.
+    from seerdb.common.tns import _END_OF_FETCH, _end_of_fetch
+
+    assert _end_of_fetch() == _END_OF_FETCH
+    assert _end_of_fetch(1) == _END_OF_FETCH
+    assert _end_of_fetch(7) != _END_OF_FETCH
+    assert len(_end_of_fetch(7)) == len(_END_OF_FETCH)
