@@ -1933,7 +1933,20 @@ def test_temp_lob_responses_round_trip_through_the_client_decoders() -> None:
     # The client reads: 0x08, ub2 length, then the locator bytes.
     assert create[0] == 0x08  # TTI_RPA
     assert int.from_bytes(create[1:3], 'big') == len(locator)
-    assert create[3:] == locator
+    assert create[3 : 3 + len(locator)] == locator
+    # 40 bytes on the wire, as a real server sends: the client allocated that
+    # much and reads exactly that much back (#846).
+    assert 2 + len(locator) == 40
+    # ... and the reply does NOT end at the locator. This test used to assert
+    # `create[3:] == locator`, which pinned the defect itself: a client that
+    # parses the whole reply reads a character set and a flags byte next, then
+    # keeps reading until a status OER ends the response, and waited forever for
+    # one. The shape below is what a live 23ai sends.
+    tail = create[3 + len(locator) :]
+    assert tail[:3] == bytes([0x02, 0x03, 0x69])  # charset 873, AL32UTF8
+    assert tail[4] == 0x04  # TTI_OER closes the response
+    err_code, _msg = decode_lobops_oer(create, 6)
+    assert err_code in (0, 1403)
 
     ack = encode_lobops_ack(locator)
     err_code, _msg = decode_lobops_oer(ack, 6)
