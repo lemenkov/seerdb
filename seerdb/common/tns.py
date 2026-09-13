@@ -33,7 +33,7 @@ from seerdb.common.datatypes import (
     Var,
 )
 from seerdb.common.date import date
-from seerdb.common.exceptions import DataError, InterfaceError
+from seerdb.common.exceptions import DataError, InterfaceError, Truncated
 from seerdb.common.sqltext import is_plsql, returning_bind_positions
 from seerdb.common.vector import (
     VECTOR_BIND_DESCRIPTOR,
@@ -1807,16 +1807,23 @@ def _decode_lobops_chunked(data: bytes) -> bytes:
     if not data:
         return b''
     if data[0] != 0xFE:
+        if len(data) < 1 + data[0]:
+            raise Truncated(f'LOB write: {data[0]} bytes, {len(data) - 1} left')
         return data[1 : 1 + data[0]]
     rest = data[1:]
     out = bytearray()
-    while rest:
+    # The payload ends at a zero-length chunk, and only there. Running out of
+    # bytes first used to return whatever had arrived as if it were the whole
+    # value -- which is how a WRITE spanning TNS packets lost everything after
+    # its first packet without a word (#848, #849).
+    while True:
         chunk_len, rest = decode_ub4(rest)
         if chunk_len == 0:
-            break
+            return bytes(out)
+        if len(rest) < chunk_len:
+            raise Truncated(f'LOB write chunk: {chunk_len} bytes, {len(rest)} left')
         out += rest[:chunk_len]
         rest = rest[chunk_len:]
-    return bytes(out)
 
 
 # The opcodes the Mirror acknowledges with a content-free RPA+OER but does not
@@ -9425,10 +9432,16 @@ def decode_ub4(Bytes: bytes) -> tuple[int, bytes]:
     # magnitude width (0..4 for a real ub4 / sb4); the high bit flags a negative
     # value (sign-magnitude, not two's complement). So -1 arrives as 0x81 0x01,
     # NUMBER scale -127 as 0x81 0x7f, and -256 as 0x82 0x01 0x00.
+    if not Bytes:
+        raise Truncated('ub4: no length byte')
     Length = Bytes[0]
     Negative = bool(Length & 0x80)
     Width = Length & 0x7F
     if Width <= 4:
+        # A slice past the end returns fewer bytes and a smaller number, not an
+        # error, so a short buffer has to be caught before it is read (#849).
+        if len(Bytes) < Width + 1:
+            raise Truncated(f'ub4: {Width} magnitude bytes, {len(Bytes) - 1} left')
         Magnitude = int.from_bytes(Bytes[1 : Width + 1], 'big')
         Value = -Magnitude if Negative else Magnitude
         return (Value, Bytes[Width + 1 :])
@@ -9440,6 +9453,9 @@ def decode_ub4(Bytes: bytes) -> tuple[int, bytes]:
     # OER stream aligned for ordinary multi-row fetches. Keep it: a prior strict
     # version that raised here crashed plain
     # "SELECT level FROM dual CONNECT BY level <= 50" (#24).
+    # Only the length is checked here -- the lenient reading itself is untouched.
+    if len(Bytes) < 2:
+        raise Truncated('ub4: two-byte form cut short')
     return (-Bytes[1], Bytes[2:])
 
 
@@ -9733,6 +9749,10 @@ def decode_dalc(Bytes: bytes) -> tuple[bytes | list, bytes]:
         if Bytes[0] == TNS_LONG_LENGTH_INDICATOR:
             return decode_chr(Bytes)
         Length = Bytes[0]
+        if len(Bytes) < Length + 1:
+            # The case the IndexError handler below never caught: a length byte
+            # that promises more than remains slices quietly (#849).
+            raise Truncated(f'DALC: {Length} bytes, {len(Bytes) - 1} left')
         return (Bytes[1 : Length + 1], Bytes[Length + 1 :])
     except IndexError as Exc:
         # A truncated field (empty Bytes, or a chunk length in decode_chr that
@@ -9742,6 +9762,8 @@ def decode_dalc(Bytes: bytes) -> tuple[bytes | list, bytes]:
 
 
 def decode_chr(Bytes: bytes) -> tuple[bytes, bytes]:
+    if not Bytes:
+        raise Truncated('CHR: empty')
     if Bytes[0] == TNS_LONG_LENGTH_INDICATOR:
         # LONG (chunked) value. 12c+ prefixes each chunk with a ub4 length and
         # ends with a zero-length chunk (same framing as _skip_chunked_bytes);
@@ -9754,12 +9776,20 @@ def decode_chr(Bytes: bytes) -> tuple[bytes, bytes]:
                 (ChunkLen, Rest) = decode_ub4(Rest)
                 if ChunkLen == 0:
                     return (Out, Rest)
+                if len(Rest) < ChunkLen:
+                    raise Truncated(f'chunk: {ChunkLen} bytes, {len(Rest)} left')
                 Out += Rest[:ChunkLen]
                 Rest = Rest[ChunkLen:]
+        if len(Bytes) < 2:
+            raise Truncated('chunked value: no first chunk length')
         j = 1
         i = Bytes[j]
         Out = b''
         while True:
+            # Each chunk is followed by at least the next length byte (the 0
+            # terminator on the last), so the chunk plus that byte must be there.
+            if len(Bytes) < i + j + 2:
+                raise Truncated(f'chunk: {i} bytes, {len(Bytes) - j - 1} left')
             Out += Bytes[j + 1 : i + j + 1]
             if Bytes[i + j + 1] == 0:
                 break
@@ -9767,6 +9797,8 @@ def decode_chr(Bytes: bytes) -> tuple[bytes, bytes]:
             i = Bytes[j]
         return (Out, Bytes[i + j + 1 + 1 :])
     else:
+        if len(Bytes) < Bytes[0] + 1:
+            raise Truncated(f'CHR: {Bytes[0]} bytes, {len(Bytes) - 1} left')
         return (Bytes[1 : Bytes[0] + 1], Bytes[Bytes[0] + 1 :])
 
 
