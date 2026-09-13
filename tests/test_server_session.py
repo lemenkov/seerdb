@@ -1610,3 +1610,41 @@ def test_reexecute_runs_the_cursors_own_statement() -> None:
     # knows what to run.
     cursors.take(first, 99)
     assert cursors.query_sql(first) == 'select 7 from dual'
+
+
+def test_a_break_episode_is_answered_with_reset_then_cancel() -> None:
+    # connection.cancel() sends its break in-band AFTER the call's reply arrives
+    # (no out-of-band support is advertised), then waits. The thin loop dropped
+    # every marker into its "not DATA, ignore it" branch, so the client waited
+    # forever (#844). A real 23ai answers the episode like this:
+    #
+    #     client -> MARKER 01 00 03   interrupt
+    #     client -> MARKER 01 00 02   reset
+    #     server -> MARKER 01 00 02   reset
+    #     server -> DATA   OER        ORA-01013
+    from seerdb.common.tns_consts import TNS_MARKER, TNS_MARKER_TYPE_RESET
+    from seerdb.server.session import _answer_marker
+
+    class _FakeStream:
+        def __init__(self) -> None:
+            self.sent: list[tuple[int, bytes]] = []
+
+        def write_packet(self, packet_type: int, body: bytes) -> None:
+            self.sent.append((packet_type, body))
+
+    stream: Any = _FakeStream()
+
+    # The interrupt opens the episode and draws a reset -- not an error yet.
+    _answer_marker(stream, bytes([1, 0, 3]))
+    assert stream.sent == [(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))]
+
+    # The client's own reset closes it, and only then is the cancel reported --
+    # which is what the client is waiting to read.
+    _answer_marker(stream, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
+    packet_type, body = stream.sent[-1]
+    assert packet_type == TNS_DATA
+    assert b'ORA-01013' in body
+    assert b'User requested cancel of current operation.' in body
+    # Exactly one reset for the whole episode: echoing each marker would
+    # ping-pong the two sides into a reset storm.
+    assert sum(1 for t, _ in stream.sent if t == TNS_MARKER) == 1
