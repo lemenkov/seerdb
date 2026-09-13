@@ -41,6 +41,19 @@ class DataError(DatabaseError):
     pass
 
 
+class Truncated(DataError):
+    """A field needs more bytes than the buffer holds (#849).
+
+    Raised by the codec primitives instead of letting a slice run past the end,
+    which in Python silently returns fewer bytes and so produces a wrong value
+    rather than an error. A message that spans TNS packets arrives in pieces, and
+    this is how a reader tells "incomplete, read on" from "complete".
+
+    A DataError, so callers that already treat a truncated field as bad data keep
+    doing so; not an IndexError, which some decoders catch and would swallow.
+    """
+
+
 class OperationalError(DatabaseError):
     pass
 
