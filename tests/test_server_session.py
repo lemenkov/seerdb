@@ -25,6 +25,7 @@ from seerdb.common.tns_consts import (
     TNS_DATA,
     TNS_TYPE_VARCHAR,
     TTI_FUN,
+    TTI_MSG_TYPE_PIGGYBACK,
     VERSION_11_2_0_2,
     VERSION_12_1_0_2,
     VERSION_12_2_0_1,
@@ -1464,6 +1465,63 @@ def test_unimplemented_ttc_function_is_refused_not_ignored() -> None:
         assert received is not False, 'the Mirror answered nothing -- it hung'
         assert b'ORA-03115' in received[1]
         # ... and the session is still usable, exactly as after any other error.
+        cursor = conn.cursor()
+        cursor.execute('select * from dual')
+        row = cursor.fetchone()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        server.join(timeout=5)
+        listen.close()
+
+    assert row == ('X',)
+
+
+def test_unhandled_piggyback_is_refused_not_dropped() -> None:
+    # The sibling of the test above (#836). _skip_piggybacks stops on a piggyback
+    # it does not know rather than guess its length -- guessing would desync the
+    # stream -- which left the dispatch unable to reach the call behind it. The
+    # message was then dropped silently and the client blocked forever, because a
+    # piggyback is only a PREFIX to a real call whose reply is already awaited.
+    #
+    # Refusing keeps the stream in sync, so the session answers the next
+    # statement normally. (A real client that set a connection attribute will
+    # re-send the same piggyback on every call, so ITS connection stays unusable
+    # until the piggyback is implemented -- but that is the client holding a
+    # pending attribute, not a desync here.)
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    port = listen.getsockname()[1]
+
+    result: dict = {}
+    server = threading.Thread(
+        target=_run_mirror_session, args=(listen, result), daemon=True
+    )
+    server.start()
+
+    conn = seerdb.connect(
+        host='127.0.0.1',
+        port=port,
+        user='PYO',
+        password='pyo123',
+        service_name='XE',
+        timeout=5000,
+    )
+    try:
+        # A SET_SCHEMA (152) piggyback, the shape a real client sends after
+        # `connection.current_schema = ...`, with no handler behind it.
+        conn.send(TNS_DATA, bytes([TTI_MSG_TYPE_PIGGYBACK, 152]) + bytes(8))
+        received = conn._next_data_packet()
+        assert received is not False, 'the Mirror answered nothing -- it hung'
+        assert b'ORA-03115' in received[1]
+        # The refusal names the piggyback, so the gap is identifiable from the
+        # error alone rather than needing a packet capture.
+        assert b'piggyback 152' in received[1]
+        # The stream is still in sync: an ordinary statement runs.
         cursor = conn.cursor()
         cursor.execute('select * from dual')
         row = cursor.fetchone()

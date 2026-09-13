@@ -530,6 +530,46 @@ def _isolated(call: Callable[..., _T], *args: object, **kwargs: object) -> _T:
     return contextvars.copy_context().run(call, *args, **kwargs)
 
 
+def _unreachable_call(body: bytes) -> str:
+    """Name what stopped the dispatch, for the refusal message.
+
+    Worth the specificity: "piggyback 152" points straight at
+    ``TNS_FUNC_SET_SCHEMA`` and a missing handler, where a generic "bad message"
+    would send a reader looking at the framing instead.
+    """
+    if len(body) >= 2 and body[0] == TTI_MSG_TYPE_PIGGYBACK:
+        return f'piggyback {body[1]}'
+    if not body:
+        return 'an empty message'
+    return f'message type {body[0]}'
+
+
+def _refuse_unhandled(stream: PacketStream, what: str) -> None:
+    """Answer a call the Mirror cannot serve, instead of going quiet.
+
+    Answering is not optional. The client has sent a call and is blocked reading
+    its reply, so returning to the read loop leaves it waiting for something that
+    never arrives -- for as long as it is willing to wait, which for an ordinary
+    client is forever. A real server always answers, even when the answer is a
+    refusal.
+
+    The cost of not doing this was not one hung call but an unusable conformance
+    run: every gap presented as an indefinite stall instead of a failure, so the
+    suite could not reach the next test (#832, #836). ORA-03115 is the error a
+    client already understands as "this server will not do that", and it leaves
+    the session usable so the following statements still run.
+    """
+    logger.info('unhandled %s; refusing', what)
+    stream.write_packet(
+        TNS_DATA,
+        encode_error(
+            _ORA_UNSUPPORTED_CALL,
+            f'ORA-{_ORA_UNSUPPORTED_CALL:05d}: unsupported network datatype or '
+            f'representation ({what})',
+        ),
+    )
+
+
 # ORA-03115 is what a client already reads as "this server will not do that".
 # Used for a TTC function the Mirror does not implement, so the call is refused
 # rather than left unanswered (#832).
@@ -620,6 +660,14 @@ def serve_session(
             continue
         body = _skip_piggybacks(body, backend)  # CLOSE_CURSORS, tracing, …
         if len(body) < 2 or body[0] != TTI_FUN:
+            # Piggyback processing could not reach a call. That is what happens
+            # when the message leads with a piggyback the Mirror does not know:
+            # _skip_piggybacks stops rather than guess its length (guessing would
+            # desync the stream), so the call sitting behind it stays out of
+            # reach. Leaving the message unparsed is right; dropping it without a
+            # word is not -- the piggyback is only a PREFIX to a real call, and
+            # the client is already blocked reading that call's reply (#836).
+            _refuse_unhandled(stream, _unreachable_call(body))
             continue
         if body[1] == TTI_ALL8:
             # A cached-cursor re-execute (cursor set, no SQL) omits the OACs; hand
@@ -666,28 +714,8 @@ def serve_session(
         elif body[1] == TTI_LOGOFF:
             return user
         else:
-            # A TTC function the Mirror does not implement. Answering is not
-            # optional: the client has sent a call and is blocked reading its
-            # reply, so falling through to the next read_packet() leaves it
-            # waiting for something that never arrives -- for as long as it is
-            # willing to wait, which for an ordinary client is forever. A real
-            # server always answers, even when the answer is a refusal.
-            #
-            # The cost of not doing this was not one hung call but an unusable
-            # conformance run: every gap presented as an indefinite stall
-            # instead of a failure, so the suite could not reach the next test
-            # (#832). ORA-03115 is the error a client already understands as
-            # "this server will not do that", and it leaves the session usable
-            # so the following statements still run.
-            logger.info('unimplemented TTC function %s; refusing', body[1])
-            stream.write_packet(
-                TNS_DATA,
-                encode_error(
-                    _ORA_UNSUPPORTED_CALL,
-                    f'ORA-{_ORA_UNSUPPORTED_CALL:05d}: unsupported network '
-                    f'datatype or representation (TTC function {body[1]})',
-                ),
-            )
+            # A TTC function the Mirror does not implement (#832).
+            _refuse_unhandled(stream, f'TTC function {body[1]}')
 
 
 def _serve_oci_session(
