@@ -1729,9 +1729,10 @@ def _answer_query(
             # order for the loop to drain (#413).
             lobs = oci_lob_contents(result.columns, rows)
             # Send the first `fetch` rows now; park any remainder on a cursor for
-            # the client's follow-up TTI_FETCH calls. A non-positive fetch (or a
-            # result that fits) is delivered whole, ending with ORA-01403.
-            batch_size = request.fetch if request.fetch > 0 else len(rows)
+            # the client's follow-up TTI_FETCH calls. A result that fits is
+            # delivered whole, ending with ORA-01403; a zero prefetch sends none
+            # of it inline (#856).
+            batch_size = _prefetch_batch(request.fetch, len(rows))
             first, remaining = rows[:batch_size], rows[batch_size:]
             if remaining:
                 cursor_id = cursors.open(
@@ -1823,7 +1824,7 @@ def _answer_scroll(
     columns = result.columns
     rows = list(result.rows)
     cursor_id = cursors.open_scroll(columns, rows)
-    size = request.fetch if request.fetch > 0 else len(rows)
+    size = _prefetch_batch(request.fetch, len(rows))
     batch = rows[:size]
     last_abs = len(batch)
     stream.write_packet(
@@ -1885,7 +1886,7 @@ def _answer_reexecute(
     # The request's iteration count is the client's prefetch size, so it is also
     # the batch size. Anything past it is parked on the SAME cursor id the client
     # already holds, so its follow-up fetches address the statement it just ran.
-    batch_size = request.fetch if request.fetch > 0 else len(rows)
+    batch_size = _prefetch_batch(request.fetch, len(rows))
     first, remaining = rows[:batch_size], rows[batch_size:]
     cursors.reopen(request.cursor, columns, remaining, sql=sql)
     stream.write_packet(
@@ -1968,6 +1969,25 @@ def _answer_reexecute_binds(
     cursors.reopen(request.cursor, columns, all_rows, sql=sql)
     stream.write_packet(TNS_DATA, encode_status(0, cursor_id=request.cursor))
     return oci_lob_contents(columns, all_rows) if columns else []
+
+
+def _prefetch_batch(fetch: int, total: int) -> int:
+    """How many of ``total`` rows an EXECUTE reply carries inline (#856).
+
+    The execute's fetch field is the client's **prefetch**, and a zero there
+    means "send me no rows on the execute" -- the client has allocated no fetch
+    buffer and will ask with ``TTI_FETCH`` -- not "send everything". Reading it
+    the other way overruns the client's define array: the reference thin client
+    dies inside its own row decoder (an ``IndexError`` in ``_process_row_data``)
+    before it can turn the reply into an error anyone can read. A real 23ai
+    answers a prefetch-0 execute with describe + status and no row data at all
+    (captured: 149 bytes, not one ``TTI_RXD`` token in them).
+
+    This is the *execute* rule only. A ``TTI_FETCH``, and a scroll that
+    repositions, ask for rows now rather than declaring a prefetch, so a zero
+    there keeps meaning "as many as there are".
+    """
+    return total if fetch < 0 else min(fetch, total)
 
 
 def _answer_fetch(

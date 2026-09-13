@@ -1323,6 +1323,22 @@ matters even for a moderately large result set: the client's row decoder recurse
 once per row within a single response, so inlining thousands of rows would exhaust
 the recursion limit — fetch-sized batches keep each response shallow.
 
+**A zero prefetch means no rows on the execute** (#856). The execute's `fetch`
+field is the client's prefetch, and a zero is a real value with its own meaning:
+*send none of the result inline, I will ask for it*. It is not "no limit". A
+client that turns prefetching off (`prefetchrows = 0`) allocates no fetch buffer
+on the execute, so rows sent anyway are written past the end of its define
+array — the reference thin client dies inside its own row decoder with an
+`IndexError` in `_process_row_data`, before the reply can become an error anyone
+can read. Captured off a live 23ai, a prefetch-0 `SELECT` execute answers with
+**describe + status and not one `TTI_RXD` token** (149 bytes), the whole result
+waiting on the cursor for the following `TTI_FETCH`. The Mirror applies the rule
+in `_prefetch_batch` at the three places a prefetch governs an execute reply:
+the ordinary query, the scrollable open, and `REEXECUTE_AND_FETCH`. A
+`TTI_FETCH` and a scroll *reposition* are the other kind of request — they ask
+for rows now rather than declaring a prefetch — so a zero there still means "as
+many as there are".
+
 **Temporal values are width-fixed by the column type, not the value.** The
 client-side encoder (§10.3) is value-driven — it picks 7/11/13 bytes from
 whether a `datetime` carries sub-second or zone parts — but a *column* must emit
