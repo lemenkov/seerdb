@@ -5494,25 +5494,32 @@ def _oci_outbind_tail(sequence: int) -> bytes:
     return _OCI_STATUS_FRAME_PREFIX + bytes(oer)
 
 
-def _oci_tti_sta(call_status: int, value: int) -> bytes:
+def _oci_tti_sta(call_status: int, sequence: int) -> bytes:
     """A small TTI_STA acknowledgement — a ``TTI_STA`` token, the OER call status
-    (ub4 LE) and a ub2 value (row count / message length), carried from the
-    capture. The commit and logoff acks sqlplus waits for share this shape."""
+    (ub4 LE) and the OER **end-to-end sequence** (ub2 LE): the same free-running
+    per-session server counter the full OER carries at offset 5 (§36), not a row
+    count or a length. The commit and logoff acks sqlplus waits for share this
+    shape."""
     return (
         bytes([TTI_STA])
         + call_status.to_bytes(4, 'little')
-        + value.to_bytes(2, 'little')
+        + sequence.to_bytes(2, 'little')
     )
 
 
-# A live commit reply. sqlplus sends a bare commit before the user's statement;
-# this acknowledges it.
-_OCI_COMMIT_STATUS = _oci_tti_sta(5, 0x12)
+# The TTI_STA call status is the OER's flag word, NOT the OER status byte at
+# offset 1 that OCI_OER_STATUS_SUCCESS / _ERROR name (they share the values 1 and
+# 5 by coincidence). Live 10g and 11g both answer a commit with 5 and a logoff
+# with 1; never gate behaviour on it (see the flag-word note in §36.1).
+_OCI_STA_CALL_STATUS_COMMIT = 5
+_OCI_STA_CALL_STATUS_LOGOFF = 1
 
 
 # sqlplus waits for this ack of its logoff before closing; without it the client
-# sees an abrupt EOF and reports ORA-03113 on exit.
-_OCI_LOGOFF_STATUS = _oci_tti_sta(1, 0)
+# sees an abrupt EOF and reports ORA-03113 on exit. It is the one OCI reply that
+# does NOT carry the session counter: a live server sends a literal 0 here, on
+# both 10g and 11g, so this stays a constant (§36.2).
+_OCI_LOGOFF_STATUS = _oci_tti_sta(_OCI_STA_CALL_STATUS_LOGOFF, 0)
 
 
 def _oci_auth_trailer(sequence: int) -> bytes:
@@ -7070,9 +7077,10 @@ def encode_out_bind_response_oci(values: list[object], *, sequence: int) -> byte
     return header + define_markers + rxd + _oci_outbind_tail(sequence)
 
 
-def encode_commit_status_oci() -> bytes:
-    """OCI reply to a bare commit / rollback — a TTI_STA acknowledgement."""
-    return _OCI_COMMIT_STATUS
+def encode_commit_status_oci(sequence: int) -> bytes:
+    """OCI reply to a bare commit / rollback — a TTI_STA acknowledgement carrying
+    the session's OER sequence, like every other reply on this path (§36.2)."""
+    return _oci_tti_sta(_OCI_STA_CALL_STATUS_COMMIT, sequence)
 
 
 def encode_logoff_status_oci() -> bytes:

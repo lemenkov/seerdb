@@ -992,7 +992,7 @@ def _serve_oci_session(
                     )
                 continue
             if body[1] in (TTI_COMMIT, TTI_ROLLBACK):
-                stream.write_packet(TNS_DATA, encode_commit_status_oci())
+                stream.write_packet(TNS_DATA, encode_commit_status_oci(seq.next()))
                 continue
             if body[1] == TTI_AUTH:
                 # A post-login TTI_AUTH is a password change: sqlplus's PASSWORD

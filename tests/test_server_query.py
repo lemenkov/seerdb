@@ -1529,7 +1529,28 @@ def test_encode_status_oci_and_commit_shapes() -> None:
 
     status = encode_status_oci(7)
     assert status[:3] == b'\x08\x06\x00' and len(status) == 171
-    assert encode_commit_status_oci()[0] == 0x09  # TTI_STA
+    assert encode_commit_status_oci(7)[0] == 0x09  # TTI_STA
+
+
+def test_encode_commit_status_oci_carries_the_session_sequence() -> None:
+    # The trailing ub2 is the OER end-to-end sequence, the same free-running
+    # counter every other reply on this path carries — not a frozen capture
+    # value (#883). Live 11g answered 7 where its neighbouring OERs were 5 and
+    # 8; live 10g answered 6 in the same position one sequence lower.
+    from seerdb.common.tns import encode_commit_status_oci
+
+    assert encode_commit_status_oci(7) == bytes.fromhex('09050000000700')
+    assert encode_commit_status_oci(6) == bytes.fromhex('09050000000600')
+    # It moves with the counter rather than repeating one number.
+    assert encode_commit_status_oci(4) != encode_commit_status_oci(5)
+
+
+def test_encode_logoff_status_oci_stays_a_zero_sequence() -> None:
+    # The one OCI reply a live server does NOT put its counter in: both 10g and
+    # 11g send a literal 0 there, on every captured session (#883).
+    from seerdb.common.tns import encode_logoff_status_oci
+
+    assert encode_logoff_status_oci() == bytes.fromhex('09010000000000')
 
 
 def test_encode_long_value_oci_matches_the_captured_wire() -> None:
