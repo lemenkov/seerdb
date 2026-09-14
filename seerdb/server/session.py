@@ -27,7 +27,11 @@ from typing import NoReturn, TypeVar
 
 from seerdb.common.crypto import decrypt_password
 from seerdb.common.exceptions import InterfaceError, Truncated
-from seerdb.common.oci import OCI_CMD_COMMIT, OCI_CMD_ROLLBACK
+from seerdb.common.oci import (
+    OCI_CMD_COMMIT,
+    OCI_CMD_ROLLBACK,
+    strip_oci_e2e_piggyback,
+)
 from seerdb.common.tns import (
     _DECODE_FIELD_VERSION,
     _ENCODE_FIELD_VERSION,
@@ -582,6 +586,33 @@ def _refuse_unhandled(stream: PacketStream, what: str) -> None:
 _ORA_UNSUPPORTED_CALL = 3115
 
 
+# The OCI end-to-end tracing piggyback (func 135) modern sqlplus sends after
+# login. Its own message prefix, unlike the OCCA / TTI_80SES wrappers that
+# strip_oci_piggyback already unwraps (#825).
+_OCI_PIGGYBACK_E2E = bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_SET_END_TO_END_ATTR])
+
+
+def _refuse_unhandled_oci(stream: PacketStream, what: str, seq: _OciSequence) -> None:
+    """Refuse a thick/OCI call the Mirror cannot serve, keeping the session.
+
+    The OCI counterpart of :func:`_refuse_unhandled`. The loop used to `return`
+    here, which closes the connection: sqlplus renders that as ORA-03113 /
+    ORA-03114 for every statement afterwards, indistinguishable from the server
+    crashing, and one unimplemented call takes the whole session with it. An
+    ORA-03115 in the dialect's own OER envelope leaves the connection intact.
+    """
+    logger.info('OCI: unhandled %s; refusing', what)
+    stream.write_packet(
+        TNS_DATA,
+        encode_error_oci(
+            _ORA_UNSUPPORTED_CALL,
+            f'ORA-{_ORA_UNSUPPORTED_CALL:05d}: unsupported network datatype or '
+            f'representation ({what})',
+            sequence=seq.next(),
+        ),
+    )
+
+
 def serve_session(
     stream: PacketStream,
     backend: Backend,
@@ -804,6 +835,20 @@ def _serve_oci_session(
         # Every statement past the first arrives wrapped in an OCCA close-cursors
         # piggyback; unwrap it to reach the execute.
         body = strip_oci_piggyback(body)
+        if body[:2] == _OCI_PIGGYBACK_E2E:
+            # Modern sqlplus sends its end-to-end tracing attributes as a
+            # piggyback right after login, and it is a PREFIX: a real call
+            # follows in the same message. The thin loop walks its piggybacks;
+            # this one never did, so the message fell through to the refusal at
+            # the bottom -- which used to CLOSE the session, so sqlplus reported
+            # ORA-03114 for every statement afterwards (#825).
+            #
+            # The walker checks its own landing and returns None rather than
+            # guess, so a shape it does not know becomes a clean refusal instead
+            # of a desynchronised stream.
+            behind = strip_oci_e2e_piggyback(body)
+            if behind is not None:
+                body = behind
         if len(body) >= 2 and body[0] == TTI_FUN:
             if body[1] == TTI_ALL8:
                 if parked is not None and is_reexecute_oci(body):
@@ -890,8 +935,14 @@ def _serve_oci_session(
             if body[1] == TTI_LOGOFF:
                 stream.write_packet(TNS_DATA, encode_logoff_status_oci())
                 return user
-        logger.info('OCI: unhandled call ttc=%s; ending session', body[:2].hex())
-        return user
+        # An OCI call the Mirror cannot serve is REFUSED, not answered by
+        # hanging up. Closing the connection is what a client reads as
+        # ORA-03113/03114 -- indistinguishable from a crash, and it takes the
+        # whole session down for one unimplemented call. The thin loop was
+        # taught this in #832/#836; the OCI loop keeps the session usable the
+        # same way, so the statements after the gap still run.
+        _refuse_unhandled_oci(stream, f'OCI call {body[:2].hex()}', seq)
+        continue
 
 
 _OCI_DML_KEYWORDS = ('INSERT', 'UPDATE', 'DELETE', 'MERGE')
