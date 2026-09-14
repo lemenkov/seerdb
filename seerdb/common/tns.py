@@ -6,7 +6,7 @@ import datetime
 import platform
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 if TYPE_CHECKING:
     from seerdb.common.ano_session import AnoChannel
@@ -6073,36 +6073,53 @@ _OCI_ALL8_SQL_OFF = 196  # SQL text; the ub1 length prefix is the byte before it
 
 # The OALL8 preamble comes in two widths, and which one a client sends is fixed
 # for the life of its connection (#866). Between the 8-byte pointer indicators
-# sit scalar length slots that an older sqlplus writes as ub8 and a modern one
-# (23.26 measured) writes as ub4 — five such slots, so the modern preamble is 20
-# bytes shorter and every offset behind the indicator at 11 moves with it. The
-# indicators themselves stay 8 bytes wide in both, which is what makes the two
-# forms tellable apart: the second one sits at 27 in the wide form and at 23 in
-# the narrow one, and those two cannot both hold (the pattern starts with 0xFE
-# and continues 0xFF, so an indicator at 23 puts 0xFF at 27). Detect it from the
-# wire rather than assume a width -- reading a narrow execute with the wide
-# offsets lands 20 bytes past the SQL length prefix and yields garbage.
+# sit scalar slots that an older sqlplus writes as ub8 and a modern one (23.26
+# measured) writes as ub4. Five slots shrink by 4 bytes each, so the narrow
+# preamble is 20 bytes shorter overall — but they are spread through the header,
+# so each field behind them moves by a DIFFERENT amount (the running total of the
+# slots ahead of it), not by one global shift:
+#
+#     field                 wide   narrow
+#     cursor id (ub4)          7        7   (ahead of every shrinking slot)
+#     3x SQL byte length      19       19
+#     second indicator        27       23
+#     bind count (ub4)        83       71
+#     SQL text               196      176
+#
+# The indicators themselves stay 8 bytes wide in both, which is what makes the
+# two forms tellable apart: the second one sits at 27 in the wide form and at 23
+# in the narrow, and those two cannot both hold (the pattern starts with 0xFE and
+# continues 0xFF, so an indicator at 23 puts 0xFF at 27). Detect the width from
+# the wire rather than assume one: reading a narrow execute with the wide offsets
+# lands 20 bytes past the SQL length prefix and reads the bind count off an
+# indicator (0xFFFFFFFE) instead of the header.
 _OCI_ALL8_IND2_OFF = 27  # second indicator, wide preamble
-_OCI_ALL8_IND2_OFF_NARROW = 23  # ... and narrow: one ub8 slot ahead of it shrank
-_OCI_ALL8_NARROW_SHIFT = 20  # how much the narrow preamble pulls everything in
+_OCI_ALL8_IND2_OFF_NARROW = 23  # ... and narrow: one shrinking slot sits ahead
 
 
-def _oci_all8_shift(payload: bytes) -> int:
-    """How far the whole OALL8 preamble in ``payload`` is pulled in from the wide
-    form (0 = wide, :data:`_OCI_ALL8_NARROW_SHIFT` = narrow). Raises
-    :class:`InterfaceError` when neither shape holds, so a differently-shaped
-    message errors rather than yielding a garbage SQL.
+class _OciAll8Layout(NamedTuple):
+    """Where the width-dependent OALL8 header fields sit in one preamble form."""
 
-    Only one of the five shrinking slots sits ahead of the second indicator, so
-    that indicator moves by 4 while the SQL behind it moves by the full 20."""
+    sql: int  # SQL text; the ub1 length prefix is the byte before it
+    bind_count: int  # ub4 LE number of binds
+
+
+_OCI_ALL8_WIDE = _OciAll8Layout(sql=_OCI_ALL8_SQL_OFF, bind_count=83)
+_OCI_ALL8_NARROW = _OciAll8Layout(sql=176, bind_count=71)
+
+
+def _oci_all8_layout(payload: bytes) -> _OciAll8Layout:
+    """Which OALL8 preamble width ``payload`` carries, as the offsets that depend
+    on it. Raises :class:`InterfaceError` when neither shape holds, so a
+    differently-shaped message errors rather than yielding a garbage SQL."""
     if payload[_OCI_ALL8_IND_OFF : _OCI_ALL8_IND_OFF + 8] != oci.OCI_INDICATOR:
         raise InterfaceError(f'OCI OALL8: no indicator at offset {_OCI_ALL8_IND_OFF}')
-    for ind2, shift in (
-        (_OCI_ALL8_IND2_OFF, 0),
-        (_OCI_ALL8_IND2_OFF_NARROW, _OCI_ALL8_NARROW_SHIFT),
+    for ind2, layout in (
+        (_OCI_ALL8_IND2_OFF, _OCI_ALL8_WIDE),
+        (_OCI_ALL8_IND2_OFF_NARROW, _OCI_ALL8_NARROW),
     ):
         if payload[ind2 : ind2 + 8] == oci.OCI_INDICATOR:
-            return shift
+            return layout
     raise InterfaceError(f'OCI OALL8: no indicator at offset {_OCI_ALL8_IND2_OFF}')
 
 
@@ -6111,7 +6128,7 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
 
     The OCI counterpart of :func:`parse_exec`. Extracts the SQL text and cursor
     id from the fixed-shape OCI header, in either preamble width (see
-    :func:`_oci_all8_shift`). Scope: a single statement with no binds and SQL up
+    :func:`_oci_all8_layout`). Scope: a single statement with no binds and SQL up
     to 253 bytes (the ub1 length prefix) — binds and chunked/long SQL are a
     follow-up, gated by the length cross-check below. Raises
     :class:`InterfaceError` if the message is not an OCI OALL8 in that shape.
@@ -6120,9 +6137,9 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
         raise InterfaceError('not an OCI OALL8 execute')
     # Validate the indicators where the thin form has 0x01 flags, so a
     # differently-shaped message errors rather than yielding a garbage SQL.
-    shift = _oci_all8_shift(payload)
-    sql_off = _OCI_ALL8_SQL_OFF - shift
-    bind_count_off = _OCI_BIND_COUNT_OFF - shift
+    layout = _oci_all8_layout(payload)
+    sql_off = layout.sql
+    bind_count_off = layout.bind_count
     if len(payload) < sql_off:
         raise InterfaceError('not an OCI OALL8 execute')
     cursor = int.from_bytes(
@@ -6165,11 +6182,13 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
     )
 
 
-# The bind count sits at this fixed ub4 in the OCI OALL8 header. After the SQL
-# come an option array, one OAC type-descriptor per bind (each led by
+# The bind count sits at a fixed ub4 in the OCI OALL8 header, at whichever offset
+# the preamble width puts it (:class:`_OciAll8Layout`). After the SQL come an
+# option array, one OAC type-descriptor per bind (each led by
 # ``01 <TNS type> 03 00 00``), and an RXD row (``0x07`` + one DALC value per
-# bind) — the same value framing the thin form uses (#265, #347).
-_OCI_BIND_COUNT_OFF = 83
+# bind) — the same value framing the thin form uses (#265, #347). That bind
+# section is read by scanning from the end of the SQL, so it needs no offset of
+# its own and is the same in both widths.
 
 
 _OCI_OAC_MARKER = re.compile(rb'\x01(.)\x03\x00\x00')

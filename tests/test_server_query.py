@@ -1089,6 +1089,32 @@ def test_parse_exec_oci_narrow_preamble_strips_the_internal_query_nul() -> None:
     assert '\x00' not in req.sql
 
 
+# The same `EXEC :n := 42` PL/SQL block from sqlplus 23.26. The shrinking slots
+# are spread through the header, so the bind count moves by 12 where the SQL
+# moves by 20 — read with one global shift it came back as 0xFFFFFFFE (an
+# indicator) and sqlplus PRINT reported ORA-01008 (#866).
+_OCI_EXEC_OUT_BIND_NARROW = bytes.fromhex(
+    '035e042904040000000000feffffffffffffff3c000000feffffffffffffff0d000000'
+    'fefffffffffffffffeffffffffffffff000000000100000000000000feffffffffffff'
+    'ff010000000000000000000000feffffffffffffff0000000000000000feffffffffff'
+    'fffffefffffffffffffffeffffffffffffff0000000000000000fefffffffffffffffe'
+    'ffffffffffffff00000000000000000000000000000000000000000000000000000000'
+    '14626567696e203a6e203a3d2034323b20656e643b0100000001000000000000000000'
+    '0000000000000000000000000000080000000000000000800000000000000000000000'
+    '0000000102030000160000000000000000000000000000000000000000000000000000'
+    '00000000000000000007fd01'
+)
+
+
+def test_parse_exec_oci_narrow_preamble_reads_the_bind_count() -> None:
+    req = parse_exec_oci(_OCI_EXEC_OUT_BIND_NARROW)
+    assert req.sql == 'begin :n := 42; end;'
+    assert req.bind_count == 1
+    # The OUT bind rides as the `fd 01` absent-value marker, typed by its OAC.
+    assert req.binds == [None]
+    assert req.bind_meta == [(TNS_TYPE_NUMBER, 22)]
+
+
 def test_parse_exec_oci_rejects_an_unknown_preamble_width() -> None:
     # Neither indicator position holds — refuse rather than read a garbage SQL
     # from whichever offset happens to be in range.
