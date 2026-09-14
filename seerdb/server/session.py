@@ -32,11 +32,13 @@ from seerdb.common.oci import (
     OCI_CMD_ROLLBACK,
     strip_oci_e2e_piggyback,
 )
+from seerdb.common.sqltext import is_reusable_dml
 from seerdb.common.tns import (
     _DECODE_FIELD_VERSION,
     _ENCODE_FIELD_VERSION,
     _ENCODE_OCI_CALL_SEQ,
     _ENCODE_OER_SEQ,
+    _ENCODE_TXN_IN_PROGRESS,
     _SERVER_RUNTIME_CAPS,
     ArrayOutBind,
     ColumnMeta,
@@ -1066,6 +1068,26 @@ def _serve_oci_long_row(
     return (columns, rows[1:]) if len(rows) > 1 else None
 
 
+def _mark_transaction(sql: str, autocommit: bool) -> None:
+    """Record whether this statement left an uncommitted transaction open (#889).
+
+    The OER's call_status flag word carries TXN_IN_PROGRESS, and a client reads
+    it to decide whether releasing the connection to a pool (or closing it) owes
+    a rollback. python-oracledb skips its rollback when the bit is clear, so a
+    Mirror that never sets it leaves the DML holding its TM lock until the
+    session dies — which is what blocked later statements with ORA-00054 across
+    unrelated features.
+
+    DML and PL/SQL open a transaction; autocommit closes it again straight away,
+    as does an explicit commit / rollback. DDL commits implicitly. A query
+    changes nothing, so it leaves the flag alone.
+    """
+    if autocommit:
+        _ENCODE_TXN_IN_PROGRESS.set(False)
+    elif is_reusable_dml(sql) or _is_plsql_block(sql):
+        _ENCODE_TXN_IN_PROGRESS.set(True)
+
+
 def _oci_no_row_status(sql: str, rowcount: int, seq: '_OciSequence') -> bytes:
     # Pick the OCI success reply for a statement that returned no columns, so
     # sqlplus renders the right message (#348 / #349): DML carries the affected row
@@ -1820,6 +1842,7 @@ def _answer_query(
             result = _run_returning(backend, sql, request)
             if request.autocommit:
                 backend.commit()
+            _mark_transaction(sql, request.autocommit)
             stream.write_packet(
                 TNS_DATA,
                 encode_returning_response(
@@ -1882,6 +1905,7 @@ def _answer_query(
         # leaves the bit clear and drives commit/rollback itself).
         if request.autocommit:
             backend.commit()
+        _mark_transaction(sql, request.autocommit)
         # Build the reply inside the same guard: encoding the result must honour
         # the never-desync contract too. A value the wire can't carry (e.g. a
         # backend that hands back a type the encoder has no branch for) raises
@@ -1992,6 +2016,7 @@ def _answer_scroll(
         result = backend.execute(request.sql, request.binds)
         if request.autocommit:
             backend.commit()
+        _mark_transaction(request.sql, request.autocommit)
     except BackendError as err:
         logger.info('scrollable query refused: %s', err.ora_message)
         stream.write_packet(
@@ -2311,6 +2336,7 @@ def _answer_txn(stream: PacketStream, backend: Backend, *, commit: bool) -> None
             backend.commit()
         else:
             backend.rollback()
+        _ENCODE_TXN_IN_PROGRESS.set(False)
     except BackendError as err:
         response = encode_error(err.ora_code, err.ora_message)
     except Exception as exc:

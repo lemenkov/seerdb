@@ -135,6 +135,13 @@ TNS_SESSION_STATE_EXPLICIT_BOUNDARY = 0x40
 CCAP_TTC4_EXPLICIT_BOUNDARY = 0x40
 RCAP_TTC_SESSION_STATE_OPS = 0x10
 
+# The OER's call_status is a flag word, not a result code (§6.5). This is the bit
+# a server sets while the session has an uncommitted transaction, and a client
+# reads it to decide whether releasing or closing the connection owes a rollback.
+# A server that never sets it tells every client there is nothing to roll back,
+# so the transaction (and its locks) outlive the connection (#889).
+TNS_EOCS_FLAGS_TXN_IN_PROGRESS = 0x02
+
 TNS_ATTENTION = 13
 TNS_CONTROL = 14
 TNS_MAX = 19
