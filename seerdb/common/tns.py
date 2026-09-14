@@ -1042,6 +1042,13 @@ _DESCRIBE_WIRE_LENGTH = {
     # the client the column sends no bytes at all, and it then reads the value's
     # byte as the next column's type (#740).
     TNS_TYPE_BOOLEAN: 1,
+    # 23ai describes a VECTOR column with length 8200, whatever the vector's
+    # dimension or element format (measured: `02 20 08` in the describe of a
+    # 3-element float32 column). Same failure mode as BOOLEAN above and the same
+    # cost: with 0 here the reference client builds a fetch variable that reads
+    # no bytes, consumes nothing from the row, and takes the following byte for
+    # a message type (#887).
+    TNS_TYPE_VECTOR: 8200,
 }
 
 
@@ -1282,10 +1289,21 @@ def encode_rows(
         if len(row) != len(columns):
             raise InterfaceError('row width does not match the column count')
         body += bytes([TTI_RXD]) + b''.join(
-            encode_value(_national_wire_value(v, col), col.data_type)
-            for v, col in zip(row, columns)
+            _thin_column_value(v, col) for v, col in zip(row, columns)
         )
     return header + bytes(body)
+
+
+def _thin_column_value(value: object, col: 'ColumnMeta') -> bytes:
+    # One row value for the thin path. A VECTOR carries its image inline (#887);
+    # everything else goes through the type-only encoder. The column is needed
+    # for the element format, so an INT8 or FLOAT64 vector keeps the width it was
+    # declared with rather than being re-encoded as float32.
+    if col.data_type == TNS_TYPE_VECTOR and value is not None:
+        return encode_vector_value_thin(
+            encode_vector(_vector_as(value, col.vector_format))
+        )
+    return encode_value(_national_wire_value(value, col), col.data_type)
 
 
 def encode_error(ora_code: int, message: str, error_pos: int | None = None) -> bytes:
@@ -3265,7 +3283,9 @@ def _decode_rxd_step(Data: bytes, Acc: tuple) -> tuple:
                 continue
             DataType = Col.get('data_type')
             if DataType in _LOB_DATA_TYPES:
-                (Locator, Rest) = _read_lob_column(Rest)
+                (Locator, Rest) = _read_lob_column(
+                    Rest, inline_image=DataType == TNS_TYPE_VECTOR
+                )
                 Row.append(None if Locator is None else LOB(DataType, Locator))
                 continue
             if DataType in _ROWID_DATA_TYPES:
@@ -3316,7 +3336,9 @@ def decode_token_rxd(Data: bytes, Acc: tuple) -> tuple:
     return decode_packet(Rest, NewAcc)
 
 
-def _read_lob_column(Rest: bytes) -> tuple[bytes | None, bytes]:
+def _read_lob_column(
+    Rest: bytes, *, inline_image: bool = False
+) -> tuple[bytes | None, bytes]:
     # LOB column layout in RXD (Oracle 11g):
     #
     #   ub1 0x00              → NULL LOB; total column size = 1 byte.
@@ -3360,6 +3382,14 @@ def _read_lob_column(Rest: bytes) -> tuple[bytes | None, bytes]:
         (_Size, Body) = decode_ub4(Body)
         (_ChunkSize, Body) = decode_ub4(Body)
     (Locator, Tail) = decode_dalc(Body)
+    if inline_image and Tail[:1] and Tail[0] == NumBytes:
+        # A VECTOR column carries its image inline AND the locator behind it
+        # (§ VECTOR value): the first field just read is the image, and the
+        # locator follows as a second DALC whose length is the `num_bytes` at the
+        # front. Consume it, or it is read as the next column's value (#887). The
+        # length check keeps this to the form that actually has two fields --
+        # a server that sends the bare locator alone leaves Tail elsewhere.
+        (_Locator, Tail) = decode_dalc(Tail)
     if isinstance(Locator, list):  # 0x00 / 0xFF DALC → empty / null
         return (None, Tail)
     return (bytes(Locator), Tail)
@@ -7247,7 +7277,7 @@ def encode_lob_read_response_oci(
 
 
 def oci_lob_contents(
-    columns: list[ColumnMeta], rows: list[tuple]
+    columns: list[ColumnMeta], rows: list[tuple], *, inline_vectors: bool = False
 ) -> list[tuple[bytes, bool]]:
     """The (wire-content, is_clob) of each non-NULL LOB cell, row-major (#405).
 
@@ -7262,6 +7292,12 @@ def oci_lob_contents(
     for row in rows:
         for value, col in zip(row, columns):
             if col.data_type not in _LOB_CONTENT_TYPES or value is None:
+                continue
+            if inline_vectors and col.data_type == TNS_TYPE_VECTOR:
+                # The thin path carries a VECTOR's image in the row itself, so it
+                # queues no content: a client that already has the value issues no
+                # TTI_LOBOPS for it, and an entry here would shift every later
+                # LOB's position in the queue (#887).
                 continue
             if col.data_type == TNS_TYPE_CLOB:
                 out.append((str(value).encode('utf-16-be'), True))
@@ -9946,6 +9982,36 @@ def _lob_value_size(Value: object) -> int:
     if isinstance(Value, (bytes, bytearray, memoryview)):
         return len(bytes(Value))
     return 0
+
+
+# The chunk size a live 23ai reports alongside a VECTOR column, measured
+# identical across 3-, 5- and 16-element float32 columns (#887).
+_THIN_VECTOR_CHUNK_SIZE = 32600
+
+
+def encode_vector_value_thin(image: bytes) -> bytes:
+    """The RXD value for a thin VECTOR column: the binary image **inline**,
+    followed by the locator, in the LOB column's metadata framing --
+    ``ub4 locator length | ub8 size | ub4 chunk size | DALC image | DALC
+    locator``. Both length-prefixed fields are there: the reference client reads
+    the image and then reads the locator to discard it, so a reply that stops
+    after the image leaves it consuming the next token as locator bytes.
+
+    A VECTOR does **not** ride as a locator with its content following over
+    TTI_LOBOPS, the way a CLOB or BLOB does. Measured against a live 23ai: after
+    a vector SELECT the reference client issues **no** TTI_LOBOPS call at all --
+    it already has the value. The Mirror used to mint a locator and wait to be
+    asked for the content, so that client read the placeholder locator's bytes as
+    the next token and died with `DPY-5000 ... unknown protocol message type`
+    (#887). seerdb's own client never noticed, because :func:`_read_lob_column`
+    hands the "locator" straight to the vector decoder either way."""
+    return (
+        encode_sb4(len(_THIN_LOB_LOCATOR))
+        + encode_sb4(len(image))
+        + encode_sb4(_THIN_VECTOR_CHUNK_SIZE)
+        + _bytes_with_length(image)
+        + _bytes_with_length(_THIN_LOB_LOCATOR)
+    )
 
 
 def encode_lob_locator_thin(size: int = 0, *, with_metadata: bool = False) -> bytes:

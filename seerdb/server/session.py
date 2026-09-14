@@ -119,8 +119,10 @@ from seerdb.common.tns_consts import (
     TNS_MSG_TYPE_FAST_AUTH,
     TNS_TYPE_BLOB,
     TNS_TYPE_CLOB,
+    TNS_TYPE_JSON,
     TNS_TYPE_LONG,
     TNS_TYPE_LONGRAW,
+    TNS_TYPE_VECTOR,
     TNS_VERSION_MIN_LARGE_SDU,
     TTI_ALL8,
     TTI_AUTH,
@@ -1040,6 +1042,17 @@ def _is_long_result(columns: list[ColumnMeta]) -> bool:
     return any(col.data_type in (TNS_TYPE_LONG, TNS_TYPE_LONGRAW) for col in columns)
 
 
+def _defers_inline_rows(columns: list[ColumnMeta]) -> bool:
+    # True when a result's columns force the rows out of the execute reply and
+    # into a follow-up fetch. A real server does this for any LOB-class column,
+    # and the reference client requires it: on reading such a describe it sets
+    # "requires define / no prefetch" and stops expecting inline rows (#887).
+    return any(
+        col.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB, TNS_TYPE_JSON, TNS_TYPE_VECTOR)
+        for col in columns
+    )
+
+
 def _is_lob_result(columns: list[ColumnMeta]) -> bool:
     # A result that carries a CLOB / BLOB column, whose locator row is fetched with
     # a non-terminator status and whose content follows over TTI_LOBOPS (#405).
@@ -1639,6 +1652,13 @@ class _Cursors:
     def has(self, cursor_id: int) -> bool:
         return cursor_id in self._open
 
+    def columns(self, cursor_id: int) -> list[ColumnMeta]:
+        """The column metadata a parked cursor was opened with, empty if the id
+        is not parked. Read without taking any rows, so a caller can decide how
+        to answer before it commits to draining the cursor (#887)."""
+        state = self._open.get(cursor_id)
+        return state[0] if state is not None else []
+
 
 class _TempLobs:
     # Bytes streamed into each session temp LOB via TTI_LOBOPS WRITE, keyed by the
@@ -1832,8 +1852,39 @@ def _answer_query(
     # below if it is DML.
     reused_id = request.cursor if (request.cursor and not request.sql) else 0
     sql = cursors.dml_sql(request.cursor) if reused_id else request.sql
+    if sql is None and reused_id:
+        # Not a DML cursor -- a QUERY cursor being re-executed. The reference
+        # client does that for a LOB-class result: it reads the describe, marks
+        # the statement "requires define", and re-executes by id with no SQL to
+        # apply the define before any row arrives (#887). Resolve the query the
+        # id stands for, or the empty statement reaches the backend as
+        # ORA-01009.
+        sql = cursors.query_sql(request.cursor)
     if sql is None:
         sql = request.sql
+    if (
+        reused_id
+        and cursors.has(reused_id)
+        and _defers_inline_rows(cursors.columns(reused_id))
+    ):
+        # The define round-trip for a LOB-class result (#887). The first execute
+        # ran the query, sent the describe alone and parked every row; this call
+        # is the client applying its define and asking for those rows. Serve them
+        # from the cursor rather than re-running the statement -- the backend's
+        # own cursor cache answers an identical second execute with no describe
+        # at all, so re-running loses the column metadata the reply needs.
+        count = request.fetch if request.fetch > 0 else _ALL_ROWS
+        columns_out, batch = cursors.take(reused_id, count)
+        stream.write_packet(
+            TNS_DATA,
+            encode_fetch_response(
+                columns_out,
+                batch,
+                cursor_id=reused_id,
+                more=cursors.has(reused_id),
+            ),
+        )
+        return lobs
     try:
         if request.return_binds:
             # DML ... RETURNING col INTO :b (#689). The reply owes one set of
@@ -1940,6 +1991,15 @@ def _answer_query(
             # delivered whole, ending with ORA-01403; a zero prefetch sends none
             # of it inline (#856).
             batch_size = _prefetch_batch(request.fetch, len(rows))
+            if _defers_inline_rows(result.columns):
+                # A result carrying a LOB-class column (CLOB / BLOB / JSON /
+                # VECTOR) delivers NO rows in the execute reply, whatever the
+                # client's prefetch asked for: the reference client marks such a
+                # statement "requires define, no prefetch" the moment it reads
+                # the describe, and then reads whatever follows the describe as
+                # the next message rather than as row data (#887). A live server
+                # does the same -- it defers even a single row this way (§11.9).
+                batch_size = 0
             first, remaining = rows[:batch_size], rows[batch_size:]
             if remaining:
                 cursor_id = cursors.open(
