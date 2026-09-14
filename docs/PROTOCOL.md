@@ -5020,6 +5020,23 @@ category, error_code)`. Here `category` is `2` for a row/value-producing
 statement and `1` for a no-row one — the same offset-`18` field as the envelope,
 so it is carried, not fully pinned.
 
+**The 7-byte `TTI_STA` acks.** A bare commit / rollback and a logoff are answered
+without any OER frame at all, by a 7-byte token: `09 | ub4 LE call status |
+ub2 LE sequence`. That trailing `ub2` is the **same end-to-end sequence** the
+full OER carries at offset `5`, not a row count or a length — a live 11g answers
+`7` there while the OERs on either side of it carry `5` and `8`, and a live 10g
+answers `6` in the same position with its whole call chain one sequence lower.
+So the commit ack takes the session counter like every other reply
+(`encode_commit_status_oci(sequence)`); before #883 it emitted a frozen `0x12`
+carried from one capture, which made a session's replies jump to 18 between a 4
+and a 6.
+
+The **logoff** ack is the one exception: a live server sends a literal `0` there,
+on both 10g and 11g and in every captured session, so `_OCI_LOGOFF_STATUS` stays
+a constant. The `ub4` call status is the OER's flag word (§36.1) — `5` on the
+commit, `1` on the logoff — and **not** the offset-`1` OER status byte, which
+happens to use the same two values for success and error.
+
 ### 36.3 DML execute-status
 
 The DML execute-status reply wraps the OER in a larger status frame: a 35-byte
