@@ -6071,30 +6071,64 @@ _OCI_ALL8_SQLLEN3_OFF = 19  # ub4 LE = 3 x the SQL byte length
 _OCI_ALL8_SQL_OFF = 196  # SQL text; the ub1 length prefix is the byte before it
 
 
+# The OALL8 preamble comes in two widths, and which one a client sends is fixed
+# for the life of its connection (#866). Between the 8-byte pointer indicators
+# sit scalar length slots that an older sqlplus writes as ub8 and a modern one
+# (23.26 measured) writes as ub4 — five such slots, so the modern preamble is 20
+# bytes shorter and every offset behind the indicator at 11 moves with it. The
+# indicators themselves stay 8 bytes wide in both, which is what makes the two
+# forms tellable apart: the second one sits at 27 in the wide form and at 23 in
+# the narrow one, and those two cannot both hold (the pattern starts with 0xFE
+# and continues 0xFF, so an indicator at 23 puts 0xFF at 27). Detect it from the
+# wire rather than assume a width -- reading a narrow execute with the wide
+# offsets lands 20 bytes past the SQL length prefix and yields garbage.
+_OCI_ALL8_IND2_OFF = 27  # second indicator, wide preamble
+_OCI_ALL8_IND2_OFF_NARROW = 23  # ... and narrow: one ub8 slot ahead of it shrank
+_OCI_ALL8_NARROW_SHIFT = 20  # how much the narrow preamble pulls everything in
+
+
+def _oci_all8_shift(payload: bytes) -> int:
+    """How far the whole OALL8 preamble in ``payload`` is pulled in from the wide
+    form (0 = wide, :data:`_OCI_ALL8_NARROW_SHIFT` = narrow). Raises
+    :class:`InterfaceError` when neither shape holds, so a differently-shaped
+    message errors rather than yielding a garbage SQL.
+
+    Only one of the five shrinking slots sits ahead of the second indicator, so
+    that indicator moves by 4 while the SQL behind it moves by the full 20."""
+    if payload[_OCI_ALL8_IND_OFF : _OCI_ALL8_IND_OFF + 8] != oci.OCI_INDICATOR:
+        raise InterfaceError(f'OCI OALL8: no indicator at offset {_OCI_ALL8_IND_OFF}')
+    for ind2, shift in (
+        (_OCI_ALL8_IND2_OFF, 0),
+        (_OCI_ALL8_IND2_OFF_NARROW, _OCI_ALL8_NARROW_SHIFT),
+    ):
+        if payload[ind2 : ind2 + 8] == oci.OCI_INDICATOR:
+            return shift
+    raise InterfaceError(f'OCI OALL8: no indicator at offset {_OCI_ALL8_IND2_OFF}')
+
+
 def parse_exec_oci(payload: bytes) -> ExecRequest:
     """Parse a sqlplus / thick-OCI (deadbeef dialect) OALL8 execute (#265).
 
     The OCI counterpart of :func:`parse_exec`. Extracts the SQL text and cursor
-    id from the fixed-shape OCI header. Scope: a single statement with no binds
-    and SQL up to 253 bytes (the ub1 length prefix) — binds and chunked/long SQL
-    are a follow-up, gated by the length cross-check below. Raises
+    id from the fixed-shape OCI header, in either preamble width (see
+    :func:`_oci_all8_shift`). Scope: a single statement with no binds and SQL up
+    to 253 bytes (the ub1 length prefix) — binds and chunked/long SQL are a
+    follow-up, gated by the length cross-check below. Raises
     :class:`InterfaceError` if the message is not an OCI OALL8 in that shape.
     """
-    if (
-        len(payload) < _OCI_ALL8_SQL_OFF
-        or payload[0] != TTI_FUN
-        or payload[1] != TTI_ALL8
-    ):
+    if len(payload) < 12 or payload[0] != TTI_FUN or payload[1] != TTI_ALL8:
         raise InterfaceError('not an OCI OALL8 execute')
     # Validate the indicators where the thin form has 0x01 flags, so a
     # differently-shaped message errors rather than yielding a garbage SQL.
-    for ind_off in (11, 27):
-        if payload[ind_off : ind_off + 8] != oci.OCI_INDICATOR:
-            raise InterfaceError(f'OCI OALL8: no indicator at offset {ind_off}')
+    shift = _oci_all8_shift(payload)
+    sql_off = _OCI_ALL8_SQL_OFF - shift
+    bind_count_off = _OCI_BIND_COUNT_OFF - shift
+    if len(payload) < sql_off:
+        raise InterfaceError('not an OCI OALL8 execute')
     cursor = int.from_bytes(
         payload[_OCI_ALL8_CURSOR_OFF : _OCI_ALL8_CURSOR_OFF + 4], 'little'
     )
-    marker = payload[_OCI_ALL8_SQL_OFF - 1]  # ub1 length prefix (0xFE = chunked)
+    marker = payload[sql_off - 1]  # ub1 length prefix (0xFE = chunked)
     declared_len = (
         int.from_bytes(
             payload[_OCI_ALL8_SQLLEN3_OFF : _OCI_ALL8_SQLLEN3_OFF + 4], 'little'
@@ -6104,9 +6138,9 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
     if marker == 0xFE:
         # Long SQL — chunked from the marker: 0xFE, then <ub1 len><chunk> repeated
         # (a zero length, or the declared total, ends it).
-        raw_sql = _read_chunked_sql(payload[_OCI_ALL8_SQL_OFF - 1 :], declared_len)
+        raw_sql = _read_chunked_sql(payload[sql_off - 1 :], declared_len)
     elif marker == declared_len:
-        raw_sql = payload[_OCI_ALL8_SQL_OFF : _OCI_ALL8_SQL_OFF + marker]
+        raw_sql = payload[sql_off : sql_off + marker]
     else:
         # The two lengths disagree only for a bound statement (the bind section
         # shifts things) — out of this increment's scope, a clean error.
@@ -6115,15 +6149,11 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
     # a user-typed statement has none. Strip trailing NULs so the backend sees
     # clean SQL either way.
     sql = raw_sql.rstrip(b'\x00').decode('utf-8')
-    bind_count = int.from_bytes(
-        payload[_OCI_BIND_COUNT_OFF : _OCI_BIND_COUNT_OFF + 4], 'little'
-    )
+    bind_count = int.from_bytes(payload[bind_count_off : bind_count_off + 4], 'little')
     binds: list = []
     bind_meta: list[tuple[int, int]] = []
     if bind_count and marker != 0xFE:
-        binds, bind_meta = _parse_oci_binds(
-            payload, _OCI_ALL8_SQL_OFF + marker, bind_count
-        )
+        binds, bind_meta = _parse_oci_binds(payload, sql_off + marker, bind_count)
     return ExecRequest(
         sql=sql,
         cursor=cursor,
