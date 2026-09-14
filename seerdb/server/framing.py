@@ -72,7 +72,8 @@ class PacketStream:
 
     def _fill(self, n: int) -> bool:
         # Pull from the socket until the accumulator holds at least n bytes.
-        # False signals the peer closed before n bytes arrived.
+        # False signals the peer closed before n bytes arrived. A socket timeout
+        # (only ever set by read_packet's `within`) propagates to the caller.
         while len(self._acc) < n:
             chunk = self._sock.recv(self.sdu)
             if not chunk:
@@ -89,13 +90,34 @@ class PacketStream:
             size, _cksum, packet_type, _flags, _zero = _HEADER_LEGACY.unpack(head)
         return size, packet_type
 
-    def read_packet(self) -> tuple[int, bytes] | None:
+    def _read_packet_within(self, seconds: float) -> tuple[int, bytes] | None:
+        # read_packet with the socket timed out for the duration, restoring the
+        # previous setting afterwards so the session's ordinary reads keep
+        # blocking. socket.timeout is an alias of TimeoutError.
+        previous = self._sock.gettimeout()
+        self._sock.settimeout(seconds)
+        try:
+            return self.read_packet()
+        finally:
+            self._sock.settimeout(previous)
+
+    def read_packet(self, *, within: float | None = None) -> tuple[int, bytes] | None:
         """Return ``(type, body)`` for the next packet, or ``None`` at EOF.
 
         ``DATA`` fragments (non-final ones carry the ``0x0020`` flag) are
         reassembled into a single body. For non-``DATA`` packets the body is
         everything after the 8-byte header.
+
+        ``within`` bounds the wait in seconds and raises :class:`TimeoutError`
+        instead of blocking. It exists for ONE caller -- the reader that grows a
+        message spanning several packets (#868). There, waiting forever is not
+        safe: the continuation is only coming if the message really was cut in
+        transport, and a decode fault inside a complete message looks exactly
+        the same to the parser. An ordinary read takes no timeout and blocks, as
+        a server should while a client thinks.
         """
+        if within is not None:
+            return self._read_packet_within(within)
         body = b''
         while True:
             if not self._fill(8):

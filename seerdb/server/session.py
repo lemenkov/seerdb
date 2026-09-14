@@ -717,13 +717,16 @@ def serve_session(
                 else None
             )
             max_size = max_string_size(_SERVER_RUNTIME_CAPS)
-            body = _complete_message(
+            completed = _complete_message(
                 stream,
                 body,
                 lambda b: parse_exec(
                     b, bind_types=cached_types, max_string_size=max_size
                 ),
             )
+            if completed is None:  # answered already: it never completes
+                continue
+            body = completed
             request = _resolve_temp_lob_binds(
                 parse_exec(body, bind_types=cached_types, max_string_size=max_size),
                 temp_lobs,
@@ -733,7 +736,10 @@ def serve_session(
             else:
                 lobs = _answer_query(stream, backend, request, cursors)
         elif body[1] == TTI_LOBOPS:
-            body = _complete_message(stream, body, parse_lobops_request)
+            completed = _complete_message(stream, body, parse_lobops_request)
+            if completed is None:
+                continue
+            body = completed
             lobs = _answer_lobops(stream, body, lobs, temp_lobs)
         elif body[1] == TNS_FUNC_REEXECUTE_AND_FETCH:
             lobs = _answer_reexecute(stream, backend, parse_reexecute(body), cursors)
@@ -743,16 +749,22 @@ def serve_session(
             # was opened with are looked up first (the header names the cursor)
             # and then the whole message -- rows included, which can span
             # packets like any other bind data -- is read with them.
-            body = _complete_message(stream, body, parse_reexecute)
+            completed = _complete_message(stream, body, parse_reexecute)
+            if completed is None:
+                continue
+            body = completed
             cached_types = cursors.bind_types(parse_reexecute(body).cursor)
             max_size = max_string_size(_SERVER_RUNTIME_CAPS)
-            body = _complete_message(
+            completed = _complete_message(
                 stream,
                 body,
                 lambda b: parse_reexecute(
                     b, bind_types=cached_types, max_string_size=max_size
                 ),
             )
+            if completed is None:
+                continue
+            body = completed
             reexecute = parse_reexecute(
                 body, bind_types=cached_types, max_string_size=max_size
             )
@@ -1217,9 +1229,20 @@ def _answer_marker(stream: PacketStream, body: bytes) -> None:
         stream.write_packet(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
 
 
+# How long to wait for a packet that continues a message already being parsed
+# (#868). A genuine continuation is already in flight -- the client wrote the
+# whole message in one call, so it arrives within milliseconds on any network
+# the Mirror is reachable over -- which makes two seconds about a thousandfold
+# margin. It is deliberately not larger: this timeout is paid in full by every
+# request that can never be parsed, and at ten seconds a suite run spends more
+# time waiting for messages that will never arrive than it does testing (the
+# reference client's 16 boolean tests alone took 83 seconds of it).
+_CONTINUATION_TIMEOUT = 2.0
+
+
 def _complete_message(
     stream: PacketStream, body: bytes, parse: Callable[[bytes], object]
-) -> bytes:
+) -> bytes | None:
     """Return ``body`` grown until ``parse`` no longer reports it truncated (#848).
 
     A TTC message is a byte stream; TNS packets are only its transport, and a
@@ -1238,15 +1261,34 @@ def _complete_message(
 
     A continuation packet is raw stream bytes with no TTC framing of its own, so
     its body appends directly after the first packet's (whose piggybacks were
-    already stripped). Reads block until the message completes or the client goes
-    away, exactly as a real server waits on the rest of a call.
+    already stripped).
+
+    Returns ``None`` when the message never completes, having already answered
+    the client -- the caller drops the message and reads the next one.
+
+    **The wait is bounded, and that is the point** (#868). ``Truncated`` means
+    "the parser ran off the end", which a message cut by the transport and a
+    decode fault inside a *complete* message produce alike: a NULL BOOLEAN bind
+    made decode_dalc read the 0xFD escape marker as a length of 253 and ask for
+    bytes that were never sent (#869). Waiting forever for them hung the session
+    while the client blocked on its reply -- the silent hang #832/#836 removed,
+    coming back through a different door, and one such wedge stalls an entire
+    suite run. A real continuation is already in flight (the client wrote the
+    whole message in one go), so a short wait separates the two cases, and a
+    message that does not complete is refused like any other request the Mirror
+    cannot serve. The invariant is that the Mirror never blocks indefinitely on
+    a request it has begun parsing.
     """
     while True:
         try:
             parse(body)
             return body
-        except Truncated:
-            received = stream.read_packet()
+        except Truncated as truncated:
+            try:
+                received = stream.read_packet(within=_CONTINUATION_TIMEOUT)
+            except TimeoutError:
+                _refuse_unhandled(stream, f'unparsable request ({truncated})')
+                return None
             if received is None:
                 raise InterfaceError('client closed mid-message') from None
             cont_type, cont_body = received

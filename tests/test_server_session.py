@@ -1215,7 +1215,7 @@ def test_oci_loop_refuses_an_unknown_call_instead_of_closing_the_session() -> No
             self.inbox = [(TNS_DATA, unknown), (TNS_DATA, unknown), None]
             self.sent: list[tuple[int, bytes]] = []
 
-        def read_packet(self):
+        def read_packet(self, **_kw):
             return self.inbox.pop(0)
 
         def write_packet(self, ptype: int, body: bytes, **_kw) -> None:
@@ -1246,7 +1246,7 @@ def test_oci_loop_answers_a_break_marker() -> None:
             self.inbox = [(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET])), None]
             self.sent: list[tuple[int, bytes]] = []
 
-        def read_packet(self):
+        def read_packet(self, **_kw):
             return self.inbox.pop(0)
 
         def write_packet(self, ptype: int, body: bytes, **_kw) -> None:
@@ -1393,7 +1393,7 @@ def test_oci_banner_follows_the_advertised_release(
             self.inbox = [(TNS_DATA, version_call), None]
             self.sent: list[bytes] = []
 
-        def read_packet(self):
+        def read_packet(self, **_kw):
             return self.inbox.pop(0)
 
         def write_packet(self, ptype: int, body: bytes, **_kw) -> None:
@@ -1952,7 +1952,7 @@ def test_complete_message_reassembles_a_spanning_request() -> None:
         def __init__(self) -> None:
             self.reads = 0
 
-        def read_packet(self):
+        def read_packet(self, **_kw):
             self.reads += 1
             # parts[0] is the caller's `body`; hand out parts[1:] on demand.
             return (TNS_DATA, parts[self.reads])
@@ -1976,12 +1976,60 @@ def test_complete_message_returns_a_single_packet_untouched() -> None:
     from seerdb.server.session import _complete_message
 
     class _Stream:
-        def read_packet(self):  # pragma: no cover - must not be called
+        def read_packet(self, **_kw):  # pragma: no cover - must not be called
             raise AssertionError('read_packet called for a complete message')
 
     stream: Any = _Stream()
     body = b'\x03\x60\x00\x01whole'
     assert _complete_message(stream, body, lambda b: b) is body
+
+
+def test_complete_message_refuses_a_message_that_never_completes() -> None:
+    # `Truncated` means "the parser ran off the end", which a message cut by the
+    # transport and a DECODE FAULT inside a complete message produce alike. The
+    # reader used to wait for a continuation either way, so a fault hung the
+    # session while the client blocked on its reply -- the silent hang #832/#836
+    # removed, back through another door, and one wedge stalls a whole suite run
+    # (#868; the fault that found it was a NULL BOOLEAN bind, #869).
+    #
+    # A real continuation is already in flight, so the wait is bounded: when it
+    # expires the request is refused like any other the Mirror cannot serve, and
+    # the session stays usable.
+    from seerdb.common.exceptions import Truncated
+    from seerdb.common.tns_consts import TNS_DATA
+    from seerdb.server.session import _complete_message
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.sent: list[tuple[int, bytes]] = []
+            self.waits: list[float | None] = []
+
+        def read_packet(self, *, within: float | None = None):
+            # Nothing more is coming -- exactly what a decode fault looks like.
+            self.waits.append(within)
+            raise TimeoutError
+
+        def write_packet(self, packet_type: int, body: bytes) -> None:
+            self.sent.append((packet_type, body))
+
+    stream: Any = _Stream()
+    answer = _complete_message(
+        stream,
+        b'\x03\x5eunparsable',
+        lambda b: (_ for _ in ()).throw(Truncated('DALC: 253 bytes, 1 left')),
+    )
+    # It gives up rather than blocking...
+    assert answer is None
+    # ...having BOUNDED the wait (the whole point -- an unbounded read here is
+    # the hang), and having answered the client, which is still waiting.
+    assert stream.waits and all(w is not None for w in stream.waits)
+    assert len(stream.sent) == 1
+    packet_type, body = stream.sent[0]
+    assert packet_type == TNS_DATA
+    assert b'ORA-03115' in body
+    # The refusal names what could not be read, so the gap is identifiable from
+    # the error alone rather than needing a packet capture.
+    assert b'DALC: 253 bytes, 1 left' in body
 
 
 def test_complete_message_raises_when_the_client_vanishes_mid_message() -> None:
@@ -1991,7 +2039,7 @@ def test_complete_message_raises_when_the_client_vanishes_mid_message() -> None:
     from seerdb.server.session import _complete_message
 
     class _Stream:
-        def read_packet(self):
+        def read_packet(self, **_kw):
             return None
 
     stream: Any = _Stream()
