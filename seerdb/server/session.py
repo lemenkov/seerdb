@@ -777,7 +777,29 @@ def serve_session(
             body = completed
             lobs = _answer_lobops(stream, body, lobs, temp_lobs)
         elif body[1] == TNS_FUNC_REEXECUTE_AND_FETCH:
-            lobs = _answer_reexecute(stream, backend, parse_reexecute(body), cursors)
+            # The rows carry no OACs -- the cursor's opening execute declared the
+            # types -- so look those up from the header first, then read the
+            # whole message with them, rows included, which can span packets
+            # like any other bind data (#873, the same shape as #854's func 4).
+            cached_types = cursors.bind_types(parse_reexecute(body).cursor)
+            max_size = max_string_size(_SERVER_RUNTIME_CAPS)
+            completed = _complete_message(
+                stream,
+                body,
+                lambda b: parse_reexecute(
+                    b, bind_types=cached_types, max_string_size=max_size
+                ),
+            )
+            if completed is None:
+                continue
+            lobs = _answer_reexecute(
+                stream,
+                backend,
+                parse_reexecute(
+                    completed, bind_types=cached_types, max_string_size=max_size
+                ),
+                cursors,
+            )
         elif body[1] == TNS_FUNC_REEXECUTE:
             # The plain re-execute (#854): the cursor's statement again with
             # fresh bind rows. The rows carry no OACs, so the types the cursor
@@ -2018,7 +2040,14 @@ def _answer_reexecute(
         )
         return []
     try:
-        result = backend.execute(sql)
+        # WITH the request's fresh bind values. This path used to run the
+        # statement bare, which is right only for a query that has no binds --
+        # what #833's tests happened to use. Re-executing `select ... :1` then
+        # reached the backend with nothing bound and failed with ORA-01008, so
+        # the second and every later iteration of a loop over one query died
+        # (#873). The sibling func-4 path has carried its rows since #854; this
+        # is the same for func 78.
+        result = backend.execute(sql, request.bind_rows[0] if request.bind_rows else ())
     except BackendError as err:
         logger.info('re-execute refused: %s', err.ora_message)
         stream.write_packet(
