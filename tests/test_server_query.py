@@ -11,6 +11,7 @@ from seerdb.common.datatypes import IntervalYM, Var
 from seerdb.common.exceptions import DataError, InterfaceError
 from seerdb.common.tns import (
     _DECODE_FIELD_VERSION,
+    _ENCODE_OCI_CALL_SEQ,
     ColumnMeta,
     _decode_describe_body,
     _skip_chunked_bytes,
@@ -1197,9 +1198,18 @@ def test_encode_describe_reply_oci_matches_live_11g() -> None:
     # The describe timestamp is generated (the current time) in production; pin it
     # to the capture's date here so the rest of the reply is checked byte-for-byte
     # against the live 11g bytes.
-    reply = encode_describe_reply_oci(
-        [col], schema=b'PYO', table=b'SEER_N', timestamp=bytes.fromhex('787e09020c281b')
-    )
+    # The capture's trailing OER carries its own counter (19) and the sequence of
+    # the DESCRIBE call it answered (21) at offset 49 (#884).
+    token = _ENCODE_OCI_CALL_SEQ.set(0x15)
+    try:
+        reply = encode_describe_reply_oci(
+            [col],
+            schema=b'PYO',
+            table=b'SEER_N',
+            timestamp=bytes.fromhex('787e09020c281b'),
+        )
+    finally:
+        _ENCODE_OCI_CALL_SEQ.reset(token)
     assert reply == _OCI_DESCRIBE_SEER_N
 
 
@@ -2374,9 +2384,16 @@ def test_encode_error_oci_matches_the_captured_ora_error() -> None:
         '0000000000000000284f52412d30303934323a207461626c65206f7220766965'
         '7720646f6573206e6f742065786973740a'
     )
-    assert (
-        encode_error_oci(942, 'table or view does not exist', sequence=0x13) == captured
-    )
+    # sequence 0x13 is the reply's own counter; 0x15 the sequence of the call it
+    # answered, which the capture carries at offset 49 (#884).
+    token = _ENCODE_OCI_CALL_SEQ.set(0x15)
+    try:
+        assert (
+            encode_error_oci(942, 'table or view does not exist', sequence=0x13)
+            == captured
+        )
+    finally:
+        _ENCODE_OCI_CALL_SEQ.reset(token)
 
 
 def test_oci_dcb_tail_is_column_aware() -> None:

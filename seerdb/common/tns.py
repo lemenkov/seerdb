@@ -482,6 +482,15 @@ _ENCODE_FIELD_VERSION = contextvars.ContextVar('encode_field_version', default=6
 # not a decoded Oracle rule.
 _ENCODE_OER_SEQ = contextvars.ContextVar('encode_oer_seq', default=0)
 
+# The sequence number of the OCI call currently being answered — the ub1 in the
+# client's `03 <func> <seq>` header, after any piggybacks in front of it have
+# been stripped (#884). A live server echoes it in the 136-byte OER's offset-49
+# field, which is therefore NOT an echo of the server's own counter above: the
+# two coincide only early in a session, before the client's sequence runs ahead
+# of the server's. Set per message by the Mirror's OCI session loop. Like the
+# counter it sits beside, no client validates it.
+_ENCODE_OCI_CALL_SEQ = contextvars.ContextVar('encode_oci_call_seq', default=0)
+
 # Set True for the duration of an execute that requested array-DML row counts
 # (oracledb arraydmlrowcounts, #18). It tells decode_token_rpa_piggyback to
 # expect the `ub4 count | count×ub4` row-count block the server appends to the
@@ -5323,10 +5332,13 @@ def encode_oci_oer(
         # The statement-category byte (offset 18; 2 row/value-producing, 1 DDL,
         # 0 on the DESCRIBE status). Left at the envelope's value when not given.
         oer[18] = category
-    # FIXME: the offset-49 echo is only reliably `sequence + 2` for the row /
-    # return statuses; the outbind reply carries 0 there instead, so this is not
-    # a settled rule. Semantics of the field are unpinned (see §36.1).
-    struct.pack_into('<H', oer, 49, sequence + 2)
+    # Offset 49 carries the sequence of the CALL being answered, not an echo of
+    # the counter above: the client's own `03 <func> <seq>` byte, published by
+    # the OCI session loop (§36.1). Decoded across every reply kind in one live
+    # 11g session and confirmed on 10g; `sequence + 2` was a coincidence of the
+    # early-session captures it was read off, where the two counters had not yet
+    # diverged.
+    struct.pack_into('<H', oer, 49, _ENCODE_OCI_CALL_SEQ.get())
     struct.pack_into('<I', oer, 12, error_code)
     return bytes(oer)
 
@@ -5476,22 +5488,17 @@ def _oci_outbind_header(bind_count: int) -> bytes:
 
 
 # The outbind (PL/SQL OUT-bind) reply's trailing execute status: the shared
-# status preamble + a PL/SQL-block success OER. Unlike the describe/DDL statuses
-# this reply does not echo the sequence at offset 49 (it stays 0), so that field
-# is cleared after the envelope build.
+# status preamble + a PL/SQL-block success OER. It used to zero offset 49, on the
+# reading that this reply alone did not echo the sequence; a live 11g capture of
+# `begin :n := 42; end;` shows it carrying the call's sequence (11) like every
+# other reply, so it now takes the shared builder unmodified (#884).
 def _oci_outbind_tail(sequence: int) -> bytes:
-    oer = bytearray(
-        encode_oci_oer(
-            oci.OCI_OER_STATUS_SUCCESS,
-            sequence=sequence,
-            row_kind=oci.OCI_OER_ROW_KIND_LOB,
-            command_type=oci.OCI_CMD_PLSQL,
-        )
+    return _OCI_STATUS_FRAME_PREFIX + encode_oci_oer(
+        oci.OCI_OER_STATUS_SUCCESS,
+        sequence=sequence,
+        row_kind=oci.OCI_OER_ROW_KIND_LOB,
+        command_type=oci.OCI_CMD_PLSQL,
     )
-    # FIXME: why this reply zeroes the offset-49 echo while the describe / DDL
-    # statuses carry `sequence + 2` there is unknown (see §36.1).
-    oer[49] = 0
-    return _OCI_STATUS_FRAME_PREFIX + bytes(oer)
 
 
 def _oci_tti_sta(call_status: int, sequence: int) -> bytes:
@@ -6533,13 +6540,20 @@ def _oci_desc_trailer_frame() -> bytes:
     return bytes(frame)
 
 
-_OCI_DESC_TRAILER = _oci_desc_trailer_frame() + encode_oci_oer(
-    _OCI_DESC_STATUS,
-    sequence=_OCI_DESC_OER_SEQUENCE,
-    row_kind=_OCI_DESC_OER_ROW_FIELD,
-    command_type=0,
-    category=_OCI_DESC_OER_CATEGORY,
-)
+def _oci_desc_trailer() -> bytes:
+    # Built per reply, not once at import: the OER's offset-49 field carries the
+    # sequence of the call being answered, which is only known per message
+    # (#884). Freezing it at import would pin every DESCRIBE reply to whatever
+    # the context held when the module loaded.
+    return _oci_desc_trailer_frame() + encode_oci_oer(
+        _OCI_DESC_STATUS,
+        sequence=_OCI_DESC_OER_SEQUENCE,
+        row_kind=_OCI_DESC_OER_ROW_FIELD,
+        command_type=0,
+        category=_OCI_DESC_OER_CATEGORY,
+    )
+
+
 # Fixed-size types report a constant wire length in the describe (a NUMBER is
 # always 22, a DATE 7, …) rather than the backend's display size; variable types
 # (VARCHAR / CHAR / RAW) report their declared length.
@@ -6669,7 +6683,7 @@ def encode_describe_reply_oci(
     out += header_post
     for index, col in enumerate(columns):
         out += _oci_desc_block(col, last=index == len(columns) - 1, timestamp=timestamp)
-    trailer = bytearray(_OCI_DESC_TRAILER)
+    trailer = bytearray(_oci_desc_trailer())
     trailer[_OCI_DESC_TR_COUNT] = len(columns) & 0xFF
     trailer[_OCI_DESC_TR_OPAQUE] = (
         _OCI_DESC_TR_OPAQUE_BY_TYPE.get(columns[0].data_type, _OCI_DESC_TR_OPAQUE_MULTI)

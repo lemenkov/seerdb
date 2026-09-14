@@ -20,6 +20,7 @@ from seerdb.common.oci import (
     OCI_OER_STATUS_SUCCESS,
 )
 from seerdb.common.tns import (
+    _ENCODE_OCI_CALL_SEQ,
     _OCI_CMD_TYPE_OFF,
     _OCI_DML_ROWCOUNT_OFF,
     encode_changepassword_status_oci,
@@ -50,31 +51,55 @@ LOB_FETCH_STATUS = bytes.fromhex(
 )
 
 
+class _CallSeq:
+    """Publish the answered call's sequence, as the OCI session loop does per
+    message. Each golden below was captured two sequences after its reply's own
+    counter, which is why `sequence + 2` fitted them before it was decoded."""
+
+    def __init__(self, call_sequence):
+        self.call_sequence = call_sequence
+
+    def __enter__(self):
+        self._token = _ENCODE_OCI_CALL_SEQ.set(self.call_sequence)
+
+    def __exit__(self, *exc):
+        _ENCODE_OCI_CALL_SEQ.reset(self._token)
+        return False
+
+
 class TestOciOerGeneration(unittest.TestCase):
     def test_long_fetch_status(self):
-        self.assertEqual(
-            encode_oci_oer(
-                OCI_OER_STATUS_SUCCESS, sequence=0x11, row_kind=OCI_OER_ROW_KIND_LONG
-            ),
-            LONG_FETCH_STATUS,
-        )
+        with _CallSeq(0x13):
+            self.assertEqual(
+                encode_oci_oer(
+                    OCI_OER_STATUS_SUCCESS,
+                    sequence=0x11,
+                    row_kind=OCI_OER_ROW_KIND_LONG,
+                ),
+                LONG_FETCH_STATUS,
+            )
 
     def test_lob_fetch_status(self):
-        self.assertEqual(
-            encode_oci_oer(
-                OCI_OER_STATUS_SUCCESS, sequence=0x10, row_kind=OCI_OER_ROW_KIND_LOB
-            ),
-            LOB_FETCH_STATUS,
-        )
+        with _CallSeq(0x12):
+            self.assertEqual(
+                encode_oci_oer(
+                    OCI_OER_STATUS_SUCCESS,
+                    sequence=0x10,
+                    row_kind=OCI_OER_ROW_KIND_LOB,
+                ),
+                LOB_FETCH_STATUS,
+            )
 
     def test_error_oer_envelope(self):
         # the error path builds the same envelope with the code patched in at
         # offset 12 (ub4 LE), then appends the ORA-… message DALC.
         expected = bytearray(ERROR_OER)
         expected[12:16] = (942).to_bytes(4, 'little')
-        # sequence=0x13 is the value the golden capture carried; passing it
-        # reproduces the live 11g error reply byte-for-byte.
-        got = encode_error_oci(942, 'table or view does not exist', sequence=0x13)
+        # sequence=0x13 and call sequence 0x15 are the values the golden
+        # capture carried; passing both reproduces the live 11g error reply
+        # byte-for-byte.
+        with _CallSeq(0x15):
+            got = encode_error_oci(942, 'table or view does not exist', sequence=0x13)
         self.assertEqual(got[:136], bytes(expected))
 
     def test_error_oer_status_and_code(self):
@@ -91,11 +116,24 @@ class TestOciOerGeneration(unittest.TestCase):
             got[136:], bytes([40]) + b'ORA-00942: table or view does not exist\n'
         )
 
-    def test_sequence_echo_is_plus_two(self):
-        # offset 49 echoes the sequence field + 2 (a derived internal field).
-        oer = encode_oci_oer(OCI_OER_STATUS_SUCCESS, sequence=0x20)
+    def test_offset_49_is_the_call_sequence_not_the_counter(self):
+        # Offset 5 is the server's own counter; offset 49 is the sequence of the
+        # call being answered. They are independent — the captures this was first
+        # read off happened to sit two apart, which is where `sequence + 2` came
+        # from, but a live session's two counters diverge (#884).
+        with _CallSeq(0x31):
+            oer = encode_oci_oer(OCI_OER_STATUS_SUCCESS, sequence=0x20)
         self.assertEqual(oer[5], 0x20)
-        self.assertEqual(oer[49], 0x22)
+        self.assertEqual(oer[49], 0x31)
+
+    def test_offset_49_moves_with_the_call_not_the_counter(self):
+        # Holding the counter and moving the call sequence changes offset 49 and
+        # nothing else; the reverse changes offset 5 and nothing else.
+        with _CallSeq(0x31):
+            a = encode_oci_oer(OCI_OER_STATUS_SUCCESS, sequence=0x20)
+        with _CallSeq(0x32):
+            b = encode_oci_oer(OCI_OER_STATUS_SUCCESS, sequence=0x20)
+        self.assertEqual([i for i in range(len(a)) if a[i] != b[i]], [49])
 
 
 class TestExecuteStatusGeneration(unittest.TestCase):
@@ -147,16 +185,17 @@ class TestExecuteStatusGeneration(unittest.TestCase):
         self.assertEqual(diffs, [_OCI_CMD_TYPE_OFF])
 
     def test_status_replies_carry_the_live_sequence(self):
-        # The OER sequence is now a per-session counter threaded in, not a frozen
-        # capture constant: a different sequence changes offset 5 (and its +2 echo
-        # at offset 49) of the OER while the rest of the frame is unchanged. Tested
+        # The OER sequence is a per-session counter threaded in, not a frozen
+        # capture constant: a different sequence changes offset 5 of the OER and
+        # nothing else, now that offset 49 tracks the call instead (#884). Tested
         # on the bare-OER error reply, whose OER starts at offset 0.
-        a = encode_error_oci(942, 'x', sequence=0x13)[:136]
-        b = encode_error_oci(942, 'x', sequence=0x14)[:136]
+        with _CallSeq(0x15):
+            a = encode_error_oci(942, 'x', sequence=0x13)[:136]
+            b = encode_error_oci(942, 'x', sequence=0x14)[:136]
         self.assertEqual(a[5], 0x13)
         self.assertEqual(b[5], 0x14)
         diffs = [i for i in range(len(a)) if a[i] != b[i]]
-        self.assertEqual(diffs, [5, 49])
+        self.assertEqual(diffs, [5])
 
 
 class ChangePasswordStatusGolden(unittest.TestCase):
