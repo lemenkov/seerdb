@@ -4945,21 +4945,64 @@ to real 11g, varying one thing at a time. Offsets are from the `0x04` token:
 | `20` | 1 | error position (parse offset; the column sqlplus draws its caret under) | ORA-00942 → `0x0e`; the Mirror emits the backend-supplied offset (`encode_error_oci(error_pos=...)`), clamped to one byte, or `0x0e` when unknown |
 | `22` | 1 | **V$SQL command type** | INSERT=2, UPDATE=6, DELETE=7, SELECT=3, CREATE TABLE=1, DROP TABLE=12, PL/SQL=47 |
 | `27..40` | | rowid of the touched row (DML only) | capture-specific; the Mirror reuses a fixed frame |
-| `49..51` | ub2 LE | echo of the sequence field | `sequence + 2` for row/return statuses; `0` in the outbind reply |
+| `49..51` | ub2 LE | **sequence of the call being answered** — the client's own `03 <func> <seq>` byte | decoded across every reply kind in one live 11g session and confirmed on 10g; *not* an echo of offset `5` (§36.1a) |
 | `52` | 1 | constant `0x01` | constant across captures |
 | `56..58` | ub2 LE | fixed 11g constant — `0x0136` (310) | **not** the TTC version (disproven by differential capture: absent from 21c/23ai, which replace the whole trailer); an 11g OER-format constant, carried |
 | `72..76` | | fixed `20 f6 31 0a` marker | an 11g OER-trailer constant; byte-identical across every 11g reply, absent from 21c/23ai |
 
 The rest of the 136-byte frame (SCN region, cursor/rowid slots) is a fixed
 zero-filled envelope. For an error, the `ORA-NNNNN: <message>` DALC follows the
-136-byte OER. Offsets `18` and `49` carry values whose exact semantics are not
-yet pinned down (a non-zero position under a *success* describe status, an echo
-that is `+2` for some replies and `0` for others); they are carried from the
-captures byte-for-byte. Offset `56` looks like the session's negotiated TTC
+136-byte OER. Offset `18` carries a value whose exact semantics are not
+yet pinned down (a non-zero position under a *success* describe status); it is
+carried from the captures byte-for-byte. Offset `49` **is** pinned — see §36.1a. Offset `56` looks like the session's negotiated TTC
 protocol version (`310` sits in the same `0x013x` family as the versions the
 handshake negotiates); the Mirror emits the captured value rather than its own,
 which sqlplus accepts — whether the field must track the live negotiation is
 not confirmed.
+
+#### 36.1a The two sequence fields are independent
+
+The OER carries two counters, and they are **not** the same number:
+
+- **offset `5`** is the *server's* free-running per-session counter (below).
+- **offset `49`** is the sequence number of the **call being answered** — the
+  `seq` byte from the client's own `03 <func> <seq>` header, after any
+  piggybacks in front of it have been stripped. Where a request carries
+  piggybacks the field takes the **call's** sequence, never a piggyback's.
+
+One live 11g sqlplus session, every reply kind, through `tools/capture_proxy.py`:
+
+| request | offset `5` | offset `49` |
+| --- | --- | --- |
+| `FUN 118` seq 2 (OSESSKEY) | 2 | 2 |
+| `FUN 115` seq 3 (AUTH) | 3 | 3 |
+| `FUN 94` seq 6 (execute) | 4 | 6 |
+| `FUN 5` seq 7 (fetch) | 5 | 7 |
+| `FUN 94` seq 11 (PL/SQL, outbind reply) | 8 | 11 |
+| `PGY 105/12 + FUN 94/13` | 10 | 13 |
+| `PGY 105/15 + FUN 94/16` (DDL) | 13 | 16 |
+| `PGY 105/19 + FUN 94/20` (DML) | 17 | 20 |
+| `PGY 105/24 + FUN 119/25` (describe) | 22 | 25 |
+| `FUN 94` seq 26 | 23 | 26 |
+
+Thirteen replies, thirteen matches, across success and error statuses and on 10g
+as well. The two counters diverge as a session runs: the client burns sequence
+numbers on piggybacks the server's counter does not tick for, so the gap grows
+from 0 to 2 to 3 over the captures above.
+
+That divergence is what makes the field decidable. It was previously written as
+`sequence + 2`, fitted to a handful of early-session captures where the gap
+happened to be exactly 2 — every one of those still reproduces byte-for-byte
+under the decoded rule, but `+2` fails for the later replies (offset `5` of 8
+against an echo of 11, 10 against 13, 22 against 25). The outbind reply was
+likewise thought to zero the field; it carries 11, like everything else.
+
+The Mirror publishes the call sequence per message on a ContextVar
+(`_ENCODE_OCI_CALL_SEQ`), the same shape the thin path uses for its own counter,
+rather than threading a second parameter through every encoder. Note the
+**compact 24-byte OER** (§36.2) is too short to have this field at all, so the
+replies that use it — the SELECT execute status, the fetch terminator, the no-row
+status — carry no call sequence.
 
 The `sequence` at offset `5` is the OER's **end-to-end sequence number** — a
 diagnostic/tracing counter (same family as the end-to-end application-tracing

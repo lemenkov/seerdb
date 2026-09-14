@@ -35,6 +35,7 @@ from seerdb.common.oci import (
 from seerdb.common.tns import (
     _DECODE_FIELD_VERSION,
     _ENCODE_FIELD_VERSION,
+    _ENCODE_OCI_CALL_SEQ,
     _ENCODE_OER_SEQ,
     _SERVER_RUNTIME_CAPS,
     ArrayOutBind,
@@ -918,6 +919,12 @@ def _serve_oci_session(
             behind = strip_oci_e2e_piggyback(body)
             if behind is not None:
                 body = behind
+        if len(body) >= 3 and body[0] == TTI_FUN:
+            # The OER's offset-49 field echoes the sequence of the CALL being
+            # answered — this byte, after the piggybacks in front of it have been
+            # stripped, never a piggyback's own (§36.1). Publish it for the
+            # encoders the same way the thin path publishes its counter (#842).
+            _ENCODE_OCI_CALL_SEQ.set(body[2])
         if len(body) >= 2 and body[0] == TTI_FUN:
             if body[1] == TTI_ALL8:
                 if parked is not None and is_reexecute_oci(body):
