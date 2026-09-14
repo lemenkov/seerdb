@@ -10395,6 +10395,16 @@ def encode_token_oac(Token: object) -> bytes:
             return encode_token_raw(TNS_TYPE_INTERVALYM, 5, 0, 0, 0, A)
         if DT == TNS_TYPE_REFCURSOR:
             return encode_token_raw(TNS_TYPE_REFCURSOR, 1, 0, UTF8_CHARSET, 0)
+        if DT == TNS_TYPE_BOOLEAN:
+            # Native BOOLEAN Var, what setinputsizes(bool) / DB_TYPE_BOOLEAN
+            # produces (#870). The same OAC a plain bool value already gets --
+            # type 252, fixed size 4 -- and the same pre-23ai fallback to NUMBER,
+            # which pairs with the NUMBER value encode_token_rxd writes there.
+            # Only this Var path was missing, so binding a boolean through a Var
+            # raised and, through the Mirror, surfaced as ORA-00600.
+            if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_23_1:
+                return encode_token_raw(TNS_TYPE_BOOLEAN, 4, 0, 0, 0, A)
+            return encode_token_raw(TNS_TYPE_NUMBER, 22, 0, 0, 0, A)
         raise Exception('Unsupported Var OAC type', DT)
     if isinstance(Token, TempLob):
         # Temp-LOB locator bind (#91): a CLOB / BLOB OAC carrying the LOB

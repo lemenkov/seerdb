@@ -7156,3 +7156,42 @@ class TestShortLengthBoundary(unittest.TestCase):
             self.assertEqual(encode_chr('y' * 253)[0], 254)
         finally:
             _ENCODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
+
+
+class TestBooleanVarBind(unittest.TestCase):
+    """A Var declared as a native BOOLEAN can be bound (#870).
+
+    Every other Var type had a branch in the OAC encoder; BOOLEAN did not, so
+    `setinputsizes(bool)` / `DB_TYPE_BOOLEAN` raised. Through the Mirror that
+    surfaced as ORA-00600 and the reference client tore the connection down, so
+    none of its boolean tests could run.
+    """
+
+    def tearDown(self):
+        from seerdb.common.tns import _ENCODE_FIELD_VERSION
+
+        _ENCODE_FIELD_VERSION.set(6)  # restore module default
+
+    def test_boolean_var_gets_the_native_oac_on_23ai(self):
+        from seerdb.common.datatypes import DB_TYPE_BOOLEAN, Var
+        from seerdb.common.tns import _ENCODE_FIELD_VERSION
+        from seerdb.common.tns_consts import TNS_TYPE_BOOLEAN
+
+        _ENCODE_FIELD_VERSION.set(24)
+        oac = encode_token_oac(Var(DB_TYPE_BOOLEAN))
+        # The same OAC a plain `bool` value already produced: type 252, size 4.
+        self.assertEqual(oac[0], TNS_TYPE_BOOLEAN)
+        self.assertEqual(oac, encode_token_oac(True))
+
+    def test_boolean_var_falls_back_to_number_before_23ai(self):
+        from seerdb.common.datatypes import DB_TYPE_BOOLEAN, Var
+        from seerdb.common.tns import _ENCODE_FIELD_VERSION
+        from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+
+        # There is no native BOOLEAN before 23ai, so the Var rides as a NUMBER --
+        # pairing with the NUMBER value encode_token_rxd writes there, exactly as
+        # a plain bool already does.
+        _ENCODE_FIELD_VERSION.set(8)
+        oac = encode_token_oac(Var(DB_TYPE_BOOLEAN))
+        self.assertEqual(oac[0], TNS_TYPE_NUMBER)
+        self.assertEqual(oac, encode_token_oac(True))
