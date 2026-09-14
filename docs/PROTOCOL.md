@@ -1551,6 +1551,44 @@ function was refused outright as `ORA-03115 (TTC function 4)`, so through the
 Mirror only the *first* execute of any statement worked with the reference
 client — a loop of inserts died on its second iteration.
 
+**OALL8 execute request — two preamble widths (the Mirror, OCI dialect, #866).**
+The OCI execute's header up to the SQL is a fixed preamble: 8-byte
+`FE FF FF FF FF FF FF FF` pointer indicators (§4.1.2) with scalar slots between
+them, and the ub1-length-prefixed SQL text at the end. It comes in **two widths**,
+and which one a client sends is fixed for the life of its connection:
+
+| field | wide (sqlplus 11.2-era) | narrow (sqlplus 23.26) |
+| --- | --- | --- |
+| scalar slots | `ub8` | `ub4` |
+| cursor id (`ub4`) | 7 | 7 |
+| 3x SQL byte length (`ub4`) | 19 | 19 |
+| second indicator | 27 | 23 |
+| bind count (`ub4`) | 83 | 71 |
+| SQL text | 196 | 176 |
+
+Five slots shrink from 8 bytes to 4, so the narrow preamble is **20 bytes
+shorter** overall — but they are spread through the header, so each field behind
+them moves by a **different** amount, the running total of the slots ahead of it:
+the second indicator by 4, the bind count by 12, the SQL text by the full 20.
+The cursor id and the SQL length sit ahead of all five and do not move. The
+indicators stay 8 bytes wide in both, and that is what makes the two forms
+tellable apart on the wire: the second indicator is at 27 in the wide form and 23
+in the narrow one, and the two cannot both hold (the pattern starts `FE` and
+continues `FF`, so an indicator at 23 puts `FF` at 27). The bind section behind
+the SQL is read by scanning from the end of the SQL text, so it is the same in
+both widths and needs no offset of its own.
+
+`_oci_all8_layout` picks the width from the wire on every execute rather than
+assuming one, and raises when neither shape holds. Read with the wide offsets, a
+narrow execute lands 20 bytes past the SQL length prefix, and the Mirror then
+answered every modern-sqlplus statement with a no-rows success status, which
+sqlplus reports as `SP2-0642: SQL*Plus internal error state 2090` on the first
+query whose row it needs (its `SELECT DECODE(USER, …) FROM SYS.DUAL` login
+probe). Read with one **global** 20-byte shift instead of per-field ones, the
+bind count comes off an indicator as `0xFFFFFFFE` and sqlplus `PRINT` of a bound
+variable reports `ORA-01008`. The widths are the only difference; the field
+order is identical.
+
 **OUT-bind reply (the Mirror, OCI dialect).** The classic sqlplus `VARIABLE v
 NUMBER` / `EXEC :v := 42` flow sends a PL/SQL block that assigns literals to OUT
 binds; the client parks bind buffers and expects the values back. The Mirror

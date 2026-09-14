@@ -1044,6 +1044,86 @@ def test_parse_exec_oci_rejects_a_non_oci_message() -> None:
         parse_exec_oci(b'\x03\x5e\x06not the oci shape' + b'\x00' * 200)
 
 
+# The same two queries from sqlplus 23.26, which writes the preamble's scalar
+# slots as ub4 where 11.2 wrote ub8 — 20 bytes shorter, so the SQL sits at 176
+# rather than 196 (#866). Captured sqlplus 23.26 <-> XE 11.2 through
+# tools/capture_proxy.py.
+_OCI_EXEC_USER_NARROW = bytes.fromhex(
+    '035e0b6180000000000000feffffffffffffff36000000feffffffffffffff0d000000'
+    'fefffffffffffffffeffffffffffffff00000000010000000000000000000000000000'
+    '00000000000000000000000000feffffffffffffff0000000000000000feffffffffff'
+    'fffffefffffffffffffffeffffffffffffff0000000000000000fefffffffffffffffe'
+    'ffffffffffffff00000000000000000000000000000000000000000000000000000000'
+    '1273656c65637420312066726f6d206475616c01000000000000000000000000000000'
+    '0000000000000000000000000100000000000000008000000000000000000000000000'
+    '00'
+)
+_OCI_EXEC_INTERNAL_NARROW = bytes.fromhex(
+    '035e066180000000000000feffffffffffffff17010000feffffffffffffff0d000000'
+    'fefffffffffffffffeffffffffffffff00000000010000000000000000000000000000'
+    '00000000000000000000000000feffffffffffffff0000000000000000feffffffffff'
+    'fffffefffffffffffffffeffffffffffffff0000000000000000fefffffffffffffffe'
+    'ffffffffffffff00000000000000000000000000000000000000000000000000000000'
+    '5d53454c454354204445434f444528555345522c20275853244e554c4c272c20205853'
+    '5f5359535f434f4e54455854282758532453455353494f4e272c27555345524e414d45'
+    '27292c2055534552292046524f4d205359532e4455414c000100000000000000000000'
+    '0000000000000000000000000000000000010000000000000000800000000000000000'
+    '000000000000'
+)
+
+
+def test_parse_exec_oci_reads_the_narrow_preamble() -> None:
+    # sqlplus 23.26's shorter header must give the same SQL as 11.2's longer one.
+    req = parse_exec_oci(_OCI_EXEC_USER_NARROW)
+    assert req.sql == 'select 1 from dual'
+    assert req.cursor == 0
+    assert req.bind_count == 0
+
+
+def test_parse_exec_oci_narrow_preamble_strips_the_internal_query_nul() -> None:
+    # The login probe whose row sqlplus needs — read with the wide offsets it
+    # came back as a no-rows status and sqlplus reported SP2-0642 (#866).
+    req = parse_exec_oci(_OCI_EXEC_INTERNAL_NARROW)
+    assert req.sql.startswith('SELECT DECODE(USER,')
+    assert req.sql.endswith('FROM SYS.DUAL')
+    assert '\x00' not in req.sql
+
+
+# The same `EXEC :n := 42` PL/SQL block from sqlplus 23.26. The shrinking slots
+# are spread through the header, so the bind count moves by 12 where the SQL
+# moves by 20 — read with one global shift it came back as 0xFFFFFFFE (an
+# indicator) and sqlplus PRINT reported ORA-01008 (#866).
+_OCI_EXEC_OUT_BIND_NARROW = bytes.fromhex(
+    '035e042904040000000000feffffffffffffff3c000000feffffffffffffff0d000000'
+    'fefffffffffffffffeffffffffffffff000000000100000000000000feffffffffffff'
+    'ff010000000000000000000000feffffffffffffff0000000000000000feffffffffff'
+    'fffffefffffffffffffffeffffffffffffff0000000000000000fefffffffffffffffe'
+    'ffffffffffffff00000000000000000000000000000000000000000000000000000000'
+    '14626567696e203a6e203a3d2034323b20656e643b0100000001000000000000000000'
+    '0000000000000000000000000000080000000000000000800000000000000000000000'
+    '0000000102030000160000000000000000000000000000000000000000000000000000'
+    '00000000000000000007fd01'
+)
+
+
+def test_parse_exec_oci_narrow_preamble_reads_the_bind_count() -> None:
+    req = parse_exec_oci(_OCI_EXEC_OUT_BIND_NARROW)
+    assert req.sql == 'begin :n := 42; end;'
+    assert req.bind_count == 1
+    # The OUT bind rides as the `fd 01` absent-value marker, typed by its OAC.
+    assert req.binds == [None]
+    assert req.bind_meta == [(TNS_TYPE_NUMBER, 22)]
+
+
+def test_parse_exec_oci_rejects_an_unknown_preamble_width() -> None:
+    # Neither indicator position holds — refuse rather than read a garbage SQL
+    # from whichever offset happens to be in range.
+    broken = bytearray(_OCI_EXEC_USER_NARROW)
+    broken[23:31] = b'\x00' * 8
+    with pytest.raises(InterfaceError):
+        parse_exec_oci(bytes(broken))
+
+
 # A live sqlplus 11.2 `EXEC :n := 42` — a PL/SQL block with one NUMBER OUT bind.
 # The wire carries no bind direction: the OUT bind rides with the 2-byte `fd 01`
 # placeholder in its value slot (the tail `... 07 fd 01`), and its OAC gives the
