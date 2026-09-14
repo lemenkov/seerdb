@@ -1712,12 +1712,49 @@ def test_the_end_of_fetch_terminator_carries_the_cursor_id() -> None:
     # The captured 11g terminator stays byte-identical when the caller has no
     # cursor of its own, so nothing changes for the paths that never had one;
     # a real id changes only that field.
-    from seerdb.common.tns import _END_OF_FETCH, _end_of_fetch
+    from seerdb.common.tns import _ENCODE_OER_SEQ, _END_OF_FETCH, _end_of_fetch
 
     assert _end_of_fetch() == _END_OF_FETCH
     assert _end_of_fetch(1) == _END_OF_FETCH
-    assert _end_of_fetch(7) != _END_OF_FETCH
-    assert len(_end_of_fetch(7)) == len(_END_OF_FETCH)
+
+    # Pinned to the sequence the capture was taken at, a real cursor id changes
+    # that field and nothing else -- the terminator keeps its captured shape.
+    token = _ENCODE_OER_SEQ.set(4)
+    try:
+        assert _end_of_fetch(7) != _END_OF_FETCH
+        assert len(_end_of_fetch(7)) == len(_END_OF_FETCH)
+    finally:
+        _ENCODE_OER_SEQ.reset(token)
+
+
+def test_the_thin_terminator_advances_its_oer_sequence() -> None:
+    # The thin reply path used to emit the frozen sequence every captured status
+    # was decoded with, so a whole session repeated one number while the
+    # thick/OCI path advanced a real counter (#842). The field is diagnostic --
+    # no client validates it -- so what is asserted is that it MOVES and that it
+    # reaches the wire, not any particular value.
+    from seerdb.common.tns import _ENCODE_OER_SEQ, _end_of_fetch, encode_status
+
+    seen = set()
+    for n in (1, 2, 3):
+        token = _ENCODE_OER_SEQ.set(n)
+        try:
+            seen.add((encode_status(1, cursor_id=9), _end_of_fetch(7)))
+        finally:
+            _ENCODE_OER_SEQ.reset(token)
+    # Three sequence values, three distinct pairs of encoded replies.
+    assert len(seen) == 3
+
+    # A caller that pins `seq` is reproducing a captured frame and is unaffected
+    # by the session counter -- that is what keeps _END_OF_FETCH verbatim.
+    from seerdb.common.tns import _encode_oer
+
+    token = _ENCODE_OER_SEQ.set(99)
+    try:
+        assert _encode_oer(1, 0, 0, b'', seq=4) == _encode_oer(1, 0, 0, b'', seq=4)
+        assert _encode_oer(1, 0, 0, b'', seq=4) != _encode_oer(1, 0, 0, b'')
+    finally:
+        _ENCODE_OER_SEQ.reset(token)
 
 
 def test_reexecute_runs_the_cursors_own_statement() -> None:
