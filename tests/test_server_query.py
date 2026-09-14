@@ -720,8 +720,14 @@ def test_row_width_mismatch_raises() -> None:
 
 
 def test_unsupported_value_type_raises() -> None:
+    # A type the wire cannot carry raises NotSupportedError -- the DB-API's own
+    # type for "this is not supported" -- and not a generic one. The Mirror keys
+    # on it to answer a feature gap with ORA-03115 instead of ORA-00600, which
+    # clients treat as fatal and which cost a whole session per gap (#875).
+    from seerdb.common.exceptions import NotSupportedError
+
     col = ColumnMeta(name=b'N', data_type=TNS_TYPE_NUMBER, data_length=22, max_size=22)
-    with pytest.raises(InterfaceError):
+    with pytest.raises(NotSupportedError):
         encode_rows([(object(),)], [col])
 
 

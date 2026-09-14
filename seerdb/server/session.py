@@ -26,7 +26,7 @@ from secrets import token_bytes
 from typing import NoReturn, TypeVar
 
 from seerdb.common.crypto import decrypt_password
-from seerdb.common.exceptions import InterfaceError, Truncated
+from seerdb.common.exceptions import InterfaceError, NotSupportedError, Truncated
 from seerdb.common.oci import (
     OCI_CMD_COMMIT,
     OCI_CMD_ROLLBACK,
@@ -552,6 +552,30 @@ def _unreachable_call(body: bytes) -> str:
     if not body:
         return 'an empty message'
     return f'message type {body[0]}'
+
+
+def _backend_fault_error(exc: Exception) -> bytes:
+    """The reply for an exception the backend let escape.
+
+    A type the codec cannot represent is a **feature gap, not an internal
+    fault**, and the difference costs a whole session. ORA-00600 is Oracle's
+    internal-error code: clients treat it as fatal, so one unsupported bind tore
+    the connection down and every later statement on it failed too -- 92 such
+    gaps produced 114 dead-connection failures in one conformance run (#875).
+    ORA-03115 is what every other unsupported path already answers (#832/#836):
+    the statement fails, the session lives, and the next one runs.
+
+    Anything that is not a NotSupportedError really is unexpected, and keeps
+    ORA-00600 -- the point is to stop mislabelling gaps as crashes, not to stop
+    reporting crashes.
+    """
+    if isinstance(exc, NotSupportedError):
+        return encode_error(
+            _ORA_UNSUPPORTED_CALL,
+            f'ORA-{_ORA_UNSUPPORTED_CALL:05d}: unsupported network datatype or '
+            f'representation ({exc})',
+        )
+    return _backend_fault_error(exc)
 
 
 def _refuse_unhandled(stream: PacketStream, what: str) -> None:
@@ -1884,7 +1908,7 @@ def _answer_query(
         response = encode_error(err.ora_code, err.ora_message, err.error_offset)
     except Exception as exc:
         logger.warning('backend raised a non-ORA error: %s', exc)
-        response = encode_error(_INTERNAL_ERROR, f'ORA-00600: backend error: {exc}')
+        response = _backend_fault_error(exc)
     stream.write_packet(TNS_DATA, response)
     return lobs
 
@@ -1936,9 +1960,7 @@ def _answer_scroll(
         return []
     except Exception as exc:
         logger.warning('backend raised a non-ORA error: %s', exc)
-        stream.write_packet(
-            TNS_DATA, encode_error(_INTERNAL_ERROR, f'ORA-00600: backend error: {exc}')
-        )
+        stream.write_packet(TNS_DATA, _backend_fault_error(exc))
         return []
     columns = result.columns
     rows = list(result.rows)
@@ -1996,7 +2018,7 @@ def _answer_reexecute(
         logger.warning('backend raised a non-ORA error: %s', exc)
         stream.write_packet(
             TNS_DATA,
-            encode_error(_INTERNAL_ERROR, f'ORA-00600: backend error: {exc}'),
+            _backend_fault_error(exc),
         )
         return []
     columns = list(result.columns or [])
@@ -2080,7 +2102,7 @@ def _answer_reexecute_binds(
         logger.warning('backend raised a non-ORA error: %s', exc)
         stream.write_packet(
             TNS_DATA,
-            encode_error(_INTERNAL_ERROR, f'ORA-00600: backend error: {exc}'),
+            _backend_fault_error(exc),
         )
         return []
     columns = list(result.columns or [])
@@ -2167,9 +2189,7 @@ def _answer_changepassword(
         return
     except Exception as exc:
         logger.warning('backend raised a non-ORA error: %s', exc)
-        stream.write_packet(
-            TNS_DATA, encode_error(_INTERNAL_ERROR, f'ORA-00600: backend error: {exc}')
-        )
+        stream.write_packet(TNS_DATA, _backend_fault_error(exc))
         return
     logger.info('password changed: %s', user)
     stream.write_packet(TNS_DATA, encode_status(0))
@@ -2248,7 +2268,7 @@ def _answer_txn(stream: PacketStream, backend: Backend, *, commit: bool) -> None
         response = encode_error(err.ora_code, err.ora_message)
     except Exception as exc:
         logger.warning('backend raised a non-ORA error: %s', exc)
-        response = encode_error(_INTERNAL_ERROR, f'ORA-00600: backend error: {exc}')
+        response = _backend_fault_error(exc)
     else:
         response = encode_status(0)
     stream.write_packet(TNS_DATA, response)

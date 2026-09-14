@@ -86,6 +86,9 @@ _TAG_UB4_OFFSETS = 0x20  # this container's value-offsets are ub4 (a container
 # the image-level offset width.
 
 
+from seerdb.common.exceptions import NotSupportedError
+
+
 class OsonError(Exception):
     """Raised on an OSON image whose encoding we do not yet decode."""
 
@@ -486,4 +489,8 @@ def _decode_node(
     if tag in _EXT_SCALAR:  # extended scalar (#69)
         length, dec = _EXT_SCALAR[tag]
         return dec(seg[off + 1 : off + 1 + length]), off + 1 + length
-    raise OsonError(f'unsupported OSON node tag 0x{tag:02x} at offset {off}')
+    # A tag we do not implement is a FEATURE GAP: raise the DB-API's
+    # NotSupportedError so the Mirror answers ORA-03115 and the session lives,
+    # rather than ORA-00600, which clients treat as fatal (#875). A malformed or
+    # truncated image keeps OsonError -- bad data is a different thing.
+    raise NotSupportedError(f'unsupported OSON node tag 0x{tag:02x} at offset {off}')

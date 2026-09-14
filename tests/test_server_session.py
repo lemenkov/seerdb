@@ -755,7 +755,11 @@ def test_unencodable_out_bind_errors_but_keeps_connection() -> None:
         cursor = conn.cursor()
         with pytest.raises(seerdb.DatabaseError) as excinfo:
             cursor.callproc('P', [cursor.var(seerdb.DB_TYPE_NUMBER)])
-        assert 'ORA-00600' in str(excinfo.value)
+        # ORA-03115, not ORA-00600: a value the wire cannot carry is a feature
+        # gap, and ORA-00600 is Oracle's INTERNAL-error code, which real clients
+        # treat as fatal -- so reporting it here killed the session the rest of
+        # this test is about proving survives (#875).
+        assert 'ORA-03115' in str(excinfo.value)
         # The connection survived the encoding failure — a valid query still works.
         cursor.execute('select * from dual')
         row = cursor.fetchone()
