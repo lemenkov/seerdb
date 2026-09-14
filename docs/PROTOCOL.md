@@ -113,6 +113,40 @@ be *exactly* maximum-sized from a true continuation. In practice this has not
 been observed as the cause of any desync (the server appears to avoid emitting
 a maximally-sized final fragment), so the test holds for normal traffic.
 
+**Reading a message that spans packets, and why the wait must be bounded**
+(#848 / #851 / #868). The receive side has the harder half of this. A TTC
+*message* is a byte stream; TNS packets are only its transport, and a large one
+— an OALL8 with sizeable inline binds, a LOB `WRITE` — arrives as several `DATA`
+packets. The reference thin client sends those continuations with **no `0x0020`
+MORE flag**, so `read_packet` hands back only the first and parsing it runs off
+the end.
+
+That leaves exactly one signal that a message is complete: **the parser
+succeeded**. The Mirror's codec primitives say the opposite by raising
+`Truncated`, and the reader grows the buffer with further packets until the
+parse stops complaining.
+
+The catch is that `Truncated` means only "the parser ran off the end", and two
+quite different things produce it: a message genuinely cut by the transport, and
+a **decode fault inside a message that is already complete** — a decoder that
+misreads a marker as a length asks for bytes that were never sent and looks
+exactly the same. There is no positional or structural test that separates them,
+because the faulty read also runs past the buffer's end.
+
+So the wait is **bounded**, and the invariant is worth stating plainly: *the
+Mirror never blocks indefinitely on a request it has begun parsing.* A genuine
+continuation is already in flight — the client wrote the whole message in one
+call — so a couple of seconds is a vast margin, while a message that will never
+complete is refused (`ORA-03115`) like any other request the server cannot
+serve. Without that bound a single decode fault hangs the session with the
+client blocked on its reply: the silent-hang failure mode of §(unimplemented
+calls) returning through a different door, and one such wedge stalls an entire
+conformance run.
+
+The timeout is a backstop for decoder bugs, not a substitute for correct
+decoders — the fault that exposed it (§12.2, the `0xFD` marker) was fixed so the
+bound is rarely reached rather than load-bearing.
+
 The **Mirror** (server side) fragments a large `DATA` response this same way —
 `seerdb/server/framing.py::PacketStream._write_data` emits continuation packets
 of exactly `SDU-37` bytes and a final packet of the remainder. It must *not*
@@ -2490,12 +2524,27 @@ bytes — e.g. NUMBER scale `-127` arrives as `0x81 0x7f` and `-256` as
 
 Variable-length data with a length prefix:
 
-| Length     | Encoding                                                     |
-|------------|--------------------------------------------------------------|
-| 0 (empty)  | `0x00`                                                       |
-| 1..253     | `<length>, <data>`                                           |
-| 254 (long) | `0xFE`, then chunked: repeated `<chunk_len>, <chunk_data>` (max 64 bytes per chunk), terminated by `0x00` |
-| 255 (null) | `0xFF` — null marker, no data follows                        |
+| Length byte    | Encoding                                                 |
+|----------------|----------------------------------------------------------|
+| `0x00` (empty) | nothing follows                                          |
+| `0x01`..`0xFC` | `<length>, <data>` — **252 is the largest real length**   |
+| `0xFD` (253)   | **escape / absent value**: the 2-byte placeholder `FD 01`, no data. Not a length. |
+| `0xFE` (254)   | chunked: repeated `<chunk_len>, <chunk_data>` (max 64 bytes per chunk), terminated by `0x00` |
+| `0xFF` (255)   | null marker, no data follows                             |
+
+**The top three bytes are markers, not lengths**, and getting that wrong is not
+theoretical. This table used to read `1..253` for the plain form, contradicting
+§11's own statement that "the boundary is 252, not 253" — and `decode_dalc` was
+written from the table. A NULL `BOOLEAN` bind, whose value slot carries the
+`FD 01` placeholder, was therefore read as a length of 253, so the decoder asked
+for bytes that had never been sent, the message looked truncated, and the Mirror
+blocked waiting for a continuation that could never arrive (#869, and the hang
+it caused, #868).
+
+`FD 01` means **the slot carries no value**: a pure-OUT bind, or a NULL of a
+type with no inline form. §19.7 documents the same placeholder on the OCI
+dialect's bind rows — it is shared, not OCI-specific, which is precisely what
+the thin decoder had missed.
 
 ### 12.3 Key-Value Pair Encoding
 
