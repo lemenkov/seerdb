@@ -9975,6 +9975,23 @@ def decode_dalc(Bytes: bytes) -> tuple[bytes | list, bytes]:
             return ([], Bytes[1:])
         if Bytes[0] == TNS_LONG_LENGTH_INDICATOR:
             return decode_chr(Bytes)
+        if Bytes[0] == TNS_ESCAPE_CHAR:
+            # The wire's absent-value marker, NOT a length of 253. A bind whose
+            # slot carries no inline value -- a pure-OUT bind, or a NULL of a
+            # type with no inline form, such as the NULL BOOLEAN the reference
+            # client sends -- fills it with the two-byte placeholder `FD 01`.
+            # The three bytes above TNS_MAX_SHORT_LENGTH (252) are all markers:
+            # 0xFF null, 0xFE chunked, and this one. The first two were honoured
+            # here and this one was not, so it was read as a length and the
+            # decoder asked for 253 bytes that had never been sent (#869) --
+            # which made a complete message look truncated and hung the session
+            # waiting for the rest of it (#868).
+            #
+            # Same reading as the OCI bind path and the 8i encoder's
+            # _O8I_OUT_PLACEHOLDER, which have always known this shape.
+            if len(Bytes) < 2:
+                raise Truncated('DALC: absent-value marker cut short')
+            return ([], Bytes[2:])
         Length = Bytes[0]
         if len(Bytes) < Length + 1:
             # The case the IndexError handler below never caught: a length byte
