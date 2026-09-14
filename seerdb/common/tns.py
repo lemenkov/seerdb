@@ -232,6 +232,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_CHAR,
     TNS_TYPE_CLOB,
     TNS_TYPE_DATE,
+    TNS_TYPE_INT,
     TNS_TYPE_INTERVALDS,
     TNS_TYPE_INTERVALYM,
     TNS_TYPE_JSON,
@@ -10111,6 +10112,13 @@ def encode_value(Value: object, DataType: int) -> bytes:
         if DataType in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
             return encode_lob_locator_thin(_lob_value_size(Value), with_metadata=True)
         return encode_lob_locator_thin()
+    if DataType == TNS_TYPE_INT and isinstance(Value, (int, float, Decimal)):
+        # Oracle's native integer, not a base-100 NUMBER: the client reads it
+        # with a 4-byte-max integer read, so a NUMBER encoding comes back as
+        # "read integer of length 10 when expecting no more than 4" (#888).
+        # A non-numeric value for this type falls through to the branches below
+        # rather than raising -- bind leniency is deliberate here.
+        return encode_sb4(int(Value))
     if DataType == TNS_TYPE_BOOLEAN:
         # Native SQL BOOLEAN (23ai): a one-byte value, 0x01 for TRUE and 0x00 for
         # FALSE, which the client reads by its last byte (Data[-1] != 0). This must

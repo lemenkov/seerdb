@@ -150,6 +150,11 @@ TNS_TYPE_CHAR = 96
 TNS_TYPE_VARCHAR = 1
 TNS_TYPE_VCS = 9
 TNS_TYPE_NUMBER = 2
+# Oracle's native signed integer (pls_integer / binary_integer). A client
+# declares it for a numeric PL/SQL OUT bind, and an overloaded procedure
+# resolves on it -- forwarding such a bind as VARCHAR makes the call
+# ambiguous (PLS-00307) even though the value itself is fine (#888).
+TNS_TYPE_INT = 3
 TNS_TYPE_FLOAT = 4
 TNS_TYPE_VARNUM = 6
 TNS_TYPE_LONG = 8
