@@ -33,7 +33,12 @@ from seerdb.common.datatypes import (
     Var,
 )
 from seerdb.common.date import date
-from seerdb.common.exceptions import DataError, InterfaceError, Truncated
+from seerdb.common.exceptions import (
+    DataError,
+    InterfaceError,
+    NotSupportedError,
+    Truncated,
+)
 from seerdb.common.sqltext import is_plsql, returning_bind_positions
 from seerdb.common.vector import (
     VECTOR_BIND_DESCRIPTOR,
@@ -661,7 +666,7 @@ def decode_packet(Data: bytes, Acc: tuple, FieldVersion: int | None = None) -> t
     # No case matched — raise here rather than via `case _` so every branch is a
     # value-return, matching encode_dictionary below and keeping CodeQL's flow
     # analysis happy (the `case _` wildcard reads as an implicit fall-through).
-    raise Exception("Can't decode unknown type", Token, Data, Acc)
+    raise NotSupportedError(f'no decoder for response token {Token}')
 
 
 def _decode_bvc_step(Data: bytes, Acc: tuple) -> tuple:
@@ -9657,7 +9662,9 @@ def encode_sb4(Val: int) -> bytes:
             return bytes([4, Bytes[0], Bytes[1], Bytes[2], Bytes[3]])
     # Out of ub4 range (or negative); raise here rather than via `case _` so
     # every branch is a value-return for flow analysis.
-    raise Exception("Can't encode value", Val)
+    raise NotSupportedError(
+        f'no wire encoding for a value of type {type(Val).__name__}'
+    )
 
 
 # The end-of-fetch OER (ORA-01403 "no data found"): the OER return-status token
@@ -9902,7 +9909,6 @@ def encode_value(Value: object, DataType: int) -> bytes:
     column's temporal type. ROWID / UROWID / LONG carry their own framing (a NULL
     still carries it, so they skip the bare-0x00 NULL path), and a LOB rides as a
     minted locator with its content following over TTI_LOBOPS."""
-    from seerdb.common.exceptions import InterfaceError
 
     if DataType == TNS_TYPE_RID:
         return encode_rowid_value(Value)
@@ -9961,7 +9967,9 @@ def encode_value(Value: object, DataType: int) -> bytes:
         # A VARCHAR2 / RAW column value: length-prefixed data, chunked when it
         # exceeds the single-byte length, honouring the negotiated field version.
         return encode_chr(Value)
-    raise InterfaceError(f'unsupported column value type: {type(Value).__name__}')
+    raise NotSupportedError(
+        f'no wire encoding for a column value of type {type(Value).__name__}'
+    )
 
 
 def decode_dalc(Bytes: bytes) -> tuple[bytes | list, bytes]:
@@ -10405,7 +10413,9 @@ def encode_token_oac(Token: object) -> bytes:
             if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_23_1:
                 return encode_token_raw(TNS_TYPE_BOOLEAN, 4, 0, 0, 0, A)
             return encode_token_raw(TNS_TYPE_NUMBER, 22, 0, 0, 0, A)
-        raise Exception('Unsupported Var OAC type', DT)
+        raise NotSupportedError(
+            f'no bind encoding for data type {DT}',
+        )
     if isinstance(Token, TempLob):
         # Temp-LOB locator bind (#91): a CLOB / BLOB OAC carrying the LOB
         # cont-flag 0x02000000 (the same flag the native VECTOR / JSON OACs
