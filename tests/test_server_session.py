@@ -1164,6 +1164,73 @@ def test_backend_codec_context_does_not_leak_into_the_session() -> None:
     assert backend.binds[1] == [text]
 
 
+# The end-to-end tracing piggyback modern sqlplus sends immediately after login,
+# captured live (sqlplus 23.26, field version 6): the 0x11 0x87 header, a fixed
+# block whose marshalled fields include client pointer values, the module name
+# "SQL*Plus" as its only set value, and then the real call -- 03 0e, a commit.
+_OCI_E2E_PIGGYBACK_SQLPLUS = bytes.fromhex(
+    '1187020000000000000000000000000000000018000000000000000000000000'
+    '0000000000000000000000feffffffffffffff18000000000000002806734615'
+    '5600000000000000000000000000000000000000000000000001000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '00000000000000000000000853514c2a506c7573030e03'
+)
+
+
+def test_oci_tracing_piggyback_is_walked_to_the_call_behind_it() -> None:
+    # Modern sqlplus bundles its tracing attributes as a piggyback in FRONT of a
+    # real call. The OCI loop stripped only the close-cursors and TTI_80SES
+    # wrappers, so this one fell through and the session was closed on the
+    # client -- sqlplus then reported ORA-03114 for every statement (#825).
+    #
+    # Its thick-OCI block is not decoded: only one live sample exists and
+    # several layouts fit it. The walker reads the length-prefixed values and
+    # then CHECKS its landing, returning None rather than guessing, so an
+    # unknown shape becomes a refusal instead of a desynchronised stream.
+    from seerdb.common.oci import strip_oci_e2e_piggyback
+    from seerdb.common.tns_consts import TTI_COMMIT, TTI_FUN
+
+    behind = strip_oci_e2e_piggyback(_OCI_E2E_PIGGYBACK_SQLPLUS)
+    assert behind == bytes([TTI_FUN, TTI_COMMIT, 3])
+
+    # A shape it cannot walk is reported, never guessed at: a block whose values
+    # run off the end, and one that never reaches a TTI_FUN.
+    assert strip_oci_e2e_piggyback(_OCI_E2E_PIGGYBACK_SQLPLUS[:145]) is None
+    assert strip_oci_e2e_piggyback(bytes([0x11, 0x87]) + bytes(200)) is None
+
+
+def test_oci_loop_refuses_an_unknown_call_instead_of_closing_the_session() -> None:
+    # The OCI loop used to `return` on any call it did not implement, which
+    # closes the connection: sqlplus renders that as ORA-03113 / ORA-03114 for
+    # everything afterwards, indistinguishable from the server crashing, and one
+    # unimplemented call takes the whole session with it. The thin loop was
+    # taught to refuse in #832/#836; this is the same rule for the thick one.
+    from seerdb.common.tns_consts import TNS_DATA
+    from seerdb.server.session import _serve_oci_session
+
+    unknown = bytes([TTI_FUN, 0xFA, 1])  # a function the Mirror does not serve
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.inbox = [(TNS_DATA, unknown), (TNS_DATA, unknown), None]
+            self.sent: list[tuple[int, bytes]] = []
+
+        def read_packet(self):
+            return self.inbox.pop(0)
+
+        def write_packet(self, ptype: int, body: bytes, **_kw) -> None:
+            self.sent.append((ptype, body))
+
+    stream: Any = _Stream()
+    backend: Any = object()
+    assert _serve_oci_session(stream, backend, 'PYO') == 'PYO'
+    # BOTH calls were answered -- the session survived the first refusal, which
+    # is the whole point -- and each answer names the error the client knows.
+    assert len(stream.sent) == 2
+    for _ptype, body in stream.sent:
+        assert b'ORA-03115' in body
+
+
 def test_oci_loop_answers_a_break_marker() -> None:
     """A break / reset marker gets a marker back, not silence.
 

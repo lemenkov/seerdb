@@ -19,7 +19,7 @@ type maps) stay server-side: a client parses whatever the real server sends and
 never emits those.
 """
 
-from seerdb.common.tns_consts import TTI_80SES, TTI_MSG_TYPE_PIGGYBACK
+from seerdb.common.tns_consts import TTI_80SES, TTI_FUN, TTI_MSG_TYPE_PIGGYBACK
 
 # The 8-byte pointer indicator the OCI dialect uses where a thin client writes a
 # single ``0x01`` marker byte: 0xFFFFFFFFFFFFFFFE, little-endian. It flags a
@@ -81,3 +81,42 @@ OCI_CMD_COMMIT = 44  # bare COMMIT typed as a statement (not OCITransCommit)
 OCI_CMD_ROLLBACK = 45  # bare ROLLBACK typed as a statement
 OCI_CMD_PLSQL = 47  # anonymous PL/SQL block (EXEC / OUT-bind reply)
 OCI_CMD_TRUNCATE_TABLE = 85
+
+# The end-to-end tracing piggyback (func TTI_SCID = 135) in the OCI dialect
+# (#825). Modern sqlplus sends it once, immediately after login, carrying its
+# module name -- and it is a PREFIX: a real call follows in the same message.
+#
+# Only ONE live sample exists (sqlplus 23.26 at field version 6, module
+# "SQL*Plus"), and several field layouts fit it, so the block is NOT decoded
+# here. What the sample does establish is its shape: a fixed head whose
+# marshalled fields include client pointer values -- `fe ff ff ff ff ff ff ff`
+# (OCI_INDICATOR) at offset 43 and a heap address at 59, which vary per run --
+# followed by the attribute values as length-prefixed strings, and then the
+# call. Offset 139 is where the values begin in that sample, and 0x18
+# (MODULE | ACTION, exactly what sqlplus sets) sits at offset 19.
+#
+# So the walker below reads the values and then CHECKS ITS OWN ANSWER: it must
+# land on a TTI_FUN byte, or it reports failure and the caller refuses the
+# message. A wrong offset therefore costs a legible ORA-03115 and a session that
+# stays usable -- never a desynchronised stream, which is the failure mode that
+# guessing a layout invites.
+OCI_E2E_VALUES_OFF = 139
+OCI_E2E_MAX_VALUES = 9  # client_identifier, module, action, ... (thin's slots)
+
+
+def strip_oci_e2e_piggyback(body: bytes) -> bytes | None:
+    """The real call behind an OCI end-to-end tracing piggyback, or ``None``.
+
+    ``None`` means "this does not walk", and the caller must refuse the message
+    rather than guess at it. See the note above for why the check matters more
+    than the layout.
+    """
+    at = OCI_E2E_VALUES_OFF
+    for _ in range(OCI_E2E_MAX_VALUES + 1):
+        if at >= len(body):
+            return None
+        if body[at] == TTI_FUN:
+            # Landed on the call, and there is a function code behind it.
+            return body[at:] if at + 1 < len(body) else None
+        at += 1 + body[at]  # a length-prefixed attribute value
+    return None
