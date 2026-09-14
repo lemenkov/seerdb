@@ -2056,7 +2056,8 @@ and the error code distinguishes the outcome. On 11g:
 ```
 TTI_OER |
   call_status (ub4) |
-  end_to_end_seq# (ub2, skipped) |
+  end_to_end_seq# (ub2, skipped)  -- diagnostic only; the Mirror advances it
+                                  -- per message, see 36.2 |
   current_row_number (ub4)    -- the DML rowcount on 11g (see note) |
   ora_error_code (ub2)        -- 0 on success |
   array_elem_error (ub2, skipped) | array_elem_error (ub2, skipped) |
@@ -4934,10 +4935,22 @@ failures, not sequence-value mismatches).
 
 Because the field is consumer-ignored, the Mirror is free to emit **any**
 monotonic value — but a real server *advances* it per reply, so the Mirror does
-too: `seerdb/server/session.py:_OciSequence` is a per-session counter (`+1` per
-OER-bearing reply, starting at `1`) threaded into every OCI status builder,
-replacing the frozen per-capture constant each status was reverse-engineered
-with. The captured adjacency of the SELECT execute status (`19`) and the
+too, on **both** reply paths:
+
+- **thick / OCI** — `seerdb/server/session.py:_OciSequence`, a per-session
+  counter (`+1` per OER-bearing reply, starting at `1`) threaded into every OCI
+  status builder.
+- **thin** — the `_ENCODE_OER_SEQ` context variable, advanced once per message
+  by the session loop beside the field version and read by `_encode_oer`, so
+  every thin status, error and fetch terminator in a session carries a moving
+  value (#842). A caller that pins `seq` explicitly is reproducing a captured
+  frame byte-for-byte and is deliberately unaffected — that is what keeps
+  `_END_OF_FETCH` verbatim.
+
+Both replace the frozen per-capture constant each status was reverse-engineered
+with. On the thin side the live evidence is the 23ai auth exchange captured for
+§4.1.2, where consecutive replies differ in exactly this field —
+`04 01 01 02 18 16` for the challenge and `04 01 01 02 18 17` for the result. The captured adjacency of the SELECT execute status (`19`) and the
 following fetch terminator (`20`) is the evidence that the real field advances
 `+1` per reply. The start value and step are therefore Mirror
 response-generation policy, not a decoded Oracle rule. (Offline tests reproduce

@@ -471,6 +471,16 @@ _DECODE_FIELD_VERSION = contextvars.ContextVar('decode_field_version', default=6
 # pick the 11g vs 12c+ bind-OAC layout. Separate from the decode var so the two
 # phases never interfere. Default 6 == FIELD_VERSION_11_2.
 _ENCODE_FIELD_VERSION = contextvars.ContextVar('encode_field_version', default=6)
+# The per-session OER end-to-end sequence number for the THIN reply path (#842).
+# A real server advances this diagnostic counter on every reply; the thick/OCI
+# path already does so via _OciSequence, while the thin path emitted the frozen
+# value each captured status was reverse-engineered with, so every session
+# repeated one number. Set per message by the Mirror's session loop, exactly as
+# the field version is. No client validates the field -- the reference thin
+# client reads it into nothing (`skip_ub2`) and seerdb's does not read it at all
+# -- so the start value and step are the Mirror's response-generation policy,
+# not a decoded Oracle rule.
+_ENCODE_OER_SEQ = contextvars.ContextVar('encode_oer_seq', default=0)
 
 # Set True for the duration of an execute that requested array-DML row counts
 # (oracledb arraydmlrowcounts, #18). It tells decode_token_rpa_piggyback to
@@ -1132,7 +1142,7 @@ def _encode_oer(
     cursor_id: int = 0,
     batch_errors: list[tuple[int, int, str]] | None = None,
     *,
-    seq: int = 0,
+    seq: int | None = None,
     error_pos: int = 0,
     sql_type: int = 0,
     call_number: int = 0,
@@ -1146,6 +1156,10 @@ def _encode_oer(
     # the OER fields left zero by the ordinary error/status paths but non-zero in a
     # captured terminator (see :data:`_END_OF_FETCH`); they carry the captured
     # value there and default to zero everywhere else.
+    # A caller that pins `seq` is reproducing a captured frame byte for byte;
+    # everyone else gets the session's live counter (#842).
+    if seq is None:
+        seq = _ENCODE_OER_SEQ.get()
     batch_errors = batch_errors or []
     codes = [code for _offset, code, _msg in batch_errors]
     offsets = [offset for offset, _code, _msg in batch_errors]
@@ -9706,7 +9720,6 @@ def _end_of_fetch(cursor_id: int = 1) -> bytes:
         1,
         b'ORA-01403: no data found\n',
         cursor_id=cursor_id,
-        seq=4,
         error_pos=14,
         sql_type=3,
         call_number=7,

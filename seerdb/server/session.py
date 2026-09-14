@@ -35,6 +35,7 @@ from seerdb.common.oci import (
 from seerdb.common.tns import (
     _DECODE_FIELD_VERSION,
     _ENCODE_FIELD_VERSION,
+    _ENCODE_OER_SEQ,
     _SERVER_RUNTIME_CAPS,
     ArrayOutBind,
     ColumnMeta,
@@ -703,6 +704,8 @@ def serve_session(
     # TTI_LOBOPS reads (it reads each LOB whole, row-major) (#413).
     lobs: list[tuple[bytes, bool]] = []
     temp_lobs = _TempLobs()
+    # The thin reply path's OER sequence, advanced per message below (#842).
+    oer_seq = 0
     while True:
         # The codec's per-message state defaults to 11g (and token auth leaves it
         # at 12.2); pin it to the field version this session negotiated so each
@@ -710,6 +713,14 @@ def serve_session(
         # backend runs in a copied context, so its own client cannot disturb it.
         _DECODE_FIELD_VERSION.set(field_version)
         _ENCODE_FIELD_VERSION.set(field_version)
+        # Advance the thin path's OER end-to-end sequence once per message, so a
+        # session's replies carry a moving counter like a live server's instead
+        # of repeating the value the captured statuses were decoded with (#842).
+        # The thick/OCI loop has done this since it was written (_OciSequence);
+        # this is the thin half. Captured from 23ai, consecutive replies differ
+        # by one in exactly this field: 0x1816 then 0x1817.
+        oer_seq += 1
+        _ENCODE_OER_SEQ.set(oer_seq)
         received = stream.read_packet()
         if received is None:
             return user
