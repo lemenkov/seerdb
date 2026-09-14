@@ -24,6 +24,7 @@ from seerdb.common.tns import (
 )
 from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
+    TNS_EOCS_FLAGS_TXN_IN_PROGRESS,
     TNS_TYPE_BDOUBLE,
     TNS_TYPE_BFLOAT,
     TNS_TYPE_BLOB,
@@ -3265,3 +3266,76 @@ def test_run_returning_runs_once_per_iteration_when_no_input_row() -> None:
     assert len(sent) == 3
     assert all(len(row) == 1 and isinstance(row[0], BindVar) for row in sent)
     assert len(result.returned_rows) == 3
+
+
+def test_encode_status_reports_no_transaction_by_default() -> None:
+    # call_status is a flag word; with no transaction open the bit stays clear
+    # and the reply is exactly what it always was.
+    from seerdb.common.tns import decode_ub4, encode_status
+
+    status, _ = decode_ub4(encode_status(1)[1:])
+    assert status == 0
+
+
+def test_encode_status_sets_the_transaction_flag_while_one_is_open() -> None:
+    # A live server sets TXN_IN_PROGRESS in every reply's call_status while the
+    # session holds an uncommitted transaction. python-oracledb reads that bit to
+    # decide whether releasing the connection owes a rollback; with it clear the
+    # DML kept its TM lock and blocked later statements with ORA-00054 (#889).
+    from seerdb.common.tns import _ENCODE_TXN_IN_PROGRESS, decode_ub4, encode_status
+
+    token = _ENCODE_TXN_IN_PROGRESS.set(True)
+    try:
+        status, _ = decode_ub4(encode_status(1)[1:])
+    finally:
+        _ENCODE_TXN_IN_PROGRESS.reset(token)
+    assert status & TNS_EOCS_FLAGS_TXN_IN_PROGRESS
+
+
+def test_transaction_flag_is_ored_into_the_callers_status() -> None:
+    # The caller's value says what the reply is ("more rows"); the bit says what
+    # the session is. One must not overwrite the other.
+    from seerdb.common.tns import _ENCODE_TXN_IN_PROGRESS, decode_ub4, encode_more_rows
+
+    token = _ENCODE_TXN_IN_PROGRESS.set(True)
+    try:
+        status, _ = decode_ub4(encode_more_rows(3)[1:])
+    finally:
+        _ENCODE_TXN_IN_PROGRESS.reset(token)
+    assert status & TNS_EOCS_FLAGS_TXN_IN_PROGRESS
+    assert status & 1  # the "more rows" status the caller asked for survives
+
+
+def test_end_of_fetch_terminator_carries_the_transaction_flag() -> None:
+    # The 11g terminator is a constant built at import time, so it would freeze
+    # the flag clear; it must be re-encoded while a transaction is open (#889).
+    from seerdb.common.tns import _ENCODE_TXN_IN_PROGRESS, _end_of_fetch, decode_ub4
+
+    plain, _ = decode_ub4(_end_of_fetch()[1:])
+    token = _ENCODE_TXN_IN_PROGRESS.set(True)
+    try:
+        in_txn, _ = decode_ub4(_end_of_fetch()[1:])
+    finally:
+        _ENCODE_TXN_IN_PROGRESS.reset(token)
+    assert not plain & TNS_EOCS_FLAGS_TXN_IN_PROGRESS
+    assert in_txn & TNS_EOCS_FLAGS_TXN_IN_PROGRESS
+
+
+def test_mark_transaction_tracks_statement_kinds() -> None:
+    # DML and PL/SQL open a transaction; autocommit closes it again; a query
+    # leaves the flag as it found it.
+    from seerdb.common.tns import _ENCODE_TXN_IN_PROGRESS
+    from seerdb.server.session import _mark_transaction
+
+    token = _ENCODE_TXN_IN_PROGRESS.set(False)
+    try:
+        _mark_transaction('insert into t values (1)', False)
+        assert _ENCODE_TXN_IN_PROGRESS.get() is True
+        _mark_transaction('select 1 from dual', False)
+        assert _ENCODE_TXN_IN_PROGRESS.get() is True  # a query changes nothing
+        _mark_transaction('insert into t values (2)', True)
+        assert _ENCODE_TXN_IN_PROGRESS.get() is False  # autocommit closes it
+        _mark_transaction('begin null; end;', False)
+        assert _ENCODE_TXN_IN_PROGRESS.get() is True
+    finally:
+        _ENCODE_TXN_IN_PROGRESS.reset(token)

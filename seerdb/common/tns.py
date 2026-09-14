@@ -180,6 +180,7 @@ from seerdb.common.tns_consts import (
     TNS_END_TO_END_CLIENT_INFO,
     TNS_END_TO_END_DBOP,
     TNS_END_TO_END_MODULE,
+    TNS_EOCS_FLAGS_TXN_IN_PROGRESS,
     TNS_ESCAPE_CHAR,
     TNS_EXEC_FLAGS_DML_ROWCOUNTS,
     TNS_EXEC_FLAGS_IMPLICIT_RESULTSET,
@@ -490,6 +491,18 @@ _ENCODE_OER_SEQ = contextvars.ContextVar('encode_oer_seq', default=0)
 # of the server's. Set per message by the Mirror's OCI session loop. Like the
 # counter it sits beside, no client validates it.
 _ENCODE_OCI_CALL_SEQ = contextvars.ContextVar('encode_oci_call_seq', default=0)
+
+# True while the session being replied to has an uncommitted transaction (#889).
+# Every OER the Mirror builds then sets TXN_IN_PROGRESS in its call_status flag
+# word, which is how a client learns it owes a rollback when it releases the
+# connection to a pool or closes it. The Mirror reported a clear flag on every
+# reply, so python-oracledb concluded there was nothing to roll back, skipped it,
+# and the uncommitted DML kept its TM lock until the session finally died --
+# blocking the next test's TRUNCATE with ORA-00054 across unrelated features.
+# seerdb's own client never noticed: it rolls back unconditionally on close.
+_ENCODE_TXN_IN_PROGRESS = contextvars.ContextVar(
+    'encode_txn_in_progress', default=False
+)
 
 # Set True for the duration of an execute that requested array-DML row counts
 # (oracledb arraydmlrowcounts, #18). It tells decode_token_rpa_piggyback to
@@ -1169,6 +1182,11 @@ def _encode_oer(
     # everyone else gets the session's live counter (#842).
     if seq is None:
         seq = _ENCODE_OER_SEQ.get()
+    # call_status is a flag word, so the transaction bit is OR'd into whatever
+    # the caller asked for rather than replacing it (#889). The caller's value
+    # says what this reply is; this bit says what the session is.
+    if _ENCODE_TXN_IN_PROGRESS.get():
+        call_status |= TNS_EOCS_FLAGS_TXN_IN_PROGRESS
     batch_errors = batch_errors or []
     codes = [code for _offset, code, _msg in batch_errors]
     offsets = [offset for offset, _code, _msg in batch_errors]
@@ -9783,7 +9801,13 @@ def _end_of_fetch(cursor_id: int = 1) -> bytes:
     # cursor id out of this OER and caches it against the statement, so a
     # terminator that always says 1 tells every query it is cursor 1 (#840). The
     # default keeps the captured value for callers with no cursor of their own.
-    if cursor_id == 1 and _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_12_1:
+    if (
+        cursor_id == 1
+        and _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_12_1
+        and not _ENCODE_TXN_IN_PROGRESS.get()
+    ):
+        # The pinned constant was built at import time, so it carries a clear
+        # transaction flag; re-encode when the session has one open (#889).
         return _END_OF_FETCH
     return _encode_oer(
         1,

@@ -1110,6 +1110,27 @@ PL/SQL execute. seerdb once fetched only on `call_status == 1`, which worked
 solely because autocommit on was the default; with autocommit off a LOB
 SELECT of an uncommitted row returned no rows at all (#712).
 
+**Server side: the transaction bit is not optional (#889).** A client reads
+`TXN_IN_PROGRESS` (`0x02`) to decide whether releasing a connection to a pool,
+or closing it, owes a **rollback**. python-oracledb sends no rollback at all
+when the bit is clear — it believes there is nothing to roll back. A server that
+always reports `0` therefore leaves every uncommitted statement's TM lock held
+until the session finally dies, and the next statement needing an exclusive lock
+on that table fails with `ORA-00054`. Measured against the Mirror before the
+fix: an `INSERT` with no commit, then a pool release, then `truncate table` from
+a second connection — the truncate was refused, where the same sequence against
+a live 23ai succeeded. seerdb's own client hides the bug completely, because it
+rolls back unconditionally on close.
+
+The Mirror therefore tracks the session's transaction state and OR's the bit
+into every OER it builds (`_ENCODE_TXN_IN_PROGRESS`). It is OR'd, not assigned:
+the caller's `call_status` says what the *reply* is ("more rows" is `1`), the
+bit says what the *session* is, and both must survive. DML and PL/SQL open a
+transaction, an explicit commit / rollback closes it, autocommit closes it
+immediately, DDL commits implicitly, and a query leaves it alone. Note the 11g
+end-of-fetch terminator is a constant built at import time, so it has to be
+re-encoded rather than handed out while a transaction is open.
+
 seerdb implements the FETCH flow in `OracleConnect._drain_cursor`:
 after the initial EXEC response, if the OER is not `ORA-01403` and a cursor
 handle was returned, it loops issuing `TTI_FETCH` (with the prior
