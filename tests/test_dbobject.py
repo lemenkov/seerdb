@@ -31,10 +31,12 @@ from seerdb.common.tns import (
     _encode_ref_bind_value,
     _encode_ref_oac,
     _read_object_column,
+    encode_object_column_value,
     encode_object_image,
 )
 from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
+    TNS_TYPE_ADT,
     TNS_TYPE_CHAR,
     TNS_TYPE_NUMBER,
     TNS_TYPE_REF,
@@ -168,6 +170,116 @@ class TestObjectBindEncode(unittest.TestCase):
         Wire = _encode_object_bind_value(Obj)
         # toid = 00 22 02 08 + the 16-byte type OID + the fixed extent OID.
         self.assertIn(b'\x00\x22\x02\x08' + _ADDR_TYPE.oid, Wire)
+
+
+class TestObjectColumnValueEncode(unittest.TestCase):
+    # The Mirror re-encoding a fetched object as an RXD column value (#116). The
+    # populated frame is the write_dbobject framing (verified to round-trip); the
+    # NULL frame is byte-checked against a live 23ai capture: an object column
+    # still carries the full toid + zero image-length gate, never a bare 0x00.
+
+    # `select cast(null as ADDR_T)` on 23ai: the toid (00 22 02 08 + type OID +
+    # extent OID), empty object OID, zero snapshot/version, a zero image-length
+    # gate (=> NULL, no image), and the TOP_LEVEL flags. No packed image follows.
+    _NULL_COLUMN = bytes.fromhex(
+        '01 24 24 00 22 02 08 00112233445566778899aabbccddeeff'
+        '00000000000000000000000000010001 00 00 00 00 01 01'.replace(' ', '')
+    )
+
+    def test_populated_column_value_roundtrips(self):
+        Obj = _ADDR_TYPE.newobject({'STREET': 'Main St', 'ZIP': 12345, 'CODE': 'US'})
+        Wire = encode_object_column_value(Obj, _ADDR_TYPE.oid) + _SENTINEL
+        Col = {'type_schema': 'PYO', 'type_name': 'ADDR_T', 'charset': 0}
+        (Val, Rest) = _read_object_column(Wire, Col)
+        self.assertIsInstance(Val, ObjectImage)
+        self.assertEqual(Rest, _SENTINEL)
+        self.assertEqual(
+            decode_object_image(Val.image, _ADDR_LAYOUT),
+            [('STREET', 'Main St'), ('ZIP', 12345), ('CODE', 'US')],
+        )
+
+    def test_null_column_value_matches_capture(self):
+        self.assertEqual(
+            encode_object_column_value(None, _ADDR_TYPE.oid), self._NULL_COLUMN
+        )
+
+    def test_null_column_value_keeps_stream_in_sync(self):
+        Wire = encode_object_column_value(None, _ADDR_TYPE.oid) + _SENTINEL
+        (Val, Rest) = _read_object_column(Wire, {'charset': 0})
+        self.assertIsNone(Val)
+        self.assertEqual(Rest, _SENTINEL)
+
+    def test_null_without_type_oid_still_decodes(self):
+        # With no column type OID the frame carries an empty toid; it must still
+        # decode to NULL and leave the following row untouched.
+        Wire = encode_object_column_value(None) + _SENTINEL
+        (Val, Rest) = _read_object_column(Wire, {'charset': 0})
+        self.assertIsNone(Val)
+        self.assertEqual(Rest, _SENTINEL)
+
+
+class TestNestedObjectImageEncode(unittest.TestCase):
+    # The recursive image encoder (#116/#117/#118), the inverse of the nested
+    # decode (#920): an object attribute of an object rides inline (no header), a
+    # NULL nested object is the atomic-null 0xFD, and an object inside a
+    # collection is a length-prefixed full image. Synthetic types (the framing is
+    # layout-independent), each encode round-tripped back through the decoder.
+    _SUB_LAYOUT = [
+        {'name': 'N', 'data_type': TNS_TYPE_NUMBER, 'charset': None},
+        {'name': 'S', 'data_type': TNS_TYPE_VARCHAR, 'charset': None},
+    ]
+    _SUB_TYPE = DbObjectType('PYO', 'SUB_T', bytes.fromhex('aa' * 16), 1, _SUB_LAYOUT)
+    _NEST_LAYOUT = [
+        {'name': 'ID', 'data_type': TNS_TYPE_NUMBER, 'charset': None},
+        {
+            'name': 'SUB',
+            'data_type': TNS_TYPE_ADT,
+            'charset': None,
+            'object_type': _SUB_TYPE,
+        },
+    ]
+    _NEST_TYPE = DbObjectType(
+        'PYO', 'NEST_T', bytes.fromhex('bb' * 16), 1, _NEST_LAYOUT
+    )
+    _ARR_TYPE = DbObjectType(
+        'PYO',
+        'ARR_T',
+        bytes.fromhex('cc' * 16),
+        1,
+        [],
+        is_collection=True,
+        collection_type=COLLECTION_VARRAY,
+        element={
+            'data_type': TNS_TYPE_ADT,
+            'charset': None,
+            'object_type': _SUB_TYPE,
+        },
+    )
+
+    def test_nested_object_roundtrips(self):
+        Sub = self._SUB_TYPE.newobject({'N': 9, 'S': 'sub'})
+        Obj = self._NEST_TYPE.newobject({'ID': 1, 'SUB': Sub})
+        Attrs = dict(decode_object_image(encode_object_image(Obj), self._NEST_LAYOUT))
+        self.assertEqual(Attrs['ID'], 1)
+        self.assertEqual((Attrs['SUB'].N, Attrs['SUB'].S), (9, 'sub'))
+
+    def test_nested_null_object_is_atomic_null(self):
+        Obj = self._NEST_TYPE.newobject({'ID': 2, 'SUB': None})
+        # The NULL nested object rides as the single atomic-null byte 0xFD.
+        Image = encode_object_image(Obj)
+        self.assertIn(bytes([0xFD]), Image)
+        Attrs = dict(decode_object_image(Image, self._NEST_LAYOUT))
+        self.assertEqual(Attrs['ID'], 2)
+        self.assertIsNone(Attrs['SUB'])
+
+    def test_collection_of_objects_roundtrips(self):
+        Els = [
+            self._SUB_TYPE.newobject({'N': 1, 'S': 'a'}),
+            self._SUB_TYPE.newobject({'N': 2, 'S': 'b'}),
+        ]
+        Coll = self._ARR_TYPE.newobject(Els)
+        Out = decode_collection_image(encode_object_image(Coll), self._ARR_TYPE.element)
+        self.assertEqual([(e.N, e.S) for e in Out], [(1, 'a'), (2, 'b')])
 
 
 class TestRefBindEncode(unittest.TestCase):

@@ -1340,6 +1340,23 @@ def _thin_column_value(value: object, col: 'ColumnMeta') -> bytes:
         return encode_vector_value_thin(
             encode_vector(_vector_as(value, col.vector_format))
         )
+    if col.data_type == TNS_TYPE_ADT:
+        # A SQL object (ADT) column carries its own image framing, NULL included
+        # (#116) — the bare-0x00 NULL path below would desync the row stream.
+        return encode_object_column_value(value, col.type_oid)
+    if (
+        describe_wire_length(col) == 0
+        and col.data_type not in _ZERO_DESCRIBE_CARRIES_DATA
+    ):
+        # A plain-scalar column the describe gives a zero buffer size carries NO
+        # bytes in the row — the reference client reads it as NULL-by-describe and
+        # consumes nothing (the mirror image of the decoder's data-length-0 rule).
+        # Emitting even the empty DALC a NULL would send desyncs the reader by one
+        # byte per row; a metadata cursor's literal-NULL column (`get_type_shape`'s
+        # attrs cursor, #888) and `SELECT NULL` both describe exactly this way.
+        # LOB / LONG / ROWID / UROWID keep a zero describe length yet do carry
+        # data, so they are excluded and fall through to their own framing below.
+        return b''
     return encode_value(_national_wire_value(value, col), col.data_type)
 
 
@@ -2184,12 +2201,20 @@ def _encode_refcursor_out(bind: RefCursorOutBind) -> bytes:
     # A REF CURSOR OUT value in the IOV's RXD (#483/#84), the inverse of the
     # client's _read_refcursor_out: a 1-byte length, the inline describe body
     # (the same per-column DCB metadata a describe carries), the nested cursor
-    # id, and a 1-byte present indicator.
+    # id, then the per-value return code.
+    #
+    # The trailer is the same ub4 return code (`actual_num_bytes`) that follows
+    # every OUT-bind value, not a `0x01` marker: python-oracledb reads it with
+    # `read_sb4` after the cursor id, so a `0x01` there is taken as a length-1
+    # integer and swallows the next bind's first byte (#888). A zero return code
+    # is one `0x00` byte, which the client's reader skips as its indicator all
+    # the same, so both dialects stay in sync. A middle REF CURSOR OUT bind (the
+    # object-type metadata cursor's `attrs_rc`) desynced every following bind.
     return (
         bytes([1])  # length prefix (skipped by the client)
         + _encode_describe_body(bind.columns)
         + encode_sb4(bind.cursor_id)
-        + bytes([1])  # per-value present indicator
+        + encode_sb4(0)  # per-value return code (actual_num_bytes = 0)
     )
 
 
@@ -2227,10 +2252,22 @@ def encode_out_bind_response_thin(
             # ub4 element count, then each element as a value + return code.
             rxd += encode_sb4(len(bind.values))
             for element in bind.values:
-                rxd += encode_value(element, bind.tns_type) + encode_sb4(0)
+                rxd += _encode_out_bind_value(element, bind.tns_type) + encode_sb4(0)
         else:
-            rxd += encode_value(bind.value, bind.tns_type) + encode_sb4(0)
+            rxd += _encode_out_bind_value(bind.value, bind.tns_type) + encode_sb4(0)
     return iov + bytes(rxd) + encode_status(0)
+
+
+def _encode_out_bind_value(value: object, tns_type: int) -> bytes:
+    # One scalar OUT-bind value for the IOV's RXD. A BINARY_INTEGER / PLS_INTEGER
+    # OUT bind (``TNS_TYPE_INT``) rides as a NUMBER, not the native integer the
+    # column form uses: the client reads ``DB_TYPE_BINARY_INTEGER`` as a NUMBER,
+    # and a native ``encode_sb4`` would render 0 as an empty DALC that reads back
+    # as NULL -- python-oracledb then rejects the object-type metadata call with
+    # ``DPY-2035`` because its ``ret_val`` came back NULL rather than 0 (#888).
+    if tns_type == TNS_TYPE_INT and isinstance(value, (int, float)):
+        return _bytes_with_length(encode_token_num(value))
+    return encode_value(value, tns_type)
 
 
 def encode_returning_response(
@@ -3361,6 +3398,15 @@ _LOB_DATA_TYPES = frozenset(
 _ROWID_DATA_TYPES = frozenset((TNS_TYPE_RID,))
 _UROWID_DATA_TYPES = frozenset((TNS_TYPE_UROWID,))
 _LONG_DATA_TYPES = frozenset((TNS_TYPE_LONG, TNS_TYPE_LONGRAW))
+# Types whose row value is carried even when the describe reports a zero buffer
+# size: LOB-class (delivered over a define round-trip / TTI_LOBOPS), ROWID,
+# UROWID and LONG all send bytes the reference client reads despite the zero.
+# A plain scalar described with a zero length, by contrast, sends nothing (it is
+# read as NULL-by-describe), so the row encoder skips it (see _thin_column_value,
+# the mirror image of decode_token_rxd's data-length-0 rule).
+_ZERO_DESCRIBE_CARRIES_DATA = (
+    _LOB_DATA_TYPES | _ROWID_DATA_TYPES | _UROWID_DATA_TYPES | _LONG_DATA_TYPES
+)
 
 
 def _decode_rxd_step(Data: bytes, Acc: tuple) -> tuple:
@@ -7493,6 +7539,8 @@ def _encode_oci_value(value: object, col: ColumnMeta) -> bytes:
         return encode_lob_locator_oci(value, col.data_type == TNS_TYPE_CLOB)
     if col.data_type in _OCI_LONG_TYPES:
         return encode_long_value_oci(value)
+    if col.data_type == TNS_TYPE_ADT:
+        return encode_object_column_value(value, col.type_oid)
     return encode_value(_national_wire_value(value, col), col.data_type)
 
 
@@ -11020,6 +11068,7 @@ def encode_token_decimal(Value: Decimal) -> bytes:
 _OBJ_IMAGE_FLAGS = 0x84  # IS_VERSION_81 (0x80) | NO_PREFIX_SEG (0x04)
 _OBJ_IMAGE_FLAGS_COLLECTION = 0x88  # IS_VERSION_81 (0x80) | IS_COLLECTION (0x08)
 _OBJ_IMAGE_VERSION = 1
+_OBJ_ATOMIC_NULL = 0xFD  # marks a NULL nested object attribute (#117)
 _OBJ_TOP_LEVEL = 0x01
 _OBJ_MAX_SHORT_LEN = 245  # TNS_OBJ_MAX_SHORT_LENGTH
 # toid wrapper for a new object: 00 22 (NON_NULL_OID | HAS_EXTENT_OID) + oid +
@@ -11091,21 +11140,23 @@ def _encode_object_attr_field(DataType: int, Charset: int, Value: Any) -> bytes:
 
 
 def encode_object_image(Obj: 'DbObject') -> bytes:
-    # Pack a DbObject into its image. For an object: header (flags, version,
-    # long-form length backpatched) then each attribute length-prefixed in
-    # declaration order. For a collection (#117/#118): the header also carries a
-    # prefix segment (01 01), then a collection-flags byte, the element count,
-    # and each element. A NULL field is a single 0xFF. Mirrors python-oracledb
-    # _get_packed_data / write_header / _pack_data / _pack_value.
+    # Pack a DbObject into its image, the inverse of dbobject.decode_object_image
+    # and matching python-oracledb _pack_data / _pack_value. Recurses into nested
+    # object / collection attributes: an object attribute of an object rides
+    # inline (no header); a collection attribute, and any object / collection
+    # inside a collection, is a length-prefixed full image; a NULL nested object
+    # is the atomic-null 0xFD, a NULL collection 0xFF (#117/#118).
+    return _encode_object_image(Obj, header=True)
+
+
+def _encode_object_image(Obj: 'DbObject', *, header: bool) -> bytes:
     Typ = Obj._dbtype
     if Typ is not None and Typ.is_collection:
         Element = Typ.element or {}
-        Charset = Element.get('charset') or AL32UTF8_CHARSET
-        DataType = Element.get('data_type')
         Body = bytes([0])  # collection flags
         Body += _obj_write_length(len(Obj._elements))
         for Value in Obj._elements:
-            Body += _encode_object_attr_field(cast(int, DataType), Charset, Value)
+            Body += _encode_object_member(Value, Element, in_collection=True)
         # Collection header = flags, version, long-form length, prefix seg (01 01).
         Total = 9 + len(Body)
         return (
@@ -11122,11 +11173,12 @@ def encode_object_image(Obj: 'DbObject') -> bytes:
         )
     Body = b''
     for Attr in Typ.attrs:
-        Body += _encode_object_attr_field(
-            Attr.get('data_type'),
-            Attr.get('charset') or AL32UTF8_CHARSET,
-            Obj._attrs.get(Attr['name']),
+        Body += _encode_object_member(
+            Obj._attrs.get(Attr['name']), Attr, in_collection=False
         )
+    if not header:
+        # A nested object attribute embeds its attributes inline, no header.
+        return Body
     # Header length is written long-form (0xFE + ub4) and covers the whole image
     # (the 7-byte header included), matching python-oracledb write_header.
     Total = 7 + len(Body)
@@ -11134,6 +11186,30 @@ def encode_object_image(Obj: 'DbObject') -> bytes:
         bytes([_OBJ_IMAGE_FLAGS, _OBJ_IMAGE_VERSION, TNS_LONG_LENGTH_INDICATOR])
         + struct.pack('>I', Total)
         + Body
+    )
+
+
+def _encode_object_member(Value: object, Attr: dict, *, in_collection: bool) -> bytes:
+    from seerdb.common.dbobject import DbObject
+
+    Nested = Attr.get('object_type')
+    if Nested is not None and getattr(Nested, 'is_collection', False):
+        if Value is None:
+            return bytes([TNS_NULL_LENGTH_INDICATOR])
+        Image = _encode_object_image(cast(DbObject, Value), header=True)
+        return _obj_write_length(len(Image)) + Image
+    if Nested is not None:
+        if Value is None:
+            return bytes([_OBJ_ATOMIC_NULL])
+        if in_collection:
+            Image = _encode_object_image(cast(DbObject, Value), header=True)
+            return _obj_write_length(len(Image)) + Image
+        # An object attribute of an object: its attributes inline, no header.
+        return _encode_object_image(cast(DbObject, Value), header=False)
+    return _encode_object_attr_field(
+        cast(int, Attr.get('data_type')),
+        Attr.get('charset') or AL32UTF8_CHARSET,
+        Value,
     )
 
 
@@ -11153,6 +11229,30 @@ def _encode_object_bind_value(Obj: 'DbObject') -> bytes:
         + encode_sb4(_OBJ_TOP_LEVEL)  # flags
         + _bytes_with_length(Image)
     )  # the image
+
+
+def encode_object_column_value(Value: object, TypeOid: bytes = b'') -> bytes:
+    """The RXD wire form of a SQL object (ADT, type 109) column value — the
+    inverse of :func:`_read_object_column`, matching python-oracledb
+    ``write_dbobject``.
+
+    A populated value reuses the object bind framing (``_encode_object_bind_value``):
+    the constructed toid, an empty object OID, zero snapshot/version, the image
+    length, the TOP_LEVEL flags, then the packed image. A NULL object still carries
+    the whole frame with a zero image-length gate (and the column's type toid when
+    known), exactly as Oracle does, so the row stream stays in sync — a bare 0x00
+    DALC would desync the reader (#116)."""
+    if Value is not None:
+        return _encode_object_bind_value(cast('DbObject', Value))
+    Toid = _OBJ_TOID_PREFIX + TypeOid + _OBJ_EXTENT_OID if TypeOid else b''
+    return (
+        _obj_two_lengths(Toid)  # type OID
+        + _obj_two_lengths(b'')  # object OID (empty)
+        + encode_sb4(0)  # snapshot
+        + encode_sb4(0)  # version
+        + encode_sb4(0)  # image length gate = 0 => NULL
+        + encode_sb4(_OBJ_TOP_LEVEL)  # flags
+    )
 
 
 def _encode_object_oac(Obj: 'DbObject') -> bytes:

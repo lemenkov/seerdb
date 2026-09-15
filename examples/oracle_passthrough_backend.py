@@ -25,6 +25,7 @@ from seerdb.common.datatypes import TempLob, dbtype_for_oracle_type
 from seerdb.common.sqltext import is_plsql
 from seerdb.common.tns import AL16UTF16_CHARSET, ColumnMeta
 from seerdb.common.tns_consts import (
+    TNS_TYPE_ADT,
     TNS_TYPE_BLOB,
     TNS_TYPE_CLOB,
     TNS_TYPE_REF,
@@ -440,6 +441,14 @@ def _to_column_meta(desc: tuple) -> ColumnMeta:
     # upstream describe does not report it (falls back to FLOAT32).
     vector_format = getattr(desc, 'vector_format', None)
     vector_dimensions = getattr(desc, 'vector_dimensions', None)
+    # An object (ADT) column carries its type identity in the describe (unlike a
+    # REF, whose identity is enriched from values below); re-emit it so the
+    # external client can resolve the object type (#888). FetchInfo exposes it.
+    type_oid = type_schema = type_name = b''
+    if int(tns_type) == TNS_TYPE_ADT:
+        type_oid = getattr(desc, 'type_oid', None) or b''
+        type_schema = (getattr(desc, 'type_schema', None) or '').encode('ascii')
+        type_name = (getattr(desc, 'type_name', None) or '').encode('ascii')
     byte_size = internal_size or display_size or 0
     if csfrm == 2:
         # National char (NCHAR / NVARCHAR2): UTF-16BE in AL16UTF16. data_length is
@@ -461,4 +470,7 @@ def _to_column_meta(desc: tuple) -> ColumnMeta:
         null_ok=int(bool(null_ok)),
         vector_format=vector_format,
         vector_dimensions=vector_dimensions,
+        type_oid=type_oid,
+        type_schema=type_schema,
+        type_name=type_name,
     )
