@@ -708,6 +708,9 @@ def serve_session(
     # the order their locators went out; the thin client drains them with
     # TTI_LOBOPS reads (it reads each LOB whole, row-major) (#413).
     lobs: list[tuple[bytes, bool]] = []
+    # The LOB a client is part-way through reading, kept across its several
+    # TTI_LOBOPS passes (#903); None until the first read.
+    current_lob: tuple[bytes, bool] | None = None
     temp_lobs = _TempLobs()
     # The thin reply path's OER sequence, advanced per message below (#842).
     oer_seq = 0
@@ -780,7 +783,9 @@ def serve_session(
             if completed is None:
                 continue
             body = completed
-            lobs = _answer_lobops(stream, body, lobs, temp_lobs)
+            lobs, current_lob = _answer_lobops(
+                stream, body, lobs, temp_lobs, current_lob
+            )
         elif body[1] == TNS_FUNC_REEXECUTE_AND_FETCH:
             # The rows carry no OACs -- the cursor's opening execute declared the
             # types -- so look those up from the header first, then read the
@@ -834,7 +839,7 @@ def serve_session(
                 stream, backend, reexecute, cursors, temp_lobs
             )
         elif body[1] == TTI_FETCH:
-            _answer_fetch(stream, parse_fetch(body), cursors)
+            lobs += _answer_fetch(stream, parse_fetch(body), cursors)
         elif body[1] == TTI_COMMIT:
             _answer_txn(stream, backend, commit=True)
         elif body[1] == TTI_ROLLBACK:
@@ -1700,7 +1705,8 @@ def _answer_lobops(
     body: bytes,
     lobs: list[tuple[bytes, bool]],
     temp_lobs: _TempLobs,
-) -> list[tuple[bytes, bool]]:
+    current_lob: tuple[bytes, bool] | None = None,
+) -> tuple[list[tuple[bytes, bool]], tuple[bytes, bool] | None]:
     # Dispatch a thin TTI_LOBOPS message. CREATE_TEMP / WRITE drive the temp-LOB
     # write flow (#412); FREE_TEMP / OPEN / CLOSE / TRIM / GET_CHUNK_SIZE are
     # acknowledged so a programmatic client doesn't desync (#417); a plain READ
@@ -1710,31 +1716,45 @@ def _answer_lobops(
     if request.kind == 'create_temp':
         locator = temp_lobs.mint(request.is_blob)
         stream.write_packet(TNS_DATA, encode_create_temp_response(locator))
-        return lobs
+        return lobs, current_lob
     if request.kind == 'write':
         # Append at the write offset the client streamed (it writes from the
         # start and appends, so a plain concat matches every real client).
         temp_lobs.append(request.locator, request.payload)
         stream.write_packet(TNS_DATA, encode_lobops_ack(request.locator))
-        return lobs
+        return lobs, current_lob
     if request.kind == 'free_temp':
         # Release the temp LOB now rather than at session end.
         temp_lobs.free(request.locator)
         stream.write_packet(TNS_DATA, encode_lobops_ack(request.locator))
-        return lobs
+        return lobs, current_lob
     if request.kind == 'ack':
         # OPEN / CLOSE / TRIM / GET_CHUNK_SIZE: acknowledge with the content-free
         # reply the client accepts. The value-returning form (a real chunk size,
         # applying TRIM's length) is deferred (#421) — no test client needs it.
         stream.write_packet(TNS_DATA, encode_lobops_ack(request.locator))
-        return lobs
-    # A READ of an emitted column locator: hand back the next queued LOB whole,
-    # row-major, matching the order the locators went out (#413).
-    content, is_clob = lobs.pop(0) if lobs else (b'', True)
+        return lobs, current_lob
+    # A READ of an emitted column locator. The queue is row-major, matching the
+    # order the locators went out (#413), but a client reads a large LOB in
+    # several passes, so the entry stays until it is drained and each read is
+    # served the slice it asked for (#903). A read at offset 1 starts the next
+    # LOB; later offsets continue the current one -- the same rule the OCI loop
+    # follows.
+    if request.offset <= 1 or not current_lob:
+        current = lobs.pop(0) if lobs else (b'', True)
+    else:
+        current = current_lob
+    content, is_clob = current
+    unit = 2 if is_clob else 1  # bytes per counted unit (a CLOB rides UTF-16BE)
+    total = len(content) // unit
+    start = request.offset - 1
+    count = total - start if request.amount <= 0 else min(request.amount, total - start)
+    count = max(count, 0)
+    slice_ = content[start * unit : (start + count) * unit]
     stream.write_packet(
-        TNS_DATA, encode_lob_read_response_thin(content, is_clob=is_clob)
+        TNS_DATA, encode_lob_read_response_thin(slice_, is_clob=is_clob)
     )
-    return lobs
+    return lobs, current
 
 
 def _resolve_temp_lob_binds(request: ExecRequest, temp_lobs: _TempLobs) -> ExecRequest:
@@ -2272,7 +2292,7 @@ def _prefetch_batch(fetch: int, total: int) -> int:
 
 def _answer_fetch(
     stream: PacketStream, request: FetchRequest, cursors: _Cursors
-) -> None:
+) -> list[tuple[bytes, bool]]:
     # Deliver the next batch of a parked result set. `take` hands back the
     # columns (the wire needs their types to encode values, though no describe is
     # sent) and the next `fetch` rows, dropping the cursor once it drains; `has`
@@ -2280,10 +2300,17 @@ def _answer_fetch(
     # terminated by ORA-01403.
     count = request.fetch if request.fetch > 0 else _ALL_ROWS
     columns, batch = cursors.take(request.cursor, count)
+    # Queue the LOB content of the rows THIS batch delivers. A result too large
+    # for one batch hands its later rows out here, and their locators are read
+    # over TTI_LOBOPS like any other -- without this the queue held only the
+    # rows the execute delivered and every later row's LOB read found nothing
+    # (#903).
+    lobs = oci_lob_contents(columns, batch) if columns else []
     response = encode_fetch_response(
         columns, batch, cursor_id=request.cursor, more=cursors.has(request.cursor)
     )
     stream.write_packet(TNS_DATA, response)
+    return lobs
 
 
 _CHANGE_PASSWORD_UNSUPPORTED = 1031  # ORA-01031: insufficient privileges
