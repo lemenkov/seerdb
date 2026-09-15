@@ -2880,6 +2880,39 @@ def test_encode_urowid_value_roundtrips_via_client_reader() -> None:
     assert rest == b'\xaa'
 
 
+def test_urowid_value_roundtrips_the_chunked_long_form() -> None:
+    # A large UROWID (an index-organized table's rowid, 300+ bytes) exceeds the
+    # 252-byte single-length limit and rides in the 0xFE-chunked form, like a
+    # LONG value. Reading it as one length-prefixed block desynced the row and
+    # left a stray 0xFE that the token loop rejected ("no decoder for response
+    # token 254", #904); encoding it raised on bytes([>255]). Round-trip both the
+    # 12c+ ub4-length chunk form and the pre-12c single-byte one.
+    import base64
+
+    from seerdb.common.tns import (
+        _DECODE_FIELD_VERSION,
+        _ENCODE_FIELD_VERSION,
+        _read_urowid_column,
+        encode_urowid_value,
+    )
+    from seerdb.common.tns_consts import FIELD_VERSION_11_2, FIELD_VERSION_23_1
+
+    # a ~400-byte rowid body -> the "*"+base64 form a decoded UROWID takes
+    big = '*' + base64.b64encode(bytes(range(200)) * 2).decode('ascii').rstrip('=')
+    for version in (FIELD_VERSION_11_2, FIELD_VERSION_23_1):
+        et = _ENCODE_FIELD_VERSION.set(version)
+        dt = _DECODE_FIELD_VERSION.set(version)
+        try:
+            wire = encode_urowid_value(big)
+            assert bytes([0xFE]) in wire[:6], version  # chunked, not single-length
+            val, rest = _read_urowid_column(wire + b'\xaa')
+        finally:
+            _ENCODE_FIELD_VERSION.reset(et)
+            _DECODE_FIELD_VERSION.reset(dt)
+        assert val == big, version
+        assert rest == b'\xaa', version
+
+
 def test_encode_value_routes_rowid_columns() -> None:
     from seerdb.common.tns import (
         encode_rowid_value,

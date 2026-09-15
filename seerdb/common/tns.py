@@ -3571,7 +3571,30 @@ def _read_urowid_column(Rest: bytes) -> tuple[str | None, bytes]:
     (NumBytes, Rest) = decode_ub4(Rest)
     if NumBytes <= 0:
         return (None, Rest)
-    Rest = Rest[1:]  # 1-byte length echo
+    if Rest[0] == TNS_LONG_LENGTH_INDICATOR:
+        # A large UROWID rides chunked (0xFE marker), like a LONG value: an
+        # index-organized table's rowid crosses the 252-byte short-length limit
+        # (its raw form carries a physical guess plus the primary key). Reading it
+        # as a single 1-byte-length block left the chunk-length prefix and the
+        # zero terminator in the stream, desyncing the row -- the leftover 0xFE
+        # then reached the token loop as "no decoder for response token 254"
+        # (#904). Same framing as _read_long_column: ub4-length chunks on 12c+, a
+        # single length byte per chunk before, both ending on a zero-length chunk.
+        Rest = Rest[1:]
+        Chunks = b''
+        Wide = _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_2
+        while Rest:
+            if Wide:
+                (ChunkLen, Rest) = decode_ub4(Rest)
+            else:
+                ChunkLen = Rest[0]
+                Rest = Rest[1:]
+            if ChunkLen == 0:
+                break
+            Chunks += bytes(Rest[:ChunkLen])
+            Rest = Rest[ChunkLen:]
+        return (urowid_to_string(Chunks), Rest)
+    Rest = Rest[1:]  # 1-byte length echo (== NumBytes) for a short UROWID
     Value = bytes(Rest[:NumBytes])
     Rest = Rest[NumBytes:]
     return (urowid_to_string(Value), Rest)
@@ -10076,7 +10099,23 @@ def encode_urowid_value(Value: object) -> bytes:
     Body = str(Value)[1:]  # drop the leading '*'
     Raw = base64.b64decode(Body + '=' * (-len(Body) % 4))
     Payload = bytes([_UROWID_TAG]) + Raw
-    return encode_sb4(len(Payload)) + bytes([len(Payload)]) + Payload
+    if len(Payload) <= TNS_MAX_SHORT_LENGTH:
+        return encode_sb4(len(Payload)) + bytes([len(Payload)]) + Payload
+    # A large UROWID (an index-organized table's rowid) rides chunked, like a
+    # LONG value: a single ub1 length cannot carry 253+ bytes and would collide
+    # with the 0xFE / 0xFF markers. ub4 total, the 0xFE marker, then a run of
+    # length-prefixed chunks (ub4 on 12c+, a single length byte before) closed by
+    # a zero-length chunk -- the inverse of the chunked branch in
+    # _read_urowid_column (#904). Without this the encoder raised on
+    # bytes([>255]) and the Mirror could not return an IOT rowid at all.
+    wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_2
+    encode_len = encode_sb4 if wide else (lambda n: bytes([n]))
+    out = bytearray(encode_sb4(len(Payload)) + bytes([TNS_LONG_LENGTH_INDICATOR]))
+    for start in range(0, len(Payload), TNS_MAX_SHORT_LENGTH):
+        chunk = Payload[start : start + TNS_MAX_SHORT_LENGTH]
+        out += encode_len(len(chunk)) + chunk
+    out += encode_len(0)  # zero-length chunk terminates the run
+    return bytes(out)
 
 
 # A thin (seerdb / oracledb-thin) LONG / LONG RAW value streams inline in the RXD
