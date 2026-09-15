@@ -1067,6 +1067,28 @@ _DESCRIBE_WIRE_LENGTH = {
 }
 
 
+# The types that carry a declared maximum size in a describe. Everything else
+# reports 0 there, and a client uses that to decide whether the column HAS an
+# internal size at all: the reference client returns `cursor.description`'s
+# internal_size only when max_size is non-zero, so reporting a figure for a
+# NUMBER or a DATE gives it a size where a live server gives it None (#905).
+_DESCRIBE_SIZED_TYPES = frozenset(
+    {
+        TNS_TYPE_VARCHAR,
+        TNS_TYPE_CHAR,
+        TNS_TYPE_RAW,
+        TNS_TYPE_LONG,
+        TNS_TYPE_LONGRAW,
+    }
+)
+
+
+def describe_max_size(col: ColumnMeta) -> int:
+    """The maximum size to describe ``col`` with: its declared size for the types
+    that have one, and 0 for every other type, matching a live server."""
+    return col.max_size if col.data_type in _DESCRIBE_SIZED_TYPES else 0
+
+
 def describe_wire_length(col: ColumnMeta) -> int:
     """The buffer length to describe ``col`` with.
 
@@ -1098,7 +1120,7 @@ def _encode_dcb_column(col: ColumnMeta, position: int) -> bytes:
         + encode_sb4(0)  # version
         + encode_sb4(col.charset)
         + bytes([col.csfrm])
-        + encode_sb4(col.max_size)
+        + encode_sb4(describe_max_size(col))
         + (encode_sb4(0) if is_12c else b'')  # oaccolid (12.2+)
         + bytes([col.null_ok, 0])  # null_ok + (skipped) v7 name length
         + _str_with_length(col.name)
