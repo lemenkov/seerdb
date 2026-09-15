@@ -2007,16 +2007,27 @@ def test_encode_lob_read_response_thin_carries_content_then_a_success_oer() -> N
     # The thin READ reply is the whole LOB as LOB_DATA followed by a success OER:
     # the client reads the content, scans to the 04 01 XX OER, and stops (#413).
     from seerdb.common.tns import (
+        _THIN_LOB_LOCATOR,
         _oci_lob_data,
+        decode_ub4,
         encode_lob_read_response_thin,
     )
+    from seerdb.common.tns_consts import TTI_RPA
 
     content = 'grüße'.encode('utf-16-be')
-    reply = encode_lob_read_response_thin(content)
+    reply = encode_lob_read_response_thin(content, is_clob=True)
     assert reply[0] == TTI_LOB
     assert reply.startswith(_oci_lob_data(content))
+    # Between the content and the OER sits the return-parameter block: the echoed
+    # locator raw (not length-prefixed, the client reads back exactly what it
+    # sent) and the amount read, in characters for a CLOB (#903).
+    tail = reply[len(_oci_lob_data(content)) :]
+    assert tail[0] == TTI_RPA
+    assert tail[1 : 1 + len(_THIN_LOB_LOCATOR)] == _THIN_LOB_LOCATOR
+    amount, rest = decode_ub4(tail[1 + len(_THIN_LOB_LOCATOR) :])
+    assert amount == len(content) // 2  # characters, not bytes
     # The trailing success OER the client scans for (04 01 <status>).
-    assert reply[len(_oci_lob_data(content)) :].startswith(b'\x04\x01')
+    assert rest.startswith(b'\x04\x01')
     assert encode_lob_read_response_thin(b'').startswith(_oci_lob_data(b''))
 
 
@@ -2028,11 +2039,17 @@ def test_lob_read_reply_chunks_in_the_negotiated_versions_framing() -> None:
     # content through the client's chunk logic.
     from seerdb.common.tns import (
         _ENCODE_FIELD_VERSION,
+        _THIN_LOB_LOCATOR,
         _oci_lob_data,
         decode_ub4,
         encode_lob_read_response_thin,
     )
-    from seerdb.common.tns_consts import FIELD_VERSION_11_2, FIELD_VERSION_23_1, TTI_OER
+    from seerdb.common.tns_consts import (
+        FIELD_VERSION_11_2,
+        FIELD_VERSION_23_1,
+        TTI_OER,
+        TTI_RPA,
+    )
 
     content = bytes(range(256)) * 3  # 768 bytes → several chunks
 
@@ -2052,7 +2069,11 @@ def test_lob_read_reply_chunks_in_the_negotiated_versions_framing() -> None:
                 break
             out += reply[pos : pos + length]
             pos += length
-        assert reply[pos] == TTI_OER  # the success OER stop signal follows
+        # The return-parameter block now sits between the chunks and the OER.
+        assert reply[pos] == TTI_RPA
+        pos += 1 + len(_THIN_LOB_LOCATOR)
+        _amount, rest = decode_ub4(reply[pos:])
+        assert rest[0] == TTI_OER  # the success OER stop signal follows
         return bytes(out)
 
     tok = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
