@@ -281,3 +281,27 @@ class Declared9iCharBind(unittest.TestCase):
         var = Var(seerdb.DB_TYPE_NCHAR)
         var.setvalue(0, 'ab')
         self.assertEqual(self._max_size(_o7_bind_oac(var, Statement=True)), 4)
+
+
+class TestArrayDmlOacRepresentative(unittest.TestCase):
+    """The single OAC an array-DML batch sends must take each column's TYPE from
+    a non-NULL value, not the first row: a column NULL in the first row but
+    holding a value later would otherwise type as a minimal VARCHAR2, and the
+    later value overflowed it on a real server (ORA-01461, #894)."""
+
+    def test_a_leading_null_column_types_from_a_later_value(self):
+        from seerdb.common.tns import _oac_rep_row
+
+        self.assertEqual(
+            _oac_rep_row([[1, None], [2, -12312.1], [3, None]]), [1, -12312.1]
+        )
+
+    def test_the_widest_string_still_wins_for_sizing(self):
+        from seerdb.common.tns import _oac_rep_row
+
+        self.assertEqual(_oac_rep_row([['a'], [None], ['bbb']]), ['bbb'])
+
+    def test_an_all_null_column_stays_null(self):
+        from seerdb.common.tns import _oac_rep_row
+
+        self.assertEqual(_oac_rep_row([[None], [None]]), [None])

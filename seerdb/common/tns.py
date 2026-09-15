@@ -7783,9 +7783,14 @@ def encode_dictionary_dty(Dictionary: dict) -> bytes:
 
 def _oac_rep_row(Rows: list) -> list:
     # For array DML, pick a representative value per column for the single OAC:
-    # the one with the largest declared size (str/bytes byte length), so the
-    # OAC's max-length covers every iteration. Fixed-size types (NUMBER, DATE,
-    # ...) keep the first row's value.
+    # a NON-NULL value (so the OAC carries the column's real TYPE) with the
+    # largest declared size (str/bytes byte length, so the OAC's max-length
+    # covers every iteration). A column that is NULL in the first row but holds a
+    # value in a later one would otherwise take its type from the None -- a
+    # minimal VARCHAR2 -- and the later value then overflowed it (ORA-01461, the
+    # value exceeded the maximum VARCHAR2 length), which is exactly what a
+    # DataFrame column with a leading NULL hits (#894). A column that is NULL in
+    # every row keeps None (a VARCHAR2 NULL bind, as before).
     def _size(Value: object) -> int:
         if isinstance(Value, str):
             return len(Value.encode('utf-8'))
@@ -7796,13 +7801,16 @@ def _oac_rep_row(Rows: list) -> list:
     NumCols = len(Rows[0])
     Rep = []
     for J in range(NumCols):
-        Best = Rows[0][J]
-        BestSize = _size(Best)
-        for R in Rows[1:]:
-            S = _size(R[J])
+        Best = None
+        BestSize = -1
+        for R in Rows:
+            Value = R[J]
+            if Value is None:
+                continue
+            S = _size(Value)
             if S > BestSize:
-                Best, BestSize = R[J], S
-        Rep.append(Best)
+                Best, BestSize = Value, S
+        Rep.append(Best if Best is not None else Rows[0][J])
     return Rep
 
 

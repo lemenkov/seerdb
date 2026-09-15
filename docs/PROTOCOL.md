@@ -1290,7 +1290,12 @@ id=:2` binds the string to `id`). seerdb therefore sizes a VARCHAR/RAW OAC to
 the actual value's byte length (NULL → 1); values genuinely over 4000 bytes
 keep their true size and the intended LONG handling (the multi-KiB CLOB/BLOB
 regular-path bind). For array DML the single OAC is sized to the widest value
-in each column across all rows.
+in each column across all rows, and its **type** is taken from a non-NULL value
+in the column, not the first row: a column NULL in row 0 but holding a value
+later would otherwise type as a minimal VARCHAR2, and the later value overflowed
+it on a real server (ORA-01461 — the value exceeded the maximum VARCHAR2 length,
+which a DataFrame column with a leading NULL hits, #894). A column NULL in every
+row keeps the VARCHAR2 NULL bind.
 
 ### 5.4 Bind Data (TTI_RXD)
 
