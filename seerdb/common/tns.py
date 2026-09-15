@@ -10702,6 +10702,33 @@ _JSON_BIND_OAC = _encode_native_lob_oac(TNS_TYPE_JSON, 0x02000000)  # 32 MiB
 _VECTOR_BIND_OAC = _encode_native_lob_oac(TNS_TYPE_VECTOR, 0x00100000)  # 1 MiB
 
 
+def _encode_lob_bind_oac(is_blob: bool) -> bytes:
+    """The CLOB / BLOB bind OAC: type 0x70 / 0x71 with the LOB cont-flag
+    0x02000000 (the flag the native VECTOR / JSON OACs set too). Built explicitly
+    because encode_token_raw zeroes the cont-flag.
+
+    The max-data-length field is the LOB's fixed buffer-size factor (112 for both
+    CLOB and BLOB, what python-oracledb announces for every LOB bind), NOT the
+    value's byte budget: the server reads a length of 0 there as "no LOB here"
+    and binds NULL, and a Var's declared size instead is rejected outright
+    (ORA-03120, two-task integer overflow), which is why a declared CLOB / BLOB
+    bind had no encoder until now (#902). The same OAC serves a temp-LOB locator
+    bind (#91) and a declared CLOB / BLOB Var (#902); a Var's IN value is promoted
+    to a temp LOB before it reaches the wire, so only its type matters here."""
+    return (
+        bytes([TNS_TYPE_BLOB if is_blob else TNS_TYPE_CLOB, 1, 0, 0])
+        + encode_sb4(_LOB_BIND_BUFFER_SIZE)  # max data length (fixed, not value)
+        + encode_sb4(0)  # max number of array elements
+        + encode_sb4(0x02000000)  # cont flag (ub8) — LOB
+        + encode_sb4(0)  # OID
+        + encode_sb4(0)  # version
+        + encode_sb4(0 if is_blob else AL32UTF8_CHARSET)  # charset id (ub2)
+        + bytes([0 if is_blob else 1])  # character set form
+        + encode_sb4(0)  # LOB prefetch length
+        + encode_sb4(0)  # oaccolid (12.2+)
+    )
+
+
 def encode_token_oac(Token: object) -> bytes:
     # The OAC field tells the server the maximum size we *might* send for
     # this bind. Oracle rejects with ORA-01461 ("can bind a LONG value only
@@ -10759,10 +10786,17 @@ def encode_token_oac(Token: object) -> bytes:
             if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_23_1:
                 return encode_token_raw(TNS_TYPE_BOOLEAN, 4, 0, 0, 0, A)
             return encode_token_raw(TNS_TYPE_NUMBER, 22, 0, 0, 0, A)
-        # A declared CLOB / BLOB Var is deliberately NOT handled here: an OAC
-        # built from the Var's size is rejected by a live server with
-        # ORA-03120 (integer overflow), so that one needs the size field
-        # decoded rather than guessed, and is left to #902's follow-up.
+        if DT in (TNS_TYPE_CLOB, TNS_TYPE_BLOB) and (
+            _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+        ):
+            # A declared CLOB / BLOB Var (cursor.var / setinputsizes): the fixed
+            # LOB bind OAC, not one sized from the Var (that overflows,
+            # ORA-03120). A non-NULL IN value is promoted to a temp LOB before
+            # encoding (Cursor._promote_lob_var_binds), so this OAC pairs either
+            # with that locator or with a NULL value (a pure OUT / NULL bind).
+            # 11g has no CREATE_TEMP for the promotion, so a CLOB / BLOB Var there
+            # keeps raising below rather than emitting a bind it cannot back. #902.
+            return _encode_lob_bind_oac(DT == TNS_TYPE_BLOB)
         if DT == TNS_TYPE_JSON:
             # The same OAC a JSON value binds with; only the Var path was
             # missing, so setinputsizes(DB_TYPE_JSON) raised (#902).
@@ -10796,21 +10830,7 @@ def encode_token_oac(Token: object) -> bytes:
         # for a non-empty LOB (any non-zero length does) but bound an **empty**
         # temp LOB as NULL -- ORA-01400 on a NOT NULL column, and a silent NULL
         # otherwise (#903).
-        DT = TNS_TYPE_BLOB if Token.is_blob else TNS_TYPE_CLOB
-        Charset = 0 if Token.is_blob else AL32UTF8_CHARSET
-        Csfrm = 0 if Token.is_blob else 1
-        return (
-            bytes([DT, 1, 0, 0])
-            + encode_sb4(_LOB_BIND_BUFFER_SIZE)
-            + encode_sb4(0)  # max number of array elements
-            + encode_sb4(0x02000000)  # cont flag (ub8) — LOB
-            + encode_sb4(0)  # OID
-            + encode_sb4(0)  # version
-            + encode_sb4(Charset)  # charset id (ub2)
-            + bytes([Csfrm])  # character set form
-            + encode_sb4(0)  # LOB prefetch length
-            + encode_sb4(0)
-        )  # oaccolid (12.2+)
+        return _encode_lob_bind_oac(Token.is_blob)
     if Token is None:
         # NULL value (0 bytes): a minimal VARCHAR OAC, again avoiding the
         # 32767 LONG-reorder swap when a NULL bind precedes another bind.

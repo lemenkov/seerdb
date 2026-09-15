@@ -1845,6 +1845,33 @@ class TempLobBindIntegration(_IntegrationBase):
         b_val = b_val.read() if hasattr(b_val, 'read') else b_val
         self.assertEqual((c_val, b_val), ('', b''))
 
+    def test_clob_blob_var_bind(self):
+        # A CLOB / BLOB bound through a Var -- setinputsizes(DB_TYPE_CLOB) or
+        # cursor.var(DB_TYPE_BLOB) -- has no inline wire form; its value is
+        # promoted to a temp LOB and the locator bound (#902). Previously raised
+        # "no bind encoding for data type 112 / 113".
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, c CLOB, b BLOB)')
+        # setinputsizes path
+        self.cur.setinputsizes(None, seerdb.DB_TYPE_CLOB, seerdb.DB_TYPE_BLOB)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (:1, :2, :3)',
+            [1, 'a clob value', b'\x01\x02\x03'],
+        )
+        # cursor.var path
+        cvar = self.cur.var(seerdb.DB_TYPE_CLOB)
+        cvar.setvalue(0, 'x' * 50000)  # over the inline limit, too
+        bvar = self.cur.var(seerdb.DB_TYPE_BLOB)
+        bvar.setvalue(0, b'\xaa' * 40000)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (2, :c, :b)', {'c': cvar, 'b': bvar}
+        )
+        self.conn.commit()
+        self.cur.execute(
+            f'SELECT id, DBMS_LOB.GETLENGTH(c), DBMS_LOB.GETLENGTH(b) '
+            f'FROM {self.TABLE} ORDER BY id'
+        )
+        self.assertEqual(self.cur.fetchall(), [(1, 12, 3), (2, 50000, 40000)])
+
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class ErrorAndRowcountIntegration(_IntegrationBase):

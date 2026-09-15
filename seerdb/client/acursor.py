@@ -30,6 +30,8 @@ from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
     FIELD_VERSION_10_2,
     FIELD_VERSION_12_1,
+    TNS_TYPE_BLOB,
+    TNS_TYPE_CLOB,
 )
 
 
@@ -103,6 +105,36 @@ class AsyncCursor(_CursorLogic):
                 Promoted.append(Value)
         return Promoted
 
+    async def _promote_lob_var_binds(self, Bind: list) -> list:
+        # Async equivalent of Cursor._promote_lob_var_binds (#902): a CLOB / BLOB
+        # bound through a Var rides as a temp-LOB locator, so promote each such
+        # Var's non-NULL value to a server temp LOB. A NULL Var keeps its typed
+        # form (a LOB bind OAC + NULL value). 12c+ only.
+        Conn = self._connection
+        if getattr(Conn, 'field_version', 0) < FIELD_VERSION_12_1 or not Bind:
+            return Bind
+        Out: list = []
+        for V in Bind:
+            if (
+                isinstance(V, Var)
+                and not V.is_array
+                and V.dbtype.tns_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB)
+                and V._value is not None
+            ):
+                IsBlob = V.dbtype.tns_type == TNS_TYPE_BLOB
+                Locator = await Conn.create_temp_lob(is_blob=IsBlob)
+                Payload = (
+                    bytes(V._value)
+                    if isinstance(V._value, (bytes, bytearray))
+                    else str(V._value)
+                )
+                if Payload:
+                    await Conn.write_temp_lob(Locator, Payload, is_blob=IsBlob)
+                Out.append(TempLob(Locator, IsBlob))
+            else:
+                Out.append(V)
+        return Out
+
     async def _run(
         self,
         operation: str,
@@ -116,6 +148,8 @@ class AsyncCursor(_CursorLogic):
         Bind = self._typed_binds(operation, Bind)
         if Batch:
             Batch = [self._typed_binds(operation, Row) for Row in Batch]
+        else:
+            Bind = await self._promote_lob_var_binds(Bind)
         self._inputsizes = ((), {})
         _check_object_bind_support(self._connection, Bind, Batch)
         Kw: dict[str, Any] = {

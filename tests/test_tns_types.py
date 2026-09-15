@@ -186,6 +186,27 @@ class TestVarOacTypes(unittest.TestCase):
             encode_token_oac(IntervalYM(1, 2)),
         )
 
+    def test_clob_and_blob(self):
+        # A declared CLOB / BLOB Var carries the fixed LOB bind OAC -- the same
+        # one a temp-LOB locator bind uses (#902). Its type byte is 0x70 / 0x71,
+        # and it is identical to encoding a TempLob of that kind. 12.1+ only: 11g
+        # has no CREATE_TEMP for the value promotion, so it still raises there.
+        from seerdb.common.datatypes import DB_TYPE_BLOB, DB_TYPE_CLOB, TempLob
+        from seerdb.common.tns import _ENCODE_FIELD_VERSION
+        from seerdb.common.tns_consts import FIELD_VERSION_12_1
+
+        loc = b'\x00seerdb-mirror-temp-lob-\x00\x00\x00\x00\x00'
+        token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_12_1)
+        try:
+            clob_oac = encode_token_oac(Var(DB_TYPE_CLOB))
+            blob_oac = encode_token_oac(Var(DB_TYPE_BLOB))
+            self.assertEqual(clob_oac[0], 0x70)
+            self.assertEqual(blob_oac[0], 0x71)
+            self.assertEqual(clob_oac, encode_token_oac(TempLob(loc, is_blob=False)))
+            self.assertEqual(blob_oac, encode_token_oac(TempLob(loc, is_blob=True)))
+        finally:
+            _ENCODE_FIELD_VERSION.reset(token)
+
     def test_python_type_mappings_resolve(self):
         self.assertEqual(Var(datetime.timedelta).dbtype, DB_TYPE_INTERVAL_DS)
         self.assertEqual(Var(IntervalYM).dbtype, DB_TYPE_INTERVAL_YM)
