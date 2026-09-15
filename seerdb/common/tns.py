@@ -1043,6 +1043,14 @@ _DESCRIBE_WIRE_LENGTH = {
     # the client the column sends no bytes at all, and it then reads the value's
     # byte as the next column's type (#740).
     TNS_TYPE_BOOLEAN: 1,
+    # ROWID / UROWID / object (ADT, which XMLType rides as) all carry data and
+    # all reported 0 here, so a client read nothing for them and lost its place
+    # in the row -- the same fault as BOOLEAN and VECTOR. Measured on live 23ai
+    # (#887): a ROWID column describes as 1, a UROWID as 292, and an object
+    # column as 2000, the same figure a plain object and an XMLType both report.
+    TNS_TYPE_RID: 1,
+    TNS_TYPE_UROWID: 292,
+    TNS_TYPE_ADT: 2000,
     # 23ai describes a VECTOR column with length 8200, whatever the vector's
     # dimension or element format (measured: `02 20 08` in the describe of a
     # 3-element float32 column). Same failure mode as BOOLEAN above and the same
