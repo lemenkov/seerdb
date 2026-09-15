@@ -1937,7 +1937,7 @@ def _lob_data_thin(content: bytes) -> bytes:
     # same framing its own writer uses for a long bind — and a zero terminator.
     if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_12_2:
         return _oci_lob_data(content)
-    if len(content) < 0xFE:
+    if len(content) < TNS_LONG_LENGTH_INDICATOR:
         return bytes([TTI_LOB, len(content)]) + content
     out = bytearray([TTI_LOB, TNS_LONG_LENGTH_INDICATOR])
     for start in range(0, len(content), _OCI_LOB_CHUNK):
@@ -2016,7 +2016,7 @@ def _decode_lobops_chunked(data: bytes) -> bytes:
     # until a zero-length terminator (§14.2). Inverse of the client encoder.
     if not data:
         return b''
-    if data[0] != 0xFE:
+    if data[0] != TNS_LONG_LENGTH_INDICATOR:
         if len(data) < 1 + data[0]:
             raise Truncated(f'LOB write: {data[0]} bytes, {len(data) - 1} left')
         return data[1 : 1 + data[0]]
@@ -3616,7 +3616,7 @@ def _read_long_column(Rest: bytes) -> tuple[bytes | None, bytes]:
     if Marker == 0x00:
         Val = None
         Rest = Rest[1:]
-    elif Marker == 0xFE:
+    elif Marker == TNS_LONG_LENGTH_INDICATOR:
         Rest = Rest[1:]
         Chunks = b''
         if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_2:
@@ -6378,7 +6378,7 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
         )
         // 3
     )
-    if marker == 0xFE:
+    if marker == TNS_LONG_LENGTH_INDICATOR:
         # Long SQL — chunked from the marker: 0xFE, then <ub1 len><chunk> repeated
         # (a zero length, or the declared total, ends it).
         raw_sql = _read_chunked_sql(payload[sql_off - 1 :], declared_len)
@@ -6395,7 +6395,7 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
     bind_count = int.from_bytes(payload[bind_count_off : bind_count_off + 4], 'little')
     binds: list = []
     bind_meta: list[tuple[int, int]] = []
-    if bind_count and marker != 0xFE:
+    if bind_count and marker != TNS_LONG_LENGTH_INDICATOR:
         binds, bind_meta = _parse_oci_binds(payload, sql_off + marker, bind_count)
     return ExecRequest(
         sql=sql,
@@ -8453,7 +8453,7 @@ def decode_fv2_lob_chunks(Data: bytes) -> tuple[bytes, bool]:
         return (b'', False)
     # Data[1] is the 0xfe chunked marker; a non-chunked single value would be
     # `0e <len> <bytes>`, handled by treating Data[1] as the first chunk length.
-    Pos = 2 if Data[1] == 0xFE else 1
+    Pos = 2 if Data[1] == TNS_LONG_LENGTH_INDICATOR else 1
     Content = b''
     while Pos < len(Data):
         ChunkLen = Data[Pos]
@@ -9464,7 +9464,7 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
         if len(Data) <= TNS_MAX_SHORT_LENGTH:
             Out += bytes([len(Data)]) + Data
         else:
-            Out += bytes([0xFE])
+            Out += bytes([TNS_LONG_LENGTH_INDICATOR])
             for K in range(0, len(Data), 0x7FFF):
                 Chunk = Data[K : K + 0x7FFF]
                 Out += encode_sb4(len(Chunk)) + Chunk
@@ -10482,7 +10482,7 @@ def decode_kv(
             (Size, R) = decode_ub4(D)
             if R[0] == Size:
                 return (R[1 : 1 + Size], R[1 + Size :])
-            elif R[0] == 254:
+            elif R[0] == TNS_LONG_LENGTH_INDICATOR:
                 return decode_chr(R)
             else:
                 return decode_chr(R)
