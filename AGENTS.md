@@ -4,6 +4,41 @@ This file collects repeatable procedures for automated / AI agents working
 on seerdb. For the project's clean-room posture and contribution rules, read
 [`CONTRIBUTING.md`](CONTRIBUTING.md) first — those requirements always apply.
 
+## Before you open a PR
+
+Linting and type checking are expensive to run on GitHub, so they are **not**
+what CI is for. Run them locally — they gate opening a PR:
+
+```sh
+ruff check seerdb tests
+ruff format --check seerdb tests
+python -m mypy
+reuse lint
+```
+
+All four, every time, including before amending onto a PR that is already open.
+
+Two things bite repeatedly:
+
+- **`python -m mypy` takes no path.** Bare, it checks every file including the
+  tests; `mypy seerdb` checks a third of them and has passed while the real gate
+  failed. Prefer narrowing a type to silencing it — a wrong `# type: ignore[...]`
+  error code is itself an error.
+- **`reuse lint` sees untracked files.** A suite run leaves
+  `mirror-passthrough.log` and `mirror-postgres.log` beside the checkout, and
+  `reuse` flags them even though git ignores them. Delete them before linting,
+  and never stage them.
+
+### Tests
+
+CI runs the offline suite and 23ai. Everything else — 8i, 9i, 10g, 11g, 21c, the
+Mirror legs and the SQLAlchemy compliance suite — is **local only**, so a green
+CI badge says little about a change to the codec or the login path. Run the
+tiers your change can reach, and put the numbers in the PR description.
+
+A docs-only change needs none of the test tiers; the repository's own workflows
+skip them on those paths too.
+
 ## Cutting a release
 
 seerdb releases publish to PyPI automatically via GitHub Actions Trusted
