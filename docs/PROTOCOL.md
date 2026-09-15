@@ -897,13 +897,23 @@ TTI_FUN | TTI_AUTH | SeqNum | 1 | UserLen | AuthMode | 1 | NumPairs | 1 | 1 |
 
 If successful, the server returns TTI_RPA with:
 
-| Key                   | Description                        |
-|-----------------------|------------------------------------|
-| `AUTH_SVR_RESPONSE`   | Server proof (hex-encoded)         |
-| `AUTH_VERSION_NO`     | Server version number              |
-| `AUTH_SESSION_ID`     | Session identifier                 |
+| Key                     | Description                        |
+|-------------------------|------------------------------------|
+| `AUTH_SVR_RESPONSE`     | Server proof (hex-encoded)         |
+| `AUTH_VERSION_NO`       | Server version number              |
+| `AUTH_SESSION_ID`       | Session identifier                 |
+| `AUTH_SERIAL_NUM`       | Session serial number (12.1+)      |
+| `AUTH_MAX_OPEN_CURSORS` | Session's max open cursors (12.1+) |
 
 The client validates by decrypting `AUTH_SVR_RESPONSE` with the connection key and checking for the presence of `"SERVER_TO_CLIENT"` in the plaintext.
+
+`AUTH_MAX_OPEN_CURSORS` (a live 23ai reports its `open_cursors`, 300) sizes the
+array a thin client tracks cursors-to-close in. A missing or zero value clamps
+that array to length **1**, so the second cursor the client closes overruns it
+with `IndexError: array assignment index out of range` — the statement-cache
+path every `executemany` and cursor reuse drives. seerdb sends it (and
+`AUTH_SERIAL_NUM`) only in the 12.1+ result, keeping the pre-12.1 wire
+byte-identical.
 
 `AUTH_VERSION_NO` is a decimal string of a single packed integer holding
 the server's release. Decode it as `major` (bits 24-31), `minor`

@@ -110,6 +110,23 @@ def test_encode_result_decodes_as_an_auth_result() -> None:
     assert session_id == b'59'
 
 
+def test_encode_result_reports_max_open_cursors_at_12c() -> None:
+    # A thin client sizes its cursors-to-close array from AUTH_MAX_OPEN_CURSORS;
+    # a missing / zero value clamps it to 1, so the second cursor it closes
+    # overruns with "IndexError: array assignment index out of range" -- the
+    # statement-cache path every executemany and cursor reuse drives (#826).
+    # A 12.1+ client reads it; the pre-12.1 wire stays byte-identical without it.
+    from seerdb.common.tns import _ENCODE_FIELD_VERSION
+
+    token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_12_1)
+    try:
+        modern = encode_result(bytes(24), session_id=59)
+    finally:
+        _ENCODE_FIELD_VERSION.reset(token)
+    assert b'AUTH_MAX_OPEN_CURSORS' in modern
+    assert b'AUTH_MAX_OPEN_CURSORS' not in encode_result(bytes(24), session_id=59)
+
+
 def test_parse_osesskey_recovers_the_username() -> None:
     request = encode_dictionary_sess(
         {'seq': 1, 'field_version': 6, 'env': {'user': 'PYO'}}
