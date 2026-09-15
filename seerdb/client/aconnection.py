@@ -1578,7 +1578,11 @@ class AsyncOracleConnect(_ConnectionLogic):
         """Async port of the sync `_read_lob_response`. Same token
         walk; everything between TTI_LOB content and TTI_OER is RPA
         metadata we don't decode."""
-        from seerdb.common.tns_consts import TTI_LOB, TTI_OER
+        from seerdb.common.tns_consts import (
+            TNS_LONG_LENGTH_INDICATOR,
+            TTI_LOB,
+            TTI_OER,
+        )
 
         Buffer = b''
         while True:
@@ -1600,7 +1604,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                     Pos += 1
                     if Length == 0:
                         continue
-                    if Length == 0xFE:
+                    if Length == TNS_LONG_LENGTH_INDICATOR:
                         # Chunked content. 12c+ prefixes each chunk with a ub4
                         # length (terminated by a zero-length chunk); 11g uses a
                         # single length byte per chunk. Without the 12c+ branch

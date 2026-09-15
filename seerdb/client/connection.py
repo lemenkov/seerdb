@@ -2134,7 +2134,11 @@ class OracleConnect(_ConnectionLogic):
         # (call status). We pull the content out of the LOB chunk(s) and
         # use OER as the stop signal; everything between LOB and OER is
         # RPA-shaped metadata we don't need.
-        from seerdb.common.tns_consts import TTI_LOB, TTI_OER
+        from seerdb.common.tns_consts import (
+            TNS_LONG_LENGTH_INDICATOR,
+            TTI_LOB,
+            TTI_OER,
+        )
 
         Buffer = b''
         while True:
@@ -2161,7 +2165,7 @@ class OracleConnect(_ConnectionLogic):
                     Pos += 1
                     if Length == 0:
                         continue
-                    if Length == 0xFE:
+                    if Length == TNS_LONG_LENGTH_INDICATOR:
                         # Chunked content. 12c+ prefixes each chunk with a ub4
                         # length (terminated by a zero-length chunk); 11g uses a
                         # single length byte per chunk.
