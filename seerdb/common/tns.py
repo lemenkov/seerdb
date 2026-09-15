@@ -2071,7 +2071,11 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
     # the ub2-prefixed locator (and, for a WRITE, the 0x0E payload). CREATE_TEMP
     # shares the layout up to the operation, so it is classified there too.
     rest = payload[1:]  # source_pointer_flag
-    _loc_len_plus2, rest = decode_ub4(rest)
+    # The declared source-locator-length (§14.1). It equals the locator byte
+    # count for a raw locator (a persistent / column-LOB op) and that count + 2
+    # for a ub2-length-prefixed one (a temp-LOB op), so skipping this many bytes
+    # steps over the whole locator field either way.
+    source_loc_len, rest = decode_ub4(rest)
     rest = rest[1:]  # dest_pointer_flag
     _dest_length, rest = decode_ub4(rest)
     _short_src_off, rest = decode_ub4(rest)
@@ -2112,16 +2116,20 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
     # READ (the #413 column-LOB read) and anything else fall through to the read
     # path — unchanged, so an unrecognised op behaves as before rather than worse.
     if operation == TNS_LOB_OP_READ:
-        # Same walk as the WRITE branch above to the locator, then the trailing
-        # ub8 amount the client writes last of all (#903).
+        # Walk to the trailing ub8 amount the client writes last of all (#903).
+        # A column-LOB READ sends the locator RAW (not ub2-length-prefixed the way
+        # a temp op does), so the locator cannot be skipped by reading a length
+        # prefix -- that read the first two locator bytes as a length, overshot,
+        # and dropped every read to the "whole LOB from offset 1" fallback, which
+        # served the wrong queue entry (#903). Skip it by the declared
+        # source-locator-length instead, which spans the field in both forms.
         try:
             tail = rest[2:]  # scn-array pointer + length
             source_offset, tail = decode_ub4(tail)
             _dest_offset, tail = decode_ub4(tail)
             tail = tail[1:]  # amount pointer flag
             tail = tail[6:]  # three reserved ub2 array-LOB slots
-            loc_len = struct.unpack('>H', tail[:2])[0]
-            tail = tail[2 + loc_len :]
+            tail = tail[source_loc_len:]  # the locator, raw or ub2-prefixed
             amount, _ = decode_ub4(tail)
             return LobOpsRequest(
                 kind='read', offset=max(source_offset, 1), amount=amount

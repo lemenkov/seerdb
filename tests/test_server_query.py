@@ -2264,6 +2264,34 @@ def test_parse_lobops_request_classifies_the_state_opcodes() -> None:
         assert req.locator == locator, op
 
 
+def test_parse_lobops_read_extracts_offset_and_amount_from_a_raw_locator() -> None:
+    # A column-LOB READ sends the locator RAW (a persistent-LOB op), not the
+    # ub2-length-prefixed form a temp op uses. The parser must skip it by the
+    # declared source-locator-length, not by reading a 2-byte prefix: reading the
+    # first two locator bytes as a length overshot the buffer, threw, and dropped
+    # every read to the "whole LOB from offset 1" fallback -- which served the
+    # wrong row's content from the read queue (#903). Both framings must parse.
+    from seerdb.common.tns import encode_dictionary_lobops, parse_lobops_request
+    from seerdb.common.tns_consts import TNS_LOB_OP_READ
+
+    locator = b'\x00seerdb-mirror-lob-locator-0000000000\x00'  # 38 bytes
+    for prefixed in (False, True):
+        body = encode_dictionary_lobops(
+            {
+                'seq': 1,
+                'operation': TNS_LOB_OP_READ,
+                'locator': locator,
+                'source_offset': 25000,
+                'amount': 10,
+                'locator_prefixed': prefixed,
+            }
+        )
+        req = parse_lobops_request(body)
+        assert req.kind == 'read', prefixed
+        assert req.offset == 25000, prefixed
+        assert req.amount == 10, prefixed
+
+
 def test_parse_exec_decodes_a_temp_lob_bind_as_a_reference() -> None:
     # A CLOB / BLOB bind is the temp-LOB descriptor 01 28 28 | ub2 len | locator,
     # not a plain DALC — parse_exec keeps it as a TempLobRef for the session to

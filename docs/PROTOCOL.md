@@ -1828,13 +1828,26 @@ reads a LOB the same shape as sqlplus — locator in the row, content over
    over the ordinary RXD. A NULL LOB is the bare `0x00` (`§12`), drawing no read.
    The client keeps the locator opaque and echoes it back.
 
-2. **`TTI_LOBOPS` READ → whole content, once.** The thin client does *not* loop:
-   its `encode_dictionary_lobops` requests the whole LOB in one read (amount
-   `0x40000000`, no per-chunk offset walk). The Mirror answers with
-   `encode_lob_read_response_thin` — the full content as `LOB_DATA` (`0e` +
+2. **`TTI_LOBOPS` READ → the requested slice.** seerdb's own client requests the
+   whole LOB in one read (amount `0x40000000`), but the reference client reads at
+   an explicit 1-based offset and amount (`lob.read(offset, amount)`, `str(lob)`),
+   so the Mirror honours both (`§14`). The READ carries its **column-LOB locator
+   raw**, not ub2-length-prefixed the way a temp-LOB op does, so the parser skips
+   it by the declared source-locator-length (which spans the field in either
+   form) to reach the trailing amount — reading the first two locator bytes as a
+   length overshot, threw, and dropped every read to a "whole LOB from offset 1"
+   fallback that served the wrong row's queue entry (#903). The Mirror answers
+   with `encode_lob_read_response_thin` — the slice as `LOB_DATA` (`0e` +
    `0xFF`-byte chunks, §14) followed by a **success OER** `04 01 <status>`
    (`_encode_oer(1,0,0,b'')`). The client reads the content, scans to the OER, and
    stops; CLOB content is UTF-16BE (decoded to `str`), BLOB is raw `bytes`.
+
+   The per-LOB position is still tracked by read order (the minted locator is a
+   shared placeholder, so a READ cannot say *which* row's LOB it wants): a read
+   at offset 1 starts the next queued LOB, later offsets continue the current
+   one. A client that reads one LOB from offset 1 more than once (e.g. `read()`
+   then `str(lob)`) therefore still advances the queue early; serving that needs
+   a **distinct** locator per column LOB, a separate follow-up.
 
 Unlike the OCI locator, the thin locator carries no load-bearing size / charset
 fields (the CLOB / BLOB split is already in the describe, and the read is
