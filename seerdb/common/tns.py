@@ -1563,6 +1563,16 @@ def _read_bind_value(
         raw, after = decode_dalc(after)
         locator = bytes(raw) if not isinstance(raw, list) else b''
         return DbRef(locator, type_oid=toid or None), after
+    if data_type == TNS_TYPE_ADT:
+        # An object (ADT, #116/#888) bind: the value is the write_dbobject
+        # framing (toid, object OID, snapshot, version, image length, flags,
+        # packed image) — the same framing a fetched object column carries, so
+        # _read_object_column reads it and hands back an ObjectImage placeholder
+        # (or None for a NULL object). The OAC's 16-byte type OID is threaded in
+        # so the backend can resolve the type and decode the image into a
+        # DbObject to re-bind; a plain DALC read would mistake the toid's own
+        # length prefix for the value length and desync.
+        return _read_object_column(after, {'type_oid': toid})
     if (
         data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB)
         and after[:3] == _TEMP_LOB_BIND_PREFIX
@@ -2267,6 +2277,13 @@ def _encode_out_bind_value(value: object, tns_type: int) -> bytes:
     # ``DPY-2035`` because its ``ret_val`` came back NULL rather than 0 (#888).
     if tns_type == TNS_TYPE_INT and isinstance(value, (int, float)):
         return _bytes_with_length(encode_token_num(value))
+    if tns_type == TNS_TYPE_ADT:
+        # An object (ADT) OUT-bind slot — e.g. the echoed object IN bind of a
+        # callfunc/callproc. The client reads this position with the object
+        # framing (read_dbobject), so it must carry the full frame even when the
+        # value is None (an IN-only object whose OUT value the Mirror leaves
+        # unset); a bare 0x00 DALC would desync the reader (#888).
+        return encode_object_column_value(value)
     return encode_value(value, tns_type)
 
 

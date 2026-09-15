@@ -4371,8 +4371,28 @@ object read, each of which desyncs the client if wrong:
   the row encoder emits nothing for it.
 
 With these, python-oracledb resolves the object type and fetches scalar objects,
-nested objects, NULL objects and collections through the Mirror. Binding an
-object *into* a call (the reverse direction) is separate and still open.
+nested objects, NULL objects and collections through the Mirror.
+
+### 21.10 Binding an object *into* a call — the Mirror (#888)
+
+An inbound object (ADT) bind arrives in the RXD as the `write_dbobject` framing
+(§21.5) — the same bytes a fetched object column carries — behind a type-109 OAC
+whose only type identity is the 16-byte OID. The Mirror reads it with the shared
+`_read_object_column` (`_read_bind_value`'s ADT branch), producing an
+`ObjectImage` placeholder (or `None` for a NULL object). The passthrough backend
+then resolves the OID to a name (`all_types.type_oid`), describes the type to get
+the attribute (or element) layout, decodes the image into a `DbObject` — an
+object via `decode_object_image`, a VARRAY / nested table via
+`decode_collection_image` — and re-binds it upstream. In a PL/SQL block the
+object rides as a plain value (not an OUT `Var`); an echoed object bind position
+in the IOV reply carries the full object frame (`encode_object_column_value`),
+never a bare `0x00`, so the client stays in sync (§6.5).
+
+This covers a populated object or collection bound **IN**, in SQL or a PL/SQL
+call. Two directions stay open, both blocked on the same missing client feature —
+`cursor.var()` of an object type: an object/collection **OUT** bind (a function
+returning one), and a **typed-NULL** object bind (which must carry its type so a
+PL/SQL overload resolves and the value reads back as NULL, not an empty object).
 
 ## 22. DML RETURNING ... INTO (#120)
 

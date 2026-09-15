@@ -22,6 +22,11 @@ from dataclasses import replace
 
 import seerdb
 from seerdb.common.datatypes import TempLob, dbtype_for_oracle_type
+from seerdb.common.dbobject import (
+    ObjectImage,
+    decode_collection_image,
+    decode_object_image,
+)
 from seerdb.common.sqltext import is_plsql
 from seerdb.common.tns import AL16UTF16_CHARSET, ColumnMeta
 from seerdb.common.tns_consts import (
@@ -132,9 +137,55 @@ class OraclePassthroughBackend:
         )
         return password
 
+    def _object_from_image(self, image: ObjectImage) -> object:
+        # Turn an inbound object (ADT) bind's image back into a DbObject the
+        # upstream connection can bind (#888). The bind OAC carries only the
+        # type's 16-byte OID, so resolve it to a name, describe the type (which
+        # gives the attribute layout the image needs to decode), and rebuild the
+        # object. Returns None if the OID cannot be resolved -- the caller then
+        # binds NULL rather than desyncing.
+        assert self._conn is not None
+        # The image's toid is the constructed form 00 22 02 08 + <16-byte type
+        # OID> + <extent OID> (36 bytes); all_types.type_oid is the bare 16-byte
+        # OID, so pull it out of the middle. A value that already carries the bare
+        # OID (16 bytes) is used as-is.
+        toid = image.type_oid or b''
+        oid = toid[4:20] if len(toid) >= 20 else toid
+        probe = self._conn.cursor()
+        probe.execute(
+            'SELECT owner, type_name FROM all_types WHERE type_oid = :1', [oid]
+        )
+        row = probe.fetchone()
+        if row is None:
+            return None
+        owner, name = row
+        typ = self._conn.gettype(f'{owner}.{name}')
+        if getattr(typ, 'is_collection', False):
+            # A VARRAY / nested table bind: the image is a collection image whose
+            # elements decode against the single element type (#117/#118).
+            elements = decode_collection_image(image.image, typ.element)
+            return typ.newobject(list(elements))
+        attrs = decode_object_image(image.image, typ.attrs)
+        return typ.newobject(dict(attrs))
+
+    def _resolve_object_binds(self, binds: Sequence) -> list:
+        # Replace any object (ADT) bind -- a bare ObjectImage, or one wrapped in a
+        # BindVar -- with the DbObject the upstream binds. A NULL object arrives
+        # as None already, so only a populated image needs resolving (#888).
+        out: list = []
+        for b in binds:
+            value = b.value if isinstance(b, BindVar) else b
+            if isinstance(value, ObjectImage):
+                obj = self._object_from_image(value)
+                out.append(replace(b, value=obj) if isinstance(b, BindVar) else obj)
+            else:
+                out.append(b)
+        return out
+
     def execute(self, sql: str, binds: Sequence = ()) -> Result:
         assert self._conn is not None  # authenticate() ran before any execute
         cursor = self._conn.cursor()
+        binds = self._resolve_object_binds(binds)
         # A PL/SQL block hands its binds over as BindVar (value + type + buffer
         # size) so OUT binds can be registered correctly (#483). Bind each as an
         # OUT-capable Var seeded with the input value, run, and return every Var's
@@ -260,6 +311,13 @@ class OraclePassthroughBackend:
                 bind.tns_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB)
                 and bind.value is not None
             ):
+                variables.append(bind.value)
+                continue
+            if bind.tns_type == TNS_TYPE_ADT and bind.value is not None:
+                # An object (ADT) IN bind: _resolve_object_binds already turned the
+                # inbound image into a DbObject, which binds as a plain value. An
+                # object OUT bind is not supported here (rare); the value carries
+                # its own type identity, so no Var wrapping is needed (#888).
                 variables.append(bind.value)
                 continue
             dbtype = dbtype_for_oracle_type(bind.tns_type, 1)

@@ -30,6 +30,7 @@ from seerdb.common.tns import (
     _encode_object_bind_value,
     _encode_ref_bind_value,
     _encode_ref_oac,
+    _read_bind_value,
     _read_object_column,
     encode_object_column_value,
     encode_object_image,
@@ -170,6 +171,32 @@ class TestObjectBindEncode(unittest.TestCase):
         Wire = _encode_object_bind_value(Obj)
         # toid = 00 22 02 08 + the 16-byte type OID + the fixed extent OID.
         self.assertIn(b'\x00\x22\x02\x08' + _ADDR_TYPE.oid, Wire)
+
+    def test_read_bind_value_decodes_inbound_object(self):
+        # The server reads an inbound object (ADT) bind the same framing the
+        # client writes (#888): _read_bind_value hands back an ObjectImage the
+        # backend resolves + decodes. The next bind's bytes stay untouched.
+        from seerdb.common.tns_consts import TNS_TYPE_ADT
+
+        Obj = _ADDR_TYPE.newobject({'STREET': 'Main St', 'ZIP': 12345, 'CODE': 'US'})
+        Wire = _encode_object_bind_value(Obj) + _SENTINEL
+        Val, Rest = _read_bind_value(TNS_TYPE_ADT, 0, Wire, _ADDR_TYPE.oid)
+        self.assertIsInstance(Val, ObjectImage)
+        self.assertEqual(Rest, _SENTINEL)
+        self.assertEqual(
+            decode_object_image(Val.image, _ADDR_LAYOUT),
+            [('STREET', 'Main St'), ('ZIP', 12345), ('CODE', 'US')],
+        )
+
+    def test_read_bind_value_null_object_is_none(self):
+        # A NULL object bind carries the full frame with a zero image gate, and
+        # reads back as None (the backend then binds a typed NULL).
+        from seerdb.common.tns_consts import TNS_TYPE_ADT
+
+        Wire = encode_object_column_value(None, _ADDR_TYPE.oid) + _SENTINEL
+        Val, Rest = _read_bind_value(TNS_TYPE_ADT, 0, Wire, _ADDR_TYPE.oid)
+        self.assertIsNone(Val)
+        self.assertEqual(Rest, _SENTINEL)
 
 
 class TestObjectColumnValueEncode(unittest.TestCase):
