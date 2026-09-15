@@ -2088,3 +2088,22 @@ def test_complete_message_raises_when_the_client_vanishes_mid_message() -> None:
         _complete_message(
             stream, b'\x03\x60partial', lambda b: (_ for _ in ()).throw(Truncated('x'))
         )
+
+
+def test_backend_fault_error_reports_ora600_without_recursing() -> None:
+    # An exception the backend lets escape must become a one-statement error the
+    # session survives, not a crash. A NotSupportedError is a feature gap ->
+    # ORA-03115; anything else is genuinely unexpected -> ORA-00600. The
+    # non-NotSupportedError branch used to `return _backend_fault_error(exc)`,
+    # an infinite self-call that raised RecursionError and tore the connection
+    # down (DPY-4011) for every unexpected fault (#904 follow-up).
+    from seerdb.common.exceptions import NotSupportedError
+    from seerdb.server.session import _backend_fault_error
+
+    gap = _backend_fault_error(NotSupportedError('no wire encoding for X'))
+    assert b'ORA-03115' in gap
+
+    # A ValueError (e.g. an encoder raising on a bad length) must not recurse.
+    fault = _backend_fault_error(ValueError('encoded number data too long'))
+    assert b'ORA-00600' in fault
+    assert b'encoded number data too long' in fault

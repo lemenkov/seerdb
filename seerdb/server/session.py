@@ -581,7 +581,14 @@ def _backend_fault_error(exc: Exception) -> bytes:
             f'ORA-{_ORA_UNSUPPORTED_CALL:05d}: unsupported network datatype or '
             f'representation ({exc})',
         )
-    return _backend_fault_error(exc)
+    # Genuinely unexpected: report it as ORA-00600 rather than recurse. This
+    # branch used to `return _backend_fault_error(exc)` -- an infinite self-call
+    # that raised RecursionError and tore the connection down (DPY-4011), turning
+    # every unexpected backend fault into a session-killing crash-loop instead of
+    # a one-statement error the session survives.
+    return encode_error(
+        _INTERNAL_ERROR, f'ORA-{_INTERNAL_ERROR:05d}: backend error: {exc}'
+    )
 
 
 def _refuse_unhandled(stream: PacketStream, what: str) -> None:
