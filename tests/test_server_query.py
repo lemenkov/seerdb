@@ -2166,6 +2166,49 @@ def test_temp_lob_responses_round_trip_through_the_client_decoders() -> None:
     assert err_code in (0, 1403)  # a success OER, not a real error
 
 
+def test_minted_temp_clob_locator_declares_utf16be_content() -> None:
+    # The reference thin client encodes what it writes to a CLOB by two flag bytes
+    # of the locator, read at offsets 6 and 7 of the ub2-prefixed 40 bytes it
+    # holds: the variable-length-charset bit (0x80, flag byte 3) and the
+    # little-endian bit (0x40, flag byte 4). It writes UTF-16BE when the charset
+    # bit is set and the little-endian bit clear, UTF-16LE when both are set, and
+    # UTF-8 when the charset bit is clear. The Mirror decodes every temp CLOB as
+    # UTF-16BE, so the minted locator must present that exact combination -- the
+    # bit clear gave UTF-8 and, once set, an uncleared little-endian bit gave
+    # UTF-16LE, and either mojibake'd the bind and killed the session (#903). A
+    # BLOB carries no charset and keeps both bytes as-is.
+    from seerdb.common.tns import (
+        ExecRequest,
+        TempLobRef,
+        encode_create_temp_response,
+        mint_temp_lob_locator,
+    )
+    from seerdb.server.session import _resolve_temp_lob_binds, _TempLobs
+
+    flag_3, flag_4, var_length_charset, little_endian = 6, 7, 0x80, 0x40
+    for index in (0, 7, 0x01020304):
+        clob = encode_create_temp_response(mint_temp_lob_locator(index, is_blob=False))[
+            1:41
+        ]
+        assert clob[flag_3] & var_length_charset  # UTF-16...
+        assert not clob[flag_4] & little_endian  # ...BE, not LE
+        blob = encode_create_temp_response(mint_temp_lob_locator(index, is_blob=True))[
+            1:41
+        ]
+        assert not blob[flag_3] & var_length_charset
+    # Distinctness survives the flags: consecutive locators still differ.
+    assert len({mint_temp_lob_locator(i, is_blob=False) for i in range(5)}) == 5
+    # And the content a client then writes, UTF-16BE, resolves to the value.
+    temp_lobs = _TempLobs()
+    locator = temp_lobs.mint(is_blob=False)
+    temp_lobs.append(locator, 'A test string value'.encode('utf-16-be'))
+    ref = TempLobRef(locator, is_blob=False)
+    request = ExecRequest(
+        'insert into t values (:1)', 0, 1, 0, binds=[ref], bind_rows=[[ref]]
+    )
+    assert _resolve_temp_lob_binds(request, temp_lobs).binds == ['A test string value']
+
+
 def _lobops_op_request(operation: int, locator: bytes, *, seq: int = 1) -> bytes:
     # A TTI_LOBOPS request for a state op (FREE_TEMP / OPEN / CLOSE / TRIM /
     # GET_CHUNK_SIZE), built in the shared §14.1 layout with the ub2-prefixed

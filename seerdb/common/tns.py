@@ -1961,15 +1961,47 @@ def mint_temp_lob_locator(index: int, is_blob: bool) -> bytes:
     The value is echoed back verbatim on WRITE and on the bind, so it only has to
     be stable and distinct per temp LOB — the Mirror keys its buffer on it. It is
     padded to the length a real server uses, which is what the client expects to
-    read (#846)."""
-    return (
-        _TEMP_LOB_LOCATOR_PREFIX
-        + struct.pack('>I', index)
-        + (b'\x01' if is_blob else b'\x00')
-    ).ljust(_TEMP_LOB_LOCATOR_LEN, b'\x00')
+    read (#846).
+
+    Not quite opaque, though: two flag bytes of a CLOB locator steer how the
+    reference client encodes everything it writes to (and reads from) the LOB.
+    Flag byte 3 carries the **variable-length-charset** bit (``0x80``) and flag
+    byte 4 the **little-endian** bit (``0x40``): the client writes UTF-16BE when
+    the charset bit is set and the little-endian bit clear, UTF-16LE when both
+    are set, and UTF-8 when the charset bit is clear (an NCLOB is UTF-16BE
+    regardless, by its charset form). The Mirror decodes a temp CLOB as UTF-16BE,
+    so the minted locator must present exactly that combination -- charset bit
+    set, little-endian bit clear -- and a live 23ai's own temp CLOB locators do
+    (flags ``82 08 80 03``). The Mirror's locator carried ASCII in those bytes:
+    the charset bit was clear (client wrote UTF-8) and, once that was set, byte 4
+    still held ``'d'`` (``0x64``), whose ``0x40`` made the client write UTF-16LE
+    -- either way the UTF-16BE decode on the bind produced mojibake and the
+    session died (#903). seerdb's own client is unaffected: it always writes
+    UTF-16BE. The client reads the locator behind a ``ub2`` length prefix
+    (:func:`encode_create_temp_response`), so its flag bytes 3 and 4 (offsets 6
+    and 7 of what it holds) are offsets 4 and 5 of the minted value. A BLOB
+    carries no charset and keeps both bytes untouched."""
+    raw = bytearray(
+        (
+            _TEMP_LOB_LOCATOR_PREFIX
+            + struct.pack('>I', index)
+            + (b'\x01' if is_blob else b'\x00')
+        ).ljust(_TEMP_LOB_LOCATOR_LEN, b'\x00')
+    )
+    if not is_blob:
+        raw[_TEMP_LOB_LOC_OFFSET_FLAG_3] |= _THIN_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET
+        raw[_TEMP_LOB_LOC_OFFSET_FLAG_4] &= ~_THIN_LOB_LOC_FLAGS_LITTLE_ENDIAN
+    return bytes(raw)
 
 
 _TEMP_LOB_LOCATOR_PREFIX = b'\x00seerdb-mirror-temp-lob-'
+# Client-side flag-byte offsets 6 and 7 (see _THIN_LOB_LOC_OFFSET_FLAG_3), less
+# the ub2 length prefix the CREATE_TEMP reply puts in front of the minted bytes.
+_TEMP_LOB_LOC_OFFSET_FLAG_3 = 4
+_TEMP_LOB_LOC_OFFSET_FLAG_4 = 5
+# The little-endian bit in flag byte 4: with the variable-length-charset bit set,
+# it tells the client the CLOB rides UTF-16LE rather than UTF-16BE.
+_THIN_LOB_LOC_FLAGS_LITTLE_ENDIAN = 0x40
 
 
 def _decode_lobops_chunked(data: bytes) -> bytes:

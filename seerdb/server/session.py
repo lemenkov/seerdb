@@ -1760,7 +1760,9 @@ def _answer_lobops(
 def _resolve_temp_lob_binds(request: ExecRequest, temp_lobs: _TempLobs) -> ExecRequest:
     # Swap any temp-LOB locator bind for the bytes streamed into it over
     # TTI_LOBOPS WRITE, so the backend sees a plain str / bytes value (#412). A
-    # CLOB's content is UTF-16BE on the wire; a BLOB's is raw.
+    # CLOB's content is UTF-16BE on the wire -- the minted locator says so with
+    # its variable-length-charset flag, which is what a client encodes by (see
+    # mint_temp_lob_locator) -- and a BLOB's is raw.
     def resolve(value: object) -> object:
         if isinstance(value, TempLobRef):
             data = temp_lobs.content(value.locator)
