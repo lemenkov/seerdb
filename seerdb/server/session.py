@@ -1763,10 +1763,25 @@ def _resolve_temp_lob_binds(request: ExecRequest, temp_lobs: _TempLobs) -> ExecR
     # CLOB's content is UTF-16BE on the wire -- the minted locator says so with
     # its variable-length-charset flag, which is what a client encodes by (see
     # mint_temp_lob_locator) -- and a BLOB's is raw.
+    # An empty temp LOB is resolved to a typed bind, not a bare '' / b'': a
+    # backend that binds the bare value stores NULL on an Oracle target (an empty
+    # scalar is NULL there), losing the "empty, non-NULL LOB" the client meant.
+    # Only meaningful on a single execute -- the array path takes plain values,
+    # and an empty temp LOB in an executemany is not a real case -- so a batch
+    # keeps the bare form.
+    single = len(request.bind_rows) <= 1
+
     def resolve(value: object) -> object:
         if isinstance(value, TempLobRef):
             data = temp_lobs.content(value.locator)
-            return data if value.is_blob else data.decode('utf-16-be')
+            content = data if value.is_blob else data.decode('utf-16-be')
+            if single and not content:
+                return BindVar(
+                    value=content,
+                    tns_type=TNS_TYPE_BLOB if value.is_blob else TNS_TYPE_CLOB,
+                    max_size=0,
+                )
+            return content
         return value
 
     if not any(isinstance(v, TempLobRef) for row in request.bind_rows for v in row):

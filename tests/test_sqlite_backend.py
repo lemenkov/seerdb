@@ -490,15 +490,15 @@ def test_temp_lob_write_round_trip() -> None:
             'insert into t values (:1, :2, :3)',
             [
                 1,
-                TempLob(cloc, False, len(big_clob) * 4),
-                TempLob(bloc, True, len(big_blob)),
+                TempLob(cloc, False),
+                TempLob(bloc, True),
             ],
         )
 
         sloc = conn.create_temp_lob()  # a single-chunk WRITE
         conn.write_temp_lob(sloc, 'hi-temp')
         cur.execute(
-            'insert into t values (:1, :2, :3)', [2, TempLob(sloc, False, 28), None]
+            'insert into t values (:1, :2, :3)', [2, TempLob(sloc, False), None]
         )
 
         cur.execute('select id, c, b from t order by id')

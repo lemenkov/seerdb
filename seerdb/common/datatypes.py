@@ -51,16 +51,17 @@ class TempLob:
     CLOB / BLOB OAC plus the LOB-descriptor value (`01 28 28` + ub2 length +
     locator), the same descriptor framing the native VECTOR / JSON binds use.
 
-    `oac_size` is the byte budget announced in the OAC (CLOB = chars * 4 for
-    AL32UTF8, BLOB = byte length), matching python-oracledb.
+    The OAC announces a fixed LOB buffer size, not the value's byte budget --
+    python-oracledb sends its DB_TYPE buffer_size_factor for every temp-LOB bind
+    regardless of the value, and a size of 0 makes the server bind NULL (#903).
+    So the marker carries only the locator and its kind.
     """
 
-    __slots__ = ('locator', 'is_blob', 'oac_size')
+    __slots__ = ('locator', 'is_blob')
 
-    def __init__(self, locator: bytes, is_blob: bool, oac_size: int):
+    def __init__(self, locator: bytes, is_blob: bool):
         self.locator = locator
         self.is_blob = is_blob
-        self.oac_size = oac_size
 
     def __repr__(self) -> str:
         kind = 'BLOB' if self.is_blob else 'CLOB'

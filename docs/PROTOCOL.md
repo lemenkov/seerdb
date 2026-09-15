@@ -2819,7 +2819,13 @@ conversion"). seerdb handles it the way python-oracledb does, on 12c+:
 3. The temp locator is bound as a CLOB / BLOB value: the OAC is type `0x70` /
    `0x71` with the LOB cont-flag `0x02000000`, and the bind value is the
    LOB-descriptor `01 28 28` + `ub2` locator length + locator (the same
-   descriptor framing the native VECTOR / JSON binds use, §18.1 / §17).
+   descriptor framing the native VECTOR / JSON binds use, §18.1 / §17). The
+   OAC's **max-data-length** field is the LOB's fixed buffer-size factor (112
+   for both CLOB and BLOB, what python-oracledb sends for *every* temp-LOB bind),
+   **not** the value's byte budget: the server reads a length of `0` there as
+   "no LOB" and binds NULL, so an **empty** temp LOB announced with length 0 was
+   stored NULL — `ORA-01400` on a NOT NULL column (#903). A non-zero value size
+   happened to work, which hid it. seerdb now always announces 112.
 4. `execute`. No `FREE_TEMP` — the temp LOB is released at session end.
 
 `Cursor.execute` / `AsyncCursor.execute` do this transparently: a PL/SQL block
@@ -2887,7 +2893,12 @@ inline bind. It is the inverse of §14.1/§14.2:
    `str`, BLOB → raw), and hands the real value to the backend. The temp-LOB
    OAC also carries a trailing `oaccolid` field the shared OAC decoder stops
    short of, so the server swallows one byte after a CLOB / BLOB bind OAC to keep
-   the next descriptor aligned.
+   the next descriptor aligned. An **empty** temp LOB is resolved to a typed LOB
+   bind rather than a bare `''` / `b''`: a backend that binds the bare value
+   stores NULL on an Oracle target (an empty scalar is NULL there), losing the
+   empty, non-NULL LOB the client meant (#903). The Oracle passthrough example
+   binds such a value back through an upstream temp LOB, since seerdb has no
+   CLOB / BLOB Var-bind of its own.
 
 Verified over the SQLite-backed Mirror driven by the seerdb thin client's temp-LOB
 primitives (the auto-promotion is `12.1`+/PL/SQL-gated and the Mirror pins 11g, so

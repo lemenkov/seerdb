@@ -94,11 +94,11 @@ class AsyncCursor(_CursorLogic):
             if isinstance(Value, str) and len(Value.encode('utf-8')) > 32767:
                 Locator = await Conn.create_temp_lob()
                 await Conn.write_temp_lob(Locator, Value)
-                Promoted.append(TempLob(Locator, False, len(Value) * 4))
+                Promoted.append(TempLob(Locator, False))
             elif isinstance(Value, (bytes, bytearray)) and len(Value) > 32767:
                 Locator = await Conn.create_temp_lob(is_blob=True)
                 await Conn.write_temp_lob(Locator, bytes(Value), is_blob=True)
-                Promoted.append(TempLob(Locator, True, len(Value)))
+                Promoted.append(TempLob(Locator, True))
             else:
                 Promoted.append(Value)
         return Promoted

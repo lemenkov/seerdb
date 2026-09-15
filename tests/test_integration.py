@@ -1816,6 +1816,35 @@ class TempLobBindIntegration(_IntegrationBase):
             )
             self.assertEqual(r.getvalue(), n)
 
+    def test_empty_temp_lob_binds_non_null(self):
+        # An empty temp LOB (CREATE_TEMP, no WRITE) is a zero-length, non-NULL
+        # LOB, not a NULL bind. The bind OAC announces a fixed LOB buffer size,
+        # not the value's byte budget; announcing 0 for the empty value made the
+        # server store NULL -- ORA-01400 on a NOT NULL column (#903). A thick
+        # client / the Mirror passthrough reaches this through the temp-LOB
+        # primitives, so exercise them directly.
+        from seerdb.common.datatypes import TempLob
+
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (id NUMBER, c CLOB NOT NULL, b BLOB NOT NULL)'
+        )
+        c_loc = self.conn.create_temp_lob(is_blob=False)
+        b_loc = self.conn.create_temp_lob(is_blob=True)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (1, :c, :b)',
+            [TempLob(c_loc, False), TempLob(b_loc, True)],
+        )
+        self.conn.commit()
+        self.cur.execute(
+            f'SELECT DBMS_LOB.GETLENGTH(c), DBMS_LOB.GETLENGTH(b), '
+            f'c, b FROM {self.TABLE} WHERE id = 1'
+        )
+        c_len, b_len, c_val, b_val = self.cur.fetchone()
+        self.assertEqual((c_len, b_len), (0, 0))
+        c_val = c_val.read() if hasattr(c_val, 'read') else c_val
+        b_val = b_val.read() if hasattr(b_val, 'read') else b_val
+        self.assertEqual((c_val, b_val), ('', b''))
+
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class ErrorAndRowcountIntegration(_IntegrationBase):
