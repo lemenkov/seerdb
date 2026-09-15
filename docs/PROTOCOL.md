@@ -2864,6 +2864,17 @@ streamed-LONG path. **11g is excluded** — it rejects `CREATE_TEMP` outright
 against, and a large PL/SQL LOB bind there keeps its prior ORA-01460 behaviour;
 the feature is gated on `field_version >= 12.1`.
 
+A bind **declared** a CLOB / BLOB — `cursor.var(DB_TYPE_CLOB)` or
+`setinputsizes(DB_TYPE_BLOB)` — promotes the same way, on any statement and any
+value size, because a LOB has no inline wire form: its OAC is the fixed LOB bind
+OAC (`_encode_lob_bind_oac`, type `0x70` / `0x71`, cont-flag `0x02000000`, the
+112-byte fixed buffer factor, **not** a size derived from the Var, which a live
+server rejects with ORA-03120), and its value rides as the temp-LOB locator
+(`Cursor._promote_lob_var_binds`). A NULL such Var (a pure OUT bind, or a NULL
+IN) is not promoted and keeps the OAC with a NULL value. This is what closed the
+last of the six declared-type bind encoders (#902); 11g, with no `CREATE_TEMP`,
+raises `NotSupportedError` for a declared LOB Var as before.
+
 ### 14.5 Temp-LOB WRITE (the Mirror, server side, #412)
 
 The Mirror answers the *server* half of the temp-LOB write flow above, so a
