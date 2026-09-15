@@ -853,6 +853,79 @@ class TestRefCursor(unittest.TestCase):
         self.assertEqual(out_values, [b'\xc1\x64'])
 
 
+class TestObjectMetadataReply(unittest.TestCase):
+    # The object-type metadata call (python-oracledb's dbms_pickler.get_type_shape)
+    # comes back as an IOV of OUT binds that must not desync the reader (#888):
+    # a BINARY_INTEGER rides as a NUMBER, a REF CURSOR's trailer is a return code,
+    # and a describe-zero-length column sends no row bytes.
+
+    def test_binary_integer_out_bind_is_nonempty_number(self):
+        # ret_val = 0 (BINARY_INTEGER) must encode as a non-empty NUMBER, else the
+        # client reads it as NULL and rejects the metadata call (DPY-2035).
+        from seerdb.common.tns import _encode_out_bind_value
+        from seerdb.common.tns_consts import TNS_TYPE_INT
+
+        wire = _encode_out_bind_value(0, TNS_TYPE_INT)
+        self.assertEqual(wire, bytes([1, 0x80]))  # DALC len 1 + NUMBER 0
+        self.assertNotEqual(wire, bytes([0]))  # not the empty (NULL) DALC
+
+    def test_refcursor_out_bind_trailer_keeps_following_bind_in_sync(self):
+        # A REF CURSOR OUT bind in the middle of the IOV must be followed by a
+        # return code (a single 0x00), not a 0x01 present marker: the reference
+        # client reads a ub4 return code after the cursor value, so a 0x01 there
+        # is a length-1 integer that swallows the next bind's first byte.
+        from seerdb.client.cursor import cursor as RefCur
+        from seerdb.common.tns import (
+            ColumnMeta,
+            RefCursorOutBind,
+            ScalarOutBind,
+            _read_iov,
+            encode_out_bind_response_thin,
+        )
+        from seerdb.common.tns_consts import TNS_TYPE_NUMBER as _NUM
+        from seerdb.common.tns_consts import TNS_TYPE_VARCHAR as _VC
+
+        columns = [ColumnMeta(name=b'N', data_type=_NUM, data_length=22, max_size=0)]
+        reply = encode_out_bind_response_thin(
+            [
+                RefCursorOutBind(columns=columns, cursor_id=7),
+                ScalarOutBind(value='tail', tns_type=_VC),
+            ]
+        )
+        # Re-read the reply: the second bind must decode as 'tail', proving the
+        # REF CURSOR trailer did not steal a byte.
+        directions, out_values, _ = _read_iov(reply, [RefCur(), None])
+        self.assertEqual(directions, [16, 16])
+        self.assertTrue(out_values[0].get('_refcursor'))
+        self.assertEqual(out_values[0]['cursor_id'], 7)
+        self.assertEqual(out_values[1], b'tail')
+
+    def test_zero_describe_length_column_sends_no_row_bytes(self):
+        # A plain-scalar column the describe sizes at zero carries no row bytes
+        # (the client reads it as NULL-by-describe); a LOB / LONG keeps its value.
+        from seerdb.common.tns import ColumnMeta, _thin_column_value
+        from seerdb.common.tns_consts import (
+            TNS_TYPE_BLOB,
+            TNS_TYPE_LONG,
+            TNS_TYPE_VARCHAR,
+        )
+
+        null_col = ColumnMeta(
+            name=b'X', data_type=TNS_TYPE_VARCHAR, data_length=0, max_size=0
+        )
+        self.assertEqual(_thin_column_value(None, null_col), b'')
+        # LONG keeps a zero describe length yet carries data, so it is NOT skipped.
+        long_col = ColumnMeta(
+            name=b'L', data_type=TNS_TYPE_LONG, data_length=0, max_size=0
+        )
+        self.assertNotEqual(_thin_column_value('data', long_col), b'')
+        # A BLOB (LOB-class) likewise carries its locator despite the zero length.
+        blob_col = ColumnMeta(
+            name=b'B', data_type=TNS_TYPE_BLOB, data_length=0, max_size=0
+        )
+        self.assertNotEqual(_thin_column_value(b'x', blob_col), b'')
+
+
 class TestVar(unittest.TestCase):
     def test_var_python_type(self):
         from seerdb.common.datatypes import Var

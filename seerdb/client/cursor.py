@@ -966,6 +966,9 @@ def _column_description(Col: dict) -> 'FetchInfo':
         fields,
         vector_dimensions=Col.get('vector_dimensions'),
         vector_format=Col.get('vector_format'),
+        type_schema=Col.get('type_schema'),
+        type_name=Col.get('type_name'),
+        type_oid=Col.get('type_oid') or None,
     )
 
 
@@ -982,12 +985,29 @@ class FetchInfo(tuple):
     * ``vector_format`` — its element format code (2 FLOAT32, 3 FLOAT64, 4 INT8,
       5 BINARY; 0 flexible), matching the value image's element type, else
       ``None``.
+    * ``type_schema`` / ``type_name`` / ``type_oid`` — an object (ADT / REF)
+      column's referenced type identity, carried in the per-column describe
+      (§21.1); ``None`` for a non-object column. The Mirror re-emits these so an
+      external client can resolve the type (#888).
 
-    Both are ``None`` for a non-VECTOR column and whenever the server is older
-    than 23.4 (the describe carries no vector descriptor before then)."""
+    The vector and object attributes are ``None`` for a column that does not
+    carry them (and the vector pair whenever the server is older than 23.4, which
+    sends no vector descriptor)."""
 
-    def __new__(cls, fields, *, vector_dimensions=None, vector_format=None):
+    def __new__(
+        cls,
+        fields,
+        *,
+        vector_dimensions=None,
+        vector_format=None,
+        type_schema=None,
+        type_name=None,
+        type_oid=None,
+    ):
         self = super().__new__(cls, fields)
         self.vector_dimensions = vector_dimensions
         self.vector_format = vector_format
+        self.type_schema = type_schema
+        self.type_name = type_name
+        self.type_oid = type_oid
         return self

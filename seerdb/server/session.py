@@ -1911,14 +1911,31 @@ def _answer_query(
     if (
         reused_id
         and cursors.has(reused_id)
-        and _defers_inline_rows(cursors.columns(reused_id))
+        and (
+            _defers_inline_rows(cursors.columns(reused_id))
+            or (
+                cursors.query_sql(reused_id) is None
+                and cursors.dml_sql(reused_id) is None
+            )
+        )
     ):
-        # The define round-trip for a LOB-class result (#887). The first execute
-        # ran the query, sent the describe alone and parked every row; this call
-        # is the client applying its define and asking for those rows. Serve them
-        # from the cursor rather than re-running the statement -- the backend's
-        # own cursor cache answers an identical second execute with no describe
-        # at all, so re-running loses the column metadata the reply needs.
+        # Two cases serve parked rows on a re-execute rather than re-running SQL:
+        #   * the define round-trip for a LOB-class result (#887): the first
+        #     execute ran the query, sent the describe alone and parked every
+        #     row; this call is the client applying its define and asking for
+        #     them (re-running would lose the column metadata the reply needs);
+        #   * a REF CURSOR OUT bind's nested cursor (#888): python-oracledb
+        #     drains an attrs_rc-style cursor by re-executing its id with an
+        #     empty statement, but the cursor has no statement of its own
+        #     (`cursors.open(sql=None)`), so there is nothing to re-run and the
+        #     empty query would reach the backend as ORA-01009.
+        # A query that parked its remainder keeps its SQL, so it re-runs instead.
+        # A REF CURSOR re-execute is a fresh open of that cursor, so the reply
+        # carries the describe + rows (encode_query_response); the LOB define
+        # round-trip already has the describe and takes only rows (#887/#888).
+        is_refcursor = (
+            cursors.query_sql(reused_id) is None and cursors.dml_sql(reused_id) is None
+        )
         count = request.fetch if request.fetch > 0 else _ALL_ROWS
         columns_out, batch = cursors.take(reused_id, count)
         # Queue the content of the LOB cells in the rows THIS reply delivers.
@@ -1926,9 +1943,12 @@ def _answer_query(
         # opening execute had built, so every follow-up TTI_LOBOPS read found
         # nothing and handed the client an empty LOB (#903).
         lobs = oci_lob_contents(columns_out, batch)
+        encode_reexecute = (
+            encode_query_response if is_refcursor else encode_fetch_response
+        )
         stream.write_packet(
             TNS_DATA,
-            encode_fetch_response(
+            encode_reexecute(
                 columns_out,
                 batch,
                 cursor_id=reused_id,

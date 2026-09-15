@@ -2094,13 +2094,19 @@ value per OUT / IN OUT bind **in bind order** (IN binds contribute nothing):
   e.g. NUMBER `10` → `02 c1 0b 00`, VARCHAR `"hi!"` → `03 68 69 21 00`.
 - **REF CURSOR** OUT value: a 1-byte length, then an inline describe of the
   cursor's result set (the same per-column metadata *and trailer* as a `TTI_DCB`,
-  §6.4), then the nested cursor id (`ub2`) and a 1-byte indicator. The client then
+  §6.4), then the nested cursor id (`ub2`) and the per-value **`ub4` return code**
+  (`actual_num_bytes`, `0`) that follows every OUT-bind value. The client then
   drains that cursor id with `TTI_FETCH` (§5.2). See python-oracledb's
-  `_create_cursor_from_describe`. Because this nested describe reuses the §6.4
-  format, it carries the **same pre-11g difference**: at field version < 11.2 (10g)
-  there is no `dcbqcky` trailer, so skipping a phantom one consumes the cursor id
-  and desyncs the IOV decode. seerdb gates it identically (#84/#87); the
-  per-column metadata already shares the field-version-gated decoder.
+  `_create_cursor_from_describe`, which reads that return code with `read_sb4`
+  after the cursor id. A `0x01` "present" byte there (an earlier seerdb guess)
+  is read as a length-1 integer and swallows the next bind's first byte, so a
+  REF CURSOR that is not the *last* OUT bind — the object-type metadata cursor's
+  `attrs_rc`, §21.9 — desyncs every bind after it; the zero return code is one
+  `0x00` byte, which the reader takes as its present indicator all the same
+  (#84/#87/#888). Because this nested describe reuses the §6.4 format, it also
+  carries the **same pre-11g difference**: at field version < 11.2 (10g) there is
+  no `dcbqcky` trailer, so skipping a phantom one consumes the cursor id and
+  desyncs the IOV decode. seerdb gates both identically.
 
 After the values come the usual `TTI_RPA` and `TTI_OER` tokens.
 
@@ -2123,11 +2129,15 @@ A **REF CURSOR OUT bind** (`OUT SYS_REFCURSOR`, #483) is returned in that same
 RXD slot but in the inline-describe form above: the backend opens the cursor, the
 Mirror drains its columns + rows into a `CursorResult`, parks the rows on a fresh
 cursor id (the ordinary `_Cursors` registry), and `encode_out_bind_response_thin`
-emits `<len><describe body><cursor id><indicator>` for that position (the describe
-body is the shared §6.4 encoder). The client reads the marker, then drains that
-cursor id with `TTI_FETCH` like any other result set. Because the inline describe
-reuses the §6.4 body, it inherits the same field-version gating (no `dcbqcky`
-before 11.2).
+emits `<len><describe body><cursor id><ub4 return code>` for that position (the
+describe body is the shared §6.4 encoder). The client reads the marker, then
+drains that cursor id — with `TTI_FETCH` like any other result set, or by
+**re-executing the id with an empty statement** (python-oracledb does the latter
+for the object-type metadata cursor, §21.9). A REF CURSOR has no statement of its
+own, so on that re-execute the Mirror serves the parked rows with a full
+describe + rows reply rather than forwarding the empty statement to the backend
+(which would answer `ORA-01009`). Because the inline describe reuses the §6.4
+body, it inherits the same field-version gating (no `dcbqcky` before 11.2).
 
 ### 6.6 Return Parameter (TTI_RPA)
 
@@ -4215,8 +4225,13 @@ the exact inverse of the read path (python-oracledb `write_dbobject` /
 - **Image** (`encode_object_image`): `flags 0x84` + `version 1` + the length
   written long-form (`0xFE` + ub4, covering the 7-byte header) + each attribute
   length-prefixed in declaration order (`write_length`: ≤245 a single byte, else
-  `0xFE` + ub4). A NULL attribute is a single `0xFF`. Each scalar uses the same
-  encoder as its column-form bind.
+  `0xFE` + ub4). A NULL scalar attribute is a single `0xFF`. Each scalar uses the
+  same encoder as its column-form bind. The encoder **recurses** exactly as the
+  decoder frames it (§21.2 / §21.6, python-oracledb `_pack_value`): an object
+  attribute of an object rides **inline, no header**; a NULL nested object is the
+  atomic-null `0xFD`; a collection attribute — and any object *or* collection
+  **inside** a collection — is a length-prefixed **full image** (own header),
+  with a NULL collection written as `0xFF`.
 - **OAC** (`_encode_object_oac`): the 12c+ bind-metadata layout — `type 109`,
   flag `TNS_BIND_USE_INDICATORS`, precision/scale `0`, buffer size, the type OID
   via `two_lengths`, and the type version (no charset). This is the **12c+** OAC;
@@ -4229,6 +4244,18 @@ Verified by round-trip (bind via seerdb, read back via §21.1–21.4) on 21c and
 23ai, scalar attribute types + NULL attributes, sync + async. Binding a bare
 Python `None` to an object column is unsupported (an untyped `None` carries no
 type identity); use a typed value. REF binds are #119.
+
+**Server side (the Mirror, #116).** To serve a fetched object *back to* an
+external client as a row value, `encode_object_column_value` emits the §21.2
+framing — identical to the bind (`_encode_object_bind_value`): the toid, empty
+object OID, zero snapshot/version, the image length, `TNS_OBJ_TOP_LEVEL` flags,
+then the packed image. A **NULL** object column still carries the whole frame
+with a **zero image-length gate** (and the column's type toid from
+`ColumnMeta.type_oid` when known) — never a bare `0x00` DALC, which would desync
+the reader. `_thin_column_value` / `_encode_oci_value` route a type-109 column
+here. The image itself is byte-compatible with python-oracledb: its
+`write_header` also writes the length long-form (`0xFE` + ub4), so a client that
+would receive Oracle's short-form length accepts the long form unchanged.
 
 ### 21.6 Collections — VARRAY / nested table (#117 / #118)
 
@@ -4310,6 +4337,42 @@ type-111 bind). Two parts:
 bind on field version < 12.1 raises `NotSupportedError` up front. Verified on
 21c/23ai, sync + async (round-trip through `DEREF` returns the original object).
 This completes the object-type family (#115–#119).
+
+### 21.9 Object-type metadata cursor — the Mirror serving a thin client (#888)
+
+Before python-oracledb reads an object column it resolves the type: on the first
+describe that names an ADT column (§21.1) it builds a *partial* type from the
+column's OID + schema + name, then runs a metadata PL/SQL block —
+`dbms_pickler.get_type_shape` — whose OUT binds return the type descriptor
+segment (TDS) and an `attrs_rc` REF CURSOR of the attribute rows. Serving that
+call through the passthrough Mirror needs three things beyond the ordinary
+object read, each of which desyncs the client if wrong:
+
+- **The ADT column describe must carry the type identity.** Oracle sends the
+  object type's schema + name (and 16-byte OID) in the same per-column fields a
+  REF uses (§21.1). Without them the client builds a type with `name = None` and
+  raises before any row is read. seerdb surfaces the identity on the client's
+  `FetchInfo` (`type_schema` / `type_name` / `type_oid`), and the passthrough
+  copies it into the `ColumnMeta` the describe re-emits.
+- **A `BINARY_INTEGER` OUT bind rides as a NUMBER.** `get_type_shape`'s `ret_val`
+  and `version` come back as `DB_TYPE_BINARY_INTEGER`, which the client reads as
+  a NUMBER. Encoding them with the native integer form renders `0` as an empty
+  DALC that reads back as NULL, and the client then rejects the call with
+  `DPY-2035` because `ret_val` was NULL rather than `0`; so the Mirror encodes an
+  INT-typed OUT value as a NUMBER (`_encode_out_bind_value`).
+- **The `attrs_rc` REF CURSOR is drained by re-execute.** The client re-executes
+  the nested cursor id with an empty statement rather than a `TTI_FETCH`; the
+  Mirror serves its parked rows with a full describe + rows reply (§6.5). The
+  REF CURSOR value's trailer is the `ub4` return code every OUT bind carries, not
+  a `0x01` marker — a middle REF CURSOR with the wrong trailer desyncs the binds
+  after it (§6.5). Any literal-NULL column in the attrs query (e.g. a `NULL`
+  select-list entry) describes with a zero buffer size and so sends **no** row
+  bytes, exactly as `SELECT NULL` does (§21.2 / the decoder's data-length-0 rule);
+  the row encoder emits nothing for it.
+
+With these, python-oracledb resolves the object type and fetches scalar objects,
+nested objects, NULL objects and collections through the Mirror. Binding an
+object *into* a call (the reverse direction) is separate and still open.
 
 ## 22. DML RETURNING ... INTO (#120)
 
