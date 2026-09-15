@@ -1851,12 +1851,24 @@ def _bind_vars(request: ExecRequest) -> list:
         return request.binds
     block = _is_plsql_block(request.sql)
     arrays = request.bind_arrays or [0] * len(request.binds)
+    # The per-bind type OID (an object / REF bind carries it in the OAC) rides on
+    # bind_types as the 4th field; thread it so an object OUT / typed-NULL bind
+    # keeps its type identity even when its value is None (#888).
+    toids = [(bt[3] if len(bt) > 3 else b'') for bt in (request.bind_types or [])] or [
+        b''
+    ] * len(request.binds)
     return [
-        BindVar(value=value, tns_type=tns_type, max_size=size, array_size=capacity)
+        BindVar(
+            value=value,
+            tns_type=tns_type,
+            max_size=size,
+            array_size=capacity,
+            toid=toid,
+        )
         if block or value is None
         else value
-        for value, (tns_type, size), capacity in zip(
-            request.binds, request.bind_meta, arrays
+        for value, (tns_type, size), capacity, toid in zip(
+            request.binds, request.bind_meta, arrays, toids
         )
     ]
 

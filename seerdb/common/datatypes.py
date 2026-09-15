@@ -251,11 +251,19 @@ _PYTYPE_TO_DBTYPE = {
 }
 
 
-def _resolve_dbtype(typ: object) -> _DbType:
+def _resolve_dbtype(typ: object):
     if isinstance(typ, _DbType):
         return typ
     if isinstance(typ, type) and typ in _PYTYPE_TO_DBTYPE:
         return _PYTYPE_TO_DBTYPE[typ]
+    # An object type (from connection.gettype) is a valid var() type: it exposes
+    # the DbType surface a Var reads (tns_type / default_size / csfrm) so an
+    # object / collection OUT bind and a typed-NULL object bind carry their type
+    # (#888). Imported lazily to avoid a datatypes <- dbobject import cycle.
+    from seerdb.common.dbobject import DbObjectType
+
+    if isinstance(typ, DbObjectType):
+        return typ
     raise ValueError(f'unsupported var() type: {typ!r}')
 
 

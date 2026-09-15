@@ -31,6 +31,7 @@ from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
     TNS_LONG_LENGTH_INDICATOR,
     TNS_NULL_LENGTH_INDICATOR,
+    TNS_TYPE_ADT,
     TNS_TYPE_BDOUBLE,
     TNS_TYPE_BFLOAT,
     TNS_TYPE_CHAR,
@@ -208,7 +209,18 @@ class DbObjectType:
     its version, and the ordered attribute layout (each entry
     ``{'name', 'type_name', 'data_type', 'charset'}``). ``newobject()`` builds
     a fresh, settable DbObject of this type ready to bind (#116).
+
+    A DbObjectType can also stand in as a ``cursor.var()`` type, so it exposes the
+    minimal DbType surface a Var reads (``tns_type`` / ``default_size`` /
+    ``csfrm``). That is how an object / collection OUT bind and a typed-NULL
+    object bind carry their type (#888).
     """
+
+    # DbType-like surface so `cursor.var(objtype)` works: an object is TNS type
+    # 109, needs no fixed buffer size, and carries no character-set form.
+    tns_type = TNS_TYPE_ADT
+    default_size = 0
+    csfrm = 0
 
     def __init__(
         self,

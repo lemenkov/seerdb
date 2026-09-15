@@ -36,6 +36,7 @@ from seerdb.common.tns_consts import (
     TNS_FETCH_ORIENTATION_FIRST,
     TNS_FETCH_ORIENTATION_LAST,
     TNS_FETCH_ORIENTATION_RELATIVE,
+    TNS_TYPE_ADT,
     TNS_TYPE_BLOB,
     TNS_TYPE_CLOB,
     TNS_TYPE_RAW,
@@ -614,6 +615,26 @@ class Cursor(_CursorLogic):
         self.close()
 
 
+def _object_from_out_image(image, objtype):
+    # Build a DbObject of `objtype` from an object OUT bind's ObjectImage (#888).
+    # The image decodes against the type's own layout: named attributes for an
+    # object, the single element type for a VARRAY / nested table. None (a NULL
+    # object OUT) stays None.
+    if image is None:
+        return None
+    from seerdb.common.dbobject import (
+        DbObject,
+        decode_collection_image,
+        decode_object_image,
+    )
+
+    if getattr(objtype, 'is_collection', False):
+        elements = decode_collection_image(image.image, objtype.element)
+        return DbObject(objtype.full_name, elements=elements, dbtype=objtype)
+    attrs = decode_object_image(image.image, objtype.attrs)
+    return DbObject(objtype.full_name, attrs, dbtype=objtype)
+
+
 def _assign_out_binds(Bind, Result) -> list:
     # After a PL/SQL execute, the IOV decoder leaves an {'out_positions',
     # 'out_values', ...} record as the single "row". Decode each scalar OUT
@@ -644,6 +665,12 @@ def _assign_out_binds(Bind, Result) -> list:
             Variable._value = [
                 decode_value(Column, V if V else None) for V in Value['values']
             ]
+        elif Variable.dbtype.tns_type == TNS_TYPE_ADT:
+            # Object / collection OUT (#888): the IOV decoder handed back an
+            # ObjectImage (or None); build a DbObject of the Var's type from it,
+            # decoding the image against the type's own attribute / element
+            # layout (which the Var's DbObjectType already carries).
+            Variable._value = _object_from_out_image(Value, Variable.dbtype)
         else:
             Variable._value = decode_value(Column, Value if Value else None)
     return RefCursors
