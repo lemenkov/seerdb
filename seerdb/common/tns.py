@@ -2180,7 +2180,17 @@ def _scroll_terminator(cursor_id: int, server_rowcount: int, eof: bool) -> bytes
     # client stops pulling. The cursor id ties the opening execute's response to
     # the kept-open scrollable cursor; a re-execute carries no id (0).
     if eof:
-        return _encode_oer(0, 1403, server_rowcount, b'', cursor_id=cursor_id)
+        # The message text is not decoration: a client reads the error number
+        # first and only reads a message when it is non-zero, so a 1403 with an
+        # empty message leaves it with None where a string must be (#893). Every
+        # other end-of-fetch terminator carries the same text.
+        return _encode_oer(
+            0,
+            1403,
+            server_rowcount,
+            b'ORA-01403: no data found\n',
+            cursor_id=cursor_id,
+        )
     return _encode_oer(1, 0, server_rowcount, b'', cursor_id=cursor_id)
 
 
