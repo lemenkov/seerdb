@@ -17,6 +17,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_CHAR,
     TNS_TYPE_CLOB,
     TNS_TYPE_DATE,
+    TNS_TYPE_INT,
     TNS_TYPE_INTERVALDS,
     TNS_TYPE_INTERVALYM,
     TNS_TYPE_JSON,
@@ -190,6 +191,11 @@ def Binary(value) -> bytes:  # noqa: N802
 # CLOB/NCLOB) that share a wire code.
 _FETCH_DBTYPE: dict[tuple[int, int], _DbType] = {
     (TNS_TYPE_NUMBER, 1): DB_TYPE_NUMBER,
+    # The native integer maps onto NUMBER: seerdb has no separate binary
+    # integer type, and a numeric bind is what an overloaded PL/SQL call
+    # needs to resolve. Unmapped, it resolved to None and every caller
+    # fell back to a string bind (#888).
+    (TNS_TYPE_INT, 1): DB_TYPE_NUMBER,
     (TNS_TYPE_VARCHAR, 1): DB_TYPE_VARCHAR,
     (TNS_TYPE_VARCHAR, 2): DB_TYPE_NVARCHAR,
     (TNS_TYPE_CHAR, 1): DB_TYPE_CHAR,
