@@ -2852,6 +2852,26 @@ inline bind. It is the inverse of §14.1/§14.2:
    its buffer, and the close-temp-LOBs piggyback (§14.5) riding on the third call
    then freed the locator that same call was about to bind, so the bind resolved
    to nothing and the column was written NULL (`ORA-01400`).
+   **Two bytes of the locator are not opaque to the client.** The thin
+   reference client picks the encoding of every WRITE to, and READ from, a CLOB
+   off two flag bytes: flag byte 3 (offset 6 of the 40 bytes the client holds,
+   offset 4 of the 38 the server sends after the `ub2` length) carries the
+   **variable-length-charset** bit `0x80`, and flag byte 4 (offset 7 / 5) the
+   **little-endian** bit `0x40`. The client writes UTF-16BE when the charset bit
+   is set and the little-endian bit clear, UTF-16LE when both are set, and UTF-8
+   when the charset bit is clear (an NCLOB is UTF-16BE regardless, by its charset
+   form). Captured off a live 23ai (`createlob` of each type, then a WRITE of
+   `abc`): the temp **CLOB** locator comes back with flags `82 08 80 03` —
+   charset set, little-endian clear — and the client's WRITE payload is `00 61
+   00 62 00 63` (UTF-16BE); the temp BLOB's flags are `81 08 00 03` and the
+   NCLOB's `84 48 00 03`. So the Mirror mints its temp CLOB locators with the
+   charset bit set and the little-endian bit clear (`mint_temp_lob_locator`),
+   which is the UTF-16BE it decodes on the bind. Before that the bytes held
+   ASCII: the charset bit was clear (client wrote UTF-8) and, once set, byte 4
+   still held `'d'` (`0x64`), whose `0x40` made the client write UTF-16LE —
+   either way the bind's UTF-16BE decode produced mojibake and the session died
+   (#903). seerdb's own client never noticed: it writes UTF-16BE
+   unconditionally.
 2. **`WRITE`** (op `0x0040`). The Mirror walks the §14.1 field block to the
    operation, then to the `ub2`-length-prefixed locator and the `0x0E` chunked
    payload (`ub1` len ≤ `0xFC`, else `0xFE` + `sb4`-length chunks + a zero
