@@ -48,6 +48,11 @@ from seerdb.common.tns_consts import (
 # Object image header flags (python-oracledb constants.pxi "image flags").
 _OBJ_IS_DEGENERATE = 0x10  # object stored in a LOB -- not supported here
 _OBJ_NO_PREFIX_SEG = 0x04  # no prefix segment precedes the attributes
+# The byte that precedes a nested object / collection attribute when it is NULL:
+# an "atomic null" (python-oracledb TNS_OBJ_ATOMIC_NULL). A collection also
+# accepts the ordinary 0xFF null there. Distinct from a scalar attribute's own
+# 0xFF null, so the flat length walk mistook it for a length of 253 and desynced.
+_OBJ_ATOMIC_NULL = 0xFD
 
 # Collection kinds (python-oracledb "database object collection types").
 COLLECTION_PLSQL_INDEX_TABLE = 1
@@ -80,9 +85,19 @@ _TYPE_NAME_TO_TNS = {
     'NCHAR': TNS_TYPE_CHAR,
     'NUMBER': TNS_TYPE_NUMBER,
     'FLOAT': TNS_TYPE_NUMBER,
+    # ALL_TYPE_ATTRS reports the NUMBER subtypes by their SQL spelling; they all
+    # store as NUMBER in the object image.
+    'INTEGER': TNS_TYPE_NUMBER,
+    'SMALLINT': TNS_TYPE_NUMBER,
+    'REAL': TNS_TYPE_NUMBER,
+    'DOUBLE PRECISION': TNS_TYPE_NUMBER,
     'RAW': TNS_TYPE_RAW,
     'DATE': TNS_TYPE_DATE,
     'TIMESTAMP': TNS_TYPE_TIMESTAMP,
+    # ALL_TYPE_ATTRS abbreviates the zone as "TZ", not "TIME ZONE" (as a column
+    # describe spells it); map both spellings.
+    'TIMESTAMP WITH TZ': TNS_TYPE_TIMESTAMPTZ,
+    'TIMESTAMP WITH LOCAL TZ': TNS_TYPE_TIMESTAMPLTZ,
     'TIMESTAMP WITH TIME ZONE': TNS_TYPE_TIMESTAMPTZ,
     'TIMESTAMP WITH LOCAL TIME ZONE': TNS_TYPE_TIMESTAMPLTZ,
     'BINARY_FLOAT': TNS_TYPE_BFLOAT,
@@ -391,13 +406,14 @@ def _read_length(Image: bytes, Pos: int) -> tuple[int | None, int]:
     return (Length, Pos)
 
 
-def _read_image_header(Image: bytes) -> int:
+def _read_image_header(Image: bytes, Pos: int = 0) -> int:
     # Mirrors python-oracledb DbObjectPickleBuffer.read_header: flags + version,
     # the (skipped) image length, then -- unless the NO_PREFIX_SEG flag is set
     # -- a prefix segment that is read and skipped. Returns the offset of the
-    # first attribute.
-    Flags = Image[0]
-    Pos = 2  # flags + version
+    # first attribute. ``Pos`` lets a nested object / collection image be read
+    # inline, in the middle of its parent's image.
+    Flags = Image[Pos]
+    Pos += 2  # flags + version
     (_, Pos) = _read_length(Image, Pos)  # image length (unused here)
     if Flags & _OBJ_IS_DEGENERATE:
         raise NotSupportedError('decoding an object stored in a LOB is not supported')
@@ -412,26 +428,78 @@ def decode_object_image(
 ) -> list[tuple[str, object]]:
     """Walk an object image into a list of (attr_name, value) pairs.
 
-    ``Layout`` is the ordered attribute list from the data dictionary; each
-    entry is ``{'name': str, 'data_type': int|None, 'charset': int|None}``.
+    ``Layout`` is the ordered attribute list from the data dictionary; each entry
+    is ``{'name', 'data_type', 'charset'}``, plus ``'object_type'`` (a nested
+    ``DbObjectType``) for an attribute that is itself an object or a collection.
+    A nested attribute is decoded recursively into a ``DbObject``; a nested value
+    that is atomically NULL is ``None`` (#117/#118).
     """
-    from seerdb.common.types import decode_value
+    Attrs, _ = _decode_object_attrs(Image, 0, Layout, Charset, header=True)
+    return Attrs
 
-    Pos = _read_image_header(Image)
+
+def _decode_object_attrs(
+    Image: bytes, Pos: int, Layout: list[dict], Charset: int, *, header: bool
+) -> tuple[list[tuple[str, object]], int]:
+    # The image header (flags / version / length / prefix seg) precedes only a
+    # self-contained image. A nested object *attribute* embeds its attributes
+    # inline with no header of its own, so ``header`` is False there.
+    if header:
+        Pos = _read_image_header(Image, Pos)
     Attrs: list[tuple[str, object]] = []
     for Attr in Layout:
+        (Value, Pos) = _decode_member(Image, Pos, Attr, Charset, in_collection=False)
+        Attrs.append((Attr['name'], Value))
+    return Attrs, Pos
+
+
+def _decode_member(
+    Image: bytes, Pos: int, Attr: dict, Charset: int, *, in_collection: bool
+) -> tuple[object, int]:
+    # One attribute (or collection element). How a nested value is framed depends
+    # on where it sits (python-oracledb `_pack_value`):
+    #   * an object ATTRIBUTE of an object -> its attributes inline, no header;
+    #   * a collection attribute, or ANY nested value inside a collection ->
+    #     a length-prefixed full image (with its own header);
+    #   * a scalar -> a length-prefixed value.
+    # A NULL nested object is the atomic-null 0xFD; a NULL collection is 0xFF.
+    Nested = Attr.get('object_type')
+    if Nested is not None and Nested.is_collection:
+        if Image[Pos] in (TNS_NULL_LENGTH_INDICATOR, _OBJ_ATOMIC_NULL):
+            return (None, Pos + 1)
         (Length, Pos) = _read_length(Image, Pos)
-        if Length is None or Length == 0:
-            Attrs.append((Attr['name'], None))
-            continue
-        Raw = bytes(Image[Pos : Pos + Length])
-        Pos += Length
-        Col = {
-            'data_type': Attr.get('data_type'),
-            'charset': Attr.get('charset') or Charset,
-        }
-        Attrs.append((Attr['name'], decode_value(Col, Raw)))
-    return Attrs
+        Sub = bytes(Image[Pos : Pos + (Length or 0)])
+        Pos += Length or 0
+        Elements = decode_collection_image(Sub, Nested.element or {}, Charset)
+        return (DbObject(Nested.full_name, elements=Elements, dbtype=Nested), Pos)
+    if Nested is not None:
+        if Image[Pos] == _OBJ_ATOMIC_NULL:
+            return (None, Pos + 1)
+        if in_collection:
+            # A length-prefixed full object image (its own header included).
+            (Length, Pos) = _read_length(Image, Pos)
+            Sub = bytes(Image[Pos : Pos + (Length or 0)])
+            Pos += Length or 0
+            SubAttrs = decode_object_image(Sub, Nested.attrs, Charset)
+            return (DbObject(Nested.full_name, SubAttrs, dbtype=Nested), Pos)
+        # An object attribute of an object: its attributes inline, no header.
+        SubAttrs, Pos = _decode_object_attrs(
+            Image, Pos, Nested.attrs, Charset, header=False
+        )
+        return (DbObject(Nested.full_name, SubAttrs, dbtype=Nested), Pos)
+    # A scalar (or a LOB, whose locator bytes come back raw for now).
+    from seerdb.common.types import decode_value
+
+    (Length, Pos) = _read_length(Image, Pos)
+    if Length is None or Length == 0:
+        return (None, Pos)
+    Raw = bytes(Image[Pos : Pos + Length])
+    Pos += Length
+    Col = {
+        'data_type': Attr.get('data_type'),
+        'charset': Attr.get('charset') or Charset,
+    }
+    return (decode_value(Col, Raw), Pos)
 
 
 def decode_xmltype(Image: bytes, Charset: int = AL32UTF8_CHARSET) -> tuple:
@@ -479,22 +547,11 @@ def decode_collection_image(
     decoded with the single element type. A NULL element is ``None``. (PL/SQL
     associative arrays prefix each element with an int32 key -- that is #122.)
     """
-    from seerdb.common.types import decode_value
-
-    Pos = _read_image_header(Image)
+    Pos = _read_image_header(Image, 0)
     Pos += 1  # collection flags (skip)
     (Count, Pos) = _read_length(Image, Pos)
-    Col = {
-        'data_type': Element.get('data_type'),
-        'charset': Element.get('charset') or Charset,
-    }
     Out: list = []
     for _ in range(Count or 0):
-        (Length, Pos) = _read_length(Image, Pos)
-        if Length is None or Length == 0:
-            Out.append(None)
-            continue
-        Raw = bytes(Image[Pos : Pos + Length])
-        Pos += Length
-        Out.append(decode_value(Col, Raw))
+        (Value, Pos) = _decode_member(Image, Pos, Element, Charset, in_collection=True)
+        Out.append(Value)
     return Out
