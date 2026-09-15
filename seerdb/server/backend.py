@@ -81,6 +81,11 @@ class BindVar:
     tns_type: int
     max_size: int
     array_size: int = 0
+    # The referenced type's 16-byte OID for an object (ADT) bind, so the backend
+    # can register a Var of that type for an object OUT / typed-NULL bind — the
+    # value alone (None) carries no type identity (#888). Empty for every other
+    # bind.
+    toid: bytes = b''
 
 
 @dataclass(frozen=True)

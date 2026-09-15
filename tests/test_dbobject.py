@@ -245,6 +245,61 @@ class TestObjectColumnValueEncode(unittest.TestCase):
         self.assertEqual(Rest, _SENTINEL)
 
 
+class TestObjectVar(unittest.TestCase):
+    # cursor.var() of an object type (#888): the Var carries the DbObjectType, so
+    # an object OUT bind and a typed-NULL object bind announce their type in the
+    # OAC and read back as a DbObject.
+
+    def test_var_accepts_object_type(self):
+        from seerdb.common.datatypes import Var
+
+        var = Var(_ADDR_TYPE)
+        self.assertEqual(var.dbtype.tns_type, TNS_TYPE_ADT)
+        self.assertIs(var.dbtype, _ADDR_TYPE)
+
+    def test_var_object_oac_carries_type_oid(self):
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import encode_token_oac
+
+        _ENCODE_FIELD_VERSION.set(24)
+        try:
+            oac = encode_token_oac(Var(_ADDR_TYPE))
+        finally:
+            _ENCODE_FIELD_VERSION.set(6)
+        self.assertEqual(oac[0], TNS_TYPE_ADT)
+        self.assertIn(_ADDR_TYPE.oid, oac)
+
+    def test_unseeded_object_var_binds_typed_null_frame(self):
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import encode_token_rxd
+
+        wire = encode_token_rxd(Var(_ADDR_TYPE))  # no setvalue -> NULL object
+        self.assertNotEqual(wire, bytes([0]))  # not the bare scalar NULL DALC
+        (val, rest) = _read_object_column(
+            wire + _SENTINEL, {'type_oid': _ADDR_TYPE.oid}
+        )
+        self.assertIsNone(val)
+        self.assertEqual(rest, _SENTINEL)
+
+    def test_object_out_bind_round_trips(self):
+        from seerdb.client.cursor import _object_from_out_image
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import (
+            ScalarOutBind,
+            _read_iov,
+            encode_out_bind_response_thin,
+        )
+
+        Obj = _ADDR_TYPE.newobject({'STREET': 'Main St', 'ZIP': 12345, 'CODE': 'US'})
+        reply = encode_out_bind_response_thin(
+            [ScalarOutBind(value=Obj, tns_type=TNS_TYPE_ADT)]
+        )
+        _, out_values, _ = _read_iov(reply, [Var(_ADDR_TYPE)])
+        self.assertIsInstance(out_values[0], ObjectImage)
+        back = _object_from_out_image(out_values[0], _ADDR_TYPE)
+        self.assertEqual(back.aslist(), ['Main St', 12345, 'US'])
+
+
 class TestNestedObjectImageEncode(unittest.TestCase):
     # The recursive image encoder (#116/#117/#118), the inverse of the nested
     # decode (#920): an object attribute of an object rides inline (no header), a

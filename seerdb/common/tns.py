@@ -2796,6 +2796,12 @@ def _is_refcursor_bind(Bind: object) -> bool:
     return isinstance(Bind, RefCursorBind)
 
 
+def _is_object_bind(Bind: object) -> bool:
+    # An object / collection Var (cursor.var(objtype)) whose OUT value the server
+    # returns in the object framing, not a plain DALC (#888).
+    return isinstance(Bind, Var) and Bind.dbtype.tns_type == TNS_TYPE_ADT
+
+
 def _read_iov(
     Data: bytes, Binds: list | None = None
 ) -> tuple[list[int], list[object], bytes]:
@@ -2834,6 +2840,14 @@ def _read_iov(
             if _is_refcursor_bind(Bind):
                 (Value, Rest) = _read_refcursor_out(Rest)
                 OutValues.append(Value)
+            elif _is_object_bind(Bind):
+                # An object / collection OUT value: the read_dbobject framing
+                # (an ObjectImage the cursor turns into a DbObject), then the
+                # per-value return code (#888).
+                oid = getattr(cast(Var, Bind).dbtype, 'oid', b'')
+                (ObjVal, Rest) = _read_object_column(Rest, {'type_oid': oid})
+                (_, Rest) = decode_ub4(Rest)
+                OutValues.append(ObjVal)
             elif Bind is not None and getattr(Bind, 'is_array', False):
                 # Associative-array OUT (#122): a ub4 element count, then each
                 # element as a DALC value + indicator. Kept as a list of raw
@@ -10664,6 +10678,14 @@ def encode_token_rxd(Token: object) -> bytes:
             return Out
         if Token.dbtype.tns_type == TNS_TYPE_REFCURSOR:
             return bytes([1, 0])  # REF CURSOR slot placeholder
+        if Token.dbtype.tns_type == TNS_TYPE_ADT:
+            # Object / collection Var: a DbObject value binds as its write_dbobject
+            # image; an unset / NULL Var sends the typed-NULL object frame (the
+            # OAC's OID names the type), never the bare 0x00 a scalar NULL sends,
+            # which the server would misread against read_dbobject (#888).
+            if Token._value is None:
+                return encode_object_column_value(None, Token.dbtype.oid)
+            return _encode_object_bind_value(cast('DbObject', Token._value))
         if Token._value is None:
             return bytes([0])
         if getattr(Token.dbtype, 'csfrm', 1) == 2 and isinstance(Token._value, str):
@@ -10880,6 +10902,13 @@ def encode_token_oac(Token: object) -> bytes:
             return encode_token_raw(TNS_TYPE_INTERVALYM, 5, 0, 0, 0, A)
         if DT == TNS_TYPE_REFCURSOR:
             return encode_token_raw(TNS_TYPE_REFCURSOR, 1, 0, UTF8_CHARSET, 0)
+        if DT == TNS_TYPE_ADT:
+            # An object / collection Var (cursor.var(objtype)): the object bind
+            # OAC carrying the type's 16-byte OID + version, sized for the server
+            # to return into. Pairs with a DbObject value or a typed NULL (#888).
+            return _object_oac(
+                Token.dbtype.oid, Token.dbtype.version, _OBJECT_OAC_BUFFER_SIZE
+            )
         if DT == TNS_TYPE_BOOLEAN:
             # Native BOOLEAN Var, what setinputsizes(bool) / DB_TYPE_BOOLEAN
             # produces (#870). The same OAC a plain bool value already gets --
@@ -11272,25 +11301,36 @@ def encode_object_column_value(Value: object, TypeOid: bytes = b'') -> bytes:
     )
 
 
-def _encode_object_oac(Obj: 'DbObject') -> bytes:
+# Buffer size the OAC of an object OUT bind advertises when there is no value to
+# size it from (a pure OUT / typed-NULL bind) — the same figure a fetched object
+# column describes with (§21.1). The image is self-delimiting, so the exact value
+# is not load-bearing for the read.
+_OBJECT_OAC_BUFFER_SIZE = 2000
+
+
+def _object_oac(oid: bytes, version: int, buffer_size: int) -> bytes:
     # The bind OAC for an object (type 109): the 12c+ metadata layout injecting
     # the type's 16-byte OID + version (precision/scale 0, no charset). Mirrors
     # python-oracledb _write_column_metadata's object branch. 12c+ only — pre-12c
     # object binds are gated in the cursor (no thin reference for that OAC).
-    Typ = Obj._dbtype
-    Image = encode_object_image(Obj)
     return (
         bytes([TNS_TYPE_ADT, 1, 0, 0])  # type, flag (USE_INDICATORS), p, s
-        + encode_sb4(len(Image))  # buffer size
+        + encode_sb4(buffer_size)  # buffer size
         + encode_sb4(0)  # max number of array elements
         + encode_sb4(0)  # cont flag (ub8)
-        + _obj_two_lengths(Typ.oid)  # type OID (16 bytes)
-        + encode_sb4(Typ.version)  # type version
+        + _obj_two_lengths(oid)  # type OID (16 bytes)
+        + encode_sb4(version)  # type version
         + encode_sb4(0)  # charset id (ub2)
         + bytes([0])  # character set form
         + encode_sb4(0)  # LOB prefetch length
         + encode_sb4(0)
     )  # oaccolid (12.2+)
+
+
+def _encode_object_oac(Obj: 'DbObject') -> bytes:
+    # A populated object value's bind OAC: the buffer size is the image length.
+    Typ = Obj._dbtype
+    return _object_oac(Typ.oid, Typ.version, len(encode_object_image(Obj)))
 
 
 # Fixed buffer size the REF bind OAC advertises (matches the Oracle JDBC thin

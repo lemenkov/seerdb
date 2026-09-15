@@ -23,6 +23,7 @@ from dataclasses import replace
 import seerdb
 from seerdb.common.datatypes import TempLob, dbtype_for_oracle_type
 from seerdb.common.dbobject import (
+    DbObjectType,
     ObjectImage,
     decode_collection_image,
     decode_object_image,
@@ -137,20 +138,16 @@ class OraclePassthroughBackend:
         )
         return password
 
-    def _object_from_image(self, image: ObjectImage) -> object:
-        # Turn an inbound object (ADT) bind's image back into a DbObject the
-        # upstream connection can bind (#888). The bind OAC carries only the
-        # type's 16-byte OID, so resolve it to a name, describe the type (which
-        # gives the attribute layout the image needs to decode), and rebuild the
-        # object. Returns None if the OID cannot be resolved -- the caller then
-        # binds NULL rather than desyncing.
+    def _gettype_by_oid(self, oid: bytes) -> DbObjectType | None:
+        # Resolve a type's 16-byte OID to its DbObjectType via all_types (the bind
+        # OAC carries only the OID, not the name). None if it cannot be resolved.
         assert self._conn is not None
-        # The image's toid is the constructed form 00 22 02 08 + <16-byte type
-        # OID> + <extent OID> (36 bytes); all_types.type_oid is the bare 16-byte
-        # OID, so pull it out of the middle. A value that already carries the bare
-        # OID (16 bytes) is used as-is.
-        toid = image.type_oid or b''
-        oid = toid[4:20] if len(toid) >= 20 else toid
+        if not oid:
+            return None
+        # A value's toid is the constructed 36-byte form (00 22 02 08 + OID +
+        # extent); the OAC carries the bare 16-byte OID. Accept either.
+        if len(oid) >= 20:
+            oid = oid[4:20]
         probe = self._conn.cursor()
         probe.execute(
             'SELECT owner, type_name FROM all_types WHERE type_oid = :1', [oid]
@@ -159,10 +156,18 @@ class OraclePassthroughBackend:
         if row is None:
             return None
         owner, name = row
-        typ = self._conn.gettype(f'{owner}.{name}')
+        return self._conn.gettype(f'{owner}.{name}')
+
+    def _object_from_image(self, image: ObjectImage) -> object:
+        # Turn an inbound object (ADT) bind's image back into a DbObject the
+        # upstream connection can bind (#888): resolve the type, decode the image
+        # against its layout, and rebuild the object (or collection). None if the
+        # OID cannot be resolved -- the caller then binds NULL rather than
+        # desyncing.
+        typ = self._gettype_by_oid(image.type_oid or b'')
+        if typ is None:
+            return None
         if getattr(typ, 'is_collection', False):
-            # A VARRAY / nested table bind: the image is a collection image whose
-            # elements decode against the single element type (#117/#118).
             elements = decode_collection_image(image.image, typ.element)
             return typ.newobject(list(elements))
         attrs = decode_object_image(image.image, typ.attrs)
@@ -313,13 +318,21 @@ class OraclePassthroughBackend:
             ):
                 variables.append(bind.value)
                 continue
-            if bind.tns_type == TNS_TYPE_ADT and bind.value is not None:
-                # An object (ADT) IN bind: _resolve_object_binds already turned the
-                # inbound image into a DbObject, which binds as a plain value. An
-                # object OUT bind is not supported here (rare); the value carries
-                # its own type identity, so no Var wrapping is needed (#888).
-                variables.append(bind.value)
-                continue
+            if bind.tns_type == TNS_TYPE_ADT:
+                # An object (ADT) bind (#888). A populated IN value was already
+                # turned into a DbObject by _resolve_object_binds and binds as a
+                # plain value. A None value is an object OUT bind (a function
+                # returning an object/collection) or a typed NULL: register a Var
+                # of the type so the result comes back typed and a NULL carries
+                # its type for overload resolution. The OAC's OID rides on the
+                # BindVar; if it cannot be resolved, fall through to bind None.
+                if bind.value is not None:
+                    variables.append(bind.value)
+                    continue
+                objtype = self._gettype_by_oid(bind.toid)
+                if objtype is not None:
+                    variables.append(cursor.var(objtype))
+                    continue
             dbtype = dbtype_for_oracle_type(bind.tns_type, 1)
             if bind.array_size:
                 # An associative-array bind (#743): an array variable of the

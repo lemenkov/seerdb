@@ -4388,11 +4388,36 @@ object rides as a plain value (not an OUT `Var`); an echoed object bind position
 in the IOV reply carries the full object frame (`encode_object_column_value`),
 never a bare `0x00`, so the client stays in sync (§6.5).
 
-This covers a populated object or collection bound **IN**, in SQL or a PL/SQL
-call. Two directions stay open, both blocked on the same missing client feature —
-`cursor.var()` of an object type: an object/collection **OUT** bind (a function
-returning one), and a **typed-NULL** object bind (which must carry its type so a
-PL/SQL overload resolves and the value reads back as NULL, not an empty object).
+### 21.11 `cursor.var()` of an object type (#888)
+
+An object / collection **OUT** bind (a function returning one) and a **typed-NULL**
+object bind both need the bind to carry its type when the value cannot — a NULL
+says nothing about its type, and a pure-OUT slot has no value at all. The client
+supports this by letting a `DbObjectType` (from `connection.gettype`) stand in as
+a `cursor.var()` type: the type exposes the minimal DbType surface a `Var` reads
+(`tns_type` = 109, no fixed size, no charset form), and the Var routes the object
+path throughout:
+
+- **OAC** (`_object_oac`): type 109 + the type's 16-byte OID + version, sized for
+  the server to return into — the same OAC an object value binds with, minus the
+  image length.
+- **Value**: a `DbObject` seeded on the Var binds as its `write_dbobject` image; an
+  unseeded Var (pure OUT) or a NULL sends the typed-NULL object frame
+  (`encode_object_column_value(None, oid)`), never the bare `0x00` a scalar NULL
+  sends — the server reads this slot with `read_dbobject`.
+- **OUT read-back** (`_read_iov` → `_assign_out_binds`): the returned value is the
+  object framing (an `ObjectImage`, then the per-value return code), which the
+  cursor rebuilds into a `DbObject` of the Var's type — attributes for an object,
+  the element list for a collection.
+
+**Server side (the Mirror).** The passthrough threads the OAC's type OID onto the
+`BindVar` (an object bind's value alone is `None` for OUT / typed-NULL), and for
+such a bind registers `cursor.var(objtype)` upstream so the function's object
+result comes back typed and a NULL binds with its type for overload resolution.
+This closes object binding in both directions — python-oracledb's
+`data_types/test_1900_dbobject` reaches 39 / 48 through the Mirror (IN, OUT and
+typed-NULL object and collection binds); the rest are attribute-fidelity for
+specific attribute types, XMLType (§21 / #124), and a large-collection case.
 
 ## 22. DML RETURNING ... INTO (#120)
 
