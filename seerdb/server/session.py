@@ -1730,8 +1730,10 @@ def _answer_lobops(
         return lobs
     # A READ of an emitted column locator: hand back the next queued LOB whole,
     # row-major, matching the order the locators went out (#413).
-    content, _is_clob = lobs.pop(0) if lobs else (b'', True)
-    stream.write_packet(TNS_DATA, encode_lob_read_response_thin(content))
+    content, is_clob = lobs.pop(0) if lobs else (b'', True)
+    stream.write_packet(
+        TNS_DATA, encode_lob_read_response_thin(content, is_clob=is_clob)
+    )
     return lobs
 
 
@@ -1875,6 +1877,11 @@ def _answer_query(
         # at all, so re-running loses the column metadata the reply needs.
         count = request.fetch if request.fetch > 0 else _ALL_ROWS
         columns_out, batch = cursors.take(reused_id, count)
+        # Queue the content of the LOB cells in the rows THIS reply delivers.
+        # Returning the function-local (empty) list here wiped the queue the
+        # opening execute had built, so every follow-up TTI_LOBOPS read found
+        # nothing and handed the client an empty LOB (#903).
+        lobs = oci_lob_contents(columns_out, batch)
         stream.write_packet(
             TNS_DATA,
             encode_fetch_response(

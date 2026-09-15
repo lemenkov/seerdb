@@ -1878,11 +1878,27 @@ def parse_lobops_read(body: bytes) -> tuple[int, int]:
     return max(offset, 1), amount
 
 
-def encode_lob_read_response_thin(content: bytes) -> bytes:
-    """The thin TTI_LOBOPS READ reply (#413): the whole LOB content as LOB_DATA
-    then a success OER (the client reads the content, skips to the OER, and stops).
-    ``content`` is UTF-16BE for a CLOB, raw for a BLOB."""
-    return _lob_data_thin(content) + _encode_oer(1, 0, 0, b'')
+def encode_lob_read_response_thin(content: bytes, *, is_clob: bool = False) -> bytes:
+    """The thin TTI_LOBOPS READ reply (#413): the whole LOB content as LOB_DATA,
+    the return-parameter block naming the amount read, then a success OER.
+    ``content`` is UTF-16BE for a CLOB, raw for a BLOB.
+
+    The **amount** is in the LOB's own units -- characters for a CLOB, bytes for
+    a BLOB -- which is why it cannot be inferred from the content length. Without
+    this block a client falls back to counting the bytes it received, and a CLOB
+    then reads back at twice its length, every character counted once per UTF-16
+    byte (#903). seerdb's own client never noticed: it takes the content whole
+    and does not consult the amount."""
+    amount = len(content) // 2 if is_clob else len(content)
+    return (
+        _lob_data_thin(content)
+        + bytes([TTI_RPA])
+        # The locator rides RAW here, not length-prefixed: the client reads back
+        # exactly as many bytes as the locator it sent, then the amount.
+        + _THIN_LOB_LOCATOR
+        + encode_sb4(amount)
+        + _encode_oer(1, 0, 0, b'')
+    )
 
 
 def _lob_data_thin(content: bytes) -> bytes:
@@ -9987,7 +10003,23 @@ def encode_long_value_thin(Value: object) -> bytes:
 
 # The RXD value the Mirror mints for a thin LOB column: an opaque locator the
 # client echoes back over TTI_LOBOPS, the content following in the read reply.
-_THIN_LOB_LOCATOR = b'\x00seerdb-mirror-lob-locator-0000000000\x00'
+# Flag byte 3 of a LOB locator carries the variable-length-charset bit. A client
+# reads a CLOB as UTF-16 only when it is set and as UTF-8 otherwise, so the flat
+# placeholder -- all zeros in the flag bytes -- told every client the UTF-16BE
+# content it was about to receive was UTF-8, and each character came back twice
+# (#903). seerdb's own client assumes UTF-16 and never looked, which is why only
+# an independent client saw it.
+_THIN_LOB_LOC_OFFSET_FLAG_3 = 6
+_THIN_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET = 0x80
+
+
+def _thin_lob_locator() -> bytes:
+    raw = bytearray(b'\x00seerdb-mirror-lob-locator-0000000000\x00')
+    raw[_THIN_LOB_LOC_OFFSET_FLAG_3] |= _THIN_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET
+    return bytes(raw)
+
+
+_THIN_LOB_LOCATOR = _thin_lob_locator()
 # The chunk size a live 23ai reports alongside a LOB column locator. The client
 # keeps it for its own chunking (`lob.getchunksize()`); any sane value works.
 _THIN_LOB_CHUNK_SIZE = 8060
