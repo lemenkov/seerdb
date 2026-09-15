@@ -10613,6 +10613,27 @@ def encode_token_oac(Token: object) -> bytes:
             if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_23_1:
                 return encode_token_raw(TNS_TYPE_BOOLEAN, 4, 0, 0, 0, A)
             return encode_token_raw(TNS_TYPE_NUMBER, 22, 0, 0, 0, A)
+        # A declared CLOB / BLOB Var is deliberately NOT handled here: an OAC
+        # built from the Var's size is rejected by a live server with
+        # ORA-03120 (integer overflow), so that one needs the size field
+        # decoded rather than guessed, and is left to #902's follow-up.
+        if DT == TNS_TYPE_JSON:
+            # The same OAC a JSON value binds with; only the Var path was
+            # missing, so setinputsizes(DB_TYPE_JSON) raised (#902).
+            return _JSON_BIND_OAC
+        if DT == TNS_TYPE_VECTOR:
+            return _VECTOR_BIND_OAC
+        if DT == TNS_TYPE_TIMESTAMPLTZ:
+            # 11 bytes, like TIMESTAMP -- the local-time-zone variant carries no
+            # extra offset on the wire, the session's zone supplies it.
+            return encode_token_raw(TNS_TYPE_TIMESTAMPLTZ, 11, 0, 0, 0, A)
+        if DT in (TNS_TYPE_LONG, TNS_TYPE_LONGRAW):
+            # LONG-class Var: the declared buffer, character for LONG and binary
+            # for LONG RAW. The value itself still rides after the row
+            # (see the LONG-bind note in encode_dictionary_exec).
+            return encode_token_raw(
+                DT, Token.size, 16, 0 if DT == TNS_TYPE_LONGRAW else CharCs, 0, A
+            )
         raise NotSupportedError(
             f'no bind encoding for data type {DT}',
         )
