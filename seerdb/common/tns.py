@@ -399,6 +399,12 @@ class LobOpsRequest:
     is_blob: bool = False
     locator: bytes = b''
     payload: bytes = b''
+    # A READ names the 1-based position it wants and how much, in the LOB's own
+    # units -- characters for a CLOB, bytes for a BLOB (#903). A client reads a
+    # large LOB in several passes, so serving the whole thing on the first read
+    # leaves the rest unanswered. 0 amount means "whatever is there".
+    offset: int = 1
+    amount: int = 0
 
 
 @dataclass(frozen=True)
@@ -2045,6 +2051,24 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
         return LobOpsRequest(kind='ack', locator=_lobops_locator_after_operation(rest))
     # READ (the #413 column-LOB read) and anything else fall through to the read
     # path — unchanged, so an unrecognised op behaves as before rather than worse.
+    if operation == TNS_LOB_OP_READ:
+        # Same walk as the WRITE branch above to the locator, then the trailing
+        # ub8 amount the client writes last of all (#903).
+        try:
+            tail = rest[2:]  # scn-array pointer + length
+            source_offset, tail = decode_ub4(tail)
+            _dest_offset, tail = decode_ub4(tail)
+            tail = tail[1:]  # amount pointer flag
+            tail = tail[6:]  # three reserved ub2 array-LOB slots
+            loc_len = struct.unpack('>H', tail[:2])[0]
+            tail = tail[2 + loc_len :]
+            amount, _ = decode_ub4(tail)
+            return LobOpsRequest(
+                kind='read', offset=max(source_offset, 1), amount=amount
+            )
+        except (IndexError, struct.error, Truncated):
+            # A shape this walk does not fit reads the LOB whole, as before.
+            return LobOpsRequest(kind='read')
     return LobOpsRequest(kind='read')
 
 
