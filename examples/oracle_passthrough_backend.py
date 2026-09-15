@@ -21,7 +21,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 
 import seerdb
-from seerdb.common.datatypes import dbtype_for_oracle_type
+from seerdb.common.datatypes import TempLob, dbtype_for_oracle_type
 from seerdb.common.sqltext import is_plsql
 from seerdb.common.tns import AL16UTF16_CHARSET, ColumnMeta
 from seerdb.common.tns_consts import (
@@ -141,17 +141,33 @@ class OraclePassthroughBackend:
         if any(isinstance(b, BindVar) for b in binds):
             if is_plsql(sql):
                 return self._execute_plsql(cursor, sql, binds)
-            # An ordinary statement's BindVar is a typed NULL (#699): declare
-            # the type upstream the way the client did, and bind the NULL.
-            cursor.setinputsizes(
-                *[
-                    dbtype_for_oracle_type(b.tns_type, 1)
-                    if isinstance(b, BindVar)
-                    else None
-                    for b in binds
-                ]
-            )
-            binds = [b.value if isinstance(b, BindVar) else b for b in binds]
+            # An ordinary statement's BindVar is either a typed NULL (#699) or a
+            # LOB the Mirror could not bind as a bare value -- an empty CLOB /
+            # BLOB, which stores NULL when bound as a plain '' / b'' (#903).
+            # Route a LOB-typed bind through an upstream temp LOB so it stores as
+            # a non-NULL LOB (seerdb has no CLOB / BLOB Var-bind); declare every
+            # other typed NULL the way the client did and bind its value.
+            sizes: list = []
+            resolved: list = []
+            for b in binds:
+                if isinstance(b, BindVar) and b.tns_type in (
+                    TNS_TYPE_CLOB,
+                    TNS_TYPE_BLOB,
+                ):
+                    is_blob = b.tns_type == TNS_TYPE_BLOB
+                    locator = self._conn.create_temp_lob(is_blob=is_blob)
+                    if b.value and isinstance(b.value, (str, bytes)):
+                        self._conn.write_temp_lob(locator, b.value, is_blob=is_blob)
+                    sizes.append(None)
+                    resolved.append(TempLob(locator, is_blob))
+                elif isinstance(b, BindVar):
+                    sizes.append(dbtype_for_oracle_type(b.tns_type, 1))
+                    resolved.append(b.value)
+                else:
+                    sizes.append(None)
+                    resolved.append(b)
+            cursor.setinputsizes(*sizes)
+            binds = resolved
         try:
             cursor.execute(sql, list(binds))
         except seerdb.DatabaseError as exc:

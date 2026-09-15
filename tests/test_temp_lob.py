@@ -104,18 +104,33 @@ class BindEncode(_FieldVersionIsolated):
         _ENCODE_FIELD_VERSION.set(16)  # 21c
 
     def test_clob_oac(self):
-        Oac = encode_token_oac(TempLob(LOCATOR, False, 400000))
-        # type 0x70, LOB cont-flag 0x02000000, charset 873 (AL32UTF8), csfrm 1.
-        self.assertEqual(Oac.hex(), '7001000003061a800004020000000000020369010000')
+        Oac = encode_token_oac(TempLob(LOCATOR, False))
+        # type 0x70, max-data-length 112 (the fixed LOB buffer factor, sb4
+        # 01 70), LOB cont-flag 0x02000000, charset 873 (AL32UTF8), csfrm 1.
+        self.assertEqual(Oac.hex(), '7001000001700004020000000000020369010000')
 
     def test_blob_oac(self):
-        Oac = encode_token_oac(TempLob(LOCATOR, True, 60000))
-        # type 0x71, cont-flag 0x02000000, charset 0, csfrm 0.
-        self.assertEqual(Oac.hex(), '7101000002ea60000402000000000000000000')
+        Oac = encode_token_oac(TempLob(LOCATOR, True))
+        # type 0x71, max-data-length 112, cont-flag 0x02000000, charset 0, csfrm 0.
+        self.assertEqual(Oac.hex(), '710100000170000402000000000000000000')
+
+    def test_oac_size_is_fixed_not_value_derived(self):
+        # The OAC announces the fixed LOB buffer size, never the value's byte
+        # budget: python-oracledb sends the same for an empty and a huge LOB, and
+        # a size of 0 makes the server bind NULL (#903). The marker no longer even
+        # carries a size, so the CLOB / BLOB OAC is one fixed string each.
+        self.assertEqual(
+            encode_token_oac(TempLob(LOCATOR, False)).hex(),
+            '7001000001700004020000000000020369010000',
+        )
+        self.assertEqual(
+            encode_token_oac(TempLob(LOCATOR, True)).hex(),
+            '710100000170000402000000000000000000',
+        )
 
     def test_rxd_descriptor(self):
         # LOB-descriptor prefix 01 28 28 + ub2 locator length + locator.
-        Rxd = encode_token_rxd(TempLob(LOCATOR, False, 400000))
+        Rxd = encode_token_rxd(TempLob(LOCATOR, False))
         self.assertEqual(
             Rxd, bytes.fromhex('012828') + struct.pack('>H', len(LOCATOR)) + LOCATOR
         )

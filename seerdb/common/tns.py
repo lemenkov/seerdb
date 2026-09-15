@@ -1954,6 +1954,12 @@ def _lob_data_thin(content: bytes) -> bytes:
 # waiting on bytes that never come. A live 23ai returns 40.
 _TEMP_LOB_LOCATOR_LEN = 38
 
+# The max-data-length a temp-LOB bind OAC announces: python-oracledb's DB_TYPE
+# buffer_size_factor for a LOB, 112 for both CLOB and BLOB, sent for every
+# temp-LOB bind regardless of the value size. The server reads 0 here as "no
+# LOB" and stores NULL, so this must be non-zero even for an empty LOB (#903).
+_LOB_BIND_BUFFER_SIZE = 112
+
 
 def mint_temp_lob_locator(index: int, is_blob: bool) -> bytes:
     """A unique opaque locator for the ``index``-th temp LOB of a session (#412).
@@ -10750,14 +10756,22 @@ def encode_token_oac(Token: object) -> bytes:
     if isinstance(Token, TempLob):
         # Temp-LOB locator bind (#91): a CLOB / BLOB OAC carrying the LOB
         # cont-flag 0x02000000 (the same flag the native VECTOR / JSON OACs
-        # set). The announced length is the source value's byte budget. Built
-        # explicitly because encode_token_raw zeroes the cont-flag.
+        # set). Built explicitly because encode_token_raw zeroes the cont-flag.
+        #
+        # The max-data-length field is the LOB's fixed buffer-size factor, NOT
+        # the source value's byte budget: python-oracledb announces its DB_TYPE
+        # buffer_size_factor (112 for both CLOB and BLOB) for every temp-LOB
+        # bind regardless of the value's size, and the server reads a length of
+        # 0 as "no LOB here" and stores NULL. Announcing the value size worked
+        # for a non-empty LOB (any non-zero length does) but bound an **empty**
+        # temp LOB as NULL -- ORA-01400 on a NOT NULL column, and a silent NULL
+        # otherwise (#903).
         DT = TNS_TYPE_BLOB if Token.is_blob else TNS_TYPE_CLOB
         Charset = 0 if Token.is_blob else AL32UTF8_CHARSET
         Csfrm = 0 if Token.is_blob else 1
         return (
             bytes([DT, 1, 0, 0])
-            + encode_sb4(Token.oac_size)
+            + encode_sb4(_LOB_BIND_BUFFER_SIZE)
             + encode_sb4(0)  # max number of array elements
             + encode_sb4(0x02000000)  # cont flag (ub8) — LOB
             + encode_sb4(0)  # OID

@@ -2283,7 +2283,7 @@ def test_parse_exec_decodes_a_temp_lob_bind_as_a_reference() -> None:
                 'server_version': VERSION_11_2_0_2,
                 'cursor': 0,
                 'query': 'insert into t values (:1, :2)',
-                'bind': [7, TempLob(locator, True, 4096)],
+                'bind': [7, TempLob(locator, True)],
                 'batch': [],
                 'def': [],
             },
