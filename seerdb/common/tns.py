@@ -2648,6 +2648,13 @@ def encode_challenge(challenge: Challenge) -> bytes:
 # is the one per-login value and is appended by encode_result_oci.
 
 
+# The session's max open cursors, reported to a thin client as
+# AUTH_MAX_OPEN_CURSORS: it sizes the cursors-to-close array from this (a missing
+# / zero value clamps to 1 and overruns). The value only has to be a sane ceiling;
+# a live 23ai reports its open_cursors default, 300.
+_AUTH_MAX_OPEN_CURSORS = 300
+
+
 def encode_result(
     session_key: bytes,
     *,
@@ -2668,6 +2675,12 @@ def encode_result(
     - ``AUTH_SERIAL_NUM`` joins the session identity — a 12.1+ client reads
       session id, serial number and version number, and raises on a missing key
       rather than defaulting;
+    - ``AUTH_MAX_OPEN_CURSORS`` joins it too — a thin client sizes the array it
+      tracks cursors-to-close in from this value, clamping a missing / zero one
+      to **1**, so the second cursor it tries to close overruns that array with
+      ``IndexError: array assignment index out of range`` (the statement-cache
+      path every ``executemany`` and cursor reuse drives). A live 23ai reports
+      its ``open_cursors`` here (300);
     - a status OER closes the reply, as it closes the challenge (see
       :func:`encode_challenge` for why a client waits without one).
     """
@@ -2680,6 +2693,7 @@ def encode_result(
     ]
     if modern:
         pairs.append((b'AUTH_SERIAL_NUM', str(serial_num).encode('ascii')))
+        pairs.append((b'AUTH_MAX_OPEN_CURSORS', str(_AUTH_MAX_OPEN_CURSORS).encode()))
     payload = encode_rpa_kv(pairs)
     if modern:
         payload += encode_status()
