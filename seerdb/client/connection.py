@@ -808,6 +808,8 @@ class OracleConnect(_ConnectionLogic):
         # (owner, type_name). Populated on demand from ALL_TYPE_ATTRS the first
         # time an object of that type is fetched.
         self._object_type_cache: dict[tuple[str, str], 'DbObjectType'] = {}
+        # (owner, name) currently being described, to break nested-type cycles.
+        self._object_type_describing: set[tuple[str, str]] = set()
 
     def _next_seq(self) -> int:
         seq = self.seq
@@ -1907,8 +1909,6 @@ class OracleConnect(_ConnectionLogic):
         # empty layout (the #115 read path tolerates that).
         if not name:
             return None
-        from seerdb.common.dbobject import DbObjectType, type_name_to_tns
-
         Owner = schema
         if Owner is None:
             Result = self.execute('SELECT USER FROM dual')
@@ -1920,6 +1920,21 @@ class OracleConnect(_ConnectionLogic):
         Cached = self._object_type_cache.get(Key)
         if Cached is not None:
             return Cached
+        # Cycle guard for the nested-type recursion below: a type that references
+        # itself (directly or through a collection) would recurse forever.
+        if Key in self._object_type_describing:
+            return None
+        self._object_type_describing.add(Key)
+        try:
+            return self._describe_object_type_uncached(Owner, name, Key)
+        finally:
+            self._object_type_describing.discard(Key)
+
+    def _describe_object_type_uncached(
+        self, Owner: str, name: str, Key: tuple
+    ) -> 'DbObjectType | None':
+        from seerdb.common.dbobject import DbObjectType, type_name_to_tns
+
         OidSQL = (
             'SELECT type_oid, typecode FROM all_types '
             'WHERE owner = :1 AND type_name = :2'
@@ -1929,8 +1944,8 @@ class OracleConnect(_ConnectionLogic):
         Oid = bytes(OidRows[0][0]) if OidRows and OidRows[0][0] else b''
         TypeCode = OidRows[0][1] if OidRows else None
         SQL = (
-            'SELECT attr_name, attr_type_name, length, precision, scale '
-            'FROM all_type_attrs '
+            'SELECT attr_name, attr_type_name, attr_type_owner, length, '
+            'precision, scale FROM all_type_attrs '
             'WHERE owner = :1 AND type_name = :2 '
             'ORDER BY attr_no'
         )
@@ -1938,15 +1953,19 @@ class OracleConnect(_ConnectionLogic):
         Rows = self._rows(Result)
         Attrs = []
         for Row in Rows:
-            TypeName = Row[1]
-            Attrs.append(
-                {
-                    'name': Row[0],
-                    'type_name': TypeName,
-                    'data_type': type_name_to_tns(TypeName),
-                    'charset': None,
-                }
-            )
+            TypeName, TypeOwner = Row[1], Row[2]
+            Attr = {
+                'name': Row[0],
+                'type_name': TypeName,
+                'data_type': type_name_to_tns(TypeName),
+                'charset': None,
+            }
+            if TypeOwner:
+                # A nested object / collection attribute (#117/#118): embed its
+                # own layout so the pure image decoder can recurse into it
+                # without a connection. Cached + cycle-guarded above.
+                Attr['object_type'] = self._describe_object_type(TypeOwner, TypeName)
+            Attrs.append(Attr)
         CollKW = self._collection_describe(Owner, name, TypeCode)
         # The OAC type version: the freshly-created/common case is 1; the server
         # validated this across 10g..23ai in the round-trip tests.
@@ -1967,14 +1986,25 @@ class OracleConnect(_ConnectionLogic):
         )
 
         Res = self.execute(
-            'SELECT coll_type, elem_type_name, length, precision, scale, '
-            'upper_bound FROM all_coll_types WHERE owner = :1 AND type_name = :2',
+            'SELECT coll_type, elem_type_name, elem_type_owner, length, '
+            'precision, scale, upper_bound '
+            'FROM all_coll_types WHERE owner = :1 AND type_name = :2',
             Bind=[owner, name],
         )
         Rows = self._rows(Res)
         if not Rows:
             return {'is_collection': True}
-        (CollType, ElemType, _Len, _Prec, _Scale, Upper) = Rows[0][:6]
+        (CollType, ElemType, ElemOwner, _Len, _Prec, _Scale, Upper) = Rows[0][:7]
+        Element = {
+            'name': 'element',
+            'type_name': ElemType,
+            'data_type': type_name_to_tns(ElemType),
+            'charset': None,
+        }
+        if ElemOwner:
+            # A collection of a UDT (#118): embed the element type's layout so the
+            # decoder can recurse per element without a connection.
+            Element['object_type'] = self._describe_object_type(ElemOwner, ElemType)
         return {
             'is_collection': True,
             'collection_type': (
@@ -1982,12 +2012,7 @@ class OracleConnect(_ConnectionLogic):
                 if CollType == 'VARYING ARRAY'
                 else COLLECTION_NESTED_TABLE
             ),
-            'element': {
-                'name': 'element',
-                'type_name': ElemType,
-                'data_type': type_name_to_tns(ElemType),
-                'charset': None,
-            },
+            'element': Element,
             'max_elements': int(Upper) if Upper else 0,
         }
 

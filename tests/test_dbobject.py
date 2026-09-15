@@ -412,3 +412,93 @@ class TestTypeNameMap(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestNestedObjectDecode(unittest.TestCase):
+    """Recursive object-image decode (#117/#118): nested object and collection
+    attributes, and the atomic-null (0xFD) marker that precedes a NULL nested
+    object -- which the flat decoder mistook for a length of 253 and desynced."""
+
+    @staticmethod
+    def _dalc(raw: bytes) -> bytes:
+        return bytes([len(raw)]) + raw
+
+    def _num(self, n: int) -> bytes:
+        from seerdb.common.tns import encode_token_num
+
+        return self._dalc(encode_token_num(n))
+
+    def _sub_type(self) -> DbObjectType:
+        return DbObjectType(
+            'T',
+            'SUB',
+            b'',
+            1,
+            [
+                {'name': 'X', 'data_type': TNS_TYPE_NUMBER, 'charset': None},
+                {'name': 'Y', 'data_type': TNS_TYPE_VARCHAR, 'charset': None},
+            ],
+        )
+
+    def _parent_layout(self, sub: DbObjectType) -> list:
+        return [
+            {'name': 'A', 'data_type': TNS_TYPE_NUMBER, 'charset': None},
+            {'name': 'SUB', 'data_type': None, 'charset': None, 'object_type': sub},
+        ]
+
+    def _image(self, body: bytes) -> bytes:
+        # 0x84 = IS_VERSION_81 | NO_PREFIX_SEG; short length = whole image.
+        return bytes([0x84, 0x01, 3 + len(body)]) + body
+
+    def test_nested_object_populated_inline(self):
+        sub = self._sub_type()
+        # SUB rides inline (no header): X=5, Y='hi'.
+        sub_inline = self._num(5) + self._dalc(b'hi')
+        image = self._image(self._num(1) + sub_inline)
+        attrs = decode_object_image(image, self._parent_layout(sub))
+        self.assertEqual(attrs[0], ('A', 1))
+        obj = attrs[1][1]
+        self.assertEqual((obj.X, obj.Y), (5, 'hi'))
+
+    def test_nested_object_atomic_null(self):
+        sub = self._sub_type()
+        image = self._image(self._num(1) + bytes([0xFD]))
+        attrs = decode_object_image(image, self._parent_layout(sub))
+        self.assertEqual(attrs, [('A', 1), ('SUB', None)])
+
+    def test_collection_of_objects(self):
+        sub = self._sub_type()
+        coll = DbObjectType(
+            'T',
+            'ARR',
+            b'',
+            1,
+            [],
+            is_collection=True,
+            element={
+                'name': 'element',
+                'data_type': None,
+                'charset': None,
+                'object_type': sub,
+            },
+        )
+        # Each element is a length-prefixed full object image (own header).
+        elem1 = self._image(self._num(1) + self._dalc(b'a'))
+        elem2 = self._image(self._num(2) + self._dalc(b'b'))
+        body = bytes([0x00]) + bytes([2]) + self._dalc(elem1) + self._dalc(elem2)
+        # collection header 0x88 with a prefix segment (01 01).
+        image = bytes([0x88, 0x01, 4 + len(body), 0x01, 0x01]) + body
+        elements = decode_collection_image(image, coll.element)
+        self.assertEqual([(e.X, e.Y) for e in elements], [(1, 'a'), (2, 'b')])
+
+
+class TestTypeNameMapAdditions(unittest.TestCase):
+    def test_number_subtypes_and_tz_names(self):
+        for name in ('INTEGER', 'SMALLINT', 'REAL', 'DOUBLE PRECISION'):
+            self.assertEqual(type_name_to_tns(name), TNS_TYPE_NUMBER, name)
+        from seerdb.common.tns_consts import TNS_TYPE_TIMESTAMPLTZ, TNS_TYPE_TIMESTAMPTZ
+
+        self.assertEqual(type_name_to_tns('TIMESTAMP WITH TZ'), TNS_TYPE_TIMESTAMPTZ)
+        self.assertEqual(
+            type_name_to_tns('TIMESTAMP WITH LOCAL TZ'), TNS_TYPE_TIMESTAMPLTZ
+        )
