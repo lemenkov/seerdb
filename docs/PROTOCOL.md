@@ -4670,6 +4670,24 @@ clear `NotSupportedError` for it rather than returning corrupt data; cast such a
 column in SQL (`XMLTYPE.getclobval(col)` / `XMLSERIALIZE`) to read it. Inline XML
 (`XMLELEMENT`, etc.) on 11g uses the STRING flag and works. Sync + async.
 
+### 24.1 XMLType as an object attribute
+
+An XMLType **attribute** of an object rides *inside the packed image* (§21.3),
+not as a nested object's inline attributes. It is a **length-prefixed XMLType
+image** — the `_read_length` prefix (§21.3), then the §24 image above — and a
+NULL attribute is the single `0xFF` length-null marker (not the `0xFD`
+atomic-null a normal nested object uses). Treating it as a normal nested object
+(recursing into `SYS.XMLTYPE`'s empty attribute list) consumes no bytes and
+bleeds the XMLType image into the next attribute; seerdb tells the two apart by
+the attribute's type identity (`SYS.XMLTYPE`) and routes to the XMLType walk.
+
+The image encoder emits the inline STRING form (`xml_flag & 0x0004`); a live
+server also sets a `0x10` bit there, which python-oracledb ignores (it checks
+only STRING / LOB / SKIP_NEXT_4), so the STRING flag alone round-trips. Through
+the Mirror this closes python-oracledb's `test_1900_dbobject` XMLType-in-object
+cases (a populated and a NULL XMLType attribute); the object suite is then 47/50,
+the remaining three being thick-mode-only skips and an environmental credential.
+
 ## 25. Query cancellation / call_timeout (#123, #144)
 
 `connection.cancel()` interrupts the call currently executing on the connection,
