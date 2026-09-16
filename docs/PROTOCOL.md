@@ -2326,6 +2326,30 @@ with no body:
 length | flags | typ| f | data_flags = EOF
 ```
 
+### 10.1 The server's logoff reply (thin)
+
+Step 3 above — "reads its response" — is load-bearing from python-oracledb
+26.0.0 on. Its `LogoffMessage` sends `TTI_LOGOFF` and then **reads a reply**
+before closing; earlier thin clients sent `TTI_LOGOFF` and closed the socket
+without reading, so a server (or the Mirror) could end the session silently.
+Against 26.0.0 a silent close is an unexpected EOF — `DPY-4011: the database or
+network closed the connection` — raised even on a clean `connection.close()`.
+
+The reply is a `TTI_STA` status token, then the per-response `END_OF_RESPONSE`
+marker (`0x1d`, 29):
+
+```
+09 | 01 01 | 00 | 1d
+STA| call status (ub4 = 1) | end-to-end seq (ub2 = 0) | END_OF_RESPONSE
+```
+
+The integers are the thin protocol's variable-length form, **not** the
+fixed-width little-endian the OCI/sqlplus logoff ack (§36.2) uses. A bare
+`STATUS` token does not by itself end a response for a client that negotiated
+end-of-response, so the `0x1d` marker is required. Byte-identical to a live 23ai
+reply. (The Mirror sends this from its thin loop; the OCI loop keeps its own
+`_OCI_LOGOFF_STATUS`.)
+
 ## 11. Data Type Encoding
 
 ### 11.1 Oracle NUMBER

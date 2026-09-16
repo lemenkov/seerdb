@@ -7407,6 +7407,27 @@ def encode_logoff_status_oci() -> bytes:
     return _OCI_LOGOFF_STATUS
 
 
+def encode_logoff_status_thin() -> bytes:
+    """The thin reply to ``TTI_LOGOFF``: a ``TTI_STA`` status token (OER call
+    status 1, end-to-end sequence 0) followed by the per-response
+    ``END_OF_RESPONSE`` marker. The integers are the thin protocol's
+    variable-length form (``encode_sb4``), not the OCI fixed-width LE the sqlplus
+    ack uses.
+
+    python-oracledb 26.0.0's ``LogoffMessage`` sends ``LOGOFF`` and then **reads
+    a reply** before closing; earlier clients closed the socket without reading,
+    so the Mirror could return silently. Against 26.0.0 the silent close is an
+    unexpected EOF -- ``DPY-4011``. A ``STATUS`` token does not by itself end a
+    response for a client that negotiated end-of-response, so the marker is
+    required; byte-identical to a live 23ai's logoff reply (``09 01 01 00 1d``)."""
+    return (
+        bytes([TTI_STA])
+        + encode_sb4(1)  # OER call status (1 = logoff, per the OER flag word)
+        + encode_sb4(0)  # end-to-end sequence
+        + bytes([TTI_END_OF_RESPONSE])
+    )
+
+
 def _decode_describe_oci(payload: bytes) -> list[dict]:
     # A minimal reader for encode_describe_oci's own output — the thin client
     # can't parse the OCI describe, so this round-trips the meaningful fields to
