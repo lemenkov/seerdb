@@ -868,3 +868,48 @@ class TestPlsqlIndexTableImage(unittest.TestCase):
         image = encode_object_image(varray.newobject([10, 20, 30]))
         self.assertEqual(image[9], 0x00)  # no HAS_INDEXES flag
         self.assertEqual(decode_collection_image(image, varray.element), [10, 20, 30])
+
+
+# SYS.XMLTYPE stands in as an object attribute type; it is framed as an XMLType
+# image, not a normal nested object (#124).
+_XML_TYPE = DbObjectType('SYS', 'XMLTYPE', bytes.fromhex('11' * 16), 1, [])
+_XML_OBJ_LAYOUT = [
+    {'name': 'NUMBERVALUE', 'data_type': TNS_TYPE_NUMBER, 'charset': None},
+    {'name': 'XMLVALUE', 'type_name': 'XMLTYPE', 'object_type': _XML_TYPE},
+    {'name': 'STRINGVALUE', 'data_type': TNS_TYPE_VARCHAR, 'charset': None},
+]
+_XML_OBJ_TYPE = DbObjectType(
+    'PYO', 'OBJ_WITH_XML', bytes.fromhex('22' * 16), 1, _XML_OBJ_LAYOUT
+)
+
+
+class TestXmlTypeInObject(unittest.TestCase):
+    def test_encode_xmltype_roundtrips(self):
+        from seerdb.common.dbobject import decode_xmltype, encode_xmltype
+
+        blob = encode_xmltype('<item>ab</item>')
+        self.assertEqual(decode_xmltype(blob), (False, '<item>ab</item>'))
+
+    def test_object_with_xmltype_attribute_roundtrips(self):
+        obj = _XML_OBJ_TYPE.newobject(
+            {
+                'NUMBERVALUE': 2339,
+                'XMLVALUE': '<item>test</item>',
+                'STRINGVALUE': 'a string',
+            }
+        )
+        attrs = dict(decode_object_image(encode_object_image(obj), _XML_OBJ_LAYOUT))
+        # The XMLType attribute decodes back to the string, and the trailing
+        # scalar is not corrupted (the old bug bled XML bytes into it).
+        self.assertEqual(attrs['NUMBERVALUE'], 2339)
+        self.assertEqual(attrs['XMLVALUE'], '<item>test</item>')
+        self.assertEqual(attrs['STRINGVALUE'], 'a string')
+
+    def test_null_xmltype_attribute_is_ff_marker(self):
+        obj = _XML_OBJ_TYPE.newobject(
+            {'NUMBERVALUE': 1, 'XMLVALUE': None, 'STRINGVALUE': 'x'}
+        )
+        image = encode_object_image(obj)
+        attrs = dict(decode_object_image(image, _XML_OBJ_LAYOUT))
+        self.assertIsNone(attrs['XMLVALUE'])
+        self.assertEqual(attrs['STRINGVALUE'], 'x')  # not corrupted by the NULL

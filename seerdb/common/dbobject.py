@@ -30,6 +30,7 @@ from seerdb.common.exceptions import NotSupportedError
 from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
     TNS_LONG_LENGTH_INDICATOR,
+    TNS_MAX_SHORT_LENGTH,
     TNS_NULL_LENGTH_INDICATOR,
     TNS_TYPE_ADT,
     TNS_TYPE_BDOUBLE,
@@ -501,6 +502,15 @@ def _decode_member(
     #   * a scalar -> a length-prefixed value.
     # A NULL nested object is the atomic-null 0xFD; a NULL collection is 0xFF.
     Nested = Attr.get('object_type')
+    if Nested is not None and is_xml_type(Nested):
+        # An XMLType attribute rides as a length-prefixed XMLType image, not the
+        # inline attributes a normal nested object uses; a NULL is the 0xFF marker
+        # (#124). A large (CLOB-backed) document is left to decode_xmltype.
+        (Length, Pos) = _read_length(Image, Pos)
+        if Length is None:
+            return (None, Pos)
+        (_is_lob, Value) = decode_xmltype(bytes(Image[Pos : Pos + Length]), Charset)
+        return (Value, Pos + Length)
     if Nested is not None and Nested.is_collection:
         if Image[Pos] in (TNS_NULL_LENGTH_INDICATOR, _OBJ_ATOMIC_NULL):
             return (None, Pos + 1)
@@ -571,6 +581,43 @@ def decode_xmltype(Image: bytes, Charset: int = AL32UTF8_CHARSET) -> tuple:
             )
         return (True, Content)  # CLOB locator
     raise NotSupportedError(f'unexpected XMLType flag 0x{Flag:x}')
+
+
+# The image flags an inline XMLType carries: IS_VERSION_81 | NO_PREFIX_SEG plus
+# the XMLType marker bit, exactly as a live 23ai emits (#124).
+_XML_IMAGE_FLAGS = 0x85
+
+
+def encode_xmltype(Value: object, Charset: int = AL32UTF8_CHARSET) -> bytes:
+    """Encode an inline XMLType document into its image — the inverse of
+    :func:`decode_xmltype` for the ``STRING`` form.
+
+    The image is the shared header (flags + version + length), a 1-byte XML
+    version, a ub4 flag word (``STRING``), then the UTF-8 content. Only the
+    inline form is produced; a large (CLOB-backed) document is not, matching the
+    decoder's reach. A live 23ai additionally sets a ``0x10`` bit in the flag
+    word, which python-oracledb ignores (it checks only STRING / LOB /
+    SKIP_NEXT_4), so the bare STRING flag round-trips through either reader (#124).
+    """
+    content = str(Value).encode('utf-8')
+    tail = bytes([1]) + _XML_TYPE_STRING.to_bytes(4, 'big') + content
+    if len(tail) + 3 > TNS_MAX_SHORT_LENGTH:
+        raise NotSupportedError(
+            'encoding a large (CLOB-backed) XMLType is not supported'
+        )
+    # flags + version + 1-byte image length + tail; the length spans the whole
+    # image, as the server writes it (the reader skips it, so it need only be
+    # well-formed).
+    return bytes([_XML_IMAGE_FLAGS, 1, len(tail) + 3]) + tail
+
+
+def is_xml_type(typ: object) -> bool:
+    """Whether ``typ`` (a DbObjectType) is SYS.XMLTYPE, which rides as a
+    specially-framed XMLType image rather than a normal object (#124)."""
+    return (
+        getattr(typ, 'schema', None) == 'SYS'
+        and getattr(typ, 'name', None) == 'XMLTYPE'
+    )
 
 
 def decode_collection_image(

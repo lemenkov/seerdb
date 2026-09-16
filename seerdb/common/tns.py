@@ -11373,9 +11373,21 @@ def _encode_object_image(Obj: 'DbObject', *, header: bool) -> bytes:
 
 
 def _encode_object_member(Value: object, Attr: dict, *, in_collection: bool) -> bytes:
-    from seerdb.common.dbobject import _OBJ_ATOMIC_NULL, DbObject
+    from seerdb.common.dbobject import (
+        _OBJ_ATOMIC_NULL,
+        DbObject,
+        encode_xmltype,
+        is_xml_type,
+    )
 
     Nested = Attr.get('object_type')
+    if Nested is not None and is_xml_type(Nested):
+        # An XMLType attribute rides as a length-prefixed XMLType image; a NULL is
+        # the 0xFF marker, not the atomic-null a normal nested object uses (#124).
+        if Value is None:
+            return bytes([TNS_NULL_LENGTH_INDICATOR])
+        Image = encode_xmltype(Value)
+        return _obj_write_length(len(Image)) + Image
     if Nested is not None and getattr(Nested, 'is_collection', False):
         if Value is None:
             return bytes([TNS_NULL_LENGTH_INDICATOR])
