@@ -27,6 +27,8 @@ from seerdb.common.dbobject import (
 from seerdb.common.exceptions import NotSupportedError
 from seerdb.common.tns import (
     _ENCODE_FIELD_VERSION,
+    _THIN_OBJ_LOB_LOCATOR,
+    ColumnMeta,
     _encode_object_bind_value,
     _encode_ref_bind_value,
     _encode_ref_oac,
@@ -34,11 +36,14 @@ from seerdb.common.tns import (
     _read_object_column,
     encode_object_column_value,
     encode_object_image,
+    object_lob_contents,
 )
 from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
     TNS_TYPE_ADT,
+    TNS_TYPE_BLOB,
     TNS_TYPE_CHAR,
+    TNS_TYPE_CLOB,
     TNS_TYPE_NUMBER,
     TNS_TYPE_REF,
     TNS_TYPE_TIMESTAMP,
@@ -696,3 +701,69 @@ class TestTypeNameMapAdditions(unittest.TestCase):
         self.assertEqual(
             type_name_to_tns('TIMESTAMP WITH LOCAL TZ'), TNS_TYPE_TIMESTAMPLTZ
         )
+
+    def test_lob_attribute_type_names(self):
+        # A LOB attribute is typed so the object walkers tell it from an inline
+        # scalar; NCLOB shares CLOB's wire type (#888).
+        self.assertEqual(type_name_to_tns('CLOB'), TNS_TYPE_CLOB)
+        self.assertEqual(type_name_to_tns('NCLOB'), TNS_TYPE_CLOB)
+        self.assertEqual(type_name_to_tns('BLOB'), TNS_TYPE_BLOB)
+
+
+# An object type with LOB attributes: NAME (VARCHAR2), DOC (CLOB), PIC (BLOB).
+_DOC_LAYOUT = [
+    {'name': 'NAME', 'data_type': TNS_TYPE_VARCHAR, 'charset': None},
+    {'name': 'DOC', 'data_type': TNS_TYPE_CLOB, 'charset': None},
+    {'name': 'PIC', 'data_type': TNS_TYPE_BLOB, 'charset': None},
+]
+_DOC_TYPE = DbObjectType(
+    'PYO', 'DOC_T', bytes.fromhex('00112233445566778899aabbccddeeff'), 1, _DOC_LAYOUT
+)
+_ADT_COLUMN = ColumnMeta(
+    name=b'DOCCOL', data_type=TNS_TYPE_ADT, data_length=0, max_size=0
+)
+
+
+class TestObjectLobAttributes(unittest.TestCase):
+    # A fetched object's LOB attributes ride as locators inside the image; their
+    # content is read back over TTI_LOBOPS from a separate queue (#888).
+
+    def _doc(self, name, doc, pic):
+        return DbObject(
+            'PYO.DOC_T', [('NAME', name), ('DOC', doc), ('PIC', pic)], dbtype=_DOC_TYPE
+        )
+
+    def test_image_carries_locator_not_content(self):
+        # The CLOB / BLOB attributes are the distinct object-LOB locator, and the
+        # content ("hello" / b"\\x01\\x02") is not written inline.
+        image = encode_object_image(self._doc('file', 'hello', b'\x01\x02'))
+        self.assertEqual(image.count(_THIN_OBJ_LOB_LOCATOR), 2)
+        self.assertNotIn(b'hello', image)
+        self.assertNotIn('hello'.encode('utf-16-be'), image)
+        self.assertIn(b'file', image)  # a plain scalar attribute stays inline
+
+    def test_object_lob_contents_order_and_encoding(self):
+        # Row-major, attribute order: CLOB content is UTF-16BE (is_clob True),
+        # BLOB content raw bytes (is_clob False).
+        rows = [(self._doc('a', 'hello', b'\x01\x02'),)]
+        self.assertEqual(
+            object_lob_contents([_ADT_COLUMN], rows),
+            [('hello'.encode('utf-16-be'), True), (b'\x01\x02', False)],
+        )
+
+    def test_null_lob_attribute_contributes_nothing(self):
+        # A NULL LOB attribute is the 0xFF null in the image and queues no content.
+        obj = self._doc('a', None, b'\x02')
+        image = encode_object_image(obj)
+        self.assertEqual(image.count(_THIN_OBJ_LOB_LOCATOR), 1)  # only PIC
+        self.assertEqual(
+            object_lob_contents([_ADT_COLUMN], [(obj,)]), [(b'\x02', False)]
+        )
+
+    def test_null_object_and_non_object_columns_ignored(self):
+        # A NULL object cell and a non-ADT column carry no object LOBs.
+        self.assertEqual(object_lob_contents([_ADT_COLUMN], [(None,)]), [])
+        scalar_col = ColumnMeta(
+            name=b'N', data_type=TNS_TYPE_NUMBER, data_length=0, max_size=0
+        )
+        self.assertEqual(object_lob_contents([scalar_col], [(5,)]), [])

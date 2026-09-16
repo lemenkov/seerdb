@@ -2156,10 +2156,14 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
             _dest_offset, tail = decode_ub4(tail)
             tail = tail[1:]  # amount pointer flag
             tail = tail[6:]  # three reserved ub2 array-LOB slots
-            tail = tail[source_loc_len:]  # the locator, raw or ub2-prefixed
+            locator = tail[:source_loc_len]  # the locator, raw or ub2-prefixed
+            tail = tail[source_loc_len:]
             amount, _ = decode_ub4(tail)
             return LobOpsRequest(
-                kind='read', offset=max(source_offset, 1), amount=amount
+                kind='read',
+                offset=max(source_offset, 1),
+                amount=amount,
+                locator=locator,
             )
         except (IndexError, struct.error, Truncated):
             # A shape this walk does not fit reads the LOB whole, as before.
@@ -10252,6 +10256,19 @@ def _thin_lob_locator() -> bytes:
 
 
 _THIN_LOB_LOCATOR = _thin_lob_locator()
+
+
+def _thin_obj_lob_locator() -> bytes:
+    # A LOB attribute inside an object image rides a locator distinct from a
+    # top-level LOB column's, so the session can route its TTI_LOBOPS reads to the
+    # persistent object-LOB queue rather than the transient column queue (which an
+    # object type's post-describe get_type_shape queries would reset) (#888).
+    raw = bytearray(b'\x00seerdb-mirror-obj-lob-locator-000000\x00')
+    raw[_THIN_LOB_LOC_OFFSET_FLAG_3] |= _THIN_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET
+    return bytes(raw)
+
+
+_THIN_OBJ_LOB_LOCATOR = _thin_obj_lob_locator()
 # The chunk size a live 23ai reports alongside a LOB column locator. The client
 # keeps it for its own chunking (`lob.getchunksize()`); any sane value works.
 _THIN_LOB_CHUNK_SIZE = 8060
@@ -11181,6 +11198,15 @@ def _encode_object_attr_field(DataType: int, Charset: int, Value: Any) -> bytes:
     # raw scalar bytes.
     if Value is None:
         return bytes([TNS_NULL_LENGTH_INDICATOR])
+    if DataType in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
+        # A LOB attribute rides in the image as a minted locator the client reads
+        # back over TTI_LOBOPS; the content is queued separately, in the same
+        # attribute order, by object_lob_contents. The value here is the content
+        # (the Mirror resolves each LOB attribute upstream before re-encoding), so
+        # it is not written inline -- only the locator is. The object-LOB locator
+        # is distinct from a column LOB's so the session routes its reads to the
+        # persistent object-LOB queue (#888).
+        return _obj_write_length(len(_THIN_OBJ_LOB_LOCATOR)) + _THIN_OBJ_LOB_LOCATOR
     Raw = _encode_object_attr(DataType, Charset or AL32UTF8_CHARSET, Value)
     return _obj_write_length(len(Raw)) + Raw
 
@@ -11257,6 +11283,70 @@ def _encode_object_member(Value: object, Attr: dict, *, in_collection: bool) -> 
         Attr.get('charset') or AL32UTF8_CHARSET,
         Value,
     )
+
+
+def object_lob_contents(
+    columns: list[ColumnMeta], rows: list[tuple]
+) -> list[tuple[bytes, bool]]:
+    """The (wire-content, is_clob) of every LOB attribute embedded in an object
+    (ADT) column of ``rows``, row-major then attribute-order — the order the
+    external client reads them back over TTI_LOBOPS after decoding the images.
+
+    These ride a **distinct** locator (:data:`_THIN_OBJ_LOB_LOCATOR`) and a
+    session-persistent queue, kept apart from the top-level LOB queue: an object
+    column's type has to be populated after the describe, and that runs several
+    ``get_type_shape`` metadata queries which would otherwise reset a single
+    shared queue before the client ever issued its LOB reads (#888)."""
+    out: list[tuple[bytes, bool]] = []
+    for row in rows:
+        for value, col in zip(row, columns):
+            if col.data_type == TNS_TYPE_ADT and value is not None:
+                out.extend(_object_lob_contents(value))
+    return out
+
+
+def _object_lob_contents(Obj: object) -> list[tuple[bytes, bool]]:
+    """The (wire-content, is_clob) of every non-NULL LOB attribute in an object
+    (or collection) value, in the exact order :func:`_encode_object_image` emits
+    their locators — so the session drains this queue as the client issues its
+    TTI_LOBOPS reads for the LOBs it decoded out of the image (#888).
+
+    CLOB / NCLOB content rides as UTF-16BE (``is_clob`` True, char-counted);
+    BLOB content is raw bytes. A NULL attribute contributes nothing (its image
+    field is the 0xFF null, which the client never reads as a LOB). Nested
+    objects and collections are walked recursively, matching the encoder."""
+    from seerdb.common.dbobject import DbObject
+
+    if not isinstance(Obj, DbObject):
+        return []
+    Typ = Obj._dbtype
+    out: list[tuple[bytes, bool]] = []
+    if Typ is not None and Typ.is_collection:
+        Element = Typ.element or {}
+        for Value in Obj._elements:
+            out += _member_lob_contents(Value, Element)
+        return out
+    if Typ is None:
+        return out
+    for Attr in Typ.attrs:
+        out += _member_lob_contents(Obj._attrs.get(Attr['name']), Attr)
+    return out
+
+
+def _member_lob_contents(Value: object, Attr: dict) -> list[tuple[bytes, bool]]:
+    # One attribute / element's LOB content, mirroring _encode_object_member: a
+    # nested object / collection recurses; a scalar contributes only when it is a
+    # non-NULL CLOB / BLOB.
+    if Attr.get('object_type') is not None:
+        return _object_lob_contents(Value) if Value is not None else []
+    if Value is None:
+        return []
+    DataType = Attr.get('data_type')
+    if DataType == TNS_TYPE_CLOB:
+        return [(str(Value).encode('utf-16-be'), True)]
+    if DataType == TNS_TYPE_BLOB:
+        return [(bytes(cast('bytes', Value)), False)]
+    return []
 
 
 def _encode_object_bind_value(Obj: 'DbObject') -> bytes:

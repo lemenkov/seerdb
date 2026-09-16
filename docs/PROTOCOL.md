@@ -4419,6 +4419,48 @@ This closes object binding in both directions — python-oracledb's
 typed-NULL object and collection binds); the rest are attribute-fidelity for
 specific attribute types, XMLType (§21 / #124), and a large-collection case.
 
+### 21.12 LOB attributes of an object — the Mirror fetch path (#888)
+
+A `CLOB` / `NCLOB` / `BLOB` **attribute** of an object rides **inside the packed
+image** (§21.3) as a plain LOB **locator** — the same length-prefixed `read_bytes`
+field a scalar attribute uses, carrying no `size`/`chunk` metadata (unlike a
+top-level LOB *column*, §6.x). The external client reads that locator out of the
+image, builds a LOB from it, and then reads the content over `TTI_LOBOPS` exactly
+as for a column LOB. `ALL_TYPE_ATTRS` reports these attribute types by name
+(`CLOB` / `NCLOB` / `BLOB`), which the attribute layout (§21.4) maps to the wire
+type so the image walkers can tell a LOB attribute from an inline scalar; `NCLOB`
+shares `CLOB`'s wire type with a national character-set form, as `NVARCHAR2`
+shares `VARCHAR2`'s.
+
+**The Mirror serves the content it has already read, not an upstream locator.**
+Two pieces make this work:
+
+1. **Resolve upstream, re-emit a minted locator.** A locator decoded from the
+   upstream image points at the *upstream* database — useless to the external
+   client, which would read it against the Mirror. So the backend reads each LOB
+   attribute's content over its own connection while it has one, and the image the
+   Mirror re-encodes carries a **minted** locator in each LOB attribute field. The
+   content is queued for the read path; only the locator is written inline.
+
+2. **A distinct locator + a persistent queue.** Object-attribute LOBs use a
+   locator **distinct** from a column LOB's, and their content rides a
+   **session-persistent** queue rather than the transient row-major column queue.
+   This is required, not cosmetic: resolving an object column's *type* happens
+   **after** its describe (the `get_type_shape` metadata cursor, §21.9), and those
+   metadata queries would reset a single shared LOB queue before the client ever
+   issued its `TTI_LOBOPS` reads. Routing a read to the right queue by its locator
+   keeps the object LOBs intact across that interleaving. Within the queue the
+   order is row-major then attribute-order — the exact order the image emits the
+   locators, and the order the client reads them.
+
+Verified through the Mirror against a live 23ai: python-oracledb's
+`test_1900_dbobject` test 1904 (fetch an object holding `CLOB` / `NCLOB` / `BLOB`
+attributes, plus a nested object and a collection) reads every attribute back.
+Binding an object that *carries* LOB attributes (test 1907) is the inbound
+direction and is not yet covered — the client sends its own LOB locators inside
+the image, which the Mirror would have to resolve to content and re-materialise
+as upstream LOBs before binding.
+
 ## 22. DML RETURNING ... INTO (#120)
 
 `INSERT/UPDATE/DELETE ... RETURNING col[, ...] INTO :b[, ...]` returns the
