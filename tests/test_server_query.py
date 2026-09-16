@@ -1564,6 +1564,17 @@ def test_encode_logoff_status_oci_stays_a_zero_sequence() -> None:
     assert encode_logoff_status_oci() == bytes.fromhex('09010000000000')
 
 
+def test_encode_logoff_status_thin_matches_the_captured_wire() -> None:
+    # python-oracledb 26.0.0 reads a reply to its TTI_LOGOFF before closing; the
+    # thin reply is a TTI_STA status token (call status 1, sequence 0) in the
+    # protocol's variable-length integer form, followed by the END_OF_RESPONSE
+    # marker -- byte-identical to a live 23ai's logoff reply (#888). Distinct
+    # from the OCI fixed-width form above.
+    from seerdb.common.tns import encode_logoff_status_thin
+
+    assert encode_logoff_status_thin() == bytes.fromhex('090101001d')
+
+
 def test_encode_long_value_oci_matches_the_captured_wire() -> None:
     # A LONG value streams inline as 0xFE-chunked bytes + a zero trailing ub4,
     # reproduced byte-for-byte from a live 11g LONG SELECT (#407).

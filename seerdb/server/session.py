@@ -74,6 +74,7 @@ from seerdb.common.tns import (
     encode_lob_read_response_thin,
     encode_lobops_ack,
     encode_logoff_status_oci,
+    encode_logoff_status_thin,
     encode_long_fetch_row_oci,
     encode_out_bind_response_oci,
     encode_out_bind_response_thin,
@@ -888,6 +889,11 @@ def serve_session(
             # and drive the backend's password change.
             _answer_changepassword(stream, backend, body, conn_key, user, field_version)
         elif body[1] == TTI_LOGOFF:
+            # Acknowledge the logoff before ending the session. python-oracledb
+            # 26.0.0 reads this reply and hits DPY-4011 on a silent close; older
+            # clients closed without reading, so returning silently used to do
+            # (#888).
+            stream.write_packet(TNS_DATA, encode_logoff_status_thin())
             return user
         else:
             # A TTC function the Mirror does not implement (#832).
