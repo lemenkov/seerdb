@@ -34,7 +34,9 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_ADT,
     TNS_TYPE_BDOUBLE,
     TNS_TYPE_BFLOAT,
+    TNS_TYPE_BLOB,
     TNS_TYPE_CHAR,
+    TNS_TYPE_CLOB,
     TNS_TYPE_DATE,
     TNS_TYPE_INTERVALDS,
     TNS_TYPE_INTERVALYM,
@@ -93,6 +95,13 @@ _TYPE_NAME_TO_TNS = {
     'REAL': TNS_TYPE_NUMBER,
     'DOUBLE PRECISION': TNS_TYPE_NUMBER,
     'RAW': TNS_TYPE_RAW,
+    # A LOB attribute of an object: the image carries a locator (its content is
+    # read separately over TTI_LOBOPS), so typing it lets the object walkers tell
+    # a LOB attribute from an inline scalar. NCLOB shares CLOB's wire type + a
+    # national charset form, exactly as NVARCHAR2 shares VARCHAR2's (#888).
+    'CLOB': TNS_TYPE_CLOB,
+    'NCLOB': TNS_TYPE_CLOB,
+    'BLOB': TNS_TYPE_BLOB,
     'DATE': TNS_TYPE_DATE,
     'TIMESTAMP': TNS_TYPE_TIMESTAMP,
     # ALL_TYPE_ATTRS abbreviates the zone as "TZ", not "TIME ZONE" (as a column

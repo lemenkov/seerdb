@@ -23,6 +23,7 @@ from dataclasses import replace
 import seerdb
 from seerdb.common.datatypes import TempLob, dbtype_for_oracle_type
 from seerdb.common.dbobject import (
+    DbObject,
     DbObjectType,
     ObjectImage,
     decode_collection_image,
@@ -173,6 +174,66 @@ class OraclePassthroughBackend:
         attrs = decode_object_image(image.image, typ.attrs)
         return typ.newobject(dict(attrs))
 
+    def _resolve_fetched_object_lobs(self, columns: list, rows: list) -> list:
+        # An object (ADT) column's LOB attributes decode upstream to bare locator
+        # bytes (seerdb leaves a LOB attribute's content unread). The external
+        # client, though, reads each such attribute back over TTI_LOBOPS against
+        # the Mirror -- which serves LOB content it has already read, not upstream
+        # locators -- so resolve every object LOB attribute to its content now,
+        # while the upstream connection is in hand (#888). Non-object columns and
+        # objects without LOB attributes are untouched.
+        adt_positions = [
+            i for i, col in enumerate(columns) if int(col.data_type) == TNS_TYPE_ADT
+        ]
+        if not adt_positions:
+            return rows
+        resolved: list = []
+        for row in rows:
+            cells = list(row)
+            for i in adt_positions:
+                if cells[i] is not None:
+                    self._resolve_object_lobs(cells[i])
+            resolved.append(tuple(cells))
+        return resolved
+
+    def _resolve_object_lobs(self, value: object) -> None:
+        # Walk an object (or collection) value in place, replacing each LOB
+        # attribute's locator bytes with the content read from upstream. Nested
+        # objects and collections recurse. Mirrors _object_lob_contents' walk.
+        if not isinstance(value, DbObject):
+            return
+        typ = value._dbtype
+        if typ is not None and typ.is_collection:
+            element = typ.element or {}
+            for idx, elem in enumerate(value._elements):
+                value._elements[idx] = self._resolve_member_lob(elem, element)
+            return
+        if typ is None:
+            return
+        for attr in typ.attrs:
+            name = attr['name']
+            value._attrs[name] = self._resolve_member_lob(value._attrs.get(name), attr)
+
+    def _resolve_member_lob(self, value: object, attr: dict) -> object:
+        # One attribute / element: recurse into a nested object / collection, read
+        # a LOB attribute's content, or leave a plain scalar as-is.
+        from seerdb.common.lob import LOB
+
+        if attr.get('object_type') is not None:
+            if value is not None:
+                self._resolve_object_lobs(value)
+            return value
+        if value is None:
+            return value
+        data_type = attr.get('data_type')
+        if data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB) and isinstance(
+            value, (bytes, bytearray)
+        ):
+            # The decoded attribute is the raw LOB locator; read its content over
+            # the upstream connection so the Mirror can serve it back.
+            return LOB(data_type, bytes(value), self._conn).read()
+        return value
+
     def _resolve_object_binds(self, binds: Sequence) -> list:
         # Replace any object (ADT) bind -- a bare ObjectImage, or one wrapped in a
         # BindVar -- with the DbObject the upstream binds. A NULL object arrives
@@ -233,6 +294,7 @@ class OraclePassthroughBackend:
             columns = [_to_column_meta(desc) for desc in cursor.description]
             rows = cursor.fetchall()
             columns = _enrich_ref_columns(columns, rows)
+            rows = self._resolve_fetched_object_lobs(columns, rows)
             return Result(columns=columns, rows=rows)
         return Result(rowcount=cursor.rowcount or 0)
 
@@ -520,12 +582,23 @@ def _to_column_meta(desc: tuple) -> ColumnMeta:
         type_oid = getattr(desc, 'type_oid', None) or b''
         type_schema = (getattr(desc, 'type_schema', None) or '').encode('ascii')
         type_name = (getattr(desc, 'type_name', None) or '').encode('ascii')
+        # DB_TYPE_OBJECT and DB_TYPE_XMLTYPE share one wire type number (ADT);
+        # the external client tells them apart by the character-set form, mapping
+        # csfrm 0 to a generic object and csfrm 1 (implicit) to XMLType (its later
+        # SYS.XMLTYPE name check only tags the type, it never undoes that dbtype).
+        # A real server describes an object column with csfrm 0 and charset 0, so
+        # emit those here -- the FetchInfo's bare wire type carries no csfrm, and
+        # the default (1) would surface every object as XMLType (#888).
+        csfrm = 0
     byte_size = internal_size or display_size or 0
     if csfrm == 2:
         # National char (NCHAR / NVARCHAR2): UTF-16BE in AL16UTF16. data_length is
         # the byte buffer (internal_size), max_size the declared character length.
         data_length, max_size = byte_size, (display_size or byte_size)
         charset = AL16UTF16_CHARSET
+    elif int(tns_type) == TNS_TYPE_ADT:
+        data_length = max_size = byte_size
+        charset = 0
     else:
         data_length = max_size = byte_size
         charset = ColumnMeta.charset

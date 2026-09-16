@@ -40,6 +40,7 @@ from seerdb.common.tns import (
     _ENCODE_OER_SEQ,
     _ENCODE_TXN_IN_PROGRESS,
     _SERVER_RUNTIME_CAPS,
+    _THIN_OBJ_LOB_LOCATOR,
     ArrayOutBind,
     ColumnMeta,
     ExecRequest,
@@ -89,6 +90,7 @@ from seerdb.common.tns import (
     is_version_call_oci,
     max_string_size,
     mint_temp_lob_locator,
+    object_lob_contents,
     oci_lob_contents,
     parse_describe_oci,
     parse_exec,
@@ -718,6 +720,12 @@ def serve_session(
     # The LOB a client is part-way through reading, kept across its several
     # TTI_LOBOPS passes (#903); None until the first read.
     current_lob: tuple[bytes, bool] | None = None
+    # The LOB attributes embedded in the last object result's rows, on their own
+    # persistent queue: an object type is populated after the describe, and that
+    # runs get_type_shape queries that would reset the transient LOB queue before
+    # the client ever reads them (#888). Reads route here by a distinct locator.
+    object_lobs: list[tuple[bytes, bool]] = []
+    current_object_lob: tuple[bytes, bool] | None = None
     temp_lobs = _TempLobs()
     # The thin reply path's OER sequence, advanced per message below (#842).
     oer_seq = 0
@@ -784,14 +792,20 @@ def serve_session(
             if request.scrollable:
                 lobs = _answer_scroll(stream, backend, request, cursors)
             else:
-                lobs = _answer_query(stream, backend, request, cursors)
+                lobs = _answer_query(stream, backend, request, cursors, object_lobs)
         elif body[1] == TTI_LOBOPS:
             completed = _complete_message(stream, body, parse_lobops_request)
             if completed is None:
                 continue
             body = completed
-            lobs, current_lob = _answer_lobops(
-                stream, body, lobs, temp_lobs, current_lob
+            lobs, current_lob, current_object_lob = _answer_lobops(
+                stream,
+                body,
+                lobs,
+                temp_lobs,
+                current_lob,
+                object_lobs,
+                current_object_lob,
             )
         elif body[1] == TNS_FUNC_REEXECUTE_AND_FETCH:
             # The rows carry no OACs -- the cursor's opening execute declared the
@@ -1713,44 +1727,55 @@ def _answer_lobops(
     lobs: list[tuple[bytes, bool]],
     temp_lobs: _TempLobs,
     current_lob: tuple[bytes, bool] | None = None,
-) -> tuple[list[tuple[bytes, bool]], tuple[bytes, bool] | None]:
+    object_lobs: list[tuple[bytes, bool]] | None = None,
+    current_object_lob: tuple[bytes, bool] | None = None,
+) -> tuple[
+    list[tuple[bytes, bool]],
+    tuple[bytes, bool] | None,
+    tuple[bytes, bool] | None,
+]:
     # Dispatch a thin TTI_LOBOPS message. CREATE_TEMP / WRITE drive the temp-LOB
     # write flow (#412); FREE_TEMP / OPEN / CLOSE / TRIM / GET_CHUNK_SIZE are
     # acknowledged so a programmatic client doesn't desync (#417); a plain READ
     # drains the content of a column locator the Mirror emitted (#413). Returns
-    # the (possibly shortened) read queue.
+    # the (possibly shortened) column read queue and the current column / object
+    # read cursors.
     request = parse_lobops_request(body)
     if request.kind == 'create_temp':
         locator = temp_lobs.mint(request.is_blob)
         stream.write_packet(TNS_DATA, encode_create_temp_response(locator))
-        return lobs, current_lob
+        return lobs, current_lob, current_object_lob
     if request.kind == 'write':
         # Append at the write offset the client streamed (it writes from the
         # start and appends, so a plain concat matches every real client).
         temp_lobs.append(request.locator, request.payload)
         stream.write_packet(TNS_DATA, encode_lobops_ack(request.locator))
-        return lobs, current_lob
+        return lobs, current_lob, current_object_lob
     if request.kind == 'free_temp':
         # Release the temp LOB now rather than at session end.
         temp_lobs.free(request.locator)
         stream.write_packet(TNS_DATA, encode_lobops_ack(request.locator))
-        return lobs, current_lob
+        return lobs, current_lob, current_object_lob
     if request.kind == 'ack':
         # OPEN / CLOSE / TRIM / GET_CHUNK_SIZE: acknowledge with the content-free
         # reply the client accepts. The value-returning form (a real chunk size,
         # applying TRIM's length) is deferred (#421) — no test client needs it.
         stream.write_packet(TNS_DATA, encode_lobops_ack(request.locator))
-        return lobs, current_lob
+        return lobs, current_lob, current_object_lob
     # A READ of an emitted column locator. The queue is row-major, matching the
     # order the locators went out (#413), but a client reads a large LOB in
     # several passes, so the entry stays until it is drained and each read is
     # served the slice it asked for (#903). A read at offset 1 starts the next
     # LOB; later offsets continue the current one -- the same rule the OCI loop
-    # follows.
-    if request.offset <= 1 or not current_lob:
-        current = lobs.pop(0) if lobs else (b'', True)
+    # follows. A LOB attribute of an object rides a distinct locator and drains
+    # the persistent object queue instead of the column one (#888).
+    is_object = request.locator == _THIN_OBJ_LOB_LOCATOR
+    queue = (object_lobs if object_lobs is not None else []) if is_object else lobs
+    resume = current_object_lob if is_object else current_lob
+    if request.offset <= 1 or not resume:
+        current = queue.pop(0) if queue else (b'', True)
     else:
-        current = current_lob
+        current = resume
     content, is_clob = current
     unit = 2 if is_clob else 1  # bytes per counted unit (a CLOB rides UTF-16BE)
     total = len(content) // unit
@@ -1761,7 +1786,9 @@ def _answer_lobops(
     stream.write_packet(
         TNS_DATA, encode_lob_read_response_thin(slice_, is_clob=is_clob)
     )
-    return lobs, current
+    if is_object:
+        return lobs, current_lob, current
+    return lobs, current, current_object_lob
 
 
 def _resolve_temp_lob_binds(request: ExecRequest, temp_lobs: _TempLobs) -> ExecRequest:
@@ -1894,7 +1921,11 @@ def _out_bind_entries(
 
 
 def _answer_query(
-    stream: PacketStream, backend: Backend, request: ExecRequest, cursors: _Cursors
+    stream: PacketStream,
+    backend: Backend,
+    request: ExecRequest,
+    cursors: _Cursors,
+    object_lobs: list[tuple[bytes, bool]] | None = None,
 ) -> list[tuple[bytes, bool]]:
     # Run the query and reply. Any failure becomes an ORA error on a healthy
     # connection — the Mirror must never desync, so even a backend that leaks a
@@ -2069,6 +2100,15 @@ def _answer_query(
             # row-major over TTI_LOBOPS, so queue every cell's content in that
             # order for the loop to drain (#413).
             lobs = oci_lob_contents(result.columns, rows)
+            # Object columns queue their embedded LOB attributes separately, on a
+            # persistent queue routed by a distinct locator: populating an object
+            # type after the describe runs get_type_shape queries that reset the
+            # transient LOB queue before the client issues its reads (#888). A
+            # metadata query carries no object LOBs, so it leaves the queue as-is.
+            if object_lobs is not None:
+                these_object_lobs = object_lob_contents(result.columns, rows)
+                if these_object_lobs:
+                    object_lobs[:] = these_object_lobs
             # Send the first `fetch` rows now; park any remainder on a cursor for
             # the client's follow-up TTI_FETCH calls. A result that fits is
             # delivered whole, ending with ORA-01403; a zero prefetch sends none
