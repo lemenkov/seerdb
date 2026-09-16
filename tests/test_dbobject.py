@@ -15,6 +15,7 @@ import unittest
 
 from seerdb.common.dbobject import (
     COLLECTION_NESTED_TABLE,
+    COLLECTION_PLSQL_INDEX_TABLE,
     COLLECTION_VARRAY,
     DbObject,
     DbObjectType,
@@ -814,3 +815,56 @@ class TestObjectLobAttributeBind(unittest.TestCase):
     def test_lob_object_attribute_queues_no_content(self):
         # A bound upstream LOB is not the Mirror's to serve, so it queues nothing.
         self.assertEqual(object_lob_contents([_ADT_COLUMN], [(self._lob_obj(),)]), [])
+
+
+_INDEX_TABLE_TYPE = DbObjectType(
+    'PYO',
+    'NUMLIST_T',
+    bytes.fromhex('dd' * 16),
+    1,
+    [],
+    is_collection=True,
+    collection_type=COLLECTION_PLSQL_INDEX_TABLE,
+    element={'name': 'element', 'data_type': TNS_TYPE_NUMBER, 'charset': None},
+)
+
+
+class TestPlsqlIndexTableImage(unittest.TestCase):
+    # A PL/SQL associative array (index table) sets the HAS_INDEXES flag (0x10)
+    # in the collection body and prefixes each element with its int32 key; a SQL
+    # collection does neither (#888).
+
+    def test_index_table_image_flag_and_keys(self):
+        obj = _INDEX_TABLE_TYPE.newobject([10, 20, 30])
+        image = encode_object_image(obj)
+        # Collection header is flags(0x88) version(01) 0xFE + ub4 length + prefix
+        # (01 01); the body then opens with the HAS_INDEXES flag byte.
+        self.assertEqual(image[7:9], bytes([1, 1]))  # prefix segment
+        self.assertEqual(image[9], 0x10)  # HAS_INDEXES collection flag
+        # Each element carries its 1-based int32 key.
+        self.assertIn(struct.pack('>I', 1), image)
+        self.assertIn(struct.pack('>I', 2), image)
+        self.assertIn(struct.pack('>I', 3), image)
+
+    def test_index_table_roundtrips(self):
+        obj = _INDEX_TABLE_TYPE.newobject([10, 20, 30])
+        image = encode_object_image(obj)
+        self.assertEqual(
+            decode_collection_image(image, _INDEX_TABLE_TYPE.element), [10, 20, 30]
+        )
+
+    def test_varray_has_no_index_flag(self):
+        # The SQL collection path is unchanged: flag byte 0, no per-element keys.
+        varray = DbObjectType(
+            'PYO',
+            'INTS_T',
+            bytes.fromhex('ee' * 16),
+            1,
+            [],
+            is_collection=True,
+            collection_type=COLLECTION_VARRAY,
+            element={'name': 'element', 'data_type': TNS_TYPE_NUMBER, 'charset': None},
+        )
+        image = encode_object_image(varray.newobject([10, 20, 30]))
+        self.assertEqual(image[9], 0x00)  # no HAS_INDEXES flag
+        self.assertEqual(decode_collection_image(image, varray.element), [10, 20, 30])

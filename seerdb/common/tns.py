@@ -11220,7 +11220,6 @@ def encode_token_decimal(Value: Decimal) -> bytes:
 _OBJ_IMAGE_FLAGS = 0x84  # IS_VERSION_81 (0x80) | NO_PREFIX_SEG (0x04)
 _OBJ_IMAGE_FLAGS_COLLECTION = 0x88  # IS_VERSION_81 (0x80) | IS_COLLECTION (0x08)
 _OBJ_IMAGE_VERSION = 1
-_OBJ_ATOMIC_NULL = 0xFD  # marks a NULL nested object attribute (#117)
 _OBJ_TOP_LEVEL = 0x01
 _OBJ_MAX_SHORT_LEN = 245  # TNS_OBJ_MAX_SHORT_LENGTH
 # toid wrapper for a new object: 00 22 (NON_NULL_OID | HAS_EXTENT_OID) + oid +
@@ -11322,10 +11321,24 @@ def encode_object_image(Obj: 'DbObject') -> bytes:
 def _encode_object_image(Obj: 'DbObject', *, header: bool) -> bytes:
     Typ = Obj._dbtype
     if Typ is not None and Typ.is_collection:
+        from seerdb.common.dbobject import (
+            _COLL_HAS_INDEXES,
+            COLLECTION_PLSQL_INDEX_TABLE,
+        )
+
         Element = Typ.element or {}
-        Body = bytes([0])  # collection flags
+        index_table = Typ.collection_type == COLLECTION_PLSQL_INDEX_TABLE
+        # A PL/SQL associative array sets the HAS_INDEXES collection flag (0x10)
+        # and prefixes each element with its int32 key; a SQL VARRAY / nested
+        # table clears the flag and carries bare elements (#888).
+        Body = bytes([_COLL_HAS_INDEXES if index_table else 0])
         Body += _obj_write_length(len(Obj._elements))
-        for Value in Obj._elements:
+        for Position, Value in enumerate(Obj._elements, start=1):
+            if index_table:
+                # python-oracledb packs in sorted-key order, and the arrays that
+                # round-trip through here are dense from 1, so the key is the
+                # 1-based position.
+                Body += struct.pack('>I', Position)
             Body += _encode_object_member(Value, Element, in_collection=True)
         # Collection header = flags, version, long-form length, prefix seg (01 01).
         Total = 9 + len(Body)
@@ -11360,7 +11373,7 @@ def _encode_object_image(Obj: 'DbObject', *, header: bool) -> bytes:
 
 
 def _encode_object_member(Value: object, Attr: dict, *, in_collection: bool) -> bytes:
-    from seerdb.common.dbobject import DbObject
+    from seerdb.common.dbobject import _OBJ_ATOMIC_NULL, DbObject
 
     Nested = Attr.get('object_type')
     if Nested is not None and getattr(Nested, 'is_collection', False):

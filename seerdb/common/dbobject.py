@@ -62,6 +62,10 @@ COLLECTION_PLSQL_INDEX_TABLE = 1
 COLLECTION_NESTED_TABLE = 2
 COLLECTION_VARRAY = 3
 
+# The HAS_INDEXES bit in a collection image's flag byte: set for a PL/SQL
+# associative array, whose elements are each prefixed with an int32 key (#888).
+_COLL_HAS_INDEXES = 0x10
+
 
 # XMLType image flags (#124, python-oracledb constants.pxi).
 _XML_TYPE_LOB = 0x0001  # content is a CLOB locator
@@ -577,14 +581,23 @@ def decode_collection_image(
     The header (incl. the prefix segment a collection carries) is consumed by
     the shared ``_read_image_header``; then a 1-byte collection-flags marker, a
     length-prefixed element count, and that many length-prefixed element values
-    decoded with the single element type. A NULL element is ``None``. (PL/SQL
-    associative arrays prefix each element with an int32 key -- that is #122.)
+    decoded with the single element type. A NULL element is ``None``.
+
+    A PL/SQL associative array sets the HAS_INDEXES flag in that marker byte and
+    prefixes each element with its int32 key (big-endian); the flag makes the
+    image self-describing, so the key is read and dropped here. Elements ride in
+    sorted-key order, so the returned list keeps that order; the keys are not
+    retained (the arrays that round-trip through the Mirror are dense from 1, and
+    the re-encode regenerates 1-based keys) (#888).
     """
     Pos = _read_image_header(Image, 0)
-    Pos += 1  # collection flags (skip)
+    index_table = bool(Image[Pos] & _COLL_HAS_INDEXES)
+    Pos += 1  # collection flags
     (Count, Pos) = _read_length(Image, Pos)
     Out: list = []
     for _ in range(Count or 0):
+        if index_table:
+            Pos += 4  # the int32 associative-array key (big-endian)
         (Value, Pos) = _decode_member(Image, Pos, Element, Charset, in_collection=True)
         Out.append(Value)
     return Out
