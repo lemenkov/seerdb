@@ -1870,7 +1870,15 @@ def parse_exec(
     # al8i4[1] is the execute iteration count (1 + array-DML batch length); a
     # plain execute is 1. It is the only record of how many iterations an
     # all-clause-filled RETURNING runs, whose rows carry no values (#33).
-    iterations = al8[1] if len(al8) > 1 else 1
+    #
+    # For a QUERY that slot means something else entirely: the number of rows to
+    # prefetch. al8i4[7] is the is-query flag, and the reference client writes the
+    # fetch array size there whenever it re-executes a cursor it already has
+    # (`arraysize`, 100 by default). Read as an iteration count that turned a
+    # plain re-executed SELECT into a 100-iteration array DML, which ran no query
+    # at all and answered with a row count (#826).
+    is_query = bool(al8[7]) if len(al8) > 7 else False
+    iterations = 1 if is_query else (al8[1] if len(al8) > 1 else 1)
 
     binds: list = []
     bind_rows: list = []

@@ -1167,6 +1167,19 @@ All8 list):
   `LAST 0x08`, `PRIOR 0x10`, `ABSOLUTE 0x20`, `RELATIVE 0x40`.
 - `al8i4[11]` — 1-based fetch position (for ABSOLUTE / RELATIVE).
 
+Two other `al8i4` slots matter to anything parsing an execute, and they are easy
+to confuse:
+
+- `al8i4[7]` — the **is-query** flag, 1 for a SELECT.
+- `al8i4[1]` — **two different things, told apart by `al8i4[7]`.** For a DML it
+  is the execute iteration count (`1 + array-DML batch length`, and the only
+  record of it when a `RETURNING` clause fills every bind, §22.1). For a **query**
+  it is the number of rows to **prefetch**: 0 on the opening parse+execute, and
+  the client's fetch array size (oracledb's `arraysize`, 100 by default) on any
+  re-execute of a cursor it already holds. Reading the query form as an iteration
+  count turns a plain re-executed SELECT into an N-iteration array DML — the
+  query never runs and the client is answered with a row count (#826).
+
 **Open** — a normal parse+execute (cursor 0, SQL present) with the al8i4 scroll
 fields and orientation `CURRENT`/1. It keeps the fv24 query options `0x8061`
 (`NOT_PLSQL | FETCH | EXECUTE | PARSE`) and prefetches only a small batch
