@@ -819,4 +819,7 @@ def _to_column_meta(desc: tuple) -> ColumnMeta:
         type_oid=type_oid,
         type_schema=type_schema,
         type_name=type_name,
+        # Re-mark a JSON / OSON column so the external client decodes it (#826).
+        is_json=bool(getattr(desc, 'is_json', False)),
+        is_oson=bool(getattr(desc, 'is_oson', False)),
     )

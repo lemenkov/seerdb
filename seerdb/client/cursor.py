@@ -996,6 +996,8 @@ def _column_description(Col: dict) -> 'FetchInfo':
         type_schema=Col.get('type_schema'),
         type_name=Col.get('type_name'),
         type_oid=Col.get('type_oid') or None,
+        is_json=bool(Col.get('is_json')),
+        is_oson=bool(Col.get('is_oson')),
     )
 
 
@@ -1030,6 +1032,8 @@ class FetchInfo(tuple):
         type_schema=None,
         type_name=None,
         type_oid=None,
+        is_json=False,
+        is_oson=False,
     ):
         self = super().__new__(cls, fields)
         self.vector_dimensions = vector_dimensions
@@ -1037,4 +1041,10 @@ class FetchInfo(tuple):
         self.type_schema = type_schema
         self.type_name = type_name
         self.type_oid = type_oid
+        # is_json: a native JSON column. is_oson: a BLOB / CLOB holding an OSON
+        # image, which a client decodes with decode_oson instead of surfacing as
+        # a LOB (oracledb's FetchInfo.is_oson). Carried so the Mirror can re-mark
+        # the column for an external client (#826).
+        self.is_json = is_json
+        self.is_oson = is_oson
         return self

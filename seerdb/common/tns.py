@@ -331,6 +331,18 @@ class ColumnMeta:
     # report it) — the encoder then falls back to FLOAT32 (#55).
     vector_format: int | None = None
     vector_dimensions: int | None = None
+    # The describe's uds-flags bits a client reads to decide how to decode the
+    # value: is_json marks a native JSON column, is_oson a BLOB / CLOB holding an
+    # OSON image (an `IS JSON FORMAT OSON` column). A client re-types an is_oson
+    # column to LONG RAW and runs decode_oson over the bytes, so it must be
+    # carried through the describe or the value surfaces as a raw LOB (#826).
+    is_json: bool = False
+    is_oson: bool = False
+
+
+# The describe's ub4 uds-flags bits (python-oracledb's TNS_UDS_FLAGS_*).
+_UDS_FLAGS_IS_JSON = 0x00000100
+_UDS_FLAGS_IS_OSON = 0x00000800
 
 
 @dataclass(frozen=True)
@@ -911,13 +923,15 @@ def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
     (TypeSchema, Rest) = _read_str_with_length(Rest)  # owner of the type (ADT)
     (TypeName, Rest) = _read_str_with_length(Rest)  # the type's name (ADT)
     (_, Rest) = decode_ub4(Rest)  # column position
+    UdsFlags = 0
     if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2:
         # `uds flags` is an 11g addition; a 10g (field version 4) describe ends
         # the per-column metadata at column position. Reading a phantom ub4 here
         # eats the next column's first bytes (or the DCB trailer's date length),
         # desyncing the whole row decode (#84). Verified against a live 10.2.0.5
-        # server across 1/2/6-column, mixed-type and 0-row describes.
-        (_, Rest) = decode_ub4(Rest)  # uds flags
+        # server across 1/2/6-column, mixed-type and 0-row describes. Its bits
+        # mark a JSON / OSON column, which the describe has to carry (#826).
+        (UdsFlags, Rest) = decode_ub4(Rest)  # uds flags
     DomainSchema = DomainName = b''
     if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_23_1:
         # 23c (field version 17) appends the column's SQL-domain schema and
@@ -979,6 +993,8 @@ def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
         'domain_schema': DomainSchema or None,
         'domain_name': DomainName or None,
         'annotations': Annotations or None,
+        'is_json': bool(UdsFlags & _UDS_FLAGS_IS_JSON),
+        'is_oson': bool(UdsFlags & _UDS_FLAGS_IS_OSON),
     }
     if DataType in (TNS_TYPE_ADT, TNS_TYPE_REF):
         # Object (ADT, #115) and REF (#119) columns carry the (referenced) type
@@ -1127,7 +1143,10 @@ def _encode_dcb_column(col: ColumnMeta, position: int) -> bytes:
         + _str_with_length(col.type_schema)  # type schema (ADT owner)
         + _str_with_length(col.type_name)  # type name
         + encode_sb4(position)  # column position
-        + encode_sb4(0)  # uds flags (11g addition)
+        + encode_sb4(  # uds flags (11g addition): mark a JSON / OSON column (#826)
+            (_UDS_FLAGS_IS_JSON if col.is_json else 0)
+            | (_UDS_FLAGS_IS_OSON if col.is_oson else 0)
+        )
         + (
             _str_with_length(b'') + _str_with_length(b'')  # domain schema + name
             if field_version >= FIELD_VERSION_23_1
@@ -1344,6 +1363,12 @@ def _thin_column_value(value: object, col: 'ColumnMeta') -> bytes:
         # A SQL object (ADT) column carries its own image framing, NULL included
         # (#116) — the bare-0x00 NULL path below would desync the row stream.
         return encode_object_column_value(value, col.type_oid)
+    if col.is_oson and value is not None:
+        # A BLOB / CLOB holding an OSON image. The client re-types such a column
+        # to LONG RAW and runs decode_oson over the bytes, so the value rides
+        # inline in the row rather than as a LOB locator -- a locator here is
+        # read as LONG RAW and desyncs the row (#826).
+        return encode_long_value_thin(value)
     if col.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB) and value is not None:
         # Mint a unique locator and remember the content, so an object bind that
         # later carries this locator can recover it (#888). The read path is
@@ -7570,6 +7595,12 @@ def oci_lob_contents(
     for row in rows:
         for value, col in zip(row, columns):
             if col.data_type not in _LOB_CONTENT_TYPES or value is None:
+                continue
+            if col.is_oson:
+                # An OSON-in-BLOB column carries its bytes in the row itself
+                # (LONG RAW), so the client issues no TTI_LOBOPS read for it and
+                # an entry here would shift every later LOB's position (#826) --
+                # the same reason the inline VECTOR case below skips.
                 continue
             if inline_vectors and col.data_type == TNS_TYPE_VECTOR:
                 # The thin path carries a VECTOR's image in the row itself, so it

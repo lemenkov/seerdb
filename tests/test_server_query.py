@@ -546,6 +546,60 @@ def test_describe_roundtrips_to_the_dual_column() -> None:
     assert col['null_ok'] == 1
 
 
+def test_describe_roundtrips_the_json_and_oson_flags() -> None:
+    # The uds-flags bits that tell a client a column is native JSON, or a BLOB /
+    # CLOB holding an OSON image it should decode rather than surface as a raw
+    # LOB (#826). A plain column carries neither; the Mirror used to emit a zero
+    # flags word for every column, so an OSON column read back as a LOB.
+    from seerdb.common.tns_consts import TNS_TYPE_JSON
+
+    payload = encode_describe(
+        [
+            ColumnMeta(
+                name=b'PLAIN', data_type=TNS_TYPE_VARCHAR, data_length=1, max_size=1
+            ),
+            ColumnMeta(
+                name=b'OSONCOL',
+                data_type=TNS_TYPE_BLOB,
+                data_length=4000,
+                max_size=4000,
+                is_oson=True,
+            ),
+            ColumnMeta(
+                name=b'JSONCOL',
+                data_type=TNS_TYPE_JSON,
+                data_length=4000,
+                max_size=4000,
+                is_json=True,
+            ),
+        ]
+    )
+    plain, oson, native = _decode_describe(payload)
+    assert (plain['is_json'], plain['is_oson']) == (False, False)
+    assert (oson['is_json'], oson['is_oson']) == (False, True)
+    assert (native['is_json'], native['is_oson']) == (True, False)
+
+
+def test_oson_column_value_rides_inline_and_queues_no_lob() -> None:
+    # A client re-types an is_oson column to LONG RAW and runs decode_oson over
+    # the bytes, so the value belongs in the row itself: a LOB locator there is
+    # read as LONG RAW and desyncs the row, and a LOB-queue entry would shift
+    # every later LOB's position (#826).
+    from seerdb.common.oson import encode_oson
+    from seerdb.common.tns import encode_long_value_thin, oci_lob_contents
+
+    image = encode_oson({'id': 6901, 'value': 'string 6901'})
+    col = ColumnMeta(
+        name=b'OSONCOL',
+        data_type=TNS_TYPE_BLOB,
+        data_length=4000,
+        max_size=4000,
+        is_oson=True,
+    )
+    assert oci_lob_contents([col], [(image,)]) == []
+    assert encode_long_value_thin(image) in encode_rows([(image,)], [col])
+
+
 def test_multiple_columns_and_not_null_roundtrip() -> None:
     payload = encode_describe(
         [
