@@ -141,9 +141,17 @@ def _oson_str_node(b: bytes) -> bytes:
 
 
 def _oson_scalar_node(value, allow_wide: bool = False) -> bytes:
+    import datetime
     from decimal import Decimal
 
-    from seerdb.common.tns import encode_token_decimal, encode_token_num
+    from seerdb.common.datatypes import IntervalYM
+    from seerdb.common.tns import (
+        encode_token_datetime,
+        encode_token_decimal,
+        encode_token_interval_ds,
+        encode_token_interval_ym,
+        encode_token_num,
+    )
 
     if value is None:
         return b'\x30'
@@ -156,9 +164,33 @@ def _oson_scalar_node(value, allow_wide: bool = False) -> bytes:
         if len(b) > 0xFF and not allow_wide:
             raise OsonError('string too long for the native OSON encoder')
         return _oson_str_node(b)
+    if isinstance(value, (bytes, bytearray)):
+        # RAW: a ub2 (0x3a) or, past 64 KiB, a ub4 (0x3b) length then the bytes.
+        raw = bytes(value)
+        if len(raw) <= 0xFFFF:
+            return b'\x3a' + len(raw).to_bytes(2, 'big') + raw
+        return b'\x3b' + len(raw).to_bytes(4, 'big') + raw
     if isinstance(value, Decimal):
         nb = encode_token_decimal(value)
         return b'\x34' + bytes([len(nb)]) + nb
+    if isinstance(value, datetime.datetime):
+        # encode_token_datetime picks the width from the value; pair it with the
+        # tag the decoder reads at that width: 13 B -> TIMESTAMP_TZ (0x7c),
+        # 11 B -> TIMESTAMP (0x39), 7 B -> the 7-byte timestamp form (0x7d).
+        if value.tzinfo is not None:
+            tag = 0x7C
+        elif value.microsecond:
+            tag = 0x39
+        else:
+            tag = 0x7D
+        return bytes([tag]) + encode_token_datetime(value)
+    if isinstance(value, datetime.date):  # a bare date -> DATE (0x3c, 7 B)
+        midnight = datetime.datetime(value.year, value.month, value.day)
+        return b'\x3c' + encode_token_datetime(midnight)
+    if isinstance(value, datetime.timedelta):  # INTERVAL DAY TO SECOND (0x3e)
+        return b'\x3e' + encode_token_interval_ds(value)
+    if isinstance(value, IntervalYM):  # INTERVAL YEAR TO MONTH (0x3d)
+        return b'\x3d' + encode_token_interval_ym(value)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         nb = encode_token_num(value)
         return b'\x34' + bytes([len(nb)]) + nb
@@ -231,6 +263,12 @@ def encode_oson(value, *, allow_wide: bool = False) -> bytes:
     asked to parse a wide image the compact path can't already carry."""
     if not isinstance(value, (dict, list)):
         node = _oson_scalar_node(value, allow_wide)
+        # The bare-scalar image carries the node length in a single value_size
+        # byte (decode_oson reads reserved(ub1) + value_size(ub1)), so a scalar
+        # over 255 bytes -- a long RAW / string -- cannot ride at top level; it
+        # has to sit inside a container, whose value-offsets are ub2 / ub4.
+        if len(node) > 0xFF:
+            raise OsonError('scalar too large for the bare-scalar OSON image')
         return OSON_MAGIC + b'\x01' + b'\x00\x16\x00' + bytes([len(node)]) + node
     fnames: list[str] = []
     ids = {}
