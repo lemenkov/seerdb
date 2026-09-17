@@ -506,3 +506,104 @@ class TestDecodeOsonLarge(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestOsonVersionThree(unittest.TestCase):
+    """Field names longer than 255 bytes ride a second segment (#826).
+
+    Both images are captured from a live 23ai, from a document inserted as JSON
+    *text* so the server encoded it. That is the only way version 3 turns up: an
+    image the client encoded stays version 1, and a server image whose field
+    names are all short does too.
+    """
+
+    # {"A" * 256: 6700}
+    ONE_LONG = bytes.fromhex(
+        'ff4a5a0320060000000100000000010000010200080000c56200000100414141'
+        '4141414141414141414141414141414141414141414141414141414141414141'
+        '4141414141414141414141414141414141414141414141414141414141414141'
+        '4141414141414141414141414141414141414141414141414141414141414141'
+        '4141414141414141414141414141414141414141414141414141414141414141'
+        '4141414141414141414141414141414141414141414141414141414141414141'
+        '4141414141414141414141414141414141414141414141414141414141414141'
+        '4141414141414141414141414141414141414141414141414141414141414141'
+        '4141414141414141414141414141414141414141414141414141414141840101'
+        '000521c244'
+    )
+
+    # {"short_name": "Short name", "A" * 256: 6701}
+    SHORT_AND_LONG = bytes.fromhex(
+        'ff4a5a03210601000b01000000000100000102001700009d00000a73686f7274'
+        '5f6e616d65c56200000100414141414141414141414141414141414141414141'
+        '4141414141414141414141414141414141414141414141414141414141414141'
+        '4141414141414141414141414141414141414141414141414141414141414141'
+        '4141414141414141414141414141414141414141414141414141414141414141'
+        '4141414141414141414141414141414141414141414141414141414141414141'
+        '4141414141414141414141414141414141414141414141414141414141414141'
+        '4141414141414141414141414141414141414141414141414141414141414141'
+        '4141414141414141414141414141414141414141414141414141414141414141'
+        '414141414141414141414184020102000800130a53686f7274206e616d6522c2'
+        '4402'
+    )
+
+    def test_a_single_long_field_name(self):
+        self.assertEqual(self.ONE_LONG[3], 3)  # the version byte, not flags
+        self.assertEqual(decode_oson(self.ONE_LONG), {'A' * 256: 6700})
+
+    def test_short_and_long_names_share_one_field_id_space(self):
+        # ids 1..num_short index the short segment, the rest the long one. Read
+        # as one segment the long name came back as garbage or an IndexError.
+        self.assertEqual(
+            decode_oson(self.SHORT_AND_LONG),
+            {'short_name': 'Short name', 'A' * 256: 6701},
+        )
+
+    def test_an_unknown_version_is_refused_not_misread(self):
+        # Version 2 is not a format we have seen; decoding it as version 1 walks
+        # off into the tree segment and reports a nonsense node tag, which is how
+        # version 3 first surfaced (`unsupported OSON node tag 0x73 at offset 0`).
+        image = bytearray(self.ONE_LONG)
+        image[3] = 2
+        with self.assertRaises(OsonError) as caught:
+            decode_oson(bytes(image))
+        self.assertIn('version 2', str(caught.exception))
+
+    def test_the_encoder_emits_version_3_for_a_long_name(self):
+        # Round-trip through our own decoder: the image has to say version 3 and
+        # come back equal. The encoder used to raise a bare ValueError from
+        # bytes([len(b)]) here, which reached the Mirror as a non-ORA fault and
+        # dropped the connection.
+        doc = {'A' * 256: 6700}
+        image = encode_oson(doc, allow_wide=True)
+        self.assertEqual(image[3], 3)
+        self.assertEqual(decode_oson(image), doc)
+
+    def test_the_encoder_keeps_version_1_when_every_name_is_short(self):
+        # Version 3 costs bytes, so it is used only when a long name is present;
+        # a live server makes the same choice.
+        image = encode_oson({'a': 1, 'b': 'x'}, allow_wide=True)
+        self.assertEqual(image[3], 1)
+
+    def test_short_names_keep_the_low_field_ids(self):
+        # The two segments share one id space with every short name first, so the
+        # ids assigned while walking the document have to be renumbered. Getting
+        # this wrong swaps values between keys rather than failing outright.
+        doc = {'z_short': 1, 'A' * 300: 2, 'a_short': 3, 'B' * 300: 4}
+        self.assertEqual(decode_oson(encode_oson(doc, allow_wide=True)), doc)
+
+    def test_the_field_id_width_follows_the_total_name_count(self):
+        # 676 long names and no short ones: the header's count is the SHORT
+        # names' (zero), but the flag sizing it also sizes every field id in the
+        # tree, so it has to follow the total or the ids are read one byte wide.
+        doc = {
+            chr(i + 65) + chr(j + 65) + 'X' * 254: 12.25
+            for i in range(26)
+            for j in range(26)
+        }
+        image = encode_oson(doc, allow_wide=True)
+        self.assertEqual(image[3], 3)
+        self.assertEqual(decode_oson(image), doc)
+
+    def test_a_long_name_nested_inside_the_document(self):
+        doc = {'A' * 300: {'B' * 280: [1, 2, {'c': 3}]}}
+        self.assertEqual(decode_oson(encode_oson(doc, allow_wide=True)), doc)

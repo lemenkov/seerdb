@@ -8,16 +8,33 @@ The format was reverse-engineered from images captured off a live 21c server
 (see docs/PROTOCOL.md §17); every encoding below is backed by a captured sample
 with known content. An OSON image is:
 
-    magic "FF 4A 5A" | version(1) | flags(ub2) | body
+    magic "FF 4A 5A" | version(ub1) | flags(ub2) | body
 
 ``flags & 0x2000`` marks a *tree* (container) image; otherwise the body is a
 single bare scalar. A tree body is::
 
-    num_fnames(ub1) | fnames_seg_size(ub2) | tree_seg_size(ub2) | reserved(ub2)
+    num_fnames(ub1) | fnames_seg_size(ub2) | tree_seg_size(ub2) | num_tiny(ub2)
     hash_array(num_fnames * 1)        # one hash byte per field name (unused here)
     offset_array(num_fnames * ub2)    # field-id -> offset into fnames_seg
-    fnames_seg                        # the field names, each <len><utf8>
+    fnames_seg                        # the field names, each <ub1 len><utf8>
     tree_seg                          # the node tree, root at offset 0
+
+**Version 3** (#826) adds a *second* field-name segment, for names too long for
+the ub1 length prefix above. Its three sizing fields sit between
+``fnames_seg_size`` and ``tree_seg_size``::
+
+    secondary_flags(ub2) | num_long_fnames(ub4) | long_fnames_seg_size(ub4)
+
+and the segment itself follows the short one::
+
+    long_hash_array(num_long * 2)     # TWO bytes per name here, not one
+    long_offset_array(num_long * ub2 or ub4)   # ub2 when secondary flag 0x0100
+    long_fnames_seg                   # the names, each <ub2 len><utf8>
+
+The two segments share one field-id space: ids ``1..num_fnames`` index the short
+segment, the rest index the long one. A live 23ai emits version 3 only when a
+long name is actually present, and only for documents the **server** encoded --
+from a JSON-text insert, say. An image the client encoded stays version 1.
 
 Nodes (within tree_seg, or the lone scalar of a non-tree image):
 
@@ -77,7 +94,17 @@ _FLAG_UB2_FNAMES = 0x0400  # num_fnames is ub2 (object with > 255 field names);
 # else ub1 (#69). A container node tag with the
 # 0x08 bit then also has a ub2 count + ub2 field-ids.
 _FLAG_UB4_TREE_SIZE = 0x1000  # tree-segment size is ub4, not ub2 (tree > 64 KiB);
-# set on large documents (#88). fnames_size stays ub2.
+# set on large documents (#88).
+_FLAG_UB4_FNAMES_SIZE = 0x0800  # field-name segment size (and its offset array)
+# are ub4, not ub2.
+# Image versions. Version 3 adds a second field-name segment for names longer
+# than 255 bytes, whose length prefix is ub2 rather than ub1 (#826). A live 23ai
+# emits it only when such a name is present -- a document the SERVER encoded from
+# JSON text keeps version 1 while every field name is short.
+_VERSION_FNAME_255 = 1
+_VERSION_FNAME_65535 = 3
+# Version 3's own flags word, read straight after the field-name segment size.
+_SEC_FLAG_UB2_FNAME_OFFSETS = 0x0100  # long-name offset array is ub2, else ub4
 _TAG_WIDE_COUNT = 0x08  # container count + field-ids are ub2, not ub1
 _TAG_UB4_COUNT = 0x10  # container count + field-ids are ub4 (> 65535
 # entries/keys, #88); takes precedence over 0x08.
@@ -303,10 +330,35 @@ def encode_oson(value, *, allow_wide: bool = False) -> bytes:
     walk(value)
     nfw = _width(len(fnames))
 
-    fnames_b = [n.encode('utf-8') for n in fnames]
+    # A field name over 255 bytes does not fit the ub1 length prefix of the
+    # ordinary names segment, and goes in version 3's second segment instead.
+    # The two share one field-id space with every short name first, so the ids
+    # walk() handed out have to be renumbered into that order (#826).
+    encoded = [n.encode('utf-8') for n in fnames]
+    short_at = [i for i, b in enumerate(encoded) if len(b) <= 0xFF]
+    long_at = [i for i, b in enumerate(encoded) if len(b) > 0xFF]
+    if long_at:
+        renumber = {old + 1: new + 1 for new, old in enumerate(short_at + long_at)}
+        remapped = {name: renumber[old] for name, old in ids.items()}
+        ids.clear()
+        ids.update(remapped)
+    fnames_b = [encoded[i] for i in short_at]
     fnames_seg = b''.join(bytes([len(b)]) + b for b in fnames_b)
     off_arr = b''.join(off.to_bytes(2, 'big') for off in _fname_offsets(fnames_b))
-    hash_arr = b'\x00' * len(fnames)
+    hash_arr = b'\x00' * len(fnames_b)
+    long_b = [encoded[i] for i in long_at]
+    long_seg = b''.join(len(b).to_bytes(2, 'big') + b for b in long_b)
+    if len(long_seg) > 0xFFFF:
+        long_off_size, secondary = 4, 0
+    else:
+        long_off_size, secondary = 2, _SEC_FLAG_UB2_FNAME_OFFSETS
+    long_offsets = []
+    _pos = 0
+    for b in long_b:
+        long_offsets.append(_pos)
+        _pos += 2 + len(b)
+    long_off_arr = b''.join(o.to_bytes(long_off_size, 'big') for o in long_offsets)
+    long_hash_arr = b'\x00\x00' * len(long_b)
     # Build the tree with ub2 value-offsets; if the tree exceeds what a ub2
     # offset can address (either it grows past 0xFFFF or an individual offset
     # would overflow), rebuild with ub4 offsets (#88). Two passes at most.
@@ -329,23 +381,46 @@ def encode_oson(value, *, allow_wide: bool = False) -> bytes:
     flags = 0x2106
     if off_size == 4:
         flags &= ~_FLAG_UB2_OFFSETS
+    # The header's field-name count is the SHORT names', but the flag that sizes
+    # it also sizes every field id in the tree, so it follows the TOTAL -- a
+    # document of 676 long names and no short ones still needs ub2 ids (#826).
     if len(fnames) > 0xFF:
         flags |= _FLAG_UB2_FNAMES
     tree_ub4 = len(tree) > 0xFFFF
     if tree_ub4:
         flags |= _FLAG_UB4_TREE_SIZE
-    num_fnames = len(fnames).to_bytes(2 if len(fnames) > 0xFF else 1, 'big')
+    num_fnames = len(fnames_b).to_bytes(2 if len(fnames) > 0xFF else 1, 'big')
     tree_size = len(tree).to_bytes(4 if tree_ub4 else 2, 'big')
+    # Version 3 only when a long name is actually present: a live server emits the
+    # compact version 1 whenever it can, and so do we.
+    version = _VERSION_FNAME_65535 if long_b else _VERSION_FNAME_255
+    long_header = (
+        secondary.to_bytes(2, 'big')
+        + len(long_b).to_bytes(4, 'big')
+        + len(long_seg).to_bytes(4, 'big')
+        if long_b
+        else b''
+    )
     header = (
         OSON_MAGIC
-        + b'\x01'
+        + bytes([version])
         + flags.to_bytes(2, 'big')
         + num_fnames
         + len(fnames_seg).to_bytes(2, 'big')
+        + long_header
         + tree_size
         + b'\x00\x00'
     )
-    return header + hash_arr + off_arr + fnames_seg + bytes(tree)
+    return (
+        header
+        + hash_arr
+        + off_arr
+        + fnames_seg
+        + long_hash_arr
+        + long_off_arr
+        + long_seg
+        + bytes(tree)
+    )
 
 
 def _fname_offsets(fnames_b: list[bytes]) -> list[int]:
@@ -383,6 +458,9 @@ def decode_oson(data: bytes) -> object:
 
 
 def _decode_image(data: bytes) -> object:
+    version = data[3]
+    if version not in (_VERSION_FNAME_255, _VERSION_FNAME_65535):
+        raise OsonError(f'unsupported OSON image version {version}')
     flags = _u16(data, 4)
     pos = 6
     # Container value-offsets are ub2 when the compact flag is set, else ub4.
@@ -399,24 +477,62 @@ def _decode_image(data: bytes) -> object:
     else:
         num_fnames = data[pos]
         pos += 1
-    fnames_size = _u16(data, pos)
+    # The short-name segment's size, and the width of its offset array, move
+    # together.
+    name_off_size = 4 if (flags & _FLAG_UB4_FNAMES_SIZE) else 2
+    fnames_size = _uint(data, pos, name_off_size)
+    pos += name_off_size
+    # Version 3 describes a second segment here, for the field names too long for
+    # the ub1 length prefix the first one uses (#826).
+    num_long = 0
+    long_size = 0
+    long_off_size = 4
+    if version == _VERSION_FNAME_65535:
+        secondary = _u16(data, pos)
+        pos += 2
+        if secondary & _SEC_FLAG_UB2_FNAME_OFFSETS:
+            long_off_size = 2
+        num_long = _uint(data, pos, 4)
+        long_size = _uint(data, pos + 4, 4)
+        pos += 8
     if flags & _FLAG_UB4_TREE_SIZE:  # tree > 64 KiB (#88)
-        tree_size = _uint(data, pos + 2, 4)
-        pos += 8  # fnames_size(2) + tree_size(4) + reserved(2)
+        tree_size = _uint(data, pos, 4)
+        pos += 4
     else:
-        tree_size = _u16(data, pos + 2)
-        pos += 6  # fnames_size + tree_size + reserved
+        tree_size = _u16(data, pos)
+        pos += 2
+    pos += 2  # number of "tiny" nodes (unused here)
     pos += num_fnames  # hash array (1 byte / field)
-    offsets = [_u16(data, pos + 2 * i) for i in range(num_fnames)]
-    pos += 2 * num_fnames
+    offsets = [
+        _uint(data, pos + name_off_size * i, name_off_size) for i in range(num_fnames)
+    ]
+    pos += name_off_size * num_fnames
     fnames_seg = data[pos : pos + fnames_size]
     pos += fnames_size
+    # The long names follow the short ones and continue the same field-id space:
+    # ids 1..num_fnames index the short segment, the rest index this one. Their
+    # hash array is TWO bytes per name, not one.
+    long_names: list[str] = []
+    if num_long:
+        pos += num_long * 2
+        long_offsets = [
+            _uint(data, pos + long_off_size * i, long_off_size) for i in range(num_long)
+        ]
+        pos += long_off_size * num_long
+        long_seg = data[pos : pos + long_size]
+        pos += long_size
+        for off in long_offsets:
+            length = _u16(long_seg, off)
+            long_names.append(long_seg[off + 2 : off + 2 + length].decode('utf-8'))
     tree_seg = data[pos : pos + tree_size]
 
     def field_name(field_id: int) -> str:
-        off = offsets[field_id - 1]
-        length = fnames_seg[off]
-        return fnames_seg[off + 1 : off + 1 + length].decode('utf-8')
+        index = field_id - 1
+        if index < num_fnames:
+            off = offsets[index]
+            length = fnames_seg[off]
+            return fnames_seg[off + 1 : off + 1 + length].decode('utf-8')
+        return long_names[index - num_fnames]
 
     value, _ = _decode_node(tree_seg, 0, field_name, tree_seg, off_size)
     return value

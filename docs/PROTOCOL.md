@@ -3288,6 +3288,61 @@ i.e. the tree segment exceeds 64 KiB (#88). `fnames_seg_size` stays `ub2`.
 A field id is 1-based: `offset_array[id - 1]` locates the field's name in
 `fnames_seg`.
 
+### 17.0b Image version 3 — field names over 255 bytes (#826)
+
+The byte after the magic is a **version**, and it is load-bearing. Two values
+occur: **1**, the layout above, whose field-name length prefix is a `ub1` and so
+caps a name at 255 bytes; and **3**, which adds a *second* field-name segment for
+the names that do not fit.
+
+Version 3's three extra sizing fields sit between `fnames_seg_size` and
+`tree_seg_size`:
+
+```
+secondary_flags (ub2) | num_long_fnames (ub4) | long_fnames_seg_size (ub4)
+```
+
+and its segment follows the short one, before `tree_seg`:
+
+```
+long_hash_array   (num_long × ub2)   TWO bytes per name here, not one
+long_offset_array (num_long × ub2|ub4)   ub2 when secondary_flags & 0x0100
+long_fnames_seg                      the names, each <len(ub2)><utf8 bytes>
+```
+
+The two segments **share one field-id space**: ids `1..num_fnames` index the
+short segment, ids above it index the long one (offset by `num_fnames`).
+
+Captured from a live 23ai for `{"A"×256: 6700}` — `num_fnames` 0, so the whole
+document lives in the long segment:
+
+```
+ff 4a 5a | 03 | 20 06 | 00 | 00 00 | 01 00 | 00 00 00 01 | 00 00 01 02 | 00 08 | 00 00
+           ^ver  ^flags  ^0 short   ^0 size ^sec=0x0100   ^1 long name  ^258    ^tree 8
+c5 62 | 00 00 | 01 00 <256 × 'A'> | <8-byte tree>
+^hash   ^offset ^ub2 len 256
+```
+
+**When it appears:** only for an image the **server** encoded — a JSON-text
+insert, `JSON_OBJECT`, and so on — and only when a long name is actually present.
+A document the client encoded stays version 1, and a server image whose names are
+all short does too. That is why this went unnoticed for so long: every JSON test
+that binds a native value round-trips version 1.
+
+**Reading the version as part of the flags is silent corruption**, not an error:
+a version-3 image parsed as version 1 is 8 bytes out by the time it reaches the
+tree and reports a nonsense node tag (`unsupported OSON node tag 0x73 at offset
+0`), which looks like an unimplemented node type rather than a header fault.
+seerdb therefore refuses an unknown version outright.
+
+**Writing one has a trap of its own.** The header's field-name count is the
+**short** names' count, but the flag that sizes it (`0x0400`) also sizes *every
+field id in the tree*. A document of 676 long names and no short ones therefore
+still needs that flag set, even though the count it sizes is zero — drive it off
+the **total**. Reading the ids one byte wide instead produces
+`DPY-5006: unexpected end of data: want 1 bytes but only -16771386 bytes are
+available`, a negative figure that gives the real cause away.
+
 ### 17.1 Node encoding
 
 | Tag byte            | Node                                                        |
