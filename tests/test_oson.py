@@ -375,6 +375,41 @@ class TestEncodeOson(unittest.TestCase):
             with self.subTest(v=v):
                 self._roundtrip(v)
 
+    def test_binary_datetime_interval_scalars(self):
+        # RAW, datetime, and the two interval types (#826): the OSON re-encoder
+        # inverts the decoder so the Mirror round-trips a JSON value from a real
+        # server back to a thin client.
+        for v in (
+            b'\xde\xad\xbe\xef',
+            b'',
+            datetime.datetime(2026, 6, 15, 12, 30, 45),  # 7-byte (no micro)
+            datetime.datetime(2026, 6, 15, 12, 30, 45, 123456),  # 11-byte
+            datetime.datetime(  # 13-byte (with zone)
+                2026, 6, 15, 12, 30, 45, tzinfo=datetime.timezone.utc
+            ),
+            datetime.timedelta(days=2, seconds=3661),
+            IntervalYM(3, 2),
+        ):
+            with self.subTest(v=v):
+                self._roundtrip(v)
+        # A bare date has no JSON type of its own; it decodes back as a datetime.
+        self.assertEqual(
+            decode_oson(encode_oson(datetime.date(2026, 6, 15))),
+            datetime.datetime(2026, 6, 15, 0, 0),
+        )
+        # A RAW past the 255-byte bare-scalar limit still round-trips inside a
+        # container, whose value-offsets are ub2 / ub4.
+        self.assertEqual(
+            decode_oson(encode_oson({'r': b'\x02' * 300}, allow_wide=True)),
+            {'r': b'\x02' * 300},
+        )
+
+    def test_bare_scalar_over_255_raises(self):
+        # A top-level scalar over 255 bytes cannot ride the bare-scalar image
+        # (its value_size is a single byte); the caller falls back to the text cast.
+        with self.assertRaises(OsonError):
+            encode_oson(b'\x00' * 256)
+
     def test_objects(self):
         self._roundtrip({'a': 1, 'b': 'hi'})
         self._roundtrip({'price': Decimal('19.99')})
