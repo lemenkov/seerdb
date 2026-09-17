@@ -1093,6 +1093,11 @@ _DESCRIBE_WIRE_LENGTH = {
     # no bytes, consumes nothing from the row, and takes the following byte for
     # a message type (#887).
     TNS_TYPE_VECTOR: 8200,
+    # A native JSON column measures the same 8200 on a live 23ai (`02 20 08` in
+    # the describe), and costs the same when reported as 0: the reference client
+    # reads no bytes for the column, so the OSON image the row carries is taken
+    # for the next message (#826). The fourth time a zero here has bitten.
+    TNS_TYPE_JSON: 8200,
 }
 
 
@@ -1445,14 +1450,21 @@ def encode_rows(
 
 
 def _thin_column_value(value: object, col: 'ColumnMeta') -> bytes:
-    # One row value for the thin path. A VECTOR carries its image inline (#887);
-    # everything else goes through the type-only encoder. The column is needed
-    # for the element format, so an INT8 or FLOAT64 vector keeps the width it was
-    # declared with rather than being re-encoded as float32.
+    # One row value for the thin path. A VECTOR (#887) or a native JSON column
+    # (#826) carries its image inline; everything else goes through the type-only
+    # encoder. The column is needed for the element format, so an INT8 or FLOAT64
+    # vector keeps the width it was declared with rather than being re-encoded as
+    # float32.
     if col.data_type == TNS_TYPE_VECTOR and value is not None:
-        return encode_vector_value_thin(
+        return encode_prefetched_lob_value_thin(
             encode_vector(_vector_as(value, col.vector_format))
         )
+    if col.data_type == TNS_TYPE_JSON and value is not None:
+        # allow_wide so a > 255-key or > 64 KiB document still re-encodes for the
+        # client's decoder -- the framing carries any size.
+        from seerdb.common.oson import encode_oson
+
+        return encode_prefetched_lob_value_thin(encode_oson(value, allow_wide=True))
     if col.data_type == TNS_TYPE_ADT:
         # A SQL object (ADT) column carries its own image framing, NULL included
         # (#116) — the bare-0x00 NULL path below would desync the row stream.
@@ -7713,7 +7725,7 @@ def encode_lob_read_response_oci(
 
 
 def oci_lob_contents(
-    columns: list[ColumnMeta], rows: list[tuple], *, inline_vectors: bool = False
+    columns: list[ColumnMeta], rows: list[tuple], *, for_oci: bool = False
 ) -> list[tuple[bytes, bool]]:
     """The (wire-content, is_clob) of each non-NULL LOB cell, row-major (#405).
 
@@ -7721,7 +7733,13 @@ def oci_lob_contents(
     reads this queue in sequence as sqlplus issues TTI_LOBOPS calls. CLOB content
     is UTF-16BE (``is_clob`` True — offsets/amounts count characters, 2 bytes
     each); BLOB content is raw bytes (counts bytes). The session slices this per
-    the offset/amount each read requests."""
+    the offset/amount each read requests.
+
+    ``for_oci`` picks the caller's path. The OCI (sqlplus) path reads every
+    LOB-class column over TTI_LOBOPS and passes True. The thin path does not: it
+    carries a JSON or VECTOR image in the row itself (see
+    :func:`encode_prefetched_lob_value_thin`), so those columns draw no read, and
+    queueing them would shift every later LOB's position (#826/#887)."""
     from seerdb.common.oson import encode_oson
 
     out: list[tuple[bytes, bool]] = []
@@ -7741,11 +7759,11 @@ def oci_lob_contents(
                 # an entry here would shift every later LOB's position (#826) --
                 # the same reason the inline VECTOR case below skips.
                 continue
-            if inline_vectors and col.data_type == TNS_TYPE_VECTOR:
-                # The thin path carries a VECTOR's image in the row itself, so it
-                # queues no content: a client that already has the value issues no
-                # TTI_LOBOPS for it, and an entry here would shift every later
-                # LOB's position in the queue (#887).
+            if not for_oci and col.data_type in (TNS_TYPE_JSON, TNS_TYPE_VECTOR):
+                # The thin path carries a JSON or VECTOR image in the row itself,
+                # so it queues no content: a client that already has the value
+                # issues no TTI_LOBOPS for it, and an entry here would shift every
+                # later LOB's position in the queue (#887/#826).
                 continue
             if col.data_type == TNS_TYPE_CLOB:
                 out.append((str(value).encode('utf-16-be'), True))
@@ -10537,31 +10555,35 @@ def _lob_value_size(Value: object) -> int:
     return 0
 
 
-# The chunk size a live 23ai reports alongside a VECTOR column, measured
-# identical across 3-, 5- and 16-element float32 columns (#887).
-_THIN_VECTOR_CHUNK_SIZE = 32600
+# The chunk size a live 23ai reports alongside a prefetched LOB-class column,
+# measured identical across 3-, 5- and 16-element float32 VECTOR columns (#887)
+# and on a JSON column (0x7f58 on the wire, #826).
+_THIN_PREFETCH_CHUNK_SIZE = 32600
 
 
-def encode_vector_value_thin(image: bytes) -> bytes:
-    """The RXD value for a thin VECTOR column: the binary image **inline**,
+def encode_prefetched_lob_value_thin(image: bytes) -> bytes:
+    """The RXD value for a thin JSON / VECTOR column: the binary image **inline**,
     followed by the locator, in the LOB column's metadata framing --
     ``ub4 locator length | ub8 size | ub4 chunk size | DALC image | DALC
     locator``. Both length-prefixed fields are there: the reference client reads
     the image and then reads the locator to discard it, so a reply that stops
     after the image leaves it consuming the next token as locator bytes.
 
-    A VECTOR does **not** ride as a locator with its content following over
-    TTI_LOBOPS, the way a CLOB or BLOB does. Measured against a live 23ai: after
-    a vector SELECT the reference client issues **no** TTI_LOBOPS call at all --
-    it already has the value. The Mirror used to mint a locator and wait to be
-    asked for the content, so that client read the placeholder locator's bytes as
-    the next token and died with `DPY-5000 ... unknown protocol message type`
-    (#887). seerdb's own client never noticed, because :func:`_read_lob_column`
-    hands the "locator" straight to the vector decoder either way."""
+    Neither type rides as a bare locator with its content following over
+    TTI_LOBOPS, the way a CLOB or BLOB does -- the server prefetches the whole
+    value into the row. Measured against a live 23ai: after a VECTOR or JSON
+    SELECT the reference client issues **no** TTI_LOBOPS call at all, because it
+    already has the value (its ``read_vector`` / ``read_oson`` read this framing
+    and drop the locator). The Mirror used to mint a locator and wait to be asked
+    for the content, so that client read the placeholder locator's bytes as the
+    next token and died with `DPY-5000 ... unknown protocol message type`
+    (#887 for VECTOR, #826 for JSON). seerdb's own client never noticed, because
+    :func:`_read_lob_column` hands the "locator" straight to the decoder either
+    way."""
     return (
         encode_sb4(len(_THIN_LOB_LOCATOR))
         + encode_sb4(len(image))
-        + encode_sb4(_THIN_VECTOR_CHUNK_SIZE)
+        + encode_sb4(_THIN_PREFETCH_CHUNK_SIZE)
         + _bytes_with_length(image)
         + _bytes_with_length(_THIN_LOB_LOCATOR)
     )

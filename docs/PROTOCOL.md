@@ -3045,8 +3045,9 @@ chunk size 8060. The reference thin client reads exactly this, and reads the two
 middle fields **unconditionally** for every CLOB / BLOB / BFILE column
 (`read_lob_with_length`); given only `ub4 length | locator` it takes the
 locator's own length prefix for the `ub8` size and fails with `DPY-5002`. JSON
-and VECTOR columns are *not* read by that path (`read_oson` / `read_vector`), so
-they carry no such metadata.
+and VECTOR columns are *not* read by that path (`read_oson` / `read_vector`) —
+they carry the same three metadata fields but then the **value itself**, ahead of
+the locator; see §14.5e.
 
 **A real server sends two different forms, and the switch is not known.** A live
 23ai sends the framing above to the reference client and the bare
@@ -3162,6 +3163,47 @@ position.
 In seerdb the define OACs are `ExecRequest.define_types`, and
 `inline_long_for_defines()` applies them to the parked columns before the reply
 is built.
+
+### 14.5e JSON and VECTOR are **prefetched into the row** (#887, #826)
+
+A native JSON or VECTOR column is LOB-class in the describe but is never fetched
+over TTI_LOBOPS. The server sends the whole value in the row, in the LOB metadata
+framing of §14.5b with the image spliced in before the locator:
+
+```
+ub4 locator length | ub8 image size | ub4 chunk size | DALC image | DALC locator
+```
+
+Captured from a live 23ai for `select JsonCol from TestJson` holding
+`{'a': 1, 'b': 'x'}`:
+
+```
+01 28 | 01 2a | 02 7f 58 | 2a <42-byte OSON image> | 28 <40-byte locator>
+  40     42      32600
+```
+
+Note the first field is the **locator's** length, not the image's — it is the
+same `ub4` a plain LOB column puts there, and the client uses it only as a
+non-zero "present" marker. The locator is read and **discarded**
+(`read_oson` / `read_vector` both end with a throwaway `read_bytes()`), so a
+reply that stops after the image leaves the client consuming the next token as
+locator bytes.
+
+The chunk size is **32600** (`02 7f 58`), measured identical for VECTOR columns
+of 3, 5 and 16 float32 elements and for a JSON column — it is not derived from
+the value.
+
+**The describe must report length 8200 for both.** Measured on 23ai as
+`02 20 08`, whatever the document or the vector's dimension and element format. A
+zero there is not a harmless "unknown": the reference client builds a fetch
+variable that reads no bytes, consumes nothing from the row, and takes the
+image's first byte for a message type — `DPY-5000 ... unknown protocol message
+type`. This is the same trap §6.4's length table exists for, and JSON was the
+fourth column type to fall into it after BOOLEAN, ROWID/UROWID/ADT and VECTOR.
+
+Consequence for a server: such a column belongs in the row encoder and **not** in
+the TTI_LOBOPS content queue. An entry there is never drained, and it shifts the
+position of every later CLOB / BLOB in the same result.
 
 ### 14.6 Persistent-LOB locator field map (Mirror, deadbeef dialect)
 
