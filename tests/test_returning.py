@@ -518,3 +518,63 @@ class TestPreTenReturningWrap(unittest.TestCase):
         # Both tiers are field version 2, so the version cannot tell them apart.
         self.assertEqual(_pre10_tier_name_for(Fv2Dialect()), '9i')
         self.assertEqual(_pre10_tier_name_for(O8iDialect(lambda: 0)), '8i')
+
+
+class TestJsonReturnBind(unittest.TestCase):
+    """A JSON return bind carries its OSON image, not a DALC (#826).
+
+    A `RETURNING JsonCol INTO :b` reply frames the returned value the way such a
+    column is framed in a row: the metadata header, then the image, then a
+    locator to be discarded. Read as a plain DALC the locator stayed in the
+    stream and became the next field, so the response desynced on the token
+    after it (`no decoder for response token 2` against a live 23ai).
+    """
+
+    def tearDown(self):
+        set_decode_return_binds(None)
+
+    def test_decode_reads_the_image_and_drops_the_locator(self):
+        from seerdb.common.oson import decode_oson, encode_oson
+        from seerdb.common.tns import encode_prefetched_lob_value_thin, encode_sb4
+        from seerdb.common.tns_consts import TNS_TYPE_JSON, TTI_RXD
+
+        doc = {'a': 1, 'b': 'x'}
+        image = encode_oson(doc, allow_wide=True)
+        payload = (
+            bytes([TTI_RXD])
+            + encode_sb4(1)  # one affected row
+            + encode_prefetched_lob_value_thin(image)
+            + encode_sb4(0)  # sb4 truncation length
+            + bytes([TTI_STA])  # the token that used to be misread
+        )
+        set_decode_return_binds([0], {0: TNS_TYPE_JSON})
+        (Done, Acc) = decode_token_rxd(payload, (None, None, []))
+        self.assertTrue(Done)
+        (value,) = Acc[2][0]['return_values'][0]
+        self.assertEqual(decode_oson(bytes(value)), doc)
+
+    def test_a_position_with_no_type_still_reads_as_a_dalc(self):
+        # Every other bind keeps the plain framing, so arming the types must not
+        # change how an untyped position is read.
+        rec = TestReturningDecode()._decode(_RXD_TWO, [0, 1])
+        self.assertEqual(rec['return_values'][1], [b'hi'])
+
+    def test_encode_frames_a_json_value_as_its_image(self):
+        from seerdb.common.oson import encode_oson
+        from seerdb.common.tns import (
+            encode_prefetched_lob_value_thin,
+            encode_returning_response,
+        )
+        from seerdb.common.tns_consts import TNS_TYPE_JSON
+
+        doc = {'hello': 'world'}
+        reply = encode_returning_response(1, [[(doc,)]], [TNS_TYPE_JSON])
+        expected = encode_prefetched_lob_value_thin(encode_oson(doc, allow_wide=True))
+        self.assertIn(expected, reply)
+
+    def test_encode_keeps_a_null_json_value_bare(self):
+        from seerdb.common.tns import encode_returning_response
+        from seerdb.common.tns_consts import TNS_TYPE_JSON
+
+        reply = encode_returning_response(1, [[(None,)]], [TNS_TYPE_JSON])
+        self.assertIn(b'\x00', reply)

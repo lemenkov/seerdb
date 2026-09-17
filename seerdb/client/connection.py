@@ -57,6 +57,7 @@ from seerdb.common.tns import (
     find_fast_auth_rpa,
     has_long_class_bind,
     max_string_size,
+    return_bind_types,
     set_decode_dml_rowcounts,
     set_decode_prev_row,
     set_decode_return_binds,
@@ -1604,7 +1605,7 @@ class OracleConnect(_ConnectionLogic):
         # Arm row-count extraction for this response only (#18).
         set_decode_dml_rowcounts(ArrayDmlRowCounts)
         # Arm RETURNING out-bind decoding for this response only (#120).
-        set_decode_return_binds(ReturnBinds)
+        set_decode_return_binds(ReturnBinds, return_bind_types(Bind, ReturnBinds))
         # call_timeout (#123): a timer fires an out-of-band break if the call
         # runs too long; the server interrupts it (ORA-01013), which we remap to
         # a call-timeout error below.

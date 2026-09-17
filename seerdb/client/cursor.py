@@ -39,6 +39,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_ADT,
     TNS_TYPE_BLOB,
     TNS_TYPE_CLOB,
+    TNS_TYPE_JSON,
     TNS_TYPE_RAW,
     UTF8_CHARSET,
 )
@@ -676,6 +677,20 @@ def _assign_out_binds(Bind, Result) -> list:
     return RefCursors
 
 
+def _decode_returned_image(TnsType: int, Raw) -> object:
+    # The binary image a JSON / VECTOR return bind carries, decoded to a Python
+    # value. An empty / missing image is a NULL returned value (#826).
+    if not Raw:
+        return None
+    if TnsType == TNS_TYPE_JSON:
+        from seerdb.common.oson import decode_oson
+
+        return decode_oson(bytes(Raw))
+    from seerdb.common.vector import decode_vector
+
+    return decode_vector(bytes(Raw))
+
+
 def _assign_return_binds(Bind, Result) -> None:
     # DML RETURNING ... INTO (#120): the response decoder left one
     # {'return_positions', 'return_values'} record per execute iteration, where
@@ -695,6 +710,7 @@ def _assign_return_binds(Bind, Result) -> None:
     Records = [R for R in Rows or () if isinstance(R, dict) and 'return_positions' in R]
     if not Records:
         return
+    from seerdb.common.tns import _PREFETCHED_IMAGE_TYPES
     from seerdb.common.types import decode_value
 
     PerBind: dict = {}
@@ -703,7 +719,16 @@ def _assign_return_binds(Bind, Result) -> None:
             if Pos >= len(Bind) or not isinstance(Bind[Pos], Var):
                 continue
             Variable = Bind[Pos]
-            Column = {'data_type': Variable.dbtype.tns_type, 'charset': UTF8_CHARSET}
+            TnsType = Variable.dbtype.tns_type
+            if TnsType in _PREFETCHED_IMAGE_TYPES:
+                # A JSON / VECTOR bind's returned value arrives as its binary
+                # image, the same one such a column carries in a row, so it is
+                # decoded rather than run through the scalar type decoder (#826).
+                PerBind.setdefault(Pos, []).append(
+                    [_decode_returned_image(TnsType, V) for V in Values]
+                )
+                continue
+            Column = {'data_type': TnsType, 'charset': UTF8_CHARSET}
             PerBind.setdefault(Pos, []).append(
                 [decode_value(Column, V if V else None) for V in Values]
             )
