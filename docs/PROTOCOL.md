@@ -4718,6 +4718,43 @@ unchanged. python-oracledb-compatible. Sync + async; verified on
 10g/11g/21c/23ai (array INSERT, array UPDATE with a different row count per
 iteration, single-row batch, and multiple return binds).
 
+### 22.1b A JSON / VECTOR return bind carries its **image**, not a DALC (#826)
+
+`DALC + sb4 0` describes every return bind but two. `RETURNING JsonCol INTO :b`
+(and the same for a VECTOR column) frames the returned value the way such a
+column is framed in a row — §14.5e's prefetched form:
+
+```
+ub4 locator length | ub8 image size | ub4 chunk size | DALC image | DALC locator
+```
+
+Captured from a live 23ai for `insert into TestJson values (:1, :2) returning
+JsonCol into :json_out`, the whole RXD record:
+
+```
+07        TTI_RXD
+01 01     ub4 num_rows = 1
+01 28 | 01 25 | 02 1f 7c | 25 <37-byte OSON image> | 28 <40-byte locator>
+00        sb4 truncation length
+```
+
+Note the chunk size here is **8060** (`02 1f 7c`), not the 32600 a fetched column
+reports — it is skipped by every reader, so nothing depends on it, but it is not
+a constant of the type.
+
+Read as a plain DALC, the image is taken for the value and the **locator is left
+in the stream**, where it becomes the next field and desyncs the rest of the
+response. Against a live 23ai that surfaces as `no decoder for response token 2`
+— a byte from inside the locator read as a token. A server that writes the bare
+locator instead of this framing fails the reference client the other way, with
+`DPY-5002: read integer of length 38 when expecting integer of no more than
+length 8`.
+
+Because the framing depends on the bind's type and the request carries no
+describe for out-binds, a **decoder has to be told the return binds' types** —
+it cannot infer them from the reply. In seerdb that is
+`set_decode_return_binds(positions, types)`.
+
 ### 22.2 Serving it — the same rule read backwards (#689)
 
 A **server** parsing such a request faces the exact mirror of §22.1's first

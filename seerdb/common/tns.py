@@ -554,16 +554,45 @@ def set_decode_dml_rowcounts(Flag: bool) -> None:
 
 
 # DML RETURNING ... INTO (#120): the sorted return-bind positions for the next
-# response, so the TTI_RXD decoder reads the out-bind return data (per bind:
-# ub4 num_rows + per row a value + sb4 truncation length) instead of treating
-# the RXD as query rows. Reset every execute.
-_DECODE_RETURN_BINDS = contextvars.ContextVar('decode_return_binds', default=())
+# response, each with its TNS type when the bind declared one (#826), so the
+# TTI_RXD decoder reads the out-bind return data (per bind: ub4 num_rows + per
+# row a value + sb4 truncation length) instead of treating the RXD as query rows.
+# Reset every execute.
+_DECODE_RETURN_BINDS: contextvars.ContextVar[tuple[tuple[int, int | None], ...]] = (
+    contextvars.ContextVar('decode_return_binds', default=())
+)
 
 
-def set_decode_return_binds(Positions) -> None:
+def set_decode_return_binds(Positions, Types=None) -> None:
     """Arm return-bind decoding for the next response (#120). `Positions` is the
-    set/list of 0-based OUT-bind positions, or empty/None to disarm."""
-    _DECODE_RETURN_BINDS.set(tuple(sorted(Positions)) if Positions else ())
+    set/list of 0-based OUT-bind positions, or empty/None to disarm.
+
+    `Types` optionally maps a position to that bind's TNS type. It is needed only
+    for the types whose returned value is NOT a plain DALC -- a JSON or VECTOR
+    bind gets its binary image prefetched into the reply, ahead of a locator, the
+    same framing such a column uses in a row (#826). Positions it does not name
+    read as a DALC, which is every other type."""
+    if not Positions:
+        _DECODE_RETURN_BINDS.set(())
+        return
+    Lookup = dict(Types or {})
+    _DECODE_RETURN_BINDS.set(tuple((Pos, Lookup.get(Pos)) for Pos in sorted(Positions)))
+
+
+def return_bind_types(Bind, Positions) -> dict:
+    """The TNS type of each return bind that declares one, by position (#826).
+
+    Only a `Var` carries a declared type, and only the prefetched-image types
+    change how the reply is read, so anything else is simply left out."""
+    from seerdb.common.datatypes import Var
+
+    if not Bind or not Positions:
+        return {}
+    return {
+        Pos: Bind[Pos].dbtype.tns_type
+        for Pos in Positions
+        if Pos < len(Bind) and isinstance(Bind[Pos], Var)
+    }
 
 
 # The last row of the previous fetch, seeded for a scroll re-execute (#181). When
@@ -2493,6 +2522,11 @@ def encode_returning_response(
     that many values, each a DALC followed by an sb4 truncation length (always 0
     here -- the client discards it). ``iterations`` arrives the other way round,
     as the rows each iteration returned, so it is transposed here.
+
+    A JSON or VECTOR bind is the exception to "each a DALC": its value comes back
+    as the prefetched binary image with a locator behind it, the same framing such
+    a column uses in a row (#826). A bare locator there is read as the metadata
+    form and fails with ``DPY-5002``.
     """
     out = bytearray()
     for rows in iterations:
@@ -2501,8 +2535,20 @@ def encode_returning_response(
             out += encode_sb4(len(rows))
             for row in rows:
                 value = row[position] if position < len(row) else None
-                out += encode_value(value, tns_type) + encode_sb4(0)
+                out += _returned_value(value, tns_type) + encode_sb4(0)
     return bytes(out) + encode_status(rowcount, cursor_id=cursor_id)
+
+
+def _returned_value(value: object, tns_type: int) -> bytes:
+    # One RETURNING out-bind value. JSON and VECTOR carry their image inline, the
+    # way the row encoder sends them (#826/#887); everything else is a DALC.
+    if tns_type not in _PREFETCHED_IMAGE_TYPES or value is None:
+        return encode_value(value, tns_type)
+    if tns_type == TNS_TYPE_JSON:
+        from seerdb.common.oson import encode_oson
+
+        return encode_prefetched_lob_value_thin(encode_oson(value, allow_wide=True))
+    return encode_prefetched_lob_value_thin(encode_vector(value))
 
 
 def scroll_start_row(orientation: int, position: int, total: int) -> int:
@@ -3612,6 +3658,11 @@ def decode_token_uds(Data: bytes, Acc: tuple) -> tuple:
 _LOB_DATA_TYPES = frozenset(
     (TNS_TYPE_CLOB, TNS_TYPE_BLOB, TNS_TYPE_BFILE, TNS_TYPE_JSON, TNS_TYPE_VECTOR)
 )
+# The LOB-class types a server prefetches whole rather than handing over a bare
+# locator: the binary image rides in the reply with the locator behind it, both
+# in a row (see encode_prefetched_lob_value_thin) and in DML RETURNING out-bind
+# data (#826/#887).
+_PREFETCHED_IMAGE_TYPES = frozenset((TNS_TYPE_JSON, TNS_TYPE_VECTOR))
 _ROWID_DATA_TYPES = frozenset((TNS_TYPE_RID,))
 _UROWID_DATA_TYPES = frozenset((TNS_TYPE_UROWID,))
 _LONG_DATA_TYPES = frozenset((TNS_TYPE_LONG, TNS_TYPE_LONGRAW))
@@ -3660,16 +3711,25 @@ def _decode_rxd_step(Data: bytes, Acc: tuple) -> tuple:
         # raw value bytes; the cursor decodes them by each Var's type. Surfaced
         # as a record the cursor maps onto its return Vars (one list per bind).
         ReturnValues = []
-        for _ in ReturnPositions:
+        for _Pos, TnsType in ReturnPositions:
             (NumRows, Rest) = decode_ub4(Rest)
             Vals = []
             for _Row in range(NumRows):
-                (Val, Rest) = decode_dalc(Rest)
+                if TnsType in _PREFETCHED_IMAGE_TYPES:
+                    # A JSON / VECTOR bind's returned value is its binary image
+                    # prefetched into the reply with a locator behind it, not a
+                    # plain DALC -- the same framing the column uses in a row.
+                    # Read as a DALC the locator was left in place and became the
+                    # next field, so the response desynced on the token after it
+                    # (#826).
+                    (Val, Rest) = _read_lob_column(Rest, inline_image=True)
+                else:
+                    (Val, Rest) = decode_dalc(Rest)
                 (_, Rest) = decode_ub4(Rest)  # sb4 actual length (trunc)
                 Vals.append(Val)
             ReturnValues.append(Vals)
         Record = {
-            'return_positions': list(ReturnPositions),
+            'return_positions': [Pos for Pos, _T in ReturnPositions],
             'return_values': ReturnValues,
         }
         Rows.append(Record)
