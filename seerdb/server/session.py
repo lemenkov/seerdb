@@ -1586,6 +1586,13 @@ class _Cursors:
         # it, so a client that re-executes a query by id gets that query (#840)
         # and its fresh bind values decode (#854). Shares the `_next` id space.
         self._query: dict[int, tuple[str, list]] = {}
+        # The column describe last sent for a cursor id. On a re-execute the
+        # client reuses the describe from the first execute and does not expect
+        # another -- unless the statement's shape changed underneath it (a view
+        # replaced with different column types, #826). Comparing the re-run's
+        # columns against this decides whether the re-execute reply must carry a
+        # fresh describe, the way a real server re-describes an invalidated cursor.
+        self._describe: dict[int, list[ColumnMeta]] = {}
 
     def open_query(self, sql: str, bind_types: Sequence = ()) -> int:
         # A cursor id for a query, minted even when the whole result fit and
@@ -1641,6 +1648,7 @@ class _Cursors:
         cursor_id = self._next
         self._next += 1
         self._open[cursor_id] = (columns, rows)
+        self._describe[cursor_id] = columns
         if sql is not None:
             self._query[cursor_id] = (sql, list(bind_types))
         return cursor_id
@@ -1659,6 +1667,7 @@ class _Cursors:
         # The bind format stays what the opening execute recorded.
         previous = self._query.get(cursor_id)
         self._query[cursor_id] = (sql, previous[1] if previous else [])
+        self._describe[cursor_id] = columns
         if rows:
             self._open[cursor_id] = (columns, rows)
         else:
@@ -1700,6 +1709,12 @@ class _Cursors:
         to answer before it commits to draining the cursor (#887)."""
         state = self._open.get(cursor_id)
         return state[0] if state is not None else []
+
+    def describe_columns(self, cursor_id: int) -> list[ColumnMeta]:
+        """The describe last sent for a cursor id, empty if unknown. Unlike
+        :meth:`columns` this survives a fully-drained cursor, so a re-execute can
+        tell whether the statement's column shape changed (#826)."""
+        return self._describe.get(cursor_id, [])
 
 
 class _TempLobs:
@@ -2336,12 +2351,18 @@ def _answer_reexecute(
     # already holds, so its follow-up fetches address the statement it just ran.
     batch_size = _prefetch_batch(request.fetch, len(rows))
     first, remaining = rows[:batch_size], rows[batch_size:]
+    # A re-execute normally omits the describe -- the client kept it from the
+    # first execute. But if the statement's column shape changed underneath the
+    # cached cursor (a view replaced with different column types, #826), the
+    # client would decode these rows with the stale describe; send a fresh one,
+    # the way a real server re-describes an invalidated cursor. Read the prior
+    # describe before reopen() records the new one.
+    redescribe = columns != cursors.describe_columns(request.cursor)
     cursors.reopen(request.cursor, columns, remaining, sql=sql)
+    encode = encode_query_response if redescribe else encode_fetch_response
     stream.write_packet(
         TNS_DATA,
-        encode_fetch_response(
-            columns, first, cursor_id=request.cursor, more=bool(remaining)
-        ),
+        encode(columns, first, cursor_id=request.cursor, more=bool(remaining)),
     )
     return lobs
 
