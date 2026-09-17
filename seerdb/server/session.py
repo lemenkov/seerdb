@@ -1236,7 +1236,9 @@ def _answer_query_oci(
     rows = list(result.rows)
     # Every LOB cell across the whole result queues its content now, row-major, so
     # the follow-up TTI_LOBOPS reads drain it in the order the locators went out.
-    lobs = oci_lob_contents(result.columns, rows)
+    # This is the OCI path, which reads JSON and VECTOR that way too -- unlike the
+    # thin path, which carries their images in the row (#826/#887).
+    lobs = oci_lob_contents(result.columns, rows, for_oci=True)
     has_long = any(
         col.data_type in (TNS_TYPE_LONG, TNS_TYPE_LONGRAW) for col in result.columns
     )

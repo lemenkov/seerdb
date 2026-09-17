@@ -36,6 +36,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_DATE,
     TNS_TYPE_INTERVALDS,
     TNS_TYPE_INTERVALYM,
+    TNS_TYPE_JSON,
     TNS_TYPE_NUMBER,
     TNS_TYPE_RAW,
     TNS_TYPE_REF,
@@ -580,8 +581,6 @@ def test_describe_roundtrips_the_json_and_oson_flags() -> None:
     # CLOB holding an OSON image it should decode rather than surface as a raw
     # LOB (#826). A plain column carries neither; the Mirror used to emit a zero
     # flags word for every column, so an OSON column read back as a LOB.
-    from seerdb.common.tns_consts import TNS_TYPE_JSON
-
     payload = encode_describe(
         [
             ColumnMeta(
@@ -792,6 +791,10 @@ def test_describe_fills_in_the_length_a_backend_cannot_report() -> None:
         TNS_TYPE_BLOB: 4000,
         # A zero here made the client skip the column's byte entirely (#740).
         TNS_TYPE_BOOLEAN: 1,
+        # A native JSON column measures the same 8200 a VECTOR does, and a zero
+        # cost the same: the client read no bytes for it and took the OSON image
+        # the row carries for the next message (#826).
+        TNS_TYPE_JSON: 8200,
     }
     for data_type, length in expected.items():
         column = ColumnMeta(name=b'C', data_type=data_type, data_length=0, max_size=0)
@@ -2003,7 +2006,7 @@ def test_oci_lob_contents_encodes_a_json_cell_as_its_oson_image() -> None:
         ColumnMeta(name=b'D', data_type=TNS_TYPE_JSON, data_length=4000, max_size=0)
     ]
     doc = {'hello': 'world', 'n': 42, 'arr': [1, 2, 3]}
-    got = oci_lob_contents(cols, [(doc,), (None,)])
+    got = oci_lob_contents(cols, [(doc,), (None,)], for_oci=True)
     assert len(got) == 1
     image, is_clob = got[0]
     assert is_clob is False
@@ -2011,9 +2014,35 @@ def test_oci_lob_contents_encodes_a_json_cell_as_its_oson_image() -> None:
     assert decode_oson(image) == doc
 
 
+def test_a_thin_json_cell_rides_in_the_row_and_queues_no_lob() -> None:
+    # The thin path does not hand a JSON column over as a locator with its image
+    # following over TTI_LOBOPS. A real server prefetches the whole value into the
+    # row, and the reference client's read_oson expects exactly that -- it issues
+    # no TTI_LOBOPS call at all, so a queue entry here would shift every later
+    # LOB's position (#826, the same shape VECTOR needed in #887).
+    from seerdb.common.oson import encode_oson
+    from seerdb.common.tns import (
+        ColumnMeta,
+        encode_prefetched_lob_value_thin,
+        encode_rows,
+        oci_lob_contents,
+    )
+
+    doc = {'hello': 'world', 'n': 42}
+    col = ColumnMeta(name=b'D', data_type=TNS_TYPE_JSON, data_length=8200, max_size=0)
+    assert oci_lob_contents([col], [(doc,)]) == []
+    image = encode_oson(doc, allow_wide=True)
+    assert encode_prefetched_lob_value_thin(image) in encode_rows([(doc,)], [col])
+    # The OCI (sqlplus) path does read it over TTI_LOBOPS, so it still queues.
+    assert len(oci_lob_contents([col], [(doc,)], for_oci=True)) == 1
+
+
 def test_encode_value_emits_a_thin_lob_locator_for_a_json_column() -> None:
-    # A JSON value rides as a LOB locator inline (its OSON image follows over
-    # TTI_LOBOPS), exactly like a CLOB / BLOB; NULL is a bare 0x00 (#30/#50).
+    # The type-only encoder treats JSON like a CLOB / BLOB: a locator whose
+    # content follows over TTI_LOBOPS, NULL a bare 0x00 (#30/#50). A row built by
+    # _thin_column_value no longer reaches this for a JSON column -- it carries
+    # the OSON image in the row instead (#826) -- but the locator form is still
+    # what a bare encode_value means by a JSON value.
     from seerdb.common.tns import encode_lob_locator_thin, encode_value
     from seerdb.common.tns_consts import TNS_TYPE_JSON
 
@@ -2083,7 +2112,7 @@ def test_oci_lob_contents_encodes_a_vector_cell_by_element_format() -> None:
             vector_format=4,  # INT8
         )
     ]
-    got = oci_lob_contents(cols, [([1, -2, 3, -4],), (None,)])
+    got = oci_lob_contents(cols, [([1, -2, 3, -4],), (None,)], for_oci=True)
     assert len(got) == 1
     image, is_clob = got[0]
     assert is_clob is False
