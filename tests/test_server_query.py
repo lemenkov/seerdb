@@ -428,6 +428,35 @@ def test_parse_exec_reports_the_execute_iteration_count(version: int) -> None:
     assert array.iterations == 3
 
 
+def test_a_query_reexecutes_once_however_many_rows_it_prefetches() -> None:
+    # al8i4[1] carries the execute iteration count for a DML, but for a QUERY it
+    # carries the number of rows to prefetch -- and al8i4[7] is the is-query flag
+    # that tells the two apart. The reference client writes its fetch array size
+    # (arraysize, 100 by default) there whenever it re-executes a cursor it
+    # already holds, so reading it as an iteration count turned a plain
+    # re-executed SELECT into a 100-iteration array DML: the query never ran and
+    # the client got a row count where it expected rows (#826).
+    from seerdb.common.tns import _DECODE_FIELD_VERSION
+    from seerdb.server.session import _skip_piggybacks
+
+    # Byte-for-byte off a live capture (fv24): a close-cursors piggyback, then
+    # the OALL8 re-executing cursor 2 with no SQL, no binds and al8i4 =
+    # [0, 100, 0, 0, 0, 0, 0, 1, ...] -- 100 prefetch rows, is-query set.
+    captured = bytes.fromhex(
+        '116908000101010103035e09000280200102000001010d0000000164047fffff'
+        'ff00000000000000000000000100000000000000000000000000000000016400'
+        '00000000010100028000000000'
+    )
+    token = _DECODE_FIELD_VERSION.set(24)
+    try:
+        request = parse_exec(_skip_piggybacks(captured))
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+    assert (request.sql, request.cursor, request.bind_count) == ('', 2, 0)
+    assert request.fetch == 100  # it does want a hundred rows back...
+    assert request.iterations == 1  # ...from ONE execution of the statement
+
+
 def test_returning_response_round_trips_to_the_client_decoder() -> None:
     # The reply carries one record per iteration, values grouped by bind. Decode
     # it with the client's own reader to prove the two agree (#689).
