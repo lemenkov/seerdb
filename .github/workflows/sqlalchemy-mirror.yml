@@ -25,7 +25,6 @@ on:
     paths:
       - 'seerdb/**'
       - 'examples/**'
-      - 'tools/**'
       - 'pyproject.toml'
       - '.github/workflows/sqlalchemy-mirror.yml'
   pull_request:
@@ -33,7 +32,6 @@ on:
     paths:
       - 'seerdb/**'
       - 'examples/**'
-      - 'tools/**'
       - 'pyproject.toml'
       - '.github/workflows/sqlalchemy-mirror.yml'
   workflow_dispatch:
