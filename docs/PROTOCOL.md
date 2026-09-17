@@ -3114,6 +3114,55 @@ In seerdb this is `inline_long_after_type_change()`, whose mark on a column
 routes it past the locator branch in `_thin_column_value` and out of the
 `oci_lob_contents` queue.
 
+### 14.5d The define round-trip, and what the client actually asks for (#826)
+
+§14.5c's "inline as LONG" framing has a second, more common trigger: the client
+simply **asks** for it. A client fetching a LOB as string / bytes — an
+`outputtypehandler` returning a `DB_TYPE_VARCHAR` / `DB_TYPE_RAW` variable for a
+CLOB / BLOB column — reads the describe, sets "requires define", and re-executes
+the cursor with the **DEFINE** execute option (`0x10`) and one OAC per column.
+
+That define execute is the one place a client tells the server what it wants each
+column *as*:
+
+```
+options   0x8010        NOT_PLSQL | DEFINE       (no EXECUTE, no FETCH, no PARSE)
+cursor    <id>          the cursor the describe reported
+sql       absent
+binds     0             a define execute never carries binds
+defines   <n>           one per column, where the bind count would be
+```
+
+and after the `al8i4` array, one OAC per column in the **same layout a bind OAC
+uses** — so the same decoder reads them. Captured from a live 23ai for a CLOB
+column an `outputtypehandler` fetched as a string:
+
+```
+08 01 00 00 | 04 7f ff ff ff | 00 | 00 00 00 00 | 00 | 02 03 69 | 01 | 00 | 00
+^^ LONG       ^^ buffer size                            ^^ 873     ^^ csfrm
+```
+
+and for a BLOB fetched as bytes, `18 ...` — LONG RAW, with `csfrm 0` and so no
+charset field. Note the client has already converted its `VARCHAR` / `RAW`
+variable into a **LONG (RAW)** define; the wire never carries the user's type.
+
+The reply is rows alone (`TTI_RXH` + `TTI_RXD`, no describe — the client has it),
+with the value framed inline exactly as §14.5c describes:
+
+```
+06 22 01 01 00 01 02 00 00 00 | 07 09 62 6c 6f 62 5f 34 36 32 30 | 00 00
+                                ^^ RXD, 9 bytes, "blob_4620"       ^^ LONG trailer
+```
+
+**No TTI_LOBOPS follows.** The client asked for the bytes and got them, so it
+never issues a read — which is why a Mirror that answers this with a locator both
+desyncs the row and leaves an orphan in its LOB queue, shifting every later LOB's
+position.
+
+In seerdb the define OACs are `ExecRequest.define_types`, and
+`inline_long_for_defines()` applies them to the parked columns before the reply
+is built.
+
 ### 14.6 Persistent-LOB locator field map (Mirror, deadbeef dialect)
 
 The Mirror hands sqlplus a **persistent-LOB locator** in the row value
