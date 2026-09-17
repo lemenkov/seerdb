@@ -8,6 +8,7 @@ known JSON document (see docs/PROTOCOL.md §15). No server is needed to run
 these — they pin the decoder against the actual wire format.
 """
 
+import array
 import datetime
 import json
 import unittest
@@ -252,7 +253,7 @@ class TestOsonBinaryVectorInteger(unittest.TestCase):
                     'c0059c28bfc00000c0200000c0600000'
                 )
             ),
-            [1.5, 2.5, 3.5],
+            array.array('f', [1.5, 2.5, 3.5]),
         )
 
     def test_object_with_raw_int_number(self):

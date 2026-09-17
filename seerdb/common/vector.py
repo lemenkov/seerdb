@@ -23,8 +23,11 @@ packed bytes unchanged (matching the form a ``VECTOR(n, BINARY)`` literal takes,
 e.g. ``[170]`` ⇒ byte ``0xAA``). The 8-byte norm is a cached magnitude (also
 sortable-encoded) that we skip; it is not part of the value.
 
-Returns a list of Python floats (FLOAT32/64) or ints (INT8 values, or BINARY
-packed bytes).
+Returns an ``array.array`` whose typecode records the element format — ``f``
+FLOAT32, ``d`` FLOAT64, ``b`` INT8, ``B`` the packed bytes of a BINARY vector —
+or a :class:`SparseVector`. Matching the reference client's representation keeps
+the format through a decode/re-encode (the Mirror), so a served vector reports
+the same typecode a real server would.
 """
 
 import array
@@ -56,8 +59,12 @@ class SparseVector:
 
     def __init__(self, num_dimensions: int, indices, values):
         self.num_dimensions = num_dimensions
-        self.indices = list(indices)
-        self.values = list(values)
+        # Stored as passed: the decoder hands an array('I') of indices and an
+        # array of values (typecode per the element format), matching the
+        # reference client; a caller binding may pass plain lists, which the
+        # encoder handles just as well.
+        self.indices = indices
+        self.values = values
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, SparseVector):
@@ -93,9 +100,15 @@ def _decode_float(chunk: bytes, fmt: str, bits: int) -> float:
 
 _VEC_ELEMENT_WIDTH = {_VEC_FLOAT32: 4, _VEC_FLOAT64: 8, _VEC_INT8: 1}
 
+# The array.array typecode carrying each numeric element format.
+_ELEMENT_TYPECODE = {_VEC_FLOAT32: 'f', _VEC_FLOAT64: 'd', _VEC_INT8: 'b'}
 
-def _decode_elements(image: bytes, pos: int, element_type: int, n: int) -> list:
-    # Decode `n` consecutive numeric vector elements starting at `pos`.
+
+def _decode_elements(
+    image: bytes, pos: int, element_type: int, n: int
+) -> 'array.array':
+    # Decode `n` consecutive numeric vector elements starting at `pos` into an
+    # array.array whose typecode records the element format.
     width = _VEC_ELEMENT_WIDTH.get(element_type)
     if width is None:
         raise VectorError(
@@ -104,25 +117,31 @@ def _decode_elements(image: bytes, pos: int, element_type: int, n: int) -> list:
         )
     # `n` comes straight from the image's ub4 element count (or ub2 sparse
     # count); reject a count that cannot fit before iterating, so a crafted
-    # value (e.g. a ~4-billion ub4) can't spin building a huge list (#165).
+    # value (e.g. a ~4-billion ub4) can't spin building a huge array (#165).
     if pos + width * n > len(image):
         raise VectorError('VECTOR element count exceeds image')
     if element_type == _VEC_FLOAT32:
-        return [
-            _decode_float(image[pos + 4 * i : pos + 4 * i + 4], 'f', 32)
-            for i in range(n)
-        ]
+        return array.array(
+            'f',
+            (
+                _decode_float(image[pos + 4 * i : pos + 4 * i + 4], 'f', 32)
+                for i in range(n)
+            ),
+        )
     if element_type == _VEC_FLOAT64:
-        return [
-            _decode_float(image[pos + 8 * i : pos + 8 * i + 8], 'd', 64)
-            for i in range(n)
-        ]
-    return [v - 256 if v > 127 else v for v in image[pos : pos + n]]
+        return array.array(
+            'd',
+            (
+                _decode_float(image[pos + 8 * i : pos + 8 * i + 8], 'd', 64)
+                for i in range(n)
+            ),
+        )
+    return array.array('b', (v - 256 if v > 127 else v for v in image[pos : pos + n]))
 
 
-def decode_vector(image: bytes) -> list | SparseVector:
-    """Decode a VECTOR binary image to a list of floats / ints (dense) or a
-    SparseVector (sparse, 23ai)."""
+def decode_vector(image: bytes) -> 'array.array | SparseVector':
+    """Decode a VECTOR binary image to an ``array.array`` (dense; typecode per
+    the element format) or a :class:`SparseVector` (sparse, 23ai)."""
     if not image or image[0] != VECTOR_MAGIC:
         raise VectorError(
             f'not a VECTOR image (magic {image[:1].hex() if image else "∅"})'
@@ -142,10 +161,13 @@ def decode_vector(image: bytes) -> list | SparseVector:
         pos += 2
         if pos + 4 * nnz > len(image):  # index array must fit (#165)
             raise VectorError('VECTOR sparse index count exceeds image')
-        indices = [
-            int.from_bytes(image[pos + 4 * i : pos + 4 * i + 4], 'big')
-            for i in range(nnz)
-        ]
+        indices = array.array(
+            'I',
+            (
+                int.from_bytes(image[pos + 4 * i : pos + 4 * i + 4], 'big')
+                for i in range(nnz)
+            ),
+        )
         pos += 4 * nnz
         values = _decode_elements(image, pos, element_type, nnz)
         return SparseVector(num_elements, indices, values)
@@ -155,7 +177,7 @@ def decode_vector(image: bytes) -> list | SparseVector:
         nbytes = (num_elements + 7) // 8
         if pos + nbytes > len(image):  # packed bit payload must fit (#165)
             raise VectorError('VECTOR bit count exceeds image')
-        return list(image[pos : pos + nbytes])
+        return array.array('B', image[pos : pos + nbytes])
     return _decode_elements(image, pos, element_type, num_elements)
 
 
@@ -226,7 +248,13 @@ def encode_vector(value: object) -> bytes:
     (f/d/b/B); a SparseVector -> a sparse FLOAT32 image. The 8-byte norm is sent
     as zeros (the server recomputes it)."""
     if isinstance(value, SparseVector):
-        element_type = _VEC_FLOAT32
+        # Preserve the stored element format (array values carry it); a plain
+        # list of values keeps the FLOAT32 default.
+        element_type = (
+            _TYPECODE_ELEMENT.get(value.values.typecode, _VEC_FLOAT32)
+            if isinstance(value.values, array.array)
+            else _VEC_FLOAT32
+        )
         flags = _BIND_HEADER[element_type][1] | _FLAG_SPARSE
         header = (
             bytes([VECTOR_MAGIC, 2])

@@ -62,7 +62,7 @@ class TestVectorDecode(unittest.TestCase):
 
     def test_int8_returns_ints(self):
         got = decode_vector(bytes.fromhex('db0000120400000004c015e8add236a58f01fe03fc'))
-        self.assertEqual(got, [1, -2, 3, -4])
+        self.assertEqual(got, array.array('b', [1, -2, 3, -4]))
         self.assertTrue(all(isinstance(v, int) for v in got))
 
     def test_float32_returns_floats(self):
@@ -74,7 +74,7 @@ class TestVectorDecode(unittest.TestCase):
     def test_binary_returns_packed_bytes(self):
         # VECTOR(16, BINARY) '[170, 1]' -> two packed bytes, ints, verbatim.
         got = decode_vector(bytes.fromhex('db01001005000000108000000000000000aa01'))
-        self.assertEqual(got, [0xAA, 0x01])
+        self.assertEqual(got, array.array('B', [0xAA, 0x01]))
         self.assertTrue(all(isinstance(v, int) for v in got))
 
     def test_bad_magic_raises(self):
@@ -137,20 +137,24 @@ class TestVectorBind(unittest.TestCase):
             'db00001202000000030000000000000000bfc00000c0200000c0600000',
         )
         self.assertEqual(
-            decode_vector(encode_vector(array.array('d', [1.5, -2.5]))), [1.5, -2.5]
+            decode_vector(encode_vector(array.array('d', [1.5, -2.5]))),
+            array.array('d', [1.5, -2.5]),
         )
         self.assertEqual(
-            decode_vector(encode_vector(array.array('b', [1, -2, 3]))), [1, -2, 3]
+            decode_vector(encode_vector(array.array('b', [1, -2, 3]))),
+            array.array('b', [1, -2, 3]),
         )
         self.assertEqual(
-            decode_vector(encode_vector(array.array('B', [170, 1]))), [170, 1]
+            decode_vector(encode_vector(array.array('B', [170, 1]))),
+            array.array('B', [170, 1]),
         )
         self.assertEqual(
-            decode_vector(encode_vector([1.5, 2.5, 3.5])), [1.5, 2.5, 3.5]
+            decode_vector(encode_vector([1.5, 2.5, 3.5])),
+            array.array('f', [1.5, 2.5, 3.5]),
         )  # plain list -> FLOAT32
 
     def test_encode_sparse_roundtrips(self):
-        sv = SparseVector(8, [2, 5], [1.5, 2.5])
+        sv = SparseVector(8, array.array('I', [2, 5]), array.array('f', [1.5, 2.5]))
         self.assertEqual(decode_vector(encode_vector(sv)), sv)
 
 
@@ -165,7 +169,7 @@ class TestSparseVector(unittest.TestCase):
                     '05bfc00000c0200000'
                 )
             ),
-            SparseVector(8, [2, 5], [1.5, 2.5]),
+            SparseVector(8, array.array('I', [2, 5]), array.array('f', [1.5, 2.5])),
         )
 
     def test_decode_float32_index0_and_negative(self):
@@ -176,7 +180,7 @@ class TestSparseVector(unittest.TestCase):
                     'bf800000407fffff'
                 )
             ),
-            SparseVector(8, [0, 7], [1.0, -1.0]),
+            SparseVector(8, array.array('I', [0, 7]), array.array('f', [1.0, -1.0])),
         )
 
     def test_decode_int8(self):
@@ -186,7 +190,7 @@ class TestSparseVector(unittest.TestCase):
                     'db0200320400000008c0140000000000000002000000020000000503fc'
                 )
             ),
-            SparseVector(8, [2, 5], [3, -4]),
+            SparseVector(8, array.array('I', [2, 5]), array.array('b', [3, -4])),
         )
 
     def test_decode_wide_index_ub4(self):
@@ -197,11 +201,11 @@ class TestSparseVector(unittest.TestCase):
                     'bfc00000c0200000'
                 )
             ),
-            SparseVector(300, [1, 299], [1.5, 2.5]),
+            SparseVector(300, array.array('I', [1, 299]), array.array('f', [1.5, 2.5])),
         )
 
     def test_is_vector_bind_and_encode(self):
-        sv = SparseVector(8, [2, 5], [1.5, 2.5])
+        sv = SparseVector(8, array.array('I', [2, 5]), array.array('f', [1.5, 2.5]))
         self.assertTrue(is_vector_bind(sv))
         # encodes to a version-2 / flag-0x20 sparse image that round-trips.
         img = encode_vector(sv)
