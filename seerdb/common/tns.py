@@ -4,7 +4,7 @@
 import base64
 import datetime
 import platform
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
@@ -338,6 +338,13 @@ class ColumnMeta:
     # carried through the describe or the value surfaces as a raw LOB (#826).
     is_json: bool = False
     is_oson: bool = False
+    # Set only when a cached cursor is re-executed and this column's type changed
+    # to CLOB / BLOB under a describe that had said CHAR / VARCHAR / LONG (or RAW
+    # / LONG RAW): the value then rides inline as LONG / LONG RAW instead of as a
+    # locator, and this is the charset form its bytes use — the one the describe
+    # being REPLACED carried, not this describe's own (#826). None everywhere
+    # else, so an ordinary LOB column keeps its locator.
+    inline_long_csfrm: int | None = None
 
 
 # The describe's ub4 uds-flags bits (python-oracledb's TNS_UDS_FLAGS_*).
@@ -1116,6 +1123,59 @@ def describe_wire_length(col: ColumnMeta) -> int:
     return _DESCRIBE_WIRE_LENGTH.get(col.data_type, 0)
 
 
+# The describe types a CLOB may replace and still be served inline, and the ones
+# a BLOB may. Outside these pairs a type change is an ordinary re-describe and the
+# new type's own framing applies.
+_INLINE_LONG_FROM = {
+    TNS_TYPE_CLOB: frozenset({TNS_TYPE_CHAR, TNS_TYPE_VARCHAR, TNS_TYPE_LONG}),
+    TNS_TYPE_BLOB: frozenset({TNS_TYPE_RAW, TNS_TYPE_LONGRAW}),
+}
+
+
+def _effective_describe_type(col: ColumnMeta) -> int:
+    # The type a client's fetch variable holds for ``col``. Normally the described
+    # type -- but a column already being served inline as LONG stands in the
+    # client as LONG (RAW), not as the LOB the describe named.
+    if col.inline_long_csfrm is None:
+        return col.data_type
+    return TNS_TYPE_LONGRAW if col.data_type == TNS_TYPE_BLOB else TNS_TYPE_LONG
+
+
+def inline_long_after_type_change(
+    columns: list[ColumnMeta], previous: list[ColumnMeta]
+) -> list[ColumnMeta]:
+    """``columns``, with every column a cached cursor must keep serving inline.
+
+    When a query is re-executed and a column's type has changed to CLOB or BLOB
+    while the describe it replaces said CHAR / VARCHAR / LONG (or RAW / LONG RAW),
+    a real server reports the new LOB type but still sends the value inline, as
+    LONG (RAW) in the charset form the client already had -- the same shape a
+    define of a LOB as string / bytes produces. The reference client relies on
+    that: it rewrites such a column's fetch type itself and so asks for no LOB
+    read. Mark those columns; :func:`_thin_column_value` then serves them inline
+    and :func:`oci_lob_contents` queues nothing for them (#826).
+    """
+    if not previous:
+        return columns
+    out = list(columns)
+    for i, col in enumerate(columns):
+        if i >= len(previous):
+            break
+        allowed = _INLINE_LONG_FROM.get(col.data_type)
+        if allowed and _effective_describe_type(previous[i]) in allowed:
+            # The charset form the client's variable holds, which for a column
+            # already being served inline is the one it was given then -- not the
+            # LOB describe that replaced it.
+            prior = previous[i]
+            csfrm = (
+                prior.csfrm
+                if prior.inline_long_csfrm is None
+                else prior.inline_long_csfrm
+            )
+            out[i] = replace(col, inline_long_csfrm=csfrm)
+    return out
+
+
 def _encode_dcb_column(col: ColumnMeta, position: int) -> bytes:
     # Inverse of _decode_dcb_column, in the layout the negotiated field version's
     # client reads: 12.2+ carries the scale as one signed byte and appends an
@@ -1368,6 +1428,15 @@ def _thin_column_value(value: object, col: 'ColumnMeta') -> bytes:
         # to LONG RAW and runs decode_oson over the bytes, so the value rides
         # inline in the row rather than as a LOB locator -- a locator here is
         # read as LONG RAW and desyncs the row (#826).
+        return encode_long_value_thin(value)
+    if col.inline_long_csfrm is not None:
+        # This column's type changed to CLOB / BLOB under a cached cursor whose
+        # previous describe said CHAR / VARCHAR / LONG (or RAW / LONG RAW). A real
+        # server keeps serving such a column the way the client still expects it --
+        # inline as LONG / LONG RAW, in the OLD charset form -- even though the
+        # describe reports the new LOB type; a locator here desyncs the row (#826).
+        if isinstance(value, str) and col.inline_long_csfrm == _CSFRM_NCHAR:
+            return encode_long_value_thin(value.encode('utf-16-be'))
         return encode_long_value_thin(value)
     if col.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB) and value is not None:
         # Mint a unique locator and remember the content, so an object bind that
@@ -7595,6 +7664,12 @@ def oci_lob_contents(
     for row in rows:
         for value, col in zip(row, columns):
             if col.data_type not in _LOB_CONTENT_TYPES or value is None:
+                continue
+            if col.inline_long_csfrm is not None:
+                # A column served inline as LONG / LONG RAW after a type change
+                # under a cached cursor carries its content in the row, so the
+                # client issues no TTI_LOBOPS read for it and an entry here would
+                # shift every later LOB's position in the queue (#826).
                 continue
             if col.is_oson:
                 # An OSON-in-BLOB column carries its bytes in the row itself

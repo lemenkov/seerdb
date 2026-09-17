@@ -3060,6 +3060,47 @@ Consequences for seerdb:
   is a heuristic and is written down as one; it becomes unnecessary the day the
   switch above is identified.
 
+### 14.5c A type change to CLOB / BLOB under a cached cursor stays **inline** (#826)
+
+A client caches a statement against the cursor id the server reported and
+re-executes it by that id (§19.x, func 78 / a bare OALL8). If the statement's
+shape changed underneath — the classic case is a view redefined between the two
+executes — the server answers the re-execute with a **fresh TTI_DCB** instead of
+a bare row batch. That much is the ordinary re-describe.
+
+What is not obvious is how the value is then framed. When the column's new type
+is **CLOB or BLOB** and the describe being replaced said **CHAR / VARCHAR2 /
+LONG** (respectively **RAW / LONG RAW**), the server reports the new LOB type in
+the describe but **sends the value inline, as LONG (RAW), in the row itself** —
+no locator, no follow-up TTI_LOBOPS. It is the same framing a define of a LOB as
+string / bytes produces. The reference client depends on it: on reading such a
+describe it rewrites the column's fetch type to LONG (RAW) itself
+(`_adjust_metadata`) and therefore neither sets "requires define" nor issues a
+LOB read. A locator in that row is read as a LONG length and desyncs the stream
+— `DPY-5000: unknown protocol message type 38`.
+
+Two details captured from a live 23ai (`create or replace view` swapping the
+column type, `select * from` it twice on one cursor):
+
+- **The describe still names the LOB type.** The re-describe carries
+  `data_type = 112` (CLOB), `data_length = 4000`, `max_size = 0`. The LONG is
+  the client's own reinterpretation, never something the wire says.
+- **The charset form is the OLD one.** A column that was `NVARCHAR2` and became
+  a `CLOB` arrives as **UTF-16BE**, although the new describe reports
+  `csfrm = 1`; the client took csfrm from the variable it already held. Captured
+  as `07 12 | 00 63 00 6c 00 6f 00 62 00 5f 00 34 00 36 00 30 00 33 00 00` for
+  `'clob_4603'`, against `07 09 | 63 6c 6f 62 5f 34 36 30 30` for the plain
+  VARCHAR2 → CLOB case.
+
+Once a column is being served this way it stays that way: the client's variable
+is LONG from then on, so every later re-execute of that cursor pairs LONG with
+CLOB and inlines again. The reverse pairing (a CLOB replaced by a VARCHAR2) is
+an ordinary re-describe and uses the new type's own framing.
+
+In seerdb this is `inline_long_after_type_change()`, whose mark on a column
+routes it past the locator branch in `_thin_column_value` and out of the
+`oci_lob_contents` queue.
+
 ### 14.6 Persistent-LOB locator field map (Mirror, deadbeef dialect)
 
 The Mirror hands sqlplus a **persistent-LOB locator** in the row value

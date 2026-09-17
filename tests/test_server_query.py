@@ -600,6 +600,72 @@ def test_oson_column_value_rides_inline_and_queues_no_lob() -> None:
     assert encode_long_value_thin(image) in encode_rows([(image,)], [col])
 
 
+def test_a_type_change_to_clob_keeps_the_column_inline() -> None:
+    # Re-executing a cached cursor whose column turned from VARCHAR into a CLOB:
+    # a real server reports the new LOB type but keeps sending the value the way
+    # the client's variable still reads it -- inline as LONG, no locator and no
+    # LOB read (#826). The reverse pairing (CLOB -> VARCHAR) is an ordinary
+    # re-describe and must not be marked.
+    from seerdb.common.tns import inline_long_after_type_change
+
+    was_varchar = ColumnMeta(
+        name=b'VALUE', data_type=TNS_TYPE_VARCHAR, data_length=15, max_size=15
+    )
+    now_clob = ColumnMeta(
+        name=b'VALUE', data_type=TNS_TYPE_CLOB, data_length=4000, max_size=0
+    )
+    (adjusted,) = inline_long_after_type_change([now_clob], [was_varchar])
+    assert adjusted.data_type == TNS_TYPE_CLOB  # the describe still says CLOB
+    assert adjusted.inline_long_csfrm == was_varchar.csfrm
+    # ... and it stays inline on every later re-execute, because the client's
+    # variable is LONG from now on.
+    (again,) = inline_long_after_type_change([now_clob], [adjusted])
+    assert again.inline_long_csfrm == was_varchar.csfrm
+    assert inline_long_after_type_change([was_varchar], [now_clob]) == [was_varchar]
+    # A BLOB pairs with RAW, never with a character type.
+    now_blob = ColumnMeta(
+        name=b'VALUE', data_type=TNS_TYPE_BLOB, data_length=4000, max_size=0
+    )
+    assert inline_long_after_type_change([now_blob], [was_varchar]) == [now_blob]
+    was_raw = ColumnMeta(
+        name=b'VALUE', data_type=TNS_TYPE_RAW, data_length=15, max_size=15
+    )
+    assert (
+        inline_long_after_type_change([now_blob], [was_raw])[0].inline_long_csfrm
+        == was_raw.csfrm
+    )
+
+
+def test_an_inlined_clob_carries_the_previous_charset_form() -> None:
+    # The charset form comes from the describe being REPLACED, not from the CLOB
+    # that replaced it: a column that was NVARCHAR2 keeps arriving as UTF-16BE
+    # even though the new CLOB describes itself as csfrm 1 (#826). Reading the
+    # server's own csfrm handed the client half a character per byte.
+    from seerdb.common.tns import (
+        _CSFRM_NCHAR,
+        encode_long_value_thin,
+        inline_long_after_type_change,
+        oci_lob_contents,
+    )
+
+    was_nvarchar = ColumnMeta(
+        name=b'VALUE',
+        data_type=TNS_TYPE_VARCHAR,
+        data_length=30,
+        max_size=30,
+        csfrm=_CSFRM_NCHAR,
+    )
+    now_clob = ColumnMeta(
+        name=b'VALUE', data_type=TNS_TYPE_CLOB, data_length=4000, max_size=0
+    )
+    (adjusted,) = inline_long_after_type_change([now_clob], [was_nvarchar])
+    assert adjusted.inline_long_csfrm == _CSFRM_NCHAR
+    row = encode_rows([('clob_4603',)], [adjusted])
+    assert encode_long_value_thin('clob_4603'.encode('utf-16-be')) in row
+    # An inlined column queues no LOB content -- the client issues no read for it.
+    assert oci_lob_contents([adjusted], [('clob_4603',)]) == []
+
+
 def test_multiple_columns_and_not_null_roundtrip() -> None:
     payload = encode_describe(
         [
