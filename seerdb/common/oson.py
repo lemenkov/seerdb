@@ -141,6 +141,7 @@ def _oson_str_node(b: bytes) -> bytes:
 
 
 def _oson_scalar_node(value, allow_wide: bool = False) -> bytes:
+    import array
     import datetime
     from decimal import Decimal
 
@@ -153,6 +154,13 @@ def _oson_scalar_node(value, allow_wide: bool = False) -> bytes:
         encode_token_num,
     )
 
+    if isinstance(value, array.array):
+        # A VECTOR rides as the EXTENDED wrapper: 0x7b, sub-tag 0x01, a ub4
+        # length, then the bare vector image (the inverse of the decoder).
+        from seerdb.common.vector import encode_vector
+
+        img = encode_vector(value)
+        return b'\x7b\x01' + len(img).to_bytes(4, 'big') + img
     if value is None:
         return b'\x30'
     if value is True:

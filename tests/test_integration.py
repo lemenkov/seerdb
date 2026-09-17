@@ -20,6 +20,7 @@
 #   SEERDB_TEST_ADMIN_USER      a DBA (e.g. 'system')
 #   SEERDB_TEST_ADMIN_PASSWORD
 
+import array
 import datetime
 import math
 import os
@@ -2719,26 +2720,26 @@ class VectorIntegration(_IntegrationBase):
 
     def test_float32(self):
         got = self._roundtrip('VECTOR(3, FLOAT32)', '[1.5, 2.5, 3.5]')
-        self.assertEqual(got, [1.5, 2.5, 3.5])
+        self.assertEqual(got, array.array('f', [1.5, 2.5, 3.5]))
 
     def test_float32_signed(self):
         got = self._roundtrip('VECTOR(4, FLOAT32)', '[-1, 0, 2.25, -8]')
-        self.assertEqual(got, [-1.0, 0.0, 2.25, -8.0])
+        self.assertEqual(got, array.array('f', [-1.0, 0.0, 2.25, -8.0]))
 
     def test_float64(self):
         got = self._roundtrip('VECTOR(3, FLOAT64)', '[1.5, 2.5, 3.5]')
-        self.assertEqual(got, [1.5, 2.5, 3.5])
+        self.assertEqual(got, array.array('d', [1.5, 2.5, 3.5]))
 
     def test_int8(self):
         got = self._roundtrip('VECTOR(4, INT8)', '[1, -2, 3, -4]')
-        self.assertEqual(got, [1, -2, 3, -4])
+        self.assertEqual(got, array.array('b', [1, -2, 3, -4]))
         self.assertTrue(all(isinstance(v, int) for v in got))
 
     def test_binary(self):
         # BINARY (bit) vectors (#60): the literal gives one packed byte per 8
         # dimensions; seerdb surfaces those packed bytes verbatim.
         got = self._roundtrip('VECTOR(16, BINARY)', '[170, 1]')
-        self.assertEqual(got, [170, 1])
+        self.assertEqual(got, array.array('B', [170, 1]))
         self.assertTrue(all(isinstance(v, int) for v in got))
 
     # Binds (#62): seerdb sends the native binary VECTOR image; covers plain
@@ -2746,7 +2747,7 @@ class VectorIntegration(_IntegrationBase):
     def test_bind_float32_list(self):
         self.assertEqual(
             self._bind_roundtrip('VECTOR(4, FLOAT32)', [-1, 0, 2.25, -8]),
-            [-1.0, 0.0, 2.25, -8.0],
+            array.array('f', [-1.0, 0.0, 2.25, -8.0]),
         )
 
     def test_bind_float32_array(self):
@@ -2756,7 +2757,7 @@ class VectorIntegration(_IntegrationBase):
             self._bind_roundtrip(
                 'VECTOR(3, FLOAT32)', array.array('f', [1.5, 2.5, 3.5])
             ),
-            [1.5, 2.5, 3.5],
+            array.array('f', [1.5, 2.5, 3.5]),
         )
 
     def test_bind_float64_array(self):
@@ -2766,7 +2767,7 @@ class VectorIntegration(_IntegrationBase):
             self._bind_roundtrip(
                 'VECTOR(3, FLOAT64)', array.array('d', [0.1, 2.5, 3.5])
             ),
-            [0.1, 2.5, 3.5],
+            array.array('d', [0.1, 2.5, 3.5]),
         )
 
     def test_bind_int8(self):
@@ -2774,7 +2775,7 @@ class VectorIntegration(_IntegrationBase):
 
         self.assertEqual(
             self._bind_roundtrip('VECTOR(4, INT8)', array.array('b', [1, -2, 3, -4])),
-            [1, -2, 3, -4],
+            array.array('b', [1, -2, 3, -4]),
         )
 
     def test_bind_binary(self):
@@ -2782,14 +2783,14 @@ class VectorIntegration(_IntegrationBase):
 
         self.assertEqual(
             self._bind_roundtrip('VECTOR(16, BINARY)', array.array('B', [170, 1])),
-            [170, 1],
+            array.array('B', [170, 1]),
         )
 
     def test_sparse_roundtrip(self):
         # SPARSE vectors (#68): bind a SparseVector and read it back.
         from seerdb.common.vector import SparseVector
 
-        sv = SparseVector(8, [2, 5], [1.5, 2.5])
+        sv = SparseVector(8, array.array('I', [2, 5]), array.array('f', [1.5, 2.5]))
         self.assertEqual(self._bind_roundtrip('VECTOR(8, FLOAT32, SPARSE)', sv), sv)
 
     def test_description_reports_vector_format_and_dimensions(self):
@@ -3777,14 +3778,16 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                     [array.array('f', [1.5, 2.5, 3.5])],
                 )
                 await Cur.execute('SELECT v FROM PYORACLE_ASYNC_VEC')
-                self.assertEqual(await Cur.fetchone(), ([1.5, 2.5, 3.5],))
+                self.assertEqual(
+                    await Cur.fetchone(), (array.array('f', [1.5, 2.5, 3.5]),)
+                )
                 await self._drop_async(Cur, 'PYORACLE_ASYNC_VEC')
 
     async def test_sparse_vector_bind_roundtrip(self):
         # Async parity for SPARSE vectors (#68).
         from seerdb.common.vector import SparseVector
 
-        sv = SparseVector(8, [2, 5], [1.5, 2.5])
+        sv = SparseVector(8, array.array('I', [2, 5]), array.array('f', [1.5, 2.5]))
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
             async with Conn.cursor() as Cur:
                 await self._drop_async(Cur, 'PYORACLE_ASYNC_SPV')
