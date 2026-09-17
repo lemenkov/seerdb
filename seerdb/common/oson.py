@@ -442,6 +442,29 @@ def _decode_node(
     if tag == 0x38:  # string, ub4 length prefix (>64 KiB, #88)
         length = _uint(seg, off + 1, 4)
         return seg[off + 5 : off + 5 + length].decode('utf-8'), off + 5 + length
+    if tag == 0x3A:  # RAW, ub2 length prefix -> bytes (#826)
+        length = _u16(seg, off + 1)
+        return seg[off + 3 : off + 3 + length], off + 3 + length
+    if tag == 0x3B:  # RAW, ub4 length prefix -> bytes (#826)
+        length = _uint(seg, off + 1, 4)
+        return seg[off + 5 : off + 5 + length], off + 5 + length
+    if 0x40 <= tag <= 0x5F:  # integer, byte length in the low nibble (#826)
+        length = tag & 0x0F
+        return decode_number(seg[off + 1 : off + 1 + length]), off + 1 + length
+    if 0x60 <= tag <= 0x6F:  # number, (low nibble + 1) byte length (#826)
+        length = (tag & 0x0F) + 1
+        return decode_number(seg[off + 1 : off + 1 + length]), off + 1 + length
+    if tag == 0x7B:  # extended-type wrapper: a ub1 sub-tag then the payload (#826)
+        sub = seg[off + 1]
+        if sub == 0x01:  # VECTOR: ub4 length, then a bare vector image
+            from seerdb.common.vector import decode_vector
+
+            length = _uint(seg, off + 2, 4)
+            payload = seg[off + 6 : off + 6 + length]
+            return decode_vector(payload), off + 6 + length
+        raise NotSupportedError(
+            f'unsupported OSON extended sub-tag 0x{sub:02x} at offset {off}'
+        )
     # A container with > 255 entries / field-ids uses ub2 count + ub2 field-ids
     # (tag 0x08 bit); otherwise ub1. The value-offset width is per-image
     # (off_size), but a large container overrides it to ub4 via the tag 0x20 bit

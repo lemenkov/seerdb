@@ -222,6 +222,65 @@ class TestOsonExtendedScalars(unittest.TestCase):
         )
 
 
+class TestOsonBinaryVectorInteger(unittest.TestCase):
+    # OSON node tags seerdb did not decode, which crashed the session decoding a
+    # real 23ai reply (#826). RAW (binary), the EXTENDED/VECTOR wrapper, and the
+    # in-tag integer/number families -- all transcribed from the reference
+    # client's own decoder. The 0x3a and 0x7b fixtures are live images captured
+    # from 23ai (JSON_SCALAR / JSON_OBJECT), verified against the reference
+    # client's decoded value.
+    def test_raw_binary_ub2(self):
+        # JSON_SCALAR(HEXTORAW('DEADBEEF')): tag 0x3a, ub2 length, then the bytes.
+        self.assertEqual(
+            decode_oson(bytes.fromhex('ff4a5a01001600073a0004deadbeef')),
+            b'\xde\xad\xbe\xef',
+        )
+
+    def test_raw_binary_ub4(self):
+        # tag 0x3b: RAW with a ub4 length (bare-scalar frame, exercises the path).
+        self.assertEqual(
+            decode_oson(bytes.fromhex('ff4a5a01001600073b00000002aabb')), b'\xaa\xbb'
+        )
+
+    def test_vector_extended(self):
+        # JSON_SCALAR(TO_VECTOR('[1.5, 2.5, 3.5]')): tag 0x7b, sub-tag 0x01
+        # (VECTOR), ub4 length, then a bare vector image.
+        self.assertEqual(
+            decode_oson(
+                bytes.fromhex(
+                    'ff4a5a01001600237b010000001ddb0000160200000003c012388a'
+                    'c0059c28bfc00000c0200000c0600000'
+                )
+            ),
+            [1.5, 2.5, 3.5],
+        )
+
+    def test_object_with_raw_int_number(self):
+        # JSON_OBJECT('r' VALUE HEXTORAW('AABB'), 'i' VALUE 7, 'n' VALUE 3.14):
+        # an object mixing a RAW (0x3a) with integer/number scalars.
+        self.assertEqual(
+            decode_oson(
+                bytes.fromhex(
+                    'ff4a5a0131060300060000001700001531c400000004000201720169'
+                    '016e8403010302000b001000133a0002aabb21c10822c1040f'
+                )
+            ),
+            {'r': b'\xaa\xbb', 'i': 7, 'n': Decimal('3.14')},
+        )
+
+    def test_integer_low_nibble_length(self):
+        # tag 0x40-0x5F: integer whose byte length is the low nibble (here 2),
+        # then an Oracle number (c1 02 = 1). The server emits this form for some
+        # integers; JSON_SCALAR uses the 0x2x form, so this is a hand-framed image
+        # exercising the branch as the reference decoder reads it.
+        self.assertEqual(decode_oson(bytes.fromhex('ff4a5a010016000342c102')), 1)
+
+    def test_number_low_nibble_length(self):
+        # tag 0x60-0x6F: number whose length is (low nibble + 1) bytes (here 2),
+        # then an Oracle number (c1 08 = 7).
+        self.assertEqual(decode_oson(bytes.fromhex('ff4a5a010016000361c108')), 7)
+
+
 class TestOsonUb4Offsets(unittest.TestCase):
     # ub4 container value-offsets (#69): oracledb-produced images clear the
     # compact-offset flag (flags 0x2102) and use 4-byte offsets; the ub2 reader
