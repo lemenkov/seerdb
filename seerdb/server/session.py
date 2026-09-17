@@ -90,6 +90,7 @@ from seerdb.common.tns import (
     encode_status_with_rowcounts,
     encode_token_result,
     encode_version_banner_oci,
+    inline_long_after_type_change,
     is_reexecute_oci,
     is_version_call_oci,
     max_string_size,
@@ -1091,14 +1092,26 @@ def _defers_inline_rows(columns: list[ColumnMeta]) -> bool:
     # "requires define / no prefetch" and stops expecting inline rows (#887).
     return any(
         col.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB, TNS_TYPE_JSON, TNS_TYPE_VECTOR)
+        and col.inline_long_csfrm is None
         for col in columns
     )
+
+
+def _as_described(columns: list[ColumnMeta]) -> list[ColumnMeta]:
+    # The columns as the describe puts them on the wire. inline_long_csfrm is a
+    # decision about how this reply serves a value, not part of the metadata the
+    # client is told, so two describes that differ only in it are the same.
+    return [replace(col, inline_long_csfrm=None) for col in columns]
 
 
 def _is_lob_result(columns: list[ColumnMeta]) -> bool:
     # A result that carries a CLOB / BLOB column, whose locator row is fetched with
     # a non-terminator status and whose content follows over TTI_LOBOPS (#405).
-    return any(col.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB) for col in columns)
+    return any(
+        col.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB)
+        and col.inline_long_csfrm is None
+        for col in columns
+    )
 
 
 def _serve_oci_long_row(
@@ -1594,15 +1607,24 @@ class _Cursors:
         # fresh describe, the way a real server re-describes an invalidated cursor.
         self._describe: dict[int, list[ColumnMeta]] = {}
 
-    def open_query(self, sql: str, bind_types: Sequence = ()) -> int:
+    def open_query(
+        self,
+        sql: str,
+        bind_types: Sequence = (),
+        columns: Sequence[ColumnMeta] = (),
+    ) -> int:
         # A cursor id for a query, minted even when the whole result fit and
         # there is nothing parked. The client caches the id against the statement
         # and re-executes by it, so every query needs one of its own -- sharing
         # the captured 1 told every query it was the same cursor (#840). The SQL
-        # is kept because re-executing by id has to know what to run (#833).
+        # is kept because re-executing by id has to know what to run (#833), and
+        # the describe because a re-execute has to tell whether the statement's
+        # shape changed underneath the cached cursor (#826) -- a fully-delivered
+        # result parks no rows, so this is the only record of what it looked like.
         cursor_id = self._next
         self._next += 1
         self._query[cursor_id] = (sql, list(bind_types))
+        self._describe[cursor_id] = list(columns)
         return cursor_id
 
     def query_sql(self, cursor_id: int) -> str | None:
@@ -2206,7 +2228,9 @@ def _answer_query(
                 response = encode_query_response(
                     result.columns,
                     first,
-                    cursor_id=cursors.open_query(sql, request.bind_types),
+                    cursor_id=cursors.open_query(
+                        sql, request.bind_types, result.columns
+                    ),
                 )
         else:
             # DML / DDL success. Hand back a server cursor id (reused on a cached
@@ -2343,7 +2367,13 @@ def _answer_reexecute(
             _backend_fault_error(exc),
         )
         return []
-    columns = list(result.columns or [])
+    # A column whose type changed to CLOB / BLOB under this cached cursor keeps
+    # being served the way the client's variable still reads it -- inline as LONG
+    # (RAW) rather than as a locator (#826). Apply that before anything reads the
+    # columns, so the row encoder and the LOB queue agree on which cells are
+    # inline. Read the prior describe first: reopen() below replaces it.
+    previous = cursors.describe_columns(request.cursor)
+    columns = inline_long_after_type_change(list(result.columns or []), previous)
     rows = list(result.rows)
     lobs = oci_lob_contents(columns, rows) if columns else []
     # The request's iteration count is the client's prefetch size, so it is also
@@ -2355,9 +2385,10 @@ def _answer_reexecute(
     # first execute. But if the statement's column shape changed underneath the
     # cached cursor (a view replaced with different column types, #826), the
     # client would decode these rows with the stale describe; send a fresh one,
-    # the way a real server re-describes an invalidated cursor. Read the prior
-    # describe before reopen() records the new one.
-    redescribe = columns != cursors.describe_columns(request.cursor)
+    # the way a real server re-describes an invalidated cursor. Compare on the
+    # describe as the wire carries it: inline_long_csfrm is a serving decision
+    # this reply just made, not a shape change the client needs telling about.
+    redescribe = _as_described(columns) != _as_described(previous)
     cursors.reopen(request.cursor, columns, remaining, sql=sql)
     encode = encode_query_response if redescribe else encode_fetch_response
     stream.write_packet(
