@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import array
+
 import pytest
 
 from seerdb.common.datatypes import IntervalYM, Var
@@ -1886,8 +1888,9 @@ def test_oci_lob_contents_encodes_a_vector_cell_by_element_format() -> None:
     image, is_clob = got[0]
     assert is_clob is False
     decoded = decode_vector(image)
-    assert isinstance(decoded, list) and decoded == [1, -2, 3, -4]
-    assert all(isinstance(v, int) for v in decoded)
+    # decode_vector reports the element format in the array's typecode ('b' is
+    # INT8), so the cell keeps the width it was declared with (#826).
+    assert decoded == array.array('b', [1, -2, 3, -4])
 
 
 def test_encode_value_emits_a_thin_lob_locator_for_a_vector_column() -> None:
