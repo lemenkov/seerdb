@@ -695,6 +695,57 @@ def test_an_inlined_clob_carries_the_previous_charset_form() -> None:
     assert oci_lob_contents([adjusted], [('clob_4603',)]) == []
 
 
+def test_a_define_execute_carries_one_oac_per_column() -> None:
+    # A client fetching a LOB as string / bytes reads the describe, then
+    # re-executes with the DEFINE option and one OAC per column saying what it
+    # wants. Those OACs sit exactly where a bind's would and share its layout, so
+    # the bind decoder reads them -- the Mirror used to skip the count and never
+    # look (#826).
+    from seerdb.common.tns import _DECODE_FIELD_VERSION
+    from seerdb.common.tns_consts import TNS_TYPE_LONG
+
+    # Byte-for-byte off a live capture (fv24): cursor 2, no SQL, no binds, one
+    # define, options 0x8010 (NOT_PLSQL | DEFINE). The define asks for LONG (8)
+    # in the database charset form -- this is an outputtypehandler fetching a
+    # CLOB column as a string.
+    captured = bytes.fromhex(
+        '035e06000280100102000001010d0000000102047fffffff0000000000000001'
+        '0101000001000000000000000000000000000000000102000000000001010000'
+        '00000008010000047fffffff00000000020369010000'
+    )
+    token = _DECODE_FIELD_VERSION.set(24)
+    try:
+        request = parse_exec(captured)
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+    assert (request.sql, request.cursor, request.bind_count) == ('', 2, 0)
+    assert request.define_types == [(TNS_TYPE_LONG, 1)]
+
+
+def test_a_define_of_a_lob_as_a_string_keeps_the_column_inline() -> None:
+    # Given LONG (RAW) in a define, a real server sends the LOB's value inline in
+    # the row rather than a locator, which is why such a client issues no LOB
+    # read at all. A define that does not re-type the column leaves it alone
+    # (#826).
+    from seerdb.common.tns import inline_long_for_defines
+    from seerdb.common.tns_consts import TNS_TYPE_LONG, TNS_TYPE_LONGRAW
+
+    clob = ColumnMeta(name=b'C', data_type=TNS_TYPE_CLOB, data_length=4000, max_size=0)
+    blob = ColumnMeta(name=b'B', data_type=TNS_TYPE_BLOB, data_length=4000, max_size=0)
+    marked = inline_long_for_defines(
+        [clob, blob], [(TNS_TYPE_LONG, 1), (TNS_TYPE_LONGRAW, 0)]
+    )
+    assert [col.inline_long_csfrm for col in marked] == [1, 0]
+    # Defined as the LOBs they are: nothing changes, the locators stand.
+    assert inline_long_for_defines(
+        [clob, blob], [(TNS_TYPE_CLOB, 1), (TNS_TYPE_BLOB, 0)]
+    ) == [clob, blob]
+    # A CLOB pairs with the character types only, never with LONG RAW.
+    assert inline_long_for_defines([clob], [(TNS_TYPE_LONGRAW, 0)]) == [clob]
+    # An execute that carries no defines leaves every column alone.
+    assert inline_long_for_defines([clob, blob], []) == [clob, blob]
+
+
 def test_multiple_columns_and_not_null_roundtrip() -> None:
     payload = encode_describe(
         [

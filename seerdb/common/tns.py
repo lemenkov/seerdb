@@ -4,6 +4,7 @@
 import base64
 import datetime
 import platform
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -396,6 +397,11 @@ class ExecRequest:
     # A RETURNING statement whose binds are all clause-filled sends no RXD row,
     # so bind_rows is empty; this still says how many times it runs (#33).
     iterations: int = 1
+    # Per-column (tns_type, csfrm) from the define OACs, in column order — what
+    # the client's own fetch variables are, sent on the re-execute that applies a
+    # define (the DEFINE execute option). Empty on every other execute; a define
+    # execute carries no binds, so this and ``bind_types`` never both fill (#826).
+    define_types: list = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1155,24 +1161,52 @@ def inline_long_after_type_change(
     read. Mark those columns; :func:`_thin_column_value` then serves them inline
     and :func:`oci_lob_contents` queues nothing for them (#826).
     """
-    if not previous:
+    # The charset form the client's variable holds, which for a column already
+    # being served inline is the one it was given then -- not the LOB describe
+    # that replaced it.
+    return _mark_inline_long(
+        columns,
+        [
+            (
+                _effective_describe_type(col),
+                col.csfrm if col.inline_long_csfrm is None else col.inline_long_csfrm,
+            )
+            for col in previous
+        ],
+    )
+
+
+def inline_long_for_defines(
+    columns: list[ColumnMeta], defines: Sequence[tuple[int, int]]
+) -> list[ColumnMeta]:
+    """``columns``, with every column the client's own define asks for inline.
+
+    A client that fetches a LOB as string / bytes -- an ``outputtypehandler``
+    returning a VARCHAR / RAW variable for a CLOB / BLOB column -- reads the
+    describe, then re-executes with the DEFINE option and one OAC per column
+    saying what it wants. Given LONG (RAW) there, a real server sends the value
+    inline in the row instead of a locator, and the client issues no LOB read.
+    ``defines`` is ``ExecRequest.define_types``, the ``(tns_type, csfrm)`` of each
+    of those OACs (#826).
+    """
+    return _mark_inline_long(columns, defines)
+
+
+def _mark_inline_long(
+    columns: list[ColumnMeta], wanted: Sequence[tuple[int, int]]
+) -> list[ColumnMeta]:
+    # Mark each LOB column the client is going to read as LONG (RAW), carrying the
+    # charset form its bytes must use. ``wanted`` is the (type, csfrm) the client
+    # holds for each column, however it came to hold it.
+    if not wanted:
         return columns
     out = list(columns)
     for i, col in enumerate(columns):
-        if i >= len(previous):
+        if i >= len(wanted):
             break
         allowed = _INLINE_LONG_FROM.get(col.data_type)
-        if allowed and _effective_describe_type(previous[i]) in allowed:
-            # The charset form the client's variable holds, which for a column
-            # already being served inline is the one it was given then -- not the
-            # LOB describe that replaced it.
-            prior = previous[i]
-            csfrm = (
-                prior.csfrm
-                if prior.inline_long_csfrm is None
-                else prior.inline_long_csfrm
-            )
-            out[i] = replace(col, inline_long_csfrm=csfrm)
+        if allowed and wanted[i][0] in allowed:
+            out[i] = replace(col, inline_long_csfrm=wanted[i][1])
     return out
 
 
@@ -1611,6 +1645,10 @@ _SERVER_VERSION_SLOT = 5
 # statement (set_opts encodes it as Param * 256 into the options word).
 _EXEC_OPTION_COMMIT = 0x100
 
+# The DEFINE bit in the same word: this execute applies the client's own fetch
+# variables and carries one define OAC per column in place of any binds (#826).
+_EXEC_OPTION_DEFINE = 0x10
+
 
 # A TTI_LOBOPS READ request carries the slice sqlplus wants: a 1-based source
 # offset and an amount, both counts (characters for a CLOB, bytes for a BLOB),
@@ -1832,7 +1870,7 @@ def parse_exec(
     bind_count, rest = decode_ub4(rest)
     rest = rest[5:]  # five reserved bytes
     _def_flag, rest = rest[0], rest[1:]
-    _def_len, rest = decode_ub4(rest)
+    define_count, rest = decode_ub4(rest)
 
     field_version = _DECODE_FIELD_VERSION.get()
     if field_version >= FIELD_VERSION_12_2:
@@ -1879,6 +1917,23 @@ def parse_exec(
     # at all and answered with a row count (#826).
     is_query = bool(al8[7]) if len(al8) > 7 else False
     iterations = 1 if is_query else (al8[1] if len(al8) > 1 else 1)
+
+    # A define execute (the DEFINE option) carries one OAC per column in place of
+    # the binds -- the client's own fetch variables, telling the server what it
+    # wants each column AS. The OACs sit exactly where a bind's would, and have
+    # the same layout, so the bind decoder reads them (#826).
+    define_types: list = []
+    if options & _EXEC_OPTION_DEFINE and define_count:
+        defines_rest = after
+        for _ in range(define_count):
+            data_type, _maxlen, _scale, _charset, csfrm, _toid, defines_rest = (
+                decode_oac_fields(defines_rest)
+            )
+            if field_version >= FIELD_VERSION_12_2:
+                # The 12.2+ OAC appends an oaccolid the shared decoder stops short
+                # of -- consume it so the next define aligns.
+                _, defines_rest = decode_ub4(defines_rest)
+            define_types.append((data_type, csfrm))
 
     binds: list = []
     bind_rows: list = []
@@ -1984,6 +2039,7 @@ def parse_exec(
         arraydmlrowcounts=arraydmlrowcounts,
         return_binds=return_binds,
         iterations=iterations,
+        define_types=define_types,
     )
 
 

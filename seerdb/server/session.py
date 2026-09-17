@@ -91,6 +91,7 @@ from seerdb.common.tns import (
     encode_token_result,
     encode_version_banner_oci,
     inline_long_after_type_change,
+    inline_long_for_defines,
     is_reexecute_oci,
     is_version_call_oci,
     max_string_size,
@@ -2070,6 +2071,11 @@ def _answer_query(
         )
         count = request.fetch if request.fetch > 0 else _ALL_ROWS
         columns_out, batch = cursors.take(reused_id, count)
+        # Honour what the define actually asked for. A client fetching a LOB as
+        # string / bytes defines the column as LONG (RAW), and a real server then
+        # sends the value inline in the row instead of a locator -- which is why
+        # such a client issues no TTI_LOBOPS read for it (#826).
+        columns_out = inline_long_for_defines(columns_out, request.define_types)
         # Queue the content of the LOB cells in the rows THIS reply delivers.
         # Returning the function-local (empty) list here wiped the queue the
         # opening execute had built, so every follow-up TTI_LOBOPS read found
