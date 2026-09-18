@@ -3825,3 +3825,37 @@ def test_a_temp_lob_read_echoes_the_clients_own_locator() -> None:
     assert b'ABCDE' in mine
     # The default keeps the column placeholder, so the column path is unchanged.
     assert locator not in encode_lob_read_response_thin(b'ABCDE')
+
+
+def test_implicit_results_round_trip_through_the_client_decoder() -> None:
+    # A PL/SQL block that called DBMS_SQL.RETURN_RESULT hands its result sets back
+    # as a TTI_IRD block naming one server cursor per set, which the client then
+    # fetches like a REF CURSOR (#121/#826). The Mirror had no encoder for it at
+    # all, so getimplicitresults() found nothing and raised DPY-1004.
+    from seerdb.common.tns import decode_token_implicit, encode_implicit_results
+    from seerdb.common.tns_consts import TTI_STA
+
+    columns = [
+        ColumnMeta(
+            name=b'INTCOL', data_type=TNS_TYPE_NUMBER, data_length=22, max_size=0
+        )
+    ]
+    payload = encode_implicit_results([(columns, 7), (columns, 8)]) + bytes([TTI_STA])
+    (_done, acc) = decode_token_implicit(payload, (0, [], []))
+    (record,) = acc[2]
+    results = record['implicit_results']
+    assert [r['cursor_id'] for r in results] == [7, 8]
+    assert [c['column_name'] for c in results[0]['row_format']] == [b'INTCOL']
+
+
+def test_no_implicit_results_is_an_empty_block_not_a_missing_one() -> None:
+    # A block that returned none still decodes -- a zero count, not an absent
+    # token -- so the caller can emit it unconditionally if it wants to.
+    from seerdb.common.tns import decode_token_implicit, encode_implicit_results
+    from seerdb.common.tns_consts import TTI_STA
+
+    (_done, acc) = decode_token_implicit(
+        encode_implicit_results([]) + bytes([TTI_STA]), (0, [], [])
+    )
+    (record,) = acc[2]
+    assert record['implicit_results'] == []

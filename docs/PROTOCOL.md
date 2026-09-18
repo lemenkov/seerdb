@@ -5083,6 +5083,23 @@ describe body is shared with the `TTI_DCB` decoder (`_decode_describe_body`).
 Sync + async; verified on 21c / 23ai (multiple result sets, varying shapes);
 12c+ only (11g lacks `DBMS_SQL.RETURN_RESULT`).
 
+### 23.1 Serving it (#826)
+
+A server owes the same block, and the ordering is what matters: **each result's
+rows have to be parked on the cursor id it names before the block's reply goes
+out**, because the client fetches them afterwards exactly as it fetches a REF
+CURSOR. The reply is the `TTI_IRD` block then a plain success status — the block
+itself returned neither rows nor a row count.
+
+A block that returned no results is not a special case: the token still decodes,
+with a zero count.
+
+A relaying server gets these from its backend however that backend surfaces them
+— seerdb's own client surfaces them PEP 249 style, so the passthrough drains
+`nextset()` until it returns `None`. That call is **optional** on a DB-API
+cursor, so it is probed for rather than assumed: a statement that returned
+nothing must not fail because the cursor has no `nextset`.
+
 ## 24. XMLType (#124)
 
 An XMLType column is **TNS type 109 with no user object type** — the same row
