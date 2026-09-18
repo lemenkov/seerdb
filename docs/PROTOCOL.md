@@ -3183,6 +3183,27 @@ In seerdb the define OACs are `ExecRequest.define_types`, and
 `inline_long_for_defines()` applies them to the parked columns before the reply
 is built.
 
+### 14.5d-bis A define **stands for the life of the cursor** (#826)
+
+§14.5d covers the round-trip that *carries* a define. What it does not say is how
+long one lasts: a client sends a define **once**, on the round-trip after the
+first describe, and every later execute of that cursor carries none at all.
+
+So a server has to remember it. Forgetting reverts the column to LOB-class
+handling on the re-execute — another describe the client is not expecting, then a
+locator for a column it is still reading as a string or bytes — and the row
+stream desyncs (`DPY-5000 ... unknown protocol message type`). Measured against a
+live 23ai: the re-execute reply is rows alone, no describe, value inline, exactly
+as the define asked.
+
+There is a second half to this, and it is easy to miss. A re-run of a cached
+query **mints a fresh cursor id** and reports that one, so the defines standing
+on the id the client re-executed have to travel to it. Without that the failure
+appears on the *third* execute of a statement rather than the second, which makes
+it look like whatever else changed on that call — in oracledb's own suite, a bind
+whose type went from `str` to `int`, so the test is named "changing bind type
+with define needed" and the bind type has nothing to do with it.
+
 ### 14.5e JSON and VECTOR are **prefetched into the row** (#887, #826)
 
 A native JSON or VECTOR column is LOB-class in the describe but is never fetched

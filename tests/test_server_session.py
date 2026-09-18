@@ -2107,3 +2107,43 @@ def test_backend_fault_error_reports_ora600_without_recursing() -> None:
     fault = _backend_fault_error(ValueError('encoded number data too long'))
     assert b'ORA-00600' in fault
     assert b'encoded number data too long' in fault
+
+
+def test_a_define_stands_for_the_life_of_the_cursor() -> None:
+    # A client applies a define ONCE, on the round-trip that follows the first
+    # describe, and it then stands: every later execute of that cursor carries
+    # none. A server that forgets reverts to LOB-class handling -- another
+    # describe the client is not expecting, then a locator for a column it is
+    # reading as a string or bytes, and the row stream desyncs (#826).
+    from seerdb.common.tns_consts import TNS_TYPE_LONG
+    from seerdb.server.session import _Cursors
+
+    cursors = _Cursors()
+    cursor_id = cursors.open_query('select ClobCol from TestClobs')
+    assert cursors.defines(cursor_id) == []
+    cursors.set_defines(cursor_id, [(TNS_TYPE_LONG, 1)])
+    assert cursors.defines(cursor_id) == [(TNS_TYPE_LONG, 1)]
+    # An execute carrying no defines is an ordinary call, NOT the client
+    # withdrawing them.
+    cursors.set_defines(cursor_id, [])
+    assert cursors.defines(cursor_id) == [(TNS_TYPE_LONG, 1)]
+    # An id nobody defined has none, rather than inheriting a neighbour's.
+    assert cursors.defines(cursor_id + 1) == []
+
+
+def test_defines_travel_to_the_id_a_re_run_mints() -> None:
+    # Re-running a cached query mints a FRESH cursor id and reports that, so the
+    # defines standing on the id the client re-executed have to travel with it.
+    # Without that the next re-execute found none and desynced on the third
+    # execute of a statement, not the second -- which is what made it look like a
+    # bind-type problem rather than a lost define (#826).
+    from seerdb.common.tns_consts import TNS_TYPE_LONG
+    from seerdb.server.session import _Cursors
+
+    cursors = _Cursors()
+    first = cursors.open_query('select ClobCol from TestClobs')
+    cursors.set_defines(first, [(TNS_TYPE_LONG, 1)])
+    second = cursors.open_query('select ClobCol from TestClobs')
+    assert second != first
+    cursors.set_defines(second, cursors.defines(first))
+    assert cursors.defines(second) == [(TNS_TYPE_LONG, 1)]

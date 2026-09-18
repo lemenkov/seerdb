@@ -1610,6 +1610,23 @@ class _Cursors:
         # columns against this decides whether the re-execute reply must carry a
         # fresh describe, the way a real server re-describes an invalidated cursor.
         self._describe: dict[int, list[ColumnMeta]] = {}
+        # The defines a client applied to a cursor, by cursor id (#826). A define
+        # is applied ONCE, on the round-trip that follows the first describe, and
+        # then stands for the life of the cursor -- a re-execute carries none, so
+        # without remembering them the Mirror reverted to locators and desynced a
+        # client that was still reading the column as a string / bytes.
+        self._defines: dict[int, list[tuple[int, int]]] = {}
+
+    def set_defines(self, cursor_id: int, define_types: Sequence) -> None:
+        """Remember the defines applied to a cursor, if this execute carried
+        any. An execute with no defines leaves the cursor's alone -- it is not a
+        client withdrawing them, just an ordinary call."""
+        if define_types:
+            self._defines[cursor_id] = list(define_types)
+
+    def defines(self, cursor_id: int) -> list[tuple[int, int]]:
+        """The defines standing on a cursor, empty if it has none."""
+        return self._defines.get(cursor_id, [])
 
     def open_query(
         self,
@@ -2077,8 +2094,11 @@ def _answer_query(
         # Honour what the define actually asked for. A client fetching a LOB as
         # string / bytes defines the column as LONG (RAW), and a real server then
         # sends the value inline in the row instead of a locator -- which is why
-        # such a client issues no TTI_LOBOPS read for it (#826).
-        columns_out = inline_long_for_defines(columns_out, request.define_types)
+        # such a client issues no TTI_LOBOPS read for it (#826). The define is
+        # applied once and then STANDS, so remember it against the cursor: a
+        # re-execute carries none and would otherwise revert to locators.
+        cursors.set_defines(reused_id, request.define_types)
+        columns_out = inline_long_for_defines(columns_out, cursors.defines(reused_id))
         # Queue the content of the LOB cells in the rows THIS reply delivers.
         # Returning the function-local (empty) list here wiped the queue the
         # opening execute had built, so every follow-up TTI_LOBOPS read found
@@ -2202,17 +2222,26 @@ def _answer_query(
         # describe — the client expects one or the other, not both.
         elif result.columns:
             rows = list(result.rows)
+            # A define the client applied to this cursor still stands. It is sent
+            # ONCE, on the round-trip after the first describe, and a re-execute
+            # carries none -- so a re-run reverted to LOB-class handling: another
+            # describe the client was not expecting, then a locator for a column
+            # it reads as bytes. With the defines applied the columns are no
+            # longer LOB-class to this client, which also stops the deferral
+            # below (#826).
+            standing_defines = cursors.defines(reused_id)
+            columns = inline_long_for_defines(list(result.columns), standing_defines)
             # A LOB result's rows carry locators; the client reads their content
             # row-major over TTI_LOBOPS, so queue every cell's content in that
             # order for the loop to drain (#413).
-            lobs = oci_lob_contents(result.columns, rows)
+            lobs = oci_lob_contents(columns, rows)
             # Object columns queue their embedded LOB attributes separately, on a
             # persistent queue routed by a distinct locator: populating an object
             # type after the describe runs get_type_shape queries that reset the
             # transient LOB queue before the client issues its reads (#888). A
             # metadata query carries no object LOBs, so it leaves the queue as-is.
             if object_lobs is not None:
-                these_object_lobs = object_lob_contents(result.columns, rows)
+                these_object_lobs = object_lob_contents(columns, rows)
                 if these_object_lobs:
                     object_lobs[:] = these_object_lobs
             # Send the first `fetch` rows now; park any remainder on a cursor for
@@ -2220,7 +2249,7 @@ def _answer_query(
             # delivered whole, ending with ORA-01403; a zero prefetch sends none
             # of it inline (#856).
             batch_size = _prefetch_batch(request.fetch, len(rows))
-            if _defers_inline_rows(result.columns):
+            if _defers_inline_rows(columns):
                 # A result carrying a LOB-class column (CLOB / BLOB / JSON /
                 # VECTOR) delivers NO rows in the execute reply, whatever the
                 # client's prefetch asked for: the reference client marks such a
@@ -2232,23 +2261,24 @@ def _answer_query(
             first, remaining = rows[:batch_size], rows[batch_size:]
             if remaining:
                 cursor_id = cursors.open(
-                    result.columns, remaining, sql=sql, bind_types=request.bind_types
+                    columns, remaining, sql=sql, bind_types=request.bind_types
                 )
+                # A re-run mints a FRESH id, so the defines standing on the one
+                # the client re-executed have to travel with it -- otherwise the
+                # next re-execute finds none and reverts to LOB-class handling
+                # (#826).
+                cursors.set_defines(cursor_id, standing_defines)
                 response = encode_query_response(
-                    result.columns, first, cursor_id=cursor_id, more=True
+                    columns, first, cursor_id=cursor_id, more=True
                 )
             else:
                 # Mint an id even though nothing is parked: the terminator
                 # reports it and the client caches it against this statement, so
                 # a query with no leftover rows still needs an identity of its
                 # own (#840).
-                response = encode_query_response(
-                    result.columns,
-                    first,
-                    cursor_id=cursors.open_query(
-                        sql, request.bind_types, result.columns
-                    ),
-                )
+                cursor_id = cursors.open_query(sql, request.bind_types, columns)
+                cursors.set_defines(cursor_id, standing_defines)
+                response = encode_query_response(columns, first, cursor_id=cursor_id)
         else:
             # DML / DDL success. Hand back a server cursor id (reused on a cached
             # re-execute, freshly minted otherwise) so the client's cursor cache
@@ -2418,6 +2448,11 @@ def _answer_reexecute(
     # inline. Read the prior describe first: reopen() below replaces it.
     previous = cursors.describe_columns(request.cursor)
     columns = inline_long_after_type_change(list(result.columns or []), previous)
+    # A define the client applied to this cursor earlier still stands: it is sent
+    # once, on the round-trip after the first describe, and a re-execute carries
+    # none. Reverting to locators here desynced a client that was still reading
+    # the column as a string / bytes (#826).
+    columns = inline_long_for_defines(columns, cursors.defines(request.cursor))
     rows = list(result.rows)
     lobs = oci_lob_contents(columns, rows) if columns else []
     # The request's iteration count is the client's prefetch size, so it is also
