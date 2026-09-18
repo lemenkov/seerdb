@@ -75,6 +75,7 @@ from seerdb.common.tns import (
     encode_lob_read_response_oci,
     encode_lob_read_response_thin,
     encode_lobops_ack,
+    encode_lobops_length,
     encode_logoff_status_oci,
     encode_logoff_status_thin,
     encode_long_fetch_row_oci,
@@ -1827,7 +1828,33 @@ class _TempLobs:
         self._is_blob.pop(bytes(locator), None)
 
     def content(self, locator: bytes) -> bytes:
-        return bytes(self._buffers.get(bytes(locator), b''))
+        key = self.resolve(locator)
+        return bytes(self._buffers.get(key, b'')) if key else b''
+
+    def truncate(self, locator: bytes, size: int) -> None:
+        """Cut the temp LOB down to ``size`` bytes (TRIM, #826)."""
+        key = self.resolve(locator)
+        if key is not None:
+            del self._buffers[key][size:]
+
+    def resolve(self, locator: bytes) -> bytes | None:
+        """The canonical key for ``locator``, or None if it is not a temp LOB.
+
+        A temp-LOB op carries the locator ub2-length-prefixed, but a READ is
+        parsed by the declared source length and keeps that prefix, so the same
+        LOB arrives under two spellings. Try both rather than miss one (#826).
+        """
+        raw = bytes(locator)
+        if raw in self._buffers:
+            return raw
+        stripped = raw[2:]
+        return stripped if stripped in self._buffers else None
+
+    def is_blob(self, locator: bytes) -> bool:
+        """Whether this temp LOB is a BLOB. Unknown locators read as BLOB, which
+        counts bytes -- the safer guess for something the Mirror did not mint."""
+        key = self.resolve(locator)
+        return self._is_blob.get(key, True) if key else True
 
     def contents_map(self) -> dict[bytes, tuple[object, bool]]:
         # Each live temp LOB's content as (value, is_clob) for an object bind to
@@ -1879,6 +1906,25 @@ def _answer_lobops(
         temp_lobs.free(request.locator)
         stream.write_packet(TNS_DATA, encode_lobops_ack(request.locator))
         return lobs, current_lob, current_object_lob
+    if request.kind == 'trim':
+        # Truncate the temp LOB to the requested length and report the new one.
+        # A CLOB counts CHARACTERS and its buffer is UTF-16BE, so two bytes each.
+        unit = 1 if temp_lobs.is_blob(request.locator) else 2
+        temp_lobs.truncate(request.locator, request.amount * unit)
+        stream.write_packet(
+            TNS_DATA, encode_lobops_length(request.locator, request.amount)
+        )
+        return lobs, current_lob, current_object_lob
+    if request.kind == 'get_length':
+        # `lob.size()`. A temp LOB the client created is measured from what it
+        # has streamed in; a CLOB counts CHARACTERS, and its buffer holds
+        # UTF-16BE, so two bytes per character (#826).
+        content = temp_lobs.content(request.locator)
+        unit = 1 if temp_lobs.is_blob(request.locator) else 2
+        stream.write_packet(
+            TNS_DATA, encode_lobops_length(request.locator, len(content) // unit)
+        )
+        return lobs, current_lob, current_object_lob
     if request.kind == 'ack':
         # OPEN / CLOSE / TRIM / GET_CHUNK_SIZE: acknowledge with the content-free
         # reply the client accepts. The value-returning form (a real chunk size,
@@ -1892,6 +1938,30 @@ def _answer_lobops(
     # LOB; later offsets continue the current one -- the same rule the OCI loop
     # follows. A LOB attribute of an object rides a distinct locator and drains
     # the persistent object queue instead of the column one (#888).
+    temp_key = temp_lobs.resolve(request.locator)
+    if temp_key is not None:
+        # A READ of a temp LOB the client created itself. Its content is what the
+        # client streamed in, not an entry on the column queue -- serving that
+        # queue here handed back another row's LOB, or nothing at all. The reply
+        # must echo the client's OWN locator, not the column placeholder (#826).
+        content = temp_lobs.content(temp_key)
+        is_clob = not temp_lobs.is_blob(temp_key)
+        unit = 2 if is_clob else 1
+        total = len(content) // unit
+        start = max(request.offset - 1, 0)
+        count = (
+            total - start if request.amount <= 0 else min(request.amount, total - start)
+        )
+        count = max(count, 0)
+        stream.write_packet(
+            TNS_DATA,
+            encode_lob_read_response_thin(
+                content[start * unit : (start + count) * unit],
+                is_clob=is_clob,
+                locator=request.locator,
+            ),
+        )
+        return lobs, current_lob, current_object_lob
     is_object = request.locator == _THIN_OBJ_LOB_LOCATOR
     queue = (object_lobs if object_lobs is not None else []) if is_object else lobs
     resume = current_object_lob if is_object else current_lob

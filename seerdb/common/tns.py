@@ -2173,10 +2173,13 @@ def parse_lobops_read(body: bytes) -> tuple[int, int]:
     return max(offset, 1), amount
 
 
-def encode_lob_read_response_thin(content: bytes, *, is_clob: bool = False) -> bytes:
+def encode_lob_read_response_thin(
+    content: bytes, *, is_clob: bool = False, locator: bytes | None = None
+) -> bytes:
     """The thin TTI_LOBOPS READ reply (#413): the whole LOB content as LOB_DATA,
     the return-parameter block naming the amount read, then a success OER.
-    ``content`` is UTF-16BE for a CLOB, raw for a BLOB.
+    ``content`` is UTF-16BE for a CLOB, raw for a BLOB. ``locator`` is echoed
+    back verbatim and defaults to the Mirror's column placeholder.
 
     The **amount** is in the LOB's own units -- characters for a CLOB, bytes for
     a BLOB -- which is why it cannot be inferred from the content length. Without
@@ -2185,12 +2188,18 @@ def encode_lob_read_response_thin(content: bytes, *, is_clob: bool = False) -> b
     byte (#903). seerdb's own client never noticed: it takes the content whole
     and does not consult the amount."""
     amount = len(content) // 2 if is_clob else len(content)
+    # Defaulted here, not in the signature: _THIN_LOB_LOCATOR is defined further
+    # down the module, and a default argument is evaluated at def time.
+    echo = _THIN_LOB_LOCATOR if locator is None else locator
     return (
         _lob_data_thin(content)
         + bytes([TTI_RPA])
         # The locator rides RAW here, not length-prefixed: the client reads back
-        # exactly as many bytes as the locator it sent, then the amount.
-        + _THIN_LOB_LOCATOR
+        # exactly as many bytes as the locator it sent, then the amount. Which is
+        # why it has to be the locator the client ACTUALLY sent for a temp LOB it
+        # created itself -- the placeholder is only right for a column LOB the
+        # Mirror minted, where the client ignores what comes back (#826).
+        + echo
         + encode_sb4(amount)
         + _encode_oer(1, 0, 0, b'')
     )
@@ -2309,7 +2318,7 @@ def _decode_lobops_chunked(data: bytes) -> bytes:
 # client from desyncing. FREE_TEMP is handled apart (it drops the temp buffer).
 # The value-returning form of GET_CHUNK_SIZE / TRIM is a #421 follow-up.
 _LOBOPS_ACK_OPS = frozenset(
-    {TNS_LOB_OP_OPEN, TNS_LOB_OP_CLOSE, TNS_LOB_OP_TRIM, TNS_LOB_OP_GET_CHUNK_SIZE}
+    {TNS_LOB_OP_OPEN, TNS_LOB_OP_CLOSE, TNS_LOB_OP_GET_CHUNK_SIZE}
 )
 
 
@@ -2324,6 +2333,18 @@ def _lobops_locator_after_operation(rest: bytes) -> bytes:
     rest = rest[6:]  # three reserved ub2 array-LOB slots
     loc_len = struct.unpack('>H', rest[:2])[0]
     return rest[2 : 2 + loc_len]
+
+
+def _lobops_locator_and_tail(rest: bytes) -> tuple[bytes, bytes]:
+    # The locator AND whatever follows it, for an op that carries a value --
+    # TRIM writes its new length there as a trailing ub4 (#826).
+    rest = rest[2:]  # scn-array pointer + length
+    _src_offset, rest = decode_ub4(rest)
+    _dest_offset, rest = decode_ub4(rest)
+    rest = rest[1:]  # amount pointer flag
+    rest = rest[6:]  # three reserved ub2 array-LOB slots
+    loc_len = struct.unpack('>H', rest[:2])[0]
+    return rest[2 : 2 + loc_len], rest[2 + loc_len :]
 
 
 def parse_lobops_request(body: bytes) -> LobOpsRequest:
@@ -2377,6 +2398,20 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
     if operation == TNS_LOB_OP_FREE_TEMP:
         return LobOpsRequest(
             kind='free_temp', locator=_lobops_locator_after_operation(rest)
+        )
+    if operation == TNS_LOB_OP_TRIM:
+        # TRIM carries its new length as a trailing ub4 and is answered with that
+        # length, exactly like GET_LENGTH -- not with a content-free ack, which is
+        # what left `lob.trim()` desyncing (#826).
+        locator, tail = _lobops_locator_and_tail(rest)
+        amount, _ = decode_ub4(tail) if tail else (0, b'')
+        return LobOpsRequest(kind='trim', locator=locator, amount=amount)
+    if operation == TNS_LOB_OP_GET_LENGTH:
+        # `lob.size()`. It owes a real figure, so it cannot join the ack ops
+        # above -- and it must not fall through to the column-read path, which
+        # answers with a read reply and a placeholder locator (#826).
+        return LobOpsRequest(
+            kind='get_length', locator=_lobops_locator_after_operation(rest)
         )
     if operation in _LOBOPS_ACK_OPS:
         return LobOpsRequest(kind='ack', locator=_lobops_locator_after_operation(rest))
@@ -2449,6 +2484,29 @@ def encode_lobops_ack(locator: bytes) -> bytes:
     GET_CHUNK_SIZE state ops the Mirror acknowledges (#417)."""
     rpa = bytes([TTI_RPA]) + struct.pack('>H', len(locator)) + locator
     return rpa + _encode_oer(1, 0, 0, b'')
+
+
+def encode_lobops_length(locator: bytes, length: int) -> bytes:
+    """The GET_LENGTH reply (#826): the acknowledged locator, then the LOB's
+    current length, then a success OER.
+
+    Shape read off a live 23ai -- the :func:`encode_lobops_ack` reply with a ub4
+    length spliced in ahead of the status::
+
+        08 | 00 26 <38 locator bytes> | 02 01 04 | 04 ... (OER)
+             ub2 len + locator          ub4 260
+
+    An empty LOB sends a ub4 zero (a bare ``00``), not an absent field. The
+    length counts CHARACTERS for a CLOB and bytes for a BLOB, the same unit every
+    other LOB call uses.
+
+    Without this a GET_LENGTH fell through to the column-read path, which
+    answered with a TTI_LOB read reply (token 0x0e) echoing a placeholder
+    locator -- the wrong token and the wrong locator -- and the client desynced
+    on the first ``lob.size()`` of anything it had created itself.
+    """
+    rpa = bytes([TTI_RPA]) + struct.pack('>H', len(locator)) + locator
+    return rpa + encode_sb4(length) + _encode_oer(1, 0, 0, b'')
 
 
 def _encode_refcursor_out(bind: RefCursorOutBind) -> bytes:

@@ -2481,8 +2481,10 @@ def _lobops_op_request(operation: int, locator: bytes, *, seq: int = 1) -> bytes
 
 def test_parse_lobops_request_classifies_the_state_opcodes() -> None:
     # FREE_TEMP releases a temp LOB (its own kind, so the session drops the
-    # buffer); OPEN / CLOSE / TRIM / GET_CHUNK_SIZE are acknowledged; each carries
-    # the locator so the reply can echo it (#417).
+    # buffer); OPEN / CLOSE / GET_CHUNK_SIZE are acknowledged; each carries the
+    # locator so the reply can echo it (#417). TRIM has since moved out of the
+    # acknowledged set -- it carries a new length and is answered with one, the
+    # way GET_LENGTH is (#826).
     from seerdb.common.tns import parse_lobops_request
     from seerdb.common.tns_consts import (
         TNS_LOB_OP_CLOSE,
@@ -2499,12 +2501,14 @@ def test_parse_lobops_request_classifies_the_state_opcodes() -> None:
     for op in (
         TNS_LOB_OP_OPEN,
         TNS_LOB_OP_CLOSE,
-        TNS_LOB_OP_TRIM,
         TNS_LOB_OP_GET_CHUNK_SIZE,
     ):
         req = parse_lobops_request(_lobops_op_request(op, locator))
         assert req.kind == 'ack', op
         assert req.locator == locator, op
+    trim = parse_lobops_request(_lobops_op_request(TNS_LOB_OP_TRIM, locator))
+    assert trim.kind == 'trim'
+    assert trim.locator == locator
 
 
 def test_parse_lobops_read_extracts_offset_and_amount_from_a_raw_locator() -> None:
@@ -3786,3 +3790,38 @@ def test_an_ordinary_execute_is_not_taken_for_a_parse() -> None:
     finally:
         _DECODE_FIELD_VERSION.reset(token)
     assert request.parse_only is False
+
+
+def test_a_temp_lob_answers_its_own_length_and_trim() -> None:
+    # GET_LENGTH and TRIM both owe a real figure, so neither can be a
+    # content-free ack and neither may fall through to the column-read path --
+    # which answered with a read reply (token 0x0e) echoing the Mirror's
+    # placeholder locator, the wrong token AND the wrong locator, so the first
+    # `lob.size()` on anything the client created desynced (#826).
+    from seerdb.common.tns import encode_lobops_length
+    from seerdb.common.tns_consts import TTI_RPA
+
+    locator = b'\x00seerdb-mirror-temp-lob-\x00\x00\x00\x00\x01'
+    reply = encode_lobops_length(locator, 260)
+    assert reply[0] == TTI_RPA
+    assert locator in reply
+    # 260 as a ub4: a length byte then the two value bytes, exactly as a live
+    # 23ai sends it.
+    assert b'\x02\x01\x04' in reply
+    # An empty LOB sends a ub4 zero, not an absent field.
+    assert b'\x00' in encode_lobops_length(locator, 0)
+
+
+def test_a_temp_lob_read_echoes_the_clients_own_locator() -> None:
+    # A column-LOB read may echo the Mirror's placeholder -- the client ignores
+    # what comes back there. A temp LOB the client created itself may not: it
+    # reads back exactly as many bytes as the locator it sent, so a placeholder
+    # of a different length desyncs the reply (#826).
+    from seerdb.common.tns import encode_lob_read_response_thin
+
+    locator = b'\x00seerdb-mirror-temp-lob-\x00\x00\x00\x00\x07'
+    mine = encode_lob_read_response_thin(b'ABCDE', locator=locator)
+    assert locator in mine
+    assert b'ABCDE' in mine
+    # The default keeps the column placeholder, so the column path is unchanged.
+    assert locator not in encode_lob_read_response_thin(b'ABCDE')

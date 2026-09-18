@@ -3066,6 +3066,45 @@ of the wrong shape.
   Instant Client), and the ack already keeps the wire in sync. `READ` (and any
   unrecognised op) still routes to the #413 read path, unchanged.
 
+### 14.4b Operations on a temp LOB the CLIENT created (#826)
+
+`connection.createlob()` mints a temp LOB on the server and then drives it over
+TTI_LOBOPS like any other. Three of those ops owe a real answer, and none of them
+is the column-read path:
+
+**GET_LENGTH (`0x0001`)** — the acknowledged locator, the current length, a
+status. Captured from a live 23ai for a 260-byte BLOB:
+
+```
+08 | 00 26 <38 locator bytes> | 02 01 04 | 04 ... (OER)
+     ub2 len + locator          ub4 260
+```
+
+An empty LOB sends a ub4 zero (a bare `00`), not an absent field. The length is
+in the LOB's own units — characters for a CLOB, bytes for a BLOB.
+
+**TRIM (`0x0020`)** — carries its new length as a **trailing ub4** after the
+locator, and is answered with exactly the GET_LENGTH reply above carrying that
+new length. It is *not* a content-free acknowledgement.
+
+**READ** — the ordinary read reply, but it must echo **the client's own
+locator**, not a placeholder:
+
+```
+0e fe 01 05 | 41 42 43 44 45 | 00 | 08 00 26 <38 locator> | 01 05 | 04 ... (OER)
+  LOB_DATA    "ABCDE"          end   the locator back       ub4 5
+```
+
+A column LOB can get away with a placeholder there because the client ignores
+what comes back; a temp LOB cannot, because the client reads back exactly as many
+bytes as the locator it sent.
+
+**The failure mode is identical for all three and misleading.** Anything that
+falls through to the column-read path is answered with a read reply (token
+`0x0e`) echoing the column placeholder — the wrong token *and* the wrong locator
+— so the client desyncs on the very first `lob.size()` of something it created
+itself, long before any of its content is in question.
+
 ### 14.5b LOB **column** value framing, and its two forms (#853)
 
 A CLOB / BLOB column value in an RXD row is
