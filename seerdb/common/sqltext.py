@@ -121,6 +121,16 @@ def returning_bind_positions(SQL: str, num_binds: int) -> frozenset:
     # named and numeric placeholder styles.
     if num_binds <= 0:
         return frozenset()
+    if is_plsql(SQL):
+        # A `RETURNING ... INTO` *inside* a PL/SQL block is the block's own
+        # business, not the wire's: the INTO target is an ordinary PL/SQL OUT
+        # bind, and the block is executed like any other. Classified as a DML
+        # RETURNING, the bind is one the client writes NO value for -- so the
+        # server sat waiting for bind bytes that never came and neither side
+        # ever spoke again, until the client's read timeout fired 15s later
+        # (#826). The same misreading on the Mirror's side of this function
+        # routed the block into the DML-RETURNING path.
+        return frozenset()
     Cleaned = strip_non_bind_text(SQL)
     Ret = _RETURNING_RE.search(Cleaned)
     if Ret is None:
