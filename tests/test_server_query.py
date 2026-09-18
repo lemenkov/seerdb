@@ -227,6 +227,49 @@ def test_lob_column_locator_carries_metadata_and_reads_back_either_form() -> Non
     assert locator is not None and len(locator) == 38 and tail == b''
 
 
+def test_prefetched_vector_row_keeps_its_image_instead_of_reading_it() -> None:
+    # The Mirror always serves a JSON / VECTOR column in the PREFETCHED framing
+    # (image inline, locator behind it), because that is what the reference
+    # client reads -- a real 23ai sends seerdb the bare locator instead, and
+    # seerdb read the content over TTI_LOBOPS. Given the prefetched form it kept
+    # doing that, and the locator behind the image resolves to nothing to fetch:
+    # read() came back empty and the decoder rejected it as "not a VECTOR image"
+    # (#959). The image in the row IS the content, so keep it on the LOB.
+    import array
+
+    from seerdb.common.tns_consts import TNS_TYPE_JSON, TNS_TYPE_VECTOR
+
+    col = ColumnMeta(
+        name=b'V',
+        data_type=TNS_TYPE_VECTOR,
+        data_length=8200,
+        max_size=8200,
+        vector_format=4,  # INT8
+    )
+    value = array.array('b', [1, -2, 3, -4])
+    response = (
+        encode_describe([col]) + encode_rows([(value,)], [col]) + bytes([TTI_STA])
+    )
+    _, rows = _decode_response(response)
+    (lob,) = rows[0]
+    # No connection is attached, so a LOB that still wanted a round trip raises
+    # InterfaceError here -- which is what master does. Reading must be answered
+    # from the row itself.
+    assert lob.read() == value
+
+    # The same for a native JSON column, whose image the Mirror prefetches too.
+    jcol = ColumnMeta(
+        name=b'J', data_type=TNS_TYPE_JSON, data_length=8200, max_size=8200
+    )
+    doc = {'a': 1, 'b': ['x', True, None]}
+    response = (
+        encode_describe([jcol]) + encode_rows([(doc,)], [jcol]) + bytes([TTI_STA])
+    )
+    _, rows = _decode_response(response)
+    (jlob,) = rows[0]
+    assert jlob.read() == doc
+
+
 def test_encode_status_with_rowcounts_is_the_return_parameters_block() -> None:
     # The arraydmlrowcounts status carries the counts in the execute's
     # return-parameters block (TTI_RPA), laid out as a real server lays it out

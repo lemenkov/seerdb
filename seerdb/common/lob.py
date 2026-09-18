@@ -35,17 +35,23 @@ _LOCATOR_OVERHEAD = 102
 
 
 class LOB:
-    __slots__ = ('data_type', 'raw', '_connection')
+    __slots__ = ('data_type', 'raw', '_connection', '_prefetched')
 
-    def __init__(self, data_type: int, raw: bytes, connection=None):
+    def __init__(self, data_type: int, raw: bytes, connection=None, prefetched=None):
         # `data_type` is the column's TNS data type code (112 CLOB, 113 BLOB,
         # 114 BFILE; NCLOB shares 112 + a national charset form). `raw` is
         # the locator block from RXD — same bytes go back to the server for
         # TTI_LOBOPS. `connection` is the OracleConnect used to round-trip
         # in `read()`; `Cursor.execute` injects it after fetching rows.
+        #
+        # `prefetched` is the value's image when the server already sent it in
+        # the row (a JSON or VECTOR column in the prefetched framing, §22.1b):
+        # there is nothing to fetch, and asking would be answered with whatever
+        # the locator resolves to -- nothing, in the Mirror's case (#959).
         self.data_type = data_type
         self.raw = bytes(raw)
         self._connection = connection
+        self._prefetched = None if prefetched is None else bytes(prefetched)
 
     @property
     def is_binary(self) -> bool:
@@ -132,6 +138,8 @@ class LOB:
     def _fetch_content(self) -> bytes:
         # Fetch the raw locator content over TTI_LOBOPS (the OSON image for a
         # JSON column). Shared by the sync read() path.
+        if self._prefetched is not None:
+            return self._prefetched
         if self._connection is None:
             from seerdb.common.exceptions import InterfaceError
 
@@ -156,6 +164,8 @@ class LOB:
         an `AsyncOracleConnect` whose `lob_read` / `bfile_read` are
         coroutines."""
         if self.data_type in _DECODED_IMAGE_TYPES:
+            if self._prefetched is not None:
+                return self._decode_image(self._prefetched)
             if self._connection is None:
                 from seerdb.common.exceptions import InterfaceError
 
