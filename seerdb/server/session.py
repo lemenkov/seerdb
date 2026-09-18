@@ -35,6 +35,7 @@ from seerdb.common.oci import (
 )
 from seerdb.common.sqltext import bind_placeholders, is_reusable_dml
 from seerdb.common.tns import (
+    _CSFRM_DB,
     _DECODE_FIELD_VERSION,
     _ENCODE_FIELD_VERSION,
     _ENCODE_OCI_CALL_SEQ,
@@ -2128,7 +2129,11 @@ def _bind_vars(request: ExecRequest) -> list:
 
 
 def _out_bind_entries(
-    out_binds: list, bind_meta: list, cursors: _Cursors, bind_arrays: Sequence = ()
+    out_binds: list,
+    bind_meta: list,
+    cursors: _Cursors,
+    bind_arrays: Sequence = (),
+    bind_types: Sequence = (),
 ) -> list[ScalarOutBind | ArrayOutBind | RefCursorOutBind]:
     # Turn the backend's OUT bind values into IOV reply entries (#483). A scalar
     # rides with its declared type; an associative array as its element list
@@ -2136,14 +2141,22 @@ def _out_bind_entries(
     # cursor id the client then drains with TTI_FETCH.
     entries: list[ScalarOutBind | ArrayOutBind | RefCursorOutBind] = []
     arrays = list(bind_arrays) or [0] * len(bind_meta)
-    for value, (tns_type, _size), capacity in zip(out_binds, bind_meta, arrays):
+    # The charset form per bind, from the OACs the client sent. A national
+    # (NCHAR / NVARCHAR2) bind's text goes back as UTF-16BE, as it does in a row
+    # -- sent as UTF-8 the client reads two bytes per character (#826).
+    forms = [entry[1] for entry in bind_types] or [_CSFRM_DB] * len(bind_meta)
+    for value, (tns_type, _size), capacity, csfrm in zip(
+        out_binds, bind_meta, arrays, forms
+    ):
         if isinstance(value, CursorResult):
             cursor_id = cursors.open(value.columns, list(value.rows))
             entries.append(RefCursorOutBind(columns=value.columns, cursor_id=cursor_id))
         elif capacity:
-            entries.append(ArrayOutBind(values=list(value or []), tns_type=tns_type))
+            entries.append(
+                ArrayOutBind(values=list(value or []), tns_type=tns_type, csfrm=csfrm)
+            )
         else:
-            entries.append(ScalarOutBind(value=value, tns_type=tns_type))
+            entries.append(ScalarOutBind(value=value, tns_type=tns_type, csfrm=csfrm))
     return entries
 
 
@@ -2343,7 +2356,11 @@ def _answer_query(
         if result.out_binds:
             response = encode_out_bind_response_thin(
                 _out_bind_entries(
-                    result.out_binds, request.bind_meta, cursors, request.bind_arrays
+                    result.out_binds,
+                    request.bind_meta,
+                    cursors,
+                    request.bind_arrays,
+                    request.bind_types,
                 )
             )
         # A query carries result columns (even with zero rows); a DDL/DML

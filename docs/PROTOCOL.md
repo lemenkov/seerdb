@@ -1771,7 +1771,11 @@ rest carried:
   character `max_size` rather than the wider byte buffer, and the `DESCRIBE`
   reply reports the **byte** length in its size field with a `0x80` national flag
   and the character length in the scale byte, so sqlplus halves the byte size to
-  render `NCHAR(N)`;
+  render `NCHAR(N)`. **The rule is not confined to columns**: a national PL/SQL
+  **OUT bind** carries its text the same way, and so does each element of a
+  national `arrayvar`. Sent as UTF-8 instead, the client reads two bytes per
+  character and `'Called'` comes back as `'\u434d\u6c6c\u6564'` — readable
+  mojibake rather than an error, which is how it survives review (#826);
 - each non-last column carries a `1` **continuation flag** three bytes before its
   end and a **describe-timestamp entry** in its post-name region (the last column
   leaves both zero);

@@ -440,10 +440,16 @@ class LobOpsRequest:
 
 @dataclass(frozen=True)
 class ScalarOutBind:
-    """A scalar PL/SQL OUT bind value + its declared type, for the IOV reply."""
+    """A scalar PL/SQL OUT bind value + its declared type, for the IOV reply.
+
+    ``csfrm`` is the bind's charset form. An NCHAR / NVARCHAR2 bind (csfrm 2)
+    carries its text as UTF-16BE, exactly as a national column does in a row --
+    sent as UTF-8 the client reads each pair of bytes as one character and
+    'Called' comes back as '\u434d\u6c6c\u6564' (#826)."""
 
     value: object
     tns_type: int
+    csfrm: int = _CSFRM_DB
 
 
 @dataclass(frozen=True)
@@ -451,10 +457,12 @@ class ArrayOutBind:
     """A PL/SQL associative-array OUT bind's value: its elements, in order, with
     the bind's declared element type (#743). The reply carries the element
     count and then each element as a value plus a return code, the form the
-    client's decoder reads for a bind it registered with ``arrayvar``."""
+    client's decoder reads for a bind it registered with ``arrayvar``. ``csfrm``
+    carries the element charset form, as for a scalar."""
 
     values: list
     tns_type: int
+    csfrm: int = _CSFRM_DB
 
 
 @dataclass(frozen=True)
@@ -2586,19 +2594,29 @@ def encode_out_bind_response_thin(
             # ub4 element count, then each element as a value + return code.
             rxd += encode_sb4(len(bind.values))
             for element in bind.values:
-                rxd += _encode_out_bind_value(element, bind.tns_type) + encode_sb4(0)
+                rxd += _encode_out_bind_value(
+                    element, bind.tns_type, bind.csfrm
+                ) + encode_sb4(0)
         else:
-            rxd += _encode_out_bind_value(bind.value, bind.tns_type) + encode_sb4(0)
+            rxd += _encode_out_bind_value(
+                bind.value, bind.tns_type, bind.csfrm
+            ) + encode_sb4(0)
     return iov + bytes(rxd) + encode_status(0)
 
 
-def _encode_out_bind_value(value: object, tns_type: int) -> bytes:
+def _encode_out_bind_value(
+    value: object, tns_type: int, csfrm: int = _CSFRM_DB
+) -> bytes:
     # One scalar OUT-bind value for the IOV's RXD. A BINARY_INTEGER / PLS_INTEGER
     # OUT bind (``TNS_TYPE_INT``) rides as a NUMBER, not the native integer the
     # column form uses: the client reads ``DB_TYPE_BINARY_INTEGER`` as a NUMBER,
     # and a native ``encode_sb4`` would render 0 as an empty DALC that reads back
     # as NULL -- python-oracledb then rejects the object-type metadata call with
     # ``DPY-2035`` because its ``ret_val`` came back NULL rather than 0 (#888).
+    if csfrm == _CSFRM_NCHAR and isinstance(value, str):
+        # National character data travels as UTF-16BE, the same form a
+        # national COLUMN uses in a row (_national_wire_value). #826.
+        return _bytes_with_length(value.encode('utf-16-be'))
     if tns_type == TNS_TYPE_INT and isinstance(value, (int, float)):
         return _bytes_with_length(encode_token_num(value))
     if tns_type == TNS_TYPE_ADT:
