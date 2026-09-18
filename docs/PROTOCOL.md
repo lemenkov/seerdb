@@ -2192,6 +2192,17 @@ value per OUT / IN OUT bind **in bind order** (IN binds contribute nothing):
   than an off-by-one. seerdb reads both forms through the same helper, with the
   trailer switched off for a column.
 
+  **Serving one** (#826) needs two more things beyond writing that value. The
+  column's **describe length is 5** — measured on a live 23ai; a zero there is
+  the same trap BOOLEAN, ROWID/UROWID/ADT, VECTOR and JSON each fell into before
+  it (§6.4's length table), and it is the *fifth* occurrence. And **every level
+  needs a parked cursor of its own**: a nested cursor may itself select a
+  `CURSOR(...)` column, so the walk that parks rows and the one that drains them
+  both have to recurse, or the inner result set reaches the row encoder as a raw
+  value. seerdb parks them on every path that runs a statement fresh — the
+  query, the re-execute and the scroll open — because the remainder a query parks
+  is served later from the same converted rows.
+
 After the values come the usual `TTI_RPA` and `TTI_OER` tokens.
 
 **Server side — the Mirror answering a thin client (#483).** The wire carries

@@ -542,6 +542,7 @@ class OraclePassthroughBackend:
             rows = cursor.fetchall()
             columns = _enrich_ref_columns(columns, rows)
             rows = self._resolve_fetched_object_lobs(columns, rows)
+            rows = _drain_nested_cursors(columns, rows)
             return Result(columns=columns, rows=rows)
         implicit = self._drain_implicit_results(cursor)
         if implicit:
@@ -837,13 +838,39 @@ def _lookup_bind_lob(lob_contents: dict, locator: bytes) -> tuple[object, bool] 
     return None
 
 
+def _drain_nested_cursors(columns: list, rows: list) -> list:
+    # A nested-cursor cell -- `select ..., CURSOR(select ...) from ...` -- comes
+    # back as a fetchable cursor. Drain each into a CursorResult the Mirror parks
+    # and names, the same shape a REF CURSOR OUT param produces (#826).
+    positions = [
+        index
+        for index, col in enumerate(columns)
+        if col.data_type == TNS_TYPE_REFCURSOR
+    ]
+    if not positions:
+        return rows
+    out = []
+    for row in rows:
+        cells = list(row)
+        for index in positions:
+            value = cells[index] if index < len(cells) else None
+            if value is not None:
+                cells[index] = _out_value(value)
+        out.append(tuple(cells))
+    return out
+
+
 def _out_value(value: object) -> object:
     # A REF CURSOR OUT param resolves to a nested cursor; drain its describe +
     # rows into a CursorResult the Mirror can park and hand back. Any other OUT
     # value is a plain scalar the Mirror encodes by the bind's declared type.
     if hasattr(value, 'description') and hasattr(value, 'fetchall'):
         columns = [_to_column_meta(desc) for desc in value.description]
-        return CursorResult(columns=columns, rows=value.fetchall())
+        # Recursive: a nested cursor may itself select a CURSOR(...) column, so
+        # drain its rows the same way (#826).
+        return CursorResult(
+            columns=columns, rows=_drain_nested_cursors(columns, value.fetchall())
+        )
     return value
 
 

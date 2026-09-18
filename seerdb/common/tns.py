@@ -439,6 +439,18 @@ class LobOpsRequest:
 
 
 @dataclass(frozen=True)
+class NestedCursor:
+    """A nested-cursor CELL, once its rows are parked (#826).
+
+    The session parks each row's cursor under an id of its own and leaves this in
+    the cell; the row encoder writes the inline describe naming that id.
+    """
+
+    columns: list = field(default_factory=list)
+    cursor_id: int = 0
+
+
+@dataclass(frozen=True)
 class ScalarOutBind:
     """A scalar PL/SQL OUT bind value + its declared type, for the IOV reply.
 
@@ -1141,6 +1153,11 @@ _DESCRIBE_WIRE_LENGTH = {
     # reads no bytes for the column, so the OSON image the row carries is taken
     # for the next message (#826). The fourth time a zero here has bitten.
     TNS_TYPE_JSON: 8200,
+    # A nested cursor column (`select ..., CURSOR(select ...)`) describes as 5
+    # on a live 23ai. Zero here is the same trap as BOOLEAN, ROWID, VECTOR and
+    # JSON before it -- the FIFTH time: the client reads no bytes for the
+    # column and takes the value's first byte for the next token (#826).
+    TNS_TYPE_REFCURSOR: 5,
 }
 
 
@@ -1530,6 +1547,10 @@ def _thin_column_value(value: object, col: 'ColumnMeta') -> bytes:
         from seerdb.common.oson import encode_oson
 
         return encode_prefetched_lob_value_thin(encode_oson(value, allow_wide=True))
+    if col.data_type == TNS_TYPE_REFCURSOR and isinstance(value, NestedCursor):
+        # A nested cursor column: its rows are already parked under cursor_id,
+        # and the value is the inline describe naming it (#826).
+        return encode_refcursor_column_value(value.columns, value.cursor_id)
     if col.data_type == TNS_TYPE_ADT:
         # A SQL object (ADT) column carries its own image framing, NULL included
         # (#116) — the bare-0x00 NULL path below would desync the row stream.
@@ -2557,6 +2578,22 @@ def _encode_refcursor_out(bind: RefCursorOutBind) -> bytes:
         + _encode_describe_body(bind.columns)
         + encode_sb4(bind.cursor_id)
         + encode_sb4(0)  # per-value return code (actual_num_bytes = 0)
+    )
+
+
+def encode_refcursor_column_value(columns: list[ColumnMeta], cursor_id: int) -> bytes:
+    """A nested-cursor COLUMN value in an RXD row (#826).
+
+    `select ..., CURSOR(select ...) from ...` carries the same inline describe +
+    cursor id an OUT bind does, but **without** the trailing return code an OUT
+    bind ends on: in a row the next byte is the following row's TTI_RXD token.
+    The reference client reads exactly `skip_ub1`, the describe body, then a ub2
+    cursor id, and nothing after it.
+    """
+    return (
+        bytes([1])  # length prefix (skipped by the client)
+        + _encode_describe_body(columns)
+        + encode_sb4(cursor_id)
     )
 
 
