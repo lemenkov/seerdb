@@ -272,7 +272,18 @@ class AsyncCursor(_CursorLogic):
         for Row in Rows or []:
             NewRow = list(Row)
             for I, Val in enumerate(NewRow):
-                if isinstance(Val, LOB):
+                if isinstance(Val, dict) and Val.get('_refcursor'):
+                    # A nested cursor -- `select ..., CURSOR(select ...)` (#826).
+                    # Same marker a REF CURSOR OUT bind leaves; fetch its rows and
+                    # wrap them the way _build_refcursor does.
+                    NewRow[I] = await self._build_refcursor(
+                        await self._connection.fetch_all_rows(
+                            Val['cursor_id'], Val['row_format']
+                        )
+                        or [],
+                        Val,
+                    )
+                elif isinstance(Val, LOB):
                     Val._connection = self._connection
                     NewRow[I] = await Val.aread()
                 elif isinstance(Val, ObjectImage) and Val.type_name == 'XMLTYPE':

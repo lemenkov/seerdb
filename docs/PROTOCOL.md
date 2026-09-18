@@ -2180,6 +2180,18 @@ value per OUT / IN OUT bind **in bind order** (IN binds contribute nothing):
   no `dcbqcky` trailer, so skipping a phantom one consumes the cursor id and
   desyncs the IOV decode. seerdb gates both identically.
 
+  **A nested cursor COLUMN is the same value MINUS that trailer (#826).**
+  `select IntCol, CURSOR(select ...) from ...` returns one cursor per row, and
+  its cell is the 1-byte length + inline describe + `ub2` cursor id and **nothing
+  more** — python-oracledb reads exactly that (`skip_ub1`,
+  `_create_cursor_from_describe`, `read_ub2`) with no return code after it,
+  because in a row the next byte is the following row's `TTI_RXD` token.
+  Consuming an indicator there swallows that token, and the decoder then reports
+  the first byte of the next row's data as an unknown response token — the number
+  varies with the data, which is what makes it look like a decoder gap rather
+  than an off-by-one. seerdb reads both forms through the same helper, with the
+  trailer switched off for a column.
+
 After the values come the usual `TTI_RPA` and `TTI_OER` tokens.
 
 **Server side — the Mirror answering a thin client (#483).** The wire carries
