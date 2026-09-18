@@ -25,6 +25,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_BOOLEAN,
     TNS_TYPE_CHAR,
     TNS_TYPE_DATE,
+    TNS_TYPE_INT,
     TNS_TYPE_INTERVALDS,
     TNS_TYPE_INTERVALYM,
     TNS_TYPE_LONG,
@@ -379,7 +380,12 @@ def decode_value(Column: dict, Data: bytes | list | None) -> object:
     if isinstance(Data, list):
         return None
     DataType = Column.get('data_type')
-    if DataType == TNS_TYPE_NUMBER:
+    if DataType in (TNS_TYPE_NUMBER, TNS_TYPE_INT):
+        # BINARY_INTEGER / PLS_INTEGER (TNS_TYPE_INT) rides the wire as an Oracle
+        # NUMBER, not as a native integer -- the same fact the OUT-bind encoder
+        # relies on (#888). Left undecoded it surfaced as the raw NUMBER bytes,
+        # so `select :1 from dual` on such a bind came back as DB_TYPE_RAW
+        # b'\xc1 ' instead of 31 (#826).
         return decode_number(Data)
     if DataType in (TNS_TYPE_VARCHAR, TNS_TYPE_CHAR, TNS_TYPE_LONG):
         return decode_string(Data, _string_charset(Column))
