@@ -3859,3 +3859,46 @@ def test_no_implicit_results_is_an_empty_block_not_a_missing_one() -> None:
     )
     (record,) = acc[2]
     assert record['implicit_results'] == []
+
+
+def test_a_national_out_bind_travels_as_utf_16be() -> None:
+    # An NCHAR / NVARCHAR2 OUT bind carries its text as UTF-16BE, exactly as a
+    # national COLUMN does in a row. Sent as UTF-8 the client reads two bytes per
+    # character, so 'Called' came back as '䍍汬敤' -- readable
+    # mojibake rather than an error, which is how it survived (#826).
+    from seerdb.common.tns import (
+        _CSFRM_DB,
+        _CSFRM_NCHAR,
+        ScalarOutBind,
+        encode_out_bind_response_thin,
+    )
+
+    national = encode_out_bind_response_thin(
+        [ScalarOutBind(value='Called', tns_type=TNS_TYPE_VARCHAR, csfrm=_CSFRM_NCHAR)]
+    )
+    assert 'Called'.encode('utf-16-be') in national
+    assert b'Called' not in national
+    # An ordinary bind is untouched, so the database-charset path is unchanged.
+    ordinary = encode_out_bind_response_thin(
+        [ScalarOutBind(value='Called', tns_type=TNS_TYPE_VARCHAR, csfrm=_CSFRM_DB)]
+    )
+    assert b'Called' in ordinary
+
+
+def test_a_national_array_out_bind_converts_every_element() -> None:
+    # The same rule element by element, for a bind registered with arrayvar.
+    from seerdb.common.tns import (
+        _CSFRM_NCHAR,
+        ArrayOutBind,
+        encode_out_bind_response_thin,
+    )
+
+    reply = encode_out_bind_response_thin(
+        [
+            ArrayOutBind(
+                values=['one', 'two'], tns_type=TNS_TYPE_VARCHAR, csfrm=_CSFRM_NCHAR
+            )
+        ]
+    )
+    assert 'one'.encode('utf-16-be') in reply
+    assert 'two'.encode('utf-16-be') in reply
