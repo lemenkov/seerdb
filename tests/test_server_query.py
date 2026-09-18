@@ -3746,3 +3746,43 @@ def test_a_json_bind_is_not_sorted_to_the_end_of_the_row() -> None:
     # not be listed as LONG-class, or seerdb's own client writes it out of place
     # and a real 23ai answers ORA-24813.
     assert _long_bind_positions([JSON({'b': 2}), 1], 4000) == frozenset()
+
+
+def test_a_parse_only_execute_is_recognised_and_carries_no_binds() -> None:
+    # `cursor.parse()` asks the server to parse the statement WITHOUT running it:
+    # PARSE (0x01) set, EXECUTE (0x20) clear. A query adds DESCRIBE (0x20000) and
+    # the reply owes the column metadata; a DML / PL/SQL parse owes only a
+    # success status. Either way the message carries NO bind values, so running
+    # it reached the backend as ORA-01008 -- which is what every parse in the
+    # reference suite hit (#826).
+    from seerdb.common.tns import _DECODE_FIELD_VERSION
+
+    # Byte-for-byte off a live capture (fv24): parse of
+    # `select LongIntCol from TestNumbers where IntCol = :val`, options 0x20001.
+    query_parse = bytes.fromhex(
+        '035e030004000200010001013601010d0000000101047fffffff000000000000'
+        '0000000000010000000000000000000000000000003673656c656374204c6f6e'
+        '67496e74436f6c2066726f6d20546573744e756d626572732077686572652049'
+        '6e74436f6c203d203a76616c010100000000000001010000000000'
+    )
+    token = _DECODE_FIELD_VERSION.set(24)
+    try:
+        request = parse_exec(query_parse)
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+    assert request.parse_only is True
+    assert request.describe_only is True
+    assert request.bind_count == 0  # a parse sends no values, whatever :val is
+
+
+def test_an_ordinary_execute_is_not_taken_for_a_parse() -> None:
+    # PARSE rides along with EXECUTE on every first execute of a statement, so
+    # the test has to be "PARSE and NOT EXECUTE", not "PARSE".
+    from seerdb.common.tns import _DECODE_FIELD_VERSION
+
+    token = _DECODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
+    try:
+        request = parse_exec(_DUAL_EXEC)
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+    assert request.parse_only is False

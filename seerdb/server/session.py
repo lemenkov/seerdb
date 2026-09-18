@@ -33,7 +33,7 @@ from seerdb.common.oci import (
     OCI_CMD_ROLLBACK,
     strip_oci_e2e_piggyback,
 )
-from seerdb.common.sqltext import is_reusable_dml
+from seerdb.common.sqltext import bind_placeholders, is_reusable_dml
 from seerdb.common.tns import (
     _DECODE_FIELD_VERSION,
     _ENCODE_FIELD_VERSION,
@@ -61,6 +61,7 @@ from seerdb.common.tns import (
     encode_commit_status_oci,
     encode_create_temp_response,
     encode_ddl_status_oci,
+    encode_describe,
     encode_describe_reply_oci,
     encode_dml_status_oci,
     encode_error,
@@ -2097,6 +2098,14 @@ def _answer_query(
         )
         return lobs
     try:
+        if request.parse_only:
+            # `cursor.parse()`: parse the statement, do NOT run it (#826). It
+            # carries no bind values, so running it anyway reached the backend as
+            # ORA-01008 -- which is what every parse in the reference suite hit.
+            # A query owes the describe (the DESCRIBE option rides with PARSE) and
+            # a plain success status; a DML / PL/SQL parse owes the status alone.
+            stream.write_packet(TNS_DATA, _answer_parse(backend, sql, request))
+            return lobs
         if request.return_binds:
             # DML ... RETURNING col INTO :b (#689). The reply owes one set of
             # returned values per iteration, so this cannot go through the
@@ -2257,6 +2266,33 @@ def _answer_query(
         response = _backend_fault_error(exc)
     stream.write_packet(TNS_DATA, response)
     return lobs
+
+
+def _answer_parse(backend: Backend, sql: str, request: ExecRequest) -> bytes:
+    """The reply to a `cursor.parse()` — parse, never run (#826).
+
+    A DML or PL/SQL parse owes a bare success status. A query parse also owes the
+    describe, so its columns have to come from somewhere: a backend that can
+    describe a statement without running it says so with a ``describe`` method,
+    and otherwise the query is run with every bind NULL and its rows discarded.
+    That is safe for a SELECT, which is the only shape that reaches the fallback,
+    and it validates the statement the way a real parse does.
+    """
+    if not request.describe_only:
+        return encode_status(0)
+    describe = getattr(backend, 'describe', None)
+    if describe is not None:
+        columns = list(describe(sql))
+    else:
+        # A parse carries NO bind values, so request.bind_count is 0 however many
+        # placeholders the statement has. Count them in the text instead, or the
+        # fallback runs `where IntCol = :val` with nothing bound and the backend
+        # answers the very ORA-01008 this branch exists to avoid.
+        placeholders = len(bind_placeholders(sql, dedupe=True))
+        columns = list(backend.execute(sql, [None] * placeholders).columns or [])
+    # Describe + a plain success status, NOT encode_query_response: that ends a
+    # batch with the end-of-fetch ORA-01403, and a parse fetched nothing.
+    return encode_describe(columns) + encode_status(0)
 
 
 def _answer_scroll(

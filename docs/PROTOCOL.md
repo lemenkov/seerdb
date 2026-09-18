@@ -1180,6 +1180,25 @@ to confuse:
   count turns a plain re-executed SELECT into an N-iteration array DML — the
   query never runs and the client is answered with a row count (#826).
 
+**`cursor.parse()` — parse without executing (#826).** The options word carries
+`PARSE (0x01)` and **not** `EXECUTE (0x20)`; a query adds `DESCRIBE (0x20000)`.
+Captured from a live 23ai:
+
+| statement | options | reply |
+|---|---|---|
+| `select ... where IntCol = :val` | `0x20001` | `TTI_DCB` describe, then a plain status |
+| `begin :value := 5; end;` | `0x01` | a plain status |
+| `insert into t (IntCol) values (:1)` | `0x01` | a plain status |
+
+Two things a server has to get right here. The message **carries no bind values**
+however many placeholders the statement has, so running it anyway fails with
+`ORA-01008: value for bind variable placeholder was not provided`. And the query
+reply is the describe followed by a **success** status — not the end-of-fetch
+`ORA-01403` a real fetch ends on, because nothing was fetched.
+
+The test is "PARSE **and not** EXECUTE": `PARSE` also rides along with `EXECUTE`
+on the first execute of any statement, so testing for it alone catches everything.
+
 **Open** — a normal parse+execute (cursor 0, SQL present) with the al8i4 scroll
 fields and orientation `CURRENT`/1. It keeps the fv24 query options `0x8061`
 (`NOT_PLSQL | FETCH | EXECUTE | PARSE`) and prefetches only a small batch
