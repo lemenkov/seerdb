@@ -745,6 +745,15 @@ class TestLong(unittest.TestCase):
         self.assertEqual(Out, b'\xde\xad')
         self.assertIsInstance(Out, bytes)
 
+    def test_decode_value_binary_integer_is_a_number(self):
+        # BINARY_INTEGER / PLS_INTEGER (TNS_TYPE_INT) rides the wire as an
+        # Oracle NUMBER -- the same fact the OUT-bind encoder relies on. With no
+        # branch of its own it fell through undecoded, so the raw NUMBER bytes
+        # surfaced as DB_TYPE_RAW b'\xc1 ' instead of the integer 31 (#826).
+        from seerdb.common.tns_consts import TNS_TYPE_INT
+
+        self.assertEqual(decode_value({'data_type': TNS_TYPE_INT}, b'\xc1 '), 31)
+
 
 class TestPasswordRedaction(unittest.TestCase):
     # The bind/handshake dicts carry the password so the encoders can use it;

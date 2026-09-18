@@ -4824,7 +4824,12 @@ object read, each of which desyncs the client if wrong:
   a NUMBER. Encoding them with the native integer form renders `0` as an empty
   DALC that reads back as NULL, and the client then rejects the call with
   `DPY-2035` because `ret_val` was NULL rather than `0`; so the Mirror encodes an
-  INT-typed OUT value as a NUMBER (`_encode_out_bind_value`).
+  INT-typed OUT value as a NUMBER (`_encode_out_bind_value`). **Decoding is the
+  same fact in reverse** and applies to any client, Mirror or not: a column or
+  bind described as type 3 carries base-100 NUMBER bytes, so `decode_value` must
+  run them through `decode_number`. Left with no branch of its own the raw bytes
+  came back as a `DB_TYPE_RAW` value — `select :1 from dual` on a
+  `DB_TYPE_BINARY_INTEGER` bind yielded `b'\xc1 '` instead of `31` (seerdb#826).
 - **The `attrs_rc` REF CURSOR is drained by re-execute.** The client re-executes
   the nested cursor id with an empty statement rather than a `TTI_FETCH`; the
   Mirror serves its parked rows with a full describe + rows reply (§6.5). The
