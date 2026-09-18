@@ -3343,6 +3343,45 @@ the **total**. Reading the ids one byte wide instead produces
 `DPY-5006: unexpected end of data: want 1 bytes but only -16771386 bytes are
 available`, a negative figure that gives the real cause away.
 
+### 17.0c Compressed columns: relative offsets and shared field ids (#826)
+
+A JSON column declared `store as (compress high)` writes two things an ordinary
+column does not. Both show up in every image from such a column — header flags
+`0x2107`, the `0x01` being the new one.
+
+**Relative offsets** (image flag `0x01`). A container's child value-offsets count
+from **that container's own offset** within the tree segment, not from the start
+of it. An image whose only container is the root decodes identically either way,
+which is why a one-object document hides the difference.
+
+**Shared field ids** (container tag count-bits `0x18`). The two bits that
+normally select the count width — `00` ub1, `01` ub2, `10` ub4 — mean something
+else entirely when both are set: *this object stores no field-id array; its keys
+come from another object, whose offset follows in their place.* Read the donor's
+tag byte and count to recover both the entry count and where its field ids live,
+then read this node's own value offsets from straight after the donor pointer.
+
+**The donor pointer is absolute even in relative mode.** Only the value offsets
+are rebased. Rebasing the donor too lands mid-value and reports a nonsense count.
+
+Captured from a live 23ai for `[{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]` in a
+compressed column — the tree segment, with absolute offsets in the margin:
+
+```
+ 0  c0 02 00 06 00 13     array, 2 children at 6 and 19 (root: relative == absolute)
+ 6  86 02 01 02 00 08 00 0b   object, ids a,b; children at +8, +11 → 14, 17
+14  21 c1 02              the number 1
+17  01 78                 the string "x"
+19  9c 00 06 00 07 00 0a  object, SHARES the ids at 6; children at +7, +10 → 26, 29
+26  21 c1 03              the number 2
+29  01 79                 the string "y"
+```
+
+**A decoder trap.** The `0x18` test must be applied to **container tags only**.
+DATE (`0x3C`), TIMESTAMP (`0x39`), TIMESTAMP WITH TZ (`0x7C`) and both intervals
+all happen to carry both bits, so an unguarded test turns every bare-scalar
+temporal image into a malformed object.
+
 ### 17.1 Node encoding
 
 | Tag byte            | Node                                                        |

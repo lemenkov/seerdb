@@ -86,6 +86,10 @@ _EXT_SCALAR = {
 
 # Image flags (header ub2).
 _FLAG_TREE = 0x2000  # container image (object/array) vs bare scalar
+_FLAG_REL_OFFSETS = 0x01  # container value-offsets are relative to the
+# container's own offset, not absolute in the tree
+# segment. A `store as (compress high)` JSON column
+# is written this way (#826).
 _FLAG_UB2_OFFSETS = 0x04  # container value-offsets are ub2; else ub4 (#69).
 # Server JSON_OBJECT / JSON() literals set it;
 # oracledb-produced images (flags 0x2102) clear it
@@ -108,6 +112,9 @@ _SEC_FLAG_UB2_FNAME_OFFSETS = 0x0100  # long-name offset array is ub2, else ub4
 _TAG_WIDE_COUNT = 0x08  # container count + field-ids are ub2, not ub1
 _TAG_UB4_COUNT = 0x10  # container count + field-ids are ub4 (> 65535
 # entries/keys, #88); takes precedence over 0x08.
+_TAG_COUNT_BITS = 0x18  # the two bits selecting a container's count width
+_TAG_SHARED_FIELDS = 0x18  # ...and, when BOTH are set, "my field ids live in
+# another container, whose offset follows" (#826)
 _TAG_UB4_OFFSETS = 0x20  # this container's value-offsets are ub4 (a container
 # whose values span a >64 KiB tree, #88), overriding
 # the image-level offset width.
@@ -423,6 +430,15 @@ def encode_oson(value, *, allow_wide: bool = False) -> bytes:
     )
 
 
+def _count_width(tag: int) -> int:
+    # The byte width of a container's entry count (and of its field ids), from the
+    # two count bits in its tag: 00 ub1, 01 ub2, 10 ub4. The fourth combination
+    # means "shared field ids" and carries no count of its own.
+    if tag & _TAG_UB4_COUNT:
+        return 4
+    return 2 if (tag & _TAG_WIDE_COUNT) else 1
+
+
 def _fname_offsets(fnames_b: list[bytes]) -> list[int]:
     # The ub2 offset of each field name within the names segment (each name is a
     # ub1 length + its bytes).
@@ -465,6 +481,7 @@ def _decode_image(data: bytes) -> object:
     pos = 6
     # Container value-offsets are ub2 when the compact flag is set, else ub4.
     off_size = 2 if (flags & _FLAG_UB2_OFFSETS) else 4
+    relative = bool(flags & _FLAG_REL_OFFSETS)
     if not (flags & _FLAG_TREE):
         # Bare scalar image: reserved(ub1), value_size(ub1), scalar node.
         size = data[pos + 1]
@@ -534,12 +551,20 @@ def _decode_image(data: bytes) -> object:
             return fnames_seg[off + 1 : off + 1 + length].decode('utf-8')
         return long_names[index - num_fnames]
 
-    value, _ = _decode_node(tree_seg, 0, field_name, tree_seg, off_size)
+    value, _ = _decode_node(
+        tree_seg, 0, field_name, tree_seg, off_size, relative=relative
+    )
     return value
 
 
 def _decode_child(
-    tree: bytes, off: int, field_name, off_size: int, memo: dict, stack: set
+    tree: bytes,
+    off: int,
+    field_name,
+    off_size: int,
+    memo: dict,
+    stack: set,
+    relative: bool = False,
 ):
     # Bounded recursion into a container value-offset. Memoise the decoded value
     # by offset so a shared child (a "diamond" of offsets) is decoded once rather
@@ -555,7 +580,9 @@ def _decode_child(
     if off in stack:
         raise OsonError(f'cyclic OSON node offset {off}')
     stack.add(off)
-    value = _decode_node(tree, off, field_name, tree, off_size, memo, stack)[0]
+    value = _decode_node(tree, off, field_name, tree, off_size, memo, stack, relative)[
+        0
+    ]
     stack.discard(off)
     memo[off] = value
     return value
@@ -569,6 +596,7 @@ def _decode_node(
     off_size: int = 2,
     memo: dict | None = None,
     stack: set | None = None,
+    relative: bool = False,
 ):
     # Returns (python_value, next_offset). `tree` is the tree segment that
     # container value-offsets are relative to; `field_name` maps an object's
@@ -631,8 +659,47 @@ def _decode_node(
     # (tag 0x08 bit); otherwise ub1. The value-offset width is per-image
     # (off_size), but a large container overrides it to ub4 via the tag 0x20 bit
     # (#88) — its values span a >64 KiB tree so ub2 offsets can't address them.
-    csz = 4 if (tag & _TAG_UB4_COUNT) else (2 if (tag & _TAG_WIDE_COUNT) else 1)
     osz = 4 if (tag & _TAG_UB4_OFFSETS) else off_size
+    # A value-offset is relative to the CONTAINER'S OWN offset when the image is
+    # in relative-offset mode, absolute within the tree segment otherwise (#826).
+    # Only a container that does not start the tree is affected, which is why an
+    # image whose root is its only container decodes either way.
+    base = off if relative else 0
+    # Containers only: the count bits are only count bits in a container tag, and
+    # plenty of extended scalars (DATE 0x3C, TIMESTAMP 0x39, the intervals) happen
+    # to carry both of them.
+    if (tag & 0x80) and (tag & _TAG_COUNT_BITS) == _TAG_SHARED_FIELDS:  # (#826)
+        # This object stores only its own value offsets; its keys come from an
+        # earlier object, whose offset it carries in their place. A compressed
+        # JSON column uses this for every repeat of a shape it has already
+        # written. Read as an ordinary container the shared offset is taken for a
+        # count, which is how it surfaced ("OSON object count exceeds image").
+        if field_name is None:
+            raise OsonError('object node in a scalar-only OSON image')
+        # The pointer to the donor is ABSOLUTE within the tree segment even in
+        # relative-offset mode -- only the value offsets below are rebased.
+        donor = _uint(seg, off + 1, osz)
+        val_pos = off + 1 + osz
+        if not 0 <= donor < len(seg):
+            raise OsonError('OSON shared-field offset outside image')
+        donor_tag = seg[donor]
+        donor_csz = _count_width(donor_tag)
+        count = _uint(seg, donor + 1, donor_csz)
+        ids_pos = donor + 1 + donor_csz
+        if ids_pos + donor_csz * count > len(seg) or val_pos + osz * count > len(seg):
+            raise OsonError('OSON object count exceeds image')
+        ids = [_uint(seg, ids_pos + donor_csz * i, donor_csz) for i in range(count)]
+        val_offsets = [_uint(seg, val_pos + osz * i, osz) for i in range(count)]
+        return (
+            {
+                field_name(i): _decode_child(
+                    tree, o + base, field_name, off_size, memo, stack, relative
+                )
+                for i, o in zip(ids, val_offsets)
+            },
+            val_pos + osz * count,
+        )
+    csz = _count_width(tag)
     if (tag & 0xC0) == 0xC0:  # array container
         count = _uint(seg, off + 1, csz)
         p = off + 1 + csz
@@ -644,7 +711,9 @@ def _decode_node(
         elem_offsets = [_uint(seg, p + osz * i, osz) for i in range(count)]
         return (
             [
-                _decode_child(tree, o, field_name, off_size, memo, stack)
+                _decode_child(
+                    tree, o + base, field_name, off_size, memo, stack, relative
+                )
                 for o in elem_offsets
             ],
             p + osz * count,
@@ -666,7 +735,9 @@ def _decode_node(
         val_offsets = [_uint(seg, p + osz * i, osz) for i in range(count)]
         return (
             {
-                field_name(i): _decode_child(tree, o, field_name, off_size, memo, stack)
+                field_name(i): _decode_child(
+                    tree, o + base, field_name, off_size, memo, stack, relative
+                )
                 for i, o in zip(ids, val_offsets)
             },
             p + osz * count,
