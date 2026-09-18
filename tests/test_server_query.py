@@ -3940,3 +3940,86 @@ def test_a_nested_cursor_column_carries_no_indicator_byte() -> None:
     finally:
         _ENCODE_FIELD_VERSION.reset(enc)
         _DECODE_FIELD_VERSION.reset(dec)
+
+
+def test_the_describe_length_of_a_nested_cursor_column() -> None:
+    # A live 23ai describes a CURSOR(...) column with length 5. Zero here is the
+    # same trap as BOOLEAN, ROWID/UROWID/ADT, VECTOR and JSON before it -- the
+    # FIFTH occurrence: the client reads no bytes for the column and takes the
+    # value's first byte for the next token (#826).
+    from seerdb.common.tns import describe_wire_length
+    from seerdb.common.tns_consts import TNS_TYPE_REFCURSOR
+
+    column = ColumnMeta(
+        name=b'CURSORVALUE', data_type=TNS_TYPE_REFCURSOR, data_length=0, max_size=0
+    )
+    assert describe_wire_length(column) == 5
+
+
+def test_a_served_nested_cursor_round_trips_to_the_client_decoder() -> None:
+    # The value the Mirror writes for a cursor column must read back through the
+    # same decoder a real server's does, and must leave the NEXT row's token
+    # untouched (#826).
+    from seerdb.common.tns import (
+        _DECODE_FIELD_VERSION,
+        _ENCODE_FIELD_VERSION,
+        _read_refcursor_out,
+        encode_refcursor_column_value,
+    )
+    from seerdb.common.tns_consts import TTI_RXD
+
+    columns = [
+        ColumnMeta(
+            name=b'INTCOL+1', data_type=TNS_TYPE_NUMBER, data_length=22, max_size=0
+        )
+    ]
+    enc = _ENCODE_FIELD_VERSION.set(24)
+    dec = _DECODE_FIELD_VERSION.set(24)
+    try:
+        wire = encode_refcursor_column_value(columns, 7) + bytes([TTI_RXD])
+        record, rest = _read_refcursor_out(wire, indicator=False)
+    finally:
+        _ENCODE_FIELD_VERSION.reset(enc)
+        _DECODE_FIELD_VERSION.reset(dec)
+    assert record['cursor_id'] == 7
+    assert [c['column_name'] for c in record['row_format']] == [b'INTCOL+1']
+    assert rest[:1] == bytes([TTI_RXD])
+
+
+def test_parking_a_nested_cursor_recurses() -> None:
+    # A nested cursor may itself select a CURSOR(...) column. Each level needs a
+    # parked id of its own, or the inner CursorResult reaches the row encoder and
+    # the session dies with "no wire encoding for a column value of type
+    # CursorResult" (#826).
+    from seerdb.common.tns import NestedCursor
+    from seerdb.common.tns_consts import TNS_TYPE_REFCURSOR
+    from seerdb.server.backend import CursorResult
+    from seerdb.server.session import _Cursors, _park_nested_cursors
+
+    leaf_cols = [
+        ColumnMeta(name=b'V', data_type=TNS_TYPE_VARCHAR, data_length=10, max_size=10)
+    ]
+    inner_cols = [
+        ColumnMeta(
+            name=b'INNER', data_type=TNS_TYPE_REFCURSOR, data_length=5, max_size=0
+        )
+    ]
+    outer_cols = [
+        ColumnMeta(
+            name=b'OUTER', data_type=TNS_TYPE_REFCURSOR, data_length=5, max_size=0
+        )
+    ]
+    deep = CursorResult(columns=leaf_cols, rows=[('x',)])
+    middle = CursorResult(columns=inner_cols, rows=[(deep,)])
+    cursors = _Cursors()
+    (row,) = _park_nested_cursors([(middle,)], outer_cols, cursors)
+    outer = row[0]
+    assert isinstance(outer, NestedCursor)
+    # The inner level was parked too, and under a DIFFERENT id.
+    _cols, parked = cursors.take(outer.cursor_id, 10)
+    inner = parked[0][0]
+    assert isinstance(inner, NestedCursor)
+    assert inner.cursor_id != outer.cursor_id
+    # A result with no cursor column is returned untouched, allocating nothing.
+    plain = [(1,), (2,)]
+    assert _park_nested_cursors(plain, leaf_cols, cursors) is plain

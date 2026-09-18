@@ -769,8 +769,13 @@ def _build_refcursor_cursor(Connection, Rows, Marker) -> 'Cursor':
     Nested = Cursor(Connection)
     Nested._description = [_column_description(C) for C in Marker['row_format']]
     Nested._annotations = [_col_annotations(C) for C in Marker['row_format']]
+    # Recursive: a nested cursor may itself select a CURSOR(...) column, so its
+    # rows get the same resolution the outer ones did (#826).
     Nested._rows = [
-        _resolve_objects(Connection, _resolve_lobs(Connection, Row)) for Row in Rows
+        _resolve_nested_cursors(
+            Connection, _resolve_objects(Connection, _resolve_lobs(Connection, Row))
+        )
+        for Row in Rows
     ]
     Nested._rowcount = len(Nested._rows)
     Nested._row_index = 0

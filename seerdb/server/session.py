@@ -50,6 +50,7 @@ from seerdb.common.tns import (
     ExecRequest,
     FetchRequest,
     LobEmitLog,
+    NestedCursor,
     ReexecuteRequest,
     RefCursorOutBind,
     ScalarOutBind,
@@ -135,6 +136,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_JSON,
     TNS_TYPE_LONG,
     TNS_TYPE_LONGRAW,
+    TNS_TYPE_REFCURSOR,
     TNS_TYPE_VECTOR,
     TNS_VERSION_MIN_LARGE_SDU,
     TTI_ALL8,
@@ -2128,6 +2130,36 @@ def _bind_vars(request: ExecRequest) -> list:
     ]
 
 
+def _park_nested_cursors(
+    rows: list[tuple], columns: list[ColumnMeta], cursors: _Cursors
+) -> list[tuple]:
+    # Replace every CursorResult cell with a NestedCursor naming a freshly parked
+    # cursor. A result with no cursor column returns untouched, so the ordinary
+    # path allocates nothing (#826).
+    positions = [
+        index
+        for index, col in enumerate(columns)
+        if col.data_type == TNS_TYPE_REFCURSOR
+    ]
+    if not positions:
+        return rows
+    out = []
+    for row in rows:
+        cells = list(row)
+        for index in positions:
+            value = cells[index] if index < len(cells) else None
+            if isinstance(value, CursorResult):
+                # Recursive: a nested cursor may itself select a CURSOR(...)
+                # column, so park ITS cursors before parking it (#826).
+                inner = _park_nested_cursors(list(value.rows), value.columns, cursors)
+                cells[index] = NestedCursor(
+                    columns=value.columns,
+                    cursor_id=cursors.open(value.columns, inner),
+                )
+        out.append(tuple(cells))
+    return out
+
+
 def _out_bind_entries(
     out_binds: list,
     bind_meta: list,
@@ -2377,6 +2409,11 @@ def _answer_query(
             # below (#826).
             standing_defines = cursors.defines(reused_id)
             columns = inline_long_for_defines(list(result.columns), standing_defines)
+            # A nested-cursor cell (`select ..., CURSOR(select ...)`) arrives as a
+            # whole result set. Park each one's rows under an id of its own and
+            # leave a marker naming it, the way a REF CURSOR OUT bind is served --
+            # the client fetches them by that id afterwards (#826).
+            rows = _park_nested_cursors(rows, columns, cursors)
             # A LOB result's rows carry locators; the client reads their content
             # row-major over TTI_LOBOPS, so queue every cell's content in that
             # order for the loop to drain (#413).
@@ -2522,7 +2559,7 @@ def _answer_scroll(
         stream.write_packet(TNS_DATA, _backend_fault_error(exc))
         return []
     columns = result.columns
-    rows = list(result.rows)
+    rows = _park_nested_cursors(list(result.rows), columns, cursors)
     cursor_id = cursors.open_scroll(columns, rows)
     size = _prefetch_batch(request.fetch, len(rows))
     batch = rows[:size]
@@ -2599,7 +2636,7 @@ def _answer_reexecute(
     # none. Reverting to locators here desynced a client that was still reading
     # the column as a string / bytes (#826).
     columns = inline_long_for_defines(columns, cursors.defines(request.cursor))
-    rows = list(result.rows)
+    rows = _park_nested_cursors(list(result.rows), columns, cursors)
     lobs = oci_lob_contents(columns, rows) if columns else []
     # The request's iteration count is the client's prefetch size, so it is also
     # the batch size. Anything past it is parked on the SAME cursor id the client
