@@ -474,3 +474,77 @@ def test_a_backend_that_cannot_report_its_session_never_fails_the_login() -> Non
     # Neither stands in for a whole Backend; the hook is all this reads.
     assert _backend_session_info(cast('Backend', NoHook())) == SessionInfo()
     assert _backend_session_info(cast('Backend', Raises())) == SessionInfo()
+
+
+def test_the_osesskey_carries_the_callers_session_identity() -> None:
+    # program / machine / terminal / osuser are informational -- nothing
+    # authenticates on them -- but they are readable ONLY through this message,
+    # so a caller's values have to travel here or v$session shows the driver's
+    # own (#826). AUTH_SID is osuser, not a session id.
+    from seerdb.common.tns import encode_dictionary_sess
+    from seerdb.common.tns_consts import FIELD_VERSION_12_1
+    from seerdb.server.auth import parse_client_identity
+
+    env = {
+        'user': 'PYTHONTEST',
+        'program': 'newprogram',
+        'machine': 'newmachine',
+        'terminal': 'newterminal',
+        'osuser': 'newosuser',
+    }
+    payload = encode_dictionary_sess(
+        {'seq': 1, 'env': env, 'field_version': FIELD_VERSION_12_1}
+    )
+    assert parse_client_identity(payload, FIELD_VERSION_12_1) == {
+        'program': 'newprogram',
+        'machine': 'newmachine',
+        'terminal': 'newterminal',
+        'osuser': 'newosuser',
+    }
+
+
+def test_the_osesskey_falls_back_to_what_this_process_is() -> None:
+    # A caller who sets nothing keeps the previous behaviour exactly: the
+    # program is app_name, the osuser is the database user, and the machine is
+    # this host.
+    import socket
+
+    from seerdb.common.tns import encode_dictionary_sess
+    from seerdb.common.tns_consts import FIELD_VERSION_12_1
+    from seerdb.server.auth import parse_client_identity
+
+    payload = encode_dictionary_sess(
+        {
+            'seq': 1,
+            'env': {'user': 'PYTHONTEST', 'app_name': 'seerdb'},
+            'field_version': FIELD_VERSION_12_1,
+        }
+    )
+    identity = parse_client_identity(payload, FIELD_VERSION_12_1)
+    assert identity['program'] == 'seerdb'
+    assert identity['osuser'] == 'PYTHONTEST'
+    assert identity['machine'] == socket.gethostname()
+    assert identity['terminal'] == 'unknown'
+
+
+def test_parse_client_identity_never_raises_on_rubbish() -> None:
+    # Identity is metadata. A login must not fail because it could not be read.
+    from seerdb.server.auth import parse_client_identity
+
+    assert parse_client_identity(b'') == {}
+    assert parse_client_identity(b'\x03\x76not an osesskey') == {}
+
+
+def test_both_connections_take_the_same_identity_arguments() -> None:
+    # Sync/async parity: the async connection inherits the shared logic that
+    # reads these, so an attribute missing from one of them is an AttributeError
+    # at connect time, not a type error here.
+    import inspect
+
+    from seerdb.client.aconnection import AsyncOracleConnect
+    from seerdb.client.connection import OracleConnect
+
+    wanted = {'program', 'machine', 'terminal', 'osuser'}
+    for cls in (OracleConnect, AsyncOracleConnect):
+        params = set(inspect.signature(cls.__init__).parameters)
+        assert wanted <= params, cls.__name__

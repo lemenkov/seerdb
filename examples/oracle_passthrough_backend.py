@@ -119,6 +119,8 @@ class OraclePassthroughBackend:
         # every session's backend authenticates against — a fresh connection then
         # sees the new password (#21/#486). Keys are upper-cased in place.
         self._credentials = credentials
+        # What the client said it is, filled in before authenticate() (#826).
+        self._client_identity: dict[str, str] = {}
         for name in list(self._credentials):
             if name != name.upper():
                 self._credentials[name.upper()] = self._credentials.pop(name)
@@ -142,8 +144,25 @@ class OraclePassthroughBackend:
             password=password,
             service_name=self._service,
             autocommit=False,
+            # Present the CLIENT's identity upstream, not this process's, so
+            # v$session shows who actually connected (#826). Each is None when
+            # the client declared nothing, and the driver falls back to its own.
+            **self._client_identity,
         )
         return password
+
+    def set_client_identity(self, identity: dict) -> None:
+        """The session identity the client declared, for the upstream connect.
+
+        Called before :meth:`authenticate`, because that is where the upstream
+        connection opens and program / machine / terminal / osuser are login-time
+        attributes there as much as here -- they cannot be set afterwards (#826).
+        """
+        self._client_identity = {
+            key: value
+            for key, value in identity.items()
+            if key in ('program', 'machine', 'terminal', 'osuser')
+        }
 
     def session_info(self) -> SessionInfo:
         """The upstream session's real identity, for the Mirror's login reply.

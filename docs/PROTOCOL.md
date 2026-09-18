@@ -895,6 +895,26 @@ TTI_FUN | TTI_AUTH | SeqNum | 1 | UserLen | AuthMode | 1 | NumPairs | 1 | 1 |
 
 ### 4.6 Authentication Result (TTI_RPA from Server)
 
+The OSESSKEY also carries the client's **session identity** — what a server
+records in `v$session` (#826):
+
+| Pair | `v$session` column |
+|---|---|
+| `AUTH_PROGRAM_NM` | `program` |
+| `AUTH_MACHINE` | `machine` |
+| `AUTH_TERMINAL` | `terminal` |
+| `AUTH_SID` | **`osuser`** — not a session id, despite the name |
+
+None of it is authenticated; the server simply records what it is told. It is
+readable *only* through this message, so a client that wants its own values there
+has to send them here, and a relaying server has to read them here.
+
+**The driver name is not among them.** `client_driver`, in
+`v$session_connect_info`, arrives one message later — in the AUTH, after the
+OSESSKEY. That ordering matters to anything that opens a downstream connection
+during authentication: the first four are available in time, the driver name is
+not.
+
 If successful, the server returns TTI_RPA with:
 
 | Key                     | Description                        |

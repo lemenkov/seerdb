@@ -79,6 +79,10 @@ class _ConnectionLogic:
     charset: str
     prelim: int
     app_name: str
+    program: str | None
+    machine: str | None
+    terminal: str | None
+    osuser: str | None
     sdu: int
     _e2e_values: dict
     _e2e_pending: dict
@@ -309,6 +313,13 @@ class _ConnectionLogic:
                 'charset': self.charset,
                 'prelim': self.prelim,
                 'app_name': self.app_name,
+                # Session identity recorded in v$session (#826). Each is
+                # None unless the caller set it, and encode_dictionary_sess
+                # falls back to what this process actually is.
+                'program': self.program,
+                'machine': self.machine,
+                'terminal': self.terminal,
+                'osuser': self.osuser,
             },
             'sdu': self.sdu,
             'type': Type,

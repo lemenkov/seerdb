@@ -351,6 +351,40 @@ def parse_osesskey(payload: bytes, field_version: int = FIELD_VERSION_11_2) -> b
     return user
 
 
+# The OSESSKEY pairs that carry the client's session identity, mapped to the
+# v$session column each one lands in. AUTH_SID is osuser, not a session id (#826).
+_IDENTITY_KEYS = {
+    b'AUTH_PROGRAM_NM': 'program',
+    b'AUTH_MACHINE': 'machine',
+    b'AUTH_TERMINAL': 'terminal',
+    b'AUTH_SID': 'osuser',
+}
+
+
+def parse_client_identity(
+    payload: bytes, field_version: int = FIELD_VERSION_11_2
+) -> dict[str, str]:
+    """The session identity the client declared in its OSESSKEY (#826).
+
+    program / machine / terminal / osuser, by the name each is known by, and only
+    the ones actually sent. They ride in the FIRST auth message, which is why a
+    Mirror can relay them to an upstream session it opens during authentication --
+    the driver name arrives later, in the AUTH, and is not here.
+
+    Never raises: identity is informational, and a login must not fail over it.
+    """
+    try:
+        _subtype, _user, kvs = _parse_fun_auth(payload, field_version)
+    except Exception:  # noqa: BLE001 - a login must not fail over metadata
+        return {}
+    out = {}
+    for key, name in _IDENTITY_KEYS.items():
+        value = kvs.get(key)
+        if value:
+            out[name] = value.decode('utf-8', 'replace')
+    return out
+
+
 # The classic sqlplus / thick-OCI (deadbeef dialect) OSESSKEY marshals its fixed
 # header fields very differently from the thin form: an 8-byte 0xFE indicator
 # (0xFFFFFFFFFFFFFFFE little-endian) stands in for thin's 0x01 pointer bytes, and

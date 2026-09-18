@@ -159,6 +159,7 @@ from seerdb.server.auth import (
     parse_auth_response_oci,
     parse_changepassword,
     parse_changepassword_oci,
+    parse_client_identity,
     parse_osesskey,
     parse_osesskey_oci,
     parse_token_auth,
@@ -440,6 +441,19 @@ def handle_login(
         if sqlplus
         else parse_osesskey(osesskey, field_version)
     ).decode('utf-8')
+    # Hand the client's declared session identity to the backend BEFORE it
+    # authenticates: that is where a passthrough opens its upstream connection,
+    # and program / machine / terminal / osuser are login-time attributes there
+    # too -- they cannot be set afterwards (#826). A backend without the hook, or
+    # a client that declared nothing, simply skips this.
+    if not sqlplus:
+        identity_kvs = parse_client_identity(osesskey, field_version)
+        set_identity = getattr(backend, 'set_client_identity', None)
+        if identity_kvs and set_identity is not None:
+            try:
+                set_identity(identity_kvs)
+            except Exception as exc:  # noqa: BLE001 - never fail a login over this
+                logger.warning('backend refused the client identity: %s', exc)
     secret = backend.authenticate(user)
     if secret is None:
         _deny_login(stream, f'unknown user: {user!r}')
