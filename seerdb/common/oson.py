@@ -342,17 +342,29 @@ def encode_oson(value, *, allow_wide: bool = False) -> bytes:
     # The two share one field-id space with every short name first, so the ids
     # walk() handed out have to be renumbered into that order (#826).
     encoded = [n.encode('utf-8') for n in fnames]
-    short_at = [i for i, b in enumerate(encoded) if len(b) <= 0xFF]
-    long_at = [i for i, b in enumerate(encoded) if len(b) > 0xFF]
-    if long_at:
-        renumber = {old + 1: new + 1 for new, old in enumerate(short_at + long_at)}
-        remapped = {name: renumber[old] for name, old in ids.items()}
-        ids.clear()
-        ids.update(remapped)
+
+    def _sort_key(index: int) -> tuple:
+        # The server keeps its field names ORDERED BY HASH and looks them up that
+        # way, so an image whose names are in any other order matches no path.
+        # Ties break on the name's length, then its bytes. The key uses the low
+        # byte of the hash even for a long name, whose stored hash is 16 bits.
+        name = encoded[index]
+        return (_fname_hash(name) & 0xFF, len(name), name)
+
+    short_at = sorted(
+        (i for i, b in enumerate(encoded) if len(b) <= 0xFF), key=_sort_key
+    )
+    long_at = sorted((i for i, b in enumerate(encoded) if len(b) > 0xFF), key=_sort_key)
+    # Renumber unconditionally: sorting reorders the ids walk() handed out even
+    # when there is no long name to move to the back.
+    renumber = {old + 1: new + 1 for new, old in enumerate(short_at + long_at)}
+    remapped = {name: renumber[old] for name, old in ids.items()}
+    ids.clear()
+    ids.update(remapped)
     fnames_b = [encoded[i] for i in short_at]
     fnames_seg = b''.join(bytes([len(b)]) + b for b in fnames_b)
     off_arr = b''.join(off.to_bytes(2, 'big') for off in _fname_offsets(fnames_b))
-    hash_arr = b'\x00' * len(fnames_b)
+    hash_arr = bytes(_fname_hash(b) & 0xFF for b in fnames_b)
     long_b = [encoded[i] for i in long_at]
     long_seg = b''.join(len(b).to_bytes(2, 'big') + b for b in long_b)
     if len(long_seg) > 0xFFFF:
@@ -365,7 +377,12 @@ def encode_oson(value, *, allow_wide: bool = False) -> bytes:
         long_offsets.append(_pos)
         _pos += 2 + len(b)
     long_off_arr = b''.join(o.to_bytes(long_off_size, 'big') for o in long_offsets)
-    long_hash_arr = b'\x00\x00' * len(long_b)
+    # A long name's hash is the same FNV-1a, low SIXTEEN bits, little-endian --
+    # so its first byte is the short form's byte and the second extends it.
+    # Captured from 23ai as c5 62 / c5 dd for 'A'*256 / 'B'*256.
+    long_hash_arr = b''.join(
+        (_fname_hash(b) & 0xFFFF).to_bytes(2, 'little') for b in long_b
+    )
     # Build the tree with ub2 value-offsets; if the tree exceeds what a ub2
     # offset can address (either it grows past 0xFFFF or an individual offset
     # would overflow), rebuild with ub4 offsets (#88). Two passes at most.
@@ -437,6 +454,15 @@ def _count_width(tag: int) -> int:
     if tag & _TAG_UB4_COUNT:
         return 4
     return 2 if (tag & _TAG_WIDE_COUNT) else 1
+
+
+def _fname_hash(name: bytes) -> int:
+    # FNV-1a, 32-bit. The server indexes field names by this, so an image whose
+    # hash array is wrong stores and serialises fine but matches NO json path.
+    h = 0x811C9DC5
+    for byte in name:
+        h = ((h ^ byte) * 16777619) & 0xFFFFFFFF
+    return h
 
 
 def _fname_offsets(fnames_b: list[bytes]) -> list[int]:

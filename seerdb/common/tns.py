@@ -2041,10 +2041,18 @@ def parse_exec(
         # in place -- come after all its other values (docs/PROTOCOL.md 5.4); a
         # PL/SQL block's ride in place. (A cached re-execute carries no SQL, but
         # a cached cursor is DML only, #703.)
+        # A native JSON / VECTOR bind is NOT LONG-class, however wide its OAC
+        # says it is -- and it always says 32 MiB. It carries its own descriptor
+        # framing and rides in place, so sorting it to the end swapped it with
+        # every bind after it: the value landed in the following bind's slot and
+        # that bind read the image's bytes as a NUMBER (#826). It went unnoticed
+        # because a JSON bind is usually the last one, where the move is a no-op.
         long_binds = frozenset(
             index
-            for index, (_data_type, _csfrm, maxlen, _toid) in enumerate(types)
-            if maxlen > max_string_size and not is_plsql(sql)
+            for index, (data_type, _csfrm, maxlen, _toid) in enumerate(types)
+            if maxlen > max_string_size
+            and data_type not in _PREFETCHED_IMAGE_TYPES
+            and not is_plsql(sql)
         )
         carried = [index for index in range(len(types)) if index not in return_binds]
         order = [index for index in carried if index not in long_binds] + [
@@ -8211,7 +8219,15 @@ def _long_bind_positions(Oac: list, MaxStringSize: int) -> frozenset:
     for Index, Token in enumerate(Oac):
         if isinstance(Token, Var) and Token.is_array:
             continue
-        (_, MaxLen, *_rest) = decode_oac_fields(encode_token_oac(Token))
+        (DataType, MaxLen, *_rest) = decode_oac_fields(encode_token_oac(Token))
+        if DataType in _PREFETCHED_IMAGE_TYPES:
+            # A native JSON / VECTOR bind declares 32 MiB but is NOT LONG-class:
+            # it carries its own descriptor framing and rides in place. Sorting it
+            # to the end put it in the following bind's slot, which a real 23ai
+            # rejects with ORA-24813 -- so `update t set j = :1 where id = :2`
+            # failed while `insert into t values (:1, :2)` worked, the JSON bind
+            # being last there and the move a no-op (#826).
+            continue
         if MaxLen > MaxStringSize:
             Out.add(Index)
     return frozenset(Out)
