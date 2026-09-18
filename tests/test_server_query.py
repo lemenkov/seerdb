@@ -1126,6 +1126,31 @@ def test_encode_rows_timestamptz_values() -> None:
     ]
 
 
+def test_encode_rows_timestamp_ltz_values() -> None:
+    import datetime
+
+    from seerdb.common.tns_consts import TNS_TYPE_TIMESTAMPLTZ
+
+    # TIMESTAMP WITH LOCAL TIME ZONE is the 11-byte TIMESTAMP shape, not the
+    # 13-byte TZ one and not a 7-byte DATE: the server normalises it to the
+    # session zone and sends no offset. Encoding it as a DATE dropped the
+    # fractional seconds SILENTLY -- .123456 came back .0, no error (#826).
+    col = ColumnMeta(
+        name=b'LTZ', data_type=TNS_TYPE_TIMESTAMPLTZ, data_length=11, max_size=11
+    )
+    values = [
+        (datetime.datetime(2024, 1, 15, 13, 30, 45, 123456),),
+        (datetime.datetime(2023, 5, 4, 22, 30, 2, 500000),),
+        (datetime.datetime(2020, 12, 31, 23, 59, 59),),
+    ]
+    body = encode_rows(values, [col])
+    response = encode_describe([col]) + body + bytes([TTI_STA])
+    _, rows = _decode_response(response)
+    assert rows == [list(v) for v in values]
+    # And the column really is 11 bytes wide on the wire, like a TIMESTAMP.
+    assert body.count(bytes([11])) >= len(values)
+
+
 def test_parse_exec_extracts_bind_values() -> None:
     from seerdb.common.tns import encode_dictionary_exec
 
