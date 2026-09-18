@@ -10915,9 +10915,16 @@ def _encode_temporal(Value: datetime.date, DataType: int) -> bytes:
             Dt if Dt.tzinfo is not None else Dt.replace(tzinfo=datetime.timezone.utc)
         )
         return encode_token_datetime(Aware)
-    if DataType == TNS_TYPE_TIMESTAMP:
+    if DataType in (TNS_TYPE_TIMESTAMP, TNS_TYPE_TIMESTAMPLTZ):
         # 11 bytes always: DATE prefix + 4 BE nanosecond bytes (zero when the
         # value has no sub-second part), keeping the column a fixed width.
+        #
+        # TIMESTAMP WITH LOCAL TIME ZONE is the SAME shape: it is normalised to
+        # the session zone and carries no explicit offset, which is why its
+        # describe length is 11 like a plain TIMESTAMP and unlike TZ's 13. Left
+        # out of this branch it fell through to the DATE form below and silently
+        # dropped the fractional seconds -- 22:30:02.5 came back 22:30:02, with
+        # no error anywhere (#826).
         Naive = Dt.replace(tzinfo=None)
         return _encode_date_prefix(Naive) + (Naive.microsecond * 1000).to_bytes(
             4, 'big'

@@ -2527,6 +2527,23 @@ local time. The encoder is symmetric: a `datetime` with `tzinfo` is
 first converted to UTC for the wall-clock bytes, then tagged with the
 original offset.
 
+### 11.4a TIMESTAMP WITH LOCAL TIME ZONE
+
+11 bytes — the **same** shape as a plain TIMESTAMP (§11.3), not the 13-byte TZ
+form. The server normalises the value to the session's time zone on the way in
+and renders it back in the session zone on the way out, so nothing on the wire
+identifies a zone and no offset bytes are carried. Its describe length is 11
+accordingly (§6.2), which is the giveaway: a 13-byte frame is always a real
+TIMESTAMP WITH TIME ZONE.
+
+The consequence for an encoder is that dispatch must be on the column's
+`data_type`, and TIMESTAMPLTZ (231) must land on the 11-byte branch. Falling
+through to the 7-byte DATE form produces a frame the client reads without
+complaint and **silently drops the fractional seconds** — `22:30:02.5` arrives
+as `22:30:02` with no error anywhere (seerdb#826). A `datetime`'s `tzinfo`, if
+any, is discarded rather than applied: the wall clock is already session-local
+by the time it reaches the wire.
+
 ### 11.5 INTERVAL YEAR TO MONTH
 
 5 bytes: `Year(4 bytes, big-endian) | Month(1 byte)`, biased by `2**31` and `60`
