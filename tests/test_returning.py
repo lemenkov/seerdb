@@ -58,6 +58,42 @@ class TestReturningDetection(unittest.TestCase):
         sql = "UPDATE t SET note = 'returning into x' WHERE id = :1"
         self.assertEqual(returning_bind_positions(sql, 1), frozenset())
 
+    def test_returning_inside_a_plsql_block_is_not_a_wire_returning(self):
+        # A RETURNING INTO inside a PL/SQL block is the block's own business:
+        # the INTO target is an ordinary PL/SQL OUT bind and the block executes
+        # like any other. Treated as a wire DML RETURNING, the client writes NO
+        # value for that bind, so the server waits for bind bytes that never
+        # arrive and neither side speaks again -- a HANG, not an error, ended
+        # only by the client's 15s read timeout (#826).
+        block = """
+            declare
+                t_id number;
+            begin
+                select nvl(count(*), 0) + 1 into t_id from t;
+                insert into t (id) values (t_id)
+                    returning id into :out_bind;
+            end;
+        """
+        self.assertEqual(returning_bind_positions(block, 1), frozenset())
+
+    def test_begin_block_with_returning_is_not_a_wire_returning(self):
+        # The BEGIN form too, and with a leading comment -- is_plsql() strips
+        # comments, so the guard must not be fooled into seeing plain DML.
+        block = '-- go\nBEGIN insert into t (a) values (:1) returning id into :2; END;'
+        self.assertEqual(returning_bind_positions(block, 2), frozenset())
+
+    def test_plain_dml_returning_still_detected_when_wrapped_by_us(self):
+        # The pre-10g path wraps a DML RETURNING in a block itself (#801) and
+        # relies on the ORIGINAL statement still classifying as RETURNING -- the
+        # positions are computed before the wrap. Guard that it does.
+        from seerdb.common.sqltext import wrap_returning_in_block
+
+        sql = 'INSERT INTO t VALUES (:1) RETURNING id INTO :2'
+        self.assertEqual(returning_bind_positions(sql, 2), frozenset({1}))
+        wrapped, _name = wrap_returning_in_block(sql)
+        # ...and that the wrapped form is a block, so it takes the new path.
+        self.assertEqual(returning_bind_positions(wrapped, 2), frozenset())
+
 
 # A TTI_RXD (0x07) carrying return data for two binds: NUMBER 42 and VARCHAR
 # 'hi', one row each, then a TTI_STA to end the response.

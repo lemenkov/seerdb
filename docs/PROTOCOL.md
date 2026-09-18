@@ -5011,6 +5011,27 @@ list of returned values (python-oracledb-compatible). Sync + async; verified on
 10g/11g/21c/23ai (INSERT / multi-row UPDATE / multi-row DELETE / zero-row /
 all-return-no-input).
 
+**This form is for a DML statement only — a PL/SQL block is never it.** A block
+may well contain `... RETURNING col INTO :b`, but that is the block's own PL/SQL:
+the INTO target is an ordinary OUT bind and the block executes like any other
+anonymous block. Text-matching `RETURNING ... INTO` without first excluding a
+block gets this catastrophically wrong in a way that is hard to read from a
+capture, because **nothing is sent**: rule 1 says the client writes no value for
+a return bind, so the server keeps waiting for bind bytes that never arrive, the
+client keeps waiting for a reply, and the connection sits dead until one side's
+read timeout fires (seerdb#826 — 15 s, reported as a network read timeout rather
+than anything naming the real cause). Both ends of seerdb share one classifier
+(`returning_bind_positions`), so the same misreading appeared symmetrically: the
+client hung on its own request, and the Mirror routed an inbound block into its
+DML-RETURNING path.
+
+Note that the pre-10g fallback wraps a real DML RETURNING *into* a block
+deliberately (§19.3 — those servers refuse the native form with `ORA-00439`).
+That is consistent with the rule rather than an exception to it —
+once wrapped, the statement genuinely is a block with ordinary OUT binds, which
+is exactly why those servers accept it. Its return-bind positions are computed
+from the original statement, before the wrap.
+
 ### 22.1 Array RETURNING (`executemany`, #687)
 
 An array execute of a RETURNING statement follows the same two rules, applied
