@@ -607,3 +607,60 @@ class TestOsonVersionThree(unittest.TestCase):
     def test_a_long_name_nested_inside_the_document(self):
         doc = {'A' * 300: {'B' * 280: [1, 2, {'c': 3}]}}
         self.assertEqual(decode_oson(encode_oson(doc, allow_wide=True)), doc)
+
+
+class TestOsonRelativeOffsetsAndSharedFields(unittest.TestCase):
+    """A `store as (compress high)` JSON column writes two things extra (#826).
+
+    Both are in the image below, captured from a live 23ai for
+    ``[{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]`` in a compressed column, and
+    hand-decoded byte by byte:
+
+    * **relative offsets** (image flag `0x01`): a container's child value-offsets
+      count from the container's own offset, not from the start of the tree
+      segment. The first object sits at tree offset 6 and stores 8 / 11 for
+      children that really live at 14 / 17.
+    * **shared field ids** (container tag count-bits `0x18`): the second object
+      stores no field-id array at all, only an offset to the first object's.
+    """
+
+    SHARED = bytes.fromhex(
+        'ff4a5a012107020004001f00012ce50000000201610162'  # header + field names
+        'c00200060013'  # root array: 2 children, at tree offsets 6 and 19
+        '860201020008000b'  # object @6: field ids a,b; children at +8, +11
+        '21c102'  # the number 1, at 14
+        '0178'  # the string "x", at 17
+        '9c00060007000a'  # object @19: SHARES @6's field ids; children at +7, +10
+        '21c103'  # the number 2, at 26
+        '0179'  # the string "y", at 29
+    )
+
+    def test_relative_offsets_and_shared_field_ids(self):
+        self.assertEqual(
+            decode_oson(self.SHARED), [{'a': 1, 'b': 'x'}, {'a': 2, 'b': 'y'}]
+        )
+
+    def test_the_shared_pointer_is_absolute_even_in_relative_mode(self):
+        # The donor offset is NOT rebased -- only the value offsets are. Rebasing
+        # it too sent the second object's lookup to 6 + 19 = 25, mid-value.
+        image = bytearray(self.SHARED)
+        tree = 23  # where the tree segment starts in this image
+        self.assertEqual(image[tree + 19], 0x9C)  # the sharing node
+        self.assertEqual(int.from_bytes(image[tree + 20 : tree + 22], 'big'), 6)
+
+    def test_an_extended_scalar_is_not_mistaken_for_a_shared_container(self):
+        # DATE (0x3C), TIMESTAMP (0x39), TIMESTAMP WITH TZ (0x7C) and the two
+        # intervals all carry BOTH count bits, so the shared-container test has to
+        # require a container tag as well. Without that every bare-scalar temporal
+        # image raised "object node in a scalar-only OSON image" -- eight fixtures
+        # went red at once.
+        for tag in (0x3C, 0x39, 0x7C, 0x3D, 0x3E, 0x7D):
+            self.assertEqual(tag & 0x18, 0x18, f'0x{tag:02x} carries both bits')
+        for image in (
+            'ff4a5a01001600083c787c060f010101',  # DATE
+            'ff4a5a010016000c39787e060f0d340f2faabe58',  # TIMESTAMP
+            'ff4a5a010016000e7c787e060f0d323135cad020143c',  # TIMESTAMP WITH TZ
+            'ff4a5a01001600063d800000033e',  # INTERVAL YEAR TO MONTH
+            'ff4a5a010016000c3e800000023c3c3c80000000',  # INTERVAL DAY TO SECOND
+        ):
+            decode_oson(bytes.fromhex(image))  # must not raise
