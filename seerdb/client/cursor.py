@@ -274,7 +274,12 @@ class Cursor(_CursorLogic):
             self._description = [_column_description(C) for C in ColMeta]
             self._annotations = [_col_annotations(C) for C in ColMeta]
             self._rows = [
-                _resolve_objects(self._connection, _resolve_lobs(self._connection, row))
+                _resolve_nested_cursors(
+                    self._connection,
+                    _resolve_objects(
+                        self._connection, _resolve_lobs(self._connection, row)
+                    ),
+                )
                 for row in (Rows or [])
             ]
             # For SELECT, the OER's success-iters value is the per-call fetch
@@ -504,7 +509,12 @@ class Cursor(_CursorLogic):
         self._description = [_column_description(C) for C in RowFormat]
         self._annotations = [_col_annotations(C) for C in RowFormat]
         self._rows = [
-            _resolve_objects(self._connection, _resolve_lobs(self._connection, Row))
+            _resolve_nested_cursors(
+                self._connection,
+                _resolve_objects(
+                    self._connection, _resolve_lobs(self._connection, Row)
+                ),
+            )
             for Row in (Rows or [])
         ]
         self._rowcount = len(self._rows)
@@ -765,6 +775,19 @@ def _build_refcursor_cursor(Connection, Rows, Marker) -> 'Cursor':
     Nested._rowcount = len(Nested._rows)
     Nested._row_index = 0
     return Nested
+
+
+def _resolve_nested_cursors(Connection, Row: list) -> list:
+    # Turn a nested-cursor cell -- `select ..., CURSOR(select ...) from ...` --
+    # into a fetchable Cursor (#826). The row decoder leaves the same marker a
+    # REF CURSOR OUT bind does: a cursor id plus the row format the server
+    # described inline, so the rows are fetched here and wrapped the same way.
+    Out = list(Row)
+    for I, Val in enumerate(Out):
+        if isinstance(Val, dict) and Val.get('_refcursor'):
+            Rows = Connection.fetch_all_rows(Val['cursor_id'], Val['row_format'])
+            Out[I] = _build_refcursor_cursor(Connection, Rows or [], Val)
+    return Out
 
 
 def _resolve_lobs(Connection, Row: list) -> list:

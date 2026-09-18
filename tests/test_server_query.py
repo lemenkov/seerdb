@@ -3902,3 +3902,41 @@ def test_a_national_array_out_bind_converts_every_element() -> None:
     )
     assert 'one'.encode('utf-16-be') in reply
     assert 'two'.encode('utf-16-be') in reply
+
+
+def test_a_nested_cursor_column_carries_no_indicator_byte() -> None:
+    # `select ..., CURSOR(select ...) from ...` returns a cursor per row. Its
+    # value is the same inline describe + cursor id a REF CURSOR OUT bind
+    # carries, but WITHOUT the trailing indicator / return code an OUT bind ends
+    # on -- in a row the next byte is the following row's TTI_RXD token.
+    # Consuming one there swallows that token, and the decoder then reports the
+    # first byte of the row's data as an unknown response token (#826).
+    from seerdb.common.tns import (
+        _DECODE_FIELD_VERSION,
+        _ENCODE_FIELD_VERSION,
+        _encode_describe_body,
+        _read_refcursor_out,
+        encode_sb4,
+    )
+    from seerdb.common.tns_consts import TTI_RXD
+
+    columns = [
+        ColumnMeta(
+            name=b'INTCOL+1', data_type=TNS_TYPE_NUMBER, data_length=22, max_size=0
+        )
+    ]
+    enc = _ENCODE_FIELD_VERSION.set(24)
+    dec = _DECODE_FIELD_VERSION.set(24)
+    try:
+        value = bytes([1]) + _encode_describe_body(columns) + encode_sb4(3)
+        # A column value: the next byte belongs to the next row.
+        record, rest = _read_refcursor_out(value + bytes([TTI_RXD]), indicator=False)
+        assert record['cursor_id'] == 3
+        assert [c['column_name'] for c in record['row_format']] == [b'INTCOL+1']
+        assert rest[:1] == bytes([TTI_RXD]), 'the next row token must survive'
+        # An OUT bind value: the indicator is real and is consumed.
+        _record, rest = _read_refcursor_out(value + b'\x00' + bytes([TTI_RXD]))
+        assert rest[:1] == bytes([TTI_RXD])
+    finally:
+        _ENCODE_FIELD_VERSION.reset(enc)
+        _DECODE_FIELD_VERSION.reset(dec)

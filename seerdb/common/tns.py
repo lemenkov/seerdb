@@ -3245,7 +3245,7 @@ def _read_iov(
     return (Directions, OutValues, Rest)
 
 
-def _read_refcursor_out(Rest: bytes) -> tuple[dict, bytes]:
+def _read_refcursor_out(Rest: bytes, *, indicator: bool = True) -> tuple[dict, bytes]:
     # A REF CURSOR OUT value: a 1-byte length, then an inline describe (max row
     # size, num columns, the same per-column metadata as a DCB), then the
     # nested cursor id (ub2) and a 1-byte indicator. Mirrors oracledb's
@@ -3269,7 +3269,12 @@ def _read_refcursor_out(Rest: bytes) -> tuple[dict, bytes]:
         # a REF CURSOR OUT bind (#84) — same pre-11g gap as decode_token_dcb.
         Rest = _skip_bytes_with_length(Rest)  # dcbqcky
     (CursorId, Rest) = decode_ub4(Rest)
-    Rest = Rest[1:]  # per-value indicator byte
+    if indicator:
+        # An OUT bind's value ends with a per-value indicator byte. A nested
+        # CURSOR COLUMN does not -- consuming one there swallows the next row's
+        # TTI_RXD token, and the decoder reports it as an unknown response token
+        # whose number is really the first byte of that row's data (#826).
+        Rest = Rest[1:]
     return ({'_refcursor': True, 'cursor_id': CursorId, 'row_format': Columns}, Rest)
 
 
@@ -3906,6 +3911,13 @@ def _decode_rxd_step(Data: bytes, Acc: tuple) -> tuple:
             if DataType in _LONG_DATA_TYPES:
                 (Val, Rest) = _read_long_column(Rest)
                 Row.append(decode_value(Col, Val))
+                continue
+            if DataType == TNS_TYPE_REFCURSOR:
+                # A nested cursor -- `select ..., CURSOR(select ...) from ...`.
+                # The value is the same inline describe + cursor id a REF CURSOR
+                # OUT bind carries, so it reads with the same helper (#826).
+                (Val, Rest) = _read_refcursor_out(Rest, indicator=False)
+                Row.append(Val)
                 continue
             if DataType == TNS_TYPE_ADT:
                 (Val, Rest) = _read_object_column(Rest, Col)
