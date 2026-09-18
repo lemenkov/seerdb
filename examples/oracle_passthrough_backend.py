@@ -49,6 +49,7 @@ from seerdb.server.backend import (
     Capability,
     CursorResult,
     Result,
+    SessionInfo,
 )
 
 
@@ -143,6 +144,45 @@ class OraclePassthroughBackend:
             autocommit=False,
         )
         return password
+
+    def session_info(self) -> SessionInfo:
+        """The upstream session's real identity, for the Mirror's login reply.
+
+        A client reads session_id / serial_num / instance_name / db_name /
+        service_name from that reply alone -- never by querying -- so relaying
+        the upstream's own values is the only way they come out right (#826).
+        """
+        assert self._conn is not None  # authenticate() ran before any execute
+        cursor = self._conn.cursor()
+        cursor.execute("""
+            select sys_context('userenv', 'sid'),
+                   sys_context('userenv', 'instance_name'),
+                   sys_context('userenv', 'db_unique_name'),
+                   sys_context('userenv', 'db_domain'),
+                   sys_context('userenv', 'service_name')
+              from dual""")
+        sid, instance, db_name, db_domain, service = cursor.fetchone()
+        serial = 0
+        try:
+            cursor.execute(
+                'select serial# from v$session '
+                "where sid = sys_context('userenv', 'sid')"
+            )
+            row = cursor.fetchone()
+            serial = int(row[0]) if row else 0
+        except seerdb.DatabaseError:
+            # v$session needs a grant this account may not have. The serial
+            # number is the one field with no sys_context equivalent, and a
+            # login must not fail over it.
+            pass
+        return SessionInfo(
+            session_id=int(sid) if sid else 0,
+            serial_num=serial,
+            instance_name=instance,
+            db_name=db_name,
+            db_domain=db_domain,
+            service_name=service,
+        )
 
     def _gettype_by_oid(self, oid: bytes) -> DbObjectType | None:
         # Resolve a type's 16-byte OID to its DbObjectType via all_types (the bind

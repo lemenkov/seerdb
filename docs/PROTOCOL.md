@@ -904,6 +904,22 @@ If successful, the server returns TTI_RPA with:
 | `AUTH_SESSION_ID`       | Session identifier                 |
 | `AUTH_SERIAL_NUM`       | Session serial number (12.1+)      |
 | `AUTH_MAX_OPEN_CURSORS` | Session's max open cursors (12.1+) |
+| `AUTH_INSTANCENAME`     | Instance name                      |
+| `AUTH_SC_DBUNIQUE_NAME` | Database unique name               |
+| `AUTH_SC_DB_DOMAIN`     | Database domain                    |
+| `AUTH_SC_SERVICE_NAME`  | Service name                       |
+
+**The session's identity is reported here and NOWHERE else (#826).** A client
+exposes `session_id`, `serial_num`, `instance_name`, `db_name`, `db_domain` and
+`service_name` straight from this reply and never queries for them, so a server
+that omits them leaves those attributes empty for the life of the connection
+however correct the session otherwise is — `sys_context('userenv', 'sid')` will
+happily return the right value in the same breath. Measured on a live 23ai:
+`AUTH_INSTANCENAME` `FREE`, `AUTH_SC_DBUNIQUE_NAME` `FREE`,
+`AUTH_SC_SERVICE_NAME` `freepdb1` (lower case, unlike the others).
+
+A server sends only the names that apply — one with no domain sends no
+`AUTH_SC_DB_DOMAIN` at all rather than an empty value.
 
 The client validates by decrypting `AUTH_SVR_RESPONSE` with the connection key and checking for the presence of `"SERVER_TO_CLIENT"` in the plaintext.
 

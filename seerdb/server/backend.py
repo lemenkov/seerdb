@@ -122,6 +122,25 @@ class Result:
     returned_rows: list[list[tuple]] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class SessionInfo:
+    """What a login reply tells the client about its session (#826).
+
+    A client reads these ONLY from the auth reply -- `connection.session_id`,
+    `.serial_num`, `.instance_name`, `.db_name`, `.service_name` never query for
+    them -- so a Mirror that reports placeholders here leaves them wrong however
+    correct the session otherwise is. Every field is optional: a backend fills in
+    what it knows, and the reply carries only those.
+    """
+
+    session_id: int = 0
+    serial_num: int = 0
+    instance_name: str | None = None
+    db_name: str | None = None
+    db_domain: str | None = None
+    service_name: str | None = None
+
+
 class BackendError(Exception):
     """A backend failure surfaced to the client as an ORA error.
 
@@ -175,6 +194,18 @@ class Backend(Protocol):
         fills. Those carry no value from the client, and the BindVar says what
         type is wanted there. Without it such a statement is refused with an ORA
         error rather than breaking the connection.
+
+    ``session_info() -> SessionInfo``
+        The session's real identity -- id, serial number, instance / database /
+        service name -- which the Mirror reports in the login reply. A client
+        exposes these as ``connection.session_id`` and friends, and reads them
+        ONLY from that reply, never by querying (#826). Without it the Mirror
+        reports a placeholder id of 0 and no names at all.
+
+    ``describe(sql) -> list[ColumnMeta]``
+        Describe a statement without running it, for ``cursor.parse()`` (#826).
+        Without it the Mirror runs the query with every bind NULL and drops the
+        rows, which is side-effect free but does reach the database.
 
     ``field_version`` (int) / ``tns_version`` (int)
         The Oracle protocol version this backend presents. A backend that

@@ -43,6 +43,7 @@ from seerdb.common.tns import (
     _LOB_EMIT_LOG,
     _SERVER_RUNTIME_CAPS,
     _THIN_OBJ_LOB_LOCATOR,
+    AUTH_SERIAL_NUM,
     ArrayOutBind,
     ColumnMeta,
     ExecRequest,
@@ -169,6 +170,7 @@ from seerdb.server.backend import (
     Capability,
     CursorResult,
     Result,
+    SessionInfo,
     UnsupportedFeature,
 )
 from seerdb.server.framing import PacketStream
@@ -481,12 +483,42 @@ def handle_login(
     if sqlplus:
         stream.send_raw(encode_result_oci(conn_key, identity=identity))
     else:
+        # Report the session's REAL identity when the backend can say what it is.
+        # A client reads session_id / serial_num / instance_name / db_name /
+        # service_name only from this reply, never by querying, so a placeholder
+        # here is wrong for the life of the connection (#826).
+        info = _backend_session_info(backend)
         stream.write_packet(
-            TNS_DATA, encode_result(conn_key, version_no=identity.version_no)
+            TNS_DATA,
+            encode_result(
+                conn_key,
+                version_no=identity.version_no,
+                session_id=info.session_id,
+                serial_num=info.serial_num or AUTH_SERIAL_NUM,
+                instance_name=info.instance_name,
+                db_name=info.db_name,
+                db_domain=info.db_domain,
+                service_name=info.service_name,
+            ),
         )
 
     logger.info('login OK: %s', user)
     return user, sqlplus, conn_key, negotiated
+
+
+def _backend_session_info(backend: Backend) -> SessionInfo:
+    # What the backend says about its session, or an empty SessionInfo when it
+    # cannot say. A backend that cannot report this is not a failure -- the reply
+    # simply carries the placeholders it always did -- and neither is one that
+    # raises trying: the login must not die over metadata.
+    hook = getattr(backend, 'session_info', None)
+    if hook is None:
+        return SessionInfo()
+    try:
+        return hook()
+    except Exception as exc:  # noqa: BLE001 - metadata must never fail a login
+        logger.warning('backend could not report its session info: %s', exc)
+        return SessionInfo()
 
 
 def _deny_login(stream: PacketStream, reason: str) -> NoReturn:

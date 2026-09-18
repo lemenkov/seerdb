@@ -411,3 +411,66 @@ def test_the_11g_challenge_is_unchanged() -> None:
     payload = encode_challenge(challenge)
     assert b'AUTH_PBKDF2_CSK_SALT' not in payload
     assert payload.count(bytes([TTI_OER])) == 0
+
+
+def test_encode_result_carries_the_session_names() -> None:
+    # A client reads instance_name / db_name / service_name (and the session id
+    # and serial number) from the login reply ALONE -- never by querying -- so a
+    # reply that leaves them out leaves them None for the life of the connection,
+    # however correct the session otherwise is (#826).
+    from seerdb.common.tns import _ENCODE_FIELD_VERSION
+
+    token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_12_1)
+    try:
+        payload = encode_result(
+            bytes(24),
+            session_id=245,
+            serial_num=60722,
+            instance_name='FREE',
+            db_name='FREE',
+            service_name='freepdb1',
+        )
+    finally:
+        _ENCODE_FIELD_VERSION.reset(token)
+    assert b'AUTH_INSTANCENAME' in payload
+    assert b'FREE' in payload
+    assert b'AUTH_SC_DBUNIQUE_NAME' in payload
+    assert b'AUTH_SC_SERVICE_NAME' in payload
+    assert b'freepdb1' in payload
+    assert b'60722' in payload
+
+
+def test_encode_result_omits_a_name_the_server_does_not_know() -> None:
+    # A real server sends only what applies -- a database with no domain sends no
+    # AUTH_SC_DB_DOMAIN -- so an unset field must be absent, not an empty string.
+    from seerdb.common.tns import _ENCODE_FIELD_VERSION
+
+    token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_12_1)
+    try:
+        payload = encode_result(bytes(24), session_id=245, instance_name='FREE')
+    finally:
+        _ENCODE_FIELD_VERSION.reset(token)
+    assert b'AUTH_INSTANCENAME' in payload
+    assert b'AUTH_SC_DB_DOMAIN' not in payload
+    assert b'AUTH_SC_SERVICE_NAME' not in payload
+
+
+def test_a_backend_that_cannot_report_its_session_never_fails_the_login() -> None:
+    # session_info is optional, and a backend that raises trying to answer must
+    # not take the login down with it -- the reply falls back to the placeholders
+    # it always carried (#826).
+    from typing import cast
+
+    from seerdb.server.backend import Backend, SessionInfo
+    from seerdb.server.session import _backend_session_info
+
+    class NoHook:
+        pass
+
+    class Raises:
+        def session_info(self):
+            raise RuntimeError('v$session is not granted')
+
+    # Neither stands in for a whole Backend; the hook is all this reads.
+    assert _backend_session_info(cast('Backend', NoHook())) == SessionInfo()
+    assert _backend_session_info(cast('Backend', Raises())) == SessionInfo()
