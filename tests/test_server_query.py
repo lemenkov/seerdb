@@ -3707,3 +3707,42 @@ def test_mark_transaction_tracks_statement_kinds() -> None:
         assert _ENCODE_TXN_IN_PROGRESS.get() is True
     finally:
         _ENCODE_TXN_IN_PROGRESS.reset(token)
+
+
+def test_a_json_bind_is_not_sorted_to_the_end_of_the_row() -> None:
+    # A LONG-class bind's value rides after the row's others, and a native JSON
+    # bind's OAC declares 32 MiB -- which made it LONG-class by size. It is not:
+    # it carries its own descriptor framing and rides IN PLACE. Sorting it to the
+    # end swapped it with every bind after it, so `update t set j = :1 where
+    # id = :2` put the image in the NUMBER's slot (#826). It went unnoticed
+    # because a JSON bind is usually last, where the move is a no-op.
+    from seerdb.common.datatypes import JSON
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, _long_bind_positions
+
+    # Byte-for-byte off a live capture (fv24): `update TestJson set JsonCol = :1
+    # where IntCol = :2` binding {'b': 2} and 1, JSON FIRST.
+    captured = bytes.fromhex(
+        '035e05000280290001013201010d0000000101047fffffff0101020000000000'
+        '0000000001000000000000000000000000000000327570646174652054657374'
+        '4a736f6e20736574204a736f6e436f6c203d203a3120776865726520496e7443'
+        '6f6c203d203a3201010101000000000000000280000000007701000004020000'
+        '0000040200000000000000040200000000020100000116000000000000000007'
+        '01282800260004610800000001000000000000001d0000000000000000000000'
+        '00000000000000000000001dff4a5a012102010002000b0000e500000162a401'
+        '01000000073402c10302c102'
+    )
+    token = _DECODE_FIELD_VERSION.set(24)
+    try:
+        request = parse_exec(captured)
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+    assert request.bind_types[0][0] == 119  # TNS_TYPE_JSON
+    assert request.bind_types[0][2] == 33554432  # ...declaring 32 MiB
+    assert isinstance(request.binds[0], JSON)
+    assert request.binds[0].value == {'b': 2}
+    assert request.binds[1] == 1  # ...and the NUMBER after it is intact
+
+    # The encoder side has the same rule, read the other way: a JSON bind must
+    # not be listed as LONG-class, or seerdb's own client writes it out of place
+    # and a real 23ai answers ORA-24813.
+    assert _long_bind_positions([JSON({'b': 2}), 1], 4000) == frozenset()

@@ -664,3 +664,89 @@ class TestOsonRelativeOffsetsAndSharedFields(unittest.TestCase):
             'ff4a5a010016000c3e800000023c3c3c80000000',  # INTERVAL DAY TO SECOND
         ):
             decode_oson(bytes.fromhex(image))  # must not raise
+
+
+class TestOsonFieldNameHashAndOrder(unittest.TestCase):
+    """Field names are hashed and ORDERED BY THAT HASH, and both matter (#826).
+
+    The server indexes a document's field names by an FNV-1a hash and looks them
+    up through that array. seerdb wrote a zero hash for every name and left the
+    names in encounter order, which cost nothing visible -- the image stored,
+    fetched and `json_serialize`'d correctly -- but made every JSON path silently
+    match NOTHING. `json_exists` returned false, `json_query` and `json_value`
+    returned NULL, and a `where json_...` predicate found no rows.
+    """
+
+    # {"outer": {"inner": {"deep": "v"}}, "arr": [{"k": 1}]}, captured from a
+    # live 23ai. Its five names are stored as arr, inner, deep, outer, k --
+    # hashes 0x18, 0x27, 0x6f, 0x74, 0xea, ascending.
+    NESTED = bytes.fromhex(
+        'ff4a5a0121060500170020000118276f74ea00110006000c00000015056f7574'
+        '657205696e6e6572046465657003617272016b8402040100080014840102000d'
+        '84010300120176c0010018840105001d21c102'
+    )
+
+    def test_the_hash_is_fnv_1a(self):
+        from seerdb.common.oson import _fname_hash
+
+        # Each pinned against a captured server image's hash array.
+        self.assertEqual(_fname_hash(b'a') & 0xFF, 0x2C)
+        self.assertEqual(_fname_hash(b'b') & 0xFF, 0xE5)
+        self.assertEqual(_fname_hash(b'short_name') & 0xFF, 0x9D)
+        self.assertEqual(_fname_hash(b'outer') & 0xFF, 0x74)
+        self.assertEqual(_fname_hash(b'arr') & 0xFF, 0x18)
+        # A long name stores sixteen bits of it, little-endian.
+        self.assertEqual(
+            (_fname_hash(b'A' * 256) & 0xFFFF).to_bytes(2, 'little'), b'\xc5\x62'
+        )
+        self.assertEqual(
+            (_fname_hash(b'B' * 256) & 0xFFFF).to_bytes(2, 'little'), b'\xc5\xdd'
+        )
+
+    def test_seerdb_builds_the_same_image_the_server_does(self):
+        # Not just an equal document -- the same field-name order and the same
+        # hash array, which is what the server searches.
+        doc = {'outer': {'inner': {'deep': 'v'}}, 'arr': [{'k': 1}]}
+        mine = encode_oson(doc, allow_wide=True)
+        self.assertEqual(decode_oson(self.NESTED), doc)
+        self.assertEqual(decode_oson(mine), doc)
+        self.assertEqual(_names_and_hashes(mine), _names_and_hashes(self.NESTED))
+
+    def test_names_are_sorted_by_hash_then_length_then_bytes(self):
+        # The tiebreak matters once two names collide in the low byte, which is
+        # likely well before a hundred keys.
+        from seerdb.common.oson import _fname_hash
+
+        doc = {f'k{i:03}': i for i in range(60)}
+        names, hashes = _names_and_hashes(encode_oson(doc, allow_wide=True))
+        self.assertEqual(list(hashes), sorted(hashes))
+        keys = [(h, len(n.encode()), n.encode()) for n, h in zip(names, hashes)]
+        self.assertEqual(keys, sorted(keys))
+        for name, hashed in zip(names, hashes):
+            self.assertEqual(_fname_hash(name.encode()) & 0xFF, hashed)
+
+
+def _names_and_hashes(image: bytes) -> tuple[list[str], bytes]:
+    """The field names of a tree image, in stored order, with their hash array."""
+    flags = int.from_bytes(image[4:6], 'big')
+    pos = 6
+    count = (
+        int.from_bytes(image[pos : pos + 2], 'big') if flags & 0x0400 else image[pos]
+    )
+    pos += 2 if flags & 0x0400 else 1
+    size = int.from_bytes(image[pos : pos + 2], 'big')
+    pos += 2
+    if image[3] == 3:
+        pos += 10  # secondary flags + the two long-segment sizes
+    pos += 4 if flags & 0x1000 else 2  # tree size
+    pos += 2  # tiny-node count
+    hashes = image[pos : pos + count]
+    pos += count
+    offsets = [
+        int.from_bytes(image[pos + 2 * i : pos + 2 * i + 2], 'big')
+        for i in range(count)
+    ]
+    pos += 2 * count
+    seg = image[pos : pos + size]
+    names = [seg[o + 1 : o + 1 + seg[o]].decode() for o in offsets]
+    return names, hashes

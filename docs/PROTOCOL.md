@@ -3382,6 +3382,46 @@ DATE (`0x3C`), TIMESTAMP (`0x39`), TIMESTAMP WITH TZ (`0x7C`) and both intervals
 all happen to carry both bits, so an unguarded test turns every bare-scalar
 temporal image into a malformed object.
 
+### 17.0d The field-name hash array is **load-bearing** (#826)
+
+The `hash_array` in a tree image is not decoration, and it is not optional. The
+server indexes a document's field names through it, so an image whose hashes are
+wrong **stores, fetches and `json_serialize`s perfectly and matches no JSON path
+at all**: `json_exists` returns false, `json_query` and `json_value` return NULL,
+and a `where json_...` predicate finds no rows. Nothing errors. This is the
+quietest failure in the whole format.
+
+Two rules, and both are needed:
+
+**The hash is FNV-1a, 32-bit**, over the name's UTF-8 bytes:
+
+```
+h = 0x811C9DC5
+for byte in name:  h = ((h ^ byte) * 16777619) & 0xFFFFFFFF
+```
+
+A short name stores `h & 0xff` (one byte). A **long** name (version 3's segment)
+stores `h & 0xffff` **little-endian** — so its first byte is the short form's
+byte and the second extends it. Measured on 23ai: `a` → `2c`, `b` → `e5`,
+`short_name` → `9d`, `arr` → `18`, `outer` → `74`; `"A"×256` → `c5 62` and
+`"B"×256` → `c5 dd`.
+
+**The names are stored in hash order**, sorted by
+
+```
+(h & 0xff, len(name_bytes), name_bytes)
+```
+
+— the length and the bytes only breaking a tie in the low byte, which for a
+document of any width is common. Captured for
+`{"outer": {"inner": {"deep": "v"}}, "arr": [{"k": 1}]}`, 23ai stores the names
+as `arr, inner, deep, outer, k` — hashes `18 27 6f 74 ea`, ascending — not in the
+order they appear in the document.
+
+A decoder does not care about either: it resolves a field id through the offset
+array. That is exactly why this can be wrong for a long time without anything
+looking broken.
+
 ### 17.1 Node encoding
 
 | Tag byte            | Node                                                        |
@@ -3480,6 +3520,71 @@ and reads back through the §17.1 wide-object decode. (Reading back a document
 with a string longer than the decoder's ub1-string support is the separate,
 pre-existing long-string decode gap, not a bind limitation.)
 
+### 17.2b Binding a JSON value: NOT a LONG-class bind (#826)
+
+A native JSON (or VECTOR) bind's OAC declares a 32 MiB maximum size. That is
+larger than the server takes in place, which is the usual test for a LONG-class
+bind whose value rides **after** all the row's other values (§5.4). It is not one:
+it carries its own descriptor framing and rides **in place**.
+
+Sorting it to the end swaps it with every bind after it. The symptom depends on
+which side gets it wrong:
+
+* a **server** that reorders reads the following bind's slot as the image and the
+  image's bytes as that bind — `update t set j = :1 where id = :2` produced a
+  NUMBER of `-1E+126` from OSON bytes;
+* a **client** that reorders writes the value out of place and a real 23ai
+  answers `ORA-24813: cannot send or receive an unsupported LOB`.
+
+Both go unnoticed for a long time, because a JSON bind is usually the **last**
+bind in a statement — `insert into t values (:1, :2)` — where the move is a no-op.
+It is `UPDATE ... SET json = :1 WHERE ...` that exposes it.
+
+### 18.1 Binds (#55 / #62)
+
+seerdb binds a vector with the **native binary image** (matching
+python-oracledb). The full exec bind for a vector is `OAC | TTI_RXD | value`:
+
+- **OAC** (`encode_token_oac` → `_encode_native_lob_oac`): a fixed 25-byte block,
+  built field-by-field — type 127, the max data length (1 MiB), the *cont-flag*
+  `0x02000000`, and the *LOB-prefetch length* set to the same 1 MiB max, with the
+  trailing *oaccolid* zero:
+  `7f 01 00 00 | 04 00100000 | 00 | 04 02000000 | 00 00 00 00 | 04 00100000 | 00`.
+  python-oracledb emits the two size fields as a **non-minimal** 4-byte ub4 (the
+  leading zero of `00 10 00 00` is kept), so they are encoded fixed-width to match
+  the capture. Without the `0x02000000` flag the server rejects the inline value
+  (ORA-03120); a too-short OAC desyncs (ORA-03106).
+- **Value** (`encode_token_rxd`, after the `TTI_RXD`=0x07 token): a fixed 19-byte
+  **descriptor** (`01 28 28 00 26 00 04 61 08 00 00 00 01 00 00 00 00 00 00` —
+  the same one python-oracledb uses for any LOB-backed inline bind, so #70 JSON
+  reuses it), then the **image length (ub2)**, **22 zero bytes**, then the image
+  framed like RAW (`encode_chr`: a single length byte < 254, else the `0xFE`
+  marker + `ub4` chunks). Both constants are stable across element types and
+  sizes; works at field version 16 and 17.
+- **Image** (`encode_vector`): the read image (§18) with the 8-byte norm sent as
+  **zeros** (the server recomputes it). FLOAT32/64 use the sortable encoding,
+  INT8 raw bytes, BINARY packed bytes; a SparseVector emits the §18.2 sparse
+  image. Dense `list`/`tuple` → FLOAT32; an `array.array` maps by typecode.
+
+### 18.2 SPARSE vectors (#68)
+
+A `VECTOR(n, T, SPARSE)` column stores only the non-zero elements. Its image is
+**version `2`** with the **`0x20`** flag set, and after the header + norm carries:
+
+```
+count (ub2) | indices (ub4 × count) | values (element × count)
+```
+
+`num_elements` (header) is the total dimension count; `count` is the number of
+stored elements; the values use the same per-element encoding as a dense image
+(sortable FLOAT32/64, raw INT8). seerdb decodes it to an `seerdb.SparseVector`
+(`num_dimensions`, `indices`, `values`) and binds one back natively via §18.1
+(the sparse image carries the same OAC + descriptor). Captured on 23ai across
+FLOAT32/INT8 and a 300-dim vector (index 299 confirms the ub4 indices).
+
+> As with JSON, multi-row VECTOR `SELECT`s share the #45 LOB desync limitation
+> under load; single-row reads are reliable.
+
 ## 18. Native VECTOR (23ai+)
 
 Oracle 23ai+ stores a native `VECTOR` column as a binary image delivered, like
@@ -3532,51 +3637,6 @@ Captured reference images:
 and the packed-bit count arrive from the server and are validated against the
 image length before iterating, so a crafted count (e.g. a ~4-billion `ub4`)
 raises `VectorError` rather than spinning to build an unbounded list (#228).
-
-### 18.1 Binds (#55 / #62)
-
-seerdb binds a vector with the **native binary image** (matching
-python-oracledb). The full exec bind for a vector is `OAC | TTI_RXD | value`:
-
-- **OAC** (`encode_token_oac` → `_encode_native_lob_oac`): a fixed 25-byte block,
-  built field-by-field — type 127, the max data length (1 MiB), the *cont-flag*
-  `0x02000000`, and the *LOB-prefetch length* set to the same 1 MiB max, with the
-  trailing *oaccolid* zero:
-  `7f 01 00 00 | 04 00100000 | 00 | 04 02000000 | 00 00 00 00 | 04 00100000 | 00`.
-  python-oracledb emits the two size fields as a **non-minimal** 4-byte ub4 (the
-  leading zero of `00 10 00 00` is kept), so they are encoded fixed-width to match
-  the capture. Without the `0x02000000` flag the server rejects the inline value
-  (ORA-03120); a too-short OAC desyncs (ORA-03106).
-- **Value** (`encode_token_rxd`, after the `TTI_RXD`=0x07 token): a fixed 19-byte
-  **descriptor** (`01 28 28 00 26 00 04 61 08 00 00 00 01 00 00 00 00 00 00` —
-  the same one python-oracledb uses for any LOB-backed inline bind, so #70 JSON
-  reuses it), then the **image length (ub2)**, **22 zero bytes**, then the image
-  framed like RAW (`encode_chr`: a single length byte < 254, else the `0xFE`
-  marker + `ub4` chunks). Both constants are stable across element types and
-  sizes; works at field version 16 and 17.
-- **Image** (`encode_vector`): the read image (§18) with the 8-byte norm sent as
-  **zeros** (the server recomputes it). FLOAT32/64 use the sortable encoding,
-  INT8 raw bytes, BINARY packed bytes; a SparseVector emits the §18.2 sparse
-  image. Dense `list`/`tuple` → FLOAT32; an `array.array` maps by typecode.
-
-### 18.2 SPARSE vectors (#68)
-
-A `VECTOR(n, T, SPARSE)` column stores only the non-zero elements. Its image is
-**version `2`** with the **`0x20`** flag set, and after the header + norm carries:
-
-```
-count (ub2) | indices (ub4 × count) | values (element × count)
-```
-
-`num_elements` (header) is the total dimension count; `count` is the number of
-stored elements; the values use the same per-element encoding as a dense image
-(sortable FLOAT32/64, raw INT8). seerdb decodes it to an `seerdb.SparseVector`
-(`num_dimensions`, `indices`, `values`) and binds one back natively via §18.1
-(the sparse image carries the same OAC + descriptor). Captured on 23ai across
-FLOAT32/INT8 and a 300-dim vector (index 299 confirms the ub4 indices).
-
-> As with JSON, multi-row VECTOR `SELECT`s share the #45 LOB desync limitation
-> under load; single-row reads are reliable.
 
 ## 19. Oracle 9i (pre-10g) query/fetch — the fv2 dialect (#97)
 
