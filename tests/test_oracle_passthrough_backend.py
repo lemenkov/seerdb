@@ -81,7 +81,8 @@ class _FakeVar:
     def setvalue(self, _pos, value):
         self._value = value
 
-    def getvalue(self):
+    def getvalue(self, _pos=0):
+        # A real Var takes the iteration position; the RETURNING path passes it.
         return self._value
 
 
@@ -175,3 +176,29 @@ def test_large_lob_in_bind_is_bound_as_a_plain_value_not_a_var():
     # OUT binds: the LOB IN slot is None (discarded by the client); the Var yields
     # its assigned value.
     assert result.out_binds == [None, 42]
+
+
+def test_returning_resolves_an_object_bind_like_execute_does():
+    # An INSERT ... RETURNING with an object (ADT) IN bind: execute_returning
+    # built its batch straight from the row, so an ObjectImage -- the row
+    # decoder's placeholder, not a bindable value -- reached the upstream driver
+    # and killed the Mirror connection (DPY-4011). execute() has always run its
+    # binds through _resolve_object_binds; the RETURNING path must too (#826).
+    # An unresolvable OID resolves to None, which the driver rejects cleanly with
+    # ORA-00932 instead of dying.
+    from seerdb.common.dbobject import ObjectImage
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+
+    backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
+    cursor = _FakeCursor()
+    backend._conn = type('Conn', (), {'cursor': lambda self: cursor})()
+    # No type resolves for this OID, so _object_from_image yields None.
+    backend._gettype_by_oid = lambda _oid: None
+    image = ObjectImage(b'\x01' * 16, 'PYO', 'UDT_OBJ', 873, b'\x00\x01')
+    receiver = BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=22)
+    backend.execute_returning(
+        'INSERT INTO t VALUES (:1) RETURNING id INTO :2', [[image, receiver]]
+    )
+    assert not isinstance(cursor.bound[0], ObjectImage)
+    assert cursor.bound[0] is None
+    assert isinstance(cursor.bound[1], _FakeVar)
