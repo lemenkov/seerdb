@@ -397,6 +397,12 @@ class ExecRequest:
     # A RETURNING statement whose binds are all clause-filled sends no RXD row,
     # so bind_rows is empty; this still says how many times it runs (#33).
     iterations: int = 1
+    # `cursor.parse()`: PARSE without EXECUTE. The statement is parsed (and, for
+    # a query, described) but NOT run, and it carries no bind values (#826).
+    parse_only: bool = False
+    # The DESCRIBE option, set alongside PARSE for a query -- the reply owes the
+    # column metadata; a DML / PL/SQL parse owes only a success status.
+    describe_only: bool = False
     # Per-column (tns_type, csfrm) from the define OACs, in column order — what
     # the client's own fetch variables are, sent on the re-execute that applies a
     # define (the DEFINE execute option). Empty on every other execute; a define
@@ -1690,6 +1696,15 @@ _EXEC_OPTION_COMMIT = 0x100
 # variables and carries one define OAC per column in place of any binds (#826).
 _EXEC_OPTION_DEFINE = 0x10
 
+# PARSE asks the server to parse the statement; EXECUTE asks it to run it.
+# A `cursor.parse()` sets PARSE and leaves EXECUTE clear -- and sends no bind
+# values, so running it anyway fails with ORA-01008 (#826). For a query it
+# also sets DESCRIBE, and the reply is the describe alone: no rows, and a
+# plain success status rather than the end-of-fetch ORA-01403.
+_EXEC_OPTION_PARSE = 0x01
+_EXEC_OPTION_EXECUTE = 0x20
+_EXEC_OPTION_DESCRIBE = 0x20000
+
 
 # A TTI_LOBOPS READ request carries the slice sqlplus wants: a 1-based source
 # offset and an amount, both counts (characters for a CLOB, bytes for a BLOB),
@@ -1898,6 +1913,10 @@ def parse_exec(
     options, rest = decode_ub4(rest)
     autocommit = bool(options & _EXEC_OPTION_COMMIT)
     batcherrors = bool(options & TNS_EXEC_OPTION_BATCH_ERRORS)
+    parse_only = bool(options & _EXEC_OPTION_PARSE) and not (
+        options & _EXEC_OPTION_EXECUTE
+    )
+    describe_only = bool(options & _EXEC_OPTION_DESCRIBE)
     cursor, rest = decode_ub4(rest)
     query_flag, rest = rest[0], rest[1:]
     query_len, rest = decode_ub4(rest)
@@ -2089,6 +2108,8 @@ def parse_exec(
         return_binds=return_binds,
         iterations=iterations,
         define_types=define_types,
+        parse_only=parse_only,
+        describe_only=describe_only,
     )
 
 
