@@ -270,6 +270,43 @@ def test_prefetched_vector_row_keeps_its_image_instead_of_reading_it() -> None:
     assert jlob.read() == doc
 
 
+def test_row_codec_debug_logging_reports_the_framing_it_chose(caplog) -> None:
+    # The row codec's debug lines are a diagnostic tool, so they are pinned:
+    # they must fire, must not raise, and must report the fields the encoder and
+    # decoder actually branch on. Every mid-row desync this codebase has had was
+    # an encoder and a decoder disagreeing about one of them (#887/#826/#959),
+    # and reconstructing that took throwaway print statements each time.
+    import array
+    import logging
+
+    from seerdb.common.tns_consts import TNS_TYPE_VECTOR
+
+    col = ColumnMeta(
+        name=b'V',
+        data_type=TNS_TYPE_VECTOR,
+        data_length=8200,
+        max_size=8200,
+        vector_format=4,  # INT8
+    )
+    with caplog.at_level(logging.DEBUG, logger='seerdb.common.tns'):
+        response = (
+            encode_describe([col])
+            + encode_rows([(array.array('b', [1, -2, 3, -4]),)], [col])
+            + bytes([TTI_STA])
+        )
+        _decode_response(response)
+    lines = [r.getMessage() for r in caplog.records]
+    encoded = [m for m in lines if m.startswith('row encode:')]
+    decoded = [m for m in lines if m.startswith('row decode LOB:')]
+    assert encoded and decoded
+    assert 'type=127' in encoded[0]
+    # The prefetched form: an image was found, and the locator behind it is the
+    # one num_bytes announced -- not the image's length reported twice.
+    assert 'want_inline=True' in decoded[0]
+    assert 'image=21' in decoded[0]
+    assert 'num_bytes=38' in decoded[0] and 'locator=38' in decoded[0]
+
+
 def test_encode_status_with_rowcounts_is_the_return_parameters_block() -> None:
     # The arraydmlrowcounts status carries the counts in the execute's
     # return-parameters block (TTI_RPA), laid out as a real server lays it out

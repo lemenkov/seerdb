@@ -483,6 +483,36 @@ set; [`docs/wallet_mtls_live_testing.md`](docs/wallet_mtls_live_testing.md)
 walks through standing up a self-hosted 23ai Free + TCPS test bed (reusing
 the committed fixture wallet) and running `tests/test_wallet_live.py`.
 
+## Debug logging
+
+seerdb logs through the standard `logging` module and emits nothing by
+default. Turning on `DEBUG` traces the login/handshake negotiation, and —
+the part that is hard to reconstruct any other way — the per-value row
+codec and the Mirror's statement dispatch:
+
+```python
+import logging
+logging.basicConfig(level=logging.DEBUG)
+```
+
+Narrow it to what you are chasing, because the row lines are per column
+per row:
+
+| logger | what it traces |
+| --- | --- |
+| `seerdb.client.connection` | login, protocol negotiation, encryption |
+| `seerdb.common.tns` | row value encode / decode, including the framing chosen for each LOB-class cell |
+| `seerdb.server` | the Mirror: sessions, and which backend call each statement dispatches to |
+
+```python
+logging.getLogger('seerdb.common.tns').setLevel(logging.DEBUG)
+```
+
+The row-codec lines report exactly the fields the encoder and decoder
+branch on, so a value that desyncs a row usually shows up as an encoder
+and a decoder disagreeing on one of them. The calls are guarded, so a
+disabled level costs nothing per row.
+
 ## Contributing
 
 Pull requests are welcome. Please read
