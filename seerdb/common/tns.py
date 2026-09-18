@@ -2976,6 +2976,10 @@ def encode_result(
     session_id: int = 0,
     serial_num: int = AUTH_SERIAL_NUM,
     version_no: int = VERSION_11_2_0_2,
+    instance_name: str | None = None,
+    db_name: str | None = None,
+    db_domain: str | None = None,
+    service_name: str | None = None,
 ) -> bytes:
     """The auth-result RPA payload — the server proof, version, and session id.
 
@@ -3009,6 +3013,18 @@ def encode_result(
     if modern:
         pairs.append((b'AUTH_SERIAL_NUM', str(serial_num).encode('ascii')))
         pairs.append((b'AUTH_MAX_OPEN_CURSORS', str(_AUTH_MAX_OPEN_CURSORS).encode()))
+    # The session's names, each sent only when the server knows it -- a real
+    # server omits what does not apply (a database with no domain sends no
+    # AUTH_SC_DB_DOMAIN). A client reads these ONLY from here, so leaving them out
+    # is what left `connection.instance_name` and friends None (#826).
+    for key, value in (
+        (b'AUTH_INSTANCENAME', instance_name),
+        (b'AUTH_SC_DBUNIQUE_NAME', db_name),
+        (b'AUTH_SC_DB_DOMAIN', db_domain),
+        (b'AUTH_SC_SERVICE_NAME', service_name),
+    ):
+        if value:
+            pairs.append((key, value.encode('utf-8')))
     payload = encode_rpa_kv(pairs)
     if modern:
         payload += encode_status()
