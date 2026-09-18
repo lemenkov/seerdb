@@ -617,8 +617,17 @@ class OraclePassthroughBackend:
             receivers[i] = (
                 cursor.var(dbtype, size) if dbtype is not None else cursor.var(str)
             )
+        # Each row's remaining (input) binds go through the same object
+        # resolution execute() applies: an ObjectImage is the row decoder's
+        # placeholder, not something the upstream driver can bind, and handing
+        # one over kills the connection rather than raising (#826).
         batch = [
-            [receivers[i] if i in receivers else value for i, value in enumerate(row)]
+            self._resolve_object_binds(
+                [
+                    receivers[i] if i in receivers else value
+                    for i, value in enumerate(row)
+                ]
+            )
             for row in rows
         ]
         try:
