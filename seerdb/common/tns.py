@@ -1328,6 +1328,28 @@ def encode_describe(columns: list[ColumnMeta]) -> bytes:
     return bytes([TTI_DCB]) + preamble + _encode_describe_body(columns)
 
 
+def encode_implicit_results(results: list[tuple[list[ColumnMeta], int]]) -> bytes:
+    """The TTI_IRD block for a PL/SQL block that called ``DBMS_SQL.RETURN_RESULT``.
+
+    The inverse of :func:`decode_token_implicit` (#121, #826)::
+
+        ub4 num_results
+        per result:  ub1 len + that many bytes   (a preamble the client skips)
+                     describe body               (the column metadata)
+                     ub2 cursor id
+
+    Each result is a server cursor the client fetches on demand, exactly like a
+    REF CURSOR, so the caller must have parked its rows under that id first.
+    """
+    out = bytearray([TTI_IRD])
+    out += encode_sb4(len(results))
+    for columns, cursor_id in results:
+        out += _bytes_with_length(b'')  # the skipped preamble
+        out += _encode_describe_body(columns)
+        out += encode_sb4(cursor_id)
+    return bytes(out)
+
+
 # --- Mirror thin reply/response encoders (§6) ---
 
 

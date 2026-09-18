@@ -543,7 +543,31 @@ class OraclePassthroughBackend:
             columns = _enrich_ref_columns(columns, rows)
             rows = self._resolve_fetched_object_lobs(columns, rows)
             return Result(columns=columns, rows=rows)
+        implicit = self._drain_implicit_results(cursor)
+        if implicit:
+            return Result(implicit_results=implicit)
         return Result(rowcount=cursor.rowcount or 0)
+
+    def _drain_implicit_results(
+        self, cursor: object
+    ) -> list[tuple[list[ColumnMeta], list[tuple]]]:
+        # The result sets a PL/SQL block returned through DBMS_SQL.RETURN_RESULT
+        # (#121/#826). seerdb's cursor surfaces them PEP 249 style: nextset()
+        # makes each current in turn. A block that returned none leaves the list
+        # empty and nothing changes.
+        # Guarded rather than assumed: nextset() is optional on a DB-API cursor,
+        # and a statement that returned nothing must not fail over its absence.
+        nextset = getattr(cursor, 'nextset', None)
+        if nextset is None:
+            return []
+        out: list[tuple[list[ColumnMeta], list[tuple]]] = []
+        while nextset():
+            columns = [
+                _to_column_meta(desc)
+                for desc in cursor.description  # type: ignore[attr-defined]
+            ]
+            out.append((columns, cursor.fetchall()))  # type: ignore[attr-defined]
+        return out
 
     def execute_many(self, sql: str, rows: Sequence[Sequence]) -> int:
         # Array DML (executemany): send the whole batch upstream in one round-trip

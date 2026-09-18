@@ -120,6 +120,13 @@ class Result:
     # nothing contributes an empty list rather than being left out, so the
     # positions stay aligned with the rows the client sent.
     returned_rows: list[list[tuple]] = field(default_factory=list)
+    # The result sets a PL/SQL block handed back through DBMS_SQL.RETURN_RESULT,
+    # in the order it returned them, each as (columns, rows) (#121/#826). Empty
+    # for everything else. The Mirror parks each on a cursor of its own and names
+    # them in the reply, so the client fetches them like REF CURSORs.
+    implicit_results: list[tuple[list[ColumnMeta], list[tuple]]] = field(
+        default_factory=list
+    )
 
 
 @dataclass(frozen=True)

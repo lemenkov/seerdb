@@ -70,6 +70,7 @@ from seerdb.common.tns import (
     encode_fetch_batch_oci,
     encode_fetch_response,
     encode_fetch_terminator_oci,
+    encode_implicit_results,
     encode_lob_describe_oci,
     encode_lob_fetch_rows_oci,
     encode_lob_read_response_oci,
@@ -2322,6 +2323,18 @@ def _answer_query(
             # Array-DML batcherrors: ORA-24381 with the per-row failure arrays;
             # the client reads them from getbatcherrors() rather than raising.
             response = encode_batch_errors_status(result.rowcount, batch_errors)
+            stream.write_packet(TNS_DATA, response)
+            return lobs
+        # A PL/SQL block that called DBMS_SQL.RETURN_RESULT hands its result sets
+        # back as a TTI_IRD block naming one server cursor per set, which the
+        # client then fetches like a REF CURSOR (#121/#826). Park each set on a
+        # cursor of its own first, so the fetches that follow find their rows.
+        if result.implicit_results:
+            named = [
+                (columns, cursors.open(columns, list(rows)))
+                for columns, rows in result.implicit_results
+            ]
+            response = encode_implicit_results(named) + encode_status(0)
             stream.write_packet(TNS_DATA, response)
             return lobs
         # A PL/SQL block that assigned OUT binds returns them as an IOV vector
