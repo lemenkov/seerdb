@@ -654,6 +654,10 @@ class OracleConnect(_ConnectionLogic):
         sdu: int = DEFAULT_SDU,
         charset: str = 'utf-8',
         app_name: str = 'seerdb',
+        program: str | None = None,
+        machine: str | None = None,
+        terminal: str | None = None,
+        osuser: str | None = None,
         field_version: int = FIELD_VERSION_23_4,
         cclass: str | None = None,
         purity: int = PURITY_DEFAULT,
@@ -704,6 +708,13 @@ class OracleConnect(_ConnectionLogic):
         self.charset = charset
         self.prelim = prelim
         self.app_name = app_name
+        # Session identity the server records in v$session (#826). Named as
+        # python-oracledb names them; each defaults to what this process is
+        # (program falls back to app_name, osuser to the database user).
+        self.program = program
+        self.machine = machine
+        self.terminal = terminal
+        self.osuser = osuser
         # Token-based auth (#125): a JWT str (OAuth2) or (token, private_key)
         # (OCI IAM), resolved at connect time into the token + optional PEM key.
         self.access_token = access_token

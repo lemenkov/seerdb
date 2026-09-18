@@ -10142,18 +10142,28 @@ def find_fast_auth_rpa(Body: bytes) -> int:
 
 
 def encode_dictionary_sess(Dictionary: dict) -> bytes:
+    # The session-identity pairs the server records in v$session: program,
+    # machine, terminal and osuser. They are informational -- nothing
+    # authenticates on them -- but a client can set each, and they are readable
+    # ONLY through this message, so a caller's values have to travel here (#826).
+    # Each falls back to what this process actually is.
+    Env = Dictionary['env']
     Tseq = Dictionary['seq']
-    Hostname = encode_kv(b'AUTH_MACHINE', socket.gethostname().encode('utf-8'))
+    Hostname = encode_kv(
+        b'AUTH_MACHINE',
+        (Env.get('machine') or socket.gethostname()).encode('utf-8'),
+    )
     Pid = encode_kv(b'AUTH_PID', str(os.getpid()).encode('utf-8'))
-    User = Dictionary['env']['user'].encode('utf-8')
-    SID = encode_kv(b'AUTH_SID', Dictionary['env']['user'].encode('utf-8'))
-    UserLen = encode_sb4(len(Dictionary['env']['user']))
-    Role = Dictionary['env'].get('role', 0)
-    Prelim = Dictionary['env'].get('prelim', 0)
+    User = Env['user'].encode('utf-8')
+    # AUTH_SID is what a server reports as v$session.osuser, not a session id.
+    SID = encode_kv(b'AUTH_SID', (Env.get('osuser') or Env['user']).encode('utf-8'))
+    UserLen = encode_sb4(len(Env['user']))
+    Role = Env.get('role', 0)
+    Prelim = Env.get('prelim', 0)
     LogonMode = encode_sb4((Role * 32) | (Prelim * 128) | 1)
     AppName = encode_kv(
         b'AUTH_PROGRAM_NM',
-        Dictionary['env'].get('app_name', 'seerdb').encode('utf-8'),
+        (Env.get('program') or Env.get('app_name') or 'seerdb').encode('utf-8'),
     )
 
     FieldVersion = Dictionary.get('field_version', FIELD_VERSION_11_2)
@@ -10163,7 +10173,9 @@ def encode_dictionary_sess(Dictionary: dict) -> bytes:
         # pair count is 5, leading with AUTH_TERMINAL. 11g instead reads the
         # username by the earlier UserLen field and sends 4 pairs; sending the
         # 12c shape to 11g (or vice-versa) desyncs the server's parse.
-        Terminal = encode_kv(b'AUTH_TERMINAL', b'unknown')
+        Terminal = encode_kv(
+            b'AUTH_TERMINAL', (Env.get('terminal') or 'unknown').encode('utf-8')
+        )
         UserField = bytes([len(User)]) + User
         return (
             bytes([TTI_FUN, TTI_SESS, Tseq, 1])

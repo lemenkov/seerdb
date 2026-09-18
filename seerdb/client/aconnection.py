@@ -169,6 +169,10 @@ class AsyncOracleConnect(_ConnectionLogic):
         sdu: int = DEFAULT_SDU,
         charset: str = 'utf-8',
         app_name: str = 'seerdb',
+        program: str | None = None,
+        machine: str | None = None,
+        terminal: str | None = None,
+        osuser: str | None = None,
         field_version: int = FIELD_VERSION_23_4,
         cclass: str | None = None,
         purity: int = PURITY_DEFAULT,
@@ -213,6 +217,12 @@ class AsyncOracleConnect(_ConnectionLogic):
         self.charset = charset
         self.prelim = prelim
         self.app_name = app_name
+        # Session identity recorded in v$session (#826) -- the same four the
+        # sync connection takes, so the two stay in step.
+        self.program = program
+        self.machine = machine
+        self.terminal = terminal
+        self.osuser = osuser
         # Token auth (#125), resolved at connect time.
         self.access_token = access_token
         self._token_auth = False
