@@ -3932,9 +3932,17 @@ def _decode_rxd_step(Data: bytes, Acc: tuple) -> tuple:
                 continue
             DataType = Col.get('data_type')
             if DataType in _LOB_DATA_TYPES:
-                (Locator, Rest) = _read_lob_column(
-                    Rest, inline_image=DataType == TNS_TYPE_VECTOR
+                # A JSON or VECTOR column may arrive with its image already in
+                # the row (§22.1b). Keep the image on the LOB so read() serves it
+                # from there: the locator that rides behind it resolves to nothing
+                # to fetch, so asking for the content returned empty and the
+                # decoder rejected it as "not a VECTOR image" (#959).
+                (Locator, Rest, Image) = _read_lob_column_full(
+                    Rest, inline_image=DataType in _PREFETCHED_IMAGE_TYPES
                 )
+                if Image is not None:
+                    Row.append(LOB(DataType, Locator or b'', prefetched=Image))
+                    continue
                 Row.append(None if Locator is None else LOB(DataType, Locator))
                 continue
             if DataType in _ROWID_DATA_TYPES:
@@ -3992,9 +4000,30 @@ def decode_token_rxd(Data: bytes, Acc: tuple) -> tuple:
     return decode_packet(Rest, NewAcc)
 
 
+def _read_lob_column_full(
+    Rest: bytes, *, inline_image: bool = False
+) -> tuple[bytes | None, bytes, bytes | None]:
+    """:func:`_read_lob_column` plus the prefetched image, when the value came in
+    the two-field framing (§22.1b) rather than as a bare locator.
+
+    The plain reader returns the IMAGE as the value in that case, which is what a
+    RETURNING bind wants. A fetched column wants the other half too: the real
+    locator to keep on the LOB, and the image to serve reads from, because there
+    is nothing to fetch for it (#959)."""
+    value, tail, image, locator = _read_lob_column_parts(Rest, inline_image)
+    return (locator if image is not None else value, tail, image)
+
+
 def _read_lob_column(
     Rest: bytes, *, inline_image: bool = False
 ) -> tuple[bytes | None, bytes]:
+    value, tail, _image, _locator = _read_lob_column_parts(Rest, inline_image)
+    return (value, tail)
+
+
+def _read_lob_column_parts(
+    Rest: bytes, inline_image: bool
+) -> tuple[bytes | None, bytes, bytes | None, bytes | None]:
     # LOB column layout in RXD (Oracle 11g):
     #
     #   ub1 0x00              → NULL LOB; total column size = 1 byte.
@@ -4014,14 +4043,14 @@ def _read_lob_column(
     # single-chunk case, so the chunked form was mis-read and the leftover
     # content bytes were then fed to decode_packet as bogus tokens (#37).
     if not Rest:
-        return (None, Rest)
+        return (None, Rest, None, None)
     if Rest[0] == 0x00:
-        return (None, Rest[1:])
+        return (None, Rest[1:], None, None)
     (NumBytes, Body) = decode_ub4(Rest)
     if NumBytes <= 0 or not Body:
         # Defensive: malformed or unexpected layout. Surface what we have
         # rather than overrunning the buffer.
-        return (bytes(Body), b'')
+        return (bytes(Body), b'', None, None)
     # A CLOB / BLOB column may carry the locator's metadata -- a ub8 size and a
     # ub4 chunk size -- between the length and the locator itself (#853). A live
     # 23ai sends that form to the reference thin client and the bare form to
@@ -4038,17 +4067,23 @@ def _read_lob_column(
         (_Size, Body) = decode_ub4(Body)
         (_ChunkSize, Body) = decode_ub4(Body)
     (Locator, Tail) = decode_dalc(Body)
+    Image: bytes | None = None
+    Behind: bytes | None = None
     if inline_image and Tail[:1] and Tail[0] == NumBytes:
-        # A VECTOR column carries its image inline AND the locator behind it
-        # (§ VECTOR value): the first field just read is the image, and the
-        # locator follows as a second DALC whose length is the `num_bytes` at the
-        # front. Consume it, or it is read as the next column's value (#887). The
-        # length check keeps this to the form that actually has two fields --
-        # a server that sends the bare locator alone leaves Tail elsewhere.
+        # A VECTOR or JSON column carries its image inline AND the locator behind
+        # it (§22.1b): the first field just read is the image, and the locator
+        # follows as a second DALC whose length is the `num_bytes` at the front.
+        # Consume it, or it is read as the next column's value (#887). The length
+        # check keeps this to the form that actually has two fields -- a server
+        # that sends the bare locator alone leaves Tail elsewhere.
         (_Locator, Tail) = decode_dalc(Tail)
+        if not isinstance(Locator, list):
+            Image = bytes(Locator)
+        if not isinstance(_Locator, list):
+            Behind = bytes(_Locator)
     if isinstance(Locator, list):  # 0x00 / 0xFF DALC → empty / null
-        return (None, Tail)
-    return (bytes(Locator), Tail)
+        return (None, Tail, Image, Behind)
+    return (bytes(Locator), Tail, Image, Behind)
 
 
 def _read_rowid_column(Rest: bytes) -> tuple[str | None, bytes]:

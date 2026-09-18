@@ -3348,6 +3348,18 @@ non-zero "present" marker. The locator is read and **discarded**
 reply that stops after the image leaves the client consuming the next token as
 locator bytes.
 
+**A live server chooses per client which form to send; the Mirror cannot.** For
+the same row a 23ai sends this prefetched form to the reference thin client and
+the **bare locator** to seerdb, which then reads the content over TTI_LOBOPS like
+any other LOB. The Mirror has one reply for everybody and must send the
+prefetched form, because that is the one the reference client can read at all
+(§14.5b's bare form kills it, #887). So a client has to handle **both**, and the
+rule is: *if the image is there, it is the value* — the locator behind it is a
+placeholder that resolves to nothing, and a fetch for it comes back empty. seerdb
+keeps that image on the LOB and answers `read()` from it, rather than issuing a
+TTI_LOBOPS call whose reply is an empty image the decoder then rejects
+(seerdb#959).
+
 The chunk size is **32600** (`02 7f 58`), measured identical for VECTOR columns
 of 3, 5 and 16 float32 elements and for a JSON column — it is not derived from
 the value.
