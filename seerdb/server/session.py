@@ -352,6 +352,14 @@ def handle_login(
         tns_version = server_tns_version(field_version)
     request = parse_connect(_expect(stream, TNS_CONNECT, 'CONNECT'))
     stream.send_raw(encode_accept(request, tns_version=tns_version))
+    # Honour the SDU just negotiated in that ACCEPT. It was computed as
+    # min(client, ours) and reported, but every later write still used the
+    # LISTENER's own value, so a client that negotiated down was then sent
+    # packets larger than the buffer it had sized from our own answer. seerdb's
+    # client reads by the length header and tolerated it; the reference client
+    # sizes a fixed buffer and the connection simply DIED -- DPY-4011, with
+    # nothing in it to suggest the SDU (#826).
+    stream.sdu = min(request.sdu, stream.sdu)
     # From protocol version 315 the post-ACCEPT DATA stream carries a 4-byte
     # packet length instead of the legacy 16-bit length + flags pair (§1.1). The
     # ACCEPT itself is still framed the legacy way — the switch takes effect for
