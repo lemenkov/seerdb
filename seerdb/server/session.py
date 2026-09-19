@@ -2974,6 +2974,16 @@ def _answer_fetch(
     # terminated by ORA-01403.
     count = request.fetch if request.fetch > 0 else _ALL_ROWS
     columns, batch = cursors.take(request.cursor, count)
+    # A define the client applied to this cursor still stands, and stands for the
+    # life of the cursor. The rows were parked by the execute, BEFORE the define
+    # existed -- a LOB-class result defers its rows, so the define arrives on the
+    # round-trip after a describe-only reply -- and the re-execute that carried it
+    # applied it only to the batch it served itself. Without applying it here too,
+    # a result set larger than one batch carried two framings for the same column:
+    # the first rows inline, every later row a locator the client was no longer
+    # expecting, which it reports as an unknown message type whose number is the
+    # locator's own length byte (#982).
+    columns = inline_long_for_defines(columns, cursors.defines(request.cursor))
     # Queue the LOB content of the rows THIS batch delivers. A result too large
     # for one batch hands its later rows out here, and their locators are read
     # over TTI_LOBOPS like any other -- without this the queue held only the

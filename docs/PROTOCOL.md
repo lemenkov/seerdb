@@ -3439,6 +3439,22 @@ it look like whatever else changed on that call — in oracledb's own suite, a b
 whose type went from `str` to `int`, so the test is named "changing bind type
 with define needed" and the bind type has nothing to do with it.
 
+**And a third half, on the fetch side (#982).** "For the life of the cursor"
+includes every *batch* of one result set, not just every execute of it. The rows
+of a LOB-class result are parked by the execute, **before** the define exists —
+such a result defers its rows (§11.9), so the client gets a describe-only reply
+and sends its define on the round-trip after it. That define round-trip serves
+the first batch inline and leaves the rest parked, so a plain `TTI_FETCH` for the
+remainder has to apply the define too.
+
+A server that applies it only where it arrives sends **two framings for the same
+column in one result set** — the first rows inline, every later row a locator.
+The client reports it as `DPY-5000 ... unknown protocol message type 38`, and the
+38 is nothing but `0x26`, the length byte of the locator it was not expecting; the
+number moves with the locator, which is what makes this read like a decoder gap
+rather than a lost define. It needs a result larger than one prefetch batch to
+show up at all, so a one-row test passes.
+
 ### 14.5e JSON and VECTOR are **prefetched into the row** (#887, #826)
 
 A native JSON or VECTOR column is LOB-class in the describe but is never fetched

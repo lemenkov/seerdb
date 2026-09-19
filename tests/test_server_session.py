@@ -2232,6 +2232,47 @@ def test_a_define_stands_for_the_life_of_the_cursor() -> None:
     assert cursors.defines(cursor_id + 1) == []
 
 
+def test_a_later_fetch_honours_the_define_too() -> None:
+    # The rows of a LOB-class result are parked by the EXECUTE, before the define
+    # exists: such a result defers its rows, so the client gets a describe-only
+    # reply and sends the define on the round-trip after it. The re-execute that
+    # carries the define applied it only to the batch it served itself, so a
+    # result larger than one batch went out in two framings -- the first rows
+    # inline, every later row a locator the client was no longer expecting. It
+    # reported that as an unknown message type whose number was the locator's own
+    # length byte, which is why it read as a decoder gap (#982).
+    from seerdb.common.tns import ColumnMeta
+    from seerdb.common.tns_consts import TNS_TYPE_CLOB, TNS_TYPE_LONG
+    from seerdb.server.session import FetchRequest, _answer_fetch, _Cursors
+
+    columns = [
+        ColumnMeta(
+            name=b'CLOBCOL',
+            data_type=TNS_TYPE_CLOB,
+            data_length=4000,
+            max_size=4000,
+            csfrm=1,
+        )
+    ]
+    cursors = _Cursors()
+    cursor_id = cursors.open(columns, [('first',), ('second',)])
+    cursors.set_defines(cursor_id, [(TNS_TYPE_LONG, 1)])
+
+    stream: Any = _CollectingStream()
+    lobs = _answer_fetch(stream, FetchRequest(cursor=cursor_id, fetch=1), cursors)
+    # Served inline, so there is no locator and nothing queued for a LOB read --
+    # a client that defined the column as LONG issues none.
+    assert lobs == []
+    assert b'first' in stream.sent[0]
+
+    # And the SAME again for the batch after it, which is the half that used to
+    # revert.
+    stream = _CollectingStream()
+    lobs = _answer_fetch(stream, FetchRequest(cursor=cursor_id, fetch=1), cursors)
+    assert lobs == []
+    assert b'second' in stream.sent[0]
+
+
 def test_defines_travel_to_the_id_a_re_run_mints() -> None:
     # Re-running a cached query mints a FRESH cursor id and reports that, so the
     # defines standing on the id the client re-executed have to travel with it.
