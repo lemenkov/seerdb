@@ -117,6 +117,63 @@ def test_the_session_adopts_the_sdu_it_advertised() -> None:
     assert result['stream'].sdu == 1024  # and the SERVER writes to the same size
 
 
+def test_ping_is_relayed_to_a_backend_that_offers_it() -> None:
+    # `conn.ping()` is a pool's health check: it is asking whether the DATABASE
+    # is reachable. Answering it from the Mirror's own memory reports healthy
+    # while the upstream is gone -- the one thing the check exists to catch. A
+    # backend that can be pinged is now asked (#826).
+    pinged: list[bool] = []
+
+    class _PingableBackend(SqliteBackend):
+        def ping(self) -> None:
+            pinged.append(True)
+
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    result: dict = {}
+
+    def serve() -> None:
+        sock, _ = listen.accept()
+        try:
+            result['user'] = serve_session(
+                PacketStream(sock), _PingableBackend(':memory:', credentials=_CREDS)
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced to the test thread
+            result['error'] = exc
+        finally:
+            sock.close()
+
+    server = threading.Thread(target=serve, daemon=True)
+    server.start()
+    conn = _connect(listen.getsockname()[1])
+    try:
+        conn.ping()
+    finally:
+        conn.close()
+        server.join(timeout=5)
+        listen.close()
+
+    assert result.get('error') is None, result.get('error')
+    assert pinged == [True]
+
+
+def test_ping_still_answers_when_the_backend_cannot_be_pinged() -> None:
+    # A backend without the hook keeps the local acknowledgement: the client's
+    # round trip must complete rather than hang, which is what the plain
+    # SqliteBackend exercises here.
+    listen, server, result = _start_mirror()
+    conn = _connect(listen.getsockname()[1])
+    try:
+        conn.ping()  # no exception is the assertion
+    finally:
+        conn.close()
+        server.join(timeout=5)
+        listen.close()
+    assert result.get('error') is None, result.get('error')
+
+
 def _values(row) -> tuple:
     """A row with its LOB cells read to their values.
 
