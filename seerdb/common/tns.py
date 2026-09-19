@@ -2740,7 +2740,14 @@ def encode_returning_response(
 
 def _returned_value(value: object, tns_type: int) -> bytes:
     # One RETURNING out-bind value. JSON and VECTOR carry their image inline, the
-    # way the row encoder sends them (#826/#887); everything else is a DALC.
+    # way the row encoder sends them (#826/#887); an OBJECT / collection carries
+    # the object frame a column uses; everything else is a DALC.
+    if tns_type == TNS_TYPE_ADT:
+        # `RETURNING ObjectCol INTO :b`. Encoded as a DALC the value was asked
+        # for a scalar wire form it has none of, and the Mirror answered
+        # ORA-03115 "no wire encoding for a column value of type DbObject"
+        # (#826). The TOID comes off the value's own type, as a column's does.
+        return encode_object_column_value(value)
     if tns_type not in _PREFETCHED_IMAGE_TYPES or value is None:
         return encode_value(value, tns_type)
     if tns_type == TNS_TYPE_JSON:

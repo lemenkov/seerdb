@@ -5138,6 +5138,33 @@ unchanged. python-oracledb-compatible. Sync + async; verified on
 10g/11g/21c/23ai (array INSERT, array UPDATE with a different row count per
 iteration, single-row batch, and multiple return binds).
 
+### 22.1c An OBJECT return bind carries the **object frame** (#826)
+
+`RETURNING ObjectCol INTO :b` frames the returned value exactly as an ADT column
+is framed in a row (§21.2) — the constructed 36-byte toid, the object OID, a
+snapshot, a `ub2` version, the image-length gate, `ub2` flags, then the packed
+image. Not a DALC.
+
+Read as a DALC, the toid's leading length is taken for the value's length and
+the reply desyncs **two bytes in**, landing on that toid's own `00 22 02 08`
+prefix — which is then reported as an unknown *token 34*. The error names a
+token number and says nothing about objects, so the useful tell is the 16-byte
+type OID visible in the bytes, matching the OID the bind itself sent:
+
+```
+22 02 08 5b 5c 96 bc cc 22 5a fc e0 63 96 00 a8 c0 2c a9 …  ff 20 <the string>
+         └─────────────── the type OID ───────────────┘      └── image ──┘
+```
+
+The **client** needs the type's attribute layout to walk the image; a returning
+Var is built from the type itself, so it already has it (a fetched column has to
+look it up from the describe instead). The **server side** is the same rule
+backwards: a Mirror encodes the value with the object frame, and the bind's type
+OID has to survive parsing to get there — dropping it leaves the backend building
+an untyped receiver and the real server then refuses the statement with
+`ORA-00932: expression is of data type <SCHEMA>.<TYPE>, which is incompatible
+with expected data type CHAR`.
+
 ### 22.1b A JSON / VECTOR return bind carries its **image**, not a DALC (#826)
 
 `DALC + sb4 0` describes every return bind but two. `RETURNING JsonCol INTO :b`

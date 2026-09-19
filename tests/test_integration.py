@@ -3598,16 +3598,7 @@ class ObjectReturningIntegration(_IntegrationBase):
                 pass
         super().tearDown()
 
-    def _skip_if_mirror(self):
-        # The Mirror cannot SERVE an object RETURNING yet -- it drops the bind's
-        # type OID, so the backend builds an untyped receiver, and it has no wire
-        # encoding for a returned DbObject. That is the other half of #826 and
-        # lands separately; this class is about the CLIENT reading one.
-        if os.environ.get('SEERDB_TEST_MIRROR'):
-            self.skipTest('the Mirror does not serve an object RETURNING yet')
-
     def test_returns_the_inserted_object(self):
-        self._skip_if_mirror()
         typ = self.conn.gettype(self.TYPE)
         obj = typ.newobject()
         obj.ID = 7
@@ -3625,7 +3616,6 @@ class ObjectReturningIntegration(_IntegrationBase):
     def test_a_returned_object_survives_alongside_a_scalar(self):
         # The object frame has to consume exactly its own bytes, or the bind
         # after it reads the remainder: a scalar behind it is the check.
-        self._skip_if_mirror()
         typ = self.conn.gettype(self.TYPE)
         obj = typ.newobject()
         obj.ID = 9
