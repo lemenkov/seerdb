@@ -617,6 +617,15 @@ class OraclePassthroughBackend:
         receivers = {}
         for i in positions:
             bind = rows[0][i]
+            # An object / collection receiver has to be typed, or the upstream
+            # builds an untyped Var and the server refuses the statement with
+            # ORA-00932 "... which is incompatible with expected data type CHAR".
+            # The client sends the type OID in the bind's OAC and the Mirror now
+            # threads it through (#826).
+            objtype = self._gettype_by_oid(bind.toid) if bind.toid else None
+            if objtype is not None:
+                receivers[i] = cursor.var(objtype)
+                continue
             dbtype = dbtype_for_oracle_type(bind.tns_type, 1)
             size = bind.max_size if bind.max_size and bind.max_size > 0 else None
             receivers[i] = (

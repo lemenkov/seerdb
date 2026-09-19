@@ -592,6 +592,43 @@ def test_returning_response_round_trips_to_the_client_decoder() -> None:
     assert [len(r['return_values'][0]) for r in records] == [2, 0, 1, 1]
 
 
+def test_returned_object_round_trips_to_the_client_decoder() -> None:
+    # `RETURNING ObjectCol INTO :b`. The value carries the OBJECT frame a column
+    # uses, not a DALC: encoded as a DALC it was asked for a scalar wire form a
+    # DbObject has none of, and the Mirror answered ORA-03115 "no wire encoding
+    # for a column value of type DbObject" (#826).
+    #
+    # Encoded here and read back with the CLIENT's own decoder, because a
+    # round trip through our own encoder alone would prove only that it agrees
+    # with itself.
+    from seerdb.common.dbobject import DbObject, DbObjectType, ObjectImage
+    from seerdb.common.tns import (
+        decode_packet,
+        encode_returning_response,
+        set_decode_return_binds,
+    )
+    from seerdb.common.tns_consts import TNS_TYPE_ADT, TNS_TYPE_VARCHAR
+
+    typ = DbObjectType(
+        'PYO',
+        'UDT_OBJECT',
+        b'\x02' * 16,
+        1,
+        [{'name': 'NAME', 'data_type': TNS_TYPE_VARCHAR}],
+    )
+    obj = DbObject('UDT_OBJECT', [('NAME', 'Alice')], dbtype=typ)
+    blob = encode_returning_response(1, [[(obj,)]], [TNS_TYPE_ADT])
+    set_decode_return_binds([0], {0: TNS_TYPE_ADT})
+    try:
+        decoded = decode_packet(blob, (None, None, []))
+    finally:
+        set_decode_return_binds(None)
+    (record,) = [row for row in decoded[4] if isinstance(row, dict)]
+    (value,) = record['return_values'][0]
+    assert isinstance(value, ObjectImage)
+    assert b'Alice' in value.image
+
+
 @pytest.mark.parametrize('version', [8, 17, 24])
 def test_describe_decodes_back_at_a_12c_field_version(version: int) -> None:
     # The describe column gains a one-byte scale and an oaccolid at 12.2, and the

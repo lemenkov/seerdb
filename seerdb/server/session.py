@@ -2118,9 +2118,22 @@ def _run_returning(backend: Backend, sql: str, request: ExecRequest) -> Result:
     source_rows = request.bind_rows or [
         [None] * request.bind_count for _ in range(request.iterations)
     ]
+    # The per-bind type OID rides on bind_types as the 4th field, the same place
+    # _bind_vars takes it from (#888). A RETURNING receiver for an object or
+    # collection column needs it: without one the backend can only build an
+    # untyped Var, and the server rejects the statement with ORA-00932 "expression
+    # is of data type <SCHEMA>.<TYPE>, which is incompatible with expected data
+    # type CHAR". The client does send it -- measured -- it was simply dropped
+    # here (#826).
+    toids = [(bt[3] if len(bt) > 3 else b'') for bt in (request.bind_types or [])]
     rows = [
         [
-            BindVar(value=None, tns_type=meta[i][0], max_size=meta[i][1])
+            BindVar(
+                value=None,
+                tns_type=meta[i][0],
+                max_size=meta[i][1],
+                toid=toids[i] if i < len(toids) else b'',
+            )
             if i in request.return_binds
             else value
             for i, value in enumerate(row)
