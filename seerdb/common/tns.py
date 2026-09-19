@@ -1792,6 +1792,45 @@ _EXEC_OPTION_EXECUTE = 0x20
 _EXEC_OPTION_DESCRIBE = 0x20000
 
 
+def parse_options(options: int) -> tuple[bool, bool]:
+    """``(parse_only, describe_only)`` for an execute's option word.
+
+    The word is a bitmask of what this call is asking for, so what makes a
+    ``cursor.parse()`` a parse is not the PARSE bit -- it is the **absence of
+    EXECUTE**. Measured on a live 23ai, the two parses of one statement do not
+    even agree on PARSE:
+
+    ==================================  ========  =======================
+    call                                options   note
+    ==================================  ========  =======================
+    ``parse()``, statement unseen       ``0x1``   PARSE
+    ``parse()``, statement cached       ``0x0``   already parsed
+    ``execute()``                       ``0x8029`` NOT_PLSQL|COMMIT|EXECUTE|PARSE
+    define round-trip                   ``0x8010`` NOT_PLSQL|DEFINE
+    ==================================  ========  =======================
+
+    Reading the PARSE bit alone therefore missed the second parse of a
+    statement, which ran instead: it carries no bind values, so the backend
+    answered ORA-01008 (#984).
+
+    Two other calls have no EXECUTE either and are NOT parses, so they are
+    excluded by name: the DEFINE round-trip (``0x8010``), which is the client
+    applying its fetch types and asking for the rows already parked (§14.5d),
+    and a scroll re-execute (``0x8040``), which repositions an open cursor and
+    must NOT set EXECUTE or the server would re-run the query from the top
+    (§11.8). Calling either a parse would answer a bare status and strand the
+    rows."""
+    asks_for_work = (
+        _EXEC_OPTION_EXECUTE  # run the statement
+        | _EXEC_OPTION_DEFINE  # apply the client's fetch types, take the rows
+        | TNS_EXEC_OPTION_FETCH  # fetch / reposition (a scroll re-execute)
+    )
+    return (
+        not (options & asks_for_work),
+        bool(options & _EXEC_OPTION_DESCRIBE),
+    )
+
+
 # A TTI_LOBOPS READ request carries the slice sqlplus wants: a 1-based source
 # offset and an amount, both counts (characters for a CLOB, bytes for a BLOB),
 # at these fixed ub8-LE offsets in the OCI request. sqlplus loops over them (in
@@ -1999,10 +2038,7 @@ def parse_exec(
     options, rest = decode_ub4(rest)
     autocommit = bool(options & _EXEC_OPTION_COMMIT)
     batcherrors = bool(options & TNS_EXEC_OPTION_BATCH_ERRORS)
-    parse_only = bool(options & _EXEC_OPTION_PARSE) and not (
-        options & _EXEC_OPTION_EXECUTE
-    )
-    describe_only = bool(options & _EXEC_OPTION_DESCRIBE)
+    parse_only, describe_only = parse_options(options)
     cursor, rest = decode_ub4(rest)
     query_flag, rest = rest[0], rest[1:]
     query_len, rest = decode_ub4(rest)

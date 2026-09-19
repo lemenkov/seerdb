@@ -4082,7 +4082,8 @@ def test_a_parse_only_execute_is_recognised_and_carries_no_binds() -> None:
 
 def test_an_ordinary_execute_is_not_taken_for_a_parse() -> None:
     # PARSE rides along with EXECUTE on every first execute of a statement, so
-    # the test has to be "PARSE and NOT EXECUTE", not "PARSE".
+    # the PARSE bit alone can never be the test -- what makes a call a parse is
+    # the ABSENCE of EXECUTE (see test_the_option_word_says_parse_by_its_absence).
     from seerdb.common.tns import _DECODE_FIELD_VERSION
 
     token = _DECODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
@@ -4091,6 +4092,35 @@ def test_an_ordinary_execute_is_not_taken_for_a_parse() -> None:
     finally:
         _DECODE_FIELD_VERSION.reset(token)
     assert request.parse_only is False
+
+
+def test_the_option_word_says_parse_by_its_absence() -> None:
+    # What makes a call a `cursor.parse()` is not the PARSE bit -- it is having
+    # no EXECUTE. The two parses of ONE statement do not even agree on PARSE:
+    # the first carries 0x1, and the second, after the client has the statement
+    # cached, carries 0x0. Reading the PARSE bit alone therefore took the second
+    # one for an ordinary execute and RAN it; a parse sends no bind values, so
+    # the backend answered ORA-01008 (#984). Every option word below was
+    # measured on a live 23ai.
+    from seerdb.common.tns import parse_options
+
+    assert parse_options(0x1) == (True, False)  # parse(), statement unseen
+    assert parse_options(0x0) == (True, False)  # parse(), statement cached
+    assert parse_options(0x20001) == (True, True)  # a QUERY parse: + DESCRIBE
+
+    # Anything that actually runs the statement sets EXECUTE (0x20).
+    assert parse_options(0x8029) == (False, False)  # cached re-execute
+    assert parse_options(0x8021) == (False, False)  # DDL / first execute
+    assert parse_options(0x8061) == (False, False)  # a SELECT
+
+    # Two other calls have no EXECUTE either and are NOT parses. The define
+    # round-trip is the client applying its fetch types and asking for the rows
+    # already parked (PROTOCOL.md 14.5d); a scroll re-execute repositions an
+    # open cursor, and must not set EXECUTE or the server would re-run the query
+    # from the top (11.8). Calling either a parse answers a bare status and
+    # strands the rows.
+    assert parse_options(0x8010) == (False, False)  # define round-trip
+    assert parse_options(0x8040) == (False, False)  # scroll re-execute
 
 
 def test_a_temp_lob_answers_its_own_length_and_trim() -> None:

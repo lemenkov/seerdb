@@ -1232,8 +1232,31 @@ however many placeholders the statement has, so running it anyway fails with
 reply is the describe followed by a **success** status — not the end-of-fetch
 `ORA-01403` a real fetch ends on, because nothing was fetched.
 
-The test is "PARSE **and not** EXECUTE": `PARSE` also rides along with `EXECUTE`
-on the first execute of any statement, so testing for it alone catches everything.
+The test is **not** the `PARSE` bit (#984). `PARSE` rides along with `EXECUTE` on
+the first execute of any statement, and — the part that is easy to miss — the
+**second** `parse()` of one statement does not set it at all. By then the client
+has the statement cached, so it sends an OALL8 by cursor id with an empty
+statement and options `0x0`: nothing to parse, nothing to run. Reading the PARSE
+bit takes that for an ordinary execute and runs it, and since a parse carries no
+bind values the server answers the same `ORA-01008` this whole paragraph is about.
+
+So what marks a parse is the **absence of any bit asking for work**. Measured on
+a live 23ai:
+
+| call | options | |
+|---|---|---|
+| `parse()`, statement unseen | `0x1` | PARSE |
+| `parse()`, statement cached | `0x0` | — |
+| `parse()` of a query | `0x20001` | PARSE \| DESCRIBE |
+| `execute()`, cached | `0x8029` | NOT_PLSQL \| COMMIT \| EXECUTE \| PARSE |
+| `execute()`, first / DDL | `0x8021` | NOT_PLSQL \| EXECUTE \| PARSE |
+| a SELECT | `0x8061` | NOT_PLSQL \| FETCH \| EXECUTE \| PARSE |
+| define round-trip | `0x8010` | NOT_PLSQL \| DEFINE |
+| scroll re-execute | `0x8040` | NOT_PLSQL \| FETCH |
+
+The last two have no `EXECUTE` and are still not parses — one takes the rows
+already parked (§14.5d), the other repositions an open cursor (§11.8) — so the
+test is "no `EXECUTE`, no `DEFINE`, no `FETCH`".
 
 **Open** — a normal parse+execute (cursor 0, SQL present) with the al8i4 scroll
 fields and orientation `CURRENT`/1. It keeps the fv24 query options `0x8061`
