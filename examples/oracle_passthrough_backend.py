@@ -37,6 +37,7 @@ from seerdb.common.dbobject import (
 from seerdb.common.sqltext import is_plsql
 from seerdb.common.tns import AL16UTF16_CHARSET, ColumnMeta
 from seerdb.common.tns_consts import (
+    FIELD_VERSION_12_1,
     TNS_TYPE_ADT,
     TNS_TYPE_BLOB,
     TNS_TYPE_CLOB,
@@ -721,18 +722,30 @@ class OraclePassthroughBackend:
 
     def _execute_plsql(self, cursor, sql: str, binds: Sequence) -> Result:
         # Each PL/SQL bind is registered as an OUT-capable Var (the wire carries
-        # no direction) except a large LOB IN value: a resolved temp-LOB CLOB /
-        # BLOB (#91) is bound as its plain str / bytes, which seerdb re-promotes
-        # through an upstream temp LOB. A cursor.var(LOB) has no client-side OAC,
-        # and such a bind is only ever IN here, so it needs no Var — its OUT slot
-        # is None (the client discards a non-Var position anyway).
+        # no direction), including a resolved temp-LOB CLOB / BLOB value (#91):
+        # a block that WRITES to such a bind needs its new content back, and a
+        # LOB Var now round-trips one (#978/#979). seerdb re-promotes the value
+        # through an upstream temp LOB either way.
         variables = []
         for bind in binds:
             if (
                 bind.tns_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB)
                 and bind.value is not None
             ):
-                variables.append(bind.value)
+                if getattr(self._conn, 'field_version', 0) < FIELD_VERSION_12_1:
+                    # Below 12.1 a LOB Var has no bind encoding at all (#902),
+                    # so bind the plain str / bytes. That is IN-only -- an
+                    # IN OUT LOB is simply out of reach on such an upstream --
+                    # but it is what the server can take.
+                    variables.append(bind.value)
+                    continue
+                Var = cursor.var(
+                    seerdb.DB_TYPE_BLOB
+                    if bind.tns_type == TNS_TYPE_BLOB
+                    else seerdb.DB_TYPE_CLOB
+                )
+                Var.setvalue(0, bind.value)
+                variables.append(Var)
                 continue
             if bind.tns_type == TNS_TYPE_ADT:
                 # An object (ADT) bind (#888). A populated IN value was already

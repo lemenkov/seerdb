@@ -23,6 +23,10 @@ from oracle_passthrough_backend import (  # noqa: E402
     _relay_error,
 )
 
+from seerdb.common.tns_consts import (  # noqa: E402
+    FIELD_VERSION_11_2,
+    FIELD_VERSION_12_1,
+)
 from seerdb.server.backend import BindVar  # noqa: E402
 
 
@@ -157,24 +161,43 @@ def test_array_bind_registers_an_array_var_of_the_declared_capacity():
     assert result.out_binds == [[1, 2], [7, 8, 9]]
 
 
-def test_large_lob_in_bind_is_bound_as_a_plain_value_not_a_var():
-    # A large CLOB / BLOB IN bind (#91) resolves to plain str / bytes; the
-    # passthrough must bind that value directly (seerdb re-promotes it upstream),
-    # not a cursor.var(LOB) — which has no client-side OAC (ORA-00600 "Unsupported
-    # Var OAC type"). Its OUT slot is None; a real OUT Var still returns its value.
+def test_large_lob_in_bind_is_registered_as_a_lob_var():
+    # A large CLOB / BLOB IN bind (#91) resolves to plain str / bytes. It used to
+    # be bound as that value directly, which is IN-only -- a block that WRITES to
+    # the bind then failed upstream with ORA-06502. It is registered as a LOB Var
+    # instead, seeded with the value, so an IN OUT LOB comes back (#979).
     from seerdb.common.tns_consts import TNS_TYPE_CLOB, TNS_TYPE_NUMBER
 
     backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
+    backend._conn = type('Conn', (), {'field_version': FIELD_VERSION_12_1})()
     cursor = _FakeCursor(out_values={1: 42})
     binds = _plsql_binds(
         ('X' * 40000, TNS_TYPE_CLOB, 160000), (None, TNS_TYPE_NUMBER, 1)
     )
     result = backend._execute_plsql(cursor, 'BEGIN :r := f(:p); END;', binds)
-    # :p bound as the plain string; :r bound as a Var.
+    # Both positions are Vars now. The LOB one was seeded with the IN value, so
+    # a block that leaves it alone still returns it -- and one that writes to it
+    # returns what it wrote, which a bare string bind could never carry back.
+    assert isinstance(cursor.bound[0], _FakeVar)
+    assert isinstance(cursor.bound[1], _FakeVar)
+    assert result.out_binds == ['X' * 40000, 42]
+
+
+def test_large_lob_in_bind_stays_a_plain_value_below_12_1():
+    # Below 12.1 a LOB Var has no bind encoding at all (#902), so the plain
+    # str / bytes is all the upstream can take. IN-only, and its OUT slot is
+    # None -- which the client discards anyway.
+    from seerdb.common.tns_consts import TNS_TYPE_CLOB, TNS_TYPE_NUMBER
+
+    backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
+    backend._conn = type('Conn', (), {'field_version': FIELD_VERSION_11_2})()
+    cursor = _FakeCursor(out_values={1: 42})
+    binds = _plsql_binds(
+        ('X' * 40000, TNS_TYPE_CLOB, 160000), (None, TNS_TYPE_NUMBER, 1)
+    )
+    result = backend._execute_plsql(cursor, 'BEGIN :r := f(:p); END;', binds)
     assert cursor.bound[0] == 'X' * 40000
     assert isinstance(cursor.bound[1], _FakeVar)
-    # OUT binds: the LOB IN slot is None (discarded by the client); the Var yields
-    # its assigned value.
     assert result.out_binds == [None, 42]
 
 
