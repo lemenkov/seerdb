@@ -169,6 +169,22 @@ class OraclePassthroughBackend:
             if key in ('program', 'machine', 'terminal', 'osuser')
         }
 
+    def set_app_context(self, entries: list[tuple[str, str, str]]) -> None:
+        """Apply the application context the client declared at connect (#826).
+
+        A real server takes these in the login itself; this session is already
+        open by the time they arrive, so they go in through DBMS_SESSION, which
+        is the supported way to set a CLIENTCONTEXT namespace on a live session
+        and is what `sys_context()` then reads back.
+        """
+        assert self._conn is not None  # authenticate() ran before this
+        cursor = self._conn.cursor()
+        for namespace, attribute, value in entries:
+            cursor.execute(
+                'begin dbms_session.set_context(:1, :2, :3); end;',
+                [namespace, attribute, value],
+            )
+
     def session_info(self) -> SessionInfo:
         """The upstream session's real identity, for the Mirror's login reply.
 

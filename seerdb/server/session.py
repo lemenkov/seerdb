@@ -159,6 +159,7 @@ from seerdb.server.auth import (
     find_fast_auth_osesskey,
     is_token_auth,
     make_challenge,
+    parse_auth_app_context,
     parse_auth_new_password,
     parse_auth_response,
     parse_auth_response_oci,
@@ -547,6 +548,19 @@ def handle_login(
     # login succeeded, the password never changed, and the NEXT connect with the
     # new one was refused ORA-01017 -- a failure one step removed from its cause
     # (#826). A backend that cannot change passwords simply skips it.
+    # Application context the client declared at connect
+    # (`connect(appcontext=[...])`). It arrives in this AUTH -- AFTER the backend
+    # opened its upstream session during authenticate() -- so it is applied to
+    # that open session rather than passed to the connect, which is where
+    # DBMS_SESSION.SET_CONTEXT works anyway (#826).
+    if not sqlplus:
+        entries = parse_auth_app_context(auth_body, field_version)
+        apply_ctx = getattr(backend, 'set_app_context', None)
+        if entries and apply_ctx is not None:
+            try:
+                apply_ctx(entries)
+            except Exception as exc:  # noqa: BLE001 - never fail a good login
+                logger.info('application context refused: %s', exc)
     if not sqlplus and new_password_cipher:
         _apply_new_password(backend, user, secret, conn_key, new_password_cipher)
     if sqlplus:

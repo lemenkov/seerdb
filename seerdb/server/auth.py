@@ -32,6 +32,7 @@ values is layered on top separately.
 
 from __future__ import annotations
 
+import contextvars
 import struct
 from binascii import unhexlify
 from secrets import token_bytes
@@ -308,6 +309,13 @@ def encode_result_oci(
     return _oci_auth_packet(pairs, _RESULT_TRAILER)
 
 
+# The ordered key/value pairs of the auth message most recently parsed, for the
+# few fields that REPEAT and so cannot survive the dict form (#826).
+_LAST_AUTH_PAIRS: contextvars.ContextVar[list] = contextvars.ContextVar(
+    'last_auth_pairs', default=[]
+)
+
+
 def _parse_fun_auth(
     payload: bytes, field_version: int = FIELD_VERSION_11_2
 ) -> tuple[int, bytes, dict[bytes, bytes | None]]:
@@ -340,6 +348,10 @@ def _parse_fun_auth(
         rest = rest[1:]  # the 12.1+ length byte in front of the username
     user = rest[:userlen]
     kvs, _ = decode_kv(rest[userlen:], numpairs, [])
+    # The ORDERED pairs are kept alongside the dict: application context arrives
+    # as repeated NSPACE / ATTR / VALUE triples under the same three keys, so
+    # collapsing to a dict keeps only the LAST entry (#826).
+    _LAST_AUTH_PAIRS.set(list(kvs))
     return subtype, user, dict(kvs)
 
 
@@ -476,6 +488,55 @@ def parse_auth_response_oci(payload: bytes) -> tuple[bytes, bytes, bytes]:
     sesskey = _oci_auth_value(payload, b'AUTH_SESSKEY')
     password = _oci_auth_value(payload, b'AUTH_PASSWORD')
     return user, sesskey, password
+
+
+def _group_app_context(pairs: list) -> list[tuple[str, str, str]]:
+    """Application-context entries from the auth message's key/value pairs.
+
+    :func:`decode_kv` SORTS the pairs, so the wire order across the three keys
+    is gone by the time they arrive -- but Python's sort is stable, so each key
+    keeps its OWN sequence (ATTR1, ATTR2, ATTR3 / VALUE1, VALUE2, VALUE3).
+    Group by key and zip: that recovers the entries without depending on an
+    interleaving that no longer exists. The keys carry a trailing NUL.
+    """
+    columns: dict[str, list[str]] = {}
+    for raw_key, raw_value in pairs:
+        key = bytes(raw_key).rstrip(b'\x00')
+        if not key.startswith(b'AUTH_APPCTX_'):
+            continue
+        field = key[len(b'AUTH_APPCTX_') :].decode('ascii', 'replace').lower()
+        columns.setdefault(field, []).append(
+            bytes(raw_value or b'').decode('utf-8', 'replace')
+        )
+    return list(
+        zip(
+            columns.get('nspace', []),
+            columns.get('attr', []),
+            columns.get('value', []),
+            strict=False,
+        )
+    )
+
+
+def parse_auth_app_context(
+    payload: bytes, field_version: int = FIELD_VERSION_11_2
+) -> list[tuple[str, str, str]]:
+    """The application-context entries a login AUTH declares (#826).
+
+    `connect(appcontext=[(namespace, attribute, value), ...])` sends each entry
+    as three consecutive pairs -- ``AUTH_APPCTX_NSPACE`` / ``_ATTR`` / ``_VALUE``
+    -- REPEATING the same three keys per entry. The dict form of the message
+    therefore keeps only the last, which is why this reads the ordered pairs.
+    The keys carry a trailing NUL on the wire.
+
+    Never raises: a malformed value must not fail an otherwise good login.
+    """
+    try:
+        _parse_fun_auth(payload, field_version)
+        pairs = _LAST_AUTH_PAIRS.get()
+    except Exception:  # noqa: BLE001 - a login must not fail over this
+        return []
+    return _group_app_context(pairs)
 
 
 def parse_auth_new_password(
