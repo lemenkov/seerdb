@@ -83,6 +83,8 @@ class _ConnectionLogic:
     machine: str | None
     terminal: str | None
     osuser: str | None
+    driver_name: str | None
+    edition: str | None
     sdu: int
     _e2e_values: dict
     _e2e_pending: dict
@@ -313,6 +315,10 @@ class _ConnectionLogic:
                 'charset': self.charset,
                 'prelim': self.prelim,
                 'app_name': self.app_name,
+                # The banner reported as v$session_connect_info.client_driver.
+                # None keeps seerdb's own (#826).
+                'driver_name': self.driver_name,
+                'edition': self.edition,
                 # Session identity recorded in v$session (#826). Each is
                 # None unless the caller set it, and encode_dictionary_sess
                 # falls back to what this process actually is.
