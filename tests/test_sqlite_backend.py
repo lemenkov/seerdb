@@ -61,6 +61,62 @@ def _start_mirror(
     return listen, server, result
 
 
+def _serve_recording_stream(listen: socket.socket, result: dict) -> None:
+    """Serve one session, keeping the server's PacketStream for inspection."""
+    conn, _ = listen.accept()
+    stream = PacketStream(conn)
+    result['stream'] = stream
+    try:
+        result['user'] = serve_session(
+            stream, SqliteBackend(':memory:', credentials=_CREDS)
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced to the test thread
+        result['error'] = exc
+    finally:
+        conn.close()
+
+
+def test_the_session_adopts_the_sdu_it_advertised() -> None:
+    # The ACCEPT answers min(client, ours) and the client sizes its buffer from
+    # that -- so every later write has to respect it. The negotiated value was
+    # computed for the ACCEPT and then thrown away: the session kept writing at
+    # the LISTENER's SDU. seerdb's own client reads by the length header and
+    # never noticed; the reference client sizes a fixed buffer, and the
+    # connection simply DIED with DPY-4011 and nothing pointing at the SDU
+    # (#826).
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    result: dict = {}
+    server = threading.Thread(
+        target=_serve_recording_stream, args=(listen, result), daemon=True
+    )
+    server.start()
+    port = listen.getsockname()[1]
+    conn = seerdb.connect(
+        host='127.0.0.1',
+        port=port,
+        user='PYO',
+        password='pyo123',
+        service_name='XE',
+        timeout=5000,
+        sdu=1024,
+    )
+    try:
+        cur = conn.cursor()
+        cur.execute('select 1')
+        cur.fetchall()
+    finally:
+        conn.close()
+        server.join(timeout=5)
+        listen.close()
+
+    assert result.get('error') is None, result.get('error')
+    assert conn.sdu == 1024  # the client kept what the ACCEPT told it
+    assert result['stream'].sdu == 1024  # and the SERVER writes to the same size
+
+
 def _values(row) -> tuple:
     """A row with its LOB cells read to their values.
 
