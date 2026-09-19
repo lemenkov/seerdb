@@ -3982,6 +3982,15 @@ def _decode_rxd_step(Data: bytes, Acc: tuple) -> tuple:
                     # next field, so the response desynced on the token after it
                     # (#826).
                     (Val, Rest) = _read_lob_column(Rest, inline_image=True)
+                elif TnsType == TNS_TYPE_ADT:
+                    # An OBJECT / collection bind's returned value carries the
+                    # object framing a column uses (§21.2 -- toid, object OID,
+                    # snapshot, version, image gate, flags, image), not a DALC.
+                    # Read as one, the constructed 36-byte toid was taken for a
+                    # length and the reply desynced a couple of bytes in, landing
+                    # on that toid's own `00 22 02 08` prefix and reporting it as
+                    # "no decoder for response token 34" (#826).
+                    (Val, Rest) = _read_object_column(Rest, {})
                 else:
                     (Val, Rest) = decode_dalc(Rest)
                 (_, Rest) = decode_ub4(Rest)  # sb4 actual length (trunc)

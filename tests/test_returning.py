@@ -124,6 +124,33 @@ _RXD_MULTI = (
 )
 
 
+def _object_returning_rxd() -> bytes:
+    """A RETURNING reply carrying one OBJECT value, built with the encoder.
+
+    Hand-written hex would only prove the test matches itself; these are the
+    bytes the Mirror's own object-column encoder produces, which is the framing
+    a real server uses for a returned ADT (§21.2)."""
+    from seerdb.common.dbobject import DbObject, DbObjectType
+    from seerdb.common.tns import encode_object_column_value, encode_sb4
+    from seerdb.common.tns_consts import TNS_TYPE_VARCHAR, TTI_RXD
+
+    typ = DbObjectType(
+        'PYO',
+        'UDT_OBJECT',
+        b'\x01' * 16,
+        1,
+        [{'name': 'STRINGVALUE', 'data_type': TNS_TYPE_VARCHAR}],
+    )
+    obj = DbObject('UDT_OBJECT', [('STRINGVALUE', 'returned')], dbtype=typ)
+    return (
+        bytes([TTI_RXD])
+        + encode_sb4(1)  # one row for this bind
+        + encode_object_column_value(obj)
+        + encode_sb4(0)  # sb4 truncation length
+        + bytes([TTI_STA])
+    )
+
+
 class TestReturningDecode(unittest.TestCase):
     def tearDown(self):
         set_decode_return_binds(None)
@@ -133,6 +160,24 @@ class TestReturningDecode(unittest.TestCase):
         (Done, Acc) = decode_token_rxd(data, (None, None, []))
         self.assertTrue(Done)
         return Acc[2][0]  # the return record
+
+    def test_object_return_bind_reads_the_object_frame(self):
+        # An OBJECT / collection return bind carries the object frame a column
+        # uses, not a DALC. Read as a DALC the constructed 36-byte toid was
+        # taken for a length, the reply desynced two bytes in, and the decoder
+        # reported the toid's own `00 22 02 08` prefix as "no decoder for
+        # response token 34" -- against a REAL 23ai, with no Mirror involved
+        # (#826).
+        from seerdb.common.dbobject import ObjectImage
+        from seerdb.common.tns_consts import TNS_TYPE_ADT
+
+        set_decode_return_binds([0], {0: TNS_TYPE_ADT})
+        (Done, Acc) = decode_token_rxd(_object_returning_rxd(), (None, None, []))
+        self.assertTrue(Done)
+        rec = Acc[2][0]
+        (value,) = rec['return_values'][0]
+        self.assertIsInstance(value, ObjectImage)
+        self.assertIn(b'returned', value.image)
 
     def test_two_binds_single_row(self):
         rec = self._decode(_RXD_TWO, [0, 1])

@@ -3559,6 +3559,90 @@ class PoolIntegration(unittest.TestCase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class ObjectReturningIntegration(_IntegrationBase):
+    """`DML ... RETURNING <object column> INTO :b` (#826).
+
+    The returned value carries the OBJECT frame a column uses -- toid, object
+    OID, snapshot, version, image gate, flags, image -- not a DALC. Read as a
+    DALC the constructed 36-byte toid was taken for a length, the reply desynced
+    two bytes in, and the decoder reported that toid's own `00 22 02 08` prefix
+    as "no decoder for response token 34". Against a REAL server, no Mirror.
+    """
+
+    TYPE = 'PYORACLE_OBJRET_T'
+    TABLE = 'PYORACLE_OBJRET'
+
+    def setUp(self):
+        super().setUp()
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('an object bind needs the 12.1+ OAC')
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (f'DROP TABLE {self.TABLE}', f'DROP TYPE {self.TYPE}'):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass  # best-effort teardown of leftovers
+        self.cur.execute(
+            f'CREATE TYPE {self.TYPE} AS OBJECT (id NUMBER, name VARCHAR2(40))'
+        )
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, o {self.TYPE})')
+
+    def tearDown(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (f'DROP TABLE {self.TABLE}', f'DROP TYPE {self.TYPE}'):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass
+        super().tearDown()
+
+    def _skip_if_mirror(self):
+        # The Mirror cannot SERVE an object RETURNING yet -- it drops the bind's
+        # type OID, so the backend builds an untyped receiver, and it has no wire
+        # encoding for a returned DbObject. That is the other half of #826 and
+        # lands separately; this class is about the CLIENT reading one.
+        if os.environ.get('SEERDB_TEST_MIRROR'):
+            self.skipTest('the Mirror does not serve an object RETURNING yet')
+
+    def test_returns_the_inserted_object(self):
+        self._skip_if_mirror()
+        typ = self.conn.gettype(self.TYPE)
+        obj = typ.newobject()
+        obj.ID = 7
+        obj.NAME = 'Alice'
+        out = self.cur.var(typ)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} (n, o) VALUES (1, :obj) '
+            'RETURNING o INTO :outObj',
+            [obj, out],
+        )
+        (returned,) = out.getvalue()
+        self.assertEqual(returned.NAME, 'Alice')
+        self.assertEqual(int(returned.ID), 7)
+
+    def test_a_returned_object_survives_alongside_a_scalar(self):
+        # The object frame has to consume exactly its own bytes, or the bind
+        # after it reads the remainder: a scalar behind it is the check.
+        self._skip_if_mirror()
+        typ = self.conn.gettype(self.TYPE)
+        obj = typ.newobject()
+        obj.ID = 9
+        obj.NAME = 'Bob'
+        out_obj = self.cur.var(typ)
+        out_num = self.cur.var(int)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} (n, o) VALUES (42, :obj) '
+            'RETURNING o, n INTO :outObj, :outNum',
+            [obj, out_obj, out_num],
+        )
+        (returned,) = out_obj.getvalue()
+        self.assertEqual(returned.NAME, 'Bob')
+        self.assertEqual(int(out_num.getvalue()[0]), 42)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class RefBindIntegration(_IntegrationBase):
     # REF bind (#139): fetch a REF for a row object, bind it back into an INSERT
     # and into DEREF(?), and confirm it round-trips to the original object. REF
