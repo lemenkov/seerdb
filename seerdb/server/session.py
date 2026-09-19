@@ -159,6 +159,7 @@ from seerdb.server.auth import (
     find_fast_auth_osesskey,
     is_token_auth,
     make_challenge,
+    parse_auth_new_password,
     parse_auth_response,
     parse_auth_response_oci,
     parse_changepassword,
@@ -304,6 +305,37 @@ def _handle_token_login(
             _deny_login(stream, 'token signature verification failed')
     stream.write_packet(TNS_DATA, encode_token_result())
     return token_subject(token.decode('utf-8')) or 'TOKEN_USER'
+
+
+def _apply_new_password(
+    backend: Backend, user: str, old_password: str, conn_key: bytes, cipher: bytes
+) -> None:
+    """Apply a password change the client sent along with its login (#826).
+
+    Never raises. The login itself has already succeeded -- the proof was
+    checked against the OLD password -- so a backend that cannot change
+    passwords, or a change the server refuses, must not turn a good login into a
+    failed one. The client learns the truth on its next connect, which is the
+    same place a real server's refusal would show up.
+    """
+    change = getattr(backend, 'change_password', None)
+    if change is None:
+        logger.info('login carried a new password; backend cannot change it')
+        return
+    try:
+        new_password = decrypt_password(conn_key, cipher).decode('utf-8')
+    except Exception as exc:  # noqa: BLE001
+        logger.info('login new password could not be decrypted: %s', exc)
+        return
+    try:
+        # The OLD password is the account secret this login just authenticated
+        # against, which the backend needs to drive the change (an upstream
+        # ALTER USER ... REPLACE checks it).
+        change(user, old_password, new_password)
+    except Exception as exc:  # noqa: BLE001
+        logger.info('login new password refused: %s', exc)
+        return
+    logger.info('password changed at login: %s', user)
 
 
 def handle_login(
@@ -497,9 +529,11 @@ def handle_login(
             )
         else:
             stream.write_packet(TNS_DATA, encode_challenge(challenge))
-        _, client_sesskey, auth_password = parse_auth_response(
-            _expect(stream, TNS_DATA, 'AUTH'), field_version
-        )
+        auth_body = _expect(stream, TNS_DATA, 'AUTH')
+        _, client_sesskey, auth_password = parse_auth_response(auth_body, field_version)
+        # A client may change the password AS IT CONNECTS (`newpassword=`); the
+        # new one rides in this same AUTH rather than in a separate call (#826).
+        new_password_cipher = parse_auth_new_password(auth_body, field_version)
 
     conn_key = derive_conn_key(challenge, client_sesskey)
     # Verify the client's password proof (AUTH_PASSWORD) against the account
@@ -507,6 +541,14 @@ def handle_login(
     # would serve any client that ignores the server proof it can't validate.
     if not verify_password(conn_key, auth_password, secret.encode('utf-8')):
         _deny_login(stream, f'wrong password for user: {user!r}')
+    # The proof checked out, so a new password carried alongside it is a genuine
+    # request from an authenticated user. Applying it here rather than ignoring
+    # it is what makes `connect(newpassword=...)` mean anything: without this the
+    # login succeeded, the password never changed, and the NEXT connect with the
+    # new one was refused ORA-01017 -- a failure one step removed from its cause
+    # (#826). A backend that cannot change passwords simply skips it.
+    if not sqlplus and new_password_cipher:
+        _apply_new_password(backend, user, secret, conn_key, new_password_cipher)
     if sqlplus:
         stream.send_raw(encode_result_oci(conn_key, identity=identity))
     else:

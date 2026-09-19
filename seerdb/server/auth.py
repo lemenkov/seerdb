@@ -478,6 +478,31 @@ def parse_auth_response_oci(payload: bytes) -> tuple[bytes, bytes, bytes]:
     return user, sesskey, password
 
 
+def parse_auth_new_password(
+    payload: bytes, field_version: int = FIELD_VERSION_11_2
+) -> bytes | None:
+    """The ``AUTH_NEWPASSWORD`` a login AUTH carries, or ``None``.
+
+    A client may change the password AS IT CONNECTS (`newpassword=` on connect),
+    which rides in the ordinary login AUTH beside the proof rather than in a
+    separate changepassword call. It is AES-encrypted under the ConnKey, the same
+    as the standalone change (#826).
+
+    Never raises: a malformed value must not fail a login that is otherwise good.
+    """
+    try:
+        _subtype, _user, kvs = _parse_fun_auth(payload, field_version)
+    except Exception:  # noqa: BLE001 - a login must not fail over this
+        return None
+    value = kvs.get(b'AUTH_NEWPASSWORD')
+    if not value:
+        return None
+    try:
+        return unhexlify(value)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def parse_auth_response(
     payload: bytes, field_version: int = FIELD_VERSION_11_2
 ) -> tuple[bytes, bytes, bytes | None]:
