@@ -2701,6 +2701,58 @@ def _encode_out_bind_value(
     return encode_value(value, tns_type)
 
 
+# The session-state reply (§20.6, #973). A server that changed a session
+# attribute reports the new value back in the execute's return-parameters block,
+# and that is where a client reads `connection.current_schema` from -- it never
+# queries for it. Reconstructed from three live 23ai captures taken with schema
+# names of different lengths, which separated the value from its frame.
+#
+# The words below are named for where they sit, not for what they mean: the
+# capture pins their values but not their purpose. They are constant across
+# every capture, including ones that changed a DIFFERENT attribute
+# (nls_date_format, time_zone), which is what makes them frame rather than
+# payload.
+_STATE_AL8O4L_FIELDS = 6  # the leading al8o4l count
+_STATE_LEAD = bytes.fromhex('040000000000010201020000000000')[:0]  # placeholder
+# The frame either side of the entry list, byte for byte from the capture.
+_STATE_PREFIX_TAIL = bytes.fromhex('0000001705010110')
+_STATE_ENTRY_TYPE = 0x16  # the type byte every entry carries
+_STATE_KEY_CURRENT_SCHEMA = 0x02
+# The two entries that always follow the changed value (keys 0xa8 / 0xa9). Their
+# payloads move with the session -- they look like counters -- but nothing reads
+# them back, and a reply that DROPS them is rejected by the client, so they are
+# carried as captured. Everything after them is the ordinary status, which is
+# generated: hardcoding the captured one froze its sequence number and the
+# client waited for a reply that never matched.
+_STATE_TRAILING_ENTRIES = bytes.fromhex('0001a8000104040000008801a900')
+
+
+def encode_session_state_response(
+    schema: str, *, scn: int = 0x01B6FF73, seq: int = 2
+) -> bytes:
+    """The reply that reports a new CURRENT_SCHEMA back to the client (#973).
+
+    `alter session set current_schema = X` does not just succeed: the server
+    answers with the return-parameters block carrying the new value, and the
+    client updates `connection.current_schema` from it. Answering with a bare
+    status leaves the client's attribute stale forever, because it never asks.
+
+    The value rides as a ub4 length followed by a DALC that repeats it -- the
+    same double-length shape the SET_SCHEMA piggyback uses in the other
+    direction (§20.5).
+    """
+    name = schema.strip('"').upper().encode('utf-8')
+    out = bytearray([TTI_RPA])
+    out += encode_sb4(_STATE_AL8O4L_FIELDS)
+    for value in (scn, 0, seq, 2, 0, 0):
+        out += encode_sb4(value)
+    out += _STATE_PREFIX_TAIL
+    out += bytes([1, _STATE_KEY_CURRENT_SCHEMA, _STATE_ENTRY_TYPE])
+    out += encode_sb4(len(name)) + bytes([len(name)]) + name
+    out += _STATE_TRAILING_ENTRIES
+    return bytes(out)
+
+
 def encode_returning_response(
     rowcount: int,
     iterations: list[list[tuple]],

@@ -33,7 +33,11 @@ from seerdb.common.oci import (
     OCI_CMD_ROLLBACK,
     strip_oci_e2e_piggyback,
 )
-from seerdb.common.sqltext import bind_placeholders, is_reusable_dml
+from seerdb.common.sqltext import (
+    altered_current_schema,
+    bind_placeholders,
+    is_reusable_dml,
+)
 from seerdb.common.tns import (
     _CSFRM_DB,
     _DECODE_FIELD_VERSION,
@@ -91,6 +95,7 @@ from seerdb.common.tns import (
     encode_returning_response,
     encode_scroll_open_response,
     encode_scroll_response,
+    encode_session_state_response,
     encode_status,
     encode_status_oci,
     encode_status_with_rowcounts,
@@ -2645,6 +2650,14 @@ def _answer_query(
             if not cursor_id and not _is_plsql_block(sql):
                 cursor_id = cursors.open_dml(sql, request.bind_types)
             response = encode_status(result.rowcount, cursor_id=cursor_id)
+            # `alter session set current_schema = X` does not just succeed: the
+            # server reports the new value back, and that is the ONLY place a
+            # client learns it -- `connection.current_schema` never queries. A
+            # bare status left the attribute stale for the life of the session
+            # (#973).
+            schema = altered_current_schema(sql)
+            if schema is not None:
+                response = encode_session_state_response(schema) + response
     except BackendError as err:
         logger.info('query refused: %s', err.ora_message)
         response = encode_error(err.ora_code, err.ora_message, err.error_offset)

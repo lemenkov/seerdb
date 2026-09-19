@@ -629,6 +629,52 @@ def test_returned_object_round_trips_to_the_client_decoder() -> None:
     assert b'Alice' in value.image
 
 
+def test_session_state_reply_matches_the_captured_server_bytes() -> None:
+    # `alter session set current_schema = X` does not just succeed: the server
+    # reports the new value back, and that reply is the ONLY place a client
+    # learns it -- `connection.current_schema` never queries for it. Answering
+    # with a bare status left the attribute stale for the whole session (#973).
+    #
+    # Ground truth: the reply a live 23ai sent for `... = PYO`, captured whole.
+    # The generated block must reproduce it byte for byte up to the status,
+    # which is generated separately (hardcoding the captured one froze its
+    # sequence number and the client waited for a reply that never matched).
+    from seerdb.common.tns import encode_session_state_response
+
+    captured = bytes.fromhex(
+        '080106'
+        + '0401b6ff73'
+        + '00'
+        + '0102'
+        + '0102'
+        + '00'
+        + '00'
+        + '000000'
+        + '1705010110'
+        + '010216'
+        + '0103'
+        + '03'
+        + '50594f'
+        + '0001a8000104040000008801a900'
+    )
+    assert encode_session_state_response('PYO') == captured
+
+
+def test_session_state_reply_carries_the_name_at_any_length() -> None:
+    # Two length fields precede the name and BOTH scale -- the ub4 and the DALC
+    # repeat it, the same double-length shape the SET_SCHEMA piggyback uses in
+    # the other direction. A one-byte assumption would pass for short names and
+    # corrupt long ones.
+    from seerdb.common.tns import encode_session_state_response
+
+    for name in ('PYO', 'PYTHONTEST', 'PYTHONTESTPROXY'):
+        block = encode_session_state_response(name)
+        encoded = name.encode()
+        assert bytes([len(encoded), len(encoded)]) + encoded in block
+        # and the value is upper-cased, as the server reports it
+        assert encode_session_state_response(name.lower()) == block
+
+
 @pytest.mark.parametrize('version', [8, 17, 24])
 def test_describe_decodes_back_at_a_12c_field_version(version: int) -> None:
     # The describe column gains a one-byte scale and an oaccolid at 12.2, and the
