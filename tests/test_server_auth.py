@@ -336,6 +336,52 @@ def test_parse_changepassword_and_decrypt_roundtrip() -> None:
     assert decrypt_password(conn_key, new_cipher) == b'pyo123_chg9'
 
 
+def test_parse_auth_new_password_finds_the_login_time_change() -> None:
+    # A client may change the password AS IT CONNECTS (`newpassword=`): the new
+    # one rides in the ordinary login AUTH beside the proof, not in a separate
+    # call. The Mirror read the proof and ignored it, so the login succeeded, the
+    # password never changed, and the NEXT connect with the new one was refused
+    # ORA-01017 -- a failure one step removed from its cause (#826).
+    #
+    # The bytes come from the client's own encoder rather than by hand: the
+    # key/value framing is what is under test, and a hand-built body would only
+    # agree with itself.
+    from seerdb.common.crypto import decrypt_password
+    from seerdb.common.tns import encode_dictionary_chgpwd
+    from seerdb.server.auth import parse_auth_new_password
+
+    conn_key = bytes(range(24))
+    msg = encode_dictionary_chgpwd(
+        {
+            'seq': 1,
+            'field_version': 6,
+            'env': {'user': 'PYO'},
+            'auth': {
+                'conn_key': conn_key,
+                'old_password': 'pyo123',
+                'new_password': 'the-new-one',
+            },
+        }
+    )
+    cipher = parse_auth_new_password(msg)
+    assert cipher is not None
+    assert decrypt_password(conn_key, cipher) == b'the-new-one'
+
+
+def test_parse_auth_new_password_is_quiet_when_there_is_none() -> None:
+    # An ordinary login carries no new password, and a malformed body must not
+    # turn a good login into a failed one -- identity-ish metadata never raises.
+    from seerdb.common.tns import encode_dictionary_sess
+    from seerdb.server.auth import parse_auth_new_password
+
+    plain = encode_dictionary_sess(
+        {'seq': 1, 'field_version': 6, 'env': {'user': 'PYO'}}
+    )
+    assert parse_auth_new_password(plain) is None
+    assert parse_auth_new_password(b'') is None
+    assert parse_auth_new_password(b'\x03\x76\x01garbage') is None
+
+
 # --- the 12.1+ PBKDF2 challenge (#829) -----------------------------------------
 
 
