@@ -5138,6 +5138,55 @@ unchanged. python-oracledb-compatible. Sync + async; verified on
 10g/11g/21c/23ai (array INSERT, array UPDATE with a different row count per
 iteration, single-row batch, and multiple return binds).
 
+### 20.6 A session-state change is REPORTED BACK (#973)
+
+`ALTER SESSION SET CURRENT_SCHEMA = X` does not merely succeed. The server
+answers with the execute's return-parameters block (`TTI_RPA`, §11.8) carrying
+the new value, and that reply is the **only** place a client learns it —
+`connection.current_schema` is never queried for. A bare status leaves the
+client's attribute stale for the life of the session.
+
+Reconstructed from live 23ai captures taken with schema names of three different
+lengths, which separated the value from its frame:
+
+```
+08                      TTI_RPA
+01 06                   ub4 al8o4l count = 6
+04 01 b6 ff 73 | 00 | 01 02 | 01 02 | 00 | 00      the six al8o4l fields
+00 00 00                three zero words
+17 05 01 01 10          frame (constant across every capture)
+01 02 16                flag | KEY | type
+01 03 | 03 50 59 4f     ub4 length, then a DALC repeating it: "PYO"
+00 01 a8 ... 01 a9 00   two trailing entries
+<status>                the ordinary OER
+```
+
+Both length fields scale — a long name sends the ub4 and the DALC alike — which
+is the same double-length shape the SET_SCHEMA piggyback uses in the other
+direction (§20.5).
+
+**The KEY says which attribute changed.** Measured by altering one thing at a
+time:
+
+| key | attribute | value |
+|---|---|---|
+| `0x02` | `CURRENT_SCHEMA` | the name |
+| `0x01` | `EDITION` | the name |
+| `0x12` / `0x10` | `NLS_LANGUAGE` / `NLS_TERRITORY` | `AMERICAN` / `AMERICA` |
+
+A statement that changes nothing (`select 1 from dual`) carries no such block at
+all.
+
+**What is frame and what is payload.** The words before the entry are identical
+across captures that changed *different* attributes, which is what marks them as
+frame rather than data; their meaning is not established. The two trailing
+entries (`0xa8` / `0xa9`, and `0xac` for an edition change) carry values that
+move with the session and look like counters — nothing reads them back, but a
+reply that **drops** them is rejected by the client, so they are sent as
+captured. The status after them must be **generated**: reusing the captured one
+freezes its sequence number, and the client then waits for a reply that never
+matches — a hang, not an error.
+
 ### 22.1c An OBJECT return bind carries the **object frame** (#826)
 
 `RETURNING ObjectCol INTO :b` frames the returned value exactly as an ADT column

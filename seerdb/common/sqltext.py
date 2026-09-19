@@ -201,6 +201,22 @@ def wrap_returning_in_block(SQL: str) -> tuple[str, str]:
     return f'BEGIN {Statement}; :{Name} := SQL%ROWCOUNT; END;', Name
 
 
+_ALTER_SCHEMA_RE = re.compile(
+    r'\s*ALTER\s+SESSION\s+SET\s+CURRENT_SCHEMA\s*=\s*("?)([^\s";]+)\1', re.I
+)
+
+
+def altered_current_schema(SQL: str) -> str | None:
+    """The schema an ``ALTER SESSION SET CURRENT_SCHEMA = X`` selects, else None.
+
+    A server reports the new value back to the client, which is the only way
+    ``connection.current_schema`` ever learns it (#973), so a Mirror has to
+    recognise the statement rather than treat it as an ordinary DDL.
+    """
+    match = _ALTER_SCHEMA_RE.match(SQL)
+    return match.group(2) if match else None
+
+
 def is_plsql(SQL: str) -> bool:
     # PL/SQL blocks start with BEGIN or DECLARE after stripping leading
     # whitespace and SQL comments. Anonymous blocks, packaged calls
