@@ -4665,7 +4665,9 @@ def encode_dictionary_auth(Dictionary: dict) -> tuple[bytes, bytes]:
         Mode = encode_sb4((Role * 32) | (Prelim * 128) | 1 | 256 | 0x20000)
         UserField = bytes([len(User)]) + User
         SessionKvs = _auth_session_kvs(Dictionary)
-        NumPairs = 2 + SpeedyKeyInd + 5 + ProxyInd + DrcpInd
+        NumPairs = (
+            2 + SpeedyKeyInd + _auth_session_kv_count(Dictionary) + ProxyInd + DrcpInd
+        )
     else:
         # 12c+ length-prefixes the username (write_bytes_with_length); 11g sends
         # it raw (read via the UserLen field). Sending the raw form to 21c makes
@@ -4733,8 +4735,8 @@ def encode_dictionary_token_auth(Dictionary: dict) -> bytes:
     if Header is not None and Signature is not None:
         Pairs.append(encode_kv(b'AUTH_HEADER', Header.encode('utf-8')))
         Pairs.append(encode_kv(b'AUTH_SIGNATURE', Signature.encode('utf-8')))
-    SessionKvs = _auth_session_kvs(Dictionary)  # 5 pairs (charset..connect-string)
-    NumPairs = len(Pairs) + 5
+    SessionKvs = _auth_session_kvs(Dictionary)  # charset .. connect-string
+    NumPairs = len(Pairs) + _auth_session_kv_count(Dictionary)
 
     # No user: the has-user pointer byte is 0 and the user length is 0.
     HeaderBytes = bytes([TTI_FUN, TTI_AUTH, Tseq, 0]) + encode_sb4(0)
@@ -4770,6 +4772,42 @@ def _local_tz_clause() -> bytes:
     return f"ALTER SESSION SET TIME_ZONE='{Sign}{Hh:02d}:{Mm:02d}'\x00".encode('utf-8')
 
 
+def _auth_session_kv_count(Dictionary: dict) -> int:
+    """How many pairs :func:`_auth_session_kvs` will emit.
+
+    The AUTH header DECLARES the pair count, so it has to be derived rather than
+    written as a constant: adding the optional edition pair without counting it
+    is answered ORA-03146 "invalid buffer length for TTC field", which names the
+    buffer and not the count (#826).
+    """
+    return 5 + (1 if (Dictionary.get('env') or {}).get('edition') else 0)
+
+
+def _edition_kv(Dictionary: dict) -> bytes:
+    """``AUTH_ORA_EDITION`` when the caller asked for an edition, else nothing.
+
+    `connect(edition=...)` selects an edition for the whole session, and it is a
+    LOGIN-time choice -- it rides here rather than in a later ALTER SESSION
+    (#826). Confirmed on the wire: the key appears in the AUTH only when the
+    connect asked for one.
+    """
+    edition = (Dictionary.get('env') or {}).get('edition')
+    if not edition:
+        return b''
+    return encode_kv(b'AUTH_ORA_EDITION', str(edition).encode('utf-8'))
+
+
+def _client_driver_name(Dictionary: dict) -> str:
+    """The banner this session reports as ``client_driver``.
+
+    A caller may set it (``connect(driver_name=...)``, as python-oracledb allows)
+    so an application can identify itself in ``v$session_connect_info``; left
+    unset it is seerdb's own banner (#826).
+    """
+    declared = (Dictionary.get('env') or {}).get('driver_name')
+    return declared if declared else f'seerdb thn : {_CLIENT_VERSION}'
+
+
 def _auth_session_kvs(Dictionary: dict) -> bytes:
     """The session-context key/value pairs the OAUTH phase two must carry at
     fv >= 18 (#89): client charset, driver banner, packed version, the time-zone
@@ -4782,12 +4820,13 @@ def _auth_session_kvs(Dictionary: dict) -> bytes:
         )
         + encode_kv(
             b'SESSION_CLIENT_DRIVER_NAME',
-            f'seerdb thn : {_CLIENT_VERSION}'.encode('utf-8'),
+            _client_driver_name(Dictionary).encode('utf-8'),
         )
         + encode_kv(
             b'SESSION_CLIENT_VERSION',
             str(_packed_client_version(_CLIENT_VERSION)).encode('utf-8'),
         )
+        + _edition_kv(Dictionary)
         + encode_kv(b'AUTH_ALTER_SESSION', _local_tz_clause(), 1)
         + encode_kv(b'AUTH_CONNECT_STRING', encode_dictionary_description(Dictionary))
     )

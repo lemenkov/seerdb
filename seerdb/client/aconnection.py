@@ -174,6 +174,8 @@ class AsyncOracleConnect(_ConnectionLogic):
         terminal: str | None = None,
         osuser: str | None = None,
         fetch_lobs: bool = True,
+        driver_name: str | None = None,
+        edition: str | None = None,
         field_version: int = FIELD_VERSION_23_4,
         cclass: str | None = None,
         purity: int = PURITY_DEFAULT,
@@ -229,6 +231,13 @@ class AsyncOracleConnect(_ConnectionLogic):
         # object is what makes size() / read(offset, amount) / write() / trim()
         # reachable at all; set False for the value-only behaviour (#964).
         self.fetch_lobs = fetch_lobs
+        # What this session reports as its client_driver. python-oracledb lets an
+        # application set it so it can identify itself in
+        # v$session_connect_info; unset, seerdb reports its own banner (#826).
+        self.driver_name = driver_name
+        # The edition this session runs in. A LOGIN-time choice: it rides in the
+        # AUTH, not in a later ALTER SESSION (#826).
+        self.edition = edition
         # Token auth (#125), resolved at connect time.
         self.access_token = access_token
         self._token_auth = False

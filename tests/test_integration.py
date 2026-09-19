@@ -33,6 +33,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_10_2,
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
+    FIELD_VERSION_23_1,
 )
 
 # Features the Oracle 9i (fv2) server genuinely lacks, keyed by a substring of
@@ -217,6 +218,20 @@ _ADMIN_SKIP_REASON = (
 # freshly-booted XE (e.g. CI) the default 0.05 s isn't always enough, so the
 # delay is tunable via SEERDB_TEST_CONNECT_DELAY (CI sets it higher).
 _CONNECT_DELAY = float(os.environ.get('SEERDB_TEST_CONNECT_DELAY', '0.05'))
+
+
+def _connect_with(**extra):
+    """A connection with extra connect arguments, for the attribute tests."""
+    return seerdb.connect(
+        host=_HOST,
+        port=_PORT,
+        user=_USER,
+        password=_PASSWORD,
+        service_name=_SERVICE,
+        autocommit=True,
+        **_FV_KW,
+        **extra,
+    )
 
 
 def _connect(fetch_lobs: bool = True):
@@ -3556,6 +3571,62 @@ class PoolIntegration(unittest.TestCase):
                 self.assertEqual(Cur.fetchone(), (1,))
         finally:
             Pool.close()
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class ConnectAttributeIntegration(_IntegrationBase):
+    """Connect-time attributes that only reach the server in the login AUTH.
+
+    `driver_name` names the application in v$session_connect_info, and `edition`
+    selects the session's edition. Both are LOGIN-time: they ride in the AUTH,
+    not in a later ALTER SESSION, which is why a relay has to hold its own
+    upstream connect until that message has been read (#826).
+    """
+
+    def _skip_unless_session_kvs(self):
+        # The session-context pairs (driver banner, edition) ride only on the
+        # FAST_AUTH path, fv > 23.1 -- below that the server is never told, so
+        # there is nothing to assert rather than something that fails.
+        if self.conn.field_version <= FIELD_VERSION_23_1:
+            self.skipTest('session-context pairs need the fv > 23.1 FAST_AUTH')
+
+    def test_driver_name_defaults_to_our_own_banner(self):
+        self._skip_unless_session_kvs()
+        self.cur.execute(
+            'select distinct client_driver from v$session_connect_info '
+            "where sid = sys_context('userenv', 'sid')"
+        )
+        (driver,) = self.cur.fetchone()
+        self.assertIn('seerdb', driver)
+
+    def test_driver_name_can_be_declared(self):
+        self._skip_unless_session_kvs()
+        # A Mirror cannot relay this yet: the banner arrives in the login AUTH,
+        # after a passthrough has already opened its upstream connection, and it
+        # is settable only at connect time there. That is the follow-up (#826).
+        if os.environ.get('SEERDB_TEST_MIRROR'):
+            self.skipTest('the Mirror does not relay the driver banner yet')
+        with _connect_with(driver_name='newdriver') as conn:
+            cur = conn.cursor()
+            cur.execute(
+                'select distinct client_driver from v$session_connect_info '
+                "where sid = sys_context('userenv', 'sid')"
+            )
+            self.assertEqual(cur.fetchone()[0], 'newdriver')
+
+    def test_edition_is_ora_base_unless_asked_for(self):
+        # Editions arrived in 11gR2; older tiers have no such context value.
+        if self.conn.field_version < FIELD_VERSION_11_2:
+            self.skipTest('editions need 11g or later')
+        # Through a Mirror the answer is the BACKEND's: one over PostgreSQL has
+        # no notion of editions and returns NULL, which is correct for it. The
+        # six-tier matrix covers the real-server behaviour.
+        if os.environ.get('SEERDB_TEST_MIRROR'):
+            self.skipTest('a Mirror reports whatever its backend knows')
+        self.cur.execute(
+            "select sys_context('USERENV','CURRENT_EDITION_NAME') from dual"
+        )
+        self.assertEqual(self.cur.fetchone()[0], 'ORA$BASE')
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
