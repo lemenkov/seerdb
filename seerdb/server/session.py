@@ -35,6 +35,7 @@ from seerdb.common.oci import (
 )
 from seerdb.common.sqltext import (
     altered_current_schema,
+    altered_edition,
     bind_placeholders,
     is_reusable_dml,
 )
@@ -47,6 +48,7 @@ from seerdb.common.tns import (
     _ENCODE_TXN_IN_PROGRESS,
     _LOB_EMIT_LOG,
     _SERVER_RUNTIME_CAPS,
+    _STATE_KEY_EDITION,
     _THIN_OBJ_LOB_LOCATOR,
     AUTH_SERIAL_NUM,
     ArrayOutBind,
@@ -2656,8 +2658,14 @@ def _answer_query(
             # bare status left the attribute stale for the life of the session
             # (#973).
             schema = altered_current_schema(sql)
+            edition = altered_edition(sql)
             if schema is not None:
                 response = encode_session_state_response(schema) + response
+            elif edition is not None:
+                response = (
+                    encode_session_state_response(edition, key=_STATE_KEY_EDITION)
+                    + response
+                )
     except BackendError as err:
         logger.info('query refused: %s', err.ora_message)
         response = encode_error(err.ora_code, err.ora_message, err.error_offset)

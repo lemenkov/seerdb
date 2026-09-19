@@ -660,6 +660,41 @@ def test_session_state_reply_matches_the_captured_server_bytes() -> None:
     assert encode_session_state_response('PYO') == captured
 
 
+def test_session_state_reply_reports_an_edition_under_its_own_key() -> None:
+    # EDITION is the same mechanism as CURRENT_SCHEMA under a different key
+    # (0x01 vs 0x02) and with a different trailing entry (0xac vs 0xa8/0xa9) --
+    # both captured by altering that one attribute on a live 23ai. Ground truth
+    # is the server's own reply for `alter session set edition = PYTHONEDITION`,
+    # minus the two per-session counters it carries (the SCN-ish word and the
+    # sequence), which are session bookkeeping rather than payload (#973).
+    from seerdb.common.tns import _STATE_KEY_EDITION, encode_session_state_response
+
+    captured = bytes.fromhex(
+        '080106'
+        + '0401b70ce4'
+        + '00'
+        + '0101'
+        + '0102'
+        + '00'
+        + '00'
+        + '000000'
+        + '1705010110'
+        + '010116'
+        + '010d'
+        + '0d'
+        + '505954484f4e45444954494f4e'
+        + '0001ac00'
+    )
+    # The two per-session counters are parameters, so the capture's own values
+    # can be supplied and the whole block demanded byte for byte.
+    assert (
+        encode_session_state_response(
+            'PYTHONEDITION', key=_STATE_KEY_EDITION, scn=0x01B70CE4, seq=1
+        )
+        == captured
+    )
+
+
 def test_session_state_reply_carries_the_name_at_any_length() -> None:
     # Two length fields precede the name and BOTH scale -- the ub4 and the DALC
     # repeat it, the same double-length shape the SET_SCHEMA piggyback uses in

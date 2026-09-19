@@ -5168,11 +5168,14 @@ direction (§20.5).
 **The KEY says which attribute changed.** Measured by altering one thing at a
 time:
 
-| key | attribute | value |
-|---|---|---|
-| `0x02` | `CURRENT_SCHEMA` | the name |
-| `0x01` | `EDITION` | the name |
-| `0x12` / `0x10` | `NLS_LANGUAGE` / `NLS_TERRITORY` | `AMERICAN` / `AMERICA` |
+| key | attribute | value | trailing entries |
+|---|---|---|---|
+| `0x02` | `CURRENT_SCHEMA` | the name | `0xa8`, `0xa9` |
+| `0x01` | `EDITION` | the name | `0xac` |
+| `0x12` / `0x10` | `NLS_LANGUAGE` / `NLS_TERRITORY` | `AMERICAN` / `AMERICA` | — |
+
+The trailing entries differ per attribute, so they are part of what the key
+selects rather than a fixed tail.
 
 A statement that changes nothing (`select 1 from dual`) carries no such block at
 all.

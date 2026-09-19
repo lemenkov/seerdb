@@ -2718,6 +2718,7 @@ _STATE_LEAD = bytes.fromhex('040000000000010201020000000000')[:0]  # placeholder
 _STATE_PREFIX_TAIL = bytes.fromhex('0000001705010110')
 _STATE_ENTRY_TYPE = 0x16  # the type byte every entry carries
 _STATE_KEY_CURRENT_SCHEMA = 0x02
+_STATE_KEY_EDITION = 0x01
 # The two entries that always follow the changed value (keys 0xa8 / 0xa9). Their
 # payloads move with the session -- they look like counters -- but nothing reads
 # them back, and a reply that DROPS them is rejected by the client, so they are
@@ -2725,10 +2726,17 @@ _STATE_KEY_CURRENT_SCHEMA = 0x02
 # generated: hardcoding the captured one froze its sequence number and the
 # client waited for a reply that never matched.
 _STATE_TRAILING_ENTRIES = bytes.fromhex('0001a8000104040000008801a900')
+# An EDITION change carries a different trailing entry (key 0xac) -- captured the
+# same way, by altering that one attribute on a live 23ai.
+_STATE_TRAILING_ENTRIES_EDITION = bytes.fromhex('0001ac00')
 
 
 def encode_session_state_response(
-    schema: str, *, scn: int = 0x01B6FF73, seq: int = 2
+    schema: str,
+    *,
+    key: int = _STATE_KEY_CURRENT_SCHEMA,
+    scn: int = 0x01B6FF73,
+    seq: int = 2,
 ) -> bytes:
     """The reply that reports a new CURRENT_SCHEMA back to the client (#973).
 
@@ -2747,9 +2755,13 @@ def encode_session_state_response(
     for value in (scn, 0, seq, 2, 0, 0):
         out += encode_sb4(value)
     out += _STATE_PREFIX_TAIL
-    out += bytes([1, _STATE_KEY_CURRENT_SCHEMA, _STATE_ENTRY_TYPE])
+    out += bytes([1, key, _STATE_ENTRY_TYPE])
     out += encode_sb4(len(name)) + bytes([len(name)]) + name
-    out += _STATE_TRAILING_ENTRIES
+    out += (
+        _STATE_TRAILING_ENTRIES_EDITION
+        if key == _STATE_KEY_EDITION
+        else _STATE_TRAILING_ENTRIES
+    )
     return bytes(out)
 
 
