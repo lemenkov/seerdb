@@ -162,7 +162,11 @@ class Cursor(_CursorLogic):
                 # non-NULL, zero-length LOB (#903).
                 if Payload:
                     Conn.write_temp_lob(Locator, Payload, is_blob=IsBlob)
-                Out.append(TempLob(Locator, IsBlob))
+                # Carry the Var on the marker: the bind list is what the IOV
+                # decoder types the response against, and what the OUT value is
+                # assigned back through, so replacing the Var outright left an
+                # IN OUT LOB bind with neither (#978).
+                Out.append(TempLob(Locator, IsBlob, V))
             else:
                 Out.append(V)
         return Out
@@ -251,6 +255,7 @@ class Cursor(_CursorLogic):
                 Marker['cursor_id'], Marker['row_format']
             )
             Variable._value = _build_refcursor_cursor(self._connection, Rows, Marker)
+        _resolve_out_bind_lobs(self._connection, Bind)
 
         # DML RETURNING ... INTO: write the returned value list onto each Var.
         _assign_return_binds(Bind, Result)
@@ -659,14 +664,17 @@ def _assign_out_binds(Bind, Result) -> list:
     Rows = Result[4]
     if not Rows or not isinstance(Rows[0], dict) or 'out_positions' not in Rows[0]:
         return []
+    from seerdb.common.lob import LOB
     from seerdb.common.types import decode_value
 
     Record = Rows[0]
     RefCursors = []
     for Pos, Value in zip(Record['out_positions'], Record['out_values']):
-        if Pos >= len(Bind) or not isinstance(Bind[Pos], Var):
+        if Pos >= len(Bind):
             continue
-        Variable = Bind[Pos]
+        Variable = _bind_var(Bind[Pos])
+        if Variable is None:
+            continue
         Column = {'data_type': Variable.dbtype.tns_type, 'charset': UTF8_CHARSET}
         if isinstance(Value, dict) and Value.get('_refcursor'):
             RefCursors.append((Variable, Value))
@@ -676,6 +684,12 @@ def _assign_out_binds(Bind, Result) -> list:
             Variable._value = [
                 decode_value(Column, V if V else None) for V in Value['values']
             ]
+        elif isinstance(Value, LOB):
+            # A LOB-class OUT value arrives already built by the IOV reader
+            # (#978); the connection is attached, and `fetch_lobs` honoured, by
+            # the caller's _resolve_out_bind_lobs -- which the async cursor does
+            # with an awaited read.
+            Variable._value = Value
         elif Variable.dbtype.tns_type == TNS_TYPE_ADT:
             # Object / collection OUT (#888): the IOV decoder handed back an
             # ObjectImage (or None); build a DbObject of the Var's type from it,
@@ -830,6 +844,46 @@ def _resolve_nested_cursors(Connection, Row: list) -> list:
             Rows = Connection.fetch_all_rows(Val['cursor_id'], Val['row_format'])
             Out[I] = _build_refcursor_cursor(Connection, Rows or [], Val)
     return Out
+
+
+def _bind_var(B) -> 'Var | None':
+    # The Var behind a bind-list entry, whether it is still the Var itself or
+    # the temp-LOB marker it was promoted to on the way out (#902/#978), or None
+    # when the entry is a plain value with nothing to write an OUT value back to.
+    if isinstance(B, Var):
+        return B
+    if isinstance(B, TempLob) and isinstance(B.var, Var):
+        return B.var
+    return None
+
+
+def _out_bind_lobs(Bind) -> list:
+    """Every OUT / IN OUT bind that came back holding a LOB (#978).
+
+    The LOB still has no connection on it and has not been materialised, which
+    the sync and async cursors finish differently -- so, like the REF CURSOR
+    markers :func:`_assign_out_binds` returns, they are collected here and left
+    to the caller."""
+    from seerdb.common.lob import LOB
+
+    if not isinstance(Bind, list):
+        return []
+    Vars = (_bind_var(B) for B in Bind)
+    return [V for V in Vars if V is not None and isinstance(V._value, LOB)]
+
+
+def _resolve_out_bind_lobs(Connection, Bind) -> None:
+    # The sync half of _out_bind_lobs: attach the connection and, unless the
+    # connection asks for LOB objects, materialise -- the same rule
+    # _resolve_lobs applies to a fetched LOB cell.
+    from seerdb.common.lob import _DECODED_IMAGE_TYPES
+
+    KeepLobs = getattr(Connection, 'fetch_lobs', False)
+    for Variable in _out_bind_lobs(Bind):
+        Variable._value._connection = Connection
+        if KeepLobs and Variable._value.data_type not in _DECODED_IMAGE_TYPES:
+            continue
+        Variable._value = Variable._value.read()
 
 
 def _resolve_lobs(Connection, Row: list) -> list:

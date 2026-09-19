@@ -1066,6 +1066,78 @@ class TestIov(unittest.TestCase):
         self.assertEqual(out_values, [b'\xc1\x0b', b'hi!'])
         self.assertEqual(rest, b'\x08')
 
+    # One IN OUT CLOB bind, captured from a live 23ai answering
+    #
+    #   declare t_Clob clob;
+    #   begin
+    #       t_Clob := :data;
+    #       dbms_lob.copy(:data, t_Clob, 50000);
+    #       dbms_lob.writeappend(:data, 5, 'BBBBB');
+    #   end;
+    #
+    # The value is NOT a DALC: it is the LOB column framing (#978) --
+    #   01 28        ub4 block length = 40
+    #   02 c3 55     ub8 size         = 50005   (50000 + the 5 appended)
+    #   02 1f c4     ub4 chunk size   = 8132
+    #   28 <40B>     DALC locator
+    #   00           per-value return code
+    _LOB_LOCATOR = bytes.fromhex(
+        '00260001820880030002 2a6500000 0d500000002 036900 0a0000000100'
+        '001aab82f10000000100 00'.replace(' ', '')
+    )
+    _INOUT_LOB_IOV = (
+        bytes.fromhex('0b05010100010100000030')
+        + bytes.fromhex('07')
+        + bytes.fromhex('0128')
+        + bytes.fromhex('02c355')
+        + bytes.fromhex('021fc4')
+        + bytes([len(_LOB_LOCATOR)])
+        + _LOB_LOCATOR
+        + bytes.fromhex('00')
+        + b'\x08'
+    )
+
+    def test_inout_lob_var(self):
+        # A LOB-class Var bind: the value reads as a LOB carrying the updated
+        # locator, and the stream is left on the token that follows. Read as a
+        # DALC it took the 0x28 for the whole value and left the rest of the
+        # block behind, whose first byte then decoded as "response token 2".
+        from seerdb.common.datatypes import DB_TYPE_CLOB
+        from seerdb.common.lob import LOB
+
+        directions, out_values, rest = _read_iov(
+            self._INOUT_LOB_IOV, [Var(DB_TYPE_CLOB)]
+        )
+        self.assertEqual(directions, [48])
+        self.assertEqual(rest, b'\x08')
+        self.assertEqual(len(out_values), 1)
+        self.assertIsInstance(out_values[0], LOB)
+        self.assertEqual(out_values[0].raw, self._LOB_LOCATOR)
+
+    def test_inout_lob_temp_marker(self):
+        # The same bind after the > 32767-byte promotion (#902) replaced the Var
+        # with a temp-LOB marker: the marker types the response just as the Var
+        # did, so the promoted bind is not read as a DALC either (#978).
+        from seerdb.common.datatypes import TempLob
+        from seerdb.common.lob import LOB
+
+        _, out_values, rest = _read_iov(
+            self._INOUT_LOB_IOV, [TempLob(b'\x00' * 40, False)]
+        )
+        self.assertEqual(rest, b'\x08')
+        self.assertIsInstance(out_values[0], LOB)
+        self.assertEqual(out_values[0].raw, self._LOB_LOCATOR)
+
+    def test_out_lob_null(self):
+        # A LOB OUT bind the block left NULL: a single 0x00 block, then the
+        # return code. Nothing to build a LOB from.
+        from seerdb.common.datatypes import DB_TYPE_BLOB
+
+        wire = bytes.fromhex('0b0501010001010000001007') + b'\x00\x00' + b'\x08'
+        _, out_values, rest = _read_iov(wire, [Var(DB_TYPE_BLOB)])
+        self.assertEqual(out_values, [None])
+        self.assertEqual(rest, b'\x08')
+
 
 class TestBindDispatch(unittest.TestCase):
     # The RXD value bytes carry a 1-byte length prefix; the OAC descriptor
