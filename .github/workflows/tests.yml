@@ -199,6 +199,11 @@ jobs:
           SEERDB_TEST_HOST: 127.0.0.1
           SEERDB_TEST_PORT: "1521"
           SEERDB_TEST_SERVICE: XE
+          # This job starts the Mirror itself rather than going through
+          # tools/run_mirror_suite.py, so it has to declare what it is talking
+          # to: a test for something the Mirror does not serve yet skips on
+          # this, instead of failing as though the client were at fault (#964).
+          SEERDB_TEST_MIRROR: "1"
         run: |
           python -m pytest -q tests/test_postgres_backend.py
           # Run the Mirror from the checkout (the launcher lives in examples/, so
