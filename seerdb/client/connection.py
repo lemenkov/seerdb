@@ -658,6 +658,7 @@ class OracleConnect(_ConnectionLogic):
         machine: str | None = None,
         terminal: str | None = None,
         osuser: str | None = None,
+        fetch_lobs: bool = True,
         field_version: int = FIELD_VERSION_23_4,
         cclass: str | None = None,
         purity: int = PURITY_DEFAULT,
@@ -715,6 +716,11 @@ class OracleConnect(_ConnectionLogic):
         self.machine = machine
         self.terminal = terminal
         self.osuser = osuser
+        # Whether a fetched CLOB / BLOB comes back as a LOB object (the default,
+        # matching python-oracledb) or is materialised into str / bytes. The LOB
+        # object is what makes size() / read(offset, amount) / write() / trim()
+        # reachable at all; set False for the value-only behaviour (#964).
+        self.fetch_lobs = fetch_lobs
         # Token-based auth (#125): a JWT str (OAuth2) or (token, private_key)
         # (OCI IAM), resolved at connect time into the token + optional PEM key.
         self.access_token = access_token
@@ -1862,7 +1868,12 @@ class OracleConnect(_ConnectionLogic):
         return AllRows
 
     def lob_read(
-        self, Locator: bytes, DataType: int, prefixed: bool = False
+        self,
+        Locator: bytes,
+        DataType: int,
+        prefixed: bool = False,
+        offset: int = 1,
+        amount: int | None = None,
     ) -> str | bytes:
         # Send TTI_LOBOPS READ for the given locator and decode the response.
         # The response carries:
@@ -1876,9 +1887,15 @@ class OracleConnect(_ConnectionLogic):
         # is raw bytes. We decode CLOB to `str` and surface BLOB as `bytes`.
         from seerdb.common.tns_consts import TNS_TYPE_CLOB
 
+        Extra: dict = {'source_offset': offset}
+        if amount is not None:
+            Extra['amount'] = amount
         Data = encode_dictionary(
             self._make_dict(
-                DictionaryType.lobops, locator=Locator, locator_prefixed=prefixed
+                DictionaryType.lobops,
+                locator=Locator,
+                locator_prefixed=prefixed,
+                **Extra,
             )
         )
         self.send(TNS_DATA, Data)
@@ -2058,6 +2075,37 @@ class OracleConnect(_ConnectionLogic):
         LocLen = (Packet[1] << 8) | Packet[2]
         return Packet[3 : 3 + LocLen]
 
+    def lob_write(
+        self,
+        Locator: bytes,
+        Data: str | bytes,
+        is_blob: bool = False,
+        offset: int = 1,
+    ) -> bytes | None:
+        """Write into a persistent LOB at ``offset`` (1-based), the write half
+        of the LOB object (#964). Returns the UPDATED locator.
+
+        Oracle needs the LOB's ROW locked first, so a value fetched without
+        ``SELECT ... FOR UPDATE`` in an open transaction answers ORA-22920."""
+        from seerdb.common.tns import decode_lobops_locator
+        from seerdb.common.tns_consts import TNS_LOB_OP_WRITE
+
+        Payload = Data if is_blob else cast(str, Data).encode('utf-16-be')
+        Dict = self._make_dict(
+            DictionaryType.lobops,
+            locator=Locator,
+            data=Payload,
+            operation=TNS_LOB_OP_WRITE,
+            source_offset=offset,
+            locator_prefixed=False,
+        )
+        self.send(TNS_DATA, encode_dictionary(Dict))
+        Received = self._next_data_packet(b'', b'')
+        if Received is False:
+            raise Exception('Connection closed during LOBOPS')
+        self._raise_lobops_error(Received[1])
+        return decode_lobops_locator(Received[1])
+
     def write_temp_lob(
         self, Locator: bytes, Data: str | bytes, is_blob: bool = False
     ) -> None:
@@ -2087,6 +2135,37 @@ class OracleConnect(_ConnectionLogic):
         if Received is False:
             raise Exception('Connection closed during LOBOPS')
         self._raise_lobops_error(Received[1])
+
+    def lob_operation(
+        self, Locator: bytes, Operation: int, Amount: int = 0
+    ) -> tuple[int | None, bytes | None]:
+        """Run one value-returning TTI_LOBOPS operation and return its ``ub4``.
+
+        GET_LENGTH / GET_CHUNK_SIZE answer a size, TRIM the new length, and
+        OPEN / CLOSE carry the field without a meaningful value (§14.6). The
+        server raises for the operation itself -- ORA-22293 on a second open,
+        ORA-22289 on a second close, ORA-22920 when the row was never locked --
+        so those reach the caller as ordinary errors (#964).
+        """
+        from seerdb.common.tns import decode_lobops_locator, decode_lobops_value
+
+        Data = encode_dictionary(
+            self._make_dict(
+                DictionaryType.lobops,
+                locator=Locator,
+                operation=Operation,
+                amount=Amount,
+            )
+        )
+        self.send(TNS_DATA, Data)
+        Received = self._next_data_packet(b'', b'')
+        if Received is False:
+            raise Exception('Connection closed during LOBOPS')
+        self._raise_lobops_error(Received[1])
+        return (
+            decode_lobops_value(Received[1]),
+            decode_lobops_locator(Received[1]),
+        )
 
     def bfile_read_native(self, Locator: bytes) -> bytes:
         # Read a BFILE natively over TTI_LOBOPS (#46): FILE_OPEN -> READ ->

@@ -61,6 +61,16 @@ def _start_mirror(
     return listen, server, result
 
 
+def _values(row) -> tuple:
+    """A row with its LOB cells read to their values.
+
+    These tests are about the CONTENT surviving the wire, not about the LOB
+    object model, so they keep the default `fetch_lobs` (a LOB object, #964)
+    and read through it -- while the connection is still open, since that is
+    what a LOB needs to read."""
+    return tuple(v.read() if hasattr(v, 'read') else v for v in row)
+
+
 def _connect(port: int):
     return seerdb.connect(
         host='127.0.0.1',
@@ -132,7 +142,7 @@ def test_real_sql_round_trip() -> None:
         cur.execute("insert into t values (1, 'alice', 9.5)")
         cur.execute("insert into t values (2, 'bob', -3)")
         cur.execute('select id, name, score from t order by id')
-        rows = cur.fetchall()
+        rows = [_values(r) for r in cur.fetchall()]
         # A second statement after a fetch exercises the CLOSE_CURSORS piggyback
         # the client prepends — the Mirror must skip it and still answer.
         cur.execute('select name from t where id = 2')
@@ -165,7 +175,7 @@ def test_typed_null_bind_is_a_null() -> None:
             'select id from t where case when :foo is not null then :foo else d end = d',
             {'foo': None},
         )
-        rows = cur.fetchall()
+        rows = [_values(r) for r in cur.fetchall()]
     finally:
         try:
             conn.close()
@@ -218,7 +228,7 @@ def test_encrypted_round_trip() -> None:
         cur.execute("insert into t values (1, 'alice')")
         cur.execute("insert into t values (2, 'bob')")
         cur.execute('select id, name from t order by id')
-        rows = cur.fetchall()
+        rows = [_values(r) for r in cur.fetchall()]
     finally:
         try:
             conn.close()
@@ -275,7 +285,7 @@ def test_bad_sql_is_an_ora_error_not_a_desync() -> None:
         cur.execute('create table t (n number)')
         cur.execute('insert into t values (42)')
         cur.execute('select n from t')
-        rows = cur.fetchall()
+        rows = [_values(r) for r in cur.fetchall()]
     finally:
         try:
             conn.close()
@@ -393,7 +403,7 @@ def test_large_response_spans_many_packets() -> None:
         for i in range(50):
             cur.execute('insert into t values (:1, :2)', [i, chr(65 + i % 26) * 3500])
         cur.execute('select id, v from t order by id')
-        rows = cur.fetchall()
+        rows = [_values(r) for r in cur.fetchall()]
     finally:
         try:
             conn.close()
@@ -450,7 +460,7 @@ def test_thin_lob_read_round_trip() -> None:
         cur.execute('insert into t values (:1, :2, :3)', [2, big_clob, big_blob])
         cur.execute('insert into t values (:1, :2, :3)', [3, None, None])
         cur.execute('select id, c, b from t order by id')
-        rows = cur.fetchall()
+        rows = [_values(r) for r in cur.fetchall()]
     finally:
         try:
             conn.close()
@@ -502,7 +512,7 @@ def test_temp_lob_write_round_trip() -> None:
         )
 
         cur.execute('select id, c, b from t order by id')
-        rows = cur.fetchall()
+        rows = [_values(r) for r in cur.fetchall()]
     finally:
         try:
             conn.close()
@@ -530,7 +540,7 @@ def test_executemany_array_dml() -> None:
         )
         rowcount = cur.rowcount
         cur.execute('select id, name from t order by id')
-        rows = cur.fetchall()
+        rows = [_values(r) for r in cur.fetchall()]
     finally:
         try:
             conn.close()
@@ -585,7 +595,7 @@ def test_fractional_number_bind() -> None:
         cur.execute('insert into t values (:1, :2)', [1, Decimal('3.14159')])
         cur.execute('insert into t values (:1, :2)', [2, 2.5])
         cur.execute('select v from t order by id')
-        rows = cur.fetchall()
+        rows = [_values(r) for r in cur.fetchall()]
     finally:
         try:
             conn.close()
@@ -750,7 +760,7 @@ def test_reexecute_reruns_cached_dml_with_fresh_bind_rows() -> None:
         assert b'ORA-01001' in received[1]
         # Every row landed, and the session is in sync for ordinary work.
         cur.execute('select id, s from t854 order by id')
-        rows = cur.fetchall()
+        rows = [_values(r) for r in cur.fetchall()]
     finally:
         try:
             conn.close()

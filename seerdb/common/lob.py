@@ -33,9 +33,41 @@ _DECODED_IMAGE_TYPES = (TNS_TYPE_JSON, TNS_TYPE_VECTOR)
 
 _LOCATOR_OVERHEAD = 102
 
+# The mode a LOB OPEN carries in its amount field. Measured against a live 23ai:
+# 1 (read-only) and 2 (read-write) are accepted, 0 and 11 are refused with
+# ORA-64219 "invalid LOB locator encountered" (#964, PROTOCOL.md 14.6).
+_LOB_OPEN_READ_ONLY = 1
+_LOB_OPEN_READ_WRITE = 2
+
+
+def _check_write_value(is_character: bool, value: object, offset: object) -> None:
+    # A CLOB takes str and a BLOB bytes; the reference driver raises TypeError
+    # for the wrong one rather than coercing, and its suite pins that.
+    if is_character and not isinstance(value, str):
+        raise TypeError('a CLOB is written from str, not bytes')
+    if not is_character and not isinstance(value, (bytes, bytearray)):
+        raise TypeError('a BLOB is written from bytes, not str')
+    if not isinstance(offset, int) or isinstance(offset, bool):
+        raise TypeError('offset must be an int')
+
+
+def _check_read_range(offset: int, amount: int | None) -> None:
+    # oracledb's codes, so a caller sees the same failure it would there.
+    from seerdb.common.exceptions import InterfaceError
+
+    if not isinstance(offset, int) or isinstance(offset, bool):
+        raise TypeError('offset must be an int')
+    if offset < 1:
+        raise InterfaceError('DPY-2030: LOB offset must be greater than zero')
+    if amount is not None:
+        if not isinstance(amount, int) or isinstance(amount, bool):
+            raise TypeError('amount must be an int')
+        if amount < 1:
+            raise InterfaceError('DPY-2047: LOB amount must be greater than zero')
+
 
 class LOB:
-    __slots__ = ('data_type', 'raw', '_connection', '_prefetched')
+    __slots__ = ('data_type', 'raw', '_connection', '_prefetched', '_is_open')
 
     def __init__(self, data_type: int, raw: bytes, connection=None, prefetched=None):
         # `data_type` is the column's TNS data type code (112 CLOB, 113 BLOB,
@@ -52,6 +84,10 @@ class LOB:
         self.raw = bytes(raw)
         self._connection = connection
         self._prefetched = None if prefetched is None else bytes(prefetched)
+        # Whether open() was called through this object and not yet closed. The
+        # server owns the real state -- a second open answers ORA-22293 and a
+        # second close ORA-22289 -- so this only reports what we did.
+        self._is_open = False
 
     @property
     def is_binary(self) -> bool:
@@ -119,12 +155,16 @@ class LOB:
             return 0
         return len(self.raw) - _LOCATOR_OVERHEAD
 
-    def read(self) -> object:
+    def read(self, offset: int = 1, amount: int | None = None) -> object:
         # Sync read. Returns str/bytes for a CLOB/BLOB but the decoded value
         # (e.g. dict/list) for a JSON/VECTOR image LOB, hence `object` for now
         # (to be narrowed later). See `aread` below for the async equivalent.
+        #
+        # `offset` is 1-based and `amount` counts CHARACTERS for a CLOB / NCLOB
+        # and bytes for a BLOB / BFILE, as every LOB call does (#964).
         if self.data_type in _DECODED_IMAGE_TYPES:
             return self._decode_image(self._fetch_content())
+        _check_read_range(offset, amount)
         if len(self.raw) == _LOCATOR_OVERHEAD:
             return '' if self.is_character else b''
         if self._connection is None:
@@ -133,7 +173,116 @@ class LOB:
             raise InterfaceError('LOB has no connection to read from')
         if self.is_file:
             return self._connection.bfile_read_native(self.raw)
-        return self._connection.lob_read(self.raw, self.data_type)
+        return self._connection.lob_read(
+            self.raw, self.data_type, offset=offset, amount=amount
+        )
+
+    def size(self) -> int:
+        """The LOB's length — characters for a CLOB / NCLOB, bytes for a BLOB."""
+        from seerdb.common.tns_consts import TNS_LOB_OP_GET_LENGTH
+
+        return self._operation(TNS_LOB_OP_GET_LENGTH) or 0
+
+    def getchunksize(self) -> int:
+        """The server's chunk size for this LOB, for sizing reads and writes."""
+        from seerdb.common.tns_consts import TNS_LOB_OP_GET_CHUNK_SIZE
+
+        return self._operation(TNS_LOB_OP_GET_CHUNK_SIZE) or 0
+
+    def write(self, value: str | bytes, offset: int = 1) -> None:
+        """Write ``value`` at ``offset`` (1-based), extending the LOB if needed.
+
+        Oracle requires the LOB's ROW to be locked first — a value fetched
+        without `SELECT ... FOR UPDATE` in an open transaction answers
+        ORA-22920 rather than writing (#964)."""
+        _check_write_value(self.is_character, value, offset)
+        self._refresh(
+            self._require_mutable().lob_write(
+                self.raw, value, is_blob=not self.is_character, offset=offset
+            )
+        )
+
+    def trim(self, new_size: int = 0) -> None:
+        """Shorten the LOB to ``new_size``. Needs the row locked, like write()."""
+        if not isinstance(new_size, int) or isinstance(new_size, bool):
+            raise TypeError('new_size must be an int')
+        from seerdb.common.tns_consts import TNS_LOB_OP_TRIM
+
+        self._require_mutable()
+        self._operation(TNS_LOB_OP_TRIM, new_size)
+
+    def open(self) -> None:
+        """Open the LOB for read-write. A second open answers ORA-22293."""
+        from seerdb.common.tns_consts import TNS_LOB_OP_OPEN
+
+        self._operation(TNS_LOB_OP_OPEN, _LOB_OPEN_READ_WRITE)
+        self._is_open = True
+
+    def close(self) -> None:
+        """Close the LOB. Closing one that is not open answers ORA-22289."""
+        from seerdb.common.tns_consts import TNS_LOB_OP_CLOSE
+
+        self._operation(TNS_LOB_OP_CLOSE)
+        self._is_open = False
+
+    def isopen(self) -> bool:
+        """Whether this LOB was opened through this object and not yet closed."""
+        return self._is_open
+
+    def _require_connection(self):
+        if self._connection is None:
+            from seerdb.common.exceptions import InterfaceError
+
+            raise InterfaceError('LOB has no connection to operate on')
+        return self._connection
+
+    def _require_mutable(self):
+        # Writing a PERSISTENT LOB locator is 11g and up. Measured on every
+        # tier: the ub2-prefixed locator form a temp LOB uses is answered
+        # ORA-22275 everywhere, and the bare form that 11g / 21c / 23ai accept
+        # makes 10g DROP THE CONNECTION outright -- taking the row lock with it,
+        # so the next statement then fails ORA-00054. Refusing up front is the
+        # only honest option until 10g's form is found (#964).
+        from seerdb.common.exceptions import NotSupportedError
+        from seerdb.common.tns_consts import FIELD_VERSION_11_2
+
+        conn = self._require_connection()
+        if getattr(conn, 'field_version', FIELD_VERSION_11_2) < FIELD_VERSION_11_2:
+            raise NotSupportedError(
+                'modifying a LOB needs Oracle 11g or later; on 10g the server '
+                'closes the connection on a persistent-LOB write'
+            )
+        return conn
+
+    def _operation(self, operation: int, amount: int = 0) -> int | None:
+        (value, locator) = self._require_connection().lob_operation(
+            self.raw, operation, amount
+        )
+        self._refresh(locator)
+        return value
+
+    def _refresh(self, locator: bytes | None) -> None:
+        # Every LOB call answers with the locator as the server now sees it, and
+        # a mutating one really does change it. Keeping the original meant the
+        # next read was served the PRE-write value, so a write looked like it
+        # had silently done nothing (#964).
+        #
+        # The two forms differ by a header: a locator taken from a ROW carries a
+        # 2-byte length prefix that the one in a reply does not (measured on
+        # 23ai: reply == row[2:]). Adopting the reply's bytes as-is therefore
+        # produced a locator the next call refused with ORA-22275, so the prefix
+        # is put back when the original had one.
+        if not locator:
+            return
+        prefixed = (
+            len(self.raw) >= 2
+            and int.from_bytes(self.raw[:2], 'big') == len(self.raw) - 2
+        )
+        self.raw = (
+            len(locator).to_bytes(2, 'big') + bytes(locator)
+            if prefixed
+            else bytes(locator)
+        )
 
     def _fetch_content(self) -> bytes:
         # Fetch the raw locator content over TTI_LOBOPS (the OSON image for a
@@ -158,11 +307,13 @@ class LOB:
 
         return decode_vector(content)
 
-    async def aread(self) -> object:
+    async def aread(self, offset: int = 1, amount: int | None = None) -> object:
         """Async equivalent of `read()`. Use this when the LOB came
         out of an `AsyncCursor`; the `_connection` attached to it is
         an `AsyncOracleConnect` whose `lob_read` / `bfile_read` are
         coroutines."""
+        if self.data_type not in _DECODED_IMAGE_TYPES:
+            _check_read_range(offset, amount)
         if self.data_type in _DECODED_IMAGE_TYPES:
             if self._prefetched is not None:
                 return self._decode_image(self._prefetched)
@@ -180,7 +331,60 @@ class LOB:
             raise InterfaceError('LOB has no connection to read from')
         if self.is_file:
             return await self._connection.bfile_read_native(self.raw)
-        return await self._connection.lob_read(self.raw, self.data_type)
+        return await self._connection.lob_read(
+            self.raw, self.data_type, offset=offset, amount=amount
+        )
+
+    async def asize(self) -> int:
+        """Async equivalent of :meth:`size`."""
+        from seerdb.common.tns_consts import TNS_LOB_OP_GET_LENGTH
+
+        return await self._aoperation(TNS_LOB_OP_GET_LENGTH) or 0
+
+    async def agetchunksize(self) -> int:
+        """Async equivalent of :meth:`getchunksize`."""
+        from seerdb.common.tns_consts import TNS_LOB_OP_GET_CHUNK_SIZE
+
+        return await self._aoperation(TNS_LOB_OP_GET_CHUNK_SIZE) or 0
+
+    async def awrite(self, value: str | bytes, offset: int = 1) -> None:
+        """Async equivalent of :meth:`write`."""
+        _check_write_value(self.is_character, value, offset)
+        self._refresh(
+            await self._require_mutable().lob_write(
+                self.raw, value, is_blob=not self.is_character, offset=offset
+            )
+        )
+
+    async def atrim(self, new_size: int = 0) -> None:
+        """Async equivalent of :meth:`trim`."""
+        if not isinstance(new_size, int) or isinstance(new_size, bool):
+            raise TypeError('new_size must be an int')
+        from seerdb.common.tns_consts import TNS_LOB_OP_TRIM
+
+        self._require_mutable()
+        await self._aoperation(TNS_LOB_OP_TRIM, new_size)
+
+    async def aopen(self) -> None:
+        """Async equivalent of :meth:`open`."""
+        from seerdb.common.tns_consts import TNS_LOB_OP_OPEN
+
+        await self._aoperation(TNS_LOB_OP_OPEN, _LOB_OPEN_READ_WRITE)
+        self._is_open = True
+
+    async def aclose(self) -> None:
+        """Async equivalent of :meth:`close`."""
+        from seerdb.common.tns_consts import TNS_LOB_OP_CLOSE
+
+        await self._aoperation(TNS_LOB_OP_CLOSE)
+        self._is_open = False
+
+    async def _aoperation(self, operation: int, amount: int = 0) -> int | None:
+        (value, locator) = await self._require_connection().lob_operation(
+            self.raw, operation, amount
+        )
+        self._refresh(locator)
+        return value
 
     def __repr__(self) -> str:
         Kind = (

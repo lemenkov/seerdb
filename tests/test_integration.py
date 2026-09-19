@@ -29,7 +29,11 @@ import unittest
 from decimal import Decimal
 
 import seerdb
-from seerdb.common.tns_consts import FIELD_VERSION_10_2, FIELD_VERSION_12_1
+from seerdb.common.tns_consts import (
+    FIELD_VERSION_10_2,
+    FIELD_VERSION_11_2,
+    FIELD_VERSION_12_1,
+)
 
 # Features the Oracle 9i (fv2) server genuinely lacks, keyed by a substring of
 # the test method name. A 9i (field_version < 10.2) connection skips these with
@@ -215,7 +219,7 @@ _ADMIN_SKIP_REASON = (
 _CONNECT_DELAY = float(os.environ.get('SEERDB_TEST_CONNECT_DELAY', '0.05'))
 
 
-def _connect():
+def _connect(fetch_lobs: bool = True):
     import time
 
     time.sleep(_CONNECT_DELAY)
@@ -226,6 +230,7 @@ def _connect():
         password=_PASSWORD,
         service_name=_SERVICE,
         autocommit=True,
+        fetch_lobs=fetch_lobs,
         **_FV_KW,
     )
 
@@ -331,7 +336,7 @@ class _IntegrationBase(unittest.TestCase):
         Last: Exception = RuntimeError('setUp: connection retries exhausted')
         for _ in range(5):
             try:
-                self.conn = _connect()
+                self.conn = _connect(getattr(self, '_fetch_lobs', True))
                 self.cur = self.conn.cursor()
                 self._skip_if_fv2_unsupported()
                 self._drop_silently(self.cur)
@@ -2367,6 +2372,11 @@ class FetchFlowIntegration(_IntegrationBase):
 class LOBIntegration(_IntegrationBase):
     """Verify LOB column read + content extraction.
 
+    These tests are about the CONTENT surviving the wire, so they connect with
+    ``fetch_lobs=False`` and keep asserting on str / bytes. The LOB OBJECT that
+    the default now returns is exercised by :class:`LOBObjectIntegration`
+    below (#964).
+
     NULL LOBs surface as Python None. EMPTY_CLOB() / EMPTY_BLOB() come
     back as `""` / `b""`. Non-empty small LOBs whose content fits inside
     the inline section of the locator block round-trip as `str` (CLOB) or
@@ -2374,6 +2384,11 @@ class LOBIntegration(_IntegrationBase):
     inline budget) needs a TTI_LOBOPS round-trip the driver doesn't yet
     issue — see the README's "still in progress" list.
     """
+
+    def setUp(self):
+        # Values, not LOB objects: see the class docstring (#964).
+        self._fetch_lobs = False
+        super().setUp()
 
     def test_lob_columns_are_readable_inside_an_open_transaction(self):
         # call_status reads 2 while a transaction is open; keyed on the value 1,
@@ -2648,6 +2663,137 @@ class LOBIntegration(_IntegrationBase):
             (Got,) = self.cur.fetchone()
             self.assertEqual(len(Got), len(Big))
             self.assertEqual(Got, Big)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class LOBObjectIntegration(_IntegrationBase):
+    """The LOB OBJECT a fetch returns by default (#964).
+
+    `fetch_lobs` defaults True, matching python-oracledb, so a CLOB / BLOB
+    column comes back as a LOB rather than str / bytes. Everything here was
+    reverse-engineered against a live 23ai and then checked on every tier:
+    GET_LENGTH / GET_CHUNK_SIZE / TRIM answer a ub4 after the updated locator,
+    OPEN takes a mode in its amount field, and each reply carries the locator
+    AS THE SERVER NOW SEES IT -- keeping the original made a write look like it
+    had silently done nothing.
+    """
+
+    TABLE = 'PYORACLE_LOBOBJ'
+
+    def _fetch_lob(self):
+        # A LOB is only mutable while its ROW is locked, so the insert is left
+        # uncommitted and the select takes FOR UPDATE -- otherwise Oracle
+        # answers ORA-22920 rather than writing.
+        self.cur.execute(f'SELECT c FROM {self.TABLE} FOR UPDATE')
+        (lob,) = self.cur.fetchone()
+        return lob
+
+    def setUp(self):
+        super().setUp()
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            self.skipTest('the LOB object needs the 10g+ LOBOPS path')
+        self.conn.autocommit = False
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, c CLOB)')
+        self.cur.execute(f"INSERT INTO {self.TABLE} VALUES (1, 'hello world')")
+
+    def tearDown(self):
+        # The row is deliberately left LOCKED for the duration of each test (a
+        # LOB is only mutable that way), so the transaction has to be released
+        # here -- otherwise the lock outlives the test and the base tearDown's
+        # DROP hits ORA-00054 "resource busy", which is how this first showed up
+        # on 10g while 11g happened to get away with it.
+        try:
+            self.conn.rollback()
+        except Exception:  # noqa: BLE001, S110
+            pass
+        super().tearDown()
+
+    def test_a_fetched_clob_is_a_lob_object(self):
+        lob = self._fetch_lob()
+        self.assertTrue(hasattr(lob, 'read'), f'expected a LOB, got {type(lob)}')
+        self.assertEqual(lob.read(), 'hello world')
+
+    def test_size_and_chunk_size_come_from_the_server(self):
+        # Against a Mirror both of these answer 0: it recovers a column
+        # locator from a GET_LENGTH only in the ub2-PREFIXED form, while a real
+        # server wants the BARE one for that op (and answers the prefixed form
+        # with an error), so the Mirror never finds the locator the client
+        # actually sent. GET_CHUNK_SIZE it acks without a value at all. Both are
+        # Mirror-side follow-ups to #964.
+        self._skip_if_mirror('GET_LENGTH / GET_CHUNK_SIZE on a column locator')
+        lob = self._fetch_lob()
+        self.assertEqual(lob.size(), 11)
+        self.assertGreater(lob.getchunksize(), 0)
+
+    def test_read_takes_a_one_based_offset_and_an_amount(self):
+        lob = self._fetch_lob()
+        self.assertEqual(lob.read(7, 5), 'world')
+        self.assertEqual(lob.read(1, 5), 'hello')
+        self.assertEqual(lob.read(7), 'world')
+
+    def test_a_bad_read_range_is_refused_before_the_wire(self):
+        lob = self._fetch_lob()
+        with self.assertRaises(Exception):
+            lob.read(0)
+        with self.assertRaises(Exception):
+            lob.read(1, 0)
+
+    def _skip_if_immutable(self):
+        if self.conn.field_version < FIELD_VERSION_11_2:
+            self.skipTest('modifying a LOB needs 11g+ (10g closes the connection)')
+        self._skip_if_mirror('serving LOB writes on a column locator')
+
+    def _skip_if_mirror(self, feature: str):
+        # The Mirror serves a column LOB's content and length by locator (#826)
+        # but does not yet MUTATE one, nor answer GET_CHUNK_SIZE with a real
+        # value -- that is the follow-up #964 names. Skip rather than fail, so a
+        # Mirror leg does not look like a client regression.
+        if os.environ.get('SEERDB_TEST_MIRROR'):
+            self.skipTest(f'the Mirror does not implement {feature} yet')
+
+    def test_write_applies_and_the_size_follows(self):
+        self._skip_if_immutable()
+        lob = self._fetch_lob()
+        lob.write('WORLD', 7)
+        self.assertEqual(lob.read(), 'hello WORLD')
+        self.assertEqual(lob.size(), 11)
+
+    def test_write_past_the_end_extends_the_lob(self):
+        self._skip_if_immutable()
+        lob = self._fetch_lob()
+        lob.write('!', 12)
+        self.assertEqual(lob.read(), 'hello world!')
+        self.assertEqual(lob.size(), 12)
+
+    def test_trim_shortens_it(self):
+        self._skip_if_immutable()
+        lob = self._fetch_lob()
+        lob.trim(5)
+        self.assertEqual(lob.read(), 'hello')
+        self.assertEqual(lob.size(), 5)
+
+    def test_open_close_round_trip(self):
+        lob = self._fetch_lob()
+        self.assertFalse(lob.isopen())
+        lob.open()
+        self.assertTrue(lob.isopen())
+        lob.close()
+        self.assertFalse(lob.isopen())
+
+    def test_writing_the_wrong_python_type_is_a_type_error(self):
+        self._skip_if_immutable()
+        lob = self._fetch_lob()
+        self.assertRaises(TypeError, lob.write, 1000, 1)
+        self.assertRaises(TypeError, lob.write, b'bytes-into-a-clob', 1)
+
+    def test_fetch_lobs_false_restores_the_plain_value(self):
+        self.conn.commit()
+        with _connect(fetch_lobs=False) as Conn:
+            Cur = Conn.cursor()
+            Cur.execute(f'SELECT c FROM {self.TABLE}')
+            (value,) = Cur.fetchone()
+        self.assertEqual(value, 'hello world')
+        self.assertIsInstance(value, str)
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
@@ -3615,7 +3761,7 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
     """Verify the async surface: connect_async, AsyncCursor, fetch
     flow, async iteration, context managers."""
 
-    def _kwargs(self):
+    def _kwargs(self, **extra):
         return dict(
             host=_HOST,
             port=_PORT,
@@ -3624,6 +3770,7 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
             service_name=_SERVICE,
             autocommit=True,
             **_FV_KW,
+            **extra,
         )
 
     async def asyncSetUp(self):
@@ -3907,7 +4054,7 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_lob_auto_resolve(self):
         # CLOB / BLOB / NULL / EMPTY all surface as Python str/bytes/None
         # through the auto-resolve in `AsyncCursor.execute`.
-        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+        async with await seerdb.connect_async(**self._kwargs(fetch_lobs=False)) as Conn:
             async with Conn.cursor() as Cur:
                 await self._drop_async(Cur, 'PYORACLE_ASYNC_LOB')
                 await Cur.execute(
@@ -3941,7 +4088,7 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
         # them followed by a large CLOB read must not desync the stream.
         from seerdb.common.exceptions import DatabaseError
 
-        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+        async with await seerdb.connect_async(**self._kwargs(fetch_lobs=False)) as Conn:
             if Conn.field_version < FIELD_VERSION_10_2:
                 self.skipTest('Oracle 9i has no streamed LOB/LONG bind path (#169)')
             async with Conn.cursor() as Cur:

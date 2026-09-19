@@ -173,6 +173,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         machine: str | None = None,
         terminal: str | None = None,
         osuser: str | None = None,
+        fetch_lobs: bool = True,
         field_version: int = FIELD_VERSION_23_4,
         cclass: str | None = None,
         purity: int = PURITY_DEFAULT,
@@ -223,6 +224,11 @@ class AsyncOracleConnect(_ConnectionLogic):
         self.machine = machine
         self.terminal = terminal
         self.osuser = osuser
+        # Whether a fetched CLOB / BLOB comes back as a LOB object (the default,
+        # matching python-oracledb) or is materialised into str / bytes. The LOB
+        # object is what makes size() / read(offset, amount) / write() / trim()
+        # reachable at all; set False for the value-only behaviour (#964).
+        self.fetch_lobs = fetch_lobs
         # Token auth (#125), resolved at connect time.
         self.access_token = access_token
         self._token_auth = False
@@ -1345,16 +1351,28 @@ class AsyncOracleConnect(_ConnectionLogic):
     # ----- LOB read (async mirror of `OracleConnect.lob_read`) -----
 
     async def lob_read(
-        self, Locator: bytes, DataType: int, prefixed: bool = False
+        self,
+        Locator: bytes,
+        DataType: int,
+        prefixed: bool = False,
+        offset: int = 1,
+        amount: int | None = None,
     ) -> str | bytes:
         """Async port of the sync `lob_read`. See its docstring for
         the wire format we walk through. `prefixed` opts into the
-        ub2-length-prefixed locator form required for temp LOBs (#91)."""
+        ub2-length-prefixed locator form required for temp LOBs (#91);
+        `offset` / `amount` select a slice (#964)."""
         from seerdb.common.tns_consts import TNS_TYPE_CLOB
 
+        Extra: dict = {'source_offset': offset}
+        if amount is not None:
+            Extra['amount'] = amount
         Data = encode_dictionary(
             self._make_dict(
-                DictionaryType.lobops, locator=Locator, locator_prefixed=prefixed
+                DictionaryType.lobops,
+                locator=Locator,
+                locator_prefixed=prefixed,
+                **Extra,
             )
         )
         await self.send(TNS_DATA, Data)
@@ -1514,6 +1532,60 @@ class AsyncOracleConnect(_ConnectionLogic):
         if Received is False:
             raise Exception('Connection closed during LOBOPS')
         self._raise_lobops_error(Received[1])
+
+    async def lob_write(
+        self,
+        Locator: bytes,
+        Data: str | bytes,
+        is_blob: bool = False,
+        offset: int = 1,
+    ) -> bytes | None:
+        """Async port of the sync :meth:`lob_write` (#964)."""
+        from typing import cast
+
+        from seerdb.common.tns import decode_lobops_locator
+        from seerdb.common.tns_consts import TNS_LOB_OP_WRITE
+
+        Payload = Data if is_blob else cast(str, Data).encode('utf-16-be')
+        Dict = self._make_dict(
+            DictionaryType.lobops,
+            locator=Locator,
+            data=Payload,
+            operation=TNS_LOB_OP_WRITE,
+            source_offset=offset,
+            locator_prefixed=False,
+        )
+        await self.send(TNS_DATA, encode_dictionary(Dict))
+        Received = await self._next_data_packet(b'', b'')
+        if Received is False:
+            raise Exception('Connection closed during LOBOPS')
+        self._raise_lobops_error(Received[1])
+        return decode_lobops_locator(Received[1])
+
+    async def lob_operation(
+        self, Locator: bytes, Operation: int, Amount: int = 0
+    ) -> tuple[int | None, bytes | None]:
+        """Async port of the sync :meth:`lob_operation` (#964): one
+        value-returning TTI_LOBOPS operation, returning its ``ub4``."""
+        from seerdb.common.tns import decode_lobops_locator, decode_lobops_value
+
+        Data = encode_dictionary(
+            self._make_dict(
+                DictionaryType.lobops,
+                locator=Locator,
+                operation=Operation,
+                amount=Amount,
+            )
+        )
+        await self.send(TNS_DATA, Data)
+        Received = await self._next_data_packet(b'', b'')
+        if Received is False:
+            raise Exception('Connection closed during LOBOPS')
+        self._raise_lobops_error(Received[1])
+        return (
+            decode_lobops_value(Received[1]),
+            decode_lobops_locator(Received[1]),
+        )
 
     async def bfile_read_native(self, Locator: bytes) -> bytes:
         """Async port of the sync `bfile_read_native` (#46): FILE_OPEN ->

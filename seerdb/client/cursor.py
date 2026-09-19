@@ -796,16 +796,23 @@ def _resolve_nested_cursors(Connection, Row: list) -> list:
 
 
 def _resolve_lobs(Connection, Row: list) -> list:
-    # Replace any LOB cells in the row with their resolved Python value.
-    # CLOB → str, BLOB → bytes, empty → "" / b"", NULL stays as None (the
-    # row decoder already handed back None for NULL LOBs before they ever
-    # became LOB objects).
-    from seerdb.common.lob import LOB
+    # Attach the connection to every LOB cell so it can be read from, and --
+    # unless the connection asks for LOB objects (`fetch_lobs`, the default,
+    # #964) -- materialise it: CLOB -> str, BLOB -> bytes, empty -> "" / b"".
+    # NULL stays None (the row decoder hands back None for a NULL LOB before it
+    # ever becomes a LOB object).
+    #
+    # A JSON / VECTOR column arrives as a LOB too but is never a LOB to the
+    # caller: its image decodes to a Python value whatever `fetch_lobs` says.
+    from seerdb.common.lob import _DECODED_IMAGE_TYPES, LOB
 
     Out = list(Row)
+    KeepLobs = getattr(Connection, 'fetch_lobs', False)
     for I, Val in enumerate(Out):
         if isinstance(Val, LOB):
             Val._connection = Connection
+            if KeepLobs and Val.data_type not in _DECODED_IMAGE_TYPES:
+                continue
             Out[I] = Val.read()
     return Out
 

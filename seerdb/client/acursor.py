@@ -265,7 +265,7 @@ class AsyncCursor(_CursorLogic):
             decode_object_image,
             decode_xmltype,
         )
-        from seerdb.common.lob import LOB
+        from seerdb.common.lob import _DECODED_IMAGE_TYPES, LOB
         from seerdb.common.tns_consts import TNS_TYPE_CLOB
 
         ResolvedRows = []
@@ -285,6 +285,13 @@ class AsyncCursor(_CursorLogic):
                     )
                 elif isinstance(Val, LOB):
                     Val._connection = self._connection
+                    # Keep the LOB object unless the connection asks for values
+                    # (#964); a JSON / VECTOR image is never a LOB to the caller.
+                    if (
+                        getattr(self._connection, 'fetch_lobs', False)
+                        and Val.data_type not in _DECODED_IMAGE_TYPES
+                    ):
+                        continue
                     NewRow[I] = await Val.aread()
                 elif isinstance(Val, ObjectImage) and Val.type_name == 'XMLTYPE':
                     # XMLType (#124): decode to str, or read the CLOB locator.
