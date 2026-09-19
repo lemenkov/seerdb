@@ -3516,6 +3516,45 @@ def decode_token_oer(Data: bytes, Acc: tuple) -> tuple:
     )
 
 
+def decode_lobops_locator(Packet: bytes) -> bytes | None:
+    """The UPDATED locator a TTI_LOBOPS reply leads with, or ``None``.
+
+    Every LOB call answers with the locator as the server now sees it, and a
+    MUTATING call (WRITE / TRIM / OPEN / CLOSE) really does change it. Keeping
+    the original meant the next read was served the pre-write value and the
+    write looked like it had silently done nothing (#964) -- the same rule the
+    BFILE path already follows for FILE_OPEN (§14.4)."""
+    if not Packet or Packet[0] != TTI_RPA or len(Packet) < 3:
+        return None
+    Length = (Packet[1] << 8) | Packet[2]
+    if Length <= 0 or 3 + Length > len(Packet):
+        return None
+    return bytes(Packet[3 : 3 + Length])
+
+
+def decode_lobops_value(Packet: bytes) -> int | None:
+    """The ``ub4`` a value-returning TTI_LOBOPS reply carries between the updated
+    locator and the trailing OER — ``None`` when the reply has no such field.
+
+    Captured from a live 23ai (§14.6): GET_LENGTH answers the LOB's length,
+    GET_CHUNK_SIZE its chunk size (8060 there), TRIM the NEW length, and OPEN /
+    CLOSE carry the field too (their value is not meaningful)::
+
+        08 | ub2 112 | <112-byte updated locator> | 01 0b | 04 <OER>
+             locator length                         ub4 = 11
+
+    The locator is binary and can contain anything, so it is skipped by its
+    declared length rather than scanned for — the same reason
+    :func:`decode_lobops_oer` does."""
+    if not Packet or Packet[0] != TTI_RPA or len(Packet) < 3:
+        return None
+    Pos = 3 + ((Packet[1] << 8) | Packet[2])
+    if Pos >= len(Packet) or Packet[Pos] == TTI_OER:
+        return None
+    (Value, _Rest) = decode_ub4(Packet[Pos:])
+    return Value
+
+
 def decode_lobops_oer(Packet: bytes, FieldVersion: int) -> tuple[int, str | None]:
     # Pull the (error code, message) out of a content-free TTI_LOBOPS response
     # (WRITE / temp ops): TTI_RPA (updated locator + amount) optionally followed
@@ -10092,9 +10131,14 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
         Locator = Dictionary['locator']
         Data = Dictionary['data']
         SourceOffset = Dictionary.get('source_offset', 1)
+        # A TEMP locator rides ub2-length-prefixed with the length counting the
+        # prefix; a PERSISTENT (column) locator rides bare with its own length,
+        # exactly the split READ already makes. Sending a column locator in the
+        # temp form is answered ORA-22275 "invalid LOB locator specified" (#964).
+        Prefixed = Dictionary.get('locator_prefixed', True)
         Out = LobHead
         Out += bytes([1])  # source pointer present
-        Out += encode_sb4(len(Locator) + 2)  # source locator length (+ub2)
+        Out += encode_sb4(len(Locator) + 2 if Prefixed else len(Locator))
         Out += bytes([0])  # dest pointer absent
         Out += encode_sb4(0)  # dest_length
         Out += encode_sb4(0)  # short source offset
@@ -10109,7 +10153,8 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
         Out += encode_sb4(0)  # dest offset (ub8)
         Out += bytes([0])  # amount pointer absent
         Out += struct.pack('>HHH', 0, 0, 0)  # three reserved ub16be slots
-        Out += struct.pack('>H', len(Locator))  # ub2 locator length prefix
+        if Prefixed:
+            Out += struct.pack('>H', len(Locator))  # ub2 locator length prefix
         Out += Locator
         Out += bytes([0x0E])  # WRITE-data marker
         if len(Data) <= TNS_MAX_SHORT_LENGTH:

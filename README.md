@@ -161,11 +161,17 @@ What works:
   record batches (column types derived from the describe, so a NUMBER /
   Decimal column lands as the right Arrow type without inference). Sync
   and async
-- LOB content: CLOB / BLOB columns in a SELECT round-trip as `str` /
-  `bytes` of any size. `Cursor.execute` automatically issues a
-  `TTI_LOBOPS` READ for each non-empty LOB cell, materialising the
-  content from the server. NULL LOBs come back as `None`;
-  `EMPTY_CLOB()` / `EMPTY_BLOB()` as `""` / `b""`
+- LOB objects: a SELECT of a CLOB / BLOB returns a `LOB` you can
+  `read(offset, amount)`, `size()`, `write(value, offset)`, `trim()`,
+  `open()` / `close()` / `isopen()` and `getchunksize()` — sync, and the
+  same set prefixed `a` on an async cursor. NULL LOBs come back as
+  `None`. **Mutating one needs its row locked** (`SELECT ... FOR UPDATE`,
+  or an uncommitted INSERT in the same transaction), as Oracle requires;
+  otherwise the server answers `ORA-22920`
+- `fetch_lobs=False` on `connect()` restores value semantics: CLOB /
+  BLOB columns materialise to `str` / `bytes` of any size, with
+  `EMPTY_CLOB()` / `EMPTY_BLOB()` as `""` / `b""`. The default is `True`,
+  matching python-oracledb
 - BFILE read: SELECT of a `BFILENAME(...)` / BFILE column round-trips
   the external file contents as `bytes`, read natively over
   `TTI_LOBOPS` (`FILE_OPEN` → `READ` → `FILE_CLOSE`). The only

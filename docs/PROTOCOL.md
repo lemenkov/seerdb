@@ -2871,6 +2871,11 @@ form by default and opts into the prefix per call (`locator_prefixed`).
 |-----------|-------------------|--------------------------------------|
 | `0x0001`  | GET_LENGTH        | Total length of the LOB              |
 | `0x0002`  | READ              | Read content from the LOB            |
+| `0x0020`  | TRIM              | Shorten the LOB to `amount`          |
+| `0x0040`  | WRITE             | Write at `source_offset`             |
+| `0x4000`  | GET_CHUNK_SIZE    | The server's chunk size              |
+| `0x8000`  | OPEN              | Open; `amount` carries the MODE      |
+| `0x10000` | CLOSE             | Close                                |
 
 **CREATE_TEMP body** (no source locator): a fixed field block captured verbatim
 from python-oracledb on 21c, differing between CLOB (type `0x70`) and BLOB
@@ -3179,6 +3184,59 @@ falls through to the column-read path is answered with a read reply (token
 `0x0e`) echoing the column placeholder — the wrong token *and* the wrong locator
 — so the client desyncs on the very first `lob.size()` of something it created
 itself, long before any of its content is in question.
+
+### 14.4c The operations a LOB object needs (#964)
+
+Captured from a live 23ai against a **persistent column** locator, which is a
+different animal from the temp locator §14.5 covers.
+
+**A value-returning reply.** GET_LENGTH, GET_CHUNK_SIZE, TRIM, OPEN and CLOSE
+all answer in one shape — the updated locator, then a `ub4`, then the OER:
+
+```
+08 | 00 70 | <112-byte updated locator> | 01 0b | 04 <OER>
+     ub2 112                              ub4 = 11
+```
+
+GET_LENGTH's `ub4` is the length (characters for a CLOB, bytes for a BLOB),
+GET_CHUNK_SIZE's is the chunk size (**8060** on 23ai), and TRIM's is the **new**
+length. OPEN / CLOSE carry the field without a meaningful value.
+
+**The reply's locator is not the one you sent, and that matters.** Every call
+answers with the locator as the server now sees it, and a mutating one really
+does change it. Reusing the original meant the next read was served the
+*pre-write* value, so a write looked like it had silently done nothing. The two
+forms also differ by a header: a locator taken from a ROW carries a 2-byte
+length prefix that the reply's does not (measured: `reply == row[2:]`), so the
+prefix has to be put back before the next call or it is refused with ORA-22275.
+
+**OPEN takes a mode in the amount field.** `1` (read-only) and `2` (read-write)
+are accepted; `0` and `11` are refused with `ORA-64219: invalid LOB locator
+encountered`, which names the locator rather than the mode and is therefore
+thoroughly misleading. A second OPEN answers `ORA-22293`, and a CLOSE of an
+unopened LOB `ORA-22289` — the codes a client surfaces directly.
+
+**Mutation needs the ROW locked.** TRIM and WRITE against a committed row answer
+`ORA-22920: row containing the LOB value is not locked prior to update`. The
+lock comes from an open transaction over that row — `SELECT ... FOR UPDATE`, or
+simply an uncommitted INSERT in the same transaction.
+
+**WRITE frames its locator differently per kind.** A TEMP locator rides
+ub2-length-prefixed with the declared length counting the prefix (`len + 2`); a
+PERSISTENT one rides bare with its own length, the same split READ already
+makes. Sending a column locator in the temp form is answered ORA-22275 on
+**every** tier (10g / 11g / 21c / 23ai, measured). (READ wants the bare form and
+GET_LENGTH the prefixed one, so the two are not simply "temp vs persistent" — it
+is per operation.)
+
+**Writing a persistent LOB is 11g and up.** The bare form 11g, 21c and 23ai all
+accept makes **10g drop the connection outright** — no error, no reply, the
+socket closes. That is worse than a refusal in a specific way: the session dies
+holding the row's lock, so the *next* statement fails `ORA-00054: resource busy`
+and the cause looks like a locking problem several steps removed from the write.
+What 10g does want is not known; seerdb refuses `LOB.write()` / `LOB.trim()`
+below 11g with `NotSupportedError` rather than take a session down looking for
+it. Reads, `size()` and `getchunksize()` are unaffected and work on 10g.
 
 ### 14.5b LOB **column** value framing, and its two forms (#853)
 

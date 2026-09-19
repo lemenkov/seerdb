@@ -97,6 +97,10 @@ def main(argv: list[str]) -> int:
                 SEERDB_TEST_HOST='127.0.0.1',
                 SEERDB_TEST_PORT=str(port),
                 SEERDB_TEST_SERVICE='XE',
+                # Tell the suite it is talking to a Mirror, so a test can skip
+                # for a feature the Mirror does not serve yet rather than fail
+                # as though the CLIENT were at fault (#964).
+                SEERDB_TEST_MIRROR='1',
             )
             env.pop('SEERDB_TEST_FIELD_VERSION', None)
             status = subprocess.call(

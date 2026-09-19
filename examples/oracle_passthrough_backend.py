@@ -144,6 +144,11 @@ class OraclePassthroughBackend:
             password=password,
             service_name=self._service,
             autocommit=False,
+            # The backend wants LOB VALUES, not LOB objects: it reads each LOB's
+            # content to queue for the Mirror's own read path. seerdb defaults
+            # fetch_lobs=True now (#964), so this has to be explicit -- the same
+            # one-line opt-out any consumer that wants str / bytes needs.
+            fetch_lobs=False,
             # Present the CLIENT's identity upstream, not this process's, so
             # v$session shows who actually connected (#826). Each is None when
             # the client declared nothing, and the driver falls back to its own.
