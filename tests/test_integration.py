@@ -3601,11 +3601,6 @@ class ConnectAttributeIntegration(_IntegrationBase):
 
     def test_driver_name_can_be_declared(self):
         self._skip_unless_session_kvs()
-        # A Mirror cannot relay this yet: the banner arrives in the login AUTH,
-        # after a passthrough has already opened its upstream connection, and it
-        # is settable only at connect time there. That is the follow-up (#826).
-        if os.environ.get('SEERDB_TEST_MIRROR'):
-            self.skipTest('the Mirror does not relay the driver banner yet')
         with _connect_with(driver_name='newdriver') as conn:
             cur = conn.cursor()
             cur.execute(
