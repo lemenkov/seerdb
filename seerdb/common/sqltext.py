@@ -217,6 +217,21 @@ def altered_current_schema(SQL: str) -> str | None:
     return match.group(2) if match else None
 
 
+_ALTER_EDITION_RE = re.compile(
+    r'\s*ALTER\s+SESSION\s+SET\s+EDITION\s*=\s*("?)([^\s";]+)\1', re.I
+)
+
+
+def altered_edition(SQL: str) -> str | None:
+    """The edition an ``ALTER SESSION SET EDITION = X`` selects, else None.
+
+    Reported back to the client the same way a schema change is (§20.6), under
+    its own key -- `connection.edition` learns it from that reply alone (#973).
+    """
+    match = _ALTER_EDITION_RE.match(SQL)
+    return match.group(2) if match else None
+
+
 def is_plsql(SQL: str) -> bool:
     # PL/SQL blocks start with BEGIN or DECLARE after stripping leading
     # whitespace and SQL comments. Anonymous blocks, packaged calls
