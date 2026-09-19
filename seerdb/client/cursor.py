@@ -701,6 +701,36 @@ def _decode_returned_image(TnsType: int, Raw) -> object:
     return decode_vector(bytes(Raw))
 
 
+def _decode_returned_object(Typ: object, Image: object) -> object:
+    # The object image an ADT return bind carries, walked into a DbObject with
+    # the layout the Var was declared with. A returning Var is created from the
+    # type itself (`cursor.var(conn.gettype(...))`), and `_resolve_dbtype` keeps
+    # that DbObjectType as the Var's dbtype, so the layout is already in hand --
+    # unlike a fetched COLUMN, which has to look the type up from the describe
+    # (#826).
+    from seerdb.common.dbobject import (
+        DbObject,
+        DbObjectType,
+        ObjectImage,
+        decode_collection_image,
+        decode_object_image,
+    )
+
+    if not isinstance(Image, ObjectImage) or not Image.image:
+        return None
+    if not isinstance(Typ, DbObjectType):
+        # A Var declared with a plain DB_TYPE_OBJECT carries no layout, so the
+        # image cannot be walked; hand back the placeholder rather than guess.
+        return Image
+    Charset = Image.charset or AL32UTF8_CHARSET
+    Name = Typ.name or Image.type_name
+    if Typ.is_collection:
+        Elements = decode_collection_image(Image.image, Typ.element or {}, Charset)
+        return DbObject(Name, elements=Elements, dbtype=Typ)
+    Attrs = decode_object_image(Image.image, Typ.attrs or [], Charset)
+    return DbObject(Name, Attrs, dbtype=Typ)
+
+
 def _assign_return_binds(Bind, Result) -> None:
     # DML RETURNING ... INTO (#120): the response decoder left one
     # {'return_positions', 'return_values'} record per execute iteration, where
@@ -736,6 +766,13 @@ def _assign_return_binds(Bind, Result) -> None:
                 # decoded rather than run through the scalar type decoder (#826).
                 PerBind.setdefault(Pos, []).append(
                     [_decode_returned_image(TnsType, V) for V in Values]
+                )
+                continue
+            if TnsType == TNS_TYPE_ADT:
+                # An OBJECT / collection bind's returned value is an object
+                # image, decoded with the type the Var was declared with (#826).
+                PerBind.setdefault(Pos, []).append(
+                    [_decode_returned_object(Variable.dbtype, V) for V in Values]
                 )
                 continue
             Column = {'data_type': TnsType, 'charset': UTF8_CHARSET}
