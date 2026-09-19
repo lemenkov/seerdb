@@ -307,6 +307,37 @@ def test_row_codec_debug_logging_reports_the_framing_it_chose(caplog) -> None:
     assert 'num_bytes=38' in decoded[0] and 'locator=38' in decoded[0]
 
 
+def test_an_xmltype_column_is_served_as_a_document_not_an_object() -> None:
+    # XMLType describes as an ADT (type 109, SYS.XMLTYPE) but its VALUE is a
+    # document, and every client surfaces it as a string -- so a backend hands
+    # the Mirror a `str` for that column. Encoding it as an object asked the
+    # `str` for its `_dbtype`, which is not an ORA error but an AttributeError:
+    # the Mirror answered with an internal fault and the client's connection
+    # died (DPY-4011). It rides the ordinary object frame with an XML image
+    # inside (#826).
+    from seerdb.common.dbobject import ObjectImage, decode_xmltype
+    from seerdb.common.tns_consts import TNS_TYPE_ADT
+
+    col = ColumnMeta(
+        name=b'X',
+        data_type=TNS_TYPE_ADT,
+        data_length=2000,
+        max_size=2000,
+        type_schema=b'SYS',
+        type_name=b'XMLTYPE',
+        type_oid=b'\x01' * 16,
+    )
+    doc = '<IntCol>5</IntCol>'
+    response = encode_describe([col]) + encode_rows([(doc,)], [col]) + bytes([TTI_STA])
+    _, rows = _decode_response(response)
+    (image,) = rows[0]
+    assert isinstance(image, ObjectImage)
+    assert image.type_name == 'XMLTYPE'
+    # The image is an XMLType document, which is what the cursor layer decodes
+    # when it sees that type name.
+    assert decode_xmltype(image.image)[1] == doc
+
+
 def test_encode_status_with_rowcounts_is_the_return_parameters_block() -> None:
     # The arraydmlrowcounts status carries the counts in the execute's
     # return-parameters block (TTI_RPA), laid out as a real server lays it out

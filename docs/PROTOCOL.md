@@ -5223,6 +5223,16 @@ converts). Verified on 10g/11g/21c/23ai. (A document over the ~32 KB regular-bin
 limit hits the usual streamed-LONG ORA-01461 — the general large-bind limit, not
 XMLType-specific.)
 
+**Serving one** (the Mirror) is the same rule read backwards, and the trap is
+that the column is an ADT by describe while its VALUE is not an object. Every
+client surfaces an XMLType as a string, so a backend hands one over as a `str`;
+it rides the ordinary object frame (§21.2 — toid, object OID, snapshot, version,
+image length, flags) with an **XML image** inside rather than a packed object
+image. Encoding it as an object instead asks a `str` for its type, which is not
+an ORA error but an `AttributeError`: the Mirror answers with an internal fault
+and the client's connection **dies** (`DPY-4011`) rather than receiving an error
+it can act on (seerdb#826).
+
 **Limitation:** Oracle **11g** XMLType *columns* are CLOB-stored with a complex
 binary image whose locator seerdb can't read (a reference-less case —
 python-oracledb requires 12.1+). That image sets a distinguishing flag bit
