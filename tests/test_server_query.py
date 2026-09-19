@@ -3496,6 +3496,53 @@ def test_encode_out_bind_response_thin_roundtrips_via_client() -> None:
     assert v_io.getvalue() == 'hi!'
 
 
+def test_encode_out_bind_response_thin_lob_roundtrips_via_client() -> None:
+    # A LOB-class OUT bind rides as the LOB block, not a DALC (#979): the client
+    # reads it with the reader a fetched LOB column uses, and gets a LOB whose
+    # locator resolves back to the content the Mirror recorded -- which is what
+    # answers the read the client then issues.
+    from seerdb.client.cursor import _assign_out_binds
+    from seerdb.common.datatypes import DB_TYPE_BLOB, DB_TYPE_CLOB, Var
+    from seerdb.common.lob import LOB
+    from seerdb.common.tns import (
+        _LOB_EMIT_LOG,
+        LobEmitLog,
+        ScalarOutBind,
+        decode_packet,
+        encode_out_bind_response_thin,
+    )
+    from seerdb.common.tns_consts import TNS_TYPE_BLOB, TNS_TYPE_CLOB
+
+    _DECODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
+    log = LobEmitLog()
+    _LOB_EMIT_LOG.set(log)
+    try:
+        resp = encode_out_bind_response_thin(
+            [
+                ScalarOutBind('clob content', TNS_TYPE_CLOB),
+                ScalarOutBind(b'blob content', TNS_TYPE_BLOB),
+                ScalarOutBind(None, TNS_TYPE_CLOB),
+            ]
+        )
+    finally:
+        _LOB_EMIT_LOG.set(None)
+    v_clob, v_blob, v_null = Var(DB_TYPE_CLOB), Var(DB_TYPE_BLOB), Var(DB_TYPE_CLOB)
+    bind = [v_clob, v_blob, v_null]
+    result = decode_packet(resp, (0, [], [], bind))
+    assert result[1] == 0  # success OER
+    assert _assign_out_binds(bind, result) == []
+    got_clob, got_blob = v_clob.getvalue(), v_blob.getvalue()
+    assert isinstance(got_clob, LOB)
+    assert isinstance(got_blob, LOB)
+    # A NULL LOB is a single 0x00, so there is nothing to build a LOB from.
+    assert v_null.getvalue() is None
+    # Each locator the client got back is one the Mirror can still resolve, so
+    # the read that follows serves the right value -- a locator it cannot look
+    # up would read as empty rather than error.
+    assert log.content(got_clob.raw) == ('clob content', True)
+    assert log.content(got_blob.raw) == (b'blob content', False)
+
+
 @pytest.mark.parametrize('version', [6, 17])  # 11.2 and 23ai OAC layouts
 def test_parse_exec_reads_an_associative_array_bind(version: int) -> None:
     # An arrayvar bind (#122) carries the ARRAY flag and its capacity in the

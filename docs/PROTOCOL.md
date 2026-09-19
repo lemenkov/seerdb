@@ -2260,6 +2260,24 @@ is what carries the thin `callproc` / `callfunc` / OUT-`Var` flow; passing the
 value with its type + size is also the fix for the `ORA-06502: buffer too small`
 a value-only OUT bind hit.
 
+A **LOB-class OUT bind** is the exception to "a DALC value" above (#979): it
+carries the LOB block, because that is what the client's reader expects. The
+Mirror has no upstream locator to pass along — a passthrough backend reads its
+upstream with `fetch_lobs=False`, so the value arrives already materialised — so
+it **mints** a locator, records the content against it in the session's
+`LobEmitLog`, and writes the block with `encode_lob_locator_thin`, exactly as the
+LOB *column* path does. The read the client then issues is answered from that log
+by locator (§14.5b), so nothing about the read path changes. A NULL LOB is the
+single byte `0x00`.
+
+Getting one **into** the backend needs the matching step: a large LOB IN value
+reaches the Mirror as a temp LOB the client streamed in (§14.2), which the
+passthrough had been binding upstream as plain `str` / `bytes`. That is IN-only —
+a block that writes to the bind fails upstream with `ORA-06502` — so the value is
+registered as a LOB `Var` instead, on an upstream at 12.1 or above. Below that a
+LOB `Var` has no bind encoding at all, so the plain value stays, and an IN OUT LOB
+is simply out of reach on such an upstream.
+
 A **REF CURSOR OUT bind** (`OUT SYS_REFCURSOR`, #483) is returned in that same
 RXD slot but in the inline-describe form above: the backend opens the cursor, the
 Mirror drains its columns + rows into a `CursorResult`, parks the rows on a fresh

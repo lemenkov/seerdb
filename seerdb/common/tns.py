@@ -2685,6 +2685,29 @@ def _encode_out_bind_value(
     # and a native ``encode_sb4`` would render 0 as an empty DALC that reads back
     # as NULL -- python-oracledb then rejects the object-type metadata call with
     # ``DPY-2035`` because its ``ret_val`` came back NULL rather than 0 (#888).
+    if tns_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
+        # A LOB-class OUT bind's value is the LOB block -- a ub4 length, the
+        # locator's ub8 size and ub4 chunk size, then the locator -- and not a
+        # DALC, because the client reads it with the same reader a fetched LOB
+        # column uses (§6.5, #979). Mint a unique locator and remember the
+        # content exactly as the column path does, so the read the client then
+        # issues against it resolves (#888/#962). A NULL LOB is a single 0x00
+        # instead of the whole block.
+        #
+        # This has to sit ahead of the national-charset branch: an NCLOB OUT
+        # bind is a CLOB with csfrm 2, and encoding it as UTF-16BE text would
+        # hand the LOB reader a DALC.
+        if value is None:
+            return bytes([0])
+        Log = _LOB_EMIT_LOG.get()
+        Locator = (
+            Log.record(value, tns_type == TNS_TYPE_CLOB)
+            if Log is not None
+            else _THIN_LOB_LOCATOR
+        )
+        return encode_lob_locator_thin(
+            _lob_value_size(value), with_metadata=True, locator=Locator
+        )
     if csfrm == _CSFRM_NCHAR and isinstance(value, str):
         # National character data travels as UTF-16BE, the same form a
         # national COLUMN uses in a row (_national_wire_value). #826.
