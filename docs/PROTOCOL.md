@@ -5253,6 +5253,34 @@ captured. The status after them must be **generated**: reusing the captured one
 freezes its sequence number, and the client then waits for a reply that never
 matches — a hang, not an error.
 
+### 22.1d A LOB return bind carries the **LOB block** (#985)
+
+`RETURNING ClobCol INTO :b` frames the returned value exactly as a fetched LOB
+column is framed in a row (§14.5b) — a `ub4` block length, the locator's `ub8`
+size and `ub4` chunk size, then the locator as a DALC. Not a DALC on its own.
+A **NULL** LOB is the single byte `0x00` in place of the whole block, and either
+way the per-value `sb4` truncation length follows.
+
+This is the third carrier of that same block, and each one had to learn it
+separately:
+
+| carrier | |
+|---|---|
+| a fetched row | §14.5b |
+| an OUT / IN OUT bind | §6.5 |
+| a DML RETURNING bind | here |
+
+All three fail identically when read as a DALC: the block length is taken for
+the entire value, the size, chunk size and locator stay in the stream, and the
+next byte decodes as a response token. **The number in the error comes from the
+data**, so the same bug reports itself as a different unknown token each time —
+`2` from the ub4 length marker of the size field, `38` from a locator's own
+length byte. That is what makes each instance look like a fresh decoder gap.
+
+An `UPDATE` touching several rows returns one block per row, so a reader that
+mis-measures the first never reaches the second intact — a single-row test
+passes.
+
 ### 22.1c An OBJECT return bind carries the **object frame** (#826)
 
 `RETURNING ObjectCol INTO :b` frames the returned value exactly as an ADT column

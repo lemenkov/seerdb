@@ -37,6 +37,7 @@ from seerdb.common.tns_consts import (
     TNS_FETCH_ORIENTATION_LAST,
     TNS_FETCH_ORIENTATION_RELATIVE,
     TNS_TYPE_ADT,
+    TNS_TYPE_BFILE,
     TNS_TYPE_BLOB,
     TNS_TYPE_CLOB,
     TNS_TYPE_JSON,
@@ -259,6 +260,7 @@ class Cursor(_CursorLogic):
 
         # DML RETURNING ... INTO: write the returned value list onto each Var.
         _assign_return_binds(Bind, Result)
+        _resolve_return_bind_lobs(self._connection, Bind)
 
         # Implicit result sets (#121): queue any DBMS_SQL.RETURN_RESULT cursors
         # for nextset() to fetch on demand.
@@ -789,6 +791,12 @@ def _assign_return_binds(Bind, Result) -> None:
                     [_decode_returned_object(Variable.dbtype, V) for V in Values]
                 )
                 continue
+            if TnsType in _LOB_RETURN_TYPES:
+                # A CLOB / BLOB bind's returned value is already a LOB built by
+                # the reader (#985); the connection is attached, and fetch_lobs
+                # honoured, by _resolve_return_bind_lobs.
+                PerBind.setdefault(Pos, []).append(list(Values))
+                continue
             Column = {'data_type': TnsType, 'charset': UTF8_CHARSET}
             PerBind.setdefault(Pos, []).append(
                 [decode_value(Column, V if V else None) for V in Values]
@@ -844,6 +852,55 @@ def _resolve_nested_cursors(Connection, Row: list) -> list:
             Rows = Connection.fetch_all_rows(Val['cursor_id'], Val['row_format'])
             Out[I] = _build_refcursor_cursor(Connection, Rows or [], Val)
     return Out
+
+
+# The LOB-class types a RETURNING bind can bring back as a LOB object. JSON and
+# VECTOR are LOB-class too but never surface as LOBs -- their image decodes to a
+# Python value -- and they are handled ahead of this (#985).
+_LOB_RETURN_TYPES = (TNS_TYPE_CLOB, TNS_TYPE_BLOB, TNS_TYPE_BFILE)
+
+
+def _return_bind_lobs(Bind) -> list:
+    """Every LOB a RETURNING bind brought back, paired with the Var holding it.
+
+    A RETURNING Var holds a LIST per iteration, not a single value, so these
+    cannot go through _out_bind_lobs (#985)."""
+    from seerdb.common.lob import LOB
+
+    if not isinstance(Bind, list):
+        return []
+    Out = []
+    for B in Bind:
+        Variable = _bind_var(B)
+        if Variable is None:
+            continue
+        for Bucket in _return_value_lists(Variable):
+            for Index, Value in enumerate(Bucket):
+                if isinstance(Value, LOB):
+                    Out.append((Bucket, Index, Value))
+    return Out
+
+
+def _return_value_lists(Variable) -> list:
+    # The per-iteration value lists a RETURNING Var holds: `_value` is the first
+    # iteration's list, and `_iteration_values` the whole set when an array DML
+    # returned more than one.
+    Lists = Variable._iteration_values or (
+        [Variable._value] if isinstance(Variable._value, list) else []
+    )
+    return [L for L in Lists if isinstance(L, list)]
+
+
+def _resolve_return_bind_lobs(Connection, Bind) -> None:
+    # Attach the connection to every LOB a RETURNING bind returned and, unless
+    # the connection asks for LOB objects, materialise it -- the same rule
+    # _resolve_lobs applies to a fetched cell. The async cursor does the awaited
+    # half itself.
+    KeepLobs = getattr(Connection, 'fetch_lobs', False)
+    for Bucket, Index, Value in _return_bind_lobs(Bind):
+        Value._connection = Connection
+        if not KeepLobs:
+            Bucket[Index] = Value.read()
 
 
 def _bind_var(B) -> 'Var | None':

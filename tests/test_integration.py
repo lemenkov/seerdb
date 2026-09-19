@@ -3710,6 +3710,89 @@ class ConnectAttributeIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class LOBReturningIntegration(_IntegrationBase):
+    """`DML ... RETURNING <lob column> INTO :b` (#985).
+
+    The returned value is the LOB block a fetched column carries -- a block
+    length, the locator's size and chunk size, then the locator -- not a DALC.
+    Read as a DALC the block length was taken for the whole value and the rest
+    left in the stream, where its next byte decoded as a response token, so the
+    number came from the data. Same misunderstanding as the OUT bind in #978,
+    reached through the other reader. Against a REAL server, no Mirror.
+    """
+
+    TABLE = 'PYORACLE_LOBRET'
+
+    def setUp(self):
+        super().setUp()
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('a LOB Var bind needs the 12.1+ OAC (#902)')
+        self.conn.autocommit = False
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, c CLOB, b BLOB)')
+
+    def tearDown(self):
+        try:
+            self.conn.rollback()
+        except Exception:
+            pass
+        super().tearDown()
+
+    def test_returning_a_clob(self):
+        Var = self.cur.var(seerdb.DB_TYPE_CLOB)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} (n, c) VALUES (1, :a) RETURNING c INTO :b',
+            ['the returned clob', Var],
+        )
+        self.assertEqual([V.read() for V in Var.getvalue()], ['the returned clob'])
+
+    def test_returning_a_blob(self):
+        Var = self.cur.var(seerdb.DB_TYPE_BLOB)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} (n, b) VALUES (1, :a) RETURNING b INTO :b',
+            [b'the returned blob', Var],
+        )
+        self.assertEqual([V.read() for V in Var.getvalue()], [b'the returned blob'])
+
+    def test_returning_several_lobs_from_one_update(self):
+        # An UPDATE touching several rows returns one value per row, so the
+        # reader has to walk the whole list in the LOB framing, not just the
+        # first -- a per-row desync only shows from the second value on.
+        for N, Text in enumerate(('first', 'second', 'third'), start=1):
+            self.cur.execute(
+                f'INSERT INTO {self.TABLE} (n, c) VALUES (:1, :2)', [N, Text]
+            )
+        Var = self.cur.var(seerdb.DB_TYPE_CLOB)
+        self.cur.execute(
+            f'UPDATE {self.TABLE} SET n = n + 10 RETURNING c INTO :v', [Var]
+        )
+        self.assertEqual(
+            sorted(V.read() for V in Var.getvalue()), ['first', 'second', 'third']
+        )
+
+    def test_returning_a_null_lob(self):
+        Var = self.cur.var(seerdb.DB_TYPE_CLOB)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} (n, c) VALUES (1, NULL) RETURNING c INTO :v',
+            [Var],
+        )
+        self.assertEqual(Var.getvalue(), [None])
+
+    def test_fetch_lobs_false_materialises_a_returned_lob(self):
+        self.conn.rollback()
+        with _connect(fetch_lobs=False) as Conn:
+            Cur = Conn.cursor()
+            if Conn.field_version < FIELD_VERSION_12_1:
+                self.skipTest('a LOB Var bind needs the 12.1+ OAC (#902)')
+            Var = Cur.var(seerdb.DB_TYPE_CLOB)
+            Cur.execute(
+                f'INSERT INTO {self.TABLE} (n, c) VALUES (2, :a) RETURNING c INTO :b',
+                ['materialised', Var],
+            )
+            self.assertEqual(Var.getvalue(), ['materialised'])
+            Conn.rollback()
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class ObjectReturningIntegration(_IntegrationBase):
     """`DML ... RETURNING <object column> INTO :b` (#826).
 
@@ -4071,6 +4154,34 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                 [Var],
             )
             self.assertEqual(await Var.getvalue().aread(), 'A' * 50000 + 'B' * 5)
+        finally:
+            await Conn.close()
+
+    async def test_returning_a_clob(self):
+        # The async twin of LOBReturningIntegration (#985): the read that
+        # materialises a returned LOB is awaited. 12.1+ only, like the sync class.
+        Table = 'PYO_ASYNC_LOBRET'
+        Conn = await seerdb.connect_async(**{**self._kwargs(), 'autocommit': False})
+        try:
+            if Conn.field_version < FIELD_VERSION_12_1:
+                self.skipTest('a LOB Var bind needs the 12.1+ OAC (#902)')
+            Cur = Conn.cursor()
+            try:
+                await Cur.execute(f'DROP TABLE {Table}')
+            except seerdb.DatabaseError:
+                pass
+            await Cur.execute(f'CREATE TABLE {Table} (n NUMBER, c CLOB)')
+            try:
+                Var = Cur.var(seerdb.DB_TYPE_CLOB)
+                await Cur.execute(
+                    f'INSERT INTO {Table} (n, c) VALUES (1, :a) RETURNING c INTO :b',
+                    ['async returned clob', Var],
+                )
+                Values = [await V.aread() for V in Var.getvalue()]
+                self.assertEqual(Values, ['async returned clob'])
+                await Conn.rollback()
+            finally:
+                await Cur.execute(f'DROP TABLE {Table}')
         finally:
             await Conn.close()
 
