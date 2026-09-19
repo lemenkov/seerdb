@@ -871,6 +871,7 @@ def serve_session(
                 current_lob,
                 object_lobs,
                 current_object_lob,
+                lob_emit_log,
             )
         elif body[1] == TNS_FUNC_REEXECUTE_AND_FETCH:
             # The rows carry no OACs -- the cursor's opening execute declared the
@@ -1889,6 +1890,27 @@ class _TempLobs:
         return out
 
 
+def _emitted_lob(
+    lob_emit_log: 'LobEmitLog | None', locator: bytes
+) -> tuple[str | bytes, bool] | None:
+    """The content the Mirror served under this column-LOB locator, if it is one.
+
+    ``None`` for a temp-LOB locator, an object-LOB locator, or the fixed
+    placeholder an OCI client sees -- those keep their own paths. The log is
+    typed ``object`` because it holds whatever a backend produced, so anything
+    that is not the str / bytes a LOB column yields is treated as not found
+    rather than trusted into the framing code."""
+    if lob_emit_log is None:
+        return None
+    entry = lob_emit_log.content(locator)
+    if entry is None:
+        return None
+    value, is_clob = entry
+    if not isinstance(value, (str, bytes)):
+        return None
+    return (value, is_clob)
+
+
 def _answer_lobops(
     stream: PacketStream,
     body: bytes,
@@ -1897,6 +1919,7 @@ def _answer_lobops(
     current_lob: tuple[bytes, bool] | None = None,
     object_lobs: list[tuple[bytes, bool]] | None = None,
     current_object_lob: tuple[bytes, bool] | None = None,
+    lob_emit_log: LobEmitLog | None = None,
 ) -> tuple[
     list[tuple[bytes, bool]],
     tuple[bytes, bool] | None,
@@ -1934,9 +1957,23 @@ def _answer_lobops(
         )
         return lobs, current_lob, current_object_lob
     if request.kind == 'get_length':
-        # `lob.size()`. A temp LOB the client created is measured from what it
-        # has streamed in; a CLOB counts CHARACTERS, and its buffer holds
-        # UTF-16BE, so two bytes per character (#826).
+        # `lob.size()`. A FETCHED column LOB is measured from what the Mirror
+        # served under that locator: this used to consult the temp-LOB store
+        # alone, which knows nothing about a column locator and so reported 0 --
+        # every size() on a fetched LOB came back zero (#826).
+        emitted = _emitted_lob(lob_emit_log, request.locator)
+        if emitted is not None:
+            # The log keeps the value in its own unit already -- a `str` for a
+            # CLOB, whose length IS the character count the client asks for, and
+            # `bytes` for a BLOB.
+            value, _is_clob = emitted
+            stream.write_packet(
+                TNS_DATA, encode_lobops_length(request.locator, len(value))
+            )
+            return lobs, current_lob, current_object_lob
+        # A temp LOB the client created is measured from what it has streamed
+        # in; a CLOB counts CHARACTERS, and its buffer holds UTF-16BE, so two
+        # bytes per character (#826).
         content = temp_lobs.content(request.locator)
         unit = 1 if temp_lobs.is_blob(request.locator) else 2
         stream.write_packet(
@@ -1964,6 +2001,35 @@ def _answer_lobops(
         # must echo the client's OWN locator, not the column placeholder (#826).
         content = temp_lobs.content(temp_key)
         is_clob = not temp_lobs.is_blob(temp_key)
+        unit = 2 if is_clob else 1
+        total = len(content) // unit
+        start = max(request.offset - 1, 0)
+        count = (
+            total - start if request.amount <= 0 else min(request.amount, total - start)
+        )
+        count = max(count, 0)
+        stream.write_packet(
+            TNS_DATA,
+            encode_lob_read_response_thin(
+                content[start * unit : (start + count) * unit],
+                is_clob=is_clob,
+                locator=request.locator,
+            ),
+        )
+        return lobs, current_lob, current_object_lob
+    emitted = _emitted_lob(lob_emit_log, request.locator)
+    if emitted is not None:
+        # A READ of a column LOB the Mirror emitted, answered from the content
+        # it served under THAT locator. The queue below is row-major and assumes
+        # the client reads every LOB exactly once in the order the locators went
+        # out; a client that reads them in another order, twice, or not at all
+        # got another row's content or nothing (#826). Every locator is unique
+        # and its content is already recorded (#888), so the order stops
+        # mattering.
+        value, is_clob = emitted
+        # A CLOB rides UTF-16BE on the wire and counts CHARACTERS, so the two
+        # bytes per unit below are what make an offset/amount read land right.
+        content = value.encode('utf-16-be') if isinstance(value, str) else value
         unit = 2 if is_clob else 1
         total = len(content) // unit
         start = max(request.offset - 1, 0)
