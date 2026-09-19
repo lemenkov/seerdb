@@ -382,6 +382,53 @@ def test_parse_auth_new_password_is_quiet_when_there_is_none() -> None:
     assert parse_auth_new_password(b'\x03\x76\x01garbage') is None
 
 
+def test_app_context_entries_survive_the_sorted_pairs() -> None:
+    # `connect(appcontext=[(ns, attr, value), ...])` sends each entry as three
+    # pairs REPEATING the same three keys, so the dict form of the message keeps
+    # only the last -- and decode_kv SORTS the pairs, so the wire interleaving is
+    # gone as well. What survives is each key's own order, because the sort is
+    # stable, which is what makes grouping-and-zipping correct (#826).
+    #
+    # These pairs are exactly what a live oracledb 4.0.1 connect produced,
+    # captured off the Mirror rather than imagined.
+    from seerdb.server.auth import _group_app_context
+
+    pairs = [
+        (b'AUTH_APPCTX_ATTR\x00', b'ATTR1'),
+        (b'AUTH_APPCTX_ATTR\x00', b'ATTR2'),
+        (b'AUTH_APPCTX_ATTR\x00', b'ATTR3'),
+        (b'AUTH_APPCTX_NSPACE\x00', b'CLIENTCONTEXT'),
+        (b'AUTH_APPCTX_NSPACE\x00', b'CLIENTCONTEXT'),
+        (b'AUTH_APPCTX_NSPACE\x00', b'CLIENTCONTEXT'),
+        (b'AUTH_APPCTX_VALUE\x00', b'VALUE1'),
+        (b'AUTH_APPCTX_VALUE\x00', b'VALUE2'),
+        (b'AUTH_APPCTX_VALUE\x00', b'VALUE3'),
+    ]
+    assert _group_app_context(pairs) == [
+        ('CLIENTCONTEXT', 'ATTR1', 'VALUE1'),
+        ('CLIENTCONTEXT', 'ATTR2', 'VALUE2'),
+        ('CLIENTCONTEXT', 'ATTR3', 'VALUE3'),
+    ]
+
+
+def test_app_context_ignores_everything_else_in_the_auth() -> None:
+    # The auth message is mostly NOT application context; a login with none at
+    # all must come back empty rather than mis-pair whatever else is there.
+    from seerdb.server.auth import _group_app_context
+
+    assert _group_app_context([]) == []
+    assert (
+        _group_app_context(
+            [
+                (b'AUTH_PASSWORD', b'ABCDEF'),
+                (b'SESSION_CLIENT_DRIVER_NAME', b'python-oracledb thn : 4.0.1'),
+                (b'AUTH_ALTER_SESSION', b"ALTER SESSION SET TIME_ZONE='+02:00'\x00"),
+            ]
+        )
+        == []
+    )
+
+
 # --- the 12.1+ PBKDF2 challenge (#829) -----------------------------------------
 
 
