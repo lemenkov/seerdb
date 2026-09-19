@@ -12036,13 +12036,10 @@ def _member_lob_contents(Value: object, Attr: dict) -> list[tuple[bytes, bool]]:
     return []
 
 
-def _encode_object_bind_value(Obj: 'DbObject') -> bytes:
-    # The bind value framing (python-oracledb write_dbobject): the constructed
-    # toid, an empty object OID, zero snapshot/version, the image length, the
-    # TOP_LEVEL flags, then the image.
-    Typ = Obj._dbtype
-    Toid = _OBJ_TOID_PREFIX + Typ.oid + _OBJ_EXTENT_OID
-    Image = encode_object_image(Obj)
+def _encode_object_frame(Toid: bytes, Image: bytes) -> bytes:
+    # The frame every populated ADT value rides in, whatever the image inside it
+    # is: the constructed toid, an empty object OID, zero snapshot/version, the
+    # image length, the TOP_LEVEL flags, then the image.
     return (
         _obj_two_lengths(Toid)
         + _obj_two_lengths(b'')  # object OID (empty for new)
@@ -12051,7 +12048,15 @@ def _encode_object_bind_value(Obj: 'DbObject') -> bytes:
         + encode_sb4(len(Image))  # image length
         + encode_sb4(_OBJ_TOP_LEVEL)  # flags
         + _bytes_with_length(Image)
-    )  # the image
+    )
+
+
+def _encode_object_bind_value(Obj: 'DbObject') -> bytes:
+    # The bind value framing (python-oracledb write_dbobject).
+    Typ = Obj._dbtype
+    return _encode_object_frame(
+        _OBJ_TOID_PREFIX + Typ.oid + _OBJ_EXTENT_OID, encode_object_image(Obj)
+    )
 
 
 def encode_object_column_value(Value: object, TypeOid: bytes = b'') -> bytes:
@@ -12064,7 +12069,19 @@ def encode_object_column_value(Value: object, TypeOid: bytes = b'') -> bytes:
     length, the TOP_LEVEL flags, then the packed image. A NULL object still carries
     the whole frame with a zero image-length gate (and the column's type toid when
     known), exactly as Oracle does, so the row stream stays in sync — a bare 0x00
-    DALC would desync the reader (#116)."""
+    DALC would desync the reader (#116).
+
+    An **XMLType** column is an ADT by describe (type 109, `SYS.XMLTYPE`) but its
+    value is a document, not an object: a backend hands it over as a `str`, since
+    that is what every client surfaces it as. It rides the same frame with an XML
+    image inside (§21.10) rather than a packed object image -- encoding it as an
+    object asked a `str` for its `_dbtype` and took the session down with it
+    (#826)."""
+    if isinstance(Value, str):
+        from seerdb.common.dbobject import encode_xmltype
+
+        Toid = _OBJ_TOID_PREFIX + TypeOid + _OBJ_EXTENT_OID if TypeOid else b''
+        return _encode_object_frame(Toid, encode_xmltype(Value))
     if Value is not None:
         return _encode_object_bind_value(cast('DbObject', Value))
     Toid = _OBJ_TOID_PREFIX + TypeOid + _OBJ_EXTENT_OID if TypeOid else b''
