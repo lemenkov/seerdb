@@ -2279,6 +2279,20 @@ def _answer_query(
             ),
         )
         return lobs
+    # Which backend call a statement ends up in is the first thing worth knowing
+    # when a reply is wrong, and it is not obvious from the SQL: a PL/SQL block
+    # whose body happens to contain `RETURNING ... INTO` used to land in the
+    # RETURNING path and hang there (#826). One line per statement, so no guard.
+    logger.debug(
+        'execute dispatch: parse_only=%s return_binds=%s iterations=%s '
+        'bind_rows=%s cached_id=%s sql=%.60r',
+        request.parse_only,
+        sorted(request.return_binds) if request.return_binds else [],
+        request.iterations,
+        len(request.bind_rows),
+        reused_id,
+        sql,
+    )
     try:
         if request.parse_only:
             # `cursor.parse()`: parse the statement, do NOT run it (#826). It

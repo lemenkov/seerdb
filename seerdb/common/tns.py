@@ -1531,12 +1531,47 @@ def encode_rows(
     return header + bytes(body)
 
 
+# The cell types whose wire form is more than a DALC: a LOB-class locator, a
+# prefetched image, an object image, a nested cursor, or a column a cached
+# cursor is still reading inline as LONG. These are the ones worth tracing.
+_FRAMED_CELL_TYPES = frozenset(
+    (
+        TNS_TYPE_VECTOR,
+        TNS_TYPE_JSON,
+        TNS_TYPE_REFCURSOR,
+        TNS_TYPE_ADT,
+        TNS_TYPE_CLOB,
+        TNS_TYPE_BLOB,
+        TNS_TYPE_BFILE,
+    )
+)
+
+
 def _thin_column_value(value: object, col: 'ColumnMeta') -> bytes:
     # One row value for the thin path. A VECTOR (#887) or a native JSON column
     # (#826) carries its image inline; everything else goes through the type-only
     # encoder. The column is needed for the element format, so an INT8 or FLOAT64
     # vector keeps the width it was declared with rather than being re-encoded as
     # float32.
+    if (
+        col.data_type in _FRAMED_CELL_TYPES
+        or col.is_oson
+        or col.inline_long_csfrm is not None
+    ) and logger.isEnabledFor(logging.DEBUG):
+        # This runs per column per row, so the cheap structural test comes first
+        # and `isEnabledFor` only for the cells that can actually be mis-framed.
+        # A NUMBER or VARCHAR cell is a DALC and has never desynced a row; every
+        # desync this codebase has had was a framed cell, and tracing only those
+        # keeps an ordinary fetch's encode cost where it was. The fields logged
+        # are exactly what the branches below dispatch on.
+        logger.debug(
+            'row encode: col=%s type=%s is_oson=%s inline_long=%s value=%s',
+            col.name,
+            col.data_type,
+            col.is_oson,
+            col.inline_long_csfrm,
+            type(value).__name__,
+        )
     if col.data_type == TNS_TYPE_VECTOR and value is not None:
         return encode_prefetched_lob_value_thin(
             encode_vector(_vector_as(value, col.vector_format))
@@ -4081,6 +4116,23 @@ def _read_lob_column_parts(
             Image = bytes(Locator)
         if not isinstance(_Locator, list):
             Behind = bytes(_Locator)
+    if logger.isEnabledFor(logging.DEBUG):
+        # Guarded for the same reason as the encoder: per LOB cell, per row. The
+        # pair that matters is `inline_image` (did the caller expect the
+        # prefetched form) against `image` (was it actually there) -- a mismatch
+        # is what desyncs a row or empties a read (#887/#826/#959).
+        logger.debug(
+            'row decode LOB: num_bytes=%s want_inline=%s image=%s locator=%s',
+            NumBytes,
+            inline_image,
+            None if Image is None else len(Image),
+            # In the two-field form the locator is the one BEHIND the image;
+            # `Locator` still holds the image there, and reporting its length
+            # twice would read as a locator that shrank to the image's size.
+            len(Behind)
+            if Behind is not None
+            else (None if isinstance(Locator, list) else len(Locator)),
+        )
     if isinstance(Locator, list):  # 0x00 / 0xFF DALC → empty / null
         return (None, Tail, Image, Behind)
     return (bytes(Locator), Tail, Image, Behind)
