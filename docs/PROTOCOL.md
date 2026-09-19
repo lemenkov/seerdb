@@ -2175,6 +2175,35 @@ value per OUT / IN OUT bind **in bind order** (IN binds contribute nothing):
 - **Scalar** OUT value: a DALC blob (decoded by the bind's declared type) plus
   a trailing 1-byte indicator (`0x00` = present).
   e.g. NUMBER `10` → `02 c1 0b 00`, VARCHAR `"hi!"` → `03 68 69 21 00`.
+- **LOB-class** OUT value (CLOB / NCLOB / BLOB / JSON / VECTOR, #978): **not a
+  DALC.** It is the LOB column framing of §22.1b, byte for byte — the block
+  length, the locator's `ub8` size and `ub4` chunk size, then the locator as a
+  DALC — followed by the same `ub4` return code every OUT value carries.
+  Measured on a live 23ai returning an IN OUT `CLOB` a block had appended to:
+
+  ```
+  07                     TTI_RXD
+  01 28                  ub4 block length = 40
+  02 c3 55               ub8 size         = 50005
+  02 1f c4               ub4 chunk size   = 8132
+  28 <40 bytes>          DALC locator
+  00                     ub4 return code
+  ```
+
+  A NULL LOB is the single byte `0x00` instead of the whole block, again plus
+  the return code. Reading any of this as a DALC takes the block length for the
+  entire value and leaves the size, chunk size and locator in the stream, whose
+  next byte then decodes as a response token — the `02` above surfaced as
+  "no decoder for response token 2". Note this is the framing a **bind** gets
+  even though the value never rode in a row: the size and chunk size are always
+  present here, unlike a fetched column, where a live server sends the bare
+  locator to some clients (§22.1b).
+
+  The bind is recognised by its **declared type**, so a bind promoted to a
+  temp-LOB locator on the way out (§14.2) has to keep pointing back at the
+  `Var` it replaced — otherwise the reply has neither a type to decode against
+  nor a destination.
+
 - **REF CURSOR** OUT value: a 1-byte length, then an inline describe of the
   cursor's result set (the same per-column metadata *and trailer* as a `TTI_DCB`,
   §6.4), then the nested cursor id (`ub2`) and the per-value **`ub4` return code**

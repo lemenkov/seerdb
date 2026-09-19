@@ -3320,6 +3320,38 @@ def _is_object_bind(Bind: object) -> bool:
     return isinstance(Bind, Var) and Bind.dbtype.tns_type == TNS_TYPE_ADT
 
 
+def _lob_bind_type(Bind: object) -> int | None:
+    # The LOB-class TNS type an OUT value for this bind arrives as, or None when
+    # the bind is not LOB-class (#978). Either a Var the caller typed
+    # (cursor.var(DB_TYPE_CLOB / BLOB / NCLOB / JSON / VECTOR)) or the temp-LOB
+    # marker such a Var was promoted to on the way out (#902).
+    if isinstance(Bind, TempLob):
+        return TNS_TYPE_BLOB if Bind.is_blob else TNS_TYPE_CLOB
+    if isinstance(Bind, Var) and Bind.dbtype.tns_type in _LOB_DATA_TYPES:
+        return Bind.dbtype.tns_type
+    return None
+
+
+def _read_lob_out_bind(Rest: bytes, DataType: int) -> tuple[object, bytes]:
+    # A LOB-class OUT / IN OUT bind's value. The server sends the same block a
+    # fetched LOB column carries -- a ub4 block length, the locator's ub8 size
+    # and ub4 chunk size, then the locator itself (§22.1b) -- so it reads with
+    # the row reader rather than as a DALC. Reading it as a DALC took the block
+    # length for the whole value and left the rest of the block in the stream,
+    # where its first byte then decoded as a response token (#978).
+    from seerdb.common.lob import LOB
+
+    (Locator, Rest, Image) = _read_lob_column_full(
+        Rest, inline_image=DataType in _PREFETCHED_IMAGE_TYPES
+    )
+    (_, Rest) = decode_ub4(Rest)  # per-value return code
+    if Locator is None and Image is None:
+        return (None, Rest)
+    if Image is not None:
+        return (LOB(DataType, Locator or b'', prefetched=Image), Rest)
+    return (LOB(DataType, Locator or b''), Rest)
+
+
 def _read_iov(
     Data: bytes, Binds: list | None = None
 ) -> tuple[list[int], list[object], bytes]:
@@ -3377,6 +3409,9 @@ def _read_iov(
                     (_, Rest) = decode_ub4(Rest)  # per-element return code
                     Elements.append(b'' if Val == [] else bytes(Val))
                 OutValues.append({'_array': True, 'values': Elements})
+            elif (LobType := _lob_bind_type(Bind)) is not None:
+                (LobValue, Rest) = _read_lob_out_bind(Rest, LobType)
+                OutValues.append(LobValue)
             else:
                 (Val, Rest) = decode_dalc(Rest)
                 # The per-value return code is a variable-length integer, not a

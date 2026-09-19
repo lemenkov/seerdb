@@ -2812,6 +2812,91 @@ class LOBObjectIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class LOBOutBindIntegration(_IntegrationBase):
+    """A LOB-class Var bound OUT / IN OUT to a PL/SQL block (#978).
+
+    The value the server sends back is the LOB framing a fetched LOB column
+    uses -- a block length, the locator's size and chunk size, then the locator
+    -- not the DALC every other scalar OUT bind carries. Reading it as a DALC
+    left most of the block in the stream, where its next byte decoded as a
+    bogus response token, so EVERY LOB OUT bind failed.
+
+    12.1+ only: below that the CLOB / BLOB bind itself has no encoding (#902),
+    which is a separate gap -- the block never gets as far as a reply.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('a LOB Var bind needs the 12.1+ temp-LOB path (#902)')
+
+    def test_out_clob_var(self):
+        # Pure OUT: the block creates the LOB, the bind brings back its locator.
+        Var = self.cur.var(seerdb.DB_TYPE_CLOB)
+        self.cur.execute("BEGIN :d := TO_CLOB(LPAD('x', 200, 'x')); END;", [Var])
+        self.assertEqual(Var.getvalue().read(), 'x' * 200)
+
+    def test_out_clob_var_left_null(self):
+        # A block that assigns NULL sends a one-byte block, not a locator.
+        Var = self.cur.var(seerdb.DB_TYPE_CLOB)
+        self.cur.execute('BEGIN :d := NULL; END;', [Var])
+        self.assertIsNone(Var.getvalue())
+
+    def test_inout_clob_var_small(self):
+        # Under the 32767-byte promotion threshold, so the bind stays a Var.
+        Var = self.cur.var(seerdb.DB_TYPE_CLOB)
+        Var.setvalue(0, 'small')
+        self.cur.execute("BEGIN DBMS_LOB.WRITEAPPEND(:d, 3, 'END'); END;", [Var])
+        self.assertEqual(Var.getvalue().read(), 'smallEND')
+
+    def test_inout_clob_var_over_the_promotion_threshold(self):
+        # Over it, so the Var is promoted to a temp-LOB marker on the way out
+        # (#902). The marker has to carry the Var, or the returned value has
+        # neither a type to decode against nor anywhere to land.
+        Var = self.cur.var(seerdb.DB_TYPE_CLOB)
+        Var.setvalue(0, 'A' * 50000)
+        self.cur.execute(
+            """
+            DECLARE t_Clob CLOB;
+            BEGIN
+                t_Clob := :d;
+                DBMS_LOB.COPY(:d, t_Clob, 50000);
+                DBMS_LOB.WRITEAPPEND(:d, 5, 'BBBBB');
+            END;""",
+            [Var],
+        )
+        Value = Var.getvalue().read()
+        self.assertEqual(len(Value), 50005)
+        self.assertEqual(Value, 'A' * 50000 + 'B' * 5)
+
+    def test_inout_blob_var_over_the_promotion_threshold(self):
+        Var = self.cur.var(seerdb.DB_TYPE_BLOB)
+        Var.setvalue(0, b'L' * 52345)
+        self.cur.execute(
+            """
+            DECLARE t_Blob BLOB;
+            BEGIN
+                t_Blob := :d;
+                DBMS_LOB.COPY(:d, t_Blob, 52345);
+                DBMS_LOB.WRITEAPPEND(:d, 6, '515151515151');
+            END;""",
+            [Var],
+        )
+        self.assertEqual(Var.getvalue().read(), b'L' * 52345 + b'Q' * 6)
+
+    def test_fetch_lobs_false_materialises_an_out_bind(self):
+        # `fetch_lobs=False` applies to an OUT bind's LOB the same way it does
+        # to a fetched cell.
+        with _connect(fetch_lobs=False) as Conn:
+            Cur = Conn.cursor()
+            if Conn.field_version < FIELD_VERSION_12_1:
+                self.skipTest('a LOB Var bind needs the 12.1+ temp-LOB path (#902)')
+            Var = Cur.var(seerdb.DB_TYPE_CLOB)
+            Cur.execute("BEGIN :d := TO_CLOB('materialised'); END;", [Var])
+            self.assertEqual(Var.getvalue(), 'materialised')
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class BooleanIntegration(_IntegrationBase):
     # Native SQL BOOLEAN columns, 23ai+ (#54, TNS type 252). Skipped on servers
     # without the type (21c/11g reject the column with ORA-00902).
@@ -3961,6 +4046,31 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                 await Conn.rollback()
             finally:
                 await Cur.execute(f'DROP TABLE {Table}')
+        finally:
+            await Conn.close()
+
+    async def test_inout_clob_var(self):
+        # The async twin of LOBOutBindIntegration (#978): a LOB OUT bind's value
+        # arrives in the LOB framing, and the read that materialises it is
+        # awaited. 12.1+ only, like the sync class.
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            if Conn.field_version < FIELD_VERSION_12_1:
+                self.skipTest('a LOB Var bind needs the 12.1+ temp-LOB path (#902)')
+            Cur = Conn.cursor()
+            Var = Cur.var(seerdb.DB_TYPE_CLOB)
+            Var.setvalue(0, 'A' * 50000)
+            await Cur.execute(
+                """
+                DECLARE t_Clob CLOB;
+                BEGIN
+                    t_Clob := :d;
+                    DBMS_LOB.COPY(:d, t_Clob, 50000);
+                    DBMS_LOB.WRITEAPPEND(:d, 5, 'BBBBB');
+                END;""",
+                [Var],
+            )
+            self.assertEqual(await Var.getvalue().aread(), 'A' * 50000 + 'B' * 5)
         finally:
             await Conn.close()
 

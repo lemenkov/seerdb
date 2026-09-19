@@ -54,14 +54,17 @@ class TempLob:
     The OAC announces a fixed LOB buffer size, not the value's byte budget --
     python-oracledb sends its DB_TYPE buffer_size_factor for every temp-LOB bind
     regardless of the value, and a size of 0 makes the server bind NULL (#903).
-    So the marker carries only the locator and its kind.
+    So the marker carries only the locator and its kind -- plus, when the value
+    came from a `Var` the marker replaced on the bind list, that `Var`, so an
+    OUT / IN OUT value still has somewhere to be written back to (#978).
     """
 
-    __slots__ = ('locator', 'is_blob')
+    __slots__ = ('locator', 'is_blob', 'var')
 
-    def __init__(self, locator: bytes, is_blob: bool):
+    def __init__(self, locator: bytes, is_blob: bool, var: object = None):
         self.locator = locator
         self.is_blob = is_blob
+        self.var = var
 
     def __repr__(self) -> str:
         kind = 'BLOB' if self.is_blob else 'CLOB'

@@ -15,6 +15,7 @@ from seerdb.client.cursor import (
     _col_annotations,
     _column_description,
     _extract_implicit_results,
+    _out_bind_lobs,
     _resolve_parameters,
 )
 from seerdb.common.datatypes import TempLob, Var
@@ -130,7 +131,9 @@ class AsyncCursor(_CursorLogic):
                 )
                 if Payload:
                     await Conn.write_temp_lob(Locator, Payload, is_blob=IsBlob)
-                Out.append(TempLob(Locator, IsBlob))
+                # The Var rides on the marker so an IN OUT LOB bind still has a
+                # type to decode against and a place to land (#978).
+                Out.append(TempLob(Locator, IsBlob, V))
             else:
                 Out.append(V)
         return Out
@@ -212,6 +215,16 @@ class AsyncCursor(_CursorLogic):
                 Marker['cursor_id'], Marker['row_format']
             )
             Variable._value = await self._build_refcursor(Rows, Marker)
+        # A LOB-class OUT bind's value (#978): the async half of the sync
+        # _resolve_out_bind_lobs -- same rule, awaited read.
+        from seerdb.common.lob import _DECODED_IMAGE_TYPES
+
+        KeepLobs = getattr(self._connection, 'fetch_lobs', False)
+        for Variable in _out_bind_lobs(Bind):
+            Variable._value._connection = self._connection
+            if KeepLobs and Variable._value.data_type not in _DECODED_IMAGE_TYPES:
+                continue
+            Variable._value = await Variable._value.aread()
 
         # DML RETURNING ... INTO: write the returned value list onto each Var.
         _assign_return_binds(Bind, Result)
