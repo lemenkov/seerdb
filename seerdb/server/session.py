@@ -998,10 +998,27 @@ def serve_session(
         elif body[1] == TNS_FUNC_TPC_TXN_SWITCH:
             _answer_sessionless_switch(stream, backend, body, field_version)
         elif body[1] == TTI_PING:
-            # A keepalive / pool health check (conn.ping()): no state to touch,
-            # just acknowledge with a success status so the client round-trip
-            # completes instead of hanging.
-            stream.write_packet(TNS_DATA, encode_status(0))
+            # A keepalive / pool health check (conn.ping()). RELAY it when the
+            # backend can be pinged: answering locally makes the Mirror report
+            # healthy while the database behind it is gone, which is the one
+            # thing a health check exists to catch. A backend without the hook
+            # keeps the local acknowledgement, and a refusal comes back as the
+            # ORA error the client can act on (#826).
+            ping = getattr(backend, 'ping', None)
+            if ping is None:
+                stream.write_packet(TNS_DATA, encode_status(0))
+            else:
+                try:
+                    ping()
+                except BackendError as err:
+                    stream.write_packet(
+                        TNS_DATA, encode_error(err.ora_code, err.ora_message)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning('backend ping failed: %s', exc)
+                    stream.write_packet(TNS_DATA, _backend_fault_error(exc))
+                else:
+                    stream.write_packet(TNS_DATA, encode_status(0))
         elif body[1] == TTI_AUTH:
             # A post-login TTI_AUTH is a password change (#21/#486): it reuses the
             # login session key, so decrypt the old / new passwords with conn_key

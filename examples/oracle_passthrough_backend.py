@@ -169,6 +169,19 @@ class OraclePassthroughBackend:
             if key in ('program', 'machine', 'terminal', 'osuser')
         }
 
+    def ping(self) -> None:
+        """Prove the UPSTREAM session is alive, not just this process (#826).
+
+        A pool's health check is asking whether the database is reachable; a
+        Mirror that answers from memory would keep handing out a connection
+        whose upstream had gone away.
+        """
+        assert self._conn is not None  # authenticate() ran before this
+        try:
+            self._conn.ping()
+        except seerdb.DatabaseError as exc:
+            raise _relay_error(exc) from exc
+
     def set_app_context(self, entries: list[tuple[str, str, str]]) -> None:
         """Apply the application context the client declared at connect (#826).
 
