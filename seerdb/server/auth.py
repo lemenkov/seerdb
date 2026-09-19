@@ -539,6 +539,36 @@ def parse_auth_app_context(
     return _group_app_context(pairs)
 
 
+_CONNECT_ATTR_KEYS = {
+    b'SESSION_CLIENT_DRIVER_NAME': 'driver_name',
+    b'AUTH_ORA_EDITION': 'edition',
+}
+
+
+def parse_auth_connect_attrs(
+    payload: bytes, field_version: int = FIELD_VERSION_11_2
+) -> dict[str, str]:
+    """Connect-time attributes that ride in the login AUTH (#826).
+
+    The driver banner and the edition arrive HERE, not in the OSESSKEY the
+    identity comes from -- so a backend can only honour them if it has held its
+    upstream connect until after this message. Only the ones actually sent are
+    returned.
+
+    Never raises: a malformed value must not fail an otherwise good login.
+    """
+    try:
+        _subtype, _user, kvs = _parse_fun_auth(payload, field_version)
+    except Exception:  # noqa: BLE001 - a login must not fail over this
+        return {}
+    out = {}
+    for key, name in _CONNECT_ATTR_KEYS.items():
+        value = kvs.get(key)
+        if value:
+            out[name] = bytes(value).rstrip(b'\x00').decode('utf-8', 'replace')
+    return out
+
+
 def parse_auth_new_password(
     payload: bytes, field_version: int = FIELD_VERSION_11_2
 ) -> bytes | None:

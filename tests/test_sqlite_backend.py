@@ -174,6 +174,72 @@ def test_ping_still_answers_when_the_backend_cannot_be_pinged() -> None:
     assert result.get('error') is None, result.get('error')
 
 
+def test_the_upstream_session_opens_after_the_auth() -> None:
+    # A backend that needs the client's connect-time attributes -- the driver
+    # banner, the edition -- cannot open its own upstream session inside
+    # authenticate(): those arrive later, in the login AUTH, and are settable
+    # only at connect time upstream. So the two jobs are split. authenticate()
+    # answers with the account secret, which the Mirror needs BEFORE the AUTH
+    # exists (it builds the O5LOGON challenge from it), and `open_session` runs
+    # once the client's proof has been verified (#826).
+    order: list[str] = []
+
+    class _TwoPhaseBackend(SqliteBackend):
+        def authenticate(self, username: str):
+            order.append('authenticate')
+            return super().authenticate(username)
+
+        def open_session(self, attrs: dict | None = None) -> None:
+            order.append('open_session')
+
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    result: dict = {}
+
+    def serve() -> None:
+        sock, _ = listen.accept()
+        try:
+            result['user'] = serve_session(
+                PacketStream(sock), _TwoPhaseBackend(':memory:', credentials=_CREDS)
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced to the test thread
+            result['error'] = exc
+        finally:
+            sock.close()
+
+    server = threading.Thread(target=serve, daemon=True)
+    server.start()
+    conn = seerdb.connect(
+        host='127.0.0.1',
+        port=listen.getsockname()[1],
+        user='PYO',
+        password='pyo123',
+        service_name='XE',
+        timeout=5000,
+        driver_name='a-declared-banner',
+    )
+    try:
+        conn.cursor().execute('select 1')
+    finally:
+        conn.close()
+        server.join(timeout=5)
+        listen.close()
+
+    assert result.get('error') is None, result.get('error')
+    # authenticate FIRST (the challenge needs its answer), open_session after.
+    # authenticate FIRST -- the O5LOGON challenge is built from what it
+    # answers, before the AUTH exists -- and open_session strictly after, which
+    # is what puts the AUTH's connect-time attributes within reach at all.
+    #
+    # This asserts the ORDER, not the attribute values: the pairs those values
+    # ride in are only sent on the FAST_AUTH path, which this in-process harness
+    # does not negotiate. The relay itself is covered live, against a real
+    # server, by the connection tests.
+    assert order == ['authenticate', 'open_session']
+
+
 def _values(row) -> tuple:
     """A row with its LOB cells read to their values.
 

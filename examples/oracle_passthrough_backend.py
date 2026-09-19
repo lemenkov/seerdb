@@ -125,13 +125,43 @@ class OraclePassthroughBackend:
             if name != name.upper():
                 self._credentials[name.upper()] = self._credentials.pop(name)
         self._conn: seerdb.OracleConnect | None = None
+        self._username = ''
+        self._password = ''
 
     def authenticate(self, username: str) -> str | None:
         password = self._credentials.get(username.upper())
         if password is None:
             return None
-        # Open the upstream connection now, with the same credentials, so the
-        # session is ready by the time the client runs its first statement.
+        # The upstream connection is NOT opened here. It used to be, but the
+        # driver banner and the edition arrive later, in the login AUTH, and
+        # they are connect-time attributes upstream -- unreachable once the
+        # session is open. `open_session` runs after that AUTH; this call only
+        # answers with the secret the Mirror needs to build its O5LOGON
+        # challenge, which it needs BEFORE the AUTH exists (#826).
+        self._username = username
+        self._password = password
+        return password
+
+    def open_session(self, attrs: dict | None = None) -> None:
+        """Open the upstream session, now that the AUTH has been read (#826).
+
+        Called after the client's proof is verified, so everything it declared
+        at connect -- identity, driver banner, edition -- is in hand and can be
+        passed to a connect rather than applied to an already-open session.
+        """
+        username = self._username
+        password = self._password
+        extra: dict = {}
+        declared = (attrs or {}).get('driver_name')
+        if declared:
+            # Report the CLIENT's banner upstream, so v$session_connect_info
+            # names the application rather than this relay.
+            extra['driver_name'] = declared
+        edition = (attrs or {}).get('edition')
+        if edition:
+            # The edition is chosen at LOGIN; deferring this connect until after
+            # the AUTH is what makes it reachable at all.
+            extra['edition'] = edition
         # autocommit=False so the client drives the upstream transaction through
         # the Mirror: an explicit commit / rollback reaches the backend, and an
         # autocommit client still commits because the Mirror calls backend.commit()
@@ -153,8 +183,8 @@ class OraclePassthroughBackend:
             # v$session shows who actually connected (#826). Each is None when
             # the client declared nothing, and the driver falls back to its own.
             **self._client_identity,
+            **extra,
         )
-        return password
 
     def set_client_identity(self, identity: dict) -> None:
         """The session identity the client declared, for the upstream connect.

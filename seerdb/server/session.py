@@ -167,6 +167,7 @@ from seerdb.server.auth import (
     is_token_auth,
     make_challenge,
     parse_auth_app_context,
+    parse_auth_connect_attrs,
     parse_auth_new_password,
     parse_auth_response,
     parse_auth_response_oci,
@@ -555,6 +556,22 @@ def handle_login(
     # login succeeded, the password never changed, and the NEXT connect with the
     # new one was refused ORA-01017 -- a failure one step removed from its cause
     # (#826). A backend that cannot change passwords simply skips it.
+    # Connect-time attributes that arrive ONLY in this AUTH -- the driver banner
+    # and the edition. A backend that opens its own upstream session can use them
+    # if it has deferred that connect until now; one that connected during
+    # authenticate() cannot, and skips the hook. Either way the login stands
+    # (#826).
+    if not sqlplus:
+        connect_attrs = parse_auth_connect_attrs(auth_body, field_version)
+        open_session = getattr(backend, 'open_session', None)
+        if open_session is not None:
+            try:
+                open_session(connect_attrs)
+            except BackendError as err:
+                _deny_login(stream, f'upstream session refused: {err.ora_message}')
+            except Exception as exc:  # noqa: BLE001
+                _deny_login(stream, f'upstream session failed: {exc}')
+
     # Application context the client declared at connect
     # (`connect(appcontext=[...])`). It arrives in this AUTH -- AFTER the backend
     # opened its upstream session during authenticate() -- so it is applied to
