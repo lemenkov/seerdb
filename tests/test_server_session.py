@@ -828,6 +828,107 @@ def test_free_temp_drops_the_buffer_and_state_ops_ack() -> None:
     assert decode_lobops_oer(stream.sent[-1], 6)[0] in (0, 1403)
 
 
+def _lobops_request(operation: int, locator: bytes, **extra) -> bytes:
+    """A real TTI_LOBOPS request, built with the client's own encoder.
+
+    Hand-rolling the body here silently produced one with an EMPTY locator
+    field, which every locator-keyed assertion would then have passed or failed
+    for the wrong reason."""
+    from seerdb.common.tns import encode_dictionary_lobops
+
+    return encode_dictionary_lobops(
+        {'seq': 1, 'locator': locator, 'operation': operation, **extra}
+    )
+
+
+class _CollectingStream:
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+
+    def write_packet(self, packet_type: int, body: bytes) -> None:
+        from seerdb.common.tns_consts import TNS_DATA
+
+        assert packet_type == TNS_DATA
+        self.sent.append(body)
+
+
+def test_a_column_lob_read_is_answered_by_its_own_locator() -> None:
+    # A fetched column LOB is read by the locator the Mirror minted for it, not
+    # by arrival order. The old path popped a row-major queue, which is only
+    # right when the client reads every LOB exactly once in the order the
+    # locators went out. Read them in any other order -- which the reference
+    # client does -- and each got another row's content, or nothing at all once
+    # the queue ran dry (#826).
+    from seerdb.common.tns import LobEmitLog
+    from seerdb.common.tns_consts import TNS_LOB_OP_READ
+    from seerdb.server.session import _answer_lobops, _TempLobs
+
+    log = LobEmitLog()
+    first = log.record(b'first-row-content', is_clob=False)
+    second = log.record(b'second-row-content', is_clob=False)
+    assert first != second  # each emitted LOB gets its own locator (#888)
+
+    stream: Any = _CollectingStream()
+
+    def read(locator: bytes) -> bytes:
+        # The row-major queue is primed with a decoy. Anything answered from it
+        # rather than from the locator shows up as this content, which is what
+        # the old path would hand back for every one of these reads.
+        _answer_lobops(
+            stream,
+            _lobops_request(TNS_LOB_OP_READ, locator),
+            [(b'decoy-from-the-queue', False)],
+            _TempLobs(),
+            lob_emit_log=log,
+        )
+        return stream.sent[-1]
+
+    # The SECOND one first: order must not matter, and the queue is empty
+    # throughout, so on master both of these come back with no content.
+    reply = read(second)
+    assert b'second-row-content' in reply
+    assert b'first-row-content' not in reply
+    assert b'decoy-from-the-queue' not in reply
+    assert b'first-row-content' in read(first)
+    # Re-reading one already read still works -- there is no queue to exhaust.
+    assert b'second-row-content' in read(second)
+
+
+def test_a_column_lob_reports_its_own_size_not_zero() -> None:
+    # `lob.size()` on a FETCHED LOB consulted the temp-LOB store, which knows
+    # nothing about a column locator, so every such size() came back 0 (#826).
+    from seerdb.common.tns import LobEmitLog, decode_ub4
+    from seerdb.common.tns_consts import TNS_LOB_OP_GET_LENGTH
+    from seerdb.server.session import _answer_lobops, _TempLobs
+
+    log = LobEmitLog()
+    # A CLOB counts CHARACTERS: the log keeps the `str`, so a multi-byte
+    # character must not inflate the answer the way its UTF-16BE buffer would.
+    clob = log.record('caf\u00e9' + 'x' * 96, is_clob=True)
+    blob = log.record(b'\x00' * 250, is_clob=False)
+    stream: Any = _CollectingStream()
+
+    def length_of(locator: bytes) -> int:
+        # GET_LENGTH carries the locator ub2-prefixed where READ sends it bare;
+        # the parser handles both, and picking the wrong one here silently
+        # yields an empty locator and a length of 0 for the wrong reason.
+        _answer_lobops(
+            stream,
+            _lobops_request(TNS_LOB_OP_GET_LENGTH, locator, locator_prefixed=True),
+            [],
+            _TempLobs(),
+            lob_emit_log=log,
+        )
+        # The reply is the acknowledged locator then a ub4 length (§14): skip
+        # the ub2-prefixed locator echo and read the length that follows.
+        body = stream.sent[-1]
+        head = 1 + 2 + len(locator)
+        return decode_ub4(body[head:])[0]
+
+    assert length_of(clob) == 100
+    assert length_of(blob) == 250
+
+
 # --- PL/SQL OUT-bind helpers (#483) --------------------------------------------
 
 

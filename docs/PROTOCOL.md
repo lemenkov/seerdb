@@ -1929,12 +1929,23 @@ reads a LOB the same shape as sqlplus — locator in the row, content over
    (`_encode_oer(1,0,0,b'')`). The client reads the content, scans to the OER, and
    stops; CLOB content is UTF-16BE (decoded to `str`), BLOB is raw `bytes`.
 
-   The per-LOB position is still tracked by read order (the minted locator is a
-   shared placeholder, so a READ cannot say *which* row's LOB it wants): a read
-   at offset 1 starts the next queued LOB, later offsets continue the current
-   one. A client that reads one LOB from offset 1 more than once (e.g. `read()`
-   then `str(lob)`) therefore still advances the queue early; serving that needs
-   a **distinct** locator per column LOB, a separate follow-up.
+   **A READ is answered by its locator.** Each column LOB is emitted under a
+   locator of its own (`mint_column_lob_locator`, #888) and the content served
+   under it is remembered, so a READ says exactly which row's LOB it wants and
+   the answer never depends on the order the reads arrive. Re-reading one, or
+   skipping one, or reading them back-to-front all work.
+
+   This replaces the original read-order rule, which was the follow-up this
+   section used to describe: the locator was a shared placeholder, so the Mirror
+   tracked position by arrival — a read at offset 1 started the *next* queued
+   LOB and later offsets continued the current one. That is right only for a
+   client that reads every LOB exactly once, in the order the locators went out.
+   The reference client does not: reading one LOB from offset 1 twice (`read()`
+   then `str(lob)`) advanced the queue early, and from there every later row got
+   its neighbour's content and the last got nothing at all (seerdb#826). The
+   order-based path remains for a locator the log does not know — an OCI
+   (sqlplus) client, whose locators are not minted this way, and the
+   session-persistent object-attribute queue below.
 
 Unlike the OCI locator, the thin locator carries no load-bearing size / charset
 fields (the CLOB / BLOB split is already in the describe, and the read is
