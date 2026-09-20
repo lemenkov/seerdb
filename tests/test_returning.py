@@ -321,6 +321,95 @@ class TestReturningDecode(unittest.TestCase):
         self.assertEqual(bind[2].getvalue(), ['hi'])
 
 
+class TestReturningResponseLengths(unittest.TestCase):
+    """What the Mirror writes in the trailing actual-length field (#1023).
+
+    It used to write 0 for everything, so it could never tell a client that a
+    value did not fit -- the client got half a string and called it an answer.
+    Round-tripped through the client's own decoder + assignment, which is what
+    reports the truncation.
+    """
+
+    def _assign(self, values, types, bind, max_sizes=None):
+        # The Mirror's reply, decoded by the client's own packet decoder and
+        # assigned to the Vars -- both halves of the round trip, since the
+        # report is only produced at assignment.
+        from seerdb.common.tns import encode_returning_response
+
+        reply = encode_returning_response(1, [values], types, max_sizes=max_sizes)
+        set_decode_return_binds(list(range(len(types))), dict(enumerate(types)))
+        try:
+            result = decode_packet(reply, (0, [], [], bind))
+        finally:
+            set_decode_return_binds(None)
+        record = result[4][0]
+        _assign_return_binds(bind, result)
+        return record
+
+    def test_a_value_longer_than_the_clients_buffer_is_cut_and_reported(self):
+        from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
+
+        bind = [Var(str)]
+        with self.assertRaises(DatabaseError) as ctx:
+            self._assign(
+                [('a value far longer than two',)],
+                [TNS_TYPE_VARCHAR],
+                bind,
+                max_sizes=[2],
+            )
+        self.assertIn('DPY-4002', str(ctx.exception))
+        self.assertIn('27', str(ctx.exception))  # the untruncated length
+
+    def test_a_value_that_fits_reports_zero(self):
+        from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
+
+        bind = [Var(str)]
+        rec = self._assign([('hi',)], [TNS_TYPE_VARCHAR], bind, max_sizes=[100])
+        self.assertEqual(rec['return_lengths'][0], [0])
+        self.assertEqual(bind[0].getvalue(), ['hi'])
+
+    def test_a_null_reports_minus_one(self):
+        # What a real server sends, and it is not a length: read as one it turns
+        # every NULL RETURNING into a truncation (#1021).
+        from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
+
+        bind = [Var(str)]
+        rec = self._assign([(None,)], [TNS_TYPE_VARCHAR], bind, max_sizes=[100])
+        self.assertEqual(rec['return_lengths'][0], [-1])
+        self.assertEqual(bind[0].getvalue(), [None])
+
+    def test_a_multibyte_value_is_cut_on_a_character_boundary(self):
+        # A buffer that splits a multi-byte character would hand the client an
+        # undecodable tail, so the cut lands on a boundary and the reported
+        # length is still the whole value's.
+        from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
+
+        bind = [Var(str)]
+        with self.assertRaises(DatabaseError):
+            self._assign([('\u00e9' * 10,)], [TNS_TYPE_VARCHAR], bind, max_sizes=[5])
+        self.assertEqual(bind[0].getvalue(), ['\u00e9\u00e9'])  # 4 of the 5 bytes
+
+    def test_a_fixed_width_type_is_never_truncated(self):
+        # A NUMBER's declared size is not a buffer the value can overflow, so
+        # the size is ignored rather than cutting a number in half.
+        from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+
+        bind = [Var(int)]
+        rec = self._assign([(42,)], [TNS_TYPE_NUMBER], bind, max_sizes=[1])
+        self.assertEqual(rec['return_lengths'][0], [0])
+        self.assertEqual(bind[0].getvalue(), [42])
+
+    def test_without_sizes_nothing_is_truncated(self):
+        # The sizes are optional: a caller that does not know them gets the
+        # whole value and a 0, which is what every other encoder call does.
+        from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
+
+        bind = [Var(str)]
+        rec = self._assign([('a long value',)], [TNS_TYPE_VARCHAR], bind)
+        self.assertEqual(rec['return_lengths'][0], [0])
+        self.assertEqual(bind[0].getvalue(), ['a long value'])
+
+
 def _exec_bytes(bind, batch, return_binds):
     """The wire bytes of one array execute of a RETURNING statement."""
     return encode_dictionary_exec(

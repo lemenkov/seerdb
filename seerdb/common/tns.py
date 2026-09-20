@@ -2899,6 +2899,7 @@ def encode_returning_response(
     return_types: list[int],
     *,
     cursor_id: int = 0,
+    max_sizes: list[int] | None = None,
 ) -> bytes:
     """The reply to a `DML ... RETURNING col INTO :b` execute (#689).
 
@@ -2912,9 +2913,13 @@ def encode_returning_response(
     return bind in bind order, the number of rows that iteration affected, then
     that many values, each a DALC followed by an sb4 **actual length** -- 0 when
     the value fitted the client's variable, -1 when it is NULL, its untruncated
-    length when it did not fit (#1021). The Mirror's own values are never
-    truncated, so it writes 0. ``iterations`` arrives the other way round, as
-    the rows each iteration returned, so it is transposed here.
+    length when it did not fit (#1021). ``max_sizes`` is what the client
+    declared for each return bind, and writing that field correctly is the only
+    way to tell a client its variable was too small: a value longer than the
+    buffer is cut to it and its real length written here, which is what a real
+    server does. Without the sizes nothing is truncated and every length is 0 or
+    -1 (#1023). ``iterations`` arrives the other way round, as the rows each
+    iteration returned, so it is transposed here.
 
     A JSON or VECTOR bind is the exception to "each a DALC": its value comes back
     as the prefetched binary image with a locator behind it, the same framing such
@@ -2926,10 +2931,46 @@ def encode_returning_response(
         out.append(TTI_RXD)
         for position, tns_type in enumerate(return_types):
             out += encode_sb4(len(rows))
+            limit = (
+                max_sizes[position]
+                if max_sizes is not None and position < len(max_sizes)
+                else 0
+            )
             for row in rows:
                 value = row[position] if position < len(row) else None
-                out += _returned_value(value, tns_type) + encode_sb4(0)
+                value, actual = _fit_returned_value(value, tns_type, limit)
+                out += _returned_value(value, tns_type) + _encode_signed_sb4(actual)
     return bytes(out) + encode_status(rowcount, cursor_id=cursor_id)
+
+
+# The return-bind types whose declared size is a real client buffer, so a value
+# longer than it is truncated rather than rejected. A NUMBER or DATE is fixed
+# width and always fits; a LONG-class bind is unbounded; a LOB, OBJECT or
+# JSON / VECTOR bind carries its own framing and its length field says nothing
+# about a buffer (§22.1b-e).
+_TRUNCATABLE_RETURN_TYPES = (TNS_TYPE_VARCHAR, TNS_TYPE_CHAR, TNS_TYPE_RAW)
+
+
+def _fit_returned_value(value: object, tns_type: int, limit: int) -> tuple:
+    # One returned value cut to the client's declared buffer, with the actual
+    # length that goes after it (#1023). -1 for a NULL, 0 for a value that
+    # fitted, and the untruncated length for one that did not -- the client has
+    # no other way to learn its variable was too small, and a Mirror that always
+    # wrote 0 handed back half a string and called it an answer.
+    if value is None:
+        return (None, -1)
+    if limit <= 0 or tns_type not in _TRUNCATABLE_RETURN_TYPES:
+        return (value, 0)
+    if isinstance(value, (bytes, bytearray)):
+        return (bytes(value)[:limit], len(value)) if len(value) > limit else (value, 0)
+    if isinstance(value, str):
+        payload = value.encode('utf-8')
+        if len(payload) <= limit:
+            return (value, 0)
+        # Cut on a character boundary: a buffer that splits a multi-byte
+        # character would hand the client an undecodable tail.
+        return (payload[:limit].decode('utf-8', 'ignore'), len(payload))
+    return (value, 0)
 
 
 def _returned_value(value: object, tns_type: int) -> bytes:
