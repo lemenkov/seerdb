@@ -17,7 +17,32 @@
 
 
 class Warning(Exception):
-    pass
+    """A condition the server reports alongside a call that SUCCEEDED.
+
+    Carried on ``cursor.warning``, never raised. ``full_code`` is the part of the
+    message before the first colon, matching how python-oracledb exposes one, so
+    a caller can test ``cursor.warning.full_code == 'DPY-7000'`` (#993)."""
+
+    def __init__(self, message: str, code: int = 0):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.iswarning = True
+        Colon = message.find(':')
+        self.full_code = message[:Colon] if Colon > 0 else ''
+
+
+# A PL/SQL object that was CREATED but compiled with errors. The call succeeded
+# and the object exists, invalid; only the OER's warn bit says so (#993). The
+# code matches python-oracledb's, so a caller can test either driver alike.
+WRN_COMPILATION_ERROR = 7000
+
+
+def compilation_warning() -> Warning:
+    return Warning(
+        f'DPY-{WRN_COMPILATION_ERROR}: creation succeeded with compilation errors',
+        code=WRN_COMPILATION_ERROR,
+    )
 
 
 class Error(Exception):

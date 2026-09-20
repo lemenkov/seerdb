@@ -764,6 +764,42 @@ def test_long_error_message_decodes_back_at_every_field_version(version: int) ->
     assert [e['message'] for e in batch[7]] == [message, 'short']
 
 
+def test_the_oer_warn_bit_survives_the_decode() -> None:
+    # Bit 0x20 of the OER's warn byte says the call CREATED a PL/SQL object that
+    # compiled with errors. The call SUCCEEDED, so nothing else in the reply
+    # differs -- the decoder used to skip that byte with its five neighbours,
+    # and the condition vanished (#993). Built by patching the encoder's own
+    # status frame, so the offset is the one the encoder actually writes.
+    from seerdb.common.tns import decode_token_oer, encode_status
+    from seerdb.common.tns_consts import TNS_OER_WARN_COMPILATION_ERROR
+
+    clean = encode_status(0)
+    decoded = decode_token_oer(clean, (0, [], []))
+    assert decoded[10] == 0
+
+    # The warn byte is the 6th of the six single-byte fields; find that run by
+    # the sql_type byte the encoder leads it with, which is 0 for a status.
+    warned = bytearray(clean)
+    index = _oer_warn_byte_index(bytes(clean))
+    warned[index] = TNS_OER_WARN_COMPILATION_ERROR
+    decoded = decode_token_oer(bytes(warned), (0, [], []))
+    assert decoded[10] & TNS_OER_WARN_COMPILATION_ERROR
+    # and nothing else moved: same error code, same rowcount.
+    assert decoded[1] == 0
+
+
+def _oer_warn_byte_index(status: bytes) -> int:
+    # Walk the OER the way the decoder does, and report where the warn byte sits.
+    # Computed rather than hardcoded: a hardcoded offset would still pass if the
+    # encoder's field order changed underneath it.
+    from seerdb.common.tns import decode_ub4
+
+    rest = status[1:]  # the TTI_OER token
+    for _ in range(8):  # call_status, seq, rowcount, err, arr1, arr2, cursor, pos
+        (_, rest) = decode_ub4(rest)
+    return len(status) - len(rest) + 5
+
+
 @pytest.mark.parametrize('version', [8, 14, 17])  # 12.2, 20.1, 23ai
 def test_oer_decodes_back_at_a_12c_field_version(version: int) -> None:
     # A 12.1+ client reads an extended error number + rowcount ahead of the

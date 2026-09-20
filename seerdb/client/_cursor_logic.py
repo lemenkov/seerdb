@@ -18,7 +18,13 @@ read and write.
 from __future__ import annotations
 
 from seerdb.common.datatypes import Var
-from seerdb.common.exceptions import ProgrammingError, from_ora_code
+from seerdb.common.exceptions import (
+    ProgrammingError,
+    from_ora_code,
+)
+from seerdb.common.exceptions import (
+    Warning as DbWarning,
+)
 from seerdb.common.sqltext import bind_placeholders, is_plsql
 
 
@@ -59,6 +65,12 @@ class _CursorLogic:
         self._closed: bool = False
         self._lastrowid = None
         self._rowfactory = None
+        # The warning the last execute reported, or None (#993). A condition the
+        # server raises alongside a call that SUCCEEDED -- a PL/SQL object
+        # created with compilation errors -- so it is an attribute, never
+        # raised. Present from construction: a caller may read it before any
+        # execute has run.
+        self.warning: DbWarning | None = None
         # Scrollable cursor. With scrollable=True a SELECT is fetched lazily from
         # a kept-open server cursor: scroll() repositions server-side and
         # fetchone/many pull batches on demand (#181). With scrollable=False the

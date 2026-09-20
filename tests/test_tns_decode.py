@@ -1993,6 +1993,7 @@ class TestTnsCommandDecoders(unittest.TestCase):
                 [],  # batch errors (none)
                 None,  # array-DML row counts (not requested)
                 11,  # error position (parse offset) — the 0x0B field above
+                0,  # warn flags: no compilation warning on this reply (#993)
             ),
         )
 

@@ -3773,6 +3773,87 @@ class ConnectAttributeIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class CursorWarningIntegration(_IntegrationBase):
+    """`cursor.warning` for a PL/SQL object created with compilation errors.
+
+    Such a CREATE **succeeds** -- the object exists, invalid -- and the only
+    thing that says otherwise is bit 0x20 of the OER's warn byte, which the
+    decoder used to skip along with its five neighbours. Measured by diffing a
+    live 23ai's reply to the same CREATE compiled clean and broken: identical
+    but for the sequence fields and that byte, 0x21 against 0x00 (#993).
+    """
+
+    def setUp(self):
+        super().setUp()
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            # fv2 (9i / 8i) answers a CREATE on its own dialect path, whose
+            # reply does not carry this byte where the 10g+ OER does -- a broken
+            # CREATE there comes back as a bare token, with nothing to read. Not
+            # gated because the decode is wrong on those tiers; gated because
+            # the signal has not been located on them, and claiming coverage
+            # would be worse than admitting the gap (#993).
+            self.skipTest('the OER warn byte is not located on fv2')
+
+    def _bad_procedure(self, name: str) -> None:
+        # Creating an object that does NOT compile is the precondition of this
+        # whole class, and it is an Oracle behaviour: the statement succeeds and
+        # the object exists, invalid. A backend without those semantics rejects
+        # the statement outright -- Mirror-over-PostgreSQL answers ORA-00900 --
+        # and there is no warning to report because there was no create. Skip on
+        # that rather than fail, and say which it is (#993).
+        from seerdb.common.exceptions import DatabaseError
+
+        try:
+            self.cur.execute(
+                f"""CREATE OR REPLACE PROCEDURE {name} AS
+                    BEGIN
+                        NULL
+                    END;"""  # the missing semicolon is the point
+            )
+        except DatabaseError as exc:
+            self.skipTest(f'this backend refuses an invalid CREATE outright: {exc}')
+
+    def tearDown(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        for Name in ('PYORACLE_WARN_P', 'PYORACLE_WARN_F'):
+            try:
+                self.cur.execute(f'DROP PROCEDURE {Name}')
+            except DatabaseError:
+                pass
+        super().tearDown()
+
+    def test_no_warning_before_anything_runs(self):
+        # A caller may read it before any execute; it must exist and be None.
+        self.assertIsNone(self.conn.cursor().warning)
+
+    def test_a_procedure_with_compilation_errors_warns(self):
+        self._bad_procedure('PYORACLE_WARN_P')
+        Warn = self.cur.warning
+        self.assertIsNotNone(Warn, 'a CREATE that compiled with errors set no warning')
+        self.assertEqual(Warn.full_code, 'DPY-7000')
+        self.assertTrue(Warn.iswarning)
+
+    def test_the_warning_is_cleared_by_the_next_clean_execute(self):
+        # It reports the LAST execute, not "something once went wrong".
+        self._bad_procedure('PYORACLE_WARN_P')
+        self.assertIsNotNone(self.cur.warning)
+        self.cur.execute(
+            """CREATE OR REPLACE PROCEDURE PYORACLE_WARN_P AS
+               BEGIN
+                   NULL;
+               END;"""
+        )
+        self.assertIsNone(self.cur.warning)
+        self.cur.execute('DROP PROCEDURE PYORACLE_WARN_P')
+        self.assertIsNone(self.cur.warning)
+
+    def test_an_ordinary_statement_sets_no_warning(self):
+        self.cur.execute('SELECT 1 FROM dual')
+        self.assertIsNone(self.cur.warning)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class LOBReturningIntegration(_IntegrationBase):
     """`DML ... RETURNING <lob column> INTO :b` (#985).
 

@@ -25,6 +25,7 @@ from seerdb.common.exceptions import (
     InterfaceError,
     NotSupportedError,
     ProgrammingError,
+    compilation_warning,
     from_ora_code,
 )
 from seerdb.common.sqltext import is_plsql, returning_bind_positions
@@ -32,6 +33,7 @@ from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
     FIELD_VERSION_10_2,
     FIELD_VERSION_12_1,
+    TNS_OER_WARN_COMPILATION_ERROR,
     TNS_TYPE_BLOB,
     TNS_TYPE_CLOB,
 )
@@ -187,8 +189,20 @@ class AsyncCursor(_CursorLogic):
             Message = Result[5] if len(Result) > 5 else None
             LastRowid = Result[6] if len(Result) > 6 else None
             ErrorOffset = Result[9] if len(Result) > 9 else None
+            WarnFlags = Result[10] if len(Result) > 10 else 0
         except (TypeError, IndexError, ValueError) as exc:
             raise DatabaseError(f'unexpected wire response: {Result!r}') from exc
+
+        # `cursor.warning` (#993): a CREATE that produced a PL/SQL object with
+        # compilation errors SUCCEEDS -- the object exists, invalid -- and says
+        # so only with bit 0x20 of the OER's warn byte. Set here and cleared by
+        # the next execute that does not raise it, so a DROP of the same object
+        # clears it.
+        self.warning = (
+            compilation_warning()
+            if WarnFlags & TNS_OER_WARN_COMPILATION_ERROR
+            else None
+        )
 
         # Array-DML batch errors (#18): each entry is {offset, code, message}.
         self._batcherrors = list(Result[7]) if len(Result) > 7 else []
