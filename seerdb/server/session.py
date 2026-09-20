@@ -2831,8 +2831,19 @@ def _answer_parse(backend: Backend, sql: str, request: ExecRequest) -> bytes:
     and otherwise the query is run with every bind NULL and its rows discarded.
     That is safe for a SELECT, which is the only shape that reaches the fallback,
     and it validates the statement the way a real parse does.
+
+    A status is the whole reply for a non-query, and answering it from here is
+    how every parse-time error used to be lost: nothing parsed the statement, so
+    `returning IntCol into :ROWID` came back clean where a real server answers
+    ORA-01745 (#1019). A backend that can validate a statement without running
+    it says so with a ``parse`` method and gets asked. One that cannot keeps the
+    bare status — the PostgreSQL and SQLite demos cannot parse Oracle SQL, and
+    claiming a statement is good is the only answer they can give.
     """
     if not request.describe_only:
+        parse = getattr(backend, 'parse', None)
+        if parse is not None:
+            parse(sql)
         return encode_status(0)
     describe = getattr(backend, 'describe', None)
     if describe is not None:

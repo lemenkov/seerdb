@@ -238,6 +238,15 @@ class Backend(Protocol):
         Without it the Mirror runs the query with every bind NULL and drops the
         rows, which is side-effect free but does reach the database.
 
+    ``parse(sql) -> None``
+        Validate a statement without running it — the other half of
+        ``cursor.parse()``, for everything that is not a query and so owes no
+        describe (#1019). Raise :class:`BackendError` for a statement that will
+        not parse; return nothing for one that will. Without it the Mirror
+        answers a bare success status, so every parse-time error is lost: a
+        client asking whether a statement is valid is told yes whatever it sent.
+        A backend that cannot parse Oracle SQL at all is right to omit it.
+
     ``field_version`` (int) / ``tns_version`` (int)
         The Oracle protocol version this backend presents. A backend that
         declares ``field_version`` makes the Mirror advertise it -- its identity

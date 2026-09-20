@@ -99,8 +99,12 @@ def main(argv: list[str]) -> int:
                 SEERDB_TEST_SERVICE='XE',
                 # Tell the suite it is talking to a Mirror, so a test can skip
                 # for a feature the Mirror does not serve yet rather than fail
-                # as though the CLIENT were at fault (#964).
-                SEERDB_TEST_MIRROR='1',
+                # as though the CLIENT were at fault (#964). The value names the
+                # backend, because some of what a leg cannot do belongs to the
+                # backend rather than to the Mirror: PostgreSQL cannot parse
+                # Oracle SQL, so it serves no `cursor.parse()` of a non-query,
+                # while the passthrough does (#1019).
+                SEERDB_TEST_MIRROR=backend,
             )
             env.pop('SEERDB_TEST_FIELD_VERSION', None)
             status = subprocess.call(

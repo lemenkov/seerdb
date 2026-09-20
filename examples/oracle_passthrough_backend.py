@@ -560,6 +560,21 @@ class OraclePassthroughBackend:
                 out.append(b)
         return out
 
+    def parse(self, sql: str) -> None:
+        # `cursor.parse()` of anything that is not a query (#1019). The upstream
+        # is a real Oracle, so the honest answer is to ask it — the driver's own
+        # `cursor.parse()` sends PARSE without EXECUTE (#1018), which parses the
+        # statement and runs nothing. Without this the Mirror answers its own
+        # bare success status and every parse-time error is lost: a client asking
+        # whether `returning IntCol into :ROWID` is valid is told yes, where a
+        # real server answers ORA-01745.
+        assert self._conn is not None  # authenticate() ran before any execute
+        cursor = self._conn.cursor()
+        try:
+            cursor.parse(sql)
+        except seerdb.DatabaseError as exc:
+            raise _relay_error(exc) from exc
+
     def execute(self, sql: str, binds: Sequence = ()) -> Result:
         assert self._conn is not None  # authenticate() ran before any execute
         cursor = self._conn.cursor()
