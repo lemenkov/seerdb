@@ -2210,6 +2210,35 @@ def test_backend_fault_error_reports_ora600_without_recursing() -> None:
     assert b'encoded number data too long' in fault
 
 
+def test_a_cursors_bind_format_is_refreshed_when_the_client_redescribes() -> None:
+    # An OAC-less re-execute decodes its rows with the bind format recorded
+    # against the cursor. That was recorded once, at open -- so when a client
+    # re-describes its binds mid-stream, the NEXT OAC-less execute still decoded
+    # with the original types. A column that is all-NULL in the first
+    # executemany batch and carries numbers in a later one is exactly that: the
+    # numbers came back as their raw NUMBER bytes read as text, and the upstream
+    # answered ORA-01722 (#999).
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER, TNS_TYPE_VARCHAR
+    from seerdb.server.session import _Cursors
+
+    cursors = _Cursors()
+    opened = [(TNS_TYPE_VARCHAR, 1, 40, b'')]
+    cursor_id = cursors.open_dml('insert into t (a, b) values (:1, :2)', opened)
+    assert cursors.bind_types(cursor_id) == opened
+
+    redescribed = [(TNS_TYPE_NUMBER, 1, 22, b'')]
+    cursors.set_bind_types(cursor_id, redescribed)
+    assert cursors.bind_types(cursor_id) == redescribed
+
+    # An execute carrying NO OACs is asking to reuse the format, not to clear
+    # it -- the same rule a define follows.
+    cursors.set_bind_types(cursor_id, [])
+    assert cursors.bind_types(cursor_id) == redescribed
+
+    # The statement the cursor stands for is untouched by any of this.
+    assert cursors.dml_sql(cursor_id) == 'insert into t (a, b) values (:1, :2)'
+
+
 def test_a_define_stands_for_the_life_of_the_cursor() -> None:
     # A client applies a define ONCE, on the round-trip that follows the first
     # describe, and it then stands: every later execute of that cursor carries

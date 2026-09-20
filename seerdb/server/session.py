@@ -1816,6 +1816,23 @@ class _Cursors:
         state = self._dml.get(cursor_id) or self._query.get(cursor_id)
         return state[1] if state is not None else None
 
+    def set_bind_types(self, cursor_id: int, bind_types: list) -> None:
+        """Refresh the bind format recorded against a cursor (#999).
+
+        It was recorded once, at open, and an OAC-less re-execute decodes with
+        it. But a client re-describes its binds mid-stream whenever their types
+        change -- a column that was all-NULL in the first executemany batch and
+        carries numbers in a later one -- and the next OAC-less execute then
+        decoded those numbers with the original types. An execute carrying no
+        OACs leaves the record alone; it is asking to reuse it, not replacing
+        it."""
+        if not bind_types:
+            return
+        for table in (self._dml, self._query):
+            state = table.get(cursor_id)
+            if state is not None:
+                table[cursor_id] = (state[0], list(bind_types))
+
     def open_dml(self, sql: str, bind_types: list) -> int:
         cursor_id = self._next
         self._next += 1
@@ -2415,6 +2432,11 @@ def _answer_query(
         sql = cursors.query_sql(request.cursor)
     if sql is None:
         sql = request.sql
+    # A cached cursor's recorded bind format is what an OAC-less re-execute
+    # decodes with. Recorded once at open, it went stale as soon as the client
+    # re-described its binds mid-stream (#999).
+    if reused_id:
+        cursors.set_bind_types(reused_id, request.bind_types)
     if (
         reused_id
         and cursors.has(reused_id)

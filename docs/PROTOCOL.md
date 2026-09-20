@@ -3508,6 +3508,18 @@ it look like whatever else changed on that call — in oracledb's own suite, a b
 whose type went from `str` to `int`, so the test is named "changing bind type
 with define needed" and the bind type has nothing to do with it.
 
+The **bind format** a cursor records has the same shape of problem, and it bites
+in the other direction (#999). An OAC-less re-execute decodes its rows with the
+format recorded against the cursor, which is written once, at open. A client
+re-describes its binds mid-stream whenever their types change — and a column
+that is all-NULL in the first `executemany` batch and carries numbers in a later
+one does exactly that. The batch carrying the re-describe decodes fine, because
+it brought its own OACs; the batch **after** it does not, and the numbers arrive
+as their raw NUMBER bytes read as text (`ORA-01722 ... UNISTR('\FFFD')`). So the
+record has to be refreshed whenever an execute carries OACs, and left alone when
+it does not — an execute with none is asking to reuse the format, not to clear
+it.
+
 **And a third half, on the fetch side (#982).** "For the life of the cursor"
 includes every *batch* of one result set, not just every execute of it. The rows
 of a LOB-class result are parked by the execute, **before** the define exists —
