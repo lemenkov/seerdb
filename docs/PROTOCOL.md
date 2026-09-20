@@ -2337,7 +2337,7 @@ TTI_OER |
   cursor_id (ub2) |
   error_position (sb2)         -- the parse offset; surfaced as DatabaseError.offset (oracledb parity) |
   sql_type, fatal, flags, user_cursor_options, upi_param,
-    warn_flags (6 x ub1) |
+    warn_flags (6 x ub1)      -- see 6.3a: warn_flags carries a real signal |
   rowid (ub4 data_object + ub2 rel_file + ub1 + ub4 block + ub2 slot) |
   os_error (ub4, skipped) |
   statement_number (ub1, skipped) | call_number (ub1, skipped) |
@@ -2349,6 +2349,34 @@ TTI_OER |
   num_batch_error_messages (ub2)[+ batch messages block]
   [trailing message DALC iff ora_error_code != 0]
 ```
+
+#### 6.3a `warn_flags`: a warning on a call that SUCCEEDED (#993)
+
+Five of those six single-byte fields are diagnostic and skipped. The **last** one
+is not. Bit `0x20` says the statement created a PL/SQL object that **compiled
+with errors** — a `CREATE PROCEDURE` with a syntax error *succeeds*, the object
+exists in an invalid state, `ora_error_code` is 0 and the reply is otherwise
+indistinguishable from a clean one.
+
+Measured by diffing a live 23ai's reply to the same `CREATE` compiled clean and
+broken. The two packets are 69 bytes each and differ in **four** bytes — three
+of them the end-to-end sequence and SCN, and this:
+
+```
+offset 47:   broken = 0x21      clean = 0x00
+```
+
+`0x01` rides alongside in other captures either way, so the test is the bit, not
+the value: `flags & 0x20`.
+
+The reference client surfaces it as `cursor.warning`, an object carrying
+`DPY-7000: creation succeeded with compilation errors`, set by the execute that
+raised the bit and cleared by the next one that does not — so a `DROP` of the
+same object clears it. seerdb matches that, including `full_code`.
+
+Skipping the byte loses the only signal there is: the caller is told the create
+succeeded, which is true, and never that the object it just made does not
+compile.
 
 **11g rowcount quirk.** The field labelled "current row number" in
 newer Oracle (and in python-oracledb's source) doubles as the affected

@@ -142,6 +142,11 @@ RCAP_TTC_SESSION_STATE_OPS = 0x10
 # so the transaction (and its locks) outlive the connection (#889).
 TNS_EOCS_FLAGS_TXN_IN_PROGRESS = 0x02
 
+# The OER's warn-flags byte (the last of the six single-byte fields after the
+# error position). Bit 0x20 says the call CREATED a PL/SQL object that compiled
+# with errors: the statement succeeded and the object exists, invalid (#993).
+TNS_OER_WARN_COMPILATION_ERROR = 0x20
+
 TNS_ATTENTION = 13
 TNS_CONTROL = 14
 TNS_MAX = 19
