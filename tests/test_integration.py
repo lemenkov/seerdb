@@ -1500,6 +1500,69 @@ class BindIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT v FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchall(), [(val,)])
 
+    def test_national_scalar_out_bind(self):
+        # A national OUT bind arrives as AL16UTF16, and the Var's charset form is
+        # what says so. Without it the value came back as its raw UTF-16BE bytes
+        # read one per character (#991).
+        #
+        # 10g+ only: on fv2 (9i / 8i) the server refuses the bind descriptor
+        # outright with ORA-03120 "two-task conversion routine: integer
+        # overflow", before any value comes back. That is a tier limitation, not
+        # this decode -- the request bytes are identical either way.
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            self.skipTest('a national OUT bind is refused on fv2 (ORA-03120)')
+        Var = self.cur.var(seerdb.DB_TYPE_NVARCHAR)
+        self.cur.execute("BEGIN :v := N'nat \u00fcn\u00ee \u4e2d'; END;", [Var])
+        self.assertEqual(Var.getvalue(), 'nat ünî 中')
+
+    def test_national_array_bind_round_trip(self):
+        # An associative array of NVARCHAR2 in both directions (#991). The
+        # element is encoded as a bare value, so it never saw the bind's charset
+        # form: going out it went as UTF-8 and the server read those bytes as
+        # UTF-16BE, silently halving every string.
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('an associative-array bind needs 12.1+ (#122)')
+        Proc = 'PYORACLE_NARR'
+        self.cur.execute(
+            f"""CREATE OR REPLACE PACKAGE {Proc} AS
+                    TYPE t IS TABLE OF NVARCHAR2(60) INDEX BY BINARY_INTEGER;
+                    FUNCTION total_len(a t) RETURN NUMBER;
+                    PROCEDURE echo(a IN OUT t);
+                END;"""
+        )
+        self.cur.execute(
+            f"""CREATE OR REPLACE PACKAGE BODY {Proc} AS
+                    FUNCTION total_len(a t) RETURN NUMBER IS
+                        n NUMBER := 0;
+                    BEGIN
+                        FOR i IN 1 .. a.COUNT LOOP n := n + LENGTH(a(i)); END LOOP;
+                        RETURN n;
+                    END;
+                    PROCEDURE echo(a IN OUT t) IS
+                    BEGIN
+                        FOR i IN 1 .. a.COUNT LOOP a(i) := a(i) || N'\u00e9'; END LOOP;
+                    END;
+                END;"""
+        )
+        try:
+            Values = ['nat \u00fcn\u00ee \u4e2d', 'caf\u00e9 \u65e5\u672c']
+            # IN: the server must count CHARACTERS, not halved UTF-8 bytes.
+            Arr = self.cur.arrayvar(seerdb.DB_TYPE_NVARCHAR, Values)
+            Total = self.cur.var(seerdb.DB_TYPE_NUMBER)
+            self.cur.execute(f'BEGIN :n := {Proc}.total_len(:a); END;', [Total, Arr])
+            self.assertEqual(Total.getvalue(), sum(len(V) for V in Values))
+            # IN OUT: and what comes back decodes from AL16UTF16.
+            Arr2 = self.cur.arrayvar(seerdb.DB_TYPE_NVARCHAR, Values)
+            self.cur.execute(f'BEGIN {Proc}.echo(:a); END;', [Arr2])
+            self.assertEqual(Arr2.getvalue(), [V + 'é' for V in Values])
+        finally:
+            from seerdb.common.exceptions import DatabaseError
+
+            try:
+                self.cur.execute(f'DROP PACKAGE {Proc}')
+            except DatabaseError:
+                pass
+
     def test_db_charset_varchar_roundtrip(self):
         # VARCHAR2 non-ASCII that the database charset can represent round-trips
         # (#174). On 9i (WE8ISO8859P1) the server converts the AL32UTF8 session
