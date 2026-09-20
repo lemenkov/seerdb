@@ -950,6 +950,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         ReturnBinds=None,
         scrollable: bool = False,
         Prefetch: int | None = None,
+        ParseOnly: bool = False,
     ) -> object:
         """Same shape as `OracleConnect.execute` but async.
 
@@ -968,6 +969,15 @@ class AsyncOracleConnect(_ConnectionLogic):
         if self._dialect is not None:
             from seerdb.client.connection import _check_fv2_bind_sizes
 
+            if ParseOnly:
+                # No parse-without-execute shape exists on these tiers -- see
+                # the sync twin.
+                from seerdb.common.exceptions import NotSupportedError
+
+                raise NotSupportedError(
+                    'cursor.parse() is not supported on Oracle '
+                    + _pre10_tier_name_for(self._dialect)
+                )
             _check_fv2_bind_sizes(Bind, Batch)
             if Batch and CAP_ARRAY_DML not in self._dialect.capabilities():
                 from seerdb.common.exceptions import NotSupportedError
@@ -1027,6 +1037,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             self._cursor_cache.clear()
         if (
             Type == 'change'
+            and not ParseOnly
             and is_reusable_dml(Query)
             and not Def
             and self.field_version < FIELD_VERSION_12_1
@@ -1058,6 +1069,8 @@ class AsyncOracleConnect(_ConnectionLogic):
             # at CURRENT (describe-only — rows come from scroll_fetch).
             'scrollable': scrollable,
             'scroll': (TNS_FETCH_ORIENTATION_CURRENT, 1) if scrollable else None,
+            # `cursor.parse()` (#1018): parse the statement and stop there.
+            'parse_only': ParseOnly,
         }
         Pre = (
             self._flush_cursor_closes_bytes()  # close drained cursors (#191)
@@ -1137,7 +1150,9 @@ class AsyncOracleConnect(_ConnectionLogic):
             # open for the scroll re-executes (#181). The cursor frees it on
             # close / re-execute.
             return Result
-        Drained = await self._drain_cursor(Result)
+        # A parse leaves a described cursor with no result set; draining it
+        # fetches from a cursor the parse never positioned (ORA-01002, #1018).
+        Drained = Result if ParseOnly else await self._drain_cursor(Result)
         # Queue the statement's own server cursor for close unless cached (#191).
         if (
             not Stored

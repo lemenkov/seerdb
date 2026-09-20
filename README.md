@@ -288,6 +288,7 @@ the 12c+ protocol the 21c tier exercises.
 | **Transactions** — commit, rollback, autocommit, ping | ✅ |
 | **Array DML** — `executemany`, `getbatcherrors`, `getarraydmlrowcounts` (12.1+) | ✅ |
 | **Result handling** — large-result `TTI_FETCH` drain, server-side scrollable cursors (`scroll()`, with a client-buffered fallback), `rowfactory`, `lastrowid` | ✅ |
+| **Statement validation** — `cursor.parse()` parses a statement on the server without running it (10g+) | ✅ |
 | **Arrow / DataFrame fetch** — `cursor.fetch_df_all` / `fetch_df_batches` (pyarrow `Table` / record batches) | ✅ |
 | **SODA** — document store over `DBMS_SODA`: collections, documents, query-by-example (with streaming), insert / read / upsert / update / delete / bulk, indexing + data guide (18c+) | ✅ |
 | **Connection** — pool (warm sessions + idle health-check), statement cache, `changepassword`, TLS, wallet mTLS, DRCP (`cclass` / `purity`), proxy auth, an opt-in negotiation cache that skips a round trip on fast-auth reconnects | ✅ |

@@ -1490,6 +1490,7 @@ class OracleConnect(_ConnectionLogic):
         ReturnBinds=None,
         scrollable: bool = False,
         Prefetch: int | None = None,
+        ParseOnly: bool = False,
     ) -> object:
         if Bind is None:
             Bind = []
@@ -1503,6 +1504,18 @@ class OracleConnect(_ConnectionLogic):
         # driven by _drive; the connection is a thin orchestrator (#369). Neither
         # tier carries an autocommit bit, so commit is explicit.
         if self._dialect is not None:
+            if ParseOnly:
+                # The pre-10g dialects build their own request (TTI_ALL7 / the
+                # 8i OALL8), and both hard-wire PARSE|EXECUTE — there is no
+                # parse-without-execute shape to send. Running the statement
+                # instead would be worse than refusing: `cursor.parse()` is what
+                # callers use to validate a statement they do *not* want run.
+                from seerdb.common.exceptions import NotSupportedError
+
+                raise NotSupportedError(
+                    'cursor.parse() is not supported on Oracle '
+                    + _pre10_tier_name_for(self._dialect)
+                )
             _check_fv2_bind_sizes(Bind, Batch)
             if Batch and CAP_ARRAY_DML not in self._dialect.capabilities():
                 # Array DML (executemany) would silently apply only the first row
@@ -1583,6 +1596,7 @@ class OracleConnect(_ConnectionLogic):
             self._cursor_cache.clear()
         if (
             Type == 'change'
+            and not ParseOnly
             and is_reusable_dml(Query)
             and not Def
             and self.field_version < FIELD_VERSION_12_1
@@ -1616,6 +1630,10 @@ class OracleConnect(_ConnectionLogic):
             # rows come from later scroll_fetch re-executes).
             'scrollable': scrollable,
             'scroll': (TNS_FETCH_ORIENTATION_CURRENT, 1) if scrollable else None,
+            # `cursor.parse()` (#1018): ask the server to parse the statement
+            # and stop there. A query still owes its describe, so the reply is
+            # the describe alone; anything else answers a bare status.
+            'parse_only': ParseOnly,
         }
         # Piggybacks in front of this execute (each gets a seq before the
         # execute's): close any drained server cursors queued from prior calls
@@ -1705,7 +1723,12 @@ class OracleConnect(_ConnectionLogic):
             # open for the scroll re-executes (#181). The cursor closes it when
             # the user closes / re-executes the cursor.
             return Result
-        Drained = self._drain_cursor(Result)
+        # A parse describes the query without running it, so the cursor it
+        # leaves behind has no result set to drain. Draining anyway sent a
+        # TTI_FETCH the parse had not positioned, and the server answered
+        # ORA-01002 (fetch out of sequence) — a correct parse reported as a
+        # failure (#1018). The cursor is still queued for close below.
+        Drained = Result if ParseOnly else self._drain_cursor(Result)
         # Queue the statement's own server cursor for close unless it was cached
         # for reuse (#191). The result set is fully buffered by now, and this is
         # the main statement cursor — REF CURSOR / implicit-result cursors carry
