@@ -3795,12 +3795,23 @@ class CursorWarningIntegration(_IntegrationBase):
             self.skipTest('the OER warn byte is not located on fv2')
 
     def _bad_procedure(self, name: str) -> None:
-        self.cur.execute(
-            f"""CREATE OR REPLACE PROCEDURE {name} AS
-                BEGIN
-                    NULL
-                END;"""  # the missing semicolon is the point
-        )
+        # Creating an object that does NOT compile is the precondition of this
+        # whole class, and it is an Oracle behaviour: the statement succeeds and
+        # the object exists, invalid. A backend without those semantics rejects
+        # the statement outright -- Mirror-over-PostgreSQL answers ORA-00900 --
+        # and there is no warning to report because there was no create. Skip on
+        # that rather than fail, and say which it is (#993).
+        from seerdb.common.exceptions import DatabaseError
+
+        try:
+            self.cur.execute(
+                f"""CREATE OR REPLACE PROCEDURE {name} AS
+                    BEGIN
+                        NULL
+                    END;"""  # the missing semicolon is the point
+            )
+        except DatabaseError as exc:
+            self.skipTest(f'this backend refuses an invalid CREATE outright: {exc}')
 
     def tearDown(self):
         from seerdb.common.exceptions import DatabaseError
