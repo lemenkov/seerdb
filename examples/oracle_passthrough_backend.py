@@ -995,6 +995,9 @@ def _to_column_meta(desc: tuple) -> ColumnMeta:
     # upstream describe does not report it (falls back to FLOAT32).
     vector_format = getattr(desc, 'vector_format', None)
     vector_dimensions = getattr(desc, 'vector_dimensions', None)
+    # The flags byte says whether the dimension count means anything: a flexible
+    # column allows ANY number, and its count is 0 (#1013).
+    vector_flags = getattr(desc, 'vector_flags', None)
     # An object (ADT) column carries its type identity in the describe (unlike a
     # REF, whose identity is enriched from values below); re-emit it so the
     # external client can resolve the object type (#888). FetchInfo exposes it.
@@ -1035,6 +1038,7 @@ def _to_column_meta(desc: tuple) -> ColumnMeta:
         null_ok=int(bool(null_ok)),
         vector_format=vector_format,
         vector_dimensions=vector_dimensions,
+        vector_flags=vector_flags,
         type_oid=type_oid,
         type_schema=type_schema,
         type_name=type_name,

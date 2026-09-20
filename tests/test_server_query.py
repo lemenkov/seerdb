@@ -3604,6 +3604,42 @@ def test_a_binds_charset_form_reaches_the_backend() -> None:
     assert [b.csfrm for b in binds] == [2, 1]
 
 
+def test_the_describe_relays_a_vector_columns_flags() -> None:
+    # A VECTOR column that allows ANY number of dimensions says so with a flag,
+    # and the count beside it is 0. Zeroing the flag tells the client the column
+    # allows exactly none -- a different claim, and a wrong one (#1013).
+    from seerdb.common.tns import ColumnMeta, encode_describe
+    from seerdb.common.tns_consts import (
+        FIELD_VERSION_23_4,
+        TNS_TYPE_VECTOR,
+        VECTOR_FLAG_FLEXIBLE_DIM,
+    )
+
+    def described(**kw) -> bytes:
+        col = ColumnMeta(
+            name=b'V',
+            data_type=TNS_TYPE_VECTOR,
+            data_length=0,
+            max_size=0,
+            **kw,
+        )
+        with _at_field_version(FIELD_VERSION_23_4):
+            return encode_describe([col])
+
+    flexible = described(
+        vector_dimensions=0, vector_format=2, vector_flags=VECTOR_FLAG_FLEXIBLE_DIM
+    )
+    fixed = described(vector_dimensions=16, vector_format=2, vector_flags=0)
+    # The two describes differ, and by more than the dimension count: without
+    # the flag a client reads the flexible column's 0 as a real answer.
+    assert flexible != fixed
+    assert VECTOR_FLAG_FLEXIBLE_DIM in flexible
+
+    # A column with no vector metadata at all still encodes a zero flag.
+    plain = described()
+    assert plain != flexible
+
+
 def test_a_vector_out_bind_carries_its_image_not_a_locator() -> None:
     # A VECTOR is never fetched over TTI_LOBOPS -- the server prefetches the
     # whole value into the reply. That was settled for COLUMNS in #887 and for
