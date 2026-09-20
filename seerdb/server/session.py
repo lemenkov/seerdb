@@ -2231,12 +2231,14 @@ def _run_returning(backend: Backend, sql: str, request: ExecRequest) -> Result:
     # type CHAR". The client does send it -- measured -- it was simply dropped
     # here (#826).
     toids = [(bt[3] if len(bt) > 3 else b'') for bt in (request.bind_types or [])]
+    forms = [(bt[1] if len(bt) > 1 else _CSFRM_DB) for bt in (request.bind_types or [])]
     rows = [
         [
             BindVar(
                 value=None,
                 tns_type=meta[i][0],
                 max_size=meta[i][1],
+                csfrm=forms[i] if i < len(forms) else _CSFRM_DB,
                 toid=toids[i] if i < len(toids) else b'',
             )
             if i in request.return_binds
@@ -2298,18 +2300,24 @@ def _bind_vars(request: ExecRequest) -> list:
     toids = [(bt[3] if len(bt) > 3 else b'') for bt in (request.bind_types or [])] or [
         b''
     ] * len(request.binds)
+    # The charset form rides on bind_types as the 2nd field. A national bind is
+    # the ordinary type plus csfrm 2, so a backend given tns_type alone binds
+    # NVARCHAR2 as VARCHAR2 and a PL/SQL table of the former rejects it (#990).
+    forms = [(bt[1] if len(bt) > 1 else _CSFRM_DB) for bt in (request.bind_types or [])]
+    forms = forms or [_CSFRM_DB] * len(request.binds)
     return [
         BindVar(
             value=value,
             tns_type=tns_type,
             max_size=size,
             array_size=capacity,
+            csfrm=csfrm,
             toid=toid,
         )
         if block or value is None
         else value
-        for value, (tns_type, size), capacity, toid in zip(
-            request.binds, request.bind_meta, arrays, toids
+        for value, (tns_type, size), capacity, csfrm, toid in zip(
+            request.binds, request.bind_meta, arrays, forms, toids
         )
     ]
 

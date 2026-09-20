@@ -591,7 +591,7 @@ class OraclePassthroughBackend:
                     sizes.append(None)
                     resolved.append(TempLob(locator, is_blob))
                 elif isinstance(b, BindVar):
-                    sizes.append(dbtype_for_oracle_type(b.tns_type, 1))
+                    sizes.append(dbtype_for_oracle_type(b.tns_type, b.csfrm))
                     resolved.append(b.value)
                 else:
                     sizes.append(None)
@@ -686,7 +686,7 @@ class OraclePassthroughBackend:
             if objtype is not None:
                 receivers[i] = cursor.var(objtype)
                 continue
-            dbtype = dbtype_for_oracle_type(bind.tns_type, 1)
+            dbtype = dbtype_for_oracle_type(bind.tns_type, bind.csfrm)
             size = bind.max_size if bind.max_size and bind.max_size > 0 else None
             receivers[i] = (
                 cursor.var(dbtype, size) if dbtype is not None else cursor.var(str)
@@ -762,7 +762,7 @@ class OraclePassthroughBackend:
                 if objtype is not None:
                     variables.append(cursor.var(objtype))
                     continue
-            dbtype = dbtype_for_oracle_type(bind.tns_type, 1)
+            dbtype = dbtype_for_oracle_type(bind.tns_type, bind.csfrm)
             if bind.array_size:
                 # An associative-array bind (#743): an array variable of the
                 # declared capacity, seeded with the elements the client sent

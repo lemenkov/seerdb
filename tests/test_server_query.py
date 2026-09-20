@@ -3496,6 +3496,37 @@ def test_encode_out_bind_response_thin_roundtrips_via_client() -> None:
     assert v_io.getvalue() == 'hi!'
 
 
+def test_a_binds_charset_form_reaches_the_backend() -> None:
+    # A national bind is not a distinct TNS type -- NVARCHAR2 is VARCHAR with
+    # csfrm 2 -- so a backend handed tns_type alone resolves the wrong type and
+    # binds NVARCHAR2 as VARCHAR2 upstream. A PL/SQL table of the former then
+    # rejects it with PLS-00418 (#990). The form rides on the OAC and the Mirror
+    # already keeps it; it simply never reached BindVar.
+    from dataclasses import replace
+
+    from seerdb.server.backend import BindVar
+    from seerdb.server.session import _bind_vars
+
+    seeded = Var(str, is_array=True, num_elements=3)
+    seeded.setvalue(0, ['a', 'b'])
+    msg = _client_exec_request(
+        17, 'BEGIN p(:1, :2); END;', [seeded, 'plain'], kind='block'
+    )
+    with _at_field_version(17):
+        req = parse_exec(msg)
+    # Force the national form on the first bind, as an NVARCHAR OAC would.
+    req = replace(
+        req,
+        bind_types=[
+            (t, 2 if i == 0 else 1, m, o)
+            for i, (t, _c, m, o) in enumerate(req.bind_types)
+        ],
+    )
+    binds = _bind_vars(req)
+    assert all(isinstance(b, BindVar) for b in binds)
+    assert [b.csfrm for b in binds] == [2, 1]
+
+
 def test_encode_out_bind_response_thin_lob_roundtrips_via_client() -> None:
     # A LOB-class OUT bind rides as the LOB block, not a DALC (#979): the client
     # reads it with the reader a fetched LOB column uses, and gets a LOB whose
