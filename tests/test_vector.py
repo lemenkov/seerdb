@@ -214,5 +214,58 @@ class TestSparseVector(unittest.TestCase):
         self.assertEqual(decode_vector(img), sv)
 
 
+class TestNativeBindLength(unittest.TestCase):
+    """The image-length field of a native VECTOR / JSON bind is THREE bytes.
+
+    Written as a ub2 it encoded correctly for every image under 64 KiB and
+    raised OverflowError above it, so a float64 VECTOR of more than ~8,000
+    dimensions never reached the wire (#1008). The framing below is from a live
+    23ai, binding one column with a 4-dimension vector and a 30,000-dimension
+    one and aligning the two on the descriptor:
+
+        SMALL  ... 01 00 00 00 00 | 00 00 31 | 00 00 ...   image = 49
+        LARGE  ... 01 00 00 00 00 | 03 a9 91 | 00 00 ...   image = 240,017
+    """
+
+    def _length_field(self, size: int) -> bytes:
+        from seerdb.common.tns import _native_lob_bind_value
+
+        body = _native_lob_bind_value(b'x' * size)
+        # The field sits where the 19-byte descriptor used to end: its last
+        # byte was really this field's high byte.
+        return body[18:21]
+
+    def test_a_small_image_is_unchanged(self):
+        # The case that always worked must keep the same bytes -- the capture
+        # shows 00 00 31 for a 49-byte image, and reading the field as a ub2 at
+        # 19..20 gives the same answer, which is exactly why this went unnoticed.
+        self.assertEqual(self._length_field(49), bytes.fromhex('000031'))
+
+    def test_a_large_image_no_longer_overflows(self):
+        self.assertEqual(self._length_field(240017), bytes.fromhex('03a991'))
+
+    def test_the_largest_vector_the_server_accepts_fits(self):
+        # 65,533 float64 dimensions is the documented maximum; its image is
+        # ~512 KB, which a two-byte field cannot express at all.
+        from seerdb.common.tns import _native_lob_bind_value
+
+        size = 65533 * 8 + 17
+        field = self._length_field(size)
+        self.assertEqual(int.from_bytes(field, 'big'), size)
+        # and the whole value still frames -- the image rides as a chunked DALC.
+        self.assertGreater(len(_native_lob_bind_value(b'x' * size)), size)
+
+    def test_the_descriptor_head_and_the_field_do_not_drift(self):
+        # The head is derived from the shared descriptor rather than copied, so
+        # a change to one cannot silently disagree with the other.
+        from seerdb.common.tns import (
+            _VECTOR_BIND_DESCRIPTOR_HEAD,
+            VECTOR_BIND_DESCRIPTOR,
+        )
+
+        self.assertEqual(_VECTOR_BIND_DESCRIPTOR_HEAD, VECTOR_BIND_DESCRIPTOR[:-1])
+        self.assertEqual(VECTOR_BIND_DESCRIPTOR[-1], 0)
+
+
 if __name__ == '__main__':
     unittest.main()

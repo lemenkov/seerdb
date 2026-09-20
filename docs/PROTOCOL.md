@@ -4010,13 +4010,29 @@ python-oracledb). The full exec bind for a vector is `OAC | TTI_RXD | value`:
   leading zero of `00 10 00 00` is kept), so they are encoded fixed-width to match
   the capture. Without the `0x02000000` flag the server rejects the inline value
   (ORA-03120); a too-short OAC desyncs (ORA-03106).
-- **Value** (`encode_token_rxd`, after the `TTI_RXD`=0x07 token): a fixed 19-byte
-  **descriptor** (`01 28 28 00 26 00 04 61 08 00 00 00 01 00 00 00 00 00 00` —
-  the same one python-oracledb uses for any LOB-backed inline bind, so #70 JSON
-  reuses it), then the **image length (ub2)**, **22 zero bytes**, then the image
-  framed like RAW (`encode_chr`: a single length byte < 254, else the `0xFE`
-  marker + `ub4` chunks). Both constants are stable across element types and
-  sizes; works at field version 16 and 17.
+- **Value** (`encode_token_rxd`, after the `TTI_RXD`=0x07 token): an 18-byte
+  **descriptor** (`01 28 28 00 26 00 04 61 08 00 00 00 01 00 00 00 00 00` — the
+  same one python-oracledb uses for any LOB-backed inline bind, so #70 JSON
+  reuses it), then the **image length as THREE bytes**, **22 zero bytes**, then
+  the image framed like RAW (`encode_chr`: a single length byte < 254, else the
+  `0xFE` marker + `ub4` chunks). Works at field version 16 and 17.
+
+  **The length is three bytes, and that is easy to get wrong (#1008).** The
+  descriptor is often written as 19 bytes ending in `00` followed by a `ub2`
+  length — which produces identical bytes for every image under 64 KiB, because
+  that trailing `00` *is* the field's high byte. It only shows up above the
+  ceiling, where a `ub2` cannot hold the value at all. Measured on a live 23ai,
+  binding one column with a 4-dimension vector and a 30,000-dimension one and
+  aligning the two on the descriptor:
+
+  ```
+  SMALL  ... 01 00 00 00 00 | 00 00 31 | 00 00 ...    image = 49 bytes
+  LARGE  ... 01 00 00 00 00 | 03 a9 91 | 00 00 ...    image = 240,017 bytes
+                              ^^^^^^^^
+  ```
+
+  Three bytes allows 16 MiB, past the 65,533-dimension maximum — a float64
+  vector that size has a ~512 KB image.
 - **Image** (`encode_vector`): the read image (§18) with the 8-byte norm sent as
   **zeros** (the server recomputes it). FLOAT32/64 use the sortable encoding,
   INT8 raw bytes, BINARY packed bytes; a SparseVector emits the §18.2 sparse

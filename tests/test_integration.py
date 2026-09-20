@@ -3027,6 +3027,32 @@ class VectorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT v FROM {self.TABLE}')
         return self.cur.fetchone()[0]
 
+    def test_a_vector_larger_than_64_kib(self):
+        # The image length is a three-byte field; written as a ub2 it raised
+        # OverflowError for anything past 64 KiB, so a float64 vector of more
+        # than ~8,000 dimensions never reached the wire (#1008). 30,000
+        # dimensions is 240 KB -- comfortably over the old ceiling and well
+        # under the 65,533 maximum, so this tests the fix and not the limit.
+        import array
+
+        Dims = 30000
+        Value = array.array('d', [2.5] * Dims)
+        Got = self._bind_roundtrip(f'VECTOR({Dims}, float64)', Value)
+        self.assertEqual(len(Got), Dims)
+        self.assertEqual(Got[0], 2.5)
+        self.assertEqual(Got[-1], 2.5)
+
+    def test_the_largest_vector_the_server_accepts(self):
+        # 65,533 float64 dimensions is the documented maximum: a ~512 KB image,
+        # which is what python-oracledb's own suite binds.
+        import array
+
+        Dims = 65533
+        Value = array.array('d', [1.25] * Dims)
+        Got = self._bind_roundtrip(f'VECTOR({Dims}, float64)', Value)
+        self.assertEqual(len(Got), Dims)
+        self.assertEqual(Got[0], 1.25)
+
     def test_float32(self):
         got = self._roundtrip('VECTOR(3, FLOAT32)', '[1.5, 2.5, 3.5]')
         self.assertEqual(got, array.array('f', [1.5, 2.5, 3.5]))
