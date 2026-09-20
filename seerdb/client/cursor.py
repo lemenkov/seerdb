@@ -820,10 +820,17 @@ def _assign_return_binds(Bind, Result) -> None:
     from seerdb.common.types import decode_value
 
     PerBind: dict = {}
+    Truncated: list = []
     for Record in Records:
-        for Pos, Values in zip(Record['return_positions'], Record['return_values']):
+        Lengths = Record.get('return_lengths') or []
+        for Index, (Pos, Values) in enumerate(
+            zip(Record['return_positions'], Record['return_values'])
+        ):
             if Pos >= len(Bind) or not isinstance(Bind[Pos], Var):
                 continue
+            Truncated += _truncated_returns(
+                Values, Lengths[Index] if Index < len(Lengths) else []
+            )
             Variable = Bind[Pos]
             TnsType = Variable.dbtype.tns_type
             if TnsType in _PREFETCHED_IMAGE_TYPES:
@@ -862,6 +869,36 @@ def _assign_return_binds(Bind, Result) -> None:
         Variable._value = Iterations[0]
         Variable._iteration_values = Iterations if len(Iterations) > 1 else None
         Variable.has_value = True
+    if Truncated:
+        # Reported only now, with every Var assigned: the values that did fit
+        # are correct and worth keeping, and the statement really ran -- the
+        # DML is committed or pending on the server either way, exactly as it
+        # is for python-oracledb, which raises the same DPY-4002 here (#1021).
+        Got, Wanted = Truncated[0]
+        raise DatabaseError(
+            f'DPY-4002: column truncated to {Got} characters. Untruncated was {Wanted}'
+        )
+
+
+def _truncated_returns(Values, Lengths) -> list:
+    # The (received, actual) pairs among a return bind's values the server
+    # marked truncated (#1021). The trailing sb4 is the value's actual length,
+    # and only ONE of its shapes is a report: a positive length longer than
+    # what arrived. 0 is "it fitted" and -1 is "this value is NULL" -- measured
+    # on a live 23ai, where a NULL return of any type sends -1, LOB or not.
+    # Reading -1 as a report made `RETURNING ClobCol` into a NULL variable
+    # raise instead of returning None.
+    #
+    # Only a value that arrived as bytes can be compared, which is the whole
+    # set that truncates this way: a LOB, object or JSON / VECTOR return bind
+    # carries its own framing and its length field says nothing about a buffer.
+    Out = []
+    for Value, Actual in zip(Values, Lengths):
+        if not isinstance(Value, (bytes, bytearray)):
+            continue
+        if Actual > len(Value):
+            Out.append((len(Value), Actual))
+    return Out
 
 
 def _extract_implicit_results(Result) -> list:

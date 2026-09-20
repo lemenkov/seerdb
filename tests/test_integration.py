@@ -966,6 +966,62 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute('SELECT 1 FROM dual')
         self.assertEqual(self.cur.fetchall(), [(1,)])
 
+    def test_a_too_small_returning_variable_is_reported(self):
+        # A RETURNING value that does not fit its variable comes back cut down,
+        # and the server says so in the sb4 after the value -- 0 when it fitted,
+        # the untruncated length when it did not. Discarding that field turned a
+        # wrong answer into a plausible one: the variable held half a string and
+        # nothing was raised (#1021).
+        self._skip_if_mirror('the RETURNING actual-length field (#1023)')
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, v VARCHAR2(40))')
+        small = self.cur.var(str, 2)
+        with self.assertRaises(seerdb.DatabaseError) as ctx:
+            self.cur.execute(
+                f'INSERT INTO {self.TABLE} (id, v) VALUES (1, :1) RETURNING v INTO :2',
+                ['a value far longer than two characters', small],
+            )
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            # Pre-10g runs RETURNING as a PL/SQL block (#801), where the INTO
+            # target is an ordinary OUT bind — so the *server* catches it, and
+            # says so in its own words. Reported either way, which is the point.
+            self.assertEqual(ctx.exception.code, 6502)
+        else:
+            self.assertIn('DPY-4002', str(ctx.exception))
+        # The session is still usable: the report comes after the whole response
+        # has been read, not part way through it.
+        self.cur.execute('SELECT 1 FROM dual')
+        self.assertEqual(self.cur.fetchall(), [(1,)])
+
+    def test_a_returning_variable_that_fits_is_untouched(self):
+        # The companion: the same statement into a big-enough variable must not
+        # be reported. A rule of "non-zero means truncated" is only safe if what
+        # fits really does report 0, on every tier.
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, v VARCHAR2(40))')
+        big = self.cur.var(str, 100)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} (id, v) VALUES (1, :1) RETURNING v INTO :2',
+            ['a value far longer than two characters', big],
+        )
+        self.assertEqual(big.getvalue(), ['a value far longer than two characters'])
+
+    def test_a_null_returning_value_is_not_a_truncation(self):
+        # A NULL returned value carries -1 in the same actual-length field, on
+        # every type. Read as "the untruncated length" it turns every NULL
+        # RETURNING into a truncation report (#1021) -- which is how the live
+        # matrix caught the first cut of this check, on a NULL LOB.
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            # Pre-10g runs RETURNING as a PL/SQL block (#801), and that rewrite
+            # collapses "the value is NULL" into "nothing matched" -- [] rather
+            # than [None]. A separate bug in a separate mechanism (#1022); this
+            # test is about the wire field.
+            self.skipTest('pre-10g reports a NULL RETURNING value as no rows (#1022)')
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, v VARCHAR2(40))')
+        got = self.cur.var(str, 100)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} (id) VALUES (1) RETURNING v INTO :1', [got]
+        )
+        self.assertEqual(got.getvalue(), [None])
+
     def test_failing_array_returning_raises_cleanly(self):
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER NOT NULL, v NUMBER)')
         got = self.cur.var(int)

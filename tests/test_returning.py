@@ -13,7 +13,7 @@ import unittest
 from seerdb.client.connection import OracleConnect
 from seerdb.client.cursor import _assign_return_binds
 from seerdb.common.datatypes import Var
-from seerdb.common.exceptions import InterfaceError
+from seerdb.common.exceptions import DatabaseError, InterfaceError
 from seerdb.common.sqltext import returning_bind_positions
 from seerdb.common.tns import (
     FLUSH_OUT_BINDS,
@@ -111,6 +111,19 @@ _RXD_TWO = (
 )
 
 # One NUMBER bind, two rows (multi-row DML RETURNING): 42 then 43.
+# The same one-bind, one-row shape as _RXD_TWO's second bind, but with the
+# trailing sb4 carrying 23 instead of 0: the server saying the value it just
+# sent was cut down from 23 bytes to fit the client's variable (#1021).
+_RXD_TRUNCATED = (
+    bytes([7])
+    + bytes.fromhex('0101')  # num_rows = 1
+    + bytes.fromhex('02')
+    + b'A '
+    + bytes.fromhex('0117')  # sb4 actual length = 23
+    + bytes([TTI_STA])
+)
+
+
 _RXD_MULTI = (
     bytes([7])
     + bytes.fromhex('0102')  # num_rows = 2
@@ -171,7 +184,12 @@ def _lob_returning_rxd(values: list[bytes | None]) -> bytes:
                 with_metadata=True,
                 locator=bytes([0x00, 0x26]) + bytes(36) + bytes([index]),
             )
-        out += encode_sb4(0)  # sb4 truncation length
+        # The actual-length field: -1 for a NULL, 0 for a value that fitted.
+        # A real 23ai sends -1 here, and writing 0 hid a bug the live matrix
+        # caught instead -- a NULL LOB return was read as a truncation (#1021).
+        # -1 is sign-magnitude on the wire (§12.1): the high bit of the
+        # length byte is the sign, so 0x81 0x01 rather than encode_sb4.
+        out += bytes([0x81, 0x01]) if value is None else encode_sb4(0)
     return out + bytes([TTI_STA])
 
 
@@ -243,6 +261,56 @@ class TestReturningDecode(unittest.TestCase):
     def test_multi_row(self):
         rec = self._decode(_RXD_MULTI, [0])
         self.assertEqual(rec['return_values'][0], [b'\xc1\x2b', b'\xc1\x2c'])
+
+    def test_a_truncated_value_is_reported_not_silently_returned(self):
+        # A RETURNING value too big for its variable comes back cut down, and
+        # the trailing sb4 -- otherwise 0 -- carries the untruncated length.
+        # Discarding it turned a wrong answer into a plausible one: `var(str, 2)`
+        # returned 'A ' and said nothing (#1021). Measured on a live 23ai.
+        rec = self._decode(_RXD_TRUNCATED, [0])
+        self.assertEqual(rec['return_values'][0], [b'A '])
+        self.assertEqual(rec['return_lengths'][0], [23])
+        bind = [Var(str)]
+        with self.assertRaises(DatabaseError) as ctx:
+            _assign_return_binds(bind, (None, None, None, None, [rec]))
+        self.assertIn('DPY-4002', str(ctx.exception))
+        self.assertIn('23', str(ctx.exception))
+
+    def test_a_value_that_fitted_reports_nothing(self):
+        # The companion: every value here carries a 0 length, so the same code
+        # path must stay silent. A rule of "non-zero means truncated" is only
+        # safe if what fits really does report 0.
+        rec = self._decode(_RXD_TWO, [1, 2])
+        self.assertEqual(rec['return_lengths'], [[0], [0]])
+        bind = ['input', Var(int), Var(str)]
+        _assign_return_binds(bind, (None, None, None, None, [rec]))
+        self.assertEqual(bind[2].getvalue(), ['hi'])
+
+    def test_a_length_equal_to_what_arrived_is_not_a_truncation(self):
+        # Defensive: a server that echoed the true length for a value that DID
+        # fit must not be read as a truncation report.
+        rec = self._decode(_RXD_TRUNCATED, [0])
+        rec['return_lengths'] = [[len(rec['return_values'][0][0])]]
+        bind = [Var(str)]
+        _assign_return_binds(bind, (None, None, None, None, [rec]))
+        self.assertEqual(bind[0].getvalue(), ['A '])
+
+    def test_a_null_return_is_not_a_truncation(self):
+        # A NULL returned value carries -1 in the actual-length field, on every
+        # type -- measured on a live 23ai with a NUMBER, a VARCHAR2, a RAW and a
+        # CLOB. Read as "the untruncated length", it turned every NULL RETURNING
+        # into a DPY-4002 (#1021); the live matrix caught it, the offline
+        # fixture did not, because the fixture wrote 0.
+        from seerdb.common.tns_consts import TNS_TYPE_CLOB
+
+        set_decode_return_binds([0], {0: TNS_TYPE_CLOB})
+        (Done, Acc) = decode_token_rxd(_lob_returning_rxd([None]), (None, None, []))
+        self.assertTrue(Done)
+        rec = Acc[2][0]
+        self.assertEqual(rec['return_lengths'][0], [-1])
+        bind = [Var(str)]
+        _assign_return_binds(bind, (None, None, None, None, [rec]))
+        self.assertEqual(bind[0].getvalue(), [None])
 
     def test_assign_decodes_by_var_type(self):
         rec = self._decode(_RXD_TWO, [1, 2])  # binds at positions 1 and 2
