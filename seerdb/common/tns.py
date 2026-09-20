@@ -11646,9 +11646,20 @@ def encode_token_rxd(Token: object) -> bytes:
         if Token.is_array:
             # Associative-array bind (#122): a ub4 element count then each
             # element value, in order. Empty (count 0) for a pure-OUT array.
+            #
+            # Each ELEMENT of a national array rides as AL16UTF16 too. The
+            # charset form is a property of the BIND, not of the value, and an
+            # element is encoded as a bare Python value -- so it never reached
+            # the csfrm rule below and went out as UTF-8. The server read those
+            # bytes as UTF-16BE and got a string of half the length, with no
+            # error, because they are a perfectly valid if wrong string (#991).
             Elements = cast(list, Token._value or [])
+            National = getattr(Token.dbtype, 'csfrm', 1) == _CSFRM_NCHAR
             Out = encode_sb4(len(Elements))
             for Element in Elements:
+                if National and isinstance(Element, str):
+                    Out += encode_chr(Element.encode('utf-16-be'))
+                    continue
                 Out += encode_token_rxd(Element)
             return Out
         if Token.dbtype.tns_type == TNS_TYPE_REFCURSOR:

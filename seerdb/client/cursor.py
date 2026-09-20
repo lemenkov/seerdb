@@ -677,7 +677,15 @@ def _assign_out_binds(Bind, Result) -> list:
         Variable = _bind_var(Bind[Pos])
         if Variable is None:
             continue
-        Column = {'data_type': Variable.dbtype.tns_type, 'charset': UTF8_CHARSET}
+        # The Var's charset form has to travel with the type: national (csfrm 2)
+        # data arrives as AL16UTF16, and _string_charset keys on exactly this.
+        # Without it every NVARCHAR OUT bind -- scalar and array alike -- came
+        # back as its raw UTF-16BE bytes read one per character (#991).
+        Column = {
+            'data_type': Variable.dbtype.tns_type,
+            'charset': UTF8_CHARSET,
+            'csfrm': getattr(Variable.dbtype, 'csfrm', 1),
+        }
         if isinstance(Value, dict) and Value.get('_refcursor'):
             RefCursors.append((Variable, Value))
         elif isinstance(Value, dict) and Value.get('_array'):
@@ -797,7 +805,13 @@ def _assign_return_binds(Bind, Result) -> None:
                 # honoured, by _resolve_return_bind_lobs.
                 PerBind.setdefault(Pos, []).append(list(Values))
                 continue
-            Column = {'data_type': TnsType, 'charset': UTF8_CHARSET}
+            # Same rule as the OUT-bind path: a national return bind's value
+            # arrives as AL16UTF16, and the charset form is what says so (#991).
+            Column = {
+                'data_type': TnsType,
+                'charset': UTF8_CHARSET,
+                'csfrm': getattr(Variable.dbtype, 'csfrm', 1),
+            }
             PerBind.setdefault(Pos, []).append(
                 [decode_value(Column, V if V else None) for V in Values]
             )

@@ -64,6 +64,54 @@ class TestArrayEncode(unittest.TestCase):
         self.assertEqual(encode_token_rxd(_arrayvar(int, 5)), encode_sb4(0))
 
 
+class TestNationalArray(unittest.TestCase):
+    """A national (csfrm 2) array carries AL16UTF16 in BOTH directions (#991).
+
+    The charset form is a property of the BIND, not of the value. An element is
+    encoded and decoded as a bare Python value, so it never saw the Var's csfrm:
+    going out it went as UTF-8, and the server read those bytes as UTF-16BE and
+    got a string of half the length -- with no error, because they are a
+    perfectly valid if wrong string. Coming back it was the raw UTF-16BE bytes
+    read one per character.
+    """
+
+    def setUp(self):
+        _ENCODE_FIELD_VERSION.set(8)
+
+    def tearDown(self):
+        _ENCODE_FIELD_VERSION.set(6)
+
+    def test_elements_go_out_as_utf16be(self):
+        from seerdb.common.datatypes import DB_TYPE_NVARCHAR
+
+        text = 'Unicode \u3042 0'  # 11 characters, 13 bytes in UTF-8
+        out = encode_token_rxd(_arrayvar(DB_TYPE_NVARCHAR, [text]))
+        # The count, then the element: a length and the AL16UTF16 bytes.
+        self.assertTrue(out.startswith(encode_sb4(1)))
+        body = out[len(encode_sb4(1)) :]
+        self.assertIn(text.encode('utf-16-be'), body)
+        self.assertNotIn(text.encode('utf-8'), body)
+
+    def test_an_ordinary_array_still_goes_out_as_utf8(self):
+        from seerdb.common.datatypes import DB_TYPE_VARCHAR
+
+        text = 'Unicode \u3042 0'
+        out = encode_token_rxd(_arrayvar(DB_TYPE_VARCHAR, [text]))
+        self.assertIn(text.encode('utf-8'), out)
+
+    def test_out_elements_are_decoded_from_utf16be(self):
+        from seerdb.common.datatypes import DB_TYPE_NVARCHAR
+
+        text = 'Test out \u3042'
+        v = _arrayvar(DB_TYPE_NVARCHAR, 10)
+        record = {
+            'out_positions': [0],
+            'out_values': [{'_array': True, 'values': [text.encode('utf-16-be')]}],
+        }
+        _assign_out_binds([v], (None, None, None, None, [record]))
+        self.assertEqual(v.getvalue(), [text])
+
+
 class TestArrayAssign(unittest.TestCase):
     def test_out_array_decoded_to_list(self):
         v = _arrayvar(int, 10)
