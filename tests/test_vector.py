@@ -214,6 +214,49 @@ class TestSparseVector(unittest.TestCase):
         self.assertEqual(decode_vector(img), sv)
 
 
+class TestFlexibleColumnMetadata(unittest.TestCase):
+    """A VECTOR column that allows ANY dimensions says so with a FLAG (#1012).
+
+    The dimension count alongside that flag is 0 and means nothing. Reporting
+    the 0 claims the column holds zero-element vectors, which is a different
+    statement and a wrong one -- python-oracledb reports None, and a caller
+    testing `if fi.vector_dimensions:` cannot tell the two apart otherwise.
+    """
+
+    def _info(self, **kw):
+        from seerdb.client.cursor import FetchInfo
+
+        return FetchInfo(('V', None, None, None, None, None, True), **kw)
+
+    def test_a_flexible_dimension_reports_none(self):
+        from seerdb.common.tns_consts import VECTOR_FLAG_FLEXIBLE_DIM
+
+        info = self._info(
+            vector_dimensions=0, vector_format=2, vector_flags=VECTOR_FLAG_FLEXIBLE_DIM
+        )
+        self.assertIsNone(info.vector_dimensions)
+        self.assertEqual(info.vector_format, 2)
+        self.assertEqual(info.vector_flags, VECTOR_FLAG_FLEXIBLE_DIM)
+
+    def test_a_fixed_dimension_is_reported(self):
+        info = self._info(vector_dimensions=16, vector_format=2, vector_flags=0)
+        self.assertEqual(info.vector_dimensions, 16)
+        self.assertEqual(info.vector_format, 2)
+
+    def test_a_flexible_format_reports_none(self):
+        # The format needs no flag -- a flexible format simply IS 0 -- but 0 is
+        # not a format either, so it reports None for the same reason.
+        info = self._info(vector_dimensions=2, vector_format=0, vector_flags=0)
+        self.assertIsNone(info.vector_format)
+        self.assertEqual(info.vector_dimensions, 2)
+
+    def test_a_non_vector_column_carries_neither(self):
+        info = self._info()
+        self.assertIsNone(info.vector_dimensions)
+        self.assertIsNone(info.vector_format)
+        self.assertIsNone(info.vector_flags)
+
+
 class TestNativeBindLength(unittest.TestCase):
     """The image-length field of a native VECTOR / JSON bind is THREE bytes.
 
