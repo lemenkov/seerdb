@@ -2378,6 +2378,12 @@ Skipping the byte loses the only signal there is: the caller is told the create
 succeeded, which is true, and never that the object it just made does not
 compile.
 
+**Server side — the Mirror (#995).** `encode_status(..., compilation_warning=True)`
+raises the bit; everything else about the reply is unchanged, because the call
+*did* succeed. The backend has to be able to tell — a passthrough reads it
+straight off its own upstream cursor, and a backend that cannot leaves it unset,
+which is what the client saw before any of this existed.
+
 **11g rowcount quirk.** The field labelled "current row number" in
 newer Oracle (and in python-oracledb's source) doubles as the affected
 row count on 11g: an UPDATE / DELETE / INSERT writes the number of

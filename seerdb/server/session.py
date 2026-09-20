@@ -2668,7 +2668,13 @@ def _answer_query(
             cursor_id = reused_id
             if not cursor_id and not _is_plsql_block(sql):
                 cursor_id = cursors.open_dml(sql, request.bind_types)
-            response = encode_status(result.rowcount, cursor_id=cursor_id)
+            # A CREATE whose PL/SQL object compiled with errors SUCCEEDS and
+            # says so only through the OER's warn bit (§6.3a, #995).
+            response = encode_status(
+                result.rowcount,
+                cursor_id=cursor_id,
+                compilation_warning=result.compilation_warning,
+            )
             # `alter session set current_schema = X` does not just succeed: the
             # server reports the new value back, and that is the ONLY place a
             # client learns it -- `connection.current_schema` never queries. A

@@ -127,6 +127,13 @@ class Result:
     implicit_results: list[tuple[list[ColumnMeta], list[tuple]]] = field(
         default_factory=list
     )
+    # True when the statement CREATED a PL/SQL object that compiled with errors
+    # (#995). The call succeeded and the object exists, invalid -- there is no
+    # error code to carry it, so it rides as bit 0x20 of the OER's warn byte,
+    # which is the only thing in the reply that differs from a clean create. A
+    # backend that cannot tell leaves it False and the client sees no warning,
+    # which is what it saw before this existed.
+    compilation_warning: bool = False
 
 
 @dataclass(frozen=True)
