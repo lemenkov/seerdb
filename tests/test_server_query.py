@@ -784,6 +784,27 @@ def test_the_status_encoder_raises_the_warn_bit() -> None:
     assert decoded[2] == 7
 
 
+def test_an_error_carries_what_the_call_managed() -> None:
+    # An executemany whose batch aborts part-way really did apply the earlier
+    # rows, and the count rides in the SAME OER field a success reports its own
+    # count in. encode_error hard-coded 0 there, so a client asking what
+    # happened was told nothing did (#998).
+    from seerdb.common.tns import decode_token_oer, encode_error
+
+    _DECODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
+    plain = decode_token_oer(encode_error(1, 'ORA-00001: dup'), (0, [], []))
+    assert plain[1] == 1
+    assert plain[3][0] == 0  # nothing applied
+
+    partial = decode_token_oer(
+        encode_error(1, 'ORA-00001: dup', rowcount=3), (0, [], [])
+    )
+    # The count rides ALONGSIDE the error, not instead of it.
+    assert partial[1] == 1
+    assert partial[5] == 'ORA-00001: dup'
+    assert partial[3][0] == 3
+
+
 def test_the_oer_warn_bit_survives_the_decode() -> None:
     # Bit 0x20 of the OER's warn byte says the call CREATED a PL/SQL object that
     # compiled with errors. The call SUCCEEDED, so nothing else in the reply

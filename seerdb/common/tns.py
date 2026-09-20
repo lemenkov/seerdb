@@ -1637,12 +1637,24 @@ def _thin_column_value(value: object, col: 'ColumnMeta') -> bytes:
     return encode_value(_national_wire_value(value, col), col.data_type)
 
 
-def encode_error(ora_code: int, message: str, error_pos: int | None = None) -> bytes:
+def encode_error(
+    ora_code: int,
+    message: str,
+    error_pos: int | None = None,
+    *,
+    rowcount: int = 0,
+) -> bytes:
     """OER reporting an error: the client raises ``ORA-<code>: <message>`` and
     the connection stays usable. ``error_pos`` is the parse offset of the error
-    (``None`` -> 0, no specific position)."""
+    (``None`` -> 0, no specific position).
+
+    ``rowcount`` is what the call MANAGED before it failed. An executemany whose
+    batch aborts part-way really did apply the earlier rows, and a real server
+    reports how many in the same field a success reports its own count -- so a
+    caller reading ``cursor.rowcount`` to decide what to retry is not told that
+    nothing happened (#998)."""
     return _encode_oer(
-        1, ora_code, 0, message.encode('utf-8'), error_pos=error_pos or 0
+        1, ora_code, rowcount, message.encode('utf-8'), error_pos=error_pos or 0
     )
 
 

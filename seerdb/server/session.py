@@ -2576,6 +2576,12 @@ def _answer_query(
                         affected += backend.execute(sql, row).rowcount
                     except BackendError as err:
                         if not request.batcherrors:
+                            # The rows before this one applied, and the client
+                            # is told how many in the error's own rowcount
+                            # field. Attaching it HERE rather than in a backend
+                            # is what makes every backend report it, not just
+                            # one that happens to track the count itself (#998).
+                            err.rowcount = affected
                             raise
                         batch_errors.append((offset, err.ora_code, err.ora_message))
                 result = Result(rowcount=affected)
@@ -2721,7 +2727,11 @@ def _answer_query(
                 )
     except BackendError as err:
         logger.info('query refused: %s', err.ora_message)
-        response = encode_error(err.ora_code, err.ora_message, err.error_offset)
+        # An executemany that aborted part-way applied the earlier rows; report
+        # how many, in the same field a success reports its count (#998).
+        response = encode_error(
+            err.ora_code, err.ora_message, err.error_offset, rowcount=err.rowcount
+        )
     except Exception as exc:
         logger.warning('backend raised a non-ORA error: %s', exc)
         response = _backend_fault_error(exc)

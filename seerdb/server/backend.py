@@ -170,7 +170,12 @@ class BackendError(Exception):
     """
 
     def __init__(
-        self, message: str, *, ora_code: int = 900, error_offset: int | None = None
+        self,
+        message: str,
+        *,
+        ora_code: int = 900,
+        error_offset: int | None = None,
+        rowcount: int = 0,
     ) -> None:
         super().__init__(message)
         self.ora_code = ora_code
@@ -179,6 +184,12 @@ class BackendError(Exception):
         # sqlplus draws its caret under), when the backend knows it; None means
         # unknown and the Mirror uses its default.
         self.error_offset = error_offset
+        # The rows this call applied BEFORE it failed. An executemany whose
+        # batch aborts part-way really did write the earlier rows, and a real
+        # server reports how many -- a caller deciding what to retry or roll
+        # back is otherwise told nothing happened (#998). 0 for everything that
+        # failed outright.
+        self.rowcount = rowcount
 
 
 class UnsupportedFeature(BackendError):
