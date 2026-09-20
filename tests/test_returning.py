@@ -720,6 +720,19 @@ class TestPreTenReturningWrap(unittest.TestCase):
         # 10g+ reports [] for a RETURNING that matched no rows; match it.
         self.assertEqual(Out[4][0]['return_values'], [[]])
 
+    def test_a_null_value_is_one_row_not_no_rows(self):
+        from seerdb.client._conn_logic import returning_block_result
+
+        # The row WAS affected and its returned value is NULL. Both arrive as an
+        # empty OUT value, and collapsing them reported a NULL RETURNING as "no
+        # rows returned" -- [] where 10g+ gives [None] (#1022). The appended
+        # SQL%ROWCOUNT tells them apart: 1 here, 0 in the test above.
+        Record = {'out_positions': [1, 2], 'out_values': [None, bytes.fromhex('c102')]}
+        Result = (0, 0, 0, (None, None), [Record], None, None, [], None)
+        Out = returning_block_result(Result, 2)
+        self.assertEqual(Out[3][0], 1)
+        self.assertEqual(Out[4][0]['return_values'], [[None]])
+
     def test_both_pre_10g_tiers_are_served(self):
         import types
 

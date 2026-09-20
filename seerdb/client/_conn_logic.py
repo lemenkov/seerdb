@@ -591,10 +591,11 @@ def returning_block_result(Result, NumBinds: int):
     every other statement's row count lives in.
 
     The shape: a native RETURNING bind hands back **a list, one entry per
-    affected row** (``[2]``, or ``[]`` when nothing matched), which is what
-    python-oracledb does and what callers on 10g+ already see. Read as a PL/SQL
-    OUT bind it would arrive as a bare scalar instead, so the same code would
-    need writing twice to be portable across tiers. Re-label the record as the
+    affected row** (``[2]``, ``[None]`` when the row's value is NULL, or ``[]``
+    when nothing matched), which is what python-oracledb does and what callers
+    on 10g+ already see. Read as a PL/SQL OUT bind it would arrive as a bare
+    scalar instead, so the same code would need writing twice to be portable
+    across tiers. Re-label the record as the
     return record the cursor's native path decodes, and the tiers agree.
 
     The block form binds at most one row -- Oracle raises ORA-01422 for more, as
@@ -612,7 +613,7 @@ def returning_block_result(Result, NumBinds: int):
     Record = Rows[0]
     RowCount = None
     ReturnPositions: list = []
-    ReturnValues: list = []
+    Raws: list = []
     for Pos, Raw in zip(
         Record.get('out_positions') or [], Record.get('out_values') or []
     ):
@@ -622,7 +623,15 @@ def returning_block_result(Result, NumBinds: int):
                 RowCount = int(Decoded)
             continue
         ReturnPositions.append(Pos)
-        ReturnValues.append([Raw] if Raw else [])
+        Raws.append(Raw)
+    # An empty OUT value means one of two things, and they are not the same
+    # answer: the statement matched no row, or it matched one whose returned
+    # value is NULL. Collapsing both into [] reported a NULL RETURNING as "no
+    # rows returned", where 10g+ gives [None] (#1022). The rowcount the rewrite
+    # already appends tells them apart -- which is why the values are built
+    # after the loop, since that bind comes last.
+    Matched = bool(RowCount)
+    ReturnValues = [[Raw] if Raw else ([None] if Matched else []) for Raw in Raws]
     NewRecord = {'return_positions': ReturnPositions, 'return_values': ReturnValues}
     Meta = Result[3][1] if isinstance(Result[3], tuple) and len(Result[3]) > 1 else None
     return Result[:3] + ((RowCount, Meta), [NewRecord]) + Result[5:]
