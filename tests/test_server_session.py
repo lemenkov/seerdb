@@ -2210,6 +2210,25 @@ def test_backend_fault_error_reports_ora600_without_recursing() -> None:
     assert b'encoded number data too long' in fault
 
 
+def test_a_parse_fault_refuses_the_call_instead_of_killing_the_session() -> None:
+    # A message cut by the transport says so with Truncated, and _complete_message
+    # waits for the rest. Anything ELSE a parser raises is a bug in that parser --
+    # but it must not take the connection down with it: the Mirror's contract is
+    # that it never desyncs, and an unhandled exception here killed the whole
+    # session (#1000). Answer the way any unservable call is answered, and let
+    # the client carry on.
+    from seerdb.server.session import _complete_message
+
+    stream: Any = _CollectingStream()
+
+    def exploding_parse(body: bytes) -> object:
+        raise ValueError('a parser bug, not a short message')
+
+    assert _complete_message(stream, b'anything', exploding_parse) is None
+    # The client was ANSWERED -- the failure mode this replaces was silence.
+    assert stream.sent, 'a parse fault left the client with no reply'
+
+
 def test_a_cursors_bind_format_is_refreshed_when_the_client_redescribes() -> None:
     # An OAC-less re-execute decodes its rows with the bind format recorded
     # against the cursor. That was recorded once, at open -- so when a client
