@@ -612,7 +612,13 @@ class OraclePassthroughBackend:
         implicit = self._drain_implicit_results(cursor)
         if implicit:
             return Result(implicit_results=implicit)
-        return Result(rowcount=cursor.rowcount or 0)
+        # A CREATE whose PL/SQL object compiled with errors succeeded upstream
+        # and said so on the upstream cursor; relay it so the client sees the
+        # same warning it would from the real server (#995).
+        return Result(
+            rowcount=cursor.rowcount or 0,
+            compilation_warning=getattr(cursor, 'warning', None) is not None,
+        )
 
     def _drain_implicit_results(
         self, cursor: object

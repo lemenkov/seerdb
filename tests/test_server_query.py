@@ -764,6 +764,26 @@ def test_long_error_message_decodes_back_at_every_field_version(version: int) ->
     assert [e['message'] for e in batch[7]] == [message, 'short']
 
 
+def test_the_status_encoder_raises_the_warn_bit() -> None:
+    # The Mirror's side of the compilation warning (#995): a status OER with the
+    # bit set, decoded back through the client's own reader. Everything else
+    # about the reply is identical -- the call SUCCEEDED -- so a test that only
+    # compared lengths or error codes would pass either way.
+    from seerdb.common.tns import decode_token_oer, encode_status
+    from seerdb.common.tns_consts import TNS_OER_WARN_COMPILATION_ERROR
+
+    plain = encode_status(3, cursor_id=7)
+    warned = encode_status(3, cursor_id=7, compilation_warning=True)
+    assert len(plain) == len(warned)
+    assert decode_token_oer(plain, (0, [], []))[10] == 0
+    decoded = decode_token_oer(warned, (0, [], []))
+    assert decoded[10] & TNS_OER_WARN_COMPILATION_ERROR
+    # and the warning rides ALONGSIDE an ordinary success: same code, rowcount,
+    # cursor id.
+    assert decoded[1] == 0
+    assert decoded[2] == 7
+
+
 def test_the_oer_warn_bit_survives_the_decode() -> None:
     # Bit 0x20 of the OER's warn byte says the call CREATED a PL/SQL object that
     # compiled with errors. The call SUCCEEDED, so nothing else in the reply

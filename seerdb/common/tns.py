@@ -214,6 +214,7 @@ from seerdb.common.tns_consts import (
     TNS_MAX_SHORT_LENGTH,
     TNS_MSG_TYPE_FAST_AUTH,
     TNS_NULL_LENGTH_INDICATOR,
+    TNS_OER_WARN_COMPILATION_ERROR,
     TNS_REDIRECT,
     TNS_SECURITY_CONTEXT_ATTACH_FLAG,
     TNS_SERVER_CONVERTS_CHARS,
@@ -1412,6 +1413,7 @@ def _encode_oer(
     error_pos: int = 0,
     sql_type: int = 0,
     call_number: int = 0,
+    warn_flags: int = 0,
 ) -> bytes:
     # An OER return-status token (§6.5, 11g) — the terminal of every response.
     # Rowid fields are zero; call status, the ORA error number, the affected-row
@@ -1445,7 +1447,9 @@ def _encode_oer(
         + encode_sb4(0)  # array element error 2
         + encode_sb4(cursor_id)  # current cursor id
         + encode_sb4(error_pos)  # error position
-        + bytes([sql_type, 0, 0, 0, 0, 0])  # sql_type, fatal, flags, opts, upi, warn
+        + bytes(
+            [sql_type, 0, 0, 0, 0, warn_flags]
+        )  # sql_type, fatal, flags, opts, upi, warn
         + encode_sb4(0)  # rowid data object number
         + encode_sb4(0)  # rowid relative file number
         + bytes(1)  # rowid reserved
@@ -1642,12 +1646,26 @@ def encode_error(ora_code: int, message: str, error_pos: int | None = None) -> b
     )
 
 
-def encode_status(rowcount: int = 0, cursor_id: int = 0) -> bytes:
+def encode_status(
+    rowcount: int = 0, cursor_id: int = 0, *, compilation_warning: bool = False
+) -> bytes:
     """OER reporting success for a non-query (DDL / DML), with the affected-row
     count. No describe, no rows — the client just sees the statement completed.
     A non-zero ``cursor_id`` lets the client's cursor cache remember the server
-    handle and re-execute the same DML by id with an empty query (#80/#486)."""
-    return _encode_oer(0, 0, rowcount, b'', cursor_id=cursor_id)
+    handle and re-execute the same DML by id with an empty query (#80/#486).
+
+    ``compilation_warning`` raises bit 0x20 of the warn byte: the statement
+    CREATED a PL/SQL object that compiled with errors. The call succeeded and
+    there is no error code to carry it, so this bit is the whole signal
+    (§6.3a, #995)."""
+    return _encode_oer(
+        0,
+        0,
+        rowcount,
+        b'',
+        cursor_id=cursor_id,
+        warn_flags=(TNS_OER_WARN_COMPILATION_ERROR if compilation_warning else 0),
+    )
 
 
 def encode_status_with_rowcounts(

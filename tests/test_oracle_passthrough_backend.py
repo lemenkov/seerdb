@@ -167,6 +167,25 @@ def test_array_bind_registers_an_array_var_of_the_declared_capacity():
     assert result.out_binds == [[1, 2], [7, 8, 9]]
 
 
+def test_a_compilation_warning_is_relayed_from_upstream():
+    # A CREATE whose PL/SQL object compiled with errors SUCCEEDED upstream and
+    # said so on the upstream cursor. The passthrough relays it so the client
+    # sees what the real server would; a backend that cannot tell leaves it
+    # False and the client sees no warning, as before (#995).
+    backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
+
+    cursor = _FakeCursor()
+    cursor.warning = object()  # the upstream driver's warning object
+    backend._conn = type('Conn', (), {'cursor': lambda self: cursor})()
+    result = backend.execute('CREATE OR REPLACE PROCEDURE p AS BEGIN null END;')
+    assert result.compilation_warning is True
+
+    clean = _FakeCursor()
+    clean.warning = None
+    backend._conn = type('Conn', (), {'cursor': lambda self: clean})()
+    assert backend.execute('CREATE TABLE t (n NUMBER)').compilation_warning is False
+
+
 def test_an_array_bind_keeps_its_national_charset_form():
     # A national bind is the ordinary TNS type plus csfrm 2, so resolving a type
     # from tns_type alone binds NVARCHAR2 as VARCHAR2 upstream and a PL/SQL table
