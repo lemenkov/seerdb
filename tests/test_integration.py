@@ -3773,6 +3773,72 @@ class ConnectAttributeIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class PartialBatchRowcountIntegration(_IntegrationBase):
+    """`cursor.rowcount` after an executemany that failed part-way (#998/#1003).
+
+    The earlier rows really were applied, and the server reports how many in the
+    same OER field a success reports its own count. The cursor set that AFTER the
+    error check, so on the raising path the attribute kept whatever it had -- the
+    -1 a fresh cursor starts with, or a count left over from an earlier
+    statement, which is the worse of the two because it looks plausible.
+    """
+
+    TABLE = 'PYORACLE_PARTIAL'
+
+    def setUp(self):
+        super().setUp()
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            # fv2 (9i / 8i) has no array DML at all -- the client refuses the
+            # call before a batch can partly apply, so there is no partial count
+            # to report.
+            self.skipTest('executemany (array DML) is not supported on fv2')
+        self.conn.autocommit = False
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (n NUMBER CONSTRAINT {self.TABLE}_pk PRIMARY KEY)'
+        )
+
+    def tearDown(self):
+        try:
+            self.conn.rollback()
+        except Exception:
+            pass
+        super().tearDown()
+
+    def test_rowcount_reports_the_rows_applied_before_the_failure(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        Rows = [(n,) for n in (1, 2, 3, 2, 5)]  # the 4th duplicates the 2nd
+        with self.assertRaises(DatabaseError):
+            self.cur.executemany(f'INSERT INTO {self.TABLE} (n) VALUES (:1)', Rows)
+        # Read it before anything else runs: the next execute replaces it.
+        Reported = self.cur.rowcount
+        self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
+        (Applied,) = self.cur.fetchone()
+        if Applied and not Reported:
+            # The rows landed but the server said nothing about them. That is a
+            # server that does not report a partial count, not a client that
+            # lost one -- Mirror-over-PostgreSQL until #998. Skip rather than
+            # fail, and say which it is.
+            self.skipTest('this server reports no count for a partly-applied batch')
+        # Asserting against what actually LANDED, not against a constant: the
+        # point is that the number means something.
+        self.assertEqual(Reported, Applied)
+
+    def test_a_statement_that_fails_outright_reports_none_applied(self):
+        # The count is what the call MANAGED, so a statement that never applied
+        # a row reports 0 -- not a leftover from the executemany before it.
+        from seerdb.common.exceptions import DatabaseError
+
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} (n) VALUES (:1)', [(10,), (11,), (12,)]
+        )
+        self.assertEqual(self.cur.rowcount, 3)
+        with self.assertRaises(DatabaseError):
+            self.cur.execute(f'INSERT INTO {self.TABLE} (n) VALUES (10)')
+        self.assertEqual(self.cur.rowcount, 0)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class CursorWarningIntegration(_IntegrationBase):
     """`cursor.warning` for a PL/SQL object created with compilation errors.
 
