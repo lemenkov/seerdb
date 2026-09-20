@@ -5438,6 +5438,42 @@ captured. The status after them must be **generated**: reusing the captured one
 freezes its sequence number, and the client then waits for a reply that never
 matches — a hang, not an error.
 
+### 22.1e The trailing `sb4` is the value's **actual length** (#1021)
+
+Every returned value is followed by an `sb4`, and it is not padding. It is the
+value's **actual length**, and it has three shapes — only one of which is a
+report. Measured on a live 23ai:
+
+| what came back | value on the wire | trailing `sb4` |
+|---|---|---|
+| 23 bytes into `var(str, 2)` | `41 20` (`'A '`) | **`01 17`** = 23 |
+| 23 bytes into `var(str, 100)` | the whole 23 bytes | `00` |
+| a NUMBER that fitted | `c1 07` | `00` |
+| **NULL** — NUMBER, VARCHAR2, RAW or CLOB alike | nothing / `00` | `81 01` = **-1** |
+
+A positive length longer than what arrived is the server's one and only report
+that what it just sent is not the whole answer. `0` means it fitted, and `-1`
+means the value is NULL — **not** a length at all, and reading it as one turns
+every NULL RETURNING into a truncation.
+
+Discard it and a too-small variable returns a **silently cut-down value** — the
+right shape with the wrong content, and no error anywhere. That is worse than a
+desync, which at least announces itself.
+
+Two rules for a client reading it. Compare the length with what actually
+arrived rather than trusting a non-zero value — that is what makes `-1` and a
+server echoing the true length for a value that *did* fit both harmless. And
+report it **after the whole message is read**, not at the value: the response
+still has the remaining binds, the RPA and the status in it, and raising part
+way through leaves the session out of step — the same trap §6.9 (`TTI_FOB`)
+sets.
+
+Only a value that arrived as plain bytes can be compared, which is the whole
+set that truncates this way. A LOB, OBJECT or JSON / VECTOR return bind carries
+its own framing (§22.1b–d) and its length field says nothing about a buffer.
+
+A server writes `0` unless it is relaying a truncation it was told about.
+
 ### 22.1d A LOB return bind carries the **LOB block** (#985)
 
 `RETURNING ClobCol INTO :b` frames the returned value exactly as a fetched LOB

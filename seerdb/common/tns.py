@@ -2910,9 +2910,11 @@ def encode_returning_response(
 
     Within a record the values are grouped **by bind, not by row**: for each
     return bind in bind order, the number of rows that iteration affected, then
-    that many values, each a DALC followed by an sb4 truncation length (always 0
-    here -- the client discards it). ``iterations`` arrives the other way round,
-    as the rows each iteration returned, so it is transposed here.
+    that many values, each a DALC followed by an sb4 **actual length** -- 0 when
+    the value fitted the client's variable, -1 when it is NULL, its untruncated
+    length when it did not fit (#1021). The Mirror's own values are never
+    truncated, so it writes 0. ``iterations`` arrives the other way round, as
+    the rows each iteration returned, so it is transposed here.
 
     A JSON or VECTOR bind is the exception to "each a DALC": its value comes back
     as the prefetched binary image with a locator behind it, the same framing such
@@ -4270,9 +4272,11 @@ def _decode_rxd_step(Data: bytes, Acc: tuple) -> tuple:
         # raw value bytes; the cursor decodes them by each Var's type. Surfaced
         # as a record the cursor maps onto its return Vars (one list per bind).
         ReturnValues = []
+        ReturnLengths = []
         for _Pos, TnsType in ReturnPositions:
             (NumRows, Rest) = decode_ub4(Rest)
             Vals = []
+            Lens = []
             for _Row in range(NumRows):
                 if TnsType in _PREFETCHED_IMAGE_TYPES:
                     # A JSON / VECTOR bind's returned value is its binary image
@@ -4299,12 +4303,23 @@ def _decode_rxd_step(Data: bytes, Acc: tuple) -> tuple:
                     (Val, Rest) = _read_object_column(Rest, {})
                 else:
                     (Val, Rest) = decode_dalc(Rest)
-                (_, Rest) = decode_ub4(Rest)  # sb4 actual length (trunc)
+                # The sb4 after the value is the value's ACTUAL length: 0 when
+                # it fitted the client's variable, -1 when the value is NULL,
+                # and the untruncated length when it did not fit. Discarding it
+                # made a too-small RETURNING variable return a silently cut-down
+                # value that looked like a correct answer (#1021). Kept here and
+                # reported by the cursor, once the whole message has been read --
+                # raising mid-decode would leave the rest of the response
+                # unparsed and the session out of step.
+                (Actual, Rest) = decode_ub4(Rest)
                 Vals.append(Val)
+                Lens.append(Actual)
             ReturnValues.append(Vals)
+            ReturnLengths.append(Lens)
         Record = {
             'return_positions': [Pos for Pos, _T in ReturnPositions],
             'return_values': ReturnValues,
+            'return_lengths': ReturnLengths,
         }
         Rows.append(Record)
         return (Rest, (Cursor, RowFormat, Rows))
