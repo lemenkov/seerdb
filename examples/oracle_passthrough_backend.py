@@ -713,9 +713,16 @@ class OraclePassthroughBackend:
                 receivers[i] = cursor.var(objtype)
                 continue
             dbtype = dbtype_for_oracle_type(bind.tns_type, bind.csfrm)
-            size = bind.max_size if bind.max_size and bind.max_size > 0 else None
+            # NOT sized to `bind.max_size`. That is the *client's* buffer, and
+            # sizing the upstream receiver with it made the UPSTREAM truncate:
+            # the Mirror then had the cut-down value and no idea of the real
+            # length, so it could not tell the client its variable was too small
+            # (#1023). Take the whole value here and let the response encoder cut
+            # it to the client's size, the way a real server does.
             receivers[i] = (
-                cursor.var(dbtype, size) if dbtype is not None else cursor.var(str)
+                cursor.var(dbtype, _RECEIVER_SIZE)
+                if dbtype is not None
+                else cursor.var(str, _RECEIVER_SIZE)
             )
         # Each row's remaining (input) binds go through the same object
         # resolution execute() applies: an ObjectImage is the row decoder's
@@ -907,6 +914,13 @@ class OraclePassthroughBackend:
 # code from it (falling back to exc.code, then ORA-00900) so the Mirror emits
 # exactly one, matching a real server.
 _ORA_PREFIX = re.compile(r'^ORA-(\d{5}):\s*')
+
+
+# How big a RETURNING receiver the passthrough declares upstream. The client's
+# own declared size must not be used (see execute_returning), and a VARCHAR2 /
+# RAW column cannot exceed 32767 bytes even with extended sizes on, so this
+# takes any value a return bind can carry.
+_RECEIVER_SIZE = 32767
 
 
 def _relay_error(exc: 'seerdb.DatabaseError', rowcount: int = 0) -> BackendError:

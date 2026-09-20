@@ -983,7 +983,6 @@ class CursorIntegration(_IntegrationBase):
         # the untruncated length when it did not. Discarding that field turned a
         # wrong answer into a plausible one: the variable held half a string and
         # nothing was raised (#1021).
-        self._skip_if_mirror('the RETURNING actual-length field (#1023)')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, v VARCHAR2(40))')
         small = self.cur.var(str, 2)
         with self.assertRaises(seerdb.DatabaseError) as ctx:

@@ -2613,6 +2613,13 @@ def _answer_query(
                     result.rowcount,
                     result.returned_rows,
                     [request.bind_meta[i][0] for i in sorted(request.return_binds)],
+                    # What the client declared for each receiving variable. A
+                    # value longer than its buffer is cut to it and its real
+                    # length written after it, which is the only way a client
+                    # learns its variable was too small (#1023).
+                    max_sizes=[
+                        request.bind_meta[i][1] for i in sorted(request.return_binds)
+                    ],
                 ),
             )
             return lobs

@@ -5472,7 +5472,18 @@ Only a value that arrived as plain bytes can be compared, which is the whole
 set that truncates this way. A LOB, OBJECT or JSON / VECTOR return bind carries
 its own framing (§22.1b–d) and its length field says nothing about a buffer.
 
-A server writes `0` unless it is relaying a truncation it was told about.
+**Serving it.** A server cuts each value to the size the client declared for
+that bind and writes the value's real length here — which means it must hold
+the *whole* value at that point. The Mirror's passthrough learned this the hard
+way: it sized its upstream receiver with the client's own buffer, so the
+upstream truncated first and left the Mirror with the short value and no idea
+what the real length was (#1023). Size the receiver for the column, cut on the
+way out.
+
+Only the types whose declared size is a real buffer are cut — VARCHAR2, CHAR,
+RAW. A NUMBER or DATE is fixed width and always fits, and a character value is
+cut on a **character boundary**, since a buffer that splits a multi-byte
+character hands the client an undecodable tail.
 
 ### 22.1d A LOB return bind carries the **LOB block** (#985)
 
