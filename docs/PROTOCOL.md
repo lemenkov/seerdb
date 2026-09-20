@@ -2368,6 +2368,23 @@ TTI_OER |
   [trailing message DALC iff ora_error_code != 0]
 ```
 
+#### 6.2a A message is a byte stream; a parse fault must not end the session (#1000)
+
+A TTC message spans as many DATA packets as it needs, and python-oracledb sends
+the continuations with **no MORE flag** — so the first parse of a large request
+runs off the end *by design*, and the server grows the body until it does not.
+That works only because every decode primitive says "I ran off the end" the same
+way. Two reads in the OAC walk did not: a `struct.unpack` of the 3-byte header
+and a bare index for the csfrm byte, which raise `struct.error` and `IndexError`.
+Neither reads as "read more", and neither was caught, so a PL/SQL block with
+~1400 binds took the whole connection down (`DPY-4011`).
+
+Both now raise the truncation signal. And, separately, **a parse fault answers
+rather than kills**: reaching the request parser with something it cannot walk is
+always a bug in that parser, but the server's contract is that it never desyncs,
+so it logs loudly and refuses the one call. A client that gets an error can
+carry on; a client whose connection was dropped mid-suite cannot.
+
 #### 6.3a `warn_flags`: a warning on a call that SUCCEEDED (#993)
 
 Five of those six single-byte fields are diagnostic and skipped. The **last** one

@@ -1612,6 +1612,20 @@ def _complete_message(
                     f'expected a continuation DATA packet, got type {cont_type}'
                 ) from None
             body = body + cont_body
+        except InterfaceError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a parse fault must not desync
+            # Reaching here is always a bug in a request parser: a message cut
+            # by the transport says so with Truncated, and so should every other
+            # shape of input the parser cannot walk. But a parse fault must not
+            # KILL the session -- the Mirror's contract is that it never
+            # desyncs, and an unhandled exception here took the whole connection
+            # down with it (DPY-4011 on a ~1400-bind PL/SQL block, #1000). Log
+            # loudly, answer the way any unservable call is answered, and let
+            # the client carry on.
+            logger.warning('request parse failed: %s', exc, exc_info=True)
+            _refuse_unhandled(stream, f'unparsable request ({exc})')
+            return None
 
 
 def _skip_piggybacks(

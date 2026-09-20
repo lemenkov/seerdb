@@ -3774,6 +3774,10 @@ def _decode_oac_walk(Data: bytes) -> tuple:
     # Every OAC field in wire order, raw: (DataType, Flg, DataScale,
     # MaxDataLength, Mal, Fl2, ToId, VSN, Charset, Csfrm, Mxlc, Rest). The
     # public decoders pick what they need from it.
+    if len(Data) < 3:
+        # Same reason as the csfrm byte below: a half-arrived message must say
+        # "read more", not raise (#1000).
+        raise Truncated('OAC: header short')
     (DataType, Flg, _Pre) = struct.unpack('>BBB', Data[:3])
     (DataScale, R0) = decode_ub4(Data[3:])
     (MaxDataLength, R1) = decode_ub4(R0)
@@ -3792,6 +3796,15 @@ def _decode_oac_walk(Data: bytes) -> tuple:
         ToId, R4 = b'', R3a
     (VSN, R5) = decode_ub4(R4)
     (Charset, R6) = decode_ub4(R5)
+    if not R6:
+        # A big request spans several DATA packets, and the continuations carry
+        # no MORE flag -- so the first parse runs off the end by design, and
+        # _complete_message grows the body until it does not. It tells "read
+        # more" from "done" by the Truncated every other primitive raises; a
+        # bare index raised IndexError instead, which nothing reads as "read
+        # more" and nothing catches, so the session died on a ~1400-bind PL/SQL
+        # block (#1000).
+        raise Truncated('OAC: no csfrm byte')
     Csfrm = R6[0]
     (Mxlc, R7) = decode_ub4(R6[1:])
     return (
