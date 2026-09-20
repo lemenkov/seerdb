@@ -109,6 +109,24 @@ class Cursor(_CursorLogic):
         Bind = self._promote_large_lob_binds(operation, Bind)
         return self._run(operation, Bind)
 
+    def parse(self, operation: str) -> None:
+        """Parse ``operation`` on the server without running it (#1018).
+
+        The statement is validated — syntax, object names, bind-variable names —
+        and nothing else happens: no rows change, no query runs. A statement
+        that will not parse raises the server's error, which is the point of the
+        call. A query also comes back described, so ``description`` is populated
+        for a SELECT and cleared for anything else.
+
+        This is python-oracledb's ``Cursor.parse``, an extension to DB-API 2.0.
+        Not available on the pre-10g tiers, whose request dialects have no
+        parse-without-execute shape.
+        """
+        self._check_open()
+        self._release_scroll_cursor()
+        Result = self._connection.execute(operation, ParseOnly=True)
+        self._apply_result([], Result)
+
     def _promote_large_lob_binds(self, operation: str, Bind: list) -> list:
         # Large CLOB / BLOB into a PL/SQL locator param (#91): a str / bytes
         # bind over the 32767-byte PL/SQL VARCHAR2 / RAW limit can't go through

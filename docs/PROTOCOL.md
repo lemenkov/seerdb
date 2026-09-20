@@ -1276,6 +1276,22 @@ The last two have no `EXECUTE` and are still not parses — one takes the rows
 already parked (§14.5d), the other repositions an open cursor (§11.8) — so the
 test is "no `EXECUTE`, no `DEFINE`, no `FETCH`".
 
+**Sending one** (#1018). Everything else in the OALL8 is byte-identical to an
+ordinary execute of the same statement — the al8i4 array, the SQL, the header
+fields — with two exceptions, both of them query-execute fields that have to
+come off *with* the `EXECUTE` bit:
+
+- the **prefetch row count** (the header's `Fetch` field) is `1`, not the
+  connection's fetch array size;
+- **al8i4[9]** carries no query flag: on 23ai an ordinary SELECT sets `0x8000`
+  there (§20.4), and a parse must not.
+
+Leaving either in place asks the server to fetch, and it answers `ORA-01002:
+fetch out of sequence`. So does draining the cursor afterwards: the reply to a
+query parse is a describe with **no result set**, so the usual follow-up
+`TTI_FETCH` (§5.2) fetches from a cursor the parse never positioned. A client
+must skip the drain for a parse — the cursor is still queued for close.
+
 **Open** — a normal parse+execute (cursor 0, SQL present) with the al8i4 scroll
 fields and orientation `CURRENT`/1. It keeps the fv24 query options `0x8061`
 (`NOT_PLSQL | FETCH | EXECUTE | PARSE`) and prefetches only a small batch

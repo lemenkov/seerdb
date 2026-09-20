@@ -84,6 +84,13 @@ class AsyncCursor(_CursorLogic):
         Bind = await self._promote_large_lob_binds(operation, Bind)
         return await self._run(operation, Bind)
 
+    async def parse(self, operation: str) -> None:
+        """Async port of `Cursor.parse` (#1018): parse without running."""
+        self._check_open()
+        self._release_scroll_cursor()
+        Result = await self._connection.execute(operation, ParseOnly=True)
+        await self._apply_result([], Result)
+
     async def _promote_large_lob_binds(self, operation: str, Bind: list) -> list:
         """Async port of `Cursor._promote_large_lob_binds` (#91): stream a
         > 32767-byte CLOB / BLOB bind for a PL/SQL block into a server temp LOB

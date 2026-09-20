@@ -403,6 +403,15 @@ class _IntegrationBase(unittest.TestCase):
         finally:
             self.conn.close()
 
+    def _skip_if_mirror(self, feature: str):
+        # A Mirror leg runs the same suite against seerdb's own server, which
+        # trails the client on some features -- a column LOB's mutation (#964),
+        # validating a non-query parse (#1019). Skip rather than fail, so a
+        # Mirror gap does not read as a client regression. Each caller names the
+        # follow-up ticket.
+        if os.environ.get('SEERDB_TEST_MIRROR'):
+            self.skipTest(f'the Mirror does not implement {feature} yet')
+
     def _drop_silently(self, cur):
         try:
             cur.execute(f'DROP TABLE {self.TABLE}')
@@ -2210,6 +2219,94 @@ class CursorCacheIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class ParseIntegration(_IntegrationBase):
+    """`cursor.parse()` (#1018): parse the statement, never run it.
+
+    The server validates syntax, object names and bind-variable names, and
+    nothing else happens. A query also comes back described. 10g and up — the
+    pre-10g request dialects have no parse-without-execute shape, and refuse.
+    """
+
+    def _pre10(self):
+        return self.conn.field_version < FIELD_VERSION_10_2
+
+    def test_parse_is_refused_on_pre10(self):
+        if not self._pre10():
+            self.skipTest('10g+ sends a real parse; this is the pre-10g refusal')
+        with self.assertRaises(seerdb.NotSupportedError):
+            self.cur.parse('SELECT 1 FROM DUAL')
+        # The connection is untouched by the refusal — nothing went on the wire.
+        self.cur.execute('SELECT 1 FROM DUAL')
+        self.assertEqual(self.cur.fetchone(), (1,))
+
+    def test_parse_describes_a_query_without_fetching_it(self):
+        if self._pre10():
+            self.skipTest('cursor.parse() needs 10g+')
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, name VARCHAR2(40))')
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1, %s)' % "'a'")
+        self.cur.parse(f'SELECT id, name FROM {self.TABLE}')
+        self.assertEqual([d[0] for d in self.cur.description], ['ID', 'NAME'])
+        # Described, not run: no rows were fetched. Draining the parse's cursor
+        # is what ORA-01002 (fetch out of sequence) came from.
+        self.assertEqual(self.cur.fetchall(), [])
+
+    def test_parse_does_not_run_the_statement(self):
+        if self._pre10():
+            self.skipTest('cursor.parse() needs 10g+')
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
+        self.cur.parse(f'INSERT INTO {self.TABLE} (id) VALUES (:v)')
+        self.assertIsNone(self.cur.description)  # not a query
+        self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone(), (0,))
+
+    def test_parse_reports_an_unknown_column(self):
+        if self._pre10():
+            self.skipTest('cursor.parse() needs 10g+')
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
+        with self.assertRaises(seerdb.DatabaseError) as ctx:
+            self.cur.parse(f'SELECT nonexistent_col FROM {self.TABLE}')
+        self.assertEqual(ctx.exception.code, 904)  # ORA-00904
+
+    def test_parse_reports_an_invalid_bind_name(self):
+        # The motivating case (#826): a RETURNING clause whose INTO target names
+        # a reserved word is rejected at parse time and at no other time.
+        if self._pre10():
+            self.skipTest('cursor.parse() needs 10g+')
+        self._skip_if_mirror('validating a non-query parse (#1019)')
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
+        with self.assertRaises(seerdb.DatabaseError) as ctx:
+            self.cur.parse(
+                f'INSERT INTO {self.TABLE} (id) VALUES (:v) RETURNING id INTO :ROWID'
+            )
+        self.assertEqual(ctx.exception.code, 1745)  # ORA-01745
+
+    def test_parse_reports_a_statement_that_is_not_sql(self):
+        if self._pre10():
+            self.skipTest('cursor.parse() needs 10g+')
+        self._skip_if_mirror('validating a non-query parse (#1019)')
+        with self.assertRaises(seerdb.DatabaseError) as ctx:
+            self.cur.parse('this is not sql')
+        self.assertEqual(ctx.exception.code, 900)  # ORA-00900
+
+    def test_parse_accepts_a_plsql_block(self):
+        if self._pre10():
+            self.skipTest('cursor.parse() needs 10g+')
+        self.cur.parse('BEGIN NULL; END;')
+        self.assertIsNone(self.cur.description)
+
+    def test_the_cursor_is_usable_after_a_failed_parse(self):
+        # A parse that raised must leave the session in step — the whole point
+        # of validating without running.
+        if self._pre10():
+            self.skipTest('cursor.parse() needs 10g+')
+        self._skip_if_mirror('validating a non-query parse (#1019)')
+        with self.assertRaises(seerdb.DatabaseError):
+            self.cur.parse('this is not sql')
+        self.cur.execute('SELECT 1 FROM DUAL')
+        self.assertEqual(self.cur.fetchone(), (1,))
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class FetchFlowIntegration(_IntegrationBase):
     """Verify the follow-up TTI_FETCH flow.
 
@@ -2820,14 +2917,6 @@ class LOBObjectIntegration(_IntegrationBase):
         if self.conn.field_version < FIELD_VERSION_11_2:
             self.skipTest('modifying a LOB needs 11g+ (10g closes the connection)')
         self._skip_if_mirror('serving LOB writes on a column locator')
-
-    def _skip_if_mirror(self, feature: str):
-        # The Mirror serves a column LOB's content and length by locator (#826)
-        # but does not yet MUTATE one, nor answer GET_CHUNK_SIZE with a real
-        # value -- that is the follow-up #964 names. Skip rather than fail, so a
-        # Mirror leg does not look like a client regression.
-        if os.environ.get('SEERDB_TEST_MIRROR'):
-            self.skipTest(f'the Mirror does not implement {feature} yet')
 
     def test_write_applies_and_the_size_follows(self):
         self._skip_if_immutable()
@@ -4396,6 +4485,38 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
         await Conn.close()
         if Fv < FIELD_VERSION_10_2:
             self.skipTest(Reason)
+
+    async def test_parse_describes_a_query_without_running_it(self):
+        # Async twin of ParseIntegration (#1018). Pre-10g refuses instead.
+        Table = 'PYO_ASYNC_PARSE'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            if Conn.field_version < FIELD_VERSION_10_2:
+                with self.assertRaises(seerdb.NotSupportedError):
+                    await Cur.parse('SELECT 1 FROM DUAL')
+                return
+            try:
+                await Cur.execute(f'DROP TABLE {Table}')
+            except seerdb.DatabaseError:
+                pass
+            await Cur.execute(f'CREATE TABLE {Table} (id NUMBER)')
+            try:
+                await Cur.parse(f'SELECT id FROM {Table}')
+                self.assertEqual([d[0] for d in Cur.description], ['ID'])
+                self.assertEqual(await Cur.fetchall(), [])
+                # A DML parse validates and stops: the row never lands.
+                await Cur.parse(f'INSERT INTO {Table} (id) VALUES (:v)')
+                self.assertIsNone(Cur.description)
+                await Cur.execute(f'SELECT COUNT(*) FROM {Table}')
+                self.assertEqual(await Cur.fetchone(), (0,))
+                with self.assertRaises(seerdb.DatabaseError) as ctx:
+                    await Cur.parse(f'SELECT nonexistent_col FROM {Table}')
+                self.assertEqual(ctx.exception.code, 904)
+            finally:
+                await Cur.execute(f'DROP TABLE {Table}')
+        finally:
+            await Conn.close()
 
     async def test_lob_columns_are_readable_inside_an_open_transaction(self):
         # The async twin of LOBIntegration's test (#712).

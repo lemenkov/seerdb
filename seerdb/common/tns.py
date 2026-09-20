@@ -9060,6 +9060,27 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
             if Cursor != 0:
                 Opt &= ~TNS_EXEC_OPTION_EXECUTE
 
+    # `cursor.parse()` (#1018): parse the statement, do NOT run it. What makes a
+    # call a parse is the *absence* of EXECUTE, so the option word is set
+    # outright rather than masked — every bit set_opts derived above (EXECUTE,
+    # NOT_PLSQL, the commit bit, the fetch bits) describes work a parse does not
+    # ask for. Measured against a live 23ai: a query parse sends 0x20001
+    # (PARSE | DESCRIBE, and the reply is the describe alone), any other
+    # statement 0x1.
+    if Dictionary['query'].get('parse_only'):
+        Opt = _EXEC_OPTION_PARSE | (_EXEC_OPTION_DESCRIBE if Type == 'select' else 0)
+        # Two more query-execute fields have to come off with the EXECUTE bit,
+        # both measured against a live 23ai by capturing the reference client's
+        # own parse and diffing it against ours: the prefetch row count (1, not
+        # the connection's `fetch`) and the 23ai query flag in al8i4[9], which
+        # the fv24 branch above set because the statement is a SELECT. Leaving
+        # either in place asks the server to fetch from a cursor the parse never
+        # positioned, and it answers ORA-01002 (fetch out of sequence).
+        Fetch = 1
+        if len(All8) > 9:
+            All8 = list(All8)
+            All8[9] = 0
+
     All8Len = len(All8)
     All8Flag = 1 if All8Len > 0 else 0
     All8s = reduce(lambda x, y: x + y, [encode_sb4(A) for A in All8])
