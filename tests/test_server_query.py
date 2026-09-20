@@ -3543,6 +3543,69 @@ def test_encode_out_bind_response_thin_lob_roundtrips_via_client() -> None:
     assert log.content(got_blob.raw) == (b'blob content', False)
 
 
+def test_encode_returning_response_lob_roundtrips_via_client() -> None:
+    # A LOB return bind rides as the LOB block, not a DALC (#987). Sent as a
+    # DALC the client read the block length as the whole value and handed back
+    # an EMPTY string -- the right shape with the wrong content, which is why
+    # this asserts the content and not just the type.
+    from typing import cast
+
+    from seerdb.client.cursor import _assign_return_binds
+    from seerdb.common.datatypes import DB_TYPE_CLOB, Var
+    from seerdb.common.lob import LOB
+    from seerdb.common.tns import (
+        _LOB_EMIT_LOG,
+        LobEmitLog,
+        decode_packet,
+        encode_returning_response,
+        set_decode_return_binds,
+    )
+    from seerdb.common.tns_consts import TNS_TYPE_CLOB
+
+    _DECODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
+    log = LobEmitLog()
+    _LOB_EMIT_LOG.set(log)
+    try:
+        resp = encode_returning_response(
+            2, [[('first',), ('second',)]], [TNS_TYPE_CLOB]
+        )
+    finally:
+        _LOB_EMIT_LOG.set(None)
+
+    var = Var(DB_TYPE_CLOB)
+    bind = [var]
+    set_decode_return_binds([0], {0: TNS_TYPE_CLOB})
+    try:
+        result = decode_packet(resp, (0, [], [], bind))
+    finally:
+        set_decode_return_binds(None)
+    _assign_return_binds(bind, result)
+    values = cast(list, var.getvalue())
+    # Two rows, so the SECOND is the half a mis-measured first never reaches.
+    assert len(values) == 2
+    assert all(isinstance(v, LOB) for v in values)
+    recorded = [log.content(v.raw) for v in values]
+    assert [entry[0] for entry in recorded if entry is not None] == ['first', 'second']
+
+
+def test_a_long_return_bind_is_a_plain_dalc() -> None:
+    # A LONG return bind is a DALC -- no 0xFE chunk marker and no trailing
+    # indicators, unlike a LONG COLUMN in a row. Measured on a live 23ai
+    # returning a CLOB column into a DB_TYPE_LONG var; giving it the column
+    # framing desynced the reply on a zero byte (#987).
+    from seerdb.common.tns import encode_returning_response
+    from seerdb.common.tns_consts import TNS_TYPE_LONG, TTI_RXD
+
+    resp = encode_returning_response(1, [[('A short CLOB - 1619',)]], [TNS_TYPE_LONG])
+    body = resp[resp.index(bytes([TTI_RXD])) :]
+    #  RXD | ub4 rows=1 | DALC(19) | sb4 trunc=0
+    assert body[:2] == bytes([TTI_RXD, 0x01])
+    assert body[2] == 0x01  # the ub4 row count's value byte
+    assert body[3] == 19  # a plain 1-byte DALC length, NOT 0xFE
+    assert body[4:23] == b'A short CLOB - 1619'
+    assert body[23] == 0x00  # the truncation length, with no LONG trailer first
+
+
 @pytest.mark.parametrize('version', [6, 17])  # 11.2 and 23ai OAC layouts
 def test_parse_exec_reads_an_associative_array_bind(version: int) -> None:
     # An arrayvar bind (#122) carries the ARRAY flag and its capacity in the

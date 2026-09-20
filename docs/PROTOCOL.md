@@ -5281,6 +5281,30 @@ An `UPDATE` touching several rows returns one block per row, so a reader that
 mis-measures the first never reaches the second intact — a single-row test
 passes.
 
+**Server side — the Mirror serving one (#987).** Same shape as the OUT bind in
+§6.5: no upstream locator exists (a passthrough reads its upstream with
+`fetch_lobs=False`, so the value arrives materialised), so the Mirror mints a
+locator, records the content against it in the session's `LobEmitLog`, and writes
+the block. The read the client then issues is answered from that log by locator.
+Sending a DALC instead does **not** error — the client reads the block length as
+the whole value and hands back an **empty string**, which is the right shape with
+the wrong content.
+
+**A LONG return bind, by contrast, IS a plain DALC (#987)** — and this is the
+part that catches you out, because a LONG *column* is not. `cursor.var(DB_TYPE_LONG)`
+receiving a CLOB column gets, measured on a live 23ai:
+
+```
+07 | 01 01 | 13 <19 bytes> | 00 | 08 ...
+^^   ^^      ^^              ^^   ^^ RPA
+RXD  rows=1  DALC, length 19  sb4 truncation length
+```
+
+No `0xFE` chunk marker and no trailing indicators — a LONG column in a row has
+both (§14.5c). Give a return bind the column framing and the client reads the
+chunk marker as the value, then desyncs on a zero byte
+(`DPY-5000 ... unknown protocol message type 0`).
+
 ### 22.1c An OBJECT return bind carries the **object frame** (#826)
 
 `RETURNING ObjectCol INTO :b` frames the returned value exactly as an ADT column
