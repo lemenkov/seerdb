@@ -256,6 +256,15 @@ class Cursor(_CursorLogic):
         # error. Surface them through getbatcherrors() instead of raising.
         NonFatal = (0, 1403, 24381) if BatchErrors else (0, 1403)
         if OraCode not in NonFatal:
+            # An executemany whose batch aborts part-way really DID apply the
+            # rows before the failing one, and the server reports how many in
+            # the same OER field a success reports its own count. Setting it
+            # before the raise is what lets a caller read cursor.rowcount in the
+            # except block and know what to retry -- it used to read the -1 the
+            # cursor was constructed with, or a count left over from an earlier
+            # statement, neither of which says anything (#998).
+            if isinstance(RetFormat, tuple) and isinstance(RetFormat[0], int):
+                self._rowcount = RetFormat[0]
             Detail = Message or f'ORA-{OraCode:05d}'
             Exc = from_ora_code(OraCode)(Detail, code=OraCode)
             # oracledb parity: the 0-based character offset of the error in the
