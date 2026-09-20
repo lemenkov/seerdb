@@ -3508,10 +3508,34 @@ def _is_refcursor_bind(Bind: object) -> bool:
     return isinstance(Bind, RefCursorBind)
 
 
+def _object_bind_type(Bind: object) -> object | None:
+    # The DbObjectType behind an object / collection bind whose OUT value the
+    # server returns in the object framing rather than as a plain DALC, or None
+    # when the bind is not one.
+    #
+    # TWO shapes reach here and both are ordinary use. `cursor.var(objtype)`
+    # gives a Var (#888); `cursor.callproc(name, (3, obj))` passes the DbObject
+    # ITSELF, which is how python-oracledb is normally called. Recognising only
+    # the Var sent the bare object down the plain-DALC branch, where the object
+    # frame's 36-byte toid was read as a length and the reply desynced two bytes
+    # in, onto that toid's own `00 22 02 08` prefix -- reported as "no decoder
+    # for response token 34", a number that came from the data (#1029).
+    from seerdb.common.dbobject import DbObject
+
+    if isinstance(Bind, Var):
+        Type = Bind.dbtype
+        return Type if getattr(Type, 'tns_type', None) == TNS_TYPE_ADT else None
+    if isinstance(Bind, DbObject):
+        # A DbObject built by DbObjectType.newobject() carries its type; one
+        # decoded from a fetched row may not, and then there is nothing to
+        # decode an OUT image against.
+        return object.__getattribute__(Bind, '_dbtype')
+    return None
+
+
 def _is_object_bind(Bind: object) -> bool:
-    # An object / collection Var (cursor.var(objtype)) whose OUT value the server
-    # returns in the object framing, not a plain DALC (#888).
-    return isinstance(Bind, Var) and Bind.dbtype.tns_type == TNS_TYPE_ADT
+    # Whether this bind's OUT value arrives in the object framing (#888/#1029).
+    return _object_bind_type(Bind) is not None
 
 
 def _lob_bind_type(Bind: object) -> int | None:
@@ -3612,7 +3636,7 @@ def _read_iov(
                 # An object / collection OUT value: the read_dbobject framing
                 # (an ObjectImage the cursor turns into a DbObject), then the
                 # per-value return code (#888).
-                oid = getattr(cast(Var, Bind).dbtype, 'oid', b'')
+                oid = getattr(_object_bind_type(Bind), 'oid', b'')
                 (ObjVal, Rest) = _read_object_column(Rest, {'type_oid': oid})
                 (_, Rest) = decode_ub4(Rest)
                 OutValues.append(ObjVal)
