@@ -79,13 +79,33 @@ def _vector_as(value: object, vector_format: int | None) -> object:
     return array.array(typecode, cast('Any', value))
 
 
+# The VECTOR / JSON bind descriptor without its final byte: that byte is not part
+# of the descriptor at all, it is the high byte of the image-length field which
+# follows (#1008). Kept derived from the shared constant so the two cannot drift.
+_VECTOR_BIND_DESCRIPTOR_HEAD = VECTOR_BIND_DESCRIPTOR[:-1]
+
+
 def _native_lob_bind_value(image: bytes) -> bytes:
     # Native inline bind value for a LOB-backed type (VECTOR #62, JSON #70): a
-    # fixed descriptor, the image length (ub2), 22 zero bytes, then the image
-    # framed like RAW (encode_chr).
+    # fixed descriptor, the image length, 22 zero bytes, then the image framed
+    # like RAW (encode_chr).
+    #
+    # The length is THREE bytes, not two. The descriptor below ends with a
+    # constant 0x00 that is really this field's high byte, which is why a length
+    # written as a ub2 encoded correctly for every image under 64 KiB and
+    # overflowed above it -- a float64 VECTOR of more than ~8,000 dimensions
+    # raised OverflowError before it ever reached the wire (#1008). Measured on
+    # a live 23ai by binding the same column with a 4-dimension vector and a
+    # 30,000-dimension one and aligning the two on the descriptor:
+    #
+    #   SMALL  ... 01 00 00 00 00 | 00 00 31 | 00 00 ...   image = 49
+    #   LARGE  ... 01 00 00 00 00 | 03 a9 91 | 00 00 ...   image = 240,017
+    #
+    # Three bytes allows 16 MiB, past the 65,533-dimension maximum (a float64
+    # vector that size is ~512 KB).
     return (
-        VECTOR_BIND_DESCRIPTOR
-        + len(image).to_bytes(2, 'big')
+        _VECTOR_BIND_DESCRIPTOR_HEAD
+        + len(image).to_bytes(3, 'big')
         + b'\x00' * 22
         + encode_chr(image)
     )
