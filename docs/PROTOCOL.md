@@ -2300,6 +2300,32 @@ value per OUT / IN OUT bind **in bind order** (IN binds contribute nothing):
   query, the re-execute and the scroll open — because the remainder a query parks
   is served later from the same converted rows.
 
+- **OBJECT / collection** OUT value: the object frame a row cell carries
+  (§21.2) — a constructed 36-byte toid, the object OID, snapshot, version, image
+  gate, flags and the image — then the per-value `ub4` return code. Not a DALC.
+
+  **Which binds get it is the part that bites.** A client naturally recognises
+  an object bind by the `Var` wrapped around it, and that is not the only shape
+  one arrives in: `cursor.callproc(name, (3, obj))` passes the object **itself**,
+  with no `Var` anywhere, and that is the ordinary way to call a procedure.
+  Recognising only the wrapped form sends the bare object down the scalar branch,
+  where the toid's leading `24` is read as a length; the reply then desyncs two
+  bytes in, onto that toid's own `00 22 02 08` prefix, and the decoder reports
+  "response token 34". Put a second bind behind the object and the number changes
+  to whatever that bind's first byte is — the number is **data**, which is what
+  makes this read like a missing decoder and not an off-by-one (#1029).
+
+  This is the fourth carrier of the same frame — a fetched row (§21.2), a DML
+  RETURNING bind (§22.1c), an inbound bind, and here — and each has had to learn
+  it separately, exactly as the LOB block did across its three.
+
+  A client also has to put the value **back where the caller can see it**. With
+  a `Var` there is somewhere to put it; with a bare object there is not, and the
+  caller's own object is the handle on the result — so the decoded image is
+  written into it in place. A NULL object OUT clears its contents but keeps its
+  shape (a record's attribute names survive, all NULL): the type did not change,
+  only the value.
+
 After the values come the usual `TTI_RPA` and `TTI_OER` tokens.
 
 **Server side — the Mirror answering a thin client (#483).** The wire carries

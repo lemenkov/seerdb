@@ -28,6 +28,7 @@ from seerdb.common.sqltext import (
     returning_bind_positions,
     strip_non_bind_text,
 )
+from seerdb.common.tns import _object_bind_type
 from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
     FIELD_VERSION_10_2,
@@ -695,6 +696,34 @@ def _object_from_out_image(image, objtype):
     return DbObject(objtype.full_name, attrs, dbtype=objtype)
 
 
+def _update_object_in_place(Target, Image) -> None:
+    # Write an object OUT bind's returned image into the DbObject the CALLER
+    # passed, rather than onto a Var (#1029). `cursor.callproc(name, (3, obj))`
+    # hands the object over directly and then reads `obj` back -- the object is
+    # the caller's handle on the result, exactly as in python-oracledb, so a new
+    # DbObject built beside it would leave the caller looking at an empty one.
+    Decoded = _object_from_out_image(Image, object.__getattribute__(Target, '_dbtype'))
+    if Decoded is None:
+        # A NULL object OUT: clear the values the caller's object was built
+        # with, which are the INPUT half of an IN OUT bind and would otherwise
+        # read as a successful no-op. The object keeps its SHAPE -- a record
+        # still has its attribute names, all NULL -- because its type did not
+        # change, only its contents.
+        if Target.is_collection:
+            object.__getattribute__(Target, '_elements')[:] = []
+        else:
+            Attrs = object.__getattribute__(Target, '_attrs')
+            for Name in object.__getattribute__(Target, '_order'):
+                Attrs[Name] = None
+        return
+    if Target.is_collection:
+        object.__getattribute__(Target, '_elements')[:] = list(Decoded)
+        return
+    Attrs = object.__getattribute__(Target, '_attrs')
+    for Name in object.__getattribute__(Decoded, '_order'):
+        Attrs[Name] = object.__getattribute__(Decoded, '_attrs')[Name]
+
+
 def _assign_out_binds(Bind, Result) -> list:
     # After a PL/SQL execute, the IOV decoder leaves an {'out_positions',
     # 'out_values', ...} record as the single "row". Decode each scalar OUT
@@ -715,6 +744,11 @@ def _assign_out_binds(Bind, Result) -> list:
     RefCursors = []
     for Pos, Value in zip(Record['out_positions'], Record['out_values']):
         if Pos >= len(Bind):
+            continue
+        if _object_bind_type(Bind[Pos]) is not None and not isinstance(Bind[Pos], Var):
+            # An object passed straight to callproc / execute, with no Var to
+            # hold the result -- the caller's own object is where it goes.
+            _update_object_in_place(Bind[Pos], Value)
             continue
         Variable = _bind_var(Bind[Pos])
         if Variable is None:

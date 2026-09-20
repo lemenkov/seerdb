@@ -4238,6 +4238,129 @@ class LOBReturningIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class ObjectOutBindIntegration(_IntegrationBase):
+    """An object bound DIRECTLY as an OUT / IN OUT parameter (#1029).
+
+    `cursor.callproc(name, (3, obj))` hands the object over itself, with no Var
+    around it -- which is how python-oracledb is normally called. Recognising
+    only the Var form sent the bare object down the plain-DALC branch, where the
+    object frame's 36-byte toid was read as a length and the reply desynced onto
+    that toid's own `00 22 02 08` prefix ("no decoder for response token 34").
+    Against a REAL server, no Mirror.
+    """
+
+    TYPE = 'PYORACLE_OUTBIND_T'
+    REC = 'PYORACLE_OUTREC_T'
+    PKG = 'PYORACLE_OUTBIND_PKG'
+
+    def setUp(self):
+        super().setUp()
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('an object bind needs the 12.1+ OAC')
+        # The whole class, including the NULL case: the Mirror reports a bare
+        # DbObject's OUT value as None, so "nothing came back" and "the value is
+        # NULL" are indistinguishable there and even the passes are accidents.
+        self._skip_if_mirror('an OUT value for a bare object bind (#1032)')
+        self._drop_objects()
+        self.cur.execute(f'CREATE TYPE {self.TYPE} AS VARRAY(10) OF NUMBER')
+        self.cur.execute(
+            f'CREATE TYPE {self.REC} AS OBJECT (id NUMBER, name VARCHAR2(40))'
+        )
+        self.cur.execute(f"""CREATE PACKAGE {self.PKG} AS
+              PROCEDURE fill(n IN NUMBER, l IN OUT {self.TYPE});
+              PROCEDURE double_all(l IN OUT {self.TYPE});
+              PROCEDURE rename(r IN OUT {self.REC});
+              PROCEDURE blank(l IN OUT {self.TYPE});
+            END;""")
+        self.cur.execute(f"""CREATE PACKAGE BODY {self.PKG} AS
+              PROCEDURE fill(n IN NUMBER, l IN OUT {self.TYPE}) IS
+              BEGIN
+                l := {self.TYPE}();
+                FOR i IN 1..n LOOP l.extend; l(i) := i * 100; END LOOP;
+              END;
+              PROCEDURE double_all(l IN OUT {self.TYPE}) IS
+              BEGIN
+                FOR i IN 1..l.count LOOP l(i) := l(i) * 2; END LOOP;
+              END;
+              PROCEDURE rename(r IN OUT {self.REC}) IS
+              BEGIN
+                r.id := r.id + 1;
+                r.name := 'renamed ' || r.name;
+              END;
+              PROCEDURE blank(l IN OUT {self.TYPE}) IS
+              BEGIN
+                l := NULL;
+              END;
+            END;""")
+
+    def _drop_objects(self):
+        for stmt in (
+            f'DROP PACKAGE {self.PKG}',
+            f'DROP TYPE {self.REC}',
+            f'DROP TYPE {self.TYPE}',
+        ):
+            try:
+                self.cur.execute(stmt)
+            except seerdb.DatabaseError:
+                pass  # best-effort teardown of leftovers
+
+    def tearDown(self):
+        try:
+            self._drop_objects()
+        except seerdb.DatabaseError:
+            pass
+        super().tearDown()
+
+    def test_a_bare_collection_takes_the_out_value(self):
+        # The plain reproduction: nothing but the object goes in, and the
+        # caller reads the result off that same object.
+        typ = self.conn.gettype(self.TYPE)
+        obj = typ.newobject()
+        self.cur.callproc(f'{self.PKG}.fill', (3, obj))
+        self.assertEqual([int(v) for v in obj.aslist()], [100, 200, 300])
+
+    def test_a_bare_collection_round_trips_in_out(self):
+        # IN OUT: the values sent must reach the server and the values it wrote
+        # must come back -- [] or the unchanged input both mean it did not.
+        typ = self.conn.gettype(self.TYPE)
+        obj = typ.newobject()
+        obj.extend([1, 2, 3])
+        self.cur.callproc(f'{self.PKG}.double_all', (obj,))
+        self.assertEqual([int(v) for v in obj.aslist()], [2, 4, 6])
+
+    def test_a_bare_record_takes_its_attributes_back(self):
+        # The non-collection shape: attributes are written back by name, in
+        # place, on the caller's own object.
+        typ = self.conn.gettype(self.REC)
+        obj = typ.newobject()
+        obj.ID = 7
+        obj.NAME = 'Alice'
+        self.cur.callproc(f'{self.PKG}.rename', (obj,))
+        self.assertEqual(int(obj.ID), 8)
+        self.assertEqual(obj.NAME, 'renamed Alice')
+
+    def test_a_null_out_value_empties_the_object(self):
+        # A NULL object OUT must not leave the INPUT half of an IN OUT bind
+        # sitting in the caller's object, which reads as a successful no-op.
+        typ = self.conn.gettype(self.TYPE)
+        obj = typ.newobject()
+        obj.extend([1, 2, 3])
+        self.cur.callproc(f'{self.PKG}.blank', (obj,))
+        self.assertEqual(obj.aslist(), [])
+
+    def test_the_bind_after_an_object_is_still_intact(self):
+        # The object frame has to consume exactly its own bytes: a scalar OUT
+        # behind it is what catches a mis-measurement, since the desync this
+        # fixes showed up as a bogus token rather than a wrong value.
+        typ = self.conn.gettype(self.TYPE)
+        obj = typ.newobject()
+        tail = self.cur.var(int)
+        self.cur.execute(f'BEGIN {self.PKG}.fill(2, :1); :2 := 4242; END;', [obj, tail])
+        self.assertEqual([int(v) for v in obj.aslist()], [100, 200])
+        self.assertEqual(int(tail.getvalue()), 4242)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class ObjectReturningIntegration(_IntegrationBase):
     """`DML ... RETURNING <object column> INTO :b` (#826).
 
@@ -4545,6 +4668,49 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
         await Conn.close()
         if Fv < FIELD_VERSION_10_2:
             self.skipTest(Reason)
+
+    async def test_a_bare_object_out_bind_takes_its_value(self):
+        # Async twin of ObjectOutBindIntegration (#1029): an object handed to
+        # callproc with no Var around it takes the OUT value in place.
+        Typ = 'PYO_ASYNC_OUTBIND_T'
+        Pkg = 'PYO_ASYNC_OUTBIND_PKG'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            if Conn.field_version < FIELD_VERSION_12_1:
+                self.skipTest('an object bind needs the 12.1+ OAC')
+            if os.environ.get('SEERDB_TEST_MIRROR'):
+                self.skipTest('the Mirror does not serve this OUT value yet (#1032)')
+            Cur = Conn.cursor()
+            for Stmt in (f'DROP PACKAGE {Pkg}', f'DROP TYPE {Typ}'):
+                try:
+                    await Cur.execute(Stmt)
+                except seerdb.DatabaseError:
+                    pass
+            await Cur.execute(f'CREATE TYPE {Typ} AS VARRAY(10) OF NUMBER')
+            await Cur.execute(
+                f'CREATE PACKAGE {Pkg} AS '
+                f'PROCEDURE fill(n IN NUMBER, l IN OUT {Typ}); END;'
+            )
+            await Cur.execute(
+                f'CREATE PACKAGE BODY {Pkg} AS '
+                f'PROCEDURE fill(n IN NUMBER, l IN OUT {Typ}) IS BEGIN '
+                f'l := {Typ}(); '
+                'FOR i IN 1..n LOOP l.extend; l(i) := i * 100; END LOOP; '
+                'END; END;'
+            )
+            try:
+                ObjType = await Conn.gettype(Typ)
+                Obj = ObjType.newobject()
+                await Cur.callproc(f'{Pkg}.fill', (3, Obj))
+                self.assertEqual([int(v) for v in Obj.aslist()], [100, 200, 300])
+            finally:
+                for Stmt in (f'DROP PACKAGE {Pkg}', f'DROP TYPE {Typ}'):
+                    try:
+                        await Cur.execute(Stmt)
+                    except seerdb.DatabaseError:
+                        pass
+        finally:
+            await Conn.close()
 
     async def test_parse_describes_a_query_without_running_it(self):
         # Async twin of ParseIntegration (#1018). Pre-10g refuses instead.

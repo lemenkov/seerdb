@@ -311,6 +311,88 @@ class TestObjectVar(unittest.TestCase):
         self.assertEqual(back.aslist(), ['Main St', 12345, 'US'])
 
 
+class TestBareObjectOutBind(unittest.TestCase):
+    # An object passed to callproc / execute WITHOUT a Var around it (#1029).
+    # `cursor.callproc(name, (3, obj))` is how python-oracledb is normally
+    # called, and recognising only the Var form sent the bare object down the
+    # plain-DALC branch: the object frame's 36-byte toid was read as a length
+    # and the reply desynced onto that toid's own `00 22 02 08` prefix, reported
+    # as "no decoder for response token 34".
+
+    def _reply(self, value):
+        from seerdb.common.tns import ScalarOutBind, encode_out_bind_response_thin
+
+        return encode_out_bind_response_thin(
+            [ScalarOutBind(value=value, tns_type=TNS_TYPE_ADT)]
+        )
+
+    def test_a_bare_object_is_recognised_as_an_object_bind(self):
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import _is_object_bind, _object_bind_type
+
+        obj = _ADDR_TYPE.newobject({'STREET': 'Main St', 'ZIP': 1, 'CODE': 'US'})
+        self.assertTrue(_is_object_bind(obj))
+        self.assertIs(_object_bind_type(obj), _ADDR_TYPE)
+        # The Var form keeps working, and a plain value is still not one.
+        self.assertTrue(_is_object_bind(Var(_ADDR_TYPE)))
+        self.assertFalse(_is_object_bind('a string'))
+        self.assertFalse(_is_object_bind(Var(int)))
+
+    def test_a_bare_object_out_value_reads_as_the_object_frame(self):
+        from seerdb.client.cursor import _object_from_out_image
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import (
+            ScalarOutBind,
+            _read_iov,
+            encode_out_bind_response_thin,
+        )
+        from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+
+        sent = _ADDR_TYPE.newobject({'STREET': 'Main St', 'ZIP': 12345, 'CODE': 'US'})
+        # A SECOND bind behind the object is the real check: the frame has to
+        # consume exactly its own bytes, and a mis-measurement shows up as the
+        # next value being garbage (or a bogus token) rather than a wrong one.
+        reply = encode_out_bind_response_thin(
+            [
+                ScalarOutBind(value=sent, tns_type=TNS_TYPE_ADT),
+                ScalarOutBind(value=4242, tns_type=TNS_TYPE_NUMBER),
+            ]
+        )
+        # The bind list holds the object ITSELF, as callproc leaves it.
+        _, out_values, _ = _read_iov(reply, [sent, Var(int)])
+        self.assertIsInstance(out_values[0], ObjectImage)
+        back = _object_from_out_image(out_values[0], _ADDR_TYPE)
+        self.assertEqual(back.aslist(), ['Main St', 12345, 'US'])
+        self.assertTrue(out_values[1])  # the bind behind it survived
+
+    def test_the_out_value_lands_in_the_caller_s_own_object(self):
+        # python-oracledb mutates the object the caller passed; a new DbObject
+        # built beside it would leave the caller looking at an empty one.
+        from seerdb.client.cursor import _assign_out_binds
+
+        target = _ADDR_TYPE.newobject()
+        record = {'out_positions': [0], 'out_values': [None]}
+        sent = _ADDR_TYPE.newobject({'STREET': 'Main St', 'ZIP': 12345, 'CODE': 'US'})
+        from seerdb.common.tns import _read_iov
+
+        _, out_values, _ = _read_iov(self._reply(sent), [target])
+        record['out_values'] = out_values
+        _assign_out_binds([target], (None, None, None, None, [record]))
+        self.assertEqual(target.aslist(), ['Main St', 12345, 'US'])
+
+    def test_a_null_out_value_empties_the_caller_s_object(self):
+        # A NULL object OUT must not leave the INPUT half of an IN OUT bind
+        # behind, which reads as a successful no-op.
+        from seerdb.client.cursor import _assign_out_binds
+        from seerdb.common.tns import _read_iov
+
+        target = _ADDR_TYPE.newobject({'STREET': 'Old St', 'ZIP': 1, 'CODE': 'GB'})
+        _, out_values, _ = _read_iov(self._reply(None), [target])
+        record = {'out_positions': [0], 'out_values': out_values}
+        _assign_out_binds([target], (None, None, None, None, [record]))
+        self.assertEqual(target.aslist(), [None, None, None])
+
+
 class TestNestedObjectImageEncode(unittest.TestCase):
     # The recursive image encoder (#116/#117/#118), the inverse of the nested
     # decode (#920): an object attribute of an object rides inline (no header), a
