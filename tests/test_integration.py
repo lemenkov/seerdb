@@ -416,7 +416,11 @@ class _IntegrationBase(unittest.TestCase):
         # BACKEND, not to the Mirror, so only the named one skips. PostgreSQL
         # cannot parse Oracle SQL and serves no non-query `cursor.parse()`,
         # while the passthrough asks a real server and does (#1019).
-        if os.environ.get('SEERDB_TEST_MIRROR') == backend:
+        leg = os.environ.get('SEERDB_TEST_MIRROR')
+        # A leg that does not name its backend -- '1', which is what a runner
+        # predating the named value sets, including the CI job that starts its
+        # own Mirror -- gets the conservative answer rather than a guess.
+        if leg and leg in (backend, '1'):
             self.skipTest(f"the Mirror's {backend} backend cannot {feature}")
 
     def _drop_silently(self, cur):
