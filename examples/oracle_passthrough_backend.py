@@ -654,7 +654,12 @@ class OraclePassthroughBackend:
         try:
             cursor.executemany(sql, [list(row) for row in rows])
         except seerdb.DatabaseError as exc:
-            raise _relay_error(exc) from exc
+            # The batch aborted part-way, and the rows before the failing one
+            # really were applied -- the upstream cursor's rowcount says how
+            # many, which is exactly what a real server reports (#998). Clamped
+            # at zero: DB-API leaves rowcount -1 when it means nothing, and a
+            # negative count is not a smaller number of rows, it is no answer.
+            raise _relay_error(exc, max(cursor.rowcount or 0, 0)) from exc
         return cursor.rowcount or 0
 
     def execute_many_rowcounts(
@@ -889,7 +894,7 @@ class OraclePassthroughBackend:
 _ORA_PREFIX = re.compile(r'^ORA-(\d{5}):\s*')
 
 
-def _relay_error(exc: 'seerdb.DatabaseError') -> BackendError:
+def _relay_error(exc: 'seerdb.DatabaseError', rowcount: int = 0) -> BackendError:
     text = str(exc)
     match = _ORA_PREFIX.match(text)
     code = getattr(exc, 'code', None)
@@ -900,7 +905,10 @@ def _relay_error(exc: 'seerdb.DatabaseError') -> BackendError:
     # Relay the parse offset (oracledb's DatabaseError.offset) so the Mirror draws
     # the error caret under the same column the real server flagged.
     return BackendError(
-        text, ora_code=code or 900, error_offset=getattr(exc, 'offset', None)
+        text,
+        ora_code=code or 900,
+        error_offset=getattr(exc, 'offset', None),
+        rowcount=rowcount,
     )
 
 

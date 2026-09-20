@@ -2460,6 +2460,23 @@ token_oer` skips these by field version (§4.2); without it the message
 DALC is mis-aligned and decodes to garbage even though the early
 `ora_error_code` (and thus the exception class) is still correct.
 
+#### 6.3b The rowcount field is read on an ERROR too (#998/#1003)
+
+`current_row_number` is not only a success field. An `executemany` whose batch
+aborts part-way really did apply the rows before the failing one, and the server
+reports how many **there**, alongside the error — a caller reading
+`cursor.rowcount` in an `except` block is asking what actually happened, which is
+exactly when it matters.
+
+Both sides of that have to agree. A client that sets its rowcount only on the
+success path keeps whatever it had — the `-1` a fresh cursor starts with, or a
+count left over from an earlier statement, which is the worse of the two because
+it looks plausible. And a server that hard-codes 0 into every error OER tells a
+caller nothing happened when three rows did.
+
+Note the count is what the call **managed**, so a statement that failed outright
+reports 0 rather than inheriting the previous statement's number.
+
 ### 6.8 Status (TTI_STA)
 
 Indicates successful completion of a transaction operation (COMMIT, ROLLBACK, PING).
