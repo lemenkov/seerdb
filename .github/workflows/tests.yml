@@ -203,7 +203,9 @@ jobs:
           # tools/run_mirror_suite.py, so it has to declare what it is talking
           # to: a test for something the Mirror does not serve yet skips on
           # this, instead of failing as though the client were at fault (#964).
-          SEERDB_TEST_MIRROR: "1"
+          # The value names the backend, since some of what a leg cannot do is
+          # the backend's rather than the Mirror's (#1019).
+          SEERDB_TEST_MIRROR: "postgres"
         run: |
           python -m pytest -q tests/test_postgres_backend.py
           # Run the Mirror from the checkout (the launcher lives in examples/, so

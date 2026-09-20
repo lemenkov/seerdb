@@ -405,12 +405,19 @@ class _IntegrationBase(unittest.TestCase):
 
     def _skip_if_mirror(self, feature: str):
         # A Mirror leg runs the same suite against seerdb's own server, which
-        # trails the client on some features -- a column LOB's mutation (#964),
-        # validating a non-query parse (#1019). Skip rather than fail, so a
-        # Mirror gap does not read as a client regression. Each caller names the
-        # follow-up ticket.
+        # trails the client on some features -- a column LOB's mutation (#964).
+        # Skip rather than fail, so a Mirror gap does not read as a client
+        # regression. Each caller names the follow-up ticket.
         if os.environ.get('SEERDB_TEST_MIRROR'):
             self.skipTest(f'the Mirror does not implement {feature} yet')
+
+    def _skip_if_mirror_backend(self, backend: str, feature: str):
+        # Narrower than _skip_if_mirror: what this leg cannot do belongs to the
+        # BACKEND, not to the Mirror, so only the named one skips. PostgreSQL
+        # cannot parse Oracle SQL and serves no non-query `cursor.parse()`,
+        # while the passthrough asks a real server and does (#1019).
+        if os.environ.get('SEERDB_TEST_MIRROR') == backend:
+            self.skipTest(f"the Mirror's {backend} backend cannot {feature}")
 
     def _drop_silently(self, cur):
         try:
@@ -2328,7 +2335,7 @@ class ParseIntegration(_IntegrationBase):
         # a reserved word is rejected at parse time and at no other time.
         if self._pre10():
             self.skipTest('cursor.parse() needs 10g+')
-        self._skip_if_mirror('validating a non-query parse (#1019)')
+        self._skip_if_mirror_backend('postgres', 'parse Oracle SQL')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
         with self.assertRaises(seerdb.DatabaseError) as ctx:
             self.cur.parse(
@@ -2339,7 +2346,7 @@ class ParseIntegration(_IntegrationBase):
     def test_parse_reports_a_statement_that_is_not_sql(self):
         if self._pre10():
             self.skipTest('cursor.parse() needs 10g+')
-        self._skip_if_mirror('validating a non-query parse (#1019)')
+        self._skip_if_mirror_backend('postgres', 'parse Oracle SQL')
         with self.assertRaises(seerdb.DatabaseError) as ctx:
             self.cur.parse('this is not sql')
         self.assertEqual(ctx.exception.code, 900)  # ORA-00900
@@ -2355,7 +2362,7 @@ class ParseIntegration(_IntegrationBase):
         # of validating without running.
         if self._pre10():
             self.skipTest('cursor.parse() needs 10g+')
-        self._skip_if_mirror('validating a non-query parse (#1019)')
+        self._skip_if_mirror_backend('postgres', 'parse Oracle SQL')
         with self.assertRaises(seerdb.DatabaseError):
             self.cur.parse('this is not sql')
         self.cur.execute('SELECT 1 FROM DUAL')

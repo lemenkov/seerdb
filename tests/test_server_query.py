@@ -4369,6 +4369,62 @@ def test_a_parse_only_execute_is_recognised_and_carries_no_binds() -> None:
     assert request.bind_count == 0  # a parse sends no values, whatever :val is
 
 
+def test_a_non_query_parse_is_handed_to_a_backend_that_can_validate() -> None:
+    # A non-query parse owes only a status, and answering it from the Mirror's
+    # own side is how every parse-time error was lost: nothing parsed the
+    # statement, so `returning IntCol into :ROWID` came back clean where a real
+    # server answers ORA-01745 (#1019). A backend with a `parse` method is asked,
+    # and what it refuses reaches the client as that error.
+    from typing import cast
+
+    from seerdb.common.tns import ExecRequest
+    from seerdb.server.backend import Backend, BackendError
+    from seerdb.server.session import _answer_parse
+
+    asked = []
+
+    class _CanParse:
+        def parse(self, sql: str) -> None:
+            asked.append(sql)
+            if 'ROWID' in sql:
+                raise BackendError('invalid host/bind variable name', ora_code=1745)
+
+    request = ExecRequest(
+        sql='', cursor=0, bind_count=0, fetch=0, parse_only=True, describe_only=False
+    )
+    good = 'insert into t (v) values (:1)'
+    assert _answer_parse(
+        cast(Backend, _CanParse()), good, request
+    )  # a status, no exception
+    assert asked == [good]
+
+    bad = 'insert into t (v) values (:1) returning v into :ROWID'
+    with pytest.raises(BackendError) as err:
+        _answer_parse(cast(Backend, _CanParse()), bad, request)
+    assert err.value.ora_code == 1745
+
+
+def test_a_backend_that_cannot_parse_still_answers_a_status() -> None:
+    # The capability is optional, and omitting it is the right answer for a
+    # backend that cannot parse Oracle SQL at all -- the PostgreSQL and SQLite
+    # demos. They must not break on a parse, only decline to validate it.
+    from typing import cast
+
+    from seerdb.common.tns import ExecRequest
+    from seerdb.server.backend import Backend
+    from seerdb.server.session import _answer_parse
+
+    class _CannotParse:
+        pass
+
+    request = ExecRequest(
+        sql='', cursor=0, bind_count=0, fetch=0, parse_only=True, describe_only=False
+    )
+    assert _answer_parse(
+        cast(Backend, _CannotParse()), 'insert into t (v) values (:1)', request
+    )
+
+
 def test_an_ordinary_execute_is_not_taken_for_a_parse() -> None:
     # PARSE rides along with EXECUTE on every first execute of a statement, so
     # the PARSE bit alone can never be the test -- what makes a call a parse is
