@@ -2762,6 +2762,22 @@ def encode_out_bind_response_thin(
     return iov + bytes(rxd) + encode_status(0)
 
 
+def _prefetched_image_value(value: object, tns_type: int) -> bytes:
+    """A JSON or VECTOR value as the reply carries it: the IMAGE, prefetched,
+    with the locator behind it (§22.1b).
+
+    Neither type is ever fetched over TTI_LOBOPS -- the server puts the whole
+    value in the reply and the client reads it there. Three carriers need this
+    and each had to learn it separately: the column (#887), the RETURNING bind
+    (§22.1c), and the OUT bind (#1010), which was still minting a locator."""
+    if tns_type == TNS_TYPE_JSON:
+        from seerdb.common.oson import encode_oson
+
+        # allow_wide so a > 255-key or > 64 KiB document still re-encodes.
+        return encode_prefetched_lob_value_thin(encode_oson(value, allow_wide=True))
+    return encode_prefetched_lob_value_thin(encode_vector(value))
+
+
 def _encode_out_bind_value(
     value: object, tns_type: int, csfrm: int = _CSFRM_DB
 ) -> bytes:
@@ -2771,6 +2787,14 @@ def _encode_out_bind_value(
     # and a native ``encode_sb4`` would render 0 as an empty DALC that reads back
     # as NULL -- python-oracledb then rejects the object-type metadata call with
     # ``DPY-2035`` because its ``ret_val`` came back NULL rather than 0 (#888).
+    if tns_type in _PREFETCHED_IMAGE_TYPES and value is not None:
+        # A JSON or VECTOR OUT bind carries its IMAGE, prefetched into the
+        # reply, not a locator to fetch it with -- the same framing the column
+        # (#887) and RETURNING (§22.1b) carriers use, and the third of the three
+        # to need saying so (#1010). Falling through to encode_value minted a
+        # locator, 41 bytes whatever the value, and the client ran off the end
+        # of it.
+        return _prefetched_image_value(value, tns_type)
     if tns_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
         # A LOB-class OUT bind's value is the LOB block, not a DALC (§6.5,
         # #979). This has to sit ahead of the national-charset branch: an NCLOB
@@ -2933,11 +2957,7 @@ def _returned_value(value: object, tns_type: int) -> bytes:
         return encode_object_column_value(value)
     if tns_type not in _PREFETCHED_IMAGE_TYPES or value is None:
         return encode_value(value, tns_type)
-    if tns_type == TNS_TYPE_JSON:
-        from seerdb.common.oson import encode_oson
-
-        return encode_prefetched_lob_value_thin(encode_oson(value, allow_wide=True))
-    return encode_prefetched_lob_value_thin(encode_vector(value))
+    return _prefetched_image_value(value, tns_type)
 
 
 def scroll_start_row(orientation: int, position: int, total: int) -> int:
@@ -3442,12 +3462,23 @@ def _is_object_bind(Bind: object) -> bool:
 def _lob_bind_type(Bind: object) -> int | None:
     # The LOB-class TNS type an OUT value for this bind arrives as, or None when
     # the bind is not LOB-class (#978). Either a Var the caller typed
-    # (cursor.var(DB_TYPE_CLOB / BLOB / NCLOB / JSON / VECTOR)) or the temp-LOB
-    # marker such a Var was promoted to on the way out (#902).
+    # (cursor.var(DB_TYPE_CLOB / BLOB / NCLOB / JSON / VECTOR)), the temp-LOB
+    # marker such a Var was promoted to on the way out (#902), or a RAW value
+    # the caller passed that this client itself binds as a VECTOR (#1010).
+    #
+    # That last case exists because the Mirror cannot see bind direction on the
+    # wire, so it marks every bind of a block OUT and echoes a value for each --
+    # including a pure-IN one. The client discards the positions it did not bind
+    # as a Var, but it still has to READ PAST them, and reading past a VECTOR
+    # needs to know it is one. A real server marks such a bind IN and sends no
+    # value at all, so this only ever arises behind a Mirror; decoding by the
+    # type this client declared in its own OAC is right either way.
     if isinstance(Bind, TempLob):
         return TNS_TYPE_BLOB if Bind.is_blob else TNS_TYPE_CLOB
     if isinstance(Bind, Var) and Bind.dbtype.tns_type in _LOB_DATA_TYPES:
         return Bind.dbtype.tns_type
+    if is_vector_bind(Bind):
+        return TNS_TYPE_VECTOR
     return None
 
 

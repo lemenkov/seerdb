@@ -3604,6 +3604,57 @@ def test_a_binds_charset_form_reaches_the_backend() -> None:
     assert [b.csfrm for b in binds] == [2, 1]
 
 
+def test_a_vector_out_bind_carries_its_image_not_a_locator() -> None:
+    # A VECTOR is never fetched over TTI_LOBOPS -- the server prefetches the
+    # whole value into the reply. That was settled for COLUMNS in #887 and for
+    # RETURNING binds in §22.1c; the OUT-bind carrier was still minting a
+    # locator, 41 bytes whatever the value, and the client ran off the end of it
+    # (#1010).
+    import array
+    from collections.abc import Iterable
+    from typing import cast
+
+    from seerdb.common.tns import _encode_out_bind_value, _read_lob_bind_value
+    from seerdb.common.tns_consts import TNS_TYPE_VECTOR
+
+    small = _encode_out_bind_value(array.array('f', [1.5] * 4), TNS_TYPE_VECTOR)
+    large = _encode_out_bind_value(array.array('f', [1.5] * 4000), TNS_TYPE_VECTOR)
+    # The bug's signature was a CONSTANT size: a locator says nothing about the
+    # value, so the two encodings were byte-identical in length.
+    assert len(large) > len(small) * 10
+
+    # And it reads back as the image, through the client's own reader.
+    from seerdb.common.lob import LOB
+    from seerdb.common.vector import decode_vector
+
+    value, rest = _read_lob_bind_value(small, TNS_TYPE_VECTOR)
+    assert isinstance(value, LOB)
+    assert rest == b'', 'the reader must consume the value exactly'
+    image = value._prefetched
+    assert image is not None, 'the image must ride in the value, not be fetched'
+    assert list(cast(Iterable, decode_vector(image))) == [1.5] * 4
+
+
+def test_a_raw_vector_bind_is_typed_for_its_echoed_value() -> None:
+    # The Mirror cannot see bind direction on the wire, so it marks every bind
+    # of a block OUT and echoes a value for each -- including a pure-IN one. The
+    # client discards positions it did not bind as a Var, but it still has to
+    # READ PAST them, and reading past a VECTOR means knowing it is one (#1010).
+    import array
+
+    from seerdb.common.datatypes import DB_TYPE_VECTOR, Var
+    from seerdb.common.tns import _lob_bind_type
+    from seerdb.common.tns_consts import TNS_TYPE_VECTOR
+
+    assert _lob_bind_type(array.array('f', [1.0, 2.0])) == TNS_TYPE_VECTOR
+    assert _lob_bind_type([1.0, 2.0]) == TNS_TYPE_VECTOR
+    assert _lob_bind_type(Var(DB_TYPE_VECTOR)) == TNS_TYPE_VECTOR
+    # Things that are not vector binds keep reading as plain DALC values.
+    assert _lob_bind_type('a string') is None
+    assert _lob_bind_type(42) is None
+    assert _lob_bind_type(None) is None
+
+
 def test_encode_out_bind_response_thin_lob_roundtrips_via_client() -> None:
     # A LOB-class OUT bind rides as the LOB block, not a DALC (#979): the client
     # reads it with the reader a fetched LOB column uses, and gets a LOB whose
