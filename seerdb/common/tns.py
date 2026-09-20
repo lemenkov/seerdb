@@ -353,6 +353,11 @@ class ColumnMeta:
     # report it) — the encoder then falls back to FLOAT32 (#55).
     vector_format: int | None = None
     vector_dimensions: int | None = None
+    # The describe's vector-metadata flags byte. A VECTOR column that allows ANY
+    # number of dimensions says so HERE, not by its count -- the count beside
+    # the flag is 0 and means nothing, so a describe that drops the flag tells
+    # the client the column holds zero-element vectors (#1013).
+    vector_flags: int | None = None
     # The describe's uds-flags bits a client reads to decide how to decode the
     # value: is_json marks a native JSON column, is_oson a BLOB / CLOB holding an
     # OSON image (an `IS JSON FORMAT OSON` column). A client re-types an is_oson
@@ -1337,10 +1342,17 @@ def _encode_dcb_column(col: ColumnMeta, position: int) -> bytes:
             # a vector descriptor after the domain fields (§20.5); the client
             # consumes both or the row stream desyncs. The Mirror emits no
             # annotations (count 0) and a descriptor from the column's own vector
-            # metadata (dimensions 0 = flexible / non-vector, flags 0).
+            # metadata. The flags byte is RELAYED, not zeroed: a flexible
+            # column says it allows any dimensions there, and a zero told
+            # the client it allows exactly none (#1013).
             encode_sb4(0)  # num_annotations
             + encode_sb4(col.vector_dimensions or 0)  # vector_dimensions
-            + bytes([(col.vector_format or 0) & 0xFF, 0])  # vector_format, flags
+            + bytes(
+                [
+                    (col.vector_format or 0) & 0xFF,
+                    (col.vector_flags or 0) & 0xFF,
+                ]
+            )  # vector_format, flags
             if field_version > FIELD_VERSION_23_1
             else b''
         )
