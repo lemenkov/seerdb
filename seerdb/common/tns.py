@@ -2722,28 +2722,11 @@ def _encode_out_bind_value(
     # as NULL -- python-oracledb then rejects the object-type metadata call with
     # ``DPY-2035`` because its ``ret_val`` came back NULL rather than 0 (#888).
     if tns_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
-        # A LOB-class OUT bind's value is the LOB block -- a ub4 length, the
-        # locator's ub8 size and ub4 chunk size, then the locator -- and not a
-        # DALC, because the client reads it with the same reader a fetched LOB
-        # column uses (§6.5, #979). Mint a unique locator and remember the
-        # content exactly as the column path does, so the read the client then
-        # issues against it resolves (#888/#962). A NULL LOB is a single 0x00
-        # instead of the whole block.
-        #
-        # This has to sit ahead of the national-charset branch: an NCLOB OUT
-        # bind is a CLOB with csfrm 2, and encoding it as UTF-16BE text would
-        # hand the LOB reader a DALC.
-        if value is None:
-            return bytes([0])
-        Log = _LOB_EMIT_LOG.get()
-        Locator = (
-            Log.record(value, tns_type == TNS_TYPE_CLOB)
-            if Log is not None
-            else _THIN_LOB_LOCATOR
-        )
-        return encode_lob_locator_thin(
-            _lob_value_size(value), with_metadata=True, locator=Locator
-        )
+        # A LOB-class OUT bind's value is the LOB block, not a DALC (§6.5,
+        # #979). This has to sit ahead of the national-charset branch: an NCLOB
+        # OUT bind is a CLOB with csfrm 2, and encoding it as UTF-16BE text
+        # would hand the LOB reader a DALC.
+        return encode_lob_bind_block(value, is_clob=tns_type == TNS_TYPE_CLOB)
     if csfrm == _CSFRM_NCHAR and isinstance(value, str):
         # National character data travels as UTF-16BE, the same form a
         # national COLUMN uses in a row (_national_wire_value). #826.
@@ -2863,8 +2846,35 @@ def encode_returning_response(
 
 def _returned_value(value: object, tns_type: int) -> bytes:
     # One RETURNING out-bind value. JSON and VECTOR carry their image inline, the
-    # way the row encoder sends them (#826/#887); an OBJECT / collection carries
-    # the object frame a column uses; everything else is a DALC.
+    # way the row encoder sends them (#826/#887); a CLOB / BLOB carries the LOB
+    # block a fetched column carries; an OBJECT / collection carries the object
+    # frame a column uses; everything else is a DALC.
+    if tns_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
+        # `RETURNING ClobCol INTO :b` (§22.1d, #987). Sent as a DALC the client
+        # read the block length as the whole value and got an EMPTY string back
+        # -- not an error, which is what makes this one worth a test: it was the
+        # right shape and the wrong content.
+        return encode_lob_bind_block(value, is_clob=tns_type == TNS_TYPE_CLOB)
+    if tns_type in (TNS_TYPE_LONG, TNS_TYPE_LONGRAW):
+        # A LONG return bind is a plain DALC -- NOT the 0xFE-chunked inline
+        # framing a LONG COLUMN uses in a row, which is what encode_value would
+        # give it. Measured on a live 23ai returning a CLOB column into a
+        # DB_TYPE_LONG var, the whole reply is:
+        #
+        #   07 | 01 01 | 13 <19 bytes> | 00 | 08 ...
+        #   ^RXD  ^rows   ^DALC          ^trunc
+        #
+        # The column framing adds a chunk marker and two trailing indicators, so
+        # the client read those as the next field and the reply desynced on a
+        # zero byte -- reported as "unknown protocol message type 0" (#987).
+        if value is None:
+            return bytes([0])
+        payload = (
+            bytes(value)
+            if isinstance(value, (bytes, bytearray))
+            else str(value).encode('utf-8')
+        )
+        return _bytes_with_length(payload)
     if tns_type == TNS_TYPE_ADT:
         # `RETURNING ObjectCol INTO :b`. Encoded as a DALC the value was asked
         # for a scalar wire form it has none of, and the Mirror answered
@@ -11222,6 +11232,30 @@ def encode_prefetched_lob_value_thin(image: bytes) -> bytes:
         + encode_sb4(_THIN_PREFETCH_CHUNK_SIZE)
         + _bytes_with_length(image)
         + _bytes_with_length(_THIN_LOB_LOCATOR)
+    )
+
+
+def encode_lob_bind_block(value: object, *, is_clob: bool) -> bytes:
+    """The LOB block a BIND's value rides in, for a Mirror serving one.
+
+    The block is the same one a fetched LOB column carries (§14.5b) -- a ub4
+    length, the locator's ub8 size and ub4 chunk size, then the locator -- and a
+    NULL LOB is the single byte ``0x00`` in place of it. Both bind carriers use
+    it: an OUT / IN OUT bind (§6.5, #979) and a DML RETURNING bind (§22.1d,
+    #987).
+
+    The Mirror has no upstream locator to pass along -- a passthrough backend
+    reads its upstream with ``fetch_lobs=False``, so the value arrives already
+    materialised -- so it MINTS one and records the content against it in the
+    session's :class:`LobEmitLog`, exactly as the column path does. The read the
+    client then issues is answered from that log by locator, so nothing about
+    the read path changes."""
+    if value is None:
+        return bytes([0])
+    log = _LOB_EMIT_LOG.get()
+    locator = log.record(value, is_clob) if log is not None else _THIN_LOB_LOCATOR
+    return encode_lob_locator_thin(
+        _lob_value_size(value), with_metadata=True, locator=locator
     )
 
 
