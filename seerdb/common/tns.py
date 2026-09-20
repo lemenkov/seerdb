@@ -3391,24 +3391,37 @@ def _lob_bind_type(Bind: object) -> int | None:
     return None
 
 
-def _read_lob_out_bind(Rest: bytes, DataType: int) -> tuple[object, bytes]:
-    # A LOB-class OUT / IN OUT bind's value. The server sends the same block a
-    # fetched LOB column carries -- a ub4 block length, the locator's ub8 size
-    # and ub4 chunk size, then the locator itself (§22.1b) -- so it reads with
-    # the row reader rather than as a DALC. Reading it as a DALC took the block
-    # length for the whole value and left the rest of the block in the stream,
-    # where its first byte then decoded as a response token (#978).
+def _read_lob_bind_value(Rest: bytes, DataType: int) -> tuple[object, bytes]:
+    """A LOB-class bind's returned value, WITHOUT the return code after it.
+
+    The server sends the same block a fetched LOB column carries -- a ub4 block
+    length, the locator's ub8 size and ub4 chunk size, then the locator itself
+    (§22.1b) -- so it reads with the row reader rather than as a DALC. Read as a
+    DALC the block length was taken for the whole value and the rest of the
+    block left in the stream, where its next byte decoded as a response token
+    (#978/#985).
+
+    Both carriers of such a value use this -- an OUT / IN OUT bind (§6.5) and a
+    DML RETURNING bind (§22.1c) -- but they disagree about what follows it, so
+    the trailer is each caller's own business."""
     from seerdb.common.lob import LOB
 
     (Locator, Rest, Image) = _read_lob_column_full(
         Rest, inline_image=DataType in _PREFETCHED_IMAGE_TYPES
     )
-    (_, Rest) = decode_ub4(Rest)  # per-value return code
     if Locator is None and Image is None:
         return (None, Rest)
     if Image is not None:
         return (LOB(DataType, Locator or b'', prefetched=Image), Rest)
     return (LOB(DataType, Locator or b''), Rest)
+
+
+def _read_lob_out_bind(Rest: bytes, DataType: int) -> tuple[object, bytes]:
+    # A LOB-class OUT / IN OUT bind: the value, then the per-value return code
+    # every OUT bind carries (#978).
+    (Value, Rest) = _read_lob_bind_value(Rest, DataType)
+    (_, Rest) = decode_ub4(Rest)
+    return (Value, Rest)
 
 
 def _read_iov(
@@ -4147,6 +4160,12 @@ def _decode_rxd_step(Data: bytes, Acc: tuple) -> tuple:
                     # next field, so the response desynced on the token after it
                     # (#826).
                     (Val, Rest) = _read_lob_column(Rest, inline_image=True)
+                elif TnsType in _LOB_DATA_TYPES:
+                    # A CLOB / BLOB / NCLOB bind's returned value is the LOB
+                    # block a fetched column carries (§22.1b), not a DALC --
+                    # the same misunderstanding as the OUT bind above it (#978),
+                    # reached through this reader instead (#985).
+                    (Val, Rest) = _read_lob_bind_value(Rest, TnsType)
                 elif TnsType == TNS_TYPE_ADT:
                     # An OBJECT / collection bind's returned value carries the
                     # object framing a column uses (§21.2 -- toid, object OID,

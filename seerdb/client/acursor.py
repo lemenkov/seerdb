@@ -17,6 +17,7 @@ from seerdb.client.cursor import (
     _extract_implicit_results,
     _out_bind_lobs,
     _resolve_parameters,
+    _return_bind_lobs,
 )
 from seerdb.common.datatypes import TempLob, Var
 from seerdb.common.exceptions import (
@@ -228,6 +229,13 @@ class AsyncCursor(_CursorLogic):
 
         # DML RETURNING ... INTO: write the returned value list onto each Var.
         _assign_return_binds(Bind, Result)
+        # A LOB a RETURNING bind brought back (#985): the async half of the sync
+        # _resolve_return_bind_lobs -- same rule, awaited read.
+        KeepReturnLobs = getattr(self._connection, 'fetch_lobs', False)
+        for Bucket, Index, Value in _return_bind_lobs(Bind):
+            Value._connection = self._connection
+            if not KeepReturnLobs:
+                Bucket[Index] = await Value.aread()
 
         ServerRowCount = None
         ColMeta = None

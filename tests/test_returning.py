@@ -151,6 +151,30 @@ def _object_returning_rxd() -> bytes:
     )
 
 
+def _lob_returning_rxd(values: list[bytes | None]) -> bytes:
+    """A RETURNING reply carrying CLOB values, built with the LOB COLUMN encoder.
+
+    Deliberately not the Mirror's return-bind encoder: that one still writes a
+    DALC for a LOB (the server half of #985). The column encoder is the framing
+    a real server uses for a returned LOB -- verified on a live 23ai, where
+    reading it as a DALC is exactly what desynced the reply."""
+    from seerdb.common.tns import encode_lob_locator_thin, encode_sb4
+    from seerdb.common.tns_consts import TTI_RXD
+
+    out = bytes([TTI_RXD]) + encode_sb4(len(values))
+    for index, value in enumerate(values):
+        if value is None:
+            out += b'\x00'  # a NULL LOB is the single byte, not a block
+        else:
+            out += encode_lob_locator_thin(
+                len(value),
+                with_metadata=True,
+                locator=bytes([0x00, 0x26]) + bytes(36) + bytes([index]),
+            )
+        out += encode_sb4(0)  # sb4 truncation length
+    return out + bytes([TTI_STA])
+
+
 class TestReturningDecode(unittest.TestCase):
     def tearDown(self):
         set_decode_return_binds(None)
@@ -178,6 +202,37 @@ class TestReturningDecode(unittest.TestCase):
         (value,) = rec['return_values'][0]
         self.assertIsInstance(value, ObjectImage)
         self.assertIn(b'returned', value.image)
+
+    def test_lob_return_bind_reads_the_lob_block(self):
+        # A CLOB / BLOB return bind carries the LOB block a fetched column uses
+        # -- a ub4 block length, the locator's ub8 size and ub4 chunk size, then
+        # the locator -- not a DALC. Read as a DALC the block length was taken
+        # for the whole value and the rest left in the stream, where its next
+        # byte decoded as a response token; the number came from the data, which
+        # is what made it read like a decoder gap. Against a REAL 23ai, no
+        # Mirror (#985).
+        from seerdb.common.lob import LOB
+        from seerdb.common.tns_consts import TNS_TYPE_CLOB
+
+        set_decode_return_binds([0], {0: TNS_TYPE_CLOB})
+        (Done, Acc) = decode_token_rxd(
+            _lob_returning_rxd([b'first', b'second']), (None, None, [])
+        )
+        self.assertTrue(Done)
+        (first, second) = Acc[2][0]['return_values'][0]
+        # Two values, so the SECOND one is the half a desync loses: a reader
+        # that mis-measured the first never reaches it intact.
+        self.assertIsInstance(first, LOB)
+        self.assertIsInstance(second, LOB)
+        self.assertNotEqual(first.raw, second.raw)
+
+    def test_a_null_lob_return_bind_is_a_single_byte(self):
+        from seerdb.common.tns_consts import TNS_TYPE_CLOB
+
+        set_decode_return_binds([0], {0: TNS_TYPE_CLOB})
+        (Done, Acc) = decode_token_rxd(_lob_returning_rxd([None]), (None, None, []))
+        self.assertTrue(Done)
+        self.assertEqual(Acc[2][0]['return_values'][0], [None])
 
     def test_two_binds_single_row(self):
         rec = self._decode(_RXD_TWO, [0, 1])
