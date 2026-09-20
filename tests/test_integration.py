@@ -3027,6 +3027,24 @@ class VectorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT v FROM {self.TABLE}')
         return self.cur.fetchone()[0]
 
+    def test_a_vector_through_a_plsql_in_out_bind(self):
+        # A VECTOR OUT / IN OUT bind carries its IMAGE, not a locator (#1010).
+        # Served as a locator the client ran off the end of it -- and the size
+        # was irrelevant, which is what made this look like the 64 KiB ceiling
+        # of #1008 when it is a different bug entirely.
+        import array
+
+        self._setup_vec('VECTOR(4, float32)')  # the table is incidental here
+        In = array.array('f', [1.0, 1.5, 2.0, 2.5])
+        InOut = self.cur.var(seerdb.DB_TYPE_VECTOR)
+        InOut.setvalue(0, array.array('f', [4.0, 4.5, 5.0, 5.5]))
+        Out = self.cur.var(seerdb.DB_TYPE_VECTOR)
+        # Binds are positional by first appearance, so the list reads :o, :b, :a
+        # -- not the order the names appear in the assignment.
+        self.cur.execute('BEGIN :o := :b; :b := :a; END;', [Out, InOut, In])
+        self.assertEqual(list(Out.getvalue()), [4.0, 4.5, 5.0, 5.5])
+        self.assertEqual(list(InOut.getvalue()), [1.0, 1.5, 2.0, 2.5])
+
     def test_a_vector_larger_than_64_kib(self):
         # The image length is a three-byte field; written as a ub2 it raised
         # OverflowError for anything past 64 KiB, so a float64 vector of more
