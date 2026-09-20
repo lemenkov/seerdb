@@ -1019,12 +1019,6 @@ class CursorIntegration(_IntegrationBase):
         # every type. Read as "the untruncated length" it turns every NULL
         # RETURNING into a truncation report (#1021) -- which is how the live
         # matrix caught the first cut of this check, on a NULL LOB.
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            # Pre-10g runs RETURNING as a PL/SQL block (#801), and that rewrite
-            # collapses "the value is NULL" into "nothing matched" -- [] rather
-            # than [None]. A separate bug in a separate mechanism (#1022); this
-            # test is about the wire field.
-            self.skipTest('pre-10g reports a NULL RETURNING value as no rows (#1022)')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, v VARCHAR2(40))')
         got = self.cur.var(str, 100)
         self.cur.execute(
