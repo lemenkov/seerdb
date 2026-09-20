@@ -2210,6 +2210,62 @@ def test_backend_fault_error_reports_ora600_without_recursing() -> None:
     assert b'encoded number data too long' in fault
 
 
+def test_a_login_failure_reports_why_it_failed() -> None:
+    # ORA-01017 is reserved for a credential that did not verify. It used to be
+    # sent for EVERY login-time failure, including ones where the password was
+    # perfectly good and the server simply had no session to give -- a full
+    # database (ORA-12516) reported as "invalid username/password". The one
+    # thing a client cannot do with that is tell the two apart, and it cost two
+    # investigations before the Mirror's own log gave it away (#1006).
+    from seerdb.common.exceptions import InterfaceError
+    from seerdb.common.tns import decode_token_oer
+    from seerdb.server.session import _deny_login
+
+    def reported(**kw) -> tuple:
+        stream: Any = _CollectingStream()
+        try:
+            _deny_login(stream, 'reason', **kw)
+        except InterfaceError:
+            pass
+        decoded = decode_token_oer(stream.sent[0], (0, [], []))
+        return (decoded[1], decoded[5])
+
+    # A credential that did not verify still says so, and still says it the way
+    # Oracle does -- without distinguishing user from password.
+    code, message = reported()
+    assert code == 1017
+    assert 'invalid username/password' in message
+
+    # A backend that refused says what the BACKEND said, so a client behind a
+    # passthrough sees what a direct connection would have seen.
+    assert reported(
+        ora_code=12516, message='ORA-12516: connection refused by the listener'
+    ) == (12516, 'ORA-12516: connection refused by the listener')
+
+
+def test_a_backend_failure_keeps_its_own_ora_code() -> None:
+    # Where the code comes from: an upstream driver's error already carries the
+    # server's own, and relaying it is the whole point. Anything without one
+    # becomes ORA-01034 -- the server exists but has no session to give, which
+    # is true of every case that lands here (#1006).
+    import seerdb
+    from seerdb.server.session import _login_failure_error
+
+    upstream = seerdb.DatabaseError(
+        'ORA-12516: connection refused by the listener', code=12516
+    )
+    assert _login_failure_error(upstream) == {
+        'ora_code': 12516,
+        'message': 'ORA-12516: connection refused by the listener',
+    }
+
+    # A socket error has no ORA code to relay, and inventing a specific one
+    # would be a different lie from the one this fixes.
+    fallback = _login_failure_error(OSError('connection refused'))
+    assert fallback['ora_code'] == 1034
+    assert fallback['message'].startswith('ORA-01034:')
+
+
 def test_a_parse_fault_refuses_the_call_instead_of_killing_the_session() -> None:
     # A message cut by the transport says so with Truncated, and _complete_message
     # waits for the rest. Anything ELSE a parser raises is a bug in that parser --

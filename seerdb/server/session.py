@@ -568,9 +568,21 @@ def handle_login(
             try:
                 open_session(connect_attrs)
             except BackendError as err:
-                _deny_login(stream, f'upstream session refused: {err.ora_message}')
+                # The credentials verified; the BACKEND refused. Relay its own
+                # code, so a client behind a passthrough sees what a direct
+                # connection would have seen (#1006).
+                _deny_login(
+                    stream,
+                    f'upstream session refused: {err.ora_message}',
+                    ora_code=err.ora_code,
+                    message=err.ora_message,
+                )
             except Exception as exc:  # noqa: BLE001
-                _deny_login(stream, f'upstream session failed: {exc}')
+                _deny_login(
+                    stream,
+                    f'upstream session failed: {exc}',
+                    **_login_failure_error(exc),
+                )
 
     # Application context the client declared at connect
     # (`connect(appcontext=[...])`). It arrives in this AUTH -- AFTER the backend
@@ -628,15 +640,57 @@ def _backend_session_info(backend: Backend) -> SessionInfo:
         return SessionInfo()
 
 
-def _deny_login(stream: PacketStream, reason: str) -> NoReturn:
-    # Reject a login the way Oracle does — an ORA-01017 OER in place of the next
-    # auth reply, which the client raises out of connect() — then drop the
+def _login_failure_error(exc: Exception) -> dict:
+    """The ORA code and message to report for a backend that could not open a
+    session, when the credentials themselves were fine (#1006).
+
+    An upstream driver's error already carries the server's own code -- a full
+    database answers ORA-12516, a down one ORA-12541 -- and relaying it is what
+    lets a client behind a passthrough Mirror see what a direct connection would
+    have seen. Anything with no code of its own becomes ORA-01034: the server
+    exists but has no session to give, which is true of every case that lands
+    here."""
+    code = getattr(exc, 'code', None)
+    text = str(exc).strip()
+    if isinstance(code, int) and code > 0 and text.startswith('ORA-'):
+        return {'ora_code': code, 'message': text}
+    return {
+        'ora_code': _ORA_NOT_AVAILABLE,
+        'message': f'ORA-{_ORA_NOT_AVAILABLE:05d}: the backend is not available',
+    }
+
+
+# ORA-01034: the instance is not available. What a client is told when the login
+# itself was fine but the server cannot produce a session, and there is no more
+# specific code to relay (#1006).
+_ORA_NOT_AVAILABLE = 1034
+
+
+def _deny_login(
+    stream: PacketStream,
+    reason: str,
+    *,
+    ora_code: int = 1017,
+    message: str | None = None,
+) -> NoReturn:
+    # Reject a login the way Oracle does — an OER in place of the next auth
+    # reply, which the client raises out of connect() — then drop the
     # connection. (Without this the client would connect() cleanly and fail
-    # later.) The message is deliberately generic (user vs password not
-    # distinguished) as Oracle's ORA-01017 is.
+    # later.)
+    #
+    # The DEFAULT is ORA-01017, deliberately generic about user vs password the
+    # way Oracle's own is. It must stay reserved for a credential that did not
+    # verify. Sending it for anything else says the caller got their password
+    # wrong when they did not: a full database (ORA-12516) reported that way
+    # cost two separate investigations, because the one thing a client cannot do
+    # with ORA-01017 is tell a bad password from a server that had no session to
+    # give (#1006). Callers with a real reason pass it.
     stream.write_packet(
         TNS_DATA,
-        encode_error(1017, 'ORA-01017: invalid username/password; logon denied'),
+        encode_error(
+            ora_code,
+            message or 'ORA-01017: invalid username/password; logon denied',
+        ),
     )
     raise InterfaceError(f'authentication rejected — {reason}')
 
