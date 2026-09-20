@@ -81,6 +81,7 @@ def test_missing_offset_is_none():
 class _FakeVar:
     def __init__(self, value=None):
         self._value = value
+        self.dbtype = None
 
     def setvalue(self, _pos, value):
         self._value = value
@@ -101,10 +102,15 @@ class _FakeCursor:
         self._out_values = out_values or {}
 
     def var(self, dbtype, size=None):
-        return _FakeVar()
+        # Keep the type asked for: which dbtype a bind resolves to is the thing
+        # under test for a national bind (#990).
+        var = _FakeVar()
+        var.dbtype = dbtype
+        return var
 
     def arrayvar(self, dbtype, value_or_numelements, size=None):
         var = _FakeVar()
+        var.dbtype = dbtype
         var.capacity = value_or_numelements
         return var
 
@@ -178,6 +184,31 @@ def test_a_compilation_warning_is_relayed_from_upstream():
     clean.warning = None
     backend._conn = type('Conn', (), {'cursor': lambda self: clean})()
     assert backend.execute('CREATE TABLE t (n NUMBER)').compilation_warning is False
+
+
+def test_an_array_bind_keeps_its_national_charset_form():
+    # A national bind is the ordinary TNS type plus csfrm 2, so resolving a type
+    # from tns_type alone binds NVARCHAR2 as VARCHAR2 upstream and a PL/SQL table
+    # of the former rejects it with PLS-00418. The form rides on the BindVar
+    # now, so the passthrough registers the right array type (#990).
+    import seerdb
+    from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
+
+    backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
+    cursor = _FakeCursor()
+    binds = [
+        BindVar(
+            value=['a'], tns_type=TNS_TYPE_VARCHAR, max_size=60, array_size=4, csfrm=2
+        ),
+        BindVar(
+            value=['b'], tns_type=TNS_TYPE_VARCHAR, max_size=60, array_size=4, csfrm=1
+        ),
+    ]
+    backend._execute_plsql(cursor, 'BEGIN p(:1, :2); END;', binds)
+    assert [getattr(v, 'dbtype', None) for v in cursor.bound] == [
+        seerdb.DB_TYPE_NVARCHAR,
+        seerdb.DB_TYPE_VARCHAR,
+    ]
 
 
 def test_large_lob_in_bind_is_registered_as_a_lob_var():

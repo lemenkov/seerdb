@@ -654,6 +654,24 @@ msgtype=2 | charset_in (UB2 LE) | charset_out (UB2 LE) | flag (UB1) |
   and decodes the value with it, so an NCHAR / NVARCHAR bind (csfrm 2, UTF-16BE)
   is recovered as text rather than mojibake; the common 5-tuple OAC decode drops
   csfrm, which had defaulted every bind to the ordinary form.
+
+  **The form belongs to the BIND, not to the value (#991/#990).** Two places got
+  this wrong by looking the form up from whatever they happened to hold:
+
+  * An associative array's **elements** are encoded as bare Python values, which
+    carry no type, so a national array sent them as UTF-8. The server read those
+    bytes as UTF-16BE and produced a string of **half the length** — silently,
+    because they are a valid if wrong string. The form has to be applied per
+    element, from the array's own declaration.
+  * The OUT-bind and RETURNING decode paths built their column dict without a
+    csfrm at all, so **every** national OUT value — scalar as well as array —
+    came back as raw UTF-16BE read one byte per character.
+
+  Server side, the same rule has to reach the **backend**: a national bind is
+  not a distinct TNS type (NVARCHAR2 is VARCHAR plus csfrm 2), so a backend
+  handed `tns_type` alone binds the ordinary type upstream and a PL/SQL table of
+  the national one refuses it with `PLS-00418: array bind type must match PL/SQL
+  table`. The Mirror carries the form on its `BindVar` for that reason.
 - **compile_caps / runtime_caps**: two length-prefixed byte arrays. Each index
   is a named feature slot (`TNS_CCAP_*` / `TNS_RCAP_*`). The most important is
   the **field version** at compile-cap index 7 (`TNS_CCAP_FIELD_VERSION`): it

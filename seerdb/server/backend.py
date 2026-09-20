@@ -81,6 +81,12 @@ class BindVar:
     tns_type: int
     max_size: int
     array_size: int = 0
+    # The bind's charset form, off the client's OAC. A national-charset bind is
+    # not a distinct TNS type -- NVARCHAR2 is VARCHAR with csfrm 2, NCLOB is CLOB
+    # with csfrm 2 -- so a backend that resolves a type from tns_type alone binds
+    # the wrong one, and a PL/SQL table of NVARCHAR2 rejects it with PLS-00418
+    # (#990). 1 (the database charset) for every ordinary bind.
+    csfrm: int = 1
     # The referenced type's 16-byte OID for an object (ADT) bind, so the backend
     # can register a Var of that type for an object OUT / typed-NULL bind — the
     # value alone (None) carries no type identity (#888). Empty for every other
