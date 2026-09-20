@@ -2368,6 +2368,38 @@ TTI_OER |
   [trailing message DALC iff ora_error_code != 0]
 ```
 
+#### 6.1a ORA-01017 means the credential failed, and nothing else (#1006)
+
+A login can fail for reasons that have nothing to do with the credential: the
+proof verifies, and then the server cannot produce a session for it. A Mirror
+feels this most sharply — its backend is a second database, which can be full,
+down, or refusing — but a real server has the same distinction.
+
+`ORA-01017` is deliberately vague about **user versus password**, and that is
+the only ambiguity it is allowed to carry. Sending it for anything else tells
+the caller they got their password wrong when they did not, and the one thing
+they cannot then do is tell a bad password from a server with no session to
+give.
+
+Relay what actually happened:
+
+| cause | what the client is told |
+|---|---|
+| the password proof did not verify | `ORA-01017`, as Oracle sends it |
+| the backend refused with its own code | **that code** — e.g. `ORA-12516` when the database is out of processes |
+| the backend failed with no ORA code | `ORA-01034`, the instance is not available |
+
+Relaying the backend's own code is what lets a client behind a passthrough see
+exactly what a direct connection would have seen.
+
+Worth recording why this is not cosmetic. A full-suite run produced a burst of
+`ORA-01017` setup errors, twice, in two different sessions. Both times the
+credential was correct and the affected file passed in isolation, so both times
+it was written off as flaky account state. It was actually the database hitting
+its process limit (`v$resource_limit`: 173 of 200), and only the Mirror's own
+log said so. A misreported error does not just lose information — it sends the
+reader somewhere else entirely.
+
 #### 6.2a A message is a byte stream; a parse fault must not end the session (#1000)
 
 A TTC message spans as many DATA packets as it needs, and python-oracledb sends
