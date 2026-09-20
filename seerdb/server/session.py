@@ -2458,6 +2458,21 @@ def _out_bind_entries(
         out_binds, bind_meta, arrays, forms
     ):
         if isinstance(value, CursorResult):
+            # A REF cursor the block never OPENED is reported with cursor id 0
+            # and no columns, and the client keys on the id: executing a ref
+            # cursor whose id is 0, with no statement of its own, is what makes
+            # it raise rather than hand back an empty result. Parking this one
+            # like any other gave the caller a perfectly valid handle to a
+            # cursor that does not exist, so a fetch returned nothing instead of
+            # failing -- silently empty, which cannot be told from a cursor
+            # opened over no rows (#1016).
+            #
+            # Zero columns is a sound signal: a REF cursor that really was
+            # opened always describes at least one, because `open c for <query>`
+            # requires a query.
+            if not value.columns:
+                entries.append(RefCursorOutBind(columns=[], cursor_id=0))
+                continue
             cursor_id = cursors.open(value.columns, list(value.rows))
             entries.append(RefCursorOutBind(columns=value.columns, cursor_id=cursor_id))
         elif capacity:

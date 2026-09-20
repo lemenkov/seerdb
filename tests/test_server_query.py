@@ -3640,6 +3640,37 @@ def test_the_describe_relays_a_vector_columns_flags() -> None:
     assert plain != flexible
 
 
+def test_an_unopened_ref_cursor_is_reported_with_id_zero() -> None:
+    # A REF cursor the block never OPENED is reported with cursor id 0 and no
+    # columns. The client keys on the id -- executing a ref cursor whose id is 0
+    # with no statement of its own is what makes it raise. Parking it like any
+    # other cursor handed the caller a valid handle, so a fetch returned nothing
+    # instead of failing: silently empty, which cannot be told from a cursor
+    # opened over no rows (#1016).
+    from seerdb.common.tns import ColumnMeta, RefCursorOutBind
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+    from seerdb.server.backend import CursorResult
+    from seerdb.server.session import _Cursors, _out_bind_entries
+
+    cursors = _Cursors()
+    col = ColumnMeta(name=b'N', data_type=TNS_TYPE_NUMBER, data_length=22, max_size=22)
+
+    (never_opened,) = _out_bind_entries(
+        [CursorResult(columns=[], rows=[])], [(102, 4)], cursors
+    )
+    assert isinstance(never_opened, RefCursorOutBind)
+    assert never_opened.cursor_id == 0
+    assert never_opened.columns == []
+
+    # An opened one still gets a real id and is parked for the client to drain.
+    (opened,) = _out_bind_entries(
+        [CursorResult(columns=[col], rows=[(1,)])], [(102, 4)], cursors
+    )
+    assert isinstance(opened, RefCursorOutBind)
+    assert opened.cursor_id != 0
+    assert cursors.has(opened.cursor_id)
+
+
 def test_a_vector_out_bind_carries_its_image_not_a_locator() -> None:
     # A VECTOR is never fetched over TTI_LOBOPS -- the server prefetches the
     # whole value into the reply. That was settled for COLUMNS in #887 and for
