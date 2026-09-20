@@ -45,6 +45,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_JSON,
     TNS_TYPE_RAW,
     UTF8_CHARSET,
+    VECTOR_FLAG_FLEXIBLE_DIM,
 )
 
 # `RETURNING col BULK COLLECT INTO :x` -- the bulk form of the clause.
@@ -1238,6 +1239,7 @@ def _column_description(Col: dict) -> 'FetchInfo':
         fields,
         vector_dimensions=Col.get('vector_dimensions'),
         vector_format=Col.get('vector_format'),
+        vector_flags=Col.get('vector_flags'),
         type_schema=Col.get('type_schema'),
         type_name=Col.get('type_name'),
         type_oid=Col.get('type_oid') or None,
@@ -1274,6 +1276,7 @@ class FetchInfo(tuple):
         *,
         vector_dimensions=None,
         vector_format=None,
+        vector_flags=None,
         type_schema=None,
         type_name=None,
         type_oid=None,
@@ -1281,8 +1284,19 @@ class FetchInfo(tuple):
         is_oson=False,
     ):
         self = super().__new__(cls, fields)
-        self.vector_dimensions = vector_dimensions
-        self.vector_format = vector_format
+        self.vector_flags = vector_flags
+        # A VECTOR column that allows ANY number of dimensions says so with a
+        # flag, not with a count -- the count alongside it is 0 and means
+        # nothing. Reporting that 0 tells a caller the column holds zero-element
+        # vectors, which is a different claim and a wrong one, so it is reported
+        # as None the way python-oracledb reports it (#1012).
+        #
+        # The FORMAT needs no flag: a flexible format simply is 0. It still has
+        # to become None for the same reason -- 0 is not a format.
+        if vector_flags is not None and vector_flags & VECTOR_FLAG_FLEXIBLE_DIM:
+            vector_dimensions = None
+        self.vector_dimensions = vector_dimensions or None
+        self.vector_format = vector_format or None
         self.type_schema = type_schema
         self.type_name = type_name
         self.type_oid = type_oid

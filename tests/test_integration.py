@@ -3027,6 +3027,48 @@ class VectorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT v FROM {self.TABLE}')
         return self.cur.fetchone()[0]
 
+    def test_a_flexible_column_reports_no_dimension_count(self):
+        # `VECTOR(*, *)` allows any dimensions and any format. The describe says
+        # so with a FLAG; the dimension count beside it is 0 and means nothing,
+        # so reporting it would claim the column holds zero-element vectors
+        # (#1012). python-oracledb reports None for both.
+        from seerdb.common.exceptions import DatabaseError
+
+        try:
+            self.cur.execute(
+                f'CREATE TABLE {self.TABLE} ('
+                f'  flex_all VECTOR(*, *),'
+                f'  flex_dim VECTOR(*, float32),'
+                f'  fixed    VECTOR(16, float32))'
+            )
+        except DatabaseError as exc:
+            # Same two codes _setup_vec skips on: 21c rejects the type
+            # (ORA-00902) and 11g's parser cannot read the syntax at all
+            # (ORA-00907). This test needs three columns rather than the one
+            # _setup_vec makes, so it repeats the guard instead.
+            if exc.code in (902, 907):
+                self.skipTest('native VECTOR type needs a 23ai+ server')
+            raise
+        self.cur.execute(f'SELECT flex_all, flex_dim, fixed FROM {self.TABLE}')
+        FlexAll, FlexDim, Fixed = self.cur.description
+        # The per-column vector descriptor is a 23.4+ addition and not every
+        # 23ai release populates it; a server that omits it reports None for
+        # every column, flexible or not, and seerdb surfaces what it is sent.
+        # The FIXED column is the probe: where the descriptor is populated it
+        # has a format, so its absence means there is nothing to assert about
+        # any of them. Same guard as
+        # test_description_reports_vector_format_and_dimensions.
+        if not Fixed.vector_format:
+            self.skipTest('server does not populate the vector describe format')
+        self.assertEqual(Fixed.vector_dimensions, 16)
+        self.assertEqual(Fixed.vector_format, 2)  # float32
+        # A flexible dimension is None -- NOT the 0 that rides beside the flag.
+        self.assertIsNone(FlexDim.vector_dimensions)
+        self.assertEqual(FlexDim.vector_format, 2)
+        # And a column flexible in both reports neither.
+        self.assertIsNone(FlexAll.vector_dimensions)
+        self.assertIsNone(FlexAll.vector_format)
+
     def test_a_vector_through_a_plsql_in_out_bind(self):
         # A VECTOR OUT / IN OUT bind carries its IMAGE, not a locator (#1010).
         # Served as a locator the client ran off the end of it -- and the size

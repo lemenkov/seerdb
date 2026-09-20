@@ -147,6 +147,13 @@ TNS_EOCS_FLAGS_TXN_IN_PROGRESS = 0x02
 # with errors: the statement succeeded and the object exists, invalid (#993).
 TNS_OER_WARN_COMPILATION_ERROR = 0x20
 
+# The describe's vector-metadata flags byte (23.4+). A VECTOR column that allows
+# ANY number of dimensions says so HERE, not by its dimension count -- the count
+# alongside this bit is 0 and means nothing, so reporting it claims the column
+# holds zero-element vectors (#1012). SPARSE marks a sparse VECTOR column.
+VECTOR_FLAG_FLEXIBLE_DIM = 0x01
+VECTOR_FLAG_SPARSE = 0x02
+
 TNS_ATTENTION = 13
 TNS_CONTROL = 14
 TNS_MAX = 19
