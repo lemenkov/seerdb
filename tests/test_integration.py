@@ -4384,11 +4384,18 @@ class PlsqlTypeIntegration(_IntegrationBase):
               TYPE udt_numlist IS TABLE OF NUMBER INDEX BY BINARY_INTEGER;
               TYPE udt_rec IS RECORD (id NUMBER, name VARCHAR2(40));
               PROCEDURE fill(n IN NUMBER, l IN OUT udt_numlist);
+              FUNCTION total_from_zero(l IN udt_numlist) RETURN NUMBER;
             END;""")
         self.cur.execute(f"""CREATE PACKAGE BODY {self.PKG} AS
               PROCEDURE fill(n IN NUMBER, l IN OUT udt_numlist) IS
               BEGIN
                 FOR i IN 1..n LOOP l(i) := i * 100; END LOOP;
+              END;
+              FUNCTION total_from_zero(l IN udt_numlist) RETURN NUMBER IS
+                t NUMBER := 0;
+              BEGIN
+                FOR i IN 0..l.COUNT - 1 LOOP t := t + l(i); END LOOP;
+                RETURN t;
               END;
             END;""")
 
@@ -4445,6 +4452,26 @@ class PlsqlTypeIntegration(_IntegrationBase):
         obj = typ.newobject()
         self.cur.callproc(f'{self.PKG}.fill', (3, obj))
         self.assertEqual([int(v) for v in obj.aslist()], [100, 200, 300])
+
+    def test_a_locally_built_array_is_keyed_from_zero(self):
+        # PL/SQL written for an index-by table indexes from ZERO -- `for i in
+        # 0..l.COUNT - 1` is the ordinary idiom. seerdb keyed a locally built
+        # array 1..N, so `l(0)` was a missing key and PL/SQL raised
+        # NO_DATA_FOUND, surfacing as ORA-01403 (#1055).
+        typ = self.conn.gettype(f'{self.PKG}.UDT_NUMLIST')
+        obj = typ.newobject()
+        for Value in (10, 20, 30):
+            obj.append(Value)
+        Total = self.cur.callfunc(f'{self.PKG}.total_from_zero', int, [obj])
+        self.assertEqual(int(Total), 60)
+
+    def test_a_seeded_array_is_keyed_from_zero(self):
+        # Same, seeded through newobject() rather than append().
+        typ = self.conn.gettype(f'{self.PKG}.UDT_NUMLIST')
+        Total = self.cur.callfunc(
+            f'{self.PKG}.total_from_zero', int, [typ.newobject([1, 2, 3, 4])]
+        )
+        self.assertEqual(int(Total), 10)
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)

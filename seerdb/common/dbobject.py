@@ -354,13 +354,28 @@ class DbObject:
             self, '_elements', list(elements or []) if IsCollection else None
         )
         # An associative array's element keys, parallel to _elements and in the
-        # same (sorted-key) order; None for a VARRAY / nested table, and for an
-        # index-by table built locally, whose keys are 1..N until the server
-        # sends real ones. Kept beside the list rather than replacing it so
+        # same (sorted-key) order; None for a VARRAY / nested table, which has
+        # no keys at all. Kept beside the list rather than replacing it so
         # aslist() / len() / [i] / append() keep meaning what they mean (#1053).
-        object.__setattr__(
-            self, '_keys', list(keys) if (IsCollection and keys is not None) else None
+        #
+        # An index-by table built locally gets keys 0..N-1 rather than None, so
+        # it goes out under real keys like any other. Zero-based because that is
+        # where PL/SQL written for these arrays starts -- `for i in 0..count-1`
+        # is the ordinary idiom, and a 1-based array makes `a(0)` raise
+        # NO_DATA_FOUND (#1055).
+        Keyed = IsCollection and (
+            keys is not None
+            or (
+                dbtype is not None
+                and dbtype.collection_type == COLLECTION_PLSQL_INDEX_TABLE
+            )
         )
+        if not Keyed:
+            object.__setattr__(self, '_keys', None)
+        elif keys is not None:
+            object.__setattr__(self, '_keys', list(keys))
+        else:
+            object.__setattr__(self, '_keys', list(range(len(self._elements or []))))
         object.__setattr__(self, '_attrs', {} if IsCollection else dict(attrs or []))
         object.__setattr__(
             self, '_order', [] if IsCollection else [Name for Name, _ in (attrs or [])]
@@ -427,13 +442,14 @@ class DbObject:
             self._key_appended()
 
     def _key_appended(self) -> None:
-        # Keep _keys parallel to _elements when a keyed collection grows. The new
-        # key follows the highest one, the way PL/SQL's own append does; without
+        # Keep _keys parallel to _elements when a keyed collection grows; without
         # this the two lists drift apart and the encoder pairs a value with some
-        # other element's key.
+        # other element's key. The new key follows the highest, and the FIRST one
+        # is 0 -- PL/SQL written for these arrays indexes from zero, so a 1-based
+        # array makes `a(0)` raise NO_DATA_FOUND (#1055).
         if self._keys is None:
             return
-        self._keys.append(max(self._keys) + 1 if self._keys else 1)
+        self._keys.append(max(self._keys) + 1 if self._keys else 0)
 
     def aslist(self) -> list:
         """The collection elements, or an object's attribute values in order."""
