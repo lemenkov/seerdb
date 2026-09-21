@@ -77,6 +77,8 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_23_1,
     FIELD_VERSION_23_4,
     MAX_SEQ_NUM,
+    ORA_ARRAY_DML_ERRORS,
+    ORA_NO_DATA_FOUND,
     PURITY_DEFAULT,
     TNS_ACCEPT,
     TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE,
@@ -1214,7 +1216,7 @@ class OracleConnect(_ConnectionLogic):
                                 )
                                 ErrCode = Result[1]
                                 Message = Result[5] if len(Result) > 5 else None
-                            if ErrCode and ErrCode not in (0, 1403):
+                            if ErrCode and ErrCode not in (0, ORA_NO_DATA_FOUND):
                                 raise from_ora_code(ErrCode)(
                                     Message or f'ORA-{ErrCode:05d}', code=ErrCode
                                 )
@@ -1722,7 +1724,7 @@ class OracleConnect(_ConnectionLogic):
             and CacheKey is not None
             and isinstance(Result, tuple)
             and len(Result) >= 2
-            and Result[1] not in (0, 1403, 24381)
+            and Result[1] not in (0, ORA_NO_DATA_FOUND, ORA_ARRAY_DML_ERRORS)
         ):
             self._cursor_cache.pop(CacheKey, None)
         # Stash the cursor id the server returned so the next execute of
@@ -1737,7 +1739,7 @@ class OracleConnect(_ConnectionLogic):
             and len(Result) >= 3
             and isinstance(Result[2], int)
             and Result[2] > 0
-            and Result[1] in (0, 1403)
+            and Result[1] in (0, ORA_NO_DATA_FOUND)
         ):
             # CacheKey is None whenever the cache is disabled for this execute
             # (12c+, where a cached re-execute fails) — gating the write on it
@@ -1830,7 +1832,7 @@ class OracleConnect(_ConnectionLogic):
         if not isinstance(Result, tuple) or len(Result) < 6:
             return ([], True, 0)
         (_, OraCode, _, RetFormat, Rows, *_) = Result
-        AtEof = (OraCode == 1403) or not Rows
+        AtEof = (OraCode == ORA_NO_DATA_FOUND) or not Rows
         ServerRowCount = (
             RetFormat[0] if (isinstance(RetFormat, tuple) and RetFormat) else 0
         )
@@ -1865,7 +1867,7 @@ class OracleConnect(_ConnectionLogic):
         # column whose row was still uncommitted returned no rows at all: the
         # server defers those rows to a FETCH (call_status 2, no 1403, nothing
         # inline) and the client never asked for them (#712).
-        if RowFormat and CursorId and OraCode != 1403:
+        if RowFormat and CursorId and OraCode != ORA_NO_DATA_FOUND:
             try:
                 while True:
                     # Bit-vector (BVC) duplicate-column detection is per fetch
@@ -1887,7 +1889,7 @@ class OracleConnect(_ConnectionLogic):
                     # call_status != 1 means the same thing via a different field.
                     # End of fetch, or a batch that brought nothing back --
                     # which also guarantees this loop terminates.
-                    if OraCode == 1403 or not MoreRows:
+                    if OraCode == ORA_NO_DATA_FOUND or not MoreRows:
                         break
             finally:
                 set_decode_prev_row(None)
@@ -1900,7 +1902,7 @@ class OracleConnect(_ConnectionLogic):
         # (#1039). A result set is what makes the code a sentinel, so RowFormat
         # is the test -- nothing can be at the end of a fetch that never had
         # rows to fetch.
-        if OraCode == 1403 and RowFormat:
+        if OraCode == ORA_NO_DATA_FOUND and RowFormat:
             OraCode = 0
         return (CallStatus, OraCode, CursorId, RetFormat, AllRows) + tuple(Tail)
 
@@ -1934,7 +1936,7 @@ class OracleConnect(_ConnectionLogic):
                 (CallStatus, OraCode, _, _, MoreRows, *_) = Result
                 if MoreRows:
                     AllRows.extend(MoreRows)
-                if OraCode == 1403 or not MoreRows:
+                if OraCode == ORA_NO_DATA_FOUND or not MoreRows:
                     break
         finally:
             set_decode_prev_row(None)
@@ -2619,7 +2621,7 @@ class OracleConnect(_ConnectionLogic):
         self.send(TNS_DATA, Data)
         Result = cast(tuple, self._handle_response())
         ErrCode = Result[1] if isinstance(Result, tuple) and len(Result) > 1 else 0
-        if ErrCode and ErrCode not in (0, 1403):
+        if ErrCode and ErrCode not in (0, ORA_NO_DATA_FOUND):
             Message = Result[5] if len(Result) > 5 else None
             raise from_ora_code(ErrCode)(Message or f'ORA-{ErrCode:05d}', code=ErrCode)
         self.password = new_password

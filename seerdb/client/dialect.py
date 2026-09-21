@@ -65,7 +65,7 @@ from seerdb.common.tns import (
     encode_tokens_rxd,
     o8i_stmt_type,
 )
-from seerdb.common.tns_consts import TTI_LOB, TTI_OER
+from seerdb.common.tns_consts import ORA_NO_DATA_FOUND, TTI_LOB, TTI_OER
 
 # Oracle 8i LONG / LONG RAW type codes — a LONG changes the fetch shape (one row
 # per round trip, read the whole value) (#377).
@@ -100,7 +100,7 @@ def fv2_raise_for_error(packet: bytes, *, end_of_fetch_ok: bool = True) -> None:
     value (#1039). The 10g+ path draws the same line in `_drain_cursor`.
     """
     (err_code, message) = decode_fv2_oer_error(packet)
-    benign = (0, 1403) if end_of_fetch_ok else (0,)
+    benign = (0, ORA_NO_DATA_FOUND) if end_of_fetch_ok else (0,)
     if err_code and err_code not in benign:
         from seerdb.common.exceptions import from_ora_code
 
@@ -177,7 +177,7 @@ class Fv2Dialect:
                 raise Exception('Connection closed during 9i fetch')
             (rows, err_code) = decode_fv2_exec_response(resp[1], columns)
             all_rows.extend(rows)
-            if err_code == 1403 or not rows:
+            if err_code == ORA_NO_DATA_FOUND or not rows:
                 break
         # Resolve LOB cells while the cursor is still open (JDBC does the same):
         # decode_fv2_exec_response left LOB objects in the rows; replace each with
@@ -334,8 +334,8 @@ class Fv2Dialect:
 
 
 def _raise_terminal(err_code: int) -> None:
-    # Raise the ORA error carried by a terminal status (not success / 1403).
-    if err_code and err_code not in (0, 1403):
+    # Raise the ORA error carried by a terminal status (not success / no-data).
+    if err_code and err_code not in (0, ORA_NO_DATA_FOUND):
         from seerdb.common.exceptions import from_ora_code
 
         raise from_ora_code(err_code)(f'ORA-{err_code:05d}', code=err_code)
