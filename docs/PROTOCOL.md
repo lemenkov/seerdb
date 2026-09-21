@@ -5188,8 +5188,15 @@ re-encode) until #1053; an external client then saw a correctly framed image
 carrying the wrong numbers.
 
 A collection decoded off the wire must therefore be re-encoded under **its own**
-keys. One built locally has none and is keyed 1..N, which is also what PL/SQL's
-own append does.
+keys. One built locally is keyed **0..N-1**, and an appended element takes the
+highest key plus one — starting at **0**, matching the reference client
+(`new_index = keys[-1] + 1 if keys else 0`).
+
+**Zero, not one.** PL/SQL written for these arrays indexes from zero — the
+ordinary idiom is `for i in 0..a_Value.count - 1` — so a 1-based array makes
+`a_Value(0)` a missing key, and a missing key raises NO_DATA_FOUND, i.e.
+`ORA-01403`. seerdb keyed locally built arrays 1..N until #1055, and binding one
+to any such procedure failed.
 
 Two header details differ between the server's image and seerdb's encoder, with
 no known consequence: the server writes the **short** image length (`88 01 51`)

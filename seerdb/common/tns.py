@@ -12511,9 +12511,12 @@ def _encode_object_image(Obj: 'DbObject', *, header: bool) -> bytes:
         # be keyed by any BINARY_INTEGER, and renumbering it 1..N hands the far
         # side a faithfully framed image full of wrong numbers (#1053).
         Keys = Obj._keys if index_table else None
-        for Position, Value in enumerate(Obj._elements, start=1):
+        for Position, Value in enumerate(Obj._elements):
             if index_table:
-                Key = Keys[Position - 1] if Keys is not None else Position
+                # Zero-based when the object carries no keys of its own: PL/SQL
+                # written for these arrays indexes from 0, and a 1-based array
+                # makes `a(0)` raise NO_DATA_FOUND (#1055).
+                Key = Keys[Position] if Keys is not None else Position
                 # SIGNED: the negative half of BINARY_INTEGER is ordinary (a live
                 # 23ai sends -1048576 as ff f0 00 00). Packing '>I' agrees for
                 # every key a dense 1..N array has and raises on a real one.

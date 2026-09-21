@@ -960,10 +960,13 @@ class TestPlsqlIndexTableImage(unittest.TestCase):
         # (01 01); the body then opens with the HAS_INDEXES flag byte.
         self.assertEqual(image[7:9], bytes([1, 1]))  # prefix segment
         self.assertEqual(image[9], 0x10)  # HAS_INDEXES collection flag
-        # A locally built array has no keys of its own, so it is keyed 1..N.
-        self.assertIn(struct.pack('>i', 1), image)
-        self.assertIn(struct.pack('>i', 2), image)
-        self.assertIn(struct.pack('>i', 3), image)
+        # A locally built array is keyed 0..N-1: PL/SQL written for these arrays
+        # indexes from zero (`for i in 0..count-1`), and a 1-based array makes
+        # `a(0)` raise NO_DATA_FOUND (#1055).
+        self.assertEqual(
+            decode_collection_keyed(image, _INDEX_TABLE_TYPE.element)[1], [0, 1, 2]
+        )
+        self.assertIn(struct.pack('>i', 0), image)
 
     def test_index_table_roundtrips(self):
         obj = _INDEX_TABLE_TYPE.newobject([10, 20, 30])
@@ -1013,6 +1016,42 @@ class TestPlsqlIndexTableImage(unittest.TestCase):
         self.assertIsNone(
             decode_collection_keyed(varray_image, _INDEX_TABLE_TYPE.element)[1]
         )
+
+    def test_locally_built_array_is_zero_based(self):
+        # The case that failed live: a seerdb-built array bound to PL/SQL that
+        # loops `for i in 0..count - 1` raised ORA-01403, because we keyed the
+        # elements 1..N and `a(0)` did not exist (#1055).
+        obj = _INDEX_TABLE_TYPE.newobject([10, 20, 30])
+        self.assertEqual(object.__getattribute__(obj, '_keys'), [0, 1, 2])
+
+    def test_append_to_empty_starts_at_zero(self):
+        obj = _INDEX_TABLE_TYPE.newobject()
+        obj.append(10)
+        obj.append(20)
+        self.assertEqual(
+            decode_collection_keyed(
+                encode_object_image(obj), _INDEX_TABLE_TYPE.element
+            )[1],
+            [0, 1],
+        )
+
+    def test_varray_gets_no_keys_from_its_type(self):
+        # Only an INDEX TABLE is keyed; a SQL collection stays keyless, so the
+        # zero-based seeding must not leak into VARRAY / nested table.
+        varray = DbObjectType(
+            'PYO',
+            'INTS_T',
+            bytes.fromhex('ee' * 16),
+            1,
+            [],
+            is_collection=True,
+            collection_type=COLLECTION_VARRAY,
+            element=_INDEX_TABLE_TYPE.element,
+        )
+        obj = varray.newobject([10, 20, 30])
+        self.assertIsNone(object.__getattribute__(obj, '_keys'))
+        obj.append(40)
+        self.assertIsNone(object.__getattribute__(obj, '_keys'))
 
     def test_append_keeps_keys_parallel(self):
         # Growing a keyed array must extend _keys too, or the encoder pairs each
