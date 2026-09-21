@@ -71,6 +71,49 @@ DENYLIST: dict[str, str] = {
     'test_9700_direct_path_load_async.py': 'Direct path load',
 }
 
+# Individual tests that cannot pass through a Mirror **by construction**, in
+# files that otherwise do. Unlike DENYLIST above these are not whole features,
+# so each entry says exactly why it can never go green rather than what has not
+# been built yet -- something merely unimplemented belongs in a ticket and stays
+# red until it is fixed.
+#
+# Keep this short. Every line here is a test whose signal is being given up.
+DENYLIST_TESTS: dict[str, str] = {}
+
+for _test, _reason in (
+    # A passthrough measures the UPSTREAM session, not the client's. The Mirror
+    # holds one upstream connection per client session and issues its own
+    # statements on it (type lookups, the describe fallback), so a round-trip or
+    # parse count read from v$mystat/v$sesstat counts the Mirror's work as well
+    # as the client's. There is no arrangement of the relay that makes these
+    # agree: the number the test asserts is a property of a DIRECT connection.
+    ('test_4300_cursor_other.py::test_4322', 'v$mystat round-trip count'),
+    ('test_4300_cursor_other.py::test_4323', 'v$mystat round-trip count'),
+    ('test_4300_cursor_other.py::test_4333', 'v$mystat parse count'),
+    ('test_6300_cursor_other_async.py::test_6315', 'v$mystat round-trip count'),
+    ('test_6300_cursor_other_async.py::test_6316', 'v$mystat round-trip count'),
+    ('test_6300_cursor_other_async.py::test_6322', 'v$mystat parse count'),
+    # Same root cause: the count comes from v$temporary_lobs for the session id
+    # the CLIENT sees, which is the upstream session the Mirror shares with its
+    # own temp-LOB bookkeeping.
+    ('test_1900_lob_var.py::test_1918', 'v$temporary_lobs on a shared session'),
+    ('test_5700_lob_var_async.py::test_5715', 'v$temporary_lobs on a shared session'),
+    # The bed's server is NEWER than the suite's expectation and raises a
+    # different (also correct) code; the Mirror relays it faithfully. Both fail
+    # DIRECTLY against the same server too, which is how they are told apart
+    # from a relay gap -- verified by running the whole suite direct: 2 failed
+    # out of 2134, and these are the two.
+    (
+        'test_6400_vector_var.py::test_6430',
+        'server raises ORA-51807, suite wants 51805',
+    ),
+    (
+        'test_7700_sparse_vector.py::test_7734',
+        'server raises a newer vector error code',
+    ),
+):
+    DENYLIST_TESTS[_test] = _reason
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -114,11 +157,16 @@ def main() -> int:
     ]
     for filename in DENYLIST:
         cmd += ['--ignore', f'tests/{filename}']
+    for test in DENYLIST_TESTS:
+        cmd += ['--deselect', f'tests/{test}']
     cmd += args.pytest_args
 
     print(f'# {len(DENYLIST)} files denylisted (out-of-scope features):')
     for filename, reason in sorted(DENYLIST.items()):
         print(f'#   {filename:<42} {reason}')
+    print(f'# {len(DENYLIST_TESTS)} individual tests deselected (cannot pass here):')
+    for test, reason in sorted(DENYLIST_TESTS.items()):
+        print(f'#   {test:<52} {reason}')
     print(f'# running in {args.suite} against {args.dsn}\n', flush=True)
     return subprocess.call(cmd, cwd=args.suite, env=env)
 
