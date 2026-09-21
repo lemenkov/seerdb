@@ -106,6 +106,12 @@ DB_TYPE_TIMESTAMP = _DbType('DB_TYPE_TIMESTAMP', TNS_TYPE_TIMESTAMP, 11)
 DB_TYPE_TIMESTAMP_TZ = _DbType('DB_TYPE_TIMESTAMP_TZ', TNS_TYPE_TIMESTAMPTZ, 13)
 DB_TYPE_BINARY_FLOAT = _DbType('DB_TYPE_BINARY_FLOAT', TNS_TYPE_BFLOAT, 4)
 DB_TYPE_BINARY_DOUBLE = _DbType('DB_TYPE_BINARY_DOUBLE', TNS_TYPE_BDOUBLE, 8)
+# PL/SQL BINARY_INTEGER / PLS_INTEGER (#1044). It travels as an Oracle NUMBER on
+# the wire -- `decode_value` reads TNS_TYPE_INT and TNS_TYPE_NUMBER through the
+# same branch -- but it is NOT a NUMBER to the server: assigning 2.9 to one
+# yields 2, and a call overloaded on the two resolves by this type. Without it a
+# caller could only bind NUMBER and got 2.9 back.
+DB_TYPE_BINARY_INTEGER = _DbType('DB_TYPE_BINARY_INTEGER', TNS_TYPE_INT, 22)
 DB_TYPE_INTERVAL_DS = _DbType('DB_TYPE_INTERVAL_DS', TNS_TYPE_INTERVALDS, 11)
 DB_TYPE_INTERVAL_YM = _DbType('DB_TYPE_INTERVAL_YM', TNS_TYPE_INTERVALYM, 5)
 # Fetch-oriented types (mostly appear in cursor.description; kept as objects so
@@ -195,11 +201,11 @@ def Binary(value) -> bytes:  # noqa: N802
 # CLOB/NCLOB) that share a wire code.
 _FETCH_DBTYPE: dict[tuple[int, int], _DbType] = {
     (TNS_TYPE_NUMBER, 1): DB_TYPE_NUMBER,
-    # The native integer maps onto NUMBER: seerdb has no separate binary
-    # integer type, and a numeric bind is what an overloaded PL/SQL call
-    # needs to resolve. Unmapped, it resolved to None and every caller
-    # fell back to a string bind (#888).
-    (TNS_TYPE_INT, 1): DB_TYPE_NUMBER,
+    # BINARY_INTEGER / PLS_INTEGER. It used to map onto NUMBER, because seerdb
+    # had no binary-integer type at all (#888); that made every such bind a
+    # NUMBER to the server, so PL/SQL never truncated (`:v := 2.9` came back
+    # 2.9, not 2) and a call overloaded on the two could not resolve (#1044).
+    (TNS_TYPE_INT, 1): DB_TYPE_BINARY_INTEGER,
     (TNS_TYPE_VARCHAR, 1): DB_TYPE_VARCHAR,
     (TNS_TYPE_VARCHAR, 2): DB_TYPE_NVARCHAR,
     (TNS_TYPE_CHAR, 1): DB_TYPE_CHAR,

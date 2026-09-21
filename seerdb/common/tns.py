@@ -2833,7 +2833,12 @@ def _encode_out_bind_value(
         # National character data travels as UTF-16BE, the same form a
         # national COLUMN uses in a row (_national_wire_value). #826.
         return _bytes_with_length(value.encode('utf-16-be'))
-    if tns_type == TNS_TYPE_INT and isinstance(value, (int, float)):
+    if tns_type == TNS_TYPE_INT and isinstance(value, (int, float, Decimal)):
+        value = int(value) if isinstance(value, Decimal) else value
+        # Decimal counts: a backend reading a NUMBER hands one back by default,
+        # and leaving it out sent the value down the native-integer path, where
+        # a non-integral or negative value raised `struct.error` INSIDE the
+        # encoder -- a crash, not an ORA error, so the session died (#1044).
         return _bytes_with_length(encode_token_num(value))
     if tns_type == TNS_TYPE_ADT:
         # An object (ADT) OUT-bind slot — e.g. the echoed object IN bind of a
@@ -12151,6 +12156,14 @@ def encode_token_oac(Token: object) -> bytes:
             return _JSON_BIND_OAC
         if DT == TNS_TYPE_VECTOR:
             return _VECTOR_BIND_OAC
+        if DT == TNS_TYPE_INT:
+            # BINARY_INTEGER / PLS_INTEGER Var (#1044). Captured from the
+            # reference client binding one as an OUT param: type 3, buffer 22 --
+            # the NUMBER buffer, because the VALUE rides the wire as an Oracle
+            # NUMBER. Only the declared TYPE differs, and it is what makes the
+            # server truncate (`:v := 2.9` yields 2) and what resolves a call
+            # overloaded on NUMBER vs BINARY_INTEGER.
+            return encode_token_raw(TNS_TYPE_INT, 22, 0, 0, 0, A)
         if DT == TNS_TYPE_TIMESTAMPLTZ:
             # 11 bytes, like TIMESTAMP -- the local-time-zone variant carries no
             # extra offset on the wire, the session's zone supplies it.

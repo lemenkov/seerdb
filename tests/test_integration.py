@@ -959,6 +959,30 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), (7,))
 
+    def test_binary_integer_out_bind_is_an_int(self):
+        # BINARY_INTEGER / PLS_INTEGER travels as an Oracle NUMBER, so the bytes
+        # for `:v := 2.9` are the same either way -- the DECLARED type is what
+        # makes the value an integer, and the truncation is the client's (#1044).
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('a typed BINARY_INTEGER bind needs the 12c+ bind OAC')
+        for expr, want in (('2.9', 2), ('-2.9', -2), ('5', 5), ('0', 0)):
+            with self.subTest(expr=expr):
+                got = self.cur.var(seerdb.DB_TYPE_BINARY_INTEGER)
+                self.cur.execute(f'BEGIN :value := {expr}; END;', [got])
+                value = got.getvalue()
+                self.assertIsInstance(value, int)
+                self.assertEqual(value, want)
+
+    def test_a_number_out_bind_is_still_not_truncated(self):
+        # The companion: the same statement through a NUMBER var keeps its
+        # fraction, so the coercion belongs to the declared type and not to the
+        # wire form the two share.
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('a typed bind needs the 12c+ bind OAC')
+        got = self.cur.var(seerdb.DB_TYPE_NUMBER)
+        self.cur.execute('BEGIN :value := 2.9; END;', [got])
+        self.assertEqual(float(got.getvalue()), 2.9)
+
     def test_select_into_with_no_rows_raises(self):
         # ORA-01403 is the end-of-fetch sentinel a query's last FETCH ends on,
         # AND the error a PL/SQL `SELECT ... INTO` raises when it matches

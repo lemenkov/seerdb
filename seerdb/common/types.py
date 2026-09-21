@@ -386,7 +386,15 @@ def decode_value(Column: dict, Data: bytes | list | None) -> object:
         # relies on (#888). Left undecoded it surfaced as the raw NUMBER bytes,
         # so `select :1 from dual` on such a bind came back as DB_TYPE_RAW
         # b'\xc1 ' instead of 31 (#826).
-        return decode_number(Data)
+        Value = decode_number(Data)
+        if DataType == TNS_TYPE_INT and Value is not None:
+            # The truncation is the CLIENT's, not the server's: the bytes for
+            # `:v := 2.9` are the same NUMBER either way, and it is the declared
+            # BINARY_INTEGER that makes the value an integer. Verified by
+            # capturing both clients' binds -- byte-identical OACs, and only the
+            # decode differs (#1044).
+            return int(Value)
+        return Value
     if DataType in (TNS_TYPE_VARCHAR, TNS_TYPE_CHAR, TNS_TYPE_LONG):
         return decode_string(Data, _string_charset(Column))
     if DataType == TNS_TYPE_LONGRAW:
