@@ -2544,12 +2544,18 @@ def _lobops_state_locator(rest: bytes, source_loc_len: int) -> bytes:
     _dest_offset, rest = decode_ub4(rest)
     rest = rest[1:]  # amount pointer flag
     rest = rest[6:]  # three reserved ub2 array-LOB slots
-    field = rest[:source_loc_len]
-    # Strip the prefix when there is one, so the key and the echoed locator are
-    # the locator proper either way.
-    if len(field) >= 2 and struct.unpack('>H', field[:2])[0] == len(field) - 2:
-        field = field[2:]
-    return field
+    # No ub2 prefix to strip, and no guessing at whether there is one. The
+    # client writes the locator RAW (`write_bytes`, which adds no length) and
+    # declares `write_ub4(len(locator))` for the source length, so the declared
+    # length IS the locator's -- exactly, for every op.
+    #
+    # An earlier version decided by looking at the bytes: strip two if the first
+    # two read as len - 2. That is a coincidence, not a fact. A raw locator
+    # whose opening bytes happen to hold that value lost two bytes that were
+    # never a prefix, the echoed locator came back the wrong length, and the
+    # client read past it -- DPY-5002. It survived an isolated run of the LOB
+    # files and failed the moment the whole suite supplied other locators.
+    return rest[:source_loc_len]
 
 
 def _lobops_locator_after_operation(rest: bytes) -> bytes:
@@ -2565,16 +2571,19 @@ def _lobops_locator_after_operation(rest: bytes) -> bytes:
     return rest[2 : 2 + loc_len]
 
 
-def _lobops_locator_and_tail(rest: bytes) -> tuple[bytes, bytes]:
-    # The locator AND whatever follows it, for an op that carries a value --
-    # TRIM writes its new length there as a trailing ub4 (#826).
+def _lobops_locator_and_tail(rest: bytes, source_loc_len: int) -> tuple[bytes, bytes]:
+    # The locator field AND whatever follows it, for an op that carries a value
+    # -- TRIM writes its new length there as a trailing ub4 (#826).
+    #
+    # By the declared source length, and the field is returned AS SENT, because
+    # the reply echoes it verbatim. Reading a ub2 here instead mangles a COLUMN
+    # locator, which is sent raw (#903/#887).
     rest = rest[2:]  # scn-array pointer + length
     _src_offset, rest = decode_ub4(rest)
     _dest_offset, rest = decode_ub4(rest)
     rest = rest[1:]  # amount pointer flag
     rest = rest[6:]  # three reserved ub2 array-LOB slots
-    loc_len = struct.unpack('>H', rest[:2])[0]
-    return rest[2 : 2 + loc_len], rest[2 + loc_len :]
+    return rest[:source_loc_len], rest[source_loc_len:]
 
 
 def parse_lobops_request(body: bytes) -> LobOpsRequest:
@@ -2612,18 +2621,31 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
         return LobOpsRequest(kind='create_temp', is_blob=0x71 in rest)
     if operation == TNS_LOB_OP_WRITE:
         rest = rest[2:]  # scn-array pointer + length
-        _src_offset, rest = decode_ub4(rest)
+        # The 1-based position the write starts at. A client does not only
+        # append: `lob.write(value, 1)` OVERWRITES from the start, so dropping
+        # this put every write on the end (#903/#887).
+        write_offset, rest = decode_ub4(rest)
         _dest_offset, rest = decode_ub4(rest)
         rest = rest[1:]  # amount pointer flag
         rest = rest[6:]  # three reserved ub2 array-LOB slots
-        loc_len = struct.unpack('>H', rest[:2])[0]
-        rest = rest[2:]
-        locator = rest[:loc_len]
-        rest = rest[loc_len:]
+        # The field as sent, by the declared source length -- which spans it in
+        # both forms, so the payload after it starts in the same place either
+        # way. A COLUMN LOB sends the locator RAW, and reading its first two
+        # bytes as a ub2 length yielded a garbage key, so the write was filed
+        # somewhere the following size() could not find (#903/#887).
+        #
+        # The REPLY must then echo this field verbatim (encode_lobops_echo).
+        # Passing it to encode_lobops_ack instead prepends a second length --
+        # 42 bytes where the client expects 40 -- which desynced 44 tests.
+        locator = rest[:source_loc_len]
+        rest = rest[source_loc_len:]
         if rest and rest[0] == 0x0E:
             rest = rest[1:]
         return LobOpsRequest(
-            kind='write', locator=locator, payload=_decode_lobops_chunked(rest)
+            kind='write',
+            locator=locator,
+            payload=_decode_lobops_chunked(rest),
+            offset=max(write_offset, 1),
         )
     if operation == TNS_LOB_OP_FREE_TEMP:
         return LobOpsRequest(
@@ -2633,7 +2655,7 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
         # TRIM carries its new length as a trailing ub4 and is answered with that
         # length, exactly like GET_LENGTH -- not with a content-free ack, which is
         # what left `lob.trim()` desyncing (#826).
-        locator, tail = _lobops_locator_and_tail(rest)
+        locator, tail = _lobops_locator_and_tail(rest, source_loc_len)
         amount, _ = decode_ub4(tail) if tail else (0, b'')
         return LobOpsRequest(kind='trim', locator=locator, amount=amount)
     if operation == TNS_LOB_OP_GET_LENGTH:
@@ -2641,7 +2663,7 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
         # above -- and it must not fall through to the column-read path, which
         # answers with a read reply and a placeholder locator (#826).
         return LobOpsRequest(
-            kind='get_length', locator=_lobops_locator_after_operation(rest)
+            kind='get_length', locator=_lobops_state_locator(rest, source_loc_len)
         )
     if operation == TNS_LOB_OP_IS_OPEN:
         # `lob.isopen()`. It owes a real answer, so like GET_LENGTH it cannot
@@ -2662,9 +2684,23 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
         # did not: OPEN stripped a ub2 prefix unconditionally while IS_OPEN
         # skipped by the declared length, so on a raw column locator one of them
         # keyed on garbage and `isopen()` denied an open it had just accepted.
+        field = _lobops_state_locator(rest, source_loc_len)
+        # OPEN carries its MODE as the trailing amount, and the reply owes that
+        # field back (encode_lobops_open_ack). CLOSE sends none.
+        mode = 0
+        if operation == TNS_LOB_OP_OPEN:
+            tail = rest[2:]
+            _s, tail = decode_ub4(tail)
+            _d, tail = decode_ub4(tail)
+            tail = tail[1:]
+            tail = tail[6:]
+            tail = tail[source_loc_len:]
+            if tail:
+                mode, _ = decode_ub4(tail)
         return LobOpsRequest(
             kind='open' if operation == TNS_LOB_OP_OPEN else 'close',
-            locator=_lobops_state_locator(rest, source_loc_len),
+            locator=field,
+            amount=mode,
         )
     if operation in _LOBOPS_ACK_OPS:
         return LobOpsRequest(kind='ack', locator=_lobops_locator_after_operation(rest))
@@ -2784,12 +2820,63 @@ def encode_lobops_is_open(locator: bytes, is_open: bool) -> bytes:
     A plain ack (no flag) is NOT a safe fallback -- the client reads the byte
     regardless, so it would take whatever follows and then desync.
 
-    The locator is echoed RAW, without the ub2 length :func:`encode_lobops_ack`
-    writes: the client reads it with ``read_raw_bytes(len(its own locator))``,
-    so a length prefix shifts every following byte and it takes two locator
-    bytes as the flag."""
-    rpa = bytes([TTI_RPA]) + locator
-    return rpa + bytes([1 if is_open else 0]) + _encode_oer(1, 0, 0, b'')
+    The locator field is echoed VERBATIM -- exactly the bytes the request
+    carried, with nothing added. See :func:`encode_lobops_echo`."""
+    return (
+        bytes([TTI_RPA])
+        + locator
+        + bytes([1 if is_open else 0])
+        + _encode_oer(1, 0, 0, b'')
+    )
+
+
+def encode_lobops_open_ack(locator_field: bytes, amount: int) -> bytes:
+    """The OPEN reply: the echoed locator field, then the amount, then the OER.
+
+    OPEN carries its MODE in the request's trailing amount, and the client reads
+    an amount BACK for any op that sent one::
+
+        elif self.send_amount:
+            buf.read_sb8(&self.amount)
+
+    so the reply owes that field. Leaving it out does not lose a value -- the
+    client reads the OER's opening bytes as the amount instead and then desyncs
+    (#903/#887).
+
+    Confirmed by reply sizes on a live 23ai, which differ by exactly the field
+    each op adds to the same echoed locator::
+
+        CLOSE    168   locator only
+        IS_OPEN  169   + ub1 flag
+        OPEN     170   + the amount
+    """
+    return (
+        bytes([TTI_RPA])
+        + locator_field
+        + encode_sb4(amount)
+        + _encode_oer(1, 0, 0, b'')
+    )
+
+
+def encode_lobops_echo(locator_field: bytes) -> bytes:
+    """A TTI_LOBOPS ack that echoes the locator field VERBATIM.
+
+    The difference from :func:`encode_lobops_ack` is that nothing is prepended.
+    A client reads the locator back with
+    ``read_raw_bytes(len(its own locator))`` -- no length prefix is consumed --
+    so the reply has to reproduce the field exactly as it arrived:
+
+    - python-oracledb writes the locator raw and declares ``len(locator)`` as
+      the source length, so the field IS the locator and the echo is raw;
+    - a client that sends the ub2-prefixed form declares ``len + 2``, so the
+      field carries its own prefix and echoing it verbatim reproduces that too.
+
+    Echoing verbatim therefore serves both without the server having to decide
+    which form it is looking at. Prepending a length unconditionally (what
+    :func:`encode_lobops_ack` does) shifts every following byte for the first
+    kind of client, which is what left ``lob.open()`` failing with
+    ``DPY-5002: read integer of … too large`` (#903/#887)."""
+    return bytes([TTI_RPA]) + locator_field + _encode_oer(1, 0, 0, b'')
 
 
 def encode_lobops_length(locator: bytes, length: int) -> bytes:
@@ -2811,8 +2898,9 @@ def encode_lobops_length(locator: bytes, length: int) -> bytes:
     locator -- the wrong token and the wrong locator -- and the client desynced
     on the first ``lob.size()`` of anything it had created itself.
     """
-    rpa = bytes([TTI_RPA]) + struct.pack('>H', len(locator)) + locator
-    return rpa + encode_sb4(length) + _encode_oer(1, 0, 0, b'')
+    # Verbatim echo, like every other LOBOPS reply: the client reads the
+    # locator with read_raw_bytes and consumes no length prefix (#903/#887).
+    return bytes([TTI_RPA]) + locator + encode_sb4(length) + _encode_oer(1, 0, 0, b'')
 
 
 def _encode_refcursor_out(bind: RefCursorOutBind) -> bytes:

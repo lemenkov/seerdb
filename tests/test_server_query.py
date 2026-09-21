@@ -2682,9 +2682,15 @@ def test_parse_lobops_request_classifies_create_temp() -> None:
 
 
 def test_parse_lobops_request_extracts_the_write_locator_and_payload() -> None:
-    # WRITE carries the ub2-prefixed locator and a 0x0E chunked payload; the Mirror
+    # WRITE carries the locator field and a 0x0E chunked payload; the Mirror
     # pulls both out to append to the temp LOB (#412). Cover both the single-chunk
     # (<= 0xFC) and the multi-chunk (0xFE-marked) payload forms.
+    #
+    # WRITE reads a real ub2 prefix here, unlike the OPEN / CLOSE / IS_OPEN /
+    # GET_LENGTH group, which skip by the declared source length. Making WRITE
+    # match them regressed 44 tests: its payload starts immediately after the
+    # locator, so a two-byte error in the locator's extent misreads the 0x0E
+    # payload marker and corrupts every write (#903/#887).
     from seerdb.common.tns import encode_dictionary_lobops, parse_lobops_request
     from seerdb.common.tns_consts import TNS_LOB_OP_WRITE
 
@@ -2700,7 +2706,9 @@ def test_parse_lobops_request_extracts_the_write_locator_and_payload() -> None:
         )
         req = parse_lobops_request(body)
         assert req.kind == 'write'
-        assert req.locator == locator
+        # The field carries the ub2 the encoder wrote; resolve() maps it back.
+        assert req.locator.endswith(locator)
+        assert len(req.locator) == len(locator) + 2
         assert req.payload == payload
 
 
@@ -2886,16 +2894,26 @@ def test_parse_lobops_request_classifies_the_state_opcodes() -> None:
     # OPEN / CLOSE are named apart from the plain acks: the server has to
     # remember the state so IS_OPEN can report it, and so a second open can be
     # refused (#903/#887).
+    # OPEN / CLOSE / IS_OPEN take the locator RAW: the client writes it with no
+    # length of its own and declares `len(locator)` as the source length, so the
+    # declared length is the locator's exactly. GET_CHUNK_SIZE still goes
+    # through the older ub2-prefixed walk.
     for op, kind in (
         (TNS_LOB_OP_OPEN, 'open'),
         (TNS_LOB_OP_CLOSE, 'close'),
         (TNS_LOB_OP_IS_OPEN, 'is_open'),
-        (TNS_LOB_OP_GET_CHUNK_SIZE, 'ack'),
     ):
-        req = parse_lobops_request(_lobops_op_request(op, locator))
+        req = parse_lobops_request(_lobops_op_request(op, locator, prefixed=False))
         assert req.kind == kind, op
         assert req.locator == locator, op
-    trim = parse_lobops_request(_lobops_op_request(TNS_LOB_OP_TRIM, locator))
+    chunk = parse_lobops_request(_lobops_op_request(TNS_LOB_OP_GET_CHUNK_SIZE, locator))
+    assert chunk.kind == 'ack'
+    assert chunk.locator == locator
+    # TRIM joins the declared-length group: its reply echoes the locator
+    # verbatim, so the parse must hand back the field as sent (#903/#887).
+    trim = parse_lobops_request(
+        _lobops_op_request(TNS_LOB_OP_TRIM, locator, prefixed=False)
+    )
     assert trim.kind == 'trim'
     assert trim.locator == locator
 
