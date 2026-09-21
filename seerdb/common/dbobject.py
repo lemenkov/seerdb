@@ -287,7 +287,7 @@ class DbObjectType:
     def attr_names(self) -> list:
         return [A['name'] for A in self.attrs]
 
-    def newobject(self, values=None) -> 'DbObject':
+    def newobject(self, values=None, keys: list[int] | None = None) -> 'DbObject':
         """A new DbObject of this type, ready to bind (#116/#117).
 
         For an object type every attribute starts NULL; seed from ``values`` (a
@@ -295,9 +295,15 @@ class DbObjectType:
         ``values`` is the element sequence (default empty). Set object
         attributes by name (``obj.STREET = '...'``) or collection elements by
         index / ``append`` before binding.
+
+        ``keys`` carries an associative array's element keys, for rebuilding one
+        that came off the wire; a locally built array leaves it None and is
+        keyed 1..N (#1053).
         """
         if self.is_collection:
-            return DbObject(self.full_name, elements=list(values or []), dbtype=self)
+            return DbObject(
+                self.full_name, elements=list(values or []), dbtype=self, keys=keys
+            )
         Obj = DbObject(
             self.full_name, [(A['name'], None) for A in self.attrs], dbtype=self
         )
@@ -333,6 +339,7 @@ class DbObject:
         attrs: list[tuple[str, object]] | None = None,
         elements: list | None = None,
         dbtype: 'DbObjectType | None' = None,
+        keys: list[int] | None = None,
     ):
         # _ prefixes keep the namespace clear of attribute names; __setattr__
         # routes any non-underscore name into _attrs. A collection object holds
@@ -345,6 +352,14 @@ class DbObject:
         object.__setattr__(self, '_is_collection', IsCollection)
         object.__setattr__(
             self, '_elements', list(elements or []) if IsCollection else None
+        )
+        # An associative array's element keys, parallel to _elements and in the
+        # same (sorted-key) order; None for a VARRAY / nested table, and for an
+        # index-by table built locally, whose keys are 1..N until the server
+        # sends real ones. Kept beside the list rather than replacing it so
+        # aslist() / len() / [i] / append() keep meaning what they mean (#1053).
+        object.__setattr__(
+            self, '_keys', list(keys) if (IsCollection and keys is not None) else None
         )
         object.__setattr__(self, '_attrs', {} if IsCollection else dict(attrs or []))
         object.__setattr__(
@@ -400,12 +415,25 @@ class DbObject:
         if not self._is_collection:
             raise TypeError('append is only valid on a collection object')
         self._elements.append(value)
+        self._key_appended()
 
     def extend(self, values) -> None:
         """Append several elements (collection types only)."""
         if not self._is_collection:
             raise TypeError('extend is only valid on a collection object')
+        Before = len(self._elements)
         self._elements.extend(values)
+        for _ in range(len(self._elements) - Before):
+            self._key_appended()
+
+    def _key_appended(self) -> None:
+        # Keep _keys parallel to _elements when a keyed collection grows. The new
+        # key follows the highest one, the way PL/SQL's own append does; without
+        # this the two lists drift apart and the encoder pairs a value with some
+        # other element's key.
+        if self._keys is None:
+            return
+        self._keys.append(max(self._keys) + 1 if self._keys else 1)
 
     def aslist(self) -> list:
         """The collection elements, or an object's attribute values in order."""
@@ -524,8 +552,11 @@ def _decode_member(
         (Length, Pos) = _read_length(Image, Pos)
         Sub = bytes(Image[Pos : Pos + (Length or 0)])
         Pos += Length or 0
-        Elements = decode_collection_image(Sub, Nested.element or {}, Charset)
-        return (DbObject(Nested.full_name, elements=Elements, dbtype=Nested), Pos)
+        (Elements, Keys) = decode_collection_keyed(Sub, Nested.element or {}, Charset)
+        return (
+            DbObject(Nested.full_name, elements=Elements, dbtype=Nested, keys=Keys),
+            Pos,
+        )
     if Nested is not None:
         if Image[Pos] == _OBJ_ATOMIC_NULL:
             return (None, Pos + 1)
@@ -627,10 +658,10 @@ def is_xml_type(typ: object) -> bool:
     )
 
 
-def decode_collection_image(
+def decode_collection_keyed(
     Image: bytes, Element: dict, Charset: int = AL32UTF8_CHARSET
-) -> list:
-    """Walk a collection (VARRAY / nested table) image into a list of elements.
+) -> tuple[list, list[int] | None]:
+    """Walk a collection image into ``(elements, keys)``.
 
     The header (incl. the prefix segment a collection carries) is consumed by
     the shared ``_read_image_header``; then a 1-byte collection-flags marker, a
@@ -638,20 +669,36 @@ def decode_collection_image(
     decoded with the single element type. A NULL element is ``None``.
 
     A PL/SQL associative array sets the HAS_INDEXES flag in that marker byte and
-    prefixes each element with its int32 key (big-endian); the flag makes the
-    image self-describing, so the key is read and dropped here. Elements ride in
-    sorted-key order, so the returned list keeps that order; the keys are not
-    retained (the arrays that round-trip through the Mirror are dense from 1, and
-    the re-encode regenerates 1-based keys) (#888).
+    prefixes each element with its key; ``keys`` is that list, and ``None`` for a
+    VARRAY / nested table, which has no keys at all. Elements ride in sorted-key
+    order, so the element list is in key order either way (#888/#1053).
+
+    The key is a **signed** big-endian int32: a PL/SQL index-by table may be
+    keyed by any BINARY_INTEGER, and the negative half is not hypothetical --
+    ``fff00000`` is -1048576 on a live 23ai. Reading it unsigned agrees for every
+    key a dense 1..N array has, which is why it went unnoticed.
     """
     Pos = _read_image_header(Image, 0)
     index_table = bool(Image[Pos] & _COLL_HAS_INDEXES)
     Pos += 1  # collection flags
     (Count, Pos) = _read_length(Image, Pos)
     Out: list = []
+    Keys: list[int] | None = [] if index_table else None
     for _ in range(Count or 0):
-        if index_table:
-            Pos += 4  # the int32 associative-array key (big-endian)
+        if Keys is not None:
+            Keys.append(int.from_bytes(Image[Pos : Pos + 4], 'big', signed=True))
+            Pos += 4
         (Value, Pos) = _decode_member(Image, Pos, Element, Charset, in_collection=True)
         Out.append(Value)
-    return Out
+    return (Out, Keys)
+
+
+def decode_collection_image(
+    Image: bytes, Element: dict, Charset: int = AL32UTF8_CHARSET
+) -> list:
+    """The elements of a collection image, without their keys.
+
+    For callers that only want values; an associative array's keys come from
+    :func:`decode_collection_keyed`, which this wraps.
+    """
+    return decode_collection_keyed(Image, Element, Charset)[0]

@@ -12505,12 +12505,19 @@ def _encode_object_image(Obj: 'DbObject', *, header: bool) -> bytes:
         # table clears the flag and carries bare elements (#888).
         Body = bytes([_COLL_HAS_INDEXES if index_table else 0])
         Body += _obj_write_length(len(Obj._elements))
+        # The keys the value arrived with, when it came off the wire. A locally
+        # built array has none, and then the key is the 1-based position -- but a
+        # DECODED one must go back out under its OWN keys: an index-by table may
+        # be keyed by any BINARY_INTEGER, and renumbering it 1..N hands the far
+        # side a faithfully framed image full of wrong numbers (#1053).
+        Keys = Obj._keys if index_table else None
         for Position, Value in enumerate(Obj._elements, start=1):
             if index_table:
-                # python-oracledb packs in sorted-key order, and the arrays that
-                # round-trip through here are dense from 1, so the key is the
-                # 1-based position.
-                Body += struct.pack('>I', Position)
+                Key = Keys[Position - 1] if Keys is not None else Position
+                # SIGNED: the negative half of BINARY_INTEGER is ordinary (a live
+                # 23ai sends -1048576 as ff f0 00 00). Packing '>I' agrees for
+                # every key a dense 1..N array has and raises on a real one.
+                Body += struct.pack('>i', Key)
             Body += _encode_object_member(Value, Element, in_collection=True)
         # Collection header = flags, version, long-form length, prefix seg (01 01).
         Total = 9 + len(Body)

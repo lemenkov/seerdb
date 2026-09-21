@@ -323,7 +323,7 @@ def _decode_aq_payload(Rest: bytes, queue):
     if queue.payload_type is not None:
         from seerdb.common.dbobject import (
             DbObject,
-            decode_collection_image,
+            decode_collection_keyed,
             decode_object_image,
         )
         from seerdb.common.tns import _read_object_column
@@ -335,10 +335,13 @@ def _decode_aq_payload(Rest: bytes, queue):
         Img = cast(Any, Img)  # the decoded object image (has .image)
         Typ = queue.payload_type
         if Typ.is_collection:
-            Elements = decode_collection_image(
+            (Elements, Keys) = decode_collection_keyed(
                 Img.image, Typ.element or {}, AL32UTF8_CHARSET
             )
-            return (DbObject(Typ.name, elements=Elements, dbtype=Typ), Rest)
+            return (
+                DbObject(Typ.name, elements=Elements, dbtype=Typ, keys=Keys),
+                Rest,
+            )
         Attrs = decode_object_image(Img.image, Typ.attrs, AL32UTF8_CHARSET)
         return (DbObject(Typ.name, Attrs, dbtype=Typ), Rest)
     (_toid, Rest) = _aq_str(Rest)

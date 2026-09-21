@@ -5140,8 +5140,8 @@ the same bind OAC (§21.5) — only the *type metadata* and the *image body* dif
   and skips it). Then a `ub1` collection-flags marker (`0` for VARRAY / nested
   table), a length-prefixed **element count**, and that many length-prefixed
   element values (decoded / encoded with the single element type, NULL element =
-  `0xFF`). PL/SQL associative arrays additionally prefix each element with an
-  int32 key — that is #122.
+  `0xFF`). A PL/SQL associative array sets **`HAS_INDEXES` (0x10)** in that
+  marker and prefixes each element with its key — see §21.6b.
 - **Value framing + OAC**: unchanged from §21.2 / §21.5; only the image body is
   collection-shaped. The 12c+ bind gate applies identically.
 
@@ -5153,8 +5153,53 @@ tier (verified 10g/11g read), bind is 12c+ (round-trip 21c/23ai, sync + async).
 **Both VARRAY (#117) and nested table (#118) go through this one path** — they
 share the image and bind framing exactly, differing only in `collection_type`
 (VARRAY 3 vs nested table 2), so nested-table support needed no new wire code
-(verified read 10g/11g/21c/23ai, bind round-trip 21c/23ai). PL/SQL
-associative-array element keys are #122.
+(verified read 10g/11g/21c/23ai, bind round-trip 21c/23ai).
+
+### 21.6b Associative-array element keys (#1053)
+
+A PL/SQL associative array (`INDEX BY BINARY_INTEGER`, `coll_type`
+`'PL/SQL INDEX TABLE'`, §21.6a) sets **`HAS_INDEXES` = `0x10`** in the
+collection-flags byte and prefixes every element with its key. The image is
+self-describing: the flag says the keys are there, so a decoder need not consult
+the type metadata to read the body.
+
+The key is a **4-byte big-endian two's-complement signed** integer, and the
+elements ride in **sorted-key order**. Captured from 23ai —
+`pkg_TestStringArrays.TestIndexBy`, which keys four strings at -1048576, -576,
+284 and 8388608:
+
+```
+88 01 51 01 03 | 10 | 04 | ff f0 00 00 | 0d 'First element' | ff ff fd c0 | 0e 'Second element' | …
+   header        flags count   key         value               key
+```
+
+| raw | signed | unsigned |
+|---|---|---|
+| `ff f0 00 00` | **-1048576** | 4293918720 |
+| `ff ff fd c0` | **-576** | 4294966720 |
+| `00 00 01 1c` | 284 | 284 |
+| `00 80 00 00` | 8388608 | 8388608 |
+
+**Signed is not a detail.** `BINARY_INTEGER` spans the negative half, and a
+server uses it: the two readings agree on every key a dense 1..N array has and
+diverge only on a real one, so a round-trip over dense arrays cannot tell them
+apart. seerdb read the key unsigned (and *dropped* it, renumbering 1..N on
+re-encode) until #1053; an external client then saw a correctly framed image
+carrying the wrong numbers.
+
+A collection decoded off the wire must therefore be re-encoded under **its own**
+keys. One built locally has none and is keyed 1..N, which is also what PL/SQL's
+own append does.
+
+Two header details differ between the server's image and seerdb's encoder, with
+no known consequence: the server writes the **short** image length (`88 01 51`)
+where the encoder always writes the long form (`88 01 FE` + ub4), and its prefix
+segment is `01 03` against the encoder's `01 01`.
+
+Note this is a different mechanism from `cursor.arrayvar()` (§26, #122), which
+binds an `INDEX BY PLS_INTEGER` parameter as a **bulk array** — `ub4 count` +
+values, with no keys at all. The two share the phrase "associative array" and
+nothing else.
 
 ### 21.6a PL/SQL package-level types live in their own dictionaries (#1030)
 
@@ -5179,8 +5224,9 @@ Three consequences worth stating:
 
 - **`coll_type` has a third value here**, `'PL/SQL INDEX TABLE'`, alongside
   `'VARYING ARRAY'` and `'TABLE'`. It is not cosmetic: an index table prefixes
-  each image element with its int32 key (§21.6), so reading the kind wrong
-  mis-decodes every element.
+  each image element with its signed int32 key (§21.6b), so reading the kind
+  wrong mis-encodes every element. (A *decoder* is safe either way — the image's
+  own `HAS_INDEXES` flag says whether the keys are present.)
 - **A name is one to three parts.** `OWNER.PACKAGE.TYPE` is unambiguous;
   `A.B` is not — it may be `SCHEMA.TYPE` or `PACKAGE.TYPE` in the current
   schema. Resolving the schema reading first keeps every name that worked

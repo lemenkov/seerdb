@@ -746,13 +746,13 @@ def _object_from_out_image(image, objtype):
         return None
     from seerdb.common.dbobject import (
         DbObject,
-        decode_collection_image,
+        decode_collection_keyed,
         decode_object_image,
     )
 
     if getattr(objtype, 'is_collection', False):
-        elements = decode_collection_image(image.image, objtype.element)
-        return DbObject(objtype.full_name, elements=elements, dbtype=objtype)
+        (elements, keys) = decode_collection_keyed(image.image, objtype.element)
+        return DbObject(objtype.full_name, elements=elements, dbtype=objtype, keys=keys)
     attrs = decode_object_image(image.image, objtype.attrs)
     return DbObject(objtype.full_name, attrs, dbtype=objtype)
 
@@ -772,6 +772,7 @@ def _update_object_in_place(Target, Image) -> None:
         # change, only its contents.
         if Target.is_collection:
             object.__getattribute__(Target, '_elements')[:] = []
+            object.__setattr__(Target, '_keys', None)
         else:
             Attrs = object.__getattribute__(Target, '_attrs')
             for Name in object.__getattribute__(Target, '_order'):
@@ -779,6 +780,11 @@ def _update_object_in_place(Target, Image) -> None:
         return
     if Target.is_collection:
         object.__getattribute__(Target, '_elements')[:] = list(Decoded)
+        # The keys travel with the values: an associative array OUT bind is the
+        # one place the caller's object learns keys it did not have, and leaving
+        # _keys behind would pair the new values with the old array's keys
+        # (#1053).
+        object.__setattr__(Target, '_keys', object.__getattribute__(Decoded, '_keys'))
         return
     Attrs = object.__getattribute__(Target, '_attrs')
     for Name in object.__getattribute__(Decoded, '_order'):
@@ -873,7 +879,7 @@ def _decode_returned_object(Typ: object, Image: object) -> object:
         DbObject,
         DbObjectType,
         ObjectImage,
-        decode_collection_image,
+        decode_collection_keyed,
         decode_object_image,
     )
 
@@ -886,8 +892,10 @@ def _decode_returned_object(Typ: object, Image: object) -> object:
     Charset = Image.charset or AL32UTF8_CHARSET
     Name = Typ.name or Image.type_name
     if Typ.is_collection:
-        Elements = decode_collection_image(Image.image, Typ.element or {}, Charset)
-        return DbObject(Name, elements=Elements, dbtype=Typ)
+        (Elements, Keys) = decode_collection_keyed(
+            Image.image, Typ.element or {}, Charset
+        )
+        return DbObject(Name, elements=Elements, dbtype=Typ, keys=Keys)
     Attrs = decode_object_image(Image.image, Typ.attrs or [], Charset)
     return DbObject(Name, Attrs, dbtype=Typ)
 
@@ -1241,7 +1249,7 @@ def _resolve_objects(Connection, Row: list) -> list:
     from seerdb.common.dbobject import (
         DbObject,
         ObjectImage,
-        decode_collection_image,
+        decode_collection_keyed,
         decode_object_image,
         decode_xmltype,
     )
@@ -1267,10 +1275,12 @@ def _resolve_objects(Connection, Row: list) -> list:
             Typ = Connection._describe_object_type(Val.type_schema, Val.type_name)
             Charset = Val.charset or AL32UTF8_CHARSET
             if Typ is not None and Typ.is_collection:
-                Elements = decode_collection_image(
+                (Elements, Keys) = decode_collection_keyed(
                     Val.image, Typ.element or {}, Charset
                 )
-                Out[I] = DbObject(Val.type_name, elements=Elements, dbtype=Typ)
+                Out[I] = DbObject(
+                    Val.type_name, elements=Elements, dbtype=Typ, keys=Keys
+                )
             else:
                 Layout = Typ.attrs if Typ is not None else []
                 Attrs = decode_object_image(Val.image, Layout, Charset)
