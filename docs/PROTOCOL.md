@@ -5126,6 +5126,39 @@ share the image and bind framing exactly, differing only in `collection_type`
 (verified read 10g/11g/21c/23ai, bind round-trip 21c/23ai). PL/SQL
 associative-array element keys are #122.
 
+### 21.6a PL/SQL package-level types live in their own dictionaries (#1030)
+
+A type declared **inside a package** — `PKG_TESTRECORDS.UDT_RECORD`,
+`PKG_TESTNUMBERARRAYS.UDT_NUMBERLIST` — is a first-class object type on the
+wire: same TNS type 109, same value framing (§21.2), same bind OAC (§21.5),
+identified by the same 16-byte OID. Only the **metadata** is somewhere else,
+and it is invisible to the `ALL_TYPES` / `ALL_TYPE_ATTRS` pair a schema-level
+type is read from:
+
+| what | schema-level | package-level |
+|---|---|---|
+| OID + typecode | `ALL_TYPES` | `ALL_PLSQL_TYPES` |
+| record attributes | `ALL_TYPE_ATTRS` | `ALL_PLSQL_TYPE_ATTRS` |
+| collection element | `ALL_COLL_TYPES` | `ALL_PLSQL_COLL_TYPES` |
+
+Keyed by `(owner, package_name, type_name)` rather than `(owner, type_name)` —
+two packages may each declare a `UDT_RECORD`, so the package is part of the
+identity and belongs in the type's full name.
+
+Three consequences worth stating:
+
+- **`coll_type` has a third value here**, `'PL/SQL INDEX TABLE'`, alongside
+  `'VARYING ARRAY'` and `'TABLE'`. It is not cosmetic: an index table prefixes
+  each image element with its int32 key (§21.6), so reading the kind wrong
+  mis-decodes every element.
+- **A name is one to three parts.** `OWNER.PACKAGE.TYPE` is unambiguous;
+  `A.B` is not — it may be `SCHEMA.TYPE` or `PACKAGE.TYPE` in the current
+  schema. Resolving the schema reading first keeps every name that worked
+  before pointing at the same type.
+- **The OID resolves back to a name through the same split.** A bind OAC
+  carries only the OID, so a server (or a Mirror) turning one back into a type
+  looks in `ALL_TYPES` first and `ALL_PLSQL_TYPES` second.
+
 ### 21.7 REF — object references (#119)
 
 A REF column has TNS data type **111**. Its value is **not** the object — it is

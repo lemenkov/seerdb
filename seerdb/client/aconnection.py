@@ -298,7 +298,11 @@ class AsyncOracleConnect(_ConnectionLogic):
         self._cursors_to_close: list[int] = []  # drained cursors to free (#191)
         # Ordered attribute layout per SQL object type (#115), keyed by
         # (owner, type_name); see OracleConnect._object_type_layout.
-        self._object_type_cache: dict[tuple[str, str], 'DbObjectType'] = {}
+        self._object_type_cache: dict[tuple[str, ...], 'DbObjectType'] = {}
+        # In-flight describes, so a PL/SQL type that references itself through
+        # an attribute or element does not recurse forever (#1030); the sync
+        # class guards its schema-level describe the same way.
+        self._object_type_describing: set[tuple[str, ...]] = set()
 
     # ----- bookkeeping shared with the sync class -----
     # These are copy-pasted from connection.py rather than imported via a
@@ -1408,18 +1412,28 @@ class AsyncOracleConnect(_ConnectionLogic):
     async def gettype(self, name: str) -> 'DbObjectType':
         """Async port of `OracleConnect.gettype` (#116): look up a SQL object
         type by (optionally schema-qualified) name and return a DbObjectType."""
-        if '.' in name:
-            Schema, _, TypeName = name.partition('.')
-            Schema = Schema.strip('"') if '"' in Schema else Schema.upper()
+        from seerdb.client.connection import (
+            _is_described,
+            _normalise_type_part,
+            _split_type_name,
+        )
+
+        Parts = [_normalise_type_part(P) for P in _split_type_name(name)]
+        if len(Parts) == 3:  # OWNER.PACKAGE.TYPE -- a PL/SQL package type
+            Typ = await self._describe_plsql_type(*Parts)
+        elif len(Parts) == 2:
+            # SCHEMA.TYPE or PACKAGE.TYPE; the schema reading goes first so
+            # every name that resolved before still resolves the same (#1030).
+            Typ = await self._describe_object_type(Parts[0], Parts[1])
+            if not _is_described(Typ):
+                Typ = await self._describe_plsql_type(None, Parts[0], Parts[1])
         else:
-            Schema, TypeName = None, name
-        TypeName = TypeName.strip('"') if '"' in TypeName else TypeName.upper()
-        Typ = await self._describe_object_type(Schema, TypeName)
-        if Typ is None or (not Typ.attrs and not Typ.is_collection):
+            Typ = await self._describe_object_type(None, Parts[0])
+        if not _is_described(Typ):
             from seerdb.common.exceptions import DatabaseError
 
             raise DatabaseError(f'object type {name!r} not found')
-        return Typ
+        return cast('DbObjectType', Typ)
 
     async def _describe_object_type(
         self, schema: str | None, name: str | None
@@ -1471,6 +1485,121 @@ class AsyncOracleConnect(_ConnectionLogic):
         Typ = DbObjectType(Owner, name, Oid, 1, Attrs, **CollKW)
         self._object_type_cache[Key] = Typ
         return Typ
+
+    async def _describe_plsql_type(
+        self, schema: str | None, package: str, name: str
+    ) -> 'DbObjectType | None':
+        """Async port of `OracleConnect._describe_plsql_type` (#1030): a PL/SQL
+        package-level type, read from the all_plsql_* dictionaries."""
+        from seerdb.common.dbobject import DbObjectType, type_name_to_tns
+
+        Owner = schema
+        if Owner is None:
+            Rows = self._rows(await self.execute('SELECT USER FROM dual'))
+            Owner = Rows[0][0] if Rows else None
+        if not Owner or not package or not name:
+            return None
+        Key = (Owner, package, name)
+        Cached = self._object_type_cache.get(Key)
+        if Cached is not None:
+            return Cached
+        if Key in self._object_type_describing:
+            return None  # cycle guard
+        self._object_type_describing.add(Key)
+        try:
+            Rows = self._rows(
+                await self.execute(
+                    'SELECT type_oid, typecode FROM all_plsql_types '
+                    'WHERE owner = :1 AND package_name = :2 AND type_name = :3',
+                    Bind=[Owner, package, name],
+                )
+            )
+            if not Rows:
+                return None
+            Oid = bytes(Rows[0][0]) if Rows[0][0] else b''
+            Attrs: list = []
+            Extra: dict = {}
+            if Rows[0][1] == 'COLLECTION':
+                Extra = await self._plsql_collection_describe(Owner, package, name)
+            else:
+                AttrRows = self._rows(
+                    await self.execute(
+                        'SELECT attr_name, attr_type_name, attr_type_owner, '
+                        'attr_type_package FROM all_plsql_type_attrs '
+                        'WHERE owner = :1 AND package_name = :2 AND type_name = :3 '
+                        'ORDER BY attr_no',
+                        Bind=[Owner, package, name],
+                    )
+                )
+                for AttrName, TypeName, TypeOwner, TypePackage in AttrRows:
+                    Attr: dict = {
+                        'name': AttrName,
+                        'type_name': TypeName,
+                        'data_type': type_name_to_tns(TypeName),
+                        'charset': None,
+                    }
+                    if TypePackage:
+                        Attr['object_type'] = await self._describe_plsql_type(
+                            TypeOwner, TypePackage, TypeName
+                        )
+                    elif TypeOwner:
+                        Attr['object_type'] = await self._describe_object_type(
+                            TypeOwner, TypeName
+                        )
+                    Attrs.append(Attr)
+            Typ = DbObjectType(
+                Owner, name, Oid, 1, Attrs, package_name=package, **Extra
+            )
+            self._object_type_cache[Key] = Typ
+            return Typ
+        finally:
+            self._object_type_describing.discard(Key)
+
+    async def _plsql_collection_describe(
+        self, owner: str, package: str, name: str
+    ) -> dict:
+        """Async port of `OracleConnect._plsql_collection_describe` (#1030)."""
+        from seerdb.common.dbobject import (
+            COLLECTION_NESTED_TABLE,
+            COLLECTION_PLSQL_INDEX_TABLE,
+            COLLECTION_VARRAY,
+            type_name_to_tns,
+        )
+
+        Rows = self._rows(
+            await self.execute(
+                'SELECT coll_type, elem_type_name, elem_type_owner, '
+                'elem_type_package, upper_bound FROM all_plsql_coll_types '
+                'WHERE owner = :1 AND package_name = :2 AND type_name = :3',
+                Bind=[owner, package, name],
+            )
+        )
+        if not Rows:
+            return {'is_collection': True}
+        (CollType, ElemName, ElemOwner, ElemPackage, Upper) = Rows[0][:5]
+        Element: dict = {
+            'name': 'element',
+            'type_name': ElemName,
+            'data_type': type_name_to_tns(ElemName),
+            'charset': None,
+        }
+        if ElemPackage:
+            Element['object_type'] = await self._describe_plsql_type(
+                ElemOwner, ElemPackage, ElemName
+            )
+        elif ElemOwner:
+            Element['object_type'] = await self._describe_object_type(
+                ElemOwner, ElemName
+            )
+        return {
+            'is_collection': True,
+            'collection_type': {
+                'PL/SQL INDEX TABLE': COLLECTION_PLSQL_INDEX_TABLE,
+                'VARYING ARRAY': COLLECTION_VARRAY,
+            }.get(CollType, COLLECTION_NESTED_TABLE),
+            'element': Element,
+            'max_elements': int(Upper) if Upper else 0,
+        }
 
     async def _collection_describe(self, owner, name, typecode) -> dict:
         """Async port of `OracleConnect._collection_describe` (#117/#118)."""

@@ -24,15 +24,11 @@ from dataclasses import replace
 import seerdb
 from seerdb.common.datatypes import TempLob, dbtype_for_oracle_type
 from seerdb.common.dbobject import (
-    COLLECTION_NESTED_TABLE,
-    COLLECTION_PLSQL_INDEX_TABLE,
-    COLLECTION_VARRAY,
     DbObject,
     DbObjectType,
     ObjectImage,
     decode_collection_image,
     decode_object_image,
-    type_name_to_tns,
 )
 from seerdb.common.sqltext import is_plsql
 from seerdb.common.tns import AL16UTF16_CHARSET, ColumnMeta
@@ -287,131 +283,18 @@ class OraclePassthroughBackend:
             owner, name = row
             return self._conn.gettype(f'{owner}.{name}')
         # A PL/SQL package-level type is not in all_types; it lives in
-        # all_plsql_types (which carries a type_oid for records and collections
-        # alike). seerdb's own gettype cannot build one, so construct the
-        # DbObjectType here from the data-dictionary (#888).
+        # all_plsql_types, which carries a type_oid for records and collections
+        # alike. The OID is all the bind OAC gives, so the name comes from there
+        # and the driver describes it (#888/#1030).
         probe.execute(
-            'SELECT owner, package_name, type_name, typecode '
+            'SELECT owner, package_name, type_name '
             'FROM all_plsql_types WHERE type_oid = :1',
             [oid],
         )
         prow = probe.fetchone()
         if prow is None:
             return None
-        owner, package, name, typecode = prow
-        return self._plsql_object_type(owner, package, name, oid, typecode)
-
-    def _plsql_object_type(
-        self, owner: str, package: str, name: str, oid: bytes, typecode: str
-    ) -> DbObjectType | None:
-        # Build a DbObjectType for a PL/SQL package-level type from the
-        # all_plsql_* dictionaries (#888). Records carry their attributes in
-        # all_plsql_type_attrs; a collection its element type in
-        # all_plsql_coll_types; a nested attribute / element that is itself a
-        # package type recurses.
-        assert self._conn is not None
-        if typecode == 'COLLECTION':
-            return self._plsql_collection_type(owner, package, name, oid)
-        attrs_cur = self._conn.cursor()
-        attrs_cur.execute(
-            'SELECT attr_name, attr_type_name, attr_type_owner, attr_type_package '
-            'FROM all_plsql_type_attrs '
-            'WHERE owner = :1 AND package_name = :2 AND type_name = :3 '
-            'ORDER BY attr_no',
-            [owner, package, name],
-        )
-        attrs: list[dict] = []
-        for attr_name, type_name, type_owner, type_package in attrs_cur.fetchall():
-            attr: dict = {
-                'name': attr_name,
-                'type_name': type_name,
-                'data_type': type_name_to_tns(type_name),
-                'charset': None,
-            }
-            if type_package:
-                # A nested package type (e.g. UDT_OUTER.INNER1 -> UDT_INNER).
-                nested_oid = self._plsql_type_oid(type_owner, type_package, type_name)
-                nested_code = self._plsql_typecode(type_owner, type_package, type_name)
-                attr['object_type'] = self._plsql_object_type(
-                    type_owner, type_package, type_name, nested_oid, nested_code
-                )
-            elif type_owner:
-                # A nested schema-level object type.
-                attr['object_type'] = self._conn.gettype(f'{type_owner}.{type_name}')
-            attrs.append(attr)
-        return DbObjectType(owner, name, oid, 1, attrs)
-
-    def _plsql_collection_type(
-        self, owner: str, package: str, name: str, oid: bytes
-    ) -> DbObjectType | None:
-        # Build a collection DbObjectType for a package-level collection from
-        # all_plsql_coll_types (#888): the element type and the collection kind
-        # (a PL/SQL index table prefixes each image element with its int32 key,
-        # which the object-image codec handles off collection_type).
-        assert self._conn is not None
-        cur = self._conn.cursor()
-        cur.execute(
-            'SELECT coll_type, elem_type_name, elem_type_owner, elem_type_package, '
-            'upper_bound FROM all_plsql_coll_types '
-            'WHERE owner = :1 AND package_name = :2 AND type_name = :3',
-            [owner, package, name],
-        )
-        row = cur.fetchone()
-        if row is None:
-            return None
-        coll_type, elem_name, elem_owner, elem_package, upper_bound = row
-        element: dict = {
-            'name': 'element',
-            'type_name': elem_name,
-            'data_type': type_name_to_tns(elem_name),
-            'charset': None,
-        }
-        if elem_package:
-            elem_oid = self._plsql_type_oid(elem_owner, elem_package, elem_name)
-            elem_code = self._plsql_typecode(elem_owner, elem_package, elem_name)
-            element['object_type'] = self._plsql_object_type(
-                elem_owner, elem_package, elem_name, elem_oid, elem_code
-            )
-        elif elem_owner:
-            element['object_type'] = self._conn.gettype(f'{elem_owner}.{elem_name}')
-        collection_type = {
-            'PL/SQL INDEX TABLE': COLLECTION_PLSQL_INDEX_TABLE,
-            'VARYING ARRAY': COLLECTION_VARRAY,
-        }.get(coll_type, COLLECTION_NESTED_TABLE)
-        return DbObjectType(
-            owner,
-            name,
-            oid,
-            1,
-            [],
-            is_collection=True,
-            collection_type=collection_type,
-            element=element,
-            max_elements=int(upper_bound) if upper_bound else 0,
-        )
-
-    def _plsql_type_oid(self, owner: str, package: str, name: str) -> bytes:
-        # The 16-byte type OID of a package-level type (empty if absent).
-        assert self._conn is not None
-        cur = self._conn.cursor()
-        cur.execute(
-            'SELECT type_oid FROM all_plsql_types '
-            'WHERE owner = :1 AND package_name = :2 AND type_name = :3',
-            [owner, package, name],
-        )
-        row = cur.fetchone()
-        return bytes(row[0]) if row and row[0] else b''
-
-    def _plsql_typecode(self, owner: str, package: str, name: str) -> str:
-        assert self._conn is not None
-        cur = self._conn.cursor()
-        cur.execute(
-            'SELECT typecode FROM all_plsql_types '
-            'WHERE owner = :1 AND package_name = :2 AND type_name = :3',
-            [owner, package, name],
-        )
-        row = cur.fetchone()
-        return row[0] if row else ''
+        return self._conn.gettype('.'.join(prow))
 
     def _object_from_image(self, image: ObjectImage) -> object:
         # Turn an inbound object (ADT) bind's image back into a DbObject the
