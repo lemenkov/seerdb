@@ -1956,6 +1956,19 @@ def _read_bind_value(
     # 0x01 would otherwise be mistaken for a DALC length). Everything else is the
     # ordinary DALC value decoded by its OAC type and charset form. `toid` is the
     # referenced type's OID from the OAC, used to rebuild a REF bind (#139).
+    if data_type == TNS_TYPE_REFCURSOR:
+        # A REF CURSOR bind: a ub4 COUNT then that many ub4 cursor ids -- not a
+        # DALC (#1048). Read as one, the count's magnitude byte came back as the
+        # value and the id was left in the stream, so a client binding an open
+        # cursor was answered about whichever cursor happened to share that
+        # number. The OUT form is a count of 1 holding the id 0, "open one for
+        # me"; an IN bind carries the real id. Zero ids yields 0, the same
+        # "nothing to reuse" answer.
+        (count, after) = decode_ub4(after)
+        cursor_id = 0
+        for _ in range(count):
+            (cursor_id, after) = decode_ub4(after)
+        return cursor_id, after
     if data_type == TNS_TYPE_REF:
         # A REF bind (#139): the value is just the opaque locator (a DALC). Pair
         # it with the OID the OAC carried so the backend re-binds a DbRef with

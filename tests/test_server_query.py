@@ -4197,7 +4197,7 @@ def test_run_returning_runs_once_per_iteration_when_no_input_row() -> None:
 
     from seerdb.common.tns import ExecRequest
     from seerdb.server.backend import Backend, BindVar, Result
-    from seerdb.server.session import _run_returning
+    from seerdb.server.session import _Cursors, _run_returning
 
     class _Backend:
         def __init__(self) -> None:
@@ -4221,7 +4221,9 @@ def test_run_returning_runs_once_per_iteration_when_no_input_row() -> None:
         return_binds=frozenset({0}),
         iterations=3,
     )
-    result = _run_returning(cast(Backend, backend), request.sql, request)
+    # The cursor registry is only consulted for a REF CURSOR bind (#1048), and
+    # this request has none -- an empty one says so.
+    result = _run_returning(cast(Backend, backend), request.sql, request, _Cursors())
     # Three synthesized rows reached the backend, each a lone clause-filled bind.
     assert len(backend.calls) == 1
     sent = backend.calls[0]

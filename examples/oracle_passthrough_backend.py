@@ -443,6 +443,25 @@ class OraclePassthroughBackend:
                 out.append(b)
         return out
 
+    def open_ref_cursor(self, sql: str, skip: int = 0) -> object:
+        # A cursor to hand a PL/SQL block as an open `sys_refcursor` IN
+        # parameter (#1048). It has to be left OPEN with its rows unread, which
+        # is exactly what a scrollable cursor is: the ordinary path drains a
+        # query to EOF and queues the cursor for close, so its id would name
+        # nothing the block could fetch from. The driver refuses to bind
+        # anything else (#1047), so this is not a preference.
+        assert self._conn is not None  # authenticate() ran before any execute
+        cursor = self._conn.cursor(scrollable=True)
+        # `skip` rows have already gone to the client under this cursor id, and
+        # the block resumes after them -- so the open consumes exactly that many
+        # and leaves the rest. Zero reads nothing, which is the common case.
+        cursor.prefetchrows = skip
+        try:
+            cursor.execute(sql)
+        except seerdb.DatabaseError as exc:
+            raise _relay_error(exc) from exc
+        return cursor
+
     def parse(self, sql: str) -> None:
         # `cursor.parse()` of anything that is not a query (#1019). The upstream
         # is a real Oracle, so the honest answer is to ask it — the driver's own
@@ -700,6 +719,14 @@ class OraclePassthroughBackend:
                 variables.append(var)
                 continue
             if bind.tns_type == TNS_TYPE_REFCURSOR:
+                if bind.value is not None and not isinstance(bind.value, int):
+                    # An IN bind the Mirror already resolved: it turned the
+                    # client's cursor id into an open upstream cursor,
+                    # positioned where the client left off, and put the cursor
+                    # object here (#1047/#1048). A bare int means it did not:
+                    # that is the decoded cursor id, and the OUT form's is 0.
+                    variables.append(bind.value)
+                    continue
                 # A REF CURSOR OUT param: the DB opens the cursor, so bind a
                 # cursor var and don't seed it.
                 var = cursor.var(seerdb.DB_TYPE_CURSOR)
