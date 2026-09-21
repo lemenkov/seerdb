@@ -308,7 +308,6 @@ from seerdb.common.tns_consts import (
     TTI_TOKEN,
     TTI_UDS,
     TTI_WRN,
-    UTF8_CHARSET,
     VERSION_11_2_0_2,
     CharsetDict,
     DictionaryType,
@@ -11897,7 +11896,7 @@ def encode_token_rxd(Token: object) -> bytes:
                 Out += encode_token_rxd(Element)
             return Out
         if Token.dbtype.tns_type == TNS_TYPE_REFCURSOR:
-            return bytes([1, 0])  # REF CURSOR slot placeholder
+            return _refcursor_bind_value(Token)
         if Token.dbtype.tns_type == TNS_TYPE_ADT:
             # Object / collection Var: a DbObject value binds as its write_dbobject
             # image; an unset / NULL Var sends the typed-NULL object frame (the
@@ -11994,7 +11993,7 @@ def encode_token_rxd(Token: object) -> bytes:
         # anything that wasn't ASCII (and outright failed on 0x80+ bytes).
         return encode_chr(bytes(Token))
     if isinstance(Token, RefCursorBind):
-        return bytes([1, 0])
+        return _refcursor_bind_value(Token)
     if isinstance(Token, date):
         # Legacy seerdb.common.date.date with has_timestamp / timestamptz flags;
         # keep it on its own path so callers who built one explicitly still
@@ -12075,6 +12074,45 @@ def _encode_lob_bind_oac(is_blob: bool) -> bytes:
     )
 
 
+# The OAC a REF CURSOR bind carries, IN or OUT alike -- the reference client
+# sends the same one for both, and only the value after it differs (#1047).
+# Buffer 4 and charset 0, not 1 and the DB charset: a cursor id is a number, not
+# text. The narrower form worked for an OUT bind, where the server fills the
+# slot itself and the declared size never has to hold anything; handing it an id
+# to READ, the server sized its buffer from this and then waited for bytes that
+# did not fit -- a HANG rather than an error.
+def _refcursor_bind_oac() -> bytes:
+    return encode_token_raw(TNS_TYPE_REFCURSOR, 4, 0, 0, 0)
+
+
+def _refcursor_bind_value(Token: object) -> bytes:
+    """A REF CURSOR bind's value: the server-side cursor id (#1047).
+
+    Zero is the OUT form -- "open a cursor for me and tell me its id" -- and is
+    what every REF CURSOR bind sent until now, because the id was hard-coded.
+    A non-zero id is an IN bind handing the server a cursor it already has:
+    `cursor.execute(plsql, rcursor=open_cursor)`, which a PL/SQL block declares
+    as a plain `sys_refcursor` IN parameter and fetches from.
+
+    The value is a **presence byte** then the id as a ub4. Captured from the
+    reference client, which sends the SAME OAC either way and differs only
+    here::
+
+        07 00              OUT: RXD, then an absent value
+        07 01 01 01 03     IN:  present, one of them, then ub4 3 -- the id
+
+    The OUT form keeps its historical `01 00` spelling, which the server has
+    accepted for years even though the reference client sends the barer `00`.
+    Only the IN form is new, and it needs BOTH leading bytes: with the id alone
+    the server sizes a value it never receives and waits -- a HANG, not an
+    error, which is what makes a byte-for-byte capture the only way to find it.
+    """
+    CursorId = getattr(Token, 'id', 0) or 0
+    if not CursorId:
+        return bytes([1, 0])
+    return bytes([1, 1]) + encode_sb4(CursorId)
+
+
 def encode_token_oac(Token: object) -> bytes:
     # The OAC field tells the server the maximum size we *might* send for
     # this bind. Oracle rejects with ORA-01461 ("can bind a LONG value only
@@ -12121,7 +12159,7 @@ def encode_token_oac(Token: object) -> bytes:
         if DT == TNS_TYPE_INTERVALYM:
             return encode_token_raw(TNS_TYPE_INTERVALYM, 5, 0, 0, 0, A)
         if DT == TNS_TYPE_REFCURSOR:
-            return encode_token_raw(TNS_TYPE_REFCURSOR, 1, 0, UTF8_CHARSET, 0)
+            return _refcursor_bind_oac()
         if DT == TNS_TYPE_ADT:
             # An object / collection Var (cursor.var(objtype)): the object bind
             # OAC carrying the type's 16-byte OID + version, sized for the server
@@ -12256,7 +12294,7 @@ def encode_token_oac(Token: object) -> bytes:
         # actual value (see the str case) to avoid the LONG-reorder swap.
         return encode_token_raw(TNS_TYPE_RAW, max(len(Token), 1), 16, 0, 0)
     if isinstance(Token, RefCursorBind):
-        return encode_token_raw(TNS_TYPE_REFCURSOR, 1, 0, UTF8_CHARSET, 0)
+        return _refcursor_bind_oac()
     if isinstance(Token, date):
         if Token.has_timestamp and Token.timestamptz:
             return encode_token_raw(TNS_TYPE_TIMESTAMPTZ, 13, 0, 0, 0)

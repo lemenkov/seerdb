@@ -6095,9 +6095,15 @@ class TestTnsBaseEncoders(unittest.TestCase):
         self.assertEqual(Oac[4:7], bytes([2, 0x13, 0x88]))
 
     def test_encode_token_oac_3(self):
+        # A REF CURSOR bind: buffer 4 and charset 0, IN or OUT alike. Captured
+        # from the reference client and diffed against ours until the two
+        # requests were byte-identical (#1047). It used to declare buffer 1 and
+        # the DB charset, which an OUT bind never noticed -- the server fills
+        # that slot itself -- but which made an IN bind hang, because the server
+        # sized its read from here and the cursor id did not fit.
         self.assertEqual(
             encode_token_oac(cursor()),
-            bytes([102, 3, 0, 0, 1, 1, 0, 0, 0, 0, 2, 3, 103, 1, 0]),
+            bytes([102, 3, 0, 0, 1, 4, 0, 0, 0, 0, 0, 1, 0]),
         )
 
     def test_encode_token_oac_4(self):

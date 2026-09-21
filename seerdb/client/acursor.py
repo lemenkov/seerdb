@@ -18,6 +18,7 @@ from seerdb.client.cursor import (
     _out_bind_lobs,
     _resolve_parameters,
     _return_bind_lobs,
+    cursor,
 )
 from seerdb.common.datatypes import TempLob, Var
 from seerdb.common.exceptions import (
@@ -81,6 +82,7 @@ class AsyncCursor(_CursorLogic):
         self._check_open()
         self._release_scroll_cursor()  # free any prior scrollable cursor (#181)
         Bind = _resolve_parameters(operation, parameters)
+        Bind = self._resolve_cursor_binds(Bind)
         Bind = await self._promote_large_lob_binds(operation, Bind)
         return await self._run(operation, Bind)
 
@@ -90,6 +92,29 @@ class AsyncCursor(_CursorLogic):
         self._release_scroll_cursor()
         Result = await self._connection.execute(operation, ParseOnly=True)
         await self._apply_result([], Result)
+
+    def _resolve_cursor_binds(self, Bind: list) -> list:
+        """Async port of `Cursor._resolve_cursor_binds` (#1047): an open
+        AsyncCursor bind becomes the REF CURSOR sentinel carrying its id."""
+        if not Bind:
+            return Bind
+        Out: list = []
+        for Value in Bind:
+            if not isinstance(Value, AsyncCursor):
+                Out.append(Value)
+                continue
+            CursorId = Value._scroll_cursor_id if Value._scroll_active else 0
+            if not CursorId:
+                raise NotSupportedError(
+                    'binding a cursor as a REF CURSOR parameter needs one that '
+                    'is still open on the server with its rows unread; open it '
+                    'with connection.cursor(scrollable=True) so the driver '
+                    'leaves it open rather than draining it'
+                )
+            Sentinel = cursor()
+            Sentinel.id = CursorId
+            Out.append(Sentinel)
+        return Out
 
     async def _promote_large_lob_binds(self, operation: str, Bind: list) -> list:
         """Async port of `Cursor._promote_large_lob_binds` (#91): stream a

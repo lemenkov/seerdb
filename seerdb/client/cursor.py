@@ -107,6 +107,7 @@ class Cursor(_CursorLogic):
         # Re-executing frees any cursor left open by a prior scrollable SELECT.
         self._release_scroll_cursor()
         Bind = _resolve_parameters(operation, parameters)
+        Bind = self._resolve_cursor_binds(Bind)
         Bind = self._promote_large_lob_binds(operation, Bind)
         return self._run(operation, Bind)
 
@@ -127,6 +128,40 @@ class Cursor(_CursorLogic):
         self._release_scroll_cursor()
         Result = self._connection.execute(operation, ParseOnly=True)
         self._apply_result([], Result)
+
+    def _resolve_cursor_binds(self, Bind: list) -> list:
+        """Turn an open ``Cursor`` bind into the REF CURSOR sentinel (#1047).
+
+        `cursor.execute(plsql, rcursor=other_cursor)` hands a PL/SQL block a
+        cursor the server already has, declared there as a plain
+        ``sys_refcursor`` IN parameter; the block fetches from it, and may close
+        it. python-oracledb takes the cursor object itself, so this does too.
+
+        What travels is the server-side cursor **id**, so the cursor has to
+        still be open on the server with its rows unread. A cursor whose rows
+        this driver already drained is closed as far as the block is concerned,
+        and the server says so — ``ORA-01007``, a reference to a variable not in
+        the SELECT — so it is refused here with a reason instead.
+        """
+        if not Bind:
+            return Bind
+        Out: list = []
+        for Value in Bind:
+            if not isinstance(Value, Cursor):
+                Out.append(Value)
+                continue
+            CursorId = Value._scroll_cursor_id if Value._scroll_active else 0
+            if not CursorId:
+                raise NotSupportedError(
+                    'binding a cursor as a REF CURSOR parameter needs one that '
+                    'is still open on the server with its rows unread; open it '
+                    'with connection.cursor(scrollable=True) so the driver '
+                    'leaves it open rather than draining it'
+                )
+            Sentinel = cursor()
+            Sentinel.id = CursorId
+            Out.append(Sentinel)
+        return Out
 
     def _promote_large_lob_binds(self, operation: str, Bind: list) -> list:
         # Large CLOB / BLOB into a PL/SQL locator param (#91): a str / bytes
