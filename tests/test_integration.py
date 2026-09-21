@@ -4319,7 +4319,6 @@ class PlsqlTypeIntegration(_IntegrationBase):
     def test_a_package_type_resolved_by_name_can_be_bound(self):
         # The point of resolving it: an index-by table bound through the type
         # `gettype` returned, with no Mirror and no hand-built DbObjectType.
-        self._skip_if_mirror('an OUT value for a bare object bind (#1032)')
         typ = self.conn.gettype(f'{self.PKG}.UDT_NUMLIST')
         obj = typ.newobject()
         self.cur.callproc(f'{self.PKG}.fill', (3, obj))
@@ -4346,10 +4345,6 @@ class ObjectOutBindIntegration(_IntegrationBase):
         super().setUp()
         if self.conn.field_version < FIELD_VERSION_12_1:
             self.skipTest('an object bind needs the 12.1+ OAC')
-        # The whole class, including the NULL case: the Mirror reports a bare
-        # DbObject's OUT value as None, so "nothing came back" and "the value is
-        # NULL" are indistinguishable there and even the passes are accidents.
-        self._skip_if_mirror('an OUT value for a bare object bind (#1032)')
         self._drop_objects()
         self.cur.execute(f'CREATE TYPE {self.TYPE} AS VARRAY(10) OF NUMBER')
         self.cur.execute(
@@ -4787,10 +4782,9 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(Coll.package_name, Pkg)
                 Rec = await Conn.gettype(f'{Coll.schema}.{Pkg}.UDT_REC')
                 self.assertEqual(Rec.attr_names, ['ID', 'NAME'])
-                if not os.environ.get('SEERDB_TEST_MIRROR'):
-                    Obj = Coll.newobject()
-                    await Cur.callproc(f'{Pkg}.fill', (3, Obj))
-                    self.assertEqual([int(v) for v in Obj.aslist()], [100, 200, 300])
+                Obj = Coll.newobject()
+                await Cur.callproc(f'{Pkg}.fill', (3, Obj))
+                self.assertEqual([int(v) for v in Obj.aslist()], [100, 200, 300])
             finally:
                 try:
                     await Cur.execute(f'DROP PACKAGE {Pkg}')
@@ -4808,8 +4802,6 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
         try:
             if Conn.field_version < FIELD_VERSION_12_1:
                 self.skipTest('an object bind needs the 12.1+ OAC')
-            if os.environ.get('SEERDB_TEST_MIRROR'):
-                self.skipTest('the Mirror does not serve this OUT value yet (#1032)')
             Cur = Conn.cursor()
             for Stmt in (f'DROP PACKAGE {Pkg}', f'DROP TYPE {Typ}'):
                 try:
