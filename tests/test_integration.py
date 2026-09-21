@@ -1190,6 +1190,66 @@ class CursorIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.getarraydmlrowcounts(), [3, 1, 2, 0])
 
+    def test_arraydmlrowcounts_survive_a_batch_that_aborts(self):
+        # A batch that fails part-way really applied the earlier rows, and a
+        # client that asked for the per-iteration counts is owed them in the
+        # ERROR reply too. Without them it reports the mode as never enabled --
+        # a worse answer than the failure it is also being told about (#1031).
+        self._require_12c()
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (id NUMBER PRIMARY KEY, v VARCHAR2(10))'
+        )
+        with self.assertRaises(seerdb.IntegrityError):
+            self.cur.executemany(
+                f'INSERT INTO {self.TABLE} VALUES (:1, :2)',
+                [(1, 'a'), (2, 'b'), (2, 'dup'), (4, 'd')],
+                arraydmlrowcounts=True,
+            )
+        self.assertEqual(self.cur.getarraydmlrowcounts(), [1, 1])
+
+    def test_batcherrors_and_arraydmlrowcounts_together(self):
+        # They are not alternatives: one execute may ask for both, and then the
+        # batcherrors reply owes the counts as well (#1031). A row that failed
+        # affected nothing and still holds its slot, or every count after it
+        # shifts.
+        self._require_12c()
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (id NUMBER PRIMARY KEY, v VARCHAR2(10))'
+        )
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1, :2)',
+            [(1, 'a'), (2, 'b'), (2, 'dup'), (4, 'd')],
+            batcherrors=True,
+            arraydmlrowcounts=True,
+        )
+        self.assertEqual(
+            [(e.offset, e.code) for e in self.cur.getbatcherrors()], [(2, 1)]
+        )
+        self.assertEqual(self.cur.getarraydmlrowcounts(), [1, 1, 0, 1])
+
+    def test_batch_errors_report_index_failures_last(self):
+        # Not row order: a real server evaluates the row (conversion, NOT NULL,
+        # CHECK) as it goes and maintains the unique index afterwards, so the
+        # unique violations come after every other failure, each group still
+        # ascending. Measured on a live 23ai with the orders deliberately
+        # reversed against each other (#1031).
+        self._require_12c()
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} '
+            '(id NUMBER PRIMARY KEY, v NUMBER(3), c NUMBER CHECK (c < 100))'
+        )
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (99, 1, 1)')
+        # The duplicate comes FIRST in row order and must be reported LAST.
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1, :2, :3)',
+            [(1, 1, 1), (99, 1, 1), (3, 1, 999), (4, 1000, 1), (5, 1, 1)],
+            batcherrors=True,
+        )
+        self.assertEqual(
+            [(e.offset, e.code) for e in self.cur.getbatcherrors()],
+            [(2, 2290), (3, 1438), (1, 1)],
+        )
+
     def test_executemany_arraydmlrowcounts_insert(self):
         # Each INSERT iteration affects exactly one row.
         self._require_12c()

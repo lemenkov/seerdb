@@ -571,7 +571,16 @@ class OraclePassthroughBackend:
         try:
             cursor.executemany(sql, [list(row) for row in rows], arraydmlrowcounts=True)
         except seerdb.DatabaseError as exc:
-            raise _relay_error(exc) from exc
+            # The batch aborted part-way, and the rows before the failing one
+            # applied. The upstream cursor still holds their per-iteration
+            # counts -- the client asked for them, so they belong in the error
+            # reply as much as in a successful one (#1031).
+            error = _relay_error(exc, max(cursor.rowcount or 0, 0))
+            try:
+                error.row_counts = list(cursor.getarraydmlrowcounts())
+            except seerdb.DatabaseError:
+                pass  # the upstream has none to give; the error still stands
+            raise error from exc
         return cursor.rowcount or 0, list(cursor.getarraydmlrowcounts())
 
     def execute_returning(self, sql: str, rows: Sequence[Sequence]) -> Result:

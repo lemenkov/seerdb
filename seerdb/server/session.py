@@ -95,6 +95,7 @@ from seerdb.common.tns import (
     encode_reexec_row_oci,
     encode_result,
     encode_returning_response,
+    encode_rowcounts_block,
     encode_scroll_open_response,
     encode_scroll_response,
     encode_session_state_response,
@@ -2499,6 +2500,11 @@ def _answer_query(
     lobs: list[tuple[bytes, bool]] = []
     # Per-row failures collected in array-DML batcherrors mode (#18).
     batch_errors: list[tuple[int, int, str]] = []
+    # The per-iteration affected-row counts, when the client asked for them
+    # (arraydmlrowcounts). They ride in front of whatever reply follows -- a
+    # success, the batcherrors summary, or the error that aborted the batch
+    # (#1031).
+    per_iteration: list[int] = []
     # Cursor cache (#80/#486): a re-execute carries the cached cursor id and an
     # empty query, so resolve the SQL the Mirror parked for that id and reuse the
     # id in the reply. A fresh statement runs its own SQL and is assigned a new id
@@ -2663,7 +2669,9 @@ def _answer_query(
                 affected = 0
                 for offset, row in enumerate(iter_rows):
                     try:
-                        affected += backend.execute(sql, row).rowcount
+                        applied = backend.execute(sql, row).rowcount
+                        affected += applied
+                        per_iteration.append(applied)
                     except BackendError as err:
                         if not request.batcherrors:
                             # The rows before this one applied, and the client
@@ -2672,7 +2680,12 @@ def _answer_query(
                             # is what makes every backend report it, not just
                             # one that happens to track the count itself (#998).
                             err.rowcount = affected
+                            err.row_counts = per_iteration
                             raise
+                        # A row that failed affected nothing, and its slot still
+                        # belongs in the counts -- they are per ITERATION, so
+                        # dropping it would shift every count after it (#1031).
+                        per_iteration.append(0)
                         batch_errors.append((offset, err.ora_code, err.ora_message))
                 result = Result(rowcount=affected)
         else:
@@ -2691,7 +2704,11 @@ def _answer_query(
         if batch_errors:
             # Array-DML batcherrors: ORA-24381 with the per-row failure arrays;
             # the client reads them from getbatcherrors() rather than raising.
-            response = encode_batch_errors_status(result.rowcount, batch_errors)
+            response = encode_batch_errors_status(
+                result.rowcount,
+                _order_batch_errors(batch_errors),
+                per_iteration if request.arraydmlrowcounts else None,
+            )
             stream.write_packet(TNS_DATA, response)
             return lobs
         # A PL/SQL block that called DBMS_SQL.RETURN_RESULT hands its result sets
@@ -2818,15 +2835,49 @@ def _answer_query(
     except BackendError as err:
         logger.info('query refused: %s', err.ora_message)
         # An executemany that aborted part-way applied the earlier rows; report
-        # how many, in the same field a success reports its count (#998).
+        # how many, in the same field a success reports its count (#998) -- and
+        # their per-iteration counts too when the client asked for those, or it
+        # reads the mode as never enabled and learns nothing about the rows that
+        # did apply (#1031).
         response = encode_error(
             err.ora_code, err.ora_message, err.error_offset, rowcount=err.rowcount
         )
+        if err.row_counts:
+            response = encode_rowcounts_block(err.row_counts) + response
     except Exception as exc:
         logger.warning('backend raised a non-ORA error: %s', exc)
         response = _backend_fault_error(exc)
     stream.write_packet(TNS_DATA, response)
     return lobs
+
+
+# The error codes a real server reports in a SECOND pass over an array DML,
+# after every other row error. Measured on a live 23ai with a batch failing on
+# several codes at once, each ordering deliberately reversed against the row
+# order:
+#
+#   dup@1 check@2 big@3 -> [(2, ORA-02290), (3, ORA-01438), (1, ORA-00001)]
+#   dup@2        big@4  -> [(4, ORA-01438), (2, ORA-00001)]
+#   dup@1        dup@3  -> [(1, ORA-00001), (3, ORA-00001)]
+#
+# So it is not an ordering on the codes: everything else comes in row order and
+# the unique-constraint violations come after it, each group ascending. That is
+# what index maintenance being a separate pass looks like from outside -- a
+# column conversion (ORA-01438), a NOT NULL (ORA-01400) and even a CHECK
+# constraint (ORA-02290) are evaluated with the row, while the unique index is
+# updated afterwards. Only ORA-00001 was measured; a foreign key is presumably
+# the same pass but is not claimed here.
+_INDEX_PHASE_ERRORS = frozenset({1})  # ORA-00001, unique constraint violated
+
+
+def _order_batch_errors(
+    errors: list[tuple[int, int, str]],
+) -> list[tuple[int, int, str]]:
+    # Put the index-phase failures after the rest, each keeping row order, the
+    # way a real server reports them (#1031). The Mirror applies the rows one at
+    # a time, so it collects every error in row order and has to re-group; the
+    # sort is stable, which is what keeps each group ascending.
+    return sorted(errors, key=lambda e: e[1] in _INDEX_PHASE_ERRORS)
 
 
 def _answer_parse(backend: Backend, sql: str, request: ExecRequest) -> bytes:
