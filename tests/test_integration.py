@@ -4385,6 +4385,7 @@ class PlsqlTypeIntegration(_IntegrationBase):
               TYPE udt_rec IS RECORD (id NUMBER, name VARCHAR2(40));
               PROCEDURE fill(n IN NUMBER, l IN OUT udt_numlist);
               FUNCTION total_from_zero(l IN udt_numlist) RETURN NUMBER;
+              PROCEDURE fill_sparse(l OUT udt_numlist);
             END;""")
         self.cur.execute(f"""CREATE PACKAGE BODY {self.PKG} AS
               PROCEDURE fill(n IN NUMBER, l IN OUT udt_numlist) IS
@@ -4396,6 +4397,13 @@ class PlsqlTypeIntegration(_IntegrationBase):
               BEGIN
                 FOR i IN 0..l.COUNT - 1 LOOP t := t + l(i); END LOOP;
                 RETURN t;
+              END;
+              PROCEDURE fill_sparse(l OUT udt_numlist) IS
+              BEGIN
+                l(-1048576) := 10;
+                l(-576)     := 20;
+                l(284)      := 30;
+                l(8388608)  := 40;
               END;
             END;""")
 
@@ -4464,6 +4472,40 @@ class PlsqlTypeIntegration(_IntegrationBase):
             obj.append(Value)
         Total = self.cur.callfunc(f'{self.PKG}.total_from_zero', int, [obj])
         self.assertEqual(int(Total), 60)
+
+    def test_sparse_keys_survive_and_are_walkable(self):
+        # The keys PL/SQL used, not positions: sparse and negative, read back
+        # through first/last/next/prev/exists/getelement/asdict (#1035).
+        typ = self.conn.gettype(f'{self.PKG}.UDT_NUMLIST')
+        obj = typ.newobject()
+        self.cur.callproc(f'{self.PKG}.fill_sparse', [obj])
+        self.assertEqual(obj.first(), -1048576)
+        self.assertEqual(obj.last(), 8388608)
+        self.assertEqual(obj.next(-576), 284)
+        self.assertEqual(obj.prev(284), -576)
+        self.assertEqual(obj.size(), 4)
+        self.assertTrue(obj.exists(-576))
+        self.assertFalse(obj.exists(-577))
+        self.assertEqual(int(obj.getelement(284)), 30)
+        self.assertIsNone(obj.next(8388608))
+        self.assertEqual(
+            {K: int(V) for (K, V) in obj.asdict().items()},
+            {-1048576: 10, -576: 20, 284: 30, 8388608: 40},
+        )
+
+    def test_a_deleted_key_leaves_a_hole_on_the_wire(self):
+        # delete() must reach the server as a hole, not as a renumbering: the
+        # survivors keep their own keys, so total_from_zero (which indexes
+        # 0..count-1) can no longer find them.
+        typ = self.conn.gettype(f'{self.PKG}.UDT_NUMLIST')
+        obj = typ.newobject()
+        self.cur.callproc(f'{self.PKG}.fill_sparse', [obj])
+        obj.delete(-576)
+        self.assertEqual([int(V) for V in obj.aslist()], [10, 30, 40])
+        self.assertEqual(obj.next(-1048576), 284)
+        Echo = typ.newobject()
+        self.cur.callproc(f'{self.PKG}.fill_sparse', [Echo])
+        self.assertEqual(Echo.size(), 4)
 
     def test_a_seeded_array_is_keyed_from_zero(self):
         # Same, seeded through newobject() rather than append().

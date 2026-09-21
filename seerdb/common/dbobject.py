@@ -24,9 +24,10 @@
 # "unsupported operand type(s) for |: 'property' and 'NoneType'".
 from __future__ import annotations
 
+import bisect
 import builtins
 
-from seerdb.common.exceptions import NotSupportedError
+from seerdb.common.exceptions import NotSupportedError, ProgrammingError
 from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
     TNS_LONG_LENGTH_INDICATOR,
@@ -458,10 +459,118 @@ class DbObject:
         return [self._attrs[Name] for Name in self._order]
 
     def asdict(self) -> dict:
-        """A name -> value mapping of the attributes (object types only)."""
+        """An index -> value mapping for a collection, name -> value otherwise.
+
+        For an associative array the keys are the PL/SQL ones, so this is the
+        view that survives a ``delete()`` -- ``aslist()`` renumbers nothing but
+        also says nothing about which key a value sits at (#1035).
+        """
         if self._is_collection:
-            raise TypeError('asdict is not valid on a collection object')
+            return {Key: Value for (Key, Value) in zip(self._indices(), self._elements)}
         return dict(self._attrs)
+
+    # --- collection index access (#1035) ------------------------------------
+    #
+    # An "index" here is what PL/SQL calls it: an associative array's own key,
+    # which may be sparse and negative, and for a VARRAY / nested table the
+    # 0-based position. The two live in one API because that is how
+    # python-oracledb surfaces them, and code that walks a collection with
+    # first()/next() then works on either kind.
+
+    def _ensure_collection(self, What: str) -> None:
+        if not self._is_collection:
+            raise TypeError(f'{What} is only valid on a collection object')
+
+    def _indices(self) -> list[int]:
+        # The valid indices in order: an associative array's keys, or 0..N-1.
+        if self._keys is not None:
+            return self._keys
+        return list(range(len(self._elements)))
+
+    def _position_of(self, Index: int) -> int | None:
+        # Where `Index` sits in _elements, or None if there is no such element.
+        if self._keys is None:
+            return Index if 0 <= Index < len(self._elements) else None
+        try:
+            return self._keys.index(Index)
+        except ValueError:
+            return None
+
+    def first(self) -> int | None:
+        """The lowest index in the collection, or None if it is empty."""
+        self._ensure_collection('first')
+        Indices = self._indices()
+        return Indices[0] if Indices else None
+
+    def last(self) -> int | None:
+        """The highest index in the collection, or None if it is empty."""
+        self._ensure_collection('last')
+        Indices = self._indices()
+        return Indices[-1] if Indices else None
+
+    def next(self, index: int) -> int | None:
+        """The index following ``index``, or None if there is none."""
+        self._ensure_collection('next')
+        return next((I for I in self._indices() if I > index), None)
+
+    def prev(self, index: int) -> int | None:
+        """The index preceding ``index``, or None if there is none."""
+        self._ensure_collection('prev')
+        return next((I for I in reversed(self._indices()) if I < index), None)
+
+    def exists(self, index: int) -> bool:
+        """Whether an element exists at ``index``."""
+        self._ensure_collection('exists')
+        return self._position_of(index) is not None
+
+    def getelement(self, index: int):
+        """The element at ``index``; raises if there is none."""
+        self._ensure_collection('getelement')
+        Position = self._position_of(index)
+        if Position is None:
+            raise ProgrammingError(f'DPY-2038: element at index {index} does not exist')
+        return self._elements[Position]
+
+    def setelement(self, index: int, value) -> None:
+        """Set the element at ``index``.
+
+        On an associative array an unused key CREATES an element, keeping the
+        keys sorted -- that is what `a(k) := v` does in PL/SQL. A VARRAY /
+        nested table has no such thing, so an out-of-range index is an error.
+        """
+        self._ensure_collection('setelement')
+        Position = self._position_of(index)
+        if Position is not None:
+            self._elements[Position] = value
+            return
+        if self._keys is None:
+            Max = max(len(self._elements) - 1, 0)
+            raise ProgrammingError(
+                f'DPY-2039: given index {index} must be in the range of 0 to {Max}'
+            )
+        At = bisect.bisect_left(self._keys, index)
+        self._keys.insert(At, index)
+        self._elements.insert(At, value)
+
+    def delete(self, index: int) -> None:
+        """Remove the element at ``index``.
+
+        On an associative array this leaves a HOLE: the surviving elements keep
+        their own keys rather than shifting down. On a VARRAY / nested table,
+        whose index *is* the position, the later elements do shift.
+        """
+        self._ensure_collection('delete')
+        Position = self._position_of(index)
+        if Position is None:
+            raise ProgrammingError(f'DPY-2038: element at index {index} does not exist')
+        del self._elements[Position]
+        if self._keys is not None:
+            del self._keys[Position]
+
+    def size(self) -> int:
+        """The number of elements in the collection."""
+        self._ensure_collection('size')
+        return len(self._elements)
 
     def __eq__(self, other):
         if not isinstance(other, DbObject):
