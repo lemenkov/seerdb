@@ -359,7 +359,7 @@ class AsyncCursor(_CursorLogic):
         from seerdb.common.dbobject import (
             DbObject,
             ObjectImage,
-            decode_collection_image,
+            decode_collection_keyed,
             decode_object_image,
             decode_xmltype,
         )
@@ -408,11 +408,14 @@ class AsyncCursor(_CursorLogic):
                     )
                     Charset = Val.charset or AL32UTF8_CHARSET
                     if Typ is not None and Typ.is_collection:
-                        Elements = decode_collection_image(
+                        (Elements, Keys) = decode_collection_keyed(
                             Val.image, Typ.element or {}, Charset
                         )
                         NewRow[I] = DbObject(
-                            Val.type_name, elements=Elements, dbtype=Typ
+                            Val.type_name,
+                            elements=Elements,
+                            dbtype=Typ,
+                            keys=Keys,
                         )
                     else:
                         Layout = Typ.attrs if Typ is not None else []

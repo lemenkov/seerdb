@@ -22,6 +22,7 @@ from seerdb.common.dbobject import (
     DbRef,
     ObjectImage,
     decode_collection_image,
+    decode_collection_keyed,
     decode_object_image,
     decode_xmltype,
     type_name_to_tns,
@@ -959,10 +960,10 @@ class TestPlsqlIndexTableImage(unittest.TestCase):
         # (01 01); the body then opens with the HAS_INDEXES flag byte.
         self.assertEqual(image[7:9], bytes([1, 1]))  # prefix segment
         self.assertEqual(image[9], 0x10)  # HAS_INDEXES collection flag
-        # Each element carries its 1-based int32 key.
-        self.assertIn(struct.pack('>I', 1), image)
-        self.assertIn(struct.pack('>I', 2), image)
-        self.assertIn(struct.pack('>I', 3), image)
+        # A locally built array has no keys of its own, so it is keyed 1..N.
+        self.assertIn(struct.pack('>i', 1), image)
+        self.assertIn(struct.pack('>i', 2), image)
+        self.assertIn(struct.pack('>i', 3), image)
 
     def test_index_table_roundtrips(self):
         obj = _INDEX_TABLE_TYPE.newobject([10, 20, 30])
@@ -970,6 +971,120 @@ class TestPlsqlIndexTableImage(unittest.TestCase):
         self.assertEqual(
             decode_collection_image(image, _INDEX_TABLE_TYPE.element), [10, 20, 30]
         )
+
+    def test_index_table_keeps_its_own_keys(self):
+        # A decoded array re-encodes under the keys it arrived with, not 1..N.
+        obj = _INDEX_TABLE_TYPE.newobject([10, 20, 30], keys=[-576, 284, 8388608])
+        image = encode_object_image(obj)
+        for key in (-576, 284, 8388608):
+            self.assertIn(struct.pack('>i', key), image)
+        self.assertNotIn(struct.pack('>i', 1), image)
+        (values, keys) = decode_collection_keyed(image, _INDEX_TABLE_TYPE.element)
+        self.assertEqual(values, [10, 20, 30])
+        self.assertEqual(keys, [-576, 284, 8388608])
+
+    def test_negative_key_encodes_signed(self):
+        # struct.pack('>I', -576) RAISES rather than mis-encoding, so the old
+        # unsigned pack could not represent a real index-by key at all. Signed
+        # and unsigned agree on every key a dense 1..N array has, which is why
+        # this went unnoticed for so long (#1053).
+        obj = _INDEX_TABLE_TYPE.newobject([10], keys=[-1048576])
+        image = encode_object_image(obj)
+        self.assertIn(bytes.fromhex('fff00000'), image)
+        self.assertEqual(
+            decode_collection_keyed(image, _INDEX_TABLE_TYPE.element)[1], [-1048576]
+        )
+
+    def test_varray_has_no_keys(self):
+        # keys is None for a SQL collection -- it has none, which is not the
+        # same as having an empty list of them.
+        varray_image = encode_object_image(
+            DbObjectType(
+                'PYO',
+                'INTS_T',
+                bytes.fromhex('ee' * 16),
+                1,
+                [],
+                is_collection=True,
+                collection_type=COLLECTION_VARRAY,
+                element=_INDEX_TABLE_TYPE.element,
+            ).newobject([10, 20, 30])
+        )
+        self.assertIsNone(
+            decode_collection_keyed(varray_image, _INDEX_TABLE_TYPE.element)[1]
+        )
+
+    def test_append_keeps_keys_parallel(self):
+        # Growing a keyed array must extend _keys too, or the encoder pairs each
+        # value with some other element's key.
+        obj = _INDEX_TABLE_TYPE.newobject([10, 20], keys=[-576, 284])
+        obj.append(30)
+        obj.extend([40, 50])
+        (values, keys) = decode_collection_keyed(
+            encode_object_image(obj), _INDEX_TABLE_TYPE.element
+        )
+        self.assertEqual(values, [10, 20, 30, 40, 50])
+        self.assertEqual(keys, [-576, 284, 285, 286, 287])
+
+
+class TestPlsqlIndexTableCapture(unittest.TestCase):
+    # The real thing: the image a live 23ai sends for
+    # `pkg_TestStringArrays.TestIndexBy`, which keys four strings at -1048576,
+    # -576, 284 and 8388608 (#1053). Captured rather than hand-built -- the
+    # signedness of the key is exactly the field a hand-written fixture would
+    # have encoded my assumption about.
+    _IMAGE = bytes.fromhex(
+        '88 01 51 01 03 10 04'
+        + 'fff00000'
+        + '0d'
+        + b'First element'.hex()
+        + 'fffffdc0'
+        + '0e'
+        + b'Second element'.hex()
+        + '0000011c'
+        + '0d'
+        + b'Third element'.hex()
+        + '00800000'
+        + '0e'
+        + b'Fourth element'.hex()
+    )
+
+    _ELEMENT = {
+        'name': 'element',
+        'data_type': TNS_TYPE_VARCHAR,
+        'charset': None,
+    }
+
+    def test_capture_decodes_to_its_real_keys(self):
+        (values, keys) = decode_collection_keyed(self._IMAGE, self._ELEMENT)
+        self.assertEqual(
+            values,
+            ['First element', 'Second element', 'Third element', 'Fourth element'],
+        )
+        self.assertEqual(keys, [-1048576, -576, 284, 8388608])
+
+    def test_capture_re_encodes_byte_identical(self):
+        # Decode then re-encode must reproduce the server's own bytes: this is
+        # the Mirror's passthrough path, where losing a key hands an external
+        # client a well-formed image full of wrong numbers.
+        typ = DbObjectType(
+            'PYO',
+            'UDT_STRINGLIST',
+            bytes.fromhex('cc' * 16),
+            1,
+            [],
+            is_collection=True,
+            collection_type=COLLECTION_PLSQL_INDEX_TABLE,
+            element=self._ELEMENT,
+        )
+        (values, keys) = decode_collection_keyed(self._IMAGE, self._ELEMENT)
+        again = encode_object_image(typ.newobject(values, keys=keys))
+        # Bodies only. The two headers legitimately differ in form: the server
+        # wrote the SHORT length (`88 01 51`, 5 bytes to the body) where the
+        # encoder always writes the long one (`88 01 FE` + ub4 + prefix, 9), and
+        # its prefix segment is `01 03` against our `01 01`. Neither has ever
+        # been shown to matter; what must match to the byte is the keyed body.
+        self.assertEqual(again[9:], self._IMAGE[5:])
 
     def test_varray_has_no_index_flag(self):
         # The SQL collection path is unchanged: flag byte 0, no per-element keys.

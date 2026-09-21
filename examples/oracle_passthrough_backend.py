@@ -27,7 +27,7 @@ from seerdb.common.dbobject import (
     DbObject,
     DbObjectType,
     ObjectImage,
-    decode_collection_image,
+    decode_collection_keyed,
     decode_object_image,
 )
 from seerdb.common.sqltext import is_plsql
@@ -307,8 +307,8 @@ class OraclePassthroughBackend:
             return None
         lob_contents = getattr(image, 'lob_contents', None) or {}
         if getattr(typ, 'is_collection', False):
-            elements = decode_collection_image(image.image, typ.element)
-            obj = typ.newobject(list(elements))
+            (elements, keys) = decode_collection_keyed(image.image, typ.element)
+            obj = typ.newobject(list(elements), keys=keys)
         else:
             attrs = decode_object_image(image.image, typ.attrs)
             obj = typ.newobject(dict(attrs))
