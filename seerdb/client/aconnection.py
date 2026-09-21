@@ -1288,7 +1288,9 @@ class AsyncOracleConnect(_ConnectionLogic):
                         break
             finally:
                 set_decode_prev_row(None)
-        if OraCode == 1403:
+        # Only a statement that FETCHES can be at the end of a fetch: in a
+        # PL/SQL block ORA-01403 is a real error (#1039). See the sync twin.
+        if OraCode == 1403 and RowFormat:
             OraCode = 0
         return (CallStatus, OraCode, CursorId, RetFormat, AllRows) + tuple(Tail)
 

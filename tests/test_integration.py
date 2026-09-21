@@ -959,6 +959,44 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), (7,))
 
+    def test_select_into_with_no_rows_raises(self):
+        # ORA-01403 is the end-of-fetch sentinel a query's last FETCH ends on,
+        # AND the error a PL/SQL `SELECT ... INTO` raises when it matches
+        # nothing. Masking it for both turned every such block into a silent
+        # success handing back NULL (#1039).
+        self._skip_if_mirror_backend('postgres', 'run a PL/SQL block')
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
+        got = self.cur.var(int)
+        with self.assertRaises(seerdb.DatabaseError) as ctx:
+            self.cur.execute(
+                f'BEGIN SELECT id INTO :1 FROM {self.TABLE} WHERE 1 = 0; END;',
+                [got],
+            )
+        self.assertEqual(ctx.exception.code, 1403)
+        # The session is still usable: this is an ordinary error, not a desync.
+        self.cur.execute('SELECT 1 FROM dual')
+        self.assertEqual(self.cur.fetchone(), (1,))
+
+    def test_a_query_that_matches_nothing_still_raises_nothing(self):
+        # The other half, and the reason the mask exists: a SELECT that matches
+        # no row ends on the same ORA-01403 and must stay silent. A fix that
+        # only looked at the code would break every empty result set.
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
+        self.cur.execute(f'SELECT id FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchall(), [])
+        self.cur.execute(f'SELECT id FROM {self.TABLE} WHERE 1 = 0')
+        self.assertIsNone(self.cur.fetchone())
+
+    def test_select_into_that_finds_a_row_is_unaffected(self):
+        # The block still works when it does find its row -- the guard must not
+        # turn a success into an error either.
+        self._skip_if_mirror_backend('postgres', 'run a PL/SQL block')
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (7)')
+        got = self.cur.var(int)
+        self.cur.execute(f'BEGIN SELECT id INTO :1 FROM {self.TABLE}; END;', [got])
+        self.assertEqual(int(got.getvalue()), 7)
+
     def test_failing_returning_raises_cleanly_and_keeps_the_session(self):
         # A statement with a RETURNING clause that fails does not answer with the
         # error straight away: the server sends a bare flush-out-binds token and
@@ -4812,6 +4850,35 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
         await Conn.close()
         if Fv < FIELD_VERSION_10_2:
             self.skipTest(Reason)
+
+    async def test_select_into_with_no_rows_raises(self):
+        # Async twin of the ORA-01403 tests (#1039).
+        Table = 'PYO_ASYNC_NODATA'
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest("the Mirror's postgres backend cannot run a PL/SQL block")
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            try:
+                await Cur.execute(f'DROP TABLE {Table}')
+            except seerdb.DatabaseError:
+                pass
+            await Cur.execute(f'CREATE TABLE {Table} (id NUMBER)')
+            try:
+                Got = Cur.var(int)
+                with self.assertRaises(seerdb.DatabaseError) as ctx:
+                    await Cur.execute(
+                        f'BEGIN SELECT id INTO :1 FROM {Table} WHERE 1 = 0; END;',
+                        [Got],
+                    )
+                self.assertEqual(ctx.exception.code, 1403)
+                # A query matching nothing still raises nothing.
+                await Cur.execute(f'SELECT id FROM {Table}')
+                self.assertEqual(await Cur.fetchall(), [])
+            finally:
+                await Cur.execute(f'DROP TABLE {Table}')
+        finally:
+            await Conn.close()
 
     async def test_gettype_resolves_a_package_level_type(self):
         # Async twin of PlsqlTypeIntegration (#1030).

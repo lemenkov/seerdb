@@ -271,10 +271,32 @@ class Cursor(_CursorLogic):
             list(Result[8]) if len(Result) > 8 and Result[8] else []
         )
 
+        # The column metadata of a result set, if this reply carries one. Read
+        # before the error gate below, which needs it to tell an end-of-fetch
+        # ORA-01403 from a real one.
+        ServerRowCount = None
+        ColMeta = None
+        if isinstance(RetFormat, tuple) and len(RetFormat) >= 2:
+            ServerRowCount = RetFormat[0]
+            if isinstance(RetFormat[1], list):
+                ColMeta = RetFormat[1]
+
         # ORA-24381 ("error(s) in array DML") is the summary code the server
         # returns when batcherrors collected per-row failures — not a fatal
         # error. Surface them through getbatcherrors() instead of raising.
-        NonFatal = (0, 1403, 24381) if BatchErrors else (0, 1403)
+        #
+        # ORA-01403 is the end-of-fetch sentinel ONLY for a statement that
+        # fetches. A `SELECT ... INTO` inside a PL/SQL block that matches no row
+        # raises it as a real error, and masking it there turned every such
+        # block into a silent success handing back NULL -- the caller's OUT
+        # variable simply stayed None (#1039). A query's execute reply carries
+        # the column metadata, so its presence is what tells the two apart:
+        # nothing can be at the end of a fetch that never had rows to fetch.
+        NonFatal: tuple[int, ...] = (0,)
+        if ColMeta:
+            NonFatal += (1403,)
+        if BatchErrors:
+            NonFatal += (24381,)
         if OraCode not in NonFatal:
             # An executemany whose batch aborts part-way really DID apply the
             # rows before the failing one, and the server reports how many in
@@ -308,13 +330,6 @@ class Cursor(_CursorLogic):
         # Implicit result sets (#121): queue any DBMS_SQL.RETURN_RESULT cursors
         # for nextset() to fetch on demand.
         self._implicit_results = _extract_implicit_results(Result)
-
-        ServerRowCount = None
-        ColMeta = None
-        if isinstance(RetFormat, tuple) and len(RetFormat) >= 2:
-            ServerRowCount = RetFormat[0]
-            if isinstance(RetFormat[1], list):
-                ColMeta = RetFormat[1]
 
         if ColMeta:
             # A result set (SELECT): no "last modified row", so lastrowid is
