@@ -245,6 +245,15 @@ class Backend(Protocol):
         Without it the Mirror runs the query with every bind NULL and drops the
         rows, which is side-effect free but does reach the database.
 
+    ``open_ref_cursor(sql) -> object``
+        Open a cursor on ``sql`` and return something :meth:`execute` will
+        accept as a bind value — for a PL/SQL block that takes an open
+        ``sys_refcursor`` IN parameter and fetches from it (#1048). The cursor
+        must be left OPEN and UNREAD: the Mirror advances it itself, by serving
+        the rows the client has already had, so that the block resumes exactly
+        where the client stopped. Without it such a bind is refused with an ORA
+        error rather than handing the block a cursor positioned wrongly.
+
     ``parse(sql) -> None``
         Validate a statement without running it — the other half of
         ``cursor.parse()``, for everything that is not a query and so owes no

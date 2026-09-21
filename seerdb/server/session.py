@@ -1842,6 +1842,12 @@ class _Cursors:
         # without remembering them the Mirror reverted to locators and desynced a
         # client that was still reading the column as a string / bytes.
         self._defines: dict[int, list[tuple[int, int]]] = {}
+        # How many rows have been handed out under each cursor id (#1048). A
+        # client may bind an open cursor into a PL/SQL block, which then fetches
+        # from where the client left off -- so serving that needs an upstream
+        # cursor advanced by exactly this many rows, or the block reads rows the
+        # client already has.
+        self._delivered: dict[int, int] = {}
 
     def set_defines(self, cursor_id: int, define_types: Sequence) -> None:
         """Remember the defines applied to a cursor, if this execute carried
@@ -1927,14 +1933,19 @@ class _Cursors:
         *,
         sql: str | None = None,
         bind_types: Sequence = (),
+        delivered: int = 0,
     ) -> int:
         # `sql` is the statement this cursor ran, recorded so a re-execute by id
         # knows what to run (#840), with the bind format its values came in (#854).
         # A REF CURSOR has no statement of its own and passes None.
+        # `delivered` is how many rows already went out with the execute itself
+        # -- they never pass through `take`, and a cursor bound into a PL/SQL
+        # block has to resume after them (#1048).
         cursor_id = self._next
         self._next += 1
         self._open[cursor_id] = (columns, rows)
         self._describe[cursor_id] = columns
+        self._delivered[cursor_id] = delivered
         if sql is not None:
             self._query[cursor_id] = (sql, list(bind_types))
         return cursor_id
@@ -1959,10 +1970,17 @@ class _Cursors:
         else:
             self._open.pop(cursor_id, None)
 
-    def open_scroll(self, columns: list[ColumnMeta], rows: list[tuple]) -> int:
+    def open_scroll(
+        self, columns: list[ColumnMeta], rows: list[tuple], *, sql: str | None = None
+    ) -> int:
         cursor_id = self._next
         self._next += 1
         self._scroll[cursor_id] = (columns, list(rows))
+        if sql is not None:
+            # A scrollable cursor is one a client deliberately keeps OPEN, so it
+            # is the likeliest kind to be bound into a PL/SQL block later --
+            # recording its statement is what lets that bind be served (#1048).
+            self._query[cursor_id] = (sql, [])
         return cursor_id
 
     def scroll_state(
@@ -1980,11 +1998,21 @@ class _Cursors:
             return [], []
         columns, remaining = state
         batch, rest = remaining[:count], remaining[count:]
+        self._delivered[cursor_id] = self._delivered.get(cursor_id, 0) + len(batch)
         if rest:
             self._open[cursor_id] = (columns, rest)
         else:
             del self._open[cursor_id]
         return columns, batch
+
+    def delivered(self, cursor_id: int) -> int:
+        """How many rows have gone out under this cursor id (#1048)."""
+        return self._delivered.get(cursor_id, 0)
+
+    def note_delivered(self, cursor_id: int, count: int) -> None:
+        """Record rows served outside `take` -- the batch that rides with an
+        execute, and a scrollable open's own (#1048)."""
+        self._delivered[cursor_id] = self._delivered.get(cursor_id, 0) + count
 
     def has(self, cursor_id: int) -> bool:
         return cursor_id in self._open
@@ -2292,7 +2320,9 @@ def _resolve_temp_lob_binds(request: ExecRequest, temp_lobs: _TempLobs) -> ExecR
     return replace(request, binds=rows[0], bind_rows=rows)
 
 
-def _run_returning(backend: Backend, sql: str, request: ExecRequest) -> Result:
+def _run_returning(
+    backend: Backend, sql: str, request: ExecRequest, cursors: _Cursors
+) -> Result:
     # Hand a RETURNING statement to the backend with a BindVar standing in at
     # every position the clause fills, so the backend knows which binds it owes
     # values for and what type is wanted there (#689). A backend with no
@@ -2328,7 +2358,9 @@ def _run_returning(backend: Backend, sql: str, request: ExecRequest) -> Result:
                 toid=toids[i] if i < len(toids) else b'',
             )
             if i in request.return_binds
-            else value
+            else _resolve_refcursor_in_value(
+                backend, cursors, meta[i][0] if i < len(meta) else 0, value
+            )
             for i, value in enumerate(row)
         ]
         for row in source_rows
@@ -2364,6 +2396,56 @@ def _attach_object_bind_lobs(
         for value in values or []:
             if isinstance(value, ObjectImage):
                 value.lob_contents = combined
+
+
+def _resolve_refcursor_in_binds(backend: Backend, cursors: _Cursors, binds: list):
+    """Turn a REF CURSOR bind carrying a cursor **id** into an open cursor the
+    backend can take (#1048).
+
+    A client may hand a PL/SQL block a cursor the server already has, declared
+    there as a plain ``sys_refcursor`` IN parameter. The id in the bind is one
+    the MIRROR handed out, and the backend has never heard of it — so the
+    statement behind it is re-opened on the backend and advanced by the rows
+    already served under that id, leaving the block to resume exactly where the
+    client stopped.
+
+    A zero id is the ordinary OUT form ("open one for me") and is left alone. An
+    id the Mirror cannot place — no statement recorded, or a backend with no
+    ``open_ref_cursor`` — keeps its raw value, so the reply is the backend's own
+    ORA error rather than a cursor positioned wrongly.
+    """
+    Out = []
+    for bind in binds:
+        if isinstance(bind, BindVar):
+            resolved = _resolve_refcursor_in_value(
+                backend, cursors, bind.tns_type, bind.value
+            )
+            bind = bind if resolved is bind.value else replace(bind, value=resolved)
+        Out.append(bind)
+    return Out
+
+
+def _resolve_refcursor_in_value(
+    backend: Backend, cursors: _Cursors, tns_type: int, value: object
+) -> object:
+    # One bind's worth of the rule above: a REF CURSOR position carrying a
+    # non-zero cursor id becomes an open backend cursor, anything else is
+    # returned untouched. Shared by the block path and the RETURNING path, which
+    # build their bind lists differently but owe the same translation -- a REF
+    # cursor can be bound into a plain SQL statement too, as an argument to a
+    # PL/SQL function called from it.
+    if tns_type != TNS_TYPE_REFCURSOR or not isinstance(value, int) or not value:
+        return value
+    Open = getattr(backend, 'open_ref_cursor', None)
+    if Open is None:
+        return value
+    sql = cursors.query_sql(value)
+    if not sql or bind_placeholders(sql, dedupe=True):
+        # No statement recorded for that id, or one whose own binds this does
+        # not have. Re-running it with the wrong values would be worse than not
+        # running it, so leave the value alone and let the backend answer.
+        return value
+    return Open(sql, cursors.delivered(value))
 
 
 def _bind_vars(request: ExecRequest) -> list:
@@ -2458,6 +2540,17 @@ def _out_bind_entries(
     for value, (tns_type, _size), capacity, csfrm in zip(
         out_binds, bind_meta, arrays, forms
     ):
+        if value is None and tns_type == TNS_TYPE_REFCURSOR:
+            # A REF CURSOR bind the client passed IN (#1048). The block fetched
+            # from the cursor the Mirror opened for it and, as such a block
+            # usually does, closed it -- so there is no result to park and the
+            # backend reports nothing for the position. A real server answers
+            # the shape #1016 established: no columns and cursor id 0, a closed
+            # cursor. Left to the scalar branch below it goes out as a plain
+            # NULL, which the client reads as the start of a REF CURSOR value
+            # and then waits for a describe that never comes -- a HANG.
+            entries.append(RefCursorOutBind(columns=[], cursor_id=0))
+            continue
         if isinstance(value, CursorResult):
             # A REF cursor the block never OPENED is reported with cursor id 0
             # and no columns, and the client keys on the id: executing a ref
@@ -2609,7 +2702,7 @@ def _answer_query(
             # DML ... RETURNING col INTO :b (#689). The reply owes one set of
             # returned values per iteration, so this cannot go through the
             # ordinary DML paths below, which report only a row count.
-            result = _run_returning(backend, sql, request)
+            result = _run_returning(backend, sql, request, cursors)
             if request.autocommit:
                 backend.commit()
             _mark_transaction(sql, request.autocommit)
@@ -2689,7 +2782,9 @@ def _answer_query(
                         batch_errors.append((offset, err.ora_code, err.ora_message))
                 result = Result(rowcount=affected)
         else:
-            result = backend.execute(sql, _bind_vars(request))
+            result = backend.execute(
+                sql, _resolve_refcursor_in_binds(backend, cursors, _bind_vars(request))
+            )
         # Autocommit mode: the client set the commit-on-success option, so
         # persist this statement before replying (an explicit-transaction client
         # leaves the bit clear and drives commit/rollback itself).
@@ -2785,7 +2880,11 @@ def _answer_query(
             first, remaining = rows[:batch_size], rows[batch_size:]
             if remaining:
                 cursor_id = cursors.open(
-                    columns, remaining, sql=sql, bind_types=request.bind_types
+                    columns,
+                    remaining,
+                    sql=sql,
+                    bind_types=request.bind_types,
+                    delivered=len(first),
                 )
                 # A re-run mints a FRESH id, so the defines standing on the one
                 # the client re-executed have to travel with it -- otherwise the
@@ -2970,10 +3069,13 @@ def _answer_scroll(
         return []
     columns = result.columns
     rows = _park_nested_cursors(list(result.rows), columns, cursors)
-    cursor_id = cursors.open_scroll(columns, rows)
+    cursor_id = cursors.open_scroll(columns, rows, sql=request.sql or None)
     size = _prefetch_batch(request.fetch, len(rows))
     batch = rows[:size]
     last_abs = len(batch)
+    # The rows this open hands over are rows the client has; a block that later
+    # binds this cursor resumes after them (#1048).
+    cursors.note_delivered(cursor_id, last_abs)
     stream.write_packet(
         TNS_DATA,
         encode_scroll_open_response(

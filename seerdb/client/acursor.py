@@ -204,7 +204,12 @@ class AsyncCursor(_CursorLogic):
         # the buffered scroll (#161).
         if self._scrollable and self._connection.field_version >= FIELD_VERSION_10_2:
             Kw['scrollable'] = True
-            Kw['Prefetch'] = max(int(self.prefetchrows), 1)
+            # 0 is a real answer, not a missing one: it opens the cursor and
+            # reads NOTHING, which is what binding it into a PL/SQL block needs
+            # (the block fetches from row one) and what python-oracledb's
+            # prefetchrows=0 means. Clamping it to 1 silently consumed a row,
+            # so the block resumed one row late (#1048).
+            Kw['Prefetch'] = max(int(self.prefetchrows), 0)
         Result = await self._connection.execute(operation, **Kw)
         return await self._apply_result(Bind, Result, BatchErrors=BatchErrors)
 

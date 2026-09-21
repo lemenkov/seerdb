@@ -4502,10 +4502,6 @@ class RefCursorInBindIntegration(_IntegrationBase):
         # The proof that the id reached the server and named a usable cursor:
         # the block read a row off it and wrote the row down. Row 1 was consumed
         # by the scrollable open's prefetch, so row 2 is what it sees.
-        #
-        # Through a Mirror the id is one the MIRROR handed out, and its backend
-        # has never heard of it -- that half is #1048.
-        self._skip_if_mirror('an open cursor bound as a REF CURSOR IN (#1048)')
         self.cur.execute(f'BEGIN {self.PKG}.drain(:1); END;', [self._open_ref_cursor()])
         self.cur.execute(f'SELECT id, v FROM {self.TABLE}')
         self.assertEqual(
