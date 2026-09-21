@@ -1833,6 +1833,7 @@ from seerdb.common.tns_consts import (
     TNS_LOB_OP_CREATE_TEMP,
     TNS_LOB_OP_FREE_TEMP,
     TNS_LOB_OP_GET_CHUNK_SIZE,
+    TNS_LOB_OP_IS_OPEN,
     TNS_LOB_OP_OPEN,
     TNS_LOB_OP_TRIM,
 )
@@ -2530,6 +2531,27 @@ _LOBOPS_ACK_OPS = frozenset(
 )
 
 
+def _lobops_state_locator(rest: bytes, source_loc_len: int) -> bytes:
+    # The locator for the OPEN / CLOSE / IS_OPEN trio, which must agree on it
+    # because one records a state the next reads back (#903/#887).
+    #
+    # Skipped by the DECLARED source length rather than a ub2 prefix, the same
+    # way the READ path does it: the declared length spans the field in both
+    # forms -- it is the locator's own size when the locator is raw (a column
+    # LOB) and that size + 2 when it is ub2-prefixed (a temp LOB).
+    rest = rest[2:]  # scn-array pointer + length
+    _src_offset, rest = decode_ub4(rest)
+    _dest_offset, rest = decode_ub4(rest)
+    rest = rest[1:]  # amount pointer flag
+    rest = rest[6:]  # three reserved ub2 array-LOB slots
+    field = rest[:source_loc_len]
+    # Strip the prefix when there is one, so the key and the echoed locator are
+    # the locator proper either way.
+    if len(field) >= 2 and struct.unpack('>H', field[:2])[0] == len(field) - 2:
+        field = field[2:]
+    return field
+
+
 def _lobops_locator_after_operation(rest: bytes) -> bytes:
     # From just past the operation code, walk the shared §14.1 tail to the
     # ub2-length-prefixed locator (WRITE / FREE_TEMP / OPEN / CLOSE / TRIM /
@@ -2621,6 +2643,29 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
         return LobOpsRequest(
             kind='get_length', locator=_lobops_locator_after_operation(rest)
         )
+    if operation == TNS_LOB_OP_IS_OPEN:
+        # `lob.isopen()`. It owes a real answer, so like GET_LENGTH it cannot
+        # join the ack ops -- and it must not reach the read path below, which
+        # replies with a read shape the client walks off the end of (#903/#887).
+        #
+        # Skipped by the DECLARED source length, not by a ub2 prefix: a column
+        # LOB carries its locator raw, and reading the first two locator bytes
+        # as a length yields a garbage locator to echo back. The READ path below
+        # draws the same distinction for the same reason (#903).
+        return LobOpsRequest(
+            kind='is_open', locator=_lobops_state_locator(rest, source_loc_len)
+        )
+    if operation in (TNS_LOB_OP_OPEN, TNS_LOB_OP_CLOSE):
+        # Acknowledged like the ops below, but named apart so the server can
+        # remember the open state IS_OPEN has to report back -- and extracted
+        # the SAME way IS_OPEN extracts it, so the two agree on the key. They
+        # did not: OPEN stripped a ub2 prefix unconditionally while IS_OPEN
+        # skipped by the declared length, so on a raw column locator one of them
+        # keyed on garbage and `isopen()` denied an open it had just accepted.
+        return LobOpsRequest(
+            kind='open' if operation == TNS_LOB_OP_OPEN else 'close',
+            locator=_lobops_state_locator(rest, source_loc_len),
+        )
     if operation in _LOBOPS_ACK_OPS:
         return LobOpsRequest(kind='ack', locator=_lobops_locator_after_operation(rest))
     # READ (the #413 column-LOB read) and anything else fall through to the read
@@ -2692,6 +2737,59 @@ def encode_lobops_ack(locator: bytes) -> bytes:
     GET_CHUNK_SIZE state ops the Mirror acknowledges (#417)."""
     rpa = bytes([TTI_RPA]) + struct.pack('>H', len(locator)) + locator
     return rpa + _encode_oer(1, 0, 0, b'')
+
+
+# The two errors a LOB's own open/close bracket raises, with the message text a
+# live 23ai sends verbatim -- including ORA-22289's double space after
+# "perform", which is the server's, not a typo here (#903/#887).
+LOBOPS_ERR_ALREADY_OPEN = (
+    22293,
+    b'ORA-22293: LOB already opened in the same transaction\n',
+)
+LOBOPS_ERR_NOT_OPENED = (
+    22289,
+    b'ORA-22289: cannot perform  operation on an unopened file or LOB\n',
+)
+
+
+def encode_lobops_error(code: int, message: bytes) -> bytes:
+    """A TTI_LOBOPS failure: a bare OER, with NO locator echo.
+
+    Captured from 23ai -- a second ``lob.open()`` comes back as ``04 01 02 02 15
+    43 00 02 57 15 …``: the OER token straight after the data flags, the ub4
+    ``0x5715`` = 22293, then the text. A success carries the acknowledged
+    locator first; a failure does not, so a reply built from
+    :func:`encode_lobops_ack` with the code swapped in would desync."""
+    return _encode_oer(1, code, 0, message)
+
+
+def encode_lobops_is_open(locator: bytes, is_open: bool) -> bytes:
+    """The IS_OPEN reply (#903/#887): the acknowledged locator, a ub1 flag, then
+    a success OER.
+
+    Shape established two ways, because one was not enough. Captured from a live
+    23ai (``pkg`` LOB open/close round in python-oracledb's ``test_1904``), the
+    two replies -- asked once while closed and once while open -- differ in
+    THREE of 169 bytes, so the capture alone does not say which one is the
+    answer. The reference client's own decoder settles it::
+
+        if self.operation in (TNS_LOB_OP_IS_OPEN, ...):
+            buf.read_ub1(&temp8)
+            self.bool_flag = temp8 > 0
+
+    It reads the echoed locator and then a single ub1: nonzero is open. The
+    other two bytes that move are server-side state inside the locator, which
+    the client copies over its own but does not consult here.
+
+    A plain ack (no flag) is NOT a safe fallback -- the client reads the byte
+    regardless, so it would take whatever follows and then desync.
+
+    The locator is echoed RAW, without the ub2 length :func:`encode_lobops_ack`
+    writes: the client reads it with ``read_raw_bytes(len(its own locator))``,
+    so a length prefix shifts every following byte and it takes two locator
+    bytes as the flag."""
+    rpa = bytes([TTI_RPA]) + locator
+    return rpa + bytes([1 if is_open else 0]) + _encode_oer(1, 0, 0, b'')
 
 
 def encode_lobops_length(locator: bytes, length: int) -> bytes:

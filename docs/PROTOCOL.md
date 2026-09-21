@@ -3136,6 +3136,7 @@ form by default and opts into the prefix per call (`locator_prefixed`).
 | `0x4000`  | GET_CHUNK_SIZE    | The server's chunk size              |
 | `0x8000`  | OPEN              | Open; `amount` carries the MODE      |
 | `0x10000` | CLOSE             | Close                                |
+| `0x11000` | IS_OPEN           | Is the LOB open? (§14.4c)            |
 
 **CREATE_TEMP body** (no source locator): a fixed field block captured verbatim
 from python-oracledb on 21c, differing between CLOB (type `0x70`) and BLOB
@@ -3398,13 +3399,63 @@ of the wrong shape.
   / `encode_free_temp_lobs_piggyback`). Before #852 it was refused as
   `ORA-03115 (piggyback 96)`, so only the *first* temp-LOB write of a session
   ever worked.
-- **`OPEN`** (`0x8000`) / **`CLOSE`** (`0x10000`) / **`TRIM`** (`0x0020`) /
-  **`GET_CHUNK_SIZE`** (`0x4000`) — acked. Their *value-returning* forms (a real
-  server-preferred chunk size, applying `TRIM`'s new length, `GET_LENGTH` /
-  `IS_OPEN`) are deferred to #421: pinning those reply bytes needs a capture from
-  a client that actually sends them (the thin client doesn't, and thick needs
-  Instant Client), and the ack already keeps the wire in sync. `READ` (and any
-  unrecognised op) still routes to the #413 read path, unchanged.
+- **`OPEN`** (`0x8000`) / **`CLOSE`** (`0x10000`) — acked, and the state is
+  **remembered**, because `IS_OPEN` reports it back and because the bracket is
+  not idempotent (§14.4c). **`TRIM`** (`0x0020`) / **`GET_CHUNK_SIZE`**
+  (`0x4000`) are acked without one; their value-returning forms (a real
+  server-preferred chunk size, applying `TRIM`'s new length) stay deferred to
+  #421. `READ` (and any unrecognised op) still routes to the #413 read path,
+  unchanged.
+
+  Note this bullet used to defer `IS_OPEN` alongside them, on the reasoning that
+  "pinning those reply bytes needs a capture from a client that actually sends
+  them (the thin client doesn't)". That was **wrong**: python-oracledb thin
+  sends `IS_OPEN` on every `lob.isopen()`, and because the op had no case it
+  fell through to the read path and the client walked off the end of the reply
+  (#903/#887). An op assumed unreachable is worth re-testing before it is
+  deferred again.
+
+### 14.4c IS_OPEN, and the open/close bracket (#903/#887)
+
+**`IS_OPEN` (`0x11000`) owes an answer**, unlike `OPEN` / `CLOSE`. The reply is
+the acknowledged locator, a **`ub1`** flag (nonzero = open), then the success
+OER — and the locator is echoed **RAW**, without the `ub2` length an ordinary
+ack carries:
+
+```
+08 <locator bytes …> <ub1 flag> <OER>
+```
+
+The client reads it as `read_raw_bytes(len(its own locator))` followed by
+`read_ub1`, so a length prefix shifts every following byte and it takes two
+locator bytes as the flag. A plain ack is not a safe fallback either: the flag
+byte is read regardless, so the client would consume whatever follows and then
+desync.
+
+Establishing that took **two** sources, because one was not enough. Captured
+from 23ai, the two replies — asked once while closed and once while open —
+differ in **three of 169 bytes**, so the capture alone does not say which is the
+answer. The reference client's decoder settles it: it reads the locator, then a
+single `ub1`, and treats `> 0` as open. The other two moving bytes are
+server-side state *inside* the locator, which the client copies over its own
+but does not consult here.
+
+**The bracket is not idempotent.** A second `OPEN` and a `CLOSE` of something
+never opened are errors, and the reply is a **bare OER with no locator echo**:
+
+| condition | code | message (verbatim from 23ai) |
+|---|---|---|
+| open an already-open LOB | 22293 | `ORA-22293: LOB already opened in the same transaction` |
+| close an unopened LOB | 22289 | `ORA-22289: cannot perform  operation on an unopened file or LOB` |
+
+The double space after "perform" in ORA-22289 is the server's own.
+
+**`OPEN`, `CLOSE` and `IS_OPEN` must extract the locator the same way**, since
+one records a state the next reads back. Skip it by the **declared source
+length** (which spans the field whether the locator is raw or `ub2`-prefixed),
+not by reading a prefix: a column LOB sends its locator raw, and stripping two
+bytes that are not a prefix yields a different key, so `isopen()` denied an open
+it had just accepted.
 
 ### 14.4b Operations on a temp LOB the CLIENT created (#826)
 
