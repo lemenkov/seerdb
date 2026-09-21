@@ -706,11 +706,18 @@ class OraclePassthroughBackend:
             cursor.execute(sql, variables)
         except seerdb.DatabaseError as exc:
             raise _relay_error(exc) from exc
-        # A plain-value (LOB IN) position has no OUT value — None; a Var yields
-        # its assigned value (a nested cursor for a REF CURSOR).
+        # A Var yields its assigned value (a nested cursor for a REF CURSOR).
+        # An object bound as a bare DbObject has no getvalue() -- the driver
+        # writes an OUT value straight into it (#1029) -- so the object IS the
+        # value. Reading it through getvalue() reported None, and the Mirror
+        # then sent nothing back: the client saw its own input unchanged, which
+        # is the OUT half of a callproc silently doing nothing (#1032). Any
+        # other plain-value position (a LOB IN) genuinely has no OUT value.
         return Result(
             out_binds=[
-                _out_value(v.getvalue()) if hasattr(v, 'getvalue') else None
+                _out_value(v.getvalue())
+                if hasattr(v, 'getvalue')
+                else (v if isinstance(v, DbObject) else None)
                 for v in variables
             ]
         )
