@@ -147,6 +147,21 @@ TNS_EOCS_FLAGS_TXN_IN_PROGRESS = 0x02
 # with errors: the statement succeeded and the object exists, invalid (#993).
 TNS_OER_WARN_COMPILATION_ERROR = 0x20
 
+# The two ORA codes an OER carries as control flow rather than as a failure: a
+# caller that raises on either of them is wrong (#1051). Decimal, unlike the
+# flags and masks above -- an ORA number IS its decimal spelling, so 1403 reads
+# back as the ORA-01403 a user sees and 0x57B would not.
+#
+# ORA-01403 is how the server says a result set is drained -- the fetch loop's
+# terminator, not an error. It is only benign for a statement that produces
+# rows, though: a PL/SQL block's SELECT INTO raises the same code for real, and
+# masking it there turned "no rows" into None (#1039).
+ORA_NO_DATA_FOUND = 1403
+# ORA-24381 summarises an array-DML execute that ran with batcherrors on and
+# collected per-row failures. The batch ran and the cursor is still usable; the
+# rows that failed are read back through getbatcherrors() (#18).
+ORA_ARRAY_DML_ERRORS = 24381
+
 # The describe's vector-metadata flags byte (23.4+). A VECTOR column that allows
 # ANY number of dimensions says so HERE, not by its dimension count -- the count
 # alongside this bit is 0 and means nothing, so reporting it claims the column

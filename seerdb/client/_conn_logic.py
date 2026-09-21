@@ -42,6 +42,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_10_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_23_1,
+    ORA_NO_DATA_FOUND,
     RCAP_TTC,
     RCAP_TTC_SESSION_STATE_OPS,
     TNS_SESSION_STATE_REQUEST_BEGIN,
@@ -552,7 +553,7 @@ class _ConnectionLogic:
         from seerdb.common.tns import decode_lobops_oer
 
         (ErrCode, Message) = decode_lobops_oer(Packet, self.field_version)
-        if ErrCode and ErrCode not in (0, 1403):
+        if ErrCode and ErrCode not in (0, ORA_NO_DATA_FOUND):
             raise from_ora_code(ErrCode)(Message or f'ORA-{ErrCode:05d}', code=ErrCode)
 
 

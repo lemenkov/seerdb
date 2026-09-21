@@ -174,6 +174,8 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_21_1,
     FIELD_VERSION_23_1,
     ISO_LATIN_1_CHARSET,
+    ORA_ARRAY_DML_ERRORS,
+    ORA_NO_DATA_FOUND,
     RCAP_COMPAT,
     RCAP_COMPAT_81,
     RCAP_TTC,
@@ -1753,12 +1755,6 @@ def encode_rowcounts_block(counts: list[int]) -> bytes:
     return bytes([TTI_RPA]) + fields + rows
 
 
-# ORA-24381: the array-DML summary code the server returns when a batcherrors
-# execute collected per-row failures — non-fatal, the client reads the errors
-# from getbatcherrors() rather than raising (#18).
-_ARRAY_DML_ERRORS = 24381
-
-
 def encode_batch_errors_status(
     rowcount: int,
     batch_errors: list[tuple[int, int, str]],
@@ -1772,10 +1768,10 @@ def encode_batch_errors_status(
     ``batcherrors`` and ``arraydmlrowcounts`` are not alternatives -- a client
     may ask for both on one execute, and then this reply owes the per-iteration
     counts as well (#1031)."""
-    message = f'ORA-{_ARRAY_DML_ERRORS:05d}: error(s) in array DML'.encode()
+    message = f'ORA-{ORA_ARRAY_DML_ERRORS:05d}: error(s) in array DML'.encode()
     prefix = encode_rowcounts_block(counts) if counts is not None else b''
     return prefix + _encode_oer(
-        0, _ARRAY_DML_ERRORS, rowcount, message, batch_errors=batch_errors
+        0, ORA_ARRAY_DML_ERRORS, rowcount, message, batch_errors=batch_errors
     )
 
 
@@ -3077,7 +3073,7 @@ def _scroll_terminator(cursor_id: int, server_rowcount: int, eof: bool) -> bytes
         # other end-of-fetch terminator carries the same text.
         return _encode_oer(
             0,
-            1403,
+            ORA_NO_DATA_FOUND,
             server_rowcount,
             b'ORA-01403: no data found\n',
             cursor_id=cursor_id,
@@ -6697,7 +6693,10 @@ _OCI_STATUS_FRAME_PREFIX = _oci_status_frame_prefix(row_producing=True)
 def _oci_fetch_oer_header(sequence: int) -> bytes:
     # The fetch-terminator OER: a compact OER carrying ORA-01403 (no data found).
     return _oci_oer_short(
-        sequence=sequence, command_type=oci.OCI_CMD_SELECT, category=2, error_code=1403
+        sequence=sequence,
+        command_type=oci.OCI_CMD_SELECT,
+        category=2,
+        error_code=ORA_NO_DATA_FOUND,
     )
 
 
@@ -11186,7 +11185,7 @@ def encode_sb4(Val: int) -> bytes:
 # placement here is fine.
 _END_OF_FETCH = _encode_oer(
     1,
-    1403,
+    ORA_NO_DATA_FOUND,
     1,
     b'ORA-01403: no data found\n',
     cursor_id=1,
@@ -11215,7 +11214,7 @@ def _end_of_fetch(cursor_id: int = 1) -> bytes:
         return _END_OF_FETCH
     return _encode_oer(
         1,
-        1403,
+        ORA_NO_DATA_FOUND,
         1,
         b'ORA-01403: no data found\n',
         cursor_id=cursor_id,

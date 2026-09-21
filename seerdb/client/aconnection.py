@@ -99,6 +99,8 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_12_2,
     FIELD_VERSION_23_1,
     FIELD_VERSION_23_4,
+    ORA_ARRAY_DML_ERRORS,
+    ORA_NO_DATA_FOUND,
     PURITY_DEFAULT,
     TNS_ACCEPT,
     TNS_CONNECT,
@@ -676,7 +678,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                                 )
                                 ErrCode = Result[1]
                                 Message = Result[5] if len(Result) > 5 else None
-                            if ErrCode and ErrCode not in (0, 1403):
+                            if ErrCode and ErrCode not in (0, ORA_NO_DATA_FOUND):
                                 raise from_ora_code(ErrCode)(
                                     Message or f'ORA-{ErrCode:05d}', code=ErrCode
                                 )
@@ -1125,7 +1127,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             and CacheKey is not None
             and isinstance(Result, tuple)
             and len(Result) >= 2
-            and Result[1] not in (0, 1403, 24381)
+            and Result[1] not in (0, ORA_NO_DATA_FOUND, ORA_ARRAY_DML_ERRORS)
         ):
             self._cursor_cache.pop(CacheKey, None)
         Stored = False
@@ -1137,7 +1139,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             and len(Result) >= 3
             and isinstance(Result[2], int)
             and Result[2] > 0
-            and Result[1] in (0, 1403)
+            and Result[1] in (0, ORA_NO_DATA_FOUND)
         ):
             # Gate the write on CacheKey too so 12c+ (cache disabled) never
             # parks a stray {None: cursor_id} entry (#80); mirrors the sync fix.
@@ -1267,7 +1269,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         # column whose row was still uncommitted returned no rows at all: the
         # server defers those rows to a FETCH (call_status 2, no 1403, nothing
         # inline) and the client never asked for them (#712).
-        if RowFormat and CursorId and OraCode != 1403:
+        if RowFormat and CursorId and OraCode != ORA_NO_DATA_FOUND:
             try:
                 while True:
                     # Seed the last row so a BVC-reused column in the next
@@ -1284,13 +1286,13 @@ class AsyncOracleConnect(_ConnectionLogic):
                         AllRows.extend(MoreRows)
                     # End of fetch, or a batch that brought nothing back --
                     # which also guarantees this loop terminates.
-                    if OraCode == 1403 or not MoreRows:
+                    if OraCode == ORA_NO_DATA_FOUND or not MoreRows:
                         break
             finally:
                 set_decode_prev_row(None)
         # Only a statement that FETCHES can be at the end of a fetch: in a
         # PL/SQL block ORA-01403 is a real error (#1039). See the sync twin.
-        if OraCode == 1403 and RowFormat:
+        if OraCode == ORA_NO_DATA_FOUND and RowFormat:
             OraCode = 0
         return (CallStatus, OraCode, CursorId, RetFormat, AllRows) + tuple(Tail)
 
@@ -1349,7 +1351,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         if not isinstance(Result, tuple) or len(Result) < 6:
             return ([], True, 0)
         (_, OraCode, _, RetFormat, Rows, *_) = Result
-        AtEof = (OraCode == 1403) or not Rows
+        AtEof = (OraCode == ORA_NO_DATA_FOUND) or not Rows
         ServerRowCount = (
             RetFormat[0] if (isinstance(RetFormat, tuple) and RetFormat) else 0
         )
@@ -1372,7 +1374,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 (CallStatus, OraCode, _, _, MoreRows, *_) = Result
                 if MoreRows:
                     AllRows.extend(MoreRows)
-                if OraCode == 1403 or not MoreRows:
+                if OraCode == ORA_NO_DATA_FOUND or not MoreRows:
                     break
         finally:
             set_decode_prev_row(None)
@@ -1958,7 +1960,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         await self.send(TNS_DATA, Data)
         Result = cast(tuple, await self._handle_response())
         ErrCode = Result[1] if isinstance(Result, tuple) and len(Result) > 1 else 0
-        if ErrCode and ErrCode not in (0, 1403):
+        if ErrCode and ErrCode not in (0, ORA_NO_DATA_FOUND):
             Message = Result[5] if len(Result) > 5 else None
             raise from_ora_code(ErrCode)(Message or f'ORA-{ErrCode:05d}', code=ErrCode)
         self.password = new_password

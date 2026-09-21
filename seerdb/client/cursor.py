@@ -33,6 +33,8 @@ from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
     FIELD_VERSION_10_2,
     FIELD_VERSION_12_1,
+    ORA_ARRAY_DML_ERRORS,
+    ORA_NO_DATA_FOUND,
     TNS_FETCH_ORIENTATION_ABSOLUTE,
     TNS_FETCH_ORIENTATION_CURRENT,
     TNS_FETCH_ORIENTATION_FIRST,
@@ -334,9 +336,9 @@ class Cursor(_CursorLogic):
         # nothing can be at the end of a fetch that never had rows to fetch.
         NonFatal: tuple[int, ...] = (0,)
         if ColMeta:
-            NonFatal += (1403,)
+            NonFatal += (ORA_NO_DATA_FOUND,)
         if BatchErrors:
-            NonFatal += (24381,)
+            NonFatal += (ORA_ARRAY_DML_ERRORS,)
         if OraCode not in NonFatal:
             # An executemany whose batch aborts part-way really DID apply the
             # rows before the failing one, and the server reports how many in
@@ -404,7 +406,11 @@ class Cursor(_CursorLogic):
                     Result[2] if len(Result) > 2 and isinstance(Result[2], int) else 0
                 )
                 self._init_scroll_window(
-                    CursorId, ColMeta, ServerRowCount, len(self._rows), OraCode == 1403
+                    CursorId,
+                    ColMeta,
+                    ServerRowCount,
+                    len(self._rows),
+                    OraCode == ORA_NO_DATA_FOUND,
                 )
         else:
             # DDL / DML / non-result-set statement. OER carries the affected
