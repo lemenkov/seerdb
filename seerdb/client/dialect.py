@@ -87,13 +87,21 @@ class Send:
 RECV = object()
 
 
-def fv2_raise_for_error(packet: bytes) -> None:
+def fv2_raise_for_error(packet: bytes, *, end_of_fetch_ok: bool = True) -> None:
     """Raise the server's error if ``packet`` is a 9i OER carrying a real ORA
     code (not success / end-of-fetch), so a parse-time failure surfaces as its
     true code + message instead of a downstream desync (#102). Colorless — shared
-    by the fv2 dialect and the (still-inline) 8i methods."""
+    by the fv2 dialect and the (still-inline) 8i methods.
+
+    ``end_of_fetch_ok`` says whether ORA-01403 is this call's end-of-fetch
+    sentinel. It is for a query; it is NOT for a PL/SQL block, where the same
+    code is the real error a `SELECT ... INTO` raises when it matches no row,
+    and treating it as a sentinel returned a silent success with a NULL OUT
+    value (#1039). The 10g+ path draws the same line in `_drain_cursor`.
+    """
     (err_code, message) = decode_fv2_oer_error(packet)
-    if err_code and err_code not in (0, 1403):
+    benign = (0, 1403) if end_of_fetch_ok else (0,)
+    if err_code and err_code not in benign:
         from seerdb.common.exceptions import from_ora_code
 
         raise from_ora_code(err_code)(message or f'ORA-{err_code:05d}', code=err_code)
@@ -229,13 +237,14 @@ class Fv2Dialect:
         if input_values:
             # `packet` is the bind prompt (or an OER on a compile error). Send the
             # input values; the reply carries OUT values + RPA + OER.
-            fv2_raise_for_error(packet)
+            fv2_raise_for_error(packet, end_of_fetch_ok=False)
             yield Send(encode_tokens_rxd(input_values, b''))
             resp = yield RECV
             if resp is False:
                 raise Exception('Connection closed during 9i PL/SQL bind send')
             packet = resp[1]
-        fv2_raise_for_error(packet)  # runtime error (ORA-06512 …)
+        # A block's ORA-01403 is a real error, not an end of fetch (#1039).
+        fv2_raise_for_error(packet, end_of_fetch_ok=False)  # ORA-06512, 01403 …
         (out_values, row_count, err_code) = decode_fv2_block_out(
             packet, len(out_positions)
         )

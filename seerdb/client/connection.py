@@ -1891,9 +1891,16 @@ class OracleConnect(_ConnectionLogic):
                         break
             finally:
                 set_decode_prev_row(None)
-        # Hide the ORA-01403 sentinel from callers; it was an internal
-        # protocol marker, not a user-visible error.
-        if OraCode == 1403:
+        # Hide the ORA-01403 sentinel from callers; it was an internal protocol
+        # marker, not a user-visible error -- but ONLY for a statement that
+        # fetches. A `SELECT ... INTO` inside a PL/SQL block that matches no row
+        # raises ORA-01403 as a real error, and this mask swallowed it: the
+        # block came back a silent success and the caller's OUT variable simply
+        # stayed None, with the reason sitting unread in the message field
+        # (#1039). A result set is what makes the code a sentinel, so RowFormat
+        # is the test -- nothing can be at the end of a fetch that never had
+        # rows to fetch.
+        if OraCode == 1403 and RowFormat:
             OraCode = 0
         return (CallStatus, OraCode, CursorId, RetFormat, AllRows) + tuple(Tail)
 

@@ -218,10 +218,28 @@ class AsyncCursor(_CursorLogic):
             list(Result[8]) if len(Result) > 8 and Result[8] else []
         )
 
+        # The column metadata of a result set, if this reply carries one. Read
+        # before the error gate below, which needs it to tell an end-of-fetch
+        # ORA-01403 from a real one.
+        ServerRowCount = None
+        ColMeta = None
+        if isinstance(RetFormat, tuple) and len(RetFormat) >= 2:
+            ServerRowCount = RetFormat[0]
+            if isinstance(RetFormat[1], list):
+                ColMeta = RetFormat[1]
+
         # ORA-24381 ("error(s) in array DML") is the non-fatal summary the
         # server returns when batcherrors collected per-row failures — surface
         # them through getbatcherrors() instead of raising (mirrors sync _run).
-        NonFatal = (0, 1403, 24381) if BatchErrors else (0, 1403)
+        #
+        # ORA-01403 is the end-of-fetch sentinel ONLY for a statement that
+        # fetches; in a PL/SQL block it is a real error (#1039). See the sync
+        # twin for the whole story.
+        NonFatal: tuple[int, ...] = (0,)
+        if ColMeta:
+            NonFatal += (1403,)
+        if BatchErrors:
+            NonFatal += (24381,)
         if OraCode not in NonFatal:
             # An executemany whose batch aborts part-way really DID apply the
             # rows before the failing one, and the server reports how many in
@@ -266,13 +284,6 @@ class AsyncCursor(_CursorLogic):
             Value._connection = self._connection
             if not KeepReturnLobs:
                 Bucket[Index] = await Value.aread()
-
-        ServerRowCount = None
-        ColMeta = None
-        if isinstance(RetFormat, tuple) and len(RetFormat) >= 2:
-            ServerRowCount = RetFormat[0]
-            if isinstance(RetFormat[1], list):
-                ColMeta = RetFormat[1]
 
         if ColMeta:
             # SELECT result set: clear lastrowid (see sync Cursor._run).
