@@ -176,6 +176,7 @@ class BackendError(Exception):
         ora_code: int = 900,
         error_offset: int | None = None,
         rowcount: int = 0,
+        row_counts: list[int] | None = None,
     ) -> None:
         super().__init__(message)
         self.ora_code = ora_code
@@ -190,6 +191,12 @@ class BackendError(Exception):
         # back is otherwise told nothing happened (#998). 0 for everything that
         # failed outright.
         self.rowcount = rowcount
+        # The PER-ITERATION counts, for a batch that asked for them and then
+        # aborted (#1031). The client asked for arraydmlrowcounts, so the rows
+        # that did apply owe it their counts in the ERROR reply too -- without
+        # them it reports the mode as never enabled, which is a worse answer
+        # than the failure it is also being told about. Empty when unknown.
+        self.row_counts = list(row_counts or [])
 
 
 class UnsupportedFeature(BackendError):

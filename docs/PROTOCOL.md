@@ -1615,6 +1615,36 @@ three position-aligned batch-error arrays — codes and offsets as `ub4 count`
 `ub4`-length text (§6.7). The client surfaces them through `getbatcherrors()`
 rather than raising, and the applied rows still commit.
 
+**The errors are not in row order** (#1031). Measured on a live 23ai, with each
+batch arranged so the orders disagree:
+
+| the batch | reported |
+|---|---|
+| dup@1, check@2, too-large@3 | `(2, ORA-02290) (3, ORA-01438) (1, ORA-00001)` |
+| dup@2, too-large@4 | `(4, ORA-01438) (2, ORA-00001)` |
+| dup@1, dup@3 | `(1, ORA-00001) (3, ORA-00001)` |
+
+It is not an ordering on the codes either — `ORA-01400` precedes `ORA-01438` in
+one arrangement and follows it in another. Everything comes in **row order
+except the unique-constraint violations, which come after all of it**, each
+group still ascending. That is what index maintenance being a separate pass
+looks like from outside: a column conversion (`ORA-01438`), a `NOT NULL`
+(`ORA-01400`) and even a `CHECK` (`ORA-02290`) are evaluated with the row, while
+the unique index is updated afterwards. A server that applies the rows one at a
+time — the Mirror does — collects everything in row order and has to re-group.
+Only `ORA-00001` was measured; a foreign key is presumably the same pass.
+
+**`batcherrors` and `arraydmlrowcounts` are not alternatives.** One execute may
+set both, and then the `ORA-24381` reply owes the per-iteration counts as well —
+the `TTI_RPA` block (§6.7) rides in front of it exactly as it rides in front of a
+success status. A row that failed affected nothing and **still holds its slot**
+in the counts, or every count after it shifts.
+
+The same is true of a batch that **aborts**: a client that asked for
+`arraydmlrowcounts` is owed the counts for the rows that did apply in the ERROR
+reply too. Without them it reports the mode as never enabled, which tells the
+caller less than the failure does — and the rows really were written.
+
 **Cursor cache (the Mirror, #80/#486).** On the pre-12c connection the client
 caches a DML's server cursor id keyed on `(SQL, bind-OAC signature)` and, on the
 next identical execute, sends a **re-execute**: the cursor id set, an **empty

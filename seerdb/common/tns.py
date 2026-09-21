@@ -1738,11 +1738,20 @@ def encode_status_with_rowcounts(
 
     Without the request the client never looks for the block, and a plain
     status is sent instead."""
+    return encode_rowcounts_block(counts) + encode_status(rowcount, cursor_id=cursor_id)
+
+
+def encode_rowcounts_block(counts: list[int]) -> bytes:
+    """Just the per-iteration row-count block (`TTI_RPA`), without a status.
+
+    It is a PREFIX, so it rides in front of whatever OER follows -- a success
+    status, the ORA-24381 batcherrors summary, or the error that aborted the
+    batch. A client that asked for arraydmlrowcounts is owed the counts in all
+    three: the rows that applied applied, whatever happened after them (#1031).
+    """
     fields = encode_sb4(0) * 4  # al8o4l, al8txl, key/value pairs, registration
     rows = encode_sb4(len(counts)) + b''.join(encode_sb4(c) for c in counts)
-    return (
-        bytes([TTI_RPA]) + fields + rows + encode_status(rowcount, cursor_id=cursor_id)
-    )
+    return bytes([TTI_RPA]) + fields + rows
 
 
 # ORA-24381: the array-DML summary code the server returns when a batcherrors
@@ -1752,14 +1761,21 @@ _ARRAY_DML_ERRORS = 24381
 
 
 def encode_batch_errors_status(
-    rowcount: int, batch_errors: list[tuple[int, int, str]]
+    rowcount: int,
+    batch_errors: list[tuple[int, int, str]],
+    counts: list[int] | None = None,
 ) -> bytes:
     """OER for an array-DML ``batcherrors`` execute that collected per-row
     failures (#18): ORA-24381 with the (offset, code, message) arrays, and the
     affected-row count of the rows that applied. The client surfaces the errors
-    through ``getbatcherrors()`` instead of raising."""
+    through ``getbatcherrors()`` instead of raising.
+
+    ``batcherrors`` and ``arraydmlrowcounts`` are not alternatives -- a client
+    may ask for both on one execute, and then this reply owes the per-iteration
+    counts as well (#1031)."""
     message = f'ORA-{_ARRAY_DML_ERRORS:05d}: error(s) in array DML'.encode()
-    return _encode_oer(
+    prefix = encode_rowcounts_block(counts) if counts is not None else b''
+    return prefix + _encode_oer(
         0, _ARRAY_DML_ERRORS, rowcount, message, batch_errors=batch_errors
     )
 
