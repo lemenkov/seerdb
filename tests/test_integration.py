@@ -4448,6 +4448,103 @@ class PlsqlTypeIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class RefCursorInBindIntegration(_IntegrationBase):
+    """Binding an OPEN cursor as a REF CURSOR IN parameter (#1047).
+
+    The block declares a plain `sys_refcursor` IN, fetches from the cursor the
+    server already has, and closes it. What travels is the cursor **id**, so the
+    cursor has to still be open with its rows unread -- which is what a
+    scrollable cursor (#181) is.
+    """
+
+    PKG = 'PYORACLE_RCIN_PKG'
+    TABLE = 'PYORACLE_RCIN'
+
+    def setUp(self):
+        super().setUp()
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('a REF CURSOR IN bind needs the 12c+ bind OAC')
+        try:
+            self.cur.execute(f'DROP PACKAGE {self.PKG}')
+        except seerdb.DatabaseError:
+            pass
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, v VARCHAR2(40))')
+        self.cur.execute(
+            f'CREATE PACKAGE {self.PKG} AS '
+            'PROCEDURE drain(c IN OUT SYS_REFCURSOR); END;'
+        )
+        self.cur.execute(f"""CREATE PACKAGE BODY {self.PKG} AS
+              PROCEDURE drain(c IN OUT SYS_REFCURSOR) IS
+                t_id NUMBER; t_v VARCHAR2(40);
+              BEGIN
+                FETCH c INTO t_id, t_v;
+                IF c%FOUND THEN
+                  INSERT INTO {self.TABLE} (id, v) VALUES (t_id, t_v);
+                END IF;
+                CLOSE c;
+              END;
+            END;""")
+
+    def tearDown(self):
+        try:
+            self.cur.execute(f'DROP PACKAGE {self.PKG}')
+        except seerdb.DatabaseError:
+            pass
+        super().tearDown()
+
+    def _open_ref_cursor(self):
+        rc = self.conn.cursor(scrollable=True)
+        rc.prefetchrows = 1
+        rc.execute("SELECT level, 'String ' || level FROM dual CONNECT BY level <= 5")
+        return rc
+
+    def test_the_block_fetches_from_the_bound_cursor(self):
+        # The proof that the id reached the server and named a usable cursor:
+        # the block read a row off it and wrote the row down. Row 1 was consumed
+        # by the scrollable open's prefetch, so row 2 is what it sees.
+        #
+        # Through a Mirror the id is one the MIRROR handed out, and its backend
+        # has never heard of it -- that half is #1048.
+        self._skip_if_mirror('an open cursor bound as a REF CURSOR IN (#1048)')
+        self.cur.execute(f'BEGIN {self.PKG}.drain(:1); END;', [self._open_ref_cursor()])
+        self.cur.execute(f'SELECT id, v FROM {self.TABLE}')
+        self.assertEqual(
+            [(int(i), v) for i, v in self.cur.fetchall()], [(2, 'String 2')]
+        )
+
+    def test_a_drained_cursor_is_refused_with_a_reason(self):
+        # An ordinary cursor is drained to EOF and queued for close, so its id
+        # names nothing the block can fetch from. The server's answer three
+        # layers down is ORA-01007; say so up front instead.
+        plain = self.conn.cursor()
+        plain.execute('SELECT 1 FROM dual')
+        with self.assertRaises(seerdb.NotSupportedError) as ctx:
+            self.cur.execute(f'BEGIN {self.PKG}.drain(:1); END;', [plain])
+        self.assertIn('still open on the server', str(ctx.exception))
+
+    def test_an_out_ref_cursor_still_works(self):
+        # The OUT form shares the OAC this changed, and sends cursor id 0 -- the
+        # same bytes as before. It is the regression guard for that.
+        self.cur.execute(
+            f'CREATE PACKAGE {self.PKG}_O AS PROCEDURE give(c OUT SYS_REFCURSOR); END;'
+        )
+        self.cur.execute(
+            f'CREATE PACKAGE BODY {self.PKG}_O AS '
+            'PROCEDURE give(c OUT SYS_REFCURSOR) IS BEGIN '
+            'OPEN c FOR SELECT 42 FROM dual; END; END;'
+        )
+        try:
+            out = self.cur.var(seerdb.DB_TYPE_CURSOR)
+            self.cur.execute(f'BEGIN {self.PKG}_O.give(:1); END;', [out])
+            self.assertEqual([tuple(r) for r in out.getvalue().fetchall()], [(42,)])
+        finally:
+            try:
+                self.cur.execute(f'DROP PACKAGE {self.PKG}_O')
+            except seerdb.DatabaseError:
+                pass
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class ObjectOutBindIntegration(_IntegrationBase):
     """An object bound DIRECTLY as an OUT / IN OUT parameter (#1029).
 
