@@ -27,7 +27,7 @@ from seerdb.common.dbobject import (
     decode_xmltype,
     type_name_to_tns,
 )
-from seerdb.common.exceptions import NotSupportedError
+from seerdb.common.exceptions import NotSupportedError, ProgrammingError
 from seerdb.common.lob import LOB
 from seerdb.common.tns import (
     _ENCODE_FIELD_VERSION,
@@ -624,9 +624,11 @@ class TestVarrayCollection(unittest.TestCase):
         self.assertEqual(Rest, _SENTINEL)
         self.assertEqual(decode_collection_image(Val.image, _NUM_VA.element), [7, 8, 9])
 
-    def test_asdict_rejected_on_collection(self):
-        with self.assertRaises(TypeError):
-            _NUM_VA.newobject([1]).asdict()
+    def test_asdict_is_the_index_view_on_a_collection(self):
+        # asdict() used to refuse a collection outright. It is now the keyed
+        # view python-oracledb gives -- index -> value, positions for a VARRAY
+        # (#1035).
+        self.assertEqual(_NUM_VA.newobject([7, 8, 9]).asdict(), {0: 7, 1: 8, 2: 9})
 
 
 class TestNestedTableCollection(unittest.TestCase):
@@ -1064,6 +1066,150 @@ class TestPlsqlIndexTableImage(unittest.TestCase):
         )
         self.assertEqual(values, [10, 20, 30, 40, 50])
         self.assertEqual(keys, [-576, 284, 285, 286, 287])
+
+
+class TestCollectionIndexAccess(unittest.TestCase):
+    # first/last/next/prev/exists/getelement/setelement/delete/size/asdict
+    # (#1035). Every expectation here was compared against python-oracledb
+    # driving the same live 23ai array, value for value and message for
+    # message -- not read off its source.
+
+    _VARRAY = DbObjectType(
+        'PYO',
+        'INTS_T',
+        bytes.fromhex('ee' * 16),
+        1,
+        [],
+        is_collection=True,
+        collection_type=COLLECTION_VARRAY,
+        element={'name': 'element', 'data_type': TNS_TYPE_NUMBER, 'charset': None},
+    )
+
+    def _assoc(self):
+        # The keys pkg_TestStringArrays.TestIndexBy really returns.
+        return _INDEX_TABLE_TYPE.newobject(
+            [10, 20, 30, 40],
+            keys=[-1048576, -576, 284, 8388608],
+        )
+
+    def test_walk_an_associative_array(self):
+        obj = self._assoc()
+        self.assertEqual(obj.first(), -1048576)
+        self.assertEqual(obj.last(), 8388608)
+        self.assertEqual(obj.next(-576), 284)
+        self.assertEqual(obj.prev(284), -576)
+        self.assertEqual(obj.size(), 4)
+        self.assertTrue(obj.exists(-576))
+        self.assertFalse(obj.exists(-577))
+        self.assertEqual(obj.getelement(284), 30)
+
+    def test_walk_off_either_end_is_none(self):
+        obj = self._assoc()
+        self.assertIsNone(obj.next(8388608))
+        self.assertIsNone(obj.prev(-1048576))
+
+    def test_empty_collection_has_no_first_or_last(self):
+        obj = _INDEX_TABLE_TYPE.newobject()
+        self.assertIsNone(obj.first())
+        self.assertIsNone(obj.last())
+        self.assertEqual(obj.size(), 0)
+        self.assertEqual(obj.asdict(), {})
+
+    def test_asdict_is_the_keyed_view(self):
+        self.assertEqual(
+            self._assoc().asdict(),
+            {-1048576: 10, -576: 20, 284: 30, 8388608: 40},
+        )
+
+    def test_delete_leaves_a_hole(self):
+        # The survivors keep their OWN keys; only a positional collection shifts.
+        obj = self._assoc()
+        obj.delete(-576)
+        obj.delete(284)
+        self.assertEqual(obj.aslist(), [10, 40])
+        self.assertEqual(obj.asdict(), {-1048576: 10, 8388608: 40})
+        self.assertEqual(obj.next(-1048576), 8388608)
+        self.assertFalse(obj.exists(-576))
+
+    def test_delete_survives_the_encoder(self):
+        # A hole must reach the wire as a hole, not be renumbered away.
+        obj = self._assoc()
+        obj.delete(-576)
+        self.assertEqual(
+            decode_collection_keyed(
+                encode_object_image(obj), _INDEX_TABLE_TYPE.element
+            )[1],
+            [-1048576, 284, 8388608],
+        )
+
+    def test_setelement_replaces_and_creates(self):
+        obj = self._assoc()
+        obj.setelement(284, 99)
+        self.assertEqual(obj.getelement(284), 99)
+        self.assertEqual(obj.size(), 4)
+        # An unused key CREATES an element, as `a(k) := v` does in PL/SQL, and
+        # the keys stay sorted so the image goes out in key order.
+        obj.setelement(-1000, 77)
+        self.assertEqual(obj.first(), -1048576)
+        self.assertEqual(obj.next(-1048576), -1000)
+        self.assertEqual(obj.getelement(-1000), 77)
+        self.assertEqual(
+            decode_collection_keyed(
+                encode_object_image(obj), _INDEX_TABLE_TYPE.element
+            )[1],
+            [-1048576, -1000, -576, 284, 8388608],
+        )
+
+    def test_missing_index_raises(self):
+        obj = self._assoc()
+        with self.assertRaises(ProgrammingError) as ctx:
+            obj.getelement(999)
+        self.assertIn('DPY-2038', str(ctx.exception))
+        with self.assertRaises(ProgrammingError):
+            obj.delete(999)
+
+    def test_varray_indexes_by_position_from_zero(self):
+        obj = self._VARRAY.newobject([10, 20, 30])
+        self.assertEqual(obj.first(), 0)
+        self.assertEqual(obj.last(), 2)
+        self.assertEqual(obj.next(0), 1)
+        self.assertIsNone(obj.prev(0))
+        self.assertTrue(obj.exists(0))
+        self.assertFalse(obj.exists(3))
+        self.assertEqual(obj.getelement(0), 10)
+        self.assertEqual(obj.asdict(), {0: 10, 1: 20, 2: 30})
+
+    def test_varray_delete_shifts(self):
+        # Unlike an associative array: the index IS the position here, so the
+        # later elements move down.
+        obj = self._VARRAY.newobject([10, 20, 30])
+        obj.delete(0)
+        self.assertEqual(obj.aslist(), [20, 30])
+        self.assertEqual(obj.asdict(), {0: 20, 1: 30})
+
+    def test_varray_setelement_out_of_range_raises(self):
+        obj = self._VARRAY.newobject([10, 20, 30])
+        with self.assertRaises(ProgrammingError) as ctx:
+            obj.setelement(7, 40)
+        self.assertIn('DPY-2039', str(ctx.exception))
+
+    def test_index_access_rejects_a_non_collection(self):
+        obj = _ADDR_TYPE.newobject({'STREET': 'Main St', 'ZIP': 1, 'CODE': 'US'})
+        for Call in (
+            obj.first,
+            obj.last,
+            obj.size,
+            lambda: obj.next(0),
+            lambda: obj.prev(0),
+            lambda: obj.exists(0),
+            lambda: obj.getelement(0),
+            lambda: obj.setelement(0, 1),
+            lambda: obj.delete(0),
+        ):
+            with self.assertRaises(TypeError):
+                Call()
+        # asdict stays the attribute view on an object type.
+        self.assertEqual(obj.asdict()['STREET'], 'Main St')
 
 
 class TestPlsqlIndexTableCapture(unittest.TestCase):
