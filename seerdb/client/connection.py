@@ -146,6 +146,38 @@ _REDIRECT_CONNECT_DELAY = 0.1
 _PIPELINE_FETCH_ALL_PREFETCH = 32760
 
 
+def _split_type_name(name: str) -> list[str]:
+    # Split a type name on dots that are NOT inside a quoted identifier, so
+    # `"my.type"` stays one part. One to three parts: TYPE, SCHEMA.TYPE or
+    # PACKAGE.TYPE, and OWNER.PACKAGE.TYPE for a PL/SQL package type (#1030).
+    Parts: list[str] = []
+    Current = ''
+    Quoted = False
+    for Char in name:
+        if Char == '"':
+            Quoted = not Quoted
+            Current += Char
+        elif Char == '.' and not Quoted:
+            Parts.append(Current)
+            Current = ''
+        else:
+            Current += Char
+    Parts.append(Current)
+    return Parts
+
+
+def _normalise_type_part(part: str) -> str:
+    # Oracle upper-cases an unquoted identifier and takes a quoted one verbatim.
+    return part.strip('"') if '"' in part else part.upper()
+
+
+def _is_described(typ: 'DbObjectType | None') -> bool:
+    # A type handle the dictionary actually filled in. A name the session cannot
+    # see yields a handle with no attributes and no element, which the #115 read
+    # path tolerates but `gettype` must reject.
+    return typ is not None and bool(typ.attrs or typ.is_collection)
+
+
 def _format_version(Packed: int) -> str | None:
     # Oracle packs the release into a single integer: major (8 bits),
     # minor (4), update (8), patch (4), port-specific update (8). Verified
@@ -834,9 +866,11 @@ class OracleConnect(_ConnectionLogic):
         # Ordered attribute layout per SQL object type (#115), keyed by
         # (owner, type_name). Populated on demand from ALL_TYPE_ATTRS the first
         # time an object of that type is fetched.
-        self._object_type_cache: dict[tuple[str, str], 'DbObjectType'] = {}
+        # Keyed by (owner, name), or (owner, package, name) for a PL/SQL
+        # package-level type -- the package is part of the identity (#1030).
+        self._object_type_cache: dict[tuple[str, ...], 'DbObjectType'] = {}
         # (owner, name) currently being described, to break nested-type cycles.
-        self._object_type_describing: set[tuple[str, str]] = set()
+        self._object_type_describing: set[tuple[str, ...]] = set()
 
     def _next_seq(self) -> int:
         seq = self.seq
@@ -1944,20 +1978,25 @@ class OracleConnect(_ConnectionLogic):
         current schema. Use ``newobject()`` on the result to build a value to
         bind (#116). oracledb-compatible.
         """
-        if '.' in name:
-            Schema, _, TypeName = name.partition('.')
-            Schema = (
-                Schema.strip('"').upper() if '"' not in Schema else Schema.strip('"')
-            )
+        Parts = [_normalise_type_part(P) for P in _split_type_name(name)]
+        Typ = None
+        if len(Parts) == 3:
+            # OWNER.PACKAGE.TYPE — only a PL/SQL package type has three parts.
+            Typ = self._describe_plsql_type(*Parts)
+        elif len(Parts) == 2:
+            # Ambiguous: SCHEMA.TYPE or PACKAGE.TYPE in the current schema.
+            # The schema-level reading is tried first, so every name that
+            # resolved before still resolves to the same type.
+            Typ = self._describe_object_type(Parts[0], Parts[1])
+            if not _is_described(Typ):
+                Typ = self._describe_plsql_type(None, Parts[0], Parts[1])
         else:
-            Schema, TypeName = None, name
-        TypeName = TypeName.strip('"') if '"' in TypeName else TypeName.upper()
-        Typ = self._describe_object_type(Schema, TypeName)
-        if Typ is None or (not Typ.attrs and not Typ.is_collection):
+            Typ = self._describe_object_type(None, Parts[0])
+        if not _is_described(Typ):
             from seerdb.common.exceptions import DatabaseError
 
             raise DatabaseError(f'object type {name!r} not found')
-        return Typ
+        return cast('DbObjectType', Typ)
 
     def _describe_object_type(
         self, schema: str | None, name: str | None
@@ -2033,6 +2072,136 @@ class OracleConnect(_ConnectionLogic):
         Typ = DbObjectType(Owner, name, Oid, 1, Attrs, **CollKW)
         self._object_type_cache[Key] = Typ
         return Typ
+
+    def _describe_plsql_type(
+        self, schema: str | None, package: str, name: str
+    ) -> 'DbObjectType | None':
+        """A PL/SQL **package-level** type's identity and layout (#1030).
+
+        These live in their own dictionaries — ``all_plsql_types`` for the OID
+        and typecode, ``all_plsql_type_attrs`` for a record's attributes,
+        ``all_plsql_coll_types`` for a collection's element — and are invisible
+        to the ``all_types`` / ``all_type_attrs`` pair a schema-level type is
+        read from, which is why ``gettype`` could not see one at all.
+        """
+        from seerdb.common.dbobject import DbObjectType
+
+        Owner = schema or self._current_schema_owner()
+        if not Owner or not package or not name:
+            return None
+        Key = (Owner, package, name)
+        Cached = self._object_type_cache.get(Key)
+        if Cached is not None:
+            return Cached
+        if Key in self._object_type_describing:
+            return None  # cycle guard, as for a schema-level type
+        self._object_type_describing.add(Key)
+        try:
+            Rows = self._rows(
+                self.execute(
+                    'SELECT type_oid, typecode FROM all_plsql_types '
+                    'WHERE owner = :1 AND package_name = :2 AND type_name = :3',
+                    Bind=[Owner, package, name],
+                )
+            )
+            if not Rows:
+                return None
+            Oid = bytes(Rows[0][0]) if Rows[0][0] else b''
+            TypeCode = Rows[0][1]
+            if TypeCode == 'COLLECTION':
+                Extra = self._plsql_collection_describe(Owner, package, name)
+                Attrs: list = []
+            else:
+                Extra = {}
+                Attrs = self._plsql_type_attrs(Owner, package, name)
+            Typ = DbObjectType(
+                Owner, name, Oid, 1, Attrs, package_name=package, **Extra
+            )
+            self._object_type_cache[Key] = Typ
+            return Typ
+        finally:
+            self._object_type_describing.discard(Key)
+
+    def _plsql_type_attrs(self, owner: str, package: str, name: str) -> list:
+        # A package RECORD's ordered attributes. An attribute that is itself a
+        # package type recurses; one that is a schema-level object type goes
+        # through the ordinary describe.
+        from seerdb.common.dbobject import type_name_to_tns
+
+        Rows = self._rows(
+            self.execute(
+                'SELECT attr_name, attr_type_name, attr_type_owner, '
+                'attr_type_package FROM all_plsql_type_attrs '
+                'WHERE owner = :1 AND package_name = :2 AND type_name = :3 '
+                'ORDER BY attr_no',
+                Bind=[owner, package, name],
+            )
+        )
+        Attrs = []
+        for AttrName, TypeName, TypeOwner, TypePackage in Rows:
+            Attr: dict = {
+                'name': AttrName,
+                'type_name': TypeName,
+                'data_type': type_name_to_tns(TypeName),
+                'charset': None,
+            }
+            if TypePackage:
+                Attr['object_type'] = self._describe_plsql_type(
+                    TypeOwner, TypePackage, TypeName
+                )
+            elif TypeOwner:
+                Attr['object_type'] = self._describe_object_type(TypeOwner, TypeName)
+            Attrs.append(Attr)
+        return Attrs
+
+    def _plsql_collection_describe(self, owner: str, package: str, name: str) -> dict:
+        # A package COLLECTION's element type and kind. A PL/SQL index table
+        # prefixes each image element with its int32 key, which the object-image
+        # codec switches on off collection_type — so the kind is not cosmetic.
+        from seerdb.common.dbobject import (
+            COLLECTION_NESTED_TABLE,
+            COLLECTION_PLSQL_INDEX_TABLE,
+            COLLECTION_VARRAY,
+            type_name_to_tns,
+        )
+
+        Rows = self._rows(
+            self.execute(
+                'SELECT coll_type, elem_type_name, elem_type_owner, '
+                'elem_type_package, upper_bound FROM all_plsql_coll_types '
+                'WHERE owner = :1 AND package_name = :2 AND type_name = :3',
+                Bind=[owner, package, name],
+            )
+        )
+        if not Rows:
+            return {'is_collection': True}
+        (CollType, ElemName, ElemOwner, ElemPackage, Upper) = Rows[0][:5]
+        Element: dict = {
+            'name': 'element',
+            'type_name': ElemName,
+            'data_type': type_name_to_tns(ElemName),
+            'charset': None,
+        }
+        if ElemPackage:
+            Element['object_type'] = self._describe_plsql_type(
+                ElemOwner, ElemPackage, ElemName
+            )
+        elif ElemOwner:
+            Element['object_type'] = self._describe_object_type(ElemOwner, ElemName)
+        return {
+            'is_collection': True,
+            'collection_type': {
+                'PL/SQL INDEX TABLE': COLLECTION_PLSQL_INDEX_TABLE,
+                'VARYING ARRAY': COLLECTION_VARRAY,
+            }.get(CollType, COLLECTION_NESTED_TABLE),
+            'element': Element,
+            'max_elements': int(Upper) if Upper else 0,
+        }
+
+    def _current_schema_owner(self) -> str | None:
+        # The session's own schema, for a type name that named no owner.
+        Rows = self._rows(self.execute('SELECT USER FROM dual'))
+        return Rows[0][0] if Rows else None
 
     def _collection_describe(self, owner, name, typecode) -> dict:
         # For a collection type (#117/#118) read the single element type + kind

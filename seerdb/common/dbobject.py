@@ -259,9 +259,15 @@ class DbObjectType:
         collection_type=None,
         element=None,
         max_elements=0,
+        package_name=None,
     ):
         self.schema = schema
         self.name = name
+        # The package a PL/SQL package-level type is declared in, None for an
+        # ordinary schema-level type (#1030). It is part of the type's identity
+        # -- two packages may each declare a UDT_RECORD -- so it rides in
+        # full_name, as python-oracledb reports it.
+        self.package_name = package_name
         self.oid = oid  # 16-byte type OID (bytes)
         self.version = version
         self.attrs = attrs  # ordered layout (list of dict)
@@ -274,7 +280,8 @@ class DbObjectType:
 
     @property
     def full_name(self) -> str:
-        return f'{self.schema}.{self.name}' if self.schema else self.name
+        Parts = [P for P in (self.schema, self.package_name, self.name) if P]
+        return '.'.join(Parts)
 
     @property
     def attr_names(self) -> list:

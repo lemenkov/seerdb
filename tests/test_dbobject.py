@@ -311,6 +311,42 @@ class TestObjectVar(unittest.TestCase):
         self.assertEqual(back.aslist(), ['Main St', 12345, 'US'])
 
 
+class TestTypeNameSplitting(unittest.TestCase):
+    # How `gettype` reads a type name (#1030). One to three parts: TYPE,
+    # SCHEMA.TYPE or PACKAGE.TYPE, and OWNER.PACKAGE.TYPE for a PL/SQL package
+    # type -- which is why the old two-part split could not express one at all.
+
+    def test_one_two_and_three_part_names(self):
+        from seerdb.client.connection import _split_type_name
+
+        self.assertEqual(_split_type_name('ADDR_T'), ['ADDR_T'])
+        self.assertEqual(_split_type_name('PYO.ADDR_T'), ['PYO', 'ADDR_T'])
+        self.assertEqual(_split_type_name('PYO.PKG.UDT'), ['PYO', 'PKG', 'UDT'])
+
+    def test_a_dot_inside_a_quoted_identifier_is_not_a_separator(self):
+        # Oracle allows a quoted identifier to contain a dot; splitting on it
+        # would look up a package that does not exist.
+        from seerdb.client.connection import _split_type_name
+
+        self.assertEqual(_split_type_name('"my.type"'), ['"my.type"'])
+        self.assertEqual(_split_type_name('PYO."my.type"'), ['PYO', '"my.type"'])
+
+    def test_an_unquoted_part_is_upper_cased_and_a_quoted_one_is_not(self):
+        from seerdb.client.connection import _normalise_type_part
+
+        self.assertEqual(_normalise_type_part('addr_t'), 'ADDR_T')
+        self.assertEqual(_normalise_type_part('"addr_t"'), 'addr_t')
+
+    def test_a_package_type_reports_its_package_in_full_name(self):
+        # The package is part of the identity -- two packages may each declare a
+        # UDT_RECORD -- and python-oracledb reports it the same way.
+        typ = DbObjectType('PYO', 'UDT_REC', bytes(16), 1, [], package_name='PKG_A')
+        self.assertEqual(typ.full_name, 'PYO.PKG_A.UDT_REC')
+        self.assertEqual(typ.name, 'UDT_REC')
+        self.assertIsNone(_ADDR_TYPE.package_name)
+        self.assertEqual(_ADDR_TYPE.full_name, 'PYO.ADDR_T')
+
+
 class TestBareObjectOutBind(unittest.TestCase):
     # An object passed to callproc / execute WITHOUT a Var around it (#1029).
     # `cursor.callproc(name, (3, obj))` is how python-oracledb is normally

@@ -4238,6 +4238,95 @@ class LOBReturningIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class PlsqlTypeIntegration(_IntegrationBase):
+    """`gettype()` of a PL/SQL **package-level** type (#1030).
+
+    These live in `all_plsql_types` / `all_plsql_type_attrs` /
+    `all_plsql_coll_types`, invisible to the `all_types` pair a schema-level
+    type is read from -- so `gettype` could not see one at all, whatever the
+    name it was given.
+    """
+
+    PKG = 'PYORACLE_PLSQLTYPE_PKG'
+    SCHEMA_TYPE = 'PYORACLE_PLSQLTYPE_T'
+
+    def setUp(self):
+        super().setUp()
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('a package-level type needs the 12.1+ bind support')
+        self._drop_objects()
+        # A schema-level type of the SAME shape, so the two-part name
+        # `PKG.TYPE` cannot be confused with `SCHEMA.TYPE` by accident.
+        self.cur.execute(f'CREATE TYPE {self.SCHEMA_TYPE} AS VARRAY(5) OF NUMBER')
+        self.cur.execute(f"""CREATE PACKAGE {self.PKG} AS
+              TYPE udt_numlist IS TABLE OF NUMBER INDEX BY BINARY_INTEGER;
+              TYPE udt_rec IS RECORD (id NUMBER, name VARCHAR2(40));
+              PROCEDURE fill(n IN NUMBER, l IN OUT udt_numlist);
+            END;""")
+        self.cur.execute(f"""CREATE PACKAGE BODY {self.PKG} AS
+              PROCEDURE fill(n IN NUMBER, l IN OUT udt_numlist) IS
+              BEGIN
+                FOR i IN 1..n LOOP l(i) := i * 100; END LOOP;
+              END;
+            END;""")
+
+    def _drop_objects(self):
+        for stmt in (f'DROP PACKAGE {self.PKG}', f'DROP TYPE {self.SCHEMA_TYPE}'):
+            try:
+                self.cur.execute(stmt)
+            except seerdb.DatabaseError:
+                pass  # best-effort teardown of leftovers
+
+    def tearDown(self):
+        try:
+            self._drop_objects()
+        except seerdb.DatabaseError:
+            pass
+        super().tearDown()
+
+    def test_a_package_collection_resolves_by_two_part_name(self):
+        typ = self.conn.gettype(f'{self.PKG}.UDT_NUMLIST')
+        self.assertTrue(typ.is_collection)
+        self.assertEqual(typ.package_name, self.PKG)
+        self.assertTrue(typ.oid)  # the identity a bind announces
+
+    def test_a_package_type_resolves_by_three_part_name(self):
+        owner = self.conn.gettype(f'{self.PKG}.UDT_NUMLIST').schema
+        typ = self.conn.gettype(f'{owner}.{self.PKG}.UDT_NUMLIST')
+        self.assertEqual(typ.full_name, f'{owner}.{self.PKG}.UDT_NUMLIST')
+
+    def test_a_package_record_carries_its_attributes_in_order(self):
+        typ = self.conn.gettype(f'{self.PKG}.UDT_REC')
+        self.assertFalse(typ.is_collection)
+        self.assertEqual(typ.attr_names, ['ID', 'NAME'])
+
+    def test_a_schema_level_type_still_resolves_the_same_way(self):
+        # The two-part name is ambiguous -- SCHEMA.TYPE or PACKAGE.TYPE -- so
+        # the schema reading is tried first and every name that resolved before
+        # still resolves to the same type.
+        typ = self.conn.gettype(self.SCHEMA_TYPE)
+        self.assertTrue(typ.is_collection)
+        self.assertIsNone(typ.package_name)
+        qualified = self.conn.gettype(f'{typ.schema}.{self.SCHEMA_TYPE}')
+        self.assertEqual(qualified.full_name, typ.full_name)
+
+    def test_a_name_that_resolves_to_nothing_still_raises(self):
+        with self.assertRaises(seerdb.DatabaseError):
+            self.conn.gettype('PYORACLE_NO_SUCH_PKG.PYORACLE_NO_SUCH_TYPE')
+        with self.assertRaises(seerdb.DatabaseError):
+            self.conn.gettype('PYORACLE_NO_SUCH_TYPE')
+
+    def test_a_package_type_resolved_by_name_can_be_bound(self):
+        # The point of resolving it: an index-by table bound through the type
+        # `gettype` returned, with no Mirror and no hand-built DbObjectType.
+        self._skip_if_mirror('an OUT value for a bare object bind (#1032)')
+        typ = self.conn.gettype(f'{self.PKG}.UDT_NUMLIST')
+        obj = typ.newobject()
+        self.cur.callproc(f'{self.PKG}.fill', (3, obj))
+        self.assertEqual([int(v) for v in obj.aslist()], [100, 200, 300])
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class ObjectOutBindIntegration(_IntegrationBase):
     """An object bound DIRECTLY as an OUT / IN OUT parameter (#1029).
 
@@ -4668,6 +4757,47 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
         await Conn.close()
         if Fv < FIELD_VERSION_10_2:
             self.skipTest(Reason)
+
+    async def test_gettype_resolves_a_package_level_type(self):
+        # Async twin of PlsqlTypeIntegration (#1030).
+        Pkg = 'PYO_ASYNC_PLSQLTYPE_PKG'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            if Conn.field_version < FIELD_VERSION_12_1:
+                self.skipTest('a package-level type needs the 12.1+ bind support')
+            Cur = Conn.cursor()
+            try:
+                await Cur.execute(f'DROP PACKAGE {Pkg}')
+            except seerdb.DatabaseError:
+                pass
+            await Cur.execute(
+                f'CREATE PACKAGE {Pkg} AS '
+                'TYPE udt_numlist IS TABLE OF NUMBER INDEX BY BINARY_INTEGER; '
+                'TYPE udt_rec IS RECORD (id NUMBER, name VARCHAR2(40)); '
+                'PROCEDURE fill(n IN NUMBER, l IN OUT udt_numlist); END;'
+            )
+            await Cur.execute(
+                f'CREATE PACKAGE BODY {Pkg} AS '
+                'PROCEDURE fill(n IN NUMBER, l IN OUT udt_numlist) IS BEGIN '
+                'FOR i IN 1..n LOOP l(i) := i * 100; END LOOP; END; END;'
+            )
+            try:
+                Coll = await Conn.gettype(f'{Pkg}.UDT_NUMLIST')
+                self.assertTrue(Coll.is_collection)
+                self.assertEqual(Coll.package_name, Pkg)
+                Rec = await Conn.gettype(f'{Coll.schema}.{Pkg}.UDT_REC')
+                self.assertEqual(Rec.attr_names, ['ID', 'NAME'])
+                if not os.environ.get('SEERDB_TEST_MIRROR'):
+                    Obj = Coll.newobject()
+                    await Cur.callproc(f'{Pkg}.fill', (3, Obj))
+                    self.assertEqual([int(v) for v in Obj.aslist()], [100, 200, 300])
+            finally:
+                try:
+                    await Cur.execute(f'DROP PACKAGE {Pkg}')
+                except seerdb.DatabaseError:
+                    pass
+        finally:
+            await Conn.close()
 
     async def test_a_bare_object_out_bind_takes_its_value(self):
         # Async twin of ObjectOutBindIntegration (#1029): an object handed to
