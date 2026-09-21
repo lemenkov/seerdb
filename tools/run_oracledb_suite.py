@@ -93,6 +93,17 @@ for _test, _reason in (
     ('test_6300_cursor_other_async.py::test_6315', 'v$mystat round-trip count'),
     ('test_6300_cursor_other_async.py::test_6316', 'v$mystat round-trip count'),
     ('test_6300_cursor_other_async.py::test_6322', 'v$mystat parse count'),
+    # The same thing through the suite's own `round_trip_checker` fixture, which
+    # reads the counter before and after and asserts the difference.
+    ('test_1300_cursor_var.py::test_1306', 'round-trip count around a REF cursor'),
+    (
+        'test_5800_cursor_var_async.py::test_5806',
+        'round-trip count around a REF cursor',
+    ),
+    (
+        'test_7000_connection_async_shortcut_methods.py::test_7002',
+        'round-trip count around fetchall(arraysize)',
+    ),
     # Same root cause: the count comes from v$temporary_lobs for the session id
     # the CLIENT sees, which is the upstream session the Mirror shares with its
     # own temp-LOB bookkeeping.
