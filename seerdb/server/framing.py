@@ -29,8 +29,20 @@ import socket
 import struct
 from typing import TYPE_CHECKING
 
-from seerdb.common.tns import encode_ano_fragment, encode_data_packet, encode_packet
-from seerdb.common.tns_consts import DEFAULT_SDU, TNS_DATA, TNS_DATA_FLAGS_MORE
+from seerdb.common.tns import (
+    encode_ano_fragment,
+    encode_data_packet,
+    encode_packet,
+    encode_sb4,
+)
+from seerdb.common.tns_consts import (
+    DEFAULT_SDU,
+    TNS_DATA,
+    TNS_DATA_FLAGS_END_OF_RESPONSE,
+    TNS_DATA_FLAGS_MORE,
+    TTI_END_OF_RESPONSE,
+    TTI_TOKEN,
+)
 
 if TYPE_CHECKING:
     from seerdb.common.ano_session import AnoChannel
@@ -63,6 +75,20 @@ class PacketStream:
         # negotiation selects a cipher; each TNS_DATA fragment is then decrypted
         # on read and encrypted on write. None means plaintext framing.
         self._ano: AnoChannel | None = None
+        # End-of-response framing (#155/#132/#1059). Set once the client has
+        # opted in through its compile caps; until then every reply is framed
+        # the old way, because a client that did not ask will not skip the
+        # marker and desyncs on it.
+        self.end_of_response = False
+        # The data flags of the packet last read. A pipelined burst is marked
+        # ONLY there (BEGIN_PIPELINE / END_OF_REQUEST), so a session cannot
+        # tell one from an ordinary call without them.
+        self.last_data_flags = 0
+        # The correlation token of the pipelined call being answered, or None.
+        # A pipelined response opens with TTI_TOKEN and the token the client put
+        # in that call's header, which is how the client matches the N responses
+        # of a burst back to its N calls (#1059). Consumed by the next DATA write.
+        self.response_token: int | None = None
 
     def activate_ano(self, channel: AnoChannel) -> None:
         """Turn on per-packet encryption + MAC for every subsequent DATA packet
@@ -131,6 +157,11 @@ class PacketStream:
             self._acc = self._acc[size:]
             if packet_type == TNS_DATA:
                 (data_flags,) = _DATA_FLAGS.unpack(packet[8:10])
+                # Kept for the caller: a pipelined burst is marked in these
+                # flags (BEGIN_PIPELINE / END_OF_REQUEST) and nowhere else, so
+                # a session cannot tell one from an ordinary call without them
+                # (#1059).
+                self.last_data_flags = data_flags
                 fragment = packet[10:size]
                 # Each DATA fragment is an independent encrypt+MAC unit (#448),
                 # so decrypt before concatenating the plaintext.
@@ -159,6 +190,19 @@ class PacketStream:
         (handshake replies) are small and go out whole.
         """
         if packet_type == TNS_DATA:
+            if self.response_token is not None:
+                # Captured from 23ai: `21 01 01 <body> 1d` for the first call of a
+                # burst, `21 01 02 ...` for the second -- the marker, the token as
+                # a ub4, then the ordinary reply. One response carries it, so it
+                # is spent on the write that uses it.
+                body = bytes([TTI_TOKEN]) + encode_sb4(self.response_token) + body
+                self.response_token = None
+            if self.end_of_response:
+                # Once the capability is negotiated the client expects EVERY
+                # response to end with this marker, not only a pipelined one --
+                # it reads until the token and would otherwise wait for a
+                # response that has already arrived (#1059).
+                body = body + bytes([TTI_END_OF_RESPONSE])
             if self._ano is not None and self._ano.active:
                 self._write_data_ano(body)
             else:
@@ -189,7 +233,8 @@ class PacketStream:
                 encode_data_packet(data[:alt_body], TNS_DATA_FLAGS_MORE, self.large)
             )
             data = data[alt_body:]
-        self._sock.sendall(encode_data_packet(data, 0x0000, self.large))
+        final_flags = TNS_DATA_FLAGS_END_OF_RESPONSE if self.end_of_response else 0x0000
+        self._sock.sendall(encode_data_packet(data, final_flags, self.large))
 
     def _write_data_ano(self, body: bytes) -> None:
         # Encrypted DATA fragmentation (#448) — shared with the client's
@@ -217,9 +262,14 @@ class PacketStream:
             # callers build these with the legacy header, which is byte-identical
             # to what _write_data emits for a small packet on a legacy stream —
             # so this only changes what goes out when the stream is not legacy.
+            body = packet[10:]
+            if self.end_of_response:
+                # The pre-framed handshake replies need the marker too: a live
+                # server puts it on the PRO answer, the first DATA reply (#1059).
+                body = body + bytes([TTI_END_OF_RESPONSE])
             if self._ano is not None and self._ano.active:
-                self._write_data_ano(packet[10:])
+                self._write_data_ano(body)
             else:
-                self._write_data(packet[10:])
+                self._write_data(body)
             return
         self._sock.sendall(packet)
