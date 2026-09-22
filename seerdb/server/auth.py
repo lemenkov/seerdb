@@ -542,6 +542,10 @@ def parse_auth_app_context(
 _CONNECT_ATTR_KEYS = {
     b'SESSION_CLIENT_DRIVER_NAME': 'driver_name',
     b'AUTH_ORA_EDITION': 'edition',
+    # A proxy login: the user the authenticating user connects on behalf of
+    # (`user[proxy]`). The session belongs to THIS user, so a backend that opens
+    # its own upstream session has to open it as a proxy session too (#1093).
+    b'PROXY_CLIENT_NAME': 'proxy_client_name',
 }
 
 
