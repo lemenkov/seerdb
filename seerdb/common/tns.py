@@ -10760,6 +10760,45 @@ def decode_fv2_block_out(Data: bytes, NumOut: int) -> tuple[list, int, int]:
     return (OutValues, RowCount, ErrCode)
 
 
+# The part of a CREATE_TEMP body every LOB type shares (#91, #1066).
+_CREATE_TEMP_HEAD = bytes.fromhex('01012800010a00000100010201100000')
+
+
+def _create_temp_body(is_blob: bool, csfrm: int = _CSFRM_DB) -> bytes:
+    """A CREATE_TEMP body for a CLOB, NCLOB or BLOB (#1066).
+
+    Captured from python-oracledb against a live 23ai (``createlob`` of each
+    type) and diffed. After a shared head the three differ in exactly two places:
+
+    ======  =================  ==============================
+    type    charset form       trailing charset id (sb4)
+    ======  =================  ==============================
+    CLOB    ``01 01``          873 (AL32UTF8)
+    NCLOB   ``01 02``          **2000 (AL16UTF16)**
+    BLOB    ``00`` (none)      873
+    ======  =================  ==============================
+
+    The trailing field is the CHARSET, not a constant: this used to be two
+    captured blobs ending in a fixed ``0x0369``, which is only right because
+    nobody had created an NCLOB. Note the NCLOB's bind OAC does NOT follow it --
+    that keeps charset 873 and differs only in its form (_encode_lob_bind_oac).
+    Between them sit the LOB-type field (``01 70`` / ``01 71``) and 47 zero
+    bytes, which are the same for all three."""
+    if is_blob:
+        form, lob_type, charset = b'\x00', TNS_TYPE_BLOB, AL32UTF8_CHARSET
+    elif csfrm == _CSFRM_NCHAR:
+        form, lob_type, charset = b'\x01\x02', TNS_TYPE_CLOB, AL16UTF16_CHARSET
+    else:
+        form, lob_type, charset = b'\x01\x01', TNS_TYPE_CLOB, AL32UTF8_CHARSET
+    return (
+        _CREATE_TEMP_HEAD
+        + form
+        + bytes([0x01, lob_type])
+        + bytes(47)
+        + encode_sb4(charset)
+    )
+
+
 def encode_dictionary_lobops(Dictionary: dict) -> bytes:
     # TTI_LOBOPS request. See docs/PROTOCOL.md §14 for the field layout.
     # This builds a READ request specifically (operation = 0x0002) since
@@ -10770,24 +10809,11 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
     LobHead = _fun_header(TTI_LOBOPS, Tseq, FieldVersion)
     if Dictionary.get('create_temp'):
         # CREATE_TEMP (op 0x0110, #91): allocate a session-duration temporary
-        # LOB; the server returns the new locator in the response RPA. The body
-        # is fixed (no source locator), captured verbatim from python-oracledb
-        # on 21c — it differs between CLOB (type 0x70) and BLOB (type 0x71) in
-        # the type-spec bytes, and both forms still end with the trailing sb4
-        # 0x0369. 12c+ only; 11g rejects CREATE_TEMP.
-        if Dictionary.get('is_blob'):
-            Body = (
-                bytes.fromhex('01012800010a00000100010201100000000171')
-                + bytes(47)
-                + bytes.fromhex('020369')
-            )
-        else:
-            Body = (
-                bytes.fromhex('01012800010a0000010001020110000001010170')
-                + bytes(47)
-                + bytes.fromhex('020369')
-            )
-        return LobHead + Body
+        # LOB; the server returns the new locator in the response RPA. 12c+ only;
+        # 11g rejects CREATE_TEMP. See _create_temp_body for the field layout.
+        return LobHead + _create_temp_body(
+            bool(Dictionary.get('is_blob')), Dictionary.get('csfrm', _CSFRM_DB)
+        )
     if Dictionary.get('operation') == TNS_LOB_OP_WRITE:
         # WRITE (op 0x0040, #91): push `data` into the LOB at `source_offset`.
         # Reverse-engineered from python-oracledb on 21c (small + 60 KB CLOB
@@ -12245,7 +12271,7 @@ _JSON_BIND_OAC = _encode_native_lob_oac(TNS_TYPE_JSON, 0x02000000)  # 32 MiB
 _VECTOR_BIND_OAC = _encode_native_lob_oac(TNS_TYPE_VECTOR, 0x00100000)  # 1 MiB
 
 
-def _encode_lob_bind_oac(is_blob: bool) -> bytes:
+def _encode_lob_bind_oac(is_blob: bool, csfrm: int = _CSFRM_DB) -> bytes:
     """The CLOB / BLOB bind OAC: type 0x70 / 0x71 with the LOB cont-flag
     0x02000000 (the flag the native VECTOR / JSON OACs set too). Built explicitly
     because encode_token_raw zeroes the cont-flag.
@@ -12257,7 +12283,12 @@ def _encode_lob_bind_oac(is_blob: bool) -> bytes:
     (ORA-03120, two-task integer overflow), which is why a declared CLOB / BLOB
     bind had no encoder until now (#902). The same OAC serves a temp-LOB locator
     bind (#91) and a declared CLOB / BLOB Var (#902); a Var's IN value is promoted
-    to a temp LOB before it reaches the wire, so only its type matters here."""
+    to a temp LOB before it reaches the wire, so only its type matters here.
+
+    An NCLOB is the CLOB OAC with charset form 2, and nothing else changes -- its
+    charset id stays 873, measured against a live 23ai (#1066). That is NOT what
+    its CREATE_TEMP does, which carries 2000 (_create_temp_body); the two were
+    each captured, not inferred from the other."""
     return (
         bytes([TNS_TYPE_BLOB if is_blob else TNS_TYPE_CLOB, 1, 0, 0])
         + encode_sb4(_LOB_BIND_BUFFER_SIZE)  # max data length (fixed, not value)
@@ -12266,7 +12297,7 @@ def _encode_lob_bind_oac(is_blob: bool) -> bytes:
         + encode_sb4(0)  # OID
         + encode_sb4(0)  # version
         + encode_sb4(0 if is_blob else AL32UTF8_CHARSET)  # charset id (ub2)
-        + bytes([0 if is_blob else 1])  # character set form
+        + bytes([0 if is_blob else csfrm])  # character set form
         + encode_sb4(0)  # LOB prefetch length
         + encode_sb4(0)  # oaccolid (12.2+)
     )
@@ -12427,7 +12458,7 @@ def encode_token_oac(Token: object) -> bytes:
         # for a non-empty LOB (any non-zero length does) but bound an **empty**
         # temp LOB as NULL -- ORA-01400 on a NOT NULL column, and a silent NULL
         # otherwise (#903).
-        return _encode_lob_bind_oac(Token.is_blob)
+        return _encode_lob_bind_oac(Token.is_blob, getattr(Token, 'csfrm', _CSFRM_DB))
     if Token is None:
         # NULL value (0 bytes): a minimal VARCHAR OAC, again avoiding the
         # 32767 LONG-reorder swap when a NULL bind precedes another bind.

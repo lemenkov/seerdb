@@ -67,9 +67,26 @@ def _check_read_range(offset: int, amount: int | None) -> None:
 
 
 class LOB:
-    __slots__ = ('data_type', 'raw', '_connection', '_prefetched', '_is_open')
+    __slots__ = (
+        'data_type',
+        'raw',
+        '_connection',
+        '_prefetched',
+        '_is_open',
+        '_temp',
+        '_csfrm',
+    )
 
-    def __init__(self, data_type: int, raw: bytes, connection=None, prefetched=None):
+    def __init__(
+        self,
+        data_type: int,
+        raw: bytes,
+        connection=None,
+        prefetched=None,
+        *,
+        temp: bool = False,
+        csfrm: int = 1,
+    ):
         # `data_type` is the column's TNS data type code (112 CLOB, 113 BLOB,
         # 114 BFILE; NCLOB shares 112 + a national charset form). `raw` is
         # the locator block from RXD — same bytes go back to the server for
@@ -88,6 +105,16 @@ class LOB:
         # server owns the real state -- a second open answers ORA-22293 and a
         # second close ORA-22289 -- so this only reports what we did.
         self._is_open = False
+        # A temp LOB this client made (connection.createlob, #1066) rather than
+        # one a query returned. Only a temp LOB can be bound back as it stands:
+        # it binds as the temp-LOB locator bind, captured byte for byte against
+        # python-oracledb. Its `raw` is the locator INCLUDING the ub2 the
+        # CREATE_TEMP reply framed it in -- the form every LOBOPS call on it
+        # expects (lobops-locator rule, PROTOCOL.md 14.4d).
+        self._temp = temp
+        # The charset form: 2 for an NCLOB, 1 for a CLOB, meaningless for a
+        # BLOB. An NCLOB is a CLOB (type 112) that differs only here.
+        self._csfrm = csfrm
 
     @property
     def is_binary(self) -> bool:

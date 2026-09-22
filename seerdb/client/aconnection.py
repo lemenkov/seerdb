@@ -1645,13 +1645,36 @@ class AsyncOracleConnect(_ConnectionLogic):
         Typ = await self._describe_object_type(schema, name)
         return Typ.attrs if Typ is not None else []
 
-    async def create_temp_lob(self, is_blob: bool = False) -> bytes:
+    async def createlob(self, lob_type, data=None):
+        """Async port of the sync ``createlob`` (#1066): a new temporary LOB of
+        ``lob_type``, optionally holding ``data``. 12.1+ only."""
+        import struct
+
+        from seerdb.common.lob import LOB
+        from seerdb.common.tns_consts import TNS_TYPE_BLOB
+
+        (tns_type, csfrm) = self._createlob_form(lob_type)
+        locator = await self.create_temp_lob(tns_type == TNS_TYPE_BLOB, csfrm=csfrm)
+        lob = LOB(
+            tns_type,
+            struct.pack('>H', len(locator)) + locator,
+            connection=self,
+            temp=True,
+            csfrm=csfrm,
+        )
+        if data is not None:
+            await lob.awrite(data)
+        return lob
+
+    async def create_temp_lob(self, is_blob: bool = False, *, csfrm: int = 1) -> bytes:
         """Async port of the sync `create_temp_lob` (#91). Allocates a
         session-duration temporary LOB and returns its locator. 12c+ only."""
         from seerdb.common.tns_consts import TTI_RPA
 
         Data = encode_dictionary(
-            self._make_dict(DictionaryType.lobops, create_temp=True, is_blob=is_blob)
+            self._make_dict(
+                DictionaryType.lobops, create_temp=True, is_blob=is_blob, csfrm=csfrm
+            )
         )
         await self.send(TNS_DATA, Data)
         Received = await self._next_data_packet(b'', b'')

@@ -112,6 +112,32 @@ class _ConnectionLogic:
 
         def _send_break(self) -> None: ...
 
+    # --- Temporary LOBs (#1066) ----------------------------------------------
+
+    def _createlob_form(self, lob_type) -> tuple[int, int]:
+        """The (TNS type, charset form) a ``createlob(lob_type)`` builds, after
+        checking the server can make one at all. Shared by the sync and async
+        ``createlob`` so the two cannot disagree about what is allowed.
+
+        CLOB, NCLOB and BLOB only -- the three a temp LOB can be. An NCLOB is a
+        CLOB (type 112) with charset form 2, so the form has to come from the
+        requested type: taking the TNS type alone would quietly make a CLOB."""
+        from seerdb.common.tns_consts import TNS_TYPE_BLOB, TNS_TYPE_CLOB
+
+        tns_type = getattr(lob_type, 'tns_type', None)
+        if tns_type not in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
+            raise ProgrammingError(
+                f'createlob() needs DB_TYPE_CLOB, DB_TYPE_NCLOB or DB_TYPE_BLOB, '
+                f'not {lob_type!r}'
+            )
+        if self.field_version < FIELD_VERSION_12_1:
+            # The temp LOB it sits on is a CREATE_TEMP, which 11g refuses (#91).
+            raise NotSupportedError(
+                'createlob() requires an Oracle 12.1+ server (it makes a server '
+                'temporary LOB, which older servers refuse)'
+            )
+        return (tns_type, lob_type.csfrm)
+
     # --- End-to-end tracing attributes (#183/#184) -------------------------
 
     def _set_e2e(self, name: str, value) -> None:

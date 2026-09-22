@@ -2122,6 +2122,64 @@ class TempLobBindIntegration(_IntegrationBase):
             )
             self.assertEqual(r.getvalue(), n)
 
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class CreateLobIntegration(_IntegrationBase):
+    """``connection.createlob()``: a temp LOB the caller makes and binds (#1066).
+
+    12c+ only, like every temp LOB: 11g refuses CREATE_TEMP (#91).
+    """
+
+    def setUp(self):
+        super().setUp()
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('createlob() needs a 12c+ server (CREATE_TEMP)')
+
+    def test_each_lob_type_round_trips_through_a_bind(self):
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (id NUMBER, c CLOB, n NCLOB, b BLOB)'
+        )
+        Text = 'createlob \u3042\u4e2d ' * 3000  # past the inline limit
+        Data = bytes(range(256)) * 200
+        Clob = self.conn.createlob(seerdb.DB_TYPE_CLOB, Text)
+        Nclob = self.conn.createlob(seerdb.DB_TYPE_NCLOB)
+        Nclob.write(Text)
+        Blob = self.conn.createlob(seerdb.DB_TYPE_BLOB, Data)
+        self.assertEqual(
+            (Clob.size(), Nclob.size(), Blob.size()), (len(Text),) * 2 + (len(Data),)
+        )
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (1, :1, :2, :3)', [Clob, Nclob, Blob]
+        )
+        # The server holds each as the type asked for, not all as a CLOB.
+        self.cur.execute(
+            f'SELECT c, n, b, DBMS_LOB.GETLENGTH(n) FROM {self.TABLE} WHERE id = 1'
+        )
+        (c, n, b, n_len) = self.cur.fetchone()
+        self.assertEqual((c.read(), n.read(), b.read()), (Text, Text, Data))
+        self.assertEqual(n_len, len(Text))
+
+    def test_a_large_clob_into_xmltype(self):
+        # What the method is for: sys.xmltype() needs a genuine LOB argument,
+        # and refuses the same 32 KB as a plain string with ORA-01461.
+        self._skip_if_mirror_backend('postgres', 'build an XMLType')
+        Xml = '<data>' + 'x' * 32768 + '</data>'
+        self.cur.execute(
+            'SELECT XMLSERIALIZE(CONTENT sys.xmltype(:1) AS CLOB) FROM dual',
+            [self.conn.createlob(seerdb.DB_TYPE_CLOB, Xml)],
+        )
+        Out = self.cur.fetchone()[0]
+        self.assertEqual(Out.read() if hasattr(Out, 'read') else Out, Xml)
+
+    def test_an_empty_temp_lob_is_not_null(self):
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, c CLOB NOT NULL)')
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (1, :1)',
+            [self.conn.createlob(seerdb.DB_TYPE_CLOB)],
+        )
+        self.cur.execute(f'SELECT DBMS_LOB.GETLENGTH(c) FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone()[0], 0)
+
     def test_empty_temp_lob_binds_non_null(self):
         # An empty temp LOB (CREATE_TEMP, no WRITE) is a zero-length, non-NULL
         # LOB, not a NULL bind. The bind OAC announces a fixed LOB buffer size,
@@ -5067,6 +5125,21 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
         await Conn.close()
         if Fv < FIELD_VERSION_10_2:
             self.skipTest(Reason)
+
+    async def test_createlob_binds_as_a_lob(self):
+        # Async twin of CreateLobIntegration (#1066).
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            if Conn.field_version < FIELD_VERSION_12_1:
+                self.skipTest('createlob() needs a 12c+ server (CREATE_TEMP)')
+            Cur = Conn.cursor()
+            Text = 'async createlob \u3042 ' * 3000
+            Nclob = await Conn.createlob(seerdb.DB_TYPE_NCLOB, Text)
+            self.assertEqual(await Nclob.asize(), len(Text))
+            await Cur.execute('SELECT DBMS_LOB.GETLENGTH(:1) FROM dual', [Nclob])
+            self.assertEqual(await Cur.fetchone(), (len(Text),))
+        finally:
+            await Conn.close()
 
     async def test_select_into_with_no_rows_raises(self):
         # Async twin of the ORA-01403 tests (#1039).

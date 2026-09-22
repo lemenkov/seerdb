@@ -3138,10 +3138,22 @@ form by default and opts into the prefix per call (`locator_prefixed`).
 | `0x10000` | CLOSE             | Close                                |
 | `0x11000` | IS_OPEN           | Is the LOB open? (§14.4c)            |
 
-**CREATE_TEMP body** (no source locator): a fixed field block captured verbatim
-from python-oracledb on 21c, differing between CLOB (type `0x70`) and BLOB
-(type `0x71`) in the type-spec bytes and both ending with the trailing
-`sb4 0x0369`. The server returns the new locator in the response RPA.
+**CREATE_TEMP body** (no source locator): a field block captured from
+python-oracledb (21c, then all three kinds on 23ai, #1066). It is a fixed
+16-byte head, then the kind, then 47 zero bytes, then the charset as an `sb4`:
+
+```
+01 01 28 00 01 0a 00 00 01 00 01 02 01 10 00 00   # fixed head
+<form>                                            # CLOB 01 01, NCLOB 01 02, BLOB 00
+01 <type>                                         # 70 CLOB / NCLOB, 71 BLOB
+00 x 47
+<sb4 charset>                                     # 02 03 69 (873) CLOB and BLOB,
+                                                  # 02 07 d0 (2000) NCLOB
+```
+
+An NCLOB is a CLOB (type `0x70`) told apart only by the form byte and the
+**national** charset: sending the CLOB body for it makes a CLOB. The server
+returns the new locator in the response RPA.
 
 **WRITE payload.** After the locator the request appends a `0x0E` marker then a
 chunked-bytes field: when the data is `<= 0xFC` bytes, a `ub1` length + the
@@ -3277,6 +3289,9 @@ conversion"). seerdb handles it the way python-oracledb does, on 12c+:
    "no LOB" and binds NULL, so an **empty** temp LOB announced with length 0 was
    stored NULL — `ORA-01400` on a NOT NULL column (#903). A non-zero value size
    happened to work, which hid it. seerdb now always announces 112.
+   An **NCLOB** temp LOB binds with the CLOB OAC and charset form `02` in place
+   of `01`; the charset field stays 873, as python-oracledb sends it:
+   `70 01 00 00 01 70 00 04 02 00 00 00 00 00 02 03 69 02 00 00`.
 4. `execute`. No `FREE_TEMP` — the temp LOB is released at session end.
 
 `Cursor.execute` / `AsyncCursor.execute` do this transparently: a PL/SQL block
@@ -3286,6 +3301,15 @@ streamed-LONG path. **11g is excluded** — it rejects `CREATE_TEMP` outright
 (immediate FIN, no error packet), there is no thin reference to crack it
 against, and a large PL/SQL LOB bind there keeps its prior ORA-01460 behaviour;
 the feature is gated on `field_version >= 12.1`.
+
+`Connection.createlob(lob_type, data=None)` / `AsyncConnection.createlob`
+(#1066) hand this temp LOB to the caller as a `LOB` object for
+`DB_TYPE_CLOB` / `DB_TYPE_NCLOB` / `DB_TYPE_BLOB`. The object holds the locator
+**with** the `ub2` it came framed in from the CREATE_TEMP reply, which is the
+form every later LOBOPS call on it expects (without it the server answers
+ORA-22275). Bound as a parameter it becomes the `TempLob` marker above, which
+takes the bare locator and writes its own `ub2`. A `LOB` that a query returned
+is not rebound this way; its bind has not been measured. Also 12.1+ only.
 
 A bind **declared** a CLOB / BLOB — `cursor.var(DB_TYPE_CLOB)` or
 `setinputsizes(DB_TYPE_BLOB)` — promotes the same way, on any statement and any

@@ -2264,7 +2264,37 @@ class OracleConnect(_ConnectionLogic):
         Typ = self._describe_object_type(schema, name)
         return Typ.attrs if Typ is not None else []
 
-    def create_temp_lob(self, is_blob: bool = False) -> bytes:
+    def createlob(self, lob_type, data=None):
+        """A new temporary LOB of ``lob_type``, optionally holding ``data`` (#1066).
+
+        ``lob_type`` is ``DB_TYPE_CLOB``, ``DB_TYPE_NCLOB`` or ``DB_TYPE_BLOB``,
+        as in python-oracledb. The LOB lives on the server for the session and
+        can be written, read, trimmed and bound as a parameter -- which is the
+        point: a statement that needs a genuine LOB argument (a large value into
+        ``sys.xmltype()``, say) cannot take the same data as a plain string, the
+        server refuses it (ORA-01461). 12.1+ only."""
+        import struct
+
+        from seerdb.common.lob import LOB
+        from seerdb.common.tns_consts import TNS_TYPE_BLOB
+
+        (tns_type, csfrm) = self._createlob_form(lob_type)
+        locator = self.create_temp_lob(tns_type == TNS_TYPE_BLOB, csfrm=csfrm)
+        # Kept WITH the ub2 the CREATE_TEMP reply framed it in: that is the form
+        # every later LOBOPS call on it expects. Without it the server answers
+        # ORA-22275 "invalid LOB locator" (PROTOCOL.md 14.4d).
+        lob = LOB(
+            tns_type,
+            struct.pack('>H', len(locator)) + locator,
+            connection=self,
+            temp=True,
+            csfrm=csfrm,
+        )
+        if data is not None:
+            lob.write(data)
+        return lob
+
+    def create_temp_lob(self, is_blob: bool = False, *, csfrm: int = 1) -> bytes:
         # Create a session-duration temporary LOB on the server (TTI_LOBOPS
         # CREATE_TEMP, #91) and return its locator. Used to bind a large LOB
         # value into a PL/SQL locator parameter, where the streamed-LONG bind
@@ -2274,7 +2304,9 @@ class OracleConnect(_ConnectionLogic):
         from seerdb.common.tns_consts import TTI_RPA
 
         Data = encode_dictionary(
-            self._make_dict(DictionaryType.lobops, create_temp=True, is_blob=is_blob)
+            self._make_dict(
+                DictionaryType.lobops, create_temp=True, is_blob=is_blob, csfrm=csfrm
+            )
         )
         self.send(TNS_DATA, Data)
         Received = self._next_data_packet(b'', b'')
