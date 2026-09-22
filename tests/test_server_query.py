@@ -479,6 +479,37 @@ def test_a_json_column_defined_as_text_is_served_as_oracle_renders_it() -> None:
     assert inline != _thin_column_value(document, col)
 
 
+def test_a_plsql_reply_reports_the_directions_the_server_gave() -> None:
+    # The Mirror used to mark every bind of a PL/SQL block OUT and return each
+    # value, because the wire carries no direction on the way in. A backend that
+    # asked a real server knows better, and an IN bind then carries NO value --
+    # which matters most for a LONG-declared bind, whose echoed value the client
+    # cannot read in that position (#1064).
+    from seerdb.common.tns import ScalarOutBind, encode_out_bind_response_thin
+    from seerdb.common.tns_consts import (
+        TNS_BIND_DIR_INPUT,
+        TNS_BIND_DIR_OUTPUT,
+        TNS_TYPE_VARCHAR,
+    )
+
+    binds: list = [
+        ScalarOutBind(value='in-value', tns_type=TNS_TYPE_VARCHAR, csfrm=1),
+        ScalarOutBind(value='out-value', tns_type=TNS_TYPE_VARCHAR, csfrm=1),
+    ]
+    told = encode_out_bind_response_thin(
+        binds, (TNS_BIND_DIR_INPUT, TNS_BIND_DIR_OUTPUT)
+    )
+    assert bytes([TNS_BIND_DIR_INPUT, TNS_BIND_DIR_OUTPUT]) in told
+    assert b'out-value' in told
+    assert b'in-value' not in told  # an IN bind carries no value back
+
+    # Without directions every bind is still reported OUT and returns its value,
+    # which is what a backend that cannot know keeps doing.
+    untold = encode_out_bind_response_thin(binds)
+    assert bytes([TNS_BIND_DIR_OUTPUT, TNS_BIND_DIR_OUTPUT]) in untold
+    assert b'in-value' in untold and b'out-value' in untold
+
+
 def test_a_vector_defined_as_text_is_served_as_oracle_renders_it() -> None:
     # A client whose output type handler asks for a VECTOR column as character
     # data gets the TEXT form inline, not the binary image (#1107). The expected

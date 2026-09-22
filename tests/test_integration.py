@@ -2324,6 +2324,44 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class BindDirectionIntegration(_IntegrationBase):
+    """``cursor.bind_directions``: what the server said each bind was (#1064)."""
+
+    def setUp(self):
+        super().setUp()
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            self.skipTest('the fv2 block reply carries no IOV directions')
+        # Only a backend with a real server behind it can know the directions;
+        # one that cannot reports every bind OUT, which is the documented
+        # fallback rather than a gap (#1064).
+        self._skip_if_mirror_backend('postgres', "know a block's bind directions")
+
+    def test_a_block_reports_its_bind_directions(self):
+        # The wire carries no direction on the way in, so the reply is the only
+        # place this can be learned. The Mirror's passthrough forwards these so
+        # its own client is told the truth rather than "every bind is OUT".
+        Out = self.cur.var(str)
+        self.cur.execute(
+            "begin :result := 'got ' || :given; end;",
+            {'result': Out, 'given': 'a value'},
+        )
+        self.assertEqual(Out.getvalue(), 'got a value')
+        self.assertEqual(self.cur.bind_directions, [16, 32])  # OUT, IN
+
+    def test_a_block_whose_binds_are_all_in_reports_them_too(self):
+        self.cur.execute('CREATE TABLE ' + self.TABLE + ' (n NUMBER)')
+        self.cur.execute(
+            f'begin insert into {self.TABLE} values (:only); end;', {'only': 7}
+        )
+        self.assertEqual(self.cur.bind_directions, [32])  # IN
+
+    def test_a_query_reports_none(self):
+        self.cur.execute('SELECT 1 FROM dual')
+        self.cur.fetchall()
+        self.assertIsNone(self.cur.bind_directions)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class TempLobBindIntegration(_IntegrationBase):
     """Large CLOB / BLOB into a PL/SQL locator param (#91).
 

@@ -16,6 +16,7 @@ from seerdb.client.cursor import (
     _col_annotations,
     _column_description,
     _extract_implicit_results,
+    _iov_directions,
     _out_bind_lobs,
     _resolve_parameters,
     _return_bind_lobs,
@@ -292,6 +293,7 @@ class AsyncCursor(_CursorLogic):
 
         # PL/SQL OUT / IN OUT binds: scalars are assigned here; REF CURSOR OUT
         # binds are fetched (async) and wrapped in a nested AsyncCursor.
+        self._bind_directions = _iov_directions(Result)
         for Variable, Marker in _assign_out_binds(Bind, Result):
             Rows = await self._connection.fetch_all_rows(
                 Marker['cursor_id'], Marker['row_format']

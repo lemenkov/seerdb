@@ -358,6 +358,7 @@ class Cursor(_CursorLogic):
 
         # PL/SQL OUT / IN OUT binds: write returned values back into any Var
         # objects the caller passed. REF CURSOR OUT binds are fetched here.
+        self._bind_directions = _iov_directions(Result)
         for Variable, Marker in _assign_out_binds(Bind, Result):
             Rows = self._connection.fetch_all_rows(
                 Marker['cursor_id'], Marker['row_format']
@@ -789,6 +790,17 @@ def _update_object_in_place(Target, Image) -> None:
     Attrs = object.__getattribute__(Target, '_attrs')
     for Name in object.__getattribute__(Decoded, '_order'):
         Attrs[Name] = object.__getattribute__(Decoded, '_attrs')[Name]
+
+
+def _iov_directions(Result) -> list[int] | None:
+    # The directions the IOV carried, if this reply was a PL/SQL block's (#1064).
+    if not isinstance(Result, tuple) or len(Result) < 5:
+        return None
+    Rows = Result[4]
+    if not Rows or not isinstance(Rows[0], dict):
+        return None
+    directions = Rows[0].get('directions')
+    return list(directions) if directions else None
 
 
 def _assign_out_binds(Bind, Result) -> list:

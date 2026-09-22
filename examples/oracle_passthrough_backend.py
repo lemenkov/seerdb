@@ -843,7 +843,12 @@ class OraclePassthroughBackend:
                 if hasattr(v, 'getvalue')
                 else (v if isinstance(v, DbObject) else None)
                 for v in variables
-            ]
+            ],
+            # What the upstream server said each bind was. Only it knows -- the
+            # wire carries no direction on the way in -- so relaying this is the
+            # difference between telling the client the truth and marking every
+            # bind OUT (#1064).
+            bind_directions=tuple(getattr(cursor, 'bind_directions', None) or ()),
         )
 
     def sessionless_begin(self, transaction_id: bytes, timeout: int) -> None:

@@ -3073,14 +3073,18 @@ def encode_refcursor_column_value(columns: list[ColumnMeta], cursor_id: int) -> 
 
 def encode_out_bind_response_thin(
     out_binds: list[ScalarOutBind | ArrayOutBind | RefCursorOutBind],
+    directions: Sequence[int] = (),
 ) -> bytes:
     """The thin reply returning a PL/SQL block's OUT bind values (#483): a
     TTI_IOV vector + a TTI_RXD row of the values + a success OER.
 
-    ``out_binds`` is one entry per bind, in bind order — the Mirror can't tell IN
-    from OUT (the wire has no direction), so it marks them all OUT and returns
-    each value; the client keeps only the positions it bound as a ``Var``
-    (``_assign_out_binds``). A scalar rides as a DALC + ub4 return code; a REF
+    ``out_binds`` is one entry per bind, in bind order. ``directions`` is what the
+    server reported for each (16 OUT, 32 IN, 48 IN OUT), which a backend can only
+    know by asking one -- the wire carries no direction on the way in. Given
+    them, an IN bind is reported IN and carries NO value, as a real server does;
+    without them every bind is marked OUT and returns its value, which is what
+    the Mirror did for every block before (#1064). The client keeps only the
+    positions it bound as a ``Var`` (``_assign_out_binds``). A scalar rides as a DALC + ub4 return code; a REF
     CURSOR rides as its inline describe + cursor id. The IOV header mirrors what
     ``_read_iov`` decodes: a flag, the bind count (num_requests + num_iters*256),
     the zeroed iter / buffer / bit-vector / rowid fields, then a direction byte
@@ -3095,10 +3099,17 @@ def encode_out_bind_response_thin(
         + encode_sb4(0)  # uac buffer length
         + encode_sb4(0)  # fast-fetch bit vector length
         + encode_sb4(0)  # rowid length
-        + bytes([TNS_BIND_DIR_OUTPUT]) * count  # direction per bind
+        + bytes(
+            directions[i] if i < len(directions) else TNS_BIND_DIR_OUTPUT
+            for i in range(count)
+        )  # direction per bind
     )
     rxd = bytearray([TTI_RXD])
-    for bind in out_binds:
+    for i, bind in enumerate(out_binds):
+        if i < len(directions) and directions[i] == TNS_BIND_DIR_INPUT:
+            # An IN bind carries no value back, which is why its direction has
+            # to be right: a value here is read as the NEXT bind's (#1064).
+            continue
         if isinstance(bind, RefCursorOutBind):
             rxd += _encode_refcursor_out(bind)
         elif isinstance(bind, ArrayOutBind):
@@ -3837,7 +3848,12 @@ def decode_token_iov(Data: bytes, Acc: tuple) -> tuple:
     Binds = Acc[3] if len(Acc) > 3 else None
     (Directions, OutValues, Rest) = _read_iov(Data, Binds)
     OutPositions = [I for I, D in enumerate(Directions) if D != TNS_BIND_DIR_INPUT]
-    if OutPositions:
+    # Recorded whenever the IOV carried directions at all, not only when some
+    # bind is OUT: a block whose binds are ALL IN still reports them, and that is
+    # the only place a caller can learn what the server decided (#1064). Every
+    # consumer keys on the record's presence and tolerates an empty position
+    # list, and a block's reply carries no rows for this to be mistaken for.
+    if Directions:
         Rows = Rows + [
             {
                 'out_positions': OutPositions,

@@ -78,6 +78,13 @@ class _CursorLogic:
         self._rowcount: int = -1
         self._closed: bool = False
         self._lastrowid: str | None = None
+        # The bind directions the last PL/SQL execute's IOV reported, one per
+        # bind (16 OUT, 32 IN, 48 IN OUT), or None when the last statement was
+        # not a block. The wire carries no direction on the way IN, so this is
+        # the only place a caller can learn what the server decided -- which the
+        # Mirror's passthrough forwards so its own client is told the truth
+        # rather than "everything is OUT" (#1064).
+        self._bind_directions: list[int] | None = None
         self._rowfactory = None
         # The warning the last execute reported, or None (#993). A condition the
         # server raises alongside a call that SUCCEEDED -- a PL/SQL object
@@ -124,6 +131,16 @@ class _CursorLogic:
     @property
     def description(self) -> list[tuple] | None:
         return self._description
+
+    @property
+    def bind_directions(self) -> list[int] | None:
+        """The bind directions the last PL/SQL block's reply reported (#1064).
+
+        One per bind -- 16 OUT, 32 IN, 48 IN OUT -- or None when the last
+        statement was not a block, or carried no binds. A server reports these
+        only on the way back, so nothing else in the API can tell an IN bind
+        from an OUT one."""
+        return self._bind_directions
 
     @property
     def annotations(self) -> list[dict | None] | None:
