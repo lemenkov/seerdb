@@ -187,12 +187,14 @@ def _oson_scalar_node(value, allow_wide: bool = False) -> bytes:
         encode_token_interval_ym,
         encode_token_num,
     )
+    from seerdb.common.vector import SparseVector, encode_vector
 
-    if isinstance(value, array.array):
+    if isinstance(value, (array.array, SparseVector)):
         # A VECTOR rides as the EXTENDED wrapper: 0x7b, sub-tag 0x01, a ub4
-        # length, then the bare vector image (the inverse of the decoder).
-        from seerdb.common.vector import encode_vector
-
+        # length, then the bare vector image (the inverse of the decoder). Dense
+        # and sparse share the wrapper: the sparse flag lives in the image, and
+        # a sparse value is what the decoder hands back for one, so leaving
+        # SparseVector out made the encoder unable to re-encode its own output.
         img = encode_vector(value)
         return b'\x7b\x01' + len(img).to_bytes(4, 'big') + img
     if value is None:

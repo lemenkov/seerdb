@@ -16,6 +16,7 @@ from decimal import Decimal
 
 from seerdb.common.datatypes import IntervalYM
 from seerdb.common.oson import OsonError, decode_oson, encode_oson, json_to_text
+from seerdb.common.vector import SparseVector
 
 # (label, JSON document, captured OSON image as hex)
 FIXTURES = [
@@ -403,6 +404,36 @@ class TestEncodeOson(unittest.TestCase):
         self.assertEqual(
             decode_oson(encode_oson({'r': b'\x02' * 300}, allow_wide=True)),
             {'r': b'\x02' * 300},
+        )
+
+    def test_vector_scalars(self):
+        # A VECTOR inside a JSON document rides the EXTENDED wrapper, and the
+        # Mirror re-encodes whatever its own decoder produced: a dense vector as
+        # an array.array, a sparse one as a SparseVector (#1114). Both must go
+        # back out, or a JSON document holding a sparse vector cannot be served.
+        # A SparseVector stores its indices as passed, and the decoder hands
+        # back an array('I'), so build the expected values that way.
+        for v in (
+            array.array('f', [1.5, 2.5, 3.5]),
+            array.array('d', [1.5, 2.5]),
+            SparseVector(
+                16, array.array('I', [1, 3, 5]), array.array('d', [1.5, 0.25, 0.5])
+            ),
+            SparseVector(8, array.array('I', [0, 7]), array.array('f', [1.0, 2.0])),
+        ):
+            with self.subTest(v=v):
+                self._roundtrip(v)
+        # ...and nested in a document, which is the shape a JSON_OBJECT query
+        # with a sparse VECTOR column returns.
+        self._roundtrip(
+            {
+                'id': 7732,
+                'vector': SparseVector(
+                    16,
+                    array.array('I', [1, 3, 5]),
+                    array.array('d', [1.5, 0.25, 0.5]),
+                ),
+            }
         )
 
     def test_bare_scalar_over_255_raises(self):
