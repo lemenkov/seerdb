@@ -2187,6 +2187,39 @@ class PhysicalUrowidIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class ProxyLoginIntegration(unittest.TestCase):
+    """A proxy login, ``user[proxy]`` (#126), keeps its proxy end to end (#1093).
+
+    Needs a user the test user may connect through (``ALTER USER <proxy> GRANT
+    CONNECT THROUGH <user>``), named by SEERDB_TEST_PROXY_USER. The suite's own
+    account has no such grant, so without it the test says so and skips.
+    """
+
+    def test_the_session_runs_as_the_proxied_user(self):
+        proxy = os.environ.get('SEERDB_TEST_PROXY_USER')
+        if not proxy:
+            self.skipTest(
+                'set SEERDB_TEST_PROXY_USER to a user the test user may proxy for'
+            )
+        with seerdb.connect(
+            host=_HOST,
+            port=_PORT,
+            user=f'{_USER}[{proxy}]',
+            password=_PASSWORD,
+            service_name=_SERVICE,
+            **_FV_KW,
+        ) as conn:
+            if conn.field_version < FIELD_VERSION_10_2:
+                self.skipTest('proxy authentication needs a 10g+ server')
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT SYS_CONTEXT('userenv', 'session_user'), "
+                "SYS_CONTEXT('userenv', 'proxy_user') FROM dual"
+            )
+            self.assertEqual(cur.fetchone(), (proxy.upper(), _USER.upper()))
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class TempLobBindIntegration(_IntegrationBase):
     """Large CLOB / BLOB into a PL/SQL locator param (#91).
 

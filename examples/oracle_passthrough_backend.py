@@ -190,10 +190,14 @@ class OraclePassthroughBackend:
         # autocommit client still commits because the Mirror calls backend.commit()
         # per statement. With the driver default (autocommit=True) every statement
         # would commit upstream and a client rollback would be a no-op.
+        # A proxy login stays one upstream (#1093): seerdb's `user[proxy]` form
+        # authenticates as `user` and opens the session as `proxy`, which is what
+        # the client asked the Mirror for.
+        proxy = (attrs or {}).get('proxy_client_name')
         self._conn = seerdb.connect(
             host=self._host,
             port=self._port,
-            user=username,
+            user=f'{username}[{proxy}]' if proxy else username,
             password=password,
             service_name=self._service,
             autocommit=False,
