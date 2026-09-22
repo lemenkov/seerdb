@@ -1308,6 +1308,30 @@ class TestXmlTypeInObject(unittest.TestCase):
         blob = encode_xmltype('<item>ab</item>')
         self.assertEqual(decode_xmltype(blob), (False, '<item>ab</item>'))
 
+    def test_a_large_document_uses_the_long_length_the_server_sends(self):
+        # Captured from 23ai serving a 32 KB XMLType to python-oracledb: the same
+        # inline STRING image, its length in the long form -- fe + 4 bytes,
+        # spanning the whole image -- and no LOB anywhere (#1073). It used to be
+        # refused with ORA-03115. Only the flag word differs: 23ai also sets a
+        # 0x10 bit no reader checks (#124).
+        from seerdb.common.dbobject import decode_xmltype, encode_xmltype
+
+        captured_head = bytes.fromhex('8501fe0000801a' + '01' + '00000014')
+        doc = '<data>' + 'x' * 32768 + '</data>\n'  # 32782 bytes, as served
+        image = encode_xmltype(doc)
+        self.assertEqual(image[:7], captured_head[:7])
+        self.assertEqual(image[7:12], bytes.fromhex('0100000004'))
+        self.assertEqual(len(image), 0x801A)
+        self.assertEqual(decode_xmltype(image), (False, doc))
+
+    def test_a_small_document_keeps_the_one_byte_length(self):
+        # '<s>tiny</s>\n' as 23ai sends it: 85 01 14, a 20-byte image.
+        from seerdb.common.dbobject import encode_xmltype
+
+        image = encode_xmltype('<s>tiny</s>\n')
+        self.assertEqual(image[:3], bytes.fromhex('850114'))
+        self.assertEqual(len(image), 0x14)
+
     def test_object_with_xmltype_attribute_roundtrips(self):
         obj = _XML_OBJ_TYPE.newobject(
             {
