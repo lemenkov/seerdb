@@ -448,6 +448,67 @@ def test_a_cut_array_dml_says_truncated_so_the_request_can_grow() -> None:
             parse_exec(full[:second_row])
 
 
+def test_a_vector_defined_as_text_is_served_as_oracle_renders_it() -> None:
+    # A client whose output type handler asks for a VECTOR column as character
+    # data gets the TEXT form inline, not the binary image (#1107). The expected
+    # strings are what 23ai sent for these exact vectors, read back through a
+    # LONG redefine.
+    import array
+
+    from seerdb.common.tns import _INLINE_LONG_FROM, vector_as_text
+    from seerdb.common.tns_consts import (
+        TNS_TYPE_CHAR,
+        TNS_TYPE_LONG,
+        TNS_TYPE_VARCHAR,
+        TNS_TYPE_VECTOR,
+    )
+    from seerdb.common.vector import SparseVector
+
+    assert (
+        vector_as_text(
+            SparseVector(
+                16, array.array('I', [1, 3, 5]), array.array('f', [1.0, 0.0, 5.0])
+            )
+        )
+        == '[16,[1,3,5],[1.0E+000,0,5.0E+000]]'
+    )
+    assert (
+        vector_as_text(
+            SparseVector(
+                16, array.array('I', [1, 3, 5]), array.array('d', [1.5, 0.25, 0.5])
+            )
+        )
+        == '[16,[1,3,5],[1.5E+000,2.5E-001,5.0E-001]]'
+    )
+    assert vector_as_text(array.array('d', [1.5, -2.0, 3.25])) == (
+        '[1.5E+000,-2.0E+000,3.25E+000]'
+    )
+    # An INT8 vector prints as integers, and an exact zero prints bare.
+    assert vector_as_text(array.array('b', [1, 2, 3])) == '[1,2,3]'
+    assert vector_as_text(array.array('d', [0.0, 1.0])) == '[0,1.0E+000]'
+    # The redefine itself has to be allowed, or the define is ignored and the
+    # image goes out under a character variable.
+    assert _INLINE_LONG_FROM[TNS_TYPE_VECTOR] == frozenset(
+        {TNS_TYPE_CHAR, TNS_TYPE_VARCHAR, TNS_TYPE_LONG}
+    )
+
+
+def test_a_vector_column_defined_as_text_encodes_inline() -> None:
+    # End to end through the row encoder: with the define marked, the cell is an
+    # inline LONG carrying the text, not a prefetched image.
+    import array
+    from dataclasses import replace
+
+    from seerdb.common.tns import ColumnMeta, _thin_column_value
+    from seerdb.common.tns_consts import TNS_TYPE_VECTOR
+
+    col = ColumnMeta(name=b'V', data_type=TNS_TYPE_VECTOR, data_length=8200, max_size=0)
+    value = array.array('b', [1, 2, 3])
+    inline = _thin_column_value(value, replace(col, inline_long_csfrm=1))
+    assert b'[1,2,3]' in inline
+    assert inline != _thin_column_value(value, col)
+
+
 def test_encode_status_with_rowcounts_is_the_return_parameters_block() -> None:
     # The arraydmlrowcounts status carries the counts in the execute's
     # return-parameters block (TTI_RPA), laid out as a real server lays it out
