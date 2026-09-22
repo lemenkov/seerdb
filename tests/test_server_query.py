@@ -413,6 +413,41 @@ def test_a_urowid_is_served_with_the_tag_its_kind_carries() -> None:
     assert encode_urowid_value(None) == encode_sb4(0)
 
 
+def test_a_cut_array_dml_says_truncated_so_the_request_can_grow() -> None:
+    # A request bigger than one packet arrives in pieces and the Mirror grows it
+    # only while the parser says Truncated. A DALC cut at a row boundary used to
+    # raise a bare DataError, and an array DML cut between rows parsed "fine"
+    # with rows missing -- so a 4000-row executemany was refused as unparsable
+    # and a 10000-row one desynced the session (#1097).
+    from seerdb.common.exceptions import Truncated
+    from seerdb.common.tns import decode_dalc, parse_exec
+
+    with pytest.raises(Truncated):
+        decode_dalc(b'')
+    with pytest.raises(Truncated):
+        decode_dalc(bytes([4, 1, 2]))  # promises 4 bytes, 2 left
+
+    # A 3-row array DML from the real client encoder, then the same bytes cut at
+    # the second row's boundary -- what a Mirror sees when the request spans
+    # packets.
+    from seerdb.common.tns_consts import FIELD_VERSION_23_1, TTI_RXD
+
+    rows = [[1, 'a'], [2, 'b'], [3, 'c']]
+    with _at_field_version(FIELD_VERSION_23_1):
+        full = _client_exec_request(
+            FIELD_VERSION_23_1,
+            'insert into t values (:1, :2)',
+            rows[0],
+            batch=rows[1:],
+            kind='change',
+        )
+        request = parse_exec(full)
+        assert len(request.bind_rows) == 3 and request.iterations == 3
+        second_row = full.index(bytes([TTI_RXD]), full.index(bytes([TTI_RXD])) + 1)
+        with pytest.raises(Truncated):
+            parse_exec(full[:second_row])
+
+
 def test_encode_status_with_rowcounts_is_the_return_parameters_block() -> None:
     # The arraydmlrowcounts status carries the counts in the execute's
     # return-parameters block (TTI_RPA), laid out as a real server lays it out

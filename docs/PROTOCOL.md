@@ -126,6 +126,20 @@ succeeded**. The Mirror's codec primitives say the opposite by raising
 `Truncated`, and the reader grows the buffer with further packets until the
 parse stops complaining.
 
+Two things have to hold for that to work, and neither did (#1097):
+
+- **Every truncation says `Truncated`, not a bare `DataError`.** `decode_dalc`'s
+  `IndexError` path raised the latter, so a request cut on that path was refused
+  as unparsable instead of grown: a 4000-row `executemany` from python-oracledb
+  came back `ORA-03115`.
+- **A parse that stops early must not look like success.** The bind-row loop ends
+  at the first byte that is not a `TTI_RXD`, which the end of a cut buffer also
+  is, so an array DML cut between rows parsed "fine" with rows missing. The
+  leftover continuation was then read as a new message (`unhandled message type
+  7`) and the session desynced. The parser now checks the rows against the
+  iteration count the `al8i4` declared. A batch whose rows are ALL empty sends no
+  `TTI_RXD` at all and is not this case.
+
 The catch is that `Truncated` means only "the parser ran off the end", and two
 quite different things produce it: a message genuinely cut by the transport, and
 a **decode fault inside a message that is already complete** — a decoder that

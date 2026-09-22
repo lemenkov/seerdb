@@ -2338,6 +2338,14 @@ def parse_exec(
         bind_rows, after = _read_bind_rows(after, types, capacities, order)
         if bind_rows:
             binds = bind_rows[0]
+        if bind_rows and len(bind_rows) < iterations:
+            # The rows ran out before the iteration count did, so this message is
+            # cut mid-array and the rest is in the next packet. Saying so lets the
+            # Mirror grow the request; stopping here silently parsed a partial
+            # array DML and left the continuation to be read as a new message
+            # ("unhandled message type 7", #1097). A batch whose rows are ALL
+            # empty carries no RXD at all and is not this case.
+            raise Truncated(f'array DML: {len(bind_rows)} of {iterations} bind rows')
         # Per-bind (tns_type, max_size) — what a PL/SQL block's OUT binds need to
         # be registered on the backend with a correctly-sized buffer (#483).
         bind_meta = [(data_type, maxlen) for data_type, _csfrm, maxlen, _toid in types]
@@ -11984,9 +11992,12 @@ def decode_dalc(Bytes: bytes) -> tuple[bytes | list, bytes]:
         return (Bytes[1 : Length + 1], Bytes[Length + 1 :])
     except IndexError as Exc:
         # A truncated field (empty Bytes, or a chunk length in decode_chr that
-        # runs past the buffer) indexes out of range; surface as DataError
-        # rather than leaking a raw IndexError (#230).
-        raise DataError('truncated DALC field') from Exc
+        # runs past the buffer) indexes out of range. It says Truncated, not a
+        # bare DataError: a reader tells "incomplete, read on" from "complete but
+        # bad" by this type (#849), and the Mirror grows a multi-packet request
+        # only on Truncated -- a big array DML was refused as unparsable instead
+        # (#1097). Truncated IS a DataError, so #230's rule still holds.
+        raise Truncated('truncated DALC field') from Exc
 
 
 def decode_chr(Bytes: bytes) -> tuple[bytes, bytes]:
