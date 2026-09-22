@@ -448,6 +448,37 @@ def test_a_cut_array_dml_says_truncated_so_the_request_can_grow() -> None:
             parse_exec(full[:second_row])
 
 
+def test_a_json_column_defined_as_text_is_served_as_oracle_renders_it() -> None:
+    # A client whose output type handler asks for a JSON column as character data
+    # gets the document as compact JSON TEXT, not the OSON image (#1106). The
+    # expected string is what 23ai sent for this document through a str redefine.
+    from dataclasses import replace
+
+    from seerdb.common.tns import (
+        _INLINE_LONG_FROM,
+        ColumnMeta,
+        _thin_column_value,
+        json_as_text,
+    )
+    from seerdb.common.tns_consts import (
+        TNS_TYPE_CHAR,
+        TNS_TYPE_JSON,
+        TNS_TYPE_LONG,
+        TNS_TYPE_VARCHAR,
+    )
+
+    document = {'name': 'John', 'city': 'Delhi'}
+    assert json_as_text(document) == '{"name":"John","city":"Delhi"}'
+    assert _INLINE_LONG_FROM[TNS_TYPE_JSON] == frozenset(
+        {TNS_TYPE_CHAR, TNS_TYPE_VARCHAR, TNS_TYPE_LONG}
+    )
+    col = ColumnMeta(name=b'J', data_type=TNS_TYPE_JSON, data_length=8200, max_size=0)
+    inline = _thin_column_value(document, replace(col, inline_long_csfrm=1))
+    assert b'{"name":"John","city":"Delhi"}' in inline
+    # Without the define it is still the OSON image.
+    assert inline != _thin_column_value(document, col)
+
+
 def test_a_vector_defined_as_text_is_served_as_oracle_renders_it() -> None:
     # A client whose output type handler asks for a VECTOR column as character
     # data gets the TEXT form inline, not the binary image (#1107). The expected

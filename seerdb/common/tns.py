@@ -1248,7 +1248,21 @@ _INLINE_LONG_FROM = {
     # instead of the binary image (#1107). Measured on 23ai: a client whose
     # output type handler asks for LONG gets `[16,[1,3,5],[1.0E+000,0,5.0E+000]]`.
     TNS_TYPE_VECTOR: frozenset({TNS_TYPE_CHAR, TNS_TYPE_VARCHAR, TNS_TYPE_LONG}),
+    # And a JSON column the same way: the document as compact JSON text, not the
+    # OSON image (#1106). Measured on 23ai: `{"name":"John","city":"Delhi"}`.
+    TNS_TYPE_JSON: frozenset({TNS_TYPE_CHAR, TNS_TYPE_VARCHAR, TNS_TYPE_LONG}),
 }
+
+
+def json_as_text(value: object) -> str:
+    """A JSON document as 23ai renders it for a character define (#1106).
+
+    Compact -- no space after ``:`` or ``,`` -- which is what a live server
+    sends, and what the client's own converter then parses.
+    """
+    import json
+
+    return json.dumps(value, separators=(',', ':'), ensure_ascii=False)
 
 
 def vector_as_text(value: 'SparseVector | Sequence') -> str:
@@ -1704,6 +1718,10 @@ def _thin_column_value(value: object, col: 'ColumnMeta') -> bytes:
             encode_vector(_vector_as(value, col.vector_format))
         )
     if col.data_type == TNS_TYPE_JSON and value is not None:
+        if col.inline_long_csfrm is not None:
+            # The client's define asked for this document as character data, so
+            # it goes out as JSON text inline, not the OSON image (#1106).
+            return encode_long_value_thin(json_as_text(value))
         # allow_wide so a > 255-key or > 64 KiB document still re-encodes for the
         # client's decoder -- the framing carries any size.
         from seerdb.common.oson import encode_oson
