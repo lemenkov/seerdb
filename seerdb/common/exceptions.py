@@ -66,6 +66,16 @@ class DataError(DatabaseError):
     pass
 
 
+class DateOutOfRangeError(DataError, ValueError):
+    """A valid Oracle date that Python's ``datetime`` cannot represent.
+
+    Oracle's DATE runs from 4712 BC; ``datetime`` starts at year 1. Such a value
+    is not malformed -- the server sent it correctly -- so this says so, rather
+    than the "malformed" a corrupt frame gets. It is a :class:`DataError`, so a
+    caller can still catch it by DB-API class (#230), and also a ``ValueError``,
+    which is what python-oracledb raises for it (#1060)."""
+
+
 class Truncated(DataError):
     """A field needs more bytes than the buffer holds (#849).
 

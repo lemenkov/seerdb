@@ -107,6 +107,71 @@ class TestNamedRegionTSTZ(unittest.TestCase):
         self.assertIsNone(Dt.tzinfo)
 
 
+class TestBcDate(unittest.TestCase):
+    """A BC date is VALID Oracle data that datetime cannot hold (#1060).
+
+    Oracle's DATE runs from 4712 BC; Python's datetime starts at year 1. It used
+    to be reported as "malformed", telling a caller the server sent garbage when
+    it sent a correct value. It is now a DateOutOfRangeError: still a DataError
+    (#230's rule) and also a ValueError, as python-oracledb raises. The cases
+    that matter as much are the ones that must STAY malformed.
+    """
+
+    # to_date('-4712-01-01', 'SYYYY-MM-DD'), as a live 23ai sends it: century
+    # byte 53 and year byte 88 are (53-100)*100 + (88-100) = -4712.
+    MIN_ORACLE_DATE = bytes.fromhex('35580101010101')
+
+    def test_the_earliest_oracle_date_is_out_of_range_not_malformed(self):
+        from seerdb.common.exceptions import DateOutOfRangeError
+
+        with self.assertRaises(DateOutOfRangeError) as caught:
+            decode_date(self.MIN_ORACLE_DATE)
+        self.assertNotIn('malformed', str(caught.exception))
+        self.assertIn('-4712', str(caught.exception))
+
+    def test_it_is_both_a_data_error_and_a_value_error(self):
+        # DataError keeps #230's rule (catchable by DB-API class); ValueError is
+        # what the reference client raises and what its suite asserts.
+        with self.assertRaises(DataError):
+            decode_date(self.MIN_ORACLE_DATE)
+        with self.assertRaises(ValueError):
+            decode_date(self.MIN_ORACLE_DATE)
+
+    def test_a_bad_month_is_still_malformed(self):
+        from seerdb.common.exceptions import DateOutOfRangeError
+
+        # 2024-13-01: a real year with an impossible month is corrupt data.
+        with self.assertRaises(DataError) as caught:
+            decode_date(bytes([120, 124, 13, 1, 1, 1, 1]))
+        self.assertNotIsInstance(caught.exception, DateOutOfRangeError)
+        self.assertIn('malformed', str(caught.exception))
+
+    def test_a_bc_year_with_a_bad_field_is_still_malformed(self):
+        # A corrupt frame can land on a negative year by accident; the other
+        # fields have to be sane before the year alone is believed.
+        from seerdb.common.exceptions import DateOutOfRangeError
+
+        with self.assertRaises(DataError) as caught:
+            decode_date(bytes([0x35, 0x58, 13, 1, 1, 1, 1]))  # -4712, month 13
+        self.assertNotIsInstance(caught.exception, DateOutOfRangeError)
+
+    def test_year_zero_is_malformed(self):
+        # Oracle has no year 0 -- 1 BC is followed by AD 1.
+        from seerdb.common.exceptions import DateOutOfRangeError
+
+        with self.assertRaises(DataError) as caught:
+            decode_date(bytes([100, 100, 1, 1, 1, 1, 1]))
+        self.assertNotIsInstance(caught.exception, DateOutOfRangeError)
+
+    def test_a_year_before_the_oracle_minimum_is_malformed(self):
+        # -4713 is below Oracle's own floor, so no server sent it.
+        from seerdb.common.exceptions import DateOutOfRangeError
+
+        with self.assertRaises(DataError) as caught:
+            decode_date(bytes([0x35, 0x57, 1, 1, 1, 1, 1]))
+        self.assertNotIsInstance(caught.exception, DateOutOfRangeError)
+
+
 class TestDecodeUb4(unittest.TestCase):
     # PROTOCOL.md §12.1 variable-length integer.
 

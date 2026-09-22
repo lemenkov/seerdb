@@ -15,7 +15,7 @@ from decimal import Decimal, InvalidOperation
 
 from seerdb.common._tzregions import TZ_REGIONS
 from seerdb.common.datatypes import IntervalYM
-from seerdb.common.exceptions import DataError
+from seerdb.common.exceptions import DataError, DateOutOfRangeError
 from seerdb.common.tns_consts import (
     AL16UTF16_CHARSET,
     AL32UTF8_CHARSET,
@@ -235,10 +235,43 @@ def decode_date(Data: bytes) -> datetime.datetime | None:
         )
         return Utc.astimezone(Tz)
     except (ValueError, OverflowError) as Exc:
+        if _is_bc_date(Year, Month, Day, Hour, Minute, Second):
+            # A BC date is VALID Oracle data -- DATE runs from 4712 BC -- that
+            # Python's datetime cannot hold, since it starts at year 1. Calling
+            # it "malformed" told a caller the server sent garbage when it sent
+            # a correct value (#1060). Still a DataError, so #230's rule holds,
+            # and also a ValueError, which is what python-oracledb raises. The
+            # message leads with the same words Python's own rejection uses.
+            raise DateOutOfRangeError(
+                f'year {Year} is out of range: the Oracle date '
+                f'{Year}-{Month:02d}-{Day:02d} is before year 1, the earliest '
+                'a Python datetime can represent'
+            ) from Exc
         # Out-of-range date/time or TZ-offset fields (bad month/day, an offset
         # beyond +/-24h) make datetime()/timezone() reject; surface as DataError
         # rather than leaking a raw ValueError (#230).
         raise DataError(f'malformed Oracle DATE/TIMESTAMP: {Data.hex()}') from Exc
+
+
+# Oracle's DATE range starts here: 1 January 4712 BC, written -4712 (#1060).
+_ORACLE_MIN_YEAR = -4712
+
+
+def _is_bc_date(
+    Year: int, Month: int, Day: int, Hour: int, Minute: int, Second: int
+) -> bool:
+    # True for a well-formed date before year 1 -- valid in Oracle, out of range
+    # for datetime. Every OTHER field has to be in range too: a corrupt frame
+    # can land on a negative year by accident, and must still read as malformed.
+    # Oracle has no year 0 (1 BC is followed by AD 1), so it is not included.
+    return (
+        _ORACLE_MIN_YEAR <= Year <= -1
+        and 1 <= Month <= 12
+        and 1 <= Day <= 31
+        and 0 <= Hour <= 23
+        and 0 <= Minute <= 59
+        and 0 <= Second <= 59
+    )
 
 
 def decode_binary_float(Data: bytes) -> float | None:
