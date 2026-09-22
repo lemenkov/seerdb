@@ -161,6 +161,11 @@ class Result:
     # backend that cannot tell leaves it False and the client sees no warning,
     # which is what it saw before this existed.
     compilation_warning: bool = False
+    # The rowid of the last row a DML statement touched, in Oracle's printable
+    # extended form ('AAAs/uAAAAAAWFFADg'), which the client reports as
+    # cursor.lastrowid (#1077). None for anything else, and for a backend with no
+    # Oracle rowids -- which is what every backend reported before this existed.
+    last_rowid: str | None = None
 
 
 @dataclass(frozen=True)
@@ -236,10 +241,11 @@ class Backend(Protocol):
     extensions and falls back cleanly when they are absent, so a backend
     implements only what it can do:
 
-    ``execute_many(sql, rows) -> int``
+    ``execute_many(sql, rows) -> int | Result``
         Apply a whole array-DML batch in one call, returning the total
-        affected-row count. Without it the session applies the rows one at a
-        time.
+        affected-row count -- or a :class:`Result` carrying it, when there is a
+        ``last_rowid`` to report too (#1077). Without it the session applies the
+        rows one at a time.
 
     ``execute_many_rowcounts(sql, rows) -> tuple[int, list[int]]``
         The same, plus the per-iteration counts a 12c client can ask for.

@@ -589,6 +589,8 @@ class OraclePassthroughBackend:
         return Result(
             rowcount=cursor.rowcount or 0,
             compilation_warning=getattr(cursor, 'warning', None) is not None,
+            # The row the statement touched, as the upstream reported it (#1077).
+            last_rowid=getattr(cursor, 'lastrowid', None),
         )
 
     def _drain_implicit_results(
@@ -612,7 +614,7 @@ class OraclePassthroughBackend:
             out.append((columns, cursor.fetchall()))  # type: ignore[attr-defined]
         return out
 
-    def execute_many(self, sql: str, rows: Sequence[Sequence]) -> int:
+    def execute_many(self, sql: str, rows: Sequence[Sequence]) -> Result:
         # Array DML (executemany): send the whole batch upstream in one round-trip
         # through seerdb's own cursor.executemany — one parse, len(rows) iterations
         # — instead of the Mirror's per-row fallback (one upstream round-trip per
@@ -631,7 +633,10 @@ class OraclePassthroughBackend:
             # at zero: DB-API leaves rowcount -1 when it means nothing, and a
             # negative count is not a smaller number of rows, it is no answer.
             raise _relay_error(exc, max(cursor.rowcount or 0, 0)) from exc
-        return cursor.rowcount or 0
+        # With the last inserted row's rowid, as the upstream reported it (#1077).
+        return Result(
+            rowcount=cursor.rowcount or 0, last_rowid=getattr(cursor, 'lastrowid', None)
+        )
 
     def execute_many_rowcounts(
         self, sql: str, rows: Sequence[Sequence]

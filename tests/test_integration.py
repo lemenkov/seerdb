@@ -43,6 +43,7 @@ from seerdb.common.tns_consts import (
 # on fv2, not fixable fv2 bind gaps (those are #172 dates, #173 intervals,
 # #174 national charset).
 _FV2_UNSUPPORTED = (
+    ('lastrowid', 'the fv2 DML status is not read for a rowid yet (#1079)'),
     ('binary_double', 'BINARY_DOUBLE is a 10g+ type; Oracle 9i lacks it'),
     ('binary_float', 'BINARY_FLOAT is a 10g+ type; Oracle 9i lacks it'),
     ('kib', 'Oracle 9i has no streamed LOB/LONG bind path (#169)'),
@@ -2056,6 +2057,37 @@ class BindIntegration(_IntegrationBase):
             self.cur.fetchall(),
             [('hello :not_a_bind world',)],
         )
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class LastRowidIntegration(_IntegrationBase):
+    """``cursor.lastrowid``: the rowid of the last row a DML statement touched.
+
+    Nothing in the suite checked it live, so the Mirror reporting None for every
+    statement went unnoticed (#1077).
+    """
+
+    def _row_at(self, rowid):
+        # Which row a rowid names, asked of the server. Compared this way, not as
+        # strings: in a bigfile tablespace the status token carries the bigfile
+        # marker (1024) as the relative file number where a fetched ROWID carries
+        # 0, so the two print differently (AQ vs AA) while naming the same row.
+        # python-oracledb reports the same pair; the server accepts either.
+        self.cur.execute(f'SELECT n FROM {self.TABLE} WHERE ROWID = :1', [rowid])
+        return [r[0] for r in self.cur.fetchall()]
+
+    def test_lastrowid_follows_the_touched_row(self):
+        self._skip_if_mirror_backend('postgres', 'report an Oracle rowid')
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, s VARCHAR2(10))')
+        self.assertIsNone(self.cur.lastrowid)  # DDL
+        self.cur.execute(f"INSERT INTO {self.TABLE} VALUES (1, 'a')")
+        self.assertEqual(self._row_at(self.cur.lastrowid), [1])
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1, :2)', [(2, 'b'), (3, 'c')]
+        )
+        self.assertEqual(self._row_at(self.cur.lastrowid), [3])
+        self.cur.execute(f"UPDATE {self.TABLE} SET s = 'z' WHERE n = 2")
+        self.assertEqual(self._row_at(self.cur.lastrowid), [2])
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
@@ -5120,6 +5152,31 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
         await Conn.close()
         if Fv < FIELD_VERSION_10_2:
             self.skipTest(Reason)
+
+    async def test_lastrowid_follows_the_touched_row(self):
+        # Async twin of LastRowidIntegration (#1077).
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest("the Mirror's postgres backend cannot report an Oracle rowid")
+        Table = 'PYO_ASYNC_LASTROWID'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            try:
+                await Cur.execute(f'DROP TABLE {Table}')
+            except seerdb.DatabaseError:
+                pass
+            await Cur.execute(f'CREATE TABLE {Table} (n NUMBER)')
+            try:
+                await Cur.execute(f'INSERT INTO {Table} VALUES (7)')
+                Rowid = Cur.lastrowid
+                self.assertIsNotNone(Rowid)
+                # Which row it names, asked of the server (see LastRowidIntegration).
+                await Cur.execute(f'SELECT n FROM {Table} WHERE ROWID = :1', [Rowid])
+                self.assertEqual(await Cur.fetchone(), (7,))
+            finally:
+                await Cur.execute(f'DROP TABLE {Table}')
+        finally:
+            await Conn.close()
 
     async def test_createlob_binds_as_a_lob(self):
         # Async twin of CreateLobIntegration (#1066).

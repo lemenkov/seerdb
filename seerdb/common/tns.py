@@ -1435,6 +1435,21 @@ def _encode_batch_messages(messages: list[str]) -> bytes:
     return bytes(out)
 
 
+def _physical_rowid(rowid: str | None) -> tuple[int, int, int, int]:
+    # The four OER rowid fields for a printable extended rowid: the inverse of
+    # what the client renders them as (rowid_to_string). Anything that is not one
+    # -- None, a logical '*...' UROWID -- is no rowid, all zero (#1077).
+    from seerdb.common.types import _ROWID_ALPHABET, string_to_rowid
+
+    if (
+        rowid is None
+        or len(rowid) != 18
+        or not all(c in _ROWID_ALPHABET for c in rowid)
+    ):
+        return (0, 0, 0, 0)
+    return string_to_rowid(rowid)
+
+
 def _encode_oer(
     call_status: int,
     ora_code: int,
@@ -1448,9 +1463,11 @@ def _encode_oer(
     sql_type: int = 0,
     call_number: int = 0,
     warn_flags: int = 0,
+    rowid: str | None = None,
 ) -> bytes:
     # An OER return-status token (§6.5, 11g) — the terminal of every response.
-    # Rowid fields are zero; call status, the ORA error number, the affected-row
+    # Rowid fields carry the last touched row's physical rowid when ``rowid`` is
+    # one (#1077), zero otherwise -- block 0 reads as "no rowid"; call status, the ORA error number, the affected-row
     # count, the cursor id (for a mid-fetch "more rows" status), and the message
     # text carry meaning. ``batch_errors`` is (offset, code, message) per row that
     # failed in an array-DML batcherrors execute — the three arrays line up by
@@ -1468,6 +1485,7 @@ def _encode_oer(
     if _ENCODE_TXN_IN_PROGRESS.get():
         call_status |= TNS_EOCS_FLAGS_TXN_IN_PROGRESS
     batch_errors = batch_errors or []
+    (rowid_obj, rowid_file, rowid_block, rowid_slot) = _physical_rowid(rowid)
     codes = [code for _offset, code, _msg in batch_errors]
     offsets = [offset for offset, _code, _msg in batch_errors]
     messages = [msg for _offset, _code, msg in batch_errors]
@@ -1484,11 +1502,11 @@ def _encode_oer(
         + bytes(
             [sql_type, 0, 0, 0, 0, warn_flags]
         )  # sql_type, fatal, flags, opts, upi, warn
-        + encode_sb4(0)  # rowid data object number
-        + encode_sb4(0)  # rowid relative file number
+        + encode_sb4(rowid_obj)  # rowid data object number
+        + encode_sb4(rowid_file)  # rowid relative file number
         + bytes(1)  # rowid reserved
-        + encode_sb4(0)  # rowid block number
-        + encode_sb4(0)  # rowid slot number
+        + encode_sb4(rowid_block)  # rowid block number
+        + encode_sb4(rowid_slot)  # rowid slot number
         + encode_sb4(0)  # os error
         + bytes([0, call_number])  # statement number, call number
         + encode_sb4(0)  # padding
@@ -1693,7 +1711,11 @@ def encode_error(
 
 
 def encode_status(
-    rowcount: int = 0, cursor_id: int = 0, *, compilation_warning: bool = False
+    rowcount: int = 0,
+    cursor_id: int = 0,
+    *,
+    compilation_warning: bool = False,
+    rowid: str | None = None,
 ) -> bytes:
     """OER reporting success for a non-query (DDL / DML), with the affected-row
     count. No describe, no rows — the client just sees the statement completed.
@@ -1703,7 +1725,10 @@ def encode_status(
     ``compilation_warning`` raises bit 0x20 of the warn byte: the statement
     CREATED a PL/SQL object that compiled with errors. The call succeeded and
     there is no error code to carry it, so this bit is the whole signal
-    (§6.3a, #995)."""
+    (§6.3a, #995).
+
+    ``rowid`` is the last touched row's, which the client reports as
+    ``cursor.lastrowid`` (#1077)."""
     return _encode_oer(
         0,
         0,
@@ -1711,6 +1736,7 @@ def encode_status(
         b'',
         cursor_id=cursor_id,
         warn_flags=(TNS_OER_WARN_COMPILATION_ERROR if compilation_warning else 0),
+        rowid=rowid,
     )
 
 

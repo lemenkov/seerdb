@@ -338,6 +338,23 @@ def test_an_xmltype_column_is_served_as_a_document_not_an_object() -> None:
     assert decode_xmltype(image.image)[1] == doc
 
 
+def test_a_dml_status_carries_the_last_rowid() -> None:
+    # The client reads cursor.lastrowid from the OER's four rowid fields. The
+    # Mirror used to write them as zero, so lastrowid was always None (#1077).
+    # The rowid is one 23ai handed out; the client's own decoder reads it back.
+    from seerdb.common.tns import decode_token_oer, encode_status
+
+    rowid = 'AAAs/uAAAAAAWFFADg'
+    reply = encode_status(1, rowid=rowid)
+    assert decode_token_oer(reply, (None, None, []))[6] == rowid
+    # No rowid, or a logical UROWID the physical fields cannot hold: none.
+    for nothing in (None, '*BAMAAJ4CwQL+', 'not-a-rowid'):
+        assert (
+            decode_token_oer(encode_status(1, rowid=nothing), (None, None, []))[6]
+            is None
+        )
+
+
 def test_encode_status_with_rowcounts_is_the_return_parameters_block() -> None:
     # The arraydmlrowcounts status carries the counts in the execute's
     # return-parameters block (TTI_RPA), laid out as a real server lays it out
