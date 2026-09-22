@@ -2452,6 +2452,66 @@ describe + rows reply rather than forwarding the empty statement to the backend
 (which would answer `ORA-01009`). Because the inline describe reuses the §6.4
 body, it inherits the same field-version gating (no `dcbqcky` before 11.2).
 
+### 6.5c A PL/SQL block has a cursor id, and re-executes by it (#1064)
+
+A block is a cacheable statement like any other: its first execute returns a
+**server cursor id** in the reply's OER, and the client re-executes by that id
+afterwards. The id is not cosmetic — the reference client keeps a block in
+*single-execute* mode for exactly as long as its cursor id is zero:
+
+```python
+cdef bint requires_single_execute(self):
+    return self._is_plsql and (self._cursor_id == 0 or self._binds_changed)
+```
+
+(the reason, from its own docstring: the IN/OUT split of a block's binds is only
+settled once the block has run). Answer 0 forever and an `executemany` of a block
+is re-sent one iteration at a time — merely slow, until the client pipelines
+(§6.9), at which point it walks off the end of its own bind array.
+
+Three things separate a block's re-execute from a DML one, and each was captured
+off a live 23ai.
+
+**1. A pure-OUT bind sends no value.** The re-execute writer drops every
+`TNS_BIND_DIR_OUTPUT` bind before writing the row, so the row is narrower than
+the bind list. `callproc("proc_Test2", ("hi", 5), {"a_OutValue": out_var})`,
+re-run on cursor 3:
+
+```
+03 04 07 00 | 01 03 | 01 01 | 00 | 00 | 07 | 02 68 69 | 02 c1 06
+             cursor  1 iter  opts opts  RXD   'hi'       5
+```
+
+Three binds, two values. Reading a value for the third consumes the next bind's
+bytes and the row comes apart a position at a time — which is why the directions
+the first execute reported have to be *remembered against the cursor*: the
+re-execute message itself carries no OACs and cannot restate them.
+
+**2. A block's LONG-class binds ride IN PLACE.** Only DML sorts binds wider than
+`max_string_size` to the end of the row (§5.4). A block's binds are routinely
+wide — a `VARCHAR` OUT bind declares 16000, an object bind 16000 — so reading one
+the DML way puts the first value second. The message carries no statement, so
+whether the cursor stands for a block is something only the *server* knows, from
+what it parked under that id.
+
+**3. The reply's shape follows the message, not the statement.** A plain
+re-execute (func 4 / 78) is answered with one `TTI_RXD` per iteration carrying
+that iteration's OUT values, and **no IOV** — it could not restate the directions
+anyway. An `executemany` whose remaining four rows went in one re-execute:
+
+```
+07 02 c1 07 00 | 07 02 c1 16 00 | 07 02 c1 12 00 | 07 02 c1 2c 00 | 04 ...
+RXD  6     rc    RXD  21    rc    RXD  17    rc    RXD  43    rc    OER
+```
+
+An OALL8 carrying a cursor id and no SQL is a full execute message, and its reply
+**does** carry the IOV, exactly as the opening execute's does.
+
+Which iteration failed is carried by the OER's **rowcount** field, and it is the
+only way the client can report an offset: it adds that count to however many
+iterations it ran before sending this message. Leaving it zero blames the first
+row for every failure.
+
 ### 6.6 Return Parameter (TTI_RPA)
 
 Contains cursor information and bookkeeping after statement execution. For authentication, it carries key-value pairs. For SQL execution, it carries the cursor ID for subsequent fetch operations.

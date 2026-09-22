@@ -2398,3 +2398,169 @@ def test_defines_travel_to_the_id_a_re_run_mints() -> None:
     assert second != first
     cursors.set_defines(second, cursors.defines(first))
     assert cursors.defines(second) == [(TNS_TYPE_LONG, 1)]
+
+
+def test_parse_reexecute_of_a_block_skips_out_binds_and_keeps_wide_ones_in_place() -> (
+    None
+):
+    # A PL/SQL block gets a server cursor id like any other statement (#1064),
+    # and the client then re-executes it by that id. Two things separate such a
+    # re-execute from a DML one, and both are visible in this capture of
+    # `callproc("proc_Test2", ("hi", 5), {"a_OutValue": out_var})` re-run
+    # against a live 23ai:
+    #
+    #   03 04 07 00 | 01 03 | 01 01 | 00 | 00 | 07 | 02 68 69 | 02 c1 06
+    #               cursor 3  1 iter  opts  opts  RXD  'hi'      5
+    #
+    #   * the third bind is pure OUT and carries NO value -- the client has
+    #     nothing to send for it (its writer drops every TNS_BIND_DIR_OUTPUT
+    #     bind), so the row has two values for three binds;
+    #   * the first bind is a VARCHAR OUT declaring 16000, far past
+    #     max_string_size, yet it rides FIRST. A block's LONG-class binds stay in
+    #     place; only DML sorts them last. Reading this row the DML way put 'hi'
+    #     in the NUMBER's slot.
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, parse_reexecute
+    from seerdb.common.tns_consts import (
+        TNS_BIND_DIR_INPUT,
+        TNS_BIND_DIR_INPUT_OUTPUT,
+        TNS_BIND_DIR_OUTPUT,
+        TNS_TYPE_BOOLEAN,
+        TNS_TYPE_NUMBER,
+        TNS_TYPE_VARCHAR,
+    )
+
+    raw = bytes.fromhex('030407000103010100000702686902c106')
+    types = [
+        (TNS_TYPE_VARCHAR, 1, 16000, b''),
+        (TNS_TYPE_NUMBER, 0, 22, b''),
+        (TNS_TYPE_BOOLEAN, 0, 4, b''),
+    ]
+    directions = (
+        TNS_BIND_DIR_INPUT,
+        TNS_BIND_DIR_INPUT_OUTPUT,
+        TNS_BIND_DIR_OUTPUT,
+    )
+    token = _DECODE_FIELD_VERSION.set(24)
+    try:
+        request = parse_reexecute(
+            raw, bind_types=types, bind_directions=directions, cached_plsql=True
+        )
+        assert request.cursor == 3
+        # The OUT position keeps None, so the row still lines up with bind_meta.
+        assert request.bind_rows == [['hi', 5, None]]
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+
+
+def test_parse_reexecute_of_a_block_reads_every_iteration() -> None:
+    # An executemany of a block sends its first row as a full execute (the
+    # client keeps a block single-execute until it has a cursor id) and the rest
+    # as ONE array re-execute. Captured off a live 23ai for
+    # `executemany(block, [(31, 'Test 31'), (6, 'Test 6'), ...])`: cursor 5, four
+    # iterations, four RXD rows, and no value for the OUT bind in any of them.
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, parse_reexecute
+    from seerdb.common.tns_consts import (
+        TNS_BIND_DIR_INPUT,
+        TNS_BIND_DIR_OUTPUT,
+        TNS_TYPE_NUMBER,
+        TNS_TYPE_VARCHAR,
+    )
+
+    raw = bytes.fromhex(
+        '03040600010501040000'  # FUN, func 4, seq, token, cursor 5, 4 iters, opts
+        '0702c10706546573742036'  # RXD  6, 'Test 6'
+        '0702c1160754657374203231'  # RXD 21, 'Test 21'
+        '0702c1120754657374203137'  # RXD 17, 'Test 17'
+        '0702c12c0754657374203433'  # RXD 43, 'Test 43'
+    )
+    types = [
+        (TNS_TYPE_NUMBER, 0, 22, b''),
+        (TNS_TYPE_VARCHAR, 1, 100, b''),
+        (TNS_TYPE_NUMBER, 0, 22, b''),
+    ]
+    directions = (TNS_BIND_DIR_INPUT, TNS_BIND_DIR_INPUT, TNS_BIND_DIR_OUTPUT)
+    token = _DECODE_FIELD_VERSION.set(24)
+    try:
+        request = parse_reexecute(
+            raw, bind_types=types, bind_directions=directions, cached_plsql=True
+        )
+        assert (request.cursor, request.fetch) == (5, 4)
+        assert request.bind_rows == [
+            [6, 'Test 6', None],
+            [21, 'Test 21', None],
+            [17, 'Test 17', None],
+            [43, 'Test 43', None],
+        ]
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+
+
+def test_a_block_reexecute_reply_is_one_rxd_per_iteration() -> None:
+    # The reply the capture above drew, byte for byte: one TTI_RXD per
+    # iteration carrying that iteration's OUT value and its return code, then
+    # the success OER. No IOV -- a plain re-execute cannot restate the bind
+    # directions, and the server does not (#1064).
+    from seerdb.common.tns import ScalarOutBind, encode_out_bind_reexecute_thin
+    from seerdb.common.tns_consts import (
+        TNS_BIND_DIR_INPUT,
+        TNS_BIND_DIR_OUTPUT,
+        TNS_TYPE_NUMBER,
+    )
+
+    directions = (TNS_BIND_DIR_INPUT, TNS_BIND_DIR_INPUT, TNS_BIND_DIR_OUTPUT)
+
+    def row(value: int) -> list:
+        return [
+            ScalarOutBind(value=None, tns_type=TNS_TYPE_NUMBER, csfrm=0),
+            ScalarOutBind(value=None, tns_type=TNS_TYPE_NUMBER, csfrm=0),
+            ScalarOutBind(value=value, tns_type=TNS_TYPE_NUMBER, csfrm=0),
+        ]
+
+    reply = encode_out_bind_reexecute_thin(
+        [row(6), row(21), row(17), row(43)], directions, cursor_id=5
+    )
+    assert reply.startswith(bytes.fromhex('0702c107000702c116000702c112000702c12c00'))
+    # An OALL8 carrying a cursor id and no SQL is a full execute message, so its
+    # reply DOES restate the IOV -- captured that way too.
+    with_iov = encode_out_bind_reexecute_thin(
+        [row(6)], directions, cursor_id=5, with_iov=True
+    )
+    assert with_iov.startswith(bytes.fromhex('0b00'))
+    assert bytes(directions) in with_iov
+
+
+def test_parse_exec_keeps_a_cached_blocks_wide_bind_in_place() -> None:
+    # The same in-place rule on the OALL8 path. A cached execute carries no
+    # statement, so `is_plsql` has nothing to read and the Mirror has to say
+    # what the cursor stands for. Captured off a live 23ai: a block re-executed
+    # by id whose first bind is an object collection (declared 16000). Read as
+    # DML it is sorted last and the 16-byte type OID lands in the NUMBER's slot.
+    from seerdb.common.exceptions import DataError
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, parse_exec
+
+    raw = bytes.fromhex(
+        '035e07000204280101000001010d0000000101047fffffff010109000000000000000000'
+        '010000000000000000000000000000000001010000000000000002800000000003010000'
+        '0116000000000000000001010000023e800000000002036901000017010000020fa00000'
+        '000000000000030100000116000000000000000017010000020fa0000000000000000066'
+        '0100000104000000000000000001010000023e800000000002036901000001010000023e'
+        '800000000002036901000001010000023e80000000000203690100000701801e22505954'
+        '484f4e54455354222e225544545f4f424a454354415252415922105beac3196b130427e0'
+        '639600a8c0a49702c102ef000000eb26020001001700290000000000b406008107003c01'
+        '000001000a01000007007882000001001482000013001006000006000005000500050025'
+        '2d021506170621061d1d1e2706008107003c010000281b0000005afb2afd000000622601'
+        '00010001ff290000000000571c0000001d0000000a032a1b00000023fafd0000003c0000'
+        '001c260100010002002900000000000f06008107003c0100002a0007000a000000182601'
+        '0001000300290000000000091a1a1a2a00070008000900070007000a00100016001c0022'
+        '00250028002b002d002f003100320033003400360038003a003b003c003e004100480101'
+        '0105000a505954484f4e544553540a5544545f4f424a454354'
+    )
+    token = _DECODE_FIELD_VERSION.set(24)
+    try:
+        request = parse_exec(raw, cached_plsql=True)
+        assert request.bind_count == 9
+        assert request.binds[1] == '"PYTHONTEST"."UDT_OBJECTARRAY"'
+        with pytest.raises(DataError):
+            parse_exec(raw)
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
