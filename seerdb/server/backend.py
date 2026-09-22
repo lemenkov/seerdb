@@ -94,6 +94,27 @@ class BindVar:
     toid: bytes = b''
 
 
+class ClobValue(str):
+    """A CLOB bind's content: a ``str`` that says it came from a LOB (#1067).
+
+    A client that binds a real LOB -- a temp LOB it made and wrote, as
+    python-oracledb's ``createlob`` does -- streams the content in over LOBOPS and
+    binds the locator. The Mirror resolves that locator to the content, and a
+    bare ``str`` would lose the fact that the client bound a LOB: a backend that
+    binds it on to Oracle binds a VARCHAR2, which refuses anything over 32 KB
+    (ORA-01461). This keeps it. It IS a ``str``, so a backend with no LOB
+    binding of its own needs nothing new.
+    """
+
+    __slots__ = ()
+
+
+class BlobValue(bytes):
+    """A BLOB bind's content: the ``bytes`` twin of :class:`ClobValue` (#1067)."""
+
+    __slots__ = ()
+
+
 @dataclass(frozen=True)
 class CursorResult:
     """A REF CURSOR OUT bind's value: the nested result set the block opened, as

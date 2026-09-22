@@ -3382,9 +3382,15 @@ inline bind. It is the inverse of §14.1/§14.2:
    the next descriptor aligned. An **empty** temp LOB is resolved to a typed LOB
    bind rather than a bare `''` / `b''`: a backend that binds the bare value
    stores NULL on an Oracle target (an empty scalar is NULL there), losing the
-   empty, non-NULL LOB the client meant (#903). The Oracle passthrough example
-   binds such a value back through an upstream temp LOB, since seerdb has no
-   CLOB / BLOB Var-bind of its own.
+   empty, non-NULL LOB the client meant (#903). Any other content arrives as a
+   `ClobValue` / `BlobValue`: a `str` / `bytes` that still says it was a LOB.
+   Bound on to Oracle as a bare `str` it is a VARCHAR2, which refuses anything
+   past 32 KB with ORA-01461, so a genuine LOB argument such as `sys.xmltype(:1)`
+   failed through the Mirror while working against the server behind it (#1067).
+   A backend with no LOB binding needs nothing new, since the value is still a
+   string. The Oracle passthrough example binds both kinds back through an
+   upstream temp LOB on a 12.1+ upstream, since seerdb has no CLOB / BLOB
+   Var-bind of its own.
 
 Verified over the SQLite-backed Mirror driven by the seerdb thin client's temp-LOB
 primitives (the auto-promotion is `12.1`+/PL/SQL-gated and the Mirror pins 11g, so

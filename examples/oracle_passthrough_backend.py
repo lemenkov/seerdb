@@ -43,7 +43,9 @@ from seerdb.common.tns_consts import (
 from seerdb.server.backend import (
     BackendError,
     BindVar,
+    BlobValue,
     Capability,
+    ClobValue,
     CursorResult,
     Result,
     SessionInfo,
@@ -429,6 +431,33 @@ class OraclePassthroughBackend:
             return LOB(data_type, bytes(value), self._conn).read()
         return value
 
+    def _upstream_temp_lob(self, value: object, is_blob: bool) -> TempLob:
+        # Make an upstream temp LOB holding `value` and return the marker that
+        # binds it: seerdb has no CLOB / BLOB value bind of its own.
+        assert self._conn is not None
+        locator = self._conn.create_temp_lob(is_blob=is_blob)
+        if value and isinstance(value, (str, bytes)):
+            self._conn.write_temp_lob(locator, value, is_blob=is_blob)
+        return TempLob(locator, is_blob)
+
+    def _upstream_lob_binds(self, binds: Sequence) -> list:
+        # A LOB the client bound into an ordinary statement arrives as its
+        # content, marked ClobValue / BlobValue (#1067). Bound on as a str it
+        # would be a VARCHAR2, which the upstream refuses past 32 KB (ORA-01461),
+        # so bind it as a LOB again. A PL/SQL block's binds are BindVars, whose
+        # LOB-ness the PL/SQL path already keeps (#981), and an upstream older
+        # than 12.1 has no temp LOB to put it in (#91), so both keep the value.
+        if not any(isinstance(b, (ClobValue, BlobValue)) for b in binds):
+            return list(binds)
+        if getattr(self._conn, 'field_version', 0) < FIELD_VERSION_12_1:
+            return list(binds)
+        return [
+            self._upstream_temp_lob(b, isinstance(b, BlobValue))
+            if isinstance(b, (ClobValue, BlobValue))
+            else b
+            for b in binds
+        ]
+
     def _resolve_object_binds(self, binds: Sequence) -> list:
         # Replace any object (ADT) bind -- a bare ObjectImage, or one wrapped in a
         # BindVar -- with the DbObject the upstream binds. A NULL object arrives
@@ -481,6 +510,7 @@ class OraclePassthroughBackend:
         assert self._conn is not None  # authenticate() ran before any execute
         cursor = self._conn.cursor()
         binds = self._resolve_object_binds(binds)
+        binds = self._upstream_lob_binds(binds)
         # A PL/SQL block hands its binds over as BindVar (value + type + buffer
         # size) so OUT binds can be registered correctly (#483). Bind each as an
         # OUT-capable Var seeded with the input value, run, and return every Var's
@@ -501,12 +531,10 @@ class OraclePassthroughBackend:
                     TNS_TYPE_CLOB,
                     TNS_TYPE_BLOB,
                 ):
-                    is_blob = b.tns_type == TNS_TYPE_BLOB
-                    locator = self._conn.create_temp_lob(is_blob=is_blob)
-                    if b.value and isinstance(b.value, (str, bytes)):
-                        self._conn.write_temp_lob(locator, b.value, is_blob=is_blob)
                     sizes.append(None)
-                    resolved.append(TempLob(locator, is_blob))
+                    resolved.append(
+                        self._upstream_temp_lob(b.value, b.tns_type == TNS_TYPE_BLOB)
+                    )
                 elif isinstance(b, BindVar):
                     sizes.append(dbtype_for_oracle_type(b.tns_type, b.csfrm))
                     resolved.append(b.value)
