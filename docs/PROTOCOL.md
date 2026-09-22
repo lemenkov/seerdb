@@ -2281,6 +2281,16 @@ per bind:
 
 **Direction codes** (`TNS_BIND_DIR_*`): `16` = OUT, `32` = IN, `48` = IN OUT.
 
+A server reports these **on the way back only** — a bind carries no direction on
+the way in — so this reply is the only place a caller learns what the block did
+with each bind. `cursor.bind_directions` surfaces them, and the Mirror's
+passthrough forwards them so its own reply says what its upstream said; a backend
+that cannot know leaves them out and every bind is reported OUT, as the Mirror
+did for every block before (#1064). It matters because an IN bind carries **no**
+value back: marking one OUT and returning its value shifts the client's reading
+of everything after it, and for a LONG-declared bind the echoed chunked value
+cannot be read in that position at all (`DPY-5000`, #1105).
+
 If any bind is OUT / IN OUT, a `TTI_RXD` (`0x07`) token follows, then one
 value per OUT / IN OUT bind **in bind order** (IN binds contribute nothing):
 

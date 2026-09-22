@@ -3043,7 +3043,8 @@ def _answer_query(
                     cursors,
                     request.bind_arrays,
                     request.bind_types,
-                )
+                ),
+                result.bind_directions,
             )
         # A query carries result columns (even with zero rows); a DDL/DML
         # statement carries none and gets a bare success status instead of a

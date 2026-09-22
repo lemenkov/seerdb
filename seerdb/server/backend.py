@@ -166,6 +166,12 @@ class Result:
     # cursor.lastrowid (#1077). None for anything else, and for a backend with no
     # Oracle rowids -- which is what every backend reported before this existed.
     last_rowid: str | None = None
+    # A PL/SQL block's bind directions, one per bind (16 OUT, 32 IN, 48 IN OUT),
+    # as the server reported them. The wire carries no direction on the way in,
+    # so a backend that cannot know leaves this empty and every bind is reported
+    # OUT, as before -- which is what a client tolerates but not what a real
+    # server says (#1064).
+    bind_directions: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
