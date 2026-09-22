@@ -1244,7 +1244,40 @@ def describe_wire_length(col: ColumnMeta) -> int:
 _INLINE_LONG_FROM = {
     TNS_TYPE_CLOB: frozenset({TNS_TYPE_CHAR, TNS_TYPE_VARCHAR, TNS_TYPE_LONG}),
     TNS_TYPE_BLOB: frozenset({TNS_TYPE_RAW, TNS_TYPE_LONGRAW}),
+    # A VECTOR defined as character data is served as its TEXT form, inline,
+    # instead of the binary image (#1107). Measured on 23ai: a client whose
+    # output type handler asks for LONG gets `[16,[1,3,5],[1.0E+000,0,5.0E+000]]`.
+    TNS_TYPE_VECTOR: frozenset({TNS_TYPE_CHAR, TNS_TYPE_VARCHAR, TNS_TYPE_LONG}),
 }
+
+
+def vector_as_text(value: 'SparseVector | Sequence') -> str:
+    """A VECTOR's text form, as 23ai renders it for a character define (#1107).
+
+    Dense is ``[e, e, ...]``, sparse ``[dims, [indices], [values]]``. An integer
+    element (an INT8 vector) prints as an integer; a float element prints in
+    scientific form with a three-digit exponent and at least one decimal
+    (``1.0E+000``, ``2.5E-001``), except an exact zero, which prints bare.
+    Measured against 23ai for INT8, FLOAT64 and sparse columns.
+    """
+
+    def element(item: object) -> str:
+        if isinstance(item, int) and not isinstance(item, bool):
+            return str(item)
+        number = float(item)  # type: ignore[arg-type]
+        if number == 0:
+            return '0'
+        (mantissa, _, exponent) = f'{number:.10E}'.partition('E')
+        mantissa = mantissa.rstrip('0')
+        if mantissa.endswith('.'):
+            mantissa += '0'
+        return f'{mantissa}E{exponent[0]}{int(exponent[1:]):03d}'
+
+    if isinstance(value, SparseVector):
+        indices = ','.join(str(int(i)) for i in value.indices)
+        values = ','.join(element(v) for v in value.values)
+        return f'[{value.num_dimensions},[{indices}],[{values}]]'
+    return '[' + ','.join(element(v) for v in value) + ']'
 
 
 def _effective_describe_type(col: ColumnMeta) -> int:
@@ -1661,6 +1694,12 @@ def _thin_column_value(value: object, col: 'ColumnMeta') -> bytes:
             type(value).__name__,
         )
     if col.data_type == TNS_TYPE_VECTOR and value is not None:
+        if col.inline_long_csfrm is not None:
+            # The client's define asked for this vector as character data, so it
+            # goes out as the text form inline, not the binary image (#1107).
+            return encode_long_value_thin(
+                vector_as_text(cast('SparseVector | Sequence', value))
+            )
         return encode_prefetched_lob_value_thin(
             encode_vector(_vector_as(value, col.vector_format))
         )

@@ -3825,6 +3825,21 @@ and for a BLOB fetched as bytes, `18 ...` — LONG RAW, with `csfrm 0` and so no
 charset field. Note the client has already converted its `VARCHAR` / `RAW`
 variable into a **LONG (RAW)** define; the wire never carries the user's type.
 
+**A VECTOR column defined this way gets its TEXT form** inline, not the binary
+image (#1107). Measured on 23ai, reading each back through a LONG define:
+
+| vector | text |
+|---|---|
+| sparse float32 `[1, 0, 5]` | `[16,[1,3,5],[1.0E+000,0,5.0E+000]]` |
+| sparse float64 `[1.5, 0.25, 0.5]` | `[16,[1,3,5],[1.5E+000,2.5E-001,5.0E-001]]` |
+| dense float64 | `[1.5E+000,-2.0E+000,3.25E+000]` |
+| dense int8 | `[1,2,3]` |
+
+A float element prints in scientific form with a three-digit exponent and at
+least one decimal; an exact zero prints bare; an INT8 element prints as an
+integer; sparse is `[dims, [indices], [values]]`. Serving the image instead left
+the client reading it under a character variable (`DPY-5000`).
+
 The reply is rows alone (`TTI_RXH` + `TTI_RXD`, no describe — the client has it),
 with the value framed inline exactly as §14.5c describes:
 
