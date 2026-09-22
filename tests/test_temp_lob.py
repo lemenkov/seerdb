@@ -13,7 +13,11 @@ python-oracledb on 21c (docs/PROTOCOL.md §14) — no server needed.
 import struct
 import unittest
 
+import seerdb
+from seerdb.client._conn_logic import _ConnectionLogic
+from seerdb.client.cursor import _bind_temp_lobs
 from seerdb.common.datatypes import TempLob
+from seerdb.common.lob import LOB
 from seerdb.common.tns import (
     _DECODE_FIELD_VERSION,
     _ENCODE_FIELD_VERSION,
@@ -22,7 +26,7 @@ from seerdb.common.tns import (
     encode_token_oac,
     encode_token_rxd,
 )
-from seerdb.common.tns_consts import TNS_LOB_OP_WRITE
+from seerdb.common.tns_consts import FIELD_VERSION_12_1, TNS_LOB_OP_WRITE
 
 
 class _FieldVersionIsolated(unittest.TestCase):
@@ -61,6 +65,16 @@ class CreateTempEncode(unittest.TestCase):
         # type 0x71 (BLOB) — one byte shorter type spec than CLOB.
         self.assertEqual(
             Body.hex(), '01012800010a00000100010201100000000171' + '00' * 47 + '020369'
+        )
+
+    def test_nclob_body(self):
+        Body = encode_dictionary_lobops({'seq': 3, 'create_temp': True, 'csfrm': 2})[3:]
+        # An NCLOB is a CLOB (type 0x70) with form 01 02 and the NATIONAL charset
+        # 2000 (AL16UTF16) in the trailing sb4; captured from python-oracledb
+        # against 23ai (#1066). Sending the CLOB body made a CLOB.
+        self.assertEqual(
+            Body.hex(),
+            '01012800010a0000010001020110000001020170' + '00' * 47 + '0207d0',
         )
 
 
@@ -114,6 +128,12 @@ class BindEncode(_FieldVersionIsolated):
         # type 0x71, max-data-length 112, cont-flag 0x02000000, charset 0, csfrm 0.
         self.assertEqual(Oac.hex(), '710100000170000402000000000000000000')
 
+    def test_nclob_oac(self):
+        Oac = encode_token_oac(TempLob(LOCATOR, False, csfrm=2))
+        # The CLOB OAC with csfrm 2; the charset field stays 873, as captured
+        # from python-oracledb binding a temp NCLOB on 23ai (#1066).
+        self.assertEqual(Oac.hex(), '7001000001700004020000000000020369020000')
+
     def test_oac_size_is_fixed_not_value_derived(self):
         # The OAC announces the fixed LOB buffer size, never the value's byte
         # budget: python-oracledb sends the same for an empty and a huge LOB, and
@@ -134,6 +154,52 @@ class BindEncode(_FieldVersionIsolated):
         self.assertEqual(
             Rxd, bytes.fromhex('012828') + struct.pack('>H', len(LOCATOR)) + LOCATOR
         )
+
+
+class _StubLogic(_ConnectionLogic):
+    def __init__(self, field_version):
+        self.field_version = field_version
+
+
+class CreateLobForm(unittest.TestCase):
+    # What connection.createlob(lob_type) asks the server for (#1066).
+    def test_each_lob_type_maps_to_its_type_and_form(self):
+        Logic = _StubLogic(FIELD_VERSION_12_1)
+        self.assertEqual(Logic._createlob_form(seerdb.DB_TYPE_CLOB), (0x70, 1))
+        self.assertEqual(Logic._createlob_form(seerdb.DB_TYPE_NCLOB), (0x70, 2))
+        self.assertEqual(Logic._createlob_form(seerdb.DB_TYPE_BLOB), (0x71, 1))
+
+    def test_a_non_lob_type_is_refused(self):
+        for Typ in (seerdb.DB_TYPE_VARCHAR, seerdb.DB_TYPE_JSON, 'CLOB', None):
+            with self.assertRaises(seerdb.ProgrammingError):
+                _StubLogic(FIELD_VERSION_12_1)._createlob_form(Typ)
+
+    def test_an_11g_server_is_refused(self):
+        with self.assertRaises(seerdb.NotSupportedError):
+            _StubLogic(FIELD_VERSION_12_1 - 1)._createlob_form(seerdb.DB_TYPE_CLOB)
+
+
+class BindTempLobs(unittest.TestCase):
+    # A createlob() LOB binds as the temp-LOB locator marker (#1066).
+    def test_a_temp_lob_becomes_its_marker(self):
+        Raw = struct.pack('>H', len(LOCATOR)) + LOCATOR
+        Clob = LOB(0x70, Raw, temp=True, csfrm=2)
+        Blob = LOB(0x71, Raw, temp=True)
+        Out = _bind_temp_lobs([1, Clob, Blob, 'x'])
+        self.assertEqual(Out[0], 1)
+        self.assertEqual(Out[3], 'x')
+        # The marker holds the BARE locator: it writes the ub2 itself.
+        self.assertEqual(
+            (Out[1].locator, Out[1].is_blob, Out[1].csfrm), (LOCATOR, False, 2)
+        )
+        self.assertEqual((Out[2].locator, Out[2].is_blob), (LOCATOR, True))
+
+    def test_a_fetched_lob_is_left_alone(self):
+        Fetched = LOB(0x70, LOCATOR)
+        self.assertIs(_bind_temp_lobs([Fetched])[0], Fetched)
+
+    def test_no_binds(self):
+        self.assertEqual(_bind_temp_lobs([]), [])
 
 
 class OerDecode(_FieldVersionIsolated):

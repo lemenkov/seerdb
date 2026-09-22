@@ -10,6 +10,7 @@ from seerdb.client._cursor_logic import _CursorLogic
 from seerdb.client.cursor import (
     _assign_out_binds,
     _assign_return_binds,
+    _bind_temp_lobs,
     _check_object_bind_support,
     _check_returning_support,
     _col_annotations,
@@ -83,7 +84,7 @@ class AsyncCursor(_CursorLogic):
     async def execute(self, operation: str, parameters=None) -> 'AsyncCursor':
         self._check_open()
         self._release_scroll_cursor()  # free any prior scrollable cursor (#181)
-        Bind = _resolve_parameters(operation, parameters)
+        Bind = _bind_temp_lobs(_resolve_parameters(operation, parameters))
         Bind = self._resolve_cursor_binds(Bind)
         Bind = await self._promote_large_lob_binds(operation, Bind)
         return await self._run(operation, Bind)

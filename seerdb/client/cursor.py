@@ -108,7 +108,7 @@ class Cursor(_CursorLogic):
         self._check_open()
         # Re-executing frees any cursor left open by a prior scrollable SELECT.
         self._release_scroll_cursor()
-        Bind = _resolve_parameters(operation, parameters)
+        Bind = _bind_temp_lobs(_resolve_parameters(operation, parameters))
         Bind = self._resolve_cursor_binds(Bind)
         Bind = self._promote_large_lob_binds(operation, Bind)
         return self._run(operation, Bind)
@@ -1285,6 +1285,28 @@ def _resolve_objects(Connection, Row: list) -> list:
                 Layout = Typ.attrs if Typ is not None else []
                 Attrs = decode_object_image(Val.image, Layout, Charset)
                 Out[I] = DbObject(Val.type_name, Attrs, dbtype=Typ)
+    return Out
+
+
+def _bind_temp_lobs(Bind: list) -> list:
+    """Turn every temp LOB the caller made into the marker that binds it (#1066).
+
+    A LOB from ``connection.createlob`` is bound by its locator, exactly as the
+    temp-LOB locator bind of #91 -- same OAC, same value, both captured byte for
+    byte against python-oracledb binding one. The marker holds the BARE locator
+    and writes its own ub2 in front, so the ub2 the LOB object carries is
+    stripped here rather than written twice. Anything else is left alone: a LOB a
+    query returned is a persistent locator, whose bind has not been measured."""
+    from seerdb.common.lob import LOB
+
+    if not Bind:
+        return Bind
+    Out = []
+    for V in Bind:
+        if isinstance(V, LOB) and V._temp:
+            Out.append(TempLob(V.raw[2:], V.data_type == TNS_TYPE_BLOB, csfrm=V._csfrm))
+        else:
+            Out.append(V)
     return Out
 
 

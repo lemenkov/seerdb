@@ -59,12 +59,18 @@ class TempLob:
     OUT / IN OUT value still has somewhere to be written back to (#978).
     """
 
-    __slots__ = ('locator', 'is_blob', 'var')
+    __slots__ = ('locator', 'is_blob', 'var', 'csfrm')
 
-    def __init__(self, locator: bytes, is_blob: bool, var: object = None):
+    def __init__(
+        self, locator: bytes, is_blob: bool, var: object = None, csfrm: int = 1
+    ):
         self.locator = locator
         self.is_blob = is_blob
         self.var = var
+        # The charset form: 2 for an NCLOB, 1 for a CLOB (and meaningless for a
+        # BLOB). An NCLOB binds as a CLOB OAC that differs ONLY in this byte
+        # (#1066), so without it the marker could not say which it was.
+        self.csfrm = csfrm
 
     def __repr__(self) -> str:
         kind = 'BLOB' if self.is_blob else 'CLOB'
