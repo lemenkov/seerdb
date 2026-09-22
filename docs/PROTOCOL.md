@@ -3246,6 +3246,27 @@ position (1 = overwrite from start).
 | `0x11000` | IS_OPEN           | Test whether the LOB is open         |
 | `0x80000` | ARRAY             | Array-style operation                |
 
+**Serving a BFILE (the Mirror, #1102).** Measured against 23ai, a BFILE column
+differs from a CLOB / BLOB in three ways, and each one costs a desync:
+
+- **The locator** is `ub2 inner length | 000108080000000100000000000000 | ub1
+  dir length | DIRECTORY | 00 | ub1 file length | file`, and carries nothing
+  else -- so a server needs no state to answer a FILE_* call, the names come
+  back in the locator the client sends. A client's LOBOPS request sends it from
+  the fixed block onward, without the leading inner length.
+- **The describe** says `data_length` **530**, charset 0, csfrm 0. Zero there is
+  the sixth time that trap has bitten (after BOOLEAN, ROWID, VECTOR, JSON and
+  REF CURSOR): the client reads no bytes for the column and takes the locator's
+  first byte for the next message type.
+- **The value** rides in the BARE form, `ub4 length | DALC locator`, NOT the
+  size / chunk-size metadata form a CLOB or BLOB carries. Captured: a BFILE is
+  `00000007 01 1a | 1a <locator>` where a BLOB has `02 0b b8 | 02 1f 7c`
+  between the two.
+
+A BFILE column is also **LOB-class for the deferred-row rule** above: 23ai
+answers the execute with a describe and no row, and the client re-executes by
+cursor id to collect them.
+
 **BFILE native read (#46).** A BFILE must be opened before it can be read.
 python-oracledb's `lob.read()` issues, on 21c: `FILE_ISOPEN` (pre-check, boolean
 result) → `FILE_OPEN` → `READ` → `FILE_CLOSE`. seerdb does the minimal

@@ -2305,7 +2305,7 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
         # fetch_lobs=False used to materialise the BFILE at fetch time, which
         # opens the file -- so the SELECT itself raised ORA-22285 where
         # python-oracledb hands back the locator.
-        self._skip_if_mirror('serving a BFILE column (#1102)')
+        self._skip_if_mirror_backend('postgres', 'serve a BFILE column')
         Conn = _connect(fetch_lobs=False)
         try:
             Cur = Conn.cursor()

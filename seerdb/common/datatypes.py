@@ -7,6 +7,7 @@
 # circular dependency.
 
 import datetime
+from dataclasses import dataclass
 from decimal import Decimal
 
 from seerdb.common.tns_consts import (
@@ -442,6 +443,22 @@ class IntervalYM:
 # IntervalYM is defined above, so register its Python-type mapping now that the
 # class exists (lets `cursor.var(seerdb.IntervalYM)` resolve).
 _PYTYPE_TO_DBTYPE[IntervalYM] = DB_TYPE_INTERVAL_YM
+
+
+@dataclass(frozen=True)
+class BFile:
+    """A BFILE column's value: a file on the SERVER's filesystem (#1102).
+
+    A BFILE has no content of its own on the wire -- it names a DIRECTORY object
+    and a file in it, and the client asks the server to test, open and read that
+    file afterwards. A Mirror backend hands over the two names; the locator is
+    built from them, and the FILE_* calls that follow are answered through the
+    backend. Whether the file exists is not asked here: a BFILE naming a missing
+    directory is a perfectly good value, and only fileexists() / read() fail.
+    """
+
+    directory: str
+    filename: str
 
 
 class BcDate:
