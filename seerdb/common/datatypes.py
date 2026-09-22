@@ -444,6 +444,76 @@ class IntervalYM:
 _PYTYPE_TO_DBTYPE[IntervalYM] = DB_TYPE_INTERVAL_YM
 
 
+class BcDate:
+    """An Oracle DATE or TIMESTAMP before year 1, which no ``datetime`` can hold (#1071).
+
+    Oracle's DATE reaches back to 4712 BC; Python's ``datetime`` starts at year
+    1. A Mirror backend that has such a value -- fetched from a real server, or
+    loaded from its own database -- hands it over as this, and the Mirror encodes
+    it byte for byte like any other date. The year is numbered as Oracle numbers
+    it: negative for BC, with no year 0, so -4712 is 4712 BC.
+
+    ``microsecond`` is the TIMESTAMP fraction; a DATE column drops it, as it does
+    a ``datetime``'s. A BC ``TIMESTAMP WITH TIME ZONE`` is not covered.
+    """
+
+    __slots__ = ('year', 'month', 'day', 'hour', 'minute', 'second', 'microsecond')
+
+    def __init__(
+        self,
+        year: int,
+        month: int,
+        day: int,
+        hour: int = 0,
+        minute: int = 0,
+        second: int = 0,
+        microsecond: int = 0,
+    ):
+        if not -4712 <= year <= -1:
+            raise ValueError(
+                f'year {year} is not before year 1 (-4712 to -1); use a datetime'
+            )
+        for name, value, low, high in (
+            ('month', month, 1, 12),
+            ('day', day, 1, 31),
+            ('hour', hour, 0, 23),
+            ('minute', minute, 0, 59),
+            ('second', second, 0, 59),
+            ('microsecond', microsecond, 0, 999999),
+        ):
+            if not low <= value <= high:
+                raise ValueError(f'{name} {value} is out of range')
+        self.year = year
+        self.month = month
+        self.day = day
+        self.hour = hour
+        self.minute = minute
+        self.second = second
+        self.microsecond = microsecond
+
+    def _fields(self) -> tuple:
+        return (
+            self.year,
+            self.month,
+            self.day,
+            self.hour,
+            self.minute,
+            self.second,
+            self.microsecond,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, BcDate):
+            return NotImplemented
+        return self._fields() == other._fields()
+
+    def __hash__(self) -> int:
+        return hash(self._fields())
+
+    def __repr__(self) -> str:
+        return 'BcDate({}, {}, {}, {}, {}, {}, {})'.format(*self._fields())
+
+
 class JSON:
     """Bind marker: send the wrapped Python value into a native ``JSON`` column
     (21c+). A bare ``dict`` already binds as JSON automatically; wrap a

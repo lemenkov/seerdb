@@ -2762,6 +2762,25 @@ paths are the exact inverse of `decode_number`.
 Century+100 | Year+100 | Month | Day | Hour+1 | Minute+1 | Second+1
 ```
 
+A year **before 1** (Oracle's DATE reaches back to -4712, i.e. 4712 BC, with no
+year 0) counts **down** from the same bias: both the century and the
+year-of-century of `|year|` are subtracted from 100. Measured with `DUMP(col, 16)`
+of stored columns on 23ai:
+
+| year  | century, year bytes |
+|-------|---------------------|
+| -4712 | `35 58` (100-47, 100-12) |
+| -101  | `63 63` |
+| -100  | `63 64` |
+| -44   | `64 38` |
+| -1    | `64 63` (century 0) |
+
+The other five bytes are as for any date, and a TIMESTAMP's fraction follows as
+usual. No Python `datetime` can hold such a value. The client reports it as
+`DateOutOfRangeError`, a `DataError` and `ValueError` (#1060). A Mirror backend
+hands one over as `seerdb.server.BcDate`, which the row encoder writes in this
+form (#1071); a BC `TIMESTAMP WITH TIME ZONE` is not covered.
+
 ### 11.3 TIMESTAMP
 
 11 bytes: 7-byte DATE + 4-byte nanosecond fractional seconds (big-endian unsigned integer).

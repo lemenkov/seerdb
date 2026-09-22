@@ -22,6 +22,7 @@ observation listener that decodes and logs what a client puts on the wire.
 
 from __future__ import annotations
 
+from seerdb.common.datatypes import BcDate
 from seerdb.common.tns import (
     ColumnMeta,
     ExecRequest,
@@ -62,6 +63,7 @@ from seerdb.server.service import BackendFactory, Server, serve
 from seerdb.server.session import handle_login, serve_session
 
 __all__ = [
+    'BcDate',
     'Backend',
     'BackendError',
     'BackendFactory',

@@ -26,6 +26,7 @@ from seerdb.common.crypto import (
 )
 from seerdb.common.datatypes import (
     JSON,
+    BcDate,
     BinaryDouble,
     BinaryFloat,
     IntervalYM,
@@ -11753,11 +11754,21 @@ def encode_lob_locator_thin(
     return head + _bytes_with_length(locator)
 
 
-def _encode_temporal(Value: datetime.date, DataType: int) -> bytes:
+def _encode_temporal(Value: datetime.date | BcDate, DataType: int) -> bytes:
     # A temporal column has a fixed wire width fixed by its *type*, not by the
     # particular value — so we dispatch on the column's data_type rather than
     # letting encode_token_datetime() pick 7/11/13 bytes from the value. A plain
     # date is promoted to midnight of that day.
+    if isinstance(Value, BcDate):
+        # A date before year 1, which no datetime can hold (#1071). Same layout;
+        # only the century / year bytes go below their bias.
+        if DataType == TNS_TYPE_TIMESTAMPTZ:
+            raise DataError('a date before year 1 cannot be sent with a time zone')
+        if DataType in (TNS_TYPE_TIMESTAMP, TNS_TYPE_TIMESTAMPLTZ):
+            return _encode_date_prefix(Value) + (Value.microsecond * 1000).to_bytes(
+                4, 'big'
+            )
+        return _encode_date_prefix(Value)
     Dt = (
         Value
         if isinstance(Value, datetime.datetime)
@@ -11855,7 +11866,7 @@ def encode_value(Value: object, DataType: int) -> bytes:
         # NUMBER via the exact base-100 Decimal encoder: high-precision values
         # (beyond float's ~15 significant digits) round-trip unchanged.
         return _bytes_with_length(encode_token_decimal(Value))
-    if isinstance(Value, datetime.date):
+    if isinstance(Value, (datetime.date, BcDate)):
         # datetime is a date subclass, so this covers both; the column's data_type
         # decides DATE / TIMESTAMP / TIMESTAMPTZ width.
         return _bytes_with_length(_encode_temporal(Value, DataType))
@@ -12086,7 +12097,7 @@ def _declared_value_bytes(Value: object, DataType: int) -> bytes | None:
     """
     if Value is None:
         return None
-    if isinstance(Value, datetime.date) and DataType in _DECLARED_TEMPORAL:
+    if isinstance(Value, (datetime.date, BcDate)) and DataType in _DECLARED_TEMPORAL:
         return _bytes_with_length(_encode_temporal(Value, DataType))
     if isinstance(Value, (int, float)) and not isinstance(Value, bool):
         if DataType == TNS_TYPE_BDOUBLE:
@@ -13322,11 +13333,16 @@ def encode_token_datetime(DT: datetime.datetime) -> bytes:
     return _encode_date_prefix(DT)
 
 
-def _encode_date_prefix(DT: datetime.datetime) -> bytes:
+def _encode_date_prefix(DT: datetime.datetime | BcDate) -> bytes:
+    # Century and year-of-century, each biased by 100. A BC year counts DOWN
+    # from the bias: -4712 is century 53, year 88 (35 58), the inverse of what
+    # decode_date reads (#1071).
+    (Century, YearOfCentury) = divmod(abs(DT.year), 100)
+    Sign = -1 if DT.year < 0 else 1
     return bytes(
         [
-            DT.year // 100 + 100,
-            DT.year % 100 + 100,
+            Sign * Century + 100,
+            Sign * YearOfCentury + 100,
             DT.month,
             DT.day,
             DT.hour + 1,
