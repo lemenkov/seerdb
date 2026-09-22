@@ -51,6 +51,8 @@ from seerdb.common.tns import (
     _STATE_KEY_EDITION,
     _THIN_OBJ_LOB_LOCATOR,
     AUTH_SERIAL_NUM,
+    LOBOPS_ERR_ALREADY_OPEN,
+    LOBOPS_ERR_NOT_OPENED,
     ArrayOutBind,
     ColumnMeta,
     ExecRequest,
@@ -84,7 +86,11 @@ from seerdb.common.tns import (
     encode_lob_read_response_oci,
     encode_lob_read_response_thin,
     encode_lobops_ack,
+    encode_lobops_echo,
+    encode_lobops_error,
+    encode_lobops_is_open,
     encode_lobops_length,
+    encode_lobops_open_ack,
     encode_logoff_status_oci,
     encode_logoff_status_thin,
     encode_long_fetch_row_oci,
@@ -2047,6 +2053,27 @@ class _TempLobs:
         self._buffers: dict[bytes, bytearray] = {}
         self._is_blob: dict[bytes, bool] = {}
         self._next = 0
+        # Locators this session has OPENed and not yet CLOSEd, for IS_OPEN to
+        # report (#903/#887). Any locator, not just a temp one -- the LOB a
+        # client opens is usually a column locator the Mirror emitted.
+        self._open: set[bytes] = set()
+
+    def mark_open(self, locator: bytes) -> None:
+        self._open.add(bytes(locator))
+
+    def mark_closed(self, locator: bytes) -> None:
+        self._open.discard(bytes(locator))
+
+    def is_open(self, locator: bytes) -> bool:
+        """Whether this session opened ``locator`` and has not closed it.
+
+        This is what the SESSION has been told, not what the database knows: a
+        LOB opened by PL/SQL on the backend is invisible here. Faithful for the
+        open/close bracket a client drives itself, which is what a LOB write
+        actually uses; a Mirror that relayed the question upstream would be
+        exact, and is worth doing if a caller ever needs it.
+        """
+        return bytes(locator) in self._open
 
     def mint(self, is_blob: bool) -> bytes:
         """A locator distinct from every other this session has handed out."""
@@ -2057,7 +2084,10 @@ class _TempLobs:
         return locator
 
     def append(self, locator: bytes, payload: bytes) -> None:
-        self._buffers.setdefault(bytes(locator), bytearray()).extend(payload)
+        # Through resolve(), so a write lands on the buffer the LOB was minted
+        # under whichever spelling of the locator the client sent (#903).
+        key = self.resolve(locator) or bytes(locator)
+        self._buffers.setdefault(key, bytearray()).extend(payload)
 
     def free(self, locator: bytes) -> None:
         # A client may free a locator the Mirror never saw written; that is fine,
@@ -2121,13 +2151,36 @@ def _emitted_lob(
     rather than trusted into the framing code."""
     if lob_emit_log is None:
         return None
+    # Try the locator as the client sent it, then without a leading 2-byte
+    # wrapper. A COLUMN locator arrives exactly as the Mirror emitted it, but a
+    # TEMP one is the Mirror's reply including the ub2 it was handed back in, so
+    # the same LOB reaches here under two spellings -- the same reason
+    # _TempLobs.resolve tries both (#826/#903).
     entry = lob_emit_log.content(locator)
+    if entry is None and len(locator) > 2:
+        entry = lob_emit_log.content(locator[2:])
     if entry is None:
         return None
     value, is_clob = entry
     if not isinstance(value, (str, bytes)):
         return None
     return (value, is_clob)
+
+
+def _emit_log_key(lob_emit_log: 'LobEmitLog | None', locator: bytes) -> bytes | None:
+    """Which spelling of ``locator`` the emit log is keyed by, or None.
+
+    The companion to :func:`_emitted_lob`: that one answers *what* is stored,
+    this one *where*, for the writes that have to update it in place.
+    """
+    if lob_emit_log is None:
+        return None
+    raw = bytes(locator)
+    if lob_emit_log.content(raw) is not None:
+        return raw
+    if len(raw) > 2 and lob_emit_log.content(raw[2:]) is not None:
+        return raw[2:]
+    return None
 
 
 def _answer_lobops(
@@ -2156,10 +2209,34 @@ def _answer_lobops(
         stream.write_packet(TNS_DATA, encode_create_temp_response(locator))
         return lobs, current_lob, current_object_lob
     if request.kind == 'write':
-        # Append at the write offset the client streamed (it writes from the
-        # start and appends, so a plain concat matches every real client).
-        temp_lobs.append(request.locator, request.payload)
-        stream.write_packet(TNS_DATA, encode_lobops_ack(request.locator))
+        # A write to a COLUMN LOB extends what the Mirror served under that
+        # locator, so the emit log is what has to grow -- a size() afterwards
+        # reads that log first and would otherwise keep reporting the length
+        # the LOB had when it was fetched (#903/#887).
+        emitted = _emitted_lob(lob_emit_log, request.locator)
+        key = _emit_log_key(lob_emit_log, request.locator)
+        if emitted is not None and lob_emit_log is not None and key is not None:
+            (value, is_clob) = emitted
+            # SPLICED at the write offset, not appended: `write(v, 1)`
+            # overwrites from the start. The offset is in the LOB's own units --
+            # characters for a CLOB, which is what the log already holds, while
+            # the wire carries UTF-16BE.
+            start = min(max(request.offset - 1, 0), len(value))
+            merged: str | bytes
+            if isinstance(value, str):
+                text = request.payload.decode('utf-16-be', 'replace')
+                merged = value[:start] + text + value[start + len(text) :]
+            else:
+                raw = request.payload
+                merged = value[:start] + raw + value[start + len(raw) :]
+            lob_emit_log.contents[key] = (merged, is_clob)
+        else:
+            # Append at the write offset the client streamed (it writes from the
+            # start and appends, so a plain concat matches every real client).
+            temp_lobs.append(request.locator, request.payload)
+        # Verbatim: the locator is echoed exactly as the client sent it, prefix
+        # and all. encode_lobops_ack would add a second length (#903/#887).
+        stream.write_packet(TNS_DATA, encode_lobops_echo(request.locator))
         return lobs, current_lob, current_object_lob
     if request.kind == 'free_temp':
         # Release the temp LOB now rather than at session end.
@@ -2167,6 +2244,20 @@ def _answer_lobops(
         stream.write_packet(TNS_DATA, encode_lobops_ack(request.locator))
         return lobs, current_lob, current_object_lob
     if request.kind == 'trim':
+        # A COLUMN LOB is truncated in the emit log, which is what serves its
+        # length and content afterwards -- trimming only the temp store left
+        # size() still reporting the untrimmed figure (#903/#887).
+        trimmed = _emitted_lob(lob_emit_log, request.locator)
+        trim_key = _emit_log_key(lob_emit_log, request.locator)
+        if trimmed is not None and lob_emit_log is not None and trim_key is not None:
+            (value, is_clob) = trimmed
+            # request.amount is in the LOB's own units, which is what the log
+            # holds: characters for a CLOB (a str), bytes for a BLOB.
+            lob_emit_log.contents[trim_key] = (value[: request.amount], is_clob)
+            stream.write_packet(
+                TNS_DATA, encode_lobops_length(request.locator, request.amount)
+            )
+            return lobs, current_lob, current_object_lob
         # Truncate the temp LOB to the requested length and report the new one.
         # A CLOB counts CHARACTERS and its buffer is UTF-16BE, so two bytes each.
         unit = 1 if temp_lobs.is_blob(request.locator) else 2
@@ -2199,10 +2290,50 @@ def _answer_lobops(
             TNS_DATA, encode_lobops_length(request.locator, len(content) // unit)
         )
         return lobs, current_lob, current_object_lob
+    if request.kind in ('open', 'close'):
+        # The state is remembered, because IS_OPEN has to report it back, and
+        # because the bracket is not idempotent: a real server refuses a second
+        # open and a close of something never opened. Acking those blindly told
+        # the client an error it was testing for had not happened (#903/#887).
+        already = temp_lobs.is_open(request.locator)
+        if request.kind == 'open':
+            if already:
+                stream.write_packet(
+                    TNS_DATA, encode_lobops_error(*LOBOPS_ERR_ALREADY_OPEN)
+                )
+                return lobs, current_lob, current_object_lob
+            temp_lobs.mark_open(request.locator)
+        else:
+            if not already:
+                stream.write_packet(
+                    TNS_DATA, encode_lobops_error(*LOBOPS_ERR_NOT_OPENED)
+                )
+                return lobs, current_lob, current_object_lob
+            temp_lobs.mark_closed(request.locator)
+        # Echoed verbatim, not through encode_lobops_ack: the client reads the
+        # locator back with read_raw_bytes and consumes no length prefix, so
+        # prepending one shifts everything after it. OPEN additionally owes the
+        # amount it sent -- it is the one op here with send_amount (#903/#887).
+        stream.write_packet(
+            TNS_DATA,
+            encode_lobops_open_ack(request.locator, request.amount)
+            if request.kind == 'open'
+            else encode_lobops_echo(request.locator),
+        )
+        return lobs, current_lob, current_object_lob
+    if request.kind == 'is_open':
+        # `lob.isopen()`. It owes the ack reply PLUS a ub1 flag; answering with a
+        # bare ack is not a safe fallback, because the client reads that byte
+        # regardless and would take whatever follows it (#903/#887).
+        stream.write_packet(
+            TNS_DATA,
+            encode_lobops_is_open(request.locator, temp_lobs.is_open(request.locator)),
+        )
+        return lobs, current_lob, current_object_lob
     if request.kind == 'ack':
-        # OPEN / CLOSE / TRIM / GET_CHUNK_SIZE: acknowledge with the content-free
-        # reply the client accepts. The value-returning form (a real chunk size,
-        # applying TRIM's length) is deferred (#421) — no test client needs it.
+        # TRIM / GET_CHUNK_SIZE: acknowledge with the content-free reply the
+        # client accepts. The value-returning form (a real chunk size, applying
+        # TRIM's length) is deferred (#421) — no test client needs it.
         stream.write_packet(TNS_DATA, encode_lobops_ack(request.locator))
         return lobs, current_lob, current_object_lob
     # A READ of an emitted column locator. The queue is row-major, matching the

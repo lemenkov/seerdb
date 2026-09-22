@@ -909,20 +909,25 @@ def test_a_column_lob_reports_its_own_size_not_zero() -> None:
     stream: Any = _CollectingStream()
 
     def length_of(locator: bytes) -> int:
-        # GET_LENGTH carries the locator ub2-prefixed where READ sends it bare;
-        # the parser handles both, and picking the wrong one here silently
-        # yields an empty locator and a length of 0 for the wrong reason.
+        # The locator goes RAW, and the reply echoes it VERBATIM. This fixture
+        # used to send it ub2-prefixed, on the #826 reading that GET_LENGTH
+        # differed from READ. It does not: a real Oracle locator OPENS with its
+        # own 2-byte length (`00 70` for a 114-byte one), which reads exactly
+        # like a framing prefix and is not one. Stripping it and re-adding a
+        # prefix happens to reproduce the bytes for such a locator, which is why
+        # the mistake survived -- and corrupts any locator whose first two bytes
+        # are something else, such as the Mirror's own (#903/#887).
         _answer_lobops(
             stream,
-            _lobops_request(TNS_LOB_OP_GET_LENGTH, locator, locator_prefixed=True),
+            _lobops_request(TNS_LOB_OP_GET_LENGTH, locator, locator_prefixed=False),
             [],
             _TempLobs(),
             lob_emit_log=log,
         )
-        # The reply is the acknowledged locator then a ub4 length (§14): skip
-        # the ub2-prefixed locator echo and read the length that follows.
+        # The reply is the echoed locator then a ub4 length (§14): skip the
+        # verbatim locator echo -- no length prefix -- and read what follows.
         body = stream.sent[-1]
-        head = 1 + 2 + len(locator)
+        head = 1 + len(locator)
         return decode_ub4(body[head:])[0]
 
     assert length_of(clob) == 100

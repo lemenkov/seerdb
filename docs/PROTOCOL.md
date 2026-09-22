@@ -3136,6 +3136,7 @@ form by default and opts into the prefix per call (`locator_prefixed`).
 | `0x4000`  | GET_CHUNK_SIZE    | The server's chunk size              |
 | `0x8000`  | OPEN              | Open; `amount` carries the MODE      |
 | `0x10000` | CLOSE             | Close                                |
+| `0x11000` | IS_OPEN           | Is the LOB open? (§14.4c)            |
 
 **CREATE_TEMP body** (no source locator): a fixed field block captured verbatim
 from python-oracledb on 21c, differing between CLOB (type `0x70`) and BLOB
@@ -3398,13 +3399,101 @@ of the wrong shape.
   / `encode_free_temp_lobs_piggyback`). Before #852 it was refused as
   `ORA-03115 (piggyback 96)`, so only the *first* temp-LOB write of a session
   ever worked.
-- **`OPEN`** (`0x8000`) / **`CLOSE`** (`0x10000`) / **`TRIM`** (`0x0020`) /
-  **`GET_CHUNK_SIZE`** (`0x4000`) — acked. Their *value-returning* forms (a real
-  server-preferred chunk size, applying `TRIM`'s new length, `GET_LENGTH` /
-  `IS_OPEN`) are deferred to #421: pinning those reply bytes needs a capture from
-  a client that actually sends them (the thin client doesn't, and thick needs
-  Instant Client), and the ack already keeps the wire in sync. `READ` (and any
-  unrecognised op) still routes to the #413 read path, unchanged.
+- **`OPEN`** (`0x8000`) / **`CLOSE`** (`0x10000`) — acked, and the state is
+  **remembered**, because `IS_OPEN` reports it back and because the bracket is
+  not idempotent (§14.4c). **`TRIM`** (`0x0020`) / **`GET_CHUNK_SIZE`**
+  (`0x4000`) are acked without one; their value-returning forms (a real
+  server-preferred chunk size, applying `TRIM`'s new length) stay deferred to
+  #421. `READ` (and any unrecognised op) still routes to the #413 read path,
+  unchanged.
+
+  Note this bullet used to defer `IS_OPEN` alongside them, on the reasoning that
+  "pinning those reply bytes needs a capture from a client that actually sends
+  them (the thin client doesn't)". That was **wrong**: python-oracledb thin
+  sends `IS_OPEN` on every `lob.isopen()`, and because the op had no case it
+  fell through to the read path and the client walked off the end of the reply
+  (#903/#887). An op assumed unreachable is worth re-testing before it is
+  deferred again.
+
+### 14.4c IS_OPEN, and the open/close bracket (#903/#887)
+
+**`IS_OPEN` (`0x11000`) owes an answer**, unlike `OPEN` / `CLOSE`. The reply is
+the acknowledged locator, a **`ub1`** flag (nonzero = open), then the success
+OER — and the locator is echoed **RAW**, without the `ub2` length an ordinary
+ack carries:
+
+```
+08 <locator bytes …> <ub1 flag> <OER>
+```
+
+The client reads it as `read_raw_bytes(len(its own locator))` followed by
+`read_ub1`, so a length prefix shifts every following byte and it takes two
+locator bytes as the flag. A plain ack is not a safe fallback either: the flag
+byte is read regardless, so the client would consume whatever follows and then
+desync.
+
+Establishing that took **two** sources, because one was not enough. Captured
+from 23ai, the two replies — asked once while closed and once while open —
+differ in **three of 169 bytes**, so the capture alone does not say which is the
+answer. The reference client's decoder settles it: it reads the locator, then a
+single `ub1`, and treats `> 0` as open. The other two moving bytes are
+server-side state *inside* the locator, which the client copies over its own
+but does not consult here.
+
+**The bracket is not idempotent.** A second `OPEN` and a `CLOSE` of something
+never opened are errors, and the reply is a **bare OER with no locator echo**:
+
+| condition | code | message (verbatim from 23ai) |
+|---|---|---|
+| open an already-open LOB | 22293 | `ORA-22293: LOB already opened in the same transaction` |
+| close an unopened LOB | 22289 | `ORA-22289: cannot perform  operation on an unopened file or LOB` |
+
+The double space after "perform" in ORA-22289 is the server's own.
+
+### 14.4d The locator field rule (#903/#887)
+
+One rule governs **every** TTI_LOBOPS op, and getting it wrong is what produced
+the whole `DPY-5000` / `DPY-5002` family:
+
+1. **Parse by the declared source length.** The request's `source_loc_len`
+   spans the locator field whichever form it takes. Do *not* read a `ub2`
+   prefix: a **column** LOB sends its locator raw, and its first two bytes are
+   locator content, not a length.
+2. **Echo the field back VERBATIM.** The client reads it with
+   `read_raw_bytes(len(its own locator))` and consumes no length prefix, so
+   adding one shifts every following byte. It then **adopts** the echoed bytes
+   as its locator, so a mis-echoed locator corrupts every later call on that
+   LOB — which is how a bad `WRITE` reply made the next `size()` return 0.
+3. **Resolve the key by recognition, never by inspecting bytes.** A **temp**
+   locator is what the Mirror handed back, so the client holds it *including*
+   the `ub2` the reply carried (declaring `len + 2`); a **column** locator
+   arrives raw in row data (declaring `len`). Try the field, then the field
+   without its first two bytes, against what the session actually minted or
+   emitted.
+
+Why this hid for so long: **a real Oracle locator begins with its own 2-byte
+length** — `00 70` for a 114-byte one. That reads exactly like a framing prefix.
+Stripping it and re-adding `ub2(112)` reproduces the identical bytes, so the
+wrong model round-trips perfectly against a real server and corrupts only
+locators whose first two bytes are something else, such as the Mirror's own
+`00 73`. #826 recorded the mistaken reading as fact ("GET_LENGTH carries the
+locator ub2-prefixed where READ sends it bare"), and the hand-built fixture
+written to match could never falsify it.
+
+**`WRITE` is the one exception to (1) in spirit**: both readings advance to the
+same place, because its payload follows the locator immediately, so its extent
+must be exact. It still takes the declared length — but its reply must echo
+verbatim, and passing the field to the ordinary ack (which prepends a length)
+desynced 44 tests.
+
+**A write or trim of a COLUMN LOB updates what the Mirror served**, not the
+temp-LOB store: the emit log is what answers a later `size()` or `read()`.
+`WRITE` splices at its 1-based offset — `lob.write(v, 1)` overwrites from the
+start rather than appending — in the LOB's own units, characters for a CLOB.
+
+**`OPEN`, `CLOSE` and `IS_OPEN` must extract the locator the same way**, since
+one records a state the next reads back. `isopen()` denied an open it had just
+accepted when they disagreed.
 
 ### 14.4b Operations on a temp LOB the CLIENT created (#826)
 

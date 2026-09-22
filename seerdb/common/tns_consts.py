@@ -465,6 +465,11 @@ TNS_LOB_OP_FILE_CLOSE = 0x0200
 TNS_LOB_OP_GET_CHUNK_SIZE = 0x4000
 TNS_LOB_OP_OPEN = 0x8000
 TNS_LOB_OP_CLOSE = 0x10000
+# `lob.isopen()`. Unlike OPEN / CLOSE this one owes an ANSWER -- the ack reply
+# plus a trailing ub1, nonzero meaning open (§18.4). A server that acks it
+# without the flag, or routes it to the read path as an unknown op, hands the
+# client a reply it walks off the end of (#903/#887).
+TNS_LOB_OP_IS_OPEN = 0x11000
 TNS_LOB_OP_ARRAY = 0x80000  # OR-ed onto an op that carries an array of locators
 
 # Bind OAC flag bits: every thin bind uses indicators; a PL/SQL associative-array

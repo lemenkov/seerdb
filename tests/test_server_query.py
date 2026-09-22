@@ -2682,9 +2682,15 @@ def test_parse_lobops_request_classifies_create_temp() -> None:
 
 
 def test_parse_lobops_request_extracts_the_write_locator_and_payload() -> None:
-    # WRITE carries the ub2-prefixed locator and a 0x0E chunked payload; the Mirror
+    # WRITE carries the locator field and a 0x0E chunked payload; the Mirror
     # pulls both out to append to the temp LOB (#412). Cover both the single-chunk
     # (<= 0xFC) and the multi-chunk (0xFE-marked) payload forms.
+    #
+    # WRITE reads a real ub2 prefix here, unlike the OPEN / CLOSE / IS_OPEN /
+    # GET_LENGTH group, which skip by the declared source length. Making WRITE
+    # match them regressed 44 tests: its payload starts immediately after the
+    # locator, so a two-byte error in the locator's extent misreads the 0x0E
+    # payload marker and corrupts every write (#903/#887).
     from seerdb.common.tns import encode_dictionary_lobops, parse_lobops_request
     from seerdb.common.tns_consts import TNS_LOB_OP_WRITE
 
@@ -2700,7 +2706,9 @@ def test_parse_lobops_request_extracts_the_write_locator_and_payload() -> None:
         )
         req = parse_lobops_request(body)
         assert req.kind == 'write'
-        assert req.locator == locator
+        # The field carries the ub2 the encoder wrote; resolve() maps it back.
+        assert req.locator.endswith(locator)
+        assert len(req.locator) == len(locator) + 2
         assert req.payload == payload
 
 
@@ -2783,7 +2791,9 @@ def test_minted_temp_clob_locator_declares_utf16be_content() -> None:
     assert _resolve_temp_lob_binds(request, temp_lobs).binds == ['A test string value']
 
 
-def _lobops_op_request(operation: int, locator: bytes, *, seq: int = 1) -> bytes:
+def _lobops_op_request(
+    operation: int, locator: bytes, *, seq: int = 1, prefixed: bool = True
+) -> bytes:
     # A TTI_LOBOPS request for a state op (FREE_TEMP / OPEN / CLOSE / TRIM /
     # GET_CHUNK_SIZE), built in the shared §14.1 layout with the ub2-prefixed
     # locator — the same field block the client's WRITE / FILE_OPEN encoders use.
@@ -2794,7 +2804,9 @@ def _lobops_op_request(operation: int, locator: bytes, *, seq: int = 1) -> bytes
 
     body = _fun_header(TTI_LOBOPS, seq, FIELD_VERSION_11_2)
     body += bytes([1])  # source pointer present
-    body += encode_sb4(len(locator) + 2)  # source locator length (+ub2)
+    # A temp-LOB op declares the locator length PLUS the ub2 prefix; a column
+    # LOB sends the locator raw and declares its size alone.
+    body += encode_sb4(len(locator) + 2 if prefixed else len(locator))
     body += bytes([0])  # dest pointer absent
     body += encode_sb4(0)  # dest_length
     body += encode_sb4(0)  # short source offset
@@ -2806,8 +2818,57 @@ def _lobops_op_request(operation: int, locator: bytes, *, seq: int = 1) -> bytes
     body += encode_sb4(0)  # dest offset (ub8)
     body += bytes([0])  # amount pointer flag
     body += struct.pack('>HHH', 0, 0, 0)  # three reserved ub2 array-LOB slots
-    body += struct.pack('>H', len(locator)) + locator  # ub2-prefixed locator
+    if prefixed:
+        body += struct.pack('>H', len(locator)) + locator
+    else:
+        body += locator  # raw, the way a column LOB carries it
     return body
+
+
+def test_is_open_reply_echoes_the_locator_raw_then_a_ub1_flag() -> None:
+    # The client reads this reply as read_raw_bytes(len(its own locator)) then
+    # read_ub1, so the locator goes back RAW -- the ub2 length an ordinary ack
+    # carries would shift every following byte and it would take two locator
+    # bytes as the flag (#903/#887).
+    from seerdb.common.tns import encode_lobops_is_open
+    from seerdb.common.tns_consts import TTI_RPA
+
+    locator = bytes.fromhex('0002010c02800001000000010000003ea9cd0001f5d4')
+    closed = encode_lobops_is_open(locator, False)
+    opened = encode_lobops_is_open(locator, True)
+
+    assert closed[0] == TTI_RPA
+    assert closed[1 : 1 + len(locator)] == locator  # raw: no ub2 in between
+    # Exactly one byte separates the locator from the status, and it is the flag.
+    assert closed[1 + len(locator)] == 0
+    assert opened[1 + len(locator)] == 1
+    # Nothing else moves between the two answers.
+    flag_at = 1 + len(locator)
+    assert closed[:flag_at] == opened[:flag_at]
+    assert closed[flag_at + 1 :] == opened[flag_at + 1 :]
+
+
+def test_open_close_errors_are_a_bare_oer() -> None:
+    # A failure carries NO locator echo -- captured from 23ai, a second
+    # lob.open() comes back as the OER token straight after the data flags
+    # (#903/#887). A reply built from the ack with a code swapped in would
+    # desync the client.
+    from seerdb.common.tns import (
+        LOBOPS_ERR_ALREADY_OPEN,
+        LOBOPS_ERR_NOT_OPENED,
+        encode_lobops_error,
+    )
+    from seerdb.common.tns_consts import TTI_OER, TTI_RPA
+
+    for code, message in (LOBOPS_ERR_ALREADY_OPEN, LOBOPS_ERR_NOT_OPENED):
+        reply = encode_lobops_error(code, message)
+        assert reply[0] == TTI_OER, code
+        assert reply[0] != TTI_RPA, code
+        assert message in reply, code
+    assert LOBOPS_ERR_ALREADY_OPEN[0] == 22293
+    assert LOBOPS_ERR_NOT_OPENED[0] == 22289
+    # The double space after "perform" is the server's own text, not a typo.
+    assert b'cannot perform  operation' in LOBOPS_ERR_NOT_OPENED[1]
 
 
 def test_parse_lobops_request_classifies_the_state_opcodes() -> None:
@@ -2821,6 +2882,7 @@ def test_parse_lobops_request_classifies_the_state_opcodes() -> None:
         TNS_LOB_OP_CLOSE,
         TNS_LOB_OP_FREE_TEMP,
         TNS_LOB_OP_GET_CHUNK_SIZE,
+        TNS_LOB_OP_IS_OPEN,
         TNS_LOB_OP_OPEN,
         TNS_LOB_OP_TRIM,
     )
@@ -2829,17 +2891,52 @@ def test_parse_lobops_request_classifies_the_state_opcodes() -> None:
     req = parse_lobops_request(_lobops_op_request(TNS_LOB_OP_FREE_TEMP, locator))
     assert req.kind == 'free_temp'
     assert req.locator == locator
-    for op in (
-        TNS_LOB_OP_OPEN,
-        TNS_LOB_OP_CLOSE,
-        TNS_LOB_OP_GET_CHUNK_SIZE,
+    # OPEN / CLOSE are named apart from the plain acks: the server has to
+    # remember the state so IS_OPEN can report it, and so a second open can be
+    # refused (#903/#887).
+    # OPEN / CLOSE / IS_OPEN take the locator RAW: the client writes it with no
+    # length of its own and declares `len(locator)` as the source length, so the
+    # declared length is the locator's exactly. GET_CHUNK_SIZE still goes
+    # through the older ub2-prefixed walk.
+    for op, kind in (
+        (TNS_LOB_OP_OPEN, 'open'),
+        (TNS_LOB_OP_CLOSE, 'close'),
+        (TNS_LOB_OP_IS_OPEN, 'is_open'),
     ):
-        req = parse_lobops_request(_lobops_op_request(op, locator))
-        assert req.kind == 'ack', op
+        req = parse_lobops_request(_lobops_op_request(op, locator, prefixed=False))
+        assert req.kind == kind, op
         assert req.locator == locator, op
-    trim = parse_lobops_request(_lobops_op_request(TNS_LOB_OP_TRIM, locator))
+    chunk = parse_lobops_request(_lobops_op_request(TNS_LOB_OP_GET_CHUNK_SIZE, locator))
+    assert chunk.kind == 'ack'
+    assert chunk.locator == locator
+    # TRIM joins the declared-length group: its reply echoes the locator
+    # verbatim, so the parse must hand back the field as sent (#903/#887).
+    trim = parse_lobops_request(
+        _lobops_op_request(TNS_LOB_OP_TRIM, locator, prefixed=False)
+    )
     assert trim.kind == 'trim'
     assert trim.locator == locator
+
+
+def test_open_close_and_is_open_agree_on_the_locator() -> None:
+    # The trio keys a session state off the locator, so all three must extract
+    # the SAME bytes. They did not: OPEN stripped a ub2 prefix unconditionally
+    # while IS_OPEN skipped by the declared length, so on a RAW locator (what a
+    # column LOB sends) one of them keyed on garbage and `isopen()` denied an
+    # open it had just accepted (#903/#887).
+    from seerdb.common.tns import parse_lobops_request
+    from seerdb.common.tns_consts import (
+        TNS_LOB_OP_CLOSE,
+        TNS_LOB_OP_IS_OPEN,
+        TNS_LOB_OP_OPEN,
+    )
+
+    raw = bytes.fromhex('0002010c02800001000000010000003ea9cd0001f5d4')
+    keys = {
+        parse_lobops_request(_lobops_op_request(op, raw, prefixed=False)).locator
+        for op in (TNS_LOB_OP_OPEN, TNS_LOB_OP_CLOSE, TNS_LOB_OP_IS_OPEN)
+    }
+    assert keys == {raw}
 
 
 def test_parse_lobops_read_extracts_offset_and_amount_from_a_raw_locator() -> None:
