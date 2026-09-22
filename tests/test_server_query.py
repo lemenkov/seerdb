@@ -355,6 +355,48 @@ def test_a_dml_status_carries_the_last_rowid() -> None:
         )
 
 
+def test_a_described_column_carries_its_domain_and_annotations() -> None:
+    # A 23ai column's domain and annotation map ride the describe; the Mirror
+    # wrote them empty (#1082). The client's own column reader reads them back.
+    from seerdb.common.tns import (
+        _DECODE_FIELD_VERSION,
+        _ENCODE_FIELD_VERSION,
+        ColumnMeta,
+        _decode_dcb_column,
+        _encode_dcb_column,
+    )
+    from seerdb.common.tns_consts import FIELD_VERSION_23_4, TNS_TYPE_NUMBER
+
+    col = ColumnMeta(
+        name=b'AGE',
+        data_type=TNS_TYPE_NUMBER,
+        data_length=22,
+        max_size=22,
+        precision=3,
+        domain_schema=b'PYO',
+        domain_name=b'PYO_SIMPLE_DOMAIN',
+        annotations=((b'ANNO_1', b'first annotation'), (b'ANNO_3', b'')),
+    )
+    plain = ColumnMeta(
+        name=b'ID', data_type=TNS_TYPE_NUMBER, data_length=22, max_size=22
+    )
+    enc = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_23_4)
+    dec = _DECODE_FIELD_VERSION.set(FIELD_VERSION_23_4)
+    try:
+        (decoded, rest) = _decode_dcb_column(_encode_dcb_column(col, 2) + b'TAIL')
+        (bare, _) = _decode_dcb_column(_encode_dcb_column(plain, 1))
+    finally:
+        _ENCODE_FIELD_VERSION.reset(enc)
+        _DECODE_FIELD_VERSION.reset(dec)
+    assert (decoded['domain_schema'], decoded['domain_name']) == (
+        b'PYO',
+        b'PYO_SIMPLE_DOMAIN',
+    )
+    assert decoded['annotations'] == {b'ANNO_1': b'first annotation', b'ANNO_3': b''}
+    assert rest == b'TAIL'  # nothing left unread, so the row stream stays in sync
+    assert (bare['domain_schema'], bare['annotations']) == (None, None)
+
+
 def test_encode_status_with_rowcounts_is_the_return_parameters_block() -> None:
     # The arraydmlrowcounts status carries the counts in the execute's
     # return-parameters block (TTI_RPA), laid out as a real server lays it out

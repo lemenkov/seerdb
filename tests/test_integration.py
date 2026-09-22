@@ -2121,7 +2121,6 @@ class ColumnDomainIntegration(_IntegrationBase):
         super().setUp()
         if self.conn.field_version < FIELD_VERSION_23_4:
             self.skipTest('column domains and annotations are 23ai')
-        self._skip_if_mirror('column domains and annotations (#1082)')
         self._drop_domain()
 
     def tearDown(self):
