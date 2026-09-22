@@ -107,6 +107,55 @@ class TestNamedRegionTSTZ(unittest.TestCase):
         self.assertIsNone(Dt.tzinfo)
 
 
+class TestBcDateCarriedOn(unittest.TestCase):
+    """The passthrough's switch: a BC date decodes to a value, not an error (#1069).
+
+    The Mirror's passthrough relays rows to a client that decides for itself, so
+    it must carry such a date on. The public client never sets the switch.
+    """
+
+    MIN_ORACLE_DATE = bytes.fromhex('35580101010101')
+
+    def setUp(self):
+        from seerdb.common.types import _DECODE_BC_DATES, set_decode_bc_dates
+
+        token = set_decode_bc_dates(True)
+        self.addCleanup(_DECODE_BC_DATES.reset, token)
+
+    def test_a_bc_date_becomes_a_bcdate(self):
+        from seerdb.common.datatypes import BcDate
+
+        self.assertEqual(decode_date(self.MIN_ORACLE_DATE), BcDate(-4712, 1, 1))
+
+    def test_a_bc_timestamp_keeps_its_fraction(self):
+        from seerdb.common.datatypes import BcDate
+
+        stamp = bytes.fromhex('6438030f0d1f2e075bca00')  # DUMP of a stored column
+        self.assertEqual(decode_date(stamp), BcDate(-44, 3, 15, 12, 30, 45, 123456))
+
+    def test_one_with_a_time_zone_still_raises(self):
+        # BcDate has no zone (#1071), so it is not invented one.
+        from seerdb.common.exceptions import DateOutOfRangeError
+
+        with self.assertRaises(DateOutOfRangeError):
+            decode_date(self.MIN_ORACLE_DATE + bytes(4) + bytes([20, 60]))
+
+    def test_a_malformed_date_is_still_malformed(self):
+        with self.assertRaises(DataError):
+            decode_date(bytes.fromhex('78780d01010101'))  # month 13
+
+    def test_the_switch_is_off_by_default(self):
+        import contextvars
+
+        from seerdb.common.exceptions import DateOutOfRangeError
+
+        def fresh():
+            with self.assertRaises(DateOutOfRangeError):
+                decode_date(self.MIN_ORACLE_DATE)
+
+        contextvars.Context().run(fresh)
+
+
 class TestBcDate(unittest.TestCase):
     """A BC date is VALID Oracle data that datetime cannot hold (#1060).
 

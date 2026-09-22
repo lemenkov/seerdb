@@ -16,10 +16,12 @@ client, and the same credentials open the upstream connection.
 
 from __future__ import annotations
 
+import functools
 import re
 import struct
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
+from typing import TypeVar
 
 import seerdb
 from seerdb.common.datatypes import TempLob, dbtype_for_oracle_type
@@ -40,6 +42,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_REF,
     TNS_TYPE_REFCURSOR,
 )
+from seerdb.common.types import reset_decode_bc_dates, set_decode_bc_dates
 from seerdb.server.backend import (
     BackendError,
     BindVar,
@@ -50,6 +53,27 @@ from seerdb.server.backend import (
     Result,
     SessionInfo,
 )
+
+_T = TypeVar('_T')
+
+
+def _carries_bc_dates(method: Callable[..., _T]) -> Callable[..., _T]:
+    # Decode a date before year 1 from upstream as a BcDate, not an error, for
+    # the length of one backend call: the client decides what to do with it, as
+    # it does against the real server (#1069). Per call, because the Mirror runs
+    # every backend call in a copy of its own context, so a switch set in one
+    # call is gone by the next. Every upstream fetch happens inside one of the
+    # calls this wraps: rows, implicit results and nested cursors are drained
+    # before it returns.
+    @functools.wraps(method)
+    def wrapper(*args: object, **kwargs: object) -> _T:
+        token = set_decode_bc_dates(True)
+        try:
+            return method(*args, **kwargs)
+        finally:
+            reset_decode_bc_dates(token)
+
+    return wrapper
 
 
 class OraclePassthroughBackend:
@@ -472,6 +496,7 @@ class OraclePassthroughBackend:
                 out.append(b)
         return out
 
+    @_carries_bc_dates
     def open_ref_cursor(self, sql: str, skip: int = 0) -> object:
         # A cursor to hand a PL/SQL block as an open `sys_refcursor` IN
         # parameter (#1048). It has to be left OPEN with its rows unread, which
@@ -506,6 +531,7 @@ class OraclePassthroughBackend:
         except seerdb.DatabaseError as exc:
             raise _relay_error(exc) from exc
 
+    @_carries_bc_dates
     def execute(self, sql: str, binds: Sequence = ()) -> Result:
         assert self._conn is not None  # authenticate() ran before any execute
         cursor = self._conn.cursor()
@@ -630,6 +656,7 @@ class OraclePassthroughBackend:
             raise error from exc
         return cursor.rowcount or 0, list(cursor.getarraydmlrowcounts())
 
+    @_carries_bc_dates
     def execute_returning(self, sql: str, rows: Sequence[Sequence]) -> Result:
         # DML ... RETURNING col INTO :b (#689). The upstream is a real Oracle, so
         # the statement goes over unchanged; only the binds the clause fills need
