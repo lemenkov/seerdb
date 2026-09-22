@@ -1601,18 +1601,33 @@ def _encode_oer(
         + _encode_batch_ub4_array(offsets)  # batch error row offsets
         + _encode_batch_messages(messages)  # batch error messages
         + _oer_version_tail(ora_code, rowcount)
-        # The message DALC (read only when ora_code≠0). A message over 252 bytes
-        # is chunked, and the chunk framing depends on the field version the
-        # session negotiated: single-byte chunk lengths below 12.2, ub4 ones from
-        # it on. encode_chr picks the form the client will read (#734); a short
-        # message frames the same either way, and stays on the plain path so the
-        # captured terminator built at import time needs nothing defined later.
-        + (
-            _bytes_with_length(message)
-            if len(message) <= TNS_MAX_SHORT_LENGTH
-            else encode_chr(message)
-        )
+        + _oer_message(ora_code, message)
     )
+
+
+def _oer_message(ora_code: int, message: bytes) -> bytes:
+    # The message DALC, which a client reads ONLY when the error number is
+    # nonzero. A message over 252 bytes is chunked, and the chunk framing depends
+    # on the field version the session negotiated: single-byte chunk lengths
+    # below 12.2, ub4 ones from it on. encode_chr picks the form the client will
+    # read (#734); a short message frames the same either way, and stays on the
+    # plain path so the captured terminator built at import time needs nothing
+    # defined later.
+    #
+    # On SUCCESS, from 12.1, nothing at all is written. A 12.1+ client reads the
+    # message only `if error_num != 0`, so the empty-length byte written here
+    # before was a byte no client ever consumed. That was harmless while the OER
+    # ended the response -- the client simply stopped. Under end-of-response
+    # framing it does not stop there: it reads on for the marker, took that
+    # 0x00 as the next message type, and failed every login with "unknown
+    # protocol message type 0" (#1059). A real 23ai sends no such byte, or
+    # python-oracledb would trip on it too. Below 12.1 the captured bytes stand,
+    # and end-of-response cannot be negotiated there anyway.
+    if not ora_code and _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
+        return b''
+    if len(message) <= TNS_MAX_SHORT_LENGTH:
+        return _bytes_with_length(message)
+    return encode_chr(message)
 
 
 def _oer_version_tail(ora_code: int, rowcount: int) -> bytes:
