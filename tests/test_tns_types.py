@@ -798,6 +798,15 @@ class TestUrowid(unittest.TestCase):
     # ROWID was "*BAEAGYMCwQL+" (type tag 0x02 + 9 rowid bytes carrying the
     # NUMBER primary key c1 02).
 
+    def test_a_physical_rowid_in_a_urowid_column(self):
+        # Tag 0x01: the ordinary extended rowid, as the same row's ROWID column
+        # prints it and python-oracledb renders it. Bytes captured from 23ai
+        # (#1086); seerdb used to render them '*AAH1wQAAAAFa7QAA'.
+        self.assertEqual(
+            urowid_to_string(bytes.fromhex('010001f5c1000000015aed0000')),
+            'AAAfXBAAAAAAVrtAAA',
+        )
+
     def test_urowid_to_string(self):
         self.assertEqual(
             urowid_to_string(bytes.fromhex('02040100198302c102fe')), '*BAEAGYMCwQL+'

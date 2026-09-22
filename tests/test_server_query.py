@@ -397,6 +397,22 @@ def test_a_described_column_carries_its_domain_and_annotations() -> None:
     assert (bare['domain_schema'], bare['annotations']) == (None, None)
 
 
+def test_a_urowid_is_served_with_the_tag_its_kind_carries() -> None:
+    # The tag byte tells a client what the rowid is: 0x02 logical, 0x01 physical,
+    # both captured from 23ai. Every value used to go out tagged 0x01, so
+    # python-oracledb read an IOT's logical rowid as a physical one (#1087).
+    from seerdb.common.tns import encode_sb4, encode_urowid_value
+
+    # A logical rowid: 0x02 + the '*' body's bytes (an IOT row, captured).
+    logical = encode_urowid_value('*BAEAGYMCwQL+')
+    assert logical.endswith(bytes.fromhex('02040100198302c102fe'))
+    # A physical rowid in a UROWID column: 0x01 + object / file / block / slot,
+    # big-endian (captured: the ROWID column of the same row printed the same).
+    physical = encode_urowid_value('AAAfXBAAAAAAVrtAAA')
+    assert physical.endswith(bytes.fromhex('010001f5c1000000015aed0000'))
+    assert encode_urowid_value(None) == encode_sb4(0)
+
+
 def test_encode_status_with_rowcounts_is_the_return_parameters_block() -> None:
     # The arraydmlrowcounts status carries the counts in the execute's
     # return-parameters block (TTI_RPA), laid out as a real server lays it out

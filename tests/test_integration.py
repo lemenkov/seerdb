@@ -2165,6 +2165,28 @@ class ColumnDomainIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class PhysicalUrowidIntegration(_IntegrationBase):
+    """A physical rowid stored in a UROWID column (#1086)."""
+
+    def test_it_reads_back_as_the_same_rowid(self):
+        # A UROWID value is tagged 0x01 when it holds a physical rowid; it used to
+        # render in the '*' logical form, unlike the same row's ROWID column and
+        # unlike python-oracledb.
+        self._skip_if_mirror_backend(
+            'postgres', 'store a rowid in a ROWID / UROWID column'
+        )
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, r ROWID, u UROWID)')
+        self.cur.execute(f'INSERT INTO {self.TABLE} (n) VALUES (1)')
+        self.cur.execute(f'UPDATE {self.TABLE} SET r = ROWID, u = ROWID')
+        self.cur.execute(f'SELECT r, u FROM {self.TABLE}')
+        (r, u) = self.cur.fetchone()
+        self.assertFalse(u.startswith('*'), u)
+        self.assertEqual(u, r)
+        self.cur.execute(f'SELECT n FROM {self.TABLE} WHERE ROWID = :1', [u])
+        self.assertEqual(self.cur.fetchall(), [(1,)])
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class TempLobBindIntegration(_IntegrationBase):
     """Large CLOB / BLOB into a PL/SQL locator param (#91).
 

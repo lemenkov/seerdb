@@ -2899,18 +2899,32 @@ slot 0 → `AAAK6JAAEAAACGPAAA` (matches `ROWIDTOCHAR`).
 A **UROWID** (universal / logical rowid, TNS type 208 — e.g. the rowid of an
 index-organized table) uses the same RXD framing as a LOB column: `ub4
 num_bytes`, a 1-byte length echo, then `num_bytes` raw rowid bytes. The first
-byte is a type tag; the printable form is `"*"` + standard base-64 of the
-remaining bytes (no `=` padding). Example: value
-`02 04 01 00 19 83 02 c1 02 fe` → `*BAEAGYMCwQL+` (the trailing `c1 02` is the
-table's NUMBER primary key, since an IOT rowid is logical). NULL when
-`num_bytes` is 0.
+byte is a **type tag, and the printable form depends on it** (captured from 23ai,
+#1086):
+
+- **`02` — logical** (an index-organized table's rowid): `"*"` + standard
+  base-64 of the remaining bytes (no `=` padding). Example: value
+  `02 04 01 00 19 83 02 c1 02 fe` → `*BAEAGYMCwQL+` (the trailing `c1 02` is the
+  table's NUMBER primary key, since an IOT rowid is logical).
+- **`01` — physical** (an ordinary rowid stored in a UROWID column): 13 bytes,
+  the tag then data object (ub4), partition / relative file (ub2), block (ub4)
+  and slot (ub2), big-endian, rendered as the ordinary 18-character extended
+  rowid. Example: `01 0001f5c1 0000 00015aed 0000` → `AAAfXBAAAAAAVrtAAA`,
+  which is what the same row's ROWID column prints. python-oracledb branches on
+  the tag the same way; rendering this one in the `*` form gave a string that
+  matched neither.
+
+NULL when `num_bytes` is 0.
 
 **Server side — the Mirror (#484).** The Mirror holds a rowid as its rendered
 string (what the backend hands back), so it inverts the render before emitting.
 `encode_rowid_value` parses the 18-char string back to object / file / block /
 slot (`string_to_rowid`, the inverse of the render) and writes the structured
-RID; `encode_urowid_value` base64-decodes the `*`-body and re-frames it with a
-leading type tag (the tag is stripped on decode, so any value round-trips). Both
+RID; `encode_urowid_value` picks the tag from the string: a `*` rowid is tag
+`02` + its base64-decoded body, an 18-character one is tag `01` + its four
+big-endian fields (#1086). The tag is not cosmetic: a client renders by it, so
+the old fixed `01` made python-oracledb read every logical rowid as a physical
+one, which then matched no row. Both
 are routed before the scalar NULL path, since a NULL rowid still carries its own
 framing (the RID present indicator / a zero `num_bytes`), not the empty DALC.
 Verified live over 11g: `ROWID == ROWIDTOCHAR(ROWID)`, a rowid used as a bind,
