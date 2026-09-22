@@ -6008,6 +6008,21 @@ an ORA error but an `AttributeError`: the Mirror answers with an internal fault
 and the client's connection **dies** (`DPY-4011`) rather than receiving an error
 it can act on (seerdb#826).
 
+A **large** document is served inline too, not through a LOB. Captured from 23ai
+serving a 32 KB XMLType to python-oracledb, the image is the same STRING form
+with its length field in the long form, `fe` + a 4-byte big-endian length that
+spans the whole image (its own five bytes included):
+
+| document | image head |
+|---|---|
+| `<s>tiny</s>\n` (12 bytes) | `85 01 14 01 00000014` (length 20) |
+| 32782 bytes | `85 01 fe 0000801a 01 00000014` (length 32794) |
+
+Around the image nothing changes: the frame's image-length `sb4` simply grows,
+and the image rides as ordinary chunked column bytes (the server chunked it at
+2000 bytes). The Mirror used to refuse anything over the 1-byte length with
+ORA-03115, which is what python-oracledb's `test_2531` / `test_2534` hit (#1073).
+
 **Limitation:** Oracle **11g** XMLType *columns* are CLOB-stored with a complex
 binary image whose locator seerdb can't read (a reference-less case —
 python-oracledb requires 12.1+). That image sets a distinguishing flag bit

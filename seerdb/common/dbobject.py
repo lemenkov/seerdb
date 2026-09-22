@@ -756,22 +756,27 @@ def encode_xmltype(Value: object, Charset: int = AL32UTF8_CHARSET) -> bytes:
     :func:`decode_xmltype` for the ``STRING`` form.
 
     The image is the shared header (flags + version + length), a 1-byte XML
-    version, a ub4 flag word (``STRING``), then the UTF-8 content. Only the
-    inline form is produced; a large (CLOB-backed) document is not, matching the
-    decoder's reach. A live 23ai additionally sets a ``0x10`` bit in the flag
-    word, which python-oracledb ignores (it checks only STRING / LOB /
-    SKIP_NEXT_4), so the bare STRING flag round-trips through either reader (#124).
+    version, a ub4 flag word (``STRING``), then the UTF-8 content. A live 23ai
+    additionally sets a ``0x10`` bit in the flag word, which python-oracledb
+    ignores (it checks only STRING / LOB / SKIP_NEXT_4), so the bare STRING flag
+    round-trips through either reader (#124).
+
+    A large document is inline too. Captured from 23ai serving a 32 KB one to
+    python-oracledb, the server sends the same STRING image with the length in
+    its long form, ``fe`` + a 4-byte length, and the content rides as ordinary
+    chunked column bytes; no LOB is involved (#1073).
     """
     content = str(Value).encode('utf-8')
     tail = bytes([1]) + _XML_TYPE_STRING.to_bytes(4, 'big') + content
-    if len(tail) + 3 > TNS_MAX_SHORT_LENGTH:
-        raise NotSupportedError(
-            'encoding a large (CLOB-backed) XMLType is not supported'
-        )
-    # flags + version + 1-byte image length + tail; the length spans the whole
-    # image, as the server writes it (the reader skips it, so it need only be
-    # well-formed).
-    return bytes([_XML_IMAGE_FLAGS, 1, len(tail) + 3]) + tail
+    # flags + version + image length + tail; the length spans the whole image,
+    # its own field included, as the server writes it.
+    if len(tail) + 3 <= TNS_MAX_SHORT_LENGTH:
+        return bytes([_XML_IMAGE_FLAGS, 1, len(tail) + 3]) + tail
+    return (
+        bytes([_XML_IMAGE_FLAGS, 1, TNS_LONG_LENGTH_INDICATOR])
+        + (len(tail) + 7).to_bytes(4, 'big')
+        + tail
+    )
 
 
 def is_xml_type(typ: object) -> bool:
