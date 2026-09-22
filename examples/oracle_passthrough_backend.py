@@ -844,18 +844,17 @@ class OraclePassthroughBackend:
     def change_password(
         self, username: str, old_password: str, new_password: str
     ) -> None:
-        # ALTER USER ... REPLACE validates the old password and sets the new one
-        # on the real Oracle; the live upstream session stays authenticated. Then
-        # update the shared credential map so a fresh Mirror session authenticates
-        # (O5LOGON) with the new password and the old one is rejected (#21/#486).
+        # Relay the change as the same protocol call the client made, through the
+        # upstream connection's own changepassword; the live upstream session
+        # stays authenticated. Not as ALTER USER ... REPLACE: the server rejects
+        # the two routes with different codes -- ORA-28218 for the SQL, where
+        # the protocol call gets the ORA-01017 a client expects (#1089). Then
+        # update the shared credential map so a fresh Mirror session
+        # authenticates (O5LOGON) with the new password and the old one is
+        # rejected (#21/#486).
         assert self._conn is not None  # authenticate() ran before any execute
-        cursor = self._conn.cursor()
-        quoted = new_password.replace('"', '""')
-        old_quoted = old_password.replace('"', '""')
         try:
-            cursor.execute(
-                f'ALTER USER {username} IDENTIFIED BY "{quoted}" REPLACE "{old_quoted}"'
-            )
+            self._conn.changepassword(old_password, new_password)
         except seerdb.DatabaseError as exc:
             raise _relay_error(exc) from exc
         self._credentials[username.upper()] = new_password
