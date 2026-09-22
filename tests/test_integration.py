@@ -2186,6 +2186,55 @@ class PhysicalUrowidIntegration(_IntegrationBase):
         self.assertEqual(self.cur.fetchall(), [(1,)])
 
 
+def _kill_session(sid) -> None:
+    # Kill a session through the suite's admin account, as a DBA would. The
+    # admin, not the session's own user, reads v$session: an ordinary account
+    # cannot (ORA-00942).
+    with seerdb.connect(
+        host=_HOST,
+        port=_PORT,
+        user=_ADMIN_USER,
+        password=_ADMIN_PASSWORD,
+        service_name=_SERVICE,
+        **_FV_KW,
+    ) as admin:
+        cur = admin.cursor()
+        cur.execute('SELECT serial# FROM v$session WHERE sid = :1', [sid])
+        (serial,) = cur.fetchone()
+        cur.execute(f"ALTER SYSTEM KILL SESSION '{sid},{serial}'")
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+@unittest.skipUnless(
+    _ADMIN_USER, 'set SEERDB_TEST_ADMIN_USER (a DBA) to kill a session'
+)
+class PingKilledSessionIntegration(unittest.TestCase):
+    """A ping on a session the server killed raises, as the server says (#1095)."""
+
+    def test_ping_raises_on_a_killed_session(self):
+        conn = seerdb.connect(
+            host=_HOST,
+            port=_PORT,
+            user=_USER,
+            password=_PASSWORD,
+            service_name=_SERVICE,
+            **_FV_KW,
+        )
+        try:
+            if conn.field_version < FIELD_VERSION_10_2:
+                self.skipTest('9i pings with a query, which already raises')
+            cur = conn.cursor()
+            cur.execute("SELECT SYS_CONTEXT('userenv', 'sid') FROM dual")
+            _kill_session(int(cur.fetchone()[0]))
+            with self.assertRaises(seerdb.DatabaseError):
+                conn.ping()
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 - the session is gone
+                pass
+
+
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class ProxyLoginIntegration(unittest.TestCase):
     """A proxy login, ``user[proxy]`` (#126), keeps its proxy end to end (#1093).
@@ -5347,6 +5396,25 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                 await Cur.execute(f'DROP TABLE {Table}')
         finally:
             await Conn.close()
+
+    async def test_ping_raises_on_a_killed_session(self):
+        # Async twin of PingKilledSessionIntegration (#1095).
+        if not _ADMIN_USER:
+            self.skipTest('set SEERDB_TEST_ADMIN_USER (a DBA) to kill a session')
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            if Conn.field_version < FIELD_VERSION_10_2:
+                self.skipTest('9i pings with a query, which already raises')
+            Cur = Conn.cursor()
+            await Cur.execute("SELECT SYS_CONTEXT('userenv', 'sid') FROM dual")
+            _kill_session(int((await Cur.fetchone())[0]))
+            with self.assertRaises(seerdb.DatabaseError):
+                await Conn.ping()
+        finally:
+            try:
+                await Conn.close()
+            except Exception:  # noqa: BLE001 - the session is gone
+                pass
 
     async def test_createlob_binds_as_a_lob(self):
         # Async twin of CreateLobIntegration (#1066).

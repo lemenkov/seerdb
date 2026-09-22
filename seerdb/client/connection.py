@@ -2623,7 +2623,7 @@ class OracleConnect(_ConnectionLogic):
 
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_PING))
         self.send(TNS_DATA, Data)
-        self._handle_response()
+        self._raise_reply_error(self._handle_response())
 
     def changepassword(self, old_password: str, new_password: str) -> None:
         """Change the connected user's password (#21, oracledb-compatible).

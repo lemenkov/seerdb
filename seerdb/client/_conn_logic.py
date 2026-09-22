@@ -112,6 +112,26 @@ class _ConnectionLogic:
 
         def _send_break(self) -> None: ...
 
+    # --- Ping (#1095) -------------------------------------------------------
+
+    @staticmethod
+    def _raise_reply_error(Result: object) -> None:
+        """Raise the ORA error a call's reply carries, if it carries one.
+
+        A ping on a session the server has killed is answered with ORA-00028
+        "session has been terminated" IN the reply; ping used to read the reply
+        and drop it, so a killed session pinged healthy and a pool handed it out
+        (python-oracledb raises there). Shared by the sync and async ping."""
+        from seerdb.common.exceptions import from_ora_code
+
+        # Only a decoded status carries an int code in slot 1. A clean reply can
+        # come back in the (done, accumulator) shape instead, whose slot 1 is the
+        # accumulator tuple -- not a code, and not an error.
+        Code = Result[1] if isinstance(Result, tuple) and len(Result) > 1 else 0
+        if isinstance(Code, int) and Code:
+            Msg = Result[5] if isinstance(Result, tuple) and len(Result) > 5 else None
+            raise from_ora_code(Code)(Msg or f'ORA-{Code:05d}', code=Code)
+
     # --- Temporary LOBs (#1066) ----------------------------------------------
 
     def _createlob_form(self, lob_type) -> tuple[int, int]:
