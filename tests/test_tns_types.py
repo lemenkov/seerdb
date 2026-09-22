@@ -1334,3 +1334,57 @@ class TestCharsetAwareDecode(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestMixedPrecisionBatch(unittest.TestCase):
+    """One wire width per temporal column of an array bind (#1098).
+
+    Width is chosen per value -- 7 bytes without a sub-second part, 11 with one
+    -- but every row of an array bind must match the single OAC. A mixed batch
+    sent both widths and the server answered ORA-01483.
+    """
+
+    PLAIN = datetime.datetime(2020, 2, 29)
+    FRAC = datetime.datetime(2020, 2, 29, 23, 59, 59, 123456)
+
+    def _widen(self, rows):
+        from seerdb.common.tns import _widen_batch_datetimes
+
+        return _widen_batch_datetimes(rows)
+
+    def test_a_mixed_column_goes_out_at_one_width(self):
+        from seerdb.common.tns import encode_token_oac, encode_token_rxd
+
+        rows = self._widen([[1, self.PLAIN], [2, self.FRAC]])
+        widths = {len(encode_token_rxd(r[1])) for r in rows}
+        self.assertEqual(widths, {12})  # 1-byte length + the 11-byte TIMESTAMP
+        # and the descriptor says TIMESTAMP for either row's value
+        self.assertEqual(
+            {encode_token_oac(r[1]) for r in rows},
+            {encode_token_oac(self.FRAC)},
+        )
+
+    def test_the_values_are_unchanged(self):
+        rows = self._widen([[1, self.PLAIN], [2, self.FRAC]])
+        self.assertEqual([r[1] for r in rows], [self.PLAIN, self.FRAC])
+
+    def test_an_unmixed_column_is_left_alone(self):
+        from seerdb.common.tns import encode_token_rxd
+
+        for same in (
+            [[1, self.PLAIN], [2, self.PLAIN]],
+            [[1, self.FRAC], [2, self.FRAC]],
+        ):
+            rows = self._widen(same)
+            self.assertEqual(rows, same)
+            self.assertEqual(len({len(encode_token_rxd(r[1])) for r in rows}), 1)
+
+    def test_an_aware_column_is_left_alone(self):
+        # Widening an aware value would mean inventing a zone for the others.
+        aware = self.PLAIN.replace(tzinfo=datetime.timezone.utc)
+        rows = [[1, aware], [2, self.FRAC]]
+        self.assertEqual(self._widen(rows), rows)
+
+    def test_a_single_row_is_left_alone(self):
+        rows = [[1, self.PLAIN]]
+        self.assertEqual(self._widen(rows), rows)

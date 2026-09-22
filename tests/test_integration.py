@@ -44,6 +44,7 @@ from seerdb.common.tns_consts import (
 # on fv2, not fixable fv2 bind gaps (those are #172 dates, #173 intervals,
 # #174 national charset).
 _FV2_UNSUPPORTED = (
+    ('mixed_batch', 'executemany (array DML) is a 10g+ path'),
     ('lastrowid', 'the fv2 DML status is not read for a rowid yet (#1079)'),
     ('binary_double', 'BINARY_DOUBLE is a 10g+ type; Oracle 9i lacks it'),
     ('binary_float', 'BINARY_FLOAT is a 10g+ type; Oracle 9i lacks it'),
@@ -2266,6 +2267,29 @@ class ProxyLoginIntegration(unittest.TestCase):
                 "SYS_CONTEXT('userenv', 'proxy_user') FROM dual"
             )
             self.assertEqual(cur.fetchone(), (proxy.upper(), _USER.upper()))
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class MixedPrecisionBatchIntegration(_IntegrationBase):
+    """An executemany whose datetimes differ in sub-second precision (#1098)."""
+
+    def test_a_mixed_batch_inserts_and_round_trips(self):
+        # Every row of an array bind must match the one descriptor the OAC
+        # declares. Sending a 7-byte value under an 11-byte one (or the reverse)
+        # was rejected: ORA-01483.
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, t TIMESTAMP)')
+        values = [
+            datetime.datetime(2056, 2, 29),
+            datetime.datetime(2020, 2, 29, 23, 59, 59, 123456),
+            datetime.datetime(1900, 1, 1),
+            datetime.datetime(2024, 1, 1, 0, 0, 0, 789012),
+        ]
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1, :2)', list(enumerate(values))
+        )
+        self.conn.commit()
+        self.cur.execute(f'SELECT t FROM {self.TABLE} ORDER BY n')
+        self.assertEqual([r[0] for r in self.cur.fetchall()], values)
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)

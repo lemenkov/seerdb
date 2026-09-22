@@ -9195,6 +9195,57 @@ def encode_dictionary_dty(Dictionary: dict) -> bytes:
     )
 
 
+class _WideDateTime(datetime.datetime):
+    """A datetime that must go out in the 11-byte TIMESTAMP form (#1098).
+
+    Width is otherwise chosen per value -- 7 bytes with no sub-second part, 11
+    with one -- but every row of an ARRAY bind has to match the one descriptor
+    the OAC declares. A batch mixing the two sent rows of two widths and the
+    server rejected the call with ORA-01483.
+    """
+
+    __slots__ = ()
+
+
+def _is_wide_datetime(DT: datetime.datetime) -> bool:
+    # Does this value take the 11-byte TIMESTAMP form? True when it carries a
+    # sub-second part, or when a batch widened the whole column to match (#1098).
+    return DT.microsecond > 0 or isinstance(DT, _WideDateTime)
+
+
+def _widen_batch_datetimes(Rows: list) -> list:
+    """Give every row of a temporal column the same wire width (#1098).
+
+    A column holding both `2020-02-29` and `2020-02-29 23:59:59.123456` would
+    otherwise send a 7-byte value under an 11-byte descriptor. Naive datetimes
+    only: widening an aware one would mean inventing a zone for the others, and
+    a mix of aware and naive in one column is a different question.
+    """
+    if len(Rows) < 2:
+        return Rows
+    widen = set()
+    for J in range(len(Rows[0])):
+        Column = [R[J] for R in Rows if isinstance(R[J], datetime.datetime)]
+        if len(Column) < 2 or any(V.tzinfo is not None for V in Column):
+            continue
+        Widths = {V.microsecond > 0 for V in Column}
+        if len(Widths) > 1:
+            widen.add(J)
+    if not widen:
+        return Rows
+    Out = []
+    for R in Rows:
+        Row = list(R)
+        for J in widen:
+            V = Row[J]
+            if isinstance(V, datetime.datetime) and not isinstance(V, _WideDateTime):
+                Row[J] = _WideDateTime(
+                    V.year, V.month, V.day, V.hour, V.minute, V.second, V.microsecond
+                )
+        Out.append(Row)
+    return Out
+
+
 def _oac_rep_row(Rows: list) -> list:
     # For array DML, pick a representative value per column for the single OAC:
     # a NON-NULL value (so the OAC carries the column's real TYPE) with the
@@ -9310,6 +9361,10 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
     # iteration count is 1 + len(Batch), and each row is sent as its own RXD
     # token after the OAC.
     BatchLen = len(Batch)
+    if Batch:
+        # One wire width per temporal column, before anything is sized (#1098).
+        Widened = _widen_batch_datetimes([Bind] + Batch)
+        Bind, Batch = Widened[0], Widened[1:]
     Oac = _oac_rep_row([Bind] + Batch) if Bind else []
     # A PL/SQL block's values ride in place whatever their size; elsewhere a
     # LONG-class bind's value goes after the row's others (docs/PROTOCOL.md
@@ -12624,7 +12679,7 @@ def encode_token_oac(Token: object) -> bytes:
     if isinstance(Token, datetime.datetime):
         if Token.tzinfo is not None:
             return encode_token_raw(TNS_TYPE_TIMESTAMPTZ, 13, 0, 0, 0)
-        if Token.microsecond > 0:
+        if _is_wide_datetime(Token):
             return encode_token_raw(TNS_TYPE_TIMESTAMP, 11, 0, 0, 0)
         return encode_token_raw(TNS_TYPE_DATE, 7, 0, 0, 0)
     if isinstance(Token, datetime.date):
@@ -13408,7 +13463,7 @@ def encode_token_datetime(DT: datetime.datetime) -> bytes:
         else:
             HH, MM = divmod(Total, 60)
         return Base + Nanos + bytes([HH + 20, MM + 60])
-    if DT.microsecond > 0:
+    if _is_wide_datetime(DT):
         return _encode_date_prefix(DT) + (DT.microsecond * 1000).to_bytes(4, 'big')
     return _encode_date_prefix(DT)
 
