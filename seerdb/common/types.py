@@ -14,7 +14,7 @@ import zoneinfo
 from decimal import Decimal, InvalidOperation
 
 from seerdb.common._tzregions import TZ_REGIONS
-from seerdb.common.datatypes import IntervalYM
+from seerdb.common.datatypes import BcDate, IntervalYM
 from seerdb.common.exceptions import DataError, DateOutOfRangeError
 from seerdb.common.tns_consts import (
     AL16UTF16_CHARSET,
@@ -89,6 +89,23 @@ def set_decode_8i(value: bool) -> object:
 
 def reset_decode_8i(token: object) -> None:
     _DECODE_IS_8I.reset(token)  # type: ignore[arg-type]
+
+
+# A date before year 1 is valid Oracle data no datetime can hold, so the decoder
+# raises DateOutOfRangeError for it, as python-oracledb raises ValueError (#1060).
+# The Mirror's passthrough backend is the one caller that must carry such a value
+# on rather than refuse it: it relays the rows to a client that decides for
+# itself. With this set, a date without a time zone decodes to a BcDate the
+# Mirror can encode byte for byte (#1069). Nothing in the public client sets it.
+_DECODE_BC_DATES = contextvars.ContextVar('decode_bc_dates', default=False)
+
+
+def set_decode_bc_dates(value: bool) -> object:
+    return _DECODE_BC_DATES.set(value)
+
+
+def reset_decode_bc_dates(token: object) -> None:
+    _DECODE_BC_DATES.reset(token)  # type: ignore[arg-type]
 
 
 def _string_charset(Column: dict) -> int:
@@ -174,7 +191,7 @@ def decode_number(Data: bytes) -> int | Decimal | None:
         raise DataError(f'malformed Oracle NUMBER: {Data.hex()}') from Exc
 
 
-def decode_date(Data: bytes) -> datetime.datetime | None:
+def decode_date(Data: bytes) -> datetime.datetime | BcDate | None:
     # 7 bytes = DATE, 11 bytes adds 4-byte BE nanoseconds, 13 bytes adds a
     # 2-byte timezone offset. Year is split across two centuries-biased bytes.
     if not Data or len(Data) < 7:
@@ -236,6 +253,8 @@ def decode_date(Data: bytes) -> datetime.datetime | None:
         return Utc.astimezone(Tz)
     except (ValueError, OverflowError) as Exc:
         if _is_bc_date(Year, Month, Day, Hour, Minute, Second):
+            if _DECODE_BC_DATES.get() and Tz is None:
+                return BcDate(Year, Month, Day, Hour, Minute, Second, Microsecond)
             # A BC date is VALID Oracle data -- DATE runs from 4712 BC -- that
             # Python's datetime cannot hold, since it starts at year 1. Calling
             # it "malformed" told a caller the server sent garbage when it sent

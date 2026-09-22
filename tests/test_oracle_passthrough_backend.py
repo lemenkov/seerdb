@@ -206,6 +206,32 @@ def test_a_pre_12_1_upstream_keeps_the_lob_value():
     assert backend._conn.written == []
 
 
+def test_a_bc_date_is_carried_on_for_the_length_of_a_call():
+    # Upstream rows are decoded inside execute(), and a date before year 1 must
+    # come out as a BcDate there, not an error (#1069). The switch is set per
+    # call -- the Mirror runs each call in a copied context -- and is gone after.
+    from seerdb.common.datatypes import BcDate
+    from seerdb.common.types import decode_date
+
+    seen = []
+
+    class _DecodingCursor(_FakeCursor):
+        def execute(self, sql, variables):
+            seen.append(decode_date(bytes.fromhex('35580101010101')))
+
+    backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
+    cursor = _DecodingCursor()
+    backend._conn = type('Conn', (), {'cursor': lambda self: cursor})()
+    backend.execute('SELECT d FROM t')
+    assert seen == [BcDate(-4712, 1, 1)]
+    try:
+        decode_date(bytes.fromhex('35580101010101'))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('the switch outlived the call')
+
+
 def test_array_bind_registers_an_array_var_of_the_declared_capacity():
     # An associative-array BindVar (#743) becomes an arrayvar of the client's
     # capacity, seeded with the elements sent; its list comes back as the OUT.
