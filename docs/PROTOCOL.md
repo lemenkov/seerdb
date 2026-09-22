@@ -4225,6 +4225,23 @@ order-preserving ("sortable") form:
 | `0x3E` | INTERVAL DAY TO SECOND  | 11    |
 | `0x7D` | DATE (ub4-offset images)| 7     |
 
+**The extended wrapper `0x7B` (#1114).** One extended node is not fixed-width:
+tag `0x7B`, a sub-tag byte, a `ub4` length, then that many bytes. Sub-tag `0x01`
+is a **VECTOR**, and the payload is the bare vector image of §18 — magic, flags,
+element format, dimension count, the 8-byte norm, then the body:
+
+```
+7b 01 | 00 00 00 1d | db 00 00 16 02 00 00 00 03 c0 12 38 8a c0 05 9c 28 bf c0 00 00 ...
+^tag    ^ub4 len 29   ^the §18 image (JSON_SCALAR(TO_VECTOR('[1.5, 2.5, 3.5]')))
+```
+
+Dense and **sparse** vectors share this wrapper: what distinguishes them is the
+sparse flag inside the image, not the node. A decoder therefore returns two
+different Python types from the same tag, and an encoder that re-serialises a
+decoded document has to accept both — handling only the dense one makes the
+codec unable to re-encode its own output, which is how a JSON document holding a
+sparse vector became unservable through the Mirror.
+
 **Width selectors (#69, #88).** Widths are chosen by header flags and per-node
 tag bits:
 - *Container count + field-ids* — from the container node tag: `ub4` if the
