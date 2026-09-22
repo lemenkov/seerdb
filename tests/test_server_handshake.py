@@ -30,6 +30,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_21_1,
     FIELD_VERSION_23_1,
     FIELD_VERSION_23_4,
+    TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE,
     TNS_DATA,
     TNS_VERSION_MIN_LARGE_SDU,
     TTI_DTY,
@@ -285,10 +286,13 @@ def test_a_23ai_accept_matches_the_captured_shape() -> None:
     assert struct.unpack('>H', body[0:2])[0] == TNS_VERSION_23_1
     assert len(body) == 53
     assert struct.unpack('>H', body[12:14])[0] == 0x003D
-    # flags2 stays clear: a real 23ai sets FAST_AUTH | HAS_END_OF_RESPONSE there,
-    # and a client turns each on only when the version AND the flag agree. The
-    # Mirror sends no end-of-response markers, so claiming the bit would hang it.
-    assert struct.unpack('>I', body[33:37])[0] == 0
+    # flags2 now advertises HAS_END_OF_RESPONSE (#1059). A client turns the
+    # capability on only when the version AND the flag agree, and it is what
+    # python-oracledb gates pipelining on -- without it `run_pipeline` silently
+    # ran the operations one at a time. FAST_AUTH (0x10000000) stays clear;
+    # that one is still unimplemented, so a real 23ai's 0x1A000000 is not
+    # matched in full on purpose.
+    assert struct.unpack('>I', body[33:37])[0] == TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE
     # The trailing id is random per connection, not a constant to copy.
     other = encode_accept(req, tns_version=server_tns_version(FIELD_VERSION_23_4))[8:]
     assert body[37:] != other[37:]

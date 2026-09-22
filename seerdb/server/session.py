@@ -136,6 +136,9 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_23_1,
     TNS_CONNECT,
     TNS_DATA,
+    TNS_DATA_FLAGS_END_OF_REQUEST,
+    TNS_FUNC_PIPELINE_BEGIN,
+    TNS_FUNC_PIPELINE_END,
     TNS_FUNC_REEXECUTE,
     TNS_FUNC_REEXECUTE_AND_FETCH,
     TNS_FUNC_SESSION_STATE,
@@ -153,6 +156,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_REFCURSOR,
     TNS_TYPE_VECTOR,
     TNS_VERSION_MIN_LARGE_SDU,
+    TNS_VERSION_MIN_OOB_CHECK,
     TTI_ALL8,
     TTI_AUTH,
     TTI_COMMIT,
@@ -165,6 +169,7 @@ from seerdb.common.tns_consts import (
     TTI_OCCA,
     TTI_PING,
     TTI_ROLLBACK,
+    TTI_STA,
 )
 from seerdb.server.auth import (
     derive_conn_key,
@@ -416,6 +421,15 @@ def handle_login(
     # everything after it — so flip the stream only once it has gone out.
     if negotiated_tns_version(request, tns_version) >= TNS_VERSION_MIN_LARGE_SDU:
         stream.large = True
+    # End-of-response framing starts HERE, on the first DATA reply after the
+    # ACCEPT that advertised it -- not after login, and not on the client's later
+    # CCAP opt-in. A live 23ai sets data flags 0x2000 and a trailing 0x1d on its
+    # very first DATA reply, the PRO answer, before the client has sent the DTY
+    # that would carry the opt-in: the ACCEPT is the commitment. Turning it on
+    # after login left the client waiting for a marker the handshake replies
+    # never carried, and it hung before it could authenticate (#1059).
+    if negotiated_tns_version(request, tns_version) >= TNS_VERSION_MIN_OOB_CHECK:
+        stream.end_of_response = True
     # A modern thin client (seerdb/go-ora/oracledb) runs an ANO negotiation
     # before PRO now that our ACCEPT advertises ANO-capable (#437). Run the server
     # half (#448): select a cipher per our stance — or the null algorithm — and,
@@ -968,6 +982,18 @@ def serve_session(
             continue
         if packet_type != TNS_DATA:
             continue
+        # A pipelined call is marked END_OF_REQUEST, and its reply must open with
+        # the token the client put in its header (#1059). Read it before the
+        # piggybacks are stripped: on the first call of a burst the header that
+        # carries it is the PIPELINE_BEGIN piggyback's, which shares the call's
+        # token. From 23.1 up the token rides right after the 3-byte header.
+        stream.response_token = None
+        if (
+            stream.last_data_flags & TNS_DATA_FLAGS_END_OF_REQUEST
+            and field_version > FIELD_VERSION_23_1
+            and len(body) > 3
+        ):
+            stream.response_token, _ = decode_ub4(body[3:])
         body = _skip_piggybacks(body, backend, temp_lobs)  # CLOSE_CURSORS, …
         if len(body) < 2 or body[0] != TTI_FUN:
             # Piggyback processing could not reach a call. That is what happens
@@ -978,6 +1004,12 @@ def serve_session(
             # word is not -- the piggyback is only a PREFIX to a real call, and
             # the client is already blocked reading that call's reply (#836).
             _refuse_unhandled(stream, _unreachable_call(body))
+            continue
+        if body[1] == TNS_FUNC_PIPELINE_END:
+            # Closes the burst. A live 23ai answers it with a bare status and
+            # nothing else -- `09 01 01 00`, then the end-of-response marker --
+            # and the client reads that one reply and discards it (#1059).
+            stream.write_packet(TNS_DATA, bytes([TTI_STA, 1, 1, 0]))
             continue
         if body[1] == TTI_ALL8:
             # A cached-cursor re-execute (cursor set, no SQL) omits the OACs; hand
@@ -1750,6 +1782,16 @@ def _skip_piggybacks(
             if temp_lobs is not None:
                 for locator in freed:
                     temp_lobs.free(locator)
+        elif func == TNS_FUNC_PIPELINE_BEGIN:
+            # Opens a pipelined burst (#1059). Layout after the common header
+            # (encode_pipeline_begin): an sb4 0, a zero byte, then the error
+            # mode. It shares the first call's token, which the caller has
+            # already taken from the header for the reply. The Mirror answers
+            # every call regardless of mode -- the reference client runs its
+            # bursts in CONTINUE_ON_ERROR and enforces abort itself -- so the
+            # mode is read past rather than acted on.
+            _, rest = decode_ub4(rest)  # reserved sb4 0
+            rest = rest[2:]  # a zero byte, then the pipeline mode
         else:
             break
         body = rest

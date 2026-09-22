@@ -2440,6 +2440,16 @@ TTI_OER |
   [trailing message DALC iff ora_error_code != 0]
 ```
 
+**"iff" means a server must not write the message on success either** — not
+even an empty one. From 12.1 a client reads it only `if error_num != 0`, so a
+zero-length DALC (`0x00`) on a successful OER is a byte nothing consumes. That
+was invisible for as long as the OER ended the response, because the client
+stopped there. Under end-of-response framing (§32.1) it does not stop: it reads
+on for the marker and takes that `0x00` as the next message type — *"unknown
+protocol message type 0"* — which is how the Mirror's every login failed once it
+advertised the capability (#1059). The general lesson: end-of-response turns any
+trailing byte that used to be harmless into a desync.
+
 #### 6.1a ORA-01017 means the credential failed, and nothing else (#1006)
 
 A login can fail for reasons that have nothing to do with the credential: the
@@ -6326,6 +6336,70 @@ oracledb-thin async-pipeline capture and seerdb's own capture on 23ai:
   marker (`01 00 01`) before an erroring op's response but does **not** wait for
   a reset and keeps streaming; the pipelined reader skips the marker silently
   (unlike the break/reset handshake of §27 / #45).
+
+### 32.1 The server half (#1059)
+
+What a server has to do for a client to pipeline at all — established against a
+live 23ai, because the Mirror did none of it and python-oracledb then **never
+pipelined**: it silently fell back to running the operations one at a time. On
+that fallback path it reads `oracledb.defaults` at *run* time rather than the
+per-operation values captured at *add* time, so a pipeline built inside a
+`defaults_context_manager("fetch_decimals", True)` came back as plain `int`s.
+Nothing was wrong with the fetch handling; the options never reached it. Note
+that "44 of 49 pipelining tests pass" therefore meant **none of them were
+pipelined** — they passed because the fallback is equivalent for them.
+
+1. **Advertise** `0x02000000` in the ACCEPT `flags2` word (offset 33) at a
+   negotiated version ≥ 318. A client reads that word only from 318 up, so
+   setting it lower is noise. `FAST_AUTH` (`0x10000000`, which a real 23ai also
+   sets — its full value is `0x1A000000`) is a separate, unimplemented
+   capability and stays clear; without it the client uses the three-message
+   PRO / DTY / OSESSKEY handshake rather than one bundled packet.
+2. **Frame every DATA reply from the first one after the ACCEPT**: data flags
+   `0x2000` (`END_OF_RESPONSE`) and a trailing `TTI_END_OF_RESPONSE` (`0x1d`).
+   The ACCEPT is the commitment — a live server puts the marker on its PRO
+   answer, *before* the client has sent the DTY that carries its CCAP opt-in.
+   Turning it on after login left the client waiting for a marker the handshake
+   replies never carried, and it hung before authenticating.
+3. **Nothing may trail the last token.** Without end-of-response the client
+   treats the OER as the end of the response and stops; with it, it reads on
+   for the marker — python-oracledb:
+
+   ```python
+   # an error message marks the end of a response if no explicit end of
+   # response is available
+   if not buf._caps.supports_end_of_response:
+       self.end_of_response = True
+   ```
+
+   So a byte after the OER that was always silently ignored is now read as the
+   next message type. The Mirror wrote exactly such a byte on **every success
+   OER**: the empty message's length (`0x00`), which a 12.1+ client reads only
+   `if error_num != 0`. Every login failed with *"unknown protocol message type
+   0"*. It is no longer written from 12.1 (§6.5); below 12.1 the captured bytes
+   stand, and end-of-response cannot be negotiated there anyway.
+4. **Correlate each pipelined reply.** A call is marked by the data flags alone
+   — `BEGIN_PIPELINE | END_OF_REQUEST` (`0x1800`) on the first, `END_OF_REQUEST`
+   (`0x0800`) on the rest — and carries its token right after the 3-byte header
+   (from 23.1). Its reply opens with `TTI_TOKEN` and that token:
+
+   ```
+   21 01 01 <reply> 1d        first call
+   21 01 02 <reply> 1d        second call
+   ```
+
+   On the first call the header carrying the token is the `PIPELINE_BEGIN`
+   piggyback's (function 199), which shares the call's token. Its body is an sb4
+   `0`, a zero byte, then the error mode; a server may answer every call
+   regardless of mode, since the reference client runs its bursts in
+   `CONTINUE_ON_ERROR` and enforces abort itself.
+5. **Answer `PIPELINE_END`** (function 200) with a bare status and nothing else:
+   `09 01 01 00`, then the marker. The client reads that reply and discards it.
+
+A server that meets 1–5 but still answers a PL/SQL block with cursor id `0` will
+break a pipelined `executemany` of that block: the client keeps the block in
+single-execute mode and re-sends each row, piling several replies onto one
+operation. That is #1064.
 
 ## 33. Native network encryption / data integrity (ANO, #437)
 

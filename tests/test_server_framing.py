@@ -136,3 +136,101 @@ def test_two_back_to_back_packets() -> None:
     finally:
         left.close()
         right.close()
+
+
+# --- end-of-response framing and pipelining (#1059) --------------------------
+
+
+def _write_and_capture(stream_setup, body: bytes) -> bytes:
+    # One DATA write through a configured stream, returned as the raw packet so
+    # the flags and the trailing bytes can be read directly.
+    left, right = _pair()
+    try:
+        writer = PacketStream(left, sdu=8192)
+        stream_setup(writer)
+        writer.write_packet(TNS_DATA, body)
+        left.shutdown(socket.SHUT_WR)
+        raw = b''
+        while chunk := right.recv(65536):
+            raw += chunk
+        return raw
+    finally:
+        left.close()
+        right.close()
+
+
+def test_a_reply_is_unchanged_until_end_of_response_is_on() -> None:
+    raw = _write_and_capture(lambda s: None, b'\x09\x01\x01\x00')
+    assert raw[8:10] == b'\x00\x00'  # data flags
+    assert raw[10:] == b'\x09\x01\x01\x00'
+
+
+def test_end_of_response_marks_and_terminates_every_reply() -> None:
+    # Flags 0x2000 and a trailing 0x1d -- on EVERY reply once negotiated, not
+    # only a pipelined one: the client reads until the marker.
+    def on(s: PacketStream) -> None:
+        s.end_of_response = True
+
+    raw = _write_and_capture(on, b'\x09\x01\x01\x00')
+    assert raw[8:10] == b'\x20\x00'
+    assert raw[10:] == b'\x09\x01\x01\x00\x1d'
+
+
+def test_a_pipelined_reply_opens_with_its_token_once() -> None:
+    # Captured from 23ai: `21 01 02 <reply> 1d` for the second call of a burst.
+    # The token is spent on the write that uses it.
+    left, right = _pair()
+    try:
+        writer = PacketStream(left, sdu=8192)
+        writer.end_of_response = True
+        writer.response_token = 2
+        writer.write_packet(TNS_DATA, b'\x09\x01\x01\x00')
+        assert writer.response_token is None
+        writer.write_packet(TNS_DATA, b'\x09\x01\x01\x00')
+        left.shutdown(socket.SHUT_WR)
+        raw = b''
+        while chunk := right.recv(65536):
+            raw += chunk
+    finally:
+        left.close()
+        right.close()
+    first = raw[: int.from_bytes(raw[0:2], 'big')]
+    second = raw[len(first) :]
+    assert first[10:] == b'\x21\x01\x02\x09\x01\x01\x00\x1d'
+    assert second[10:] == b'\x09\x01\x01\x00\x1d'  # no token: not pipelined
+
+
+def test_a_pre_framed_handshake_reply_carries_the_marker_too() -> None:
+    # A live 23ai puts the marker on its PRO answer, the first DATA reply after
+    # the ACCEPT -- so send_raw's DATA path has to add it as well, or the client
+    # waits for a marker the handshake never sends and hangs before login.
+    left, right = _pair()
+    try:
+        writer = PacketStream(left, sdu=8192)
+        writer.end_of_response = True
+        pre_framed, _ = encode_packet(TNS_DATA, b'\x00\x00\x01\x06\x00', 8192)
+        writer.send_raw(pre_framed)
+        left.shutdown(socket.SHUT_WR)
+        raw = b''
+        while chunk := right.recv(65536):
+            raw += chunk
+    finally:
+        left.close()
+        right.close()
+    assert raw[8:10] == b'\x20\x00'
+    assert raw.endswith(b'\x1d')
+
+
+def test_read_packet_keeps_the_data_flags() -> None:
+    # A pipelined call is marked only in its data flags.
+    from seerdb.common.tns import encode_data_packet
+
+    left, right = _pair()
+    try:
+        left.sendall(encode_data_packet(b'\x03\x5e\x05', 0x1800, False))
+        reader = PacketStream(right, sdu=8192)
+        assert reader.read_packet() == (TNS_DATA, b'\x03\x5e\x05')
+        assert reader.last_data_flags == 0x1800
+    finally:
+        left.close()
+        right.close()

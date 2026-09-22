@@ -2398,3 +2398,53 @@ def test_defines_travel_to_the_id_a_re_run_mints() -> None:
     assert second != first
     cursors.set_defines(second, cursors.defines(first))
     assert cursors.defines(second) == [(TNS_TYPE_LONG, 1)]
+
+
+# --- pipelining and end-of-response (#1059) ----------------------------------
+
+
+@pytest.mark.parametrize('field_version', [24, 17])
+def test_skip_piggybacks_steps_over_pipeline_begin(field_version: int) -> None:
+    # The PIPELINE_BEGIN piggyback (199) opens a pipelined burst and rides in
+    # front of its first call, sharing that call's token. It must be walked,
+    # not refused: an unknown piggyback leaves the call unreachable, and the
+    # Mirror used to answer the whole burst ORA-03115 (piggyback 199).
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, encode_pipeline_begin
+    from seerdb.common.tns_consts import TNS_PIPELINE_MODE_CONTINUE_ON_ERROR
+    from seerdb.server.session import _skip_piggybacks
+
+    body = _exec_body()
+    token = _DECODE_FIELD_VERSION.set(field_version)
+    try:
+        begin = encode_pipeline_begin(
+            3, field_version, 1, TNS_PIPELINE_MODE_CONTINUE_ON_ERROR
+        )
+        assert _skip_piggybacks(begin + body) == body
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+
+
+def test_a_success_oer_carries_no_message_from_12_1() -> None:
+    # A 12.1+ client reads the message only `if error_num != 0`. The empty
+    # length byte written on success was never consumed -- harmless while the
+    # OER ended the response, and "unknown protocol message type 0" on every
+    # login once end-of-response framing made the client read on past it.
+    #
+    # Asserted on _oer_message rather than on the whole OER: every earlier field
+    # of a success status is zero too, so the OER ends in a long zero run and a
+    # suffix check cannot tell whether that one byte is present.
+    from seerdb.common.tns import _ENCODE_FIELD_VERSION, _oer_message
+    from seerdb.common.tns_consts import FIELD_VERSION_11_2, FIELD_VERSION_12_1
+
+    token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_12_1)
+    try:
+        assert _oer_message(0, b'') == b''  # success: nothing at all
+        assert _oer_message(942, b'ORA-00942: x') != b''  # an error keeps it
+    finally:
+        _ENCODE_FIELD_VERSION.reset(token)
+    token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
+    try:
+        # Below 12.1 the captured bytes stand, empty length included.
+        assert _oer_message(0, b'') == b'\x00'
+    finally:
+        _ENCODE_FIELD_VERSION.reset(token)

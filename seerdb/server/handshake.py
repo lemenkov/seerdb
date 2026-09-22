@@ -53,8 +53,10 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_21_1,
     FIELD_VERSION_23_1,
     TNS_ACCEPT,
+    TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE,
     TNS_DATA,
     TNS_VERSION_MIN_LARGE_SDU,
+    TNS_VERSION_MIN_OOB_CHECK,
     TTI_DTY,
     TTI_PRO,
 )
@@ -154,14 +156,23 @@ _LARGE_DEFAULT_TDU = 0x2000
 # flags word is 0x003D rather than 21c's 0x002D, and sixteen bytes follow the
 # flags2 word — a per-connection identifier, random in every capture.
 #
-# flags2 stays ZERO here even though a real 23ai sends 0x1A000000. Those bits
-# advertise FAST_AUTH (0x10000000) and end-of-response (0x02000000), and a
-# client enables each only when the version threshold *and* the flag agree, so
-# leaving them clear is how a server says "I speak 319 but not those two". The
-# Mirror emits no end-of-response markers, so claiming the bit would hang any
-# client that believed it.
+# flags2 carries the capability bits a real 23ai sends as 0x1A000000. A client
+# enables each only when the version threshold *and* the flag agree, so what is
+# left clear is how a server says "I speak 319 but not that".
+#
+# END_OF_RESPONSE (0x02000000) is now SET at >= 318 (#1059). It used to stay
+# clear, correctly: the Mirror emitted no end-of-response markers, and claiming
+# the bit would have hung any client that believed it. It emits them now, and
+# the cost of not claiming it was larger than it looked -- python-oracledb
+# pipelines ONLY on this capability, so without it `run_pipeline` silently fell
+# back to running the operations one at a time, losing the per-operation fetch
+# options captured at add time.
+#
+# FAST_AUTH (0x10000000) stays clear; that one is still unimplemented.
 _ACCEPT_23_BODY_LEN = 53
 _ACCEPT_23_FLAGS = 0x003D
+# The flags2 word sits between the ub4 TDU and the connection id.
+_OFF_ACCEPT_FLAGS2 = 33
 _OFF_ACCEPT_CONN_ID = 37
 _ACCEPT_CONN_ID_LEN = 16
 
@@ -283,6 +294,15 @@ def encode_accept(
         struct.pack_into(
             '>I', large_body, _OFF_ACCEPT_TDU32, min(request.tdu, _LARGE_DEFAULT_TDU)
         )
+        if version >= TNS_VERSION_MIN_OOB_CHECK:
+            # Only read by a client at this version and up, so setting it below
+            # would be noise an older client never looks at.
+            struct.pack_into(
+                '>I',
+                large_body,
+                _OFF_ACCEPT_FLAGS2,
+                TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE,
+            )
         if is_23:
             # Random per connection, as it is on the real server. It identifies
             # the session in the server's own logs; nothing reads it back here.
