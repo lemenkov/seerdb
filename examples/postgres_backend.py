@@ -89,7 +89,7 @@ from psycopg import sql
 from psycopg.adapt import Loader
 from psycopg.types.composite import CompositeInfo, register_composite
 
-from seerdb.common.datatypes import IntervalYM
+from seerdb.common.datatypes import BcDate, IntervalYM
 from seerdb.common.dbobject import DbRef
 from seerdb.common.sqltext import is_plsql, strip_returning_into
 from seerdb.common.tns_consts import (
@@ -185,6 +185,13 @@ _INTERVALYM_TYPE_DDL = (
 # _translate_idioms. EMPTY_CLOB / EMPTY_BLOB return the LOB domains, so they need
 # those to exist first (created just before this in __init__).
 _HELPER_FUNCTIONS_DDL = (
+    # TO_CHAR(d, '..SYYYY..') → the year signed as Oracle prints it: '-' before
+    # a BC year, a space before any other (#1063). The sign goes where SYYYY
+    # stood, as quoted literal text in PostgreSQL's format.
+    'CREATE OR REPLACE FUNCTION ora_to_char_signed(timestamp, text) RETURNS text '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT to_char($1, regexp_replace($2, '
+    "'syyyy', CASE WHEN $1 < '0001-01-01'::timestamp THEN '\"-\"YYYY' "
+    "ELSE '\" \"YYYY' END, 'gi')) $$;"
     # HEXTORAW('DEADBEEF') → the RAW/bytea value of a hex string.
     'CREATE OR REPLACE FUNCTION hextoraw(text) RETURNS bytea '
     "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT decode($1, 'hex') $$;"
@@ -543,6 +550,40 @@ class OraInterval(datetime.timedelta):
 # signed and either may be absent). Their sum is the whole-month count.
 _PG_INTERVAL_YEARS = re.compile(r'(-?\d+)\s+years?')
 _PG_INTERVAL_MONS = re.compile(r'(-?\d+)\s+mons?')
+
+
+# A BC value in PostgreSQL's ISO text form: '4712-01-01 BC', or with a time and
+# an optional fraction for a timestamp.
+_PG_BC_TEXT = re.compile(
+    r'^(\d+)-(\d\d)-(\d\d)(?: (\d\d):(\d\d):(\d\d)(?:\.(\d{1,6}))?)? BC$'
+)
+
+
+def _bc_date_loader(base: type) -> type:
+    # A text loader for `date` / `timestamp` that falls back to a BcDate where
+    # psycopg's own refuses the value: a year before 1, which no datetime can
+    # hold (#1063). PostgreSQL numbers BC years as Oracle does, without a year 0,
+    # so 4712 BC is -4712. Every other value is psycopg's.
+    class _Loader(base):  # type: ignore[valid-type, misc]
+        def load(self, data):
+            try:
+                return super().load(data)
+            except psycopg.DataError:
+                match = _PG_BC_TEXT.match(bytes(data).decode())
+                if match is None:
+                    raise
+                (year, month, day, hour, minute, second, frac) = match.groups()
+                return BcDate(
+                    -int(year),
+                    int(month),
+                    int(day),
+                    int(hour or 0),
+                    int(minute or 0),
+                    int(second or 0),
+                    int((frac or '0').ljust(6, '0')),
+                )
+
+    return _Loader
 
 
 class _IntervalMonthsTextLoader(Loader):
@@ -1219,10 +1260,87 @@ def _translate_connect_by(sql: str) -> str:
     )
 
 
+# The Oracle date functions whose format can carry a signed year (SYYYY).
+_SIGNED_YEAR_CALL = re.compile(r'\b(to_char|to_date|to_timestamp)\s*\(', re.IGNORECASE)
+_SIGNED_YEAR = re.compile('syyyy', re.IGNORECASE)
+
+
+def _call_args(sql: str, start: int) -> tuple[list[str], int] | None:
+    # The top-level arguments of the call whose '(' is at `start`, and the index
+    # just past its ')'. String literals ('' escapes included) and nested
+    # parentheses are skipped over whole. None if the call never closes.
+    (depth, i, arg_start, args) = (0, start, start + 1, [])
+    while i < len(sql):
+        char = sql[i]
+        if char == "'":
+            i += 1
+            while i < len(sql) and not (sql[i] == "'" and sql[i + 1 : i + 2] != "'"):
+                i += 2 if sql[i] == "'" else 1
+        elif char == '(':
+            depth += 1
+        elif char == ')':
+            depth -= 1
+            if depth == 0:
+                args.append(sql[arg_start:i])
+                return (args, i + 1)
+        elif char == ',' and depth == 1:
+            args.append(sql[arg_start:i])
+            arg_start = i + 1
+        i += 1
+    return None
+
+
+def _translate_signed_year(sql: str) -> str:
+    """Give Oracle's signed year, ``SYYYY``, a PostgreSQL meaning (#1063).
+
+    PostgreSQL knows no ``S``. Reading a date it dropped the sign, so 4712 BC
+    became 4712 AD; writing one it printed a literal ``S``. PostgreSQL's own
+    ``YYYY`` already reads ``-4712`` as 4712 BC, so a parsing format just loses
+    the ``S``. Printing needs the sign itself, which only the value knows, so
+    that call goes to ``ora_to_char_signed``. Only a format given as a literal
+    is rewritten; nothing else is touched.
+    """
+    if not _SIGNED_YEAR.search(sql):
+        return sql
+    (out, pos) = ([], 0)
+    in_string = False
+    i = 0
+    while i < len(sql):
+        if sql[i] == "'":
+            in_string = not in_string
+            i += 1
+            continue
+        match = None if in_string else _SIGNED_YEAR_CALL.match(sql, i)
+        if match is None or (i and (sql[i - 1].isalnum() or sql[i - 1] == '_')):
+            i += 1
+            continue
+        found = _call_args(sql, match.end() - 1)
+        if found is None:
+            break
+        (args, end) = found
+        fmt = args[1].strip() if len(args) >= 2 else ''
+        if not (fmt.startswith("'") and fmt.endswith("'") and _SIGNED_YEAR.search(fmt)):
+            i = match.end()
+            continue
+        inner = [_translate_signed_year(a) for a in args]
+        name = match.group(1).lower()
+        if name == 'to_char':
+            call = f'ora_to_char_signed({inner[0]}, {fmt})'
+        else:
+            parsed = _SIGNED_YEAR.sub('YYYY', fmt)
+            call = f'{match.group(1)}({", ".join([inner[0], parsed, *inner[2:]])})'
+        out.append(sql[pos:i])
+        out.append(call)
+        pos = i = end
+    out.append(sql[pos:])
+    return ''.join(out)
+
+
 def _translate_idioms(sql: str) -> str:
     """Rewrite the Oracle SQL functions / literal idioms the suite uses to their
     PostgreSQL equivalents (#502). Applied to every statement."""
     sql = _translate_connect_by(sql)
+    sql = _translate_signed_year(sql)
     for pattern, replacement in _IDIOM_REWRITES:
         sql = pattern.sub(replacement, sql)
     return _TSTZ_LITERAL.sub(_tstz_literal_sub, sql)
@@ -1719,6 +1837,13 @@ class PostgresBackend:
             # Preserve an interval's months through psycopg (its default loader
             # flattens them to a timedelta), so a YEAR TO MONTH value survives (#504).
             self._conn.adapters.register_loader('interval', _IntervalMonthsTextLoader)
+            # A date before year 1 loads as a BcDate the Mirror can serve (#1063).
+            from psycopg.types.datetime import DateLoader, TimestampLoader
+
+            self._conn.adapters.register_loader('date', _bc_date_loader(DateLoader))
+            self._conn.adapters.register_loader(
+                'timestamp', _bc_date_loader(TimestampLoader)
+            )
             self._conn.adapters.register_loader('interval', _IntervalMonthsBinaryLoader)
         except psycopg.Error:
             self._conn.rollback()

@@ -32,6 +32,7 @@ from postgres_backend import (  # noqa: E402
     OraInterval,
     PostgresBackend,
     _backend_error,
+    _bc_date_loader,
     _distinct_bind_refs,
     _iot_primary_key,
     _parse_out_assignments,
@@ -44,6 +45,7 @@ from postgres_backend import (  # noqa: E402
     _translate_idioms,
     _translate_plsql_block,
     _translate_routine_ddl,
+    _translate_signed_year,
     _urowid_expression,
 )
 
@@ -295,6 +297,53 @@ def test_translate_ddl_time_zone_variants() -> None:
     assert 'a timestamptz' in sent
     assert 'b ora_tstz' in sent
     assert 'c timestamp' in sent and 'c ora_tstz' not in sent
+
+
+def test_a_signed_year_format_is_given_a_postgresql_meaning() -> None:
+    # PostgreSQL knows no S in SYYYY: reading it dropped the sign (4712 BC came
+    # back AD), writing it printed a literal S (#1063). A parse loses the S --
+    # PostgreSQL's YYYY reads -4712 as 4712 BC -- and a print goes to the helper
+    # that writes the sign itself.
+    assert (
+        _translate_signed_year("SELECT TO_DATE('-4712-01-01', 'SYYYY-MM-DD') FROM dual")
+        == "SELECT TO_DATE('-4712-01-01', 'YYYY-MM-DD') FROM dual"
+    )
+    assert _translate_signed_year(
+        "SELECT TO_CHAR(TO_DATE('-4712-01-01', 'SYYYY-MM-DD'), 'SYYYY-MM-DD') FROM dual"
+    ) == (
+        "SELECT ora_to_char_signed(TO_DATE('-4712-01-01', 'YYYY-MM-DD'), "
+        "'SYYYY-MM-DD') FROM dual"
+    )
+    assert _translate_signed_year("SELECT to_timestamp(:1, 'syyyy-mm-dd') FROM t") == (
+        "SELECT to_timestamp(:1, 'YYYY-mm-dd') FROM t"
+    )
+
+
+def test_a_signed_year_rewrite_leaves_everything_else_alone() -> None:
+    for sql in (
+        "SELECT TO_CHAR(d, 'YYYY-MM-DD') FROM t",  # no signed year
+        'SELECT TO_CHAR(d, :fmt) FROM t',  # a format that is not a literal
+        "SELECT 'TO_DATE(x, ''SYYYY'')' FROM dual",  # inside a string literal
+        "SELECT my_to_date(x, 'SYYYY') FROM t",  # another function's name
+        "SELECT TO_DATE('x', 'SYYYY'",  # never closes
+    ):
+        assert _translate_signed_year(sql) == sql, sql
+
+
+def test_a_bc_value_loads_as_a_bcdate() -> None:
+    # psycopg refuses a year before 1; the backend's loaders fall back to the
+    # BcDate the Mirror can serve (#1063). Everything else stays psycopg's.
+    from psycopg.types.datetime import DateLoader, TimestampLoader
+
+    from seerdb.server import BcDate
+
+    date_loader = _bc_date_loader(DateLoader)(1082)
+    stamp_loader = _bc_date_loader(TimestampLoader)(1114)
+    assert date_loader.load(b'4712-01-01 BC') == BcDate(-4712, 1, 1)
+    assert stamp_loader.load(b'0044-03-15 12:30:45.1234 BC') == BcDate(
+        -44, 3, 15, 12, 30, 45, 123400
+    )
+    assert date_loader.load(b'2024-06-15') == datetime.date(2024, 6, 15)
 
 
 def test_translate_idioms_rewrites_connect_by_level_row_generator() -> None:
@@ -1033,9 +1082,10 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
         'empty_blob',
         'from_tz',
         'rowidtochar',
+        'ora_to_char_signed',
     ):
         assert f'FUNCTION {name}(' in _HELPER_FUNCTIONS_DDL
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 6
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 7
     # rowidtochar is the identity on the text ctid the ROWID pseudo-column rewrites
     # to, so ROWIDTOCHAR(ROWID) equals ROWID.
     assert 'FUNCTION rowidtochar(text) RETURNS text' in _HELPER_FUNCTIONS_DDL
