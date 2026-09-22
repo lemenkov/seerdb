@@ -412,20 +412,32 @@ class O8iDialect:
         # cleanly AND leaves a non-empty terminal (a value split mid-boundary makes
         # the decoder raise DataError/IndexError; a clean split at a row boundary
         # leaves nothing after the rows — both mean "read more").
-        from seerdb.common.exceptions import DataError
+        #
+        # "Read more" is ONLY a field that ran off the end -- Truncated, the codec's
+        # explicit signal for it (#849), or an IndexError from an older primitive.
+        # Any OTHER DataError came from a message that is complete and holds a value
+        # that genuinely does not decode, and must propagate. Catching the whole
+        # DataError family treated that as "incomplete" too: the loop read on for a
+        # packet that was never coming, and a BC date -- valid Oracle data a Python
+        # datetime cannot hold -- hung for the full read timeout instead of raising
+        # (#1061). Same distinction the Mirror draws in _complete_message (#1000).
+        from seerdb.common.exceptions import Truncated
 
         while True:
             try:
                 (rows, terminal, last) = decode_8i_exec_response(buf, columns, last_row)
                 if terminal:
                     return (rows, terminal, last)
-            except (DataError, IndexError):
+            except (Truncated, IndexError):
                 pass
             received = yield RECV
             if received is False:
                 try:
                     return decode_8i_exec_response(buf, columns, last_row)
-                except (DataError, IndexError):
+                except (Truncated, IndexError):
+                    # The connection closed on a genuinely incomplete message:
+                    # nothing more is coming, so there are no rows to return. A
+                    # value that is complete but bad still raises, as above.
                     return ([], b'', last_row)
             buf += received[1]
 

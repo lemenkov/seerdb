@@ -4890,8 +4890,19 @@ default) makes the fetch response span several `TNS_DATA` packets, and 8i sets
 no framing signal, so the driver accumulates packets and uses the decoder itself
 as the completeness test: `decode_8i_exec_response` raises while a value is still
 truncated, and a complete response ends on a terminal token (`0x08` piggyback /
-`0x04` OER, ≥ 12 bytes for the cursor id). `_recv_8i_rows` reads until that holds.
-Driver: `_execute_8i_select` / `_recv_8i_rows`; encoder: `encode_8i_oall8_fetch`.
+`0x04` OER, ≥ 12 bytes for the cursor id). The reader reads until that holds.
+Driver: `O8iDialect.execute_query` / `recv_rows`; encoder: `encode_8i_oall8_fetch`.
+
+**Which raise means "read on" matters (#1061).** Only a field that ran **off the
+end** means more packets are coming — the codec's explicit `Truncated` (#849),
+or an `IndexError` from an older primitive. Any other `DataError` comes from a
+message that is already **complete** and holds a value that genuinely does not
+decode, and must reach the caller. Treating the whole `DataError` family as
+"incomplete" made the reader ask for a packet that was never going to arrive, so
+a BC date — valid Oracle data a Python `datetime` cannot hold — hung for the full
+read timeout instead of raising. The multi-packet LONG tests above are what
+confirm the narrower rule is enough: every short-buffer path raises `Truncated`.
+It is the same distinction the Mirror draws when growing a request (§6.2a).
 
 ### 19.17 Oracle 8i BFILE read — the native TTI_LOBOPS wire (#401)
 

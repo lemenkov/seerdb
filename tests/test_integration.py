@@ -1760,11 +1760,6 @@ class BindIntegration(_IntegrationBase):
         # both a DataError and a ValueError, as python-oracledb raises.
         from seerdb.common.exceptions import DataError, DateOutOfRangeError
 
-        if _target_is_8i():
-            # On 8i the fetch HANGS to the read timeout instead of raising --
-            # pre-existing (master hangs identically), the server answers the
-            # same date as text at once. Skipped here, not hidden (#1061).
-            self.skipTest('8i hangs on a BC date instead of raising (#1061)')
         # The precondition is a server that really HOLDS a BC date. Not every
         # backend does: Mirror-over-PostgreSQL drops the sign and returns 4712
         # AD, so there is nothing out of range to report. Ask the server itself,
