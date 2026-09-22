@@ -34,6 +34,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_23_1,
+    FIELD_VERSION_23_4,
 )
 
 # Features the Oracle 9i (fv2) server genuinely lacks, keyed by a substring of
@@ -2108,6 +2109,60 @@ class ZeroRowDmlIntegration(_IntegrationBase):
         self.cur.execute(f'DELETE FROM {self.TABLE} WHERE 1 = 0')
         self.assertEqual(self.cur.rowcount, 0)
         self.assertIsNone(self.cur.lastrowid)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class ColumnDomainIntegration(_IntegrationBase):
+    """A 23ai column's SQL domain and annotations on ``cursor.description`` (#1083)."""
+
+    DOMAIN = 'PYO_SIMPLE_DOMAIN'
+
+    def setUp(self):
+        super().setUp()
+        if self.conn.field_version < FIELD_VERSION_23_4:
+            self.skipTest('column domains and annotations are 23ai')
+        self._skip_if_mirror('column domains and annotations (#1082)')
+        self._drop_domain()
+
+    def tearDown(self):
+        self._drop_domain()
+        super().tearDown()
+
+    def _drop_domain(self):
+        # The table first, PURGEd: a dropped table in the recycle bin still uses
+        # the domain, and the domain would then outlive the test. FORCE covers a
+        # leftover from an interrupted run.
+        with self.conn.cursor() as cur:
+            for sql in (
+                f'DROP TABLE {self.TABLE} PURGE',
+                f'DROP DOMAIN {self.DOMAIN} FORCE',
+            ):
+                try:
+                    cur.execute(sql)
+                except seerdb.DatabaseError:
+                    pass
+
+    def test_domain_and_annotations_are_described(self):
+        # The table python-oracledb's suite uses for the same check (test_4361).
+        self.cur.execute(f'CREATE DOMAIN {self.DOMAIN} AS NUMBER(3, 0) NOT NULL')
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (id NUMBER(9) NOT NULL, '
+            f'age NUMBER(3, 0) DOMAIN {self.DOMAIN} '
+            "ANNOTATIONS (Anno_1 'first annotation', Anno_2 'second annotation', Anno_3))"
+        )
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1, 25)')
+        self.cur.execute(f'SELECT * FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchall(), [(1, 25)])
+        (plain, annotated) = self.cur.description
+        self.assertIsNone(plain.domain_schema)
+        self.assertIsNone(plain.domain_name)
+        self.assertIsNone(plain.annotations)
+        self.assertEqual(annotated.domain_schema, _USER.upper())
+        self.assertEqual(annotated.domain_name, self.DOMAIN)
+        self.assertEqual(
+            annotated.annotations,
+            {'ANNO_1': 'first annotation', 'ANNO_2': 'second annotation', 'ANNO_3': ''},
+        )
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
