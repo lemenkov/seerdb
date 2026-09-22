@@ -27,6 +27,7 @@ from seerdb.common.crypto import (
 from seerdb.common.datatypes import (
     JSON,
     BcDate,
+    BFile,
     BinaryDouble,
     BinaryFloat,
     IntervalYM,
@@ -229,6 +230,8 @@ from seerdb.common.tns_consts import (
     TNS_KPD_AQ_BUFMSG,
     TNS_KPD_AQ_EITHER,
     TNS_LOB_OP_FILE_CLOSE,
+    TNS_LOB_OP_FILE_EXISTS,
+    TNS_LOB_OP_FILE_ISOPEN,
     TNS_LOB_OP_FILE_OPEN,
     TNS_LOB_OP_GET_LENGTH,
     TNS_LOB_OP_READ,
@@ -1192,6 +1195,13 @@ _DESCRIBE_WIRE_LENGTH = {
     # JSON before it -- the FIFTH time: the client reads no bytes for the
     # column and takes the value's first byte for the next token (#826).
     TNS_TYPE_REFCURSOR: 5,
+    # A BFILE column describes as 530 on a live 23ai (measured against
+    # `select BFILENAME('D','f.txt') from dual`, whose describe also carries
+    # charset 0 / csfrm 0). Zero here is the same trap as BOOLEAN, ROWID,
+    # VECTOR, JSON and REF CURSOR before it -- the SIXTH time: the reference
+    # client reads no bytes for the column and takes the locator's first byte
+    # for the next message type (#1102).
+    TNS_TYPE_BFILE: 530,
 }
 
 
@@ -2703,6 +2713,13 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
             locator=locator,
             payload=_decode_lobops_chunked(rest),
             offset=max(write_offset, 1),
+        )
+    if operation in _LOBOPS_FILE_KINDS:
+        # A BFILE call: the locator carries the directory and file name, so the
+        # server needs no state to answer one (#1102).
+        return LobOpsRequest(
+            kind=_LOBOPS_FILE_KINDS[operation],
+            locator=_lobops_locator_after_operation(rest),
         )
     if operation == TNS_LOB_OP_FREE_TEMP:
         return LobOpsRequest(
@@ -11932,6 +11949,71 @@ def _encode_temporal(Value: datetime.date | BcDate, DataType: int) -> bytes:
     return _encode_date_prefix(Dt.replace(microsecond=0, tzinfo=None))
 
 
+# The fixed block a BFILE locator carries between its length and the directory
+# name. Captured from 23ai, identical for every BFILE (#1102).
+_BFILE_LOCATOR_FIXED = bytes.fromhex('000108080000000100000000000000')
+
+
+_LOBOPS_FILE_KINDS = {
+    TNS_LOB_OP_FILE_OPEN: 'file_open',
+    TNS_LOB_OP_FILE_CLOSE: 'file_close',
+    TNS_LOB_OP_FILE_EXISTS: 'file_exists',
+    TNS_LOB_OP_FILE_ISOPEN: 'file_isopen',
+}
+
+
+def encode_bfile_locator(Directory: str, Filename: str) -> bytes:
+    """A BFILE locator naming ``Directory`` and ``Filename`` (#1102).
+
+    The form 23ai sends, and the inverse of the client's reader: a ub2 of
+    everything after it, the fixed block, then the two names each with a ub1
+    length, separated by a zero byte::
+
+        00 35 | 000108080000000100000000000000 | 0f 'PYO_MISSING_DIR' | 00 | 14 'pyo_missing_file.txt'
+    """
+    Dir = Directory.encode('ascii')
+    File = Filename.encode('ascii')
+    if len(Dir) > 255 or len(File) > 255:
+        raise DataError('a BFILE directory or file name is longer than 255 bytes')
+    Body = (
+        _BFILE_LOCATOR_FIXED
+        + bytes([len(Dir)])
+        + Dir
+        + bytes([0])
+        + bytes([len(File)])
+        + File
+    )
+    return len(Body).to_bytes(2, 'big') + Body
+
+
+def decode_bfile_locator(Locator: bytes) -> tuple[str, str] | None:
+    """The directory and file name a BFILE locator carries, or None (#1102).
+
+    The Mirror needs no state to answer a FILE_* call: the names travel in the
+    locator the client sends back. They are anchored on the fixed block rather
+    than a fixed offset, because a locator arrives in more than one framing --
+    as fetched it opens with its own ub2 inner length, while a client's LOBOPS
+    request sends it from the fixed block onward.
+    """
+    at = Locator.find(_BFILE_LOCATOR_FIXED)
+    if at < 0:
+        return None
+    pos = at + len(_BFILE_LOCATOR_FIXED)
+    try:
+        DirLen = Locator[pos]
+        DirEnd = pos + 1 + DirLen
+        FileLen = Locator[DirEnd + 1]
+        FileEnd = DirEnd + 2 + FileLen
+        if FileEnd > len(Locator):
+            return None
+        return (
+            Locator[pos + 1 : DirEnd].decode('ascii'),
+            Locator[DirEnd + 2 : FileEnd].decode('ascii'),
+        )
+    except (IndexError, UnicodeDecodeError):
+        return None
+
+
 def encode_value(Value: object, DataType: int) -> bytes:
     """A scalar column value as its RXD wire form — the inverse of
     :func:`~seerdb.common.types.decode_value`.
@@ -11942,6 +12024,21 @@ def encode_value(Value: object, DataType: int) -> bytes:
     still carries it, so they skip the bare-0x00 NULL path), and a LOB rides as a
     minted locator with its content following over TTI_LOBOPS."""
 
+    if DataType == TNS_TYPE_BFILE:
+        # A BFILE names a file on the server; the locator carries the two names
+        # and the client asks about the file separately (#1102). It rides the
+        # same framing as a CLOB / BLOB column -- the reference client reads
+        # that one for every LOB-class column -- with the size left 0, since
+        # nothing has opened the file at fetch time.
+        if not isinstance(Value, BFile):
+            return encode_sb4(0)
+        # The BARE form -- ub4 length + the locator -- not the size / chunk-size
+        # metadata a CLOB or BLOB carries. Captured from 23ai: `00000007 01 1a |
+        # 1a <locator>` where a BLOB has `02 0b b8 | 02 1f 7c` between the two
+        # (#1102).
+        return encode_lob_locator_thin(
+            locator=encode_bfile_locator(Value.directory, Value.filename)
+        )
     if DataType == TNS_TYPE_RID:
         return encode_rowid_value(Value)
     if DataType == TNS_TYPE_UROWID:

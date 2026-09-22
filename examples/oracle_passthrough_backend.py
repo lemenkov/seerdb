@@ -24,7 +24,7 @@ from dataclasses import replace
 from typing import TypeVar
 
 import seerdb
-from seerdb.common.datatypes import TempLob, dbtype_for_oracle_type
+from seerdb.common.datatypes import BFile, TempLob, dbtype_for_oracle_type
 from seerdb.common.dbobject import (
     DbObject,
     DbObjectType,
@@ -37,6 +37,7 @@ from seerdb.common.tns import AL16UTF16_CHARSET, ColumnMeta
 from seerdb.common.tns_consts import (
     FIELD_VERSION_12_1,
     TNS_TYPE_ADT,
+    TNS_TYPE_BFILE,
     TNS_TYPE_BLOB,
     TNS_TYPE_CLOB,
     TNS_TYPE_REF,
@@ -225,6 +226,28 @@ class OraclePassthroughBackend:
             for key, value in identity.items()
             if key in ('program', 'machine', 'terminal', 'osuser')
         }
+
+    def bfile_exists(self, directory: str, filename: str) -> bool:
+        """Does this BFILE's file exist upstream? (#1102)
+
+        Asked of the real server, so its own answer reaches the client --
+        including ORA-22285 for a DIRECTORY object that does not exist, which is
+        a different thing from a file that is simply absent.
+        """
+        assert self._conn is not None  # authenticate() ran before this
+        cursor = self._conn.cursor()
+        try:
+            # Asked in SQL: DBMS_LOB.FILEEXISTS answers 1 / 0 for a file, and
+            # raises ORA-22285 itself when the DIRECTORY object does not exist --
+            # which is the answer the client is waiting for.
+            cursor.execute(
+                'SELECT DBMS_LOB.FILEEXISTS(BFILENAME(:1, :2)) FROM dual',
+                [directory, filename],
+            )
+            (present,) = cursor.fetchone()
+            return bool(present)
+        except seerdb.DatabaseError as exc:
+            raise _relay_error(exc) from exc
 
     def ping(self) -> None:
         """Prove the UPSTREAM session is alive, not just this process (#826).
@@ -583,6 +606,7 @@ class OraclePassthroughBackend:
             columns = _enrich_ref_columns(columns, rows)
             rows = self._resolve_fetched_object_lobs(columns, rows)
             rows = _drain_nested_cursors(columns, rows)
+            rows = _resolve_bfiles(rows)
             return Result(columns=columns, rows=rows)
         implicit = self._drain_implicit_results(cursor)
         if implicit:
@@ -912,6 +936,30 @@ _ORA_PREFIX = re.compile(r'^ORA-(\d{5}):\s*')
 _RECEIVER_SIZE = 32767
 
 
+def _resolve_bfiles(rows: list) -> list:
+    """Hand a BFILE over as its two names (#1102).
+
+    A BFILE has no content to read here -- reading one opens a file on the
+    server -- so the upstream LOB is turned into the pair the Mirror builds a
+    locator from, and the client's later FILE_* calls come back through
+    ``bfile_exists``.
+    """
+    out = []
+    for row in rows:
+        if not any(getattr(v, 'is_file', False) for v in row):
+            out.append(row)
+            continue
+        out.append(
+            tuple(
+                BFile(v.directory_name, v.filename)
+                if getattr(v, 'is_file', False)
+                else v
+                for v in row
+            )
+        )
+    return out
+
+
 def _relay_error(exc: 'seerdb.DatabaseError', rowcount: int = 0) -> BackendError:
     text = str(exc)
     match = _ORA_PREFIX.match(text)
@@ -1032,13 +1080,19 @@ def _to_column_meta(desc: tuple) -> ColumnMeta:
         # emit those here -- the FetchInfo's bare wire type carries no csfrm, and
         # the default (1) would surface every object as XMLType (#888).
         csfrm = 0
+    elif int(tns_type) == TNS_TYPE_BFILE:
+        # A BFILE describes with charset 0 / csfrm 0 too: it carries the two
+        # names, not character data (#1102).
+        csfrm = 0
     byte_size = internal_size or display_size or 0
     if csfrm == 2:
         # National char (NCHAR / NVARCHAR2): UTF-16BE in AL16UTF16. data_length is
         # the byte buffer (internal_size), max_size the declared character length.
         data_length, max_size = byte_size, (display_size or byte_size)
         charset = AL16UTF16_CHARSET
-    elif int(tns_type) == TNS_TYPE_ADT:
+    elif int(tns_type) in (TNS_TYPE_ADT, TNS_TYPE_BFILE):
+        # A BFILE describes with charset 0 / csfrm 0, like an object: it carries
+        # no character data of its own, only the two names (#1102).
         data_length = max_size = byte_size
         charset = 0
     else:

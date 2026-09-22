@@ -58,12 +58,14 @@ from seerdb.common.tns import (
     ExecRequest,
     FetchRequest,
     LobEmitLog,
+    LobOpsRequest,
     NestedCursor,
     ReexecuteRequest,
     RefCursorOutBind,
     ScalarOutBind,
     TempLobRef,
     ddl_command_type,
+    decode_bfile_locator,
     decode_dalc,
     decode_ub4,
     encode_batch_errors_status,
@@ -145,6 +147,7 @@ from seerdb.common.tns_consts import (
     TNS_MARKER,
     TNS_MARKER_TYPE_RESET,
     TNS_MSG_TYPE_FAST_AUTH,
+    TNS_TYPE_BFILE,
     TNS_TYPE_BLOB,
     TNS_TYPE_CLOB,
     TNS_TYPE_JSON,
@@ -832,6 +835,11 @@ def _refuse_unhandled(stream: PacketStream, what: str) -> None:
 # Used for a TTC function the Mirror does not implement, so the call is refused
 # rather than left unanswered (#832).
 _ORA_UNSUPPORTED_CALL = 3115
+# What a server answers when a BFILE's DIRECTORY object or file is not there.
+_ORA_BFILE_MISSING = 22285
+_ORA_BFILE_MISSING_TEXT = (
+    'ORA-22285: non-existent directory or file for FILEOPEN operation'
+)
 
 
 # The OCI end-to-end tracing piggyback (func 135) modern sqlplus sends after
@@ -1023,6 +1031,7 @@ def serve_session(
                 object_lobs,
                 current_object_lob,
                 lob_emit_log,
+                backend,
             )
         elif body[1] == TNS_FUNC_REEXECUTE_AND_FETCH:
             # The rows carry no OACs -- the cursor's opening execute declared the
@@ -1313,7 +1322,17 @@ def _defers_inline_rows(columns: list[ColumnMeta]) -> bool:
     # and the reference client requires it: on reading such a describe it sets
     # "requires define / no prefetch" and stops expecting inline rows (#887).
     return any(
-        col.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB, TNS_TYPE_JSON, TNS_TYPE_VECTOR)
+        col.data_type
+        in (
+            TNS_TYPE_CLOB,
+            TNS_TYPE_BLOB,
+            TNS_TYPE_JSON,
+            TNS_TYPE_VECTOR,
+            # A BFILE is LOB-class too: 23ai answers a `select BFILENAME(...)`
+            # with a describe and no row, and the reference client reads
+            # anything that follows as the next message (#1102).
+            TNS_TYPE_BFILE,
+        )
         and col.inline_long_csfrm is None
         for col in columns
     )
@@ -2185,6 +2204,47 @@ def _emit_log_key(lob_emit_log: 'LobEmitLog | None', locator: bytes) -> bytes | 
     return None
 
 
+def _answer_bfile(
+    stream: PacketStream, backend: Backend | None, request: LobOpsRequest
+) -> None:
+    """Answer a BFILE call (#1102).
+
+    The locator carries the directory and file name, so nothing is remembered
+    between calls: each is answered by asking the backend about those two names.
+    A backend with no BFILE hooks refuses the call the way any unservable one is
+    refused, rather than claiming the file is missing -- "I cannot" and "it is
+    not there" are different answers, and only the server knows the second.
+    """
+    names = decode_bfile_locator(request.locator)
+    exists = getattr(backend, 'bfile_exists', None)
+    if names is None or exists is None:
+        _refuse_unhandled(stream, f'a BFILE {request.kind}')
+        return
+    (directory, filename) = names
+    try:
+        present = bool(exists(directory, filename))
+    except BackendError as err:
+        # The server's own answer -- ORA-22285 for a directory that does not
+        # exist -- is what the client is asking for, so relay it.
+        stream.write_packet(TNS_DATA, encode_error(err.ora_code, err.ora_message))
+        return
+    if request.kind == 'file_exists':
+        stream.write_packet(TNS_DATA, encode_lobops_is_open(request.locator, present))
+        return
+    if request.kind == 'file_isopen':
+        # Nothing is held open between calls, so it never reports open.
+        stream.write_packet(TNS_DATA, encode_lobops_is_open(request.locator, False))
+        return
+    if request.kind == 'file_open' and not present:
+        stream.write_packet(
+            TNS_DATA, encode_error(_ORA_BFILE_MISSING, _ORA_BFILE_MISSING_TEXT)
+        )
+        return
+    # FILE_OPEN on a file that is there, and FILE_CLOSE: the locator back, which
+    # is what the client reads and reuses for the READ that follows.
+    stream.write_packet(TNS_DATA, encode_lobops_ack(request.locator))
+
+
 def _answer_lobops(
     stream: PacketStream,
     body: bytes,
@@ -2194,6 +2254,7 @@ def _answer_lobops(
     object_lobs: list[tuple[bytes, bool]] | None = None,
     current_object_lob: tuple[bytes, bool] | None = None,
     lob_emit_log: LobEmitLog | None = None,
+    backend: Backend | None = None,
 ) -> tuple[
     list[tuple[bytes, bool]],
     tuple[bytes, bool] | None,
@@ -2206,6 +2267,9 @@ def _answer_lobops(
     # the (possibly shortened) column read queue and the current column / object
     # read cursors.
     request = parse_lobops_request(body)
+    if request.kind in ('file_open', 'file_close', 'file_exists', 'file_isopen'):
+        _answer_bfile(stream, backend, request)
+        return lobs, current_lob, current_object_lob
     if request.kind == 'create_temp':
         locator = temp_lobs.mint(request.is_blob)
         stream.write_packet(TNS_DATA, encode_create_temp_response(locator))
