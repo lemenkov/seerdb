@@ -3840,6 +3840,11 @@ least one decimal; an exact zero prints bare; an INT8 element prints as an
 integer; sparse is `[dims, [indices], [values]]`. Serving the image instead left
 the client reading it under a character variable (`DPY-5000`).
 
+**A native JSON column defined this way** gets the document as **compact JSON
+text** — no space after `:` or `,` — in place of the OSON image (#1106).
+Captured from 23ai: `{"name":"John","city":"Delhi"}`. Same failure mode when the
+image goes out instead.
+
 The reply is rows alone (`TTI_RXH` + `TTI_RXD`, no describe — the client has it),
 with the value framed inline exactly as §14.5c describes:
 
