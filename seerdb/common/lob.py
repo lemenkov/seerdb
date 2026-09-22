@@ -31,6 +31,14 @@ from seerdb.common.tns_consts import (
 # fetched binary image into a Python object (not returned as a LOB).
 _DECODED_IMAGE_TYPES = (TNS_TYPE_JSON, TNS_TYPE_VECTOR)
 
+# Types that stay a LOB object even when the connection asks for values
+# (`fetch_lobs=False`). A BFILE names a file on the SERVER's filesystem and has
+# no inline value: reading it opens that file, which is a question for
+# fileexists() / read(), not for the fetch. Materialising one made selecting a
+# BFILE whose directory does not exist fail with ORA-22285 at the fetch, where
+# python-oracledb hands back the locator (#1101).
+_EXTERNAL_LOB_TYPES = (TNS_TYPE_BFILE,)
+
 _LOCATOR_OVERHEAD = 102
 
 # The mode a LOB OPEN carries in its amount field. Measured against a live 23ai:

@@ -475,3 +475,30 @@ class TestPingReplyError(unittest.TestCase):
         _ConnectionLogic._raise_reply_error((0, 0, None, None, None, None))
         # The (done, accumulator) shape a clean ping can come back in (#1095).
         _ConnectionLogic._raise_reply_error((True, (None, None, [])))
+
+
+class TestBFileIsNeverMaterialised(unittest.TestCase):
+    # fetch_lobs=False turns a CLOB / BLOB into a value; a BFILE keeps its LOB
+    # object, because reading one opens a file on the server (#1101).
+    class _Conn:
+        fetch_lobs = False
+
+    def _row(self, data_type):
+        from seerdb.client.cursor import _resolve_lobs
+        from seerdb.common.lob import LOB
+
+        return _resolve_lobs(self._Conn(), [LOB(data_type, b'locator-bytes')])
+
+    def test_a_bfile_stays_a_lob(self):
+        from seerdb.common.lob import LOB
+        from seerdb.common.tns_consts import TNS_TYPE_BFILE
+
+        self.assertIsInstance(self._row(TNS_TYPE_BFILE)[0], LOB)
+
+    def test_a_clob_is_still_materialised(self):
+        from seerdb.common.tns_consts import TNS_TYPE_CLOB
+
+        # No connection to read over, so the attempt fails -- which is itself the
+        # proof that a CLOB still takes the materialising path.
+        with self.assertRaises(Exception):
+            self._row(TNS_TYPE_CLOB)

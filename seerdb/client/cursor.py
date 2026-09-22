@@ -1092,10 +1092,12 @@ def _resolve_return_bind_lobs(Connection, Bind) -> None:
     # the connection asks for LOB objects, materialise it -- the same rule
     # _resolve_lobs applies to a fetched cell. The async cursor does the awaited
     # half itself.
+    from seerdb.common.lob import _EXTERNAL_LOB_TYPES
+
     KeepLobs = getattr(Connection, 'fetch_lobs', False)
     for Bucket, Index, Value in _return_bind_lobs(Bind):
         Value._connection = Connection
-        if not KeepLobs:
+        if not KeepLobs and Value.data_type not in _EXTERNAL_LOB_TYPES:
             Bucket[Index] = Value.read()
 
 
@@ -1129,11 +1131,13 @@ def _resolve_out_bind_lobs(Connection, Bind) -> None:
     # The sync half of _out_bind_lobs: attach the connection and, unless the
     # connection asks for LOB objects, materialise -- the same rule
     # _resolve_lobs applies to a fetched LOB cell.
-    from seerdb.common.lob import _DECODED_IMAGE_TYPES
+    from seerdb.common.lob import _DECODED_IMAGE_TYPES, _EXTERNAL_LOB_TYPES
 
     KeepLobs = getattr(Connection, 'fetch_lobs', False)
     for Variable in _out_bind_lobs(Bind):
         Variable._value._connection = Connection
+        if Variable._value.data_type in _EXTERNAL_LOB_TYPES:
+            continue
         if KeepLobs and Variable._value.data_type not in _DECODED_IMAGE_TYPES:
             continue
         Variable._value = Variable._value.read()
@@ -1148,13 +1152,15 @@ def _resolve_lobs(Connection, Row: list) -> list:
     #
     # A JSON / VECTOR column arrives as a LOB too but is never a LOB to the
     # caller: its image decodes to a Python value whatever `fetch_lobs` says.
-    from seerdb.common.lob import _DECODED_IMAGE_TYPES, LOB
+    from seerdb.common.lob import _DECODED_IMAGE_TYPES, _EXTERNAL_LOB_TYPES, LOB
 
     Out = list(Row)
     KeepLobs = getattr(Connection, 'fetch_lobs', False)
     for I, Val in enumerate(Out):
         if isinstance(Val, LOB):
             Val._connection = Connection
+            if Val.data_type in _EXTERNAL_LOB_TYPES:
+                continue
             if KeepLobs and Val.data_type not in _DECODED_IMAGE_TYPES:
                 continue
             Out[I] = Val.read()

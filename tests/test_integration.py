@@ -44,6 +44,7 @@ from seerdb.common.tns_consts import (
 # on fv2, not fixable fv2 bind gaps (those are #172 dates, #173 intervals,
 # #174 national charset).
 _FV2_UNSUPPORTED = (
+    ('missing_directory', 'pre-10g reads a BFILE at fetch time (#1103)'),
     ('mixed_batch', 'executemany (array DML) is a 10g+ path'),
     ('lastrowid', 'the fv2 DML status is not read for a rowid yet (#1079)'),
     ('binary_double', 'BINARY_DOUBLE is a 10g+ type; Oracle 9i lacks it'),
@@ -2290,6 +2291,36 @@ class MixedPrecisionBatchIntegration(_IntegrationBase):
         self.conn.commit()
         self.cur.execute(f'SELECT t FROM {self.TABLE} ORDER BY n')
         self.assertEqual([r[0] for r in self.cur.fetchall()], values)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class BFileMissingDirectoryIntegration(_IntegrationBase):
+    """A BFILE naming a directory that does not exist (#1101).
+
+    Needs no configured directory, unlike BFILEIntegration: the point is that
+    selecting the locator works and only reading it fails.
+    """
+
+    def test_bfile_missing_directory_fetches_and_only_the_read_fails(self):
+        # fetch_lobs=False used to materialise the BFILE at fetch time, which
+        # opens the file -- so the SELECT itself raised ORA-22285 where
+        # python-oracledb hands back the locator.
+        self._skip_if_mirror('serving a BFILE column (#1102)')
+        Conn = _connect(fetch_lobs=False)
+        try:
+            Cur = Conn.cursor()
+            Cur.execute(
+                'SELECT BFILENAME(:1, :2) FROM dual',
+                ['PYO_MISSING_DIR', 'pyo_missing_file.txt'],
+            )
+            (Lob,) = Cur.fetchone()
+            self.assertEqual(Lob.directory_name, 'PYO_MISSING_DIR')
+            self.assertEqual(Lob.filename, 'pyo_missing_file.txt')
+            with self.assertRaises(seerdb.DatabaseError) as caught:
+                Lob.read()
+            self.assertEqual(caught.exception.code, 22285)
+        finally:
+            Conn.close()
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
