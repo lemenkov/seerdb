@@ -1500,6 +1500,17 @@ widest value in each column across all rows), the All8 iteration count is the
 number of rows, and each row's values follow as its own `TTI_RXD` token after
 the OAC block.
 
+Because there is one descriptor per column, **every row's value in that column
+must have the same wire width**. That is not automatic for a temporal column: a
+`datetime` carrying no sub-second part encodes as the 7-byte DATE form and one
+carrying microseconds as the 11-byte TIMESTAMP form, so a batch mixing the two
+sent both widths under one descriptor and the server answered `ORA-01483:
+invalid length for DATE or NUMBER bind variable`. seerdb widens such a column to
+the 11-byte form for every row before sizing the OAC (#1098); the values are
+unchanged, and a DATE column still truncates the sub-second part server-side.
+Aware values are left alone -- widening one would mean inventing a zone for the
+others.
+
 **LONG-class binds come last** (#705). The server takes a character or RAW bind
 in place only up to its *maximum string size*: 32767 bytes when its runtime
 capability vector carries the 32K TTC bit (`RCAP_TTC` bit `0x04`, which 12c and
