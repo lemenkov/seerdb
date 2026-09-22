@@ -4101,6 +4101,24 @@ class ChangePasswordIntegration(unittest.TestCase):
             if conn.field_version < FIELD_VERSION_10_2:
                 self.skipTest('changepassword is not supported on Oracle 9i')
 
+    def test_a_rejected_change_reports_the_servers_code(self):
+        # python-oracledb's test_1108: an over-long new password, with the right
+        # and then a wrong old one. The server rejects both with ORA-01017 on the
+        # protocol route; through the Mirror the change used to go out as ALTER
+        # USER ... REPLACE, which the server rejects as ORA-28218 instead (#1089).
+        # Both calls fail, so the password never changes.
+        with seerdb.connect(**self._kwargs(_PASSWORD)) as conn:
+            if conn.field_version < FIELD_VERSION_12_1:
+                self.skipTest(
+                    'a very long new password gets ORA-03120 before 12c (#1090)'
+                )
+            for old in (_PASSWORD, 'incorrect old password'):
+                with self.assertRaises(seerdb.DatabaseError) as caught:
+                    conn.changepassword(old, '1' * 1500)
+                self.assertIn(caught.exception.code, (1017, 988, 28008))
+        with seerdb.connect(**self._kwargs(_PASSWORD)):
+            pass  # unchanged
+
     def test_changepassword_roundtrip(self):
         new = _PASSWORD + '_chg9'
         with seerdb.connect(**self._kwargs(_PASSWORD)) as conn:
