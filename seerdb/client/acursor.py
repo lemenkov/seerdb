@@ -6,7 +6,7 @@
 
 from typing import Any
 
-from seerdb.client._cursor_logic import _CursorLogic
+from seerdb.client._cursor_logic import _CursorLogic, _touched_rowid
 from seerdb.client.cursor import (
     _assign_out_binds,
     _assign_return_binds,
@@ -341,7 +341,7 @@ class AsyncCursor(_CursorLogic):
                     OraCode == ORA_NO_DATA_FOUND,
                 )
         else:
-            self._lastrowid = LastRowid
+            self._lastrowid = _touched_rowid(LastRowid, ServerRowCount)
             self._description = None
             self._annotations = None
             self._rows = []
