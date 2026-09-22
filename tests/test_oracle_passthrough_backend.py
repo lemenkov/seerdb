@@ -232,6 +232,19 @@ def test_a_bc_date_is_carried_on_for_the_length_of_a_call():
         raise AssertionError('the switch outlived the call')
 
 
+def test_the_upstream_lastrowid_is_relayed():
+    # A DML's touched row, single or array, as the upstream reported it (#1077).
+    backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
+    cursor = _FakeCursor()
+    cursor.rowcount = 1
+    cursor.lastrowid = 'AAAs/uAAAAAAWFFADg'
+    cursor.executemany = lambda sql, rows: None
+    backend._conn = type('Conn', (), {'cursor': lambda self: cursor})()
+    assert backend.execute('INSERT INTO t VALUES (1)').last_rowid == cursor.lastrowid
+    many = backend.execute_many('INSERT INTO t VALUES (:1)', [[1], [2]])
+    assert (many.rowcount, many.last_rowid) == (1, cursor.lastrowid)
+
+
 def test_array_bind_registers_an_array_var_of_the_declared_capacity():
     # An associative-array BindVar (#743) becomes an arrayvar of the client's
     # capacity, seeded with the elements sent; its list comes back as the OUT.

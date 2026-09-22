@@ -2893,17 +2893,27 @@ def _answer_query(
                 # its network latency once per row). A per-row failure aborts the
                 # batch — exactly Oracle's non-batcherrors behaviour. batcherrors
                 # keeps the per-row path below so each failure can be attributed.
-                result = Result(rowcount=execute_many(sql, iter_rows))
+                applied_many = execute_many(sql, iter_rows)
+                # An int is the affected-row count; a Result also carries the
+                # last row's rowid (#1077).
+                result = (
+                    applied_many
+                    if isinstance(applied_many, Result)
+                    else Result(rowcount=applied_many)
+                )
             else:
                 # Per row: needed for batcherrors (the good rows still apply and a
                 # per-row failure is collected as (offset, code, message) rather
                 # than aborting the batch), and the fallback for a backend that
                 # offers no array path.
                 affected = 0
+                last_rowid = None
                 for offset, row in enumerate(iter_rows):
                     try:
-                        applied = backend.execute(sql, row).rowcount
+                        applied_row = backend.execute(sql, row)
+                        applied = applied_row.rowcount
                         affected += applied
+                        last_rowid = applied_row.last_rowid or last_rowid
                         per_iteration.append(applied)
                     except BackendError as err:
                         if not request.batcherrors:
@@ -2920,7 +2930,7 @@ def _answer_query(
                         # dropping it would shift every count after it (#1031).
                         per_iteration.append(0)
                         batch_errors.append((offset, err.ora_code, err.ora_message))
-                result = Result(rowcount=affected)
+                result = Result(rowcount=affected, last_rowid=last_rowid)
         else:
             result = backend.execute(
                 sql, _resolve_refcursor_in_binds(backend, cursors, _bind_vars(request))
@@ -3056,6 +3066,7 @@ def _answer_query(
                 result.rowcount,
                 cursor_id=cursor_id,
                 compilation_warning=result.compilation_warning,
+                rowid=result.last_rowid,
             )
             # `alter session set current_schema = X` does not just succeed: the
             # server reports the new value back, and that is the ONLY place a

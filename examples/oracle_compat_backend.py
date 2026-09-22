@@ -141,7 +141,7 @@ class OracleCompatBackend:
         # being dialect-specific, translates Oracle SQL to its own dialect there).
         return self._inner.execute(sql, binds)
 
-    def execute_many(self, sql: str, rows: Sequence[Sequence]) -> int:
+    def execute_many(self, sql: str, rows: Sequence[Sequence]) -> int | Result:
         # Array DML (executemany): hand the whole batch to the inner backend's own
         # array path when it has one (one round-trip instead of per row), else fall
         # back to a per-row loop through this wrapper's execute. Array DML is plain

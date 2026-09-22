@@ -2543,6 +2543,19 @@ fetched row's rowid, which is not a "last modified row", so the driver
 clears `lastrowid` on result-set statements; a zero block number (DDL /
 no row) means no rowid.
 
+In a **bigfile** tablespace (23ai's default `USERS`) this field and a fetched
+ROWID column disagree on the relative file number: the status token carries the
+bigfile marker **1024**, the column **0**. So the same row prints `…AQAAAD…` as
+`lastrowid` and `…AAAAAD…` as a fetched ROWID or through `ROWIDTOCHAR`, and the
+server accepts either back (`WHERE ROWID = :1` finds the row with both).
+python-oracledb reports exactly the same pair, so compare rowids by the row they
+name, never as strings. Measured on 23ai.
+
+The Mirror writes these fields from the backend's `Result.last_rowid` (its
+printable form, parsed back by `string_to_rowid`); a backend with no Oracle
+rowids leaves them zero (#1077). The fv2 short status (8i / 9i) is read for the
+row count and code only, so `lastrowid` is `None` there (#1079).
+
 **Common error codes**:
 - `0`: Success.
 - `1`: ORA-00001 — unique constraint violated.
