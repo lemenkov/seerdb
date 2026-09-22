@@ -151,6 +151,61 @@ def test_typed_null_of_an_ordinary_statement_is_declared_upstream():
     assert not isinstance(cursor.bound[0], BindVar)
 
 
+class _FakeLobConn:
+    """An upstream connection that records the temp LOBs made on it."""
+
+    def __init__(self, cursor, field_version):
+        self._cursor = cursor
+        self.field_version = field_version
+        self.written: list = []
+
+    def cursor(self):
+        return self._cursor
+
+    def create_temp_lob(self, is_blob=False):
+        return b'LOC%d' % len(self.written)
+
+    def write_temp_lob(self, locator, data, is_blob=False):
+        self.written.append((locator, data, is_blob))
+
+
+def test_a_lob_bound_into_plain_sql_is_bound_upstream_as_a_lob():
+    # A LOB the client bound arrives as a ClobValue / BlobValue (#1067). Bound on
+    # as a str it would be a VARCHAR2, which a real server refuses past 32 KB
+    # (ORA-01461), so the passthrough puts it in an upstream temp LOB again.
+    from seerdb.common.datatypes import TempLob
+    from seerdb.server.backend import BlobValue, ClobValue
+
+    backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
+    cursor = _FakeCursor()
+    backend._conn = _FakeLobConn(cursor, FIELD_VERSION_12_1)
+    text = 'x' * 40000
+    backend.execute(
+        'INSERT INTO t VALUES (:1, :2, :3)',
+        [ClobValue(text), BlobValue(b'\x01'), 'plain'],
+    )
+    (c, b, plain) = cursor.bound
+    assert isinstance(c, TempLob) and not c.is_blob
+    assert isinstance(b, TempLob) and b.is_blob
+    assert plain == 'plain' and not isinstance(plain, TempLob)
+    assert backend._conn.written == [
+        (c.locator, text, False),
+        (b.locator, b'\x01', True),
+    ]
+
+
+def test_a_pre_12_1_upstream_keeps_the_lob_value():
+    # 11g has no temp LOB to put it in (#91): bind the content, as before.
+    from seerdb.server.backend import ClobValue
+
+    backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
+    cursor = _FakeCursor()
+    backend._conn = _FakeLobConn(cursor, FIELD_VERSION_12_1 - 1)
+    backend.execute('INSERT INTO t VALUES (:1)', [ClobValue('short')])
+    assert cursor.bound == ['short']
+    assert backend._conn.written == []
+
+
 def test_array_bind_registers_an_array_var_of_the_declared_capacity():
     # An associative-array BindVar (#743) becomes an arrayvar of the client's
     # capacity, seeded with the elements sent; its list comes back as the OUT.

@@ -2791,6 +2791,47 @@ def test_minted_temp_clob_locator_declares_utf16be_content() -> None:
     assert _resolve_temp_lob_binds(request, temp_lobs).binds == ['A test string value']
 
 
+def test_a_resolved_temp_lob_still_says_it_was_a_lob() -> None:
+    # The content of a temp LOB the client bound resolves to a str / bytes that
+    # is ALSO a ClobValue / BlobValue, so a backend binding on to Oracle can bind
+    # a LOB instead of a VARCHAR2 that refuses it past 32 KB (#1067). An empty
+    # one stays the typed BindVar it was (#903); a batch gets typed values too.
+    from seerdb.common.tns import ExecRequest, TempLobRef
+    from seerdb.server.backend import BindVar, BlobValue, ClobValue
+    from seerdb.server.session import _resolve_temp_lob_binds, _TempLobs
+
+    temp_lobs = _TempLobs()
+    clob = temp_lobs.mint(is_blob=False)
+    temp_lobs.append(clob, ('x' * 40000).encode('utf-16-be'))
+    blob = temp_lobs.mint(is_blob=True)
+    temp_lobs.append(blob, b'\x00\x01')
+    empty = temp_lobs.mint(is_blob=False)
+    row = [
+        TempLobRef(clob, is_blob=False),
+        TempLobRef(blob, is_blob=True),
+        TempLobRef(empty, is_blob=False),
+        7,
+    ]
+    request = ExecRequest(
+        'insert into t values (:1, :2, :3, :4)', 0, 1, 0, binds=row, bind_rows=[row]
+    )
+    (c, b, e, n) = _resolve_temp_lob_binds(request, temp_lobs).binds
+    assert type(c) is ClobValue and c == 'x' * 40000
+    assert type(b) is BlobValue and b == b'\x00\x01'
+    assert isinstance(e, BindVar) and e.value == ''
+    assert n == 7
+    batch = ExecRequest(
+        'insert into t values (:1)',
+        0,
+        2,
+        0,
+        binds=[row[0]],
+        bind_rows=[[row[0]], [row[1]]],
+    )
+    rows = _resolve_temp_lob_binds(batch, temp_lobs).bind_rows
+    assert [type(r[0]) for r in rows] == [ClobValue, BlobValue]
+
+
 def _lobops_op_request(
     operation: int, locator: bytes, *, seq: int = 1, prefixed: bool = True
 ) -> bytes:

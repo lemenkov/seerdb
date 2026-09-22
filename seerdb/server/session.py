@@ -190,7 +190,9 @@ from seerdb.server.backend import (
     Backend,
     BackendError,
     BindVar,
+    BlobValue,
     Capability,
+    ClobValue,
     CursorResult,
     Result,
     SessionInfo,
@@ -2420,7 +2422,7 @@ def _answer_lobops(
 
 def _resolve_temp_lob_binds(request: ExecRequest, temp_lobs: _TempLobs) -> ExecRequest:
     # Swap any temp-LOB locator bind for the bytes streamed into it over
-    # TTI_LOBOPS WRITE, so the backend sees a plain str / bytes value (#412). A
+    # TTI_LOBOPS WRITE, so the backend sees a str / bytes value (#412). A
     # CLOB's content is UTF-16BE on the wire -- the minted locator says so with
     # its variable-length-charset flag, which is what a client encodes by (see
     # mint_temp_lob_locator) -- and a BLOB's is raw.
@@ -2430,12 +2432,19 @@ def _resolve_temp_lob_binds(request: ExecRequest, temp_lobs: _TempLobs) -> ExecR
     # Only meaningful on a single execute -- the array path takes plain values,
     # and an empty temp LOB in an executemany is not a real case -- so a batch
     # keeps the bare form.
+    # Any other content is resolved to a ClobValue / BlobValue, a str / bytes
+    # that still says it was a LOB, so a backend binding on to Oracle can bind a
+    # LOB rather than a VARCHAR2 that refuses it past 32 KB (#1067).
     single = len(request.bind_rows) <= 1
 
     def resolve(value: object) -> object:
         if isinstance(value, TempLobRef):
             data = temp_lobs.content(value.locator)
-            content = data if value.is_blob else data.decode('utf-16-be')
+            content: bytes | str = (
+                BlobValue(data)
+                if value.is_blob
+                else ClobValue(data.decode('utf-16-be'))
+            )
             if single and not content:
                 return BindVar(
                     value=content,
