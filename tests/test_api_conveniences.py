@@ -457,3 +457,21 @@ class TestFetchInfoDomain(unittest.TestCase):
         self.assertEqual(
             (info.domain_schema, info.domain_name, info.annotations), (None,) * 3
         )
+
+
+class TestPingReplyError(unittest.TestCase):
+    # A ping's reply can carry the error that ends the session (#1095).
+    def test_the_replys_error_is_raised(self):
+        from seerdb.client._conn_logic import _ConnectionLogic
+
+        reply = (0, 28, None, None, None, 'ORA-00028: session has been terminated')
+        with self.assertRaises(seerdb.DatabaseError) as caught:
+            _ConnectionLogic._raise_reply_error(reply)
+        self.assertEqual(caught.exception.code, 28)
+
+    def test_a_clean_reply_raises_nothing(self):
+        from seerdb.client._conn_logic import _ConnectionLogic
+
+        _ConnectionLogic._raise_reply_error((0, 0, None, None, None, None))
+        # The (done, accumulator) shape a clean ping can come back in (#1095).
+        _ConnectionLogic._raise_reply_error((True, (None, None, [])))

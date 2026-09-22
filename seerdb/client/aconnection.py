@@ -1960,7 +1960,7 @@ class AsyncOracleConnect(_ConnectionLogic):
 
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_PING))
         await self.send(TNS_DATA, Data)
-        await self._handle_response()
+        self._raise_reply_error(await self._handle_response())
 
     async def changepassword(self, old_password: str, new_password: str) -> None:
         """Change the connected user's password (#21). Async mirror of
