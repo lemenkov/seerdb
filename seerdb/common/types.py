@@ -391,14 +391,31 @@ def string_to_rowid(Text: str) -> tuple[int, int, int, int]:
     return (_seg(Text[0:6]), _seg(Text[6:9]), _seg(Text[9:15]), _seg(Text[15:18]))
 
 
+# A UROWID's leading tag byte: a PHYSICAL rowid, stored in a UROWID column. A
+# logical one (an index-organized table's) is tagged 0x02. Both captured from 23ai
+# (#1086).
+_UROWID_PHYSICAL_TAG = 0x01
+
+
 def urowid_to_string(Value: bytes) -> str:
-    # A logical/universal ROWID (e.g. an index-organized table's rowid) renders
-    # as "*" + base64 of the rowid bytes minus their leading 1-byte type tag,
-    # e.g. b"\x02\x04\x01\x00\x19\x83\x02\xc1\x02\xfe" -> "*BAEAGYMCwQL+".
+    # A universal ROWID's printable form depends on its leading tag byte. A
+    # physical rowid (tag 0x01) is the ordinary 18-character extended rowid, from
+    # the data object (ub4), partition / relative file (ub2), block (ub4) and slot
+    # (ub2) that follow, big-endian -- exactly what the same row's ROWID column
+    # prints, and what python-oracledb renders (#1086). Anything else is a logical
+    # rowid: "*" + base64 of the bytes after the tag, e.g.
+    # b"\x02\x04\x01\x00\x19\x83\x02\xc1\x02\xfe" -> "*BAEAGYMCwQL+".
     # base64 uses the standard alphabet; Oracle's printable form carries no
     # padding.
     import base64
 
+    if len(Value) >= 13 and Value[0] == _UROWID_PHYSICAL_TAG:
+        return rowid_to_string(
+            int.from_bytes(Value[1:5], 'big'),
+            int.from_bytes(Value[5:7], 'big'),
+            int.from_bytes(Value[7:11], 'big'),
+            int.from_bytes(Value[11:13], 'big'),
+        )
     return '*' + base64.b64encode(Value[1:]).decode('ascii').rstrip('=')
 
 

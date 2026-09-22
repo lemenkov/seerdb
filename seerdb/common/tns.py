@@ -11518,10 +11518,14 @@ _LOBOP_FCLOSE_MID = _o7_lobop_mid(TNS_LOB_OP_FILE_CLOSE, has_reply=0)
 # non-0xff value) from a NULL. The client only tests for 0 / 0xff, so the exact
 # size is cosmetic; 10 is a physical rowid's structured length.
 _RID_PRESENT = 0x0A
-# The leading type tag of a logical/universal rowid (UROWID, type 208). The
-# client strips it before rendering, so any value round-trips; 0x01 is the
-# logical-rowid tag.
-_UROWID_TAG = 0x01
+# The leading type tag of a UROWID (type 208) value, which says what it holds.
+# Captured from 23ai: 0x02 for a logical rowid (an index-organized table's), 0x01
+# for a PHYSICAL rowid stored in a UROWID column. A client branches on it --
+# python-oracledb renders a 0x01 value as an ordinary extended rowid -- so it is
+# not cosmetic. Writing 0x01 for every value made python-oracledb read an IOT's
+# logical rowid as a physical one, which then matched no row (#1087).
+_UROWID_LOGICAL_TAG = 0x02
+_UROWID_PHYSICAL_TAG = 0x01
 
 
 def encode_rowid_value(Value: object) -> bytes:
@@ -11549,12 +11553,29 @@ def encode_urowid_value(Value: object) -> bytes:
     """The UROWID (logical/universal rowid, type 208) RXD value (#484), the
     inverse of :func:`_read_urowid_column`: a ub4 byte count, a 1-byte length
     echo, then the rowid bytes (a leading type tag + the body). ``Value`` is the
-    ``*``-prefixed base64 string; ``None`` (or empty) is a zero count (NULL)."""
+    printable rowid: the ``*``-prefixed base64 form of a logical rowid, or the
+    18-character form of a physical one held in a UROWID column; ``None`` (or
+    empty) is a zero count (NULL)."""
     if Value is None or Value == '':
         return encode_sb4(0)
-    Body = str(Value)[1:]  # drop the leading '*'
-    Raw = base64.b64decode(Body + '=' * (-len(Body) % 4))
-    Payload = bytes([_UROWID_TAG]) + Raw
+    Text = str(Value)
+    if Text.startswith('*'):
+        Body = Text[1:]  # drop the leading '*'
+        Raw = base64.b64decode(Body + '=' * (-len(Body) % 4))
+        Payload = bytes([_UROWID_LOGICAL_TAG]) + Raw
+    else:
+        # A physical rowid: object (ub4), partition / file (ub2), block (ub4),
+        # slot (ub2), big-endian, after its tag (#1087).
+        from seerdb.common.types import string_to_rowid
+
+        (Obj, File, Block, Slot) = string_to_rowid(Text)
+        Payload = (
+            bytes([_UROWID_PHYSICAL_TAG])
+            + Obj.to_bytes(4, 'big')
+            + File.to_bytes(2, 'big')
+            + Block.to_bytes(4, 'big')
+            + Slot.to_bytes(2, 'big')
+        )
     if len(Payload) <= TNS_MAX_SHORT_LENGTH:
         return encode_sb4(len(Payload)) + bytes([len(Payload)]) + Payload
     # A large UROWID (an index-organized table's rowid) rides chunked, like a

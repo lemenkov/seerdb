@@ -92,12 +92,16 @@ class TestUrowidCaptureDecode(unittest.TestCase):
         rows = self._decode()[4]
         self.assertEqual(len(rows), 12)
         # The first row's UROWID and a NULL UROWID mid-set both decode.
-        self.assertEqual(rows[0], ['*AAAAegABAAAAAQAK'])
+        # These are PHYSICAL rowids (tag 0x01: object 122, file 1, block 1, slot
+        # 10), which Oracle and python-oracledb print as ordinary extended
+        # rowids. The '*' form this used to expect was seerdb's old rendering,
+        # written down as the answer (#1086).
+        self.assertEqual(rows[0], ['AAAAB6AABAAAAABAAK'])
         self.assertIsNone(rows[3][0])
         for (value,) in rows:
             if value is not None:
-                # Oracle's UROWID text is the '*'-prefixed base64 physical rowid.
-                self.assertTrue(value.startswith('*'))
+                self.assertEqual(len(value), 18)
+                self.assertFalse(value.startswith('*'))
 
     def test_terminating_error_is_ora_01403(self):
         result = self._decode()
