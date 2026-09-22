@@ -1589,6 +1589,18 @@ the ordinary query, the scrollable open, and `REEXECUTE_AND_FETCH`. A
 for rows now rather than declaring a prefetch — so a zero there still means "as
 many as there are".
 
+The rule reaches one more reply that is easy to overlook: the **define
+re-execute** of a LOB-class result (§14.5d). That round-trip serves rows the
+opening execute parked rather than running the statement again, but it is still
+an EXECUTE, so its `fetch` field is still a prefetch — a zero there sends no
+rows and leaves the result on the cursor, `more` set, for the `TTI_FETCH` that
+follows. Reading that particular zero as "all of them" does not overrun anything
+(the client has applied its define by now), so it fails in a quieter way: the
+values arrive one round-trip early, inside `execute()` instead of on the fetch,
+and any error decoding them surfaces from the wrong call (#1113). A REF CURSOR
+re-execute, which shares the same code path, is a fresh open rather than a
+continuation, and no capture yet says what a real server prefetches for one.
+
 **Temporal values are width-fixed by the column type, not the value.** The
 client-side encoder (§10.3) is value-driven — it picks 7/11/13 bytes from
 whether a `datetime` carries sub-second or zone parts — but a *column* must emit

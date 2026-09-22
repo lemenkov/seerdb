@@ -2851,7 +2851,20 @@ def _answer_query(
         is_refcursor = (
             cursors.query_sql(reused_id) is None and cursors.dml_sql(reused_id) is None
         )
-        count = request.fetch if request.fetch > 0 else _ALL_ROWS
+        # This is an EXECUTE, so its fetch field is a PREFETCH and a zero there
+        # means "send me no rows now" -- the same rule `_prefetch_batch` applies
+        # to the opening execute (#856). Reading the zero as "all of them" made
+        # the define round-trip deliver the whole result inline, so a client that
+        # set prefetchrows = 0 decoded its values during execute() instead of on
+        # the fetch it was waiting to issue (#1113). The rows stay parked and the
+        # reply says `more`, so the client's TTI_FETCH collects them.
+        # A REF CURSOR re-execute is a fresh open rather than a continuation, and
+        # no capture says what a real server prefetches for one, so it keeps the
+        # older reading until one does.
+        if is_refcursor:
+            count = request.fetch if request.fetch > 0 else _ALL_ROWS
+        else:
+            count = _ALL_ROWS if request.fetch < 0 else request.fetch
         columns_out, batch = cursors.take(reused_id, count)
         # Honour what the define actually asked for. A client fetching a LOB as
         # string / bytes defines the column as LONG (RAW), and a real server then
