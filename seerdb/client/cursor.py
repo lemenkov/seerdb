@@ -1427,6 +1427,20 @@ def _column_description(Col: dict) -> 'FetchInfo':
         type_oid=Col.get('type_oid') or None,
         is_json=bool(Col.get('is_json')),
         is_oson=bool(Col.get('is_oson')),
+        domain_schema=_text(Col.get('domain_schema')),
+        domain_name=_text(Col.get('domain_name')),
+        annotations=_col_annotations(Col),
+    )
+
+
+def _text(Value: object) -> str | None:
+    # A describe string as python-oracledb reports it: str, or None when absent.
+    if not Value:
+        return None
+    return (
+        Value.decode('utf-8', errors='replace')
+        if isinstance(Value, bytes)
+        else str(Value)
     )
 
 
@@ -1443,6 +1457,9 @@ class FetchInfo(tuple):
     * ``vector_format`` — its element format code (2 FLOAT32, 3 FLOAT64, 4 INT8,
       5 BINARY; 0 flexible), matching the value image's element type, else
       ``None``.
+    * ``domain_schema`` / ``domain_name`` / ``annotations`` — a 23ai column's
+      SQL domain (``str``) and annotation map (``dict``, ``''`` for a name-only
+      annotation); ``None`` for a column without them (#1083).
     * ``type_schema`` / ``type_name`` / ``type_oid`` — an object (ADT / REF)
       column's referenced type identity, carried in the per-column describe
       (§21.1); ``None`` for a non-object column. The Mirror re-emits these so an
@@ -1464,6 +1481,9 @@ class FetchInfo(tuple):
         type_oid=None,
         is_json=False,
         is_oson=False,
+        domain_schema=None,
+        domain_name=None,
+        annotations=None,
     ):
         self = super().__new__(cls, fields)
         self.vector_flags = vector_flags
@@ -1488,4 +1508,9 @@ class FetchInfo(tuple):
         # the column for an external client (#826).
         self.is_json = is_json
         self.is_oson = is_oson
+        # A 23ai column's SQL domain and annotations, as python-oracledb's
+        # FetchInfo carries them: None for a column without (#1083).
+        self.domain_schema = domain_schema
+        self.domain_name = domain_name
+        self.annotations = annotations
         return self

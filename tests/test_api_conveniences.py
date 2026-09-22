@@ -428,3 +428,32 @@ class TestTouchedRowid(unittest.TestCase):
             _touched_rowid('AAAtNiAAAAADSDjAAB', None), 'AAAtNiAAAAADSDjAAB'
         )
         self.assertIsNone(_touched_rowid(None, 3))
+
+
+class TestFetchInfoDomain(unittest.TestCase):
+    # A 23ai column's domain and annotations on cursor.description (#1083).
+    def test_a_described_domain_column(self):
+        from seerdb.client.cursor import _column_description
+
+        col = {
+            'column_name': b'AGE',
+            'data_type': 2,
+            'precision': 3,
+            'null_ok': 1,
+            'domain_schema': b'PYO',
+            'domain_name': b'PYO_SIMPLE_DOMAIN',
+            'annotations': {b'ANNO_1': b'first annotation', b'ANNO_3': b''},
+        }
+        info = _column_description(col)
+        self.assertEqual(
+            (info.domain_schema, info.domain_name), ('PYO', 'PYO_SIMPLE_DOMAIN')
+        )
+        self.assertEqual(info.annotations, {'ANNO_1': 'first annotation', 'ANNO_3': ''})
+
+    def test_a_plain_column_has_none(self):
+        from seerdb.client.cursor import _column_description
+
+        info = _column_description({'column_name': b'ID', 'data_type': 2})
+        self.assertEqual(
+            (info.domain_schema, info.domain_name, info.annotations), (None,) * 3
+        )
