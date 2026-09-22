@@ -5072,3 +5072,58 @@ def test_parking_a_nested_cursor_recurses() -> None:
     # A result with no cursor column is returned untouched, allocating nothing.
     plain = [(1,), (2,)]
     assert _park_nested_cursors(plain, leaf_cols, cursors) is plain
+
+
+def test_a_define_reexecute_honours_a_zero_prefetch() -> None:
+    # The define round-trip of a LOB-class result is an EXECUTE, so its fetch
+    # field is a PREFETCH: a zero means "send me no rows now", exactly as it does
+    # on the opening execute (#856). Reading the zero as "all of them" delivered
+    # the whole result inline, and a client that had set prefetchrows = 0 then
+    # decoded its values inside execute() instead of on the fetch it was waiting
+    # to issue -- python-oracledb's test_3509 catches it, because the DPY-3007 it
+    # expects from fetchone() came out of execute() instead (#1113).
+    from typing import Any
+
+    from seerdb.common.tns import TTI_RXD, ExecRequest
+    from seerdb.server.session import _answer_query, _Cursors
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.packets: list[bytes] = []
+
+        def write_packet(self, kind: int, body: bytes) -> None:
+            self.packets.append(body)
+
+    column = ColumnMeta(
+        name=b'JSONCOL', data_type=TNS_TYPE_JSON, data_length=0, max_size=0
+    )
+    rows = [(b'{"a": 1}',), (b'{"a": 2}',)]
+
+    def _reexecute(fetch: int) -> tuple[Any, _Cursors, int]:
+        cursors = _Cursors()
+        cursor_id = cursors.open([column], list(rows), sql='select j from t')
+        stream: Any = _Recorder()
+        backend: Any = None  # the parked-rows branch never reaches the backend
+        _answer_query(
+            stream,
+            backend,
+            ExecRequest(sql='', cursor=cursor_id, bind_count=0, fetch=fetch),
+            cursors,
+            None,
+        )
+        return stream, cursors, cursor_id
+
+    # Prefetch 0: no row data goes out, and the rows stay parked for the fetch.
+    stream, cursors, cursor_id = _reexecute(0)
+    assert cursors.delivered(cursor_id) == 0
+    assert bytes([TTI_RXD]) not in stream.packets[0]
+    assert cursors.has(cursor_id)
+    # A positive prefetch still takes that many...
+    stream, cursors, cursor_id = _reexecute(1)
+    assert cursors.delivered(cursor_id) == 1
+    assert bytes([TTI_RXD]) in stream.packets[0]
+    assert cursors.has(cursor_id)
+    # ... and one large enough drains the cursor, as before.
+    stream, cursors, cursor_id = _reexecute(10)
+    assert cursors.delivered(cursor_id) == len(rows)
+    assert not cursors.has(cursor_id)
