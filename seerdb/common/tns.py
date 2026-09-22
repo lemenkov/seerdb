@@ -440,6 +440,12 @@ class ExecRequest:
     # The DESCRIBE option, set alongside PARSE for a query -- the reply owes the
     # column metadata; a DML / PL/SQL parse owes only a success status.
     describe_only: bool = False
+    # True when this request was synthesised from a plain re-execute (func 4)
+    # rather than parsed from an OALL8. The two ask for the same work but are
+    # answered differently where a PL/SQL block is concerned: an OALL8 is a full
+    # execute message and its reply restates the bind IOV, a func-4 re-execute
+    # cannot and its reply carries the row data alone (#1064).
+    from_reexecute: bool = False
     # Per-column (tns_type, csfrm) from the define OACs, in column order — what
     # the client's own fetch variables are, sent on the re-execute that applies a
     # define (the DEFINE execute option). Empty on every other execute; a define
@@ -2215,7 +2221,10 @@ def _skip_exec_middle_12c(rest: bytes, field_version: int) -> bytes:
 
 
 def parse_exec(
-    payload: bytes, bind_types: list | None = None, max_string_size: int = 4000
+    payload: bytes,
+    bind_types: list | None = None,
+    max_string_size: int = 4000,
+    cached_plsql: bool = False,
 ) -> ExecRequest:
     """Parse an OALL8 execute payload (the TTC message from ``read_packet``).
 
@@ -2337,8 +2346,11 @@ def parse_exec(
         # handed an execute with no bind values at all (ORA-01008, #859). Decide
         # from the wire instead: the descriptors are absent exactly when the bind
         # area already sits on a TTI_RXD row.
-        # A cached re-execute carries no OACs and is DML only (#703), where no
-        # bind is an array; a block is never cached.
+        # A cached re-execute carries no OACs, and no bind of one is an array
+        # (#703). A PL/SQL block is cached too now (#1064), which is why the
+        # directions matter below -- but only here, where the types come from
+        # the record: a client that re-describes its binds sends OACs and a
+        # value for every one of them, including the OUT positions.
         capacities: list[int] = []
         omits_oacs = not after or after[0] == TTI_RXD
         if bind_types is not None and omits_oacs:
@@ -2391,12 +2403,19 @@ def parse_exec(
         # every bind after it: the value landed in the following bind's slot and
         # that bind read the image's bytes as a NUMBER (#826). It went unnoticed
         # because a JSON bind is usually the last one, where the move is a no-op.
+        # ...and whether this is a block cannot always be read off `sql`: a
+        # cached re-execute carries none. Since a block got a cursor id of its
+        # own (#1064) that case is real, and reading the empty statement as
+        # "not PL/SQL" sorted a wide bind -- an object bind declares 16000 --
+        # to the end of the row, so every value after it was read at the wrong
+        # offset. The caller says what the cursor stands for.
+        block = cached_plsql if not sql else is_plsql(sql)
         long_binds = frozenset(
             index
             for index, (data_type, _csfrm, maxlen, _toid) in enumerate(types)
             if maxlen > max_string_size
             and data_type not in _PREFETCHED_IMAGE_TYPES
-            and not is_plsql(sql)
+            and not block
         )
         carried = [index for index in range(len(types)) if index not in return_binds]
         order = [index for index in carried if index not in long_binds] + [
@@ -3074,11 +3093,14 @@ def encode_refcursor_column_value(columns: list[ColumnMeta], cursor_id: int) -> 
 def encode_out_bind_response_thin(
     out_binds: list[ScalarOutBind | ArrayOutBind | RefCursorOutBind],
     directions: Sequence[int] = (),
+    cursor_id: int = 0,
 ) -> bytes:
     """The thin reply returning a PL/SQL block's OUT bind values (#483): a
     TTI_IOV vector + a TTI_RXD row of the values + a success OER.
 
-    ``out_binds`` is one entry per bind, in bind order. ``directions`` is what the
+    ``out_binds`` is one entry per bind, in bind order. ``cursor_id`` is the
+    block's own server cursor, which a client needs before it will stop treating
+    the statement as single-execute (#1064). ``directions`` is what the
     server reported for each (16 OUT, 32 IN, 48 IN OUT), which a backend can only
     know by asking one -- the wire carries no direction on the way in. Given
     them, an IN bind is reported IN and carries NO value, as a real server does;
@@ -3089,13 +3111,24 @@ def encode_out_bind_response_thin(
     ``_read_iov`` decodes: a flag, the bind count (num_requests + num_iters*256),
     the zeroed iter / buffer / bit-vector / rowid fields, then a direction byte
     per bind."""
-    count = len(out_binds)
+    return (
+        _encode_iov_header(len(out_binds), directions, 1)
+        + _encode_out_bind_row_thin(out_binds, directions)
+        + encode_status(0, cursor_id=cursor_id)
+    )
+
+
+def _encode_iov_header(count: int, directions: Sequence[int], iterations: int) -> bytes:
+    # The TTI_IOV vector heading a block's reply, as ``_read_iov`` decodes it: a
+    # flag, the bind count (num_requests + num_iters*256), how many iterations
+    # this reply carries, the zeroed uac / bit-vector / rowid lengths, then one
+    # direction byte per bind.
     num_requests, num_iters = count % 256, count // 256
-    iov = (
+    return (
         bytes([TTI_IOV, 0])  # token + flag
         + encode_sb4(num_requests)
         + encode_sb4(num_iters)
-        + encode_sb4(1)  # num iters this time
+        + encode_sb4(iterations)
         + encode_sb4(0)  # uac buffer length
         + encode_sb4(0)  # fast-fetch bit vector length
         + encode_sb4(0)  # rowid length
@@ -3104,6 +3137,15 @@ def encode_out_bind_response_thin(
             for i in range(count)
         )  # direction per bind
     )
+
+
+def _encode_out_bind_row_thin(
+    out_binds: Sequence[ScalarOutBind | ArrayOutBind | RefCursorOutBind],
+    directions: Sequence[int] = (),
+) -> bytes:
+    # One iteration's OUT values: a TTI_RXD token then a value + return code for
+    # each bind that returns one. Shared by the opening execute's reply and the
+    # re-execute's, which sends one of these per iteration and nothing else.
     rxd = bytearray([TTI_RXD])
     for i, bind in enumerate(out_binds):
         if i < len(directions) and directions[i] == TNS_BIND_DIR_INPUT:
@@ -3123,7 +3165,42 @@ def encode_out_bind_response_thin(
             rxd += _encode_out_bind_value(
                 bind.value, bind.tns_type, bind.csfrm
             ) + encode_sb4(0)
-    return iov + bytes(rxd) + encode_status(0)
+    return bytes(rxd)
+
+
+def encode_out_bind_reexecute_thin(
+    iterations: Sequence[Sequence[ScalarOutBind | ArrayOutBind | RefCursorOutBind]],
+    directions: Sequence[int] = (),
+    cursor_id: int = 0,
+    with_iov: bool = False,
+) -> bytes:
+    """The reply to a PL/SQL block re-executed by cursor id (#1064).
+
+    One ``TTI_RXD`` per iteration, each carrying that iteration's OUT values,
+    then the success OER.
+
+    Whether an IOV heads it depends on which message asked, and both forms were
+    captured off a live 23ai (§6.5c). A plain re-execute (func 4) gets **no
+    IOV** -- the directions were settled by the execute that opened the cursor
+    and this message cannot restate them. An ``executemany`` whose remaining four
+    rows went that way is answered::
+
+        07 02 c1 07 00 | 07 02 c1 16 00 | 07 02 c1 12 00 | 07 02 c1 2c 00 | 04 ...
+        RXD  6     rc    RXD  21    rc    RXD  17    rc    RXD  43    rc    OER
+
+    An OALL8 carrying a cursor id and no SQL is a full execute message, and its
+    reply **does** carry the IOV, exactly as the opening execute's does.
+    """
+    head = b''
+    if with_iov:
+        head = _encode_iov_header(
+            len(iterations[0]) if iterations else 0, directions, len(iterations)
+        )
+    return (
+        head
+        + b''.join(_encode_out_bind_row_thin(row, directions) for row in iterations)
+        + encode_status(0, cursor_id=cursor_id)
+    )
 
 
 def _prefetched_image_value(value: object, tns_type: int) -> bytes:
@@ -3452,7 +3529,11 @@ def parse_fetch(payload: bytes) -> FetchRequest:
 
 
 def parse_reexecute(
-    payload: bytes, bind_types: list | None = None, max_string_size: int = 4000
+    payload: bytes,
+    bind_types: list | None = None,
+    max_string_size: int = 4000,
+    bind_directions: Sequence[int] = (),
+    cached_plsql: bool = False,
 ) -> ReexecuteRequest:
     """Parse a re-execute message: ``[TTI_FUN, func, seq]`` + ub4 cursor id +
     ub4 iterations + ub4 options + ub4 options, then -- when the statement has
@@ -3479,6 +3560,19 @@ def parse_reexecute(
     declared wider than ``max_string_size`` is LONG-class and rides after the
     row's other values, as on the opening execute.
 
+    ``bind_directions`` is what the server reported for the statement's binds
+    the first time it ran (16 OUT, 32 IN, 48 IN OUT). It matters only for a
+    PL/SQL block, whose pure-OUT binds send **no value** on a re-execute -- the
+    client has nothing to send for them. Reading one anyway consumes the next
+    bind's bytes and the row falls apart a position at a time. Ordinary DML has
+    no OUT binds, so it passes nothing here and every bind carries a value.
+
+    ``cached_plsql`` says the cursor stands for a block, which the message
+    itself cannot say (it carries no statement). A block's LONG-class binds ride
+    **in place** rather than last, and a block's binds are routinely wide -- a
+    VARCHAR OUT bind declares 16000 -- so reading the row in the DML order put
+    the first value second.
+
     ``iterations`` is the client's prefetch size for the fetch-carrying form, so
     it doubles as the batch size for the reply; for the plain form it is the
     number of executions, one bind row each.
@@ -3493,14 +3587,28 @@ def parse_reexecute(
     bind_rows: list = []
     if bind_types:
         types = list(bind_types)
-        # A cached cursor is DML only (#703): no array binds, no clause-filled
-        # positions to skip -- every bind carries a value, LONG-class ones last.
-        long_binds = [
+        # A cached cursor carries no array binds and no clause-filled positions,
+        # so every bind sends a value with the LONG-class ones last -- except a
+        # PL/SQL block, whose pure-OUT binds send nothing at all and whose wide
+        # binds ride in place (#1064). A position left out of `order` keeps None
+        # in the row.
+        long_binds = (
+            []
+            if cached_plsql
+            else [
+                i
+                for i, (_t, _c, maxlen, _o) in enumerate(types)
+                if maxlen > max_string_size
+            ]
+        )
+        sends_value = [
             i
-            for i, (_t, _c, maxlen, _o) in enumerate(types)
-            if maxlen > max_string_size
+            for i in range(len(types))
+            if i >= len(bind_directions) or bind_directions[i] != TNS_BIND_DIR_OUTPUT
         ]
-        order = [i for i in range(len(types)) if i not in long_binds] + long_binds
+        order = [i for i in sends_value if i not in long_binds] + [
+            i for i in long_binds if i in sends_value
+        ]
         bind_rows, _rest = _read_bind_rows(rest, types, [0] * len(types), order)
     return ReexecuteRequest(
         cursor=cursor,

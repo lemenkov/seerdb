@@ -96,6 +96,7 @@ from seerdb.common.tns import (
     encode_logoff_status_oci,
     encode_logoff_status_thin,
     encode_long_fetch_row_oci,
+    encode_out_bind_reexecute_thin,
     encode_out_bind_response_oci,
     encode_out_bind_response_thin,
     encode_query_response,
@@ -992,24 +993,36 @@ def serve_session(
             # parse_exec the bind types the Mirror remembered for that cursor so
             # its RXD decodes (#80/#486).
             peek_cursor, peek_has_query = peek_exec_cursor(body)
-            cached_types = (
-                cursors.dml_bind_types(peek_cursor)
-                if peek_cursor and not peek_has_query
-                else None
+            cached = bool(peek_cursor) and not peek_has_query
+            cached_types = cursors.dml_bind_types(peek_cursor) if cached else None
+            # A cached re-execute carries no statement, and whether the cursor
+            # stands for a PL/SQL block decides where its wide binds sit in the
+            # row -- in place for a block, last for anything else. Only the
+            # Mirror knows, from what it parked for that id (#1064).
+            cached_plsql = cached and _is_plsql_block(
+                cursors.dml_sql(peek_cursor) or ''
             )
             max_size = max_string_size(_SERVER_RUNTIME_CAPS)
             completed = _complete_message(
                 stream,
                 body,
                 lambda b: parse_exec(
-                    b, bind_types=cached_types, max_string_size=max_size
+                    b,
+                    bind_types=cached_types,
+                    max_string_size=max_size,
+                    cached_plsql=cached_plsql,
                 ),
             )
             if completed is None:  # answered already: it never completes
                 continue
             body = completed
             request = _resolve_temp_lob_binds(
-                parse_exec(body, bind_types=cached_types, max_string_size=max_size),
+                parse_exec(
+                    body,
+                    bind_types=cached_types,
+                    max_string_size=max_size,
+                    cached_plsql=cached_plsql,
+                ),
                 temp_lobs,
             )
             _attach_object_bind_lobs(request, lob_emit_log, temp_lobs)
@@ -1038,13 +1051,20 @@ def serve_session(
             # types -- so look those up from the header first, then read the
             # whole message with them, rows included, which can span packets
             # like any other bind data (#873, the same shape as #854's func 4).
-            cached_types = cursors.bind_types(parse_reexecute(body).cursor)
+            peeked = parse_reexecute(body).cursor
+            cached_types = cursors.bind_types(peeked)
+            cached_dirs = cursors.bind_directions(peeked)
+            cached_plsql = _is_plsql_block(cursors.dml_sql(peeked) or '')
             max_size = max_string_size(_SERVER_RUNTIME_CAPS)
             completed = _complete_message(
                 stream,
                 body,
                 lambda b: parse_reexecute(
-                    b, bind_types=cached_types, max_string_size=max_size
+                    b,
+                    bind_types=cached_types,
+                    max_string_size=max_size,
+                    bind_directions=cached_dirs,
+                    cached_plsql=cached_plsql,
                 ),
             )
             if completed is None:
@@ -1053,7 +1073,11 @@ def serve_session(
                 stream,
                 backend,
                 parse_reexecute(
-                    completed, bind_types=cached_types, max_string_size=max_size
+                    completed,
+                    bind_types=cached_types,
+                    max_string_size=max_size,
+                    bind_directions=cached_dirs,
+                    cached_plsql=cached_plsql,
                 ),
                 cursors,
             )
@@ -1067,20 +1091,31 @@ def serve_session(
             if completed is None:
                 continue
             body = completed
-            cached_types = cursors.bind_types(parse_reexecute(body).cursor)
+            peeked = parse_reexecute(body).cursor
+            cached_types = cursors.bind_types(peeked)
+            cached_dirs = cursors.bind_directions(peeked)
+            cached_plsql = _is_plsql_block(cursors.dml_sql(peeked) or '')
             max_size = max_string_size(_SERVER_RUNTIME_CAPS)
             completed = _complete_message(
                 stream,
                 body,
                 lambda b: parse_reexecute(
-                    b, bind_types=cached_types, max_string_size=max_size
+                    b,
+                    bind_types=cached_types,
+                    max_string_size=max_size,
+                    bind_directions=cached_dirs,
+                    cached_plsql=cached_plsql,
                 ),
             )
             if completed is None:
                 continue
             body = completed
             reexecute = parse_reexecute(
-                body, bind_types=cached_types, max_string_size=max_size
+                body,
+                bind_types=cached_types,
+                max_string_size=max_size,
+                bind_directions=cached_dirs,
+                cached_plsql=cached_plsql,
             )
             lobs = _answer_reexecute_binds(
                 stream, backend, reexecute, cursors, temp_lobs
@@ -1856,6 +1891,11 @@ class _Cursors:
         # it, so a client that re-executes a query by id gets that query (#840)
         # and its fresh bind values decode (#854). Shares the `_next` id space.
         self._query: dict[int, tuple[str, list]] = {}
+        # The bind directions reported for a PL/SQL block, by cursor id (#1064).
+        # A re-execute of a block sends values only for the binds that take one,
+        # so decoding its rows needs to know which positions those are -- the
+        # bind format alone does not say. Empty for DML, whose binds are all IN.
+        self._bind_directions: dict[int, tuple[int, ...]] = {}
         # The column describe last sent for a cursor id. On a re-execute the
         # client reuses the describe from the first execute and does not expect
         # another -- unless the statement's shape changed underneath it (a view
@@ -1946,6 +1986,18 @@ class _Cursors:
         # to, or None if the id isn't a known DML cursor.
         state = self._dml.get(cursor_id)
         return state[0] if state is not None else None
+
+    def set_bind_directions(self, cursor_id: int, directions: Sequence[int]) -> None:
+        """Record what the server reported for a block's binds (#1064).
+
+        A backend that cannot know them reports none, and the cursor keeps no
+        record -- a re-execute then reads a value for every bind, which is what
+        a block with no OUT binds sends anyway."""
+        if directions:
+            self._bind_directions[cursor_id] = tuple(directions)
+
+    def bind_directions(self, cursor_id: int) -> tuple[int, ...]:
+        return self._bind_directions.get(cursor_id, ())
 
     def dml_bind_types(self, cursor_id: int) -> list | None:
         # The remembered bind format for a cached DML cursor, so its re-execute's
@@ -2915,6 +2967,18 @@ def _answer_query(
             # a plain success status; a DML / PL/SQL parse owes the status alone.
             stream.write_packet(TNS_DATA, _answer_parse(backend, sql, request))
             return lobs
+        if reused_id and _is_plsql_block(sql):
+            # A PL/SQL block re-executed by its cursor id (#1064). Once the block
+            # has an id the client stops sending it one iteration at a time and
+            # re-executes the remaining rows as one array call, with values for
+            # the binds that take one and nothing for the rest. Captured off a
+            # live 23ai, the reply is one TTI_RXD per iteration carrying that
+            # iteration's OUT values -- and NO IOV: the directions were settled
+            # by the opening execute and are not restated (§6.5c).
+            lobs += _answer_block_reexecute(
+                stream, backend, sql, request, cursors, reused_id
+            )
+            return lobs
         if request.return_binds:
             # DML ... RETURNING col INTO :b (#689). The reply owes one set of
             # returned values per iteration, so this cannot go through the
@@ -3049,6 +3113,18 @@ def _answer_query(
         # (the client keeps only its Var positions); this precedes the column /
         # status branches — a block carries neither rows nor a rowcount (#483).
         if result.out_binds:
+            # The block gets a server cursor of its own, like any other reusable
+            # statement. A client keeps a PL/SQL block in SINGLE-EXECUTE mode for
+            # as long as its cursor id is 0 -- `requires_single_execute()` reads
+            # exactly that -- because the IN/OUT split is only settled once the
+            # block has run. Answering 0 forever made an executemany of a block
+            # re-send every row as its own execute, which is merely slow until
+            # the client pipelines, and then walks off the end of its own bind
+            # array (#1064).
+            block_id = reused_id or cursors.open_dml(sql, request.bind_types)
+            # Remember the directions with the cursor: the re-execute that id
+            # invites carries values only for the binds that send one (#1064).
+            cursors.set_bind_directions(block_id, result.bind_directions)
             response = encode_out_bind_response_thin(
                 _out_bind_entries(
                     result.out_binds,
@@ -3058,6 +3134,7 @@ def _answer_query(
                     request.bind_types,
                 ),
                 result.bind_directions,
+                cursor_id=block_id,
             )
         # A query carries result columns (even with zero rows); a DDL/DML
         # statement carries none and gets a bare success status instead of a
@@ -3133,10 +3210,11 @@ def _answer_query(
         else:
             # DML / DDL success. Hand back a server cursor id (reused on a cached
             # re-execute, freshly minted otherwise) so the client's cursor cache
-            # can re-run this DML by id — but not for a PL/SQL block, which the
-            # client never caches (#80/#486).
+            # can re-run this DML by id (#80/#486). A PL/SQL block needs one for a
+            # second reason: until it has an id, a client keeps re-sending the
+            # block one iteration at a time (#1064).
             cursor_id = reused_id
-            if not cursor_id and not _is_plsql_block(sql):
+            if not cursor_id:
                 cursor_id = cursors.open_dml(sql, request.bind_types)
             # A CREATE whose PL/SQL object compiled with errors SUCCEEDS and
             # says so only through the OER's warn bit (§6.3a, #995).
@@ -3206,6 +3284,83 @@ def _order_batch_errors(
     # a time, so it collects every error in row order and has to re-group; the
     # sort is stable, which is what keeps each group ascending.
     return sorted(errors, key=lambda e: e[1] in _INDEX_PHASE_ERRORS)
+
+
+def _answer_block_reexecute(
+    stream: PacketStream,
+    backend: Backend,
+    sql: str,
+    request: ExecRequest,
+    cursors: _Cursors,
+    cursor_id: int,
+) -> list[tuple[bytes, bool]]:
+    """Run a PL/SQL block re-executed by cursor id and reply (#1064).
+
+    The client re-executes a block by id once the Mirror has given it one, and
+    an ``executemany`` then sends the remaining rows as a single array call.
+    Each iteration has to run on its own -- a block's OUT binds are per
+    iteration, and a backend's array path reports a row count, not values -- so
+    this loops, keeps each iteration's OUT binds, and answers with one TTI_RXD
+    apiece.
+
+    The directions recorded when the block first ran say which positions the
+    rows carry a value for; the rest are None in every row and must not be
+    handed to the backend as a bound NULL.
+    """
+    directions = cursors.bind_directions(cursor_id)
+    # A block whose binds are ALL pure-OUT sends no row at all -- there is
+    # nothing to put in one -- and a block with no binds sends none either; the
+    # iteration count is all the message carries then (#33). Stand in a row of
+    # the right width so every bind still reaches the backend as an OUT-capable
+    # position, or the block runs with its placeholders unbound (ORA-01008).
+    rows = request.bind_rows or [
+        [None] * len(request.bind_meta) for _ in range(max(request.iterations, 1))
+    ]
+    iterations = []
+    rowcount = 0
+    lobs: list[tuple[bytes, bool]] = []
+    for done, row in enumerate(rows):
+        one = replace(request, sql=sql, binds=list(row), bind_rows=[list(row)])
+        try:
+            result = backend.execute(
+                sql, _resolve_refcursor_in_binds(backend, cursors, _bind_vars(one))
+            )
+        except BackendError as err:
+            # Which iteration failed is carried by the OER's rowcount field, and
+            # it is the only way the client can say so: it reports the offset as
+            # this count plus however many iterations it ran before sending this
+            # message. Leaving it at zero blamed the first row for every failure
+            # (#1064).
+            err.rowcount = done
+            raise
+        rowcount += result.rowcount
+        iterations.append(
+            _out_bind_entries(
+                result.out_binds,
+                request.bind_meta,
+                cursors,
+                request.bind_arrays,
+                request.bind_types,
+            )
+            if result.out_binds
+            else []
+        )
+    if request.autocommit:
+        backend.commit()
+    _mark_transaction(sql, request.autocommit)
+    if any(iterations):
+        response = encode_out_bind_reexecute_thin(
+            iterations,
+            directions,
+            cursor_id=cursor_id,
+            with_iov=not request.from_reexecute,
+        )
+    else:
+        # A block that assigns nothing owes only a status, as its first execute
+        # does -- there is no IOV and no row data to carry.
+        response = encode_status(rowcount, cursor_id=cursor_id)
+    stream.write_packet(TNS_DATA, response)
+    return lobs
 
 
 def _answer_parse(backend: Backend, sql: str, request: ExecRequest) -> bytes:
@@ -3442,6 +3597,7 @@ def _answer_reexecute_binds(
             bind_types=list(types),
             autocommit=request.autocommit,
             iterations=max(request.fetch, 1),
+            from_reexecute=True,
         )
         return _answer_query(
             stream, backend, _resolve_temp_lob_binds(execute, temp_lobs), cursors
