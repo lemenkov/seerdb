@@ -299,11 +299,13 @@ class AsyncCursor(_CursorLogic):
             Variable._value = await self._build_refcursor(Rows, Marker)
         # A LOB-class OUT bind's value (#978): the async half of the sync
         # _resolve_out_bind_lobs -- same rule, awaited read.
-        from seerdb.common.lob import _DECODED_IMAGE_TYPES
+        from seerdb.common.lob import _DECODED_IMAGE_TYPES, _EXTERNAL_LOB_TYPES
 
         KeepLobs = getattr(self._connection, 'fetch_lobs', False)
         for Variable in _out_bind_lobs(Bind):
             Variable._value._connection = self._connection
+            if Variable._value.data_type in _EXTERNAL_LOB_TYPES:
+                continue
             if KeepLobs and Variable._value.data_type not in _DECODED_IMAGE_TYPES:
                 continue
             Variable._value = await Variable._value.aread()
@@ -364,7 +366,11 @@ class AsyncCursor(_CursorLogic):
             decode_object_image,
             decode_xmltype,
         )
-        from seerdb.common.lob import _DECODED_IMAGE_TYPES, LOB
+        from seerdb.common.lob import (
+            _DECODED_IMAGE_TYPES,
+            _EXTERNAL_LOB_TYPES,
+            LOB,
+        )
         from seerdb.common.tns_consts import TNS_TYPE_CLOB
 
         ResolvedRows = []
@@ -385,7 +391,10 @@ class AsyncCursor(_CursorLogic):
                 elif isinstance(Val, LOB):
                     Val._connection = self._connection
                     # Keep the LOB object unless the connection asks for values
-                    # (#964); a JSON / VECTOR image is never a LOB to the caller.
+                    # (#964); a JSON / VECTOR image is never a LOB to the caller,
+                    # and a BFILE is never materialised at all (#1101).
+                    if Val.data_type in _EXTERNAL_LOB_TYPES:
+                        continue
                     if (
                         getattr(self._connection, 'fetch_lobs', False)
                         and Val.data_type not in _DECODED_IMAGE_TYPES
