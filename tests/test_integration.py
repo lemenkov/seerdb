@@ -1754,6 +1754,37 @@ class BindIntegration(_IntegrationBase):
             except DatabaseError:
                 pass
 
+    def test_a_bc_date_is_out_of_range_not_malformed(self):
+        # Oracle's DATE runs from 4712 BC; Python's datetime starts at year 1. The
+        # value is correct -- it was reported as "malformed" (#1060). It is now
+        # both a DataError and a ValueError, as python-oracledb raises.
+        from seerdb.common.exceptions import DataError, DateOutOfRangeError
+
+        if _target_is_8i():
+            # On 8i the fetch HANGS to the read timeout instead of raising --
+            # pre-existing (master hangs identically), the server answers the
+            # same date as text at once. Skipped here, not hidden (#1061).
+            self.skipTest('8i hangs on a BC date instead of raising (#1061)')
+        # The precondition is a server that really HOLDS a BC date. Not every
+        # backend does: Mirror-over-PostgreSQL drops the sign and returns 4712
+        # AD, so there is nothing out of range to report. Ask the server itself,
+        # as text, and skip with its answer when it disagrees.
+        self.cur.execute(
+            "SELECT TO_CHAR(TO_DATE('-4712-01-01', 'SYYYY-MM-DD'), 'SYYYY-MM-DD') "
+            'FROM dual'
+        )
+        (AsText,) = self.cur.fetchone()
+        if AsText.strip() != '-4712-01-01':
+            self.skipTest(f'this server does not hold a BC date: it says {AsText!r}')
+        # Both calls sit inside the block: the row is prefetched, so the decode
+        # -- and the raise -- happens in execute(), before fetchone() is reached.
+        with self.assertRaises(DateOutOfRangeError) as caught:
+            self.cur.execute("SELECT TO_DATE('-4712-01-01', 'SYYYY-MM-DD') FROM dual")
+            self.cur.fetchone()
+        self.assertIsInstance(caught.exception, DataError)
+        self.assertIsInstance(caught.exception, ValueError)
+        self.assertNotIn('malformed', str(caught.exception))
+
     def test_db_charset_varchar_roundtrip(self):
         # VARCHAR2 non-ASCII that the database charset can represent round-trips
         # (#174). On 9i (WE8ISO8859P1) the server converts the AL32UTF8 session
