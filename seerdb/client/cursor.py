@@ -4,7 +4,7 @@
 import re
 from typing import Any
 
-from seerdb.client._cursor_logic import _CursorLogic
+from seerdb.client._cursor_logic import _CursorLogic, _touched_rowid
 from seerdb.common.datatypes import (
     _DATE_TNS_TYPES,
     _NUMBER_TNS_TYPES,
@@ -416,7 +416,7 @@ class Cursor(_CursorLogic):
             # DDL / DML / non-result-set statement. OER carries the affected
             # row count in its success-iters field; surface it, along with the
             # touched-row rowid (None for DDL / zero-row changes).
-            self._lastrowid = LastRowid
+            self._lastrowid = _touched_rowid(LastRowid, ServerRowCount)
             self._description = None
             self._annotations = None
             self._rows = []

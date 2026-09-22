@@ -2091,6 +2091,26 @@ class LastRowidIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class ZeroRowDmlIntegration(_IntegrationBase):
+    """A DML that touches no rows has no rowid (#1078)."""
+
+    def test_a_dml_touching_no_row_reports_no_rowid(self):
+        # After a SELECT on the same cursor, 23ai's reply to a DELETE that
+        # matched nothing carried the rowid of the row the SELECT fetched, and
+        # the client reported it. python-oracledb reports None (test_4321).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, s VARCHAR2(10))')
+        self.cur.execute(f"INSERT INTO {self.TABLE} VALUES (1, 'a')")
+        self.cur.execute(f"INSERT INTO {self.TABLE} VALUES (2, 'b')")
+        self.cur.execute(f"UPDATE {self.TABLE} SET s = 'z' WHERE n = 2")
+        touched = self.cur.lastrowid
+        self.cur.execute(f'SELECT n FROM {self.TABLE} WHERE ROWID = :1', [touched])
+        self.cur.fetchall()
+        self.cur.execute(f'DELETE FROM {self.TABLE} WHERE 1 = 0')
+        self.assertEqual(self.cur.rowcount, 0)
+        self.assertIsNone(self.cur.lastrowid)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class TempLobBindIntegration(_IntegrationBase):
     """Large CLOB / BLOB into a PL/SQL locator param (#91).
 
@@ -5173,6 +5193,29 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                 # Which row it names, asked of the server (see LastRowidIntegration).
                 await Cur.execute(f'SELECT n FROM {Table} WHERE ROWID = :1', [Rowid])
                 self.assertEqual(await Cur.fetchone(), (7,))
+            finally:
+                await Cur.execute(f'DROP TABLE {Table}')
+        finally:
+            await Conn.close()
+
+    async def test_a_dml_touching_no_row_reports_no_rowid(self):
+        # Async twin of ZeroRowDmlIntegration (#1078).
+        Table = 'PYO_ASYNC_ZERO_ROW'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            try:
+                await Cur.execute(f'DROP TABLE {Table}')
+            except seerdb.DatabaseError:
+                pass
+            await Cur.execute(f'CREATE TABLE {Table} (n NUMBER)')
+            try:
+                await Cur.execute(f'INSERT INTO {Table} VALUES (2)')
+                await Cur.execute(f'SELECT n FROM {Table}')
+                await Cur.fetchall()
+                await Cur.execute(f'DELETE FROM {Table} WHERE 1 = 0')
+                self.assertEqual(Cur.rowcount, 0)
+                self.assertIsNone(Cur.lastrowid)
             finally:
                 await Cur.execute(f'DROP TABLE {Table}')
         finally:

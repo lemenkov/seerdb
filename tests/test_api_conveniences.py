@@ -410,3 +410,21 @@ class TestDdlForgetsCachedCursors(unittest.TestCase):
         self.assertTrue(
             any(k[0].startswith('INSERT INTO n') for k in conn._cursor_cache)
         )
+
+
+class TestTouchedRowid(unittest.TestCase):
+    # A DML that affected no rows touched no row (#1078).
+    def test_a_zero_row_statement_has_no_rowid_whatever_the_token_says(self):
+        from seerdb.client._cursor_logic import _touched_rowid
+
+        self.assertIsNone(_touched_rowid('AAAtNiAAAAADSDjAAB', 0))
+
+    def test_a_statement_that_touched_a_row_keeps_it(self):
+        from seerdb.client._cursor_logic import _touched_rowid
+
+        self.assertEqual(_touched_rowid('AAAtNiAAAAADSDjAAB', 1), 'AAAtNiAAAAADSDjAAB')
+        # No count to go by (a block, an unknown shape): the token decides.
+        self.assertEqual(
+            _touched_rowid('AAAtNiAAAAADSDjAAB', None), 'AAAtNiAAAAADSDjAAB'
+        )
+        self.assertIsNone(_touched_rowid(None, 3))

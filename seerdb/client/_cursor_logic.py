@@ -41,6 +41,20 @@ def _declared_bind(declared: object, value: object) -> Var:
     return variable
 
 
+def _touched_rowid(rowid: str | None, rowcount: object) -> str | None:
+    """The ``lastrowid`` a DML / DDL reply reports (#1078).
+
+    A statement that affected no rows touched no row, so it has no rowid,
+    whatever the status token carries. The token can echo an earlier row: after
+    a SELECT on the same cursor, 23ai's reply to a DELETE that matched nothing
+    carried the rowid of the row the SELECT had fetched. python-oracledb reports
+    None there, and its suite asserts it (test_4321).
+    """
+    if isinstance(rowcount, int) and rowcount == 0:
+        return None
+    return rowid
+
+
 class _CursorLogic:
     """Shared non-I/O logic for `Cursor` / `AsyncCursor` (#553)."""
 
@@ -63,7 +77,7 @@ class _CursorLogic:
         self._row_index: int = 0
         self._rowcount: int = -1
         self._closed: bool = False
-        self._lastrowid = None
+        self._lastrowid: str | None = None
         self._rowfactory = None
         # The warning the last execute reported, or None (#993). A condition the
         # server raises alongside a call that SUCCEEDED -- a PL/SQL object
