@@ -5126,10 +5126,16 @@ codes as the value image's element type, §18) are kept and exposed on the
 parsers (`parse_exec`, `parse_fetch`, `parse_lobops_request`, `peek_exec_cursor`)
 skip the extra token byte after the sequence at fv > 17 via `_skip_fun_header` —
 without it every field mis-aligns and binds are dropped (the backend then sees
-`:1` unbound → ORA-01009). Its describe (`_encode_dcb_column`) appends the
-per-column annotation count (0 — the Mirror emits none) and the vector descriptor
-(dimensions / format / flags, from the column's own vector metadata) at fv > 17,
-which the client consumes or the row stream desyncs. Validated end to end: the
+`:1` unbound → ORA-01009). Its describe (`_encode_dcb_column`) carries the
+column's SQL domain (schema + name, two counted strings, from fv 17) and appends
+its annotation map and the vector descriptor (dimensions / format / flags, from
+the column's own vector metadata) at fv > 17, which the client consumes or the
+row stream desyncs. The map is the count, a pointer byte, the count again, a
+pointer byte, then key / value / ub4 flags per pair and a trailing ub4 flags; an
+empty map is a bare count of 0. Both readers skip the pointer bytes and flags, so
+the Mirror writes `01` and `0`. A backend supplies the domain and annotations on
+`ColumnMeta`, and the passthrough relays its upstream's (#1082); python-oracledb's
+`test_4361` / `test_6347` read them through it. Validated end to end: the
 full integration suite passes through the Mirror in front of a live 23ai server
 at fv24.
 

@@ -374,6 +374,12 @@ class ColumnMeta:
     # being REPLACED carried, not this describe's own (#826). None everywhere
     # else, so an ordinary LOB column keeps its locator.
     inline_long_csfrm: int | None = None
+    # A 23ai column's SQL domain and annotations (#1082): the domain's schema and
+    # name, and the annotation map as (key, value) pairs, a name-only annotation
+    # with an empty value. Empty for a column without them.
+    domain_schema: bytes = b''
+    domain_name: bytes = b''
+    annotations: tuple[tuple[bytes, bytes], ...] = ()
 
 
 # The describe's ub4 uds-flags bits (python-oracledb's TNS_UDS_FLAGS_*).
@@ -1335,19 +1341,19 @@ def _encode_dcb_column(col: ColumnMeta, position: int) -> bytes:
             | (_UDS_FLAGS_IS_OSON if col.is_oson else 0)
         )
         + (
-            _str_with_length(b'') + _str_with_length(b'')  # domain schema + name
+            _str_with_length(col.domain_schema) + _str_with_length(col.domain_name)
             if field_version >= FIELD_VERSION_23_1
             else b''
         )
         + (
             # fv > 17 (23ai fv24): each column also carries its annotation map and
             # a vector descriptor after the domain fields (§20.5); the client
-            # consumes both or the row stream desyncs. The Mirror emits no
-            # annotations (count 0) and a descriptor from the column's own vector
+            # consumes both or the row stream desyncs. The Mirror emits the
+            # column's annotations (#1082) and a descriptor from the column's own vector
             # metadata. The flags byte is RELAYED, not zeroed: a flexible
             # column says it allows any dimensions there, and a zero told
             # the client it allows exactly none (#1013).
-            encode_sb4(0)  # num_annotations
+            _encode_annotations(col.annotations)
             + encode_sb4(col.vector_dimensions or 0)  # vector_dimensions
             + bytes(
                 [
@@ -1375,6 +1381,22 @@ def _encode_describe_body(columns: list[ColumnMeta]) -> bytes:
     body += encode_sb4(0) * 4  # dcbflag / dcbmdbz / dcbmnpr / dcbmxpr
     body += _bytes_with_length(b'')  # dcbqcky query-cache key (11g)
     return body
+
+
+def _encode_annotations(annotations: tuple[tuple[bytes, bytes], ...]) -> bytes:
+    # A column's annotation map, as a 23ai (fv > 17) describe carries it: the
+    # count, a pointer byte, the count again, a pointer byte, then per pair its
+    # key, its value and a ub4 flags word, and a trailing ub4 flags. None is a
+    # bare count of 0. The inverse of the client's reader (#89), which skips the
+    # pointer bytes and flags, as python-oracledb's does (#1082).
+    if not annotations:
+        return encode_sb4(0)
+    out = (
+        encode_sb4(len(annotations)) + b'\x01' + encode_sb4(len(annotations)) + b'\x01'
+    )
+    for key, value in annotations:
+        out += _str_with_length(key) + _str_with_length(value) + encode_sb4(0)
+    return out + encode_sb4(0)
 
 
 def encode_describe(columns: list[ColumnMeta]) -> bytes:

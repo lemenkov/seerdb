@@ -1060,4 +1060,11 @@ def _to_column_meta(desc: tuple) -> ColumnMeta:
         # Re-mark a JSON / OSON column so the external client decodes it (#826).
         is_json=bool(getattr(desc, 'is_json', False)),
         is_oson=bool(getattr(desc, 'is_oson', False)),
+        # A 23ai column's SQL domain and annotations, relayed as described (#1082).
+        domain_schema=(getattr(desc, 'domain_schema', None) or '').encode('utf-8'),
+        domain_name=(getattr(desc, 'domain_name', None) or '').encode('utf-8'),
+        annotations=tuple(
+            (key.encode('utf-8'), (value or '').encode('utf-8'))
+            for key, value in (getattr(desc, 'annotations', None) or {}).items()
+        ),
     )
