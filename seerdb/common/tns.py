@@ -4687,10 +4687,13 @@ def decode_token_rpa_piggyback(Data: bytes, Acc: tuple) -> tuple:
     # call lands on the real status token (OER). Its fields, by name (#859):
     # `ub2 al8o4l count | count x ub4 | ub2 al8txl length (+bytes) | ub2 key/value
     # pairs (+pairs) | ub2 registration length (+bytes)`, then the optional
-    # row-count tail below. This walker predates that knowledge and reads it more
-    # loosely -- Num, then Num fields, then any zero bytes -- which lands in the
-    # same place for every block seen live, where the three trailing words are
-    # zero; it is left as is because it also copes with 9i's over-counting Num.
+    # row-count tail below. From 10.2 up an execute's block is read by those
+    # fields; the loose walk -- Num, then Num fields, then any zero bytes --
+    # stays for 9i, whose Num over-counts, and for a block that has no trailing
+    # fields at all (a changepassword reply is `08 00` and then its OER). The
+    # loose walk only lands right while those trailing words are zero, and
+    # 11g's reply to ALTER SESSION SET CURRENT_SCHEMA carries two key/value
+    # pairs there (#1141).
     Rest = Data[1:]
     try:
         (Num, Rest) = decode_ub4(Rest)
@@ -4709,8 +4712,12 @@ def decode_token_rpa_piggyback(Data: bytes, Acc: tuple) -> tuple:
             (_, Rest) = decode_ub4(Rest)
         except IndexError:
             return (True, Acc)
-    while Rest and Rest[0] == 0:
-        Rest = Rest[1:]
+    Exact = None if BreakOnToken else _skip_rpa_tail_fields(Rest)
+    if Exact is not None:
+        Rest = Exact
+    else:
+        while Rest and Rest[0] == 0:
+            Rest = Rest[1:]
     # Array-DML row counts (#18): when the execute requested arraydmlrowcounts
     # the server appends a `ub4 count | count×ub4` block here, between the RPA
     # body and the trailing OER — the per-iteration affected-row counts. Without
@@ -4736,6 +4743,36 @@ def decode_token_rpa_piggyback(Data: bytes, Acc: tuple) -> tuple:
     if Rest:
         return decode_packet(Rest, Acc)
     return (True, Acc)
+
+
+def _skip_rpa_tail_fields(Rest: bytes) -> bytes | None:
+    # The three fields after the al8o4l words (#1141), or None when they are
+    # not there to read -- the parse runs off the end, or does not land on what
+    # follows a block (a token, the end, or an armed row-count tail). Each is a
+    # ub2 count or length; zero is the usual case and a single 00 byte.
+    try:
+        (TxnLen, Rest) = decode_ub4(Rest)  # al8txl: transaction id, raw bytes
+        Rest = Rest[TxnLen:]
+        (Pairs, Rest) = decode_ub4(Rest)  # session-state key/value pairs
+        for _ in range(Pairs):
+            # A pair is `ub2 text length (+DALC) | ub2 binary length (+DALC) |
+            # ub2 keyword`, as in the server piggyback. 11g reports a
+            # CURRENT_SCHEMA change as two: the name under keyword 168, its id
+            # under 169.
+            (TextLen, Rest) = decode_ub4(Rest)
+            if TextLen > 0:
+                (_, Rest) = decode_dalc(Rest)
+            (BinLen, Rest) = decode_ub4(Rest)
+            if BinLen > 0:
+                (_, Rest) = decode_dalc(Rest)
+            (_, Rest) = decode_ub4(Rest)  # keyword number
+        (RegLen, Rest) = decode_ub4(Rest)  # registration, raw bytes
+    except (IndexError, Truncated):
+        return None
+    Rest = Rest[RegLen:]
+    if not Rest or Rest[0] in _KNOWN_TTI_TOKENS or _DECODE_DML_ROWCOUNTS.get():
+        return Rest
+    return None
 
 
 def decode_token_uds(Data: bytes, Acc: tuple) -> tuple:

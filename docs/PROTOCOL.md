@@ -1160,11 +1160,41 @@ modes layer onto an array-DML execute, each oracledb-compatible:
   (the reference client's `_process_return_parameters`, matched against a
   live 23ai reply, `08 01 06 04 01 69 21 60 00 01 06 01 01 00 00 00 00 00 04 …`:
   six `al8o4l` words, three empty words, then the OER). seerdb's
-  `decode_token_rpa_piggyback` walks it more loosely — a count, that many
-  fields, then any zero bytes — which lands in the same place for every block
-  seen live, and pulls the row-count tail out (armed for the execute via a
-  context flag) into `cursor.getarraydmlrowcounts()`. The two modes combine: a
-  failed iteration reports a row count of `0`.
+  `decode_token_rpa_piggyback` reads it by those fields from 10.2 up, and pulls
+  the row-count tail out (armed for the execute via a context flag) into
+  `cursor.getarraydmlrowcounts()`. The two modes combine: a failed iteration
+  reports a row count of `0`. On 9i the `al8o4l` count over-counts, so there
+  the walk stays loose: a count, that many fields (stopping at a known token),
+  then any zero bytes.
+
+  **The key/value pairs are not always empty (#1141).** 11g answers
+  `ALTER SESSION SET CURRENT_SCHEMA = SYSTEM` with two of them — the
+  session-state change a later release reports in a server piggyback instead
+  (§20.6). A pair is `ub2 text length (+ DALC) | ub2 binary length (+ DALC) |
+  ub2 keyword`. Captured live from 11.2 XE:
+
+  ```
+  08 | 01 06 | 03 c1 40 83 | 00 | 01 02 | 01 02 | 00 | 00   six al8o4l words
+     | 00                                                   al8txl length 0
+     | 01 02                                                2 key/value pairs
+     | 01 06  06 "SYSTEM" | 00 | 01 a8                      name, keyword 168
+     | 00 | 01 04  04 00 00 00 05 | 01 a9                   id 5, keyword 169
+     | 00                                                   registration length 0
+     | 04 …                                                 the OER
+  ```
+
+  Skipping zero bytes past the `al8o4l` words — the walk every release used
+  until then — stopped on the first pair's `01` and read it as a token
+  (`no decoder for response token 1`). 23ai leaves the pair count at zero and
+  never showed it.
+
+  **Not every `TTI_RPA` has the trailing fields.** A `changepassword` reply is
+  `08 00` and then its OER (`04 …`) — no `al8o4l` words and nothing after
+  them. Read by the execute layout, the OER's own `04 01 01 02 98` is taken for
+  the `al8txl` length and the parse runs off the end, after the server has
+  already changed the password. seerdb therefore reads the three fields only
+  when they parse cleanly and land on a token, the end of the data or an armed
+  row-count tail, and otherwise falls back to skipping zero bytes.
 
   **The Mirror's side of it (#859).** Two faults, and the reference client's
   `executemany` needed both fixed. The Mirror detected the request with the
@@ -5950,7 +5980,7 @@ iteration, single-row batch, and multiple return binds).
 ### 20.6 A session-state change is REPORTED BACK (#973)
 
 `ALTER SESSION SET CURRENT_SCHEMA = X` does not merely succeed. The server
-answers with the execute's return-parameters block (`TTI_RPA`, §11.8) carrying
+answers with the execute's return-parameters block (`TTI_RPA`, §5.1) carrying
 the new value, and that reply is the **only** place a client learns it —
 `connection.current_schema` is never queried for. A bare status leaves the
 client's attribute stale for the life of the session.

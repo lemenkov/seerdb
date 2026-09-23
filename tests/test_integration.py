@@ -871,6 +871,22 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute('SELECT sessiontimezone FROM dual')
         self.assertEqual(self.cur.fetchone()[0].strip(), expected)
 
+    def test_alter_session_current_schema_round_trips(self):
+        # 11g answers this with a return-parameters block that carries the
+        # session-state change as key/value pairs; reading past them only by
+        # skipping zero bytes left "no decoder for response token 1" (#1141).
+        self._skip_if_mirror_backend('postgres', 'switch to the SYSTEM schema')
+        self.cur.execute("SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual")
+        (own,) = self.cur.fetchone()
+        self.cur.execute('ALTER SESSION SET CURRENT_SCHEMA = SYSTEM')
+        try:
+            self.cur.execute(
+                "SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual"
+            )
+            self.assertEqual(self.cur.fetchone(), ('SYSTEM',))
+        finally:
+            self.cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = {own}')
+
     def test_bit_vector_reuse_across_fetch_boundary(self):
         # #326: a column the server elides as "same as previous row" (bit-vector
         # duplicate detection) must survive a fetch-continuation boundary. The
@@ -5625,6 +5641,25 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await Cur.fetchall(), [])
             finally:
                 await Cur.execute(f'DROP TABLE {Table}')
+        finally:
+            await Conn.close()
+
+    async def test_alter_session_current_schema_round_trips(self):
+        # Async twin of CursorIntegration's (#1141).
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest(
+                "the Mirror's postgres backend cannot switch to the SYSTEM schema"
+            )
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            Query = "SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual"
+            await Cur.execute(Query)
+            (Own,) = await Cur.fetchone()
+            await Cur.execute('ALTER SESSION SET CURRENT_SCHEMA = SYSTEM')
+            await Cur.execute(Query)
+            self.assertEqual(await Cur.fetchone(), ('SYSTEM',))
+            await Cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = {Own}')
         finally:
             await Conn.close()
 
