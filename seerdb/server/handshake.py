@@ -55,6 +55,11 @@ from seerdb.common.tns_consts import (
     TNS_ACCEPT,
     TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE,
     TNS_DATA,
+    TNS_VERSION_11_2,
+    TNS_VERSION_12_1,
+    TNS_VERSION_12_2,
+    TNS_VERSION_21_1,
+    TNS_VERSION_23_1,
     TNS_VERSION_MIN_LARGE_SDU,
     TNS_VERSION_MIN_OOB_CHECK,
     TTI_DTY,
@@ -98,10 +103,6 @@ _MIN_HEADER = 20  # bytes we must have to read every field above
 #
 # Note 319, not 320: a real 23ai answers exactly the value a client knows as
 # ``TNS_VERSION_MIN_END_OF_RESPONSE``.
-TNS_VERSION_11_2 = 314
-TNS_VERSION_12_2 = 316
-TNS_VERSION_21_1 = 318
-TNS_VERSION_23_1 = 319
 
 _SERVER_TNS_VERSION = TNS_VERSION_11_2
 
@@ -126,6 +127,8 @@ def server_tns_version(field_version: int) -> int:
         return TNS_VERSION_21_1
     if field_version >= FIELD_VERSION_12_2:
         return TNS_VERSION_12_2
+    if field_version >= FIELD_VERSION_12_1:
+        return TNS_VERSION_12_1
     return TNS_VERSION_11_2
 
 
