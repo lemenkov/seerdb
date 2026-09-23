@@ -37,6 +37,7 @@ from seerdb.client._conn_logic import (
     returning_block_result,
 )
 from seerdb.client.connection import (
+    _CURRENT_SCHEMA_SQL,
     _MAX_REDIRECTS,
     _REDIRECT_CONNECT_ATTEMPTS,
     _REDIRECT_CONNECT_DELAY,
@@ -1450,7 +1451,7 @@ class AsyncOracleConnect(_ConnectionLogic):
 
         Owner = schema
         if Owner is None:
-            Result = await self.execute('SELECT USER FROM dual')
+            Result = await self.execute(_CURRENT_SCHEMA_SQL)
             Rows = self._rows(Result)
             Owner = Rows[0][0] if Rows else None
         if not Owner:
@@ -1499,7 +1500,7 @@ class AsyncOracleConnect(_ConnectionLogic):
 
         Owner = schema
         if Owner is None:
-            Rows = self._rows(await self.execute('SELECT USER FROM dual'))
+            Rows = self._rows(await self.execute(_CURRENT_SCHEMA_SQL))
             Owner = Rows[0][0] if Rows else None
         if not Owner or not package or not name:
             return None
