@@ -40,11 +40,13 @@ ORA-00902. The rest have no such guard and simply do not pass; they are the hone
 edge of this adapter:
 
 - **UROWID / index-organized rowids** — the physical ``ROWID`` pseudo-column is
-  emulated with PostgreSQL's ``ctid`` (rendered as text, ``ROWIDTOCHAR``-comparable,
-  usable as a bind), but ``ctid`` is *mutable* — it changes on ``UPDATE`` / ``VACUUM
-  FULL`` — so it is a faithful locator only within an unmodified snapshot, not a
-  durable cross-transaction handle (a real migration substitutes a surrogate identity
-  key). The UROWID (``*``-prefixed logical rowid) of an ``ORGANIZATION INDEX`` table
+  emulated with PostgreSQL's ``ctid``, rendered in Oracle's 18-character extended
+  form (the table's oid as the data object), so ``SELECT ROWID``, a bound rowid and
+  ``cursor.lastrowid`` all agree. But ``ctid`` is *mutable* — PostgreSQL writes an
+  updated row at a new address, and ``VACUUM FULL`` moves rows too — so it is a
+  faithful locator only within an unmodified snapshot, not a durable
+  cross-transaction handle (a real migration substitutes a surrogate identity key);
+  a rowid stored with ``SET r = ROWID`` names the version that update replaced. The UROWID (``*``-prefixed logical rowid) of an ``ORGANIZATION INDEX`` table
   is emulated from the table's primary key (see ``_urowid_expression``): a stable,
   ``*``-prefixed handle that round-trips as a ``WHERE ROWID = :bind``, but not
   Oracle's actual key encoding. ``DBMS_ROWID`` is unimplemented: ``ctid`` exposes
@@ -225,8 +227,24 @@ _HELPER_FUNCTIONS_DDL = (
     f')::{_TSTZ_TYPE} FROM (SELECT CASE '
     "WHEN $2 ~ '^[+-]?[0-9]{1,2}:[0-9]{2}$' THEN $1 AT TIME ZONE ($2)::interval "
     'ELSE $1 AT TIME ZONE $2 END) AS z(i) $$;'
+    # sys.ora_rowid(tableoid, ctid): a heap row's ROWID in Oracle's extended
+    # form, OOOOOO FFF BBBBBB RRR in Oracle's base64 -- the table's oid as the
+    # data object, file 1, and the ctid's block (plus one: a client takes block 0
+    # for "no rowid", as it is Oracle's file header) and slot. It is the form a
+    # client renders from the rowid an OER carries, so SELECT ROWID, a bound
+    # rowid and cursor.lastrowid all speak one language.
+    'CREATE OR REPLACE FUNCTION sys.ora_rowid_b64(n bigint, width int) RETURNS text '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT string_agg(substr('
+    "'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/', "
+    "((n >> (6 * (width - 1 - i))) & 63)::int + 1, 1), '' ORDER BY i) "
+    'FROM generate_series(0, width - 1) AS g(i) $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_rowid(tab oid, t tid) RETURNS text '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT sys.ora_rowid_b64(tab::bigint, 6) '
+    '|| sys.ora_rowid_b64(1, 3) '
+    '|| sys.ora_rowid_b64((t::text::point)[0]::bigint + 1, 6) '
+    '|| sys.ora_rowid_b64((t::text::point)[1]::bigint, 3) $$;'
     # ROWIDTOCHAR(rowid) → the VARCHAR2 form of a ROWID. The ROWID pseudo-column is
-    # rewritten to `ctid::text` (already text), so this is the identity on that text.
+    # rewritten to text already (sys.ora_rowid), so this is the identity on it.
     'CREATE OR REPLACE FUNCTION rowidtochar(text) RETURNS text '
     'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
 )
@@ -800,6 +818,14 @@ _DDL_TYPE_REWRITES = [
     # a column merely *named* `ref` (ref INTEGER) is left alone. `REF(` (a REF()
     # call) has no space and is not matched.
     (re.compile(r'\b(\w+)\s+REF\s+\w+', re.IGNORECASE), r'\1 bytea'),
+    # ROWID / UROWID column types hold a rowid's text form. Without this the
+    # ROWID pseudo-column rewrite reached the column's TYPE and the CREATE
+    # failed. A UROWID can hold an index-organized table's logical rowid, which
+    # is longer than the 18 characters of a heap one.
+    # Anchored to a column definition -- after `(` or `,` -- so a `SELECT ROWID`
+    # in CREATE TABLE ... AS SELECT is left to the pseudo-column rewrite.
+    (re.compile(r'([(,]\s*\w+)\s+UROWID\b', re.IGNORECASE), r'\1 varchar(4000)'),
+    (re.compile(r'([(,]\s*\w+)\s+ROWID\b', re.IGNORECASE), r'\1 varchar(18)'),
     (re.compile(r'\bLONG\s+RAW\b', re.IGNORECASE), 'bytea'),
     (re.compile(r'\bRAW\s*\(\s*\d+\s*\)', re.IGNORECASE), 'bytea'),
     (re.compile(r'\bRAW\b', re.IGNORECASE), 'bytea'),
@@ -867,6 +893,12 @@ _PK_CONSTRAINT = re.compile(r'\bPRIMARY\s+KEY\s*\(([^)]+)\)', re.IGNORECASE)
 _PK_INLINE = re.compile(r'[(,]\s*(\w+)\s+[^,()]*?\bPRIMARY\s+KEY\b', re.IGNORECASE)
 _DROP_TABLE_NAME = re.compile(r'\s*DROP\s+TABLE\s+([\w.]+)', re.IGNORECASE)
 _STATEMENT_TABLE = re.compile(r'\b(?:FROM|UPDATE|INTO)\s+([\w.]+)', re.IGNORECASE)
+# A DML statement, and the RETURNING that reports the rowid of each row it
+# touched: Oracle hands the last one back with every INSERT / UPDATE / DELETE
+# (cursor.lastrowid), in the same form SELECT ROWID gives.
+_DML_HEAD = re.compile(r'\s*(INSERT|UPDATE|DELETE)\b', re.IGNORECASE)
+_HAS_RETURNING = re.compile(r'\bRETURNING\b', re.IGNORECASE)
+_ROWID_RETURNING = ' RETURNING sys.ora_rowid(tableoid, ctid)'
 _ROWID_WORD = re.compile(r'\bROWID\b', re.IGNORECASE)
 
 
@@ -1062,9 +1094,10 @@ _IDIOM_REWRITES = [
     # SYSDATE / SYSTIMESTAMP → the session clock (SYSDATE is to-the-second).
     (re.compile(r'\bsystimestamp\b', re.IGNORECASE), 'now()'),
     (re.compile(r'\bsysdate\b', re.IGNORECASE), 'localtimestamp(0)'),
-    # The ROWID pseudo-column → PostgreSQL's `ctid` as text ('(0,1)'). This one
-    # rewrite serves both a SELECT (returns the str) and a `WHERE ROWID = :bind`
-    # (compares the bound text). The word boundary keeps it off ROWIDTOCHAR (no
+    # The ROWID pseudo-column → the row's ctid, in Oracle's extended form
+    # (sys.ora_rowid). This one rewrite serves a SELECT (returns the str), a
+    # `WHERE ROWID = :bind` (compares the bound text) and `SET col = ROWID`, and
+    # it is the form cursor.lastrowid reports, so each can be fed to the other. The word boundary keeps it off ROWIDTOCHAR (no
     # boundary mid-token) and UROWID (a word char precedes ROWID). ctid is a
     # physical, *mutable* address — it changes on UPDATE / VACUUM FULL — so it is a
     # faithful row locator only within an unmodified snapshot, which is all the
@@ -1073,7 +1106,7 @@ _IDIOM_REWRITES = [
     # index-organized table's ROWID is rewritten earlier, per session, from its
     # primary key (PostgresBackend._rewrite_iot_rowid), so this only sees heap
     # tables.
-    (re.compile(r'\bROWID\b', re.IGNORECASE), 'ctid::text'),
+    (re.compile(r'\bROWID\b', re.IGNORECASE), 'sys.ora_rowid(tableoid, ctid)'),
     # A BINARY_DOUBLE / BINARY_FLOAT numeric literal suffix (1234.5678d, 1.5f) —
     # PostgreSQL has no such suffix, so drop it. A decimal point is required so
     # this never touches an identifier or a plain integer.
@@ -1962,6 +1995,9 @@ class PostgresBackend:
                 _translate_routine_ddl(_translate_ddl(_translate_admin(sql)))
             )
         )
+        with_rowid = self._returning_rowid(original, sql)
+        if with_rowid is not None:
+            sql = with_rowid
         params: dict | None = None
         if binds:
             sql, params = _translate_binds(sql, binds)
@@ -1983,6 +2019,13 @@ class PostgresBackend:
         # so a later rollback discards only DML, not the table (#532).
         if is_ddl:
             self._conn.commit()
+        if with_rowid is not None:
+            # The rows are the rowids of the rows touched, not a result set: a
+            # DML still answers with a count, and the last one is its rowid.
+            touched = [row[0] for row in result.rows]
+            return Result(
+                rowcount=len(touched), last_rowid=touched[-1] if touched else None
+            )
         return result
 
     def execute_returning(self, sql: str, rows: Sequence[Sequence]) -> Result:
@@ -2007,6 +2050,18 @@ class PostgresBackend:
             # the count is the rows read rather than a separate report.
             affected += len(iteration)
         return Result(rowcount=affected, returned_rows=returned)
+
+    def _returning_rowid(self, original: str, translated: str) -> str | None:
+        # The translated DML with the rowid RETURNING added, or None where it
+        # does not apply: not an INSERT / UPDATE / DELETE, one that returns
+        # something already, or one on an index-organized table, whose ROWID is
+        # its primary key rather than a heap address.
+        if not _DML_HEAD.match(translated) or _HAS_RETURNING.search(translated):
+            return None
+        table = _STATEMENT_TABLE.search(original)
+        if table is not None and _bare_table(table.group(1)) in self._iot_pk:
+            return None
+        return translated.rstrip().rstrip(';') + _ROWID_RETURNING
 
     def _rewrite_iot_rowid(self, sql: str) -> str:
         # ROWID on a registered index-organized table → its logical-rowid
@@ -2111,7 +2166,7 @@ class PostgresBackend:
         # for the session to map to an ORA error; the connection stays usable.
         return self._build_result(statement)
 
-    def execute_many(self, sql: str, rows: Sequence[Sequence]) -> int:
+    def execute_many(self, sql: str, rows: Sequence[Sequence]) -> int | Result:
         # Array DML (executemany) in one round-trip: translate the statement once
         # and send every bind row through psycopg's executemany (which pipelines),
         # instead of a round-trip per row — the difference is ~7 s vs a few ms for
@@ -2124,18 +2179,36 @@ class PostgresBackend:
         translated = _translate_idioms(
             _translate_plsql_block(_translate_routine_ddl(_translate_ddl(sql)))
         )
+        with_rowid = self._returning_rowid(sql, translated)
+        if with_rowid is not None:
+            translated = with_rowid
         bound_sql, _ = _translate_binds(translated, rows[0])
         params = [_translate_binds(translated, row)[1] for row in rows]
         cursor = self._conn.cursor()
         cursor.execute('SAVEPOINT _mirror_stmt')
+        touched: list = []
         try:
-            cursor.executemany(bound_sql, params)
-            affected = cursor.rowcount
+            if with_rowid is None:
+                cursor.executemany(bound_sql, params)
+                affected = cursor.rowcount
+            else:
+                # One result per iteration, each the rowids that row touched;
+                # the batch's count is all of them, its rowid the very last.
+                cursor.executemany(bound_sql, params, returning=True)
+                while True:
+                    touched.extend(r[0] for r in cursor.fetchall())
+                    if not cursor.nextset():
+                        break
+                affected = len(touched)
         except psycopg.Error as exc:
             self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_stmt')
             self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
             raise _backend_error(exc) from exc
         self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
+        if with_rowid is not None:
+            return Result(
+                rowcount=affected, last_rowid=touched[-1] if touched else None
+            )
         return max(affected, 0)
 
     def _object_type_name(self, table: str) -> str | None:

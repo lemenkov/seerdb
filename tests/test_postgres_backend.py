@@ -1087,10 +1087,12 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
         'from_tz',
         'rowidtochar',
         'ora_to_char_signed',
+        'sys.ora_rowid_b64',
+        'sys.ora_rowid',
     ):
         assert f'FUNCTION {name}(' in _HELPER_FUNCTIONS_DDL
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 7
-    # rowidtochar is the identity on the text ctid the ROWID pseudo-column rewrites
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 9
+    # rowidtochar is the identity on the text the ROWID pseudo-column rewrites
     # to, so ROWIDTOCHAR(ROWID) equals ROWID.
     assert 'FUNCTION rowidtochar(text) RETURNS text' in _HELPER_FUNCTIONS_DDL
     # empty_clob / empty_blob hand back the domain types, so a value stored
@@ -1137,24 +1139,55 @@ def test_translate_idioms_functions_and_literals() -> None:
     )
 
 
+def test_a_rowid_column_type_is_text_and_a_dml_reports_its_rowid() -> None:
+    # A ROWID / UROWID column holds a rowid's text; the pseudo-column rewrite
+    # used to reach the column TYPE and fail the CREATE. `SELECT ROWID` in a
+    # CREATE TABLE ... AS SELECT is not a column definition and is left alone.
+    assert _translate_ddl('CREATE TABLE t (n NUMBER, r ROWID, u UROWID)') == (
+        'CREATE TABLE t (n numeric, r varchar(18), u varchar(4000))'
+    )
+    assert 'varchar' not in _translate_ddl('CREATE TABLE t AS SELECT ROWID FROM s')
+
+
+def test_a_rowid_renders_as_the_client_renders_it() -> None:
+    # The backend's sys.ora_rowid and the client's rowid_to_string must agree,
+    # or a lastrowid the Mirror reports would never match a SELECT ROWID. The
+    # block is one past the ctid's: a client takes block 0 for "no rowid".
+    from seerdb.common.types import rowid_to_string
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        (got,) = backend._conn.execute(
+            "SELECT sys.ora_rowid(16384, '(12,3)'::tid)"
+        ).fetchone()
+        assert got == rowid_to_string(16384, 1, 13, 3)
+    finally:
+        backend.close()
+
+
 def test_translate_idioms_rewrites_rowid_pseudocolumn() -> None:
-    # The ROWID pseudo-column becomes ctid::text — one rewrite serving both a
-    # SELECT (returns the '(0,1)' text) and a WHERE ROWID = :bind (text compare).
-    assert _translate_idioms('SELECT ROWID FROM t') == 'SELECT ctid::text FROM t'
+    # The ROWID pseudo-column becomes the row's ctid in Oracle's extended form —
+    # one rewrite serving a SELECT, a WHERE ROWID = :bind (text compare), and the
+    # form cursor.lastrowid reports.
+    rowid = 'sys.ora_rowid(tableoid, ctid)'
+    assert _translate_idioms('SELECT ROWID FROM t') == f'SELECT {rowid} FROM t'
     assert _translate_idioms('SELECT id FROM t WHERE ROWID = :r') == (
-        'SELECT id FROM t WHERE ctid::text = :r'
+        f'SELECT id FROM t WHERE {rowid} = :r'
     )
     # The word boundary keeps it off ROWIDTOCHAR (no boundary mid-token) — that call
     # resolves to the installed identity helper — and off UROWID (a word char
     # precedes ROWID), so a UROWID column type name is left intact.
     assert _translate_idioms('SELECT ROWIDTOCHAR(ROWID) FROM t') == (
-        'SELECT ROWIDTOCHAR(ctid::text) FROM t'
+        f'SELECT ROWIDTOCHAR({rowid}) FROM t'
     )
     assert _translate_idioms('CREATE TABLE t (r UROWID)') == (
         'CREATE TABLE t (r UROWID)'
     )
     # Case-insensitive, like the other pseudo-column rewrites.
-    assert _translate_idioms('select rowid from t') == 'select ctid::text from t'
+    assert (
+        _translate_idioms('select rowid from t')
+        == 'select sys.ora_rowid(tableoid, ctid) from t'
+    )
 
 
 def test_translate_idioms_binary_float_double_literals() -> None:
