@@ -6692,14 +6692,21 @@ class BFILEIntegration(unittest.TestCase):
         self.conn.close()
 
     def test_bfile_select_returns_file_contents(self):
-        # The user-facing path: a plain SELECT of a BFILE column returns
-        # the file content as bytes (via the auto-resolve in Cursor.execute).
+        # The user-facing path: a plain SELECT of a BFILE column hands back the
+        # LOB, and reading it gives the file's bytes.
+        #
+        # It used to hand back the bytes directly, resolved at fetch time. #1101
+        # stopped that on purpose: reading a BFILE OPENS the file, so the SELECT
+        # itself raised ORA-22285 for a missing directory where the reference
+        # client simply returns a locator. The content still arrives -- one
+        # explicit read later (#1119).
         self.cur.execute(
             'SELECT BFILENAME(:d, :f) FROM DUAL',
             {'d': self.dir, 'f': _BFILE_TEST_FILE},
         )
-        (Got,) = self.cur.fetchone()
-        self.assertEqual(Got, _BFILE_TEST_CONTENT)
+        (Lob,) = self.cur.fetchone()
+        self.assertTrue(Lob.is_file)
+        self.assertEqual(Lob.read(), _BFILE_TEST_CONTENT)
 
     def test_bfile_locator_parsing(self):
         # The LOB-object surface: directory_name / filename / is_file
@@ -6770,8 +6777,9 @@ class AsyncBFILEIntegration(unittest.IsolatedAsyncioTestCase):
                     'SELECT BFILENAME(:d, :f) FROM DUAL',
                     {'d': Dir, 'f': _BFILE_TEST_FILE},
                 )
-                (Got,) = await Cur.fetchone()
-                self.assertEqual(Got, _BFILE_TEST_CONTENT)
+                (Lob,) = await Cur.fetchone()
+                self.assertTrue(Lob.is_file)
+                self.assertEqual(await Lob.aread(), _BFILE_TEST_CONTENT)
 
     async def test_async_bfile_fileexists(self):
         # Sync/async parity for the BFILE round-trip (#1109).
