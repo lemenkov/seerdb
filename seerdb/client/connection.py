@@ -672,6 +672,14 @@ def _reject_cqn() -> None:
     )
 
 
+# The schema an unqualified type name resolves in. That is the session's
+# CURRENT schema, which ALTER SESSION SET CURRENT_SCHEMA moves -- not USER, the
+# login: Oracle's own SQL and the reference client both resolve there, and a
+# lookup by USER found a type the session could not use (and missed the one it
+# could).
+_CURRENT_SCHEMA_SQL = "SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual"
+
+
 class OracleConnect(_ConnectionLogic):
     def __init__(
         self,
@@ -2021,11 +2029,7 @@ class OracleConnect(_ConnectionLogic):
         # empty layout (the #115 read path tolerates that).
         if not name:
             return None
-        Owner = schema
-        if Owner is None:
-            Result = self.execute('SELECT USER FROM dual')
-            Rows = self._rows(Result)
-            Owner = Rows[0][0] if Rows else None
+        Owner = schema if schema is not None else self._current_schema_owner()
         if not Owner:
             return None
         Key = (Owner, name)
@@ -2211,8 +2215,8 @@ class OracleConnect(_ConnectionLogic):
         }
 
     def _current_schema_owner(self) -> str | None:
-        # The session's own schema, for a type name that named no owner.
-        Rows = self._rows(self.execute('SELECT USER FROM dual'))
+        # The schema a type name that named no owner resolves in.
+        Rows = self._rows(self.execute(_CURRENT_SCHEMA_SQL))
         return Rows[0][0] if Rows else None
 
     def _collection_describe(self, owner, name, typecode) -> dict:

@@ -4856,6 +4856,51 @@ class LOBReturningIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class GettypeCurrentSchemaIntegration(_IntegrationBase):
+    """An unqualified `gettype()` name resolves in the CURRENT schema.
+
+    That is where Oracle's own SQL resolves one, and the reference client too;
+    ALTER SESSION SET CURRENT_SCHEMA moves it away from the login user. Looking
+    under USER instead found a type the session could not use in SQL at all.
+    """
+
+    TYPE = 'PYORACLE_CURSCHEMA_T'
+
+    def setUp(self):
+        super().setUp()
+        self._skip_if_mirror_backend('postgres', 'describe an object type')
+        self._drop_type()
+        self.cur.execute(f'CREATE TYPE {self.TYPE} AS OBJECT (id NUMBER)')
+        self.owner = self.conn.gettype(self.TYPE).schema
+
+    def tearDown(self):
+        self._drop_type()
+        super().tearDown()
+
+    def _drop_type(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        try:
+            self.cur.execute(f'DROP TYPE {self.TYPE}')
+        except DatabaseError:
+            pass  # best-effort teardown of a leftover
+
+    def test_an_unqualified_name_follows_the_current_schema(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        self.cur.execute('ALTER SESSION SET CURRENT_SCHEMA = SYSTEM')
+        try:
+            # SQL cannot see the type from here, so neither may gettype...
+            with self.assertRaises(DatabaseError):
+                self.conn.gettype(self.TYPE)
+            # ...while the qualified name still names it.
+            typ = self.conn.gettype(f'{self.owner}.{self.TYPE}')
+            self.assertEqual(typ.schema, self.owner)
+        finally:
+            self.cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = {self.owner}')
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class PlsqlTypeIntegration(_IntegrationBase):
     """`gettype()` of a PL/SQL **package-level** type (#1030).
 
@@ -5660,6 +5705,34 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
             await Cur.execute(Query)
             self.assertEqual(await Cur.fetchone(), ('SYSTEM',))
             await Cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = {Own}')
+        finally:
+            await Conn.close()
+
+    async def test_gettype_follows_the_current_schema(self):
+        # Async twin of GettypeCurrentSchemaIntegration.
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest(
+                "the Mirror's postgres backend cannot describe an object type"
+            )
+        Typ = 'PYO_ASYNC_CURSCHEMA_T'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            try:
+                await Cur.execute(f'DROP TYPE {Typ}')
+            except seerdb.DatabaseError:
+                pass
+            await Cur.execute(f'CREATE TYPE {Typ} AS OBJECT (id NUMBER)')
+            try:
+                Owner = (await Conn.gettype(Typ)).schema
+                await Cur.execute('ALTER SESSION SET CURRENT_SCHEMA = SYSTEM')
+                with self.assertRaises(seerdb.DatabaseError):
+                    await Conn.gettype(Typ)
+                Qualified = await Conn.gettype(f'{Owner}.{Typ}')
+                self.assertEqual(Qualified.schema, Owner)
+                await Cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = {Owner}')
+            finally:
+                await Cur.execute(f'DROP TYPE {Typ}')
         finally:
             await Conn.close()
 
