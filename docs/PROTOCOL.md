@@ -3392,6 +3392,19 @@ reverse-engineered byte-for-byte and verified on 10g / 11g / 21c / 23ai:
   `False`: the server raises `ORA-22285` for it, because "there is no such
   alias" and "the file is missing" are different answers.
 
+- **`FILE_EXISTS`** (op `0x0800`) and **`FILE_ISOPEN`** (`0x0400`) answer with
+  the echoed locator **field** and then a ub1 flag. The field is what matters:
+  the client reads `len(locator)` raw bytes and only then the flag, and a BFILE
+  locator's length *includes its own leading ub2* (§14.4d) — so a reply that
+  echoes the body inside the field is two bytes short and the flag is read from
+  inside the locator. python-oracledb does not merely get the wrong answer, it
+  desyncs: `DPY-5000: unknown protocol message type 1 at position 68` (#1120).
+
+  Note the asymmetry on the server side: a BFILE request's locator arrives with
+  that ub2 **stripped** (the op's field is ub2-prefixed, so the parser consumes
+  it), and the acknowledging replies re-add it — so whichever encoder builds the
+  reply has to know which of the two it has been handed.
+
 **Retargeting a BFILE locator (#1109).** `setfilename` replaces only the two
 names; the **16 bytes in front of them are kept verbatim**. That span covers the
 locator's own ub2 inner length and the 14 fixed bytes behind it, and it is the
