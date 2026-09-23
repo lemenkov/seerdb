@@ -9622,9 +9622,17 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
     # engineered from an oracledb-thin capture: (1) al8i4[9] = 0xC000 here, and
     # (2) the al8pidmlrc pointer + iteration count in `Middle`. Omitting either
     # makes the server reject the execute as malformed (ORA-03137 kpoal8Check).
+    # 12.1, matching the cursor's own gate. These two used to disagree -- the
+    # cursor raised below 12.1 and the encoder set the flag only from 12.2 -- so
+    # a 12.1 server was asked for nothing while the caller's request was
+    # accepted, and getarraydmlrowcounts() answered [] rather than raising. An
+    # empty list reads as "every iteration affected no rows", which is a worse
+    # answer than the NotSupportedError it would have got on 11g (#1135).
+    # python-oracledb gates the feature by version nowhere at all: it sets the
+    # flag and lets the server answer.
     ArrayDmlRowCounts = bool(
         Dictionary['query'].get('arraydmlrowcounts')
-        and FieldVersion >= FIELD_VERSION_12_2
+        and FieldVersion >= FIELD_VERSION_12_1
         and BatchLen > 0
     )
     if ArrayDmlRowCounts and len(All8) > 9:
