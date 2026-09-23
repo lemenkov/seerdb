@@ -1019,7 +1019,8 @@ def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
     # (sb1), and an extra ub4 `oaccolid` follows max_size. 11g keeps an
     # sb4-style variable scale (so NUMBER's -127 default arrives as 0x81 0x7f)
     # and has no oaccolid. precision is sb1 in both.
-    Is12c = _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_2
+    Is12c = _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+    HasOacColId = _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_2
     DataType = Rest[0]
     Precision = Rest[2]  # sb1
     Rest = Rest[3:]
@@ -1043,7 +1044,7 @@ def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
     Csfrm = Rest[0]  # charset form (1 DB / 2 national)
     Rest = Rest[1:]
     (MaxSize, Rest) = decode_ub4(Rest)
-    if Is12c:
+    if HasOacColId:
         (_, Rest) = decode_ub4(Rest)  # oaccolid (12.2+)
     NullOk = Rest[0]
     Rest = Rest[2:]  # skip nulls_allowed-byte AND v7 name length
@@ -1397,7 +1398,10 @@ def _encode_dcb_column(col: ColumnMeta, position: int) -> bytes:
     # zeros; only type/precision/scale/length/charset/csfrm/max_size/null_ok/name
     # carry meaning.
     field_version = _ENCODE_FIELD_VERSION.get()
-    is_12c = field_version >= FIELD_VERSION_12_2
+    # The one-byte scale is 12.1's already; only the oaccolid waits for 12.2
+    # (#1144).
+    is_12c = field_version >= FIELD_VERSION_12_1
+    has_oac_col_id = field_version >= FIELD_VERSION_12_2
     return (
         bytes([col.data_type, 0, col.precision & 0xFF])
         + (bytes([col.scale & 0xFF]) if is_12c else _encode_signed_sb4(col.scale))
@@ -1410,7 +1414,7 @@ def _encode_dcb_column(col: ColumnMeta, position: int) -> bytes:
         + encode_sb4(col.charset)
         + bytes([col.csfrm])
         + encode_sb4(describe_max_size(col))
-        + (encode_sb4(0) if is_12c else b'')  # oaccolid (12.2+)
+        + (encode_sb4(0) if has_oac_col_id else b'')  # oaccolid (12.2+)
         + bytes([col.null_ok, 0])  # null_ok + (skipped) v7 name length
         + _str_with_length(col.name)
         + _str_with_length(col.type_schema)  # type schema (ADT owner)
@@ -2239,7 +2243,7 @@ def peek_exec_cursor(payload: bytes) -> tuple[int, bool]:
 
 
 def _skip_exec_middle_12c(rest: bytes, field_version: int) -> bytes:
-    # The 12.2+ OALL8 block between the fixed head and the SQL (the client's
+    # The 12.1+ OALL8 block between the fixed head and the SQL (the client's
     # encode_dictionary_exec `Middle`): the 0,0,1 marker, the registration
     # fields, the array-DML row-count block (a 1 + sb4 iteration count + 1 when
     # arraydmlrowcounts was requested, else three zeros), the SQL-signature /
@@ -2251,7 +2255,8 @@ def _skip_exec_middle_12c(rest: bytes, field_version: int) -> bytes:
         rest = rest[1:]
     else:
         rest = rest[3:]
-    rest = rest[5:]  # al8sqlsig / SQL id
+    if field_version >= FIELD_VERSION_12_2:
+        rest = rest[5:]  # al8sqlsig / SQL id
     if field_version >= FIELD_VERSION_12_2_EXT1:
         rest = rest[2:]  # chunk ids
     return rest
@@ -2304,9 +2309,10 @@ def parse_exec(
     define_count, rest = decode_ub4(rest)
 
     field_version = _DECODE_FIELD_VERSION.get()
-    if field_version >= FIELD_VERSION_12_2:
-        # 12.2+ replaces the marker + server-version slot with the registration /
-        # array-DML row-count / SQL-signature block, and length-prefixes the SQL.
+    if field_version >= FIELD_VERSION_12_1:
+        # 12.1+ replaces the marker + server-version slot with the registration /
+        # array-DML row-count block (and from 12.2 the SQL-signature one), and
+        # length-prefixes the SQL (#1144).
         rest = _skip_exec_middle_12c(rest, field_version)
         if query_flag:
             raw, after = decode_dalc(rest)
@@ -2411,7 +2417,10 @@ def parse_exec(
                     # stops short of (the same trailer a 12.2+ describe column
                     # carries) — consume it so the next OAC aligns.
                     _, after = decode_ub4(after)
-                elif data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
+                elif field_version < FIELD_VERSION_12_1 and data_type in (
+                    TNS_TYPE_CLOB,
+                    TNS_TYPE_BLOB,
+                ):
                     # A thin CLOB / BLOB bind is the temp-LOB locator form (#412),
                     # whose OAC appends a trailing oaccolid field the shared
                     # decoder stops short of — swallow it so the next OAC aligns.
@@ -2597,10 +2606,10 @@ def encode_lob_read_response_thin(
 def _lob_data_thin(content: bytes) -> bytes:
     # LOB_DATA in the negotiated version's chunk framing. A short value is one
     # length byte + data at every version. A longer one is the 0xFE-marked run of
-    # chunks: 11g prefixes each chunk with a single length byte, a 12.2+ client
+    # chunks: 11g prefixes each chunk with a single length byte, a 12.1+ client
     # reads a variable-width big-endian length (the ub4 form) per chunk — the
     # same framing its own writer uses for a long bind — and a zero terminator.
-    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_12_2:
+    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_12_1:
         return _oci_lob_data(content)
     if len(content) < TNS_LONG_LENGTH_INDICATOR:
         return bytes([TTI_LOB, len(content)]) + content
@@ -4539,7 +4548,7 @@ def _oac_array_capacity(Data: bytes, field_version: int) -> int:
         Mxlc,
         _Rest,
     ) = _decode_oac_walk(Data)
-    if field_version >= FIELD_VERSION_12_2:
+    if field_version >= FIELD_VERSION_12_1:
         return Mal if Flg & TNS_BIND_ARRAY else 0
     return Mxlc if Fl2 & TNS_BIND_ARRAY else 0
 
@@ -5169,7 +5178,7 @@ def _read_urowid_column(Rest: bytes) -> tuple[str | None, bytes]:
         # single length byte per chunk before, both ending on a zero-length chunk.
         Rest = Rest[1:]
         Chunks = b''
-        Wide = _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_2
+        Wide = _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
         while Rest:
             if Wide:
                 (ChunkLen, Rest) = decode_ub4(Rest)
@@ -5206,7 +5215,7 @@ def _read_long_column(Rest: bytes) -> tuple[bytes | None, bytes]:
     elif Marker == TNS_LONG_LENGTH_INDICATOR:
         Rest = Rest[1:]
         Chunks = b''
-        if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_2:
+        if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
             # 12c+ prefixes each chunk with a ub4 length (zero-length terminator)
             # rather than 11g's single length byte.
             while Rest:
@@ -9817,10 +9826,12 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
         + encode_sb4(DefLen)
     )
 
-    if FieldVersion >= FIELD_VERSION_12_2:
+    if FieldVersion >= FIELD_VERSION_12_1:
         # 12c+ OALL8 carries extra al8 fields after the 11g header: the DML
-        # row-count block, then (12.2+) the SQL-signature / SQL-id pointers and
-        # (12.2_EXT1+) the chunk-id pointers — all zero/null for us. The SQL is
+        # row-count block from 12.1, then (12.2+) the SQL-signature / SQL-id
+        # pointers and (12.2_EXT1+) the chunk-id pointers — all zero/null for
+        # us. Gating the whole tail on 12.2 sent a 12.1 session the 11g shape,
+        # and a real server refused every call ORA-03120 (#1144). The SQL is
         # length-prefixed (write_bytes_with_length). Without these the server
         # reads the SQL/al8i4 array from the wrong offset and returns ORA-03120
         # (two-task conversion routine: integer overflow). See oracledb
@@ -9834,7 +9845,8 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
             Middle += bytes([1]) + encode_sb4(1 + BatchLen) + bytes([1])
         else:
             Middle += bytes([0, 0, 0])  # al8pidmlrc block
-        Middle += bytes([0, 0, 0, 0, 0])  # 12.2 al8sqlsig / SQL id
+        if FieldVersion >= FIELD_VERSION_12_2:
+            Middle += bytes([0, 0, 0, 0, 0])  # 12.2 al8sqlsig / SQL id
         if FieldVersion >= FIELD_VERSION_12_2_EXT1:
             Middle += bytes([0, 0])  # 12.2_EXT1 chunk ids
         # The length-prefixed SQL is written only when there is SQL to parse. On
@@ -11955,7 +11967,7 @@ def encode_urowid_value(Value: object) -> bytes:
     # a zero-length chunk -- the inverse of the chunked branch in
     # _read_urowid_column (#904). Without this the encoder raised on
     # bytes([>255]) and the Mirror could not return an IOT rowid at all.
-    wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_2
+    wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
     encode_len = encode_sb4 if wide else (lambda n: bytes([n]))
     out = bytearray(encode_sb4(len(Payload)) + bytes([TNS_LONG_LENGTH_INDICATOR]))
     for start in range(0, len(Payload), TNS_MAX_SHORT_LENGTH):
@@ -11988,10 +12000,10 @@ def encode_long_value_thin(Value: object) -> bytes:
         Content = bytes(Value)
     else:
         Content = str(Value).encode('utf-8')
-    # 11g frames each inline LONG chunk with a single length byte; a 12.2+ client
+    # 11g frames each inline LONG chunk with a single length byte; a 12.1+ client
     # reads a ub4 length per chunk (its _read_long_column), so chunk in the
     # session's negotiated version — the same split as the LOB read reply.
-    wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_2
+    wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
     encode_len = encode_sb4 if wide else (lambda n: bytes([n]))
     Out = bytearray([TNS_LONG_LENGTH_INDICATOR])
     for Start in range(0, len(Content), TNS_MAX_SHORT_LENGTH):
@@ -12450,7 +12462,7 @@ def decode_chr(Bytes: bytes) -> tuple[bytes, bytes]:
         # ends with a zero-length chunk (same framing as _skip_chunked_bytes);
         # 11g uses a single length byte per chunk. The decode field version is
         # set by decode_packet for the current response.
-        if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_2:
+        if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
             Rest = Bytes[1:]
             Out = b''
             while True:
@@ -12485,7 +12497,7 @@ def decode_chr(Bytes: bytes) -> tuple[bytes, bytes]:
 
 def encode_chr(String: str | bytes) -> bytes:
     Bytes = String.encode('utf-8') if isinstance(String, str) else String
-    if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_2:
+    if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
         # 12c+ bind data follows write_bytes_with_length: a single length byte
         # for values up to 252 bytes, otherwise the 254 marker + ub4-prefixed
         # chunks.
@@ -12793,7 +12805,9 @@ def _encode_native_lob_oac(DataType: int, Size: int) -> bytes:
         + encode_sb4(0)  # charset id (ub2) — binary
         + bytes([0])  # character set form
         + FixedSize  # LOB prefetch length (= max size)
-        + encode_sb4(0)  # oaccolid (12.2+)
+        # oaccolid, unconditionally: these OACs are built once at import, and a
+        # JSON or VECTOR bind only exists on a 21c+ session, always past 12.2.
+        + encode_sb4(0)
     )
 
 
@@ -12832,7 +12846,7 @@ def _encode_lob_bind_oac(is_blob: bool, csfrm: int = _CSFRM_DB) -> bytes:
         + encode_sb4(0 if is_blob else AL32UTF8_CHARSET)  # charset id (ub2)
         + bytes([0 if is_blob else csfrm])  # character set form
         + encode_sb4(0)  # LOB prefetch length
-        + encode_sb4(0)  # oaccolid (12.2+)
+        + _oac_col_id()  # oaccolid (12.2+)
     )
 
 
@@ -13491,7 +13505,7 @@ def _object_oac(oid: bytes, version: int, buffer_size: int) -> bytes:
         + encode_sb4(0)  # charset id (ub2)
         + bytes([0])  # character set form
         + encode_sb4(0)  # LOB prefetch length
-        + encode_sb4(0)
+        + _oac_col_id()
     )  # oaccolid (12.2+)
 
 
@@ -13530,7 +13544,7 @@ def _encode_ref_oac(Ref: 'DbRef') -> bytes:
         + encode_sb4(2)  # charset id (ub2) — per capture
         + bytes([0])  # character set form
         + encode_sb4(0)  # LOB prefetch length
-        + encode_sb4(0)
+        + _oac_col_id()
     )  # oaccolid (12.2+)
 
 
@@ -13992,6 +14006,17 @@ def encode_token_interval_ym(IV: IntervalYM) -> bytes:
     return (IV.years + 2**31).to_bytes(4, 'big') + bytes([IV.months + 60])
 
 
+def _oac_col_id() -> bytes:
+    # The trailing `oaccolid` of a hand-built bind OAC. A 12.2+ server reads it
+    # and a 12.1 one does not: sent to a 12.1 session it is one byte too many
+    # and the server refuses the call (ORA-03106 / ORA-03120) (#1144). Below
+    # 12.1 the byte stays, as it always has been sent there.
+    field_version = _ENCODE_FIELD_VERSION.get()
+    if FIELD_VERSION_12_1 <= field_version < FIELD_VERSION_12_2:
+        return b''
+    return encode_sb4(0)
+
+
 def encode_token_raw(
     DataType: int, Length: int, Flag: int, Charset: int, Max: int, Array: int = 0
 ) -> bytes:
@@ -13999,13 +14024,15 @@ def encode_token_raw(
     # TNS_BIND_ARRAY (0x40) and the max-number-of-array-elements field carries
     # the array's declared capacity (0 for a scalar bind).
     FormOfUse = 2 if Charset == AL16UTF16_CHARSET else 1
-    if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_2:
+    if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
         # 12c+ bind OAC (oracledb _write_column_metadata): a fixed flag byte
         # (TNS_BIND_USE_INDICATORS = 1), a ub8 cont-flag, OID + version, the
         # bind charset as a ub2 (AL32UTF8 / AL16UTF16, 0 for non-char), the
-        # csfrm byte, a LOB-prefetch length, and a trailing oaccolid ub4. The
-        # 11g layout below is shorter/differently shaped and a 12c server
-        # rejects it with ORA-03115 (unsupported network datatype).
+        # csfrm byte, a LOB-prefetch length, and -- from 12.2 only -- a
+        # trailing oaccolid ub4. The 11g layout below is shorter/differently
+        # shaped and a 12c server rejects it with ORA-03115 (unsupported network
+        # datatype); a 12.1 session needs this one too, less the oaccolid
+        # (#1144).
         if Charset == 0:
             BindCharset, Csfrm = 0, 0
         elif Charset == AL16UTF16_CHARSET:
@@ -14023,8 +14050,8 @@ def encode_token_raw(
             + encode_sb4(BindCharset)  # charset id (ub2)
             + bytes([Csfrm])  # character set form
             + encode_sb4(0)  # LOB prefetch length
-            + encode_sb4(0)
-        )  # oaccolid (12.2+)
+            + _oac_col_id()  # oaccolid (12.2+)
+        )
     FlagOut = (Flag | TNS_BIND_ARRAY) if Array else Flag
     MaxOut = Array if Array else Max
     return (
