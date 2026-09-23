@@ -3328,7 +3328,6 @@ position (1 = overwrite from start).
 | `0x0040`  | WRITE             | Write content into the LOB           |
 | `0x0100`  | FILE_OPEN         | Open a BFILE                         |
 | `0x0200`  | FILE_CLOSE        | Close a BFILE                        |
-| `0x0800`  | FILE_EXISTS       | Whether a BFILE's file is there      |
 | `0x0400`  | FILE_ISOPEN       | Test whether a BFILE is open         |
 | `0x0800`  | FILE_EXISTS       | Test whether a BFILE exists          |
 | `0x4000`  | GET_CHUNK_SIZE    | Server-preferred chunk size          |
