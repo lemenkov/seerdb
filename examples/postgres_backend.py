@@ -2310,7 +2310,19 @@ class PostgresBackend:
         # with one SELECT and place each result onto its bind position (#517).
         refs = _distinct_bind_refs(body)
         exprs = ', '.join(expr for _ref, expr in assignments)
-        sql, params = _translate_binds(_translate_idioms(f'SELECT {exprs}'), values)
+        # Bind the SELECT by NAME, against the block's own bind order. The SELECT
+        # carries only the right-hand sides, so the OUT targets are gone from it
+        # and its placeholders no longer line up with `values`, which is in the
+        # BLOCK's order. Passing `values` straight through bound them by position
+        # within the SELECT: for `:r := f(:p)` the block's order is [r, p], the
+        # SELECT has only :p, and :p took position 0 -- r's value, which for a
+        # pure OUT bind is None. So f received NULL whatever the caller passed,
+        # and no error was raised (#1137).
+        by_name = dict(zip(refs, values))
+        select = _translate_idioms(f'SELECT {exprs}')
+        sql, params = _translate_binds(
+            select, [by_name[ref] for ref in _distinct_bind_refs(select)]
+        )
         cursor = self._conn.cursor()
         cursor.execute(sql, params)
         row = _decode_row(cursor, cursor.fetchone(), self._tstz_oid) or []

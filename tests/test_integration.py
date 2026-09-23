@@ -1569,6 +1569,28 @@ class BindIntegration(_IntegrationBase):
         self.assertIsInstance(got.getvalue(), float)
         self.assertEqual(got.getvalue(), 8.5514716)
 
+    def test_an_out_assignment_reads_the_in_bind_on_its_right(self):
+        # The OUT tests above all assign a literal. With a bind on the right-hand
+        # side too, Mirror-over-PostgreSQL passed the function the OUT target's
+        # value -- None -- instead of :p, because the SELECT it evaluates the
+        # right-hand side with no longer contains :r and so its placeholders sat
+        # one position off from the block's bind list (#1137). No error; just a
+        # wrong answer. LENGTH is native to both servers, so this holds every leg
+        # to the answer Oracle gives, at every version.
+        got = self.cur.var(seerdb.NUMBER)
+        self.cur.execute('BEGIN :r := LENGTH(:p); END;', {'r': got, 'p': 'hello'})
+        self.assertEqual(got.getvalue(), 5)
+
+    def test_several_out_assignments_share_an_in_bind(self):
+        # The same through the multi-assignment path, with the IN bind between the
+        # two OUT targets in the block's own bind order: [a, x, b].
+        a = self.cur.var(seerdb.NUMBER)
+        b = self.cur.var(seerdb.NUMBER)
+        self.cur.execute(
+            'BEGIN :a := :x + 1; :b := :x * 2; END;', {'a': a, 'x': 5, 'b': b}
+        )
+        self.assertEqual((a.getvalue(), b.getvalue()), (6, 10))
+
     def test_var_float_in_every_iteration_of_an_array_returning(self):
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, f NUMBER)')
         got = self.cur.var(float)
