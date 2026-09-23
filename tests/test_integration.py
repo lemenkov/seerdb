@@ -2964,7 +2964,6 @@ class ParseIntegration(_IntegrationBase):
         # a reserved word is rejected at parse time and at no other time.
         if self._pre10():
             self.skipTest('cursor.parse() needs 10g+')
-        self._skip_if_mirror_backend('postgres', 'parse Oracle SQL')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
         with self.assertRaises(seerdb.DatabaseError) as ctx:
             self.cur.parse(
@@ -2975,7 +2974,6 @@ class ParseIntegration(_IntegrationBase):
     def test_parse_reports_a_statement_that_is_not_sql(self):
         if self._pre10():
             self.skipTest('cursor.parse() needs 10g+')
-        self._skip_if_mirror_backend('postgres', 'parse Oracle SQL')
         with self.assertRaises(seerdb.DatabaseError) as ctx:
             self.cur.parse('this is not sql')
         self.assertEqual(ctx.exception.code, 900)  # ORA-00900
@@ -2991,7 +2989,6 @@ class ParseIntegration(_IntegrationBase):
         # of validating without running.
         if self._pre10():
             self.skipTest('cursor.parse() needs 10g+')
-        self._skip_if_mirror_backend('postgres', 'parse Oracle SQL')
         with self.assertRaises(seerdb.DatabaseError):
             self.cur.parse('this is not sql')
         self.cur.execute('SELECT 1 FROM DUAL')
