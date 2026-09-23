@@ -1802,6 +1802,12 @@ class PostgresBackend:
         # like Oracle's SYS — so its views are never reflected as user objects.
         try:
             self._conn.execute('CREATE SCHEMA IF NOT EXISTS sys')
+            # SYSTEM is a user every Oracle database has, so a client may point
+            # its session at it (ALTER SESSION SET CURRENT_SCHEMA = SYSTEM). That
+            # becomes a search_path, and PostgreSQL's current_schema() passes
+            # over a schema that does not exist -- the session stayed where it
+            # was and SYS_CONTEXT went on naming it. An empty one is enough.
+            self._conn.execute('CREATE SCHEMA IF NOT EXISTS system')
         except psycopg.Error:
             self._conn.rollback()
         # `sys` ahead of `oracle`: orafce ships its own `user_tables` and
