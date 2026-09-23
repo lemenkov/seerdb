@@ -3328,6 +3328,7 @@ position (1 = overwrite from start).
 | `0x0040`  | WRITE             | Write content into the LOB           |
 | `0x0100`  | FILE_OPEN         | Open a BFILE                         |
 | `0x0200`  | FILE_CLOSE        | Close a BFILE                        |
+| `0x0800`  | FILE_EXISTS       | Whether a BFILE's file is there      |
 | `0x0400`  | FILE_ISOPEN       | Test whether a BFILE is open         |
 | `0x0800`  | FILE_EXISTS       | Test whether a BFILE exists          |
 | `0x4000`  | GET_CHUNK_SIZE    | Server-preferred chunk size          |
@@ -3378,6 +3379,36 @@ reverse-engineered byte-for-byte and verified on 10g / 11g / 21c / 23ai:
 - **`READ`** (op `0x0002`) is the ordinary read with the ub2-prefixed (opened)
   locator; content streams back as the normal `LOB_DATA` chunk (§14.3).
 - **`FILE_CLOSE`** (op `0x0200`) sends neither amount nor data.
+- **`FILE_EXISTS`** (op `0x0800`, #1109) shares that field block but differs in
+  **one byte**: it sets the *null-lob pointer*, because the field it sets is
+  where the answer comes back — the server writes "is this LOB null" into it.
+  Source offset 0, no amount, no data. Sending the READ shape instead (pointer
+  clear, an amount, source offset 1) is answered
+
+  ```
+  ORA-03137: malformed TTC packet from client rejected: [kpolob:lobnull 0]
+  ```
+
+  which names the field outright. A *directory* that does not exist is not a
+  `False`: the server raises `ORA-22285` for it, because "there is no such
+  alias" and "the file is missing" are different answers.
+
+**Retargeting a BFILE locator (#1109).** `setfilename` replaces only the two
+names; the **16 bytes in front of them are kept verbatim**. That span covers the
+locator's own ub2 inner length and the 14 fixed bytes behind it, and it is the
+server's — a locator built from scratch is answered `ORA-22285` or `ORA-22275:
+invalid LOB locator specified`, because what makes a locator valid is that the
+server minted it. Each name rides behind a **ub2** length:
+
+```
+00 36 | 00 01 08 08 00 00 00 01 00 00 00 00 00 00 | 00 0d 'PYO_BFILE_DIR' | 00 17 'pyoracle_bfile_test.txt'
+^ub2    ^14 fixed bytes -- kept                     ^ub2  dir              ^ub2  file
+```
+
+(Read the other way round, a ub2 under 256 is a zero byte then a ub1, which is
+how the locator *reader* walks it — the same bytes either way for any name
+shorter than 256.) The names start at offset **16** counted from the start of
+the locator as fetched.
 
 This replaced an earlier server-side PL/SQL helper
 (`DBMS_LOB.FILEOPEN`/`LOADBLOBFROMFILE`), removing its `CREATE PROCEDURE`

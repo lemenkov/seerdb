@@ -11190,16 +11190,36 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
                 Out += encode_sb4(len(Chunk)) + Chunk
             Out += encode_sb4(0)  # zero-length terminator
         return Out
-    if Dictionary.get('operation') in (TNS_LOB_OP_FILE_OPEN, TNS_LOB_OP_FILE_CLOSE):
-        # BFILE open / close (#46). Same field block as READ but with source
-        # offset 0 and no read amount. FILE_OPEN sets the amount pointer and
-        # sends the open mode (sb4 0x0B = read-only) where READ sends the read
-        # amount; FILE_CLOSE sends neither. The locator is ub2-length-prefixed
-        # (declared len + 2), like every temp / BFILE LOBOPS. Reverse-engineered
-        # from python-oracledb on 21c, byte-for-byte.
+    if Dictionary.get('operation') in (
+        TNS_LOB_OP_FILE_OPEN,
+        TNS_LOB_OP_FILE_CLOSE,
+        TNS_LOB_OP_FILE_EXISTS,
+    ):
+        # BFILE open / close (#46) and exists (#1109). Same field block as READ
+        # but with source offset 0 and no read amount. FILE_OPEN sets the amount
+        # pointer and sends the open mode (sb4 0x0B = read-only) where READ sends
+        # the read amount; FILE_CLOSE and FILE_EXISTS send neither. The locator is
+        # ub2-length-prefixed (declared len + 2), like every temp / BFILE LOBOPS.
+        # Reverse-engineered from python-oracledb on 21c and 23ai, byte-for-byte.
+        #
+        # FILE_EXISTS differs from the other two in ONE byte: it sets the
+        # null-lob pointer, because the answer it asks for IS that field -- the
+        # server writes "is this LOB null" back into it. Sending the READ shape
+        # instead (pointer clear, an amount, source offset 1) is answered
+        # `ORA-03137: malformed TTC packet from client rejected: [kpolob:lobnull
+        # 0]`, which names the field outright.
         Locator = Dictionary['locator']
         Operation = Dictionary['operation']
         IsOpen = Operation == TNS_LOB_OP_FILE_OPEN
+        Exists = Operation == TNS_LOB_OP_FILE_EXISTS
+        # A BFILE locator as FETCHED leads with its own ub2 inner length, and
+        # this branch re-adds that prefix -- so the body is what goes in. The
+        # FILE_OPEN / FILE_CLOSE callers strip it themselves before calling; a
+        # locator that arrives already stripped does not match the guard, so
+        # doing it here as well is a no-op for them and saves every other caller
+        # from having to know (#1109).
+        if len(Locator) >= 2 and ((Locator[0] << 8) | Locator[1]) == len(Locator) - 2:
+            Locator = Locator[2:]
         Out = LobHead
         Out += bytes([1])  # source pointer present
         Out += encode_sb4(len(Locator) + 2)  # source locator length (+ub2)
@@ -11209,7 +11229,7 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
         Out += encode_sb4(0)  # short dest offset
         Out += bytes([0])  # charset pointer absent
         Out += bytes([0])  # short amount absent
-        Out += bytes([0])  # null lob pointer absent
+        Out += bytes([1 if Exists else 0])  # null lob pointer
         Out += encode_sb4(Operation)  # operation code
         Out += bytes([0])  # scn array pointer absent
         Out += bytes([0])  # scn array length
