@@ -64,18 +64,52 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: oracle/python-oracledb
-          ref: v4.0.1
+          ref: v4.0.2
           path: python-oracledb
 
-      # numpy / pandas / pyarrow are the suite's own conftest imports, not ours:
-      # tests/conftest.py imports numpy and pandas at module scope, so WITHOUT
-      # them pytest cannot even collect, and the dataframe tests import pyarrow.
-      # They are deliberately unpinned -- the suite expects current versions of
-      # them, and pinning would be a second maintenance burden for no gain. Only
-      # oracledb itself is pinned, because that is the referee whose
-      # expectations the number means something against.
+      # The suite's dependencies come from the suite's own `test` extra rather
+      # than a hand-written list: python-oracledb declares exactly what its tests
+      # need (anyio, numpy, pandas, pyarrow, pytest, tox), so `[test]` tracks
+      # upstream and cannot drift out of date the way a copy would. It also gets
+      # the async plugin right -- the suite drives its async tests with ANYIO,
+      # not pytest-asyncio, which is easy to get wrong by hand because a machine
+      # that happens to have pytest-asyncio installed runs them anyway.
+      #
+      # oracledb itself stays pinned: it is the referee whose expectations the
+      # number means something against.
       - name: Install
-        run: pip install . pytest "oracledb==4.0.1" numpy pandas pyarrow
+        run: pip install . "oracledb[test]==4.0.2"
+
+      # Two things the suite's schema script expects that a -slim image does not
+      # provide on its own.
+      #
+      # `ctxapp` is the Oracle Text role. create_schema.sql grants it, and the
+      # slim image omits Oracle Text, so the grant is ORA-01919 and the whole
+      # script fails. An EMPTY role satisfies it and costs nothing: the grant is
+      # vestigial for our purposes -- that one line is the only mention of
+      # ctxapp anywhere in the suite, and nothing in it builds a CONTEXT index or
+      # calls ctx_ddl. Were a future suite version to add Oracle Text tests, they
+      # would fail loudly and the answer then is the full image, not this.
+      #
+      # `pyoadm` is the suite's DBA, for the tests that read v$session or kill
+      # one. It is separate from `system` so the suite is not handed more than it
+      # needs. It goes in here rather than after the schema because
+      # `create_schema` drops only the main and proxy users, so the order is
+      # free -- and one step is simpler than two.
+      - name: Prepare the database for the suite
+        run: |
+          python - <<'PY'
+          import oracledb
+
+          conn = oracledb.connect(
+              user="system", password="oracle", dsn="localhost:1521/FREEPDB1"
+          )
+          with conn.cursor() as cur:
+              cur.execute("create role ctxapp")
+              cur.execute("create user pyoadm identified by pyoadm123")
+              cur.execute("grant dba to pyoadm")
+          conn.close()
+          PY
 
       # The suite owns its schema: users, tables, packages and types. It is
       # created DIRECTLY against the database rather than through the Mirror —
@@ -92,23 +126,6 @@ jobs:
           PYO_TEST_ADMIN_USER: system
           PYO_TEST_ADMIN_PASSWORD: oracle
         run: python -m pytest -q tests/create_schema.py
-
-      # `pyoadm` is the suite's DBA for the tests that read v$session or kill a
-      # session. It is separate from `system` so the suite is not handed more
-      # than it needs.
-      - name: Grant the suite's admin account
-        run: |
-          python - <<'PY'
-          import oracledb
-
-          conn = oracledb.connect(
-              user="system", password="oracle", dsn="localhost:1521/FREEPDB1"
-          )
-          with conn.cursor() as cur:
-              cur.execute("create user pyoadm identified by pyoadm123")
-              cur.execute("grant dba to pyoadm")
-          conn.close()
-          PY
 
       - name: Run the suite through a passthrough Mirror
         run: |
