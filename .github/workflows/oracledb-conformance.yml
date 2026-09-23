@@ -67,8 +67,15 @@ jobs:
           ref: v4.0.1
           path: python-oracledb
 
+      # numpy / pandas / pyarrow are the suite's own conftest imports, not ours:
+      # tests/conftest.py imports numpy and pandas at module scope, so WITHOUT
+      # them pytest cannot even collect, and the dataframe tests import pyarrow.
+      # They are deliberately unpinned -- the suite expects current versions of
+      # them, and pinning would be a second maintenance burden for no gain. Only
+      # oracledb itself is pinned, because that is the referee whose
+      # expectations the number means something against.
       - name: Install
-        run: pip install . pytest "oracledb==4.0.1"
+        run: pip install . pytest "oracledb==4.0.1" numpy pandas pyarrow
 
       # The suite owns its schema: users, tables, packages and types. It is
       # created DIRECTLY against the database rather than through the Mirror —
@@ -126,6 +133,14 @@ jobs:
           kill "$MIRROR_PID" 2>/dev/null || true
           exit "$STATUS"
 
+      # `if: failure()` also fires when an EARLIER step failed, and the Mirror is
+      # only started by the step above -- so the log may not exist. Say so
+      # instead of failing, or the real error is buried under a `tail` error.
       - name: The Mirror's log, when the suite failed
         if: failure()
-        run: tail -200 mirror.log
+        run: |
+          if [ -f mirror.log ]; then
+            tail -200 mirror.log
+          else
+            echo "No mirror.log: the run failed before the Mirror was started."
+          fi
