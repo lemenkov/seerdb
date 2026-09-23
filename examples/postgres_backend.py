@@ -94,7 +94,7 @@ from psycopg.types.composite import CompositeInfo, register_composite
 
 from seerdb.common.datatypes import BcDate, IntervalYM
 from seerdb.common.dbobject import DbRef
-from seerdb.common.sqltext import is_plsql, strip_returning_into
+from seerdb.common.sqltext import bind_placeholders, is_plsql, strip_returning_into
 from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
     TNS_TYPE_BDOUBLE,
@@ -1765,6 +1765,29 @@ def _column_meta(desc, values: list, tstz_oid: int | None = None) -> ColumnMeta:
     )
 
 
+# Oracle's reserved words, which cannot name a bind: `:ROWID` is refused
+# ORA-01745 at parse. Unquoted names only -- a quoted one may be anything.
+_ORACLE_RESERVED_WORDS = frozenset(
+    'ACCESS ADD ALL ALTER AND ANY AS ASC AUDIT BETWEEN BY CHAR CHECK CLUSTER '
+    'COLUMN COMMENT COMPRESS CONNECT CREATE CURRENT DATE DECIMAL DEFAULT DELETE '
+    'DESC DISTINCT DROP ELSE EXCLUSIVE EXISTS FILE FLOAT FOR FROM GRANT GROUP '
+    'HAVING IDENTIFIED IMMEDIATE IN INCREMENT INDEX INITIAL INSERT INTEGER '
+    'INTERSECT INTO IS LEVEL LIKE LOCK LONG MAXEXTENTS MINUS MLSLABEL MODE MODIFY '
+    'NOAUDIT NOCOMPRESS NOT NOWAIT NULL NUMBER OF OFFLINE ON ONLINE OPTION OR '
+    'ORDER PCTFREE PRIOR PUBLIC RAW RENAME RESOURCE REVOKE ROW ROWID ROWNUM ROWS '
+    'SELECT SESSION SET SHARE SIZE SMALLINT START SUCCESSFUL SYNONYM SYSDATE '
+    'TABLE THEN TO TRIGGER UID UNION UNIQUE UPDATE USER VALIDATE VALUES VARCHAR '
+    'VARCHAR2 VIEW WHENEVER WHERE WITH'.split()
+)
+# The statements PostgreSQL's EXPLAIN does not take; a parse of one is answered
+# as before, with a bare success.
+_NOT_EXPLAINABLE = re.compile(
+    r'\s*(CREATE|ALTER|DROP|TRUNCATE|RENAME|COMMENT|GRANT|REVOKE|LOCK|COMMIT|'
+    r'ROLLBACK|SAVEPOINT|SET|CALL|ANALYZE|AUDIT|NOAUDIT|PURGE|FLASHBACK)\b',
+    re.IGNORECASE,
+)
+
+
 class PostgresBackend:
     """A :class:`~seerdb.server.Backend` over a psycopg connection.
 
@@ -1953,6 +1976,48 @@ class PostgresBackend:
         # from the libpq `conninfo` the backend itself connects to PostgreSQL
         # with. A production backend might instead consult a PG table here.
         return credential_lookup(self._credentials, username)
+
+    def parse(self, sql: str) -> None:
+        """Validate a statement without running it -- ``cursor.parse()`` of
+        anything that is not a query.
+
+        Without this the Mirror answered its own bare success and every
+        parse-time error was lost. Oracle refuses a bind named by a reserved
+        word (ORA-01745), a rule PostgreSQL does not have, so it is checked
+        here; the rest is PostgreSQL's EXPLAIN of the translated statement,
+        which plans without running, inside a savepoint so a refusal leaves the
+        session as it was. DDL, PL/SQL and transaction control have no EXPLAIN
+        and keep the bare success they had.
+        """
+        for name, quoted in bind_placeholders(sql, dedupe=True):
+            if not quoted and name.upper() in _ORACLE_RESERVED_WORDS:
+                raise BackendError('invalid host/bind variable name', ora_code=1745)
+        if is_plsql(sql) or _NOT_EXPLAINABLE.match(sql):
+            return
+        translated = _translate_idioms(
+            _translate_plsql_block(
+                _translate_routine_ddl(
+                    _translate_ddl(_translate_admin(strip_returning_into(sql)))
+                )
+            )
+        )
+        placeholders = len(bind_placeholders(sql, dedupe=True))
+        params: dict | None = None
+        if placeholders:
+            translated, params = _translate_binds(translated, [None] * placeholders)
+        cursor = self._conn.cursor()
+        cursor.execute('SAVEPOINT _mirror_parse')
+        try:
+            cursor.execute(f'EXPLAIN {translated}', params)
+        except psycopg.Error as exc:
+            self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_parse')
+            self._conn.execute('RELEASE SAVEPOINT _mirror_parse')
+            # A bind whose type only its value would settle is not an error in
+            # Oracle, whose parse has no value either.
+            if getattr(exc, 'sqlstate', None) == '42P18':
+                return
+            raise _backend_error(exc, original=sql, translated=translated) from exc
+        self._conn.execute('RELEASE SAVEPOINT _mirror_parse')
 
     def execute(self, sql: str, binds: Sequence = ()) -> Result:
         # A PL/SQL block from callproc / callfunc arrives with BindVar binds (the
