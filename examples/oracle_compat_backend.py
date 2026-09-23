@@ -163,6 +163,32 @@ class OracleCompatBackend:
             raise UnsupportedFeature('RETURNING is not supported by this backend')
         return inner(sql, rows)
 
+    def __getattr__(self, name: str) -> object:
+        """Forward anything this wrapper does not define to the inner backend.
+
+        The Mirror discovers a backend's OPTIONAL capabilities with
+        ``getattr(backend, '<hook>', None)`` -- on the backend it was HANDED,
+        which is this wrapper. Before this, a hook the wrapper did not name was
+        invisible however well the backend beneath implemented it, and it failed
+        silently: the Mirror simply concluded the capability was absent. The server
+        probes for more than ten such hooks -- parse, describe, open_session,
+        ping, bfile_exists, open_ref_cursor and others -- and the wrapper named
+        none of them, because it names a fixed set and the server keeps growing
+        new ones.
+
+        Forwarding is the right default for a wrapper whose job is to answer a
+        handful of sqlplus bootstrap queries and otherwise get out of the way.
+        Everything it DOES define still wins -- ``__getattr__`` runs only when
+        normal lookup fails -- so the interception this class exists for is
+        untouched.
+
+        It also keeps the Mirror's absence check honest: a hook the inner backend
+        lacks raises AttributeError here, so ``getattr(..., None)`` returns None
+        and the Mirror takes its fallback path, instead of finding a method that
+        exists only to refuse.
+        """
+        return getattr(self._inner, name)
+
     def change_password(
         self, username: str, old_password: str, new_password: str
     ) -> None:
