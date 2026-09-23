@@ -80,6 +80,7 @@ edge of this adapter:
 from __future__ import annotations
 
 import datetime
+import hashlib
 import re
 import struct
 from collections.abc import Sequence
@@ -514,6 +515,13 @@ _ORACLE_DICTIONARY_DDL = (
     'JOIN pg_attribute a ON a.attrelid=tc.oid AND a.attnum=k.attnum '
     'WHERE (k.opt & 1) = 1 '
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
+)
+
+# What the installed dictionary is stamped with, as the `sys` schema's comment:
+# a digest of the DDL itself, so any change to a view or function reinstalls it
+# and an unchanged one is left alone (#1152).
+_DICTIONARY_STAMP = (
+    'seerdb dictionary ' + hashlib.sha256(_ORACLE_DICTIONARY_DDL.encode()).hexdigest()
 )
 
 # The PostgreSQL `interval` OID (pg_type.oid) — the base type ora_intervalym is a
@@ -1875,11 +1883,31 @@ class PostgresBackend:
         except psycopg.Error:
             self._conn.rollback()
         # Oracle data-dictionary emulation (#759): SYS_CONTEXT + catalog views.
+        # Installed only when missing or changed, not on every connect: CREATE
+        # OR REPLACE VIEW takes an exclusive lock, so a client reading one of the
+        # views inside an open transaction made every new connection wait for
+        # it to end -- a login hang one step removed from its cause (#1152).
+        # When it does run -- a first install, or a seerdb whose views differ --
+        # a held view makes it give up after a short wait rather than hang; the
+        # session then works with the views already there, and a later
+        # connection installs them. Committed first, so a give-up here cannot
+        # take the helpers above down with it.
+        self._conn.commit()
         try:
-            self._conn.execute(_ORACLE_DICTIONARY_DDL)
+            self._install_dictionary()
         except psycopg.Error:
             self._conn.rollback()
         self._conn.commit()
+
+    def _install_dictionary(self) -> None:
+        row = self._conn.execute(
+            "SELECT obj_description(to_regnamespace('sys'), 'pg_namespace')"
+        ).fetchone()
+        if row is not None and row[0] == _DICTIONARY_STAMP:
+            return
+        self._conn.execute("SET LOCAL lock_timeout = '2s'")
+        self._conn.execute(_ORACLE_DICTIONARY_DDL)
+        self._conn.execute(f"COMMENT ON SCHEMA sys IS '{_DICTIONARY_STAMP}'")
 
     def authenticate(self, username: str) -> str | None:
         # The login store the Mirror authenticates clients against — separate
