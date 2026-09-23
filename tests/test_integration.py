@@ -3739,6 +3739,10 @@ class BooleanIntegration(_IntegrationBase):
     def _setup_bool(self):
         from seerdb.common.exceptions import DatabaseError
 
+        if self.conn.field_version < FIELD_VERSION_23_1:
+            # As for JSON: a 23ai server carries BOOLEAN natively only to a
+            # session that negotiated 23.1+ (#1149).
+            self.skipTest('native BOOLEAN needs a session at field version 23.1+')
         try:
             self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, flag BOOLEAN)')
         except DatabaseError as exc:
@@ -3991,6 +3995,12 @@ class JSONIntegration(_IntegrationBase):
     def _setup_json(self):
         from seerdb.common.exceptions import DatabaseError
 
+        if self.conn.field_version < FIELD_VERSION_20_1:
+            # The server may have the type and still not hand it to this
+            # session natively: 23ai sends a JSON column to a session that
+            # negotiated below 20.1 as a plain BLOB, as it would to a real
+            # client of that release (#1149).
+            self.skipTest('native JSON needs a session at field version 20.1+')
         try:
             self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, doc JSON)')
         except DatabaseError as exc:
@@ -6102,6 +6112,8 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_json_bind_roundtrip(self):
         # Async parity for JSON binds (#50): bind a dict, read it back.
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            if Conn.field_version < FIELD_VERSION_20_1:
+                self.skipTest('native JSON needs a session at field version 20.1+')
             async with Conn.cursor() as Cur:
                 await self._drop_async(Cur, 'PYORACLE_ASYNC_JSON')
                 try:
