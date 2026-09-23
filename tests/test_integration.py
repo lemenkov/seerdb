@@ -33,6 +33,8 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_10_2,
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
+    FIELD_VERSION_12_2,
+    FIELD_VERSION_20_1,
     FIELD_VERSION_23_1,
     FIELD_VERSION_23_4,
 )
@@ -2642,6 +2644,28 @@ class ErrorAndRowcountIntegration(_IntegrationBase):
         # "table or view does not exist" no longer appears as one substring.
         self.assertIn('table or view', str(ctx.exception))
         self.assertIn('does not exist', str(ctx.exception))
+
+    def test_a_session_below_the_server_release_keeps_the_message(self):
+        # A 20.1+ server ends every error with a SQL type and a checksum, even
+        # to a session that negotiated lower. Read by the negotiated version,
+        # the SQL type became the message length and the text was lost (#1145).
+        conn = seerdb.connect(
+            host=_HOST,
+            port=_PORT,
+            user=_USER,
+            password=_PASSWORD,
+            service_name=_SERVICE,
+            field_version=FIELD_VERSION_12_2,
+        )
+        try:
+            if conn._server_field_version() < FIELD_VERSION_20_1:
+                self.skipTest('the server predates 20.1, so it sends no such fields')
+            with self.assertRaises(seerdb.DatabaseError) as ctx:
+                conn.cursor().execute("SELECT TO_NUMBER('x') FROM dual")
+            self.assertEqual(ctx.exception.code, 1722)
+            self.assertIn('ORA-01722', str(ctx.exception))
+        finally:
+            conn.close()
 
     def test_error_offset_points_at_the_bad_token(self):
         # oracledb parity: DatabaseError.offset is the 0-based character offset of
@@ -5686,6 +5710,21 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await Cur.fetchall(), [])
             finally:
                 await Cur.execute(f'DROP TABLE {Table}')
+        finally:
+            await Conn.close()
+
+    async def test_a_session_below_the_server_release_keeps_the_message(self):
+        # Async twin of ErrorAndRowcountIntegration's (#1145).
+        Conn = await seerdb.connect_async(
+            **{**self._kwargs(), 'field_version': FIELD_VERSION_12_2}
+        )
+        try:
+            if Conn._server_field_version() < FIELD_VERSION_20_1:
+                self.skipTest('the server predates 20.1, so it sends no such fields')
+            with self.assertRaises(seerdb.DatabaseError) as ctx:
+                await Conn.cursor().execute("SELECT TO_NUMBER('x') FROM dual")
+            self.assertEqual(ctx.exception.code, 1722)
+            self.assertIn('ORA-01722', str(ctx.exception))
         finally:
             await Conn.close()
 

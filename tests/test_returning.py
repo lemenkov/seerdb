@@ -582,6 +582,9 @@ class TestFlushOutBindsAcknowledged(unittest.TestCase):
         def send(self, _type, data):
             self.sent.append(data)
 
+        def _server_field_version(self):
+            return self.field_version
+
     def _read(self, packets):
         wire = self._Wire(packets)
         result = OracleConnect._handle_response(wire)

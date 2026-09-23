@@ -2743,6 +2743,23 @@ token_oer` skips these by field version (§4.2); without it the message
 DALC is mis-aligned and decodes to garbage even though the early
 `ora_error_code` (and thus the exception class) is still correct.
 
+**The 20.1 pair follows the server's release, not the negotiated version
+(#1145).** 21c and 23ai send the SQL type and checksum to every session,
+including one that negotiated 12.1, 12.2 or 19c (7, 8, 12). The OER bytes are
+identical at every negotiated version apart from the sequence number:
+
+```
+… 02 06 ba | 00 | 01 03 | 00 | 7e "ORA-01722: …"
+  ext err    ub8   sql     checksum  message
+  (1722)     rows  type
+```
+
+Read by the negotiated version, a session below 20.1 took the SQL type for the
+message length and lost every error's text. The client therefore gates the pair
+on the field version the server **advertised** in its compile-time
+capabilities, and the Mirror on the one it presents. The extended error number
+and rowcount stay on the negotiated 12.1.
+
 #### 6.3b The rowcount field is read on an ERROR too (#998/#1003)
 
 `current_row_number` is not only a success field. An `executemany` whose batch

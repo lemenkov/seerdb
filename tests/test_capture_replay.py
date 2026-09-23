@@ -18,6 +18,8 @@ from seerdb.common.tns import assemble_packet, decode_packet
 from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
+    FIELD_VERSION_12_2,
+    FIELD_VERSION_23_4,
     TNS_DATA,
 )
 
@@ -141,6 +143,29 @@ class TestAlterSessionCurrentSchemaReplay(unittest.TestCase):
         assert body is not None
         result = decode_packet(body, (None, None, []), FIELD_VERSION_12_1)
         self.assertEqual(result[1], 0)
+
+
+class TestOerTailFollowsTheServerRelease(unittest.TestCase):
+    # A 20.1+ server ends every OER with a SQL type and a checksum, whatever
+    # field version the session negotiated. These are live 23ai bytes, taken
+    # from a session that negotiated 12.2 (8): `... 02 06 ba | 00 | 01 03 | 00
+    # | 7e "ORA-01722 ..."`. Read by the negotiated version, the SQL type was
+    # taken for the message length and the text was lost (#1145).
+    _OER = bytes.fromhex(
+        '04010102ee7c000206ba0000010101110300000000000000000000000006000101'
+        '000000000206ba000103007e4f52412d30313732323a20756e61626c6520746f20'
+        '636f6e7665727420737472696e672076616c756520636f6e7461696e696e672027'
+        '782720746f2061206e756d6265723a200a4f52412d30333330323a20284f52412d'
+        '30313732322064657461696c732920696e76616c696420737472696e672076616c'
+        '75653a20780a1d'
+    )
+
+    def test_the_message_survives_a_session_below_the_server_release(self):
+        result = decode_packet(
+            self._OER, (None, None, []), FIELD_VERSION_12_2, FIELD_VERSION_23_4
+        )
+        self.assertEqual(result[1], 1722)
+        self.assertTrue(result[5].startswith('ORA-01722: unable to convert'))
 
 
 if __name__ == '__main__':

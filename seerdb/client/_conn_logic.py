@@ -37,6 +37,7 @@ from seerdb.common.tns import (
 from seerdb.common.tns_consts import (
     CCAP_FEATURE_BACKPORT2,
     CCAP_FEATURE_BACKPORT2_END_USER_SEC,
+    CCAP_FIELD_VERSION,
     CCAP_TTC4,
     CCAP_TTC4_EXPLICIT_BOUNDARY,
     FIELD_VERSION_10_2,
@@ -260,6 +261,16 @@ class _ConnectionLogic:
         )
         self._cursors_to_close = []
         return Data
+
+    def _server_field_version(self) -> int:
+        # The field version the SERVER advertised, before negotiating down.
+        # Some reply fields follow the server's own release, not the version
+        # the session agreed on: a 20.1+ server ends every OER with a SQL type
+        # and a checksum even when a client negotiated 12.1 (#1145).
+        Caps = self._server_compile_caps
+        if len(Caps) > CCAP_FIELD_VERSION:
+            return Caps[CCAP_FIELD_VERSION]
+        return self.field_version
 
     def _supports_end_user_sec(self) -> bool:
         # The server advertises end-user security context via a compile-cap bit
