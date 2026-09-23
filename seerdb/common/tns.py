@@ -12713,7 +12713,7 @@ def encode_token_rxd(Token: object) -> bytes:
         Token = _json_bind_text(Token)
     elif is_vector_bind(Token):
         # Native VECTOR bind on 23ai (#62): the OAC counterpart is
-        # _VECTOR_BIND_OAC.
+        # _vector_bind_oac.
         return _native_lob_bind_value(encode_vector(Token))
     if isinstance(Token, bool):
         # Native SQL BOOLEAN bind on 23ai (#54): the value is a 2-byte DALC
@@ -12805,17 +12805,21 @@ def _encode_native_lob_oac(DataType: int, Size: int) -> bytes:
         + encode_sb4(0)  # charset id (ub2) — binary
         + bytes([0])  # character set form
         + FixedSize  # LOB prefetch length (= max size)
-        # oaccolid, unconditionally: these OACs are built once at import, and a
-        # JSON or VECTOR bind only exists on a 21c+ session, always past 12.2.
-        + encode_sb4(0)
+        + _oac_col_id()  # oaccolid (12.2+)
     )
 
 
 # Native JSON bind OAC (#70): type 119, 32 MiB max. Native VECTOR bind OAC (#62):
 # type 127, 1 MiB max. Both were captured verbatim from python-oracledb (21c /
-# 23ai); the capture is now reproduced field-by-field.
-_JSON_BIND_OAC = _encode_native_lob_oac(TNS_TYPE_JSON, 0x02000000)  # 32 MiB
-_VECTOR_BIND_OAC = _encode_native_lob_oac(TNS_TYPE_VECTOR, 0x00100000)  # 1 MiB
+# 23ai); the capture is now reproduced field-by-field. Built per bind, not once
+# at import: the trailing oaccolid depends on the session's version, and 23ai
+# serves VECTOR to a session that negotiated 12.1 / 12.2 as well (#1148).
+def _json_bind_oac() -> bytes:
+    return _encode_native_lob_oac(TNS_TYPE_JSON, 0x02000000)  # 32 MiB
+
+
+def _vector_bind_oac() -> bytes:
+    return _encode_native_lob_oac(TNS_TYPE_VECTOR, 0x00100000)  # 1 MiB
 
 
 def _encode_lob_bind_oac(is_blob: bool, csfrm: int = _CSFRM_DB) -> bytes:
@@ -12967,9 +12971,9 @@ def encode_token_oac(Token: object) -> bytes:
         if DT == TNS_TYPE_JSON:
             # The same OAC a JSON value binds with; only the Var path was
             # missing, so setinputsizes(DB_TYPE_JSON) raised (#902).
-            return _JSON_BIND_OAC
+            return _json_bind_oac()
         if DT == TNS_TYPE_VECTOR:
-            return _VECTOR_BIND_OAC
+            return _vector_bind_oac()
         if DT == TNS_TYPE_INT:
             # BINARY_INTEGER / PLS_INTEGER Var (#1044). Captured from the
             # reference client binding one as an OUT param: type 3, buffer 22 --
@@ -13023,12 +13027,12 @@ def encode_token_oac(Token: object) -> bytes:
         # else the VARCHAR OAC for the text cast (#50). Must match the choice in
         # encode_token_rxd.
         if _json_oson_image(Token) is not None:
-            return _JSON_BIND_OAC
+            return _json_bind_oac()
         Token = _json_bind_text(Token)
     elif is_vector_bind(Token):
         # Native VECTOR bind on 23ai (#62): the fixed OAC python-oracledb sends
         # (built above). The image rides in encode_token_rxd.
-        return _VECTOR_BIND_OAC
+        return _vector_bind_oac()
     if isinstance(Token, BinaryFloat):
         return encode_token_raw(TNS_TYPE_BFLOAT, 4, 0, 0, 0)
     if isinstance(Token, BinaryDouble):

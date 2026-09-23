@@ -2934,30 +2934,32 @@ class TestTnsCommandEncodersDict(unittest.TestCase):
 
     def test_native_lob_oac(self):
         # The native JSON (#70) and VECTOR (#62) bind OACs are built field-by-field
-        # by _encode_native_lob_oac; both must stay byte-identical to the
+        # by _encode_native_lob_oac; at 23ai both must stay byte-identical to the
         # python-oracledb capture (§18.1). The two size fields are a non-minimal
         # 4-byte ub4 — VECTOR's 1 MiB keeps its leading zero (04 00100000).
         from seerdb.common.tns import (
-            _JSON_BIND_OAC,
-            _VECTOR_BIND_OAC,
-            _encode_native_lob_oac,
+            _ENCODE_FIELD_VERSION,
+            _json_bind_oac,
+            _vector_bind_oac,
         )
-        from seerdb.common.tns_consts import TNS_TYPE_JSON, TNS_TYPE_VECTOR
+        from seerdb.common.tns_consts import FIELD_VERSION_12_1, FIELD_VERSION_23_4
 
-        self.assertEqual(
-            _JSON_BIND_OAC.hex(),
-            '77010000040200000000040200000000000000040200000000',
-        )
-        self.assertEqual(
-            _VECTOR_BIND_OAC.hex(),
-            '7f010000040010000000040200000000000000040010000000',
-        )
-        self.assertEqual(
-            _encode_native_lob_oac(TNS_TYPE_JSON, 0x02000000), _JSON_BIND_OAC
-        )
-        self.assertEqual(
-            _encode_native_lob_oac(TNS_TYPE_VECTOR, 0x00100000), _VECTOR_BIND_OAC
-        )
+        json_23ai = '77010000040200000000040200000000000000040200000000'
+        vector_23ai = '7f010000040010000000040200000000000000040010000000'
+        token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_23_4)
+        try:
+            self.assertEqual(_json_bind_oac().hex(), json_23ai)
+            self.assertEqual(_vector_bind_oac().hex(), vector_23ai)
+        finally:
+            _ENCODE_FIELD_VERSION.reset(token)
+        # A 12.1 session gets them without the trailing oaccolid: 23ai serves
+        # VECTOR to one, and the extra byte failed every vector bind (#1148).
+        token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_12_1)
+        try:
+            self.assertEqual(_json_bind_oac().hex(), json_23ai[:-2])
+            self.assertEqual(_vector_bind_oac().hex(), vector_23ai[:-2])
+        finally:
+            _ENCODE_FIELD_VERSION.reset(token)
 
     def test_dty_table_12c(self):
         # The 12c+ datatype table must stay byte-identical to python-oracledb
