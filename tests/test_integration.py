@@ -5784,7 +5784,6 @@ class GettypeCurrentSchemaIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        self._skip_if_mirror_backend('postgres', 'describe an object type')
         self._drop_type()
         self.cur.execute(f'CREATE TYPE {self.TYPE} AS OBJECT (id NUMBER)')
         self.owner = self.conn.gettype(self.TYPE).schema
@@ -7727,10 +7726,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
 
     async def test_gettype_follows_the_current_schema(self):
         # Async twin of GettypeCurrentSchemaIntegration.
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest(
-                "the Mirror's postgres backend cannot describe an object type"
-            )
         Typ = 'PYO_ASYNC_CURSCHEMA_T'
         Conn = await seerdb.connect_async(**self._kwargs())
         try:
