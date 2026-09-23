@@ -2126,7 +2126,6 @@ class LastRowidIntegration(_IntegrationBase):
         return [r[0] for r in self.cur.fetchall()]
 
     def test_lastrowid_follows_the_touched_row(self):
-        self._skip_if_mirror_backend('postgres', 'report an Oracle rowid')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, s VARCHAR2(10))')
         self.assertIsNone(self.cur.lastrowid)  # DDL
         self.cur.execute(f"INSERT INTO {self.TABLE} VALUES (1, 'a')")
@@ -2220,8 +2219,11 @@ class PhysicalUrowidIntegration(_IntegrationBase):
         # A UROWID value is tagged 0x01 when it holds a physical rowid; it used to
         # render in the '*' logical form, unlike the same row's ROWID column and
         # unlike python-oracledb.
+        # PostgreSQL writes an UPDATEd row as a new version at a new address, so
+        # the rowid `SET r = ROWID` stores names the version it replaced; an
+        # Oracle ROWID does not move on UPDATE.
         self._skip_if_mirror_backend(
-            'postgres', 'store a rowid in a ROWID / UROWID column'
+            'postgres', 'keep a row at one address across an UPDATE'
         )
         self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, r ROWID, u UROWID)')
         self.cur.execute(f'INSERT INTO {self.TABLE} (n) VALUES (1)')
@@ -5620,8 +5622,6 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
 
     async def test_lastrowid_follows_the_touched_row(self):
         # Async twin of LastRowidIntegration (#1077).
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest("the Mirror's postgres backend cannot report an Oracle rowid")
         Table = 'PYO_ASYNC_LASTROWID'
         Conn = await seerdb.connect_async(**self._kwargs())
         try:
