@@ -45,6 +45,7 @@ from seerdb.common.tns import (
     _ENCODE_FIELD_VERSION,
     _ENCODE_OCI_CALL_SEQ,
     _ENCODE_OER_SEQ,
+    _ENCODE_SERVER_FIELD_VERSION,
     _ENCODE_TXN_IN_PROGRESS,
     _LOB_EMIT_LOG,
     _SERVER_RUNTIME_CAPS,
@@ -493,6 +494,9 @@ def handle_login(
     # bundle, whose DTY does not arrive on its own, and for anything unparseable;
     # the caller then keeps its configured version, as before.
     negotiated = client_field_version(after_pro)
+    # What this Mirror presents stays in force for the fields a server writes
+    # by its own release, whatever the client negotiated (#1145).
+    _ENCODE_SERVER_FIELD_VERSION.set(field_version)
     if negotiated is not None and negotiated != field_version:
         if negotiated < min_field_version:
             raise InterfaceError(
@@ -967,6 +971,7 @@ def serve_session(
         tns_version=tns_version,
         identity=identity,
     )
+    advertised = field_version
     # Serve the session at the version the client actually negotiated, not the
     # one this Mirror advertises. A client above the advertised version comes
     # down to it and was already served; one below it used to be answered in the
@@ -1009,6 +1014,7 @@ def serve_session(
         # backend runs in a copied context, so its own client cannot disturb it.
         _DECODE_FIELD_VERSION.set(field_version)
         _ENCODE_FIELD_VERSION.set(field_version)
+        _ENCODE_SERVER_FIELD_VERSION.set(advertised)
         # Advance the thin path's OER end-to-end sequence once per message, so a
         # session's replies carry a moving counter like a live server's instead
         # of repeating the value the captured statuses were decoded with (#842).

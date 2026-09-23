@@ -1097,6 +1097,33 @@ def test_oer_decodes_back_at_a_12c_field_version(version: int) -> None:
     assert eof[1] == 1403
 
 
+def test_a_mirror_presenting_23ai_writes_the_oer_tail_to_a_lower_session() -> None:
+    # A real 23ai ends the OER with a SQL type and a checksum even to a client
+    # that negotiated 12.2, and the client reads them by the server's release.
+    # A Mirror presenting 23ai has to do the same, or the two disagree on where
+    # the message starts (#1145).
+    from seerdb.common.tns import (
+        _DECODE_SERVER_FIELD_VERSION,
+        _ENCODE_SERVER_FIELD_VERSION,
+        decode_token_oer,
+        encode_error,
+    )
+
+    with _at_field_version(8):
+        e_tok = _ENCODE_SERVER_FIELD_VERSION.set(24)
+        d_tok = _DECODE_SERVER_FIELD_VERSION.set(24)
+        try:
+            error = decode_token_oer(
+                encode_error(942, 'ORA-00942: table or view does not exist'),
+                (0, [], []),
+            )
+        finally:
+            _ENCODE_SERVER_FIELD_VERSION.reset(e_tok)
+            _DECODE_SERVER_FIELD_VERSION.reset(d_tok)
+    assert error[1] == 942
+    assert error[5] == 'ORA-00942: table or view does not exist'
+
+
 def test_describe_roundtrips_to_the_dual_column() -> None:
     # The DUMMY VARCHAR2(1) column of DUAL, encoded then decoded by the client.
     payload = encode_describe(

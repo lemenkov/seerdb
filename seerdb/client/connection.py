@@ -2720,7 +2720,9 @@ class OracleConnect(_ConnectionLogic):
             (Type, Packet) = Received
             if Type != TNS_DATA:
                 raise Exception('Unexpected response type', Type)
-            Result = decode_packet(Packet, Acc, self.field_version)
+            Result = decode_packet(
+                Packet, Acc, self.field_version, self._server_field_version()
+            )
             if Result != FLUSH_OUT_BINDS:
                 return Result
             # A flush-out-binds request, not a result: echo the token back and
@@ -3133,7 +3135,14 @@ class OracleConnect(_ConnectionLogic):
             Body = self._pipeline_recv_response()
             set_decode_dml_rowcounts(False)
             set_decode_return_binds(None)
-            Raw.append(decode_packet(Body, (None, None, [], Bind), self.field_version))
+            Raw.append(
+                decode_packet(
+                    Body,
+                    (None, None, [], Bind),
+                    self.field_version,
+                    self._server_field_version(),
+                )
+            )
         # The end-pipeline message (func 200) draws its own terminating
         # response after the N op responses; read and discard it so the next
         # call on this connection is not left reading a stale packet.

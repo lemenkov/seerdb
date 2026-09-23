@@ -567,12 +567,22 @@ class ReexecuteRequest:
 # value. Default 6 == FIELD_VERSION_11_2 (defined later); decoders only diverge
 # from the 11g layout when this is >= a 12c+ field version.
 _DECODE_FIELD_VERSION = contextvars.ContextVar('decode_field_version', default=6)
+# The field version the server itself advertised, which can be higher than the
+# negotiated one above. None means "the same as the negotiated one" (#1145).
+_DECODE_SERVER_FIELD_VERSION: contextvars.ContextVar[int | None] = (
+    contextvars.ContextVar('decode_server_field_version', default=None)
+)
 
 # Same idea for the *encode* side: the field version of the message currently
 # being built, set by encode_dictionary_exec and read by encode_token_raw to
 # pick the 11g vs 12c+ bind-OAC layout. Separate from the decode var so the two
 # phases never interfere. Default 6 == FIELD_VERSION_11_2.
 _ENCODE_FIELD_VERSION = contextvars.ContextVar('encode_field_version', default=6)
+# The Mirror's side of _DECODE_SERVER_FIELD_VERSION: the version it presents,
+# for the fields a server writes by its own release (#1145).
+_ENCODE_SERVER_FIELD_VERSION: contextvars.ContextVar[int | None] = (
+    contextvars.ContextVar('encode_server_field_version', default=None)
+)
 # The per-session OER end-to-end sequence number for the THIN reply path (#842).
 # A real server advances this diagnostic counter on every reply; the thick/OCI
 # path already does so via _OciSequence, while the thin path emitted the frozen
@@ -759,12 +769,19 @@ FLUSH_OUT_BINDS = (False, 'fob')
 MAX_FLUSH_OUT_BINDS = 4
 
 
-def decode_packet(Data: bytes, Acc: tuple, FieldVersion: int | None = None) -> tuple:
+def decode_packet(
+    Data: bytes,
+    Acc: tuple,
+    FieldVersion: int | None = None,
+    ServerFieldVersion: int | None = None,
+) -> tuple:
     # FieldVersion is passed only by the top-level caller (the connection's
     # response handler); recursive token decoders omit it and inherit the value
-    # via the ContextVar set here.
+    # via the ContextVar set here. ServerFieldVersion likewise: what the server
+    # advertised, for the few fields that follow its release (#1145).
     if FieldVersion is not None:
         _DECODE_FIELD_VERSION.set(FieldVersion)
+        _DECODE_SERVER_FIELD_VERSION.set(ServerFieldVersion)
     # RXD (row data) and BVC (its bit vector) are the only tokens that repeat
     # proportional to the row count. Loop over them here instead of recursing per
     # row, so a large fetch batch cannot overflow Python's recursion limit (a
@@ -1634,11 +1651,16 @@ def _oer_version_tail(ora_code: int, rowcount: int) -> bytes:
     # The fields a 12.1+ client reads between the batch-error arrays and the
     # message (its decode_token_oer): the extended error number and the ub8
     # rowcount, then from 20.1 a SQL type and a server checksum. 11g has none.
+    # The last two follow the release the Mirror PRESENTS, as a real 21c / 23ai
+    # sends them to a client that negotiated lower too (#1145).
     field_version = _ENCODE_FIELD_VERSION.get()
     if field_version < FIELD_VERSION_12_1:
         return b''
     tail = encode_sb4(ora_code) + encode_sb4(rowcount)
-    if field_version >= FIELD_VERSION_20_1:
+    # Never below the negotiated version: a server does not advertise less
+    # than a session agrees on.
+    server_field_version = max(_ENCODE_SERVER_FIELD_VERSION.get() or 0, field_version)
+    if server_field_version >= FIELD_VERSION_20_1:
         tail += encode_sb4(0) + encode_sb4(0)  # sql type, server checksum
     return tail
 
@@ -4304,12 +4326,19 @@ def decode_token_oer(Data: bytes, Acc: tuple) -> tuple:
     # On 11g the trailing message DALC comes right here. 12c+ inserts the
     # extended-precision error number (ub4) and rowcount (ub8) ahead of it, and
     # 20.1+ adds a ub4 sql type + ub4 server checksum (oracledb
-    # _process_error_info). Skip them so the message DALC stays aligned.
+    # _process_error_info). Skip them so the message DALC stays aligned. The
+    # last two follow the SERVER's release, not the negotiated version: 21c
+    # and 23ai send them to a session that negotiated 12.1 as well, and reading
+    # past them by the negotiated version lost every error message (#1145).
     FieldVersion = _DECODE_FIELD_VERSION.get()
+    # A server never advertises less than the session negotiated, so the higher
+    # of the two is its release; that also keeps a value left over from an
+    # earlier session in this context from lowering it.
+    ServerFieldVersion = max(_DECODE_SERVER_FIELD_VERSION.get() or 0, FieldVersion)
     if FieldVersion >= FIELD_VERSION_12_1:
         (_, Rest) = decode_ub4(Rest)  # extended error number
         (_, Rest) = decode_ub4(Rest)  # extended rowcount (ub8)
-        if FieldVersion >= FIELD_VERSION_20_1:
+        if ServerFieldVersion >= FIELD_VERSION_20_1:
             (_, Rest) = decode_ub4(Rest)  # sql type
             (_, Rest) = decode_ub4(Rest)  # server checksum
     Message = None
