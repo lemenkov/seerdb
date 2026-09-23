@@ -1,0 +1,131 @@
+# SPDX-FileCopyrightText: © 2026 Peter Lemenkov
+# SPDX-License-Identifier: CC0-1.0
+
+# python-oracledb's OWN test suite, run against a passthrough Mirror over a real
+# 23ai (#826). This is the independent-client leg of the Mirror conformance
+# matrix: a second implementation writes and reads the bytes, so a shared
+# protocol misunderstanding shows up as a failure instead of passing silently on
+# both sides — which is how the OSON, VECTOR, pipelining and PL/SQL cursor-id
+# gaps were all found.
+#
+# NIGHTLY, not per-PR: the run costs ~8 minutes of live-Oracle time and the suite
+# is a regression net rather than a gate. Promoting it to a PR trigger (filtered
+# to seerdb/server/** and seerdb/common/tns.py) is a small edit when that trade
+# looks worth it.
+#
+# Mirror-over-PostgreSQL is deliberately NOT here: python-oracledb refuses a
+# server reporting below 12.1 (DPY-3010), and that example presents 11.2, so the
+# suite cannot connect at all. Tracked as #1127.
+
+name: oracledb conformance
+
+on:
+  schedule:
+    # 03:30 UTC daily. Nothing depends on the hour; it is simply away from the
+    # push-triggered runs so the two do not contend for the Actions budget.
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  conformance:
+    name: python-oracledb suite (Mirror over Oracle 23ai)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      oracle:
+        image: "gvenzl/oracle-free:23-slim"
+        env:
+          ORACLE_PASSWORD: oracle
+          APP_USER: pyo
+          APP_USER_PASSWORD: pyo123
+        ports:
+          - 1521:1521
+        options: >-
+          --health-cmd healthcheck.sh
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 40
+          --health-start-period 90s
+          --shm-size=2g
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # The suite is pinned to the release whose expectations we measure
+      # against: an unpinned checkout would change the number under us and make
+      # a run's result mean something different from the last one's.
+      - name: Check out python-oracledb's test suite
+        uses: actions/checkout@v7
+        with:
+          repository: oracle/python-oracledb
+          ref: v4.0.1
+          path: python-oracledb
+
+      - name: Install
+        run: pip install . pytest "oracledb==4.0.1"
+
+      # The suite owns its schema: users, tables, packages and types. It is
+      # created DIRECTLY against the database rather than through the Mirror —
+      # this step is setup, not something under test, and going direct keeps a
+      # Mirror bug from looking like a broken fixture.
+      - name: Create the suite's schema
+        working-directory: python-oracledb
+        env:
+          PYO_TEST_CONNECT_STRING: "localhost:1521/FREEPDB1"
+          PYO_TEST_MAIN_USER: pythontest
+          PYO_TEST_MAIN_PASSWORD: pythontest
+          PYO_TEST_PROXY_USER: pythontestproxy
+          PYO_TEST_PROXY_PASSWORD: pythontestproxy
+          PYO_TEST_ADMIN_USER: system
+          PYO_TEST_ADMIN_PASSWORD: oracle
+        run: python -m pytest -q tests/create_schema.py
+
+      # `pyoadm` is the suite's DBA for the tests that read v$session or kill a
+      # session. It is separate from `system` so the suite is not handed more
+      # than it needs.
+      - name: Grant the suite's admin account
+        run: |
+          python - <<'PY'
+          import oracledb
+
+          conn = oracledb.connect(
+              user="system", password="oracle", dsn="localhost:1521/FREEPDB1"
+          )
+          with conn.cursor() as cur:
+              cur.execute("create user pyoadm identified by pyoadm123")
+              cur.execute("grant dba to pyoadm")
+          conn.close()
+          PY
+
+      - name: Run the suite through a passthrough Mirror
+        run: |
+          # The Mirror runs from the checkout (its launcher lives in examples/,
+          # so without PYTHONPATH it would import whatever `pip install .`
+          # shipped) and in the background of this step, so it is torn down with
+          # it.
+          MIRROR_USERS=pythontest:pythontest,pythontestproxy:pythontestproxy,pyoadm:pyoadm123 \
+            PYTHONPATH="$PWD" python examples/mirror_over_oracle.py 1600 \
+              localhost:1521/FREEPDB1 > mirror.log 2>&1 &
+          MIRROR_PID=$!
+          for i in $(seq 1 30); do
+            python -c "import socket; socket.create_connection(('127.0.0.1', 1600), timeout=1).close()" 2>/dev/null && break
+            sleep 1
+          done
+          set +e
+          PYTHONPATH="$PWD" python tools/run_oracledb_suite.py \
+            --suite python-oracledb --dsn 127.0.0.1:1600/FREEPDB1 \
+            -- -p no:randomly --tb=line -rfE
+          STATUS=$?
+          set -e
+          kill "$MIRROR_PID" 2>/dev/null || true
+          exit "$STATUS"
+
+      - name: The Mirror's log, when the suite failed
+        if: failure()
+        run: tail -200 mirror.log
