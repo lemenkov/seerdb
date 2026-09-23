@@ -15,7 +15,11 @@ import unittest
 from replay import ReplaySocket, load_capture, parse_hexdump
 
 from seerdb.common.tns import assemble_packet, decode_packet
-from seerdb.common.tns_consts import TNS_DATA
+from seerdb.common.tns_consts import (
+    FIELD_VERSION_11_2,
+    FIELD_VERSION_12_1,
+    TNS_DATA,
+)
 
 
 class TestParseHexdump(unittest.TestCase):
@@ -107,6 +111,36 @@ class TestUrowidCaptureDecode(unittest.TestCase):
         result = self._decode()
         self.assertEqual(result[1], 1403)
         self.assertEqual(result[5], 'ORA-01403: no data found')
+
+
+class TestAlterSessionCurrentSchemaReplay(unittest.TestCase):
+    # 11g answers ALTER SESSION SET CURRENT_SCHEMA with a return-parameters
+    # block that carries two session-state key/value pairs. Skipping only zero
+    # bytes past the al8o4l words left the first pair's `01` to be read as a
+    # token: "no decoder for response token 1" (#1141).
+    _CAPTURE = load_capture('alter_session_current_schema_11g.hexdump')
+
+    def test_the_key_value_pairs_are_consumed_and_the_call_succeeds(self):
+        (_flag, packet_type, body, rest) = assemble_packet(self._CAPTURE, 8192, False)
+        self.assertEqual(packet_type, TNS_DATA)
+        self.assertEqual(rest, b'')
+        assert body is not None
+        result = decode_packet(body, (None, None, []), FIELD_VERSION_11_2)
+        self.assertEqual(result[1], 0)  # the OER behind the block: success
+
+    def test_a_block_with_no_trailing_fields_still_decodes(self):
+        # A changepassword reply's block is `08 00` and then its OER, with none
+        # of an execute's trailing fields. Reading them regardless took the
+        # OER's own bytes for a length and ran off the end, after the server had
+        # already changed the password. Live 23ai bytes.
+        raw = bytes.fromhex(
+            '0000003106000000200008000401010298e800000000000000000000000000'
+            '00000000000007000000000000000000001d'
+        )
+        (_flag, _type, body, _rest) = assemble_packet(raw, 8192, True)
+        assert body is not None
+        result = decode_packet(body, (None, None, []), FIELD_VERSION_12_1)
+        self.assertEqual(result[1], 0)
 
 
 if __name__ == '__main__':
