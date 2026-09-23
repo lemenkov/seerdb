@@ -15,8 +15,10 @@ import os
 import socket
 import sys
 import threading
+import time
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -26,6 +28,7 @@ from seerdb.server import PacketStream, serve_session
 psycopg = pytest.importorskip('psycopg')
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'examples'))
 from postgres_backend import (  # noqa: E402
+    _DICTIONARY_STAMP,
     _HELPER_FUNCTIONS_DDL,
     _IS_DDL,
     _NO_OP,
@@ -1446,6 +1449,67 @@ def test_dictionary_views_reflect_a_created_table() -> None:
         backend.commit()
     finally:
         backend.close()
+
+
+def _hold_a_dictionary_read() -> Any:
+    # A client mid-transaction that has read a dictionary view: its lock on the
+    # view is what a CREATE OR REPLACE VIEW has to wait for (#1152).
+    holder = psycopg.connect(_CONNINFO)
+    holder.execute('SET search_path TO public, sys, oracle')
+    holder.execute('SELECT count(*) FROM sys.user_tables').fetchone()
+    return holder
+
+
+def _connect_time(deadline: float = 15.0) -> float:
+    # How long a new backend takes to connect -- infinity past `deadline`, so a
+    # regression fails the test rather than hanging it (the holder's rollback
+    # in the caller's `finally` then frees the stuck connect).
+    took: list[float] = []
+
+    def connect() -> None:
+        started = time.monotonic()
+        PostgresBackend(_CONNINFO, credentials=dict(_CREDS)).close()
+        took.append(time.monotonic() - started)
+
+    worker = threading.Thread(target=connect, daemon=True)
+    worker.start()
+    worker.join(deadline)
+    return took[0] if took else float('inf')
+
+
+def test_a_held_dictionary_read_does_not_block_a_new_connection() -> None:
+    # The dictionary is installed once, stamped, and left alone: every connect
+    # used to CREATE OR REPLACE its views, and so waited for any open
+    # transaction that had read one -- a login hang until that client ended
+    # its transaction (#1152).
+    PostgresBackend(_CONNINFO, credentials=dict(_CREDS)).close()  # installed
+    holder = _hold_a_dictionary_read()
+    try:
+        assert _connect_time() < 1.5
+    finally:
+        holder.rollback()
+        holder.close()
+
+
+def test_a_held_read_delays_a_reinstall_but_does_not_hang_it() -> None:
+    # When the views do have to be (re)installed -- a first start, or a seerdb
+    # whose dictionary changed -- a held view makes the install give up after a
+    # short wait; the session carries on with the views already there, and a
+    # later connection installs them.
+    with psycopg.connect(_CONNINFO, autocommit=True) as admin:
+        admin.execute('COMMENT ON SCHEMA sys IS NULL')
+    holder = _hold_a_dictionary_read()
+    try:
+        assert _connect_time() < 10
+    finally:
+        holder.rollback()
+        holder.close()
+    PostgresBackend(_CONNINFO, credentials=dict(_CREDS)).close()
+    with psycopg.connect(_CONNINFO) as check:
+        (stamp,) = check.execute(
+            "SELECT obj_description(to_regnamespace('sys'), 'pg_namespace')"
+        ).fetchone()
+    assert stamp == _DICTIONARY_STAMP
 
 
 def test_dictionary_views_preserve_quoted_identifier_case() -> None:
