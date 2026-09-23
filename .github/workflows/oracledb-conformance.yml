@@ -8,10 +8,13 @@
 # both sides — which is how the OSON, VECTOR, pipelining and PL/SQL cursor-id
 # gaps were all found.
 #
-# NIGHTLY, not per-PR: the run costs ~8 minutes of live-Oracle time and the suite
-# is a regression net rather than a gate. Promoting it to a PR trigger (filtered
-# to seerdb/server/** and seerdb/common/tns.py) is a small edit when that trade
-# looks worth it.
+# WEEKLY, not per-PR and not nightly. The suite is a regression net rather than a
+# gate, and it is expensive here in a way a local run does not suggest: 7m22s on
+# a dedicated bed, but 43m53s on a GitHub runner and still unfinished when the
+# first 45-minute job was killed. The Oracle container, the Mirror and the suite
+# share two cores, so that gap is structural and not something tuning fixes.
+# Once a week keeps the net at a seventh of the budget; `workflow_dispatch` is
+# there for before a release, or after a change to the Mirror or the codec.
 #
 # Mirror-over-PostgreSQL is deliberately NOT here: python-oracledb refuses a
 # server reporting below 12.1 (DPY-3010), and that example presents 11.2, so the
@@ -21,9 +24,9 @@ name: oracledb conformance
 
 on:
   schedule:
-    # 03:30 UTC daily. Nothing depends on the hour; it is simply away from the
-    # push-triggered runs so the two do not contend for the Actions budget.
-    - cron: "30 3 * * *"
+    # 03:30 UTC on Sundays. Nothing depends on the hour or the day; it is simply
+    # away from the push-triggered runs so the two do not contend for the budget.
+    - cron: "30 3 * * 0"
   workflow_dispatch:
 
 concurrency:
@@ -34,7 +37,10 @@ jobs:
   conformance:
     name: python-oracledb suite (Mirror over Oracle 23ai)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 43m53s of suite and still going when the 45-minute cap killed the first
+    # run, so the real figure is unknown and certainly above 45. Generous enough
+    # to find out, and it costs nothing when the run finishes sooner.
+    timeout-minutes: 90
     services:
       oracle:
         image: "gvenzl/oracle-free:23-slim"
