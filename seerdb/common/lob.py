@@ -39,6 +39,12 @@ _DECODED_IMAGE_TYPES = (TNS_TYPE_JSON, TNS_TYPE_VECTOR)
 # python-oracledb hands back the locator (#1101).
 _EXTERNAL_LOB_TYPES = (TNS_TYPE_BFILE,)
 
+# Where a BFILE locator's two names begin, counted from the start of `raw` --
+# so it spans raw's own ub2 inner length and the 14 fixed bytes behind it.
+# Everything before it is the server's header and is never rebuilt; see
+# LOB.setfilename.
+_BFILE_NAMES_OFFSET = 16
+
 _LOCATOR_OVERHEAD = 102
 
 # The mode a LOB OPEN carries in its amount field. Measured against a live 23ai:
@@ -264,6 +270,76 @@ class LOB:
         """Whether this LOB was opened through this object and not yet closed."""
         return self._is_open
 
+    def _require_file(self, what: str):
+        # The three BFILE calls below are meaningless on a CLOB / BLOB, and the
+        # reference client refuses them there rather than answering something
+        # (DPY-3026). A BFILE is the only external LOB: its bytes live in a
+        # server-side DIRECTORY, so it is the only one with a file name at all.
+        if not self.is_file:
+            from seerdb.common.exceptions import NotSupportedError
+
+            raise NotSupportedError(f'{what} is only supported on a BFILE')
+
+    def getfilename(self) -> tuple[str, str]:
+        """The ``(directory, filename)`` pair this BFILE names (#1109).
+
+        Both come out of the locator itself -- the server is not asked -- which
+        is why this answers for a file that does not exist, and for a DIRECTORY
+        that was never created.
+        """
+        self._require_file('getfilename()')
+        parts = self._parse_bfile_locator()
+        if parts is None:
+            from seerdb.common.exceptions import InterfaceError
+
+            raise InterfaceError('this BFILE locator carries no file name')
+        return parts
+
+    def setfilename(self, directory: str, filename: str) -> None:
+        """Point this BFILE at ``directory``/``filename`` (#1109).
+
+        Local: nothing is sent. Whether either name exists is only settled when
+        the file is asked about -- ``fileexists()`` or a read.
+
+        Only the NAMES are replaced. The 16 bytes in front of them are the
+        server's own locator header and are kept verbatim: a locator built from
+        scratch is answered ``ORA-22275: invalid LOB locator specified``, because
+        what makes a locator valid is that the server minted it. Each name rides
+        behind a ub2 length (the same bytes ``_parse_bfile_locator`` reads as a
+        zero separator plus a ub1, which is all a name under 256 bytes needs).
+        """
+        self._require_file('setfilename()')
+        Dir = directory.encode('ascii')
+        File = filename.encode('ascii')
+        if len(Dir) > 0xFFFF or len(File) > 0xFFFF:
+            from seerdb.common.exceptions import DataError
+
+            raise DataError('a BFILE directory or file name is too long')
+        # `raw` opens with the ub2 length of everything after it, so the header
+        # to keep is that prefix plus the 16 fixed bytes, and the prefix is
+        # recomputed for the new names.
+        Body = (
+            self.raw[2:_BFILE_NAMES_OFFSET]
+            + len(Dir).to_bytes(2, 'big')
+            + Dir
+            + len(File).to_bytes(2, 'big')
+            + File
+        )
+        self.raw = len(Body).to_bytes(2, 'big') + Body
+
+    def fileexists(self) -> bool:
+        """Whether the file this BFILE names is there (#1109).
+
+        One ``TTI_LOBOPS`` round-trip (``FILE_EXISTS``). A *directory* that does
+        not exist is not a False -- the server raises ORA-22285 for it, and that
+        reaches the caller, because "there is no such alias" and "the file is
+        missing" are different answers.
+        """
+        self._require_file('fileexists()')
+        from seerdb.common.tns_consts import TNS_LOB_OP_FILE_EXISTS
+
+        return bool(self._operation(TNS_LOB_OP_FILE_EXISTS))
+
     def _require_connection(self):
         if self._connection is None:
             from seerdb.common.exceptions import InterfaceError
@@ -413,6 +489,13 @@ class LOB:
 
         await self._aoperation(TNS_LOB_OP_CLOSE)
         self._is_open = False
+
+    async def afileexists(self) -> bool:
+        """Async equivalent of :meth:`fileexists`."""
+        self._require_file('fileexists()')
+        from seerdb.common.tns_consts import TNS_LOB_OP_FILE_EXISTS
+
+        return bool(await self._aoperation(TNS_LOB_OP_FILE_EXISTS))
 
     async def _aoperation(self, operation: int, amount: int = 0) -> int | None:
         (value, locator) = await self._require_connection().lob_operation(

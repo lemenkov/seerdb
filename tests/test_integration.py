@@ -2322,6 +2322,59 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
         finally:
             Conn.close()
 
+    def test_bfile_methods_on_a_missing_directory(self):
+        # getfilename() answers from the locator, so it works for a file that is
+        # not there and a DIRECTORY that was never created. fileexists() asks
+        # the server, and a missing alias is ORA-22285 rather than False --
+        # "there is no such alias" and "the file is missing" are different
+        # answers (#1109).
+        self._skip_if_mirror_backend('postgres', 'serve a BFILE column')
+        Conn = _connect(fetch_lobs=False)
+        try:
+            Cur = Conn.cursor()
+            Cur.execute(
+                'SELECT BFILENAME(:1, :2) FROM dual',
+                ['PYO_MISSING_DIR', 'pyo_missing_file.txt'],
+            )
+            (Lob,) = Cur.fetchone()
+            self.assertEqual(
+                Lob.getfilename(), ('PYO_MISSING_DIR', 'pyo_missing_file.txt')
+            )
+            with self.assertRaises(seerdb.DatabaseError) as caught:
+                Lob.fileexists()
+            self.assertEqual(caught.exception.code, 22285)
+            # setfilename retargets the locator locally; nothing is sent, so a
+            # name that does not exist is accepted here too.
+            Lob.setfilename('PYO_OTHER_DIR', 'other.txt')
+            self.assertEqual(Lob.getfilename(), ('PYO_OTHER_DIR', 'other.txt'))
+            self.assertEqual(Lob.directory_name, 'PYO_OTHER_DIR')
+            self.assertEqual(Lob.filename, 'other.txt')
+        finally:
+            Conn.close()
+
+    def test_bfile_methods_refuse_a_non_bfile_lob(self):
+        # The three are meaningless on a CLOB / BLOB and are refused there, as
+        # the reference client refuses them (DPY-3026) rather than answering
+        # something (#1109). Needs a temp LOB to have a non-BFILE to refuse, and
+        # CREATE_TEMP is 12c+ -- 11g refuses it (#91), so there is nothing to
+        # build the CLOB / BLOB out of there.
+        self._skip_if_mirror_backend('postgres', 'create a temp LOB')
+        Conn = _connect()
+        if Conn.field_version < FIELD_VERSION_12_1:
+            Conn.close()
+            self.skipTest('createlob() needs a 12c+ server (CREATE_TEMP)')
+        try:
+            for Kind in (seerdb.DB_TYPE_CLOB, seerdb.DB_TYPE_BLOB):
+                Lob = Conn.createlob(Kind)
+                with self.assertRaises(seerdb.NotSupportedError):
+                    Lob.getfilename()
+                with self.assertRaises(seerdb.NotSupportedError):
+                    Lob.setfilename('not_relevant', 'not_relevant')
+                with self.assertRaises(seerdb.NotSupportedError):
+                    Lob.fileexists()
+        finally:
+            Conn.close()
+
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class BindDirectionIntegration(_IntegrationBase):
@@ -6670,6 +6723,30 @@ class BFILEIntegration(unittest.TestCase):
         self.assertEqual(Lob.directory_name, self.dir)
         self.assertEqual(Lob.filename, _BFILE_TEST_FILE)
 
+    def test_bfile_fileexists_against_a_real_directory(self):
+        # The server's own answer for a directory that DOES exist: True for the
+        # file that is there, False for one that is not -- no error either way,
+        # because the alias resolves (#1109). fetch_lobs=False rather than the
+        # monkeypatch the sibling test uses: fileexists() needs the connection,
+        # and stubbing the resolver out is what attaches it.
+        Conn = _connect(fetch_lobs=False)
+        try:
+            Cur = Conn.cursor()
+            Cur.execute(
+                'SELECT BFILENAME(:d, :f) FROM DUAL',
+                {'d': self.dir, 'f': _BFILE_TEST_FILE},
+            )
+            (Lob,) = Cur.fetchone()
+            self.assertEqual(Lob.getfilename(), (self.dir, _BFILE_TEST_FILE))
+            self.assertIs(Lob.fileexists(), True)
+            # ...and the same locator pointed at a file that is not there. The
+            # 16-byte header the server minted is kept, so it stays valid.
+            Lob.setfilename(self.dir, 'pyo_no_such_file.txt')
+            self.assertEqual(Lob.getfilename(), (self.dir, 'pyo_no_such_file.txt'))
+            self.assertIs(Lob.fileexists(), False)
+        finally:
+            Conn.close()
+
 
 @unittest.skipUnless(
     _USER and os.environ.get('SEERDB_TEST_BFILE_DIR'),
@@ -6695,6 +6772,30 @@ class AsyncBFILEIntegration(unittest.IsolatedAsyncioTestCase):
                 )
                 (Got,) = await Cur.fetchone()
                 self.assertEqual(Got, _BFILE_TEST_CONTENT)
+
+    async def test_async_bfile_fileexists(self):
+        # Sync/async parity for the BFILE round-trip (#1109).
+        Dir = os.environ['SEERDB_TEST_BFILE_DIR']
+        async with await seerdb.connect_async(
+            host=_HOST,
+            port=_PORT,
+            user=_USER,
+            password=_PASSWORD,
+            service_name=_SERVICE,
+            autocommit=True,
+            fetch_lobs=False,
+            **_FV_KW,
+        ) as Conn:
+            async with Conn.cursor() as Cur:
+                await Cur.execute(
+                    'SELECT BFILENAME(:d, :f) FROM DUAL',
+                    {'d': Dir, 'f': _BFILE_TEST_FILE},
+                )
+                (Lob,) = await Cur.fetchone()
+                self.assertEqual(Lob.getfilename(), (Dir, _BFILE_TEST_FILE))
+                self.assertIs(await Lob.afileexists(), True)
+                Lob.setfilename(Dir, 'pyo_no_such_file.txt')
+                self.assertIs(await Lob.afileexists(), False)
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
