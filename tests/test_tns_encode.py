@@ -21,6 +21,9 @@ from seerdb.common.tns import (
 )
 from seerdb.common.tns_consts import (
     FIELD_VERSION_9_2,
+    FIELD_VERSION_11_2,
+    FIELD_VERSION_12_1,
+    FIELD_VERSION_12_2,
     TNS_CONNECT,
     TNS_DATA,
     DictionaryType,
@@ -7201,3 +7204,68 @@ class TestBooleanVarBind(unittest.TestCase):
         oac = encode_token_oac(Var(DB_TYPE_BOOLEAN))
         self.assertEqual(oac[0], TNS_TYPE_NUMBER)
         self.assertEqual(oac, encode_token_oac(True))
+
+
+class ArrayDmlRowCountsGate(unittest.TestCase):
+    """The al8i4[9] request bit follows the cursor's own version gate (#1135).
+
+    `cursor.executemany(..., arraydmlrowcounts=True)` raises below 12.1 and is
+    accepted from 12.1 up. The encoder used to set the wire flag only from 12.2,
+    so at 12.1 the call was accepted, the server was never asked, and
+    getarraydmlrowcounts() answered [] -- which reads as "every iteration
+    affected no rows" rather than "you were never asked". python-oracledb gates
+    it by version nowhere at all.
+    """
+
+    def _server_sees_request(self, field_version: int, requested: bool) -> bool:
+        # Read the flag back with the SERVER's parser rather than a hand-rolled
+        # offset: the property under test is that the two sides agree, and
+        # `parse_exec`'s reading of al8i4[9] is itself pinned against a captured
+        # request in test_server_query.py.
+        from seerdb.common.tns import (
+            _DECODE_FIELD_VERSION,
+            _ENCODE_FIELD_VERSION,
+            encode_dictionary_exec,
+            parse_exec,
+        )
+
+        token = _ENCODE_FIELD_VERSION.set(field_version)
+        try:
+            payload = encode_dictionary_exec(
+                {
+                    'seq': 3,
+                    'field_version': field_version,
+                    'query': {
+                        'type': 'change',
+                        'auto': 0,
+                        'fetch': 0,
+                        'server_version': 0,
+                        'cursor': 0,
+                        'query': 'insert into t values (:1)',
+                        'bind': [1],
+                        'batch': [[2], [3]],
+                        'def': [],
+                        'arraydmlrowcounts': requested,
+                    },
+                }
+            )
+        finally:
+            _ENCODE_FIELD_VERSION.reset(token)
+        decode = _DECODE_FIELD_VERSION.set(field_version)
+        try:
+            return parse_exec(payload).arraydmlrowcounts
+        finally:
+            _DECODE_FIELD_VERSION.reset(decode)
+
+    def test_the_flag_is_set_from_12_1(self) -> None:
+        self.assertTrue(self._server_sees_request(FIELD_VERSION_12_1, True))
+        self.assertTrue(self._server_sees_request(FIELD_VERSION_12_2, True))
+
+    def test_the_flag_stays_clear_when_not_asked_for(self) -> None:
+        self.assertFalse(self._server_sees_request(FIELD_VERSION_12_1, False))
+
+    def test_an_11g_execute_never_carries_it(self) -> None:
+        # The cursor raises before reaching the encoder on 11g; the encoder
+        # refusing too means a caller that bypasses the cursor cannot send a
+        # flag an 11.2 server would reject the whole execute over.
+        self.assertFalse(self._server_sees_request(FIELD_VERSION_11_2, True))
