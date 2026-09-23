@@ -573,6 +573,30 @@ def parse_auth_connect_attrs(
     return out
 
 
+def parse_auth_alter_session(
+    payload: bytes, field_version: int = FIELD_VERSION_11_2
+) -> str | None:
+    """The ``ALTER SESSION`` statement a login AUTH carries, or ``None``.
+
+    From 12.1 a client pins the session time zone to its own UTC offset AS IT
+    LOGS IN: ``AUTH_ALTER_SESSION`` holds a complete
+    ``ALTER SESSION SET TIME_ZONE='+hh:mm'`` statement, NUL-terminated, which a
+    real server runs in the new session before answering. Without it the session
+    reports the server's zone for SESSIONTIMEZONE / CURRENT_TIMESTAMP.
+
+    Never raises: a malformed value must not fail an otherwise good login.
+    """
+    try:
+        _subtype, _user, kvs = _parse_fun_auth(payload, field_version)
+    except Exception:  # noqa: BLE001 - a login must not fail over this
+        return None
+    value = kvs.get(b'AUTH_ALTER_SESSION')
+    if not value:
+        return None
+    statement = bytes(value).rstrip(b'\x00').decode('utf-8', 'replace').strip()
+    return statement or None
+
+
 def parse_auth_new_password(
     payload: bytes, field_version: int = FIELD_VERSION_11_2
 ) -> bytes | None:

@@ -266,6 +266,85 @@ def test_live_seerdb_login_at_a_higher_field_version(version: int) -> None:
     assert result.get('user') == 'PYO'
 
 
+class _AlterSessionBackend(_DualBackend):
+    """Records the ALTER SESSION a client sends with its login; optionally
+    refuses it, to show a refusal never fails the login."""
+
+    def __init__(self, refuse: bool = False) -> None:
+        super().__init__()
+        self.statements: list[str] = []
+        self.refuse = refuse
+
+    def alter_session(self, statement: str) -> None:
+        self.statements.append(statement)
+        if self.refuse:
+            raise RuntimeError('refused')
+
+
+def _login_with(backend: _DualBackend, version: int) -> dict:
+    # Serve one real seerdb login at `version` against `backend`, and run one
+    # query so the session is known to be usable.
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    result: dict = {}
+
+    def serve() -> None:
+        conn, _ = listen.accept()
+        try:
+            result['user'] = serve_session(
+                PacketStream(conn), backend, field_version=version
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced to the test thread
+            result['error'] = exc
+        finally:
+            conn.close()
+
+    server = threading.Thread(target=serve, daemon=True)
+    server.start()
+    conn = seerdb.connect(
+        host='127.0.0.1',
+        port=listen.getsockname()[1],
+        user='PYO',
+        password='pyo123',
+        service_name='XE',
+        timeout=5000,
+    )
+    try:
+        cursor = conn.cursor()
+        cursor.execute('select * from dual')
+        result['row'] = cursor.fetchone()
+    finally:
+        conn.close()
+        server.join(timeout=5)
+        listen.close()
+    return result
+
+
+@pytest.mark.parametrize('version', [6, 7, 8, 17])  # 11.2, 12.1, 12.2, 23ai
+def test_the_login_time_zone_reaches_the_backend(version: int) -> None:
+    # From 12.1 a client pins the session time zone to its own UTC offset in the
+    # login AUTH (AUTH_ALTER_SESSION); the Mirror hands that statement to the
+    # backend's alter_session hook. An 11.2 client sends none.
+    backend = _AlterSessionBackend()
+    result = _login_with(backend, version)
+    assert result['row'] == ('X',)
+    if version < 7:
+        assert backend.statements == []
+    else:
+        (statement,) = backend.statements
+        assert statement.startswith("ALTER SESSION SET TIME_ZONE='")
+        assert not statement.endswith('\x00')
+
+
+def test_a_refused_login_time_zone_does_not_fail_the_login() -> None:
+    backend = _AlterSessionBackend(refuse=True)
+    result = _login_with(backend, 7)
+    assert len(backend.statements) == 1
+    assert result['row'] == ('X',)
+
+
 class _Present12cBackend(_DualBackend):
     # Declares a server identity (12.1) independent of its wire field version, which
     # stays the 11.2 default -- the decoupling a PostgreSQL-backed Mirror uses to get
