@@ -101,3 +101,51 @@ def test_plsql_without_assignments_stays_a_noop() -> None:
         'BEGIN DBMS_OUTPUT.DISABLE; END;'
     )
     assert result.out_binds == []
+
+
+def test_a_hook_the_backend_lacks_stays_absent_through_the_wrapper() -> None:
+    # The absence has to survive the wrapper too. The Mirror decides whether a
+    # capability exists with `getattr(backend, hook, None)`, so a wrapper that
+    # answered with a method existing only to refuse would turn "this backend
+    # cannot" into an error where the Mirror has a perfectly good fallback.
+    wrapper = OracleCompatBackend(_FakeInner())
+    assert getattr(wrapper, 'set_end_to_end', None) is None
+    assert getattr(wrapper, 'execute_many_rowcounts', None) is None
+
+
+def test_the_wrapper_forwards_every_hook_the_mirror_probes_for() -> None:
+    # The Mirror discovers a backend's OPTIONAL capabilities with
+    # `getattr(backend, '<hook>', None)` -- on the backend it was handed, which
+    # for the PostgreSQL and SQLite examples is this wrapper. A hook the wrapper
+    # does not name is therefore invisible however well the backend beneath
+    # implements it, and it fails SILENTLY: the Mirror simply concludes the
+    # capability is absent.
+    #
+    # The list is derived from the Mirror's own source rather than written out
+    # here, so this test fails the next time a hook is added to the server
+    # without the wrapper passing it on.
+    import re
+    from pathlib import Path
+
+    server = Path(__file__).resolve().parent.parent / 'seerdb' / 'server'
+    probed = set()
+    for module in server.glob('*.py'):
+        probed |= set(
+            re.findall(r"getattr\(\s*backend,\s*'([a-z_]+)'", module.read_text())
+        )
+    assert probed, 'found no getattr(backend, ...) probes -- has the idiom moved?'
+
+    class _Everything(_FakeInner):
+        pass
+
+    # Give the inner backend every hook the Mirror looks for, then check the
+    # wrapper exposes each one.
+    for hook in probed:
+        setattr(_Everything, hook, lambda self, *a, **k: None)
+    wrapper = OracleCompatBackend(_Everything())
+    missing = sorted(h for h in probed if getattr(wrapper, h, None) is None)
+    assert not missing, (
+        f'OracleCompatBackend drops optional hooks the Mirror probes for: '
+        f'{missing}. Add a delegating method for each -- the Mirror will '
+        f'otherwise treat the capability as absent, with no error anywhere.'
+    )
