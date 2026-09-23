@@ -29,8 +29,24 @@ TNS_GSO_CAN_RECV_ATTENTION = 0x0400
 # 4-byte ("large") packet length, and a >= 318 server's ACCEPT carries an
 # extended flags2 word whose HAS_END_OF_RESPONSE bit lets the client opt into the
 # end-of-response framing that pipelining (#132) needs.
-TNS_VERSION_MIN_LARGE_SDU = 315  # 4-byte packet length from here up
-TNS_VERSION_MIN_OOB_CHECK = 318  # accept carries the extended flags2
+# The TNS protocol version each Oracle release answers with. A server reports one
+# of these in its ACCEPT, and a client refuses a server below the version it
+# needs -- python-oracledb will not talk to anything under 315 at all.
+TNS_VERSION_11_2 = 314
+TNS_VERSION_12_1 = 315
+TNS_VERSION_12_2 = 316
+TNS_VERSION_21_1 = 318
+TNS_VERSION_23_1 = 319
+
+# The capability thresholds ARE those releases, not numbers that happen to match
+# them: the 4-byte packet length arrived in 12.1 and the extended flags2 word in
+# 21.1. Writing them as aliases says so. It used to be written twice -- the
+# releases here under capability names and again in server/handshake.py under
+# release names -- and the cost was not cosmetic: `server_tns_version` could not
+# see 315 as a release, so a Mirror asked for a 12.1 identity answered 314 and no
+# modern thin client would connect to it (#1131).
+TNS_VERSION_MIN_LARGE_SDU = TNS_VERSION_12_1  # 4-byte packet length from here up
+TNS_VERSION_MIN_OOB_CHECK = TNS_VERSION_21_1  # accept carries the extended flags2
 TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE = 0x02000000
 TNS_CCAP_END_OF_RESPONSE = 0x20  # CCAP_TTC4 opt-in bit (#155/#132)
 TTI_END_OF_RESPONSE = 29  # per-response terminator marker

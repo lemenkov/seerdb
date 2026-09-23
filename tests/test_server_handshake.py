@@ -33,11 +33,13 @@ from seerdb.common.tns_consts import (
     TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE,
     TNS_DATA,
     TNS_VERSION_MIN_LARGE_SDU,
+    TNS_VERSION_MIN_OOB_CHECK,
     TTI_DTY,
     TTI_PRO,
 )
 from seerdb.server.handshake import (
     TNS_VERSION_11_2,
+    TNS_VERSION_12_1,
     TNS_VERSION_12_2,
     TNS_VERSION_21_1,
     TNS_VERSION_23_1,
@@ -259,7 +261,14 @@ def test_protocol_version_follows_the_field_version() -> None:
     describe a server that does not exist.
     """
     assert server_tns_version(FIELD_VERSION_11_2) == TNS_VERSION_11_2
-    assert server_tns_version(FIELD_VERSION_12_1) == TNS_VERSION_11_2
+    # 12.1 answers 315, not 314. This line asserted 314 until #1131: the release
+    # constants lived in handshake.py and the capability thresholds in
+    # tns_consts.py, so 315 was present only as TNS_VERSION_MIN_LARGE_SDU and
+    # `server_tns_version` could not see it as a tier -- 12.1 fell through to
+    # 11.2's 314. A Mirror asked for a 12.1 identity then answered 314, and
+    # python-oracledb refuses anything below 315 outright (DPY-3010), so no
+    # modern thin client would connect to it.
+    assert server_tns_version(FIELD_VERSION_12_1) == TNS_VERSION_12_1
     assert server_tns_version(FIELD_VERSION_12_2) == TNS_VERSION_12_2
     # The same argument one tier up: a Mirror presenting 21c or 23ai must frame
     # like one, not fall back to 12.2's 316 (#823). 318 and 319 are captured off
@@ -267,6 +276,36 @@ def test_protocol_version_follows_the_field_version() -> None:
     assert server_tns_version(FIELD_VERSION_21_1) == TNS_VERSION_21_1
     assert server_tns_version(FIELD_VERSION_23_1) == TNS_VERSION_23_1
     assert server_tns_version(FIELD_VERSION_23_4) == TNS_VERSION_23_1
+
+
+def test_every_field_version_tier_has_its_own_protocol_version() -> None:
+    """No tier may silently fall through to a lower release's framing (#1131).
+
+    The specific way this went wrong is worth pinning rather than just fixing:
+    12.1's protocol version, 315, WAS in the codebase -- spelled
+    ``TNS_VERSION_MIN_LARGE_SDU``, because 12.1 is the release that introduced
+    the 4-byte packet length. Written under a capability name in one module and
+    the release names in another, nothing connected the two, so the tier table
+    skipped straight from 11.2 to 12.2 and a 12.1 Mirror answered 314.
+
+    Reading the table as a whole catches that: a version that falls through
+    shows up as a duplicate, and a strictly increasing table has none.
+    """
+    tiers = [
+        (FIELD_VERSION_11_2, TNS_VERSION_11_2),
+        (FIELD_VERSION_12_1, TNS_VERSION_12_1),
+        (FIELD_VERSION_12_2, TNS_VERSION_12_2),
+        (FIELD_VERSION_21_1, TNS_VERSION_21_1),
+        (FIELD_VERSION_23_1, TNS_VERSION_23_1),
+    ]
+    answered = [server_tns_version(fv) for fv, _ in tiers]
+    assert answered == [tns for _, tns in tiers]
+    # Strictly increasing: equal neighbours would mean one release borrowing
+    # another's framing, which is the fall-through this test exists to stop.
+    assert all(a < b for a, b in zip(answered, answered[1:]))
+    # And the aliases still say what they mean.
+    assert TNS_VERSION_MIN_LARGE_SDU == TNS_VERSION_12_1
+    assert TNS_VERSION_MIN_OOB_CHECK == TNS_VERSION_21_1
 
 
 def test_a_12_2_mirror_is_large_sdu_without_being_asked() -> None:
