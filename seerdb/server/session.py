@@ -183,6 +183,7 @@ from seerdb.server.auth import (
     find_fast_auth_osesskey,
     is_token_auth,
     make_challenge,
+    parse_auth_alter_session,
     parse_auth_app_context,
     parse_auth_connect_attrs,
     parse_auth_new_password,
@@ -663,6 +664,20 @@ def handle_login(
                 apply_ctx(entries)
             except Exception as exc:  # noqa: BLE001 - never fail a good login
                 logger.info('application context refused: %s', exc)
+
+    # The session settings the client asked for as it logged in -- from 12.1 the
+    # time zone pinned to its own UTC offset. A real server runs the statement in
+    # the new session before it answers, so SESSIONTIMEZONE reflects the client
+    # from the first query. A backend without the hook keeps its own zone; a
+    # refusal is logged, never a failed login.
+    if not sqlplus:
+        statement = parse_auth_alter_session(auth_body, field_version)
+        alter_session = getattr(backend, 'alter_session', None)
+        if statement and alter_session is not None:
+            try:
+                alter_session(statement)
+            except Exception as exc:  # noqa: BLE001 - never fail a good login
+                logger.info('login ALTER SESSION refused: %s', exc)
     if not sqlplus and new_password_cipher:
         _apply_new_password(backend, user, secret, conn_key, new_password_cipher)
     if sqlplus:

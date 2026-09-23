@@ -641,3 +641,54 @@ def test_both_connections_take_the_same_identity_arguments() -> None:
     for cls in (OracleConnect, AsyncOracleConnect):
         params = set(inspect.signature(cls.__init__).parameters)
         assert wanted <= params, cls.__name__
+
+
+def test_parse_auth_alter_session_finds_the_login_time_zone() -> None:
+    # From 12.1 the client pins the session time zone to its own UTC offset in
+    # the login AUTH itself (AUTH_ALTER_SESSION). The Mirror read the proof and
+    # dropped the statement, so SESSIONTIMEZONE reported the backend's zone.
+    # Built by the client's own encoder: the key/value framing is under test.
+    from seerdb.common.tns import _local_tz_clause
+    from seerdb.common.tns_consts import FIELD_VERSION_12_1
+    from seerdb.server.auth import parse_auth_alter_session
+
+    challenge = make_challenge(b'pyo123')
+    request, _ = encode_dictionary_auth(
+        {
+            'seq': 1,
+            'field_version': FIELD_VERSION_12_1,
+            'auth': {
+                'sess': challenge.auth_sesskey,
+                'salt': challenge.salt,
+                'derived_salt': None,
+            },
+            'env': {'user': 'PYO', 'password': 'pyo123'},
+        }
+    )
+    statement = parse_auth_alter_session(request, FIELD_VERSION_12_1)
+    # The trailing NUL the client terminates it with is not part of the SQL.
+    assert statement == _local_tz_clause().rstrip(b'\x00').decode()
+    assert statement.startswith("ALTER SESSION SET TIME_ZONE='")
+
+
+def test_parse_auth_alter_session_is_quiet_when_there_is_none() -> None:
+    # Before 12.1 the client sends no such pair, and a malformed body must not
+    # turn a good login into a failed one.
+    from seerdb.server.auth import parse_auth_alter_session
+
+    challenge = make_challenge(b'pyo123')
+    request, _ = encode_dictionary_auth(
+        {
+            'seq': 1,
+            'field_version': 6,
+            'auth': {
+                'sess': challenge.auth_sesskey,
+                'salt': challenge.salt,
+                'derived_salt': None,
+            },
+            'env': {'user': 'PYO', 'password': 'pyo123'},
+        }
+    )
+    assert parse_auth_alter_session(request) is None
+    assert parse_auth_alter_session(b'') is None
+    assert parse_auth_alter_session(b'\x03\x73\x01garbage') is None
