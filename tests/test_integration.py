@@ -873,6 +873,13 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute('SELECT sessiontimezone FROM dual')
         self.assertEqual(self.cur.fetchone()[0].strip(), expected)
 
+    def test_a_session_setting_answers_with_no_result_set(self):
+        # ALTER SESSION is not a query: a server answers it with a status and no
+        # rows. A backend that stood a `SELECT 1` in for one answered with a row,
+        # which seerdb let pass and the reference thin client failed on.
+        self.cur.execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '.,'")
+        self.assertIsNone(self.cur.description)
+
     def test_alter_session_current_schema_round_trips(self):
         # 11g answers this with a return-parameters block that carries the
         # session-state change as key/value pairs; reading past them only by
@@ -5735,6 +5742,16 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                 await Conn.cursor().execute("SELECT TO_NUMBER('x') FROM dual")
             self.assertEqual(ctx.exception.code, 1722)
             self.assertIn('ORA-01722', str(ctx.exception))
+        finally:
+            await Conn.close()
+
+    async def test_a_session_setting_answers_with_no_result_set(self):
+        # Async twin of CursorIntegration's.
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            await Cur.execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '.,'")
+            self.assertIsNone(Cur.description)
         finally:
             await Conn.close()
 

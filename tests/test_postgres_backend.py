@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'examples'))
 from postgres_backend import (  # noqa: E402
     _HELPER_FUNCTIONS_DDL,
     _IS_DDL,
+    _NO_OP,
     _REF_SELECT,
     OraInterval,
     PostgresBackend,
@@ -443,7 +444,7 @@ def test_translate_admin_maps_session_user_and_index() -> None:
         _translate_admin('CREATE USER test_schema IDENTIFIED BY secret')
         == 'CREATE SCHEMA IF NOT EXISTS test_schema'
     )
-    assert _translate_admin('GRANT CREATE SESSION TO test_schema') == 'SELECT 1'
+    assert _translate_admin('GRANT CREATE SESSION TO test_schema') == _NO_OP
     assert (
         _translate_admin('CREATE INDEX test_schema.ix1 ON test_schema.t (c)')
         == 'CREATE INDEX ix1 ON test_schema.t (c)'

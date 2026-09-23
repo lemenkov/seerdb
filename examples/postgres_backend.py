@@ -946,8 +946,17 @@ def _translate_admin(sql: str) -> str:
         # PostgreSQL puts the index in the table's schema and rejects the prefix.
         return m.group(1) + m.group(2)
     if _ADMIN_NOOP.match(sql):
-        return 'SELECT 1'  # no PostgreSQL equivalent — succeed and do nothing
+        # No PostgreSQL equivalent: succeed and do nothing -- and return nothing.
+        # A `SELECT 1` here answered a GRANT or an ALTER SESSION with a row, which
+        # a real server never does; seerdb's client let it pass, but the
+        # reference thin client decoded the row against a statement it expected
+        # none from and failed with a TypeError.
+        return _NO_OP
     return sql
+
+
+# A statement PostgreSQL runs to no effect and answers with no result set.
+_NO_OP = 'DO $$ BEGIN END $$'
 
 
 # Oracle's negative / unbounded / caching keywords in CREATE/ALTER SEQUENCE are
