@@ -2322,12 +2322,21 @@ def _answer_bfile(
         # exist -- is what the client is asking for, so relay it.
         stream.write_packet(TNS_DATA, encode_error(err.ora_code, err.ora_message))
         return
+    # The two boolean answers echo the locator FIELD, not the locator: the client
+    # reads `len(locator)` raw bytes and then one ub1, and a BFILE locator's
+    # length includes its own leading ub2 (§14.4d). `parse_lobops_request` hands
+    # a BFILE op its locator with that ub2 stripped, and `encode_lobops_is_open`
+    # echoes verbatim by design -- so the field came out two bytes short and the
+    # client read the boolean from inside the locator, reporting a file that is
+    # there as missing (#1120). FILE_OPEN / FILE_CLOSE below are unaffected:
+    # `encode_lobops_ack` re-adds the prefix itself.
+    field = len(request.locator).to_bytes(2, 'big') + request.locator
     if request.kind == 'file_exists':
-        stream.write_packet(TNS_DATA, encode_lobops_is_open(request.locator, present))
+        stream.write_packet(TNS_DATA, encode_lobops_is_open(field, present))
         return
     if request.kind == 'file_isopen':
         # Nothing is held open between calls, so it never reports open.
-        stream.write_packet(TNS_DATA, encode_lobops_is_open(request.locator, False))
+        stream.write_packet(TNS_DATA, encode_lobops_is_open(field, False))
         return
     if request.kind == 'file_open' and not present:
         stream.write_packet(

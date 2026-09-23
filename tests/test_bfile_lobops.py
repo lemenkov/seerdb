@@ -71,3 +71,74 @@ class BfileLobopsEncode(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BfileFileExistsReply(unittest.TestCase):
+    """The Mirror's answer to FILE_EXISTS (#1120).
+
+    The reference client reads ``len(locator)`` raw bytes and then ONE ub1::
+
+        if self.operation in (TNS_LOB_OP_IS_OPEN, TNS_LOB_OP_FILE_EXISTS,
+                              TNS_LOB_OP_FILE_ISOPEN):
+            buf.read_ub1(&temp8)
+            self.bool_flag = temp8 > 0
+
+    and a BFILE locator's length includes its own leading ub2 -- so the reply
+    owes the whole FIELD, not the body inside it. Short by those two bytes, the
+    boolean is read from inside the locator: our own client reported a file that
+    is there as missing, and python-oracledb desynced outright with
+    ``DPY-5000: unknown protocol message type 1 at position 68``.
+    """
+
+    # A real FILE_EXISTS request, captured off python-oracledb 4.0.1 asking a
+    # live 23ai about PYO_BFILE_DIR/pyoracle_bfile_test.txt.
+    REQUEST = bytes.fromhex(
+        '03600500010138000000000000010208000000000000000000000000003600010808'
+        '00000001000000000000000d50594f5f4246494c455f444952001770796f7261636c'
+        '655f6266696c655f746573742e747874'
+    )
+
+    def _reply(self, present: bool) -> bytes:
+        from typing import Any
+
+        from seerdb.common.tns import _DECODE_FIELD_VERSION, parse_lobops_request
+        from seerdb.server.session import _answer_bfile
+
+        class _Backend:
+            def bfile_exists(self, directory, filename):
+                return present
+
+        class _Stream:
+            def __init__(self):
+                self.body = b''
+
+            def write_packet(self, kind, body):
+                self.body = body
+
+        token = _DECODE_FIELD_VERSION.set(24)
+        try:
+            request = parse_lobops_request(self.REQUEST)
+            self.assertEqual(request.kind, 'file_exists')
+            stream: Any = _Stream()
+            backend: Any = _Backend()
+            _answer_bfile(stream, backend, request)
+            return stream.body
+        finally:
+            _DECODE_FIELD_VERSION.reset(token)
+
+    def test_the_locator_field_is_echoed_whole(self):
+        # 54 bytes of locator arrive behind their own ub2, so 56 go back -- and
+        # the flag is the byte after all 56.
+        from seerdb.common.tns_consts import TTI_RPA
+
+        body = self._reply(True)
+        self.assertEqual(body[0], TTI_RPA)
+        field = self.REQUEST[-56:]
+        self.assertEqual(field[:2], b'\x00\x36')  # the locator's own ub2
+        self.assertEqual(body[1:57], field)
+        self.assertEqual(body[57], 1)
+
+    def test_a_missing_file_answers_zero_in_the_same_place(self):
+        body = self._reply(False)
+        self.assertEqual(body[1:57], self.REQUEST[-56:])
+        self.assertEqual(body[57], 0)
