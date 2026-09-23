@@ -750,6 +750,17 @@ pre-11g describe layout (§6.4) and the unsalted DES auth (§4.4) — so a singl
 build speaks 10g through 23ai. (Reference field versions: 10.2 = 4, 11.2 = 6,
 12.1 = 7, 12.2 = 8, 19c = 12, 21c = 16, 23ai = 17, fast-auth-max = 24.)
 
+**Which "12c" layouts start at 12.1 and which at 12.2 (#1144).** A client that
+negotiates 12.1 (7) — a real 12.1 client against any newer server — gets the
+12c forms of the execute tail's array-DML block (§5.1), the one-byte describe
+scale (§6), the bind OAC (§5.1) and `ub4` chunk lengths (§6.4). Only the
+execute's SQL-signature pointers and the `oaccolid` of describe and bind
+metadata wait for 12.2 (8). seerdb had gated all of them on 12.2, and no testbed
+ever negotiates 7, so it went unseen until the Mirror advertised 12.1: forced
+to 7 against 23ai, 409 of 454 integration tests failed, 406 with `ORA-03120`.
+Forcing a lower version against a newer server (`SEERDB_TEST_FIELD_VERSION=7`)
+is the way to test it, since that is exactly what a real 12.1 client does.
+
 > **Oracle 26ai advertises field version 27 (#458).** The
 > `container-registry.oracle.com/database/free:latest` image — branded **26ai**
 > (`ORACLE_HOME=.../26ai/dbhomeFree`), though the engine still reports
@@ -1452,12 +1463,15 @@ Mirror's `decode_oac_fields` reads the two-length form and pairs the OID with th
 REF locator (the bind value, a plain DALC) to rebuild the `DbRef` the backend
 re-binds (#139).
 
-The layout above is the 11g form. 12c+ (field version >= 12.2,
+The layout above is the 11g form. 12c+ (field version >= 12.1,
 `encode_token_raw`) uses oracledb's `_write_column_metadata` layout instead:
 a fixed flag byte (`TNS_BIND_USE_INDICATORS = 1`), `ContFlags` as a `ub8`, an
 `OID`/`Version`, the bind charset as a `ub2` (AL32UTF8 = 873 for char binds,
-0 otherwise), the `CharsetForm` byte, a LOB-prefetch length, and a trailing
-`oaccolid` `ub4`. Sending the 11g OAC to a 12c server is rejected with
+0 otherwise), the `CharsetForm` byte, a LOB-prefetch length, and — from 12.2
+only — a trailing `oaccolid` `ub4`. A 12.1 session sent the `oaccolid` answers
+`ORA-03106`; one sent the 11g layout, `ORA-03120` (#1144). The hand-built OACs
+(LOB, object, REF) follow the same rule, except that below 12.1 the LOB one
+keeps the trailing field it has always carried. Sending the 11g OAC to a 12c server is rejected with
 `ORA-03115` (unsupported network datatype). The bind *value* (TTI_RXD) is the
 same in both, except long values use the version-gated `bytes_with_length`
 chunking described in §6.4 (`encode_chr`): 11g chunks anything over 64 bytes
@@ -2289,9 +2303,9 @@ seerdb gates both on `field_version >= FIELD_VERSION_11_2` (#84/#85),
 reverse-engineered by diffing 1/2/6-column, mixed-type and 0-row describes from a
 live 10.2.0.5 server against the identical 11g responses.
 
-12c+ (field version >= 12.2) differs from 11g in the per-column block:
+12c+ differs from 11g in the per-column block: from 12.1 (field version 7)
 scale is `sb1` (a raw signed byte) rather than 11g's variable-length
-sb4, and an extra `oaccolid` ub4 follows `max_size`. seerdb decodes
+sb4, and from 12.2 an extra `oaccolid` ub4 follows `max_size` (#1144). seerdb decodes
 all three (10g / 11g / 12c+), gated on the negotiated TTC field version
 (§4.2): the response handler passes `connection.field_version` into
 `decode_packet`, which publishes it (via a `ContextVar`) to the token
@@ -6443,7 +6457,7 @@ elements are out of scope).
 
 
 The Mirror reads the same forms (#743): the capacity off the OAC (the ARRAY flag
-and max-array-size field of the 12.2+ layout, the second flag word and trailing
+and max-array-size field of the 12.1+ layout, the second flag word and trailing
 field of the 11g one), the value as its count and elements, and it answers an
 OUT array with the count and one value plus return code per element.
 

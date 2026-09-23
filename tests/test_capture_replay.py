@@ -168,5 +168,32 @@ class TestOerTailFollowsTheServerRelease(unittest.TestCase):
         self.assertTrue(result[5].startswith('ORA-01722: unable to convert'))
 
 
+class TestTwelveOneQueryReplay(unittest.TestCase):
+    # A live 23ai reply to `SELECT CAST(12.34 AS NUMBER(5,2)) AS n, 'abc' AS s
+    # FROM dual` in a session that negotiated 12.1 (7): a describe, one row and
+    # the end-of-fetch OER. The describe already carries the one-byte scale of
+    # the 12c layout but not yet the 12.2 oaccolid; decoded as 11g or as 12.2,
+    # the second column desyncs (#1144).
+    _REPLY = bytes.fromhex(
+        '10170f5a3945b1fb23d02169ce288349a8e7787e091713211701190102590200050201'
+        '160000000000000001010101014e00000000608000000103000000000203690101030101'
+        '010101530000010100010707787e091713211700021fe80102010200062201020001640000'
+        '000703c10d230361626308010604018fe5f7000101000000000000040101021'
+        '1a9010102057b00000101013803000000000000000000000000060001010000000002057b'
+        '0101010300194f52412d30313430333a206e6f206461746120666f756e640a1d'
+    )
+
+    def test_describe_and_row_decode_at_field_version_7(self):
+        result = decode_packet(
+            self._REPLY, (None, None, []), FIELD_VERSION_12_1, FIELD_VERSION_23_4
+        )
+        columns = result[3][1]
+        self.assertEqual([c['column_name'] for c in columns], [b'N', b'S'])
+        self.assertEqual(columns[0]['data_scale'], 2)
+        self.assertEqual(len(result[4]), 1)
+        self.assertEqual(result[4][0][1], 'abc')
+        self.assertEqual(result[1], 1403)
+
+
 if __name__ == '__main__':
     unittest.main()
