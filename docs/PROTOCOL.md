@@ -96,6 +96,25 @@ Messages larger than the Session Data Unit (SDU) are split across multiple TNS_D
 - All fragments except the last have Data Flags set to `0x0020`.
 - The last fragment has Data Flags set to `0x0000`.
 
+> **The reference thin client does NOT flag its fragments** (#968). That rule
+> describes what *seerdb* sends, not what arrives. Captured from
+> python-oracledb 4.0.1 connecting with `sdu=803`, its DATA_TYPES message goes
+> out as four packets and every one of them carries `0x0000`:
+>
+> ```
+> size=803 type=6 data_flags=0000     <- non-final, unflagged
+> size=802 type=6 data_flags=0000     <- non-final, unflagged
+> size=802 type=6 data_flags=0000     <- non-final, unflagged
+> size=453 type=6 data_flags=0000     <- final
+> ```
+>
+> So a server cannot find the end of an inbound message from the flags: it is
+> expected to know the message's own structure. Nor can it find it by size — the
+> client flushes as soon as the next *field* will not fit, so a non-final
+> fragment can stop a byte or two short of the SDU (note the 803 / 802 above).
+> Anything that reassembles an inbound message has to reason about the message,
+> not the framing.
+
 **Server -> client** (responses we receive):
 
 - The server does **not** flag fragments at all — Data Flags are `0x0000` on

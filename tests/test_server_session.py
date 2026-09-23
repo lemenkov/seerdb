@@ -139,6 +139,42 @@ def test_live_seerdb_login() -> None:
     assert result.get('user') == 'PYO'
 
 
+def test_login_steps_over_a_split_data_types_message() -> None:
+    # A client splits a message at the negotiated SDU, and the modern
+    # DATA_TYPES table is ~2642 bytes -- so every SDU below about 2650 cuts the
+    # DTY into two packets or more. The Mirror answered the first half and then
+    # read the REMAINDER as the OSESSKEY that should have followed, which the
+    # client saw as DPY-4011 (#968).
+    #
+    # The tail here is a REAL DTY, sliced where a 1024-byte SDU would cut it.
+    from seerdb.common.tns import _ENCODE_FIELD_VERSION, encode_dictionary_dty
+    from seerdb.common.tns_consts import TNS_DATA, TTI_FUN
+    from seerdb.server.session import _expect_login_message
+
+    token = _ENCODE_FIELD_VERSION.set(24)
+    try:
+        dty = encode_dictionary_dty({'req': 'AL32UTF8', 'seq': 1, 'field_version': 24})
+    finally:
+        _ENCODE_FIELD_VERSION.reset(token)
+    tail = dty[1014:]  # what a second packet would carry at sdu=1024
+    assert tail[:1] != bytes([TTI_FUN])  # ...and it is not mistakable for one
+    osesskey = bytes([TTI_FUN, 0x76]) + b'\x00' * 8
+
+    class _Stream:
+        def __init__(self, packets):
+            self.packets = list(packets)
+
+        def read_packet(self):
+            return (TNS_DATA, self.packets.pop(0))
+
+    stream: Any = _Stream([tail, osesskey])
+    assert _expect_login_message(stream, 'OSESSKEY') == osesskey
+    # A login that was NOT split still costs exactly one read.
+    stream = _Stream([osesskey])
+    assert _expect_login_message(stream, 'OSESSKEY') == osesskey
+    assert stream.packets == []
+
+
 def _run_mirror_session(listen: socket.socket, result: dict) -> None:
     conn, _ = listen.accept()
     try:

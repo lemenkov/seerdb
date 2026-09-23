@@ -236,6 +236,41 @@ _INTERNAL_ERROR = 600
 _ALL_ROWS = 2**31
 
 
+# How many leftover packets the Mirror will step over while looking for the
+# message that should follow the DTY. A DTY is ~2.6 KiB and the smallest SDU a
+# client may negotiate is 512, so six fragments is already the worst case; the
+# cap exists so a client sending something else entirely still fails fast.
+_LOGIN_MAX_CONTINUATIONS = 8
+
+
+def _expect_login_message(stream: PacketStream, what: str) -> bytes:
+    """Read the next login message, stepping over any tail of the previous one.
+
+    A client splits a message at the negotiated SDU, and the modern DATA_TYPES
+    table is ~2642 bytes -- so every SDU below about 2650 cuts the DTY into two
+    or more packets. The Mirror read one packet, answered the half it had, and
+    then took the REMAINDER as the message that should have followed:
+
+        InterfaceError: not a TTI_FUN message
+
+    which the client saw as DPY-4011. It looked intermittent only because
+    python-oracledb's test_1144 picks a random SDU; swept against the Mirror,
+    every value up to 2646 failed and every value from 2743 up passed (#968).
+
+    The tail is recognised by what it is NOT: every message the login path reads
+    here -- OSESSKEY, the OCI type round, a token AUTH -- begins with TTI_FUN,
+    and a fragment of a DATA_TYPES table does not. Measuring the fragment
+    against the SDU instead does not work: the client flushes a packet as soon as
+    the next field will not fit, so a fragment can stop a byte or two short of
+    the capacity and "exactly full" never holds.
+    """
+    for _ in range(_LOGIN_MAX_CONTINUATIONS):
+        body = _expect(stream, TNS_DATA, what)
+        if body[:1] == bytes([TTI_FUN]):
+            return body
+    raise InterfaceError(f'no {what} arrived after the data-type negotiation')
+
+
 def _expect(stream: PacketStream, want: int, what: str) -> bytes:
     received = stream.read_packet()
     if received is None:
@@ -498,7 +533,7 @@ def handle_login(
             # skips it (#265).
             _expect(stream, TNS_DATA, 'TYPE')
             stream.send_raw(encode_type_reply_sqlplus())
-        osesskey = _expect(stream, TNS_DATA, 'OSESSKEY')
+        osesskey = _expect_login_message(stream, 'OSESSKEY')
 
     # --- O5LOGON (§4) ---
     # The same mutual-auth crypto drives both dialects; only the wire marshalling
