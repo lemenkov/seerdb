@@ -232,12 +232,26 @@ def altered_edition(SQL: str) -> str | None:
     return match.group(2) if match else None
 
 
+_LEADING_COMMENTS_RE = re.compile(r'^\s*(?:--[^\n]*\n|/\*.*?\*/|\s)+', re.S)
+
+
+def statement_head(SQL: str) -> str:
+    """The statement, upper-cased, from its first word: leading whitespace and
+    SQL comments dropped.
+
+    What kind of statement it is -- a query, a PL/SQL block, DML -- is read off
+    its first word, and a comment ahead of that word does not change it. Read
+    off the raw text instead, `/* why */ SELECT ...` was taken for DML and its
+    rows were never fetched ("no result set").
+    """
+    return _LEADING_COMMENTS_RE.sub('', SQL, count=1).upper()
+
+
 def is_plsql(SQL: str) -> bool:
     # PL/SQL blocks start with BEGIN or DECLARE after stripping leading
     # whitespace and SQL comments. Anonymous blocks, packaged calls
     # wrapped in BEGIN...END;, and DECLARE...BEGIN forms all match.
-    Stripped = re.sub(r'^\s*(?:--[^\n]*\n|/\*.*?\*/|\s)+', '', SQL, flags=re.S)
-    Head = Stripped[:8].upper()
+    Head = statement_head(SQL)[:8]
     return Head.startswith('BEGIN') or Head.startswith('DECLARE')
 
 

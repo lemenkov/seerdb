@@ -34,7 +34,7 @@ from seerdb.common.exceptions import (
     NotSupportedError,
     OperationalError,
 )
-from seerdb.common.sqltext import is_reusable_dml
+from seerdb.common.sqltext import is_reusable_dml, statement_head
 from seerdb.common.tns import (
     _DTY_8I,
     assemble_packet,
@@ -1544,7 +1544,7 @@ class OracleConnect(_ConnectionLogic):
             Def = []
         if Batch is None:
             Batch = []
-        Head = Query.strip().upper()
+        Head = statement_head(Query)
         # A pre-10g dialect (9i / fv2 or 8i) speaks its own request dialect, not
         # the TTI_ALL8 the rest of execute() builds. It runs as sans-io generators
         # driven by _drive; the connection is a thin orchestrator (#369). Neither
@@ -3013,7 +3013,7 @@ class OracleConnect(_ConnectionLogic):
             Rows = [_resolve_parameters(Op.statement, P) for P in (Op.parameters or [])]
             Bind = Rows[0] if Rows else []
             Batch = Rows[1:]
-        Head = Op.statement.strip().upper()
+        Head = statement_head(Op.statement)
         if Head.startswith('SELECT'):
             Type = 'select'
         elif Head.startswith('BEGIN') or Head.startswith('DECLARE'):
