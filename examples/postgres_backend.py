@@ -1152,6 +1152,18 @@ def _translate_replace_view(sql: str) -> str | None:
     )
 
 
+# CREATE OR REPLACE TYPE (#1197). PostgreSQL has no such statement, so the old
+# type is dropped and the new one created, translated exactly as a plain CREATE
+# TYPE is. No CASCADE: Oracle refuses to replace a type another type or a table
+# depends on, even with the same spec (ORA-02303), and so does the drop. The
+# statement savepoint undoes the drop if the create then fails. `... FORCE AS`
+# is not matched, and a change of kind (OBJECT to VARRAY), which Oracle refuses
+# with ORA-06545, is replaced here.
+_CREATE_OR_REPLACE_TYPE = re.compile(
+    r'(\s*CREATE)\s+OR\s+REPLACE\s+(TYPE\s+([\w."$#]+)\s+AS\b)', re.IGNORECASE
+)
+
+
 def _translate_ddl(sql: str) -> str:
     """Rewrite an Oracle ``CREATE TABLE`` / object ``CREATE TYPE`` to PostgreSQL:
     map the column/attribute types and drop the clauses PostgreSQL has no equal
@@ -1160,6 +1172,12 @@ def _translate_ddl(sql: str) -> str:
         for pattern, replacement in _SEQUENCE_KEYWORD_REWRITES:
             sql = pattern.sub(replacement, sql)
         return re.sub(r'\s{2,}', ' ', sql).rstrip()
+    replaced = _CREATE_OR_REPLACE_TYPE.match(sql)
+    if replaced:
+        plain = _translate_ddl(
+            f'{replaced.group(1)} {replaced.group(2)}{sql[replaced.end() :]}'
+        )
+        return f'DROP TYPE IF EXISTS {replaced.group(3)}; {plain}'
     varray = _CREATE_TYPE_VARRAY.match(sql)
     if varray:
         name, bound, element = varray.groups()
@@ -1825,6 +1843,7 @@ _SQLSTATE_TO_ORA = {
 # by Oracle version anyway (e.g. ORA-01722).
 _ORA_MESSAGE = {
     942: 'table or view does not exist',
+    2303: 'cannot drop or replace a type with type or table dependents',
 }
 
 
@@ -1835,12 +1854,25 @@ def _ora_code_for(exc) -> int:
     return _SQLSTATE_TO_ORA.get(sqlstate, _ORA_INVALID_SQL)
 
 
+# A type statement refused because something depends on the type: Oracle's
+# ORA-02303 (#1197). PostgreSQL's dependent_objects_still_exist means other things
+# for other objects, so it maps only for a type statement.
+_TYPE_DDL = re.compile(r'\s*(?:CREATE\s+OR\s+REPLACE|DROP)\s+TYPE\b', re.IGNORECASE)
+_ORA_TYPE_HAS_DEPENDENTS = 2303
+
+
 def _backend_error(
     exc, *, original: str | None = None, translated: str | None = None
 ) -> BackendError:
     # A PostgreSQL failure as a clean ORA error: the mapped code, and the Oracle
     # canonical text for it when there is one, else PostgreSQL's own message (#529).
     code = _ora_code_for(exc)
+    if (
+        getattr(exc, 'sqlstate', None) == '2BP01'
+        and original is not None
+        and _TYPE_DDL.match(original)
+    ):
+        code = _ORA_TYPE_HAS_DEPENDENTS
     return BackendError(
         _ORA_MESSAGE.get(code, str(exc).strip()),
         ora_code=code,
