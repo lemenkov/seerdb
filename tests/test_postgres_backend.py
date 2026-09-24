@@ -474,6 +474,31 @@ def test_table_compression_is_dropped() -> None:
     assert kept == 'CREATE TABLE t (id numeric, "COMPRESS" numeric)'
 
 
+def test_a_replaced_type_is_dropped_and_created() -> None:
+    # PostgreSQL has no CREATE OR REPLACE TYPE; the old type goes, without
+    # CASCADE, and the new one is translated as a plain CREATE TYPE (#1197).
+    assert _translate_ddl('CREATE OR REPLACE TYPE s.o AS OBJECT (a NUMBER)') == (
+        'DROP TYPE IF EXISTS s.o; CREATE TYPE s.o AS (a numeric)'
+    )
+    assert _translate_ddl('create or replace type s.v as varray(4) of number;') == (
+        'DROP TYPE IF EXISTS s.v; CREATE DOMAIN s.v AS numeric[] '
+        'CHECK (VALUE IS NULL OR array_length(VALUE, 1) <= 4)'
+    )
+    assert _translate_ddl('create or replace type s.t\n    as table of s.o;') == (
+        'DROP TYPE IF EXISTS s.t; CREATE DOMAIN s.t AS s.o[]'
+    )
+    # FORCE is not translated.
+    forced = 'CREATE OR REPLACE TYPE s.o FORCE AS OBJECT (a NUMBER)'
+    assert not _translate_ddl(forced).startswith('DROP TYPE')
+    # A type something depends on is refused as Oracle refuses it; the same
+    # SQLSTATE on another statement keeps the generic code.
+    held = _FakePgError('2BP01', 'cannot drop type s.o because other objects depend')
+    assert _backend_error(held, original='DROP TYPE s.o').ora_code == 2303
+    replaced = 'CREATE OR REPLACE TYPE s.o AS OBJECT (a NUMBER)'
+    assert _backend_error(held, original=replaced).ora_code == 2303
+    assert _backend_error(held, original='DROP TABLE t').ora_code != 2303
+
+
 def test_a_nested_table_type_becomes_an_unbounded_array_domain() -> None:
     # A nested table has no maximum size, so no CHECK (#1194); the element type
     # is mapped as a column's, and may be another collection type.

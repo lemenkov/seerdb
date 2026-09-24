@@ -816,6 +816,37 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id, n FROM {self.TABLE} ORDER BY id')
         self.assertEqual(self.cur.fetchall(), [(1, 1), (2, 0)])
 
+    def test_a_type_may_be_replaced_until_something_depends_on_it(self):
+        # CREATE OR REPLACE TYPE replaces a type nothing depends on, and is
+        # refused with ORA-02303 once another type does (#1197). The dependent is
+        # a type, not a table: a dropped table stays in Oracle's recycle bin,
+        # still depending on the type.
+        from seerdb.common.exceptions import DatabaseError
+
+        (obj, arr) = ('PYO_REPLACE_T', 'PYO_REPLACE_ARR_T')
+        for name in (arr, obj):
+            try:
+                self.cur.execute(f'DROP TYPE {name}')
+            except DatabaseError:
+                # No leftover type from a prior run; nothing to clean up.
+                pass
+        self.cur.execute(f'CREATE TYPE {obj} AS OBJECT (a NUMBER)')
+        try:
+            self.cur.execute(
+                f'CREATE OR REPLACE TYPE {obj} AS OBJECT (a NUMBER, b NUMBER)'
+            )
+            self.cur.execute(f'CREATE OR REPLACE TYPE {arr} AS VARRAY(3) OF {obj};')
+            with self.assertRaises(DatabaseError) as ctx:
+                self.cur.execute(f'CREATE OR REPLACE TYPE {obj} AS OBJECT (c NUMBER)')
+            self.assertEqual(ctx.exception.code, 2303)
+        finally:
+            for name in (arr, obj):
+                try:
+                    self.cur.execute(f'DROP TYPE {name}')
+                except DatabaseError:
+                    # A CREATE above failed, so there is no type to drop.
+                    pass
+
     def test_untyped_null_column(self):
         # An untyped NULL is described with a zero data length and sends no
         # value; the column after it must still decode (#682, and #1185 on 9i).
@@ -6635,6 +6666,40 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                 await Cur.execute(f'SELECT id, n FROM {Table} ORDER BY id')
                 self.assertEqual(await Cur.fetchall(), [(1, 1), (2, 0)])
                 await self._drop_async(Cur, Table)
+
+    async def test_a_type_may_be_replaced_until_something_depends_on_it(self):
+        # Async twin of TypesIntegration's.
+        from seerdb.common.exceptions import DatabaseError
+
+        (Obj, Arr) = ('PYO_AREPLACE_T', 'PYO_AREPLACE_ARR_T')
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                for name in (Arr, Obj):
+                    try:
+                        await Cur.execute(f'DROP TYPE {name}')
+                    except DatabaseError:
+                        # No leftover type from a prior run; nothing to clean up.
+                        pass
+                await Cur.execute(f'CREATE TYPE {Obj} AS OBJECT (a NUMBER)')
+                try:
+                    await Cur.execute(
+                        f'CREATE OR REPLACE TYPE {Obj} AS OBJECT (a NUMBER, b NUMBER)'
+                    )
+                    await Cur.execute(
+                        f'CREATE OR REPLACE TYPE {Arr} AS VARRAY(3) OF {Obj};'
+                    )
+                    with self.assertRaises(DatabaseError) as ctx:
+                        await Cur.execute(
+                            f'CREATE OR REPLACE TYPE {Obj} AS OBJECT (c NUMBER)'
+                        )
+                    self.assertEqual(ctx.exception.code, 2303)
+                finally:
+                    for name in (Arr, Obj):
+                        try:
+                            await Cur.execute(f'DROP TYPE {name}')
+                        except DatabaseError:
+                            # A CREATE above failed, so there is no type to drop.
+                            pass
 
     async def test_untyped_null_column(self):
         # Async twin of TypesIntegration's.
