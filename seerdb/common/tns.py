@@ -11044,6 +11044,18 @@ def decode_fv2_exec_response(Data: bytes, Columns: list) -> tuple[list, int]:
                             LOB(DataType, Locator) if Locator is not None else None
                         )
                     continue
+                if (
+                    Col.get('data_length', None) == 0
+                    and DataType not in _LONG_DATA_TYPES
+                ):
+                    # A column described with a zero data length -- `SELECT NULL`
+                    # -- is always NULL and sends no value at all, only the
+                    # `81 01` NULL indicator (#1185). The 9i form of #682. A LONG
+                    # is described with a zero length too, and does carry data.
+                    if Rest[:1] == b'\x81':
+                        Rest = Rest[2:]
+                    Row.append(None)
+                    continue
                 # The value is a DALC; decode_dalc handles the 0xfe chunked form
                 # that LONG / LONG RAW stream in (in batch fetch they arrive
                 # inline as a plain chunked value, no trailing descriptor).

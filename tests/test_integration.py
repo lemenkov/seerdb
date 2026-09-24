@@ -760,6 +760,13 @@ class TypesIntegration(_IntegrationBase):
         v = self._round_trip('DATE', 'NULL')
         self.assertIsNone(v)
 
+    def test_untyped_null_column(self):
+        # An untyped NULL is described with a zero data length and sends no
+        # value; the column after it must still decode (#682, and #1185 on 9i).
+        # Oracle folds a DECODE that matches nothing into the same thing.
+        self.cur.execute("SELECT NULL AS a, 5 AS b, DECODE(3, 1, 'one') AS c FROM dual")
+        self.assertEqual(self.cur.fetchone(), (None, 5, None))
+
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class CursorIntegration(_IntegrationBase):
@@ -6420,6 +6427,15 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
             Cur = Conn.cursor()
             await Cur.execute('SELECT 1 FROM dual')
             self.assertEqual(await Cur.fetchone(), (1,))
+
+    async def test_untyped_null_column(self):
+        # Async twin of TypesIntegration's.
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await Cur.execute(
+                    "SELECT NULL AS a, 5 AS b, DECODE(3, 1, 'one') AS c FROM dual"
+                )
+                self.assertEqual(await Cur.fetchone(), (None, 5, None))
 
     async def test_commit_persists_dml(self):
         # autocommit=False, then explicit commit. A second connection
