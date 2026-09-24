@@ -1362,6 +1362,48 @@ def test_a_query_leaves_no_lock_behind() -> None:
         other.close()
 
 
+def test_a_column_name_folds_as_oracle_folds_it() -> None:
+    # A legal unquoted lower-case name came from an unquoted one; anything else
+    # was quoted and is kept (#1204). A reserved word could only be quoted.
+    from postgres_backend import _oracle_column_name
+
+    assert _oracle_column_name('all_lowercase') == 'ALL_LOWERCASE'
+    assert _oracle_column_name('a$b#1') == 'A$B#1'
+    for kept in ('MixedCase', 'ALL_UPPERCASE_QUOTED', 'select', '_x', 'two words'):
+        assert _oracle_column_name(kept) == kept
+
+
+def test_a_quoted_lower_case_column_keeps_its_name() -> None:
+    # PostgreSQL stores "abc" as it stores an unquoted abc, so the backend records
+    # the quoted one at CREATE TABLE and reports it as Oracle does (#1204) --
+    # also to a session that was already open before the table existed.
+    early = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    creator = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        creator.execute(
+            'CREATE TABLE pyo_quoted_names (id NUMBER, all_lowercase NUMBER, '
+            '"MixedCase" NUMBER, "all_lowercase_quoted" NUMBER, '
+            '"ALL_UPPERCASE_QUOTED" NUMBER)'
+        )
+        expected = [
+            b'ID',
+            b'ALL_LOWERCASE',
+            b'MixedCase',
+            b'all_lowercase_quoted',
+            b'ALL_UPPERCASE_QUOTED',
+        ]
+        for backend in (creator, early):
+            result = backend.execute('SELECT * FROM pyo_quoted_names')
+            assert [c.name for c in result.columns] == expected
+        # A computed column has no table behind it and keeps the rule.
+        result = creator.execute('SELECT 1 AS "lower_alias" FROM dual')
+        assert [c.name for c in result.columns] == [b'LOWER_ALIAS']
+    finally:
+        creator.execute('DROP TABLE pyo_quoted_names')
+        creator.close()
+        early.close()
+
+
 def test_translate_idioms_rewrites_rowid_pseudocolumn() -> None:
     # The ROWID pseudo-column becomes the row's ctid in Oracle's extended form —
     # one rewrite serving a SELECT, a WHERE ROWID = :bind (text compare), and the

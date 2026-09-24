@@ -847,6 +847,26 @@ class TypesIntegration(_IntegrationBase):
                     # A CREATE above failed, so there is no type to drop.
                     pass
 
+    def test_quoted_column_names_keep_their_case(self):
+        # Oracle folds an unquoted name to upper case and keeps a quoted one as
+        # written, whatever its case (#1204).
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (id NUMBER, all_lowercase NUMBER, '
+            '"MixedCase" NUMBER, "all_lowercase_quoted" NUMBER, '
+            '"ALL_UPPERCASE_QUOTED" NUMBER)'
+        )
+        self.cur.execute(f'SELECT * FROM {self.TABLE}')
+        self.assertEqual(
+            [d[0] for d in self.cur.description],
+            [
+                'ID',
+                'ALL_LOWERCASE',
+                'MixedCase',
+                'all_lowercase_quoted',
+                'ALL_UPPERCASE_QUOTED',
+            ],
+        )
+
     def test_untyped_null_column(self):
         # An untyped NULL is described with a zero data length and sends no
         # value; the column after it must still decode (#682, and #1185 on 9i).
@@ -6700,6 +6720,30 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                         except DatabaseError:
                             # A CREATE above failed, so there is no type to drop.
                             pass
+
+    async def test_quoted_column_names_keep_their_case(self):
+        # Async twin of TypesIntegration's.
+        Table = 'PYO_ASYNC_QUOTED_NAMES'
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await self._drop_async(Cur, Table)
+                await Cur.execute(
+                    f'CREATE TABLE {Table} (id NUMBER, all_lowercase NUMBER, '
+                    '"MixedCase" NUMBER, "all_lowercase_quoted" NUMBER, '
+                    '"ALL_UPPERCASE_QUOTED" NUMBER)'
+                )
+                await Cur.execute(f'SELECT * FROM {Table}')
+                self.assertEqual(
+                    [d[0] for d in Cur.description],
+                    [
+                        'ID',
+                        'ALL_LOWERCASE',
+                        'MixedCase',
+                        'all_lowercase_quoted',
+                        'ALL_UPPERCASE_QUOTED',
+                    ],
+                )
+                await self._drop_async(Cur, Table)
 
     async def test_untyped_null_column(self):
         # Async twin of TypesIntegration's.
