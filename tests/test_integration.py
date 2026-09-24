@@ -928,6 +928,30 @@ class CursorIntegration(_IntegrationBase):
         (ym,) = self.cur.fetchone()
         self.assertEqual((ym.years, ym.months), (1, 2))
 
+    def test_a_view_may_be_replaced_with_different_column_types(self):
+        # Oracle's CREATE OR REPLACE VIEW replaces the view whatever its new
+        # columns are; PostgreSQL's refuses to change a column's type, and the
+        # reference thin client's suite redefines one view per type it tests.
+        from seerdb.common.exceptions import DatabaseError
+
+        view = 'PYO_REPLACED_VIEW'
+        try:
+            self.cur.execute(
+                f'CREATE OR REPLACE VIEW {view} AS SELECT 1 AS c FROM dual'
+            )
+        except DatabaseError as exc:
+            if exc.code == 1031:  # ORA-01031: the suite needs no CREATE VIEW
+                self.skipTest('the test user lacks the CREATE VIEW privilege')
+            raise
+        try:
+            self.cur.execute(
+                f"CREATE OR REPLACE VIEW {view} AS SELECT 'x' AS c FROM dual"
+            )
+            self.cur.execute(f'SELECT c FROM {view}')
+            self.assertEqual(self.cur.fetchone(), ('x',))
+        finally:
+            self.cur.execute(f'DROP VIEW {view}')
+
     def test_the_nls_parameters_are_readable(self):
         # A client may read the database character set before anything else:
         # the reference thin client's own test harness does, and a server that
@@ -5849,6 +5873,33 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
             await Cur.execute(f'SELECT n FROM {Table}')
             self.assertEqual(float((await Cur.fetchone())[0]), 2.5)
             await self._drop_async(Cur, Table)
+        finally:
+            await Conn.close()
+
+    async def test_a_view_may_be_replaced_with_different_column_types(self):
+        # Async twin of CursorIntegration's.
+        from seerdb.common.exceptions import DatabaseError
+
+        View = 'PYO_ASYNC_REPLACED_VIEW'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            try:
+                await Cur.execute(
+                    f'CREATE OR REPLACE VIEW {View} AS SELECT 1 AS c FROM dual'
+                )
+            except DatabaseError as exc:
+                if exc.code == 1031:  # ORA-01031: the suite needs no CREATE VIEW
+                    self.skipTest('the test user lacks the CREATE VIEW privilege')
+                raise
+            try:
+                await Cur.execute(
+                    f"CREATE OR REPLACE VIEW {View} AS SELECT 'x' AS c FROM dual"
+                )
+                await Cur.execute(f'SELECT c FROM {View}')
+                self.assertEqual(await Cur.fetchone(), ('x',))
+            finally:
+                await Cur.execute(f'DROP VIEW {View}')
         finally:
             await Conn.close()
 

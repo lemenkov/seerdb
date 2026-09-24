@@ -451,6 +451,23 @@ def test_leading_comments_are_dropped_before_the_statement_is_recognised() -> No
     )
 
 
+def test_a_replaced_view_falls_back_to_drop_and_create() -> None:
+    # PostgreSQL's OR REPLACE refuses to change a view column's type, or to drop
+    # or rename one; Oracle's replaces the view. The replacement is tried as
+    # written and only that refusal drops the view -- plainly, not CASCADE.
+    out = _translate_ddl('CREATE OR REPLACE FORCE VIEW s.v AS SELECT 1 c FROM dual')
+    assert out.startswith(
+        'DO $$ BEGIN EXECUTE $seerdb_view$CREATE OR REPLACE VIEW s.v '
+    )
+    assert 'EXCEPTION WHEN invalid_table_definition THEN' in out
+    assert 'DROP VIEW s.v$seerdb_view$' in out
+    assert 'CASCADE' not in out and 'FORCE' not in out
+    # A plain CREATE VIEW is left as it was.
+    assert _translate_ddl('CREATE VIEW v AS SELECT 1 x FROM dual') == (
+        'CREATE VIEW v AS SELECT 1 x FROM dual'
+    )
+
+
 def test_translate_admin_maps_session_user_and_index() -> None:
     # Oracle session/user admin → PostgreSQL: schema resolution is search_path, a
     # user is a schema, and grants/tablespace admin no-op; a schema-qualified index
