@@ -99,6 +99,13 @@ jobs:
             image: "gvenzl/oracle-xe:11-slim"
             service: "XE"
             field_version: "0"
+          # 18c negotiates field version 11 by itself -- the only release here
+          # in the 12.2-19c band, where a reply field that follows the server's
+          # release rather than the negotiated version went unnoticed (#1145).
+          - name: "Oracle XE 18c"
+            image: "gvenzl/oracle-xe:18-slim"
+            service: "XEPDB1"
+            field_version: "0"
           - name: "Oracle XE 21c"
             image: "gvenzl/oracle-xe:21-slim"
             service: "XEPDB1"
@@ -107,6 +114,14 @@ jobs:
             image: "gvenzl/oracle-free:23-slim"
             service: "FREEPDB1"
             field_version: "17"
+          # The 12.1 wire format, from a client that negotiates 12.1 with a
+          # newer server -- exactly what a real 12.1 client does. No image
+          # negotiates 7 on its own, which is how every 12.1 execute went out
+          # misframed unseen (#1144).
+          - name: "Oracle 23ai Free at 12.1"
+            image: "gvenzl/oracle-free:23-slim"
+            service: "FREEPDB1"
+            field_version: "7"
     services:
       oracle:
         image: ${{ matrix.db.image }}
