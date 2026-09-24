@@ -873,6 +873,17 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute('SELECT sessiontimezone FROM dual')
         self.assertEqual(self.cur.fetchone()[0].strip(), expected)
 
+    def test_a_query_may_start_with_a_comment(self):
+        # Whether a statement is a query is read off its first word, and a
+        # comment ahead of that word does not change it. Read off the raw text,
+        # `/* why */ SELECT ...` was taken for DML and its rows were never
+        # fetched: "no result set".
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER(9, 2), s VARCHAR2(10))')
+        self.cur.execute(f"/* one row */ INSERT INTO {self.TABLE} VALUES (1.5, 'a')")
+        self.cur.execute(f'/* leading */ -- and another\nSELECT n, s FROM {self.TABLE}')
+        (n, text) = self.cur.fetchone()
+        self.assertEqual((float(n), text), (1.5, 'a'))
+
     def test_a_session_setting_answers_with_no_result_set(self):
         # ALTER SESSION is not a query: a server answers it with a status and no
         # rows. A backend that stood a `SELECT 1` in for one answered with a row,
@@ -5747,6 +5758,21 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                 await Conn.cursor().execute("SELECT TO_NUMBER('x') FROM dual")
             self.assertEqual(ctx.exception.code, 1722)
             self.assertIn('ORA-01722', str(ctx.exception))
+        finally:
+            await Conn.close()
+
+    async def test_a_query_may_start_with_a_comment(self):
+        # Async twin of CursorIntegration's.
+        Table = 'PYO_ASYNC_LEADING_COMMENT'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            await self._drop_async(Cur, Table)
+            await Cur.execute(f'CREATE TABLE {Table} (n NUMBER(9, 2))')
+            await Cur.execute(f'/* one row */ INSERT INTO {Table} VALUES (2.5)')
+            await Cur.execute(f'/* leading */ SELECT n FROM {Table}')
+            self.assertEqual(float((await Cur.fetchone())[0]), 2.5)
+            await self._drop_async(Cur, Table)
         finally:
             await Conn.close()
 

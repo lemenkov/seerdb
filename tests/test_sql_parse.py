@@ -25,7 +25,27 @@ from seerdb.common.sqltext import (
     extract_bind_names,
     is_plsql,
     is_reusable_dml,
+    statement_head,
 )
+
+
+class TestStatementHead(unittest.TestCase):
+    # What kind of statement it is is read off its first word; a comment ahead
+    # of it must not change that. `/* why */ SELECT` was taken for DML.
+    def test_leading_comments_and_whitespace_go(self):
+        self.assertEqual(
+            statement_head('/* why */ select 1 from dual'), 'SELECT 1 FROM DUAL'
+        )
+        self.assertEqual(statement_head('-- a\n  -- b\n\tselect 1'), 'SELECT 1')
+        self.assertEqual(
+            statement_head('  insert into t values (1)'), 'INSERT INTO T VALUES (1)'
+        )
+
+    def test_a_hint_inside_the_statement_stays(self):
+        self.assertEqual(
+            statement_head('select /*+ index(t) */ 1 from t'),
+            'SELECT /*+ INDEX(T) */ 1 FROM T',
+        )
 
 
 class TestIsPlsql(unittest.TestCase):
