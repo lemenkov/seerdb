@@ -41,6 +41,7 @@ from postgres_backend import (  # noqa: E402
     _iot_primary_key,
     _parse_out_assignments,
     _reject_unsupported_ddl_types,
+    _strip_leading_comments,
     _to_interval_ym,
     _translate_admin,
     _translate_binds,
@@ -429,6 +430,24 @@ def test_translate_idioms_parenthesizes_offset_fetch_expression() -> None:
     assert (
         _translate_idioms('SELECT x FROM t ORDER BY x OFFSET :o ROWS')
         == 'SELECT x FROM t ORDER BY x OFFSET (:o) ROWS'
+    )
+
+
+def test_leading_comments_are_dropped_before_the_statement_is_recognised() -> None:
+    # Every rewrite recognises a statement by its first word, so a comment ahead
+    # of it has to go first. A hint INSIDE the statement is left alone, and an
+    # unterminated comment is not guessed at.
+    assert _strip_leading_comments('-- make it\nCREATE TABLE t (n NUMBER)') == (
+        'CREATE TABLE t (n NUMBER)'
+    )
+    assert _strip_leading_comments('/* a */ -- b\n  SELECT 1 FROM dual') == (
+        'SELECT 1 FROM dual'
+    )
+    assert _strip_leading_comments('SELECT /*+ hint */ 1 FROM dual') == (
+        'SELECT /*+ hint */ 1 FROM dual'
+    )
+    assert _strip_leading_comments('/* unterminated SELECT 1') == (
+        '/* unterminated SELECT 1'
     )
 
 

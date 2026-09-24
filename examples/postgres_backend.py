@@ -1765,6 +1765,18 @@ def _column_meta(desc, values: list, tstz_oid: int | None = None) -> ColumnMeta:
     )
 
 
+# Comments ahead of a statement's first word. Every rewrite here recognises a
+# statement by that word -- CREATE TABLE's types, DDL's autocommit, PL/SQL's
+# routing -- so `-- make it\nCREATE TABLE t (n NUMBER(9))` went to PostgreSQL
+# untranslated and failed on `number`, a type it does not have. Oracle ignores
+# the comment, so drop it before anything looks at the statement.
+_LEADING_COMMENTS = re.compile(r'\A(?:\s+|--[^\n]*(?:\n|\Z)|/\*.*?\*/)+', re.DOTALL)
+
+
+def _strip_leading_comments(sql: str) -> str:
+    return _LEADING_COMMENTS.sub('', sql, count=1)
+
+
 # Oracle's reserved words, which cannot name a bind: `:ROWID` is refused
 # ORA-01745 at parse. Unquoted names only -- a quoted one may be anything.
 _ORACLE_RESERVED_WORDS = frozenset(
@@ -1989,6 +2001,7 @@ class PostgresBackend:
         session as it was. DDL, PL/SQL and transaction control have no EXPLAIN
         and keep the bare success they had.
         """
+        sql = _strip_leading_comments(sql)
         for name, quoted in bind_placeholders(sql, dedupe=True):
             if not quoted and name.upper() in _ORACLE_RESERVED_WORDS:
                 raise BackendError('invalid host/bind variable name', ora_code=1745)
@@ -2024,6 +2037,7 @@ class PostgresBackend:
         # Mirror's OUT-bind flow); run it via CALL / SELECT and return the OUT
         # values (#503). An ordinary statement's BindVar is a typed NULL, which
         # _translate_binds casts (#699).
+        sql = _strip_leading_comments(sql)
         if binds and is_plsql(sql):
             return self._execute_plsql(sql, binds)
         # A `SELECT REF(alias)` object-REF fetch: PostgreSQL has no REF, so stand in
@@ -2238,6 +2252,7 @@ class PostgresBackend:
         # 500 rows against a remote database. Returns the total affected-row count.
         # The Mirror calls this only for the non-batcherrors path, where a per-row
         # failure aborts the whole batch — exactly Oracle's non-batcherrors DML.
+        sql = _strip_leading_comments(sql)
         rows = list(rows)
         if not rows:
             return 0

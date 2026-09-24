@@ -884,6 +884,20 @@ class CursorIntegration(_IntegrationBase):
         (n, text) = self.cur.fetchone()
         self.assertEqual((float(n), text), (1.5, 'a'))
 
+    def test_a_ddl_statement_may_start_with_a_comment(self):
+        # A script's statements often lead with a comment. It must not change
+        # what the statement is: a backend that recognised a CREATE TABLE by its
+        # first word sent `-- ...\nCREATE TABLE ... NUMBER(9, 2)` on
+        # untranslated and failed on the type.
+        self.cur.execute(
+            f'-- the table the rest of this test reads\n'
+            f'CREATE TABLE {self.TABLE} (n NUMBER(9, 2), s VARCHAR2(10))'
+        )
+        self.cur.execute(f"INSERT INTO {self.TABLE} VALUES (1.5, 'a')")
+        self.cur.execute(f'SELECT n, s FROM {self.TABLE}')
+        (n, text) = self.cur.fetchone()
+        self.assertEqual((float(n), text), (1.5, 'a'))
+
     def test_a_session_setting_answers_with_no_result_set(self):
         # ALTER SESSION is not a query: a server answers it with a status and no
         # rows. A backend that stood a `SELECT 1` in for one answered with a row,
@@ -5771,6 +5785,23 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
             await Cur.execute(f'CREATE TABLE {Table} (n NUMBER(9, 2))')
             await Cur.execute(f'/* one row */ INSERT INTO {Table} VALUES (2.5)')
             await Cur.execute(f'/* leading */ SELECT n FROM {Table}')
+            self.assertEqual(float((await Cur.fetchone())[0]), 2.5)
+            await self._drop_async(Cur, Table)
+        finally:
+            await Conn.close()
+
+    async def test_a_ddl_statement_may_start_with_a_comment(self):
+        # Async twin of CursorIntegration's.
+        Table = 'PYO_ASYNC_COMMENTED_DDL'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            await self._drop_async(Cur, Table)
+            await Cur.execute(
+                f'-- made by a script\nCREATE TABLE {Table} (n NUMBER(9, 2))'
+            )
+            await Cur.execute(f'INSERT INTO {Table} VALUES (2.5)')
+            await Cur.execute(f'SELECT n FROM {Table}')
             self.assertEqual(float((await Cur.fetchone())[0]), 2.5)
             await self._drop_async(Cur, Table)
         finally:
