@@ -4175,7 +4175,16 @@ class SodaIntegration(_IntegrationBase):
             'd := SODA_DOCUMENT_T(b_content => utl_raw.cast_to_raw(\'{"a":1}\')); '
             'n := c.insert_one(d); END;'
         )
-        col.truncate()
+        try:
+            col.truncate()
+        except seerdb.DatabaseError as exc:
+            # SODA_COLLECTION_T grew TRUNCATE after 18c: 18c's DBMS_SODA answers
+            # PLS-00302 "component 'TRUNCATE' must be declared". Skipping on the
+            # server's own answer, not a guessed version, stays right for any
+            # release in between.
+            if 'PLS-00302' in str(exc) and 'TRUNCATE' in str(exc):
+                self.skipTest("this server's DBMS_SODA has no TRUNCATE")
+            raise
         v = self.cur.var(seerdb.NUMBER)
         self.cur.execute(
             'DECLARE c SODA_COLLECTION_T; BEGIN '
