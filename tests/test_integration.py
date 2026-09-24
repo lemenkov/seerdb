@@ -952,6 +952,29 @@ class CursorIntegration(_IntegrationBase):
         finally:
             self.cur.execute(f'DROP VIEW {view}')
 
+    def test_transaction_control_statements_run_as_sql(self):
+        # COMMIT, ROLLBACK, SAVEPOINT and ROLLBACK TO sent as SQL text, as a
+        # script sends them, rather than through the connection's calls (#1181).
+        from seerdb.common.exceptions import DatabaseError
+
+        self.conn.autocommit = False
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER)')
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1)')
+        self.cur.execute('COMMIT')
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (2)')
+        self.cur.execute('ROLLBACK')
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (3)')
+        self.cur.execute('SAVEPOINT pyo_sp')
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (4)')
+        self.cur.execute('ROLLBACK TO SAVEPOINT pyo_sp')
+        # A savepoint never taken fails alone; the transaction goes on.
+        with self.assertRaises(DatabaseError) as ctx:
+            self.cur.execute('ROLLBACK TO pyo_no_such_sp')
+        self.assertEqual(ctx.exception.code, 1086)
+        self.cur.execute('COMMIT WORK')
+        self.cur.execute(f'SELECT n FROM {self.TABLE} ORDER BY n')
+        self.assertEqual(self.cur.fetchall(), [(1,), (3,)])
+
     def test_the_nls_parameters_are_readable(self):
         # A client may read the database character set before anything else:
         # the reference thin client's own test harness does, and a server that
@@ -5900,6 +5923,36 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await Cur.fetchone(), ('x',))
             finally:
                 await Cur.execute(f'DROP VIEW {View}')
+        finally:
+            await Conn.close()
+
+    async def test_transaction_control_statements_run_as_sql(self):
+        # Async twin of CursorIntegration's.
+        from seerdb.common.exceptions import DatabaseError
+
+        Table = 'PYO_ASYNC_TXN_SQL'
+        Kw = self._kwargs()
+        Kw['autocommit'] = False
+        Conn = await seerdb.connect_async(**Kw)
+        try:
+            Cur = Conn.cursor()
+            await self._drop_async(Cur, Table)
+            await Cur.execute(f'CREATE TABLE {Table} (n NUMBER)')
+            await Cur.execute(f'INSERT INTO {Table} VALUES (1)')
+            await Cur.execute('COMMIT')
+            await Cur.execute(f'INSERT INTO {Table} VALUES (2)')
+            await Cur.execute('ROLLBACK')
+            await Cur.execute(f'INSERT INTO {Table} VALUES (3)')
+            await Cur.execute('SAVEPOINT pyo_sp')
+            await Cur.execute(f'INSERT INTO {Table} VALUES (4)')
+            await Cur.execute('ROLLBACK TO SAVEPOINT pyo_sp')
+            with self.assertRaises(DatabaseError) as ctx:
+                await Cur.execute('ROLLBACK TO pyo_no_such_sp')
+            self.assertEqual(ctx.exception.code, 1086)
+            await Cur.execute('COMMIT WORK')
+            await Cur.execute(f'SELECT n FROM {Table} ORDER BY n')
+            self.assertEqual(await Cur.fetchall(), [(1,), (3,)])
+            await self._drop_async(Cur, Table)
         finally:
             await Conn.close()
 
