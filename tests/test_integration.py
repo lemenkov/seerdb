@@ -737,6 +737,15 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT txt, id FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), ('hi', 5))
 
+    def test_long_in_an_uncompressed_table(self):
+        # A table compression clause is storage only: the table behaves the
+        # same (#1182). The reference thin client's suite creates its LONG and
+        # LONG RAW tables NOCOMPRESS.
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, l LONG) NOCOMPRESS')
+        self.cur.execute(f"INSERT INTO {self.TABLE} VALUES (1, 'kept')")
+        self.cur.execute(f'SELECT id, l FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone(), (1, 'kept'))
+
     # ----- NULL -----
 
     def test_null_number(self):
@@ -6447,6 +6456,19 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                 await Cur.execute('SELECT COUNT(*) FROM PYORACLE_ASYNC_RB')
                 self.assertEqual(await Cur.fetchone(), (0,))
                 await Cur.execute('DROP TABLE PYORACLE_ASYNC_RB')
+
+    async def test_long_in_an_uncompressed_table(self):
+        # Async twin of TypesIntegration's.
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await self._drop_async(Cur, 'PYO_ASYNC_NOCOMPRESS')
+                await Cur.execute(
+                    'CREATE TABLE PYO_ASYNC_NOCOMPRESS (id NUMBER, l LONG) NOCOMPRESS'
+                )
+                await Cur.execute("INSERT INTO PYO_ASYNC_NOCOMPRESS VALUES (1, 'kept')")
+                await Cur.execute('SELECT id, l FROM PYO_ASYNC_NOCOMPRESS')
+                self.assertEqual(await Cur.fetchone(), (1, 'kept'))
+                await Cur.execute('DROP TABLE PYO_ASYNC_NOCOMPRESS')
 
     async def test_lob_auto_resolve(self):
         # CLOB / BLOB / NULL / EMPTY all surface as Python str/bytes/None

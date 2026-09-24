@@ -930,6 +930,15 @@ _DDL_TYPE_REWRITES = [
 # TEMPORARY table (ON COMMIT ... ROWS is already valid PostgreSQL).
 _DDL_ORG_INDEX = re.compile(r'\s+ORGANIZATION\s+INDEX\b', re.IGNORECASE)
 _DDL_GLOBAL_TEMPORARY = re.compile(r'\bGLOBAL\s+TEMPORARY\b', re.IGNORECASE)
+# Table compression (#1182) is a storage hint no query can see, and PostgreSQL
+# compresses large values on its own. The clause is recognised straight after
+# the column list's closing parenthesis, where Oracle puts it, so a column or a
+# string that merely says "compress" is left alone.
+_DDL_COMPRESSION = re.compile(
+    r'\)\s*(?:NOCOMPRESS|(?:ROW\s+STORE\s+)?COMPRESS'
+    r'(?:\s+(?:BASIC|ADVANCED|FOR\s+(?:OLTP|ALL\s+OPERATIONS)))?)\b',
+    re.IGNORECASE,
+)
 # Index-organized tables: Oracle gives their rows a logical UROWID — a
 # '*'-prefixed base64 of the primary key — where a heap table has a physical
 # ROWID. PostgreSQL has neither, so the backend remembers which tables a session
@@ -1133,6 +1142,7 @@ def _translate_ddl(sql: str) -> str:
         return sql
     out = _DDL_GLOBAL_TEMPORARY.sub('TEMPORARY', sql)
     out = _DDL_ORG_INDEX.sub('', out)
+    out = _DDL_COMPRESSION.sub(')', out)
     for pattern, replacement in _DDL_TYPE_REWRITES:
         out = pattern.sub(replacement, out)
     return out

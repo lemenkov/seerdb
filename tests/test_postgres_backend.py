@@ -433,6 +433,17 @@ def test_translate_idioms_parenthesizes_offset_fetch_expression() -> None:
     )
 
 
+def test_table_compression_is_dropped() -> None:
+    # A storage hint with no PostgreSQL equal (#1182); only the table clause
+    # goes, so a column that happens to be called that survives.
+    for clause in ('nocompress', 'COMPRESS', 'compress basic', 'ROW STORE COMPRESS'):
+        assert _translate_ddl(f'CREATE TABLE t (id NUMBER, l LONG) {clause}') == (
+            'CREATE TABLE t (id numeric, l text)'
+        )
+    kept = _translate_ddl('CREATE TABLE t (id NUMBER, "COMPRESS" NUMBER)')
+    assert kept == 'CREATE TABLE t (id numeric, "COMPRESS" numeric)'
+
+
 def test_leading_comments_are_dropped_before_the_statement_is_recognised() -> None:
     # Every rewrite recognises a statement by its first word, so a comment ahead
     # of it has to go first. A hint INSIDE the statement is left alone, and an
