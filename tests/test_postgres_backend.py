@@ -474,6 +474,21 @@ def test_table_compression_is_dropped() -> None:
     assert kept == 'CREATE TABLE t (id numeric, "COMPRESS" numeric)'
 
 
+def test_a_varray_type_becomes_a_bounded_array_domain() -> None:
+    # The bound rides in a CHECK; a script's trailing `;`, which Oracle accepts
+    # on type DDL, stays out of the element type.
+    bounded = (
+        'CREATE DOMAIN s.a AS numeric[] '
+        'CHECK (VALUE IS NULL OR array_length(VALUE, 1) <= 10)'
+    )
+    assert _translate_ddl('create type s.a as varray(10) of number') == bounded
+    assert _translate_ddl('create type s.a as varray(10) of number;') == bounded
+    assert _translate_ddl('create type s.o as\n    varray(10) of s.sub;') == (
+        'CREATE DOMAIN s.o AS s.sub[] '
+        'CHECK (VALUE IS NULL OR array_length(VALUE, 1) <= 10)'
+    )
+
+
 def test_leading_comments_are_dropped_before_the_statement_is_recognised() -> None:
     # Every rewrite recognises a statement by its first word, so a comment ahead
     # of it has to go first. A hint INSIDE the statement is left alone, and an

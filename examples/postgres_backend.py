@@ -1029,6 +1029,30 @@ _CREATE_TYPE_OBJECT = re.compile(
 )
 
 
+# An Oracle VARRAY -- `CREATE TYPE name AS VARRAY(n) OF elem` -- maps to a
+# PostgreSQL DOMAIN over an array of the element type, with a CHECK carrying the
+# bound: `CREATE DOMAIN name AS elem[] CHECK (VALUE IS NULL OR
+# array_length(VALUE, 1) <= n)`. That is the mapping Oracle-to-PostgreSQL
+# migrations settle on, and the sibling of the OBJECT rewrite above (#1193).
+#
+# Measured against the running server rather than assumed: the CHECK does
+# enforce the bound (n+1 elements are refused, as Oracle refuses them), and a
+# plain `DROP TYPE name` removes the domain, so a caller's teardown needs no
+# translation of its own.
+#
+# Type DDL is compiled like PL/SQL, so Oracle takes a trailing `;` on it, and
+# scripts carry one; it is left out of the element type.
+#
+# Only the plain form. `CREATE OR REPLACE TYPE ... AS VARRAY` is not matched:
+# PostgreSQL has no CREATE OR REPLACE DOMAIN, and emitting a plain CREATE would
+# quietly drop the replace semantics -- failing on an existing type where Oracle
+# succeeds. Better to leave that statement untranslated and let it fail honestly.
+_CREATE_TYPE_VARRAY = re.compile(
+    r'\s*CREATE\s+TYPE\s+(\S+)\s+AS\s+VARRAY\s*\(\s*(\d+)\s*\)\s+OF\s+(.+?)\s*;?\s*$',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
 # Oracle session / user admin statements the provisioning issues, mapped to their
 # PostgreSQL equivalent or a no-op (#759). Oracle treats a user as a schema, so a
 # CREATE USER becomes a CREATE SCHEMA; ALTER SESSION SET CURRENT_SCHEMA points
@@ -1128,6 +1152,15 @@ def _translate_ddl(sql: str) -> str:
         for pattern, replacement in _SEQUENCE_KEYWORD_REWRITES:
             sql = pattern.sub(replacement, sql)
         return re.sub(r'\s{2,}', ' ', sql).rstrip()
+    varray = _CREATE_TYPE_VARRAY.match(sql)
+    if varray:
+        name, bound, element = varray.groups()
+        for pattern, replacement in _DDL_TYPE_REWRITES:
+            element = pattern.sub(replacement, element)
+        return (
+            f'CREATE DOMAIN {name} AS {element}[] '
+            f'CHECK (VALUE IS NULL OR array_length(VALUE, 1) <= {bound})'
+        )
     if _CREATE_TYPE_OBJECT.match(sql):
         # `... AS OBJECT (attrs)` → `... AS (attrs)`, then map the attribute types
         # (NUMBER → numeric, VARCHAR2(n) → varchar(n), …) the same way as a table.

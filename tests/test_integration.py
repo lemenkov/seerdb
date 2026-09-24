@@ -760,6 +760,27 @@ class TypesIntegration(_IntegrationBase):
         v = self._round_trip('DATE', 'NULL')
         self.assertIsNone(v)
 
+    def test_a_varray_type_can_type_a_column(self):
+        # A VARRAY type, written as a script writes it -- type DDL takes a
+        # trailing `;` -- then a table with a column of it (#1193).
+        from seerdb.common.exceptions import DatabaseError
+
+        vtype = 'PYO_VARRAY_T'
+        try:
+            self.cur.execute(f'DROP TYPE {vtype}')
+        except DatabaseError:
+            # No leftover type from a prior run; nothing to clean up.
+            pass
+        self.cur.execute(f'CREATE TYPE {vtype} AS VARRAY(3) OF NUMBER;')
+        try:
+            self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, v {vtype})')
+            self.cur.execute(f'INSERT INTO {self.TABLE} (id) VALUES (1)')
+            self.cur.execute(f'SELECT id FROM {self.TABLE}')
+            self.assertEqual(self.cur.fetchone(), (1,))
+            self.cur.execute(f'DROP TABLE {self.TABLE}')
+        finally:
+            self.cur.execute(f'DROP TYPE {vtype}')
+
     def test_untyped_null_column(self):
         # An untyped NULL is described with a zero data length and sends no
         # value; the column after it must still decode (#682, and #1185 on 9i).
@@ -6501,6 +6522,29 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
             Cur = Conn.cursor()
             await Cur.execute('SELECT 1 FROM dual')
             self.assertEqual(await Cur.fetchone(), (1,))
+
+    async def test_a_varray_type_can_type_a_column(self):
+        # Async twin of TypesIntegration's.
+        from seerdb.common.exceptions import DatabaseError
+
+        Table, VType = 'PYO_ASYNC_VARRAY', 'PYO_ASYNC_VARRAY_T'
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await self._drop_async(Cur, Table)
+                try:
+                    await Cur.execute(f'DROP TYPE {VType}')
+                except DatabaseError:
+                    # No leftover type from a prior run; nothing to clean up.
+                    pass
+                await Cur.execute(f'CREATE TYPE {VType} AS VARRAY(3) OF NUMBER;')
+                try:
+                    await Cur.execute(f'CREATE TABLE {Table} (id NUMBER, v {VType})')
+                    await Cur.execute(f'INSERT INTO {Table} (id) VALUES (1)')
+                    await Cur.execute(f'SELECT id FROM {Table}')
+                    self.assertEqual(await Cur.fetchone(), (1,))
+                    await Cur.execute(f'DROP TABLE {Table}')
+                finally:
+                    await Cur.execute(f'DROP TYPE {VType}')
 
     async def test_untyped_null_column(self):
         # Async twin of TypesIntegration's.
