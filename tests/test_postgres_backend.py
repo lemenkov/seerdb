@@ -1280,6 +1280,34 @@ def test_unqualified_names_resolve_in_the_login_users_schema() -> None:
         admin.close()
 
 
+def test_a_query_leaves_no_lock_behind() -> None:
+    # An Oracle query takes no table lock; a PostgreSQL read keeps one until its
+    # transaction ends, which blocked another session's TRUNCATE for ever
+    # (#1190). A transaction that has written, or holds a client savepoint,
+    # stays open.
+    reader = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    other = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        reader.execute('CREATE TABLE pyo_read_lock (n NUMBER)')
+        other._conn.execute("SET lock_timeout = '2s'")
+        other._conn.commit()
+        reader.execute('SELECT n FROM pyo_read_lock')
+        other.execute('TRUNCATE TABLE pyo_read_lock')
+        reader.execute('INSERT INTO pyo_read_lock VALUES (1)')
+        reader.execute('SELECT n FROM pyo_read_lock')
+        idle = psycopg.pq.TransactionStatus.INTRANS
+        assert reader._conn.info.transaction_status == idle
+        reader.rollback()
+        reader.execute('SAVEPOINT pyo_sp')
+        reader.execute('SELECT n FROM pyo_read_lock')
+        reader.execute('ROLLBACK TO SAVEPOINT pyo_sp')
+        reader.rollback()
+    finally:
+        reader.execute('DROP TABLE pyo_read_lock')
+        reader.close()
+        other.close()
+
+
 def test_translate_idioms_rewrites_rowid_pseudocolumn() -> None:
     # The ROWID pseudo-column becomes the row's ctid in Oracle's extended form —
     # one rewrite serving a SELECT, a WHERE ROWID = :bind (text compare), and the

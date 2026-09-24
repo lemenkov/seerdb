@@ -2008,6 +2008,9 @@ class PostgresBackend:
         # Index-organized tables this session created, with their primary-key
         # columns, for the logical-rowid rendering.
         self._iot_pk: dict[str, list[str]] = {}
+        # Whether the client has taken a SAVEPOINT in the open transaction, which
+        # a transaction that has written nothing must keep for it (#1190).
+        self._user_savepoint = False
         # Pipeline mode ships a statement's SAVEPOINT / statement / RELEASE in one
         # network round-trip instead of three (a 3x per-statement latency cut
         # against a remote database). It needs libpq >= 14; older builds fall back
@@ -2206,6 +2209,29 @@ class PostgresBackend:
                 return
             raise _backend_error(exc, original=sql, translated=translated) from exc
         self._conn.execute('RELEASE SAVEPOINT _mirror_parse')
+        self._release_read_locks()
+
+    def _release_read_locks(self) -> None:
+        """End the open transaction if it has written nothing (#1190).
+
+        An Oracle query takes no table lock. A PostgreSQL read takes
+        AccessShareLock and keeps it until its transaction ends, and a client
+        has no reason to commit after a plain query, so the lock outlived the
+        query for as long as the session did: another session's TRUNCATE, DROP
+        or ALTER then waited on it for ever. A transaction with no transaction
+        id has written nothing, not even a row lock (SELECT ... FOR UPDATE
+        assigns one), so committing it only lets the read locks go. One the
+        client took a SAVEPOINT in is kept, as the commit would destroy it.
+        """
+        if self._user_savepoint:
+            return
+        if self._conn.info.transaction_status != psycopg.pq.TransactionStatus.INTRANS:
+            return
+        row = self._conn.execute(
+            'SELECT pg_current_xact_id_if_assigned() IS NULL'
+        ).fetchone()
+        if row is not None and row[0]:
+            self._conn.commit()
 
     def execute(self, sql: str, binds: Sequence = ()) -> Result:
         # A PL/SQL block from callproc / callfunc arrives with BindVar binds (the
@@ -2276,6 +2302,7 @@ class PostgresBackend:
         # so a later rollback discards only DML, not the table (#532).
         if is_ddl:
             self._conn.commit()
+            self._user_savepoint = False
         if with_rowid is not None:
             # The rows are the rowids of the rows touched, not a result set: a
             # DML still answers with a count, and the last one is its rowid.
@@ -2283,6 +2310,8 @@ class PostgresBackend:
             return Result(
                 rowcount=len(touched), last_rowid=touched[-1] if touched else None
             )
+        if result.columns and not is_ddl:
+            self._release_read_locks()
         return result
 
     def _execute_transaction_control(self, sql: str) -> Result | None:
@@ -2298,6 +2327,7 @@ class PostgresBackend:
         savepoint = _SAVEPOINT.match(sql)
         if savepoint is not None:
             self._conn.execute(f'SAVEPOINT {savepoint.group(1)}')
+            self._user_savepoint = True
             return Result()
         rollback_to = _ROLLBACK_TO.match(sql)
         if rollback_to is None:
@@ -2783,9 +2813,11 @@ class PostgresBackend:
 
     def commit(self) -> None:
         self._conn.commit()
+        self._user_savepoint = False
 
     def rollback(self) -> None:
         self._conn.rollback()
+        self._user_savepoint = False
 
     def close(self) -> None:
         self._conn.close()

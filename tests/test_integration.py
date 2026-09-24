@@ -985,6 +985,19 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT n FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), (8,))
 
+    def test_a_query_does_not_block_another_sessions_ddl(self):
+        # A query takes no table lock, so another session may truncate the
+        # table it read while the reader's session is still open (#1190).
+        self.conn.autocommit = False
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER)')
+        self.cur.execute(f'SELECT n FROM {self.TABLE}')
+        self.cur.fetchall()
+        other = _connect_with()
+        try:
+            other.cursor().execute(f'TRUNCATE TABLE {self.TABLE}')
+        finally:
+            other.close()
+
     def test_transaction_control_statements_run_as_sql(self):
         # COMMIT, ROLLBACK, SAVEPOINT and ROLLBACK TO sent as SQL text, as a
         # script sends them, rather than through the connection's calls (#1181).
@@ -5978,6 +5991,27 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
             )
             await Cur.execute(f'SELECT n FROM {Table}')
             self.assertEqual(await Cur.fetchone(), (8,))
+            await self._drop_async(Cur, Table)
+        finally:
+            await Conn.close()
+
+    async def test_a_query_does_not_block_another_sessions_ddl(self):
+        # Async twin of CursorIntegration's.
+        Table = 'PYO_ASYNC_READ_LOCK'
+        Kw = self._kwargs()
+        Kw['autocommit'] = False
+        Conn = await seerdb.connect_async(**Kw)
+        try:
+            Cur = Conn.cursor()
+            await self._drop_async(Cur, Table)
+            await Cur.execute(f'CREATE TABLE {Table} (n NUMBER)')
+            await Cur.execute(f'SELECT n FROM {Table}')
+            await Cur.fetchall()
+            Other = await seerdb.connect_async(**self._kwargs())
+            try:
+                await Other.cursor().execute(f'TRUNCATE TABLE {Table}')
+            finally:
+                await Other.close()
             await self._drop_async(Cur, Table)
         finally:
             await Conn.close()
