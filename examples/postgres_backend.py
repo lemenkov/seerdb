@@ -1069,6 +1069,35 @@ _SEQUENCE_KEYWORD_REWRITES = [
 ]
 
 
+# CREATE OR REPLACE VIEW whose columns change. Oracle replaces the view whatever
+# its new columns; PostgreSQL's OR REPLACE refuses to change a column's type, or
+# to drop or rename one (42P16, invalid_table_definition) -- and the reference
+# thin client's suite redefines one view with a different type per test. So the
+# replacement is tried as written and, on that refusal alone, the view is
+# dropped and created afresh. A plain DROP, not CASCADE: a view other views
+# depend on still refuses loudly rather than taking them with it.
+_CREATE_OR_REPLACE_VIEW = re.compile(
+    r'\s*CREATE\s+OR\s+REPLACE\s+(?:(?:NO)?FORCE\s+)?VIEW\s+([\w."$#]+)',
+    re.IGNORECASE,
+)
+_VIEW_BODY_QUOTE = '$seerdb_view$'
+
+
+def _translate_replace_view(sql: str) -> str | None:
+    match = _CREATE_OR_REPLACE_VIEW.match(sql)
+    if match is None or _VIEW_BODY_QUOTE in sql:
+        return None
+    name = match.group(1)
+    body = _CREATE_OR_REPLACE_VIEW.sub(f'CREATE OR REPLACE VIEW {name}', sql, count=1)
+    quote = _VIEW_BODY_QUOTE
+    return (
+        f'DO $$ BEGIN EXECUTE {quote}{body}{quote}; '
+        'EXCEPTION WHEN invalid_table_definition THEN '
+        f'EXECUTE {quote}DROP VIEW {name}{quote}; EXECUTE {quote}{body}{quote}; '
+        'END $$'
+    )
+
+
 def _translate_ddl(sql: str) -> str:
     """Rewrite an Oracle ``CREATE TABLE`` / object ``CREATE TYPE`` to PostgreSQL:
     map the column/attribute types and drop the clauses PostgreSQL has no equal
@@ -1084,6 +1113,9 @@ def _translate_ddl(sql: str) -> str:
         for pattern, replacement in _DDL_TYPE_REWRITES:
             out = pattern.sub(replacement, out)
         return out
+    view = _translate_replace_view(sql)
+    if view is not None:
+        return view
     if not _IS_CREATE_TABLE.match(sql):
         return sql
     out = _DDL_GLOBAL_TEMPORARY.sub('TEMPORARY', sql)
