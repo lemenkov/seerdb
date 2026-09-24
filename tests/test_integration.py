@@ -781,6 +781,30 @@ class TypesIntegration(_IntegrationBase):
         finally:
             self.cur.execute(f'DROP TYPE {vtype}')
 
+    def test_a_nested_table_type_can_type_a_collection(self):
+        # A nested table type, one of it, and a VARRAY of it (#1194). The types
+        # are created as a script writes them, with type DDL's trailing `;`.
+        from seerdb.common.exceptions import DatabaseError
+
+        names = ('PYO_NT_VARRAY_T', 'PYO_NT_NESTED_T', 'PYO_NT_T')
+        for name in names:
+            try:
+                self.cur.execute(f'DROP TYPE {name}')
+            except DatabaseError:
+                # No leftover type from a prior run; nothing to clean up.
+                pass
+        try:
+            self.cur.execute('CREATE TYPE PYO_NT_T AS TABLE OF NUMBER;')
+            self.cur.execute('CREATE TYPE PYO_NT_NESTED_T AS TABLE OF PYO_NT_T;')
+            self.cur.execute('CREATE TYPE PYO_NT_VARRAY_T AS VARRAY(3) OF PYO_NT_T;')
+        finally:
+            for name in names:
+                try:
+                    self.cur.execute(f'DROP TYPE {name}')
+                except DatabaseError:
+                    # A CREATE above failed, so there is no type to drop.
+                    pass
+
     def test_untyped_null_column(self):
         # An untyped NULL is described with a zero data length and sends no
         # value; the column after it must still decode (#682, and #1185 on 9i).
@@ -6545,6 +6569,35 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                     await Cur.execute(f'DROP TABLE {Table}')
                 finally:
                     await Cur.execute(f'DROP TYPE {VType}')
+
+    async def test_a_nested_table_type_can_type_a_collection(self):
+        # Async twin of TypesIntegration's.
+        from seerdb.common.exceptions import DatabaseError
+
+        names = ('PYO_ANT_VARRAY_T', 'PYO_ANT_NESTED_T', 'PYO_ANT_T')
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                for name in names:
+                    try:
+                        await Cur.execute(f'DROP TYPE {name}')
+                    except DatabaseError:
+                        # No leftover type from a prior run; nothing to clean up.
+                        pass
+                try:
+                    await Cur.execute('CREATE TYPE PYO_ANT_T AS TABLE OF NUMBER;')
+                    await Cur.execute(
+                        'CREATE TYPE PYO_ANT_NESTED_T AS TABLE OF PYO_ANT_T;'
+                    )
+                    await Cur.execute(
+                        'CREATE TYPE PYO_ANT_VARRAY_T AS VARRAY(3) OF PYO_ANT_T;'
+                    )
+                finally:
+                    for name in names:
+                        try:
+                            await Cur.execute(f'DROP TYPE {name}')
+                        except DatabaseError:
+                            # A CREATE above failed, so there is no type to drop.
+                            pass
 
     async def test_untyped_null_column(self):
         # Async twin of TypesIntegration's.
