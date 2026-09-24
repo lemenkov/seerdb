@@ -40,6 +40,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # The SQLAlchemy the compliance suite runs against: one exact version, never a
+  # range or the newest release, so a run changes only when this line does. A
+  # newer SQLAlchemy is a deliberate upgrade of its own (#1199).
+  SQLALCHEMY: "2.0.54"
+
 jobs:
   mirror-compliance:
     name: SQLAlchemy compliance (Mirror over PostgreSQL)
@@ -81,12 +87,13 @@ jobs:
           path: dialect
       - name: Install the dialect and this driver
         run: |
-          pip install "./dialect[test]" "psycopg[binary]"
+          pip install "./dialect[test]" "psycopg[binary]" "SQLAlchemy==$SQLALCHEMY"
           # This checkout's driver on top: master carries the last release's
           # version string, so force the reinstall over the dialect's floor.
           pip install --force-reinstall --no-deps .
       - name: Which driver and dialect this run uses
         run: |
+          python -c "import sqlalchemy; print('SQLAlchemy', sqlalchemy.__version__)"
           python -c "import seerdb, inspect, pathlib; print('driver from:', pathlib.Path(inspect.getfile(seerdb)).parent)"
           python -c "import sqlalchemy_seerdb, inspect, pathlib; print('dialect from:', pathlib.Path(inspect.getfile(sqlalchemy_seerdb)).parent)"
       - name: Run the compliance suite through the Mirror
