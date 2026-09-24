@@ -43,6 +43,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # The SQLAlchemy the compliance suite runs against: one exact version, never a
+  # range or the newest release, so a run changes only when this line does. A
+  # newer SQLAlchemy is a deliberate upgrade of its own (#1199).
+  SQLALCHEMY: "2.0.54"
+
 jobs:
   compliance:
     name: SQLAlchemy compliance (${{ matrix.db.name }}, driver ${{ inputs.driver || (github.event_name == 'schedule' && 'tag') || 'checkout' }}, dialect ${{ inputs.dialect || (github.event_name == 'schedule' && 'pypi') || 'tag' }})
@@ -103,7 +109,7 @@ jobs:
         id: dialect
         run: |
           if [ "$DIALECT" = "pypi" ]; then
-            pip install "sqlalchemy-seerdb[test]"
+            pip install "sqlalchemy-seerdb[test]" "SQLAlchemy==$SQLALCHEMY"
             TAG=$(pip show sqlalchemy-seerdb | awk '/^Version:/{print $2}')
             echo "newest sqlalchemy-seerdb release on PyPI: $TAG"
           else
@@ -128,7 +134,7 @@ jobs:
       # master carries the last release's version string until the next bump.
       - name: Install the dialect from the checkout
         if: env.DIALECT != 'pypi'
-        run: pip install "./dialect[test]"
+        run: pip install "./dialect[test]" "SQLAlchemy==$SQLALCHEMY"
       # pytest runs from the dialect checkout, where its package directory
       # would shadow the installed wheel; in the `pypi` mode only the harness
       # stays.
@@ -139,6 +145,7 @@ jobs:
         run: pip install --force-reinstall --no-deps .
       - name: Which driver and dialect this run uses
         run: |
+          python -c "import sqlalchemy; print('SQLAlchemy', sqlalchemy.__version__)"
           python -c "import seerdb, inspect, pathlib; print('driver from:', pathlib.Path(inspect.getfile(seerdb)).parent)"
           python -c "import sqlalchemy_seerdb, inspect, pathlib; print('dialect', sqlalchemy_seerdb.__version__, 'from:', pathlib.Path(inspect.getfile(sqlalchemy_seerdb)).parent, '| harness at', '${{ steps.dialect.outputs.tag }}')"
           pip show seerdb | grep -E '^(Version|Location)'
