@@ -805,6 +805,17 @@ class TypesIntegration(_IntegrationBase):
                     # A CREATE above failed, so there is no type to drop.
                     pass
 
+    def test_a_bool_declared_number_is_stored_as_a_number(self):
+        # A bool bound with a declared NUMBER type is the NUMBER 0 or 1 on every
+        # server; from 23.1 it used to go out as a native BOOLEAN value, which
+        # the server read as some non-zero NUMBER (#1201).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, n NUMBER)')
+        for i, value in ((1, True), (2, False)):
+            self.cur.setinputsizes(None, seerdb.DB_TYPE_NUMBER)
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', [i, value])
+        self.cur.execute(f'SELECT id, n FROM {self.TABLE} ORDER BY id')
+        self.assertEqual(self.cur.fetchall(), [(1, 1), (2, 0)])
+
     def test_untyped_null_column(self):
         # An untyped NULL is described with a zero data length and sends no
         # value; the column after it must still decode (#682, and #1185 on 9i).
@@ -3983,6 +3994,16 @@ class BooleanIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id, flag FROM {self.TABLE} ORDER BY id')
         self.assertEqual(self.cur.fetchall(), [(1, True), (2, False)])
 
+    def test_boolean_bind_declared_number(self):
+        # A bool whose bind was declared NUMBER, as SQLAlchemy's Oracle dialect
+        # declares every Boolean, stores False as FALSE (#1201).
+        self._setup_bool()
+        for i, value in ((1, True), (2, False)):
+            self.cur.setinputsizes(None, seerdb.DB_TYPE_NUMBER)
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', [i, value])
+        self.cur.execute(f'SELECT id, flag FROM {self.TABLE} ORDER BY id')
+        self.assertEqual(self.cur.fetchall(), [(1, True), (2, False)])
+
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class VectorIntegration(_IntegrationBase):
@@ -6598,6 +6619,22 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                         except DatabaseError:
                             # A CREATE above failed, so there is no type to drop.
                             pass
+
+    async def test_a_bool_declared_number_is_stored_as_a_number(self):
+        # Async twin of TypesIntegration's.
+        Table = 'PYO_ASYNC_BOOL_NUMBER'
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await self._drop_async(Cur, Table)
+                await Cur.execute(f'CREATE TABLE {Table} (id NUMBER, n NUMBER)')
+                for i, value in ((1, True), (2, False)):
+                    Cur.setinputsizes(None, seerdb.DB_TYPE_NUMBER)
+                    await Cur.execute(
+                        f'INSERT INTO {Table} VALUES (:1, :2)', [i, value]
+                    )
+                await Cur.execute(f'SELECT id, n FROM {Table} ORDER BY id')
+                self.assertEqual(await Cur.fetchall(), [(1, 1), (2, 0)])
+                await self._drop_async(Cur, Table)
 
     async def test_untyped_null_column(self):
         # Async twin of TypesIntegration's.
