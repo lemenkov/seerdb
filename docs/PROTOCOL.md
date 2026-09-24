@@ -4749,6 +4749,13 @@ value (`0x00`) followed by the two-byte marker **`0x81 0x01`**. Missing the
 wider NULL indicator silently truncates the row stream (consumes one byte too
 few and desyncs the following rows).
 
+A column the describe gives a **zero data length** (§19.1's MaxLen) -- an untyped
+`SELECT NULL`, or anything Oracle folds to one at parse, such as
+`DECODE(3, 1, 'one')` -- sends **no value at all**, only the `0x81 0x01` marker
+(#1185; captured on 9.2.0.4: `SELECT NULL AS a, 5 AS b` → `07 81 01 02 c1 06 00`).
+It is the 9i form of §6.2's zero-length rule (#682). LONG and LONG RAW are also
+described with a zero length and are the exception: they carry data.
+
 A result set larger than the fetch-array size is drained by **re-sending the
 same exec+fetch `TTI_ALL7`** — the server continues the cursor and ends with
 ORA-01403 (#99; verified: 28 rows arrive as 10 + 10 + 8 across three identical

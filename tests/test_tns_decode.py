@@ -5951,6 +5951,40 @@ class TestFv2ExecResponse(unittest.TestCase):
         self.assertEqual(rows[2][1], 'carol')
 
 
+class TestFv2ZeroLengthColumn(unittest.TestCase):
+    """A 9i column described with a zero data length sends only the NULL
+    indicator, no value (#1185). Real 9.2.0.4 replies."""
+
+    # SELECT NULL AS a FROM dual
+    ALONE = bytes.fromhex(
+        '0602010100010a00000007810104010102057b000001010003000000000000'
+        '0000000000000000010100000000194f52412d30313430333a206e6f206461'
+        '746120666f756e640a'
+    )
+    # SELECT NULL AS a, 5 AS b FROM dual
+    BEFORE_A_VALUE = bytes.fromhex(
+        '0602010200010a00000007810102c1060004010102057b0000010100030000'
+        '000000000000000000000000010100000000194f52412d30313430333a206e'
+        '6f206461746120666f756e640a'
+    )
+
+    def test_it_is_null(self):
+        from seerdb.common.tns import decode_fv2_exec_response
+
+        cols = [{'data_type': 1, 'data_length': 0}]
+        self.assertEqual(decode_fv2_exec_response(self.ALONE, cols), ([[None]], 1403))
+
+    def test_it_does_not_swallow_the_next_column(self):
+        from seerdb.common.tns import decode_fv2_exec_response
+
+        cols = [
+            {'data_type': 1, 'data_length': 0},
+            {'data_type': 2, 'data_length': 2},
+        ]
+        rows = decode_fv2_exec_response(self.BEFORE_A_VALUE, cols)
+        self.assertEqual(rows, ([[None, 5]], 1403))
+
+
 class TestFv2LongRows(unittest.TestCase):
     """Oracle 9i LONG columns in a batch fetch (#102): the value is a chunked
     DALC (0xfe form), no trailing descriptor. Fixture is a real response for
