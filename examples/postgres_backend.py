@@ -994,6 +994,19 @@ _IS_DDL = re.compile(
     r'\s*(CREATE|ALTER|DROP|TRUNCATE|RENAME|COMMENT|GRANT|REVOKE)\b', re.IGNORECASE
 )
 
+# Transaction control sent as SQL text (#1181). Every other statement runs inside
+# the `_mirror_stmt` savepoint (see execute), and these cannot: a COMMIT or
+# ROLLBACK ends the transaction and the savepoint with it, so the RELEASE after
+# it failed and the session was lost; a user SAVEPOINT taken inside it died with
+# its RELEASE; and a ROLLBACK TO an earlier savepoint destroys it.
+_TRANSACTION_END = re.compile(r'\s*(COMMIT|ROLLBACK)(?:\s+WORK)?\s*\Z', re.IGNORECASE)
+_SAVEPOINT_NAME = r'("[^"]+"|[A-Za-z][\w$]*)'
+_SAVEPOINT = re.compile(rf'\s*SAVEPOINT\s+{_SAVEPOINT_NAME}\s*\Z', re.IGNORECASE)
+_ROLLBACK_TO = re.compile(
+    rf'\s*ROLLBACK(?:\s+WORK)?\s+TO\s+(?:SAVEPOINT\s+)?{_SAVEPOINT_NAME}\s*\Z',
+    re.IGNORECASE,
+)
+
 
 # An Oracle object type — `CREATE [OR REPLACE] TYPE name AS OBJECT (attrs)` — maps
 # to a PostgreSQL composite type (`CREATE TYPE name AS (attrs)`), which a typed
@@ -1691,6 +1704,7 @@ _SQLSTATE_TO_ORA = {
     #                direction is ORA-02292, not distinguished by SQLSTATE alone)
     '23514': 2290,  # check_violation         -> check constraint violated
     '22P02': 1722,  # invalid_text_representation -> invalid number (TO_NUMBER)
+    '3B001': 1086,  # invalid_savepoint_specification -> savepoint never established
 }
 
 
@@ -2124,6 +2138,9 @@ class PostgresBackend:
         # values (#503). An ordinary statement's BindVar is a typed NULL, which
         # _translate_binds casts (#699).
         sql = _strip_leading_comments(sql)
+        transaction_control = self._execute_transaction_control(sql)
+        if transaction_control is not None:
+            return transaction_control
         if binds and is_plsql(sql):
             return self._execute_plsql(sql, binds)
         # A `SELECT REF(alias)` object-REF fetch: PostgreSQL has no REF, so stand in
@@ -2192,6 +2209,36 @@ class PostgresBackend:
                 rowcount=len(touched), last_rowid=touched[-1] if touched else None
             )
         return result
+
+    def _execute_transaction_control(self, sql: str) -> Result | None:
+        # COMMIT / ROLLBACK / SAVEPOINT / ROLLBACK TO as SQL text, outside the
+        # per-statement savepoint (#1181); None for any other statement.
+        end = _TRANSACTION_END.match(sql)
+        if end is not None:
+            if end.group(1).upper() == 'COMMIT':
+                self.commit()
+            else:
+                self.rollback()
+            return Result()
+        savepoint = _SAVEPOINT.match(sql)
+        if savepoint is not None:
+            self._conn.execute(f'SAVEPOINT {savepoint.group(1)}')
+            return Result()
+        rollback_to = _ROLLBACK_TO.match(sql)
+        if rollback_to is None:
+            return None
+        # Still under `_mirror_stmt`, so an unknown name fails as ORA-01086 and
+        # leaves the transaction usable, as Oracle's does; PostgreSQL alone would
+        # abort it. On success there is nothing to release: rolling back to the
+        # older savepoint has destroyed `_mirror_stmt` already.
+        self._conn.execute('SAVEPOINT _mirror_stmt')
+        try:
+            self._conn.execute(f'ROLLBACK TO SAVEPOINT {rollback_to.group(1)}')
+        except psycopg.Error as exc:
+            self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_stmt')
+            self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
+            raise _backend_error(exc, original=sql) from exc
+        return Result()
 
     def execute_returning(self, sql: str, rows: Sequence[Sequence]) -> Result:
         # DML ... RETURNING col INTO :b (#689). PostgreSQL has the feature but

@@ -1391,6 +1391,59 @@ def test_change_password_updates_the_shared_credential_map() -> None:
     assert creds['PYO'] == 'again'
 
 
+class _RecordingConn:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def execute(self, statement: str) -> None:
+        self.calls.append(statement)
+
+    def commit(self) -> None:
+        self.calls.append('<commit>')
+
+    def rollback(self) -> None:
+        self.calls.append('<rollback>')
+
+
+class _RecordingPostgresBackend(PostgresBackend):
+    # Just a connection that records what reaches it.
+    def __init__(self) -> None:
+        self._conn = _RecordingConn()
+
+
+def test_transaction_control_runs_outside_the_statement_savepoint() -> None:
+    # COMMIT / ROLLBACK end the transaction and SAVEPOINT must outlive the
+    # statement, so none of them may sit inside `_mirror_stmt` (#1181).
+    backend = _RecordingPostgresBackend()
+    for statement in ('COMMIT', 'commit work', 'ROLLBACK', '-- done\nROLLBACK WORK'):
+        backend.execute(statement)
+    backend.execute('SAVEPOINT sp1')
+    assert backend._conn.calls == [
+        '<commit>',
+        '<commit>',
+        '<rollback>',
+        '<rollback>',
+        'SAVEPOINT sp1',
+    ]
+
+
+def test_rollback_to_a_savepoint_is_guarded_but_not_released() -> None:
+    # Under `_mirror_stmt`, so an unknown name fails without aborting the
+    # transaction; no RELEASE after, as rolling back to the older savepoint
+    # destroyed it (#1181).
+    backend = _RecordingPostgresBackend()
+    backend.execute('ROLLBACK WORK TO SAVEPOINT sp1')
+    backend.execute('rollback to "Sp2"')
+    assert backend._conn.calls == [
+        'SAVEPOINT _mirror_stmt',
+        'ROLLBACK TO SAVEPOINT sp1',
+        'SAVEPOINT _mirror_stmt',
+        'ROLLBACK TO SAVEPOINT "Sp2"',
+    ]
+    unknown = _backend_error(_FakePgError('3B001', 'savepoint "sp9" does not exist'))
+    assert unknown.ora_code == 1086
+
+
 def test_change_password_rejects_a_wrong_old_password() -> None:
     from seerdb.server import BackendError
 
