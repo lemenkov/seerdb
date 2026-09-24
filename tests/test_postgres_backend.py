@@ -1110,7 +1110,18 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
         'sys.ora_rowid',
     ):
         assert f'FUNCTION {name}(' in _HELPER_FUNCTIONS_DDL
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 9
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 19
+    # Oracle's conversion functions orafce lacks, one overload per argument
+    # type a caller passes.
+    for name in (
+        'to_binary_float',
+        'to_binary_double',
+        'to_dsinterval',
+        'to_yminterval',
+        'to_blob',
+        'to_nclob',
+    ):
+        assert f'FUNCTION {name}(' in _HELPER_FUNCTIONS_DDL
     # rowidtochar is the identity on the text the ROWID pseudo-column rewrites
     # to, so ROWIDTOCHAR(ROWID) equals ROWID.
     assert 'FUNCTION rowidtochar(text) RETURNS text' in _HELPER_FUNCTIONS_DDL
