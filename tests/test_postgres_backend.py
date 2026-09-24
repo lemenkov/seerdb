@@ -474,6 +474,20 @@ def test_table_compression_is_dropped() -> None:
     assert kept == 'CREATE TABLE t (id numeric, "COMPRESS" numeric)'
 
 
+def test_a_nested_table_type_becomes_an_unbounded_array_domain() -> None:
+    # A nested table has no maximum size, so no CHECK (#1194); the element type
+    # is mapped as a column's, and may be another collection type.
+    assert _translate_ddl('create type s.t as table of number;') == (
+        'CREATE DOMAIN s.t AS numeric[]'
+    )
+    assert _translate_ddl('CREATE TYPE s.v AS TABLE OF VARCHAR2(20)') == (
+        'CREATE DOMAIN s.v AS varchar(20)[]'
+    )
+    assert _translate_ddl('create type s.tt\n    as table of s.t;') == (
+        'CREATE DOMAIN s.tt AS s.t[]'
+    )
+
+
 def test_a_varray_type_becomes_a_bounded_array_domain() -> None:
     # The bound rides in a CHECK; a script's trailing `;`, which Oracle accepts
     # on type DDL, stays out of the element type.

@@ -1051,6 +1051,14 @@ _CREATE_TYPE_VARRAY = re.compile(
     r'\s*CREATE\s+TYPE\s+(\S+)\s+AS\s+VARRAY\s*\(\s*(\d+)\s*\)\s+OF\s+(.+?)\s*;?\s*$',
     re.IGNORECASE | re.DOTALL,
 )
+# A nested table type -- `CREATE TYPE name AS TABLE OF elem` -- is the same
+# mapping without the bound: a nested table has no maximum size (#1194). The
+# element may itself be a collection type: PostgreSQL takes an array of a domain
+# over an array, jagged inner collections and all.
+_CREATE_TYPE_TABLE_OF = re.compile(
+    r'\s*CREATE\s+TYPE\s+(\S+)\s+AS\s+TABLE\s+OF\s+(.+?)\s*;?\s*$',
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 # Oracle session / user admin statements the provisioning issues, mapped to their
@@ -1161,6 +1169,12 @@ def _translate_ddl(sql: str) -> str:
             f'CREATE DOMAIN {name} AS {element}[] '
             f'CHECK (VALUE IS NULL OR array_length(VALUE, 1) <= {bound})'
         )
+    nested = _CREATE_TYPE_TABLE_OF.match(sql)
+    if nested:
+        name, element = nested.groups()
+        for pattern, replacement in _DDL_TYPE_REWRITES:
+            element = pattern.sub(replacement, element)
+        return f'CREATE DOMAIN {name} AS {element}[]'
     if _CREATE_TYPE_OBJECT.match(sql):
         # `... AS OBJECT (attrs)` → `... AS (attrs)`, then map the attribute types
         # (NUMBER → numeric, VARCHAR2(n) → varchar(n), …) the same way as a table.
