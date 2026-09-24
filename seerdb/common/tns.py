@@ -12645,6 +12645,13 @@ def _declared_value_bytes(Value: object, DataType: int) -> bytes | None:
         return None
     if isinstance(Value, (datetime.date, BcDate)) and DataType in _DECLARED_TEMPORAL:
         return _bytes_with_length(_encode_temporal(Value, DataType))
+    if isinstance(Value, bool) and DataType == TNS_TYPE_NUMBER:
+        # From 23.1 a bare bool goes out as a native BOOLEAN value, which a
+        # NUMBER descriptor makes the server read as a non-zero NUMBER: False
+        # was stored as TRUE (#1201). Declared NUMBER, it is the NUMBER 0 or 1,
+        # as python-oracledb sends it.
+        Bytes = encode_token_num(int(Value))
+        return bytes([len(Bytes)]) + Bytes
     if isinstance(Value, (int, float)) and not isinstance(Value, bool):
         if DataType == TNS_TYPE_BDOUBLE:
             return _bytes_with_length(encode_token_binary_double(float(Value)))

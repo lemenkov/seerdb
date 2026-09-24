@@ -178,6 +178,25 @@ class TestTheDeclarationGovernsTheValue(unittest.TestCase):
     def test_a_null_is_still_a_null(self):
         self.assertEqual(encode_token_rxd(Var(seerdb.DB_TYPE_DATE)), bytes([0]))
 
+    def test_a_bool_declared_number_is_a_number(self):
+        # From 23.1 a bare bool is a native BOOLEAN value; declared NUMBER it
+        # must be the NUMBER 0 or 1 the descriptor announces, or the server
+        # reads False as a non-zero NUMBER (#1201).
+        from seerdb.common.tns import _ENCODE_FIELD_VERSION
+        from seerdb.common.tns_consts import FIELD_VERSION_12_1, FIELD_VERSION_23_1
+
+        for version in (FIELD_VERSION_12_1, FIELD_VERSION_23_1):
+            token = _ENCODE_FIELD_VERSION.set(version)
+            try:
+                self.assertEqual(
+                    self._sent(seerdb.DB_TYPE_NUMBER, False), encode_token_rxd(0)
+                )
+                self.assertEqual(
+                    self._sent(seerdb.DB_TYPE_NUMBER, True), encode_token_rxd(1)
+                )
+            finally:
+                _ENCODE_FIELD_VERSION.reset(token)
+
 
 if __name__ == '__main__':
     unittest.main()
