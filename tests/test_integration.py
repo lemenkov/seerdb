@@ -898,6 +898,36 @@ class CursorIntegration(_IntegrationBase):
         (n, text) = self.cur.fetchone()
         self.assertEqual((float(n), text), (1.5, 'a'))
 
+    def test_the_conversion_functions(self):
+        # TO_BINARY_FLOAT / _DOUBLE, TO_DSINTERVAL / TO_YMINTERVAL, TO_BLOB and
+        # TO_NCLOB -- a backend without them answered "function ... does not
+        # exist" to the reference thin client's own suite.
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            self.skipTest('BINARY_FLOAT / BINARY_DOUBLE are 10g+')
+        self.cur.execute(
+            "SELECT TO_BINARY_DOUBLE(1.5), TO_BINARY_FLOAT('2.5'), "
+            "TO_DSINTERVAL('1 02:03:04') FROM dual"
+        )
+        (dbl, flt, ds) = self.cur.fetchone()
+        self.assertEqual((dbl, flt), (1.5, 2.5))
+        self.assertEqual(ds, datetime.timedelta(days=1, hours=2, minutes=3, seconds=4))
+        self.cur.execute("SELECT TO_BLOB(HEXTORAW('ABCD')), TO_NCLOB('n') FROM dual")
+        (blob, nclob) = self.cur.fetchone()
+        # A real server hands back LOBs, this backend the values themselves.
+        self.assertEqual(blob.read() if hasattr(blob, 'read') else blob, b'\xab\xcd')
+        self.assertEqual(nclob.read() if hasattr(nclob, 'read') else nclob, 'n')
+
+    def test_a_computed_year_to_month_interval(self):
+        # PostgreSQL reports a computed domain-typed value as its base type, so
+        # that backend can tell a YEAR TO MONTH interval from a DAY TO SECOND one
+        # only when it comes from a column of that type.
+        self._skip_if_mirror_backend(
+            'postgres', 'tell a computed YEAR TO MONTH interval from DAY TO SECOND'
+        )
+        self.cur.execute("SELECT TO_YMINTERVAL('01-02') FROM dual")
+        (ym,) = self.cur.fetchone()
+        self.assertEqual((ym.years, ym.months), (1, 2))
+
     def test_the_nls_parameters_are_readable(self):
         # A client may read the database character set before anything else:
         # the reference thin client's own test harness does, and a server that

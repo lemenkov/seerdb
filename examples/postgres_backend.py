@@ -247,6 +247,34 @@ _HELPER_FUNCTIONS_DDL = (
     # rewritten to text already (sys.ora_rowid), so this is the identity on it.
     'CREATE OR REPLACE FUNCTION rowidtochar(text) RETURNS text '
     'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
+    # Oracle's conversion functions orafce does not provide. TO_BINARY_FLOAT /
+    # TO_BINARY_DOUBLE are the two float widths, from a number or its text --
+    # PostgreSQL's float input already takes Oracle's 'Inf' / '-Inf' / 'NaN'.
+    # TO_DSINTERVAL ('8 09:24:18.1') and TO_YMINTERVAL ('8-04') are interval
+    # literals PostgreSQL parses as they stand, SQL-standard or ISO 'P...' form
+    # alike. TO_BLOB / TO_NCLOB are the identity, as a BLOB is bytea and an
+    # NCLOB text here. A bare literal is `unknown` to PostgreSQL, which the text
+    # overloads take.
+    'CREATE OR REPLACE FUNCTION to_binary_float(numeric) RETURNS real '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::real $$;'
+    'CREATE OR REPLACE FUNCTION to_binary_float(double precision) RETURNS real '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::real $$;'
+    'CREATE OR REPLACE FUNCTION to_binary_float(text) RETURNS real '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::real $$;'
+    'CREATE OR REPLACE FUNCTION to_binary_double(numeric) RETURNS double precision '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::double precision $$;'
+    'CREATE OR REPLACE FUNCTION to_binary_double(double precision) '
+    'RETURNS double precision LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
+    'CREATE OR REPLACE FUNCTION to_binary_double(text) RETURNS double precision '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::double precision $$;'
+    'CREATE OR REPLACE FUNCTION to_dsinterval(text) RETURNS interval '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::interval $$;'
+    'CREATE OR REPLACE FUNCTION to_yminterval(text) RETURNS interval '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::interval $$;'
+    'CREATE OR REPLACE FUNCTION to_blob(bytea) RETURNS bytea '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
+    'CREATE OR REPLACE FUNCTION to_nclob(text) RETURNS text '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
 )
 
 
