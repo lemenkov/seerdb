@@ -898,6 +898,21 @@ class CursorIntegration(_IntegrationBase):
         (n, text) = self.cur.fetchone()
         self.assertEqual((float(n), text), (1.5, 'a'))
 
+    def test_the_nls_parameters_are_readable(self):
+        # A client may read the database character set before anything else:
+        # the reference thin client's own test harness does, and a server that
+        # lacked the view failed every one of its tests in setup (ORA-00942).
+        self.cur.execute(
+            'SELECT value FROM nls_database_parameters '
+            "WHERE parameter = 'NLS_CHARACTERSET'"
+        )
+        (charset,) = self.cur.fetchone()
+        self.assertTrue(charset)
+        self.cur.execute(
+            "SELECT value FROM nls_session_parameters WHERE parameter = 'NLS_DATE_FORMAT'"
+        )
+        self.assertTrue(self.cur.fetchone()[0])
+
     def test_a_session_setting_answers_with_no_result_set(self):
         # ALTER SESSION is not a query: a server answers it with a status and no
         # rows. A backend that stood a `SELECT 1` in for one answered with a row,
@@ -5804,6 +5819,19 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
             await Cur.execute(f'SELECT n FROM {Table}')
             self.assertEqual(float((await Cur.fetchone())[0]), 2.5)
             await self._drop_async(Cur, Table)
+        finally:
+            await Conn.close()
+
+    async def test_the_nls_parameters_are_readable(self):
+        # Async twin of CursorIntegration's.
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            await Cur.execute(
+                'SELECT value FROM nls_database_parameters '
+                "WHERE parameter = 'NLS_CHARACTERSET'"
+            )
+            self.assertTrue((await Cur.fetchone())[0])
         finally:
             await Conn.close()
 

@@ -448,6 +448,32 @@ _ORACLE_DICTIONARY_DDL = (
     # read username from here; the emulation schemas (oracle, sys) and PostgreSQL's
     # own (pg_*, information_schema) are hidden, so a reflecting client sees the
     # real schemas (public, test_schema, ...) under Oracle's upper-cased names.
+    # NLS parameters: the database character set and the formats a client may
+    # read before it does anything else -- the reference thin client's test
+    # harness asks nls_database_parameters for NLS_CHARACTERSET while it sets up,
+    # so without the view every one of its tests failed ORA-00942 before its
+    # body ran. The values are Oracle's defaults, which is what this backend
+    # behaves as: AL32UTF8 data, AL16UTF16 national data, AMERICAN formats. The
+    # session and instance views carry no character sets, as Oracle's do not.
+    'CREATE OR REPLACE VIEW sys.nls_database_parameters AS SELECT * FROM (VALUES '
+    "('NLS_LANGUAGE', 'AMERICAN'), ('NLS_TERRITORY', 'AMERICA'), "
+    "('NLS_CURRENCY', '$'), ('NLS_ISO_CURRENCY', 'AMERICA'), "
+    "('NLS_NUMERIC_CHARACTERS', '.,'), ('NLS_CHARACTERSET', 'AL32UTF8'), "
+    "('NLS_CALENDAR', 'GREGORIAN'), ('NLS_DATE_FORMAT', 'DD-MON-RR'), "
+    "('NLS_DATE_LANGUAGE', 'AMERICAN'), ('NLS_SORT', 'BINARY'), "
+    "('NLS_TIME_FORMAT', 'HH.MI.SSXFF AM'), "
+    "('NLS_TIMESTAMP_FORMAT', 'DD-MON-RR HH.MI.SSXFF AM'), "
+    "('NLS_TIME_TZ_FORMAT', 'HH.MI.SSXFF AM TZR'), "
+    "('NLS_TIMESTAMP_TZ_FORMAT', 'DD-MON-RR HH.MI.SSXFF AM TZR'), "
+    "('NLS_DUAL_CURRENCY', '$'), ('NLS_COMP', 'BINARY'), "
+    "('NLS_LENGTH_SEMANTICS', 'BYTE'), ('NLS_NCHAR_CONV_EXCP', 'FALSE'), "
+    "('NLS_NCHAR_CHARACTERSET', 'AL16UTF16')"
+    ') AS p(parameter, value);'
+    'CREATE OR REPLACE VIEW sys.nls_session_parameters AS SELECT * FROM '
+    'nls_database_parameters WHERE parameter NOT IN '
+    "('NLS_CHARACTERSET', 'NLS_NCHAR_CHARACTERSET');"
+    'CREATE OR REPLACE VIEW sys.nls_instance_parameters AS SELECT * FROM '
+    'nls_session_parameters;'
     'CREATE OR REPLACE VIEW sys.all_users AS SELECT upper(nspname) AS username, '
     'oid::bigint AS user_id, NULL::timestamp AS created FROM pg_namespace '
     "WHERE nspname NOT LIKE 'pg\\_%' "
