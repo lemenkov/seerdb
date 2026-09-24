@@ -968,6 +968,23 @@ class CursorIntegration(_IntegrationBase):
         finally:
             self.cur.execute(f'DROP VIEW {view}')
 
+    def test_decode(self):
+        # DECODE with untyped literals, a NULL matching a NULL, several searches
+        # and no default; and, as a schema script populates a table, a DECODE of
+        # mixed types into a NUMBER column (#822).
+        self.cur.execute(
+            "SELECT DECODE('a', 'a', 'A', 'z'), DECODE(NULL, NULL, 'null', 'no'), "
+            "DECODE(2, 1, 'one', 2, 'two'), DECODE(3, 1, 'one') FROM dual"
+        )
+        self.assertEqual(self.cur.fetchone(), ('A', 'null', 'two', None))
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, n NUMBER)')
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} '
+            'SELECT 3, DECODE(MOD(3, 2), 0, NULL, POWER(2, 3)) FROM dual'
+        )
+        self.cur.execute(f'SELECT n FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone(), (8,))
+
     def test_transaction_control_statements_run_as_sql(self):
         # COMMIT, ROLLBACK, SAVEPOINT and ROLLBACK TO sent as SQL text, as a
         # script sends them, rather than through the connection's calls (#1181).
@@ -5939,6 +5956,29 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await Cur.fetchone(), ('x',))
             finally:
                 await Cur.execute(f'DROP VIEW {View}')
+        finally:
+            await Conn.close()
+
+    async def test_decode(self):
+        # Async twin of CursorIntegration's.
+        Table = 'PYO_ASYNC_DECODE'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            await Cur.execute(
+                "SELECT DECODE('a', 'a', 'A', 'z'), DECODE(NULL, NULL, 'null', 'no'), "
+                "DECODE(2, 1, 'one', 2, 'two'), DECODE(3, 1, 'one') FROM dual"
+            )
+            self.assertEqual(await Cur.fetchone(), ('A', 'null', 'two', None))
+            await self._drop_async(Cur, Table)
+            await Cur.execute(f'CREATE TABLE {Table} (id NUMBER, n NUMBER)')
+            await Cur.execute(
+                f'INSERT INTO {Table} '
+                'SELECT 3, DECODE(MOD(3, 2), 0, NULL, POWER(2, 3)) FROM dual'
+            )
+            await Cur.execute(f'SELECT n FROM {Table}')
+            self.assertEqual(await Cur.fetchone(), (8,))
+            await self._drop_async(Cur, Table)
         finally:
             await Conn.close()
 

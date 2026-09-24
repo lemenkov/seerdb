@@ -362,6 +362,36 @@ def test_translate_idioms_rewrites_connect_by_level_row_generator() -> None:
     assert multi == 'SELECT 42 AS k, LEVEL AS n FROM generate_series(1, 200) AS level'
 
 
+def test_translate_idioms_rewrites_decode_to_case() -> None:
+    # orafce's decode resolves no untyped or mixed arguments; a CASE takes both,
+    # and IS NOT DISTINCT FROM matches NULL with NULL as DECODE does (#822).
+    assert _translate_idioms("SELECT decode('a', 'a', 'A', 'z') FROM dual") == (
+        "SELECT CASE WHEN ('a') IS NOT DISTINCT FROM ('a') THEN 'A' ELSE 'z' END "
+        'FROM dual'
+    )
+    assert _translate_idioms('SELECT DECODE(x, 1, 1, 2, 4) FROM t') == (
+        'SELECT CASE WHEN (x) IS NOT DISTINCT FROM (1) THEN 1 '
+        'WHEN (x) IS NOT DISTINCT FROM (2) THEN 4 END FROM t'
+    )
+    # Arguments are split at the top level only, and a nested DECODE is
+    # rewritten too.
+    assert _translate_idioms(
+        "SELECT decode(decode(x, 1, f(a, b), 'y,z'), 'y,z', 0, 1) FROM t"
+    ) == (
+        'SELECT CASE WHEN (CASE WHEN (x) IS NOT DISTINCT FROM (1) THEN f(a, b) '
+        "ELSE 'y,z' END) IS NOT DISTINCT FROM ('y,z') THEN 0 ELSE 1 END FROM t"
+    )
+    # PostgreSQL's own decode(data, format), a qualified call, another
+    # function's name and a string are left alone.
+    for untouched in (
+        "SELECT decode(v, 'hex') FROM t",
+        'SELECT pg_catalog.decode(a, b, c) FROM t',
+        'SELECT my_decode(a, b, c) FROM t',
+        "SELECT 'decode(a, b, c)' FROM dual",
+    ):
+        assert _translate_idioms(untouched) == untouched
+
+
 def test_translate_idioms_rewrites_minus_to_except() -> None:
     # Oracle's MINUS set operator is PostgreSQL's EXCEPT; the SQLAlchemy Oracle
     # dialect's get_table_names query uses MINUS (#759).

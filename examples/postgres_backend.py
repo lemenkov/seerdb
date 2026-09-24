@@ -1166,7 +1166,7 @@ _REF_SELECT = re.compile(
 _IDIOM_REWRITES = [
     # (HEXTORAW, RAWTOHEX, EMPTY_CLOB / EMPTY_BLOB and FROM_TZ are installed as
     # real PostgreSQL functions — see _HELPER_FUNCTIONS_DDL / __init__ — so their
-    # call sites resolve directly and need no rewrite here. DECODE, TO_CHAR,
+    # call sites resolve directly and need no rewrite here. TO_CHAR,
     # TO_DATE, ADD_MONTHS, INSTR, … come from the orafce extension the same way.
     # Only bare pseudo-constants and literal / clause shapes remain below.)
     # NVL is the exception: orafce offers four overloads — nvl(anyelement,
@@ -1495,11 +1495,63 @@ def _translate_signed_year(sql: str) -> str:
     return ''.join(out)
 
 
+# DECODE(expr, search1, result1, ..., [default]) becomes a CASE (#822). orafce's
+# decode is declared over polymorphic parameters, which PostgreSQL resolves from
+# the argument types: all-untyped literals give it nothing to resolve from, and
+# mixed types -- DECODE(MOD(i, 2), 0, NULL, POWER(143, i)) -- match no candidate.
+# CASE takes both. IS NOT DISTINCT FROM, not `=`, because DECODE matches a NULL
+# against a NULL. Two known differences remain: `expr` is repeated once per
+# search, so a volatile one is evaluated more than once; and CASE types the
+# result from all its branches, where Oracle takes the first result's type and
+# makes a leading NULL one VARCHAR2. The expression and each search go in
+# parentheses, as IS NOT DISTINCT FROM binds tighter than `=`, AND or OR.
+# PostgreSQL's own two-argument decode(data, format) is left alone, as is a
+# schema-qualified call.
+_DECODE_CALL = re.compile(r'decode\s*\(', re.IGNORECASE)
+
+
+def _translate_decode(sql: str) -> str:
+    if 'decode' not in sql.lower():
+        return sql
+    (out, pos) = ([], 0)
+    in_string = False
+    i = 0
+    while i < len(sql):
+        if sql[i] == "'":
+            in_string = not in_string
+            i += 1
+            continue
+        match = None if in_string else _DECODE_CALL.match(sql, i)
+        if match is None or (i and (sql[i - 1].isalnum() or sql[i - 1] in '_$#."')):
+            i += 1
+            continue
+        found = _call_args(sql, match.end() - 1)
+        if found is None:
+            break
+        (args, end) = found
+        if len(args) < 3:
+            i = match.end()
+            continue
+        (expr, *rest) = [_translate_decode(a).strip() for a in args]
+        default = rest.pop() if len(rest) % 2 else None
+        branches = ' '.join(
+            f'WHEN ({expr}) IS NOT DISTINCT FROM ({search}) THEN {result}'
+            for search, result in zip(rest[::2], rest[1::2])
+        )
+        otherwise = f' ELSE {default}' if default is not None else ''
+        out.append(sql[pos:i])
+        out.append(f'CASE {branches}{otherwise} END')
+        pos = i = end
+    out.append(sql[pos:])
+    return ''.join(out)
+
+
 def _translate_idioms(sql: str) -> str:
     """Rewrite the Oracle SQL functions / literal idioms the suite uses to their
     PostgreSQL equivalents (#502). Applied to every statement."""
     sql = _translate_connect_by(sql)
     sql = _translate_signed_year(sql)
+    sql = _translate_decode(sql)
     for pattern, replacement in _IDIOM_REWRITES:
         sql = pattern.sub(replacement, sql)
     return _TSTZ_LITERAL.sub(_tstz_literal_sub, sql)
