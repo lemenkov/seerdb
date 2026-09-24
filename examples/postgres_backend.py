@@ -86,6 +86,7 @@ import hashlib
 import re
 import struct
 from collections.abc import Sequence
+from dataclasses import replace
 
 import psycopg
 from psycopg import sql
@@ -587,6 +588,12 @@ _ORACLE_DICTIONARY_DDL = (
     'JOIN pg_attribute a ON a.attrelid=tc.oid AND a.attnum=k.attnum '
     'WHERE (k.opt & 1) = 1 '
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    # The columns created with a quoted all-lower-case name (#1204). PostgreSQL
+    # stores "abc" exactly as it stores an unquoted abc, which Oracle would have
+    # folded to ABC, so the difference has to be kept here. Keyed by PostgreSQL's
+    # own column identity; rows of dropped tables are pruned on the next write.
+    'CREATE TABLE IF NOT EXISTS sys.ora_quoted_names ('
+    'relid oid NOT NULL, attnum smallint NOT NULL, PRIMARY KEY (relid, attnum));'
 )
 
 # What the installed dictionary is stamped with, as the `sys` schema's comment:
@@ -995,6 +1002,14 @@ def _urowid_expression(pk_columns: list[str]) -> str:
 _IS_CREATE_TABLE = re.compile(
     r'\s*CREATE\s+(?:GLOBAL\s+TEMPORARY\s+)?TABLE\b', re.IGNORECASE
 )
+# The table a CREATE TABLE names, and the quoted all-lower-case identifiers in it
+# -- the column names Oracle keeps in lower case (#1204).
+_CREATE_TABLE_NAME = re.compile(
+    r'\s*CREATE\s+(?:GLOBAL\s+TEMPORARY\s+)?TABLE\s+'
+    r'((?:"[^"]+"|[\w$#]+)(?:\.(?:"[^"]+"|[\w$#]+))?)',
+    re.IGNORECASE,
+)
+_QUOTED_LOWER_NAME = re.compile(r'"([a-z][a-z0-9_$#]*)"')
 # Oracle auto-commits DDL (an implicit COMMIT before and after), so a DDL statement
 # is never rolled back and any pending DML committed with it. PostgreSQL keeps DDL
 # transactional, so the Mirror commits after a successful DDL to match — a later
@@ -1929,12 +1944,27 @@ def _decode_row(cursor, row, tstz_oid: int | None) -> list | None:
     ]
 
 
+# How Oracle reports an identifier (#1204): an unquoted one folded to upper case,
+# a quoted one as written. PostgreSQL folds the other way, so a legal unquoted
+# lower-case name -- one that is not a reserved word, which only a quoted name
+# could be -- came from an unquoted one and is upper-cased; anything else (mixed
+# case, special characters) was quoted and is kept. A quoted all-lower-case name
+# is indistinguishable here; sys.ora_quoted_names records those.
+_UNQUOTED_NAME = re.compile(r'[a-z][a-z0-9_$#]*')
+
+
+def _oracle_column_name(name: str) -> str:
+    if _UNQUOTED_NAME.fullmatch(name) and name.upper() not in _ORACLE_RESERVED_WORDS:
+        return name.upper()
+    return name
+
+
 def _lob_column_meta(name: str, tns_type: int) -> ColumnMeta:
     # A CLOB / BLOB result column (an ora_clob / ora_blob domain traced back through
     # the catalog). LOBs are unsized on the wire — data_length is nominal, max_size
     # 0 — and the Mirror streams the cell content as a locator (#534).
     return ColumnMeta(
-        name=name.upper().encode('utf-8'),
+        name=_oracle_column_name(name).encode('utf-8'),
         data_type=tns_type,
         data_length=4000,
         max_size=0,
@@ -1946,7 +1976,7 @@ def _intervalym_column_meta(name: str) -> ColumnMeta:
     # through the catalog). The wire form is 5 bytes — 4-byte years + 1-byte months
     # (see the Mirror's encode_interval_ym) — and its cells are IntervalYM (#504).
     return ColumnMeta(
-        name=name.upper().encode('utf-8'),
+        name=_oracle_column_name(name).encode('utf-8'),
         data_type=TNS_TYPE_INTERVALYM,
         data_length=5,
         max_size=5,
@@ -1956,7 +1986,7 @@ def _intervalym_column_meta(name: str) -> ColumnMeta:
 def _column_meta(desc, values: list, tstz_oid: int | None = None) -> ColumnMeta:
     # `desc` is a psycopg Column (name / type_code / precision / scale / ...).
     name, oid = desc.name, desc.type_code
-    ident = name.upper().encode('utf-8')
+    ident = _oracle_column_name(name).encode('utf-8')
     if tstz_oid is not None and oid == tstz_oid:
         # The ora_tstz composite backing TIMESTAMP WITH TIME ZONE — the cells are
         # reconstructed to aware datetimes by the caller (#519).
@@ -2216,6 +2246,14 @@ class PostgresBackend:
         except psycopg.Error:
             self._conn.rollback()
         self._conn.commit()
+        # The quoted-name catalog (#1204) comes with the dictionary; a session
+        # whose dictionary could not be installed does without it.
+        row = self._conn.execute(
+            "SELECT to_regclass('sys.ora_quoted_names') IS NOT NULL"
+        ).fetchone()
+        self._has_quoted_names = bool(row and row[0])
+        self._quoted_col_cache: dict[tuple[int, int], bool] = {}
+        self._conn.commit()
 
     def _install_dictionary(self) -> None:
         row = self._conn.execute(
@@ -2382,6 +2420,7 @@ class PostgresBackend:
         if is_ddl:
             self._conn.commit()
             self._user_savepoint = False
+            self._record_quoted_names(original)
         if with_rowid is not None:
             # The rows are the rowids of the rows touched, not a result set: a
             # DML still answers with a count, and the last one is its rowid.
@@ -2473,6 +2512,59 @@ class PostgresBackend:
             return sql
         return _ROWID_WORD.sub(_urowid_expression(pk), sql)
 
+    def _record_quoted_names(self, statement: str) -> None:
+        # After a committed CREATE TABLE: note which of its columns were created
+        # with a quoted all-lower-case name (#1204). Done after the commit and on
+        # its own, so a failure here cannot take the table with it. A statement
+        # without such a name costs nothing. A column added later by ALTER TABLE
+        # ... ADD is not recorded, and reports its name by the folding rule.
+        table = _CREATE_TABLE_NAME.match(statement)
+        if table is None or not self._has_quoted_names:
+            return
+        names = [
+            name
+            for name in _QUOTED_LOWER_NAME.findall(statement)
+            if name.upper() not in _ORACLE_RESERVED_WORDS
+        ]
+        if not names:
+            return
+        try:
+            self._conn.execute(
+                'DELETE FROM sys.ora_quoted_names q WHERE NOT EXISTS '
+                '(SELECT 1 FROM pg_class c WHERE c.oid = q.relid)'
+            )
+            self._conn.execute(
+                'INSERT INTO sys.ora_quoted_names SELECT attrelid, attnum '
+                'FROM pg_attribute WHERE attrelid = to_regclass(%s) '
+                'AND attname = ANY(%s) AND attnum > 0 ON CONFLICT DO NOTHING',
+                (table.group(1), names),
+            )
+            self._conn.commit()
+        except psycopg.Error:
+            self._conn.rollback()
+
+    def _quoted_lower_columns(self, pgresult, indexes: list[int]) -> set[int]:
+        # Which of the result columns at `indexes` -- each one whose name the
+        # folding rule would upper-case -- were created with a quoted
+        # all-lower-case name, so Oracle reports them as written (#1204). Traced
+        # through libpq ftable / ftablecol to the table column, cached per
+        # (relid, attnum); a computed column has no table and keeps the rule.
+        keys = {}
+        for index in indexes:
+            relid = pgresult.ftable(index)
+            if relid:
+                keys[index] = (relid, pgresult.ftablecol(index))
+        unknown = {key for key in keys.values() if key not in self._quoted_col_cache}
+        if unknown:
+            found = self._conn.execute(
+                'SELECT relid, attnum FROM sys.ora_quoted_names WHERE relid = ANY(%s)',
+                ([relid for relid, _attnum in unknown],),
+            ).fetchall()
+            recorded = {(relid, attnum) for relid, attnum in found}
+            for key in unknown:
+                self._quoted_col_cache[key] = key in recorded
+        return {index for index, key in keys.items() if self._quoted_col_cache[key]}
+
     def _build_result(self, cursor) -> Result:
         # Turn an executed statement's cursor into a Result: a row count for a
         # no-row statement, else the fetched rows plus a ColumnMeta per column.
@@ -2505,6 +2597,15 @@ class PostgresBackend:
                 columns.append(_intervalym_column_meta(desc.name))
             else:
                 columns.append(_column_meta(desc, [r[i] for r in rows], self._tstz_oid))
+        if self._has_quoted_names:
+            folded = [
+                i
+                for i, desc in enumerate(cursor.description)
+                if _oracle_column_name(desc.name) != desc.name
+            ]
+            for i in self._quoted_lower_columns(cursor.pgresult, folded):
+                name = cursor.description[i].name.encode('utf-8')
+                columns[i] = replace(columns[i], name=name)
         return Result(columns=columns, rows=[tuple(r) for r in rows])
 
     def _execute_sequential(
