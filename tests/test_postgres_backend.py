@@ -1253,6 +1253,33 @@ def test_a_rowid_renders_as_the_client_renders_it() -> None:
         backend.close()
 
 
+def test_unqualified_names_resolve_in_the_login_users_schema() -> None:
+    # Oracle starts a session in the login user's schema, so a table created as
+    # user.t is found as plain t (#1188); a user without a schema of its own
+    # still resolves through public, as before.
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    admin.execute('DROP SCHEMA IF EXISTS pyo_login CASCADE')
+    admin.execute('CREATE SCHEMA pyo_login')
+    admin.execute('CREATE TABLE pyo_login.pyo_login_t (n integer)')
+    admin.execute('INSERT INTO pyo_login.pyo_login_t VALUES (7)')
+    creds = {'PYO_LOGIN': 'x', 'PYO_NO_SCHEMA': 'y'}
+    backend = PostgresBackend(_CONNINFO, credentials=creds)
+    other = PostgresBackend(_CONNINFO, credentials=creds)
+    try:
+        assert backend.authenticate('PYO_LOGIN') == 'x'
+        assert backend.execute('SELECT n FROM pyo_login_t').rows == [(7,)]
+        (schema,) = backend._conn.execute('SELECT current_schema()').fetchone()
+        assert schema == 'pyo_login'
+        assert other.authenticate('PYO_NO_SCHEMA') == 'y'
+        (schema,) = other._conn.execute('SELECT current_schema()').fetchone()
+        assert schema == 'public'
+    finally:
+        backend.close()
+        other.close()
+        admin.execute('DROP SCHEMA pyo_login CASCADE')
+        admin.close()
+
+
 def test_translate_idioms_rewrites_rowid_pseudocolumn() -> None:
     # The ROWID pseudo-column becomes the row's ctid in Oracle's extended form —
     # one rewrite serving a SELECT, a WHERE ROWID = :bind (text compare), and the
