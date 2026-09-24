@@ -2149,7 +2149,20 @@ class PostgresBackend:
         # The login store the Mirror authenticates clients against — separate
         # from the libpq `conninfo` the backend itself connects to PostgreSQL
         # with. A production backend might instead consult a PG table here.
-        return credential_lookup(self._credentials, username)
+        secret = credential_lookup(self._credentials, username)
+        if secret is not None:
+            # An Oracle session's current schema starts as the login user's, so
+            # an unqualified name resolves there first (#1188) -- the path ALTER
+            # SESSION SET CURRENT_SCHEMA builds. PostgreSQL skips a schema that
+            # does not exist, so a user without one resolves as before. Committed
+            # at once: a SET inside a transaction that rolls back is undone.
+            self._conn.execute(
+                sql.SQL('SET search_path TO {}, public, sys, oracle').format(
+                    sql.Identifier(username.lower())
+                )
+            )
+            self._conn.commit()
+        return secret
 
     def parse(self, sql: str) -> None:
         """Validate a statement without running it -- ``cursor.parse()`` of
