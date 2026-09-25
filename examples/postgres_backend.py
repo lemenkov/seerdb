@@ -95,7 +95,12 @@ from psycopg.types.composite import CompositeInfo, register_composite
 
 from seerdb.common.datatypes import BcDate, IntervalYM
 from seerdb.common.dbobject import DbRef
-from seerdb.common.sqltext import bind_placeholders, is_plsql, strip_returning_into
+from seerdb.common.sqltext import (
+    bind_placeholders,
+    is_plsql,
+    returning_bind_positions,
+    strip_returning_into,
+)
 from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
     TNS_TYPE_BDOUBLE,
@@ -1840,6 +1845,8 @@ _TEMPORAL_OIDS = {
 _INTERVAL_OIDS = frozenset({_INTERVAL_OID})
 
 _ORA_INVALID_SQL = 900
+# PL/SQL's single-row fetch, SELECT INTO or RETURNING INTO, that found several.
+_ORA_TOO_MANY_ROWS = 1422
 
 # Map a PostgreSQL error (by SQLSTATE) to the Oracle error number a client
 # expects, so error-conditional flows behave (#500). The load-bearing one is
@@ -2976,13 +2983,33 @@ class PostgresBackend:
 
     def _run_block_statement(self, statement: str, values: list) -> Result:
         # A single DML statement unwrapped from a BEGIN … END block — run it with
-        # the binds (#517). The block carried IN binds, so there are no OUT values
-        # to return; the input values keep the bind positions aligned.
+        # the binds (#517). The input values keep the bind positions aligned.
+        #
+        # One with RETURNING ... INTO runs without the INTO, and the rows it
+        # returns go to the INTO binds -- the trailing ones -- by PL/SQL's rule
+        # for a single-row RETURNING: no row leaves them NULL, and more than one
+        # is ORA-01422 (#1209).
+        into = sorted(returning_bind_positions(statement, len(values)))
+        if into:
+            statement = strip_returning_into(statement)
         sql, params = _translate_binds(
             _translate_idioms(_translate_ddl(statement)), values
         )
-        self._conn.cursor().execute(sql, params)
-        return Result(out_binds=values)
+        cursor = self._conn.cursor()
+        cursor.execute(sql, params)
+        if not into:
+            return Result(out_binds=values)
+        rows = cursor.fetchall()
+        if len(rows) > 1:
+            raise BackendError(
+                'exact fetch returns more than requested number of rows',
+                ora_code=_ORA_TOO_MANY_ROWS,
+            )
+        returned = _decode_row(cursor, rows[0], self._tstz_oid) if rows else None
+        out = list(values)
+        for i, position in enumerate(into):
+            out[position] = returned[i] if returned is not None else None
+        return Result(out_binds=out)
 
     def _proc_signature(self, name: str) -> tuple[list | None, list]:
         # A routine's parameter modes ('i' IN, 'o' OUT, 'b' IN OUT) and the aligned
