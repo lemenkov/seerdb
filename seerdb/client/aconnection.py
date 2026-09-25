@@ -287,7 +287,10 @@ class AsyncOracleConnect(_ConnectionLogic):
         self._ano: AnoChannel | None = None
         self.conn_key: bytes | None = None
         self.server_version = 0
-        self.session_id = None
+        # The session's SID and SERIAL#, from the login reply; None before 10g,
+        # whose reply carries neither (#1218).
+        self.session_id: int | None = None
+        self.serial_num: int | None = None
         # Negotiated TTC field version; see OracleConnect for the full note.
         self.field_version = field_version
         self._field_version_requested = field_version  # for the nego-cache retry
@@ -902,17 +905,19 @@ class AsyncOracleConnect(_ConnectionLogic):
             return await self.handle_login()
         elif Result[0] == TTI_AUTH:
             # Second RPA: auth result.
-            (_, Resp, Ver, SessId) = Result
+            (_, Resp, Ver, SessId, SerialNum) = Result
             if self._token_auth:
                 # Token auth (#125): no server proof / ConnKey; accept directly.
                 self.server_version = Ver
                 self.session_id = SessId
+                self.serial_num = SerialNum
                 self.conn_state = CONN_STATE_AUTHENTICATED
                 return 0
             assert self.conn_key is not None
             if validate(bytes.fromhex(Resp.decode('utf-8')), self.conn_key):
                 self.server_version = Ver
                 self.session_id = SessId
+                self.serial_num = SerialNum
                 self.conn_state = CONN_STATE_AUTHENTICATED
                 if self.negotiation_cache and self.field_version > FIELD_VERSION_23_1:
                     from seerdb.client.connection import _nego_cache_put
