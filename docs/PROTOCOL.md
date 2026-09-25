@@ -984,7 +984,7 @@ If successful, the server returns TTI_RPA with:
 | `AUTH_SVR_RESPONSE`     | Server proof (hex-encoded)         |
 | `AUTH_VERSION_NO`       | Server version number              |
 | `AUTH_SESSION_ID`       | Session identifier                 |
-| `AUTH_SERIAL_NUM`       | Session serial number (12.1+)      |
+| `AUTH_SERIAL_NUM`       | Session serial number              |
 | `AUTH_MAX_OPEN_CURSORS` | Session's max open cursors (12.1+) |
 | `AUTH_INSTANCENAME`     | Instance name                      |
 | `AUTH_SC_DBUNIQUE_NAME` | Database unique name               |
@@ -1009,9 +1009,16 @@ The client validates by decrypting `AUTH_SVR_RESPONSE` with the connection key a
 array a thin client tracks cursors-to-close in. A missing or zero value clamps
 that array to length **1**, so the second cursor the client closes overruns it
 with `IndexError: array assignment index out of range` — the statement-cache
-path every `executemany` and cursor reuse drives. seerdb sends it (and
-`AUTH_SERIAL_NUM`) only in the 12.1+ result, keeping the pre-12.1 wire
-byte-identical.
+path every `executemany` and cursor reuse drives. seerdb's Mirror sends it only
+in the 12.1+ result, as a pre-12.1 server does not.
+
+`AUTH_SERIAL_NUM` is in the reply at **every** version, not only 12.1+. A
+captured 11.2 reply carries it (1725, beside `AUTH_SESSION_ID` 160), and 10g,
+11g, 18c, 21c and 23ai all send it. With `AUTH_SESSION_ID` it names the session
+as `ALTER SYSTEM KILL SESSION 'sid,serial'` does, and the pair equals
+`dbms_debug_jdwp.current_session_id` / `current_session_serial`. The Mirror
+used to send it from 12.1 only, which left a pre-12.1 client with no serial
+(#1234). A 9i reply carries neither.
 
 `AUTH_VERSION_NO` is a decimal string of a single packed integer holding
 the server's release. Decode it as `major` (bits 24-31), `minor`

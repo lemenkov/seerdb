@@ -115,7 +115,7 @@ def test_encode_result_reports_max_open_cursors_at_12c() -> None:
     # a missing / zero value clamps it to 1, so the second cursor it closes
     # overruns with "IndexError: array assignment index out of range" -- the
     # statement-cache path every executemany and cursor reuse drives (#826).
-    # A 12.1+ client reads it; the pre-12.1 wire stays byte-identical without it.
+    # A 12.1+ client reads it; a pre-12.1 reply goes without it, as 11g's does.
     from seerdb.common.tns import _ENCODE_FIELD_VERSION
 
     token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_12_1)
@@ -125,6 +125,27 @@ def test_encode_result_reports_max_open_cursors_at_12c() -> None:
         _ENCODE_FIELD_VERSION.reset(token)
     assert b'AUTH_MAX_OPEN_CURSORS' in modern
     assert b'AUTH_MAX_OPEN_CURSORS' not in encode_result(bytes(24), session_id=59)
+
+
+def test_encode_result_names_the_serial_at_every_version() -> None:
+    # A real 11g's login reply carries AUTH_SERIAL_NUM beside AUTH_SESSION_ID
+    # (the captured reply in test_tns_decode has 1725). Sending it only from
+    # 12.1 left a pre-12.1 client with no serial to name its session by (#1234).
+    from seerdb.common.tns import _ENCODE_FIELD_VERSION, decode_kv, decode_ub4
+
+    def pairs(payload: bytes) -> dict:
+        (count, rest) = decode_ub4(payload[1:])
+        return dict(decode_kv(rest, count, [], {})[0])
+
+    token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_12_1)
+    try:
+        modern = pairs(encode_result(bytes(24), session_id=59, serial_num=4711))
+    finally:
+        _ENCODE_FIELD_VERSION.reset(token)
+    legacy = pairs(encode_result(bytes(24), session_id=59, serial_num=4711))
+    for reply in (modern, legacy):
+        assert reply[b'AUTH_SESSION_ID'] == b'59'
+        assert reply[b'AUTH_SERIAL_NUM'] == b'4711'
 
 
 def test_parse_osesskey_recovers_the_username() -> None:
