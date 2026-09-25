@@ -463,6 +463,14 @@ def test_translate_idioms_parenthesizes_offset_fetch_expression() -> None:
     )
 
 
+def test_drop_table_purge_is_a_plain_drop() -> None:
+    # PostgreSQL has no recycle bin, so DROP TABLE already purges (#1207); a
+    # table merely called that is left alone.
+    assert _translate_ddl('DROP TABLE t PURGE') == 'DROP TABLE t'
+    assert _translate_ddl('drop table s.t purge') == 'drop table s.t'
+    assert _translate_ddl('DROP TABLE purge') == 'DROP TABLE purge'
+
+
 def test_table_compression_is_dropped() -> None:
     # A storage hint with no PostgreSQL equal (#1182); only the table clause
     # goes, so a column that happens to be called that survives.

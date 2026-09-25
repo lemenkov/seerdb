@@ -962,6 +962,11 @@ _CREATE_TABLE_NAME = re.compile(
 _PK_CONSTRAINT = re.compile(r'\bPRIMARY\s+KEY\s*\(([^)]+)\)', re.IGNORECASE)
 _PK_INLINE = re.compile(r'[(,]\s*(\w+)\s+[^,()]*?\bPRIMARY\s+KEY\b', re.IGNORECASE)
 _DROP_TABLE_NAME = re.compile(r'\s*DROP\s+TABLE\s+([\w.]+)', re.IGNORECASE)
+# DROP TABLE ... PURGE drops without keeping the table in the recycle bin
+# (#1207). PostgreSQL has none, so its DROP TABLE already is that.
+_DROP_TABLE_PURGE = re.compile(
+    r'(\s*DROP\s+TABLE\s+.+?)\s+PURGE\s*$', re.IGNORECASE | re.DOTALL
+)
 _STATEMENT_TABLE = re.compile(r'\b(?:FROM|UPDATE|INTO)\s+([\w.]+)', re.IGNORECASE)
 # A DML statement, and the RETURNING that reports the rowid of each row it
 # touched: Oracle hands the last one back with every INSERT / UPDATE / DELETE
@@ -1183,6 +1188,9 @@ def _translate_ddl(sql: str) -> str:
     """Rewrite an Oracle ``CREATE TABLE`` / object ``CREATE TYPE`` to PostgreSQL:
     map the column/attribute types and drop the clauses PostgreSQL has no equal
     for (#500). Other SQL is returned unchanged."""
+    purged = _DROP_TABLE_PURGE.match(sql)
+    if purged:
+        return purged.group(1)
     if _IS_SEQUENCE_DDL.match(sql):
         for pattern, replacement in _SEQUENCE_KEYWORD_REWRITES:
             sql = pattern.sub(replacement, sql)
