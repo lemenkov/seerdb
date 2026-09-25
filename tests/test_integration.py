@@ -746,6 +746,22 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id, l FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), (1, 'kept'))
 
+    def test_drop_table_purge(self):
+        # DROP TABLE ... PURGE drops the table past the recycle bin (#1207). 9i
+        # has no recycle bin and rejects the clause, ORA-00933.
+        from seerdb.common.exceptions import DatabaseError
+
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER)')
+        try:
+            self.cur.execute(f'DROP TABLE {self.TABLE} PURGE')
+        except DatabaseError as exc:
+            if exc.code == 933:
+                self.skipTest('no recycle bin, so no PURGE, before 10g')
+            raise
+        with self.assertRaises(DatabaseError) as ctx:
+            self.cur.execute(f'SELECT n FROM {self.TABLE}')
+        self.assertEqual(ctx.exception.code, 942)
+
     # ----- NULL -----
 
     def test_null_number(self):
@@ -6802,6 +6818,24 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                 await Cur.execute('SELECT id, l FROM PYO_ASYNC_NOCOMPRESS')
                 self.assertEqual(await Cur.fetchone(), (1, 'kept'))
                 await Cur.execute('DROP TABLE PYO_ASYNC_NOCOMPRESS')
+
+    async def test_drop_table_purge(self):
+        # Async twin of TypesIntegration's.
+        from seerdb.common.exceptions import DatabaseError
+
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await self._drop_async(Cur, 'PYO_ASYNC_PURGE')
+                await Cur.execute('CREATE TABLE PYO_ASYNC_PURGE (n NUMBER)')
+                try:
+                    await Cur.execute('DROP TABLE PYO_ASYNC_PURGE PURGE')
+                except DatabaseError as exc:
+                    if exc.code == 933:
+                        self.skipTest('no recycle bin, so no PURGE, before 10g')
+                    raise
+                with self.assertRaises(DatabaseError) as ctx:
+                    await Cur.execute('SELECT n FROM PYO_ASYNC_PURGE')
+                self.assertEqual(ctx.exception.code, 942)
 
     async def test_lob_auto_resolve(self):
         # CLOB / BLOB / NULL / EMPTY all surface as Python str/bytes/None
