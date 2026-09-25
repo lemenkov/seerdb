@@ -1170,6 +1170,46 @@ class CursorIntegration(_IntegrationBase):
             driver = 'pyo-driver' if conn.field_version > FIELD_VERSION_23_1 else None
             self.assertEqual(cur.fetchall(), [(driver,)])
 
+    def test_kill_session_ends_the_named_session(self):
+        # ALTER SYSTEM KILL SESSION 'sid,serial' ends that session: its next call
+        # fails and the connection is gone (#1212). A malformed ID is ORA-00026,
+        # an unknown one ORA-00030. The suite's user may neither read v$session
+        # nor ALTER SYSTEM on any Oracle bed, so there it skips.
+        from seerdb.common.exceptions import DatabaseError
+
+        victim = _connect_with()
+        try:
+            vcur = victim.cursor()
+            try:
+                vcur.execute(
+                    "SELECT * FROM v$session WHERE sid = sys_context('userenv', 'sid')"
+                )
+            except DatabaseError as exc:
+                if exc.code in (942, 2003):
+                    self.skipTest(f'v$session not readable: ORA-{exc.code:05d}')
+                raise
+            names = [d[0] for d in vcur.description]
+            row = vcur.fetchone()
+            (sid, serial) = (row[names.index('SID')], row[names.index('SERIAL#')])
+            try:
+                self.cur.execute(f"ALTER SYSTEM KILL SESSION '{sid},{serial}'")
+            except DatabaseError as exc:
+                if exc.code == 1031:
+                    self.skipTest('no ALTER SYSTEM privilege')
+                raise
+            with self.assertRaises(seerdb.Error):
+                vcur.execute('SELECT 1 FROM dual')
+                vcur.fetchall()
+        finally:
+            try:
+                victim.close()
+            except seerdb.Error:
+                pass
+        for session, code in (('x', 26), (f'{sid},{serial}', 30)):
+            with self.assertRaises(DatabaseError) as caught:
+                self.cur.execute(f"ALTER SYSTEM KILL SESSION '{session}'")
+            self.assertEqual(caught.exception.code, code)
+
     def test_decode(self):
         # DECODE with untyped literals, a NULL matching a NULL, several searches
         # and no default; and, as a schema script populates a table, a DECODE of
@@ -6279,6 +6319,49 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                     'pyo-driver' if Conn.field_version > FIELD_VERSION_23_1 else None
                 )
                 self.assertEqual(await Cur.fetchall(), [(driver,)])
+
+    async def test_kill_session_ends_the_named_session(self):
+        # Async twin of CursorIntegration's.
+        from seerdb.common.exceptions import DatabaseError
+
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                victim = await seerdb.connect_async(**self._kwargs())
+                try:
+                    vcur = victim.cursor()
+                    try:
+                        await vcur.execute(
+                            'SELECT * FROM v$session '
+                            "WHERE sid = sys_context('userenv', 'sid')"
+                        )
+                    except DatabaseError as exc:
+                        if exc.code in (942, 2003):
+                            self.skipTest(f'v$session not readable: ORA-{exc.code:05d}')
+                        raise
+                    names = [d[0] for d in vcur.description]
+                    row = await vcur.fetchone()
+                    (sid, serial) = (
+                        row[names.index('SID')],
+                        row[names.index('SERIAL#')],
+                    )
+                    try:
+                        await Cur.execute(f"ALTER SYSTEM KILL SESSION '{sid},{serial}'")
+                    except DatabaseError as exc:
+                        if exc.code == 1031:
+                            self.skipTest('no ALTER SYSTEM privilege')
+                        raise
+                    with self.assertRaises(seerdb.Error):
+                        await vcur.execute('SELECT 1 FROM dual')
+                        await vcur.fetchall()
+                finally:
+                    try:
+                        await victim.close()
+                    except seerdb.Error:
+                        pass
+                for session, code in (('x', 26), (f'{sid},{serial}', 30)):
+                    with self.assertRaises(DatabaseError) as caught:
+                        await Cur.execute(f"ALTER SYSTEM KILL SESSION '{session}'")
+                    self.assertEqual(caught.exception.code, code)
 
     async def test_decode(self):
         # Async twin of CursorIntegration's.
