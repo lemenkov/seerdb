@@ -1092,6 +1092,23 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT n FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), (8,))
 
+    def test_ddl_on_a_table_another_session_holds_fails(self):
+        # Oracle's DDL does not wait for a lock another session holds: ORA-00054
+        # at once, where PostgreSQL would wait for ever (#1191).
+        from seerdb.common.exceptions import DatabaseError
+
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER)')
+        self.conn.autocommit = False
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1)')
+        other = _connect_with()
+        try:
+            with self.assertRaises(DatabaseError) as ctx:
+                other.cursor().execute(f'TRUNCATE TABLE {self.TABLE}')
+            self.assertEqual(ctx.exception.code, 54)
+        finally:
+            other.close()
+            self.conn.rollback()
+
     def test_a_query_does_not_block_another_sessions_ddl(self):
         # A query takes no table lock, so another session may truncate the
         # table it read while the reader's session is still open (#1190).
@@ -6108,6 +6125,31 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
             )
             await Cur.execute(f'SELECT n FROM {Table}')
             self.assertEqual(await Cur.fetchone(), (8,))
+            await self._drop_async(Cur, Table)
+        finally:
+            await Conn.close()
+
+    async def test_ddl_on_a_table_another_session_holds_fails(self):
+        # Async twin of CursorIntegration's.
+        from seerdb.common.exceptions import DatabaseError
+
+        Table = 'PYO_ASYNC_DDL_NOWAIT'
+        Kw = self._kwargs()
+        Kw['autocommit'] = False
+        Conn = await seerdb.connect_async(**Kw)
+        try:
+            Cur = Conn.cursor()
+            await self._drop_async(Cur, Table)
+            await Cur.execute(f'CREATE TABLE {Table} (n NUMBER)')
+            await Cur.execute(f'INSERT INTO {Table} VALUES (1)')
+            Other = await seerdb.connect_async(**self._kwargs())
+            try:
+                with self.assertRaises(DatabaseError) as ctx:
+                    await Other.cursor().execute(f'TRUNCATE TABLE {Table}')
+                self.assertEqual(ctx.exception.code, 54)
+            finally:
+                await Other.close()
+            await Conn.rollback()
             await self._drop_async(Cur, Table)
         finally:
             await Conn.close()
