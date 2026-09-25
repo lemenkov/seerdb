@@ -1437,6 +1437,35 @@ def test_ddl_on_a_locked_table_fails_as_oracle_does() -> None:
         ddl.close()
 
 
+def test_a_block_returning_several_rows_into_a_bind_is_ora_01422() -> None:
+    # PL/SQL's single-row RETURNING INTO found two rows (#1209).
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+    from seerdb.server import BackendError
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE pyo_block_returning (id NUMBER, n NUMBER)')
+        backend.execute('INSERT INTO pyo_block_returning VALUES (1, 10)')
+        backend.execute('INSERT INTO pyo_block_returning VALUES (1, 11)')
+        binds = [
+            BindVar(value=20, tns_type=TNS_TYPE_NUMBER, max_size=22),
+            BindVar(value=1, tns_type=TNS_TYPE_NUMBER, max_size=22),
+            BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=22),
+        ]
+        with pytest.raises(BackendError) as exc:
+            backend.execute(
+                'BEGIN UPDATE pyo_block_returning SET n = :1 WHERE id = :2 '
+                'RETURNING n INTO :3; END;',
+                binds,
+            )
+        assert exc.value.ora_code == 1422
+    finally:
+        backend.rollback()
+        backend.execute('DROP TABLE pyo_block_returning')
+        backend.close()
+
+
 def test_translate_idioms_rewrites_rowid_pseudocolumn() -> None:
     # The ROWID pseudo-column becomes the row's ctid in Oracle's extended form —
     # one rewrite serving a SELECT, a WHERE ROWID = :bind (text compare), and the

@@ -1091,6 +1091,23 @@ class CursorIntegration(_IntegrationBase):
         finally:
             self.cur.execute(f'DROP VIEW {view}')
 
+    def test_returning_into_inside_a_plsql_block(self):
+        # A block wrapping a DML with RETURNING ... INTO: the returned value
+        # goes to the OUT bind, and a statement that matched no row leaves it
+        # NULL (#1209).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, n NUMBER)')
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1, 10)')
+        block = (
+            f'BEGIN UPDATE {self.TABLE} SET n = :1 WHERE id = :2 '
+            'RETURNING n INTO :3; END;'
+        )
+        out = self.cur.var(int)
+        self.cur.execute(block, [20, 1, out])
+        self.assertEqual(out.getvalue(), 20)
+        out = self.cur.var(int)
+        self.cur.execute(block, [30, 2, out])
+        self.assertIsNone(out.getvalue())
+
     def test_decode(self):
         # DECODE with untyped literals, a NULL matching a NULL, several searches
         # and no default; and, as a schema script populates a table, a DECODE of
@@ -6119,6 +6136,29 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await Cur.fetchone(), ('x',))
             finally:
                 await Cur.execute(f'DROP VIEW {View}')
+        finally:
+            await Conn.close()
+
+    async def test_returning_into_inside_a_plsql_block(self):
+        # Async twin of CursorIntegration's.
+        Table = 'PYO_ASYNC_BLOCK_RETURNING'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            await self._drop_async(Cur, Table)
+            await Cur.execute(f'CREATE TABLE {Table} (id NUMBER, n NUMBER)')
+            await Cur.execute(f'INSERT INTO {Table} VALUES (1, 10)')
+            block = (
+                f'BEGIN UPDATE {Table} SET n = :1 WHERE id = :2 '
+                'RETURNING n INTO :3; END;'
+            )
+            out = Cur.var(int)
+            await Cur.execute(block, [20, 1, out])
+            self.assertEqual(out.getvalue(), 20)
+            out = Cur.var(int)
+            await Cur.execute(block, [30, 2, out])
+            self.assertIsNone(out.getvalue())
+            await self._drop_async(Cur, Table)
         finally:
             await Conn.close()
 
