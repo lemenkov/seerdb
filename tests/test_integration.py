@@ -256,17 +256,21 @@ def _connect(fetch_lobs: bool = True):
     )
 
 
-# Number of times to replay a whole test that tripped ORA-01013, and the pause
-# between attempts. See `_IntegrationBase.run`.
+# Number of times to replay a whole test that tripped a transient server
+# refusal, and the pause between attempts. See `_ThrottleRetry.run`.
 _THROTTLE_RETRIES = int(os.environ.get('SEERDB_TEST_THROTTLE_RETRIES', '2'))
 _THROTTLE_RETRY_DELAY = float(os.environ.get('SEERDB_TEST_THROTTLE_DELAY', '0.5'))
+# The refusals worth a replay: XE's logon-storm cancel (ORA-01013), and a login
+# its listener refuses while it still counts sessions that have just closed
+# (ORA-12516, #1229).
+_TRANSIENT_CODES = frozenset({1013, 12516})
 
 
 class _CaptureResult(unittest.TestResult):
     """Runs one test attempt and remembers its single outcome (with the
     original exc_info) instead of reporting it. Lets `_IntegrationBase.run`
-    decide whether the attempt was a transient ORA-01013 throttle cancel worth
-    retrying, then forward the final outcome to the real result — without
+    decide whether the attempt hit a transient server refusal worth retrying
+    (_TRANSIENT_CODES), then forward the final outcome to the real result — without
     double-running the test or losing the traceback."""
 
     def __init__(self):
@@ -291,12 +295,53 @@ class _CaptureResult(unittest.TestResult):
             return False
         exc = payload[1]
         return (
-            isinstance(exc, seerdb.OperationalError)
-            and getattr(exc, 'code', None) == 1013
+            isinstance(exc, seerdb.DatabaseError)
+            and getattr(exc, 'code', None) in _TRANSIENT_CODES
         )
 
 
-class _IntegrationBase(unittest.TestCase):
+class _ThrottleRetry:
+    """Replay a whole test that hit a transient server refusal (_TRANSIENT_CODES),
+    after a pause, up to _THROTTLE_RETRIES times; report only the last attempt.
+
+    Mixed into every integration class, sync and async alike: the async ones
+    open connections as fast as any, and were the ones left without it when
+    11g's listener began refusing logins (#1229).
+    """
+
+    def run(self, result=None):
+        import time
+
+        for attempt in range(_THROTTLE_RETRIES + 1):
+            # An IsolatedAsyncioTestCase keeps its finished asyncio runner and
+            # refuses to run again while one is set, so drop it before a replay.
+            if getattr(self, '_asyncioRunner', None) is not None:
+                self._asyncioRunner = None
+            capture = _CaptureResult()
+            super().run(capture)  # type: ignore[misc]
+            if attempt == _THROTTLE_RETRIES or not capture.is_throttle():
+                break
+            time.sleep(_THROTTLE_RETRY_DELAY)
+        # Forward the final attempt's outcome to the real result so reporting
+        # (counts, tracebacks, verbose output) is unaffected by the retry.
+        if result is not None:
+            kind, payload = capture.outcome
+            result.startTest(self)
+            try:
+                if kind == 'error':
+                    result.addError(self, payload)
+                elif kind == 'failure':
+                    result.addFailure(self, payload)
+                elif kind == 'skip':
+                    result.addSkip(self, payload)
+                else:
+                    result.addSuccess(self)
+            finally:
+                result.stopTest(self)
+        return result
+
+
+class _IntegrationBase(_ThrottleRetry, unittest.TestCase):
     """Per-test connection; fresh cursor + scratch table per test.
 
     Oracle XE's listener throttles rapid logins ("logon storm"
@@ -326,33 +371,6 @@ class _IntegrationBase(unittest.TestCase):
             Name = cls.__name__.replace('Integration', '') or cls.__name__
             cls.TABLE = ('PYO_' + Name.upper())[:30]
 
-    def run(self, result=None):
-        import time
-
-        for attempt in range(_THROTTLE_RETRIES + 1):
-            capture = _CaptureResult()
-            super().run(capture)
-            if attempt == _THROTTLE_RETRIES or not capture.is_throttle():
-                break
-            time.sleep(_THROTTLE_RETRY_DELAY)
-        # Forward the final attempt's outcome to the real result so reporting
-        # (counts, tracebacks, verbose output) is unaffected by the retry.
-        if result is not None:
-            kind, payload = capture.outcome
-            result.startTest(self)
-            try:
-                if kind == 'error':
-                    result.addError(self, payload)
-                elif kind == 'failure':
-                    result.addFailure(self, payload)
-                elif kind == 'skip':
-                    result.addSkip(self, payload)
-                else:
-                    result.addSuccess(self)
-            finally:
-                result.stopTest(self)
-        return result
-
     def setUp(self):
         Last: Exception = RuntimeError('setUp: connection retries exhausted')
         for _ in range(5):
@@ -362,8 +380,8 @@ class _IntegrationBase(unittest.TestCase):
                 self._skip_if_fv2_unsupported()
                 self._drop_silently(self.cur)
                 return
-            except seerdb.OperationalError as e:
-                if e.code != 1013:
+            except seerdb.DatabaseError as e:
+                if e.code not in _TRANSIENT_CODES:
                     raise
                 Last = e
                 # Bleed a few ms and try a fresh connection.
@@ -2680,7 +2698,7 @@ def _kill_session(sid) -> None:
 @unittest.skipUnless(
     _ADMIN_USER, 'set SEERDB_TEST_ADMIN_USER (a DBA) to kill a session'
 )
-class PingKilledSessionIntegration(unittest.TestCase):
+class PingKilledSessionIntegration(_ThrottleRetry, unittest.TestCase):
     """A ping on a session the server killed raises, as the server says (#1095)."""
 
     def test_ping_raises_on_a_killed_session(self):
@@ -2708,7 +2726,7 @@ class PingKilledSessionIntegration(unittest.TestCase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
-class ProxyLoginIntegration(unittest.TestCase):
+class ProxyLoginIntegration(_ThrottleRetry, unittest.TestCase):
     """A proxy login, ``user[proxy]`` (#126), keeps its proxy end to end (#1093).
 
     Needs a user the test user may connect through (``ALTER USER <proxy> GRANT
@@ -4846,7 +4864,7 @@ class SqlDomainIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
-class ChangePasswordIntegration(unittest.TestCase):
+class ChangePasswordIntegration(_ThrottleRetry, unittest.TestCase):
     """Connection.changepassword over the wire (#21). Each test changes the
     test user's password and always restores it (on the original, still-
     authenticated connection) so the rest of the suite is unaffected."""
@@ -4925,7 +4943,7 @@ class ChangePasswordIntegration(unittest.TestCase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
-class RedirectIntegration(unittest.TestCase):
+class RedirectIntegration(_ThrottleRetry, unittest.TestCase):
     """Follow a TNS_REDIRECT to reconnect to the address the server hands back
     (#23). A RedirectListener stands in for a shared-server / RAC listener: it
     answers the first CONNECT with a redirect to the real backend, and the
@@ -4956,7 +4974,7 @@ class RedirectIntegration(unittest.TestCase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
-class PoolIntegration(unittest.TestCase):
+class PoolIntegration(_ThrottleRetry, unittest.TestCase):
     """Verify the connection pool: pre-warm, acquire/release, capacity,
     and timeout behaviour."""
 
@@ -5927,7 +5945,7 @@ class PipelineIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
-class SessionlessTransactionIntegration(unittest.TestCase):
+class SessionlessTransactionIntegration(_ThrottleRetry, unittest.TestCase):
     # Sessionless transactions (#133, 23ai). A transaction is started on one
     # session, suspended, then resumed and committed on a *different* session.
     # Needs two connections with autocommit off, so it manages its own
@@ -6026,7 +6044,7 @@ _BFILE_TEST_CONTENT = b'hello bfile from disk'
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
-class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
+class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
     """Verify the async surface: connect_async, AsyncCursor, fetch
     flow, async iteration, context managers."""
 
@@ -7770,7 +7788,7 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
     'DBMS_LOB and CREATE PROCEDURE so the helper function can install '
     'itself on first call.',
 )
-class BFILEIntegration(unittest.TestCase):
+class BFILEIntegration(_ThrottleRetry, unittest.TestCase):
     """Verify BFILE read round-trips."""
 
     def setUp(self):
@@ -7858,7 +7876,7 @@ class BFILEIntegration(unittest.TestCase):
     'Async BFILE tests share the same fixture requirements as the '
     'sync BFILEIntegration.',
 )
-class AsyncBFILEIntegration(unittest.IsolatedAsyncioTestCase):
+class AsyncBFILEIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
     async def test_async_bfile_select_returns_file_contents(self):
         Dir = os.environ['SEERDB_TEST_BFILE_DIR']
         async with await seerdb.connect_async(
@@ -7905,7 +7923,7 @@ class AsyncBFILEIntegration(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
-class AsyncPoolIntegration(unittest.IsolatedAsyncioTestCase):
+class AsyncPoolIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
     """AsyncPool: pre-warm, acquire / release, capacity, timeout,
     health-check on dead connection."""
 
@@ -8008,7 +8026,7 @@ class AsyncPoolIntegration(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
-class SSLIntegration(unittest.TestCase):
+class SSLIntegration(_ThrottleRetry, unittest.TestCase):
     """Verify the TLS wrap by talking to Oracle through a local TLS proxy.
 
     The proxy terminates TLS on a random local port and forwards plaintext
@@ -8294,7 +8312,7 @@ class CallprocIntegration(_IntegrationBase):
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
 @unittest.skipUnless(_ADMIN_USER, _ADMIN_SKIP_REASON)
-class PreSha2VerifierLoginIntegration(unittest.TestCase):
+class PreSha2VerifierLoginIntegration(_ThrottleRetry, unittest.TestCase):
     """#311/#312: authenticate an account whose *only* password verifier is the
     11g SHA-1 one against a modern (12c+) server.
 
@@ -8430,7 +8448,7 @@ class PreSha2VerifierLoginIntegration(unittest.TestCase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
-class O8iSelectIntegration(unittest.TestCase):
+class O8iSelectIntegration(_ThrottleRetry, unittest.TestCase):
     # Live read-only SELECT coverage for Oracle 8i (8.1.7), whose support is
     # currently SELECT-only (#244 task #4, PROTOCOL.md §19.9-10). 8i cannot run
     # the CREATE/INSERT the rest of the suite uses to seed a table, so these
@@ -8528,7 +8546,7 @@ class O8iSelectIntegration(unittest.TestCase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
-class O8iDmlIntegration(unittest.TestCase):
+class O8iDmlIntegration(_ThrottleRetry, unittest.TestCase):
     # Live DDL / DML / transaction coverage for Oracle 8i (#360): the 9.2-era
     # OALL8 with the statement-type option word and no fetch, the affected-row
     # count from the response OER, and OALL8-based COMMIT / ROLLBACK. Self-skips
@@ -8745,7 +8763,7 @@ class O8iDmlIntegration(unittest.TestCase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
-class AsyncO8iIntegration(unittest.IsolatedAsyncioTestCase):
+class AsyncO8iIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
     # Async Oracle 8i coverage (#365): the sync 8i surface ported to
     # aconnection.py / acursor.py. Self-skips unless the target is an 8i server.
     TABLE = 'zz_seerdb_o8i_async'
