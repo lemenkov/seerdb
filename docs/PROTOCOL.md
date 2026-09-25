@@ -5089,6 +5089,28 @@ column, …) the execute reply is a **`TTI_OER` (`0x04`)** error status, *not* t
 mapped ORA error; feeding an OER to `decode_8i_dcb_describe` (which assumes a
 describe header) overruns and raises a meaningless `IndexError`.
 
+**A describe wider than a packet (#1226).** 8i caps each DATA packet at the SDU
+(2 KB here) with no end-of-message flag, so a wide select list continues in the
+next packet with nothing saying so. The 45 columns of `V$SESSION` describe to
+2776 bytes: a first packet of 2009, then 767 more. Whether the client sees
+them apart depends on timing. The transport returns every packet that has
+already arrived in one read, so a 60-column table's describe usually comes
+back whole. `V$SESSION` is computed live, and the server pauses between its
+packets. The decoder raises `Truncated` when a column or the trailer runs past
+the data, and the reader (`O8iDialect._recv_describe`) reads the next packet and
+decodes again, as the row reader does (#849).
+
+**A describe cut short by an error (#1226).** A statement that fails as it
+*executes* can stop the describe partway. 8i sends what fitted in the first
+packet, then the error as a `TTI_OER` of its own (`04 <ub4 rows> <ub4 LE code>
+… ORA-NNNNN: …`), and nothing more: the rest of the describe never comes.
+Captured with `SELECT * FROM v$session WHERE sid = sys_context('userenv',
+'sid')`, which 8i refuses with ORA-02003 (USERENV has no SID before 10g). Just
+as often it refuses up front with a bare OER instead. So when the continuation
+of an incomplete describe opens with `TTI_OER` and carries an `ORA-` text, that
+error is the answer. A reader that waits for more of the describe hangs for its
+read timeout.
+
 **Duplicate-column compression.** Like the modern `TTI_BVC`, 8i omits a column
 from the RXD when it repeats the previous row's value — but 8i carries the
 **column bit vector inside the RXH** (a `ub1` length + the vector, at offset 14)

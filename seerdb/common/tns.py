@@ -10891,6 +10891,9 @@ def decode_8i_dcb_describe(Data: bytes) -> tuple[list[dict], bytes]:
     Off += 1  # constant 0x33
     Columns: list[dict] = []
     for _ in range(NumCols):
+        if Off + 32 > len(Data):
+            # The describe continues in the next packet (#1226).
+            raise Truncated(f'8i describe: column {len(Columns)} of {NumCols}')
         DataType = Data[Off]
         SizeField = int.from_bytes(Data[Off + 1 : Off + 5], 'big')
         if DataType == 2:
@@ -10915,6 +10918,11 @@ def decode_8i_dcb_describe(Data: bytes) -> tuple[list[dict], bytes]:
         NullOk = 0 if Data[Off + 25] == 0 else 1
         NameLen = int.from_bytes(Data[Off + 28 : Off + 32], 'big')
         Name = bytes(Data[Off + 32 : Off + 32 + NameLen])
+        if Off + 32 + NameLen + 8 > len(Data):
+            # A wide describe outgrows 8i's SDU and continues in the next
+            # packet; a slice past the end reads short rather than failing, so
+            # say so instead of returning a half-read column (#1226).
+            raise Truncated(f'8i describe: column {len(Columns)} of {NumCols}')
         Columns.append(
             {
                 'data_type': DataType,
@@ -10936,6 +10944,8 @@ def decode_8i_dcb_describe(Data: bytes) -> tuple[list[dict], bytes]:
     # uses. Skip it to land on the first row token (TTI_RXH / TTI_RXD).
     TLen = int.from_bytes(Data[Off + 1 : Off + 5], 'big')
     Off += 1 + 4 + TLen
+    if Off > len(Data):
+        raise Truncated('8i describe: trailer')
     return (Columns, Data[Off:])
 
 

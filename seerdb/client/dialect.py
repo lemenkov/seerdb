@@ -383,7 +383,7 @@ class O8iDialect:
             from seerdb.common.exceptions import DatabaseError
 
             raise DatabaseError('Oracle 8i rejected the query (no ORA code)')
-        (columns, rest) = decode_8i_dcb_describe(packet)
+        (columns, rest) = yield from self._recv_describe(packet)
         # A LONG / LONG RAW column caps the value at the fetch long-size field and
         # returns one row per fetch, so ask for the whole value (#377).
         has_long = any(col.get('data_type') in _O8I_LONG_TYPES for col in columns)
@@ -403,6 +403,35 @@ class O8iDialect:
             rows.extend(more)
         yield from self.resolve_lobs(rows, columns)
         return (0, 0, 0, (len(rows), columns), rows, None, None, [], None)
+
+    def _recv_describe(self, packet: bytes):
+        # The 8i describe, read on across packets: 8i caps each DATA packet at
+        # the SDU with no end-of-message flag, and a wide select list -- the 45
+        # columns of V$SESSION -- does not fit in one. Decoding the first packet
+        # alone ran off its end with an IndexError (#1226). Read on only while
+        # a field runs off the end (Truncated, or IndexError from an older
+        # primitive), as recv_rows does for the row stream.
+        #
+        # A statement that fails as it executes can stop the describe partway:
+        # 8i sends what fitted in the first packet, then the error as a TTI_OER
+        # of its own and nothing more. That error is the answer, not more of
+        # the describe.
+        from seerdb.common.exceptions import Truncated
+
+        buf = bytes(packet)
+        while True:
+            try:
+                return decode_8i_dcb_describe(buf)
+            except (Truncated, IndexError):
+                received = yield RECV
+                if received is False:
+                    raise Exception('Connection closed during 8i describe') from None
+                more = received[1]
+                if more[:1] == bytes([TTI_OER]):
+                    (err_code, message) = _scan_ora_message(more)
+                    if err_code and message:
+                        _raise_ora(err_code, message)
+                buf += more
 
     def recv_rows(self, buf: bytes, columns: list, last_row: list | None):
         # Read one logical 8i execute/fetch response and decode its RXH/RXD row
