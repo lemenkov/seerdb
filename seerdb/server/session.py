@@ -18,6 +18,7 @@ usernames match case-insensitively); a backend-mapped auth API comes later.
 from __future__ import annotations
 
 import contextvars
+import datetime
 import functools
 import logging
 from collections.abc import Callable, Sequence
@@ -159,6 +160,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_LONG,
     TNS_TYPE_LONGRAW,
     TNS_TYPE_REFCURSOR,
+    TNS_TYPE_TIMESTAMPLTZ,
     TNS_TYPE_VECTOR,
     TNS_VERSION_MIN_LARGE_SDU,
     TNS_VERSION_MIN_OOB_CHECK,
@@ -205,6 +207,7 @@ from seerdb.server.backend import (
     Capability,
     ClobValue,
     CursorResult,
+    LtzValue,
     Result,
     SessionInfo,
     UnsupportedFeature,
@@ -1104,14 +1107,16 @@ def serve_session(
             if completed is None:  # answered already: it never completes
                 continue
             body = completed
-            request = _resolve_temp_lob_binds(
-                parse_exec(
-                    body,
-                    bind_types=cached_types,
-                    max_string_size=max_size,
-                    cached_plsql=cached_plsql,
-                ),
-                temp_lobs,
+            request = _mark_ltz_binds(
+                _resolve_temp_lob_binds(
+                    parse_exec(
+                        body,
+                        bind_types=cached_types,
+                        max_string_size=max_size,
+                        cached_plsql=cached_plsql,
+                    ),
+                    temp_lobs,
+                )
             )
             _attach_object_bind_lobs(request, lob_emit_log, temp_lobs)
             if request.scrollable:
@@ -2643,6 +2648,29 @@ def _answer_lobops(
     return lobs, current, current_object_lob
 
 
+def _mark_ltz_binds(request: ExecRequest) -> ExecRequest:
+    # A TIMESTAMP WITH LOCAL TIME ZONE bind decodes to the same naive datetime
+    # a TIMESTAMP bind does, but Oracle reads the two in different zones, so
+    # the backend is handed an LtzValue that says which it was (#1222). A NULL
+    # stays None: an ordinary NULL arrives as a BindVar with its type already.
+    ltz = {
+        i
+        for i, meta in enumerate(request.bind_meta)
+        if meta and meta[0] == TNS_TYPE_TIMESTAMPLTZ
+    }
+    if not ltz:
+        return request
+
+    def mark(i: int, value: object) -> object:
+        if i in ltz and type(value) is datetime.datetime:
+            return LtzValue.of(value)
+        return value
+
+    rows = [[mark(i, v) for i, v in enumerate(row)] for row in request.bind_rows]
+    binds = rows[0] if rows else [mark(i, v) for i, v in enumerate(request.binds)]
+    return replace(request, binds=binds, bind_rows=rows)
+
+
 def _resolve_temp_lob_binds(request: ExecRequest, temp_lobs: _TempLobs) -> ExecRequest:
     # Swap any temp-LOB locator bind for the bytes streamed into it over
     # TTI_LOBOPS WRITE, so the backend sees a str / bytes value (#412). A
@@ -3707,7 +3735,10 @@ def _answer_reexecute_binds(
             from_reexecute=True,
         )
         return _answer_query(
-            stream, backend, _resolve_temp_lob_binds(execute, temp_lobs), cursors
+            stream,
+            backend,
+            _mark_ltz_binds(_resolve_temp_lob_binds(execute, temp_lobs)),
+            cursors,
         )
     sql = cursors.query_sql(request.cursor)
     if sql is None:

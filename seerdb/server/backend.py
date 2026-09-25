@@ -17,6 +17,7 @@ correct, not a failure.
 
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -113,6 +114,35 @@ class BlobValue(bytes):
     """A BLOB bind's content: the ``bytes`` twin of :class:`ClobValue` (#1067)."""
 
     __slots__ = ()
+
+
+class LtzValue(datetime.datetime):
+    """A TIMESTAMP WITH LOCAL TIME ZONE bind's value: a naive ``datetime`` that
+    says it was bound as LTZ (#1222).
+
+    An LTZ bind and a TIMESTAMP bind decode to the same naive ``datetime``, but
+    Oracle reads them in different zones: an LTZ value is the instant in the
+    database time zone, a TIMESTAMP a wall-clock time in the session's. A backend
+    that stores both into an LTZ column has to know which it was handed. It IS a
+    ``datetime``, so a backend that does not care needs nothing new.
+    """
+
+    __slots__ = ()
+
+    @classmethod
+    def of(cls, value: datetime.datetime) -> LtzValue:
+        """The same wall-clock value, marked as bound as LTZ."""
+        return cls(
+            value.year,
+            value.month,
+            value.day,
+            value.hour,
+            value.minute,
+            value.second,
+            value.microsecond,
+            value.tzinfo,
+            fold=value.fold,
+        )
 
 
 @dataclass(frozen=True)
