@@ -407,3 +407,44 @@ def test_returning_resolves_an_object_bind_like_execute_does():
     assert not isinstance(cursor.bound[0], ObjectImage)
     assert cursor.bound[0] is None
     assert isinstance(cursor.bound[1], _FakeVar)
+
+
+def test_the_login_reply_carries_the_upstream_serial_without_v_session():
+    # The serial has no sys_context equivalent. v$session needs a grant an
+    # ordinary account lacks (ORA-00942), which left clients with the Mirror's
+    # placeholder serial; DBMS_DEBUG_JDWP reports it to anyone (#1236).
+    class _UpstreamCursor:
+        def __init__(self, answers):
+            self._answers, self._row = answers, None
+
+        def execute(self, sql, *args):
+            # The most specific needle first: the v$session query names
+            # sys_context too.
+            for needle, answer in self._answers.items():
+                if needle in sql:
+                    if isinstance(answer, Exception):
+                        raise answer
+                    self._row = answer
+                    return
+            raise AssertionError(sql)
+
+        def fetchone(self):
+            return self._row
+
+    ident = ('62', 'FREE', 'FREE', None, 'freepdb1')
+    no_view = seerdb.DatabaseError('ORA-00942: table or view does not exist')
+    for answers, serial in (
+        (
+            {'dbms_debug_jdwp': (23073,), 'v$session': no_view, 'sys_context': ident},
+            23073,
+        ),
+        ({'dbms_debug_jdwp': no_view, 'v$session': (77,), 'sys_context': ident}, 77),
+        ({'dbms_debug_jdwp': no_view, 'v$session': no_view, 'sys_context': ident}, 0),
+    ):
+        cursor = _UpstreamCursor(answers)
+        backend = OraclePassthroughBackend(
+            host='h', port=1, service='s', credentials={}
+        )
+        backend._conn = type('Conn', (), {'cursor': lambda self: cursor})()
+        info = backend.session_info()
+        assert (info.session_id, info.serial_num) == (62, serial)
