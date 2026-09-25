@@ -131,6 +131,7 @@ from seerdb.server import (
     UnsupportedFeature,
     credential_lookup,
 )
+from seerdb.server.backend import SessionInfo
 from seerdb.server.identity import IDENTITY_12_1
 
 # The PostgreSQL composite type that backs Oracle's TIMESTAMP WITH TIME ZONE
@@ -364,8 +365,16 @@ CREATE OR REPLACE PROCEDURE dbms_utility.db_version(
 _ORACLE_DICTIONARY_DDL = (
     # SYS_CONTEXT('userenv', <param>) — the session context the dialect reads to
     # learn its current schema/user before it reflects anything.
+    # ora_serial(pid): the session's SERIAL#, stable for its life and different
+    # for the next session to reuse the pid -- the backend's start time folded
+    # to Oracle's range (#1212).
+    'CREATE OR REPLACE FUNCTION sys.ora_serial(integer) RETURNS integer '
+    'LANGUAGE sql STABLE AS $$ SELECT (extract(epoch FROM backend_start)::bigint '
+    '% 65535)::integer + 1 FROM pg_stat_activity WHERE pid = $1 $$;'
     'CREATE OR REPLACE FUNCTION sys.sys_context(text, text) RETURNS text '
     'LANGUAGE sql STABLE AS $$ SELECT CASE lower($2) '
+    # The session's SID is its backend's pid, the one the login reply names.
+    "WHEN 'sid' THEN pg_backend_pid()::text "
     "WHEN 'current_schema' THEN upper(current_schema()) "
     "WHEN 'current_user' THEN upper(current_user::text) "
     "WHEN 'session_user' THEN upper(session_user::text) "
@@ -2286,6 +2295,27 @@ class PostgresBackend:
         self._conn.execute("SET LOCAL lock_timeout = '2s'")
         self._conn.execute(_ORACLE_DICTIONARY_DDL)
         self._conn.execute(f"COMMENT ON SCHEMA sys IS '{_DICTIONARY_STAMP}'")
+
+    def session_info(self) -> SessionInfo:
+        """The session's identity, for the Mirror's login reply (#1212).
+
+        A client reads its session id and serial only from that reply, never by
+        querying, so without this it reported a placeholder for the life of the
+        connection. The SID is the backend's pid, as sys_context('userenv',
+        'sid') reports it, so SQL and the reply agree; the names are the ones
+        sys_context gives.
+        """
+        row = self._conn.execute(
+            'SELECT pg_backend_pid(), sys.ora_serial(pg_backend_pid()), '
+            'upper(current_database())'
+        ).fetchone()
+        self._conn.commit()
+        if row is None:
+            return SessionInfo()
+        (pid, serial, name) = row
+        return SessionInfo(
+            session_id=pid, serial_num=serial or 0, instance_name=name, db_name=name
+        )
 
     def authenticate(self, username: str) -> str | None:
         # The login store the Mirror authenticates clients against — separate
