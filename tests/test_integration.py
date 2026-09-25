@@ -1301,6 +1301,29 @@ class CursorIntegration(_IntegrationBase):
             ],
         )
 
+    def test_a_describe_wider_than_a_packet(self):
+        # V$SESSION's 45 columns describe to more than an 8i packet holds, and
+        # the server pauses between the packets, so the client sees the
+        # describe split (#1226). It is read whole; a describe that a failing
+        # execute cuts short gives the server's error, and the session goes on.
+        # 8i only: that is where the describe outgrows a packet, and where the
+        # suite's user (SYSTEM) may read V$SESSION.
+        from seerdb.common.exceptions import DatabaseError
+
+        if not _conn_is_8i(self.conn):
+            self.skipTest('a describe outgrows a packet on 8i')
+        self.cur.execute("SELECT * FROM v$session WHERE audsid = userenv('sessionid')")
+        self.assertGreater(len(self.cur.description), 40)
+        self.assertEqual(len(self.cur.fetchall()), 1)
+        # 8i's USERENV has no SID: it starts to describe, then fails.
+        with self.assertRaises(DatabaseError) as caught:
+            self.cur.execute(
+                "SELECT * FROM v$session WHERE sid = sys_context('userenv', 'sid')"
+            )
+        self.assertEqual(caught.exception.code, 2003)
+        self.cur.execute('SELECT 1 FROM dual')
+        self.assertEqual(self.cur.fetchall(), [(1,)])
+
     def test_decode(self):
         # DECODE with untyped literals, a NULL matching a NULL, several searches
         # and no default; and, as a schema script populates a table, a DECODE of
@@ -6526,6 +6549,27 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await self._drop_async(Cur, Table)
         finally:
             await Conn.close()
+
+    async def test_a_describe_wider_than_a_packet(self):
+        # Async twin of CursorIntegration's.
+        from seerdb.common.exceptions import DatabaseError
+
+        if not _target_is_8i():
+            self.skipTest('a describe outgrows a packet on 8i')
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await Cur.execute(
+                    "SELECT * FROM v$session WHERE audsid = userenv('sessionid')"
+                )
+                self.assertGreater(len(Cur.description), 40)
+                self.assertEqual(len(await Cur.fetchall()), 1)
+                with self.assertRaises(DatabaseError) as caught:
+                    await Cur.execute(
+                        "SELECT * FROM v$session WHERE sid = sys_context('userenv', 'sid')"
+                    )
+                self.assertEqual(caught.exception.code, 2003)
+                await Cur.execute('SELECT 1 FROM dual')
+                self.assertEqual(await Cur.fetchall(), [(1,)])
 
     async def test_decode(self):
         # Async twin of CursorIntegration's.
