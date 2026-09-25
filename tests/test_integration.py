@@ -5276,7 +5276,11 @@ class GettypeCurrentSchemaIntegration(_IntegrationBase):
     def test_an_unqualified_name_follows_the_current_schema(self):
         from seerdb.common.exceptions import DatabaseError
 
-        self.cur.execute('ALTER SESSION SET CURRENT_SCHEMA = SYSTEM')
+        # A schema that is not the type's owner: the suite logs in as SYSTEM
+        # where the bed has no application user (8i), and SYSTEM is then the
+        # owner's own (#1215).
+        other = 'SYS' if self.owner == 'SYSTEM' else 'SYSTEM'
+        self.cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = {other}')
         try:
             # SQL cannot see the type from here, so neither may gettype...
             with self.assertRaises(DatabaseError):
@@ -6326,7 +6330,8 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
             await Cur.execute(f'CREATE TYPE {Typ} AS OBJECT (id NUMBER)')
             try:
                 Owner = (await Conn.gettype(Typ)).schema
-                await Cur.execute('ALTER SESSION SET CURRENT_SCHEMA = SYSTEM')
+                Other = 'SYS' if Owner == 'SYSTEM' else 'SYSTEM'
+                await Cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = {Other}')
                 with self.assertRaises(seerdb.DatabaseError):
                     await Conn.gettype(Typ)
                 Qualified = await Conn.gettype(f'{Owner}.{Typ}')
