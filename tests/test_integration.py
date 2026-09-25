@@ -1134,6 +1134,42 @@ class CursorIntegration(_IntegrationBase):
         self.assertIsNotNone(self.conn.session_id)
         self.assertEqual(int(self.conn.session_id), int(sid))
 
+    def test_v_session_shows_the_identity_the_client_declared(self):
+        # v$session and v$session_connect_info show this session as its login
+        # declared it (#1212); the terminal is left out, since a login in the
+        # pre-12c shape declares none. Reading them needs a privilege the suite's user
+        # has on no Oracle bed (ORA-00942), so there it skips.
+        from seerdb.common.exceptions import DatabaseError
+
+        with _connect_with(
+            program='pyo-program',
+            machine='pyo-machine',
+            terminal='pyo-terminal',
+            osuser='pyo-osuser',
+            driver_name='pyo-driver',
+        ) as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    'SELECT program, machine, osuser FROM v$session '
+                    "WHERE sid = sys_context('userenv', 'sid')"
+                )
+            except DatabaseError as exc:
+                if exc.code in (942, 2003):
+                    self.skipTest(f'v$session not readable: ORA-{exc.code:05d}')
+                raise
+            self.assertEqual(
+                cur.fetchall(),
+                [('pyo-program', 'pyo-machine', 'pyo-osuser')],
+            )
+            cur.execute(
+                'SELECT DISTINCT client_driver FROM v$session_connect_info '
+                "WHERE sid = sys_context('userenv', 'sid')"
+            )
+            # The driver name travels only in the 23ai-shaped login (fv > 23.1).
+            driver = 'pyo-driver' if conn.field_version > FIELD_VERSION_23_1 else None
+            self.assertEqual(cur.fetchall(), [(driver,)])
+
     def test_decode(self):
         # DECODE with untyped literals, a NULL matching a NULL, several searches
         # and no default; and, as a schema script populates a table, a DECODE of
@@ -6207,6 +6243,42 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
                 (sid,) = await Cur.fetchone()
                 self.assertIsNotNone(Conn.session_id)
                 self.assertEqual(int(Conn.session_id), int(sid))
+
+    async def test_v_session_shows_the_identity_the_client_declared(self):
+        # Async twin of CursorIntegration's.
+        from seerdb.common.exceptions import DatabaseError
+
+        async with await seerdb.connect_async(
+            **self._kwargs(
+                program='pyo-program',
+                machine='pyo-machine',
+                terminal='pyo-terminal',
+                osuser='pyo-osuser',
+                driver_name='pyo-driver',
+            )
+        ) as Conn:
+            async with Conn.cursor() as Cur:
+                try:
+                    await Cur.execute(
+                        'SELECT program, machine, osuser FROM v$session '
+                        "WHERE sid = sys_context('userenv', 'sid')"
+                    )
+                except DatabaseError as exc:
+                    if exc.code in (942, 2003):
+                        self.skipTest(f'v$session not readable: ORA-{exc.code:05d}')
+                    raise
+                self.assertEqual(
+                    await Cur.fetchall(),
+                    [('pyo-program', 'pyo-machine', 'pyo-osuser')],
+                )
+                await Cur.execute(
+                    'SELECT DISTINCT client_driver FROM v$session_connect_info '
+                    "WHERE sid = sys_context('userenv', 'sid')"
+                )
+                driver = (
+                    'pyo-driver' if Conn.field_version > FIELD_VERSION_23_1 else None
+                )
+                self.assertEqual(await Cur.fetchall(), [(driver,)])
 
     async def test_decode(self):
         # Async twin of CursorIntegration's.

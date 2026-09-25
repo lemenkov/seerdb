@@ -371,6 +371,13 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE OR REPLACE FUNCTION sys.ora_serial(integer) RETURNS integer '
     'LANGUAGE sql STABLE AS $$ SELECT (extract(epoch FROM backend_start)::bigint '
     '% 65535)::integer + 1 FROM pg_stat_activity WHERE pid = $1 $$;'
+    # What each session's client declared at login (#1212): the identity a
+    # v$session row shows, which PostgreSQL's own pg_stat_activity does not
+    # carry. Keyed by the backend pid; rows of ended backends are pruned as new
+    # sessions record themselves.
+    'CREATE TABLE IF NOT EXISTS sys.ora_sessions (pid integer PRIMARY KEY, '
+    'username text, program text, machine text, terminal text, osuser text, '
+    'driver text);'
     'CREATE OR REPLACE FUNCTION sys.sys_context(text, text) RETURNS text '
     'LANGUAGE sql STABLE AS $$ SELECT CASE lower($2) '
     # The session's SID is its backend's pid, the one the login reply names.
@@ -608,6 +615,38 @@ _ORACLE_DICTIONARY_DDL = (
     # own column identity; rows of dropped tables are pruned on the next write.
     'CREATE TABLE IF NOT EXISTS sys.ora_quoted_names ('
     'relid oid NOT NULL, attnum smallint NOT NULL, PRIMARY KEY (relid, attnum));'
+    # v$session / v$session_connect_info (#1212): the sessions of this database,
+    # a SID being the backend's pid (as the login reply names it) and the
+    # identity columns the ones the client declared.
+    # Oracle compares a NUMBER with a VARCHAR2 by converting the string, so
+    # `sid = sys_context('userenv', 'sid')` works there; PostgreSQL has no
+    # integer = text. The operator pair converts as Oracle does, a non-number
+    # failing with 22P02, ORA-01722 (#1212).
+    'CREATE OR REPLACE FUNCTION sys.ora_eq_int_text(integer, text) RETURNS boolean '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT $1::numeric = $2::numeric $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_eq_text_int(text, integer) RETURNS boolean '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT $1::numeric = $2::numeric $$;'
+    'DO $$ BEGIN '
+    "IF NOT EXISTS (SELECT FROM pg_operator WHERE oprname = '=' "
+    "AND oprleft = 'integer'::regtype AND oprright = 'text'::regtype) THEN "
+    'CREATE OPERATOR sys.= (LEFTARG = integer, RIGHTARG = text, '
+    'FUNCTION = sys.ora_eq_int_text, COMMUTATOR = OPERATOR(sys.=)); '
+    'CREATE OPERATOR sys.= (LEFTARG = text, RIGHTARG = integer, '
+    'FUNCTION = sys.ora_eq_text_int, COMMUTATOR = OPERATOR(sys.=)); END IF; '
+    'END $$;'
+    'CREATE OR REPLACE VIEW sys."v$session" AS SELECT a.pid AS sid, '
+    'sys.ora_serial(a.pid) AS "serial#", '
+    'coalesce(s.username, upper(a.usename::text)) AS username, '
+    "CASE WHEN a.state = 'active' THEN 'ACTIVE' ELSE 'INACTIVE' END AS status, "
+    "'USER'::text AS type, s.program, s.machine, s.terminal, s.osuser, "
+    'NULL::text AS ecid, NULL::text AS module, NULL::text AS action, '
+    'a.backend_start AS logon_time '
+    'FROM pg_stat_activity a LEFT JOIN sys.ora_sessions s ON s.pid = a.pid '
+    "WHERE a.datname = current_database() AND a.backend_type = 'client backend';"
+    'CREATE OR REPLACE VIEW sys."v$session_connect_info" AS SELECT a.pid AS sid, '
+    'sys.ora_serial(a.pid) AS "serial#", s.driver AS client_driver '
+    'FROM pg_stat_activity a LEFT JOIN sys.ora_sessions s ON s.pid = a.pid '
+    "WHERE a.datname = current_database() AND a.backend_type = 'client backend';"
 )
 
 # What the installed dictionary is stamped with, as the `sys` schema's comment:
@@ -2296,6 +2335,48 @@ class PostgresBackend:
         self._conn.execute(_ORACLE_DICTIONARY_DDL)
         self._conn.execute(f"COMMENT ON SCHEMA sys IS '{_DICTIONARY_STAMP}'")
 
+    def set_client_identity(self, identity: dict[str, str]) -> None:
+        # program / machine / terminal / osuser, as the client declared them in
+        # its first login message; recorded for v$session (#1212).
+        self._client_identity = dict(identity)
+
+    def open_session(self, connect_attrs: dict[str, str]) -> None:
+        # The driver name arrives only in the second login message (#1212).
+        self._client_driver = connect_attrs.get('driver_name')
+
+    def _record_session(self) -> None:
+        # This session's row in sys.ora_sessions, and none for backends that have
+        # ended. Best effort: a login must not fail over its v$session row.
+        identity = getattr(self, '_client_identity', {})
+        program = identity.get('program')
+        try:
+            if program:
+                self._conn.execute(
+                    "SELECT set_config('application_name', %s, false)", (program[:63],)
+                )
+            self._conn.execute(
+                'DELETE FROM sys.ora_sessions WHERE pid NOT IN '
+                '(SELECT pid FROM pg_stat_activity)'
+            )
+            self._conn.execute(
+                'INSERT INTO sys.ora_sessions VALUES (pg_backend_pid(), %s, %s, %s, %s, %s, %s) '
+                'ON CONFLICT (pid) DO UPDATE SET username = excluded.username, '
+                'program = excluded.program, machine = excluded.machine, '
+                'terminal = excluded.terminal, osuser = excluded.osuser, '
+                'driver = excluded.driver',
+                (
+                    getattr(self, '_login_user', None),
+                    program,
+                    identity.get('machine'),
+                    identity.get('terminal'),
+                    identity.get('osuser'),
+                    getattr(self, '_client_driver', None),
+                ),
+            )
+            self._conn.commit()
+        except psycopg.Error:
+            self._conn.rollback()
+
     def session_info(self) -> SessionInfo:
         """The session's identity, for the Mirror's login reply (#1212).
 
@@ -2305,6 +2386,9 @@ class PostgresBackend:
         'sid') reports it, so SQL and the reply agree; the names are the ones
         sys_context gives.
         """
+        # The last login hook to run, so the session is recorded for v$session
+        # here, with everything the client declared by now.
+        self._record_session()
         row = self._conn.execute(
             'SELECT pg_backend_pid(), sys.ora_serial(pg_backend_pid()), '
             'upper(current_database())'
@@ -2322,6 +2406,7 @@ class PostgresBackend:
         # from the libpq `conninfo` the backend itself connects to PostgreSQL
         # with. A production backend might instead consult a PG table here.
         secret = credential_lookup(self._credentials, username)
+        self._login_user = username.upper()
         if secret is not None:
             # An Oracle session's current schema starts as the login user's, so
             # an unqualified name resolves there first (#1188) -- the path ALTER

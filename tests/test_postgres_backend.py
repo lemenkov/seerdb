@@ -1483,6 +1483,29 @@ def test_session_info_names_the_backend_and_sql_agrees() -> None:
         backend.close()
 
 
+def test_v_session_shows_what_the_login_declared() -> None:
+    # The login hooks' values land in this session's v$session and
+    # v$session_connect_info rows, found by comparing the NUMBER sid with the
+    # VARCHAR2 sys_context gives, as Oracle converts it (#1212).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.set_client_identity(
+            {'program': 'p', 'machine': 'm', 'terminal': 't', 'osuser': 'o'}
+        )
+        backend.authenticate('PYO')
+        backend.open_session({'driver_name': 'd'})
+        backend.session_info()
+        where = "WHERE sid = sys_context('userenv', 'sid')"
+        assert backend.execute(
+            f'SELECT program, machine, terminal, osuser, username FROM v$session {where}'
+        ).rows == [('p', 'm', 't', 'o', 'PYO')]
+        assert backend.execute(
+            f'SELECT client_driver FROM v$session_connect_info {where}'
+        ).rows == [('d',)]
+    finally:
+        backend.close()
+
+
 def test_translate_idioms_rewrites_rowid_pseudocolumn() -> None:
     # The ROWID pseudo-column becomes the row's ctid in Oracle's extended form —
     # one rewrite serving a SELECT, a WHERE ROWID = :bind (text compare), and the
