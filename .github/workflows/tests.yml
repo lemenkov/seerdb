@@ -147,6 +147,42 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install .
+      # 11g XE's listener refuses logins with ORA-12516 once the suite's
+      # connection churn outruns its count of sessions that have closed, and
+      # the slim image is sized for light use. Give it headroom (#1229); the
+      # suite also replays a test refused that way.
+      - name: Give 11g XE more processes and sessions
+        if: matrix.db.name == 'Oracle XE 11g'
+        run: |
+          docker exec -i ${{ job.services.oracle.id }} sqlplus -s / as sysdba <<'SQL'
+          set heading off feedback off
+          select 'before: ' || name || ' = ' || value from v$parameter where name in ('processes', 'sessions');
+          alter system set processes = 200 scope = spfile;
+          alter system set sessions = 322 scope = spfile;
+          shutdown immediate
+          startup
+          alter system register;
+          select 'after: ' || name || ' = ' || value from v$parameter where name in ('processes', 'sessions');
+          exit
+          SQL
+          python - <<'PY'
+          import time
+
+          import seerdb
+
+          last = None
+          for attempt in range(60):
+              try:
+                  seerdb.connect(user='pyo', password='pyo123', host='localhost',
+                                 port=1521, service_name='XE').close()
+                  print(f'11g XE accepts logins again (attempt {attempt + 1})')
+                  break
+              except seerdb.Error as exc:
+                  last = exc
+                  time.sleep(2)
+          else:
+              raise SystemExit(f'11g XE did not come back: {last}')
+          PY
       - name: Run integration suite against ${{ matrix.db.name }}
         env:
           SEERDB_TEST_USER: pyo
