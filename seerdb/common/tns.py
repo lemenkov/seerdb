@@ -3932,15 +3932,17 @@ def encode_result(
     Decodes back through ``decode_token_rpa`` as a ``TTI_AUTH`` result whose
     ``AUTH_SVR_RESPONSE`` the client's ``validate()`` accepts.
 
-    From 12.1 three things change (#829), none of which a pre-12.1 reply gets, so
-    the 11g wire stays byte-identical:
+    The session identity is the session id and ``AUTH_SERIAL_NUM`` at every
+    version: a real 11g sends the serial too, and a 12.1+ client reads session
+    id, serial number and version number and raises on a missing key rather
+    than defaulting. Without it a pre-12.1 client had no serial to name the
+    session by (#1234).
+
+    From 12.1 more changes (#829), none of which a pre-12.1 reply gets:
 
     - the proof is the 48-byte padded form, because a 12.1+ client checks for the
       marker at a fixed offset rather than anywhere in the plaintext;
-    - ``AUTH_SERIAL_NUM`` joins the session identity — a 12.1+ client reads
-      session id, serial number and version number, and raises on a missing key
-      rather than defaulting;
-    - ``AUTH_MAX_OPEN_CURSORS`` joins it too — a thin client sizes the array it
+    - ``AUTH_MAX_OPEN_CURSORS`` joins the reply — a thin client sizes the array it
       tracks cursors-to-close in from this value, clamping a missing / zero one
       to **1**, so the second cursor it tries to close overruns that array with
       ``IndexError: array assignment index out of range`` (the statement-cache
@@ -3955,9 +3957,9 @@ def encode_result(
         (b'AUTH_SVR_RESPONSE', _hexval(proof)),
         (b'AUTH_VERSION_NO', str(version_no).encode('ascii')),
         (b'AUTH_SESSION_ID', str(session_id).encode('ascii')),
+        (b'AUTH_SERIAL_NUM', str(serial_num).encode('ascii')),
     ]
     if modern:
-        pairs.append((b'AUTH_SERIAL_NUM', str(serial_num).encode('ascii')))
         pairs.append((b'AUTH_MAX_OPEN_CURSORS', str(_AUTH_MAX_OPEN_CURSORS).encode()))
     # The session's names, each sent only when the server knows it -- a real
     # server omits what does not apply (a database with no domain sends no
