@@ -1089,6 +1089,12 @@ _DDL_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '1s'"
 _TRANSACTION_END = re.compile(r'\s*(COMMIT|ROLLBACK)(?:\s+WORK)?\s*\Z', re.IGNORECASE)
 _SAVEPOINT_NAME = r'("[^"]+"|[A-Za-z][\w$]*)'
 _SAVEPOINT = re.compile(rf'\s*SAVEPOINT\s+{_SAVEPOINT_NAME}\s*\Z', re.IGNORECASE)
+# ALTER SYSTEM KILL SESSION 'sid,serial[,@inst]' [IMMEDIATE | NOREPLAY] (#1212).
+_KILL_SESSION = re.compile(
+    r"\s*ALTER\s+SYSTEM\s+KILL\s+SESSION\s+'([^']*)'(?:\s+(?:IMMEDIATE|NOREPLAY))*\s*\Z",
+    re.IGNORECASE,
+)
+_KILL_SESSION_ID = re.compile(r'\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*@\d+\s*)?\Z')
 _ROLLBACK_TO = re.compile(
     rf'\s*ROLLBACK(?:\s+WORK)?\s+TO\s+(?:SAVEPOINT\s+)?{_SAVEPOINT_NAME}\s*\Z',
     re.IGNORECASE,
@@ -1895,6 +1901,9 @@ _INTERVAL_OIDS = frozenset({_INTERVAL_OID})
 _ORA_INVALID_SQL = 900
 # PL/SQL's single-row fetch, SELECT INTO or RETURNING INTO, that found several.
 _ORA_TOO_MANY_ROWS = 1422
+_ORA_INVALID_SESSION_ID = 26
+_ORA_KILL_CURRENT_SESSION = 27
+_ORA_NO_SUCH_SESSION = 30
 
 # Map a PostgreSQL error (by SQLSTATE) to the Oracle error number a client
 # expects, so error-conditional flows behave (#500). The load-bearing one is
@@ -2496,6 +2505,9 @@ class PostgresBackend:
         transaction_control = self._execute_transaction_control(sql)
         if transaction_control is not None:
             return transaction_control
+        kill = _KILL_SESSION.match(sql)
+        if kill is not None:
+            return self._kill_session(kill.group(1))
         if binds and is_plsql(sql):
             return self._execute_plsql(sql, binds)
         # A `SELECT REF(alias)` object-REF fetch: PostgreSQL has no REF, so stand in
@@ -2572,6 +2584,34 @@ class PostgresBackend:
         if result.columns and not is_ddl:
             self._release_read_locks()
         return result
+
+    def _kill_session(self, session: str) -> Result:
+        # ALTER SYSTEM KILL SESSION (#1212): end the backend whose pid is the SID,
+        # but only while its serial is the one named, so a pid reused by a later
+        # session is not killed in its place. The victim learns of it on its next
+        # call, its connection gone, as a killed Oracle session's is. Like any
+        # ALTER SYSTEM it leaves the caller's transaction alone.
+        ids = _KILL_SESSION_ID.match(session)
+        if ids is None:
+            raise BackendError(
+                'missing or invalid session ID', ora_code=_ORA_INVALID_SESSION_ID
+            )
+        (sid, serial) = (int(ids.group(1)), int(ids.group(2)))
+        row = self._conn.execute(
+            'SELECT pg_backend_pid() FROM pg_stat_activity '
+            'WHERE pid = %s AND sys.ora_serial(pid) = %s',
+            (sid, serial),
+        ).fetchone()
+        if row is None:
+            raise BackendError(
+                'User session ID does not exist.', ora_code=_ORA_NO_SUCH_SESSION
+            )
+        if row[0] == sid:
+            raise BackendError(
+                'cannot kill current session', ora_code=_ORA_KILL_CURRENT_SESSION
+            )
+        self._conn.execute('SELECT pg_terminate_backend(%s)', (sid,))
+        return Result()
 
     def _execute_transaction_control(self, sql: str) -> Result | None:
         # COMMIT / ROLLBACK / SAVEPOINT / ROLLBACK TO as SQL text, outside the

@@ -1506,6 +1506,36 @@ def test_v_session_shows_what_the_login_declared() -> None:
         backend.close()
 
 
+def test_kill_session_ends_only_the_session_named() -> None:
+    # KILL SESSION ends the backend with that SID while its serial still matches;
+    # a stale serial, the caller's own session or a malformed ID fail as Oracle's
+    # do (#1212).
+    from seerdb.server import BackendError
+
+    killer = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    victim = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        info = victim.session_info()
+        own = killer.session_info()
+        for session, code in (
+            ('1,2,3,4', 26),
+            (f'{info.session_id},{info.serial_num + 1}', 30),
+            (f'{own.session_id},{own.serial_num}', 27),
+        ):
+            with pytest.raises(BackendError) as caught:
+                killer.execute(f"ALTER SYSTEM KILL SESSION '{session}'")
+            assert caught.value.ora_code == code
+        killer.execute(
+            f"alter system kill session '{info.session_id},{info.serial_num}' immediate"
+        )
+        with pytest.raises(psycopg.OperationalError):
+            victim._conn.execute('SELECT 1')
+        assert killer.execute('SELECT 1 FROM dual').rows == [(1,)]
+    finally:
+        killer.close()
+        victim.close()
+
+
 def test_translate_idioms_rewrites_rowid_pseudocolumn() -> None:
     # The ROWID pseudo-column becomes the row's ctid in Oracle's extended form —
     # one rewrite serving a SELECT, a WHERE ROWID = :bind (text compare), and the
