@@ -5971,6 +5971,17 @@ class SessionlessTransactionIntegration(_ThrottleRetry, unittest.TestCase):
         self.conns = []
         setup = self._conn()
         self.conns.append(setup)
+        # Probe support before creating anything, so a pre-23ai skip leaves no
+        # table behind (#1224).
+        try:
+            setup.begin_sessionless_transaction('probe', timeout=10)
+            setup.suspend_sessionless_transaction()
+            setup.rollback()
+        except NotSupportedError:
+            # tearDown does not run after a skip in setUp: close the probe's
+            # connection here, or it stays open until it is collected.
+            setup.close()
+            self.skipTest('sessionless transactions need a 23ai+ server')
         cur = setup.cursor()
         try:
             cur.execute(f'DROP TABLE {self.TABLE}')
@@ -5979,13 +5990,6 @@ class SessionlessTransactionIntegration(_ThrottleRetry, unittest.TestCase):
                 raise
         cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
         setup.commit()
-        # Probe support up front so the whole class skips cleanly pre-23ai.
-        try:
-            setup.begin_sessionless_transaction('probe', timeout=10)
-            setup.suspend_sessionless_transaction()
-            setup.rollback()
-        except NotSupportedError:
-            self.skipTest('sessionless transactions need a 23ai+ server')
 
     def tearDown(self):
         for c in self.conns:
@@ -5994,6 +5998,14 @@ class SessionlessTransactionIntegration(_ThrottleRetry, unittest.TestCase):
             except Exception:
                 # best-effort close; the test already passed/failed
                 pass
+        # The table the test made, on a fresh connection: the test's own may
+        # hold a transaction open on it (#1224).
+        with self._conn() as c:
+            try:
+                c.cursor().execute(f'DROP TABLE {self.TABLE}')
+            except seerdb.DatabaseError as e:
+                if e.code != 942:
+                    raise
 
     def test_suspend_resume_commit_across_sessions(self):
         c1 = self._conn()
@@ -7696,13 +7708,14 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             'PYORACLE_AREF_REFS',
         )
         Conn = await seerdb.connect_async(**self._kwargs())
+        drops = (f'DROP TABLE {REFS}', f'DROP TABLE {PEOPLE}', f'DROP TYPE {TYPE}')
         try:
+            # Checked before creating anything, so a skip leaves nothing behind
+            # (#1224).
+            if getattr(Conn, 'field_version', 0) < _FV12:
+                self.skipTest('REF bind needs a 12.1+ server')
             cur = Conn.cursor()
-            for s in (
-                f'DROP TABLE {REFS}',
-                f'DROP TABLE {PEOPLE}',
-                f'DROP TYPE {TYPE}',
-            ):
+            for s in drops:
                 try:
                     await cur.execute(s)
                 except seerdb.DatabaseError:
@@ -7716,22 +7729,17 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await cur.execute(f'CREATE TABLE {REFS} (id NUMBER, r REF {TYPE})')
             await cur.execute(f'SELECT REF(p) FROM {PEOPLE} p WHERE p.id = 1')
             ref = (await cur.fetchone())[0]
-            if getattr(Conn, 'field_version', 0) < _FV12:
-                self.skipTest('REF bind needs a 12.1+ server')
             await cur.execute(f'INSERT INTO {REFS} (id, r) VALUES (:1, :2)', [100, ref])
             await cur.execute(f'SELECT id, DEREF(r).name FROM {REFS} WHERE id = 100')
             self.assertEqual(await cur.fetchone(), (100, 'Alice'))
-            for s in (
-                f'DROP TABLE {REFS}',
-                f'DROP TABLE {PEOPLE}',
-                f'DROP TYPE {TYPE}',
-            ):
+        finally:
+            cur = Conn.cursor()
+            for s in drops:
                 try:
                     await cur.execute(s)
                 except seerdb.DatabaseError:
                     # best-effort drop of a table that may not exist
                     pass
-        finally:
             await Conn.close()
 
     async def test_async_sessionless_suspend_resume(self):
@@ -7745,6 +7753,14 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         setup = await seerdb.connect_async(**Kw)
         c1 = c2 = None
         try:
+            # Probe before creating anything, so a pre-23ai skip leaves no
+            # table behind (#1224).
+            try:
+                await setup.begin_sessionless_transaction('aprobe', timeout=10)
+            except NotSupportedError:
+                self.skipTest('sessionless transactions need a 23ai+ server')
+            await setup.suspend_sessionless_transaction()
+            await setup.rollback()
             scur = setup.cursor()
             try:
                 await scur.execute(f'DROP TABLE {table}')
@@ -7753,12 +7769,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     raise
             await scur.execute(f'CREATE TABLE {table} (id NUMBER)')
             await setup.commit()
-            try:
-                await setup.begin_sessionless_transaction('aprobe', timeout=10)
-            except NotSupportedError:
-                self.skipTest('sessionless transactions need a 23ai+ server')
-            await setup.suspend_sessionless_transaction()
-            await setup.rollback()
 
             c1 = await seerdb.connect_async(**Kw)
             await c1.begin_sessionless_transaction('asl-1', timeout=120)
@@ -7774,9 +7784,15 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await ccur.execute(f'SELECT id FROM {table} ORDER BY id')
             self.assertEqual(await ccur.fetchall(), [(10,), (20,)])
         finally:
-            for c in (setup, c1, c2):
+            for c in (c1, c2):
                 if c is not None:
                     await c.close()
+            # The table the test made, on the connection that made it, now that
+            # no other session holds it (#1224).
+            try:
+                await self._drop_async(setup.cursor(), table)
+            finally:
+                await setup.close()
 
 
 @unittest.skipUnless(
