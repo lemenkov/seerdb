@@ -740,8 +740,18 @@ class TypesIntegration(_IntegrationBase):
     def test_long_in_an_uncompressed_table(self):
         # A table compression clause is storage only: the table behaves the
         # same (#1182). The reference thin client's suite creates its LONG and
-        # LONG RAW tables NOCOMPRESS.
-        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, l LONG) NOCOMPRESS')
+        # LONG RAW tables NOCOMPRESS. Table compression is 9i Release 2 and
+        # later; 8i rejects the clause, ORA-00922 (#1214).
+        from seerdb.common.exceptions import DatabaseError
+
+        try:
+            self.cur.execute(
+                f'CREATE TABLE {self.TABLE} (id NUMBER, l LONG) NOCOMPRESS'
+            )
+        except DatabaseError as exc:
+            if exc.code == 922:
+                self.skipTest('no table compression before 9i Release 2')
+            raise
         self.cur.execute(f"INSERT INTO {self.TABLE} VALUES (1, 'kept')")
         self.cur.execute(f'SELECT id, l FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), (1, 'kept'))
@@ -6890,12 +6900,19 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
 
     async def test_long_in_an_uncompressed_table(self):
         # Async twin of TypesIntegration's.
+        from seerdb.common.exceptions import DatabaseError
+
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
             async with Conn.cursor() as Cur:
                 await self._drop_async(Cur, 'PYO_ASYNC_NOCOMPRESS')
-                await Cur.execute(
-                    'CREATE TABLE PYO_ASYNC_NOCOMPRESS (id NUMBER, l LONG) NOCOMPRESS'
-                )
+                try:
+                    await Cur.execute(
+                        'CREATE TABLE PYO_ASYNC_NOCOMPRESS (id NUMBER, l LONG) NOCOMPRESS'
+                    )
+                except DatabaseError as exc:
+                    if exc.code == 922:
+                        self.skipTest('no table compression before 9i Release 2')
+                    raise
                 await Cur.execute("INSERT INTO PYO_ASYNC_NOCOMPRESS VALUES (1, 'kept')")
                 await Cur.execute('SELECT id, l FROM PYO_ASYNC_NOCOMPRESS')
                 self.assertEqual(await Cur.fetchone(), (1, 'kept'))
