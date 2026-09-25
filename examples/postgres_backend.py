@@ -1022,6 +1022,11 @@ _QUOTED_LOWER_NAME = re.compile(r'"([a-z][a-z0-9_$#]*)"')
 _IS_DDL = re.compile(
     r'\s*(CREATE|ALTER|DROP|TRUNCATE|RENAME|COMMENT|GRANT|REVOKE)\b', re.IGNORECASE
 )
+# Oracle's DDL does not wait for a lock (DDL_LOCK_TIMEOUT is 0): a TRUNCATE, DROP
+# or ALTER of a table another session holds fails at once with ORA-00054, where
+# PostgreSQL waits for ever (#1191). The wait is bounded, briefly rather than not
+# at all, so a lock being released that very moment does not fail the DDL.
+_DDL_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '1s'"
 
 # Transaction control sent as SQL text (#1181). Every other statement runs inside
 # the `_mirror_stmt` savepoint (see execute), and these cannot: a COMMIT or
@@ -1855,6 +1860,7 @@ _SQLSTATE_TO_ORA = {
     '23514': 2290,  # check_violation         -> check constraint violated
     '22P02': 1722,  # invalid_text_representation -> invalid number (TO_NUMBER)
     '3B001': 1086,  # invalid_savepoint_specification -> savepoint never established
+    '55P03': 54,  # lock_not_available -> resource busy (a DDL's lock wait, #1191)
 }
 
 
@@ -1865,6 +1871,7 @@ _SQLSTATE_TO_ORA = {
 # with its ORA-NNNNN by the Mirror), which is right where the English text varies
 # by Oracle version anyway (e.g. ORA-01722).
 _ORA_MESSAGE = {
+    54: 'resource busy and acquire with NOWAIT specified or timeout expired',
     942: 'table or view does not exist',
     2303: 'cannot drop or replace a type with type or table dependents',
 }
@@ -2421,6 +2428,10 @@ class PostgresBackend:
         # so the hot SELECT/DML path (single-command) is where the round-trips count.
         if self._use_pipeline and not is_ddl:
             result = self._execute_pipelined(sql, params, original)
+        elif is_ddl:
+            result = self._execute_sequential(
+                sql, params, original, prelude=_DDL_LOCK_TIMEOUT
+            )
         else:
             result = self._execute_sequential(sql, params, original)
         # DDL auto-commits (Oracle semantics): persist it — and any pending DML —
@@ -2617,12 +2628,21 @@ class PostgresBackend:
         return Result(columns=columns, rows=[tuple(r) for r in rows])
 
     def _execute_sequential(
-        self, sql: str, params: dict | None, original: str | None = None
+        self,
+        sql: str,
+        params: dict | None,
+        original: str | None = None,
+        *,
+        prelude: str | None = None,
     ) -> Result:
         # SAVEPOINT + statement + RELEASE as three round-trips; the fallback path.
+        # A `prelude` runs inside the savepoint first, so a SET LOCAL there is
+        # undone with a statement that fails and ends with one that commits.
         cursor = self._conn.cursor()
         cursor.execute('SAVEPOINT _mirror_stmt')
         try:
+            if prelude is not None:
+                cursor.execute(prelude)
             cursor.execute(sql, params)
             result = self._build_result(cursor)
         except psycopg.Error as exc:

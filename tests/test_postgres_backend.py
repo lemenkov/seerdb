@@ -1412,6 +1412,31 @@ def test_a_quoted_lower_case_column_keeps_its_name() -> None:
         early.close()
 
 
+def test_ddl_on_a_locked_table_fails_as_oracle_does() -> None:
+    # Oracle's DDL does not wait for another session's lock: ORA-00054 (#1191).
+    # The bounded wait lives and dies with the DDL's own savepoint, so the
+    # session's later statements wait as before.
+    from seerdb.server import BackendError
+
+    holder = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    ddl = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        holder.execute('CREATE TABLE pyo_ddl_nowait (n NUMBER)')
+        holder.execute('INSERT INTO pyo_ddl_nowait VALUES (1)')
+        with pytest.raises(BackendError) as exc:
+            ddl.execute('TRUNCATE TABLE pyo_ddl_nowait')
+        assert exc.value.ora_code == 54
+        (timeout,) = ddl._conn.execute('SHOW lock_timeout').fetchone()
+        assert timeout == '0'
+        holder.rollback()
+        ddl.execute('TRUNCATE TABLE pyo_ddl_nowait')
+    finally:
+        holder.rollback()
+        holder.execute('DROP TABLE pyo_ddl_nowait')
+        holder.close()
+        ddl.close()
+
+
 def test_translate_idioms_rewrites_rowid_pseudocolumn() -> None:
     # The ROWID pseudo-column becomes the row's ctid in Oracle's extended form —
     # one rewrite serving a SELECT, a WHERE ROWID = :bind (text compare), and the
