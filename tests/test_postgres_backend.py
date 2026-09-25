@@ -1466,6 +1466,23 @@ def test_a_block_returning_several_rows_into_a_bind_is_ora_01422() -> None:
         backend.close()
 
 
+def test_session_info_names_the_backend_and_sql_agrees() -> None:
+    # The login reply's SID is the backend's pid, and sys_context says the same;
+    # the serial is the one ora_serial gives that pid (#1212).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        info = backend.session_info()
+        (pid, sid, serial) = backend._conn.execute(
+            "SELECT pg_backend_pid(), sys.sys_context('userenv', 'sid'), "
+            'sys.ora_serial(pg_backend_pid())'
+        ).fetchone()
+        assert info.session_id == pid == int(sid)
+        assert info.serial_num == serial > 0
+        assert info.db_name == info.instance_name
+    finally:
+        backend.close()
+
+
 def test_translate_idioms_rewrites_rowid_pseudocolumn() -> None:
     # The ROWID pseudo-column becomes the row's ctid in Oracle's extended form —
     # one rewrite serving a SELECT, a WHERE ROWID = :bind (text compare), and the

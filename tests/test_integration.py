@@ -1118,6 +1118,22 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(block, [30, 2, out])
         self.assertIsNone(out.getvalue())
 
+    def test_the_session_id_is_the_sid_sql_reports(self):
+        # A client reads its session id from the login reply alone, and SQL
+        # names the same session (#1212). Before 10g USERENV has no SID
+        # (ORA-02003), and the login carries none.
+        from seerdb.common.exceptions import DatabaseError
+
+        try:
+            self.cur.execute("SELECT sys_context('userenv', 'sid') FROM dual")
+        except DatabaseError as exc:
+            if exc.code == 2003:
+                self.skipTest('no USERENV SID before 10g')
+            raise
+        (sid,) = self.cur.fetchone()
+        self.assertIsNotNone(self.conn.session_id)
+        self.assertEqual(int(self.conn.session_id), int(sid))
+
     def test_decode(self):
         # DECODE with untyped literals, a NULL matching a NULL, several searches
         # and no default; and, as a schema script populates a table, a DECODE of
@@ -6175,6 +6191,22 @@ class AsyncConnectionIntegration(unittest.IsolatedAsyncioTestCase):
             await self._drop_async(Cur, Table)
         finally:
             await Conn.close()
+
+    async def test_the_session_id_is_the_sid_sql_reports(self):
+        # Async twin of CursorIntegration's.
+        from seerdb.common.exceptions import DatabaseError
+
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                try:
+                    await Cur.execute("SELECT sys_context('userenv', 'sid') FROM dual")
+                except DatabaseError as exc:
+                    if exc.code == 2003:
+                        self.skipTest('no USERENV SID before 10g')
+                    raise
+                (sid,) = await Cur.fetchone()
+                self.assertIsNotNone(Conn.session_id)
+                self.assertEqual(int(Conn.session_id), int(sid))
 
     async def test_decode(self):
         # Async twin of CursorIntegration's.
