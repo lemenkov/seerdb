@@ -296,19 +296,23 @@ class OraclePassthroughBackend:
                    sys_context('userenv', 'service_name')
               from dual""")
         sid, instance, db_name, db_domain, service = cursor.fetchone()
+        # The serial has no sys_context equivalent. DBMS_DEBUG_JDWP reports it
+        # to any user; v$session needs a grant an ordinary account does not have
+        # (ORA-00942), and relying on it alone left every such client with the
+        # Mirror's placeholder serial (#1236). A login must not fail over it.
         serial = 0
-        try:
-            cursor.execute(
-                'select serial# from v$session '
-                "where sid = sys_context('userenv', 'sid')"
-            )
-            row = cursor.fetchone()
-            serial = int(row[0]) if row else 0
-        except seerdb.DatabaseError:
-            # v$session needs a grant this account may not have. The serial
-            # number is the one field with no sys_context equivalent, and a
-            # login must not fail over it.
-            pass
+        for query in (
+            'select dbms_debug_jdwp.current_session_serial from dual',
+            "select serial# from v$session where sid = sys_context('userenv', 'sid')",
+        ):
+            try:
+                cursor.execute(query)
+                row = cursor.fetchone()
+            except seerdb.DatabaseError:
+                continue
+            if row and row[0] is not None:
+                serial = int(row[0])
+                break
         return SessionInfo(
             session_id=int(sid) if sid else 0,
             serial_num=serial,
