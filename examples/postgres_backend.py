@@ -127,6 +127,7 @@ from seerdb.server import (
     ColumnMeta,
     Credentials,
     CursorResult,
+    LtzValue,
     Result,
     UnsupportedFeature,
     credential_lookup,
@@ -141,6 +142,11 @@ from seerdb.server.identity import IDENTITY_12_1
 # the instant (a real timestamptz, so the instant is stored correctly) and `off`
 # is the entered offset in seconds, which the read path uses to re-tag the value.
 _TSTZ_TYPE = 'ora_tstz'
+# The database time zone, what DBTIMEZONE answers: the zone TIMESTAMP WITH LOCAL
+# TIME ZONE travels in (#1208). A PostgreSQL timestamptz stores the instant, so any
+# fixed zone would do; UTC is Oracle's own default.
+_DB_TIME_ZONE = datetime.timezone.utc
+_DB_TIME_ZONE_NAME = '+00:00'
 _TSTZ_TYPE_DDL = (
     'DO $$ BEGIN CREATE TYPE ora_tstz AS (utc timestamptz, off integer); '
     'EXCEPTION WHEN duplicate_object THEN NULL; END $$'
@@ -282,6 +288,30 @@ _HELPER_FUNCTIONS_DDL = (
     'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
     'CREATE OR REPLACE FUNCTION to_nclob(text) RETURNS text '
     'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
+    # SYSTIMESTAMP / CURRENT_TIMESTAMP are TIMESTAMP WITH TIME ZONE values, the
+    # first at the database's offset, the second at the session's; a plain
+    # timestamptz is TIMESTAMP WITH LOCAL TIME ZONE here (#1208).
+    f'CREATE OR REPLACE FUNCTION ora_systimestamp() RETURNS {_TSTZ_TYPE} '
+    f'LANGUAGE sql STABLE AS $$ SELECT ROW(now(), 0)::{_TSTZ_TYPE} $$;'
+    f'CREATE OR REPLACE FUNCTION ora_current_timestamp() RETURNS {_TSTZ_TYPE} '
+    'LANGUAGE sql STABLE AS $$ SELECT '
+    f'ROW(now(), extract(timezone FROM now())::integer)::{_TSTZ_TYPE} $$;'
+    # A WITH TIME ZONE value is its instant where a timestamptz is wanted -- in
+    # arithmetic, a comparison, an LTZ column -- and its own wall-clock time where
+    # a TIMESTAMP is, as Oracle converts it (#1208).
+    f'CREATE OR REPLACE FUNCTION ora_tstz_instant({_TSTZ_TYPE}) RETURNS timestamptz '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT ($1).utc $$;'
+    f'CREATE OR REPLACE FUNCTION ora_tstz_local({_TSTZ_TYPE}) RETURNS timestamp '
+    "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT (($1).utc AT TIME ZONE 'UTC') "
+    '+ make_interval(secs => ($1).off) $$;'
+    'DO $$ BEGIN '
+    f'CREATE CAST ({_TSTZ_TYPE} AS timestamptz) '
+    f'WITH FUNCTION ora_tstz_instant({_TSTZ_TYPE}) AS IMPLICIT; '
+    'EXCEPTION WHEN duplicate_object THEN NULL; END $$;'
+    'DO $$ BEGIN '
+    f'CREATE CAST ({_TSTZ_TYPE} AS timestamp) '
+    f'WITH FUNCTION ora_tstz_local({_TSTZ_TYPE}) AS ASSIGNMENT; '
+    'EXCEPTION WHEN duplicate_object THEN NULL; END $$;'
 )
 
 
@@ -850,6 +880,7 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
     names: list[str] = []  # distinct bind names, in first-appearance order
     out: list[str] = []
     tstz_keys: set[str] = set()  # bind keys whose value is an aware datetime
+    ltz_keys: set[str] = set()  # bind keys whose value is an LtzValue
     intervalym_keys: set[str] = set()  # bind keys whose value is an IntervalYM
     i, n = 0, len(sql)
     while i < n:
@@ -876,6 +907,12 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
                 # declared type, where there is a PostgreSQL type to cast to.
                 cast = _NULL_CASTS.get(value.tns_type)
                 out.append(f'%({key})s::{cast}' if cast else f'%({key})s')
+            elif isinstance(value, LtzValue):
+                # A TIMESTAMP WITH LOCAL TIME ZONE bind is the instant in the
+                # database time zone, where a TIMESTAMP bind is a wall-clock time
+                # in the session's (#1208, #1222).
+                out.append(f'%({key})s::timestamptz')
+                ltz_keys.add(key)
             elif isinstance(value, datetime.datetime) and value.tzinfo is not None:
                 # An aware datetime binds a TIMESTAMP WITH TIME ZONE — build the
                 # offset-preserving composite so the entered offset survives the
@@ -901,7 +938,11 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
         key = _bind_key(name)
         value = values[idx]
         params[key] = value.value if isinstance(value, BindVar) else value
-        if key in tstz_keys:
+        if key in ltz_keys:
+            params[key] = datetime.datetime.combine(
+                value.date(), value.time(), _DB_TIME_ZONE
+            )
+        elif key in tstz_keys:
             params[f'{key}__off'] = int(values[idx].utcoffset().total_seconds())
         elif key in intervalym_keys:
             params[key] = values[idx].years * 12 + values[idx].months
@@ -949,11 +990,16 @@ _DDL_TYPE_REWRITES = [
     # (utc, offset) that carries the offset across the round trip (#519). LOCAL is
     # matched first (it is the more specific keyword).
     (
-        re.compile(r'\bTIMESTAMP\s+WITH\s+LOCAL\s+TIME\s+ZONE\b', re.IGNORECASE),
-        'timestamptz',
+        re.compile(
+            r'\bTIMESTAMP\s*(\(\s*\d+\s*\))?\s+WITH\s+LOCAL\s+TIME\s+ZONE\b',
+            re.IGNORECASE,
+        ),
+        r'timestamptz\1',
     ),
     (
-        re.compile(r'\bTIMESTAMP\s+WITH\s+TIME\s+ZONE\b', re.IGNORECASE),
+        re.compile(
+            r'\bTIMESTAMP\s*(?:\(\s*\d+\s*\))?\s+WITH\s+TIME\s+ZONE\b', re.IGNORECASE
+        ),
         _TSTZ_TYPE,
     ),
     (re.compile(r'\bTIMESTAMP\b', re.IGNORECASE), 'timestamp'),
@@ -1353,7 +1399,25 @@ _IDIOM_REWRITES = [
         r"- INTERVAL '\1' \2",
     ),
     # SYSDATE / SYSTIMESTAMP → the session clock (SYSDATE is to-the-second).
-    (re.compile(r'\bsystimestamp\b', re.IGNORECASE), 'now()'),
+    (re.compile(r'\bsystimestamp\b', re.IGNORECASE), 'ora_systimestamp()'),
+    # CURRENT_TIMESTAMP [(p)] is the session's TIMESTAMP WITH TIME ZONE (#1208).
+    (
+        re.compile(r'\bcurrent_timestamp\b(?:\s*\(\s*\d+\s*\))?', re.IGNORECASE),
+        'ora_current_timestamp()',
+    ),
+    (re.compile(r'\bdbtimezone\b', re.IGNORECASE), f"'{_DB_TIME_ZONE_NAME}'::text"),
+    # SESSIONTIMEZONE: the zone a TIMESTAMP is read in on its way into an LTZ
+    # value, the PostgreSQL session's, as an offset (#1208).
+    (re.compile(r'\bsessiontimezone\b', re.IGNORECASE), "to_char(now(), 'TZH:TZM')"),
+    # CAST(x AS TIMESTAMP [(p)] WITH LOCAL TIME ZONE): the DDL type rewrite only
+    # runs on DDL, so a query's cast is translated here (#1208).
+    (
+        re.compile(
+            r'\bAS\s+TIMESTAMP\s*(\(\s*\d+\s*\))?\s+WITH\s+LOCAL\s+TIME\s+ZONE\b',
+            re.IGNORECASE,
+        ),
+        r'AS timestamptz\1',
+    ),
     (re.compile(r'\bsysdate\b', re.IGNORECASE), 'localtimestamp(0)'),
     # The ROWID pseudo-column → the row's ctid, in Oracle's extended form
     # (sys.ora_rowid). This one rewrite serves a SELECT (returns the str), a
@@ -1886,11 +1950,12 @@ _RAW_OIDS = frozenset({17})  # bytea
 # distinguishes them is skipped for anything else.
 _DOMAIN_BASE_OIDS = frozenset({25, 17, _INTERVAL_OID})
 # Each PostgreSQL temporal OID maps to the Oracle type of matching precision:
-# a bare date → DATE (7 bytes), timestamp → TIMESTAMP (11), timestamptz → 13.
+# a bare date → DATE (7 bytes), timestamp → TIMESTAMP (11), and timestamptz →
+# TIMESTAMP WITH LOCAL TIME ZONE (11), since WITH TIME ZONE is ora_tstz (#1208).
 _TEMPORAL_OIDS = {
     1082: (TNS_TYPE_DATE, 7),  # date
     1114: (TNS_TYPE_TIMESTAMP, 11),  # timestamp (without time zone)
-    1184: (TNS_TYPE_TIMESTAMPTZ, 13),  # timestamptz
+    1184: (TNS_TYPE_TIMESTAMPLTZ, 11),  # timestamptz
 }
 # PostgreSQL `interval` (oid 1186) → Oracle INTERVAL DAY TO SECOND by default;
 # psycopg returns it as a timedelta (an OraInterval, months == 0), which the Mirror
@@ -2010,15 +2075,34 @@ def _reconstruct_tstz(value):
     )
 
 
+_TIMESTAMPTZ_OID = 1184
+
+
+def _to_ltz(value):
+    # A timestamptz cell → TIMESTAMP WITH LOCAL TIME ZONE's wire value: the
+    # instant in the database time zone, naive, as Oracle sends it (#1208).
+    if not isinstance(value, datetime.datetime) or value.tzinfo is None:
+        return value
+    return value.astimezone(_DB_TIME_ZONE).replace(tzinfo=None)
+
+
+def _wire_cell(value, type_code: int, tstz_oid: int | None):
+    # A fetched cell as the wire encoder wants it: an ora_tstz composite as an
+    # aware datetime at its offset (#519), a timestamptz as an LTZ value (#1208).
+    if tstz_oid is not None and type_code == tstz_oid:
+        return _reconstruct_tstz(value)
+    if type_code == _TIMESTAMPTZ_OID:
+        return _to_ltz(value)
+    return value
+
+
 def _decode_row(cursor, row, tstz_oid: int | None) -> list | None:
-    # Re-tag any ora_tstz composite cells in a fetched row to aware datetimes, so a
-    # WITH TIME ZONE value returned from a routine keeps its offset (#519).
+    # Re-tag a fetched row's zoned cells (see _wire_cell), so a value returned from
+    # a routine is sent as its type is.
     if row is None:
         return None
     return [
-        _reconstruct_tstz(value)
-        if (tstz_oid is not None and desc.type_code == tstz_oid)
-        else value
+        _wire_cell(value, desc.type_code, tstz_oid)
         for value, desc in zip(row, cursor.description or ())
     ]
 
@@ -2752,12 +2836,11 @@ class PostgresBackend:
         if cursor.description is None:
             return Result(rowcount=max(cursor.rowcount, 0))
         rows = [list(r) for r in cursor.fetchall()]
-        # Re-tag any ora_tstz composite cells to aware datetimes carrying the
-        # entered offset before they reach the wire encoder (#519).
+        # Re-tag the zoned cells before they reach the wire encoder (_wire_cell).
         for i, desc in enumerate(cursor.description):
-            if self._tstz_oid is not None and desc.type_code == self._tstz_oid:
+            if desc.type_code in (self._tstz_oid, _TIMESTAMPTZ_OID):
                 for row in rows:
-                    row[i] = _reconstruct_tstz(row[i])
+                    row[i] = _wire_cell(row[i], desc.type_code, self._tstz_oid)
         columns = []
         for i, desc in enumerate(cursor.description):
             # A column tracing back to a typed domain is that Oracle type — an
@@ -3083,10 +3166,8 @@ class PostgresBackend:
                 decoded.append(None)
             elif desc.type_code == _REFCURSOR_OID:
                 decoded.append(self._drain_refcursor(value))
-            elif self._tstz_oid is not None and desc.type_code == self._tstz_oid:
-                decoded.append(_reconstruct_tstz(value))
             else:
-                decoded.append(value)
+                decoded.append(_wire_cell(value, desc.type_code, self._tstz_oid))
         return decoded
 
     def _drain_refcursor(self, portal: str) -> CursorResult:
@@ -3098,9 +3179,9 @@ class PostgresBackend:
         fetch.execute(sql.SQL('FETCH ALL FROM {}').format(sql.Identifier(portal)))
         rows = [list(r) for r in fetch.fetchall()]
         for i, desc in enumerate(fetch.description or ()):
-            if self._tstz_oid is not None and desc.type_code == self._tstz_oid:
+            if desc.type_code in (self._tstz_oid, _TIMESTAMPTZ_OID):
                 for row in rows:
-                    row[i] = _reconstruct_tstz(row[i])
+                    row[i] = _wire_cell(row[i], desc.type_code, self._tstz_oid)
         columns = [
             _column_meta(desc, [r[i] for r in rows], self._tstz_oid)
             for i, desc in enumerate(fetch.description or ())

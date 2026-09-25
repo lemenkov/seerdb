@@ -24,6 +24,7 @@ import array
 import datetime
 import math
 import os
+import re
 import ssl
 import unittest
 from decimal import Decimal
@@ -238,6 +239,22 @@ def _connect_with(**extra):
         **_FV_KW,
         **extra,
     )
+
+
+def _tz_offset(zone: str) -> datetime.timedelta | None:
+    """A ``+HH:MM`` time zone as its offset; None for a named region."""
+    m = re.fullmatch(r'\s*([+-])(\d{1,2}):(\d{2})\s*', zone or '')
+    if m is None:
+        return None
+    offset = datetime.timedelta(hours=int(m.group(2)), minutes=int(m.group(3)))
+    return -offset if m.group(1) == '-' else offset
+
+
+_LTZ_VALUE = datetime.datetime(2026, 9, 25, 13, 45, 6, 123456)
+_LTZ_TABLE_DDL = (
+    'CREATE TABLE {} (k NUMBER, a TIMESTAMP WITH LOCAL TIME ZONE, '
+    'b TIMESTAMP(3) WITH LOCAL TIME ZONE)'
+)
 
 
 def _connect(fetch_lobs: bool = True):
@@ -1227,6 +1244,62 @@ class CursorIntegration(_IntegrationBase):
             with self.assertRaises(DatabaseError) as caught:
                 self.cur.execute(f"ALTER SYSTEM KILL SESSION '{session}'")
             self.assertEqual(caught.exception.code, code)
+
+    def test_timestamp_with_local_time_zone(self):
+        # TIMESTAMP WITH LOCAL TIME ZONE (#1208), as measured on 9i to 23ai: a value
+        # bound as LTZ is the instant in the database zone and round-trips as it
+        # is; a TIMESTAMP bound into one is read in the session zone and comes
+        # back in the database's; a precision truncates; a CAST does the same
+        # conversions; SYSTIMESTAMP / CURRENT_TIMESTAMP are WITH TIME ZONE.
+        if _conn_is_8i(self.conn):
+            self.skipTest('8i has no TIMESTAMP WITH LOCAL TIME ZONE')
+        self.cur.execute('SELECT sessiontimezone, dbtimezone FROM dual')
+        (session, database) = (_tz_offset(z) for z in self.cur.fetchone())
+        if session is None or database is None:
+            self.skipTest('a named time zone')
+        value = _LTZ_VALUE
+        local = value - session + database
+        self.cur.execute(_LTZ_TABLE_DDL.format(self.TABLE))
+        for k, kind in (
+            (1, seerdb.DB_TYPE_TIMESTAMP_LTZ),
+            (2, seerdb.DB_TYPE_TIMESTAMP),
+        ):
+            self.cur.setinputsizes(kind, kind)
+            self.cur.execute(
+                f'INSERT INTO {self.TABLE} VALUES ({k}, :1, :2)', [value, value]
+            )
+        self.cur.execute(f'SELECT k, a, b FROM {self.TABLE} ORDER BY k')
+        self.assertEqual(
+            [d[1] for d in self.cur.description[1:]], [seerdb.DB_TYPE_TIMESTAMP_LTZ] * 2
+        )
+        self.assertEqual(
+            self.cur.fetchall(),
+            [
+                (1, value, value.replace(microsecond=123000)),
+                (2, local, local.replace(microsecond=123000)),
+            ],
+        )
+        for kind, expected in (
+            (seerdb.DB_TYPE_TIMESTAMP_LTZ, value),
+            (seerdb.DB_TYPE_TIMESTAMP, local),
+        ):
+            self.cur.setinputsizes(kind)
+            self.cur.execute(
+                'SELECT CAST(:1 AS TIMESTAMP WITH LOCAL TIME ZONE) FROM dual', [value]
+            )
+            self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_TIMESTAMP_LTZ)
+            self.assertEqual(self.cur.fetchone(), (expected,))
+        self.cur.execute(
+            'SELECT systimestamp, current_timestamp, localtimestamp FROM dual'
+        )
+        self.assertEqual(
+            [d[1] for d in self.cur.description],
+            [
+                seerdb.DB_TYPE_TIMESTAMP_TZ,
+                seerdb.DB_TYPE_TIMESTAMP_TZ,
+                seerdb.DB_TYPE_TIMESTAMP,
+            ],
+        )
 
     def test_decode(self):
         # DECODE with untyped literals, a NULL matching a NULL, several searches
@@ -6392,6 +6465,67 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     with self.assertRaises(DatabaseError) as caught:
                         await Cur.execute(f"ALTER SYSTEM KILL SESSION '{session}'")
                     self.assertEqual(caught.exception.code, code)
+
+    async def test_timestamp_with_local_time_zone(self):
+        # Async twin of CursorIntegration's.
+        if _target_is_8i():
+            self.skipTest('8i has no TIMESTAMP WITH LOCAL TIME ZONE')
+        Table = 'PYO_ASYNC_LTZ'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            await Cur.execute('SELECT sessiontimezone, dbtimezone FROM dual')
+            (session, database) = (_tz_offset(z) for z in await Cur.fetchone())
+            if session is None or database is None:
+                self.skipTest('a named time zone')
+            value = _LTZ_VALUE
+            local = value - session + database
+            await self._drop_async(Cur, Table)
+            await Cur.execute(_LTZ_TABLE_DDL.format(Table))
+            for k, kind in (
+                (1, seerdb.DB_TYPE_TIMESTAMP_LTZ),
+                (2, seerdb.DB_TYPE_TIMESTAMP),
+            ):
+                Cur.setinputsizes(kind, kind)
+                await Cur.execute(
+                    f'INSERT INTO {Table} VALUES ({k}, :1, :2)', [value, value]
+                )
+            await Cur.execute(f'SELECT k, a, b FROM {Table} ORDER BY k')
+            self.assertEqual(
+                [d[1] for d in Cur.description[1:]], [seerdb.DB_TYPE_TIMESTAMP_LTZ] * 2
+            )
+            self.assertEqual(
+                await Cur.fetchall(),
+                [
+                    (1, value, value.replace(microsecond=123000)),
+                    (2, local, local.replace(microsecond=123000)),
+                ],
+            )
+            for kind, expected in (
+                (seerdb.DB_TYPE_TIMESTAMP_LTZ, value),
+                (seerdb.DB_TYPE_TIMESTAMP, local),
+            ):
+                Cur.setinputsizes(kind)
+                await Cur.execute(
+                    'SELECT CAST(:1 AS TIMESTAMP WITH LOCAL TIME ZONE) FROM dual',
+                    [value],
+                )
+                self.assertIs(Cur.description[0][1], seerdb.DB_TYPE_TIMESTAMP_LTZ)
+                self.assertEqual(await Cur.fetchone(), (expected,))
+            await Cur.execute(
+                'SELECT systimestamp, current_timestamp, localtimestamp FROM dual'
+            )
+            self.assertEqual(
+                [d[1] for d in Cur.description],
+                [
+                    seerdb.DB_TYPE_TIMESTAMP_TZ,
+                    seerdb.DB_TYPE_TIMESTAMP_TZ,
+                    seerdb.DB_TYPE_TIMESTAMP,
+                ],
+            )
+            await self._drop_async(Cur, Table)
+        finally:
+            await Conn.close()
 
     async def test_decode(self):
         # Async twin of CursorIntegration's.

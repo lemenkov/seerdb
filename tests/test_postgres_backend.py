@@ -825,7 +825,8 @@ def test_unsupported_pg_type_is_an_ora_error() -> None:
 def test_date_and_timestamp_columns() -> None:
     # Each temporal PostgreSQL type maps to the Oracle type of matching
     # precision: date → DATE (day), timestamp → TIMESTAMP (sub-second),
-    # timestamptz → TIMESTAMPTZ (offset-aware).
+    # timestamptz → TIMESTAMP WITH LOCAL TIME ZONE, the instant in the database
+    # time zone (#1208).
     listen, server, result = _start_mirror()
     conn = _connect(listen.getsockname()[1])
     try:
@@ -836,6 +837,7 @@ def test_date_and_timestamp_columns() -> None:
         ts_value = cur.fetchone()[0]
         cur.execute("select timestamptz '2024-06-01 09:00:00+02' as tz")
         tz_value = cur.fetchone()[0]
+        tz_type = cur.description[0][1]
     finally:
         try:
             conn.close()
@@ -849,11 +851,9 @@ def test_date_and_timestamp_columns() -> None:
     assert date_value == datetime.datetime(2020, 12, 31, 0, 0)
     # TIMESTAMP keeps the microseconds.
     assert ts_value == datetime.datetime(2024, 1, 15, 13, 30, 45, 123456)
-    # TIMESTAMPTZ is offset-aware and equals the same instant as 07:00Z.
-    assert tz_value.tzinfo is not None
-    assert tz_value == datetime.datetime(
-        2024, 6, 1, 7, 0, 0, tzinfo=datetime.timezone.utc
-    )
+    # LTZ is naive: the instant 07:00Z in the database zone, UTC.
+    assert tz_type is seerdb.DB_TYPE_TIMESTAMP_LTZ
+    assert tz_value == datetime.datetime(2024, 6, 1, 7, 0, 0)
 
 
 def test_interval_day_to_second_column() -> None:
@@ -1228,9 +1228,13 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
         'ora_to_char_signed',
         'sys.ora_rowid_b64',
         'sys.ora_rowid',
+        'ora_systimestamp',
+        'ora_current_timestamp',
+        'ora_tstz_instant',
+        'ora_tstz_local',
     ):
         assert f'FUNCTION {name}(' in _HELPER_FUNCTIONS_DDL
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 19
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 23
     # Oracle's conversion functions orafce lacks, one overload per argument
     # type a caller passes.
     for name in (
