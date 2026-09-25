@@ -151,6 +151,44 @@ def test_typed_null_of_an_ordinary_statement_is_declared_upstream():
     assert not isinstance(cursor.bound[0], BindVar)
 
 
+def test_an_ltz_bind_is_declared_upstream_as_one():
+    # An LTZ bind arrives as an LtzValue (#1222); bound on as a bare datetime it
+    # would be a TIMESTAMP, read in the session zone instead of the database's,
+    # so the passthrough declares it LTZ -- alone, beside a typed NULL, and
+    # across an array (#1225).
+    import datetime
+
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+    from seerdb.server.backend import LtzValue
+
+    value = datetime.datetime(2026, 9, 25, 13, 45, 6)
+    ltz = LtzValue.of(value)
+
+    class _ArrayCursor(_FakeCursor):
+        def executemany(self, sql, rows, **kwargs):
+            self.bound = [list(r) for r in rows]
+
+    backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
+    cursor = _ArrayCursor()
+    backend._conn = type('Conn', (), {'cursor': lambda self: cursor})()
+
+    backend.execute('INSERT INTO t VALUES (:1, :2)', [ltz, value])
+    assert cursor.declared == (seerdb.DB_TYPE_TIMESTAMP_LTZ, None)
+    assert cursor.bound == [value, value]
+
+    (typed,) = _plsql_binds((None, TNS_TYPE_NUMBER, 22))
+    backend.execute('INSERT INTO t VALUES (:1, :2)', [typed, ltz])
+    assert cursor.declared == (seerdb.DB_TYPE_NUMBER, seerdb.DB_TYPE_TIMESTAMP_LTZ)
+
+    cursor.declared = None
+    backend.execute_many('INSERT INTO t VALUES (:1, :2)', [[1, ltz], [2, None]])
+    assert cursor.declared == (None, seerdb.DB_TYPE_TIMESTAMP_LTZ)
+
+    cursor.declared = None
+    backend.execute('INSERT INTO t VALUES (:1)', [value])
+    assert cursor.declared is None
+
+
 class _FakeLobConn:
     """An upstream connection that records the temp LOBs made on it."""
 
