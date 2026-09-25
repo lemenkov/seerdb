@@ -2685,7 +2685,7 @@ class OracleConnect(_ConnectionLogic):
                 # reconnect cycles. Format: 10-byte header (PacketSize,
                 # PacketFlags, Type, Flags, DataFlags).
                 if self.sock is not None:
-                    self._sock.send(
+                    self._write(
                         struct.pack('>hhBBh', 10, 0, TNS_DATA, 0, TNS_DATA_FLAGS_EOF)
                     )
         except (OSError, Exception):
@@ -2741,13 +2741,28 @@ class OracleConnect(_ConnectionLogic):
                 (Packet, Rest) = encode_packet(
                     Type, Data, self.sdu, self._large_packets
                 )
-            try:
-                self._sock.send(Packet)
-            except TimeoutError as exc:
-                raise self._timeout_error('write') from exc
+            self._write(Packet)
             Data = Rest
         logger.debug('Send OK')
         return True
+
+    def _write(self, Packet: bytes) -> None:
+        # Write the whole packet. socket.send() may take only part of it: when
+        # the server stops reading -- a slow INSERT while it hunts for space --
+        # the window fills and a timeout socket sends what fits and returns the
+        # count. Dropping the rest cut a TNS packet short; the server read the
+        # next packet's bytes as its tail and refused the call with ORA-03146,
+        # or waited for bytes that never came (#861). Not sendall(): its timeout
+        # bounds the whole write, so a large bind over a slow link would time
+        # out while still progressing; here each wait for the socket gets the
+        # full timeout.
+        View = memoryview(Packet)
+        while View:
+            try:
+                Sent = self._sock.send(View)
+            except TimeoutError as exc:
+                raise self._timeout_error('write') from exc
+            View = View[Sent:]
 
     def _negotiate_ano(self) -> None:
         # Run the ANO negotiation (plaintext) after the accept, then activate the
@@ -3058,13 +3073,11 @@ class OracleConnect(_ConnectionLogic):
         First = True
         while len(Data) > BodyMax:
             Flags = TNS_DATA_FLAGS_MORE | (FirstFlags if First else 0)
-            self._sock.send(
-                encode_data_packet(Data[:BodyMax], Flags, self._large_packets)
-            )
+            self._write(encode_data_packet(Data[:BodyMax], Flags, self._large_packets))
             Data = Data[BodyMax:]
             First = False
         Flags = FinalFlags | (FirstFlags if First else 0)
-        self._sock.send(encode_data_packet(Data, Flags, self._large_packets))
+        self._write(encode_data_packet(Data, Flags, self._large_packets))
 
     def _pipeline_recv_response(self) -> bytes:
         # Read exactly one op's response (TOKEN + body + EOR) as a single
