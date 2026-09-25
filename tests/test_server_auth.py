@@ -24,6 +24,7 @@ from seerdb.common.crypto import (
 )
 from seerdb.common.exceptions import InterfaceError
 from seerdb.common.tns import (
+    AUTH_SERIAL_NUM,
     decode_token_rpa,
     encode_challenge,
     encode_dictionary_auth,
@@ -104,10 +105,12 @@ def test_encode_challenge_decodes_as_a_sess_challenge() -> None:
 
 def test_encode_result_decodes_as_an_auth_result() -> None:
     payload = encode_result(bytes(24), session_id=59)
-    kind, resp, version, session_id = decode_token_rpa(payload[1:], ())
+    kind, resp, version, session_id, serial_num = decode_token_rpa(payload[1:], ())
     assert kind == TTI_AUTH
     assert version == VERSION_11_2_0_2
-    assert session_id == b'59'
+    # The numbers, as a client reads them (#1218), the serial included (#1234).
+    assert session_id == 59
+    assert serial_num == AUTH_SERIAL_NUM
 
 
 def test_encode_result_reports_max_open_cursors_at_12c() -> None:
@@ -325,7 +328,7 @@ def test_full_auth_roundtrip_through_seerdb_client_encoders() -> None:
     assert not verify_password(server_conn, auth_password, b'wrongpass')
 
     # The result the server sends back, validated by the client's own check.
-    _, resp, _, _ = decode_token_rpa(encode_result(server_conn)[1:], ())
+    _, resp, _, _, _ = decode_token_rpa(encode_result(server_conn)[1:], ())
     assert validate(unhexlify(resp), client_conn)
 
 

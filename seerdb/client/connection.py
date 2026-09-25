@@ -847,7 +847,10 @@ class OracleConnect(_ConnectionLogic):
         self._used_nego_cache = False
         self._skip_nego_cache = False  # forced true on the invalidate-and-retry
         self.server_version = 0
-        self.session_id = None
+        # The session's SID and SERIAL#, from the login reply; None before 10g,
+        # whose reply carries neither (#1218).
+        self.session_id: int | None = None
+        self.serial_num: int | None = None
         # Negotiated TTC field version. Starts at the client's advertised max
         # (the field_version arg; 21.1 by default) and is lowered to the
         # server's during the PRO handshake — min(client, server), see
@@ -1413,8 +1416,8 @@ class OracleConnect(_ConnectionLogic):
             self.send(TNS_DATA, Data)
             return self.handle_login()
         elif Result[0] == TTI_AUTH:
-            # Auth result: (TTI_AUTH, Resp, Ver, SessId)
-            (_, Resp, Ver, SessId) = Result
+            # Auth result: (TTI_AUTH, Resp, Ver, SessId, SerialNum)
+            (_, Resp, Ver, SessId, SerialNum) = Result
             logger.debug('handle_login: auth result Ver=%s SessId=%s', Ver, SessId)
             if self._token_auth:
                 # Token auth (#125): the server grants the session with no
@@ -1422,6 +1425,7 @@ class OracleConnect(_ConnectionLogic):
                 # returned version + session id directly.
                 self.server_version = Ver
                 self.session_id = SessId
+                self.serial_num = SerialNum
                 self.conn_state = CONN_STATE_AUTHENTICATED
                 logger.debug('handle_login: authenticated (token)')
                 return 0
@@ -1429,6 +1433,7 @@ class OracleConnect(_ConnectionLogic):
             if validate(bytes.fromhex(Resp.decode('utf-8')), self.conn_key):
                 self.server_version = Ver
                 self.session_id = SessId
+                self.serial_num = SerialNum
                 self.conn_state = CONN_STATE_AUTHENTICATED
                 logger.debug('handle_login: authenticated')
                 # Negotiation cache (#438): record the fast-auth field version so

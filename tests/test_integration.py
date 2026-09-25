@@ -1154,9 +1154,9 @@ class CursorIntegration(_IntegrationBase):
         self.assertIsNone(out.getvalue())
 
     def test_the_session_id_is_the_sid_sql_reports(self):
-        # A client reads its session id from the login reply alone, and SQL
-        # names the same session (#1212). Before 10g USERENV has no SID
-        # (ORA-02003), and the login carries none.
+        # A client reads its session id and serial from the login reply alone,
+        # and SQL names the same session (#1212, #1218). Before 10g USERENV has
+        # no SID (ORA-02003), and the login carries neither.
         from seerdb.common.exceptions import DatabaseError
 
         try:
@@ -1166,8 +1166,18 @@ class CursorIntegration(_IntegrationBase):
                 self.skipTest('no USERENV SID before 10g')
             raise
         (sid,) = self.cur.fetchone()
-        self.assertIsNotNone(self.conn.session_id)
-        self.assertEqual(int(self.conn.session_id), int(sid))
+        # Both are ints, as python-oracledb gives them (#1218).
+        self.assertIsInstance(self.conn.session_id, int)
+        self.assertIsInstance(self.conn.serial_num, int)
+        self.assertEqual(self.conn.session_id, int(sid))
+        # The serial is the one the server names the session by. The package
+        # needs no privilege; a server without it (the Mirror over PostgreSQL)
+        # checks only the type.
+        try:
+            self.cur.execute('SELECT dbms_debug_jdwp.current_session_serial FROM dual')
+        except DatabaseError:
+            return
+        self.assertEqual(self.cur.fetchone(), (self.conn.serial_num,))
 
     def test_v_session_shows_the_identity_the_client_declared(self):
         # v$session and v$session_connect_info show this session as its login
@@ -6407,8 +6417,16 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                         self.skipTest('no USERENV SID before 10g')
                     raise
                 (sid,) = await Cur.fetchone()
-                self.assertIsNotNone(Conn.session_id)
-                self.assertEqual(int(Conn.session_id), int(sid))
+                self.assertIsInstance(Conn.session_id, int)
+                self.assertIsInstance(Conn.serial_num, int)
+                self.assertEqual(Conn.session_id, int(sid))
+                try:
+                    await Cur.execute(
+                        'SELECT dbms_debug_jdwp.current_session_serial FROM dual'
+                    )
+                except DatabaseError:
+                    return
+                self.assertEqual(await Cur.fetchone(), (Conn.serial_num,))
 
     async def test_v_session_shows_the_identity_the_client_declared(self):
         # Async twin of CursorIntegration's.

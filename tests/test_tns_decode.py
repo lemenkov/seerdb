@@ -3714,8 +3714,11 @@ class TestTnsCommandDecoders(unittest.TestCase):
         # Full packed AUTH_VERSION_NO (0x0b200200 = 11.2.0.2.0); the connection
         # masks the major release out of this for its protocol gate.
         Ver = VERSION_11_2_0_2
-        SessId = b'160'
-        self.assertEqual(decode_token_rpa(Data, None), (TTI_AUTH, Resp, Ver, SessId))
+        # The SID and SERIAL#, as the numbers the captured reply carries (#1218).
+        (SessId, SerialNum) = (160, 1725)
+        self.assertEqual(
+            decode_token_rpa(Data, None), (TTI_AUTH, Resp, Ver, SessId, SerialNum)
+        )
 
 
 from seerdb.common.tns import decode_chr, decode_kv

@@ -4562,6 +4562,17 @@ def decode_token_oac(Data: bytes, Acc: tuple) -> tuple[int, int, int, int, bytes
     return (DataType, MaxDataLength, DataScale, Charset, Rest)
 
 
+def _auth_int(Value: bytes | None) -> int | None:
+    # A numeric login-reply value (sent as its decimal text), or None when the
+    # reply does not carry it or it is not a number.
+    if Value is None:
+        return None
+    try:
+        return int(bytes(Value))
+    except ValueError:
+        return None
+
+
 def decode_token_rpa(Data: bytes, Acc: tuple) -> tuple:
     (Num, Rest0) = decode_ub4(Data)
     Flags: dict = {}
@@ -4579,8 +4590,12 @@ def decode_token_rpa(Data: bytes, Acc: tuple) -> tuple:
         # release (>> 24) for its protocol gate and the full dotted string for
         # the `version` property.
         Ver = 0 if Value is None else int(Value)
-        SessId = dict(KVs).get(b'AUTH_SESSION_ID')
-        return (TTI_AUTH, Resp, Ver, SessId)
+        # The session's SID and SERIAL#, as the numbers they are: the SID is the
+        # one sys_context('userenv', 'sid') reports, and the pair is what
+        # ALTER SYSTEM KILL SESSION names (#1218). A pre-10g reply has neither.
+        SessId = _auth_int(dict(KVs).get(b'AUTH_SESSION_ID'))
+        SerialNum = _auth_int(dict(KVs).get(b'AUTH_SERIAL_NUM'))
+        return (TTI_AUTH, Resp, Ver, SessId, SerialNum)
     else:
         # The 256-bit scheme carries the server's PBKDF2 iteration counts; the
         # client must derive the key with these, not hardcoded defaults (#309).
