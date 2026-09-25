@@ -10,8 +10,10 @@ O5LOGON) against a real client.
 
 from __future__ import annotations
 
+import datetime
 import socket
 import threading
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -468,6 +470,96 @@ def test_empty_row_array_execute_runs_once_per_iteration() -> None:
     assert result.get('error') is None, result.get('error')
     # All three empty iterations reached the backend, not just one.
     assert len(backend.inserts) == 3
+
+
+def test_an_ltz_bind_reaches_the_backend_marked_as_one() -> None:
+    # A TIMESTAMP WITH LOCAL TIME ZONE bind and a TIMESTAMP bind decode to the same
+    # naive datetime; the backend is told which was which, since Oracle reads them
+    # in different zones (#1222). Once, again (the re-execute) and as an array.
+    from seerdb.server import LtzValue
+
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    port = listen.getsockname()[1]
+
+    result: dict = {}
+    backend = _RecordingArrayBackend()
+    server = threading.Thread(
+        target=_run_recording_session, args=(listen, result, backend), daemon=True
+    )
+    server.start()
+
+    conn = seerdb.connect(
+        host='127.0.0.1',
+        port=port,
+        user='PYO',
+        password='pyo123',
+        service_name='XE',
+        timeout=5000,
+    )
+    value = datetime.datetime(2026, 9, 25, 13, 45, 6, 123456)
+    sql = 'INSERT INTO t (ltz, ts) VALUES (:1, :2)'
+    try:
+        cursor = conn.cursor()
+        for _ in range(2):
+            cursor.setinputsizes(seerdb.DB_TYPE_TIMESTAMP_LTZ, seerdb.DB_TYPE_TIMESTAMP)
+            cursor.execute(sql, [value, value])
+        cursor.setinputsizes(seerdb.DB_TYPE_TIMESTAMP_LTZ, seerdb.DB_TYPE_TIMESTAMP)
+        cursor.executemany(sql, [[value, value], [None, value]])
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        server.join(timeout=5)
+        listen.close()
+
+    assert result.get('error') is None, result.get('error')
+    rows = backend.inserts
+    assert len(rows) == 4
+    for ltz, ts in rows[:3]:
+        assert type(ltz) is LtzValue and ltz == value
+        assert type(ts) is datetime.datetime and ts == value
+    assert rows[3][0] is None
+
+
+def test_mark_ltz_binds_leaves_nulls_and_other_types_alone() -> None:
+    # Only a non-NULL datetime at an LTZ position is marked; a NULL, a BindVar
+    # (which says its type itself) and every other position are left as they are.
+    from seerdb.common.tns import ExecRequest
+    from seerdb.common.tns_consts import TNS_TYPE_TIMESTAMP, TNS_TYPE_TIMESTAMPLTZ
+    from seerdb.server import BindVar, LtzValue
+    from seerdb.server.session import _mark_ltz_binds
+
+    value = datetime.datetime(2026, 9, 25, 13, 45, 6)
+    null = BindVar(value=None, tns_type=TNS_TYPE_TIMESTAMPLTZ, max_size=11)
+    row = [value, value, None, null]
+    request = ExecRequest(
+        'insert into t values (:1, :2, :3, :4)',
+        0,
+        4,
+        0,
+        binds=row,
+        bind_rows=[row],
+        bind_meta=[
+            (TNS_TYPE_TIMESTAMPLTZ, 11),
+            (TNS_TYPE_TIMESTAMP, 11),
+            (TNS_TYPE_TIMESTAMPLTZ, 11),
+            (TNS_TYPE_TIMESTAMPLTZ, 11),
+        ],
+    )
+    marked = _mark_ltz_binds(request)
+    assert [type(v) for v in marked.binds] == [
+        LtzValue,
+        datetime.datetime,
+        type(None),
+        BindVar,
+    ]
+    assert marked.bind_rows == [marked.binds]
+    no_ltz = replace(request, bind_meta=[(TNS_TYPE_TIMESTAMP, 11)] * 4)
+    assert _mark_ltz_binds(no_ltz) is no_ltz
 
 
 def _exec_body() -> bytes:
