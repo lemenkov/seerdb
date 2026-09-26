@@ -257,6 +257,21 @@ _LTZ_TABLE_DDL = (
 )
 
 
+def _tz(hours: int) -> datetime.timezone:
+    return datetime.timezone(datetime.timedelta(hours=hours))
+
+
+# Two rows at the same instant written at different offsets, and a later one:
+# Oracle compares WITH TIME ZONE values by their instant (#1239).
+_TSTZ_ROWS = [
+    [1, datetime.datetime(2022, 5, 10, 12, 0, tzinfo=_tz(0))],
+    [2, datetime.datetime(2022, 5, 10, 14, 0, tzinfo=_tz(2))],
+    [3, datetime.datetime(2022, 5, 10, 13, 0, tzinfo=_tz(0))],
+]
+_TSTZ_SAME_INSTANT = datetime.datetime(2022, 5, 10, 17, 0, tzinfo=_tz(5))
+_TSTZ_BEFORE = datetime.datetime(2022, 5, 10, 12, 30, tzinfo=_tz(0))
+
+
 def _connect(fetch_lobs: bool = True):
     import time
 
@@ -1333,6 +1348,33 @@ class CursorIntegration(_IntegrationBase):
         self.assertEqual(caught.exception.code, 2003)
         self.cur.execute('SELECT 1 FROM dual')
         self.assertEqual(self.cur.fetchall(), [(1,)])
+
+    def test_timestamp_with_time_zone_compares_by_instant(self):
+        # Equal, ordered and counted by the instant, whatever the offset each
+        # value was written at; a NULL bind matches nothing (#1239).
+        if _conn_is_8i(self.conn):
+            self.skipTest('8i has no TIMESTAMP WITH TIME ZONE')
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (k NUMBER, t TIMESTAMP WITH TIME ZONE)'
+        )
+        for row in _TSTZ_ROWS:  # one at a time: 9i has no array DML
+            self.cur.setinputsizes(None, seerdb.DB_TYPE_TIMESTAMP_TZ)
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', row)
+        for value, expected in ((_TSTZ_SAME_INSTANT, [(1,), (2,)]), (None, [])):
+            self.cur.setinputsizes(seerdb.DB_TYPE_TIMESTAMP_TZ)
+            self.cur.execute(
+                f'SELECT k FROM {self.TABLE} WHERE t = :1 ORDER BY k', [value]
+            )
+            self.assertEqual(self.cur.fetchall(), expected)
+        self.cur.setinputsizes(seerdb.DB_TYPE_TIMESTAMP_TZ)
+        self.cur.execute(
+            f'SELECT k FROM {self.TABLE} WHERE t < :1 ORDER BY k', [_TSTZ_BEFORE]
+        )
+        self.assertEqual(self.cur.fetchall(), [(1,), (2,)])
+        self.cur.execute(f'SELECT k FROM {self.TABLE} ORDER BY t DESC, k')
+        self.assertEqual(self.cur.fetchall(), [(3,), (1,), (2,)])
+        self.cur.execute(f'SELECT COUNT(DISTINCT t) FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchall(), [(2,)])
 
     def test_decode(self):
         # DECODE with untyped literals, a NULL matching a NULL, several searches
@@ -6588,6 +6630,40 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 self.assertEqual(caught.exception.code, 2003)
                 await Cur.execute('SELECT 1 FROM dual')
                 self.assertEqual(await Cur.fetchall(), [(1,)])
+
+    async def test_timestamp_with_time_zone_compares_by_instant(self):
+        # Async twin of CursorIntegration's.
+        if _target_is_8i():
+            self.skipTest('8i has no TIMESTAMP WITH TIME ZONE')
+        Table = 'PYO_ASYNC_TSTZ_CMP'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            await self._drop_async(Cur, Table)
+            await Cur.execute(
+                f'CREATE TABLE {Table} (k NUMBER, t TIMESTAMP WITH TIME ZONE)'
+            )
+            for row in _TSTZ_ROWS:  # one at a time: 9i has no array DML
+                Cur.setinputsizes(None, seerdb.DB_TYPE_TIMESTAMP_TZ)
+                await Cur.execute(f'INSERT INTO {Table} VALUES (:1, :2)', row)
+            for value, expected in ((_TSTZ_SAME_INSTANT, [(1,), (2,)]), (None, [])):
+                Cur.setinputsizes(seerdb.DB_TYPE_TIMESTAMP_TZ)
+                await Cur.execute(
+                    f'SELECT k FROM {Table} WHERE t = :1 ORDER BY k', [value]
+                )
+                self.assertEqual(await Cur.fetchall(), expected)
+            Cur.setinputsizes(seerdb.DB_TYPE_TIMESTAMP_TZ)
+            await Cur.execute(
+                f'SELECT k FROM {Table} WHERE t < :1 ORDER BY k', [_TSTZ_BEFORE]
+            )
+            self.assertEqual(await Cur.fetchall(), [(1,), (2,)])
+            await Cur.execute(f'SELECT k FROM {Table} ORDER BY t DESC, k')
+            self.assertEqual(await Cur.fetchall(), [(3,), (1,), (2,)])
+            await Cur.execute(f'SELECT COUNT(DISTINCT t) FROM {Table}')
+            self.assertEqual(await Cur.fetchall(), [(2,)])
+            await self._drop_async(Cur, Table)
+        finally:
+            await Conn.close()
 
     async def test_decode(self):
         # Async twin of CursorIntegration's.
