@@ -365,6 +365,45 @@ _HELPER_FUNCTIONS_DDL = (
     # An operator class needs a superuser; without one the operators still
     # compare by instant, and ORDER BY / DISTINCT keep the record's meaning.
     'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+    # A number of days added to a WITH [LOCAL] TIME ZONE value (#1240). Oracle
+    # makes it a DATE first, on the session's clock for LTZ and on the value's
+    # own offset for TSTZ, dropping the fractional seconds; the result is that
+    # DATE. A plain TIMESTAMP already gets this from orafce's DATE arithmetic,
+    # which these leave alone: a timestamp matches that exactly.
+    'CREATE OR REPLACE FUNCTION ora_ltz_add_days(timestamptz, numeric) '
+    'RETURNS timestamp LANGUAGE sql STABLE STRICT AS $$ SELECT '
+    "date_trunc('second', date_trunc('second', $1::timestamp) "
+    "+ $2 * interval '1 day') $$;"
+    f'CREATE OR REPLACE FUNCTION ora_tstz_add_days({_TSTZ_TYPE}, numeric) '
+    'RETURNS timestamp LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT '
+    "date_trunc('second', date_trunc('second', ora_tstz_local($1)) "
+    "+ $2 * interval '1 day') $$;"
+    'CREATE OR REPLACE FUNCTION ora_ltz_sub_days(timestamptz, numeric) '
+    'RETURNS timestamp LANGUAGE sql STABLE STRICT AS $$ '
+    'SELECT ora_ltz_add_days($1, -$2) $$;'
+    f'CREATE OR REPLACE FUNCTION ora_tstz_sub_days({_TSTZ_TYPE}, numeric) '
+    'RETURNS timestamp LANGUAGE sql IMMUTABLE STRICT AS $$ '
+    'SELECT ora_tstz_add_days($1, -$2) $$;'
+    'CREATE OR REPLACE FUNCTION ora_days_add_ltz(numeric, timestamptz) '
+    'RETURNS timestamp LANGUAGE sql STABLE STRICT AS $$ '
+    'SELECT ora_ltz_add_days($2, $1) $$;'
+    f'CREATE OR REPLACE FUNCTION ora_days_add_tstz(numeric, {_TSTZ_TYPE}) '
+    'RETURNS timestamp LANGUAGE sql IMMUTABLE STRICT AS $$ '
+    'SELECT ora_tstz_add_days($2, $1) $$;'
+    'DO $$ BEGIN '
+    'CREATE OPERATOR + (LEFTARG = timestamptz, RIGHTARG = numeric, '
+    'FUNCTION = ora_ltz_add_days, COMMUTATOR = +); '
+    'CREATE OPERATOR + (LEFTARG = numeric, RIGHTARG = timestamptz, '
+    'FUNCTION = ora_days_add_ltz, COMMUTATOR = +); '
+    'CREATE OPERATOR - (LEFTARG = timestamptz, RIGHTARG = numeric, '
+    'FUNCTION = ora_ltz_sub_days); '
+    f'CREATE OPERATOR + (LEFTARG = {_TSTZ_TYPE}, RIGHTARG = numeric, '
+    'FUNCTION = ora_tstz_add_days, COMMUTATOR = +); '
+    f'CREATE OPERATOR + (LEFTARG = numeric, RIGHTARG = {_TSTZ_TYPE}, '
+    'FUNCTION = ora_days_add_tstz, COMMUTATOR = +); '
+    f'CREATE OPERATOR - (LEFTARG = {_TSTZ_TYPE}, RIGHTARG = numeric, '
+    'FUNCTION = ora_tstz_sub_days); '
+    'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
 )
 
 
@@ -3247,7 +3286,6 @@ class PostgresBackend:
         # BEGIN :a := <expr>; :b := <expr>; END — evaluate the right-hand sides
         # with one SELECT and place each result onto its bind position (#517).
         refs = _distinct_bind_refs(body)
-        exprs = ', '.join(expr for _ref, expr in assignments)
         # Bind the SELECT by NAME, against the block's own bind order. The SELECT
         # carries only the right-hand sides, so the OUT targets are gone from it
         # and its placeholders no longer line up with `values`, which is in the
@@ -3257,6 +3295,16 @@ class PostgresBackend:
         # pure OUT bind is None. So f received NULL whatever the caller passed,
         # and no error was raised (#1137).
         by_name = dict(zip(refs, values))
+        # A DATE or TIMESTAMP assigned to a TIMESTAMP WITH LOCAL TIME ZONE is read
+        # in the session's zone, as Oracle converts it; the cast does that, and
+        # leaves a value that is already an instant alone (#1240).
+        exprs = ', '.join(
+            f'CAST(({expr}) AS timestamptz)'
+            if isinstance(by_name.get(ref), BindVar)
+            and by_name[ref].tns_type == TNS_TYPE_TIMESTAMPLTZ
+            else expr
+            for ref, expr in assignments
+        )
         select = _translate_idioms(f'SELECT {exprs}')
         sql, params = _translate_binds(
             select, [by_name[ref] for ref in _distinct_bind_refs(select)]
