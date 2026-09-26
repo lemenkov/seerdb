@@ -582,6 +582,14 @@ _ORACLE_DICTIONARY_DDL = (
     'ELSE upper(c.table_schema) END AS owner, '
     'ora_name(c.table_name) AS table_name, ora_name(c.column_name) AS column_name, '
     'c.ordinal_position AS column_id, '
+    # A collection (an array domain) or an object type is reported by its type's
+    # name, as Oracle names it, and its schema is DATA_TYPE_OWNER (#1251). The
+    # WITH TIME ZONE composite is the backend's own and reads as the built-in.
+    "CASE WHEN c.data_type = 'ARRAY' AND c.domain_name IS NOT NULL "
+    'THEN ora_name(c.domain_name) '
+    "WHEN c.data_type = 'USER-DEFINED' AND c.udt_name = 'ora_tstz' "
+    "THEN 'TIMESTAMP WITH TIME ZONE' "
+    "WHEN c.data_type = 'USER-DEFINED' THEN ora_name(c.udt_name) ELSE "
     "CASE c.data_type WHEN 'numeric' THEN 'NUMBER' WHEN 'integer' THEN 'NUMBER' "
     "WHEN 'bigint' THEN 'NUMBER' WHEN 'smallint' THEN 'NUMBER' "
     "WHEN 'double precision' THEN 'BINARY_DOUBLE' WHEN 'real' THEN 'BINARY_FLOAT' "
@@ -590,13 +598,18 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN 'timestamp without time zone' THEN 'TIMESTAMP' "
     "WHEN 'timestamp with time zone' THEN 'TIMESTAMP WITH TIME ZONE' "
     "WHEN 'bytea' THEN 'BLOB' WHEN 'boolean' THEN 'NUMBER' "
-    'ELSE upper(c.data_type) END AS data_type, '
+    'ELSE upper(c.data_type) END END AS data_type, '
     'coalesce(c.character_maximum_length, c.numeric_precision, 22) AS data_length, '
     'c.numeric_precision AS data_precision, c.numeric_scale AS data_scale, '
     'c.character_maximum_length AS char_length, '
     "CASE c.is_nullable WHEN 'YES' THEN 'Y' ELSE 'N' END AS nullable, "
     "c.column_default AS data_default, 'NO' AS hidden_column, "
-    "'NO' AS virtual_column, 'NO' AS identity_column, NULL::text AS default_on_null "
+    "'NO' AS virtual_column, 'NO' AS identity_column, NULL::text AS default_on_null, "
+    # Appended: CREATE OR REPLACE VIEW can only add a column at the end.
+    "CASE WHEN c.data_type = 'ARRAY' AND c.domain_name IS NOT NULL "
+    'THEN ora_owner(c.domain_schema) '
+    "WHEN c.data_type = 'USER-DEFINED' AND c.udt_name <> 'ora_tstz' "
+    'THEN ora_owner(c.udt_schema) END AS data_type_owner '
     'FROM information_schema.columns c '
     "WHERE c.table_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
     'CREATE OR REPLACE VIEW sys.all_tab_columns AS SELECT * FROM all_tab_cols;'
