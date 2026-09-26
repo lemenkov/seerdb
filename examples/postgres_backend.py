@@ -200,6 +200,25 @@ _INTERVALYM_TYPE_DDL = (
 # `1.5f` suffix, CONNECT BY LEVEL) has no call to resolve and stays a rewrite in
 # _translate_idioms. EMPTY_CLOB / EMPTY_BLOB return the LOB domains, so they need
 # those to exist first (created just before this in __init__).
+# The WITH TIME ZONE comparisons (#1239): (function suffix, operator) and, for
+# CREATE OPERATOR, commutator, negator, and selectivity estimators; `=` also
+# supports hash and merge joins.
+_TSTZ_COMPARISONS = (
+    ('eq', '='),
+    ('ne', '<>'),
+    ('lt', '<'),
+    ('le', '<='),
+    ('gt', '>'),
+    ('ge', '>='),
+)
+_TSTZ_OPERATORS = (
+    ('eq', '=', '=', '<>', 'eqsel', 'eqjoinsel', ', HASHES, MERGES'),
+    ('ne', '<>', '<>', '=', 'neqsel', 'neqjoinsel', ''),
+    ('lt', '<', '>', '>=', 'scalarltsel', 'scalarltjoinsel', ''),
+    ('le', '<=', '>=', '>', 'scalarlesel', 'scalarlejoinsel', ''),
+    ('gt', '>', '<', '<=', 'scalargtsel', 'scalargtjoinsel', ''),
+    ('ge', '>=', '<=', '<', 'scalargesel', 'scalargejoinsel', ''),
+)
 _HELPER_FUNCTIONS_DDL = (
     # TO_CHAR(d, '..SYYYY..') → the year signed as Oracle prints it: '-' before
     # a BC year, a space before any other (#1063). The sign goes where SYYYY
@@ -312,6 +331,40 @@ _HELPER_FUNCTIONS_DDL = (
     f'CREATE CAST ({_TSTZ_TYPE} AS timestamp) '
     f'WITH FUNCTION ora_tstz_local({_TSTZ_TYPE}) AS ASSIGNMENT; '
     'EXCEPTION WHEN duplicate_object THEN NULL; END $$;'
+    # Oracle compares WITH TIME ZONE values by their instant: 12:00 +00:00 and
+    # 14:00 +02:00 are equal, order together and count once in a DISTINCT. The
+    # composite's own record comparison would also compare the offsets, and
+    # beside the cast to timestamptz above it made `=` ambiguous (#1239). So the
+    # comparison operators, and the btree and hash classes ORDER BY, DISTINCT
+    # and grouping use, all go by the instant.
+    f'CREATE OR REPLACE FUNCTION ora_tstz_cmp({_TSTZ_TYPE}, {_TSTZ_TYPE}) '
+    'RETURNS integer LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT CASE '
+    'WHEN ($1).utc < ($2).utc THEN -1 WHEN ($1).utc > ($2).utc THEN 1 ELSE 0 END $$;'
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION ora_tstz_{name}({_TSTZ_TYPE}, {_TSTZ_TYPE}) '
+        f'RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT ($1).utc {op} ($2).utc $$;'
+        for name, op in _TSTZ_COMPARISONS
+    )
+    + f'CREATE OR REPLACE FUNCTION ora_tstz_hash({_TSTZ_TYPE}) RETURNS integer '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ '
+    'SELECT hashfloat8(extract(epoch FROM ($1).utc)::float8) $$;'
+    'DO $$ BEGIN '
+    + ''.join(
+        f'CREATE OPERATOR {op} (LEFTARG = {_TSTZ_TYPE}, RIGHTARG = {_TSTZ_TYPE}, '
+        f'FUNCTION = ora_tstz_{name}, COMMUTATOR = {commutator}, NEGATOR = {negator}, '
+        f'RESTRICT = {restrict}, JOIN = {join}{extra}); '
+        for name, op, commutator, negator, restrict, join, extra in _TSTZ_OPERATORS
+    )
+    + 'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
+    'DO $$ BEGIN '
+    f'CREATE OPERATOR CLASS ora_tstz_ops DEFAULT FOR TYPE {_TSTZ_TYPE} USING btree AS '
+    'OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >, '
+    f'FUNCTION 1 ora_tstz_cmp({_TSTZ_TYPE}, {_TSTZ_TYPE}); '
+    f'CREATE OPERATOR CLASS ora_tstz_hash_ops DEFAULT FOR TYPE {_TSTZ_TYPE} USING hash AS '
+    f'OPERATOR 1 =, FUNCTION 1 ora_tstz_hash({_TSTZ_TYPE}); '
+    # An operator class needs a superuser; without one the operators still
+    # compare by instant, and ORDER BY / DISTINCT keep the record's meaning.
+    'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
 )
 
 
