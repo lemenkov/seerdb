@@ -84,6 +84,12 @@ edge of this adapter:
   row is gone dereferences to NULL, as a dangling Oracle REF does. PostgreSQL has
   no hidden columns, though: ``SELECT *`` from an object table, and the dictionary
   views, show ``sys_nc_oid$`` too.
+- **``INVISIBLE`` columns, over one table** — PostgreSQL has no hidden column, so
+  the attribute is kept in ``sys.ora_invisible_columns``. An ``INSERT`` with no
+  column list and a ``*`` or ``alias.*`` over a single table name the visible
+  columns; the dictionary and ``%ROWTYPE`` follow. A join, a subquery or a view
+  over such a table is not expanded, so its ``*`` still includes the column. A
+  column made ``VISIBLE`` again keeps its place, where Oracle moves it to the end.
 - **Integer division semantics** — Oracle's ``/`` is always NUMBER (float)
   division, so ``15 / 10`` is ``1.5``; PostgreSQL's integer ``/`` truncates to
   ``1``. Matching Oracle would mean coercing every division to numeric, a broad
@@ -663,11 +669,20 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE OR REPLACE VIEW sys.all_mview_comments AS SELECT upper(schemaname) AS owner, '
     "ora_name(matviewname) AS mview_name, obj_description((quote_ident(schemaname)||'.'||"
     'quote_ident(matviewname))::regclass) AS comments FROM pg_matviews;'
+    # INVISIBLE columns (#1195): a 12.1 column attribute PostgreSQL has no equal
+    # for, recorded by the column's own identity so a rename keeps it.
+    'CREATE TABLE IF NOT EXISTS sys.ora_invisible_columns ('
+    'relid oid NOT NULL, attnum smallint NOT NULL, PRIMARY KEY (relid, attnum));'
     'CREATE OR REPLACE VIEW sys.all_tab_cols AS SELECT '
     "CASE WHEN c.table_schema LIKE 'pg_temp%' THEN upper(current_schema()) "
     'ELSE upper(c.table_schema) END AS owner, '
     'ora_name(c.table_name) AS table_name, ora_name(c.column_name) AS column_name, '
-    'c.ordinal_position AS column_id, '
+    # An INVISIBLE column has no COLUMN_ID, and the visible ones are numbered
+    # without it, as Oracle numbers them (#1195). The type stays the one the
+    # view always had: CREATE OR REPLACE VIEW cannot change a column's type.
+    '(CASE WHEN h.relid IS NULL THEN row_number() OVER (PARTITION BY c.table_schema, '
+    'c.table_name, h.relid IS NULL ORDER BY c.ordinal_position) END)::integer'
+    '::information_schema.cardinal_number AS column_id, '
     # A collection (an array domain) or an object type is reported by its type's
     # name, as Oracle names it, and its schema is DATA_TYPE_OWNER (#1251). The
     # WITH TIME ZONE composite is the backend's own and reads as the built-in.
@@ -681,7 +696,8 @@ _ORACLE_DICTIONARY_DDL = (
     'c.numeric_precision AS data_precision, c.numeric_scale AS data_scale, '
     'c.character_maximum_length AS char_length, '
     "CASE c.is_nullable WHEN 'YES' THEN 'Y' ELSE 'N' END AS nullable, "
-    "c.column_default AS data_default, 'NO' AS hidden_column, "
+    'c.column_default AS data_default, '
+    "CASE WHEN h.relid IS NULL THEN 'NO' ELSE 'YES' END AS hidden_column, "
     "'NO' AS virtual_column, 'NO' AS identity_column, NULL::text AS default_on_null, "
     # Appended: CREATE OR REPLACE VIEW can only add a column at the end.
     "CASE WHEN c.data_type = 'ARRAY' AND c.domain_name IS NOT NULL "
@@ -689,7 +705,14 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN c.data_type = 'USER-DEFINED' AND c.udt_name <> 'ora_tstz' "
     'THEN ora_owner(c.udt_schema) END AS data_type_owner '
     'FROM information_schema.columns c '
+    'LEFT JOIN sys.ora_invisible_columns h ON h.relid = '
+    "(quote_ident(c.table_schema) || '.' || quote_ident(c.table_name))::regclass "
+    'AND h.attnum = c.ordinal_position '
     "WHERE c.table_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    'CREATE OR REPLACE VIEW sys.user_tab_cols AS SELECT * FROM all_tab_cols '
+    'WHERE owner=upper(current_schema());'
+    # Both list an INVISIBLE column, with no COLUMN_ID; only *_TAB_COLS say
+    # HIDDEN_COLUMN in Oracle (#1195).
     'CREATE OR REPLACE VIEW sys.all_tab_columns AS SELECT * FROM all_tab_cols;'
     'CREATE OR REPLACE VIEW sys.user_tab_columns AS SELECT * FROM all_tab_cols '
     'WHERE owner=upper(current_schema());'
@@ -1421,6 +1444,128 @@ _CREATE_TABLE_NAME = re.compile(
     re.IGNORECASE,
 )
 _QUOTED_LOWER_NAME = re.compile(r'"([a-z][a-z0-9_$#]*)"')
+
+# INVISIBLE / VISIBLE columns (#1195). The attribute follows a column's data type
+# in CREATE TABLE, ALTER TABLE ... ADD and ALTER TABLE ... MODIFY; PostgreSQL has
+# none, so it is taken out of the statement and kept in sys.ora_invisible_columns.
+_TABLE_NAME = r'((?:"[^"]+"|[\w$#]+)(?:\.(?:"[^"]+"|[\w$#]+))?)'
+_ALTER_TABLE_COLUMNS = re.compile(
+    rf'\s*ALTER\s+TABLE\s+{_TABLE_NAME}\s+(ADD|MODIFY)\b\s*', re.IGNORECASE
+)
+_VISIBILITY_WORD = re.compile(r'\b(IN)?VISIBLE\b', re.IGNORECASE)
+_COLUMN_NAME = re.compile(r'\s*("[^"]+"|[\w$#]+)')
+# INSERT with no column list, and a query whose whole select list is `*` or
+# `alias.*` over one table: what an INVISIBLE column is left out of.
+_INSERT_NO_COLUMNS = re.compile(
+    rf'(\s*INSERT\s+INTO\s+){_TABLE_NAME}\s*(?=(?:VALUES|SELECT|WITH)\b|\(\s*(?:SELECT|WITH)\b)',
+    re.IGNORECASE,
+)
+_SELECT_STAR = re.compile(
+    r'(\s*SELECT\s+(?:(?:DISTINCT|ALL|UNIQUE)\s+)?)(.+?)(\s+FROM\s+)'
+    rf'{_TABLE_NAME}'
+    r'(?:\s+(?:AS\s+)?(?!(?:WHERE|ORDER|GROUP|FOR|CONNECT|START|FETCH|OFFSET|HAVING)\b)'
+    r'(\w+))?\s*(?=$|;|(?:WHERE|ORDER|GROUP|FOR|CONNECT|START|FETCH|OFFSET|HAVING)\b)',
+    re.IGNORECASE | re.DOTALL,
+)
+_NESTED_QUERY = re.compile(r'\b(?:SELECT|FROM)\b', re.IGNORECASE)
+
+
+def _top_level_items(text: str, start: int, end: int) -> list[tuple[int, int]]:
+    # The comma-separated items of text[start:end], ignoring commas inside
+    # parentheses or quotes.
+    items, depth, item_start, i = [], 0, start, start
+    while i < end:
+        char = text[i]
+        if char in ("'", '"'):
+            close = text.find(char, i + 1)
+            i = end if close < 0 else close + 1
+            continue
+        if char == '(':
+            depth += 1
+        elif char == ')':
+            depth -= 1
+        elif char == ',' and depth == 0:
+            items.append((item_start, i))
+            item_start = i + 1
+        i += 1
+    items.append((item_start, end))
+    return items
+
+
+def _matching_paren(text: str, open_at: int) -> int:
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == '(':
+            depth += 1
+        elif text[i] == ')':
+            depth -= 1
+            if depth == 0:
+                return i
+    return len(text)
+
+
+def _column_visibility(sql: str) -> tuple[str, tuple[str, list, list, bool] | None]:
+    """The statement without its VISIBLE / INVISIBLE column attributes, and what
+    they said: (table, columns made invisible, columns made visible, whether the
+    statement changed nothing else), or None when it names none (#1195).
+
+    A name is PostgreSQL's spelling: a quoted one as written, an unquoted one in
+    lower case.
+    """
+    if not _VISIBILITY_WORD.search(sql):
+        return sql, None
+    create = _CREATE_TABLE_NAME.match(sql)
+    alter = _ALTER_TABLE_COLUMNS.match(sql) if create is None else None
+    if create is not None:
+        table, open_at = create.group(1), sql.find('(', create.end())
+        if open_at < 0:
+            return sql, None
+        spans = _top_level_items(sql, open_at + 1, _matching_paren(sql, open_at))
+    elif alter is not None:
+        table = alter.group(1)
+        rest = alter.end()
+        if sql.startswith('(', rest):
+            spans = _top_level_items(sql, rest + 1, _matching_paren(sql, rest))
+        else:
+            spans = [(rest, len(sql.rstrip().rstrip(';')))]
+    else:
+        return sql, None
+    hidden: list[str] = []
+    shown: list[str] = []
+    cuts: list[tuple[int, int]] = []
+    bare = True
+    for start, end in spans:
+        name = _COLUMN_NAME.match(sql, start, end)
+        if name is None:
+            continue
+        depth, found = 0, None
+        for word in _VISIBILITY_WORD.finditer(sql, name.end(), end):
+            depth = sql.count('(', name.end(), word.start()) - sql.count(
+                ')', name.end(), word.start()
+            )
+            if depth == 0:
+                found = word
+                break
+        if found is None:
+            bare = False
+            continue
+        column = name.group(1)
+        column = column[1:-1] if column.startswith('"') else column.lower()
+        (hidden if found.group(1) else shown).append(column)
+        cuts.append((found.start(), found.end()))
+        remainder = sql[name.end() : found.start()] + sql[found.end() : end]
+        bare = bare and not remainder.strip()
+    if not cuts:
+        return sql, None
+    out, last = [], 0
+    for cut_start, cut_end in cuts:
+        out.append(sql[last:cut_start])
+        last = cut_end
+    out.append(sql[last:])
+    only_visibility = alter is not None and alter.group(2).upper() == 'MODIFY' and bare
+    return ''.join(out), (table, hidden, shown, only_visibility)
+
+
 # Oracle auto-commits DDL (an implicit COMMIT before and after), so a DDL statement
 # is never rolled back and any pending DML committed with it. PostgreSQL keeps DDL
 # transactional, so the Mirror commits after a successful DDL to match — a later
@@ -3456,6 +3601,15 @@ class PostgresBackend:
         ).fetchone()
         self._has_quoted_names = bool(row and row[0])
         self._quoted_col_cache: dict[tuple[int, int], bool] = {}
+        # INVISIBLE columns (#1195): whether the catalog exists, whether any
+        # table has one (None: not yet read; reset by any DDL), and the visible
+        # columns of the tables that do.
+        row = self._conn.execute(
+            "SELECT to_regclass('sys.ora_invisible_columns') IS NOT NULL"
+        ).fetchone()
+        self._has_invisible_catalog = bool(row and row[0])
+        self._any_invisible: bool | None = None
+        self._visible_cache: dict[str, list[str] | None] = {}
         self._conn.commit()
 
     def _install_dictionary(self) -> None:
@@ -3655,6 +3809,15 @@ class PostgresBackend:
         if dropped is not None:
             self._iot_pk.pop(_bare_table(dropped.group(1)), None)
         sql = self._rewrite_iot_rowid(sql)
+        # INVISIBLE / VISIBLE columns (#1195): the attribute comes out of the DDL
+        # and goes to the catalog; a MODIFY that only changes it has nothing left
+        # to run. An INSERT with no column list and a `SELECT *` name only the
+        # visible columns.
+        (sql, visibility) = _column_visibility(sql)
+        if visibility is not None and visibility[3]:
+            self._record_visibility(visibility)
+            return Result()
+        sql = self._expand_visible_columns(sql)
         # Oracle auto-commits DDL — decide from the original statement, before the
         # dialect rewrite reshapes it (#532).
         is_ddl = _IS_DDL.match(sql) is not None
@@ -3699,6 +3862,7 @@ class PostgresBackend:
             self._conn.commit()
             self._user_savepoint = False
             self._record_quoted_names(original)
+            self._record_visibility(visibility)
         if with_rowid is not None:
             # The rows are the rowids of the rows touched, not a result set: a
             # DML still answers with a count, and the last one is its rowid.
@@ -3817,6 +3981,114 @@ class PostgresBackend:
         if pk is None:
             return sql
         return _ROWID_WORD.sub(_urowid_expression(pk), sql)
+
+    def _record_visibility(self, visibility: tuple | None) -> None:
+        # Keep what a DDL said about its columns' visibility (#1195): add the
+        # invisible ones, drop the ones made visible, and prune the rows of
+        # dropped tables. Any DDL may change which columns a table has, so the
+        # cache of visible columns starts over either way.
+        self._any_invisible = None
+        self._visible_cache.clear()
+        if visibility is None or not self._has_invisible_catalog:
+            return
+        (table, hidden, shown, _only) = visibility
+        try:
+            self._conn.execute(
+                'DELETE FROM sys.ora_invisible_columns i WHERE NOT EXISTS '
+                '(SELECT 1 FROM pg_attribute a WHERE a.attrelid = i.relid '
+                'AND a.attnum = i.attnum AND NOT a.attisdropped)'
+            )
+            if hidden:
+                self._conn.execute(
+                    'INSERT INTO sys.ora_invisible_columns SELECT attrelid, attnum '
+                    'FROM pg_attribute WHERE attrelid = to_regclass(%s) '
+                    'AND attname = ANY(%s) AND attnum > 0 ON CONFLICT DO NOTHING',
+                    (table, hidden),
+                )
+            if shown:
+                self._conn.execute(
+                    'DELETE FROM sys.ora_invisible_columns i USING pg_attribute a '
+                    'WHERE a.attrelid = i.relid AND a.attnum = i.attnum '
+                    'AND a.attrelid = to_regclass(%s) AND a.attname = ANY(%s)',
+                    (table, shown),
+                )
+            self._conn.commit()
+        except psycopg.Error:
+            self._conn.rollback()
+
+    def _visible_columns(self, table: str) -> list[str] | None:
+        # The visible columns of `table`, quoted, in order -- or None when it has
+        # no INVISIBLE column, or is not a table (#1195).
+        if not self._has_invisible_catalog:
+            return None
+        if self._any_invisible is None:
+            row = self._conn.execute(
+                'SELECT EXISTS (SELECT 1 FROM sys.ora_invisible_columns)'
+            ).fetchone()
+            self._any_invisible = bool(row and row[0])
+        if not self._any_invisible:
+            return None
+        key = table.lower() if '"' not in table else table
+        if key not in self._visible_cache:
+            rows = self._conn.execute(
+                'SELECT a.attname, h.relid IS NOT NULL FROM pg_attribute a '
+                'LEFT JOIN sys.ora_invisible_columns h '
+                'ON h.relid = a.attrelid AND h.attnum = a.attnum '
+                'WHERE a.attrelid = to_regclass(%s) AND a.attnum > 0 '
+                'AND NOT a.attisdropped ORDER BY a.attnum',
+                (table,),
+            ).fetchall()
+            self._visible_cache[key] = (
+                [
+                    '"' + name.replace('"', '""') + '"'
+                    for name, hidden in rows
+                    if not hidden
+                ]
+                if any(hidden for _name, hidden in rows)
+                else None
+            )
+        return self._visible_cache[key]
+
+    def _expand_visible_columns(self, sql: str) -> str:
+        # Name the visible columns where a statement means "all of them": an
+        # INSERT with no column list, and a select list that is only `*` or
+        # `alias.*` over one table. A join, a subquery or a view over a table
+        # with an INVISIBLE column is not expanded (#1195).
+        insert = _INSERT_NO_COLUMNS.match(sql)
+        if insert is not None:
+            columns = self._visible_columns(insert.group(2))
+            if columns:
+                at = insert.end()
+                return f'{sql[:at].rstrip()} ({", ".join(columns)}) {sql[at:]}'
+            return sql
+        star = _SELECT_STAR.match(sql)
+        if star is not None and '*' in star.group(2):
+            select_list = star.group(2)
+            if _NESTED_QUERY.search(select_list):
+                return sql
+            (table, alias) = (star.group(4), star.group(5))
+            columns = self._visible_columns(table)
+            if not columns:
+                return sql
+            names = {
+                table.lower(),
+                (alias or '').lower(),
+                table.rsplit('.', 1)[-1].lower(),
+            }
+            items = []
+            for start, end in _top_level_items(select_list, 0, len(select_list)):
+                item = select_list[start:end].strip()
+                if item == '*':
+                    items.append(', '.join(columns))
+                elif item.endswith('.*') and item[:-2].lower() in names:
+                    items.append(', '.join(f'{item[:-2]}.{c}' for c in columns))
+                else:
+                    items.append(item)
+            return (
+                f'{star.group(1)}{", ".join(items)}{star.group(3)}'
+                + sql[star.start(4) :]
+            )
+        return sql
 
     def _record_quoted_names(self, statement: str) -> None:
         # After a committed CREATE TABLE: note which of its columns were created
@@ -3991,7 +4263,15 @@ class PostgresBackend:
             'SELECT a.attname, a.atttypid, a.atttypmod FROM pg_type t '
             'JOIN pg_attribute a ON a.attrelid = t.typrelid '
             'WHERE t.oid = %s AND a.attnum > 0 AND NOT a.attisdropped '
-            "AND a.attname <> 'sys_nc_oid$' ORDER BY a.attnum",
+            "AND a.attname <> 'sys_nc_oid$' "
+            + (
+                # A table's INVISIBLE column is no attribute of its %ROWTYPE (#1195).
+                'AND NOT EXISTS (SELECT 1 FROM sys.ora_invisible_columns h '
+                'WHERE h.relid = a.attrelid AND h.attnum = a.attnum) '
+                if self._has_invisible_catalog
+                else ''
+            )
+            + 'ORDER BY a.attnum',
             (pg_oid,),
         ).fetchall()
 
@@ -4315,7 +4595,7 @@ class PostgresBackend:
         # 500 rows against a remote database. Returns the total affected-row count.
         # The Mirror calls this only for the non-batcherrors path, where a per-row
         # failure aborts the whole batch — exactly Oracle's non-batcherrors DML.
-        sql = _strip_leading_comments(sql)
+        sql = self._expand_visible_columns(_strip_leading_comments(sql))
         rows = list(rows)
         if not rows:
             return 0

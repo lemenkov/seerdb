@@ -1615,6 +1615,41 @@ class CursorIntegration(_IntegrationBase):
             self._drop_silently(self.cur)
             self.cur.execute(f'DROP TYPE {Type}')
 
+    def test_an_invisible_column(self):
+        # An INVISIBLE column (12.1+) is left out of `*` and of an INSERT with no
+        # column list, works when named, and has no COLUMN_ID; USER_TAB_COLS
+        # marks it HIDDEN (#1195). Measured on 23ai.
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('INVISIBLE columns are 12.1+')
+        T = self.TABLE
+        self.cur.execute(f'CREATE TABLE {T} (a NUMBER, h NUMBER INVISIBLE, b NUMBER)')
+        self.cur.execute(f'INSERT INTO {T} VALUES (1, 2)')
+        self.cur.execute(f'INSERT INTO {T} (a, h, b) VALUES (3, 4, 5)')
+        self.cur.execute(f'SELECT * FROM {T} ORDER BY a')
+        self.assertEqual([d[0] for d in self.cur.description], ['A', 'B'])
+        self.assertEqual(self.cur.fetchall(), [(1, 2), (3, 5)])
+        self.cur.execute(f'SELECT t.*, h FROM {T} t ORDER BY a')
+        self.assertEqual([d[0] for d in self.cur.description], ['A', 'B', 'H'])
+        self.assertEqual(self.cur.fetchall(), [(1, 2, None), (3, 5, 4)])
+        self.cur.execute(
+            'SELECT column_name, column_id, hidden_column FROM user_tab_cols '
+            'WHERE table_name = :1 ORDER BY column_name',
+            [T],
+        )
+        self.assertEqual(
+            self.cur.fetchall(), [('A', 1, 'NO'), ('B', 2, 'NO'), ('H', None, 'YES')]
+        )
+        self.cur.execute(
+            'SELECT column_name, column_id FROM user_tab_columns '
+            'WHERE table_name = :1 ORDER BY column_name',
+            [T],
+        )
+        self.assertEqual(self.cur.fetchall(), [('A', 1), ('B', 2), ('H', None)])
+        # Made visible, it is in `*` again (Oracle moves it last; see #1195).
+        self.cur.execute(f'ALTER TABLE {T} MODIFY h VISIBLE')
+        self.cur.execute(f'SELECT * FROM {T} ORDER BY a')
+        self.assertEqual(sorted(d[0] for d in self.cur.description), ['A', 'B', 'H'])
+
     def test_decode(self):
         # DECODE with untyped literals, a NULL matching a NULL, several searches
         # and no default; and, as a schema script populates a table, a DECODE of
@@ -7458,6 +7493,35 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 finally:
                     await self._drop_async(Cur, Table)
                     await Cur.execute(f'DROP TYPE {otype}')
+
+    async def test_an_invisible_column(self):
+        # Async twin of CursorIntegration's.
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            if Conn.field_version < FIELD_VERSION_12_1:
+                self.skipTest('INVISIBLE columns are 12.1+')
+            T = 'PYO_ASYNC_INVISIBLE'
+            async with Conn.cursor() as Cur:
+                await self._drop_async(Cur, T)
+                await Cur.execute(
+                    f'CREATE TABLE {T} (a NUMBER, h NUMBER INVISIBLE, b NUMBER)'
+                )
+                await Cur.execute(f'INSERT INTO {T} VALUES (1, 2)')
+                await Cur.execute(f'INSERT INTO {T} (a, h, b) VALUES (3, 4, 5)')
+                await Cur.execute(f'SELECT * FROM {T} ORDER BY a')
+                self.assertEqual([d[0] for d in Cur.description], ['A', 'B'])
+                self.assertEqual(await Cur.fetchall(), [(1, 2), (3, 5)])
+                await Cur.execute(f'SELECT t.*, h FROM {T} t ORDER BY a')
+                self.assertEqual(await Cur.fetchall(), [(1, 2, None), (3, 5, 4)])
+                await Cur.execute(
+                    'SELECT column_name, column_id, hidden_column FROM user_tab_cols '
+                    'WHERE table_name = :1 ORDER BY column_name',
+                    [T],
+                )
+                self.assertEqual(
+                    await Cur.fetchall(),
+                    [('A', 1, 'NO'), ('B', 2, 'NO'), ('H', None, 'YES')],
+                )
+                await self._drop_async(Cur, T)
 
     async def test_decode(self):
         # Async twin of CursorIntegration's.

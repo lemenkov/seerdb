@@ -1925,6 +1925,31 @@ def test_get_type_shape_is_answered_from_the_catalog() -> None:
         admin.close()
 
 
+def test_the_column_visibility_attribute_comes_out_of_the_ddl() -> None:
+    # INVISIBLE / VISIBLE follow a column's type in CREATE TABLE and in ALTER
+    # TABLE ADD / MODIFY; the statement loses it and says which columns it named,
+    # in PostgreSQL's spelling (#1195).
+    from postgres_backend import _column_visibility as visibility
+
+    assert visibility('CREATE TABLE t (a NUMBER, h NUMBER INVISIBLE DEFAULT 5)') == (
+        'CREATE TABLE t (a NUMBER, h NUMBER  DEFAULT 5)',
+        ('t', ['h'], [], False),
+    )
+    assert visibility(
+        'CREATE TABLE t ("Hid" NUMBER INVISIBLE, c NUMBER(5, 2) VISIBLE)'
+    )[1] == ('t', ['Hid'], ['c'], False)
+    # A MODIFY that only changes visibility leaves nothing to run.
+    assert visibility('ALTER TABLE t MODIFY (a INVISIBLE, b VISIBLE)')[1] == (
+        't',
+        ['a'],
+        ['b'],
+        True,
+    )
+    assert visibility('ALTER TABLE t MODIFY (a NUMBER(10) INVISIBLE)')[1][3] is False
+    # A table or column merely named so is not the attribute.
+    assert visibility('CREATE TABLE invisible (visible NUMBER)')[1] is None
+
+
 def test_translate_idioms_rewrites_rowid_pseudocolumn() -> None:
     # The ROWID pseudo-column becomes the row's ctid in Oracle's extended form —
     # one rewrite serving a SELECT, a WHERE ROWID = :bind (text compare), and the
