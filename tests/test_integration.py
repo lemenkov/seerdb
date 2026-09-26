@@ -1376,6 +1376,34 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT COUNT(DISTINCT t) FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchall(), [(2,)])
 
+    def test_days_added_to_a_timestamp_with_local_time_zone(self):
+        # LTZ + n is a DATE on the session's clock, its fractional seconds
+        # dropped; assigned back to an LTZ it is read in the session zone again,
+        # so a PL/SQL in/out round trip moves the value by exactly n days (#1240).
+        if _conn_is_8i(self.conn):
+            self.skipTest('8i has no TIMESTAMP WITH LOCAL TIME ZONE')
+        self.cur.execute('SELECT sessiontimezone, dbtimezone FROM dual')
+        (session, database) = (_tz_offset(z) for z in self.cur.fetchone())
+        if session is None or database is None:
+            self.skipTest('a named time zone')
+        value = datetime.datetime(2022, 5, 10, 12, 0, 0, 700000)
+        on_session_clock = value.replace(microsecond=0) - database + session
+        self.cur.setinputsizes(seerdb.DB_TYPE_TIMESTAMP_LTZ)
+        self.cur.execute('SELECT :1 + 5.25, :1 - 0.5 FROM dual', [value])
+        self.assertEqual(
+            self.cur.fetchone(),
+            (
+                on_session_clock + datetime.timedelta(days=5.25),
+                on_session_clock - datetime.timedelta(days=0.5),
+            ),
+        )
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            self.skipTest('9i reads an LTZ var() bind in the session zone (#1241)')
+        var = self.cur.var(seerdb.DB_TYPE_TIMESTAMP_LTZ)
+        var.setvalue(0, value.replace(microsecond=0))
+        self.cur.execute('begin :value := :value + 5.25; end;', {'value': var})
+        self.assertEqual(var.getvalue(), datetime.datetime(2022, 5, 15, 18, 0, 0))
+
     def test_decode(self):
         # DECODE with untyped literals, a NULL matching a NULL, several searches
         # and no default; and, as a schema script populates a table, a DECODE of
@@ -6664,6 +6692,38 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await self._drop_async(Cur, Table)
         finally:
             await Conn.close()
+
+    async def test_days_added_to_a_timestamp_with_local_time_zone(self):
+        # Async twin of CursorIntegration's.
+        if _target_is_8i():
+            self.skipTest('8i has no TIMESTAMP WITH LOCAL TIME ZONE')
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await Cur.execute('SELECT sessiontimezone, dbtimezone FROM dual')
+                (session, database) = (_tz_offset(z) for z in await Cur.fetchone())
+                if session is None or database is None:
+                    self.skipTest('a named time zone')
+                value = datetime.datetime(2022, 5, 10, 12, 0, 0, 700000)
+                on_session_clock = value.replace(microsecond=0) - database + session
+                Cur.setinputsizes(seerdb.DB_TYPE_TIMESTAMP_LTZ)
+                await Cur.execute('SELECT :1 + 5.25, :1 - 0.5 FROM dual', [value])
+                self.assertEqual(
+                    await Cur.fetchone(),
+                    (
+                        on_session_clock + datetime.timedelta(days=5.25),
+                        on_session_clock - datetime.timedelta(days=0.5),
+                    ),
+                )
+                if Conn.field_version < FIELD_VERSION_10_2:
+                    self.skipTest(
+                        '9i reads an LTZ var() bind in the session zone (#1241)'
+                    )
+                var = Cur.var(seerdb.DB_TYPE_TIMESTAMP_LTZ)
+                var.setvalue(0, value.replace(microsecond=0))
+                await Cur.execute('begin :value := :value + 5.25; end;', {'value': var})
+                self.assertEqual(
+                    var.getvalue(), datetime.datetime(2022, 5, 15, 18, 0, 0)
+                )
 
     async def test_decode(self):
         # Async twin of CursorIntegration's.
