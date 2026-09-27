@@ -1429,6 +1429,39 @@ class CursorIntegration(_IntegrationBase):
         self.assertEqual([d[0] for d in self.cur.description], ['OBJ#', 'NAME'])
         self.assertEqual(self.cur.fetchall(), [(7, 'a#b')])
 
+    def test_a_column_of_a_user_defined_type_names_its_owner(self):
+        # A collection column is reported by its type's name, and the type's
+        # schema is DATA_TYPE_OWNER; a built-in has none (#1251).
+        Type = 'PYO_DTO_ARR'
+        try:
+            self.cur.execute(f'DROP TYPE {Type}')
+        except seerdb.DatabaseError:
+            pass
+        self.cur.execute(f'CREATE TYPE {Type} AS VARRAY(5) OF NUMBER')
+        # The type's owner is the schema it was made in: the current one.
+        self.cur.execute("SELECT sys_context('userenv', 'current_schema') FROM dual")
+        (owner,) = self.cur.fetchone()
+        try:
+            self.cur.execute(
+                f'CREATE TABLE {self.TABLE} (i NUMBER(9), v VARCHAR2(10), a {Type})'
+            )
+            self.cur.execute(
+                'SELECT column_name, data_type, data_type_owner FROM user_tab_columns '
+                'WHERE table_name = :1 ORDER BY column_name',
+                [self.TABLE],
+            )
+            self.assertEqual(
+                self.cur.fetchall(),
+                [
+                    ('A', Type, owner),
+                    ('I', 'NUMBER', None),
+                    ('V', 'VARCHAR2', None),
+                ],
+            )
+        finally:
+            self._drop_silently(self.cur)
+            self.cur.execute(f'DROP TYPE {Type}')
+
     def test_decode(self):
         # DECODE with untyped literals, a NULL matching a NULL, several searches
         # and no default; and, as a schema script populates a table, a DECODE of
@@ -6779,6 +6812,36 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 self.assertEqual([d[0] for d in Cur.description], ['OBJ#', 'NAME'])
                 self.assertEqual(await Cur.fetchall(), [(7, 'a#b')])
                 await self._drop_async(Cur, Table)
+
+    async def test_a_column_of_a_user_defined_type_names_its_owner(self):
+        # Async twin of CursorIntegration's.
+        Table, Type = 'PYO_ASYNC_DTO', 'PYO_ASYNC_DTO_ARR'
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await self._drop_async(Cur, Table)
+                try:
+                    await Cur.execute(f'DROP TYPE {Type}')
+                except seerdb.DatabaseError:
+                    pass
+                await Cur.execute(f'CREATE TYPE {Type} AS VARRAY(5) OF NUMBER')
+                await Cur.execute(
+                    "SELECT sys_context('userenv', 'current_schema') FROM dual"
+                )
+                (owner,) = await Cur.fetchone()
+                try:
+                    await Cur.execute(f'CREATE TABLE {Table} (i NUMBER(9), a {Type})')
+                    await Cur.execute(
+                        'SELECT column_name, data_type, data_type_owner '
+                        'FROM user_tab_columns WHERE table_name = :1 ORDER BY column_name',
+                        [Table],
+                    )
+                    self.assertEqual(
+                        await Cur.fetchall(),
+                        [('A', Type, owner), ('I', 'NUMBER', None)],
+                    )
+                finally:
+                    await self._drop_async(Cur, Table)
+                    await Cur.execute(f'DROP TYPE {Type}')
 
     async def test_decode(self):
         # Async twin of CursorIntegration's.
