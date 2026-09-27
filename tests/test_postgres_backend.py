@@ -563,6 +563,15 @@ def test_nested_table_storage_clauses_are_dropped() -> None:
         'nested table "W" store as s.t_w return as locator'
     )
     assert _translate_ddl(ddl) == 'CREATE TABLE t (id numeric, v s.nt, "W" s.nt)'
+    # The storage table's own properties, a collection of collections' inner
+    # clause among them, go with it; quoted parentheses do not count (#1275).
+    nested = (
+        'CREATE TABLE t (c s.tt) NESTED TABLE c STORE AS t_nt '
+        '(NESTED TABLE COLUMN_VALUE STORE AS t_nti) RETURN AS VALUE'
+    )
+    assert _translate_ddl(nested) == 'CREATE TABLE t (c s.tt)'
+    quoted = "CREATE TABLE t (c s.nt) NESTED TABLE c STORE AS t_nt (COMMENT 'a (b')"
+    assert _translate_ddl(quoted) == 'CREATE TABLE t (c s.nt)'
 
 
 def test_a_varray_type_becomes_a_bounded_array_domain() -> None:

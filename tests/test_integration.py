@@ -140,6 +140,7 @@ _8I_UNSUPPORTED = (
     # Genuine 8i limitations (8.1.7 predates the feature).
     ('timestamp', 'TIMESTAMP is a 9i+ type; Oracle 8i has only DATE'),
     ('interval', 'INTERVAL is a 9i+ type; Oracle 8i lacks it'),
+    ('multilevel', 'a collection of collections is a 9i+ type; Oracle 8i lacks it'),
     ('national_char', 'Oracle 8i predates AL16UTF16 NCHAR (WE8ISO8859P1 only)'),
     ('bit_vector_reuse', 'CONNECT BY LEVEL returns one row on Oracle 8i'),
     # Async-only / connectivity tests (AsyncConnectionIntegration, Redirect).
@@ -914,6 +915,34 @@ class TypesIntegration(_IntegrationBase):
             self.cur.execute(f'DROP TABLE {self.TABLE}')
         finally:
             self.cur.execute(f'DROP TYPE {vtype}')
+
+    def test_a_multilevel_nested_table_names_its_inner_storage(self):
+        # A nested table of nested tables names the inner one's storage inside
+        # the outer one's parenthesized properties, as the reference suite's
+        # schema does; the Mirror left that clause behind (#1275).
+        from seerdb.common.exceptions import DatabaseError
+
+        inner, outer = 'PYO_NTP_INNER_T', 'PYO_NTP_OUTER_T'
+        for name in (outer, inner):
+            try:
+                self.cur.execute(f'DROP TYPE {name}')
+            except DatabaseError:
+                pass  # no leftover type from a prior run
+        self.cur.execute(f'CREATE TYPE {inner} AS TABLE OF NUMBER')
+        self.cur.execute(f'CREATE TYPE {outer} AS TABLE OF {inner}')
+        try:
+            self.cur.execute(
+                f'CREATE TABLE {self.TABLE} (id NUMBER, c {outer}) '
+                f'NESTED TABLE c STORE AS {self.TABLE}_NT ('
+                f'NESTED TABLE COLUMN_VALUE STORE AS {self.TABLE}_NTI)'
+            )
+            self.cur.execute(f'INSERT INTO {self.TABLE} (id) VALUES (1)')
+            self.cur.execute(f'SELECT id FROM {self.TABLE}')
+            self.assertEqual(self.cur.fetchone(), (1,))
+            self.cur.execute(f'DROP TABLE {self.TABLE}')
+        finally:
+            for name in (outer, inner):
+                self.cur.execute(f'DROP TYPE {name}')
 
     def test_a_nested_table_column_names_its_storage(self):
         # A nested-table column needs `NESTED TABLE c STORE AS s` on Oracle; the
