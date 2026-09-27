@@ -1399,6 +1399,38 @@ _CREATE_OR_REPLACE_TYPE = re.compile(
 )
 
 
+# `DROP TYPE name [FORCE]`: a collection type's constructors depend on it, so they
+# go first, or PostgreSQL refuses the drop (#1206).
+_DROP_TYPE = re.compile(
+    r'\s*DROP\s+TYPE\s+([\w."$#]+)(?:\s+FORCE)?\s*;?\s*$', re.IGNORECASE
+)
+
+
+def _collection_constructors(name: str, element: str) -> str:
+    """The constructors Oracle gives a collection type (#1206): `name(e1, e2, …)`
+    and the empty `name()`, each returning the type, so a VARRAY's bound still
+    applies to what they build."""
+    return (
+        f'; CREATE OR REPLACE FUNCTION {name}(VARIADIC {element}[]) RETURNS {name} '
+        f'LANGUAGE sql IMMUTABLE AS $$ SELECT $1::{name} $$'
+        f'; CREATE OR REPLACE FUNCTION {name}() RETURNS {name} '
+        f"LANGUAGE sql IMMUTABLE AS $$ SELECT '{{}}'::{element}[]::{name} $$"
+    )
+
+
+def _drop_type(name: str, if_exists: bool = False) -> str:
+    """Drop a type and the constructors made with it: the functions named as the
+    type and returning it, never a user's other functions (#1206)."""
+    literal = name.replace("'", "''")
+    return (
+        'DO $$ DECLARE f regprocedure; BEGIN FOR f IN SELECT p.oid::regprocedure '
+        f"FROM pg_proc p WHERE p.prorettype = to_regtype('{literal}') "
+        f"AND p.oid::regprocedure::text LIKE split_part(to_regtype('{literal}')::text, "
+        "'(', 1) || '(%' LOOP EXECUTE 'DROP FUNCTION ' || f; END LOOP; END $$; "
+        f'DROP TYPE {"IF EXISTS " if if_exists else ""}{name}'
+    )
+
+
 def _translate_ddl(sql: str) -> str:
     """Rewrite an Oracle ``CREATE TABLE`` / object ``CREATE TYPE`` to PostgreSQL:
     map the column/attribute types and drop the clauses PostgreSQL has no equal
@@ -1415,7 +1447,10 @@ def _translate_ddl(sql: str) -> str:
         plain = _translate_ddl(
             f'{replaced.group(1)} {replaced.group(2)}{sql[replaced.end() :]}'
         )
-        return f'DROP TYPE IF EXISTS {replaced.group(3)}; {plain}'
+        return f'{_drop_type(replaced.group(3), if_exists=True)}; {plain}'
+    dropped = _DROP_TYPE.match(sql)
+    if dropped:
+        return _drop_type(dropped.group(1))
     varray = _CREATE_TYPE_VARRAY.match(sql)
     if varray:
         name, bound, element = varray.groups()
@@ -1424,13 +1459,15 @@ def _translate_ddl(sql: str) -> str:
         return (
             f'CREATE DOMAIN {name} AS {element}[] '
             f'CHECK (VALUE IS NULL OR array_length(VALUE, 1) <= {bound})'
-        )
+        ) + _collection_constructors(name, element)
     nested = _CREATE_TYPE_TABLE_OF.match(sql)
     if nested:
         name, element = nested.groups()
         for pattern, replacement in _DDL_TYPE_REWRITES:
             element = pattern.sub(replacement, element)
-        return f'CREATE DOMAIN {name} AS {element}[]'
+        return f'CREATE DOMAIN {name} AS {element}[]' + _collection_constructors(
+            name, element
+        )
     if _CREATE_TYPE_OBJECT.match(sql):
         # `... AS OBJECT (attrs)` → `... AS (attrs)`, then map the attribute types
         # (NUMBER → numeric, VARCHAR2(n) → varchar(n), …) the same way as a table.
