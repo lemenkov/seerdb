@@ -33,23 +33,30 @@ from seerdb.common.dbobject import (
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
 from seerdb.common.lob import LOB
 from seerdb.common.tns import (
+    _DECODE_FIELD_VERSION,
     _ENCODE_FIELD_VERSION,
     _THIN_LOB_LOCATOR,
     _THIN_OBJ_LOB_LOCATOR,
     ColumnMeta,
     LobEmitLog,
+    _bytes_with_length,
     _encode_object_bind_value,
     _encode_ref_bind_value,
     _encode_ref_oac,
     _read_bind_value,
+    _read_chunked_bytes,
     _read_object_column,
+    _skip_chunked_bytes,
     encode_object_column_value,
     encode_object_image,
+    encode_sb4,
     mint_column_lob_locator,
     object_lob_contents,
 )
 from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
+    FIELD_VERSION_11_2,
+    FIELD_VERSION_12_1,
     TNS_TYPE_ADT,
     TNS_TYPE_BLOB,
     TNS_TYPE_CHAR,
@@ -918,6 +925,48 @@ class TestLobEmitLog(unittest.TestCase):
         self.assertEqual(mint_column_lob_locator(0), _THIN_LOB_LOCATOR)
         self.assertEqual(len(mint_column_lob_locator(7)), len(_THIN_LOB_LOCATOR))
         self.assertNotEqual(mint_column_lob_locator(7), _THIN_LOB_LOCATOR)
+
+
+class TestPre12ChunkedObjectImage(unittest.TestCase):
+    # An object image past 252 bytes rides chunked. Before 12.1 each chunk has a
+    # single length byte; from 12.1 a ub4 one. Read the 12.1 way on 11g, a
+    # 300-character attribute decoded as one character (#1261).
+
+    # A live 11g's image for `c61_ov(RPAD('x', 300, 'x'))`, `v VARCHAR2(400)`:
+    # the 0xFE marker, chunks of 255 and 57 bytes, the zero terminator.
+    _CAPTURED = bytes.fromhex(
+        'feff8401fe00000138fe0000012c' + '78' * 243 + '39' + '78' * 57 + '00'
+    )
+    _LAYOUT = [{'name': 'V', 'data_type': TNS_TYPE_VARCHAR, 'charset': None}]
+
+    def _at(self, version):
+        token = _DECODE_FIELD_VERSION.set(version)
+        self.addCleanup(_DECODE_FIELD_VERSION.reset, token)
+
+    def test_an_11g_image_reads_whole(self):
+        self._at(FIELD_VERSION_11_2)
+        (image, rest) = _read_chunked_bytes(self._CAPTURED + b'\x99')
+        self.assertEqual((len(image), rest), (312, b'\x99'))
+        self.assertEqual(
+            dict(decode_object_image(image, self._LAYOUT)), {'V': 'x' * 300}
+        )
+
+    def test_the_encoder_writes_the_width_the_decoder_reads(self):
+        for version, first_chunk in (
+            (FIELD_VERSION_11_2, b'\x40'),
+            (FIELD_VERSION_12_1, encode_sb4(0x40)),
+        ):
+            with self.subTest(version=version):
+                enc = _ENCODE_FIELD_VERSION.set(version)
+                dec = _DECODE_FIELD_VERSION.set(version)
+                try:
+                    out = _bytes_with_length(b'y' * 1000)
+                    self.assertEqual(out[: 1 + len(first_chunk)], b'\xfe' + first_chunk)
+                    self.assertEqual(_read_chunked_bytes(out), (b'y' * 1000, b''))
+                    self.assertEqual(_skip_chunked_bytes(out + b'!'), b'!')
+                finally:
+                    _DECODE_FIELD_VERSION.reset(dec)
+                    _ENCODE_FIELD_VERSION.reset(enc)
 
 
 class TestObjectLobAttributeBind(unittest.TestCase):
