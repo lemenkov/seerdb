@@ -596,7 +596,9 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN 'character varying' THEN 'VARCHAR2' WHEN 'character' THEN 'CHAR' "
     "WHEN 'text' THEN 'CLOB' WHEN 'date' THEN 'DATE' "
     "WHEN 'timestamp without time zone' THEN 'TIMESTAMP' "
-    "WHEN 'timestamp with time zone' THEN 'TIMESTAMP WITH TIME ZONE' "
+    # A timestamptz column is TIMESTAMP WITH LOCAL TIME ZONE (#1208); WITH TIME
+    # ZONE is the ora_tstz composite, named above (#1272).
+    "WHEN 'timestamp with time zone' THEN 'TIMESTAMP WITH LOCAL TIME ZONE' "
     "WHEN 'bytea' THEN 'BLOB' WHEN 'boolean' THEN 'NUMBER' "
     'ELSE upper(c.data_type) END END AS data_type, '
     'coalesce(c.character_maximum_length, c.numeric_precision, 22) AS data_length, '

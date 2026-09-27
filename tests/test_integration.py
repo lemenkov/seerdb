@@ -963,6 +963,23 @@ class TypesIntegration(_IntegrationBase):
         finally:
             self.cur.execute(f'DROP TYPE {otype}')
 
+    def test_a_local_time_zone_timestamp_column_is_named_so(self):
+        # USER_TAB_COLUMNS tells a WITH LOCAL TIME ZONE column from a WITH TIME
+        # ZONE one; the Mirror-over-PG called both WITH TIME ZONE (#1272). Oracle
+        # also names the precision -- TIMESTAMP(6) WITH ... -- which is left out.
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (a TIMESTAMP WITH TIME ZONE, '
+            'b TIMESTAMP WITH LOCAL TIME ZONE)'
+        )
+        self.cur.execute(
+            'SELECT column_name, data_type FROM user_tab_columns '
+            'WHERE table_name = :1 ORDER BY column_name',
+            [self.TABLE],
+        )
+        (a, b) = [row[1] for row in self.cur.fetchall()]
+        self.assertTrue(a.endswith('WITH TIME ZONE') and 'LOCAL' not in a, a)
+        self.assertTrue(b.endswith('WITH LOCAL TIME ZONE'), b)
+
     def test_a_bool_declared_number_is_stored_as_a_number(self):
         # A bool bound with a declared NUMBER type is the NUMBER 0 or 1 on every
         # server; from 23.1 it used to go out as a native BOOLEAN value, which
