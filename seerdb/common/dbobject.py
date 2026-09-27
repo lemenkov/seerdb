@@ -165,6 +165,30 @@ class ObjectImage:
         # session fills it, the decoder leaves it empty.
         self.lob_contents: dict[bytes, tuple[object, bool]] = {}
 
+    def served_lob(self, locator: bytes) -> tuple[object, bool] | None:
+        """The (content, is_clob) the Mirror served under a LOB attribute's
+        locator in this image, or None for one it never served."""
+        return served_lob_content(self.lob_contents, locator)
+
+
+def served_lob_content(
+    contents: dict[bytes, tuple[object, bool]], locator: bytes
+) -> tuple[object, bool] | None:
+    """The (content, is_clob) held for ``locator`` in a map of the LOBs the
+    Mirror served (#888), or None.
+
+    The map keys a fetched LOB by the locator it went out as, and a temporary
+    LOB by the bare locator CREATE_TEMP minted. A client echoes a temporary
+    LOB's locator with the ub2 length it was handed out with (#1260), so the
+    locator is tried as it came, then with a leading ub2 that states the rest's
+    length removed."""
+    entry = contents.get(locator)
+    if entry is not None:
+        return entry
+    if len(locator) >= 2 and int.from_bytes(locator[:2], 'big') == len(locator) - 2:
+        return contents.get(locator[2:])
+    return None
+
 
 class DbRef:
     """A REF — an opaque reference to a row object (#119).

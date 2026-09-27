@@ -31,6 +31,7 @@ from seerdb.common.dbobject import (
     ObjectImage,
     decode_collection_keyed,
     decode_object_image,
+    served_lob_content,
 )
 from seerdb.common.sqltext import is_plsql
 from seerdb.common.tns import AL16UTF16_CHARSET, ColumnMeta
@@ -416,7 +417,7 @@ class OraclePassthroughBackend:
         # `value` is the LOB locator the client sent inside the image. Resolve it
         # to the content the Mirror served, then stream that into an upstream temp
         # LOB and bind the object attribute to it.
-        entry = _lookup_bind_lob(lob_contents, bytes(value))
+        entry = served_lob_content(lob_contents, bytes(value))
         if entry is None:
             return None
         content, _is_clob = entry
@@ -1038,20 +1039,6 @@ def _enrich_ref_columns(columns: list, rows: list) -> list:
                 )
                 break
     return out
-
-
-def _lookup_bind_lob(lob_contents: dict, locator: bytes) -> tuple[object, bool] | None:
-    # The content the Mirror served under an object-bind LOB attribute's locator.
-    # A temp LOB's locator rides in the image behind a ub2 length prefix (the
-    # server hands temp locators out ub2-prefixed, and the client echoes that
-    # into the image), while a fetched column LOB's is bare -- so try the locator
-    # as-is, then with a leading ub2 length prefix stripped (#888).
-    entry = lob_contents.get(locator)
-    if entry is not None:
-        return entry
-    if len(locator) >= 2 and struct.unpack('>H', locator[:2])[0] == len(locator) - 2:
-        return lob_contents.get(locator[2:])
-    return None
 
 
 def _drain_nested_cursors(columns: list, rows: list) -> list:
