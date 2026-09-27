@@ -73,6 +73,7 @@ _FV2_UNSUPPORTED = (
     ('batcherror', 'array DML batcherrors are not supported on Oracle 9i'),
     ('refcursor', 'REF CURSOR is not supported on Oracle 9i (fv2)'),
     ('ref_bind', 'REF / object types are not supported on Oracle 9i'),
+    ('collection_of_objects', 'object types are not supported on Oracle 9i'),
     ('changepassword', 'changepassword is not supported on Oracle 9i'),
     ('cache_evicts', 'the cursor cache is a fv4+ feature; 9i re-parses'),
     ('reuses_cursor', 'the cursor cache is a fv4+ feature; 9i re-parses'),
@@ -6110,6 +6111,45 @@ class ObjectReturningIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class ObjectCollectionFetchIntegration(_IntegrationBase):
+    """A collection of an object type fetches its elements as objects (#1254)."""
+
+    ELEM = 'PYO_OCOLL_ELEM_T'
+    ELEMS = 'PYO_OCOLL_ELEMS_T'
+
+    def setUp(self):
+        super().setUp()
+        self._skip_if_mirror_backend('postgres', 'fetch a collection value')
+        self._drop()
+        self.cur.execute(
+            f'CREATE TYPE {self.ELEM} AS OBJECT (id NUMBER, name VARCHAR2(40))'
+        )
+        self.cur.execute(f'CREATE TYPE {self.ELEMS} AS TABLE OF {self.ELEM}')
+
+    def tearDown(self):
+        self._drop()
+        super().tearDown()
+
+    def _drop(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (f'DROP TYPE {self.ELEMS}', f'DROP TYPE {self.ELEM}'):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass  # best-effort teardown of leftovers
+
+    def test_a_collection_of_objects_fetches_objects(self):
+        self.cur.execute(
+            f"SELECT {self.ELEMS}({self.ELEM}(1, 'a'), {self.ELEM}(2, 'b')) FROM dual"
+        )
+        (value,) = self.cur.fetchone()
+        self.assertEqual(
+            [(int(e.ID), e.NAME) for e in value.aslist()], [(1, 'a'), (2, 'b')]
+        )
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class RefBindIntegration(_IntegrationBase):
     # REF bind (#139): fetch a REF for a row object, bind it back into an INSERT
     # and into DEREF(?), and confirm it round-trips to the original object. REF
@@ -7031,6 +7071,43 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await Cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = {Own}')
         finally:
             await Conn.close()
+
+    async def test_a_collection_of_objects_fetches_objects(self):
+        # Async twin of ObjectCollectionFetchIntegration: the async describe
+        # left the element's object type out, so each element came back as its
+        # raw image (#1254).
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest(
+                "the Mirror's postgres backend cannot fetch a collection value"
+            )
+        Elem, Elems = 'PYO_AOCOLL_ELEM_T', 'PYO_AOCOLL_ELEMS_T'
+        Drops = (f'DROP TYPE {Elems}', f'DROP TYPE {Elem}')
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                for Stmt in Drops:
+                    try:
+                        await Cur.execute(Stmt)
+                    except seerdb.DatabaseError:
+                        pass  # no leftover from a prior run
+                try:
+                    await Cur.execute(
+                        f'CREATE TYPE {Elem} AS OBJECT (id NUMBER, name VARCHAR2(40))'
+                    )
+                    await Cur.execute(f'CREATE TYPE {Elems} AS TABLE OF {Elem}')
+                    await Cur.execute(
+                        f"SELECT {Elems}({Elem}(1, 'a'), {Elem}(2, 'b')) FROM dual"
+                    )
+                    (Value,) = await Cur.fetchone()
+                    self.assertEqual(
+                        [(int(E.ID), E.NAME) for E in Value.aslist()],
+                        [(1, 'a'), (2, 'b')],
+                    )
+                finally:
+                    for Stmt in Drops:
+                        try:
+                            await Cur.execute(Stmt)
+                        except seerdb.DatabaseError:
+                            pass  # a CREATE above failed, so nothing to drop
 
     async def test_gettype_follows_the_current_schema(self):
         # Async twin of GettypeCurrentSchemaIntegration.
