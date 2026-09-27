@@ -77,6 +77,7 @@ _FV2_UNSUPPORTED = (
     ('lob_attribute', 'object types are not supported on Oracle 9i'),
     ('large_object_image', 'object types are not supported on Oracle 9i'),
     ('nested_attribute', 'object types are not supported on Oracle 9i'),
+    ('collection_value', 'object types are not supported on Oracle 9i'),
     ('changepassword', 'changepassword is not supported on Oracle 9i'),
     ('cache_evicts', 'the cursor cache is a fv4+ feature; 9i re-parses'),
     ('reuses_cursor', 'the cursor cache is a fv4+ feature; 9i re-parses'),
@@ -6506,7 +6507,7 @@ class ObjectCollectionFetchIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        self._skip_if_mirror_backend('postgres', 'fetch a collection value')
+        self._skip_if_mirror_backend('postgres', 'fetch a computed collection')
         self._drop()
         self.cur.execute(
             f'CREATE TYPE {self.ELEM} AS OBJECT (id NUMBER, name VARCHAR2(40))'
@@ -6729,6 +6730,26 @@ class CollectionTypeIntegration(_IntegrationBase):
         elems = self.conn.gettype(self.ELEMS)
         self.assertEqual(elems.collection_type, COLLECTION_NESTED_TABLE)
         self.assertEqual(elems.element['object_type'].name, self.ELEM)
+
+    def test_a_collection_value_fetches(self):
+        # A VARRAY of NUMBER and a nested table of objects, filled, empty and
+        # NULL: an empty collection is a value, not NULL.
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (id NUMBER, v {self.NUMS}, w {self.ELEMS}) '
+            f'NESTED TABLE w STORE AS {self.TABLE}_W'
+        )
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (1, {self.NUMS}(5, 10, 15), '
+            f"{self.ELEMS}({self.ELEM}(1, 'a'), {self.ELEM}(2, 'b')))"
+        )
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (2, {self.NUMS}(), NULL)')
+        self.cur.execute(f'SELECT v, w FROM {self.TABLE} ORDER BY id')
+        (v1, w1), (v2, w2) = self.cur.fetchall()
+        self.assertEqual([int(x) for x in v1.aslist()], [5, 10, 15])
+        self.assertEqual(
+            [(int(e.ID), e.NAME) for e in w1.aslist()], [(1, 'a'), (2, 'b')]
+        )
+        self.assertEqual((v2.aslist(), w2), ([], None))
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
@@ -7866,7 +7887,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         # raw image (#1254).
         if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
             self.skipTest(
-                "the Mirror's postgres backend cannot fetch a collection value"
+                "the Mirror's postgres backend cannot fetch a computed collection"
             )
         Elem, Elems = 'PYO_AOCOLL_ELEM_T', 'PYO_AOCOLL_ELEMS_T'
         Drops = (f'DROP TYPE {Elems}', f'DROP TYPE {Elem}')
@@ -7964,6 +7985,53 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     pass
         finally:
             await Conn.close()
+
+    async def test_a_collection_value_fetches(self):
+        # Async twin of CollectionTypeIntegration's.
+        Elem, Nums, Elems = 'PYO_ACOLF_ELEM_T', 'PYO_ACOLF_NUMS_T', 'PYO_ACOLF_ELEMS_T'
+        Table = 'PYO_ACOLF_TAB'
+        Drops = (
+            f'DROP TABLE {Table}',
+            f'DROP TYPE {Elems}',
+            f'DROP TYPE {Nums}',
+            f'DROP TYPE {Elem}',
+        )
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                for Stmt in Drops:
+                    try:
+                        await Cur.execute(Stmt)
+                    except seerdb.DatabaseError:
+                        pass  # no leftover from a prior run
+                try:
+                    await Cur.execute(
+                        f'CREATE TYPE {Elem} AS OBJECT (id NUMBER, name VARCHAR2(40))'
+                    )
+                    await Cur.execute(f'CREATE TYPE {Nums} AS VARRAY(3) OF NUMBER')
+                    await Cur.execute(f'CREATE TYPE {Elems} AS TABLE OF {Elem}')
+                    await Cur.execute(
+                        f'CREATE TABLE {Table} (id NUMBER, v {Nums}, w {Elems}) '
+                        f'NESTED TABLE w STORE AS {Table}_W'
+                    )
+                    await Cur.execute(
+                        f'INSERT INTO {Table} VALUES (1, {Nums}(5, 10, 15), '
+                        f"{Elems}({Elem}(1, 'a'), {Elem}(2, 'b')))"
+                    )
+                    await Cur.execute(f'INSERT INTO {Table} VALUES (2, {Nums}(), NULL)')
+                    await Cur.execute(f'SELECT v, w FROM {Table} ORDER BY id')
+                    (V1, W1), (V2, W2) = await Cur.fetchall()
+                    self.assertEqual([int(X) for X in V1.aslist()], [5, 10, 15])
+                    self.assertEqual(
+                        [(int(E.ID), E.NAME) for E in W1.aslist()],
+                        [(1, 'a'), (2, 'b')],
+                    )
+                    self.assertEqual((V2.aslist(), W2), ([], None))
+                finally:
+                    for Stmt in Drops:
+                        try:
+                            await Cur.execute(Stmt)
+                        except seerdb.DatabaseError:
+                            pass  # a CREATE above failed, so nothing to drop
 
     async def test_gettype_describes_a_collection(self):
         # Async twin of CollectionTypeIntegration's.

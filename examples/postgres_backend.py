@@ -66,7 +66,10 @@ edge of this adapter:
   binds, returns (``RETURNING o INTO :b``) and fetches. Not yet: binding an
   attribute that is itself an object or a collection (refused, not guessed), and
   type methods. A VARRAY or nested table is a domain over an array, listed in
-  ``all_coll_types``. The block python-oracledb runs to learn a type,
+  ``all_types`` and ``all_coll_types``. A column of one fetches as the collection;
+  PostgreSQL describes a domain value by its base type, so a computed one, such
+  as a constructor call in a select list, has no type to trace and is refused,
+  and so is a collection of collections. The block python-oracledb runs to learn a type,
   ``DBMS_PICKLER.GET_TYPE_SHAPE``, is answered from the catalog with the TDS and
   attribute cursor 23ai sends; an attribute is reported as the DDL translation
   stored it, so ``RAW`` reads as ``BLOB``, ``NVARCHAR2`` / ``NCHAR`` / ``NCLOB``
@@ -124,6 +127,8 @@ from psycopg.types.composite import CompositeInfo, register_composite
 
 from seerdb.common.datatypes import BcDate, IntervalYM
 from seerdb.common.dbobject import (
+    COLLECTION_NESTED_TABLE,
+    COLLECTION_VARRAY,
     DbObjectType,
     DbRef,
     ObjectImage,
@@ -3482,6 +3487,13 @@ class PostgresBackend:
         # other composite), and the registered companion per target type.
         self._ref_targets: dict[int, int | None] = {}
         self._ref_composites: dict[int, CompositeInfo] = {}
+        # Collections (#1206): the collection type each array-domain oid stands
+        # for (None for any other type); whether a result oid is an array at all;
+        # and the declared type of each (relid, attnum) an array column traces
+        # back to -- PostgreSQL describes a domain column by its base type.
+        self._collection_types: dict[int, DbObjectType | None] = {}
+        self._array_oids: dict[int, bool] = {}
+        self._column_types: dict[tuple[int, int], int] = {}
         # Pipeline mode ships a statement's SAVEPOINT / statement / RELEASE in one
         # network round-trip instead of three (a 3x per-statement latency cut
         # against a remote database). It needs libpq >= 14; older builds fall back
@@ -4195,6 +4207,12 @@ class PostgresBackend:
                 for row in rows:
                     row[i] = self._ref_cell(target, row[i])
                 columns.append(self._ref_column_meta(desc.name, target))
+            elif (
+                coll := self._column_collection_type(cursor.pgresult, i, desc.type_code)
+            ) is not None:
+                for row in rows:
+                    row[i] = self._db_collection(coll, row[i], desc.type_code)
+                columns.append(_object_column_meta(desc.name, coll))
             elif (entry := self._column_object_type(desc.type_code)) is not None:
                 typ, info = entry
                 for row in rows:
@@ -4221,6 +4239,122 @@ class PostgresBackend:
         if pg_oid in _BUILTIN_OIDS or pg_oid == self._tstz_oid:
             return None
         return self._object_type(pg_oid)
+
+    def _column_collection_type(
+        self, pgresult, index: int, pg_oid: int
+    ) -> DbObjectType | None:
+        # A VARRAY / nested-table column (#1206). PostgreSQL describes a domain
+        # column by its base type, an array here, so an array column is traced
+        # through libpq ftable / ftablecol to the type its table declares. A
+        # computed array, a constructor call among them, has no table column
+        # and stays a plain array.
+        if pg_oid not in self._array_oids:
+            row = self._conn.execute(
+                "SELECT typcategory = 'A' FROM pg_type WHERE oid = %s", (pg_oid,)
+            ).fetchone()
+            self._array_oids[pg_oid] = bool(row and row[0])
+        if not self._array_oids[pg_oid]:
+            return None
+        relid = pgresult.ftable(index)
+        if not relid:
+            return None
+        key = (relid, pgresult.ftablecol(index))
+        if key not in self._column_types:
+            row = self._conn.execute(
+                'SELECT atttypid FROM pg_attribute WHERE attrelid = %s AND attnum = %s',
+                key,
+            ).fetchone()
+            self._column_types[key] = row[0] if row else 0
+        return self._collection_type(self._column_types[key])
+
+    def _collection_type(self, pg_oid: int) -> DbObjectType | None:
+        """The Oracle collection type an array domain stands for (#1206).
+
+        Built the way ``all_types`` / ``all_coll_types`` build what a client
+        reads, so the two agree on the OID, the kind and the element. None when
+        the oid is not a collection type.
+        """
+        if pg_oid in self._collection_types:
+            return self._collection_types[pg_oid]
+        kind = self._type_kind(pg_oid)
+        typ = None
+        if kind is not None and kind[0] == 'collection':
+            (_kind, owner, name, element, _typmod) = kind
+            bound = self._conn.execute(
+                "SELECT substring(pg_get_constraintdef(oid) FROM '<=\\s*([0-9]+)')::int "
+                'FROM pg_constraint WHERE contypid = %s',
+                (pg_oid,),
+            ).fetchone()
+            upper = bound[0] if bound else None
+            typ = DbObjectType(
+                owner,
+                name,
+                _object_type_oid(pg_oid),
+                1,
+                [],
+                is_collection=True,
+                collection_type=(
+                    COLLECTION_VARRAY if upper else COLLECTION_NESTED_TABLE
+                ),
+                element=self._collection_element(element),
+                max_elements=upper or 0,
+            )
+        self._collection_types[pg_oid] = typ
+        return typ
+
+    def _collection_element(self, pg_oid: int) -> dict:
+        # The element layout a collection's image is packed against: an object
+        # element carries its own type, as a client's describe embeds it.
+        entry = self._object_type(pg_oid)
+        if entry is not None:
+            typ = entry[0]
+            return {
+                'name': 'element',
+                'type_name': typ.name,
+                'data_type': type_name_to_tns(typ.name),
+                'charset': None,
+                'object_type': typ,
+            }
+        if self._collection_type(pg_oid) is not None:
+            raise UnsupportedFeature('a collection of collections is not supported yet')
+        row = self._conn.execute(
+            f"SELECT CASE WHEN typname = '{_CLOB_TYPE}' THEN 'CLOB' "
+            f"WHEN typname = '{_BLOB_TYPE}' THEN 'BLOB' "
+            'ELSE sys.ora_type_name(format_type(oid, NULL)) END '
+            'FROM pg_type WHERE oid = %s',
+            (pg_oid,),
+        ).fetchone()
+        type_name = row[0] if row else None
+        return {
+            'name': 'element',
+            'type_name': type_name,
+            'data_type': type_name_to_tns(type_name),
+            'charset': None,
+        }
+
+    def _db_collection(
+        self, typ: DbObjectType, value: object, array_oid: int
+    ) -> object:
+        # One array cell as the collection DbObject the Mirror encodes; an
+        # object element is built as an object column's value is. A cursor that
+        # executed before the element's composite was registered hands the text
+        # form `{"(1,a)"}`; the array loader registered with it parses that.
+        if value is None:
+            return None
+        if isinstance(value, str):
+            loader = self._conn.adapters.get_loader(array_oid, psycopg.pq.Format.TEXT)
+            if loader is None:
+                raise UnsupportedFeature(f'collection type {typ.name}: no loader')
+            value = loader(array_oid, self._conn).load(value.encode('utf-8'))
+        if not isinstance(value, list):
+            raise UnsupportedFeature(f'collection type {typ.name}: not an array value')
+        nested = (typ.element or {}).get('object_type')
+        if nested is not None:
+            entry = self._object_type(_pg_oid_of(nested.oid) or 0)
+            if entry is None:
+                raise UnsupportedFeature(f'collection type {typ.name}: no element type')
+            value = [self._db_object(entry[0], entry[1], v) for v in value]
+        return typ.newobject(value)
 
     def _type_kind(self, pg_oid: int) -> tuple[str, str, str, int, int] | None:
         # (kind, owner, name, element oid, element typmod) of a named type: kind

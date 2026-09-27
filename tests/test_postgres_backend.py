@@ -2458,6 +2458,52 @@ def test_rownum_becomes_limit_only_where_it_means_limit() -> None:
             _rewrite_rownum(sql)
 
 
+def test_a_collection_column_fetches_as_a_collection() -> None:
+    # PostgreSQL describes a domain column by its base type; traced back to its
+    # table, an array-domain column is the collection type, and its value a
+    # collection DbObject of that type -- objects for an object element (#1206).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    drops = (
+        'DROP TABLE t_collfetch',
+        'DROP TYPE t_collfetch_nt',
+        'DROP TYPE t_collfetch_va',
+        'DROP TYPE t_collfetch_o',
+    )
+    try:
+        for stmt in drops:
+            try:
+                backend.execute(stmt)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute(
+            'CREATE TYPE t_collfetch_o AS OBJECT (id NUMBER, name VARCHAR2(9))'
+        )
+        backend.execute('CREATE TYPE t_collfetch_va AS VARRAY(3) OF NUMBER')
+        backend.execute('CREATE TYPE t_collfetch_nt AS TABLE OF t_collfetch_o')
+        backend.execute(
+            'CREATE TABLE t_collfetch (id NUMBER, v t_collfetch_va, w t_collfetch_nt)'
+        )
+        backend.execute(
+            "INSERT INTO t_collfetch VALUES (1, '{1,2}', "
+            "ARRAY[ROW(1,'a')::t_collfetch_o, ROW(2,'b')::t_collfetch_o])"
+        )
+        backend.execute("INSERT INTO t_collfetch VALUES (2, '{}', NULL)")
+        result = backend.execute('SELECT v, w FROM t_collfetch ORDER BY id')
+        assert [c.type_name for c in result.columns] == [
+            b'T_COLLFETCH_VA',
+            b'T_COLLFETCH_NT',
+        ]
+        (v1, w1), (v2, w2) = result.rows
+        assert v1.aslist() == [1, 2]
+        assert [(e.ID, e.NAME) for e in w1.aslist()] == [(1, 'a'), (2, 'b')]
+        assert (v2.aslist(), w2) == ([], None)
+        for stmt in drops:
+            backend.execute(stmt)
+        backend.commit()
+    finally:
+        backend.close()
+
+
 def test_dictionary_views_preserve_quoted_identifier_case() -> None:
     # Oracle stores an unquoted identifier upper-case and a quoted one verbatim;
     # PostgreSQL folds unquoted names lower-case. sys.ora_name() reconstructs the
