@@ -6328,7 +6328,6 @@ class LargeObjectImageIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        self._skip_if_mirror_backend('postgres', 'fetch an object column')
         self._drop()
         self.cur.execute(f'CREATE TYPE {self.TEXT_TYPE} AS OBJECT (v VARCHAR2(400))')
         self.cur.execute(
@@ -7770,8 +7769,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
 
     async def test_a_large_object_image_fetches_whole(self):
         # Async twin of LargeObjectImageIntegration's (#1261).
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest("the Mirror's postgres backend cannot fetch an object column")
         Typ, Table = 'PYO_ABIGIMG_T', 'PYO_ABIGIMG_TAB'
         Drops = (f'DROP TABLE {Table}', f'DROP TYPE {Typ}')
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
