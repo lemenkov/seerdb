@@ -881,6 +881,36 @@ class TypesIntegration(_IntegrationBase):
                     # A CREATE above failed, so there is no type to drop.
                     pass
 
+    def test_a_collection_type_has_its_constructors(self):
+        # A collection type comes with Oracle's constructors: `t(e1, e2, …)` and
+        # the empty `t()`, which is a collection and not NULL; a VARRAY's bound
+        # holds for what they build (#1206).
+        from seerdb.common.exceptions import DatabaseError
+
+        vtype = 'PYO_CTOR_T'
+        try:
+            self.cur.execute(f'DROP TYPE {vtype}')
+        except DatabaseError:
+            # No leftover type from a prior run; nothing to clean up.
+            pass
+        self.cur.execute(f'CREATE TYPE {vtype} AS VARRAY(3) OF NUMBER')
+        try:
+            self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, v {vtype})')
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1, {vtype}(5, 10, 15))')
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (2, {vtype}())')
+            self.cur.execute(f'INSERT INTO {self.TABLE} (id) VALUES (3)')
+            with self.assertRaises(DatabaseError):
+                self.cur.execute(
+                    f'INSERT INTO {self.TABLE} VALUES (4, {vtype}(1, 2, 3, 4))'
+                )
+            self.cur.execute(
+                f'SELECT id FROM {self.TABLE} WHERE v IS NOT NULL ORDER BY id'
+            )
+            self.assertEqual(self.cur.fetchall(), [(1,), (2,)])
+            self.cur.execute(f'DROP TABLE {self.TABLE}')
+        finally:
+            self.cur.execute(f'DROP TYPE {vtype}')
+
     def test_a_bool_declared_number_is_stored_as_a_number(self):
         # A bool bound with a declared NUMBER type is the NUMBER 0 or 1 on every
         # server; from 23.1 it used to go out as a native BOOLEAN value, which
@@ -6842,6 +6872,28 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 finally:
                     await self._drop_async(Cur, Table)
                     await Cur.execute(f'DROP TYPE {Type}')
+
+    async def test_a_collection_type_has_its_constructors(self):
+        # Async twin of CursorIntegration's, for a nested table, whose
+        # constructors a query can call directly.
+        from seerdb.common.exceptions import DatabaseError
+
+        vtype = 'PYO_ASYNC_CTOR_T'
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                try:
+                    await Cur.execute(f'DROP TYPE {vtype}')
+                except DatabaseError:
+                    pass
+                await Cur.execute(f'CREATE TYPE {vtype} AS TABLE OF NUMBER')
+                try:
+                    await Cur.execute(
+                        f'SELECT CASE WHEN {vtype}(5, 10) IS NOT NULL THEN 1 END, '
+                        f'CASE WHEN {vtype}() IS NOT NULL THEN 1 END FROM dual'
+                    )
+                    self.assertEqual(await Cur.fetchone(), (1, 1))
+                finally:
+                    await Cur.execute(f'DROP TYPE {vtype}')
 
     async def test_decode(self):
         # Async twin of CursorIntegration's.

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import re
 import socket
 import sys
 import threading
@@ -482,22 +483,49 @@ def test_table_compression_is_dropped() -> None:
     assert kept == 'CREATE TABLE t (id numeric, "COMPRESS" numeric)'
 
 
+def _type_ddl(sql: str) -> str:
+    # What _translate_ddl makes of type DDL, without the constructors a
+    # collection type now comes with, or the constructor drop ahead of a DROP
+    # TYPE: those have their own test (#1206).
+    translated = re.sub(
+        r'DO \$\$ DECLARE f regprocedure;.*?END \$\$; ', '', _translate_ddl(sql)
+    )
+    return translated.split('; CREATE OR REPLACE FUNCTION')[0]
+
+
+def test_a_collection_type_comes_with_its_constructors() -> None:
+    # `t(e1, e2, …)` and the empty `t()`, made with the type, and dropped
+    # with it: DROP TYPE and the drop inside CREATE OR REPLACE TYPE remove
+    # the functions named as the type and returning it first (#1206).
+    made = _translate_ddl('create type s.a as varray(3) of number')
+    assert 'CREATE OR REPLACE FUNCTION s.a(VARIADIC numeric[]) RETURNS s.a' in made
+    assert 'CREATE OR REPLACE FUNCTION s.a() RETURNS s.a' in made
+    assert 'FUNCTION s.t(VARIADIC numeric[])' in _translate_ddl(
+        'CREATE TYPE s.t AS TABLE OF NUMBER'
+    )
+    dropped = _translate_ddl('DROP TYPE s.a')
+    assert dropped.startswith('DO $$') and dropped.endswith('; DROP TYPE s.a')
+    assert "to_regtype('s.a')" in dropped
+    replaced = _translate_ddl('CREATE OR REPLACE TYPE s.a AS VARRAY(3) OF NUMBER')
+    assert replaced.startswith('DO $$') and '; DROP TYPE IF EXISTS s.a; ' in replaced
+
+
 def test_a_replaced_type_is_dropped_and_created() -> None:
     # PostgreSQL has no CREATE OR REPLACE TYPE; the old type goes, without
     # CASCADE, and the new one is translated as a plain CREATE TYPE (#1197).
-    assert _translate_ddl('CREATE OR REPLACE TYPE s.o AS OBJECT (a NUMBER)') == (
+    assert _type_ddl('CREATE OR REPLACE TYPE s.o AS OBJECT (a NUMBER)') == (
         'DROP TYPE IF EXISTS s.o; CREATE TYPE s.o AS (a numeric)'
     )
-    assert _translate_ddl('create or replace type s.v as varray(4) of number;') == (
+    assert _type_ddl('create or replace type s.v as varray(4) of number;') == (
         'DROP TYPE IF EXISTS s.v; CREATE DOMAIN s.v AS numeric[] '
         'CHECK (VALUE IS NULL OR array_length(VALUE, 1) <= 4)'
     )
-    assert _translate_ddl('create or replace type s.t\n    as table of s.o;') == (
+    assert _type_ddl('create or replace type s.t\n    as table of s.o;') == (
         'DROP TYPE IF EXISTS s.t; CREATE DOMAIN s.t AS s.o[]'
     )
     # FORCE is not translated.
     forced = 'CREATE OR REPLACE TYPE s.o FORCE AS OBJECT (a NUMBER)'
-    assert not _translate_ddl(forced).startswith('DROP TYPE')
+    assert not _type_ddl(forced).startswith('DROP TYPE')
     # A type something depends on is refused as Oracle refuses it; the same
     # SQLSTATE on another statement keeps the generic code.
     held = _FakePgError('2BP01', 'cannot drop type s.o because other objects depend')
@@ -510,13 +538,13 @@ def test_a_replaced_type_is_dropped_and_created() -> None:
 def test_a_nested_table_type_becomes_an_unbounded_array_domain() -> None:
     # A nested table has no maximum size, so no CHECK (#1194); the element type
     # is mapped as a column's, and may be another collection type.
-    assert _translate_ddl('create type s.t as table of number;') == (
+    assert _type_ddl('create type s.t as table of number;') == (
         'CREATE DOMAIN s.t AS numeric[]'
     )
-    assert _translate_ddl('CREATE TYPE s.v AS TABLE OF VARCHAR2(20)') == (
+    assert _type_ddl('CREATE TYPE s.v AS TABLE OF VARCHAR2(20)') == (
         'CREATE DOMAIN s.v AS varchar(20)[]'
     )
-    assert _translate_ddl('create type s.tt\n    as table of s.t;') == (
+    assert _type_ddl('create type s.tt\n    as table of s.t;') == (
         'CREATE DOMAIN s.tt AS s.t[]'
     )
 
@@ -528,9 +556,9 @@ def test_a_varray_type_becomes_a_bounded_array_domain() -> None:
         'CREATE DOMAIN s.a AS numeric[] '
         'CHECK (VALUE IS NULL OR array_length(VALUE, 1) <= 10)'
     )
-    assert _translate_ddl('create type s.a as varray(10) of number') == bounded
-    assert _translate_ddl('create type s.a as varray(10) of number;') == bounded
-    assert _translate_ddl('create type s.o as\n    varray(10) of s.sub;') == (
+    assert _type_ddl('create type s.a as varray(10) of number') == bounded
+    assert _type_ddl('create type s.a as varray(10) of number;') == bounded
+    assert _type_ddl('create type s.o as\n    varray(10) of s.sub;') == (
         'CREATE DOMAIN s.o AS s.sub[] '
         'CHECK (VALUE IS NULL OR array_length(VALUE, 1) <= 10)'
     )
