@@ -549,6 +549,16 @@ def test_a_nested_table_type_becomes_an_unbounded_array_domain() -> None:
     )
 
 
+def test_nested_table_storage_clauses_are_dropped() -> None:
+    # One clause per nested-table column, with or without RETURN AS (#1253).
+    ddl = (
+        'CREATE TABLE t (id NUMBER, v s.nt, "W" s.nt) '
+        'NESTED TABLE v STORE AS t_v '
+        'nested table "W" store as s.t_w return as locator'
+    )
+    assert _translate_ddl(ddl) == 'CREATE TABLE t (id numeric, v s.nt, "W" s.nt)'
+
+
 def test_a_varray_type_becomes_a_bounded_array_domain() -> None:
     # The bound rides in a CHECK; a script's trailing `;`, which Oracle accepts
     # on type DDL, stays out of the element type.

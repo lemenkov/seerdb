@@ -1141,6 +1141,15 @@ _DDL_TYPE_REWRITES = [
 # TEMPORARY table (ON COMMIT ... ROWS is already valid PostgreSQL).
 _DDL_ORG_INDEX = re.compile(r'\s+ORGANIZATION\s+INDEX\b', re.IGNORECASE)
 _DDL_GLOBAL_TEMPORARY = re.compile(r'\bGLOBAL\s+TEMPORARY\b', re.IGNORECASE)
+# `NESTED TABLE c STORE AS s [RETURN [AS] LOCATOR | VALUE]`, once per nested-table
+# column: Oracle requires it to name the column's storage table. A nested table is
+# an array domain here, stored in the row (#1194), so there is nothing for it to
+# name, and it goes (#1253).
+_DDL_NESTED_TABLE_STORE = re.compile(
+    r'\s+NESTED\s+TABLE\s+("[^"]+"|[\w$#]+)\s+STORE\s+AS\s+("[^"]+"|[\w$#.]+)'
+    r'(?:\s+RETURN\s+(?:AS\s+)?(?:LOCATOR|VALUE))?',
+    re.IGNORECASE,
+)
 # Table compression (#1182) is a storage hint no query can see, and PostgreSQL
 # compresses large values on its own. The clause is recognised straight after
 # the column list's closing parenthesis, where Oracle puts it, so a column or a
@@ -1482,6 +1491,7 @@ def _translate_ddl(sql: str) -> str:
         return sql
     out = _DDL_GLOBAL_TEMPORARY.sub('TEMPORARY', sql)
     out = _DDL_ORG_INDEX.sub('', out)
+    out = _DDL_NESTED_TABLE_STORE.sub('', out)
     out = _DDL_COMPRESSION.sub(')', out)
     for pattern, replacement in _DDL_TYPE_REWRITES:
         out = pattern.sub(replacement, out)
