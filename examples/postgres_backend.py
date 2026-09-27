@@ -70,7 +70,8 @@ edge of this adapter:
   an array, listed in ``all_types`` and ``all_coll_types``. A column of one
   fetches as the collection; PostgreSQL describes a domain value by its base
   type, so a computed one, such as a constructor call in a select list, has no
-  type to trace and is refused, and so is a collection of collections. The block
+  type to trace and is refused. A collection of collections is a domain over an
+  array of the inner domain, bound as an array literal. The block
   python-oracledb runs to learn a type,
   ``DBMS_PICKLER.GET_TYPE_SHAPE``, is answered from the catalog with the TDS and
   attribute cursor 23ai sends; an attribute is reported as the DDL translation
@@ -3434,6 +3435,29 @@ def _served_lobs(value: DbObject, image: ObjectImage) -> DbObject:
     return mapped if isinstance(mapped, DbObject) else value
 
 
+def _array_literal(values: list) -> str:
+    # A PostgreSQL array literal of `values` (#1276): NULL for None, every other
+    # element double-quoted with `"` and `\\` escaped, so a string, a timestamp
+    # or an inner array literal all go in as text PostgreSQL parses by the
+    # element type.
+    def element(value: object) -> str:
+        if value is None:
+            return 'NULL'
+        if isinstance(value, (bytes, bytearray)):
+            text = '\\x' + bytes(value).hex()
+        elif isinstance(value, datetime.datetime | datetime.date):
+            text = (
+                value.isoformat(sep=' ')
+                if isinstance(value, datetime.datetime)
+                else value.isoformat()
+            )
+        else:
+            text = str(value)
+        return '"' + text.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+    return '{' + ','.join(element(v) for v in values) + '}'
+
+
 def _pg_oid_of(oid: bytes) -> int | None:
     # The inverse of _object_type_oid; None for an OID that cannot be one of
     # ours (a real Oracle OID a client carried over, or a malformed one).
@@ -4374,8 +4398,19 @@ class PostgresBackend:
                 'charset': None,
                 'object_type': typ,
             }
-        if self._collection_type(pg_oid) is not None:
-            raise UnsupportedFeature('a collection of collections is not supported yet')
+        inner = self._collection_type(pg_oid)
+        if inner is not None:
+            # A collection of collections (#1276): psycopg does not know the inner
+            # domain, so a value came back as text; load the domain as its base
+            # array, and arrays of it as lists of those.
+            self._register_collection_loaders(pg_oid)
+            return {
+                'name': 'element',
+                'type_name': inner.name,
+                'data_type': type_name_to_tns(inner.name),
+                'charset': None,
+                'object_type': inner,
+            }
         row = self._conn.execute(
             f"SELECT CASE WHEN typname = '{_CLOB_TYPE}' THEN 'CLOB' "
             f"WHEN typname = '{_BLOB_TYPE}' THEN 'BLOB' "
@@ -4390,6 +4425,27 @@ class PostgresBackend:
             'data_type': type_name_to_tns(type_name),
             'charset': None,
         }
+
+    def _register_collection_loaders(self, pg_oid: int) -> None:
+        # An array domain inside another array loads as its base array does, and
+        # an array of it as a list of those (#1276).
+        from psycopg.types import TypeInfo
+        from psycopg.types.array import register_array
+
+        row = self._conn.execute(
+            'SELECT typbasetype, %s::oid::regtype::text FROM pg_type WHERE oid = %s',
+            (pg_oid, pg_oid),
+        ).fetchone()
+        if row is None:
+            return
+        (base, regtype) = row
+        for fmt in (psycopg.pq.Format.TEXT, psycopg.pq.Format.BINARY):
+            loader = self._conn.adapters.get_loader(base, fmt)
+            if loader is not None:
+                self._conn.adapters.register_loader(pg_oid, loader)
+        domain = TypeInfo.fetch(self._conn, regtype)
+        if domain is not None:
+            register_array(domain, self._conn)
 
     def _db_collection(
         self, typ: DbObjectType, value: object, array_oid: int
@@ -4408,7 +4464,17 @@ class PostgresBackend:
         if not isinstance(value, list):
             raise UnsupportedFeature(f'collection type {typ.name}: not an array value')
         nested = (typ.element or {}).get('object_type')
-        if nested is not None:
+        if nested is not None and nested.is_collection:
+            # A collection of collections (#1276): each element its own
+            # collection, NULL staying NULL.
+            inner_oid = _pg_oid_of(nested.oid) or 0
+            base = self._conn.execute(
+                'SELECT typbasetype FROM pg_type WHERE oid = %s', (inner_oid,)
+            ).fetchone()
+            value = [
+                self._db_collection(nested, v, base[0] if base else 0) for v in value
+            ]
+        elif nested is not None:
             entry = self._object_type(_pg_oid_of(nested.oid) or 0)
             if entry is None:
                 raise UnsupportedFeature(f'collection type {typ.name}: no element type')
@@ -4766,7 +4832,9 @@ class PostgresBackend:
         )
         return self._composite_value(entry, value.asdict())
 
-    def _collection_bind_value(self, typ: DbObjectType, image: ObjectImage) -> list:
+    def _collection_bind_value(
+        self, typ: DbObjectType, image: ObjectImage
+    ) -> list | str:
         # A VARRAY / nested-table bind (#1206): the image's elements, bound as the
         # array the domain is over; an object element as its composite.
         element = typ.element or {}
@@ -4775,11 +4843,18 @@ class PostgresBackend:
         ).aslist()
         return self._collection_values(typ, values)
 
-    def _collection_values(self, typ: DbObjectType, values: list) -> list:
+    def _collection_values(self, typ: DbObjectType, values: list) -> list | str:
         # A collection's elements as the array its domain is over: an object
         # element as its composite, a NUMBER list all one Python type.
         element = typ.element or {}
         nested = element.get('object_type')
+        if nested is not None and nested.is_collection:
+            # A collection of collections (#1276): psycopg would bind a list of
+            # lists as a rectangular multi-dimensional array, which the domain
+            # refuses, so the value goes as an array literal PostgreSQL casts.
+            return _array_literal(
+                [None if v is None else _array_literal(v.aslist()) for v in values]
+            )
         if nested is None:
             # A NUMBER decodes as an int when it is whole and a Decimal when not,
             # and psycopg binds no list that mixes the two.

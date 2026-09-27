@@ -2710,6 +2710,70 @@ def test_zoned_timestamp_attributes_take_oracle_names() -> None:
         backend.close()
 
 
+def test_a_collection_of_collections_fetches_and_binds() -> None:
+    # A nested table whose elements are nested tables (#1276): the element type
+    # is embedded, a value loads as nested collections -- a NULL and an empty
+    # inner one included -- and a bound image goes back as an array literal.
+    from seerdb.common.dbobject import ObjectImage
+    from seerdb.common.tns import encode_object_image
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    drops = ('DROP TABLE t_coc', 'DROP TYPE t_coc_tt', 'DROP TYPE t_coc_t1')
+    try:
+        for stmt in drops:
+            try:
+                backend.execute(stmt)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute('CREATE TYPE t_coc_t1 AS TABLE OF NUMBER')
+        backend.execute('CREATE TYPE t_coc_tt AS TABLE OF t_coc_t1')
+        backend.execute('CREATE TABLE t_coc (id NUMBER, c t_coc_tt)')
+        backend.execute(
+            'INSERT INTO t_coc VALUES (1, t_coc_tt(t_coc_t1(1, 2), NULL, t_coc_t1()))'
+        )
+        (c,) = backend.execute('SELECT c FROM t_coc').rows[0]
+        assert c._dbtype.element['object_type'].name == 'T_COC_T1'
+        assert [None if e is None else e.aslist() for e in c.aslist()] == [
+            [1, 2],
+            None,
+            [],
+        ]
+        typ = c._dbtype
+        image = ObjectImage(typ.oid, typ.schema, typ.name, None, encode_object_image(c))
+        backend.execute('INSERT INTO t_coc VALUES (2, :1)', [image])
+        (c2,) = backend.execute('SELECT c FROM t_coc WHERE id = 2').rows[0]
+        assert [None if e is None else e.aslist() for e in c2.aslist()] == [
+            [1, 2],
+            None,
+            [],
+        ]
+        for stmt in drops:
+            backend.execute(stmt)
+        backend.commit()
+    finally:
+        backend.close()
+
+
+def test_an_array_literal_quotes_every_element() -> None:
+    # NULL bare; strings, timestamps and inner literals quoted, `"` and `\\`
+    # escaped, so PostgreSQL parses each by the element type (#1276).
+    import datetime
+    from decimal import Decimal
+
+    from postgres_backend import _array_literal
+
+    assert (
+        _array_literal([None, Decimal('1.5'), 'a"b\\c']) == '{NULL,"1.5","a\\"b\\\\c"}'
+    )
+    assert (
+        _array_literal([datetime.datetime(2026, 1, 2, 3, 4, 5)])
+        == '{"2026-01-02 03:04:05"}'
+    )
+    assert (
+        _array_literal([_array_literal([1, 2]), None]) == '{"{\\"1\\",\\"2\\"}",NULL}'
+    )
+
+
 def test_dictionary_views_preserve_quoted_identifier_case() -> None:
     # Oracle stores an unquoted identifier upper-case and a quoted one verbatim;
     # PostgreSQL folds unquoted names lower-case. sys.ora_name() reconstructs the

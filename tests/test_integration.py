@@ -77,6 +77,7 @@ _FV2_UNSUPPORTED = (
     ('lob_attribute', 'object types are not supported on Oracle 9i'),
     ('large_object_image', 'object types are not supported on Oracle 9i'),
     ('nested_attribute', 'object types are not supported on Oracle 9i'),
+    ('collection_of_collections', 'object types are not supported on Oracle 9i'),
     ('local_time_zone_attribute', 'object types are not supported on Oracle 9i'),
     ('collection_value', 'object types are not supported on Oracle 9i'),
     ('changepassword', 'changepassword is not supported on Oracle 9i'),
@@ -6841,6 +6842,87 @@ class ObjectLocalTimeZoneAttributeIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class CollectionOfCollectionsIntegration(_IntegrationBase):
+    """A nested table and a VARRAY whose elements are nested tables, the shapes
+    the reference suite's NestedCollectionTests uses (#1276): fetched and bound,
+    a NULL and an empty inner collection included."""
+
+    INNER = 'PYO_COC_INNER_T'
+    TABLE_OF = 'PYO_COC_TT'
+    VARRAY_OF = 'PYO_COC_VT'
+    TABLE = 'PYO_COC_TAB'
+
+    def setUp(self):
+        super().setUp()
+        self._drop()
+        self.cur.execute(f'CREATE TYPE {self.INNER} AS TABLE OF NUMBER')
+        self.cur.execute(f'CREATE TYPE {self.TABLE_OF} AS TABLE OF {self.INNER}')
+        self.cur.execute(f'CREATE TYPE {self.VARRAY_OF} AS VARRAY(5) OF {self.INNER}')
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (id NUMBER, tc {self.TABLE_OF}, '
+            f'vc {self.VARRAY_OF}) NESTED TABLE tc STORE AS {self.TABLE}_NT '
+            f'(NESTED TABLE COLUMN_VALUE STORE AS {self.TABLE}_NTI)'
+        )
+
+    def tearDown(self):
+        self._drop()
+        super().tearDown()
+
+    def _drop(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (
+            f'DROP TABLE {self.TABLE}',
+            f'DROP TYPE {self.VARRAY_OF}',
+            f'DROP TYPE {self.TABLE_OF}',
+            f'DROP TYPE {self.INNER}',
+        ):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass  # best-effort teardown of leftovers
+
+    @staticmethod
+    def _lists(value):
+        if value is None:
+            return None
+        return [
+            None if e is None else [int(x) for x in e.aslist()] for e in value.aslist()
+        ]
+
+    def test_a_collection_of_collections_fetches(self):
+        i, tt, vt = self.INNER, self.TABLE_OF, self.VARRAY_OF
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (1, '
+            f'{tt}({i}(1, 2), {i}(3), NULL, {i}()), {vt}({i}(4)))'
+        )
+        self.cur.execute(f'SELECT tc, vc FROM {self.TABLE}')
+        (tc, vc) = self.cur.fetchone()
+        self.assertEqual(
+            (self._lists(tc), self._lists(vc)), ([[1, 2], [3], None, []], [[4]])
+        )
+
+    def test_a_collection_of_collections_binds(self):
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('an object bind needs the 12.1+ OAC')
+        inner = self.conn.gettype(self.INNER)
+        tt = self.conn.gettype(self.TABLE_OF)
+        vt = self.conn.gettype(self.VARRAY_OF)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (2, :1, :2)',
+            [
+                tt.newobject([inner.newobject([5, 6]), None, inner.newobject()]),
+                vt.newobject([inner.newobject([7])]),
+            ],
+        )
+        self.cur.execute(f'SELECT tc, vc FROM {self.TABLE} WHERE id = 2')
+        (tc, vc) = self.cur.fetchone()
+        self.assertEqual(
+            (self._lists(tc), self._lists(vc)), ([[5, 6], None, []], [[7]])
+        )
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class RefBindIntegration(_IntegrationBase):
     # REF bind (#139): fetch a REF for a row object, bind it back into an INSERT
     # and into DEREF(?), and confirm it round-trips to the original object. REF
@@ -7945,6 +8027,56 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     await Cur.execute(f'SELECT o FROM {Table}')
                     (Fetched,) = await Cur.fetchone()
                     self.assertEqual(Fetched.TS.replace(tzinfo=None), Given)
+                finally:
+                    for Stmt in Drops:
+                        try:
+                            await Cur.execute(Stmt)
+                        except seerdb.DatabaseError:
+                            pass  # a CREATE above failed, so nothing to drop
+
+    async def test_a_collection_of_collections_fetches_and_binds(self):
+        # Async twin of CollectionOfCollectionsIntegration's (#1276).
+        Inner, Outer, Table = 'PYO_ACOC_INNER_T', 'PYO_ACOC_TT', 'PYO_ACOC_TAB'
+        Drops = (f'DROP TABLE {Table}', f'DROP TYPE {Outer}', f'DROP TYPE {Inner}')
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                for Stmt in Drops:
+                    try:
+                        await Cur.execute(Stmt)
+                    except seerdb.DatabaseError:
+                        pass  # no leftover from a prior run
+                try:
+                    await Cur.execute(f'CREATE TYPE {Inner} AS TABLE OF NUMBER')
+                    await Cur.execute(f'CREATE TYPE {Outer} AS TABLE OF {Inner}')
+                    await Cur.execute(
+                        f'CREATE TABLE {Table} (id NUMBER, c {Outer}) '
+                        f'NESTED TABLE c STORE AS {Table}_NT '
+                        f'(NESTED TABLE COLUMN_VALUE STORE AS {Table}_NTI)'
+                    )
+                    await Cur.execute(
+                        f'INSERT INTO {Table} VALUES (1, {Outer}({Inner}(1, 2), NULL))'
+                    )
+                    await Cur.execute(f'SELECT c FROM {Table}')
+                    (C,) = await Cur.fetchone()
+                    self.assertEqual(
+                        [
+                            None if E is None else [int(X) for X in E.aslist()]
+                            for E in C.aslist()
+                        ],
+                        [[1, 2], None],
+                    )
+                    if Conn.field_version >= FIELD_VERSION_12_1:
+                        InnerT = await Conn.gettype(Inner)
+                        OuterT = await Conn.gettype(Outer)
+                        await Cur.execute(
+                            f'INSERT INTO {Table} VALUES (2, :1)',
+                            [OuterT.newobject([InnerT.newobject([3])])],
+                        )
+                        await Cur.execute(f'SELECT c FROM {Table} WHERE id = 2')
+                        (C,) = await Cur.fetchone()
+                        self.assertEqual(
+                            [[int(X) for X in E.aslist()] for E in C.aslist()], [[3]]
+                        )
                 finally:
                     for Stmt in Drops:
                         try:
