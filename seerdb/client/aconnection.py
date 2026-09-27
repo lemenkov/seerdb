@@ -1623,14 +1623,27 @@ class AsyncOracleConnect(_ConnectionLogic):
         )
 
         Res = await self.execute(
-            'SELECT coll_type, elem_type_name, length, precision, scale, '
-            'upper_bound FROM all_coll_types WHERE owner = :1 AND type_name = :2',
+            'SELECT coll_type, elem_type_name, elem_type_owner, length, '
+            'precision, scale, upper_bound '
+            'FROM all_coll_types WHERE owner = :1 AND type_name = :2',
             Bind=[owner, name],
         )
         Rows = self._rows(Res)
         if not Rows:
             return {'is_collection': True}
-        (CollType, ElemType, _Len, _Prec, _Scale, Upper) = Rows[0][:6]
+        (CollType, ElemType, ElemOwner, _Len, _Prec, _Scale, Upper) = Rows[0][:7]
+        Element: dict = {
+            'name': 'element',
+            'type_name': ElemType,
+            'data_type': type_name_to_tns(ElemType),
+            'charset': None,
+        }
+        if ElemOwner:
+            # A collection of a UDT (#1254): embed the element type's layout so
+            # the decoder can recurse per element, as the sync describe does.
+            Element['object_type'] = await self._describe_object_type(
+                ElemOwner, ElemType
+            )
         return {
             'is_collection': True,
             'collection_type': (
@@ -1638,12 +1651,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 if CollType == 'VARYING ARRAY'
                 else COLLECTION_NESTED_TABLE
             ),
-            'element': {
-                'name': 'element',
-                'type_name': ElemType,
-                'data_type': type_name_to_tns(ElemType),
-                'charset': None,
-            },
+            'element': Element,
             'max_elements': int(Upper) if Upper else 0,
         }
 
