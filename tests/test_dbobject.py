@@ -27,6 +27,7 @@ from seerdb.common.dbobject import (
     decode_xmltype,
     lob_attribute_csfrm,
     map_object_lobs,
+    served_lob_content,
     type_name_to_tns,
 )
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
@@ -979,6 +980,34 @@ class TestObjectLobAttributeBind(unittest.TestCase):
     def test_lob_object_attribute_queues_no_content(self):
         # A bound LOB is not the Mirror's to serve, so it queues nothing.
         self.assertEqual(object_lob_contents([_ADT_COLUMN], [(self._lob_obj(),)]), [])
+
+
+class TestServedLobContent(unittest.TestCase):
+    # The content the Mirror served under a LOB attribute's locator, for a bound
+    # image to be resolved against (#888); shared by every backend.
+
+    _CONTENTS = {b'fetched-loc': ('fetched', True), b'temp-loc': (b'\x01', False)}
+
+    def test_a_locator_is_found_as_it_came(self):
+        self.assertEqual(
+            served_lob_content(self._CONTENTS, b'fetched-loc'), ('fetched', True)
+        )
+
+    def test_a_ub2_stating_the_rest_is_stripped(self):
+        locator = struct.pack('>H', len(b'temp-loc')) + b'temp-loc'
+        self.assertEqual(served_lob_content(self._CONTENTS, locator), (b'\x01', False))
+
+    def test_a_leading_pair_that_is_no_length_is_kept(self):
+        self.assertIsNone(served_lob_content(self._CONTENTS, b'\x00\x01temp-loc'))
+
+    def test_an_unknown_locator_is_none(self):
+        self.assertIsNone(served_lob_content(self._CONTENTS, b'other'))
+
+    def test_the_image_answers_from_its_own_map(self):
+        image = ObjectImage(bytes(16), 'PYO', 'T', None, b'')
+        self.assertIsNone(image.served_lob(b'fetched-loc'))
+        image.lob_contents = dict(self._CONTENTS)
+        self.assertEqual(image.served_lob(b'fetched-loc'), ('fetched', True))
 
 
 class TestMapObjectLobs(unittest.TestCase):
