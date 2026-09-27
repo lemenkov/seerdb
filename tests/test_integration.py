@@ -6682,6 +6682,56 @@ class ObjectTimeZoneAttributeIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class CollectionTypeIntegration(_IntegrationBase):
+    """VARRAY and nested-table types: described, fetched and bound (#1206)."""
+
+    ELEM = 'PYO_COLL_ELEM_T'
+    NUMS = 'PYO_COLL_NUMS_T'
+    ELEMS = 'PYO_COLL_ELEMS_T'
+    TABLE = 'PYO_COLL_TAB'
+
+    def setUp(self):
+        super().setUp()
+        self._drop()
+        self.cur.execute(
+            f'CREATE TYPE {self.ELEM} AS OBJECT (id NUMBER, name VARCHAR2(40))'
+        )
+        self.cur.execute(f'CREATE TYPE {self.NUMS} AS VARRAY(3) OF NUMBER')
+        self.cur.execute(f'CREATE TYPE {self.ELEMS} AS TABLE OF {self.ELEM}')
+
+    def tearDown(self):
+        self._drop()
+        super().tearDown()
+
+    def _drop(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (
+            f'DROP TABLE {self.TABLE}',
+            f'DROP TYPE {self.ELEMS}',
+            f'DROP TYPE {self.NUMS}',
+            f'DROP TYPE {self.ELEM}',
+        ):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass  # best-effort teardown of leftovers
+
+    def test_gettype_describes_a_collection(self):
+        from seerdb.common.dbobject import COLLECTION_NESTED_TABLE, COLLECTION_VARRAY
+
+        nums = self.conn.gettype(self.NUMS)
+        self.assertTrue(nums.is_collection)
+        self.assertEqual(
+            (nums.collection_type, nums.max_elements, nums.element['type_name']),
+            (COLLECTION_VARRAY, 3, 'NUMBER'),
+        )
+        elems = self.conn.gettype(self.ELEMS)
+        self.assertEqual(elems.collection_type, COLLECTION_NESTED_TABLE)
+        self.assertEqual(elems.element['object_type'].name, self.ELEM)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class RefBindIntegration(_IntegrationBase):
     # REF bind (#139): fetch a REF for a row object, bind it back into an INSERT
     # and into DEREF(?), and confirm it round-trips to the original object. REF
@@ -7914,6 +7964,45 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     pass
         finally:
             await Conn.close()
+
+    async def test_gettype_describes_a_collection(self):
+        # Async twin of CollectionTypeIntegration's.
+        from seerdb.common.dbobject import COLLECTION_NESTED_TABLE, COLLECTION_VARRAY
+
+        Elem, Nums, Elems = 'PYO_ACOLL_ELEM_T', 'PYO_ACOLL_NUMS_T', 'PYO_ACOLL_ELEMS_T'
+        Drops = (f'DROP TYPE {Elems}', f'DROP TYPE {Nums}', f'DROP TYPE {Elem}')
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                for Stmt in Drops:
+                    try:
+                        await Cur.execute(Stmt)
+                    except seerdb.DatabaseError:
+                        pass  # no leftover from a prior run
+                try:
+                    await Cur.execute(
+                        f'CREATE TYPE {Elem} AS OBJECT (id NUMBER, name VARCHAR2(40))'
+                    )
+                    await Cur.execute(f'CREATE TYPE {Nums} AS VARRAY(3) OF NUMBER')
+                    await Cur.execute(f'CREATE TYPE {Elems} AS TABLE OF {Elem}')
+                    NumsType = await Conn.gettype(Nums)
+                    self.assertTrue(NumsType.is_collection)
+                    self.assertEqual(
+                        (
+                            NumsType.collection_type,
+                            NumsType.max_elements,
+                            NumsType.element['type_name'],
+                        ),
+                        (COLLECTION_VARRAY, 3, 'NUMBER'),
+                    )
+                    ElemsType = await Conn.gettype(Elems)
+                    self.assertEqual(ElemsType.collection_type, COLLECTION_NESTED_TABLE)
+                    self.assertEqual(ElemsType.element['object_type'].name, Elem)
+                finally:
+                    for Stmt in Drops:
+                        try:
+                            await Cur.execute(Stmt)
+                        except seerdb.DatabaseError:
+                            pass  # a CREATE above failed, so nothing to drop
 
     async def test_a_bare_object_out_bind_takes_its_value(self):
         # PL/SQL-bound: the object OUT bind is filled by a PL/SQL PACKAGE (#1127).

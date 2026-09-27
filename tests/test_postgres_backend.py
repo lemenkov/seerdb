@@ -2890,3 +2890,35 @@ def test_an_object_type_is_in_the_dictionary_and_round_trips() -> None:
         backend.commit()
     finally:
         backend.close()
+
+
+def test_a_collection_type_is_in_the_dictionary() -> None:
+    # A VARRAY / nested table is a COLLECTION in all_types, with no attributes;
+    # all_coll_types gives its element's size as Oracle does (#1206).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    names = ('t_colldict_s', 't_colldict_n')
+    try:
+        for name in names:
+            try:
+                backend.execute(f'DROP TYPE {name}')
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute('CREATE TYPE t_colldict_s AS VARRAY(5) OF VARCHAR2(20)')
+        backend.execute('CREATE TYPE t_colldict_n AS TABLE OF NUMBER(9,2)')
+        assert backend.execute(
+            'SELECT type_name, typecode, attributes FROM all_types '
+            "WHERE type_name LIKE 'T_COLLDICT%' ORDER BY 1"
+        ).rows == [('T_COLLDICT_N', 'COLLECTION', 0), ('T_COLLDICT_S', 'COLLECTION', 0)]
+        assert backend.execute(
+            'SELECT type_name, coll_type, upper_bound, elem_type_name, length, '
+            "precision, scale FROM all_coll_types WHERE type_name LIKE 'T_COLLDICT%' "
+            'ORDER BY 1'
+        ).rows == [
+            ('T_COLLDICT_N', 'TABLE', None, 'NUMBER', None, 9, 2),
+            ('T_COLLDICT_S', 'VARYING ARRAY', 5, 'VARCHAR2', 20, None, None),
+        ]
+        for name in names:
+            backend.execute(f'DROP TYPE {name}')
+        backend.commit()
+    finally:
+        backend.close()

@@ -900,6 +900,14 @@ _ORACLE_DICTIONARY_DDL = (
     'JOIN pg_class c ON c.oid = t.typrelid '
     "WHERE t.typtype = 'c' AND c.relkind = 'c' "
     f"AND t.typname <> '{_TSTZ_TYPE}' AND t.typname !~ '[$]ref$' "
+    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    # A VARRAY or nested table, a domain over an array, is a COLLECTION with no
+    # attributes of its own (#1206).
+    'UNION ALL SELECT ora_owner(n.nspname), ora_name(d.typname), '
+    "decode(lpad(to_hex(d.oid::bigint), 32, '0'), 'hex'), 'COLLECTION', 0 "
+    'FROM pg_type d JOIN pg_namespace n ON n.oid = d.typnamespace '
+    "JOIN pg_type b ON b.oid = d.typbasetype AND b.typcategory = 'A' "
+    "WHERE d.typtype = 'd' "
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
     'CREATE OR REPLACE VIEW sys.user_types AS SELECT * FROM all_types '
     'WHERE owner=upper(current_schema());'
@@ -934,7 +942,15 @@ _ORACLE_DICTIONARY_DDL = (
     'THEN ora_name(e.typname) '
     f"WHEN e.typname = '{_CLOB_TYPE}' THEN 'CLOB' WHEN e.typname = '{_BLOB_TYPE}' THEN 'BLOB' "
     'ELSE ora_type_name(format_type(e.oid, NULL)) END AS elem_type_name, '
-    'NULL::text AS elem_type_package '
+    'NULL::text AS elem_type_package, '
+    # The element's size, which the domain's typmod carries for its elements: a
+    # character length, or a NUMBER's precision and scale (#1206).
+    'CASE WHEN e.oid IN (1042, 1043) AND d.typtypmod > 4 '
+    'THEN d.typtypmod - 4 END AS length, '
+    'CASE WHEN e.oid = 1700 AND d.typtypmod >= 4 '
+    'THEN (d.typtypmod - 4) >> 16 END AS precision, '
+    'CASE WHEN e.oid = 1700 AND d.typtypmod >= 4 '
+    'THEN (d.typtypmod - 4) & 65535 END AS scale '
     'FROM pg_type d JOIN pg_namespace n ON n.oid = d.typnamespace '
     "JOIN pg_type b ON b.oid = d.typbasetype AND b.typcategory = 'A' "
     'JOIN pg_type e ON e.oid = b.typelem '
