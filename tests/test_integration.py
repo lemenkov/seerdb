@@ -6280,8 +6280,6 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
             f"INSERT INTO {self.TABLE} VALUES (1, {self.TYPE}(1, 'some clob', "
             f"HEXTORAW('0102FF')), {self.NTYPE}(1, TO_NCLOB('{self.TEXT}')))"
         )
-        # Each object's LOBs are read before the next query: the Mirror serves
-        # attribute LOBs in fetch order (#1262).
         o = self._fetched(1)
         self.assertIsInstance(o.C, LOB)
         self.assertIsInstance(o.B, LOB)
@@ -6289,6 +6287,21 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
         n = self._fetched(1, 'p')
         self.assertIsInstance(n.N, LOB)
         self.assertEqual(n.N.read(), self.TEXT)
+
+    def test_lob_attributes_read_in_any_order(self):
+        # Read only after a later query, and in another order: over the Mirror
+        # every attribute LOB shared one locator, served in fetch order, so
+        # these read another object's content (#1262).
+        self.cur.execute(
+            f"INSERT INTO {self.TABLE} VALUES (7, {self.TYPE}(7, 'seven', "
+            f"HEXTORAW('07')), {self.NTYPE}(7, TO_NCLOB('{self.TEXT}')))"
+        )
+        o = self._fetched(7)
+        n = self._fetched(7, 'p')
+        self.assertEqual(
+            (n.N.read(), o.B.read(), o.C.read(), o.C.read()),
+            (self.TEXT, b'\x07', 'seven', 'seven'),
+        )
 
     def test_a_null_lob_attribute_is_none(self):
         self.cur.execute(
@@ -6325,7 +6338,6 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
 
     def test_a_fetched_lob_attribute_binds_back(self):
         self._skip_before_12_1()
-        self._skip_if_mirror('binding back a fetched LOB attribute (#1262)')
         self.cur.execute(
             f"INSERT INTO {self.TABLE} (k, o) VALUES (5, {self.TYPE}(5, 'fetched', NULL))"
         )

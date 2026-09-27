@@ -5960,6 +5960,17 @@ Two pieces make this work:
    order is row-major then attribute-order — the exact order the image emits the
    locators, and the order the client reads them.
 
+**One locator per attribute LOB, answered by locator (#1262).** The design
+above served every attribute LOB under the same locator, from a queue in fetch
+order. That only works if the client reads each LOB once, in that order, before
+its next query. Reading object A's LOBs after fetching object B returned B's
+content, and binding a fetched attribute LOB back had no content to find, so it
+bound NULL. So inside a session each attribute LOB now gets its own minted
+locator, recorded with its content in the session's emit log as a column LOB's
+is. A read is answered from the log by locator, in any order and any number of
+times, and a bind resolves it like a fetched column LOB (§21.13). The shared
+locator and its queue remain only for encoding with no session behind it.
+
 Verified through the Mirror against a live 23ai: python-oracledb's
 `test_1900_dbobject` test 1904 (fetch an object holding `CLOB` / `NCLOB` / `BLOB`
 attributes, plus a nested object and a collection) reads every attribute back.
