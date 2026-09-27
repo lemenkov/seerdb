@@ -77,6 +77,7 @@ _FV2_UNSUPPORTED = (
     ('lob_attribute', 'object types are not supported on Oracle 9i'),
     ('large_object_image', 'object types are not supported on Oracle 9i'),
     ('nested_attribute', 'object types are not supported on Oracle 9i'),
+    ('local_time_zone_attribute', 'object types are not supported on Oracle 9i'),
     ('collection_value', 'object types are not supported on Oracle 9i'),
     ('changepassword', 'changepassword is not supported on Oracle 9i'),
     ('cache_evicts', 'the cursor cache is a fv4+ feature; 9i re-parses'),
@@ -6789,6 +6790,57 @@ class CollectionTypeIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class ObjectLocalTimeZoneAttributeIntegration(_IntegrationBase):
+    # An object's TIMESTAMP WITH LOCAL TIME ZONE attribute binds and returns as
+    # the time it was given. The Mirror-over-PG described one as WITH TIME ZONE
+    # and wrapped the value in its WITH TIME ZONE composite, which PostgreSQL
+    # refused (#1270).
+    TYPE = 'PYO_LTZ_ATTR_T'
+    TABLE = 'PYO_LTZ_ATTR_TAB'
+
+    def setUp(self):
+        super().setUp()
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('an object bind needs the 12.1+ OAC')
+        self._drop()
+        self.cur.execute(
+            f'CREATE TYPE {self.TYPE} AS OBJECT '
+            '(id NUMBER, ts TIMESTAMP WITH LOCAL TIME ZONE)'
+        )
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, o {self.TYPE})')
+
+    def tearDown(self):
+        self._drop()
+        super().tearDown()
+
+    def _drop(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (f'DROP TABLE {self.TABLE}', f'DROP TYPE {self.TYPE}'):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass  # best-effort teardown of leftovers
+
+    def test_a_local_time_zone_attribute_round_trips(self):
+        import datetime
+
+        given = datetime.datetime(2026, 9, 27, 13, 14, 15)
+        typ = self.conn.gettype(self.TYPE)
+        self.assertEqual(typ.attrs[1]['type_name'], 'TIMESTAMP WITH LOCAL TZ')
+        out = self.cur.var(typ)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (1, :1) RETURNING o INTO :2',
+            [typ.newobject({'ID': 1, 'TS': given}), out],
+        )
+        (returned,) = out.getvalue()
+        self.assertEqual(returned.TS.replace(tzinfo=None), given)
+        self.cur.execute(f'SELECT o FROM {self.TABLE}')
+        (fetched,) = self.cur.fetchone()
+        self.assertEqual(fetched.TS.replace(tzinfo=None), given)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class RefBindIntegration(_IntegrationBase):
     # REF bind (#139): fetch a REF for a row object, bind it back into an INSERT
     # and into DEREF(?), and confirm it round-trips to the original object. REF
@@ -7856,6 +7908,43 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                         self.assertEqual(
                             (O.SUB.S, [E.S for E in O.SUBS.aslist()]), ('nine', ['d'])
                         )
+                finally:
+                    for Stmt in Drops:
+                        try:
+                            await Cur.execute(Stmt)
+                        except seerdb.DatabaseError:
+                            pass  # a CREATE above failed, so nothing to drop
+
+    async def test_a_local_time_zone_attribute_round_trips(self):
+        # Async twin of ObjectLocalTimeZoneAttributeIntegration's (#1270).
+        import datetime
+
+        Typ, Table = 'PYO_ALTZ_ATTR_T', 'PYO_ALTZ_ATTR_TAB'
+        Drops = (f'DROP TABLE {Table}', f'DROP TYPE {Typ}')
+        Given = datetime.datetime(2026, 9, 27, 13, 14, 15)
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            if Conn.field_version < FIELD_VERSION_12_1:
+                self.skipTest('an object bind needs the 12.1+ OAC')
+            async with Conn.cursor() as Cur:
+                for Stmt in Drops:
+                    try:
+                        await Cur.execute(Stmt)
+                    except seerdb.DatabaseError:
+                        pass  # no leftover from a prior run
+                try:
+                    await Cur.execute(
+                        f'CREATE TYPE {Typ} AS OBJECT '
+                        '(id NUMBER, ts TIMESTAMP WITH LOCAL TIME ZONE)'
+                    )
+                    await Cur.execute(f'CREATE TABLE {Table} (n NUMBER, o {Typ})')
+                    ObjType = await Conn.gettype(Typ)
+                    await Cur.execute(
+                        f'INSERT INTO {Table} VALUES (1, :1)',
+                        [ObjType.newobject({'ID': 1, 'TS': Given})],
+                    )
+                    await Cur.execute(f'SELECT o FROM {Table}')
+                    (Fetched,) = await Cur.fetchone()
+                    self.assertEqual(Fetched.TS.replace(tzinfo=None), Given)
                 finally:
                     for Stmt in Drops:
                         try:

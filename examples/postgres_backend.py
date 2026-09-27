@@ -928,10 +928,13 @@ _ORACLE_DICTIONARY_DDL = (
     # The ora_tstz composite is this backend's TIMESTAMP WITH TIME ZONE, not an
     # object type an attribute holds.
     # Nor are the ora_clob / ora_blob domains: they are CLOB and BLOB (#1256).
-    f"CASE WHEN a.attribute_udt_name = '{_TSTZ_TYPE}' THEN 'TIMESTAMP WITH TIME ZONE' "
+    # The zones take Oracle's attribute spellings, and a timestamptz is WITH
+    # LOCAL TIME ZONE here (#1208, #1270).
+    f"CASE WHEN a.attribute_udt_name = '{_TSTZ_TYPE}' THEN 'TIMESTAMP WITH TZ' "
     f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CLOB' "
     f"WHEN a.attribute_udt_name = '{_BLOB_TYPE}' THEN 'BLOB' "
     "WHEN a.data_type = 'USER-DEFINED' THEN ora_name(a.attribute_udt_name) "
+    "WHEN a.data_type = 'timestamp with time zone' THEN 'TIMESTAMP WITH LOCAL TZ' "
     'ELSE ora_type_name(a.data_type) END AS attr_type_name, '
     "CASE WHEN a.data_type = 'USER-DEFINED' AND a.attribute_udt_name NOT IN "
     f"('{_TSTZ_TYPE}', '{_CLOB_TYPE}', '{_BLOB_TYPE}') "
@@ -3194,6 +3197,15 @@ def _to_ltz(value):
     return value.astimezone(_DB_TIME_ZONE).replace(tzinfo=None)
 
 
+def _from_ltz(value):
+    # A bound TIMESTAMP WITH LOCAL TIME ZONE value, naive, is an instant in the
+    # database time zone, as an LtzValue bind is (#1222): made aware so
+    # PostgreSQL does not read it in the session's zone instead (#1270).
+    if not isinstance(value, datetime.datetime) or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=_DB_TIME_ZONE)
+
+
 def _wire_cell(value, type_code: int, tstz_oid: int | None):
     # A fetched cell as the wire encoder wants it: an ora_tstz composite as an
     # aware datetime at its offset (#519), a timestamptz as an LTZ value (#1208).
@@ -4590,11 +4602,13 @@ class PostgresBackend:
             for attr_name, type_name, type_owner, attr_type_oid in self._conn.execute(
                 'SELECT sys.ora_name(a.attribute_name), '
                 f"CASE WHEN a.attribute_udt_name = '{_TSTZ_TYPE}' "
-                "THEN 'TIMESTAMP WITH TIME ZONE' "
+                "THEN 'TIMESTAMP WITH TZ' "
                 f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CLOB' "
                 f"WHEN a.attribute_udt_name = '{_BLOB_TYPE}' THEN 'BLOB' "
                 "WHEN a.data_type = 'USER-DEFINED' "
                 'THEN sys.ora_name(a.attribute_udt_name) '
+                "WHEN a.data_type = 'timestamp with time zone' "
+                "THEN 'TIMESTAMP WITH LOCAL TZ' "
                 'ELSE sys.ora_type_name(a.data_type) END, '
                 "CASE WHEN a.data_type = 'USER-DEFINED' "
                 'AND a.attribute_udt_name NOT IN '
@@ -4694,6 +4708,10 @@ class PostgresBackend:
             {
                 a['name']: _reconstruct_tstz(v)
                 if a['data_type'] == TNS_TYPE_TIMESTAMPTZ and hasattr(v, 'utc')
+                # A LOCAL TIME ZONE attribute goes out as a column of it does:
+                # the instant in the database time zone, naive (#1208, #1270).
+                else _to_ltz(v)
+                if a['data_type'] == TNS_TYPE_TIMESTAMPLTZ
                 else self._nested_value(a, v)
                 for a, v in zip(typ.attrs, value)
             }
@@ -4793,6 +4811,8 @@ class PostgresBackend:
             *(
                 self._tstz_composite(attrs.get(a['name']))
                 if a['data_type'] == TNS_TYPE_TIMESTAMPTZ
+                else _from_ltz(attrs.get(a['name']))
+                if a['data_type'] == TNS_TYPE_TIMESTAMPLTZ
                 else self._nested_bind_value(a, attrs.get(a['name']))
                 for a in typ.attrs
             )

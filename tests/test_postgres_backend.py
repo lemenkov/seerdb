@@ -2666,6 +2666,50 @@ def test_object_and_collection_attributes_nest() -> None:
         backend.close()
 
 
+def test_zoned_timestamp_attributes_take_oracle_names() -> None:
+    # Oracle spells a zoned attribute's type TIMESTAMP WITH [LOCAL] TZ in
+    # ALL_TYPE_ATTRS; a timestamptz is the LOCAL one here, and its value goes
+    # out and comes back as a naive database-zone instant (#1270).
+    import datetime
+
+    from seerdb.common.dbobject import ObjectImage
+    from seerdb.common.tns import encode_object_image
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for stmt in ('DROP TABLE t_zoneattr', 'DROP TYPE t_zoneattr_o'):
+            try:
+                backend.execute(stmt)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute(
+            'CREATE TYPE t_zoneattr_o AS OBJECT (a TIMESTAMP, '
+            'b TIMESTAMP WITH TIME ZONE, c TIMESTAMP WITH LOCAL TIME ZONE)'
+        )
+        backend.execute('CREATE TABLE t_zoneattr (k NUMBER, o t_zoneattr_o)')
+        assert backend.execute(
+            'SELECT attr_type_name FROM all_type_attrs '
+            "WHERE type_name = 'T_ZONEATTR_O' ORDER BY attr_no"
+        ).rows == [('TIMESTAMP',), ('TIMESTAMP WITH TZ',), ('TIMESTAMP WITH LOCAL TZ',)]
+        (oid,) = backend.execute(
+            "SELECT type_oid FROM all_types WHERE type_name = 'T_ZONEATTR_O'"
+        ).rows[0]
+        typ, _info = backend._object_type(_pg_oid_of(bytes(oid)))
+        given = datetime.datetime(2026, 9, 27, 13, 14, 15)
+        obj = typ.newobject({'A': given, 'C': given})
+        image = ObjectImage(
+            bytes(oid), typ.schema, typ.name, None, encode_object_image(obj)
+        )
+        backend.execute('INSERT INTO t_zoneattr VALUES (1, :1)', [image])
+        (got,) = backend.execute('SELECT o FROM t_zoneattr').rows[0]
+        assert (got.A, got.C) == (given, given)
+        for stmt in ('DROP TABLE t_zoneattr', 'DROP TYPE t_zoneattr_o'):
+            backend.execute(stmt)
+        backend.commit()
+    finally:
+        backend.close()
+
+
 def test_dictionary_views_preserve_quoted_identifier_case() -> None:
     # Oracle stores an unquoted identifier upper-case and a quoted one verbatim;
     # PostgreSQL folds unquoted names lower-case. sys.ora_name() reconstructs the
