@@ -1453,8 +1453,6 @@ class AsyncOracleConnect(_ConnectionLogic):
         the type's 16-byte OID + version + ordered attribute layout, cached."""
         if not name:
             return None
-        from seerdb.common.dbobject import DbObjectType, type_name_to_tns
-
         Owner = schema
         if Owner is None:
             Result = await self.execute(_CURRENT_SCHEMA_SQL)
@@ -1466,6 +1464,21 @@ class AsyncOracleConnect(_ConnectionLogic):
         Cached = self._object_type_cache.get(Key)
         if Cached is not None:
             return Cached
+        # Cycle guard for the nested-type recursion below, as in the sync
+        # describe: a type that references itself would recurse forever.
+        if Key in self._object_type_describing:
+            return None
+        self._object_type_describing.add(Key)
+        try:
+            return await self._describe_object_type_uncached(Owner, name, Key)
+        finally:
+            self._object_type_describing.discard(Key)
+
+    async def _describe_object_type_uncached(
+        self, Owner: str, name: str, Key: tuple
+    ) -> 'DbObjectType | None':
+        from seerdb.common.dbobject import DbObjectType, type_name_to_tns
+
         OidRes = await self.execute(
             'SELECT type_oid, typecode FROM all_types '
             'WHERE owner = :1 AND type_name = :2',
@@ -1475,23 +1488,30 @@ class AsyncOracleConnect(_ConnectionLogic):
         Oid = bytes(OidRows[0][0]) if OidRows and OidRows[0][0] else b''
         TypeCode = OidRows[0][1] if OidRows else None
         Result = await self.execute(
-            'SELECT attr_name, attr_type_name, length, precision, scale '
-            'FROM all_type_attrs WHERE owner = :1 AND type_name = :2 '
+            'SELECT attr_name, attr_type_name, attr_type_owner, length, '
+            'precision, scale FROM all_type_attrs '
+            'WHERE owner = :1 AND type_name = :2 '
             'ORDER BY attr_no',
             Bind=[Owner, name],
         )
         Rows = self._rows(Result)
         Attrs = []
         for Row in Rows:
-            TypeName = Row[1]
-            Attrs.append(
-                {
-                    'name': Row[0],
-                    'type_name': TypeName,
-                    'data_type': type_name_to_tns(TypeName),
-                    'charset': None,
-                }
-            )
+            TypeName, TypeOwner = Row[1], Row[2]
+            Attr: dict = {
+                'name': Row[0],
+                'type_name': TypeName,
+                'data_type': type_name_to_tns(TypeName),
+                'charset': None,
+            }
+            if TypeOwner:
+                # A nested object / collection attribute (#1268): embed its own
+                # layout so the image codec can recurse into it, as the sync
+                # describe does.
+                Attr['object_type'] = await self._describe_object_type(
+                    TypeOwner, TypeName
+                )
+            Attrs.append(Attr)
         CollKW = await self._collection_describe(Owner, name, TypeCode)
         Typ = DbObjectType(Owner, name, Oid, 1, Attrs, **CollKW)
         self._object_type_cache[Key] = Typ

@@ -76,6 +76,7 @@ _FV2_UNSUPPORTED = (
     ('collection_of_objects', 'object types are not supported on Oracle 9i'),
     ('lob_attribute', 'object types are not supported on Oracle 9i'),
     ('large_object_image', 'object types are not supported on Oracle 9i'),
+    ('nested_attribute', 'object types are not supported on Oracle 9i'),
     ('changepassword', 'changepassword is not supported on Oracle 9i'),
     ('cache_evicts', 'the cursor cache is a fv4+ feature; 9i re-parses'),
     ('reuses_cursor', 'the cursor cache is a fv4+ feature; 9i re-parses'),
@@ -6374,6 +6375,92 @@ class ObjectCollectionFetchIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class NestedAttributeIntegration(_IntegrationBase):
+    """An object whose attributes are an object and a VARRAY of objects (#1268):
+    fetched, bound and returned whole."""
+
+    SUB = 'PYO_NEST_SUB_T'
+    ARR = 'PYO_NEST_ARR_T'
+    OUTER = 'PYO_NEST_OUTER_T'
+    TABLE = 'PYO_NEST_TAB'
+
+    def setUp(self):
+        super().setUp()
+        self._skip_if_mirror_backend('postgres', 'fetch an object column')
+        self._drop()
+        self.cur.execute(f'CREATE TYPE {self.SUB} AS OBJECT (n NUMBER, s VARCHAR2(20))')
+        self.cur.execute(f'CREATE TYPE {self.ARR} AS VARRAY(5) OF {self.SUB}')
+        self.cur.execute(
+            f'CREATE TYPE {self.OUTER} AS OBJECT '
+            f'(id NUMBER, sub {self.SUB}, subs {self.ARR})'
+        )
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (k NUMBER, o {self.OUTER})')
+
+    def tearDown(self):
+        self._drop()
+        super().tearDown()
+
+    def _drop(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (
+            f'DROP TABLE {self.TABLE}',
+            f'DROP TYPE {self.OUTER}',
+            f'DROP TYPE {self.ARR}',
+            f'DROP TYPE {self.SUB}',
+        ):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass  # best-effort teardown of leftovers
+
+    def _shape(self, o):
+        return (
+            int(o.ID),
+            (int(o.SUB.N), o.SUB.S) if o.SUB is not None else None,
+            [(int(e.N), e.S) for e in o.SUBS.aslist()] if o.SUBS is not None else None,
+        )
+
+    def test_a_nested_attribute_fetches(self):
+        self.cur.execute(
+            f"INSERT INTO {self.TABLE} VALUES (1, {self.OUTER}(1, {self.SUB}(7, 'seven'), "
+            f"{self.ARR}({self.SUB}(1, 'a'), {self.SUB}(2, 'b'))))"
+        )
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (2, {self.OUTER}(2, NULL, NULL))'
+        )
+        self.cur.execute(f'SELECT o FROM {self.TABLE} ORDER BY k')
+        rows = [self._shape(o) for (o,) in self.cur.fetchall()]
+        self.assertEqual(
+            rows, [(1, (7, 'seven'), [(1, 'a'), (2, 'b')]), (2, None, None)]
+        )
+
+    def test_a_nested_attribute_binds_and_returns(self):
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('an object bind needs the 12.1+ OAC')
+        sub = self.conn.gettype(self.SUB)
+        outer = self.conn.gettype(self.OUTER)
+        arr = self.conn.gettype(self.ARR)
+        obj = outer.newobject(
+            {
+                'ID': 3,
+                'SUB': sub.newobject({'N': 9, 'S': 'nine'}),
+                'SUBS': arr.newobject([sub.newobject({'N': 4, 'S': 'd'})]),
+            }
+        )
+        out = self.cur.var(outer)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (3, :1) RETURNING o INTO :2', [obj, out]
+        )
+        (returned,) = out.getvalue()
+        self.assertEqual(self._shape(returned), (3, (9, 'nine'), [(4, 'd')]))
+        self.cur.execute(f'SELECT o FROM {self.TABLE} WHERE k = 3')
+        self.assertEqual(
+            self._shape(self.cur.fetchone()[0]), (3, (9, 'nine'), [(4, 'd')])
+        )
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class RefBindIntegration(_IntegrationBase):
     # REF bind (#139): fetch a REF for a row object, bind it back into an INSERT
     # and into DEREF(?), and confirm it round-trips to the original object. REF
@@ -7348,6 +7435,74 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     (Value,) = await Cur.fetchone()
                     self.assertEqual(Value.V, 'y' * 300)
                     self.assertEqual(await Value.C.aread(), 'z')
+                finally:
+                    for Stmt in Drops:
+                        try:
+                            await Cur.execute(Stmt)
+                        except seerdb.DatabaseError:
+                            pass  # a CREATE above failed, so nothing to drop
+
+    async def test_a_nested_attribute_fetches_and_binds(self):
+        # Async twin of NestedAttributeIntegration's: the async describe left
+        # an attribute's own type out, so it came back as raw bytes (#1268).
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest("the Mirror's postgres backend cannot fetch an object column")
+        Sub, Arr, Outer, Table = (
+            'PYO_ANEST_SUB_T',
+            'PYO_ANEST_ARR_T',
+            'PYO_ANEST_OUTER_T',
+            'PYO_ANEST_TAB',
+        )
+        Drops = (
+            f'DROP TABLE {Table}',
+            f'DROP TYPE {Outer}',
+            f'DROP TYPE {Arr}',
+            f'DROP TYPE {Sub}',
+        )
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                for Stmt in Drops:
+                    try:
+                        await Cur.execute(Stmt)
+                    except seerdb.DatabaseError:
+                        pass  # no leftover from a prior run
+                try:
+                    await Cur.execute(
+                        f'CREATE TYPE {Sub} AS OBJECT (n NUMBER, s VARCHAR2(20))'
+                    )
+                    await Cur.execute(f'CREATE TYPE {Arr} AS VARRAY(5) OF {Sub}')
+                    await Cur.execute(
+                        f'CREATE TYPE {Outer} AS OBJECT (id NUMBER, sub {Sub}, subs {Arr})'
+                    )
+                    await Cur.execute(f'CREATE TABLE {Table} (k NUMBER, o {Outer})')
+                    await Cur.execute(
+                        f"INSERT INTO {Table} VALUES (1, {Outer}(1, {Sub}(7, 'seven'), "
+                        f"{Arr}({Sub}(1, 'a'))))"
+                    )
+                    await Cur.execute(f'SELECT o FROM {Table}')
+                    (O,) = await Cur.fetchone()
+                    self.assertEqual(
+                        (O.SUB.S, [E.S for E in O.SUBS.aslist()]), ('seven', ['a'])
+                    )
+                    if Conn.field_version >= FIELD_VERSION_12_1:
+                        SubT = await Conn.gettype(Sub)
+                        ArrT = await Conn.gettype(Arr)
+                        OuterT = await Conn.gettype(Outer)
+                        Obj = OuterT.newobject(
+                            {
+                                'ID': 2,
+                                'SUB': SubT.newobject({'N': 9, 'S': 'nine'}),
+                                'SUBS': ArrT.newobject(
+                                    [SubT.newobject({'N': 4, 'S': 'd'})]
+                                ),
+                            }
+                        )
+                        await Cur.execute(f'INSERT INTO {Table} VALUES (2, :1)', [Obj])
+                        await Cur.execute(f'SELECT o FROM {Table} WHERE k = 2')
+                        (O,) = await Cur.fetchone()
+                        self.assertEqual(
+                            (O.SUB.S, [E.S for E in O.SUBS.aslist()]), ('nine', ['d'])
+                        )
                 finally:
                     for Stmt in Drops:
                         try:
