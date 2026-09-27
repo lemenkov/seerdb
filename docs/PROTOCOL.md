@@ -5571,6 +5571,22 @@ This framing needs no attribute layout, so seerdb reads it into an
 `ObjectImage` placeholder during row decode (keeping the stream in sync) and
 resolves it after the fetch.
 
+**The chunked form follows the field version (#1261).** An image longer than
+252 bytes is `0xFE` followed by chunks and a zero-length terminator, and each
+chunk's length has the width every other chunked value uses (§6.4, LONG): **one
+byte before 12.1, a `ub4` from 12.1**. A live 11g sends a 312-byte image as
+`fe ff <255 bytes> 39 <57 bytes> 00`. Reading those lengths as `ub4`s on 10g /
+11g lost the chunk boundaries: a 300-character attribute decoded as one
+character, silently, and an object with three LOB locators (322 bytes) desynced
+the row (`no decoder for response token …`). The same width rule applies to
+every `bytes_with_length` a Mirror writes (a long error message, say). Token
+auth is the exception: it exists only on 12.2+ servers, so its long values
+always go out in the `ub4` form, whatever the login has negotiated so far. The
+login-phase AUTH and change-password messages carry long values too (an
+encrypted 1500-character password), and are encoded at the session's negotiated
+version. They had taken whatever an earlier execute left, and a 10g / 11g
+server answered `ORA-03120` (#1090).
+
 ### 21.3 The packed image
 
 The image is the attributes serialised length-prefixed in declaration order
@@ -6007,8 +6023,9 @@ Captured with the reference thin client against a live 23ai, for a type
 - **NCLOB.** It shares CLOB's wire type. The national form comes from the
   attribute's type name, and a temp NCLOB is created with charset form 2.
 
-On 10g and 11g, an object with **three** LOB attributes breaks the fetch (#1261,
-open). Two work.
+On 10g and 11g, an object with three LOB attributes once broke the fetch. Its
+image passed 252 bytes and went chunked, with one-byte chunk lengths (§21.2,
+#1261).
 
 ## 22. DML RETURNING ... INTO (#120)
 

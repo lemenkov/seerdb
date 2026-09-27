@@ -75,6 +75,7 @@ _FV2_UNSUPPORTED = (
     ('ref_bind', 'REF / object types are not supported on Oracle 9i'),
     ('collection_of_objects', 'object types are not supported on Oracle 9i'),
     ('lob_attribute', 'object types are not supported on Oracle 9i'),
+    ('large_object_image', 'object types are not supported on Oracle 9i'),
     ('changepassword', 'changepassword is not supported on Oracle 9i'),
     ('cache_evicts', 'the cursor cache is a fv4+ feature; 9i re-parses'),
     ('reuses_cursor', 'the cursor cache is a fv4+ feature; 9i re-parses'),
@@ -5207,11 +5208,14 @@ class ChangePasswordIntegration(_ThrottleRetry, unittest.TestCase):
         # protocol route; through the Mirror the change used to go out as ALTER
         # USER ... REPLACE, which the server rejects as ORA-28218 instead (#1089).
         # Both calls fail, so the password never changes.
+        # Before 12.1 the long values went out with ub4 chunk lengths, which the
+        # server read as ORA-03120 (#1090, #1261).
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest(
+                "the Mirror's postgres backend cannot reject an over-long new "
+                'password yet (#1266)'
+            )
         with seerdb.connect(**self._kwargs(_PASSWORD)) as conn:
-            if conn.field_version < FIELD_VERSION_12_1:
-                self.skipTest(
-                    'a very long new password gets ORA-03120 before 12c (#1090)'
-                )
             for old in (_PASSWORD, 'incorrect old password'):
                 with self.assertRaises(seerdb.DatabaseError) as caught:
                     conn.changepassword(old, '1' * 1500)
@@ -6160,12 +6164,69 @@ class ObjectReturningIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class LargeObjectImageIntegration(_IntegrationBase):
+    """An object image past 252 bytes rides chunked, with one length byte per
+    chunk before 12.1 and a ub4 one from 12.1 (#1261). Read the 12.1 way on
+    10g / 11g, a 300-character attribute came back one character long, and an
+    object with three LOB locators desynced the row."""
+
+    TEXT_TYPE = 'PYO_BIGIMG_V_T'
+    LOB_TYPE = 'PYO_BIGIMG_L_T'
+    TABLE = 'PYO_BIGIMG_TAB'
+
+    def setUp(self):
+        super().setUp()
+        self._skip_if_mirror_backend('postgres', 'fetch an object column')
+        self._drop()
+        self.cur.execute(f'CREATE TYPE {self.TEXT_TYPE} AS OBJECT (v VARCHAR2(400))')
+        self.cur.execute(
+            f'CREATE TYPE {self.LOB_TYPE} AS OBJECT (a CLOB, b CLOB, c BLOB)'
+        )
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (t {self.TEXT_TYPE}, l {self.LOB_TYPE})'
+        )
+        self.cur.execute(
+            f"INSERT INTO {self.TABLE} VALUES ({self.TEXT_TYPE}(RPAD('x', 300, 'x')), "
+            f"{self.LOB_TYPE}('first', 'second', HEXTORAW('0A0B')))"
+        )
+
+    def tearDown(self):
+        self._drop()
+        super().tearDown()
+
+    def _drop(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (
+            f'DROP TABLE {self.TABLE}',
+            f'DROP TYPE {self.LOB_TYPE}',
+            f'DROP TYPE {self.TEXT_TYPE}',
+        ):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass  # best-effort teardown of leftovers
+
+    def test_a_large_object_image_fetches_whole(self):
+        self.cur.execute(f'SELECT t FROM {self.TABLE}')
+        (value,) = self.cur.fetchone()
+        self.assertEqual(value.V, 'x' * 300)
+
+    def test_a_large_object_image_with_three_lobs_fetches(self):
+        self.cur.execute(f'SELECT l, 42 FROM {self.TABLE}')
+        (value, after) = self.cur.fetchone()
+        self.assertEqual(
+            (value.A.read(), value.B.read(), value.C.read(), after),
+            ('first', 'second', b'\n\x0b', 42),
+        )
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class ObjectLobAttributeIntegration(_IntegrationBase):
     """CLOB / NCLOB / BLOB attributes of an object type (#1260): fetched, each is
     a LOB on the connection; bound, it takes a LOB -- fetched or temporary -- or a
     str / bytes, which goes out as a temporary LOB, as the reference client does."""
 
-    # Two LOB attributes per type: three break a 10g / 11g fetch (#1261).
     TYPE = 'PYO_LOBATTR_T'
     NTYPE = 'PYO_LOBATTR_N_T'
     LIST = 'PYO_LOBATTR_LIST_T'
@@ -7261,6 +7322,38 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await Cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = {Own}')
         finally:
             await Conn.close()
+
+    async def test_a_large_object_image_fetches_whole(self):
+        # Async twin of LargeObjectImageIntegration's (#1261).
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest("the Mirror's postgres backend cannot fetch an object column")
+        Typ, Table = 'PYO_ABIGIMG_T', 'PYO_ABIGIMG_TAB'
+        Drops = (f'DROP TABLE {Table}', f'DROP TYPE {Typ}')
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                for Stmt in Drops:
+                    try:
+                        await Cur.execute(Stmt)
+                    except seerdb.DatabaseError:
+                        pass  # no leftover from a prior run
+                try:
+                    await Cur.execute(
+                        f'CREATE TYPE {Typ} AS OBJECT (v VARCHAR2(400), c CLOB)'
+                    )
+                    await Cur.execute(f'CREATE TABLE {Table} (o {Typ})')
+                    await Cur.execute(
+                        f"INSERT INTO {Table} VALUES ({Typ}(RPAD('y', 300, 'y'), 'z'))"
+                    )
+                    await Cur.execute(f'SELECT o FROM {Table}')
+                    (Value,) = await Cur.fetchone()
+                    self.assertEqual(Value.V, 'y' * 300)
+                    self.assertEqual(await Value.C.aread(), 'z')
+                finally:
+                    for Stmt in Drops:
+                        try:
+                            await Cur.execute(Stmt)
+                        except seerdb.DatabaseError:
+                            pass  # a CREATE above failed, so nothing to drop
 
     async def test_a_lob_attribute_fetches_and_binds(self):
         # Async twin of ObjectLobAttributeIntegration's fetch and str bind (#1260).

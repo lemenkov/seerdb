@@ -872,16 +872,27 @@ def decode_token_bvc(Data: bytes, Acc: tuple) -> tuple:
     return decode_packet(Rest, NewAcc)
 
 
+def _chunk_length(Data: bytes) -> tuple[int, bytes]:
+    # One chunk's length in a chunked (0xFE) value: a ub4 from 12.1, a single
+    # byte before -- the rule _read_long_column and the UROWID reader follow.
+    # Read as a ub4 on 10g / 11g, an object image past 252 bytes lost its
+    # chunk boundaries: a 300-character attribute came back one character
+    # long, and three LOB locators desynced the row (#1261).
+    if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
+        return decode_ub4(Data)
+    return (Data[0], Data[1:])
+
+
 def _skip_chunked_bytes(Data: bytes) -> bytes:
     # Mirrors oracledb's skip_bytes: 1-byte length, then either that many raw
     # bytes (length < 254), nothing (length == 255 NULL marker), or a chunked
-    # sequence of ub4-prefixed segments terminated by a zero-length segment
+    # sequence of length-prefixed segments terminated by a zero-length segment
     # (length == 254 LONG marker).
     Length = Data[0]
     if Length == TNS_LONG_LENGTH_INDICATOR:
         Rest = Data[1:]
         while True:
-            (ChunkLen, Rest) = decode_ub4(Rest)
+            (ChunkLen, Rest) = _chunk_length(Rest)
             if ChunkLen == 0:
                 return Rest
             Rest = Rest[ChunkLen:]
@@ -894,13 +905,14 @@ def _skip_chunked_bytes(Data: bytes) -> bytes:
 def _read_chunked_bytes(Data: bytes) -> tuple[bytes, bytes]:
     # The value form _skip_chunked_bytes skips, but returning the bytes: a
     # 1-byte length then that many raw bytes (length < 254), nothing (255 NULL),
-    # or a chunked ub4-prefixed sequence terminated by a zero-length chunk (254).
+    # or a chunked length-prefixed sequence terminated by a zero-length chunk
+    # (254).
     Length = Data[0]
     if Length == TNS_LONG_LENGTH_INDICATOR:
         Rest = Data[1:]
         Out = b''
         while True:
-            (ChunkLen, Rest) = decode_ub4(Rest)
+            (ChunkLen, Rest) = _chunk_length(Rest)
             if ChunkLen == 0:
                 return (Out, Rest)
             Out += bytes(Rest[:ChunkLen])
@@ -921,14 +933,18 @@ def _skip_bytes_with_length(Data: bytes) -> bytes:
 def _bytes_with_length(Data: bytes) -> bytes:
     # Inverse of `_skip_chunked_bytes` (oracledb write_bytes_with_length): a
     # 1-byte length + data for short values (<= 252 bytes), or the 254 LONG
-    # marker followed by ub4-prefixed chunks terminated by a zero-length chunk.
+    # marker followed by length-prefixed chunks terminated by a zero-length
+    # chunk -- a ub4 length from 12.1, a single byte before, as an 11g server
+    # writes them and as _chunk_length reads them (#1261).
     if len(Data) <= TNS_MAX_SHORT_LENGTH:
         return bytes([len(Data)]) + Data
+    wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+    encode_len = encode_sb4 if wide else (lambda n: bytes([n]))
     Out = bytearray([TNS_LONG_LENGTH_INDICATOR])
     for I in range(0, len(Data), 0x40):
         Chunk = Data[I : I + 0x40]
-        Out += encode_sb4(len(Chunk)) + Chunk
-    Out += encode_sb4(0)
+        Out += encode_len(len(Chunk)) + Chunk
+    Out += encode_len(0)
     return bytes(Out)
 
 
@@ -5476,7 +5492,18 @@ def encode_dictionary(Dictionary: dict) -> bytes:
 ##
 
 
+def _encode_at_negotiated_version(Dictionary: dict) -> None:
+    # A login-phase message carries long values (an encrypted password, a
+    # verifier) in the chunked form, whose chunk width follows the field version
+    # (#1261). Nothing on this path had set it: the width came from whatever an
+    # earlier execute left, or the default. These go out after the protocol
+    # negotiation, so the session's own version is the one to encode at.
+    if Dictionary.get('field_version'):
+        _ENCODE_FIELD_VERSION.set(Dictionary['field_version'])
+
+
 def encode_dictionary_auth(Dictionary: dict) -> tuple[bytes, bytes]:
+    _encode_at_negotiated_version(Dictionary)
     Tseq = Dictionary['seq']
     Sess = Dictionary['auth']['sess']
     Salt = Dictionary['auth']['salt']
@@ -5621,12 +5648,21 @@ def encode_dictionary_token_auth(Dictionary: dict) -> bytes:
     # NoNewPass (0x1) only — no UserAndPass (0x100), since there is no password.
     Mode = encode_sb4((Role * 32) | (Prelim * 128) | 1)
 
-    Pairs = [encode_kv(b'AUTH_TOKEN', Dictionary['token'].encode('utf-8'))]
-    Header = Dictionary.get('token_header')
-    Signature = Dictionary.get('token_signature')
-    if Header is not None and Signature is not None:
-        Pairs.append(encode_kv(b'AUTH_HEADER', Header.encode('utf-8')))
-        Pairs.append(encode_kv(b'AUTH_SIGNATURE', Signature.encode('utf-8')))
+    # Token auth is a 12.2+ feature: its long values (an RSA signature, a real
+    # JWT) go out in the ub4-chunked form, whatever version login has reached --
+    # the form the server side decodes them in (#1261).
+    Token = _ENCODE_FIELD_VERSION.set(
+        max(_ENCODE_FIELD_VERSION.get(), FIELD_VERSION_12_2)
+    )
+    try:
+        Pairs = [encode_kv(b'AUTH_TOKEN', Dictionary['token'].encode('utf-8'))]
+        Header = Dictionary.get('token_header')
+        Signature = Dictionary.get('token_signature')
+        if Header is not None and Signature is not None:
+            Pairs.append(encode_kv(b'AUTH_HEADER', Header.encode('utf-8')))
+            Pairs.append(encode_kv(b'AUTH_SIGNATURE', Signature.encode('utf-8')))
+    finally:
+        _ENCODE_FIELD_VERSION.reset(Token)
     SessionKvs = _auth_session_kvs(Dictionary)  # charset .. connect-string
     NumPairs = len(Pairs) + _auth_session_kv_count(Dictionary)
 
@@ -5735,6 +5771,7 @@ def encode_dictionary_chgpwd(Dictionary: dict) -> bytes:
     #   - exactly two key/value pairs: AUTH_PASSWORD (current) and
     #     AUTH_NEWPASSWORD (new), both AES-CBC-encrypted with the login ConnKey;
     #   - no AUTH_SESSKEY / AUTH_PBKDF2_SPEEDY_KEY (the session already exists).
+    _encode_at_negotiated_version(Dictionary)
     Tseq = Dictionary['seq']
     User = Dictionary['env']['user'].encode('utf-8')
     ConnKey = Dictionary['auth']['conn_key']
