@@ -65,13 +65,13 @@ edge of this adapter:
   composite's own ``pg_type`` oid, zero-padded to Oracle's 16 bytes. An object
   binds, returns (``RETURNING o INTO :b``) and fetches, ``CLOB`` / ``BLOB``
   attributes included (an ``NCLOB`` one is stored and reported as ``CLOB``, as an
-  ``NCLOB`` column is). Not yet: binding an
-  attribute that is itself an object or a collection (refused, not guessed), and
-  type methods. A VARRAY or nested table is a domain over an array, listed in
-  ``all_types`` and ``all_coll_types``. A column of one fetches as the collection;
-  PostgreSQL describes a domain value by its base type, so a computed one, such
-  as a constructor call in a select list, has no type to trace and is refused,
-  and so is a collection of collections. The block python-oracledb runs to learn a type,
+  ``NCLOB`` column is), and attributes that are themselves objects or
+  collections. Not yet: type methods. A VARRAY or nested table is a domain over
+  an array, listed in ``all_types`` and ``all_coll_types``. A column of one
+  fetches as the collection; PostgreSQL describes a domain value by its base
+  type, so a computed one, such as a constructor call in a select list, has no
+  type to trace and is refused, and so is a collection of collections. The block
+  python-oracledb runs to learn a type,
   ``DBMS_PICKLER.GET_TYPE_SHAPE``, is answered from the catalog with the TDS and
   attribute cursor 23ai sends; an attribute is reported as the DDL translation
   stored it, so ``RAW`` reads as ``BLOB``, ``NVARCHAR2`` / ``NCHAR`` / ``NCLOB``
@@ -3515,6 +3515,9 @@ class PostgresBackend:
         # and the declared type of each (relid, attnum) an array column traces
         # back to -- PostgreSQL describes a domain column by its base type.
         self._collection_types: dict[int, DbObjectType | None] = {}
+        # The attribute types being described, so a type that reached itself
+        # would be refused rather than recursed into (#1265).
+        self._describing: set[int] = set()
         self._array_oids: dict[int, bool] = {}
         self._column_types: dict[tuple[int, int], int] = {}
         # Pipeline mode ships a statement's SAVEPOINT / statement / RELEASE in one
@@ -4584,7 +4587,7 @@ class PostgresBackend:
             # information_schema is PostgreSQL's own, never replaced at connect,
             # so reading it holds nothing a new session waits on. The mapping is
             # the one all_type_attrs applies.
-            for attr_name, type_name, type_owner in self._conn.execute(
+            for attr_name, type_name, type_owner, attr_type_oid in self._conn.execute(
                 'SELECT sys.ora_name(a.attribute_name), '
                 f"CASE WHEN a.attribute_udt_name = '{_TSTZ_TYPE}' "
                 "THEN 'TIMESTAMP WITH TIME ZONE' "
@@ -4596,25 +4599,27 @@ class PostgresBackend:
                 "CASE WHEN a.data_type = 'USER-DEFINED' "
                 'AND a.attribute_udt_name NOT IN '
                 f"('{_TSTZ_TYPE}', '{_CLOB_TYPE}', '{_BLOB_TYPE}') "
-                'THEN sys.ora_owner(a.attribute_udt_schema) END '
+                'THEN sys.ora_owner(a.attribute_udt_schema) END, '
+                "format('%%I.%%I', a.attribute_udt_schema, a.attribute_udt_name)"
+                '::regtype::oid '
                 'FROM information_schema.attributes a '
                 'WHERE a.udt_schema = %s AND a.udt_name = %s '
                 'ORDER BY a.ordinal_position',
                 (pg_schema, pg_name),
             ):
+                attr = {
+                    'name': attr_name,
+                    'type_name': type_name,
+                    'data_type': type_name_to_tns(type_name),
+                    'charset': None,
+                }
                 if type_owner is not None:
-                    raise UnsupportedFeature(
-                        f'object type {owner}.{name}: attribute {attr_name} is '
-                        f'itself an object type ({type_name}), not supported yet'
+                    # An object or collection attribute carries its own type, as
+                    # a client's describe embeds it, for the image walkers (#1265).
+                    attr['object_type'] = self._nested_type(
+                        attr_type_oid, f'{owner}.{name}', attr_name, type_name
                     )
-                attrs.append(
-                    {
-                        'name': attr_name,
-                        'type_name': type_name,
-                        'data_type': type_name_to_tns(type_name),
-                        'charset': None,
-                    }
-                )
+                attrs.append(attr)
             regtype = self._conn.execute(
                 'SELECT %s::oid::regtype::text', (pg_oid,)
             ).fetchone()
@@ -4624,6 +4629,51 @@ class PostgresBackend:
                 entry = (DbObjectType(owner, name, oid, 1, attrs), info)
         self._object_types[pg_oid] = entry
         return entry
+
+    def _nested_type(
+        self, pg_oid: int, outer: str, attr_name: str, type_name: str
+    ) -> DbObjectType:
+        # The type of an attribute that is itself an object or a collection
+        # (#1265). PostgreSQL refuses a composite that contains itself; the
+        # guard is there should a domain ever let one through.
+        if pg_oid in self._describing:
+            raise UnsupportedFeature(
+                f'object type {outer}: attribute {attr_name} refers back to it'
+            )
+        self._describing.add(pg_oid)
+        try:
+            kind = self._type_kind(pg_oid)
+            if kind is not None and kind[0] == 'object':
+                entry = self._object_type(pg_oid)
+                if entry is not None:
+                    return entry[0]
+            if kind is not None and kind[0] == 'collection':
+                coll = self._collection_type(pg_oid)
+                if coll is not None:
+                    return coll
+        finally:
+            self._describing.discard(pg_oid)
+        raise UnsupportedFeature(
+            f'object type {outer}: attribute {attr_name} is of type {type_name}, '
+            'which is neither an object nor a collection type'
+        )
+
+    def _nested_value(self, attr: dict, value: object) -> object:
+        # A fetched object or collection attribute as its DbObject (#1265); any
+        # other attribute passes through.
+        nested = attr.get('object_type')
+        if nested is None or value is None:
+            return value
+        pg_oid = _pg_oid_of(nested.oid) or 0
+        if nested.is_collection:
+            base = self._conn.execute(
+                'SELECT typbasetype FROM pg_type WHERE oid = %s', (pg_oid,)
+            ).fetchone()
+            return self._db_collection(nested, value, base[0] if base else 0)
+        entry = self._object_type(pg_oid)
+        if entry is None:
+            raise UnsupportedFeature(f'object type {nested.name}: not found')
+        return self._db_object(entry[0], entry[1], value)
 
     def _db_object(
         self, typ: DbObjectType, info: CompositeInfo, value: object
@@ -4644,7 +4694,7 @@ class PostgresBackend:
             {
                 a['name']: _reconstruct_tstz(v)
                 if a['data_type'] == TNS_TYPE_TIMESTAMPTZ and hasattr(v, 'utc')
-                else v
+                else self._nested_value(a, v)
                 for a, v in zip(typ.attrs, value)
             }
         )
@@ -4705,6 +4755,12 @@ class PostgresBackend:
         values = _served_lobs(
             typ.newobject(decode_collection_image(image.image, element)), image
         ).aslist()
+        return self._collection_values(typ, values)
+
+    def _collection_values(self, typ: DbObjectType, values: list) -> list:
+        # A collection's elements as the array its domain is over: an object
+        # element as its composite, a NUMBER list all one Python type.
+        element = typ.element or {}
         nested = element.get('object_type')
         if nested is None:
             # A NUMBER decodes as an int when it is whole and a Decimal when not,
@@ -4737,10 +4793,24 @@ class PostgresBackend:
             *(
                 self._tstz_composite(attrs.get(a['name']))
                 if a['data_type'] == TNS_TYPE_TIMESTAMPTZ
-                else attrs.get(a['name'])
+                else self._nested_bind_value(a, attrs.get(a['name']))
                 for a in typ.attrs
             )
         )
+
+    def _nested_bind_value(self, attr: dict, value: object) -> object:
+        # A bound object or collection attribute (#1265), already decoded into a
+        # DbObject, as the composite or array PostgreSQL stores; any other
+        # attribute passes through.
+        nested = attr.get('object_type')
+        if nested is None or not isinstance(value, DbObject):
+            return value
+        if nested.is_collection:
+            return self._collection_values(nested, value.aslist())
+        entry = self._object_type(_pg_oid_of(nested.oid) or 0)
+        if entry is None:
+            raise UnsupportedFeature(f'object type {nested.name}: not found')
+        return self._composite_value(entry, value.asdict())
 
     def _tstz_composite(self, value: object) -> object:
         # An aware datetime as the ora_tstz composite a TIMESTAMP WITH TIME ZONE

@@ -6556,7 +6556,6 @@ class NestedAttributeIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        self._skip_if_mirror_backend('postgres', 'fetch an object column')
         self._drop()
         self.cur.execute(f'CREATE TYPE {self.SUB} AS OBJECT (n NUMBER, s VARCHAR2(20))')
         self.cur.execute(f'CREATE TYPE {self.ARR} AS VARRAY(5) OF {self.SUB}')
@@ -7804,8 +7803,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
     async def test_a_nested_attribute_fetches_and_binds(self):
         # Async twin of NestedAttributeIntegration's: the async describe left
         # an attribute's own type out, so it came back as raw bytes (#1268).
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest("the Mirror's postgres backend cannot fetch an object column")
         Sub, Arr, Outer, Table = (
             'PYO_ANEST_SUB_T',
             'PYO_ANEST_ARR_T',

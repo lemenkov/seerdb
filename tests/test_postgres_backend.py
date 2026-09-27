@@ -2615,6 +2615,57 @@ def test_lob_attributes_are_clob_and_blob() -> None:
         backend.close()
 
 
+def test_object_and_collection_attributes_nest() -> None:
+    # An object whose attributes are an object and a VARRAY of objects: the
+    # describe embeds both types, a fetch builds the nested DbObjects, and a
+    # bound image goes back into the nested composite and array (#1265).
+    from seerdb.common.dbobject import ObjectImage
+    from seerdb.common.tns import encode_object_image
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    drops = (
+        'DROP TABLE t_nest',
+        'DROP TYPE t_nest_outer',
+        'DROP TYPE t_nest_arr',
+        'DROP TYPE t_nest_sub',
+    )
+    try:
+        for stmt in drops:
+            try:
+                backend.execute(stmt)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute('CREATE TYPE t_nest_sub AS OBJECT (n NUMBER, s VARCHAR2(9))')
+        backend.execute('CREATE TYPE t_nest_arr AS VARRAY(3) OF t_nest_sub')
+        backend.execute(
+            'CREATE TYPE t_nest_outer AS OBJECT (id NUMBER, sub t_nest_sub, subs t_nest_arr)'
+        )
+        backend.execute('CREATE TABLE t_nest (k NUMBER, o t_nest_outer)')
+        backend.execute(
+            "INSERT INTO t_nest VALUES (1, t_nest_outer(1, t_nest_sub(7, 'seven'), "
+            "t_nest_arr(t_nest_sub(1, 'a'))))"
+        )
+        (o,) = backend.execute('SELECT o FROM t_nest').rows[0]
+        typ = o._dbtype
+        assert [a['object_type'].name for a in typ.attrs[1:]] == [
+            'T_NEST_SUB',
+            'T_NEST_ARR',
+        ]
+        assert (o.SUB.N, o.SUB.S) == (7, 'seven')
+        assert [(e.N, e.S) for e in o.SUBS.aslist()] == [(1, 'a')]
+        o.ID = 2
+        o.SUB.S = 'changed'
+        image = ObjectImage(typ.oid, typ.schema, typ.name, None, encode_object_image(o))
+        backend.execute('INSERT INTO t_nest VALUES (2, :1)', [image])
+        (got,) = backend.execute('SELECT o FROM t_nest WHERE k = 2').rows[0]
+        assert (got.SUB.S, [e.S for e in got.SUBS.aslist()]) == ('changed', ['a'])
+        for stmt in drops:
+            backend.execute(stmt)
+        backend.commit()
+    finally:
+        backend.close()
+
+
 def test_dictionary_views_preserve_quoted_identifier_case() -> None:
     # Oracle stores an unquoted identifier upper-case and a quoted one verbatim;
     # PostgreSQL folds unquoted names lower-case. sys.ora_name() reconstructs the
