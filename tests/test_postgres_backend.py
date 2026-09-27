@@ -490,6 +490,7 @@ def _type_ddl(sql: str) -> str:
     translated = re.sub(
         r'DO \$\$ DECLARE f regprocedure;.*?END \$\$; ', '', _translate_ddl(sql)
     )
+    translated = translated.split('; DO $$ DECLARE t regtype')[0]
     return translated.split('; CREATE OR REPLACE FUNCTION')[0]
 
 
@@ -506,6 +507,11 @@ def test_a_collection_type_comes_with_its_constructors() -> None:
     dropped = _translate_ddl('DROP TYPE s.a')
     assert dropped.startswith('DO $$') and dropped.endswith('; DROP TYPE s.a')
     assert "to_regtype('s.a')" in dropped
+    # An object type's constructor is built from the catalog once the type
+    # exists, one argument per attribute.
+    obj = _translate_ddl('CREATE TYPE s.o AS OBJECT (a NUMBER, b VARCHAR2(5));')
+    assert obj.startswith('CREATE TYPE s.o AS (a numeric, b varchar(5)); DO $$')
+    assert "to_regtype('s.o')" in obj and 'SELECT ROW(%s)::%s' in obj
     replaced = _translate_ddl('CREATE OR REPLACE TYPE s.a AS VARRAY(3) OF NUMBER')
     assert replaced.startswith('DO $$') and '; DROP TYPE IF EXISTS s.a; ' in replaced
 
