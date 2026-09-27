@@ -2504,6 +2504,62 @@ def test_a_collection_column_fetches_as_a_collection() -> None:
         backend.close()
 
 
+def test_a_collection_bind_is_bound_as_its_array() -> None:
+    # A collection image whose OID names an array domain is decoded against the
+    # element type and bound as the array; object elements as composites (#1206).
+    from seerdb.common.dbobject import ObjectImage
+    from seerdb.common.tns import encode_object_image
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    drops = (
+        'DROP TABLE t_collbind',
+        'DROP TYPE t_collbind_nt',
+        'DROP TYPE t_collbind_va',
+        'DROP TYPE t_collbind_o',
+    )
+    try:
+        for stmt in drops:
+            try:
+                backend.execute(stmt)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute(
+            'CREATE TYPE t_collbind_o AS OBJECT (id NUMBER, name VARCHAR2(9))'
+        )
+        backend.execute('CREATE TYPE t_collbind_va AS VARRAY(3) OF NUMBER')
+        backend.execute('CREATE TYPE t_collbind_nt AS TABLE OF t_collbind_o')
+        backend.execute(
+            'CREATE TABLE t_collbind (id NUMBER, v t_collbind_va, w t_collbind_nt)'
+        )
+        oids = dict(
+            backend.execute(
+                'SELECT type_name, type_oid FROM all_types '
+                "WHERE type_name LIKE 'T_COLLBIND%'"
+            ).rows
+        )
+        va = backend._collection_type(_pg_oid_of(bytes(oids['T_COLLBIND_VA'])))
+        nt = backend._collection_type(_pg_oid_of(bytes(oids['T_COLLBIND_NT'])))
+        elem = nt.element['object_type']
+        images = [
+            ObjectImage(
+                bytes(oids[t.name]), t.schema, t.name, None, encode_object_image(v)
+            )
+            for t, v in (
+                (va, va.newobject([5, Decimal('10.5')])),
+                (nt, nt.newobject([elem.newobject({'ID': 1, 'NAME': 'a'})])),
+            )
+        ]
+        backend.execute('INSERT INTO t_collbind VALUES (1, :1, :2)', images)
+        (v, w) = backend.execute('SELECT v, w FROM t_collbind').rows[0]
+        assert v.aslist() == [5, Decimal('10.5')]
+        assert [(e.ID, e.NAME) for e in w.aslist()] == [(1, 'a')]
+        for stmt in drops:
+            backend.execute(stmt)
+        backend.commit()
+    finally:
+        backend.close()
+
+
 def test_dictionary_views_preserve_quoted_identifier_case() -> None:
     # Oracle stores an unquoted identifier upper-case and a quoted one verbatim;
     # PostgreSQL folds unquoted names lower-case. sys.ora_name() reconstructs the

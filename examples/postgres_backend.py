@@ -113,6 +113,7 @@ edge of this adapter:
 from __future__ import annotations
 
 import datetime
+import decimal
 import hashlib
 import re
 import struct
@@ -132,6 +133,7 @@ from seerdb.common.dbobject import (
     DbObjectType,
     DbRef,
     ObjectImage,
+    decode_collection_image,
     decode_object_image,
     type_name_to_tns,
 )
@@ -4636,16 +4638,51 @@ class PostgresBackend:
         if len(oid) >= 20:
             oid = oid[4:20]
         pg_oid = _pg_oid_of(oid)
+        coll = self._collection_type(pg_oid) if pg_oid is not None else None
+        if coll is not None:
+            return self._collection_bind_value(coll, image.image)
         entry = self._object_type(pg_oid) if pg_oid is not None else None
         if entry is None:
             raise UnsupportedFeature(
                 f'object bind: no object type has the OID {oid.hex()}'
             )
+        return self._composite_value(
+            entry, dict(decode_object_image(image.image, entry[0].attrs))
+        )
+
+    def _collection_bind_value(self, typ: DbObjectType, image: bytes) -> list:
+        # A VARRAY / nested-table bind (#1206): the image's elements, bound as the
+        # array the domain is over; an object element as its composite.
+        element = typ.element or {}
+        values = decode_collection_image(image, element)
+        nested = element.get('object_type')
+        if nested is None:
+            # A NUMBER decodes as an int when it is whole and a Decimal when not,
+            # and psycopg binds no list that mixes the two.
+            if any(isinstance(v, decimal.Decimal) for v in values):
+                values = [
+                    decimal.Decimal(v)
+                    if isinstance(v, int) and not isinstance(v, bool)
+                    else v
+                    for v in values
+                ]
+            return values
+        entry = self._object_type(_pg_oid_of(nested.oid) or 0)
+        if entry is None:
+            raise UnsupportedFeature(f'collection type {typ.name}: no element type')
+        return [
+            None if v is None else self._composite_value(entry, v.asdict())
+            for v in values
+        ]
+
+    def _composite_value(
+        self, entry: tuple[DbObjectType, CompositeInfo], attrs: dict
+    ) -> object:
+        # An object's attribute values as the registered composite psycopg binds.
         typ, info = entry
         factory = info.python_type  # set by register_composite
         if factory is None:
             raise UnsupportedFeature(f'object type {typ.name}: not registered')
-        attrs = dict(decode_object_image(image.image, typ.attrs))
         return factory(
             *(
                 self._tstz_composite(attrs.get(a['name']))

@@ -6751,6 +6751,37 @@ class CollectionTypeIntegration(_IntegrationBase):
         )
         self.assertEqual((v2.aslist(), w2), ([], None))
 
+    def test_a_collection_value_binds(self):
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('an object bind needs the 12.1+ OAC')
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (id NUMBER, v {self.NUMS}, w {self.ELEMS}) '
+            f'NESTED TABLE w STORE AS {self.TABLE}_W'
+        )
+        nums = self.conn.gettype(self.NUMS)
+        elems = self.conn.gettype(self.ELEMS)
+        elem = self.conn.gettype(self.ELEM)
+        filled = elems.newobject(
+            [
+                elem.newobject({'ID': 1, 'NAME': 'a'}),
+                elem.newobject({'ID': 2, 'NAME': 'b'}),
+            ]
+        )
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (1, :1, :2)',
+            [nums.newobject([5, 10, 15]), filled],
+        )
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (2, :1, NULL)', [nums.newobject()]
+        )
+        self.cur.execute(f'SELECT v, w FROM {self.TABLE} ORDER BY id')
+        (v1, w1), (v2, w2) = self.cur.fetchall()
+        self.assertEqual([int(x) for x in v1.aslist()], [5, 10, 15])
+        self.assertEqual(
+            [(int(e.ID), e.NAME) for e in w1.aslist()], [(1, 'a'), (2, 'b')]
+        )
+        self.assertEqual((v2.aslist(), w2), ([], None))
+
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class RefBindIntegration(_IntegrationBase):
@@ -7985,6 +8016,67 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     pass
         finally:
             await Conn.close()
+
+    async def test_a_collection_value_binds(self):
+        # Async twin of CollectionTypeIntegration's.
+        Elem, Nums, Elems = 'PYO_ACOLB_ELEM_T', 'PYO_ACOLB_NUMS_T', 'PYO_ACOLB_ELEMS_T'
+        Table = 'PYO_ACOLB_TAB'
+        Drops = (
+            f'DROP TABLE {Table}',
+            f'DROP TYPE {Elems}',
+            f'DROP TYPE {Nums}',
+            f'DROP TYPE {Elem}',
+        )
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            if Conn.field_version < FIELD_VERSION_12_1:
+                self.skipTest('an object bind needs the 12.1+ OAC')
+            async with Conn.cursor() as Cur:
+                for Stmt in Drops:
+                    try:
+                        await Cur.execute(Stmt)
+                    except seerdb.DatabaseError:
+                        pass  # no leftover from a prior run
+                try:
+                    await Cur.execute(
+                        f'CREATE TYPE {Elem} AS OBJECT (id NUMBER, name VARCHAR2(40))'
+                    )
+                    await Cur.execute(f'CREATE TYPE {Nums} AS VARRAY(3) OF NUMBER')
+                    await Cur.execute(f'CREATE TYPE {Elems} AS TABLE OF {Elem}')
+                    await Cur.execute(
+                        f'CREATE TABLE {Table} (id NUMBER, v {Nums}, w {Elems}) '
+                        f'NESTED TABLE w STORE AS {Table}_W'
+                    )
+                    NumsType = await Conn.gettype(Nums)
+                    ElemsType = await Conn.gettype(Elems)
+                    ElemType = await Conn.gettype(Elem)
+                    Filled = ElemsType.newobject(
+                        [
+                            ElemType.newobject({'ID': 1, 'NAME': 'a'}),
+                            ElemType.newobject({'ID': 2, 'NAME': 'b'}),
+                        ]
+                    )
+                    await Cur.execute(
+                        f'INSERT INTO {Table} VALUES (1, :1, :2)',
+                        [NumsType.newobject([5, 10, 15]), Filled],
+                    )
+                    await Cur.execute(
+                        f'INSERT INTO {Table} VALUES (2, :1, NULL)',
+                        [NumsType.newobject()],
+                    )
+                    await Cur.execute(f'SELECT v, w FROM {Table} ORDER BY id')
+                    (V1, W1), (V2, W2) = await Cur.fetchall()
+                    self.assertEqual([int(X) for X in V1.aslist()], [5, 10, 15])
+                    self.assertEqual(
+                        [(int(E.ID), E.NAME) for E in W1.aslist()],
+                        [(1, 'a'), (2, 'b')],
+                    )
+                    self.assertEqual((V2.aslist(), W2), ([], None))
+                finally:
+                    for Stmt in Drops:
+                        try:
+                            await Cur.execute(Stmt)
+                        except seerdb.DatabaseError:
+                            pass  # a CREATE above failed, so nothing to drop
 
     async def test_a_collection_value_fetches(self):
         # Async twin of CollectionTypeIntegration's.
