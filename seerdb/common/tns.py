@@ -13349,11 +13349,17 @@ def _encode_object_attr_field(DataType: int, Charset: int, Value: Any) -> bytes:
             # Distinct from the fetch path below, whose value is content.
             return _obj_write_length(len(Value.raw)) + Value.raw
         # A LOB attribute the Mirror emits to an external client: it rides as a
-        # minted locator the client reads back over TTI_LOBOPS, with the content
-        # queued separately (in attribute order) by object_lob_contents. The value
-        # here is the content, so it is not written inline -- only the locator is,
-        # distinct from a column LOB's so the session routes its reads to the
-        # persistent object-LOB queue (#888).
+        # minted locator the client reads back over TTI_LOBOPS. The value here is
+        # the content, so it is not written inline -- only the locator is. In a
+        # session each attribute LOB gets its own locator, recorded with its
+        # content in the emit log as a column LOB's is, so a read is answered by
+        # locator whatever the order, and a bind of it back resolves (#1262).
+        # Without a log, the one shared locator and the attribute-order queue of
+        # object_lob_contents (#888).
+        log = _LOB_EMIT_LOG.get()
+        if log is not None:
+            locator = log.record(Value, DataType == TNS_TYPE_CLOB)
+            return _obj_write_length(len(locator)) + locator
         return _obj_write_length(len(_THIN_OBJ_LOB_LOCATOR)) + _THIN_OBJ_LOB_LOCATOR
     Raw = _encode_object_attr(DataType, Charset or AL32UTF8_CHARSET, Value)
     return _obj_write_length(len(Raw)) + Raw
