@@ -13304,13 +13304,13 @@ def _encode_object_attr_field(DataType: int, Charset: int, Value: Any) -> bytes:
         from seerdb.common.lob import LOB
 
         if isinstance(Value, LOB):
-            # An upstream LOB bound into an object attribute (the inbound bind
-            # direction, #888): the image field is the locator behind a ub2 length
-            # prefix (python-oracledb writes `write_bytes_with_length` of the
-            # ub2-prefixed locator), which the receiving server dereferences
-            # directly. Distinct from the fetch path below, whose value is content.
-            field = struct.pack('>H', len(Value.raw)) + Value.raw
-            return _obj_write_length(len(field)) + field
+            # A LOB bound into an object attribute: the image field is the
+            # locator verbatim, which starts with its own ub2 length -- a fetched
+            # one (`00 70` + 112 bytes) as much as a temp one (`00 26` + 38), both
+            # captured against a live 23ai (#1260). A LOB's raw is that form
+            # already; adding another ub2 made the server refuse it (ORA-22275).
+            # Distinct from the fetch path below, whose value is content.
+            return _obj_write_length(len(Value.raw)) + Value.raw
         # A LOB attribute the Mirror emits to an external client: it rides as a
         # minted locator the client reads back over TTI_LOBOPS, with the content
         # queued separately (in attribute order) by object_lob_contents. The value

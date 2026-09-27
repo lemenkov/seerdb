@@ -17,9 +17,12 @@ from seerdb.client.cursor import (
     _column_description,
     _extract_implicit_results,
     _iov_directions,
+    _object_bind_lob_values,
+    _object_with_lobs,
     _out_bind_lobs,
     _resolve_parameters,
     _return_bind_lobs,
+    _with_object_bind_lobs,
     cursor,
 )
 from seerdb.common.datatypes import TempLob, Var
@@ -88,6 +91,15 @@ class AsyncCursor(_CursorLogic):
         Bind = _bind_temp_lobs(_resolve_parameters(operation, parameters))
         Bind = self._resolve_cursor_binds(Bind)
         Bind = await self._promote_large_lob_binds(operation, Bind)
+        # A plain loop: an await inside a nested comprehension is a SyntaxError
+        # before Python 3.12.
+        Made: list[list] = []
+        for Pending in _object_bind_lob_values(Bind):
+            Lobs = []
+            for Type, Content in Pending:
+                Lobs.append(await self._connection.createlob(Type, Content))
+            Made.append(Lobs)
+        Bind = _with_object_bind_lobs(Bind, Made)
         return await self._run(operation, Bind)
 
     async def parse(self, operation: str) -> None:
@@ -294,7 +306,7 @@ class AsyncCursor(_CursorLogic):
         # PL/SQL OUT / IN OUT binds: scalars are assigned here; REF CURSOR OUT
         # binds are fetched (async) and wrapped in a nested AsyncCursor.
         self._bind_directions = _iov_directions(Result)
-        for Variable, Marker in _assign_out_binds(Bind, Result):
+        for Variable, Marker in _assign_out_binds(Bind, Result, self._connection):
             Rows = await self._connection.fetch_all_rows(
                 Marker['cursor_id'], Marker['row_format']
             )
@@ -313,7 +325,7 @@ class AsyncCursor(_CursorLogic):
             Variable._value = await Variable._value.aread()
 
         # DML RETURNING ... INTO: write the returned value list onto each Var.
-        _assign_return_binds(Bind, Result)
+        _assign_return_binds(Bind, Result, self._connection)
         # A LOB a RETURNING bind brought back (#985): the async half of the sync
         # _resolve_return_bind_lobs -- same rule, awaited read.
         KeepReturnLobs = getattr(self._connection, 'fetch_lobs', False)
@@ -433,6 +445,7 @@ class AsyncCursor(_CursorLogic):
                         Layout = Typ.attrs if Typ is not None else []
                         Attrs = decode_object_image(Val.image, Layout, Charset)
                         NewRow[I] = DbObject(Val.type_name, Attrs, dbtype=Typ)
+                    NewRow[I] = _object_with_lobs(NewRow[I], self._connection)
             ResolvedRows.append(NewRow)
         return ResolvedRows
 

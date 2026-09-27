@@ -111,6 +111,13 @@ class Cursor(_CursorLogic):
         Bind = _bind_temp_lobs(_resolve_parameters(operation, parameters))
         Bind = self._resolve_cursor_binds(Bind)
         Bind = self._promote_large_lob_binds(operation, Bind)
+        Bind = _with_object_bind_lobs(
+            Bind,
+            [
+                [self._connection.createlob(T, C) for T, C in Pending]
+                for Pending in _object_bind_lob_values(Bind)
+            ],
+        )
         return self._run(operation, Bind)
 
     def parse(self, operation: str) -> None:
@@ -359,7 +366,7 @@ class Cursor(_CursorLogic):
         # PL/SQL OUT / IN OUT binds: write returned values back into any Var
         # objects the caller passed. REF CURSOR OUT binds are fetched here.
         self._bind_directions = _iov_directions(Result)
-        for Variable, Marker in _assign_out_binds(Bind, Result):
+        for Variable, Marker in _assign_out_binds(Bind, Result, self._connection):
             Rows = self._connection.fetch_all_rows(
                 Marker['cursor_id'], Marker['row_format']
             )
@@ -367,7 +374,7 @@ class Cursor(_CursorLogic):
         _resolve_out_bind_lobs(self._connection, Bind)
 
         # DML RETURNING ... INTO: write the returned value list onto each Var.
-        _assign_return_binds(Bind, Result)
+        _assign_return_binds(Bind, Result, self._connection)
         _resolve_return_bind_lobs(self._connection, Bind)
 
         # Implicit result sets (#121): queue any DBMS_SQL.RETURN_RESULT cursors
@@ -738,7 +745,81 @@ class Cursor(_CursorLogic):
         self.close()
 
 
-def _object_from_out_image(image, objtype):
+def _object_with_lobs(Obj, Connection):
+    # A decoded object's LOB attributes are the locators its image carried; make
+    # each a LOB on the connection, as a fetched LOB column is -- what the
+    # reference client hands back for one (#1260). Anything else passes through.
+    from seerdb.common.dbobject import lob_attribute_csfrm, map_object_lobs
+    from seerdb.common.lob import LOB
+
+    def Make(Attr, Value):
+        if not isinstance(Value, (bytes, bytearray)):
+            return Value
+        return LOB(
+            Attr['data_type'],
+            bytes(Value),
+            connection=Connection,
+            csfrm=lob_attribute_csfrm(Attr),
+        )
+
+    return map_object_lobs(Obj, Make)
+
+
+def _object_bind_lob_values(Bind) -> list[list[tuple[object, object]]]:
+    # For each bind, the (LOB type, content) of every LOB attribute of a bound
+    # object that holds a str or bytes rather than a LOB, in image order. A
+    # server takes nothing but a locator there, so the reference client makes a
+    # temporary LOB of each and binds that (captured against 23ai, #1260); the
+    # caller does the making, which the async cursor has to await.
+    from seerdb.common.datatypes import DB_TYPE_BLOB, DB_TYPE_CLOB, DB_TYPE_NCLOB
+    from seerdb.common.dbobject import DbObject, lob_attribute_csfrm, map_object_lobs
+
+    Out: list[list[tuple[object, object]]] = []
+    for Value in Bind if isinstance(Bind, list) else []:
+        Pending: list[tuple[object, object]] = []
+
+        def Collect(Attr, Content, Pending=Pending):
+            if isinstance(Content, (str, bytes, bytearray)):
+                if Attr['data_type'] == TNS_TYPE_BLOB:
+                    Type = DB_TYPE_BLOB
+                elif lob_attribute_csfrm(Attr) == 2:
+                    Type = DB_TYPE_NCLOB
+                else:
+                    Type = DB_TYPE_CLOB
+                Pending.append((Type, Content))
+            return Content
+
+        if isinstance(Value, DbObject):
+            map_object_lobs(Value, Collect)
+        Out.append(Pending)
+    return Out
+
+
+def _with_object_bind_lobs(Bind: list, Lobs: list[list]) -> list:
+    # The binds with each object that had str / bytes LOB attributes replaced by
+    # a copy holding the LOBs made for them, in the order
+    # _object_bind_lob_values listed them. The caller's own object is left as it
+    # was set.
+    from seerdb.common.dbobject import map_object_lobs
+
+    if not isinstance(Bind, list) or not any(Lobs):
+        return Bind
+    Out = []
+    for Value, Made in zip(Bind, Lobs):
+        if Made:
+            Next = iter(Made)
+
+            def Put(_Attr: dict, Content: object, Next=Next) -> object:
+                if isinstance(Content, (str, bytes, bytearray)):
+                    return next(Next)
+                return Content
+
+            Value = map_object_lobs(Value, Put)
+        Out.append(Value)
+    return Out
+
+
+def _object_from_out_image(image, objtype, Connection=None):
     # Build a DbObject of `objtype` from an object OUT bind's ObjectImage (#888).
     # The image decodes against the type's own layout: named attributes for an
     # object, the single element type for a VARRAY / nested table. None (a NULL
@@ -753,18 +834,25 @@ def _object_from_out_image(image, objtype):
 
     if getattr(objtype, 'is_collection', False):
         (elements, keys) = decode_collection_keyed(image.image, objtype.element)
-        return DbObject(objtype.full_name, elements=elements, dbtype=objtype, keys=keys)
+        return _object_with_lobs(
+            DbObject(objtype.full_name, elements=elements, dbtype=objtype, keys=keys),
+            Connection,
+        )
     attrs = decode_object_image(image.image, objtype.attrs)
-    return DbObject(objtype.full_name, attrs, dbtype=objtype)
+    return _object_with_lobs(
+        DbObject(objtype.full_name, attrs, dbtype=objtype), Connection
+    )
 
 
-def _update_object_in_place(Target, Image) -> None:
+def _update_object_in_place(Target, Image, Connection=None) -> None:
     # Write an object OUT bind's returned image into the DbObject the CALLER
     # passed, rather than onto a Var (#1029). `cursor.callproc(name, (3, obj))`
     # hands the object over directly and then reads `obj` back -- the object is
     # the caller's handle on the result, exactly as in python-oracledb, so a new
     # DbObject built beside it would leave the caller looking at an empty one.
-    Decoded = _object_from_out_image(Image, object.__getattribute__(Target, '_dbtype'))
+    Decoded = _object_from_out_image(
+        Image, object.__getattribute__(Target, '_dbtype'), Connection
+    )
     if Decoded is None:
         # A NULL object OUT: clear the values the caller's object was built
         # with, which are the INPUT half of an IN OUT bind and would otherwise
@@ -803,7 +891,7 @@ def _iov_directions(Result) -> list[int] | None:
     return list(directions) if directions else None
 
 
-def _assign_out_binds(Bind, Result) -> list:
+def _assign_out_binds(Bind, Result, Connection=None) -> list:
     # After a PL/SQL execute, the IOV decoder leaves an {'out_positions',
     # 'out_values', ...} record as the single "row". Decode each scalar OUT
     # value by its Var's declared type and store it on the Var. REF CURSOR OUT
@@ -827,7 +915,7 @@ def _assign_out_binds(Bind, Result) -> list:
         if _object_bind_type(Bind[Pos]) is not None and not isinstance(Bind[Pos], Var):
             # An object passed straight to callproc / execute, with no Var to
             # hold the result -- the caller's own object is where it goes.
-            _update_object_in_place(Bind[Pos], Value)
+            _update_object_in_place(Bind[Pos], Value, Connection)
             continue
         Variable = _bind_var(Bind[Pos])
         if Variable is None:
@@ -860,7 +948,7 @@ def _assign_out_binds(Bind, Result) -> list:
             # ObjectImage (or None); build a DbObject of the Var's type from it,
             # decoding the image against the type's own attribute / element
             # layout (which the Var's DbObjectType already carries).
-            Variable._value = _object_from_out_image(Value, Variable.dbtype)
+            Variable._value = _object_from_out_image(Value, Variable.dbtype, Connection)
         else:
             Variable._value = decode_value(Column, Value if Value else None)
     return RefCursors
@@ -880,7 +968,7 @@ def _decode_returned_image(TnsType: int, Raw) -> object:
     return decode_vector(bytes(Raw))
 
 
-def _decode_returned_object(Typ: object, Image: object) -> object:
+def _decode_returned_object(Typ: object, Image: object, Connection=None) -> object:
     # The object image an ADT return bind carries, walked into a DbObject with
     # the layout the Var was declared with. A returning Var is created from the
     # type itself (`cursor.var(conn.gettype(...))`), and `_resolve_dbtype` keeps
@@ -907,12 +995,14 @@ def _decode_returned_object(Typ: object, Image: object) -> object:
         (Elements, Keys) = decode_collection_keyed(
             Image.image, Typ.element or {}, Charset
         )
-        return DbObject(Name, elements=Elements, dbtype=Typ, keys=Keys)
+        return _object_with_lobs(
+            DbObject(Name, elements=Elements, dbtype=Typ, keys=Keys), Connection
+        )
     Attrs = decode_object_image(Image.image, Typ.attrs or [], Charset)
-    return DbObject(Name, Attrs, dbtype=Typ)
+    return _object_with_lobs(DbObject(Name, Attrs, dbtype=Typ), Connection)
 
 
-def _assign_return_binds(Bind, Result) -> None:
+def _assign_return_binds(Bind, Result, Connection=None) -> None:
     # DML RETURNING ... INTO (#120): the response decoder left one
     # {'return_positions', 'return_values'} record per execute iteration, where
     # return_values[i] is the list of raw values for that bind (one per row the
@@ -960,7 +1050,10 @@ def _assign_return_binds(Bind, Result) -> None:
                 # An OBJECT / collection bind's returned value is an object
                 # image, decoded with the type the Var was declared with (#826).
                 PerBind.setdefault(Pos, []).append(
-                    [_decode_returned_object(Variable.dbtype, V) for V in Values]
+                    [
+                        _decode_returned_object(Variable.dbtype, V, Connection)
+                        for V in Values
+                    ]
                 )
                 continue
             if TnsType in _LOB_RETURN_TYPES:
@@ -1303,6 +1396,7 @@ def _resolve_objects(Connection, Row: list) -> list:
                 Layout = Typ.attrs if Typ is not None else []
                 Attrs = decode_object_image(Val.image, Layout, Charset)
                 Out[I] = DbObject(Val.type_name, Attrs, dbtype=Typ)
+            Out[I] = _object_with_lobs(Out[I], Connection)
     return Out
 
 

@@ -5953,8 +5953,11 @@ attributes, plus a nested object and a collection) reads every attribute back.
 The reverse of §21.12: the client sets an object's LOB attribute to a LOB it
 holds — one it fetched (`obj.CLOBVALUE = clob`) or a temp LOB it created
 (`obj.CLOBVALUE = conn.createlob(...)`) — and binds the object. It writes that
-LOB's **locator** into the image, `write_bytes_with_length` of a **ub2-prefixed**
-locator (`_obj_write_length(2 + n) | ub2 n | <n-byte locator>`). But the locator
+LOB's **locator** into the image: the attribute's length byte, then the locator
+**exactly as the server handed it out**, which starts with its own ub2 length
+(`_obj_write_length(2 + n) | ub2 n | <n bytes>`). That ub2 is part of the
+locator, not framing: a LOB object's raw locator already holds it, so writing the
+raw verbatim is right and adding another ub2 in front is refused (§21.14). But the locator
 is one the *Mirror* invented, with no live upstream LOB behind it; binding it
 straight through fails `ORA-22275 invalid LOB locator`.
 
@@ -5973,12 +5976,39 @@ The Mirror turns each such locator back into a real upstream LOB before binding:
    or with a leading ub2 length stripped for a temp locator, which rides
    ub2-prefixed), streams the content into a fresh **upstream** temp LOB, and binds
    the attribute to that. A locator with no known content binds NULL rather than
-   desyncing. The object encoder writes an upstream LOB attribute as its real
-   locator behind the ub2 prefix, the form the receiving server dereferences.
+   desyncing. The upstream LOB carries the ub2-prefixed form, which the object
+   encoder writes verbatim.
 
 Verified end to end against a live 23ai: `test_1900_dbobject` test 1907 (insert an
 object holding both a fetched and a `createlob` `CLOB` / `NCLOB` / `BLOB`, then read
 it back) passes through the Mirror. Object dbobject count 40 → 41.
+
+### 21.14 LOB attributes in the client (#1260)
+
+Captured with the reference thin client against a live 23ai, for a type
+`(id NUMBER, c CLOB, b BLOB)`:
+
+- **Fetch.** A LOB attribute's image field is its length byte followed by the
+  locator, `00 70` + 112 bytes for a stored CLOB (`72 00 70 00 02 02 0c …`). The
+  client makes it a LOB object on the connection, read over `TTI_LOBOPS` like a
+  column LOB. A NULL attribute is the `0xFF` null and stays `None`.
+- **Bind, attribute set to a LOB.** A fetched LOB goes back as the same field it
+  came in (`72 00 70 …`), and a temp LOB as `28 00 26 …`: the length byte, then the
+  locator verbatim with its own ub2. Writing an extra ub2 in front, as the encoder
+  once did for every LOB (`2a 00 28 00 26 …`), draws `ORA-22275 invalid LOB
+  locator specified`.
+- **Bind, attribute set to `str` / `bytes`.** The image has no room for a value,
+  only a locator. The reference client therefore first makes a temporary LOB for
+  each such attribute: `TTI_LOBOPS` CREATE_TEMP, then a WRITE with the content,
+  one pair per attribute in image order. It then sends the execute with those
+  locators in the image. seerdb does the same on a copy of the bound object, so
+  the caller's object keeps the `str` it was given. CREATE_TEMP needs 12.1+, as an
+  object bind does anyway.
+- **NCLOB.** It shares CLOB's wire type. The national form comes from the
+  attribute's type name, and a temp NCLOB is created with charset form 2.
+
+On 10g and 11g, an object with **three** LOB attributes breaks the fetch (#1261,
+open). Two work.
 
 ## 22. DML RETURNING ... INTO (#120)
 
