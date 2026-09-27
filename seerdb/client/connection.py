@@ -332,17 +332,23 @@ def _decode_aq_payload(Rest: bytes, queue):
         if Img is None:
             return (None, Rest)
         Img = cast(Any, Img)  # the decoded object image (has .image)
+        from seerdb.client.cursor import _object_with_lobs
+
         Typ = queue.payload_type
+        Conn = getattr(queue, '_connection', None)
         if Typ.is_collection:
             (Elements, Keys) = decode_collection_keyed(
                 Img.image, Typ.element or {}, AL32UTF8_CHARSET
             )
             return (
-                DbObject(Typ.name, elements=Elements, dbtype=Typ, keys=Keys),
+                _object_with_lobs(
+                    DbObject(Typ.name, elements=Elements, dbtype=Typ, keys=Keys),
+                    Conn,
+                ),
                 Rest,
             )
         Attrs = decode_object_image(Img.image, Typ.attrs, AL32UTF8_CHARSET)
-        return (DbObject(Typ.name, Attrs, dbtype=Typ), Rest)
+        return (_object_with_lobs(DbObject(Typ.name, Attrs, dbtype=Typ), Conn), Rest)
     (_toid, Rest) = _aq_str(Rest)
     (_oid, Rest) = _aq_str(Rest)
     (_snapshot, Rest) = _aq_str(Rest)

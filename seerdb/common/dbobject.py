@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import bisect
 import builtins
+from collections.abc import Callable
 
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
 from seerdb.common.tns_consts import (
@@ -710,6 +711,54 @@ def _decode_member(
         'charset': Attr.get('charset') or Charset,
     }
     return (decode_value(Col, Raw), Pos)
+
+
+def lob_attribute_csfrm(Attr: dict) -> int:
+    """The charset form of a LOB attribute: an NCLOB shares CLOB's wire type, so
+    only its type name tells the national form apart (#1260)."""
+    return 2 if (Attr.get('type_name') or '').upper() == 'NCLOB' else 1
+
+
+def map_object_lobs(Value: object, Fn: Callable[[dict, object], object]) -> object:
+    """A copy of an object or collection with ``Fn(attr, value)`` applied to each
+    non-NULL CLOB / BLOB attribute or element, nested objects and collections
+    included, in the order the image carries them (#1260).
+
+    Decoded, such a leaf is the locator the image carried; bound, it is whatever
+    the caller set. Walking in image order lets a caller first collect the leaves
+    with one ``Fn`` and then substitute results with another, which the async
+    client needs: it cannot await inside ``Fn``."""
+    if not isinstance(Value, DbObject):
+        return Value
+    Typ = Value._dbtype
+    if Typ is None:
+        return Value
+    if Typ.is_collection:
+        Element = Typ.element or {}
+        return DbObject(
+            Value._type_name,
+            elements=[_map_lob_member(E, Element, Fn) for E in Value._elements or []],
+            dbtype=Typ,
+            keys=Value._keys,
+        )
+    Attrs = [
+        (Name, _map_lob_member(Value._attrs.get(Name), Attr, Fn))
+        for Name, Attr in ((A['name'], A) for A in Typ.attrs)
+    ]
+    Known = {Name for Name, _ in Attrs}
+    # An attribute the layout does not name (set by hand) rides along untouched.
+    Attrs += [(N, V) for N, V in Value._attrs.items() if N not in Known]
+    return DbObject(Value._type_name, Attrs, dbtype=Typ)
+
+
+def _map_lob_member(Value: object, Attr: dict, Fn: Callable) -> object:
+    if Value is None:
+        return None
+    if Attr.get('object_type') is not None:
+        return map_object_lobs(Value, Fn)
+    if Attr.get('data_type') in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
+        return Fn(Attr, Value)
+    return Value
 
 
 def decode_xmltype(Image: bytes, Charset: int = AL32UTF8_CHARSET) -> tuple:

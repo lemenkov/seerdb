@@ -25,6 +25,8 @@ from seerdb.common.dbobject import (
     decode_collection_keyed,
     decode_object_image,
     decode_xmltype,
+    lob_attribute_csfrm,
+    map_object_lobs,
     type_name_to_tns,
 )
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
@@ -918,24 +920,128 @@ class TestLobEmitLog(unittest.TestCase):
 
 
 class TestObjectLobAttributeBind(unittest.TestCase):
-    # The inbound direction: an object whose LOB attribute is set to a resolved
-    # upstream LOB rides its real locator behind a ub2 length prefix (#888).
+    # The inbound direction: an object whose LOB attribute is a LOB -- fetched,
+    # temporary, or an upstream one the passthrough made -- carries its locator
+    # verbatim, which starts with its own ub2 length (#888, #1260).
+
+    # The image python-oracledb sent for `cla_o(2, <temp CLOB>, <temp BLOB>)`
+    # (id NUMBER, c CLOB, b BLOB), captured against a live 23ai: each LOB
+    # attribute is its length byte (0x28) and the 40-byte locator the
+    # CREATE_TEMP reply returned, `00 26` and all.
+    _CAPTURED = bytes.fromhex(
+        '8401fe0000005c02c10328002600018208800300029c83000000d10000000103690'
+        '00a0000000100001aab82f100000001000028002600018108000300019c83000000'
+        'd1000000020000000a0000000100001aab82f1000000010000'
+    )
+    _CLOB_LOCATOR = _CAPTURED[11:51]
+    _BLOB_LOCATOR = _CAPTURED[52:92]
+    _TYPE = DbObjectType(
+        'PYO',
+        'CLA_O',
+        bytes(16),
+        1,
+        [
+            {'name': 'ID', 'data_type': TNS_TYPE_NUMBER, 'charset': None},
+            {
+                'name': 'C',
+                'type_name': 'CLOB',
+                'data_type': TNS_TYPE_CLOB,
+                'charset': None,
+            },
+            {
+                'name': 'B',
+                'type_name': 'BLOB',
+                'data_type': TNS_TYPE_BLOB,
+                'charset': None,
+            },
+        ],
+    )
 
     def _lob_obj(self):
-        lob = LOB(TNS_TYPE_CLOB, b'UPSTREAM-LOCATOR-BYTES', connection=None)
-        return _DOC_TYPE.newobject({'NAME': 'file', 'DOC': lob, 'PIC': None})
+        return self._TYPE.newobject(
+            {
+                'ID': 2,
+                'C': LOB(TNS_TYPE_CLOB, self._CLOB_LOCATOR, connection=None),
+                'B': LOB(TNS_TYPE_BLOB, self._BLOB_LOCATOR, connection=None),
+            }
+        )
 
-    def test_lob_object_attribute_is_ub2_prefixed_locator(self):
-        image = encode_object_image(self._lob_obj())
-        # The image carries the raw locator behind its ub2 length, not the fetch
-        # placeholder locator.
-        self.assertIn(struct.pack('>H', len(b'UPSTREAM-LOCATOR-BYTES')), image)
-        self.assertIn(b'UPSTREAM-LOCATOR-BYTES', image)
-        self.assertNotIn(_THIN_OBJ_LOB_LOCATOR, image)
+    def test_the_locators_ride_verbatim(self):
+        self.assertEqual(self._CLOB_LOCATOR[:2], b'\x00\x26')
+        self.assertEqual(encode_object_image(self._lob_obj()), self._CAPTURED)
+
+    def test_the_captured_image_decodes_to_those_locators(self):
+        attrs = dict(decode_object_image(self._CAPTURED, self._TYPE.attrs))
+        self.assertEqual(
+            (attrs['C'], attrs['B']), (self._CLOB_LOCATOR, self._BLOB_LOCATOR)
+        )
 
     def test_lob_object_attribute_queues_no_content(self):
-        # A bound upstream LOB is not the Mirror's to serve, so it queues nothing.
+        # A bound LOB is not the Mirror's to serve, so it queues nothing.
         self.assertEqual(object_lob_contents([_ADT_COLUMN], [(self._lob_obj(),)]), [])
+
+
+class TestMapObjectLobs(unittest.TestCase):
+    # The walk that turns a decoded object's LOB leaves into LOBs, and finds the
+    # str / bytes ones a bind turns into temporary LOBs (#1260).
+
+    _NCLOB_TYPE = DbObjectType(
+        'PYO',
+        'N_T',
+        bytes(16),
+        1,
+        [
+            {'name': 'ID', 'data_type': TNS_TYPE_NUMBER, 'charset': None},
+            {
+                'name': 'N',
+                'type_name': 'NCLOB',
+                'data_type': TNS_TYPE_CLOB,
+                'charset': None,
+            },
+        ],
+    )
+    _LIST_TYPE = DbObjectType(
+        'PYO',
+        'N_LIST',
+        bytes(16),
+        1,
+        [],
+        is_collection=True,
+        collection_type=COLLECTION_NESTED_TABLE,
+        element={
+            'name': 'element',
+            'data_type': TNS_TYPE_ADT,
+            'object_type': _NCLOB_TYPE,
+        },
+    )
+
+    def test_each_lob_leaf_is_mapped_in_image_order(self):
+        value = self._LIST_TYPE.newobject(
+            [
+                self._NCLOB_TYPE.newobject({'ID': 1, 'N': b'loc-1'}),
+                None,
+                self._NCLOB_TYPE.newobject({'ID': 2, 'N': None}),
+                self._NCLOB_TYPE.newobject({'ID': 3, 'N': b'loc-3'}),
+            ]
+        )
+        seen = []
+
+        def fn(attr, leaf):
+            seen.append((lob_attribute_csfrm(attr), leaf))
+            return leaf.upper()
+
+        mapped = map_object_lobs(value, fn)
+        # NULLs are skipped; the NCLOB's national form comes from its type name.
+        self.assertEqual(seen, [(2, b'loc-1'), (2, b'loc-3')])
+        self.assertEqual(
+            [e.N if e else None for e in mapped.aslist()],
+            [b'LOC-1', None, None, b'LOC-3'],
+        )
+        # The original is left as it was.
+        self.assertEqual(value.aslist()[0].N, b'loc-1')
+
+    def test_a_non_object_passes_through(self):
+        self.assertEqual(map_object_lobs('text', lambda a, v: 1 / 0), 'text')
 
 
 _INDEX_TABLE_TYPE = DbObjectType(

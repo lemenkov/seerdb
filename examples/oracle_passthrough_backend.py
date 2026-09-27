@@ -425,7 +425,9 @@ class OraclePassthroughBackend:
         locator = self._conn.create_temp_lob(is_blob=is_blob)
         if content and isinstance(content, (str, bytes)):
             self._conn.write_temp_lob(locator, content, is_blob=is_blob)
-        return LOB(data_type, locator, self._conn)
+        # Carried with its ub2, the form a LOB's raw has and an object image
+        # writes verbatim (#1260).
+        return LOB(data_type, struct.pack('>H', len(locator)) + locator, self._conn)
 
     def _resolve_fetched_object_lobs(self, columns: list, rows: list) -> list:
         # An object (ADT) column's LOB attributes decode upstream to bare locator
@@ -478,13 +480,12 @@ class OraclePassthroughBackend:
             return value
         if value is None:
             return value
-        data_type = attr.get('data_type')
-        if data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB) and isinstance(
-            value, (bytes, bytearray)
+        # A fetched LOB attribute is a LOB on the upstream connection (#1260);
+        # read its content so the Mirror can serve it back.
+        if attr.get('data_type') in (TNS_TYPE_CLOB, TNS_TYPE_BLOB) and isinstance(
+            value, LOB
         ):
-            # The decoded attribute is the raw LOB locator; read its content over
-            # the upstream connection so the Mirror can serve it back.
-            return LOB(data_type, bytes(value), self._conn).read()
+            return value.read()
         return value
 
     def _upstream_temp_lob(self, value: object, is_blob: bool) -> TempLob:

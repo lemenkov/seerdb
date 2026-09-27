@@ -74,6 +74,7 @@ _FV2_UNSUPPORTED = (
     ('refcursor', 'REF CURSOR is not supported on Oracle 9i (fv2)'),
     ('ref_bind', 'REF / object types are not supported on Oracle 9i'),
     ('collection_of_objects', 'object types are not supported on Oracle 9i'),
+    ('lob_attribute', 'object types are not supported on Oracle 9i'),
     ('changepassword', 'changepassword is not supported on Oracle 9i'),
     ('cache_evicts', 'the cursor cache is a fv4+ feature; 9i re-parses'),
     ('reuses_cursor', 'the cursor cache is a fv4+ feature; 9i re-parses'),
@@ -6159,6 +6160,120 @@ class ObjectReturningIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class ObjectLobAttributeIntegration(_IntegrationBase):
+    """CLOB / NCLOB / BLOB attributes of an object type (#1260): fetched, each is
+    a LOB on the connection; bound, it takes a LOB -- fetched or temporary -- or a
+    str / bytes, which goes out as a temporary LOB, as the reference client does."""
+
+    # Two LOB attributes per type: three break a 10g / 11g fetch (#1261).
+    TYPE = 'PYO_LOBATTR_T'
+    NTYPE = 'PYO_LOBATTR_N_T'
+    LIST = 'PYO_LOBATTR_LIST_T'
+    TABLE = 'PYO_LOBATTR_TAB'
+    TEXT = 'national \u00e9\u4e2d'
+
+    def setUp(self):
+        super().setUp()
+        self._skip_if_mirror_backend('postgres', 'fetch an object with a LOB attribute')
+        self._drop()
+        self.cur.execute(
+            f'CREATE TYPE {self.TYPE} AS OBJECT (id NUMBER, c CLOB, b BLOB)'
+        )
+        self.cur.execute(f'CREATE TYPE {self.NTYPE} AS OBJECT (id NUMBER, n NCLOB)')
+        self.cur.execute(f'CREATE TYPE {self.LIST} AS TABLE OF CLOB')
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (k NUMBER, o {self.TYPE}, p {self.NTYPE})'
+        )
+
+    def tearDown(self):
+        self._drop()
+        super().tearDown()
+
+    def _drop(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (
+            f'DROP TABLE {self.TABLE}',
+            f'DROP TYPE {self.LIST}',
+            f'DROP TYPE {self.NTYPE}',
+            f'DROP TYPE {self.TYPE}',
+        ):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass  # best-effort teardown of leftovers
+
+    def _fetched(self, k, column='o'):
+        self.cur.execute(f'SELECT {column} FROM {self.TABLE} WHERE k = :1', [k])
+        return self.cur.fetchone()[0]
+
+    def _skip_before_12_1(self):
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('an object bind needs the 12.1+ OAC')
+
+    def test_a_lob_attribute_fetches_as_a_lob(self):
+        from seerdb.common.lob import LOB
+
+        self.cur.execute(
+            f"INSERT INTO {self.TABLE} VALUES (1, {self.TYPE}(1, 'some clob', "
+            f"HEXTORAW('0102FF')), {self.NTYPE}(1, TO_NCLOB('{self.TEXT}')))"
+        )
+        # Each object's LOBs are read before the next query: the Mirror serves
+        # attribute LOBs in fetch order (#1262).
+        o = self._fetched(1)
+        self.assertIsInstance(o.C, LOB)
+        self.assertIsInstance(o.B, LOB)
+        self.assertEqual((o.C.read(), o.B.read()), ('some clob', b'\x01\x02\xff'))
+        n = self._fetched(1, 'p')
+        self.assertIsInstance(n.N, LOB)
+        self.assertEqual(n.N.read(), self.TEXT)
+
+    def test_a_null_lob_attribute_is_none(self):
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (2, {self.TYPE}(2, NULL, NULL), '
+            f'{self.NTYPE}(2, NULL))'
+        )
+        self.assertEqual((self._fetched(2).C, self._fetched(2).B), (None, None))
+        self.assertIsNone(self._fetched(2, 'p').N)
+
+    def test_a_collection_of_lob_attributes_fetches_lobs(self):
+        self.cur.execute(f"SELECT {self.LIST}('a', 'bc') FROM dual")
+        (value,) = self.cur.fetchone()
+        self.assertEqual([e.read() for e in value.aslist()], ['a', 'bc'])
+
+    def test_a_lob_attribute_binds_from_str_and_bytes(self):
+        self._skip_before_12_1()
+        typ = self.conn.gettype(self.TYPE)
+        obj = typ.newobject({'ID': 3, 'C': 'bound text', 'B': b'\x07'})
+        nobj = self.conn.gettype(self.NTYPE).newobject({'ID': 3, 'N': self.TEXT})
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (3, :1, :2)', [obj, nobj])
+        o = self._fetched(3)
+        self.assertEqual((o.C.read(), o.B.read()), ('bound text', b'\x07'))
+        self.assertEqual(self._fetched(3, 'p').N.read(), self.TEXT)
+        # The caller's object keeps what it was set to.
+        self.assertEqual(obj.C, 'bound text')
+
+    def test_a_lob_attribute_binds_a_temporary_lob(self):
+        self._skip_before_12_1()
+        typ = self.conn.gettype(self.TYPE)
+        obj = typ.newobject({'ID': 4})
+        obj.C = self.conn.createlob(seerdb.DB_TYPE_CLOB, 'temp lob')
+        self.cur.execute(f'INSERT INTO {self.TABLE} (k, o) VALUES (4, :1)', [obj])
+        self.assertEqual(self._fetched(4).C.read(), 'temp lob')
+
+    def test_a_fetched_lob_attribute_binds_back(self):
+        self._skip_before_12_1()
+        self._skip_if_mirror('binding back a fetched LOB attribute (#1262)')
+        self.cur.execute(
+            f"INSERT INTO {self.TABLE} (k, o) VALUES (5, {self.TYPE}(5, 'fetched', NULL))"
+        )
+        o = self._fetched(5)
+        o.ID = 6
+        self.cur.execute(f'INSERT INTO {self.TABLE} (k, o) VALUES (6, :1)', [o])
+        self.assertEqual(self._fetched(6).C.read(), 'fetched')
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class ObjectCollectionFetchIntegration(_IntegrationBase):
     """A collection of an object type fetches its elements as objects (#1254)."""
 
@@ -7146,6 +7261,56 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await Cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = {Own}')
         finally:
             await Conn.close()
+
+    async def test_a_lob_attribute_fetches_and_binds(self):
+        # Async twin of ObjectLobAttributeIntegration's fetch and str bind (#1260).
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest(
+                "the Mirror's postgres backend cannot fetch an object with a LOB "
+                'attribute'
+            )
+        from seerdb.common.lob import LOB
+
+        Typ, Table = 'PYO_ALOBATTR_T', 'PYO_ALOBATTR_TAB'
+        Drops = (f'DROP TABLE {Table}', f'DROP TYPE {Typ}')
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                for Stmt in Drops:
+                    try:
+                        await Cur.execute(Stmt)
+                    except seerdb.DatabaseError:
+                        pass  # no leftover from a prior run
+                try:
+                    await Cur.execute(
+                        f'CREATE TYPE {Typ} AS OBJECT (id NUMBER, c CLOB, b BLOB)'
+                    )
+                    await Cur.execute(f'CREATE TABLE {Table} (k NUMBER, o {Typ})')
+                    await Cur.execute(
+                        f"INSERT INTO {Table} VALUES (1, {Typ}(1, 'some clob', "
+                        "HEXTORAW('0102FF')))"
+                    )
+                    await Cur.execute(f'SELECT o FROM {Table} WHERE k = 1')
+                    (O,) = await Cur.fetchone()
+                    self.assertIsInstance(O.C, LOB)
+                    self.assertEqual(
+                        (await O.C.aread(), await O.B.aread()),
+                        ('some clob', b'\x01\x02\xff'),
+                    )
+                    if Conn.field_version >= FIELD_VERSION_12_1:
+                        ObjType = await Conn.gettype(Typ)
+                        Obj = ObjType.newobject({'ID': 2, 'C': 'bound', 'B': b'\x07'})
+                        await Cur.execute(f'INSERT INTO {Table} VALUES (2, :1)', [Obj])
+                        await Cur.execute(f'SELECT o FROM {Table} WHERE k = 2')
+                        (O,) = await Cur.fetchone()
+                        self.assertEqual(
+                            (await O.C.aread(), await O.B.aread()), ('bound', b'\x07')
+                        )
+                finally:
+                    for Stmt in Drops:
+                        try:
+                            await Cur.execute(Stmt)
+                        except seerdb.DatabaseError:
+                            pass  # a CREATE above failed, so nothing to drop
 
     async def test_a_collection_of_objects_fetches_objects(self):
         # Async twin of ObjectCollectionFetchIntegration: the async describe
