@@ -1408,6 +1408,8 @@ _CREATE_OR_REPLACE_TYPE = re.compile(
 )
 
 
+# The name in a CREATE TYPE, for the object constructor built after it (#1206).
+_CREATE_TYPE_NAME = re.compile(r'\s*CREATE\s+TYPE\s+([\w."$#]+)', re.IGNORECASE)
 # `DROP TYPE name [FORCE]`: a collection type's constructors depend on it, so they
 # go first, or PostgreSQL refuses the drop (#1206).
 _DROP_TYPE = re.compile(
@@ -1424,6 +1426,25 @@ def _collection_constructors(name: str, element: str) -> str:
         f'LANGUAGE sql IMMUTABLE AS $$ SELECT $1::{name} $$'
         f'; CREATE OR REPLACE FUNCTION {name}() RETURNS {name} '
         f"LANGUAGE sql IMMUTABLE AS $$ SELECT '{{}}'::{element}[]::{name} $$"
+    )
+
+
+def _object_constructor(name: str) -> str:
+    """The constructor Oracle gives an object type (#1206): `name(a1, a2, …)`,
+    one argument per attribute in order, returning the object. It is built
+    from the catalog once the type exists, so the attribute types are the ones
+    the type was given."""
+    literal = name.replace("'", "''")
+    return (
+        '; DO $$ DECLARE t regtype := ' + f"to_regtype('{literal}'); "
+        'a text; v text; BEGIN '
+        "SELECT string_agg(format_type(atttypid, NULL), ', ' ORDER BY attnum), "
+        "string_agg('$' || row_number, ', ' ORDER BY attnum) INTO a, v FROM ("
+        'SELECT atttypid, attnum, row_number() OVER (ORDER BY attnum) '
+        'FROM pg_attribute WHERE attrelid = (SELECT typrelid FROM pg_type '
+        'WHERE oid = t) AND attnum > 0 AND NOT attisdropped) x; '
+        "EXECUTE format('CREATE OR REPLACE FUNCTION %s(%s) RETURNS %s LANGUAGE sql "
+        "IMMUTABLE AS $f$ SELECT ROW(%s)::%s $f$', t, a, t, v, t); END $$"
     )
 
 
@@ -1483,7 +1504,10 @@ def _translate_ddl(sql: str) -> str:
         out = _CREATE_TYPE_OBJECT.sub(r'\1', sql, count=1)
         for pattern, replacement in _DDL_TYPE_REWRITES:
             out = pattern.sub(replacement, out)
-        return out
+        name = _CREATE_TYPE_NAME.match(out)
+        if name is None:
+            return out
+        return out.rstrip().rstrip(';') + _object_constructor(name.group(1))
     view = _translate_replace_view(sql)
     if view is not None:
         return view

@@ -936,6 +936,30 @@ class TypesIntegration(_IntegrationBase):
         finally:
             self.cur.execute(f'DROP TYPE {ntype}')
 
+    def test_an_object_type_has_its_constructor(self):
+        # An object type comes with Oracle's constructor, one argument per
+        # attribute; a call with the wrong number of them is refused (#1206).
+        from seerdb.common.exceptions import DatabaseError
+
+        otype = 'PYO_OBJ_CTOR_T'
+        try:
+            self.cur.execute(f'DROP TYPE {otype}')
+        except DatabaseError:
+            # No leftover type from a prior run; nothing to clean up.
+            pass
+        self.cur.execute(f'CREATE TYPE {otype} AS OBJECT (n NUMBER, s VARCHAR2(10));')
+        try:
+            self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, o {otype})')
+            self.cur.execute(f"INSERT INTO {self.TABLE} VALUES (1, {otype}(5, 'x'))")
+            self.cur.execute(f'INSERT INTO {self.TABLE} (id) VALUES (2)')
+            with self.assertRaises(DatabaseError):
+                self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (3, {otype}(5))')
+            self.cur.execute(f'SELECT id FROM {self.TABLE} WHERE o IS NOT NULL')
+            self.assertEqual(self.cur.fetchall(), [(1,)])
+            self.cur.execute(f'DROP TABLE {self.TABLE}')
+        finally:
+            self.cur.execute(f'DROP TYPE {otype}')
+
     def test_a_bool_declared_number_is_stored_as_a_number(self):
         # A bool bound with a declared NUMBER type is the NUMBER 0 or 1 on every
         # server; from 23.1 it used to go out as a native BOOLEAN value, which
@@ -6958,6 +6982,33 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     self.assertEqual(await Cur.fetchone(), (1, 1))
                 finally:
                     await Cur.execute(f'DROP TYPE {vtype}')
+
+    async def test_an_object_type_has_its_constructor(self):
+        # Async twin of CursorIntegration's.
+        from seerdb.common.exceptions import DatabaseError
+
+        Table, otype = 'PYO_ASYNC_OBJ_CTOR', 'PYO_ASYNC_OBJ_CTOR_T'
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await self._drop_async(Cur, Table)
+                try:
+                    await Cur.execute(f'DROP TYPE {otype}')
+                except DatabaseError:
+                    pass
+                await Cur.execute(
+                    f'CREATE TYPE {otype} AS OBJECT (n NUMBER, s VARCHAR2(10))'
+                )
+                try:
+                    await Cur.execute(f'CREATE TABLE {Table} (id NUMBER, o {otype})')
+                    await Cur.execute(
+                        f"INSERT INTO {Table} VALUES (1, {otype}(5, 'x'))"
+                    )
+                    await Cur.execute(f'INSERT INTO {Table} (id) VALUES (2)')
+                    await Cur.execute(f'SELECT id FROM {Table} WHERE o IS NOT NULL')
+                    self.assertEqual(await Cur.fetchall(), [(1,)])
+                finally:
+                    await self._drop_async(Cur, Table)
+                    await Cur.execute(f'DROP TYPE {otype}')
 
     async def test_decode(self):
         # Async twin of CursorIntegration's.
