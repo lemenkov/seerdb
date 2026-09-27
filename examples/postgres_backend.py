@@ -63,7 +63,9 @@ edge of this adapter:
 - **Object types, partly** — ``CREATE TYPE ... AS OBJECT`` is a PostgreSQL
   composite, listed in ``all_types`` / ``all_type_attrs`` under an OID that is the
   composite's own ``pg_type`` oid, zero-padded to Oracle's 16 bytes. An object
-  binds, returns (``RETURNING o INTO :b``) and fetches. Not yet: binding an
+  binds, returns (``RETURNING o INTO :b``) and fetches, ``CLOB`` / ``BLOB``
+  attributes included (an ``NCLOB`` one is stored and reported as ``CLOB``, as an
+  ``NCLOB`` column is). Not yet: binding an
   attribute that is itself an object or a collection (refused, not guessed), and
   type methods. A VARRAY or nested table is a domain over an array, listed in
   ``all_types`` and ``all_coll_types``. A column of one fetches as the collection;
@@ -130,11 +132,13 @@ from seerdb.common.datatypes import BcDate, IntervalYM
 from seerdb.common.dbobject import (
     COLLECTION_NESTED_TABLE,
     COLLECTION_VARRAY,
+    DbObject,
     DbObjectType,
     DbRef,
     ObjectImage,
     decode_collection_image,
     decode_object_image,
+    map_object_lobs,
     type_name_to_tns,
 )
 from seerdb.common.sqltext import (
@@ -923,12 +927,15 @@ _ORACLE_DICTIONARY_DDL = (
     'ora_name(a.attribute_name) AS attr_name, '
     # The ora_tstz composite is this backend's TIMESTAMP WITH TIME ZONE, not an
     # object type an attribute holds.
+    # Nor are the ora_clob / ora_blob domains: they are CLOB and BLOB (#1256).
     f"CASE WHEN a.attribute_udt_name = '{_TSTZ_TYPE}' THEN 'TIMESTAMP WITH TIME ZONE' "
+    f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CLOB' "
+    f"WHEN a.attribute_udt_name = '{_BLOB_TYPE}' THEN 'BLOB' "
     "WHEN a.data_type = 'USER-DEFINED' THEN ora_name(a.attribute_udt_name) "
     'ELSE ora_type_name(a.data_type) END AS attr_type_name, '
-    "CASE WHEN a.data_type = 'USER-DEFINED' "
-    f"AND a.attribute_udt_name <> '{_TSTZ_TYPE}' THEN ora_owner(a.attribute_udt_schema) "
-    'END AS attr_type_owner, '
+    "CASE WHEN a.data_type = 'USER-DEFINED' AND a.attribute_udt_name NOT IN "
+    f"('{_TSTZ_TYPE}', '{_CLOB_TYPE}', '{_BLOB_TYPE}') "
+    'THEN ora_owner(a.attribute_udt_schema) END AS attr_type_owner, '
     'a.character_maximum_length AS length, a.numeric_precision AS precision, '
     'a.numeric_scale AS scale, a.ordinal_position AS attr_no '
     'FROM information_schema.attributes a '
@@ -3401,6 +3408,20 @@ def _parse_ref_locator(locator: bytes) -> tuple[int, int, uuid.UUID] | None:
     return type_pg_oid, table_oid, uuid.UUID(bytes=locator[tag + 8 :])
 
 
+def _served_lobs(value: DbObject, image: ObjectImage) -> DbObject:
+    # A bound object's or collection's LOB attributes carry locators the Mirror
+    # handed out; each becomes the content served under it, or NULL for one it
+    # never served, as the passthrough binds it (#1256).
+    def content(_attr: dict, locator: object) -> object:
+        served = (
+            image.served_lob(bytes(locator)) if isinstance(locator, bytes) else None
+        )
+        return served[0] if served is not None else None
+
+    mapped = map_object_lobs(value, content)
+    return mapped if isinstance(mapped, DbObject) else value
+
+
 def _pg_oid_of(oid: bytes) -> int | None:
     # The inverse of _object_type_oid; None for an OID that cannot be one of
     # ours (a real Oracle OID a client carried over, or a malformed one).
@@ -3577,6 +3598,27 @@ class PostgresBackend:
                     self._domain_type_by_oid[row[0]] = tns_type
                     if name == _INTERVALYM_TYPE:
                         self._intervalym_oid = row[0]
+            # A LOB inside a composite or an array is typed by its domain, which
+            # psycopg does not know: a BLOB attribute came back as its hex text.
+            # Load both domains, and arrays of them, as their base types (#1256).
+            from psycopg.types import TypeInfo
+            from psycopg.types.array import register_array
+            from psycopg.types.string import (
+                ByteaBinaryLoader,
+                ByteaLoader,
+                TextBinaryLoader,
+                TextLoader,
+            )
+
+            for name, loaders in (
+                (_CLOB_TYPE, (TextLoader, TextBinaryLoader)),
+                (_BLOB_TYPE, (ByteaLoader, ByteaBinaryLoader)),
+            ):
+                domain = TypeInfo.fetch(self._conn, name)
+                if domain is not None:
+                    for loader in loaders:
+                        self._conn.adapters.register_loader(domain.oid, loader)
+                    register_array(domain, self._conn)
             # Preserve an interval's months through psycopg (its default loader
             # flattens them to a timedelta), so a YEAR TO MONTH value survives (#504).
             self._conn.adapters.register_loader('interval', _IntervalMonthsTextLoader)
@@ -4546,11 +4588,14 @@ class PostgresBackend:
                 'SELECT sys.ora_name(a.attribute_name), '
                 f"CASE WHEN a.attribute_udt_name = '{_TSTZ_TYPE}' "
                 "THEN 'TIMESTAMP WITH TIME ZONE' "
+                f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CLOB' "
+                f"WHEN a.attribute_udt_name = '{_BLOB_TYPE}' THEN 'BLOB' "
                 "WHEN a.data_type = 'USER-DEFINED' "
                 'THEN sys.ora_name(a.attribute_udt_name) '
                 'ELSE sys.ora_type_name(a.data_type) END, '
                 "CASE WHEN a.data_type = 'USER-DEFINED' "
-                f"AND a.attribute_udt_name <> '{_TSTZ_TYPE}' "
+                'AND a.attribute_udt_name NOT IN '
+                f"('{_TSTZ_TYPE}', '{_CLOB_TYPE}', '{_BLOB_TYPE}') "
                 'THEN sys.ora_owner(a.attribute_udt_schema) END '
                 'FROM information_schema.attributes a '
                 'WHERE a.udt_schema = %s AND a.udt_name = %s '
@@ -4640,21 +4685,26 @@ class PostgresBackend:
         pg_oid = _pg_oid_of(oid)
         coll = self._collection_type(pg_oid) if pg_oid is not None else None
         if coll is not None:
-            return self._collection_bind_value(coll, image.image)
+            return self._collection_bind_value(coll, image)
         entry = self._object_type(pg_oid) if pg_oid is not None else None
         if entry is None:
             raise UnsupportedFeature(
                 f'object bind: no object type has the OID {oid.hex()}'
             )
-        return self._composite_value(
-            entry, dict(decode_object_image(image.image, entry[0].attrs))
+        typ = entry[0]
+        value = _served_lobs(
+            DbObject(typ.name, decode_object_image(image.image, typ.attrs), dbtype=typ),
+            image,
         )
+        return self._composite_value(entry, value.asdict())
 
-    def _collection_bind_value(self, typ: DbObjectType, image: bytes) -> list:
+    def _collection_bind_value(self, typ: DbObjectType, image: ObjectImage) -> list:
         # A VARRAY / nested-table bind (#1206): the image's elements, bound as the
         # array the domain is over; an object element as its composite.
         element = typ.element or {}
-        values = decode_collection_image(image, element)
+        values = _served_lobs(
+            typ.newobject(decode_collection_image(image.image, element)), image
+        ).aslist()
         nested = element.get('object_type')
         if nested is None:
             # A NUMBER decodes as an int when it is whole and a Decimal when not,

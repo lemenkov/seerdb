@@ -2560,6 +2560,61 @@ def test_a_collection_bind_is_bound_as_its_array() -> None:
         backend.close()
 
 
+def test_lob_attributes_are_clob_and_blob() -> None:
+    # An object's CLOB / BLOB attribute is the ora_clob / ora_blob domain; it is
+    # listed and described as CLOB / BLOB, not taken for a nested object type,
+    # fetches as its content, and binds back from the locators the Mirror served
+    # -- NULL for one it never served (#1256).
+    from seerdb.common.dbobject import ObjectImage
+    from seerdb.common.lob import LOB
+    from seerdb.common.tns import encode_object_image
+    from seerdb.common.tns_consts import TNS_TYPE_BLOB, TNS_TYPE_CLOB
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for stmt in ('DROP TABLE t_lobattr', 'DROP TYPE t_lobattr_o'):
+            try:
+                backend.execute(stmt)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute('CREATE TYPE t_lobattr_o AS OBJECT (id NUMBER, c CLOB, b BLOB)')
+        backend.execute('CREATE TABLE t_lobattr (k NUMBER, o t_lobattr_o)')
+        assert backend.execute(
+            'SELECT attr_name, attr_type_name, attr_type_owner FROM all_type_attrs '
+            "WHERE type_name = 'T_LOBATTR_O' ORDER BY attr_no"
+        ).rows == [('ID', 'NUMBER', None), ('C', 'CLOB', None), ('B', 'BLOB', None)]
+        backend.execute(
+            "INSERT INTO t_lobattr VALUES (1, t_lobattr_o(1, 'text', HEXTORAW('01FF')))"
+        )
+        (got,) = backend.execute('SELECT o FROM t_lobattr WHERE k = 1').rows[0]
+        assert (got.C, got.B) == ('text', b'\x01\xff')
+
+        (oid,) = backend.execute(
+            "SELECT type_oid FROM all_types WHERE type_name = 'T_LOBATTR_O'"
+        ).rows[0]
+        typ, _info = backend._object_type(_pg_oid_of(bytes(oid)))
+        assert [a['data_type'] for a in typ.attrs][1:] == [TNS_TYPE_CLOB, TNS_TYPE_BLOB]
+        obj = typ.newobject(
+            {
+                'ID': 2,
+                'C': LOB(TNS_TYPE_CLOB, b'served-clob', connection=None),
+                'B': LOB(TNS_TYPE_BLOB, b'never-served', connection=None),
+            }
+        )
+        image = ObjectImage(
+            bytes(oid), typ.schema, typ.name, None, encode_object_image(obj)
+        )
+        image.lob_contents = {b'served-clob': ('bound text', True)}
+        backend.execute('INSERT INTO t_lobattr VALUES (2, :1)', [image])
+        (got,) = backend.execute('SELECT o FROM t_lobattr WHERE k = 2').rows[0]
+        assert (got.C, got.B) == ('bound text', None)
+        for stmt in ('DROP TABLE t_lobattr', 'DROP TYPE t_lobattr_o'):
+            backend.execute(stmt)
+        backend.commit()
+    finally:
+        backend.close()
+
+
 def test_dictionary_views_preserve_quoted_identifier_case() -> None:
     # Oracle stores an unquoted identifier upper-case and a quoted one verbatim;
     # PostgreSQL folds unquoted names lower-case. sys.ora_name() reconstructs the

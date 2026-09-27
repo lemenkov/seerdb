@@ -6387,7 +6387,6 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        self._skip_if_mirror_backend('postgres', 'fetch an object with a LOB attribute')
         self._drop()
         self.cur.execute(
             f'CREATE TYPE {self.TYPE} AS OBJECT (id NUMBER, c CLOB, b BLOB)'
@@ -6407,6 +6406,7 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
 
         for stmt in (
             f'DROP TABLE {self.TABLE}',
+            f'DROP TABLE {self.TABLE}_L',
             f'DROP TYPE {self.LIST}',
             f'DROP TYPE {self.NTYPE}',
             f'DROP TYPE {self.TYPE}',
@@ -6463,7 +6463,14 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
         self.assertIsNone(self._fetched(2, 'p').N)
 
     def test_a_collection_of_lob_attributes_fetches_lobs(self):
-        self.cur.execute(f"SELECT {self.LIST}('a', 'bc') FROM dual")
+        # From a column: the Mirror-over-PG cannot type a computed collection.
+        # _drop removes the table.
+        table = f'{self.TABLE}_L'
+        self.cur.execute(
+            f'CREATE TABLE {table} (l {self.LIST}) NESTED TABLE l STORE AS {table}_S'
+        )
+        self.cur.execute(f"INSERT INTO {table} VALUES ({self.LIST}('a', 'bc'))")
+        self.cur.execute(f'SELECT l FROM {table}')
         (value,) = self.cur.fetchone()
         self.assertEqual([e.read() for e in value.aslist()], ['a', 'bc'])
 
@@ -7864,11 +7871,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
 
     async def test_a_lob_attribute_fetches_and_binds(self):
         # Async twin of ObjectLobAttributeIntegration's fetch and str bind (#1260).
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest(
-                "the Mirror's postgres backend cannot fetch an object with a LOB "
-                'attribute'
-            )
         from seerdb.common.lob import LOB
 
         Typ, Table = 'PYO_ALOBATTR_T', 'PYO_ALOBATTR_TAB'
