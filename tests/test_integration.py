@@ -912,6 +912,30 @@ class TypesIntegration(_IntegrationBase):
         finally:
             self.cur.execute(f'DROP TYPE {vtype}')
 
+    def test_a_nested_table_column_names_its_storage(self):
+        # A nested-table column needs `NESTED TABLE c STORE AS s` on Oracle; the
+        # Mirror stores it in the row and takes the clause as said (#1253).
+        from seerdb.common.exceptions import DatabaseError
+
+        ntype = 'PYO_NT_STORE_T'
+        try:
+            self.cur.execute(f'DROP TYPE {ntype}')
+        except DatabaseError:
+            # No leftover type from a prior run; nothing to clean up.
+            pass
+        self.cur.execute(f'CREATE TYPE {ntype} AS TABLE OF NUMBER;')
+        try:
+            self.cur.execute(
+                f'CREATE TABLE {self.TABLE} (id NUMBER, v {ntype}) '
+                f'NESTED TABLE v STORE AS {self.TABLE}_V'
+            )
+            self.cur.execute(f'INSERT INTO {self.TABLE} (id) VALUES (1)')
+            self.cur.execute(f'SELECT id FROM {self.TABLE}')
+            self.assertEqual(self.cur.fetchone(), (1,))
+            self.cur.execute(f'DROP TABLE {self.TABLE}')
+        finally:
+            self.cur.execute(f'DROP TYPE {ntype}')
+
     def test_a_bool_declared_number_is_stored_as_a_number(self):
         # A bool bound with a declared NUMBER type is the NUMBER 0 or 1 on every
         # server; from 23.1 it used to go out as a native BOOLEAN value, which
@@ -7579,6 +7603,32 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                         except DatabaseError:
                             # A CREATE above failed, so there is no type to drop.
                             pass
+
+    async def test_a_nested_table_column_names_its_storage(self):
+        # Async twin of TypesIntegration's.
+        from seerdb.common.exceptions import DatabaseError
+
+        Table, NType = 'PYO_ASYNC_NT_STORE', 'PYO_ASYNC_NT_STORE_T'
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await self._drop_async(Cur, Table)
+                try:
+                    await Cur.execute(f'DROP TYPE {NType}')
+                except DatabaseError:
+                    # No leftover type from a prior run; nothing to clean up.
+                    pass
+                await Cur.execute(f'CREATE TYPE {NType} AS TABLE OF NUMBER;')
+                try:
+                    await Cur.execute(
+                        f'CREATE TABLE {Table} (id NUMBER, v {NType}) '
+                        f'NESTED TABLE v STORE AS {Table}_V RETURN AS VALUE'
+                    )
+                    await Cur.execute(f'INSERT INTO {Table} (id) VALUES (1)')
+                    await Cur.execute(f'SELECT id FROM {Table}')
+                    self.assertEqual(await Cur.fetchone(), (1,))
+                    await Cur.execute(f'DROP TABLE {Table}')
+                finally:
+                    await Cur.execute(f'DROP TYPE {NType}')
 
     async def test_a_bool_declared_number_is_stored_as_a_number(self):
         # Async twin of TypesIntegration's.
