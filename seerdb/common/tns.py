@@ -8493,6 +8493,13 @@ def _oci_desc_hdr_post(timestamp: bytes) -> bytes:
     return timestamp.join(_OCI_DESC_HDR_POST_SEGMENTS)
 
 
+def _oci_desc_hdr_third_entry_end(timestamp: bytes) -> int:
+    # Where the header's third segment starts plus its leading `02` byte: the
+    # two segments ahead of it, each followed by a describe time.
+    head = _OCI_DESC_HDR_POST_SEGMENTS[:2]
+    return sum(len(seg) for seg in head) + 2 * len(timestamp) + 1
+
+
 def _oci_desc_ts_entry(timestamp: bytes) -> bytes:
     # The describe-time entry a non-last column block carries (§39.2).
     return _OCI_DESC_TS_ENTRY_PRE + timestamp + _OCI_DESC_TS_ENTRY_POST
@@ -8550,12 +8557,48 @@ def _oci_desc_trailer_frame() -> bytes:
     return bytes(frame)
 
 
-def _oci_desc_trailer() -> bytes:
+# The DESCRIBE reply at the 12c band (#1282), measured against a live 18c's
+# describe of a NUMBER / VARCHAR2 / DATE table. It is the 11g reply with zero
+# runs inserted and three carried values changed:
+#   - the header gains 8 zero bytes after the third describe-time entry;
+#   - each column block gains 20 zero bytes after its post-name byte 34, which
+#     reads 0x04 instead of 0x24, and its leading length-like byte reads 0x7a
+#     instead of 0x5c;
+#   - the trailer frame is 137 bytes, not 121: 8 zero bytes in front and 8 at
+#     the end, with byte 4 reading 0x05 instead of 0x04 and the type-dependent
+#     bytes (8, 9, 11) left zero, as 18c leaves them.
+# The OER behind the frame widens like every other (_oci_oer_tail). None of the
+# changed values is decoded; they are carried from the capture.
+_OCI_DESC_12C_HDR_GROWTH = 8
+_OCI_DESC_12C_BLK_LEAD = 0x7A
+_OCI_DESC_12C_POST_MARK_OFF = 34
+_OCI_DESC_12C_POST_MARK = 0x04
+_OCI_DESC_12C_BLK_GROWTH = 20
+_OCI_DESC_12C_TR_PAD = 8
+_OCI_DESC_12C_TR_MARK = 0x05
+
+
+def _oci_desc_12c() -> bool:
+    return _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+
+
+def _oci_desc_trailer_frame_12c(column_count: int) -> bytes:
+    frame = bytearray(_OCI_DESC_TRAILER_FRAME_LEN)
+    frame[_OCI_DESC_TR_COUNT] = column_count & 0xFF
+    frame[4] = _OCI_DESC_12C_TR_MARK
+    frame[16] = 0x09
+    pad = bytes(_OCI_DESC_12C_TR_PAD)
+    return pad + bytes(frame) + pad
+
+
+def _oci_desc_trailer(frame: bytes | None = None) -> bytes:
     # Built per reply, not once at import: the OER's offset-49 field carries the
     # sequence of the call being answered, which is only known per message
     # (#884). Freezing it at import would pin every DESCRIBE reply to whatever
     # the context held when the module loaded.
-    return _oci_desc_trailer_frame() + encode_oci_oer(
+    if frame is None:
+        frame = _oci_desc_trailer_frame()
+    return frame + encode_oci_oer(
         _OCI_DESC_STATUS,
         sequence=_OCI_DESC_OER_SEQUENCE,
         row_kind=_OCI_DESC_OER_ROW_FIELD,
@@ -8659,6 +8702,11 @@ def _oci_desc_block(col: ColumnMeta, *, last: bool, timestamp: bytes) -> bytes:
         entry = _oci_desc_ts_entry(timestamp)
         off = _OCI_DESC_BLK_TS_OFF
         post[off : off + len(entry)] = entry
+    if _oci_desc_12c():
+        pre[1] = _OCI_DESC_12C_BLK_LEAD
+        mark = _OCI_DESC_12C_POST_MARK_OFF
+        post[mark] = _OCI_DESC_12C_POST_MARK
+        post[mark + 1 : mark + 1] = bytes(_OCI_DESC_12C_BLK_GROWTH)
     block = bytes(pre) + _oci_desc_dalc(col.name) + bytes(post)
     if not last:
         # …and a `1` continuation flag 3 bytes before its end.
@@ -8690,9 +8738,16 @@ def encode_describe_reply_oci(
     out += _oci_desc_dalc(schema) + _oci_desc_dalc(table)
     header_post = bytearray(_oci_desc_hdr_post(timestamp))
     header_post[_OCI_DESC_COLCOUNT_OFF] = (len(columns) + 1) & 0xFF
+    if _oci_desc_12c():
+        # After the third describe-time entry and the `02` behind it (#1282).
+        at = _oci_desc_hdr_third_entry_end(timestamp)
+        header_post[at:at] = bytes(_OCI_DESC_12C_HDR_GROWTH)
     out += header_post
     for index, col in enumerate(columns):
         out += _oci_desc_block(col, last=index == len(columns) - 1, timestamp=timestamp)
+    if _oci_desc_12c():
+        out += _oci_desc_trailer(_oci_desc_trailer_frame_12c(len(columns)))
+        return bytes(out)
     trailer = bytearray(_oci_desc_trailer())
     trailer[_OCI_DESC_TR_COUNT] = len(columns) & 0xFF
     trailer[_OCI_DESC_TR_OPAQUE] = (

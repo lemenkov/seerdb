@@ -101,17 +101,23 @@ OCI_CMD_TRUNCATE_TABLE = 85
 # stays usable -- never a desynchronised stream, which is the failure mode that
 # guessing a layout invites.
 OCI_E2E_VALUES_OFF = 139
+# At the 12c band the head is 16 bytes longer, so the values begin 16 bytes
+# later (sqlplus 23.26 against a live 18c; the same walk lands on the call).
+OCI_E2E_VALUES_OFF_12C = 155
 OCI_E2E_MAX_VALUES = 9  # client_identifier, module, action, ... (thin's slots)
 
 
-def strip_oci_e2e_piggyback(body: bytes) -> bytes | None:
+def strip_oci_e2e_piggyback(
+    body: bytes, values_off: int = OCI_E2E_VALUES_OFF
+) -> bytes | None:
     """The real call behind an OCI end-to-end tracing piggyback, or ``None``.
 
     ``None`` means "this does not walk", and the caller must refuse the message
     rather than guess at it. See the note above for why the check matters more
-    than the layout.
+    than the layout. ``values_off`` is where the values begin in the session's
+    layout.
     """
-    at = OCI_E2E_VALUES_OFF
+    at = values_off
     for _ in range(OCI_E2E_MAX_VALUES + 1):
         if at >= len(body):
             return None

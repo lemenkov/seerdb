@@ -662,10 +662,28 @@ widenings, and the Mirror applies both at the 12c band:
 The row header and the describe tail keep their 11g length: 18c's differ only
 in instance values (an SCN).
 
-The `DESCRIBE <object>` reply (§6.0) is a different message and is not ported
-yet: 18c's grows by about 30 bytes per column. Nor is the end-to-end tracing
-piggyback sqlplus sends ahead of some calls; at the 12c band the Mirror refuses
-it instead of walking it.
+**The `DESCRIBE <object>` reply** (§6.0) is a different message, with its own
+widening at the 12c band. Against a live 18c's describe of a NUMBER / VARCHAR2 /
+DATE table, it is the 11g reply with zero runs inserted and three carried values
+changed:
+- the header gains 8 zero bytes after its third describe-time entry;
+- each column block gains 20 zero bytes after its post-name byte 34, which reads
+  `0x04` (11g: `0x24`), and the block's leading byte reads `0x7a` (11g: `0x5c`);
+- the trailer frame is 137 bytes, not 121: 8 zero bytes in front and 8 at the
+  end, byte 4 reading `0x05` (11g: `0x04`), and the type-dependent bytes zero;
+- its OER widens like every other.
+None of the changed values is decoded; they are carried.
+
+**The end-to-end tracing piggyback** (`11 87`) sqlplus sends ahead of a call
+has a head 16 bytes longer at the 12c band, so its values start at offset 155,
+not 139. The Mirror walks it there, and lands on the call behind it.
+
+With these, sqlplus 23.26's output against a 12.1 Mirror is byte-identical to
+the same session at 11.2. That covers queries, fetches in batches, errors, DDL,
+DML, commit and rollback, `DESCRIBE`, `VARIABLE` / `EXEC` out binds and bind
+variables. What still fails at 11.2 fails the same way at 12.1: a CLOB select
+hangs (over PostgreSQL and SQLite alike), and over the SQLite example `SET
+SERVEROUTPUT ON` loses the session.
 
 These captured templates are **stepping stones** — the crypto and offsets are
 understood; a proper `deadbeef` codec (encoding these packets field-by-field

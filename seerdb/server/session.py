@@ -32,6 +32,8 @@ from seerdb.common.exceptions import InterfaceError, NotSupportedError, Truncate
 from seerdb.common.oci import (
     OCI_CMD_COMMIT,
     OCI_CMD_ROLLBACK,
+    OCI_E2E_VALUES_OFF,
+    OCI_E2E_VALUES_OFF_12C,
     strip_oci_e2e_piggyback,
 )
 from seerdb.common.sqltext import (
@@ -1350,7 +1352,12 @@ def _serve_oci_session(
             # The walker checks its own landing and returns None rather than
             # guess, so a shape it does not know becomes a clean refusal instead
             # of a desynchronised stream.
-            behind = strip_oci_e2e_piggyback(body)
+            behind = strip_oci_e2e_piggyback(
+                body,
+                OCI_E2E_VALUES_OFF_12C
+                if oci_version >= FIELD_VERSION_12_1
+                else OCI_E2E_VALUES_OFF,
+            )
             if behind is not None:
                 body = behind
         if len(body) >= 3 and body[0] == TTI_FUN:
