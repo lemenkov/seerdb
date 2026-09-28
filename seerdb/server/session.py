@@ -606,9 +606,8 @@ def handle_login(
             else make_challenge(secret.encode('utf-8'), salt=token_bytes(10))
         )
         stream.send_raw(encode_challenge_oci(challenge))
-        _, client_sesskey, auth_password = parse_auth_response_oci(
-            _expect(stream, TNS_DATA, 'AUTH')
-        )
+        auth_body = _expect(stream, TNS_DATA, 'AUTH')
+        _, client_sesskey, auth_password = parse_auth_response_oci(auth_body)
     else:
         # The thin challenge follows the session's field version: 12.1+ gets the
         # PBKDF2 shape and derivation, below that the 11g one (#829).
@@ -647,28 +646,7 @@ def handle_login(
     # if it has deferred that connect until now; one that connected during
     # authenticate() cannot, and skips the hook. Either way the login stands
     # (#826).
-    if not sqlplus:
-        connect_attrs = parse_auth_connect_attrs(auth_body, field_version)
-        open_session = getattr(backend, 'open_session', None)
-        if open_session is not None:
-            try:
-                open_session(connect_attrs)
-            except BackendError as err:
-                # The credentials verified; the BACKEND refused. Relay its own
-                # code, so a client behind a passthrough sees what a direct
-                # connection would have seen (#1006).
-                _deny_login(
-                    stream,
-                    f'upstream session refused: {err.ora_message}',
-                    ora_code=err.ora_code,
-                    message=err.ora_message,
-                )
-            except Exception as exc:  # noqa: BLE001
-                _deny_login(
-                    stream,
-                    f'upstream session failed: {exc}',
-                    **_login_failure_error(exc),
-                )
+    _open_backend_session(stream, backend, sqlplus, auth_body, field_version)
 
     # Application context the client declared at connect
     # (`connect(appcontext=[...])`). It arrives in this AUTH -- AFTER the backend
@@ -766,6 +744,44 @@ def _login_failure_error(exc: Exception) -> dict:
 # itself was fine but the server cannot produce a session, and there is no more
 # specific code to relay (#1006).
 _ORA_NOT_AVAILABLE = 1034
+
+
+def _open_backend_session(
+    stream: PacketStream,
+    backend: Backend,
+    sqlplus: bool,
+    auth_body: bytes,
+    field_version: int,
+) -> None:
+    """Let the backend open its session, now that the client's proof checked out.
+
+    sqlplus opens one too. Its OCI AUTH is not read for the connect-time
+    attributes, so it opens with none -- but it must open: a backend that
+    connects upstream here (the passthrough) otherwise serves every sqlplus
+    statement from no connection at all (#1289). A refusal fails the login.
+    """
+    connect_attrs = (
+        {} if sqlplus else parse_auth_connect_attrs(auth_body, field_version)
+    )
+    open_session = getattr(backend, 'open_session', None)
+    if open_session is None:
+        return
+    try:
+        open_session(connect_attrs)
+    except BackendError as err:
+        # The credentials verified; the BACKEND refused. Relay its own code, so
+        # a client behind a passthrough sees what a direct connection would
+        # have seen (#1006).
+        _deny_login(
+            stream,
+            f'upstream session refused: {err.ora_message}',
+            ora_code=err.ora_code,
+            message=err.ora_message,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _deny_login(
+            stream, f'upstream session failed: {exc}', **_login_failure_error(exc)
+        )
 
 
 def _deny_login(
