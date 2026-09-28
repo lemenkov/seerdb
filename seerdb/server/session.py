@@ -550,12 +550,24 @@ def handle_login(
             # skips it (#265).
             capabilities = _expect(stream, TNS_DATA, 'TYPE')
             stream.send_raw(encode_type_reply_sqlplus())
-            # That request carries sqlplus's capability block (it is the DTY
-            # proper; the round before it is its TTI_PRO). Which LOB column form
-            # this client reads follows from it: the one with the LOB's length
-            # and chunk size, if it offered CCAP_LOB_12C (#1287).
+            # That request is sqlplus's DTY proper (the round before it carries
+            # its TTI_PRO), so its capability block says what the client reads.
+            # Which LOB column form: the one with the LOB's length and chunk
+            # size, if it offered CCAP_LOB_12C (#1287).
             lob_caps = client_compile_cap(capabilities, CCAP_LOB) or 0
             _ENCODE_OCI_LOB_12C.set(bool(lob_caps & CCAP_LOB_12C))
+            # And what version it speaks. sqlplus does not come down to what the
+            # Mirror advertised, as a thin client does -- sqlplus 23.26 sends 27
+            # -- but an OLDER one sends its own, lower, and must be served at
+            # that: sqlplus 11.2 at a 12.1 Mirror cannot use the 12c-band login
+            # and failed with ORA-28041 (#1291). A higher one keeps the Mirror's.
+            spoken = sqlplus_field_version(
+                capabilities, field_version, min_field_version
+            )
+            if spoken != field_version:
+                field_version = negotiated = spoken
+                _DECODE_FIELD_VERSION.set(field_version)
+                _ENCODE_FIELD_VERSION.set(field_version)
         osesskey = _expect_login_message(stream, 'OSESSKEY')
 
     # --- O5LOGON (§4) ---
@@ -792,6 +804,29 @@ def _open_backend_session(
         _deny_login(
             stream, f'upstream session failed: {exc}', **_login_failure_error(exc)
         )
+
+
+def sqlplus_field_version(
+    capabilities: bytes, field_version: int, min_field_version: int
+) -> int:
+    """The field version to serve a sqlplus / thick-OCI client at, from the
+    capability block it sent (its DTY proper, the round after its TTI_PRO).
+
+    sqlplus does not come down to what the Mirror advertised, as a thin client
+    does -- sqlplus 23.26 sends 27 -- so a higher version keeps the Mirror's own.
+    An older sqlplus sends its own, lower one, and is served at that: sqlplus
+    11.2 at a 12.1 Mirror cannot use the 12c-band login (#1291). A block that
+    cannot be read keeps the Mirror's version too.
+    """
+    spoken = client_field_version(capabilities)
+    if spoken is None or spoken >= field_version:
+        return field_version
+    if spoken < min_field_version:
+        raise InterfaceError(
+            f'sqlplus speaks TTC field version {spoken}, below the '
+            f'{min_field_version} this Mirror serves'
+        )
+    return spoken
 
 
 def _deny_login(

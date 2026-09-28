@@ -635,6 +635,17 @@ from 12.1 the deadbeef DTY reply advertises **18c's field version** and the
 Mirror serves sqlplus in 18c's layout, while thin clients keep 12.1. sqlplus
 accepts that over a 12.1 ACCEPT.
 
+**That band is per client (#1291).** An older sqlplus cannot use it: sqlplus
+11.2 answers the 12c-band challenge with ORA-28041. So, as a real server does,
+the Mirror serves each sqlplus at the version the client speaks. That version
+is in the client's capability block, and in this dialect the block arrives one
+round later than the Mirror's round names suggest: the "DTY" round carries
+sqlplus's `TTI_PRO`, and the "TYPE" round the DTY proper. sqlplus does not
+come down to what the Mirror advertised, as a thin client does. sqlplus 23.26
+sends 27 and sqlplus 11.2 sends 6, so the Mirror takes the lower of the
+client's version and its own. Everything after that point follows it: the
+challenge, the result trailer, and the session's OCI layout.
+
 In that layout the narrow `OALL8` preamble grows by **64
 zero bytes** ahead of the SQL, eight more 8-byte slots. The SQL text moves from
 offset 176 to 240, while the bind count (71) and the bind section behind the SQL
