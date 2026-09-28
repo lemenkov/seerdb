@@ -39,6 +39,13 @@ just as the JSON / VECTOR / BOOLEAN column types (21c/23ai) are refused with
 ORA-00902. The rest have no such guard and simply do not pass; they are the honest
 edge of this adapter:
 
+- **``ROWNUM``, as a filter only** — a top-level ``WHERE … AND ROWNUM <= n``
+  (``< n``, ``= n``; n a number or a bind) becomes ``LIMIT``, the top-N idiom over
+  an ordered inline view included. Oracle numbers rows before it sorts, groups,
+  de-duplicates or combines them, and ``LIMIT`` applies after, so with an
+  ``ORDER BY``, ``GROUP BY``, ``DISTINCT``, aggregate or set operator at that level,
+  an ``OR``, ``FOR UPDATE``, or ``ROWNUM`` anywhere else (a select list,
+  nested-ROWNUM pagination), it is refused by name (#1271).
 - **UROWID / index-organized rowids** — the physical ``ROWID`` pseudo-column is
   emulated with PostgreSQL's ``ctid``, rendered in Oracle's 18-character extended
   form (the table's oid as the data object), so ``SELECT ROWID``, a bound rowid and
@@ -2030,10 +2037,144 @@ def _quote_hash_identifiers(sql: str) -> str:
     return ''.join(out)
 
 
+_ROWNUM_WORD = re.compile(r'\bROWNUM\b', re.IGNORECASE)
+_ROWNUM_PREDICATE = re.compile(r'ROWNUM\s*(<=|<|=)\s*(\d+|:\w+)', re.IGNORECASE)
+# The top-level words under which ROWNUM and LIMIT part ways: Oracle numbers the
+# rows before it sorts, groups, de-duplicates or combines them, LIMIT after; an
+# OR could bind the filter to one side only (#1271).
+_ROWNUM_BLOCKERS = frozenset(
+    {
+        'ORDER', 'GROUP', 'HAVING', 'UNION', 'INTERSECT', 'MINUS', 'EXCEPT',
+        'CONNECT', 'START', 'FOR', 'OR', 'FETCH', 'OFFSET', 'LIMIT', 'MODEL',
+    }
+)  # fmt: skip
+_ROWNUM_AGGREGATES = re.compile(
+    r'\b(?:COUNT|SUM|AVG|MIN|MAX|LISTAGG|STDDEV|VARIANCE|MEDIAN|COLLECT|XMLAGG|'
+    r'JSON_ARRAYAGG|JSON_OBJECTAGG|ARRAY_AGG|STRING_AGG|CORR|COVAR_POP|COVAR_SAMP|'
+    r'REGR_\w+|PERCENTILE_\w+|RANK|DENSE_RANK|CUME_DIST|PERCENT_RANK)\s*\(|\bOVER\b',
+    re.IGNORECASE,
+)
+
+
+def _top_level_words(sql: str) -> tuple[list[tuple[int, str]], list[int]]:
+    # (position, UPPER word) of every word outside parentheses, quotes and
+    # comments, and the position of every ROWNUM outside quotes and comments at
+    # any depth.
+    words: list[tuple[int, str]] = []
+    rownums: list[int] = []
+    depth, i, n = 0, 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch in '\'"':
+            end = sql.find(ch, i + 1)
+            while end != -1 and sql[end + 1 : end + 2] == ch:
+                end = sql.find(ch, end + 2)
+            i = n if end == -1 else end + 1
+        elif sql.startswith('--', i):
+            end = sql.find('\n', i)
+            i = n if end == -1 else end + 1
+        elif sql.startswith('/*', i):
+            end = sql.find('*/', i + 2)
+            i = n if end == -1 else end + 2
+        elif ch == '(':
+            depth += 1
+            i += 1
+        elif ch == ')':
+            depth -= 1
+            i += 1
+        elif ch.isalpha() or ch == '_':
+            j = i
+            while j < n and (sql[j].isalnum() or sql[j] in '_$#'):
+                j += 1
+            word = sql[i:j].upper()
+            if word == 'ROWNUM':
+                rownums.append(i)
+            if depth == 0:
+                words.append((i, word))
+            i = j
+        else:
+            i += 1
+    return words, rownums
+
+
+def _rewrite_rownum(sql: str) -> str:
+    """Translate `... WHERE a AND ROWNUM <= n` to `... WHERE a LIMIT n` (#1271).
+
+    Only where the two mean the same: a top-level SELECT whose WHERE is a chain
+    of ANDs with one `ROWNUM <= n`, `< n` or `= n` in it (n a number or a bind),
+    and nothing that Oracle applies after numbering the rows -- no ORDER BY,
+    GROUP BY, DISTINCT, aggregate or analytic function, set operator,
+    hierarchical query, FOR UPDATE or OR. Nested-ROWNUM pagination has no
+    faithful rewrite (#33); every ROWNUM this leaves is refused by name, rather
+    than reaching PostgreSQL as an unknown column.
+    """
+    if not _ROWNUM_WORD.search(sql):
+        return sql
+    words, rownums = _top_level_words(sql)
+    if not rownums:
+        return sql  # only in a string or a comment
+    refusal = UnsupportedFeature(
+        'ROWNUM is translated only as a top-level `AND ROWNUM <= n` filter of a '
+        'query with no ORDER BY, GROUP BY, DISTINCT, aggregate or set operator'
+    )
+    names = [w for _, w in words]
+    if (
+        len(rownums) != 1
+        or not names
+        or names[0] != 'SELECT'
+        or 'WHERE' not in names
+        or 'FROM' not in names
+        or _ROWNUM_BLOCKERS.intersection(names)
+    ):
+        raise refusal
+    first_at = dict((w, p) for p, w in reversed(words))
+    where = first_at['WHERE']
+    select_list = sql[words[0][0] + len('SELECT') : first_at['FROM']]
+    pos = rownums[0]
+    first = select_list.split(None, 1)[0].upper() if select_list.split() else ''
+    if (
+        pos < where
+        or (pos, 'ROWNUM') not in words
+        or first in ('DISTINCT', 'UNIQUE')
+        or _ROWNUM_AGGREGATES.search(select_list)
+    ):
+        raise refusal
+    predicate = _ROWNUM_PREDICATE.match(sql, pos)
+    if predicate is None:
+        raise refusal
+    before = sql[where + len('WHERE') : pos].rstrip()
+    after = sql[predicate.end() :].rstrip().rstrip(';').rstrip()
+    joined_before = re.search(r'\bAND$', before, re.IGNORECASE)
+    joined_after = re.match(r'\s*AND\b', after, re.IGNORECASE)
+    if (before and not joined_before) or (after and not joined_after):
+        raise refusal
+    op, bound = predicate.group(1), predicate.group(2)
+    if bound.isdigit():
+        count = int(bound)
+        limit = str(
+            count if op == '<=' else max(count - 1, 0) if op == '<' else int(count == 1)
+        )
+    elif op == '<=':
+        limit = bound
+    elif op == '<':
+        limit = f'greatest({bound} - 1, 0)'
+    else:
+        limit = f'CASE WHEN {bound} = 1 THEN 1 ELSE 0 END'
+    if before:
+        rest = before[: joined_before.start()].rstrip() if joined_before else before
+        rest = f'{rest} {after}' if after else rest
+    else:
+        rest = after[joined_after.end() :].strip() if joined_after else after
+    head = sql[:where].rstrip()
+    body = f'{head} WHERE {rest.strip()}' if rest.strip() else head
+    return f'{body} LIMIT {limit}'
+
+
 def _translate_idioms(sql: str) -> str:
     """Rewrite the Oracle SQL functions / literal idioms the suite uses to their
     PostgreSQL equivalents (#502). Applied to every statement."""
     sql = _quote_hash_identifiers(sql)
+    sql = _rewrite_rownum(sql)
     sql = _translate_connect_by(sql)
     sql = _translate_signed_year(sql)
     sql = _translate_decode(sql)
