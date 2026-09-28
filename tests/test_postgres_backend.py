@@ -40,7 +40,10 @@ from postgres_backend import (  # noqa: E402
     _bc_date_loader,
     _distinct_bind_refs,
     _iot_primary_key,
+    _object_column_meta,
+    _object_type_oid,
     _parse_out_assignments,
+    _pg_oid_of,
     _reject_unsupported_ddl_types,
     _strip_leading_comments,
     _to_interval_ym,
@@ -184,22 +187,96 @@ def test_translate_ddl_maps_object_type_to_composite() -> None:
     assert 'PYORACLE_REF_PERSON' in sent  # the type name is untouched
 
 
-def test_translate_ddl_maps_ref_column_to_bytea() -> None:
-    # A `REF <object type>` column has no PostgreSQL equal; since the REF bind that
-    # uses it is 12c+ and skips on the 11g Mirror, the column becomes a bytea
-    # placeholder so the CREATE succeeds (#139). A REF() call is left alone.
-    sent = _translate_ddl('CREATE TABLE t (id NUMBER, r REF PYORACLE_REF_PERSON)')
-    assert 'r bytea' in sent
-    assert 'REF' not in sent
-    # CREATE TABLE ... OF type (a typed table) passes through unchanged.
-    assert _translate_ddl('CREATE TABLE people OF PYORACLE_REF_PERSON') == (
-        'CREATE TABLE people OF PYORACLE_REF_PERSON'
+def test_translate_ddl_maps_a_ref_column_to_its_companion_type() -> None:
+    # A `REF <type>` column holds the type's `<type>$ref` companion -- the object
+    # table's oid and the row's stable id -- which sys.deref() resolves (#1127).
+    # A column merely NAMED `ref` is left alone.
+    assert _translate_ddl('CREATE TABLE t (id NUMBER, r REF person_t)') == (
+        'CREATE TABLE t (id numeric, r person_t$ref)'
     )
-    # A column merely NAMED `ref` (with an ordinary type) is not a REF type, so
-    # it is left alone — the match is anchored to a column name before REF, which
-    # a leading `ref INTEGER` has none of (BizarroCharacterTest, #10275).
-    named = _translate_ddl('CREATE TABLE other (id INTEGER, ref INTEGER)')
-    assert 'ref integer' in named.lower() and 'bytea' not in named
+    assert (
+        _translate_ddl('CREATE TABLE t (ref NUMBER)') == 'CREATE TABLE t (ref numeric)'
+    )
+
+
+def test_an_object_type_brings_its_ref_companions() -> None:
+    out = _translate_ddl('CREATE TYPE person_t AS OBJECT (id NUMBER)')
+    assert out.startswith('CREATE TYPE person_t AS (id numeric); ')
+    assert 'CREATE TYPE person_t$ref AS (tab oid, id uuid)' in out
+    assert 'CREATE FUNCTION sys.deref(r person_t$ref) RETURNS person_t' in out
+    # Dropped first, without CASCADE: a REF column still holding the type keeps
+    # the drop refused, as Oracle's ORA-02303 does.
+    drop = _translate_ddl('DROP TYPE person_t')
+    assert drop.endswith('; DROP TYPE person_t')
+    assert 'CASCADE' not in drop
+
+
+def test_an_object_table_is_an_ordinary_table_with_a_hidden_object_id() -> None:
+    # A typed table cannot take the stable row id a REF needs, so an object
+    # table is the type's columns plus `sys_nc_oid$`, recorded with its type.
+    out = _translate_ddl('CREATE TABLE people OF person_t')
+    assert out.startswith(
+        'CREATE TABLE people (LIKE person_t, "sys_nc_oid$" uuid NOT NULL '
+        'DEFAULT gen_random_uuid() UNIQUE); '
+    )
+    assert "INSERT INTO sys.ora_object_tables VALUES ('people'::regclass" in out
+
+
+def test_deref_becomes_a_parenthesised_sys_deref() -> None:
+    assert _translate_idioms('SELECT id, DEREF(r).name FROM t') == (
+        'SELECT id, (sys.deref(r)).name FROM t'
+    )
+    assert _translate_idioms('SELECT DEREF(:1).name FROM dual') == (
+        'SELECT (sys.deref(:1)).name FROM dual'
+    )
+
+
+def test_a_ref_survives_update_and_vacuum_full() -> None:
+    # The point of the hidden object id: an UPDATE and a VACUUM FULL both move
+    # the row physically (its ctid), and a stored REF still reaches it.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for stmt in (
+            'DROP TABLE t_refkeep',
+            'DROP TABLE t_refpeople',
+            'DROP TYPE t_refperson',
+        ):
+            try:
+                backend.execute(stmt)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute(
+            'CREATE TYPE t_refperson AS OBJECT (id NUMBER, name VARCHAR2(40))'
+        )
+        backend.execute('CREATE TABLE t_refpeople OF t_refperson')
+        backend.execute("INSERT INTO t_refpeople VALUES (1, 'Alice')")
+        backend.execute('CREATE TABLE t_refkeep (id NUMBER, r REF t_refperson)')
+        (ref,) = backend.execute(
+            'SELECT REF(p) FROM t_refpeople p WHERE p.id = 1'
+        ).rows[0]
+        assert ref.type_name == 'T_REFPERSON'
+        backend.execute('INSERT INTO t_refkeep (id, r) VALUES (:1, :2)', [100, ref])
+        backend.execute("UPDATE t_refpeople SET name = 'Alicia' WHERE id = 1")
+        backend.commit()
+        backend._conn.autocommit = True
+        backend._conn.execute('VACUUM FULL t_refpeople')
+        backend._conn.autocommit = False
+        rows = backend.execute(
+            'SELECT id, DEREF(r).name FROM t_refkeep WHERE id = 100'
+        ).rows
+        assert rows == [(100, 'Alicia')]
+        assert backend.execute('SELECT DEREF(:1).name FROM dual', [ref]).rows == [
+            ('Alicia',)
+        ]
+        for stmt in (
+            'DROP TABLE t_refkeep',
+            'DROP TABLE t_refpeople',
+            'DROP TYPE t_refperson',
+        ):
+            backend.execute(stmt)
+        backend.commit()
+    finally:
+        backend.close()
 
 
 def test_ref_select_matches_the_object_ref_fetch() -> None:
@@ -510,7 +587,8 @@ def test_a_collection_type_comes_with_its_constructors() -> None:
     # An object type's constructor is built from the catalog once the type
     # exists, one argument per attribute.
     obj = _translate_ddl('CREATE TYPE s.o AS OBJECT (a NUMBER, b VARCHAR2(5));')
-    assert obj.startswith('CREATE TYPE s.o AS (a numeric, b varchar(5)); DO $$')
+    assert obj.startswith('CREATE TYPE s.o AS (a numeric, b varchar(5)); ')
+    assert obj.index('; CREATE TYPE s.o$ref') < obj.index('; DO $$ DECLARE t regtype')
     assert "to_regtype('s.o')" in obj and 'SELECT ROW(%s)::%s' in obj
     replaced = _translate_ddl('CREATE OR REPLACE TYPE s.a AS VARRAY(3) OF NUMBER')
     assert replaced.startswith('DO $$') and '; DROP TYPE IF EXISTS s.a; ' in replaced
@@ -518,20 +596,27 @@ def test_a_collection_type_comes_with_its_constructors() -> None:
 
 def test_a_replaced_type_is_dropped_and_created() -> None:
     # PostgreSQL has no CREATE OR REPLACE TYPE; the old type goes, without
-    # CASCADE, and the new one is translated as a plain CREATE TYPE (#1197).
-    assert _type_ddl('CREATE OR REPLACE TYPE s.o AS OBJECT (a NUMBER)') == (
-        'DROP TYPE IF EXISTS s.o; CREATE TYPE s.o AS (a numeric)'
+    # CASCADE, and the new one is translated as a plain CREATE TYPE (#1197). The
+    # REF companions of an object type depend on it, so they go first when they
+    # exist, and a replaced object type gets new ones (#1127).
+    companions_first = (
+        "DO $$ BEGIN IF to_regtype('s.o$ref') IS NOT NULL THEN "
+        'DROP FUNCTION sys.deref(s.o$ref); DROP TYPE s.o$ref; END IF; END $$'
+        '; DROP TYPE IF EXISTS s.o; CREATE TYPE s.o AS (a numeric)'
     )
-    assert _type_ddl('create or replace type s.v as varray(4) of number;') == (
-        'DROP TYPE IF EXISTS s.v; CREATE DOMAIN s.v AS numeric[] '
+    replaced_object = _type_ddl('CREATE OR REPLACE TYPE s.o AS OBJECT (a NUMBER)')
+    assert replaced_object.startswith(companions_first)
+    assert '; CREATE TYPE s.o$ref AS (tab oid, id uuid)' in replaced_object
+    assert _type_ddl('create or replace type s.v as varray(4) of number;').endswith(
+        '; DROP TYPE IF EXISTS s.v; CREATE DOMAIN s.v AS numeric[] '
         'CHECK (VALUE IS NULL OR array_length(VALUE, 1) <= 4)'
     )
-    assert _type_ddl('create or replace type s.t\n    as table of s.o;') == (
-        'DROP TYPE IF EXISTS s.t; CREATE DOMAIN s.t AS s.o[]'
+    assert _type_ddl('create or replace type s.t\n    as table of s.o;').endswith(
+        '; DROP TYPE IF EXISTS s.t; CREATE DOMAIN s.t AS s.o[]'
     )
     # FORCE is not translated.
     forced = 'CREATE OR REPLACE TYPE s.o FORCE AS OBJECT (a NUMBER)'
-    assert not _type_ddl(forced).startswith('DROP TYPE')
+    assert not _type_ddl(forced).startswith(('DROP TYPE', 'DO $$'))
     # A type something depends on is refused as Oracle refuses it; the same
     # SQLSTATE on another statement keeps the generic code.
     held = _FakePgError('2BP01', 'cannot drop type s.o because other objects depend')
@@ -643,6 +728,39 @@ def test_translate_admin_maps_session_user_and_index() -> None:
     assert (
         _translate_admin('CREATE INDEX test_schema.ix1 ON test_schema.t (c)')
         == 'CREATE INDEX ix1 ON test_schema.t (c)'
+    )
+
+
+def test_translate_admin_sets_the_session_time_zone_without_inverting_it() -> None:
+    # A 12.1+ client sends ALTER SESSION SET TIME_ZONE at login. PostgreSQL reads
+    # a bare offset as POSIX and INVERTS it (`SET TIME ZONE '+05:30'` runs at
+    # -05:30), so the offset goes in as an explicit POSIX spec -- and is also
+    # kept in Oracle's spelling, which SESSIONTIMEZONE reports back.
+    assert _translate_admin("ALTER SESSION SET TIME_ZONE='+05:30'") == (
+        "DO $$ BEGIN PERFORM set_config('TimeZone', '<+05:30>-05:30', false); "
+        "PERFORM set_config('seerdb.time_zone', '+05:30', false); END $$"
+    )
+    # A single-digit hour is Oracle's to normalise; a negative sub-hour offset
+    # keeps its sign.
+    assert _translate_admin("alter session set time_zone = '-0:30'") == (
+        "DO $$ BEGIN PERFORM set_config('TimeZone', '<-00:30>+00:30', false); "
+        "PERFORM set_config('seerdb.time_zone', '-00:30', false); END $$"
+    )
+    # A region name means the same thing to both, and is echoed as given.
+    assert _translate_admin("ALTER SESSION SET TIME_ZONE='Europe/Moscow'") == (
+        "DO $$ BEGIN PERFORM set_config('TimeZone', 'Europe/Moscow', false); "
+        "PERFORM set_config('seerdb.time_zone', 'Europe/Moscow', false); END $$"
+    )
+    # Any other ALTER SESSION is still the harmless no-op it was.
+    assert _translate_admin("ALTER SESSION SET NLS_DATE_FORMAT='YYYY'") == _NO_OP
+
+
+def test_sessiontimezone_reads_the_zone_the_session_was_given() -> None:
+    # The Oracle spelling ALTER SESSION stored, or before any was set the
+    # session's own offset in Oracle's `+hh:mm` form.
+    assert _translate_idioms('SELECT sessiontimezone FROM dual') == (
+        "SELECT coalesce(nullif(current_setting('seerdb.time_zone', true), ''), "
+        "to_char(now(), 'TZH:TZM')) FROM dual"
     )
     # An ordinary statement is passed through untouched.
     assert _translate_admin('SELECT 1 FROM dual') == 'SELECT 1 FROM dual'
@@ -1613,6 +1731,225 @@ def test_an_identifier_containing_a_hash_is_quoted() -> None:
     assert quote('SELECT 1 FROM dual') == 'SELECT 1 FROM dual'
 
 
+# --- DBMS_PICKLER.GET_TYPE_SHAPE (#1134) -----------------------------------------
+
+# The TDS real 23ai returned for each type (type_shape capture, 2026-09-25), the
+# ground truth the encoder has to reproduce. The DDL of each is in the shapes
+# below; the OIDs inside are not in a TDS, so these bytes are the server's own.
+_CAPTURED_TDS = {
+    'PYO_TS_SUB': '0000001426010001000100290000000000090600812a0007',
+    'PYO_TS_ALL': '0000007926020001001600290000000000440600810605020609000600000500050a07003c01000001000a01000007003c820000010008820000130010252d0215061503170621061d1d1e27060081282a0007000a000d0010001300150017001d00230029002f003200330034003500370039003b003d003e003f0041',
+    'PYO_TS_VARRAY': '0000001e260100010001ff290000000000131c0000001d0000000a032a0600810007',
+    'PYO_TS_TABLE_V': '00000021260100010001ff290000000000161c0000001d00000000022a0700140100000007',
+    'PYO_TS_TABLE_O': '00000057260100010001ff2900000000004c1c0000001d00000000022a1b00000023fafd000000310000001426010001000100290000000000090600812a00070000001526010001000200290000000000081a1a2a000700080007',
+    'PYO_TS_VARRAY_O': '00000057260100010001ff2900000000004c1c0000001d00000003032a1b00000023fafd000000310000001426010001000100290000000000090600812a00070000001526010001000200290000000000081a1a2a000700080007',
+    'PYO_T2_NUM2': '00000019260100010002002900000000000c0600810600812a0007000a',
+    'PYO_T2_VC': '0000001c260100010002002900000000000f0700140100000604002a0007000d',
+    'PYO_T2_TS': '00000013260200010001002900000000000815062a0007',
+    'PYO_T2_BF': '000000122602000100010029000000000007252a0007',
+    'PYO_T2_CL': '0000001226010001000100290000000000071d2a0007',
+    'PYO_T2_DT': '000000122601000100010029000000000007022a0007',
+    'PYO_T2_EMB': '00000020260100010003002900000000001106008127060081060081282a0007000b000e',
+    'PYO_T2_TAB_VC': '00000062260100010001ff290000000000571c0000001d00000000022a1b00000023fafd0000003c0000001c260100010002002900000000000f0700140100000604002a0007000d0000001826010001000300290000000000091a1a1a2a0007000800090007',
+    'PYO_T2_VA_NUM2': '0000005f260100010001ff290000000000541c0000001d00000005032a1b00000023fafd0000003900000019260100010002002900000000000c0600810600812a0007000a0000001826010001000300290000000000091a1a1a2a0007000800090007',
+    'PYO_T2_TN': '0000001e260100010001ff290000000000131c0000001d00000000022a0600810007',
+    'PYO_T2_TTN': '00000044260100010001ff290000000000391c0000001d00000000022a1b00000023fbfd0000001e260100010001ff290000000000131c0000001d00000000022a06008100070007',
+    'PYO_T2_VTN': '00000044260100010001ff290000000000391c0000001d00000004032a1b00000023fbfd0000001e260100010001ff290000000000131c0000001d00000000022a06008100070007',
+    'PYO_T2_TAB_EMB': '0000006e260100010001ff290000000000631c0000001d00000000022a1b00000023fafd0000004800000020260100010003002900000000001106008127060081060081282a0007000b000e00000020260100010005002900000000000d1a1a271a1a1a282a00070008000a000b000c0007',
+    'PYO_T3_ARR': '00000057260100010001ff2900000000004c1c0000001d0000000a032a1b00000023fafd000000310000001426010001000100290000000000090600812a00070000001526010001000200290000000000081a1a2a000700080007',
+    'PYO_T3_OBJ': '000000ab260100010004002900000000009a0600811b00000028fb1b00000084fb0700050100002afd00000057260100010001ff2900000000004c1c0000001d0000000a032a1b00000023fafd000000310000001426010001000100290000000000090600812a00070000001526010001000200290000000000081a1a2a000700080007fd0000001e260100010001ff290000000000131c0000001d00000000022a06008100070007000a00100016',
+}
+
+
+def _captured_shapes() -> dict:
+    from postgres_backend import _tds_chars, _tds_number, _tds_timestamp
+    from postgres_backend import _TdsCollection as C
+    from postgres_backend import _TdsLeaf as L
+    from postgres_backend import _TdsObject as _O
+
+    def O(*attrs):  # noqa: N802 -- a constructor, as the encoder's types read
+        return _O(tuple(attrs))
+
+    N = _tds_number()
+    V20 = _tds_chars(0x07, 20, False)
+    SUB = O(N)
+    NUM2 = O(N, N)
+    VC = O(V20, _tds_number(4, 0))
+    EMB = O(N, NUM2)
+    TN = C(False, 0, N)
+    ARR3 = C(True, 10, SUB)
+    return {
+        'PYO_TS_SUB': SUB,
+        'PYO_TS_ALL': O(
+            N,
+            _tds_number(5, 2),
+            _tds_number(9, 0),
+            _tds_number(0, 0),
+            L(b'\x05\x00'),
+            L(b'\x05\x0a'),
+            _tds_chars(0x07, 60, False),
+            _tds_chars(0x01, 10, False),
+            _tds_chars(0x07, 60, True),
+            _tds_chars(0x01, 8, True),
+            L(b'\x13\x00\x10'),
+            L(b'\x25', newer=True),
+            L(b'\x2d', newer=True),
+            L(b'\x02'),
+            _tds_timestamp(0x15, 6),
+            _tds_timestamp(0x15, 3),
+            _tds_timestamp(0x17, 6),
+            _tds_timestamp(0x21, 6),
+            L(b'\x1d'),
+            L(b'\x1d'),
+            L(b'\x1e'),
+            SUB,
+        ),
+        'PYO_TS_VARRAY': C(True, 10, N),
+        'PYO_TS_TABLE_V': C(False, 0, V20),
+        'PYO_TS_TABLE_O': C(False, 0, SUB),
+        'PYO_TS_VARRAY_O': C(True, 3, SUB),
+        'PYO_T2_NUM2': NUM2,
+        'PYO_T2_VC': VC,
+        'PYO_T2_TS': O(_tds_timestamp(0x15, 6)),
+        'PYO_T2_BF': O(L(b'\x25', newer=True)),
+        'PYO_T2_CL': O(L(b'\x1d')),
+        'PYO_T2_DT': O(L(b'\x02')),
+        'PYO_T2_EMB': EMB,
+        'PYO_T2_TAB_VC': C(False, 0, VC),
+        'PYO_T2_VA_NUM2': C(True, 5, NUM2),
+        'PYO_T2_TN': TN,
+        'PYO_T2_TTN': C(False, 0, TN),
+        'PYO_T2_VTN': C(True, 4, TN),
+        'PYO_T2_TAB_EMB': C(False, 0, EMB),
+        'PYO_T3_ARR': ARR3,
+        'PYO_T3_OBJ': O(N, ARR3, C(False, 0, N), _tds_chars(0x07, 5, False)),
+    }
+
+
+def test_the_tds_encoder_reproduces_what_23ai_sends() -> None:
+    # Byte for byte, header, embedded objects, references, null images and the
+    # index table included, for every captured object and collection type.
+    from postgres_backend import _tds
+
+    shapes = _captured_shapes()
+    assert set(shapes) == set(_CAPTURED_TDS)
+    for name, shape in shapes.items():
+        assert _tds(shape).hex() == _CAPTURED_TDS[name], name
+
+
+_TYPE_SHAPE_SQL = """
+        declare
+            t_Instantiable              varchar2(3);
+            t_SuperTypeOwner            varchar2(128);
+            t_SuperTypeName             varchar2(128);
+            t_SubTypeRefCursor          sys_refcursor;
+            t_Pos                       pls_integer;
+        begin
+            :ret_val := dbms_pickler.get_type_shape(:full_name, :oid,
+                :version, :tds, t_Instantiable, t_SuperTypeOwner,
+                t_SuperTypeName, :attrs_rc, t_SubTypeRefCursor);
+            :package_name := null;
+        end;"""
+
+
+def test_get_type_shape_is_answered_from_the_catalog() -> None:
+    # python-oracledb's type-metadata block, answered whole: the OID, the TDS,
+    # the attribute cursor, the type's own schema and name -- and 1001 for a
+    # type that does not exist, as GET_TYPE_SHAPE returns it.
+    from postgres_backend import _tds
+
+    from seerdb.common.tns_consts import (
+        TNS_TYPE_NUMBER,
+        TNS_TYPE_RAW,
+        TNS_TYPE_REFCURSOR,
+        TNS_TYPE_VARCHAR,
+    )
+    from seerdb.server.backend import BindVar
+
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    admin.execute('DROP SCHEMA IF EXISTS pyo_shape CASCADE')
+    admin.execute('CREATE SCHEMA pyo_shape')
+    backend = PostgresBackend(_CONNINFO, credentials={'PYO_SHAPE': 'x'})
+    try:
+        backend.authenticate('PYO_SHAPE')
+        backend.execute('CREATE TYPE pyo_shape_sub AS OBJECT (a NUMBER)')
+        backend.execute('CREATE TYPE pyo_shape_arr AS VARRAY(10) OF pyo_shape_sub')
+        backend.execute(
+            'CREATE TYPE pyo_shape_obj AS OBJECT '
+            '(n NUMBER(5,2), v VARCHAR2(20), arr pyo_shape_arr)'
+        )
+
+        def shape(full_name: str) -> list:
+            binds = [
+                BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=4),
+                BindVar(value=full_name, tns_type=TNS_TYPE_VARCHAR, max_size=128),
+                BindVar(value=None, tns_type=TNS_TYPE_RAW, max_size=16),
+                BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=4),
+                BindVar(value=None, tns_type=TNS_TYPE_RAW, max_size=32767),
+                BindVar(value=None, tns_type=TNS_TYPE_REFCURSOR, max_size=1),
+                BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=128),
+            ]
+            return backend.execute(_TYPE_SHAPE_SQL, binds).out_binds
+
+        (ret_val, _full, oid, version, tds, attrs, package) = shape(
+            'PYO_SHAPE.PYO_SHAPE_OBJ'
+        )
+        assert (ret_val, version, package) == (0, 1, None)
+        assert len(oid) == 16
+        from postgres_backend import _tds_chars, _tds_number, _TdsCollection, _TdsObject
+
+        sub = _TdsObject((_tds_number(),))
+        assert tds == _tds(
+            _TdsObject(
+                (
+                    _tds_number(5, 2),
+                    _tds_chars(0x07, 20, False),
+                    _TdsCollection(True, 10, sub),
+                )
+            )
+        )
+        assert [r[1:5] for r in attrs.rows] == [
+            ('N', 1, 'NUMBER', None),
+            ('V', 2, 'VARCHAR2', None),
+            ('ARR', 3, 'PYO_SHAPE_ARR', 'PYO_SHAPE'),
+        ]
+        # A collection has no attributes; unqualified resolves in the schema.
+        (ret_val, _f, _o, _v, tds, attrs, _p) = shape('PYO_SHAPE_ARR')
+        assert ret_val == 0 and attrs.rows == []
+        assert tds == _tds(_TdsCollection(True, 10, sub))
+        (ret_val, _f, oid, _v, tds, _a, _p) = shape('PYO_SHAPE.NO_SUCH_TYPE')
+        assert (ret_val, oid, tds) == (1001, None, None)
+    finally:
+        backend.close()
+        admin.execute('DROP SCHEMA pyo_shape CASCADE')
+        admin.close()
+
+
+def test_the_column_visibility_attribute_comes_out_of_the_ddl() -> None:
+    # INVISIBLE / VISIBLE follow a column's type in CREATE TABLE and in ALTER
+    # TABLE ADD / MODIFY; the statement loses it and says which columns it named,
+    # in PostgreSQL's spelling (#1195).
+    from postgres_backend import _column_visibility as visibility
+
+    assert visibility('CREATE TABLE t (a NUMBER, h NUMBER INVISIBLE DEFAULT 5)') == (
+        'CREATE TABLE t (a NUMBER, h NUMBER  DEFAULT 5)',
+        ('t', ['h'], [], False),
+    )
+    assert visibility(
+        'CREATE TABLE t ("Hid" NUMBER INVISIBLE, c NUMBER(5, 2) VISIBLE)'
+    )[1] == ('t', ['Hid'], ['c'], False)
+    # A MODIFY that only changes visibility leaves nothing to run.
+    assert visibility('ALTER TABLE t MODIFY (a INVISIBLE, b VISIBLE)')[1] == (
+        't',
+        ['a'],
+        ['b'],
+        True,
+    )
+    assert visibility('ALTER TABLE t MODIFY (a NUMBER(10) INVISIBLE)')[1][3] is False
+    # A table or column merely named so is not the attribute.
+    assert visibility('CREATE TABLE invisible (visible NUMBER)')[1] is None
+
+
 def test_translate_idioms_rewrites_rowid_pseudocolumn() -> None:
     # The ROWID pseudo-column becomes the row's ctid in Oracle's extended form —
     # one rewrite serving a SELECT, a WHERE ROWID = :bind (text compare), and the
@@ -2121,6 +2458,322 @@ def test_rownum_becomes_limit_only_where_it_means_limit() -> None:
             _rewrite_rownum(sql)
 
 
+def test_a_collection_column_fetches_as_a_collection() -> None:
+    # PostgreSQL describes a domain column by its base type; traced back to its
+    # table, an array-domain column is the collection type, and its value a
+    # collection DbObject of that type -- objects for an object element (#1206).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    drops = (
+        'DROP TABLE t_collfetch',
+        'DROP TYPE t_collfetch_nt',
+        'DROP TYPE t_collfetch_va',
+        'DROP TYPE t_collfetch_o',
+    )
+    try:
+        for stmt in drops:
+            try:
+                backend.execute(stmt)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute(
+            'CREATE TYPE t_collfetch_o AS OBJECT (id NUMBER, name VARCHAR2(9))'
+        )
+        backend.execute('CREATE TYPE t_collfetch_va AS VARRAY(3) OF NUMBER')
+        backend.execute('CREATE TYPE t_collfetch_nt AS TABLE OF t_collfetch_o')
+        backend.execute(
+            'CREATE TABLE t_collfetch (id NUMBER, v t_collfetch_va, w t_collfetch_nt)'
+        )
+        backend.execute(
+            "INSERT INTO t_collfetch VALUES (1, '{1,2}', "
+            "ARRAY[ROW(1,'a')::t_collfetch_o, ROW(2,'b')::t_collfetch_o])"
+        )
+        backend.execute("INSERT INTO t_collfetch VALUES (2, '{}', NULL)")
+        result = backend.execute('SELECT v, w FROM t_collfetch ORDER BY id')
+        assert [c.type_name for c in result.columns] == [
+            b'T_COLLFETCH_VA',
+            b'T_COLLFETCH_NT',
+        ]
+        (v1, w1), (v2, w2) = result.rows
+        assert v1.aslist() == [1, 2]
+        assert [(e.ID, e.NAME) for e in w1.aslist()] == [(1, 'a'), (2, 'b')]
+        assert (v2.aslist(), w2) == ([], None)
+        for stmt in drops:
+            backend.execute(stmt)
+        backend.commit()
+    finally:
+        backend.close()
+
+
+def test_a_collection_bind_is_bound_as_its_array() -> None:
+    # A collection image whose OID names an array domain is decoded against the
+    # element type and bound as the array; object elements as composites (#1206).
+    from seerdb.common.dbobject import ObjectImage
+    from seerdb.common.tns import encode_object_image
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    drops = (
+        'DROP TABLE t_collbind',
+        'DROP TYPE t_collbind_nt',
+        'DROP TYPE t_collbind_va',
+        'DROP TYPE t_collbind_o',
+    )
+    try:
+        for stmt in drops:
+            try:
+                backend.execute(stmt)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute(
+            'CREATE TYPE t_collbind_o AS OBJECT (id NUMBER, name VARCHAR2(9))'
+        )
+        backend.execute('CREATE TYPE t_collbind_va AS VARRAY(3) OF NUMBER')
+        backend.execute('CREATE TYPE t_collbind_nt AS TABLE OF t_collbind_o')
+        backend.execute(
+            'CREATE TABLE t_collbind (id NUMBER, v t_collbind_va, w t_collbind_nt)'
+        )
+        oids = dict(
+            backend.execute(
+                'SELECT type_name, type_oid FROM all_types '
+                "WHERE type_name LIKE 'T_COLLBIND%'"
+            ).rows
+        )
+        va = backend._collection_type(_pg_oid_of(bytes(oids['T_COLLBIND_VA'])))
+        nt = backend._collection_type(_pg_oid_of(bytes(oids['T_COLLBIND_NT'])))
+        elem = nt.element['object_type']
+        images = [
+            ObjectImage(
+                bytes(oids[t.name]), t.schema, t.name, None, encode_object_image(v)
+            )
+            for t, v in (
+                (va, va.newobject([5, Decimal('10.5')])),
+                (nt, nt.newobject([elem.newobject({'ID': 1, 'NAME': 'a'})])),
+            )
+        ]
+        backend.execute('INSERT INTO t_collbind VALUES (1, :1, :2)', images)
+        (v, w) = backend.execute('SELECT v, w FROM t_collbind').rows[0]
+        assert v.aslist() == [5, Decimal('10.5')]
+        assert [(e.ID, e.NAME) for e in w.aslist()] == [(1, 'a')]
+        for stmt in drops:
+            backend.execute(stmt)
+        backend.commit()
+    finally:
+        backend.close()
+
+
+def test_lob_attributes_are_clob_and_blob() -> None:
+    # An object's CLOB / BLOB attribute is the ora_clob / ora_blob domain; it is
+    # listed and described as CLOB / BLOB, not taken for a nested object type,
+    # fetches as its content, and binds back from the locators the Mirror served
+    # -- NULL for one it never served (#1256).
+    from seerdb.common.dbobject import ObjectImage
+    from seerdb.common.lob import LOB
+    from seerdb.common.tns import encode_object_image
+    from seerdb.common.tns_consts import TNS_TYPE_BLOB, TNS_TYPE_CLOB
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for stmt in ('DROP TABLE t_lobattr', 'DROP TYPE t_lobattr_o'):
+            try:
+                backend.execute(stmt)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute('CREATE TYPE t_lobattr_o AS OBJECT (id NUMBER, c CLOB, b BLOB)')
+        backend.execute('CREATE TABLE t_lobattr (k NUMBER, o t_lobattr_o)')
+        assert backend.execute(
+            'SELECT attr_name, attr_type_name, attr_type_owner FROM all_type_attrs '
+            "WHERE type_name = 'T_LOBATTR_O' ORDER BY attr_no"
+        ).rows == [('ID', 'NUMBER', None), ('C', 'CLOB', None), ('B', 'BLOB', None)]
+        backend.execute(
+            "INSERT INTO t_lobattr VALUES (1, t_lobattr_o(1, 'text', HEXTORAW('01FF')))"
+        )
+        (got,) = backend.execute('SELECT o FROM t_lobattr WHERE k = 1').rows[0]
+        assert (got.C, got.B) == ('text', b'\x01\xff')
+
+        (oid,) = backend.execute(
+            "SELECT type_oid FROM all_types WHERE type_name = 'T_LOBATTR_O'"
+        ).rows[0]
+        typ, _info = backend._object_type(_pg_oid_of(bytes(oid)))
+        assert [a['data_type'] for a in typ.attrs][1:] == [TNS_TYPE_CLOB, TNS_TYPE_BLOB]
+        obj = typ.newobject(
+            {
+                'ID': 2,
+                'C': LOB(TNS_TYPE_CLOB, b'served-clob', connection=None),
+                'B': LOB(TNS_TYPE_BLOB, b'never-served', connection=None),
+            }
+        )
+        image = ObjectImage(
+            bytes(oid), typ.schema, typ.name, None, encode_object_image(obj)
+        )
+        image.lob_contents = {b'served-clob': ('bound text', True)}
+        backend.execute('INSERT INTO t_lobattr VALUES (2, :1)', [image])
+        (got,) = backend.execute('SELECT o FROM t_lobattr WHERE k = 2').rows[0]
+        assert (got.C, got.B) == ('bound text', None)
+        for stmt in ('DROP TABLE t_lobattr', 'DROP TYPE t_lobattr_o'):
+            backend.execute(stmt)
+        backend.commit()
+    finally:
+        backend.close()
+
+
+def test_object_and_collection_attributes_nest() -> None:
+    # An object whose attributes are an object and a VARRAY of objects: the
+    # describe embeds both types, a fetch builds the nested DbObjects, and a
+    # bound image goes back into the nested composite and array (#1265).
+    from seerdb.common.dbobject import ObjectImage
+    from seerdb.common.tns import encode_object_image
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    drops = (
+        'DROP TABLE t_nest',
+        'DROP TYPE t_nest_outer',
+        'DROP TYPE t_nest_arr',
+        'DROP TYPE t_nest_sub',
+    )
+    try:
+        for stmt in drops:
+            try:
+                backend.execute(stmt)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute('CREATE TYPE t_nest_sub AS OBJECT (n NUMBER, s VARCHAR2(9))')
+        backend.execute('CREATE TYPE t_nest_arr AS VARRAY(3) OF t_nest_sub')
+        backend.execute(
+            'CREATE TYPE t_nest_outer AS OBJECT (id NUMBER, sub t_nest_sub, subs t_nest_arr)'
+        )
+        backend.execute('CREATE TABLE t_nest (k NUMBER, o t_nest_outer)')
+        backend.execute(
+            "INSERT INTO t_nest VALUES (1, t_nest_outer(1, t_nest_sub(7, 'seven'), "
+            "t_nest_arr(t_nest_sub(1, 'a'))))"
+        )
+        (o,) = backend.execute('SELECT o FROM t_nest').rows[0]
+        typ = o._dbtype
+        assert [a['object_type'].name for a in typ.attrs[1:]] == [
+            'T_NEST_SUB',
+            'T_NEST_ARR',
+        ]
+        assert (o.SUB.N, o.SUB.S) == (7, 'seven')
+        assert [(e.N, e.S) for e in o.SUBS.aslist()] == [(1, 'a')]
+        o.ID = 2
+        o.SUB.S = 'changed'
+        image = ObjectImage(typ.oid, typ.schema, typ.name, None, encode_object_image(o))
+        backend.execute('INSERT INTO t_nest VALUES (2, :1)', [image])
+        (got,) = backend.execute('SELECT o FROM t_nest WHERE k = 2').rows[0]
+        assert (got.SUB.S, [e.S for e in got.SUBS.aslist()]) == ('changed', ['a'])
+        for stmt in drops:
+            backend.execute(stmt)
+        backend.commit()
+    finally:
+        backend.close()
+
+
+def test_zoned_timestamp_attributes_take_oracle_names() -> None:
+    # Oracle spells a zoned attribute's type TIMESTAMP WITH [LOCAL] TZ in
+    # ALL_TYPE_ATTRS; a timestamptz is the LOCAL one here, and its value goes
+    # out and comes back as a naive database-zone instant (#1270).
+    import datetime
+
+    from seerdb.common.dbobject import ObjectImage
+    from seerdb.common.tns import encode_object_image
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for stmt in ('DROP TABLE t_zoneattr', 'DROP TYPE t_zoneattr_o'):
+            try:
+                backend.execute(stmt)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute(
+            'CREATE TYPE t_zoneattr_o AS OBJECT (a TIMESTAMP, '
+            'b TIMESTAMP WITH TIME ZONE, c TIMESTAMP WITH LOCAL TIME ZONE)'
+        )
+        backend.execute('CREATE TABLE t_zoneattr (k NUMBER, o t_zoneattr_o)')
+        assert backend.execute(
+            'SELECT attr_type_name FROM all_type_attrs '
+            "WHERE type_name = 'T_ZONEATTR_O' ORDER BY attr_no"
+        ).rows == [('TIMESTAMP',), ('TIMESTAMP WITH TZ',), ('TIMESTAMP WITH LOCAL TZ',)]
+        (oid,) = backend.execute(
+            "SELECT type_oid FROM all_types WHERE type_name = 'T_ZONEATTR_O'"
+        ).rows[0]
+        typ, _info = backend._object_type(_pg_oid_of(bytes(oid)))
+        given = datetime.datetime(2026, 9, 27, 13, 14, 15)
+        obj = typ.newobject({'A': given, 'C': given})
+        image = ObjectImage(
+            bytes(oid), typ.schema, typ.name, None, encode_object_image(obj)
+        )
+        backend.execute('INSERT INTO t_zoneattr VALUES (1, :1)', [image])
+        (got,) = backend.execute('SELECT o FROM t_zoneattr').rows[0]
+        assert (got.A, got.C) == (given, given)
+        for stmt in ('DROP TABLE t_zoneattr', 'DROP TYPE t_zoneattr_o'):
+            backend.execute(stmt)
+        backend.commit()
+    finally:
+        backend.close()
+
+
+def test_a_collection_of_collections_fetches_and_binds() -> None:
+    # A nested table whose elements are nested tables (#1276): the element type
+    # is embedded, a value loads as nested collections -- a NULL and an empty
+    # inner one included -- and a bound image goes back as an array literal.
+    from seerdb.common.dbobject import ObjectImage
+    from seerdb.common.tns import encode_object_image
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    drops = ('DROP TABLE t_coc', 'DROP TYPE t_coc_tt', 'DROP TYPE t_coc_t1')
+    try:
+        for stmt in drops:
+            try:
+                backend.execute(stmt)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute('CREATE TYPE t_coc_t1 AS TABLE OF NUMBER')
+        backend.execute('CREATE TYPE t_coc_tt AS TABLE OF t_coc_t1')
+        backend.execute('CREATE TABLE t_coc (id NUMBER, c t_coc_tt)')
+        backend.execute(
+            'INSERT INTO t_coc VALUES (1, t_coc_tt(t_coc_t1(1, 2), NULL, t_coc_t1()))'
+        )
+        (c,) = backend.execute('SELECT c FROM t_coc').rows[0]
+        assert c._dbtype.element['object_type'].name == 'T_COC_T1'
+        assert [None if e is None else e.aslist() for e in c.aslist()] == [
+            [1, 2],
+            None,
+            [],
+        ]
+        typ = c._dbtype
+        image = ObjectImage(typ.oid, typ.schema, typ.name, None, encode_object_image(c))
+        backend.execute('INSERT INTO t_coc VALUES (2, :1)', [image])
+        (c2,) = backend.execute('SELECT c FROM t_coc WHERE id = 2').rows[0]
+        assert [None if e is None else e.aslist() for e in c2.aslist()] == [
+            [1, 2],
+            None,
+            [],
+        ]
+        for stmt in drops:
+            backend.execute(stmt)
+        backend.commit()
+    finally:
+        backend.close()
+
+
+def test_an_array_literal_quotes_every_element() -> None:
+    # NULL bare; strings, timestamps and inner literals quoted, `"` and `\\`
+    # escaped, so PostgreSQL parses each by the element type (#1276).
+    import datetime
+    from decimal import Decimal
+
+    from postgres_backend import _array_literal
+
+    assert (
+        _array_literal([None, Decimal('1.5'), 'a"b\\c']) == '{NULL,"1.5","a\\"b\\\\c"}'
+    )
+    assert (
+        _array_literal([datetime.datetime(2026, 1, 2, 3, 4, 5)])
+        == '{"2026-01-02 03:04:05"}'
+    )
+    assert (
+        _array_literal([_array_literal([1, 2]), None]) == '{"{\\"1\\",\\"2\\"}",NULL}'
+    )
+
+
 def test_dictionary_views_preserve_quoted_identifier_case() -> None:
     # Oracle stores an unquoted identifier upper-case and a quoted one verbatim;
     # PostgreSQL folds unquoted names lower-case. sys.ora_name() reconstructs the
@@ -2475,5 +3128,113 @@ def test_an_assignment_into_an_ltz_out_bind_is_read_in_the_session_zone() -> Non
         bind = BindVar(value=value, tns_type=TNS_TYPE_TIMESTAMPLTZ, max_size=11)
         result = backend.execute('begin :value := :value + 5.25; end;', [bind])
         assert result.out_binds == [datetime.datetime(2022, 5, 15, 18, 0, 0)]
+    finally:
+        backend.close()
+
+
+def test_an_object_type_oid_is_its_pg_oid_padded_and_back() -> None:
+    # all_types reports a composite's PostgreSQL oid zero-padded to Oracle's 16
+    # bytes, so the OID a bind carries turns straight back into the type. A real
+    # Oracle OID a client carried over is not one of ours (#1127).
+    oid = _object_type_oid(0x16F248)
+    assert oid == bytes(13) + b'\x16\xf2\x48'
+    assert _pg_oid_of(oid) == 0x16F248
+    assert _pg_oid_of(bytes.fromhex('5c284ab405f7def0e0639600a8c0b006')) is None
+    assert _pg_oid_of(b'short') is None
+
+
+def test_an_object_column_describes_as_a_real_server_does() -> None:
+    # Measured on 23ai: ADT, data length 2000, max size 0, no charset / form, and
+    # the type's identity -- a zero length would claim the column sends nothing.
+    from seerdb.common.dbobject import DbObjectType
+
+    typ = DbObjectType('PUBLIC', 'T_OBJ', _object_type_oid(42), 1, [])
+    col = _object_column_meta('o', typ)
+    assert (col.name, col.data_type, col.data_length, col.max_size) == (
+        b'O',
+        109,
+        2000,
+        0,
+    )
+    assert (col.charset, col.csfrm) == (0, 0)
+    assert (col.type_schema, col.type_name, col.type_oid) == (
+        b'PUBLIC',
+        b'T_OBJ',
+        _object_type_oid(42),
+    )
+
+
+def test_an_object_type_is_in_the_dictionary_and_round_trips() -> None:
+    # CREATE TYPE ... AS OBJECT is a composite; all_types / all_type_attrs are
+    # what a client's gettype reads, a bound image is decoded into the
+    # composite, and a selected composite comes back as a DbObject (#1127).
+    from seerdb.common.dbobject import ObjectImage
+    from seerdb.common.tns import encode_object_image
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for stmt in ('DROP TABLE t_objround', 'DROP TYPE t_objround_t'):
+            try:
+                backend.execute(stmt)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute(
+            'CREATE TYPE t_objround_t AS OBJECT (id NUMBER, name VARCHAR2(40))'
+        )
+        backend.execute('CREATE TABLE t_objround (n NUMBER, o t_objround_t)')
+        (row,) = backend.execute(
+            'SELECT owner, type_oid, typecode FROM all_types '
+            "WHERE type_name = 'T_OBJROUND_T'"
+        ).rows
+        owner, oid, typecode = row
+        assert typecode == 'OBJECT'
+        attrs = backend.execute(
+            'SELECT attr_name, attr_type_name, attr_type_owner, length '
+            "FROM all_type_attrs WHERE type_name = 'T_OBJROUND_T' ORDER BY attr_no"
+        ).rows
+        assert attrs == [('ID', 'NUMBER', None, None), ('NAME', 'VARCHAR2', None, 40)]
+
+        typ, _info = backend._object_type(_pg_oid_of(bytes(oid)))
+        obj = typ.newobject({'ID': 7, 'NAME': 'Alice'})
+        image = ObjectImage(bytes(oid), owner, typ.name, None, encode_object_image(obj))
+        backend.execute('INSERT INTO t_objround VALUES (1, :o)', [image])
+        (got,) = backend.execute('SELECT o FROM t_objround').rows[0]
+        assert got.NAME == 'Alice'
+        assert int(got.ID) == 7
+        backend.execute('DROP TABLE t_objround')
+        backend.execute('DROP TYPE t_objround_t')
+        backend.commit()
+    finally:
+        backend.close()
+
+
+def test_a_collection_type_is_in_the_dictionary() -> None:
+    # A VARRAY / nested table is a COLLECTION in all_types, with no attributes;
+    # all_coll_types gives its element's size as Oracle does (#1206).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    names = ('t_colldict_s', 't_colldict_n')
+    try:
+        for name in names:
+            try:
+                backend.execute(f'DROP TYPE {name}')
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute('CREATE TYPE t_colldict_s AS VARRAY(5) OF VARCHAR2(20)')
+        backend.execute('CREATE TYPE t_colldict_n AS TABLE OF NUMBER(9,2)')
+        assert backend.execute(
+            'SELECT type_name, typecode, attributes FROM all_types '
+            "WHERE type_name LIKE 'T_COLLDICT%' ORDER BY 1"
+        ).rows == [('T_COLLDICT_N', 'COLLECTION', 0), ('T_COLLDICT_S', 'COLLECTION', 0)]
+        assert backend.execute(
+            'SELECT type_name, coll_type, upper_bound, elem_type_name, length, '
+            "precision, scale FROM all_coll_types WHERE type_name LIKE 'T_COLLDICT%' "
+            'ORDER BY 1'
+        ).rows == [
+            ('T_COLLDICT_N', 'TABLE', None, 'NUMBER', None, 9, 2),
+            ('T_COLLDICT_S', 'VARYING ARRAY', 5, 'VARCHAR2', 20, None, None),
+        ]
+        for name in names:
+            backend.execute(f'DROP TYPE {name}')
+        backend.commit()
     finally:
         backend.close()

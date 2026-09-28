@@ -77,6 +77,9 @@ _FV2_UNSUPPORTED = (
     ('lob_attribute', 'object types are not supported on Oracle 9i'),
     ('large_object_image', 'object types are not supported on Oracle 9i'),
     ('nested_attribute', 'object types are not supported on Oracle 9i'),
+    ('collection_of_collections', 'object types are not supported on Oracle 9i'),
+    ('local_time_zone_attribute', 'object types are not supported on Oracle 9i'),
+    ('collection_value', 'object types are not supported on Oracle 9i'),
     ('changepassword', 'changepassword is not supported on Oracle 9i'),
     ('cache_evicts', 'the cursor cache is a fv4+ feature; 9i re-parses'),
     ('reuses_cursor', 'the cursor cache is a fv4+ feature; 9i re-parses'),
@@ -1615,6 +1618,41 @@ class CursorIntegration(_IntegrationBase):
             self._drop_silently(self.cur)
             self.cur.execute(f'DROP TYPE {Type}')
 
+    def test_an_invisible_column(self):
+        # An INVISIBLE column (12.1+) is left out of `*` and of an INSERT with no
+        # column list, works when named, and has no COLUMN_ID; USER_TAB_COLS
+        # marks it HIDDEN (#1195). Measured on 23ai.
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('INVISIBLE columns are 12.1+')
+        T = self.TABLE
+        self.cur.execute(f'CREATE TABLE {T} (a NUMBER, h NUMBER INVISIBLE, b NUMBER)')
+        self.cur.execute(f'INSERT INTO {T} VALUES (1, 2)')
+        self.cur.execute(f'INSERT INTO {T} (a, h, b) VALUES (3, 4, 5)')
+        self.cur.execute(f'SELECT * FROM {T} ORDER BY a')
+        self.assertEqual([d[0] for d in self.cur.description], ['A', 'B'])
+        self.assertEqual(self.cur.fetchall(), [(1, 2), (3, 5)])
+        self.cur.execute(f'SELECT t.*, h FROM {T} t ORDER BY a')
+        self.assertEqual([d[0] for d in self.cur.description], ['A', 'B', 'H'])
+        self.assertEqual(self.cur.fetchall(), [(1, 2, None), (3, 5, 4)])
+        self.cur.execute(
+            'SELECT column_name, column_id, hidden_column FROM user_tab_cols '
+            'WHERE table_name = :1 ORDER BY column_name',
+            [T],
+        )
+        self.assertEqual(
+            self.cur.fetchall(), [('A', 1, 'NO'), ('B', 2, 'NO'), ('H', None, 'YES')]
+        )
+        self.cur.execute(
+            'SELECT column_name, column_id FROM user_tab_columns '
+            'WHERE table_name = :1 ORDER BY column_name',
+            [T],
+        )
+        self.assertEqual(self.cur.fetchall(), [('A', 1), ('B', 2), ('H', None)])
+        # Made visible, it is in `*` again (Oracle moves it last; see #1195).
+        self.cur.execute(f'ALTER TABLE {T} MODIFY h VISIBLE')
+        self.cur.execute(f'SELECT * FROM {T} ORDER BY a')
+        self.assertEqual(sorted(d[0] for d in self.cur.description), ['A', 'B', 'H'])
+
     def test_decode(self):
         # DECODE with untyped literals, a NULL matching a NULL, several searches
         # and no default; and, as a schema script populates a table, a DECODE of
@@ -2584,6 +2622,8 @@ class BindIntegration(_IntegrationBase):
         self.assertEqual(Var.getvalue(), 'nat ünî 中')
 
     def test_national_array_bind_round_trip(self):
+        # PL/SQL-bound: an associative array lives in a PL/SQL PACKAGE (#1127).
+        self._skip_if_mirror_backend('postgres', 'run PL/SQL')
         # An associative array of NVARCHAR2 in both directions (#991). The
         # element is encoded as a bare value, so it never saw the bind's charset
         # form: going out it went as UTF-8 and the server read those bytes as
@@ -3521,6 +3561,31 @@ class ErrorAndRowcountIntegration(_IntegrationBase):
         # value … to a number"), so assert on the code + prefix, not the phrase.
         self.assertEqual(ctx.exception.code, 1722)
         self.assertIn('ORA-01722', str(ctx.exception))
+
+    def test_a_string_too_long_for_its_column_is_ora_12899(self):
+        # "value too large for column". A real server raises it natively, so this
+        # holds every leg to the same answer -- over PostgreSQL it arrives as
+        # SQLSTATE 22001 and has to be mapped, or a client branching on the code
+        # is told ORA-00900, a syntax error (#1127).
+        # Before 10g the same error is ORA-01401, "inserted value too large for
+        # column" (measured on 8i and 9i).
+        expected = 1401 if self.conn.field_version < FIELD_VERSION_10_2 else 12899
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (v VARCHAR2(3))')
+        with self.assertRaises(seerdb.DatabaseError) as ctx:
+            self.cur.execute(f"INSERT INTO {self.TABLE} VALUES ('abcd')")
+        self.assertEqual(ctx.exception.code, expected)
+        self.assertIn(f'ORA-{expected:05d}', str(ctx.exception))
+
+    def test_a_number_too_wide_for_its_column_is_ora_01438(self):
+        # "value larger than specified precision allowed for this column". Over
+        # PostgreSQL it shares SQLSTATE 22003 with arithmetic overflow, which is
+        # Oracle's ORA-01426 instead, so the mapping has to tell them apart
+        # (#1127). This is the column case.
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (v NUMBER(3))')
+        with self.assertRaises(seerdb.DatabaseError) as ctx:
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1000)')
+        self.assertEqual(ctx.exception.code, 1438)
+        self.assertIn('ORA-01438', str(ctx.exception))
 
     def test_error_message_for_unique_constraint(self):
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER PRIMARY KEY)')
@@ -4511,6 +4576,8 @@ class LOBOutBindIntegration(_IntegrationBase):
         self.assertIsNone(Var.getvalue())
 
     def test_inout_clob_var_small(self):
+        # PL/SQL-bound: DBMS_LOB.WRITEAPPEND is a PL/SQL procedure with an IN OUT LOB (#1127).
+        self._skip_if_mirror_backend('postgres', 'run PL/SQL')
         # Under the 32767-byte promotion threshold, so the bind stays a Var.
         Var = self.cur.var(seerdb.DB_TYPE_CLOB)
         Var.setvalue(0, 'small')
@@ -4518,6 +4585,8 @@ class LOBOutBindIntegration(_IntegrationBase):
         self.assertEqual(Var.getvalue().read(), 'smallEND')
 
     def test_inout_clob_var_over_the_promotion_threshold(self):
+        # PL/SQL-bound: the IN OUT LOB is filled by a multi-statement DECLARE block (#1127).
+        self._skip_if_mirror_backend('postgres', 'run PL/SQL')
         # Over it, so the Var is promoted to a temp-LOB marker on the way out
         # (#902). The marker has to carry the Var, or the returned value has
         # neither a type to decode against nor anywhere to land.
@@ -4538,6 +4607,8 @@ class LOBOutBindIntegration(_IntegrationBase):
         self.assertEqual(Value, 'A' * 50000 + 'B' * 5)
 
     def test_inout_blob_var_over_the_promotion_threshold(self):
+        # PL/SQL-bound: the IN OUT LOB is filled by a multi-statement DECLARE block (#1127).
+        self._skip_if_mirror_backend('postgres', 'run PL/SQL')
         Var = self.cur.var(seerdb.DB_TYPE_BLOB)
         Var.setvalue(0, b'L' * 52345)
         self.cur.execute(
@@ -5751,7 +5822,6 @@ class GettypeCurrentSchemaIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        self._skip_if_mirror_backend('postgres', 'describe an object type')
         self._drop_type()
         self.cur.execute(f'CREATE TYPE {self.TYPE} AS OBJECT (id NUMBER)')
         self.owner = self.conn.gettype(self.TYPE).schema
@@ -5804,6 +5874,12 @@ class PlsqlTypeIntegration(_IntegrationBase):
         super().setUp()
         if self.conn.field_version < FIELD_VERSION_12_1:
             self.skipTest('a package-level type needs the 12.1+ bind support')
+        # A package-level type lives in a PL/SQL PACKAGE, so this class cannot
+        # run against a backend with no PL/SQL at all. It skipped on the
+        # PostgreSQL leg only by accident until that Mirror reached 12.1: the
+        # version gate above was doing the work. The capability is what actually
+        # decides it (#1127).
+        self._skip_if_mirror_backend('postgres', 'create a PL/SQL package')
         self._drop_objects()
         # A schema-level type of the SAME shape, so the two-part name
         # `PKG.TYPE` cannot be confused with `SCHEMA.TYPE` by accident.
@@ -5961,6 +6037,11 @@ class RefCursorInBindIntegration(_IntegrationBase):
         super().setUp()
         if self.conn.field_version < FIELD_VERSION_12_1:
             self.skipTest('a REF CURSOR IN bind needs the 12c+ bind OAC')
+        # The cursor is drained by a PL/SQL procedure in a PACKAGE, and the whole
+        # class is built on one, so a backend with no PL/SQL cannot run it. It
+        # skipped on the PostgreSQL leg only because that Mirror was below 12.1;
+        # the capability is what actually decides it (#1127).
+        self._skip_if_mirror_backend('postgres', 'create a PL/SQL package')
         try:
             self.cur.execute(f'DROP PACKAGE {self.PKG}')
         except seerdb.DatabaseError:
@@ -6057,6 +6138,12 @@ class ObjectOutBindIntegration(_IntegrationBase):
         super().setUp()
         if self.conn.field_version < FIELD_VERSION_12_1:
             self.skipTest('an object bind needs the 12.1+ OAC')
+        # The object OUT binds are filled by procedures in a PL/SQL PACKAGE this
+        # setUp builds and every test calls into, so a backend with no PL/SQL
+        # cannot run the class. It was hidden twice over on the PostgreSQL leg:
+        # first by the 12.1 version gate above, then by the VARRAY it declares,
+        # which PostgreSQL could not parse until that was translated (#1127).
+        self._skip_if_mirror_backend('postgres', 'create a PL/SQL package')
         self._drop_objects()
         self.cur.execute(f'CREATE TYPE {self.TYPE} AS VARRAY(10) OF NUMBER')
         self.cur.execute(
@@ -6243,7 +6330,6 @@ class LargeObjectImageIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        self._skip_if_mirror_backend('postgres', 'fetch an object column')
         self._drop()
         self.cur.execute(f'CREATE TYPE {self.TEXT_TYPE} AS OBJECT (v VARCHAR2(400))')
         self.cur.execute(
@@ -6302,7 +6388,6 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        self._skip_if_mirror_backend('postgres', 'fetch an object with a LOB attribute')
         self._drop()
         self.cur.execute(
             f'CREATE TYPE {self.TYPE} AS OBJECT (id NUMBER, c CLOB, b BLOB)'
@@ -6322,6 +6407,7 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
 
         for stmt in (
             f'DROP TABLE {self.TABLE}',
+            f'DROP TABLE {self.TABLE}_L',
             f'DROP TYPE {self.LIST}',
             f'DROP TYPE {self.NTYPE}',
             f'DROP TYPE {self.TYPE}',
@@ -6378,7 +6464,14 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
         self.assertIsNone(self._fetched(2, 'p').N)
 
     def test_a_collection_of_lob_attributes_fetches_lobs(self):
-        self.cur.execute(f"SELECT {self.LIST}('a', 'bc') FROM dual")
+        # From a column: the Mirror-over-PG cannot type a computed collection.
+        # _drop removes the table.
+        table = f'{self.TABLE}_L'
+        self.cur.execute(
+            f'CREATE TABLE {table} (l {self.LIST}) NESTED TABLE l STORE AS {table}_S'
+        )
+        self.cur.execute(f"INSERT INTO {table} VALUES ({self.LIST}('a', 'bc'))")
+        self.cur.execute(f'SELECT l FROM {table}')
         (value,) = self.cur.fetchone()
         self.assertEqual([e.read() for e in value.aslist()], ['a', 'bc'])
 
@@ -6422,7 +6515,7 @@ class ObjectCollectionFetchIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        self._skip_if_mirror_backend('postgres', 'fetch a collection value')
+        self._skip_if_mirror_backend('postgres', 'fetch a computed collection')
         self._drop()
         self.cur.execute(
             f'CREATE TYPE {self.ELEM} AS OBJECT (id NUMBER, name VARCHAR2(40))'
@@ -6464,7 +6557,6 @@ class NestedAttributeIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        self._skip_if_mirror_backend('postgres', 'fetch an object column')
         self._drop()
         self.cur.execute(f'CREATE TYPE {self.SUB} AS OBJECT (n NUMBER, s VARCHAR2(20))')
         self.cur.execute(f'CREATE TYPE {self.ARR} AS VARRAY(5) OF {self.SUB}')
@@ -6535,6 +6627,298 @@ class NestedAttributeIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT o FROM {self.TABLE} WHERE k = 3')
         self.assertEqual(
             self._shape(self.cur.fetchone()[0]), (3, (9, 'nine'), [(4, 'd')])
+        )
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class ObjectTimeZoneAttributeIntegration(_IntegrationBase):
+    # An object whose attribute is TIMESTAMP WITH TIME ZONE binds and returns
+    # with the offset it was entered at. The Mirror-over-PG stores that type as
+    # a composite of its own, which its object support once took for a nested
+    # object type and refused (#1134).
+    TYPE = 'PYO_TSTZ_ATTR_T'
+
+    def setUp(self):
+        super().setUp()
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('an object bind needs the 12.1+ OAC')
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (f'DROP TABLE {self.TABLE}', f'DROP TYPE {self.TYPE}'):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass  # best-effort teardown of leftovers
+        self.cur.execute(
+            f'CREATE TYPE {self.TYPE} AS OBJECT (id NUMBER, ts TIMESTAMP WITH TIME ZONE)'
+        )
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, o {self.TYPE})')
+
+    def tearDown(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (f'DROP TABLE {self.TABLE}', f'DROP TYPE {self.TYPE}'):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass
+        super().tearDown()
+
+    def test_the_attribute_keeps_its_offset(self):
+        import datetime
+
+        entered = datetime.datetime(
+            2026, 9, 25, 1, 2, 3, tzinfo=datetime.timezone(datetime.timedelta(hours=2))
+        )
+        typ = self.conn.gettype(self.TYPE)
+        obj = typ.newobject()
+        obj.ID = 1
+        obj.TS = entered
+        out = self.cur.var(typ)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} (n, o) VALUES (1, :obj) '
+            'RETURNING o INTO :outObj',
+            [obj, out],
+        )
+        (returned,) = out.getvalue()
+        self.assertEqual(returned.TS, entered)
+        self.assertEqual(returned.TS.utcoffset(), datetime.timedelta(hours=2))
+        self.cur.execute(f'SELECT o FROM {self.TABLE}')
+        (fetched,) = self.cur.fetchone()
+        self.assertEqual(fetched.TS, entered)
+        self.assertEqual(fetched.TS.utcoffset(), datetime.timedelta(hours=2))
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class CollectionTypeIntegration(_IntegrationBase):
+    """VARRAY and nested-table types: described, fetched and bound (#1206)."""
+
+    ELEM = 'PYO_COLL_ELEM_T'
+    NUMS = 'PYO_COLL_NUMS_T'
+    ELEMS = 'PYO_COLL_ELEMS_T'
+    TABLE = 'PYO_COLL_TAB'
+
+    def setUp(self):
+        super().setUp()
+        self._drop()
+        self.cur.execute(
+            f'CREATE TYPE {self.ELEM} AS OBJECT (id NUMBER, name VARCHAR2(40))'
+        )
+        self.cur.execute(f'CREATE TYPE {self.NUMS} AS VARRAY(3) OF NUMBER')
+        self.cur.execute(f'CREATE TYPE {self.ELEMS} AS TABLE OF {self.ELEM}')
+
+    def tearDown(self):
+        self._drop()
+        super().tearDown()
+
+    def _drop(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (
+            f'DROP TABLE {self.TABLE}',
+            f'DROP TYPE {self.ELEMS}',
+            f'DROP TYPE {self.NUMS}',
+            f'DROP TYPE {self.ELEM}',
+        ):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass  # best-effort teardown of leftovers
+
+    def test_gettype_describes_a_collection(self):
+        from seerdb.common.dbobject import COLLECTION_NESTED_TABLE, COLLECTION_VARRAY
+
+        nums = self.conn.gettype(self.NUMS)
+        self.assertTrue(nums.is_collection)
+        self.assertEqual(
+            (nums.collection_type, nums.max_elements, nums.element['type_name']),
+            (COLLECTION_VARRAY, 3, 'NUMBER'),
+        )
+        elems = self.conn.gettype(self.ELEMS)
+        self.assertEqual(elems.collection_type, COLLECTION_NESTED_TABLE)
+        self.assertEqual(elems.element['object_type'].name, self.ELEM)
+
+    def test_a_collection_value_fetches(self):
+        # A VARRAY of NUMBER and a nested table of objects, filled, empty and
+        # NULL: an empty collection is a value, not NULL.
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (id NUMBER, v {self.NUMS}, w {self.ELEMS}) '
+            f'NESTED TABLE w STORE AS {self.TABLE}_W'
+        )
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (1, {self.NUMS}(5, 10, 15), '
+            f"{self.ELEMS}({self.ELEM}(1, 'a'), {self.ELEM}(2, 'b')))"
+        )
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (2, {self.NUMS}(), NULL)')
+        self.cur.execute(f'SELECT v, w FROM {self.TABLE} ORDER BY id')
+        (v1, w1), (v2, w2) = self.cur.fetchall()
+        self.assertEqual([int(x) for x in v1.aslist()], [5, 10, 15])
+        self.assertEqual(
+            [(int(e.ID), e.NAME) for e in w1.aslist()], [(1, 'a'), (2, 'b')]
+        )
+        self.assertEqual((v2.aslist(), w2), ([], None))
+
+    def test_a_collection_value_binds(self):
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('an object bind needs the 12.1+ OAC')
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (id NUMBER, v {self.NUMS}, w {self.ELEMS}) '
+            f'NESTED TABLE w STORE AS {self.TABLE}_W'
+        )
+        nums = self.conn.gettype(self.NUMS)
+        elems = self.conn.gettype(self.ELEMS)
+        elem = self.conn.gettype(self.ELEM)
+        filled = elems.newobject(
+            [
+                elem.newobject({'ID': 1, 'NAME': 'a'}),
+                elem.newobject({'ID': 2, 'NAME': 'b'}),
+            ]
+        )
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (1, :1, :2)',
+            [nums.newobject([5, 10, 15]), filled],
+        )
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (2, :1, NULL)', [nums.newobject()]
+        )
+        self.cur.execute(f'SELECT v, w FROM {self.TABLE} ORDER BY id')
+        (v1, w1), (v2, w2) = self.cur.fetchall()
+        self.assertEqual([int(x) for x in v1.aslist()], [5, 10, 15])
+        self.assertEqual(
+            [(int(e.ID), e.NAME) for e in w1.aslist()], [(1, 'a'), (2, 'b')]
+        )
+        self.assertEqual((v2.aslist(), w2), ([], None))
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class ObjectLocalTimeZoneAttributeIntegration(_IntegrationBase):
+    # An object's TIMESTAMP WITH LOCAL TIME ZONE attribute binds and returns as
+    # the time it was given. The Mirror-over-PG described one as WITH TIME ZONE
+    # and wrapped the value in its WITH TIME ZONE composite, which PostgreSQL
+    # refused (#1270).
+    TYPE = 'PYO_LTZ_ATTR_T'
+    TABLE = 'PYO_LTZ_ATTR_TAB'
+
+    def setUp(self):
+        super().setUp()
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('an object bind needs the 12.1+ OAC')
+        self._drop()
+        self.cur.execute(
+            f'CREATE TYPE {self.TYPE} AS OBJECT '
+            '(id NUMBER, ts TIMESTAMP WITH LOCAL TIME ZONE)'
+        )
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, o {self.TYPE})')
+
+    def tearDown(self):
+        self._drop()
+        super().tearDown()
+
+    def _drop(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (f'DROP TABLE {self.TABLE}', f'DROP TYPE {self.TYPE}'):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass  # best-effort teardown of leftovers
+
+    def test_a_local_time_zone_attribute_round_trips(self):
+        import datetime
+
+        given = datetime.datetime(2026, 9, 27, 13, 14, 15)
+        typ = self.conn.gettype(self.TYPE)
+        self.assertEqual(typ.attrs[1]['type_name'], 'TIMESTAMP WITH LOCAL TZ')
+        out = self.cur.var(typ)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (1, :1) RETURNING o INTO :2',
+            [typ.newobject({'ID': 1, 'TS': given}), out],
+        )
+        (returned,) = out.getvalue()
+        self.assertEqual(returned.TS.replace(tzinfo=None), given)
+        self.cur.execute(f'SELECT o FROM {self.TABLE}')
+        (fetched,) = self.cur.fetchone()
+        self.assertEqual(fetched.TS.replace(tzinfo=None), given)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class CollectionOfCollectionsIntegration(_IntegrationBase):
+    """A nested table and a VARRAY whose elements are nested tables, the shapes
+    the reference suite's NestedCollectionTests uses (#1276): fetched and bound,
+    a NULL and an empty inner collection included."""
+
+    INNER = 'PYO_COC_INNER_T'
+    TABLE_OF = 'PYO_COC_TT'
+    VARRAY_OF = 'PYO_COC_VT'
+    TABLE = 'PYO_COC_TAB'
+
+    def setUp(self):
+        super().setUp()
+        self._drop()
+        self.cur.execute(f'CREATE TYPE {self.INNER} AS TABLE OF NUMBER')
+        self.cur.execute(f'CREATE TYPE {self.TABLE_OF} AS TABLE OF {self.INNER}')
+        self.cur.execute(f'CREATE TYPE {self.VARRAY_OF} AS VARRAY(5) OF {self.INNER}')
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (id NUMBER, tc {self.TABLE_OF}, '
+            f'vc {self.VARRAY_OF}) NESTED TABLE tc STORE AS {self.TABLE}_NT '
+            f'(NESTED TABLE COLUMN_VALUE STORE AS {self.TABLE}_NTI)'
+        )
+
+    def tearDown(self):
+        self._drop()
+        super().tearDown()
+
+    def _drop(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (
+            f'DROP TABLE {self.TABLE}',
+            f'DROP TYPE {self.VARRAY_OF}',
+            f'DROP TYPE {self.TABLE_OF}',
+            f'DROP TYPE {self.INNER}',
+        ):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass  # best-effort teardown of leftovers
+
+    @staticmethod
+    def _lists(value):
+        if value is None:
+            return None
+        return [
+            None if e is None else [int(x) for x in e.aslist()] for e in value.aslist()
+        ]
+
+    def test_a_collection_of_collections_fetches(self):
+        i, tt, vt = self.INNER, self.TABLE_OF, self.VARRAY_OF
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (1, '
+            f'{tt}({i}(1, 2), {i}(3), NULL, {i}()), {vt}({i}(4)))'
+        )
+        self.cur.execute(f'SELECT tc, vc FROM {self.TABLE}')
+        (tc, vc) = self.cur.fetchone()
+        self.assertEqual(
+            (self._lists(tc), self._lists(vc)), ([[1, 2], [3], None, []], [[4]])
+        )
+
+    def test_a_collection_of_collections_binds(self):
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('an object bind needs the 12.1+ OAC')
+        inner = self.conn.gettype(self.INNER)
+        tt = self.conn.gettype(self.TABLE_OF)
+        vt = self.conn.gettype(self.VARRAY_OF)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (2, :1, :2)',
+            [
+                tt.newobject([inner.newobject([5, 6]), None, inner.newobject()]),
+                vt.newobject([inner.newobject([7])]),
+            ],
+        )
+        self.cur.execute(f'SELECT tc, vc FROM {self.TABLE} WHERE id = 2')
+        (tc, vc) = self.cur.fetchone()
+        self.assertEqual(
+            (self._lists(tc), self._lists(vc)), ([[5, 6], None, []], [[7]])
         )
 
 
@@ -7351,6 +7735,35 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     await self._drop_async(Cur, Table)
                     await Cur.execute(f'DROP TYPE {otype}')
 
+    async def test_an_invisible_column(self):
+        # Async twin of CursorIntegration's.
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            if Conn.field_version < FIELD_VERSION_12_1:
+                self.skipTest('INVISIBLE columns are 12.1+')
+            T = 'PYO_ASYNC_INVISIBLE'
+            async with Conn.cursor() as Cur:
+                await self._drop_async(Cur, T)
+                await Cur.execute(
+                    f'CREATE TABLE {T} (a NUMBER, h NUMBER INVISIBLE, b NUMBER)'
+                )
+                await Cur.execute(f'INSERT INTO {T} VALUES (1, 2)')
+                await Cur.execute(f'INSERT INTO {T} (a, h, b) VALUES (3, 4, 5)')
+                await Cur.execute(f'SELECT * FROM {T} ORDER BY a')
+                self.assertEqual([d[0] for d in Cur.description], ['A', 'B'])
+                self.assertEqual(await Cur.fetchall(), [(1, 2), (3, 5)])
+                await Cur.execute(f'SELECT t.*, h FROM {T} t ORDER BY a')
+                self.assertEqual(await Cur.fetchall(), [(1, 2, None), (3, 5, 4)])
+                await Cur.execute(
+                    'SELECT column_name, column_id, hidden_column FROM user_tab_cols '
+                    'WHERE table_name = :1 ORDER BY column_name',
+                    [T],
+                )
+                self.assertEqual(
+                    await Cur.fetchall(),
+                    [('A', 1, 'NO'), ('B', 2, 'NO'), ('H', None, 'YES')],
+                )
+                await self._drop_async(Cur, T)
+
     async def test_decode(self):
         # Async twin of CursorIntegration's.
         Table = 'PYO_ASYNC_DECODE'
@@ -7490,8 +7903,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
 
     async def test_a_large_object_image_fetches_whole(self):
         # Async twin of LargeObjectImageIntegration's (#1261).
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest("the Mirror's postgres backend cannot fetch an object column")
         Typ, Table = 'PYO_ABIGIMG_T', 'PYO_ABIGIMG_TAB'
         Drops = (f'DROP TABLE {Table}', f'DROP TYPE {Typ}')
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
@@ -7523,8 +7934,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
     async def test_a_nested_attribute_fetches_and_binds(self):
         # Async twin of NestedAttributeIntegration's: the async describe left
         # an attribute's own type out, so it came back as raw bytes (#1268).
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest("the Mirror's postgres backend cannot fetch an object column")
         Sub, Arr, Outer, Table = (
             'PYO_ANEST_SUB_T',
             'PYO_ANEST_ARR_T',
@@ -7588,13 +7997,95 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                         except seerdb.DatabaseError:
                             pass  # a CREATE above failed, so nothing to drop
 
+    async def test_a_local_time_zone_attribute_round_trips(self):
+        # Async twin of ObjectLocalTimeZoneAttributeIntegration's (#1270).
+        import datetime
+
+        Typ, Table = 'PYO_ALTZ_ATTR_T', 'PYO_ALTZ_ATTR_TAB'
+        Drops = (f'DROP TABLE {Table}', f'DROP TYPE {Typ}')
+        Given = datetime.datetime(2026, 9, 27, 13, 14, 15)
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            if Conn.field_version < FIELD_VERSION_12_1:
+                self.skipTest('an object bind needs the 12.1+ OAC')
+            async with Conn.cursor() as Cur:
+                for Stmt in Drops:
+                    try:
+                        await Cur.execute(Stmt)
+                    except seerdb.DatabaseError:
+                        pass  # no leftover from a prior run
+                try:
+                    await Cur.execute(
+                        f'CREATE TYPE {Typ} AS OBJECT '
+                        '(id NUMBER, ts TIMESTAMP WITH LOCAL TIME ZONE)'
+                    )
+                    await Cur.execute(f'CREATE TABLE {Table} (n NUMBER, o {Typ})')
+                    ObjType = await Conn.gettype(Typ)
+                    await Cur.execute(
+                        f'INSERT INTO {Table} VALUES (1, :1)',
+                        [ObjType.newobject({'ID': 1, 'TS': Given})],
+                    )
+                    await Cur.execute(f'SELECT o FROM {Table}')
+                    (Fetched,) = await Cur.fetchone()
+                    self.assertEqual(Fetched.TS.replace(tzinfo=None), Given)
+                finally:
+                    for Stmt in Drops:
+                        try:
+                            await Cur.execute(Stmt)
+                        except seerdb.DatabaseError:
+                            pass  # a CREATE above failed, so nothing to drop
+
+    async def test_a_collection_of_collections_fetches_and_binds(self):
+        # Async twin of CollectionOfCollectionsIntegration's (#1276).
+        Inner, Outer, Table = 'PYO_ACOC_INNER_T', 'PYO_ACOC_TT', 'PYO_ACOC_TAB'
+        Drops = (f'DROP TABLE {Table}', f'DROP TYPE {Outer}', f'DROP TYPE {Inner}')
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                for Stmt in Drops:
+                    try:
+                        await Cur.execute(Stmt)
+                    except seerdb.DatabaseError:
+                        pass  # no leftover from a prior run
+                try:
+                    await Cur.execute(f'CREATE TYPE {Inner} AS TABLE OF NUMBER')
+                    await Cur.execute(f'CREATE TYPE {Outer} AS TABLE OF {Inner}')
+                    await Cur.execute(
+                        f'CREATE TABLE {Table} (id NUMBER, c {Outer}) '
+                        f'NESTED TABLE c STORE AS {Table}_NT '
+                        f'(NESTED TABLE COLUMN_VALUE STORE AS {Table}_NTI)'
+                    )
+                    await Cur.execute(
+                        f'INSERT INTO {Table} VALUES (1, {Outer}({Inner}(1, 2), NULL))'
+                    )
+                    await Cur.execute(f'SELECT c FROM {Table}')
+                    (C,) = await Cur.fetchone()
+                    self.assertEqual(
+                        [
+                            None if E is None else [int(X) for X in E.aslist()]
+                            for E in C.aslist()
+                        ],
+                        [[1, 2], None],
+                    )
+                    if Conn.field_version >= FIELD_VERSION_12_1:
+                        InnerT = await Conn.gettype(Inner)
+                        OuterT = await Conn.gettype(Outer)
+                        await Cur.execute(
+                            f'INSERT INTO {Table} VALUES (2, :1)',
+                            [OuterT.newobject([InnerT.newobject([3])])],
+                        )
+                        await Cur.execute(f'SELECT c FROM {Table} WHERE id = 2')
+                        (C,) = await Cur.fetchone()
+                        self.assertEqual(
+                            [[int(X) for X in E.aslist()] for E in C.aslist()], [[3]]
+                        )
+                finally:
+                    for Stmt in Drops:
+                        try:
+                            await Cur.execute(Stmt)
+                        except seerdb.DatabaseError:
+                            pass  # a CREATE above failed, so nothing to drop
+
     async def test_a_lob_attribute_fetches_and_binds(self):
         # Async twin of ObjectLobAttributeIntegration's fetch and str bind (#1260).
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest(
-                "the Mirror's postgres backend cannot fetch an object with a LOB "
-                'attribute'
-            )
         from seerdb.common.lob import LOB
 
         Typ, Table = 'PYO_ALOBATTR_T', 'PYO_ALOBATTR_TAB'
@@ -7644,7 +8135,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         # raw image (#1254).
         if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
             self.skipTest(
-                "the Mirror's postgres backend cannot fetch a collection value"
+                "the Mirror's postgres backend cannot fetch a computed collection"
             )
         Elem, Elems = 'PYO_AOCOLL_ELEM_T', 'PYO_AOCOLL_ELEMS_T'
         Drops = (f'DROP TYPE {Elems}', f'DROP TYPE {Elem}')
@@ -7677,10 +8168,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
 
     async def test_gettype_follows_the_current_schema(self):
         # Async twin of GettypeCurrentSchemaIntegration.
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest(
-                "the Mirror's postgres backend cannot describe an object type"
-            )
         Typ = 'PYO_ASYNC_CURSCHEMA_T'
         Conn = await seerdb.connect_async(**self._kwargs())
         try:
@@ -7705,6 +8192,9 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await Conn.close()
 
     async def test_gettype_resolves_a_package_level_type(self):
+        # PL/SQL-bound: a package-level type lives in a PL/SQL PACKAGE (#1127).
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest("the Mirror's postgres backend cannot run PL/SQL")
         # Async twin of PlsqlTypeIntegration (#1030).
         Pkg = 'PYO_ASYNC_PLSQLTYPE_PKG'
         Conn = await seerdb.connect_async(**self._kwargs())
@@ -7744,7 +8234,157 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
+    async def test_a_collection_value_binds(self):
+        # Async twin of CollectionTypeIntegration's.
+        Elem, Nums, Elems = 'PYO_ACOLB_ELEM_T', 'PYO_ACOLB_NUMS_T', 'PYO_ACOLB_ELEMS_T'
+        Table = 'PYO_ACOLB_TAB'
+        Drops = (
+            f'DROP TABLE {Table}',
+            f'DROP TYPE {Elems}',
+            f'DROP TYPE {Nums}',
+            f'DROP TYPE {Elem}',
+        )
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            if Conn.field_version < FIELD_VERSION_12_1:
+                self.skipTest('an object bind needs the 12.1+ OAC')
+            async with Conn.cursor() as Cur:
+                for Stmt in Drops:
+                    try:
+                        await Cur.execute(Stmt)
+                    except seerdb.DatabaseError:
+                        pass  # no leftover from a prior run
+                try:
+                    await Cur.execute(
+                        f'CREATE TYPE {Elem} AS OBJECT (id NUMBER, name VARCHAR2(40))'
+                    )
+                    await Cur.execute(f'CREATE TYPE {Nums} AS VARRAY(3) OF NUMBER')
+                    await Cur.execute(f'CREATE TYPE {Elems} AS TABLE OF {Elem}')
+                    await Cur.execute(
+                        f'CREATE TABLE {Table} (id NUMBER, v {Nums}, w {Elems}) '
+                        f'NESTED TABLE w STORE AS {Table}_W'
+                    )
+                    NumsType = await Conn.gettype(Nums)
+                    ElemsType = await Conn.gettype(Elems)
+                    ElemType = await Conn.gettype(Elem)
+                    Filled = ElemsType.newobject(
+                        [
+                            ElemType.newobject({'ID': 1, 'NAME': 'a'}),
+                            ElemType.newobject({'ID': 2, 'NAME': 'b'}),
+                        ]
+                    )
+                    await Cur.execute(
+                        f'INSERT INTO {Table} VALUES (1, :1, :2)',
+                        [NumsType.newobject([5, 10, 15]), Filled],
+                    )
+                    await Cur.execute(
+                        f'INSERT INTO {Table} VALUES (2, :1, NULL)',
+                        [NumsType.newobject()],
+                    )
+                    await Cur.execute(f'SELECT v, w FROM {Table} ORDER BY id')
+                    (V1, W1), (V2, W2) = await Cur.fetchall()
+                    self.assertEqual([int(X) for X in V1.aslist()], [5, 10, 15])
+                    self.assertEqual(
+                        [(int(E.ID), E.NAME) for E in W1.aslist()],
+                        [(1, 'a'), (2, 'b')],
+                    )
+                    self.assertEqual((V2.aslist(), W2), ([], None))
+                finally:
+                    for Stmt in Drops:
+                        try:
+                            await Cur.execute(Stmt)
+                        except seerdb.DatabaseError:
+                            pass  # a CREATE above failed, so nothing to drop
+
+    async def test_a_collection_value_fetches(self):
+        # Async twin of CollectionTypeIntegration's.
+        Elem, Nums, Elems = 'PYO_ACOLF_ELEM_T', 'PYO_ACOLF_NUMS_T', 'PYO_ACOLF_ELEMS_T'
+        Table = 'PYO_ACOLF_TAB'
+        Drops = (
+            f'DROP TABLE {Table}',
+            f'DROP TYPE {Elems}',
+            f'DROP TYPE {Nums}',
+            f'DROP TYPE {Elem}',
+        )
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                for Stmt in Drops:
+                    try:
+                        await Cur.execute(Stmt)
+                    except seerdb.DatabaseError:
+                        pass  # no leftover from a prior run
+                try:
+                    await Cur.execute(
+                        f'CREATE TYPE {Elem} AS OBJECT (id NUMBER, name VARCHAR2(40))'
+                    )
+                    await Cur.execute(f'CREATE TYPE {Nums} AS VARRAY(3) OF NUMBER')
+                    await Cur.execute(f'CREATE TYPE {Elems} AS TABLE OF {Elem}')
+                    await Cur.execute(
+                        f'CREATE TABLE {Table} (id NUMBER, v {Nums}, w {Elems}) '
+                        f'NESTED TABLE w STORE AS {Table}_W'
+                    )
+                    await Cur.execute(
+                        f'INSERT INTO {Table} VALUES (1, {Nums}(5, 10, 15), '
+                        f"{Elems}({Elem}(1, 'a'), {Elem}(2, 'b')))"
+                    )
+                    await Cur.execute(f'INSERT INTO {Table} VALUES (2, {Nums}(), NULL)')
+                    await Cur.execute(f'SELECT v, w FROM {Table} ORDER BY id')
+                    (V1, W1), (V2, W2) = await Cur.fetchall()
+                    self.assertEqual([int(X) for X in V1.aslist()], [5, 10, 15])
+                    self.assertEqual(
+                        [(int(E.ID), E.NAME) for E in W1.aslist()],
+                        [(1, 'a'), (2, 'b')],
+                    )
+                    self.assertEqual((V2.aslist(), W2), ([], None))
+                finally:
+                    for Stmt in Drops:
+                        try:
+                            await Cur.execute(Stmt)
+                        except seerdb.DatabaseError:
+                            pass  # a CREATE above failed, so nothing to drop
+
+    async def test_gettype_describes_a_collection(self):
+        # Async twin of CollectionTypeIntegration's.
+        from seerdb.common.dbobject import COLLECTION_NESTED_TABLE, COLLECTION_VARRAY
+
+        Elem, Nums, Elems = 'PYO_ACOLL_ELEM_T', 'PYO_ACOLL_NUMS_T', 'PYO_ACOLL_ELEMS_T'
+        Drops = (f'DROP TYPE {Elems}', f'DROP TYPE {Nums}', f'DROP TYPE {Elem}')
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                for Stmt in Drops:
+                    try:
+                        await Cur.execute(Stmt)
+                    except seerdb.DatabaseError:
+                        pass  # no leftover from a prior run
+                try:
+                    await Cur.execute(
+                        f'CREATE TYPE {Elem} AS OBJECT (id NUMBER, name VARCHAR2(40))'
+                    )
+                    await Cur.execute(f'CREATE TYPE {Nums} AS VARRAY(3) OF NUMBER')
+                    await Cur.execute(f'CREATE TYPE {Elems} AS TABLE OF {Elem}')
+                    NumsType = await Conn.gettype(Nums)
+                    self.assertTrue(NumsType.is_collection)
+                    self.assertEqual(
+                        (
+                            NumsType.collection_type,
+                            NumsType.max_elements,
+                            NumsType.element['type_name'],
+                        ),
+                        (COLLECTION_VARRAY, 3, 'NUMBER'),
+                    )
+                    ElemsType = await Conn.gettype(Elems)
+                    self.assertEqual(ElemsType.collection_type, COLLECTION_NESTED_TABLE)
+                    self.assertEqual(ElemsType.element['object_type'].name, Elem)
+                finally:
+                    for Stmt in Drops:
+                        try:
+                            await Cur.execute(Stmt)
+                        except seerdb.DatabaseError:
+                            pass  # a CREATE above failed, so nothing to drop
+
     async def test_a_bare_object_out_bind_takes_its_value(self):
+        # PL/SQL-bound: the object OUT bind is filled by a PL/SQL PACKAGE (#1127).
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest("the Mirror's postgres backend cannot run PL/SQL")
         # Async twin of ObjectOutBindIntegration (#1029): an object handed to
         # callproc with no Var around it takes the OUT value in place.
         Typ = 'PYO_ASYNC_OUTBIND_T'
@@ -7849,6 +8489,9 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await Conn.close()
 
     async def test_inout_clob_var(self):
+        # PL/SQL-bound: the IN OUT LOB is filled by a multi-statement DECLARE block (#1127).
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest("the Mirror's postgres backend cannot run PL/SQL")
         # The async twin of LOBOutBindIntegration (#978): a LOB OUT bind's value
         # arrives in the LOB framing, and the read that materialises it is
         # awaited. 12.1+ only, like the sync class.
