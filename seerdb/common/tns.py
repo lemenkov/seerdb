@@ -2093,6 +2093,17 @@ _OCI_LOBOPS_OFFSET_OFF = 91
 
 _OCI_LOBOPS_AMOUNT_OFF = 269
 
+# A modern sqlplus (23.26) writes the request's scalar slots narrower, as it
+# does its OALL8 (#866), so the fields move (#1287). Measured against a live
+# 11g: a 135-byte header with the ub4 locator length at 11, the ub8 offset at 75
+# and a second pointer indicator at 91, then the locator, then the ub8 amount.
+# An indicator at 91 marks the narrow form: in the wide one that is where the
+# offset sits, and no offset reads as `fe ff ff ff ff ff ff ff`.
+_OCI_LOBOPS_NARROW_IND_OFF = 91
+_OCI_LOBOPS_NARROW_OFFSET_OFF = 75
+_OCI_LOBOPS_NARROW_LOCLEN_OFF = 11
+_OCI_LOBOPS_NARROW_HEADER = 135
+
 
 _OCI_LOB_CHUNK = 0xFF  # content bytes per 11g LOB_DATA chunk (matches live 11g)
 
@@ -2576,14 +2587,19 @@ def parse_lobops_read(body: bytes) -> tuple[int, int]:
     """Extract ``(source_offset, amount)`` from an OCI TTI_LOBOPS READ (#405) —
     both 1-based counts (characters for a CLOB, bytes for a BLOB). A malformed /
     short request falls back to reading the whole LOB from the start."""
-    if len(body) < _OCI_LOBOPS_AMOUNT_OFF + 8:
+    ind = _OCI_LOBOPS_NARROW_IND_OFF
+    if body[ind : ind + 8] == oci.OCI_INDICATOR:
+        loclen_off = _OCI_LOBOPS_NARROW_LOCLEN_OFF
+        loclen = int.from_bytes(body[loclen_off : loclen_off + 4], 'little')
+        offset_off = _OCI_LOBOPS_NARROW_OFFSET_OFF
+        amount_off = _OCI_LOBOPS_NARROW_HEADER + loclen
+    else:
+        offset_off = _OCI_LOBOPS_OFFSET_OFF
+        amount_off = _OCI_LOBOPS_AMOUNT_OFF
+    if len(body) < amount_off + 8:
         return 1, 2**31
-    offset = int.from_bytes(
-        body[_OCI_LOBOPS_OFFSET_OFF : _OCI_LOBOPS_OFFSET_OFF + 8], 'little'
-    )
-    amount = int.from_bytes(
-        body[_OCI_LOBOPS_AMOUNT_OFF : _OCI_LOBOPS_AMOUNT_OFF + 8], 'little'
-    )
+    offset = int.from_bytes(body[offset_off : offset_off + 8], 'little')
+    amount = int.from_bytes(body[amount_off : amount_off + 8], 'little')
     return max(offset, 1), amount
 
 
@@ -9269,6 +9285,19 @@ _OCI_LOB_TAIL_SIZE_OFF = 93  # ub4 BE byte size in the echoed locator
 _OCI_LOB_TAIL_AMOUNT_OFF = 107  # ub4 LE amount read (characters for CLOB / bytes)
 
 
+# The LOB's length (ub8) and chunk size (ub4) a LOB column value carries between
+# its locator length and the locator (#1287); the chunk size is 11g's.
+_OCI_LOB_CHUNK_SIZE = 8132
+_OCI_LOB_ROW_METADATA_LEN = 12
+
+# Whether the sqlplus / thick-OCI client offered CCAP_LOB_12C, and so reads a LOB
+# column value with the LOB's length and chunk size in it. Set per session at
+# login from the client's own capabilities (#1287).
+_ENCODE_OCI_LOB_12C: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    'encode_oci_lob_12c', default=False
+)
+
+
 def _oci_lob_byte_size(value: object, is_clob: bool) -> int:
     # The LOB content byte count sqlplus reads from the locator: a CLOB is UTF-16
     # on the wire (2 bytes per character), a BLOB is its raw bytes.
@@ -9281,16 +9310,26 @@ def _oci_lob_byte_size(value: object, is_clob: bool) -> int:
 
 def encode_lob_locator_oci(value: object, is_clob: bool) -> bytes:
     """The RXD value for a LOB column (#405): a minted opaque locator carrying the
-    content **byte** size so sqlplus issues a TTI_LOBOPS READ. NULL is a zero
-    num_bytes and draws no read."""
+    content **byte** size so sqlplus issues a TTI_LOBOPS READ.
+
+    The locator's length leads, as a fixed ub4 like every OCI length. A client
+    that offered CCAP_LOB_12C (sqlplus 23.26) then reads the LOB's length (a ub8,
+    characters for a CLOB) and its chunk size (a ub4) before the locator, and
+    cannot parse the row without them; one that did not (sqlplus 11.2) reads
+    the locator straight away and cannot parse it with them. A live 11g answers
+    each in its own form (#1287). NULL is that leading length at zero, all four
+    bytes of it, and draws no read."""
     if value is None:
-        return bytes([0])
+        return bytes(4)
     byte_size = _oci_lob_byte_size(value, is_clob)
     loc = bytearray(_OCI_LOB_ROW_VALUE[is_clob])
     loc[_OCI_LOB_ROW_SIZE_OFF : _OCI_LOB_ROW_SIZE_OFF + 4] = byte_size.to_bytes(
         4, 'big'
     )
-    return bytes(loc)
+    if not _ENCODE_OCI_LOB_12C.get():
+        return bytes(loc)
+    metadata = struct.pack('<QI', _lob_value_size(value), _OCI_LOB_CHUNK_SIZE)
+    return bytes(loc[:4]) + metadata + bytes(loc[4:])
 
 
 def encode_lob_read_response_oci(

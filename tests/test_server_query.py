@@ -2484,8 +2484,9 @@ def test_long_row_replies_carry_the_right_status() -> None:
 
 def test_lob_locator_carries_the_content_byte_size() -> None:
     # The row locator's size field is the content BYTE count (big-endian): a CLOB
-    # is UTF-16 (2 bytes per char), a BLOB is its raw bytes. NULL is a lone 0x00
-    # (no read). This unit is what makes sqlplus accept the locator (#405).
+    # is UTF-16 (2 bytes per char), a BLOB is its raw bytes. NULL is a zero
+    # length, all four bytes of it (no read, #1287). This unit is what makes
+    # sqlplus accept the locator (#405).
     from seerdb.common.tns import (
         _OCI_LOB_ROW_SIZE_OFF,
         encode_lob_locator_oci,
@@ -2496,7 +2497,7 @@ def test_lob_locator_carries_the_content_byte_size() -> None:
     assert int.from_bytes(clob[off : off + 4], 'big') == 4000  # 2000 chars * 2
     blob = encode_lob_locator_oci(b'\x00' * 2500, is_clob=False)
     assert int.from_bytes(blob[off : off + 4], 'big') == 2500  # raw bytes
-    assert encode_lob_locator_oci(None, is_clob=True) == b'\x00'
+    assert encode_lob_locator_oci(None, is_clob=True) == bytes(4)
     # CLOB and BLOB use different locator templates: the type bytes and the charset
     # differ (a CLOB is AL32UTF8 characters, a BLOB is binary) so sqlplus does not
     # decode a BLOB's raw bytes as text (#406).
@@ -2544,6 +2545,52 @@ def test_parse_lobops_read_extracts_offset_and_amount() -> None:
     assert parse_lobops_read(bytes(body))[0] == 1
     # Too short → read the whole LOB from the start.
     assert parse_lobops_read(b'\x03\x60\x01') == (1, 2**31)
+
+
+# sqlplus 23.26's third CLOB read of one LOB (#1287): the narrow request, whose
+# fields sit elsewhere than the wide form's. It asks for 50 characters from
+# character 51.
+_OCI_LOBOPS_READ_NARROW = bytes.fromhex(
+    '036004feffffffffffffff6a0000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000200000000'
+    '000000000000000000000033000000000000000400000000000000feffffffff'
+    'ffffff0000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000680001020c88000002000000010000005600000001000000'
+    '0100000002000203690002000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000010000000000000000001405'
+    '00000000000258000000000002000000003200000000000000'
+)
+
+
+def test_parse_lobops_read_reads_the_narrow_request() -> None:
+    # Read with the wide offsets, this request is too short, so the Mirror
+    # served the whole LOB to every read, which sqlplus cannot take (#1287).
+    from seerdb.common.tns import parse_lobops_read
+
+    assert parse_lobops_read(_OCI_LOBOPS_READ_NARROW) == (51, 50)
+
+
+def test_lob_column_value_carries_the_lob_length_and_chunk_size() -> None:
+    # A live 11g sends sqlplus 23.26, which offers CCAP_LOB_12C, a LOB column as
+    # its locator length (ub4), the LOB's length (ub8, characters for a CLOB),
+    # its chunk size (ub4), then the locator; sqlplus cannot parse the row
+    # without the middle two. sqlplus 11.2 gets the bare form (#1287).
+    from seerdb.common.tns import _ENCODE_OCI_LOB_12C, encode_lob_locator_oci
+
+    bare = encode_lob_locator_oci('short clob', is_clob=True)
+    token = _ENCODE_OCI_LOB_12C.set(True)
+    try:
+        value = encode_lob_locator_oci('short clob', is_clob=True)
+        blob = encode_lob_locator_oci(b'\x01\x02', is_clob=False)
+        null = encode_lob_locator_oci(None, is_clob=True)
+    finally:
+        _ENCODE_OCI_LOB_12C.reset(token)
+    assert int.from_bytes(value[4:12], 'little') == 10  # characters
+    assert int.from_bytes(value[12:16], 'little') == 8132  # 11g's chunk size
+    # Around them, the bare form a client without CCAP_LOB_12C reads.
+    assert value[:4] + value[16:] == bare
+    assert int.from_bytes(blob[4:12], 'little') == 2  # bytes
+    assert null == bytes(4)
 
 
 def test_encode_lob_describe_oci_omits_the_dcb_tail() -> None:
