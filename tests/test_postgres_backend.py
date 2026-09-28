@@ -2070,6 +2070,40 @@ def test_a_timestamptz_column_is_local_time_zone() -> None:
         backend.close()
 
 
+def test_rownum_becomes_limit_only_where_it_means_limit() -> None:
+    # A top-level `AND ROWNUM <= n` filter is LIMIT n (#1271); where Oracle
+    # numbers rows before a sort, grouping, DISTINCT, aggregate, set operator,
+    # OR or FOR UPDATE, the two differ, and ROWNUM is refused by name.
+    from postgres_backend import UnsupportedFeature, _rewrite_rownum
+
+    rewritten = {
+        'select c from t where c is not null and rownum <= 1': (
+            'select c from t WHERE c is not null LIMIT 1'
+        ),
+        'SELECT id FROM t WHERE rownum < 3 AND a = 1': 'SELECT id FROM t WHERE a = 1 LIMIT 2',
+        'SELECT id FROM t WHERE rownum = 1': 'SELECT id FROM t LIMIT 1',
+        'SELECT id FROM t WHERE rownum = 2': 'SELECT id FROM t LIMIT 0',
+        'SELECT id FROM t WHERE rownum <= :1': 'SELECT id FROM t LIMIT :1',
+        'SELECT * FROM (SELECT id FROM t ORDER BY id) WHERE rownum <= 3': (
+            'SELECT * FROM (SELECT id FROM t ORDER BY id) LIMIT 3'
+        ),
+        "SELECT 'rownum' FROM dual": "SELECT 'rownum' FROM dual",
+    }
+    for sql, expected in rewritten.items():
+        assert _rewrite_rownum(sql) == expected, sql
+    for sql in (
+        'SELECT id FROM t WHERE rownum <= 1 ORDER BY id',
+        'SELECT count(*) FROM t WHERE rownum <= 5',
+        'SELECT DISTINCT a FROM t WHERE rownum <= 5',
+        'SELECT id FROM t WHERE a = 1 OR rownum <= 1',
+        'SELECT id FROM t WHERE rownum <= 1 FOR UPDATE',
+        'SELECT id, rownum FROM t',
+        'SELECT id FROM t WHERE rownum > 1',
+    ):
+        with pytest.raises(UnsupportedFeature):
+            _rewrite_rownum(sql)
+
+
 def test_dictionary_views_preserve_quoted_identifier_case() -> None:
     # Oracle stores an unquoted identifier upper-case and a quoted one verbatim;
     # PostgreSQL folds unquoted names lower-case. sys.ora_name() reconstructs the

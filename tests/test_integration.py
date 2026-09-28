@@ -1009,6 +1009,31 @@ class TypesIntegration(_IntegrationBase):
         self.assertTrue(a.endswith('WITH TIME ZONE') and 'LOCAL' not in a, a)
         self.assertTrue(b.endswith('WITH LOCAL TIME ZONE'), b)
 
+    def test_rownum_filters_the_first_rows(self):
+        # ROWNUM as a top-level filter, the top-N idiom over an ordered inline
+        # view, and `ROWNUM = 2`, which Oracle never satisfies (#1271).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, v VARCHAR2(5))')
+        for i in range(1, 6):
+            self.cur.execute(
+                f'INSERT INTO {self.TABLE} VALUES (:1, :2)',
+                [i, None if i == 2 else 'x'],
+            )
+        self.cur.execute(
+            f'SELECT id FROM {self.TABLE} WHERE v IS NOT NULL AND ROWNUM <= 2'
+        )
+        rows = self.cur.fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertNotIn((2,), rows)
+        self.cur.execute(
+            f'SELECT id FROM (SELECT id FROM {self.TABLE} ORDER BY id DESC) '
+            'WHERE ROWNUM < 3'
+        )
+        self.assertEqual(self.cur.fetchall(), [(5,), (4,)])
+        self.cur.execute(f'SELECT id FROM {self.TABLE} WHERE ROWNUM = 2')
+        self.assertEqual(self.cur.fetchall(), [])
+        self.cur.execute(f'SELECT id FROM {self.TABLE} WHERE ROWNUM <= :1', [3])
+        self.assertEqual(len(self.cur.fetchall()), 3)
+
     def test_a_bool_declared_number_is_stored_as_a_number(self):
         # A bool bound with a declared NUMBER type is the NUMBER 0 or 1 on every
         # server; from 23.1 it used to go out as a native BOOLEAN value, which
@@ -8151,6 +8176,22 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     await Cur.execute(f'DROP TABLE {Table}')
                 finally:
                     await Cur.execute(f'DROP TYPE {NType}')
+
+    async def test_rownum_filters_the_first_rows(self):
+        # Async twin of TypesIntegration's (#1271).
+        Table = 'PYO_ASYNC_ROWNUM'
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await self._drop_async(Cur, Table)
+                await Cur.execute(f'CREATE TABLE {Table} (id NUMBER)')
+                for I in range(1, 6):
+                    await Cur.execute(f'INSERT INTO {Table} VALUES (:1)', [I])
+                await Cur.execute(
+                    f'SELECT id FROM (SELECT id FROM {Table} ORDER BY id) '
+                    'WHERE ROWNUM <= 2'
+                )
+                self.assertEqual(await Cur.fetchall(), [(1,), (2,)])
+                await self._drop_async(Cur, Table)
 
     async def test_a_bool_declared_number_is_stored_as_a_number(self):
         # Async twin of TypesIntegration's.
