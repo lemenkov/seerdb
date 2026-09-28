@@ -127,6 +127,7 @@ from seerdb.common.tns import (
     parse_exec,
     parse_exec_oci,
     parse_fetch,
+    parse_fetch_oci,
     parse_free_temp_lobs_piggyback,
     parse_lobops_read,
     parse_lobops_request,
@@ -1391,12 +1392,21 @@ def _serve_oci_session(
                     )
                     parked = (columns, rows[1:]) if len(rows) > 1 else None
                 elif parked is not None:
+                    # Never more rows than the fetch asked for: sqlplus sized its
+                    # buffer to that count, and overrunning it crashes the client.
+                    # The rest stays parked for the next fetch (#1284).
                     columns, rows = parked
+                    count = max(1, parse_fetch_oci(body))
                     stream.write_packet(
                         TNS_DATA,
-                        encode_fetch_batch_oci(columns, rows, sequence=seq.next()),
+                        encode_fetch_batch_oci(
+                            columns,
+                            rows[:count],
+                            sequence=seq.next(),
+                            more=len(rows) > count,
+                        ),
                     )
-                    parked = None
+                    parked = (columns, rows[count:]) if len(rows) > count else None
                 else:
                     # Nothing parked — the execute already delivered every row;
                     # the fetch just wants the end-of-fetch terminator (ORA-01403).

@@ -1238,6 +1238,15 @@ The default fetch size is 100 rows (configurable via the `fetch` parameter),
 matching oracledb's effective batch so a large `fetchall` drains in ~n/100
 round-trips rather than ~n/15.
 
+**sqlplus / thick OCI** sends the same call with fixed-width fields: `03 05
+<seq>`, then the cursor and the row count as ub4 LE (`03 05 0f 02 00 00 00 0f
+00 00 00` asks cursor 2 for 15 rows, which is what sqlplus 23.26 asks for). The
+count is a hard limit here: sqlplus sizes its fetch buffer to it, and a reply
+with more rows overruns that buffer and **crashes the client**. A live 11g
+answers a 30-row query with 1 row in the execute reply, then 15, then the last
+14. A batch with rows still to come ends with a plain success OER and the last
+one with the `ORA-01403` OER. The Mirror does the same (#1284).
+
 **When a follow-up FETCH is required.** The execute response ends with an
 OER (`§6.7`). What says "more rows are available on the cursor" is the
 *absence* of the end-of-fetch code: an OER whose error is `ORA-01403` means
