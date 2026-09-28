@@ -47,9 +47,12 @@ from seerdb.common.tns import (
 from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
     CCAP_FIELD_VERSION,
+    CCAP_LOGON_O7LOGON,
+    CCAP_LOGON_TYPES,
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_12_2,
+    FIELD_VERSION_18_1_EXT1,
     FIELD_VERSION_21_1,
     FIELD_VERSION_23_1,
     TNS_ACCEPT,
@@ -370,7 +373,25 @@ _DB_TZ_HMS = (0, 0, 0)  # DB session time zone = UTC (+00:00:00)
 _TZFILE_VERSION = 14  # the 11.2 default timezone-file (DST rules) version
 
 
-def build_caps_block_reply(field_version: int = FIELD_VERSION_11_2) -> bytes:
+def oci_field_version(field_version: int) -> int:
+    """The field version the Mirror speaks to sqlplus / thick OCI.
+
+    A sqlplus client lays out its requests, and reads the replies, by the field
+    version the handshake advertises. Below 12.1 that is the session's own. From
+    12.1 it is 18c's: the only 12c-band layout there are live captures of, so
+    every byte the Mirror sends there can be checked against a real server's. A
+    12.1 server's own layout differs from it (sqlplus sends a 12.1 server a
+    shorter statement than an 18c one), and nothing here has seen it. sqlplus
+    accepts 18c's layout over a 12.1 ACCEPT (#1282).
+    """
+    if field_version >= FIELD_VERSION_12_1:
+        return FIELD_VERSION_18_1_EXT1
+    return field_version
+
+
+def build_caps_block_reply(
+    field_version: int = FIELD_VERSION_11_2, *, oci: bool = False
+) -> bytes:
     """The TTI_PRO capability block as a TTC payload (no packet header): version
     banner, charset, the charset-element array, the fixed descriptor, and the
     server 11g capability vectors. Serves both the thin PRO reply and the
@@ -379,9 +400,17 @@ def build_caps_block_reply(field_version: int = FIELD_VERSION_11_2) -> bytes:
     ``field_version`` is the field version the Mirror advertises — the byte at
     ``CCAP_FIELD_VERSION`` in the compile capabilities, which is what a thin
     client negotiates down to and gates its 12c+ / 23ai wire formats on. The
-    rest of the block is the pinned 11.2 identity whatever the version."""
+    rest of the block is the pinned 11.2 identity whatever the version.
+
+    ``oci`` marks the sqlplus/deadbeef DTY reply, which advertises
+    :func:`oci_field_version` instead. From 12.1 it also adds the O7LOGON logon
+    type a 12c-band server advertises: without it a modern sqlplus cannot use
+    the 12c SHA-2 verifier the OCI challenge then offers (#1282)."""
     compile_caps = bytearray(_SERVER_COMPILE_CAPS)
     compile_caps[CCAP_FIELD_VERSION] = field_version
+    if oci and field_version >= FIELD_VERSION_12_1:
+        compile_caps[CCAP_FIELD_VERSION] = oci_field_version(field_version)
+        compile_caps[CCAP_LOGON_TYPES] |= CCAP_LOGON_O7LOGON
     return (
         # TTI_PRO, the negotiated field version (6 = 11g), a zero, then the
         # NUL-terminated version banner.
@@ -547,7 +576,7 @@ def encode_dty_reply(
     of the handshake speak one dialect.
     """
     payload = (
-        build_caps_block_reply(field_version)
+        build_caps_block_reply(field_version, oci=True)
         if sqlplus
         else build_dty_type_reply(field_version)
     )

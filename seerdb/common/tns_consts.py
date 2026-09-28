@@ -392,6 +392,9 @@ FIELD_VERSION_11_2 = 6
 FIELD_VERSION_12_1 = 7
 FIELD_VERSION_12_2 = 8
 FIELD_VERSION_12_2_EXT1 = 9
+FIELD_VERSION_18_1_EXT1 = (
+    11  # Oracle 18c; the layout the Mirror speaks to sqlplus from 12.1 (#1282)
+)
 FIELD_VERSION_19_1 = 12
 FIELD_VERSION_19_1_EXT1 = 13  # written inside the FAST_AUTH envelope (#89)
 FIELD_VERSION_20_1 = 14  # AQ JSON-payload pointer gate (#128)
@@ -404,6 +407,10 @@ FIELD_VERSION_23_4 = 24  # 23ai max; reached only via FAST_AUTH (#89)
 # gate (CCAP_TTC4_EXPLICIT_BOUNDARY, CCAP_FEATURE_BACKPORT2_END_USER_SEC).
 CCAP_SQL_VERSION = 0
 CCAP_LOGON_TYPES = 4
+# The O7LOGON bit of CCAP_LOGON_TYPES. A 12c-band server sets it (18c sends
+# 0x6F); a modern sqlplus offered the 12c SHA-2 verifier derives its 256-bit
+# key only when it is set, and fails the login without it (#1282).
+CCAP_LOGON_O7LOGON = 0x20
 CCAP_FEATURE_BACKPORT = 5
 CCAP_FIELD_VERSION = 7  # gates the auth verifier + version-gated formats
 CCAP_SERVER_DEFINE_CONV = 8

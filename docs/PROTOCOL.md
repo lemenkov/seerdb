@@ -604,6 +604,87 @@ substring after decrypting, so the nonce is an unchecked filler
 (`server_proof_oci`). Reconstructing it byte-for-byte from a decrypted live
 capture confirmed the structure.
 
+**From 12.1 the login takes the 12c-band shape (#1282).** Once the ACCEPT says
+315 or later, a modern sqlplus (23.26 measured) hangs up on the 11g challenge
+above. What an 18c server sends instead, and what the Mirror now sends at field
+version 12.1+:
+
+- **Challenge: six pairs, not three.** `AUTH_SESSKEY` (a **32-byte** server
+  session, 64 hex), `AUTH_VFR_DATA` (a 16-byte salt, flag **`0x4815`** — the 12c
+  SHA-2 verifier), `AUTH_PBKDF2_CSK_SALT`, `AUTH_PBKDF2_VGEN_COUNT` (`4096`),
+  `AUTH_PBKDF2_SDER_COUNT` (`3`), `AUTH_GLOBALLY_UNIQUE_DBID`. The crypto is the
+  thin 256-bit scheme (§4.5): `KeySess = SHA-512(PBKDF2-SHA512(pw, salt ‖
+  "AUTH_PBKDF2_SPEEDY_KEY", 4096) ‖ salt)[:32]`. The client still answers with
+  the §4.1.2 AUTH form, only with a 32-byte session key.
+- **`CCAP_LOGON_TYPES` needs `0x20` (O7LOGON).** The 11.2 identity advertises
+  `0x0F`; 18c sends `0x6F`. With the SHA-2 challenge but without that bit,
+  sqlplus derives a different key and the login fails. Setting `0x20` alone
+  (`0x2F`) is enough, and `0x40` alone (`0x4F`) is not. The Mirror sets it only
+  in the deadbeef DTY reply's capability block; the thin PRO reply keeps `0x0F`.
+- **Both auth trailers are 144 bytes, not 136.** They are the same OER frame
+  followed by eight zero bytes. Apart from those eight bytes, 18c's differ from
+  the Mirror's only at the per-message counter (offsets 5–6) and at a leaked
+  native pointer (offsets 72–77).
+
+With these, sqlplus 23.26 logs in to a 12.1 Mirror.
+
+**The layout past login follows the advertised field version.** sqlplus sends
+the same statement as 321 bytes to 11g (field version 6), 351 to a Mirror
+advertising 12.1 (7) and 385 to 18c (11). There is no 12.1 server to capture, so
+from 12.1 the deadbeef DTY reply advertises **18c's field version** and the
+Mirror serves sqlplus in 18c's layout, while thin clients keep 12.1. sqlplus
+accepts that over a 12.1 ACCEPT.
+
+In that layout the narrow `OALL8` preamble grows by **64
+zero bytes** ahead of the SQL, eight more 8-byte slots. The SQL text moves from
+offset 176 to 240, while the bind count (71) and the bind section behind the SQL
+stay put. The inserted bytes are all zero, so the session's field version, not
+the wire, says which layout a statement is in.
+
+**The statement replies.** 11g and 18c answer sqlplus 23 with the same messages
+(`TTI_DCB` describe, row header, rows, RPA, OER). 18c's are 11g's with two
+widenings, and the Mirror applies both at the 12c band:
+
+- **Every OER is 144 bytes, not 136.** The error number appears again at offset
+  132 (1403 at the end of a fetch, 942 on a failed parse), and a ub8 row count
+  follows it. This covers the auth trailers, the status frames, the error
+  reply and the end of fetch. sqlplus takes a DML statement's "N rows created"
+  from that row count, not from the frame's own field, so it reported 0 rows
+  until the Mirror filled it in. On query replies the Mirror leaves it zero,
+  and sqlplus counts the rows itself.
+- **Each describe column's pre-name block is 56 bytes, not 48.** It gains 4 zero
+  bytes ahead of the char-semantics flag (offset 15 → 19) and 4 more ahead of the
+  charset (30 → 38). The first column's leading byte is `0x5c` (11g: `0x51`). A
+  character column carries a ub4 `0x3ffe` behind `max_size`, meaning unpinned,
+  where 11g has zero. Measured on NUMBER, DATE, VARCHAR2, NCHAR and NVARCHAR2
+  columns.
+
+The row header and the describe tail keep their 11g length: 18c's differ only
+in instance values (an SCN).
+
+**The `DESCRIBE <object>` reply** (§6.0) is a different message, with its own
+widening at the 12c band. Against a live 18c's describe of a NUMBER / VARCHAR2 /
+DATE table, it is the 11g reply with zero runs inserted and three carried values
+changed:
+- the header gains 8 zero bytes after its third describe-time entry;
+- each column block gains 20 zero bytes after its post-name byte 34, which reads
+  `0x04` (11g: `0x24`), and the block's leading byte reads `0x7a` (11g: `0x5c`);
+- the trailer frame is 137 bytes, not 121: 8 zero bytes in front and 8 at the
+  end, byte 4 reading `0x05` (11g: `0x04`), and the type-dependent bytes zero;
+- its OER widens like every other.
+None of the changed values is decoded; they are carried.
+
+**The end-to-end tracing piggyback** (`11 87`) sqlplus sends ahead of a call
+has a head 16 bytes longer at the 12c band, so its values start at offset 155,
+not 139. The Mirror walks it there, and lands on the call behind it.
+
+With these, sqlplus 23.26's output against a 12.1 Mirror is byte-identical to
+the same session at 11.2. That covers queries, fetches in batches, errors, DDL,
+DML, commit and rollback, `DESCRIBE`, `VARIABLE` / `EXEC` out binds and bind
+variables. What still fails at 11.2 fails the same way at 12.1: a CLOB select
+hangs (over PostgreSQL and SQLite alike), and over the SQLite example `SET
+SERVEROUTPUT ON` loses the session.
+
 These captured templates are **stepping stones** — the crypto and offsets are
 understood; a proper `deadbeef` codec (encoding these packets field-by-field
 rather than replaying templates) can replace them later. Auth is only the login

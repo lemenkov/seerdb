@@ -26,12 +26,14 @@ from dataclasses import replace
 from secrets import token_bytes
 from typing import NoReturn, TypeVar
 
-from seerdb.common.crypto import decrypt_password
+from seerdb.common.crypto import VFR_12C_SHA2, decrypt_password
 from seerdb.common.dbobject import ObjectImage
 from seerdb.common.exceptions import InterfaceError, NotSupportedError, Truncated
 from seerdb.common.oci import (
     OCI_CMD_COMMIT,
     OCI_CMD_ROLLBACK,
+    OCI_E2E_VALUES_OFF,
+    OCI_E2E_VALUES_OFF_12C,
     strip_oci_e2e_piggyback,
 )
 from seerdb.common.sqltext import (
@@ -139,6 +141,7 @@ from seerdb.common.tns import (
 )
 from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
+    FIELD_VERSION_12_1,
     FIELD_VERSION_23_1,
     TNS_CONNECT,
     TNS_DATA,
@@ -224,6 +227,7 @@ from seerdb.server.handshake import (
     encode_type_reply_sqlplus,
     is_ano_negotiation,
     negotiated_tns_version,
+    oci_field_version,
     parse_connect,
     pro_is_sqlplus,
     server_tns_version,
@@ -587,16 +591,27 @@ def handle_login(
     auth_password: bytes | None
     if sqlplus:
         # The OCI challenge template carries a 10-byte salt slot (thin uses 16).
-        challenge = make_challenge(secret.encode('utf-8'), salt=token_bytes(10))
+        # Its shape follows the field version as the thin one does: 12.1+ gets the
+        # PBKDF2 challenge, which a modern sqlplus insists on once the ACCEPT says
+        # 12.1 or later (#1282); below that, the 11g one.
+        # With it goes the 12c SHA-2 verifier, as a 12c-band server offers it
+        # (captured from 18c); a modern sqlplus hangs up on the 11g one there.
+        challenge = (
+            make_challenge(
+                secret.encode('utf-8'),
+                field_version=field_version,
+                verifier_type=VFR_12C_SHA2,
+            )
+            if field_version >= FIELD_VERSION_12_1
+            else make_challenge(secret.encode('utf-8'), salt=token_bytes(10))
+        )
         stream.send_raw(encode_challenge_oci(challenge))
         _, client_sesskey, auth_password = parse_auth_response_oci(
             _expect(stream, TNS_DATA, 'AUTH')
         )
     else:
         # The thin challenge follows the session's field version: 12.1+ gets the
-        # PBKDF2 shape and derivation, below that the 11g one (#829). The OCI
-        # branch above stays 11g -- its dialect is pinned to the captured 11.2
-        # identity.
+        # PBKDF2 shape and derivation, below that the 11g one (#829).
         challenge = make_challenge(secret.encode('utf-8'), field_version=field_version)
         # Fast-auth expects the challenge bundled with the PRO + DTY replies it
         # deferred; legacy sends the challenge on its own.
@@ -685,7 +700,9 @@ def handle_login(
     if not sqlplus and new_password_cipher:
         _apply_new_password(backend, user, secret, conn_key, new_password_cipher)
     if sqlplus:
-        stream.send_raw(encode_result_oci(conn_key, identity=identity))
+        stream.send_raw(
+            encode_result_oci(conn_key, identity=identity, field_version=field_version)
+        )
     else:
         # Report the session's REAL identity when the backend can say what it is.
         # A client reads session_id / serial_num / instance_name / db_name /
@@ -1002,7 +1019,9 @@ def serve_session(
         )
         field_version = negotiated
     if sqlplus:
-        return _serve_oci_session(stream, backend, user, conn_key, identity)
+        return _serve_oci_session(
+            stream, backend, user, conn_key, identity, field_version=field_version
+        )
     cursors = _Cursors()
     # LOB contents (wire bytes + is_clob) the current statement's rows carry, in
     # the order their locators went out; the thin client drains them with
@@ -1267,6 +1286,8 @@ def _serve_oci_session(
     user: str,
     conn_key: bytes | None = None,
     identity: ServerIdentity = IDENTITY_11_2,
+    *,
+    field_version: int = FIELD_VERSION_11_2,
 ) -> str:
     # The sqlplus / thick-OCI query loop (#265), built up one message shape at a
     # time. So far: the post-login version call (-> banner), the OCI execute
@@ -1285,7 +1306,15 @@ def _serve_oci_session(
     # The live per-session OER end-to-end sequence counter (§36); every OER-bearing
     # reply below draws its next value so the field advances like a real server's.
     seq = _OciSequence()
+    # sqlplus lays out its requests and reads the replies in the layout of the
+    # field version its handshake advertised, which from 12.1 is not the
+    # session's own (#1282).
+    oci_version = oci_field_version(field_version)
     while True:
+        # Pinned per message, as the thin loop does: the backend runs in a copied
+        # context, so nothing it does can move it.
+        _DECODE_FIELD_VERSION.set(oci_version)
+        _ENCODE_FIELD_VERSION.set(oci_version)
         received = stream.read_packet()
         if received is None:
             return user
@@ -1323,7 +1352,12 @@ def _serve_oci_session(
             # The walker checks its own landing and returns None rather than
             # guess, so a shape it does not know becomes a clean refusal instead
             # of a desynchronised stream.
-            behind = strip_oci_e2e_piggyback(body)
+            behind = strip_oci_e2e_piggyback(
+                body,
+                OCI_E2E_VALUES_OFF_12C
+                if oci_version >= FIELD_VERSION_12_1
+                else OCI_E2E_VALUES_OFF,
+            )
             if behind is not None:
                 body = behind
         if len(body) >= 3 and body[0] == TTI_FUN:

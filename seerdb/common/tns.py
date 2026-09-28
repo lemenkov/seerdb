@@ -3806,14 +3806,21 @@ _OCI_FETCH_CONST_OFF = 73
 _OCI_FETCH_OER_LEN = 136
 
 
-def encode_fetch_terminator_oci(sequence: int) -> bytes:
-    """The sqlplus / thick-OCI end-of-fetch reply (ORA-01403 = cursor drained)."""
+def encode_fetch_terminator_oci(sequence: int, *, rowcount: int = 0) -> bytes:
+    """The sqlplus / thick-OCI end-of-fetch reply (ORA-01403 = cursor drained).
+
+    ``rowcount`` is the rows the cursor delivered in all, which the 12c band's
+    OER carries (#1282)."""
     header = _oci_fetch_oer_header(sequence)
     oer = bytearray(_OCI_FETCH_OER_LEN)
     oer[0 : len(header)] = header
     off = _OCI_FETCH_CONST_OFF
     oer[off : off + len(_OCI_FETCH_CONST)] = _OCI_FETCH_CONST
-    return bytes(oer) + bytes([len(_OCI_END_OF_FETCH_MSG)]) + _OCI_END_OF_FETCH_MSG
+    return (
+        _oci_oer_tail(bytes(oer), error_code=ORA_NO_DATA_FOUND, rowcount=rowcount)
+        + bytes([len(_OCI_END_OF_FETCH_MSG)])
+        + _OCI_END_OF_FETCH_MSG
+    )
 
 
 # On the wire the auth-result values (session key, salt, proof) are
@@ -3865,6 +3872,10 @@ class Challenge:
     # is what selects the modern key derivation on both sides, so it doubles as
     # the flag for "this is a 12c-shaped challenge".
     derived_salt: bytes | None = None
+    # The password verifier the challenge offers (AUTH_VFR_DATA's flag): the 11g
+    # SHA-1 one, or the 12c SHA-2 one a modern sqlplus insists on (#1282). It
+    # picks the key length on both sides -- 192 bits against 256.
+    verifier_type: int = VFR_11G_SHA1
 
 
 # The database identifier a real server puts on the challenge. It is opaque to
@@ -7213,6 +7224,24 @@ _OCI_OER_ENVELOPE = bytes.fromhex(
 )
 
 
+# From the 12c band the OCI OER is 144 bytes, not 136: the same frame, with the
+# error number repeated at offset 132 (the extended error number) and a ub8 row
+# count after it. Both are the fields a 12.1+ thin OER adds too. Captured from
+# 18c for every reply kind (#1282): 1403 there at the end of a fetch and 942 on
+# a failed parse; the row count is the rows fetched so far, or the rows a DML
+# statement touched.
+_OCI_OER_EXT_ERROR_OFF = 132
+
+
+def _oci_oer_tail(oer: bytes, *, error_code: int = 0, rowcount: int = 0) -> bytes:
+    """Widen a 136-byte OCI OER to the band the session speaks (#1282)."""
+    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_12_1:
+        return oer
+    out = bytearray(oer)
+    struct.pack_into('<I', out, _OCI_OER_EXT_ERROR_OFF, error_code)
+    return bytes(out) + struct.pack('<Q', rowcount)
+
+
 def encode_oci_oer(
     status: int,
     *,
@@ -7222,6 +7251,7 @@ def encode_oci_oer(
     error_code: int = 0,
     command_type: int = oci.OCI_CMD_SELECT,
     category: int | None = None,
+    rowcount: int = 0,
 ) -> bytes:
     """Build a 136-byte OCI OER return-status token (§36) over
     :data:`_OCI_OER_ENVELOPE`. ``status`` is SUCCESS (0x01) or ERROR (0x05);
@@ -7259,7 +7289,7 @@ def encode_oci_oer(
     # diverged.
     struct.pack_into('<H', oer, 49, _ENCODE_OCI_CALL_SEQ.get())
     struct.pack_into('<I', oer, 12, error_code)
-    return bytes(oer)
+    return _oci_oer_tail(bytes(oer), error_code=error_code, rowcount=rowcount)
 
 
 # The 35-byte `08 06` OCI exec-status frame preamble, shared by the describe /
@@ -7370,10 +7400,16 @@ def _oci_dml_frame_trailer(rowid: bytes) -> bytes:
 _OCI_DML_FRAME_TRAILER = _oci_dml_frame_trailer(_OCI_DML_ROWID)
 
 
-def _oci_dml_status_frame(sequence: int) -> bytes:
+def _oci_dml_status_frame(sequence: int, rowcount: int = 0) -> bytes:
     # status 2 is the DML call status (not the fetch/exec 1); offset-20 carries a
     # non-zero value under it (the same murky field as the describe status, §36.1).
-    oer = bytearray(encode_oci_oer(2, sequence=sequence, error_pos=12, command_type=0))
+    # From the 12c band sqlplus reads the affected-row count from the OER's ub8
+    # row count, not from the frame (#1282).
+    oer = bytearray(
+        encode_oci_oer(
+            2, sequence=sequence, error_pos=12, command_type=0, rowcount=rowcount
+        )
+    )
     oer[27 : 27 + len(_OCI_DML_ROWID)] = _OCI_DML_ROWID
     oer[80] = 0x0D  # carried row/SCN byte
     return _OCI_DML_FRAME_PREFIX + bytes(oer) + _OCI_DML_FRAME_TRAILER
@@ -7469,6 +7505,13 @@ def _oci_auth_trailer(sequence: int) -> bytes:
 
 _CHALLENGE_TRAILER = _oci_auth_trailer(2)
 _RESULT_TRAILER = _oci_auth_trailer(3)
+
+# From 12.1 the auth trailer is 8 bytes longer: the same frame, then eight zero
+# bytes (captured from 18c). sqlplus reads the 12c-band length; the 136-byte form
+# leaves it short and the login stalls (#1282).
+_OCI_AUTH_TRAILER_12C_TAIL = bytes(8)
+_CHALLENGE_TRAILER_12C = _CHALLENGE_TRAILER + _OCI_AUTH_TRAILER_12C_TAIL
+_RESULT_TRAILER_12C = _RESULT_TRAILER + _OCI_AUTH_TRAILER_12C_TAIL
 
 
 # --- Captured 11g handshake-identity blobs (opaque, staged here) ---
@@ -8043,6 +8086,16 @@ class _OciAll8Layout(NamedTuple):
 _OCI_ALL8_WIDE = _OciAll8Layout(sql=_OCI_ALL8_SQL_OFF, bind_count=83)
 _OCI_ALL8_NARROW = _OciAll8Layout(sql=176, bind_count=71)
 
+# From the 12c band the narrow preamble grows by 64 bytes, all of them ahead of
+# the SQL and behind the bind count (eight more 8-byte slots, zero in every
+# capture; sqlplus 23.26 against a live 18c, #1282). The width tests above still
+# hold, and the inserted bytes are zeros a wire test could only guess at, so the
+# session's field version says which form it is.
+_OCI_ALL8_12C_GROWTH = 64
+_OCI_ALL8_NARROW_12C = _OCI_ALL8_NARROW._replace(
+    sql=_OCI_ALL8_NARROW.sql + _OCI_ALL8_12C_GROWTH
+)
+
 
 def _oci_all8_layout(payload: bytes) -> _OciAll8Layout:
     """Which OALL8 preamble width ``payload`` carries, as the offsets that depend
@@ -8055,6 +8108,11 @@ def _oci_all8_layout(payload: bytes) -> _OciAll8Layout:
         (_OCI_ALL8_IND2_OFF_NARROW, _OCI_ALL8_NARROW),
     ):
         if payload[ind2 : ind2 + 8] == oci.OCI_INDICATOR:
+            if (
+                layout is _OCI_ALL8_NARROW
+                and _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+            ):
+                return _OCI_ALL8_NARROW_12C
             return layout
     raise InterfaceError(f'OCI OALL8: no indicator at offset {_OCI_ALL8_IND2_OFF}')
 
@@ -8252,9 +8310,37 @@ _OCI_DCB_CHAR_SEMANTICS_OFF = 15
 _OCI_DCB_CHAR_SEMANTICS_FLAG = 0x10
 
 
+# From the 12c band each column's pre-name block is 8 bytes longer: 4 zero bytes
+# ahead of the char-semantics flag (so it moves from 15 to 19) and 4 more ahead
+# of the charset (30 to 38), which pushes everything from there on 8 bytes along
+# (measured against a live 18c for NUMBER, DATE, VARCHAR2, NCHAR and NVARCHAR2
+# columns, #1282). Two values change too: the first column's leading byte, and
+# a ub4 behind max_size that 18c sets on a character column and 11g leaves
+# zero; its meaning is unpinned, carried from the capture.
+_OCI_DCB_COL_12C_SPLITS = (14, 30)
+_OCI_DCB_COL_12C_GROWTH = 4
+_OCI_DCB_FIRST_COL_11G = 0x51
+_OCI_DCB_FIRST_COL_12C = 0x5C
+_OCI_DCB_CHAR_12C_OFF = 46
+_OCI_DCB_CHAR_12C_VALUE = 0x3FFE
+
+
+def _widen_dcb_column_oci(pre: bytes, is_char: bool) -> bytes:
+    # The 11g pre-name block, laid out as the 12c band's (see above).
+    a, b = _OCI_DCB_COL_12C_SPLITS
+    pad = bytes(_OCI_DCB_COL_12C_GROWTH)
+    out = bytearray(pre[:a] + pad + pre[a:b] + pad + pre[b:])
+    if out[0] == _OCI_DCB_FIRST_COL_11G:
+        out[0] = _OCI_DCB_FIRST_COL_12C
+    if is_char:
+        off = _OCI_DCB_CHAR_12C_OFF
+        out[off : off + 4] = _oci_ub4(_OCI_DCB_CHAR_12C_VALUE)
+    return bytes(out)
+
+
 def _encode_dcb_column_oci(col: ColumnMeta, position: int, first: bool) -> bytes:
     pre = bytearray(_OCI_DCB_COL_PRENAME)
-    pre[0] = 0x51 if first else 0x00  # a first-column marker byte
+    pre[0] = _OCI_DCB_FIRST_COL_11G if first else 0x00  # a first-column marker byte
     pre[1] = 0x01
     pre[2] = col.data_type
     is_char = col.data_type in _OCI_CHAR_TYPES
@@ -8280,6 +8366,8 @@ def _encode_dcb_column_oci(col: ColumnMeta, position: int, first: bool) -> bytes
     # The post-name block is zeroed — a live 11g describe carries no column
     # position here (verified against the captured single-column reply).
     post = bytes(_OCI_DCB_COL_POSTNAME)
+    if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
+        return _widen_dcb_column_oci(bytes(pre), is_char) + name + post
     return bytes(pre) + name + post
 
 
@@ -8405,6 +8493,13 @@ def _oci_desc_hdr_post(timestamp: bytes) -> bytes:
     return timestamp.join(_OCI_DESC_HDR_POST_SEGMENTS)
 
 
+def _oci_desc_hdr_third_entry_end(timestamp: bytes) -> int:
+    # Where the header's third segment starts plus its leading `02` byte: the
+    # two segments ahead of it, each followed by a describe time.
+    head = _OCI_DESC_HDR_POST_SEGMENTS[:2]
+    return sum(len(seg) for seg in head) + 2 * len(timestamp) + 1
+
+
 def _oci_desc_ts_entry(timestamp: bytes) -> bytes:
     # The describe-time entry a non-last column block carries (§39.2).
     return _OCI_DESC_TS_ENTRY_PRE + timestamp + _OCI_DESC_TS_ENTRY_POST
@@ -8462,12 +8557,48 @@ def _oci_desc_trailer_frame() -> bytes:
     return bytes(frame)
 
 
-def _oci_desc_trailer() -> bytes:
+# The DESCRIBE reply at the 12c band (#1282), measured against a live 18c's
+# describe of a NUMBER / VARCHAR2 / DATE table. It is the 11g reply with zero
+# runs inserted and three carried values changed:
+#   - the header gains 8 zero bytes after the third describe-time entry;
+#   - each column block gains 20 zero bytes after its post-name byte 34, which
+#     reads 0x04 instead of 0x24, and its leading length-like byte reads 0x7a
+#     instead of 0x5c;
+#   - the trailer frame is 137 bytes, not 121: 8 zero bytes in front and 8 at
+#     the end, with byte 4 reading 0x05 instead of 0x04 and the type-dependent
+#     bytes (8, 9, 11) left zero, as 18c leaves them.
+# The OER behind the frame widens like every other (_oci_oer_tail). None of the
+# changed values is decoded; they are carried from the capture.
+_OCI_DESC_12C_HDR_GROWTH = 8
+_OCI_DESC_12C_BLK_LEAD = 0x7A
+_OCI_DESC_12C_POST_MARK_OFF = 34
+_OCI_DESC_12C_POST_MARK = 0x04
+_OCI_DESC_12C_BLK_GROWTH = 20
+_OCI_DESC_12C_TR_PAD = 8
+_OCI_DESC_12C_TR_MARK = 0x05
+
+
+def _oci_desc_12c() -> bool:
+    return _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+
+
+def _oci_desc_trailer_frame_12c(column_count: int) -> bytes:
+    frame = bytearray(_OCI_DESC_TRAILER_FRAME_LEN)
+    frame[_OCI_DESC_TR_COUNT] = column_count & 0xFF
+    frame[4] = _OCI_DESC_12C_TR_MARK
+    frame[16] = 0x09
+    pad = bytes(_OCI_DESC_12C_TR_PAD)
+    return pad + bytes(frame) + pad
+
+
+def _oci_desc_trailer(frame: bytes | None = None) -> bytes:
     # Built per reply, not once at import: the OER's offset-49 field carries the
     # sequence of the call being answered, which is only known per message
     # (#884). Freezing it at import would pin every DESCRIBE reply to whatever
     # the context held when the module loaded.
-    return _oci_desc_trailer_frame() + encode_oci_oer(
+    if frame is None:
+        frame = _oci_desc_trailer_frame()
+    return frame + encode_oci_oer(
         _OCI_DESC_STATUS,
         sequence=_OCI_DESC_OER_SEQUENCE,
         row_kind=_OCI_DESC_OER_ROW_FIELD,
@@ -8571,6 +8702,11 @@ def _oci_desc_block(col: ColumnMeta, *, last: bool, timestamp: bytes) -> bytes:
         entry = _oci_desc_ts_entry(timestamp)
         off = _OCI_DESC_BLK_TS_OFF
         post[off : off + len(entry)] = entry
+    if _oci_desc_12c():
+        pre[1] = _OCI_DESC_12C_BLK_LEAD
+        mark = _OCI_DESC_12C_POST_MARK_OFF
+        post[mark] = _OCI_DESC_12C_POST_MARK
+        post[mark + 1 : mark + 1] = bytes(_OCI_DESC_12C_BLK_GROWTH)
     block = bytes(pre) + _oci_desc_dalc(col.name) + bytes(post)
     if not last:
         # …and a `1` continuation flag 3 bytes before its end.
@@ -8602,9 +8738,16 @@ def encode_describe_reply_oci(
     out += _oci_desc_dalc(schema) + _oci_desc_dalc(table)
     header_post = bytearray(_oci_desc_hdr_post(timestamp))
     header_post[_OCI_DESC_COLCOUNT_OFF] = (len(columns) + 1) & 0xFF
+    if _oci_desc_12c():
+        # After the third describe-time entry and the `02` behind it (#1282).
+        at = _oci_desc_hdr_third_entry_end(timestamp)
+        header_post[at:at] = bytes(_OCI_DESC_12C_HDR_GROWTH)
     out += header_post
     for index, col in enumerate(columns):
         out += _oci_desc_block(col, last=index == len(columns) - 1, timestamp=timestamp)
+    if _oci_desc_12c():
+        out += _oci_desc_trailer(_oci_desc_trailer_frame_12c(len(columns)))
+        return bytes(out)
     trailer = bytearray(_oci_desc_trailer())
     trailer[_OCI_DESC_TR_COUNT] = len(columns) & 0xFF
     trailer[_OCI_DESC_TR_OPAQUE] = (
@@ -8681,7 +8824,7 @@ _OCI_MORE_ROWS_OFF = 55
 _OCI_MORE_ROWS_FLAG = 0x1E
 
 
-def _oci_row_status(sequence: int, *, more: bool = False) -> bytes:
+def _oci_row_status(sequence: int, *, more: bool = False, rowcount: int = 0) -> bytes:
     status = bytearray(_OCI_ROW_STATUS_LEN)
     status[0:3] = b'\x08\x06\x00'  # return marker
     status[11] = 0x02  # a required sentinel
@@ -8690,7 +8833,8 @@ def _oci_row_status(sequence: int, *, more: bool = False) -> bytes:
     status[off : off + len(exec_oer)] = exec_oer
     if more:
         status[_OCI_MORE_ROWS_OFF] = _OCI_MORE_ROWS_FLAG
-    return bytes(status)
+    # The frame ends with its OER, which the 12c band widens (#1282).
+    return _oci_oer_tail(bytes(status), rowcount=rowcount)
 
 
 # The row-header (TTI_RXH) that leads a fetch batch: a small fixed frame plus the
@@ -8846,7 +8990,7 @@ def encode_status_oci(sequence: int) -> bytes:
     status_oer = _oci_status_oer(sequence)
     off = _OCI_EXEC_OER_OFF
     status[off : off + len(status_oer)] = status_oer
-    return bytes(status)
+    return _oci_oer_tail(bytes(status))
 
 
 # The sqlplus PASSWORD success reply (OCIPasswordChange complete, #21): an empty
@@ -8883,7 +9027,7 @@ _OCI_CHANGEPASSWORD_STATUS = _build_changepassword_status_oci()
 
 def encode_changepassword_status_oci() -> bytes:
     """The sqlplus / thick-OCI reply that completes an OCIPasswordChange (#21)."""
-    return _OCI_CHANGEPASSWORD_STATUS
+    return _oci_oer_tail(_OCI_CHANGEPASSWORD_STATUS)
 
 
 # OCI DML execute-status reply (#348/#349). sqlplus renders the completion
@@ -8971,7 +9115,7 @@ def encode_dml_status_oci(keyword: str, rowcount: int, *, sequence: int) -> byte
     prints ``N rows created/updated/deleted``. ``keyword`` (INSERT/UPDATE/DELETE)
     selects the V$SQL command type; MERGE and anything else fall back to INSERT.
     ``sequence`` is the live per-session OER counter."""
-    status = bytearray(_oci_dml_status_frame(sequence))
+    status = bytearray(_oci_dml_status_frame(sequence, rowcount))
     status[_OCI_DML_ROWCOUNT_OFF : _OCI_DML_ROWCOUNT_OFF + 4] = rowcount.to_bytes(
         4, 'little'
     )

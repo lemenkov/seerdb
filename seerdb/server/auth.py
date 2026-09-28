@@ -35,6 +35,7 @@ from __future__ import annotations
 import contextvars
 import struct
 from binascii import unhexlify
+from hashlib import pbkdf2_hmac, sha512
 from secrets import token_bytes
 
 from Crypto.Cipher import AES
@@ -43,7 +44,9 @@ from seerdb.common import oci
 from seerdb.common.crypto import (
     O5LOGON_IV,
     PBKDF2_SDER_COUNT,
+    PBKDF2_VGEN_COUNT,
     VFR_11G_SHA1,
+    VFR_12C_SHA2,
     cat_key,
     conn_key,
     decrypt_password,
@@ -54,8 +57,10 @@ from seerdb.common.crypto import (
 from seerdb.common.exceptions import InterfaceError
 from seerdb.common.tns import (
     _CHALLENGE_TRAILER,
+    _CHALLENGE_TRAILER_12C,
     _DECODE_FIELD_VERSION,
     _RESULT_TRAILER,
+    _RESULT_TRAILER_12C,
     AUTH_GLOBALLY_UNIQUE_DBID,
     Challenge,
     _hexval,
@@ -75,8 +80,10 @@ from seerdb.common.tns_consts import (
 )
 from seerdb.server.identity import IDENTITY_11_2, ServerIdentity
 
-# 11g accounts carry the SHA1 verifier → the 192-bit AES key schedule.
+# 11g accounts carry the SHA1 verifier → the 192-bit AES key schedule; the 12c
+# SHA-2 verifier → the 256-bit one.
 _BITS_11G = 192
+_BITS_12C = 256
 # A server session key is 40 random bytes + an 8-byte pad2 tail, so the client
 # recognises it and mints a matching 48-byte session key (see crypto.o5logon0).
 _SERVER_SESSION_LEN = 40
@@ -99,6 +106,7 @@ def make_challenge(
     server_session: bytes | None = None,
     derived_salt: bytes | None = None,
     field_version: int = FIELD_VERSION_11_2,
+    verifier_type: int = VFR_11G_SHA1,
 ) -> Challenge:
     """Build the O5LOGON challenge for an account whose password is known.
 
@@ -109,9 +117,28 @@ def make_challenge(
     offer — which is a combination a real server also produces, for an account
     that predates SHA-2. ``AUTH_VFR_DATA``'s flag tells the client so.
 
+    ``verifier_type=VFR_12C_SHA2`` offers the 12c SHA-2 verifier instead -- a
+    16-byte salt, the session key sealed with the SHA-512 of the PBKDF2 "speedy
+    key", a 256-bit connection key -- which a modern sqlplus insists on once the
+    ACCEPT says 12.1 or later (#1282). It needs the 12.1+ derived salt.
+
     ``salt`` / ``server_session`` / ``derived_salt`` are injectable for
     deterministic tests; all default to fresh random values.
     """
+    if verifier_type == VFR_12C_SHA2:
+        salt = salt if salt is not None else token_bytes(16)
+        derived_salt = derived_salt or token_bytes(_DERIVED_SALT_LEN)
+        server_session = server_session or token_bytes(_MODERN_SESSION_LEN)
+        speedy = pbkdf2_hmac(
+            'sha512', password, salt + b'AUTH_PBKDF2_SPEEDY_KEY', PBKDF2_VGEN_COUNT
+        )
+        key_sess = sha512(speedy + salt).digest()[:32]
+        auth_sesskey = AES.new(key_sess, AES.MODE_CBC, O5LOGON_IV).encrypt(
+            server_session
+        )
+        return Challenge(
+            salt, server_session, key_sess, auth_sesskey, derived_salt, verifier_type
+        )
     if salt is None:
         salt = token_bytes(16)
     if derived_salt is None and field_version >= FIELD_VERSION_12_1:
@@ -139,10 +166,11 @@ def derive_conn_key(challenge: Challenge, client_auth_sesskey: bytes) -> bytes:
     client_session = AES.new(challenge.key_sess, AES.MODE_CBC, O5LOGON_IV).decrypt(
         client_auth_sesskey
     )
+    bits = _BITS_12C if challenge.verifier_type == VFR_12C_SHA2 else _BITS_11G
     combined = cat_key(
-        challenge.server_session, client_session, challenge.derived_salt, _BITS_11G
+        challenge.server_session, client_session, challenge.derived_salt, bits
     )
-    return conn_key(combined, challenge.derived_salt, _BITS_11G, PBKDF2_SDER_COUNT)
+    return conn_key(combined, challenge.derived_salt, bits, PBKDF2_SDER_COUNT)
 
 
 # The OCI dialect's AUTH_SVR_RESPONSE is 48 bytes, not the thin 16: the real 11g
@@ -269,13 +297,28 @@ def encode_challenge_oci(challenge: Challenge) -> bytes:
     """Build the sqlplus / thick-OCI (deadbeef dialect) O5LOGON challenge (#265).
 
     Returns the **full TNS_DATA packet** (header included), ready for
-    ``PacketStream.send_raw``. Requires an 11g-shaped challenge — a 48-byte
-    encrypted server session (96 hex) and a 10-byte salt (20 hex): pass
-    ``make_challenge(secret, salt=token_bytes(10))``. Validated against live
-    sqlplus 11.2, which accepts it and proceeds to send AUTH.
+    ``PacketStream.send_raw``. An 11g-shaped challenge -- a 48-byte encrypted
+    server session (96 hex) and a 10-byte salt (20 hex), from
+    ``make_challenge(secret, salt=token_bytes(10))`` -- was validated against
+    live sqlplus 11.2. From 12.1 (a challenge with a derived salt) it carries the
+    PBKDF2 salt and the two iteration counts too, as a 12c-band server sends
+    them (captured from 18c): a modern sqlplus refuses an 11g-shaped challenge
+    from a server whose ACCEPT says 12.1 or later, and hangs up (#1282).
     """
     sesskey = _hexval(challenge.auth_sesskey)
     salt = _hexval(challenge.salt)
+    if challenge.derived_salt is not None:
+        return _oci_auth_packet(
+            [
+                (b'AUTH_SESSKEY', sesskey, 0),
+                (b'AUTH_VFR_DATA', salt, challenge.verifier_type),
+                (b'AUTH_PBKDF2_CSK_SALT', _hexval(challenge.derived_salt), 0),
+                (b'AUTH_PBKDF2_VGEN_COUNT', str(PBKDF2_VGEN_COUNT).encode('ascii'), 0),
+                (b'AUTH_PBKDF2_SDER_COUNT', str(PBKDF2_SDER_COUNT).encode('ascii'), 0),
+                (b'AUTH_GLOBALLY_UNIQUE_DBID\x00', AUTH_GLOBALLY_UNIQUE_DBID, 0),
+            ],
+            _CHALLENGE_TRAILER_12C,
+        )
     if len(sesskey) != oci.OCI_SESSKEY_HEXLEN or len(salt) != oci.OCI_SALT_HEXLEN:
         raise InterfaceError(
             'OCI challenge needs a 48-byte server session and a 10-byte salt, '
@@ -294,6 +337,7 @@ def encode_result_oci(
     *,
     nonce: bytes | None = None,
     identity: ServerIdentity = IDENTITY_11_2,
+    field_version: int = FIELD_VERSION_11_2,
 ) -> bytes:
     """Build the sqlplus / thick-OCI (deadbeef dialect) O5LOGON result (#265).
 
@@ -301,12 +345,17 @@ def encode_result_oci(
     ``PacketStream.send_raw``. ``AUTH_SVR_RESPONSE`` (the freshly computed 48-byte
     server proof) is the one per-login value; the release fields come from
     ``identity`` and the rest is the Mirror's fixed identity. ``nonce`` is
-    forwarded to :func:`server_proof_oci` for deterministic tests.
+    forwarded to :func:`server_proof_oci` for deterministic tests. From 12.1
+    (``field_version``) the trailer takes its 12c-band length, as the
+    challenge's does (#1282).
     """
     proof = _hexval(server_proof_oci(session_key, nonce=nonce))
     pairs = [(k, v, 0) for k, v in _result_params(identity)]
     pairs.append((b'AUTH_SVR_RESPONSE', proof, 0))
-    return _oci_auth_packet(pairs, _RESULT_TRAILER)
+    trailer = (
+        _RESULT_TRAILER_12C if field_version >= FIELD_VERSION_12_1 else _RESULT_TRAILER
+    )
+    return _oci_auth_packet(pairs, trailer)
 
 
 # The ordered key/value pairs of the auth message most recently parsed, for the

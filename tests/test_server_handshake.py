@@ -345,3 +345,49 @@ def test_a_21c_accept_keeps_the_37_byte_shape() -> None:
     assert struct.unpack('>H', body[0:2])[0] == TNS_VERSION_21_1
     assert len(body) == 37
     assert struct.unpack('>H', body[12:14])[0] == 0x002D
+
+
+def test_oci_dty_reply_adds_o7logon_from_12_1() -> None:
+    # A modern sqlplus uses the 12c SHA-2 verifier only when the logon types
+    # carry O7LOGON, as a 12c-band server's do (18c: 0x6F) (#1282). The thin
+    # reply and the 11.2 OCI one keep the captured 0x0F.
+    from seerdb.common.tns_consts import (
+        CCAP_LOGON_O7LOGON,
+        FIELD_VERSION_11_2,
+        FIELD_VERSION_12_1,
+        FIELD_VERSION_18_1_EXT1,
+    )
+    from seerdb.server.handshake import build_caps_block_reply
+
+    oci_121 = build_caps_block_reply(FIELD_VERSION_12_1, oci=True)
+    thin_121 = build_caps_block_reply(FIELD_VERSION_12_1)
+    assert len(oci_121) == len(thin_121)
+    diff = {
+        (thin_121[i], oci_121[i])
+        for i in range(len(oci_121))
+        if oci_121[i] != thin_121[i]
+    }
+    # Two bytes differ: the logon types, and the field version the OCI reply
+    # advertises instead (see the next test).
+    logon = 0x0F
+    assert diff == {
+        (logon, logon | CCAP_LOGON_O7LOGON),
+        (FIELD_VERSION_12_1, FIELD_VERSION_18_1_EXT1),
+    }
+    assert build_caps_block_reply(FIELD_VERSION_11_2, oci=True) == (
+        build_caps_block_reply(FIELD_VERSION_11_2)
+    )
+
+
+def test_oci_dty_reply_advertises_18c_from_12_1() -> None:
+    # From 12.1 sqlplus is told 18c's field version, the one 12c-band layout
+    # there are captures of; below 12.1 it gets the session's own (#1282).
+    from seerdb.common.tns_consts import (
+        FIELD_VERSION_11_2,
+        FIELD_VERSION_12_1,
+        FIELD_VERSION_18_1_EXT1,
+    )
+    from seerdb.server.handshake import oci_field_version
+
+    assert oci_field_version(FIELD_VERSION_11_2) == FIELD_VERSION_11_2
+    assert oci_field_version(FIELD_VERSION_12_1) == FIELD_VERSION_18_1_EXT1
