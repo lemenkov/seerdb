@@ -98,6 +98,7 @@ from seerdb.common.tns import (
     encode_lobops_is_open,
     encode_lobops_length,
     encode_lobops_open_ack,
+    encode_login_refusal_oci,
     encode_logoff_status_oci,
     encode_logoff_status_thin,
     encode_long_fetch_row_oci,
@@ -158,6 +159,7 @@ from seerdb.common.tns_consts import (
     TNS_FUNC_SET_SCHEMA,
     TNS_FUNC_TPC_TXN_SWITCH,
     TNS_MARKER,
+    TNS_MARKER_TYPE_BREAK,
     TNS_MARKER_TYPE_RESET,
     TNS_MSG_TYPE_FAST_AUTH,
     TNS_TYPE_BFILE,
@@ -606,7 +608,12 @@ def handle_login(
                 logger.warning('backend refused the client identity: %s', exc)
     secret = backend.authenticate(user)
     if secret is None:
-        _deny_login(stream, f'unknown user: {user!r}')
+        _deny_login(
+            stream,
+            f'unknown user: {user!r}',
+            sqlplus=sqlplus,
+            call_sequence=osesskey[2] if sqlplus else 0,
+        )
 
     # The thin AUTH may omit AUTH_PASSWORD (bytes | None); the OCI AUTH always
     # carries it. Declare the wider type so both branches unpack cleanly.
@@ -656,7 +663,12 @@ def handle_login(
     # secret — the server half of O5LOGON's mutual auth. Without it the Mirror
     # would serve any client that ignores the server proof it can't validate.
     if not verify_password(conn_key, auth_password, secret.encode('utf-8')):
-        _deny_login(stream, f'wrong password for user: {user!r}')
+        _deny_login(
+            stream,
+            f'wrong password for user: {user!r}',
+            sqlplus=sqlplus,
+            call_sequence=auth_body[2] if sqlplus else 0,
+        )
     # The proof checked out, so a new password carried alongside it is a genuine
     # request from an authenticated user. Applying it here rather than ignoring
     # it is what makes `connect(newpassword=...)` mean anything: without this the
@@ -788,6 +800,8 @@ def _open_backend_session(
     open_session = getattr(backend, 'open_session', None)
     if open_session is None:
         return
+    # A sqlplus refusal names the call it refuses: the AUTH, `03 73 <seq>`.
+    refused_call = auth_body[2] if sqlplus and len(auth_body) > 2 else 0
     try:
         open_session(connect_attrs)
     except BackendError as err:
@@ -799,10 +813,16 @@ def _open_backend_session(
             f'upstream session refused: {err.ora_message}',
             ora_code=err.ora_code,
             message=err.ora_message,
+            sqlplus=sqlplus,
+            call_sequence=refused_call,
         )
     except Exception as exc:  # noqa: BLE001
         _deny_login(
-            stream, f'upstream session failed: {exc}', **_login_failure_error(exc)
+            stream,
+            f'upstream session failed: {exc}',
+            sqlplus=sqlplus,
+            call_sequence=refused_call,
+            **_login_failure_error(exc),
         )
 
 
@@ -835,6 +855,8 @@ def _deny_login(
     *,
     ora_code: int = 1017,
     message: str | None = None,
+    sqlplus: bool = False,
+    call_sequence: int = 0,
 ) -> NoReturn:
     # Reject a login the way Oracle does — an OER in place of the next auth
     # reply, which the client raises out of connect() — then drop the
@@ -848,14 +870,33 @@ def _deny_login(
     # cost two separate investigations, because the one thing a client cannot do
     # with ORA-01017 is tell a bad password from a server that had no session to
     # give (#1006). Callers with a real reason pass it.
-    stream.write_packet(
-        TNS_DATA,
-        encode_error(
-            ora_code,
-            message or 'ORA-01017: invalid username/password; logon denied',
-        ),
-    )
+    text = message or 'ORA-01017: invalid username/password; logon denied'
+    if sqlplus:
+        # sqlplus reads a refusal in its own dialect, after the break / reset
+        # marker exchange a live server opens it with. A thin OER is lost on it:
+        # it saw only the connection close and reported ORA-03113 (#1290).
+        stream.write_packet(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_BREAK]))
+        stream.write_packet(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
+        _await_reset_marker(stream)
+        stream.write_packet(
+            TNS_DATA,
+            encode_login_refusal_oci(ora_code, text, call_sequence=call_sequence),
+        )
+    else:
+        stream.write_packet(TNS_DATA, encode_error(ora_code, text))
     raise InterfaceError(f'authentication rejected — {reason}')
+
+
+def _await_reset_marker(stream: PacketStream) -> None:
+    # The client answers the server's break / reset with a reset of its own
+    # before it reads what follows. Anything else it sends first is dropped.
+    for _ in range(8):
+        received = stream.read_packet()
+        if received is None:
+            return
+        packet_type, body = received
+        if packet_type == TNS_MARKER and body[-1:] == bytes([TNS_MARKER_TYPE_RESET]):
+            return
 
 
 class _IsolatedBackend:

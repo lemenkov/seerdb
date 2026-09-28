@@ -597,6 +597,21 @@ sqlplus 11.2 logs in — verified live. The rounds:
    does not cryptographically check) vary. `encode_result_oci` substitutes the
    proof in place and keeps the template's identity values.
 
+**A refused login** (#1290). A live server refuses sqlplus (wrong password, or
+unknown user after the OSESSKEY) in two steps:
+1. it opens a **break / reset marker exchange** (`01 00 01`, then `01 00 02`),
+   and waits for the client's own reset;
+2. it sends, in place of the reply to the refused call, an OCI OER carrying the
+   ORA error and its text.
+
+That OER is the error envelope (§36) without the statement fields: a success
+status byte `01`, zero category, error position and command type, a zero
+sequence, the refused call's own sequence at offset 49 (3 for the AUTH), and
+zero at offset 52. At the 12c band it widens like every OER. A thin-dialect
+OER, which the Mirror used to send, is lost on sqlplus: it sees only the
+connection close and reports ORA-03113. `encode_login_refusal_oci` reproduces
+11g's refusal byte for byte.
+
 **`AUTH_SVR_RESPONSE` is 48 bytes here, not thin's 16.** The real 11g listener
 sends `AES-CBC(nonce16 ‖ "SERVER_TO_CLIENT" ‖ PKCS7-pad, ConnKey)` — a 16-byte
 nonce, the marker, and a full 0x10 pad block. The client finds the marker

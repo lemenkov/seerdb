@@ -8962,6 +8962,42 @@ def encode_error_oci(
     return oer + bytes([len(text)]) + text
 
 
+def encode_login_refusal_oci(
+    ora_code: int, message: str, *, call_sequence: int
+) -> bytes:
+    """The OER a live server refuses a sqlplus / thick-OCI login with (#1290).
+
+    It follows the break / reset marker exchange, in place of the reply to the
+    refused call (the AUTH, or the OSESSKEY for an unknown user), and carries
+    the ORA error and its text. It is the error OER without the statement fields:
+    a success status byte, no category, error position or command type, and the
+    refused call's own sequence where the envelope echoes one. The 12c band
+    widens it like every OER. Measured against a live 11g and 18c for a wrong
+    password.
+    """
+    token = _ENCODE_OCI_CALL_SEQ.set(call_sequence)
+    try:
+        oer = bytearray(
+            encode_oci_oer(
+                oci.OCI_OER_STATUS_SUCCESS,
+                sequence=0,
+                error_code=ora_code,
+                command_type=0,
+                category=0,
+            )
+        )
+    finally:
+        _ENCODE_OCI_CALL_SEQ.reset(token)
+    oer[_OCI_OER_LOGIN_REFUSAL_ZERO] = 0
+    text = f'{message}\n'.encode('utf-8')
+    return bytes(oer) + bytes([len(text)]) + text
+
+
+# The one envelope byte a login refusal leaves zero that the statement OERs
+# carry as 0x01 (§36.1).
+_OCI_OER_LOGIN_REFUSAL_ZERO = 52
+
+
 def encode_query_response_oci(
     columns: list[ColumnMeta], rows: list[tuple], *, sequence: int, more: bool = False
 ) -> bytes:
