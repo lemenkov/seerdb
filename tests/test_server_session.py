@@ -1644,6 +1644,58 @@ def test_oci_fetch_serves_no_more_rows_than_it_asked_for() -> None:
     assert [b'ORA-01403' in reply for reply in stream.sent[1:]] == [False, True]
 
 
+# sqlplus 23.26's `create table t1282 (...)`, captured against a live 11g
+# (piggyback-wrapped, as every statement past the first arrives).
+_OCI_EXEC_CREATE_TABLE = bytes.fromhex(
+    '116913feffffffffffffff010000000000000001000000035e14218000000000'
+    '0000feffffffffffffffa2000000feffffffffffffff0d000000feffffffffff'
+    'fffffeffffffffffffff00000000010000000000000000000000000000000000'
+    '00000000000000000000feffffffffffffff0000000000000000feffffffffff'
+    'fffffefffffffffffffffeffffffffffffff0000000000000000feffffffffff'
+    'fffffeffffffffffffff00000000000000000000000000000000000000000000'
+    '00000000000036637265617465207461626c6520743132383220286964206e75'
+    '6d6265722c2073207661726368617232283230292c2064206461746529010000'
+    '0001000000000000000000000000000000000000000000000005000000000000'
+    '0000800000000000000000000000000000'
+)
+
+
+def test_oci_relays_a_failed_ddl_as_its_error() -> None:
+    # A statement the backend refuses must reach sqlplus as its ORA error, as a
+    # live server's does. Only a SELECT's error used to be relayed: anything
+    # else got a plain success, so a CREATE of an existing table printed "PL/SQL
+    # procedure successfully completed" (#1288).
+    from seerdb.common.tns_consts import TNS_DATA
+    from seerdb.server.backend import BackendError
+    from seerdb.server.session import _serve_oci_session
+
+    class _Exists:
+        capabilities: frozenset[Capability] = frozenset()
+
+        def execute(self, sql: str, binds=()) -> Result:
+            assert sql.startswith('create table t1282')
+            raise BackendError(
+                'name is already used by an existing object', ora_code=955
+            )
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.inbox = [(TNS_DATA, _OCI_EXEC_CREATE_TABLE), None]
+            self.sent: list[bytes] = []
+
+        def read_packet(self, **_kw):
+            return self.inbox.pop(0)
+
+        def write_packet(self, _ptype: int, body: bytes, **_kw) -> None:
+            self.sent.append(body)
+
+    stream: Any = _Stream()
+    backend: Any = _Exists()
+    _serve_oci_session(stream, backend, 'PYO')
+    [reply] = stream.sent
+    assert b'ORA-00955: name is already used by an existing object' in reply
+
+
 def _run_mirror_at_tns_version(listen: socket.socket, result: dict, tns: int) -> None:
     conn, _ = listen.accept()
     try:

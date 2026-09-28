@@ -1630,23 +1630,21 @@ def _answer_query_oci(
         # type (#699).
         result = backend.execute(request.sql, _bind_vars(request))
     except BackendError as err:
-        # A statement the backend can't run. A failed SELECT (e.g. sqlplus's
-        # PRODUCT_PRIVS lookup) must come back as an ORA error — sqlplus expects
-        # a query reply for a query and tolerates the error — while a non-query
-        # (PL/SQL / DDL it can't do) gets a success status so the session
-        # continues.
-        if request.sql.lstrip().upper().startswith('SELECT'):
-            stream.write_packet(
-                TNS_DATA,
-                encode_error_oci(
-                    err.ora_code,
-                    str(err),
-                    sequence=seq.next(),
-                    error_pos=err.error_offset,
-                ),
-            )
-        else:
-            stream.write_packet(TNS_DATA, encode_status_oci(seq.next()))
+        # A statement the backend can't run comes back as its ORA error, as a
+        # live server's does, and the session continues. Only a SELECT's error
+        # used to be relayed; every other failure was answered with a success
+        # status, so sqlplus reported a failed CREATE as having worked (#1288).
+        # sqlplus's startup is unaffected: its session comes up as before over
+        # Mirror-over-PG and the SQLite example alike.
+        stream.write_packet(
+            TNS_DATA,
+            encode_error_oci(
+                err.ora_code,
+                str(err),
+                sequence=seq.next(),
+                error_pos=err.error_offset,
+            ),
+        )
         return None, []
     if result.out_binds:
         # A PL/SQL block that assigned OUT binds (sqlplus VARIABLE / EXEC) — return
