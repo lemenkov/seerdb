@@ -72,6 +72,16 @@ def test_plsql_block_is_a_noop_success() -> None:
     assert result.columns == [] and inner.calls == []
 
 
+def test_any_other_block_is_the_inner_backends_to_run() -> None:
+    # An anonymous block a script runs -- a loop of INSERTs, say -- goes to the
+    # inner backend, which runs it or refuses it; the shim once answered it with
+    # a success and ran nothing (#1281).
+    inner = _FakeInner()
+    block = 'begin for i in 1..10 loop insert into t values (i); end loop; end;'
+    OracleCompatBackend(inner).execute(block)
+    assert inner.calls == [block]
+
+
 def test_from_dual_is_stripped_before_delegation() -> None:
     inner = _FakeInner()
     OracleCompatBackend(inner).execute('select 1 from dual')

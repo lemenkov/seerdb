@@ -54,6 +54,19 @@ _OUT_BIND_ASSIGN = re.compile(
 )
 
 
+# sqlplus's own session calls -- `BEGIN DBMS_OUTPUT.DISABLE; END;` and the like --
+# which have nothing to do on a non-Oracle backend. Only these blocks, and the
+# literal `EXEC :v := ...` idiom, are answered here; any other block is a real one
+# and goes to the inner backend, which runs it or says why not (#1281).
+_SESSION_CALL = re.compile(
+    r'\s*BEGIN\s+DBMS_OUTPUT\.\w+(?:\s*\([^;]*\))?\s*;\s*END\s*;?\s*$', re.IGNORECASE
+)
+_LITERAL_ASSIGNMENTS = re.compile(
+    r"\s*BEGIN\s+(?::\w+\s*:=\s*(?:'(?:[^']|'')*'|-?\d+(?:\.\d+)?)\s*;\s*)+END\s*;?\s*$",
+    re.IGNORECASE,
+)
+
+
 def _plsql_out_bind_values(sql: str) -> list:
     """Extract the OUT values from ``BEGIN :v := <literal>; ... END;``.
 
@@ -114,17 +127,19 @@ class OracleCompatBackend:
 
     def execute(self, sql: str, binds: Sequence = ()) -> Result:
         normalized = ' '.join(sql.strip().upper().split())
-        if normalized.startswith('BEGIN'):
-            # A real callproc / callfunc (BindVar binds) is a proc call the inner
-            # backend runs — delegate it. Only the bind-less sqlplus
-            # ``EXEC :v := <literal>`` idiom is handled here: assign the OUT binds
-            # the client reads back from those literal assignments, and
-            # acknowledge any other session call (DBMS_OUTPUT.DISABLE, …) that has
-            # no effect on a non-Oracle backend.
-            if any(isinstance(b, BindVar) for b in binds):
-                return self._inner.execute(sql, binds)
-            out_binds = _plsql_out_bind_values(sql)
-            return Result(out_binds=out_binds) if out_binds else Result()
+        if normalized.startswith('BEGIN') and not any(
+            isinstance(b, BindVar) for b in binds
+        ):
+            # Only sqlplus's own idioms are handled here: the bind-less
+            # ``EXEC :v := <literal>`` assigns the OUT binds the client reads
+            # back, and a DBMS_OUTPUT session call has no effect on a non-Oracle
+            # backend. Every other block -- a callproc / callfunc, or an
+            # anonymous block a script runs -- is the inner backend's to run or
+            # refuse; answering it here with a success ran nothing (#1281).
+            if _LITERAL_ASSIGNMENTS.match(sql):
+                return Result(out_binds=_plsql_out_bind_values(sql))
+            if _SESSION_CALL.match(sql):
+                return Result()
         if 'PRODUCT_PRIVS' in normalized:
             raise BackendError(
                 'table or view does not exist', ora_code=_ORA_NO_SUCH_TABLE
