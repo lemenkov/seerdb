@@ -183,3 +183,38 @@ def test_the_wrapper_forwards_every_hook_the_mirror_probes_for() -> None:
         f'{missing}. Add a delegating method for each -- the Mirror will '
         f'otherwise treat the capability as absent, with no error anywhere.'
     )
+
+
+def test_application_info_calls_are_recorded_not_run() -> None:
+    # sqlplus 11.2 names itself as it logs in, with the module bound. The shim
+    # hands the attributes to the inner backend's set_end_to_end, which keeps
+    # them for SYS_CONTEXT; passed through instead, a PostgreSQL backend refused
+    # the call and every login printed "Error accessing package
+    # DBMS_APPLICATION_INFO" (#1295).
+    from seerdb.server import BindVar
+
+    recorded: list[dict] = []
+
+    class _Tracing(_FakeInner):
+        def set_end_to_end(self, attrs: dict) -> None:
+            recorded.append(attrs)
+
+    inner = _Tracing()
+    backend = OracleCompatBackend(inner)
+    module = BindVar(value='SQL*Plus', tns_type=1, max_size=100)
+    backend.execute('BEGIN DBMS_APPLICATION_INFO.SET_MODULE(:1,NULL); END;', [module])
+    backend.execute("begin dbms_application_info.set_action('load'); end;")
+    backend.execute('BEGIN DBMS_APPLICATION_INFO.SET_CLIENT_INFO(:c); END;', ['me'])
+    assert recorded == [
+        {'module': 'SQL*Plus', 'action': None},
+        {'action': 'load'},
+        {'client_info': 'me'},
+    ]
+    assert inner.calls == []
+    # An argument that is not a bind, literal or NULL is the inner backend's.
+    backend.execute("BEGIN DBMS_APPLICATION_INFO.SET_MODULE(upper('x'), NULL); END;")
+    assert len(inner.calls) == 1
+    # A backend without the hook still gets the call answered.
+    OracleCompatBackend(_FakeInner()).execute(
+        'BEGIN DBMS_APPLICATION_INFO.SET_MODULE(:1,NULL); END;', [module]
+    )

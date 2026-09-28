@@ -61,10 +61,57 @@ _OUT_BIND_ASSIGN = re.compile(
 _SESSION_CALL = re.compile(
     r'\s*BEGIN\s+DBMS_OUTPUT\.\w+(?:\s*\([^;]*\))?\s*;\s*END\s*;?\s*$', re.IGNORECASE
 )
+# sqlplus names itself as it logs in: `BEGIN DBMS_APPLICATION_INFO.SET_MODULE(:1,
+# NULL); END;` (sqlplus 11.2), with the module bound. These three calls only set
+# the session's tracing attributes, which the inner backend keeps if it can
+# (set_end_to_end) -- so they are recorded, not run. Passed through instead, a
+# PostgreSQL backend refused them and every sqlplus 11.2 login printed "Error
+# accessing package DBMS_APPLICATION_INFO" (#1295).
+_APP_INFO_CALL = re.compile(
+    r'\s*BEGIN\s+DBMS_APPLICATION_INFO\.(SET_MODULE|SET_ACTION|SET_CLIENT_INFO)'
+    r'\s*\(([^;]*)\)\s*;\s*END\s*;?\s*$',
+    re.IGNORECASE,
+)
+# The tracing attributes each call sets, in argument order.
+_APP_INFO_ATTRIBUTES = {
+    'SET_MODULE': ('module', 'action'),
+    'SET_ACTION': ('action',),
+    'SET_CLIENT_INFO': ('client_info',),
+}
+_APP_INFO_ARGUMENT = re.compile(
+    r"\s*(?::(\w+)|'((?:[^']|'')*)'|(NULL))\s*", re.IGNORECASE
+)
 _LITERAL_ASSIGNMENTS = re.compile(
     r"\s*BEGIN\s+(?::\w+\s*:=\s*(?:'(?:[^']|'')*'|-?\d+(?:\.\d+)?)\s*;\s*)+END\s*;?\s*$",
     re.IGNORECASE,
 )
+
+
+def _app_info_attributes(sql: str, binds: Sequence) -> dict | None:
+    """The tracing attributes a DBMS_APPLICATION_INFO call sets, or ``None``
+    when ``sql`` is not one (or passes something other than binds, literals and
+    NULLs). Binds are positional, in the order they appear."""
+    call = _APP_INFO_CALL.match(sql)
+    if call is None:
+        return None
+    names = _APP_INFO_ATTRIBUTES[call.group(1).upper()]
+    arguments = call.group(2).split(',') if call.group(2).strip() else []
+    if len(arguments) > len(names):
+        return None
+    values = iter(binds)
+    attrs: dict = {}
+    for name, argument in zip(names, arguments):
+        parsed = _APP_INFO_ARGUMENT.fullmatch(argument)
+        if parsed is None:
+            return None
+        if parsed.group(1) is not None:
+            bound = next(values, None)
+            attrs[name] = bound.value if isinstance(bound, BindVar) else bound
+        elif parsed.group(2) is not None:
+            attrs[name] = parsed.group(2).replace("''", "'")
+        else:
+            attrs[name] = None
+    return attrs
 
 
 def _plsql_out_bind_values(sql: str) -> list:
@@ -127,6 +174,12 @@ class OracleCompatBackend:
 
     def execute(self, sql: str, binds: Sequence = ()) -> Result:
         normalized = ' '.join(sql.strip().upper().split())
+        attrs = _app_info_attributes(sql, binds)
+        if attrs is not None:
+            record = getattr(self._inner, 'set_end_to_end', None)
+            if record is not None:
+                record(attrs)
+            return Result()
         if normalized.startswith('BEGIN') and not any(
             isinstance(b, BindVar) for b in binds
         ):
