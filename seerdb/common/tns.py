@@ -3709,6 +3709,24 @@ def is_reexecute_oci(payload: bytes) -> bool:
     )
 
 
+# The OCI fetch is `03 05 <seq>`, then the cursor id and the number of rows the
+# client has room for, each a fixed ub4 LE (live 11g/18c: `03 05 0f 02 00 00 00
+# 0f 00 00 00` asks cursor 2 for 15 rows).
+_OCI_FETCH_ROWS_OFF = 7
+
+
+def parse_fetch_oci(payload: bytes) -> int:
+    """How many rows an OCI ``TTI_FETCH`` asks for.
+
+    sqlplus sizes its fetch buffer to this count, so a reply carrying more rows
+    than it asked for overruns that buffer and crashes it (#1284).
+    """
+    end = _OCI_FETCH_ROWS_OFF + 4
+    if len(payload) < end or payload[0] != TTI_FUN or payload[1] != TTI_FETCH:
+        raise InterfaceError('not an OCI TTI_FETCH')
+    return int.from_bytes(payload[_OCI_FETCH_ROWS_OFF:end], 'little')
+
+
 def is_version_call_oci(payload: bytes) -> bool:
     """True if this is the sqlplus / thick-OCI post-login version request.
 
@@ -8692,13 +8710,15 @@ def _oci_rxh() -> bytes:
 
 
 def encode_fetch_batch_oci(
-    columns: list[ColumnMeta], rows: list[tuple], *, sequence: int
+    columns: list[ColumnMeta], rows: list[tuple], *, sequence: int, more: bool = False
 ) -> bytes:
-    """A sqlplus / thick-OCI fetch reply: RXH + one RXD per row + end-of-fetch.
+    """A sqlplus / thick-OCI fetch reply: RXH + one RXD per row + a status.
 
-    Used when the execute parked rows for follow-up fetches — the batch carries
-    the next rows and, since the Mirror returns the remainder in one go, the
-    ORA-01403 terminator (#351). ``sequence`` is the live per-session OER counter.
+    Used when the execute parked rows for follow-up fetches (#351). The last batch
+    ends with the ORA-01403 terminator. A batch with rows still to come
+    (``more``) ends with a plain success status instead, as a live 11g's does, so
+    the client fetches again (#1284). ``sequence`` is the live per-session OER
+    counter.
     """
     out = bytearray(_oci_rxh())
     for row in rows:
@@ -8707,7 +8727,10 @@ def encode_fetch_batch_oci(
         out += bytes([TTI_RXD]) + b''.join(
             _encode_oci_value(v, col) for v, col in zip(row, columns)
         )
-    out += encode_fetch_terminator_oci(sequence)
+    if more:
+        out += encode_oci_oer(oci.OCI_OER_STATUS_SUCCESS, sequence=sequence)
+    else:
+        out += encode_fetch_terminator_oci(sequence)
     return bytes(out)
 
 

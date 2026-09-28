@@ -1577,6 +1577,73 @@ def test_oci_loop_answers_a_break_marker() -> None:
     assert stream.sent == [(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))]
 
 
+# sqlplus 23.26's execute of a 30-row query, then its two follow-up fetches,
+# captured against a live 11g (piggyback-wrapped, as every statement past the
+# first arrives). Each fetch asks cursor 2 for 15 rows (#1284).
+_OCI_EXEC_30_ROWS = bytes.fromhex(
+    '11690dfeffffffffffffff010000000000000001000000035e0e618000000000'
+    '0000feffffffffffffffbd000000feffffffffffffff0d000000feffffffffff'
+    'fffffeffffffffffffff00000000010000000000000000000000000000000000'
+    '00000000000000000000feffffffffffffff0000000000000000feffffffffff'
+    'fffffefffffffffffffffeffffffffffffff0000000000000000feffffffffff'
+    'fffffeffffffffffffff00000000000000000000000000000000000000000000'
+    '0000000000003f73656c656374206c6576656c206e2c20277827207c7c206c65'
+    '76656c20732066726f6d206475616c20636f6e6e656374206279206c6576656c'
+    '203c3d2033300100000000000000000000000000000000000000000000000000'
+    '0000010000000000000000800000000000000000000000000000'
+)
+_OCI_FETCH_15_ROWS = (
+    bytes.fromhex('03050f020000000f000000'),
+    bytes.fromhex('030510020000000f000000'),
+)
+
+
+def test_oci_fetch_serves_no_more_rows_than_it_asked_for() -> None:
+    # sqlplus sizes its fetch buffer to the row count it asks for. The Mirror
+    # used to answer the first fetch with every parked row at once, which
+    # overruns that buffer and crashes sqlplus on any result of more than 16
+    # rows (the execute's 1 + one fetch's 15). A live 11g answers 1, then 15,
+    # then the last 14 with the end of fetch, and so must the Mirror (#1284).
+    from seerdb.common.tns import parse_fetch_oci
+    from seerdb.common.tns_consts import TNS_DATA
+    from seerdb.server.session import _serve_oci_session
+
+    assert [parse_fetch_oci(f) for f in _OCI_FETCH_15_ROWS] == [15, 15]
+    col = ColumnMeta(name=b'S', data_type=TNS_TYPE_VARCHAR, data_length=3, max_size=3)
+
+    class _Rows:
+        capabilities: frozenset[Capability] = frozenset()
+
+        def execute(self, sql: str, binds=()) -> Result:
+            return Result(columns=[col], rows=[(f'r{n:02}',) for n in range(1, 31)])
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.inbox = [
+                (TNS_DATA, _OCI_EXEC_30_ROWS),
+                *((TNS_DATA, f) for f in _OCI_FETCH_15_ROWS),
+                None,
+            ]
+            self.sent: list[bytes] = []
+
+        def read_packet(self, **_kw):
+            return self.inbox.pop(0)
+
+        def write_packet(self, _ptype: int, body: bytes, **_kw) -> None:
+            self.sent.append(body)
+
+    stream: Any = _Stream()
+    backend: Any = _Rows()
+    _serve_oci_session(stream, backend, 'PYO')
+    served = [
+        [n for n in range(1, 31) if f'r{n:02}'.encode() in reply]
+        for reply in stream.sent
+    ]
+    assert served == [[1], list(range(2, 17)), list(range(17, 31))]
+    # Only the last batch ends the fetch; the first leaves rows to come.
+    assert [b'ORA-01403' in reply for reply in stream.sent[1:]] == [False, True]
+
+
 def _run_mirror_at_tns_version(listen: socket.socket, result: dict, tns: int) -> None:
     conn, _ = listen.accept()
     try:
