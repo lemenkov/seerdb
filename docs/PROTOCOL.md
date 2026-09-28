@@ -641,15 +641,31 @@ offset 176 to 240, while the bind count (71) and the bind section behind the SQL
 stay put. The inserted bytes are all zero, so the session's field version, not
 the wire, says which layout a statement is in.
 
-**The replies are not ported yet.** 11g and 18c answer sqlplus 23 with the same
-messages (`TTI_DCB` describe, row header, rows, RPA, OER), which the Mirror
-builds in their 11g form. Measured differences at 18c:
-- every OER is 144 bytes (the error number again at offset 132, then a ub8 row
-  count);
-- each describe column's pre-name block is 8 bytes longer;
-- the row header is 2 bytes longer.
+**The statement replies.** 11g and 18c answer sqlplus 23 with the same messages
+(`TTI_DCB` describe, row header, rows, RPA, OER). 18c's are 11g's with two
+widenings, and the Mirror applies both at the 12c band:
 
-Until the Mirror emits those, sqlplus logs in but cannot run a statement.
+- **Every OER is 144 bytes, not 136.** The error number appears again at offset
+  132 (1403 at the end of a fetch, 942 on a failed parse), and a ub8 row count
+  follows it. This covers the auth trailers, the status frames, the error
+  reply and the end of fetch. sqlplus takes a DML statement's "N rows created"
+  from that row count, not from the frame's own field, so it reported 0 rows
+  until the Mirror filled it in. On query replies the Mirror leaves it zero,
+  and sqlplus counts the rows itself.
+- **Each describe column's pre-name block is 56 bytes, not 48.** It gains 4 zero
+  bytes ahead of the char-semantics flag (offset 15 → 19) and 4 more ahead of the
+  charset (30 → 38). The first column's leading byte is `0x5c` (11g: `0x51`). A
+  character column carries a ub4 `0x3ffe` behind `max_size`, meaning unpinned,
+  where 11g has zero. Measured on NUMBER, DATE, VARCHAR2, NCHAR and NVARCHAR2
+  columns.
+
+The row header and the describe tail keep their 11g length: 18c's differ only
+in instance values (an SCN).
+
+The `DESCRIBE <object>` reply (§6.0) is a different message and is not ported
+yet: 18c's grows by about 30 bytes per column. Nor is the end-to-end tracing
+piggyback sqlplus sends ahead of some calls; at the 12c band the Mirror refuses
+it instead of walking it.
 
 These captured templates are **stepping stones** — the crypto and offsets are
 understood; a proper `deadbeef` codec (encoding these packets field-by-field
