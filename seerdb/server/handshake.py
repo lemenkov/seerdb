@@ -612,14 +612,20 @@ def client_field_version(dty_body: bytes) -> int | None:
     back to their configured version, so an unreadable block costs nothing that
     worked before.
     """
+    version = client_compile_cap(dty_body, CCAP_FIELD_VERSION)
+    return version or None
+
+
+def client_compile_cap(dty_body: bytes, index: int) -> int | None:
+    """One slot of the compile capabilities a client sent in its DTY, or ``None``
+    when the block cannot be read (see :func:`client_field_version`)."""
     try:
         if not dty_body or dty_body[0] != TTI_DTY:
             return None
         caps_len = dty_body[6]
         caps = dty_body[7 : 7 + caps_len]
-        if len(caps) <= CCAP_FIELD_VERSION:
+        if len(caps) <= index:
             return None
-        version = caps[CCAP_FIELD_VERSION]
-        return version or None
+        return caps[index]
     except IndexError:
         return None

@@ -391,3 +391,31 @@ def test_oci_dty_reply_advertises_18c_from_12_1() -> None:
 
     assert oci_field_version(FIELD_VERSION_11_2) == FIELD_VERSION_11_2
     assert oci_field_version(FIELD_VERSION_12_1) == FIELD_VERSION_18_1_EXT1
+
+
+# The capability block (the DTY proper) each sqlplus sends, one round after its
+# TTI_PRO: sqlplus 23.26 and sqlplus 11.2.0.2, captured against live 11g.
+_SQLPLUS_23_DTY = bytes.fromhex(
+    '0269036903023706010101ef0f011b010101010101017fff031003030101ff01'
+    'ffff010e0101ff01060cf6097f050fff0d0b00ff030000000000070202040d02'
+    '010000180087000300000000800000003c3c3c800000000000002bd007'
+)
+_SQLPLUS_11_DTY = bytes.fromhex(
+    '02690369030227060101010f010106010101010101017fff030a030301007f01'
+    '7fff010601013f010306000103020702010000180003800000003c3c3c800000'
+    '000000000ed007'
+)
+
+
+def test_the_lob_column_form_follows_the_client() -> None:
+    # sqlplus 23.26 offers CCAP_LOB_12C and reads a LOB column with the LOB's
+    # length and chunk size in it; sqlplus 11.2 does not, and reads the bare
+    # locator. A live 11g answers each in its own form (#1287).
+    from seerdb.common.tns_consts import CCAP_LOB, CCAP_LOB_12C
+    from seerdb.server.handshake import client_compile_cap, client_field_version
+
+    assert (client_compile_cap(_SQLPLUS_23_DTY, CCAP_LOB) or 0) & CCAP_LOB_12C
+    assert not (client_compile_cap(_SQLPLUS_11_DTY, CCAP_LOB) or 0) & CCAP_LOB_12C
+    # The same block carries the field version each can speak.
+    assert client_field_version(_SQLPLUS_23_DTY) == 27
+    assert client_field_version(_SQLPLUS_11_DTY) == 6

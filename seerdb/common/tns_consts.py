@@ -422,6 +422,12 @@ CCAP_RPC_VERSION = 18
 CCAP_RPC_SIG = 19
 CCAP_DBF_VERSION = 21
 CCAP_LOB = 23
+# A client that sets this bit of CCAP_LOB reads a LOB column value with the
+# LOB's length (ub8) and chunk size (ub4) between the locator length and the
+# locator; one without it reads the bare locator. sqlplus 23.26 sets it and
+# sqlplus 11.2 does not, and a live 11g answers each in its own form, although
+# the server does not set the bit itself (#1287).
+CCAP_LOB_12C = 0x80
 CCAP_TTC2 = 26
 CCAP_UB2_DTY = 27  # 2-byte data-type ids (12c+)
 CCAP_OCI2 = 31

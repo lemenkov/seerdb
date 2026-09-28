@@ -47,6 +47,7 @@ from seerdb.common.tns import (
     _DECODE_FIELD_VERSION,
     _ENCODE_FIELD_VERSION,
     _ENCODE_OCI_CALL_SEQ,
+    _ENCODE_OCI_LOB_12C,
     _ENCODE_OER_SEQ,
     _ENCODE_SERVER_FIELD_VERSION,
     _ENCODE_TXN_IN_PROGRESS,
@@ -140,6 +141,8 @@ from seerdb.common.tns import (
     strip_oci_piggyback,
 )
 from seerdb.common.tns_consts import (
+    CCAP_LOB,
+    CCAP_LOB_12C,
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_23_1,
@@ -218,6 +221,7 @@ from seerdb.server.backend import (
 )
 from seerdb.server.framing import PacketStream
 from seerdb.server.handshake import (
+    client_compile_cap,
     client_field_version,
     encode_accept,
     encode_ano_null_reply,
@@ -544,8 +548,14 @@ def handle_login(
             # sqlplus / thick OCI runs a third data-type negotiation round after
             # DTY (a `ttc=02` request) before it sends OSESSKEY; a thin client
             # skips it (#265).
-            _expect(stream, TNS_DATA, 'TYPE')
+            capabilities = _expect(stream, TNS_DATA, 'TYPE')
             stream.send_raw(encode_type_reply_sqlplus())
+            # That request carries sqlplus's capability block (it is the DTY
+            # proper; the round before it is its TTI_PRO). Which LOB column form
+            # this client reads follows from it: the one with the LOB's length
+            # and chunk size, if it offered CCAP_LOB_12C (#1287).
+            lob_caps = client_compile_cap(capabilities, CCAP_LOB) or 0
+            _ENCODE_OCI_LOB_12C.set(bool(lob_caps & CCAP_LOB_12C))
         osesskey = _expect_login_message(stream, 'OSESSKEY')
 
     # --- O5LOGON (§4) ---

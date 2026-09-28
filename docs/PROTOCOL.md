@@ -2171,6 +2171,33 @@ The full server side, reduced from live 11g out-of-line CLOB captures:
    requested ends the loop. The row locator and the READ reply come from one
    capture, so they echo the same opaque locator and stay consistent.
 
+**What a modern sqlplus changes (#1287).** sqlplus 23.26 against that path
+hung on any CLOB select. A live 11g answers it differently from sqlplus 11.2 in
+two places, and each client can only read its own form:
+
+- **The LOB column value.** It leads with the locator length (a fixed ub4). For
+  a client whose compile capabilities set **`CCAP_LOB_12C` (0x80 of
+  `CCAP_LOB`)** the server then sends the **LOB's length** (ub8, characters for a
+  CLOB) and its **chunk size** (ub4, 8132 from 11g), and only then the locator.
+  sqlplus 23.26 sets the bit; sqlplus 11.2 does not, and gets the locator
+  straight after its length. The 11g server does not set the bit itself: it
+  follows the client's. The Mirror reads the bit from sqlplus's capability
+  block and answers in the same form. That block arrives in the round *after*
+  sqlplus's `TTI_PRO`: in this dialect the Mirror's "DTY" round carries the
+  `TTI_PRO`, and its "TYPE" round the DTY proper.
+- **A NULL LOB is four zero bytes** (the ub4 length at 0), not one. A single
+  `00` left both sqlplus versions waiting for the rest of the row.
+- **The READ request is narrower.** sqlplus 23.26 writes its scalar slots
+  narrower, as it does in its `OALL8` (#866). In that form the header is 135
+  bytes, with the locator length (ub4) at 11, the offset (ub8) at 75 and a second
+  pointer indicator at 91, followed by the locator and then the amount (ub8). An
+  indicator at 91 identifies the narrow form, because in the wide one the offset
+  sits there. Read with the wide offsets, the request was too short, so the
+  Mirror served the whole LOB to every read.
+
+With these, sqlplus 11.2 and 23.26 print the same CLOB / BLOB results the live
+11g gives them, NULLs included, against a Mirror at 11.2.
+
 Verified live on 11g over the SQLite-backed Mirror: CLOB and BLOB values display
 under default sqlplus settings (the 80-char read loop) and with a large
 `LONGCHUNKSIZE` (single read, multi-packet), single- and multi-row, session clean
