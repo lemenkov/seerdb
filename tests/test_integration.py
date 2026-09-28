@@ -5282,11 +5282,6 @@ class ChangePasswordIntegration(_ThrottleRetry, unittest.TestCase):
         # Both calls fail, so the password never changes.
         # Before 12.1 the long values went out with ub4 chunk lengths, which the
         # server read as ORA-03120 (#1090, #1261).
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest(
-                "the Mirror's postgres backend cannot reject an over-long new "
-                'password yet (#1266)'
-            )
         with seerdb.connect(**self._kwargs(_PASSWORD)) as conn:
             for old in (_PASSWORD, 'incorrect old password'):
                 with self.assertRaises(seerdb.DatabaseError) as caught:
