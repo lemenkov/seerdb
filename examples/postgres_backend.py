@@ -2503,6 +2503,10 @@ _NOT_EXPLAINABLE = re.compile(
 )
 
 
+# The longest password Oracle 12.2+ accepts; measured on 23ai (#1266).
+_MAX_PASSWORD_BYTES = 1024
+
+
 class PostgresBackend:
     """A :class:`~seerdb.server.Backend` over a psycopg connection.
 
@@ -3556,6 +3560,12 @@ class PostgresBackend:
         # the stored secret (#515). The map is shared across sessions.
         current = credential_lookup(self._credentials, username)
         if current is not None and old_password != current:
+            raise BackendError('invalid username/password; logon denied', ora_code=1017)
+        # Oracle takes a password of at most 1024 bytes (12.2+; 11g far less).
+        # Past that, the 1500-character change a client may try draws ORA-01017
+        # from 11g and 23ai alike, so the Mirror answers the same, rather than
+        # storing a password no Oracle would (#1266).
+        if len(new_password.encode('utf-8')) > _MAX_PASSWORD_BYTES:
             raise BackendError('invalid username/password; logon denied', ora_code=1017)
         for name in list(self._credentials):
             if name.upper() == username.upper():

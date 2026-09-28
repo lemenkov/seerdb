@@ -1854,6 +1854,23 @@ def test_change_password_rejects_a_wrong_old_password() -> None:
     assert exc.value.ora_code == 1017
 
 
+def test_change_password_refuses_a_password_oracle_would() -> None:
+    # Past 1024 bytes, 11g and 23ai both answer a change with ORA-01017; the
+    # stored password stays as it was. 1024 bytes itself is taken (#1266).
+    from seerdb.server import BackendError
+
+    creds = {'PYO': 'pyo123'}
+    backend = _NoConnPostgresBackend(creds)
+    with pytest.raises(BackendError) as exc:
+        backend.change_password('PYO', 'pyo123', '1' * 1500)
+    assert exc.value.ora_code == 1017
+    assert creds['PYO'] == 'pyo123'
+    with pytest.raises(BackendError):
+        backend.change_password('PYO', 'pyo123', '\u00e9' * 513)  # 1026 bytes
+    backend.change_password('PYO', 'pyo123', 'x' * 1024)
+    assert creds['PYO'] == 'x' * 1024
+
+
 # --- Bind translation (#516) — a pure function, no live PG needed --------------
 
 
