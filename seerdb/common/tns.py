@@ -3865,6 +3865,10 @@ class Challenge:
     # is what selects the modern key derivation on both sides, so it doubles as
     # the flag for "this is a 12c-shaped challenge".
     derived_salt: bytes | None = None
+    # The password verifier the challenge offers (AUTH_VFR_DATA's flag): the 11g
+    # SHA-1 one, or the 12c SHA-2 one a modern sqlplus insists on (#1282). It
+    # picks the key length on both sides -- 192 bits against 256.
+    verifier_type: int = VFR_11G_SHA1
 
 
 # The database identifier a real server puts on the challenge. It is opaque to
@@ -7469,6 +7473,13 @@ def _oci_auth_trailer(sequence: int) -> bytes:
 
 _CHALLENGE_TRAILER = _oci_auth_trailer(2)
 _RESULT_TRAILER = _oci_auth_trailer(3)
+
+# From 12.1 the auth trailer is 8 bytes longer: the same frame, then eight zero
+# bytes (captured from 18c). sqlplus reads the 12c-band length; the 136-byte form
+# leaves it short and the login stalls (#1282).
+_OCI_AUTH_TRAILER_12C_TAIL = bytes(8)
+_CHALLENGE_TRAILER_12C = _CHALLENGE_TRAILER + _OCI_AUTH_TRAILER_12C_TAIL
+_RESULT_TRAILER_12C = _RESULT_TRAILER + _OCI_AUTH_TRAILER_12C_TAIL
 
 
 # --- Captured 11g handshake-identity blobs (opaque, staged here) ---

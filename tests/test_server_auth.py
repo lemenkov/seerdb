@@ -18,6 +18,7 @@ from seerdb.common.crypto import (
     PBKDF2_SDER_COUNT,
     PBKDF2_VGEN_COUNT,
     VFR_11G_SHA1,
+    VFR_12C_SHA2,
     o5logon,
     server_proof,
     validate,
@@ -36,6 +37,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_12_1,
     TTI_AUTH,
     TTI_OER,
+    TTI_RPA,
     TTI_SESS,
     VERSION_11_2_0_2,
 )
@@ -716,3 +718,71 @@ def test_parse_auth_alter_session_is_quiet_when_there_is_none() -> None:
     assert parse_auth_alter_session(request) is None
     assert parse_auth_alter_session(b'') is None
     assert parse_auth_alter_session(b'\x03\x73\x01garbage') is None
+
+
+def test_oci_challenge_at_12_1_offers_the_12c_verifier() -> None:
+    # From 12.1 the OCI challenge takes a 12c-band server's shape (captured from
+    # 18c): the PBKDF2 salt and both iteration counts, the 12c SHA-2 verifier
+    # flag, and the 144-byte trailer. A modern sqlplus refuses the 11g form from a
+    # 12.1+ server (#1282).
+    from seerdb.common.tns import _CHALLENGE_TRAILER_12C
+    from seerdb.server.auth import encode_challenge_oci
+
+    challenge = make_challenge(
+        b'pyo123', field_version=FIELD_VERSION_12_1, verifier_type=VFR_12C_SHA2
+    )
+    packet = encode_challenge_oci(challenge)
+    assert packet[10] == TTI_RPA and packet[11] == 6  # six key-value pairs
+    for key in (
+        b'AUTH_PBKDF2_CSK_SALT',
+        b'AUTH_PBKDF2_VGEN_COUNT',
+        b'AUTH_PBKDF2_SDER_COUNT',
+    ):
+        assert key in packet
+    i = packet.index(b'AUTH_VFR_DATA') + len(b'AUTH_VFR_DATA')
+    salt = challenge.salt.hex().upper().encode()
+    assert packet[i + 5 : i + 5 + len(salt)] == salt
+    assert packet[i + 5 + len(salt) : i + 9 + len(salt)] == (
+        VFR_12C_SHA2.to_bytes(4, 'little')
+    )
+    assert len(_CHALLENGE_TRAILER_12C) == 144
+    assert packet.endswith(_CHALLENGE_TRAILER_12C)
+
+
+def test_oci_12c_verifier_agrees_with_the_client() -> None:
+    # The 12c SHA-2 challenge derives the 256-bit ConnKey the client derives from
+    # it, and the password it proves verifies (a wrong one does not) (#1282).
+    from seerdb.server.auth import verify_password
+
+    challenge = make_challenge(
+        b'pyo123', field_version=FIELD_VERSION_12_1, verifier_type=VFR_12C_SHA2
+    )
+    auth_pass, auth_sess, _speedy, _ind, conn = o5logon(
+        challenge.auth_sesskey,
+        challenge.salt,
+        challenge.derived_salt,
+        b'PYO',
+        b'pyo123',
+        PBKDF2_VGEN_COUNT,
+        PBKDF2_SDER_COUNT,
+        VFR_12C_SHA2,
+    )
+    server_conn = derive_conn_key(challenge, auth_sess)
+    assert len(server_conn) == 32
+    assert server_conn == conn
+    assert verify_password(server_conn, auth_pass, b'pyo123')
+    assert not verify_password(server_conn, auth_pass, b'wrongpass')
+
+
+def test_oci_result_trailer_follows_the_field_version() -> None:
+    # The result's trailer grows to the 12c-band 144 bytes from 12.1, as the
+    # challenge's does; below that it stays the 136-byte 11.2 form (#1282).
+    from seerdb.common.tns import _RESULT_TRAILER, _RESULT_TRAILER_12C
+    from seerdb.server.auth import encode_result_oci
+
+    conn = bytes(32)
+    old = encode_result_oci(conn, nonce=bytes(16))
+    new = encode_result_oci(conn, nonce=bytes(16), field_version=FIELD_VERSION_12_1)
+    assert old.endswith(_RESULT_TRAILER) and len(_RESULT_TRAILER) == 136
+    assert new.endswith(_RESULT_TRAILER_12C) and len(_RESULT_TRAILER_12C) == 144
+    assert new[2:-144] == old[2:-136]  # past the packet length, only the trailer

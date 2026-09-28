@@ -604,6 +604,33 @@ substring after decrypting, so the nonce is an unchecked filler
 (`server_proof_oci`). Reconstructing it byte-for-byte from a decrypted live
 capture confirmed the structure.
 
+**From 12.1 the login takes the 12c-band shape (#1282).** Once the ACCEPT says
+315 or later, a modern sqlplus (23.26 measured) hangs up on the 11g challenge
+above. What an 18c server sends instead, and what the Mirror now sends at field
+version 12.1+:
+
+- **Challenge: six pairs, not three.** `AUTH_SESSKEY` (a **32-byte** server
+  session, 64 hex), `AUTH_VFR_DATA` (a 16-byte salt, flag **`0x4815`** — the 12c
+  SHA-2 verifier), `AUTH_PBKDF2_CSK_SALT`, `AUTH_PBKDF2_VGEN_COUNT` (`4096`),
+  `AUTH_PBKDF2_SDER_COUNT` (`3`), `AUTH_GLOBALLY_UNIQUE_DBID`. The crypto is the
+  thin 256-bit scheme (§4.5): `KeySess = SHA-512(PBKDF2-SHA512(pw, salt ‖
+  "AUTH_PBKDF2_SPEEDY_KEY", 4096) ‖ salt)[:32]`. The client still answers with
+  the §4.1.2 AUTH form, only with a 32-byte session key.
+- **`CCAP_LOGON_TYPES` needs `0x20` (O7LOGON).** The 11.2 identity advertises
+  `0x0F`; 18c sends `0x6F`. With the SHA-2 challenge but without that bit,
+  sqlplus derives a different key and the login fails. Setting `0x20` alone
+  (`0x2F`) is enough, and `0x40` alone (`0x4F`) is not. The Mirror sets it only
+  in the deadbeef DTY reply's capability block; the thin PRO reply keeps `0x0F`.
+- **Both auth trailers are 144 bytes, not 136.** They are the same OER frame
+  followed by eight zero bytes. Apart from those eight bytes, 18c's differ from
+  the Mirror's only at the per-message counter (offsets 5–6) and at a leaked
+  native pointer (offsets 72–77).
+
+With these, sqlplus 23.26 logs in to a 12.1 Mirror. **The statement phase is not
+done yet:** the first `OALL8` still gets the 11.2 describe/status frames (`08
+06 …`, §36), where 18c answers with a different describe, and sqlplus stops
+there.
+
 These captured templates are **stepping stones** — the crypto and offsets are
 understood; a proper `deadbeef` codec (encoding these packets field-by-field
 rather than replaying templates) can replace them later. Auth is only the login

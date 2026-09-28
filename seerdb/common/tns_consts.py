@@ -404,6 +404,10 @@ FIELD_VERSION_23_4 = 24  # 23ai max; reached only via FAST_AUTH (#89)
 # gate (CCAP_TTC4_EXPLICIT_BOUNDARY, CCAP_FEATURE_BACKPORT2_END_USER_SEC).
 CCAP_SQL_VERSION = 0
 CCAP_LOGON_TYPES = 4
+# The O7LOGON bit of CCAP_LOGON_TYPES. A 12c-band server sets it (18c sends
+# 0x6F); a modern sqlplus offered the 12c SHA-2 verifier derives its 256-bit
+# key only when it is set, and fails the login without it (#1282).
+CCAP_LOGON_O7LOGON = 0x20
 CCAP_FEATURE_BACKPORT = 5
 CCAP_FIELD_VERSION = 7  # gates the auth verifier + version-gated formats
 CCAP_SERVER_DEFINE_CONV = 8
