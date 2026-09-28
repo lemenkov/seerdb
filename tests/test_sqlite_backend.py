@@ -16,10 +16,12 @@ import sys
 import threading
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 import seerdb
+from seerdb.common.tns_consts import FIELD_VERSION_11_2
 from seerdb.server import PacketStream, serve_session
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'examples'))
@@ -238,6 +240,25 @@ def test_the_upstream_session_opens_after_the_auth() -> None:
     # does not negotiate. The relay itself is covered live, against a real
     # server, by the connection tests.
     assert order == ['authenticate', 'open_session']
+
+
+def test_a_sqlplus_login_opens_the_backend_session_too() -> None:
+    # The passthrough connects upstream in open_session. The login used to call
+    # it for thin clients only, so every sqlplus statement then ran on no
+    # connection and came back ORA-03114 (#1289). sqlplus's AUTH is not read for
+    # connect-time attributes, so it opens with none.
+    from seerdb.server.session import _open_backend_session
+
+    opened: list[dict | None] = []
+
+    class _Recording(SqliteBackend):
+        def open_session(self, attrs: dict | None = None) -> None:
+            opened.append(attrs)
+
+    stream: Any = None  # never written to: the backend does not refuse
+    backend = _Recording(':memory:', credentials=_CREDS)
+    _open_backend_session(stream, backend, True, b'', FIELD_VERSION_11_2)
+    assert opened == [{}]
 
 
 def _values(row) -> tuple:
@@ -955,7 +976,6 @@ def test_reexecute_of_a_query_cursor_parks_the_rows_for_fetch() -> None:
     # server answers a bare status with rowcount 0 and the client drains the
     # rows with TTI_FETCH against the same cursor id -- so every row is parked
     # on that cursor, with the fresh bind applied.
-    from typing import Any
 
     from seerdb.common.tns import ReexecuteRequest, encode_status
     from seerdb.common.tns_consts import TNS_DATA, TNS_TYPE_NUMBER
