@@ -1696,6 +1696,48 @@ def test_oci_relays_a_failed_ddl_as_its_error() -> None:
     assert b'ORA-00955: name is already used by an existing object' in reply
 
 
+# The capability block each sqlplus sends (its DTY proper, one round after its
+# TTI_PRO): sqlplus 23.26 and sqlplus 11.2.0.2, captured against live 11g.
+_SQLPLUS_23_CAPABILITIES = bytes.fromhex(
+    '0269036903023706010101ef0f011b010101010101017fff031003030101ff01'
+    'ffff010e0101ff01060cf6097f050fff0d0b00ff030000000000070202040d02'
+    '010000180087000300000000800000003c3c3c800000000000002bd007'
+)
+_SQLPLUS_11_CAPABILITIES = bytes.fromhex(
+    '02690369030227060101010f010106010101010101017fff030a030301007f01'
+    '7fff010601013f010306000103020702010000180003800000003c3c3c800000'
+    '000000000ed007'
+)
+
+
+def test_sqlplus_is_served_at_the_version_it_speaks() -> None:
+    # sqlplus 11.2 speaks field version 6. A 12.1 Mirror answered it with the
+    # 12c-band login anyway, which it cannot use (ORA-28041, #1291). sqlplus
+    # 23.26 sends 27, above anything the Mirror advertises, and keeps its version.
+    from seerdb.common.tns_consts import (
+        FIELD_VERSION_11_2,
+        FIELD_VERSION_12_1,
+        FIELD_VERSION_23_1,
+    )
+    from seerdb.server.session import sqlplus_field_version
+
+    low = FIELD_VERSION_11_2
+    assert sqlplus_field_version(_SQLPLUS_11_CAPABILITIES, FIELD_VERSION_12_1, low) == (
+        FIELD_VERSION_11_2
+    )
+    assert sqlplus_field_version(_SQLPLUS_23_CAPABILITIES, FIELD_VERSION_12_1, low) == (
+        FIELD_VERSION_12_1
+    )
+    assert sqlplus_field_version(_SQLPLUS_23_CAPABILITIES, FIELD_VERSION_23_1, low) == (
+        FIELD_VERSION_23_1
+    )
+    # Below what the Mirror serves at all, it is refused, as a thin client is.
+    with pytest.raises(InterfaceError):
+        sqlplus_field_version(_SQLPLUS_11_CAPABILITIES, FIELD_VERSION_12_1, 7)
+    # An unreadable block keeps the Mirror's version.
+    assert sqlplus_field_version(b'', FIELD_VERSION_12_1, low) == FIELD_VERSION_12_1
+
+
 def _run_mirror_at_tns_version(listen: socket.socket, result: dict, tns: int) -> None:
     conn, _ = listen.accept()
     try:
