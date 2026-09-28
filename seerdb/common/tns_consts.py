@@ -392,6 +392,9 @@ FIELD_VERSION_11_2 = 6
 FIELD_VERSION_12_1 = 7
 FIELD_VERSION_12_2 = 8
 FIELD_VERSION_12_2_EXT1 = 9
+FIELD_VERSION_18_1_EXT1 = (
+    11  # Oracle 18c; the layout the Mirror speaks to sqlplus from 12.1 (#1282)
+)
 FIELD_VERSION_19_1 = 12
 FIELD_VERSION_19_1_EXT1 = 13  # written inside the FAST_AUTH envelope (#89)
 FIELD_VERSION_20_1 = 14  # AQ JSON-payload pointer gate (#128)

@@ -1837,6 +1837,40 @@ def test_parse_exec_oci_strips_the_internal_query_nul() -> None:
     assert '\x00' not in req.sql
 
 
+# sqlplus 23.26's `select 1 + 1 as two from dual` to a live 18c: the narrow
+# preamble, with the 12c band's 64 extra zero bytes ahead of the SQL (#1282).
+_OCI_EXEC_18C = bytes.fromhex(
+    '035e0b6180000000000000feffffffffffffff57000000feffffffffffffff0d'
+    '000000fefffffffffffffffeffffffffffffff00000000010000000000000000'
+    '00000000000000000000000000000000000000feffffffffffffff0000000000'
+    '000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000001d73656c6563742031202b203120617320'
+    '74776f2066726f6d206475616c01000000000000000000000000000000000000'
+    '0000000000000000000100000000000000008000000000000000000000000000'
+    '00'
+)
+
+
+def test_parse_exec_oci_reads_the_12c_band_layout() -> None:
+    # The session's field version says which layout the statement is in: the
+    # inserted bytes are zeros, so the wire alone cannot tell (#1282).
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT1
+
+    token = _DECODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT1)
+    try:
+        req = parse_exec_oci(_OCI_EXEC_18C)
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+    assert req.sql == 'select 1 + 1 as two from dual'
+    assert req.cursor == 0
+    # Read in the 11.2 layout, the SQL is not where the header says it is.
+    with pytest.raises(InterfaceError):
+        parse_exec_oci(_OCI_EXEC_18C)
+
+
 def test_parse_exec_oci_rejects_a_non_oci_message() -> None:
     with pytest.raises(InterfaceError):
         parse_exec_oci(b'\x03\x5e\x06not the oci shape' + b'\x00' * 200)

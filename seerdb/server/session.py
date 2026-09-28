@@ -225,6 +225,7 @@ from seerdb.server.handshake import (
     encode_type_reply_sqlplus,
     is_ano_negotiation,
     negotiated_tns_version,
+    oci_field_version,
     parse_connect,
     pro_is_sqlplus,
     server_tns_version,
@@ -1016,7 +1017,9 @@ def serve_session(
         )
         field_version = negotiated
     if sqlplus:
-        return _serve_oci_session(stream, backend, user, conn_key, identity)
+        return _serve_oci_session(
+            stream, backend, user, conn_key, identity, field_version=field_version
+        )
     cursors = _Cursors()
     # LOB contents (wire bytes + is_clob) the current statement's rows carry, in
     # the order their locators went out; the thin client drains them with
@@ -1281,6 +1284,8 @@ def _serve_oci_session(
     user: str,
     conn_key: bytes | None = None,
     identity: ServerIdentity = IDENTITY_11_2,
+    *,
+    field_version: int = FIELD_VERSION_11_2,
 ) -> str:
     # The sqlplus / thick-OCI query loop (#265), built up one message shape at a
     # time. So far: the post-login version call (-> banner), the OCI execute
@@ -1299,7 +1304,15 @@ def _serve_oci_session(
     # The live per-session OER end-to-end sequence counter (§36); every OER-bearing
     # reply below draws its next value so the field advances like a real server's.
     seq = _OciSequence()
+    # sqlplus lays out its requests and reads the replies in the layout of the
+    # field version its handshake advertised, which from 12.1 is not the
+    # session's own (#1282).
+    oci_version = oci_field_version(field_version)
     while True:
+        # Pinned per message, as the thin loop does: the backend runs in a copied
+        # context, so nothing it does can move it.
+        _DECODE_FIELD_VERSION.set(oci_version)
+        _ENCODE_FIELD_VERSION.set(oci_version)
         received = stream.read_packet()
         if received is None:
             return user

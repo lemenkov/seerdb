@@ -8054,6 +8054,16 @@ class _OciAll8Layout(NamedTuple):
 _OCI_ALL8_WIDE = _OciAll8Layout(sql=_OCI_ALL8_SQL_OFF, bind_count=83)
 _OCI_ALL8_NARROW = _OciAll8Layout(sql=176, bind_count=71)
 
+# From the 12c band the narrow preamble grows by 64 bytes, all of them ahead of
+# the SQL and behind the bind count (eight more 8-byte slots, zero in every
+# capture; sqlplus 23.26 against a live 18c, #1282). The width tests above still
+# hold, and the inserted bytes are zeros a wire test could only guess at, so the
+# session's field version says which form it is.
+_OCI_ALL8_12C_GROWTH = 64
+_OCI_ALL8_NARROW_12C = _OCI_ALL8_NARROW._replace(
+    sql=_OCI_ALL8_NARROW.sql + _OCI_ALL8_12C_GROWTH
+)
+
 
 def _oci_all8_layout(payload: bytes) -> _OciAll8Layout:
     """Which OALL8 preamble width ``payload`` carries, as the offsets that depend
@@ -8066,6 +8076,11 @@ def _oci_all8_layout(payload: bytes) -> _OciAll8Layout:
         (_OCI_ALL8_IND2_OFF_NARROW, _OCI_ALL8_NARROW),
     ):
         if payload[ind2 : ind2 + 8] == oci.OCI_INDICATOR:
+            if (
+                layout is _OCI_ALL8_NARROW
+                and _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+            ):
+                return _OCI_ALL8_NARROW_12C
             return layout
     raise InterfaceError(f'OCI OALL8: no indicator at offset {_OCI_ALL8_IND2_OFF}')
 

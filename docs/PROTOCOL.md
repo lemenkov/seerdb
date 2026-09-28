@@ -626,10 +626,30 @@ version 12.1+:
   the Mirror's only at the per-message counter (offsets 5–6) and at a leaked
   native pointer (offsets 72–77).
 
-With these, sqlplus 23.26 logs in to a 12.1 Mirror. **The statement phase is not
-done yet:** the first `OALL8` still gets the 11.2 describe/status frames (`08
-06 …`, §36), where 18c answers with a different describe, and sqlplus stops
-there.
+With these, sqlplus 23.26 logs in to a 12.1 Mirror.
+
+**The layout past login follows the advertised field version.** sqlplus sends
+the same statement as 321 bytes to 11g (field version 6), 351 to a Mirror
+advertising 12.1 (7) and 385 to 18c (11). There is no 12.1 server to capture, so
+from 12.1 the deadbeef DTY reply advertises **18c's field version** and the
+Mirror serves sqlplus in 18c's layout, while thin clients keep 12.1. sqlplus
+accepts that over a 12.1 ACCEPT.
+
+In that layout the narrow `OALL8` preamble grows by **64
+zero bytes** ahead of the SQL, eight more 8-byte slots. The SQL text moves from
+offset 176 to 240, while the bind count (71) and the bind section behind the SQL
+stay put. The inserted bytes are all zero, so the session's field version, not
+the wire, says which layout a statement is in.
+
+**The replies are not ported yet.** 11g and 18c answer sqlplus 23 with the same
+messages (`TTI_DCB` describe, row header, rows, RPA, OER), which the Mirror
+builds in their 11g form. Measured differences at 18c:
+- every OER is 144 bytes (the error number again at offset 132, then a ub8 row
+  count);
+- each describe column's pre-name block is 8 bytes longer;
+- the row header is 2 bytes longer.
+
+Until the Mirror emits those, sqlplus logs in but cannot run a statement.
 
 These captured templates are **stepping stones** — the crypto and offsets are
 understood; a proper `deadbeef` codec (encoding these packets field-by-field
