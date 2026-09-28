@@ -261,6 +261,50 @@ def test_a_sqlplus_login_opens_the_backend_session_too() -> None:
     assert opened == [{}]
 
 
+def test_a_refused_sqlplus_session_is_refused_in_its_own_dialect() -> None:
+    # A backend that refuses the session (the passthrough's upstream saying no)
+    # fails the login. For sqlplus that refusal must be the break / reset marker
+    # exchange and an OCI OER, or sqlplus shows ORA-03113 instead (#1290).
+    from seerdb.common.exceptions import InterfaceError
+    from seerdb.common.tns_consts import (
+        TNS_DATA,
+        TNS_MARKER,
+        TNS_MARKER_TYPE_BREAK,
+        TNS_MARKER_TYPE_RESET,
+    )
+    from seerdb.server.backend import BackendError
+    from seerdb.server.session import _open_backend_session
+
+    class _Refusing(SqliteBackend):
+        def open_session(self, attrs: dict | None = None) -> None:
+            raise BackendError('no session for you', ora_code=12516)
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.sent: list[tuple[int, bytes]] = []
+
+        def read_packet(self, **_kw):
+            return (TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
+
+        def write_packet(self, ptype: int, body: bytes, **_kw) -> None:
+            self.sent.append((ptype, body))
+
+    stream: Any = _Stream()
+    backend = _Refusing(':memory:', credentials=_CREDS)
+    auth = bytes([0x03, 0x73, 0x03])  # the refused AUTH
+    with pytest.raises(InterfaceError):
+        _open_backend_session(stream, backend, True, auth, FIELD_VERSION_11_2)
+    assert stream.sent[:2] == [
+        (TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_BREAK])),
+        (TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET])),
+    ]
+    ptype, oer = stream.sent[2]
+    assert ptype == TNS_DATA and oer[:2] == bytes([0x04, 0x01])
+    assert oer[12:14] == (12516).to_bytes(2, 'little')
+    assert oer[49] == 3  # names the refused AUTH
+    assert b'no session for you' in oer
+
+
 def _values(row) -> tuple:
     """A row with its LOB cells read to their values.
 

@@ -244,3 +244,49 @@ class ErrorPositionOverride(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# How a live server refuses sqlplus 23.26's wrong password, after the break /
+# reset marker exchange: 11g, and 18c (the 12c band) (#1290).
+_LOGIN_REFUSAL_11G = bytes.fromhex(
+    '040100000000000100000000f903000000000000000000000000000000000000'
+    '0000000000000000000000000000000000030000000000003601000000000000'
+    '000000000000000020f6310a0000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000334f52412d30313031373a20696e76616c69642075736572'
+    '6e616d652f70617373776f72643b206c6f676f6e2064656e6965640a'
+)
+_LOGIN_REFUSAL_18C = bytes.fromhex(
+    '040100000000000100000000f903000000000000000000000000000000000000'
+    '0000000000000000000000000000000000030000000000003601000000000000'
+    '0000000000000000403eb424a37f000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '00000000f90300000000000000000000334f52412d30313031373a20696e7661'
+    '6c696420757365726e616d652f70617373776f72643b206c6f676f6e2064656e'
+    '6965640a'
+)
+
+
+class LoginRefusal(unittest.TestCase):
+    def _refusal(self, field_version: int) -> bytes:
+        from seerdb.common.tns import _ENCODE_FIELD_VERSION, encode_login_refusal_oci
+
+        token = _ENCODE_FIELD_VERSION.set(field_version)
+        try:
+            return encode_login_refusal_oci(
+                1017,
+                'ORA-01017: invalid username/password; logon denied',
+                call_sequence=3,  # the refused AUTH, `03 73 03`
+            )
+        finally:
+            _ENCODE_FIELD_VERSION.reset(token)
+
+    def test_the_11g_refusal_is_byte_identical(self) -> None:
+        self.assertEqual(self._refusal(6), _LOGIN_REFUSAL_11G)
+
+    def test_the_12c_refusal_differs_only_by_the_leaked_pointer(self) -> None:
+        # 18c leaks a native pointer where 11g's envelope carries its marker.
+        ours = self._refusal(11)
+        self.assertEqual(len(ours), len(_LOGIN_REFUSAL_18C))
+        differ = [i for i in range(len(ours)) if ours[i] != _LOGIN_REFUSAL_18C[i]]
+        self.assertEqual(differ, list(range(72, 78)))
