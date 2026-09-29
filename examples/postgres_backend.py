@@ -393,6 +393,13 @@ _HELPER_FUNCTIONS_DDL = (
     "f := regexp_replace(f, '\\s*TZH(\\s*:?\\s*TZM)?', '', 'gi'); "
     "ELSE zone := current_setting('TimeZone'); END IF; "
     'RETURN from_tz(to_timestamp(t, f)::timestamp, zone); END $f$;'
+    # TO_TIMESTAMP(text, fmt) → a TIMESTAMP (#1321). PostgreSQL's own returns a
+    # timestamptz, which described as WITH LOCAL TIME ZONE and could not be passed
+    # where a timestamp is expected -- an object constructor's argument, say. Its
+    # wall clock is the one the text spells, with Oracle's FF as PostgreSQL's US.
+    'CREATE OR REPLACE FUNCTION to_timestamp(text, text) RETURNS timestamp '
+    'LANGUAGE sql STABLE STRICT AS $$ SELECT pg_catalog.to_timestamp($1, '
+    "regexp_replace($2, 'FF(?![1-9])', 'US', 'gi'))::timestamp $$;"
     # SYSTIMESTAMP / CURRENT_TIMESTAMP are TIMESTAMP WITH TIME ZONE values, the
     # first at the database's offset, the second at the session's; a plain
     # timestamptz is TIMESTAMP WITH LOCAL TIME ZONE here (#1208).
