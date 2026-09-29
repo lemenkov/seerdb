@@ -2898,6 +2898,17 @@ class BindIntegration(_IntegrationBase):
             ),
         )
 
+    def test_a_not_null_column_is_described_as_not_nullable(self):
+        # A column declared NOT NULL is described with null_ok false; a nullable
+        # one and a computed one with it true. A Mirror-over-PG described every
+        # column as nullable (#1307).
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (a NUMBER(9) NOT NULL, b VARCHAR2(10))'
+        )
+        self.cur.execute(f'SELECT a, b, a + 1 AS c FROM {self.TABLE}')
+        null_ok = [column[6] for column in self.cur.description]
+        self.assertEqual(null_ok, [False, True, True])
+
     def test_timestamptz_plus_and_minus_an_interval(self):
         # A WITH TIME ZONE value moved by an INTERVAL keeps its own offset, in
         # either operand order. The python-oracledb suite builds its time-zone
