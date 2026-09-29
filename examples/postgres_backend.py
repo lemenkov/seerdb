@@ -3881,6 +3881,9 @@ class PostgresBackend:
         ).fetchone()
         self._has_quoted_names = bool(row and row[0])
         self._quoted_col_cache: dict[tuple[int, int], bool] = {}
+        # Whether a table column is NOT NULL, by (relid, attnum) (#1307); any DDL
+        # starts it over, as a column's constraint may have changed.
+        self._not_null_cache: dict[tuple[int, int], bool] = {}
         # INVISIBLE columns (#1195): whether the catalog exists, whether any
         # table has one (None: not yet read; reset by any DDL), and the visible
         # columns of the tables that do.
@@ -4270,6 +4273,7 @@ class PostgresBackend:
         # cache of visible columns starts over either way.
         self._any_invisible = None
         self._visible_cache.clear()
+        self._not_null_cache.clear()
         if visibility is None or not self._has_invisible_catalog:
             return
         (table, hidden, shown, _only) = visibility
@@ -4424,6 +4428,28 @@ class PostgresBackend:
                 self._quoted_col_cache[key] = key in recorded
         return {index for index, key in keys.items() if self._quoted_col_cache[key]}
 
+    def _not_null_columns(self, pgresult, count: int) -> set[int]:
+        # Which result columns come straight from a NOT NULL table column, which
+        # Oracle describes as not nullable (#1307). Traced through libpq
+        # ftable / ftablecol, cached per (relid, attnum); a computed column has
+        # no table and stays nullable, as in Oracle.
+        keys = {}
+        for index in range(count):
+            relid = pgresult.ftable(index)
+            if relid:
+                keys[index] = (relid, pgresult.ftablecol(index))
+        unknown = {key for key in keys.values() if key not in self._not_null_cache}
+        if unknown:
+            found = self._conn.execute(
+                'SELECT attrelid, attnum FROM pg_attribute '
+                'WHERE attrelid = ANY(%s) AND attnum > 0 AND attnotnull',
+                ([relid for relid, _attnum in unknown],),
+            ).fetchall()
+            not_null = {(relid, attnum) for relid, attnum in found}
+            for key in unknown:
+                self._not_null_cache[key] = key in not_null
+        return {index for index, key in keys.items() if self._not_null_cache[key]}
+
     def _build_result(self, cursor) -> Result:
         # Turn an executed statement's cursor into a Result: a row count for a
         # no-row statement, else the fetched rows plus a ColumnMeta per column.
@@ -4482,6 +4508,8 @@ class PostgresBackend:
             for i in self._quoted_lower_columns(cursor.pgresult, folded):
                 name = cursor.description[i].name.encode('utf-8')
                 columns[i] = replace(columns[i], name=name)
+        for i in self._not_null_columns(cursor.pgresult, len(columns)):
+            columns[i] = replace(columns[i], null_ok=0)
         return Result(columns=columns, rows=[tuple(r) for r in rows])
 
     def _column_object_type(
