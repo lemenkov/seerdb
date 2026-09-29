@@ -535,6 +535,18 @@ _HELPER_FUNCTIONS_DDL = (
 _ORAFCE_HELPERS_DDL = (
     'CREATE OR REPLACE FUNCTION to_date(numeric, text) RETURNS oracle.date '
     'LANGUAGE sql STABLE STRICT AS $$ SELECT oracle.to_date($1::text, $2) $$;'
+    # TRUNC / ROUND of a WITH TIME ZONE value (#1313) work on the value's OWN
+    # wall-clock time and return a DATE: TRUNC of 2022-06-08 00:00:10 +05:30 is
+    # 2022-06-08. Left to orafce, the ora_tstz composite reached its trunc /
+    # round only through the implicit cast to timestamptz, which truncated the
+    # instant in the SESSION's zone -- 2022-06-07 in a UTC session.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION {fn}({_TSTZ_TYPE}{arg}) RETURNS timestamp '
+        f'LANGUAGE sql IMMUTABLE STRICT AS $$ '
+        f'SELECT oracle.{fn}(ora_tstz_local($1){use}) $$;'
+        for fn in ('trunc', 'round')
+        for arg, use in (('', ''), (', text', ', $2'))
+    )
 )
 
 

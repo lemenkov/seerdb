@@ -2868,6 +2868,36 @@ class BindIntegration(_IntegrationBase):
         self.assertEqual(got, [datetime.datetime(2022, 6, 3, 10, 0, tzinfo=Tz), None])
         self.assertEqual(got[0].utcoffset(), datetime.timedelta(hours=3))
 
+    def test_trunc_and_round_of_a_timestamptz(self):
+        # TRUNC and ROUND of a WITH TIME ZONE value work on its own wall-clock
+        # time and give a DATE. 2022-06-08 00:00:10 +05:30 is 2022-06-07 in UTC,
+        # which a Mirror-over-PG used to truncate in a UTC session (#1313).
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            self.skipTest("9i's TRUNC and ROUND take no TIMESTAMP (ORA-00932)")
+        self.cur.execute('SELECT sessiontimezone FROM dual')
+        (zone,) = self.cur.fetchone()
+        self.cur.execute("ALTER SESSION SET TIME_ZONE = '+00:00'")
+        try:
+            self.cur.execute(f'CREATE TABLE {self.TABLE} (t TIMESTAMP WITH TIME ZONE)')
+            self.cur.execute(
+                f'INSERT INTO {self.TABLE} VALUES '
+                "(from_tz(timestamp '2022-06-08 00:00:10', '+05:30'))"
+            )
+            self.cur.execute(
+                f"SELECT trunc(t), trunc(t, 'MM'), round(t) FROM {self.TABLE}"
+            )
+            got = self.cur.fetchone()
+        finally:
+            self.cur.execute(f"ALTER SESSION SET TIME_ZONE = '{zone}'")
+        self.assertEqual(
+            got,
+            (
+                datetime.datetime(2022, 6, 8),
+                datetime.datetime(2022, 6, 1),
+                datetime.datetime(2022, 6, 8),
+            ),
+        )
+
     def test_timestamptz_plus_and_minus_an_interval(self):
         # A WITH TIME ZONE value moved by an INTERVAL keeps its own offset, in
         # either operand order. The python-oracledb suite builds its time-zone
