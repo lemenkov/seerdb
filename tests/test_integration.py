@@ -2791,6 +2791,19 @@ class BindIntegration(_IntegrationBase):
         self.assertEqual(Got, Value)
         self.assertEqual(Got.utcoffset(), Value.utcoffset())
 
+    def test_to_timestamp_is_a_timestamp(self):
+        # TO_TIMESTAMP gives a TIMESTAMP, fractional seconds and all. A
+        # Mirror-over-PG gave a timestamptz, which described as WITH LOCAL TIME
+        # ZONE and matched no function taking a TIMESTAMP (#1321).
+        self.cur.execute(
+            "SELECT to_timestamp('20080912 16:40:00.125', 'YYYYMMDD HH24:MI:SS.FF') "
+            'FROM dual'
+        )
+        self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_TIMESTAMP)
+        self.assertEqual(
+            self.cur.fetchone(), (datetime.datetime(2008, 9, 12, 16, 40, 0, 125000),)
+        )
+
     def test_to_timestamp_tz_with_an_offset(self):
         # TO_TIMESTAMP_TZ reads the zone off the text: an offset for TZH:TZM,
         # which the value keeps. The python-oracledb suite builds its time-zone
