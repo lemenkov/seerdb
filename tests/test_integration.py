@@ -596,6 +596,14 @@ class TypesIntegration(_IntegrationBase):
         v = self._round_trip('DATE', "DATE '0001-01-01'")
         self.assertEqual(v, datetime.datetime(1, 1, 1))
 
+    def test_to_date_of_a_number(self):
+        # Oracle converts a numeric first argument of TO_DATE to text, so a
+        # number works as the date's digits, and the result takes DATE
+        # arithmetic. The python-oracledb suite builds its date test data this
+        # way; a Mirror-over-PG had no to_date(numeric, text) (#1299).
+        v = self._round_trip('DATE', "to_date(20021209, 'YYYYMMDD') + 1")
+        self.assertEqual(v, datetime.datetime(2002, 12, 10))
+
     def test_timestamp_microseconds(self):
         v = self._round_trip('TIMESTAMP', "TIMESTAMP '2026-05-23 10:11:12.345678'")
         self.assertEqual(v, datetime.datetime(2026, 5, 23, 10, 11, 12, 345678))
