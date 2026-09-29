@@ -604,6 +604,15 @@ class TypesIntegration(_IntegrationBase):
         v = self._round_trip('DATE', "to_date(20021209, 'YYYYMMDD') + 1")
         self.assertEqual(v, datetime.datetime(2002, 12, 10))
 
+    def test_to_date_keeps_the_time_of_day(self):
+        # Oracle's TO_DATE yields a DATE, which carries a time of day. On a
+        # Mirror-over-PG, PostgreSQL's own date-only to_date shadowed orafce's
+        # and dropped it (#1305).
+        v = self._round_trip(
+            'DATE', "to_date('20220601 15:38:12', 'YYYYMMDD HH24:MI:SS')"
+        )
+        self.assertEqual(v, datetime.datetime(2022, 6, 1, 15, 38, 12))
+
     def test_timestamp_microseconds(self):
         v = self._round_trip('TIMESTAMP', "TIMESTAMP '2026-05-23 10:11:12.345678'")
         self.assertEqual(v, datetime.datetime(2026, 5, 23, 10, 11, 12, 345678))
