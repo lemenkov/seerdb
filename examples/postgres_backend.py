@@ -404,6 +404,26 @@ _HELPER_FUNCTIONS_DDL = (
     f'CREATE CAST ({_TSTZ_TYPE} AS timestamp) '
     f'WITH FUNCTION ora_tstz_local({_TSTZ_TYPE}) AS ASSIGNMENT; '
     'EXCEPTION WHEN duplicate_object THEN NULL; END $$;'
+    # The other way, a TIMESTAMP or LOCAL TIME ZONE value going into a WITH TIME
+    # ZONE column (#1310): Oracle converts it implicitly in the SESSION's zone --
+    # a TIMESTAMP's wall-clock time read there, an LTZ instant shown at the
+    # session's offset for it. Without these casts PostgreSQL had no way in at
+    # all ("column is of type ora_tstz but expression is of type timestamp").
+    # Assignment casts, not implicit ones: ora_tstz -> timestamptz already is
+    # implicit, and implicit casts both ways would make operators ambiguous.
+    f'CREATE OR REPLACE FUNCTION ora_tstz_of_instant(timestamptz) RETURNS {_TSTZ_TYPE} '
+    'LANGUAGE sql STABLE STRICT AS $$ '
+    f'SELECT ROW($1, extract(timezone FROM $1)::integer)::{_TSTZ_TYPE} $$;'
+    f'CREATE OR REPLACE FUNCTION ora_tstz_of_local(timestamp) RETURNS {_TSTZ_TYPE} '
+    'LANGUAGE sql STABLE STRICT AS $$ SELECT ora_tstz_of_instant($1::timestamptz) $$;'
+    'DO $$ BEGIN '
+    f'CREATE CAST (timestamptz AS {_TSTZ_TYPE}) '
+    'WITH FUNCTION ora_tstz_of_instant(timestamptz) AS ASSIGNMENT; '
+    'EXCEPTION WHEN duplicate_object THEN NULL; END $$;'
+    'DO $$ BEGIN '
+    f'CREATE CAST (timestamp AS {_TSTZ_TYPE}) '
+    'WITH FUNCTION ora_tstz_of_local(timestamp) AS ASSIGNMENT; '
+    'EXCEPTION WHEN duplicate_object THEN NULL; END $$;'
     # Oracle compares WITH TIME ZONE values by their instant: 12:00 +00:00 and
     # 14:00 +02:00 are equal, order together and count once in a DISTINCT. The
     # composite's own record comparison would also compare the offsets, and
