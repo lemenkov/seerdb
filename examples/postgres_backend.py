@@ -958,6 +958,13 @@ _ORACLE_DICTIONARY_DDL = (
     # own column identity; rows of dropped tables are pruned on the next write.
     'CREATE TABLE IF NOT EXISTS sys.ora_quoted_names ('
     'relid oid NOT NULL, attnum smallint NOT NULL, PRIMARY KEY (relid, attnum));'
+    # The fractional-seconds precision a TIMESTAMP(n) WITH TIME ZONE column was
+    # declared with (#1308). WITH TIME ZONE is the ora_tstz composite, which has
+    # no type modifier to hold it, so it is kept here; a column not listed has
+    # Oracle's default, 6. Keyed like the quoted names above.
+    'CREATE TABLE IF NOT EXISTS sys.ora_tstz_precision ('
+    'relid oid NOT NULL, attnum smallint NOT NULL, prec smallint NOT NULL, '
+    'PRIMARY KEY (relid, attnum));'
     # v$session / v$session_connect_info (#1212): the sessions of this database,
     # a SID being the backend's pid (as the login reply names it) and the
     # identity columns the ones the client declared.
@@ -1573,6 +1580,13 @@ _CREATE_TABLE_NAME = re.compile(
     re.IGNORECASE,
 )
 _QUOTED_LOWER_NAME = re.compile(r'"([a-z][a-z0-9_$#]*)"')
+# A column declared TIMESTAMP(n) WITH TIME ZONE, for its precision (#1308).
+_TSTZ_PRECISION_COLUMN = re.compile(
+    r'("[^"]+"|[A-Za-z_][\w$#]*)\s+TIMESTAMP\s*\(\s*(\d)\s*\)\s+WITH\s+TIME\s+ZONE\b',
+    re.IGNORECASE,
+)
+# Oracle's fractional-seconds precision when a TIMESTAMP declares none.
+_DEFAULT_FRACTIONAL_PRECISION = 6
 
 # INVISIBLE / VISIBLE columns (#1195). The attribute follows a column's data type
 # in CREATE TABLE, ALTER TABLE ... ADD and ALTER TABLE ... MODIFY; PostgreSQL has
@@ -3437,7 +3451,12 @@ def _column_meta(desc, values: list, tstz_oid: int | None = None) -> ColumnMeta:
         # The ora_tstz composite backing TIMESTAMP WITH TIME ZONE — the cells are
         # reconstructed to aware datetimes by the caller (#519).
         return ColumnMeta(
-            name=ident, data_type=TNS_TYPE_TIMESTAMPTZ, data_length=13, max_size=13
+            name=ident,
+            data_type=TNS_TYPE_TIMESTAMPTZ,
+            data_length=13,
+            max_size=13,
+            # Oracle's default until the caller finds a declared one (#1308).
+            scale=_DEFAULT_FRACTIONAL_PRECISION,
         )
     if oid in _NUMBER_OIDS:
         # A numeric(p, s) column reports its precision/scale; int / float / bare
@@ -3457,8 +3476,23 @@ def _column_meta(desc, values: list, tstz_oid: int | None = None) -> ColumnMeta:
         )
     if oid in _TEMPORAL_OIDS:
         data_type, width = _TEMPORAL_OIDS[oid]
+        # A TIMESTAMP [WITH LOCAL TIME ZONE] carries its fractional-seconds
+        # precision as the scale, precision 0, as Oracle describes it (#1308).
+        # PostgreSQL keeps timestamp(n)'s n in the type modifier, which psycopg
+        # reports as the column's precision; none declared is Oracle's 6.
+        scale = 0
+        if data_type != TNS_TYPE_DATE:
+            scale = (
+                desc.precision
+                if desc.precision is not None
+                else _DEFAULT_FRACTIONAL_PRECISION
+            )
         return ColumnMeta(
-            name=ident, data_type=data_type, data_length=width, max_size=width
+            name=ident,
+            data_type=data_type,
+            data_length=width,
+            max_size=width,
+            scale=scale,
         )
     if oid in _INTERVAL_OIDS:
         return ColumnMeta(
@@ -3880,6 +3914,13 @@ class PostgresBackend:
             "SELECT to_regclass('sys.ora_quoted_names') IS NOT NULL"
         ).fetchone()
         self._has_quoted_names = bool(row and row[0])
+        row = self._conn.execute(
+            "SELECT to_regclass('sys.ora_tstz_precision') IS NOT NULL"
+        ).fetchone()
+        self._has_tstz_precision = bool(row and row[0])
+        # A WITH TIME ZONE column's recorded precision, by (relid, attnum), None
+        # for one not recorded (#1308); any DDL starts it over.
+        self._tstz_precision_cache: dict[tuple[int, int], int | None] = {}
         self._quoted_col_cache: dict[tuple[int, int], bool] = {}
         # Whether a table column is NOT NULL, by (relid, attnum) (#1307); any DDL
         # starts it over, as a column's constraint may have changed.
@@ -4146,6 +4187,7 @@ class PostgresBackend:
             self._conn.commit()
             self._user_savepoint = False
             self._record_quoted_names(original)
+            self._record_tstz_precisions(original)
             self._record_visibility(visibility)
         if with_rowid is not None:
             # The rows are the rowids of the rows touched, not a result set: a
@@ -4274,6 +4316,7 @@ class PostgresBackend:
         self._any_invisible = None
         self._visible_cache.clear()
         self._not_null_cache.clear()
+        self._tstz_precision_cache.clear()
         if visibility is None or not self._has_invisible_catalog:
             return
         (table, hidden, shown, _only) = visibility
@@ -4406,6 +4449,62 @@ class PostgresBackend:
         except psycopg.Error:
             self._conn.rollback()
 
+    def _record_tstz_precisions(self, statement: str) -> None:
+        # After a committed CREATE TABLE: note the precision of each column it
+        # declares TIMESTAMP(n) WITH TIME ZONE (#1308). On its own, like the
+        # quoted names, so a failure here cannot take the table with it; a
+        # column added later by ALTER TABLE ... ADD keeps the default.
+        table = _CREATE_TABLE_NAME.match(statement)
+        if table is None or not self._has_tstz_precision:
+            return
+        declared = {
+            (name[1:-1] if name.startswith('"') else name.lower()): int(prec)
+            for name, prec in _TSTZ_PRECISION_COLUMN.findall(statement)
+        }
+        if not declared:
+            return
+        try:
+            self._conn.execute(
+                'DELETE FROM sys.ora_tstz_precision p WHERE NOT EXISTS '
+                '(SELECT 1 FROM pg_class c WHERE c.oid = p.relid)'
+            )
+            for name, prec in declared.items():
+                self._conn.execute(
+                    'INSERT INTO sys.ora_tstz_precision SELECT attrelid, attnum, %s '
+                    'FROM pg_attribute WHERE attrelid = to_regclass(%s) '
+                    'AND attname = %s AND attnum > 0 '
+                    'ON CONFLICT (relid, attnum) DO UPDATE SET prec = EXCLUDED.prec',
+                    (prec, table.group(1), name),
+                )
+            self._conn.commit()
+        except psycopg.Error:
+            self._conn.rollback()
+
+    def _tstz_precisions(self, pgresult, indexes: list[int]) -> dict[int, int]:
+        # The recorded precision of each WITH TIME ZONE result column at
+        # `indexes` that comes straight from a table column (#1308), traced
+        # through libpq ftable / ftablecol and cached per (relid, attnum).
+        keys = {}
+        for index in indexes:
+            relid = pgresult.ftable(index)
+            if relid:
+                keys[index] = (relid, pgresult.ftablecol(index))
+        unknown = {k for k in keys.values() if k not in self._tstz_precision_cache}
+        if unknown and self._has_tstz_precision:
+            found = self._conn.execute(
+                'SELECT relid, attnum, prec FROM sys.ora_tstz_precision '
+                'WHERE relid = ANY(%s)',
+                ([relid for relid, _attnum in unknown],),
+            ).fetchall()
+            recorded = {(relid, attnum): prec for relid, attnum, prec in found}
+            for key in unknown:
+                self._tstz_precision_cache[key] = recorded.get(key)
+        return {
+            index: prec
+            for index, key in keys.items()
+            if (prec := self._tstz_precision_cache.get(key)) is not None
+        }
+
     def _quoted_lower_columns(self, pgresult, indexes: list[int]) -> set[int]:
         # Which of the result columns at `indexes` -- each one whose name the
         # folding rule would upper-case -- were created with a quoted
@@ -4510,6 +4609,12 @@ class PostgresBackend:
                 columns[i] = replace(columns[i], name=name)
         for i in self._not_null_columns(cursor.pgresult, len(columns)):
             columns[i] = replace(columns[i], null_ok=0)
+        tstz = [
+            i for i, col in enumerate(columns) if col.data_type == TNS_TYPE_TIMESTAMPTZ
+        ]
+        if tstz:
+            for i, prec in self._tstz_precisions(cursor.pgresult, tstz).items():
+                columns[i] = replace(columns[i], scale=prec)
         return Result(columns=columns, rows=[tuple(r) for r in rows])
 
     def _column_object_type(

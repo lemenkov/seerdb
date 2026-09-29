@@ -2909,6 +2909,21 @@ class BindIntegration(_IntegrationBase):
         null_ok = [column[6] for column in self.cur.description]
         self.assertEqual(null_ok, [False, True, True])
 
+    def test_a_timestamp_column_describes_its_precision(self):
+        # A TIMESTAMP column, with or without a time zone, is described with
+        # precision 0 and its fractional-seconds precision as the scale: the
+        # declared one, else 6. A Mirror-over-PG described neither (#1308).
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (a TIMESTAMP(3), b TIMESTAMP, '
+            'c TIMESTAMP(5) WITH LOCAL TIME ZONE, d TIMESTAMP(2) WITH TIME ZONE, '
+            'f TIMESTAMP WITH TIME ZONE)'
+        )
+        self.cur.execute(f'SELECT a, b, c, d, f FROM {self.TABLE}')
+        self.assertEqual(
+            [(column[4], column[5]) for column in self.cur.description],
+            [(0, 3), (0, 6), (0, 5), (0, 2), (0, 6)],
+        )
+
     def test_timestamptz_plus_and_minus_an_interval(self):
         # A WITH TIME ZONE value moved by an INTERVAL keeps its own offset, in
         # either operand order. The python-oracledb suite builds its time-zone
