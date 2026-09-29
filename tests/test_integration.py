@@ -2771,6 +2771,37 @@ class BindIntegration(_IntegrationBase):
         self.assertEqual(Got, Value)
         self.assertEqual(Got.utcoffset(), Value.utcoffset())
 
+    def test_to_timestamp_tz_with_an_offset(self):
+        # TO_TIMESTAMP_TZ reads the zone off the text: an offset for TZH:TZM,
+        # which the value keeps. The python-oracledb suite builds its time-zone
+        # test data this way; a Mirror-over-PG had no TO_TIMESTAMP_TZ (#1300).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (t TIMESTAMP WITH TIME ZONE)')
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (to_timestamp_tz('
+            "'20220602 13:45:06.25 +01:30', 'YYYYMMDD HH24:MI:SS.FF TZH:TZM'))"
+        )
+        self.cur.execute(f'SELECT t FROM {self.TABLE}')
+        Got = self.cur.fetchone()[0]
+        Tz = datetime.timezone(datetime.timedelta(hours=1, minutes=30))
+        self.assertEqual(Got, datetime.datetime(2022, 6, 2, 13, 45, 6, 250000, Tz))
+        self.assertEqual(Got.utcoffset(), datetime.timedelta(hours=1, minutes=30))
+
+    def test_to_timestamp_tz_with_a_region(self):
+        # A region for TZR, which gets the offset in force on that date: US/Eastern
+        # is five hours behind UTC in January (#1300).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (t TIMESTAMP WITH TIME ZONE)')
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (to_timestamp_tz('
+            "'20220112 10:00 US/Eastern', 'YYYYMMDD HH24:MI TZR'))"
+        )
+        self.cur.execute(f'SELECT t FROM {self.TABLE}')
+        Got = self.cur.fetchone()[0]
+        self.assertEqual(Got.utcoffset(), datetime.timedelta(hours=-5))
+        self.assertEqual(
+            Got.astimezone(datetime.timezone.utc),
+            datetime.datetime(2022, 1, 12, 15, 0, tzinfo=datetime.timezone.utc),
+        )
+
     def test_binary_float_bind(self):
         self.cur.execute(f'CREATE TABLE {self.TABLE} (v BINARY_FLOAT)')
         self.cur.execute(
