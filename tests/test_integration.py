@@ -2811,6 +2811,34 @@ class BindIntegration(_IntegrationBase):
             datetime.datetime(2022, 1, 12, 15, 0, tzinfo=datetime.timezone.utc),
         )
 
+    def test_a_timestamp_stored_into_a_timestamptz_column(self):
+        # Oracle converts a TIMESTAMP, or a TIMESTAMP WITH LOCAL TIME ZONE, into
+        # a WITH TIME ZONE column in the session's zone. A Mirror-over-PG had no
+        # way to store either there at all (#1310).
+        self.cur.execute('SELECT sessiontimezone FROM dual')
+        (zone,) = self.cur.fetchone()
+        self.cur.execute("ALTER SESSION SET TIME_ZONE = '+03:00'")
+        try:
+            self.cur.execute(
+                f'CREATE TABLE {self.TABLE} (id NUMBER, t TIMESTAMP WITH TIME ZONE)'
+            )
+            self.cur.execute(
+                f"INSERT INTO {self.TABLE} VALUES (1, timestamp '2022-06-03 10:00:00')"
+            )
+            self.cur.execute(
+                f'INSERT INTO {self.TABLE} VALUES (2, CAST(timestamp '
+                "'2022-06-03 10:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE))"
+            )
+            self.cur.execute(f'SELECT t FROM {self.TABLE} ORDER BY id')
+            got = [row[0] for row in self.cur.fetchall()]
+        finally:
+            self.cur.execute(f"ALTER SESSION SET TIME_ZONE = '{zone}'")
+        Tz = datetime.timezone(datetime.timedelta(hours=3))
+        expected = datetime.datetime(2022, 6, 3, 10, 0, tzinfo=Tz)
+        self.assertEqual(got, [expected, expected])
+        for value in got:
+            self.assertEqual(value.utcoffset(), datetime.timedelta(hours=3))
+
     def test_timestamptz_plus_and_minus_an_interval(self):
         # A WITH TIME ZONE value moved by an INTERVAL keeps its own offset, in
         # either operand order. The python-oracledb suite builds its time-zone
