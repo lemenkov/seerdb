@@ -872,6 +872,46 @@ def test_translate_plsql_block_wraps_anonymous_declare_block() -> None:
     assert numeric.startswith('DO $$ DECLARE n numeric; BEGIN ')
     # A bare BEGIN with no END (transaction control) is left alone.
     assert _translate_plsql_block('BEGIN') == 'BEGIN'
+
+
+def test_translate_plsql_block_hoists_local_functions() -> None:
+    # Each local function becomes a pg_temp function ahead of the DO block, and a
+    # call to one -- from the block or another local function -- is qualified
+    # (#1322). END IF / END LOOP / END CASE / CASE ... END inside a body close no
+    # BEGIN, and a keyword inside a string literal is text.
+    out = _translate_plsql_block(
+        'DECLARE t VARCHAR2(10);\n'
+        '  FUNCTION f(a NUMBER) RETURN VARCHAR2 IS\n'
+        "    s VARCHAR2(9) := 'begin';\n"
+        '  BEGIN\n'
+        '    IF a > 0 THEN s := g(a); END IF;\n'
+        '    FOR i IN 1..a LOOP NULL; END LOOP;\n'
+        "    RETURN CASE WHEN a > 1 THEN s ELSE 'end' END;\n"
+        '  END f;\n'
+        '  FUNCTION g(a NUMBER) RETURN VARCHAR2 IS BEGIN\n'
+        '    CASE a WHEN 1 THEN NULL; ELSE NULL; END CASE;\n'
+        '    RETURN to_char(a);\n'
+        '  END;\n'
+        "BEGIN t := f(2); INSERT INTO x VALUES (t, 'f(1)'); END;"
+    )
+    hoisted, block = out.split(' DO ')
+    assert hoisted.startswith('DROP FUNCTION IF EXISTS pg_temp.f; ')
+    assert 'CREATE FUNCTION pg_temp.f(a numeric) RETURNS varchar ' in out
+    assert "DECLARE s varchar(9) := 'begin'; BEGIN" in out
+    assert 's := pg_temp.g(a); END IF;' in out
+    assert "ELSE 'end' END; END $f$;" in out
+    assert 'CREATE FUNCTION pg_temp.g(a numeric) RETURNS varchar ' in out
+    assert block == (
+        '$$ DECLARE t varchar(10); BEGIN t := pg_temp.f(2); '
+        "INSERT INTO x VALUES (t, 'f(1)'); END $$"
+    )
+
+
+def test_translate_plsql_block_leaves_a_local_procedure_alone() -> None:
+    # A local PROCEDURE isn't hoisted (#1322): the block keeps its plain DO
+    # translation, which PostgreSQL then refuses.
+    sql = 'DECLARE PROCEDURE p IS BEGIN NULL; END; BEGIN p; END;'
+    assert _translate_plsql_block(sql).startswith('DO $$ DECLARE PROCEDURE p')
     # Non-block SQL passes through untouched.
     assert _translate_plsql_block('SELECT 1') == 'SELECT 1'
 
