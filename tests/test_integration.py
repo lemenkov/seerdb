@@ -1040,6 +1040,30 @@ class TypesIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.fetchall(), [('DATE', 7, None, None)])
 
+    def test_integer_and_smallint_are_number_38(self):
+        # INTEGER, INT and SMALLINT are NUMBER(38): 20 digits fit, and the
+        # columns describe as NUMBER(38,0). A SMALLINT parameter takes an
+        # integer. A Mirror-over-PG made them PostgreSQL's integers (#1326).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (a INTEGER, b SMALLINT, c INT)')
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (1, 2, 12345678901234567890)'
+        )
+        self.cur.execute(f'SELECT a, b, c FROM {self.TABLE}')
+        self.assertEqual(
+            [(column[4], column[5]) for column in self.cur.description],
+            [(38, 0)] * 3,
+        )
+        self.assertEqual(self.cur.fetchall(), [(1, 2, 12345678901234567890)])
+        self.cur.execute(
+            'CREATE OR REPLACE FUNCTION f1326(a SMALLINT) RETURN NUMBER AS '
+            'BEGIN RETURN a * 2; END;'
+        )
+        try:
+            self.cur.execute('SELECT f1326(21) FROM dual')
+            self.assertEqual(self.cur.fetchone(), (42,))
+        finally:
+            self.cur.execute('DROP FUNCTION f1326')
+
     def test_rownum_filters_the_first_rows(self):
         # ROWNUM as a top-level filter, the top-N idiom over an ordered inline
         # view, and `ROWNUM = 2`, which Oracle never satisfies (#1271).

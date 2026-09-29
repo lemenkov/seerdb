@@ -1474,6 +1474,14 @@ _DDL_TYPE_REWRITES = [
     (re.compile(r'\bVARCHAR2\b', re.IGNORECASE), 'varchar'),
     (re.compile(r'\bNCHAR\b', re.IGNORECASE), 'char'),
     (re.compile(r'\bNUMBER\b', re.IGNORECASE), 'numeric'),
+    # INTEGER / INT / SMALLINT are Oracle's names for NUMBER(38) (#1326), not
+    # PostgreSQL's integers: those took no numeric value as a function argument, and
+    # an integer none as a smallint one -- an object type's constructor, say. An
+    # identity column stays PostgreSQL's integer, the only kind it can be.
+    (
+        re.compile(r'\b(?:INTEGER|INT|SMALLINT)\b(?!\s+GENERATED\b)', re.IGNORECASE),
+        'numeric(38)',
+    ),
     # CLOB / NCLOB / BLOB → domains over text / bytea, so the read path can tell a
     # LOB column from a plain VARCHAR2 / RAW and preserve empty-vs-NULL (#534).
     (re.compile(r'\bNCLOB\b', re.IGNORECASE), _CLOB_TYPE),
