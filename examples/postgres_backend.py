@@ -123,6 +123,7 @@ import struct
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from typing import Final
 
 import psycopg
 from psycopg import sql
@@ -2006,10 +2007,28 @@ _ADMIN_NOOP = re.compile(
 )
 
 
+# The schemas every session resolves unqualified names through, after the
+# session's own. `pg_catalog` is named LAST on purpose. A search_path that does
+# not name it has PostgreSQL search it FIRST, and then its built-ins beat orafce
+# wherever both define a function with the same signature: TO_DATE came back as
+# PostgreSQL's date-only one, and every time of day was silently dropped
+# (#1305). Named after `oracle`, orafce's Oracle versions win, as orafce's own
+# documentation sets it up.
+_SEARCH_PATH_TAIL: Final = 'public, sys, oracle, pg_catalog'
+
+# orafce's TO_DATE refuses a date before 1100-03-01 (or 1582-10-05 for 'J'),
+# because it cannot VERIFY such dates against Oracle, not because Oracle
+# refuses them: Oracle takes them back to 4712 BC. With orafce's to_date the one
+# in use (above), that refusal reached clients as an error Oracle never raises,
+# so the Mirror turns it off for its sessions. It is orafce's own setting, and
+# a PostgreSQL without orafce accepts it as a harmless placeholder.
+_ORAFCE_SESSION_SETTINGS: Final = 'SET orafce.oracle_compatibility_date_limit = off'
+
+
 def _translate_admin(sql: str) -> str:
     m = _ALTER_SESSION_SCHEMA.match(sql)
     if m:
-        return f'SET search_path TO {m.group(1).lower()}, public, sys, oracle'
+        return f'SET search_path TO {m.group(1).lower()}, {_SEARCH_PATH_TAIL}'
     m = _ALTER_SESSION_TIME_ZONE.match(sql)
     if m:
         return _translate_time_zone(m.group(1))
@@ -3658,7 +3677,8 @@ class PostgresBackend:
         # schemas share, so this ordering changes nothing else: user objects
         # still resolve first through the schema ahead of both, and the rest of
         # orafce is still reached through `oracle` (#818).
-        self._conn.execute('SET search_path TO public, sys, oracle')
+        self._conn.execute(f'SET search_path TO {_SEARCH_PATH_TAIL}')
+        self._conn.execute(_ORAFCE_SESSION_SETTINGS)
         # Create + register the composite that backs TIMESTAMP WITH TIME ZONE, so
         # its columns come back as a typed tuple the read path can re-tag with the
         # entered offset (#519). Best-effort: a backend that can't create the type
@@ -3880,10 +3900,11 @@ class PostgresBackend:
             # does not exist, so a user without one resolves as before. Committed
             # at once: a SET inside a transaction that rolls back is undone.
             self._conn.execute(
-                sql.SQL('SET search_path TO {}, public, sys, oracle').format(
+                sql.SQL('SET search_path TO {}, ' + _SEARCH_PATH_TAIL).format(
                     sql.Identifier(username.lower())
                 )
             )
+            self._conn.execute(_ORAFCE_SESSION_SETTINGS)
             self._conn.commit()
         return secret
 

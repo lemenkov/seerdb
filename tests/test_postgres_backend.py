@@ -718,7 +718,7 @@ def test_translate_admin_maps_session_user_and_index() -> None:
     # session could not find the table it had just created (#818).
     assert (
         _translate_admin('ALTER SESSION SET CURRENT_SCHEMA = TEST_SCHEMA')
-        == 'SET search_path TO test_schema, public, sys, oracle'
+        == 'SET search_path TO test_schema, public, sys, oracle, pg_catalog'
     )
     assert (
         _translate_admin('CREATE USER test_schema IDENTIFIED BY secret')
@@ -2343,7 +2343,7 @@ def _hold_a_dictionary_read() -> Any:
     # A client mid-transaction that has read a dictionary view: its lock on the
     # view is what a CREATE OR REPLACE VIEW has to wait for (#1152).
     holder = psycopg.connect(_CONNINFO)
-    holder.execute('SET search_path TO public, sys, oracle')
+    holder.execute('SET search_path TO public, sys, oracle, pg_catalog')
     holder.execute('SELECT count(*) FROM sys.user_tables').fetchone()
     return holder
 
