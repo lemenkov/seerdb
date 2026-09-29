@@ -2924,6 +2924,19 @@ class BindIntegration(_IntegrationBase):
             [(0, 3), (0, 6), (0, 5), (0, 2), (0, 6)],
         )
 
+    def test_a_date_column_is_described_as_a_date(self):
+        # A DATE column is described as a DATE, with neither precision nor
+        # scale, and keeps its time of day. A Mirror-over-PG described it as a
+        # TIMESTAMP (#1316).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (d DATE)')
+        value = datetime.datetime(2022, 6, 3, 13, 14, 15)
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1)', [value])
+        self.cur.execute(f'SELECT d FROM {self.TABLE}')
+        column = self.cur.description[0]
+        self.assertIs(column[1], seerdb.DB_TYPE_DATE)
+        self.assertEqual((column[4], column[5]), (None, None))
+        self.assertEqual(self.cur.fetchone(), (value,))
+
     def test_timestamptz_plus_and_minus_an_interval(self):
         # A WITH TIME ZONE value moved by an INTERVAL keeps its own offset, in
         # either operand order. The python-oracledb suite builds its time-zone
