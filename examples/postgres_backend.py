@@ -355,6 +355,30 @@ _HELPER_FUNCTIONS_DDL = (
     'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
     'CREATE OR REPLACE FUNCTION to_nclob(text) RETURNS text '
     'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
+    # TO_TIMESTAMP_TZ(text, fmt) → a TIMESTAMP WITH TIME ZONE (#1300). Neither
+    # PostgreSQL nor orafce has it. The zone comes off the end of the text: a
+    # region for TZR (US/Eastern), an offset for TZH[:TZM] (+01:30, -5), or, with
+    # neither, the session's time zone, as Oracle's default. The rest is parsed by
+    # PostgreSQL's to_timestamp, with Oracle's FF (fractional seconds) as its US,
+    # and from_tz makes the value, so a region gets its DST-correct offset. A zone
+    # written anywhere but at the end of the text is not supported.
+    f'CREATE OR REPLACE FUNCTION to_timestamp_tz(text, text) RETURNS {_TSTZ_TYPE} '
+    'LANGUAGE plpgsql STABLE STRICT AS $f$ DECLARE '
+    't text := btrim($1); '
+    "f text := regexp_replace($2, 'FF(?![1-9])', 'US', 'gi'); "
+    'zone text; m text[]; BEGIN '
+    "IF f ~* 'TZR' THEN "
+    "zone := substring(t from '(\\S+)$'); "
+    "t := regexp_replace(t, '\\s*\\S+$', ''); "
+    "f := regexp_replace(f, '\\s*TZR(\\s*TZD)?', '', 'gi'); "
+    "ELSIF f ~* 'TZH' THEN "
+    "m := regexp_match(t, '([+-]?)(\\d{1,2})(?::?(\\d{2}))?$'); "
+    "zone := coalesce(nullif(m[1], ''), '+') || lpad(m[2], 2, '0') || ':' "
+    "|| coalesce(m[3], '00'); "
+    "t := regexp_replace(t, '\\s*[+-]?\\d{1,2}(:?\\d{2})?$', ''); "
+    "f := regexp_replace(f, '\\s*TZH(\\s*:?\\s*TZM)?', '', 'gi'); "
+    "ELSE zone := current_setting('TimeZone'); END IF; "
+    'RETURN from_tz(to_timestamp(t, f)::timestamp, zone); END $f$;'
     # SYSTIMESTAMP / CURRENT_TIMESTAMP are TIMESTAMP WITH TIME ZONE values, the
     # first at the database's offset, the second at the session's; a plain
     # timestamptz is TIMESTAMP WITH LOCAL TIME ZONE here (#1208).
