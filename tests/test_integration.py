@@ -2802,6 +2802,31 @@ class BindIntegration(_IntegrationBase):
             datetime.datetime(2022, 1, 12, 15, 0, tzinfo=datetime.timezone.utc),
         )
 
+    def test_timestamptz_plus_and_minus_an_interval(self):
+        # A WITH TIME ZONE value moved by an INTERVAL keeps its own offset, in
+        # either operand order. The python-oracledb suite builds its time-zone
+        # test data this way; a Mirror-over-PG returned a plain value that lost
+        # the offset and did not fit the column (#1301).
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (id NUMBER, t TIMESTAMP WITH TIME ZONE)'
+        )
+        start = "from_tz(timestamp '2022-06-03 00:00:00', '+05:30')"
+        step = "interval '2 00:00:03.125' day to second"
+        for n, expr in (
+            (1, f'{start} + {step}'),
+            (2, f'{step} + {start}'),
+            (3, f'{start} - {step}'),
+        ):
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES ({n}, {expr})')
+        self.cur.execute(f'SELECT t FROM {self.TABLE} ORDER BY id')
+        got = [row[0] for row in self.cur.fetchall()]
+        Tz = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+        later = datetime.datetime(2022, 6, 5, 0, 0, 3, 125000, Tz)
+        earlier = datetime.datetime(2022, 5, 31, 23, 59, 56, 875000, Tz)
+        self.assertEqual(got, [later, later, earlier])
+        for value in got:
+            self.assertEqual(value.utcoffset(), datetime.timedelta(hours=5, minutes=30))
+
     def test_binary_float_bind(self):
         self.cur.execute(f'CREATE TABLE {self.TABLE} (v BINARY_FLOAT)')
         self.cur.execute(

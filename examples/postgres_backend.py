@@ -476,6 +476,29 @@ _HELPER_FUNCTIONS_DDL = (
     f'CREATE OPERATOR - (LEFTARG = {_TSTZ_TYPE}, RIGHTARG = numeric, '
     'FUNCTION = ora_tstz_sub_days); '
     'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
+    # A WITH TIME ZONE value plus or minus an INTERVAL (#1301): the same instant
+    # moved by it, keeping the value's own offset, as Oracle does. Without these
+    # the implicit cast to timestamptz took the arithmetic and returned a plain
+    # timestamptz, which lost the offset and did not fit a WITH TIME ZONE column.
+    # They get their own DO block: one that already ran on a database raises
+    # duplicate_function at its first operator and would never reach new ones.
+    f'CREATE OR REPLACE FUNCTION ora_tstz_add_interval({_TSTZ_TYPE}, interval) '
+    f'RETURNS {_TSTZ_TYPE} LANGUAGE sql IMMUTABLE STRICT AS $$ '
+    f'SELECT ROW(($1).utc + $2, ($1).off)::{_TSTZ_TYPE} $$;'
+    f'CREATE OR REPLACE FUNCTION ora_interval_add_tstz(interval, {_TSTZ_TYPE}) '
+    f'RETURNS {_TSTZ_TYPE} LANGUAGE sql IMMUTABLE STRICT AS $$ '
+    'SELECT ora_tstz_add_interval($2, $1) $$;'
+    f'CREATE OR REPLACE FUNCTION ora_tstz_sub_interval({_TSTZ_TYPE}, interval) '
+    f'RETURNS {_TSTZ_TYPE} LANGUAGE sql IMMUTABLE STRICT AS $$ '
+    f'SELECT ROW(($1).utc - $2, ($1).off)::{_TSTZ_TYPE} $$;'
+    'DO $$ BEGIN '
+    f'CREATE OPERATOR + (LEFTARG = {_TSTZ_TYPE}, RIGHTARG = interval, '
+    'FUNCTION = ora_tstz_add_interval, COMMUTATOR = +); '
+    f'CREATE OPERATOR + (LEFTARG = interval, RIGHTARG = {_TSTZ_TYPE}, '
+    'FUNCTION = ora_interval_add_tstz, COMMUTATOR = +); '
+    f'CREATE OPERATOR - (LEFTARG = {_TSTZ_TYPE}, RIGHTARG = interval, '
+    'FUNCTION = ora_tstz_sub_interval); '
+    'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
 )
 
 
