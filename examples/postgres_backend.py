@@ -233,6 +233,19 @@ _INTERVALYM_TYPE_DDL = (
     'EXCEPTION WHEN duplicate_object THEN NULL; END $$'
 )
 
+# A DATE table column onto a domain over timestamp(0) (#1316). Oracle's DATE
+# carries a time of day to the second, which PostgreSQL's own `date` drops, so the
+# column is a timestamp(0) -- whose oid is a TIMESTAMP's, and a DATE column was
+# described as one. The domain lets the column trace back through pg_attribute to
+# `ora_date`, as the LOB and YEAR TO MONTH domains do, and describe as a DATE. Only
+# a CREATE TABLE column takes it: a computed value (SYSDATE, TO_DATE) reports its
+# base type and still describes as a TIMESTAMP.
+_DATE_TYPE = 'ora_date'
+_DATE_TYPE_DDL = (
+    'DO $$ BEGIN CREATE DOMAIN ora_date AS timestamp(0); '
+    'EXCEPTION WHEN duplicate_object THEN NULL; END $$'
+)
+
 # Oracle scalar functions the backend installs as real PostgreSQL functions,
 # rather than rewriting each call site with a regex (#513). A parens-called Oracle
 # function — HEXTORAW('..'), EMPTY_CLOB(), FROM_TZ(ts, 'zone') — resolves
@@ -1111,6 +1124,10 @@ _DICTIONARY_STAMP = (
 # domain over, so both YEAR TO MONTH and DAY TO SECOND columns report it on the
 # wire.
 _INTERVAL_OID = 1186
+# PostgreSQL `date` and `timestamp` (without time zone): the ora_date domain is
+# over the timestamp, and a DATE column describes as a bare date would (#1316).
+_DATE_OID = 1082
+_TIMESTAMP_OID = 1114
 
 
 class OraInterval(datetime.timedelta):
@@ -1379,6 +1396,10 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
 # matched with its parens and dropped. Word boundaries keep column names and
 # other tokens untouched; only CREATE TABLE is rewritten, so a type keyword used
 # as an identifier elsewhere is left alone.
+# A table's DATE column is the ora_date domain (#1316); elsewhere -- an object
+# attribute, a collection element, a routine parameter -- DATE stays the plain
+# timestamp(0) of _DDL_TYPE_REWRITES.
+_DDL_DATE_COLUMN = re.compile(r'\bDATE\b', re.IGNORECASE)
 _DDL_TYPE_REWRITES = [
     # Oracle character-length semantics: VARCHAR2(20 CHAR) / CHAR(1 BYTE) — the
     # `CHAR` / `BYTE` length qualifier PostgreSQL has no syntax for; drop it so the
@@ -2327,6 +2348,7 @@ def _translate_ddl(sql: str) -> str:
     out = _DDL_ORG_INDEX.sub('', out)
     out = _strip_nested_table_storage(out)
     out = _DDL_COMPRESSION.sub(')', out)
+    out = _DDL_DATE_COLUMN.sub(_DATE_TYPE, out)
     for pattern, replacement in _DDL_TYPE_REWRITES:
         out = pattern.sub(replacement, out)
     return out
@@ -3208,10 +3230,10 @@ _BINARY_FLOAT_OIDS = {
 _TEXT_OIDS = frozenset({18, 19, 25, 1042, 1043})  # char name text bpchar varchar
 _RAW_OIDS = frozenset({17})  # bytea
 # The base type oids the Oracle-typed domains report on the wire — ora_clob /
-# ora_blob over text / bytea (#534), ora_intervalym over interval (#504). Only a
-# column of one of these can be such a domain, so the catalog lookup that
-# distinguishes them is skipped for anything else.
-_DOMAIN_BASE_OIDS = frozenset({25, 17, _INTERVAL_OID})
+# ora_blob over text / bytea (#534), ora_intervalym over interval (#504), ora_date
+# over timestamp (#1316). Only a column of one of these can be such a domain, so
+# the catalog lookup that distinguishes them is skipped for anything else.
+_DOMAIN_BASE_OIDS = frozenset({25, 17, _INTERVAL_OID, _TIMESTAMP_OID})
 # Each PostgreSQL temporal OID maps to the Oracle type of matching precision:
 # a bare date → DATE (7 bytes), timestamp → TIMESTAMP (11), and timestamptz →
 # TIMESTAMP WITH LOCAL TIME ZONE (11), since WITH TIME ZONE is ora_tstz (#1208).
@@ -3428,6 +3450,18 @@ def _lob_column_meta(name: str, tns_type: int) -> ColumnMeta:
         data_type=tns_type,
         data_length=4000,
         max_size=0,
+    )
+
+
+def _date_column_meta(name: str) -> ColumnMeta:
+    # A DATE result column (an ora_date domain traced back through the catalog,
+    # #1316): Oracle's 7-byte DATE, whose cells are the timestamp(0)'s datetimes.
+    data_type, width = _TEMPORAL_OIDS[_DATE_OID]
+    return ColumnMeta(
+        name=_oracle_column_name(name).encode('utf-8'),
+        data_type=data_type,
+        data_length=width,
+        max_size=width,
     )
 
 
@@ -3822,10 +3856,12 @@ class PostgresBackend:
         try:
             self._conn.execute(_LOB_TYPE_DDL)
             self._conn.execute(_INTERVALYM_TYPE_DDL)
+            self._conn.execute(_DATE_TYPE_DDL)
             for name, tns_type in (
                 (_CLOB_TYPE, TNS_TYPE_CLOB),
                 (_BLOB_TYPE, TNS_TYPE_BLOB),
                 (_INTERVALYM_TYPE, TNS_TYPE_INTERVALYM),
+                (_DATE_TYPE, TNS_TYPE_DATE),
             ):
                 row = self._conn.execute(
                     'SELECT oid FROM pg_type WHERE typname = %s', (name,)
@@ -4565,8 +4601,9 @@ class PostgresBackend:
             # A column tracing back to a typed domain is that Oracle type — an
             # ora_clob / ora_blob LOB (so an empty value stays '' / b'' rather than
             # collapsing to NULL, #534), or an ora_intervalym INTERVAL YEAR TO MONTH
-            # (so its months survive, #504). Only a text / bytea / interval column
-            # can be one, so cheaper types skip the catalog lookup.
+            # (so its months survive, #504), or an ora_date DATE (#1316). Only a
+            # text / bytea / interval / timestamp column can be one, so cheaper
+            # types skip the catalog lookup.
             domain = (
                 self._domain_type(cursor.pgresult, i)
                 if desc.type_code in _DOMAIN_BASE_OIDS
@@ -4578,6 +4615,8 @@ class PostgresBackend:
                 for row in rows:
                     row[i] = _to_interval_ym(row[i])
                 columns.append(_intervalym_column_meta(desc.name))
+            elif domain == TNS_TYPE_DATE:
+                columns.append(_date_column_meta(desc.name))
             elif (
                 desc.type_code not in _BUILTIN_OIDS
                 and (target := self._ref_target(desc.type_code)) is not None

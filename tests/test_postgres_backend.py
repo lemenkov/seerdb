@@ -167,7 +167,7 @@ def test_translate_ddl_maps_create_table_column_types() -> None:
     )
     assert 'numeric(10,2)' in sent
     assert 'varchar(20)' in sent
-    assert 'timestamp(0)' in sent  # DATE keeps its time-of-day
+    assert 'd ora_date' in sent  # DATE keeps its time-of-day, as a domain (#1316)
     assert 'r bytea' in sent  # RAW(16) → bytea (size dropped)
     assert 'c ora_clob' in sent  # CLOB → domain over text, so empty ≠ NULL (#534)
     assert 'b ora_blob' in sent  # BLOB → domain over bytea (#534)
