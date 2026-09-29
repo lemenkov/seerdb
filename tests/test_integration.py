@@ -2839,6 +2839,35 @@ class BindIntegration(_IntegrationBase):
         for value in got:
             self.assertEqual(value.utcoffset(), datetime.timedelta(hours=3))
 
+    def test_decode_of_a_converted_null_and_a_timestamptz(self):
+        # DECODE chooses between a NULL converted to a timestamp and a WITH TIME
+        # ZONE value; either lands in a WITH TIME ZONE column. The
+        # python-oracledb suite populates its time-zone tables this way; a
+        # Mirror-over-PG refused the translated CASE (#1306). Oracle types a
+        # DECODE by its first result, so the WITH TIME ZONE value becomes a
+        # plain TIMESTAMP first: it keeps its wall-clock time and loses its
+        # offset, and the column then takes it in the session's zone.
+        self.cur.execute('SELECT sessiontimezone FROM dual')
+        (zone,) = self.cur.fetchone()
+        self.cur.execute("ALTER SESSION SET TIME_ZONE = '+03:00'")
+        try:
+            self.cur.execute(
+                f'CREATE TABLE {self.TABLE} (id NUMBER, t TIMESTAMP WITH TIME ZONE)'
+            )
+            for n in (1, 2):
+                self.cur.execute(
+                    f'INSERT INTO {self.TABLE} VALUES ({n}, decode(mod({n}, 2), 0, '
+                    "to_timestamp(null, 'YYYYMMDD'), "
+                    "from_tz(timestamp '2022-06-03 10:00:00', '+05:30')))"
+                )
+            self.cur.execute(f'SELECT t FROM {self.TABLE} ORDER BY id')
+            got = [row[0] for row in self.cur.fetchall()]
+        finally:
+            self.cur.execute(f"ALTER SESSION SET TIME_ZONE = '{zone}'")
+        Tz = datetime.timezone(datetime.timedelta(hours=3))
+        self.assertEqual(got, [datetime.datetime(2022, 6, 3, 10, 0, tzinfo=Tz), None])
+        self.assertEqual(got[0].utcoffset(), datetime.timedelta(hours=3))
+
     def test_timestamptz_plus_and_minus_an_interval(self):
         # A WITH TIME ZONE value moved by an INTERVAL keeps its own offset, in
         # either operand order. The python-oracledb suite builds its time-zone

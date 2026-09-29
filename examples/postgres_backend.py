@@ -2690,6 +2690,49 @@ def _translate_signed_year(sql: str) -> str:
 # schema-qualified call.
 _DECODE_CALL = re.compile(r'decode\s*\(', re.IGNORECASE)
 
+# A DECODE result that converts a literal NULL -- TO_TIMESTAMP(NULL, 'YYYYMMDD')
+# -- is a NULL of that function's type in PostgreSQL, and a CASE cannot unify
+# it with a branch of another category: with a WITH TIME ZONE value (the
+# ora_tstz composite) it is refused outright, "CASE types ora_tstz and timestamp
+# with time zone cannot be matched" (#1306). Oracle types a DECODE by its FIRST
+# result and converts the others to it, so when that first result is such a
+# NULL, its type is known and applied the same way: the NULL is typed, every
+# other result is cast to the type. A live 23ai shows it matters: a WITH TIME
+# ZONE value behind a leading TO_TIMESTAMP(NULL) keeps its wall-clock time and
+# loses its offset. A converted NULL anywhere else becomes a bare NULL, which a
+# CASE types from its other branches -- the value is the same NULL. Only
+# DECODE's results are rewritten: elsewhere the function's own type is what a
+# column is described as.
+_CONVERTED_NULL = re.compile(
+    r'(to_timestamp_tz|to_timestamp|to_date|to_char|to_number|to_dsinterval'
+    r'|to_yminterval|to_binary_float|to_binary_double)\s*\(\s*null\s*'
+    r'(?:,[^()]*)?\)',
+    re.IGNORECASE,
+)
+_CONVERTED_NULL_TYPE = {
+    'to_timestamp_tz': _TSTZ_TYPE,
+    'to_timestamp': 'timestamp',
+    'to_date': 'oracle.date',
+    'to_char': 'text',
+    'to_number': 'numeric',
+    'to_dsinterval': 'interval',
+    'to_yminterval': 'interval',
+    'to_binary_float': 'real',
+    'to_binary_double': 'double precision',
+}
+
+
+def _decode_results(results: list[str]) -> list[str]:
+    # DECODE's results (default included) typed as Oracle types them (above).
+    first = _CONVERTED_NULL.fullmatch(results[0])
+    if first is None:
+        return ['NULL' if _CONVERTED_NULL.fullmatch(r) else r for r in results]
+    pg_type = _CONVERTED_NULL_TYPE[first.group(1).lower()]
+    return [f'NULL::{pg_type}'] + [
+        'NULL' if _CONVERTED_NULL.fullmatch(r) else f'CAST(({r}) AS {pg_type})'
+        for r in results[1:]
+    ]
+
 
 def _translate_decode(sql: str) -> str:
     if 'decode' not in sql.lower():
@@ -2715,6 +2758,12 @@ def _translate_decode(sql: str) -> str:
             continue
         (expr, *rest) = [_translate_decode(a).strip() for a in args]
         default = rest.pop() if len(rest) % 2 else None
+        results = _decode_results(
+            rest[1::2] + ([default] if default is not None else [])
+        )
+        if default is not None:
+            default = results.pop()
+        rest[1::2] = results
         branches = ' '.join(
             f'WHEN ({expr}) IS NOT DISTINCT FROM ({search}) THEN {result}'
             for search, result in zip(rest[::2], rest[1::2])
