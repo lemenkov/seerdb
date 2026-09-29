@@ -455,6 +455,21 @@ _HELPER_FUNCTIONS_DDL = (
 )
 
 
+# Helpers built on orafce's own functions, so they are installed apart from
+# _HELPER_FUNCTIONS_DDL: on a PostgreSQL without orafce they fail, and must not
+# take the rest down with them.
+#
+# TO_DATE of a number (#1299): Oracle converts a numeric first argument to text
+# implicitly, so to_date(20021209, 'YYYYMMDD') is a DATE. PostgreSQL has no
+# to_date(numeric, text), and does not cast a number to text implicitly, so the
+# call found no function at all. This one hands the number's text to orafce's
+# to_date, which is what Oracle does.
+_ORAFCE_HELPERS_DDL = (
+    'CREATE OR REPLACE FUNCTION to_date(numeric, text) RETURNS oracle.date '
+    'LANGUAGE sql STABLE STRICT AS $$ SELECT oracle.to_date($1::text, $2) $$;'
+)
+
+
 # UTL_RAW — Oracle's RAW/bytea manipulation package (#765). orafce does not ship
 # it, so the backend installs it as PostgreSQL functions in a `utl_raw` schema, and
 # a schema-qualified Oracle call (UTL_RAW.CAST_TO_RAW(...)) resolves to it
@@ -3677,6 +3692,12 @@ class PostgresBackend:
         # empty_blob return the LOB domains just created, so this runs after them.
         try:
             self._conn.execute(_HELPER_FUNCTIONS_DDL)
+        except psycopg.Error:
+            self._conn.rollback()
+        # The helpers that need orafce, apart so they cannot take the others
+        # down without it (#1299).
+        try:
+            self._conn.execute(_ORAFCE_HELPERS_DDL)
         except psycopg.Error:
             self._conn.rollback()
         # UTL_RAW as PostgreSQL functions (orafce ships no utl_raw) (#765).
