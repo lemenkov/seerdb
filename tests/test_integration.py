@@ -1029,6 +1029,17 @@ class TypesIntegration(_IntegrationBase):
         self.assertTrue(a.endswith('WITH TIME ZONE') and 'LOCAL' not in a, a)
         self.assertTrue(b.endswith('WITH LOCAL TIME ZONE'), b)
 
+    def test_a_date_column_is_named_so(self):
+        # USER_TAB_COLUMNS names a DATE column DATE, 7 bytes long; the
+        # Mirror-over-PG called it a 22-byte TIMESTAMP (#1318).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (d DATE)')
+        self.cur.execute(
+            'SELECT data_type, data_length, data_precision, data_scale '
+            'FROM user_tab_columns WHERE table_name = :1',
+            [self.TABLE],
+        )
+        self.assertEqual(self.cur.fetchall(), [('DATE', 7, None, None)])
+
     def test_rownum_filters_the_first_rows(self):
         # ROWNUM as a top-level filter, the top-N idiom over an ordered inline
         # view, and `ROWNUM = 2`, which Oracle never satisfies (#1271).

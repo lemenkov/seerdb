@@ -806,13 +806,17 @@ _ORACLE_DICTIONARY_DDL = (
     # A collection (an array domain) or an object type is reported by its type's
     # name, as Oracle names it, and its schema is DATA_TYPE_OWNER (#1251). The
     # WITH TIME ZONE composite is the backend's own and reads as the built-in.
+    # A DATE column is the ora_date domain over a timestamp, and reads as the
+    # 7-byte DATE it is (#1318).
     "CASE WHEN c.data_type = 'ARRAY' AND c.domain_name IS NOT NULL "
     'THEN ora_name(c.domain_name) '
+    f"WHEN c.domain_name = '{_DATE_TYPE}' THEN 'DATE' "
     "WHEN c.data_type = 'USER-DEFINED' AND c.udt_name = 'ora_tstz' "
     "THEN 'TIMESTAMP WITH TIME ZONE' "
     "WHEN c.data_type = 'USER-DEFINED' THEN ora_name(c.udt_name) "
     'ELSE ora_type_name(c.data_type) END AS data_type, '
-    'coalesce(c.character_maximum_length, c.numeric_precision, 22) AS data_length, '
+    f"CASE WHEN c.domain_name = '{_DATE_TYPE}' THEN 7 ELSE "
+    'coalesce(c.character_maximum_length, c.numeric_precision, 22) END AS data_length, '
     'c.numeric_precision AS data_precision, c.numeric_scale AS data_scale, '
     'c.character_maximum_length AS char_length, '
     "CASE c.is_nullable WHEN 'YES' THEN 'Y' ELSE 'N' END AS nullable, "
