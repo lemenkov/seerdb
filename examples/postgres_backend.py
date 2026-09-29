@@ -3167,12 +3167,145 @@ _ANON_BLOCK = re.compile(r'(?is)^\s*(DECLARE\b.*?\s)?BEGIN\b(.*)\bEND\s*;?\s*$')
 def _translate_plsql_block(sql: str) -> str:
     """Wrap an anonymous DECLARE/BEGIN … END block as a PostgreSQL ``DO $$ … $$``
     block, mapping the declared local types (#533). Non-block SQL is unchanged."""
+    hoisted = _hoist_local_functions(sql)
+    if hoisted is not None:
+        return hoisted
     match = _ANON_BLOCK.match(sql)
     if match is None:
         return sql
     declare_part, body = match.groups()
     declare = _translate_routine_types(declare_part) if declare_part else ''
     return f'DO $$ {declare}BEGIN {body.strip()} END $$'
+
+
+# The tokens of a PL/SQL text that matter to its block structure: a string
+# literal, a comment or a quoted identifier (skipped whole, so a keyword inside one
+# counts for nothing), or a word.
+_PLSQL_TOKEN = re.compile(
+    r"'(?:[^']|'')*'|--[^\n]*|/\*.*?\*/|\"[^\"]*\"|(\w+)", re.DOTALL
+)
+# A local function in a block's declarations: FUNCTION name [(params)] RETURN
+# type IS|AS, its own declarations up to BEGIN, then the body.
+_LOCAL_FUNCTION_HEAD = re.compile(
+    r'(?is)\s*FUNCTION\s+(\w+)\s*(\((?:[^()]|\([^()]*\))*\))?\s*'
+    r'RETURN\s+(.+?)\s+(?:IS|AS)\b'
+)
+
+
+def _words(text: str, start: int = 0):
+    # (word upper-cased, start, end) for each word of `text` from `start`, past
+    # string literals, comments and quoted identifiers.
+    for match in _PLSQL_TOKEN.finditer(text, start):
+        if match.group(1) is not None:
+            yield match.group(1).upper(), match.start(), match.end()
+
+
+def _block_end(text: str, begin: int) -> tuple[int, int] | None:
+    # The span of the END that closes the BEGIN at `begin`. BEGIN and CASE open a
+    # level, END closes one -- but END IF / END LOOP close no BEGIN, so they are
+    # passed over, and END CASE closes the CASE statement it ends.
+    depth = 0
+    words = list(_words(text, begin))
+    after_end = False
+    for i, (word, start, end) in enumerate(words):
+        if after_end and word in ('IF', 'LOOP', 'CASE'):
+            after_end = False  # the END's own keyword, which opens nothing
+            continue
+        after_end = False
+        if word in ('BEGIN', 'CASE'):
+            depth += 1
+        elif word == 'END':
+            after_end = True
+            if i + 1 < len(words) and words[i + 1][0] in ('IF', 'LOOP'):
+                continue
+            depth -= 1
+            if depth == 0:
+                return start, end
+    return None
+
+
+# How a block's hoisted functions start: a translation beginning with it carries
+# several commands, which only PostgreSQL's simple query protocol accepts.
+_HOISTED_FUNCTION = 'DROP FUNCTION IF EXISTS pg_temp.'
+
+
+def _hoist_local_functions(sql: str) -> str | None:
+    # An anonymous block declaring local FUNCTIONs (#1322). PL/pgSQL has no nested
+    # routines, so each becomes a session-temporary function created ahead of the
+    # DO block, and every call to one is qualified with pg_temp -- which PostgreSQL
+    # never searches for a function otherwise. None for any other block, which
+    # keeps its plain DO translation; a local PROCEDURE is not handled.
+    head = re.match(r'(?is)\s*DECLARE\b', sql)
+    if head is None:
+        return None
+    functions: list[tuple[str, str, str, str, str]] = []
+    declarations = []
+    pos = head.end()
+    while True:
+        function = _LOCAL_FUNCTION_HEAD.match(sql, pos)
+        if function is not None:
+            begin = next(
+                (s for w, s, _e in _words(sql, function.end()) if w == 'BEGIN'), None
+            )
+            if begin is None:
+                return None
+            span = _block_end(sql, begin)
+            if span is None:
+                return None
+            name, params, return_type = function.groups()
+            local = sql[function.end() : begin]
+            body = sql[begin + len('BEGIN') : span[0]]
+            functions.append((name, params or '()', return_type, local, body))
+            close = re.compile(r'\s*(?:\w+\s*)?;').match(sql, span[1])
+            pos = close.end() if close is not None else span[1]
+            continue
+        word = next(_words(sql, pos), None)
+        if word is None:
+            return None
+        if word[0] == 'BEGIN':
+            break
+        if word[0] == 'PROCEDURE':
+            return None
+        # An ordinary declaration: through its terminating semicolon.
+        stop = sql.find(';', word[1])
+        if stop < 0:
+            return None
+        declarations.append(sql[pos : stop + 1])
+        pos = stop + 1
+    if not functions:
+        return None
+    rest = _ANON_BLOCK.match(sql[pos:])
+    if rest is None:
+        return None
+    names = {name.lower() for name, *_ in functions}
+    calls = re.compile(
+        r'(?<![.\w])(' + '|'.join(re.escape(n) for n in names) + r')\s*\(',
+        re.IGNORECASE,
+    )
+
+    def qualify(text: str) -> str:
+        # Qualify the calls to the hoisted functions, outside string literals.
+        parts = re.split(r"('(?:[^']|'')*')", text)
+        return ''.join(
+            part if i % 2 else calls.sub(r'pg_temp.\1(', part)
+            for i, part in enumerate(parts)
+        )
+
+    statements = []
+    for name, params, return_type, local, body in functions:
+        params = _translate_routine_types(_PARAM_IN_OUT.sub('INOUT', params))
+        returns = _translate_routine_types(return_type.strip())
+        local = _translate_routine_types(local.strip())
+        declare = f'DECLARE {qualify(local)} ' if local else ''
+        statements.append(
+            f'{_HOISTED_FUNCTION}{name}; '
+            f'CREATE FUNCTION pg_temp.{name}{params} RETURNS {returns} '
+            f'LANGUAGE plpgsql AS $f$ {declare}BEGIN {qualify(body.strip())} END $f$;'
+        )
+    declare = _translate_routine_types(''.join(declarations).strip())
+    declare = f'DECLARE {qualify(declare)} ' if declare else ''
+    body = qualify(rest.group(2).strip())
+    return ' '.join(statements) + f' DO $$ {declare}BEGIN {body} END $$'
 
 
 # The anonymous block a thin callproc / callfunc sends: BEGIN name(:a, :b); END;
@@ -4220,7 +4353,9 @@ class PostgresBackend:
         # `DROP …; CREATE …` a routine DDL rewrites to (#526) — the simple protocol
         # the sequential path uses accepts it. DDL is infrequent and auto-commits,
         # so the hot SELECT/DML path (single-command) is where the round-trips count.
-        if self._use_pipeline and not is_ddl:
+        # A block with local functions is several commands too (#1322).
+        hoisted = sql.startswith(_HOISTED_FUNCTION)
+        if self._use_pipeline and not is_ddl and not hoisted:
             result = self._execute_pipelined(sql, params, original)
         elif is_ddl:
             result = self._execute_sequential(

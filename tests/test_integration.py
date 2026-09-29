@@ -1352,6 +1352,35 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(block, [30, 2, out])
         self.assertIsNone(out.getvalue())
 
+    def test_an_anonymous_block_with_local_functions(self):
+        # A block may declare its own functions, one calling another, ended by
+        # END or END <name>. A Mirror-over-PG refused the block (#1322).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, v VARCHAR2(20))')
+        self.cur.execute(
+            'declare\n'
+            '    t_Label varchar2(20);\n'
+            '    function twice(a number) return number is\n'
+            '    begin\n'
+            '        return a * 2;\n'
+            '    end;\n'
+            '    function label(a number) return varchar2 is\n'
+            "        s varchar2(20) := 'n';\n"
+            '    begin\n'
+            '        for i in 1..a loop\n'
+            "            s := s || '+';\n"
+            '        end loop;\n'
+            '        return s || to_char(twice(a));\n'
+            '    end label;\n'
+            'begin\n'
+            '    for i in 1..3 loop\n'
+            '        t_Label := label(i);\n'
+            f'        insert into {self.TABLE} values (i, t_Label);\n'
+            '    end loop;\n'
+            'end;'
+        )
+        self.cur.execute(f'SELECT id, v FROM {self.TABLE} ORDER BY id')
+        self.assertEqual(self.cur.fetchall(), [(1, 'n+2'), (2, 'n++4'), (3, 'n+++6')])
+
     def test_the_session_id_is_the_sid_sql_reports(self):
         # A client reads its session id and serial from the login reply alone,
         # and SQL names the same session (#1212, #1218). Before 10g USERENV has
