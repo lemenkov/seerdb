@@ -1081,6 +1081,28 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT v FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), ('123',))
 
+    def test_a_named_argument_given_twice_is_a_compile_error(self):
+        # Oracle compiles a call naming one argument twice into PLS-00703 under
+        # ORA-06550, and the session carries on. The Mirror over PostgreSQL
+        # crashed on it into an ORA-00600, which clients read as a dead
+        # connection (#1368).
+        from seerdb.common.exceptions import DatabaseError
+
+        self.cur.execute(
+            'CREATE OR REPLACE PROCEDURE pyo_p1368 (a IN NUMBER, b OUT NUMBER) AS '
+            'BEGIN b := a + 1; END;'
+        )
+        try:
+            out = self.cur.var(seerdb.NUMBER)
+            with self.assertRaises(DatabaseError) as caught:
+                self.cur.execute('BEGIN pyo_p1368(a => :1, a => :2); END;', [1, out])
+            self.assertEqual(caught.exception.code, 6550)
+            self.assertIn('PLS-00703', str(caught.exception))
+            self.cur.execute('BEGIN pyo_p1368(a => :1, b => :2); END;', [1, out])
+            self.assertEqual(out.getvalue(), 2)
+        finally:
+            self.cur.execute('DROP PROCEDURE pyo_p1368')
+
     def test_dividing_integers_is_exact(self):
         # Oracle's / never truncates: integers divide exactly whether they are
         # literals, binds or an aggregate's count (#1361).

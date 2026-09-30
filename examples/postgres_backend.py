@@ -167,6 +167,7 @@ from seerdb.common.tns_consts import (
     ORA_NOT_ENOUGH_VALUES,
     ORA_NUMERIC_OVERFLOW,
     ORA_PARENT_KEY_NOT_FOUND,
+    ORA_PLSQL_COMPILATION_ERROR,
     ORA_RESOURCE_BUSY,
     ORA_SAVEPOINT_NEVER_ESTABLISHED,
     ORA_SESSION_ID_DOES_NOT_EXIST,
@@ -3531,6 +3532,47 @@ def _hoist_local_functions(sql: str) -> str | None:
 # or BEGIN :r := name(:a, :b); END;
 _CALL_BLOCK = re.compile(r'(?is)^\s*BEGIN\s+(.*?)\s*;?\s*END\s*;?\s*$')
 _FUNC_CALL = re.compile(r'(?is)^\s*:(\d+)\s*:=\s*([\w.]+)\s*\((.*)\)\s*$')
+# A named argument in a call's list: `name => value`.
+_NAMED_ARGUMENT = re.compile(r'(?is)^\s*(\w+)\s*=>')
+
+
+def _call_argument_error(
+    block: str, routine: str, args: str, parameters: Sequence[str] | None
+) -> BackendError | None:
+    """The ORA-06550 Oracle compiles a call's argument list into, or None.
+
+    ``parameters`` are the routine's parameter names in order, when known. A
+    parameter given twice is PLS-00703 -- by name twice, or by position and then
+    by name, positional arguments filling the first parameters; more arguments
+    than the routine has parameters is PLS-00306, checked after. Unchecked, both
+    reached the backend's positional mapping, which indexed past the parameter
+    list, and the IndexError that escaped became an ORA-00600 -- which a client
+    reads as a dead connection, and python-oracledb then closes it (#1368).
+    Oracle reports the position of the routine's name in the block.
+    """
+    items = [
+        args[s:e] for s, e in _top_level_items(args, 0, len(args)) if args[s:e].strip()
+    ]
+    named = [m.group(1).lower() for m in map(_NAMED_ARGUMENT.match, items) if m]
+    positional = len(items) - len(named)
+    used = named + [name.lower() for name in (parameters or [])[:positional]]
+    if len(used) != len(set(used)):
+        pls = 'PLS-00703: multiple instances of named argument in list'
+    elif parameters is not None and len(items) > len(parameters):
+        pls = (
+            'PLS-00306: wrong number or types of arguments in call to '
+            f"'{routine.rsplit('.', 1)[-1].upper()}'"
+        )
+    else:
+        return None
+    at = max(block.lower().find(routine.lower()), 0)
+    line = block.count('\n', 0, at) + 1
+    column = at - block.rfind('\n', 0, at)
+    return BackendError(
+        f'line {line}, column {column}:\n{pls}', ora_code=ORA_PLSQL_COMPILATION_ERROR
+    )
+
+
 _PROC_CALL = re.compile(r'(?is)^\s*([\w.]+)\s*\((.*)\)\s*$')
 # A scalar OUT-bind assignment inside a block: `:ref := <expr>` (#517).
 _OUT_ASSIGN = re.compile(r'(?is)^\s*:(\w+)\s*:=\s*(.+?)\s*$')
@@ -6072,10 +6114,10 @@ class PostgresBackend:
         try:
             func = _FUNC_CALL.match(statement)
             if func is not None:
-                return self._call_function(func, values)
+                return self._call_function(func, values, sql)
             proc = _PROC_CALL.match(statement)
             if proc is not None:
-                return self._call_procedure(proc, values)
+                return self._call_procedure(proc, values, sql)
             assignments = _parse_out_assignments(statement)
             if assignments is not None:
                 return self._eval_out_assignments(statement, assignments, binds, values)
@@ -6091,10 +6133,13 @@ class PostgresBackend:
             self._conn.rollback()
             raise _backend_error(exc) from exc
 
-    def _call_function(self, match: 're.Match', values: list) -> Result:
+    def _call_function(self, match: 're.Match', values: list, block: str) -> Result:
         # BEGIN :r := name(:a, :b); END;  →  SELECT name(a, b); the result is the
         # function's return value, written back into the :r bind position.
         ret_ref, name, args = match.groups()
+        refused = _call_argument_error(block, name, args, None)
+        if refused is not None:
+            raise refused
         arg_refs = [int(r) for r in re.findall(r':(\d+)', args)]
         arg_values = [values[r - 1] for r in arg_refs]
         placeholders = ', '.join(['%s'] * len(arg_values))
@@ -6105,13 +6150,16 @@ class PostgresBackend:
         out[int(ret_ref) - 1] = row[0] if row else None
         return Result(out_binds=out)
 
-    def _call_procedure(self, match: 're.Match', values: list) -> Result:
+    def _call_procedure(self, match: 're.Match', values: list, block: str) -> Result:
         # BEGIN name(:a, :b); END;  →  CALL name(a, b); the OUT / IN OUT arguments
         # come back as a result row, in parameter order, which we place onto their
         # bind positions.
         name, args = match.groups()
         arg_refs = [int(r) for r in re.findall(r':(\d+)', args)]
-        modes, argtypes = self._proc_signature(name)
+        modes, argtypes, parameters = self._proc_signature(name)
+        refused = _call_argument_error(block, name, args, parameters or None)
+        if refused is not None:
+            raise refused
         # A pure-OUT argument carries no input — pass an untyped NULL, not the
         # client's placeholder Var value: a REF CURSOR Var marshals to bytea, which
         # makes CALL's overload resolution miss the refcursor parameter (#518). IN
@@ -6249,21 +6297,25 @@ class PostgresBackend:
             out[position] = returned[i] if returned is not None else None
         return Result(out_binds=out)
 
-    def _proc_signature(self, name: str) -> tuple[list | None, list]:
-        # A routine's parameter modes ('i' IN, 'o' OUT, 'b' IN OUT) and the aligned
-        # argument type oids, from one pg_proc row. Modes place a CALL's result row
+    def _proc_signature(self, name: str) -> tuple[list | None, list, list[str]]:
+        # A routine's parameter modes ('i' IN, 'o' OUT, 'b' IN OUT), the aligned
+        # argument type oids and the parameter names -- what a call's argument
+        # list can name (#1368) -- from one pg_proc row. Modes place a CALL's result row
         # (which carries only the OUT / IN OUT values) back onto the right bind
         # positions; the types let the OUT-bind path spot an ora_intervalym argument
         # (which has no result column to trace). Modes are None for an all-IN routine
         # (PostgreSQL leaves proargmodes — and proallargtypes — NULL then).
         row = self._conn.execute(
-            'SELECT proargmodes, proallargtypes FROM pg_proc WHERE proname = %s '
-            'ORDER BY oid DESC LIMIT 1',
+            'SELECT proargmodes, proallargtypes, proargnames FROM pg_proc '
+            'WHERE proname = %s ORDER BY oid DESC LIMIT 1',
             (name.split('.')[-1].lower(),),
         ).fetchone()
-        if not row or not row[0]:
-            return None, []
-        return list(row[0]), list(row[1] or ())
+        if not row:
+            return None, [], []
+        names = list(row[2] or ())
+        if not row[0]:
+            return None, [], names
+        return list(row[0]), list(row[1] or ()), names
 
     def change_password(
         self, username: str, old_password: str, new_password: str
