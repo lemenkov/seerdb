@@ -1081,6 +1081,17 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT v FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), ('123',))
 
+    def test_dividing_integers_is_exact(self):
+        # Oracle's / never truncates: integers divide exactly whether they are
+        # literals, binds or an aggregate's count (#1361).
+        self.cur.execute(
+            'SELECT 3 / 2, 15 / 10, 4 / 2, :1 / :2, '
+            '(SELECT COUNT(*) FROM (SELECT 1 FROM dual UNION ALL SELECT 2 FROM dual '
+            'UNION ALL SELECT 3 FROM dual)) / 2 FROM dual',
+            [7, 2],
+        )
+        self.assertEqual(self.cur.fetchone(), (1.5, 1.5, 2, 3.5, 1.5))
+
     def test_a_query_casts_to_oracle_types(self):
         # CAST to an Oracle type inside a query, not only in DDL; a type no one
         # knows is ORA-00902, not a missing table (#1329); 8i reads such a cast as

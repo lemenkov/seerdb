@@ -10,13 +10,12 @@
 # the two together); the Mirror runs in the background of the test step so it
 # is torn down with it.
 #
-# The whole suite runs except two classes that are inherent limits of a
-# PostgreSQL backend, not fixable gaps, and are documented as such in
-# examples/postgres_backend.py: TrueDivTest (Oracle's float `/` vs PostgreSQL's
-# integer `/`) and NormalizedNameTest (a quoted lower-case identifier is
-# indistinguishable from an unquoted one once PostgreSQL folds both to
-# lower-case). This is a two-class denylist over the full suite, not a curated
-# allowlist.
+# The whole suite runs except one class that is an inherent limit of a
+# PostgreSQL backend, not a fixable gap, and is documented as such in
+# examples/postgres_backend.py: NormalizedNameTest (a quoted lower-case
+# identifier is indistinguishable from an unquoted one once PostgreSQL folds
+# both to lower-case). This is a one-class denylist over the full suite, not a
+# curated allowlist.
 name: SQLAlchemy (Mirror over PostgreSQL)
 
 on:
@@ -131,11 +130,11 @@ jobs:
           print('test_schema ready')
           PY
           status=0
-          # The full suite minus the two inherent-limit classes (see the header).
+          # The full suite minus the inherent-limit class (see the header).
           # A deterministic order keeps the guard reproducible across runs.
           python -m pytest -q --tb=short -p no:randomly \
             --dburi "oracle+seerdb://pyo:pyo123@localhost:1521/?service_name=XE" \
-            -k "not TrueDivTest and not NormalizedNameTest" \
+            -k "not NormalizedNameTest" \
             test/test_suite.py || status=$?
           kill "$MIRROR_PID" 2>/dev/null || true
           if [ "$status" -ne 0 ]; then echo "--- mirror log ---"; tail -n 200 "$REPO/mirror.log"; fi

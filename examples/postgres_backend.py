@@ -96,11 +96,6 @@ edge of this adapter:
   columns; the dictionary and ``%ROWTYPE`` follow. A join, a subquery or a view
   over such a table is not expanded, so its ``*`` still includes the column. A
   column made ``VISIBLE`` again keeps its place, where Oracle moves it to the end.
-- **Integer division semantics** — Oracle's ``/`` is always NUMBER (float)
-  division, so ``15 / 10`` is ``1.5``; PostgreSQL's integer ``/`` truncates to
-  ``1``. Matching Oracle would mean coercing every division to numeric, a broad
-  change to expression semantics the backend does not make, so an integer-operand
-  division reflects PostgreSQL's result (SQLAlchemy ``TrueDivTest``).
 - **A deliberately quoted lower-case identifier** — Oracle stores an unquoted
   name upper-case and a quoted one verbatim, so a lower-case name is
   unambiguously a quoted one; PostgreSQL folds *both* an unquoted name and a
@@ -563,6 +558,22 @@ _HELPER_FUNCTIONS_DDL = (
     'CREATE OPERATOR || (LEFTARG = anynonarray, RIGHTARG = text, '
     'FUNCTION = ora_concat); '
     'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
+    # Division (#1361): Oracle's / is exact, so 3 / 2 is 1.5; PostgreSQL divides
+    # two integers as integers and gives 1. An integer reaches it as a literal, an
+    # int bind, or a function such as count(*), so every pair of PostgreSQL's
+    # integer types gets a / that divides as numeric, shadowing PostgreSQL's own
+    # from an earlier schema on the search path, as || does above. Each operator
+    # has its own DO block, so one already there doesn't stop the rest.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION ora_div({left}, {right}) RETURNS numeric '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        '$$ SELECT $1::numeric OPERATOR(pg_catalog./) $2::numeric $$;'
+        'DO $$ BEGIN '
+        f'CREATE OPERATOR / (LEFTARG = {left}, RIGHTARG = {right}, FUNCTION = ora_div); '
+        'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
+        for left in ('smallint', 'integer', 'bigint')
+        for right in ('smallint', 'integer', 'bigint')
+    )
 )
 
 
