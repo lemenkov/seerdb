@@ -1054,6 +1054,12 @@ _ORACLE_DICTIONARY_DDL = (
     "p.value::text AS display_value, 'TRUE'::text AS isdefault FROM (VALUES "
     f"('open_cursors', 3, '{_AUTH_MAX_OPEN_CURSORS}'), "
     "('db_domain', 2, NULL)) AS p(name, type, value);"
+    # v$database (#1354): the database's name as the login reports it -- the same
+    # upper(current_database()) session_info gives SessionInfo.db_name -- and the
+    # database's oid as its dbid.
+    'CREATE OR REPLACE VIEW sys."v$database" AS SELECT d.oid::bigint AS dbid, '
+    'upper(d.datname::text) AS name, upper(d.datname::text) AS db_unique_name '
+    'FROM pg_database d WHERE d.datname = current_database();'
     # v$statname / v$sesstat (#1324): the sessions' statistics, which only the
     # Mirror can count (seerdb.server.stats). v$statname names the ones it keeps,
     # numbered as 23ai numbers them. sys.ora_sesstat() unpacks a snapshot of
