@@ -3623,6 +3623,13 @@ _PROC_CALL = re.compile(r'(?is)^\s*([\w.]+)\s*\((.*)\)\s*$')
 _OUT_ASSIGN = re.compile(r'(?is)^\s*:(\w+)\s*:=\s*(.+?)\s*$')
 
 
+# A block's lone SELECT ... INTO :b1[, :b2] FROM ... (#1396): the query, and the
+# bind list it assigns the row to.
+_SELECT_INTO = re.compile(
+    r'(?is)^\s*(SELECT\s.+?)\s+INTO\s+(:\w+(?:\s*,\s*:\w+)*)\s+(FROM\b.*?)\s*;?\s*$'
+)
+
+
 def _distinct_bind_refs(text: str) -> list[str]:
     # The distinct bind references in first-appearance order (their positions in
     # the Mirror's bind list), ignoring `:` inside string literals — the same
@@ -6251,6 +6258,9 @@ class PostgresBackend:
             assignments = _parse_out_assignments(statement)
             if assignments is not None:
                 return self._eval_out_assignments(statement, assignments, binds, values)
+            select_into = _SELECT_INTO.match(statement)
+            if select_into is not None:
+                return self._select_into(select_into, values)
             if inner is not None:
                 # A block wrapping DML (BEGIN INSERT/UPDATE/DELETE …(:x); END) —
                 # unwrap and run the inner statement with the binds.
@@ -6418,6 +6428,31 @@ class PostgresBackend:
         for (ref, _expr), result in zip(assignments, row):
             if ref in refs:
                 out[refs.index(ref)] = result
+        return Result(out_binds=out)
+
+    def _select_into(self, match: 're.Match', values: list) -> Result:
+        # BEGIN SELECT <cols> INTO :a, :b FROM ...; END (#1396): run the query with
+        # its own binds and give its one row to the INTO binds, as PL/SQL does --
+        # no row is ORA-01403 and more than one ORA-01422. The query goes through
+        # execute(), so it is translated like any other (ROWID included).
+        select, targets, rest = match.groups()
+        refs = _distinct_bind_refs(match.string)
+        by_name = dict(zip(refs, values))
+        query = f'{select} {rest}'
+        result = self.execute(
+            query, [by_name[ref] for ref in _distinct_bind_refs(query)]
+        )
+        if not result.rows:
+            raise BackendError('no data found', ora_code=ORA_NO_DATA_FOUND)
+        if len(result.rows) > 1:
+            raise BackendError(
+                'exact fetch returns more than requested number of rows',
+                ora_code=ORA_TOO_MANY_ROWS,
+            )
+        out = list(values)
+        for target, value in zip(_distinct_bind_refs(targets), result.rows[0]):
+            if target in refs:
+                out[refs.index(target)] = value
         return Result(out_binds=out)
 
     def _run_block_statement(self, statement: str, values: list) -> Result:
