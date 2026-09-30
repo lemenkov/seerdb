@@ -40,6 +40,7 @@ from seerdb.common.sqltext import (
     altered_current_schema,
     altered_edition,
     bind_placeholders,
+    is_plsql,
     is_reusable_dml,
 )
 from seerdb.common.tns import (
@@ -1244,9 +1245,7 @@ def _serve_thin_session(
             # stands for a PL/SQL block decides where its wide binds sit in the
             # row -- in place for a block, last for anything else. Only the
             # Mirror knows, from what it parked for that id (#1064).
-            cached_plsql = cached and _is_plsql_block(
-                cursors.dml_sql(peek_cursor) or ''
-            )
+            cached_plsql = cached and is_plsql(cursors.dml_sql(peek_cursor) or '')
             max_size = max_string_size(_SERVER_RUNTIME_CAPS)
             completed = _complete_message(
                 stream,
@@ -1301,7 +1300,7 @@ def _serve_thin_session(
             peeked = parse_reexecute(body).cursor
             cached_types = cursors.bind_types(peeked)
             cached_dirs = cursors.bind_directions(peeked)
-            cached_plsql = _is_plsql_block(cursors.dml_sql(peeked) or '')
+            cached_plsql = is_plsql(cursors.dml_sql(peeked) or '')
             max_size = max_string_size(_SERVER_RUNTIME_CAPS)
             completed = _complete_message(
                 stream,
@@ -1341,7 +1340,7 @@ def _serve_thin_session(
             peeked = parse_reexecute(body).cursor
             cached_types = cursors.bind_types(peeked)
             cached_dirs = cursors.bind_directions(peeked)
-            cached_plsql = _is_plsql_block(cursors.dml_sql(peeked) or '')
+            cached_plsql = is_plsql(cursors.dml_sql(peeked) or '')
             max_size = max_string_size(_SERVER_RUNTIME_CAPS)
             completed = _complete_message(
                 stream,
@@ -1699,7 +1698,7 @@ def _mark_transaction(sql: str, autocommit: bool) -> None:
     """
     if autocommit:
         _ENCODE_TXN_IN_PROGRESS.set(False)
-    elif is_reusable_dml(sql) or _is_plsql_block(sql):
+    elif is_reusable_dml(sql) or is_plsql(sql):
         _ENCODE_TXN_IN_PROGRESS.set(True)
 
 
@@ -2941,11 +2940,6 @@ def _run_returning(
     return Result(rowcount=result.rowcount, returned_rows=returned[: len(rows)])
 
 
-def _is_plsql_block(sql: str) -> bool:
-    head = sql.lstrip().upper()
-    return head.startswith('BEGIN') or head.startswith('DECLARE')
-
-
 def _attach_object_bind_lobs(
     request: ExecRequest, lob_emit_log: LobEmitLog, temp_lobs: _TempLobs
 ) -> None:
@@ -3027,7 +3021,7 @@ def _bind_vars(request: ExecRequest) -> list:
     # everything on a shape mismatch.
     if not request.binds or len(request.bind_meta) != len(request.binds):
         return request.binds
-    block = _is_plsql_block(request.sql)
+    block = is_plsql(request.sql)
     arrays = request.bind_arrays or [0] * len(request.binds)
     # The per-bind type OID (an object / REF bind carries it in the OAC) rides on
     # bind_types as the 4th field; thread it so an object OUT / typed-NULL bind
@@ -3278,7 +3272,7 @@ def _answer_query(
             # a plain success status; a DML / PL/SQL parse owes the status alone.
             stream.write_packet(TNS_DATA, _answer_parse(backend, sql, request))
             return lobs
-        if reused_id and _is_plsql_block(sql):
+        if reused_id and is_plsql(sql):
             # A PL/SQL block re-executed by its cursor id (#1064). Once the block
             # has an id the client stops sending it one iteration at a time and
             # re-executes the remaining rows as one array call, with values for

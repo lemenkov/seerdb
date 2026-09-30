@@ -1146,13 +1146,41 @@ def test_a_column_lob_reports_its_own_size_not_zero() -> None:
 # --- PL/SQL OUT-bind helpers (#483) --------------------------------------------
 
 
-def test_is_plsql_block_detects_begin_and_declare() -> None:
-    from seerdb.server.session import _is_plsql_block
+@pytest.mark.parametrize(
+    'sql',
+    [
+        'BEGIN p(:1); END;',
+        '  declare x number; begin null; end;',
+        '-- fill it\nBEGIN INSERT INTO t VALUES (1); END;',
+        '/* fill it */ DECLARE x NUMBER; BEGIN NULL; END;',
+    ],
+)
+def test_a_plsql_block_opens_a_transaction(sql: str) -> None:
+    # A PL/SQL block opens a transaction, and the reply must say so, or a client
+    # that trusts the flag skips its rollback (#889). A block may start with a
+    # comment: the Mirror took one for something else and left the flag clear,
+    # where the server sets it (#1172).
+    from seerdb.common.tns import _ENCODE_TXN_IN_PROGRESS
+    from seerdb.server.session import _mark_transaction
 
-    assert _is_plsql_block('BEGIN p(:1); END;')
-    assert _is_plsql_block('  declare x number; begin null; end;')
-    assert not _is_plsql_block('SELECT 1 FROM dual')
-    assert not _is_plsql_block('INSERT INTO t VALUES (:1)')
+    token = _ENCODE_TXN_IN_PROGRESS.set(False)
+    try:
+        _mark_transaction(sql, autocommit=False)
+        assert _ENCODE_TXN_IN_PROGRESS.get() is True
+    finally:
+        _ENCODE_TXN_IN_PROGRESS.reset(token)
+
+
+def test_a_query_leaves_the_transaction_flag_alone() -> None:
+    from seerdb.common.tns import _ENCODE_TXN_IN_PROGRESS
+    from seerdb.server.session import _mark_transaction
+
+    token = _ENCODE_TXN_IN_PROGRESS.set(False)
+    try:
+        _mark_transaction('-- rows\nSELECT 1 FROM dual', autocommit=False)
+        assert _ENCODE_TXN_IN_PROGRESS.get() is False
+    finally:
+        _ENCODE_TXN_IN_PROGRESS.reset(token)
 
 
 def test_bind_vars_wraps_block_binds_with_type_and_size() -> None:
