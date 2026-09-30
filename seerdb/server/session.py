@@ -39,9 +39,9 @@ from seerdb.common.oci import (
 from seerdb.common.sqltext import (
     altered_current_schema,
     altered_edition,
-    bind_placeholders,
     is_plsql,
     is_reusable_dml,
+    placeholder_count,
 )
 from seerdb.common.tns import (
     _CSFRM_DB,
@@ -3020,7 +3020,7 @@ def _resolve_refcursor_in_value(
     if Open is None:
         return value
     sql = cursors.query_sql(value)
-    if not sql or bind_placeholders(sql, dedupe=True):
+    if not sql or placeholder_count(sql):
         # No statement recorded for that id, or one whose own binds this does
         # not have. Re-running it with the wrong values would be worse than not
         # running it, so leave the value alone and let the backend answer.
@@ -3718,7 +3718,7 @@ def _answer_parse(backend: Backend, sql: str, request: ExecRequest) -> bytes:
         # placeholders the statement has. Count them in the text instead, or the
         # fallback runs `where IntCol = :val` with nothing bound and the backend
         # answers the very ORA-01008 this branch exists to avoid.
-        placeholders = len(bind_placeholders(sql, dedupe=True))
+        placeholders = placeholder_count(sql)
         columns = list(backend.execute(sql, [None] * placeholders).columns or [])
     # Describe + a plain success status, NOT encode_query_response: that ends a
     # batch with the end-of-fetch ORA-01403, and a parse fetched nothing.

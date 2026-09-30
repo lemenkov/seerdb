@@ -245,3 +245,13 @@ class TestReusableDml(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def test_placeholder_count_counts_named_and_numbered() -> None:
+    # A parse sizes its NULL values by this, and a numbered placeholder is one
+    # too (#1394); a repeat, a `::` cast, a literal and a comment are not new.
+    from seerdb.common.sqltext import placeholder_count
+
+    assert placeholder_count('insert into t (n) values (:1)') == 1
+    assert placeholder_count('select :1, :b, :"q", :1, :B from t') == 3
+    assert placeholder_count("select x::int, ':9' from t -- :8") == 0

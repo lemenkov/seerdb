@@ -144,6 +144,7 @@ from seerdb.common.dbobject import (
 from seerdb.common.sqltext import (
     bind_placeholders,
     is_plsql,
+    placeholder_count,
     returning_bind_positions,
     strip_non_bind_text,
     strip_returning_into,
@@ -4661,7 +4662,7 @@ class PostgresBackend:
                 )
             )
         )
-        placeholders = len(bind_placeholders(sql, dedupe=True))
+        placeholders = placeholder_count(sql)
         params: dict | None = None
         if placeholders:
             translated, params = _translate_binds(translated, [None] * placeholders)
