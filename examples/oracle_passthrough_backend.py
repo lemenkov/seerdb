@@ -229,6 +229,22 @@ class OraclePassthroughBackend:
             if key in ('program', 'machine', 'terminal', 'osuser')
         }
 
+    def alter_session(self, statement: str) -> None:
+        """Run the ALTER SESSION a client sent with its login, upstream (#1139).
+
+        From 12.1 a client pins the session time zone to its own UTC offset
+        this way. The upstream session was opened by this process's client,
+        which pinned the zone of the host the Mirror runs on, so a client in
+        another zone saw that host's offset in SESSIONTIMEZONE and every LTZ
+        value. Oracle's ALTER SESSION is not transactional: nothing to commit.
+        """
+        assert self._conn is not None  # open_session ran first, during the login
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(statement)
+        finally:
+            cursor.close()
+
     def bfile_exists(self, directory: str, filename: str) -> bool:
         """Does this BFILE's file exist upstream? (#1102)
 
