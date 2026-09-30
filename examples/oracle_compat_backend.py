@@ -173,6 +173,11 @@ class OracleCompatBackend:
         return secret
 
     def execute(self, sql: str, binds: Sequence = ()) -> Result:
+        if getattr(self._inner, 'closed', False):
+            # The inner backend's connection is gone -- a killed session (#1367).
+            # Nothing may be answered from here then, not even SELECT USER, or
+            # the dead session looks alive; the inner backend says why it can't.
+            return self._inner.execute(sql, binds)
         normalized = ' '.join(sql.strip().upper().split())
         attrs = _app_info_attributes(sql, binds)
         if attrs is not None:

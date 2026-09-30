@@ -1638,9 +1638,11 @@ class CursorIntegration(_IntegrationBase):
 
     def test_kill_session_ends_the_named_session(self):
         # ALTER SYSTEM KILL SESSION 'sid,serial' ends that session: its next call
-        # fails and the connection is gone (#1212). A malformed ID is ORA-00026,
-        # an unknown one ORA-00030. The suite's user may neither read v$session
-        # nor ALTER SYSTEM on any Oracle bed, so there it skips.
+        # fails with ORA-00028 and the connection is gone (#1212, #1367) -- even a
+        # SELECT USER, which the Mirror over PostgreSQL answered without its
+        # backend and so from a dead session. A malformed ID is ORA-00026, an
+        # unknown one ORA-00030. The suite's user may neither read v$session nor
+        # ALTER SYSTEM on any Oracle bed, so there it skips.
         from seerdb.common.exceptions import DatabaseError
 
         victim = _connect_with()
@@ -1663,9 +1665,10 @@ class CursorIntegration(_IntegrationBase):
                 if exc.code == 1031:
                     self.skipTest('no ALTER SYSTEM privilege')
                 raise
-            with self.assertRaises(seerdb.Error):
-                vcur.execute('SELECT 1 FROM dual')
+            with self.assertRaises(seerdb.Error) as killed:
+                vcur.execute('SELECT USER FROM dual')
                 vcur.fetchall()
+            self.assertEqual(getattr(killed.exception, 'code', None), 28)
         finally:
             try:
                 victim.close()
@@ -7982,9 +7985,10 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                         if exc.code == 1031:
                             self.skipTest('no ALTER SYSTEM privilege')
                         raise
-                    with self.assertRaises(seerdb.Error):
-                        await vcur.execute('SELECT 1 FROM dual')
+                    with self.assertRaises(seerdb.Error) as killed:
+                        await vcur.execute('SELECT USER FROM dual')
                         await vcur.fetchall()
+                    self.assertEqual(getattr(killed.exception, 'code', None), 28)
                 finally:
                     try:
                         await victim.close()
