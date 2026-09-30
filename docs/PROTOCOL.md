@@ -6713,6 +6713,22 @@ followed by `ORA-01013` (user requested cancel); the reader drains the markers
 via the existing reset handshake (the #45 break/reset machinery), the connection
 resyncs, and it's immediately reusable.
 
+**An interrupt that finds nothing running** (sent while the connection is idle,
+or after the call already finished) still opens an episode, and the cancel
+becomes the **next** call's answer. Measured with an in-band interrupt on 26ai:
+the server answers with a reset and waits for the client's reset. The request
+the client sent meanwhile is not executed; its answer is `ORA-01013`, and the
+call after it runs normally. With encryption on, both sides re-derive their
+integrity keystreams in that exchange (§33.6).
+
+The Mirror (§33.5) answers an interrupt the same way (#1346): it sends one
+reset, reads until the client's reset (dropping the queued request), re-derives
+when encryption is on, and replies `ORA-01013`. Before that it executed the queued
+request in between: the cancel then arrived one call late, and under encryption
+the request's reply went out under keys the client had already re-derived, so it
+failed the client's integrity check. The Mirror does not honour the OOB urgent
+byte yet (#1349).
+
 - **call_timeout**: a timer (`threading.Timer` sync, `loop.call_later` async)
   fires the break after the timeout; the resulting `ORA-01013` is remapped to a
   call-timeout `OperationalError`. The timer is disarmed as soon as the call
@@ -7166,6 +7182,12 @@ AES256 + SHA256.
 The classic sqlplus / thick-OCI client also negotiates ANO but stamps version
 `0x00000000`; that path is handled inline by the `deadbeef` dialect (§4.1.1) and
 is unaffected by the stance.
+
+Like the client, the server re-derives its integrity keystreams once per
+break/reset exchange (§33.6). For the Mirror, that exchange is the cancel
+episode (§25): it re-derives when the client's reset closes it, just before the
+`ORA-01013` it sends (#1346). The Mirror reports ordinary SQL errors to a thin
+client as plain DATA, with no break, so those need nothing.
 
 ### 33.6 A break/reset re-derives the integrity keystreams (#1345)
 

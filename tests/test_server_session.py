@@ -2460,28 +2460,46 @@ def test_a_break_episode_is_answered_with_reset_then_cancel() -> None:
     from seerdb.server.session import _answer_marker
 
     class _FakeStream:
-        def __init__(self) -> None:
+        def __init__(self, inbox: list) -> None:
+            self.inbox = inbox
             self.sent: list[tuple[int, bytes]] = []
+            self.rederived = 0
+
+        def read_packet(self, **_kw):
+            return self.inbox.pop(0) if self.inbox else None
 
         def write_packet(self, packet_type: int, body: bytes) -> None:
             self.sent.append((packet_type, body))
 
-    stream: Any = _FakeStream()
+        def rederive_ano(self) -> None:
+            self.rederived += 1
 
-    # The interrupt opens the episode and draws a reset -- not an error yet.
+    # The interrupt opens the episode and draws a reset; the Mirror then waits
+    # for the client's reset -- dropping the request the client queued behind
+    # its interrupt, which gets the cancel as its answer (#1346) -- and only
+    # then reports the cancel, which is what the client is waiting to read.
+    queued = (TNS_DATA, bytes([3, 0x5E, 1]))
+    client_reset = (TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
+    stream: Any = _FakeStream([queued, client_reset])
     _answer_marker(stream, bytes([1, 0, 3]))
-    assert stream.sent == [(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))]
-
-    # The client's own reset closes it, and only then is the cancel reported --
-    # which is what the client is waiting to read.
-    _answer_marker(stream, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
+    assert stream.sent[0] == (TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
     packet_type, body = stream.sent[-1]
     assert packet_type == TNS_DATA
     assert b'ORA-01013' in body
     assert b'User requested cancel of current operation.' in body
+    assert stream.inbox == []  # the queued request was dropped
     # Exactly one reset for the whole episode: echoing each marker would
-    # ping-pong the two sides into a reset storm.
+    # ping-pong the two sides into a reset storm. And one re-derivation of the
+    # integrity keystreams, before the cancel goes out (#1346).
     assert sum(1 for t, _ in stream.sent if t == TNS_MARKER) == 1
+    assert stream.rederived == 1
+
+    # A client that sent its reset along with its interrupt: the reset is
+    # already waiting, and closes the episode the same way.
+    stream = _FakeStream([])
+    _answer_marker(stream, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
+    assert [t for t, _ in stream.sent] == [TNS_DATA]
+    assert stream.rederived == 1
 
 
 def test_complete_message_reassembles_a_spanning_request() -> None:

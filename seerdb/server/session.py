@@ -1930,21 +1930,28 @@ def _answer_marker(stream: PacketStream, body: bytes) -> None:
     client's own reset closes the episode with the cancel it asked for.
     """
     marker_type = body[2] if len(body) >= 3 else 0
-    if marker_type == TNS_MARKER_TYPE_RESET:
-        # The client's reset ends the episode: report the cancellation, which is
-        # what it is now waiting to read.
-        stream.write_packet(
-            TNS_DATA,
-            encode_error(
-                _ORA_USER_CANCEL,
-                # The text a live 23ai sends, capitalised and full-stopped.
-                f'ORA-{_ORA_USER_CANCEL:05d}: User requested cancel of current '
-                f'operation.',
-            ),
-        )
-    else:
-        # An interrupt or break opens it: answer with a single reset.
+    if marker_type != TNS_MARKER_TYPE_RESET:
+        # An interrupt or break opens it: answer with a single reset, then wait
+        # for the client's, dropping whatever it sent before it -- the request it
+        # queued behind the interrupt gets the cancel as its answer, as a live
+        # 26ai answers it (#1346). Answering that request in between left its
+        # reply ahead of the cancel, one call out of step, and under encryption
+        # sent with keys the client had already re-derived.
         stream.write_packet(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
+        _await_reset_marker(stream)
+    # The client's reset ends the episode: report the cancellation, which is what
+    # it is now waiting to read. With encryption on, both sides re-derive their
+    # integrity keystreams here -- the client did as it sent that reset -- so this
+    # side must before the reply (#1346).
+    stream.rederive_ano()
+    stream.write_packet(
+        TNS_DATA,
+        encode_error(
+            _ORA_USER_CANCEL,
+            # The text a live 23ai sends, capitalised and full-stopped.
+            f'ORA-{_ORA_USER_CANCEL:05d}: User requested cancel of current operation.',
+        ),
+    )
 
 
 # How long to wait for a packet that continues a message already being parsed
