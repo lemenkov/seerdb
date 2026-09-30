@@ -738,6 +738,16 @@ class TypesIntegration(_IntegrationBase):
             self.cur.execute(f"BEGIN :v := TO_YMINTERVAL('{text}'); END;", [v])
             self.assertEqual(v.getvalue(), expected)
 
+    def test_an_interval_ym_bound_into_a_select_list(self):
+        # An IntervalYM bound into a select list comes back as one. The Mirror
+        # over PostgreSQL described it as DAY TO SECOND and read its months as
+        # days (#1401).
+        if _conn_is_8i(self.conn):
+            self.skipTest('INTERVAL is a 9i+ type; Oracle 8i lacks it')
+        for value in (seerdb.IntervalYM(-12, -5), seerdb.IntervalYM(3, 2)):
+            self.cur.execute('SELECT :1 FROM dual', [value])
+            self.assertEqual(self.cur.fetchone(), (value,))
+
     # ----- ROWID -----
 
     def test_rowid_matches_rowidtochar(self):
