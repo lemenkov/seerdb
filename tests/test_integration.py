@@ -1072,6 +1072,17 @@ class TypesIntegration(_IntegrationBase):
             self.cur.fetchall()
             self.assertEqual(self.cur.description[0][2:4], (20, 20), where)
 
+    def test_delete_without_from(self):
+        # Oracle takes DELETE without FROM. The Mirror over PostgreSQL sent it
+        # as written, a syntax error there (#1407).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER)')
+        for n in (1, 2, 3):
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1)', [n])
+        self.cur.execute(f'DELETE {self.TABLE} WHERE n = 2')
+        self.assertEqual(self.cur.rowcount, 1)
+        self.cur.execute(f'DELETE {self.TABLE}')
+        self.assertEqual(self.cur.rowcount, 2)
+
     def test_integer_and_smallint_are_number_38(self):
         # INTEGER, INT and SMALLINT are NUMBER(38): 20 digits fit, and the
         # columns describe as NUMBER(38,0). A SMALLINT parameter takes an
