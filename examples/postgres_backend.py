@@ -5933,13 +5933,48 @@ class PostgresBackend:
         except psycopg.Error as exc:
             self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_stmt')
             self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
-            raise _backend_error(exc) from exc
+            # Oracle undoes only the row that failed: the rows before it stay
+            # applied, and the error's rowcount says how many there were. The
+            # pipelined batch cannot tell which row failed, and its savepoint
+            # undid them all, so replay the rows one at a time up to the failure
+            # (#1365).
+            raise self._replay_until_failure(bound_sql, params) from exc
         self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
         if with_rowid is not None:
             return Result(
                 rowcount=affected, last_rowid=touched[-1] if touched else None
             )
         return max(affected, 0)
+
+    def _replay_until_failure(self, bound_sql: str, params: list) -> BackendError:
+        # Run the rows of a batch that failed one at a time, each in a savepoint
+        # of its own, until one fails; that one is undone and the rest are kept.
+        # The failing row's error comes back carrying how many rows were
+        # applied before it, which is what Oracle reports for a batch that stops
+        # part-way (#998, #1365). Not the per-iteration counts: this path serves
+        # a client that did not ask for them (that one is execute_many_rowcounts),
+        # and a count block it did not ask for is a reply it cannot read.
+        cursor = self._conn.cursor()
+        cursor.execute('SAVEPOINT _mirror_replay')
+        applied = 0
+        for row in params:
+            cursor.execute('SAVEPOINT _mirror_row')
+            try:
+                cursor.execute(bound_sql, row)
+            except psycopg.Error as exc:
+                self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_row')
+                self._conn.execute('RELEASE SAVEPOINT _mirror_row')
+                self._conn.execute('RELEASE SAVEPOINT _mirror_replay')
+                err = _backend_error(exc)
+                err.rowcount = applied
+                return err
+            self._conn.execute('RELEASE SAVEPOINT _mirror_row')
+            applied += max(cursor.rowcount, 0)
+        # The batch failed and no single row does: a failure only the batch as a
+        # whole met. Nothing is left applied.
+        self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_replay')
+        self._conn.execute('RELEASE SAVEPOINT _mirror_replay')
+        return BackendError('the array statement failed', rowcount=0)
 
     @_while_connected
     def execute_many_rowcounts(

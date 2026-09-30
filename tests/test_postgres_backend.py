@@ -1336,10 +1336,11 @@ def test_executemany_array_dml_postgres() -> None:
 
 
 def test_executemany_failure_aborts_batch_and_keeps_session_postgres() -> None:
-    # A plain (non-batcherrors) array DML now runs through the backend's own
-    # executemany. A row that fails mid-batch must abort the whole batch (Oracle's
-    # non-batcherrors semantics) — the savepoint rolls back every row of it — and
-    # leave the session usable for the next statement, never desyncing.
+    # A plain (non-batcherrors) array DML runs through the backend's own
+    # executemany. A row that fails mid-batch stops the batch there and leaves
+    # the session usable for the next statement, never desyncing. As on Oracle
+    # (measured on 23ai), only the failing row is undone: the rows before it
+    # stay, and the error's rowcount says how many (#1365).
     listen, server, result = _start_mirror()
     conn = _connect(listen.getsockname()[1])
     try:
@@ -1349,8 +1350,8 @@ def test_executemany_failure_aborts_batch_and_keeps_session_postgres() -> None:
         with pytest.raises(seerdb.DatabaseError):
             # The third row duplicates the first key — the batch aborts.
             cur.executemany('insert into t_manyfail values (:1)', [(1,), (2,), (1,)])
-        # The session survived; the aborted batch applied nothing (the two good
-        # rows were rolled back with it).
+        reported = cur.rowcount
+        # The session survived, with the two good rows applied.
         cur.execute('select count(*) from t_manyfail')
         remaining = cur.fetchone()[0]
         cur.execute('drop table t_manyfail')
@@ -1363,7 +1364,7 @@ def test_executemany_failure_aborts_batch_and_keeps_session_postgres() -> None:
         listen.close()
 
     assert result.get('error') is None, result.get('error')
-    assert remaining == 0
+    assert (remaining, reported) == (2, 2)
 
 
 def test_fractional_number_bind_postgres() -> None:
