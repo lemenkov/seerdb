@@ -3278,3 +3278,16 @@ def test_a_collection_type_is_in_the_dictionary() -> None:
         backend.commit()
     finally:
         backend.close()
+
+
+def test_raise_application_error_becomes_a_coded_raise() -> None:
+    # RAISE_APPLICATION_ERROR raises P0001 with its ORA code as the message's
+    # prefix, which the error mapping reads back (#1323); the message may itself
+    # hold parentheses, and the optional third argument is dropped.
+    out = _translate_idioms(
+        "BEGIN raise_application_error(-20101, 'Test (it)!', TRUE); END;"
+    )
+    assert out == (
+        "BEGIN RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = "
+        "'ORA-' || lpad(abs((-20101))::text, 5, '0') || ': ' || ('Test (it)!'); END;"
+    )

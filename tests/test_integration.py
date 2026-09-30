@@ -1081,6 +1081,27 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT v FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), ('123',))
 
+    def test_errors_carry_their_oracle_codes(self):
+        # Each of these fails with its own ORA code, which clients check by
+        # number; a Mirror-over-PG reported them all as ORA-00900 (#1323).
+        from seerdb.common.exceptions import DatabaseError
+
+        def code_of(sql):
+            with self.assertRaises(DatabaseError) as raised:
+                self.cur.execute(sql)
+            return raised.exception.code, str(raised.exception)
+
+        self.assertEqual(code_of('SELECT 1 / 0 FROM dual')[0], 1476)
+        self.assertEqual(code_of('BEGIN RAISE no_data_found; END;')[0], 1403)
+        code, message = code_of(
+            "BEGIN raise_application_error(-20101, 'Test (it)!'); END;"
+        )
+        self.assertEqual(code, 20101)
+        self.assertIn('Test (it)!', message)
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (a NUMBER, b NUMBER)')
+        self.assertEqual(code_of(f'INSERT INTO {self.TABLE} (a) VALUES (1, 2)')[0], 913)
+        self.assertEqual(code_of(f'INSERT INTO {self.TABLE} (a, b) VALUES (1)')[0], 947)
+
     def test_rownum_filters_the_first_rows(self):
         # ROWNUM as a top-level filter, the top-N idiom over an ordered inline
         # view, and `ROWNUM = 2`, which Oracle never satisfies (#1271).

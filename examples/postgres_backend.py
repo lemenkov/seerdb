@@ -2462,6 +2462,19 @@ _IDIOM_REWRITES = [
     # the same thing — so sidestep overload resolution rather than adding a fifth
     # candidate to it (#819).
     (re.compile(r'\bNVL\s*\(', re.IGNORECASE), 'COALESCE('),
+    # RAISE_APPLICATION_ERROR(-20101, 'Test!') -- a user error, ORA-20000..20999
+    # (#1323). PL/pgSQL has no such procedure; raise P0001 with the Oracle code as
+    # the message's prefix, which _application_error reads back into the error
+    # the client gets. A third argument (keep the error stack) has no counterpart.
+    (
+        re.compile(
+            r'\braise_application_error\s*\(\s*([^,]+?)\s*,\s*(.+?)\s*'
+            r'(?:,\s*(?:true|false)\s*)?\)\s*;',
+            re.IGNORECASE | re.DOTALL,
+        ),
+        r"RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = "
+        r"'ORA-' || lpad(abs((\1))::text, 5, '0') || ': ' || (\2);",
+    ),
     # BINARY_DOUBLE/FLOAT special values → IEEE-754 float literals.
     (
         re.compile(r'\bbinary_(?:double|float)_infinity\b', re.IGNORECASE),
@@ -3490,6 +3503,9 @@ _SQLSTATE_TO_ORA = {
     # too large for column". Unlike 22003 below, this SQLSTATE means exactly one
     # Oracle error, so the table can carry it (#1127).
     '22001': 12899,  # string_data_right_truncation -> value too large for column
+    # #1323: the codes python-oracledb's suite checks by number.
+    '22012': 1476,  # division_by_zero -> divisor is equal to zero
+    'P0002': 1403,  # no_data_found (RAISE no_data_found) -> no data found
 }
 
 
@@ -3501,7 +3517,11 @@ _SQLSTATE_TO_ORA = {
 # by Oracle version anyway (e.g. ORA-01722).
 _ORA_MESSAGE = {
     54: 'resource busy and acquire with NOWAIT specified or timeout expired',
+    913: 'too many values',
     942: 'table or view does not exist',
+    947: 'not enough values',
+    1403: 'no data found',
+    1476: 'divisor is equal to zero',
     2303: 'cannot drop or replace a type with type or table dependents',
 }
 
@@ -3521,10 +3541,43 @@ _ORA_COLUMN_PRECISION = 1438
 _ORA_NUMERIC_OVERFLOW = 1426
 
 
+# A user error raised by a translated RAISE_APPLICATION_ERROR: P0001 whose message
+# leads with its ORA code (#1323).
+_APPLICATION_ERROR = re.compile(r'ORA-(20\d{3}): (.*)', re.DOTALL)
+# An INSERT whose value list and column list disagree in length. PostgreSQL files
+# both under syntax_error (42601), which says nothing an Oracle client can use;
+# Oracle names them ORA-00913 / ORA-00947 (#1323).
+_INSERT_ARITY = (
+    ('INSERT has more expressions than target columns', 913),
+    ('INSERT has more target columns than expressions', 947),
+)
+
+
+def _primary_message(exc) -> str:
+    diag = getattr(exc, 'diag', None)
+    return getattr(diag, 'message_primary', None) or str(exc)
+
+
+def _application_error(exc) -> tuple[int, str] | None:
+    # The (code, text) of a RAISE_APPLICATION_ERROR, or None for anything else.
+    if getattr(exc, 'sqlstate', None) != 'P0001':
+        return None
+    m = _APPLICATION_ERROR.match(_primary_message(exc))
+    return (int(m.group(1)), m.group(2)) if m else None
+
+
 def _ora_code_for(exc) -> int:
     sqlstate = getattr(exc, 'sqlstate', None)
     if not isinstance(sqlstate, str):
         return _ORA_INVALID_SQL
+    application = _application_error(exc)
+    if application is not None:
+        return application[0]
+    if sqlstate == '42601':
+        primary = _primary_message(exc)
+        for text, code in _INSERT_ARITY:
+            if text in primary:
+                return code
     if sqlstate == '22003':
         diag = getattr(exc, 'diag', None)
         primary = getattr(diag, 'message_primary', None) or str(exc)
@@ -3553,6 +3606,10 @@ def _backend_error(
         and _TYPE_DDL.match(original)
     ):
         code = _ORA_TYPE_HAS_DEPENDENTS
+    application = _application_error(exc)
+    if application is not None:
+        # The user's own text, which the Mirror prefixes with the code.
+        return BackendError(application[1], ora_code=code, error_offset=None)
     return BackendError(
         _ORA_MESSAGE.get(code, str(exc).strip()),
         ora_code=code,
