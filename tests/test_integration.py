@@ -1465,6 +1465,28 @@ class CursorIntegration(_IntegrationBase):
         if os.environ.get('SEERDB_TEST_MIRROR') == 'postgres':
             self.assertEqual(rows, {'open_cursors': '300', 'db_domain': None})
 
+    def test_v_database_names_the_database(self):
+        # V$DATABASE names the database. On the Mirror over PostgreSQL that is the
+        # backend database, upper-cased, as the login reports it as db_name
+        # (#1354). Reading the V$ views takes a privilege the test user may lack;
+        # 8i has no DB_UNIQUE_NAME, so the test reads the columns every version has.
+        from seerdb.common.exceptions import DatabaseError
+
+        try:
+            self.cur.execute('SELECT name, dbid FROM v$database')
+        except DatabaseError as exc:
+            if exc.code == 942 and os.environ.get('SEERDB_TEST_MIRROR') != 'postgres':
+                self.skipTest('the test user cannot read V$DATABASE')
+            raise
+        rows = self.cur.fetchall()
+        self.assertEqual(len(rows), 1)
+        name, dbid = rows[0]
+        self.assertTrue(name)
+        self.assertGreater(dbid, 0)
+        dbname = re.search(r'dbname=(\S+)', os.environ.get('MIRROR_PG', ''))
+        if os.environ.get('SEERDB_TEST_MIRROR') == 'postgres' and dbname:
+            self.assertEqual(name, dbname.group(1).upper())
+
     def test_v_sesstat_counts_the_round_trips(self):
         # Another session reads this one's round trips from V$SESSTAT, one per
         # call, as Oracle counts them (#1324). Reading the V$ views takes a
