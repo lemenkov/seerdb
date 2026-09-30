@@ -1503,10 +1503,12 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
         'ora_ltz_add_days',
         'ora_tstz_add_days',
         'ora_div',
+        'power',
     ):
         assert f'FUNCTION {name}(' in _HELPER_FUNCTIONS_DDL
-    # 47, and ora_div for each of the nine pairs of integer types (#1361).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 56
+    # 47, and ora_div (#1361) and power (#1362) for each of the nine pairs of
+    # integer types.
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 65
     # Oracle's conversion functions orafce lacks, one overload per argument
     # type a caller passes.
     for name in (

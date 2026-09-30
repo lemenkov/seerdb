@@ -1092,6 +1092,15 @@ class TypesIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.fetchone(), (1.5, 1.5, 2, 3.5, 1.5))
 
+    def test_power_of_integers_is_exact(self):
+        # Oracle's POWER of NUMBERs is exact, to all 20 digits of 143 ** 9, from
+        # literals or binds (#1362).
+        self.cur.execute(
+            'SELECT POWER(143, 9), POWER(38, 12), POWER(2, -1), POWER(:1, :2) FROM dual',
+            [10, 20],
+        )
+        self.assertEqual(self.cur.fetchone(), (143**9, 38**12, 0.5, 10**20))
+
     def test_a_query_casts_to_oracle_types(self):
         # CAST to an Oracle type inside a query, not only in DDL; a type no one
         # knows is ORA-00902, not a missing table (#1329); 8i reads such a cast as

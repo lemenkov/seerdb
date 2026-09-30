@@ -574,6 +574,18 @@ _HELPER_FUNCTIONS_DDL = (
         for left in ('smallint', 'integer', 'bigint')
         for right in ('smallint', 'integer', 'bigint')
     )
+    # POWER of two integers (#1362): PostgreSQL has power() for numeric and for
+    # double precision only, and resolves two integers to the double precision
+    # one, so POWER(143, 9) lost its low digits. Oracle's POWER of NUMBERs is
+    # exact. An overload for each pair of integer types is an exact match, found
+    # before either of those, and takes the numeric one.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION power({base}, {exponent}) RETURNS numeric '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        '$$ SELECT pg_catalog.power($1::numeric, $2::numeric) $$;'
+        for base in ('smallint', 'integer', 'bigint')
+        for exponent in ('smallint', 'integer', 'bigint')
+    )
 )
 
 
