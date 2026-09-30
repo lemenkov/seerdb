@@ -2360,7 +2360,6 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(insert, ['0A0B', raw])
         self.cur.execute(insert, ['42', number])
         self.assertEqual((raw.getvalue(), number.getvalue()), ([b'\n\x0b'], [42]))
-        # A fresh variable each: 8i cannot reuse a RETURNING one yet (#1390).
         for value, typ, code in (
             ('not hex', seerdb.DB_TYPE_RAW, 1465),
             ('not a number', seerdb.NUMBER, 1722),
@@ -2376,6 +2375,18 @@ class CursorIntegration(_IntegrationBase):
             f'UPDATE {self.TABLE} SET v = v WHERE id = 99 RETURNING v INTO :1', [none]
         )
         self.assertEqual(self.cur.rowcount, 0)
+
+    def test_a_returning_variable_can_be_used_again(self):
+        # The variable that received one RETURNING receives the next. On 8i the
+        # client sent the list it held as the next execute's input and could not
+        # encode it (#1390).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, v VARCHAR2(40))')
+        got = self.cur.var(str, 40)
+        insert = f'INSERT INTO {self.TABLE} (id, v) VALUES (:1, :2) RETURNING v INTO :3'
+        self.cur.execute(insert, [1, 'first', got])
+        self.assertEqual(got.getvalue(), ['first'])
+        self.cur.execute(insert, [2, 'second', got])
+        self.assertEqual(got.getvalue(), ['second'])
 
     def test_failing_array_returning_raises_cleanly(self):
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER NOT NULL, v NUMBER)')

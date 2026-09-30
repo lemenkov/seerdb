@@ -640,12 +640,30 @@ def returning_block_request(Query: str, Bind: list) -> tuple[str, list]:
 
     Returns the wrapped SQL and the bind list with one appended OUT bind that
     receives ``SQL%ROWCOUNT``; :func:`returning_block_result` takes it back out.
+
+    Each INTO target goes in as an empty copy of its variable. It only
+    receives, but the block's binds say IN OUT for a variable that holds a
+    value -- and one that received from an earlier RETURNING holds the LIST of
+    returned values, which 8i then tried to send as its input and could not
+    encode (#1390). The values still land in the caller's variable: they are
+    assigned through the caller's own bind list.
     """
+    import copy
+
     from seerdb.common.datatypes import Var
-    from seerdb.common.sqltext import wrap_returning_in_block
+    from seerdb.common.sqltext import returning_bind_positions, wrap_returning_in_block
 
     Wrapped, _Name = wrap_returning_in_block(Query)
-    return Wrapped, list(Bind) + [Var(int)]
+    Targets = returning_bind_positions(Query, len(Bind))
+    Block = []
+    for Pos, Value in enumerate(Bind):
+        if Pos in Targets and isinstance(Value, Var):
+            Value = copy.copy(Value)
+            Value._value = [] if Value.is_array else None
+            Value.has_value = False
+            Value._iteration_values = None
+        Block.append(Value)
+    return Wrapped, Block + [Var(int)]
 
 
 def returning_block_result(Result, NumBinds: int):
