@@ -274,6 +274,15 @@ def test_a_whole_lob_call_item_is_a_lob_column() -> None:
     assert _computed_column_types("INSERT INTO t VALUES (to_clob('a'))") == {}
 
 
+def test_delete_without_from_gains_it() -> None:
+    # Oracle's `DELETE t` is PostgreSQL's `DELETE FROM t` (#1407); a DELETE that
+    # has its FROM, and a word that merely starts with delete, are left alone.
+    assert _translate_idioms('DELETE t WHERE n = 1') == 'DELETE FROM t WHERE n = 1'
+    assert _translate_idioms('delete /*+ x */ "T"') == 'delete /*+ x */ FROM "T"'
+    assert _translate_idioms('DELETE FROM t') == 'DELETE FROM t'
+    assert _translate_idioms('SELECT deleted FROM t') == 'SELECT deleted FROM t'
+
+
 def test_deref_becomes_a_parenthesised_sys_deref() -> None:
     assert _translate_idioms('SELECT id, DEREF(r).name FROM t') == (
         'SELECT id, (sys.deref(r)).name FROM t'

@@ -2538,6 +2538,13 @@ _IDIOM_REWRITES = [
     # call sites resolve directly and need no rewrite here. TO_CHAR,
     # TO_DATE, ADD_MONTHS, INSTR, … come from the orafce extension the same way.
     # Only bare pseudo-constants and literal / clause shapes remain below.)
+    # DELETE without FROM (#1407): Oracle takes `DELETE t [WHERE ...]`, PostgreSQL
+    # only `DELETE FROM t`. Anchored at the statement's start, after an optional
+    # hint, and only where a table name follows.
+    (
+        re.compile(r'(?is)^(\s*DELETE(?:\s+/\*.*?\*/)?)\s+(?!FROM\b)(?=[\w"])'),
+        r'\1 FROM ',
+    ),
     # NVL is the exception: orafce offers four overloads — nvl(anyelement,
     # anyelement), nvl(bigint, integer), nvl(integer, integer) and nvl(numeric,
     # integer) — and a PostgreSQL literal starts out as `unknown`, so a call with
