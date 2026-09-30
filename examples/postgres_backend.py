@@ -145,6 +145,7 @@ from seerdb.common.sqltext import (
     bind_placeholders,
     is_plsql,
     returning_bind_positions,
+    strip_non_bind_text,
     strip_returning_into,
 )
 from seerdb.common.tns import _AUTH_MAX_OPEN_CURSORS
@@ -3532,6 +3533,8 @@ def _hoist_local_functions(sql: str) -> str | None:
 # or BEGIN :r := name(:a, :b); END;
 _CALL_BLOCK = re.compile(r'(?is)^\s*BEGIN\s+(.*?)\s*;?\s*END\s*;?\s*$')
 _FUNC_CALL = re.compile(r'(?is)^\s*:(\d+)\s*:=\s*([\w.]+)\s*\((.*)\)\s*$')
+# A numbered placeholder, `:3` -- not the second colon of `::`.
+_NUMBERED_BIND = re.compile(r'(?<!:):(\d+)')
 # A named argument in a call's list: `name => value`.
 _NAMED_ARGUMENT = re.compile(r'(?is)^\s*(\w+)\s*=>')
 # One argument of a call: a bind, by position or by name (`:3`, `a_x => :3`).
@@ -3554,6 +3557,21 @@ def _call_arguments(args: str) -> list[tuple[str | None, int]] | None:
         name = match.group(1)
         arguments.append((name.lower() if name else None, int(match.group(2))))
     return arguments
+
+
+def _bind_slots(block: str) -> dict[int, int]:
+    """Each numbered placeholder of a block -> the bind value it takes.
+
+    A client sends a block's bind values one per distinct placeholder, in the
+    order the placeholders first appear, whatever their numbers say:
+    `p(:3, c => :1)` takes the first value for `:3` (measured on 8i to 23ai).
+    Reading `:N` as the Nth value gave such a call the wrong values (#1380).
+    Comments and literals are skipped, as for any placeholder scan.
+    """
+    slots: dict[int, int] = {}
+    for match in _NUMBERED_BIND.finditer(strip_non_bind_text(block)):
+        slots.setdefault(int(match.group(1)), len(slots))
+    return slots
 
 
 def _call_placeholders(arguments: Sequence[tuple[str | None, int]]) -> str:
@@ -6168,14 +6186,15 @@ class PostgresBackend:
         arguments = _call_arguments(args)
         if arguments is None:
             arguments = [(None, int(r)) for r in re.findall(r':(\d+)', args)]
-        arg_values = [values[ref - 1] for _name, ref in arguments]
+        slots = _bind_slots(block)
+        arg_values = [values[slots.get(ref, ref - 1)] for _name, ref in arguments]
         cursor = self._conn.cursor()
         cursor.execute(
             f'SELECT {name}({_call_placeholders(arguments)})', tuple(arg_values) or None
         )
         row = _decode_row(cursor, cursor.fetchone(), self._tstz_oid)
         out = list(values)
-        out[int(ret_ref) - 1] = row[0] if row else None
+        out[slots.get(int(ret_ref), int(ret_ref) - 1)] = row[0] if row else None
         return Result(out_binds=out)
 
     def _call_procedure(self, match: 're.Match', values: list, block: str) -> Result:
@@ -6188,6 +6207,7 @@ class PostgresBackend:
         refused = _call_argument_error(block, name, args, parameters or None)
         if refused is not None:
             raise refused
+        slots = _bind_slots(block)
         # Which parameter each argument binds: by position, or by name (#1377). A
         # named argument the signature cannot place, or an argument that is not a
         # plain bind, leaves the call positional, as it always was.
@@ -6208,7 +6228,7 @@ class PostgresBackend:
         arg_values = [
             None
             if modes and param < len(modes) and modes[param] == 'o'
-            else values[ref - 1]
+            else values[slots.get(ref, ref - 1)]
             for param, ref in bound.items()
         ]
         cursor = self._conn.cursor()
@@ -6235,7 +6255,7 @@ class PostgresBackend:
                 and argtypes[param] == self._intervalym_oid
             ):
                 value = _to_interval_ym(value)
-            out[ref - 1] = value
+            out[slots.get(ref, ref - 1)] = value
         return Result(out_binds=out)
 
     def _decode_out_row(self, cursor, row) -> list:

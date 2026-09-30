@@ -38,6 +38,7 @@ from postgres_backend import (  # noqa: E402
     PostgresBackend,
     _backend_error,
     _bc_date_loader,
+    _bind_slots,
     _call_argument_error,
     _call_arguments,
     _computed_lob_columns,
@@ -274,6 +275,17 @@ def test_deref_becomes_a_parenthesised_sys_deref() -> None:
     assert _translate_idioms('SELECT DEREF(:1).name FROM dual') == (
         'SELECT (sys.deref(:1)).name FROM dual'
     )
+
+
+def test_numbered_placeholders_take_values_in_order_of_appearance() -> None:
+    # A block's bind values fill its placeholders in the order they first
+    # appear, whatever their numbers (#1380); a repeat, a `::` cast and a
+    # literal or comment are no new placeholder.
+    assert _bind_slots('BEGIN p(:3, c => :1, b => :2); END;') == {3: 0, 1: 1, 2: 2}
+    assert _bind_slots("BEGIN :2 := f(:1, :2, ':9', x::int); -- :8\nEND;") == {
+        2: 0,
+        1: 1,
+    }
 
 
 def test_call_arguments_keep_their_names() -> None:
