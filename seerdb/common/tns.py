@@ -2004,6 +2004,7 @@ def encode_fetch_response(
 
 
 from seerdb.common.tns_consts import (
+    TNS_BIND_DIR_INPUT_OUTPUT,
     TNS_BIND_DIR_OUTPUT,
     TNS_FETCH_ORIENTATION_FIRST,
     TNS_FETCH_ORIENTATION_LAST,
@@ -3182,8 +3183,10 @@ def encode_out_bind_response_thin(
     server reported for each (16 OUT, 32 IN, 48 IN OUT), which a backend can only
     know by asking one -- the wire carries no direction on the way in. Given
     them, an IN bind is reported IN and carries NO value, as a real server does;
-    without them every bind is marked OUT and returns its value, which is what
-    the Mirror did for every block before (#1064). The client keeps only the
+    without them every bind is marked IN OUT and returns its value (#1064). Not
+    OUT: a client re-executing the block sends no value for a bind it was told
+    is pure OUT, and a bind that also took one input then ran NULL (#1363). IN
+    OUT loses nothing -- a pure-OUT bind just sends a NULL. The client keeps only the
     positions it bound as a ``Var`` (``_assign_out_binds``). A scalar rides as a DALC + ub4 return code; a REF
     CURSOR rides as its inline describe + cursor id. The IOV header mirrors what
     ``_read_iov`` decodes: a flag, the bind count (num_requests + num_iters*256),
@@ -3211,7 +3214,7 @@ def _encode_iov_header(count: int, directions: Sequence[int], iterations: int) -
         + encode_sb4(0)  # fast-fetch bit vector length
         + encode_sb4(0)  # rowid length
         + bytes(
-            directions[i] if i < len(directions) else TNS_BIND_DIR_OUTPUT
+            directions[i] if i < len(directions) else TNS_BIND_DIR_INPUT_OUTPUT
             for i in range(count)
         )  # direction per bind
     )

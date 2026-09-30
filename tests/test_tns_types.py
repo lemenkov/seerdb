@@ -1030,7 +1030,7 @@ class TestObjectMetadataReply(unittest.TestCase):
         # Re-read the reply: the second bind must decode as 'tail', proving the
         # REF CURSOR trailer did not steal a byte.
         directions, out_values, _ = _read_iov(reply, [RefCur(), None])
-        self.assertEqual(directions, [16, 16])
+        self.assertEqual(directions, [48, 48])
         self.assertTrue(out_values[0].get('_refcursor'))
         self.assertEqual(out_values[0]['cursor_id'], 7)
         self.assertEqual(out_values[1], b'tail')
