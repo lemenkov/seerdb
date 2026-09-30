@@ -4056,6 +4056,21 @@ _ORACLE_RESERVED_WORDS = frozenset(
     'TABLE THEN TO TRIGGER UID UNION UNIQUE UPDATE USER VALIDATE VALUES VARCHAR '
     'VARCHAR2 VIEW WHENEVER WHERE WITH'.split()
 )
+
+
+def _refuse_reserved_bind_names(sql: str) -> None:
+    # Oracle refuses a bind named by a reserved word, `:ROWID` say, with
+    # ORA-01745 -- at parse and at execute alike, a query's parse included, which
+    # is described by running it (#1371). PostgreSQL has no such rule, and the
+    # ROWID pseudo-column rewrite turned such a bind into a syntax error.
+    for name, quoted in bind_placeholders(sql, dedupe=True):
+        if not quoted and name.upper() in _ORACLE_RESERVED_WORDS:
+            raise BackendError(
+                'invalid host/bind variable name',
+                ora_code=ORA_INVALID_BIND_VARIABLE_NAME,
+            )
+
+
 # The statements PostgreSQL's EXPLAIN does not take; a parse of one is answered
 # as before, with a bare success.
 _NOT_EXPLAINABLE = re.compile(
@@ -4617,12 +4632,7 @@ class PostgresBackend:
         and keep the bare success they had.
         """
         sql = _strip_leading_comments(sql)
-        for name, quoted in bind_placeholders(sql, dedupe=True):
-            if not quoted and name.upper() in _ORACLE_RESERVED_WORDS:
-                raise BackendError(
-                    'invalid host/bind variable name',
-                    ora_code=ORA_INVALID_BIND_VARIABLE_NAME,
-                )
+        _refuse_reserved_bind_names(sql)
         if is_plsql(sql) or _NOT_EXPLAINABLE.match(sql):
             return
         translated = _translate_idioms(
@@ -4680,6 +4690,7 @@ class PostgresBackend:
         # values (#503). An ordinary statement's BindVar is a typed NULL, which
         # _translate_binds casts (#699).
         sql = _strip_leading_comments(sql)
+        _refuse_reserved_bind_names(sql)
         transaction_control = self._execute_transaction_control(sql)
         if transaction_control is not None:
             return transaction_control
