@@ -38,6 +38,7 @@ from postgres_backend import (  # noqa: E402
     PostgresBackend,
     _backend_error,
     _bc_date_loader,
+    _call_argument_error,
     _computed_lob_columns,
     _distinct_bind_refs,
     _iot_primary_key,
@@ -272,6 +273,39 @@ def test_deref_becomes_a_parenthesised_sys_deref() -> None:
     assert _translate_idioms('SELECT DEREF(:1).name FROM dual') == (
         'SELECT (sys.deref(:1)).name FROM dual'
     )
+
+
+def test_a_call_argument_list_oracle_would_not_compile_is_ora_06550() -> None:
+    # A name given twice (PLS-00703), or more arguments than the routine has
+    # parameters (PLS-00306), is Oracle's compile error at the routine's name,
+    # never an IndexError that ends the session (#1368).
+    block = 'begin proc_Test(:1, :2, a_InValue => :3, a_OutValue => :4); end;'
+    params = ['a_invalue', 'a_inoutvalue', 'a_outvalue']
+    # a_InValue is the first positional argument AND named, as python-oracledb's
+    # callproc('proc_Test', ('hi', 5), {'a_InValue': 'hi', ...}) sends it; 23ai
+    # answers PLS-00703 although there is one argument too many as well.
+    twice = _call_argument_error(
+        block, 'proc_Test', ':1, :2, a_InValue => :3, a_OutValue => :4', params
+    )
+    assert twice is not None and twice.ora_code == 6550
+    assert twice.ora_message == (
+        'ORA-06550: line 1, column 7:\n'
+        'PLS-00703: multiple instances of named argument in list'
+    )
+    extra = _call_argument_error(
+        'BEGIN\n  pkg.p(:1, :2); END;', 'pkg.p', ':1, :2', ['a']
+    )
+    assert extra is not None and extra.ora_message == (
+        'ORA-06550: line 2, column 3:\n'
+        "PLS-00306: wrong number or types of arguments in call to 'P'"
+    )
+    # A call Oracle accepts, and one whose signature is unknown, pass.
+    assert (
+        _call_argument_error(block, 'proc_Test', ':1, a_outvalue => :2', params) is None
+    )
+    assert _call_argument_error(block, 'proc_Test', ':1, :2, :3, :4', None) is None
+    # With no signature, two named arguments of one name are still caught.
+    assert _call_argument_error(block, 'f', 'a => :1, A => :2', None) is not None
 
 
 def test_dbms_debug_jdwp_calls_gain_their_parentheses() -> None:
