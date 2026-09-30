@@ -2880,12 +2880,16 @@ bigfile marker **1024**, the column **0**. So the same row prints `…AQAAAD…`
 `lastrowid` and `…AAAAAD…` as a fetched ROWID or through `ROWIDTOCHAR`, and the
 server accepts either back (`WHERE ROWID = :1` finds the row with both).
 python-oracledb reports exactly the same pair, so compare rowids by the row they
-name, never as strings. Measured on 23ai.
+name, never as strings. Status tokens do not even agree among themselves: a
+DELETE's carries the relative file as **0** where the INSERT of the same row
+carried **1024** (#1079), so compare by data object, block and slot. Measured on
+23ai.
 
 The Mirror writes these fields from the backend's `Result.last_rowid` (its
 printable form, parsed back by `string_to_rowid`); a backend with no Oracle
-rowids leaves them zero (#1077). The fv2 short status (8i / 9i) is read for the
-row count and code only, so `lastrowid` is `None` there (#1079).
+rowids leaves them zero (#1077). 8i and 9i carry the rowid in their short status
+too, in the same fields (§19.3, §19.12); unlike 10g+, a statement that touched
+nothing leaves the previous rowid there rather than zeroing the block (#1079).
 
 **Common error codes**:
 - `0`: Success.
@@ -4945,6 +4949,27 @@ the short OER whose **first field is the affected-row count** (ORA code 0 =
 success). 9i's parse carries no autocommit bit, so the client issues an explicit
 `TTI_COMMIT` when autocommit is on (verified to persist on 9.2.0.4).
 
+The short OER is the 10g+ one (§ "Rowid → `lastrowid`") **without its first two
+fields** (call status, end-to-end sequence number). After the token: row count,
+ORA code, two array-error fields, cursor id and error position (a `ub4` each),
+six single bytes (the first is the SQL command type: `02` INSERT, `06` UPDATE,
+`07` DELETE, `09` CREATE INDEX, …), then the **touched row's rowid** in the
+same fields as 10g+: `ub4` data object, `ub4` relative file, one reserved byte,
+`ub4` block, `ub4` slot (#1079). Captured on 9.2.0.4, a one-row INSERT (object
+91683, file 1, block 47378, slot 2):
+
+```
+08 01 02 04 01 95 59 43 00          RPA (count 2: the counter, 0)
+04 01 01 00 00 00 01 01 01 0c       OER: rows 1, ORA 0, 0, 0, cursor 1, errpos 12
+02 00 00 00 00 00                   command type INSERT + five flag bytes
+03 01 66 23 01 01 00 02 b9 12 01 02 rowid: object, file, reserved, block, slot
+…                                   (a fixed-width copy of the rowid follows)
+```
+
+The server does **not** clear the field: a DDL, or a DML that touched no row,
+carries the previous statement's rowid. Its row count is 0, which is how the
+client drops it, exactly as it does for 10g+ (#1078).
+
 `RETURNING ... INTO` cannot be carried in this form: the 9.2 server answers
 `ORA-00439: feature not enabled: RETURNING clause from this client type`, and
 the 8i OALL8 form (§19.12) returns no value and drops the connection when the
@@ -5372,6 +5397,16 @@ piggyback (a fixed 23 bytes) then the OER, whose first field after the token is
 the **affected-row count as a little-endian `ub4`** — 8i is x86/Windows, so the
 count rides native-endian (300 = `2c 01 00 00`). A server error is surfaced from
 the trailing `ORA-NNNNN: ...` text (the binary OER layout differs from 9i's).
+
+The rest of that OER holds **the same fields as 9i's short status, at fixed
+widths and little-endian**: row count `ub4`, then a `ub2` each for the ORA code,
+the two array-error fields, cursor id, error position and SQL command type, four
+single bytes, and the touched row's rowid 21 bytes after the token — `ub4` data
+object, `ub2` file, one reserved byte, `ub4` block, `ub2` slot (#1079). Captured
+on 8.1.7 (object 73009, file 5, block 207, slot 2):
+`… 04 01 00 00 00 … 02 00 00 00 00 00 31 1d 01 00 05 00 00 cf 00 00 00 02 00 …`.
+As on 9i, a statement that touched no row leaves the previous rowid in place,
+and the zero row count drops it.
 
 **COMMIT / ROLLBACK** have no modern `TTI_COMMIT` / `TTI_ROLLBACK` on 8i; they
 ride the OALL8 as ordinary statements (type `0`). Encoder: `encode_8i_oall8_dml`
