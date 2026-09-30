@@ -150,6 +150,7 @@ from seerdb.common.sqltext import (
     returning_bind_positions,
     strip_returning_into,
 )
+from seerdb.common.tns import _AUTH_MAX_OPEN_CURSORS
 from seerdb.common.tns_consts import (
     FIELD_VERSION_12_1,
     TNS_TYPE_ADT,
@@ -1043,6 +1044,16 @@ _ORACLE_DICTIONARY_DDL = (
     'sys.ora_serial(a.pid) AS "serial#", s.driver AS client_driver '
     'FROM pg_stat_activity a LEFT JOIN sys.ora_sessions s ON s.pid = a.pid '
     "WHERE a.datname = current_database() AND a.backend_type = 'client backend';"
+    # v$parameter (#1353): the instance parameters a client can also read off its
+    # login, from the same sources, so the two never disagree -- open_cursors is
+    # the AUTH_MAX_OPEN_CURSORS the Mirror reports, db_domain the backend's
+    # SessionInfo.db_domain, which this backend leaves unset. Oracle's type codes:
+    # 2 for a string, 3 for an integer.
+    'CREATE OR REPLACE VIEW sys."v$parameter" AS SELECT p.name::text AS name, '
+    'p.type::integer AS type, p.value::text AS value, '
+    "p.value::text AS display_value, 'TRUE'::text AS isdefault FROM (VALUES "
+    f"('open_cursors', 3, '{_AUTH_MAX_OPEN_CURSORS}'), "
+    "('db_domain', 2, NULL)) AS p(name, type, value);"
     # v$statname / v$sesstat (#1324): the sessions' statistics, which only the
     # Mirror can count (seerdb.server.stats). v$statname names the ones it keeps,
     # numbered as 23ai numbers them. sys.ora_sesstat() unpacks a snapshot of

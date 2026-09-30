@@ -1443,6 +1443,28 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id, v FROM {self.TABLE} ORDER BY id')
         self.assertEqual(self.cur.fetchall(), [(1, 'n+2'), (2, 'n++4'), (3, 'n+++6')])
 
+    def test_v_parameter_names_the_instance_parameters(self):
+        # V$PARAMETER answers open_cursors and db_domain. On the Mirror over
+        # PostgreSQL they are what its login reports -- AUTH_MAX_OPEN_CURSORS
+        # (300) and no domain -- which a client compares them with (#1353).
+        # Reading the V$ views takes a privilege the test user may lack.
+        from seerdb.common.exceptions import DatabaseError
+
+        try:
+            self.cur.execute(
+                'SELECT name, value FROM v$parameter WHERE name IN '
+                "('open_cursors', 'db_domain') ORDER BY name"
+            )
+        except DatabaseError as exc:
+            if exc.code == 942 and os.environ.get('SEERDB_TEST_MIRROR') != 'postgres':
+                self.skipTest('the test user cannot read V$PARAMETER')
+            raise
+        rows = dict(self.cur.fetchall())
+        self.assertEqual(set(rows), {'db_domain', 'open_cursors'})
+        self.assertGreater(int(rows['open_cursors']), 0)
+        if os.environ.get('SEERDB_TEST_MIRROR') == 'postgres':
+            self.assertEqual(rows, {'open_cursors': '300', 'db_domain': None})
+
     def test_v_sesstat_counts_the_round_trips(self):
         # Another session reads this one's round trips from V$SESSTAT, one per
         # call, as Oracle counts them (#1324). Reading the V$ views takes a
