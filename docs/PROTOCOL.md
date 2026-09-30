@@ -1695,7 +1695,8 @@ invalid length for DATE or NUMBER bind variable`. seerdb widens such a column to
 the 11-byte form for every row before sizing the OAC (#1098); the values are
 unchanged, and a DATE column still truncates the sub-second part server-side.
 Aware values are left alone -- widening one would mean inventing a zone for the
-others.
+others. This concerns binds whose type
+comes from their values; a bind *declared* TIMESTAMP / LTZ follows §11.4b.
 
 **LONG-class binds come last** (#705). The server takes a character or RAW bind
 in place only up to its *maximum string size*: 32767 bytes when its runtime
@@ -3193,6 +3194,24 @@ complaint and **silently drops the fractional seconds** — `22:30:02.5` arrives
 as `22:30:02` with no error anywhere (seerdb#826). A `datetime`'s `tzinfo`, if
 any, is discarded rather than applied: the wall clock is already session-local
 by the time it reaches the wire.
+
+### 11.4b A declared TIMESTAMP / LTZ bind with no fractional seconds
+
+In the **bind** direction the width of a TIMESTAMP or TIMESTAMP WITH LOCAL TIME
+ZONE value is not fixed by its descriptor. A value whose fractional seconds are
+zero goes out in the **7-byte DATE form** under the 11-byte descriptor, and only
+a value with a fraction takes the 11-byte form. The reference thin client does
+exactly this, and its encoder says the protocol requires it.
+
+The two forms of the same instant are **not** read alike by the server. Measured
+live on 10g, 11g, 21c and 23ai (#1337): with a bind declared
+`TIMESTAMP WITH LOCAL TIME ZONE` and the session in the database's zone,
+`WHERE trunc(ltz_column) = :midnight` matches the row when `:midnight` arrives
+as 7 bytes and matches **nothing** when it arrives as 11 bytes with a zero
+fraction. Yet `DUMP` and `TO_CHAR` of the bind show the same value either way.
+seerdb therefore strips a zero fraction from a declared TIMESTAMP / LTZ bind.
+DATE stays 7 bytes and WITH TIME ZONE 13. The **row** direction (a server or
+the Mirror encoding a column value) keeps the fixed 11-byte form of §11.4a.
 
 ### 11.5 INTERVAL YEAR TO MONTH
 
