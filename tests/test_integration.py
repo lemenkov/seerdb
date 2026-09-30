@@ -1081,6 +1081,29 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT v FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), ('123',))
 
+    def test_a_query_casts_to_oracle_types(self):
+        # CAST to an Oracle type inside a query, not only in DDL; a type no one
+        # knows is ORA-00902, not a missing table (#1329); 8i reads such a cast as
+        # one to a collection it cannot find (ORA-22907). BINARY_DOUBLE and
+        # BINARY_FLOAT arrived in 10g.
+        from seerdb.common.exceptions import DatabaseError
+
+        self.cur.execute(
+            "SELECT CAST(:1 AS NUMBER(15)), 'n=' || CAST(NULL AS NUMBER) FROM dual",
+            [42],
+        )
+        self.assertEqual(self.cur.fetchone(), (42, 'n='))
+        if self.conn.field_version >= FIELD_VERSION_10_2:
+            self.cur.execute(
+                'SELECT CAST(1.5 AS BINARY_DOUBLE), CAST(2.5 AS BINARY_FLOAT) FROM dual'
+            )
+            self.assertEqual(self.cur.fetchone(), (1.5, 2.5))
+        with self.assertRaises(DatabaseError) as caught:
+            self.cur.execute('SELECT CAST(1 AS no_such_type) FROM dual')
+        self.assertEqual(
+            caught.exception.code, 22907 if _conn_is_8i(self.conn) else 902
+        )
+
     def test_errors_carry_their_oracle_codes(self):
         # Each of these fails with its own ORA code, which clients check by
         # number; a Mirror-over-PG reported them all as ORA-00900 (#1323).

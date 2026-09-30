@@ -2620,6 +2620,17 @@ _IDIOM_REWRITES = [
     (re.compile(r'\bNVARCHAR2\b', re.IGNORECASE), 'varchar'),
     (re.compile(r'\bVARCHAR2\b', re.IGNORECASE), 'varchar'),
     (re.compile(r'\(\s*(\d+)\s+(?:CHAR|BYTE)\s*\)', re.IGNORECASE), r'(\1)'),
+    # A CAST to an Oracle numeric or raw type in DML (CAST(:1 AS NUMBER(15))),
+    # which PostgreSQL does not know (#1329). Anchored to `AS` and, for the types
+    # that are not reserved words, to the cast's closing parenthesis, so an alias
+    # is left alone.
+    (re.compile(r'\bAS\s+NUMBER\b', re.IGNORECASE), 'AS numeric'),
+    (re.compile(r'\bAS\s+RAW\s*(?:\(\s*\d+\s*\))?', re.IGNORECASE), 'AS bytea'),
+    (re.compile(r'\bAS\s+BINARY_FLOAT(?=\s*\))', re.IGNORECASE), 'AS real'),
+    (
+        re.compile(r'\bAS\s+BINARY_DOUBLE(?=\s*\))', re.IGNORECASE),
+        'AS double precision',
+    ),
 ]
 
 
@@ -3594,6 +3605,7 @@ _SQLSTATE_TO_ORA = {
 _ORA_MESSAGE = {
     54: 'resource busy and acquire with NOWAIT specified or timeout expired',
     913: 'too many values',
+    902: 'invalid datatype',
     942: 'table or view does not exist',
     947: 'not enough values',
     1403: 'no data found',
@@ -3668,6 +3680,10 @@ def _ora_code_for(exc) -> int:
 # for other objects, so it maps only for a type statement.
 _TYPE_DDL = re.compile(r'\s*(?:CREATE\s+OR\s+REPLACE|DROP)\s+TYPE\b', re.IGNORECASE)
 _ORA_TYPE_HAS_DEPENDENTS = 2303
+# A type PostgreSQL does not know. Dropping one is Oracle's missing-object case,
+# which the ORA-00942 of _SQLSTATE_TO_ORA answers; anywhere else -- a CAST, a
+# column -- it is Oracle's ORA-00902 invalid datatype (#1329).
+_DROP_STATEMENT = re.compile(r'\s*DROP\b', re.IGNORECASE)
 
 
 def _backend_error(
@@ -3682,6 +3698,13 @@ def _backend_error(
         and _TYPE_DDL.match(original)
     ):
         code = _ORA_TYPE_HAS_DEPENDENTS
+    if (
+        getattr(exc, 'sqlstate', None) == '42704'
+        and original is not None
+        and not _DROP_STATEMENT.match(original)
+        and _primary_message(exc).startswith('type "')
+    ):
+        code = _ORA_INVALID_DATATYPE
     application = _application_error(exc)
     if application is not None:
         # The user's own text, which the Mirror prefixes with the code.
