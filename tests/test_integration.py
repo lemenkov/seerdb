@@ -4414,6 +4414,19 @@ class ParseIntegration(_IntegrationBase):
             )
         self.assertEqual(ctx.exception.code, 1745)  # ORA-01745
 
+    def test_a_query_with_a_reserved_bind_name_is_ora_01745(self):
+        # A query's bind named by a reserved word is refused as a DML's is, at
+        # parse and at execute. The Mirror over PostgreSQL turned `:ROWID` in a
+        # select list into its ROWID rewrite, a syntax error (#1371).
+        with self.assertRaises(seerdb.DatabaseError) as executed:
+            self.cur.execute('SELECT :ROWID FROM dual', [1])
+        self.assertEqual(executed.exception.code, 1745)
+        if self._pre10():
+            return  # cursor.parse() needs 10g+
+        with self.assertRaises(seerdb.DatabaseError) as parsed:
+            self.cur.parse('SELECT :ROWID FROM dual')
+        self.assertEqual(parsed.exception.code, 1745)
+
     def test_parse_reports_a_statement_that_is_not_sql(self):
         if self._pre10():
             self.skipTest('cursor.parse() needs 10g+')
