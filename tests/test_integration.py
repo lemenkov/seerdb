@@ -1116,6 +1116,32 @@ class TypesIntegration(_IntegrationBase):
         finally:
             self.cur.execute('DROP PROCEDURE pyo_p1377')
 
+    def test_positional_binds_follow_the_placeholders_order(self):
+        # A list of bind values fills a block's placeholders in the order they
+        # appear, whatever their numbers: `p(:3, c => :1, b => :2)` takes its
+        # first value for :3. The Mirror over PostgreSQL read `:N` as the Nth
+        # value (#1380).
+        self.cur.execute(
+            'CREATE OR REPLACE PROCEDURE pyo_p1380 '
+            '(a IN NUMBER, b IN OUT NUMBER, c OUT NUMBER) AS '
+            'BEGIN b := b + a; c := a * 10; END;'
+        )
+        self.cur.execute(
+            'CREATE OR REPLACE FUNCTION pyo_f1380 (x IN NUMBER) RETURN NUMBER AS '
+            'BEGIN RETURN x + 1; END;'
+        )
+        try:
+            b, c = self.cur.var(seerdb.NUMBER), self.cur.var(seerdb.NUMBER)
+            b.setvalue(0, 5)
+            self.cur.execute('BEGIN pyo_p1380(:3, c => :1, b => :2); END;', [2, c, b])
+            self.assertEqual((b.getvalue(), c.getvalue()), (7, 20))
+            ret = self.cur.var(seerdb.NUMBER)
+            self.cur.execute('BEGIN :2 := pyo_f1380(:1); END;', [ret, 41])
+            self.assertEqual(ret.getvalue(), 42)
+        finally:
+            self.cur.execute('DROP PROCEDURE pyo_p1380')
+            self.cur.execute('DROP FUNCTION pyo_f1380')
+
     def test_a_named_argument_given_twice_is_a_compile_error(self):
         # Oracle compiles a call naming one argument twice into PLS-00703 under
         # ORA-06550, and the session carries on. The Mirror over PostgreSQL
