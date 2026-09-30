@@ -1064,6 +1064,24 @@ class TypesIntegration(_IntegrationBase):
         finally:
             self.cur.execute('DROP FUNCTION f1326')
 
+    def test_concatenating_a_null(self):
+        # || reads a NULL as an empty string: only NULL || NULL is NULL, a NULL
+        # number adds nothing, and a string built up from an unset variable
+        # starts from nothing. A Mirror-over-PG gave NULL for any NULL (#1325).
+        self.cur.execute(
+            "SELECT NULL || 'ab', 'ab' || NULL, NULL || NULL, "
+            "'n=' || TO_NUMBER(NULL) FROM dual"
+        )
+        self.assertEqual(self.cur.fetchone(), ('ab', 'ab', None, 'n='))
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (v VARCHAR2(20))')
+        self.cur.execute(
+            'DECLARE s VARCHAR2(20); BEGIN FOR i IN 1..3 LOOP '
+            f's := s || to_char(i); END LOOP; INSERT INTO {self.TABLE} VALUES (s); '
+            'END;'
+        )
+        self.cur.execute(f'SELECT v FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone(), ('123',))
+
     def test_rownum_filters_the_first_rows(self):
         # ROWNUM as a top-level filter, the top-N idiom over an ordered inline
         # view, and `ROWNUM = 2`, which Oracle never satisfies (#1271).

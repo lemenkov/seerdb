@@ -540,6 +540,26 @@ _HELPER_FUNCTIONS_DDL = (
     f'CREATE OPERATOR - (LEFTARG = {_TSTZ_TYPE}, RIGHTARG = interval, '
     'FUNCTION = ora_tstz_sub_interval); '
     'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
+    # Concatenation with a NULL (#1325): Oracle reads the NULL as an empty string,
+    # so NULL || 'ab' is 'ab' and only NULL || NULL is NULL; PostgreSQL's || gives
+    # NULL for any NULL operand. These shadow PostgreSQL's three text forms --
+    # text || text and a text with any other non-array value, either side -- from
+    # an earlier schema on the search path, as orafce's do for its varchar2. The
+    # bodies name PostgreSQL's own operator, or they would call themselves.
+    'CREATE OR REPLACE FUNCTION ora_concat(text, text) RETURNS text '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT CASE WHEN $1 IS NULL THEN $2 '
+    'WHEN $2 IS NULL THEN $1 ELSE $1 OPERATOR(pg_catalog.||) $2 END $$;'
+    'CREATE OR REPLACE FUNCTION ora_concat(text, anynonarray) RETURNS text '
+    'LANGUAGE sql STABLE AS $$ SELECT ora_concat($1, $2::text) $$;'
+    'CREATE OR REPLACE FUNCTION ora_concat(anynonarray, text) RETURNS text '
+    'LANGUAGE sql STABLE AS $$ SELECT ora_concat($1::text, $2) $$;'
+    'DO $$ BEGIN '
+    'CREATE OPERATOR || (LEFTARG = text, RIGHTARG = text, FUNCTION = ora_concat); '
+    'CREATE OPERATOR || (LEFTARG = text, RIGHTARG = anynonarray, '
+    'FUNCTION = ora_concat); '
+    'CREATE OPERATOR || (LEFTARG = anynonarray, RIGHTARG = text, '
+    'FUNCTION = ora_concat); '
+    'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
 )
 
 
