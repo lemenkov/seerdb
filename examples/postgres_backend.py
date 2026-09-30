@@ -4015,7 +4015,13 @@ def _column_meta(desc, values: list, tstz_oid: int | None = None) -> ColumnMeta:
             name=ident, data_type=TNS_TYPE_RAW, data_length=width, max_size=width
         )
     if oid in _TEXT_OIDS:
-        width = max((len(str(v)) for v in values if v is not None), default=1)
+        # A varchar(n) / char(n) reports its declared n, which psycopg gives as
+        # the display size, as Oracle reports a VARCHAR2(n)'s; the longest value
+        # returned stood in for it, so the size changed with the data (#1385).
+        # Only an undeclared one -- text, an expression -- is sized from values.
+        width = desc.display_size or max(
+            (len(str(v)) for v in values if v is not None), default=1
+        )
         return ColumnMeta(
             name=ident, data_type=TNS_TYPE_VARCHAR, data_length=width, max_size=width
         )

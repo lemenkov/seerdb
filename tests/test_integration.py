@@ -1039,6 +1039,17 @@ class TypesIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.fetchall(), [('DATE', 7, None, None)])
 
+    def test_a_varchar2_column_describes_with_its_declared_length(self):
+        # A VARCHAR2(n) column describes as n, whatever its values are -- or when
+        # there are none. The Mirror over PostgreSQL sized it from the longest
+        # value returned (#1385).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (s VARCHAR2(20))')
+        self.cur.execute(f"INSERT INTO {self.TABLE} VALUES ('short')")
+        for where in ('', ' WHERE 1 = 0'):
+            self.cur.execute(f'SELECT s FROM {self.TABLE}{where}')
+            self.cur.fetchall()
+            self.assertEqual(self.cur.description[0][2:4], (20, 20), where)
+
     def test_integer_and_smallint_are_number_38(self):
         # INTEGER, INT and SMALLINT are NUMBER(38): 20 digits fit, and the
         # columns describe as NUMBER(38,0). A SMALLINT parameter takes an
