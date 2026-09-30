@@ -3139,11 +3139,18 @@ def _top_level_words(sql: str) -> tuple[list[tuple[int, str]], list[int]]:
 _LOB_CALL_ITEM = re.compile(
     r'(?:sys\s*\.\s*)?(to_clob|empty_clob|to_blob|empty_blob)\s*\(', re.IGNORECASE
 )
+# An IntervalYM bind as the translation writes it (_translate_binds).
+_INTERVALYM_BIND_ITEM = re.compile(r'make_interval\(months => %\(\w+\)s\)')
 _ITEM_ALIAS = re.compile(r'(?:AS\s+)?(?:"[^"]*"|[A-Za-z_][\w$#]*)?', re.IGNORECASE)
 
 
-def _computed_lob_columns(sql: str) -> dict[int, int]:
-    """The select-list positions of a query that are a LOB call, by Oracle type.
+def _computed_column_types(sql: str) -> dict[int, int]:
+    """The select-list positions of a query whose Oracle type the item says.
+
+    An IntervalYM bind reaches PostgreSQL as `make_interval(months => ...)`, a
+    plain interval that would describe as DAY TO SECOND and read its months as
+    days; the item alone says it is YEAR TO MONTH (#1401). The rest are LOB
+    calls, as follows.
 
     PostgreSQL describes a computed value by its base type even when the function
     returns the ora_clob / ora_blob domain, so TO_CLOB('x') or EMPTY_BLOB() would
@@ -3163,6 +3170,10 @@ def _computed_lob_columns(sql: str) -> dict[int, int]:
         return {}  # the positions are the expanded columns', not the items'
     found = {}
     for index, item in enumerate(items):
+        ym = _INTERVALYM_BIND_ITEM.match(item)
+        if ym is not None and _ITEM_ALIAS.fullmatch(item[ym.end() :].strip()):
+            found[index] = TNS_TYPE_INTERVALYM
+            continue
         call = _LOB_CALL_ITEM.match(item)
         if call is None:
             continue
@@ -5222,10 +5233,11 @@ class PostgresBackend:
     def _build_result(self, cursor, sql: str = '') -> Result:
         # Turn an executed statement's cursor into a Result: a row count for a
         # no-row statement, else the fetched rows plus a ColumnMeta per column.
-        # `sql` is the statement as run, read for the LOB calls in its select list.
+        # `sql` is the statement as run, read for the select-list items whose
+        # type only the item says (a LOB call, an IntervalYM bind).
         if cursor.description is None:
             return Result(rowcount=max(cursor.rowcount, 0))
-        computed_lobs = _computed_lob_columns(sql) if sql else {}
+        computed = _computed_column_types(sql) if sql else {}
         rows = [list(r) for r in cursor.fetchall()]
         # Re-tag the zoned cells before they reach the wire encoder (_wire_cell).
         for i, desc in enumerate(cursor.description):
@@ -5245,8 +5257,8 @@ class PostgresBackend:
                 if desc.type_code in _DOMAIN_BASE_OIDS
                 else None
             )
-            if domain is None and desc.type_code in (25, 17):
-                domain = computed_lobs.get(i)
+            if domain is None and desc.type_code in (25, 17, _INTERVAL_OID):
+                domain = computed.get(i)
             if domain in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
                 columns.append(_lob_column_meta(desc.name, domain))
             elif domain == TNS_TYPE_INTERVALYM:
