@@ -96,6 +96,17 @@ class PacketStream:
         (``ClientSide=False``) so its keystreams mirror the client's."""
         self._ano = channel
 
+    def rederive_ano(self) -> None:
+        """Re-derive the data-integrity keystreams after a break/reset (#1346).
+
+        Both sides re-derive once per break/reset exchange; the client does when
+        it answers the server's reset, so the server must before the DATA that
+        closes the episode, or that packet fails the client's MAC. A no-op while
+        no encryption is active.
+        """
+        if self._ano is not None:
+            self._ano.rederive()
+
     def _fill(self, n: int) -> bool:
         # Pull from the socket until the accumulator holds at least n bytes.
         # False signals the peer closed before n bytes arrived. A socket timeout

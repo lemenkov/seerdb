@@ -517,6 +517,42 @@ def test_encrypted_round_trip_async() -> None:
     assert rows == [(3, 'carol')]
 
 
+@pytest.mark.parametrize('encryption', ['accepted', 'required'])
+def test_an_in_band_cancel_answers_the_next_call(encryption: str) -> None:
+    # connection.cancel() with no out-of-band channel sends an interrupt marker.
+    # The Mirror answers with a reset, waits for the client's reset -- dropping
+    # the request the client queued meanwhile -- and reports ORA-01013 as that
+    # request's answer; the session then carries on. A live 26ai does exactly
+    # this. The Mirror used to answer the queued request in between, leaving the
+    # cancel one call out of step, and under encryption the reply went out with
+    # keys the client had already re-derived for the episode, so the next call
+    # failed its integrity check (#1346).
+    listen, server, result = _start_mirror(encryption=encryption)
+    conn = _connect(listen.getsockname()[1])
+    try:
+        assert (conn._ano is not None and conn._ano.active) == (
+            encryption == 'required'
+        )
+        conn._supports_oob = False  # force the in-band interrupt
+        conn.cancel()
+        cur = conn.cursor()
+        with pytest.raises(seerdb.DatabaseError) as excinfo:
+            cur.execute('create table t (n number)')
+        assert 'ORA-01013' in str(excinfo.value)
+        cur.execute('create table t (n number)')
+        cur.execute('insert into t values (7)')
+        cur.execute('select n from t')
+        assert [_values(r) for r in cur.fetchall()] == [(7,)]
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        server.join(timeout=5)
+        listen.close()
+    assert result.get('error') is None, result.get('error')
+
+
 def test_bad_sql_is_an_ora_error_not_a_desync() -> None:
     listen, server, result = _start_mirror()
     conn = _connect(listen.getsockname()[1])
