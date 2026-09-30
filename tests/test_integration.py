@@ -1142,6 +1142,36 @@ class TypesIntegration(_IntegrationBase):
             self.cur.execute('DROP PROCEDURE pyo_p1380')
             self.cur.execute('DROP FUNCTION pyo_f1380')
 
+    def test_a_block_selects_into_binds(self):
+        # A block's SELECT ... INTO takes its one row into the binds; no row is
+        # ORA-01403 and more than one ORA-01422. The Mirror over PostgreSQL
+        # answered ORA-00900 for every one (#1396).
+        from seerdb.common.exceptions import DatabaseError
+
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, s VARCHAR2(20))')
+        for row in ((3, 'three'), (4, 'four')):
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', row)
+        n, s = self.cur.var(seerdb.NUMBER), self.cur.var(str, 20)
+        self.cur.execute(
+            f'BEGIN SELECT n, s INTO :n, :s FROM {self.TABLE} WHERE n = :k; END;',
+            {'n': n, 's': s, 'k': 3},
+        )
+        self.assertEqual((n.getvalue(), s.getvalue()), (3, 'three'))
+        rid = self.cur.var(str, 40)  # the rowid as text; a ROWID Var: #1397
+        self.cur.execute(
+            f'BEGIN SELECT rowid INTO :r FROM {self.TABLE} WHERE n = 4; END;', [rid]
+        )
+        self.cur.execute(
+            f'SELECT s FROM {self.TABLE} WHERE rowid = :1', [rid.getvalue()]
+        )
+        self.assertEqual(self.cur.fetchone(), ('four',))
+        for where, code in (('n = 99', 1403), ('n > 0', 1422)):
+            with self.assertRaises(DatabaseError) as caught:
+                self.cur.execute(
+                    f'BEGIN SELECT s INTO :s FROM {self.TABLE} WHERE {where}; END;', [s]
+                )
+            self.assertEqual(caught.exception.code, code)
+
     def test_a_named_argument_given_twice_is_a_compile_error(self):
         # Oracle compiles a call naming one argument twice into PLS-00703 under
         # ORA-06550, and the session carries on. The Mirror over PostgreSQL
