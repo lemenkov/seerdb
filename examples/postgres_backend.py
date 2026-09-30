@@ -3534,6 +3534,17 @@ def _hoist_local_functions(sql: str) -> str | None:
 # The anonymous block a thin callproc / callfunc sends: BEGIN name(:a, :b); END;
 # or BEGIN :r := name(:a, :b); END;
 _CALL_BLOCK = re.compile(r'(?is)^\s*BEGIN\s+(.*?)\s*;?\s*END\s*;?\s*$')
+# A block that only calls a procedure with no arguments, `BEGIN p; END;` or
+# `BEGIN p(); END;` -- python-oracledb's callproc of one sends the former, with no
+# binds (#1404).
+_BARE_CALL = re.compile(
+    r'(?is)^\s*BEGIN\s+([\w.$#]+)\s*(?:\(\s*\))?\s*;\s*END\s*;?\s*$'
+)
+# The PL/SQL statements that are one word, which a lone word in a block may be
+# rather than a procedure's name: `begin null; end;` is a statement (#1404).
+_PLSQL_WORD_STATEMENTS = frozenset(
+    {'NULL', 'COMMIT', 'ROLLBACK', 'RETURN', 'EXIT', 'CONTINUE', 'RAISE'}
+)
 _FUNC_CALL = re.compile(r'(?is)^\s*:(\d+)\s*:=\s*([\w.]+)\s*\((.*)\)\s*$')
 # A numbered placeholder, `:3` -- not the second colon of `::`.
 _NUMBERED_BIND = re.compile(r'(?<!:):(\d+)')
@@ -4724,6 +4735,11 @@ class PostgresBackend:
         kill = _KILL_SESSION.match(sql)
         if kill is not None:
             return self._kill_session(kill.group(1))
+        bare = _BARE_CALL.match(sql)
+        if bare is not None and bare.group(1).upper() not in _PLSQL_WORD_STATEMENTS:
+            # No binds, so the block would otherwise go to PostgreSQL as it
+            # stands; the call path runs it as any other call (#1404).
+            return self._execute_plsql(f'BEGIN {bare.group(1)}(); END;', binds)
         if binds and is_plsql(sql):
             return self._execute_plsql(sql, binds)
         # A `SELECT REF(alias)` object-REF fetch: PostgreSQL has no REF, so stand in
@@ -6332,7 +6348,10 @@ class PostgresBackend:
         cursor.execute(
             f'CALL {name}({_call_placeholders(arguments)})', tuple(arg_values) or None
         )
-        returned = self._decode_out_row(cursor, cursor.fetchone())
+        # A procedure with no OUT or IN OUT parameter returns no row at all.
+        returned = self._decode_out_row(
+            cursor, cursor.fetchone() if cursor.description is not None else None
+        )
         out = list(values)
         # The result row carries the OUT and IN OUT parameters in declaration
         # order, whatever order the call named them in; each goes to the bind its

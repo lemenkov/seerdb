@@ -1201,6 +1201,30 @@ class TypesIntegration(_IntegrationBase):
             self.cur.execute(f'SELECT n FROM {self.TABLE} WHERE rowid = :r', [rid])
             self.assertEqual(self.cur.fetchall(), [(4,)], typ)
 
+    def test_callproc_of_a_procedure_without_out_parameters(self):
+        # A procedure with no arguments, and one with only IN ones, run through
+        # callproc like any other. The Mirror over PostgreSQL sent the first to
+        # PostgreSQL as written, and fetched a result row neither returns (#1404).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER)')
+        self.cur.execute(
+            f'CREATE OR REPLACE PROCEDURE pyo_p1404 AS BEGIN '
+            f'INSERT INTO {self.TABLE} VALUES (1); END;'
+        )
+        self.cur.execute(
+            f'CREATE OR REPLACE PROCEDURE pyo_q1404 (a IN NUMBER) AS BEGIN '
+            f'INSERT INTO {self.TABLE} VALUES (a); END;'
+        )
+        try:
+            self.assertEqual(self.cur.callproc('pyo_p1404'), [])
+            # A lone NULL is a statement, not a procedure's name.
+            self.cur.execute('BEGIN NULL; END;')
+            self.assertEqual(self.cur.callproc('pyo_q1404', [7]), [7])
+            self.cur.execute(f'SELECT n FROM {self.TABLE} ORDER BY n')
+            self.assertEqual(self.cur.fetchall(), [(1,), (7,)])
+        finally:
+            self.cur.execute('DROP PROCEDURE pyo_p1404')
+            self.cur.execute('DROP PROCEDURE pyo_q1404')
+
     def test_a_named_argument_given_twice_is_a_compile_error(self):
         # Oracle compiles a call naming one argument twice into PLS-00703 under
         # ORA-06550, and the session carries on. The Mirror over PostgreSQL
