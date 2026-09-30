@@ -39,6 +39,7 @@ from postgres_backend import (  # noqa: E402
     _backend_error,
     _bc_date_loader,
     _call_argument_error,
+    _call_arguments,
     _computed_lob_columns,
     _distinct_bind_refs,
     _iot_primary_key,
@@ -273,6 +274,20 @@ def test_deref_becomes_a_parenthesised_sys_deref() -> None:
     assert _translate_idioms('SELECT DEREF(:1).name FROM dual') == (
         'SELECT (sys.deref(:1)).name FROM dual'
     )
+
+
+def test_call_arguments_keep_their_names() -> None:
+    # Each argument as (parameter name, bind): the name is what binds it to its
+    # parameter, whatever order the call lists them in (#1377). Anything but a
+    # plain bind leaves the call to the positional path.
+    assert _call_arguments(':1, a_OutValue => :3, A_X=>:2') == [
+        (None, 1),
+        ('a_outvalue', 3),
+        ('a_x', 2),
+    ]
+    assert _call_arguments('') == []
+    assert _call_arguments(":1, 'literal'") is None
+    assert _call_arguments('a => :1 + 1') is None
 
 
 def test_a_call_argument_list_oracle_would_not_compile_is_ora_06550() -> None:

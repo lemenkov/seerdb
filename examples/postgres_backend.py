@@ -3534,6 +3534,31 @@ _CALL_BLOCK = re.compile(r'(?is)^\s*BEGIN\s+(.*?)\s*;?\s*END\s*;?\s*$')
 _FUNC_CALL = re.compile(r'(?is)^\s*:(\d+)\s*:=\s*([\w.]+)\s*\((.*)\)\s*$')
 # A named argument in a call's list: `name => value`.
 _NAMED_ARGUMENT = re.compile(r'(?is)^\s*(\w+)\s*=>')
+# One argument of a call: a bind, by position or by name (`:3`, `a_x => :3`).
+_CALL_ARGUMENT = re.compile(r'(?is)^\s*(?:(\w+)\s*=>\s*)?:(\d+)\s*$')
+
+
+def _call_arguments(args: str) -> list[tuple[str | None, int]] | None:
+    """A call's arguments as (parameter name or None, bind number), in order.
+
+    None when an argument is anything but a bind -- a literal, an expression --
+    which the positional path goes on handling as it always has.
+    """
+    arguments = []
+    for start, end in _top_level_items(args, 0, len(args)):
+        if not args[start:end].strip():
+            continue
+        match = _CALL_ARGUMENT.match(args[start:end])
+        if match is None:
+            return None
+        name = match.group(1)
+        arguments.append((name.lower() if name else None, int(match.group(2))))
+    return arguments
+
+
+def _call_placeholders(arguments: Sequence[tuple[str | None, int]]) -> str:
+    # PostgreSQL takes a call's named notation as Oracle writes it (#1377).
+    return ', '.join(f'{name} => %s' if name else '%s' for name, _ref in arguments)
 
 
 def _call_argument_error(
@@ -6140,11 +6165,14 @@ class PostgresBackend:
         refused = _call_argument_error(block, name, args, None)
         if refused is not None:
             raise refused
-        arg_refs = [int(r) for r in re.findall(r':(\d+)', args)]
-        arg_values = [values[r - 1] for r in arg_refs]
-        placeholders = ', '.join(['%s'] * len(arg_values))
+        arguments = _call_arguments(args)
+        if arguments is None:
+            arguments = [(None, int(r)) for r in re.findall(r':(\d+)', args)]
+        arg_values = [values[ref - 1] for _name, ref in arguments]
         cursor = self._conn.cursor()
-        cursor.execute(f'SELECT {name}({placeholders})', tuple(arg_values) or None)
+        cursor.execute(
+            f'SELECT {name}({_call_placeholders(arguments)})', tuple(arg_values) or None
+        )
         row = _decode_row(cursor, cursor.fetchone(), self._tstz_oid)
         out = list(values)
         out[int(ret_ref) - 1] = row[0] if row else None
@@ -6160,36 +6188,54 @@ class PostgresBackend:
         refused = _call_argument_error(block, name, args, parameters or None)
         if refused is not None:
             raise refused
+        # Which parameter each argument binds: by position, or by name (#1377). A
+        # named argument the signature cannot place, or an argument that is not a
+        # plain bind, leaves the call positional, as it always was.
+        arguments = _call_arguments(args)
+        lowered = [p.lower() for p in parameters]
+        if arguments is None or any(
+            n is not None and n not in lowered for n, _ref in arguments
+        ):
+            arguments = [(None, ref) for ref in arg_refs]
+        bound = {
+            (lowered.index(n) if n is not None else position): ref
+            for position, (n, ref) in enumerate(arguments)
+        }
         # A pure-OUT argument carries no input — pass an untyped NULL, not the
         # client's placeholder Var value: a REF CURSOR Var marshals to bytea, which
         # makes CALL's overload resolution miss the refcursor parameter (#518). IN
         # and IN OUT arguments pass their value.
         arg_values = [
-            None if modes and modes[position] == 'o' else values[ref - 1]
-            for position, ref in enumerate(arg_refs)
+            None
+            if modes and param < len(modes) and modes[param] == 'o'
+            else values[ref - 1]
+            for param, ref in bound.items()
         ]
-        placeholders = ', '.join(['%s'] * len(arg_values))
         cursor = self._conn.cursor()
-        cursor.execute(f'CALL {name}({placeholders})', tuple(arg_values) or None)
+        cursor.execute(
+            f'CALL {name}({_call_placeholders(arguments)})', tuple(arg_values) or None
+        )
         returned = self._decode_out_row(cursor, cursor.fetchone())
         out = list(values)
-        result_i = 0
-        for position, ref in enumerate(arg_refs):
-            is_out = modes[position] in ('o', 'b') if modes else False
-            if is_out and result_i < len(returned):
-                value = returned[result_i]
-                # An OUT INTERVAL YEAR TO MONTH arrives as an OraInterval (base
-                # interval on the wire) — turn it into an IntervalYM by matching the
-                # argument's declared ora_intervalym type, since a CALL result has no
-                # table column to trace (#504).
-                if (
-                    self._intervalym_oid is not None
-                    and position < len(argtypes)
-                    and argtypes[position] == self._intervalym_oid
-                ):
-                    value = _to_interval_ym(value)
-                out[ref - 1] = value
-                result_i += 1
+        # The result row carries the OUT and IN OUT parameters in declaration
+        # order, whatever order the call named them in; each goes to the bind its
+        # argument used.
+        outs = [param for param, mode in enumerate(modes or ()) if mode in ('o', 'b')]
+        for value, param in zip(returned, outs):
+            ref = bound.get(param)
+            if ref is None:
+                continue
+            # An OUT INTERVAL YEAR TO MONTH arrives as an OraInterval (base
+            # interval on the wire) — turn it into an IntervalYM by matching the
+            # argument's declared ora_intervalym type, since a CALL result has no
+            # table column to trace (#504).
+            if (
+                self._intervalym_oid is not None
+                and param < len(argtypes)
+                and argtypes[param] == self._intervalym_oid
+            ):
+                value = _to_interval_ym(value)
+            out[ref - 1] = value
         return Result(out_binds=out)
 
     def _decode_out_row(self, cursor, row) -> list:

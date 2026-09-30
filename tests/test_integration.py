@@ -1081,6 +1081,30 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT v FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), ('123',))
 
+    def test_named_arguments_bind_to_their_parameters(self):
+        # Named notation binds an argument to the parameter it names, in whatever
+        # order the call lists them, and each OUT value comes back to its own
+        # bind. The Mirror over PostgreSQL read the names away and bound by
+        # position, so a reordered call silently got wrong values (#1377).
+        self.cur.execute(
+            'CREATE OR REPLACE PROCEDURE pyo_p1377 '
+            '(a IN NUMBER, b IN OUT NUMBER, c OUT NUMBER) AS '
+            'BEGIN b := b + a; c := a * 10; END;'
+        )
+        try:
+            b, c = self.cur.var(seerdb.NUMBER), self.cur.var(seerdb.NUMBER)
+            b.setvalue(0, 5)
+            self.cur.execute(
+                'BEGIN pyo_p1377(c => :1, b => :2, a => :3); END;', [c, b, 2]
+            )
+            self.assertEqual((b.getvalue(), c.getvalue()), (7, 20))
+            b.setvalue(0, 5)
+            # A positional argument first, then named ones.
+            self.cur.execute('BEGIN pyo_p1377(:1, c => :2, b => :3); END;', [3, c, b])
+            self.assertEqual((b.getvalue(), c.getvalue()), (8, 30))
+        finally:
+            self.cur.execute('DROP PROCEDURE pyo_p1377')
+
     def test_a_named_argument_given_twice_is_a_compile_error(self):
         # Oracle compiles a call naming one argument twice into PLS-00703 under
         # ORA-06550, and the session carries on. The Mirror over PostgreSQL
