@@ -5237,3 +5237,31 @@ def test_a_define_reexecute_honours_a_zero_prefetch() -> None:
     stream, cursors, cursor_id = _reexecute(10)
     assert cursors.delivered(cursor_id) == len(rows)
     assert not cursors.has(cursor_id)
+
+
+def test_a_returned_value_takes_its_receiving_binds_type() -> None:
+    # Oracle converts what RETURNING hands back into the declared variable's
+    # type, and fails the statement when it cannot (#1370).
+    from decimal import Decimal
+
+    from seerdb.common.tns_consts import (
+        TNS_TYPE_NUMBER,
+        TNS_TYPE_RAW,
+        TNS_TYPE_VARCHAR,
+    )
+    from seerdb.server import BackendError, as_declared_type
+
+    assert as_declared_type('0A0B', TNS_TYPE_RAW) == b'\n\x0b'
+    assert as_declared_type('ABC', TNS_TYPE_RAW) == b'\n\xbc'  # an odd digit leads
+    assert as_declared_type(' 42 ', TNS_TYPE_NUMBER) == Decimal(42)
+    assert as_declared_type(b'\n\x0b', TNS_TYPE_VARCHAR) == '0A0B'
+    # A value already of its kind, as a passthrough backend returns them all.
+    assert as_declared_type(b'\x01', TNS_TYPE_RAW) == b'\x01'
+    assert as_declared_type(None, TNS_TYPE_NUMBER) is None
+    for value, tns_type, code in (
+        ('Value for first row', TNS_TYPE_RAW, 1465),
+        ('abc', TNS_TYPE_NUMBER, 1722),
+    ):
+        with pytest.raises(BackendError) as caught:
+            as_declared_type(value, tns_type)
+        assert caught.value.ora_code == code

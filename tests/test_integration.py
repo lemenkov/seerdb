@@ -2309,6 +2309,37 @@ class CursorIntegration(_IntegrationBase):
         )
         self.assertEqual(got.getvalue(), [None])
 
+    def test_a_returned_value_takes_its_variables_type(self):
+        # RETURNING converts the value into the receiving variable's type: text
+        # into a RAW is read as hex, into a NUMBER as a number. One it cannot
+        # convert fails the statement, which is undone. The Mirror over
+        # PostgreSQL sent the text's own bytes, or encoded the text as if it were
+        # a NUMBER, and kept the row (#1370).
+        from seerdb.common.exceptions import DatabaseError
+
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, v VARCHAR2(40))')
+        insert = f'INSERT INTO {self.TABLE} (id, v) VALUES (1, :1) RETURNING v INTO :2'
+        raw, number = self.cur.var(seerdb.DB_TYPE_RAW, 40), self.cur.var(seerdb.NUMBER)
+        self.cur.execute(insert, ['0A0B', raw])
+        self.cur.execute(insert, ['42', number])
+        self.assertEqual((raw.getvalue(), number.getvalue()), ([b'\n\x0b'], [42]))
+        # A fresh variable each: 8i cannot reuse a RETURNING one yet (#1390).
+        for value, typ, code in (
+            ('not hex', seerdb.DB_TYPE_RAW, 1465),
+            ('not a number', seerdb.NUMBER, 1722),
+        ):
+            with self.assertRaises(DatabaseError) as caught:
+                self.cur.execute(insert, [value, self.cur.var(typ, 40)])
+            self.assertEqual(caught.exception.code, code)
+        self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone(), (2,))
+        # A RETURNING that matches no row returns nothing, and is no error.
+        none = self.cur.var(seerdb.DB_TYPE_RAW, 40)
+        self.cur.execute(
+            f'UPDATE {self.TABLE} SET v = v WHERE id = 99 RETURNING v INTO :1', [none]
+        )
+        self.assertEqual(self.cur.rowcount, 0)
+
     def test_failing_array_returning_raises_cleanly(self):
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER NOT NULL, v NUMBER)')
         got = self.cur.var(int)
