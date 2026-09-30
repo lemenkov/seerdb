@@ -752,6 +752,8 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN 'session_user' THEN upper(session_user::text) "
     "WHEN 'current_schemaid' THEN current_setting('search_path') "
     "WHEN 'db_name' THEN upper(current_database()) "
+    # The service the client connected to, which the Mirror hands over (#1409).
+    "WHEN 'service_name' THEN nullif(current_setting('seerdb.service_name', true), '') "
     "WHEN 'db_unique_name' THEN upper(current_database()) "
     "WHEN 'instance_name' THEN upper(current_database()) "
     "WHEN 'server_host' THEN NULL "
@@ -4566,6 +4568,19 @@ class PostgresBackend:
     def open_session(self, connect_attrs: dict[str, str]) -> None:
         # The driver name arrives only in the second login message (#1212).
         self._client_driver = connect_attrs.get('driver_name')
+        # The service the client connected to, for USERENV SERVICE_NAME (#1409),
+        # kept in a session setting as the tracing attributes are.
+        service = connect_attrs.get('service_name')
+        if service:
+            try:
+                self._conn.execute(
+                    "SELECT set_config('seerdb.service_name', %s, false)", (service,)
+                )
+                # A setting made in a transaction that rolls back is undone with
+                # it, and nothing has run yet for this session to keep open.
+                self._conn.commit()
+            except psycopg.Error:
+                self._conn.rollback()
 
     def _record_session(self) -> None:
         # This session's row in sys.ora_sessions, and none for backends that have

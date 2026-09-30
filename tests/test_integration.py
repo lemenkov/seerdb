@@ -1686,6 +1686,25 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id, v FROM {self.TABLE} ORDER BY id')
         self.assertEqual(self.cur.fetchall(), [(1, 'n+2'), (2, 'n++4'), (3, 'n+++6')])
 
+    def test_userenv_service_name_is_the_service_connected_to(self):
+        # USERENV SERVICE_NAME names the service the session connected to. The
+        # Mirror over PostgreSQL answered NULL, and its login named none (#1409).
+        from seerdb.common.exceptions import DatabaseError
+
+        try:
+            self.cur.execute("SELECT sys_context('userenv', 'service_name') FROM dual")
+        except DatabaseError as exc:
+            if exc.code == 2003:
+                self.skipTest('no USERENV SERVICE_NAME on this version')
+            raise
+        (service,) = self.cur.fetchone()
+        self.assertIsNotNone(service)
+        if os.environ.get('SEERDB_TEST_MIRROR') == 'passthrough':
+            return  # the upstream session's service, not the one asked of the Mirror
+        # A service can be registered with a domain (orcl.example.com); the
+        # name connected with is its first part.
+        self.assertEqual(service.split('.')[0].upper(), _SERVICE.split('.')[0].upper())
+
     def test_v_parameter_names_the_instance_parameters(self):
         # V$PARAMETER answers open_cursors and db_domain. On the Mirror over
         # PostgreSQL they are what its login reports -- AUTH_MAX_OPEN_CURSORS

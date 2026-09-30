@@ -708,7 +708,9 @@ def handle_login(
     # if it has deferred that connect until now; one that connected during
     # authenticate() cannot, and skips the hook. Either way the login stands
     # (#826).
-    _open_backend_session(stream, backend, sqlplus, auth_body, field_version)
+    _open_backend_session(
+        stream, backend, sqlplus, auth_body, field_version, request.service_name
+    )
 
     # Application context the client declared at connect
     # (`connect(appcontext=[...])`). It arrives in this AUTH -- AFTER the backend
@@ -760,7 +762,9 @@ def handle_login(
                 instance_name=info.instance_name,
                 db_name=info.db_name,
                 db_domain=info.db_domain,
-                service_name=info.service_name,
+                # The service the client connected to, when the backend cannot
+                # name one of its own (#1409).
+                service_name=info.service_name or request.service_name,
             ),
         )
         session_id = info.session_id
@@ -810,6 +814,7 @@ def _open_backend_session(
     sqlplus: bool,
     auth_body: bytes,
     field_version: int,
+    service_name: str | None = None,
 ) -> None:
     """Let the backend open its session, now that the client's proof checked out.
 
@@ -821,6 +826,11 @@ def _open_backend_session(
     connect_attrs = (
         {} if sqlplus else parse_auth_connect_attrs(auth_body, field_version)
     )
+    # The service the client connected to, from its CONNECT descriptor: what a
+    # session's USERENV SERVICE_NAME names, which a backend can only learn here
+    # (#1409).
+    if service_name:
+        connect_attrs.setdefault('service_name', service_name)
     open_session = getattr(backend, 'open_session', None)
     if open_session is None:
         return
