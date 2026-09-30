@@ -448,3 +448,39 @@ def test_the_login_reply_carries_the_upstream_serial_without_v_session():
         backend._conn = type('Conn', (), {'cursor': lambda self: cursor})()
         info = backend.session_info()
         assert (info.session_id, info.serial_num) == (62, serial)
+
+
+class _RecordingConn:
+    """An upstream connection that records every statement its cursors run."""
+
+    def __init__(self):
+        self.statements = []
+        self.closed_cursors = 0
+        outer = self
+
+        class _Cursor:
+            def execute(self, sql, *args):
+                outer.statements.append(sql)
+
+            def close(self):
+                outer.closed_cursors += 1
+
+        self._cursor = _Cursor
+
+    def cursor(self):
+        return self._cursor()
+
+
+def test_the_login_time_zone_reaches_the_upstream_session():
+    # A 12.1+ client pins the session time zone to its own offset with an ALTER
+    # SESSION in its login. The passthrough runs it upstream, so a client in
+    # another zone than the Mirror's host sees its own offset (#1139). The offset
+    # is deliberately one no test host is in.
+    from oracle_passthrough_backend import OraclePassthroughBackend
+
+    backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
+    backend._conn = _RecordingConn()
+    statement = "ALTER SESSION SET TIME_ZONE='+05:45'"
+    backend.alter_session(statement)
+    assert backend._conn.statements == [statement]
+    assert backend._conn.closed_cursors == 1
