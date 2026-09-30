@@ -178,6 +178,51 @@ ORA_NO_DATA_FOUND = 1403
 # rows that failed are read back through getbatcherrors() (#18).
 ORA_ARRAY_DML_ERRORS = 24381
 
+# Every other ORA code seerdb raises, answers with or tests for (#1334): the
+# client, the Mirror and the example backends name them here and nowhere else.
+# Each is named after Oracle's message (its PL/SQL exception, TOO_MANY_ROWS,
+# where that is the handle people know) and, like the two above, decimal.
+ORA_UNIQUE_CONSTRAINT_VIOLATED = 1
+ORA_INVALID_SESSION_ID = 26  # missing or invalid session ID
+ORA_CANNOT_KILL_CURRENT_SESSION = 27
+ORA_SESSION_TERMINATED = 28  # a killed session's next call
+ORA_SESSION_ID_DOES_NOT_EXIST = 30
+ORA_RESOURCE_BUSY = 54  # resource busy and acquire with NOWAIT specified
+ORA_INTERNAL_ERROR = 600
+ORA_INVALID_SQL_STATEMENT = 900
+ORA_INVALID_CREATE_COMMAND = 901
+ORA_INVALID_DATATYPE = 902
+ORA_INVALID_IDENTIFIER = 904
+ORA_TOO_MANY_VALUES = 913
+ORA_TABLE_OR_VIEW_DOES_NOT_EXIST = 942
+ORA_NOT_ENOUGH_VALUES = 947
+ORA_NAME_ALREADY_USED = 955  # name is already used by an existing object
+ORA_INVALID_CURSOR = 1001
+ORA_USER_REQUESTED_CANCEL = 1013  # user requested cancel of current operation
+ORA_INVALID_USERNAME_PASSWORD = 1017  # invalid username/password; logon denied
+ORA_INSUFFICIENT_PRIVILEGES = 1031
+ORA_ORACLE_NOT_AVAILABLE = 1034
+ORA_SAVEPOINT_NEVER_ESTABLISHED = 1086
+ORA_CANNOT_INSERT_NULL = 1400
+ORA_TOO_MANY_ROWS = 1422  # exact fetch returns more than requested number of rows
+ORA_NUMERIC_OVERFLOW = 1426
+ORA_VALUE_LARGER_THAN_PRECISION = 1438  # ... precision allowed for this column
+ORA_DIVISOR_IS_ZERO = 1476  # divisor is equal to zero
+ORA_INVALID_NUMBER = 1722
+ORA_INVALID_BIND_VARIABLE_NAME = 1745  # invalid host/bind variable name
+ORA_CHECK_CONSTRAINT_VIOLATED = 2290
+ORA_PARENT_KEY_NOT_FOUND = 2291  # integrity constraint violated - parent key not found
+ORA_TYPE_HAS_DEPENDENTS = 2303  # cannot drop or replace a type with ... dependents
+ORA_UNIMPLEMENTED_FEATURE = 3001
+ORA_UNSUPPORTED_NETWORK_DATATYPE = 3115  # ... datatype or representation
+ORA_VALUE_TOO_LARGE_FOR_COLUMN = 12899
+ORA_NONEXISTENT_FILE = 22285  # non-existent directory or file for FILEOPEN
+ORA_LOB_NOT_OPENED = 22289  # cannot perform operation on an unopened file or LOB
+ORA_LOB_ALREADY_OPENED = 22293  # LOB already opened in the same transaction
+ORA_DEQUEUE_TIMEOUT = 25228  # timeout or end-of-fetch during message dequeue
+ORA_LISTEN_TIMEOUT = 25254  # time-out in LISTEN while waiting for a message
+ORA_NO_DATA_GUIDE = 40582  # the collection has no data-guide-enabled index
+
 # The describe's vector-metadata flags byte (23.4+). A VECTOR column that allows
 # ANY number of dimensions says so HERE, not by its dimension count -- the count
 # alongside this bit is 0 and means nothing, so reporting it claims the column

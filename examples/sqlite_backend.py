@@ -27,6 +27,7 @@ _ORACLE_BIND = re.compile(r'(?<!:):\w+')
 
 from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
+    ORA_INVALID_SQL_STATEMENT,
     TNS_TYPE_BLOB,
     TNS_TYPE_CLOB,
     TNS_TYPE_DATE,
@@ -63,10 +64,6 @@ from seerdb.server import (
     Result,
     credential_lookup,
 )
-
-# ORA-00900: invalid SQL statement — the generic code for a SQL the backend
-# rejected (syntax, unknown table, ...).
-_ORA_INVALID_SQL = 900
 
 
 def _adapt_int(value: int) -> int | float:
@@ -189,7 +186,7 @@ class SqliteBackend:
             cursor = self._conn.execute(sql, values)
         except sqlite3.Error as exc:
             # A SQLite failure surfaces as a clean ORA error — never a desync.
-            raise BackendError(str(exc), ora_code=_ORA_INVALID_SQL) from exc
+            raise BackendError(str(exc), ora_code=ORA_INVALID_SQL_STATEMENT) from exc
         if cursor.description is None:
             # DDL / DML: no result set, just an affected-row count.
             return Result(rowcount=max(cursor.rowcount, 0))
@@ -222,7 +219,9 @@ class SqliteBackend:
                 cursor = self._conn.execute(statement, values)
                 iteration = list(cursor.fetchall())
             except sqlite3.Error as exc:
-                raise BackendError(str(exc), ora_code=_ORA_INVALID_SQL) from exc
+                raise BackendError(
+                    str(exc), ora_code=ORA_INVALID_SQL_STATEMENT
+                ) from exc
             returned.append(iteration)
             # A RETURNING statement gives back one row per row it changed, so the
             # count is the rows read rather than a separate report.

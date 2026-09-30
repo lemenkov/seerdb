@@ -77,6 +77,8 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_23_4,
     MAX_SEQ_NUM,
     ORA_ARRAY_DML_ERRORS,
+    ORA_DEQUEUE_TIMEOUT,
+    ORA_LISTEN_TIMEOUT,
     ORA_NO_DATA_FOUND,
     PURITY_DEFAULT,
     TNS_ACCEPT,
@@ -377,7 +379,10 @@ def _decode_aq_deq(Packet: bytes, queue):
     if not Packet:
         return None
     if Packet[0] == TTI_OER:
-        if _aq_oer_code(Packet) in (25228, 25254):  # no message available
+        if _aq_oer_code(Packet) in (
+            ORA_DEQUEUE_TIMEOUT,
+            ORA_LISTEN_TIMEOUT,
+        ):  # no message available
             return None
         _aq_raise(Packet)
     Rest = Packet[1:]
@@ -440,7 +445,7 @@ def _decode_aq_array(Packet: bytes, queue, operation: int, props_list: list):
     if not Packet:
         return []
     if Packet[0] == TTI_OER:
-        if _aq_oer_code(Packet) in (25228, 25254):
+        if _aq_oer_code(Packet) in (ORA_DEQUEUE_TIMEOUT, ORA_LISTEN_TIMEOUT):
             return []
         _aq_raise(Packet)
     Rest = Packet[1:]

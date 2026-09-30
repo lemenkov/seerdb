@@ -23,7 +23,11 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 
-from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
+from seerdb.common.tns_consts import (
+    ORA_INSUFFICIENT_PRIVILEGES,
+    ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,
+    TNS_TYPE_VARCHAR,
+)
 from seerdb.server import (
     Backend,
     BackendError,
@@ -38,11 +42,6 @@ from seerdb.server import (
 # ``SELECT <expr>`` (no FROM) is the same thing there — so drop a trailing
 # ``FROM DUAL`` before delegating. Only the exact idiom, nothing cleverer.
 _FROM_DUAL = re.compile(r'\s+FROM\s+DUAL\s*$', re.IGNORECASE)
-
-# ORA-00942: table or view does not exist — sqlplus's PRODUCT_PRIVS lookup hits
-# this on a backend without the profile table, and tolerates it (it prints the
-# familiar "Product user profile information not loaded" warning and continues).
-_ORA_NO_SUCH_TABLE = 942
 
 # The sqlplus ``VARIABLE v NUMBER`` / ``EXEC :v := 42`` flow sends a PL/SQL block
 # that assigns literals to OUT binds — ``BEGIN :n := 42; :s := 'hi'; END;``. A
@@ -199,8 +198,12 @@ class OracleCompatBackend:
             if _SESSION_CALL.match(sql):
                 return Result()
         if 'PRODUCT_PRIVS' in normalized:
+            # sqlplus's PRODUCT_PRIVS lookup, on a backend without the profile
+            # table: sqlplus tolerates ORA-00942 there, printing the familiar
+            # "Product user profile information not loaded" warning.
             raise BackendError(
-                'table or view does not exist', ora_code=_ORA_NO_SUCH_TABLE
+                'table or view does not exist',
+                ora_code=ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,
             )
         if normalized == 'SELECT USER FROM DUAL':
             return Result(columns=[_varchar(b'USER', 30)], rows=[(self._user,)])
@@ -269,7 +272,9 @@ class OracleCompatBackend:
         # doesn't support it gets a clean ORA-01031 rather than an AttributeError.
         inner_change = getattr(self._inner, 'change_password', None)
         if inner_change is None:
-            raise BackendError('password change not supported', ora_code=1031)
+            raise BackendError(
+                'password change not supported', ora_code=ORA_INSUFFICIENT_PRIVILEGES
+            )
         inner_change(username, old_password, new_password)
 
     def commit(self) -> None:

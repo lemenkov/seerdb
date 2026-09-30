@@ -150,6 +150,34 @@ from seerdb.common.sqltext import (
 from seerdb.common.tns import _AUTH_MAX_OPEN_CURSORS
 from seerdb.common.tns_consts import (
     FIELD_VERSION_12_1,
+    ORA_CANNOT_INSERT_NULL,
+    ORA_CANNOT_KILL_CURRENT_SESSION,
+    ORA_CHECK_CONSTRAINT_VIOLATED,
+    ORA_DIVISOR_IS_ZERO,
+    ORA_INVALID_BIND_VARIABLE_NAME,
+    ORA_INVALID_CREATE_COMMAND,
+    ORA_INVALID_DATATYPE,
+    ORA_INVALID_IDENTIFIER,
+    ORA_INVALID_NUMBER,
+    ORA_INVALID_SESSION_ID,
+    ORA_INVALID_SQL_STATEMENT,
+    ORA_INVALID_USERNAME_PASSWORD,
+    ORA_NAME_ALREADY_USED,
+    ORA_NO_DATA_FOUND,
+    ORA_NOT_ENOUGH_VALUES,
+    ORA_NUMERIC_OVERFLOW,
+    ORA_PARENT_KEY_NOT_FOUND,
+    ORA_RESOURCE_BUSY,
+    ORA_SAVEPOINT_NEVER_ESTABLISHED,
+    ORA_SESSION_ID_DOES_NOT_EXIST,
+    ORA_SESSION_TERMINATED,
+    ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,
+    ORA_TOO_MANY_ROWS,
+    ORA_TOO_MANY_VALUES,
+    ORA_TYPE_HAS_DEPENDENTS,
+    ORA_UNIQUE_CONSTRAINT_VIOLATED,
+    ORA_VALUE_LARGER_THAN_PRECISION,
+    ORA_VALUE_TOO_LARGE_FOR_COLUMN,
     TNS_TYPE_ADT,
     TNS_TYPE_BDOUBLE,
     TNS_TYPE_BFLOAT,
@@ -3271,7 +3299,6 @@ def _translate_idioms(sql: str) -> str:
 # do against a real pre-21c/23ai Oracle, rather than failing on a value the
 # backend can't faithfully represent (#504). This is the honest ceiling: a
 # PostgreSQL backend behind an 11.2 Mirror does not offer these types.
-_ORA_INVALID_DATATYPE = 902
 _ORACLE_ONLY_DDL_TYPES = re.compile(r'\b(JSON|VECTOR|BOOLEAN)\b', re.IGNORECASE)
 
 
@@ -3280,7 +3307,6 @@ _ORACLE_ONLY_DDL_TYPES = re.compile(r'\b(JSON|VECTOR|BOOLEAN)\b', re.IGNORECASE)
 # *does* have CREATE DOMAIN, so without this it would run (and then fail on the
 # Oracle type name), never letting the suite's version guard skip. Reject it with
 # ORA-00901 so the SQL-domain test skips exactly as on a pre-23ai server (#512).
-_ORA_INVALID_CREATE = 901
 _IS_CREATE_DOMAIN = re.compile(r'\s*CREATE\s+DOMAIN\b', re.IGNORECASE)
 
 
@@ -3288,7 +3314,7 @@ def _reject_unsupported_ddl_types(sql: str) -> None:
     if _IS_CREATE_DOMAIN.match(sql):
         raise BackendError(
             'invalid CREATE command: SQL domains need a 23ai server',
-            ora_code=_ORA_INVALID_CREATE,
+            ora_code=ORA_INVALID_CREATE_COMMAND,
         )
     if not _IS_CREATE_TABLE.match(sql):
         return
@@ -3297,7 +3323,7 @@ def _reject_unsupported_ddl_types(sql: str) -> None:
         raise BackendError(
             f'invalid datatype: {match.group(1).upper()} is not available on '
             f'this server version',
-            ora_code=_ORA_INVALID_DATATYPE,
+            ora_code=ORA_INVALID_DATATYPE,
         )
 
 
@@ -3585,13 +3611,6 @@ _TEMPORAL_OIDS = {
 # ora_intervalym domain (traced through the catalog) and handled separately (#504).
 _INTERVAL_OIDS = frozenset({_INTERVAL_OID})
 
-_ORA_INVALID_SQL = 900
-# PL/SQL's single-row fetch, SELECT INTO or RETURNING INTO, that found several.
-_ORA_TOO_MANY_ROWS = 1422
-_ORA_INVALID_SESSION_ID = 26
-_ORA_KILL_CURRENT_SESSION = 27
-_ORA_SESSION_TERMINATED = 28
-_ORA_NO_SUCH_SESSION = 30
 
 # Map a PostgreSQL error (by SQLSTATE) to the Oracle error number a client
 # expects, so error-conditional flows behave (#500). The load-bearing one is
@@ -3599,27 +3618,26 @@ _ORA_NO_SUCH_SESSION = 30
 # best-effort and only swallows ORA-00942 — reporting ORA-00900 instead re-raised
 # and failed every test in setUp. Anything unmapped falls back to ORA-00900.
 _SQLSTATE_TO_ORA = {
-    '42P01': 942,  # undefined_table         -> table or view does not exist
-    '42704': 942,  # undefined_object (type) -> (DROP TYPE cleanup)
-    '42P07': 955,  # duplicate_table         -> name is already used
-    '42703': 904,  # undefined_column        -> invalid identifier
-    '42883': 904,  # undefined_function
-    '23505': 1,  # unique_violation        -> unique constraint violated
-    '23502': 1400,  # not_null_violation      -> cannot insert NULL
-    '23503': 2291,  # foreign_key_violation   -> integrity constraint: parent
-    #                key not found (the insert/update direction; the delete
-    #                direction is ORA-02292, not distinguished by SQLSTATE alone)
-    '23514': 2290,  # check_violation         -> check constraint violated
-    '22P02': 1722,  # invalid_text_representation -> invalid number (TO_NUMBER)
-    '3B001': 1086,  # invalid_savepoint_specification -> savepoint never established
-    '55P03': 54,  # lock_not_available -> resource busy (a DDL's lock wait, #1191)
+    '42P01': ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,  # undefined_table
+    '42704': ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,  # undefined_object (type), for DROP TYPE cleanup
+    '42P07': ORA_NAME_ALREADY_USED,  # duplicate_table
+    '42703': ORA_INVALID_IDENTIFIER,  # undefined_column
+    '42883': ORA_INVALID_IDENTIFIER,  # undefined_function
+    '23505': ORA_UNIQUE_CONSTRAINT_VIOLATED,  # unique_violation
+    '23502': ORA_CANNOT_INSERT_NULL,  # not_null_violation
+    '23503': ORA_PARENT_KEY_NOT_FOUND,  # foreign_key_violation: the insert/update
+    # direction; the delete direction is ORA-02292, which SQLSTATE cannot tell apart
+    '23514': ORA_CHECK_CONSTRAINT_VIOLATED,  # check_violation
+    '22P02': ORA_INVALID_NUMBER,  # invalid_text_representation (TO_NUMBER)
+    '3B001': ORA_SAVEPOINT_NEVER_ESTABLISHED,  # invalid_savepoint_specification
+    '55P03': ORA_RESOURCE_BUSY,  # lock_not_available (a DDL's lock wait, #1191)
     # A string too long for its VARCHAR2(n) column: Oracle's ORA-12899, "value
     # too large for column". Unlike 22003 below, this SQLSTATE means exactly one
     # Oracle error, so the table can carry it (#1127).
-    '22001': 12899,  # string_data_right_truncation -> value too large for column
+    '22001': ORA_VALUE_TOO_LARGE_FOR_COLUMN,  # string_data_right_truncation
     # #1323: the codes python-oracledb's suite checks by number.
-    '22012': 1476,  # division_by_zero -> divisor is equal to zero
-    'P0002': 1403,  # no_data_found (RAISE no_data_found) -> no data found
+    '22012': ORA_DIVISOR_IS_ZERO,  # division_by_zero
+    'P0002': ORA_NO_DATA_FOUND,  # no_data_found (RAISE no_data_found)
 }
 
 
@@ -3630,30 +3648,15 @@ _SQLSTATE_TO_ORA = {
 # with its ORA-NNNNN by the Mirror), which is right where the English text varies
 # by Oracle version anyway (e.g. ORA-01722).
 _ORA_MESSAGE = {
-    54: 'resource busy and acquire with NOWAIT specified or timeout expired',
-    913: 'too many values',
-    902: 'invalid datatype',
-    942: 'table or view does not exist',
-    947: 'not enough values',
-    1403: 'no data found',
-    1476: 'divisor is equal to zero',
-    2303: 'cannot drop or replace a type with type or table dependents',
+    ORA_RESOURCE_BUSY: 'resource busy and acquire with NOWAIT specified or timeout expired',
+    ORA_TOO_MANY_VALUES: 'too many values',
+    ORA_INVALID_DATATYPE: 'invalid datatype',
+    ORA_TABLE_OR_VIEW_DOES_NOT_EXIST: 'table or view does not exist',
+    ORA_NOT_ENOUGH_VALUES: 'not enough values',
+    ORA_NO_DATA_FOUND: 'no data found',
+    ORA_DIVISOR_IS_ZERO: 'divisor is equal to zero',
+    ORA_TYPE_HAS_DEPENDENTS: 'cannot drop or replace a type with type or table dependents',
 }
-
-
-# `22003 numeric_value_out_of_range` covers two different Oracle errors, so the
-# SQLSTATE alone cannot pick the code (#1127). A value too wide for a NUMBER(p,s)
-# column is ORA-01438, "value larger than specified precision allowed for this
-# column"; an arithmetic result that overflows is ORA-01426, "numeric overflow".
-# PostgreSQL tells them apart only in the primary message -- measured:
-#     numeric(3,0) given 123456  -> 22003 "numeric field overflow"
-#     int 2147483647 + 1         -> 22003 "integer out of range"
-# so the column case is matched on its message and everything else under 22003
-# is the arithmetic one. A client that branches on the code -- batcherrors
-# reports it per row -- would otherwise be told ORA-00900, a syntax error, about
-# a statement whose syntax was fine.
-_ORA_COLUMN_PRECISION = 1438
-_ORA_NUMERIC_OVERFLOW = 1426
 
 
 # A user error raised by a translated RAISE_APPLICATION_ERROR: P0001 whose message
@@ -3663,8 +3666,8 @@ _APPLICATION_ERROR = re.compile(r'ORA-(20\d{3}): (.*)', re.DOTALL)
 # both under syntax_error (42601), which says nothing an Oracle client can use;
 # Oracle names them ORA-00913 / ORA-00947 (#1323).
 _INSERT_ARITY = (
-    ('INSERT has more expressions than target columns', 913),
-    ('INSERT has more target columns than expressions', 947),
+    ('INSERT has more expressions than target columns', ORA_TOO_MANY_VALUES),
+    ('INSERT has more target columns than expressions', ORA_NOT_ENOUGH_VALUES),
 )
 
 
@@ -3684,7 +3687,7 @@ def _application_error(exc) -> tuple[int, str] | None:
 def _ora_code_for(exc) -> int:
     sqlstate = getattr(exc, 'sqlstate', None)
     if not isinstance(sqlstate, str):
-        return _ORA_INVALID_SQL
+        return ORA_INVALID_SQL_STATEMENT
     application = _application_error(exc)
     if application is not None:
         return application[0]
@@ -3693,20 +3696,30 @@ def _ora_code_for(exc) -> int:
         for text, code in _INSERT_ARITY:
             if text in primary:
                 return code
+    # `22003 numeric_value_out_of_range` covers two different Oracle errors, so the
+    # SQLSTATE alone cannot pick the code (#1127). A value too wide for a NUMBER(p,s)
+    # column is ORA-01438, "value larger than specified precision allowed for this
+    # column"; an arithmetic result that overflows is ORA-01426, "numeric overflow".
+    # PostgreSQL tells them apart only in the primary message -- measured:
+    #     numeric(3,0) given 123456  -> 22003 "numeric field overflow"
+    #     int 2147483647 + 1         -> 22003 "integer out of range"
+    # so the column case is matched on its message and everything else under 22003
+    # is the arithmetic one. A client that branches on the code -- batcherrors
+    # reports it per row -- would otherwise be told ORA-00900, a syntax error, about
+    # a statement whose syntax was fine.
     if sqlstate == '22003':
         diag = getattr(exc, 'diag', None)
         primary = getattr(diag, 'message_primary', None) or str(exc)
         if 'numeric field overflow' in primary:
-            return _ORA_COLUMN_PRECISION
-        return _ORA_NUMERIC_OVERFLOW
-    return _SQLSTATE_TO_ORA.get(sqlstate, _ORA_INVALID_SQL)
+            return ORA_VALUE_LARGER_THAN_PRECISION
+        return ORA_NUMERIC_OVERFLOW
+    return _SQLSTATE_TO_ORA.get(sqlstate, ORA_INVALID_SQL_STATEMENT)
 
 
 # A type statement refused because something depends on the type: Oracle's
 # ORA-02303 (#1197). PostgreSQL's dependent_objects_still_exist means other things
 # for other objects, so it maps only for a type statement.
 _TYPE_DDL = re.compile(r'\s*(?:CREATE\s+OR\s+REPLACE|DROP)\s+TYPE\b', re.IGNORECASE)
-_ORA_TYPE_HAS_DEPENDENTS = 2303
 # A type PostgreSQL does not know. Dropping one is Oracle's missing-object case,
 # which the ORA-00942 of _SQLSTATE_TO_ORA answers; anywhere else -- a CAST, a
 # column -- it is Oracle's ORA-00902 invalid datatype (#1329).
@@ -3724,14 +3737,14 @@ def _backend_error(
         and original is not None
         and _TYPE_DDL.match(original)
     ):
-        code = _ORA_TYPE_HAS_DEPENDENTS
+        code = ORA_TYPE_HAS_DEPENDENTS
     if (
         getattr(exc, 'sqlstate', None) == '42704'
         and original is not None
         and not _DROP_STATEMENT.match(original)
         and _primary_message(exc).startswith('type "')
     ):
-        code = _ORA_INVALID_DATATYPE
+        code = ORA_INVALID_DATATYPE
     application = _application_error(exc)
     if application is not None:
         # The user's own text, which the Mirror prefixes with the code.
@@ -4115,7 +4128,7 @@ def _object_column_meta(name: str, typ: DbObjectType) -> ColumnMeta:
 # ORA-00600 an escaping psycopg error became, or the ORA-00900 of an unmapped
 # SQLSTATE, said neither. psycopg reports a terminated connection as closed.
 def _session_terminated() -> BackendError:
-    return BackendError('session has been terminated', ora_code=_ORA_SESSION_TERMINATED)
+    return BackendError('session has been terminated', ora_code=ORA_SESSION_TERMINATED)
 
 
 def _while_connected(method):
@@ -4533,7 +4546,10 @@ class PostgresBackend:
         sql = _strip_leading_comments(sql)
         for name, quoted in bind_placeholders(sql, dedupe=True):
             if not quoted and name.upper() in _ORACLE_RESERVED_WORDS:
-                raise BackendError('invalid host/bind variable name', ora_code=1745)
+                raise BackendError(
+                    'invalid host/bind variable name',
+                    ora_code=ORA_INVALID_BIND_VARIABLE_NAME,
+                )
         if is_plsql(sql) or _NOT_EXPLAINABLE.match(sql):
             return
         translated = _translate_idioms(
@@ -4697,7 +4713,7 @@ class PostgresBackend:
         ids = _KILL_SESSION_ID.match(session)
         if ids is None:
             raise BackendError(
-                'missing or invalid session ID', ora_code=_ORA_INVALID_SESSION_ID
+                'missing or invalid session ID', ora_code=ORA_INVALID_SESSION_ID
             )
         (sid, serial) = (int(ids.group(1)), int(ids.group(2)))
         row = self._conn.execute(
@@ -4707,11 +4723,12 @@ class PostgresBackend:
         ).fetchone()
         if row is None:
             raise BackendError(
-                'User session ID does not exist.', ora_code=_ORA_NO_SUCH_SESSION
+                'User session ID does not exist.',
+                ora_code=ORA_SESSION_ID_DOES_NOT_EXIST,
             )
         if row[0] == sid:
             raise BackendError(
-                'cannot kill current session', ora_code=_ORA_KILL_CURRENT_SESSION
+                'cannot kill current session', ora_code=ORA_CANNOT_KILL_CURRENT_SESSION
             )
         # Wait for the victim's backend to exit before answering, as Oracle's kill
         # does, or the victim's next call could still run on it (#1367).
@@ -6224,7 +6241,7 @@ class PostgresBackend:
         if len(rows) > 1:
             raise BackendError(
                 'exact fetch returns more than requested number of rows',
-                ora_code=_ORA_TOO_MANY_ROWS,
+                ora_code=ORA_TOO_MANY_ROWS,
             )
         returned = _decode_row(cursor, rows[0], self._tstz_oid) if rows else None
         out = list(values)
@@ -6260,13 +6277,19 @@ class PostgresBackend:
         # the stored secret (#515). The map is shared across sessions.
         current = credential_lookup(self._credentials, username)
         if current is not None and old_password != current:
-            raise BackendError('invalid username/password; logon denied', ora_code=1017)
+            raise BackendError(
+                'invalid username/password; logon denied',
+                ora_code=ORA_INVALID_USERNAME_PASSWORD,
+            )
         # Oracle takes a password of at most 1024 bytes (12.2+; 11g far less).
         # Past that, the 1500-character change a client may try draws ORA-01017
         # from 11g and 23ai alike, so the Mirror answers the same, rather than
         # storing a password no Oracle would (#1266).
         if len(new_password.encode('utf-8')) > _MAX_PASSWORD_BYTES:
-            raise BackendError('invalid username/password; logon denied', ora_code=1017)
+            raise BackendError(
+                'invalid username/password; logon denied',
+                ora_code=ORA_INVALID_USERNAME_PASSWORD,
+            )
         for name in list(self._credentials):
             if name.upper() == username.upper():
                 self._credentials[name] = new_password
