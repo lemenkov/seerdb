@@ -6335,7 +6335,7 @@ class PostgresBackend:
         # bind positions.
         name, args = match.groups()
         arg_refs = [int(r) for r in re.findall(r':(\d+)', args)]
-        modes, argtypes, parameters = self._proc_signature(name)
+        modes, argtypes, parameters, kind = self._proc_signature(name)
         refused = _call_argument_error(block, name, args, parameters or None)
         if refused is not None:
             raise refused
@@ -6364,9 +6364,27 @@ class PostgresBackend:
             for param, ref in bound.items()
         ]
         cursor = self._conn.cursor()
-        cursor.execute(
-            f'CALL {name}({_call_placeholders(arguments)})', tuple(arg_values) or None
-        )
+        if kind == 'f':
+            # A routine PostgreSQL has as a function -- orafce's DBMS_OUTPUT, say
+            # (#1410) -- which CALL refuses. SELECT it instead, with only the
+            # arguments that carry an input: a function takes no OUT argument,
+            # and returns its OUT values as the row a CALL would.
+            given = [
+                (argument, value)
+                for (param, _ref), argument, value in zip(
+                    bound.items(), arguments, arg_values
+                )
+                if not (modes and param < len(modes) and modes[param] == 'o')
+            ]
+            cursor.execute(
+                f'SELECT * FROM {name}({_call_placeholders([a for a, _v in given])})',
+                tuple(v for _a, v in given) or None,
+            )
+        else:
+            cursor.execute(
+                f'CALL {name}({_call_placeholders(arguments)})',
+                tuple(arg_values) or None,
+            )
         # A procedure with no OUT or IN OUT parameter returns no row at all.
         returned = self._decode_out_row(
             cursor, cursor.fetchone() if cursor.description is not None else None
@@ -6529,25 +6547,30 @@ class PostgresBackend:
             out[position] = returned[i] if returned is not None else None
         return Result(out_binds=out)
 
-    def _proc_signature(self, name: str) -> tuple[list | None, list, list[str]]:
+    def _proc_signature(self, name: str) -> tuple[list | None, list, list[str], str]:
         # A routine's parameter modes ('i' IN, 'o' OUT, 'b' IN OUT), the aligned
-        # argument type oids and the parameter names -- what a call's argument
-        # list can name (#1368) -- from one pg_proc row. Modes place a CALL's result row
+        # argument type oids, the parameter names -- what a call's argument list
+        # can name (#1368) -- and its kind ('p' procedure, 'f' function: orafce
+        # has DBMS_OUTPUT's routines as functions, #1410), from one pg_proc row,
+        # in the schema the call names if it names one. Modes place a CALL's result row
         # (which carries only the OUT / IN OUT values) back onto the right bind
         # positions; the types let the OUT-bind path spot an ora_intervalym argument
         # (which has no result column to trace). Modes are None for an all-IN routine
         # (PostgreSQL leaves proargmodes — and proallargtypes — NULL then).
+        schema, _dot, routine = name.lower().rpartition('.')
         row = self._conn.execute(
-            'SELECT proargmodes, proallargtypes, proargnames FROM pg_proc '
-            'WHERE proname = %s ORDER BY oid DESC LIMIT 1',
-            (name.split('.')[-1].lower(),),
+            'SELECT p.proargmodes, p.proallargtypes, p.proargnames, p.prokind '
+            'FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace '
+            "WHERE p.proname = %s AND (%s = '' OR n.nspname = %s) "
+            'ORDER BY p.oid DESC LIMIT 1',
+            (routine, schema, schema),
         ).fetchone()
         if not row:
-            return None, [], []
+            return None, [], [], 'p'
         names = list(row[2] or ())
         if not row[0]:
-            return None, [], names
-        return list(row[0]), list(row[1] or ()), names
+            return None, [], names, row[3]
+        return list(row[0]), list(row[1] or ()), names, row[3]
 
     def change_password(
         self, username: str, old_password: str, new_password: str

@@ -1246,6 +1246,19 @@ class TypesIntegration(_IntegrationBase):
             self.cur.execute('DROP PROCEDURE pyo_p1404')
             self.cur.execute('DROP PROCEDURE pyo_q1404')
 
+    def test_dbms_output_round_trip(self):
+        # DBMS_OUTPUT through callproc: ENABLE, PUT_LINE, then GET_LINE hands
+        # the line back, status 0, and an empty buffer is status 1. The Mirror
+        # over PostgreSQL could not CALL orafce's DBMS_OUTPUT, whose routines are
+        # functions, and answered the ENABLE itself without running it (#1410).
+        self.cur.callproc('dbms_output.enable')
+        self.cur.callproc('dbms_output.put_line', ['a line of output'])
+        line, status = self.cur.var(str, 255), self.cur.var(int)
+        self.cur.callproc('dbms_output.get_line', [line, status])
+        self.assertEqual((line.getvalue(), status.getvalue()), ('a line of output', 0))
+        self.cur.callproc('dbms_output.get_line', [line, status])
+        self.assertEqual(status.getvalue(), 1)
+
     def test_a_named_argument_given_twice_is_a_compile_error(self):
         # Oracle compiles a call naming one argument twice into PLS-00703 under
         # ORA-06550, and the session carries on. The Mirror over PostgreSQL
