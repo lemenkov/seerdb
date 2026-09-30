@@ -1702,6 +1702,35 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute('begin :value := :value + 5.25; end;', {'value': var})
         self.assertEqual(var.getvalue(), datetime.datetime(2022, 5, 15, 18, 0, 0))
 
+    def test_a_midnight_ltz_bind_matches_a_truncated_ltz_column(self):
+        # A TIMESTAMP WITH LOCAL TIME ZONE bind with no fractional seconds goes
+        # out in the 7-byte DATE form, as python-oracledb sends it: the server
+        # compared the 11-byte form with a zero fraction to trunc() of an LTZ
+        # column and matched nothing (#1337). The session runs in the database's
+        # zone, as python-oracledb's own suite pins it.
+        if _conn_is_8i(self.conn):
+            self.skipTest('8i has no TIMESTAMP WITH LOCAL TIME ZONE')
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            self.skipTest("9i's TRUNC takes no TIMESTAMP (ORA-00932)")
+        self.cur.execute('SELECT sessiontimezone, dbtimezone FROM dual')
+        (session, database) = self.cur.fetchone()
+        self.cur.execute(f"ALTER SESSION SET TIME_ZONE = '{database}'")
+        try:
+            self.cur.execute(
+                f'CREATE TABLE {self.TABLE} (id NUMBER, t TIMESTAMP WITH LOCAL TIME ZONE)'
+            )
+            self.cur.execute(
+                f"INSERT INTO {self.TABLE} VALUES (1, TIMESTAMP '2022-06-12 10:30:20')"
+            )
+            self.cur.setinputsizes(seerdb.DB_TYPE_TIMESTAMP_LTZ)
+            self.cur.execute(
+                f'SELECT id FROM {self.TABLE} WHERE trunc(t) = :1',
+                [datetime.datetime(2022, 6, 12)],
+            )
+            self.assertEqual(self.cur.fetchall(), [(1,)])
+        finally:
+            self.cur.execute(f"ALTER SESSION SET TIME_ZONE = '{session}'")
+
     def test_a_var_read_only_as_input_beside_an_out_var(self):
         # A Var the block only reads is an IN bind: no value comes back for it,
         # and the OUT Var beside it gets its own. On 9i the reply's values were
@@ -7872,6 +7901,36 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     seerdb.DB_TYPE_TIMESTAMP,
                 ],
             )
+            await self._drop_async(Cur, Table)
+        finally:
+            await Conn.close()
+
+    async def test_a_midnight_ltz_bind_matches_a_truncated_ltz_column(self):
+        # Async twin of CursorIntegration's (#1337).
+        if _target_is_8i():
+            self.skipTest('8i has no TIMESTAMP WITH LOCAL TIME ZONE')
+        Table = 'PYO_ASYNC_LTZ_TRUNC'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            if Conn.field_version < FIELD_VERSION_10_2:
+                self.skipTest("9i's TRUNC takes no TIMESTAMP (ORA-00932)")
+            Cur = Conn.cursor()
+            await Cur.execute('SELECT dbtimezone FROM dual')
+            (database,) = await Cur.fetchone()
+            await Cur.execute(f"ALTER SESSION SET TIME_ZONE = '{database}'")
+            await self._drop_async(Cur, Table)
+            await Cur.execute(
+                f'CREATE TABLE {Table} (id NUMBER, t TIMESTAMP WITH LOCAL TIME ZONE)'
+            )
+            await Cur.execute(
+                f"INSERT INTO {Table} VALUES (1, TIMESTAMP '2022-06-12 10:30:20')"
+            )
+            Cur.setinputsizes(seerdb.DB_TYPE_TIMESTAMP_LTZ)
+            await Cur.execute(
+                f'SELECT id FROM {Table} WHERE trunc(t) = :1',
+                [datetime.datetime(2022, 6, 12)],
+            )
+            self.assertEqual(await Cur.fetchall(), [(1,)])
             await self._drop_async(Cur, Table)
         finally:
             await Conn.close()

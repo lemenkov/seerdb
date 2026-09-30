@@ -47,8 +47,12 @@ from seerdb.common.tns import (
 from seerdb.common.tns_consts import (
     TNS_TYPE_BDOUBLE,
     TNS_TYPE_BFLOAT,
+    TNS_TYPE_DATE,
     TNS_TYPE_INTERVALDS,
     TNS_TYPE_INTERVALYM,
+    TNS_TYPE_TIMESTAMP,
+    TNS_TYPE_TIMESTAMPLTZ,
+    TNS_TYPE_TIMESTAMPTZ,
 )
 from seerdb.common.types import (
     decode_binary_double,
@@ -1388,3 +1392,32 @@ class TestMixedPrecisionBatch(unittest.TestCase):
     def test_a_single_row_is_left_alone(self):
         rows = [[1, self.PLAIN]]
         self.assertEqual(self._widen(rows), rows)
+
+
+class TestDeclaredTemporalBindWidth(unittest.TestCase):
+    # A bind declared TIMESTAMP [WITH LOCAL TIME ZONE] goes out in the 7-byte DATE
+    # form when it has no fractional seconds, and in the 11-byte form when it has
+    # some, as python-oracledb sends it (#1337). DATE is always 7 bytes and WITH
+    # TIME ZONE always 13.
+
+    MIDNIGHT = datetime.datetime(2022, 6, 12)
+    FRACTION = datetime.datetime(2022, 6, 12, 0, 0, 0, 500)
+
+    def _width(self, value, data_type):
+        from seerdb.common.tns import _declared_value_bytes
+
+        encoded = _declared_value_bytes(value, data_type)
+        assert encoded is not None
+        return encoded[0]  # the one-byte length prefix
+
+    def test_no_fraction_goes_out_as_a_date(self):
+        for data_type in (TNS_TYPE_TIMESTAMP, TNS_TYPE_TIMESTAMPLTZ):
+            self.assertEqual(self._width(self.MIDNIGHT, data_type), 7)
+
+    def test_a_fraction_keeps_the_timestamp_form(self):
+        for data_type in (TNS_TYPE_TIMESTAMP, TNS_TYPE_TIMESTAMPLTZ):
+            self.assertEqual(self._width(self.FRACTION, data_type), 11)
+
+    def test_date_and_time_zone_widths_are_unchanged(self):
+        self.assertEqual(self._width(self.FRACTION, TNS_TYPE_DATE), 7)
+        self.assertEqual(self._width(self.MIDNIGHT, TNS_TYPE_TIMESTAMPTZ), 13)

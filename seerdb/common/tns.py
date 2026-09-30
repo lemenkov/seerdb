@@ -12978,7 +12978,17 @@ def _declared_value_bytes(Value: object, DataType: int) -> bytes | None:
     if Value is None:
         return None
     if isinstance(Value, (datetime.date, BcDate)) and DataType in _DECLARED_TEMPORAL:
-        return _bytes_with_length(_encode_temporal(Value, DataType))
+        Encoded = _encode_temporal(Value, DataType)
+        # A TIMESTAMP [WITH LOCAL TIME ZONE] bind with no fractional seconds goes
+        # out in the 7-byte DATE form under its 11-byte descriptor, as
+        # python-oracledb sends it. The server does not read the two forms alike:
+        # declared LTZ, `trunc(ltz_column) = :midnight` matched the row sent as 7
+        # bytes and nothing sent as 11 with a zero fraction (#1337).
+        if DataType in (TNS_TYPE_TIMESTAMP, TNS_TYPE_TIMESTAMPLTZ) and Encoded[
+            7:
+        ] == bytes(4):
+            Encoded = Encoded[:7]
+        return _bytes_with_length(Encoded)
     if isinstance(Value, bool) and DataType == TNS_TYPE_NUMBER:
         # From 23.1 a bare bool goes out as a native BOOLEAN value, which a
         # NUMBER descriptor makes the server read as a non-zero NUMBER: False
