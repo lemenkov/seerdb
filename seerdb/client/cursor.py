@@ -47,6 +47,9 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_CLOB,
     TNS_TYPE_JSON,
     TNS_TYPE_RAW,
+    TNS_TYPE_RID,
+    TNS_TYPE_UROWID,
+    TNS_TYPE_VARCHAR,
     UTF8_CHARSET,
     VECTOR_FLAG_FLEXIBLE_DIM,
 )
@@ -925,7 +928,11 @@ def _assign_out_binds(Bind, Result, Connection=None) -> list:
         # Without it every NVARCHAR OUT bind -- scalar and array alike -- came
         # back as its raw UTF-16BE bytes read one per character (#991).
         Column = {
-            'data_type': Variable.dbtype.tns_type,
+            # A ROWID / UROWID Var is bound as a VARCHAR, so its value comes back
+            # as that VARCHAR's text, which is the rowid a client uses (#1397).
+            'data_type': TNS_TYPE_VARCHAR
+            if Variable.dbtype.tns_type in (TNS_TYPE_RID, TNS_TYPE_UROWID)
+            else Variable.dbtype.tns_type,
             'charset': UTF8_CHARSET,
             'csfrm': getattr(Variable.dbtype, 'csfrm', 1),
         }

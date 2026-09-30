@@ -1172,6 +1172,23 @@ class TypesIntegration(_IntegrationBase):
                 )
             self.assertEqual(caught.exception.code, code)
 
+    def test_a_rowid_variable_binds_out_and_in(self):
+        # A ROWID / UROWID variable binds as the rowid's text: a block fills it,
+        # and it binds straight back in to find the row. The client had no bind
+        # encoding for it (#1397). The pre-10g tiers are #1399.
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            self.skipTest('a ROWID variable does not bind before 10g yet (#1399)')
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER)')
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (4)')
+        for typ in (seerdb.ROWID, seerdb.DB_TYPE_UROWID):
+            rid = self.cur.var(typ)
+            self.cur.execute(
+                f'BEGIN SELECT rowid INTO :r FROM {self.TABLE} WHERE n = 4; END;', [rid]
+            )
+            self.assertIsInstance(rid.getvalue(), str)
+            self.cur.execute(f'SELECT n FROM {self.TABLE} WHERE rowid = :r', [rid])
+            self.assertEqual(self.cur.fetchall(), [(4,)], typ)
+
     def test_a_named_argument_given_twice_is_a_compile_error(self):
         # Oracle compiles a call naming one argument twice into PLS-00703 under
         # ORA-06550, and the session carries on. The Mirror over PostgreSQL

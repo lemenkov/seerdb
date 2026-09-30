@@ -13335,6 +13335,10 @@ def _refcursor_bind_value(Token: object) -> bytes:
     return bytes([1, 1]) + encode_sb4(CursorId)
 
 
+# The longest universal rowid's text, which a ROWID / UROWID bind is sized for.
+_MAX_UROWID_LENGTH = 5267
+
+
 def encode_token_oac(Token: object) -> bytes:
     # The OAC field tells the server the maximum size we *might* send for
     # this bind. Oracle rejects with ORA-01461 ("can bind a LONG value only
@@ -13364,6 +13368,14 @@ def encode_token_oac(Token: object) -> bytes:
             return encode_token_raw(TNS_TYPE_VARCHAR, Token.size, 16, CharCs, 0, A)
         if DT == TNS_TYPE_CHAR:
             return encode_token_raw(TNS_TYPE_CHAR, Token.size, 16, CharCs, 0, A)
+        if DT in (TNS_TYPE_RID, TNS_TYPE_UROWID):
+            # A ROWID / UROWID Var binds as a VARCHAR of the longest universal
+            # rowid, 5267 characters, and its value is the rowid's text -- what
+            # the reference client sends, captured on 23ai. There is no bind form
+            # of the binary rowid a fetch returns, so this raised (#1397).
+            return encode_token_raw(
+                TNS_TYPE_VARCHAR, _MAX_UROWID_LENGTH, 16, CharCs, 0, A
+            )
         if DT == TNS_TYPE_RAW:
             return encode_token_raw(TNS_TYPE_RAW, Token.size, 16, 0, 0, A)
         if DT == TNS_TYPE_DATE:
