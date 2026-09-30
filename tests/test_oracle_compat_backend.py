@@ -66,10 +66,23 @@ def test_product_privs_lookup_raises_ora_942() -> None:
     assert excinfo.value.ora_code == 942
 
 
-def test_plsql_block_is_a_noop_success() -> None:
+def test_a_dbms_output_session_call_never_fails() -> None:
+    # sqlplus's DBMS_OUTPUT session call goes to the inner backend, which runs it
+    # where it has a DBMS_OUTPUT of its own (orafce's), so the ENABLE takes
+    # effect (#1410); one that refuses it still answers a success, as sqlplus's
+    # login needs.
     inner = _FakeInner()
-    result = OracleCompatBackend(inner).execute('BEGIN DBMS_OUTPUT.DISABLE; END;')
-    assert result.columns == [] and inner.calls == []
+    OracleCompatBackend(inner).execute('BEGIN DBMS_OUTPUT.DISABLE; END;')
+    assert inner.calls == ['BEGIN DBMS_OUTPUT.DISABLE; END;']
+
+    class _NoDbmsOutput(_FakeInner):
+        def execute(self, sql: str, binds: Sequence = ()) -> Result:
+            raise BackendError('no such package', ora_code=904)
+
+    result = OracleCompatBackend(_NoDbmsOutput()).execute(
+        'BEGIN DBMS_OUTPUT.ENABLE(NULL); END;'
+    )
+    assert result.columns == []
 
 
 def test_any_other_block_is_the_inner_backends_to_run() -> None:

@@ -54,7 +54,7 @@ _OUT_BIND_ASSIGN = re.compile(
 
 
 # sqlplus's own session calls -- `BEGIN DBMS_OUTPUT.DISABLE; END;` and the like --
-# which have nothing to do on a non-Oracle backend. Only these blocks, and the
+# which a backend without a DBMS_OUTPUT cannot run. Only these blocks, and the
 # literal `EXEC :v := ...` idiom, are answered here; any other block is a real one
 # and goes to the inner backend, which runs it or says why not (#1281).
 _SESSION_CALL = re.compile(
@@ -196,7 +196,14 @@ class OracleCompatBackend:
             if _LITERAL_ASSIGNMENTS.match(sql):
                 return Result(out_binds=_plsql_out_bind_values(sql))
             if _SESSION_CALL.match(sql):
-                return Result()
+                # A backend with a DBMS_OUTPUT of its own (orafce's) runs the
+                # call, so the ENABLE a client's later PUT_LINE / GET_LINE rely
+                # on takes effect (#1410); one without it answers as before,
+                # with nothing done, rather than failing sqlplus's login.
+                try:
+                    return self._inner.execute(sql, binds)
+                except BackendError:
+                    return Result()
         if 'PRODUCT_PRIVS' in normalized:
             # sqlplus's PRODUCT_PRIVS lookup, on a backend without the profile
             # table: sqlplus tolerates ORA-00942 there, printing the familiar
