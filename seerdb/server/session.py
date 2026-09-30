@@ -24,7 +24,7 @@ import logging
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from secrets import token_bytes
-from typing import NoReturn, TypeVar
+from typing import NoReturn, ParamSpec, TypeVar
 
 from seerdb.common.crypto import VFR_12C_SHA2, decrypt_password
 from seerdb.common.dbobject import ObjectImage
@@ -243,6 +243,22 @@ from seerdb.server.handshake import (
 from seerdb.server.identity import IDENTITY_11_2, ServerIdentity, server_identity
 
 _T = TypeVar('_T')
+_P = ParamSpec('_P')
+
+
+def _in_own_context(func: Callable[_P, _T]) -> Callable[_P, _T]:
+    # Run a session in a copy of its caller's context (#1333). A session pins
+    # its codec state -- the field version it decodes and encodes at, the OCI
+    # call sequence -- in context variables. The server gives every connection a
+    # fresh thread, but a caller that serves one session after another on the
+    # same thread (a thread pool, a test) carried each session's state into the
+    # next. A copy still starts from the caller's values.
+    @functools.wraps(func)
+    def run(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+        return contextvars.copy_context().run(func, *args, **kwargs)
+
+    return run
+
 
 logger = logging.getLogger('seerdb.server')
 
@@ -1070,6 +1086,7 @@ def _refuse_unhandled_oci(stream: PacketStream, what: str, seq: _OciSequence) ->
     )
 
 
+@_in_own_context
 def serve_session(
     stream: PacketStream,
     backend: Backend,
@@ -1413,6 +1430,7 @@ def _serve_thin_session(
             _refuse_unhandled(stream, f'TTC function {body[1]}')
 
 
+@_in_own_context
 def _serve_oci_session(
     stream: PacketStream,
     backend: Backend,

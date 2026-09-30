@@ -3067,3 +3067,33 @@ def test_a_session_counts_its_round_trips() -> None:
         server.join(5)
         listen.close()
     assert sid not in stats.snapshot()  # untracked once the session ended
+
+
+def test_a_session_leaves_its_callers_context_alone() -> None:
+    # A session pins its codec state in context variables -- here the OCI call
+    # sequence each request carries (byte 2, 1 below). Served on a thread that
+    # serves another session next (a thread pool, a test), it carried that state
+    # into the next one; run in its own copy of the context, it leaves the
+    # caller's as it was (#1333).
+    from seerdb.common.tns import _ENCODE_OCI_CALL_SEQ
+    from seerdb.common.tns_consts import TNS_DATA
+    from seerdb.server.session import _serve_oci_session
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.inbox = [(TNS_DATA, bytes([TTI_FUN, 0xFA, 1])), None]
+
+        def read_packet(self, **_kw):
+            return self.inbox.pop(0)
+
+        def write_packet(self, ptype: int, body: bytes, **_kw) -> None:
+            pass
+
+    stream: Any = _Stream()
+    backend: Any = object()
+    token = _ENCODE_OCI_CALL_SEQ.set(7)
+    try:
+        assert _serve_oci_session(stream, backend, 'PYO') == 'PYO'
+        assert _ENCODE_OCI_CALL_SEQ.get() == 7
+    finally:
+        _ENCODE_OCI_CALL_SEQ.reset(token)
