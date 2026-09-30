@@ -2626,10 +2626,16 @@ hands the backend *every* bind of a PL/SQL block as a `BindVar` (value + declare
 type + OAC buffer size); the backend registers each as an OUT-capable variable,
 runs the block (a pure-IN param simply keeps its input value, an OUT/IN OUT one
 is written back), and returns every variable's value. `encode_out_bind_response_thin`
-then emits the IOV with **all** binds marked OUT (`16`) and a DALC value + `ub4`
-return code per bind. The client keeps only the positions it bound as a `Var`
-(`_assign_out_binds` filters by its own bind list), so the extra echoed IN values
-are read and discarded — correct, if slightly more than a real server sends. This
+then emits the IOV with **all** binds marked IN OUT (`48`) and a DALC value +
+`ub4` return code per bind. The client keeps only the positions it bound as a
+`Var` (`_assign_out_binds` filters by its own bind list), so the extra echoed IN
+values are read and discarded — correct, if slightly more than a real server
+sends. IN OUT, not OUT (`16`), because the direction also governs the *next*
+execute: a client re-executing the block by cursor id sends **no value** for a bind
+it was told is pure OUT, so `:v := :v + 5` run twice got NULL for `:v` the second
+time (#1363). Marked IN OUT, every bind sends its value, and a pure-OUT one merely
+sends a NULL the block overwrites. A backend that does know the directions reports
+them, and the Mirror passes those on instead. This
 is what carries the thin `callproc` / `callfunc` / OUT-`Var` flow; passing the
 value with its type + size is also the fix for the `ORA-06502: buffer too small`
 a value-only OUT bind hit.

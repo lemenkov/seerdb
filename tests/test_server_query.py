@@ -488,6 +488,7 @@ def test_a_plsql_reply_reports_the_directions_the_server_gave() -> None:
     from seerdb.common.tns import ScalarOutBind, encode_out_bind_response_thin
     from seerdb.common.tns_consts import (
         TNS_BIND_DIR_INPUT,
+        TNS_BIND_DIR_INPUT_OUTPUT,
         TNS_BIND_DIR_OUTPUT,
         TNS_TYPE_VARCHAR,
     )
@@ -503,10 +504,11 @@ def test_a_plsql_reply_reports_the_directions_the_server_gave() -> None:
     assert b'out-value' in told
     assert b'in-value' not in told  # an IN bind carries no value back
 
-    # Without directions every bind is still reported OUT and returns its value,
-    # which is what a backend that cannot know keeps doing.
+    # Without directions every bind is reported IN OUT and returns its value,
+    # which is what a backend that cannot know keeps doing. Not OUT: a client
+    # re-executing the block sends no value for a pure-OUT bind (#1363).
     untold = encode_out_bind_response_thin(binds)
-    assert bytes([TNS_BIND_DIR_OUTPUT, TNS_BIND_DIR_OUTPUT]) in untold
+    assert bytes([TNS_BIND_DIR_INPUT_OUTPUT, TNS_BIND_DIR_INPUT_OUTPUT]) in untold
     assert b'in-value' in untold and b'out-value' in untold
 
 
@@ -4030,8 +4032,8 @@ def test_encode_out_bind_response_thin_roundtrips_via_client() -> None:
     from seerdb.common.tns_consts import TNS_TYPE_NUMBER, TNS_TYPE_VARCHAR
 
     _DECODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
-    # callproc([21, out NUMBER, io VARCHAR]) — the Mirror marks every bind OUT and
-    # returns each value; the client keeps only the positions it bound as a Var.
+    # callproc([21, out NUMBER, io VARCHAR]) — the Mirror marks every bind IN OUT
+    # and returns each value; the client keeps only the positions it bound as a Var.
     resp = encode_out_bind_response_thin(
         [
             ScalarOutBind(21, TNS_TYPE_NUMBER),
@@ -4045,7 +4047,7 @@ def test_encode_out_bind_response_thin_roundtrips_via_client() -> None:
     assert result[1] == 0  # success OER
     record = result[4][0]
     assert record['out_positions'] == [0, 1, 2]
-    assert record['directions'] == [16, 16, 16]  # all OUT
+    assert record['directions'] == [48, 48, 48]  # all IN OUT (#1363)
     # The client assigns only its Var positions; the plain IN value 0 is skipped.
     assert _assign_out_binds(bind, result) == []
     assert v_out.getvalue() == 42
