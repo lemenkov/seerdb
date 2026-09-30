@@ -187,6 +187,7 @@ from seerdb.common.tns_consts import (
     TTI_ROLLBACK,
     TTI_STA,
 )
+from seerdb.server import stats
 from seerdb.server.auth import (
     derive_conn_key,
     encode_challenge_oci,
@@ -426,14 +427,18 @@ def handle_login(
     min_field_version: int = FIELD_VERSION_11_2,
     tns_version: int | None = None,
     identity: 'ServerIdentity | None' = None,
-) -> tuple[str, bool, bytes | None, int | None]:
+) -> tuple[str, bool, bytes | None, int | None, int]:
     """Run the server side of the handshake + O5LOGON.
 
-    Returns ``(username, is_sqlplus, conn_key)`` — the second flag says whether
+    Returns ``(username, is_sqlplus, conn_key, negotiated, session_id)`` — the
+    second flag says whether
     the client speaks the classic sqlplus / thick-OCI (deadbeef) dialect, so the
     query loop can answer it in the right marshalling (#265); ``conn_key`` is the
     session key O5LOGON derived (``None`` for token auth), which the thin loop
-    reuses to decrypt a later changepassword (#21/#486).
+    reuses to decrypt a later changepassword (#21/#486). ``negotiated`` is the
+    field version the client settled on, and ``session_id`` the id the login
+    reply reported (0 when the backend could not say), which keys the session's
+    statistics (#1324).
 
     ``encryption`` is the Mirror's ANO stance (§33): ``'accepted'`` (default)
     stays plaintext unless the client forces it; ``'required'`` selects AES + a
@@ -587,6 +592,7 @@ def handle_login(
             sqlplus,
             None,
             negotiated,
+            0,
         )
     user = (
         parse_osesskey_oci(osesskey)
@@ -711,6 +717,7 @@ def handle_login(
                 logger.info('login ALTER SESSION refused: %s', exc)
     if not sqlplus and new_password_cipher:
         _apply_new_password(backend, user, secret, conn_key, new_password_cipher)
+    session_id = 0
     if sqlplus:
         stream.send_raw(
             encode_result_oci(conn_key, identity=identity, field_version=field_version)
@@ -734,9 +741,10 @@ def handle_login(
                 service_name=info.service_name,
             ),
         )
+        session_id = info.session_id
 
     logger.info('login OK: %s', user)
-    return user, sqlplus, conn_key, negotiated
+    return user, sqlplus, conn_key, negotiated, session_id
 
 
 def _backend_session_info(backend: Backend) -> SessionInfo:
@@ -1099,7 +1107,7 @@ def serve_session(
     declared_identity = getattr(backend, 'server_identity', None)
     identity = declared_identity or server_identity(field_version)
     backend = _IsolatedBackend(backend)
-    user, sqlplus, conn_key, negotiated = handle_login(
+    user, sqlplus, conn_key, negotiated, session_id = handle_login(
         stream,
         backend,
         encryption=encryption,
@@ -1124,6 +1132,29 @@ def serve_session(
         return _serve_oci_session(
             stream, backend, user, conn_key, identity, field_version=field_version
         )
+    stats.open_session(session_id)
+    try:
+        return _serve_thin_session(
+            stream, backend, user, conn_key, session_id, field_version, advertised
+        )
+    finally:
+        stats.close_session(session_id)
+
+
+def _serve_thin_session(
+    stream: PacketStream,
+    backend: Backend,
+    user: str,
+    conn_key: bytes | None,
+    session_id: int,
+    field_version: int,
+    advertised: int,
+) -> str:
+    # A logged-in thin client's calls, answered until its logoff or EOF; returns
+    # the user. Every request it sends -- one call, however many packets carry it
+    # -- is one round trip in the session's statistics (#1324), counted as it
+    # arrives, before its reply goes out, so a reader never sees a reply whose
+    # round trip is not yet counted.
     cursors = _Cursors()
     # LOB contents (wire bytes + is_clob) the current statement's rows carry, in
     # the order their locators went out; the thin client drains them with
@@ -1166,6 +1197,7 @@ def serve_session(
         received = stream.read_packet()
         if received is None:
             return user
+        stats.add(session_id, stats.ROUND_TRIPS)
         packet_type, body = received
         if packet_type == TNS_MARKER:
             _answer_marker(stream, body)
