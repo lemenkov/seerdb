@@ -205,6 +205,7 @@ ORA_ORACLE_NOT_AVAILABLE = 1034
 ORA_SAVEPOINT_NEVER_ESTABLISHED = 1086
 ORA_CANNOT_INSERT_NULL = 1400
 ORA_TOO_MANY_ROWS = 1422  # exact fetch returns more than requested number of rows
+ORA_INVALID_HEX_NUMBER = 1465
 ORA_NUMERIC_OVERFLOW = 1426
 ORA_VALUE_LARGER_THAN_PRECISION = 1438  # ... precision allowed for this column
 ORA_DIVISOR_IS_ZERO = 1476  # divisor is equal to zero

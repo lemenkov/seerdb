@@ -207,6 +207,7 @@ from seerdb.server import (
     LtzValue,
     Result,
     UnsupportedFeature,
+    as_declared_type,
     credential_lookup,
     stats,
 )
@@ -4863,17 +4864,50 @@ class PostgresBackend:
         # bind translation and per-statement savepoint apply exactly as they do
         # to any other statement. The binds the clause fills carry no value and
         # are dropped: their placeholders are gone from the trimmed text.
+        #
+        # Each value is converted to the type its receiving bind declared, as
+        # Oracle converts it, inside a savepoint of the iteration's own: a value
+        # that cannot be converted fails the iteration and undoes it, and only
+        # it (#1370).
         statement = strip_returning_into(sql)
         returned: list[list[tuple]] = []
         affected = 0
-        for row in rows:
-            values = [v for v in row if not isinstance(v, BindVar)]
-            result = self.execute(statement, values)
-            iteration = [tuple(r) for r in result.rows]
-            returned.append(iteration)
-            # A RETURNING statement gives back one row per row it changed, so
-            # the count is the rows read rather than a separate report.
-            affected += len(iteration)
+        # The iteration's savepoint has to outlive `execute`, which ends a
+        # transaction that wrote nothing to let its read locks go -- an UPDATE
+        # that matched no row, say -- and would take the savepoint with it. It
+        # spares one the client took; this one is spared the same way, and the
+        # locks are let go once the loop is done.
+        client_savepoint = self._user_savepoint
+        self._user_savepoint = True
+        try:
+            for row in rows:
+                values = [v for v in row if not isinstance(v, BindVar)]
+                declared = [v.tns_type for v in row if isinstance(v, BindVar)]
+                self._conn.execute('SAVEPOINT _mirror_returning')
+                try:
+                    result = self.execute(statement, values)
+                    iteration = [
+                        tuple(
+                            as_declared_type(value, declared[i])
+                            if i < len(declared)
+                            else value
+                            for i, value in enumerate(r)
+                        )
+                        for r in result.rows
+                    ]
+                except BackendError as err:
+                    self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_returning')
+                    self._conn.execute('RELEASE SAVEPOINT _mirror_returning')
+                    err.rowcount = affected
+                    raise
+                self._conn.execute('RELEASE SAVEPOINT _mirror_returning')
+                returned.append(iteration)
+                # A RETURNING statement gives back one row per row it changed,
+                # so the count is the rows read rather than a separate report.
+                affected += len(iteration)
+        finally:
+            self._user_savepoint = client_savepoint
+        self._release_read_locks()
         return Result(rowcount=affected, returned_rows=returned)
 
     def _returning_rowid(self, original: str, translated: str) -> str | None:

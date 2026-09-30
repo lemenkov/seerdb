@@ -49,6 +49,7 @@ from seerdb.server.backend import (
     LtzValue,
     Result,
     UnsupportedFeature,
+    as_declared_type,
     credential_lookup,
 )
 from seerdb.server.framing import PacketStream
@@ -85,6 +86,7 @@ __all__ = [
     'Result',
     'Server',
     'UnsupportedFeature',
+    'as_declared_type',
     'credential_lookup',
     'encode_accept',
     'encode_describe',

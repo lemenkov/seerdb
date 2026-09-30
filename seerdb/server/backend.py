@@ -20,13 +20,20 @@ from __future__ import annotations
 import datetime
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import Enum, auto
 from typing import Protocol, runtime_checkable
 
 from seerdb.common.tns import ColumnMeta
 from seerdb.common.tns_consts import (
+    ORA_INVALID_HEX_NUMBER,
+    ORA_INVALID_NUMBER,
     ORA_INVALID_SQL_STATEMENT,
     ORA_UNIMPLEMENTED_FEATURE,
+    TNS_TYPE_CHAR,
+    TNS_TYPE_NUMBER,
+    TNS_TYPE_RAW,
+    TNS_TYPE_VARCHAR,
 )
 
 # A username → secret map, the usual shape a backend authenticates against.
@@ -263,6 +270,42 @@ class BackendError(Exception):
         # them it reports the mode as never enabled, which is a worse answer
         # than the failure it is also being told about. Empty when unknown.
         self.row_counts = list(row_counts or [])
+
+
+def as_declared_type(value: object, tns_type: int) -> object:
+    """A RETURNING value converted to the type its receiving bind declared.
+
+    Oracle converts what the clause returns into the variable's type, and fails
+    the statement when it cannot: text returned into a RAW is read as hex
+    (ORA-01465 if it is not), into a NUMBER as a number (ORA-01722), and bytes
+    returned into a string become their hex text. A backend hands back its own
+    column's value, so without this a VARCHAR2 into a RAW arrived as its raw
+    bytes, and into a NUMBER was encoded as if its text were a NUMBER -- '42'
+    read back as -5.1E+21 (#1370). A value already of the declared kind, which
+    is all a passthrough backend returns, passes unchanged.
+
+    A backend converts inside the statement's own savepoint, so a value that
+    fails undoes the statement as Oracle does; raised once the statement is
+    kept, it would leave the row Oracle does not.
+    """
+    if tns_type == TNS_TYPE_RAW and isinstance(value, str):
+        text = value.strip()
+        try:
+            return bytes.fromhex(text if len(text) % 2 == 0 else '0' + text)
+        except ValueError:
+            raise BackendError(
+                'invalid hex number', ora_code=ORA_INVALID_HEX_NUMBER
+            ) from None
+    if tns_type == TNS_TYPE_NUMBER and isinstance(value, str):
+        try:
+            return Decimal(value.strip())
+        except ArithmeticError:
+            raise BackendError('invalid number', ora_code=ORA_INVALID_NUMBER) from None
+    if tns_type in (TNS_TYPE_VARCHAR, TNS_TYPE_CHAR) and isinstance(
+        value, (bytes, bytearray)
+    ):
+        return bytes(value).hex().upper()
+    return value
 
 
 class UnsupportedFeature(BackendError):
