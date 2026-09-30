@@ -231,6 +231,17 @@ def test_deref_becomes_a_parenthesised_sys_deref() -> None:
     )
 
 
+def test_dbms_debug_jdwp_calls_gain_their_parentheses() -> None:
+    # Oracle calls them bare; PostgreSQL would read a bare one as a column (#1355).
+    assert _translate_idioms(
+        'SELECT DBMS_DEBUG_JDWP.CURRENT_SESSION_ID, '
+        'dbms_debug_jdwp.current_session_serial() FROM dual'
+    ) == (
+        'SELECT dbms_debug_jdwp.CURRENT_SESSION_ID(), '
+        'dbms_debug_jdwp.current_session_serial() FROM dual'
+    )
+
+
 def test_a_ref_survives_update_and_vacuum_full() -> None:
     # The point of the hidden object id: an UPDATE and a VACUUM FULL both move
     # the row physically (its ctid), and a stored REF still reaches it.
