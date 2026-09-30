@@ -102,6 +102,26 @@ def bind_placeholders(SQL: str, dedupe: bool = False) -> list[tuple[str, bool]]:
     return Seen
 
 
+# Any placeholder: a quoted or unquoted name, or a number -- but not the second
+# colon of a `::` cast.
+_PLACEHOLDER_RE = re.compile(r'(?<!:):(?:"([^"\n]+)"|([A-Za-z_]\w*)|(\d+))')
+
+
+def placeholder_count(SQL: str) -> int:
+    """How many distinct placeholders a statement has, named AND numbered.
+
+    What a caller with no values sizes its list of NULLs by -- a parse, which
+    carries none. `bind_placeholders` reports only named ones, so `values (:1)`
+    counted none and went to the database with its `:1` unbound (#1394).
+    """
+    Seen: set[str] = set()
+    for M in _PLACEHOLDER_RE.finditer(strip_non_bind_text(SQL)):
+        Seen.add(
+            M.group(1) if M.group(1) is not None else (M.group(2) or M.group(3)).upper()
+        )
+    return len(Seen)
+
+
 def extract_bind_names(SQL: str, dedupe: bool = False) -> list[str]:
     # The placeholder names alone, in SQL order. See `bind_placeholders` for
     # what "name" means for each spelling.

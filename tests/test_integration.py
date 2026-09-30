@@ -4506,6 +4506,17 @@ class ParseIntegration(_IntegrationBase):
             self.cur.parse('SELECT :ROWID FROM dual')
         self.assertEqual(parsed.exception.code, 1745)
 
+    def test_parse_takes_numbered_placeholders(self):
+        # A parse carries no values, so its statement is checked with a NULL for
+        # each placeholder -- numbered ones too. The Mirror counted only named
+        # ones and sent `values (:1)` to the database unbound (#1394).
+        if self._pre10():
+            self.skipTest('cursor.parse() needs 10g+')
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
+        self.cur.parse(f'INSERT INTO {self.TABLE} (id) VALUES (:1)')
+        self.cur.parse(f'SELECT id FROM {self.TABLE} WHERE id = :1')
+        self.assertEqual([d[0] for d in self.cur.description], ['ID'])
+
     def test_parse_reports_a_statement_that_is_not_sql(self):
         if self._pre10():
             self.skipTest('cursor.parse() needs 10g+')
