@@ -6185,17 +6185,13 @@ class PartialBatchRowcountIntegration(_IntegrationBase):
             self.cur.executemany(f'INSERT INTO {self.TABLE} (n) VALUES (:1)', Rows)
         # Read it before anything else runs: the next execute replaces it.
         Reported = self.cur.rowcount
-        self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
-        (Applied,) = self.cur.fetchone()
-        if Applied and not Reported:
-            # The rows landed but the server said nothing about them. That is a
-            # server that does not report a partial count, not a client that
-            # lost one -- Mirror-over-PostgreSQL until #998. Skip rather than
-            # fail, and say which it is.
-            self.skipTest('this server reports no count for a partly-applied batch')
-        # Asserting against what actually LANDED, not against a constant: the
-        # point is that the number means something.
-        self.assertEqual(Reported, Applied)
+        self.cur.execute(f'SELECT n FROM {self.TABLE} ORDER BY n')
+        # Oracle undoes only the row that failed: the three before it stay, and
+        # the count says so. Comparing the count with whatever landed was not
+        # enough -- the Mirror over PostgreSQL undid all three and reported 0,
+        # which agreed (#1365).
+        self.assertEqual(self.cur.fetchall(), [(1,), (2,), (3,)])
+        self.assertEqual(Reported, 3)
 
     def test_a_statement_that_fails_outright_reports_none_applied(self):
         # The count is what the call MANAGED, so a statement that never applied
