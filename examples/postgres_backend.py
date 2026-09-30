@@ -728,6 +728,16 @@ _ORACLE_DICTIONARY_DDL = (
     # PostgreSQL folds the unquoted name to `dbms_lob.getlength`. orafce ships
     # dbms_alert / assert / output / pipe / random / sql / utility but no
     # dbms_lob at all, so there is nothing to lean on.
+    # DBMS_DEBUG_JDWP.CURRENT_SESSION_ID / _SERIAL (#1355): the no-privilege way
+    # a session reads its own id and serial, from the same expressions the login
+    # reports them by (session_info). Oracle calls them without parentheses;
+    # _translate_idioms adds them.
+    'CREATE SCHEMA IF NOT EXISTS dbms_debug_jdwp;'
+    'CREATE OR REPLACE FUNCTION dbms_debug_jdwp.current_session_id() '
+    'RETURNS integer LANGUAGE sql STABLE AS $$ SELECT pg_backend_pid() $$;'
+    'CREATE OR REPLACE FUNCTION dbms_debug_jdwp.current_session_serial() '
+    'RETURNS integer LANGUAGE sql STABLE AS '
+    '$$ SELECT sys.ora_serial(pg_backend_pid()) $$;'
     'CREATE SCHEMA IF NOT EXISTS dbms_lob;'
     'CREATE OR REPLACE FUNCTION dbms_lob.getlength(text) RETURNS integer '
     'LANGUAGE sql IMMUTABLE AS $$ SELECT length($1) $$;'
@@ -2516,6 +2526,16 @@ _IDIOM_REWRITES = [
     ),
     # SYSDATE / SYSTIMESTAMP → the session clock (SYSDATE is to-the-second).
     (re.compile(r'\bsystimestamp\b', re.IGNORECASE), 'ora_systimestamp()'),
+    # DBMS_DEBUG_JDWP.CURRENT_SESSION_ID / _SERIAL are called without parentheses
+    # in Oracle, which PostgreSQL would read as a column (#1355).
+    (
+        re.compile(
+            r'\bdbms_debug_jdwp\s*\.\s*(current_session_id|current_session_serial)\b'
+            r'(?!\s*\()',
+            re.IGNORECASE,
+        ),
+        r'dbms_debug_jdwp.\1()',
+    ),
     # CURRENT_TIMESTAMP [(p)] is the session's TIMESTAMP WITH TIME ZONE (#1208).
     (
         re.compile(r'\bcurrent_timestamp\b(?:\s*\(\s*\d+\s*\))?', re.IGNORECASE),

@@ -1547,14 +1547,15 @@ class CursorIntegration(_IntegrationBase):
         self.assertIsInstance(self.conn.session_id, int)
         self.assertIsInstance(self.conn.serial_num, int)
         self.assertEqual(self.conn.session_id, int(sid))
-        # The serial is the one the server names the session by. The package
-        # needs no privilege; a server without it (the Mirror over PostgreSQL)
-        # checks only the type.
-        try:
-            self.cur.execute('SELECT dbms_debug_jdwp.current_session_serial FROM dual')
-        except DatabaseError:
-            return
-        self.assertEqual(self.cur.fetchone(), (self.conn.serial_num,))
+        # The id and serial are the ones the server names the session by, read
+        # through the package that needs no privilege (#1355).
+        self.cur.execute(
+            'SELECT dbms_debug_jdwp.current_session_id, '
+            'dbms_debug_jdwp.current_session_serial FROM dual'
+        )
+        self.assertEqual(
+            self.cur.fetchone(), (self.conn.session_id, self.conn.serial_num)
+        )
 
     def test_v_session_shows_the_identity_the_client_declared(self):
         # v$session and v$session_connect_info show this session as its login
@@ -7849,13 +7850,13 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 self.assertIsInstance(Conn.session_id, int)
                 self.assertIsInstance(Conn.serial_num, int)
                 self.assertEqual(Conn.session_id, int(sid))
-                try:
-                    await Cur.execute(
-                        'SELECT dbms_debug_jdwp.current_session_serial FROM dual'
-                    )
-                except DatabaseError:
-                    return
-                self.assertEqual(await Cur.fetchone(), (Conn.serial_num,))
+                await Cur.execute(
+                    'SELECT dbms_debug_jdwp.current_session_id, '
+                    'dbms_debug_jdwp.current_session_serial FROM dual'
+                )
+                self.assertEqual(
+                    await Cur.fetchone(), (Conn.session_id, Conn.serial_num)
+                )
 
     async def test_v_session_shows_the_identity_the_client_declared(self):
         # Async twin of CursorIntegration's.
