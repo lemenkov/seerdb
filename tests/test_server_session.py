@@ -34,9 +34,11 @@ from seerdb.common.tns_consts import (
     VERSION_12_2_0_1,
     VERSION_23_1_162_0,
 )
+from seerdb.server import stats
 from seerdb.server.backend import (
     Capability,
     Result,
+    SessionInfo,
     UnsupportedFeature,
     credential_lookup,
 )
@@ -93,7 +95,7 @@ def _run_mirror(listen: socket.socket, result: dict) -> None:
     conn, _ = listen.accept()
     stream = PacketStream(conn)
     try:
-        (result['user'], _sqlplus, _conn_key, result['fv']) = handle_login(
+        (result['user'], _sqlplus, _conn_key, result['fv'], _sid) = handle_login(
             stream, _DualBackend()
         )
         # Block on the client's logoff / EOF so the socket stays open until the
@@ -2982,3 +2984,58 @@ def test_a_success_oer_carries_no_message_from_12_1() -> None:
         assert _oer_message(0, b'') == b'\x00'
     finally:
         _ENCODE_FIELD_VERSION.reset(token)
+
+
+class _NumberedBackend(_DualBackend):
+    # _DualBackend reporting a session id at login, as a real backend's
+    # session_info() does, so the Mirror tracks the session's statistics.
+    session_id = 4321
+
+    def session_info(self) -> SessionInfo:
+        return SessionInfo(session_id=self.session_id)
+
+
+def test_a_session_counts_its_round_trips() -> None:
+    # Each call the client makes is one round trip in the session's statistics,
+    # counted by the Mirror, which alone sees the wire (#1324). The session is
+    # tracked under the id its login reported, from login to its end.
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    port = listen.getsockname()[1]
+    result: dict = {}
+
+    def serve() -> None:
+        conn, _ = listen.accept()
+        try:
+            result['user'] = serve_session(PacketStream(conn), _NumberedBackend())
+        finally:
+            conn.close()
+
+    server = threading.Thread(target=serve, daemon=True)
+    server.start()
+    sid = _NumberedBackend.session_id
+
+    def round_trips() -> int:
+        return stats.snapshot()[sid][stats.ROUND_TRIPS]
+
+    conn = seerdb.connect(
+        host='127.0.0.1',
+        port=port,
+        user='PYO',
+        password='pyo123',
+        service_name='XE',
+        timeout=5000,
+    )
+    try:
+        before = round_trips()
+        conn.ping()
+        assert round_trips() - before == 1
+        conn.commit()
+        assert round_trips() - before == 2
+    finally:
+        conn.close()
+        server.join(5)
+        listen.close()
+    assert sid not in stats.snapshot()  # untracked once the session ended

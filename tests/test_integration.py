@@ -1423,6 +1423,49 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id, v FROM {self.TABLE} ORDER BY id')
         self.assertEqual(self.cur.fetchall(), [(1, 'n+2'), (2, 'n++4'), (3, 'n+++6')])
 
+    def test_v_sesstat_counts_the_round_trips(self):
+        # Another session reads this one's round trips from V$SESSTAT, one per
+        # call, as Oracle counts them (#1324). Reading the V$ views takes a
+        # privilege the test user may lack, and before 10g USERENV has no SID.
+        from seerdb.common.exceptions import DatabaseError
+
+        try:
+            self.cur.execute("SELECT sys_context('userenv', 'sid') FROM dual")
+        except DatabaseError as exc:
+            if exc.code == 2003:
+                self.skipTest('no USERENV SID before 10g')
+            raise
+        (sid,) = self.cur.fetchone()
+        reader = _connect()
+        try:
+            cur = reader.cursor()
+
+            def round_trips():
+                cur.execute(
+                    'SELECT ss.value FROM v$sesstat ss, v$statname sn '
+                    'WHERE ss.sid = :1 AND ss.statistic# = sn.statistic# '
+                    "AND sn.name = 'SQL*Net roundtrips to/from client'",
+                    [sid],
+                )
+                return cur.fetchone()[0]
+
+            try:
+                before = round_trips()
+            except DatabaseError as exc:
+                # The Mirror over PostgreSQL serves V$SESSTAT to every user.
+                if (
+                    exc.code == 942
+                    and os.environ.get('SEERDB_TEST_MIRROR') != 'postgres'
+                ):
+                    self.skipTest('the test user cannot read V$SESSTAT')
+                raise
+            self.conn.ping()
+            self.assertEqual(round_trips() - before, 1)
+            self.conn.commit()
+            self.assertEqual(round_trips() - before, 2)
+        finally:
+            reader.close()
+
     def test_the_session_id_is_the_sid_sql_reports(self):
         # A client reads its session id and serial from the login reply alone,
         # and SQL names the same session (#1212, #1218). Before 10g USERENV has

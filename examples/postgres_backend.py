@@ -118,6 +118,7 @@ from __future__ import annotations
 import datetime
 import decimal
 import hashlib
+import json
 import re
 import struct
 import uuid
@@ -180,6 +181,7 @@ from seerdb.server import (
     Result,
     UnsupportedFeature,
     credential_lookup,
+    stats,
 )
 from seerdb.server.backend import SessionInfo
 from seerdb.server.identity import IDENTITY_12_1
@@ -1041,6 +1043,23 @@ _ORACLE_DICTIONARY_DDL = (
     'sys.ora_serial(a.pid) AS "serial#", s.driver AS client_driver '
     'FROM pg_stat_activity a LEFT JOIN sys.ora_sessions s ON s.pid = a.pid '
     "WHERE a.datname = current_database() AND a.backend_type = 'client backend';"
+    # v$statname / v$sesstat (#1324): the sessions' statistics, which only the
+    # Mirror can count (seerdb.server.stats). v$statname names the ones it keeps,
+    # numbered as 23ai numbers them. sys.ora_sesstat() unpacks a snapshot of
+    # every session's counts that _translate_admin writes into a statement naming
+    # v$sesstat as it goes out -- the counts live in the Mirror process, not in
+    # the database. The view itself, with no snapshot, is empty.
+    'CREATE OR REPLACE VIEW sys."v$statname" AS SELECT s.n AS "statistic#", '
+    's.name::text AS name, s.class FROM (VALUES '
+    + ', '.join(
+        f"({number}, '{name}', 1)" for name, number in stats.STATISTIC_NUMBERS.items()
+    )
+    + ') AS s(n, name, class);'
+    'CREATE OR REPLACE FUNCTION sys.ora_sesstat(text) '
+    'RETURNS TABLE (sid integer, "statistic#" integer, value numeric) '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT (e->>0)::integer, (e->>1)::integer, '
+    '(e->>2)::numeric FROM jsonb_array_elements($1::jsonb) e $$;'
+    'CREATE OR REPLACE VIEW sys."v$sesstat" AS SELECT * FROM sys.ora_sesstat(\'[]\');'
     # Object types (#1127): `CREATE TYPE ... AS OBJECT` is a standalone composite
     # (relkind 'c' -- a table's own row type is not one). A client resolves a
     # type through these two views before it binds or reads a value of it, so a
@@ -2153,7 +2172,27 @@ def _translate_admin(sql: str) -> str:
         # reference thin client decoded the row against a statement it expected
         # none from and failed with a TypeError.
         return _NO_OP
-    return sql
+    return _with_session_stats(sql)
+
+
+# V$SESSTAT named in a statement, bare or as SYS.V$SESSTAT (#1324).
+_V_SESSTAT = re.compile(r'(?<![\w$"])(?:sys\.)?v\$sesstat\b', re.IGNORECASE)
+
+
+def _with_session_stats(sql: str) -> str:
+    # A statement reading V$SESSTAT reads a snapshot of every session's
+    # statistics as they stand now, taken from the Mirror (seerdb.server.stats)
+    # and written into the statement: the counts live in the Mirror process,
+    # where the database cannot see them (#1324).
+    if not _V_SESSTAT.search(sql):
+        return sql
+    rows = [
+        [sid, stats.STATISTIC_NUMBERS[name], value]
+        for sid, counts in stats.snapshot().items()
+        for name, value in counts.items()
+        if name in stats.STATISTIC_NUMBERS
+    ]
+    return _V_SESSTAT.sub(f"sys.ora_sesstat('{json.dumps(rows)}')", sql)
 
 
 # A statement PostgreSQL runs to no effect and answers with no result set.
