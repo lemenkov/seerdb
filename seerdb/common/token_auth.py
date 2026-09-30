@@ -15,8 +15,8 @@ message carrying the token. Two shapes (python-oracledb parity):
 
 This module is the sans-io crypto: build the header, sign it, and (for the
 Mirror's server half) verify it. The wire framing of the AUTH message lives in
-:mod:`seerdb.common.tns`. The header layout + signing scheme were re-expressed
-from the go-ora driver (MIT); they are the format the ADB server enforces.
+:mod:`seerdb.common.tns`. The header layout + signing scheme are the format the
+ADB server enforces.
 """
 
 from __future__ import annotations

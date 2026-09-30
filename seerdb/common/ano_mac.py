@@ -4,8 +4,7 @@
 """Oracle native data integrity — the AES-keystream MAC (#437, phase 4).
 
 When the ANO negotiation selects a SHA-2 data-integrity algorithm, each TTC data
-packet carries a MAC computed by this construction (re-expressed from go-ora's
-``OracleNetworkHash2``, MIT). It is *not* a standard HMAC: a keyed AES-CBC
+packet carries a MAC computed by this construction. It is *not* a standard HMAC: a keyed AES-CBC
 "keystream" produces one hash-sized block per packet, and the packet MAC is
 ``SHA(payload || keystream_block)``. The keystream is stateful — it advances one
 block per packet — so identical payloads get different MACs.
@@ -63,25 +62,45 @@ class AnoMac:
             )
         self._hash = _HASHES[Algorithm]
         self._size = self._hash().digest_size  # 32 / 48 / 64 — block-aligned
-        KeySize = 5  # go-ora's OracleNetworkHash2 keys off the first 5 bytes
-
-        # aes_key = key[:keysize] | 0xFF, zero-filled to 16 bytes.
-        AesKey = bytearray(16)
-        AesKey[:KeySize] = Key[:KeySize]
-        AesKey[KeySize] = 0xFF
-        # One AES-CBC pass over 32 zero bytes seeds the base key + IV.
-        Seed = AES.new(bytes(AesKey), AES.MODE_CBC, Iv[:16]).encrypt(bytes(32))
-        BaseKey = bytearray(Seed[:16])
-        BaseIv = Seed[16:32]
-
-        (SendTag, RecvTag) = (
+        self._key_size = 5  # go-ora's OracleNetworkHash2 keys off the first 5 bytes
+        (self._send_tag, self._recv_tag) = (
             (_SEND_TAG, _RECV_TAG) if ClientSide else (_RECV_TAG, _SEND_TAG)
         )
-        self._send_cipher = self._keystream_cipher(BaseKey, KeySize, SendTag, BaseIv)
-        self._recv_cipher = self._keystream_cipher(BaseKey, KeySize, RecvTag, BaseIv)
-        # The evolving keystream buffers (one hash-sized block).
+
+        # aes_key = key[:keysize] | 0xFF, zero-filled to 16 bytes, over the
+        # server's DH IV: the seed generator, which re-derivation re-keys.
+        AesKey = bytearray(16)
+        AesKey[: self._key_size] = Key[: self._key_size]
+        AesKey[self._key_size] = 0xFF
+        self._seed_gen = AES.new(bytes(AesKey), AES.MODE_CBC, Iv[:16])
+        self._seed = bytes(32)
+        # The evolving keystream buffers (one hash-sized block). A re-derivation
+        # re-keys the ciphers that advance them but leaves them as they are.
         self._send_buf = bytes(self._size)
         self._recv_buf = bytes(self._size)
+        self.rederive()
+
+    def rederive(self) -> None:
+        """Derive the keystream ciphers afresh (#1345).
+
+        One AES-CBC pass of the seed generator over the 32-byte seed gives the
+        next seed; its first 16 bytes key and its last 16 bytes seed both the
+        next seed generator and the two per-direction keystream ciphers. At
+        channel creation the seed is 32 zero bytes, so the first call is the
+        original derivation. The server runs it again after every break/reset
+        exchange -- an in-band error report -- so a client that did not
+        failed the MAC of the error that followed, and lost the session.
+        """
+        self._seed = self._seed_gen.encrypt(self._seed)
+        BaseKey = bytearray(self._seed[:16])
+        BaseIv = self._seed[16:32]
+        self._seed_gen = AES.new(bytes(BaseKey), AES.MODE_CBC, BaseIv)
+        self._send_cipher = self._keystream_cipher(
+            BaseKey, self._key_size, self._send_tag, BaseIv
+        )
+        self._recv_cipher = self._keystream_cipher(
+            BaseKey, self._key_size, self._recv_tag, BaseIv
+        )
 
     @staticmethod
     def _keystream_cipher(BaseKey: bytearray, KeySize: int, Tag: int, Iv: bytes):

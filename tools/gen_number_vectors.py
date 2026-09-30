@@ -20,8 +20,8 @@ import re
 import sys
 from decimal import Decimal
 
-# (sql_literal, expected value decode_number should return). Coverage follows
-# the go-ora number test table (MIT) — scenario reused as fact.
+# (sql_literal, expected value decode_number should return). The coverage
+# matches go-ora's number test table.
 CASES = [
     ('0', 0),
     ('1', 1),

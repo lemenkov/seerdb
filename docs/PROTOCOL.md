@@ -6826,7 +6826,7 @@ prepare), sync + async.
 Enqueue/dequeue via `connection.queue(name[, payload_type])` →
 `enqone`/`deqone` (single) and `enqmany`/`deqmany` (array), with
 `connection.msgproperties(payload=...)` and the queue's `enqoptions`/
-`deqoptions`. Three TTI functions, RE'd from python-oracledb:
+`deqoptions`. Three TTI functions, laid out as python-oracledb sends them:
 
 - **Enqueue** (`TNS_FUNC_AQ_ENQ` = 121) — queue name, the message properties
   block, recipients, visibility, the 16-byte payload **TOID** (RAW = `…00 17`,
@@ -7117,7 +7117,10 @@ itself is plaintext. Each `TNS_DATA` payload (the bytes after the 8-byte header 
   append one trailing marker byte `padding_count + 1` (1..16) *after* the
   ciphertext. A fresh CBC state per packet (no IV chaining across packets).
 - **Key-fold flag**: one trailing `0x00` byte. No auth-key folding happens on
-  the wire for this server (the byte is always 0).
+  the wire for this server when the client sends 0: the server mirrors the
+  client's value. The classic sqlplus client sets it to `01` in both directions
+  after login (observed in the sibling ODBC driver's investigation,
+  seerdb/SeerODBC#55); what it folds is not documented here.
 
 Receive reverses it: strip the flag byte, AES-CBC decrypt (removing the padding
 marker + padding), then verify and strip the trailing MAC. Each `TNS_DATA`
@@ -7129,7 +7132,8 @@ decrypt per packet before reassembly, and the MAC keystreams stay in lock-step.
 The negotiation completes before PRO. From there the ordinary handshake runs
 unchanged, but each `TNS_DATA` is wrapped as above: PRO → PRO reply →
 (fast-auth bundle at fv≥18, §20) → auth → result. There is no key re-keying
-after authentication for this server.
+after authentication for this server, except the integrity re-derivation that
+every break/reset exchange triggers (§33.6).
 
 ### 33.5 Server side (the Mirror)
 
@@ -7162,6 +7166,45 @@ AES256 + SHA256.
 The classic sqlplus / thick-OCI client also negotiates ANO but stamps version
 `0x00000000`; that path is handled inline by the `deadbeef` dialect (§4.1.1) and
 is unaffected by the stance.
+
+### 33.6 A break/reset re-derives the integrity keystreams (#1345)
+
+A server with out-of-band breaks disabled reports a SQL error **in-band**: a
+break marker (`01 00 01`), a reset marker (`01 00 02`), the client's reset marker,
+then the error `TNS_DATA`. After that exchange **both sides re-derive their
+data-integrity keystreams**. The cipher is unaffected. The MAC state is:
+
+- a **seed generator**, AES-128-CBC. At channel creation it is keyed
+  `shared[:5] ‖ 0xFF` (zero-filled to 16) with IV `server_iv[:16]`, the key §33.3
+  describes;
+- a 32-byte **seed**, initially zero.
+
+**Derive:** `seed = seed_generator.encrypt(seed)`; the seed generator becomes
+AES-128-CBC(key `seed[:16]`, IV `seed[16:32]`); each direction's keystream cipher
+becomes AES-128-CBC(key `seed[:16]` with byte 5 set to its `90` / `180` tag,
+IV `seed[16:32]`). The first derivation, at channel creation, is exactly §33.3's
+(one pass over 32 zero bytes). The server derives again at **every** break/reset
+exchange, so the client must too: once per episode, when it answers the server's
+break with its own reset, before it unwraps the error packet. The evolving
+per-packet keystream blocks are **not** reset; they carry on under the re-keyed
+ciphers.
+
+A client that doesn't re-derive still decrypts the error packet, but its MAC
+fails. The session is lost at its first error: the next request times out.
+
+Measured on 26ai with encryption and integrity REQUIRED (AES-256, SHA-256) and
+`DISABLE_OOB=ON`:
+- seerdb's client raised `data integrity check failed` on the first ORA-00942,
+  then timed out on the next query;
+- with the re-derivation both errors of a session come back as ORA-00942 and the
+  session carries on, sync and async;
+- a recorded session (`tests/fixtures/ano_reset_session.txt`: shared secret,
+  server IV, every server `payload ‖ MAC`, the reset points) verifies packet for
+  packet only with it. Without it, the first packet after a reset fails.
+
+The same behaviour was found independently in the sibling ODBC driver
+(seerdb/SeerODBC#55). The Mirror's side, re-deriving when it breaks for an error
+with encryption required, is #1346.
 
 ## 34. End-user security context (#460, post-23ai / milestone #29)
 

@@ -1256,6 +1256,7 @@ class OracleConnect(_ConnectionLogic):
                     # echo every marker, which storms the line.
                     if not self._in_break:
                         self.send(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
+                        self._rederive_ano_after_reset()
                         self._in_break = True
                     continue
                 case t if t == TNS_REDIRECT:
@@ -3388,6 +3389,7 @@ class OracleConnect(_ConnectionLogic):
                 return (Type, Packet)
             if not self._in_break:
                 self.send(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
+                self._rederive_ano_after_reset()
                 self._in_break = True
             # else: drain the server's terminal reset (and any straggler
             # markers) silently — do NOT reply, or the server replies again.

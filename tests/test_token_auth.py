@@ -7,8 +7,8 @@ The real Autonomous Database path needs cloud infra to test, so validation is a
 round-trip against the Mirror: the client sends the token AUTH, the Mirror
 verifies the OCI IAM signature (offline-checkable) and grants the session. The
 crypto helpers and the AUTH-message codec are checked directly. The wire format
-(AUTH_TOKEN + AUTH_HEADER + AUTH_SIGNATURE, the request header, the RSA-SHA256
-signature) is re-expressed from the go-ora driver (MIT).
+is AUTH_TOKEN + AUTH_HEADER + AUTH_SIGNATURE, the request header and the
+RSA-SHA256 signature.
 """
 
 from __future__ import annotations

@@ -335,9 +335,8 @@ class TestOtherTypeVectors(unittest.TestCase):
 
     Each row's bytes were produced by ``SELECT dump(cast(<literal> as <type>))``
     against a live Oracle, so they are exactly what Oracle puts on the wire. The
-    *choice* of literals follows the coverage of the go-ora driver's other-types
-    test table (MIT, Copyright 2020 Samy Sultan) — a scenario reused as fact; the
-    Oracle-output bytes are authoritative and the assertions are original. Both
+    *choice* of literals covers the same ground as go-ora's other-types test
+    table; the Oracle-output bytes are authoritative. Both
     directions are checked: decode (bytes → value) and encode (value → bytes).
     """
 

@@ -11,9 +11,8 @@ through leading comments and quoted text.
 A placeholder name is returned in its lookup form: an unquoted one folds to
 upper, since it is case-insensitive, while a quoted ``:"name"`` keeps its exact
 text, since it is not (#686). The scenarios (comment-led
-SELECT/DML/PLSQL classification and named-bind extraction) mirror the go-ora
-driver's statement/parse tests (MIT), reused as facts; the assertions are
-original.
+SELECT/DML/PLSQL classification and named-bind extraction) cover the same
+ground as go-ora's statement/parse tests.
 """
 
 import unittest

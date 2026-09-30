@@ -123,6 +123,14 @@ class AnoChannel:
     def active(self) -> bool:
         return self._cipher is not None
 
+    def rederive(self) -> None:
+        """Re-derive the data-integrity keystreams after a break/reset (#1345).
+
+        The cipher needs nothing; only the MAC's keystreams are re-keyed.
+        """
+        if self._mac is not None:
+            self._mac.rederive()
+
     def wrap(self, Data: bytes) -> bytes:
         if self._cipher is None:
             return Data

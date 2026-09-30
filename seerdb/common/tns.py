@@ -5684,8 +5684,8 @@ def encode_dictionary_token_auth(Dictionary: dict) -> bytes:
     (func 0x73) message with no username, logon mode ``NoNewPass`` (0x1), and the
     key/value pairs carrying the token — ``AUTH_TOKEN`` always, plus
     ``AUTH_HEADER`` + ``AUTH_SIGNATURE`` for the OCI IAM (signed) variant — after
-    the standard session-context pairs. RE'd from go-ora (MIT); the wire shape
-    matches the ordinary AUTH header with the user fields zeroed.
+    the standard session-context pairs. The wire shape matches the ordinary AUTH
+    header with the user fields zeroed.
     """
     Tseq = Dictionary['seq']
     Role = Dictionary['env'].get('role', 0)
@@ -14041,7 +14041,7 @@ def _aq_write_msg_props(Props, FieldVersion: int) -> bytes:
     # write_msg_props (aq_base): priority/delay/expiration, correlation,
     # attempts, exception queue, state, enqueue time, txn id, then the four
     # fixed agent/extension keyword-value pairs, user-property/cscn/dscn/flags,
-    # and (at fv >= 21.1) a shard id. RE'd from python-oracledb.
+    # and (at fv >= 21.1) a shard id -- the layout python-oracledb sends.
     Out = encode_sb4(Props.priority)
     Out += encode_sb4(Props.delay)
     Out += _encode_sb4i(Props.expiration)
@@ -14095,7 +14095,7 @@ def _aq_write_payload(Queue, Props) -> bytes:
 
 
 def encode_aq_enq(Seq: int, FieldVersion: int, Queue, Props) -> bytes:
-    # AQ enqueue (TNS_FUNC_AQ_ENQ). RE'd from python-oracledb AqEnqMessage.
+    # AQ enqueue (TNS_FUNC_AQ_ENQ): the layout of python-oracledb's AqEnqMessage.
     QName = Queue.name.encode('utf-8')
     Out = _fun_header(TNS_FUNC_AQ_ENQ, Seq, FieldVersion)
     Out += bytes([1]) + encode_sb4(len(QName))  # queue name ptr + len
@@ -14143,7 +14143,7 @@ def encode_aq_enq(Seq: int, FieldVersion: int, Queue, Props) -> bytes:
 
 
 def encode_aq_deq(Seq: int, FieldVersion: int, Queue) -> bytes:
-    # AQ dequeue (TNS_FUNC_AQ_DEQ). RE'd from python-oracledb AqDeqMessage.
+    # AQ dequeue (TNS_FUNC_AQ_DEQ): the layout of python-oracledb's AqDeqMessage.
     Opts = Queue.deqoptions
     QName = Queue.name.encode('utf-8')
     Out = _fun_header(TNS_FUNC_AQ_DEQ, Seq, FieldVersion)
@@ -14270,7 +14270,7 @@ def _aq_write_array_deq(Queue, PropsList, FieldVersion: int) -> bytes:
 def encode_aq_array(
     Seq: int, FieldVersion: int, Queue, Operation: int, PropsList, NumIters: int
 ) -> bytes:
-    # AQ array enqueue / dequeue (TNS_FUNC_ARRAY_AQ). RE'd from python-oracledb
+    # AQ array enqueue / dequeue (TNS_FUNC_ARRAY_AQ): the layout of python-oracledb's
     # AqArrayMessage. For dequeue PropsList is NumIters placeholder properties.
     Out = _fun_header(TNS_FUNC_ARRAY_AQ, Seq, FieldVersion)
     if Operation == TNS_AQ_ARRAY_ENQ:

@@ -7,7 +7,7 @@ Proves a captured server response — pasted from ``hexdump -C`` output into a
 ``tests/captures/*.hexdump`` file — can be pushed through seerdb's packet
 framing offline, so future decode regressions can be pinned from a Wireshark /
 tcpdump capture with no server. The seed capture is a real UROWID fetch that
-ends in ORA-01403 (adopted as a capture fact from the go-ora driver, MIT).
+ends in ORA-01403 (the same buffer go-ora's urowid test uses).
 """
 
 import unittest
