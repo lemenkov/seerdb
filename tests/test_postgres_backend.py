@@ -38,6 +38,7 @@ from postgres_backend import (  # noqa: E402
     PostgresBackend,
     _backend_error,
     _bc_date_loader,
+    _computed_lob_columns,
     _distinct_bind_refs,
     _iot_primary_key,
     _object_column_meta,
@@ -220,6 +221,21 @@ def test_an_object_table_is_an_ordinary_table_with_a_hidden_object_id() -> None:
         'DEFAULT gen_random_uuid() UNIQUE); '
     )
     assert "INSERT INTO sys.ora_object_tables VALUES ('people'::regclass" in out
+
+
+def test_a_whole_lob_call_item_is_a_lob_column() -> None:
+    # PostgreSQL describes a computed domain value by its base type, so a select
+    # list item that is one LOB call is typed from the call itself (#1351).
+    from seerdb.common.tns_consts import TNS_TYPE_BLOB, TNS_TYPE_CLOB
+
+    assert _computed_lob_columns(
+        'SELECT id, to_clob(\'a, b\') AS c, sys.empty_blob(), EMPTY_CLOB() "x" FROM t'
+    ) == {1: TNS_TYPE_CLOB, 2: TNS_TYPE_BLOB, 3: TNS_TYPE_CLOB}
+    # A call inside an expression, a star list whose positions are the expanded
+    # columns', and a statement that is not a SELECT map nothing.
+    assert _computed_lob_columns("SELECT to_clob('a') || 'b' FROM dual") == {}
+    assert _computed_lob_columns("SELECT *, to_clob('a') FROM t") == {}
+    assert _computed_lob_columns("INSERT INTO t VALUES (to_clob('a'))") == {}
 
 
 def test_deref_becomes_a_parenthesised_sys_deref() -> None:

@@ -3066,6 +3066,45 @@ def _top_level_words(sql: str) -> tuple[list[tuple[int, str]], list[int]]:
     return words, rownums
 
 
+# A select-list item that is one LOB-producing call, optionally aliased (#1351).
+_LOB_CALL_ITEM = re.compile(
+    r'(?:sys\s*\.\s*)?(to_clob|empty_clob|to_blob|empty_blob)\s*\(', re.IGNORECASE
+)
+_ITEM_ALIAS = re.compile(r'(?:AS\s+)?(?:"[^"]*"|[A-Za-z_][\w$#]*)?', re.IGNORECASE)
+
+
+def _computed_lob_columns(sql: str) -> dict[int, int]:
+    """The select-list positions of a query that are a LOB call, by Oracle type.
+
+    PostgreSQL describes a computed value by its base type even when the function
+    returns the ora_clob / ora_blob domain, so TO_CLOB('x') or EMPTY_BLOB() would
+    describe as text / bytea -- a VARCHAR or a RAW -- where Oracle describes a
+    CLOB or a BLOB (#1351). Only an item that is the whole call is recognised; a
+    call inside an expression, or a statement that is not a plain SELECT, maps
+    nothing. TO_NCLOB is left out: an NCLOB is a CLOB in the national character
+    set, which the LOB column shape does not carry.
+    """
+    words, _rownums = _top_level_words(sql)
+    if not words or words[0][1] != 'SELECT':
+        return {}
+    start = words[0][0] + len('SELECT')
+    end = next((pos for pos, word in words if word == 'FROM'), len(sql))
+    items = [sql[s:e].strip() for s, e in _top_level_items(sql, start, end)]
+    if any(item == '*' or item.endswith('.*') for item in items):
+        return {}  # the positions are the expanded columns', not the items'
+    found = {}
+    for index, item in enumerate(items):
+        call = _LOB_CALL_ITEM.match(item)
+        if call is None:
+            continue
+        close = _matching_paren(item, call.end() - 1)
+        if close >= len(item) or not _ITEM_ALIAS.fullmatch(item[close + 1 :].strip()):
+            continue
+        name = call.group(1).lower()
+        found[index] = TNS_TYPE_CLOB if name.endswith('clob') else TNS_TYPE_BLOB
+    return found
+
+
 def _rewrite_rownum(sql: str) -> str:
     """Translate `... WHERE a AND ROWNUM <= n` to `... WHERE a LIMIT n` (#1271).
 
@@ -4892,11 +4931,13 @@ class PostgresBackend:
                 self._not_null_cache[key] = key in not_null
         return {index for index, key in keys.items() if self._not_null_cache[key]}
 
-    def _build_result(self, cursor) -> Result:
+    def _build_result(self, cursor, sql: str = '') -> Result:
         # Turn an executed statement's cursor into a Result: a row count for a
         # no-row statement, else the fetched rows plus a ColumnMeta per column.
+        # `sql` is the statement as run, read for the LOB calls in its select list.
         if cursor.description is None:
             return Result(rowcount=max(cursor.rowcount, 0))
+        computed_lobs = _computed_lob_columns(sql) if sql else {}
         rows = [list(r) for r in cursor.fetchall()]
         # Re-tag the zoned cells before they reach the wire encoder (_wire_cell).
         for i, desc in enumerate(cursor.description):
@@ -4916,6 +4957,8 @@ class PostgresBackend:
                 if desc.type_code in _DOMAIN_BASE_OIDS
                 else None
             )
+            if domain is None and desc.type_code in (25, 17):
+                domain = computed_lobs.get(i)
             if domain in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
                 columns.append(_lob_column_meta(desc.name, domain))
             elif domain == TNS_TYPE_INTERVALYM:
@@ -5592,7 +5635,7 @@ class PostgresBackend:
             if prelude is not None:
                 cursor.execute(prelude)
             cursor.execute(sql, params)
-            result = self._build_result(cursor)
+            result = self._build_result(cursor, sql)
         except psycopg.Error as exc:
             self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_stmt')
             self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
@@ -5637,7 +5680,7 @@ class PostgresBackend:
         # statement had its effect. Building the result can only raise on an
         # unencodable SELECT column — no side effect to undo — so let it propagate
         # for the session to map to an ORA error; the connection stays usable.
-        return self._build_result(statement)
+        return self._build_result(statement, sql)
 
     def execute_many(self, sql: str, rows: Sequence[Sequence]) -> int | Result:
         # Array DML (executemany) in one round-trip: translate the statement once

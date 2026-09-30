@@ -4923,6 +4923,21 @@ class LOBObjectIntegration(_IntegrationBase):
             pass
         super().tearDown()
 
+    def test_a_lob_call_in_a_select_list_is_a_lob(self):
+        # TO_CLOB / EMPTY_CLOB / EMPTY_BLOB in a select list describe as a CLOB or
+        # a BLOB and fetch as a LOB, as a LOB column does (#1351).
+        self.cur.execute(
+            "SELECT TO_CLOB('some value') c, EMPTY_CLOB(), EMPTY_BLOB() FROM dual"
+        )
+        self.assertEqual(
+            [d[1] for d in self.cur.description],
+            [seerdb.DB_TYPE_CLOB, seerdb.DB_TYPE_CLOB, seerdb.DB_TYPE_BLOB],
+        )
+        clob, empty_clob, empty_blob = self.cur.fetchone()
+        self.assertEqual(clob.read(), 'some value')
+        self.assertEqual(empty_clob.read(), '')
+        self.assertEqual(empty_blob.read(), b'')
+
     def test_a_fetched_clob_is_a_lob_object(self):
         lob = self._fetch_lob()
         self.assertTrue(hasattr(lob, 'read'), f'expected a LOB, got {type(lob)}')
