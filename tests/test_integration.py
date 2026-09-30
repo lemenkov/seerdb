@@ -726,6 +726,18 @@ class TypesIntegration(_IntegrationBase):
         )
         self.assertEqual(v, seerdb.IntervalYM(-1, -2))
 
+    def test_an_interval_ym_out_bind_assigned_in_a_block(self):
+        # A block assigning an INTERVAL YEAR TO MONTH to its OUT bind returns an
+        # IntervalYM. The Mirror over PostgreSQL returned a plain interval it had
+        # no wire form for (#1400).
+        for text, expected in (
+            ('-25-7', seerdb.IntervalYM(-25, -7)),
+            ('3-2', seerdb.IntervalYM(3, 2)),
+        ):
+            v = self.cur.var(seerdb.DB_TYPE_INTERVAL_YM)
+            self.cur.execute(f"BEGIN :v := TO_YMINTERVAL('{text}'); END;", [v])
+            self.assertEqual(v.getvalue(), expected)
+
     # ----- ROWID -----
 
     def test_rowid_matches_rowidtochar(self):

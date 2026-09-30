@@ -6427,6 +6427,12 @@ class PostgresBackend:
         out = list(values)
         for (ref, _expr), result in zip(assignments, row):
             if ref in refs:
+                # An INTERVAL YEAR TO MONTH comes out of the SELECT as a plain
+                # interval, which has no YEAR TO MONTH wire form; the bind's
+                # declared type says which it is, as a procedure's parameter
+                # type does (#504, #1400).
+                if declared.get(ref) == TNS_TYPE_INTERVALYM and result is not None:
+                    result = _to_interval_ym(result)
                 out[refs.index(ref)] = result
         return Result(out_binds=out)
 
