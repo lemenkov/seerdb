@@ -5,9 +5,8 @@
 
 Once the ANO negotiation (see :mod:`seerdb.common.ano`) selects AES and the
 Diffie-Hellman exchange yields a session key + IV, each TTC data packet is
-encrypted with this cipher before framing. The construction (re-expressed from
-go-ora's ``OracleNetworkCBCCryptor``, MIT) is plain AES-CBC with an Oracle
-padding twist:
+encrypted with this cipher before framing. The construction is plain AES-CBC
+with an Oracle padding twist:
 
   * the plaintext is zero-padded up to the 16-byte block size (no padding block
     is added when it is already aligned), and

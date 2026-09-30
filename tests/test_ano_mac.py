@@ -5,8 +5,7 @@
 
 Offline: a client and a server instance (with swapped send/receive keystreams)
 exercise the real MAC round-trip in both directions, plus tamper detection and
-the stateful keystream. The construction is re-expressed from go-ora (MIT),
-which ships no crypto tests, so validation is by self-consistent round-trip.
+the stateful keystream, validated by self-consistent round-trip.
 """
 
 import unittest
@@ -76,3 +75,62 @@ class TestAnoMac(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestRederiveAfterReset(unittest.TestCase):
+    """A break/reset re-derives the integrity keystreams (#1345).
+
+    Replays one real session of seerdb's client against a 26ai server requiring
+    AES-256 + SHA-256: every server payload and MAC it received, with the first
+    packet after each break/reset exchange marked. The server re-derives its
+    keystreams at each reset, so every MAC verifies only if the client does too.
+    """
+
+    @staticmethod
+    def _session():
+        import pathlib
+
+        fields: dict[str, str] = {}
+        packets: list[tuple[bool, bytes]] = []
+        path = pathlib.Path(__file__).parent / 'fixtures' / 'ano_reset_session.txt'
+        for line in path.read_text().splitlines():
+            if not line or line.startswith('#'):
+                continue
+            if line.startswith('packet '):
+                reset, data = (part.split('=', 1)[1] for part in line.split()[1:])
+                packets.append((reset == '1', bytes.fromhex(data)))
+            else:
+                key, value = line.split('=', 1)
+                fields[key] = value
+        return fields, packets
+
+    def _mac(self, fields):
+        from seerdb.common.ano_session import make_mac
+
+        mac = make_mac(
+            int(fields['integrity']),
+            bytes.fromhex(fields['shared']),
+            bytes.fromhex(fields['server_iv']),
+        )
+        assert mac is not None
+        return mac
+
+    def test_every_server_packet_verifies_when_the_client_rederives(self):
+        fields, packets = self._session()
+        self.assertGreaterEqual(sum(reset for reset, _ in packets), 2)
+        mac = self._mac(fields)
+        for reset, data in packets:
+            if reset:
+                mac.rederive()
+            mac.validate(data)  # raises on a mismatch
+
+    def test_without_rederiving_the_first_packet_after_a_reset_fails(self):
+        fields, packets = self._session()
+        mac = self._mac(fields)
+        for reset, data in packets:
+            if reset:
+                with self.assertRaises(AnoMacError):
+                    mac.validate(data)
+                return
+            mac.validate(data)
+        self.fail('the recorded session has no reset')

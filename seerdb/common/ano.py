@@ -28,8 +28,7 @@ sub-packet is ``length(2) | type(2) | payload``; the type tags are:
 with a special UB2-array riding on the ``bytes`` tag (a ``0xDEADBEEF|3|count``
 prefix). All integers are big-endian.
 
-The layouts were re-expressed from the go-ora driver (MIT, Copyright 2020 Samy
-Sultan); they are protocol facts the Oracle server enforces on the wire.
+The layouts are protocol facts the Oracle server enforces on the wire.
 """
 
 import struct

@@ -134,7 +134,7 @@ class TestShortAcceptParse(unittest.TestCase):
     # after the reconnect-address fields — the large-SDU (offset 24) and
     # end-of-response flags2 (offset 33) fields only exist in the longer accepts
     # newer servers send. Parsing the short form must not read past its end.
-    # (#439 — the go-ora accept_packet short-packet scenario, reused as fact.)
+    # (#439 — the short accept go-ora's accept_packet test covers too.)
 
     @staticmethod
     def _short_accept_body() -> bytes:

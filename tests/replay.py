@@ -5,10 +5,8 @@
 
 A captured server response — pasted straight from ``hexdump -C`` / Wireshark /
 tcpdump output — becomes bytes an offline test can push through seerdb's packet
-framing and decoders, with no socket and no server. The idea (a fake transport
-seeded with a captured byte buffer) is adopted from the go-ora driver's debug
-session (MIT, Copyright 2020 Samy Sultan); the parser and the replay socket here
-are re-authored.
+framing and decoders, with no socket and no server: a fake transport seeded with
+a captured byte buffer, as go-ora's debug session does it.
 
 Capture files live in ``tests/captures/*.hexdump``. Each line is the canonical
 ``OFFSET  xx xx ..  |ascii|`` form; the offset column and the ``|ascii|`` gutter

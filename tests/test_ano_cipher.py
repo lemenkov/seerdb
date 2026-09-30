@@ -4,8 +4,7 @@
 """Tests for the ANO AES-CBC network cipher (#437, phase 3).
 
 Offline: a NIST AES-128-CBC known-answer vector pins the primitive, and
-round-trips exercise Oracle's zero-pad + trailing-marker framing. The wire
-layout is re-expressed from go-ora (MIT); go-ora ships no crypto tests.
+round-trips exercise Oracle's zero-pad + trailing-marker framing.
 """
 
 import unittest

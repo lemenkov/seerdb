@@ -2,9 +2,8 @@
 # SPDX-License-Identifier: CC0-1.0
 #
 # A real Oracle server response to a UROWID column fetch that ends in
-# ORA-01403 (no data found), captured as `hexdump -C` output. Reused from the
-# go-ora driver's urowid test buffer (MIT, Copyright 2020 Samy Sultan) as a
-# capture fact — a single TNS_DATA packet (length 0x193). The offset column and
+# ORA-01403 (no data found), captured as `hexdump -C` output (the same buffer
+# go-ora's urowid test uses): a single TNS_DATA packet (length 0x193). The offset column and
 # the trailing |ascii| gutter are ignored by tests.replay.parse_hexdump.
 00000000  00 00 01 93 06 00 00 00  00 00 10 17 30 77 d7 6c  |............0w.l|
 00000010  cb 70 33 79 b1 a3 44 98  cb ad 02 fb 78 7a 09 0b  |.p3y..D.....xz..|

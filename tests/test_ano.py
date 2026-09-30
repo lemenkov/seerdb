@@ -4,9 +4,8 @@
 """Codec tests for the Oracle Advanced Networking (ANO) negotiation (#437).
 
 Offline byte-level checks of the negotiation container, its services, and the
-typed sub-packets. The wire layouts are re-expressed from the go-ora driver
-(MIT); go-ora ships no ANO tests, so these known-answer bytes are computed by
-hand from the format the server enforces (magic 0xDEADBEEF framing, big-endian).
+typed sub-packets. The known-answer bytes are computed by hand from the format
+the server enforces (magic 0xDEADBEEF framing, big-endian).
 """
 
 import struct

@@ -452,6 +452,15 @@ class _ConnectionLogic:
         assert self._ano is not None  # only called while the ANO cipher is active
         return encode_ano_fragment(Data, self.sdu, self._ano, self._large_packets)
 
+    def _rederive_ano_after_reset(self) -> None:
+        # The client answered the server's break with its reset marker: an
+        # in-band error report. The server re-derives its data-integrity
+        # keystreams at this point and so must we, before the error that follows
+        # is unwrapped; otherwise that packet fails its MAC and the session is
+        # lost at its first error (#1345, PROTOCOL.md 33.6).
+        if self._ano is not None:
+            self._ano.rederive()
+
     # --- Capability / dialect / misc pure helpers --------------------------
 
     def _nego_cache_key(self) -> tuple[str, int, str]:
