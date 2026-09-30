@@ -37,11 +37,13 @@ from seerdb.common.tns import (
     decode_8i_cursor_id,
     decode_8i_dcb_describe,
     decode_8i_dml_response,
+    decode_8i_dml_rowid,
     decode_8i_exec_response,
     decode_fv2_bind_directions,
     decode_fv2_block_out,
     decode_fv2_describe,
     decode_fv2_dml_response,
+    decode_fv2_dml_rowid,
     decode_fv2_exec_response,
     decode_fv2_lob_chunks,
     decode_fv2_lob_getlen,
@@ -204,10 +206,11 @@ class Fv2Dialect:
             raise Exception('Connection closed during 9i DML')
         fv2_raise_for_error(resp[1])  # e.g. ORA-00942 / constraint
         (row_count, err_code) = decode_fv2_dml_response(resp[1])
+        rowid = decode_fv2_dml_rowid(resp[1])  # the touched row (#1079)
         yield Send(encode_o7_close(0))
         yield RECV  # close STA
         _raise_terminal(err_code)
-        return (0, 0, 0, (row_count, None), [], None, None, [], None)
+        return (0, 0, 0, (row_count, None), [], None, rowid, [], None)
 
     def execute_block(self, sql: str, bind: list | None = None):
         # Anonymous PL/SQL block over the fv2 TTI_ALL7 block path (#102, PROTOCOL
@@ -502,7 +505,8 @@ class O8iDialect:
             raise Exception('Connection closed during 8i DML')
         (row_count, err_code, message) = decode_8i_dml_response(received[1])
         _raise_ora(err_code, message)
-        return (0, 0, 0, (row_count, None), [], None, None, [], None)
+        rowid = decode_8i_dml_rowid(received[1])  # the touched row (#1079)
+        return (0, 0, 0, (row_count, None), [], None, rowid, [], None)
 
     def execute_block(self, sql: str, bind: list | None = None):
         # 8i anonymous PL/SQL block (#361/#362, §19.13-14): the same OALL8 as DML

@@ -11144,6 +11144,35 @@ def decode_8i_dml_response(Data: bytes) -> tuple[int, int, str | None]:
     return (RowCount, ErrCode, Message)
 
 
+def decode_8i_dml_rowid(Data: bytes) -> str | None:
+    """The rowid of the row an 8i DML touched, from its status, or None.
+
+    The same fields as the 9i short status (decode_fv2_dml_rowid), at fixed
+    widths and little-endian like the row count: ub4 row count, ub2 each for
+    the ORA code, the two array-error fields, cursor id, error position and
+    SQL type, four single bytes, then the rowid -- ub4 data object, ub2 file,
+    one reserved byte, ub4 block, ub2 slot -- 21 bytes after the OER token
+    (#1079). Captured on 8.1.7: `31 1d 01 00 05 00 00 cf 00 00 00 02 00` for
+    object 73009, file 5, block 207, slot 2. As on 9i, the server leaves the
+    previous statement's rowid in place when nothing was touched.
+    """
+    (ErrCode, _) = _scan_ora_message(Data)
+    Rest = Data[23:] if Data[:1] == bytes([TTI_RPA]) else Data
+    if ErrCode or Rest[:1] != bytes([TTI_OER]) or len(Rest) < 34:
+        return None
+    Block = int.from_bytes(Rest[28:32], 'little')
+    if not Block:
+        return None
+    from seerdb.common.types import rowid_to_string
+
+    return rowid_to_string(
+        int.from_bytes(Rest[21:25], 'little'),
+        int.from_bytes(Rest[25:27], 'little'),
+        Block,
+        int.from_bytes(Rest[32:34], 'little'),
+    )
+
+
 def decode_8i_dcb_describe(Data: bytes) -> tuple[list[dict], bytes]:
     # Oracle 8i answers the modern OALL8 (0x5e) execute with a TTI_DCB (0x10)
     # describe block whose header and per-column descriptors use FIXED-width
@@ -11396,6 +11425,54 @@ def decode_fv2_dml_response(Data: bytes) -> tuple[int, int]:
     # (0 = success). Returns (rowcount, ora_code). #101.
     if not Data:
         return (0, 0)
+    Rest = _skip_fv2_rpa(Data)
+    if Rest and Rest[0] == TTI_OER:
+        (RowCount, ErrCode, _) = _decode_fv2_oer(Rest)
+        return (RowCount, ErrCode)
+    return (0, 0)
+
+
+def decode_fv2_dml_rowid(Data: bytes) -> str | None:
+    """The rowid of the row a 9i DML touched, from its short status, or None.
+
+    The fv2 short OER is the 10g+ one without its call status and end-to-end
+    sequence number: row count, ORA code, the two array-error fields, cursor
+    id and error position (ub4 each), six single bytes -- the SQL type first --
+    and then the same physical rowid fields: data object, relative file, one
+    reserved byte, block, slot (#1079, PROTOCOL.md 19.2). Captured on 9.2: an
+    INSERT's reply carries `03 01 66 23 01 01 00 02 b9 12 01 02` for object
+    91683, file 1, block 47378, slot 2. The server does not clear the field:
+    a DDL or a DML that touched nothing carries the previous statement's
+    rowid, which the zero row count lets the caller drop. None on an error or
+    a reply too short to hold it -- a rowid is never worth failing a DML over.
+    """
+    Rest = _skip_fv2_rpa(Data) if Data else b''
+    if not Rest or Rest[0] != TTI_OER:
+        return None
+    try:
+        (_, ErrCode, Rest) = _decode_fv2_oer(Rest)
+        if ErrCode:
+            return None
+        for _ in range(4):  # array elem error x2, cursor id, error position
+            (_, Rest) = decode_ub4(Rest)
+        Rest = Rest[6:]  # sql type, fatal, flags, cursor opts, upi param, warnings
+        (Obj, Rest) = decode_ub4(Rest)
+        (File, Rest) = decode_ub4(Rest)
+        Rest = Rest[1:]  # reserved byte
+        (Block, Rest) = decode_ub4(Rest)
+        (Slot, Rest) = decode_ub4(Rest)
+    except (IndexError, Truncated, DataError):
+        return None
+    if not Block:
+        return None
+    from seerdb.common.types import rowid_to_string
+
+    return rowid_to_string(Obj, File, Block, Slot)
+
+
+def _skip_fv2_rpa(Data: bytes) -> bytes:
+    # The bytes after a 9i reply's leading RPA piggyback, or all of them when it
+    # has none: the stream then sits on the OER token.
     Rest = Data
     if Rest[0] == TTI_RPA:
         # Skip the RPA piggyback (same shape as decode_token_rpa_piggyback):
@@ -11415,10 +11492,7 @@ def decode_fv2_dml_response(Data: bytes) -> tuple[int, int]:
             (_, Rest) = decode_ub4(Rest)
         while Rest and Rest[0] == 0:
             Rest = Rest[1:]
-    if Rest and Rest[0] == TTI_OER:
-        (RowCount, ErrCode, _) = _decode_fv2_oer(Rest)
-        return (RowCount, ErrCode)
-    return (0, 0)
+    return Rest
 
 
 # Token that opens the 9i bind-values prompt the server sends after a PL/SQL

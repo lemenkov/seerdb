@@ -49,7 +49,6 @@ from seerdb.common.tns_consts import (
 _FV2_UNSUPPORTED = (
     ('missing_directory', 'pre-10g reads a BFILE at fetch time (#1103)'),
     ('mixed_batch', 'executemany (array DML) is a 10g+ path'),
-    ('lastrowid', 'the fv2 DML status is not read for a rowid yet (#1079)'),
     ('binary_double', 'BINARY_DOUBLE is a 10g+ type; Oracle 9i lacks it'),
     ('binary_float', 'BINARY_FLOAT is a 10g+ type; Oracle 9i lacks it'),
     ('kib', 'Oracle 9i has no streamed LOB/LONG bind path (#169)'),
@@ -3359,6 +3358,8 @@ class LastRowidIntegration(_IntegrationBase):
         return [r[0] for r in self.cur.fetchall()]
 
     def test_lastrowid_follows_the_touched_row(self):
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            self.skipTest('executemany (array DML) is a 10g+ path')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, s VARCHAR2(10))')
         self.assertIsNone(self.cur.lastrowid)  # DDL
         self.cur.execute(f"INSERT INTO {self.TABLE} VALUES (1, 'a')")
@@ -3369,6 +3370,32 @@ class LastRowidIntegration(_IntegrationBase):
         self.assertEqual(self._row_at(self.cur.lastrowid), [3])
         self.cur.execute(f"UPDATE {self.TABLE} SET s = 'z' WHERE n = 2")
         self.assertEqual(self._row_at(self.cur.lastrowid), [2])
+
+    def test_each_single_row_dml_reports_its_rowid(self):
+        # INSERT, UPDATE and DELETE each report the row they touched, and a DDL
+        # or a DML that touched nothing reports None -- on every server. 8i and
+        # 9i carry the rowid in their short status as 10g+ does, and leave the
+        # previous one in place when nothing was touched (#1079).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, s VARCHAR2(10))')
+        self.assertIsNone(self.cur.lastrowid)
+        rowids = {}
+        for n in (1, 2, 3):
+            self.cur.execute(f"INSERT INTO {self.TABLE} VALUES ({n}, 'a')")
+            rowids[n] = self.cur.lastrowid
+            self.assertEqual(self._row_at(rowids[n]), [n])
+        self.cur.execute(f"UPDATE {self.TABLE} SET s = 'z' WHERE n = 1")
+        self.assertEqual(self._row_at(self.cur.lastrowid), [1])
+        self.cur.execute(f"UPDATE {self.TABLE} SET s = 'z' WHERE n = 99")
+        self.assertIsNone(self.cur.lastrowid)
+        self.cur.execute(f'DELETE FROM {self.TABLE} WHERE n = 2')
+        # The deleted row is gone, so compare with the INSERT's rowid -- by data
+        # object, block and slot, not as strings: in a bigfile tablespace the
+        # INSERT's status carries the relative file as 1024 and the DELETE's as
+        # 0 (23ai), so the same row prints ...AQ... and ...AA....
+        without_file = lambda rowid: rowid[:6] + rowid[9:]  # noqa: E731
+        self.assertEqual(without_file(self.cur.lastrowid), without_file(rowids[2]))
+        self.cur.execute(f'CREATE INDEX {self.TABLE}_i ON {self.TABLE} (n)')
+        self.assertIsNone(self.cur.lastrowid)
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
