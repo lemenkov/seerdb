@@ -1787,7 +1787,9 @@ def test_v_session_shows_what_the_login_declared() -> None:
 def test_kill_session_ends_only_the_session_named() -> None:
     # KILL SESSION ends the backend with that SID while its serial still matches;
     # a stale serial, the caller's own session or a malformed ID fail as Oracle's
-    # do (#1212).
+    # do (#1212). The kill returns once the victim's backend is gone, and every
+    # call the victim makes then answers ORA-00028, as a killed Oracle session's
+    # does (#1367).
     from seerdb.server import BackendError
 
     killer = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
@@ -1806,9 +1808,17 @@ def test_kill_session_ends_only_the_session_named() -> None:
         killer.execute(
             f"alter system kill session '{info.session_id},{info.serial_num}' immediate"
         )
-        with pytest.raises(psycopg.OperationalError):
-            victim._conn.execute('SELECT 1')
+        assert victim.closed
+        for call in (
+            lambda: victim.execute('SELECT 1 FROM dual'),
+            victim.commit,
+            victim.ping,
+        ):
+            with pytest.raises(BackendError) as caught:
+                call()
+            assert caught.value.ora_code == 28
         assert killer.execute('SELECT 1 FROM dual').rows == [(1,)]
+        killer.ping()  # a live session's ping is quiet
     finally:
         killer.close()
         victim.close()
@@ -2228,6 +2238,8 @@ def test_change_password_updates_the_shared_credential_map() -> None:
 
 
 class _RecordingConn:
+    closed = False  # a live connection, as the backend's calls check (#1367)
+
     def __init__(self) -> None:
         self.calls: list[str] = []
 

@@ -112,9 +112,11 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import functools
 import hashlib
 import json
 import re
+import select
 import struct
 import uuid
 from collections.abc import Sequence
@@ -1864,6 +1866,7 @@ _KILL_SESSION = re.compile(
     r"\s*ALTER\s+SYSTEM\s+KILL\s+SESSION\s+'([^']*)'(?:\s+(?:IMMEDIATE|NOREPLAY))*\s*\Z",
     re.IGNORECASE,
 )
+_KILL_SESSION_WAIT_MS = 5000  # how long a kill waits for the victim to go (#1367)
 _KILL_SESSION_ID = re.compile(r'\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*@\d+\s*)?\Z')
 _ROLLBACK_TO = re.compile(
     rf'\s*ROLLBACK(?:\s+WORK)?\s+TO\s+(?:SAVEPOINT\s+)?{_SAVEPOINT_NAME}\s*\Z',
@@ -3587,6 +3590,7 @@ _ORA_INVALID_SQL = 900
 _ORA_TOO_MANY_ROWS = 1422
 _ORA_INVALID_SESSION_ID = 26
 _ORA_KILL_CURRENT_SESSION = 27
+_ORA_SESSION_TERMINATED = 28
 _ORA_NO_SUCH_SESSION = 30
 
 # Map a PostgreSQL error (by SQLSTATE) to the Oracle error number a client
@@ -4104,6 +4108,31 @@ def _object_column_meta(name: str, typ: DbObjectType) -> ColumnMeta:
     )
 
 
+# A session whose PostgreSQL connection is gone -- ALTER SYSTEM KILL SESSION ended
+# its backend, or the server did -- answers every call as Oracle answers a killed
+# session's: ORA-00028 (#1367). A client takes that code as the end of the
+# connection (python-oracledb raises DPY-4011 and closes its side), where the
+# ORA-00600 an escaping psycopg error became, or the ORA-00900 of an unmapped
+# SQLSTATE, said neither. psycopg reports a terminated connection as closed.
+def _session_terminated() -> BackendError:
+    return BackendError('session has been terminated', ora_code=_ORA_SESSION_TERMINATED)
+
+
+def _while_connected(method):
+    @functools.wraps(method)
+    def call(self, *args, **kwargs):
+        if self._conn.closed:
+            raise _session_terminated()
+        try:
+            return method(self, *args, **kwargs)
+        except (psycopg.Error, BackendError):
+            if self._conn.closed:
+                raise _session_terminated() from None
+            raise
+
+    return call
+
+
 class PostgresBackend:
     """A :class:`~seerdb.server.Backend` over a psycopg connection.
 
@@ -4459,6 +4488,36 @@ class PostgresBackend:
             self._conn.commit()
         return secret
 
+    @property
+    def closed(self) -> bool:
+        # The PostgreSQL connection is gone: ALTER SYSTEM KILL SESSION ended it, or
+        # the server did (#1367). Every call then answers ORA-00028. psycopg only
+        # learns of it when it next uses the connection, and a statement answered
+        # without the backend never does. An idle connection has nothing to read,
+        # though, until the server terminates it -- it sends a FATAL, then closes
+        # -- so while the socket is readable its input is fed to libpq: the first
+        # read takes the FATAL, the next meets the end of the stream, and libpq
+        # marks the connection bad. No round trip.
+        try:
+            for _read in range(4):
+                if self._conn.closed:
+                    return True
+                readable, _w, _x = select.select([self._conn.fileno()], [], [], 0)
+                if not readable:
+                    break
+                self._conn.pgconn.consume_input()
+        except (OSError, ValueError, psycopg.Error):
+            return True
+        return bool(self._conn.closed)
+
+    def ping(self) -> None:
+        # A health check -- conn.ping(), or a pool checking a connection before
+        # handing it out. A killed session answers ORA-00028 (#1367), so the pool
+        # drops it; a live one needs no round trip, `closed` having looked.
+        if self.closed:
+            raise _session_terminated()
+
+    @_while_connected
     def parse(self, sql: str) -> None:
         """Validate a statement without running it -- ``cursor.parse()`` of
         anything that is not a query.
@@ -4525,6 +4584,7 @@ class PostgresBackend:
         if row is not None and row[0]:
             self._conn.commit()
 
+    @_while_connected
     def execute(self, sql: str, binds: Sequence = ()) -> Result:
         # A PL/SQL block from callproc / callfunc arrives with BindVar binds (the
         # Mirror's OUT-bind flow); run it via CALL / SELECT and return the OUT
@@ -4653,7 +4713,11 @@ class PostgresBackend:
             raise BackendError(
                 'cannot kill current session', ora_code=_ORA_KILL_CURRENT_SESSION
             )
-        self._conn.execute('SELECT pg_terminate_backend(%s)', (sid,))
+        # Wait for the victim's backend to exit before answering, as Oracle's kill
+        # does, or the victim's next call could still run on it (#1367).
+        self._conn.execute(
+            'SELECT pg_terminate_backend(%s, %s)', (sid, _KILL_SESSION_WAIT_MS)
+        )
         return Result()
 
     def _execute_transaction_control(self, sql: str) -> Result | None:
@@ -4687,6 +4751,7 @@ class PostgresBackend:
             raise _backend_error(exc, original=sql) from exc
         return Result()
 
+    @_while_connected
     def execute_returning(self, sql: str, rows: Sequence[Sequence]) -> Result:
         # DML ... RETURNING col INTO :b (#689). PostgreSQL has the feature but
         # spells it without the INTO part, handing the columns back as rows
@@ -5728,6 +5793,7 @@ class PostgresBackend:
         # for the session to map to an ORA error; the connection stays usable.
         return self._build_result(statement, sql)
 
+    @_while_connected
     def execute_many(self, sql: str, rows: Sequence[Sequence]) -> int | Result:
         # Array DML (executemany) in one round-trip: translate the statement once
         # and send every bind row through psycopg's executemany (which pipelines),
@@ -5774,6 +5840,7 @@ class PostgresBackend:
             )
         return max(affected, 0)
 
+    @_while_connected
     def execute_many_rowcounts(
         self, sql: str, rows: Sequence[Sequence]
     ) -> tuple[int, list[int]]:
@@ -6213,6 +6280,7 @@ class PostgresBackend:
     # sys_context (above) reads it back.
     _END_TO_END_SETTINGS = ('client_identifier', 'module', 'action', 'client_info')
 
+    @_while_connected
     def set_end_to_end(self, attrs: dict) -> None:
         """Record the session's tracing attributes (#183).
 
@@ -6235,6 +6303,7 @@ class PostgresBackend:
                     (f'seerdb.{name}', '' if value is None else value),
                 )
 
+    @_while_connected
     def alter_session(self, statement: str) -> None:
         """Run the ALTER SESSION a client sent with its login.
 
@@ -6246,10 +6315,12 @@ class PostgresBackend:
             cur.execute(_translate_admin(statement))
         self._conn.commit()
 
+    @_while_connected
     def commit(self) -> None:
         self._conn.commit()
         self._user_savepoint = False
 
+    @_while_connected
     def rollback(self) -> None:
         self._conn.rollback()
         self._user_savepoint = False
