@@ -177,6 +177,8 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_23_1,
     ISO_LATIN_1_CHARSET,
     ORA_ARRAY_DML_ERRORS,
+    ORA_LOB_ALREADY_OPENED,
+    ORA_LOB_NOT_OPENED,
     ORA_NO_DATA_FOUND,
     RCAP_COMPAT,
     RCAP_COMPAT_81,
@@ -3008,11 +3010,11 @@ def encode_lobops_ack(locator: bytes) -> bytes:
 # live 23ai sends verbatim -- including ORA-22289's double space after
 # "perform", which is the server's, not a typo here (#903/#887).
 LOBOPS_ERR_ALREADY_OPEN = (
-    22293,
+    ORA_LOB_ALREADY_OPENED,
     b'ORA-22293: LOB already opened in the same transaction\n',
 )
 LOBOPS_ERR_NOT_OPENED = (
-    22289,
+    ORA_LOB_NOT_OPENED,
     b'ORA-22289: cannot perform  operation on an unopened file or LOB\n',
 )
 

@@ -148,6 +148,15 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_23_1,
+    ORA_INSUFFICIENT_PRIVILEGES,
+    ORA_INTERNAL_ERROR,
+    ORA_INVALID_CURSOR,
+    ORA_INVALID_USERNAME_PASSWORD,
+    ORA_NONEXISTENT_FILE,
+    ORA_ORACLE_NOT_AVAILABLE,
+    ORA_UNIQUE_CONSTRAINT_VIOLATED,
+    ORA_UNSUPPORTED_NETWORK_DATATYPE,
+    ORA_USER_REQUESTED_CANCEL,
     TNS_CONNECT,
     TNS_DATA,
     TNS_DATA_FLAGS_END_OF_REQUEST,
@@ -261,10 +270,6 @@ def _in_own_context(func: Callable[_P, _T]) -> Callable[_P, _T]:
 
 
 logger = logging.getLogger('seerdb.server')
-
-# A generic backend failure that leaked past the Backend contract still becomes
-# a clean ORA error rather than a wire desync (ORA-00600, internal error).
-_INTERNAL_ERROR = 600
 
 # A fetch count of 0 or less means "no limit" — deliver the whole remainder.
 _ALL_ROWS = 2**31
@@ -794,15 +799,9 @@ def _login_failure_error(exc: Exception) -> dict:
     if isinstance(code, int) and code > 0 and text.startswith('ORA-'):
         return {'ora_code': code, 'message': text}
     return {
-        'ora_code': _ORA_NOT_AVAILABLE,
-        'message': f'ORA-{_ORA_NOT_AVAILABLE:05d}: the backend is not available',
+        'ora_code': ORA_ORACLE_NOT_AVAILABLE,
+        'message': f'ORA-{ORA_ORACLE_NOT_AVAILABLE:05d}: the backend is not available',
     }
-
-
-# ORA-01034: the instance is not available. What a client is told when the login
-# itself was fine but the server cannot produce a session, and there is no more
-# specific code to relay (#1006).
-_ORA_NOT_AVAILABLE = 1034
 
 
 def _open_backend_session(
@@ -878,7 +877,7 @@ def _deny_login(
     stream: PacketStream,
     reason: str,
     *,
-    ora_code: int = 1017,
+    ora_code: int = ORA_INVALID_USERNAME_PASSWORD,
     message: str | None = None,
     sqlplus: bool = False,
     call_sequence: int = 0,
@@ -895,7 +894,10 @@ def _deny_login(
     # cost two separate investigations, because the one thing a client cannot do
     # with ORA-01017 is tell a bad password from a server that had no session to
     # give (#1006). Callers with a real reason pass it.
-    text = message or 'ORA-01017: invalid username/password; logon denied'
+    text = message or (
+        f'ORA-{ORA_INVALID_USERNAME_PASSWORD:05d}: '
+        'invalid username/password; logon denied'
+    )
     if sqlplus:
         # sqlplus reads a refusal in its own dialect, after the break / reset
         # marker exchange a live server opens it with. A thin OER is lost on it:
@@ -1008,8 +1010,8 @@ def _backend_fault_error(exc: Exception) -> bytes:
     """
     if isinstance(exc, NotSupportedError):
         return encode_error(
-            _ORA_UNSUPPORTED_CALL,
-            f'ORA-{_ORA_UNSUPPORTED_CALL:05d}: unsupported network datatype or '
+            ORA_UNSUPPORTED_NETWORK_DATATYPE,
+            f'ORA-{ORA_UNSUPPORTED_NETWORK_DATATYPE:05d}: unsupported network datatype or '
             f'representation ({exc})',
         )
     # Genuinely unexpected: report it as ORA-00600 rather than recurse. This
@@ -1018,7 +1020,7 @@ def _backend_fault_error(exc: Exception) -> bytes:
     # every unexpected backend fault into a session-killing crash-loop instead of
     # a one-statement error the session survives.
     return encode_error(
-        _INTERNAL_ERROR, f'ORA-{_INTERNAL_ERROR:05d}: backend error: {exc}'
+        ORA_INTERNAL_ERROR, f'ORA-{ORA_INTERNAL_ERROR:05d}: backend error: {exc}'
     )
 
 
@@ -1041,21 +1043,17 @@ def _refuse_unhandled(stream: PacketStream, what: str) -> None:
     stream.write_packet(
         TNS_DATA,
         encode_error(
-            _ORA_UNSUPPORTED_CALL,
-            f'ORA-{_ORA_UNSUPPORTED_CALL:05d}: unsupported network datatype or '
+            ORA_UNSUPPORTED_NETWORK_DATATYPE,
+            f'ORA-{ORA_UNSUPPORTED_NETWORK_DATATYPE:05d}: unsupported network datatype or '
             f'representation ({what})',
         ),
     )
 
 
-# ORA-03115 is what a client already reads as "this server will not do that".
-# Used for a TTC function the Mirror does not implement, so the call is refused
-# rather than left unanswered (#832).
-_ORA_UNSUPPORTED_CALL = 3115
 # What a server answers when a BFILE's DIRECTORY object or file is not there.
-_ORA_BFILE_MISSING = 22285
 _ORA_BFILE_MISSING_TEXT = (
-    'ORA-22285: non-existent directory or file for FILEOPEN operation'
+    f'ORA-{ORA_NONEXISTENT_FILE:05d}: '
+    'non-existent directory or file for FILEOPEN operation'
 )
 
 
@@ -1078,8 +1076,8 @@ def _refuse_unhandled_oci(stream: PacketStream, what: str, seq: _OciSequence) ->
     stream.write_packet(
         TNS_DATA,
         encode_error_oci(
-            _ORA_UNSUPPORTED_CALL,
-            f'ORA-{_ORA_UNSUPPORTED_CALL:05d}: unsupported network datatype or '
+            ORA_UNSUPPORTED_NETWORK_DATATYPE,
+            f'ORA-{ORA_UNSUPPORTED_NETWORK_DATATYPE:05d}: unsupported network datatype or '
             f'representation ({what})',
             sequence=seq.next(),
         ),
@@ -1901,10 +1899,6 @@ def _apply_schema(backend: Backend | None, schema: bytes | list) -> None:
         logger.info('set current_schema %r refused by the backend: %s', name, exc)
 
 
-_ORA_USER_CANCEL = 1013  # ORA-01013: user requested cancel of current operation
-_ORA_INVALID_CURSOR = 1001  # ORA-01001: a cursor id the session does not hold
-
-
 def _answer_marker(stream: PacketStream, body: bytes) -> None:
     """Answer a break episode the way a real server does (#844).
 
@@ -1947,9 +1941,9 @@ def _answer_marker(stream: PacketStream, body: bytes) -> None:
     stream.write_packet(
         TNS_DATA,
         encode_error(
-            _ORA_USER_CANCEL,
+            ORA_USER_REQUESTED_CANCEL,
             # The text a live 23ai sends, capitalised and full-stopped.
-            f'ORA-{_ORA_USER_CANCEL:05d}: User requested cancel of current operation.',
+            f'ORA-{ORA_USER_REQUESTED_CANCEL:05d}: User requested cancel of current operation.',
         ),
     )
 
@@ -2601,7 +2595,7 @@ def _answer_bfile(
         return
     if request.kind == 'file_open' and not present:
         stream.write_packet(
-            TNS_DATA, encode_error(_ORA_BFILE_MISSING, _ORA_BFILE_MISSING_TEXT)
+            TNS_DATA, encode_error(ORA_NONEXISTENT_FILE, _ORA_BFILE_MISSING_TEXT)
         )
         return
     # FILE_OPEN on a file that is there, and FILE_CLOSE: the locator back, which
@@ -3603,7 +3597,7 @@ def _answer_query(
 # constraint (ORA-02290) are evaluated with the row, while the unique index is
 # updated afterwards. Only ORA-00001 was measured; a foreign key is presumably
 # the same pass but is not claimed here.
-_INDEX_PHASE_ERRORS = frozenset({1})  # ORA-00001, unique constraint violated
+_INDEX_PHASE_ERRORS = frozenset({ORA_UNIQUE_CONSTRAINT_VIOLATED})
 
 
 def _order_batch_errors(
@@ -3938,7 +3932,10 @@ def _answer_reexecute_binds(
     sql = cursors.query_sql(request.cursor)
     if sql is None:
         stream.write_packet(
-            TNS_DATA, encode_error(_ORA_INVALID_CURSOR, 'ORA-01001: invalid cursor')
+            TNS_DATA,
+            encode_error(
+                ORA_INVALID_CURSOR, f'ORA-{ORA_INVALID_CURSOR:05d}: invalid cursor'
+            ),
         )
         return []
     try:
@@ -4015,9 +4012,6 @@ def _answer_fetch(
     return lobs
 
 
-_CHANGE_PASSWORD_UNSUPPORTED = 1031  # ORA-01031: insufficient privileges
-
-
 def _answer_changepassword(
     stream: PacketStream,
     backend: Backend,
@@ -4035,8 +4029,8 @@ def _answer_changepassword(
         stream.write_packet(
             TNS_DATA,
             encode_error(
-                _CHANGE_PASSWORD_UNSUPPORTED,
-                'ORA-01031: password change not supported',
+                ORA_INSUFFICIENT_PRIVILEGES,
+                f'ORA-{ORA_INSUFFICIENT_PRIVILEGES:05d}: password change not supported',
             ),
         )
         return
@@ -4047,7 +4041,11 @@ def _answer_changepassword(
     except Exception as exc:
         logger.info('changepassword parse failed: %s', exc)
         stream.write_packet(
-            TNS_DATA, encode_error(1017, 'ORA-01017: invalid credential')
+            TNS_DATA,
+            encode_error(
+                ORA_INVALID_USERNAME_PASSWORD,
+                f'ORA-{ORA_INVALID_USERNAME_PASSWORD:05d}: invalid credential',
+            ),
         )
         return
     try:
@@ -4081,8 +4079,8 @@ def _answer_changepassword_oci(
         stream.write_packet(
             TNS_DATA,
             encode_error_oci(
-                _CHANGE_PASSWORD_UNSUPPORTED,
-                'ORA-01031: password change not supported',
+                ORA_INSUFFICIENT_PRIVILEGES,
+                f'ORA-{ORA_INSUFFICIENT_PRIVILEGES:05d}: password change not supported',
                 sequence=seq.next(),
             ),
         )
@@ -4096,7 +4094,9 @@ def _answer_changepassword_oci(
         stream.write_packet(
             TNS_DATA,
             encode_error_oci(
-                1017, 'ORA-01017: invalid credential', sequence=seq.next()
+                ORA_INVALID_USERNAME_PASSWORD,
+                f'ORA-{ORA_INVALID_USERNAME_PASSWORD:05d}: invalid credential',
+                sequence=seq.next(),
             ),
         )
         return
@@ -4113,7 +4113,9 @@ def _answer_changepassword_oci(
         stream.write_packet(
             TNS_DATA,
             encode_error_oci(
-                _INTERNAL_ERROR, f'ORA-00600: backend error: {exc}', sequence=seq.next()
+                ORA_INTERNAL_ERROR,
+                f'ORA-{ORA_INTERNAL_ERROR:05d}: backend error: {exc}',
+                sequence=seq.next(),
             ),
         )
         return

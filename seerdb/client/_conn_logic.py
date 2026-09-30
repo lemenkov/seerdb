@@ -44,6 +44,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_12_1,
     FIELD_VERSION_23_1,
     ORA_NO_DATA_FOUND,
+    ORA_TOO_MANY_ROWS,
     RCAP_TTC,
     RCAP_TTC_SESSION_STATE_OPS,
     TNS_SESSION_STATE_REQUEST_BEGIN,
@@ -704,11 +705,6 @@ def returning_block_result(Result, NumBinds: int):
     return Result[:3] + ((RowCount, Meta), [NewRecord]) + Result[5:]
 
 
-# Oracle raises this when a SELECT ... INTO or a RETURNING ... INTO with scalar
-# targets matches more than one row.
-_ORA_TOO_MANY_ROWS = 1422
-
-
 def returning_block_error(Error):
     """Explain a pre-10g RETURNING failure that is really a shape limitation.
 
@@ -720,7 +716,7 @@ def returning_block_error(Error):
     """
     from seerdb.common.exceptions import NotSupportedError
 
-    if getattr(Error, 'code', None) != _ORA_TOO_MANY_ROWS:
+    if getattr(Error, 'code', None) != ORA_TOO_MANY_ROWS:
         return Error
     return NotSupportedError(
         'a DML ... RETURNING ... INTO that affects more than one row needs an '

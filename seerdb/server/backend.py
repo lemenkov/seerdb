@@ -24,6 +24,10 @@ from enum import Enum, auto
 from typing import Protocol, runtime_checkable
 
 from seerdb.common.tns import ColumnMeta
+from seerdb.common.tns_consts import (
+    ORA_INVALID_SQL_STATEMENT,
+    ORA_UNIMPLEMENTED_FEATURE,
+)
 
 # A username → secret map, the usual shape a backend authenticates against.
 Credentials = Mapping[str, str]
@@ -235,7 +239,7 @@ class BackendError(Exception):
         self,
         message: str,
         *,
-        ora_code: int = 900,
+        ora_code: int = ORA_INVALID_SQL_STATEMENT,
         error_offset: int | None = None,
         rowcount: int = 0,
         row_counts: list[int] | None = None,
@@ -266,7 +270,7 @@ class UnsupportedFeature(BackendError):
     (unimplemented feature). A clean "no", not a crash."""
 
     def __init__(self, message: str) -> None:
-        super().__init__(message, ora_code=3001)
+        super().__init__(message, ora_code=ORA_UNIMPLEMENTED_FEATURE)
 
 
 @runtime_checkable

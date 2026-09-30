@@ -27,10 +27,7 @@ import json
 
 from seerdb.common.datatypes import DB_TYPE_NUMBER, DB_TYPE_RAW, DB_TYPE_VARCHAR
 from seerdb.common.exceptions import DatabaseError, NotSupportedError
-
-# get_data_guide raises this when the collection has no data-guide-enabled
-# search index; oracledb returns None in that case, so we map it.
-_ORA_NO_DATA_GUIDE = 40582
+from seerdb.common.tns_consts import ORA_NO_DATA_GUIDE
 
 # DBMS_SODA / SODA shipped in Oracle 18c (server major version 18).
 _SODA_MIN_MAJOR = 18
@@ -599,7 +596,8 @@ class SodaCollection:
         try:
             cur.execute(_GET_DATA_GUIDE, b)
         except DatabaseError as exc:
-            if getattr(exc, 'code', None) == _ORA_NO_DATA_GUIDE:
+            # No data-guide-enabled search index: oracledb returns None then.
+            if getattr(exc, 'code', None) == ORA_NO_DATA_GUIDE:
                 return None
             raise
         return _data_guide_doc(b)
@@ -997,7 +995,8 @@ class AsyncSodaCollection:
         try:
             await cur.execute(_GET_DATA_GUIDE, b)
         except DatabaseError as exc:
-            if getattr(exc, 'code', None) == _ORA_NO_DATA_GUIDE:
+            # No data-guide-enabled search index: oracledb returns None then.
+            if getattr(exc, 'code', None) == ORA_NO_DATA_GUIDE:
                 return None
             raise
         return _data_guide_doc(b)
