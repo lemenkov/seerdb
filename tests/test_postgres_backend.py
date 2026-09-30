@@ -66,6 +66,33 @@ class _FakePgError(Exception):
         self.sqlstate = sqlstate
 
 
+def test_an_unknown_type_is_invalid_datatype_unless_dropped() -> None:
+    # A type PostgreSQL does not know: ORA-00902 in a query, but still the
+    # missing-object code a best-effort DROP TYPE swallows (#1329).
+    missing = _FakePgError('42704', 'type "no_such_type" does not exist')
+    query = 'SELECT CAST(1 AS no_such_type) FROM dual'
+    err = _backend_error(missing, original=query, translated=query)
+    assert err.ora_code == 902
+    assert 'invalid datatype' in str(err)
+    drop = 'DROP TYPE no_such_type'
+    assert _backend_error(missing, original=drop, translated=drop).ora_code == 942
+
+
+def test_a_query_cast_to_an_oracle_type_is_translated() -> None:
+    # The DDL type rewrites never see a query, so its casts are translated
+    # here; an alias of the same name is left alone (#1329).
+    assert _translate_idioms(
+        'SELECT CAST(:1 AS NUMBER(15)), CAST(x AS raw(16)), '
+        'CAST(y AS BINARY_DOUBLE), CAST(z AS binary_float ) FROM t'
+    ) == (
+        'SELECT CAST(:1 AS numeric(15)), CAST(x AS bytea), '
+        'CAST(y AS double precision), CAST(z AS real ) FROM t'
+    )
+    assert _translate_idioms('SELECT d AS binary_double FROM t') == (
+        'SELECT d AS binary_double FROM t'
+    )
+
+
 def test_backend_error_uses_oracle_canonical_text_for_mapped_code() -> None:
     # A mapped code with a canonical Oracle phrasing gets it, so a client matching
     # on the Oracle text behaves — ORA-00942 is "table or view does not exist", not
