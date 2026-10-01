@@ -350,6 +350,16 @@ def test_declared_columns_record_what_postgresql_keeps_less_of() -> None:
         {'n': ('NCLOB', 4000, None, None), 'c': None, 'r': ('RAW', 4, None, None)},
     )
     assert _declared_columns('CREATE TYPE l AS TABLE OF NCLOB') is None
+    assert _declared_columns(
+        'CREATE TABLE t (v NVARCHAR2(20), w nvarchar2 (5 CHAR), x VARCHAR2(9))'
+    ) == (
+        't',
+        {
+            'v': ('NVARCHAR2', 40, None, None),
+            'w': ('NVARCHAR2', 10, None, None),
+            'x': None,
+        },
+    )
     assert _declared_columns('DROP TABLE t') is None
 
 
