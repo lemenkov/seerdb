@@ -1736,6 +1736,40 @@ class CursorIntegration(_IntegrationBase):
         finally:
             self.cur.execute(f'DROP VIEW {view}')
 
+    def test_a_view_column_keeps_its_base_columns_type(self):
+        # A view's column describes and lists as the table column it comes from:
+        # a RAW(n) keeps its n through a view, and through a view over that
+        # view. The Mirror over PostgreSQL recorded the type for the table alone
+        # (#1425).
+        from seerdb.common.exceptions import DatabaseError
+
+        inner, outer = 'PYO_TYPED_VIEW', 'PYO_TYPED_VIEW2'
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, r RAW(30))')
+        self.cur.execute(f"INSERT INTO {self.TABLE} VALUES (1, HEXTORAW('0102'))")
+        try:
+            self.cur.execute(
+                f'CREATE OR REPLACE VIEW {inner} (a, b) AS SELECT id, r FROM {self.TABLE}'
+            )
+        except DatabaseError as exc:
+            if exc.code == 1031:  # ORA-01031: the suite needs no CREATE VIEW
+                self.skipTest('the test user lacks the CREATE VIEW privilege')
+            raise
+        try:
+            self.cur.execute(f'CREATE OR REPLACE VIEW {outer} AS SELECT b FROM {inner}')
+            for view in (inner, outer):
+                self.cur.execute(f'SELECT b FROM {view}')
+                self.cur.fetchall()
+                self.assertEqual(self.cur.description[0][2:4], (30, 30), view)
+                self.cur.execute(
+                    'SELECT data_type, data_length FROM user_tab_columns '
+                    "WHERE table_name = :1 AND column_name = 'B'",
+                    [view],
+                )
+                self.assertEqual(self.cur.fetchall(), [('RAW', 30)], view)
+        finally:
+            self.cur.execute(f'DROP VIEW {outer}')
+            self.cur.execute(f'DROP VIEW {inner}')
+
     def test_returning_into_inside_a_plsql_block(self):
         # A block wrapping a DML with RETURNING ... INTO: the returned value
         # goes to the OUT bind, and a statement that matched no row leaves it
