@@ -128,6 +128,7 @@ from seerdb.common.tns import (
     mint_temp_lob_locator,
     object_lob_contents,
     oci_lob_contents,
+    oci_lob_reads,
     parse_describe_oci,
     parse_exec,
     parse_exec_oci,
@@ -1457,11 +1458,11 @@ def _serve_oci_session(
     # Rows a multi-row execute delivered only the first of; the rest wait here
     # for the follow-up fetch (the OCI analogue of the thin _Cursors).
     parked: tuple[list[ColumnMeta], list[tuple]] | None = None
-    # LOB contents (wire bytes + is_clob) the current statement's rows carry, in the
-    # order their locators went out; sqlplus drains them with TTI_LOBOPS reads,
-    # slicing the current LOB per each read's offset/amount (#405).
-    lobs: list[tuple[bytes, bool]] = []
-    current_lob: tuple[bytes, bool] | None = None
+    # LOB contents (wire bytes + is_clob + national) the current statement's rows
+    # carry, in the order their locators went out; sqlplus drains them with
+    # TTI_LOBOPS reads, slicing the current LOB per each read's offset/amount (#405).
+    lobs: list[tuple[bytes, bool, bool]] = []
+    current_lob: tuple[bytes, bool, bool] | None = None
     # The live per-session OER end-to-end sequence counter (§36); every OER-bearing
     # reply below draws its next value so the field advances like a real server's.
     seq = _OciSequence()
@@ -1550,8 +1551,8 @@ def _serve_oci_session(
                 # read loop terminates when a read returns less than it asked (#405).
                 offset, amount = parse_lobops_read(body)
                 if offset <= 1 or current_lob is None:
-                    current_lob = lobs.pop(0) if lobs else (b'', True)
-                content, is_clob = current_lob
+                    current_lob = lobs.pop(0) if lobs else (b'', True, False)
+                content, is_clob, national = current_lob
                 unit = 2 if is_clob else 1  # bytes per counted unit (CLOB is UTF-16)
                 total = len(content) // unit
                 start = offset - 1
@@ -1560,7 +1561,12 @@ def _serve_oci_session(
                 stream.write_packet(
                     TNS_DATA,
                     encode_lob_read_response_oci(
-                        chunk, count, len(content), is_clob=is_clob, sequence=seq.next()
+                        chunk,
+                        count,
+                        len(content),
+                        is_clob=is_clob,
+                        national=national,
+                        sequence=seq.next(),
                     ),
                 )
                 continue
@@ -1751,7 +1757,7 @@ def _oci_no_row_status(sql: str, rowcount: int, seq: '_OciSequence') -> bytes:
 
 def _answer_query_oci(
     stream: PacketStream, backend: Backend, body: bytes, seq: '_OciSequence'
-) -> tuple[tuple[list[ColumnMeta], list[tuple]] | None, list[tuple[bytes, bool]]]:
+) -> tuple[tuple[list[ColumnMeta], list[tuple]] | None, list[tuple[bytes, bool, bool]]]:
     # Answer one sqlplus / thick-OCI execute. sqlplus fires a chain of setup
     # statements (PL/SQL blocks, PRODUCT_PRIVS selects) before the user's query;
     # each needs an acceptable reply or sqlplus never reaches the prompt. Returns
@@ -1807,7 +1813,7 @@ def _answer_query_oci(
     # the follow-up TTI_LOBOPS reads drain it in the order the locators went out.
     # This is the OCI path, which reads JSON and VECTOR that way too -- unlike the
     # thin path, which carries their images in the row (#826/#887).
-    lobs = oci_lob_contents(result.columns, rows, for_oci=True)
+    lobs = oci_lob_reads(result.columns, rows)
     has_long = any(
         col.data_type in (TNS_TYPE_LONG, TNS_TYPE_LONGRAW) for col in result.columns
     )

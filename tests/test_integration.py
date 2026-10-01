@@ -5354,6 +5354,30 @@ class LOBIntegration(_IntegrationBase):
             self.cur.execute(f'SELECT nc FROM {self.TABLE} WHERE id=:i', {'i': Id})
             self.assertEqual(self.cur.fetchone()[0], Text)
 
+    def test_an_nclob_column_describes_as_nclob(self):
+        # An NCLOB column describes as NCLOB, not CLOB, with rows or without,
+        # its content still reads back, and USER_TAB_COLUMNS lists it as NCLOB.
+        # The Mirror over PostgreSQL stores NCLOB and CLOB alike and described
+        # both as CLOB (#1369).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NCLOB, c CLOB)')
+        self.cur.execute(f"INSERT INTO {self.TABLE} VALUES ('ünî 中', 'plain')")
+        for where in ('', ' WHERE 1 = 0'):
+            self.cur.execute(f'SELECT n, c FROM {self.TABLE}{where}')
+            self.cur.fetchall()
+            self.assertEqual(
+                [d[1] for d in self.cur.description],
+                [seerdb.DB_TYPE_NCLOB, seerdb.DB_TYPE_CLOB],
+                where,
+            )
+        self.cur.execute(f'SELECT n FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone()[0], 'ünî 中')
+        self.cur.execute(
+            'SELECT column_name, data_type FROM user_tab_columns '
+            'WHERE table_name = :1 ORDER BY column_id',
+            [self.TABLE],
+        )
+        self.assertEqual(self.cur.fetchall(), [('N', 'NCLOB'), ('C', 'CLOB')])
+
     def test_error_then_large_lob_stays_synced(self):
         # #45: an errored call leaves the server's break/reset markers on the
         # wire; mishandling them (replying to every marker) storms the line and
@@ -7405,6 +7429,23 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
         n = self._fetched(1, 'p')
         self.assertIsInstance(n.N, LOB)
         self.assertEqual(n.N.read(), self.TEXT)
+
+    def test_an_nclob_attribute_is_listed_as_nclob(self):
+        # An NCLOB attribute is an NCLOB, not a CLOB. A client types the
+        # attribute by this name, and refuses an NCLOB for a CLOB attribute. The
+        # Mirror over PostgreSQL stores both alike and reported CLOB (#1431).
+        # 10g itself still lists it as CLOB; 11g on name it NCLOB.
+        national = 'CLOB' if int(self.conn.version.split('.')[0]) < 11 else 'NCLOB'
+        self.cur.execute(
+            'SELECT type_name, attr_name, attr_type_name FROM user_type_attrs '
+            'WHERE type_name IN (:1, :2) AND attr_name IN (:3, :4) '
+            'ORDER BY type_name',
+            [self.TYPE, self.NTYPE, 'C', 'N'],
+        )
+        self.assertEqual(
+            self.cur.fetchall(),
+            [(self.NTYPE, 'N', national), (self.TYPE, 'C', 'CLOB')],
+        )
 
     def test_lob_attributes_read_in_any_order(self):
         # Read only after a later query, and in another order: over the Mirror

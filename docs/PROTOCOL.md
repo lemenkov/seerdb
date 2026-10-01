@@ -4368,12 +4368,12 @@ structure; both the row value and the read-tail embed the *same* locator, so
 | off | field | CLOB / BLOB | kind |
 |---|---|---|---|
 | `0..2` | length `0x68 0x00` + version `0x01` | same | structural |
-| `3` | **charset form** | `02` (char) / `01` (binary) | generated |
-| `4..5` | **flags** `0x0c __` — bit `0x80` = variable-width charset | `0c 88` / `0c 08` | generated |
+| `3` | **LOB kind** | `02` (CLOB) / `01` (BLOB); `04` (NCLOB) | generated |
+| `4..5` | **flags** — `[4]` bit `0x40` = national form, `[5]` bit `0x80` = variable-width charset | `0c 88` / `0c 08`; NCLOB `4c 08` | generated |
 | `8` | **LOB type** | `02` / `01` | generated |
 | `16` | LID marker `0x56` | same | structural |
 | `17..26`, `36..38`, `52..54`, `80..82`, `102..104` | **physical LID** — object id + three segment DBAs + SCN | **synthetic (zeros)** | generated |
-| `31..32` | **charset id** (ub2 BE) | `0369` (873 = AL32UTF8) / `0000` | generated |
+| `31..32` | **charset id** (ub2 BE) | `0369` (873 = AL32UTF8) / `0000`; NCLOB `07d0` (2000 = AL16UTF16) | generated |
 | `91..94` | content byte size (ub4 BE) | patched per value | runtime |
 
 The whole locator is generated field by field. The 9-byte header (`0..8`) carries
@@ -4390,6 +4390,21 @@ So the Mirror, which has no real LOB segment, emits a **synthetic LID of zeros**
 BLOB content back correctly with the object id / DBAs / SCN zeroed. With the
 physical LID gone the CLOB and BLOB bodies are identical bar the charset id, so
 one template serves both.
+
+**NCLOB** (#1369). An NCLOB is a CLOB in the national character-set form, and its
+locator says so in three places. Measured against a live 11g, sqlplus 23.26
+selecting an NCLOB and then a CLOB column of the same table: the locators differ
+only in the header's LOB kind (`04` vs `02`), its flags (`4c 08` vs `0c 88`: the
+national bit set, and the variable-width bit clear because AL16UTF16 is fixed
+width), and the charset id (`07d0` vs `0369`). The two ub2 fields just before the
+charset id read `0002 0002` for the NCLOB and `0003 0003` for the CLOB on 11g. The
+Mirror's template carries `0002 0002` for both, and sqlplus accepts it for both.
+The content is UTF-16 for both. The describe carries the column's form too
+(charset 2000, form 2, vs 873, form 1). A CLOB-form locator under an NCLOB describe
+makes sqlplus refuse the value with **ORA-24806** ("character set form of buffer
+and LOB do not match"), and so does a READ reply echoing one: sqlplus sends the
+echoed locator on its next read, so the row value and every read reply must carry
+the same form.
 
 ## 15. TNS Marker Protocol
 

@@ -338,6 +338,18 @@ def test_declared_columns_record_what_postgresql_keeps_less_of() -> None:
             'f': None,
         },
     )
+    assert _declared_columns('CREATE TABLE t (n NCLOB, c CLOB, nclobby NUMBER)') == (
+        't',
+        {'n': ('NCLOB', 4000, None, None), 'c': None, 'nclobby': None},
+    )
+    # An object type's attributes, as a table's columns (#1431).
+    assert _declared_columns(
+        'CREATE OR REPLACE TYPE s.o FORCE AS OBJECT (n NCLOB, c CLOB, r RAW(4))'
+    ) == (
+        's.o',
+        {'n': ('NCLOB', 4000, None, None), 'c': None, 'r': ('RAW', 4, None, None)},
+    )
+    assert _declared_columns('CREATE TYPE l AS TABLE OF NCLOB') is None
     assert _declared_columns('DROP TABLE t') is None
 
 
