@@ -5827,15 +5827,29 @@ attribute value is the same encoding the column form uses, so the existing
 scalar decoders (§11) apply unchanged. `IS_DEGENERATE` (object stored in a LOB)
 raises `NotSupportedError`.
 
+That includes the character set (#1433). An `NVARCHAR2` / `NCHAR` attribute, or
+a collection of them, carries **AL16UTF16** (UTF-16BE) in the image, as a
+national column does. Everything else carries the session's AL32UTF8. Measured
+on 23ai: `N'žába 猫'` stored correctly dumps as 12 bytes
+(`01 7e 00 e1 00 62 …`). An image that writes the attribute as UTF-8 stores its
+10 UTF-8 bytes in their place, a different 5-character string. The server takes
+the bytes as they come, and seerdb read its own UTF-8 back as the right text, so
+only `LENGTH` / `DUMP` on the server or another client sees the corruption.
+
 ### 21.4 Attribute layout (data-dictionary)
 
 The ordered layout is fetched from `ALL_TYPE_ATTRS` (`attr_name`,
-`attr_type_name`, `length`, `precision`, `scale` `ORDER BY attr_no`) keyed by
+`attr_type_name`, `length`, `precision`, `scale`, `character_set_name`
+`ORDER BY attr_no`) keyed by
 `(owner, type_name)` and **cached per connection** — seerdb buffers the whole
 result set on execute (the server cursor is drained), so this extra query runs
 safely during row resolution. The SQL type name maps to a TNS type code for the
 scalar decoder; a name we don't map (e.g. a nested object type — #117/#118)
-leaves the attribute as raw bytes rather than desyncing.
+leaves the attribute as raw bytes rather than desyncing. `character_set_name`
+`NCHAR_CS` marks a national attribute (AL16UTF16, above). The type name can't:
+10g lists an `NVARCHAR2` attribute as `VARCHAR2` (and an `NCLOB` one as `CLOB`),
+while 11g and later name them, and `CHARACTER_SET_NAME` says `NCHAR_CS` on all of
+them. `ALL_COLL_TYPES` does the same for a collection's element (#1433).
 
 Decoded values surface as an `seerdb.DbObject` exposing attributes by name
 (`obj.STREET`) / item (`obj['STREET']`), plus `aslist()` / `asdict()`. A NULL

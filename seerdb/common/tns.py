@@ -13686,8 +13686,10 @@ def _encode_object_attr(DataType: int, Charset: int, Value: Any) -> bytes:
     if DataType in (TNS_TYPE_VARCHAR, TNS_TYPE_CHAR, TNS_TYPE_LONG):
         if isinstance(Value, (bytes, bytearray)):
             return bytes(Value)
-        # AL32UTF8 session -> UTF-8; the CharsetDict lookup was a no-op (it
-        # keyed a name->id map by an int, see #236).
+        # A national attribute (NVARCHAR2 / NCHAR) is AL16UTF16 in the image,
+        # as in a column (#1433); everything else is the AL32UTF8 session's.
+        if Charset == AL16UTF16_CHARSET:
+            return str(Value).encode('utf-16-be')
         return str(Value).encode('utf-8')
     if DataType == TNS_TYPE_NUMBER:
         if isinstance(Value, Decimal):

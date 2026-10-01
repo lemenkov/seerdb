@@ -1212,7 +1212,13 @@ _ORACLE_DICTIONARY_DDL = (
     f"('{_TSTZ_TYPE}', '{_CLOB_TYPE}', '{_BLOB_TYPE}') "
     'THEN ora_owner(a.attribute_udt_schema) END AS attr_type_owner, '
     'a.character_maximum_length AS length, a.numeric_precision AS precision, '
-    'a.numeric_scale AS scale, a.ordinal_position AS attr_no '
+    'a.numeric_scale AS scale, a.ordinal_position AS attr_no, '
+    # The character set a character attribute takes; a client reads the national
+    # form (NCHAR_CS) from here (#1433). Appended: CREATE OR REPLACE VIEW can
+    # only add a column at the end.
+    "CASE WHEN a.data_type IN ('character varying', 'character', 'text') "
+    f"OR a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CHAR_CS' "
+    'END::text AS character_set_name '
     'FROM information_schema.attributes a '
     'LEFT JOIN sys.ora_columns o ON o.relid = '
     "(quote_ident(a.udt_schema) || '.' || quote_ident(a.udt_name))::regclass "
@@ -1242,7 +1248,10 @@ _ORACLE_DICTIONARY_DDL = (
     'CASE WHEN e.oid = 1700 AND d.typtypmod >= 4 '
     'THEN (d.typtypmod - 4) >> 16 END AS precision, '
     'CASE WHEN e.oid = 1700 AND d.typtypmod >= 4 '
-    'THEN (d.typtypmod - 4) & 65535 END AS scale '
+    'THEN (d.typtypmod - 4) & 65535 END AS scale, '
+    # The element's character set, as all_type_attrs gives an attribute's (#1433).
+    f"CASE WHEN e.oid IN (25, 1042, 1043) OR e.typname = '{_CLOB_TYPE}' "
+    "THEN 'CHAR_CS' END::text AS character_set_name "
     'FROM pg_type d JOIN pg_namespace n ON n.oid = d.typnamespace '
     "JOIN pg_type b ON b.oid = d.typbasetype AND b.typcategory = 'A' "
     'JOIN pg_type e ON e.oid = b.typelem '

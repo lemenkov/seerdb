@@ -1479,7 +1479,11 @@ class AsyncOracleConnect(_ConnectionLogic):
     async def _describe_object_type_uncached(
         self, Owner: str, name: str, Key: tuple
     ) -> 'DbObjectType | None':
-        from seerdb.common.dbobject import DbObjectType, type_name_to_tns
+        from seerdb.common.dbobject import (
+            DbObjectType,
+            national_charset,
+            type_name_to_tns,
+        )
 
         OidRes = await self.execute(
             'SELECT type_oid, typecode FROM all_types '
@@ -1491,7 +1495,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         TypeCode = OidRows[0][1] if OidRows else None
         Result = await self.execute(
             'SELECT attr_name, attr_type_name, attr_type_owner, length, '
-            'precision, scale FROM all_type_attrs '
+            'precision, scale, character_set_name FROM all_type_attrs '
             'WHERE owner = :1 AND type_name = :2 '
             'ORDER BY attr_no',
             Bind=[Owner, name],
@@ -1504,7 +1508,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 'name': Row[0],
                 'type_name': TypeName,
                 'data_type': type_name_to_tns(TypeName),
-                'charset': None,
+                'charset': national_charset(Row[6]),
             }
             if TypeOwner:
                 # A nested object / collection attribute (#1268): embed its own
@@ -1524,7 +1528,11 @@ class AsyncOracleConnect(_ConnectionLogic):
     ) -> 'DbObjectType | None':
         """Async port of `OracleConnect._describe_plsql_type` (#1030): a PL/SQL
         package-level type, read from the all_plsql_* dictionaries."""
-        from seerdb.common.dbobject import DbObjectType, type_name_to_tns
+        from seerdb.common.dbobject import (
+            DbObjectType,
+            national_charset,
+            type_name_to_tns,
+        )
 
         Owner = schema
         if Owner is None:
@@ -1558,18 +1566,18 @@ class AsyncOracleConnect(_ConnectionLogic):
                 AttrRows = self._rows(
                     await self.execute(
                         'SELECT attr_name, attr_type_name, attr_type_owner, '
-                        'attr_type_package FROM all_plsql_type_attrs '
+                        'attr_type_package, character_set_name FROM all_plsql_type_attrs '
                         'WHERE owner = :1 AND package_name = :2 AND type_name = :3 '
                         'ORDER BY attr_no',
                         Bind=[Owner, package, name],
                     )
                 )
-                for AttrName, TypeName, TypeOwner, TypePackage in AttrRows:
+                for AttrName, TypeName, TypeOwner, TypePackage, CharsetName in AttrRows:
                     Attr: dict = {
                         'name': AttrName,
                         'type_name': TypeName,
                         'data_type': type_name_to_tns(TypeName),
-                        'charset': None,
+                        'charset': national_charset(CharsetName),
                     }
                     if TypePackage:
                         Attr['object_type'] = await self._describe_plsql_type(
@@ -1596,13 +1604,15 @@ class AsyncOracleConnect(_ConnectionLogic):
             COLLECTION_NESTED_TABLE,
             COLLECTION_PLSQL_INDEX_TABLE,
             COLLECTION_VARRAY,
+            national_charset,
             type_name_to_tns,
         )
 
         Rows = self._rows(
             await self.execute(
                 'SELECT coll_type, elem_type_name, elem_type_owner, '
-                'elem_type_package, upper_bound FROM all_plsql_coll_types '
+                'elem_type_package, upper_bound, character_set_name '
+                'FROM all_plsql_coll_types '
                 'WHERE owner = :1 AND package_name = :2 AND type_name = :3',
                 Bind=[owner, package, name],
             )
@@ -1614,7 +1624,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             'name': 'element',
             'type_name': ElemName,
             'data_type': type_name_to_tns(ElemName),
-            'charset': None,
+            'charset': national_charset(Rows[0][5]),
         }
         if ElemPackage:
             Element['object_type'] = await self._describe_plsql_type(
@@ -1641,12 +1651,13 @@ class AsyncOracleConnect(_ConnectionLogic):
         from seerdb.common.dbobject import (
             COLLECTION_NESTED_TABLE,
             COLLECTION_VARRAY,
+            national_charset,
             type_name_to_tns,
         )
 
         Res = await self.execute(
             'SELECT coll_type, elem_type_name, elem_type_owner, length, '
-            'precision, scale, upper_bound '
+            'precision, scale, upper_bound, character_set_name '
             'FROM all_coll_types WHERE owner = :1 AND type_name = :2',
             Bind=[owner, name],
         )
@@ -1658,7 +1669,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             'name': 'element',
             'type_name': ElemType,
             'data_type': type_name_to_tns(ElemType),
-            'charset': None,
+            'charset': national_charset(Rows[0][7]),
         }
         if ElemOwner:
             # A collection of a UDT (#1254): embed the element type's layout so
