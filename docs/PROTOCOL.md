@@ -3063,6 +3063,15 @@ with no body:
 length | flags | typ| f | data_flags = EOF
 ```
 
+**A clean logoff commits** (#1429). Step 1 is the *client's* choice. A session
+that sends `TTI_LOGOFF` with a transaction still open has it **committed** by the
+server, on every version measured (8i, 9i, 10g, 11g, 23ai). Only a dropped
+connection rolls back. sqlplus depends on it: with the default `EXITCOMMIT ON`,
+`INSERT …; exit` sends the INSERT and then `TTI_LOGOFF`, no COMMIT (captured,
+sqlplus 23.26 against 11g). python-oracledb and seerdb roll back first when
+autocommit is off, so a closed connection loses its uncommitted work for them;
+the Mirror commits what is left open at a logoff, thin or OCI, as Oracle does.
+
 ### 10.1 The server's logoff reply (thin)
 
 Step 3 above — "reads its response" — is load-bearing from python-oracledb
