@@ -2411,6 +2411,12 @@ _CREATE_OR_REPLACE_VIEW = re.compile(
     re.IGNORECASE,
 )
 _VIEW_BODY_QUOTE = '$seerdb_view$'
+# Any CREATE VIEW, whose columns take what sys.ora_columns has for the columns
+# they come from (#1425).
+_CREATE_VIEW_NAME = re.compile(
+    r'\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:NO)?FORCE\s+)?VIEW\s+([\w."$#]+)',
+    re.IGNORECASE,
+)
 
 
 def _translate_replace_view(sql: str) -> str | None:
@@ -5151,9 +5157,42 @@ class PostgresBackend:
                             'to_regclass(%s) AND attname = %s AND attnum > 0',
                             (*detail, table, name),
                         )
+            view = _CREATE_VIEW_NAME.match(statement)
+            if view is not None:
+                self._record_view_column_types(view.group(1))
             self._conn.commit()
         except psycopg.Error:
             self._conn.rollback()
+
+    def _record_view_column_types(self, name: str) -> None:
+        # A view's columns take the records of the columns they come from
+        # (#1425). A column read through a view traces to the view, not to its
+        # table, so the view's own definition is run instead, empty, and each of
+        # its columns traced through libpq ftable / ftablecol. A view over a
+        # view copies from the inner view's rows.
+        row = self._conn.execute(
+            'SELECT c.oid, pg_get_viewdef(c.oid) FROM pg_class c '
+            "WHERE c.oid = to_regclass(%s) AND c.relkind = 'v'",
+            (name,),
+        ).fetchone()
+        if row is None:
+            return
+        relid, definition = row
+        self._conn.execute('DELETE FROM sys.ora_columns WHERE relid = %s', (relid,))
+        pgresult = self._conn.execute(
+            f'SELECT * FROM ({definition.strip().rstrip(";")}) q LIMIT 0'
+        ).pgresult
+        if pgresult is None:
+            return
+        for index in range(pgresult.nfields):
+            source = pgresult.ftable(index)
+            if source:
+                self._conn.execute(
+                    'INSERT INTO sys.ora_columns SELECT %s, %s, data_type, '
+                    'data_length, data_precision, data_scale FROM sys.ora_columns '
+                    'WHERE relid = %s AND attnum = %s',
+                    (relid, index + 1, source, pgresult.ftablecol(index)),
+                )
 
     def _declared_column_types(self, pgresult, indexes: list[int]) -> dict[int, tuple]:
         # The declared type recorded for each result column at `indexes` that
