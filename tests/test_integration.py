@@ -1295,6 +1295,25 @@ class TypesIntegration(_IntegrationBase):
             return  # before 10g the describe carries no character length
         self.assertEqual([d[1:] for d in description], [(1, 1), (1, 2), (4, 8)])
 
+    def test_an_unconstrained_number_column_describes_as_oracle_does(self):
+        # A NUMBER column with no precision describes as precision 0 and scale
+        # -127; a computed number carries neither, and a fetched value keeps its
+        # kind. The Mirror over PostgreSQL gave the column neither (#1421).
+        # 8i itself describes the column with neither, as a computed one.
+        bare = (None, None) if _conn_is_8i(self.conn) else (0, -127)
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (a NUMBER, b NUMBER(10, 2))')
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (7, 3.25)')
+        for where in ('', ' WHERE 1 = 0'):
+            self.cur.execute(f'SELECT a, b, a + 1 FROM {self.TABLE}{where}')
+            self.cur.fetchall()
+            self.assertEqual(
+                [tuple(d)[4:6] for d in self.cur.description],
+                [bare, (10, 2), (None, None)],
+                where,
+            )
+        self.cur.execute(f'SELECT a, b FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchall(), [(7, 3.25)])
+
     def test_integer_and_smallint_are_number_38(self):
         # INTEGER, INT and SMALLINT are NUMBER(38): 20 digits fit, and the
         # columns describe as NUMBER(38,0). A SMALLINT parameter takes an
