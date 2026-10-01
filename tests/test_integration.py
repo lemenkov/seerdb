@@ -1215,6 +1215,33 @@ class TypesIntegration(_IntegrationBase):
             [('FLOAT', 22, bits, None) for bits in (126, 10, 63, 126)],
         )
 
+    def test_an_nvarchar2_column_describes_as_national(self):
+        # An NVARCHAR2(n) column describes as NVARCHAR, n characters and 2n bytes
+        # of AL16UTF16, with rows or without, keeps its text, and
+        # USER_TAB_COLUMNS lists it as NVARCHAR2 of length 2n. The Mirror over
+        # PostgreSQL stored it as a varchar and described a VARCHAR2 (#1383).
+        text = 'ko\u010dka \u4e2d'
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (v NVARCHAR2(20), p VARCHAR2(20))')
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', [text, 'plain'])
+        for where in ('', ' WHERE 1 = 0'):
+            self.cur.execute(f'SELECT v, p FROM {self.TABLE}{where}')
+            self.cur.fetchall()
+            self.assertEqual(
+                [tuple(d)[1:4] for d in self.cur.description],
+                [(seerdb.DB_TYPE_NVARCHAR, 20, 40), (seerdb.DB_TYPE_VARCHAR, 20, 20)],
+                where,
+            )
+        self.cur.execute(f'SELECT v FROM {self.TABLE} WHERE v = :1', [text])
+        self.assertEqual(self.cur.fetchall(), [(text,)])
+        self.cur.execute(
+            'SELECT data_type, data_length, char_length FROM user_tab_columns '
+            'WHERE table_name = :1 ORDER BY column_id',
+            [self.TABLE],
+        )
+        self.assertEqual(
+            self.cur.fetchall(), [('NVARCHAR2', 40, 20), ('VARCHAR2', 20, 20)]
+        )
+
     def test_integer_and_smallint_are_number_38(self):
         # INTEGER, INT and SMALLINT are NUMBER(38): 20 digits fit, and the
         # columns describe as NUMBER(38,0). A SMALLINT parameter takes an
@@ -7436,6 +7463,24 @@ class NationalAttributeIntegration(_IntegrationBase):
         self.assertEqual(self._stored_length(2), len(self.BOUND))
         self.cur.execute(f'SELECT o FROM {self.TABLE} WHERE k = 2')
         self.assertEqual(self.cur.fetchone()[0].V, self.BOUND)
+
+    def test_a_national_attribute_is_listed_as_national(self):
+        # USER_TYPE_ATTRS names an NVARCHAR2 attribute NVARCHAR2, with the
+        # national character set; 10g itself names it VARCHAR2. The Mirror over
+        # PostgreSQL stores it as a varchar (#1383).
+        national = (
+            'VARCHAR2' if int(self.conn.version.split('.')[0]) < 11 else 'NVARCHAR2'
+        )
+        self.cur.execute(
+            'SELECT attr_name, attr_type_name, length, character_set_name '
+            'FROM user_type_attrs WHERE type_name = :1 AND attr_name IN (:2, :3) '
+            'ORDER BY attr_no',
+            [self.TYPE, 'V', 'W'],
+        )
+        self.assertEqual(
+            self.cur.fetchall(),
+            [('V', national, 10, 'NCHAR_CS'), ('W', 'VARCHAR2', 10, 'CHAR_CS')],
+        )
 
     def test_a_national_attribute_collection_fetches_and_binds(self):
         self.cur.execute(

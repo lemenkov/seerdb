@@ -1204,6 +1204,7 @@ _ORACLE_DICTIONARY_DDL = (
     f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' AND o.data_type = 'NCLOB' "
     "THEN 'NCLOB' "
     f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CLOB' "
+    "WHEN o.data_type = 'NVARCHAR2' THEN 'NVARCHAR2' "
     f"WHEN a.attribute_udt_name = '{_BLOB_TYPE}' THEN 'BLOB' "
     "WHEN a.data_type = 'USER-DEFINED' THEN ora_name(a.attribute_udt_name) "
     "WHEN a.data_type = 'timestamp with time zone' THEN 'TIMESTAMP WITH LOCAL TZ' "
@@ -1216,7 +1217,10 @@ _ORACLE_DICTIONARY_DDL = (
     # The character set a character attribute takes; a client reads the national
     # form (NCHAR_CS) from here (#1433). Appended: CREATE OR REPLACE VIEW can
     # only add a column at the end.
-    "CASE WHEN a.data_type IN ('character varying', 'character', 'text') "
+    # A national attribute -- NVARCHAR2 or NCLOB, told apart by its record --
+    # takes NCHAR_CS, which the client reads its AL16UTF16 form from (#1383).
+    "CASE WHEN o.data_type IN ('NVARCHAR2', 'NCLOB') THEN 'NCHAR_CS' "
+    "WHEN a.data_type IN ('character varying', 'character', 'text') "
     f"OR a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CHAR_CS' "
     'END::text AS character_set_name '
     'FROM information_schema.attributes a '
@@ -1882,6 +1886,11 @@ _LONG_DECLARED = re.compile(r'\s*LONG(?:\s+(RAW))?\b', re.IGNORECASE)
 # NCLOB, which the rewrite stores as the ora_clob domain CLOB is (#1369). On the
 # wire it is a CLOB in the national character set form.
 _NCLOB_DECLARED = re.compile(r'\s*NCLOB\b', re.IGNORECASE)
+# NVARCHAR2(n), which the rewrite stores as varchar(n) (#1383). Oracle measures
+# it in AL16UTF16: n characters, 2n bytes.
+_NVARCHAR2_DECLARED = re.compile(
+    r'\s*NVARCHAR2\s*\(\s*(\d+)\s*(?:CHAR\s*)?\)', re.IGNORECASE
+)
 _CSFRM_NATIONAL = 2
 # An INTERVAL's precisions, which the rewrite's interval / ora_intervalym drop
 # (#1381). Oracle's defaults: DAY(2) TO SECOND(6), YEAR(2) TO MONTH.
@@ -1918,6 +1927,9 @@ def _declared_type(
         return ('LONG RAW' if long.group(1) else 'LONG', 0, None, None)
     if _NCLOB_DECLARED.match(definition):
         return ('NCLOB', 4000, None, None)
+    national = _NVARCHAR2_DECLARED.match(definition)
+    if national is not None:
+        return ('NVARCHAR2', 2 * int(national.group(1)), None, None)
     floating = _FLOAT_DECLARED.match(definition)
     if floating is not None:
         bits = int(floating.group(1) or (63 if floating.group(2) else 126))
@@ -2268,6 +2280,7 @@ _BUILTIN_TYPE_OID_BYTE = {
     'TIMESTAMP WITH LOCAL TZ': 0x41,
     'CLOB': 0x22,
     'NCLOB': 0x22,  # the same built-in OID as CLOB's, measured on 23ai (#1431)
+    'NVARCHAR2': 0x19,  # the same as VARCHAR2's, measured on 23ai (#1383)
     'BLOB': 0x23,
 }
 
@@ -5594,7 +5607,8 @@ class PostgresBackend:
             columns[i] = replace(columns[i], null_ok=0)
         # A RAW(n) column describes as its declared n, which bytea does not keep;
         # the values' widest stood in for it (#1386). A LONG / LONG RAW column,
-        # stored as text / bytea, describes as itself, unsized (#1382).
+        # stored as text / bytea, describes as itself, unsized (#1382). An
+        # NVARCHAR2 column, a varchar, describes in the national form (#1383).
         plain = [
             i
             for i, col in enumerate(columns)
@@ -5614,6 +5628,15 @@ class PostgresBackend:
                 elif declared == 'RAW' and length:
                     columns[i] = replace(
                         columns[i], data_length=length, max_size=length
+                    )
+                elif declared == 'NVARCHAR2' and length:
+                    # National: n characters of AL16UTF16, 2n bytes (#1383).
+                    columns[i] = replace(
+                        columns[i],
+                        csfrm=_CSFRM_NATIONAL,
+                        charset=AL16UTF16_CHARSET,
+                        data_length=length,
+                        max_size=length // 2,
                     )
         # An INTERVAL column describes with its declared precisions, which
         # PostgreSQL's interval does not keep (#1381). A FLOAT(b) column, a
@@ -5857,8 +5880,16 @@ class PostgresBackend:
         if kind is None:
             return _tds_scalar(self._pg_type_name(pg_oid), typmod)[0]
         if kind[0] == 'object':
+            declared = self._declared_attribute_types(pg_oid)
             return _TdsObject(
-                tuple(self._type_shape(t, m) for (_n, t, m) in self._attributes(pg_oid))
+                tuple(
+                    _tds_chars(0x07, 2 * (m - 4), True)
+                    # An NVARCHAR2(n) attribute is a varchar(n) here; its leaf
+                    # is the national one, 2n bytes, as 23ai sends it (#1383).
+                    if declared.get(n) == 'NVARCHAR2' and m > 4
+                    else self._type_shape(t, m)
+                    for (n, t, m) in self._attributes(pg_oid)
+                )
             )
         (_kind, _owner, _name, element, element_typmod) = kind
         bound = self._conn.execute(
@@ -5922,6 +5953,8 @@ class PostgresBackend:
                 # apart, and the client types the attribute by it (#1431).
                 if type_name == 'CLOB' and declared.get(attname) == 'NCLOB':
                     type_name = 'NCLOB'
+                elif type_name == 'VARCHAR2' and declared.get(attname) == 'NVARCHAR2':
+                    type_name = 'NVARCHAR2'  # (#1383)
                 (owner, toid) = (
                     None,
                     bytes(15) + bytes([_BUILTIN_TYPE_OID_BYTE[type_name]]),
@@ -6029,6 +6062,10 @@ class PostgresBackend:
                 'SELECT sys.ora_name(a.attribute_name), '
                 f"CASE WHEN a.attribute_udt_name = '{_TSTZ_TYPE}' "
                 "THEN 'TIMESTAMP WITH TZ' "
+                # The national types, told apart by their record (#1383).
+                f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' "
+                "AND o.data_type = 'NCLOB' THEN 'NCLOB' "
+                "WHEN o.data_type = 'NVARCHAR2' THEN 'NVARCHAR2' "
                 f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CLOB' "
                 f"WHEN a.attribute_udt_name = '{_BLOB_TYPE}' THEN 'BLOB' "
                 "WHEN a.data_type = 'USER-DEFINED' "
@@ -6043,7 +6080,14 @@ class PostgresBackend:
                 "format('%%I.%%I', a.attribute_udt_schema, a.attribute_udt_name)"
                 '::regtype::oid '
                 'FROM information_schema.attributes a '
-                'WHERE a.udt_schema = %s AND a.udt_name = %s '
+                + (
+                    'LEFT JOIN sys.ora_columns o ON o.relid = '
+                    "format('%%I.%%I', a.udt_schema, a.udt_name)::regclass "
+                    'AND o.attnum = a.ordinal_position '
+                    if self._has_column_catalog
+                    else 'CROSS JOIN (SELECT NULL::text AS data_type) o '
+                )
+                + 'WHERE a.udt_schema = %s AND a.udt_name = %s '
                 'ORDER BY a.ordinal_position',
                 (pg_schema, pg_name),
             ):
@@ -6051,7 +6095,9 @@ class PostgresBackend:
                     'name': attr_name,
                     'type_name': type_name,
                     'data_type': type_name_to_tns(type_name),
-                    'charset': None,
+                    # A client sends and expects an NVARCHAR2 attribute in
+                    # AL16UTF16 inside the object image (#1383).
+                    'charset': AL16UTF16_CHARSET if type_name == 'NVARCHAR2' else None,
                 }
                 if type_owner is not None:
                     # An object or collection attribute carries its own type, as
