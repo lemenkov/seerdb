@@ -926,7 +926,10 @@ _ORACLE_DICTIONARY_DDL = (
     f"CASE WHEN c.domain_name = '{_DATE_TYPE}' THEN 7 ELSE "
     'coalesce(o.data_length, c.character_maximum_length, c.numeric_precision, 22) '
     'END AS data_length, '
-    'c.numeric_precision AS data_precision, c.numeric_scale AS data_scale, '
+    'coalesce(o.data_precision, c.numeric_precision)'
+    '::information_schema.cardinal_number AS data_precision, '
+    'coalesce(o.data_scale, c.numeric_scale)'
+    '::information_schema.cardinal_number AS data_scale, '
     'c.character_maximum_length AS char_length, '
     "CASE c.is_nullable WHEN 'YES' THEN 'Y' ELSE 'N' END AS nullable, "
     'c.column_default AS data_default, '
@@ -1852,6 +1855,15 @@ _RAW_DECLARED = re.compile(r'\s*RAW\s*\(\s*(\d+)\s*\)', re.IGNORECASE)
 # LONG and LONG RAW, which the rewrite stores as text and bytea (#1382).
 _LONG_TYPES = {'LONG': TNS_TYPE_LONG, 'LONG RAW': TNS_TYPE_LONGRAW}
 _LONG_DECLARED = re.compile(r'\s*LONG(?:\s+(RAW))?\b', re.IGNORECASE)
+# An INTERVAL's precisions, which the rewrite's interval / ora_intervalym drop
+# (#1381). Oracle's defaults: DAY(2) TO SECOND(6), YEAR(2) TO MONTH.
+_INTERVAL_DS_DECLARED = re.compile(
+    r'\s*INTERVAL\s+DAY\s*(?:\(\s*(\d+)\s*\))?\s*TO\s+SECOND\b\s*(?:\(\s*(\d+)\s*\))?',
+    re.IGNORECASE,
+)
+_INTERVAL_YM_DECLARED = re.compile(
+    r'\s*INTERVAL\s+YEAR\s*(?:\(\s*(\d+)\s*\))?\s*TO\s+MONTH\b', re.IGNORECASE
+)
 # A MODIFY that leaves the column's type alone -- a constraint, a default.
 _MODIFY_WITHOUT_TYPE = re.compile(
     r'\s*(?:$|(?:NOT|NULL|DEFAULT|CONSTRAINT|CHECK|UNIQUE|PRIMARY|REFERENCES|'
@@ -1870,6 +1882,14 @@ def _declared_type(
     if long is not None:
         # Oracle lists a LONG / LONG RAW column with data_length 0.
         return ('LONG RAW' if long.group(1) else 'LONG', 0, None, None)
+    ds = _INTERVAL_DS_DECLARED.match(definition)
+    if ds is not None:
+        day, second = int(ds.group(1) or 2), int(ds.group(2) or 6)
+        return (f'INTERVAL DAY({day}) TO SECOND({second})', 11, day, second)
+    ym = _INTERVAL_YM_DECLARED.match(definition)
+    if ym is not None:
+        year = int(ym.group(1) or 2)
+        return (f'INTERVAL YEAR({year}) TO MONTH', 5, year, 0)
     return None
 
 
@@ -5491,6 +5511,21 @@ class PostgresBackend:
                 elif declared == 'RAW' and length:
                     columns[i] = replace(
                         columns[i], data_length=length, max_size=length
+                    )
+        # An INTERVAL column describes with its declared precisions, which
+        # PostgreSQL's interval does not keep (#1381).
+        interval = [
+            i
+            for i, col in enumerate(columns)
+            if col.data_type in (TNS_TYPE_INTERVALDS, TNS_TYPE_INTERVALYM)
+        ]
+        if interval:
+            for i, (_type, _length, precision, scale) in self._declared_column_types(
+                cursor.pgresult, interval
+            ).items():
+                if precision is not None:
+                    columns[i] = replace(
+                        columns[i], precision=precision, scale=scale or 0
                     )
         tstz = [
             i for i, col in enumerate(columns) if col.data_type == TNS_TYPE_TIMESTAMPTZ
