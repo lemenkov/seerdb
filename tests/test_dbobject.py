@@ -54,6 +54,7 @@ from seerdb.common.tns import (
     object_lob_contents,
 )
 from seerdb.common.tns_consts import (
+    AL16UTF16_CHARSET,
     AL32UTF8_CHARSET,
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
@@ -153,6 +154,35 @@ class TestDbObjectApi(unittest.TestCase):
 _ADDR_TYPE = DbObjectType(
     'PYO', 'ADDR_T', bytes.fromhex('00112233445566778899aabbccddeeff'), 1, _ADDR_LAYOUT
 )
+
+
+class TestNationalAttribute(unittest.TestCase):
+    # An NVARCHAR2 / NCHAR attribute is AL16UTF16 in the object image, as in a
+    # column; the client learns which attributes are national from their
+    # CHARACTER_SET_NAME (#1433). The live check that the server stores what
+    # this writes is NationalAttributeIntegration's LENGTH(x.o.v).
+
+    LAYOUT = [
+        {'name': 'V', 'data_type': TNS_TYPE_VARCHAR, 'charset': AL16UTF16_CHARSET},
+        {'name': 'W', 'data_type': TNS_TYPE_VARCHAR, 'charset': None},
+    ]
+    TYPE = DbObjectType('PYO', 'NAT_T', bytes(16), 1, LAYOUT)
+
+    def test_the_national_form_comes_from_the_character_set_name(self):
+        from seerdb.common.dbobject import national_charset
+
+        self.assertEqual(national_charset('NCHAR_CS'), AL16UTF16_CHARSET)
+        self.assertIsNone(national_charset('CHAR_CS'))
+        self.assertIsNone(national_charset(None))
+
+    def test_a_national_attribute_is_written_and_read_as_al16utf16(self):
+        text = 'ko\u010dka \u4e2d'
+        image = encode_object_image(self.TYPE.newobject({'V': text, 'W': text}))
+        self.assertIn(text.encode('utf-16-be'), image)  # V
+        self.assertIn(text.encode('utf-8'), image)  # W, the session's
+        self.assertEqual(
+            decode_object_image(image, self.LAYOUT), [('V', text), ('W', text)]
+        )
 
 
 class TestObjectBindEncode(unittest.TestCase):

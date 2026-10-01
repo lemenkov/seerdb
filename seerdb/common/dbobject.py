@@ -30,6 +30,7 @@ from collections.abc import Callable
 
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
 from seerdb.common.tns_consts import (
+    AL16UTF16_CHARSET,
     AL32UTF8_CHARSET,
     TNS_LONG_LENGTH_INDICATOR,
     TNS_MAX_SHORT_LENGTH,
@@ -122,6 +123,19 @@ _TYPE_NAME_TO_TNS = {
     'INTERVAL DAY TO SECOND': TNS_TYPE_INTERVALDS,
     'INTERVAL YEAR TO MONTH': TNS_TYPE_INTERVALYM,
 }
+
+
+def national_charset(character_set_name: str | None) -> int | None:
+    """The character set an attribute or element takes in an object image, from
+    its CHARACTER_SET_NAME in ALL_TYPE_ATTRS / ALL_COLL_TYPES: AL16UTF16 for
+    ``NCHAR_CS``, else None (the session's).
+
+    An NVARCHAR2 / NCHAR value lives in the image in the national character set,
+    as it does in a column; read and written as the session's AL32UTF8 it came
+    back garbled and went in corrupt (#1433). The character set name says so on
+    every version: 10g names such an attribute VARCHAR2 / CHAR, not NVARCHAR2.
+    """
+    return AL16UTF16_CHARSET if character_set_name == 'NCHAR_CS' else None
 
 
 def type_name_to_tns(name: str | None) -> int | None:

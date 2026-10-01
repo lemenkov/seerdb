@@ -78,6 +78,7 @@ _FV2_UNSUPPORTED = (
     ('nested_attribute', 'object types are not supported on Oracle 9i'),
     ('collection_of_collections', 'object types are not supported on Oracle 9i'),
     ('local_time_zone_attribute', 'object types are not supported on Oracle 9i'),
+    ('national_attribute', 'object types are not supported on Oracle 9i'),
     ('collection_value', 'object types are not supported on Oracle 9i'),
     ('changepassword', 'changepassword is not supported on Oracle 9i'),
     ('cache_evicts', 'the cursor cache is a fv4+ feature; 9i re-parses'),
@@ -7365,6 +7366,92 @@ class LargeObjectImageIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class NationalAttributeIntegration(_IntegrationBase):
+    """An NVARCHAR2 object attribute or collection element is AL16UTF16 in the
+    object image, as in a column: it fetches whole, and a bound value is stored
+    as the national text it is (#1433). Read and written as UTF-8, a fetch came
+    back garbled and a bind stored the UTF-8 bytes as if they were AL16UTF16 --
+    which seerdb then read back as the right text, and every other client did
+    not."""
+
+    TYPE = 'PYO_NATTR_T'
+    LIST = 'PYO_NATTR_L'
+    TABLE = 'PYO_NATTR_TAB'
+    TEXT = 'ko\u010dka \u4e2d'
+    BOUND = '\u017e\u00e1ba \u732b'
+
+    def setUp(self):
+        super().setUp()
+        self._drop()
+        self.cur.execute(
+            f'CREATE TYPE {self.TYPE} AS OBJECT (id NUMBER, v NVARCHAR2(10), w VARCHAR2(10))'
+        )
+        self.cur.execute(f'CREATE TYPE {self.LIST} AS TABLE OF NVARCHAR2(10)')
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (k NUMBER, o {self.TYPE}, l {self.LIST}) '
+            f'NESTED TABLE l STORE AS {self.TABLE}_S'
+        )
+
+    def tearDown(self):
+        self._drop()
+        super().tearDown()
+
+    def _drop(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (
+            f'DROP TABLE {self.TABLE}',
+            f'DROP TYPE {self.LIST}',
+            f'DROP TYPE {self.TYPE}',
+        ):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass  # best-effort teardown of leftovers
+
+    def _stored_length(self, k):
+        # The server's own reading of what was stored: the UTF-8 bytes of BOUND
+        # taken as AL16UTF16 are 5 characters, not 7. The Mirror over PostgreSQL
+        # cannot select an attribute in SQL yet (#1434).
+        # A leg that names no backend ('1', the CI job) gets the conservative
+        # answer, as _skip_if_mirror_backend gives it.
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            return len(self.BOUND)
+        self.cur.execute(f'SELECT LENGTH(x.o.v) FROM {self.TABLE} x WHERE k = :1', [k])
+        return self.cur.fetchone()[0]
+
+    def test_a_national_attribute_fetches_and_binds(self):
+        self.cur.execute(
+            f"INSERT INTO {self.TABLE} (k, o) VALUES (1, {self.TYPE}(1, N'{self.TEXT}', 'pes'))"
+        )
+        self.cur.execute(f'SELECT o FROM {self.TABLE} WHERE k = 1')
+        o = self.cur.fetchone()[0]
+        self.assertEqual((o.V, o.W), (self.TEXT, 'pes'))
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            return  # an object bind needs the 12.1+ OAC
+        obj = self.conn.gettype(self.TYPE).newobject(
+            {'ID': 2, 'V': self.BOUND, 'W': 'x'}
+        )
+        self.cur.execute(f'INSERT INTO {self.TABLE} (k, o) VALUES (2, :1)', [obj])
+        self.assertEqual(self._stored_length(2), len(self.BOUND))
+        self.cur.execute(f'SELECT o FROM {self.TABLE} WHERE k = 2')
+        self.assertEqual(self.cur.fetchone()[0].V, self.BOUND)
+
+    def test_a_national_attribute_collection_fetches_and_binds(self):
+        self.cur.execute(
+            f"INSERT INTO {self.TABLE} (k, l) VALUES (1, {self.LIST}('{self.TEXT}', 'pes'))"
+        )
+        self.cur.execute(f'SELECT l FROM {self.TABLE} WHERE k = 1')
+        self.assertEqual(self.cur.fetchone()[0].aslist(), [self.TEXT, 'pes'])
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            return  # an object bind needs the 12.1+ OAC
+        coll = self.conn.gettype(self.LIST).newobject([self.BOUND])
+        self.cur.execute(f'INSERT INTO {self.TABLE} (k, l) VALUES (2, :1)', [coll])
+        self.cur.execute(f'SELECT l FROM {self.TABLE} WHERE k = 2')
+        self.assertEqual(self.cur.fetchone()[0].aslist(), [self.BOUND])
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class ObjectLobAttributeIntegration(_IntegrationBase):
     """CLOB / NCLOB / BLOB attributes of an object type (#1260): fetched, each is
     a LOB on the connection; bound, it takes a LOB -- fetched or temporary -- or a
@@ -9065,6 +9152,52 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     await Cur.execute(f'SELECT o FROM {Table}')
                     (Fetched,) = await Cur.fetchone()
                     self.assertEqual(Fetched.TS.replace(tzinfo=None), Given)
+                finally:
+                    for Stmt in Drops:
+                        try:
+                            await Cur.execute(Stmt)
+                        except seerdb.DatabaseError:
+                            pass  # a CREATE above failed, so nothing to drop
+
+    async def test_a_national_attribute_fetches_and_binds(self):
+        # Async twin of NationalAttributeIntegration (#1433).
+        Typ, Table = 'PYO_ANATTR_T', 'PYO_ANATTR_TAB'
+        Drops = (f'DROP TABLE {Table}', f'DROP TYPE {Typ}')
+        Text, Bound = 'ko\u010dka \u4e2d', '\u017e\u00e1ba \u732b'
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                for Stmt in Drops:
+                    try:
+                        await Cur.execute(Stmt)
+                    except seerdb.DatabaseError:
+                        pass  # no leftover from a prior run
+                try:
+                    await Cur.execute(
+                        f'CREATE TYPE {Typ} AS OBJECT (id NUMBER, v NVARCHAR2(10))'
+                    )
+                    await Cur.execute(f'CREATE TABLE {Table} (k NUMBER, o {Typ})')
+                    await Cur.execute(
+                        f"INSERT INTO {Table} VALUES (1, {Typ}(1, N'{Text}'))"
+                    )
+                    await Cur.execute(f'SELECT o FROM {Table} WHERE k = 1')
+                    (Fetched,) = await Cur.fetchone()
+                    self.assertEqual(Fetched.V, Text)
+                    if Conn.field_version < FIELD_VERSION_12_1:
+                        return  # an object bind needs the 12.1+ OAC
+                    ObjType = await Conn.gettype(Typ)
+                    await Cur.execute(
+                        f'INSERT INTO {Table} VALUES (2, :1)',
+                        [ObjType.newobject({'ID': 2, 'V': Bound})],
+                    )
+                    # Not over PostgreSQL (#1434), nor a leg that names no backend.
+                    if os.environ.get('SEERDB_TEST_MIRROR') not in ('postgres', '1'):
+                        await Cur.execute(
+                            f'SELECT LENGTH(x.o.v) FROM {Table} x WHERE k = 2'
+                        )
+                        self.assertEqual(await Cur.fetchone(), (len(Bound),))
+                    await Cur.execute(f'SELECT o FROM {Table} WHERE k = 2')
+                    (Fetched,) = await Cur.fetchone()
+                    self.assertEqual(Fetched.V, Bound)
                 finally:
                     for Stmt in Drops:
                         try:
