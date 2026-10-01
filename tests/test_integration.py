@@ -1083,6 +1083,34 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'DELETE {self.TABLE}')
         self.assertEqual(self.cur.rowcount, 2)
 
+    def test_a_raw_column_keeps_its_declared_length(self):
+        # A RAW(n) column describes as n, and USER_TAB_COLUMNS names it RAW of
+        # length n, through a rename, whatever its values are. The Mirror over
+        # PostgreSQL stores it as bytea, which keeps no length: it described the
+        # widest value and listed a BLOB (#1386).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, r RAW(30), q RAW(5))')
+        self.cur.execute(
+            f"INSERT INTO {self.TABLE} VALUES (1, HEXTORAW('0A0B'), HEXTORAW('01'))"
+        )
+        q = 'q'
+        if not _conn_is_8i(self.conn):  # RENAME COLUMN arrived in 9i
+            self.cur.execute(f'ALTER TABLE {self.TABLE} RENAME COLUMN q TO q2')
+            q = 'q2'
+        for where in ('', ' WHERE 1 = 0'):
+            self.cur.execute(f'SELECT r, {q} FROM {self.TABLE}{where}')
+            self.cur.fetchall()
+            self.assertEqual(
+                [d[2:4] for d in self.cur.description], [(30, 30), (5, 5)], where
+            )
+        self.cur.execute(
+            'SELECT column_name, data_type, data_length FROM user_tab_columns '
+            'WHERE table_name = :1 ORDER BY column_id',
+            [self.TABLE],
+        )
+        self.assertEqual(
+            self.cur.fetchall()[1:], [('R', 'RAW', 30), (q.upper(), 'RAW', 5)]
+        )
+
     def test_integer_and_smallint_are_number_38(self):
         # INTEGER, INT and SMALLINT are NUMBER(38): 20 digits fit, and the
         # columns describe as NUMBER(38,0). A SMALLINT parameter takes an

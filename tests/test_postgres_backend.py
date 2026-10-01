@@ -42,6 +42,7 @@ from postgres_backend import (  # noqa: E402
     _call_argument_error,
     _call_arguments,
     _computed_column_types,
+    _declared_columns,
     _distinct_bind_refs,
     _iot_primary_key,
     _object_column_meta,
@@ -272,6 +273,24 @@ def test_a_whole_lob_call_item_is_a_lob_column() -> None:
     assert _computed_column_types("SELECT to_clob('a') || 'b' FROM dual") == {}
     assert _computed_column_types("SELECT *, to_clob('a') FROM t") == {}
     assert _computed_column_types("INSERT INTO t VALUES (to_clob('a'))") == {}
+
+
+def test_declared_columns_record_what_postgresql_keeps_less_of() -> None:
+    # What sys.ora_columns records from a DDL (#1386): a RAW(n)'s length, None for
+    # a type it records nothing for, no constraint as a column, and a MODIFY that
+    # changes no type left out so the column's record survives it.
+    assert _declared_columns(
+        'CREATE TABLE t (id NUMBER, r RAW(30), "Q" raw (5), CONSTRAINT pk PRIMARY KEY (id))'
+    ) == ('t', {'id': None, 'r': ('RAW', 30, None, None), 'Q': ('RAW', 5, None, None)})
+    assert _declared_columns('ALTER TABLE s.t ADD (a RAW(8), b DATE)') == (
+        's.t',
+        {'a': ('RAW', 8, None, None), 'b': None},
+    )
+    assert _declared_columns('ALTER TABLE t MODIFY (r NOT NULL, q VARCHAR2(10))') == (
+        't',
+        {'q': None},
+    )
+    assert _declared_columns('DROP TABLE t') is None
 
 
 def test_delete_without_from_gains_it() -> None:

@@ -892,6 +892,13 @@ _ORACLE_DICTIONARY_DDL = (
     # for, recorded by the column's own identity so a rename keeps it.
     'CREATE TABLE IF NOT EXISTS sys.ora_invisible_columns ('
     'relid oid NOT NULL, attnum smallint NOT NULL, PRIMARY KEY (relid, attnum));'
+    # The Oracle type a column was declared with, where PostgreSQL keeps less of
+    # it than Oracle reports -- a RAW(n)'s length, which bytea has no room for
+    # (#1386). Keyed by the column's own identity, so a rename keeps it.
+    'CREATE TABLE IF NOT EXISTS sys.ora_columns ('
+    'relid oid NOT NULL, attnum smallint NOT NULL, data_type text NOT NULL, '
+    'data_length integer, data_precision integer, data_scale integer, '
+    'PRIMARY KEY (relid, attnum));'
     'CREATE OR REPLACE VIEW sys.all_tab_cols AS SELECT '
     "CASE WHEN c.table_schema LIKE 'pg_temp%' THEN upper(current_schema()) "
     'ELSE upper(c.table_schema) END AS owner, '
@@ -913,9 +920,11 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN c.data_type = 'USER-DEFINED' AND c.udt_name = 'ora_tstz' "
     "THEN 'TIMESTAMP WITH TIME ZONE' "
     "WHEN c.data_type = 'USER-DEFINED' THEN ora_name(c.udt_name) "
-    'ELSE ora_type_name(c.data_type) END AS data_type, '
+    # A type recorded as declared reads as declared (#1386).
+    'ELSE coalesce(o.data_type, ora_type_name(c.data_type)) END AS data_type, '
     f"CASE WHEN c.domain_name = '{_DATE_TYPE}' THEN 7 ELSE "
-    'coalesce(c.character_maximum_length, c.numeric_precision, 22) END AS data_length, '
+    'coalesce(o.data_length, c.character_maximum_length, c.numeric_precision, 22) '
+    'END AS data_length, '
     'c.numeric_precision AS data_precision, c.numeric_scale AS data_scale, '
     'c.character_maximum_length AS char_length, '
     "CASE c.is_nullable WHEN 'YES' THEN 'Y' ELSE 'N' END AS nullable, "
@@ -931,6 +940,9 @@ _ORACLE_DICTIONARY_DDL = (
     'LEFT JOIN sys.ora_invisible_columns h ON h.relid = '
     "(quote_ident(c.table_schema) || '.' || quote_ident(c.table_name))::regclass "
     'AND h.attnum = c.ordinal_position '
+    'LEFT JOIN sys.ora_columns o ON o.relid = '
+    "(quote_ident(c.table_schema) || '.' || quote_ident(c.table_name))::regclass "
+    'AND o.attnum = c.ordinal_position '
     "WHERE c.table_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
     'CREATE OR REPLACE VIEW sys.user_tab_cols AS SELECT * FROM all_tab_cols '
     'WHERE owner=upper(current_schema());'
@@ -1812,6 +1824,75 @@ def _matching_paren(text: str, open_at: int) -> int:
     return len(text)
 
 
+def _ddl_column_spans(sql: str) -> tuple[str, list[tuple[int, int]], bool] | None:
+    # The table a CREATE TABLE or ALTER TABLE ... ADD / MODIFY names, the span of
+    # each column it declares, and whether it is a MODIFY; None for anything else.
+    create = _CREATE_TABLE_NAME.match(sql)
+    alter = _ALTER_TABLE_COLUMNS.match(sql) if create is None else None
+    if create is not None:
+        open_at = sql.find('(', create.end())
+        if open_at < 0:
+            return None
+        spans = _top_level_items(sql, open_at + 1, _matching_paren(sql, open_at))
+        return create.group(1), spans, False
+    if alter is None:
+        return None
+    rest = alter.end()
+    if sql.startswith('(', rest):
+        spans = _top_level_items(sql, rest + 1, _matching_paren(sql, rest))
+    else:
+        spans = [(rest, len(sql.rstrip().rstrip(';')))]
+    return alter.group(1), spans, alter.group(2).upper() == 'MODIFY'
+
+
+# A declared type PostgreSQL keeps less of than Oracle reports, as recorded in
+# sys.ora_columns: (data_type, data_length, data_precision, data_scale) (#1386).
+_RAW_DECLARED = re.compile(r'\s*RAW\s*\(\s*(\d+)\s*\)', re.IGNORECASE)
+# A MODIFY that leaves the column's type alone -- a constraint, a default.
+_MODIFY_WITHOUT_TYPE = re.compile(
+    r'\s*(?:$|(?:NOT|NULL|DEFAULT|CONSTRAINT|CHECK|UNIQUE|PRIMARY|REFERENCES|'
+    r'VISIBLE|INVISIBLE|ENABLE|DISABLE)\b)',
+    re.IGNORECASE,
+)
+
+
+def _declared_type(
+    definition: str,
+) -> tuple[str, int | None, int | None, int | None] | None:
+    raw = _RAW_DECLARED.match(definition)
+    if raw is not None:
+        return ('RAW', int(raw.group(1)), None, None)
+    return None
+
+
+def _declared_columns(sql: str) -> tuple[str, dict[str, tuple | None]] | None:
+    """The table a CREATE TABLE / ALTER TABLE ... ADD / MODIFY names, and for each
+    column it declares a type for, what sys.ora_columns records -- None for a type
+    it records nothing for (#1386). A MODIFY that changes no type is left out, so
+    a column's record survives `MODIFY (c NOT NULL)`. A name is PostgreSQL's
+    spelling: a quoted one as written, an unquoted one in lower case.
+    """
+    found = _ddl_column_spans(sql)
+    if found is None:
+        return None
+    table, spans, modify = found
+    columns: dict[str, tuple | None] = {}
+    for start, end in spans:
+        name = _COLUMN_NAME.match(sql, start, end)
+        if name is None:
+            continue
+        definition = sql[name.end() : end]
+        if modify and _MODIFY_WITHOUT_TYPE.match(definition):
+            continue
+        column = name.group(1)
+        if column.upper() in ('CONSTRAINT', 'PRIMARY', 'UNIQUE', 'FOREIGN', 'CHECK'):
+            continue
+        columns[column[1:-1] if column.startswith('"') else column.lower()] = (
+            _declared_type(definition)
+        )
+    return table, columns
+
+
 def _column_visibility(sql: str) -> tuple[str, tuple[str, list, list, bool] | None]:
     """The statement without its VISIBLE / INVISIBLE column attributes, and what
     they said: (table, columns made invisible, columns made visible, whether the
@@ -1822,22 +1903,10 @@ def _column_visibility(sql: str) -> tuple[str, tuple[str, list, list, bool] | No
     """
     if not _VISIBILITY_WORD.search(sql):
         return sql, None
-    create = _CREATE_TABLE_NAME.match(sql)
-    alter = _ALTER_TABLE_COLUMNS.match(sql) if create is None else None
-    if create is not None:
-        table, open_at = create.group(1), sql.find('(', create.end())
-        if open_at < 0:
-            return sql, None
-        spans = _top_level_items(sql, open_at + 1, _matching_paren(sql, open_at))
-    elif alter is not None:
-        table = alter.group(1)
-        rest = alter.end()
-        if sql.startswith('(', rest):
-            spans = _top_level_items(sql, rest + 1, _matching_paren(sql, rest))
-        else:
-            spans = [(rest, len(sql.rstrip().rstrip(';')))]
-    else:
+    parsed = _ddl_column_spans(sql)
+    if parsed is None:
         return sql, None
+    table, spans, modify = parsed
     hidden: list[str] = []
     shown: list[str] = []
     cuts: list[tuple[int, int]] = []
@@ -1870,7 +1939,7 @@ def _column_visibility(sql: str) -> tuple[str, tuple[str, list, list, bool] | No
         out.append(sql[last:cut_start])
         last = cut_end
     out.append(sql[last:])
-    only_visibility = alter is not None and alter.group(2).upper() == 'MODIFY' and bare
+    only_visibility = modify and bare
     return ''.join(out), (table, hidden, shown, only_visibility)
 
 
@@ -4546,6 +4615,14 @@ class PostgresBackend:
             "SELECT to_regclass('sys.ora_invisible_columns') IS NOT NULL"
         ).fetchone()
         self._has_invisible_catalog = bool(row and row[0])
+        # Declared Oracle column types (#1386): whether the catalog exists, and its
+        # rows by (relid, attnum) -- None for a column with none; any DDL starts
+        # it over.
+        row = self._conn.execute(
+            "SELECT to_regclass('sys.ora_columns') IS NOT NULL"
+        ).fetchone()
+        self._has_column_catalog = bool(row and row[0])
+        self._column_type_cache: dict[tuple[int, int], tuple | None] = {}
         self._any_invisible: bool | None = None
         self._visible_cache: dict[str, list[str] | None] = {}
         self._conn.commit()
@@ -4853,6 +4930,7 @@ class PostgresBackend:
             self._record_quoted_names(original)
             self._record_tstz_precisions(original)
             self._record_visibility(visibility)
+            self._record_column_types(original)
         if with_rowid is not None:
             # The rows are the rowids of the rows touched, not a result set: a
             # DML still answers with a count, and the last one is its rowid.
@@ -5010,6 +5088,69 @@ class PostgresBackend:
         if pk is None:
             return sql
         return _ROWID_WORD.sub(_urowid_expression(pk), sql)
+
+    def _record_column_types(self, statement: str) -> None:
+        # After a committed DDL: keep sys.ora_columns in step with it (#1386).
+        # Every DDL prunes the rows of columns that are gone -- a DROP TABLE or
+        # DROP COLUMN leaves its own behind otherwise -- and a CREATE TABLE or
+        # ALTER TABLE ... ADD / MODIFY records each column it declares a type
+        # for, a MODIFY to a type not recorded taking the old record away. On
+        # its own, like the other DDL records, so a failure here cannot take the
+        # table with it.
+        if not self._has_column_catalog:
+            return
+        self._column_type_cache.clear()
+        declared = _declared_columns(statement)
+        try:
+            self._conn.execute(
+                'DELETE FROM sys.ora_columns o WHERE NOT EXISTS '
+                '(SELECT 1 FROM pg_attribute a WHERE a.attrelid = o.relid '
+                'AND a.attnum = o.attnum AND NOT a.attisdropped)'
+            )
+            if declared is not None:
+                table, columns = declared
+                for name, detail in columns.items():
+                    self._conn.execute(
+                        'DELETE FROM sys.ora_columns o USING pg_attribute a '
+                        'WHERE a.attrelid = o.relid AND a.attnum = o.attnum '
+                        'AND a.attrelid = to_regclass(%s) AND a.attname = %s',
+                        (table, name),
+                    )
+                    if detail is not None:
+                        self._conn.execute(
+                            'INSERT INTO sys.ora_columns SELECT attrelid, attnum, '
+                            '%s, %s, %s, %s FROM pg_attribute WHERE attrelid = '
+                            'to_regclass(%s) AND attname = %s AND attnum > 0',
+                            (*detail, table, name),
+                        )
+            self._conn.commit()
+        except psycopg.Error:
+            self._conn.rollback()
+
+    def _declared_column_types(self, pgresult, indexes: list[int]) -> dict[int, tuple]:
+        # The declared type recorded for each result column at `indexes` that
+        # comes straight from a table column (#1386), traced through libpq
+        # ftable / ftablecol and cached per (relid, attnum).
+        keys = {}
+        for index in indexes:
+            relid = pgresult.ftable(index)
+            if relid:
+                keys[index] = (relid, pgresult.ftablecol(index))
+        unknown = {k for k in keys.values() if k not in self._column_type_cache}
+        if unknown and self._has_column_catalog:
+            found = self._conn.execute(
+                'SELECT relid, attnum, data_type, data_length, data_precision, '
+                'data_scale FROM sys.ora_columns WHERE relid = ANY(%s)',
+                ([relid for relid, _attnum in unknown],),
+            ).fetchall()
+            recorded = {(row[0], row[1]): tuple(row[2:]) for row in found}
+            for key in unknown:
+                self._column_type_cache[key] = recorded.get(key)
+        return {
+            index: declared
+            for index, key in keys.items()
+            if (declared := self._column_type_cache.get(key)) is not None
+        }
 
     def _record_visibility(self, visibility: tuple | None) -> None:
         # Keep what a DDL said about its columns' visibility (#1195): add the
@@ -5320,6 +5461,17 @@ class PostgresBackend:
                 columns[i] = replace(columns[i], name=name)
         for i in self._not_null_columns(cursor.pgresult, len(columns)):
             columns[i] = replace(columns[i], null_ok=0)
+        # A RAW(n) column describes as its declared n, which bytea does not keep;
+        # the values' widest stood in for it (#1386).
+        raw = [i for i, col in enumerate(columns) if col.data_type == TNS_TYPE_RAW]
+        if raw:
+            for i, (_type, length, _p, _s) in self._declared_column_types(
+                cursor.pgresult, raw
+            ).items():
+                if length:
+                    columns[i] = replace(
+                        columns[i], data_length=length, max_size=length
+                    )
         tstz = [
             i for i, col in enumerate(columns) if col.data_type == TNS_TYPE_TIMESTAMPTZ
         ]
