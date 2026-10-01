@@ -129,6 +129,7 @@ from seerdb.common.tns import (
     object_lob_contents,
     oci_lob_contents,
     oci_lob_reads,
+    oci_lob_row_cells,
     parse_describe_oci,
     parse_exec,
     parse_exec_oci,
@@ -137,6 +138,7 @@ from seerdb.common.tns import (
     parse_free_temp_lobs_piggyback,
     parse_lobops_read,
     parse_lobops_request,
+    parse_lobops_slot,
     parse_reexecute,
     parse_tpc_switch,
     peek_exec_cursor,
@@ -1463,6 +1465,11 @@ def _serve_oci_session(
     # TTI_LOBOPS reads, slicing the current LOB per each read's offset/amount (#405).
     lobs: list[tuple[bytes, bool, bool]] = []
     current_lob: tuple[bytes, bool, bool] | None = None
+    # The same LOBs by the slot (column index) their locators carry, each column's
+    # in row order, and the one each slot is reading: sqlplus reads a row's LOBs
+    # interleaved and names each by its locator (#1430).
+    slot_lobs: dict[int, list[tuple[bytes, bool, bool]]] = {}
+    slot_current: dict[int, tuple[bytes, bool, bool]] = {}
     # The live per-session OER end-to-end sequence counter (§36); every OER-bearing
     # reply below draws its next value so the field advances like a real server's.
     seq = _OciSequence()
@@ -1535,8 +1542,9 @@ def _serve_oci_session(
                     # follow-up fetches (#407).
                     parked = _serve_oci_long_row(stream, parked, seq, reexecute=True)
                     continue
-                parked, lobs = _answer_query_oci(stream, backend, body, seq)
+                parked, lobs, slot_lobs = _answer_query_oci(stream, backend, body, seq)
                 current_lob = None
+                slot_current = {}
                 continue
             if body[1] == TTI_DESCRIBE:
                 # sqlplus `DESCRIBE <object>` — reply with the object's column
@@ -1550,9 +1558,22 @@ def _serve_oci_session(
                 # the current one. Serve exactly the slice requested so the client's
                 # read loop terminates when a read returns less than it asked (#405).
                 offset, amount = parse_lobops_read(body)
-                if offset <= 1 or current_lob is None:
-                    current_lob = lobs.pop(0) if lobs else (b'', True, False)
-                content, is_clob, national = current_lob
+                slot = parse_lobops_slot(body)
+                if slot is not None and slot in slot_lobs:
+                    # The locator names its column: a read from the start takes
+                    # that column's next LOB, a later one continues it, whatever
+                    # was read in between (#1430).
+                    if offset <= 1 or slot not in slot_current:
+                        queue = slot_lobs[slot]
+                        slot_current[slot] = (
+                            queue.pop(0) if queue else (b'', True, False)
+                        )
+                    content, is_clob, national = slot_current[slot]
+                else:
+                    if offset <= 1 or current_lob is None:
+                        current_lob = lobs.pop(0) if lobs else (b'', True, False)
+                    content, is_clob, national = current_lob
+                    slot = None
                 unit = 2 if is_clob else 1  # bytes per counted unit (CLOB is UTF-16)
                 total = len(content) // unit
                 start = offset - 1
@@ -1566,6 +1587,7 @@ def _serve_oci_session(
                         len(content),
                         is_clob=is_clob,
                         national=national,
+                        slot=slot,
                         sequence=seq.next(),
                     ),
                 )
@@ -1757,19 +1779,24 @@ def _oci_no_row_status(sql: str, rowcount: int, seq: '_OciSequence') -> bytes:
 
 def _answer_query_oci(
     stream: PacketStream, backend: Backend, body: bytes, seq: '_OciSequence'
-) -> tuple[tuple[list[ColumnMeta], list[tuple]] | None, list[tuple[bytes, bool, bool]]]:
+) -> tuple[
+    tuple[list[ColumnMeta], list[tuple]] | None,
+    list[tuple[bytes, bool, bool]],
+    dict[int, list[tuple[bytes, bool, bool]]],
+]:
     # Answer one sqlplus / thick-OCI execute. sqlplus fires a chain of setup
     # statements (PL/SQL blocks, PRODUCT_PRIVS selects) before the user's query;
     # each needs an acceptable reply or sqlplus never reaches the prompt. Returns
-    # ``(parked, lobs)``: the rows held for a follow-up fetch (or None), and the
-    # LOB contents the result's rows carry for the follow-up TTI_LOBOPS reads.
+    # ``(parked, lobs, slot_lobs)``: the rows held for a follow-up fetch (or
+    # None), the LOB contents the result's rows carry for the follow-up
+    # TTI_LOBOPS reads, and the same by the slot each locator names (#1430).
     try:
         request = parse_exec_oci(body)
     except InterfaceError:
         # A shape not parsed yet (e.g. a bound PL/SQL setup call) — acknowledge
         # success so sqlplus proceeds; the backend never sees it.
         stream.write_packet(TNS_DATA, encode_status_oci(seq.next()))
-        return None, []
+        return None, [], {}
     try:
         # A PL/SQL block (sqlplus VARIABLE / EXEC :v := …) hands its binds over as
         # BindVar so the backend registers them OUT-capable and returns the assigned
@@ -1794,7 +1821,7 @@ def _answer_query_oci(
                 error_pos=err.error_offset,
             ),
         )
-        return None, []
+        return None, [], {}
     if result.out_binds:
         # A PL/SQL block that assigned OUT binds (sqlplus VARIABLE / EXEC) — return
         # the values so the client reads them back into its bound buffers.
@@ -1802,18 +1829,22 @@ def _answer_query_oci(
             TNS_DATA,
             encode_out_bind_response_oci(result.out_binds, sequence=seq.next()),
         )
-        return None, []
+        return None, [], {}
     if not result.columns:
         stream.write_packet(
             TNS_DATA, _oci_no_row_status(request.sql, result.rowcount, seq)
         )
-        return None, []
+        return None, [], {}
     rows = list(result.rows)
     # Every LOB cell across the whole result queues its content now, row-major, so
     # the follow-up TTI_LOBOPS reads drain it in the order the locators went out.
     # This is the OCI path, which reads JSON and VECTOR that way too -- unlike the
     # thin path, which carries their images in the row (#826/#887).
     lobs = oci_lob_reads(result.columns, rows)
+    slot_lobs: dict[int, list[tuple[bytes, bool, bool]]] = {}
+    for row in rows:
+        for slot, cell in oci_lob_row_cells(result.columns, row).items():
+            slot_lobs.setdefault(slot, []).append(cell)
     has_long = any(
         col.data_type in (TNS_TYPE_LONG, TNS_TYPE_LONGRAW) for col in result.columns
     )
@@ -1829,7 +1860,7 @@ def _answer_query_oci(
         stream.write_packet(
             TNS_DATA, encode_lob_describe_oci(result.columns, sequence=seq.next())
         )
-        return (result.columns, rows), lobs
+        return (result.columns, rows), lobs, slot_lobs
     if has_long and rows:
         # sqlplus fetches a LONG / LONG RAW row separately from the describe — it
         # sets up the streaming define buffer on the describe, then issues a fetch
@@ -1841,14 +1872,14 @@ def _answer_query_oci(
                 result.columns, [], sequence=seq.next(), more=True
             ),
         )
-        return (result.columns, rows), lobs
+        return (result.columns, rows), lobs, slot_lobs
     if len(rows) <= 1:
         # 0 or 1 row fits in the execute reply; sqlplus won't fetch further.
         stream.write_packet(
             TNS_DATA,
             encode_query_response_oci(result.columns, rows, sequence=seq.next()),
         )
-        return None, lobs
+        return None, lobs, slot_lobs
     # Deliver the first row now and park the rest — sqlplus reads the "more rows"
     # status and issues a fetch for the remainder.
     stream.write_packet(
@@ -1857,7 +1888,7 @@ def _answer_query_oci(
             result.columns, rows[:1], sequence=seq.next(), more=True
         ),
     )
-    return (result.columns, rows[1:]), lobs
+    return (result.columns, rows[1:]), lobs, slot_lobs
 
 
 def _answer_describe_oci(

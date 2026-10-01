@@ -4374,6 +4374,7 @@ structure; both the row value and the read-tail embed the *same* locator, so
 | `16` | LID marker `0x56` | same | structural |
 | `17..26`, `36..38`, `52..54`, `80..82`, `102..104` | **physical LID** — object id + three segment DBAs + SCN | **synthetic (zeros)** | generated |
 | `31..32` | **charset id** (ub2 BE) | `0369` (873 = AL32UTF8) / `0000`; NCLOB `07d0` (2000 = AL16UTF16) | generated |
+| `40..43` | **slot** (ub4 BE): the LOB's column index + 1, so a read names which of its row's LOBs it wants; `0` = none (#1430) | per LOB | generated |
 | `91..94` | content byte size (ub4 BE) | patched per value | runtime |
 
 The whole locator is generated field by field. The 9-byte header (`0..8`) carries
@@ -4390,6 +4391,19 @@ So the Mirror, which has no real LOB segment, emits a **synthetic LID of zeros**
 BLOB content back correctly with the object id / DBAs / SCN zeroed. With the
 physical LID gone the CLOB and BLOB bodies are identical bar the charset id, so
 one template serves both.
+
+**Interleaved reads** (#1430). sqlplus reads the LOBs of a row interleaved: with
+two LOB columns and `SET LONGCHUNKSIZE 7` it asks for `a@1, b@1, a@8, b@8, …`
+(measured, sqlplus 23.26). The only thing that tells `a`'s reads from `b`'s is the
+locator each READ echoes. With one shared locator, a server that serves "the LOB
+read last" hands `a`'s second chunk from `b`: the wrong content and no error.
+11g's locators are each a real LOB's. The Mirror's carry the LOB's column index
+in four of the template's zero bytes (offsets `40..43`, inside the synthetic LID),
+in the row value and in every READ reply's echo. A narrow-form request
+(`_OCI_LOBOPS_NARROW_*`) carries the locator at offset 135, and the slot is read
+back from there. A read at offset 1 takes that column's next LOB (row order), and
+a later offset continues it. A request with no slot, the wide form of an older
+sqlplus, keeps the old "next LOB" order.
 
 **NCLOB** (#1369). An NCLOB is a CLOB in the national character-set form, and its
 locator says so in three places. Measured against a live 11g, sqlplus 23.26
