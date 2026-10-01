@@ -2581,6 +2581,51 @@ def test_oci_lob_reads_flag_national_lobs() -> None:
     ]
 
 
+# A TTI_LOBOPS READ from sqlplus 23.26 (narrow form), captured through the Mirror:
+# the first chunk (offset 1, amount 7) of the first of two CLOB columns, its
+# locator echoed as the Mirror minted it before #1430 -- with no slot.
+_OCI_LOBOPS_READ_TWO_CLOBS = bytes.fromhex(
+    '036001feffffffffffffff6a0000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000200000000000000000000'
+    '000000000001000000000000000400000000000000feffffffffffffff000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000068000102'
+    '0c88000002000000010000005600000001000000010000000200020369000200000000'
+    '0000000000000000000000000000000000000000000000000000000000000000000000'
+    '0000010000000000000000001405000000000000280000000000020000000007000000'
+    '00000000'
+)
+
+
+def test_a_lob_read_names_its_lob_by_the_slot_in_its_locator() -> None:
+    # sqlplus reads a row's LOBs interleaved -- a's first chunk, b's first, a's
+    # second -- and tells them apart only by the locator each read echoes. A
+    # shared locator served a's second chunk from b (#1430). Each LOB's locator
+    # now carries its column index, in the row, in every READ reply, and is read
+    # back from the request.
+    from seerdb.common.tns import (
+        encode_lob_fetch_rows_oci,
+        encode_lob_read_response_oci,
+        parse_lobops_read,
+        parse_lobops_slot,
+    )
+
+    assert parse_lobops_read(_OCI_LOBOPS_READ_TWO_CLOBS) == (1, 7)
+    assert parse_lobops_slot(_OCI_LOBOPS_READ_TWO_CLOBS) is None  # minted slot-less
+    loc = _OCI_LOBOPS_READ_TWO_CLOBS.find(bytes.fromhex('680001020c88'))
+    for slot in (0, 1, 5):
+        reply = encode_lob_read_response_oci(b'\x00A', 1, 2, slot=slot, sequence=17)
+        echoed = reply[reply.find(bytes.fromhex('680001020c88')) :][:105]
+        request = bytearray(_OCI_LOBOPS_READ_TWO_CLOBS)
+        request[loc : loc + 105] = echoed  # what sqlplus sends on its next read
+        assert parse_lobops_slot(bytes(request)) == slot
+    clob = ColumnMeta(name=b'A', data_type=TNS_TYPE_CLOB, data_length=4000, max_size=0)
+    row = encode_lob_fetch_rows_oci([clob, clob], [('aa', 'bb')], sequence=3)
+    sig = bytes.fromhex('680001020c88')
+    starts = [i for i in range(len(row)) if row.startswith(sig, i)]
+    assert len(starts) == 2
+    assert row[starts[0] : starts[0] + 105] != row[starts[1] : starts[1] + 105]
+
+
 def test_parse_lobops_read_extracts_offset_and_amount() -> None:
     # sqlplus's TTI_LOBOPS READ carries a 1-based source offset (ub8-LE @91) and an
     # amount (ub8-LE @269); the Mirror serves exactly that slice so the read loop
