@@ -1314,6 +1314,23 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT a, b FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchall(), [(7, 3.25)])
 
+    def test_a_clean_logoff_commits_the_open_transaction(self):
+        # A session that logs off with a transaction open, sending no rollback
+        # first, has it committed, as Oracle does: sqlplus's EXIT sends only the
+        # logoff and relies on it. close() rolls back while autocommit is off, so
+        # turning it on just before closing logs off with the INSERT still open.
+        # The Mirror dropped the transaction (#1429).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (k NUMBER)')
+        other = _connect()
+        try:
+            other.autocommit = False
+            other.cursor().execute(f'INSERT INTO {self.TABLE} VALUES (1)')
+            other.autocommit = True  # close() now skips its rollback
+        finally:
+            other.close()
+        self.cur.execute(f'SELECT k FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchall(), [(1,)])
+
     def test_integer_and_smallint_are_number_38(self):
         # INTEGER, INT and SMALLINT are NUMBER(38): 20 digits fit, and the
         # columns describe as NUMBER(38,0). A SMALLINT parameter takes an
@@ -8400,6 +8417,32 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 # Which row it names, asked of the server (see LastRowidIntegration).
                 await Cur.execute(f'SELECT n FROM {Table} WHERE ROWID = :1', [Rowid])
                 self.assertEqual(await Cur.fetchone(), (7,))
+            finally:
+                await Cur.execute(f'DROP TABLE {Table}')
+        finally:
+            await Conn.close()
+
+    async def test_a_clean_logoff_commits_the_open_transaction(self):
+        # Async twin of test_a_clean_logoff_commits_the_open_transaction (#1429).
+        Table = 'PYO_ASYNC_LOGOFF_COMMIT'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            try:
+                await Cur.execute(f'DROP TABLE {Table}')
+            except seerdb.DatabaseError:
+                pass
+            await Cur.execute(f'CREATE TABLE {Table} (k NUMBER)')
+            try:
+                Other = await seerdb.connect_async(**self._kwargs())
+                try:
+                    Other.autocommit = False
+                    await Other.cursor().execute(f'INSERT INTO {Table} VALUES (1)')
+                    Other.autocommit = True  # close() now skips its rollback
+                finally:
+                    await Other.close()
+                await Cur.execute(f'SELECT k FROM {Table}')
+                self.assertEqual(await Cur.fetchall(), [(1,)])
             finally:
                 await Cur.execute(f'DROP TABLE {Table}')
         finally:

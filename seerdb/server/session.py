@@ -1430,10 +1430,12 @@ def _serve_thin_session(
             # and drive the backend's password change.
             _answer_changepassword(stream, backend, body, conn_key, user, field_version)
         elif body[1] == TTI_LOGOFF:
-            # Acknowledge the logoff before ending the session. python-oracledb
-            # 26.0.0 reads this reply and hits DPY-4011 on a silent close; older
-            # clients closed without reading, so returning silently used to do
-            # (#888).
+            # A clean logoff commits what the session left open, as Oracle's does
+            # (#1429). Then acknowledge it before ending the session.
+            # python-oracledb 26.0.0 reads this reply and hits DPY-4011 on a
+            # silent close; older clients closed without reading, so returning
+            # silently used to do (#888).
+            _commit_at_logoff(backend)
             stream.write_packet(TNS_DATA, encode_logoff_status_thin())
             return user
         else:
@@ -1646,6 +1648,10 @@ def _serve_oci_session(
                 _answer_changepassword_oci(stream, backend, body, conn_key, user, seq)
                 continue
             if body[1] == TTI_LOGOFF:
+                # sqlplus's EXIT (EXITCOMMIT ON, the default) sends no COMMIT,
+                # only this logoff, and relies on the server committing at it
+                # (#1429).
+                _commit_at_logoff(backend)
                 stream.write_packet(TNS_DATA, encode_logoff_status_oci())
                 return user
         # An OCI call the Mirror cannot serve is REFUSED, not answered by
@@ -1734,6 +1740,24 @@ def _serve_oci_long_row(
         reply = encode_long_fetch_row_oci(columns, rows[0], sequence=seq.next())
     stream.write_packet(TNS_DATA, reply)
     return (columns, rows[1:]) if len(rows) > 1 else None
+
+
+def _commit_at_logoff(backend: Backend) -> None:
+    # Oracle commits a session's open transaction when the client logs off
+    # cleanly, and rolls it back only when the connection drops. Measured with
+    # sqlplus 23.26 against a live 11g: `INSERT ...; exit` sends the INSERT and
+    # then TTI_LOGOFF, no COMMIT, and the row is there afterwards. A client that
+    # wants a rollback sends one first; python-oracledb and seerdb do when the
+    # server says a transaction is open (#889). A commit that fails here cannot
+    # be reported -- the client is leaving -- so it is logged and undone.
+    try:
+        backend.commit()
+    except BackendError as exc:
+        logger.warning('commit at logoff failed, rolling back: %s', exc)
+        try:
+            backend.rollback()
+        except BackendError:
+            pass  # the session is ending either way
 
 
 def _mark_transaction(sql: str, autocommit: bool) -> None:
