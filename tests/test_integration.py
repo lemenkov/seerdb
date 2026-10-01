@@ -1179,6 +1179,41 @@ class TypesIntegration(_IntegrationBase):
             self.cur.fetchall()[1:], [('R', 'RAW', 30), (q.upper(), 'RAW', 5)]
         )
 
+    def test_float_is_a_number_of_binary_precision(self):
+        # FLOAT(b), REAL and DOUBLE PRECISION are NUMBERs of binary precision b
+        # -- 126 for a bare FLOAT and DOUBLE PRECISION, 63 for REAL -- that
+        # describe with scale -127 and keep a 19-digit value exactly. The Mirror
+        # over PostgreSQL stored them as binary floating point and described
+        # BINARY_DOUBLE / BINARY_FLOAT (#1384).
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (a FLOAT, b FLOAT(10), c REAL, '
+            'd DOUBLE PRECISION)'
+        )
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (1234567890.123456789, 1, 2, 3)'
+        )
+        for where in ('', ' WHERE 1 = 0'):
+            self.cur.execute(f'SELECT a, b, c, d FROM {self.TABLE}{where}')
+            self.cur.fetchall()
+            self.assertEqual(
+                [(d[1], d[4], d[5]) for d in self.cur.description],
+                [(seerdb.DB_TYPE_NUMBER, bits, -127) for bits in (126, 10, 63, 126)],
+                where,
+            )
+        self.cur.execute(
+            f'SELECT COUNT(*) FROM {self.TABLE} WHERE a = 1234567890.123456789'
+        )
+        self.assertEqual(self.cur.fetchone(), (1,))
+        self.cur.execute(
+            'SELECT data_type, data_length, data_precision, data_scale '
+            'FROM user_tab_columns WHERE table_name = :1 ORDER BY column_id',
+            [self.TABLE],
+        )
+        self.assertEqual(
+            self.cur.fetchall(),
+            [('FLOAT', 22, bits, None) for bits in (126, 10, 63, 126)],
+        )
+
     def test_integer_and_smallint_are_number_38(self):
         # INTEGER, INT and SMALLINT are NUMBER(38): 20 digits fit, and the
         # columns describe as NUMBER(38,0). A SMALLINT parameter takes an

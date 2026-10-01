@@ -1552,6 +1552,14 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
 # attribute, a collection element, a routine parameter -- DATE stays the plain
 # timestamp(0) of _DDL_TYPE_REWRITES.
 _DDL_DATE_COLUMN = re.compile(r'\bDATE\b', re.IGNORECASE)
+# A table's FLOAT[(b)], REAL and DOUBLE PRECISION column is Oracle's NUMBER of
+# binary precision b, not binary floating point: numeric, its b in sys.ora_columns
+# (#1384). Elsewhere -- an object attribute, a routine parameter -- they stay
+# PostgreSQL's own float types, which nothing records a precision for.
+_DDL_FLOAT_COLUMN = re.compile(
+    r'\b(?:FLOAT\b(?:\s*\(\s*\d+\s*\))?|REAL\b|DOUBLE\s+PRECISION\b)',
+    re.IGNORECASE,
+)
 _DDL_TYPE_REWRITES = [
     # Oracle character-length semantics: VARCHAR2(20 CHAR) / CHAR(1 BYTE) — the
     # `CHAR` / `BYTE` length qualifier PostgreSQL has no syntax for; drop it so the
@@ -1861,6 +1869,12 @@ _INTERVAL_DS_DECLARED = re.compile(
     r'\s*INTERVAL\s+DAY\s*(?:\(\s*(\d+)\s*\))?\s*TO\s+SECOND\b\s*(?:\(\s*(\d+)\s*\))?',
     re.IGNORECASE,
 )
+# FLOAT[(b)] and its synonyms, which the rewrite stores as numeric (#1384): REAL is
+# FLOAT(63), DOUBLE PRECISION and a bare FLOAT are FLOAT(126).
+_FLOAT_DECLARED = re.compile(
+    r'\s*(?:FLOAT\b\s*(?:\(\s*(\d+)\s*\))?|(REAL)\b|DOUBLE\s+PRECISION\b)',
+    re.IGNORECASE,
+)
 _INTERVAL_YM_DECLARED = re.compile(
     r'\s*INTERVAL\s+YEAR\s*(?:\(\s*(\d+)\s*\))?\s*TO\s+MONTH\b', re.IGNORECASE
 )
@@ -1882,6 +1896,10 @@ def _declared_type(
     if long is not None:
         # Oracle lists a LONG / LONG RAW column with data_length 0.
         return ('LONG RAW' if long.group(1) else 'LONG', 0, None, None)
+    floating = _FLOAT_DECLARED.match(definition)
+    if floating is not None:
+        bits = int(floating.group(1) or (63 if floating.group(2) else 126))
+        return ('FLOAT', 22, bits, None)
     ds = _INTERVAL_DS_DECLARED.match(definition)
     if ds is not None:
         day, second = int(ds.group(1) or 2), int(ds.group(2) or 6)
@@ -2617,6 +2635,9 @@ def _translate_ddl(sql: str) -> str:
     out = _strip_nested_table_storage(out)
     out = _DDL_COMPRESSION.sub(')', out)
     out = _DDL_DATE_COLUMN.sub(_DATE_TYPE, out)
+    # Before the type rewrites: BINARY_FLOAT / BINARY_DOUBLE become real and
+    # double precision there, which this would catch.
+    out = _DDL_FLOAT_COLUMN.sub('numeric', out)
     for pattern, replacement in _DDL_TYPE_REWRITES:
         out = pattern.sub(replacement, out)
     return out
@@ -5552,17 +5573,22 @@ class PostgresBackend:
                         columns[i], data_length=length, max_size=length
                     )
         # An INTERVAL column describes with its declared precisions, which
-        # PostgreSQL's interval does not keep (#1381).
+        # PostgreSQL's interval does not keep (#1381). A FLOAT(b) column, a
+        # numeric here, describes as a NUMBER of precision b and scale -127,
+        # Oracle's marker for FLOAT (#1384).
         interval = [
             i
             for i, col in enumerate(columns)
-            if col.data_type in (TNS_TYPE_INTERVALDS, TNS_TYPE_INTERVALYM)
+            if col.data_type
+            in (TNS_TYPE_INTERVALDS, TNS_TYPE_INTERVALYM, TNS_TYPE_NUMBER)
         ]
         if interval:
-            for i, (_type, _length, precision, scale) in self._declared_column_types(
+            for i, (declared, _length, precision, scale) in self._declared_column_types(
                 cursor.pgresult, interval
             ).items():
-                if precision is not None:
+                if declared == 'FLOAT':
+                    columns[i] = replace(columns[i], precision=precision, scale=-127)
+                elif precision is not None:
                     columns[i] = replace(
                         columns[i], precision=precision, scale=scale or 0
                     )
