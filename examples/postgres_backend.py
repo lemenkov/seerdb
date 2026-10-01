@@ -3948,6 +3948,7 @@ _BINARY_FLOAT_OIDS = {
 }
 _TEXT_OIDS = frozenset({18, 19, 25, 1042, 1043})  # char name text bpchar varchar
 _BPCHAR_OID = 1042
+_NUMERIC_OID = 1700
 _RAW_OIDS = frozenset({17})  # bytea
 # The base type oids the Oracle-typed domains report on the wire — ora_clob /
 # ora_blob over text / bytea (#534), ora_intervalym over interval (#504), ora_date
@@ -5693,6 +5694,18 @@ class PostgresBackend:
                         data_length=length,
                         max_size=length // 2,
                     )
+        # A table's unconstrained NUMBER column -- a numeric with no typmod --
+        # describes with precision 0 and scale -127, as Oracle's does; a computed
+        # number has neither, as on a live server, so only a column that traces
+        # to a table counts (#1421). A FLOAT record below overrides it.
+        for i, desc in enumerate(cursor.description):
+            if (
+                desc.type_code == _NUMERIC_OID
+                and columns[i].data_type == TNS_TYPE_NUMBER
+                and cursor.pgresult.ftable(i)
+                and cursor.pgresult.fmod(i) == -1
+            ):
+                columns[i] = replace(columns[i], precision=0, scale=-127)
         # An INTERVAL column describes with its declared precisions, which
         # PostgreSQL's interval does not keep (#1381). A FLOAT(b) column, a
         # numeric here, describes as a NUMBER of precision b and scale -127,
