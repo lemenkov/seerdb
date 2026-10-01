@@ -206,6 +206,20 @@ def test_translate_ddl_maps_create_table_column_types() -> None:
     assert 'ts ora_tstz' in sent  # WITH TIME ZONE preserves the offset (#519)
     assert 'f real' in sent and 'g double precision' in sent
     assert 'NUMBER' not in sent and 'VARCHAR2' not in sent
+    # FLOAT[(b)], REAL and DOUBLE PRECISION are NUMBERs, not binary floats (#1384).
+    sent = _translate_ddl(
+        'CREATE TABLE t (a FLOAT, b FLOAT(10), c REAL, d DOUBLE PRECISION, '
+        'e BINARY_DOUBLE)'
+    )
+    assert sent == (
+        'CREATE TABLE t (a numeric, b numeric, c numeric, d numeric, '
+        'e double precision)'
+    )
+    # An object attribute keeps PostgreSQL's float: no catalog row describes it
+    # (#1423).
+    assert 'AS (r REAL, f FLOAT)' in _translate_ddl(
+        'CREATE TYPE o AS OBJECT (r REAL, f FLOAT)'
+    )
 
 
 def test_translate_ddl_maps_object_type_to_composite() -> None:
@@ -308,6 +322,20 @@ def test_declared_columns_record_what_postgresql_keeps_less_of() -> None:
             'b': ('INTERVAL DAY(3) TO SECOND(2)', 11, 3, 2),
             'c': ('INTERVAL YEAR(2) TO MONTH', 5, 2, 0),
             'd': ('INTERVAL YEAR(4) TO MONTH', 5, 4, 0),
+        },
+    )
+    assert _declared_columns(
+        'CREATE TABLE t (a FLOAT, b float (10), c REAL, d DOUBLE  PRECISION, '
+        'e BINARY_FLOAT, f FLOATING)'
+    ) == (
+        't',
+        {
+            'a': ('FLOAT', 22, 126, None),
+            'b': ('FLOAT', 22, 10, None),
+            'c': ('FLOAT', 22, 63, None),
+            'd': ('FLOAT', 22, 126, None),
+            'e': None,
+            'f': None,
         },
     )
     assert _declared_columns('DROP TABLE t') is None
