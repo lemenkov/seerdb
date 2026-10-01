@@ -2522,6 +2522,65 @@ def test_lob_read_response_selects_clob_or_blob_locator() -> None:
     assert bytes.fromhex('0001020c88') not in blob_reply
 
 
+def test_nclob_locator_carries_the_national_form() -> None:
+    # An NCLOB's locator, in its row and echoed in each READ reply, is a CLOB's
+    # with the national form: header `04 4c 08` (kind NCLOB, national bit 0x40,
+    # fixed-width charset) and charset 2000 (AL16UTF16), as a live 11g sends
+    # sqlplus 23.26. A CLOB-form locator under an NCLOB describe makes sqlplus
+    # refuse the value with ORA-24806 (#1369).
+    from seerdb.common.tns import (
+        _OCI_LOB_CHARSET_ID_OFF,
+        _oci_lob_locator,
+        encode_lob_locator_oci,
+        encode_lob_read_response_oci,
+    )
+
+    nclob = _oci_lob_locator(True, national=True)
+    assert nclob[3:6] == bytes.fromhex('044c08')
+    assert _oci_lob_locator(True)[3:6] == bytes.fromhex('020c88')
+    charset = 9 + _OCI_LOB_CHARSET_ID_OFF
+    assert nclob[charset : charset + 2] == (2000).to_bytes(2, 'big')
+    assert nclob[8] == 0x02  # still a character LOB
+    row = encode_lob_locator_oci('nat', is_clob=True, national=True)
+    assert row[6:].startswith(nclob[:9])
+    reply = encode_lob_read_response_oci(
+        b'\x00n', 1, 2, is_clob=True, national=True, sequence=17
+    )
+    assert bytes.fromhex('0001044c08') in reply
+    assert bytes.fromhex('0001020c88') not in reply
+
+
+def test_oci_lob_reads_flag_national_lobs() -> None:
+    # The sqlplus read queue says which LOB is national, so its READ reply echoes
+    # the locator its row carried (#1369); the thin queue keeps its pairs.
+    from seerdb.common.tns import (
+        TNS_TYPE_BLOB,
+        TNS_TYPE_CLOB,
+        ColumnMeta,
+        oci_lob_contents,
+        oci_lob_reads,
+    )
+
+    columns = [
+        ColumnMeta(
+            name=b'N', data_type=TNS_TYPE_CLOB, data_length=4000, max_size=0, csfrm=2
+        ),
+        ColumnMeta(name=b'C', data_type=TNS_TYPE_CLOB, data_length=4000, max_size=0),
+        ColumnMeta(name=b'B', data_type=TNS_TYPE_BLOB, data_length=4000, max_size=0),
+    ]
+    rows = [('n', 'c', b'\x01')]
+    assert oci_lob_reads(columns, rows) == [
+        ('n'.encode('utf-16-be'), True, True),
+        ('c'.encode('utf-16-be'), True, False),
+        (b'\x01', False, False),
+    ]
+    assert oci_lob_contents(columns, rows) == [
+        ('n'.encode('utf-16-be'), True),
+        ('c'.encode('utf-16-be'), True),
+        (b'\x01', False),
+    ]
+
+
 def test_parse_lobops_read_extracts_offset_and_amount() -> None:
     # sqlplus's TTI_LOBOPS READ carries a 1-based source offset (ub8-LE @91) and an
     # amount (ub8-LE @269); the Mirror serves exactly that slice so the read loop

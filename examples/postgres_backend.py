@@ -151,6 +151,7 @@ from seerdb.common.sqltext import (
 )
 from seerdb.common.tns import _AUTH_MAX_OPEN_CURSORS
 from seerdb.common.tns_consts import (
+    AL16UTF16_CHARSET,
     FIELD_VERSION_12_1,
     ORA_CANNOT_INSERT_NULL,
     ORA_CANNOT_KILL_CURRENT_SESSION,
@@ -1199,6 +1200,9 @@ _ORACLE_DICTIONARY_DDL = (
     # The zones take Oracle's attribute spellings, and a timestamptz is WITH
     # LOCAL TIME ZONE here (#1208, #1270).
     f"CASE WHEN a.attribute_udt_name = '{_TSTZ_TYPE}' THEN 'TIMESTAMP WITH TZ' "
+    # An NCLOB is an ora_clob too, told apart by its record (#1431).
+    f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' AND o.data_type = 'NCLOB' "
+    "THEN 'NCLOB' "
     f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CLOB' "
     f"WHEN a.attribute_udt_name = '{_BLOB_TYPE}' THEN 'BLOB' "
     "WHEN a.data_type = 'USER-DEFINED' THEN ora_name(a.attribute_udt_name) "
@@ -1210,6 +1214,9 @@ _ORACLE_DICTIONARY_DDL = (
     'a.character_maximum_length AS length, a.numeric_precision AS precision, '
     'a.numeric_scale AS scale, a.ordinal_position AS attr_no '
     'FROM information_schema.attributes a '
+    'LEFT JOIN sys.ora_columns o ON o.relid = '
+    "(quote_ident(a.udt_schema) || '.' || quote_ident(a.udt_name))::regclass "
+    'AND o.attnum = a.ordinal_position '
     f"WHERE a.udt_name <> '{_TSTZ_TYPE}' AND a.udt_name !~ '[$]ref$' "
     "AND a.udt_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
     'CREATE OR REPLACE VIEW sys.user_type_attrs AS SELECT * FROM all_type_attrs '
@@ -1863,6 +1870,10 @@ _RAW_DECLARED = re.compile(r'\s*RAW\s*\(\s*(\d+)\s*\)', re.IGNORECASE)
 # LONG and LONG RAW, which the rewrite stores as text and bytea (#1382).
 _LONG_TYPES = {'LONG': TNS_TYPE_LONG, 'LONG RAW': TNS_TYPE_LONGRAW}
 _LONG_DECLARED = re.compile(r'\s*LONG(?:\s+(RAW))?\b', re.IGNORECASE)
+# NCLOB, which the rewrite stores as the ora_clob domain CLOB is (#1369). On the
+# wire it is a CLOB in the national character set form.
+_NCLOB_DECLARED = re.compile(r'\s*NCLOB\b', re.IGNORECASE)
+_CSFRM_NATIONAL = 2
 # An INTERVAL's precisions, which the rewrite's interval / ora_intervalym drop
 # (#1381). Oracle's defaults: DAY(2) TO SECOND(6), YEAR(2) TO MONTH.
 _INTERVAL_DS_DECLARED = re.compile(
@@ -1896,6 +1907,8 @@ def _declared_type(
     if long is not None:
         # Oracle lists a LONG / LONG RAW column with data_length 0.
         return ('LONG RAW' if long.group(1) else 'LONG', 0, None, None)
+    if _NCLOB_DECLARED.match(definition):
+        return ('NCLOB', 4000, None, None)
     floating = _FLOAT_DECLARED.match(definition)
     if floating is not None:
         bits = int(floating.group(1) or (63 if floating.group(2) else 126))
@@ -1911,14 +1924,34 @@ def _declared_type(
     return None
 
 
+# CREATE [OR REPLACE] TYPE t [FORCE] AS|IS OBJECT (attributes): its attributes are
+# recorded in sys.ora_columns as a table's columns are, keyed by the composite's
+# relid (#1431).
+_CREATE_OBJECT_TYPE_NAME = re.compile(
+    r'\s*CREATE\s+(?:OR\s+REPLACE\s+)?TYPE\s+([\w."$#]+)\s+(?:FORCE\s+)?'
+    r'(?:AS|IS)\s+OBJECT\s*\(',
+    re.IGNORECASE,
+)
+
+
+def _object_type_spans(sql: str) -> tuple[str, list[tuple[int, int]], bool] | None:
+    created = _CREATE_OBJECT_TYPE_NAME.match(sql)
+    if created is None:
+        return None
+    open_at = created.end() - 1
+    spans = _top_level_items(sql, open_at + 1, _matching_paren(sql, open_at))
+    return created.group(1), spans, False
+
+
 def _declared_columns(sql: str) -> tuple[str, dict[str, tuple | None]] | None:
-    """The table a CREATE TABLE / ALTER TABLE ... ADD / MODIFY names, and for each
-    column it declares a type for, what sys.ora_columns records -- None for a type
-    it records nothing for (#1386). A MODIFY that changes no type is left out, so
-    a column's record survives `MODIFY (c NOT NULL)`. A name is PostgreSQL's
+    """The table a CREATE TABLE / ALTER TABLE ... ADD / MODIFY names, or the object
+    type a CREATE TYPE ... AS OBJECT does (#1431), and for each column or attribute
+    it declares a type for, what sys.ora_columns records -- None for a type it
+    records nothing for (#1386). A MODIFY that changes no type is left out, so a
+    column's record survives `MODIFY (c NOT NULL)`. A name is PostgreSQL's
     spelling: a quoted one as written, an unquoted one in lower case.
     """
-    found = _ddl_column_spans(sql)
+    found = _ddl_column_spans(sql) or _object_type_spans(sql)
     if found is None:
         return None
     table, spans, modify = found
@@ -2225,6 +2258,7 @@ _BUILTIN_TYPE_OID_BYTE = {
     'TIMESTAMP WITH TZ': 0x3E,
     'TIMESTAMP WITH LOCAL TZ': 0x41,
     'CLOB': 0x22,
+    'NCLOB': 0x22,  # the same built-in OID as CLOB's, measured on 23ai (#1431)
     'BLOB': 0x23,
 }
 
@@ -5592,6 +5626,17 @@ class PostgresBackend:
                     columns[i] = replace(
                         columns[i], precision=precision, scale=scale or 0
                     )
+        # An NCLOB column, an ora_clob like a CLOB, describes in the national
+        # character set form (#1369).
+        clob = [i for i, col in enumerate(columns) if col.data_type == TNS_TYPE_CLOB]
+        if clob:
+            for i, (declared, _length, _p, _s) in self._declared_column_types(
+                cursor.pgresult, clob
+            ).items():
+                if declared == 'NCLOB':
+                    columns[i] = replace(
+                        columns[i], csfrm=_CSFRM_NATIONAL, charset=AL16UTF16_CHARSET
+                    )
         tstz = [
             i for i, col in enumerate(columns) if col.data_type == TNS_TYPE_TIMESTAMPTZ
         ]
@@ -5818,6 +5863,21 @@ class PostgresBackend:
             element=self._type_shape(element, element_typmod),
         )
 
+    def _declared_attribute_types(self, pg_oid: int) -> dict[str, str]:
+        # The type each attribute of a composite was declared as, where
+        # sys.ora_columns records one (#1431): attribute name -> Oracle type.
+        if not self._has_column_catalog:
+            return {}
+        return dict(
+            self._conn.execute(
+                'SELECT a.attname, o.data_type FROM pg_type t '
+                'JOIN pg_attribute a ON a.attrelid = t.typrelid '
+                'JOIN sys.ora_columns o ON o.relid = a.attrelid AND o.attnum = a.attnum '
+                'WHERE t.oid = %s',
+                (pg_oid,),
+            ).fetchall()
+        )
+
     def _attributes(self, pg_oid: int) -> list[tuple[str, int, int]]:
         # (name, type oid, typmod) of a composite's attributes, in order.
         return self._conn.execute(
@@ -5842,12 +5902,17 @@ class PostgresBackend:
         # type name, its owner (a named type's only), its package, its OID, and
         # whether it is instantiable -- in the order the client reads them.
         rows = []
+        declared = self._declared_attribute_types(pg_oid)
         for position, (attname, atttypid, atttypmod) in enumerate(
             self._attributes(pg_oid), 1
         ):
             kind = self._type_kind(atttypid)
             if kind is None:
                 type_name = _tds_scalar(self._pg_type_name(atttypid), atttypmod)[1]
+                # An NCLOB is an ora_clob like a CLOB; only its name tells them
+                # apart, and the client types the attribute by it (#1431).
+                if type_name == 'CLOB' and declared.get(attname) == 'NCLOB':
+                    type_name = 'NCLOB'
                 (owner, toid) = (
                     None,
                     bytes(15) + bytes([_BUILTIN_TYPE_OID_BYTE[type_name]]),

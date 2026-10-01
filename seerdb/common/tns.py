@@ -8001,22 +8001,34 @@ _OCI_LOB_LOCATOR_BODY = bytes.fromhex(
 _OCI_LOB_CHARSET_ID_OFF = 31 - 9  # charset id ub2 BE, within the body
 
 
-def _oci_lob_locator(is_clob: bool) -> bytes:
+def _oci_lob_locator(is_clob: bool, national: bool = False) -> bytes:
     """The 105-byte persistent-LOB locator sqlplus binds and echoes (§14.6),
     generated field by field. The 9-byte header carries the LOB kind (charset
     form, flags, LOB type); the body is the shared structural template with the
-    charset id set for a CLOB and a zeroed synthetic LID."""
+    charset id set for a CLOB and a zeroed synthetic LID.
+
+    An NCLOB (``national``) is a CLOB whose header says so and whose charset is
+    AL16UTF16, fixed width (§14.6). Measured against a live 11g: sqlplus refuses
+    a CLOB-form locator under an NCLOB describe with ORA-24806."""
     body = bytearray(_OCI_LOB_LOCATOR_BODY)
     if is_clob:
-        struct.pack_into('>H', body, _OCI_LOB_CHARSET_ID_OFF, AL32UTF8_CHARSET)
+        struct.pack_into(
+            '>H',
+            body,
+            _OCI_LOB_CHARSET_ID_OFF,
+            AL16UTF16_CHARSET if national else AL32UTF8_CHARSET,
+        )
+    national = is_clob and national
     header = bytes(
         [
             0x68,
             0x00,
             0x01,  # locator length + version
-            0x02 if is_clob else 0x01,  # charset form (CLOB char / BLOB binary)
-            0x0C,
-            0x88 if is_clob else 0x08,  # flags — bit 0x80 = variable-width charset
+            # LOB kind: 0x02 CLOB, 0x04 NCLOB, 0x01 BLOB
+            0x04 if national else 0x02 if is_clob else 0x01,
+            0x4C if national else 0x0C,  # flags -- bit 0x40 = national form
+            # flags -- bit 0x80 = variable-width charset (AL16UTF16 is fixed)
+            0x88 if is_clob and not national else 0x08,
             0x00,
             0x00,
             0x02 if is_clob else 0x01,  # LOB type
@@ -8028,12 +8040,15 @@ def _oci_lob_locator(is_clob: bool) -> bytes:
 # The RXD value for a LOB column: a ub4 LE + ub2 LE length (both 106) then the
 # locator. The content byte size at offset 97 is patched per value.
 _OCI_LOB_ROW_VALUE = {
-    is_clob: struct.pack('<I', 106) + struct.pack('<H', 106) + _oci_lob_locator(is_clob)
+    (is_clob, national): struct.pack('<I', 106)
+    + struct.pack('<H', 106)
+    + _oci_lob_locator(is_clob, national)
     for is_clob in (True, False)
+    for national in (True, False)
 }
 
 
-def _oci_lob_read_tail(is_clob: bool, sequence: int) -> bytes:
+def _oci_lob_read_tail(is_clob: bool, sequence: int, national: bool = False) -> bytes:
     # The TTI_LOBOPS READ reply tail after the LOB_DATA content: a TTI_RPA (0x08
     # 0x00, the echoed locator, then the ub4 LE amount read — characters for a
     # CLOB, bytes for a BLOB) then the LOB-row OER call status. The echoed
@@ -8052,7 +8067,7 @@ def _oci_lob_read_tail(is_clob: bool, sequence: int) -> bytes:
     amount = 2000 if is_clob else 4000
     return (
         b'\x08\x00'
-        + _oci_lob_locator(is_clob)
+        + _oci_lob_locator(is_clob, national)
         + struct.pack('<I', amount)
         + b'\x00' * 4
         + bytes(oer)
@@ -9349,7 +9364,9 @@ def _oci_lob_byte_size(value: object, is_clob: bool) -> int:
     return len(str(value))
 
 
-def encode_lob_locator_oci(value: object, is_clob: bool) -> bytes:
+def encode_lob_locator_oci(
+    value: object, is_clob: bool, national: bool = False
+) -> bytes:
     """The RXD value for a LOB column (#405): a minted opaque locator carrying the
     content **byte** size so sqlplus issues a TTI_LOBOPS READ.
 
@@ -9363,7 +9380,7 @@ def encode_lob_locator_oci(value: object, is_clob: bool) -> bytes:
     if value is None:
         return bytes(4)
     byte_size = _oci_lob_byte_size(value, is_clob)
-    loc = bytearray(_OCI_LOB_ROW_VALUE[is_clob])
+    loc = bytearray(_OCI_LOB_ROW_VALUE[is_clob, national])
     loc[_OCI_LOB_ROW_SIZE_OFF : _OCI_LOB_ROW_SIZE_OFF + 4] = byte_size.to_bytes(
         4, 'big'
     )
@@ -9379,6 +9396,7 @@ def encode_lob_read_response_oci(
     total_bytes: int | None = None,
     *,
     is_clob: bool = True,
+    national: bool = False,
     sequence: int,
 ) -> bytes:
     """The TTI_LOBOPS READ reply (#405): the LOB content slice (LOB_DATA) then the
@@ -9386,11 +9404,12 @@ def encode_lob_read_response_oci(
     this call; ``amount`` is that read's count (characters for a CLOB, bytes for a
     BLOB); ``total_bytes`` is the whole LOB's byte size the echoed locator reports
     (defaults to this slice, for a single read-it-all call). ``is_clob`` selects
-    the echoed-locator template (character vs binary, #406). ``sequence`` is the
-    live per-session OER counter for the trailing status."""
+    the echoed-locator template (character vs binary, #406), and ``national`` its
+    NCLOB form (#1369). ``sequence`` is the live per-session OER counter for the
+    trailing status."""
     if total_bytes is None:
         total_bytes = len(content)
-    tail = bytearray(_oci_lob_read_tail(is_clob, sequence))
+    tail = bytearray(_oci_lob_read_tail(is_clob, sequence, national))
     tail[_OCI_LOB_TAIL_SIZE_OFF : _OCI_LOB_TAIL_SIZE_OFF + 4] = total_bytes.to_bytes(
         4, 'big'
     )
@@ -9404,6 +9423,25 @@ def oci_lob_contents(
     columns: list[ColumnMeta], rows: list[tuple], *, for_oci: bool = False
 ) -> list[tuple[bytes, bool]]:
     """The (wire-content, is_clob) of each non-NULL LOB cell, row-major (#405).
+    See :func:`_lob_queue`."""
+    return [
+        (content, is_clob) for content, is_clob, _ in _lob_queue(columns, rows, for_oci)
+    ]
+
+
+def oci_lob_reads(
+    columns: list[ColumnMeta], rows: list[tuple]
+) -> list[tuple[bytes, bool, bool]]:
+    """The OCI (sqlplus) read queue: each non-NULL LOB cell's (wire-content,
+    is_clob, national), row-major. An NCLOB's read reply echoes a national-form
+    locator, as its row did (#1369)."""
+    return _lob_queue(columns, rows, True)
+
+
+def _lob_queue(
+    columns: list[ColumnMeta], rows: list[tuple], for_oci: bool
+) -> list[tuple[bytes, bool, bool]]:
+    """The (wire-content, is_clob, national) of each non-NULL LOB cell, row-major.
 
     The order matches the locators :func:`_encode_oci_value` emits, so the session
     reads this queue in sequence as sqlplus issues TTI_LOBOPS calls. CLOB content
@@ -9418,7 +9456,7 @@ def oci_lob_contents(
     queueing them would shift every later LOB's position (#826/#887)."""
     from seerdb.common.oson import encode_oson
 
-    out: list[tuple[bytes, bool]] = []
+    out: list[tuple[bytes, bool, bool]] = []
     for row in rows:
         for value, col in zip(row, columns):
             if col.data_type not in _LOB_CONTENT_TYPES or value is None:
@@ -9442,21 +9480,23 @@ def oci_lob_contents(
                 # later LOB's position in the queue (#887/#826).
                 continue
             if col.data_type == TNS_TYPE_CLOB:
-                out.append((str(value).encode('utf-16-be'), True))
+                national = col.csfrm == _CSFRM_NCHAR
+                out.append((str(value).encode('utf-16-be'), True, national))
             elif col.data_type == TNS_TYPE_JSON:
                 # A native JSON column reads back as a LOB whose content is the
                 # value's OSON image; the client decodes it as JSON (#30/#50).
                 # allow_wide so a > 255-key or > 64 KiB document re-encodes for
                 # the client's decoder (the LOB read framing carries any size).
-                out.append((encode_oson(value, allow_wide=True), False))
+                out.append((encode_oson(value, allow_wide=True), False, False))
             elif col.data_type == TNS_TYPE_VECTOR:
                 # A native VECTOR column reads back as a LOB whose content is the
                 # value's binary image, re-encoded with the column's element
                 # format so INT8 / BINARY stay integral and FLOAT64 keeps its
                 # precision (#55).
-                out.append((encode_vector(_vector_as(value, col.vector_format)), False))
+                vector = encode_vector(_vector_as(value, col.vector_format))
+                out.append((vector, False, False))
             else:
-                out.append((bytes(value), False))
+                out.append((bytes(value), False, False))
     return out
 
 
@@ -9468,7 +9508,9 @@ def _encode_oci_value(value: object, col: ColumnMeta) -> bytes:
     # later over TTI_LOBOPS, #405); a LONG / LONG RAW column streams inline via the
     # chunked form (#407); everything else is the ordinary inline DALC value.
     if col.data_type in _OCI_LOB_TYPES:
-        return encode_lob_locator_oci(value, col.data_type == TNS_TYPE_CLOB)
+        return encode_lob_locator_oci(
+            value, col.data_type == TNS_TYPE_CLOB, col.csfrm == _CSFRM_NCHAR
+        )
     if col.data_type in _OCI_LONG_TYPES:
         return encode_long_value_oci(value)
     if col.data_type == TNS_TYPE_ADT:
