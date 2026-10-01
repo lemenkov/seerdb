@@ -785,6 +785,45 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id FROM {self.TABLE} WHERE ROWID = :r', [rid])
         self.assertEqual(self.cur.fetchone(), (1,))
 
+    def test_interval_columns_describe_their_precisions(self):
+        # An INTERVAL column describes its leading-field precision and its
+        # fractional-seconds precision, declared or Oracle's default, with rows
+        # or without, and USER_TAB_COLUMNS spells them in the type. The Mirror
+        # over PostgreSQL dropped both (#1381).
+        if _conn_is_8i(self.conn):
+            self.skipTest('INTERVAL is a 9i+ type; Oracle 8i lacks it')
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (a INTERVAL DAY TO SECOND, '
+            'b INTERVAL DAY(3) TO SECOND(2), c INTERVAL YEAR TO MONTH, '
+            'd INTERVAL YEAR(4) TO MONTH)'
+        )
+        self.cur.execute(
+            f"INSERT INTO {self.TABLE} VALUES (INTERVAL '1 2:3:4.5' DAY TO SECOND, "
+            "NULL, INTERVAL '1-2' YEAR TO MONTH, NULL)"
+        )
+        for where in ('', ' WHERE 1 = 0'):
+            self.cur.execute(f'SELECT a, b, c, d FROM {self.TABLE}{where}')
+            self.cur.fetchall()
+            self.assertEqual(
+                [tuple(d)[4:6] for d in self.cur.description],
+                [(2, 6), (3, 2), (2, 0), (4, 0)],
+                where,
+            )
+        self.cur.execute(
+            'SELECT data_type, data_length, data_precision, data_scale '
+            'FROM user_tab_columns WHERE table_name = :1 ORDER BY column_id',
+            [self.TABLE],
+        )
+        self.assertEqual(
+            self.cur.fetchall(),
+            [
+                ('INTERVAL DAY(2) TO SECOND(6)', 11, 2, 6),
+                ('INTERVAL DAY(3) TO SECOND(2)', 11, 3, 2),
+                ('INTERVAL YEAR(2) TO MONTH', 5, 2, 0),
+                ('INTERVAL YEAR(4) TO MONTH', 5, 4, 0),
+            ],
+        )
+
     # ----- LONG / LONG RAW -----
 
     def test_long(self):

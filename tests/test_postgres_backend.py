@@ -298,6 +298,18 @@ def test_declared_columns_record_what_postgresql_keeps_less_of() -> None:
         't',
         {'r': ('LONG RAW', 0, None, None)},
     )
+    assert _declared_columns(
+        'CREATE TABLE t (a INTERVAL DAY TO SECOND, b interval day (3) to second(2), '
+        'c INTERVAL YEAR TO MONTH NOT NULL, d INTERVAL YEAR(4) TO MONTH)'
+    ) == (
+        't',
+        {
+            'a': ('INTERVAL DAY(2) TO SECOND(6)', 11, 2, 6),
+            'b': ('INTERVAL DAY(3) TO SECOND(2)', 11, 3, 2),
+            'c': ('INTERVAL YEAR(2) TO MONTH', 5, 2, 0),
+            'd': ('INTERVAL YEAR(4) TO MONTH', 5, 4, 0),
+        },
+    )
     assert _declared_columns('DROP TABLE t') is None
 
 
