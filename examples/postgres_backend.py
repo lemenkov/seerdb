@@ -190,6 +190,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_DATE,
     TNS_TYPE_INTERVALDS,
     TNS_TYPE_INTERVALYM,
+    TNS_TYPE_LONG,
     TNS_TYPE_LONGRAW,
     TNS_TYPE_NUMBER,
     TNS_TYPE_RAW,
@@ -1848,6 +1849,9 @@ def _ddl_column_spans(sql: str) -> tuple[str, list[tuple[int, int]], bool] | Non
 # A declared type PostgreSQL keeps less of than Oracle reports, as recorded in
 # sys.ora_columns: (data_type, data_length, data_precision, data_scale) (#1386).
 _RAW_DECLARED = re.compile(r'\s*RAW\s*\(\s*(\d+)\s*\)', re.IGNORECASE)
+# LONG and LONG RAW, which the rewrite stores as text and bytea (#1382).
+_LONG_TYPES = {'LONG': TNS_TYPE_LONG, 'LONG RAW': TNS_TYPE_LONGRAW}
+_LONG_DECLARED = re.compile(r'\s*LONG(?:\s+(RAW))?\b', re.IGNORECASE)
 # A MODIFY that leaves the column's type alone -- a constraint, a default.
 _MODIFY_WITHOUT_TYPE = re.compile(
     r'\s*(?:$|(?:NOT|NULL|DEFAULT|CONSTRAINT|CHECK|UNIQUE|PRIMARY|REFERENCES|'
@@ -1862,6 +1866,10 @@ def _declared_type(
     raw = _RAW_DECLARED.match(definition)
     if raw is not None:
         return ('RAW', int(raw.group(1)), None, None)
+    long = _LONG_DECLARED.match(definition)
+    if long is not None:
+        # Oracle lists a LONG / LONG RAW column with data_length 0.
+        return ('LONG RAW' if long.group(1) else 'LONG', 0, None, None)
     return None
 
 
@@ -5462,13 +5470,25 @@ class PostgresBackend:
         for i in self._not_null_columns(cursor.pgresult, len(columns)):
             columns[i] = replace(columns[i], null_ok=0)
         # A RAW(n) column describes as its declared n, which bytea does not keep;
-        # the values' widest stood in for it (#1386).
-        raw = [i for i, col in enumerate(columns) if col.data_type == TNS_TYPE_RAW]
-        if raw:
-            for i, (_type, length, _p, _s) in self._declared_column_types(
-                cursor.pgresult, raw
+        # the values' widest stood in for it (#1386). A LONG / LONG RAW column,
+        # stored as text / bytea, describes as itself, unsized (#1382).
+        plain = [
+            i
+            for i, col in enumerate(columns)
+            if col.data_type in (TNS_TYPE_RAW, TNS_TYPE_VARCHAR)
+        ]
+        if plain:
+            for i, (declared, length, _p, _s) in self._declared_column_types(
+                cursor.pgresult, plain
             ).items():
-                if length:
+                if declared in _LONG_TYPES:
+                    columns[i] = replace(
+                        columns[i],
+                        data_type=_LONG_TYPES[declared],
+                        data_length=0,
+                        max_size=0,
+                    )
+                elif declared == 'RAW' and length:
                     columns[i] = replace(
                         columns[i], data_length=length, max_size=length
                     )

@@ -852,6 +852,35 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id, l FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), (1, 'kept'))
 
+    def test_long_columns_describe_as_long(self):
+        # A LONG / LONG RAW column describes as itself, unsized, with rows or
+        # without, and USER_TAB_COLUMNS lists it with length 0. The Mirror over
+        # PostgreSQL stores them as text / bytea and described a VARCHAR2 / RAW
+        # sized from the data (#1382). A table holds one LONG-class column.
+        from seerdb.common.datatypes import DB_TYPE_LONG, DB_TYPE_LONG_RAW
+
+        for declared, db_type, value in (
+            ('LONG', DB_TYPE_LONG, "'abc'"),
+            ('LONG RAW', DB_TYPE_LONG_RAW, "HEXTORAW('0102')"),
+        ):
+            self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, l {declared})')
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1, {value})')
+            for where in ('', ' WHERE 1 = 0'):
+                self.cur.execute(f'SELECT l FROM {self.TABLE}{where}')
+                self.cur.fetchall()
+                self.assertEqual(
+                    tuple(self.cur.description[0])[1:4],
+                    (db_type, None, None),
+                    declared + where,
+                )
+            self.cur.execute(
+                'SELECT data_type, data_length FROM user_tab_columns '
+                "WHERE table_name = :1 AND column_name = 'L'",
+                [self.TABLE],
+            )
+            self.assertEqual(self.cur.fetchall(), [(declared, 0)])
+            self.cur.execute(f'DROP TABLE {self.TABLE}')
+
     def test_drop_table_purge(self):
         # DROP TABLE ... PURGE drops the table past the recycle bin (#1207). 9i
         # has no recycle bin and rejects the clause, ORA-00933.

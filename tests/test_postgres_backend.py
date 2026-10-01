@@ -290,6 +290,14 @@ def test_declared_columns_record_what_postgresql_keeps_less_of() -> None:
         't',
         {'q': None},
     )
+    assert _declared_columns('CREATE TABLE t (l LONG, longer NUMBER)') == (
+        't',
+        {'l': ('LONG', 0, None, None), 'longer': None},
+    )
+    assert _declared_columns('CREATE TABLE t (r long  raw NOT NULL)') == (
+        't',
+        {'r': ('LONG RAW', 0, None, None)},
+    )
     assert _declared_columns('DROP TABLE t') is None
 
 
