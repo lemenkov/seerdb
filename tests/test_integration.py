@@ -1242,6 +1242,39 @@ class TypesIntegration(_IntegrationBase):
             self.cur.fetchall(), [('NVARCHAR2', 40, 20), ('VARCHAR2', 20, 20)]
         )
 
+    def test_char_and_nchar_columns_describe_as_char(self):
+        # A CHAR(n) column describes as CHAR, an NCHAR(n) as NCHAR of n
+        # characters and 2n bytes, with rows or without, blank-padded; the
+        # dictionary lists them so. The Mirror over PostgreSQL described both as
+        # VARCHAR (#1416).
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (c CHAR(4), n NCHAR(5), v VARCHAR2(4))'
+        )
+        self.cur.execute(f"INSERT INTO {self.TABLE} VALUES ('ab', N'xy', 'ab')")
+        for where in ('', ' WHERE 1 = 0'):
+            self.cur.execute(f'SELECT c, n, v FROM {self.TABLE}{where}')
+            self.cur.fetchall()
+            self.assertEqual(
+                [tuple(d)[1:4] for d in self.cur.description],
+                [
+                    (seerdb.DB_TYPE_CHAR, 4, 4),
+                    (seerdb.DB_TYPE_NCHAR, 5, 10),
+                    (seerdb.DB_TYPE_VARCHAR, 4, 4),
+                ],
+                where,
+            )
+        self.cur.execute(f'SELECT c, n, v FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchall(), [('ab  ', 'xy   ', 'ab')])
+        self.cur.execute(
+            'SELECT data_type, data_length, char_length FROM user_tab_columns '
+            'WHERE table_name = :1 ORDER BY column_id',
+            [self.TABLE],
+        )
+        self.assertEqual(
+            self.cur.fetchall(),
+            [('CHAR', 4, 4), ('NCHAR', 10, 5), ('VARCHAR2', 4, 4)],
+        )
+
     def test_integer_and_smallint_are_number_38(self):
         # INTEGER, INT and SMALLINT are NUMBER(38): 20 digits fit, and the
         # columns describe as NUMBER(38,0). A SMALLINT parameter takes an
@@ -7411,7 +7444,7 @@ class NationalAttributeIntegration(_IntegrationBase):
         super().setUp()
         self._drop()
         self.cur.execute(
-            f'CREATE TYPE {self.TYPE} AS OBJECT (id NUMBER, v NVARCHAR2(10), w VARCHAR2(10))'
+            f'CREATE TYPE {self.TYPE} AS OBJECT (id NUMBER, v NVARCHAR2(10), w VARCHAR2(10), f NCHAR(3))'
         )
         self.cur.execute(f'CREATE TYPE {self.LIST} AS TABLE OF NVARCHAR2(10)')
         self.cur.execute(
@@ -7449,7 +7482,7 @@ class NationalAttributeIntegration(_IntegrationBase):
 
     def test_a_national_attribute_fetches_and_binds(self):
         self.cur.execute(
-            f"INSERT INTO {self.TABLE} (k, o) VALUES (1, {self.TYPE}(1, N'{self.TEXT}', 'pes'))"
+            f"INSERT INTO {self.TABLE} (k, o) VALUES (1, {self.TYPE}(1, N'{self.TEXT}', 'pes', NULL))"
         )
         self.cur.execute(f'SELECT o FROM {self.TABLE} WHERE k = 1')
         o = self.cur.fetchone()[0]
@@ -7465,21 +7498,23 @@ class NationalAttributeIntegration(_IntegrationBase):
         self.assertEqual(self.cur.fetchone()[0].V, self.BOUND)
 
     def test_a_national_attribute_is_listed_as_national(self):
-        # USER_TYPE_ATTRS names an NVARCHAR2 attribute NVARCHAR2, with the
-        # national character set; 10g itself names it VARCHAR2. The Mirror over
-        # PostgreSQL stores it as a varchar (#1383).
-        national = (
-            'VARCHAR2' if int(self.conn.version.split('.')[0]) < 11 else 'NVARCHAR2'
-        )
+        # USER_TYPE_ATTRS names an NVARCHAR2 / NCHAR attribute so, with the
+        # national character set; 10g itself names them VARCHAR2 / CHAR. The
+        # Mirror over PostgreSQL stores them as a varchar / char (#1383, #1416).
+        old = int(self.conn.version.split('.')[0]) < 11
         self.cur.execute(
             'SELECT attr_name, attr_type_name, length, character_set_name '
-            'FROM user_type_attrs WHERE type_name = :1 AND attr_name IN (:2, :3) '
+            'FROM user_type_attrs WHERE type_name = :1 AND attr_name IN (:2, :3, :4) '
             'ORDER BY attr_no',
-            [self.TYPE, 'V', 'W'],
+            [self.TYPE, 'V', 'W', 'F'],
         )
         self.assertEqual(
             self.cur.fetchall(),
-            [('V', national, 10, 'NCHAR_CS'), ('W', 'VARCHAR2', 10, 'CHAR_CS')],
+            [
+                ('V', 'VARCHAR2' if old else 'NVARCHAR2', 10, 'NCHAR_CS'),
+                ('W', 'VARCHAR2', 10, 'CHAR_CS'),
+                ('F', 'CHAR' if old else 'NCHAR', 3, 'NCHAR_CS'),
+            ],
         )
 
     def test_a_national_attribute_collection_fetches_and_binds(self):

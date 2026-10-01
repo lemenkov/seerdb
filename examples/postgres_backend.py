@@ -187,6 +187,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_BFLOAT,
     TNS_TYPE_BLOB,
     TNS_TYPE_BOOLEAN,
+    TNS_TYPE_CHAR,
     TNS_TYPE_CLOB,
     TNS_TYPE_DATE,
     TNS_TYPE_INTERVALDS,
@@ -1204,7 +1205,7 @@ _ORACLE_DICTIONARY_DDL = (
     f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' AND o.data_type = 'NCLOB' "
     "THEN 'NCLOB' "
     f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CLOB' "
-    "WHEN o.data_type = 'NVARCHAR2' THEN 'NVARCHAR2' "
+    "WHEN o.data_type IN ('NVARCHAR2', 'NCHAR') THEN o.data_type "
     f"WHEN a.attribute_udt_name = '{_BLOB_TYPE}' THEN 'BLOB' "
     "WHEN a.data_type = 'USER-DEFINED' THEN ora_name(a.attribute_udt_name) "
     "WHEN a.data_type = 'timestamp with time zone' THEN 'TIMESTAMP WITH LOCAL TZ' "
@@ -1219,7 +1220,7 @@ _ORACLE_DICTIONARY_DDL = (
     # only add a column at the end.
     # A national attribute -- NVARCHAR2 or NCLOB, told apart by its record --
     # takes NCHAR_CS, which the client reads its AL16UTF16 form from (#1383).
-    "CASE WHEN o.data_type IN ('NVARCHAR2', 'NCLOB') THEN 'NCHAR_CS' "
+    "CASE WHEN o.data_type IN ('NVARCHAR2', 'NCHAR', 'NCLOB') THEN 'NCHAR_CS' "
     "WHEN a.data_type IN ('character varying', 'character', 'text') "
     f"OR a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CHAR_CS' "
     'END::text AS character_set_name '
@@ -1886,11 +1887,17 @@ _LONG_DECLARED = re.compile(r'\s*LONG(?:\s+(RAW))?\b', re.IGNORECASE)
 # NCLOB, which the rewrite stores as the ora_clob domain CLOB is (#1369). On the
 # wire it is a CLOB in the national character set form.
 _NCLOB_DECLARED = re.compile(r'\s*NCLOB\b', re.IGNORECASE)
-# NVARCHAR2(n), which the rewrite stores as varchar(n) (#1383). Oracle measures
-# it in AL16UTF16: n characters, 2n bytes.
+# NVARCHAR2(n) and NCHAR[(n)], which the rewrite stores as varchar(n) and
+# char(n) (#1383, #1416). Oracle measures them in AL16UTF16: n characters, 2n
+# bytes. An NCHAR with no length is NCHAR(1).
 _NVARCHAR2_DECLARED = re.compile(
     r'\s*NVARCHAR2\s*\(\s*(\d+)\s*(?:CHAR\s*)?\)', re.IGNORECASE
 )
+_NCHAR_DECLARED = re.compile(
+    r'\s*NCHAR\b(?!\s+VARYING)\s*(?:\(\s*(\d+)\s*(?:CHAR\s*)?\))?', re.IGNORECASE
+)
+# The national type each of PostgreSQL's character types stands for.
+_NATIONAL_OF = {TNS_TYPE_VARCHAR: 'NVARCHAR2', TNS_TYPE_CHAR: 'NCHAR'}
 _CSFRM_NATIONAL = 2
 # An INTERVAL's precisions, which the rewrite's interval / ora_intervalym drop
 # (#1381). Oracle's defaults: DAY(2) TO SECOND(6), YEAR(2) TO MONTH.
@@ -1930,6 +1937,9 @@ def _declared_type(
     national = _NVARCHAR2_DECLARED.match(definition)
     if national is not None:
         return ('NVARCHAR2', 2 * int(national.group(1)), None, None)
+    national = _NCHAR_DECLARED.match(definition)
+    if national is not None:
+        return ('NCHAR', 2 * int(national.group(1) or 1), None, None)
     floating = _FLOAT_DECLARED.match(definition)
     if floating is not None:
         bits = int(floating.group(1) or (63 if floating.group(2) else 126))
@@ -2281,6 +2291,7 @@ _BUILTIN_TYPE_OID_BYTE = {
     'CLOB': 0x22,
     'NCLOB': 0x22,  # the same built-in OID as CLOB's, measured on 23ai (#1431)
     'NVARCHAR2': 0x19,  # the same as VARCHAR2's, measured on 23ai (#1383)
+    'NCHAR': 0x1A,  # the same as CHAR's (#1416)
     'BLOB': 0x23,
 }
 
@@ -3896,6 +3907,7 @@ _BINARY_FLOAT_OIDS = {
     701: (TNS_TYPE_BDOUBLE, 8),  # float8 (double precision)
 }
 _TEXT_OIDS = frozenset({18, 19, 25, 1042, 1043})  # char name text bpchar varchar
+_BPCHAR_OID = 1042
 _RAW_OIDS = frozenset({17})  # bytea
 # The base type oids the Oracle-typed domains report on the wire — ora_clob /
 # ora_blob over text / bytea (#534), ora_intervalym over interval (#504), ora_date
@@ -4260,8 +4272,10 @@ def _column_meta(desc, values: list, tstz_oid: int | None = None) -> ColumnMeta:
         width = desc.display_size or max(
             (len(str(v)) for v in values if v is not None), default=1
         )
+        # A char(n) is Oracle's CHAR(n), blank-padded, and describes as one (#1416).
+        data_type = TNS_TYPE_CHAR if oid == _BPCHAR_OID else TNS_TYPE_VARCHAR
         return ColumnMeta(
-            name=ident, data_type=TNS_TYPE_VARCHAR, data_length=width, max_size=width
+            name=ident, data_type=data_type, data_length=width, max_size=width
         )
     raise UnsupportedFeature(
         f'column {name!r}: PostgreSQL type oid {oid} is not supported yet'
@@ -5612,7 +5626,7 @@ class PostgresBackend:
         plain = [
             i
             for i, col in enumerate(columns)
-            if col.data_type in (TNS_TYPE_RAW, TNS_TYPE_VARCHAR)
+            if col.data_type in (TNS_TYPE_RAW, TNS_TYPE_VARCHAR, TNS_TYPE_CHAR)
         ]
         if plain:
             for i, (declared, length, _p, _s) in self._declared_column_types(
@@ -5629,8 +5643,9 @@ class PostgresBackend:
                     columns[i] = replace(
                         columns[i], data_length=length, max_size=length
                     )
-                elif declared == 'NVARCHAR2' and length:
-                    # National: n characters of AL16UTF16, 2n bytes (#1383).
+                elif declared == _NATIONAL_OF.get(columns[i].data_type) and length:
+                    # National: n characters of AL16UTF16, 2n bytes (#1383,
+                    # #1416).
                     columns[i] = replace(
                         columns[i],
                         csfrm=_CSFRM_NATIONAL,
@@ -5883,10 +5898,15 @@ class PostgresBackend:
             declared = self._declared_attribute_types(pg_oid)
             return _TdsObject(
                 tuple(
-                    _tds_chars(0x07, 2 * (m - 4), True)
-                    # An NVARCHAR2(n) attribute is a varchar(n) here; its leaf
-                    # is the national one, 2n bytes, as 23ai sends it (#1383).
-                    if declared.get(n) == 'NVARCHAR2' and m > 4
+                    _tds_chars(
+                        0x07 if declared.get(n) == 'NVARCHAR2' else 0x01,
+                        2 * (m - 4),
+                        True,
+                    )
+                    # An NVARCHAR2(n) / NCHAR(n) attribute is a varchar(n) /
+                    # char(n) here; its leaf is the national one, 2n bytes, as
+                    # 23ai sends it (#1383, #1416).
+                    if declared.get(n) in ('NVARCHAR2', 'NCHAR') and m > 4
                     else self._type_shape(t, m)
                     for (n, t, m) in self._attributes(pg_oid)
                 )
@@ -5953,8 +5973,11 @@ class PostgresBackend:
                 # apart, and the client types the attribute by it (#1431).
                 if type_name == 'CLOB' and declared.get(attname) == 'NCLOB':
                     type_name = 'NCLOB'
-                elif type_name == 'VARCHAR2' and declared.get(attname) == 'NVARCHAR2':
-                    type_name = 'NVARCHAR2'  # (#1383)
+                elif (type_name, declared.get(attname)) in (
+                    ('VARCHAR2', 'NVARCHAR2'),
+                    ('CHAR', 'NCHAR'),
+                ):
+                    type_name = declared[attname]  # (#1383, #1416)
                 (owner, toid) = (
                     None,
                     bytes(15) + bytes([_BUILTIN_TYPE_OID_BYTE[type_name]]),
@@ -6065,7 +6088,7 @@ class PostgresBackend:
                 # The national types, told apart by their record (#1383).
                 f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' "
                 "AND o.data_type = 'NCLOB' THEN 'NCLOB' "
-                "WHEN o.data_type = 'NVARCHAR2' THEN 'NVARCHAR2' "
+                "WHEN o.data_type IN ('NVARCHAR2', 'NCHAR') THEN o.data_type "
                 f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CLOB' "
                 f"WHEN a.attribute_udt_name = '{_BLOB_TYPE}' THEN 'BLOB' "
                 "WHEN a.data_type = 'USER-DEFINED' "
@@ -6097,7 +6120,9 @@ class PostgresBackend:
                     'data_type': type_name_to_tns(type_name),
                     # A client sends and expects an NVARCHAR2 attribute in
                     # AL16UTF16 inside the object image (#1383).
-                    'charset': AL16UTF16_CHARSET if type_name == 'NVARCHAR2' else None,
+                    'charset': AL16UTF16_CHARSET
+                    if type_name in ('NVARCHAR2', 'NCHAR')
+                    else None,
                 }
                 if type_owner is not None:
                     # An object or collection attribute carries its own type, as

@@ -360,6 +360,10 @@ def test_declared_columns_record_what_postgresql_keeps_less_of() -> None:
             'x': None,
         },
     )
+    assert _declared_columns('CREATE TABLE t (n NCHAR(5), m nchar, c CHAR(3))') == (
+        't',
+        {'n': ('NCHAR', 10, None, None), 'm': ('NCHAR', 2, None, None), 'c': None},
+    )
     assert _declared_columns('DROP TABLE t') is None
 
 
