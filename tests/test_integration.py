@@ -1275,6 +1275,26 @@ class TypesIntegration(_IntegrationBase):
             [('CHAR', 4, 4), ('NCHAR', 10, 5), ('VARCHAR2', 4, 4)],
         )
 
+    def test_a_cast_to_a_national_type_describes_as_national(self):
+        # CAST(... AS NVARCHAR2(n) / NCHAR(n)) describes the national type, n
+        # characters and 2n bytes. python-oracledb's suite measures its national
+        # ratio with exactly this cast. The Mirror over PostgreSQL described a
+        # plain VARCHAR of n bytes (#1440). National literals, which 8i insists
+        # on (ORA-12704 otherwise).
+        self.cur.execute(
+            "SELECT CAST('X' AS VARCHAR2(1)), CAST(N'Y' AS NVARCHAR2(1)), "
+            "CAST(N'ab' AS NCHAR(4)) c FROM dual"
+        )
+        self.assertEqual(self.cur.fetchall(), [('X', 'Y', 'ab  ')])
+        description = [tuple(d)[1:4] for d in self.cur.description]
+        self.assertEqual(
+            [d[0] for d in description],
+            [seerdb.DB_TYPE_VARCHAR, seerdb.DB_TYPE_NVARCHAR, seerdb.DB_TYPE_NCHAR],
+        )
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            return  # before 10g the describe carries no character length
+        self.assertEqual([d[1:] for d in description], [(1, 1), (1, 2), (4, 8)])
+
     def test_integer_and_smallint_are_number_38(self):
         # INTEGER, INT and SMALLINT are NUMBER(38): 20 digits fit, and the
         # columns describe as NUMBER(38,0). A SMALLINT parameter takes an

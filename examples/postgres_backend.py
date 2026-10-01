@@ -3344,6 +3344,46 @@ _INTERVALYM_BIND_ITEM = re.compile(r'make_interval\(months => %\(\w+\)s\)')
 _ITEM_ALIAS = re.compile(r'(?:AS\s+)?(?:"[^"]*"|[A-Za-z_][\w$#]*)?', re.IGNORECASE)
 
 
+# CAST(<expr> AS NVARCHAR2(n) | NCHAR[(n)]): the national target the translation
+# turns into varchar(n) / char(n) (#1440).
+_CAST_ITEM = re.compile(r'CAST\s*\(', re.IGNORECASE)
+_NATIONAL_CAST_TARGET = re.compile(
+    r'\bAS\s+(?:NVARCHAR2\s*\(\s*(\d+)|NCHAR\b(?!\s+VARYING)\s*(?:\(\s*(\d+))?)'
+    r'[^()]*\)?\s*\Z',
+    re.IGNORECASE,
+)
+
+
+def _computed_national_columns(sql: str) -> dict[int, int]:
+    """The select-list positions of an Oracle query that CAST a value to
+    NVARCHAR2(n) or NCHAR(n), each with its n (#1440).
+
+    The translation makes the target varchar(n) / char(n), so the column comes
+    back as the database character set's; Oracle describes the national type, n
+    characters of AL16UTF16. Only an item that is the whole cast is recognised.
+    """
+    words, _rownums = _top_level_words(sql)
+    if not words or words[0][1] != 'SELECT':
+        return {}
+    start = words[0][0] + len('SELECT')
+    end = next((pos for pos, word in words if word == 'FROM'), len(sql))
+    items = [sql[s:e].strip() for s, e in _top_level_items(sql, start, end)]
+    if any(item == '*' or item.endswith('.*') for item in items):
+        return {}  # the positions are the expanded columns', not the items'
+    found = {}
+    for index, item in enumerate(items):
+        cast = _CAST_ITEM.match(item)
+        if cast is None:
+            continue
+        close = _matching_paren(item, cast.end() - 1)
+        if close >= len(item) or not _ITEM_ALIAS.fullmatch(item[close + 1 :].strip()):
+            continue
+        target = _NATIONAL_CAST_TARGET.search(item, cast.end(), close)
+        if target is not None:
+            found[index] = int(target.group(1) or target.group(2) or 1)
+    return found
+
+
 def _computed_column_types(sql: str) -> dict[int, int]:
     """The select-list positions of a query whose Oracle type the item says.
 
@@ -5551,7 +5591,7 @@ class PostgresBackend:
                 self._not_null_cache[key] = key in not_null
         return {index for index, key in keys.items() if self._not_null_cache[key]}
 
-    def _build_result(self, cursor, sql: str = '') -> Result:
+    def _build_result(self, cursor, sql: str = '', original: str = '') -> Result:
         # Turn an executed statement's cursor into a Result: a row count for a
         # no-row statement, else the fetched rows plus a ColumnMeta per column.
         # `sql` is the statement as run, read for the select-list items whose
@@ -5683,6 +5723,19 @@ class PostgresBackend:
                 if declared == 'NCLOB':
                     columns[i] = replace(
                         columns[i], csfrm=_CSFRM_NATIONAL, charset=AL16UTF16_CHARSET
+                    )
+        # A CAST to NVARCHAR2(n) / NCHAR(n) in the select list describes national,
+        # n characters and 2n bytes, which its varchar(n) / char(n) does not say
+        # (#1440).
+        if original:
+            for i, length in _computed_national_columns(original).items():
+                if i < len(columns) and columns[i].data_type in _NATIONAL_OF:
+                    columns[i] = replace(
+                        columns[i],
+                        csfrm=_CSFRM_NATIONAL,
+                        charset=AL16UTF16_CHARSET,
+                        data_length=2 * length,
+                        max_size=length,
                     )
         tstz = [
             i for i, col in enumerate(columns) if col.data_type == TNS_TYPE_TIMESTAMPTZ
@@ -6374,7 +6427,7 @@ class PostgresBackend:
             if prelude is not None:
                 cursor.execute(prelude)
             cursor.execute(sql, params)
-            result = self._build_result(cursor, sql)
+            result = self._build_result(cursor, sql, original or '')
         except psycopg.Error as exc:
             self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_stmt')
             self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
@@ -6419,7 +6472,7 @@ class PostgresBackend:
         # statement had its effect. Building the result can only raise on an
         # unencodable SELECT column — no side effect to undo — so let it propagate
         # for the session to map to an ORA error; the connection stays usable.
-        return self._build_result(statement, sql)
+        return self._build_result(statement, sql, original or '')
 
     @_while_connected
     def execute_many(self, sql: str, rows: Sequence[Sequence]) -> int | Result:

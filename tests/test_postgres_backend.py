@@ -367,6 +367,21 @@ def test_declared_columns_record_what_postgresql_keeps_less_of() -> None:
     assert _declared_columns('DROP TABLE t') is None
 
 
+def test_a_national_cast_is_found_in_the_select_list() -> None:
+    # The select-list casts to NVARCHAR2(n) / NCHAR[(n)], each with its n, from
+    # the Oracle statement (#1440); one inside an expression is not the item.
+    from postgres_backend import _computed_national_columns
+
+    assert _computed_national_columns(
+        "SELECT CAST('X' AS VARCHAR2(1)), CAST(SUBSTR(a, 1, 2) AS NVARCHAR2(5)) k, "
+        'cast(b as nchar), CAST(c AS NCHAR(3)) AS d FROM t'
+    ) == {1: 5, 2: 1, 3: 3}
+    assert (
+        _computed_national_columns("SELECT CAST(a AS NVARCHAR2(5)) || 'x' FROM t") == {}
+    )
+    assert _computed_national_columns('SELECT * FROM t') == {}
+
+
 def test_delete_without_from_gains_it() -> None:
     # Oracle's `DELETE t` is PostgreSQL's `DELETE FROM t` (#1407); a DELETE that
     # has its FROM, and a word that merely starts with delete, are left alone.
