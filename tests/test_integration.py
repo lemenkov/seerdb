@@ -1387,6 +1387,24 @@ class TypesIntegration(_IntegrationBase):
         )
         self.assertEqual([tuple(r) for r in out.getvalue().fetchall()], [('s5',)])
 
+    def test_a_cursor_expression_fetches_as_a_nested_refcursor(self):
+        # A CURSOR(subquery) select-list item is a cursor per row, its query
+        # naming the outer row's columns -- empty for one row here. The Mirror
+        # over PostgreSQL rejected the expression as a syntax error (#1461).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (k NUMBER, s VARCHAR2(10))')
+        for k in range(1, 4):
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', [k, f's{k}'])
+        self.cur.execute(
+            f'SELECT t.k, CURSOR(SELECT u.s, u.k * 10 FROM {self.TABLE} u '
+            f'WHERE u.k < t.k ORDER BY u.k) c FROM {self.TABLE} t ORDER BY t.k'
+        )
+        self.assertIs(self.cur.description[1][1], seerdb.DB_TYPE_CURSOR)
+        fetched = [(k, [tuple(r) for r in c.fetchall()]) for k, c in self.cur]
+        self.assertEqual(
+            fetched,
+            [(1, []), (2, [('s1', 10)]), (3, [('s1', 10), ('s2', 20)])],
+        )
+
     def test_a_declare_block_takes_and_returns_its_binds(self):
         # An anonymous block with declarations reads its IN binds, assigns its OUT
         # binds through locals, and returns DML's RETURNING ... INTO one -- in a

@@ -817,6 +817,18 @@ _ORACLE_DICTIONARY_DDL = (
     'IMMUTABLE AS $$ SELECT $1 $$;'
     'CREATE OR REPLACE FUNCTION sys.to_clob(anyelement) RETURNS text LANGUAGE sql '
     'IMMUTABLE AS $$ SELECT $1::text $$;'
+    # ora_cursor(doc, names): a CURSOR(subquery) expression's value (#1461). `doc`
+    # is [column types, rows] -- the subquery evaluated in place, so it may name
+    # the outer row's columns -- and the cursor opens over those rows, typed and
+    # named as the subquery's columns. A PL/pgSQL function cannot take the rows
+    # as a record[], hence the jsonb.
+    'CREATE OR REPLACE FUNCTION sys.ora_cursor(doc jsonb, names text[]) '
+    'RETURNS refcursor LANGUAGE plpgsql AS $$ DECLARE r refcursor; defs text; '
+    "cols text; BEGIN SELECT string_agg(format('c%s %s', i, t), ', ' ORDER BY i), "
+    "string_agg(format('c%s AS %I', i, names[i]), ', ' ORDER BY i) INTO defs, cols "
+    "FROM jsonb_array_elements_text(doc->0) WITH ORDINALITY AS x(t, i); OPEN r FOR "
+    "EXECUTE format('SELECT %s FROM jsonb_to_recordset($1) AS t(%s)', cols, defs) "
+    'USING doc->1; RETURN r; END $$;'
     # ora_owner(schema): the Oracle owner for a PostgreSQL schema — the current
     # schema for a session-local (pg_temp) object, so GLOBAL TEMPORARY tables and
     # their indexes/constraints report under the user's schema like Oracle (#759).
@@ -3566,6 +3578,74 @@ def _translate_deref(sql: str) -> str:
     return ''.join(out) + sql[pos:]
 
 
+# CURSOR(SELECT ...), a cursor-valued select-list item (#1461).
+_CURSOR_EXPRESSION = re.compile(r'\bCURSOR\s*\((?=\s*SELECT\b)', re.IGNORECASE)
+# A select-list item's trailing alias: `expr alias` or `expr AS alias`.
+_TRAILING_ALIAS = re.compile(
+    r'(?is)^(.*?[\w)\'"])\s+(?:AS\s+)?("[^"]+"|[A-Za-z_][\w$#]*)$'
+)
+
+
+def _select_item_name(item: str) -> str:
+    # The name Oracle gives a select-list item: its alias, a column's own name,
+    # else the expression's text, upper-cased with its spaces gone.
+    match = _TRAILING_ALIAS.match(item)
+    if match is not None and match.group(2).upper() != 'END':
+        alias = match.group(2)
+        return alias[1:-1] if alias.startswith('"') else alias.upper()
+    if re.fullmatch(r'[\w$#.]+', item):
+        return item.rsplit('.', 1)[-1].upper()
+    return re.sub(r'\s+', '', item).upper()
+
+
+def _translate_cursor_expressions(sql: str) -> str:
+    # CURSOR(sub) → sys.ora_cursor(doc, names) (#1461). PostgreSQL has no cursor
+    # expression, and `sub` usually names the outer row's columns, so it cannot
+    # run apart. It runs in place instead, inside one scalar subquery that
+    # gathers its rows and its column types into a jsonb document --
+    # LEFT JOINed to a single row, so an empty result still has its types --
+    # and sys.ora_cursor opens a cursor over that document. The result path
+    # drains it as it does a REF CURSOR (#518). A nested CURSOR(...) in `sub`
+    # translates first, its cursor a value of the outer one's rows.
+    out: list[str] = []
+    pos = 0
+    for match in _CURSOR_EXPRESSION.finditer(sql):
+        if match.start() < pos:
+            continue  # inside a subquery already translated
+        close = _matching_paren(sql, match.end() - 1)
+        if close >= len(sql):
+            return sql  # unbalanced: leave the statement to fail as is
+        sub = sql[match.end() : close].strip()
+        words, _rownums = _top_level_words(sub)
+        end = next((at for at, word in words if word == 'FROM'), len(sub))
+        start = words[0][0] + len('SELECT')
+        if len(words) > 1 and words[1][1] in ('DISTINCT', 'UNIQUE', 'ALL'):
+            start = words[1][0] + len(words[1][1])
+        items = [sub[s:e].strip() for s, e in _top_level_items(sub, start, end)]
+        if any(item == '*' or item.endswith('.*') for item in items):
+            continue  # the columns are not the items: leave it to fail
+        names = ', '.join(
+            "'" + _select_item_name(item).replace("'", "''") + "'" for item in items
+        )
+        columns = ', '.join(f'c{i}' for i in range(1, len(items) + 1))
+        types = ', '.join(
+            f'(array_agg(pg_typeof(_s.c{i})))[1]::text'
+            for i in range(1, len(items) + 1)
+        )
+        doc = (
+            f'(SELECT jsonb_build_array(jsonb_build_array({types}), '
+            f"COALESCE(jsonb_agg(to_jsonb(_s) - '_m' - '_n' ORDER BY _s._n) "
+            f"FILTER (WHERE _s._m), '[]')) FROM (SELECT 1) _d LEFT JOIN "
+            f'(SELECT true AS _m, row_number() OVER () AS _n, _x.* FROM '
+            f'({_translate_cursor_expressions(sub)}) _x({columns})) _s ON true)'
+        )
+        out.append(
+            sql[pos : match.start()] + f'sys.ora_cursor({doc}, ARRAY[{names}])'
+        )
+        pos = close + 1
+    return ''.join(out) + sql[pos:]
+
+
 def _translate_idioms(sql: str) -> str:
     """Rewrite the Oracle SQL functions / literal idioms the suite uses to their
     PostgreSQL equivalents (#502). Applied to every statement."""
@@ -3577,7 +3657,8 @@ def _translate_idioms(sql: str) -> str:
     sql = _translate_decode(sql)
     for pattern, replacement in _IDIOM_REWRITES:
         sql = pattern.sub(replacement, sql)
-    return _TSTZ_LITERAL.sub(_tstz_literal_sub, sql)
+    sql = _TSTZ_LITERAL.sub(_tstz_literal_sub, sql)
+    return _translate_cursor_expressions(sql)
 
 
 # Column types that are Oracle-only *for the version the Mirror advertises*
@@ -4376,6 +4457,16 @@ def _lob_column_meta(name: str, tns_type: int) -> ColumnMeta:
         name=_oracle_column_name(name).encode('utf-8'),
         data_type=tns_type,
         data_length=4000,
+        max_size=0,
+    )
+
+
+def _refcursor_column_meta(name: str) -> ColumnMeta:
+    # A CURSOR(...) result column (#1461); its cells are drained CursorResults.
+    return ColumnMeta(
+        name=_oracle_column_name(name).encode('utf-8'),
+        data_type=TNS_TYPE_REFCURSOR,
+        data_length=0,
         max_size=0,
     )
 
@@ -5830,6 +5921,12 @@ class PostgresBackend:
                 for row in rows:
                     row[i] = self._db_object(typ, info, row[i])
                 columns.append(_object_column_meta(desc.name, typ))
+            elif desc.type_code == _REFCURSOR_OID:
+                # A CURSOR(...) item (#1461): each row's portal, drained.
+                for row in rows:
+                    if row[i] is not None:
+                        row[i] = self._drain_refcursor(row[i])
+                columns.append(_refcursor_column_meta(desc.name))
             else:
                 columns.append(_column_meta(desc, [r[i] for r in rows], self._tstz_oid))
         if self._has_quoted_names:
@@ -7176,8 +7273,15 @@ class PostgresBackend:
             if desc.type_code in (self._tstz_oid, _TIMESTAMPTZ_OID):
                 for row in rows:
                     row[i] = _wire_cell(row[i], desc.type_code, self._tstz_oid)
+            elif desc.type_code == _REFCURSOR_OID:
+                # A nested CURSOR(...) item (#1461): its own portal, drained.
+                for row in rows:
+                    if row[i] is not None:
+                        row[i] = self._drain_refcursor(row[i])
         columns = [
-            _column_meta(desc, [r[i] for r in rows], self._tstz_oid)
+            _refcursor_column_meta(desc.name)
+            if desc.type_code == _REFCURSOR_OID
+            else _column_meta(desc, [r[i] for r in rows], self._tstz_oid)
             for i, desc in enumerate(fetch.description or ())
         ]
         return CursorResult(columns=columns, rows=[tuple(r) for r in rows])

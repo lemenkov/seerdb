@@ -3613,3 +3613,32 @@ def test_raise_application_error_becomes_a_coded_raise() -> None:
         "BEGIN RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = "
         "'ORA-' || lpad(abs((-20101))::text, 5, '0') || ': ' || ('Test (it)!'); END;"
     )
+
+
+def test_a_cursor_expression_is_a_drained_cursor_at_every_level() -> None:
+    # CURSOR(subquery) runs in place, naming the outer row's columns; each value
+    # is a CursorResult with the subquery's own column names and types, empty when
+    # no row matches, and a CURSOR(...) within one is a CursorResult of its own
+    # (#1461).
+    from seerdb.common.tns_consts import TNS_TYPE_REFCURSOR
+    from seerdb.server.backend import CursorResult
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        result = backend.execute(
+            "SELECT n, CURSOR(SELECT n + 1, 'x' label, CURSOR(SELECT n * 10 FROM "
+            'dual) inner_c FROM dual WHERE n > 1) c FROM (SELECT 1 n FROM dual '
+            'UNION ALL SELECT 2 FROM dual) t ORDER BY n'
+        )
+        assert [c.name for c in result.columns] == [b'N', b'C']
+        assert result.columns[1].data_type == TNS_TYPE_REFCURSOR
+        (first, second) = result.rows
+        assert first[0] == 1 and first[1].rows == []
+        assert [c.name for c in first[1].columns] == [b'N+1', b'LABEL', b'INNER_C']
+        assert first[1].columns[2].data_type == TNS_TYPE_REFCURSOR
+        ((plus_one, label, inner),) = second[1].rows
+        assert (plus_one, label) == (3, 'x')
+        assert isinstance(inner, CursorResult)
+        assert inner.rows == [(20,)]
+    finally:
+        backend.close()
