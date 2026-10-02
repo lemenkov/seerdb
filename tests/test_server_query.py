@@ -4303,6 +4303,36 @@ def test_an_unopened_ref_cursor_is_reported_with_id_zero() -> None:
     assert cursors.has(opened.cursor_id)
 
 
+def test_a_ref_cursor_out_bind_parks_the_cursors_in_its_rows() -> None:
+    # A REF CURSOR whose rows hold a CURSOR(...) column: each of those inner
+    # cursors needs a parked id of its own, as a query's do, or the
+    # CursorResult reaches the row encoder when the client drains the REF
+    # CURSOR and the session dies with "no wire encoding for a column value of
+    # type CursorResult" (#1465).
+    from seerdb.common.tns import ColumnMeta, NestedCursor, RefCursorOutBind
+    from seerdb.common.tns_consts import TNS_TYPE_REFCURSOR, TNS_TYPE_VARCHAR
+    from seerdb.server.backend import CursorResult
+    from seerdb.server.session import _Cursors, _out_bind_entries
+
+    leaf = ColumnMeta(
+        name=b'V', data_type=TNS_TYPE_VARCHAR, data_length=10, max_size=10
+    )
+    inner = ColumnMeta(
+        name=b'C', data_type=TNS_TYPE_REFCURSOR, data_length=5, max_size=0
+    )
+    deep = CursorResult(columns=[leaf], rows=[('deep',)])
+    cursors = _Cursors()
+    (entry,) = _out_bind_entries(
+        [CursorResult(columns=[inner], rows=[(deep,)])], [(102, 4)], cursors
+    )
+    assert isinstance(entry, RefCursorOutBind)
+    _cols, parked = cursors.take(entry.cursor_id, 10)
+    nested = parked[0][0]
+    assert isinstance(nested, NestedCursor)
+    assert nested.cursor_id != entry.cursor_id
+    assert cursors.take(nested.cursor_id, 10)[1] == [('deep',)]
+
+
 def test_a_vector_out_bind_carries_its_image_not_a_locator() -> None:
     # A VECTOR is never fetched over TTI_LOBOPS -- the server prefetches the
     # whole value into the reply. That was settled for COLUMNS in #887 and for

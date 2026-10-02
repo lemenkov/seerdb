@@ -11547,6 +11547,20 @@ class CallprocIntegration(_IntegrationBase):
         self.assertEqual(one, 1)
         self.assertEqual(inner.fetchall(), [('inner',)])
 
+    def test_callproc_refcursor_holding_a_cursor(self):
+        # A REF CURSOR whose rows hold a CURSOR(...) column: the inner cursor
+        # fetches too. The Mirror parked the REF CURSOR but not the cursors in
+        # its rows, and the session died when the client drained it (#1465).
+        self._make(
+            '(p_rc OUT SYS_REFCURSOR) AS BEGIN OPEN p_rc FOR '
+            "SELECT 2 a, CURSOR(SELECT 'deep' FROM dual) c FROM dual; END;"
+        )
+        rc = self.cur.var(seerdb.CURSOR)
+        self.cur.callproc(self.PROC, [rc])
+        ((two, deep),) = rc.getvalue().fetchall()
+        self.assertEqual(two, 2)
+        self.assertEqual(deep.fetchall(), [('deep',)])
+
     def test_callfunc_number(self):
         fn = f'{self.PROC}_F'
         self.cur.execute(
