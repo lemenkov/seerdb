@@ -11684,6 +11684,17 @@ class CallprocIntegration(_IntegrationBase):
         finally:
             self.cur.execute(f'DROP FUNCTION {fn}')
 
+    def test_a_long_out_bind_returns_its_value(self):
+        # A LONG / LONG RAW OUT bind returns its value. Through the Mirror the
+        # value went out in a LONG column's chunked form, and the client read
+        # the bytes after it as an unknown message (#1458).
+        text = self.cur.var(seerdb.DB_TYPE_LONG)
+        self.cur.execute("BEGIN :v := 'abc' || RPAD('x', 300, 'y'); END;", [text])
+        self.assertEqual(text.getvalue(), 'abc' + 'x' + 'y' * 299)
+        raw = self.cur.var(seerdb.DB_TYPE_LONG_RAW)
+        self.cur.execute("BEGIN :v := HEXTORAW('0A0B'); END;", [raw])
+        self.assertEqual(raw.getvalue(), b'\n\x0b')
+
     def test_callproc_body_with_a_parenthesised_alias(self):
         # A body selecting `count(*) AS cnt`: the Mirror over PostgreSQL took that
         # `) AS` for the end of the parameter list and split the routine (#1467).

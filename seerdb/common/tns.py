@@ -3338,6 +3338,21 @@ def _encode_out_bind_value(
         # locator, 41 bytes whatever the value, and the client ran off the end
         # of it.
         return _prefetched_image_value(value, tns_type)
+    if tns_type in (TNS_TYPE_LONG, TNS_TYPE_LONGRAW):
+        # A LONG / LONG RAW OUT bind is a plain DALC, as a LONG return bind is
+        # (§22) -- not the chunked form a LONG COLUMN takes in a row, which is
+        # what encode_value gives it. Measured on 23ai, `begin :v := 'abc';
+        # end;` with a LONG :v returns `03 61 62 63` and the return code; the
+        # column form's chunk marker and trailing indicators desynced the
+        # client, "unknown protocol message type 0" (#1458).
+        if value is None:
+            return bytes([0])
+        payload = (
+            bytes(value)
+            if isinstance(value, (bytes, bytearray))
+            else str(value).encode('utf-8')
+        )
+        return _bytes_with_length(payload)
     if tns_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
         # A LOB-class OUT bind's value is the LOB block, not a DALC (§6.5,
         # #979). This has to sit ahead of the national-charset branch: an NCLOB

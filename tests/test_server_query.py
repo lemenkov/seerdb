@@ -4517,6 +4517,28 @@ def test_a_returned_number_takes_a_varchar_binds_type() -> None:
     assert body[3:5] == bytes([1]) + b'1'  # DALC of the text '1', not NUMBER 1
 
 
+def test_a_long_out_bind_is_a_plain_dalc() -> None:
+    # A LONG OUT bind is a DALC and its return code -- `03 61 62 63 | 00`, as a
+    # live 23ai sends `begin :v := 'abc'; end;` -- not the chunked form a LONG
+    # column takes in a row, which desynced the client (#1458). A long value
+    # still chunks as any DALC does, and NULL is the empty DALC.
+    from seerdb.common.tns import ScalarOutBind, _encode_out_bind_row_thin
+    from seerdb.common.tns_consts import TNS_TYPE_LONG, TNS_TYPE_LONGRAW, TTI_RXD
+
+    row = _encode_out_bind_row_thin(
+        [ScalarOutBind(value='abc', tns_type=TNS_TYPE_LONG)]
+    )
+    assert row == bytes([TTI_RXD, 0x03]) + b'abc' + bytes([0x00])
+    raw = _encode_out_bind_row_thin(
+        [ScalarOutBind(value=b'\n\x0b', tns_type=TNS_TYPE_LONGRAW)]
+    )
+    assert raw == bytes([TTI_RXD, 0x02, 0x0A, 0x0B, 0x00])
+    null = _encode_out_bind_row_thin(
+        [ScalarOutBind(value=None, tns_type=TNS_TYPE_LONG)]
+    )
+    assert null == bytes([TTI_RXD, 0x00, 0x00])
+
+
 @pytest.mark.parametrize('version', [6, 17])  # 11.2 and 23ai OAC layouts
 def test_parse_exec_reads_an_associative_array_bind(version: int) -> None:
     # An arrayvar bind (#122) carries the ARRAY flag and its capacity in the
