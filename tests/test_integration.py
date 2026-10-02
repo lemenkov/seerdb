@@ -1405,6 +1405,25 @@ class TypesIntegration(_IntegrationBase):
             [(1, []), (2, [('s1', 10)]), (3, [('s1', 10), ('s2', 20)])],
         )
 
+    def test_a_literal_naming_a_type_or_keyword_stays_as_written(self):
+        # A string literal is data, whatever word it holds: the dictionary's own
+        # type names among them, which a query compares against. The Mirror over
+        # PostgreSQL rewrote 'VARCHAR2' to 'varchar' inside the literal, and a
+        # `data_type = 'VARCHAR2'` matched nothing (#1481).
+        self.cur.execute(
+            "SELECT 'VARCHAR2', 'NVARCHAR2(10)', 'sysdate', 'MINUS' FROM dual"
+        )
+        self.assertEqual(
+            self.cur.fetchall(), [('VARCHAR2', 'NVARCHAR2(10)', 'sysdate', 'MINUS')]
+        )
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (s VARCHAR2(10))')
+        self.cur.execute(
+            'SELECT column_name FROM user_tab_columns '
+            "WHERE table_name = :1 AND data_type = 'VARCHAR2'",
+            [self.TABLE],
+        )
+        self.assertEqual(self.cur.fetchall(), [('S',)])
+
     def test_a_declare_block_takes_and_returns_its_binds(self):
         # An anonymous block with declarations reads its IN binds, assigns its OUT
         # binds through locals, and returns DML's RETURNING ... INTO one -- in a

@@ -3628,6 +3628,25 @@ def test_a_collection_type_is_in_the_dictionary() -> None:
         backend.close()
 
 
+def test_idiom_rewrites_leave_quoted_text_alone() -> None:
+    # A literal or a quoted identifier holding an Oracle word is data: a type
+    # name compared in the dictionary, an escaped quote, a word in a comment's
+    # apostrophe. The SQL around them is still rewritten (#1481).
+    out = _translate_idioms(
+        "SELECT 'VARCHAR2', 'it''s NVARCHAR2', \"MINUS\" FROM t -- don't\n"
+        "WHERE c = CAST(x AS VARCHAR2(5)) MINUS SELECT 'sysdate', sysdate FROM dual"
+    )
+    assert out == (
+        "SELECT 'VARCHAR2', 'it''s NVARCHAR2', \"MINUS\" FROM t -- don't\n"
+        "WHERE c = CAST(x AS varchar(5)) EXCEPT SELECT 'sysdate', localtimestamp(0) "
+        'FROM dual'
+    )
+    # A rule that reads into a literal still sees it: a negative INTERVAL.
+    assert _translate_idioms("SELECT INTERVAL '-1 2:00:00' DAY TO SECOND") == (
+        "SELECT - INTERVAL '1 2:00:00' DAY TO SECOND"
+    )
+
+
 def test_raise_application_error_becomes_a_coded_raise() -> None:
     # RAISE_APPLICATION_ERROR raises P0001 with its ORA code as the message's
     # prefix, which the error mapping reads back (#1323); the message may itself
