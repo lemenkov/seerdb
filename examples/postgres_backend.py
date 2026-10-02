@@ -932,7 +932,9 @@ _ORACLE_DICTIONARY_DDL = (
     '::information_schema.cardinal_number AS data_precision, '
     'coalesce(o.data_scale, c.numeric_scale)'
     '::information_schema.cardinal_number AS data_scale, '
-    'c.character_maximum_length AS char_length, '
+    # CHAR_LENGTH is 0 for a type with no character length, not NULL (#1418).
+    'coalesce(c.character_maximum_length, 0)'
+    '::information_schema.cardinal_number AS char_length, '
     "CASE c.is_nullable WHEN 'YES' THEN 'Y' ELSE 'N' END AS nullable, "
     'c.column_default AS data_default, '
     "CASE WHEN h.relid IS NULL THEN 'NO' ELSE 'YES' END AS hidden_column, "

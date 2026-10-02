@@ -1344,6 +1344,23 @@ class TypesIntegration(_IntegrationBase):
             [tuple(d)[4:6] for d in self.cur.description][:2], [(38, 0), (38, 2)]
         )
 
+    def test_char_length_is_zero_for_a_type_without_one(self):
+        # USER_TAB_COLUMNS.CHAR_LENGTH is a character column's declared length
+        # and 0 for any other type, never NULL. The Mirror over PostgreSQL gave
+        # NULL (#1418). 8i has no CHAR_LENGTH; 9i gives a RAW its length, so the
+        # test keeps to types every version agrees on.
+        if _conn_is_8i(self.conn):
+            self.skipTest('Oracle 8i has no USER_TAB_COLUMNS.CHAR_LENGTH')
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (n NUMBER, v VARCHAR2(20), d DATE)'
+        )
+        self.cur.execute(
+            'SELECT column_name, char_length FROM user_tab_columns '
+            'WHERE table_name = :1 ORDER BY column_id',
+            [self.TABLE],
+        )
+        self.assertEqual(self.cur.fetchall(), [('N', 0), ('V', 20), ('D', 0)])
+
     def test_integer_and_smallint_are_number_38(self):
         # INTEGER, INT and SMALLINT are NUMBER(38): 20 digits fit, and the
         # columns describe as NUMBER(38,0). A SMALLINT parameter takes an
