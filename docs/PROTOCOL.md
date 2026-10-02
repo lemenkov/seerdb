@@ -2176,7 +2176,12 @@ The full server side, reduced from live 11g out-of-line CLOB captures:
    a LOB execute status — `encode_lob_describe_oci`, not the
    inline-row `encode_query_response_oci`. This is load-bearing: with the ordinary
    describe sqlplus sets up its LOB define wrong and **breaks on the locator row**
-   even when that row is byte-identical to Oracle's.
+   even when that row is byte-identical to Oracle's. **An empty result gets the
+   LOB describe too** (#1428): a live 11g answers `SELECT c FROM t` (no rows)
+   with the same LOB describe, and the re-execute sqlplus sends once its LOB
+   define is set up with the end of fetch, `ORA-01403`. Given the ordinary no-row
+   reply and then a plain success, sqlplus prints one row holding an
+   uninitialized LOB (`SP2-1504`) and "1 row selected".
 2. **Fetch → locator row.** Delivered with the LOB row header (`_oci_lob_rxh`,
    `06 01 22 fd 01 …`) and ending with a **non-terminator "more" OER**
    (`encode_lob_fetch_rows_oci`) — the content still has to come over `TTI_LOBOPS`,

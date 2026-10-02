@@ -1541,7 +1541,14 @@ def _serve_oci_session(
                     # sqlplus re-executes the described cursor to pull LONG rows
                     # once its streaming define is set up. LONG rows stream one per
                     # reply: deliver the first now, re-park the rest for the
-                    # follow-up fetches (#407).
+                    # follow-up fetches (#407). A LOB result with no rows answers
+                    # the end of fetch, ORA-01403, as a live 11g does (#1428).
+                    if not parked[1]:
+                        stream.write_packet(
+                            TNS_DATA, encode_fetch_terminator_oci(seq.next())
+                        )
+                        parked = None
+                        continue
                     parked = _serve_oci_long_row(stream, parked, seq, reexecute=True)
                     continue
                 parked, lobs, slot_lobs = _answer_query_oci(stream, backend, body, seq)
@@ -1875,12 +1882,14 @@ def _answer_query_oci(
     has_lob = any(
         col.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB) for col in result.columns
     )
-    if has_lob and rows:
+    if has_lob:
         # A LOB result: sqlplus sets up its LOB define from the describe, then
         # fetches the locator rows. The LOB describe reply has its own shape (a
         # 33-byte tail + a LOB execute status, not the ordinary inline-row DCB
         # tail) — matching it is what makes sqlplus accept the locator row rather
-        # than break (#405).
+        # than break (#405). An empty result gets it too, as from a live 11g, and
+        # is parked empty: the ordinary no-row reply read to sqlplus as a row
+        # holding an uninitialized LOB (#1428).
         stream.write_packet(
             TNS_DATA, encode_lob_describe_oci(result.columns, sequence=seq.next())
         )
