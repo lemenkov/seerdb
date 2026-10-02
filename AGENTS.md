@@ -31,10 +31,23 @@ Two things bite repeatedly:
 
 ### Tests
 
-CI runs the offline suite and 23ai. Everything else — 8i, 9i, 10g, 11g, 21c, the
-Mirror legs and the SQLAlchemy compliance suite — is **local only**, so a green
-CI badge says little about a change to the codec or the login path. Run the
-tiers your change can reach, and put the numbers in the PR description.
+CI runs the offline suite on every change. Each integration leg runs only for the
+paths it can reach (#1470):
+
+- **Oracle legs** (11g, 18c, 21c, 23ai, 23ai at 12.1, and SQLAlchemy on 11g and
+  23ai) run when `seerdb/client`, `seerdb/common`, the root package, the test
+  harness or `pyproject.toml` changed. A Mirror-only change, or a new test in
+  `tests/test_integration.py` alone, does not run them.
+- **Mirror-over-PG legs** (the integration suite and SQLAlchemy through the
+  Mirror) run for any change under `seerdb/` (the seerdb client drives the
+  Mirror, so a client change can break it), `examples/`, or the integration and
+  backend test modules.
+- A **nightly** run takes every leg whatever changed.
+
+8i, 9i, 10g and the passthrough Mirror are **local only**. So is every Oracle leg
+for a PR the gate skips, which is why a green CI badge says little about a change
+the gate let through untested. Run the tiers your change can reach, and put the
+numbers in the PR description.
 
 A docs-only change needs none of the test tiers; the repository's own workflows
 skip them on those paths too.

@@ -10,16 +10,24 @@
 name: SQLAlchemy
 
 on:
+  # Only the client and the codec reach a real Oracle; a Mirror-only change
+  # (seerdb/server, examples/) cannot change this run's outcome (#1470).
   push:
     branches: [master]
     paths:
-      - 'seerdb/**'
+      - 'seerdb/client/**'
+      - 'seerdb/common/**'
+      - 'seerdb/__init__.py'
+      - 'seerdb/py.typed'
       - 'pyproject.toml'
       - '.github/workflows/sqlalchemy.yml'
   pull_request:
     branches: [master]
     paths:
-      - 'seerdb/**'
+      - 'seerdb/client/**'
+      - 'seerdb/common/**'
+      - 'seerdb/__init__.py'
+      - 'seerdb/py.typed'
       - 'pyproject.toml'
       - '.github/workflows/sqlalchemy.yml'
   # On demand and weekly: release against release, this driver at its newest
