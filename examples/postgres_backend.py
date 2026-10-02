@@ -3684,6 +3684,43 @@ def _translate_cursor_expressions(sql: str) -> str:
     return ''.join(out) + sql[pos:]
 
 
+
+# A masked quoted region's contents: NUL, the region's index, NUL (#1481).
+_QUOTED_MASK = re.compile('\x00(\\d+)\x00')
+
+
+def _mask_quoted(sql: str) -> tuple[str, list[str]]:
+    # `sql` with each string literal's and quoted identifier's contents replaced
+    # by a numbered mask, and the contents in mask order. The quotes stay, so a
+    # rewrite still sees that a literal or an identifier is there; comments are
+    # left as they are, an apostrophe in one opening nothing.
+    out: list[str] = []
+    contents: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        if sql.startswith('--', i) or sql.startswith('/*', i):
+            end = sql.find('\n' if sql[i] == '-' else '*/', i + 2)
+            end = n if end < 0 else end + (1 if sql[i] == '-' else 2)
+            out.append(sql[i:end])
+            i = end
+            continue
+        quote = sql[i]
+        if quote not in ("'", '"'):
+            out.append(quote)
+            i += 1
+            continue
+        j = i + 1
+        while j < n and not (sql[j] == quote and sql[j + 1 : j + 2] != quote):
+            j += 2 if sql[j] == quote else 1
+        out.append(f'{quote}\x00{len(contents)}\x00{quote}')
+        contents.append(sql[i + 1 : j])
+        i = j + 1
+    return ''.join(out), contents
+
+
+def _unmask_quoted(sql: str, contents: list[str]) -> str:
+    return _QUOTED_MASK.sub(lambda m: contents[int(m.group(1))], sql)
+
 def _translate_idioms(sql: str) -> str:
     """Rewrite the Oracle SQL functions / literal idioms the suite uses to their
     PostgreSQL equivalents (#502). Applied to every statement."""
@@ -3693,8 +3730,17 @@ def _translate_idioms(sql: str) -> str:
     sql = _translate_connect_by(sql)
     sql = _translate_signed_year(sql)
     sql = _translate_decode(sql)
+    # The rewrites change Oracle words into PostgreSQL ones, and a string
+    # literal or a quoted identifier holding such a word is data, not SQL:
+    # `data_type = 'VARCHAR2'` was rewritten to `= 'varchar'` and matched
+    # nothing (#1481). Each rule runs with the quoted regions masked, but for one
+    # whose own pattern reads into a literal (a negative INTERVAL '-...').
     for pattern, replacement in _IDIOM_REWRITES:
-        sql = pattern.sub(replacement, sql)
+        if "'" in pattern.pattern:
+            sql = pattern.sub(replacement, sql)
+            continue
+        (masked, contents) = _mask_quoted(sql)
+        sql = _unmask_quoted(pattern.sub(replacement, masked), contents)
     sql = _TSTZ_LITERAL.sub(_tstz_literal_sub, sql)
     return _translate_cursor_expressions(sql)
 
