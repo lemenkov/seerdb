@@ -382,6 +382,26 @@ def test_a_national_cast_is_found_in_the_select_list() -> None:
     assert _computed_national_columns('SELECT * FROM t') == {}
 
 
+def test_a_one_element_constructor_is_spelt_as_a_call() -> None:
+    # `name('x')` for a collection type: PostgreSQL reads it as a cast to the
+    # type, so it is spelt `name(VARIADIC ARRAY['x'])` (#1435). Other calls,
+    # unknown names and a call through an alias are left alone.
+    from postgres_backend import _spell_one_element_constructors
+
+    names = frozenset({'l', 'pyo.l'})
+    assert _spell_one_element_constructors("INSERT INTO t VALUES (L('a'))", names) == (
+        "INSERT INTO t VALUES (L(VARIADIC ARRAY['a']))"
+    )
+    assert _spell_one_element_constructors("SELECT pyo.l(N'z') FROM t", names) == (
+        "SELECT pyo.l(VARIADIC ARRAY[N'z']) FROM t"
+    )
+    for sql in (
+        "SELECT l('a', 'b'), l(), upper('x') FROM t",
+        "SELECT x.l('a') FROM t x",
+    ):
+        assert _spell_one_element_constructors(sql, names) == sql
+
+
 def test_delete_without_from_gains_it() -> None:
     # Oracle's `DELETE t` is PostgreSQL's `DELETE FROM t` (#1407); a DELETE that
     # has its FROM, and a word that merely starts with delete, are left alone.

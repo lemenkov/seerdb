@@ -2610,6 +2610,30 @@ def _translate_object_ddl(sql: str) -> str | None:
     return None
 
 
+# A call with one string literal, `name('x')`: PostgreSQL reads it as a cast to
+# `name` when a type of that name exists, before it looks for a function, so a
+# one-element collection constructor became a malformed array literal (#1435).
+_ONE_LITERAL_CALL = re.compile(
+    r"(?<![\w$#.\"])((?:[A-Za-z_][\w$#]*\.)?[A-Za-z_][\w$#]*)\s*\(\s*([Nn]?'(?:[^']|'')*')\s*\)"
+)
+
+
+def _spell_one_element_constructors(sql: str, collections: frozenset[str]) -> str:
+    """`name('x')` for a collection type `name`, spelt so PostgreSQL calls the
+    constructor rather than casting the literal (#1435). Names compare in lower
+    case, schema-qualified or not."""
+    if not collections or "'" not in sql:
+        return sql
+
+    def respell(match: re.Match) -> str:
+        name, literal = match.group(1), match.group(2)
+        if name.lower() not in collections:
+            return match.group(0)
+        return f'{name}(VARIADIC ARRAY[{literal}])'
+
+    return _ONE_LITERAL_CALL.sub(respell, sql)
+
+
 def _collection_constructors(name: str, element: str) -> str:
     """The constructors Oracle gives a collection type (#1206): `name(e1, e2, …)`
     and the empty `name()`, each returning the type, so a VARRAY's bound still
@@ -4789,6 +4813,7 @@ class PostgresBackend:
         ).fetchone()
         self._has_column_catalog = bool(row and row[0])
         self._column_type_cache: dict[tuple[int, int], tuple | None] = {}
+        self._collection_name_cache: frozenset[str] | None = None
         self._any_invisible: bool | None = None
         self._visible_cache: dict[str, list[str] | None] = {}
         self._conn.commit()
@@ -5061,6 +5086,7 @@ class PostgresBackend:
                 _translate_routine_ddl(_translate_ddl(_translate_admin(sql)))
             )
         )
+        sql = _spell_one_element_constructors(sql, self._collection_names())
         with_rowid = self._returning_rowid(original, sql)
         if with_rowid is not None:
             sql = with_rowid
@@ -5097,6 +5123,7 @@ class PostgresBackend:
             self._record_tstz_precisions(original)
             self._record_visibility(visibility)
             self._record_column_types(original)
+            self._collection_name_cache = None  # a type may have come or gone
         if with_rowid is not None:
             # The rows are the rowids of the rows touched, not a result set: a
             # DML still answers with a count, and the last one is its rowid.
@@ -5254,6 +5281,24 @@ class PostgresBackend:
         if pk is None:
             return sql
         return _ROWID_WORD.sub(_urowid_expression(pk), sql)
+
+    def _collection_names(self) -> frozenset[str]:
+        # The collection types (array domains) of the user schemas, by name and
+        # by schema-qualified name, lower case; read once, then after any DDL.
+        if self._collection_name_cache is None:
+            rows = self._conn.execute(
+                'SELECT lower(t.typname), lower(n.nspname) FROM pg_type t '
+                'JOIN pg_namespace n ON n.oid = t.typnamespace '
+                "JOIN pg_type b ON b.oid = t.typbasetype AND b.typcategory = 'A' "
+                "WHERE t.typtype = 'd' "
+                "AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'oracle')"
+            ).fetchall()
+            self._collection_name_cache = frozenset(
+                name
+                for typname, schema in rows
+                for name in (typname, f'{schema}.{typname}')
+            )
+        return self._collection_name_cache
 
     def _record_column_types(self, statement: str) -> None:
         # After a committed DDL: keep sys.ora_columns in step with it (#1386).
