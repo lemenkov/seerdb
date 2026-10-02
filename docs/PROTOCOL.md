@@ -6643,6 +6643,12 @@ An iteration that affected nothing still sends its record, with a zero count —
 omitting it slides every later iteration's values one position earlier. The
 records precede the ordinary success status OER.
 
+A **LONG / LONG RAW OUT bind** of a PL/SQL block follows the same rule as a LONG
+return bind: a plain DALC and its return code, measured on 23ai as
+`07 | 03 61 62 63 | 00` for `begin :v := 'abc'; end;`. The chunked form a LONG
+*column* takes in a row adds a chunk marker and trailing indicators, which the
+client reads as the next message: "unknown protocol message type 0" (#1458).
+
 Each value goes out in the **return bind's** type, which need not be its column's
 (#1501). `RETURNING IntCol INTO :v` with a VARCHAR `:v` returns the number as
 text, the way Oracle converts it, which is TO_CHAR's default: measured on 23ai,
