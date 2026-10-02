@@ -118,6 +118,23 @@ class TestAsyncCloseTeardown(unittest.TestCase):
         a.rollback.assert_not_awaited()
         a._handle_response.assert_awaited_once()
 
+    def test_autocommit_defaults_to_off(self):
+        # PEP 249 starts a connection with auto-commit off, and python-oracledb
+        # does; seerdb defaulted it on until 3.0.0 (#1447). Sync and async alike.
+        from seerdb.client.aconnection import AsyncOracleConnect
+        from seerdb.client.connection import OracleConnect
+
+        for cls in (OracleConnect, AsyncOracleConnect):
+            self.assertIs(
+                cls(host='x', port=1, user='u', password='p').autocommit, False
+            )
+            self.assertIs(
+                cls(
+                    host='x', port=1, user='u', password='p', autocommit=True
+                ).autocommit,
+                True,
+            )
+
     def test_close_noop_when_not_authenticated(self):
         # A connection that never authenticated must not send logoff/rollback.
         from seerdb.client.aconnection import AsyncOracleConnect
