@@ -3389,6 +3389,11 @@ _LOB_CALL_ITEM = re.compile(
 # An IntervalYM bind as the translation writes it (_translate_binds).
 _INTERVALYM_BIND_ITEM = re.compile(r'make_interval\(months => %\(\w+\)s\)')
 _ITEM_ALIAS = re.compile(r'(?:AS\s+)?(?:"[^"]*"|[A-Za-z_][\w$#]*)?', re.IGNORECASE)
+# A select-list item that is one call, `name(...)` or `schema.name(...)`,
+# optionally aliased: a type constructor when `name` is a type (#1473).
+_CONSTRUCTOR_CALL_ITEM = re.compile(
+    r'([A-Za-z_][\w$#]*(?:\s*\.\s*[A-Za-z_][\w$#]*)?)\s*\('
+)
 
 
 # CAST(<expr> AS NVARCHAR2(n) | NCHAR[(n)]): the national target the translation
@@ -3471,6 +3476,34 @@ def _computed_column_types(sql: str) -> dict[int, int]:
         found[index] = TNS_TYPE_CLOB if name.endswith('clob') else TNS_TYPE_BLOB
     return found
 
+
+
+def _constructor_items(sql: str) -> dict[int, str]:
+    """The select-list positions of a query that are one call, by the name called.
+
+    PostgreSQL describes a computed value by its domain's base type, so a
+    collection constructor -- `t_arr(5, 10)`, a function returning the
+    collection's domain -- reads as a bare array with no table column to trace
+    the domain through (#1473). The name is what says which collection it is;
+    the caller keeps it only when it names a collection type.
+    """
+    words, _rownums = _top_level_words(sql)
+    if not words or words[0][1] != 'SELECT':
+        return {}
+    start = words[0][0] + len('SELECT')
+    end = next((pos for pos, word in words if word == 'FROM'), len(sql))
+    items = [sql[s:e].strip() for s, e in _top_level_items(sql, start, end)]
+    if any(item == '*' or item.endswith('.*') for item in items):
+        return {}  # the positions are the expanded columns', not the items'
+    found = {}
+    for index, item in enumerate(items):
+        call = _CONSTRUCTOR_CALL_ITEM.match(item)
+        if call is None:
+            continue
+        close = _matching_paren(item, call.end() - 1)
+        if close < len(item) and _ITEM_ALIAS.fullmatch(item[close + 1 :].strip()):
+            found[index] = re.sub(r'\s+', '', call.group(1))
+    return found
 
 def _rewrite_rownum(sql: str) -> str:
     """Translate `... WHERE a AND ROWNUM <= n` to `... WHERE a LIMIT n` (#1271).
@@ -5885,6 +5918,7 @@ class PostgresBackend:
         if cursor.description is None:
             return Result(rowcount=max(cursor.rowcount, 0))
         computed = _computed_column_types(sql) if sql else {}
+        constructors = _constructor_items(sql) if sql else {}
         rows = [list(r) for r in cursor.fetchall()]
         # Re-tag the zoned cells before they reach the wire encoder (_wire_cell).
         for i, desc in enumerate(cursor.description):
@@ -5922,7 +5956,9 @@ class PostgresBackend:
                     row[i] = self._ref_cell(target, row[i])
                 columns.append(self._ref_column_meta(desc.name, target))
             elif (
-                coll := self._column_collection_type(cursor.pgresult, i, desc.type_code)
+                coll := self._column_collection_type(
+                    cursor.pgresult, i, desc.type_code, constructors.get(i)
+                )
             ) is not None:
                 for row in rows:
                     row[i] = self._db_collection(coll, row[i], desc.type_code)
@@ -6059,13 +6095,14 @@ class PostgresBackend:
         return self._object_type(pg_oid)
 
     def _column_collection_type(
-        self, pgresult, index: int, pg_oid: int
+        self, pgresult, index: int, pg_oid: int, constructor: str | None = None
     ) -> DbObjectType | None:
         # A VARRAY / nested-table column (#1206). PostgreSQL describes a domain
         # column by its base type, an array here, so an array column is traced
         # through libpq ftable / ftablecol to the type its table declares. A
-        # computed array, a constructor call among them, has no table column
-        # and stays a plain array.
+        # computed array has no table column; when its select item is one call
+        # to a collection type's constructor, that type is the one (#1473).
+        # Any other computed array stays a plain array.
         if pg_oid not in self._array_oids:
             row = self._conn.execute(
                 "SELECT typcategory = 'A' FROM pg_type WHERE oid = %s", (pg_oid,)
@@ -6075,7 +6112,7 @@ class PostgresBackend:
             return None
         relid = pgresult.ftable(index)
         if not relid:
-            return None
+            return self._constructed_collection_type(constructor) if constructor else None
         key = (relid, pgresult.ftablecol(index))
         if key not in self._column_types:
             row = self._conn.execute(
@@ -6084,6 +6121,14 @@ class PostgresBackend:
             ).fetchone()
             self._column_types[key] = row[0] if row else 0
         return self._collection_type(self._column_types[key])
+
+    def _constructed_collection_type(self, name: str) -> DbObjectType | None:
+        # The collection type a constructor call names, or None when the name
+        # is not a type -- an ordinary function returning an array (#1473).
+        # Looked up each time: a type dropped and created again under the same
+        # name has a new oid.
+        row = self._conn.execute('SELECT to_regtype(%s)::oid', (name,)).fetchone()
+        return self._collection_type(row[0]) if row and row[0] else None
 
     def _collection_type(self, pg_oid: int) -> DbObjectType | None:
         """The Oracle collection type an array domain stands for (#1206).

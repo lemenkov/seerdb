@@ -2386,6 +2386,17 @@ def test_reject_create_domain_raises_ora_901() -> None:
 # --- PL/SQL routine translation (#503) — a pure function, no live PG needed -----
 
 
+def test_constructor_items_name_each_whole_call() -> None:
+    # A select item that is one call, aliased or not, by the name it calls; an
+    # expression around a call, or a wildcard list, names nothing (#1473).
+    from postgres_backend import _constructor_items
+
+    assert _constructor_items(
+        'SELECT t_arr(5, 10), s.t_arr(1) AS c, n + f(1), x FROM dual'
+    ) == {0: 't_arr', 1: 's.t_arr'}
+    assert _constructor_items('SELECT * FROM t') == {}
+
+
 def test_translate_routine_ddl_procedure() -> None:
     out = _translate_routine_ddl(
         'CREATE OR REPLACE PROCEDURE p '
