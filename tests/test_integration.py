@@ -6998,21 +6998,14 @@ class CursorWarningIntegration(_IntegrationBase):
     def _bad_procedure(self, name: str) -> None:
         # Creating an object that does NOT compile is the precondition of this
         # whole class, and it is an Oracle behaviour: the statement succeeds and
-        # the object exists, invalid. A backend without those semantics rejects
-        # the statement outright -- Mirror-over-PostgreSQL answers ORA-00900 --
-        # and there is no warning to report because there was no create. Skip on
-        # that rather than fail, and say which it is (#993).
-        from seerdb.common.exceptions import DatabaseError
-
-        try:
-            self.cur.execute(
-                f"""CREATE OR REPLACE PROCEDURE {name} AS
-                    BEGIN
-                        NULL
-                    END;"""  # the missing semicolon is the point
-            )
-        except DatabaseError as exc:
-            self.skipTest(f'this backend refuses an invalid CREATE outright: {exc}')
+        # the object exists, invalid. Mirror-over-PostgreSQL refused it outright
+        # (ORA-00900) until it stood an invalid object in (#1499).
+        self.cur.execute(
+            f"""CREATE OR REPLACE PROCEDURE {name} AS
+                BEGIN
+                    NULL
+                END;"""  # the missing semicolon is the point
+        )
 
     def tearDown(self):
         from seerdb.common.exceptions import DatabaseError
@@ -7048,6 +7041,25 @@ class CursorWarningIntegration(_IntegrationBase):
         self.assertIsNone(self.cur.warning)
         self.cur.execute('DROP PROCEDURE PYORACLE_WARN_P')
         self.assertIsNone(self.cur.warning)
+
+    def test_a_function_and_a_type_with_compilation_errors_warn(self):
+        # A function and an object type that do not compile are created too,
+        # with the same warning, and can be dropped (#1499).
+        for create, drop in (
+            (
+                'CREATE OR REPLACE FUNCTION PYORACLE_WARN_F RETURN NUMBER AS '
+                'BEGIN RETURN NULL END;',
+                'DROP FUNCTION PYORACLE_WARN_F',
+            ),
+            (
+                'CREATE OR REPLACE TYPE PYORACLE_WARN_T AS OBJECT (x no_such_type)',
+                'DROP TYPE PYORACLE_WARN_T',
+            ),
+        ):
+            self.cur.execute(create)
+            self.assertEqual(self.cur.warning.full_code, 'DPY-7000', create)
+            self.cur.execute(drop)
+            self.assertIsNone(self.cur.warning)
 
     def test_an_ordinary_statement_sets_no_warning(self):
         self.cur.execute('SELECT 1 FROM dual')
