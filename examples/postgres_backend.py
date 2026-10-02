@@ -6451,6 +6451,14 @@ class PostgresBackend:
                 schema=owner,
                 name=f'{name.strip(chr(34))}%ROWTYPE' if row_type else type_name,
             )
+            if row_type:
+                # full_name is IN OUT, and the server hands it back qualified by
+                # the table's owner -- 'T%ROWTYPE' returns as 'OWNER.T%ROWTYPE'.
+                # python-oracledb takes the record's schema from it and reads
+                # the attributes from all_tab_cols by that owner; echoed back
+                # unqualified, the schema was empty and the query found no
+                # columns at all (#1479).
+                answer['full_name'] = f'{owner}.{name.strip(chr(34))}%ROWTYPE'
             if isinstance(shape, _TdsObject):
                 attrs_rc.rows.extend(self._attribute_rows(pg_oid))
         return Result(out_binds=[answer.get(n, values.get(n)) for n in names])

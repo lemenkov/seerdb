@@ -2331,6 +2331,46 @@ def test_get_type_shape_of_a_rowtype_with_a_date_column() -> None:
         backend.close()
 
 
+def test_get_type_shape_qualifies_a_rowtype_full_name() -> None:
+    # full_name is IN OUT: the server hands a %ROWTYPE's name back qualified by
+    # the table's owner, as 23ai does ('T%ROWTYPE' -> 'PYO.T%ROWTYPE').
+    # python-oracledb reads the record's schema from it and then the columns
+    # from all_tab_cols by that owner; echoed back unqualified, the owner was
+    # empty and the columns query found nothing (#1479).
+    from seerdb.common.tns_consts import (
+        TNS_TYPE_NUMBER,
+        TNS_TYPE_RAW,
+        TNS_TYPE_REFCURSOR,
+        TNS_TYPE_VARCHAR,
+    )
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE pyo_rowtype_fn (n NUMBER, s VARCHAR2(10))')
+        binds = [
+            BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=4),
+            BindVar(
+                value='PYO_ROWTYPE_FN%ROWTYPE', tns_type=TNS_TYPE_VARCHAR, max_size=128
+            ),
+            BindVar(value=None, tns_type=TNS_TYPE_RAW, max_size=16),
+            BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=4),
+            BindVar(value=None, tns_type=TNS_TYPE_RAW, max_size=32767),
+            BindVar(value=None, tns_type=TNS_TYPE_REFCURSOR, max_size=1),
+            BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=128),
+        ]
+        (ret_val, full_name, *_rest) = backend.execute(_TYPE_SHAPE_SQL, binds).out_binds
+        owner = backend.execute(
+            "SELECT owner FROM all_tables WHERE table_name = 'PYO_ROWTYPE_FN'"
+        ).rows[0][0]
+        assert ret_val == 0
+        assert full_name == f'{owner}.PYO_ROWTYPE_FN%ROWTYPE'
+    finally:
+        backend.execute('DROP TABLE IF EXISTS pyo_rowtype_fn')
+        backend.commit()
+        backend.close()
+
+
 def test_the_column_visibility_attribute_comes_out_of_the_ddl() -> None:
     # INVISIBLE / VISIBLE follow a column's type in CREATE TABLE and in ALTER
     # TABLE ADD / MODIFY; the statement loses it and says which columns it named,
