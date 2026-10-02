@@ -1949,6 +1949,53 @@ def test_parse_exec_oci_narrow_preamble_reads_the_bind_count() -> None:
     assert req.bind_meta == [(TNS_TYPE_NUMBER, 22)]
 
 
+# sqlplus 23.26's `select 1 from dual` (12c band), once with NLS_LANG set to
+# ...AL32UTF8 -- the database's own character set -- and once to ...UTF8. The
+# header's SQL length is the byte length for the first, three times it for the
+# second (#1427).
+_OCI_EXEC_SELECT1_AL32UTF8 = bytes.fromhex(
+    '035e046180000000000000feffffffffffffff12000000feffffffffffffff0d'
+    '000000fefffffffffffffffeffffffffffffff00000000010000000000000000'
+    '00000000000000000000000000000000000000feffffffffffffff0000000000'
+    '000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000001273656c65637420312066726f6d206475'
+    '616c010000000000000000000000000000000000000000000000000000000100'
+    '00000000000000800000000000000000000000000000'
+)
+_OCI_EXEC_SELECT1_UTF8 = bytes.fromhex(
+    '035e0a6180000000000000feffffffffffffff36000000feffffffffffffff0d'
+    '000000fefffffffffffffffeffffffffffffff00000000010000000000000000'
+    '00000000000000000000000000000000000000feffffffffffffff0000000000'
+    '000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000001273656c65637420312066726f6d206475'
+    '616c010000000000000000000000000000000000000000000000000000000100'
+    '00000000000000800000000000000000000000000000'
+)
+
+
+def test_parse_exec_oci_reads_the_sql_whatever_the_client_character_set() -> None:
+    # Read as three times the byte length always, an AL32UTF8 client's
+    # statement failed the length check, and every statement it ran was answered
+    # with a bare success: SP2-0642 from sqlplus (#1427).
+    from seerdb.common.tns import _DECODE_FIELD_VERSION
+    from seerdb.common.tns_consts import FIELD_VERSION_12_1
+
+    token = _DECODE_FIELD_VERSION.set(FIELD_VERSION_12_1)
+    try:
+        assert _OCI_EXEC_SELECT1_AL32UTF8[19] == 18  # the byte length
+        assert _OCI_EXEC_SELECT1_UTF8[19] == 54  # three times it
+        for request in (_OCI_EXEC_SELECT1_AL32UTF8, _OCI_EXEC_SELECT1_UTF8):
+            assert parse_exec_oci(request).sql == 'select 1 from dual'
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+
+
 def test_parse_exec_oci_rejects_an_unknown_preamble_width() -> None:
     # Neither indicator position holds — refuse rather than read a garbage SQL
     # from whichever offset happens to be in range.

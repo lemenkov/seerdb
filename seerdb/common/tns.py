@@ -8117,7 +8117,11 @@ def _oci_lob_read_tail(
 _OCI_ALL8_CURSOR_OFF = 7  # ub4 LE; 0 = a new statement
 
 
-_OCI_ALL8_SQLLEN3_OFF = 19  # ub4 LE = 3 x the SQL byte length
+# ub4 LE: the SQL's length, measured for the client's character set. A client in
+# AL32UTF8, the database's own, sends the byte length; one in any other set
+# (UTF8, US7ASCII, ...) sends three times it, a conversion buffer's worth
+# (measured, sqlplus 23.26, #1427).
+_OCI_ALL8_SQLLEN3_OFF = 19
 
 
 _OCI_ALL8_SQL_OFF = 196  # SQL text; the ub1 length prefix is the byte before it
@@ -8213,17 +8217,17 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
         payload[_OCI_ALL8_CURSOR_OFF : _OCI_ALL8_CURSOR_OFF + 4], 'little'
     )
     marker = payload[sql_off - 1]  # ub1 length prefix (0xFE = chunked)
-    declared_len = (
-        int.from_bytes(
-            payload[_OCI_ALL8_SQLLEN3_OFF : _OCI_ALL8_SQLLEN3_OFF + 4], 'little'
-        )
-        // 3
+    declared = int.from_bytes(
+        payload[_OCI_ALL8_SQLLEN3_OFF : _OCI_ALL8_SQLLEN3_OFF + 4], 'little'
     )
     if marker == TNS_LONG_LENGTH_INDICATOR:
         # Long SQL — chunked from the marker: 0xFE, then <ub1 len><chunk> repeated
-        # (a zero length, or the declared total, ends it).
-        raw_sql = _read_chunked_sql(payload[sql_off - 1 :], declared_len)
-    elif marker == declared_len:
+        # until a zero length. The declared length is the byte length or three
+        # times it, never less, so it only caps the read.
+        raw_sql = _read_chunked_sql(payload[sql_off - 1 :], declared)
+    elif marker in (declared, declared // 3):
+        # The byte length, as an AL32UTF8 client declares it, or a third of the
+        # conversion-buffer length any other client declares (#1427).
         raw_sql = payload[sql_off : sql_off + marker]
     else:
         # The two lengths disagree only for a bound statement (the bind section
