@@ -1365,7 +1365,7 @@ class TypesIntegration(_IntegrationBase):
         # An anonymous block opens a REF CURSOR into a bind -- `OPEN :c FOR`, its
         # query taking IN binds of its own -- or assigns a local cursor to one.
         # The Mirror over PostgreSQL ran neither: a block is a DO block there,
-        # which returns nothing (#1300).
+        # which returns nothing (#1456).
         self.cur.execute(f'CREATE TABLE {self.TABLE} (k NUMBER, s VARCHAR2(10))')
         for k in range(1, 7):
             self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', [k, f's{k}'])
@@ -1386,6 +1386,33 @@ class TypesIntegration(_IntegrationBase):
             [5, out],
         )
         self.assertEqual([tuple(r) for r in out.getvalue().fetchall()], [('s5',)])
+
+    def test_a_declare_block_takes_and_returns_its_binds(self):
+        # An anonymous block with declarations reads its IN binds, assigns its OUT
+        # binds through locals, and returns DML's RETURNING ... INTO one -- in a
+        # loop of executes too. The Mirror over PostgreSQL ran such a block with
+        # its binds ignored and its declarations untranslated (#1459).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (k NUMBER, s VARCHAR2(20))')
+        out = self.cur.var(int)
+        self.cur.execute(
+            'DECLARE t NUMBER; BEGIN t := :a * 2; :b := t + 1; END;', [20, out]
+        )
+        self.assertEqual(out.getvalue(), 41)
+        returned = self.cur.var(seerdb.NUMBER)
+        for _ in range(3):
+            self.cur.execute(
+                'DECLARE i NUMBER; BEGIN '
+                f'SELECT NVL(COUNT(*), 0) + 1 INTO i FROM {self.TABLE}; '
+                f"INSERT INTO {self.TABLE} VALUES (i, 'r' || i) RETURNING k INTO :o; END;",
+                [returned],
+            )
+        self.assertEqual(returned.getvalue(), 3)
+        length = self.cur.var(int)
+        self.cur.execute(
+            'DECLARE t VARCHAR2(20000); BEGIN t := :big; :n := LENGTH(t); END;',
+            ['X' * 3000, length],
+        )
+        self.assertEqual(length.getvalue(), 3000)
 
     def test_integer_and_smallint_are_number_38(self):
         # INTEGER, INT and SMALLINT are NUMBER(38): 20 digits fit, and the

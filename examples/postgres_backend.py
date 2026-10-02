@@ -190,6 +190,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_CHAR,
     TNS_TYPE_CLOB,
     TNS_TYPE_DATE,
+    TNS_TYPE_INT,
     TNS_TYPE_INTERVALDS,
     TNS_TYPE_INTERVALYM,
     TNS_TYPE_LONG,
@@ -3713,32 +3714,90 @@ def _replace_binds(sql: str, replacement: dict[str, str]) -> str:
     return ''.join(out)
 
 
-# The setting a cursor block leaves each REF CURSOR bind's portal name in (#1300).
-_CURSOR_BLOCK_SETTING = 'mirror.refcursor_{}'
+# The setting a block leaves each bind's value in, read back after it (#1456, #1459).
+_BLOCK_BIND_SETTING = 'mirror.block_bind_{}'
 
 
-def _cursor_block(sql: str, cursors: dict[str, int], literals: dict[str, str]) -> str:
-    """An anonymous block with REF CURSOR binds, as a PostgreSQL DO block (#1300).
+def _bind_block(sql: str, locals_: dict[str, tuple[int, str, str]]) -> str:
+    """An anonymous block with binds, as a PostgreSQL DO block (#1456, #1459).
 
-    Each REF CURSOR bind becomes a local refcursor the block OPENs or assigns,
-    and before the block ends it leaves the cursor's portal name in a setting
-    the backend reads back -- a DO block returns nothing. Every other bind is
-    inlined as the literal `literals` gives it, a DO block taking no parameters.
+    A DO block takes no parameters and returns nothing, so each bind becomes a
+    local of the block -- `locals_` maps its name to (slot, PostgreSQL type,
+    initial literal) -- and before the block ends it leaves each local's value
+    in a setting the backend reads back: '' for NULL, else 'v' and the text. A
+    REF CURSOR's value is its portal name.
     """
-    names = {name: f'mirror_refcursor_{slot}' for name, slot in cursors.items()}
-    match = _ANON_BLOCK.match(_replace_binds(sql, {**literals, **names}))
+    names = {name: f'mirror_bind_{slot}' for name, (slot, _t, _i) in locals_.items()}
+    match = _ANON_BLOCK.match(_replace_binds(sql, names))
     if match is None:
-        raise UnsupportedFeature('a REF CURSOR bind outside a BEGIN ... END block')
+        raise UnsupportedFeature('a bind outside a BEGIN ... END block')
     declare_part, body = match.groups()
     declare = (declare_part or 'DECLARE ') + ''.join(
-        f' {variable} refcursor;' for variable in names.values()
+        f' {names[name]} {pg_type} := {initial};'
+        for name, (_slot, pg_type, initial) in locals_.items()
     )
     keep = ''.join(
-        f" PERFORM set_config('{_CURSOR_BLOCK_SETTING.format(slot)}', "
-        f"coalesce({names[name]}::text, ''), true);"
-        for name, slot in cursors.items()
+        f" PERFORM set_config('{_BLOCK_BIND_SETTING.format(slot)}', "
+        f"CASE WHEN {names[name]} IS NULL THEN '' ELSE 'v' || {names[name]}::text END, "
+        'true);'
+        for name, (slot, _t, _i) in locals_.items()
     )
     return _translate_plsql_block(f'{declare} BEGIN {body.rstrip()}{keep} END;')
+
+
+# The PostgreSQL type a block's bind local takes, by the bind's declared type.
+_BLOCK_BIND_TYPES = {
+    TNS_TYPE_NUMBER: 'numeric',
+    TNS_TYPE_INT: 'numeric',
+    TNS_TYPE_VARCHAR: 'text',
+    TNS_TYPE_CHAR: 'text',
+    TNS_TYPE_LONG: 'text',
+    TNS_TYPE_RAW: 'bytea',
+    TNS_TYPE_LONGRAW: 'bytea',
+    TNS_TYPE_DATE: 'timestamp(0)',
+    TNS_TYPE_TIMESTAMP: 'timestamp',
+    TNS_TYPE_BFLOAT: 'double precision',
+    TNS_TYPE_BDOUBLE: 'double precision',
+    TNS_TYPE_BOOLEAN: 'boolean',
+    TNS_TYPE_REFCURSOR: 'refcursor',
+}
+
+
+def _block_bind_type(bind: object) -> str:
+    # A bind's local type: its declared type's, else its value's.
+    if isinstance(bind, BindVar):
+        declared = _BLOCK_BIND_TYPES.get(bind.tns_type)
+        if declared is not None:
+            return declared
+        bind = bind.value
+    if isinstance(bind, bool):
+        return 'boolean'
+    if isinstance(bind, (int, decimal.Decimal)):
+        return 'numeric'
+    if isinstance(bind, float):
+        return 'double precision'
+    if isinstance(bind, (bytes, bytearray)):
+        return 'bytea'
+    if isinstance(bind, datetime.datetime):
+        return 'timestamp'
+    if isinstance(bind, datetime.date):
+        return 'timestamp(0)'
+    return 'text'
+
+
+def _block_bind_value(pg_type: str, text: str) -> object:
+    # A bind local's value from its text form (the setting carries text).
+    if pg_type == 'numeric':
+        return decimal.Decimal(text)
+    if pg_type == 'double precision':
+        return float(text)
+    if pg_type == 'bytea':
+        return bytes.fromhex(text[2:])
+    if pg_type.startswith('timestamp'):
+        return datetime.datetime.fromisoformat(text)
+    if pg_type == 'boolean':
+        return text == 'true'
+    return text
 
 
 def _translate_plsql_block(sql: str) -> str:
@@ -6912,10 +6971,12 @@ class PostgresBackend:
             proc = _PROC_CALL.match(statement)
             if proc is not None:
                 return self._call_procedure(proc, values, sql)
-            # Not a call: a block that opens a REF CURSOR into a bind (#1300).
-            cursor_block = self._run_cursor_block(sql, binds)
-            if cursor_block is not None:
-                return cursor_block
+            # Not a call: a block that opens a REF CURSOR into a bind (#1456).
+            if any(
+                isinstance(b, BindVar) and b.tns_type == TNS_TYPE_REFCURSOR
+                for b in binds
+            ):
+                return self._run_block(sql, binds)
             assignments = _parse_out_assignments(statement)
             if assignments is not None:
                 return self._eval_out_assignments(statement, assignments, binds, values)
@@ -6926,8 +6987,12 @@ class PostgresBackend:
                 # A block wrapping DML (BEGIN INSERT/UPDATE/DELETE …(:x); END) —
                 # unwrap and run the inner statement with the binds.
                 return self._run_block_statement(statement, values)
-            # Not a shape we model — run it as-is (best effort) so a
-            # side-effecting block still executes.
+            # Not a shape the call paths model: a block, its binds its locals
+            # (#1459).
+            if _ANON_BLOCK.match(sql):
+                return self._run_block(sql, binds)
+            # Anything else runs as it is (best effort) so a side-effecting
+            # statement still executes.
             self._conn.cursor().execute(_translate_idioms(sql))
             return Result(out_binds=values)
         except psycopg.Error as exc:
@@ -7053,45 +7118,45 @@ class PostgresBackend:
                 decoded.append(_wire_cell(value, desc.type_code, self._tstz_oid))
         return decoded
 
-    def _run_cursor_block(self, sql: str, binds: Sequence) -> Result | None:
-        # An anonymous block with a REF CURSOR bind: `OPEN :c FOR ...`, or a local
-        # cursor assigned to one (#1300). The block runs as a DO block with each
-        # cursor bind a local refcursor, and each portal it opened is drained into
-        # the bind, as a routine's REF CURSOR OUT is (#518). A cursor the block
-        # never opened comes back None. None when the block has no cursor bind.
+    def _run_block(self, sql: str, binds: Sequence) -> Result:
+        # An anonymous block of no shape the call paths model, with its binds: a
+        # DECLARE block assigning one, a SELECT ... INTO or RETURNING ... INTO
+        # one, a cursor opened into one (#1456, #1459). It runs as a DO block
+        # whose locals stand for the binds, each initialised with the bind's
+        # value; every bind comes back with the value its local ended with, a
+        # REF CURSOR's portal drained into it as a routine's is (#518) -- None
+        # for a cursor the block never opened.
         names = _bind_names(sql)
-        cursors = {
-            name: slot
-            for slot, (name, bind) in enumerate(zip(names, binds))
-            if isinstance(bind, BindVar) and bind.tns_type == TNS_TYPE_REFCURSOR
-        }
-        if not cursors:
-            return None
+        locals_: dict[str, tuple[int, str, str]] = {}
+        for slot, (name, bind) in enumerate(zip(names, binds)):
+            pg_type = _block_bind_type(bind)
+            value = bind.value if isinstance(bind, BindVar) else bind
+            initial = (
+                'NULL'
+                if pg_type == 'refcursor' or value is None
+                else psycopg.sql.Literal(value).as_string(self._conn)
+            )
+            if '$$' in initial:  # it would end the DO block's quoting
+                raise UnsupportedFeature('a bind value holding $$ in a PL/SQL block')
+            locals_[name] = (slot, pg_type, initial)
+        self._conn.execute(_translate_idioms(_bind_block(sql, locals_)))
         values = [b.value if isinstance(b, BindVar) else b for b in binds]
-        literals = {}
-        for name, value in zip(names, values):
-            if name not in cursors:
-                literal = psycopg.sql.Literal(value).as_string(self._conn)
-                if '$$' in literal:  # it would end the DO block's quoting
-                    raise UnsupportedFeature(
-                        'a bind value holding $$ in a cursor block'
-                    )
-                literals[name] = literal
-        block = _translate_idioms(_cursor_block(sql, cursors, literals))
-        self._conn.execute(block)
-        for slot in cursors.values():
+        for slot, pg_type, _initial in locals_.values():
             row = self._conn.execute(
-                'SELECT current_setting(%s, true)',
-                (_CURSOR_BLOCK_SETTING.format(slot),),
+                'SELECT current_setting(%s, true)', (_BLOCK_BIND_SETTING.format(slot),)
             ).fetchone()
-            portal = row[0] if row else None
-            if (
-                portal
+            text = row[0][1:] if row and row[0] else None
+            if pg_type != 'refcursor':
+                values[slot] = (
+                    None if text is None else _block_bind_value(pg_type, text)
+                )
+            elif (
+                text
                 and self._conn.execute(
-                    'SELECT 1 FROM pg_cursors WHERE name = %s', (portal,)
+                    'SELECT 1 FROM pg_cursors WHERE name = %s', (text,)
                 ).fetchone()
             ):
-                values[slot] = self._drain_refcursor(portal)
+                values[slot] = self._drain_refcursor(text)
             else:
                 values[slot] = None  # the block never opened it
         return Result(out_binds=values)
