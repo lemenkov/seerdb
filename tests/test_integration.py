@@ -1344,6 +1344,28 @@ class TypesIntegration(_IntegrationBase):
             [tuple(d)[4:6] for d in self.cur.description][:2], [(38, 0), (38, 2)]
         )
 
+    def test_gettype_of_a_tables_rowtype(self):
+        # `gettype('T%ROWTYPE')` describes a table's record type: its columns, in
+        # order, as the attributes, any case and qualified or not. It used to be
+        # 'not found' on every server (#1476). Its OID, which a bind of the record
+        # needs, only DBMS_PICKLER gives, from 12.1.
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (n NUMBER, s VARCHAR2(20), d DATE)'
+        )
+        typ = self.conn.gettype(f'{self.TABLE.lower()}%rowtype')
+        self.assertEqual(typ.name, f'{self.TABLE}%ROWTYPE')
+        self.assertEqual(typ.attr_names, ['N', 'S', 'D'])
+        self.assertEqual(
+            self.conn.gettype(f'{typ.schema}.{self.TABLE}%ROWTYPE').attr_names,
+            ['N', 'S', 'D'],
+        )
+        if (self.conn.server_version >> 24) >= 12:
+            self.assertEqual(len(typ.oid), 16)
+        record = typ.newobject({'s': 'x'})
+        self.assertEqual((record.N, record.S, record.D), (None, 'x', None))
+        with self.assertRaises(seerdb.DatabaseError):
+            self.conn.gettype('NO_SUCH_TABLE_AT_ALL%ROWTYPE')
+
     def test_char_length_is_zero_for_a_type_without_one(self):
         # USER_TAB_COLUMNS.CHAR_LENGTH is a character column's declared length
         # and 0 for any other type, never NULL. The Mirror over PostgreSQL gave
@@ -11008,6 +11030,19 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                         )
                 finally:
                     await Cur.execute('DROP TABLE PYORACLE_ASYNC_NS')
+
+    async def test_async_gettype_of_a_tables_rowtype(self):
+        # The async gettype resolves `T%ROWTYPE` as the sync one does (#1476).
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await Cur.execute(
+                    'CREATE TABLE PYORACLE_ASYNC_RT (n NUMBER, s VARCHAR2(5))'
+                )
+                try:
+                    typ = await Conn.gettype('PYORACLE_ASYNC_RT%ROWTYPE')
+                    self.assertEqual(typ.attr_names, ['N', 'S'])
+                finally:
+                    await Cur.execute('DROP TABLE PYORACLE_ASYNC_RT')
 
     async def test_async_callproc_refcursor(self):
         async with await seerdb.connect_async(**self._kwargs()) as Conn:

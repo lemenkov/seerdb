@@ -689,6 +689,57 @@ def _reject_cqn() -> None:
 # could).
 _CURRENT_SCHEMA_SQL = "SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual"
 
+# A table's record type, `T%ROWTYPE` (#1476). No type dictionary lists one: its
+# attributes are the table's visible columns, and only DBMS_PICKLER knows its
+# OID, which a bind of the record carries -- from 12.1, so an older server's
+# record describes but has no OID. The binds are named as python-oracledb
+# names them in the same call, which is what the Mirror answers.
+_ROWTYPE_SUFFIX = '%ROWTYPE'
+# ALL_TAB_COLUMNS lists no hidden system column, and an INVISIBLE one -- no
+# attribute of the record either -- has no COLUMN_ID. ALL_TAB_COLS, which says
+# HIDDEN_COLUMN, is 9i+.
+_ROWTYPE_COLUMNS_SQL = (
+    'SELECT column_name, data_type, data_type_owner FROM all_tab_columns '
+    'WHERE owner = :1 AND table_name = :2 AND column_id IS NOT NULL '
+    'ORDER BY column_id'
+)
+_ROWTYPE_OID_SQL = (
+    'DECLARE i VARCHAR2(3); o VARCHAR2(128); n VARCHAR2(128); s SYS_REFCURSOR; '
+    'BEGIN :ret_val := dbms_pickler.get_type_shape(:full_name, :oid, :version, '
+    ':tds, i, o, n, :attrs_rc, s); END;'
+)
+# The column types whose values are in the national character set.
+_NATIONAL_COLUMN_TYPES = frozenset({'NVARCHAR2', 'NCHAR', 'NCLOB'})
+
+
+def _rowtype_name(name: str) -> tuple[str | None, str] | None:
+    # (schema or None, table) of a `[SCHEMA.]TABLE%ROWTYPE` name, else None.
+    if not name.upper().endswith(_ROWTYPE_SUFFIX):
+        return None
+    Parts = [
+        _normalise_type_part(P) for P in _split_type_name(name[: -len(_ROWTYPE_SUFFIX)])
+    ]
+    if len(Parts) == 1:
+        return (None, Parts[0])
+    if len(Parts) == 2:
+        return (Parts[0], Parts[1])
+    return None
+
+
+def _rowtype_attr(column_name: str, data_type: str) -> dict:
+    # A %ROWTYPE attribute from its column: the column's name and type, the
+    # charset a national one takes in an object image.
+    from seerdb.common.dbobject import national_charset, type_name_to_tns
+
+    return {
+        'name': column_name,
+        'type_name': data_type,
+        'data_type': type_name_to_tns(data_type),
+        'charset': national_charset(
+            'NCHAR_CS' if data_type in _NATIONAL_COLUMN_TYPES else None
+        ),
+    }
+
 
 class OracleConnect(_ConnectionLogic):
     def __init__(
@@ -2012,12 +2063,15 @@ class OracleConnect(_ConnectionLogic):
 
         ``name`` is the type name, optionally schema-qualified
         (``'ADDR_T'`` or ``'PYO.ADDR_T'``); an unqualified name resolves in the
-        current schema. Use ``newobject()`` on the result to build a value to
+        current schema. A table's record type is ``'T%ROWTYPE'`` (12.1+). Use ``newobject()`` on the result to build a value to
         bind (#116). oracledb-compatible.
         """
+        RowType = _rowtype_name(name)
         Parts = [_normalise_type_part(P) for P in _split_type_name(name)]
         Typ = None
-        if len(Parts) == 3:
+        if RowType is not None:
+            Typ = self._describe_rowtype(*RowType)
+        elif len(Parts) == 3:
             # OWNER.PACKAGE.TYPE — only a PL/SQL package type has three parts.
             Typ = self._describe_plsql_type(*Parts)
         elif len(Parts) == 2:
@@ -2109,6 +2163,64 @@ class OracleConnect(_ConnectionLogic):
         Typ = DbObjectType(Owner, name, Oid, 1, Attrs, **CollKW)
         self._object_type_cache[Key] = Typ
         return Typ
+
+    def _describe_rowtype(
+        self, schema: str | None, table: str
+    ) -> 'DbObjectType | None':
+        # A table's `T%ROWTYPE` record type (#1476): its visible columns, in
+        # order, as the attributes; an object or collection column describes
+        # through the ordinary path. None for a table the session cannot see.
+        from seerdb.common.dbobject import DbObjectType
+
+        Owner = schema or self._current_schema_owner()
+        if not Owner or not table:
+            return None
+        Name = table + _ROWTYPE_SUFFIX
+        Key = (Owner, Name)
+        Cached = self._object_type_cache.get(Key)
+        if Cached is not None:
+            return Cached
+        Rows = self._rows(self.execute(_ROWTYPE_COLUMNS_SQL, Bind=[Owner, table]))
+        if not Rows:
+            return None
+        Attrs = []
+        for ColumnName, DataType, TypeOwner in Rows:
+            Attr = _rowtype_attr(ColumnName, DataType)
+            if TypeOwner:
+                Attr['object_type'] = self._describe_object_type(TypeOwner, DataType)
+            Attrs.append(Attr)
+        Typ = DbObjectType(Owner, Name, self._rowtype_oid(f'{Owner}.{Name}'), 1, Attrs)
+        self._object_type_cache[Key] = Typ
+        return Typ
+
+    def _rowtype_oid(self, full_name: str) -> bytes:
+        # The record type's OID, which only DBMS_PICKLER reports for a
+        # %ROWTYPE; b'' where it has none to give, which leaves the type
+        # describable but not bindable.
+        from seerdb.common.datatypes import DB_TYPE_BINARY_INTEGER, DB_TYPE_CURSOR
+        from seerdb.common.exceptions import DatabaseError
+
+        Cur = self.cursor()
+        try:
+            FullName = Cur.var(str)
+            FullName.setvalue(0, full_name)
+            Oid = Cur.var(bytes)
+            Cur.execute(
+                _ROWTYPE_OID_SQL,
+                {
+                    'ret_val': Cur.var(DB_TYPE_BINARY_INTEGER),
+                    'full_name': FullName,
+                    'oid': Oid,
+                    'version': Cur.var(DB_TYPE_BINARY_INTEGER),
+                    'tds': Cur.var(bytes),
+                    'attrs_rc': Cur.var(DB_TYPE_CURSOR),
+                },
+            )
+            return bytes(Oid.getvalue() or b'')
+        except DatabaseError:
+            return b''
+        finally:
+            Cur.close()
 
     def _describe_plsql_type(
         self, schema: str | None, package: str, name: str
