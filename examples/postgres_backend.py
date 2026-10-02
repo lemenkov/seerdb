@@ -3702,11 +3702,14 @@ def _reject_unsupported_ddl_types(sql: str) -> None:
 
 # Oracle `CREATE [OR REPLACE] PROCEDURE|FUNCTION name (params) [RETURN t] AS|IS
 # <body>`. The signature is close to PostgreSQL's; the body (BEGIN … END) is
-# valid PL/pgSQL for the simple assignment / RETURN cases the suite uses.
-_ROUTINE_DDL = re.compile(
+# valid PL/pgSQL for the simple assignment / RETURN cases the suite uses. The
+# parameter list ends at the parenthesis matching its opening one, found apart
+# from the pattern: a greedy `\((.*)\)` ran on to the last `) AS` of the BODY --
+# `count(*) AS n` -- and split the routine there (#1467).
+_ROUTINE_HEAD = re.compile(
     r'(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(PROCEDURE|FUNCTION)\s+([\w.]+)\s*'
-    r'(?:\((.*)\)\s*)?(?:RETURN\s+([\w ]+?)\s+)?(?:AS|IS)\s+(.*?)\s*;?\s*$'
 )
+_ROUTINE_TAIL = re.compile(r'(?is)\s*(?:RETURN\s+([\w ]+?)\s+)?(?:AS|IS)\s+(.*?)\s*;?\s*$')
 # Oracle parameter direction `IN OUT` → PostgreSQL `INOUT` (do this before the
 # type rewrites, which share the DDL type list).
 _PARAM_IN_OUT = re.compile(r'\bIN\s+OUT\b', re.IGNORECASE)
@@ -3723,10 +3726,18 @@ def _translate_routine_ddl(sql: str) -> str:
     routine (#503): translate the parameter types + ``IN OUT`` → ``INOUT``, map
     ``RETURN t`` → ``RETURNS t``, and wrap the ``BEGIN … END`` body as a
     ``LANGUAGE plpgsql`` dollar-quoted body. Non-routine SQL is unchanged."""
-    match = _ROUTINE_DDL.match(sql)
-    if match is None:
+    head = _ROUTINE_HEAD.match(sql)
+    if head is None:
         return sql
-    kind, name, params, return_type, body = match.groups()
+    kind, name = head.groups()
+    params, rest = None, head.end()
+    if sql.startswith('(', rest):
+        close = _matching_paren(sql, rest)
+        params, rest = sql[rest + 1 : close], close + 1
+    tail = _ROUTINE_TAIL.match(sql, rest)
+    if tail is None:
+        return sql
+    return_type, body = tail.groups()
     # Oracle allows a routine with no parameters to omit the list entirely
     # (FUNCTION f RETURN NUMBER AS …); PostgreSQL always needs the parentheses, so
     # an absent list (params is None) becomes an empty one (#530).
