@@ -2602,7 +2602,10 @@ value per OUT / IN OUT bind **in bind order** (IN binds contribute nothing):
   both have to recurse, or the inner result set reaches the row encoder as a raw
   value. seerdb parks them on every path that runs a statement fresh — the
   query, the re-execute and the scroll open — because the remainder a query parks
-  is served later from the same converted rows.
+  is served later from the same converted rows. A **REF CURSOR OUT bind** is one
+  more such path: its rows can hold a `CURSOR(...)` column too (`OPEN rc FOR
+  SELECT ..., CURSOR(...)`), and parking only the REF CURSOR itself let the inner
+  result set reach the row encoder when the client drained it (#1465).
 
   **Fetching one: an `OALL8` on the cursor id, not `TTI_FETCH` (#1462).** A
   cursor the client holds no SQL for (a nested cursor, a REF CURSOR) is fetched

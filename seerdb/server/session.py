@@ -3227,7 +3227,10 @@ def _out_bind_entries(
             if not value.columns:
                 entries.append(RefCursorOutBind(columns=[], cursor_id=0))
                 continue
-            cursor_id = cursors.open(value.columns, list(value.rows))
+            # Its rows may hold cursors of their own -- a CURSOR(...) column --
+            # each needing a parked cursor before the rows can be served (#1465).
+            rows = _park_nested_cursors(list(value.rows), value.columns, cursors)
+            cursor_id = cursors.open(value.columns, rows)
             entries.append(RefCursorOutBind(columns=value.columns, cursor_id=cursor_id))
         elif capacity:
             entries.append(
