@@ -1976,7 +1976,7 @@ and which one a client sends is fixed for the life of its connection:
 | --- | --- | --- |
 | scalar slots | `ub8` | `ub4` |
 | cursor id (`ub4`) | 7 | 7 |
-| 3x SQL byte length (`ub4`) | 19 | 19 |
+| SQL length (`ub4`), see below | 19 | 19 |
 | second indicator | 27 | 23 |
 | bind count (`ub4`) | 83 | 71 |
 | SQL text | 196 | 176 |
@@ -1985,7 +1985,15 @@ Five slots shrink from 8 bytes to 4, so the narrow preamble is **20 bytes
 shorter** overall — but they are spread through the header, so each field behind
 them moves by a **different** amount, the running total of the slots ahead of it:
 the second indicator by 4, the bind count by 12, the SQL text by the full 20.
-The cursor id and the SQL length sit ahead of all five and do not move. The
+The cursor id and the SQL length sit ahead of all five and do not move.
+
+**The SQL length depends on the client's character set** (#1427). A client in
+AL32UTF8, the database's own, declares the SQL's byte length. One in any other
+set (UTF8, US7ASCII, the unset default) declares **three times** it, a conversion
+buffer's worth. Measured with sqlplus 23.26 on `select 1 from dual`: `0x12` with
+`NLS_LANG=…AL32UTF8`, `0x36` with `…UTF8`. The ub1 prefix before the text is the
+byte length either way. A server that always divides by three rejected every
+AL32UTF8 statement, and sqlplus failed each one with SP2-0642. The
 indicators stay 8 bytes wide in both, and that is what makes the two forms
 tellable apart on the wire: the second indicator is at 27 in the wide form and 23
 in the narrow one, and the two cannot both hold (the pattern starts `FE` and
