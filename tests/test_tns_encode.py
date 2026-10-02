@@ -3116,6 +3116,34 @@ class TestTnsCommandEncodersDict(unittest.TestCase):
         self.assertIn('028061', Hex)  # FETCH|EXECUTE|PARSE
         self.assertTrue(Hex.endswith('0280820101010100'))
 
+    def test_exec_fetch_only_on_a_cursor_id(self):
+        # A fetch from a nested cursor or a REF CURSOR (#1462): an OALL8 on its
+        # id with no SQL, FETCH only (0x8040, EXECUTE cleared), as oracledb-thin
+        # and OCI send it. Byte-for-byte against the call a live 11g answered
+        # with the nested cursor's rows and their inner cursors' describes.
+        from seerdb.common.tns_consts import FIELD_VERSION_11_2
+
+        Hex = encode_dictionary(
+            {
+                'type': DictionaryType.exec,
+                'seq': 9,
+                'field_version': FIELD_VERSION_11_2,
+                'env': {'user': 'pyo'},
+                'query': self._scroll_query(
+                    fetch=100,
+                    server_version=0x0B200200,
+                    cursor=2,
+                    scrollable=None,
+                    fetch_only=True,
+                ),
+            }
+        ).hex()
+        self.assertEqual(
+            Hex,
+            '035e090280400102000001010d0000000164047fffffff000000000000000000'
+            '0000010000000000000164000000000001010000000000',
+        )
+
     def test_exec_scroll_reexecute(self):
         # Scroll re-execute (#181): open cursor (id 100), empty query, ABSOLUTE 5.
         # Two things differ from the open: the exec options are 0x8040
