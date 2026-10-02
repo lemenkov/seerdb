@@ -197,6 +197,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_NUMBER,
     TNS_TYPE_RAW,
     TNS_TYPE_REF,
+    TNS_TYPE_REFCURSOR,
     TNS_TYPE_TIMESTAMP,
     TNS_TYPE_TIMESTAMPLTZ,
     TNS_TYPE_TIMESTAMPTZ,
@@ -3671,6 +3672,75 @@ def _translate_routine_ddl(sql: str) -> str:
 _ANON_BLOCK = re.compile(r'(?is)^\s*(DECLARE\b.*?\s)?BEGIN\b(.*)\bEND\s*;?\s*$')
 
 
+def _bind_names(sql: str) -> list[str]:
+    # The distinct bind names of `sql` in first-appearance order -- the order the
+    # binds arrive in -- past string literals and quoted identifiers.
+    names: list[str] = []
+    out: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        if sql[i] in ("'", '"'):
+            i = _copy_quoted_region(sql, i, out)
+            continue
+        match = _BIND_REF.match(sql, i)
+        if match is not None and (i == 0 or sql[i - 1] != ':'):
+            name = _bind_name(match)
+            if name not in names:
+                names.append(name)
+            i = match.end()
+            continue
+        i += 1
+    return names
+
+
+def _replace_binds(sql: str, replacement: dict[str, str]) -> str:
+    # `sql` with each bind named in `replacement` replaced by its text, past
+    # string literals and quoted identifiers.
+    out: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        if sql[i] in ("'", '"'):
+            i = _copy_quoted_region(sql, i, out)
+            continue
+        match = _BIND_REF.match(sql, i)
+        if match is not None and (i == 0 or sql[i - 1] != ':'):
+            name = _bind_name(match)
+            out.append(replacement.get(name, match.group(0)))
+            i = match.end()
+            continue
+        out.append(sql[i])
+        i += 1
+    return ''.join(out)
+
+
+# The setting a cursor block leaves each REF CURSOR bind's portal name in (#1300).
+_CURSOR_BLOCK_SETTING = 'mirror.refcursor_{}'
+
+
+def _cursor_block(sql: str, cursors: dict[str, int], literals: dict[str, str]) -> str:
+    """An anonymous block with REF CURSOR binds, as a PostgreSQL DO block (#1300).
+
+    Each REF CURSOR bind becomes a local refcursor the block OPENs or assigns,
+    and before the block ends it leaves the cursor's portal name in a setting
+    the backend reads back -- a DO block returns nothing. Every other bind is
+    inlined as the literal `literals` gives it, a DO block taking no parameters.
+    """
+    names = {name: f'mirror_refcursor_{slot}' for name, slot in cursors.items()}
+    match = _ANON_BLOCK.match(_replace_binds(sql, {**literals, **names}))
+    if match is None:
+        raise UnsupportedFeature('a REF CURSOR bind outside a BEGIN ... END block')
+    declare_part, body = match.groups()
+    declare = (declare_part or 'DECLARE ') + ''.join(
+        f' {variable} refcursor;' for variable in names.values()
+    )
+    keep = ''.join(
+        f" PERFORM set_config('{_CURSOR_BLOCK_SETTING.format(slot)}', "
+        f"coalesce({names[name]}::text, ''), true);"
+        for name, slot in cursors.items()
+    )
+    return _translate_plsql_block(f'{declare} BEGIN {body.rstrip()}{keep} END;')
+
+
 def _translate_plsql_block(sql: str) -> str:
     """Wrap an anonymous DECLARE/BEGIN … END block as a PostgreSQL ``DO $$ … $$``
     block, mapping the declared local types (#533). Non-block SQL is unchanged."""
@@ -6842,6 +6912,10 @@ class PostgresBackend:
             proc = _PROC_CALL.match(statement)
             if proc is not None:
                 return self._call_procedure(proc, values, sql)
+            # Not a call: a block that opens a REF CURSOR into a bind (#1300).
+            cursor_block = self._run_cursor_block(sql, binds)
+            if cursor_block is not None:
+                return cursor_block
             assignments = _parse_out_assignments(statement)
             if assignments is not None:
                 return self._eval_out_assignments(statement, assignments, binds, values)
@@ -6979,6 +7053,49 @@ class PostgresBackend:
                 decoded.append(_wire_cell(value, desc.type_code, self._tstz_oid))
         return decoded
 
+    def _run_cursor_block(self, sql: str, binds: Sequence) -> Result | None:
+        # An anonymous block with a REF CURSOR bind: `OPEN :c FOR ...`, or a local
+        # cursor assigned to one (#1300). The block runs as a DO block with each
+        # cursor bind a local refcursor, and each portal it opened is drained into
+        # the bind, as a routine's REF CURSOR OUT is (#518). A cursor the block
+        # never opened comes back None. None when the block has no cursor bind.
+        names = _bind_names(sql)
+        cursors = {
+            name: slot
+            for slot, (name, bind) in enumerate(zip(names, binds))
+            if isinstance(bind, BindVar) and bind.tns_type == TNS_TYPE_REFCURSOR
+        }
+        if not cursors:
+            return None
+        values = [b.value if isinstance(b, BindVar) else b for b in binds]
+        literals = {}
+        for name, value in zip(names, values):
+            if name not in cursors:
+                literal = psycopg.sql.Literal(value).as_string(self._conn)
+                if '$$' in literal:  # it would end the DO block's quoting
+                    raise UnsupportedFeature(
+                        'a bind value holding $$ in a cursor block'
+                    )
+                literals[name] = literal
+        block = _translate_idioms(_cursor_block(sql, cursors, literals))
+        self._conn.execute(block)
+        for slot in cursors.values():
+            row = self._conn.execute(
+                'SELECT current_setting(%s, true)',
+                (_CURSOR_BLOCK_SETTING.format(slot),),
+            ).fetchone()
+            portal = row[0] if row else None
+            if (
+                portal
+                and self._conn.execute(
+                    'SELECT 1 FROM pg_cursors WHERE name = %s', (portal,)
+                ).fetchone()
+            ):
+                values[slot] = self._drain_refcursor(portal)
+            else:
+                values[slot] = None  # the block never opened it
+        return Result(out_binds=values)
+
     def _drain_refcursor(self, portal: str) -> CursorResult:
         # A REF CURSOR OUT bind: the routine OPENed a portal, whose name the CALL
         # returned. Fetch all its rows (still inside this transaction) and hand them
@@ -6987,6 +7104,9 @@ class PostgresBackend:
         fetch = self._conn.cursor()
         fetch.execute(sql.SQL('FETCH ALL FROM {}').format(sql.Identifier(portal)))
         rows = [list(r) for r in fetch.fetchall()]
+        # Drained, so close it: an open portal holds its tables, and PostgreSQL
+        # refuses DDL on them in this session ("being used by active queries").
+        self._conn.execute(sql.SQL('CLOSE {}').format(sql.Identifier(portal)))
         for i, desc in enumerate(fetch.description or ()):
             if desc.type_code in (self._tstz_oid, _TIMESTAMPTZ_OID):
                 for row in rows:

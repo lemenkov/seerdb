@@ -1361,6 +1361,32 @@ class TypesIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.fetchall(), [('N', 0), ('V', 20), ('D', 0)])
 
+    def test_a_block_opens_a_refcursor_into_a_bind(self):
+        # An anonymous block opens a REF CURSOR into a bind -- `OPEN :c FOR`, its
+        # query taking IN binds of its own -- or assigns a local cursor to one.
+        # The Mirror over PostgreSQL ran neither: a block is a DO block there,
+        # which returns nothing (#1300).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (k NUMBER, s VARCHAR2(10))')
+        for k in range(1, 7):
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', [k, f's{k}'])
+        out = self.cur.var(seerdb.DB_TYPE_CURSOR)
+        self.cur.execute(
+            f'BEGIN OPEN :c FOR SELECT k, s FROM {self.TABLE} '
+            'WHERE k BETWEEN :a AND :b ORDER BY k; END;',
+            [out, 2, 4],
+        )
+        self.assertEqual(
+            [tuple(r) for r in out.getvalue().fetchall()],
+            [(2, 's2'), (3, 's3'), (4, 's4')],
+        )
+        out = self.cur.var(seerdb.DB_TYPE_CURSOR)
+        self.cur.execute(
+            'DECLARE t SYS_REFCURSOR; BEGIN '
+            f'OPEN t FOR SELECT s FROM {self.TABLE} WHERE k = :k; :c := t; END;',
+            [5, out],
+        )
+        self.assertEqual([tuple(r) for r in out.getvalue().fetchall()], [('s5',)])
+
     def test_integer_and_smallint_are_number_38(self):
         # INTEGER, INT and SMALLINT are NUMBER(38): 20 digits fit, and the
         # columns describe as NUMBER(38,0). A SMALLINT parameter takes an
