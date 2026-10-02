@@ -8089,6 +8089,15 @@ class CollectionTypeIntegration(_IntegrationBase):
         )
         self.assertEqual((v2.aslist(), w2), ([], None))
 
+    def test_a_collection_value_from_a_constructor_in_the_select_list(self):
+        # A constructor computed in the select list, not read from a column. The
+        # Mirror over PostgreSQL described it by its domain's base type, a bare
+        # numeric array, and refused it as an unsupported type (#1473).
+        self.cur.execute(f'SELECT {self.NUMS}(5, 10, 15), {self.NUMS}(7) c FROM dual')
+        ((three, one),) = self.cur.fetchall()
+        self.assertEqual([int(x) for x in three.aslist()], [5, 10, 15])
+        self.assertEqual([int(x) for x in one.aslist()], [7])
+
     def test_a_collection_value_from_a_one_element_constructor(self):
         # A constructor with one string literal builds a one-element collection,
         # a national literal too. The Mirror over PostgreSQL read `t('a')` as a
