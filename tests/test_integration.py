@@ -1394,6 +1394,21 @@ class TypesIntegration(_IntegrationBase):
             ],
         )
 
+    def test_a_literal_select_item_describes_as_char(self):
+        # A string literal in a select list is CHAR of its length, as Oracle
+        # describes it; a CAST to VARCHAR2 stays VARCHAR. The Mirror over
+        # PostgreSQL described every literal as VARCHAR (#1494).
+        self.cur.execute("SELECT 'X' a, 'abc' b, CAST('x' AS VARCHAR2(5)) c FROM dual")
+        self.assertEqual(
+            [(d[1], d[2]) for d in self.cur.description],
+            [
+                (seerdb.DB_TYPE_CHAR, 1),
+                (seerdb.DB_TYPE_CHAR, 3),
+                (seerdb.DB_TYPE_VARCHAR, 5),
+            ],
+        )
+        self.assertEqual(self.cur.fetchall(), [('X', 'abc', 'x')])
+
     def test_char_length_is_zero_for_a_type_without_one(self):
         # USER_TAB_COLUMNS.CHAR_LENGTH is a character column's declared length
         # and 0 for any other type, never NULL. The Mirror over PostgreSQL gave
