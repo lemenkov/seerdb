@@ -3786,6 +3786,48 @@ def test_a_literal_select_item_is_cast_to_its_char_length() -> None:
     )
 
 
+def test_a_compile_time_error_in_a_block_is_ora_06550() -> None:
+    # PostgreSQL's class-42 errors inside a PL/SQL block are compile errors in
+    # Oracle: ORA-06550, "line L, column C:" and the PLS- error, at the position
+    # of what is wrong in the client's block. A string passed positionally where
+    # a routine of that arity takes a number converts at run time: ORA-06502
+    # (#1497).
+    from postgres_backend import _plsql_compile_error
+
+    class Failure(Exception):
+        def __init__(self, sqlstate: str, message: str) -> None:
+            super().__init__(message)
+            self.sqlstate = sqlstate
+
+    unknown = _plsql_compile_error(
+        Failure('42601', '"t_missing" is not a known variable'),
+        'begin t_Missing := 5; end;',
+    )
+    assert (unknown.ora_code, unknown.error_offset) == (6550, 6)
+    assert str(unknown).startswith('line 1, column 7:')
+    assert "PLS-00201: identifier 'T_MISSING' must be declared" in str(unknown)
+    call = 'begin :r := f(:1, :2, :3); end;'
+    too_many = _plsql_compile_error(
+        Failure('42883', 'function f(unknown, integer, integer) does not exist'),
+        call,
+        lambda name: {2},
+    )
+    assert too_many.ora_code == 6550 and 'PLS-00306' in str(too_many)
+    converted = _plsql_compile_error(
+        Failure('42883', 'function f(integer, text) does not exist'),
+        call,
+        lambda name: {2},
+    )
+    assert converted.ora_code == 6502
+    named = _plsql_compile_error(
+        Failure('42883', 'function f(text, a => boolean) does not exist'),
+        call,
+        lambda name: {2},
+    )
+    assert named.ora_code == 6550
+    assert _plsql_compile_error(Failure('22012', 'division by zero'), call) is None
+
+
 def test_raise_application_error_becomes_a_coded_raise() -> None:
     # RAISE_APPLICATION_ERROR raises P0001 with its ORA code as the message's
     # prefix, which the error mapping reads back (#1323); the message may itself
