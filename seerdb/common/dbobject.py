@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import bisect
 import builtins
+import re
 from collections.abc import Callable
 
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
@@ -141,12 +142,13 @@ def national_charset(character_set_name: str | None) -> int | None:
 def type_name_to_tns(name: str | None) -> int | None:
     """TNS data type code for an ALL_TYPE_ATTRS attribute type name (or None).
 
-    TIMESTAMP / INTERVAL names carry a precision suffix (e.g. ``TIMESTAMP(6)``);
-    strip it before the lookup.
+    TIMESTAMP / INTERVAL names carry a precision, wherever the name puts it:
+    ``TIMESTAMP(6)``, ``TIMESTAMP(6) WITH TIME ZONE`` (as a table column names
+    it, #1476), ``INTERVAL DAY(2) TO SECOND(6)``; strip each before the lookup.
     """
     if not name:
         return None
-    Key = name.split('(')[0].strip()
+    Key = ' '.join(re.sub(r'\(\s*\d+\s*\)', ' ', name).split())
     return _TYPE_NAME_TO_TNS.get(Key)
 
 

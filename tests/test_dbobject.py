@@ -364,6 +364,17 @@ class TestTypeNameSplitting(unittest.TestCase):
         self.assertEqual(_split_type_name('PYO.ADDR_T'), ['PYO', 'ADDR_T'])
         self.assertEqual(_split_type_name('PYO.PKG.UDT'), ['PYO', 'PKG', 'UDT'])
 
+    def test_a_rowtype_name_is_its_table_and_schema(self):
+        # `T%ROWTYPE` and `SCHEMA.T%ROWTYPE`, any case, name a table's record
+        # type (#1476); anything else is no record-type name.
+        from seerdb.client.connection import _rowtype_name
+
+        self.assertEqual(_rowtype_name('t%rowtype'), (None, 'T'))
+        self.assertEqual(_rowtype_name('pyo.T%ROWTYPE'), ('PYO', 'T'))
+        self.assertEqual(_rowtype_name('"Mixed"%ROWTYPE'), (None, 'Mixed'))
+        self.assertIsNone(_rowtype_name('PYO.ADDR_T'))
+        self.assertIsNone(_rowtype_name('A.B.C%ROWTYPE'))
+
     def test_a_dot_inside_a_quoted_identifier_is_not_a_separator(self):
         # Oracle allows a quoted identifier to contain a dot; splitting on it
         # would look up a package that does not exist.
@@ -763,6 +774,15 @@ class TestXmlType(unittest.TestCase):
 class TestTypeNameMap(unittest.TestCase):
     def test_known_names(self):
         self.assertEqual(type_name_to_tns('VARCHAR2'), TNS_TYPE_VARCHAR)
+        # A precision inside the name, as a table column spells it (#1476).
+        from seerdb.common.tns_consts import TNS_TYPE_INTERVALDS, TNS_TYPE_TIMESTAMPTZ
+
+        self.assertEqual(
+            type_name_to_tns('TIMESTAMP(6) WITH TIME ZONE'), TNS_TYPE_TIMESTAMPTZ
+        )
+        self.assertEqual(
+            type_name_to_tns('INTERVAL DAY(2) TO SECOND(6)'), TNS_TYPE_INTERVALDS
+        )
         self.assertEqual(type_name_to_tns('NUMBER'), TNS_TYPE_NUMBER)
         self.assertEqual(type_name_to_tns('CHAR'), TNS_TYPE_CHAR)
 

@@ -1427,11 +1427,15 @@ class AsyncOracleConnect(_ConnectionLogic):
         from seerdb.client.connection import (
             _is_described,
             _normalise_type_part,
+            _rowtype_name,
             _split_type_name,
         )
 
+        RowType = _rowtype_name(name)
         Parts = [_normalise_type_part(P) for P in _split_type_name(name)]
-        if len(Parts) == 3:  # OWNER.PACKAGE.TYPE -- a PL/SQL package type
+        if RowType is not None:  # [SCHEMA.]TABLE%ROWTYPE (#1476)
+            Typ = await self._describe_rowtype(*RowType)
+        elif len(Parts) == 3:  # OWNER.PACKAGE.TYPE -- a PL/SQL package type
             Typ = await self._describe_plsql_type(*Parts)
         elif len(Parts) == 2:
             # SCHEMA.TYPE or PACKAGE.TYPE; the schema reading goes first so
@@ -1446,6 +1450,73 @@ class AsyncOracleConnect(_ConnectionLogic):
 
             raise DatabaseError(f'object type {name!r} not found')
         return cast('DbObjectType', Typ)
+
+    async def _describe_rowtype(
+        self, schema: str | None, table: str
+    ) -> 'DbObjectType | None':
+        """Async port of `OracleConnect._describe_rowtype` (#1476): a table's
+        `T%ROWTYPE` record type, its visible columns as the attributes."""
+        from seerdb.client.connection import (
+            _ROWTYPE_COLUMNS_SQL,
+            _ROWTYPE_SUFFIX,
+            _rowtype_attr,
+        )
+        from seerdb.common.dbobject import DbObjectType
+
+        Owner = schema
+        if Owner is None:
+            Rows = self._rows(await self.execute(_CURRENT_SCHEMA_SQL))
+            Owner = Rows[0][0] if Rows else None
+        if not Owner or not table:
+            return None
+        Name = table + _ROWTYPE_SUFFIX
+        Key = (Owner, Name)
+        Cached = self._object_type_cache.get(Key)
+        if Cached is not None:
+            return Cached
+        Rows = self._rows(await self.execute(_ROWTYPE_COLUMNS_SQL, Bind=[Owner, table]))
+        if not Rows:
+            return None
+        Attrs = []
+        for ColumnName, DataType, TypeOwner in Rows:
+            Attr = _rowtype_attr(ColumnName, DataType)
+            if TypeOwner:
+                Attr['object_type'] = await self._describe_object_type(
+                    TypeOwner, DataType
+                )
+            Attrs.append(Attr)
+        Oid = await self._rowtype_oid(f'{Owner}.{Name}')
+        Typ = DbObjectType(Owner, Name, Oid, 1, Attrs)
+        self._object_type_cache[Key] = Typ
+        return Typ
+
+    async def _rowtype_oid(self, full_name: str) -> bytes:
+        """Async port of `OracleConnect._rowtype_oid` (#1476)."""
+        from seerdb.client.connection import _ROWTYPE_OID_SQL
+        from seerdb.common.datatypes import DB_TYPE_BINARY_INTEGER, DB_TYPE_CURSOR
+        from seerdb.common.exceptions import DatabaseError
+
+        Cur = self.cursor()
+        try:
+            FullName = Cur.var(str)
+            FullName.setvalue(0, full_name)
+            Oid = Cur.var(bytes)
+            await Cur.execute(
+                _ROWTYPE_OID_SQL,
+                {
+                    'ret_val': Cur.var(DB_TYPE_BINARY_INTEGER),
+                    'full_name': FullName,
+                    'oid': Oid,
+                    'version': Cur.var(DB_TYPE_BINARY_INTEGER),
+                    'tds': Cur.var(bytes),
+                    'attrs_rc': Cur.var(DB_TYPE_CURSOR),
+                },
+            )
+            return bytes(Oid.getvalue() or b'')
+        except DatabaseError:
+            return b''
+        finally:
+            await Cur.close()
 
     async def _describe_object_type(
         self, schema: str | None, name: str | None
