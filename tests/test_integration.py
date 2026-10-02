@@ -8001,6 +8001,29 @@ class CollectionTypeIntegration(_IntegrationBase):
         )
         self.assertEqual((v2.aslist(), w2), ([], None))
 
+    def test_a_collection_value_from_a_one_element_constructor(self):
+        # A constructor with one string literal builds a one-element collection,
+        # a national literal too. The Mirror over PostgreSQL read `t('a')` as a
+        # cast of the literal to the type: malformed array literal (#1435).
+        words = f'{self.TABLE}_W_T'
+        self.cur.execute(f'CREATE TYPE {words} AS TABLE OF VARCHAR2(10)')
+        try:
+            self.cur.execute(
+                f'CREATE TABLE {self.TABLE} (id NUMBER, v {words}) '
+                f'NESTED TABLE v STORE AS {self.TABLE}_V'
+            )
+            for k, value in ((1, "('a')"), (2, "(N'z')"), (3, "('it''s')")):
+                self.cur.execute(
+                    f'INSERT INTO {self.TABLE} VALUES ({k}, {words}{value})'
+                )
+            self.cur.execute(f'SELECT v FROM {self.TABLE} ORDER BY id')
+            self.assertEqual(
+                [v.aslist() for (v,) in self.cur.fetchall()], [['a'], ['z'], ["it's"]]
+            )
+        finally:
+            self._drop()
+            self.cur.execute(f'DROP TYPE {words}')
+
     def test_a_collection_value_binds(self):
         if self.conn.field_version < FIELD_VERSION_12_1:
             self.skipTest('an object bind needs the 12.1+ OAC')
