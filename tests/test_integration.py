@@ -1361,6 +1361,40 @@ class TypesIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.fetchall(), [('N', 0), ('V', 20), ('D', 0)])
 
+    def test_tab_columns_describe_binary_and_timestamp_types_as_oracle(self):
+        # A TIMESTAMP's type name carries its fractional-seconds precision, which
+        # is also its DATA_SCALE, and its length is that of its wire form; a
+        # BINARY_FLOAT / BINARY_DOUBLE has no precision and 4 / 8 bytes. The
+        # Mirror over PostgreSQL reported PostgreSQL's float precision and lost
+        # the timestamps' (#1480). BINARY_FLOAT is 10g+.
+        if (self.conn.server_version >> 24) < 10:
+            self.skipTest('BINARY_FLOAT / BINARY_DOUBLE are Oracle 10g+')
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (bf BINARY_FLOAT, bd BINARY_DOUBLE, '
+            'ts TIMESTAMP, ts3 TIMESTAMP(3), ts0 TIMESTAMP(0), '
+            'tz TIMESTAMP WITH TIME ZONE, tz2 TIMESTAMP(2) WITH TIME ZONE, '
+            'ltz TIMESTAMP WITH LOCAL TIME ZONE, ltz0 TIMESTAMP(0) WITH LOCAL TIME ZONE)'
+        )
+        self.cur.execute(
+            'SELECT column_name, data_type, data_length, data_precision, data_scale '
+            'FROM user_tab_columns WHERE table_name = :1 ORDER BY column_id',
+            [self.TABLE],
+        )
+        self.assertEqual(
+            self.cur.fetchall(),
+            [
+                ('BF', 'BINARY_FLOAT', 4, None, None),
+                ('BD', 'BINARY_DOUBLE', 8, None, None),
+                ('TS', 'TIMESTAMP(6)', 11, None, 6),
+                ('TS3', 'TIMESTAMP(3)', 11, None, 3),
+                ('TS0', 'TIMESTAMP(0)', 7, None, 0),
+                ('TZ', 'TIMESTAMP(6) WITH TIME ZONE', 13, None, 6),
+                ('TZ2', 'TIMESTAMP(2) WITH TIME ZONE', 13, None, 2),
+                ('LTZ', 'TIMESTAMP(6) WITH LOCAL TIME ZONE', 11, None, 6),
+                ('LTZ0', 'TIMESTAMP(0) WITH LOCAL TIME ZONE', 7, None, 0),
+            ],
+        )
+
     def test_a_block_opens_a_refcursor_into_a_bind(self):
         # An anonymous block opens a REF CURSOR into a bind -- `OPEN :c FOR`, its
         # query taking IN binds of its own -- or assigns a local cursor to one.
