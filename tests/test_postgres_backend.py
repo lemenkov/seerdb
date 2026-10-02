@@ -412,6 +412,35 @@ def test_a_one_element_constructor_is_spelt_as_a_call() -> None:
         assert _spell_one_element_constructors(sql, names) == sql
 
 
+def test_a_block_with_a_ref_cursor_bind_becomes_a_do_block() -> None:
+    # A REF CURSOR bind becomes a local refcursor whose portal name the block
+    # leaves in a setting; other binds are inlined as the literals given (#1300).
+    # Bind names are found, and replaced, past string literals.
+    from postgres_backend import _bind_names, _cursor_block, _replace_binds
+
+    block = "BEGIN OPEN :c FOR SELECT ':x' FROM t WHERE k BETWEEN :a AND :b; END;"
+    assert _bind_names(block) == ['c', 'a', 'b']
+    assert _replace_binds(block, {'a': '2'}) == (
+        "BEGIN OPEN :c FOR SELECT ':x' FROM t WHERE k BETWEEN 2 AND :b; END;"
+    )
+    out = _cursor_block(block, {'c': 0}, {'a': '2', 'b': '4'})
+    assert out.startswith('DO $$ DECLARE')
+    assert 'mirror_refcursor_0 refcursor;' in out
+    assert (
+        "OPEN mirror_refcursor_0 FOR SELECT ':x' FROM t WHERE k BETWEEN 2 AND 4;" in out
+    )
+    assert (
+        "set_config('mirror.refcursor_0', coalesce(mirror_refcursor_0::text, ''), true)"
+        in out
+    )
+    assigned = _cursor_block(
+        'DECLARE t SYS_REFCURSOR; BEGIN OPEN t FOR SELECT 1 FROM dual; :c := t; END;',
+        {'c': 0},
+        {},
+    )
+    assert 'mirror_refcursor_0 := t;' in assigned and 'refcursor' in assigned.lower()
+
+
 def test_delete_without_from_gains_it() -> None:
     # Oracle's `DELETE t` is PostgreSQL's `DELETE FROM t` (#1407); a DELETE that
     # has its FROM, and a word that merely starts with delete, are left alone.
