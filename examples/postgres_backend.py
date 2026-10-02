@@ -1643,6 +1643,13 @@ _DDL_TYPE_REWRITES = [
     (re.compile(r'\bNVARCHAR2\b', re.IGNORECASE), 'varchar'),
     (re.compile(r'\bVARCHAR2\b', re.IGNORECASE), 'varchar'),
     (re.compile(r'\bNCHAR\b', re.IGNORECASE), 'char'),
+    # NUMBER(*) is a plain NUMBER and NUMBER(*, s) a NUMBER(38, s), as Oracle
+    # reads them; PostgreSQL has no `*` precision (#1443).
+    (re.compile(r'\bNUMBER\s*\(\s*\*\s*\)', re.IGNORECASE), 'numeric'),
+    (
+        re.compile(r'\bNUMBER\s*\(\s*\*\s*,\s*(-?\d+)\s*\)', re.IGNORECASE),
+        r'numeric(38, \1)',
+    ),
     (re.compile(r'\bNUMBER\b', re.IGNORECASE), 'numeric'),
     # INTEGER / INT / SMALLINT are Oracle's names for NUMBER(38) (#1326), not
     # PostgreSQL's integers: those took no numeric value as a function argument, and

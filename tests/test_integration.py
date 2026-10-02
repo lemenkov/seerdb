@@ -1331,6 +1331,19 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT k FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchall(), [(1,)])
 
+    def test_a_number_of_any_precision_is_accepted(self):
+        # NUMBER(*, s) is NUMBER(38, s), rounding to s digits, and NUMBER(*) a
+        # plain NUMBER. The Mirror over PostgreSQL refused both (#1443).
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (d NUMBER(*, 0), f NUMBER(*, 2), e NUMBER(*))'
+        )
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (12.4, 3.456, 1.5)')
+        self.cur.execute(f'SELECT d, f, e FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchall(), [(12, Decimal('3.46'), Decimal('1.5'))])
+        self.assertEqual(
+            [tuple(d)[4:6] for d in self.cur.description][:2], [(38, 0), (38, 2)]
+        )
+
     def test_integer_and_smallint_are_number_38(self):
         # INTEGER, INT and SMALLINT are NUMBER(38): 20 digits fit, and the
         # columns describe as NUMBER(38,0). A SMALLINT parameter takes an
