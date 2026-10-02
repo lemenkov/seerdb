@@ -50,6 +50,20 @@ class TestColumnDescription(unittest.TestCase):
         self.assertEqual(self.d(data_type=112, csfrm=1)[1], seerdb.DB_TYPE_CLOB)
         self.assertEqual(self.d(data_type=112, csfrm=2)[1], seerdb.DB_TYPE_NCLOB)
 
+    def test_object_bfile_and_xmltype_are_dbtypes(self):
+        # An object / collection column (ADT, 109), a BFILE (114) and an XMLType
+        # -- an ADT of type SYS.XMLTYPE -- describe as python-oracledb's DbTypes,
+        # not as their bare wire codes (#1478).
+        self.assertIs(
+            self.d(data_type=109, type_schema='PYO', type_name='T_ARR')[1],
+            seerdb.DB_TYPE_OBJECT,
+        )
+        self.assertIs(self.d(data_type=114)[1], seerdb.DB_TYPE_BFILE)
+        self.assertIs(
+            self.d(data_type=109, type_schema='SYS', type_name='XMLTYPE')[1],
+            seerdb.DB_TYPE_XMLTYPE,
+        )
+
     def test_number_precision_scale_and_display(self):
         # NUMBER(10,2): precision/scale reported; display = p + 1 + (scale + 1).
         self.assertEqual(

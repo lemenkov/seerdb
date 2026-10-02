@@ -11,7 +11,9 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from seerdb.common.tns_consts import (
+    TNS_TYPE_ADT,
     TNS_TYPE_BDOUBLE,
+    TNS_TYPE_BFILE,
     TNS_TYPE_BFLOAT,
     TNS_TYPE_BLOB,
     TNS_TYPE_BOOLEAN,
@@ -136,6 +138,12 @@ DB_TYPE_TIMESTAMP_LTZ = _DbType('DB_TYPE_TIMESTAMP_LTZ', TNS_TYPE_TIMESTAMPLTZ, 
 DB_TYPE_JSON = _DbType('DB_TYPE_JSON', TNS_TYPE_JSON, 32767)
 DB_TYPE_BOOLEAN = _DbType('DB_TYPE_BOOLEAN', TNS_TYPE_BOOLEAN, 4)
 DB_TYPE_VECTOR = _DbType('DB_TYPE_VECTOR', TNS_TYPE_VECTOR, 32767)
+# An object or collection column, and the two kinds python-oracledb names apart
+# from it (#1478): a BFILE, and an XMLType -- on the wire an object (ADT) column
+# of type SYS.XMLTYPE, told apart by that type name when a column describes.
+DB_TYPE_OBJECT = _DbType('DB_TYPE_OBJECT', TNS_TYPE_ADT, 32767)
+DB_TYPE_BFILE = _DbType('DB_TYPE_BFILE', TNS_TYPE_BFILE, 32767)
+DB_TYPE_XMLTYPE = _DbType('DB_TYPE_XMLTYPE', TNS_TYPE_ADT, 32767)
 
 # The rest of the type objects PEP 249 requires a module to expose, alongside
 # STRING and NUMBER above. Each is an alias for the DbType the server reports for
@@ -237,6 +245,8 @@ _FETCH_DBTYPE: dict[tuple[int, int], _DbType] = {
     (TNS_TYPE_JSON, 1): DB_TYPE_JSON,
     (TNS_TYPE_BOOLEAN, 1): DB_TYPE_BOOLEAN,
     (TNS_TYPE_VECTOR, 1): DB_TYPE_VECTOR,
+    (TNS_TYPE_ADT, 1): DB_TYPE_OBJECT,
+    (TNS_TYPE_BFILE, 1): DB_TYPE_BFILE,
 }
 
 

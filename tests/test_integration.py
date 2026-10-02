@@ -8098,6 +8098,22 @@ class CollectionTypeIntegration(_IntegrationBase):
         self.assertEqual([int(x) for x in three.aslist()], [5, 10, 15])
         self.assertEqual([int(x) for x in one.aslist()], [7])
 
+    def test_a_collection_value_describes_as_db_type_object(self):
+        # An object or collection column's type_code is DB_TYPE_OBJECT, as
+        # python-oracledb reports it -- not the bare wire code 109 (#1478).
+        self.cur.execute(f'SELECT {self.NUMS}(1, 2) FROM dual')
+        self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_OBJECT)
+
+    def test_a_collection_value_of_bfile_or_xmltype_describes_as_its_dbtype(self):
+        # A BFILE's type_code is DB_TYPE_BFILE and an XMLType's -- an object of
+        # type SYS.XMLTYPE on the wire -- DB_TYPE_XMLTYPE, not 114 and 109 (#1478).
+        self._skip_if_mirror_backend('postgres', 'serve BFILE or XMLType')
+        self.cur.execute("SELECT bfilename('X', 'y'), sys.xmltype('<a/>') FROM dual")
+        self.assertEqual(
+            [d[1] for d in self.cur.description],
+            [seerdb.DB_TYPE_BFILE, seerdb.DB_TYPE_XMLTYPE],
+        )
+
     def test_a_collection_value_from_a_one_element_constructor(self):
         # A constructor with one string literal builds a one-element collection,
         # a national literal too. The Mirror over PostgreSQL read `t('a')` as a
