@@ -11480,6 +11480,17 @@ class CallprocIntegration(_IntegrationBase):
         self.assertEqual(o.getvalue(), 42)
         self.assertEqual(ret, [21, 42])
 
+    def test_callproc_body_with_a_parenthesised_alias(self):
+        # A body selecting `count(*) AS cnt`: the Mirror over PostgreSQL took that
+        # `) AS` for the end of the parameter list and split the routine (#1467).
+        self._make(
+            '(p_out OUT NUMBER) AS BEGIN '
+            'SELECT count(*) AS cnt INTO p_out FROM dual; END;'
+        )
+        o = self.cur.var(int)
+        self.cur.callproc(self.PROC, [o])
+        self.assertEqual(o.getvalue(), 1)
+
     def test_callproc_inout(self):
         self._make("(p_io IN OUT VARCHAR2) AS BEGIN p_io := p_io || '!'; END;")
         io = self.cur.var(str)

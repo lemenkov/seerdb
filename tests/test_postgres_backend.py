@@ -2400,6 +2400,21 @@ def test_translate_routine_ddl_procedure() -> None:
     assert 'LANGUAGE plpgsql AS $$ BEGIN p_out := p_in * 2; END $$' in out
 
 
+def test_translate_routine_ddl_body_with_a_parenthesised_alias() -> None:
+    # The parameter list ends at ITS closing parenthesis. A greedy match ran on
+    # to the body's last `) AS` -- `count(*) AS cnt` -- and split the routine
+    # there; a parameter's own parentheses (`NUMBER(5,2)`) stay inside it (#1467).
+    out = _translate_routine_ddl(
+        'CREATE OR REPLACE PROCEDURE p(n OUT NUMBER, m IN NUMBER(5,2)) AS '
+        'BEGIN SELECT count(*) AS cnt INTO n FROM dual; END;'
+    )
+    assert out == (
+        'DROP PROCEDURE IF EXISTS p; CREATE OR REPLACE PROCEDURE '
+        'p(n OUT numeric, m IN numeric(5,2)) LANGUAGE plpgsql AS $$ '
+        'BEGIN SELECT count(*) AS cnt INTO n FROM dual; END $$'
+    )
+
+
 def test_translate_routine_ddl_function() -> None:
     out = _translate_routine_ddl(
         'CREATE OR REPLACE FUNCTION f(p IN NUMBER) RETURN NUMBER '
