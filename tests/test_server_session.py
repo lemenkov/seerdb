@@ -1674,6 +1674,81 @@ def test_oci_fetch_serves_no_more_rows_than_it_asked_for() -> None:
     assert [b'ORA-01403' in reply for reply in stream.sent[1:]] == [False, True]
 
 
+# sqlplus 23.26's `select c from t1428` (c a CLOB, the table empty), then the
+# re-execute it sends once its LOB define is set up, captured against a live 11g.
+_OCI_EXEC_EMPTY_LOB = bytes.fromhex(
+    '035e0b6180000000000000feffffffffffffff39000000feffffffffffffff0d'
+    '000000fefffffffffffffffeffffffffffffff00000000010000000000000000'
+    '00000000000000000000000000000000000000feffffffffffffff0000000000'
+    '000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000000000000'
+    '0000000000000000000000000000001373656c65637420632066726f6d207431'
+    '3432380100000000000000000000000000000000000000000000000000000001'
+    '0000000000000000800000000000000000000000000000'
+)
+_OCI_REEXEC_EMPTY_LOB = bytes.fromhex(
+    '035e0c5000000001000000000000000000000000000000feffffffffffffff0d'
+    '000000fefffffffffffffffeffffffffffffff00000000000000005000000000'
+    '00000000000000000000000000000000000000feffffffffffffff0000000000'
+    '000000fefffffffffffffffefffffffffffffffeffffffffffffff0100000000'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000000000000'
+    '000000000000000000000000000000000000000f000000000000000000000000'
+    '0000000000000000000000010000000000000000000000000000000000000000'
+    '0000000170010000500000000000000000000002000000000000000000000000'
+    '690301000000000000000000'
+)
+
+
+def test_oci_an_empty_lob_result_ends_its_fetch() -> None:
+    # A LOB select that returns no rows gets the LOB describe and then, on the
+    # re-execute, the end of fetch -- ORA-01403 -- as from a live 11g. The Mirror
+    # gave it the ordinary no-row reply and the re-execute a plain success, and
+    # sqlplus printed a row holding an uninitialized LOB (SP2-1504) (#1428).
+    from seerdb.common.tns import (
+        _OCI_LOB_DESCRIBE_TAIL,
+        encode_describe_oci,
+        is_reexecute_oci,
+    )
+    from seerdb.common.tns_consts import TNS_DATA, TNS_TYPE_CLOB
+    from seerdb.server.session import _serve_oci_session
+
+    assert is_reexecute_oci(_OCI_REEXEC_EMPTY_LOB)
+    col = ColumnMeta(name=b'C', data_type=TNS_TYPE_CLOB, data_length=4000, max_size=0)
+
+    class _Empty:
+        capabilities: frozenset[Capability] = frozenset()
+
+        def execute(self, sql: str, binds=()) -> Result:
+            return Result(columns=[col], rows=[])
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.inbox = [
+                (TNS_DATA, _OCI_EXEC_EMPTY_LOB),
+                (TNS_DATA, _OCI_REEXEC_EMPTY_LOB),
+                None,
+            ]
+            self.sent: list[bytes] = []
+
+        def read_packet(self, **_kw):
+            return self.inbox.pop(0)
+
+        def write_packet(self, _ptype: int, body: bytes, **_kw) -> None:
+            self.sent.append(body)
+
+    stream: Any = _Stream()
+    backend: Any = _Empty()
+    _serve_oci_session(stream, backend, 'PYO')
+    assert len(stream.sent) == 2
+    describe, end = stream.sent
+    # The LOB describe: the column's describe, then the LOB-specific tail (the
+    # live sequence number in the status after it is the session's).
+    lob_describe = bytes(encode_describe_oci([col])) + _OCI_LOB_DESCRIBE_TAIL
+    assert describe.startswith(lob_describe)
+    assert b'ORA-01403' not in describe
+    assert b'ORA-01403' in end
+
+
 # sqlplus 23.26's `create table t1282 (...)`, captured against a live 11g
 # (piggyback-wrapped, as every statement past the first arrives).
 _OCI_EXEC_CREATE_TABLE = bytes.fromhex(
