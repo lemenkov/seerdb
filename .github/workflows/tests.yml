@@ -34,6 +34,11 @@ on:
       - '.gitignore'
       - '.git-blame-ignore-revs'
       - '.github/dependabot.yml'
+  # Nightly, and on demand: every leg, whatever changed, so a leg the path gate
+  # below skipped cannot hide a regression for longer than a day (#1470).
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
 
 # Cancel a superseded run when a new commit is pushed to the same ref, so rapid
 # pushes don't stack up and exhaust the Actions concurrency/usage budget.
@@ -42,6 +47,55 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Which integration legs this change can reach (#1470). The direct Oracle legs
+  # load only the client and the codec; the Mirror legs load all of seerdb --
+  # the seerdb client is what talks to the Mirror, so a client change can break
+  # one -- plus the Mirror-over-PG backend in examples/. The harness reaches
+  # every leg. A change to the shared suite alone runs the Mirror leg but not
+  # the Oracle ones: nearly every Mirror fix adds a test there, and gating the
+  # Oracle legs on it would run them for every PR. Such a test is checked
+  # against every Oracle release in the local matrix before a PR opens, and the
+  # nightly run below takes every leg. A scheduled or manual run, and a push
+  # whose base is unknown (a new branch), runs everything.
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      oracle: ${{ steps.gate.outputs.oracle }}
+      mirror: ${{ steps.gate.outputs.mirror }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          SHARED='^(tests/conftest\.py|pyproject\.toml|\.github/workflows/tests\.yml)$'
+          ORACLE='^(seerdb/client/|seerdb/common/|seerdb/__init__\.py$|seerdb/py\.typed$)'
+          MIRROR='^(seerdb/|examples/|tests/test_integration\.py$|tests/test_postgres_backend\.py$)'
+          case "$EVENT" in
+            pull_request) BASE=$PR_BASE ;;
+            push) BASE=$PUSH_BASE ;;
+            *) BASE= ;;
+          esac
+          if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "oracle=true" >> "$GITHUB_OUTPUT"
+            echo "mirror=true" >> "$GITHUB_OUTPUT"
+            echo "no base to diff against: every leg runs"
+            exit 0
+          fi
+          FILES=$(git diff --name-only "$BASE" HEAD)
+          echo "$FILES"
+          if echo "$FILES" | grep -Eq "$SHARED|$ORACLE"; then oracle=true; else oracle=false; fi
+          if echo "$FILES" | grep -Eq "$SHARED|$MIRROR"; then mirror=true; else mirror=false; fi
+          echo "oracle=$oracle" >> "$GITHUB_OUTPUT"
+          echo "mirror=$mirror" >> "$GITHUB_OUTPUT"
+          echo "Oracle legs: $oracle, Mirror legs: $mirror"
+
   test:
     name: Unit tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -89,6 +143,8 @@ jobs:
   # 21c/23ai containers from OOM-stalling under the suite.
   integration:
     name: Integration tests (${{ matrix.db.name }})
+    needs: changes
+    if: needs.changes.outputs.oracle == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
@@ -214,6 +270,8 @@ jobs:
   # a reachable PostgreSQL, so it is skipped everywhere else.
   mirror-postgres:
     name: Integration tests (Mirror over PostgreSQL)
+    needs: changes
+    if: needs.changes.outputs.mirror == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
