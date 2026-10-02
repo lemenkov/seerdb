@@ -964,11 +964,16 @@ _ORACLE_DICTIONARY_DDL = (
     "('timestamp without time zone', 'timestamp with time zone') "
     'THEN CASE c.datetime_precision WHEN 0 THEN 7 ELSE 11 END '
     "WHEN o.data_type IS NULL AND c.data_type = 'real' THEN 4 "
-    "WHEN o.data_type IS NULL AND c.data_type = 'double precision' THEN 8 ELSE "
+    "WHEN o.data_type IS NULL AND c.data_type = 'double precision' THEN 8 "
+    # A NUMBER is 22 bytes whatever its precision (#1483).
+    "WHEN o.data_type IS NULL AND c.data_type = 'numeric' THEN 22 ELSE "
     'coalesce(o.data_length, c.character_maximum_length, c.numeric_precision, 22) '
     'END AS data_length, '
-    "(CASE WHEN o.data_type IS NULL AND c.data_type IN ('real', 'double precision') "
-    'THEN NULL ELSE coalesce(o.data_precision, c.numeric_precision) END)'
+    # A type recorded as declared keeps its precision and scale as recorded, a
+    # NULL one included: INTEGER is numeric(38, 0) here but has none (#1483).
+    '(CASE WHEN o.data_type IS NOT NULL THEN o.data_precision '
+    "WHEN c.data_type IN ('real', 'double precision') "
+    'THEN NULL ELSE c.numeric_precision END)'
     '::information_schema.cardinal_number AS data_precision, '
     f"(CASE WHEN c.domain_name = '{_DATE_TYPE}' THEN NULL "
     "WHEN c.data_type = 'USER-DEFINED' AND c.udt_name = 'ora_tstz' "
@@ -976,7 +981,7 @@ _ORACLE_DICTIONARY_DDL = (
     'WHEN o.data_type IS NULL AND c.data_type IN '
     "('timestamp without time zone', 'timestamp with time zone') "
     'THEN c.datetime_precision '
-    'ELSE coalesce(o.data_scale, c.numeric_scale) END)'
+    'WHEN o.data_type IS NOT NULL THEN o.data_scale ELSE c.numeric_scale END)'
     '::information_schema.cardinal_number AS data_scale, '
     # CHAR_LENGTH is 0 for a type with no character length, not NULL (#1418).
     'coalesce(c.character_maximum_length, 0)'
@@ -1965,6 +1970,15 @@ _FLOAT_DECLARED = re.compile(
 _INTERVAL_YM_DECLARED = re.compile(
     r'\s*INTERVAL\s+YEAR\s*(?:\(\s*(\d+)\s*\))?\s*TO\s+MONTH\b', re.IGNORECASE
 )
+# A NUMBER with no declared precision but a fixed scale (#1483): INTEGER, INT and
+# SMALLINT, a bare DECIMAL / DEC / NUMERIC (scale 0), and NUMBER(*, s). Oracle
+# lists their precision as NULL; the rewrite stores numeric(38, s), which is
+# NUMBER(38, s)'s too, so only the declaration tells them apart.
+_NUMBER_UNSIZED_DECLARED = re.compile(
+    r'\s*(?:(?:INTEGER|INT|SMALLINT)\b|(?:DECIMAL|DEC|NUMERIC)\b(?!\s*\()'
+    r'|NUMBER\s*\(\s*\*\s*,\s*(-?\d+)\s*\))',
+    re.IGNORECASE,
+)
 # A MODIFY that leaves the column's type alone -- a constraint, a default.
 _MODIFY_WITHOUT_TYPE = re.compile(
     r'\s*(?:$|(?:NOT|NULL|DEFAULT|CONSTRAINT|CHECK|UNIQUE|PRIMARY|REFERENCES|'
@@ -2003,6 +2017,9 @@ def _declared_type(
     if ym is not None:
         year = int(ym.group(1) or 2)
         return (f'INTERVAL YEAR({year}) TO MONTH', 5, year, 0)
+    unsized = _NUMBER_UNSIZED_DECLARED.match(definition)
+    if unsized is not None:
+        return ('NUMBER', 22, None, int(unsized.group(1) or 0))
     return None
 
 

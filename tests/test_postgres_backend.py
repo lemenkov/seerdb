@@ -3734,6 +3734,26 @@ def test_idiom_rewrites_leave_quoted_text_alone() -> None:
     )
 
 
+def test_an_unsized_number_is_recorded_without_a_precision() -> None:
+    # INTEGER, SMALLINT, a bare DECIMAL and NUMBER(*, s) are numeric(38, s) here,
+    # as NUMBER(38, s) is; only the declaration says they have no precision, so
+    # it is recorded (#1483). A sized NUMBER needs no record.
+    from postgres_backend import _declared_type
+
+    assert _declared_type('INTEGER NOT NULL') == ('NUMBER', 22, None, 0)
+    assert _declared_type('smallint') == ('NUMBER', 22, None, 0)
+    assert _declared_type('DECIMAL') == ('NUMBER', 22, None, 0)
+    assert _declared_type('NUMBER(*, 2)') == ('NUMBER', 22, None, 2)
+    assert _declared_type('NUMERIC(7,1)') is None
+    assert _declared_type('NUMBER(5)') is None
+    assert _declared_type('INTERVAL DAY TO SECOND') == (
+        'INTERVAL DAY(2) TO SECOND(6)',
+        11,
+        2,
+        6,
+    )
+
+
 def test_raise_application_error_becomes_a_coded_raise() -> None:
     # RAISE_APPLICATION_ERROR raises P0001 with its ORA code as the message's
     # prefix, which the error mapping reads back (#1323); the message may itself
