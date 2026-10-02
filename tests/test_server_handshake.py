@@ -355,7 +355,7 @@ def test_oci_dty_reply_adds_o7logon_from_12_1() -> None:
         CCAP_LOGON_O7LOGON,
         FIELD_VERSION_11_2,
         FIELD_VERSION_12_1,
-        FIELD_VERSION_18_1_EXT1,
+        FIELD_VERSION_18_1_EXT_1,
     )
     from seerdb.server.handshake import build_caps_block_reply
 
@@ -372,7 +372,7 @@ def test_oci_dty_reply_adds_o7logon_from_12_1() -> None:
     logon = 0x0F
     assert diff == {
         (logon, logon | CCAP_LOGON_O7LOGON),
-        (FIELD_VERSION_12_1, FIELD_VERSION_18_1_EXT1),
+        (FIELD_VERSION_12_1, FIELD_VERSION_18_1_EXT_1),
     }
     assert build_caps_block_reply(FIELD_VERSION_11_2, oci=True) == (
         build_caps_block_reply(FIELD_VERSION_11_2)
@@ -385,12 +385,12 @@ def test_oci_dty_reply_advertises_18c_from_12_1() -> None:
     from seerdb.common.tns_consts import (
         FIELD_VERSION_11_2,
         FIELD_VERSION_12_1,
-        FIELD_VERSION_18_1_EXT1,
+        FIELD_VERSION_18_1_EXT_1,
     )
     from seerdb.server.handshake import oci_field_version
 
     assert oci_field_version(FIELD_VERSION_11_2) == FIELD_VERSION_11_2
-    assert oci_field_version(FIELD_VERSION_12_1) == FIELD_VERSION_18_1_EXT1
+    assert oci_field_version(FIELD_VERSION_12_1) == FIELD_VERSION_18_1_EXT_1
 
 
 # The capability block (the DTY proper) each sqlplus sends, one round after its

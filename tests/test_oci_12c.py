@@ -25,7 +25,7 @@ from seerdb.common.tns import (
 )
 from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
-    FIELD_VERSION_18_1_EXT1,
+    FIELD_VERSION_18_1_EXT_1,
     TNS_TYPE_DATE,
     TNS_TYPE_NUMBER,
     TNS_TYPE_VARCHAR,
@@ -34,7 +34,7 @@ from seerdb.common.tns_consts import (
 
 @pytest.fixture
 def at_12c() -> Iterator[None]:
-    token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT1)
+    token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT_1)
     yield
     _ENCODE_FIELD_VERSION.reset(token)
 

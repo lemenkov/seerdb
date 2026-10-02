@@ -52,7 +52,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_12_2,
-    FIELD_VERSION_18_1_EXT1,
+    FIELD_VERSION_18_1_EXT_1,
     FIELD_VERSION_21_1,
     FIELD_VERSION_23_1,
     TNS_ACCEPT,
@@ -385,7 +385,7 @@ def oci_field_version(field_version: int) -> int:
     accepts 18c's layout over a 12.1 ACCEPT (#1282).
     """
     if field_version >= FIELD_VERSION_12_1:
-        return FIELD_VERSION_18_1_EXT1
+        return FIELD_VERSION_18_1_EXT_1
     return field_version
 
 

@@ -1859,9 +1859,9 @@ _OCI_EXEC_18C = bytes.fromhex(
 def test_parse_exec_oci_reads_the_12c_band_layout() -> None:
     # The session's field version says which layout the statement is in: the
     # inserted bytes are zeros, so the wire alone cannot tell (#1282).
-    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT1
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1
 
-    token = _DECODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT1)
+    token = _DECODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT_1)
     try:
         req = parse_exec_oci(_OCI_EXEC_18C)
     finally:
