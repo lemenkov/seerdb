@@ -122,7 +122,7 @@ import re
 import select
 import struct
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Final
 
@@ -171,6 +171,7 @@ from seerdb.common.tns_consts import (
     ORA_NAME_ALREADY_USED,
     ORA_NO_DATA_FOUND,
     ORA_NOT_ENOUGH_VALUES,
+    ORA_NUMERIC_OR_VALUE_ERROR,
     ORA_NUMERIC_OVERFLOW,
     ORA_PARENT_KEY_NOT_FOUND,
     ORA_PLSQL_COMPILATION_ERROR,
@@ -832,7 +833,7 @@ _ORACLE_DICTIONARY_DDL = (
     # CHAR column of the rows is the unbounded bpchar instead (#1494).
     "WHEN 'character' THEN 'bpchar' ELSE t END), ', ' ORDER BY i), "
     "string_agg(format('c%s AS %I', i, names[i]), ', ' ORDER BY i) INTO defs, cols "
-    "FROM jsonb_array_elements_text(doc->0) WITH ORDINALITY AS x(t, i); OPEN r FOR "
+    'FROM jsonb_array_elements_text(doc->0) WITH ORDINALITY AS x(t, i); OPEN r FOR '
     "EXECUTE format('SELECT %s FROM jsonb_to_recordset($1) AS t(%s)', cols, defs) "
     'USING doc->1; RETURN r; END $$;'
     # ora_owner(schema): the Oracle owner for a PostgreSQL schema — the current
@@ -3530,7 +3531,6 @@ def _computed_column_types(sql: str) -> dict[int, int]:
     return found
 
 
-
 def _constructor_items(sql: str) -> dict[int, str]:
     """The select-list positions of a query that are one call, by the name called.
 
@@ -3557,6 +3557,7 @@ def _constructor_items(sql: str) -> dict[int, str]:
         if close < len(item) and _ITEM_ALIAS.fullmatch(item[close + 1 :].strip()):
             found[index] = re.sub(r'\s+', '', call.group(1))
     return found
+
 
 def _rewrite_rownum(sql: str) -> str:
     """Translate `... WHERE a AND ROWNUM <= n` to `... WHERE a LIMIT n` (#1271).
@@ -3725,12 +3726,9 @@ def _translate_cursor_expressions(sql: str) -> str:
             f'(SELECT true AS _m, row_number() OVER () AS _n, _x.* FROM '
             f'({_translate_cursor_expressions(sub)}) _x({columns})) _s ON true)'
         )
-        out.append(
-            sql[pos : match.start()] + f'sys.ora_cursor({doc}, ARRAY[{names}])'
-        )
+        out.append(sql[pos : match.start()] + f'sys.ora_cursor({doc}, ARRAY[{names}])')
         pos = close + 1
     return ''.join(out) + sql[pos:]
-
 
 
 # A masked quoted region's contents: NUL, the region's index, NUL (#1481).
@@ -3821,9 +3819,7 @@ def _cast_literal_items(sql: str) -> str:
             continue
         # The list ends at the first clause -- FROM, or an INTO in PL/SQL -- or
         # at the statement's end: the compat layer drops a `FROM dual`.
-        stop = next(
-            (p for p, w in words[1:] if w in _SELECT_LIST_ENDS), len(segment)
-        )
+        stop = next((p for p, w in words[1:] if w in _SELECT_LIST_ENDS), len(segment))
         start = len('SELECT')
         if len(words) > 1 and words[1][1] in ('DISTINCT', 'UNIQUE', 'ALL'):
             start = words[1][0] + len(words[1][1])
@@ -3842,6 +3838,7 @@ def _cast_literal_items(sql: str) -> str:
     for at, until, replacement in sorted(set(edits), reverse=True):
         masked = masked[:at] + replacement + masked[until:]
     return _unmask_quoted(masked, contents)
+
 
 def _translate_idioms(sql: str) -> str:
     """Rewrite the Oracle SQL functions / literal idioms the suite uses to their
@@ -3916,7 +3913,9 @@ def _reject_unsupported_ddl_types(sql: str) -> None:
 _ROUTINE_HEAD = re.compile(
     r'(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(PROCEDURE|FUNCTION)\s+([\w.]+)\s*'
 )
-_ROUTINE_TAIL = re.compile(r'(?is)\s*(?:RETURN\s+([\w ]+?)\s+)?(?:AS|IS)\s+(.*?)\s*;?\s*$')
+_ROUTINE_TAIL = re.compile(
+    r'(?is)\s*(?:RETURN\s+([\w ]+?)\s+)?(?:AS|IS)\s+(.*?)\s*;?\s*$'
+)
 # Oracle parameter direction `IN OUT` → PostgreSQL `INOUT` (do this before the
 # type rewrites, which share the DDL type list).
 _PARAM_IN_OUT = re.compile(r'\bIN\s+OUT\b', re.IGNORECASE)
@@ -4545,11 +4544,78 @@ _TYPE_DDL = re.compile(r'\s*(?:CREATE\s+OR\s+REPLACE|DROP)\s+TYPE\b', re.IGNOREC
 _DROP_STATEMENT = re.compile(r'\s*DROP\b', re.IGNORECASE)
 
 
+# What a PostgreSQL compile-time message names: an unknown variable, a function
+# with no matching signature, or the token a syntax error is at.
+_UNKNOWN_VARIABLE = re.compile(r'"([^"]+)" is not a known variable')
+_UNKNOWN_FUNCTION = re.compile(r'(?:function|procedure) ([\w.$#"]+)\(')
+_NEAR_TOKEN = re.compile(r'at or near "([^"]+)"')
+
+
+def _plsql_compile_error(
+    exc, block: str, arities: Callable[[str], set[int]] | None = None
+) -> BackendError | None:
+    # A block that fails to compile is ORA-06550 in Oracle, "line L, column C:"
+    # and the PLS- error, whatever was wrong in it: an undeclared identifier, a
+    # call no routine's signature matches, a syntax error (#1497). PostgreSQL
+    # reports each under SQLSTATE class 42 -- 42601 / 42883 / 42703 / 42P01 --
+    # which mapped to the SQL statement's codes, ORA-00900 / 00904 / 00942. The
+    # position is the named thing's in the client's block, as Oracle gives it.
+    if not str(getattr(exc, 'sqlstate', None) or '').startswith('42'):
+        return None
+    primary = _primary_message(exc)
+    if (variable := _UNKNOWN_VARIABLE.search(primary)) is not None:
+        name = variable.group(1)
+        pls = f"PLS-00201: identifier '{name.upper()}' must be declared"
+    elif (function := _UNKNOWN_FUNCTION.search(primary)) is not None:
+        name = function.group(1).strip('"').rsplit('.', 1)[-1]
+        # A routine that takes this many arguments compiles in Oracle, and a
+        # value of the wrong type fails when it is converted: ORA-06502, not a
+        # compile error. PostgreSQL resolves the call by type and finds none.
+        # Only a positional call that passes a string, which Oracle tries to
+        # convert; a named argument given twice, or a type it does not convert,
+        # does not compile there either.
+        given = primary[function.end() : primary.find(')', function.end())]
+        types = [a.strip() for a in given.split(',') if a.strip()]
+        if (
+            arities is not None
+            and '=>' not in given
+            and any(t in ('unknown', 'text', 'character varying') for t in types)
+            and len(types) in arities(name)
+        ):
+            return BackendError(
+                'PL/SQL: numeric or value error: character to number conversion error',
+                ora_code=ORA_NUMERIC_OR_VALUE_ERROR,
+            )
+        pls = (
+            f"PLS-00306: wrong number or types of arguments in call to '{name.upper()}'"
+        )
+    else:
+        near = _NEAR_TOKEN.search(primary)
+        name = near.group(1) if near is not None else ''
+        pls = f'PLS-00103: {primary}'
+    at = block.lower().find(name.lower()) if name else -1
+    line = block.count('\n', 0, max(at, 0)) + 1
+    column = max(at, 0) - block.rfind('\n', 0, max(at, 0))
+    return BackendError(
+        f'line {line}, column {column}:\n{pls}',
+        ora_code=ORA_PLSQL_COMPILATION_ERROR,
+        error_offset=at if at >= 0 else None,
+    )
+
+
 def _backend_error(
-    exc, *, original: str | None = None, translated: str | None = None
+    exc,
+    *,
+    original: str | None = None,
+    translated: str | None = None,
+    arities: Callable[[str], set[int]] | None = None,
 ) -> BackendError:
     # A PostgreSQL failure as a clean ORA error: the mapped code, and the Oracle
     # canonical text for it when there is one, else PostgreSQL's own message (#529).
+    if original is not None and is_plsql(original):
+        compile_error = _plsql_compile_error(exc, original, arities)
+        if compile_error is not None:
+            return compile_error
     code = _ora_code_for(exc)
     if (
         getattr(exc, 'sqlstate', None) == '2BP01'
@@ -5643,7 +5709,9 @@ class PostgresBackend:
         except psycopg.Error as exc:
             self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_stmt')
             self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
-            raise _backend_error(exc, original=sql) from exc
+            raise _backend_error(
+                exc, original=sql, arities=self._routine_arities
+            ) from exc
         return Result()
 
     @_while_connected
@@ -6286,7 +6354,9 @@ class PostgresBackend:
             return None
         relid = pgresult.ftable(index)
         if not relid:
-            return self._constructed_collection_type(constructor) if constructor else None
+            return (
+                self._constructed_collection_type(constructor) if constructor else None
+            )
         key = (relid, pgresult.ftablecol(index))
         if key not in self._column_types:
             row = self._conn.execute(
@@ -7288,6 +7358,27 @@ class PostgresBackend:
             )
         return self._domain_col_cache[key]
 
+    def _returns_a_value(self, name: str) -> bool:
+        # Whether every function of this name returns a value of its own: not
+        # void, and not the record a function with OUT parameters returns.
+        rows = self._conn.execute(
+            "SELECT prorettype = 'void'::regtype OR proargmodes IS NOT NULL "
+            "FROM pg_proc WHERE proname = lower(%s) AND prokind = 'f'",
+            (name.rsplit('.', 1)[-1],),
+        ).fetchall()
+        return bool(rows) and not any(procedure_like for (procedure_like,) in rows)
+
+    def _routine_arities(self, name: str) -> set[int]:
+        # How many arguments a routine of this name takes, each overload and
+        # each count its defaults allow (#1497).
+        rows = self._conn.execute(
+            'SELECT pronargs, pronargdefaults FROM pg_proc WHERE proname = lower(%s)',
+            (name,),
+        ).fetchall()
+        return {
+            n for nargs, ndefaults in rows for n in range(nargs - ndefaults, nargs + 1)
+        }
+
     def _execute_plsql(self, sql: str, binds: Sequence) -> Result:
         # A callproc / callfunc block. `binds` is one BindVar per positional bind
         # (:1 → index 0), value None for a pure OUT. Run the underlying routine and
@@ -7332,7 +7423,9 @@ class PostgresBackend:
             return Result(out_binds=values)
         except psycopg.Error as exc:
             self._conn.rollback()
-            raise _backend_error(exc) from exc
+            raise _backend_error(
+                exc, original=sql, arities=self._routine_arities
+            ) from exc
 
     def _call_function(self, match: 're.Match', values: list, block: str) -> Result:
         # BEGIN :r := name(:a, :b); END;  →  SELECT name(a, b); the result is the
@@ -7365,6 +7458,19 @@ class PostgresBackend:
         refused = _call_argument_error(block, name, args, parameters or None)
         if refused is not None:
             raise refused
+        if kind == 'f' and self._returns_a_value(name):
+            # A function called as a procedure does not compile in Oracle:
+            # PLS-00221 (#1497). A function that returns nothing -- orafce's
+            # DBMS_OUTPUT, say -- is a procedure there, and runs as one below.
+            at = max(block.lower().find(name.lower()), 0)
+            raise BackendError(
+                f'line {block.count(chr(10), 0, at) + 1}, column '
+                f'{at - block.rfind(chr(10), 0, at)}:\nPLS-00221: '
+                f"'{name.rsplit('.', 1)[-1].upper()}' is not a procedure or is "
+                'undefined',
+                ora_code=ORA_PLSQL_COMPILATION_ERROR,
+                error_offset=at,
+            )
         slots = _bind_slots(block)
         # Which parameter each argument binds: by position, or by name (#1377). A
         # named argument the signature cannot place, or an argument that is not a

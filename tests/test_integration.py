@@ -11640,6 +11640,27 @@ class CallprocIntegration(_IntegrationBase):
         self.assertEqual(o.getvalue(), 42)
         self.assertEqual(ret, [21, 42])
 
+    def test_a_block_that_does_not_compile_is_ora_06550(self):
+        # A block naming an undeclared identifier, and a function called as a
+        # procedure, fail to compile: ORA-06550, with the position of what is
+        # wrong. The Mirror over PostgreSQL raised ORA-00900 for the first and ran
+        # the second (#1497).
+        with self.assertRaises(seerdb.DatabaseError) as raised:
+            self.cur.execute('begin t_Missing := 5; end;')
+        self.assertEqual(raised.exception.code, 6550)
+        self.assertIn('T_MISSING', str(raised.exception).upper())
+        fn = f'{self.PROC}_F'
+        self.cur.execute(
+            f'CREATE OR REPLACE FUNCTION {fn}(p IN NUMBER) RETURN NUMBER AS '
+            'BEGIN RETURN p; END;'
+        )
+        try:
+            with self.assertRaises(seerdb.DatabaseError) as raised:
+                self.cur.callproc(fn, [1])
+            self.assertEqual(raised.exception.code, 6550)
+        finally:
+            self.cur.execute(f'DROP FUNCTION {fn}')
+
     def test_callproc_body_with_a_parenthesised_alias(self):
         # A body selecting `count(*) AS cnt`: the Mirror over PostgreSQL took that
         # `) AS` for the end of the parameter list and split the routine (#1467).

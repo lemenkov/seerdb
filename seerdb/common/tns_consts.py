@@ -214,6 +214,7 @@ ORA_INVALID_BIND_VARIABLE_NAME = 1745  # invalid host/bind variable name
 ORA_CHECK_CONSTRAINT_VIOLATED = 2290
 ORA_PARENT_KEY_NOT_FOUND = 2291  # integrity constraint violated - parent key not found
 ORA_TYPE_HAS_DEPENDENTS = 2303  # cannot drop or replace a type with ... dependents
+ORA_NUMERIC_OR_VALUE_ERROR = 6502  # PL/SQL: numeric or value error
 ORA_PLSQL_COMPILATION_ERROR = 6550  # line %s, column %s: <the PLS- error>
 ORA_UNIMPLEMENTED_FEATURE = 3001
 ORA_UNSUPPORTED_NETWORK_DATATYPE = 3115  # ... datatype or representation
