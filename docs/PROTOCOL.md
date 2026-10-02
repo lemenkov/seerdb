@@ -6643,6 +6643,13 @@ An iteration that affected nothing still sends its record, with a zero count —
 omitting it slides every later iteration's values one position earlier. The
 records precede the ordinary success status OER.
 
+Each value goes out in the **return bind's** type, which need not be its column's
+(#1501). `RETURNING IntCol INTO :v` with a VARCHAR `:v` returns the number as
+text, the way Oracle converts it, which is TO_CHAR's default: measured on 23ai,
+`1` → `'1'`, `0.5` → `'.5'`, `-0.5` → `'-.5'`, `1e-10` → `'.0000000001'`. Encoded
+in the column's type instead, the value is NUMBER bytes inside a VARCHAR DALC
+(`01 02 c1 02`), which the client fails to decode as text.
+
 Row order **within** a record is not defined. A RETURNING clause takes no
 `ORDER BY`, and neither Oracle nor any other server promises one, so a client
 must treat a record as the set of rows that iteration touched.

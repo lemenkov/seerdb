@@ -4494,6 +4494,29 @@ def test_a_long_return_bind_is_a_plain_dalc() -> None:
     assert body[23] == 0x00  # the truncation length, with no LONG trailer first
 
 
+def test_a_returned_number_takes_a_varchar_binds_type() -> None:
+    # The value goes out in the RETURN BIND's type: a number into a VARCHAR is
+    # its TO_CHAR text, measured on 23ai, not NUMBER bytes in a DALC (#1501).
+    from decimal import Decimal
+
+    from seerdb.common.tns import _as_return_bind_type, encode_returning_response
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER, TNS_TYPE_VARCHAR, TTI_RXD
+
+    for value, text in (
+        (1, '1'),
+        (0.5, '.5'),
+        (-0.5, '-.5'),
+        (Decimal('1.50'), '1.5'),
+        (1e-10, '.0000000001'),
+        (12345678901234567890, '12345678901234567890'),
+    ):
+        assert _as_return_bind_type(value, TNS_TYPE_VARCHAR) == text
+    assert _as_return_bind_type(7, TNS_TYPE_NUMBER) == 7
+    resp = encode_returning_response(1, [[(1,)]], [TNS_TYPE_VARCHAR])
+    body = resp[resp.index(bytes([TTI_RXD])) :]
+    assert body[3:5] == bytes([1]) + b'1'  # DALC of the text '1', not NUMBER 1
+
+
 @pytest.mark.parametrize('version', [6, 17])  # 11.2 and 23ai OAC layouts
 def test_parse_exec_reads_an_associative_array_bind(version: int) -> None:
     # An arrayvar bind (#122) carries the ARRAY flag and its capacity in the
