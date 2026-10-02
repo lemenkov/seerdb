@@ -222,6 +222,16 @@ def test_translate_ddl_maps_create_table_column_types() -> None:
     )
 
 
+def test_translate_ddl_maps_a_number_of_any_precision() -> None:
+    # NUMBER(*) is a plain NUMBER and NUMBER(*, s) a NUMBER(38, s) (#1443).
+    assert (
+        _translate_ddl(
+            'CREATE TABLE t (d NUMBER(*, 0), e NUMBER(*), f number( * ,-2), g NUMBER(5,2))'
+        )
+        == 'CREATE TABLE t (d numeric(38, 0), e numeric, f numeric(38, -2), g numeric(5,2))'
+    )
+
+
 def test_translate_ddl_maps_object_type_to_composite() -> None:
     # CREATE TYPE ... AS OBJECT (attrs) → a PostgreSQL composite type, the OBJECT
     # keyword dropped and the attribute types mapped like a table's columns (#139).
