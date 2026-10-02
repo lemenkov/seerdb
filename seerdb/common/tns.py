@@ -3474,9 +3474,31 @@ def encode_returning_response(
             )
             for row in rows:
                 value = row[position] if position < len(row) else None
+                value = _as_return_bind_type(value, tns_type)
                 value, actual = _fit_returned_value(value, tns_type, limit)
                 out += _returned_value(value, tns_type) + _encode_signed_sb4(actual)
     return bytes(out) + encode_status(rowcount, cursor_id=cursor_id)
+
+
+def _as_return_bind_type(value: object, tns_type: int) -> object:
+    # A returned value is the RETURN BIND's type, which need not be its column's:
+    # `RETURNING IntCol INTO :v` with a VARCHAR :v gets the number as text, as
+    # Oracle converts it -- TO_CHAR's default, so 0.5 is '.5' (#1501). The value
+    # arrives as the column gave it, and encode_value goes by the value's own
+    # type, so a number went out as NUMBER bytes in a VARCHAR and the client could
+    # not decode it.
+    if tns_type not in (TNS_TYPE_VARCHAR, TNS_TYPE_CHAR):
+        return value
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        return value
+    text = format(Decimal(str(value)).normalize(), 'f')
+    if '.' in text:
+        text = text.rstrip('0').rstrip('.')
+    if text.startswith('0.'):
+        text = text[1:]
+    elif text.startswith('-0.'):
+        text = '-' + text[2:]
+    return text
 
 
 # The return-bind types whose declared size is a real client buffer, so a value

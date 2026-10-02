@@ -3015,6 +3015,17 @@ class CursorIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.rowcount, 0)
 
+    def test_a_number_returned_into_a_varchar_variable_is_its_text(self):
+        # A NUMBER column returned into a VARCHAR variable comes back as text,
+        # TO_CHAR's default form: 0.5 is '.5'. The Mirror sent the NUMBER's own
+        # bytes in the VARCHAR, which the client could not decode (#1501).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, n NUMBER)')
+        insert = f'INSERT INTO {self.TABLE} (id, n) VALUES (1, :1) RETURNING n INTO :2'
+        for value, text in ((1, '1'), (0.5, '.5'), (-1.25, '-1.25')):
+            got = self.cur.var(seerdb.DB_TYPE_VARCHAR, 40)
+            self.cur.execute(insert, [value, got])
+            self.assertEqual(got.getvalue(), [text])
+
     def test_a_returning_variable_can_be_used_again(self):
         # The variable that received one RETURNING receives the next. On 8i the
         # client sent the list it held as the next execute's input and could not
