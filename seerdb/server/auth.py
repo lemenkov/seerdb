@@ -72,7 +72,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_12_2,
-    FIELD_VERSION_23_1,
+    FIELD_VERSION_23_1_EXT_1,
     TTI_AUTH,
     TTI_FUN,
     TTI_RPA,
@@ -379,13 +379,13 @@ def _parse_fun_auth(
         raise InterfaceError('not a TTI_FUN message')
     subtype = payload[1]
     rest = payload[3:]  # skip TTI_FUN, subtype, seq
-    # At fv > 17 the OAUTH (phase-two AUTH) header carries a `0` has-user pointer
+    # At fv >= 23.1 EXT 1 the OAUTH (phase-two AUTH) header carries a `0` has-user pointer
     # byte before the `0x01` marker (PROTOCOL.md §20.3), which the phase-one
     # OSESSKEY does not — so detect it rather than assume by subtype: when the
     # byte after the sequence is not the `0x01` marker, it is that extra pointer,
     # consume it. Below fv 18 there is never one, so this reduces to the
     # historical single-byte skip (payload[4:]).
-    if field_version > FIELD_VERSION_23_1 and rest[:1] != b'\x01':
+    if field_version >= FIELD_VERSION_23_1_EXT_1 and rest[:1] != b'\x01':
         _has_user, rest = decode_ub4(rest)
     rest = rest[1:]  # skip the 0x01 marker
     userlen, rest = decode_ub4(rest)

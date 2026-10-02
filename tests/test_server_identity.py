@@ -13,6 +13,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_19_1,
     FIELD_VERSION_21_1,
     FIELD_VERSION_23_1,
+    FIELD_VERSION_23_1_EXT_1,
 )
 from seerdb.server.identity import (
     IDENTITY_11_2,
@@ -54,7 +55,7 @@ def test_21c_and_23ai_field_versions_report_their_release() -> None:
     assert IDENTITY_21.version_no >> 24 == 21
     assert b'21c' in IDENTITY_21.banner
     assert server_identity(FIELD_VERSION_23_1) is IDENTITY_23
-    assert server_identity(FIELD_VERSION_23_1 + 1) is IDENTITY_23
+    assert server_identity(FIELD_VERSION_23_1_EXT_1) is IDENTITY_23
     assert IDENTITY_23.version_no >> 24 == 23
     assert b'26ai' in IDENTITY_23.banner  # the 23-lineage testbed's own banner
 

@@ -19,7 +19,7 @@ from seerdb.common.tns import (
 )
 from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
-    FIELD_VERSION_23_1,
+    FIELD_VERSION_23_1_EXT_1,
     FIELD_VERSION_23_4,
 )
 
@@ -73,7 +73,7 @@ def _at_field_version(version: int):
 def _options(payload: bytes, version: int) -> int:
     # The option word is the first sb4 after the TTI_FUN header — three bytes
     # (TTI_FUN, TTI_ALL8, seq), plus the 23ai token number.
-    head = 4 if version > FIELD_VERSION_23_1 else 3
+    head = 4 if version >= FIELD_VERSION_23_1_EXT_1 else 3
     width = payload[head]
     return int.from_bytes(payload[head + 1 : head + 1 + width], 'big')
 
