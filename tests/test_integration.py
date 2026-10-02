@@ -10949,6 +10949,20 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 finally:
                     await Cur.execute('DROP PROCEDURE PYORACLE_ASYNC_RC')
 
+    async def test_async_refcursor_nested_in_a_nested_cursor_fetches(self):
+        # A CURSOR(...) inside a CURSOR(...): the inner cursor is a cursor too,
+        # not the decoder's marker dict the async path left there (#1464).
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await Cur.execute(
+                    "SELECT CURSOR(SELECT 1, CURSOR(SELECT 'inner' FROM dual) "
+                    'FROM dual) FROM dual'
+                )
+                ((outer,),) = await Cur.fetchall()
+                ((one, inner),) = await outer.fetchall()
+                self.assertEqual(one, 1)
+                self.assertEqual(await inner.fetchall(), [('inner',)])
+
     async def test_async_callfunc(self):
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
             async with Conn.cursor() as Cur:

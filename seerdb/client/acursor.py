@@ -465,21 +465,14 @@ class AsyncCursor(_CursorLogic):
         return True
 
     async def _build_refcursor(self, Rows, Marker) -> 'AsyncCursor':
-        # Wrap an already-fetched REF CURSOR result set in a nested AsyncCursor,
-        # resolving any LOB cells with await (mirrors AsyncCursor.execute).
-        from seerdb.common.lob import LOB
-
+        # Wrap an already-fetched REF CURSOR result set in a nested AsyncCursor.
+        # Its rows resolve as the outer ones do -- LOBs, objects, and a nested
+        # cursor of their own, recursively (#1464); resolving only the LOBs left
+        # a CURSOR(...) cell the decoder's marker dict.
         Nested = AsyncCursor(self._connection)
         Nested._description = [_column_description(C) for C in Marker['row_format']]
         Nested._annotations = [_col_annotations(C) for C in Marker['row_format']]
-        Resolved = []
-        for Row in Rows:
-            NewRow = list(Row)
-            for I, Val in enumerate(NewRow):
-                if isinstance(Val, LOB):
-                    Val._connection = self._connection
-                    NewRow[I] = await Val.aread()
-            Resolved.append(NewRow)
+        Resolved = await Nested._resolve_rows(Rows)
         Nested._rows = Resolved
         Nested._rowcount = len(Resolved)
         Nested._row_index = 0
