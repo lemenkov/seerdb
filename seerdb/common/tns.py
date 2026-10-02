@@ -10176,6 +10176,12 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
             if Cursor != 0:
                 Opt &= ~TNS_EXEC_OPTION_EXECUTE
 
+    # A fetch from a cursor the client holds no SQL for -- a nested cursor's or
+    # a REF CURSOR's -- is the same FETCH-only call on its id (0x8040, as
+    # oracledb-thin and OCI send it; #1462).
+    if Dictionary['query'].get('fetch_only') and Cursor != 0:
+        Opt &= ~TNS_EXEC_OPTION_EXECUTE
+
     # `cursor.parse()` (#1018): parse the statement, do NOT run it. What makes a
     # call a parse is the *absence* of EXECUTE, so the option word is set
     # outright rather than masked — every bit set_opts derived above (EXECUTE,

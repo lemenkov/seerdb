@@ -1949,15 +1949,16 @@ class OracleConnect(_ConnectionLogic):
         return self._handle_response(Acc=(None, RowFormat, []))
 
     def fetch_all_rows(self, CursorId: int, RowFormat: list) -> list:
-        # Drain a server cursor (e.g. a REF CURSOR returned by a procedure)
-        # by issuing TTI_FETCH until the server signals end-of-fetch.
+        # Drain a server cursor -- a REF CURSOR a procedure returned, or a
+        # nested cursor a row carried -- until the server signals end-of-fetch.
         AllRows: list = []
         try:
             while True:
                 # Seed the last row so a BVC-reused column in the next batch's
                 # first row copies the carried value, not None (#326).
                 set_decode_prev_row(AllRows[-1] if AllRows else None)
-                Result = self.fetch_more(CursorId, self.fetch, RowFormat=RowFormat)
+                self.send(TNS_DATA, self._fetch_by_execute_bytes(CursorId))
+                Result = self._handle_response(Acc=(None, RowFormat, []))
                 if not isinstance(Result, tuple) or len(Result) < 6:
                     break
                 (CallStatus, OraCode, _, _, MoreRows, *_) = Result

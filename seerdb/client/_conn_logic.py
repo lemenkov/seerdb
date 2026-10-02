@@ -29,6 +29,7 @@ from seerdb.common.exceptions import NotSupportedError, ProgrammingError
 from seerdb.common.tns import (
     encode_ano_fragment,
     encode_close_cursors_piggyback,
+    encode_dictionary,
     encode_end_to_end_piggyback,
     encode_end_user_sec_piggyback,
     encode_session_state_piggyback,
@@ -349,6 +350,32 @@ class _ConnectionLogic:
         if self._supports_request_boundaries():
             self._session_state_desired = TNS_SESSION_STATE_REQUEST_BEGIN
             self._in_request = True
+
+    def _fetch_by_execute_bytes(self, CursorId: int) -> bytes:
+        # One batch from a cursor the client holds no SQL for -- a nested
+        # cursor's or a REF CURSOR's -- as a FETCH-only OALL8 on its id, which
+        # is how oracledb-thin and OCI fetch one. A TTI_FETCH works on 23ai, but
+        # 10g-21c answer it with each CURSOR column of the rows cut to its id,
+        # with no inline describe, so a cursor nested in one is unreadable
+        # (#1462). No piggybacks, as a TTI_FETCH carries none: the cursor-close
+        # queue may hold this cursor's parent, and closing the parent first
+        # closes this one too.
+        Query = {
+            'type': 'select',
+            'auto': 0,
+            'fetch': self.fetch,
+            'server_version': self.server_version,
+            'cursor': CursorId,
+            'query': '',
+            'bind': [],
+            'batch': [],
+            'def': [],
+            'batcherrors': None,
+            'arraydmlrowcounts': None,
+            'return_binds': None,
+            'fetch_only': True,
+        }
+        return encode_dictionary(self._make_dict(DictionaryType.exec, query=Query))
 
     # --- Request-dictionary builder ----------------------------------------
 

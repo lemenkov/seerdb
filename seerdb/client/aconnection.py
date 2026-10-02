@@ -1367,17 +1367,16 @@ class AsyncOracleConnect(_ConnectionLogic):
         return (list(Rows or []), AtEof, ServerRowCount)
 
     async def fetch_all_rows(self, CursorId: int, RowFormat: list) -> list:
-        # Async drain of a server cursor (e.g. a REF CURSOR). Mirrors
-        # OracleConnect.fetch_all_rows.
+        # Async drain of a server cursor -- a REF CURSOR, or a nested cursor a
+        # row carried. Mirrors OracleConnect.fetch_all_rows.
         AllRows: list = []
         try:
             while True:
                 # Seed the last row so a BVC-reused column in the next batch's
                 # first row copies the carried value, not None (#326; sync parity).
                 set_decode_prev_row(AllRows[-1] if AllRows else None)
-                Result = await self.fetch_more(
-                    CursorId, self.fetch, RowFormat=RowFormat
-                )
+                await self.send(TNS_DATA, self._fetch_by_execute_bytes(CursorId))
+                Result = await self._handle_response(Acc=(None, RowFormat, []))
                 if not isinstance(Result, tuple) or len(Result) < 6:
                     break
                 (CallStatus, OraCode, _, _, MoreRows, *_) = Result

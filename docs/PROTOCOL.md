@@ -2569,7 +2569,7 @@ value per OUT / IN OUT bind **in bind order** (IN binds contribute nothing):
   cursor's result set (the same per-column metadata *and trailer* as a `TTI_DCB`,
   §6.4), then the nested cursor id (`ub2`) and the per-value **`ub4` return code**
   (`actual_num_bytes`, `0`) that follows every OUT-bind value. The client then
-  drains that cursor id with `TTI_FETCH` (§5.2). See python-oracledb's
+  drains that cursor id with a FETCH-only `OALL8` on it (below). See python-oracledb's
   `_create_cursor_from_describe`, which reads that return code with `read_sb4`
   after the cursor id. A `0x01` "present" byte there (an earlier seerdb guess)
   is read as a length-1 integer and swallows the next bind's first byte, so a
@@ -2603,6 +2603,27 @@ value per OUT / IN OUT bind **in bind order** (IN binds contribute nothing):
   value. seerdb parks them on every path that runs a statement fresh — the
   query, the re-execute and the scroll open — because the remainder a query parks
   is served later from the same converted rows.
+
+  **Fetching one: an `OALL8` on the cursor id, not `TTI_FETCH` (#1462).** A
+  cursor the client holds no SQL for (a nested cursor, a REF CURSOR) is fetched
+  the way python-oracledb (`_fetch_rows`: an ExecuteMessage whenever the
+  statement has no SQL) and OCI fetch it. The call is an `OALL8` on its id with
+  an empty statement and the options **`0x8040`** (NOT_PLSQL | FETCH, with no
+  EXECUTE and no PARSE), and it carries no piggybacks. The difference shows when
+  that cursor's rows hold cursors in turn:
+
+  | fetched with | 10g, 11g, 18c, 21c | 23ai |
+  |---|---|---|
+  | `TTI_FETCH` | each inner cursor cell is cut to `02` + the `ub4` cursor id, with **no inline describe** (`02 01 03` for cursor 3) | full cell |
+  | `OALL8` fetch-only | full cell (`4c`, describe, cursor id) | full cell |
+
+  Read as a full cell, the short form takes the cursor id for the max row size
+  and desyncs the row. An execute reply always carries the full form, which is
+  why one level of nesting worked everywhere: the first level comes in the
+  execute reply. The call must carry **no close-cursors piggyback**. The close
+  queue can hold the nested cursor's own parent, and closing the parent first
+  closes the nested cursor too, so every fetch then comes back empty. A plain
+  `TTI_FETCH` never flushed that queue. Measured on 10g, 11g, 18c, 21c and 23ai.
 
 - **OBJECT / collection** OUT value: the object frame a row cell carries
   (§21.2) — a constructed 36-byte toid, the object OID, snapshot, version, image

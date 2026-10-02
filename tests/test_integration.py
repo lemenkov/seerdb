@@ -11520,6 +11520,19 @@ class CallprocIntegration(_IntegrationBase):
         self.assertEqual([d[0] for d in nested.description], ['A', 'B'])
         self.assertEqual(nested.fetchall(), [(1, 'x'), (2, 'y')])
 
+    def test_a_refcursor_nested_in_a_nested_cursor_fetches(self):
+        # A CURSOR(...) inside a CURSOR(...): a cursor whose rows hold cursors.
+        # Fetched with TTI_FETCH, 10g-21c sent each inner cursor without its
+        # describe, and the decoder desynced (#1462).
+        self.cur.execute(
+            "SELECT CURSOR(SELECT 1, CURSOR(SELECT 'inner' FROM dual) FROM dual) "
+            'FROM dual'
+        )
+        ((outer,),) = self.cur.fetchall()
+        ((one, inner),) = outer.fetchall()
+        self.assertEqual(one, 1)
+        self.assertEqual(inner.fetchall(), [('inner',)])
+
     def test_callfunc_number(self):
         fn = f'{self.PROC}_F'
         self.cur.execute(
