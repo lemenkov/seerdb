@@ -770,7 +770,7 @@ def test_translate_idioms_rewrites_decode_to_case() -> None:
         "SELECT decode(v, 'hex') FROM t",
         'SELECT pg_catalog.decode(a, b, c) FROM t',
         'SELECT my_decode(a, b, c) FROM t',
-        "SELECT 'decode(a, b, c)' FROM dual",
+        "SELECT x FROM t WHERE c = 'decode(a, b, c)'",
     ):
         assert _translate_idioms(untouched) == untouched
 
@@ -3751,6 +3751,38 @@ def test_an_unsized_number_is_recorded_without_a_precision() -> None:
         11,
         2,
         6,
+    )
+
+
+def test_a_literal_select_item_is_cast_to_its_char_length() -> None:
+    # A select item that is one string literal is CHAR(n) in Oracle (#1494): in
+    # a query, a subquery and a cursor a block opens. An empty literal (NULL),
+    # an expression, a comparison and a set operation's branches are left as
+    # they are.
+    out = _translate_idioms(
+        "SELECT 'X' s, 'it''s' AS b, '' e, 'a' || 'b' c, "
+        "(SELECT 'z' FROM dual) q FROM t WHERE c = 'lit'"
+    )
+    assert out == (
+        "SELECT CAST('X' AS char(1)) s, CAST('it''s' AS char(4)) AS b, '' e, "
+        "'a' || 'b' c, (SELECT CAST('z' AS char(1)) FROM dual) q FROM t "
+        "WHERE c = 'lit'"
+    )
+    assert _translate_idioms("BEGIN OPEN :c FOR SELECT 'X' v FROM dual; END;") == (
+        "BEGIN OPEN :c FOR SELECT CAST('X' AS char(1)) v FROM dual; END;"
+    )
+    union = "SELECT 'a' x FROM dual UNION ALL SELECT 'bbb' FROM dual"
+    assert _translate_idioms(union) == union
+    # With no FROM at all, as the compat layer leaves `SELECT 'X' FROM dual`;
+    # and twice in one DO block, as a CREATE OR REPLACE VIEW becomes, where the
+    # first list must not run on into the second.
+    assert _translate_idioms("SELECT 'X' a") == "SELECT CAST('X' AS char(1)) a"
+    block = (
+        "DO $$ BEGIN EXECUTE $v$CREATE VIEW v AS SELECT 'ab' s, 'c' t$v$; "
+        "EXECUTE $v$CREATE VIEW v AS SELECT 'ab' s, 'c' t$v$; END $$"
+    )
+    assert _translate_idioms(block) == block.replace(
+        "'ab' s, 'c' t", "CAST('ab' AS char(2)) s, CAST('c' AS char(1)) t"
     )
 
 

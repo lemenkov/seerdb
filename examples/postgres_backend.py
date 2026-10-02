@@ -827,7 +827,10 @@ _ORACLE_DICTIONARY_DDL = (
     # as a record[], hence the jsonb.
     'CREATE OR REPLACE FUNCTION sys.ora_cursor(doc jsonb, names text[]) '
     'RETURNS refcursor LANGUAGE plpgsql AS $$ DECLARE r refcursor; defs text; '
-    "cols text; BEGIN SELECT string_agg(format('c%s %s', i, t), ', ' ORDER BY i), "
+    "cols text; BEGIN SELECT string_agg(format('c%s %s', i, CASE t "
+    # pg_typeof() names a char(n) `character`, which is char(1) as a type: a
+    # CHAR column of the rows is the unbounded bpchar instead (#1494).
+    "WHEN 'character' THEN 'bpchar' ELSE t END), ', ' ORDER BY i), "
     "string_agg(format('c%s AS %I', i, names[i]), ', ' ORDER BY i) INTO defs, cols "
     "FROM jsonb_array_elements_text(doc->0) WITH ORDINALITY AS x(t, i); OPEN r FOR "
     "EXECUTE format('SELECT %s FROM jsonb_to_recordset($1) AS t(%s)', cols, defs) "
@@ -3766,10 +3769,85 @@ def _mask_quoted(sql: str) -> tuple[str, list[str]]:
 def _unmask_quoted(sql: str, contents: list[str]) -> str:
     return _QUOTED_MASK.sub(lambda m: contents[int(m.group(1))], sql)
 
+
+_SELECT_WORD = re.compile(r'\bSELECT\b', re.IGNORECASE)
+# A SELECT that is a branch of a set operation: Oracle types a literal there by
+# the widest branch, a VARCHAR when they differ, which PostgreSQL's text is.
+_SET_OPERATOR_BEFORE = re.compile(
+    r'\b(?:UNION(?:\s+ALL)?|INTERSECT|EXCEPT|MINUS)\s*\(?\s*$', re.IGNORECASE
+)
+# A dollar-quote delimiter, $$ or $tag$.
+_DOLLAR_QUOTE = re.compile(r'\$\w*\$')
+# The clauses that can follow a select list.
+_SELECT_LIST_ENDS = frozenset(
+    {'FROM', 'INTO', 'WHERE', 'GROUP', 'HAVING', 'ORDER', 'FETCH', 'OFFSET', 'LIMIT'}
+)
+# A select item that is one masked string literal, optionally aliased.
+_LITERAL_ITEM = re.compile("'\x00(\\d+)\x00'(.*)", re.DOTALL)
+
+
+def _cast_literal_items(sql: str) -> str:
+    # A select item that is one non-empty string literal is CHAR(n) in Oracle,
+    # n its length; PostgreSQL resolves it to text, a VARCHAR (#1494). Each
+    # becomes CAST(lit AS char(n)), in every select list -- a subquery's, a
+    # cursor's a block opens -- but a set operation's, where Oracle types it by
+    # the widest branch.
+    (masked, contents) = _mask_quoted(sql)
+    edits: list[tuple[int, int, str]] = []
+    for match in _SELECT_WORD.finditer(masked):
+        if _SET_OPERATOR_BEFORE.search(masked, 0, match.start()):
+            continue
+        # The statement this SELECT starts ends at its closing parenthesis, a
+        # `;` or a dollar quote: a DO block -- a CREATE OR REPLACE VIEW is one --
+        # can hold the same select list twice, and one with no FROM (the compat
+        # layer drops `FROM dual`) would otherwise run on into the next.
+        depth, end = 0, len(masked)
+        for i in range(match.end(), len(masked)):
+            if masked[i] == '(':
+                depth += 1
+            elif masked[i] == ')':
+                depth -= 1
+                if depth < 0:
+                    end = i
+                    break
+            elif depth == 0 and (
+                masked[i] == ';' or _DOLLAR_QUOTE.match(masked, i) is not None
+            ):
+                end = i
+                break
+        segment = masked[match.start() : end]
+        words, _rownums = _top_level_words(segment)
+        if any(w in ('UNION', 'INTERSECT', 'EXCEPT', 'MINUS') for _p, w in words):
+            continue
+        # The list ends at the first clause -- FROM, or an INTO in PL/SQL -- or
+        # at the statement's end: the compat layer drops a `FROM dual`.
+        stop = next(
+            (p for p, w in words[1:] if w in _SELECT_LIST_ENDS), len(segment)
+        )
+        start = len('SELECT')
+        if len(words) > 1 and words[1][1] in ('DISTINCT', 'UNIQUE', 'ALL'):
+            start = words[1][0] + len(words[1][1])
+        for s_at, e_at in _top_level_items(segment, start, stop):
+            item = segment[s_at:e_at].strip()
+            literal = _LITERAL_ITEM.fullmatch(item)
+            if literal is None or not _ITEM_ALIAS.fullmatch(literal.group(2).strip()):
+                continue
+            text = contents[int(literal.group(1))]
+            length = len(text.replace("''", "'"))
+            if not length:
+                continue  # '' is NULL in Oracle, of no length
+            at = match.start() + segment.index(item, s_at)
+            mask = item[: item.index("'", 1) + 1]
+            edits.append((at, at + len(mask), f'CAST({mask} AS char({length}))'))
+    for at, until, replacement in sorted(set(edits), reverse=True):
+        masked = masked[:at] + replacement + masked[until:]
+    return _unmask_quoted(masked, contents)
+
 def _translate_idioms(sql: str) -> str:
     """Rewrite the Oracle SQL functions / literal idioms the suite uses to their
     PostgreSQL equivalents (#502). Applied to every statement."""
     sql = _quote_hash_identifiers(sql)
+    sql = _cast_literal_items(sql)
     sql = _rewrite_rownum(sql)
     sql = _translate_deref(sql)
     sql = _translate_connect_by(sql)
