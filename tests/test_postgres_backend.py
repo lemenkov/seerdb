@@ -412,33 +412,41 @@ def test_a_one_element_constructor_is_spelt_as_a_call() -> None:
         assert _spell_one_element_constructors(sql, names) == sql
 
 
-def test_a_block_with_a_ref_cursor_bind_becomes_a_do_block() -> None:
-    # A REF CURSOR bind becomes a local refcursor whose portal name the block
-    # leaves in a setting; other binds are inlined as the literals given (#1300).
-    # Bind names are found, and replaced, past string literals.
-    from postgres_backend import _bind_names, _cursor_block, _replace_binds
+def test_a_block_with_binds_becomes_a_do_block() -> None:
+    # Each bind becomes a typed local, initialised with its value, whose value
+    # the block leaves in a setting before it ends -- a REF CURSOR's its portal
+    # name (#1456, #1459). Bind names are found, and replaced, past literals.
+    from postgres_backend import _bind_block, _bind_names, _replace_binds
 
     block = "BEGIN OPEN :c FOR SELECT ':x' FROM t WHERE k BETWEEN :a AND :b; END;"
     assert _bind_names(block) == ['c', 'a', 'b']
     assert _replace_binds(block, {'a': '2'}) == (
         "BEGIN OPEN :c FOR SELECT ':x' FROM t WHERE k BETWEEN 2 AND :b; END;"
     )
-    out = _cursor_block(block, {'c': 0}, {'a': '2', 'b': '4'})
-    assert out.startswith('DO $$ DECLARE')
-    assert 'mirror_refcursor_0 refcursor;' in out
-    assert (
-        "OPEN mirror_refcursor_0 FOR SELECT ':x' FROM t WHERE k BETWEEN 2 AND 4;" in out
+    out = _bind_block(
+        block,
+        {
+            'c': (0, 'refcursor', 'NULL'),
+            'a': (1, 'numeric', '2'),
+            'b': (2, 'numeric', '4'),
+        },
     )
+    assert out.startswith('DO $$ DECLARE')
+    assert 'mirror_bind_0 refcursor := NULL;' in out
+    assert 'mirror_bind_1 numeric := 2;' in out
     assert (
-        "set_config('mirror.refcursor_0', coalesce(mirror_refcursor_0::text, ''), true)"
+        "OPEN mirror_bind_0 FOR SELECT ':x' FROM t WHERE k BETWEEN mirror_bind_1 AND mirror_bind_2;"
         in out
     )
-    assigned = _cursor_block(
-        'DECLARE t SYS_REFCURSOR; BEGIN OPEN t FOR SELECT 1 FROM dual; :c := t; END;',
-        {'c': 0},
-        {},
+    assert (
+        "set_config('mirror.block_bind_0', CASE WHEN mirror_bind_0 IS NULL THEN '' "
+        in out
     )
-    assert 'mirror_refcursor_0 := t;' in assigned and 'refcursor' in assigned.lower()
+    declared = _bind_block(
+        'DECLARE t NUMBER; BEGIN t := :1; :2 := t * 2; END;',
+        {'1': (0, 'numeric', '21'), '2': (1, 'numeric', 'NULL')},
+    )
+    assert 't numeric;' in declared and 'mirror_bind_1 := t * 2;' in declared
 
 
 def test_delete_without_from_gains_it() -> None:
