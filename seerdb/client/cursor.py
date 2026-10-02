@@ -8,6 +8,8 @@ from seerdb.client._cursor_logic import _CursorLogic, _touched_rowid
 from seerdb.common.datatypes import (
     _DATE_TNS_TYPES,
     _NUMBER_TNS_TYPES,
+    DB_TYPE_OBJECT,
+    DB_TYPE_XMLTYPE,
     RefCursorBind,
     TempLob,
     Var,
@@ -1480,6 +1482,12 @@ def _col_annotations(Col: dict) -> dict | None:
     return {_s(K): _s(V) for K, V in Ann.items()}
 
 
+def _is_xmltype(Col: dict) -> bool:
+    return (Col.get('type_schema') or '').upper() == 'SYS' and (
+        Col.get('type_name') or ''
+    ).upper() == 'XMLTYPE'
+
+
 def _column_description(Col: dict) -> 'FetchInfo':
     # PEP 249 description tuple, matching python-oracledb's FetchInfo exactly:
     #   (name, type_code, display_size, internal_size, precision, scale, null_ok)
@@ -1494,6 +1502,10 @@ def _column_description(Col: dict) -> 'FetchInfo':
     TypeCode: object = dbtype_for_oracle_type(TnsType, Csfrm)
     if TypeCode is None:
         TypeCode = TnsType
+    elif TypeCode is DB_TYPE_OBJECT and _is_xmltype(Col):
+        # An XMLType is an object column on the wire; its type name is what
+        # python-oracledb reports it apart by (#1478).
+        TypeCode = DB_TYPE_XMLTYPE
     Precision = Col.get('precision') or 0
     Scale = Col.get('data_scale') or 0
     MaxSize = Col.get('max_size') or 0
