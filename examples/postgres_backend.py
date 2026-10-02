@@ -2308,6 +2308,7 @@ _BUILTIN_TYPE_OID_BYTE = {
     'CHAR': 0x1A,
     'BINARY_FLOAT': 0x44,
     'BINARY_DOUBLE': 0x45,
+    'DATE': 0x08,  # measured on 23ai (#1474)
     'TIMESTAMP': 0x3D,
     'TIMESTAMP WITH TZ': 0x3E,
     'TIMESTAMP WITH LOCAL TZ': 0x41,
@@ -2371,6 +2372,10 @@ def _tds_scalar(pg_name: str, typmod: int) -> tuple[_TdsLeaf, str]:
         )
     if pg_name == _TSTZ_TYPE:
         return (_tds_timestamp(0x17, 6), 'TIMESTAMP WITH TZ')
+    if pg_name == _DATE_TYPE:
+        # A table's DATE column (#1316), as a %ROWTYPE attribute: the TDS code
+        # alone, nothing after it, measured on 23ai (#1474).
+        return (_TdsLeaf(b'\x02'), 'DATE')
     raise UnsupportedFeature(f'type shape: {pg_name} has no Oracle attribute type')
 
 

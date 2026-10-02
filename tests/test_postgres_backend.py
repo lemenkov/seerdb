@@ -2285,6 +2285,52 @@ def test_get_type_shape_is_answered_from_the_catalog() -> None:
         admin.close()
 
 
+def test_get_type_shape_of_a_rowtype_with_a_date_column() -> None:
+    # A table's DATE column is the ora_date domain (#1316). As a %ROWTYPE
+    # attribute it had no Oracle type at all; its TDS leaf is the DATE code
+    # alone and its built-in type OID ends in 0x08. The whole TDS is the one a
+    # live 23ai returns for the same table (#1474).
+    from seerdb.common.tns_consts import (
+        TNS_TYPE_NUMBER,
+        TNS_TYPE_RAW,
+        TNS_TYPE_REFCURSOR,
+        TNS_TYPE_VARCHAR,
+    )
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE pyo_rowtype_date (n NUMBER, d DATE, t TIMESTAMP)')
+        binds = [
+            BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=4),
+            BindVar(
+                value='PYO_ROWTYPE_DATE%ROWTYPE',
+                tns_type=TNS_TYPE_VARCHAR,
+                max_size=128,
+            ),
+            BindVar(value=None, tns_type=TNS_TYPE_RAW, max_size=16),
+            BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=4),
+            BindVar(value=None, tns_type=TNS_TYPE_RAW, max_size=32767),
+            BindVar(value=None, tns_type=TNS_TYPE_REFCURSOR, max_size=1),
+            BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=128),
+        ]
+        (ret_val, _f, _o, _v, tds, attrs, _p) = backend.execute(
+            _TYPE_SHAPE_SQL, binds
+        ).out_binds
+        assert ret_val == 0
+        assert tds.hex() == (
+            '0000001b260200010003002900000000000c0600810215062a0007000a000b'
+        )
+        assert [(r[1], r[3], r[6][-1]) for r in attrs.rows[:2]] == [
+            ('N', 'NUMBER', 0x0F),
+            ('D', 'DATE', 0x08),
+        ]
+    finally:
+        backend.execute('DROP TABLE IF EXISTS pyo_rowtype_date')
+        backend.commit()
+        backend.close()
+
+
 def test_the_column_visibility_attribute_comes_out_of_the_ddl() -> None:
     # INVISIBLE / VISIBLE follow a column's type in CREATE TABLE and in ALTER
     # TABLE ADD / MODIFY; the statement loses it and says which columns it named,
