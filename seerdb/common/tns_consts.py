@@ -433,21 +433,38 @@ TNS_MSG_TYPE_RENEGOTIATE = 28  # server asks the client to renegotiate (TLS / ca
 # wire formats. Kept here in the leaf constants module (rather than seerdb.common.tns)
 # so seerdb.client.cursor can import the 12.1 threshold from a lightweight leaf
 # without dragging in the whole encoder.
-FIELD_VERSION_9_2 = 2  # Oracle 9i (pre-10g O3LOGON thin auth, #90)
-FIELD_VERSION_10_2 = 4  # Oracle 10g — oldest tier using the O5LOGON path
+# Every field version, an extension always spelled _EXT_<n>; the two below 11.2
+# serve the 9i / 10g paths (#1487).
+# Oracle 9i (pre-10g O3LOGON thin auth, #90).
+FIELD_VERSION_9_2 = 2
+# Oracle 10g -- the oldest tier using the O5LOGON path.
+FIELD_VERSION_10_2 = 4
 FIELD_VERSION_11_2 = 6
 FIELD_VERSION_12_1 = 7
 FIELD_VERSION_12_2 = 8
-FIELD_VERSION_12_2_EXT1 = 9
-FIELD_VERSION_18_1_EXT1 = (
-    11  # Oracle 18c; the layout the Mirror speaks to sqlplus from 12.1 (#1282)
-)
+FIELD_VERSION_12_2_EXT_1 = 9
+FIELD_VERSION_18_1 = 10
+# Oracle 18c; the layout the Mirror speaks to sqlplus from 12.1 (#1282).
+FIELD_VERSION_18_1_EXT_1 = 11
 FIELD_VERSION_19_1 = 12
-FIELD_VERSION_19_1_EXT1 = 13  # written inside the FAST_AUTH envelope (#89)
-FIELD_VERSION_20_1 = 14  # AQ JSON-payload pointer gate (#128)
+# Written inside the FAST_AUTH envelope (#89).
+FIELD_VERSION_19_1_EXT_1 = 13
+# The AQ JSON-payload pointer gate (#128).
+FIELD_VERSION_20_1 = 14
+FIELD_VERSION_20_1_EXT_1 = 15
 FIELD_VERSION_21_1 = 16
-FIELD_VERSION_23_1 = 17  # highest the LEGACY 3-message handshake reaches
-FIELD_VERSION_23_4 = 24  # 23ai max; reached only via FAST_AUTH (#89)
+# The highest the LEGACY 3-message handshake reaches.
+FIELD_VERSION_23_1 = 17
+# From here on only FAST_AUTH reaches the version (#89).
+FIELD_VERSION_23_1_EXT_1 = 18
+FIELD_VERSION_23_1_EXT_2 = 19
+FIELD_VERSION_23_1_EXT_3 = 20
+FIELD_VERSION_23_1_EXT_4 = 21
+FIELD_VERSION_23_1_EXT_5 = 22
+FIELD_VERSION_23_3_EXT_6 = 23
+FIELD_VERSION_23_4 = 24
+# The highest this client and the Mirror speak: 23ai's.
+FIELD_VERSION_MAX = FIELD_VERSION_23_4
 
 # Indices into the compile-time capability array the handshake exchanges
 # (TNS_CCAP_*); the feature bits at a few of them sit with the features they

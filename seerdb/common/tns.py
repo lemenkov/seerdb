@@ -170,8 +170,8 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_12_2,
-    FIELD_VERSION_12_2_EXT1,
-    FIELD_VERSION_19_1_EXT1,
+    FIELD_VERSION_12_2_EXT_1,
+    FIELD_VERSION_19_1_EXT_1,
     FIELD_VERSION_20_1,
     FIELD_VERSION_21_1,
     FIELD_VERSION_23_1,
@@ -2287,7 +2287,7 @@ def _skip_exec_middle_12c(rest: bytes, field_version: int) -> bytes:
         rest = rest[3:]
     if field_version >= FIELD_VERSION_12_2:
         rest = rest[5:]  # al8sqlsig / SQL id
-    if field_version >= FIELD_VERSION_12_2_EXT1:
+    if field_version >= FIELD_VERSION_12_2_EXT_1:
         rest = rest[2:]  # chunk ids
     return rest
 
@@ -10263,7 +10263,7 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
             Middle += bytes([0, 0, 0])  # al8pidmlrc block
         if FieldVersion >= FIELD_VERSION_12_2:
             Middle += bytes([0, 0, 0, 0, 0])  # 12.2 al8sqlsig / SQL id
-        if FieldVersion >= FIELD_VERSION_12_2_EXT1:
+        if FieldVersion >= FIELD_VERSION_12_2_EXT_1:
             Middle += bytes([0, 0])  # 12.2_EXT1 chunk ids
         # The length-prefixed SQL is written only when there is SQL to parse. On
         # a no-parse re-execute (Cursor != 0, empty query — e.g. a #181 scroll
@@ -12001,7 +12001,7 @@ def encode_fast_auth(Pro: bytes, Dty: bytes, Sess: bytes) -> bytes:
         0x22 ver=1 SERVER_CONVERTS_CHARS flag2=0
         <PRO message>
         charset(ub2)=0  flag(ub1)=0  ncharset(ub2)=0
-        ttc_field_version byte = FIELD_VERSION_19_1_EXT1
+        ttc_field_version byte = FIELD_VERSION_19_1_EXT_1
         <DTY message>            (its caps array still advertises the real fv)
         <OSESSKEY message>
     """
@@ -12009,7 +12009,7 @@ def encode_fast_auth(Pro: bytes, Dty: bytes, Sess: bytes) -> bytes:
         bytes([TNS_MSG_TYPE_FAST_AUTH, 1, TNS_SERVER_CONVERTS_CHARS, 0])
         + Pro
         + b'\x00\x00\x00\x00\x00'
-        + bytes([FIELD_VERSION_19_1_EXT1])
+        + bytes([FIELD_VERSION_19_1_EXT_1])
         + Dty
         + Sess
     )
