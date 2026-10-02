@@ -2836,7 +2836,8 @@ def test_a_held_read_delays_a_reinstall_but_does_not_hang_it() -> None:
 
 def test_a_timestamptz_column_is_local_time_zone() -> None:
     # A timestamptz column is TIMESTAMP WITH LOCAL TIME ZONE (#1208), and the
-    # dictionary says so; WITH TIME ZONE is the ora_tstz composite (#1272).
+    # dictionary says so; WITH TIME ZONE is the ora_tstz composite (#1272). Each
+    # names its fractional-seconds precision, as Oracle's dictionary does (#1480).
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     try:
         backend.execute('drop table if exists t_ltzcol')
@@ -2848,9 +2849,9 @@ def test_a_timestamptz_column_is_local_time_zone() -> None:
             "SELECT data_type FROM all_tab_columns WHERE table_name = 'T_LTZCOL' "
             'ORDER BY column_id'
         ).rows == [
-            ('TIMESTAMP',),
-            ('TIMESTAMP WITH TIME ZONE',),
-            ('TIMESTAMP WITH LOCAL TIME ZONE',),
+            ('TIMESTAMP(6)',),
+            ('TIMESTAMP(6) WITH TIME ZONE',),
+            ('TIMESTAMP(6) WITH LOCAL TIME ZONE',),
         ]
         backend.execute('drop table t_ltzcol')
         backend.commit()

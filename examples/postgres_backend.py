@@ -106,6 +106,9 @@ edge of this adapter:
   round-trip back as ``t1`` (SQLAlchemy ``NormalizedNameTest``). A quoted
   mixed-case or reserved-word name, which PostgreSQL *does* store distinctly, is
   preserved.
+- **Fractional seconds stop at six digits** — PostgreSQL keeps microseconds, so a
+  ``TIMESTAMP(7)`` to ``TIMESTAMP(9)`` column is a ``TIMESTAMP(6)``: it describes
+  and reads back as one, and the extra digits are not stored (#1480).
 """
 
 from __future__ import annotations
@@ -916,6 +919,14 @@ _ORACLE_DICTIONARY_DDL = (
     'relid oid NOT NULL, attnum smallint NOT NULL, data_type text NOT NULL, '
     'data_length integer, data_precision integer, data_scale integer, '
     'PRIMARY KEY (relid, attnum));'
+    # The fractional-seconds precision a TIMESTAMP(n) WITH TIME ZONE column was
+    # declared with (#1308). WITH TIME ZONE is the ora_tstz composite, which has
+    # no type modifier to hold it, so it is kept here; a column not listed has
+    # Oracle's default, 6. Keyed by the column's own
+    # identity; all_tab_cols reads it (#1480).
+    'CREATE TABLE IF NOT EXISTS sys.ora_tstz_precision ('
+    'relid oid NOT NULL, attnum smallint NOT NULL, prec smallint NOT NULL, '
+    'PRIMARY KEY (relid, attnum));'
     'CREATE OR REPLACE VIEW sys.all_tab_cols AS SELECT '
     "CASE WHEN c.table_schema LIKE 'pg_temp%' THEN upper(current_schema()) "
     'ELSE upper(c.table_schema) END AS owner, '
@@ -934,17 +945,38 @@ _ORACLE_DICTIONARY_DDL = (
     "CASE WHEN c.data_type = 'ARRAY' AND c.domain_name IS NOT NULL "
     'THEN ora_name(c.domain_name) '
     f"WHEN c.domain_name = '{_DATE_TYPE}' THEN 'DATE' "
+    # A TIMESTAMP names its fractional-seconds precision, as Oracle's
+    # TIMESTAMP(6) does, and keeps it as DATA_SCALE; its length is that of its
+    # wire form -- 11 bytes, 7 with no fraction, 13 WITH TIME ZONE. A BINARY_FLOAT / BINARY_DOUBLE (real / double
+    # precision) has no precision in Oracle, and 4 or 8 bytes (#1480).
     "WHEN c.data_type = 'USER-DEFINED' AND c.udt_name = 'ora_tstz' "
-    "THEN 'TIMESTAMP WITH TIME ZONE' "
+    "THEN 'TIMESTAMP(' || coalesce(p.prec, 6) || ') WITH TIME ZONE' "
     "WHEN c.data_type = 'USER-DEFINED' THEN ora_name(c.udt_name) "
+    "WHEN o.data_type IS NULL AND c.data_type = 'timestamp without time zone' "
+    "THEN 'TIMESTAMP(' || c.datetime_precision || ')' "
+    "WHEN o.data_type IS NULL AND c.data_type = 'timestamp with time zone' "
+    "THEN 'TIMESTAMP(' || c.datetime_precision || ') WITH LOCAL TIME ZONE' "
     # A type recorded as declared reads as declared (#1386).
     'ELSE coalesce(o.data_type, ora_type_name(c.data_type)) END AS data_type, '
-    f"CASE WHEN c.domain_name = '{_DATE_TYPE}' THEN 7 ELSE "
+    f"CASE WHEN c.domain_name = '{_DATE_TYPE}' THEN 7 "
+    "WHEN c.data_type = 'USER-DEFINED' AND c.udt_name = 'ora_tstz' THEN 13 "
+    'WHEN o.data_type IS NULL AND c.data_type IN '
+    "('timestamp without time zone', 'timestamp with time zone') "
+    'THEN CASE c.datetime_precision WHEN 0 THEN 7 ELSE 11 END '
+    "WHEN o.data_type IS NULL AND c.data_type = 'real' THEN 4 "
+    "WHEN o.data_type IS NULL AND c.data_type = 'double precision' THEN 8 ELSE "
     'coalesce(o.data_length, c.character_maximum_length, c.numeric_precision, 22) '
     'END AS data_length, '
-    'coalesce(o.data_precision, c.numeric_precision)'
+    "(CASE WHEN o.data_type IS NULL AND c.data_type IN ('real', 'double precision') "
+    'THEN NULL ELSE coalesce(o.data_precision, c.numeric_precision) END)'
     '::information_schema.cardinal_number AS data_precision, '
-    'coalesce(o.data_scale, c.numeric_scale)'
+    f"(CASE WHEN c.domain_name = '{_DATE_TYPE}' THEN NULL "
+    "WHEN c.data_type = 'USER-DEFINED' AND c.udt_name = 'ora_tstz' "
+    'THEN coalesce(p.prec, 6) '
+    'WHEN o.data_type IS NULL AND c.data_type IN '
+    "('timestamp without time zone', 'timestamp with time zone') "
+    'THEN c.datetime_precision '
+    'ELSE coalesce(o.data_scale, c.numeric_scale) END)'
     '::information_schema.cardinal_number AS data_scale, '
     # CHAR_LENGTH is 0 for a type with no character length, not NULL (#1418).
     'coalesce(c.character_maximum_length, 0)'
@@ -965,6 +997,9 @@ _ORACLE_DICTIONARY_DDL = (
     'LEFT JOIN sys.ora_columns o ON o.relid = '
     "(quote_ident(c.table_schema) || '.' || quote_ident(c.table_name))::regclass "
     'AND o.attnum = c.ordinal_position '
+    'LEFT JOIN sys.ora_tstz_precision p ON p.relid = '
+    "(quote_ident(c.table_schema) || '.' || quote_ident(c.table_name))::regclass "
+    'AND p.attnum = c.ordinal_position '
     "WHERE c.table_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
     'CREATE OR REPLACE VIEW sys.user_tab_cols AS SELECT * FROM all_tab_cols '
     'WHERE owner=upper(current_schema());'
@@ -1108,13 +1143,6 @@ _ORACLE_DICTIONARY_DDL = (
     # own column identity; rows of dropped tables are pruned on the next write.
     'CREATE TABLE IF NOT EXISTS sys.ora_quoted_names ('
     'relid oid NOT NULL, attnum smallint NOT NULL, PRIMARY KEY (relid, attnum));'
-    # The fractional-seconds precision a TIMESTAMP(n) WITH TIME ZONE column was
-    # declared with (#1308). WITH TIME ZONE is the ora_tstz composite, which has
-    # no type modifier to hold it, so it is kept here; a column not listed has
-    # Oracle's default, 6. Keyed like the quoted names above.
-    'CREATE TABLE IF NOT EXISTS sys.ora_tstz_precision ('
-    'relid oid NOT NULL, attnum smallint NOT NULL, prec smallint NOT NULL, '
-    'PRIMARY KEY (relid, attnum));'
     # v$session / v$session_connect_info (#1212): the sessions of this database,
     # a SID being the backend's pid (as the login reply names it) and the
     # identity columns the ones the client declared.
