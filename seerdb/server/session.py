@@ -150,7 +150,7 @@ from seerdb.common.tns_consts import (
     CCAP_LOB_12C,
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
-    FIELD_VERSION_23_1,
+    FIELD_VERSION_23_1_EXT_1,
     ORA_INSUFFICIENT_PRIVILEGES,
     ORA_INTERNAL_ERROR,
     ORA_INVALID_CURSOR,
@@ -1241,7 +1241,7 @@ def _serve_thin_session(
         stream.response_token = None
         if (
             stream.last_data_flags & TNS_DATA_FLAGS_END_OF_REQUEST
-            and field_version > FIELD_VERSION_23_1
+            and field_version >= FIELD_VERSION_23_1_EXT_1
             and len(body) > 3
         ):
             stream.response_token, _ = decode_ub4(body[3:])
@@ -2131,7 +2131,7 @@ def _skip_piggybacks(
     while len(body) >= 3 and body[0] == TTI_MSG_TYPE_PIGGYBACK:
         func = body[1]
         rest = body[3:]  # skip the piggyback token, function code, sequence
-        if _DECODE_FIELD_VERSION.get() > FIELD_VERSION_23_1:
+        if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_23_1_EXT_1:
             _, rest = decode_ub4(rest)  # the fv24 ub8 token
         if func == TTI_OCCA:  # CLOSE_CURSORS
             rest = rest[1:]  # pointer byte

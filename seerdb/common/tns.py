@@ -175,6 +175,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_20_1,
     FIELD_VERSION_21_1,
     FIELD_VERSION_23_1,
+    FIELD_VERSION_23_1_EXT_1,
     ISO_LATIN_1_CHARSET,
     ORA_ARRAY_DML_ERRORS,
     ORA_LOB_ALREADY_OPENED,
@@ -1097,7 +1098,7 @@ def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
     VecDims: int | None
     VecFormat: int | None
     VecFlags: int | None
-    if _DECODE_FIELD_VERSION.get() > FIELD_VERSION_23_1:  # 23ai fv >= 18 (#89)
+    if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_23_1_EXT_1:  # 23ai (#89)
         # Each column carries its annotation map and the vector descriptor after
         # the domain fields (oracledb base.pyx _process_metadata). Both must be
         # consumed or the row stream desyncs; the annotations are the #89 payload.
@@ -1448,7 +1449,7 @@ def _encode_dcb_column(col: ColumnMeta, position: int) -> bytes:
             else b''
         )
         + (
-            # fv > 17 (23ai fv24): each column also carries its annotation map and
+            # fv >= 23.1 EXT 1 (23ai fv24): each column also carries its annotation map and
             # a vector descriptor after the domain fields (§20.5); the client
             # consumes both or the row stream desyncs. The Mirror emits the
             # column's annotations (#1082) and a descriptor from the column's own vector
@@ -1463,7 +1464,7 @@ def _encode_dcb_column(col: ColumnMeta, position: int) -> bytes:
                     (col.vector_flags or 0) & 0xFF,
                 ]
             )  # vector_format, flags
-            if field_version > FIELD_VERSION_23_1
+            if field_version >= FIELD_VERSION_23_1_EXT_1
             else b''
         )
     )
@@ -1486,7 +1487,7 @@ def _encode_describe_body(columns: list[ColumnMeta]) -> bytes:
 
 
 def _encode_annotations(annotations: tuple[tuple[bytes, bytes], ...]) -> bytes:
-    # A column's annotation map, as a 23ai (fv > 17) describe carries it: the
+    # A column's annotation map, as a 23ai (fv >= 23.1 EXT 1) describe carries it: the
     # count, a pointer byte, the count again, a pointer byte, then per pair its
     # key, its value and a ub4 flags word, and a trailing ub4 flags. None is a
     # bare count of 0. The inverse of the client's reader (#89), which skips the
@@ -2248,12 +2249,12 @@ def _decode_bind_value(data_type: int, csfrm: int, raw: bytes | list) -> object:
 
 def _skip_fun_header(payload: bytes, header: int = 3) -> bytes:
     # Bytes after a TTI function-message header (TTI_FUN, subtype, seq). At
-    # fv > 17 the header carries an extra ub8 token number (0 for an ordinary
+    # fv >= 23.1 EXT 1 the header carries an extra ub8 token number (0 for an ordinary
     # call) after the sequence — oracledb's _write_function_code / PROTOCOL.md
     # §20.4 — present on every function message, so skip it too. Below fv 18
     # there is none, so this is the historical `payload[header:]`.
     rest = payload[header:]
-    if _DECODE_FIELD_VERSION.get() > FIELD_VERSION_23_1:
+    if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_23_1_EXT_1:
         _token, rest = decode_ub4(rest)
     return rest
 
@@ -5635,15 +5636,15 @@ def encode_dictionary_auth(Dictionary: dict) -> tuple[bytes, bytes]:
     # desync — surfaces as ORA-03120 (two-task conversion: integer overflow).
     FieldVersion = Dictionary.get('field_version', FIELD_VERSION_11_2)
 
-    # At fv >= 18 (fast-auth / 23ai, #89) phase two follows python-oracledb
+    # At fv >= 23.1 EXT 1 (fast-auth / 23ai, #89) phase two follows python-oracledb
     # exactly: the username is NOT re-sent (has_user = 0, user length 0 — the
     # session is already established by OSESSKEY), and the OAUTH carries the
-    # session-context pairs the server now requires. The legacy fv <= 17 path
+    # session-context pairs the server now requires. The legacy fv <= 23.1 path
     # re-sends the username and the minimal AUTH_PASSWORD/SESSKEY/SPEEDY_KEY set;
     # using either shape against the other desyncs the server's parse, surfacing
     # as ORA-03120 (two-task conversion: integer overflow). RE'd from an
     # oracledb-thin fv24 capture (docs/PROTOCOL.md §20).
-    if FieldVersion > FIELD_VERSION_23_1:
+    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
         # Header replicates python-oracledb's fv24 phase two byte-for-byte: the
         # has-user pointer byte is 0 followed by an extra 0x01, the logon mode
         # gains 0x20000, and the username is still sent length-prefixed. RE'd from
@@ -5671,7 +5672,7 @@ def encode_dictionary_auth(Dictionary: dict) -> tuple[bytes, bytes]:
         # zone, not the client's — a porting surprise (#307). Gated to 12c+: that
         # is where oracledb (thin, 12.1+) operates and the phase-two AUTH accepts
         # the extra pair; 10g / 11g have a stricter parse that desyncs on it, and
-        # no oracledb reference to match. The fv > 17 fast-auth path already
+        # no oracledb reference to match. The fv >= 23.1 EXT 1 fast-auth path already
         # carries this via _auth_session_kvs.
         if FieldVersion >= FIELD_VERSION_12_1:
             SessionKvs = encode_kv(b'AUTH_ALTER_SESSION', _local_tz_clause(), 1)
@@ -5806,7 +5807,7 @@ def _client_driver_name(Dictionary: dict) -> str:
 
 def _auth_session_kvs(Dictionary: dict) -> bytes:
     """The session-context key/value pairs the OAUTH phase two must carry at
-    fv >= 18 (#89): client charset, driver banner, packed version, the time-zone
+    fv >= 23.1 EXT 1 (#89): client charset, driver banner, packed version, the time-zone
     ALTER SESSION, and the connect descriptor."""
     Charset = struct.pack('<H', CharsetDict.get(Dictionary['req'], AL32UTF8_CHARSET))
     return (
@@ -5856,10 +5857,10 @@ def encode_dictionary_chgpwd(Dictionary: dict) -> bytes:
     )
 
     FieldVersion = Dictionary.get('field_version', FIELD_VERSION_11_2)
-    # fv >= 18 (23ai, #89) needs the same header shape as the login phase two:
+    # fv >= 23.1 EXT 1 (23ai, #89) needs the same header shape as the login phase two:
     # the extra leading pointer byte and the 0x20000 logon-mode bit (else the
     # server rejects the change with ORA-03120). See encode_dictionary_auth.
-    if FieldVersion > FIELD_VERSION_23_1:
+    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
         Header = bytes([TTI_FUN, TTI_AUTH, Tseq, 0, 1])
         LogonMode = encode_sb4(0x102 | 0x20000)
     else:
@@ -5883,7 +5884,7 @@ def encode_dictionary_chgpwd(Dictionary: dict) -> bytes:
 
 
 def _fun_header(Token: int, Seq: int, FieldVersion: int, TokenNum: int = 0) -> bytes:
-    # Header for a TTI function-call message. 23ai (fv > 17, #89) appends a
+    # Header for a TTI function-call message. 23ai (fv >= 23.1 EXT 1, #89) appends a
     # ub8 "token number" after the sequence number (oracledb's
     # _write_function_code at fv24) — present on every function message
     # (execute, fetch, commit/rollback, LOB ops, logoff, ...). Omitting it
@@ -5892,7 +5893,7 @@ def _fun_header(Token: int, Seq: int, FieldVersion: int, TokenNum: int = 0) -> b
     # (encode_sb4(0) == b"\x00", the historical single zero byte); request
     # pipelining (#132) numbers each piggybacked call 1..N so the server can tag
     # each response with a matching TOKEN (33) marker.
-    if FieldVersion > FIELD_VERSION_23_1:
+    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
         return bytes([TTI_FUN, Token, Seq]) + encode_sb4(TokenNum)
     return bytes([TTI_FUN, Token, Seq])
 
@@ -5906,7 +5907,7 @@ def encode_pipeline_begin(
     # shares that message's token. Mirrors oracledb
     # _write_begin_pipeline_piggyback; byte-validated against a 23ai capture.
     Out = bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_PIPELINE_BEGIN, Seq])
-    if FieldVersion > FIELD_VERSION_23_1:
+    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
         Out += encode_sb4(TokenNum)
     return Out + encode_sb4(0) + bytes([0]) + bytes([Mode])
 
@@ -5932,7 +5933,7 @@ def encode_close_cursors_piggyback(Seq: int, FieldVersion: int, Cursors: list) -
     _write_close_cursors_piggyback — note the ub8 token at fv24, which the older
     encode_dictionary_pig path omitted (it was never exercised on 12c+)."""
     Out = bytes([TTI_MSG_TYPE_PIGGYBACK, TTI_OCCA, Seq])
-    if FieldVersion > FIELD_VERSION_23_1:
+    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
         Out += encode_sb4(0)  # ub8 token (0)
     Out += bytes([1]) + encode_sb4(len(Cursors))  # pointer + count
     for C in Cursors:
@@ -5969,7 +5970,7 @@ def encode_end_to_end_piggyback(Seq: int, FieldVersion: int, Attrs: dict) -> byt
         Flags |= TNS_END_TO_END_DBOP
 
     Out = bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_SET_END_TO_END_ATTR, Seq])
-    if FieldVersion > FIELD_VERSION_23_1:
+    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
         Out += encode_sb4(0)  # ub8 token (0)
     Out += bytes([0, 0]) + encode_sb4(Flags)  # cidnam, cidser pointers; flags
     Out += _e2e_header(Mod['client_identifier'], Val['client_identifier'])
@@ -6007,7 +6008,7 @@ def encode_end_user_sec_piggyback(
     reconstructed from the reference thin client (docs/PROTOCOL.md §34); the
     feature is tcps-only so it cannot be captured on a cleartext transport."""
     Out = bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_END_USER_SECURITY_CTX, Seq])
-    if FieldVersion > FIELD_VERSION_23_1:
+    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
         Out += encode_sb4(0)  # ub8 token (0)
     Out += encode_sb4(TNS_SECURITY_CONTEXT_ATTACH_FLAG)  # ub4 attach flag = 1
     Out += bytes([1])  # pointer(kpdkve) non-null
@@ -6029,7 +6030,7 @@ def encode_session_state_piggyback(Seq: int, FieldVersion: int, State: int) -> b
     oracledb's _write_session_state_piggyback; byte layout in docs/PROTOCOL.md
     §35. Gated on the negotiated request-boundaries capability."""
     Out = bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_SESSION_STATE, Seq])
-    if FieldVersion > FIELD_VERSION_23_1:
+    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
         Out += encode_sb4(0)  # ub8 token (0)
     # ub8 (state | explicit-boundary); small values encode like ub4.
     Out += encode_sb4(State | TNS_SESSION_STATE_EXPLICIT_BOUNDARY)
@@ -6046,7 +6047,7 @@ def encode_free_temp_lobs_piggyback(
     server's 38). Mirrors oracledb's _write_close_temp_lobs_piggyback; byte
     layout in docs/PROTOCOL.md §14.5."""
     Out = bytes([TTI_MSG_TYPE_PIGGYBACK, TTI_LOBOPS, Seq])
-    if FieldVersion > FIELD_VERSION_23_1:
+    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
         Out += encode_sb4(0)  # ub8 token (0)
     Wire = b''.join(struct.pack('>H', len(L)) + L for L in Locators)
     Out += bytes([1]) + encode_sb4(len(Wire))  # pointer + total locator bytes
@@ -6220,7 +6221,7 @@ def parse_tpc_switch(body: bytes, field_version: int) -> tuple[int, int, int, by
     START (0x01) or DETACH (0x02), flags carry NEW vs RESUME, and the id is the
     xid's gtrid (empty for a suspend, which sends no xid)."""
     rest = body[3:]  # TTI_FUN, func, seq
-    if field_version > FIELD_VERSION_23_1:
+    if field_version >= FIELD_VERSION_23_1_EXT_1:
         _, rest = decode_ub4(rest)  # the fv24 token number
     operation, rest = decode_ub4(rest)
     rest = rest[1:]  # context pointer flag
@@ -10133,7 +10134,7 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
         All8 = list(All8)
         All8[9] = All8[9] | TNS_EXEC_FLAGS_IMPLICIT_RESULTSET
 
-    # 23ai (fv > 17, #89): the execute framing the server expects under field
+    # 23ai (fv >= 23.1 EXT 1, #89): the execute framing the server expects under field
     # version 24 differs from the legacy form in three spots, reverse-engineered
     # from an oracledb-thin fv24 capture (docs/PROTOCOL.md §20):
     #   - the prefetch-buffer-size field (LMax) must be 0, not the 0xffffffff
@@ -10142,7 +10143,7 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
     #   - the exec-options word gains 0x40;
     #   - al8i4[9] (exec flags) gains 0x8000 (already implied by the array-DML
     #     0xC000 value, so only set it when that path didn't).
-    if FieldVersion > FIELD_VERSION_23_1:
+    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
         if LMax == 0xFFFFFFFF:
             LMax = 0
         # The 0x40 options bit and al8i4[9] = 0x8000 are query-execute flags;

@@ -515,7 +515,7 @@ RCAP_TTC_32K = 0x04
 # Oracle 23ai "fast auth" (#89): a single TNS DATA packet (message type 0x22)
 # bundling the protocol, datatypes, and OSESSKEY messages in one round trip. It is
 # the only way to advertise CCAP_FIELD_VERSION >= 18 — the legacy three-message
-# handshake is rejected with ORA-03146 at fv >= 18. seerdb gates on the server's
+# handshake is rejected with ORA-03146 at fv >= 23.1 EXT 1. seerdb gates on the server's
 # own field version (learned from its PRO reply, 23ai advertises 27), not an ACCEPT
 # flag: at the protocol version seerdb sends (313) the ACCEPT carries no flag.
 TNS_MSG_TYPE_FAST_AUTH = 0x22

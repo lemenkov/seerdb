@@ -97,7 +97,7 @@ from seerdb.common.tns_consts import (
     DEFAULT_SDU,
     FIELD_VERSION_10_2,
     FIELD_VERSION_12_1,
-    FIELD_VERSION_23_1,
+    FIELD_VERSION_23_1_EXT_1,
     FIELD_VERSION_23_4,
     ORA_ARRAY_DML_ERRORS,
     ORA_NO_DATA_FOUND,
@@ -592,7 +592,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                         from seerdb.client.connection import _nego_cache_get
 
                         Cached = _nego_cache_get(self._nego_cache_key())
-                        if Cached is not None and Cached > FIELD_VERSION_23_1:
+                        if Cached is not None and Cached >= FIELD_VERSION_23_1_EXT_1:
                             self.field_version = Cached
                             self._used_nego_cache = True
                             return await self._fast_auth_login()
@@ -603,8 +603,8 @@ class AsyncOracleConnect(_ConnectionLogic):
                     match Packet[0]:
                         case p if p == TTI_PRO:
                             self._negotiate_capabilities(Packet)
-                            if self.field_version > FIELD_VERSION_23_1:
-                                # 23ai (#89): fv >= 18 needs the fast-auth bundle
+                            if self.field_version >= FIELD_VERSION_23_1_EXT_1:
+                                # 23ai (#89): fv >= 23.1 EXT 1 needs the fast-auth bundle
                                 # (the legacy OSESSKEY is rejected). See the sync
                                 # OracleConnect._fast_auth_login.
                                 return await self._fast_auth_login()
@@ -921,7 +921,10 @@ class AsyncOracleConnect(_ConnectionLogic):
                 self.session_id = SessId
                 self.serial_num = SerialNum
                 self.conn_state = CONN_STATE_AUTHENTICATED
-                if self.negotiation_cache and self.field_version > FIELD_VERSION_23_1:
+                if (
+                    self.negotiation_cache
+                    and self.field_version >= FIELD_VERSION_23_1_EXT_1
+                ):
                     from seerdb.client.connection import _nego_cache_put
 
                     _nego_cache_put(self._nego_cache_key(), self.field_version)

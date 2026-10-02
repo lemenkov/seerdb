@@ -73,7 +73,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_10_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_21_1,
-    FIELD_VERSION_23_1,
+    FIELD_VERSION_23_1_EXT_1,
     FIELD_VERSION_23_4,
     MAX_SEQ_NUM,
     ORA_ARRAY_DML_ERRORS,
@@ -522,7 +522,7 @@ def _apply_rowfactory(rows, rowfactory):
 # visible for pools that churn connections. A stale entry (the server changed
 # behind the same address) makes the cached-path handshake fail; that is caught
 # in connect(), which invalidates the entry and retries a full negotiation. Only
-# fast-auth (fv >= 18) servers are cached — older servers must negotiate down.
+# fast-auth (fv >= 23.1 EXT 1) servers are cached — older servers must negotiate down.
 _NEGOTIATION_CACHE: dict[tuple[str, int, str], int] = {}
 _NEGOTIATION_CACHE_LOCK = threading.Lock()
 
@@ -1175,7 +1175,7 @@ class OracleConnect(_ConnectionLogic):
                     # (it exists only to learn that) and go straight to the bundle.
                     if self.negotiation_cache and not self._skip_nego_cache:
                         Cached = _nego_cache_get(self._nego_cache_key())
-                        if Cached is not None and Cached > FIELD_VERSION_23_1:
+                        if Cached is not None and Cached >= FIELD_VERSION_23_1_EXT_1:
                             self.field_version = Cached
                             self._used_nego_cache = True
                             logger.debug('handle_login: negotiation cache hit')
@@ -1188,15 +1188,15 @@ class OracleConnect(_ConnectionLogic):
                         case p if p == TTI_PRO:
                             logger.debug('handle_login: recv PRO')
                             self._negotiate_capabilities(Packet)
-                            if self.field_version > FIELD_VERSION_23_1:
+                            if self.field_version >= FIELD_VERSION_23_1_EXT_1:
                                 # 23ai (#89): the negotiated field version is
                                 # >= 18, where the legacy OSESSKEY is rejected
                                 # (ORA-03146). Switch to the fast-auth bundle —
-                                # the only path to fv >= 18, which is in turn the
+                                # the only path to fv >= 23.1 EXT 1, which is in turn the
                                 # prerequisite for column annotations. The PRO
                                 # exchange just done is harmlessly repeated inside
                                 # the bundle. Only reached when the caller opts in
-                                # with field_version >= 18 (default stays 21.1).
+                                # with field_version >= 23.1 EXT 1 (default stays 21.1).
                                 return self._fast_auth_login()
                             if isinstance(self._dialect, O8iDialect):
                                 # 8i has no Unicode charset and predates ~37 data
@@ -1501,7 +1501,10 @@ class OracleConnect(_ConnectionLogic):
                 logger.debug('handle_login: authenticated')
                 # Negotiation cache (#438): record the fast-auth field version so
                 # the next reconnect to this target can skip the bare PRO probe.
-                if self.negotiation_cache and self.field_version > FIELD_VERSION_23_1:
+                if (
+                    self.negotiation_cache
+                    and self.field_version >= FIELD_VERSION_23_1_EXT_1
+                ):
                     _nego_cache_put(self._nego_cache_key(), self.field_version)
                 return 0
             else:

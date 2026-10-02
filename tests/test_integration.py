@@ -37,6 +37,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_12_2,
     FIELD_VERSION_20_1,
     FIELD_VERSION_23_1,
+    FIELD_VERSION_23_1_EXT_1,
     FIELD_VERSION_23_4,
 )
 
@@ -2310,7 +2311,9 @@ class CursorIntegration(_IntegrationBase):
                 "WHERE sid = sys_context('userenv', 'sid')"
             )
             # The driver name travels only in the 23ai-shaped login (fv > 23.1).
-            driver = 'pyo-driver' if conn.field_version > FIELD_VERSION_23_1 else None
+            driver = (
+                'pyo-driver' if conn.field_version >= FIELD_VERSION_23_1_EXT_1 else None
+            )
             self.assertEqual(cur.fetchall(), [(driver,)])
 
     def test_kill_session_ends_the_named_session(self):
@@ -6829,7 +6832,7 @@ class ConnectAttributeIntegration(_IntegrationBase):
         # The session-context pairs (driver banner, edition) ride only on the
         # FAST_AUTH path, fv > 23.1 -- below that the server is never told, so
         # there is nothing to assert rather than something that fails.
-        if self.conn.field_version <= FIELD_VERSION_23_1:
+        if self.conn.field_version < FIELD_VERSION_23_1_EXT_1:
             self.skipTest('session-context pairs need the fv > 23.1 FAST_AUTH')
 
     def test_driver_name_defaults_to_our_own_banner(self):
@@ -8911,7 +8914,9 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     "WHERE sid = sys_context('userenv', 'sid')"
                 )
                 driver = (
-                    'pyo-driver' if Conn.field_version > FIELD_VERSION_23_1 else None
+                    'pyo-driver'
+                    if Conn.field_version >= FIELD_VERSION_23_1_EXT_1
+                    else None
                 )
                 self.assertEqual(await Cur.fetchall(), [(driver,)])
 
