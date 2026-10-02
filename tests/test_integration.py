@@ -1367,6 +1367,33 @@ class TypesIntegration(_IntegrationBase):
         with self.assertRaises(seerdb.DatabaseError):
             self.conn.gettype('NO_SUCH_TABLE_AT_ALL%ROWTYPE')
 
+    def test_tab_columns_describe_the_number_family_as_oracle(self):
+        # A NUMBER's DATA_LENGTH is 22 whatever its precision; INTEGER, SMALLINT,
+        # a bare DECIMAL and NUMBER(*, s) have no precision, only a scale. The
+        # Mirror over PostgreSQL gave the precision as the length and 38 as the
+        # precision of each unsized one (#1483).
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (n NUMBER, n52 NUMBER(5,2), '
+            'nm NUMBER(*,2), i INTEGER, si SMALLINT, dc DECIMAL, nu NUMERIC(7,1))'
+        )
+        self.cur.execute(
+            'SELECT column_name, data_type, data_length, data_precision, data_scale '
+            'FROM user_tab_columns WHERE table_name = :1 ORDER BY column_id',
+            [self.TABLE],
+        )
+        self.assertEqual(
+            self.cur.fetchall(),
+            [
+                ('N', 'NUMBER', 22, None, None),
+                ('N52', 'NUMBER', 22, 5, 2),
+                ('NM', 'NUMBER', 22, None, 2),
+                ('I', 'NUMBER', 22, None, 0),
+                ('SI', 'NUMBER', 22, None, 0),
+                ('DC', 'NUMBER', 22, None, 0),
+                ('NU', 'NUMBER', 22, 7, 1),
+            ],
+        )
+
     def test_char_length_is_zero_for_a_type_without_one(self):
         # USER_TAB_COLUMNS.CHAR_LENGTH is a character column's declared length
         # and 0 for any other type, never NULL. The Mirror over PostgreSQL gave
