@@ -3828,6 +3828,38 @@ def test_a_compile_time_error_in_a_block_is_ora_06550() -> None:
     assert _plsql_compile_error(Failure('22012', 'division by zero'), call) is None
 
 
+def test_a_create_that_does_not_compile_leaves_an_invalid_object() -> None:
+    # Oracle creates a routine or type that does not compile, invalid, and warns;
+    # the backend stands one in and reports the warning. Calling it fails, a
+    # clean CREATE replaces it, and a DDL error of any other kind still fails
+    # (#1499).
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        bad = backend.execute(
+            'CREATE OR REPLACE PROCEDURE pyo_invalid_p AS BEGIN NULL END;'
+        )
+        assert bad.compilation_warning
+        with pytest.raises(BackendError) as raised:
+            backend.execute('BEGIN pyo_invalid_p; END;')
+        assert raised.value.ora_code == 6550
+        good = backend.execute(
+            'CREATE OR REPLACE PROCEDURE pyo_invalid_p AS BEGIN NULL; END;'
+        )
+        assert not good.compilation_warning
+        backend.execute('BEGIN pyo_invalid_p; END;')
+        backend.execute('DROP PROCEDURE pyo_invalid_p')
+        assert backend.execute(
+            'CREATE OR REPLACE TYPE pyo_invalid_t AS OBJECT (x no_such_type)'
+        ).compilation_warning
+        backend.execute('DROP TYPE pyo_invalid_t')
+        with pytest.raises(BackendError):
+            backend.execute('CREATE TABLE pyo_invalid_tab bogus')
+    finally:
+        backend.close()
+
+
 def test_raise_application_error_becomes_a_coded_raise() -> None:
     # RAISE_APPLICATION_ERROR raises P0001 with its ORA code as the message's
     # prefix, which the error mapping reads back (#1323); the message may itself

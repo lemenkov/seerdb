@@ -3916,6 +3916,22 @@ _ROUTINE_HEAD = re.compile(
 _ROUTINE_TAIL = re.compile(
     r'(?is)\s*(?:RETURN\s+([\w ]+?)\s+)?(?:AS|IS)\s+(.*?)\s*;?\s*$'
 )
+# CREATE [OR REPLACE] TYPE t ... -- not a TYPE BODY -- whose failure to compile
+# leaves an invalid type behind in Oracle (#1499).
+_INVALID_TYPE_DDL = re.compile(
+    r'(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?TYPE\s+(?!BODY\b)([\w.$#]+)'
+)
+# The codes a DDL statement that does not compile maps to: PostgreSQL's class 42
+# (syntax, unknown object, unknown type) and the PL/SQL compile error (#1499).
+_COMPILE_ERROR_CODES = frozenset(
+    {
+        ORA_INVALID_SQL_STATEMENT,
+        ORA_INVALID_IDENTIFIER,
+        ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,
+        ORA_INVALID_DATATYPE,
+        ORA_PLSQL_COMPILATION_ERROR,
+    }
+)
 # Oracle parameter direction `IN OUT` → PostgreSQL `INOUT` (do this before the
 # type rewrites, which share the DDL type list).
 _PARAM_IN_OUT = re.compile(r'\bIN\s+OUT\b', re.IGNORECASE)
@@ -5622,9 +5638,15 @@ class PostgresBackend:
         if self._use_pipeline and not is_ddl and not hoisted:
             result = self._execute_pipelined(sql, params, original)
         elif is_ddl:
-            result = self._execute_sequential(
-                sql, params, original, prelude=_DDL_LOCK_TIMEOUT
-            )
+            try:
+                result = self._execute_sequential(
+                    sql, params, original, prelude=_DDL_LOCK_TIMEOUT
+                )
+            except BackendError as error:
+                invalid = self._create_invalid(original, error)
+                if invalid is None:
+                    raise
+                result = invalid
         else:
             result = self._execute_sequential(sql, params, original)
         # DDL auto-commits (Oracle semantics): persist it — and any pending DML —
@@ -5647,6 +5669,38 @@ class PostgresBackend:
         if result.columns and not is_ddl:
             self._release_read_locks()
         return result
+
+    def _create_invalid(self, sql: str, error: BackendError) -> Result | None:
+        # A CREATE PROCEDURE / FUNCTION / TYPE that does not compile SUCCEEDS in
+        # Oracle: the object exists, INVALID, and the reply says so with the
+        # compilation warning the client reads as DPY-7000 (#1499). PostgreSQL
+        # refuses it outright, so a stand-in of that name takes its place -- a
+        # routine that fails when called, as an invalid one does (ORA-06550 in a
+        # block, #1497), or a shell type -- and a later CREATE replaces it as it
+        # would the invalid object. None for any other failure.
+        if error.ora_code not in _COMPILE_ERROR_CODES:
+            return None
+        routine = _ROUTINE_HEAD.match(sql)
+        type_ = _INVALID_TYPE_DDL.match(sql) if routine is None else None
+        if routine is not None:
+            kind, name = routine.group(1).upper(), routine.group(2)
+            returns = ' RETURNS integer' if kind == 'FUNCTION' else ''
+            stub = (
+                f'DROP {kind} IF EXISTS {name}; CREATE {kind} {name}(){returns} '
+                'LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION USING ERRCODE = '
+                f"'42883', MESSAGE = 'function {name}() does not exist'; END $$"
+            )
+        elif type_ is not None:
+            name = type_.group(1)
+            stub = f'DROP TYPE IF EXISTS {name}; CREATE TYPE {name}'
+        else:
+            return None
+        try:
+            self._conn.execute(stub)
+        except psycopg.Error:
+            self._conn.rollback()
+            return None
+        return Result(compilation_warning=True)
 
     def _kill_session(self, session: str) -> Result:
         # ALTER SYSTEM KILL SESSION (#1212): end the backend whose pid is the SID,
