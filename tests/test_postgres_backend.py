@@ -3492,6 +3492,26 @@ def test_dbms_lock_and_dbms_session_sleep() -> None:
         backend.close()
 
 
+def test_sys_dual_is_dual() -> None:
+    # sqlplus writes the schema out: PRINT is `SELECT :v v FROM SYS.DUAL`, and
+    # its login query reads SYS.DUAL too. Only the bare `dual` resolved, to
+    # orafce's oracle.dual, so both failed with ORA-00942 (#1516).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        assert backend.execute('SELECT 1 FROM SYS.DUAL').rows == [(1,)]
+        assert backend.execute('SELECT dummy FROM sys.dual').rows == [('X',)]
+        assert backend.execute('SELECT :v v FROM SYS.DUAL', [42]).rows == [(42,)]
+        # sqlplus's login query: XS_SYS_CONTEXT is NULL without a RAS session,
+        # and DECODE falls through to USER.
+        login = backend.execute(
+            "SELECT DECODE(USER, 'XS$NULL', XS_SYS_CONTEXT('XS$SESSION','USERNAME'), "
+            'USER) FROM SYS.DUAL'
+        )
+        assert login.rows == [(backend.execute('SELECT USER FROM dual').rows[0][0],)]
+    finally:
+        backend.close()
+
+
 def test_nvl_with_literal_arguments_runs() -> None:
     # NVL with bare literals is ordinary Oracle, and it did not run here at all:
     # orafce's four overloads left `nvl(unknown, unknown)` ambiguous and the
