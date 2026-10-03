@@ -7864,11 +7864,15 @@ Each record, verified on every record of every capture:
 0d 01
 ITEM(REF of the record's TYPE)   ub1 1
 ITEM(REF of the object itself)   ub1 <the last byte of the type's id>
-ITEM(18 00 fc 09 <b> 00 x 19)    -- <b> differs per session, fixed within one
+ITEM(18 00 <3 bytes> 00 x 19)    -- the 3 bytes differ per session, fixed within one
 00 01 00 | ub4 image length | 09 00 | the image, as a DALC (ub1 length, or fe + ub1 chunks + 00)
 ```
 
-`ITEM` is a `ub4` length then that many bytes. A **REF** item is 36 bytes:
+`ITEM` is a `ub4` length then that many bytes. The descriptor's three
+per-session bytes were `fb b9 81`, then `fc 09 86`, `fc 09 87` … in later
+sessions, climbing like a counter; the Mirror sends the first.
+The closing OER is the 136-byte envelope (§36) with a success status,
+`row_kind` 1, and command type and category 0. A **REF** item is 36 bytes:
 `24 00`, a flags triple (`22 12 08` for the metatypes' own records, `22 02 08`
 otherwise), the 16-byte object id, then 15 bytes that were `00 x 13 01 00` in
 every capture.
@@ -7914,6 +7918,11 @@ The TDS in attribute 5 is **byte for byte** what the PG backend's
 `dbms_pickler.get_type_shape` answer builds (`_tds` in
 `examples/postgres_backend.py`): for `DBMSOUTPUT_LINESARRAY`,
 `_TdsCollection(varray=True, bound=0x7fffffff, element=_tds_chars(7, 32767, False))`.
+
+**The Mirror's side.** `encode_kod_reply` / `encode_kod_image` build the reply;
+`kod_system_record` holds SYS.KOTTD's description of itself, and the OCI loop
+answers a by-REF request for it with exactly the live 11g reply. A by-name
+request, which needs the backend's type, is still refused with ORA-03115.
 
 **Inferred, not yet confirmed:** the TDS leaf codes `0d`, `0e`, `11` and `09`
 are read here as a 2-byte integer, a 4-byte integer, raw bytes and a REF, from

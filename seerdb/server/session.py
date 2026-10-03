@@ -89,6 +89,7 @@ from seerdb.common.tns import (
     encode_fetch_response,
     encode_fetch_terminator_oci,
     encode_implicit_results,
+    encode_kod_reply,
     encode_lob_describe_oci,
     encode_lob_fetch_rows_oci,
     encode_lob_read_response_oci,
@@ -124,6 +125,7 @@ from seerdb.common.tns import (
     inline_long_for_defines,
     is_reexecute_oci,
     is_version_call_oci,
+    kod_system_record,
     max_string_size,
     mint_temp_lob_locator,
     object_lob_contents,
@@ -136,6 +138,7 @@ from seerdb.common.tns import (
     parse_fetch,
     parse_fetch_oci,
     parse_free_temp_lobs_piggyback,
+    parse_kod_request,
     parse_lobops_read,
     parse_lobops_request,
     parse_lobops_slot,
@@ -192,6 +195,7 @@ from seerdb.common.tns_consts import (
     TTI_DESCRIBE,
     TTI_FETCH,
     TTI_FUN,
+    TTI_KOD,
     TTI_LOBOPS,
     TTI_LOGOFF,
     TTI_MSG_TYPE_PIGGYBACK,
@@ -1076,6 +1080,27 @@ _ORA_BFILE_MISSING_TEXT = (
 _OCI_PIGGYBACK_E2E = bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_SET_END_TO_END_ATTR])
 
 
+def _answer_kod_oci(stream: PacketStream, body: bytes, seq: '_OciSequence') -> None:
+    """Answer an OCI object-type describe, ``TTI_KOD`` (PROTOCOL.md §40).
+
+    Served: a system type asked for by REF -- SYS.KOTTD, which a client asks for
+    to learn how to read the type descriptor it was just handed. Anything else
+    is refused with ORA-03115 as before, the session intact (#1411).
+    """
+    try:
+        request = parse_kod_request(body)
+    except InterfaceError:
+        request = None
+    if request is not None and request.ref is not None:
+        record = kod_system_record(request.ref[5:21])
+        if record is not None:
+            stream.write_packet(
+                TNS_DATA, encode_kod_reply([record], sequence=seq.next())
+            )
+            return
+    _refuse_unhandled_oci(stream, f'OCI call {body[:2].hex()}', seq)
+
+
 def _refuse_unhandled_oci(stream: PacketStream, what: str, seq: _OciSequence) -> None:
     """Refuse a thick/OCI call the Mirror cannot serve, keeping the session.
 
@@ -1554,6 +1579,12 @@ def _serve_oci_session(
                 parked, lobs, slot_lobs = _answer_query_oci(stream, backend, body, seq)
                 current_lob = None
                 slot_current = {}
+                continue
+            if body[1] == TTI_KOD:
+                # An object-type describe (§40). sqlplus asks for a collection
+                # type by name, then for SYS.KOTTD by REF to learn how to read
+                # the answer; anything not served yet is refused as before.
+                _answer_kod_oci(stream, body, seq)
                 continue
             if body[1] == TTI_DESCRIBE:
                 # sqlplus `DESCRIBE <object>` — reply with the object's column
