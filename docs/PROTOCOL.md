@@ -7949,10 +7949,25 @@ the sizes of the values they describe. Attribute 0, attributes 7 and 8, and the
 
 With the type described, sqlplus binds `:LINES` as type **109** (`0x6d`). Its
 OCI bind descriptor carries, in place of a scalar's `01 <type> 03 00 00 <size>`,
-`00 6d 00 00 00 d0 07 00 00 …`, then `ub4 16`, `ub1 16` and the type's 16-byte
-id, then `ub4 1`. The IN value is the REF of the type followed by an empty image;
-the reply's OUT value is that REF and the collection's image — the same pickle
-as §21.6: `88 01 13 01 03 00 02 0a 'from plsql' ff` for one line and a NULL.
+`00 6d 00 00 00`, the `ub4` buffer size (2000), twelve zeros, `ub4 16`, `ub1 16`
+and the type's 16-byte id, then `ub4 1`. Its IN value is the type's REF `ITEM`
+followed by `01`, twelve zeros and `01 00` — a collection carrying nothing.
+
+The reply is the ordinary OCI OUT-bind reply (§36): the 50-byte header with the
+bind count, a **direction marker per bind** — `0x10` OUT, `0x30` IN OUT, the masks
+of the 9i bind prompt (§19.7): `10 30` here, the count being IN OUT, and `10` for
+a lone OUT collection — then `07` and the values. The collection's value is its
+REF `ITEM`, `01` and zeros (ten from 11g, eight from 18c), the image's `ub4`
+length, `01 00`, the image as a DALC, and no return code after it; the image is
+the pickle of §21.6: `88 01 13 01 03 00 02 0a 'from plsql' ff` for one line,
+`88 01 09 01 03 00 02 ff ff` for none. The count follows as an ordinary NUMBER
+with its return code.
+
+The Mirror reads the bind (`_oci_bind_descriptors`, the type id riding on
+`bind_types` to the backend as `BindVar.toid`) and writes the value
+(`encode_out_bind_response_oci` with `types` / `inputs`); against the captures the
+values part is the live one byte for byte in both bands. Its scalar OUT binds
+used to carry `0x10` whatever their direction; they now report it too.
 
 Decoders: `parse_kod_request`, `decode_kod_reply`, `decode_kod_image`, pinned
 to the captured exchange by `tests/test_kod_decode.py`.

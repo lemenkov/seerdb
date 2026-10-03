@@ -1930,7 +1930,16 @@ def _answer_query_oci(
         # the values so the client reads them back into its bound buffers.
         stream.write_packet(
             TNS_DATA,
-            encode_out_bind_response_oci(result.out_binds, sequence=seq.next()),
+            encode_out_bind_response_oci(
+                result.out_binds,
+                sequence=seq.next(),
+                # Each bind's type -- an object / collection goes back in its
+                # own framing -- and whether it came in with a value, which the
+                # reply reports as its direction (#1411).
+                types=[(t, toid) for (t, _cs, _size, toid) in request.bind_types]
+                or None,
+                inputs=[value is not None for value in request.binds] or None,
+            ),
         )
         return None, [], {}
     if not result.columns:

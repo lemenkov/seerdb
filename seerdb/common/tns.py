@@ -8673,8 +8673,13 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
     bind_count = int.from_bytes(payload[bind_count_off : bind_count_off + 4], 'little')
     binds: list = []
     bind_meta: list[tuple[int, int]] = []
+    bind_types: list[tuple[int, int, int, bytes]] = []
     if bind_count and marker != TNS_LONG_LENGTH_INDICATOR:
-        binds, bind_meta = _parse_oci_binds(payload, sql_off + marker, bind_count)
+        (binds, described) = _parse_oci_binds(payload, sql_off + marker, bind_count)
+        bind_meta = [(t, size) for (t, size, _toid) in described]
+        # An object / collection bind's type id rides here, as on the thin path,
+        # so the backend can register a variable of its type (#1411).
+        bind_types = [(t, _CSFRM_DB, size, toid) for (t, size, toid) in described]
     if bind_count and not bind_meta:
         # Binds the section could not be read for -- a type this path does not
         # parse, such as a collection. Run without them, the statement did
@@ -8689,6 +8694,7 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
         binds=binds,
         bind_rows=[binds] if binds else [],
         bind_meta=bind_meta,
+        bind_types=bind_types,
     )
 
 
@@ -8702,6 +8708,14 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
 
 
 _OCI_OAC_MARKER = re.compile(rb'\x01(.)\x03\x00\x00')
+# An object or collection bind's descriptor (PROTOCOL.md §40.4): `00 6d 00 00
+# 00`, the ub4 buffer size, twelve zeros, a ub4 and a ub1 16, the type's 16-byte
+# id. Captured from sqlplus 23.26 binding DBMS_OUTPUT.GET_LINES's lines (#1411).
+_OCI_ADT_MARKER = b'\x00\x6d\x00\x00\x00'
+_OCI_ADT_TOID_OFF = 26  # from the marker to the id
+# An object / collection IN value carrying nothing -- sqlplus's GET_LINES lines,
+# a pure OUT: the type's REF, then these 15 bytes.
+_OCI_ADT_EMPTY_TAIL = b'\x01' + bytes(12) + b'\x01\x00'
 
 
 _OCI_BIND_TYPES = frozenset(
@@ -8719,9 +8733,46 @@ _OCI_BIND_TYPES = frozenset(
 )
 
 
+def _oci_bind_descriptors(tail: bytes, bind_count: int) -> list[tuple[int, int, bytes]]:
+    # Each bind's (tns_type, max_size, toid), in order: a scalar's OAC marker
+    # (``01 <type> 03 00 00``) or an object / collection's (§40.4), whichever
+    # comes next. Empty if they do not add up to ``bind_count``.
+    meta: list[tuple[int, int, bytes]] = []
+    at = 0
+    while len(meta) < bind_count:
+        scalar = _OCI_OAC_MARKER.search(tail, at)
+        adt = tail.find(_OCI_ADT_MARKER, at)
+        if adt >= 0 and (scalar is None or adt < scalar.start()):
+            end = adt + len(_OCI_ADT_MARKER)
+            max_size = int.from_bytes(tail[end : end + 4], 'little')
+            toid = tail[adt + _OCI_ADT_TOID_OFF : adt + _OCI_ADT_TOID_OFF + 16]
+            meta.append((TNS_TYPE_ADT, max_size, toid))
+            at = adt + _OCI_ADT_TOID_OFF + 16
+            continue
+        if scalar is None:
+            return []
+        data_type = scalar.group(1)[0]
+        if data_type in _OCI_BIND_TYPES:
+            max_size = int.from_bytes(tail[scalar.end() : scalar.end() + 4], 'little')
+            meta.append((data_type, max_size, b''))
+        at = scalar.end()
+    return meta
+
+
+def _oci_adt_in_value(rest: bytes) -> bytes:
+    # An object / collection IN value: its REF, then -- for one carrying
+    # nothing, the only form seen -- the 15-byte empty tail. Anything else is not
+    # read yet, and raising lets the statement be refused rather than run on a
+    # guess (#1525).
+    (_ref, after) = _kod_item(rest, 0)
+    if rest[after : after + len(_OCI_ADT_EMPTY_TAIL)] != _OCI_ADT_EMPTY_TAIL:
+        raise DataError('an object bind value of a form not read yet')
+    return rest[after + len(_OCI_ADT_EMPTY_TAIL) :]
+
+
 def _parse_oci_binds(
     payload: bytes, sql_end: int, bind_count: int
-) -> tuple[list, list[tuple[int, int]]]:
+) -> tuple[list, list[tuple[int, int, bytes]]]:
     # Read the bind values AND their (tns_type, max_size) metadata from the OCI
     # bind section. Each bind's OAC marker (``01 <type> 03 00 00``) carries the TNS
     # type; the ub4 LE right after it is the bind's max buffer size (NUMBER 22,
@@ -8729,17 +8780,10 @@ def _parse_oci_binds(
     # sized correctly (#483). Returns ``(values, bind_meta)`` — bind_meta is the
     # per-bind (type, max_size) list the OUT-bind path wraps as BindVars.
     tail = payload[sql_end:]
-    meta: list[tuple[int, int]] = []
-    for match in _OCI_OAC_MARKER.finditer(tail):
-        data_type = match.group(1)[0]
-        if data_type in _OCI_BIND_TYPES:
-            max_size = int.from_bytes(tail[match.end() : match.end() + 4], 'little')
-            meta.append((data_type, max_size))
-        if len(meta) == bind_count:
-            break
+    meta = _oci_bind_descriptors(tail, bind_count)
     if len(meta) != bind_count:
         return [], []
-    types = [t for t, _ in meta]
+    types = [t for t, _s, _o in meta]
     # The RXD row is the 0x07 token whose following DALCs decode cleanly into one
     # value per bind — a position robust to 0x07 bytes appearing in the OAC area.
     for i, byte in enumerate(tail):
@@ -8758,6 +8802,10 @@ def _parse_oci_binds(
                 if len(rest) >= 2 and rest[0] == TNS_ESCAPE_CHAR:
                     values.append(None)
                     rest = rest[2:]
+                    continue
+                if data_type == TNS_TYPE_ADT:
+                    rest = _oci_adt_in_value(rest)
+                    values.append(None)
                     continue
                 raw, rest = decode_dalc(rest)
                 # The OCI (sqlplus) bind path doesn't carry a national char form;
@@ -9725,18 +9773,68 @@ _OCI_OUTBIND_DEFINE_MARKER = 0x10
 _OCI_OUTBIND_RETCODE = b'\x00\x00'
 
 
-def encode_out_bind_response_oci(values: list[object], *, sequence: int) -> bytes:
+# An object / collection OUT value in the OCI reply (PROTOCOL.md §40.4): the
+# type's REF, `01` and zeros -- ten from a live 11g, eight from a live 18c -- the
+# image's ub4 length, `01 00`, the image as a DALC, and no return code after it,
+# unlike a scalar. sqlplus 23.26 reading DBMS_OUTPUT.GET_LINES's lines (#1411).
+_OCI_OUTBIND_ADT_LEAD = b'\x01' + bytes(10)
+_OCI_OUTBIND_ADT_LEAD_12C = b'\x01' + bytes(8)
+# The marker before the values is each bind's DIRECTION, the masks the 9i bind
+# prompt uses: 0x10 for a pure OUT, 0x30 for an IN OUT. GET_LINES answers `10 30`
+# -- its lines are OUT, its count IN OUT -- and a lone OUT VARRAY `10`.
+_OCI_OUTBIND_IN_OUT_MARKER = 0x30
+_OCI_OUTBIND_ADT_IMAGE = b'\x01\x00'
+
+
+def _oci_out_object_value(value: object, toid: bytes) -> bytes:
+    image = getattr(value, 'image', b'') or b''
+    if len(image) <= TNS_MAX_SHORT_LENGTH:
+        framed = bytes([len(image)]) + image
+    else:
+        framed = _bytes_with_length(image)
+    return (
+        _kod_item_bytes(_kod_ref(toid, system=False))
+        + (
+            _OCI_OUTBIND_ADT_LEAD_12C
+            if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+            else _OCI_OUTBIND_ADT_LEAD
+        )
+        + len(image).to_bytes(4, 'little')
+        + _OCI_OUTBIND_ADT_IMAGE
+        + framed
+    )
+
+
+def encode_out_bind_response_oci(
+    values: list[object],
+    *,
+    sequence: int,
+    types: list[tuple[int, bytes]] | None = None,
+    inputs: list[bool] | None = None,
+) -> bytes:
     """OCI reply returning a PL/SQL block's OUT bind values (``EXEC :v := ...``).
 
     ``values`` are the assigned OUT values in bind order; each is marshalled as a
     DALC (the same wire form as a fetched column) so the client reads it back into
     its bound buffer. The header/tail are computed structure, not blobs (#347).
     ``sequence`` is the live per-session OER counter for the status tail.
+    ``types`` is each bind's (tns type, type id): an object or collection bind
+    (109) goes back in its own framing, its value the backend's image.
+    ``inputs`` says which binds came in with a value -- IN OUT, not pure OUT --
+    which the marker before the values reports.
     """
+    types = types or [(0, b'')] * len(values)
+    inputs = inputs or [False] * len(values)
     header = _oci_outbind_header(len(values))
-    define_markers = bytes([_OCI_OUTBIND_DEFINE_MARKER]) * len(values)
+    define_markers = bytes(
+        _OCI_OUTBIND_IN_OUT_MARKER if given else _OCI_OUTBIND_DEFINE_MARKER
+        for given in inputs
+    )
     rxd = bytes([TTI_RXD]) + b''.join(
-        encode_value(v, 0) + _OCI_OUTBIND_RETCODE for v in values
+        _oci_out_object_value(v, toid)
+        if t == TNS_TYPE_ADT
+        else encode_value(v, 0) + _OCI_OUTBIND_RETCODE
+        for v, (t, toid) in zip(values, types)
     )
     return header + define_markers + rxd + _oci_outbind_tail(sequence)
 
