@@ -142,3 +142,103 @@ def test_the_oci_loop_serves_kottd_and_still_refuses_the_rest() -> None:
     assert b'ORA-03115' in refused
     (record,) = decode_kod_reply(kottd).records
     assert decode_kod_image(record.image)[2] == b'KOTTD'
+
+
+def _linesarray_tds_pair() -> tuple[bytes, bytes]:
+    (record,) = decode_kod_reply(fx.BY_NAME_REPLY).records
+    values = decode_kod_image(record.image)
+    assert values[5] is not None and values[6] is not None
+    return (values[5], values[6])
+
+
+def test_the_mirror_answers_the_by_name_describe_as_11g_does() -> None:
+    # Given the type's identity and TDS pair -- what a backend's describe_type
+    # returns -- the reply is the live 11g one byte for byte, header naming the
+    # connected user's schema and all (#1411).
+    from seerdb.common.tns import (
+        _ENCODE_OCI_CALL_SEQ,
+        encode_kod_named_reply,
+        kod_type_record,
+    )
+
+    (tds, null_tds) = _linesarray_tds_pair()
+    record = kod_type_record(
+        oid=_LINESARRAY_ID,
+        schema='SYS',
+        name='DBMSOUTPUT_LINESARRAY',
+        kind='varray',
+        tds=tds,
+        null_tds=null_tds,
+    )
+    token = _ENCODE_OCI_CALL_SEQ.set(0x0D)
+    try:
+        got = encode_kod_named_reply(
+            schema='PYO', name='DBMSOUTPUT_LINESARRAY', record=record, sequence=0x0A
+        )
+    finally:
+        _ENCODE_OCI_CALL_SEQ.reset(token)
+    assert got == fx.BY_NAME_REPLY
+
+
+def _without_instance_marker(reply: bytes) -> bytes:
+    # Every Mirror OER carries 11g's instance marker at OER offset 72; a live
+    # 18c sends its own. Blank it so the comparison is about the rest.
+    oer = len(reply) - 144
+    return reply[: oer + 72] + bytes(6) + reply[oer + 78 :]
+
+
+def test_the_12c_band_answers_as_18c_does() -> None:
+    # The Mirror speaks 18c's layout to a 12c+ sqlplus, and there KOD differs:
+    # the record descriptor is another 35 bytes, the by-name header ends with
+    # four more, KOTTD's names are VARCHAR(128) and the OER's row kind and
+    # offset 52 are 0. With those, both replies are 18c's (#1411).
+    import kod_18c as fx18
+
+    from seerdb.common.tns import (
+        _ENCODE_FIELD_VERSION,
+        _ENCODE_OCI_CALL_SEQ,
+        KOD_KOTTD,
+        encode_kod_named_reply,
+        encode_kod_reply,
+        kod_system_record,
+        kod_type_record,
+    )
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1
+
+    request = parse_kod_request(fx18.BY_NAME_REQUEST)
+    assert request.name == 'DBMSOUTPUT_LINESARRAY'
+    named = decode_kod_reply(fx18.BY_NAME_REPLY)
+    assert named.named is not None
+    (record,) = named.records
+    values = decode_kod_image(record.image)
+    assert values[5] is not None and values[6] is not None
+    version = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT_1)
+    try:
+        call = _ENCODE_OCI_CALL_SEQ.set(0x0D)
+        got = encode_kod_named_reply(
+            schema='PYO',
+            name='DBMSOUTPUT_LINESARRAY',
+            record=kod_type_record(
+                oid=record.oid,
+                schema='SYS',
+                name='DBMSOUTPUT_LINESARRAY',
+                kind='varray',
+                tds=values[5],
+                null_tds=values[6],
+            ),
+            sequence=0x1E3,
+        )
+        _ENCODE_OCI_CALL_SEQ.reset(call)
+        assert _without_instance_marker(got) == _without_instance_marker(
+            fx18.BY_NAME_REPLY
+        )
+        call = _ENCODE_OCI_CALL_SEQ.set(0x0E)
+        kottd = kod_system_record(KOD_KOTTD)
+        assert kottd is not None
+        got = encode_kod_reply([kottd], sequence=0x1E4)
+        _ENCODE_OCI_CALL_SEQ.reset(call)
+        assert _without_instance_marker(got) == _without_instance_marker(
+            fx18.KOTTD_REPLY
+        )
+    finally:
+        _ENCODE_FIELD_VERSION.reset(version)

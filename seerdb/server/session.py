@@ -89,6 +89,7 @@ from seerdb.common.tns import (
     encode_fetch_response,
     encode_fetch_terminator_oci,
     encode_implicit_results,
+    encode_kod_named_reply,
     encode_kod_reply,
     encode_lob_describe_oci,
     encode_lob_fetch_rows_oci,
@@ -126,6 +127,7 @@ from seerdb.common.tns import (
     is_reexecute_oci,
     is_version_call_oci,
     kod_system_record,
+    kod_type_record,
     max_string_size,
     mint_temp_lob_locator,
     object_lob_contents,
@@ -1080,22 +1082,56 @@ _ORA_BFILE_MISSING_TEXT = (
 _OCI_PIGGYBACK_E2E = bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_SET_END_TO_END_ATTR])
 
 
-def _answer_kod_oci(stream: PacketStream, body: bytes, seq: '_OciSequence') -> None:
+def _answer_kod_oci(
+    stream: PacketStream,
+    backend: Backend,
+    body: bytes,
+    seq: '_OciSequence',
+    user: str,
+) -> None:
     """Answer an OCI object-type describe, ``TTI_KOD`` (PROTOCOL.md §40).
 
-    Served: a system type asked for by REF -- SYS.KOTTD, which a client asks for
-    to learn how to read the type descriptor it was just handed. Anything else
-    is refused with ORA-03115 as before, the session intact (#1411).
+    Served: a type asked for by name, which the backend describes
+    (``describe_type``), and a system type asked for by REF -- SYS.KOTTD, which a
+    client asks for to learn how to read the descriptor it was just handed.
+    Anything else is refused with ORA-03115, the session intact (#1411).
     """
     try:
         request = parse_kod_request(body)
     except InterfaceError:
         request = None
-    if request is not None and request.ref is not None:
-        record = kod_system_record(request.ref[5:21])
-        if record is not None:
+    describe_type = getattr(backend, 'describe_type', None)
+    if request is not None and request.name is not None and describe_type:
+        try:
+            described = describe_type(request.name)
+        except BackendError:
+            described = None
+        if described is not None:
+            record = kod_type_record(
+                oid=described.oid,
+                schema=described.schema,
+                name=described.name,
+                kind=described.kind,
+                tds=described.tds,
+                null_tds=described.null_tds,
+            )
+            # The header names the type as asked for, under the connected user's
+            # schema, as a live 11g answers it.
             stream.write_packet(
-                TNS_DATA, encode_kod_reply([record], sequence=seq.next())
+                TNS_DATA,
+                encode_kod_named_reply(
+                    schema=user.upper(),
+                    name=request.name,
+                    record=record,
+                    sequence=seq.next(),
+                ),
+            )
+            return
+    if request is not None and request.ref is not None:
+        system = kod_system_record(request.ref[5:21])
+        if system is not None:
+            stream.write_packet(
+                TNS_DATA, encode_kod_reply([system], sequence=seq.next())
             )
             return
     _refuse_unhandled_oci(stream, f'OCI call {body[:2].hex()}', seq)
@@ -1584,7 +1620,7 @@ def _serve_oci_session(
                 # An object-type describe (§40). sqlplus asks for a collection
                 # type by name, then for SYS.KOTTD by REF to learn how to read
                 # the answer; anything not served yet is refused as before.
-                _answer_kod_oci(stream, body, seq)
+                _answer_kod_oci(stream, backend, body, seq, user)
                 continue
             if body[1] == TTI_DESCRIBE:
                 # sqlplus `DESCRIBE <object>` — reply with the object's column

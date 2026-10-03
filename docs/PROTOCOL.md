@@ -7919,10 +7919,26 @@ The TDS in attribute 5 is **byte for byte** what the PG backend's
 `examples/postgres_backend.py`): for `DBMSOUTPUT_LINESARRAY`,
 `_TdsCollection(varray=True, bound=0x7fffffff, element=_tds_chars(7, 32767, False))`.
 
-**The Mirror's side.** `encode_kod_reply` / `encode_kod_image` build the reply;
-`kod_system_record` holds SYS.KOTTD's description of itself, and the OCI loop
-answers a by-REF request for it with exactly the live 11g reply. A by-name
-request, which needs the backend's type, is still refused with ORA-03115.
+**The 12c band** (sqlplus 23.26 against a live 18c). The same exchange, but:
+
+- the record descriptor is a bare 35 bytes, `22 00 de ad be ef 00 01 00 22`, five
+  zeros, three per-session bytes (`69 47 19`), zeros -- no `ITEM` length;
+- the by-name header ends `01 00 00 00 00 00`;
+- KOTTD's three name leaves are VARCHAR(**128**), the identifier length 12.2
+  raised, and its attribute part has another id;
+- the closing OER is the 144-byte wide form (§36) with row kind and offset 52
+  both 0, where 11g sends 1 at both.
+
+Sending a 12c client the 11g forms made it break the call off with a marker.
+
+**The Mirror's side.** `encode_kod_reply` / `encode_kod_image` build the reply in
+either band. `kod_system_record` holds SYS.KOTTD's description of itself, and
+`kod_type_record` / `encode_kod_named_reply` describe a user type from what a
+backend's `describe_type(name)` returns -- schema, name, id, kind and the TDS pair.
+The Mirror-over-PG backend answers it from the catalog, with
+`DBMSOUTPUT_LINESARRAY` a VARRAY domain in `sys`. Against the captures both
+bands' replies are byte for byte the live ones, but for the instance marker every
+Mirror OER carries.
 
 **Inferred, not yet confirmed:** the TDS leaf codes `0d`, `0e`, `11` and `09`
 are read here as a 2-byte integer, a 4-byte integer, raw bytes and a REF, from

@@ -3469,6 +3469,55 @@ def test_dbms_utility_functions() -> None:
         backend.close()
 
 
+def test_describe_type_answers_an_oci_type_describe() -> None:
+    # sqlplus describes DBMSOUTPUT_LINESARRAY by name under `set serveroutput
+    # on`; the backend answers with the type's identity and the TDS pair, which
+    # for this type are the live 11g ones byte for byte (#1411). A user's types
+    # describe the same way; a name that is no type is None.
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(__file__))
+    import kod_11g as fx
+
+    from seerdb.common.tns import decode_kod_image, decode_kod_reply
+
+    (record,) = decode_kod_reply(fx.BY_NAME_REPLY).records
+    captured = decode_kod_image(record.image)
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        lines = backend.describe_type('DBMSOUTPUT_LINESARRAY')
+        assert lines is not None
+        assert (lines.schema, lines.name, lines.kind) == (
+            'SYS',
+            'DBMSOUTPUT_LINESARRAY',
+            'varray',
+        )
+        assert (lines.tds, lines.null_tds) == (captured[5], captured[6])
+        backend.execute('CREATE TYPE kod1411_va AS VARRAY(10) OF NUMBER')
+        backend.execute('CREATE TYPE kod1411_nt AS TABLE OF VARCHAR2(30)')
+        backend.execute('CREATE TYPE kod1411_obj AS OBJECT (n NUMBER, s VARCHAR2(20))')
+        backend.commit()
+        kinds = {
+            name: backend.describe_type(name)
+            for name in ('KOD1411_VA', 'KOD1411_NT', 'KOD1411_OBJ')
+        }
+        assert {n: d.kind for n, d in kinds.items() if d} == {
+            'KOD1411_VA': 'varray',
+            'KOD1411_NT': 'nested_table',
+            'KOD1411_OBJ': 'object',
+        }
+        assert backend.describe_type('NO_SUCH_TYPE_1411') is None
+    finally:
+        for name in ('kod1411_va', 'kod1411_nt', 'kod1411_obj'):
+            try:
+                backend.execute(f'DROP TYPE {name}')
+                backend.commit()
+            except Exception:
+                backend.rollback()
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships

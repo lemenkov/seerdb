@@ -222,7 +222,7 @@ from seerdb.server import (
     credential_lookup,
     stats,
 )
-from seerdb.server.backend import SessionInfo
+from seerdb.server.backend import SessionInfo, TypeDescription
 from seerdb.server.identity import IDENTITY_12_1
 
 # The PostgreSQL composite type that backs Oracle's TIMESTAMP WITH TIME ZONE
@@ -749,6 +749,21 @@ CREATE SCHEMA IF NOT EXISTS dbms_session;
 CREATE OR REPLACE PROCEDURE dbms_session.sleep(seconds double precision)
   LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(seconds); END $$;
 """
+
+
+# SYS.DBMSOUTPUT_LINESARRAY (#1411): DBMS_OUTPUT.GET_LINES's collection, a
+# VARRAY(2147483647) OF VARCHAR2(32767) on Oracle. sqlplus describes it by name
+# under `set serveroutput on` and binds the lines as one. Here it is a collection
+# like any VARRAY -- a domain over an array with its bound -- so the type
+# describe and the binds treat it as they treat a user's. Created only when
+# missing: a domain cannot be replaced, and dropping it would break whatever
+# uses it.
+_DBMS_OUTPUT_LINES_DDL = (
+    "DO $$ BEGIN IF to_regtype('sys.dbmsoutput_linesarray') IS NULL THEN "
+    'CREATE DOMAIN sys.dbmsoutput_linesarray AS varchar(32767)[] '
+    'CHECK (VALUE IS NULL OR array_length(VALUE, 1) <= 2147483647); '
+    'END IF; END $$;'
+)
 
 
 # Oracle data-dictionary emulation (#759): the SYS_CONTEXT userenv function and a
@@ -5328,6 +5343,11 @@ class PostgresBackend:
             self._conn.execute(_DBMS_SLEEP_DDL)
         except psycopg.Error:
             self._conn.rollback()
+        # DBMS_OUTPUT.GET_LINES's collection type (#1411).
+        try:
+            self._conn.execute(_DBMS_OUTPUT_LINES_DDL)
+        except psycopg.Error:
+            self._conn.rollback()
         # Oracle data-dictionary emulation (#759): SYS_CONTEXT + catalog views.
         # Installed only when missing or changed, not on every connect: CREATE
         # OR REPLACE VIEW takes an exclusive lock, so a client reading one of the
@@ -6592,6 +6612,40 @@ class PostgresBackend:
                 raise UnsupportedFeature(f'collection type {typ.name}: no element type')
             value = [self._db_object(entry[0], entry[1], v) for v in value]
         return typ.newobject(value)
+
+    def describe_type(self, name: str) -> TypeDescription | None:
+        """The object or collection type ``name`` names, for an OCI client's
+        type describe (#1411): looked for in the session's own schemas, then in
+        SYS, as a public synonym would find it there. None if there is none."""
+        (schema, _dot, bare) = name.rpartition('.')
+        row = self._conn.execute(
+            'SELECT t.oid FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace '
+            'WHERE sys.ora_name(t.typname) = %s '
+            'AND (CASE WHEN %s <> %s THEN sys.ora_owner(n.nspname) = %s '
+            "ELSE n.nspname = ANY(current_schemas(false)) OR n.nspname = 'sys' END) "
+            "ORDER BY n.nspname = 'sys' LIMIT 1",
+            (bare, schema, '', schema),
+        ).fetchone()
+        if row is None:
+            return None
+        kind = self._type_kind(row[0])
+        if kind is None:
+            return None
+        shape = self._type_shape(row[0])
+        if isinstance(shape, _TdsCollection):
+            description = 'varray' if shape.varray else 'nested_table'
+            null_tds = _tds(_TdsObject((_TDS_NULL_LEAF,)))
+        else:
+            description = 'object'
+            null_tds = _tds_null(shape)
+        return TypeDescription(
+            schema=kind[1],
+            name=kind[2],
+            oid=_object_type_oid(row[0]),
+            kind=description,
+            tds=_tds(shape),
+            null_tds=null_tds,
+        )
 
     def _type_kind(self, pg_oid: int) -> tuple[str, str, str, int, int] | None:
         # (kind, owner, name, element oid, element typmod) of a named type: kind

@@ -3966,6 +3966,8 @@ def decode_kod_reply(payload: bytes) -> KodReply:
         at += 1
         (ref, at) = _kod_item(payload, at)
         at += 2  # 01 00
+        if payload[at : at + 4] == bytes(4):
+            at += 4  # the 12c band's longer tail
         named = (schema, name, ref)
     records = []
     while payload[at : at + 2] == _KOD_RECORD:
@@ -3973,7 +3975,10 @@ def decode_kod_reply(payload: bytes) -> KodReply:
         at += 1
         (own_ref, at) = _kod_item(payload, at)
         at += 1
-        (_desc, at) = _kod_item(payload, at)
+        if payload[at : at + 4] == _KOD_RECORD_DESC_12C[:4]:
+            at += len(_KOD_RECORD_DESC_12C)  # the 12c band's bare descriptor
+        else:
+            (_desc, at) = _kod_item(payload, at)
         at += 3 + 4 + 2  # 00 01 00, the ub4 image length, 09 00
         (image, at) = _kod_dalc(payload, at)
         records.append(KodRecord(_kod_ref_id(type_ref), _kod_ref_id(own_ref), image))
@@ -4018,6 +4023,14 @@ _KOD_REF_TAIL = bytes(13) + b'\x01\x00'
 # later captures, climbing like a counter -- then zeros. This is the value the
 # sqlplus capture carried.
 _KOD_RECORD_DESC = b'\x18\x00\xfb\xb9\x81' + bytes(19)
+# In the 12c band the descriptor is a different 35 bytes -- `22 00 de ad be ef
+# 00 01 00 22`, five zeros, three per-session bytes, zeros -- sent bare, with no
+# length in front (sqlplus 23.26 against a live 18c). Sending the 11g form to a
+# client in that band made it break the call off (#1411).
+_KOD_RECORD_DESC_12C = bytes.fromhex('2200deadbeef000100220000000000694719') + bytes(17)
+# The by-name header ends `01 00` in the 11g band, `01 00 00 00 00 00` in the 12c.
+_KOD_NAMED_TAIL = b'\x01\x00'
+_KOD_NAMED_TAIL_12C = b'\x01\x00' + bytes(4)
 _KOD_IMAGE_FLAGS = 0x85  # a pickled object (§21.3)
 _KOD_IMAGE_VERSION = 0x01
 
@@ -4069,7 +4082,11 @@ def _kod_record(record: KodRecord) -> bytes:
         + b'\x01'
         + _kod_item_bytes(_kod_ref(record.oid, system=record.oid in _KOD_SYSTEM_VALUES))
         + record.type_id[-1:]
-        + _kod_item_bytes(_KOD_RECORD_DESC)
+        + (
+            _KOD_RECORD_DESC_12C
+            if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+            else _kod_item_bytes(_KOD_RECORD_DESC)
+        )
         + b'\x00\x01\x00'
         + len(image).to_bytes(4, 'little')
         + b'\x09\x00'
@@ -4078,14 +4095,23 @@ def _kod_record(record: KodRecord) -> bytes:
 
 
 def encode_kod_reply(records: list[KodRecord], *, sequence: int) -> bytes:
-    """A by-REF ``TTI_KOD`` reply: the records, then the success OER (§40.2)."""
-    return b''.join(_kod_record(r) for r in records) + encode_oci_oer(
-        oci.OCI_OER_STATUS_SUCCESS,
-        sequence=sequence,
-        row_kind=oci.OCI_OER_ROW_KIND_LOB,
-        command_type=0,
-        category=0,
+    """A by-REF ``TTI_KOD`` reply: the records, then the success OER (§40.2).
+
+    Two of the OER's bytes follow the band: the row kind (offset 8) and offset
+    52 are 1 from a live 11g and 0 from a live 18c."""
+    wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+    oer = bytearray(
+        encode_oci_oer(
+            oci.OCI_OER_STATUS_SUCCESS,
+            sequence=sequence,
+            row_kind=oci.OCI_OER_ROW_KIND_NONE if wide else oci.OCI_OER_ROW_KIND_LOB,
+            command_type=0,
+            category=0,
+        )
     )
+    if wide:
+        oer[_OCI_OER_LOGIN_REFUSAL_ZERO] = 0
+    return b''.join(_kod_record(r) for r in records) + bytes(oer)
 
 
 # SYS.KOTTD's description of itself, the answer to every client that has just
@@ -4115,13 +4141,108 @@ _KOTTD_VALUES: list[bytes | None] = [
         '00220208ab9eebb9d66392fce040e50a194e468000000000000000000000000000010002'
     ),
 ]
+# In the 12c band KOTTD's names are VARCHAR(128) -- the identifier length 12.2
+# raised -- and its attribute part has another id; the rest is the same
+# (sqlplus 23.26 against a live 18c).
+_KOTTD_VALUES_12C: list[bytes | None] = [
+    *_KOTTD_VALUES[:5],
+    bytes.fromhex(
+        '0000003c26010001000a002900000000001f0e070080010000070080010000070080'
+        '0100000d11110d0d092a00070008000e0014001a001b001c001d001e001f'
+    ),
+    *_KOTTD_VALUES[6:9],
+    bytes.fromhex(
+        '00220208787d054056ed64c1e0530caae80aa10700000000000000000000000000010002'
+    ),
+]
 _KOD_SYSTEM_VALUES: dict[bytes, list[bytes | None]] = {KOD_KOTTD: _KOTTD_VALUES}
+_KOD_SYSTEM_VALUES_12C: dict[bytes, list[bytes | None]] = {KOD_KOTTD: _KOTTD_VALUES_12C}
+
+
+# A user type's KOTTD values that do not depend on the type (§40.3): the flags
+# word, the version string and the unnamed ub2 that was 1 for every type seen.
+_KOD_TYPE_FLAGS = bytes.fromhex('ae9a0001')
+_KOD_TYPE_VERSION = b'$8.0'
+_KOD_TYPE_UB2 = (1).to_bytes(2, 'big')
+# The typecode and the kind word, by kind: an object is typecode 108 with kind
+# 0x0004; a collection is typecode 122, 0x8000 for a VARRAY, 0x0080 for a
+# nested table. Captured from a live 11g for each kind.
+_KOD_TYPECODES = {
+    'object': (108, 0x0004),
+    'varray': (122, 0x8000),
+    'nested_table': (122, 0x0080),
+}
+# The REF an image carries to the type's next part: the part's id, flags and
+# tail as in every capture.
+_KOD_IMAGE_REF_HEAD = b'\x00\x22\x02\x08'
+_KOD_IMAGE_REF_TAIL = bytes(13) + b'\x01\x00\x02'
+
+
+def _kod_part_id(oid: bytes) -> bytes:
+    # A type's parts carry its id with byte 5 counting up (§40.3); the first is
+    # the one KOTTD's last attribute names.
+    part = bytearray(oid)
+    part[5] = (part[5] + 1) & 0xFF
+    return bytes(part)
+
+
+def kod_type_record(
+    *, oid: bytes, schema: str, name: str, kind: str, tds: bytes, null_tds: bytes
+) -> KodRecord:
+    """A user type described as a SYS.KOTTD instance (§40.3)."""
+    (typecode, kind_word) = _KOD_TYPECODES[kind]
+    values: list[bytes | None] = [
+        _KOD_TYPE_FLAGS,
+        schema.encode('utf-8'),
+        name.encode('utf-8'),
+        _KOD_TYPE_VERSION,
+        typecode.to_bytes(2, 'big'),
+        tds,
+        null_tds,
+        kind_word.to_bytes(2, 'big'),
+        _KOD_TYPE_UB2,
+        _KOD_IMAGE_REF_HEAD + _kod_part_id(oid) + _KOD_IMAGE_REF_TAIL,
+    ]
+    return KodRecord(KOD_KOTTD, oid, encode_kod_image(values))
+
+
+def _kod_text_bytes(text: str) -> bytes:
+    data = text.encode('utf-8')
+    return len(data).to_bytes(4, 'little') + bytes([len(data)]) + data
+
+
+def encode_kod_named_reply(
+    *, schema: str, name: str, record: KodRecord, sequence: int
+) -> bytes:
+    """The reply to a by-name ``TTI_KOD`` describe (§40.2): the header naming the
+    type as asked for -- under the CONNECTED user's schema, as 11g answers it --
+    then the type's record and the success OER."""
+    header = (
+        _KOD_BY_NAME_REPLY
+        + (2).to_bytes(4, 'little')
+        + _kod_text_bytes(schema)
+        + bytes(4)
+        + _kod_text_bytes(name)
+        + b'\x00'
+        + _kod_item_bytes(_kod_ref(record.oid, system=False))
+        + (
+            _KOD_NAMED_TAIL_12C
+            if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+            else _KOD_NAMED_TAIL
+        )
+    )
+    return header + encode_kod_reply([record], sequence=sequence)
 
 
 def kod_system_record(oid: bytes) -> KodRecord | None:
     """The record describing a system type, or None if it is not one the Mirror
     knows. Every type descriptor is an instance of SYS.KOTTD (§40.3)."""
-    values = _KOD_SYSTEM_VALUES.get(oid)
+    table = (
+        _KOD_SYSTEM_VALUES_12C
+        if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+        else _KOD_SYSTEM_VALUES
+    )
+    values = table.get(oid)
     if values is None:
         return None
     return KodRecord(KOD_KOTTD, oid, encode_kod_image(values))
