@@ -60,6 +60,11 @@ edge of this adapter:
   only a block and a slot, not the data-object# and
   relative-file# that the package's accessors (``ROWID_OBJECT``,
   ``ROWID_RELATIVE_FNO``, …) decompose a physical rowid into.
+- **XMLType columns** — an ``XMLTYPE`` column is PostgreSQL's ``xml``, described
+  as an ADT of ``SYS.XMLTYPE`` and fetched as the document's text; a string or
+  ``SYS.XMLTYPE(...)`` inserts into it, and ``GET_TYPE_SHAPE`` answers for
+  ``SYS.XMLTYPE`` as 23ai does. Not yet: an XMLType as an object attribute or a
+  collection element, and its methods (``EXTRACT``, ``GETCLOBVAL``).
 - **Object types, partly** — ``CREATE TYPE ... AS OBJECT`` is a PostgreSQL
   composite, listed in ``all_types`` / ``all_type_attrs`` under an OID that is the
   composite's own ``pg_type`` oid, zero-padded to Oracle's 16 bytes. An object
@@ -861,6 +866,9 @@ _ORACLE_DICTIONARY_DDL = (
     # `TO_CLOB('x')` produces -- PostgreSQL resolves `unknown` to no function at
     # all otherwise, which is what `ORA-00904: function to_clob(unknown) does
     # not exist` was. orafce does not provide it.
+    # SYS.XMLTYPE(text): the XMLType constructor, an xml value here (#1536).
+    'CREATE OR REPLACE FUNCTION sys.xmltype(text) RETURNS xml LANGUAGE sql '
+    'IMMUTABLE AS $$ SELECT $1::xml $$;'
     'CREATE OR REPLACE FUNCTION sys.to_clob(text) RETURNS text LANGUAGE sql '
     'IMMUTABLE AS $$ SELECT $1 $$;'
     'CREATE OR REPLACE FUNCTION sys.to_clob(anyelement) RETURNS text LANGUAGE sql '
@@ -1700,6 +1708,13 @@ _DDL_TYPE_REWRITES = [
     # Anchored to a column definition -- after `(` or `,` -- so a `SELECT ROWID`
     # in CREATE TABLE ... AS SELECT is left to the pseudo-column rewrite.
     (re.compile(r'([(,]\s*\w+)\s+UROWID\b', re.IGNORECASE), r'\1 varchar(4000)'),
+    # An XMLType column is PostgreSQL's xml, which the describe reports back as
+    # SYS.XMLTYPE (#1536). A column definition only, as for ROWID below, so a
+    # `sys.xmltype(...)` call in CREATE TABLE ... AS SELECT is left alone.
+    (
+        re.compile(r'([(,]\s*\w+)\s+(?:SYS\.)?XMLTYPE\b', re.IGNORECASE),
+        r'\1 xml',
+    ),
     (re.compile(r'([(,]\s*\w+)\s+ROWID\b', re.IGNORECASE), r'\1 varchar(18)'),
     (re.compile(r'\bLONG\s+RAW\b', re.IGNORECASE), 'bytea'),
     (re.compile(r'\bRAW\s*\(\s*\d+\s*\)', re.IGNORECASE), 'bytea'),
@@ -5131,6 +5146,21 @@ def _column_meta(desc, values: list, tstz_oid: int | None = None) -> ColumnMeta:
         return ColumnMeta(
             name=ident, data_type=data_type, data_length=width, max_size=width
         )
+    if oid == _XML_OID:
+        # An xml column is an XMLType one: an ADT of SYS.XMLTYPE, as a live
+        # server describes it, whose value the Mirror serves as the document the
+        # backend hands over as a str (#1536).
+        return ColumnMeta(
+            name=ident,
+            data_type=TNS_TYPE_ADT,
+            data_length=2000,
+            max_size=0,
+            charset=0,
+            csfrm=0,
+            type_oid=_XMLTYPE_OID,
+            type_schema=b'SYS',
+            type_name=b'XMLTYPE',
+        )
     raise UnsupportedFeature(
         f'column {name!r}: PostgreSQL type oid {oid} is not supported yet'
     )
@@ -5296,6 +5326,19 @@ def _pg_oid_of(oid: bytes) -> int | None:
         return None
     value = int.from_bytes(oid, 'big')
     return value if 0 < value <= 0xFFFFFFFF else None
+
+
+# PostgreSQL's xml type, and SYS.XMLTYPE's type id -- the same on 11g and 23ai
+# (all_types.type_oid) -- which an XMLType column describes with (#1536).
+_XML_OID = 142
+_XMLTYPE_OID = bytes.fromhex('00000000000000000000000000020100')
+# What DBMS_PICKLER.GET_TYPE_SHAPE answers for SYS.XMLTYPE, measured on a live
+# 23ai: version 1, this TDS -- an opaque type's -- and no attributes. A client
+# resolves an XMLType column's type through it before reading a value (#1536).
+_XMLTYPE_TDS = bytes.fromhex(
+    '00000029260100010001ff2900000000001e1b000000193a2afd0000000d01000000070000'
+    '0000000000090007'
+)
 
 
 def _object_column_meta(name: str, typ: DbObjectType) -> ColumnMeta:
@@ -7037,6 +7080,18 @@ class PostgresBackend:
         (schema, _dot, name) = full_name.rpartition('.')
         if row_type:
             name = name[: -len('%ROWTYPE')]
+        if (schema.strip('"').upper(), name.strip('"').upper()) == ('SYS', 'XMLTYPE'):
+            # A built-in, opaque type with no PostgreSQL counterpart to look up:
+            # answered as Oracle answers it (#1536).
+            answer.update(
+                ret_val=0,
+                oid=_XMLTYPE_OID,
+                version=1,
+                tds=_XMLTYPE_TDS,
+                schema='SYS',
+                name='XMLTYPE',
+            )
+            return Result(out_binds=[answer.get(n, values.get(n)) for n in names])
         found = self._conn.execute(
             'SELECT t.oid FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace '
             'LEFT JOIN pg_class c ON c.oid = t.typrelid '

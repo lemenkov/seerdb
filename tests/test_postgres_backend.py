@@ -3689,6 +3689,74 @@ def test_get_lines_hands_back_a_collection_object() -> None:
         backend.close()
 
 
+def test_an_xmltype_column_holds_and_describes_a_document() -> None:
+    # CREATE TABLE ... XMLTYPE failed with ORA-00902 (#1536). The column is
+    # PostgreSQL's xml, described as Oracle describes an XMLType one -- an ADT of
+    # SYS.XMLTYPE -- and its value comes back as the document's text, which the
+    # Mirror serves as an XMLType image. A string inserts into it, and so does
+    # SYS.XMLTYPE(...).
+    from seerdb.common.tns_consts import TNS_TYPE_ADT
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE TABLE xml1536 (IntCol NUMBER(9) NOT NULL, XMLCol XMLTYPE NOT NULL)'
+        )
+        backend.execute(
+            'INSERT INTO xml1536 (IntCol, XMLCol) VALUES (:1, :2)', [1, '<a>one</a>']
+        )
+        backend.execute(
+            'INSERT INTO xml1536 (IntCol, XMLCol) VALUES (:1, sys.xmltype(:2))',
+            [2, '<a>two</a>'],
+        )
+        result = backend.execute('SELECT XMLCol FROM xml1536 ORDER BY IntCol')
+        (column,) = result.columns
+        assert column.data_type == TNS_TYPE_ADT
+        assert (column.type_schema, column.type_name) == (b'SYS', b'XMLTYPE')
+        assert column.type_oid == bytes.fromhex('00000000000000000000000000020100')
+        assert result.rows == [('<a>one</a>',), ('<a>two</a>',)]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE xml1536')
+            backend.commit()
+        except Exception:
+            backend.rollback()
+        backend.close()
+
+
+def test_the_type_shape_of_xmltype_is_oracles() -> None:
+    # A client resolves an XMLType column's type through
+    # DBMS_PICKLER.GET_TYPE_SHAPE before reading it; SYS.XMLTYPE has no
+    # PostgreSQL type to look up, and was refused as an invalid type name. It
+    # answers as a live 23ai does (#1536).
+    from postgres_backend import _XMLTYPE_OID, _XMLTYPE_TDS
+
+    from seerdb.common.tns_consts import TNS_TYPE_RAW, TNS_TYPE_VARCHAR
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        block = (
+            'begin :ret_val := dbms_pickler.get_type_shape(:full_name, :oid, '
+            ':version, :tds, t1, t2, t3, :attrs_rc, t4); end;'
+        )
+        binds = [
+            BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=22),
+            BindVar(value='"SYS"."XMLTYPE"', tns_type=TNS_TYPE_VARCHAR, max_size=200),
+            BindVar(value=None, tns_type=TNS_TYPE_RAW, max_size=16),
+            BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=22),
+            BindVar(value=None, tns_type=TNS_TYPE_RAW, max_size=2000),
+            BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=22),
+        ]
+        (ret, _name, oid, version, tds, _attrs) = backend.execute(
+            block, binds
+        ).out_binds
+        assert (ret, oid, version, tds) == (0, _XMLTYPE_OID, 1, _XMLTYPE_TDS)
+    finally:
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships
