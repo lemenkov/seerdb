@@ -3930,6 +3930,45 @@ def test_a_collection_bound_into_a_select_list_fetches_as_the_collection() -> No
         backend.close()
 
 
+def test_an_objects_raw_attribute_is_raw() -> None:
+    # A RAW(n) attribute, a bytea here, was described and carried as a BLOB
+    # (#1544). Its record says RAW(n): the dictionary, the attribute cursor and
+    # the TDS -- 23ai's byte for byte, leaf `13 0010` -- now say so too.
+    from postgres_backend import _tds
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE TYPE ra1544 AS OBJECT (n NUMBER, r RAW(16), s VARCHAR2(5))'
+        )
+        backend.commit()
+        result = backend.execute(
+            'SELECT attr_name, attr_type_name, length FROM user_type_attrs '
+            "WHERE type_name = 'RA1544' ORDER BY attr_no"
+        )
+        assert result.rows == [
+            ('N', 'NUMBER', None),
+            ('R', 'RAW', 16),
+            ('S', 'VARCHAR2', 5),
+        ]
+        pg_oid = backend._conn.execute("SELECT 'ra1544'::regtype::oid").fetchone()[0]
+        assert _tds(backend._type_shape(pg_oid)).hex() == (
+            '0000002126010001000300290000000000120600811300100700050100002a0007000a000d'
+        )
+        row = backend._attribute_rows(pg_oid)[1]
+        assert (row[3], row[6]) == ('RAW', bytes(15) + b'\x17')
+        result = backend.execute("SELECT ra1544(2, hextoraw('ABCD'), 'y') FROM dual")
+        assert result.rows[0][0].R == b'\xab\xcd'
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TYPE ra1544')
+            backend.commit()
+        except Exception:
+            backend.rollback()
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships

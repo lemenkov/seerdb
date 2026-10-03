@@ -82,10 +82,11 @@ edge of this adapter:
   python-oracledb runs to learn a type,
   ``DBMS_PICKLER.GET_TYPE_SHAPE``, is answered from the catalog with the TDS and
   attribute cursor 23ai sends; an attribute is reported as the DDL translation
-  stored it, so ``RAW`` reads as ``BLOB``, ``FLOAT`` as ``BINARY_DOUBLE`` and
-  ``DATE`` as ``TIMESTAMP(0)``, as the rest of the dictionary reports them. An
-  ``NVARCHAR2`` / ``NCHAR`` / ``NCLOB`` attribute, and an ``NVARCHAR2`` /
-  ``NCHAR`` collection element, keep the national type the DDL declared. PL/SQL package
+  stored it, so ``FLOAT`` reads as ``BINARY_DOUBLE`` and ``DATE`` as
+  ``TIMESTAMP(0)``, as the rest of the dictionary reports them. An ``NVARCHAR2``
+  / ``NCHAR`` / ``NCLOB`` / ``RAW(n)`` attribute, and an ``NVARCHAR2`` /
+  ``NCHAR`` collection element, keep the type the DDL declared; a ``RAW(n)``
+  element reads as ``BLOB``. PL/SQL package
   types (``all_plsql_types``) are not described.
 - **``REF`` / ``DEREF``, with a visible object id** — an Oracle object table
   (``CREATE TABLE t OF type``) gives every row a hidden object id that a REF names.
@@ -1318,7 +1319,8 @@ _ORACLE_DICTIONARY_DDL = (
     f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' AND o.data_type = 'NCLOB' "
     "THEN 'NCLOB' "
     f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CLOB' "
-    "WHEN o.data_type IN ('NVARCHAR2', 'NCHAR') THEN o.data_type "
+    # A RAW(n) is a bytea, told apart by its record (#1544).
+    "WHEN o.data_type IN ('NVARCHAR2', 'NCHAR', 'RAW') THEN o.data_type "
     f"WHEN a.attribute_udt_name = '{_BLOB_TYPE}' THEN 'BLOB' "
     "WHEN a.data_type = 'USER-DEFINED' THEN ora_name(a.attribute_udt_name) "
     "WHEN a.data_type = 'timestamp with time zone' THEN 'TIMESTAMP WITH LOCAL TZ' "
@@ -1329,7 +1331,9 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN a.data_type = 'USER-DEFINED' AND a.attribute_udt_name NOT IN "
     f"('{_TSTZ_TYPE}', '{_CLOB_TYPE}', '{_BLOB_TYPE}') "
     'THEN ora_owner(a.attribute_udt_schema) END AS attr_type_owner, '
-    'a.character_maximum_length AS length, a.numeric_precision AS precision, '
+    # A RAW(n)'s length is its record's; the cast keeps the view column's type.
+    "CASE WHEN o.data_type = 'RAW' THEN o.data_length::information_schema.cardinal_number "
+    'ELSE a.character_maximum_length END AS length, a.numeric_precision AS precision, '
     'a.numeric_scale AS scale, a.ordinal_position AS attr_no, '
     # The character set a character attribute takes; a client reads the national
     # form (NCHAR_CS) from here (#1433). Appended: CREATE OR REPLACE VIEW can
@@ -2486,6 +2490,7 @@ _BUILTIN_TYPE_OID_BYTE = {
     'NVARCHAR2': 0x19,  # the same as VARCHAR2's, measured on 23ai (#1383)
     'NCHAR': 0x1A,  # the same as CHAR's (#1416)
     'BLOB': 0x23,
+    'RAW': 0x17,  # measured on 23ai (#1544)
 }
 
 
@@ -2501,6 +2506,20 @@ def _national_leaf(declared: str | None, typmod: int) -> _TdsLeaf | None:
         return None
     code = 0x07 if declared == 'NVARCHAR2' else 0x01
     return _tds_chars(code, 2 * (typmod - 4), True)
+
+
+def _declared_leaf(
+    declared: tuple[str, int | None] | None, typmod: int
+) -> _TdsLeaf | None:
+    # An attribute's leaf where its declaration says more than the PostgreSQL
+    # type does: a RAW(n), a bytea here, is `13` and a ub2 n, as 23ai sends it
+    # (#1544); a national one is _national_leaf's. None for any other.
+    if declared is None:
+        return None
+    (data_type, length) = declared
+    if data_type == 'RAW' and length:
+        return _TdsLeaf(b'\x13' + length.to_bytes(2, 'big'))
+    return _national_leaf(data_type, typmod)
 
 
 def _tds_chars(code: int, byte_length: int, national: bool) -> _TdsLeaf:
@@ -7092,7 +7111,7 @@ class PostgresBackend:
             declared = self._declared_attribute_types(pg_oid)
             return _TdsObject(
                 tuple(
-                    _national_leaf(declared.get(n), m) or self._type_shape(t, m)
+                    _declared_leaf(declared.get(n), m) or self._type_shape(t, m)
                     for (n, t, m) in self._attributes(pg_oid)
                 )
             )
@@ -7109,20 +7128,24 @@ class PostgresBackend:
             or self._type_shape(element, element_typmod),
         )
 
-    def _declared_attribute_types(self, pg_oid: int) -> dict[str, str]:
+    def _declared_attribute_types(
+        self, pg_oid: int
+    ) -> dict[str, tuple[str, int | None]]:
         # The type each attribute of a composite was declared as, where
-        # sys.ora_columns records one (#1431): attribute name -> Oracle type.
+        # sys.ora_columns records one (#1431): attribute name -> (Oracle type,
+        # its recorded length).
         if not self._has_column_catalog:
             return {}
-        return dict(
-            self._conn.execute(
-                'SELECT a.attname, o.data_type FROM pg_type t '
+        return {
+            name: (data_type, length)
+            for name, data_type, length in self._conn.execute(
+                'SELECT a.attname, o.data_type, o.data_length FROM pg_type t '
                 'JOIN pg_attribute a ON a.attrelid = t.typrelid '
                 'JOIN sys.ora_columns o ON o.relid = a.attrelid AND o.attnum = a.attnum '
                 'WHERE t.oid = %s',
                 (pg_oid,),
             ).fetchall()
-        )
+        }
 
     def _attributes(self, pg_oid: int) -> list[tuple[str, int, int]]:
         # (name, type oid, typmod) of a composite's attributes, in order.
@@ -7158,15 +7181,17 @@ class PostgresBackend:
                 (type_name, owner, toid) = ('XMLTYPE', 'SYS', _XMLTYPE_OID)
             elif kind is None:
                 type_name = _tds_scalar(self._pg_type_name(atttypid), atttypmod)[1]
+                as_declared = declared.get(attname, (None, None))[0]
                 # An NCLOB is an ora_clob like a CLOB; only its name tells them
                 # apart, and the client types the attribute by it (#1431).
-                if type_name == 'CLOB' and declared.get(attname) == 'NCLOB':
+                if type_name == 'CLOB' and as_declared == 'NCLOB':
                     type_name = 'NCLOB'
-                elif (type_name, declared.get(attname)) in (
+                elif (type_name, as_declared) in (
                     ('VARCHAR2', 'NVARCHAR2'),
                     ('CHAR', 'NCHAR'),
+                    ('BLOB', 'RAW'),  # a RAW(n) is a bytea (#1544)
                 ):
-                    type_name = declared[attname]  # (#1383, #1416)
+                    type_name = declared[attname][0]  # (#1383, #1416)
                 (owner, toid) = (
                     None,
                     bytes(15) + bytes([_BUILTIN_TYPE_OID_BYTE[type_name]]),
@@ -7297,7 +7322,7 @@ class PostgresBackend:
                 # The national types, told apart by their record (#1383).
                 f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' "
                 "AND o.data_type = 'NCLOB' THEN 'NCLOB' "
-                "WHEN o.data_type IN ('NVARCHAR2', 'NCHAR') THEN o.data_type "
+                "WHEN o.data_type IN ('NVARCHAR2', 'NCHAR', 'RAW') THEN o.data_type "
                 f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CLOB' "
                 f"WHEN a.attribute_udt_name = '{_BLOB_TYPE}' THEN 'BLOB' "
                 "WHEN a.data_type = 'USER-DEFINED' "
