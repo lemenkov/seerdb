@@ -2408,6 +2408,13 @@ def test_strip_oci_piggyback_unwraps_the_execute() -> None:
         + b'\x03\x5e\x06rest'
     )
     assert strip_oci_piggyback(wrapped) == b'\x03\x5e\x06rest'
+    # Closing two cursors, captured from sqlplus against a live 11g: the count
+    # takes 8 bytes and each cursor id 4, so the call starts at 27. Read as one
+    # 8-byte entry per cursor it started at 31, inside the call (#1517).
+    two = bytes.fromhex(
+        '116911feffffffffffffff02000000000000000300000001000000035e1221'
+    )
+    assert strip_oci_piggyback(two) == bytes.fromhex('035e1221')
     # a bare execute (no piggyback) is returned unchanged
     assert strip_oci_piggyback(b'\x03\x5e\x06bare') == b'\x03\x5e\x06bare'
 

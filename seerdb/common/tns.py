@@ -3837,12 +3837,16 @@ def encode_version_banner_oci(banner: bytes) -> bytes:
 
 # The classic sqlplus / thick-OCI OALL8 arrives wrapped in an OCCA (close-cursors)
 # piggyback for every statement past the first: `0x11 0x69`, then a fixed prefix
-# (seq, an 8-byte indicator, the ub4 cursor count, and one 8-byte entry per closed
-# cursor), then the real TTI_FUN execute. Strip it so the execute can be parsed.
+# (seq, an 8-byte indicator, the cursor count in 8 bytes), one ub4 id per closed
+# cursor, then the real TTI_FUN execute. Strip it so the execute can be parsed.
+# Live 11g, sqlplus closing cursors 3 and 1:
+#   11 69 11 | fe ff..ff | 02 00 00 00 00 00 00 00 | 03 00 00 00 01 00 00 00 | 03 5e
+# Read as one 8-byte entry per cursor instead, a single cursor landed on the same
+# byte and two cut 4 bytes into the call (#1517).
 _OCI_PIGGYBACK = bytes([TTI_MSG_TYPE_PIGGYBACK, TTI_OCCA])
 
 
-_OCI_PIGGYBACK_FIXED = 3 + 8 + 4  # 0x11 0x69 seq | indicator | ub4 count
+_OCI_PIGGYBACK_FIXED = 3 + 8 + 8  # 0x11 0x69 seq | indicator | count
 
 
 # The version call and sqlplus PASSWORD changepassword instead arrive wrapped in
@@ -3862,7 +3866,7 @@ def strip_oci_piggyback(body: bytes) -> bytes:
     changepassword (:func:`is_version_call_oci` splits those two apart)."""
     if body[:2] == _OCI_PIGGYBACK:
         count = int.from_bytes(body[11:15], 'little')
-        return body[_OCI_PIGGYBACK_FIXED + count * 8 :]
+        return body[_OCI_PIGGYBACK_FIXED + count * 4 :]
     if body[:2] == oci.OCI_PIGGYBACK_80SES:
         return body[_OCI_80SES_FIXED:]
     return body
