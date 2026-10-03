@@ -296,6 +296,7 @@ from seerdb.common.tns_consts import (
     TTI_FUN,
     TTI_IOV,
     TTI_IRD,
+    TTI_KOD,
     TTI_LOB,
     TTI_LOBOPS,
     TTI_LOGOFF,
@@ -3855,6 +3856,152 @@ _OCI_PIGGYBACK_FIXED = 3 + 8 + 8  # 0x11 0x69 seq | indicator | count
 # preamble length is constant across captures (only the seq/count bytes vary), so
 # the inner call always starts at offset 15.
 _OCI_80SES_FIXED = 15
+
+
+# The OCI object-type describe, function 92 (docs/PROTOCOL.md §40, #1411). An
+# OCI client asks for a type by name or by REF; the reply is one or more records,
+# each a pickled type-descriptor object (an instance of SYS.KOTTD / KOTTB / KOTAD,
+# whose own descriptors are answered the same way). Fixed-width little-endian.
+KOD_BY_NAME = 3
+KOD_BY_REF = 4
+_KOD_RECORD = b'\x0d\x01'
+_KOD_BY_NAME_REPLY = b'\x0d\x02'
+_KOD_NAME_OFF = 99  # after `03 5c <seq>`, the ub4 opcode and 92 zero bytes
+_KOD_REF_LEN = 36
+
+
+class KodRequest(NamedTuple):
+    opcode: int
+    schema: str | None
+    name: str | None
+    ref: bytes | None
+
+
+class KodRecord(NamedTuple):
+    """One described object: the id of its system type, its own id, its image."""
+
+    type_id: bytes
+    oid: bytes
+    image: bytes
+
+
+class KodReply(NamedTuple):
+    # (schema, name, REF) of the by-name header; None for a by-REF reply.
+    named: tuple[str, str, bytes] | None
+    records: list[KodRecord]
+
+
+def _kod_item(data: bytes, at: int) -> tuple[bytes, int]:
+    # A ub4 LE length, then that many bytes.
+    length = int.from_bytes(data[at : at + 4], 'little')
+    end = at + 4 + length
+    if end > len(data):
+        raise Truncated(f'KOD item of {length} bytes runs off the end')
+    return data[at + 4 : end], end
+
+
+def _kod_text(data: bytes, at: int) -> tuple[str, int]:
+    # A name: a ub4 count, then the ub1 length and the bytes again.
+    size = data[at + 4]
+    end = at + 5 + size
+    return data[at + 5 : end].decode('utf-8'), end
+
+
+def _kod_ref_id(ref: bytes) -> bytes:
+    # A 36-byte REF item: `24 00`, a flags triple, the 16-byte id, 15 more bytes.
+    if len(ref) != _KOD_REF_LEN:
+        raise InterfaceError(f'KOD REF of {len(ref)} bytes, not {_KOD_REF_LEN}')
+    return ref[5:21]
+
+
+def _kod_dalc(data: bytes, at: int) -> tuple[bytes, int]:
+    # A ub1 length, or 0xFE then ub1-length chunks ending in a zero one.
+    first = data[at]
+    if first != TNS_LONG_LENGTH_INDICATOR:
+        return data[at + 1 : at + 1 + first], at + 1 + first
+    at += 1
+    out = bytearray()
+    while True:
+        size = data[at]
+        at += 1
+        if size == 0:
+            return bytes(out), at
+        out += data[at : at + size]
+        at += size
+
+
+def parse_kod_request(payload: bytes) -> KodRequest:
+    """The type an OCI ``TTI_KOD`` call asks for (PROTOCOL.md §40.1)."""
+    if len(payload) < 7 or payload[0] != TTI_FUN or payload[1] != TTI_KOD:
+        raise InterfaceError('not a TTI_KOD call')
+    opcode = int.from_bytes(payload[3:7], 'little')
+    if opcode == KOD_BY_NAME:
+        at = _KOD_NAME_OFF + 4
+        schema_len = int.from_bytes(payload[at : at + 4], 'little')
+        at += 8
+        schema = None
+        if schema_len:
+            # Not seen yet: sqlplus names no schema. Refused rather than guessed.
+            raise InterfaceError('KOD by name with a schema is not decoded yet')
+        at += 4  # the name's buffer length, 3 x its characters
+        name_len = payload[at]
+        name = payload[at + 1 : at + 1 + name_len].decode('utf-8')
+        return KodRequest(opcode, schema, name, None)
+    if opcode == KOD_BY_REF:
+        at = payload.index(b'\x24\x00\x00\x00\x24\x00', 7)
+        (ref, _end) = _kod_item(payload, at)
+        return KodRequest(opcode, None, None, ref)
+    raise InterfaceError(f'KOD opcode {opcode} is not decoded yet')
+
+
+def decode_kod_reply(payload: bytes) -> KodReply:
+    """A ``TTI_KOD`` reply's header and records, up to the closing OER (§40.2)."""
+    at = 0
+    named = None
+    if payload[:2] == _KOD_BY_NAME_REPLY:
+        at = 6  # 0d 02, then a ub4 2
+        (schema, at) = _kod_text(payload, at)
+        at += 4
+        (name, at) = _kod_text(payload, at)
+        at += 1
+        (ref, at) = _kod_item(payload, at)
+        at += 2  # 01 00
+        named = (schema, name, ref)
+    records = []
+    while payload[at : at + 2] == _KOD_RECORD:
+        (type_ref, at) = _kod_item(payload, at + 2)
+        at += 1
+        (own_ref, at) = _kod_item(payload, at)
+        at += 1
+        (_desc, at) = _kod_item(payload, at)
+        at += 3 + 4 + 2  # 00 01 00, the ub4 image length, 09 00
+        (image, at) = _kod_dalc(payload, at)
+        records.append(KodRecord(_kod_ref_id(type_ref), _kod_ref_id(own_ref), image))
+    return KodReply(named, records)
+
+
+def decode_kod_image(image: bytes) -> list[bytes | None]:
+    """The attribute values of a type-descriptor image, in order (§40.3).
+
+    The image is a pickled object: ``85 01``, its length (a ub1, or ``fe`` and a
+    ub4 BE), then each value as a ub1 length, ``fe`` + ub4 BE, or ``ff`` for NULL.
+    """
+    at = 2
+    at += 5 if image[at] == TNS_LONG_LENGTH_INDICATOR else 1
+    values: list[bytes | None] = []
+    while at < len(image):
+        size = image[at]
+        if size == TNS_NULL_LENGTH_INDICATOR:
+            values.append(None)
+            at += 1
+        elif size == TNS_LONG_LENGTH_INDICATOR:
+            size = int.from_bytes(image[at + 1 : at + 5], 'big')
+            values.append(image[at + 5 : at + 5 + size])
+            at += 5 + size
+        else:
+            values.append(image[at + 1 : at + 1 + size])
+            at += 1 + size
+    return values
 
 
 def strip_oci_piggyback(body: bytes) -> bytes:

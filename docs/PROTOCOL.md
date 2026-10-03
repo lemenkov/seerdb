@@ -7813,3 +7813,126 @@ servers and diffing the trailer that follows the banner:
 A client only echoes the banner text, so the trailer never had to be decoded to
 work; this pins it to a generated version rather than a blob. Every query-path
 constant is now a real codec.
+
+## 40. OCI object-type describe — `TTI_KOD`, function 92 (#1411)
+
+An OCI client (sqlplus, thick python-oracledb) learns an object or collection
+type through function **92 (`0x5c`, `TTI_KOD`)**, not through SQL as the thin
+client does (§21.9). sqlplus needs it for `set serveroutput on`: before it reads
+`DBMS_OUTPUT.GET_LINES` it describes `DBMSOUTPUT_LINESARRAY`, and with the type
+in hand binds the lines as that collection (§40.4). Captured with sqlplus 23.26
+and with thick python-oracledb's `gettype()` against a live 11g (2026-10-03).
+The integers are OCI's fixed-width little-endian (§36), not the thin
+variable-length form.
+
+### 40.1 Request
+
+`03 5c <seq>`, a `ub4` opcode, then a mostly-zero call frame. Two forms were seen:
+
+- **By name** (opcode `3`; what sqlplus sends):
+
+  ```
+  03 5c <seq> 03 00 00 00 | 92 x 00 | ub4 2 | ub4 schema length (0: none)
+  | ub4 0 | ub4 name buffer length (3 x the name's characters, 63 for 21)
+  | ub1 length + name | 00 00 00 00 00 01
+  ```
+
+- **By REF** (opcode `4`; thick `gettype()` after resolving the name with a
+  describe of its own, and sqlplus for the system types of §40.3): the same frame
+  carrying a 36-byte REF (§40.2) of the type wanted.
+
+### 40.2 Reply
+
+A by-REF reply is one or more **records** then an ordinary OER (§36). A by-name
+reply opens with a header first:
+
+```
+0d 02 | ub4 2 | TEXT schema | ub4 0 | TEXT name | ub1 0
+      | ITEM(REF of the type) | 01 00                 then the records
+```
+
+`TEXT` is a `ub4` count, then the `ub1` length and the bytes (`03 00 00 00 03
+'PYO'`).
+
+The schema in that header is the **connected user's** (`PYO`), even for a SYS
+type reached through a public synonym; the record's own image names the real
+owner.
+
+Each record, verified on every record of every capture:
+
+```
+0d 01
+ITEM(REF of the record's TYPE)   ub1 1
+ITEM(REF of the object itself)   ub1 <the last byte of the type's id>
+ITEM(18 00 fc 09 <b> 00 x 19)    -- <b> differs per session, fixed within one
+00 01 00 | ub4 image length | 09 00 | the image, as a DALC (ub1 length, or fe + ub1 chunks + 00)
+```
+
+`ITEM` is a `ub4` length then that many bytes. A **REF** item is 36 bytes:
+`24 00`, a flags triple (`22 12 08` for the metatypes' own records, `22 02 08`
+otherwise), the 16-byte object id, then 15 bytes that were `00 x 13 01 00` in
+every capture.
+
+The **image** is a pickled object (§21.3): `85 01 fe <ub4 BE length>`, then one
+value per attribute (a `ub1` length, `fe` + `ub4 BE` length, or `ff` for NULL).
+The object is a **type descriptor**: an instance of a system type whose own
+descriptor says how to read it.
+
+### 40.3 The system types
+
+| id (16 bytes) | type | what an instance describes |
+|---|---|---|
+| `00 x 15 01` | `SYS.KOTTD` | a type: its name, typecode, TDS |
+| `00 x 15 02` | `SYS.KOTTB` | a collection's element part |
+| `00 x 15 03` | `SYS.KOTAD` | an attribute |
+| `00 x 15 42` | (not yet named) | another part of a type |
+| `00 x 15 0f` | `SYS.NUMBER` | the built-in NUMBER |
+
+A user type described by REF comes back as one `KOTTD` record and one each of the
+`KOTTB` / `KOTAD` / `0x42` parts, their ids the type's own with byte 5 counting
+up. The client then asks for each system type it has not seen by its id; those
+answers are the same in every session.
+
+A **`KOTTD` instance** has ten attributes. `KOTTD` describes itself, and its own
+TDS lists exactly these ten leaves (`0e`, three `07 00 1e 01 00 00`, `0d`, `11`,
+`11`, `0d`, `0d`, `09`):
+
+| # | value | DBMSOUTPUT_LINESARRAY | KOTTD itself |
+|---|---|---|---|
+| 0 | 4 bytes | `ae 9a 00 01` | `ae 9a 00 01` |
+| 1 | schema | `SYS` | `SYS` |
+| 2 | name | `DBMSOUTPUT_LINESARRAY` | `KOTTD` |
+| 3 | version | `$8.0` | `$8.0` |
+| 4 | ub2 BE typecode | `00 7a` (122, named collection) | `00 6c` (108, object) |
+| 5 | the TDS (§21.9) | VARRAY, bound `7fffffff`, of VARCHAR(32767) | ten leaves |
+| 6 | the null-image TDS | | |
+| 7 | ub2 BE | `80 00` | `00 16` |
+| 8 | ub2 BE | `00 01` | `00 01` |
+| 9 | a REF | the type's next part | |
+
+The TDS in attribute 5 is **byte for byte** what the PG backend's
+`dbms_pickler.get_type_shape` answer builds (`_tds` in
+`examples/postgres_backend.py`): for `DBMSOUTPUT_LINESARRAY`,
+`_TdsCollection(varray=True, bound=0x7fffffff, element=_tds_chars(7, 32767, False))`.
+
+**Inferred, not yet confirmed:** the TDS leaf codes `0d`, `0e`, `11` and `09`
+are read here as a 2-byte integer, a 4-byte integer, raw bytes and a REF, from
+the sizes of the values they describe. Attribute 0, attributes 7 and 8, and the
+`0x42` part are unnamed.
+
+### 40.4 Binding the collection (`GET_LINES`)
+
+With the type described, sqlplus binds `:LINES` as type **109** (`0x6d`). Its
+OCI bind descriptor carries, in place of a scalar's `01 <type> 03 00 00 <size>`,
+`00 6d 00 00 00 d0 07 00 00 …`, then `ub4 16`, `ub1 16` and the type's 16-byte
+id, then `ub4 1`. The IN value is the REF of the type followed by an empty image;
+the reply's OUT value is that REF and the collection's image — the same pickle
+as §21.6: `88 01 13 01 03 00 02 0a 'from plsql' ff` for one line and a NULL.
+
+Decoders: `parse_kod_request`, `decode_kod_reply`, `decode_kod_image`, pinned
+to the captured exchange by `tests/test_kod_decode.py`.
+
+Against a server that cannot describe the type (ORA-03115), sqlplus falls back to
+binding `:LINES` as a plain PL/SQL VARCHAR array (`01 01 43 …`, element size
+32765) and re-executes the block by cursor id while its line count stays above
+zero (#1411, #1515).
