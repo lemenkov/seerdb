@@ -1343,7 +1343,14 @@ _ORACLE_DICTIONARY_DDL = (
     "CASE WHEN o.data_type IN ('REAL', 'DOUBLE PRECISION', 'FLOAT') "
     'THEN o.data_precision::information_schema.cardinal_number '
     'ELSE a.numeric_precision END AS precision, '
-    'a.numeric_scale AS scale, a.ordinal_position AS attr_no, '
+    # A TIMESTAMP(n)'s scale is its n (#1550): PostgreSQL's own precision for a
+    # timestamp, the recorded one for the ora_tstz WITH TIME ZONE (#1308),
+    # Oracle's 6 when none was declared.
+    f"CASE WHEN a.attribute_udt_name = '{_TSTZ_TYPE}' "
+    'THEN coalesce(p.prec, 6)'
+    '::information_schema.cardinal_number '
+    "WHEN a.data_type LIKE 'timestamp%' THEN a.datetime_precision "
+    'ELSE a.numeric_scale END AS scale, a.ordinal_position AS attr_no, '
     # The character set a character attribute takes; a client reads the national
     # form (NCHAR_CS) from here (#1433). Appended: CREATE OR REPLACE VIEW can
     # only add a column at the end.
@@ -1357,6 +1364,9 @@ _ORACLE_DICTIONARY_DDL = (
     'LEFT JOIN sys.ora_columns o ON o.relid = '
     "(quote_ident(a.udt_schema) || '.' || quote_ident(a.udt_name))::regclass "
     'AND o.attnum = a.ordinal_position '
+    'LEFT JOIN sys.ora_tstz_precision p ON p.relid = '
+    "(quote_ident(a.udt_schema) || '.' || quote_ident(a.udt_name))::regclass "
+    'AND p.attnum = a.ordinal_position '
     f"WHERE a.udt_name <> '{_TSTZ_TYPE}' AND a.udt_name !~ '[$]ref$' "
     "AND a.udt_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
     'CREATE OR REPLACE VIEW sys.user_type_attrs AS SELECT * FROM all_type_attrs '
@@ -6624,10 +6634,14 @@ class PostgresBackend:
 
     def _record_tstz_precisions(self, statement: str) -> None:
         # After a committed CREATE TABLE: note the precision of each column it
-        # declares TIMESTAMP(n) WITH TIME ZONE (#1308). On its own, like the
-        # quoted names, so a failure here cannot take the table with it; a
-        # column added later by ALTER TABLE ... ADD keeps the default.
-        table = _CREATE_TABLE_NAME.match(statement)
+        # declares TIMESTAMP(n) WITH TIME ZONE (#1308), and of each attribute a
+        # CREATE TYPE ... AS OBJECT does, by the composite's relation (#1550).
+        # On its own, like the quoted names, so a failure here cannot take the
+        # table with it; a column added later by ALTER TABLE ... ADD keeps the
+        # default.
+        table = _CREATE_TABLE_NAME.match(statement) or _CREATE_OBJECT_TYPE_NAME.match(
+            statement
+        )
         if table is None or not self._has_tstz_precision:
             return
         declared = {

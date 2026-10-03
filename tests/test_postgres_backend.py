@@ -4057,6 +4057,42 @@ def test_an_objects_date_attribute_is_a_date() -> None:
         backend.close()
 
 
+def test_a_timestamp_attributes_scale_is_its_precision() -> None:
+    # all_type_attrs listed every TIMESTAMP attribute's scale as NULL; Oracle
+    # lists its fractional-seconds precision there (#1550). A WITH TIME ZONE
+    # one is the ora_tstz composite, its precision recorded as a table
+    # column's is (#1308). Measured on 23ai.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE TYPE ts1550 AS OBJECT (d DATE, t TIMESTAMP, t3 TIMESTAMP(3), '
+            't0 TIMESTAMP(0), tz TIMESTAMP(2) WITH TIME ZONE, '
+            'ltz TIMESTAMP(4) WITH LOCAL TIME ZONE, tzd TIMESTAMP WITH TIME ZONE)'
+        )
+        backend.commit()
+        result = backend.execute(
+            'SELECT attr_name, attr_type_name, scale FROM user_type_attrs '
+            "WHERE type_name = 'TS1550' ORDER BY attr_no"
+        )
+        assert result.rows == [
+            ('D', 'DATE', None),
+            ('T', 'TIMESTAMP', 6),
+            ('T3', 'TIMESTAMP', 3),
+            ('T0', 'TIMESTAMP', 0),
+            ('TZ', 'TIMESTAMP WITH TZ', 2),
+            ('LTZ', 'TIMESTAMP WITH LOCAL TZ', 4),
+            ('TZD', 'TIMESTAMP WITH TZ', 6),
+        ]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TYPE ts1550')
+            backend.commit()
+        except Exception:
+            backend.rollback()
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships
