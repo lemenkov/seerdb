@@ -3587,6 +3587,41 @@ def test_a_call_with_literal_arguments_passes_them() -> None:
         backend.close()
 
 
+def test_get_lines_hands_back_a_collection_object() -> None:
+    # sqlplus reads DBMS_OUTPUT.GET_LINES with the lines bound as
+    # DBMSOUTPUT_LINESARRAY (#1411). orafce returns them as text[]; the bind's
+    # type id makes them an object of that type, which the Mirror encodes.
+    from seerdb.common.dbobject import DbObject
+    from seerdb.common.tns_consts import TNS_TYPE_ADT, TNS_TYPE_NUMBER
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        lines_type = backend.describe_type('DBMSOUTPUT_LINESARRAY')
+        assert lines_type is not None
+        backend.execute('BEGIN DBMS_OUTPUT.ENABLE(NULL); END;', [])
+        backend.execute("BEGIN DBMS_OUTPUT.PUT_LINE('first'); END;", [])
+        backend.execute("BEGIN DBMS_OUTPUT.PUT_LINE('second'); END;", [])
+        result = backend.execute(
+            'BEGIN DBMS_OUTPUT.GET_LINES(:LINES, :NUMLINES); END;',
+            [
+                BindVar(
+                    value=None,
+                    tns_type=TNS_TYPE_ADT,
+                    max_size=2000,
+                    toid=lines_type.oid,
+                ),
+                BindVar(value=15, tns_type=TNS_TYPE_NUMBER, max_size=22),
+            ],
+        )
+        (lines, count) = result.out_binds
+        assert isinstance(lines, DbObject)
+        assert lines.aslist()[:count] == ['first', 'second']
+        assert count == 2
+    finally:
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships

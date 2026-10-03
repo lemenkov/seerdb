@@ -5727,7 +5727,7 @@ class PostgresBackend:
             # translate.
             return self._execute_plsql(sql, binds)
         if binds and is_plsql(sql):
-            return self._execute_plsql(sql, binds)
+            return self._collection_outs(self._execute_plsql(sql, binds), binds)
         # A `SELECT REF(alias)` object-REF fetch: PostgreSQL has no REF, so stand in
         # the row's ctid as the locator and report the referenced object type from
         # the typed table's catalog entry, so the client decodes a REF whose
@@ -7987,6 +7987,29 @@ class PostgresBackend:
         for i, position in enumerate(into):
             out[position] = returned[i] if returned is not None else None
         return Result(out_binds=out)
+
+    def _collection_outs(self, result: Result, binds: Sequence) -> Result:
+        """``result`` with each collection OUT value made an object of its type.
+
+        A routine hands a collection back as a PostgreSQL array -- orafce's
+        DBMS_OUTPUT.GET_LINES its lines as text[] -- and a client that bound a
+        collection there, sqlplus binding DBMSOUTPUT_LINESARRAY (#1411), reads
+        an object of that type: the bind carries the type's id.
+        """
+        out = list(result.out_binds)
+        for at, bind in enumerate(binds):
+            if (
+                at < len(out)
+                and isinstance(bind, BindVar)
+                and bind.tns_type == TNS_TYPE_ADT
+                and bind.toid
+                and isinstance(out[at], list)
+            ):
+                pg_oid = _pg_oid_of(bind.toid)
+                typ = self._collection_type(pg_oid) if pg_oid is not None else None
+                if typ is not None:
+                    out[at] = DbObject(typ.name, elements=out[at], dbtype=typ)
+        return replace(result, out_binds=out)
 
     def _routine_exists(self, name: str) -> bool:
         """Whether PostgreSQL has a routine of this name, in the schema the name
