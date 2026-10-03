@@ -1409,6 +1409,26 @@ class TypesIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.fetchall(), [('X', 'abc', 'x')])
 
+    def test_autocommit_is_off_unless_asked_for(self):
+        # A connection opened without `autocommit` starts with it off, as PEP 249
+        # and python-oracledb have it: a row it inserted and never committed is
+        # rolled back when it closes. seerdb defaulted to on until 3.0.0, and
+        # such a row was kept (#1447).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (k NUMBER)')
+        writer = seerdb.connect(
+            host=_HOST,
+            port=_PORT,
+            user=_USER,
+            password=_PASSWORD,
+            service_name=_SERVICE,
+            **_FV_KW,
+        )
+        self.assertIs(writer.autocommit, False)
+        writer.cursor().execute(f'INSERT INTO {self.TABLE} VALUES (1)')
+        writer.close()
+        self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone(), (0,))
+
     def test_char_length_is_zero_for_a_type_without_one(self):
         # USER_TAB_COLUMNS.CHAR_LENGTH is a character column's declared length
         # and 0 for any other type, never NULL. The Mirror over PostgreSQL gave

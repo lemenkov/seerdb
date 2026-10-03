@@ -164,7 +164,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         ssl: object = None,
         socket_options: object = None,
         timeout: int = 15000,
-        autocommit: bool = True,
+        autocommit: bool = False,
         fetch: int = 100,
         role: int = 0,
         prelim: int = 0,
