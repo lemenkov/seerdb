@@ -282,10 +282,9 @@ def test_translate_ddl_maps_create_table_column_types() -> None:
         'CREATE TABLE t (a numeric, b numeric, c numeric, d numeric, '
         'e double precision)'
     )
-    # An object attribute keeps PostgreSQL's float: no catalog row describes it
-    # (#1423).
-    assert 'AS (r REAL, f FLOAT)' in _translate_ddl(
-        'CREATE TYPE o AS OBJECT (r REAL, f FLOAT)'
+    # So are an object's attributes, their declarations recorded (#1423).
+    assert 'AS (r numeric, f numeric, g double precision)' in _translate_ddl(
+        'CREATE TYPE o AS OBJECT (r REAL, f FLOAT, g BINARY_DOUBLE)'
     )
 
 
@@ -3963,6 +3962,55 @@ def test_an_objects_raw_attribute_is_raw() -> None:
         backend.rollback()
         try:
             backend.execute('DROP TYPE ra1544')
+            backend.commit()
+        except Exception:
+            backend.rollback()
+        backend.close()
+
+
+def test_an_objects_float_attribute_is_a_number_of_binary_precision() -> None:
+    # An object's FLOAT / REAL / DOUBLE PRECISION attribute was PostgreSQL's
+    # binary float (#1423). Oracle makes it a NUMBER of binary precision, as a
+    # table's FLOAT column (#1384), listed by the name it was declared with: a
+    # numeric here, its declaration recorded. The TDS is 23ai's byte for byte.
+    from postgres_backend import _tds
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE TYPE fa1423 AS OBJECT '
+            '(r REAL, d DOUBLE PRECISION, f FLOAT, f10 FLOAT(10), n NUMBER)'
+        )
+        backend.commit()
+        result = backend.execute(
+            'SELECT attr_name, attr_type_name, length, precision, scale '
+            "FROM user_type_attrs WHERE type_name = 'FA1423' ORDER BY attr_no"
+        )
+        assert result.rows == [
+            ('R', 'REAL', None, None, None),
+            ('D', 'DOUBLE PRECISION', None, None, None),
+            ('F', 'FLOAT', None, None, None),
+            ('F10', 'FLOAT', None, 10, None),
+            ('N', 'NUMBER', None, None, None),
+        ]
+        pg_oid = backend._conn.execute("SELECT 'fa1423'::regtype::oid").fetchone()[0]
+        assert _tds(backend._type_shape(pg_oid)).hex() == (
+            '000000242601000100050029000000000011050005000500050a0600812a'
+            '00070009000b000d000f'
+        )
+        assert [(row[3], row[6][-1]) for row in backend._attribute_rows(pg_oid)] == [
+            ('REAL', 0x0C),
+            ('DOUBLE PRECISION', 0x0D),
+            ('FLOAT', 0x0E),
+            ('FLOAT', 0x0E),
+            ('NUMBER', 0x0F),
+        ]
+        result = backend.execute('SELECT fa1423(1.5, 2, 3, 4.25, 5) FROM dual')
+        assert result.rows[0][0].F10 == Decimal('4.25')
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TYPE fa1423')
             backend.commit()
         except Exception:
             backend.rollback()
