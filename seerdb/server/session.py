@@ -1221,7 +1221,7 @@ def _serve_thin_session(
         # The thick/OCI loop has done this since it was written (_OciSequence);
         # this is the thin half. Captured from 23ai, consecutive replies differ
         # by one in exactly this field: 0x1816 then 0x1817.
-        oer_seq += 1
+        oer_seq = _next_reply_sequence(oer_seq)
         _ENCODE_OER_SEQ.set(oer_seq)
         received = stream.read_packet()
         if received is None:
@@ -2242,8 +2242,17 @@ class _OciSequence:
 
     def next(self) -> int:
         n = self._n
-        self._n += 1
+        self._n = _next_reply_sequence(n)
         return n
+
+
+def _next_reply_sequence(n: int) -> int:
+    """The reply sequence after ``n``, wrapping as a 16-bit counter does.
+
+    Both reply paths carry the sequence in a 16-bit field. Left to grow, the OCI
+    path's 65,536th reply failed to encode and the session died; the thin path
+    wrote a third byte a client reads as two (#1513)."""
+    return (n + 1) & 0xFFFF
 
 
 class _Cursors:

@@ -2306,6 +2306,23 @@ def test_the_end_of_fetch_terminator_carries_the_cursor_id() -> None:
         _ENCODE_OER_SEQ.reset(token)
 
 
+def test_the_reply_sequence_wraps_at_16_bits() -> None:
+    # Both reply paths carry the sequence in a 16-bit field. The OCI counter
+    # never wrapped, so a sqlplus session died on its 65,536th reply, unable to
+    # encode it (#1513); the thin one would have grown a third byte.
+    from seerdb.common.tns import encode_status_oci
+    from seerdb.server.session import _next_reply_sequence, _OciSequence
+
+    assert _next_reply_sequence(0xFFFE) == 0xFFFF
+    assert _next_reply_sequence(0xFFFF) == 0
+    seq = _OciSequence()
+    seq._n = 0xFFFF
+    assert [seq.next() for _ in range(3)] == [0xFFFF, 0, 1]
+    seq._n = 0xFFFF
+    encode_status_oci(seq.next())
+    encode_status_oci(seq.next())  # raised struct.error past 65535
+
+
 def test_the_thin_terminator_advances_its_oer_sequence() -> None:
     # The thin reply path used to emit the frozen sequence every captured status
     # was decoded with, so a whole session repeated one number while the
