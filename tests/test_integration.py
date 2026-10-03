@@ -1705,12 +1705,7 @@ class TypesIntegration(_IntegrationBase):
                 f'BEGIN SELECT rowid INTO :r FROM {self.TABLE} WHERE n = 4; END;', [rid]
             )
             self.assertIsInstance(rid.getvalue(), str)
-            back = rid
-            if _conn_is_8i(self.conn):
-                # 8i sends a variable an OUT bind filled as NULL (#1505).
-                back = self.cur.var(typ)
-                back.setvalue(0, rid.getvalue())
-            self.cur.execute(f'SELECT n FROM {self.TABLE} WHERE rowid = :r', [back])
+            self.cur.execute(f'SELECT n FROM {self.TABLE} WHERE rowid = :r', [rid])
             self.assertEqual(self.cur.fetchall(), [(4,)], typ)
 
     def test_a_variable_an_out_bind_filled_binds_back_in(self):
