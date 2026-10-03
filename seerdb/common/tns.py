@@ -8554,6 +8554,12 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
     bind_meta: list[tuple[int, int]] = []
     if bind_count and marker != TNS_LONG_LENGTH_INDICATOR:
         binds, bind_meta = _parse_oci_binds(payload, sql_off + marker, bind_count)
+    if bind_count and not bind_meta:
+        # Binds the section could not be read for -- a type this path does not
+        # parse, such as a collection. Run without them, the statement did
+        # something else than asked, and the client got a status it could not
+        # use (#1525). A clean error instead.
+        raise InterfaceError(f'OCI OALL8: {bind_count} bind(s) of a form not read yet')
     return ExecRequest(
         sql=sql,
         cursor=cursor,
