@@ -4076,7 +4076,11 @@ def _replace_binds(sql: str, replacement: dict[str, str]) -> str:
 _BLOCK_BIND_SETTING = 'mirror.block_bind_{}'
 
 
-def _bind_block(sql: str, locals_: dict[str, tuple[int, str, str]]) -> str:
+def _bind_block(
+    sql: str,
+    locals_: dict[str, tuple[int, str, str]],
+    routine_kind: Callable[[str], str | None] | None = None,
+) -> str:
     """An anonymous block with binds, as a PostgreSQL DO block (#1456, #1459).
 
     A DO block takes no parameters and returns nothing, so each bind becomes a
@@ -4100,7 +4104,9 @@ def _bind_block(sql: str, locals_: dict[str, tuple[int, str, str]]) -> str:
         'true);'
         for name, (slot, _t, _i) in locals_.items()
     )
-    return _translate_plsql_block(f'{declare} BEGIN {body.rstrip()}{keep} END;')
+    return _translate_plsql_block(
+        f'{declare} BEGIN {body.rstrip()}{keep} END;', routine_kind
+    )
 
 
 # The PostgreSQL type a block's bind local takes, by the bind's declared type.
@@ -4158,9 +4164,124 @@ def _block_bind_value(pg_type: str, text: str) -> object:
     return text
 
 
-def _translate_plsql_block(sql: str) -> str:
+# The words after which a new PL/SQL statement starts, and those that open a
+# statement which is not a call however it continues (#1533).
+_STATEMENT_OPENERS = frozenset({'BEGIN', 'THEN', 'ELSE', 'LOOP', 'DECLARE'})
+_BLOCK_KEYWORDS = frozenset(
+    {
+        'IF',
+        'ELSIF',
+        'WHILE',
+        'FOR',
+        'CASE',
+        'WHEN',
+        'RETURN',
+        'RAISE',
+        'EXIT',
+        'CONTINUE',
+        'NULL',
+        'GOTO',
+        'COMMIT',
+        'ROLLBACK',
+        'SAVEPOINT',
+        'EXECUTE',
+        'OPEN',
+        'CLOSE',
+        'FETCH',
+        'SELECT',
+        'INSERT',
+        'UPDATE',
+        'DELETE',
+        'MERGE',
+        'WITH',
+        'PERFORM',
+        'CALL',
+        'END',
+        'BEGIN',
+        'DECLARE',
+        'PRAGMA',
+        'LOCK',
+    }
+)
+
+
+def _perform_bare_calls(body: str, routine_kind: Callable[[str], str | None]) -> str:
+    """``body`` with each statement that is a bare call made one PL/pgSQL runs.
+
+    A PL/SQL statement may be just a call, `put_line('x');` or `p;`. PL/pgSQL has
+    no such statement: a function called for its effect is `PERFORM f(...)`, a
+    procedure `CALL p(...)`, and the block failed to compile (#1533).
+    ``routine_kind`` names what PostgreSQL has under a name -- 'f', 'p' or None --
+    and a name it has nothing for is left as it was. Strings, comments and quoted
+    identifiers are skipped whole.
+    """
+    out: list[str] = []
+    at, start = 0, True
+    while at < len(body):
+        char = body[at]
+        if char == "'":
+            end = at + 1
+            while end < len(body):
+                if body[end] == "'":
+                    if body[end + 1 : end + 2] == "'":
+                        end += 2
+                        continue
+                    break
+                end += 1
+            out.append(body[at : end + 1])
+            at, start = end + 1, False
+        elif body.startswith('--', at) or body.startswith('/*', at):
+            end = body.find('\n', at) if char == '-' else body.find('*/', at) + 1
+            end = len(body) - 1 if end < at else end
+            out.append(body[at : end + 1])
+            at = end + 1
+        elif char == '"':
+            end = body.find('"', at + 1)
+            end = len(body) - 1 if end < 0 else end
+            out.append(body[at : end + 1])
+            at, start = end + 1, False
+        elif char.isspace():
+            out.append(char)
+            at += 1
+        elif char == ';':
+            out.append(char)
+            at, start = at + 1, True
+        elif char.isalpha() or char == '_':
+            end = at
+            while end < len(body) and (body[end].isalnum() or body[end] in '_$#.'):
+                end += 1
+            word = body[at:end]
+            upper = word.upper()
+            rest = body[end:].lstrip()
+            if (
+                start
+                and upper not in _BLOCK_KEYWORDS
+                and upper not in _STATEMENT_OPENERS
+                and rest[:1] in ('(', ';')
+            ):
+                kind = routine_kind(word)
+                if kind == 'f':
+                    out.append('PERFORM ')
+                elif kind == 'p':
+                    out.append('CALL ')
+                if kind in ('f', 'p') and rest[:1] == ';':
+                    word += '()'
+            out.append(word)
+            at = end
+            start = upper in _STATEMENT_OPENERS
+        else:
+            out.append(char)
+            at, start = at + 1, False
+    return ''.join(out)
+
+
+def _translate_plsql_block(
+    sql: str, routine_kind: Callable[[str], str | None] | None = None
+) -> str:
     """Wrap an anonymous DECLARE/BEGIN … END block as a PostgreSQL ``DO $$ … $$``
-    block, mapping the declared local types (#533). Non-block SQL is unchanged."""
+    block, mapping the declared local types (#533). Non-block SQL is unchanged.
+    With ``routine_kind``, a statement that is a bare call becomes one PL/pgSQL
+    runs (:func:`_perform_bare_calls`)."""
     hoisted = _hoist_local_functions(sql)
     if hoisted is not None:
         return hoisted
@@ -4169,6 +4290,8 @@ def _translate_plsql_block(sql: str) -> str:
         return sql
     declare_part, body = match.groups()
     declare = _translate_routine_types(declare_part) if declare_part else ''
+    if routine_kind is not None:
+        body = _perform_bare_calls(body, routine_kind)
     return f'DO $$ {declare}BEGIN {body.strip()} END $$'
 
 
@@ -5768,7 +5891,8 @@ class PostgresBackend:
         # generic compat shim.
         sql = _translate_idioms(
             _translate_plsql_block(
-                _translate_routine_ddl(_translate_ddl(_translate_admin(sql)))
+                _translate_routine_ddl(_translate_ddl(_translate_admin(sql))),
+                self._routine_kind,
             )
         )
         sql = _spell_one_element_constructors(sql, self._collection_names())
@@ -7836,7 +7960,9 @@ class PostgresBackend:
             if '$$' in initial:  # it would end the DO block's quoting
                 raise UnsupportedFeature('a bind value holding $$ in a PL/SQL block')
             locals_[name] = (slot, pg_type, initial)
-        self._conn.execute(_translate_idioms(_bind_block(sql, locals_)))
+        self._conn.execute(
+            _translate_idioms(_bind_block(sql, locals_, self._routine_kind))
+        )
         values = [b.value if isinstance(b, BindVar) else b for b in binds]
         for slot, pg_type, _initial in locals_.values():
             row = self._conn.execute(
@@ -8021,6 +8147,20 @@ class PostgresBackend:
             (routine, schema, schema),
         ).fetchone()
         return row is not None
+
+    def _routine_kind(self, name: str) -> str | None:
+        """What PostgreSQL has under a routine name -- 'f' a function, 'p' a
+        procedure -- in the schema the name gives if it gives one; None for
+        nothing (#1533)."""
+        schema, _dot, routine = name.lower().rpartition('.')
+        row = self._conn.execute(
+            'SELECT p.prokind FROM pg_proc p JOIN pg_namespace n '
+            'ON n.oid = p.pronamespace '
+            "WHERE p.proname = %s AND (%s = '' OR n.nspname = %s) "
+            "AND p.prokind IN ('f', 'p') LIMIT 1",
+            (routine, schema, schema),
+        ).fetchone()
+        return row[0] if row else None
 
     def _proc_signature(self, name: str) -> tuple[list | None, list, list[str], str]:
         # A routine's parameter modes ('i' IN, 'o' OUT, 'b' IN OUT), the aligned
