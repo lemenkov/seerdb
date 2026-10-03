@@ -7969,6 +7969,13 @@ The Mirror reads the bind (`_oci_bind_descriptors`, the type id riding on
 values part is the live one byte for byte in both bands. Its scalar OUT binds
 used to carry `0x10` whatever their direction; they now report it too.
 
+A backend hands a collection OUT value back as an object of the bind's type --
+Mirror-over-PG turns orafce's `text[]` into one (`_collection_outs`) -- and the
+Mirror pickles it as sqlplus was seen to get it (`_oci_object_image`): the image
+length in **one byte** when it fits (`88 01 13 …`), and the collection's **kind**
+in the prefix segment (`01 03` for a VARRAY), where the thin path's pickle writes
+`fe` and four bytes, and `01 01`. python-oracledb reads either form.
+
 Decoders: `parse_kod_request`, `decode_kod_reply`, `decode_kod_image`, pinned
 to the captured exchange by `tests/test_kod_decode.py`.
 

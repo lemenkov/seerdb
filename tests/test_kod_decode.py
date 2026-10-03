@@ -282,3 +282,49 @@ def test_a_collection_out_value_goes_back_as_live_servers_send_it() -> None:
         finally:
             _ENCODE_FIELD_VERSION.reset(token)
         assert values_part(got) == values_part(want), hex(version)
+
+
+def test_a_collection_object_goes_back_as_oracle_pickles_it() -> None:
+    # A backend hands a collection OUT value back as an object of its type
+    # (DBMS_OUTPUT.GET_LINES's lines, #1411). Its image goes to an OCI client as
+    # a live server's does: a one-byte length when it fits and the VARRAY kind in
+    # the prefix -- `88 01 13 01 03 ...` -- byte for byte the 11g capture.
+    from seerdb.common.dbobject import COLLECTION_VARRAY, DbObject, DbObjectType
+    from seerdb.common.tns import _ENCODE_FIELD_VERSION, encode_out_bind_response_oci
+    from seerdb.common.tns_consts import FIELD_VERSION_11_2, TNS_TYPE_VARCHAR
+
+    typ = DbObjectType(
+        'SYS',
+        'DBMSOUTPUT_LINESARRAY',
+        _LINESARRAY_ID,
+        1,
+        [],
+        is_collection=True,
+        collection_type=COLLECTION_VARRAY,
+        element={
+            'name': 'element',
+            'type_name': 'VARCHAR2',
+            'data_type': TNS_TYPE_VARCHAR,
+            'charset': None,
+        },
+        max_elements=0x7FFFFFFF,
+    )
+
+    def values_part(reply: bytes) -> bytes:
+        return reply[50 : reply.index(b'\x08\x06', 50)]
+
+    for want, lines, count in (
+        (fx.GET_LINES_REPLY, ['from plsql', None], 1),
+        (fx.GET_LINES_EMPTY_REPLY, [None, None], 0),
+    ):
+        token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
+        try:
+            got = encode_out_bind_response_oci(
+                [DbObject(typ.name, elements=lines, dbtype=typ), count],
+                sequence=1,
+                types=[(109, _LINESARRAY_ID), (2, b'')],
+                inputs=[False, True],
+            )
+        finally:
+            _ENCODE_FIELD_VERSION.reset(token)
+        assert values_part(got) == values_part(want)

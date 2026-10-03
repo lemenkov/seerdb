@@ -9786,8 +9786,37 @@ _OCI_OUTBIND_IN_OUT_MARKER = 0x30
 _OCI_OUTBIND_ADT_IMAGE = b'\x01\x00'
 
 
+def _oci_object_image(obj: 'DbObject') -> bytes:
+    """An object's image as a live server sends it to an OCI client (§40.4).
+
+    The pickle :func:`encode_object_image` writes, with two differences from
+    sqlplus's captures (11g and 18c): the image length is one byte when it fits
+    (``88 01 13 ...``) rather than always ``fe`` and four, and a collection's
+    prefix segment carries its kind -- ``01 03`` for a VARRAY -- where that
+    writes ``01 01``. python-oracledb reads either; these are what sqlplus was
+    seen to get.
+    """
+    image = encode_object_image(obj)
+    body = image[7:] if image[2] == TNS_LONG_LENGTH_INDICATOR else image[3:]
+    typ = obj._dbtype
+    if typ is not None and typ.is_collection and body[:2] == b'\x01\x01':
+        body = bytes([1, typ.collection_type]) + body[2:]
+    if 3 + len(body) <= _OBJ_MAX_SHORT_LEN:
+        return bytes([image[0], image[1], 3 + len(body)]) + body
+    return (
+        bytes([image[0], image[1], TNS_LONG_LENGTH_INDICATOR])
+        + (7 + len(body)).to_bytes(4, 'big')
+        + body
+    )
+
+
 def _oci_out_object_value(value: object, toid: bytes) -> bytes:
-    image = getattr(value, 'image', b'') or b''
+    from seerdb.common.dbobject import DbObject
+
+    if isinstance(value, DbObject):
+        image = _oci_object_image(value)
+    else:
+        image = getattr(value, 'image', b'') or b''
     if len(image) <= TNS_MAX_SHORT_LENGTH:
         framed = bytes([len(image)]) + image
     else:
