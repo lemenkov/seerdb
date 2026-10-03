@@ -63,8 +63,9 @@ edge of this adapter:
 - **XMLType columns** — an ``XMLTYPE`` column is PostgreSQL's ``xml``, described
   as an ADT of ``SYS.XMLTYPE`` and fetched as the document's text; a string or
   ``SYS.XMLTYPE(...)`` inserts into it, and ``GET_TYPE_SHAPE`` answers for
-  ``SYS.XMLTYPE`` as 23ai does. Not yet: an XMLType as an object attribute or a
-  collection element, and its methods (``EXTRACT``, ``GETCLOBVAL``).
+  ``SYS.XMLTYPE`` as 23ai does. An object attribute or a collection element may
+  be an XMLType too: it describes as a reference to ``SYS.XMLTYPE`` and carries
+  the document's text. Not yet: its methods (``EXTRACT``, ``GETCLOBVAL``).
 - **Object types, partly** — ``CREATE TYPE ... AS OBJECT`` is a PostgreSQL
   composite, listed in ``all_types`` / ``all_type_attrs`` under an OID that is the
   composite's own ``pg_type`` oid, zero-padded to Oracle's 16 bytes. An object
@@ -1314,8 +1315,11 @@ _ORACLE_DICTIONARY_DDL = (
     f"WHEN a.attribute_udt_name = '{_BLOB_TYPE}' THEN 'BLOB' "
     "WHEN a.data_type = 'USER-DEFINED' THEN ora_name(a.attribute_udt_name) "
     "WHEN a.data_type = 'timestamp with time zone' THEN 'TIMESTAMP WITH LOCAL TZ' "
+    # An XMLType attribute is SYS.XMLTYPE's (#1537).
+    "WHEN a.data_type = 'xml' THEN 'XMLTYPE' "
     'ELSE ora_type_name(a.data_type) END AS attr_type_name, '
-    "CASE WHEN a.data_type = 'USER-DEFINED' AND a.attribute_udt_name NOT IN "
+    "CASE WHEN a.data_type = 'xml' THEN 'SYS' "
+    "WHEN a.data_type = 'USER-DEFINED' AND a.attribute_udt_name NOT IN "
     f"('{_TSTZ_TYPE}', '{_CLOB_TYPE}', '{_BLOB_TYPE}') "
     'THEN ora_owner(a.attribute_udt_schema) END AS attr_type_owner, '
     'a.character_maximum_length AS length, a.numeric_precision AS precision, '
@@ -1345,9 +1349,12 @@ _ORACLE_DICTIONARY_DDL = (
     "CASE WHEN k.bound IS NULL THEN 'TABLE' ELSE 'VARYING ARRAY' END AS coll_type, "
     'k.bound AS upper_bound, '
     "CASE WHEN e.typtype = 'c' OR (e.typtype = 'd' AND eb.typcategory = 'A') "
-    'THEN ora_owner(en.nspname) END AS elem_type_owner, '
+    'THEN ora_owner(en.nspname) '
+    # An XMLType element is SYS.XMLTYPE's (#1537).
+    "WHEN e.oid = 142 THEN 'SYS' END AS elem_type_owner, "
     "CASE WHEN e.typtype = 'c' OR (e.typtype = 'd' AND eb.typcategory = 'A') "
     'THEN ora_name(e.typname) '
+    "WHEN e.oid = 142 THEN 'XMLTYPE' "
     f"WHEN e.typname = '{_CLOB_TYPE}' THEN 'CLOB' WHEN e.typname = '{_BLOB_TYPE}' THEN 'BLOB' "
     'ELSE ora_type_name(format_type(e.oid, NULL)) END AS elem_type_name, '
     'NULL::text AS elem_type_package, '
@@ -1708,13 +1715,11 @@ _DDL_TYPE_REWRITES = [
     # Anchored to a column definition -- after `(` or `,` -- so a `SELECT ROWID`
     # in CREATE TABLE ... AS SELECT is left to the pseudo-column rewrite.
     (re.compile(r'([(,]\s*\w+)\s+UROWID\b', re.IGNORECASE), r'\1 varchar(4000)'),
-    # An XMLType column is PostgreSQL's xml, which the describe reports back as
-    # SYS.XMLTYPE (#1536). A column definition only, as for ROWID below, so a
-    # `sys.xmltype(...)` call in CREATE TABLE ... AS SELECT is left alone.
-    (
-        re.compile(r'([(,]\s*\w+)\s+(?:SYS\.)?XMLTYPE\b', re.IGNORECASE),
-        r'\1 xml',
-    ),
+    # An XMLType -- a column's, an object attribute's, a collection's element
+    # type -- is PostgreSQL's xml, which the describe reports back as
+    # SYS.XMLTYPE (#1536, #1537). The type name only: one followed by `(` is the
+    # SYS.XMLTYPE(...) constructor, which a CREATE TABLE ... AS SELECT may call.
+    (re.compile(r'\b(?:SYS\.)?XMLTYPE\b(?!\s*\()', re.IGNORECASE), 'xml'),
     (re.compile(r'([(,]\s*\w+)\s+ROWID\b', re.IGNORECASE), r'\1 varchar(18)'),
     (re.compile(r'\bLONG\s+RAW\b', re.IGNORECASE), 'bytea'),
     (re.compile(r'\bRAW\s*\(\s*\d+\s*\)', re.IGNORECASE), 'bytea'),
@@ -2302,6 +2307,22 @@ class _TdsCollection:
 _TDS_NULL_LEAF = _TdsLeaf(b'\x1a')
 
 
+@dataclass(frozen=True)
+class _TdsXml:
+    """An XMLType attribute or element: a reference to SYS.XMLTYPE's opaque
+    descriptor rather than a leaf (#1537)."""
+
+
+_TDS_XMLTYPE = _TdsXml()
+# What an XMLType reference names, measured on a live 23ai: the opaque type's
+# block, `fd`, a ub4 13 and these 13 bytes -- the same one SYS.XMLTYPE's own TDS
+# carries (_XMLTYPE_TDS). The reference ends 3a where an object's ends fa and a
+# collection's fb.
+_XMLTYPE_TDS_BLOCK = (
+    b'\xfd' + (13).to_bytes(4, 'big') + bytes.fromhex('01000000070000000000000009')
+)
+
+
 def _tds_header(
     body: bytes, leaves: list[int], *, collection: bool, version: int
 ) -> bytes:
@@ -2330,6 +2351,8 @@ def _tds_is_newer(shape) -> bool:
 
 def _tds_reference(shape, block_at: int) -> tuple[bytes, bytes]:
     # A reference to a named object or collection, and the fd block it names.
+    if isinstance(shape, _TdsXml):
+        return (b'\x1b' + block_at.to_bytes(4, 'big') + b'\x3a', _XMLTYPE_TDS_BLOCK)
     if isinstance(shape, _TdsCollection):
         return (b'\x1b' + block_at.to_bytes(4, 'big') + b'\xfb', b'\xfd' + _tds(shape))
     image = _tds(shape) + _tds_null(shape)
@@ -2375,8 +2398,10 @@ def _tds(shape) -> bytes:
     body.append(0x2A)
     for slot, attr in pending:
         block_at = 18 + len(body)
-        (_ref, block) = _tds_reference(attr, block_at)
-        body[slot : slot + 4] = block_at.to_bytes(4, 'big')
+        (ref, block) = _tds_reference(attr, block_at)
+        # The whole reference, not just its position: an XMLType's ends 3a where
+        # a collection's ends fb (#1537).
+        body[slot - 1 : slot + 5] = ref
         body.extend(block)
     version = 2 if _tds_is_newer(shape) else 1
     return _tds_header(bytes(body), leaves, collection=False, version=version)
@@ -5332,6 +5357,9 @@ def _pg_oid_of(oid: bytes) -> int | None:
 # (all_types.type_oid) -- which an XMLType column describes with (#1536).
 _XML_OID = 142
 _XMLTYPE_OID = bytes.fromhex('00000000000000000000000000020100')
+# SYS.XMLTYPE as an attribute's or element's type: the image walkers frame a
+# value of it as an XMLType image (#1537).
+_XMLTYPE_DBTYPE = DbObjectType('SYS', 'XMLTYPE', _XMLTYPE_OID, 1, [])
 # What DBMS_PICKLER.GET_TYPE_SHAPE answers for SYS.XMLTYPE, measured on a live
 # 23ai: version 1, this TDS -- an opaque type's -- and no attributes. A client
 # resolves an XMLType column's type through it before reading a value (#1536).
@@ -6789,6 +6817,15 @@ class PostgresBackend:
     def _collection_element(self, pg_oid: int) -> dict:
         # The element layout a collection's image is packed against: an object
         # element carries its own type, as a client's describe embeds it.
+        if pg_oid == _XML_OID:
+            # A collection of XMLType (#1537).
+            return {
+                'name': 'element',
+                'type_name': 'XMLTYPE',
+                'data_type': None,
+                'charset': None,
+                'object_type': _XMLTYPE_DBTYPE,
+            }
         entry = self._object_type(pg_oid)
         if entry is not None:
             typ = entry[0]
@@ -6875,7 +6912,8 @@ class PostgresBackend:
             value = [
                 self._db_collection(nested, v, base[0] if base else 0) for v in value
             ]
-        elif nested is not None:
+        elif nested is not None and nested is not _XMLTYPE_DBTYPE:
+            # (An XMLType element is its document's text, as it comes, #1537.)
             entry = self._object_type(_pg_oid_of(nested.oid) or 0)
             if entry is None:
                 raise UnsupportedFeature(f'collection type {typ.name}: no element type')
@@ -6950,6 +6988,8 @@ class PostgresBackend:
         _TdsCollection of its element, or a scalar's leaf."""
         kind = self._type_kind(pg_oid)
         if kind is None:
+            if pg_oid == _XML_OID:
+                return _TDS_XMLTYPE  # an XMLType attribute or element (#1537)
             return _tds_scalar(self._pg_type_name(pg_oid), typmod)[0]
         if kind[0] == 'object':
             declared = self._declared_attribute_types(pg_oid)
@@ -7024,7 +7064,10 @@ class PostgresBackend:
             self._attributes(pg_oid), 1
         ):
             kind = self._type_kind(atttypid)
-            if kind is None:
+            if atttypid == _XML_OID:
+                # SYS.XMLTYPE, under its own id, as 23ai lists one (#1537).
+                (type_name, owner, toid) = ('XMLTYPE', 'SYS', _XMLTYPE_OID)
+            elif kind is None:
                 type_name = _tds_scalar(self._pg_type_name(atttypid), atttypmod)[1]
                 # An NCLOB is an ora_clob like a CLOB; only its name tells them
                 # apart, and the client types the attribute by it (#1431).
@@ -7170,10 +7213,12 @@ class PostgresBackend:
                 f"WHEN a.attribute_udt_name = '{_BLOB_TYPE}' THEN 'BLOB' "
                 "WHEN a.data_type = 'USER-DEFINED' "
                 'THEN sys.ora_name(a.attribute_udt_name) '
+                "WHEN a.data_type = 'xml' THEN 'XMLTYPE' "
                 "WHEN a.data_type = 'timestamp with time zone' "
                 "THEN 'TIMESTAMP WITH LOCAL TZ' "
                 'ELSE sys.ora_type_name(a.data_type) END, '
-                "CASE WHEN a.data_type = 'USER-DEFINED' "
+                "CASE WHEN a.data_type = 'xml' THEN 'SYS' "
+                "WHEN a.data_type = 'USER-DEFINED' "
                 'AND a.attribute_udt_name NOT IN '
                 f"('{_TSTZ_TYPE}', '{_CLOB_TYPE}', '{_BLOB_TYPE}') "
                 'THEN sys.ora_owner(a.attribute_udt_schema) END, '
@@ -7201,7 +7246,10 @@ class PostgresBackend:
                     if type_name in ('NVARCHAR2', 'NCHAR')
                     else None,
                 }
-                if type_owner is not None:
+                if type_name == 'XMLTYPE':
+                    # An XMLType attribute rides as an XMLType image (#1537).
+                    attr['object_type'] = _XMLTYPE_DBTYPE
+                elif type_owner is not None:
                     # An object or collection attribute carries its own type, as
                     # a client's describe embeds it, for the image walkers (#1265).
                     attr['object_type'] = self._nested_type(
@@ -7250,7 +7298,8 @@ class PostgresBackend:
         # A fetched object or collection attribute as its DbObject (#1265); any
         # other attribute passes through.
         nested = attr.get('object_type')
-        if nested is None or value is None:
+        if nested is None or value is None or nested is _XMLTYPE_DBTYPE:
+            # An XMLType attribute's value is its document's text (#1537).
             return value
         pg_oid = _pg_oid_of(nested.oid) or 0
         if nested.is_collection:
@@ -7356,6 +7405,9 @@ class PostgresBackend:
         # element as its composite, a NUMBER list all one Python type.
         element = typ.element or {}
         nested = element.get('object_type')
+        if nested is _XMLTYPE_DBTYPE:
+            # XMLType elements bind as their documents' text (#1537).
+            return values
         if nested is not None and nested.is_collection:
             # A collection of collections (#1276): psycopg would bind a list of
             # lists as a rectangular multi-dimensional array, which the domain
