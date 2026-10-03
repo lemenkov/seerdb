@@ -116,6 +116,34 @@ class TestOciOerGeneration(unittest.TestCase):
             got[136:], bytes([40]) + b'ORA-00942: table or view does not exist\n'
         )
 
+    def test_a_long_error_message_is_chunked(self):
+        # A message over 252 bytes follows a 0xFE marker in chunks of up to 255
+        # bytes with one-byte lengths, ending in a zero-length chunk, as a live
+        # 11g sends it -- captured with sqlplus 23.26 for RAISE_APPLICATION_ERROR
+        # of a 300-character message, 333 bytes as sent. A one-byte length could
+        # not hold it at all, and the session died while encoding the reply
+        # (#1520). sqlplus reads this form from the Mirror in both bands.
+        from seerdb.common.tns import _ENCODE_FIELD_VERSION
+        from seerdb.common.tns_consts import (
+            FIELD_VERSION_11_2,
+            FIELD_VERSION_18_1_EXT_1,
+        )
+
+        message = 'x' + 'y' * 299 + '\nORA-06512: at line 1'
+        text = f'ORA-20001: {message}\n'.encode()
+        self.assertEqual(len(text), 333)
+        form = b'\xfe\xff' + text[:255] + b'\x4e' + text[255:] + b'\x00'
+        for version in (FIELD_VERSION_11_2, FIELD_VERSION_18_1_EXT_1):
+            token = _ENCODE_FIELD_VERSION.set(version)
+            try:
+                got = encode_error_oci(20001, message, sequence=0x13)
+            finally:
+                _ENCODE_FIELD_VERSION.reset(token)
+            self.assertEqual(got[-len(form) :], form, hex(version))
+        # Up to 252 bytes the one-byte length stays.
+        short = encode_error_oci(942, 'x' * 240, sequence=0x13)
+        self.assertEqual(short[136], 252)
+
     def test_offset_49_is_the_call_sequence_not_the_counter(self):
         # Offset 5 is the server's own counter; offset 49 is the sequence of the
         # call being answered. They are independent — the captures this was first

@@ -7642,6 +7642,22 @@ a constant. The `ub4` call status is the OER's flag word (§36.1) — `5` on the
 commit, `1` on the logoff — and **not** the offset-`1` OER status byte, which
 happens to use the same two values for success and error.
 
+**The error text after an error OER** (#1520). The ORA message follows the OER
+length-prefixed: one byte for up to 252 bytes, else the chunked form. Captured
+with sqlplus 23.26 and a 333-byte `RAISE_APPLICATION_ERROR` message:
+
+```
+11g   fe ff <255 bytes> 4e <78 bytes> 00          255-byte chunks, ub1 lengths
+18c   fe 4d 01 00 00 <333 bytes> 00 00 00 00      one chunk, ub4 LE lengths
+```
+
+The width is **not** the field version: the Mirror speaks 18c's to sqlplus
+(§36 / #1282), and sqlplus hangs on the ub4 form from the Mirror while it reads
+the ub1 one. It follows some capability the real 18c and the Mirror negotiate
+differently, not yet identified. The Mirror sends the 11g form in both bands
+(`_oci_error_text`); it used to write a one-byte length whatever the message,
+and a longer message raised while the reply was built, ending the session.
+
 ### 36.3 DML execute-status
 
 The DML execute-status reply wraps the OER in a larger status frame: a 35-byte
