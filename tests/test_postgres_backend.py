@@ -3556,6 +3556,37 @@ def test_a_call_with_named_binds_passes_them() -> None:
         backend.close()
 
 
+def test_a_call_with_literal_arguments_passes_them() -> None:
+    # sqlplus's `BEGIN DBMS_OUTPUT.ENABLE(NULL); END;`, a script's
+    # `put_line('...')`: a call's literal arguments go in as written. They used
+    # to be dropped, the routine called without them -- and for DBMS_OUTPUT the
+    # failure was swallowed, so the line silently never arrived (#1531).
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER, TNS_TYPE_VARCHAR
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('BEGIN DBMS_OUTPUT.ENABLE(NULL); END;', [])
+        backend.execute("BEGIN DBMS_OUTPUT.PUT_LINE('it''s literal'); END;", [])
+        backend.execute(
+            'BEGIN DBMS_OUTPUT.PUT_LINE(:1); END;',
+            [BindVar(value='bound', tns_type=TNS_TYPE_VARCHAR, max_size=4000)],
+        )
+        lines = [
+            backend.execute(
+                'BEGIN DBMS_OUTPUT.GET_LINE(:1, :2); END;',
+                [
+                    BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=32767),
+                    BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=22),
+                ],
+            ).out_binds
+            for _ in range(3)
+        ]
+        assert lines == [["it's literal", 0], ['bound', 0], [None, 1]]
+    finally:
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships
