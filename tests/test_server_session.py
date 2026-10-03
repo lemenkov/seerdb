@@ -1630,6 +1630,45 @@ def test_oci_loop_refuses_a_call_it_cannot_parse() -> None:
         assert b'ORA-03115' in body
 
 
+# sqlplus 23.26 calling DBMS_OUTPUT.GET_LINES with :LINES bound as the
+# DBMSOUTPUT_LINESARRAY collection (type 109), captured against a live 18c (#1411).
+_OCI_GET_LINES_COLLECTION_BIND = bytes.fromhex(
+    '035e102904040000000000feffffffffffffff9c000000feffffffffffffff0d'
+    '000000fefffffffffffffffeffffffffffffff000000000100000000000000fe'
+    'ffffffffffffff020000000000000000000000feffffffffffffff0000000000'
+    '000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '00000000000000000000000000000034424547494e2044424d535f4f55545055'
+    '542e4745545f4c494e4553283a4c494e45532c203a4e554d4c494e4553293b20'
+    '454e443b01000000010000000000000000000000000000000000000000000000'
+    '080000000000000000800000000000000000000000000000006d000000d00700'
+    '000000000000000000000000001000000010787d0d2b19c46933e0530caae80a'
+    '12fb010000000000000000000000000102030000160000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '07240000002400220208787d0d2b19c46933e0530caae80a12fb000000000000'
+    '00000000000000010001000000000000000000000000010002c110'
+)
+
+
+def test_a_statement_whose_binds_are_not_read_is_refused() -> None:
+    # The bind section of a collection bind does not parse here yet. The
+    # statement used to come back with no binds and run without them, so the
+    # client got a status it could not use; it is refused instead, and the
+    # session carries on (#1525).
+    from seerdb.common.exceptions import InterfaceError
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, parse_exec_oci
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1
+
+    token = _DECODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT_1)
+    try:
+        with pytest.raises(InterfaceError, match='bind'):
+            parse_exec_oci(_OCI_GET_LINES_COLLECTION_BIND)
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+
+
 def test_oci_loop_answers_a_break_marker() -> None:
     """A break / reset marker gets a marker back, not silence.
 
