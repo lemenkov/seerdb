@@ -656,6 +656,13 @@ _ORAFCE_HELPERS_DDL = (
         for fn in ('trunc', 'round')
         for arg, use in (('', ''), (', text', ', $2'))
     )
+    # SYS.DUAL (#1516): the qualified name sqlplus uses for PRINT and its login
+    # query. orafce's DUAL is oracle.dual, which a bare `dual` finds on the
+    # search path; `sys` is the dictionary's own schema and had none. Created
+    # only when missing: replacing a view on every connect takes a lock that a
+    # reader in an open transaction holds up (#1152).
+    + "DO $$ BEGIN IF to_regclass('sys.dual') IS NULL THEN "
+    'CREATE VIEW sys.dual AS SELECT * FROM oracle.dual; END IF; END $$;'
 )
 
 
@@ -799,6 +806,13 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN 'client_info' THEN "
     "nullif(current_setting('seerdb.client_info', true), '') "
     'ELSE NULL END $$;'
+    # XS_SYS_CONTEXT(namespace, attribute): the Real Application Security
+    # context, which sqlplus reads in its login query, `DECODE(USER, 'XS$NULL',
+    # XS_SYS_CONTEXT('XS$SESSION', 'USERNAME'), USER) FROM SYS.DUAL`. A session
+    # with no RAS session attached reads NULL from it on Oracle; without the
+    # function the query fails as soon as SYS.DUAL resolves (#1516).
+    'CREATE OR REPLACE FUNCTION sys.xs_sys_context(text, text) RETURNS text '
+    'LANGUAGE sql STABLE AS $$ SELECT NULL::text $$;'
     # DBMS_LOB.GETLENGTH(lob): the one DBMS_LOB entry point the suite calls from
     # ordinary SQL rather than from inside a PL/SQL block (#1127). A CLOB is
     # `text` here and a BLOB is `bytea`, so the length is `length` or
