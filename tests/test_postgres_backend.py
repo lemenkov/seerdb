@@ -4093,6 +4093,33 @@ def test_a_timestamp_attributes_scale_is_its_precision() -> None:
         backend.close()
 
 
+def test_a_tstz_attributes_type_shape_takes_its_precision() -> None:
+    # A TIMESTAMP(n) WITH TIME ZONE attribute is the ora_tstz composite, whose
+    # leaf said precision 6 whatever n was (#1552). It takes the recorded one
+    # (#1550): 23ai's TDS byte for byte, `17 02` then `17 06`.
+    from postgres_backend import _tds
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE TYPE tz1552 AS OBJECT (n NUMBER, '
+            'tz TIMESTAMP(2) WITH TIME ZONE, tzd TIMESTAMP WITH TIME ZONE)'
+        )
+        backend.commit()
+        pg_oid = backend._conn.execute("SELECT 'tz1552'::regtype::oid").fetchone()[0]
+        assert _tds(backend._type_shape(pg_oid)).hex() == (
+            '0000001c260200010003002900000000000d060081170217062a0007000a000c'
+        )
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TYPE tz1552')
+            backend.commit()
+        except Exception:
+            backend.rollback()
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships

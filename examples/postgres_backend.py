@@ -7182,9 +7182,17 @@ class PostgresBackend:
             return _tds_scalar(self._pg_type_name(pg_oid), typmod)[0]
         if kind[0] == 'object':
             declared = self._declared_attribute_types(pg_oid)
+            # A WITH TIME ZONE attribute is the ora_tstz composite, which keeps
+            # no precision; its leaf takes the recorded one (#1308, #1552).
+            zoned = self._attribute_tstz_precisions(pg_oid)
             return _TdsObject(
                 tuple(
-                    _declared_leaf(declared.get(n), m) or self._type_shape(t, m)
+                    _declared_leaf(declared.get(n), m)
+                    or (
+                        _tds_timestamp(0x17, zoned[n])
+                        if n in zoned
+                        else self._type_shape(t, m)
+                    )
                     for (n, t, m) in self._attributes(pg_oid)
                 )
             )
@@ -7199,6 +7207,23 @@ class PostgresBackend:
             bound=bound[0] if bound and bound[0] is not None else 0,
             element=_national_leaf(self._national_element(pg_oid), element_typmod)
             or self._type_shape(element, element_typmod),
+        )
+
+    def _attribute_tstz_precisions(self, pg_oid: int) -> dict[str, int]:
+        # The precision recorded for each TIMESTAMP(n) WITH TIME ZONE attribute
+        # of a composite -- an object type's or a table's %ROWTYPE -- by name
+        # (#1552); one not listed has Oracle's default, 6.
+        if not self._has_tstz_precision:
+            return {}
+        return dict(
+            self._conn.execute(
+                'SELECT a.attname, p.prec FROM pg_type t '
+                'JOIN pg_attribute a ON a.attrelid = t.typrelid '
+                'JOIN sys.ora_tstz_precision p '
+                'ON p.relid = a.attrelid AND p.attnum = a.attnum '
+                'WHERE t.oid = %s',
+                (pg_oid,),
+            ).fetchall()
         )
 
     def _declared_attribute_types(
