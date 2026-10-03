@@ -80,3 +80,65 @@ def test_the_linesarray_tds_is_what_the_pg_backend_builds() -> None:
         )
     )
     assert decode_kod_image(record.image)[5] == want
+
+
+def test_the_mirror_answers_kottd_as_11g_does() -> None:
+    # A client handed a type descriptor asks SYS.KOTTD by REF how to read one.
+    # The Mirror's answer is the live 11g reply byte for byte, given the same
+    # reply and call sequences (#1411).
+    from seerdb.common.tns import (
+        _ENCODE_OCI_CALL_SEQ,
+        KOD_KOTTD,
+        encode_kod_reply,
+        kod_system_record,
+    )
+
+    record = kod_system_record(KOD_KOTTD)
+    assert record is not None
+    token = _ENCODE_OCI_CALL_SEQ.set(0x0E)
+    try:
+        assert encode_kod_reply([record], sequence=0x0B) == fx.KOTTD_REPLY
+    finally:
+        _ENCODE_OCI_CALL_SEQ.reset(token)
+    assert kod_system_record(_LINESARRAY_ID) is None
+
+
+def test_an_image_encodes_back_to_its_bytes() -> None:
+    from seerdb.common.tns import encode_kod_image
+
+    for reply in (fx.BY_NAME_REPLY, fx.KOTTD_REPLY):
+        for record in decode_kod_reply(reply).records:
+            assert encode_kod_image(decode_kod_image(record.image)) == record.image
+
+
+def test_the_oci_loop_serves_kottd_and_still_refuses_the_rest() -> None:
+    # The by-name describe is not served yet (it needs the backend's type), so
+    # it is refused as before and the session carries on; the KOTTD one is
+    # answered with its record.
+    from typing import Any
+
+    from seerdb.common.tns_consts import TNS_DATA
+    from seerdb.server.session import _serve_oci_session
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.inbox = [
+                (TNS_DATA, fx.BY_NAME_REQUEST),
+                (TNS_DATA, fx.KOTTD_REQUEST),
+                None,
+            ]
+            self.sent: list[bytes] = []
+
+        def read_packet(self, **_kw):
+            return self.inbox.pop(0)
+
+        def write_packet(self, ptype: int, body: bytes, **_kw) -> None:
+            self.sent.append(body)
+
+    stream: Any = _Stream()
+    backend: Any = object()
+    assert _serve_oci_session(stream, backend, 'PYO') == 'PYO'
+    (refused, kottd) = stream.sent
+    assert b'ORA-03115' in refused
+    (record,) = decode_kod_reply(kottd).records
+    assert decode_kod_image(record.image)[2] == b'KOTTD'

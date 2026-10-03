@@ -4004,6 +4004,129 @@ def decode_kod_image(image: bytes) -> list[bytes | None]:
     return values
 
 
+# The ids of the system types whose instances describe a type (§40.3). They are
+# the same in every database.
+KOD_KOTTD = bytes(15) + b'\x01'
+# A REF as KOD carries it (§40.2): `24 00`, a flags triple, the 16-byte id, then
+# 15 bytes that were `00 x 13 01 00` in every capture. The metatypes' own records
+# carry 0x12 in the flags, everything else 0x02.
+_KOD_REF_FLAGS_SYSTEM = b'\x22\x12\x08'
+_KOD_REF_FLAGS_USER = b'\x22\x02\x08'
+_KOD_REF_TAIL = bytes(13) + b'\x01\x00'
+# A record's 24-byte descriptor: `18 00`, three bytes that differed per session
+# and stayed fixed within one -- fb b9 81, then fc 09 86, fc 09 87 ... across
+# later captures, climbing like a counter -- then zeros. This is the value the
+# sqlplus capture carried.
+_KOD_RECORD_DESC = b'\x18\x00\xfb\xb9\x81' + bytes(19)
+_KOD_IMAGE_FLAGS = 0x85  # a pickled object (§21.3)
+_KOD_IMAGE_VERSION = 0x01
+
+
+def _kod_ref(oid: bytes, *, system: bool) -> bytes:
+    flags = _KOD_REF_FLAGS_SYSTEM if system else _KOD_REF_FLAGS_USER
+    return b'\x24\x00' + flags + oid + _KOD_REF_TAIL
+
+
+def _kod_item_bytes(data: bytes) -> bytes:
+    return len(data).to_bytes(4, 'little') + data
+
+
+def encode_kod_image(values: list[bytes | None]) -> bytes:
+    """A type-descriptor image from its attribute values; :func:`decode_kod_image`
+    reversed. Each value is a ub1 length, or ``fe`` + ub4 BE beyond 245 bytes,
+    or ``ff`` for NULL; the length after ``85 01`` counts the whole image."""
+    body = bytearray()
+    for value in values:
+        if value is None:
+            body.append(TNS_NULL_LENGTH_INDICATOR)
+        elif len(value) <= _OBJ_MAX_SHORT_LEN:
+            body += bytes([len(value)]) + value
+        else:
+            body += bytes([TNS_LONG_LENGTH_INDICATOR]) + len(value).to_bytes(4, 'big')
+            body += value
+    total = 2 + 5 + len(body)
+    return (
+        bytes([_KOD_IMAGE_FLAGS, _KOD_IMAGE_VERSION, TNS_LONG_LENGTH_INDICATOR])
+        + total.to_bytes(4, 'big')
+        + bytes(body)
+    )
+
+
+def _kod_record(record: KodRecord) -> bytes:
+    image = record.image
+    framed = bytearray()
+    if len(image) <= TNS_MAX_SHORT_LENGTH:
+        framed += bytes([len(image)]) + image
+    else:
+        framed.append(TNS_LONG_LENGTH_INDICATOR)
+        for at in range(0, len(image), 0xFF):
+            chunk = image[at : at + 0xFF]
+            framed += bytes([len(chunk)]) + chunk
+        framed.append(0)
+    return (
+        _KOD_RECORD
+        + _kod_item_bytes(_kod_ref(record.type_id, system=True))
+        + b'\x01'
+        + _kod_item_bytes(_kod_ref(record.oid, system=record.oid in _KOD_SYSTEM_VALUES))
+        + record.type_id[-1:]
+        + _kod_item_bytes(_KOD_RECORD_DESC)
+        + b'\x00\x01\x00'
+        + len(image).to_bytes(4, 'little')
+        + b'\x09\x00'
+        + bytes(framed)
+    )
+
+
+def encode_kod_reply(records: list[KodRecord], *, sequence: int) -> bytes:
+    """A by-REF ``TTI_KOD`` reply: the records, then the success OER (§40.2)."""
+    return b''.join(_kod_record(r) for r in records) + encode_oci_oer(
+        oci.OCI_OER_STATUS_SUCCESS,
+        sequence=sequence,
+        row_kind=oci.OCI_OER_ROW_KIND_LOB,
+        command_type=0,
+        category=0,
+    )
+
+
+# SYS.KOTTD's description of itself, the answer to every client that has just
+# been handed a type descriptor and asks how to read one (§40.3). Its values, in
+# its own attribute order: a flags word, schema, name, version, the typecode
+# (108, an object), its TDS, the null-image TDS, two unnamed ub2s and the REF of
+# its attribute part. The TDS is ten leaves -- `0e`, three `07 00 1e 01 00 00`
+# (VARCHAR(30)), `0d`, `11`, `11`, `0d`, `0d`, `09` -- one per attribute here.
+# Captured from a live 11g; the same in every database.
+_KOTTD_VALUES: list[bytes | None] = [
+    bytes.fromhex('ae9a0001'),
+    b'SYS',
+    b'KOTTD',
+    b'$8.0',
+    (108).to_bytes(2, 'big'),
+    bytes.fromhex(
+        '0000003c26010001000a002900000000001f0e07001e01000007001e01000007001e01'
+        '00000d11110d0d092a00070008000e0014001a001b001c001d001e001f'
+    ),
+    bytes.fromhex(
+        '0000003026010001000b00290000000000111a1a1a1a1a1a1a1a1a1a1a2a0007000800'
+        '09000a000b000c000d000e000f00100011'
+    ),
+    (0x16).to_bytes(2, 'big'),
+    (1).to_bytes(2, 'big'),
+    bytes.fromhex(
+        '00220208ab9eebb9d66392fce040e50a194e468000000000000000000000000000010002'
+    ),
+]
+_KOD_SYSTEM_VALUES: dict[bytes, list[bytes | None]] = {KOD_KOTTD: _KOTTD_VALUES}
+
+
+def kod_system_record(oid: bytes) -> KodRecord | None:
+    """The record describing a system type, or None if it is not one the Mirror
+    knows. Every type descriptor is an instance of SYS.KOTTD (§40.3)."""
+    values = _KOD_SYSTEM_VALUES.get(oid)
+    if values is None:
+        return None
+    return KodRecord(KOD_KOTTD, oid, encode_kod_image(values))
+
+
 def strip_oci_piggyback(body: bytes) -> bytes:
     """Return the real TTI_FUN call inside an OCI piggyback, or ``body`` unchanged.
 
