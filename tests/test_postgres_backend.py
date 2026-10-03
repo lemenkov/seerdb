@@ -3837,6 +3837,69 @@ def test_a_table_of_xmltype_names_sys_xmltype_its_element() -> None:
         backend.close()
 
 
+def test_a_collection_of_a_national_type_stays_national() -> None:
+    # A collection of NVARCHAR2 / NCHAR was reported as one of VARCHAR2 / CHAR:
+    # its domain has no relation for sys.ora_columns to record the element by
+    # (#1437). The dictionary, the TDS and the element's character set now say
+    # what 23ai does; the TDS is 23ai's byte for byte.
+    from postgres_backend import _tds
+
+    from seerdb.common.tns import AL16UTF16_CHARSET
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    types = {
+        'na1437': 'TABLE OF NVARCHAR2(10)',
+        'nb1437': 'VARRAY(5) OF NCHAR(3)',
+        'nc1437': 'TABLE OF VARCHAR2(10)',
+    }
+    try:
+        for name, definition in types.items():
+            backend.execute(f'CREATE TYPE {name} AS {definition}')
+        backend.commit()
+        result = backend.execute(
+            'SELECT type_name, elem_type_name, length, character_set_name '
+            "FROM user_coll_types WHERE type_name LIKE 'N_1437' ORDER BY 1"
+        )
+        assert result.rows == [
+            ('NA1437', 'NVARCHAR2', 10, 'NCHAR_CS'),
+            ('NB1437', 'NCHAR', 3, 'NCHAR_CS'),
+            ('NC1437', 'VARCHAR2', 10, 'CHAR_CS'),
+        ]
+        expected = {
+            'na1437': '00000021260100010001ff290000000000161c0000001d00000000022a'
+            '0700148200000007',
+            'nb1437': '00000021260100010001ff290000000000161c0000001d00000005032a'
+            '0100068200000007',
+            'nc1437': '00000021260100010001ff290000000000161c0000001d00000000022a'
+            '07000a0100000007',
+        }
+        for name, tds in expected.items():
+            pg_oid = backend._conn.execute(f"SELECT '{name}'::regtype::oid").fetchone()[
+                0
+            ]
+            assert _tds(backend._type_shape(pg_oid)).hex() == tds, name
+            element = backend._collection_type(pg_oid).element
+            national = name != 'nc1437'
+            assert (element['charset'] == AL16UTF16_CHARSET) is national, name
+        # A type that is gone takes its record with it.
+        backend.execute('DROP TYPE na1437')
+        backend.commit()
+        left = backend._conn.execute(
+            'SELECT count(*) FROM sys.ora_collection_elements x '
+            'WHERE NOT EXISTS (SELECT 1 FROM pg_type t WHERE t.oid = x.typid)'
+        ).fetchone()[0]
+        assert left == 0
+    finally:
+        backend.rollback()
+        for name in types:
+            try:
+                backend.execute(f'DROP TYPE {name}')
+                backend.commit()
+            except Exception:
+                backend.rollback()
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships
