@@ -9038,6 +9038,33 @@ def encode_long_fetch_row_oci(
     return bytes(out) + status
 
 
+def _oci_error_text(text: bytes) -> bytes:
+    """An OCI error OER's message, length-prefixed.
+
+    A message up to 252 bytes takes a one-byte length. A longer one follows a
+    0xFE marker in chunks of up to 255 bytes, each with a one-byte length, and
+    ends with a zero-length chunk -- as a live 11g sends it (sqlplus 23.26, a
+    333-byte RAISE_APPLICATION_ERROR message: ``fe ff <255 bytes> 4e <78 bytes>
+    00``). A one-byte length could not hold a longer message at all: encoding it
+    raised, and the session died (#1520).
+
+    A live 18c sent the same message as one chunk with ub4 LE lengths instead
+    (``fe 4d 01 00 00 <333 bytes> 00 00 00 00``). That is not the field version:
+    the Mirror speaks 18c's to sqlplus, and sqlplus hangs on that form from the
+    Mirror while it reads this one. It follows a capability the two negotiate
+    differently, not yet identified, so the Mirror sends the form its own
+    sessions read.
+    """
+    if len(text) <= TNS_MAX_SHORT_LENGTH:
+        return bytes([len(text)]) + text
+    out = bytearray([TNS_LONG_LENGTH_INDICATOR])
+    for at in range(0, len(text), 0xFF):
+        chunk = text[at : at + 0xFF]
+        out += bytes([len(chunk)]) + chunk
+    out.append(0)
+    return bytes(out)
+
+
 def encode_error_oci(
     ora_code: int, message: str, *, sequence: int, error_pos: int | None = None
 ) -> bytes:
@@ -9062,7 +9089,7 @@ def encode_error_oci(
         error_code=ora_code,
     )
     text = f'ORA-{ora_code:05d}: {message}\n'.encode('utf-8')
-    return oer + bytes([len(text)]) + text
+    return oer + _oci_error_text(text)
 
 
 def encode_login_refusal_oci(
@@ -9093,7 +9120,7 @@ def encode_login_refusal_oci(
         _ENCODE_OCI_CALL_SEQ.reset(token)
     oer[_OCI_OER_LOGIN_REFUSAL_ZERO] = 0
     text = f'{message}\n'.encode('utf-8')
-    return bytes(oer) + bytes([len(text)]) + text
+    return bytes(oer) + _oci_error_text(text)
 
 
 # The one envelope byte a login refusal leaves zero that the statement OERs
