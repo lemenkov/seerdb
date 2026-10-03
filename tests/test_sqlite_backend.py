@@ -533,7 +533,9 @@ def test_an_in_band_cancel_answers_the_next_call(encryption: str) -> None:
         assert (conn._ano is not None and conn._ano.active) == (
             encryption == 'required'
         )
-        conn._supports_oob = False  # force the in-band interrupt
+        # The Mirror does not offer out-of-band breaks, so the client interrupts
+        # in-band of its own accord; an urgent byte was never read (#1349).
+        assert conn._supports_oob is False
         conn.cancel()
         cur = conn.cursor()
         with pytest.raises(seerdb.DatabaseError) as excinfo:
