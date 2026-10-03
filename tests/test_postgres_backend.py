@@ -191,6 +191,73 @@ def test_iot_rowid_renders_a_star_prefixed_logical_rowid() -> None:
     )
 
 
+def test_a_bare_call_statement_is_made_one_plpgsql_runs() -> None:
+    # PL/pgSQL has no bare call statement: a function called for its effect is
+    # PERFORM f(...), a procedure CALL p(...) (#1533). Only statements that are a
+    # call to something PostgreSQL has; strings, comments, assignments and
+    # PL/SQL's own statements are left alone.
+    from postgres_backend import _perform_bare_calls
+
+    kinds = {'dbms_output.put_line': 'f', 'p': 'p', 'dbms_output.enable': 'f'}
+
+    def kind(name: str) -> str | None:
+        return kinds.get(name.lower())
+
+    cases = (
+        (
+            " dbms_output.put_line('a; b(1);'); dbms_output.put_line('two'); ",
+            " PERFORM dbms_output.put_line('a; b(1);'); "
+            "PERFORM dbms_output.put_line('two'); ",
+        ),
+        (
+            ' x := f(1); -- p(2);\n p(3); unknown(4); ',
+            ' x := f(1); -- p(2);\n CALL p(3); unknown(4); ',
+        ),
+        (
+            " IF x > 1 THEN dbms_output.put_line('y'); ELSE p; END IF; ",
+            " IF x > 1 THEN PERFORM dbms_output.put_line('y'); ELSE CALL p(); END IF; ",
+        ),
+        (
+            ' FOR i IN 1..3 LOOP dbms_output.put_line(i); END LOOP; NULL; ',
+            ' FOR i IN 1..3 LOOP PERFORM dbms_output.put_line(i); END LOOP; NULL; ',
+        ),
+        (
+            ' DBMS_OUTPUT.ENABLE; /* p(9); */ RAISE no_data_found; ',
+            ' PERFORM DBMS_OUTPUT.ENABLE(); /* p(9); */ RAISE no_data_found; ',
+        ),
+    )
+    for body, want in cases:
+        assert _perform_bare_calls(body, kind) == want
+
+
+def test_a_block_calling_put_line_twice_runs() -> None:
+    # sqlplus `set serveroutput on`, a block of two PUT_LINEs: it failed to
+    # compile as a DO block, a bare function call not being a PL/pgSQL statement
+    # (#1533). Both lines arrive.
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER, TNS_TYPE_VARCHAR
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('BEGIN DBMS_OUTPUT.ENABLE(NULL); END;', [])
+        backend.execute(
+            "BEGIN DBMS_OUTPUT.PUT_LINE('one'); DBMS_OUTPUT.PUT_LINE('two'); END;", []
+        )
+        lines = [
+            backend.execute(
+                'BEGIN DBMS_OUTPUT.GET_LINE(:1, :2); END;',
+                [
+                    BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=32767),
+                    BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=22),
+                ],
+            ).out_binds
+            for _ in range(3)
+        ]
+        assert lines == [['one', 0], ['two', 0], [None, 1]]
+    finally:
+        backend.close()
+
+
 def test_translate_ddl_maps_create_table_column_types() -> None:
     sent = _translate_ddl(
         'CREATE TABLE t (id NUMBER(10,2), v VARCHAR2(20), d DATE, '
