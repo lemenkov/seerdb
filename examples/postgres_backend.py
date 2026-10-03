@@ -75,8 +75,9 @@ edge of this adapter:
   collections. Not yet: type methods. A VARRAY or nested table is a domain over
   an array, listed in ``all_types`` and ``all_coll_types``. A column of one
   fetches as the collection; PostgreSQL describes a domain value by its base
-  type, so a computed one, such as a constructor call in a select list, has no
-  type to trace and is refused. A collection of collections is a domain over an
+  type, so a computed one has no type to trace and fetches as a plain array --
+  except a constructor call or a bound collection as a select item, which names
+  its type. A collection of collections is a domain over an
   array of the inner domain, bound as an array literal. The block
   python-oracledb runs to learn a type,
   ``DBMS_PICKLER.GET_TYPE_SHAPE``, is answered from the catalog with the TDS and
@@ -1600,6 +1601,17 @@ def _copy_quoted_region(sql: str, start: int, out: list[str]) -> int:
     return i  # unterminated region: copied to end of string
 
 
+@dataclass(frozen=True)
+class _CollectionBind:
+    """A VARRAY / nested-table bind: the array its domain is over, and the
+    domain, which the placeholder is cast to. PostgreSQL types a bare
+    placeholder from its value, so `SELECT :o FROM dual` described a plain
+    array; cast, the select item names its collection type (#1541)."""
+
+    value: object
+    domain: str
+
+
 def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
     """Rewrite Oracle bind references to psycopg named placeholders and build the
     parameter dict (#516). Oracle binds by name, so a bind repeated in the text
@@ -1652,6 +1664,8 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
                 # round trip rather than being normalised to UTC (#519).
                 out.append(f'ROW(%({key})s, %({key}__off)s)::{_TSTZ_TYPE}')
                 tstz_keys.add(key)
+            elif isinstance(value, _CollectionBind):
+                out.append(f'%({key})s::' + value.domain.replace('%', '%%'))
             elif isinstance(value, IntervalYM):
                 # An IntervalYM binds an INTERVAL YEAR TO MONTH — send its whole-month
                 # count and rebuild a PostgreSQL interval, so the months survive
@@ -1670,7 +1684,9 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
             continue
         key = _bind_key(name)
         value = values[idx]
-        params[key] = value.value if isinstance(value, BindVar) else value
+        params[key] = (
+            value.value if isinstance(value, (BindVar, _CollectionBind)) else value
+        )
         if key in ltz_keys:
             params[key] = datetime.datetime.combine(
                 value.date(), value.time(), _DB_TIME_ZONE
@@ -3562,6 +3578,8 @@ _ITEM_ALIAS = re.compile(r'(?:AS\s+)?(?:"[^"]*"|[A-Za-z_][\w$#]*)?', re.IGNORECA
 _CONSTRUCTOR_CALL_ITEM = re.compile(
     r'([A-Za-z_][\w$#]*(?:\s*\.\s*[A-Za-z_][\w$#]*)?)\s*\('
 )
+# A collection bind as _translate_binds casts it to its domain (#1541).
+_CAST_BIND_ITEM = re.compile(r'%\(\w+\)s::([\w."$#]+)')
 
 
 # CAST(<expr> AS NVARCHAR2(n) | NCHAR[(n)]): the national target the translation
@@ -3664,6 +3682,11 @@ def _constructor_items(sql: str) -> dict[int, str]:
         return {}  # the positions are the expanded columns', not the items'
     found = {}
     for index, item in enumerate(items):
+        cast = _CAST_BIND_ITEM.match(item)
+        if cast is not None and _ITEM_ALIAS.fullmatch(item[cast.end() :].strip()):
+            # A collection bind, cast to its domain, which names the type (#1541).
+            found[index] = cast.group(1)
+            continue
         call = _CONSTRUCTOR_CALL_ITEM.match(item)
         if call is None:
             continue
@@ -7442,7 +7465,11 @@ class PostgresBackend:
         pg_oid = _pg_oid_of(oid)
         coll = self._collection_type(pg_oid) if pg_oid is not None else None
         if coll is not None:
-            return self._collection_bind_value(coll, image)
+            array = self._collection_bind_value(coll, image)
+            row = self._conn.execute(
+                'SELECT %s::oid::regtype::text', (pg_oid,)
+            ).fetchone()
+            return _CollectionBind(array, row[0]) if row else array
         entry = self._object_type(pg_oid) if pg_oid is not None else None
         if entry is None:
             raise UnsupportedFeature(
