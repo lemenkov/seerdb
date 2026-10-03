@@ -234,6 +234,25 @@ class SessionInfo:
     service_name: str | None = None
 
 
+@dataclass(frozen=True)
+class TypeDescription:
+    """An object or collection type, as an OCI client's type describe needs it
+    (PROTOCOL.md §40, #1411).
+
+    ``oid`` is the type's 16-byte id, the one its objects and binds carry.
+    ``kind`` is ``'object'``, ``'varray'`` or ``'nested_table'``. ``tds`` and
+    ``null_tds`` are its type descriptor and null-image descriptor, each with its
+    ub4 length in front -- the pair ``DBMS_PICKLER.GET_TYPE_SHAPE`` returns.
+    """
+
+    schema: str
+    name: str
+    oid: bytes
+    kind: str
+    tds: bytes
+    null_tds: bytes
+
+
 class BackendError(Exception):
     """A backend failure surfaced to the client as an ORA error.
 
@@ -372,6 +391,13 @@ class Backend(Protocol):
         answers a bare success status, so every parse-time error is lost: a
         client asking whether a statement is valid is told yes whatever it sent.
         A backend that cannot parse Oracle SQL at all is right to omit it.
+
+    ``describe_type(name) -> TypeDescription | None``
+        The object or collection type ``name`` names, as the connected user
+        would resolve it, or None if there is none. An OCI client (sqlplus)
+        describes a type this way before it binds one -- sqlplus does it for
+        ``DBMS_OUTPUT.GET_LINES`` under ``set serveroutput on`` (#1411). Without
+        it the describe is refused with an ORA error.
 
     ``field_version`` (int) / ``tns_version`` (int)
         The Oracle protocol version this backend presents. A backend that
