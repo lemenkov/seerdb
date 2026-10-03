@@ -48,7 +48,7 @@ from seerdb.common.tns_consts import (
 # on fv2, not fixable fv2 bind gaps (those are #172 dates, #173 intervals,
 # #174 national charset).
 _FV2_UNSUPPORTED = (
-    ('missing_directory', 'pre-10g reads a BFILE at fetch time (#1103)'),
+    ('methods_on_a_missing_directory', 'fileexists() has no pre-10g LOBOPS form'),
     ('mixed_batch', 'executemany (array DML) is a 10g+ path'),
     ('binary_double', 'BINARY_DOUBLE is a 10g+ type; Oracle 9i lacks it'),
     ('binary_float', 'BINARY_FLOAT is a 10g+ type; Oracle 9i lacks it'),
@@ -12325,9 +12325,14 @@ class O8iDmlIntegration(_ThrottleRetry, unittest.TestCase):
             "select dbms_lob.getlength(bfilename('ZZ_SEERDB_BD', :f)) from dual",
             {'f': Alert},
         ).fetchone()
-        (Got,) = self.cur.execute(
+        (Lob,) = self.cur.execute(
             "select bfilename('ZZ_SEERDB_BD', :f) from dual", {'f': Alert}
         ).fetchone()
+        # The fetch hands back the locator; the file is read when asked (#1103).
+        from seerdb.common.lob import LOB
+
+        self.assertIsInstance(Lob, LOB)
+        Got = Lob.read()
         self.assertIsInstance(Got, bytes)
         self.assertEqual(len(Got), FileLen)
         self.assertTrue(Got.startswith(b'Dump file'))
@@ -12437,7 +12442,10 @@ class AsyncO8iIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
                     await cur.execute(
                         "select bfilename('ZZ_SEERDB_BD', :f) from dual", {'f': Cand}
                     )
-                    (Got,) = await cur.fetchone()
+                    # The fetch hands back the locator; aread() reads the file
+                    # (#1103).
+                    (Lob,) = await cur.fetchone()
+                    Got = await Lob.aread()
                     self.assertIsInstance(Got, bytes)
                     self.assertTrue(Got.startswith(b'Dump file'))
                     break

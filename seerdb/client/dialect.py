@@ -70,7 +70,7 @@ from seerdb.common.tns import (
     encode_tokens_rxd,
     o8i_stmt_type,
 )
-from seerdb.common.tns_consts import ORA_NO_DATA_FOUND, TTI_LOB, TTI_OER
+from seerdb.common.tns_consts import ORA_NO_DATA_FOUND, TNS_TYPE_BFILE, TTI_LOB, TTI_OER
 
 # Oracle 8i LONG / LONG RAW type codes — a LONG changes the fetch shape (one row
 # per round trip, read the whole value) (#377).
@@ -122,6 +122,7 @@ class Dialect(Protocol):
     def execute_dml(self, sql: str, bind: list | None): ...
     def execute_block(self, sql: str, bind: list | None): ...
     def txn_control(self, statement: str): ...  # only when CAP_OWN_TXN is set
+    def bfile_read(self, locator: bytes): ...
 
 
 # Capability tokens a dialect advertises via capabilities() — one honest place for
@@ -279,17 +280,15 @@ class Fv2Dialect:
     def resolve_lobs(self, rows: list, columns: list):
         # Replace LOB objects left by decode_fv2_exec_response with their content,
         # in place, by round-tripping each locator (#102). Done while the 9i cursor
-        # is still open.
+        # is still open. A BFILE stays a locator, read when its read() is called:
+        # reading it opens the file, so a missing one failed the fetch (#1103).
         from seerdb.common.lob import LOB
         from seerdb.common.types import decode_fv2_lob
 
         for row in rows:
             for i, val in enumerate(row):
-                if isinstance(val, LOB):
-                    if val.data_type == 114:  # BFILE: open / read / close
-                        content = yield from self.bfile_read(val.raw)
-                    else:  # CLOB / BLOB: GETLEN + READ
-                        content = yield from self.lob_read(val.raw)
+                if isinstance(val, LOB) and val.data_type != TNS_TYPE_BFILE:
+                    content = yield from self.lob_read(val.raw)
                     row[i] = decode_fv2_lob(
                         columns[i].get('data_type'),
                         content,
@@ -560,16 +559,14 @@ class O8iDialect:
     def resolve_lobs(self, rows: list, columns: list):
         # Replace each LOB locator left by decode_8i_exec_response with its content:
         # read the locator, decode CLOB text with the column charset (latin-1) and
-        # keep BLOB bytes (decode_fv2_lob, shared with the 9i path).
+        # keep BLOB bytes (decode_fv2_lob, shared with the 9i path). A BFILE stays
+        # a locator, read on demand as on 9i (#1103).
         from seerdb.common.lob import LOB
         from seerdb.common.types import decode_fv2_lob
 
         for row in rows:
             for i, val in enumerate(row):
-                if isinstance(val, LOB):
-                    if val.data_type == 114:  # BFILE — external file pointer
-                        row[i] = yield from self.bfile_read(val.raw)
-                        continue
+                if isinstance(val, LOB) and val.data_type != TNS_TYPE_BFILE:
                     content = yield from self.lob_read(val.raw)
                     row[i] = decode_fv2_lob(
                         columns[i].get('data_type'),
@@ -606,7 +603,10 @@ class O8iDialect:
         resp = yield RECV
         if resp is False:
             raise Exception('Connection closed during 8i BFILE FILE_OPEN')
-        fv2_raise_for_error(resp[1])  # e.g. ORA-22285 (file not found)
+        # 8i's OER is not 9i's: its error is the trailing ORA- text. The 9i
+        # reader missed it, unseen while a fetch read the BFILE (#1103).
+        (_row_count, err_code, message) = decode_8i_dml_response(resp[1])
+        _raise_ora(err_code, message)  # e.g. ORA-22285 (no such directory)
         opened = decode_fv2_opened_locator(resp[1])
         if opened is None:
             raise Exception('Unexpected 8i BFILE FILE_OPEN reply', resp[1][:8].hex())
