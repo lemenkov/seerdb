@@ -1642,6 +1642,7 @@ Bind values are encoded inline following OAC descriptors:
 | `seerdb.IntervalYM`     | 5-byte INTERVAL YEAR TO MONTH (§11.5)                  |
 | `None`                  | Single `0x00` byte                                     |
 | `seerdb.Var` (OUT/IN OUT) | the seeded value, or `0x00` (NULL) for a pure OUT; OAC driven by the Var's declared type |
+| `Var(seerdb.ROWID)` / `Var(DB_TYPE_UROWID)` | the rowid's text; OAC a VARCHAR of 5267 characters, the longest universal rowid, on every tier from 8i (#1397, #1399) |
 | `seerdb.cursor.cursor` / `Var(seerdb.CURSOR)` | `0x01, 0x00` (REF CURSOR placeholder); value returned in the IOV (§6.5) |
 
 **A NULL bind still has to declare a type** (#696). The row data for one is the
@@ -5184,7 +5185,9 @@ The bind **direction is not encoded in the OAC or the option word** — a block
 with OUT binds is the same `02 04 29` parse-execute, with one OAC per bind in
 position order (every bind, regardless of direction). For a `Var` the OAC carries
 its registered type and return-buffer size (NUMBER → VARNUM(6)/22; VARCHAR →
-the Var size, default `0x7fff`). The server infers each bind's direction from the
+the Var size, default `0x7fff`; ROWID / UROWID → VARCHAR(5267) carrying the
+rowid's text, since declared as type 11 / 208 the server answers with a garbled
+error, #1399). The server infers each bind's direction from the
 block and signals it in the prompt; the round-trip then differs by direction:
 
 - **Bind prompt** `0b 05 01 <numbinds> 00 01 01 00` + a direction section — one
@@ -5446,6 +5449,10 @@ ub2-LE  max_size  (22 for NUMBER, 7 for DATE, value length otherwise)   [+4]
 ub4be  character set (31 for char types, 0 otherwise)                   [+19]
 ub1 reserved(0)  ub1 csform (1 for char types, 0 otherwise)
 ```
+
+A ROWID / UROWID `Var` declares type 1 with `max_size` 5267 and carries the
+rowid's text, as on 9i and 10g+; declared as its own type, the bind drops the
+session (#1399).
 
 `max_size` is a **little-endian ub2 at offset +4** (8i is x86). For values ≤ 255
 this is byte-identical to a big-endian 3-byte field (so short binds worked

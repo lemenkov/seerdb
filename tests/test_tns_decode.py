@@ -6330,6 +6330,25 @@ class TestFv2OutBinds(unittest.TestCase):
             _o7_bind_oac(dt.Var(str)), bytes.fromhex('01010000027fff0000000002036901')
         )
 
+    def test_var_oac_rowid_is_the_rowid_text(self):
+        import seerdb
+        from seerdb.common import datatypes as dt
+        from seerdb.common.tns import _encode_8i_bind_oac, _o7_bind_oac
+
+        # A ROWID / UROWID Var declares a VARCHAR of the longest universal rowid,
+        # 5267 (0x1493) characters, on 9i and 8i as on 10g+. Declared as its own
+        # type, 9i answered with a garbled error and 8i dropped the session
+        # (#1399). 8i writes the size little-endian.
+        for typ in (seerdb.ROWID, seerdb.DB_TYPE_UROWID):
+            self.assertEqual(
+                _o7_bind_oac(dt.Var(typ)),
+                bytes.fromhex('010100000214930000000002036901'),
+            )
+            self.assertEqual(
+                _encode_8i_bind_oac(dt.Var(typ)),
+                bytes.fromhex('010300009314000000000000000000000000000000001f0001'),
+            )
+
     def test_oac_datetime_declares_temporal_type(self):
         # A datetime/date inline bind must declare the matching Oracle temporal
         # type (#172) — the value encoder emits 7/11/13 binary bytes, so a
