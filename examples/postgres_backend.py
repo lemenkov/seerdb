@@ -82,11 +82,11 @@ edge of this adapter:
   python-oracledb runs to learn a type,
   ``DBMS_PICKLER.GET_TYPE_SHAPE``, is answered from the catalog with the TDS and
   attribute cursor 23ai sends; an attribute is reported as the DDL translation
-  stored it, so ``DATE`` reads as ``TIMESTAMP(0)``, as the rest of the
-  dictionary reports it. An ``NVARCHAR2`` / ``NCHAR`` / ``NCLOB`` / ``RAW(n)`` /
-  ``FLOAT`` / ``REAL`` / ``DOUBLE PRECISION`` attribute, and an ``NVARCHAR2`` /
-  ``NCHAR`` collection element, keep the type the DDL declared; a ``RAW(n)``
-  element reads as ``BLOB``. PL/SQL package
+  stored it. An ``NVARCHAR2`` / ``NCHAR`` / ``NCLOB`` / ``RAW(n)`` / ``FLOAT``
+  / ``REAL`` / ``DOUBLE PRECISION`` attribute, and an ``NVARCHAR2`` /
+  ``NCHAR`` collection element, keep the type the DDL declared; a ``DATE``
+  attribute is ``ora_date``, as a ``DATE`` column is, and reads as ``DATE``; a
+  ``RAW(n)`` element reads as ``BLOB``. PL/SQL package
   types (``all_plsql_types``) are not described.
 - **``REF`` / ``DEREF``, with a visible object id** — an Oracle object table
   (``CREATE TABLE t OF type``) gives every row a hidden object id that a REF names.
@@ -1324,6 +1324,8 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN o.data_type IN ('NVARCHAR2', 'NCHAR', 'RAW', 'REAL', "
     "'DOUBLE PRECISION', 'FLOAT') THEN o.data_type "
     f"WHEN a.attribute_udt_name = '{_BLOB_TYPE}' THEN 'BLOB' "
+    # The ora_date domain is DATE (#1548).
+    f"WHEN a.attribute_udt_name = '{_DATE_TYPE}' THEN 'DATE' "
     "WHEN a.data_type = 'USER-DEFINED' THEN ora_name(a.attribute_udt_name) "
     "WHEN a.data_type = 'timestamp with time zone' THEN 'TIMESTAMP WITH LOCAL TZ' "
     # An XMLType attribute is SYS.XMLTYPE's (#1537).
@@ -1331,7 +1333,7 @@ _ORACLE_DICTIONARY_DDL = (
     'ELSE ora_type_name(a.data_type) END AS attr_type_name, '
     "CASE WHEN a.data_type = 'xml' THEN 'SYS' "
     "WHEN a.data_type = 'USER-DEFINED' AND a.attribute_udt_name NOT IN "
-    f"('{_TSTZ_TYPE}', '{_CLOB_TYPE}', '{_BLOB_TYPE}') "
+    f"('{_TSTZ_TYPE}', '{_CLOB_TYPE}', '{_BLOB_TYPE}', '{_DATE_TYPE}') "
     'THEN ora_owner(a.attribute_udt_schema) END AS attr_type_owner, '
     # A RAW(n)'s length is its record's; the cast keeps the view column's type.
     "CASE WHEN o.data_type = 'RAW' THEN o.data_length::information_schema.cardinal_number "
@@ -2973,6 +2975,9 @@ def _translate_ddl(sql: str) -> str:
         # `... AS OBJECT (attrs)` → `... AS (attrs)`, then map the attribute types
         # (NUMBER → numeric, VARCHAR2(n) → varchar(n), …) the same way as a table.
         out = _CREATE_TYPE_OBJECT.sub(r'\1', sql, count=1)
+        # A DATE attribute is the ora_date domain, as a table's DATE column is,
+        # so it describes as DATE rather than TIMESTAMP (#1316, #1548).
+        out = _DDL_DATE_COLUMN.sub(_DATE_TYPE, out)
         # A FLOAT / REAL / DOUBLE PRECISION attribute is a NUMBER of binary
         # precision, numeric as a table's column is (#1384, #1423); before the
         # type rewrites, which make BINARY_FLOAT a real.
@@ -5715,6 +5720,15 @@ class PostgresBackend:
             self._conn.adapters.register_loader(
                 'timestamp', _bc_date_loader(TimestampLoader)
             )
+            # A DATE inside a composite or an array is typed by the ora_date
+            # domain, which psycopg does not know: it came back as text. Load it,
+            # and arrays of it, as the timestamp it is over (#1548).
+            date_domain = TypeInfo.fetch(self._conn, _DATE_TYPE)
+            if date_domain is not None:
+                self._conn.adapters.register_loader(
+                    date_domain.oid, _bc_date_loader(TimestampLoader)
+                )
+                register_array(date_domain, self._conn)
             self._conn.adapters.register_loader('interval', _IntervalMonthsBinaryLoader)
         except psycopg.Error:
             self._conn.rollback()
@@ -7374,6 +7388,7 @@ class PostgresBackend:
                 "'DOUBLE PRECISION', 'FLOAT') THEN o.data_type "
                 f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CLOB' "
                 f"WHEN a.attribute_udt_name = '{_BLOB_TYPE}' THEN 'BLOB' "
+                f"WHEN a.attribute_udt_name = '{_DATE_TYPE}' THEN 'DATE' "
                 "WHEN a.data_type = 'USER-DEFINED' "
                 'THEN sys.ora_name(a.attribute_udt_name) '
                 "WHEN a.data_type = 'xml' THEN 'XMLTYPE' "
@@ -7383,7 +7398,7 @@ class PostgresBackend:
                 "CASE WHEN a.data_type = 'xml' THEN 'SYS' "
                 "WHEN a.data_type = 'USER-DEFINED' "
                 'AND a.attribute_udt_name NOT IN '
-                f"('{_TSTZ_TYPE}', '{_CLOB_TYPE}', '{_BLOB_TYPE}') "
+                f"('{_TSTZ_TYPE}', '{_CLOB_TYPE}', '{_BLOB_TYPE}', '{_DATE_TYPE}') "
                 'THEN sys.ora_owner(a.attribute_udt_schema) END, '
                 "format('%%I.%%I', a.attribute_udt_schema, a.attribute_udt_name)"
                 '::regtype::oid '
