@@ -3518,6 +3518,44 @@ def test_describe_type_answers_an_oci_type_describe() -> None:
         backend.close()
 
 
+def test_a_call_with_named_binds_passes_them() -> None:
+    # A call block's binds may be named as well as numbered; a client sends the
+    # values one per distinct placeholder in order of first appearance either
+    # way. A named one used to find no argument at all: the routine ran with
+    # none and the binds came back as they went in (#1529).
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER, TNS_TYPE_VARCHAR
+    from seerdb.server.backend import BindVar
+
+    def outs() -> list:
+        return [
+            BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=32767),
+            BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=22),
+        ]
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'BEGIN DBMS_OUTPUT.ENABLE(:1); END;',
+            [BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=22)],
+        )
+        for sql, want in (
+            ('BEGIN DBMS_OUTPUT.GET_LINE(:1, :2); END;', ['hello', 0]),
+            ('BEGIN DBMS_OUTPUT.GET_LINE(:l, :s); END;', ['hello', 0]),
+            # By name, in the order the placeholders first appear.
+            (
+                'BEGIN DBMS_OUTPUT.GET_LINE(status => :s, line => :l); END;',
+                [0, 'hello'],
+            ),
+        ):
+            backend.execute(
+                'BEGIN DBMS_OUTPUT.PUT_LINE(:1); END;',
+                [BindVar(value='hello', tns_type=TNS_TYPE_VARCHAR, max_size=4000)],
+            )
+            assert backend.execute(sql, outs()).out_binds == want, sql
+    finally:
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships

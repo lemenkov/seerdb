@@ -4317,15 +4317,42 @@ _PLSQL_WORD_STATEMENTS = frozenset(
     {'NULL', 'COMMIT', 'ROLLBACK', 'RETURN', 'EXIT', 'CONTINUE', 'RAISE'}
 )
 _FUNC_CALL = re.compile(r'(?is)^\s*:(\d+)\s*:=\s*([\w.]+)\s*\((.*)\)\s*$')
-# A numbered placeholder, `:3` -- not the second colon of `::`.
-_NUMBERED_BIND = re.compile(r'(?<!:):(\d+)')
+# A placeholder in a call, numbered `:3` or named `:lines` -- not the second colon
+# of `::`. A client sends a block's values one per distinct placeholder, in the
+# order they first appear, numbered or named alike (#1380, #1529). A quoted name
+# is a placeholder too, and counts toward that order. (Not `_BIND_REF`, which is
+# taken: rebinding it silently changed every reader of that one.)
+_CALL_PLACEHOLDER = re.compile(r'(?<!:):(?:"([^"\n]+)"|(\d+|[A-Za-z_][\w$#]*))')
 # A named argument in a call's list: `name => value`.
 _NAMED_ARGUMENT = re.compile(r'(?is)^\s*(\w+)\s*=>')
 # One argument of a call: a bind, by position or by name (`:3`, `a_x => :3`).
-_CALL_ARGUMENT = re.compile(r'(?is)^\s*(?:(\w+)\s*=>\s*)?:(\d+)\s*$')
+_CALL_ARGUMENT = re.compile(r'(?is)^\s*(?:(\w+)\s*=>\s*)?:(\d+|[A-Za-z_][\w$#]*)\s*$')
 
 
-def _call_arguments(args: str) -> list[tuple[str | None, int]] | None:
+def _placeholder_ref(match: 're.Match') -> int | str:
+    # The key of a _CALL_PLACEHOLDER match: a quoted name exactly as written,
+    # with its quotes so it never meets an unquoted one.
+    if match.group(1) is not None:
+        return f'"{match.group(1)}"'
+    return _placeholder_key(match.group(2))
+
+
+def _placeholder_key(ref: str) -> int | str:
+    # A placeholder's identity: a number as its value, a name case-folded, as
+    # Oracle matches an unquoted bind name.
+    return int(ref) if ref.isdigit() else ref.lower()
+
+
+def _placeholder_slot(slots: dict[int | str, int], key: int | str) -> int:
+    # The bind value a placeholder takes. A number the block never used falls
+    # back to its own position, as it always did; a name is always in the block
+    # its slots were read from.
+    if isinstance(key, int) and key not in slots:
+        return key - 1
+    return slots[key]
+
+
+def _call_arguments(args: str) -> list[tuple[str | None, int | str]] | None:
     """A call's arguments as (parameter name or None, bind number), in order.
 
     None when an argument is anything but a bind -- a literal, an expression --
@@ -4339,11 +4366,13 @@ def _call_arguments(args: str) -> list[tuple[str | None, int]] | None:
         if match is None:
             return None
         name = match.group(1)
-        arguments.append((name.lower() if name else None, int(match.group(2))))
+        arguments.append(
+            (name.lower() if name else None, _placeholder_key(match.group(2)))
+        )
     return arguments
 
 
-def _bind_slots(block: str) -> dict[int, int]:
+def _bind_slots(block: str) -> dict[int | str, int]:
     """Each numbered placeholder of a block -> the bind value it takes.
 
     A client sends a block's bind values one per distinct placeholder, in the
@@ -4352,13 +4381,13 @@ def _bind_slots(block: str) -> dict[int, int]:
     Reading `:N` as the Nth value gave such a call the wrong values (#1380).
     Comments and literals are skipped, as for any placeholder scan.
     """
-    slots: dict[int, int] = {}
-    for match in _NUMBERED_BIND.finditer(strip_non_bind_text(block)):
-        slots.setdefault(int(match.group(1)), len(slots))
+    slots: dict[int | str, int] = {}
+    for match in _CALL_PLACEHOLDER.finditer(strip_non_bind_text(block)):
+        slots.setdefault(_placeholder_ref(match), len(slots))
     return slots
 
 
-def _call_placeholders(arguments: Sequence[tuple[str | None, int]]) -> str:
+def _call_placeholders(arguments: Sequence[tuple[str | None, int | str]]) -> str:
     # PostgreSQL takes a call's named notation as Oracle writes it (#1377).
     return ', '.join(f'{name} => %s' if name else '%s' for name, _ref in arguments)
 
@@ -7578,16 +7607,20 @@ class PostgresBackend:
             raise refused
         arguments = _call_arguments(args)
         if arguments is None:
-            arguments = [(None, int(r)) for r in re.findall(r':(\d+)', args)]
+            arguments = [
+                (None, _placeholder_ref(m)) for m in _CALL_PLACEHOLDER.finditer(args)
+            ]
         slots = _bind_slots(block)
-        arg_values = [values[slots.get(ref, ref - 1)] for _name, ref in arguments]
+        arg_values = [values[_placeholder_slot(slots, ref)] for _name, ref in arguments]
         cursor = self._conn.cursor()
         cursor.execute(
             f'SELECT {name}({_call_placeholders(arguments)})', tuple(arg_values) or None
         )
         row = _decode_row(cursor, cursor.fetchone(), self._tstz_oid)
         out = list(values)
-        out[slots.get(int(ret_ref), int(ret_ref) - 1)] = row[0] if row else None
+        out[_placeholder_slot(slots, _placeholder_key(ret_ref))] = (
+            row[0] if row else None
+        )
         return Result(out_binds=out)
 
     def _call_procedure(self, match: 're.Match', values: list, block: str) -> Result:
@@ -7595,7 +7628,7 @@ class PostgresBackend:
         # come back as a result row, in parameter order, which we place onto their
         # bind positions.
         name, args = match.groups()
-        arg_refs = [int(r) for r in re.findall(r':(\d+)', args)]
+        arg_refs = [_placeholder_ref(m) for m in _CALL_PLACEHOLDER.finditer(args)]
         modes, argtypes, parameters, kind = self._proc_signature(name)
         refused = _call_argument_error(block, name, args, parameters or None)
         if refused is not None:
@@ -7634,7 +7667,7 @@ class PostgresBackend:
         arg_values = [
             None
             if modes and param < len(modes) and modes[param] == 'o'
-            else values[slots.get(ref, ref - 1)]
+            else values[_placeholder_slot(slots, ref)]
             for param, ref in bound.items()
         ]
         cursor = self._conn.cursor()
@@ -7682,7 +7715,7 @@ class PostgresBackend:
                 and argtypes[param] == self._intervalym_oid
             ):
                 value = _to_interval_ym(value)
-            out[slots.get(ref, ref - 1)] = value
+            out[_placeholder_slot(slots, ref)] = value
         return Result(out_binds=out)
 
     def _decode_out_row(self, cursor, row) -> list:
