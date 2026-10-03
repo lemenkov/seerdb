@@ -4017,6 +4017,46 @@ def test_an_objects_float_attribute_is_a_number_of_binary_precision() -> None:
         backend.close()
 
 
+def test_an_objects_date_attribute_is_a_date() -> None:
+    # An object's DATE attribute stayed timestamp(0) and described as a
+    # TIMESTAMP (#1548). It is the ora_date domain, as a table's DATE column
+    # is (#1316): DATE in the dictionary and the attribute cursor, and its TDS
+    # leaf `02` -- 23ai's TDS byte for byte -- and it fetches as a datetime.
+    from postgres_backend import _tds
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TYPE da1548 AS OBJECT (n NUMBER, d DATE, t TIMESTAMP)')
+        backend.commit()
+        result = backend.execute(
+            'SELECT attr_name, attr_type_name, attr_type_owner FROM user_type_attrs '
+            "WHERE type_name = 'DA1548' ORDER BY attr_no"
+        )
+        assert result.rows == [
+            ('N', 'NUMBER', None),
+            ('D', 'DATE', None),
+            ('T', 'TIMESTAMP', None),
+        ]
+        pg_oid = backend._conn.execute("SELECT 'da1548'::regtype::oid").fetchone()[0]
+        assert _tds(backend._type_shape(pg_oid)).hex() == (
+            '0000001b260200010003002900000000000c0600810215062a0007000a000b'
+        )
+        assert backend._attribute_rows(pg_oid)[1][3] == 'DATE'
+        result = backend.execute(
+            "SELECT da1548(1, DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05') "
+            'FROM dual'
+        )
+        assert result.rows[0][0].D == datetime.datetime(2024, 1, 2)
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TYPE da1548')
+            backend.commit()
+        except Exception:
+            backend.rollback()
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships
