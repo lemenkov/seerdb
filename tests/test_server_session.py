@@ -1578,6 +1578,58 @@ def test_oci_loop_refuses_an_unknown_call_instead_of_closing_the_session() -> No
         assert b'ORA-03115' in body
 
 
+# sqlplus 23.26 re-executing DBMS_OUTPUT.GET_LINES by cursor id, with no SQL,
+# as captured against Mirror-over-PG (#1411 / #1515).
+_OCI_REEXECUTE_GET_LINES = bytes.fromhex(
+    '035e012004040001000000000000000000000000000000feffffffffffffff0d'
+    '000000fefffffffffffffffeffffffffffffff00000000010000000000000000'
+    '00000000000000000000000000000000000000feffffffffffffff0000000000'
+    '000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000001000000000000000000000000'
+    '0000000000000000000000080000000000000000800000000000000000000000'
+    '000000070000000002c102'
+)
+
+
+def test_oci_loop_refuses_a_call_it_cannot_parse() -> None:
+    # A re-execute by cursor id with nothing parked does not parse, and it was
+    # answered as a success without running anything. sqlplus then re-executed
+    # GET_LINES 65,529 times, never getting its line count back (#1515). Refused,
+    # the client sees an error, the backend is never handed a guess, and the
+    # session carries on.
+    from seerdb.common.tns_consts import TNS_DATA
+    from seerdb.server.session import _serve_oci_session
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.inbox = [
+                (TNS_DATA, _OCI_REEXECUTE_GET_LINES),
+                (TNS_DATA, _OCI_REEXECUTE_GET_LINES),
+                None,
+            ]
+            self.sent: list[tuple[int, bytes]] = []
+
+        def read_packet(self, **_kw):
+            return self.inbox.pop(0)
+
+        def write_packet(self, ptype: int, body: bytes, **_kw) -> None:
+            self.sent.append((ptype, body))
+
+    class _NoBackend:
+        def execute(self, *_args, **_kw):
+            raise AssertionError('an unparsed call reached the backend')
+
+    stream: Any = _Stream()
+    backend: Any = _NoBackend()
+    assert _serve_oci_session(stream, backend, 'PYO') == 'PYO'
+    assert len(stream.sent) == 2
+    for _ptype, body in stream.sent:
+        assert b'ORA-03115' in body
+
+
 def test_oci_loop_answers_a_break_marker() -> None:
     """A break / reset marker gets a marker back, not silence.
 

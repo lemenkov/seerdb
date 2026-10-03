@@ -1823,10 +1823,15 @@ def _answer_query_oci(
     # TTI_LOBOPS reads, and the same by the slot each locator names (#1430).
     try:
         request = parse_exec_oci(body)
-    except InterfaceError:
-        # A shape not parsed yet (e.g. a bound PL/SQL setup call) — acknowledge
-        # success so sqlplus proceeds; the backend never sees it.
-        stream.write_packet(TNS_DATA, encode_status_oci(seq.next()))
+    except InterfaceError as err:
+        # A shape the parser cannot read yet -- a re-execute by cursor id with no
+        # SQL and nothing parked, or binds it does not know. It used to be
+        # answered as a success without running anything, so the client took the
+        # call as done: sqlplus kept re-executing DBMS_OUTPUT.GET_LINES, whose
+        # line count never came back, until the session died (#1515). Refused,
+        # the client sees the error and the session carries on. sqlplus's own
+        # startup and everyday statements never reach here.
+        _refuse_unhandled_oci(stream, f'OALL8: {err}', seq)
         return None, [], {}
     try:
         # A PL/SQL block (sqlplus VARIABLE / EXEC :v := …) hands its binds over as
