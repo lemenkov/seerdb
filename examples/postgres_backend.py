@@ -729,6 +729,21 @@ CREATE OR REPLACE PROCEDURE dbms_utility.db_version(
 """
 
 
+# DBMS_LOCK.SLEEP and its 18c name DBMS_SESSION.SLEEP (#1511): the standard way
+# to make a call take time, which is what a client's cancel and call-timeout
+# tests need. orafce ships neither. Seconds may be fractional, as in Oracle;
+# double precision takes an integer, numeric or float bind alike, where a
+# numeric parameter refused a float one.
+_DBMS_SLEEP_DDL = """
+CREATE SCHEMA IF NOT EXISTS dbms_lock;
+CREATE OR REPLACE PROCEDURE dbms_lock.sleep(seconds double precision)
+  LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(seconds); END $$;
+CREATE SCHEMA IF NOT EXISTS dbms_session;
+CREATE OR REPLACE PROCEDURE dbms_session.sleep(seconds double precision)
+  LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(seconds); END $$;
+"""
+
+
 # Oracle data-dictionary emulation (#759): the SYS_CONTEXT userenv function and a
 # minimal set of Oracle-shaped catalog views over pg_catalog / information_schema,
 # so a reflecting client (SQLAlchemy's Oracle dialect, ORMs) finds the metadata it
@@ -5292,6 +5307,11 @@ class PostgresBackend:
         # DBMS_UTILITY entry points orafce does not ship (#764).
         try:
             self._conn.execute(_DBMS_UTILITY_DDL)
+        except psycopg.Error:
+            self._conn.rollback()
+        # DBMS_LOCK.SLEEP / DBMS_SESSION.SLEEP (#1511).
+        try:
+            self._conn.execute(_DBMS_SLEEP_DDL)
         except psycopg.Error:
             self._conn.rollback()
         # Oracle data-dictionary emulation (#759): SYS_CONTEXT + catalog views.

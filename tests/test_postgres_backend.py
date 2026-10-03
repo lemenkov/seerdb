@@ -3469,6 +3469,29 @@ def test_dbms_utility_functions() -> None:
         backend.close()
 
 
+def test_dbms_lock_and_dbms_session_sleep() -> None:
+    # The way a client makes a call take time -- python-oracledb's cancel and
+    # call-timeout tests call one or the other, by server version. orafce ships
+    # neither, so the call failed at once with ORA-00900 and the cancel never
+    # had anything to interrupt (#1511). Seconds may be fractional.
+    import time
+
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for name in ('DBMS_LOCK.SLEEP', 'DBMS_SESSION.SLEEP'):
+            start = time.monotonic()
+            backend.execute(
+                f'BEGIN {name}(:1); END;',
+                [BindVar(value=0.2, tns_type=TNS_TYPE_NUMBER, max_size=22)],
+            )
+            assert time.monotonic() - start >= 0.2, name
+    finally:
+        backend.close()
+
+
 def test_nvl_with_literal_arguments_runs() -> None:
     # NVL with bare literals is ordinary Oracle, and it did not run here at all:
     # orafce's four overloads left `nvl(unknown, unknown)` ambiguous and the
