@@ -82,9 +82,9 @@ edge of this adapter:
   python-oracledb runs to learn a type,
   ``DBMS_PICKLER.GET_TYPE_SHAPE``, is answered from the catalog with the TDS and
   attribute cursor 23ai sends; an attribute is reported as the DDL translation
-  stored it, so ``FLOAT`` reads as ``BINARY_DOUBLE`` and ``DATE`` as
-  ``TIMESTAMP(0)``, as the rest of the dictionary reports them. An ``NVARCHAR2``
-  / ``NCHAR`` / ``NCLOB`` / ``RAW(n)`` attribute, and an ``NVARCHAR2`` /
+  stored it, so ``DATE`` reads as ``TIMESTAMP(0)``, as the rest of the
+  dictionary reports it. An ``NVARCHAR2`` / ``NCHAR`` / ``NCLOB`` / ``RAW(n)`` /
+  ``FLOAT`` / ``REAL`` / ``DOUBLE PRECISION`` attribute, and an ``NVARCHAR2`` /
   ``NCHAR`` collection element, keep the type the DDL declared; a ``RAW(n)``
   element reads as ``BLOB``. PL/SQL package
   types (``all_plsql_types``) are not described.
@@ -1319,8 +1319,10 @@ _ORACLE_DICTIONARY_DDL = (
     f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' AND o.data_type = 'NCLOB' "
     "THEN 'NCLOB' "
     f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CLOB' "
-    # A RAW(n) is a bytea, told apart by its record (#1544).
-    "WHEN o.data_type IN ('NVARCHAR2', 'NCHAR', 'RAW') THEN o.data_type "
+    # A RAW(n) is a bytea, told apart by its record (#1544); a FLOAT / REAL /
+    # DOUBLE PRECISION is a numeric, listed by its declared name (#1423).
+    "WHEN o.data_type IN ('NVARCHAR2', 'NCHAR', 'RAW', 'REAL', "
+    "'DOUBLE PRECISION', 'FLOAT') THEN o.data_type "
     f"WHEN a.attribute_udt_name = '{_BLOB_TYPE}' THEN 'BLOB' "
     "WHEN a.data_type = 'USER-DEFINED' THEN ora_name(a.attribute_udt_name) "
     "WHEN a.data_type = 'timestamp with time zone' THEN 'TIMESTAMP WITH LOCAL TZ' "
@@ -1333,7 +1335,12 @@ _ORACLE_DICTIONARY_DDL = (
     'THEN ora_owner(a.attribute_udt_schema) END AS attr_type_owner, '
     # A RAW(n)'s length is its record's; the cast keeps the view column's type.
     "CASE WHEN o.data_type = 'RAW' THEN o.data_length::information_schema.cardinal_number "
-    'ELSE a.character_maximum_length END AS length, a.numeric_precision AS precision, '
+    'ELSE a.character_maximum_length END AS length, '
+    # A FLOAT(b)'s precision is its b; a REAL's, a DOUBLE PRECISION's and a
+    # bare FLOAT's is NULL, as Oracle lists them (#1423).
+    "CASE WHEN o.data_type IN ('REAL', 'DOUBLE PRECISION', 'FLOAT') "
+    'THEN o.data_precision::information_schema.cardinal_number '
+    'ELSE a.numeric_precision END AS precision, '
     'a.numeric_scale AS scale, a.ordinal_position AS attr_no, '
     # The character set a character attribute takes; a client reads the national
     # form (NCHAR_CS) from here (#1433). Appended: CREATE OR REPLACE VIEW can
@@ -2131,6 +2138,30 @@ _CREATE_NATIONAL_COLLECTION = re.compile(
 )
 
 
+# An object attribute's FLOAT[(b)], REAL or DOUBLE PRECISION, which Oracle lists
+# by the name it was declared with -- and FLOAT's b only when given -- where a
+# table column is a FLOAT of b bits (#1423).
+_FLOAT_ATTRIBUTE_DECLARED = re.compile(
+    r'\s*(?:(REAL)\b|(DOUBLE\s+PRECISION)\b|FLOAT\b\s*(?:\(\s*(\d+)\s*\))?)',
+    re.IGNORECASE,
+)
+_FLOAT_ATTRIBUTE_TYPES = ('REAL', 'DOUBLE PRECISION', 'FLOAT')
+
+
+def _attribute_declared_type(
+    definition: str,
+) -> tuple[str, int | None, int | None, int | None] | None:
+    floating = _FLOAT_ATTRIBUTE_DECLARED.match(definition)
+    if floating is None:
+        return _declared_type(definition)
+    if floating.group(1):
+        return ('REAL', 22, None, None)
+    if floating.group(2):
+        return ('DOUBLE PRECISION', 22, None, None)
+    bits = floating.group(3)
+    return ('FLOAT', 22, int(bits) if bits else None, None)
+
+
 # CREATE [OR REPLACE] TYPE t [FORCE] AS|IS OBJECT (attributes): its attributes are
 # recorded in sys.ora_columns as a table's columns are, keyed by the composite's
 # relid (#1431).
@@ -2158,10 +2189,12 @@ def _declared_columns(sql: str) -> tuple[str, dict[str, tuple | None]] | None:
     column's record survives `MODIFY (c NOT NULL)`. A name is PostgreSQL's
     spelling: a quoted one as written, an unquoted one in lower case.
     """
-    found = _ddl_column_spans(sql) or _object_type_spans(sql)
+    table_spans = _ddl_column_spans(sql)
+    found = table_spans or _object_type_spans(sql)
     if found is None:
         return None
     table, spans, modify = found
+    declare = _declared_type if table_spans else _attribute_declared_type
     columns: dict[str, tuple | None] = {}
     for start, end in spans:
         name = _COLUMN_NAME.match(sql, start, end)
@@ -2173,8 +2206,8 @@ def _declared_columns(sql: str) -> tuple[str, dict[str, tuple | None]] | None:
         column = name.group(1)
         if column.upper() in ('CONSTRAINT', 'PRIMARY', 'UNIQUE', 'FOREIGN', 'CHECK'):
             continue
-        columns[column[1:-1] if column.startswith('"') else column.lower()] = (
-            _declared_type(definition)
+        columns[column[1:-1] if column.startswith('"') else column.lower()] = declare(
+            definition
         )
     return table, columns
 
@@ -2491,6 +2524,10 @@ _BUILTIN_TYPE_OID_BYTE = {
     'NCHAR': 0x1A,  # the same as CHAR's (#1416)
     'BLOB': 0x23,
     'RAW': 0x17,  # measured on 23ai (#1544)
+    # Measured on 23ai, each under its own OID (#1423).
+    'REAL': 0x0C,
+    'DOUBLE PRECISION': 0x0D,
+    'FLOAT': 0x0E,
 }
 
 
@@ -2509,16 +2546,20 @@ def _national_leaf(declared: str | None, typmod: int) -> _TdsLeaf | None:
 
 
 def _declared_leaf(
-    declared: tuple[str, int | None] | None, typmod: int
+    declared: tuple[str, int | None, int | None] | None, typmod: int
 ) -> _TdsLeaf | None:
     # An attribute's leaf where its declaration says more than the PostgreSQL
     # type does: a RAW(n), a bytea here, is `13` and a ub2 n, as 23ai sends it
-    # (#1544); a national one is _national_leaf's. None for any other.
+    # (#1544); a FLOAT / REAL / DOUBLE PRECISION, a numeric, is `05` and the
+    # declared binary precision, 0 for none (#1423); a national one is
+    # _national_leaf's. None for any other.
     if declared is None:
         return None
-    (data_type, length) = declared
+    (data_type, length, precision) = declared
     if data_type == 'RAW' and length:
         return _TdsLeaf(b'\x13' + length.to_bytes(2, 'big'))
+    if data_type in _FLOAT_ATTRIBUTE_TYPES:
+        return _TdsLeaf(bytes([0x05, precision or 0]))
     return _national_leaf(data_type, typmod)
 
 
@@ -2932,6 +2973,10 @@ def _translate_ddl(sql: str) -> str:
         # `... AS OBJECT (attrs)` → `... AS (attrs)`, then map the attribute types
         # (NUMBER → numeric, VARCHAR2(n) → varchar(n), …) the same way as a table.
         out = _CREATE_TYPE_OBJECT.sub(r'\1', sql, count=1)
+        # A FLOAT / REAL / DOUBLE PRECISION attribute is a NUMBER of binary
+        # precision, numeric as a table's column is (#1384, #1423); before the
+        # type rewrites, which make BINARY_FLOAT a real.
+        out = _DDL_FLOAT_COLUMN.sub('numeric', out)
         for pattern, replacement in _DDL_TYPE_REWRITES:
             out = pattern.sub(replacement, out)
         named = _TYPE_NAME_OF_CREATE.match(sql)
@@ -7130,16 +7175,17 @@ class PostgresBackend:
 
     def _declared_attribute_types(
         self, pg_oid: int
-    ) -> dict[str, tuple[str, int | None]]:
+    ) -> dict[str, tuple[str, int | None, int | None]]:
         # The type each attribute of a composite was declared as, where
         # sys.ora_columns records one (#1431): attribute name -> (Oracle type,
-        # its recorded length).
+        # its recorded length, its recorded precision).
         if not self._has_column_catalog:
             return {}
         return {
-            name: (data_type, length)
-            for name, data_type, length in self._conn.execute(
-                'SELECT a.attname, o.data_type, o.data_length FROM pg_type t '
+            name: (data_type, length, precision)
+            for name, data_type, length, precision in self._conn.execute(
+                'SELECT a.attname, o.data_type, o.data_length, o.data_precision '
+                'FROM pg_type t '
                 'JOIN pg_attribute a ON a.attrelid = t.typrelid '
                 'JOIN sys.ora_columns o ON o.relid = a.attrelid AND o.attnum = a.attnum '
                 'WHERE t.oid = %s',
@@ -7181,7 +7227,7 @@ class PostgresBackend:
                 (type_name, owner, toid) = ('XMLTYPE', 'SYS', _XMLTYPE_OID)
             elif kind is None:
                 type_name = _tds_scalar(self._pg_type_name(atttypid), atttypmod)[1]
-                as_declared = declared.get(attname, (None, None))[0]
+                as_declared = declared.get(attname, (None, None, None))[0]
                 # An NCLOB is an ora_clob like a CLOB; only its name tells them
                 # apart, and the client types the attribute by it (#1431).
                 if type_name == 'CLOB' and as_declared == 'NCLOB':
@@ -7190,6 +7236,8 @@ class PostgresBackend:
                     ('VARCHAR2', 'NVARCHAR2'),
                     ('CHAR', 'NCHAR'),
                     ('BLOB', 'RAW'),  # a RAW(n) is a bytea (#1544)
+                    # A FLOAT / REAL / DOUBLE PRECISION is a numeric (#1423).
+                    *(('NUMBER', name) for name in _FLOAT_ATTRIBUTE_TYPES),
                 ):
                     type_name = declared[attname][0]  # (#1383, #1416)
                 (owner, toid) = (
@@ -7322,7 +7370,8 @@ class PostgresBackend:
                 # The national types, told apart by their record (#1383).
                 f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' "
                 "AND o.data_type = 'NCLOB' THEN 'NCLOB' "
-                "WHEN o.data_type IN ('NVARCHAR2', 'NCHAR', 'RAW') THEN o.data_type "
+                "WHEN o.data_type IN ('NVARCHAR2', 'NCHAR', 'RAW', 'REAL', "
+                "'DOUBLE PRECISION', 'FLOAT') THEN o.data_type "
                 f"WHEN a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CLOB' "
                 f"WHEN a.attribute_udt_name = '{_BLOB_TYPE}' THEN 'BLOB' "
                 "WHEN a.data_type = 'USER-DEFINED' "
