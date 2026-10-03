@@ -10386,6 +10386,11 @@ def _o7_bind_oac(Value: object, Statement: bool = False) -> bytes:
             Type, MaxSize, Csfrm = 0x06, 22, 1
         elif VType == TNS_TYPE_RAW:
             Type, MaxSize, Csfrm = TNS_TYPE_RAW, Value.size, 0
+        elif VType in (TNS_TYPE_RID, TNS_TYPE_UROWID):
+            # A ROWID / UROWID Var binds as the rowid's text, as on 10g+
+            # (encode_token_oac). Declared as its own type, 9i answered with a
+            # garbled error and 8i dropped the session (#1399).
+            Type, MaxSize, Csfrm = TNS_TYPE_VARCHAR, _MAX_UROWID_LENGTH, 1
         elif (
             VType == TNS_TYPE_CHAR and Statement and isinstance(Value.getvalue(0), str)
         ):
@@ -10793,6 +10798,10 @@ def _encode_8i_bind_oac(Value: object) -> bytes:
             Charset, Csform, MaxSize = 31, Value.dbtype.csfrm, max(Value.size, 1)
         elif DType == 12:  # DATE
             Charset, Csform, MaxSize = 0, 0, 7
+        elif DType in (TNS_TYPE_RID, TNS_TYPE_UROWID):
+            # The rowid's text, as on 9i and 10g+; declared as its own type the
+            # bind dropped the session (#1399).
+            DType, Charset, Csform, MaxSize = 1, 31, 1, _MAX_UROWID_LENGTH
         else:
             Charset, Csform, MaxSize = 0, 0, max(Value.size, 1)
     elif Value is None:
