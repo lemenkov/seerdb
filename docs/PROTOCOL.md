@@ -5245,9 +5245,10 @@ the fv2 form of the modern `bfile_read_native`:
 All four share the common fv2 LOBOPS shape `03 60 <seq> 01 <sb4 locator-length>
 <op middle> <locator[1:]> <trailer>` (`_encode_o7_lobop`); the locator length is
 computed because BFILE locators vary (CLOB/BLOB are a fixed 86 bytes).
-`_bfile_read_fv2` drives the sequence (closing in a `finally`) and is dispatched
-from `_resolve_fv2_lobs` by data type; the BFILE column resolves to the file
-bytes, like the modern path. This completes the 9i LOB surface (CLOB, BLOB,
+`Fv2Dialect.bfile_read` drives the sequence (closing in a `finally`). The fetch
+leaves the BFILE column a `LOB`, and its `read()` / `aread()` runs the sequence
+through `bfile_read_native`, like the modern path; reading it during the fetch
+made a BFILE naming a missing directory fail the SELECT (#1103). This completes the 9i LOB surface (CLOB, BLOB,
 BFILE) and, with §19.6 / §19.7, the PL/SQL surface (IN, OUT, IN OUT).
 
 ### 19.8 Oracle 8i login — the OSESSKEY-envelope O3LOGON (#244)
@@ -5646,12 +5647,18 @@ extracts it. GETLEN's reply carries the file length as a `ub4-LE` right after th
 echoed locator (`decode_o8i_bfile_getlen`). READ's content is the shared
 `0e fe <chunks> 00` form (`decode_fv2_lob_chunks`), so a large file streams across
 packets and terminates on the zero-length chunk. A missing file surfaces the
-server's `ORA-22285` at FILE_OPEN.
+server's `ORA-22285` at FILE_OPEN, in 8i's own OER: the error is the trailing
+`ORA-` text, as in a DML reply (§19.12), and a 9i OER reader finds nothing there
+(#1103).
+
+The fetch does not read the file: the row hands back the `LOB`, and its
+`read()` / `aread()` runs this sequence, as on 9i (§19.8) and 10g+. Reading at
+fetch time made a BFILE naming a missing directory fail the SELECT (#1103).
 
 Encoders: `encode_o8i_bfile_open` / `encode_o8i_bfile_getlen` /
 `encode_o8i_bfile_close` (+ `encode_8i_lob_read` for the READ), all built on the
-shared `_encode_o8i_lobop` envelope. Driver: `_resolve_8i_lobs` →
-`_bfile_read_8i` (sync + async). This replaced an earlier `DBMS_LOB`
+shared `_encode_o8i_lobop` envelope. Driver: `O8iDialect.bfile_read`, reached
+from `bfile_read_native` (sync + async). This replaced an earlier `DBMS_LOB`
 temp-BLOB helper, removing its `CREATE PROCEDURE` requirement and the stored
 function it left in the user's schema — the same win #46 brought to 10g+/21c.
 

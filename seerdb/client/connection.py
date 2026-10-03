@@ -2535,6 +2535,12 @@ class OracleConnect(_ConnectionLogic):
         ORA-22289 on a second close, ORA-22920 when the row was never locked --
         so those reach the caller as ordinary errors (#964).
         """
+        if self.field_version < FIELD_VERSION_10_2:
+            # This is the 10g+ LOBOPS form, which 8i and 9i do not take; a BFILE
+            # fetched there is a LOB now, so fileexists() reaches here (#1103).
+            from seerdb.common.exceptions import NotSupportedError
+
+            raise NotSupportedError('this LOB operation needs Oracle 10g or later')
         from seerdb.common.tns import decode_lobops_locator, decode_lobops_value
 
         Data = encode_dictionary(
@@ -2562,6 +2568,10 @@ class OracleConnect(_ConnectionLogic):
         # a READ against the original locator returns empty bytes (the symptom
         # that originally blocked native BFILE support). The locator goes on the
         # wire ub2-length-prefixed (locator_prefixed), as for temp LOBs.
+        if self._dialect is not None:
+            # 8i and 9i read a BFILE through their own LOBOPS forms; the fetch
+            # leaves it a locator for this read (#1103).
+            return cast(bytes, self._drive(self._dialect.bfile_read(Locator)))
         from seerdb.common.tns_consts import (
             TNS_LOB_OP_FILE_CLOSE,
             TNS_LOB_OP_FILE_OPEN,

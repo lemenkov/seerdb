@@ -1868,6 +1868,12 @@ class AsyncOracleConnect(_ConnectionLogic):
     ) -> tuple[int | None, bytes | None]:
         """Async port of the sync :meth:`lob_operation` (#964): one
         value-returning TTI_LOBOPS operation, returning its ``ub4``."""
+        if self.field_version < FIELD_VERSION_10_2:
+            # This is the 10g+ LOBOPS form, which 8i and 9i do not take; a BFILE
+            # fetched there is a LOB now, so fileexists() reaches here (#1103).
+            from seerdb.common.exceptions import NotSupportedError
+
+            raise NotSupportedError('this LOB operation needs Oracle 10g or later')
         from seerdb.common.tns import decode_lobops_locator, decode_lobops_value
 
         Data = encode_dictionary(
@@ -1892,6 +1898,10 @@ class AsyncOracleConnect(_ConnectionLogic):
         """Async port of the sync `bfile_read_native` (#46): FILE_OPEN ->
         READ -> FILE_CLOSE over TTI_LOBOPS, using the open-flagged locator the
         server returns from FILE_OPEN."""
+        if self._dialect is not None:
+            # 8i and 9i read a BFILE through their own LOBOPS forms; the fetch
+            # leaves it a locator for this read (#1103).
+            return cast(bytes, await self._drive(self._dialect.bfile_read(Locator)))
         from seerdb.common.tns_consts import (
             TNS_LOB_OP_FILE_CLOSE,
             TNS_LOB_OP_FILE_OPEN,
