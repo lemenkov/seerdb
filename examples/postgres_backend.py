@@ -4311,6 +4311,24 @@ _CALL_BLOCK = re.compile(r'(?is)^\s*BEGIN\s+(.*?)\s*;?\s*END\s*;?\s*$')
 _BARE_CALL = re.compile(
     r'(?is)^\s*BEGIN\s+([\w.$#]+)\s*(?:\(\s*\))?\s*;\s*END\s*;?\s*$'
 )
+
+
+def _single_call_block(sql: str) -> str | None:
+    """The routine a block holding one call with arguments calls,
+    `BEGIN p(...); END;` -- one statement, not an assignment -- or None (#1531)."""
+    inner = _CALL_BLOCK.match(sql)
+    if inner is None:
+        return None
+    statement = inner.group(1)
+    bare = strip_non_bind_text(statement)
+    if ';' in bare or ':=' in bare:
+        return None
+    call = _PROC_CALL.match(statement)
+    if call is None or call.group(1).upper() in _PLSQL_WORD_STATEMENTS:
+        return None
+    return call.group(1)
+
+
 # The PL/SQL statements that are one word, which a lone word in a block may be
 # rather than a procedure's name: `begin null; end;` is a statement (#1404).
 _PLSQL_WORD_STATEMENTS = frozenset(
@@ -4352,6 +4370,44 @@ def _placeholder_slot(slots: dict[int | str, int], key: int | str) -> int:
     return slots[key]
 
 
+@dataclass(frozen=True)
+class _CallLiteral:
+    """An argument a call passes as written -- a literal, an expression -- not
+    through a bind (#1531)."""
+
+    text: str
+
+
+def _call_items(
+    args: str,
+) -> list[tuple[str | None, 'int | str | _CallLiteral']]:
+    """A call's arguments as (parameter name or None, the placeholder's key or
+    the argument's own text), in order: :func:`_call_arguments`, but with the
+    literals and expressions a call may pass among its binds kept (#1531)."""
+    items: list[tuple[str | None, int | str | _CallLiteral]] = []
+    for start, end in _top_level_items(args, 0, len(args)):
+        text = args[start:end].strip()
+        if not text:
+            continue
+        match = _CALL_ARGUMENT.match(text)
+        if match is not None:
+            name = match.group(1)
+            items.append(
+                (name.lower() if name else None, _placeholder_key(match.group(2)))
+            )
+            continue
+        named = _NAMED_ARGUMENT.match(text)
+        value = text[named.end() :].strip() if named else text
+        quoted = _CALL_PLACEHOLDER.fullmatch(value)
+        items.append(
+            (
+                named.group(1).lower() if named else None,
+                _placeholder_ref(quoted) if quoted else _CallLiteral(value),
+            )
+        )
+    return items
+
+
 def _call_arguments(args: str) -> list[tuple[str | None, int | str]] | None:
     """A call's arguments as (parameter name or None, bind number), in order.
 
@@ -4387,9 +4443,17 @@ def _bind_slots(block: str) -> dict[int | str, int]:
     return slots
 
 
-def _call_placeholders(arguments: Sequence[tuple[str | None, int | str]]) -> str:
-    # PostgreSQL takes a call's named notation as Oracle writes it (#1377).
-    return ', '.join(f'{name} => %s' if name else '%s' for name, _ref in arguments)
+def _call_placeholders(
+    arguments: Sequence[tuple[str | None, 'int | str | _CallLiteral']],
+) -> str:
+    # PostgreSQL takes a call's named notation as Oracle writes it (#1377). A
+    # literal argument goes in as written; a bind is a parameter (#1531).
+    def one(ref: int | str | _CallLiteral) -> str:
+        return ref.text.replace('%', '%%') if isinstance(ref, _CallLiteral) else '%s'
+
+    return ', '.join(
+        f'{name} => {one(ref)}' if name else one(ref) for name, ref in arguments
+    )
 
 
 def _call_argument_error(
@@ -5653,6 +5717,15 @@ class PostgresBackend:
             # No binds, so the block would otherwise go to PostgreSQL as it
             # stands; the call path runs it as any other call (#1404).
             return self._execute_plsql(f'BEGIN {bare.group(1)}(); END;', binds)
+        single = None if binds else _single_call_block(sql)
+        if single is not None and self._routine_exists(single):
+            # A call with literal arguments and no binds -- sqlplus's
+            # `DBMS_OUTPUT.ENABLE(NULL)`, a script's put_line('...'). As a DO block
+            # PostgreSQL refuses a bare function call; the call path runs it,
+            # its arguments as written (#1531). Only a routine PostgreSQL has:
+            # RAISE_APPLICATION_ERROR and the like are the block path's to
+            # translate.
+            return self._execute_plsql(sql, binds)
         if binds and is_plsql(sql):
             return self._execute_plsql(sql, binds)
         # A `SELECT REF(alias)` object-REF fetch: PostgreSQL has no REF, so stand in
@@ -7650,11 +7723,12 @@ class PostgresBackend:
         # Which parameter each argument binds: by position, or by name (#1377). A
         # named argument the signature cannot place, or an argument that is not a
         # plain bind, leaves the call positional, as it always was.
-        arguments = _call_arguments(args)
+        # Literals or expressions among the arguments go in as written, where
+        # they used to be dropped and the routine called without them (#1531).
+        arguments: list[tuple[str | None, int | str | _CallLiteral]]
+        arguments = _call_items(args)
         lowered = [p.lower() for p in parameters]
-        if arguments is None or any(
-            n is not None and n not in lowered for n, _ref in arguments
-        ):
+        if any(n is not None and n not in lowered for n, _ref in arguments):
             arguments = [(None, ref) for ref in arg_refs]
         bound = {
             (lowered.index(n) if n is not None else position): ref
@@ -7666,7 +7740,8 @@ class PostgresBackend:
         # and IN OUT arguments pass their value.
         arg_values = [
             None
-            if modes and param < len(modes) and modes[param] == 'o'
+            if isinstance(ref, _CallLiteral)
+            or (modes and param < len(modes) and modes[param] == 'o')
             else values[_placeholder_slot(slots, ref)]
             for param, ref in bound.items()
         ]
@@ -7685,12 +7760,18 @@ class PostgresBackend:
             ]
             cursor.execute(
                 f'SELECT * FROM {name}({_call_placeholders([a for a, _v in given])})',
-                tuple(v for _a, v in given) or None,
+                tuple(v for a, v in given if not isinstance(a[1], _CallLiteral))
+                or None,
             )
         else:
             cursor.execute(
                 f'CALL {name}({_call_placeholders(arguments)})',
-                tuple(arg_values) or None,
+                tuple(
+                    v
+                    for (_n, ref), v in zip(arguments, arg_values)
+                    if not isinstance(ref, _CallLiteral)
+                )
+                or None,
             )
         # A procedure with no OUT or IN OUT parameter returns no row at all.
         returned = self._decode_out_row(
@@ -7703,7 +7784,7 @@ class PostgresBackend:
         outs = [param for param, mode in enumerate(modes or ()) if mode in ('o', 'b')]
         for value, param in zip(returned, outs):
             ref = bound.get(param)
-            if ref is None:
+            if ref is None or isinstance(ref, _CallLiteral):
                 continue
             # An OUT INTERVAL YEAR TO MONTH arrives as an OraInterval (base
             # interval on the wire) — turn it into an IntervalYM by matching the
@@ -7906,6 +7987,17 @@ class PostgresBackend:
         for i, position in enumerate(into):
             out[position] = returned[i] if returned is not None else None
         return Result(out_binds=out)
+
+    def _routine_exists(self, name: str) -> bool:
+        """Whether PostgreSQL has a routine of this name, in the schema the name
+        gives if it gives one."""
+        schema, _dot, routine = name.lower().rpartition('.')
+        row = self._conn.execute(
+            'SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace '
+            "WHERE p.proname = %s AND (%s = '' OR n.nspname = %s) LIMIT 1",
+            (routine, schema, schema),
+        ).fetchone()
+        return row is not None
 
     def _proc_signature(self, name: str) -> tuple[list | None, list, list[str], str]:
         # A routine's parameter modes ('i' IN, 'o' OUT, 'b' IN OUT), the aligned
