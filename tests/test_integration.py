@@ -1713,6 +1713,17 @@ class TypesIntegration(_IntegrationBase):
             self.cur.execute(f'SELECT n FROM {self.TABLE} WHERE rowid = :r', [back])
             self.assertEqual(self.cur.fetchall(), [(4,)], typ)
 
+    def test_a_variable_an_out_bind_filled_binds_back_in(self):
+        # A Var a block filled holds that value: bound into a statement it is
+        # the value, and bound into the block again it is filled afresh. On 8i
+        # it went back in as NULL, so the statement matched nothing (#1505).
+        var = self.cur.var(str)
+        for value in ('abc', 'xyz'):
+            self.cur.execute(f"BEGIN :v := '{value}'; END;", [var])
+            self.assertEqual(var.getvalue(), value)
+        self.cur.execute("SELECT COUNT(*) FROM dual WHERE :v = 'xyz'", [var])
+        self.assertEqual(self.cur.fetchall(), [(1,)])
+
     def test_callproc_of_a_procedure_without_out_parameters(self):
         # A procedure with no arguments, and one with only IN ones, run through
         # callproc like any other. The Mirror over PostgreSQL sent the first to

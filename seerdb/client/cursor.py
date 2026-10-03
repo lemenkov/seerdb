@@ -940,7 +940,11 @@ def _assign_out_binds(Bind, Result, Connection=None) -> list:
         }
         if isinstance(Value, dict) and Value.get('_refcursor'):
             RefCursors.append((Variable, Value))
-        elif isinstance(Value, dict) and Value.get('_array'):
+            continue
+        # The Var now holds a value, so bound again it is an input: 8i decides on
+        # this flag, and sent a Var an OUT bind had filled as NULL (#1505).
+        Variable.has_value = True
+        if isinstance(Value, dict) and Value.get('_array'):
             # Associative-array OUT (#122): decode each element by the Var's
             # type into a Python list.
             Variable._value = [
