@@ -58,6 +58,7 @@ from seerdb.common.tns_consts import (
     TNS_ACCEPT,
     TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE,
     TNS_DATA,
+    TNS_GSO_CAN_RECV_ATTENTION,
     TNS_VERSION_11_2,
     TNS_VERSION_12_1,
     TNS_VERSION_12_2,
@@ -277,6 +278,11 @@ def encode_accept(
     """
     version = negotiated_tns_version(request, tns_version)
     negotiated_sdu = min(request.sdu, sdu)
+    # Every option the client offered is echoed but out-of-band breaks: the
+    # Mirror never reads urgent data, so a client that sent its cancel that way
+    # saw the call run to the end (#1349). Without it the client interrupts
+    # in-band, which the session answers as a real server does (#844).
+    options = request.global_service_options & ~TNS_GSO_CAN_RECV_ATTENTION
     if version >= TNS_VERSION_MIN_LARGE_SDU:
         # The 16-bit SDU/TDU pair is zeroed and the real values move to the ub4
         # fields the client reads at offsets 24 / 28.
@@ -288,7 +294,7 @@ def encode_accept(
             large_body,
             0,
             version,
-            request.global_service_options,
+            options,
             0,
             0,
             _ACCEPT_PROTO_CHARS,
@@ -319,7 +325,7 @@ def encode_accept(
     body = struct.pack(
         '>HHHHHHHH',
         version,
-        request.global_service_options,
+        options,
         negotiated_sdu,
         negotiated_tdu,
         _ACCEPT_PROTO_CHARS,

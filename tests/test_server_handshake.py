@@ -32,6 +32,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_23_4,
     TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE,
     TNS_DATA,
+    TNS_GSO_CAN_RECV_ATTENTION,
     TNS_VERSION_MIN_LARGE_SDU,
     TNS_VERSION_MIN_OOB_CHECK,
     TTI_DTY,
@@ -75,10 +76,31 @@ def test_descriptor_offset_is_honoured_not_assumed() -> None:
     assert b'(PORT=1599)' in req.descriptor
 
 
+def _real_11g_accept_without_oob() -> bytes:
+    # The captured ACCEPT with the one bit the Mirror does not echo: it cannot
+    # receive an out-of-band break, so it does not offer one (#1349).
+    accept = bytearray(fx.ACCEPT)
+    (options,) = struct.unpack_from('>H', accept, 10)
+    struct.pack_into('>H', accept, 10, options & ~TNS_GSO_CAN_RECV_ATTENTION)
+    return bytes(accept)
+
+
 def test_encode_accept_byte_matches_the_real_11g_accept() -> None:
-    # The killer test: our ACCEPT reproduces the captured server packet exactly.
+    # The killer test: our ACCEPT reproduces the captured server packet exactly,
+    # but for the out-of-band bit.
     req = parse_connect(fx.CONNECT[8:])
-    assert encode_accept(req) == fx.ACCEPT
+    assert encode_accept(req) == _real_11g_accept_without_oob()
+
+
+def test_accept_never_offers_out_of_band_breaks() -> None:
+    # The client offers them (0x0c41 has 0x0400) and a real server echoes that,
+    # but the Mirror never reads urgent data: a cancel sent that way was lost and
+    # the call ran to the end (#1349). The rest of the options are echoed.
+    for version in (TNS_VERSION_11_2, TNS_VERSION_23_1):
+        req = replace(parse_connect(fx.CONNECT[8:]), protocol_version=319)
+        accept = encode_accept(req, tns_version=version)
+        (options,) = struct.unpack_from('>H', accept, 10)
+        assert options == 0x0C41 & ~TNS_GSO_CAN_RECV_ATTENTION
 
 
 def test_accept_caps_version_for_a_newer_client() -> None:
@@ -240,9 +262,11 @@ def test_accept_at_12_2_uses_the_large_sdu_layout() -> None:
 
 
 def test_accept_at_11_2_is_unchanged_by_the_large_sdu_path() -> None:
-    # The default is still the byte-exact captured 11g ACCEPT.
+    # The default is still the captured 11g ACCEPT, but for the OOB bit.
     req = parse_connect(fx.CONNECT[8:])
-    assert encode_accept(req, tns_version=TNS_VERSION_11_2) == fx.ACCEPT
+    assert encode_accept(req, tns_version=TNS_VERSION_11_2) == (
+        _real_11g_accept_without_oob()
+    )
 
 
 def test_negotiated_version_takes_the_lower_of_the_two_sides() -> None:
