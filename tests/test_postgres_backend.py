@@ -3900,6 +3900,36 @@ def test_a_collection_of_a_national_type_stays_national() -> None:
         backend.close()
 
 
+def test_a_collection_bound_into_a_select_list_fetches_as_the_collection() -> None:
+    # `SELECT :o FROM dual` with a collection bound described a plain array --
+    # PostgreSQL types a bare placeholder from its value -- and fetched the
+    # array's text (#1541). The bind is cast to its domain, which names the
+    # collection type, as a constructor call's name does (#1473).
+    from seerdb.common.dbobject import ObjectImage
+    from seerdb.common.tns import encode_object_image
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TYPE cb1541 AS VARRAY(5) OF VARCHAR2(10)')
+        backend.commit()
+        pg_oid = backend._conn.execute("SELECT 'cb1541'::regtype::oid").fetchone()[0]
+        typ = backend._collection_type(pg_oid)
+        image = encode_object_image(typ.newobject(['a', 'é']))
+        bind = ObjectImage(typ.oid, typ.schema, typ.name, 0, image)
+        result = backend.execute('SELECT :o v FROM dual', [bind])
+        assert result.columns[0].type_name == b'CB1541'
+        (value,) = result.rows[0]
+        assert value.aslist() == ['a', 'é']
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TYPE cb1541')
+            backend.commit()
+        except Exception:
+            backend.rollback()
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships
