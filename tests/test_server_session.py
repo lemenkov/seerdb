@@ -1652,19 +1652,43 @@ _OCI_GET_LINES_COLLECTION_BIND = bytes.fromhex(
 )
 
 
+def test_the_get_lines_collection_bind_is_read() -> None:
+    # sqlplus binds DBMS_OUTPUT.GET_LINES's lines as DBMSOUTPUT_LINESARRAY: a
+    # collection (109) carrying the type's id, its IN value empty, and the count
+    # as an IN NUMBER (#1411). Both binds are read, the collection's type id
+    # riding on bind_types for the backend.
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, parse_exec_oci
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1, TNS_TYPE_ADT
+
+    token = _DECODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT_1)
+    try:
+        request = parse_exec_oci(_OCI_GET_LINES_COLLECTION_BIND)
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+    assert request.binds == [None, 15]
+    assert request.bind_meta == [(TNS_TYPE_ADT, 2000), (2, 22)]
+    toid = bytes.fromhex('787d0d2b19c46933e0530caae80a12fb')
+    assert [bt[3] for bt in request.bind_types] == [toid, b'']
+
+
 def test_a_statement_whose_binds_are_not_read_is_refused() -> None:
-    # The bind section of a collection bind does not parse here yet. The
-    # statement used to come back with no binds and run without them, so the
-    # client got a status it could not use; it is refused instead, and the
-    # session carries on (#1525).
+    # A bind the section cannot be read for -- here the same collection bind
+    # with an IN value of a form not read yet -- used to come back as no binds,
+    # and the statement ran without them, so the client got a status it could
+    # not use. It is refused instead, and the session carries on (#1525).
     from seerdb.common.exceptions import InterfaceError
     from seerdb.common.tns import _DECODE_FIELD_VERSION, parse_exec_oci
     from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1
 
+    empty_tail = b'\x01' + bytes(12) + b'\x01\x00'
+    assert _OCI_GET_LINES_COLLECTION_BIND.count(empty_tail) == 1
+    unread = _OCI_GET_LINES_COLLECTION_BIND.replace(
+        empty_tail, b'\x02' + empty_tail[1:]
+    )
     token = _DECODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT_1)
     try:
         with pytest.raises(InterfaceError, match='bind'):
-            parse_exec_oci(_OCI_GET_LINES_COLLECTION_BIND)
+            parse_exec_oci(unread)
     finally:
         _DECODE_FIELD_VERSION.reset(token)
 

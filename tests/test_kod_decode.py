@@ -242,3 +242,43 @@ def test_the_12c_band_answers_as_18c_does() -> None:
         )
     finally:
         _ENCODE_FIELD_VERSION.reset(version)
+
+
+def test_a_collection_out_value_goes_back_as_live_servers_send_it() -> None:
+    # DBMS_OUTPUT.GET_LINES's lines come back as the collection's image framed
+    # for OCI, and the count as an ordinary NUMBER; each bind's marker is its
+    # direction, 0x10 OUT and 0x30 IN OUT (#1411). Compared from the markers to
+    # the status tail, which carries live-instance fields of its own.
+    import kod_18c as fx18
+
+    from seerdb.common.dbobject import ObjectImage
+    from seerdb.common.tns import _ENCODE_FIELD_VERSION, encode_out_bind_response_oci
+    from seerdb.common.tns_consts import FIELD_VERSION_11_2, FIELD_VERSION_18_1_EXT_1
+
+    def values_part(reply: bytes) -> bytes:
+        return reply[50 : reply.index(b'\x08\x06', 50)]
+
+    cases = (
+        (FIELD_VERSION_11_2, _LINESARRAY_ID, fx.GET_LINES_REPLY, 1),
+        (FIELD_VERSION_11_2, _LINESARRAY_ID, fx.GET_LINES_EMPTY_REPLY, 0),
+        (
+            FIELD_VERSION_18_1_EXT_1,
+            bytes.fromhex('787d0d2b19c46933e0530caae80a12fb'),
+            fx18.GET_LINES_REPLY,
+            1,
+        ),
+    )
+    for version, toid, want, count in cases:
+        at = want.index(b'\x88\x01')
+        image = want[at : at + want[at + 2]]
+        token = _ENCODE_FIELD_VERSION.set(version)
+        try:
+            got = encode_out_bind_response_oci(
+                [ObjectImage(toid, 'SYS', 'DBMSOUTPUT_LINESARRAY', 0, image), count],
+                sequence=1,
+                types=[(109, toid), (2, b'')],
+                inputs=[False, True],
+            )
+        finally:
+            _ENCODE_FIELD_VERSION.reset(token)
+        assert values_part(got) == values_part(want), hex(version)
