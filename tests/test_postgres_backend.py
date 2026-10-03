@@ -3757,6 +3757,86 @@ def test_the_type_shape_of_xmltype_is_oracles() -> None:
         backend.close()
 
 
+def test_an_xmltype_attribute_or_element_has_23ais_tds() -> None:
+    # An XMLType attribute or element is a reference to SYS.XMLTYPE's opaque
+    # descriptor: `1b <block> 3a` and the block 23ai carries, where an object's
+    # reference ends fa and a collection's fb (#1537). Both measured on 23ai.
+    from postgres_backend import (
+        _TDS_XMLTYPE,
+        _tds,
+        _tds_chars,
+        _tds_number,
+        _TdsCollection,
+        _TdsObject,
+    )
+
+    obj = _TdsObject((_tds_number(), _TDS_XMLTYPE, _tds_chars(7, 60, False)))
+    assert _tds(obj) == bytes.fromhex(
+        '0000003626010001000300290000000000270600811b000000223a07003c0100002afd'
+        '0000000d010000000700000000000000090007000a0010'
+    )
+    table = _TdsCollection(varray=False, bound=0, element=_TDS_XMLTYPE)
+    assert _tds(table) == bytes.fromhex(
+        '00000033260100010001ff290000000000281c0000001d00000000022a1b000000233afd'
+        '0000000d010000000700000000000000090007'
+    )
+
+
+def test_an_object_with_an_xmltype_attribute_fetches() -> None:
+    # An object with an XMLType attribute -- python-oracledb's
+    # udt_ObjectWithXmlType -- was refused as having no Oracle attribute type
+    # (#1537). It fetches with the document in the attribute, which describes
+    # as SYS.XMLTYPE.
+    from postgres_backend import _XMLTYPE_OID
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE TYPE xa1537 AS OBJECT '
+            '(NumberValue NUMBER, XMLValue sys.xmltype, StringValue VARCHAR2(60))'
+        )
+        backend.commit()
+        result = backend.execute(
+            "SELECT xa1537(1, sys.xmltype('<item>one</item>'), 'abc') FROM dual"
+        )
+        (obj,) = result.rows[0]
+        assert obj.XMLVALUE == '<item>one</item>'
+        assert (obj.NUMBERVALUE, obj.STRINGVALUE) == (1, 'abc')
+        pg_oid = backend._conn.execute("SELECT 'xa1537'::regtype::oid").fetchone()[0]
+        rows = backend._attribute_rows(pg_oid)
+        assert (rows[1][3], rows[1][4], rows[1][6]) == ('XMLTYPE', 'SYS', _XMLTYPE_OID)
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TYPE xa1537')
+            backend.commit()
+        except Exception:
+            backend.rollback()
+        backend.close()
+
+
+def test_a_table_of_xmltype_names_sys_xmltype_its_element() -> None:
+    # The dictionary names an XMLType element SYS.XMLTYPE, as Oracle does;
+    # it said "None"."XML", which a client then failed to describe (#1537).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TYPE xt1537 AS TABLE OF sys.xmltype')
+        backend.commit()
+        result = backend.execute(
+            'SELECT elem_type_owner, elem_type_name FROM all_coll_types '
+            "WHERE type_name = 'XT1537'"
+        )
+        assert result.rows == [('SYS', 'XMLTYPE')]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TYPE xt1537')
+            backend.commit()
+        except Exception:
+            backend.rollback()
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships
