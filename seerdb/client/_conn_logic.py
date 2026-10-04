@@ -115,6 +115,8 @@ class _ConnectionLogic:
 
         def _send_break(self) -> None: ...
 
+        def _arm_break_deadline(self) -> None: ...
+
     # --- Ping (#1095) -------------------------------------------------------
 
     @staticmethod
@@ -533,9 +535,12 @@ class _ConnectionLogic:
         return all(Op.op_type in WireOps for Op in pipeline.operations)
 
     def _on_call_timeout(self) -> None:
-        # call_timeout timer callback: flag the timeout and break the call.
+        # call_timeout timer callback: flag the timeout and break the call. A
+        # server that does not answer the break within call_timeout again has
+        # the connection dropped, as python-oracledb drops it (#1570).
         self._timed_out = True
         self._send_break()
+        self._arm_break_deadline()
 
     # --- Statement cache / call-timeout / cancel ---------------------------
 

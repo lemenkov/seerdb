@@ -182,6 +182,15 @@ def _is_described(typ: 'DbObjectType | None') -> bool:
     return typ is not None and bool(typ.attrs or typ.is_collection)
 
 
+def _abandoned_call_message(call_timeout: int) -> str:
+    # The error a call ends with when the server leaves a call timeout's break
+    # unanswered, as python-oracledb words its DPY-4011 (#1570).
+    return (
+        'the database or network closed the connection: the server did not '
+        f'answer the break within {call_timeout} ms of the call timeout'
+    )
+
+
 def _format_version(Packed: int) -> str | None:
     # Oracle packs the release into a single integer: major (8 bits),
     # minor (4), update (8), patch (4), port-specific update (8). Verified
@@ -924,6 +933,12 @@ class OracleConnect(_ConnectionLogic):
         self._break_in_progress = False
         self._call_timeout = 0  # ms; 0 = no timeout
         self._timed_out = False
+        # After a call timeout's break, the deadline for the server's answer,
+        # whether the call is still reading its reply, and whether the deadline
+        # passed with it unanswered (#1570).
+        self._break_deadline: threading.Timer | None = None
+        self._call_in_progress = False
+        self._call_abandoned = False
         self._supports_oob = False  # set from the accept (#144)
         self._supports_eor = False  # end-of-response framing (#155/#132)
         self._large_packets = False  # 4-byte packet length (#155, ver >= 315)
@@ -1842,14 +1857,22 @@ class OracleConnect(_ConnectionLogic):
             Timer = threading.Timer(self._call_timeout / 1000.0, self._on_call_timeout)
             Timer.start()
         try:
+            self._call_in_progress = True
             # Seed the decoder with the bind list so the IOV decoder can tell a
             # REF CURSOR OUT bind from a scalar one.
             Result = self._handle_response((None, None, [], Bind))
+            self._call_in_progress = False
         except Exception as exc:
+            self._call_in_progress = False
             # If reusing a cached cursor blew up, drop it from the cache
             # so the next attempt re-parses from scratch.
             if CachedCursor and CacheKey is not None:
                 self._cursor_cache.pop(CacheKey, None)
+            if self._call_abandoned:
+                self.disconnect()
+                raise OperationalError(
+                    _abandoned_call_message(self._call_timeout)
+                ) from exc
             if self._timed_out:
                 raise OperationalError(
                     f'call timeout of {self._call_timeout} ms exceeded (ORA-03136)'
@@ -1858,8 +1881,12 @@ class OracleConnect(_ConnectionLogic):
         finally:
             if Timer is not None:
                 Timer.cancel()
+            if self._break_deadline is not None:
+                self._break_deadline.cancel()
+                self._break_deadline = None
             self._break_in_progress = False
             self._timed_out = False
+            self._call_abandoned = False
         # A cached cursor whose execute failed is gone on the server side: a
         # later re-execute of the same id answers ORA-01001 for the rest of the
         # connection, whatever the values (#709). Forget it, so the next execute
@@ -3604,6 +3631,27 @@ class OracleConnect(_ConnectionLogic):
                 self._in_break = True
             # else: drain the server's terminal reset (and any straggler
             # markers) silently — do NOT reply, or the server replies again.
+
+    def _arm_break_deadline(self) -> None:
+        # The call timeout's break is out: give the server call_timeout again to
+        # answer it (#1570).
+        self._break_deadline = threading.Timer(
+            self._call_timeout / 1000.0, self._abandon_call
+        )
+        self._break_deadline.daemon = True
+        self._break_deadline.start()
+
+    def _abandon_call(self) -> None:
+        # The server left the break unanswered: shut the socket, so the read
+        # blocked on the reply fails, and the call ends with the connection
+        # closed rather than waiting on the server for ever (#1570).
+        if not self._call_in_progress or self.sock is None:
+            return
+        self._call_abandoned = True
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
     def disconnect(self) -> None:
         if self.sock:

@@ -144,6 +144,53 @@ def test_the_connect_timeout_does_not_bound_a_call() -> None:
         listen.close()
 
 
+def test_an_unanswered_call_timeout_break_drops_the_connection() -> None:
+    # call_timeout breaks a call; a server that does not answer the break
+    # within call_timeout again -- this Mirror, busy in the backend for 1.5 s --
+    # gets the connection dropped, as python-oracledb drops it, rather than the
+    # call waiting for the server to finish (#1570). Sync and async alike.
+    listen, server = _start_slow_mirror()
+    try:
+        conn = seerdb.connect(
+            host='127.0.0.1',
+            port=listen.getsockname()[1],
+            user='PYO',
+            password='pyo123',
+            service_name='XE',
+        )
+        conn.call_timeout = 300
+        started = time.monotonic()
+        with pytest.raises(seerdb.OperationalError, match='did not answer the break'):
+            conn.cursor().execute('select 1 as slow')
+        assert time.monotonic() - started < 1.2
+        with pytest.raises(seerdb.Error):
+            conn.cursor().execute('select 1')
+    finally:
+        server.join(timeout=10)
+        listen.close()
+
+    async def run(port: int) -> float:
+        aconn = await seerdb.connect_async(
+            host='127.0.0.1',
+            port=port,
+            user='PYO',
+            password='pyo123',
+            service_name='XE',
+        )
+        aconn.call_timeout = 300
+        started = time.monotonic()
+        with pytest.raises(seerdb.OperationalError, match='did not answer the break'):
+            await aconn.cursor().execute('select 1 as slow')
+        return time.monotonic() - started
+
+    listen, server = _start_slow_mirror()
+    try:
+        assert asyncio.run(run(listen.getsockname()[1])) < 1.2
+    finally:
+        server.join(timeout=10)
+        listen.close()
+
+
 def _serve_recording_stream(listen: socket.socket, result: dict) -> None:
     """Serve one session, keeping the server's PacketStream for inspection."""
     conn, _ = listen.accept()
