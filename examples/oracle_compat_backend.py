@@ -40,7 +40,9 @@ from seerdb.server import (
 
 # Oracle's one-row ``DUAL`` table has no equal on a plain backend, but a bare
 # ``SELECT <expr>`` (no FROM) is the same thing there — so drop a trailing
-# ``FROM DUAL`` before delegating. Only the exact idiom, nothing cleverer.
+# ``FROM DUAL`` before delegating. Only the exact idiom, nothing cleverer. A
+# backend that has a DUAL of its own says so with ``has_dual = True`` and gets
+# the statement as sent (#1561).
 _FROM_DUAL = re.compile(r'\s+FROM\s+DUAL\s*$', re.IGNORECASE)
 
 # The sqlplus ``VARIABLE v NUMBER`` / ``EXEC :v := 42`` flow sends a PL/SQL block
@@ -218,7 +220,7 @@ class OracleCompatBackend:
             # sqlplus's compatibility probe — DECODE('A','A','1','2') is '1'.
             return Result(columns=[_varchar(b'DECODE', 1)], rows=[('1',)])
         # A bare `SELECT <expr> FROM DUAL` maps to `SELECT <expr>` on the backend.
-        if _FROM_DUAL.search(sql):
+        if _FROM_DUAL.search(sql) and not getattr(self._inner, 'has_dual', False):
             return self._inner.execute(_FROM_DUAL.sub('', sql.strip()), binds)
         # Every other statement is a real one — the inner backend runs it (and,
         # being dialect-specific, translates Oracle SQL to its own dialect there).

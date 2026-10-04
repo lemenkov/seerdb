@@ -5773,6 +5773,10 @@ class PostgresBackend:
     # 12.1 whichever we advertise, so 12.1 has to work regardless.
     field_version = FIELD_VERSION_12_1
     server_identity = IDENTITY_12_1
+    # This backend has Oracle's DUAL (orafce's, and sys.dual), so the compat
+    # wrapper hands it `... FROM DUAL` as the client sent it: the translation
+    # report then sees the application's own text (#1561).
+    has_dual = True
 
     def __init__(
         self,
