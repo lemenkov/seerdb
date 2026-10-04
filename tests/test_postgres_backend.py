@@ -713,6 +713,74 @@ def test_a_ref_survives_update_and_vacuum_full() -> None:
         backend.close()
 
 
+def test_a_name_postgresql_reserves_is_quoted() -> None:
+    # A name PostgreSQL reserves and Oracle does not is quoted, lower case
+    # (#1595): where declared or listed for an INSERT, after a dot, and bare where
+    # what follows shows a name. Oracle's own words and PostgreSQL's keywords in
+    # their places are left be.
+    from postgres_backend import _quote_reserved_names as quote
+
+    assert quote(
+        'CREATE TABLE i (inner NUMBER, end NUMBER, primary NUMBER, '
+        'CONSTRAINT pk PRIMARY KEY (inner))'
+    ) == (
+        'CREATE TABLE i ("inner" NUMBER, "end" NUMBER, "primary" NUMBER, '
+        'CONSTRAINT pk PRIMARY KEY ("inner"))'
+    )
+    assert quote('CREATE TYPE o AS OBJECT (window NUMBER, analyse NUMBER)') == (
+        'CREATE TYPE o AS OBJECT ("window" NUMBER, "analyse" NUMBER)'
+    )
+    assert quote('INSERT INTO i (inner, end) VALUES (1, :limit)') == (
+        'INSERT INTO i ("inner", "end") VALUES (1, :limit)'
+    )
+    assert quote('SELECT inner, x.end FROM i x WHERE limit = 1 ORDER BY window') == (
+        'SELECT "inner", x."end" FROM i x WHERE "limit" = 1 ORDER BY "window"'
+    )
+    for sql in (
+        'SELECT a.x FROM a LEFT OUTER JOIN b ON a.k = b.k NATURAL JOIN c',
+        'SELECT x FROM t ORDER BY x OFFSET 5 ROWS FETCH FIRST 3 ROWS ONLY',
+        'BEGIN FETCH c BULK COLLECT INTO v LIMIT l_batch; END;',
+        "SELECT CASE WHEN n > 1 THEN 'inner' END, CURRENT_DATE FROM dual",
+        'ANALYZE TABLE t COMPUTE STATISTICS',
+    ):
+        assert quote(sql) == sql
+
+
+def test_a_column_named_as_postgresql_reserves_round_trips() -> None:
+    # A table and an object type whose names PostgreSQL reserves, created,
+    # written, updated and read as 23ai does (#1595).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE TABLE i1595 (inner NUMBER, window VARCHAR2(5), limit NUMBER, '
+            'end NUMBER)'
+        )
+        backend.execute(
+            "INSERT INTO i1595 (inner, window, limit, end) VALUES (1, 'w', 2, 3)"
+        )
+        backend.execute('UPDATE i1595 SET limit = limit + 1 WHERE inner = 1')
+        result = backend.execute(
+            'SELECT inner, window, limit, x.end FROM i1595 x ORDER BY window'
+        )
+        assert [column.name for column in result.columns] == [
+            b'INNER',
+            b'WINDOW',
+            b'LIMIT',
+            b'END',
+        ]
+        assert [tuple(row) for row in result.rows] == [(1, 'w', 3, 3)]
+        backend.execute('CREATE TYPE oi1595 AS OBJECT (inner NUMBER, window NUMBER)')
+        (row,) = backend.execute('SELECT oi1595(1, 2) FROM dual').rows
+        assert (row[0].INNER, row[0].WINDOW) == (1, 2)
+    finally:
+        backend.rollback()
+        for statement in ('DROP TABLE i1595', 'DROP TYPE oi1595'):
+            try:
+                backend.execute(statement)
+            except Exception:
+                backend.rollback()
+
+
 def test_ref_select_matches_the_object_ref_fetch() -> None:
     # `SELECT REF(alias) FROM table alias [rest]` is recognised so the backend can
     # stand in the ctid + report the object type; the alias inside REF() must match
