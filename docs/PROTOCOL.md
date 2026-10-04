@@ -6387,8 +6387,10 @@ block gets this catastrophically wrong in a way that is hard to read from a
 capture, because **nothing is sent**: rule 1 says the client writes no value for
 a return bind, so the server keeps waiting for bind bytes that never arrive, the
 client keeps waiting for a reply, and the connection sits dead until one side's
-read timeout fires (seerdb#826 — 15 s, reported as a network read timeout rather
-than anything naming the real cause). Both ends of seerdb share one classifier
+read timeout fires (seerdb#826 — then 15 s, reported as a network read timeout
+rather than anything naming the real cause; since seerdb#1568 the client's
+connect timeout bounds only connecting, so a call is bounded by `call_timeout`
+alone, as in python-oracledb). Both ends of seerdb share one classifier
 (`returning_bind_positions`), so the same misreading appeared symmetrically: the
 client hung on its own request, and the Mirror routed an inbound block into its
 DML-RETURNING path.

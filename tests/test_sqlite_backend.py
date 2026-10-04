@@ -9,11 +9,13 @@ database — with DDL, DML and a typed SELECT, no Oracle and no Postgres in sigh
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import socket
 import sqlite3
 import sys
 import threading
+import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -61,6 +63,85 @@ def _start_mirror(
     )
     server.start()
     return listen, server, result
+
+
+class _SlowSqliteBackend(SqliteBackend):
+    """Takes 1.5 s over any statement naming `slow`: a long call."""
+
+    def execute(self, sql: str, binds: Any = ()) -> Any:
+        if 'slow' in sql:
+            time.sleep(1.5)
+        return super().execute(sql, binds)
+
+
+def _serve_slow(listen: socket.socket, result: dict) -> None:
+    conn, _ = listen.accept()
+    try:
+        result['user'] = serve_session(
+            PacketStream(conn), _SlowSqliteBackend(':memory:', credentials=_CREDS)
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced to the test thread
+        result['error'] = exc
+    finally:
+        conn.close()
+
+
+def _start_slow_mirror() -> tuple[socket.socket, threading.Thread]:
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    server = threading.Thread(target=_serve_slow, args=(listen, {}), daemon=True)
+    server.start()
+    return listen, server
+
+
+def test_the_connect_timeout_does_not_bound_a_call() -> None:
+    # The connection timeout bounds connecting, not a call after it: a server
+    # that takes longer to answer than the timeout -- a long query -- is not a
+    # stall. It failed as a "connection timeout" (#1568). Sync and async alike.
+    listen, server = _start_slow_mirror()
+    try:
+        conn = seerdb.connect(
+            host='127.0.0.1',
+            port=listen.getsockname()[1],
+            user='PYO',
+            password='pyo123',
+            service_name='XE',
+            timeout=500,
+        )
+        try:
+            cur = conn.cursor()
+            cur.execute('select 1 as slow')
+            assert cur.fetchall() == [(1,)]
+        finally:
+            conn.close()
+    finally:
+        server.join(timeout=10)
+        listen.close()
+
+    async def run(port: int) -> list:
+        aconn = await seerdb.connect_async(
+            host='127.0.0.1',
+            port=port,
+            user='PYO',
+            password='pyo123',
+            service_name='XE',
+            timeout=500,
+        )
+        try:
+            acur = aconn.cursor()
+            await acur.execute('select 1 as slow')
+            return await acur.fetchall()
+        finally:
+            await aconn.close()
+
+    listen, server = _start_slow_mirror()
+    try:
+        assert asyncio.run(run(listen.getsockname()[1])) == [(1,)]
+    finally:
+        server.join(timeout=10)
+        listen.close()
 
 
 def _serve_recording_stream(listen: socket.socket, result: dict) -> None:

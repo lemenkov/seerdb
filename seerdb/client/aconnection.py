@@ -215,6 +215,9 @@ class AsyncOracleConnect(_ConnectionLogic):
         self.socket_options = socket_options
         self.conn_state = CONN_STATE_DISCONNECTED
         self.timeout = timeout
+        # Whether connect() is running, the only time `timeout` bounds a read
+        # (#1568).
+        self._connecting = False
         self.autocommit = autocommit
         self.fetch = fetch
         self.role = role
@@ -383,6 +386,16 @@ class AsyncOracleConnect(_ConnectionLogic):
     async def connect(self) -> bool:
         """Open the TCP (optionally TLS) connection and run the
         TNS / TTC / O5LOGON handshake."""
+        # The timeout bounds the reads of connecting only, as the sync twin's
+        # does (#1568).
+        self._connecting = True
+        try:
+            await self._connect_and_login()
+        finally:
+            self._connecting = False
+        return True
+
+    async def _connect_and_login(self) -> None:
         self._redirects = 0
         await self._open_transport()
         try:
@@ -397,11 +410,10 @@ class AsyncOracleConnect(_ConnectionLogic):
             # negotiation. Mirror of OracleConnect.connect.
             if self._used_nego_cache:
                 await self._retry_without_negotiation_cache()
-                return True
+                return
             raise
         if result not in (0, None) and self._used_nego_cache:
             await self._retry_without_negotiation_cache()
-        return True
 
     async def _retry_without_negotiation_cache(self) -> None:
         from seerdb.client.connection import _nego_cache_del
@@ -511,7 +523,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                     continue
                 break
             try:
-                if self.timeout:
+                if self.timeout and self._connecting:
                     NetworkData = await asyncio.wait_for(
                         self._rd.read(self.sdu), self.timeout / 1000
                     )

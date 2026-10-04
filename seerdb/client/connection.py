@@ -979,13 +979,12 @@ class OracleConnect(_ConnectionLogic):
         self.send(TNS_DATA, encode_dictionary_token_auth(Dict))
 
     def _apply_socket_timeout(self) -> None:
-        # Bound every blocking socket operation (connect / send / recv) by the
-        # connection `timeout` (milliseconds). Without this the param was dead
-        # and a server that went quiet — e.g. an XE session held by the
-        # logon-storm throttle — wedged `recv` forever. A timeout of 0 / None
-        # keeps the historical fully-blocking behaviour. The bound is per
-        # socket operation, not per query: healthy data keeps each recv short,
-        # so it only fires on a genuine stall.
+        # Bound every blocking socket operation (connect / send / recv) while
+        # connecting by the connection `timeout` (milliseconds). Without this the
+        # param was dead and a server that went quiet -- e.g. an XE session held
+        # by the logon-storm throttle -- wedged `recv` forever. A timeout of 0 /
+        # None keeps the historical fully-blocking behaviour. connect() lifts it
+        # once logged in (#1568).
         if self.sock is not None:
             self.sock.settimeout(self.timeout / 1000 if self.timeout else None)
 
@@ -1028,6 +1027,17 @@ class OracleConnect(_ConnectionLogic):
         self.send(TNS_CONNECT, Data)
 
     def connect(self) -> bool:
+        self._connect_and_login()
+        # The timeout bounds connecting -- the TCP connect, the handshake, the
+        # login -- and no call after it, as python-oracledb's connect timeout
+        # does: a server takes as long as a query does to answer it, and a
+        # 15-second default failed every longer call as a "connection timeout"
+        # (#1568). call_timeout is what bounds a call.
+        if self.sock is not None:
+            self.sock.settimeout(None)
+        return True
+
+    def _connect_and_login(self) -> None:
         self._redirects = 0
         self._open_transport()
         try:
@@ -1046,13 +1056,12 @@ class OracleConnect(_ConnectionLogic):
             # changed). Invalidate and retry once with a full negotiation (#438).
             if self._used_nego_cache:
                 self._retry_without_negotiation_cache()
-                return True
+                return
             raise
         if result not in (0, None) and self._used_nego_cache:
             # handle_login reported a peer close on the cached path — same stale
             # -cache signal, without an exception.
             self._retry_without_negotiation_cache()
-        return True
 
     def _retry_without_negotiation_cache(self) -> None:
         # Invalidate the stale entry, reset the per-connection handshake state to
