@@ -31,6 +31,21 @@ literal / clause shapes (a negative ``INTERVAL``, the ``1.5f`` suffix, ``CONNECT
 LEVEL``) — none of which is a call that could resolve to a function — remain regex
 rewrites.
 
+**Native PostgreSQL SQL.** An application moving to PostgreSQL can send its own
+PostgreSQL over the same Oracle connection, a statement at a time, and keep the
+rest Oracle (#1556). A statement carrying the Oracle hint ``/*+ PG */`` -- at its
+start or right after its first keyword, where a real Oracle reads hints and ignores
+one it does not know -- runs untranslated. ``ALTER SESSION SET seerdb_dialect =
+'postgres'`` makes every statement native, until ``= 'oracle'`` switches back.
+Binds stay Oracle's (``:name``, ``:1``), each statement keeps its savepoint, and
+DDL still commits. What does not change is the client: an Oracle client reads
+``::type`` as a bind named ``:type`` and refuses the statement before it is sent,
+so a cast is written ``CAST(x AS type)``. It treats a statement as a query only by
+its first keyword (``SELECT`` / ``WITH``), so ``VALUES`` and ``TABLE`` return no
+rows, and ``RETURNING`` returns them only through ``INTO`` binds. A result of a
+type with no Oracle form (``jsonb``, ``json``, ``uuid``, arrays, ranges) is refused
+by name.
+
 **Oracle-only ceiling.** A handful of Oracle features a real server offers cannot
 be represented faithfully behind an 11.2 Mirror on PostgreSQL. Where the 11.2 suite
 has a version guard, the backend rejects the feature so the test *skips* exactly as
@@ -5376,6 +5391,23 @@ def _column_meta(desc, values: list, tstz_oid: int | None = None) -> ColumnMeta:
 _LEADING_COMMENTS = re.compile(r'\A(?:\s+|--[^\n]*(?:\n|\Z)|/\*.*?\*/)+', re.DOTALL)
 
 
+# Native PostgreSQL SQL over the Oracle connection (#1556), for an application
+# moving to PostgreSQL a statement at a time: such a statement skips the
+# Oracle-to-PostgreSQL translation and runs as written. Per statement, an
+# Oracle hint naming PG -- `/*+ PG */` -- at its start or right after its first
+# keyword, where Oracle reads hints and a real Oracle ignores one it does not
+# know. Per session, ALTER SESSION SET seerdb_dialect = 'postgres' | 'oracle'.
+_ALTER_SESSION_DIALECT = re.compile(
+    r"\s*ALTER\s+SESSION\s+SET\s+SEERDB_DIALECT\s*=\s*'?(POSTGRES|ORACLE)'?\s*;?\s*$",
+    re.IGNORECASE,
+)
+_PG_HINT = re.compile(
+    r'(?:\s|--[^\n]*(?:\n|$)|/\*(?!\+)(?:[^*]|\*(?!/))*\*/)*(?:[A-Za-z]+\s*)?'
+    r'/\*\+[^*]*\bPG\b',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
 def _strip_leading_comments(sql: str) -> str:
     return _LEADING_COMMENTS.sub('', sql, count=1)
 
@@ -5642,6 +5674,9 @@ class PostgresBackend:
         # Whether the client has taken a SAVEPOINT in the open transaction, which
         # a transaction that has written nothing must keep for it (#1190).
         self._user_savepoint = False
+        # The SQL dialect a statement with no PG hint is in (#1556): 'oracle',
+        # translated, or 'postgres', run as written.
+        self._sql_dialect = 'oracle'
         # The Oracle object type each PostgreSQL composite oid stands for, with
         # its registered psycopg CompositeInfo -- or None for an oid that is not
         # an object type, so a column of it is looked up once (#1127).
@@ -6030,14 +6065,19 @@ class PostgresBackend:
         session as it was. DDL, PL/SQL and transaction control have no EXPLAIN
         and keep the bare success they had.
         """
+        native = self._is_native(sql)
         sql = _strip_leading_comments(sql)
         _refuse_reserved_bind_names(sql)
         if is_plsql(sql) or _NOT_EXPLAINABLE.match(sql):
             return
-        translated = _translate_idioms(
-            _translate_plsql_block(
-                _translate_routine_ddl(
-                    _translate_ddl(_translate_admin(strip_returning_into(sql)))
+        translated = (
+            sql
+            if native
+            else _translate_idioms(
+                _translate_plsql_block(
+                    _translate_routine_ddl(
+                        _translate_ddl(_translate_admin(strip_returning_into(sql)))
+                    )
                 )
             )
         )
@@ -6088,6 +6128,11 @@ class PostgresBackend:
         # Mirror's OUT-bind flow); run it via CALL / SELECT and return the OUT
         # values (#503). An ordinary statement's BindVar is a typed NULL, which
         # _translate_binds casts (#699).
+        switch = _ALTER_SESSION_DIALECT.match(sql)
+        if switch is not None:
+            self._sql_dialect = switch.group(1).lower()
+            return Result()
+        native = self._is_native(sql)
         sql = _strip_leading_comments(sql)
         _refuse_reserved_bind_names(sql)
         transaction_control = self._execute_transaction_control(sql)
@@ -6096,6 +6141,8 @@ class PostgresBackend:
         kill = _KILL_SESSION.match(sql)
         if kill is not None:
             return self._kill_session(kill.group(1))
+        if native:
+            return self._execute_native(sql, binds)
         bare = _BARE_CALL.match(sql)
         if bare is not None and bare.group(1).upper() not in _PLSQL_WORD_STATEMENTS:
             # No binds, so the block would otherwise go to PostgreSQL as it
@@ -6208,6 +6255,31 @@ class PostgresBackend:
                 rowcount=len(touched), last_rowid=touched[-1] if touched else None
             )
         if result.columns and not is_ddl:
+            self._release_read_locks()
+        return result
+
+    def _is_native(self, sql: str) -> bool:
+        # Whether a statement is PostgreSQL's own, to run untranslated (#1556).
+        return self._sql_dialect == 'postgres' or _PG_HINT.match(sql) is not None
+
+    def _execute_native(self, sql: str, binds: Sequence) -> Result:
+        # A native PostgreSQL statement (#1556): none of the Oracle translation,
+        # but the Oracle binds mapped, the statement-level savepoint and DDL's
+        # autocommit, which the client on the other end still expects.
+        is_ddl = _IS_DDL.match(sql) is not None
+        params: dict | None = None
+        if binds:
+            binds = self._resolve_object_binds(binds)
+            (sql, params) = _translate_binds(sql, binds)
+        if self._use_pipeline and not is_ddl:
+            result = self._execute_pipelined(sql, params, sql)
+        else:
+            result = self._execute_sequential(sql, params, sql)
+        if is_ddl:
+            self._conn.commit()
+            self._user_savepoint = False
+            self._collection_name_cache = None
+        elif result.columns:
             self._release_read_locks()
         return result
 
@@ -7824,14 +7896,20 @@ class PostgresBackend:
         # 500 rows against a remote database. Returns the total affected-row count.
         # The Mirror calls this only for the non-batcherrors path, where a per-row
         # failure aborts the whole batch — exactly Oracle's non-batcherrors DML.
-        sql = self._expand_visible_columns(_strip_leading_comments(sql))
+        native = self._is_native(sql)
+        if not native:
+            sql = self._expand_visible_columns(_strip_leading_comments(sql))
         rows = list(rows)
         if not rows:
             return 0
-        translated = _translate_idioms(
-            _translate_plsql_block(_translate_routine_ddl(_translate_ddl(sql)))
+        translated = (
+            sql
+            if native
+            else _translate_idioms(
+                _translate_plsql_block(_translate_routine_ddl(_translate_ddl(sql)))
+            )
         )
-        with_rowid = self._returning_rowid(sql, translated)
+        with_rowid = None if native else self._returning_rowid(sql, translated)
         if with_rowid is not None:
             translated = with_rowid
         bound_sql, _ = _translate_binds(translated, rows[0])
@@ -7925,8 +8003,12 @@ class PostgresBackend:
         rows = list(rows)
         if not rows:
             return 0, []
-        translated = _translate_idioms(
-            _translate_plsql_block(_translate_routine_ddl(_translate_ddl(sql)))
+        translated = (
+            sql
+            if self._is_native(sql)
+            else _translate_idioms(
+                _translate_plsql_block(_translate_routine_ddl(_translate_ddl(sql)))
+            )
         )
         bound_sql, _ = _translate_binds(translated, rows[0])
         cursor = self._conn.cursor()
