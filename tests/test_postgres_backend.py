@@ -1840,9 +1840,11 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
         'power',
     ):
         assert f'FUNCTION {name}(' in _HELPER_FUNCTIONS_DDL
-    # 47, and ora_div (#1361) and power (#1362) for each of the nine pairs of
-    # integer types.
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 65
+    # 47, ora_div (#1361) and power (#1362) for each of the nine pairs of
+    # integer types, and sys.ora_to_raw's two overloads (#1496).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 67
+    assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
+    assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
     # type a caller passes.
     for name in (
@@ -4450,6 +4452,40 @@ def test_tab_columns_list_char_used_and_the_declared_length() -> None:
             backend.execute('DROP TABLE cu1451')
         except Exception:
             backend.rollback()
+        backend.close()
+
+
+def test_a_character_value_headed_for_raw_is_hex() -> None:
+    # Oracle converts a character value headed for a RAW column or attribute
+    # as HEXTORAW does; bytea read its text's own bytes (#1496). An INSERT's
+    # VALUES, with a column list or without, an UPDATE's SET, an object
+    # constructor's arguments, literal or bound, and executemany; a bytes value
+    # is itself. The rows are 23ai's.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE hx1496 (id NUMBER, r RAW(16), s VARCHAR2(20))')
+        backend.execute('CREATE TYPE hxo1496 AS OBJECT (n NUMBER, r RAW(8))')
+        backend.execute("INSERT INTO hx1496 VALUES (1, '52617720', '41')")
+        backend.execute("INSERT INTO hx1496 (s, r, id) VALUES ('b', :1, 2)", ['4142'])
+        backend.execute("INSERT INTO hx1496 VALUES (3, :r, 'c')", [b'Raw '])
+        backend.execute_many("INSERT INTO hx1496 VALUES (:1, :2, 'd')", [(4, 'FF')])
+        backend.execute("UPDATE hx1496 SET r = '00FF', s = 'u' WHERE id = 1")
+        result = backend.execute('SELECT id, r, s FROM hx1496 ORDER BY id')
+        assert [tuple(row) for row in result.rows] == [
+            (1, b'\x00\xff', 'u'),
+            (2, b'AB', 'b'),
+            (3, b'Raw ', 'c'),
+            (4, b'\xff', 'd'),
+        ]
+        (row,) = backend.execute("SELECT hxo1496(1, '52617720') FROM dual").rows
+        assert row[0].R == b'Raw '
+    finally:
+        backend.rollback()
+        for statement in ('DROP TABLE hx1496', 'DROP TYPE hxo1496'):
+            try:
+                backend.execute(statement)
+            except Exception:
+                backend.rollback()
         backend.close()
 
 

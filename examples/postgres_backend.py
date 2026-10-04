@@ -358,6 +358,14 @@ _HELPER_FUNCTIONS_DDL = (
     # HEXTORAW('DEADBEEF') → the RAW/bytea value of a hex string.
     'CREATE OR REPLACE FUNCTION hextoraw(text) RETURNS bytea '
     "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT decode($1, 'hex') $$;"
+    # A value headed for a RAW column or attribute, as Oracle converts it: a
+    # character value is hex, as HEXTORAW reads it; a RAW one is itself (#1496).
+    # PostgreSQL picks the overload by the value's type -- a string literal or a
+    # str bind the text one, a bytes bind the bytea one.
+    'CREATE OR REPLACE FUNCTION sys.ora_to_raw(text) RETURNS bytea '
+    "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT decode($1, 'hex') $$;"
+    'CREATE OR REPLACE FUNCTION sys.ora_to_raw(bytea) RETURNS bytea '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
     # RAWTOHEX(x) → the hex text of a bytea. Oracle returns upper-case hex.
     'CREATE OR REPLACE FUNCTION rawtohex(bytea) RETURNS text '
     "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT upper(encode($1, 'hex')) $$;"
@@ -3995,6 +4003,26 @@ _ROW_GENERATOR = re.compile(
 )
 
 
+# The statements whose values may be headed for a RAW target (#1496), read on
+# the text _mask_quoted leaves: INSERT INTO t [(cols)] VALUES (...), UPDATE t SET.
+_INSERT_VALUES_HEAD = re.compile(
+    rf'\s*INSERT\s+INTO\s+{_TABLE_NAME}\s*(?:\(([^()]*)\))?\s*VALUES\s*\(',
+    re.IGNORECASE,
+)
+_UPDATE_SET_HEAD = re.compile(
+    rf'\s*UPDATE\s+{_TABLE_NAME}(?:\s+(?!SET\b)[\w$#]+)?\s+SET\b', re.IGNORECASE
+)
+# A value Oracle converts to RAW as hex: a string literal (as masked) or a bind.
+_RAW_TARGET_VALUE = re.compile(r'\s*(?:[Nn]?\'\x00\d+\x00\'|:(?:\w+|"[^"]+"))\s*')
+_CALL_HEAD = re.compile(r'(?<![\w$#."])([A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)?)\s*\(')
+
+
+def _pg_identifier(name: str) -> str:
+    # A column name as PostgreSQL stores it: quoted as written, else lower case.
+    name = name.strip()
+    return name[1:-1] if name.startswith('"') else name.lower()
+
+
 def _translate_row_generator(sql: str) -> str:
     """The row generator as generate_series (#531, #1558). Its ROWNUM numbers
     the rows as LEVEL does, so ROWNUM there is the `level` column too; `< n` is
@@ -6187,6 +6215,12 @@ class PostgresBackend:
         self._has_collection_elements = bool(row and row[0])
         self._column_type_cache: dict[tuple[int, int], tuple | None] = {}
         self._collection_name_cache: frozenset[str] | None = None
+        # RAW targets (#1496): whether any column or attribute is a recorded
+        # RAW, each relation's column order and RAW positions, and each object
+        # type's RAW attribute positions, by name; any DDL starts them over.
+        self._has_raw_targets_cache: bool | None = None
+        self._raw_layout_cache: dict[str, tuple[list[str], frozenset[int]] | None] = {}
+        self._raw_constructor_cache: dict[str, frozenset[int]] | None = None
         self._any_invisible: bool | None = None
         self._visible_cache: dict[str, list[str] | None] = {}
         self._conn.commit()
@@ -6538,6 +6572,7 @@ class PostgresBackend:
             self._record_visibility(visibility)
             return Result()
         sql = _ruled('invisible-columns', self._expand_visible_columns(sql), sql)
+        sql = _ruled('hex-to-raw', self._to_raw_targets(sql), sql)
         # Oracle auto-commits DDL — decide from the original statement, before the
         # dialect rewrite reshapes it (#532).
         is_ddl = _IS_DDL.match(sql) is not None
@@ -6601,6 +6636,7 @@ class PostgresBackend:
             self._record_visibility(visibility)
             self._record_column_types(original)
             self._collection_name_cache = None  # a type may have come or gone
+            self._forget_raw_targets()
         if with_rowid is not None:
             # The rows are the rowids of the rows touched, not a result set: a
             # DML still answers with a count, and the last one is its rowid.
@@ -6633,6 +6669,7 @@ class PostgresBackend:
             self._conn.commit()
             self._user_savepoint = False
             self._collection_name_cache = None
+            self._forget_raw_targets()
         elif result.columns:
             self._release_read_locks()
         return result
@@ -6817,6 +6854,134 @@ class PostgresBackend:
         if pk is None:
             return sql
         return _ROWID_WORD.sub(_urowid_expression(pk), sql)
+
+    def _forget_raw_targets(self) -> None:
+        self._has_raw_targets_cache = None
+        self._raw_layout_cache = {}
+        self._raw_constructor_cache = None
+
+    def _has_raw_targets(self) -> bool:
+        if self._has_raw_targets_cache is None:
+            row = self._conn.execute(
+                "SELECT EXISTS (SELECT 1 FROM sys.ora_columns WHERE data_type = 'RAW')"
+            ).fetchone()
+            self._has_raw_targets_cache = bool(row and row[0])
+        return self._has_raw_targets_cache
+
+    def _raw_layout(self, name: str) -> tuple[list[str], frozenset[int]] | None:
+        # A relation's columns, in order, and which of them are RAW (#1496).
+        key = name.lower()
+        if key not in self._raw_layout_cache:
+            rows = self._conn.execute(
+                "SELECT a.attname, coalesce(o.data_type = 'RAW', false) "
+                'FROM pg_attribute a LEFT JOIN sys.ora_columns o '
+                'ON o.relid = a.attrelid AND o.attnum = a.attnum '
+                'WHERE a.attrelid = to_regclass(%s) AND a.attnum > 0 '
+                f"AND NOT a.attisdropped AND a.attname <> '{_OBJECT_ID_COLUMN}' "
+                'ORDER BY a.attnum',
+                (name,),
+            ).fetchall()
+            self._raw_layout_cache[key] = (
+                ([r[0] for r in rows], frozenset(i for i, r in enumerate(rows) if r[1]))
+                if rows
+                else None
+            )
+        return self._raw_layout_cache[key]
+
+    def _raw_constructors(self) -> dict[str, frozenset[int]]:
+        # The object types with a RAW attribute, by name and qualified name,
+        # lower case, to the positions of their RAW attributes (#1496).
+        if self._raw_constructor_cache is None:
+            rows = self._conn.execute(
+                'SELECT lower(c.relname), lower(n.nspname), array_agg(x.pos - 1) '
+                'FROM (SELECT attrelid, attnum, row_number() OVER '
+                '(PARTITION BY attrelid ORDER BY attnum) AS pos FROM pg_attribute '
+                'WHERE attnum > 0 AND NOT attisdropped) x '
+                'JOIN sys.ora_columns o ON o.relid = x.attrelid '
+                "AND o.attnum = x.attnum AND o.data_type = 'RAW' "
+                "JOIN pg_class c ON c.oid = x.attrelid AND c.relkind = 'c' "
+                'JOIN pg_namespace n ON n.oid = c.relnamespace GROUP BY 1, 2'
+            ).fetchall()
+            self._raw_constructor_cache = {
+                key: frozenset(positions)
+                for typname, schema, positions in rows
+                for key in (typname, f'{schema}.{typname}')
+            }
+        return self._raw_constructor_cache
+
+    def _to_raw_targets(self, sql: str) -> str:
+        """Wrap each string literal or bind headed for a RAW column or attribute
+        in sys.ora_to_raw, which takes a character value as hex, as Oracle
+        converts one implicitly (#1496): an INSERT's VALUES, an UPDATE's SET, an
+        object constructor's arguments. PostgreSQL's bytea would read the text's
+        own bytes instead. A bytes value passes through unchanged."""
+        if not self._has_column_catalog or not self._has_raw_targets():
+            return sql
+        (masked, contents) = _mask_quoted(sql)
+        spans: list[tuple[int, int]] = []
+        insert = _INSERT_VALUES_HEAD.match(masked)
+        if insert is not None:
+            layout = self._raw_layout(_unmask_quoted(insert.group(1), contents))
+            if layout is not None and layout[1]:
+                (names, raw) = layout
+                positions: set[int] | frozenset[int] = raw
+                if insert.group(2) is not None:
+                    listed = [
+                        _pg_identifier(_unmask_quoted(c, contents))
+                        for c in insert.group(2).split(',')
+                    ]
+                    positions = {
+                        i
+                        for i, column in enumerate(listed)
+                        if column in names and names.index(column) in raw
+                    }
+                open_at = insert.end() - 1
+                items = _top_level_items(
+                    masked, open_at + 1, _matching_paren(masked, open_at)
+                )
+                spans += [items[i] for i in positions if i < len(items)]
+        update = _UPDATE_SET_HEAD.match(masked)
+        if update is not None:
+            layout = self._raw_layout(_unmask_quoted(update.group(1), contents))
+            if layout is not None and layout[1]:
+                (names, raw) = layout
+                words, _rownums = _top_level_words(masked)
+                end = next(
+                    (
+                        pos
+                        for pos, word in words
+                        if pos > update.end() and word in ('WHERE', 'RETURNING')
+                    ),
+                    len(masked.rstrip().rstrip(';')),
+                )
+                for start, stop in _top_level_items(masked, update.end(), end):
+                    equals = masked.find('=', start, stop)
+                    if equals < 0:
+                        continue
+                    column = _pg_identifier(
+                        _unmask_quoted(masked[start:equals], contents)
+                    )
+                    if column in names and names.index(column) in raw:
+                        spans.append((equals + 1, stop))
+        constructors = self._raw_constructors()
+        if constructors:
+            for call in _CALL_HEAD.finditer(masked):
+                positions = constructors.get(call.group(1).lower(), frozenset())
+                if not positions:
+                    continue
+                open_at = call.end() - 1
+                items = _top_level_items(
+                    masked, open_at + 1, _matching_paren(masked, open_at)
+                )
+                spans += [items[i] for i in positions if i < len(items)]
+        spans = [
+            (a, b) for (a, b) in set(spans) if _RAW_TARGET_VALUE.fullmatch(masked[a:b])
+        ]
+        if not spans:
+            return sql
+        for a, b in sorted(spans, reverse=True):
+            masked = f'{masked[:a]} sys.ora_to_raw({masked[a:b].strip()}){masked[b:]}'
+        return _unmask_quoted(masked, contents)
 
     def _collection_names(self) -> frozenset[str]:
         # The collection types (array domains) of the user schemas, by name and
@@ -8267,7 +8432,9 @@ class PostgresBackend:
         # failure aborts the whole batch — exactly Oracle's non-batcherrors DML.
         native = self._is_native(sql)
         if not native:
-            sql = self._expand_visible_columns(_strip_leading_comments(sql))
+            sql = self._to_raw_targets(
+                self._expand_visible_columns(_strip_leading_comments(sql))
+            )
         rows = list(rows)
         if not rows:
             return 0
@@ -8371,7 +8538,11 @@ class PostgresBackend:
         rows = list(rows)
         if not rows:
             return 0, []
-        translated = sql if self._is_native(sql) else _translated_batch(sql)
+        translated = (
+            sql
+            if self._is_native(sql)
+            else _translated_batch(self._to_raw_targets(sql))
+        )
         bound_sql, _ = _translate_binds(translated, rows[0])
         cursor = self._conn.cursor()
         counts: list[int] = []
