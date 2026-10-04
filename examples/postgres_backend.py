@@ -3049,6 +3049,49 @@ def _object_constructor(name: str) -> str:
     )
 
 
+# What each argument of DBMS_PICKLER.GET_TYPE_SHAPE is, in order (#1542).
+_TYPE_SHAPE_ROLES: Final = (
+    'full_name',
+    'oid',
+    'version',
+    'tds',
+    'instantiable',
+    'supertype_owner',
+    'supertype_name',
+    'attrs_rc',
+    'subtype_rc',
+)
+_TYPE_SHAPE_CALL = re.compile(
+    r'(?:(:\w+|:"[^"]+")\s*:=\s*)?\bdbms_pickler\s*\.\s*get_type_shape\s*\(',
+    re.IGNORECASE,
+)
+
+
+def _type_shape_roles(sql: str) -> tuple[dict[str, str], str | None]:
+    # Each bind of a GET_TYPE_SHAPE call by the argument it is (#1542): the
+    # call's return target is ret_val, its arguments the roles above, in order;
+    # and the type's name when the call gives it as a literal.
+    call = _TYPE_SHAPE_CALL.search(sql)
+    if call is None:
+        return ({}, None)
+    roles: dict[str, str] = {}
+    if call.group(1):
+        roles[call.group(1)[1:].strip('"').lower()] = 'ret_val'
+    open_at = call.end() - 1
+    literal: str | None = None
+    for position, (start, end) in enumerate(
+        _top_level_items(sql, open_at + 1, _matching_paren(sql, open_at))
+    ):
+        argument = sql[start:end].strip()
+        if position >= len(_TYPE_SHAPE_ROLES):
+            break
+        if argument.startswith(':'):
+            roles[argument[1:].strip('"').lower()] = _TYPE_SHAPE_ROLES[position]
+        elif position == 0 and argument.startswith("'") and argument.endswith("'"):
+            literal = argument[1:-1].replace("''", "'")
+    return (roles, literal)
+
+
 def _translate_ddl(sql: str) -> str:
     """Rewrite an Oracle ``CREATE TABLE`` / object ``CREATE TYPE`` to PostgreSQL:
     map the column/attribute types and drop the clauses PostgreSQL has no equal
@@ -8015,22 +8058,37 @@ class PostgresBackend:
         return rows
 
     def _execute_type_shape(self, sql: str, binds: Sequence) -> Result:
-        """python-oracledb's type-metadata block (#1134), answered whole: the
-        type's return code, OID, version, TDS, attribute cursor, and its own
-        schema and name."""
+        """A block calling DBMS_PICKLER.GET_TYPE_SHAPE (#1134), answered whole:
+        the type's return code, OID, version, TDS, attribute cursor, and -- in
+        python-oracledb's own block -- its schema and name.
+
+        A bind takes the answer for the argument it is in the call -- the
+        full name first, the attribute cursor eighth -- or for the call's return
+        value it is assigned; a bind outside the call by its name, as
+        python-oracledb's :schema / :name / :package_name are (#1542).
+        """
         names = [name.lower() for (name, _q) in bind_placeholders(sql, dedupe=True)]
         values: dict[str, object] = {n: b.value for (n, b) in zip(names, binds)}
-        full_name = str(values.get('full_name') or '')
+        (roles, literal_name) = _type_shape_roles(sql)
+        by_role = {roles.get(n, n): v for n, v in values.items()}
+        full_name = str(by_role.get('full_name') or literal_name or '')
         attrs_rc = CursorResult(columns=list(_ATTRIBUTE_CURSOR_COLUMNS), rows=[])
         answer: dict[str, object] = {
             'ret_val': _TYPE_SHAPE_NOT_FOUND,
             'oid': None,
-            'version': None,
+            # A type not found reads version 0, as 23ai answers (#1542).
+            'version': 0,
             'tds': None,
             'attrs_rc': attrs_rc,
             'package_name': None,
             'schema': None,
             'name': None,
+            'instantiable': 'YES',
+            'supertype_owner': None,
+            'supertype_name': None,
+            'subtype_rc': CursorResult(
+                columns=list(_ATTRIBUTE_CURSOR_COLUMNS), rows=[]
+            ),
         }
         row_type = full_name.upper().endswith('%ROWTYPE')
         (schema, _dot, name) = full_name.rpartition('.')
@@ -8079,7 +8137,9 @@ class PostgresBackend:
                 answer['full_name'] = f'{owner}.{name.strip(chr(34))}%ROWTYPE'
             if isinstance(shape, _TdsObject):
                 attrs_rc.rows.extend(self._attribute_rows(pg_oid))
-        return Result(out_binds=[answer.get(n, values.get(n)) for n in names])
+        return Result(
+            out_binds=[answer.get(roles.get(n, n), values.get(n)) for n in names]
+        )
 
     def _object_type(self, pg_oid: int) -> tuple[DbObjectType, CompositeInfo] | None:
         """The Oracle object type a PostgreSQL composite oid stands for (#1127).

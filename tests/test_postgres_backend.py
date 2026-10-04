@@ -4578,6 +4578,70 @@ def test_a_dictionary_from_a_newer_seerdb_is_replaced() -> None:
         raw.close()
 
 
+def test_a_type_shape_block_is_answered_by_argument_position() -> None:
+    # A GET_TYPE_SHAPE block answers each bind for the argument it is in the
+    # call, or the call's return value -- not by python-oracledb's bind names,
+    # which a hand-written block need not use (#1542). The TDS is 23ai's.
+    from types import SimpleNamespace
+
+    from postgres_backend import _tds, _type_shape_roles
+
+    block = (
+        'declare i varchar2(3); o varchar2(128); m varchar2(128); s sys_refcursor; '
+        'begin :r := dbms_pickler.get_type_shape(:nm, :oid, :ver, :tds, i, o, m, '
+        ':rc, s); end;'
+    )
+    assert _type_shape_roles(block) == (
+        {
+            'r': 'ret_val',
+            'nm': 'full_name',
+            'oid': 'oid',
+            'ver': 'version',
+            'tds': 'tds',
+            'rc': 'attrs_rc',
+        },
+        None,
+    )
+    assert (
+        _type_shape_roles(
+            "begin :x := dbms_pickler.get_type_shape('T', :o, :v, :t, a, b, c, d, e); end;"
+        )[1]
+        == 'T'
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TYPE ts1542 AS OBJECT (n NUMBER(5), v VARCHAR2(10))')
+        backend.commit()
+        binds = [
+            SimpleNamespace(value=v) for v in (None, 'TS1542', None, None, None, None)
+        ]
+        (ret, _name, oid, version, tds, cursor) = backend.execute(
+            block, binds
+        ).out_binds
+        assert (ret, version) == (0, 1) and len(oid) == 16
+        pg_oid = backend._conn.execute("SELECT 'ts1542'::regtype::oid").fetchone()[0]
+        assert tds == _tds(backend._type_shape(pg_oid))
+        assert [(row[1], row[3]) for row in cursor.rows] == [
+            ('N', 'NUMBER'),
+            ('V', 'VARCHAR2'),
+        ]
+        missing = [
+            SimpleNamespace(value=v) for v in (None, 'NOSUCH', None, None, None, None)
+        ]
+        (ret, _name, oid, version, tds, _cursor) = backend.execute(
+            block, missing
+        ).out_binds
+        assert (ret, oid, version, tds) == (1001, None, 0, None)
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TYPE ts1542')
+            backend.commit()
+        except Exception:
+            backend.rollback()
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships
