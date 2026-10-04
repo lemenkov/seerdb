@@ -2229,6 +2229,27 @@ def test_a_quoted_lower_case_column_keeps_its_name() -> None:
         # A computed column has no table behind it and keeps the rule.
         result = creator.execute('SELECT 1 AS "lower_alias" FROM dual')
         assert [c.name for c in result.columns] == [b'LOWER_ALIAS']
+        # The dictionary names them so too, a constraint's and an index's
+        # columns as well (#1599).
+        creator.execute(
+            'ALTER TABLE pyo_quoted_names ADD CONSTRAINT pyo_qn_uk '
+            'UNIQUE ("all_lowercase_quoted")'
+        )
+        creator.execute('CREATE INDEX pyo_qn_ix ON pyo_quoted_names ("MixedCase")')
+        result = creator.execute(
+            'SELECT column_name FROM user_tab_columns '
+            "WHERE table_name = 'PYO_QUOTED_NAMES' ORDER BY column_id"
+        )
+        assert [row[0].encode() for row in result.rows] == expected
+        for view in ('all_cons_columns', 'all_ind_columns'):
+            result = creator.execute(
+                f"SELECT column_name FROM {view} WHERE table_name = 'PYO_QUOTED_NAMES'"
+            )
+            assert sorted(row[0] for row in result.rows) == (
+                ['all_lowercase_quoted']
+                if view == 'all_cons_columns'
+                else ['MixedCase', 'all_lowercase_quoted']
+            )
     finally:
         creator.execute('DROP TABLE pyo_quoted_names')
         creator.close()

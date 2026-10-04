@@ -1078,10 +1078,25 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE TABLE IF NOT EXISTS sys.ora_tstz_precision ('
     'relid oid NOT NULL, attnum smallint NOT NULL, prec smallint NOT NULL, '
     'PRIMARY KEY (relid, attnum));'
+    # The columns created with a quoted all-lower-case name (#1204). PostgreSQL
+    # stores "abc" exactly as it stores an unquoted abc, which Oracle would have
+    # folded to ABC, so the difference has to be kept here. Keyed by PostgreSQL's
+    # own column identity; rows of dropped tables are pruned on the next write.
+    'CREATE TABLE IF NOT EXISTS sys.ora_quoted_names ('
+    'relid oid NOT NULL, attnum smallint NOT NULL, PRIMARY KEY (relid, attnum));'
+    # A column's name as the dictionary lists it: a quoted all-lower-case one as
+    # written, any other as ora_name folds it (#1599).
+    'CREATE OR REPLACE FUNCTION sys.ora_column_name(oid, text) RETURNS text '
+    'LANGUAGE sql STABLE AS $$ SELECT CASE WHEN EXISTS (SELECT 1 FROM '
+    'sys.ora_quoted_names q JOIN pg_attribute a ON a.attrelid = q.relid '
+    'AND a.attnum = q.attnum WHERE q.relid = $1 AND a.attname = $2) THEN $2 '
+    'ELSE sys.ora_name($2) END $$;'
     'CREATE OR REPLACE VIEW sys.all_tab_cols AS SELECT '
     "CASE WHEN c.table_schema LIKE 'pg_temp%' THEN upper(current_schema()) "
     'ELSE upper(c.table_schema) END AS owner, '
-    'ora_name(c.table_name) AS table_name, ora_name(c.column_name) AS column_name, '
+    'ora_name(c.table_name) AS table_name, ora_column_name((quote_ident('
+    "c.table_schema) || '.' || quote_ident(c.table_name))::regclass, "
+    'c.column_name) AS column_name, '
     # An INVISIBLE column has no COLUMN_ID, and the visible ones are numbered
     # without it, as Oracle numbers them (#1195). The type stays the one the
     # view always had: CREATE OR REPLACE VIEW cannot change a column's type.
@@ -1182,7 +1197,8 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE OR REPLACE VIEW sys.user_tab_columns AS SELECT * FROM all_tab_cols '
     'WHERE owner=upper(current_schema());'
     'CREATE OR REPLACE VIEW sys.all_col_comments AS SELECT ora_owner(n.nspname) AS owner, '
-    'ora_name(c.relname) AS table_name, ora_name(a.attname) AS column_name, '
+    'ora_name(c.relname) AS table_name, '
+    'ora_column_name(a.attrelid, a.attname) AS column_name, '
     'col_description(c.oid, a.attnum) AS comments '
     'FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace '
     'JOIN pg_attribute a ON a.attrelid=c.oid '
@@ -1233,7 +1249,7 @@ _ORACLE_DICTIONARY_DDL = (
     # (pg_attribute.attidentity 'a'=ALWAYS, 'd'=BY DEFAULT). The dialect JOINs this
     # on every get_columns once it believes the server is 12c, so it must exist or
     # reflection raises ORA-00942. Options are reported as Oracle's defaults for now.
-    """CREATE OR REPLACE VIEW sys.all_tab_identity_cols AS SELECT ora_owner(n.nspname) AS owner, ora_name(c.relname) AS table_name, ora_name(a.attname) AS column_name, CASE a.attidentity WHEN 'a' THEN 'ALWAYS' ELSE 'BY DEFAULT' END AS generation_type, ora_name(c.relname || '_' || a.attname || '_seq') AS sequence_name, 'START WITH: 1, INCREMENT BY: 1, MAX_VALUE: 9999999999999999999999999999, MIN_VALUE: 1, CYCLE_FLAG: N, CACHE_SIZE: 20, ORDER_FLAG: N' AS identity_options FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE a.attidentity IN ('a','d') AND NOT a.attisdropped AND a.attnum>0 AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"""
+    """CREATE OR REPLACE VIEW sys.all_tab_identity_cols AS SELECT ora_owner(n.nspname) AS owner, ora_name(c.relname) AS table_name, ora_column_name(a.attrelid, a.attname) AS column_name, CASE a.attidentity WHEN 'a' THEN 'ALWAYS' ELSE 'BY DEFAULT' END AS generation_type, ora_name(c.relname || '_' || a.attname || '_seq') AS sequence_name, 'START WITH: 1, INCREMENT BY: 1, MAX_VALUE: 9999999999999999999999999999, MIN_VALUE: 1, CYCLE_FLAG: N, CACHE_SIZE: 20, ORDER_FLAG: N' AS identity_options FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE a.attidentity IN ('a','d') AND NOT a.attisdropped AND a.attnum>0 AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"""
     'CREATE OR REPLACE VIEW sys.all_objects AS SELECT '
     "CASE WHEN n.nspname LIKE 'pg_temp%' THEN upper(current_schema()) "
     'ELSE upper(n.nspname) END AS owner, '
@@ -1264,7 +1280,9 @@ _ORACLE_DICTIONARY_DDL = (
     "WHERE tc.constraint_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
     'CREATE OR REPLACE VIEW sys.all_cons_columns AS SELECT ora_owner(kcu.constraint_schema) '
     'AS owner, ora_name(kcu.constraint_name) AS constraint_name, '
-    'ora_name(kcu.table_name) AS table_name, ora_name(kcu.column_name) AS column_name, '
+    'ora_name(kcu.table_name) AS table_name, ora_column_name((quote_ident('
+    "kcu.table_schema) || '.' || quote_ident(kcu.table_name))::regclass, "
+    'kcu.column_name) AS column_name, '
     'kcu.ordinal_position AS position '
     'FROM information_schema.key_column_usage kcu '
     "WHERE kcu.constraint_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
@@ -1283,7 +1301,8 @@ _ORACLE_DICTIONARY_DDL = (
     "WHERE n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
     'CREATE OR REPLACE VIEW sys.all_ind_columns AS SELECT ora_owner(n.nspname) AS index_owner, '
     'ora_name(ic.relname) AS index_name, ora_owner(tn.nspname) AS table_owner, '
-    'ora_name(tc.relname) AS table_name, ora_name(a.attname) AS column_name, '
+    'ora_name(tc.relname) AS table_name, '
+    'ora_column_name(a.attrelid, a.attname) AS column_name, '
     "k.n AS column_position, CASE WHEN (k.opt & 1) = 1 THEN 'DESC' ELSE 'ASC' END AS descend "
     'FROM pg_index ix JOIN pg_class ic ON ic.oid=ix.indexrelid '
     'JOIN pg_namespace n ON n.oid=ic.relnamespace '
@@ -1300,7 +1319,8 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE OR REPLACE VIEW sys.all_ind_expressions AS SELECT '
     'ora_owner(n.nspname) AS index_owner, ora_name(ic.relname) AS index_name, '
     'ora_owner(tn.nspname) AS table_owner, ora_name(tc.relname) AS table_name, '
-    "'\"' || ora_name(a.attname) || '\"' AS column_expression, k.n AS column_position "
+    "'\"' || ora_column_name(a.attrelid, a.attname) || '\"' AS column_expression, "
+    'k.n AS column_position '
     'FROM pg_index ix JOIN pg_class ic ON ic.oid=ix.indexrelid '
     'JOIN pg_namespace n ON n.oid=ic.relnamespace '
     'JOIN pg_class tc ON tc.oid=ix.indrelid '
@@ -1310,12 +1330,6 @@ _ORACLE_DICTIONARY_DDL = (
     'JOIN pg_attribute a ON a.attrelid=tc.oid AND a.attnum=k.attnum '
     'WHERE (k.opt & 1) = 1 '
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
-    # The columns created with a quoted all-lower-case name (#1204). PostgreSQL
-    # stores "abc" exactly as it stores an unquoted abc, which Oracle would have
-    # folded to ABC, so the difference has to be kept here. Keyed by PostgreSQL's
-    # own column identity; rows of dropped tables are pruned on the next write.
-    'CREATE TABLE IF NOT EXISTS sys.ora_quoted_names ('
-    'relid oid NOT NULL, attnum smallint NOT NULL, PRIMARY KEY (relid, attnum));'
     # v$session / v$session_connect_info (#1212): the sessions of this database,
     # a SID being the backend's pid (as the login reply names it) and the
     # identity columns the ones the client declared.
