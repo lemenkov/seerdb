@@ -4942,16 +4942,18 @@ def test_an_unsized_number_is_recorded_without_a_precision() -> None:
 
 def test_a_literal_select_item_is_cast_to_its_char_length() -> None:
     # A select item that is one string literal is CHAR(n) in Oracle (#1494): in
-    # a query, a subquery and a cursor a block opens. An empty literal (NULL),
-    # an expression, a comparison and a set operation's branches are left as
-    # they are.
+    # a query, a subquery and a cursor a block opens. So is a concatenation of
+    # literals alone, n their lengths together, '' (NULL) none (#1587). An
+    # empty literal, an expression with anything else in it, a comparison and
+    # a set operation's branches are left as they are.
     out = _translate_idioms(
-        "SELECT 'X' s, 'it''s' AS b, '' e, 'a' || 'b' c, "
-        "(SELECT 'z' FROM dual) q FROM t WHERE c = 'lit'"
+        "SELECT 'X' s, 'it''s' AS b, '' e, 'a' || 'b' c, 'ab' || '' d, "
+        "'a' || n f, (SELECT 'z' FROM dual) q FROM t WHERE c = 'lit'"
     )
     assert out == (
         "SELECT CAST('X' AS char(1)) s, CAST('it''s' AS char(4)) AS b, '' e, "
-        "'a' || 'b' c, (SELECT CAST('z' AS char(1)) FROM dual) q FROM t "
+        "CAST(('a' || 'b') AS char(2)) c, CAST(('ab' || '') AS char(2)) d, "
+        "'a' || n f, (SELECT CAST('z' AS char(1)) FROM dual) q FROM t "
         "WHERE c = 'lit'"
     )
     assert _translate_idioms("BEGIN OPEN :c FOR SELECT 'X' v FROM dual; END;") == (
