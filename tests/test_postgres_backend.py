@@ -456,6 +456,11 @@ def test_a_national_cast_is_found_in_the_select_list() -> None:
         _computed_national_columns("SELECT CAST(a AS NVARCHAR2(5)) || 'x' FROM t") == {}
     )
     assert _computed_national_columns('SELECT * FROM t') == {}
+    # A national literal is NCHAR of its length, as 23ai describes it (#1586);
+    # a plain literal is not national, nor is one inside an expression.
+    assert _computed_national_columns(
+        "SELECT n'xyz', 'abc', N'it''s' AS q, N'a' || 'b' FROM dual"
+    ) == {0: 3, 2: 4}
 
 
 def test_a_one_element_constructor_is_spelt_as_a_call() -> None:

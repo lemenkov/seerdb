@@ -3919,6 +3919,8 @@ _CAST_BIND_ITEM = re.compile(r'%\(\w+\)s::([\w."$#]+)')
 # CAST(<expr> AS NVARCHAR2(n) | NCHAR[(n)]): the national target the translation
 # turns into varchar(n) / char(n) (#1440).
 _CAST_ITEM = re.compile(r'CAST\s*\(', re.IGNORECASE)
+# A select item that is one national string literal, N'...', and its alias.
+_NATIONAL_LITERAL_ITEM = re.compile(r"[Nn]'((?:[^']|'')*)'(.*)", re.DOTALL)
 _NATIONAL_CAST_TARGET = re.compile(
     r'\bAS\s+(?:NVARCHAR2\s*\(\s*(\d+)|NCHAR\b(?!\s+VARYING)\s*(?:\(\s*(\d+))?)'
     r'[^()]*\)?\s*\Z',
@@ -3928,7 +3930,8 @@ _NATIONAL_CAST_TARGET = re.compile(
 
 def _computed_national_columns(sql: str) -> dict[int, int]:
     """The select-list positions of an Oracle query that CAST a value to
-    NVARCHAR2(n) or NCHAR(n), each with its n (#1440).
+    NVARCHAR2(n) or NCHAR(n), each with its n (#1440), or that are a national
+    literal N'...', NCHAR of its length (#1586).
 
     The translation makes the target varchar(n) / char(n), so the column comes
     back as the database character set's; Oracle describes the national type, n
@@ -3944,6 +3947,11 @@ def _computed_national_columns(sql: str) -> dict[int, int]:
         return {}  # the positions are the expanded columns', not the items'
     found = {}
     for index, item in enumerate(items):
+        national = _NATIONAL_LITERAL_ITEM.fullmatch(item)
+        if national is not None and _ITEM_ALIAS.fullmatch(national.group(2).strip()):
+            if national.group(1):
+                found[index] = len(national.group(1).replace("''", "'"))
+            continue
         cast = _CAST_ITEM.match(item)
         if cast is None:
             continue
