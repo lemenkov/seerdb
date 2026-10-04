@@ -1524,6 +1524,12 @@ _ORACLE_DICTIONARY_DDL = (
 _DICTIONARY_STAMP = (
     'seerdb dictionary ' + hashlib.sha256(_ORACLE_DICTIONARY_DDL.encode()).hexdigest()
 )
+# The views the dictionary script defines, in the order it creates them (#1571).
+_DICTIONARY_VIEWS: Final = tuple(
+    dict.fromkeys(
+        re.findall(r'CREATE OR REPLACE VIEW (sys\.\w+)', _ORACLE_DICTIONARY_DDL)
+    )
+)
 
 # The PostgreSQL `interval` OID (pg_type.oid) — the base type ora_intervalym is a
 # domain over, so both YEAR TO MONTH and DAY TO SECOND columns report it on the
@@ -6263,7 +6269,21 @@ class PostgresBackend:
         if row is not None and row[0] == _DICTIONARY_STAMP:
             return
         self._conn.execute("SET LOCAL lock_timeout = '2s'")
-        self._conn.execute(_ORACLE_DICTIONARY_DDL)
+        try:
+            with self._conn.transaction():
+                self._conn.execute(_ORACLE_DICTIONARY_DDL)
+        except psycopg.errors.InvalidTableDefinition:
+            # A dictionary from another seerdb -- a newer one, rolled back from,
+            # or a branch's -- has a view CREATE OR REPLACE VIEW cannot turn into
+            # this one: a column this one does not define, or a column's type
+            # changed. It failed every connection for good (#1571). The views go
+            # and come back, in the same transaction, so a failure here leaves
+            # the old ones as they were. A view of the user's own built on one of
+            # them goes with it: CASCADE is the only way past the dependency.
+            self._conn.execute(
+                f'DROP VIEW IF EXISTS {", ".join(_DICTIONARY_VIEWS)} CASCADE'
+            )
+            self._conn.execute(_ORACLE_DICTIONARY_DDL)
         self._conn.execute(f"COMMENT ON SCHEMA sys IS '{_DICTIONARY_STAMP}'")
 
     def set_client_identity(self, identity: dict[str, str]) -> None:

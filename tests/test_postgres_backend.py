@@ -4546,6 +4546,38 @@ def test_an_application_context_reads_back_from_sys_context() -> None:
         backend.close()
 
 
+def test_a_dictionary_from_a_newer_seerdb_is_replaced() -> None:
+    # A dictionary view with a column this seerdb does not define -- left by a
+    # newer seerdb, or a branch's -- made CREATE OR REPLACE VIEW fail, so the
+    # install failed on every connection and the stamp was never written
+    # (#1571). The views are dropped and created again.
+    from postgres_backend import _DICTIONARY_STAMP
+
+    raw = psycopg.connect(_CONNINFO, autocommit=True)
+    try:
+        PostgresBackend(_CONNINFO, credentials=dict(_CREDS)).close()  # installed
+        raw.execute(
+            'CREATE OR REPLACE VIEW sys.user_types AS SELECT t.*, 1 AS newer_column '
+            'FROM sys.all_types t WHERE t.owner = upper(current_schema())'
+        )
+        raw.execute('COMMENT ON SCHEMA sys IS NULL')
+        PostgresBackend(_CONNINFO, credentials=dict(_CREDS)).close()
+        stamp = raw.execute(
+            "SELECT obj_description('sys'::regnamespace, 'pg_namespace')"
+        ).fetchone()[0]
+        assert stamp == _DICTIONARY_STAMP
+        columns = [
+            r[0]
+            for r in raw.execute(
+                "SELECT attname FROM pg_attribute WHERE attrelid = 'sys.user_types'::regclass "
+                'AND attnum > 0'
+            ).fetchall()
+        ]
+        assert 'newer_column' not in columns
+    finally:
+        raw.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships
