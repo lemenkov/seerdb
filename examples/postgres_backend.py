@@ -3983,6 +3983,146 @@ def _quote_hash_identifiers(sql: str) -> str:
     return ''.join(out)
 
 
+# The words PostgreSQL reserves that Oracle takes as a column or attribute name,
+# measured on 11g and 23ai (#1595); PostgreSQL reads them as names only quoted.
+_PG_RESERVED_NAMES = frozenset(
+    {
+        'analyse', 'analyze', 'array', 'asymmetric', 'authorization', 'binary',
+        'both', 'case', 'cast', 'collate', 'collation', 'concurrently',
+        'constraint', 'cross', 'current_catalog', 'current_date', 'current_role',
+        'current_schema', 'current_time', 'current_timestamp', 'current_user',
+        'deferrable', 'do', 'end', 'except', 'false', 'fetch', 'foreign',
+        'freeze', 'full', 'ilike', 'initially', 'inner', 'isnull', 'join',
+        'lateral', 'leading', 'left', 'limit', 'localtime', 'localtimestamp',
+        'natural', 'notnull', 'offset', 'only', 'outer', 'overlaps', 'placing',
+        'primary', 'references', 'returning', 'right', 'session_user', 'similar',
+        'some', 'symmetric', 'system_user', 'tablesample', 'trailing', 'true',
+        'using', 'variadic', 'verbose', 'when', 'window',
+    }
+)  # fmt: skip
+# Of those, the ones a statement may use bare as a name: Oracle SQL gives them
+# no part, or a part a name can't be confused with -- a join's words come before
+# JOIN, OFFSET and LIMIT before a value, ARRAY and LATERAL before a bracket. The
+# rest -- CASE, END, CAST, FETCH, CURRENT_DATE, ... -- are Oracle's own words
+# too, and are quoted only where nothing else can stand: after a dot, or as the
+# name a CREATE TABLE, ALTER TABLE or CREATE TYPE declares.
+_BARE_RESERVED_NAMES = frozenset(
+    {
+        'analyse', 'analyze', 'array', 'asymmetric', 'authorization',
+        'collation', 'concurrently', 'cross', 'current_catalog', 'current_role',
+        'freeze', 'full', 'ilike', 'inner', 'isnull', 'lateral', 'left', 'limit',
+        'natural', 'notnull', 'offset', 'outer', 'overlaps', 'placing', 'right',
+        'similar', 'symmetric', 'system_user', 'tablesample', 'verbose', 'window',
+    }
+)  # fmt: skip
+# What may follow a name, and no keyword: punctuation, an operator, the end, or
+# a word that continues an expression or opens the next clause.
+_NAME_FOLLOWER = re.compile(
+    r'\s*(?:[,)=<>!+\-*/|;]|$|(?:FROM|AS|IS|IN|NOT|BETWEEN|LIKE|DESC|ASC|NULLS'
+    r'|AND|OR|WHERE|ORDER|GROUP|HAVING|INTO|THEN|ELSE|END|WHEN|UNION|MINUS'
+    r'|INTERSECT|FOR|CONNECT|START|VALUES|SET)\b)',
+    re.IGNORECASE,
+)
+_RESERVED_SCAN = re.compile(
+    r'(--[^\n]*|/\*.*?\*/)|(?<![\w$#])([A-Za-z_][\w$#]*)', re.DOTALL
+)
+# The declarations a CREATE TYPE ... AS OBJECT lists, the names an INSERT's
+# column list holds, and the types a column's name is followed by where it
+# could be a constraint's word.
+_OBJECT_ATTRIBUTES_OPEN = re.compile(r'\bAS\s+OBJECT\s*\(', re.IGNORECASE)
+_INSERT_COLUMN_LIST = re.compile(
+    rf'\s*INSERT\s+INTO\s+{_TABLE_NAME}'
+    r'(?:\s+(?!VALUES\b|SELECT\b|WITH\b)[A-Za-z_][\w$#]*)?\s*\(',
+    re.IGNORECASE,
+)
+_BUILTIN_TYPE_WORD = re.compile(
+    r'\s+(?:NUMBER|N?VARCHAR2?|N?CHAR|DATE|TIMESTAMP|INTERVAL|N?CLOB|BLOB|RAW|LONG'
+    r'|FLOAT|REAL|DOUBLE|INTEGER|INT|SMALLINT|DECIMAL|BINARY_\w+|U?ROWID)\b',
+    re.IGNORECASE,
+)
+
+
+def _declared_name_positions(masked: str) -> set[int]:
+    # Where a CREATE TABLE, an ALTER TABLE ... ADD / MODIFY or a CREATE TYPE ...
+    # AS OBJECT declares a column or attribute, or an INSERT names one: each
+    # item's first word. One of
+    # CONSTRAINT / PRIMARY / FOREIGN is a constraint unless a type follows it.
+    spans: list[tuple[int, int]] = []
+    parsed = _ddl_column_spans(masked)
+    if parsed is not None:
+        spans = parsed[1]
+    elif _CREATE_TYPE_OBJECT.match(masked):
+        found = _OBJECT_ATTRIBUTES_OPEN.search(masked)
+        if found is not None:
+            open_at = found.end() - 1
+            spans = _top_level_items(
+                masked, open_at + 1, _matching_paren(masked, open_at)
+            )
+    # An INSERT's column list holds names only.
+    insert = _INSERT_COLUMN_LIST.match(masked)
+    if insert is not None:
+        open_at = insert.end() - 1
+        spans += _top_level_items(masked, open_at + 1, _matching_paren(masked, open_at))
+    positions = set()
+    for start, end in spans:
+        at = start + len(masked[start:end]) - len(masked[start:end].lstrip())
+        if masked.startswith(('"', "'"), at):
+            continue
+        word = _HASH_IDENTIFIER.match(masked, at)
+        if word is None:
+            continue
+        if word.group().lower() in ('constraint', 'primary', 'foreign') and (
+            _BUILTIN_TYPE_WORD.match(masked, word.end()) is None
+        ):
+            continue
+        positions.add(at)
+    return positions
+
+
+def _quote_reserved_names(sql: str) -> str:
+    """Quote a column or attribute name that PostgreSQL reserves and Oracle
+    does not, INNER or WINDOW, in PostgreSQL's spelling of an unquoted name:
+    lower case (#1595). Where it is declared, after a dot, and -- for the words
+    Oracle SQL leaves free -- wherever what follows it shows it is a name.
+
+    Runs on the Oracle statement, before any other rewrite: the translation
+    writes PostgreSQL's own keywords (LIMIT, ARRAY[...]) that this must not see.
+    """
+    lowered = sql.lower()
+    if not any(word in lowered for word in _PG_RESERVED_NAMES):
+        return sql
+    (masked, contents) = _mask_quoted(sql)
+    declared = _declared_name_positions(masked)
+    first = _HASH_IDENTIFIER.search(masked)
+    out: list[str] = []
+    pos = 0
+    for match in _RESERVED_SCAN.finditer(masked):
+        word = match.group(2)
+        if word is None or word.lower() not in _PG_RESERVED_NAMES:
+            continue
+        at, end = match.start(2), match.end(2)
+        before = masked[:at].rstrip()[-1:]
+        after = masked[end:].lstrip()[:1]
+        if before == ':' or after in ('(', '['):
+            continue
+        if not (
+            at in declared
+            or before == '.'
+            or (
+                word.lower() in _BARE_RESERVED_NAMES
+                and not (first is not None and first.start() == at)
+                and _NAME_FOLLOWER.match(masked, end)
+            )
+        ):
+            continue
+        out.append(f'{masked[pos:at]}"\x00{len(contents)}\x00"')
+        contents.append(word.lower())
+        pos = end
+    if not out:
+        return sql
+    return _unmask_quoted(''.join(out) + masked[pos:], contents)
+
+
 _ROWNUM_WORD = re.compile(r'\bROWNUM\b', re.IGNORECASE)
 _ROWNUM_PREDICATE = re.compile(r'ROWNUM\s*(<=|<|=)\s*(\d+|:\w+)', re.IGNORECASE)
 # The top-level words under which ROWNUM and LIMIT part ways: Oracle numbers the
@@ -4772,6 +4912,7 @@ def _ruled(name: str, translated: str, sql: str) -> str:
 
 def _translated_batch(sql: str) -> str:
     # An array DML statement's translation, each pass noted (#1557).
+    sql = _ruled('reserved-name', _quote_reserved_names(sql), sql)
     sql = _ruled('ddl', _translate_ddl(sql), sql)
     sql = _ruled('routine-ddl', _translate_routine_ddl(sql), sql)
     sql = _ruled('plsql-block', _translate_plsql_block(sql), sql)
@@ -6825,7 +6966,11 @@ class PostgresBackend:
             else _translate_idioms(
                 _translate_plsql_block(
                     _translate_routine_ddl(
-                        _translate_ddl(_translate_admin(strip_returning_into(sql)))
+                        _translate_ddl(
+                            _translate_admin(
+                                _quote_reserved_names(strip_returning_into(sql))
+                            )
+                        )
                     )
                 )
             )
@@ -7018,6 +7163,7 @@ class PostgresBackend:
         # column types, CREATE PROCEDURE/FUNCTION → PL/pgSQL, then the function /
         # literal idioms. This is where dialect knowledge belongs, not in the
         # generic compat shim.
+        sql = _ruled('reserved-name', _quote_reserved_names(sql), sql)
         sql = _ruled('admin', _translate_admin(sql), sql)
         sql = _ruled('ddl', _translate_ddl(sql), sql)
         sql = _ruled('routine-ddl', _translate_routine_ddl(sql), sql)
@@ -9613,7 +9759,8 @@ class PostgresBackend:
         if into:
             statement = strip_returning_into(statement)
         sql, params = _translate_binds(
-            _translate_idioms(_translate_ddl(statement)), values
+            _translate_idioms(_translate_ddl(_quote_reserved_names(statement))),
+            values,
         )
         cursor = self._conn.cursor()
         cursor.execute(sql, params)
