@@ -1052,6 +1052,9 @@ _ORACLE_DICTIONARY_DDL = (
     # A type recorded as declared reads as declared (#1386).
     'ELSE coalesce(o.data_type, ora_type_name(c.data_type)) END AS data_type, '
     f"CASE WHEN c.domain_name = '{_DATE_TYPE}' THEN 7 "
+    # A CLOB / BLOB, the ora_clob / ora_blob domains, is listed 4000 long, as
+    # Oracle lists a LOB column (#1566); an NCLOB's record says so too.
+    f"WHEN c.domain_name IN ('{_CLOB_TYPE}', '{_BLOB_TYPE}') THEN 4000 "
     "WHEN c.data_type = 'USER-DEFINED' AND c.udt_name = 'ora_tstz' THEN 13 "
     'WHEN o.data_type IS NULL AND c.data_type IN '
     "('timestamp without time zone', 'timestamp with time zone') "
