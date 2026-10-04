@@ -4406,6 +4406,11 @@ _SELECT_LIST_ENDS = frozenset(
 )
 # A select item that is one masked string literal, optionally aliased.
 _LITERAL_ITEM = re.compile("'\x00(\\d+)\x00'(.*)", re.DOTALL)
+# A select item that concatenates string literals and nothing else, which
+# Oracle types CHAR as it does one literal (#1587).
+_LITERAL_CONCAT_ITEM = re.compile(
+    "('\x00\\d+\x00'(?:\\s*\\|\\|\\s*'\x00\\d+\x00')+)(.*)", re.DOTALL
+)
 
 
 def _cast_literal_items(sql: str) -> str:
@@ -4449,6 +4454,25 @@ def _cast_literal_items(sql: str) -> str:
             start = words[1][0] + len(words[1][1])
         for s_at, e_at in _top_level_items(segment, start, stop):
             item = segment[s_at:e_at].strip()
+            concat = _LITERAL_CONCAT_ITEM.fullmatch(item)
+            if concat is not None and _ITEM_ALIAS.fullmatch(concat.group(2).strip()):
+                # The concatenation's length is its literals' together; '' is
+                # NULL in Oracle, which a concatenation passes over (#1587).
+                length = sum(
+                    len(contents[int(i)].replace("''", "'"))
+                    for i in re.findall('\x00(\\d+)\x00', concat.group(1))
+                )
+                if length:
+                    at = match.start() + segment.index(item, s_at)
+                    expression = concat.group(1)
+                    edits.append(
+                        (
+                            at,
+                            at + len(expression),
+                            f'CAST(({expression}) AS char({length}))',
+                        )
+                    )
+                continue
             literal = _LITERAL_ITEM.fullmatch(item)
             if literal is None or not _ITEM_ALIAS.fullmatch(literal.group(2).strip()):
                 continue
