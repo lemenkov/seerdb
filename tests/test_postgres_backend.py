@@ -4668,6 +4668,46 @@ def test_a_type_shape_block_is_answered_by_argument_position() -> None:
         backend.close()
 
 
+def test_a_character_value_compared_with_raw_is_hex() -> None:
+    # A single-table statement's WHERE compares a RAW column with a character
+    # value as hex, as Oracle does (#1496): either way round, an IN list, a
+    # bind, an UPDATE's and a DELETE's. A character column's comparison, and
+    # one in a subquery, are left alone. The rows are 23ai's.
+    from postgres_backend import _mask_quoted
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE rc1496 (id NUMBER, r RAW(8), s VARCHAR2(10))')
+        backend.execute("INSERT INTO rc1496 VALUES (1, hextoraw('52617720'), '41')")
+        backend.execute("INSERT INTO rc1496 VALUES (2, hextoraw('41'), 'x')")
+
+        def ids(sql: str, binds=()) -> list:
+            return sorted(row[0] for row in backend.execute(sql, list(binds)).rows)
+
+        assert ids("SELECT id FROM rc1496 WHERE r = '52617720'") == [1]
+        assert ids('SELECT id FROM rc1496 t WHERE t.r = :1', ['41']) == [2]
+        assert ids("SELECT id FROM rc1496 WHERE '41' = r") == [2]
+        assert ids("SELECT id FROM rc1496 WHERE r IN ('41', '52617720')") == [1, 2]
+        assert ids("SELECT id FROM rc1496 WHERE s = '41'") == [1]
+        assert ids(
+            "SELECT id FROM rc1496 WHERE id IN (SELECT id FROM rc1496 WHERE s = 'x')"
+        ) == [2]
+        (masked, contents) = _mask_quoted("SELECT id FROM rc1496 WHERE s = '41'")
+        assert backend._raw_comparison_spans(masked, contents) == []
+        assert backend.execute("UPDATE rc1496 SET id = 3 WHERE r = '41'").rowcount == 1
+        assert (
+            backend.execute('DELETE FROM rc1496 WHERE r = :1', ['52617720']).rowcount
+            == 1
+        )
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE rc1496')
+        except Exception:
+            backend.rollback()
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships
