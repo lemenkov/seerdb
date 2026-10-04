@@ -4422,7 +4422,7 @@ def test_tab_columns_list_char_used_and_the_declared_length() -> None:
         backend.execute(
             'CREATE TABLE cu1451 (a VARCHAR2(20), b VARCHAR2(10 BYTE), '
             'cc VARCHAR2(10 CHAR), d CHAR(4), dc CHAR(3 CHAR), e NVARCHAR2(5), '
-            'f NCHAR(3), g CLOB, h LONG, i NUMBER, n NCLOB)'
+            'f NCHAR(3), g CLOB, h LONG, i NUMBER, l BLOB, n NCLOB)'
         )
         result = backend.execute(
             'SELECT column_name, data_length, char_length, char_col_decl_length, '
@@ -4437,9 +4437,11 @@ def test_tab_columns_list_char_used_and_the_declared_length() -> None:
             ('DC', 12, 3, 12, 'C'),
             ('E', 10, 5, 5, 'C'),
             ('F', 6, 3, 3, 'C'),
-            ('G', 22, 0, 4000, None),
+            ('G', 4000, 0, 4000, None),
             ('H', 0, 0, 0, None),
             ('I', 22, 0, None, None),
+            # A CLOB / BLOB is 4000 long, as 23ai lists it (#1566).
+            ('L', 4000, 0, None, None),
             ('N', 4000, 0, 2000, None),
         ]
     finally:
