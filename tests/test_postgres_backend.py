@@ -809,6 +809,22 @@ def test_translate_idioms_rewrites_connect_by_level_row_generator() -> None:
         'SELECT 42 AS k, LEVEL AS n FROM dual CONNECT BY LEVEL <= 200'
     )
     assert multi == 'SELECT 42 AS k, LEVEL AS n FROM generate_series(1, 200) AS level'
+    # ROWNUM counts the generator's rows as LEVEL does, `< n` is n - 1 rows, and
+    # n may be a bind, taken as Oracle compares a NUMBER with it; a ROWNUM in a
+    # string stays (#1558).
+    assert _translate_idioms(
+        "SELECT 'rownum' || ROWNUM AS id FROM dual CONNECT BY ROWNUM <= :1"
+    ) == (
+        "SELECT 'rownum' || level AS id "
+        'FROM generate_series(1, floor((:1)::numeric)::bigint) AS level'
+    )
+    assert _translate_idioms('SELECT LEVEL FROM dual CONNECT BY LEVEL < 4') == (
+        'SELECT LEVEL FROM generate_series(1, 3) AS level'
+    )
+    assert _translate_idioms('SELECT count(*) FROM dual CONNECT BY ROWNUM < :n') == (
+        'SELECT count(*) FROM generate_series(1, ceil((:n)::numeric)::bigint - 1) '
+        'AS level'
+    )
 
 
 def test_translate_idioms_rewrites_decode_to_case() -> None:
