@@ -3984,6 +3984,61 @@ _CONSTANT_ITEM_ALIAS = re.compile(
 _IDENTIFIER = re.compile(r'(?<![\w$#])[A-Za-z_][\w$#]*')
 
 
+# A select item that is a column, bare, qualified or in parentheses; and the
+# pseudo-columns, which are no column but are named the way one is (#1449).
+_PLAIN_COLUMN_ITEM = re.compile(
+    r'\(*\s*(?:(?:"[^"]*"|[A-Za-z_][\w$#]*)\s*\.\s*)*("[^"]*"|[A-Za-z_][\w$#]*)\s*\)*'
+)
+_ORACLE_PSEUDO_COLUMNS = frozenset(
+    {
+        'SYSDATE',
+        'SYSTIMESTAMP',
+        'CURRENT_DATE',
+        'CURRENT_TIMESTAMP',
+        'LOCALTIMESTAMP',
+        'USER',
+        'UID',
+        'ROWNUM',
+        'LEVEL',
+        'ROWID',
+        'SESSIONTIMEZONE',
+        'DBTIMEZONE',
+    }
+)
+
+
+def _expression_names(sql: str) -> dict[int, str]:
+    """The names Oracle gives an Oracle query's unaliased computed select items,
+    by position (#1449): the item's own text, every space dropped and the rest
+    upper-cased -- its string literals and comments too -- where PostgreSQL
+    names a call by its function and anything else ?column?. A pseudo-column
+    is its name. A column, or an aliased item, keeps the name it has.
+    Measured on 23ai.
+    """
+    (masked, contents) = _mask_quoted(sql)
+    words, _rownums = _top_level_words(masked)
+    if not words or words[0][1] != 'SELECT':
+        return {}
+    start = words[0][0] + len('SELECT')
+    if len(words) > 1 and words[1][1] in ('DISTINCT', 'UNIQUE', 'ALL'):
+        start = words[1][0] + len(words[1][1])
+    end = next((pos for pos, word in words if word == 'FROM'), len(masked))
+    items = [masked[s:e].strip() for s, e in _top_level_items(masked, start, end)]
+    if any(item == '*' or item.endswith('.*') for item in items):
+        return {}
+    names = {}
+    for index, item in enumerate(items):
+        column = _PLAIN_COLUMN_ITEM.fullmatch(item)
+        if column is not None:
+            if column.group(1).upper() in _ORACLE_PSEUDO_COLUMNS:
+                names[index] = column.group(1).upper()
+            continue
+        if _CONSTANT_ITEM_ALIAS.search(item):
+            continue
+        names[index] = ''.join(_unmask_quoted(item, contents).split()).upper()
+    return names
+
+
 def _constant_items(sql: str) -> set[int]:
     """The select-list positions of an Oracle query that are constant: literals,
     operators and calls of literals, nothing else -- no column, bind,
@@ -7749,6 +7804,14 @@ class PostgresBackend:
                         data_length=length,
                         max_size=length // 2,
                     )
+        # An unaliased computed item is named by its own Oracle text, as Oracle
+        # names it, where PostgreSQL gave `length` or `?column?` (#1449).
+        if original:
+            named = _expression_names(original)
+            if named and len(named) <= len(columns):
+                for i, name in named.items():
+                    if i < len(columns):
+                        columns[i] = replace(columns[i], name=name.encode('utf-8'))
         # A table's unconstrained NUMBER column -- a numeric with no typmod --
         # describes with precision 0 and scale -127, as Oracle's does; a computed
         # number has neither, as on a live server, so only a column that traces
