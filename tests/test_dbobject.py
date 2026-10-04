@@ -1589,3 +1589,98 @@ class TestXmlTypeInObject(unittest.TestCase):
         attrs = dict(decode_object_image(image, _XML_OBJ_LAYOUT))
         self.assertIsNone(attrs['XMLVALUE'])
         self.assertEqual(attrs['STRINGVALUE'], 'x')  # not corrupted by the NULL
+
+
+class TestTypeMetadata(unittest.TestCase):
+    # DbObjectType.attributes / element_type, as python-oracledb lists them
+    # (#1490); the expectations are python-oracledb's on 23ai.
+
+    def _typ(self, attrs, **kw):
+        return DbObjectType('PYO', 'T', b'\x00' * 16, 1, attrs, **kw)
+
+    def test_numbers_and_timestamps_take_python_oracledbs_precision(self):
+        from seerdb.common import datatypes as T
+
+        attrs = [
+            {'name': 'N', 'type_name': 'NUMBER'},
+            {'name': 'N9', 'type_name': 'NUMBER', 'precision': 9, 'scale': 0},
+            {'name': 'N92', 'type_name': 'NUMBER', 'precision': 9, 'scale': 2},
+            {'name': 'NS', 'type_name': 'NUMBER', 'scale': 0},  # a table's INTEGER
+            {'name': 'F10', 'type_name': 'FLOAT', 'precision': 10},
+            {'name': 'R', 'type_name': 'REAL'},
+            {'name': 'I', 'type_name': 'INTEGER'},
+            {'name': 'TS', 'type_name': 'TIMESTAMP(3)', 'scale': 3},
+            {'name': 'TZ', 'type_name': 'TIMESTAMP WITH TZ'},
+            {'name': 'BD', 'type_name': 'BINARY_DOUBLE'},
+        ]
+        self.assertEqual(
+            [
+                (a.name, a.type, a.precision, a.scale)
+                for a in self._typ(attrs).attributes
+            ],
+            [
+                ('N', T.DB_TYPE_NUMBER, 0, -127),
+                ('N9', T.DB_TYPE_NUMBER, 9, 0),
+                ('N92', T.DB_TYPE_NUMBER, 9, 2),
+                ('NS', T.DB_TYPE_NUMBER, 38, 0),
+                ('F10', T.DB_TYPE_NUMBER, 126, -127),
+                ('R', T.DB_TYPE_NUMBER, 63, -127),
+                ('I', T.DB_TYPE_NUMBER, 38, 0),
+                ('TS', T.DB_TYPE_TIMESTAMP, 0, 3),
+                ('TZ', T.DB_TYPE_TIMESTAMP_TZ, 0, 6),
+                ('BD', T.DB_TYPE_BINARY_DOUBLE, None, None),
+            ],
+        )
+
+    def test_a_character_attributes_size_is_in_bytes(self):
+        from seerdb.common.dbobject import attr_max_size
+
+        self.assertEqual(attr_max_size('VARCHAR2', 20), 20)
+        self.assertEqual(attr_max_size('VARCHAR2', 10, 'C'), 40)
+        self.assertEqual(attr_max_size('CHAR', 3, 'B'), 3)
+        self.assertEqual(attr_max_size('NVARCHAR2', 5, 'C'), 10)
+        self.assertEqual(attr_max_size('RAW', 16), 16)
+        self.assertIsNone(attr_max_size('NUMBER', 22))
+        self.assertIsNone(attr_max_size('CLOB', 4000))
+
+    def test_ten_gs_national_attribute_reads_as_national(self):
+        # 10g lists an NVARCHAR2 attribute as VARCHAR2 in NCHAR_CS.
+        from seerdb.client.connection import _type_attr
+        from seerdb.common import datatypes as T
+
+        attr = _type_attr(('NV', 'VARCHAR2', None, 5, None, None, 'NCHAR_CS'))
+        (described,) = self._typ([attr]).attributes
+        self.assertEqual((described.type, described.max_size), (T.DB_TYPE_NVARCHAR, 10))
+
+    def test_a_rowtype_columns_size_is_its_data_length(self):
+        from seerdb.client.connection import _rowtype_attr
+
+        attrs = [
+            _rowtype_attr('VC', 'VARCHAR2', 40),
+            _rowtype_attr('N', 'NUMBER', 22, 9, 2),
+            _rowtype_attr('D', 'DATE', 7),
+        ]
+        self.assertEqual(
+            [(a.precision, a.scale, a.max_size) for a in self._typ(attrs).attributes],
+            [(None, None, 40), (9, 2, None), (None, None, None)],
+        )
+
+    def test_element_type_iscollection_and_call(self):
+        from seerdb.common import datatypes as T
+
+        nested = self._typ([{'name': 'X', 'type_name': 'NUMBER'}])
+        coll = self._typ(
+            [], is_collection=True, element={'name': 'element', 'type_name': 'NUMBER'}
+        )
+        objs = self._typ(
+            [],
+            is_collection=True,
+            element={'name': 'element', 'type_name': 'T', 'object_type': nested},
+        )
+        self.assertEqual(
+            (coll.iscollection, coll.element_type), (True, T.DB_TYPE_NUMBER)
+        )
+        self.assertIs(objs.element_type, nested)
+        self.assertEqual((nested.iscollection, nested.element_type), (False, None))
+        self.assertEqual(coll([1, 2]).aslist(), [1, 2])
+        self.assertEqual(repr(nested.attributes[0]), '<seerdb.DbObjectAttr X>')

@@ -146,6 +146,10 @@ _8I_UNSUPPORTED = (
     ('interval', 'INTERVAL is a 9i+ type; Oracle 8i lacks it'),
     ('multilevel', 'a collection of collections is a 9i+ type; Oracle 8i lacks it'),
     ('national_char', 'Oracle 8i predates AL16UTF16 NCHAR (WE8ISO8859P1 only)'),
+    (
+        'attributes_metadata',
+        'the type covers TIMESTAMP and AL16UTF16 NVARCHAR2, which Oracle 8i lacks',
+    ),
     ('bit_vector_reuse', 'CONNECT BY LEVEL returns one row on Oracle 8i'),
     # Async-only / connectivity tests (AsyncConnectionIntegration, Redirect).
     ('async_iteration', 'CONNECT BY LEVEL returns one row on Oracle 8i'),
@@ -1356,6 +1360,15 @@ class TypesIntegration(_IntegrationBase):
         typ = self.conn.gettype(f'{self.TABLE.lower()}%rowtype')
         self.assertEqual(typ.name, f'{self.TABLE}%ROWTYPE')
         self.assertEqual(typ.attr_names, ['N', 'S', 'D'])
+        # Each column's metadata, as python-oracledb lists it (#1490).
+        self.assertEqual(
+            [(a.type, a.precision, a.scale, a.max_size) for a in typ.attributes],
+            [
+                (seerdb.DB_TYPE_NUMBER, 0, -127, None),
+                (seerdb.DB_TYPE_VARCHAR, None, None, 20),
+                (seerdb.DB_TYPE_DATE, None, None, None),
+            ],
+        )
         self.assertEqual(
             self.conn.gettype(f'{typ.schema}.{self.TABLE}%ROWTYPE').attr_names,
             ['N', 'S', 'D'],
@@ -8241,6 +8254,84 @@ class CollectionTypeIntegration(_IntegrationBase):
         elems = self.conn.gettype(self.ELEMS)
         self.assertEqual(elems.collection_type, COLLECTION_NESTED_TABLE)
         self.assertEqual(elems.element['object_type'].name, self.ELEM)
+        # As python-oracledb describes them (#1490): a collection's element type,
+        # a DB_TYPE_* or the element's own type, and an object's attributes.
+        self.assertTrue(nums.iscollection)
+        self.assertIs(nums.element_type, seerdb.DB_TYPE_NUMBER)
+        self.assertEqual(elems.element_type.name, self.ELEM)
+        elem = self.conn.gettype(self.ELEM)
+        self.assertFalse(elem.iscollection)
+        self.assertIsNone(elem.element_type)
+        self.assertEqual(
+            [
+                (a.name, a.type, a.precision, a.scale, a.max_size)
+                for a in elem.attributes
+            ],
+            [
+                ('ID', seerdb.DB_TYPE_NUMBER, 0, -127, None),
+                ('NAME', seerdb.DB_TYPE_VARCHAR, None, None, 40),
+            ],
+        )
+        self.assertEqual(elem(None).ID, None)
+
+    def test_gettype_lists_each_attributes_metadata(self):
+        # Each attribute's type, precision, scale and maximum size, as
+        # python-oracledb lists them -- measured against it on 18c, 21c and 23ai
+        # (#1490). A CHAR-semantics VARCHAR2 is 4n bytes where ALL_TYPE_ATTRS
+        # says so (CHAR_USED, 11g on); elsewhere it reads as BYTE.
+        meta = 'PYO_COLL_META_T'
+        try:
+            self.cur.execute(f'DROP TYPE {meta}')
+        except seerdb.DatabaseError:
+            pass  # no leftover from a prior run
+        self.cur.execute(
+            f'CREATE TYPE {meta} AS OBJECT (n NUMBER, n92 NUMBER(9,2), f FLOAT, '
+            'i INTEGER, r REAL, v VARCHAR2(20), vc VARCHAR2(10 CHAR), c CHAR(3), '
+            'nv NVARCHAR2(5), rw RAW(16), d DATE, ts3 TIMESTAMP(3), cl CLOB, '
+            f'o {self.ELEM}, a {self.NUMS})'
+        )
+        try:
+            # Whether ALL_TYPE_ATTRS says how a character attribute was declared:
+            # 11g on, and not yet the Mirror over PostgreSQL (#1573).
+            try:
+                self.cur.execute('SELECT char_used FROM all_type_attrs WHERE 1 = 0')
+                char_semantics = True
+            except seerdb.DatabaseError:
+                char_semantics = False
+            typ = self.conn.gettype(meta)
+            self.assertEqual(
+                [
+                    (a.name, a.type, a.precision, a.scale, a.max_size)
+                    for a in typ.attributes[:13]
+                ],
+                [
+                    ('N', seerdb.DB_TYPE_NUMBER, 0, -127, None),
+                    ('N92', seerdb.DB_TYPE_NUMBER, 9, 2, None),
+                    ('F', seerdb.DB_TYPE_NUMBER, 126, -127, None),
+                    ('I', seerdb.DB_TYPE_NUMBER, 38, 0, None),
+                    ('R', seerdb.DB_TYPE_NUMBER, 63, -127, None),
+                    ('V', seerdb.DB_TYPE_VARCHAR, None, None, 20),
+                    (
+                        'VC',
+                        seerdb.DB_TYPE_VARCHAR,
+                        None,
+                        None,
+                        40 if char_semantics else 10,
+                    ),
+                    ('C', seerdb.DB_TYPE_CHAR, None, None, 3),
+                    ('NV', seerdb.DB_TYPE_NVARCHAR, None, None, 10),
+                    ('RW', seerdb.DB_TYPE_RAW, None, None, 16),
+                    ('D', seerdb.DB_TYPE_DATE, None, None, None),
+                    ('TS3', seerdb.DB_TYPE_TIMESTAMP, 0, 3, None),
+                    ('CL', seerdb.DB_TYPE_CLOB, None, None, None),
+                ],
+            )
+            self.assertEqual(
+                [(a.name, a.type.name) for a in typ.attributes[13:]],
+                [('O', self.ELEM), ('A', self.NUMS)],
+            )
+        finally:
+            self.cur.execute(f'DROP TYPE {meta}')
 
     def test_a_collection_value_fetches(self):
         # A VARRAY of NUMBER and a nested table of objects, filled, empty and
@@ -10031,6 +10122,20 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     ElemsType = await Conn.gettype(Elems)
                     self.assertEqual(ElemsType.collection_type, COLLECTION_NESTED_TABLE)
                     self.assertEqual(ElemsType.element['object_type'].name, Elem)
+                    # As python-oracledb describes them (#1490).
+                    self.assertIs(NumsType.element_type, seerdb.DB_TYPE_NUMBER)
+                    self.assertEqual(ElemsType.element_type.name, Elem)
+                    ElemType = await Conn.gettype(Elem)
+                    self.assertEqual(
+                        [
+                            (A.name, A.type, A.precision, A.scale, A.max_size)
+                            for A in ElemType.attributes
+                        ],
+                        [
+                            ('ID', seerdb.DB_TYPE_NUMBER, 0, -127, None),
+                            ('NAME', seerdb.DB_TYPE_VARCHAR, None, None, 40),
+                        ],
+                    )
                 finally:
                     for Stmt in Drops:
                         try:

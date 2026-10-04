@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2019 Peter Lemenkov <lemenkov@gmail.com>
 # SPDX-License-Identifier: MIT
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
@@ -699,10 +700,30 @@ _ROWTYPE_SUFFIX = '%ROWTYPE'
 # attribute of the record either -- has no COLUMN_ID. ALL_TAB_COLS, which says
 # HIDDEN_COLUMN, is 9i+.
 _ROWTYPE_COLUMNS_SQL = (
-    'SELECT column_name, data_type, data_type_owner FROM all_tab_columns '
+    'SELECT column_name, data_type, data_type_owner, data_length, data_precision, '
+    'data_scale FROM all_tab_columns '
     'WHERE owner = :1 AND table_name = :2 AND column_id IS NOT NULL '
     'ORDER BY column_id'
 )
+# An object type's attributes, with what python-oracledb reports of each: the
+# length, precision and scale, and -- 11g on, where ALL_TYPE_ATTRS has it -- the
+# length semantics a character attribute was declared in (#1490).
+_TYPE_ATTRS_SQL = (
+    'SELECT attr_name, attr_type_name, attr_type_owner, length, precision, '
+    'scale, character_set_name{} FROM all_type_attrs '
+    'WHERE owner = :1 AND type_name = :2 ORDER BY attr_no'
+)
+_ORA_INVALID_IDENTIFIER = 904
+_NATIONAL_TYPE_NAMES = {'VARCHAR2': 'NVARCHAR2', 'CHAR': 'NCHAR', 'CLOB': 'NCLOB'}
+
+
+def _error_code(result: object) -> int | None:
+    # The ORA code an internal execute() result carries, None for success.
+    if isinstance(result, tuple) and len(result) > 1 and isinstance(result[1], int):
+        return result[1] or None
+    return None
+
+
 _ROWTYPE_OID_SQL = (
     'DECLARE i VARCHAR2(3); o VARCHAR2(128); n VARCHAR2(128); s SYS_REFCURSOR; '
     'BEGIN :ret_val := dbms_pickler.get_type_shape(:full_name, :oid, :version, '
@@ -726,11 +747,20 @@ def _rowtype_name(name: str) -> tuple[str | None, str] | None:
     return None
 
 
-def _rowtype_attr(column_name: str, data_type: str) -> dict:
+def _rowtype_attr(
+    column_name: str,
+    data_type: str,
+    length: int | None = None,
+    precision: int | None = None,
+    scale: int | None = None,
+) -> dict:
     # A %ROWTYPE attribute from its column: the column's name and type, the
-    # charset a national one takes in an object image.
+    # charset a national one takes in an object image, and the metadata
+    # python-oracledb reports (#1490) -- a character or RAW column's length is
+    # its size in bytes already.
     from seerdb.common.dbobject import national_charset, type_name_to_tns
 
+    base = _re.sub(r'\(.*?\)', '', data_type or '').strip().upper()
     return {
         'name': column_name,
         'type_name': data_type,
@@ -738,6 +768,33 @@ def _rowtype_attr(column_name: str, data_type: str) -> dict:
         'charset': national_charset(
             'NCHAR_CS' if data_type in _NATIONAL_COLUMN_TYPES else None
         ),
+        'precision': precision,
+        'scale': scale,
+        'max_size': length
+        if base in ('VARCHAR2', 'VARCHAR', 'CHAR', 'NVARCHAR2', 'NCHAR', 'RAW')
+        else None,
+    }
+
+
+def _type_attr(row: 'Sequence[Any]') -> dict:
+    # An ALL_TYPE_ATTRS row as an attribute layout, the metadata python-oracledb
+    # reports included (#1490). Without CHAR_USED (10g and earlier) a character
+    # attribute reads as BYTE semantics.
+    from seerdb.common.dbobject import attr_max_size, national_charset, type_name_to_tns
+
+    (name, type_name, _owner, length, precision, scale, charset) = row[:7]
+    if charset == 'NCHAR_CS':
+        # 10g lists a national attribute by its non-national name and the
+        # national character set; the type is the national one.
+        type_name = _NATIONAL_TYPE_NAMES.get(type_name, type_name)
+    return {
+        'name': name,
+        'type_name': type_name,
+        'data_type': type_name_to_tns(type_name),
+        'charset': national_charset(charset),
+        'precision': precision,
+        'scale': scale,
+        'max_size': attr_max_size(type_name, length, row[7] if len(row) > 7 else None),
     }
 
 
@@ -2134,8 +2191,6 @@ class OracleConnect(_ConnectionLogic):
     ) -> 'DbObjectType | None':
         from seerdb.common.dbobject import (
             DbObjectType,
-            national_charset,
-            type_name_to_tns,
         )
 
         OidSQL = (
@@ -2146,23 +2201,11 @@ class OracleConnect(_ConnectionLogic):
         OidRows = self._rows(OidRes)
         Oid = bytes(OidRows[0][0]) if OidRows and OidRows[0][0] else b''
         TypeCode = OidRows[0][1] if OidRows else None
-        SQL = (
-            'SELECT attr_name, attr_type_name, attr_type_owner, length, '
-            'precision, scale, character_set_name FROM all_type_attrs '
-            'WHERE owner = :1 AND type_name = :2 '
-            'ORDER BY attr_no'
-        )
-        Result = self.execute(SQL, Bind=[Owner, name])
-        Rows = self._rows(Result)
+        Rows = self._type_attr_rows(Owner, name)
         Attrs = []
         for Row in Rows:
             TypeName, TypeOwner = Row[1], Row[2]
-            Attr = {
-                'name': Row[0],
-                'type_name': TypeName,
-                'data_type': type_name_to_tns(TypeName),
-                'charset': national_charset(Row[6]),
-            }
+            Attr = _type_attr(Row)
             if TypeOwner:
                 # A nested object / collection attribute (#117/#118): embed its
                 # own layout so the pure image decoder can recurse into it
@@ -2175,6 +2218,27 @@ class OracleConnect(_ConnectionLogic):
         Typ = DbObjectType(Owner, name, Oid, 1, Attrs, **CollKW)
         self._object_type_cache[Key] = Typ
         return Typ
+
+    def _type_attr_rows(self, owner: str, name: str) -> list:
+        # ALL_TYPE_ATTRS' rows for a type, CHAR_USED last where the server has
+        # it. One that has not -- 10g and earlier, or a view without it -- answers
+        # ORA-00904, which the result carries (or, on the 9i path, raises); it
+        # is asked without it from then on (#1490).
+        from seerdb.common.exceptions import DatabaseError
+
+        if getattr(self, '_type_attrs_char_used', True):
+            try:
+                Result = self.execute(
+                    _TYPE_ATTRS_SQL.format(', char_used'), Bind=[owner, name]
+                )
+            except DatabaseError as error:
+                if getattr(error, 'code', None) != _ORA_INVALID_IDENTIFIER:
+                    raise
+                Result = None
+            if Result is not None and _error_code(Result) != _ORA_INVALID_IDENTIFIER:
+                return self._rows(Result)
+            self._type_attrs_char_used = False
+        return self._rows(self.execute(_TYPE_ATTRS_SQL.format(''), Bind=[owner, name]))
 
     def _describe_rowtype(
         self, schema: str | None, table: str
@@ -2196,8 +2260,8 @@ class OracleConnect(_ConnectionLogic):
         if not Rows:
             return None
         Attrs = []
-        for ColumnName, DataType, TypeOwner in Rows:
-            Attr = _rowtype_attr(ColumnName, DataType)
+        for ColumnName, DataType, TypeOwner, Length, Precision, Scale in Rows:
+            Attr = _rowtype_attr(ColumnName, DataType, Length, Precision, Scale)
             if TypeOwner:
                 Attr['object_type'] = self._describe_object_type(TypeOwner, DataType)
             Attrs.append(Attr)

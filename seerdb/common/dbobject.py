@@ -329,6 +329,31 @@ class DbObjectType:
     def attr_names(self) -> list:
         return [A['name'] for A in self.attrs]
 
+    @property
+    def attributes(self) -> 'list[DbObjectAttr]':
+        """The attributes, in declaration order, as python-oracledb lists them
+        (#1490); empty for a collection."""
+        return [_object_attr(A) for A in self.attrs]
+
+    @property
+    def element_type(self):
+        """A collection's element type: a ``DB_TYPE_*``, or the
+        :class:`DbObjectType` of an object or collection element; None for a
+        type that is no collection (#1490)."""
+        if not self.is_collection or not self.element:
+            return None
+        return _attr_type(self.element)
+
+    @property
+    def iscollection(self) -> bool:
+        """Whether this is a collection type, as python-oracledb names it."""
+        return bool(self.is_collection)
+
+    def __call__(self, value=None) -> 'DbObject':
+        """A new object of this type: ``newobject()``, as python-oracledb lets a
+        type be called (#1490)."""
+        return self.newobject(value)
+
     def newobject(self, values=None, keys: list[int] | None = None) -> 'DbObject':
         """A new DbObject of this type, ready to bind (#116/#117).
 
@@ -751,6 +776,144 @@ def _decode_member(
         'charset': Attr.get('charset') or Charset,
     }
     return (decode_value(Col, Raw), Pos)
+
+
+class DbObjectAttr:
+    """An attribute of an object type as python-oracledb describes one (#1490):
+    its name; its type, a ``DB_TYPE_*`` or the :class:`DbObjectType` of a nested
+    object or collection; its precision and scale, set for a number or a
+    timestamp; and its maximum size in bytes, set for a character or RAW one."""
+
+    __slots__ = ('name', 'type', 'precision', 'scale', 'max_size')
+
+    def __init__(self, name, type, precision=None, scale=None, max_size=None):
+        self.name = name
+        self.type = type
+        self.precision = precision
+        self.scale = scale
+        self.max_size = max_size
+
+    def __repr__(self) -> str:
+        return f'<seerdb.DbObjectAttr {self.name}>'
+
+
+# A type name as the data dictionary spells it, its parenthesised sizes
+# dropped -- TIMESTAMP(6) WITH TIME ZONE is TIMESTAMP WITH TIME ZONE -- to the
+# DB_TYPE_* python-oracledb reports for it (#1490).
+_SIZES = re.compile(r'\s*\(\s*\d+\s*(?:,\s*-?\d+\s*)?(?:BYTE|CHAR)?\s*\)')
+
+
+def _base_type_name(name) -> str:
+    return _SIZES.sub('', str(name or '')).strip().upper()
+
+
+def _db_type_by_name() -> dict:
+    from seerdb.common import datatypes as T
+
+    return {
+        'NUMBER': T.DB_TYPE_NUMBER,
+        'FLOAT': T.DB_TYPE_NUMBER,
+        'INTEGER': T.DB_TYPE_NUMBER,
+        'SMALLINT': T.DB_TYPE_NUMBER,
+        'REAL': T.DB_TYPE_NUMBER,
+        'DOUBLE PRECISION': T.DB_TYPE_NUMBER,
+        'DECIMAL': T.DB_TYPE_NUMBER,
+        'VARCHAR2': T.DB_TYPE_VARCHAR,
+        'VARCHAR': T.DB_TYPE_VARCHAR,
+        'NVARCHAR2': T.DB_TYPE_NVARCHAR,
+        'CHAR': T.DB_TYPE_CHAR,
+        'NCHAR': T.DB_TYPE_NCHAR,
+        'RAW': T.DB_TYPE_RAW,
+        'LONG': T.DB_TYPE_LONG,
+        'LONG RAW': T.DB_TYPE_LONG_RAW,
+        'DATE': T.DB_TYPE_DATE,
+        'TIMESTAMP': T.DB_TYPE_TIMESTAMP,
+        'TIMESTAMP WITH TZ': T.DB_TYPE_TIMESTAMP_TZ,
+        'TIMESTAMP WITH TIME ZONE': T.DB_TYPE_TIMESTAMP_TZ,
+        'TIMESTAMP WITH LOCAL TZ': T.DB_TYPE_TIMESTAMP_LTZ,
+        'TIMESTAMP WITH LOCAL TIME ZONE': T.DB_TYPE_TIMESTAMP_LTZ,
+        'INTERVAL DAY TO SECOND': T.DB_TYPE_INTERVAL_DS,
+        'INTERVAL YEAR TO MONTH': T.DB_TYPE_INTERVAL_YM,
+        'BINARY_FLOAT': T.DB_TYPE_BINARY_FLOAT,
+        'BINARY_DOUBLE': T.DB_TYPE_BINARY_DOUBLE,
+        'BINARY_INTEGER': T.DB_TYPE_BINARY_INTEGER,
+        'PLS_INTEGER': T.DB_TYPE_BINARY_INTEGER,
+        'BOOLEAN': T.DB_TYPE_BOOLEAN,
+        'PL/SQL BOOLEAN': T.DB_TYPE_BOOLEAN,
+        'CLOB': T.DB_TYPE_CLOB,
+        'NCLOB': T.DB_TYPE_NCLOB,
+        'BLOB': T.DB_TYPE_BLOB,
+        'BFILE': T.DB_TYPE_BFILE,
+        'ROWID': T.DB_TYPE_ROWID,
+        'UROWID': T.DB_TYPE_UROWID,
+        'JSON': T.DB_TYPE_JSON,
+        'VECTOR': T.DB_TYPE_VECTOR,
+        'XMLTYPE': T.DB_TYPE_XMLTYPE,
+    }
+
+
+def _attr_type(layout: dict):
+    # An attribute's or element's type as python-oracledb reports it (#1490):
+    # the nested DbObjectType of an object or collection, else the DB_TYPE_*
+    # its type name stands for (None for one this does not know).
+    nested = layout.get('object_type')
+    if nested is not None and _base_type_name(layout.get('type_name')) != 'XMLTYPE':
+        return nested
+    return _db_type_by_name().get(_base_type_name(layout.get('type_name')))
+
+
+def attr_max_size(type_name, length, char_used=None) -> int | None:
+    """An attribute's maximum size in bytes, from the length ALL_TYPE_ATTRS
+    lists (#1490): a character type's in its declared semantics -- a CHAR one
+    four bytes a character, the database character set's widest -- a national
+    one's at two bytes a character, a RAW's as is; None for any other."""
+    if length is None:
+        return None
+    base = _base_type_name(type_name)
+    if base in ('VARCHAR2', 'VARCHAR', 'CHAR'):
+        return int(length) * (4 if char_used == 'C' else 1)
+    if base in ('NVARCHAR2', 'NCHAR'):
+        return 2 * int(length)
+    if base == 'RAW':
+        return int(length)
+    return None
+
+
+def _precision_scale(type_name, precision, scale) -> tuple:
+    # A number's or timestamp's (precision, scale) as python-oracledb reports it
+    # -- which it reads from the type's TDS -- from what the data dictionary
+    # lists (#1490), measured on 23ai: a NUMBER with neither is (0, -127), one
+    # with a scale alone (38, s); a FLOAT of any b is (126, -127), a REAL
+    # (63, -127); INTEGER and SMALLINT are (38, 0); a timestamp is (0, its
+    # fractional precision).
+    base = _base_type_name(type_name)
+    if base in ('NUMBER', 'DECIMAL'):
+        if precision is None:
+            return (0, -127) if scale is None else (38, int(scale))
+        return (int(precision), int(scale or 0))
+    if base == 'REAL':
+        return (63, -127)
+    if base in ('FLOAT', 'DOUBLE PRECISION'):
+        return (126, -127)
+    if base in ('INTEGER', 'SMALLINT'):
+        return (38, 0)
+    if base.startswith('TIMESTAMP'):
+        return (0, 6 if scale is None else int(scale))
+    return (None, None)
+
+
+def _object_attr(layout: dict) -> DbObjectAttr:
+    typ = _attr_type(layout)
+    (precision, scale) = (
+        (None, None)
+        if isinstance(typ, DbObjectType)
+        else _precision_scale(
+            layout.get('type_name'), layout.get('precision'), layout.get('scale')
+        )
+    )
+    return DbObjectAttr(
+        layout.get('name'), typ, precision, scale, layout.get('max_size')
+    )
 
 
 def lob_attribute_csfrm(Attr: dict) -> int:
