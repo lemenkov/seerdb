@@ -47,6 +47,7 @@ from seerdb.client.connection import (
     _normalize_sessionless_txn_id,
     _parse_accept_eor,
     _parse_accept_sdu,
+    _type_attr,
 )
 from seerdb.client.dialect import (
     CAP_ARRAY_DML,
@@ -1466,6 +1467,31 @@ class AsyncOracleConnect(_ConnectionLogic):
             raise DatabaseError(f'object type {name!r} not found')
         return cast('DbObjectType', Typ)
 
+    async def _type_attr_rows(self, owner: str, name: str) -> list:
+        """Async port of `OracleConnect._type_attr_rows` (#1490)."""
+        from seerdb.client.connection import (
+            _ORA_INVALID_IDENTIFIER,
+            _TYPE_ATTRS_SQL,
+            _error_code,
+        )
+        from seerdb.common.exceptions import DatabaseError
+
+        if getattr(self, '_type_attrs_char_used', True):
+            try:
+                Result = await self.execute(
+                    _TYPE_ATTRS_SQL.format(', char_used'), Bind=[owner, name]
+                )
+            except DatabaseError as error:
+                if getattr(error, 'code', None) != _ORA_INVALID_IDENTIFIER:
+                    raise
+                Result = None
+            if Result is not None and _error_code(Result) != _ORA_INVALID_IDENTIFIER:
+                return self._rows(Result)
+            self._type_attrs_char_used = False
+        return self._rows(
+            await self.execute(_TYPE_ATTRS_SQL.format(''), Bind=[owner, name])
+        )
+
     async def _describe_rowtype(
         self, schema: str | None, table: str
     ) -> 'DbObjectType | None':
@@ -1493,8 +1519,8 @@ class AsyncOracleConnect(_ConnectionLogic):
         if not Rows:
             return None
         Attrs = []
-        for ColumnName, DataType, TypeOwner in Rows:
-            Attr = _rowtype_attr(ColumnName, DataType)
+        for ColumnName, DataType, TypeOwner, Length, Precision, Scale in Rows:
+            Attr = _rowtype_attr(ColumnName, DataType, Length, Precision, Scale)
             if TypeOwner:
                 Attr['object_type'] = await self._describe_object_type(
                     TypeOwner, DataType
@@ -1566,8 +1592,6 @@ class AsyncOracleConnect(_ConnectionLogic):
     ) -> 'DbObjectType | None':
         from seerdb.common.dbobject import (
             DbObjectType,
-            national_charset,
-            type_name_to_tns,
         )
 
         OidRes = await self.execute(
@@ -1578,23 +1602,11 @@ class AsyncOracleConnect(_ConnectionLogic):
         OidRows = self._rows(OidRes)
         Oid = bytes(OidRows[0][0]) if OidRows and OidRows[0][0] else b''
         TypeCode = OidRows[0][1] if OidRows else None
-        Result = await self.execute(
-            'SELECT attr_name, attr_type_name, attr_type_owner, length, '
-            'precision, scale, character_set_name FROM all_type_attrs '
-            'WHERE owner = :1 AND type_name = :2 '
-            'ORDER BY attr_no',
-            Bind=[Owner, name],
-        )
-        Rows = self._rows(Result)
+        Rows = await self._type_attr_rows(Owner, name)
         Attrs = []
         for Row in Rows:
             TypeName, TypeOwner = Row[1], Row[2]
-            Attr: dict = {
-                'name': Row[0],
-                'type_name': TypeName,
-                'data_type': type_name_to_tns(TypeName),
-                'charset': national_charset(Row[6]),
-            }
+            Attr: dict = _type_attr(Row)
             if TypeOwner:
                 # A nested object / collection attribute (#1268): embed its own
                 # layout so the image codec can recurse into it, as the sync
