@@ -3164,15 +3164,6 @@ _IDIOM_REWRITES: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str
     # PostgreSQL has no such suffix, so drop it. A decimal point is required so
     # this never touches an identifier or a plain integer.
     (re.compile(r'\b(\d+\.\d+)[dfDF]\b'), r'\1'),
-    # FROM dual CONNECT BY LEVEL <= N — Oracle's row-generator idiom (LEVEL counts
-    # 1..N). PostgreSQL has no CONNECT BY, but this common counter form maps to
-    # generate_series aliased `level`, so a bare `LEVEL` in the select list resolves
-    # to its column. Only this literal-bound counter shape is handled; a general
-    # CONNECT BY hierarchical query stays Oracle-only (#531).
-    (
-        re.compile(r'\bFROM\s+dual\s+CONNECT\s+BY\s+LEVEL\s*<=\s*(\d+)', re.IGNORECASE),
-        r'FROM generate_series(1, \1) AS level',
-    ),
     # Oracle's MINUS set operator is PostgreSQL's EXCEPT (#759, reflection uses it).
     (re.compile(r'\bMINUS\b', re.IGNORECASE), 'EXCEPT'),
     # Sequence pseudo-columns: Oracle's `seq.nextval` / `seq.currval` are
@@ -3794,6 +3785,40 @@ def _constructor_items(sql: str) -> dict[int, str]:
     return found
 
 
+# FROM dual CONNECT BY LEVEL | ROWNUM <= | < n -- Oracle's row generator, which
+# counts 1..n. PostgreSQL has no CONNECT BY; the counter maps to generate_series
+# aliased `level`, so a bare LEVEL in the select list resolves to its column
+# (#531). n may be a literal or a bind (#1558).
+_ROW_GENERATOR = re.compile(
+    r'\bFROM\s+dual\s+CONNECT\s+BY\s+(?:LEVEL|ROWNUM)\s*(<=|<)\s*(\d+|:\w+)',
+    re.IGNORECASE,
+)
+
+
+def _translate_row_generator(sql: str) -> str:
+    """The row generator as generate_series (#531, #1558). Its ROWNUM numbers
+    the rows as LEVEL does, so ROWNUM there is the `level` column too; `< n` is
+    n - 1 rows. A bound n is taken as Oracle compares a NUMBER with it: LEVEL <=
+    2.5 stops at 2, LEVEL < 2.5 at 2 as well."""
+    (masked, contents) = _mask_quoted(sql)
+    found = _ROW_GENERATOR.search(masked)
+    if found is None:
+        return sql
+    (op, bound) = found.groups()
+    if bound.isdigit():
+        upper = str(int(bound) - 1) if op == '<' else bound
+    elif op == '<=':
+        upper = f'floor(({bound})::numeric)::bigint'
+    else:
+        upper = f'ceil(({bound})::numeric)::bigint - 1'
+    masked = (
+        masked[: found.start()]
+        + f'FROM generate_series(1, {upper}) AS level'
+        + masked[found.end() :]
+    )
+    return _unmask_quoted(_ROWNUM_WORD.sub('level', masked), contents)
+
+
 def _rewrite_rownum(sql: str) -> str:
     """Translate `... WHERE a AND ROWNUM <= n` to `... WHERE a LIMIT n` (#1271).
 
@@ -4080,6 +4105,7 @@ def _translate_idioms(sql: str) -> str:
     PostgreSQL equivalents (#502). Applied to every statement."""
     sql = _quote_hash_identifiers(sql)
     sql = _cast_literal_items(sql)
+    sql = _translate_row_generator(sql)
     sql = _rewrite_rownum(sql)
     sql = _translate_deref(sql)
     sql = _translate_connect_by(sql)
