@@ -2722,6 +2722,7 @@ class _RecordingPostgresBackend(PostgresBackend):
     def __init__(self) -> None:
         self._conn = _RecordingConn()
         self._sql_dialect = 'oracle'
+        self._reporting = False
 
 
 def test_transaction_control_runs_outside_the_statement_savepoint() -> None:
@@ -4228,6 +4229,84 @@ def test_native_postgresql_over_the_oracle_connection() -> None:
         except Exception:
             backend.rollback()
         backend.close()
+
+
+def test_the_translation_report_names_the_rules_a_statement_needed() -> None:
+    # Each translation step notes its name when it changes the text, while a
+    # report is being taken (#1557); a portable statement needs none, and with
+    # no report nothing is collected.
+    from postgres_backend import _TRANSLATION_RULES
+
+    rules: list[str] = []
+    token = _TRANSLATION_RULES.set(rules)
+    try:
+        _translate_idioms('SELECT NVL(a, 1), SYSDATE FROM t MINUS SELECT 1, 2 FROM u')
+        assert rules == ['nvl', 'sysdate', 'minus']
+        rules.clear()
+        _translate_idioms('SELECT coalesce(a, 1) FROM t WHERE b = :1')
+        assert rules == []
+    finally:
+        _TRANSLATION_RULES.reset(token)
+    _translate_idioms('SELECT NVL(a, 1) FROM t')  # no report: nothing to note
+
+
+def test_the_translation_report_folds_a_statements_literals() -> None:
+    # Runs with different values count as one statement; a quoted identifier
+    # and a bind stay as written (#1557).
+    from postgres_backend import _normalise_statement
+
+    assert (
+        _normalise_statement(
+            "select 'it''s',  12, -3.5e2,\n\"col 1\", t1.c2 from t where a = :1"
+        )
+        == 'select ?, ?, -?, "col 1", t1.c2 from t where a = :1'
+    )
+
+
+def test_the_translation_report_records_runs_apart_from_the_transaction() -> None:
+    # With the report on, every run is recorded: the rules it needed, a
+    # failure and its error, a native statement (#1556). The log is written on
+    # its own connection, so the client's rollback leaves it, and ALTER SESSION
+    # turns the report off and on (#1557).
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(
+        _CONNINFO, credentials=dict(_CREDS), translation_report=True
+    )
+    probe = psycopg.connect(_CONNINFO, autocommit=True)
+    marker = 'rep1557t'
+    try:
+        probe.execute(
+            'DELETE FROM sys.ora_translation_log WHERE statement LIKE %s',
+            (f'%{marker}%',),
+        )
+        for value in (1, 2):
+            backend.execute(f'SELECT NVL(NULL, {value}) AS {marker} FROM dual')
+        backend.execute(f'SELECT /*+ PG */ 1 AS {marker}')
+        with pytest.raises(BackendError):
+            backend.execute(f'SELECT no_such_column AS {marker} FROM dual')
+        backend.execute('ALTER SESSION SET seerdb_translation_report = false')
+        backend.execute(f"SELECT NVL(NULL, 'off') AS {marker}x FROM dual")
+        backend.execute('ALTER SESSION SET seerdb_translation_report = true')
+        backend.rollback()
+        backend.close()
+        logged = probe.execute(
+            'SELECT statement, rules, runs, failures, native, last_error '
+            'FROM sys.ora_translation_log WHERE statement LIKE %s ORDER BY statement',
+            (f'%{marker}%',),
+        ).fetchall()
+        assert [(r[0], r[1], r[2], r[3], r[4]) for r in logged] == [
+            (f'SELECT /*+ PG */ ? AS {marker}', [], 1, 0, True),
+            (f'SELECT NVL(NULL, ?) AS {marker} FROM dual', ['nvl'], 2, 0, False),
+            (f'SELECT no_such_column AS {marker} FROM dual', [], 1, 1, False),
+        ]
+        assert 'no_such_column' in logged[2][5]
+    finally:
+        probe.execute(
+            'DELETE FROM sys.ora_translation_log WHERE statement LIKE %s',
+            (f'%{marker}%',),
+        )
+        probe.close()
 
 
 def test_dbms_lock_and_dbms_session_sleep() -> None:
