@@ -280,8 +280,15 @@ def test_translate_ddl_maps_create_table_column_types() -> None:
     )
     assert sent == (
         'CREATE TABLE t (a numeric, b numeric, c numeric, d numeric, '
-        'e double precision)'
+        'e double precision); CREATE OR REPLACE TRIGGER ora_float_round BEFORE '
+        'INSERT OR UPDATE ON t FOR EACH ROW EXECUTE FUNCTION sys.ora_float_round()'
     )
+    # Rounded by b, which the trigger reads (#1422); so is a column an ALTER
+    # adds or makes FLOAT, and a table with none has no trigger.
+    assert _translate_ddl('ALTER TABLE t MODIFY (n FLOAT(5))').endswith(
+        'ON t FOR EACH ROW EXECUTE FUNCTION sys.ora_float_round()'
+    )
+    assert 'TRIGGER' not in _translate_ddl('CREATE TABLE t (e BINARY_FLOAT)')
     # So are an object's attributes, their declarations recorded (#1423).
     assert 'AS (r numeric, f numeric, g double precision)' in _translate_ddl(
         'CREATE TYPE o AS OBJECT (r REAL, f FLOAT, g BINARY_DOUBLE)'
@@ -1956,9 +1963,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     ):
         assert f'FUNCTION {name}(' in _HELPER_FUNCTIONS_DDL
     # 47, ora_div (#1361) and power (#1362) for each of the nine pairs of
-    # integer types, sys.ora_to_raw's two overloads (#1496) and
-    # sys.ora_raw_fits (#1415).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 68
+    # integer types, sys.ora_to_raw's two overloads (#1496), sys.ora_raw_fits
+    # (#1415) and sys.ora_float_round (#1422).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 69
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
@@ -4120,6 +4127,74 @@ def test_an_objects_raw_attribute_is_raw() -> None:
         except Exception:
             backend.rollback()
         backend.close()
+
+
+def test_a_float_column_keeps_the_digits_its_bits_hold() -> None:
+    # FLOAT(b) keeps ceil(b * log10(2)) significant digits, rounded half away
+    # from zero: 1, 4, 16, 19 (REAL) and 38 (FLOAT) here (#1422). INSERT and
+    # UPDATE alike, and an ALTER moves the limit. The values are 23ai's; long
+    # literals, as PostgreSQL divides to fewer digits than Oracle.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE TABLE f1422 (id NUMBER, a FLOAT(1), b FLOAT(10), c FLOAT(53), '
+            'd REAL, e FLOAT)'
+        )
+        for i, value in enumerate(
+            (
+                '0.' + '3' * 42,
+                '-0.' + '6' * 42,
+                '123456789.123456789',
+                '0.000123456789',
+                '9.99951',
+                '25',
+            )
+        ):
+            backend.execute(
+                f'INSERT INTO f1422 VALUES ({i}, {value}, {value}, {value}, '
+                f'{value}, {value})'
+            )
+        backend.execute('UPDATE f1422 SET b = 98765.4321 WHERE id = 5')
+        rows = backend.execute('SELECT a, b, c, d, e FROM f1422 ORDER BY id').rows
+        expected = [
+            ('0.3', '0.3333', '0.' + '3' * 16, '0.' + '3' * 19, '0.' + '3' * 38),
+            (
+                '-0.7',
+                '-0.6667',
+                '-0.' + '6' * 15 + '7',
+                '-0.' + '6' * 18 + '7',
+                '-0.' + '6' * 37 + '7',
+            ),
+            (
+                '1E8',
+                '1.235E8',
+                '123456789.1234568',
+                '123456789.123456789',
+                '123456789.123456789',
+            ),
+            (
+                '0.0001',
+                '0.0001235',
+                '0.000123456789',
+                '0.000123456789',
+                '0.000123456789',
+            ),
+            ('10', '10', '9.99951', '9.99951', '9.99951'),
+            ('30', '98770', '25', '25', '25'),
+        ]
+        assert [tuple(row) for row in rows] == [
+            tuple(Decimal(value) for value in row) for row in expected
+        ]
+        backend.execute('ALTER TABLE f1422 MODIFY (b FLOAT(20))')
+        backend.execute('UPDATE f1422 SET b = 98765.4321 WHERE id = 5')
+        (row,) = backend.execute('SELECT b FROM f1422 WHERE id = 5').rows
+        assert row[0] == Decimal('98765.43')
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE f1422')
+        except Exception:
+            backend.rollback()
 
 
 def test_an_objects_float_attribute_is_a_number_of_binary_precision() -> None:

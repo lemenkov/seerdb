@@ -375,6 +375,22 @@ _HELPER_FUNCTIONS_DDL = (
     'MESSAGE = format(\'value too large for column "%s"."%s"."%s" '
     "(actual: %s, maximum: %s)', sys.ora_owner(current_schema()), $3, $4, "
     'octet_length($1), $2); END IF; RETURN true; END $$;'
+    # A FLOAT(b) column's value as Oracle stores it, rounded to the significant
+    # digits b bits hold, ceil(b * log10(2)), half away from zero (#1422). The
+    # trigger a table with a FLOAT column has; each column's b is the one
+    # sys.ora_columns records, so an ALTER of the column changes it in step.
+    'CREATE OR REPLACE FUNCTION sys.ora_float_round() RETURNS trigger '
+    'LANGUAGE plpgsql AS $$ DECLARE c record; v numeric; '
+    "rounded jsonb := '{}'; BEGIN FOR c IN SELECT a.attname, o.data_precision "
+    'FROM sys.ora_columns o JOIN pg_attribute a ON a.attrelid = o.relid '
+    "AND a.attnum = o.attnum WHERE o.relid = TG_RELID AND o.data_type = 'FLOAT' "
+    'AND NOT a.attisdropped LOOP v := (to_jsonb(NEW) ->> c.attname)::numeric; '
+    "IF v <> 0 AND abs(v) < 'Infinity' THEN rounded := rounded || "
+    'jsonb_build_object(c.attname, trim_scale(round(v, '
+    'ceil(c.data_precision * log(2::numeric))::integer - 1 '
+    '- floor(log(abs(v)))::integer))); END IF; END LOOP; '
+    "IF rounded <> '{}' THEN NEW := jsonb_populate_record(NEW, rounded); END IF; "
+    'RETURN NEW; END $$;'
     # RAWTOHEX(x) → the hex text of a bytea. Oracle returns upper-case hex.
     'CREATE OR REPLACE FUNCTION rawtohex(bytea) RETURNS text '
     "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT upper(encode($1, 'hex')) $$;"
@@ -3171,7 +3187,23 @@ def _translate_ddl(sql: str) -> str:
     out = _DDL_ORG_INDEX.sub('', out)
     out = _strip_nested_table_storage(out)
     out = _DDL_COMPRESSION.sub(')', out)
-    return _translate_column_types(out)
+    table = _CREATE_TABLE_NAME.match(sql)
+    if table is None or not _DDL_FLOAT_COLUMN.search(out):
+        return _translate_column_types(out)
+    return _translate_column_types(out).rstrip().rstrip(';') + _float_rounding(
+        table.group(1)
+    )
+
+
+def _float_rounding(table: str) -> str:
+    # The trigger that rounds a FLOAT(b) column's values as Oracle stores them
+    # (#1422), for a table that has or gains one. It reads which columns are
+    # FLOAT, and their b, from sys.ora_columns, so one per table serves them all
+    # and a column no longer FLOAT is passed over.
+    return (
+        '; CREATE OR REPLACE TRIGGER ora_float_round BEFORE INSERT OR UPDATE '
+        f'ON {table} FOR EACH ROW EXECUTE FUNCTION sys.ora_float_round()'
+    )
 
 
 def _oracle_identifier_text(name: str) -> str:
@@ -3292,7 +3324,12 @@ def _translate_alter_columns(sql: str) -> str | None:
         if modified is None:
             return None
         actions.extend(modified)
-    return f'ALTER TABLE {table} ' + ', '.join(actions) if actions else None
+    if not actions:
+        return None
+    altered = f'ALTER TABLE {table} ' + ', '.join(actions)
+    if _DDL_FLOAT_COLUMN.search(sql[spans[0][0] : spans[-1][1]]):
+        altered += _float_rounding(table)
+    return altered
 
 
 def _modify_actions(table: str, column: str, rest: str) -> list[str] | None:
