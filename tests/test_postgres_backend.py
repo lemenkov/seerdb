@@ -4309,6 +4309,44 @@ def test_the_translation_report_records_runs_apart_from_the_transaction() -> Non
         probe.close()
 
 
+def test_a_collection_of_raw_is_a_collection_of_raw() -> None:
+    # A collection of RAW(n) was reported as one of BLOB: its domain is over
+    # bytea[], which keeps no length (#1545). The element's type and n are
+    # recorded with the DDL, as a national element's are (#1437): the
+    # dictionary, the TDS -- 23ai's byte for byte, leaf `13 0014` -- and the
+    # element's description say RAW.
+    from postgres_backend import _tds
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TYPE rc1545 AS TABLE OF RAW(20)')
+        backend.execute('CREATE TYPE rv1545 AS VARRAY(3) OF RAW(4)')
+        backend.commit()
+        result = backend.execute(
+            'SELECT type_name, elem_type_name, length, character_set_name '
+            "FROM user_coll_types WHERE type_name LIKE 'R_1545' ORDER BY 1"
+        )
+        assert result.rows == [
+            ('RC1545', 'RAW', 20, None),
+            ('RV1545', 'RAW', 4, None),
+        ]
+        pg_oid = backend._conn.execute("SELECT 'rc1545'::regtype::oid").fetchone()[0]
+        assert _tds(backend._type_shape(pg_oid)).hex() == (
+            '0000001e260100010001ff290000000000131c0000001d00000000022a1300140007'
+        )
+        element = backend._collection_type(pg_oid).element
+        assert (element['type_name'], element['charset']) == ('RAW', None)
+    finally:
+        backend.rollback()
+        for name in ('rc1545', 'rv1545'):
+            try:
+                backend.execute(f'DROP TYPE {name}')
+                backend.commit()
+            except Exception:
+                backend.rollback()
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships

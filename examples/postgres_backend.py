@@ -99,9 +99,9 @@ edge of this adapter:
   attribute cursor 23ai sends; an attribute is reported as the DDL translation
   stored it. An ``NVARCHAR2`` / ``NCHAR`` / ``NCLOB`` / ``RAW(n)`` / ``FLOAT``
   / ``REAL`` / ``DOUBLE PRECISION`` attribute, and an ``NVARCHAR2`` /
-  ``NCHAR`` collection element, keep the type the DDL declared; a ``DATE``
-  attribute is ``ora_date``, as a ``DATE`` column is, and reads as ``DATE``; a
-  ``RAW(n)`` element reads as ``BLOB``. PL/SQL package
+  ``NCHAR`` / ``RAW(n)`` collection element, keep the type the DDL declared; a
+  ``DATE`` attribute is ``ora_date``, as a ``DATE`` column is, and reads as
+  ``DATE``. PL/SQL package
   types (``all_plsql_types``) are not described.
 - **``REF`` / ``DEREF``, with a visible object id** — an Oracle object table
   (``CREATE TABLE t OF type``) gives every row a hidden object id that a REF names.
@@ -995,11 +995,14 @@ _ORACLE_DICTIONARY_DDL = (
     'relid oid NOT NULL, attnum smallint NOT NULL, data_type text NOT NULL, '
     'data_length integer, data_precision integer, data_scale integer, '
     'PRIMARY KEY (relid, attnum));'
-    # The national type a collection of NVARCHAR2 / NCHAR was declared with
-    # (#1437). A collection is a domain over an array, with no relation for
-    # sys.ora_columns to key a row by, so it is kept here by the domain's oid.
+    # The type a collection's elements were declared as, where PostgreSQL keeps
+    # less of it: an NVARCHAR2 / NCHAR (#1437), a RAW(n) and its n (#1545). A
+    # collection is a domain over an array, with no relation for sys.ora_columns
+    # to key a row by, so it is kept here by the domain's oid.
     'CREATE TABLE IF NOT EXISTS sys.ora_collection_elements ('
     'typid oid PRIMARY KEY, data_type text NOT NULL);'
+    'ALTER TABLE sys.ora_collection_elements '
+    'ADD COLUMN IF NOT EXISTS data_length integer;'
     # The translation report (#1557): per normalised statement, the translation
     # rules it needed, how often it ran and failed, and whether it came as native
     # PostgreSQL (#1556). Keyed by a hash, as a statement may be longer than an
@@ -1410,21 +1413,23 @@ _ORACLE_DICTIONARY_DDL = (
     "CASE WHEN e.typtype = 'c' OR (e.typtype = 'd' AND eb.typcategory = 'A') "
     'THEN ora_name(e.typname) '
     "WHEN e.oid = 142 THEN 'XMLTYPE' "
-    # An NVARCHAR2 / NCHAR element, told apart by its record (#1437).
+    # An NVARCHAR2 / NCHAR (#1437) or RAW(n) (#1545) element, told apart by its
+    # record.
     'WHEN x.data_type IS NOT NULL THEN x.data_type '
     f"WHEN e.typname = '{_CLOB_TYPE}' THEN 'CLOB' WHEN e.typname = '{_BLOB_TYPE}' THEN 'BLOB' "
     'ELSE ora_type_name(format_type(e.oid, NULL)) END AS elem_type_name, '
     'NULL::text AS elem_type_package, '
     # The element's size, which the domain's typmod carries for its elements: a
     # character length, or a NUMBER's precision and scale (#1206).
-    'CASE WHEN e.oid IN (1042, 1043) AND d.typtypmod > 4 '
+    "CASE WHEN x.data_type = 'RAW' THEN x.data_length "
+    'WHEN e.oid IN (1042, 1043) AND d.typtypmod > 4 '
     'THEN d.typtypmod - 4 END AS length, '
     'CASE WHEN e.oid = 1700 AND d.typtypmod >= 4 '
     'THEN (d.typtypmod - 4) >> 16 END AS precision, '
     'CASE WHEN e.oid = 1700 AND d.typtypmod >= 4 '
     'THEN (d.typtypmod - 4) & 65535 END AS scale, '
     # The element's character set, as all_type_attrs gives an attribute's (#1433).
-    "CASE WHEN x.data_type IS NOT NULL THEN 'NCHAR_CS' "
+    "CASE WHEN x.data_type IN ('NVARCHAR2', 'NCHAR') THEN 'NCHAR_CS' "
     f"WHEN e.oid IN (25, 1042, 1043) OR e.typname = '{_CLOB_TYPE}' "
     "THEN 'CHAR_CS' END::text AS character_set_name "
     'FROM pg_type d JOIN pg_namespace n ON n.oid = d.typnamespace '
@@ -2165,12 +2170,12 @@ def _declared_type(
     return None
 
 
-# CREATE [OR REPLACE] TYPE t AS VARRAY(n) | TABLE OF NVARCHAR2 / NCHAR: a
-# collection of a national type, which sys.ora_collection_elements records
-# (#1437).
-_CREATE_NATIONAL_COLLECTION = re.compile(
+# CREATE [OR REPLACE] TYPE t AS VARRAY(n) | TABLE OF NVARCHAR2 / NCHAR / RAW(n):
+# a collection whose element sys.ora_collection_elements records (#1437, #1545).
+_CREATE_RECORDED_COLLECTION = re.compile(
     r'\s*CREATE\s+(?:OR\s+REPLACE\s+)?TYPE\s+(\S+)\s+(?:FORCE\s+)?(?:AS|IS)\s+'
-    r'(?:VARRAY\s*\(\s*\d+\s*\)|TABLE)\s+OF\s+(NVARCHAR2|NCHAR)\b',
+    r'(?:VARRAY\s*\(\s*\d+\s*\)|TABLE)\s+OF\s+(NVARCHAR2|NCHAR|RAW)\b'
+    r'(?:\s*\(\s*(\d+)\s*\))?',
     re.IGNORECASE,
 )
 
@@ -6742,32 +6747,36 @@ class PostgresBackend:
 
     def _record_collection_element(self, statement: str) -> None:
         # A collection of NVARCHAR2 / NCHAR keeps its element's national type
-        # (#1437); every DDL prunes the rows of types that are gone.
+        # (#1437), one of RAW(n) its n (#1545); every DDL prunes the rows of
+        # types that are gone.
         if not self._has_collection_elements:
             return
         self._conn.execute(
             'DELETE FROM sys.ora_collection_elements x WHERE NOT EXISTS '
             '(SELECT 1 FROM pg_type t WHERE t.oid = x.typid)'
         )
-        national = _CREATE_NATIONAL_COLLECTION.match(statement)
-        if national is not None:
+        recorded = _CREATE_RECORDED_COLLECTION.match(statement)
+        if recorded is not None:
+            (name, data_type, length) = recorded.groups()
             self._conn.execute(
-                'INSERT INTO sys.ora_collection_elements '
-                'SELECT to_regtype(%s)::oid, %s WHERE to_regtype(%s) IS NOT NULL '
-                'ON CONFLICT (typid) DO UPDATE SET data_type = excluded.data_type',
-                (national.group(1), national.group(2).upper(), national.group(1)),
+                'INSERT INTO sys.ora_collection_elements (typid, data_type, data_length) '
+                'SELECT to_regtype(%s)::oid, %s, %s WHERE to_regtype(%s) IS NOT NULL '
+                'ON CONFLICT (typid) DO UPDATE SET data_type = excluded.data_type, '
+                'data_length = excluded.data_length',
+                (name, data_type.upper(), int(length) if length else None, name),
             )
 
-    def _national_element(self, pg_oid: int) -> str | None:
-        # The national type a collection's elements were declared as, or None
-        # (#1437).
+    def _recorded_element(self, pg_oid: int) -> tuple[str, int | None] | None:
+        # The type a collection's elements were declared as, where it was
+        # recorded -- (type, length) -- or None (#1437, #1545).
         if not self._has_collection_elements:
             return None
         row = self._conn.execute(
-            'SELECT data_type FROM sys.ora_collection_elements WHERE typid = %s',
+            'SELECT data_type, data_length FROM sys.ora_collection_elements '
+            'WHERE typid = %s',
             (pg_oid,),
         ).fetchone()
-        return row[0] if row else None
+        return (row[0], row[1]) if row else None
 
     def _record_view_column_types(self, name: str) -> None:
         # A view's columns take the records of the columns they come from
@@ -7323,15 +7332,17 @@ class PostgresBackend:
                 element=self._collection_element(element),
                 max_elements=upper or 0,
             )
-            national = self._national_element(pg_oid)
-            if national is not None and typ.element is not None:
+            recorded = self._recorded_element(pg_oid)
+            if recorded is not None and typ.element is not None:
                 # A client sends and expects an NVARCHAR2 / NCHAR element in
-                # AL16UTF16 inside the image, as an attribute (#1437).
+                # AL16UTF16 inside the image, as an attribute (#1437); a RAW(n)
+                # element as RAW bytes, not the BLOB a bytea reads as (#1545).
+                declared = recorded[0]
                 typ.element = {
                     **typ.element,
-                    'type_name': national,
-                    'data_type': type_name_to_tns(national),
-                    'charset': AL16UTF16_CHARSET,
+                    'type_name': declared,
+                    'data_type': type_name_to_tns(declared),
+                    'charset': AL16UTF16_CHARSET if declared != 'RAW' else None,
                 }
         self._collection_types[pg_oid] = typ
         return typ
@@ -7535,10 +7546,15 @@ class PostgresBackend:
             'FROM pg_constraint WHERE contypid = %s',
             (pg_oid,),
         ).fetchone()
+        # A recorded element type -- NVARCHAR2 / NCHAR, RAW(n) -- has its own
+        # leaf (#1437, #1545).
+        recorded = self._recorded_element(pg_oid)
         return _TdsCollection(
             varray=bound is not None and bound[0] is not None,
             bound=bound[0] if bound and bound[0] is not None else 0,
-            element=_national_leaf(self._national_element(pg_oid), element_typmod)
+            element=_declared_leaf(
+                (recorded[0], recorded[1], None) if recorded else None, element_typmod
+            )
             or self._type_shape(element, element_typmod),
         )
 
