@@ -1867,8 +1867,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     ):
         assert f'FUNCTION {name}(' in _HELPER_FUNCTIONS_DDL
     # 47, ora_div (#1361) and power (#1362) for each of the nine pairs of
-    # integer types, and sys.ora_to_raw's two overloads (#1496).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 67
+    # integer types, sys.ora_to_raw's two overloads (#1496) and
+    # sys.ora_raw_fits (#1415).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 68
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
@@ -4381,7 +4382,8 @@ def test_oracle_alter_table_column_forms_translate() -> None:
     from postgres_backend import _translate_ddl
 
     assert _translate_ddl('ALTER TABLE t ADD (d DATE, e CLOB, f RAW(5))') == (
-        'ALTER TABLE t ADD COLUMN d ora_date, ADD COLUMN e ora_clob, ADD COLUMN f bytea'
+        'ALTER TABLE t ADD COLUMN d ora_date, ADD COLUMN e ora_clob, ADD COLUMN f bytea '
+        "CONSTRAINT \"ora_raw_len_f\" CHECK (sys.ora_raw_fits(f, 5, 'T', 'F'))"
     )
     assert _translate_ddl("ALTER TABLE t ADD (g VARCHAR2(5) DEFAULT 'q' NOT NULL)") == (
         "ALTER TABLE t ADD COLUMN g varchar(5) DEFAULT 'q' NOT NULL"
@@ -4393,6 +4395,7 @@ def test_oracle_alter_table_column_forms_translate() -> None:
         "ALTER TABLE t MODIFY (a VARCHAR2(20) DEFAULT 'x' NOT NULL, b NULL)"
     ) == (
         'ALTER TABLE t ALTER COLUMN a TYPE varchar(20), '
+        'DROP CONSTRAINT IF EXISTS "ora_raw_len_a", '
         "ALTER COLUMN a SET DEFAULT 'x', ALTER COLUMN a SET NOT NULL, "
         'ALTER COLUMN b DROP NOT NULL'
     )
@@ -4400,7 +4403,8 @@ def test_oracle_alter_table_column_forms_translate() -> None:
         'ALTER TABLE t ALTER COLUMN a SET DEFAULT NULL'
     )
     assert _translate_ddl('ALTER TABLE t MODIFY n NUMBER(7, 2)') == (
-        'ALTER TABLE t ALTER COLUMN n TYPE numeric(7, 2)'
+        'ALTER TABLE t ALTER COLUMN n TYPE numeric(7, 2), '
+        'DROP CONSTRAINT IF EXISTS "ora_raw_len_n"'
     )
     assert _translate_ddl('ALTER TABLE t DROP (e, "F")') == (
         'ALTER TABLE t DROP COLUMN e, DROP COLUMN "F"'
@@ -4512,6 +4516,48 @@ def test_a_character_value_headed_for_raw_is_hex() -> None:
                 backend.execute(statement)
             except Exception:
                 backend.rollback()
+
+
+def test_a_raw_columns_length_is_a_check() -> None:
+    # bytea has no length, so a RAW(n) column carries a named CHECK that
+    # raises Oracle's ORA-12899 (#1415); MODIFY replaces it.
+    assert _translate_ddl('CREATE TABLE t (id NUMBER, r RAW(2) NOT NULL)') == (
+        'CREATE TABLE t (id numeric, r bytea NOT NULL CONSTRAINT "ora_raw_len_r" '
+        "CHECK (sys.ora_raw_fits(r, 2, 'T', 'R')))"
+    )
+
+
+def test_a_raw_value_longer_than_its_column_is_ora_12899() -> None:
+    # Too long by INSERT, by bind and by UPDATE, each ORA-12899 in 23ai's
+    # wording; MODIFY to a wider RAW moves the limit (#1415).
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE rl1415 (id NUMBER, r RAW(2))')
+        backend.execute("INSERT INTO rl1415 VALUES (1, HEXTORAW('0102'))")
+        for statement, binds in (
+            ("INSERT INTO rl1415 VALUES (2, HEXTORAW('010203'))", ()),
+            ('INSERT INTO rl1415 VALUES (3, :1)', [b'abc']),
+            ("UPDATE rl1415 SET r = HEXTORAW('AABBCC') WHERE id = 1", ()),
+        ):
+            with pytest.raises(BackendError) as exc:
+                backend.execute(statement, binds)
+            assert exc.value.ora_code == 12899
+            assert '"RL1415"."R" (actual: 3, maximum: 2)' in str(exc.value)
+            backend.rollback()
+            backend.execute("INSERT INTO rl1415 VALUES (1, HEXTORAW('0102'))")
+        backend.execute('ALTER TABLE rl1415 MODIFY (r RAW(4))')
+        backend.execute("INSERT INTO rl1415 VALUES (4, HEXTORAW('010203'))")
+        with pytest.raises(BackendError) as exc:
+            backend.execute("INSERT INTO rl1415 VALUES (5, HEXTORAW('0102030405'))")
+        assert '(actual: 5, maximum: 4)' in str(exc.value)
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE rl1415')
+        except Exception:
+            backend.rollback()
 
 
 def test_type_attrs_list_char_used() -> None:
