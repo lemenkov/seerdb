@@ -4148,6 +4148,32 @@ _INSERT_VALUES_HEAD = re.compile(
 _UPDATE_SET_HEAD = re.compile(
     rf'\s*UPDATE\s+{_TABLE_NAME}(?:\s+(?!SET\b)[\w$#]+)?\s+SET\b', re.IGNORECASE
 )
+# A single-table statement's table and alias, on masked text (#1496): SELECT ...
+# FROM t [a], UPDATE t [a] SET, DELETE [FROM] t [a].
+_SINGLE_TABLE_FROM = re.compile(
+    rf'\bFROM\s+{_TABLE_NAME}(?:\s+(?!WHERE\b|ORDER\b|GROUP\b|FOR\b)([A-Za-z_][\w$#]*))?'
+    r'\s*(?=WHERE\b|ORDER\b|GROUP\b|FOR\b|$|\))',
+    re.IGNORECASE,
+)
+_DELETE_FROM_HEAD = re.compile(
+    rf'\s*DELETE\s+(?:FROM\s+)?{_TABLE_NAME}(?:\s+(?!WHERE\b)([A-Za-z_][\w$#]*))?',
+    re.IGNORECASE,
+)
+# A comparison of a column with a value, either way round, and an IN list
+# (#1496); the value a literal (as masked) or a bind.
+_RAW_VALUE = r'(?:[Nn]?\'\x00\d+\x00\'|:(?:\w+|"[^"]+"))'
+_RAW_COMPARISON = re.compile(
+    rf'(?:([A-Za-z_][\w$#]*)\s*\.\s*)?([A-Za-z_][\w$#]*|"[^"]+")\s*'
+    rf'(?:=|<>|!=|\^=|<=|>=|<|>)\s*({_RAW_VALUE})'
+)
+_RAW_COMPARISON_REVERSED = re.compile(
+    rf'({_RAW_VALUE})\s*(?:=|<>|!=|\^=|<=|>=|<|>)\s*'
+    r'(?:([A-Za-z_][\w$#]*)\s*\.\s*)?([A-Za-z_][\w$#]*|"[^"]+")(?![\w$#]|\s*\()'
+)
+_RAW_IN_LIST = re.compile(
+    r'(?:([A-Za-z_][\w$#]*)\s*\.\s*)?([A-Za-z_][\w$#]*|"[^"]+")\s+IN\s*\(',
+    re.IGNORECASE,
+)
 # A value Oracle converts to RAW as hex: a string literal (as masked) or a bind.
 _RAW_TARGET_VALUE = re.compile(r'\s*(?:[Nn]?\'\x00\d+\x00\'|:(?:\w+|"[^"]+"))\s*')
 _CALL_HEAD = re.compile(r'(?<![\w$#."])([A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)?)\s*\(')
@@ -7113,6 +7139,7 @@ class PostgresBackend:
                     )
                     if column in names and names.index(column) in raw:
                         spans.append((equals + 1, stop))
+        spans += self._raw_comparison_spans(masked, contents)
         constructors = self._raw_constructors()
         if constructors:
             for call in _CALL_HEAD.finditer(masked):
@@ -7132,6 +7159,67 @@ class PostgresBackend:
         for a, b in sorted(spans, reverse=True):
             masked = f'{masked[:a]} sys.ora_to_raw({masked[a:b].strip()}){masked[b:]}'
         return _unmask_quoted(masked, contents)
+
+    def _raw_comparison_spans(self, masked: str, contents: list[str]) -> list:
+        # The values a single-table statement's WHERE compares with a RAW column
+        # of its table, which Oracle reads as hex too (#1496): at the clause's
+        # top level, either way round, and an IN list's items. A comparison in a
+        # subquery or parentheses is left alone -- its column may be another
+        # table's.
+        words, _rownums = _top_level_words(masked)
+        where = next((p for p, w in words if w == 'WHERE'), None)
+        if where is None or not words:
+            return []
+        head = _UPDATE_SET_HEAD.match(masked) or _DELETE_FROM_HEAD.match(masked)
+        if head is None and words[0][1] == 'SELECT':
+            head = _SINGLE_TABLE_FROM.search(masked, 0, where + 5)
+        if head is None:
+            return []
+        table = _unmask_quoted(head.group(1), contents)
+        alias = head.group(2) if head.re.groups >= 2 else None
+        layout = self._raw_layout(table)
+        if layout is None or not layout[1]:
+            return []
+        (names, raw) = layout
+        qualifiers = {table.split('.')[-1].strip('"').lower()}
+        if alias:
+            qualifiers.add(alias.lower())
+        end = next(
+            (
+                p
+                for p, w in words
+                if p > where and w in ('ORDER', 'GROUP', 'HAVING', 'RETURNING', 'FOR')
+            ),
+            len(masked.rstrip().rstrip(';')),
+        )
+        depth = [0] * (len(masked) + 1)
+        level = 0
+        for i, char in enumerate(masked):
+            depth[i] = level
+            level += {'(': 1, ')': -1}.get(char, 0)
+
+        def is_raw(qualifier: str | None, column: str) -> bool:
+            name = _pg_identifier(column)
+            return (
+                (qualifier is None or qualifier.lower() in qualifiers)
+                and name in names
+                and names.index(name) in raw
+            )
+
+        spans = []
+        for m in _RAW_COMPARISON.finditer(masked, where, end):
+            if depth[m.start()] == depth[where] and is_raw(m.group(1), m.group(2)):
+                spans.append(m.span(3))
+        for m in _RAW_COMPARISON_REVERSED.finditer(masked, where, end):
+            if depth[m.start()] == depth[where] and is_raw(m.group(2), m.group(3)):
+                spans.append(m.span(1))
+        for m in _RAW_IN_LIST.finditer(masked, where, end):
+            if depth[m.start()] == depth[where] and is_raw(m.group(1), m.group(2)):
+                open_at = m.end() - 1
+                spans += _top_level_items(
+                    masked, open_at + 1, _matching_paren(masked, open_at)
+                )
+        return spans
 
     def _collection_names(self) -> frozenset[str]:
         # The collection types (array domains) of the user schemas, by name and
