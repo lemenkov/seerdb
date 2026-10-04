@@ -437,6 +437,28 @@ def test_app_context_entries_survive_the_sorted_pairs() -> None:
     ]
 
 
+def test_app_context_keeps_each_entry_whatever_its_values_sort_as() -> None:
+    # Decoded from the wire: values that do not sort in their declared order
+    # stay with their own attribute. decode_kv sorted whole (key, value) pairs,
+    # so a key's values came out in value order and the entries were paired up
+    # wrongly -- a test with VALUE1..VALUE3 could not tell (#1582).
+    from seerdb.common.tns import decode_kv, encode_kv
+    from seerdb.server.auth import _group_app_context
+
+    entries = [
+        ('CLIENTCONTEXT', 'ATTR1', 'VALUE1'),
+        ('clientcontext', 'Attr2', 'Mixed Case'),
+        ('CLIENTCONTEXT', 'ATTR3', 'v3'),
+    ]
+    wire = b''.join(
+        encode_kv(f'AUTH_APPCTX_{key}'.encode(), value.encode())
+        for entry in entries
+        for key, value in zip(('NSPACE', 'ATTR', 'VALUE'), entry, strict=True)
+    )
+    (pairs, _rest) = decode_kv(wire, 3 * len(entries), [])
+    assert _group_app_context(pairs) == entries
+
+
 def test_app_context_ignores_everything_else_in_the_auth() -> None:
     # The auth message is mostly NOT application context; a login with none at
     # all must come back empty rather than mis-pair whatever else is there.

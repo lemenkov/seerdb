@@ -13664,6 +13664,14 @@ def encode_chr(String: str | bytes) -> bytes:
     return bytes([Length]) + Bytes
 
 
+def _sorted_by_key(pairs: list) -> list:
+    # The pairs in key order, each key's own in the order they came (a stable
+    # sort by the key alone). Sorting whole (key, value) tuples put a repeated
+    # key's values in value order, and the Mirror's reading of a login's
+    # repeated application-context triples paired them up wrongly (#1582).
+    return sorted(pairs, key=lambda pair: pair[0])
+
+
 def decode_kv(
     Data: bytes, Num: int, Acc: list, Flags: dict | None = None
 ) -> tuple[list, bytes]:
@@ -13671,7 +13679,7 @@ def decode_kv(
     # key name — needed for AUTH_VFR_DATA, whose flag names the verifier type
     # (#311). Left None by default so existing callers are unchanged.
     if Num <= 0 or not Data:
-        return (sorted(Acc), Data)
+        return (_sorted_by_key(Acc), Data)
 
     def decode_to_bin(D):
         if D[0] == 0:
@@ -13694,7 +13702,7 @@ def decode_kv(
         Val = None
     NewAcc = Acc + [(Key, Val)]
     if not R1:
-        return (sorted(NewAcc), R1)
+        return (_sorted_by_key(NewAcc), R1)
     Skip = R1[0] + 1
     return decode_kv(R1[Skip:], Num - 1, NewAcc, Flags)
 
