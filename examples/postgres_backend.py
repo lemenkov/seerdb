@@ -702,7 +702,9 @@ _ORAFCE_HELPERS_DDL = (
 # UTL_RAW — Oracle's RAW/bytea manipulation package (#765). orafce does not ship
 # it, so the backend installs it as PostgreSQL functions in a `utl_raw` schema, and
 # a schema-qualified Oracle call (UTL_RAW.CAST_TO_RAW(...)) resolves to it
-# case-insensitively. Bytes are the DB charset (UTF-8) for the varchar2/raw casts;
+# case-insensitively. A function taking a RAW takes a character value too, as
+# hex, as Oracle converts one (#1496): a text overload beside each, which
+# PostgreSQL picks for a string literal or a str bind. Bytes are the DB charset (UTF-8) for the varchar2/raw casts;
 # BIT_AND/OR/XOR follow Oracle's rule that the unprocessed tail of the longer
 # operand is appended after the shorter one runs out. The bodies qualify
 # pg_catalog.length so utl_raw.length does not recurse into itself when a
@@ -743,6 +745,23 @@ CREATE OR REPLACE FUNCTION utl_raw.bit_or(bytea, bytea) RETURNS bytea
   LANGUAGE sql IMMUTABLE AS $$ SELECT utl_raw._bitop($1, $2, '|') $$;
 CREATE OR REPLACE FUNCTION utl_raw.bit_xor(bytea, bytea) RETURNS bytea
   LANGUAGE sql IMMUTABLE AS $$ SELECT utl_raw._bitop($1, $2, '#') $$;
+CREATE OR REPLACE FUNCTION utl_raw.cast_to_varchar2(text) RETURNS text
+  LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT utl_raw.cast_to_varchar2(decode($1, 'hex')) $$;
+CREATE OR REPLACE FUNCTION utl_raw.length(text) RETURNS integer
+  LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT utl_raw.length(decode($1, 'hex')) $$;
+CREATE OR REPLACE FUNCTION utl_raw.substr(text, integer, integer DEFAULT NULL)
+  RETURNS bytea LANGUAGE sql IMMUTABLE AS $$
+    SELECT utl_raw.substr(decode($1, 'hex'), $2, $3) $$;
+CREATE OR REPLACE FUNCTION utl_raw.concat(VARIADIC text[]) RETURNS bytea
+  LANGUAGE sql IMMUTABLE AS $$
+    SELECT coalesce(string_agg(decode(x, 'hex'), ''::bytea), ''::bytea)
+    FROM unnest($1) AS x $$;
+CREATE OR REPLACE FUNCTION utl_raw.bit_and(text, text) RETURNS bytea
+  LANGUAGE sql IMMUTABLE AS $$ SELECT utl_raw._bitop(decode($1, 'hex'), decode($2, 'hex'), '&') $$;
+CREATE OR REPLACE FUNCTION utl_raw.bit_or(text, text) RETURNS bytea
+  LANGUAGE sql IMMUTABLE AS $$ SELECT utl_raw._bitop(decode($1, 'hex'), decode($2, 'hex'), '|') $$;
+CREATE OR REPLACE FUNCTION utl_raw.bit_xor(text, text) RETURNS bytea
+  LANGUAGE sql IMMUTABLE AS $$ SELECT utl_raw._bitop(decode($1, 'hex'), decode($2, 'hex'), '#') $$;
 """
 
 
