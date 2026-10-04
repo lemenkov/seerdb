@@ -52,7 +52,13 @@ def main() -> None:
         '127.0.0.1',
         port,
         backend_factory=lambda: OracleCompatBackend(
-            PostgresBackend(conninfo, credentials=credentials)
+            PostgresBackend(
+                conninfo,
+                credentials=credentials,
+                # SEERDB_TRANSLATION_REPORT=1 logs, per statement, the Oracle
+                # translation it took, to sys.ora_translation_log (#1557).
+                translation_report=os.environ.get('SEERDB_TRANSLATION_REPORT') == '1',
+            )
         ),
     )
 

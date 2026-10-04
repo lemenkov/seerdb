@@ -147,8 +147,9 @@ import select
 import struct
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
-from typing import Final
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
+from typing import Final, TypeVar
 
 import psycopg
 from psycopg import sql
@@ -999,6 +1000,15 @@ _ORACLE_DICTIONARY_DDL = (
     # sys.ora_columns to key a row by, so it is kept here by the domain's oid.
     'CREATE TABLE IF NOT EXISTS sys.ora_collection_elements ('
     'typid oid PRIMARY KEY, data_type text NOT NULL);'
+    # The translation report (#1557): per normalised statement, the translation
+    # rules it needed, how often it ran and failed, and whether it came as native
+    # PostgreSQL (#1556). Keyed by a hash, as a statement may be longer than an
+    # index entry can be.
+    'CREATE TABLE IF NOT EXISTS sys.ora_translation_log ('
+    'statement_key text PRIMARY KEY, statement text NOT NULL, '
+    'rules text[] NOT NULL, runs bigint NOT NULL, failures bigint NOT NULL, '
+    'last_error text, native boolean NOT NULL, '
+    'first_seen timestamptz NOT NULL, last_seen timestamptz NOT NULL);'
     # The fractional-seconds precision a TIMESTAMP(n) WITH TIME ZONE column was
     # declared with (#1308). WITH TIME ZONE is the ora_tstz composite, which has
     # no type modifier to hold it, so it is kept here; a column not listed has
@@ -3057,7 +3067,9 @@ def _xmlelement_name(match: re.Match[str]) -> str:
 # call or a literal keyword the suite uses; the rewrites are anchored on the
 # call's `(` or a word boundary, so ordinary identifiers are left alone. Applied
 # to every statement (a DEFAULT SYSDATE in DDL is rewritten too).
-_IDIOM_REWRITES: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]]] = [
+_IDIOM_REWRITES: list[
+    tuple[str, re.Pattern[str], str | Callable[[re.Match[str]], str]]
+] = [
     # (HEXTORAW, RAWTOHEX, EMPTY_CLOB / EMPTY_BLOB and FROM_TZ are installed as
     # real PostgreSQL functions — see _HELPER_FUNCTIONS_DDL / __init__ — so their
     # call sites resolve directly and need no rewrite here. TO_CHAR,
@@ -3067,6 +3079,7 @@ _IDIOM_REWRITES: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str
     # only `DELETE FROM t`. Anchored at the statement's start, after an optional
     # hint, and only where a table name follows.
     (
+        'delete-without-from',
         re.compile(r'(?is)^(\s*DELETE(?:\s+/\*.*?\*/)?)\s+(?!FROM\b)(?=[\w"])'),
         r'\1 FROM ',
     ),
@@ -3078,12 +3091,13 @@ _IDIOM_REWRITES: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str
     # accepts untyped literals, and for the two arguments NVL takes means exactly
     # the same thing — so sidestep overload resolution rather than adding a fifth
     # candidate to it (#819).
-    (re.compile(r'\bNVL\s*\(', re.IGNORECASE), 'COALESCE('),
+    ('nvl', re.compile(r'\bNVL\s*\(', re.IGNORECASE), 'COALESCE('),
     # RAISE_APPLICATION_ERROR(-20101, 'Test!') -- a user error, ORA-20000..20999
     # (#1323). PL/pgSQL has no such procedure; raise P0001 with the Oracle code as
     # the message's prefix, which _application_error reads back into the error
     # the client gets. A third argument (keep the error stack) has no counterpart.
     (
+        'raise-application-error',
         re.compile(
             r'\braise_application_error\s*\(\s*([^,]+?)\s*,\s*(.+?)\s*'
             r'(?:,\s*(?:true|false)\s*)?\)\s*;',
@@ -3094,10 +3108,12 @@ _IDIOM_REWRITES: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str
     ),
     # BINARY_DOUBLE/FLOAT special values → IEEE-754 float literals.
     (
+        'binary-infinity',
         re.compile(r'\bbinary_(?:double|float)_infinity\b', re.IGNORECASE),
         "'Infinity'::float8",
     ),
     (
+        'binary-nan',
         re.compile(r'\bbinary_(?:double|float)_nan\b', re.IGNORECASE),
         "'NaN'::float8",
     ),
@@ -3107,6 +3123,7 @@ _IDIOM_REWRITES: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str
     # the time part positive. Lift the inner `-` out to a unary minus on the whole
     # literal, which negates every field the way Oracle does (#520).
     (
+        'negative-interval',
         re.compile(
             r"\bINTERVAL\s+'-([^']*)'\s+"
             r'(DAY(?:\s*\(\d+\))?\s+TO\s+SECOND(?:\s*\(\d+\))?)\b',
@@ -3120,6 +3137,7 @@ _IDIOM_REWRITES: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str
     # fold it to lower; it goes quoted, upper-cased. One already spelt
     # `NAME x`, which Oracle takes too, and Oracle's EVALNAME are left alone.
     (
+        'xmlelement-name',
         re.compile(
             r'\bXMLELEMENT\s*\(\s*(?!(?:NAME|EVALNAME)\b)("[^"]*"|[A-Za-z_][\w$#]*)',
             re.IGNORECASE,
@@ -3127,10 +3145,15 @@ _IDIOM_REWRITES: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str
         _xmlelement_name,
     ),
     # SYSDATE / SYSTIMESTAMP → the session clock (SYSDATE is to-the-second).
-    (re.compile(r'\bsystimestamp\b', re.IGNORECASE), 'ora_systimestamp()'),
+    (
+        'systimestamp',
+        re.compile(r'\bsystimestamp\b', re.IGNORECASE),
+        'ora_systimestamp()',
+    ),
     # DBMS_DEBUG_JDWP.CURRENT_SESSION_ID / _SERIAL are called without parentheses
     # in Oracle, which PostgreSQL would read as a column (#1355).
     (
+        'dbms-debug-jdwp',
         re.compile(
             r'\bdbms_debug_jdwp\s*\.\s*(current_session_id|current_session_serial)\b'
             r'(?!\s*\()',
@@ -3140,24 +3163,31 @@ _IDIOM_REWRITES: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str
     ),
     # CURRENT_TIMESTAMP [(p)] is the session's TIMESTAMP WITH TIME ZONE (#1208).
     (
+        'current-timestamp',
         re.compile(r'\bcurrent_timestamp\b(?:\s*\(\s*\d+\s*\))?', re.IGNORECASE),
         'ora_current_timestamp()',
     ),
-    (re.compile(r'\bdbtimezone\b', re.IGNORECASE), f"'{_DB_TIME_ZONE_NAME}'::text"),
+    (
+        'dbtimezone',
+        re.compile(r'\bdbtimezone\b', re.IGNORECASE),
+        f"'{_DB_TIME_ZONE_NAME}'::text",
+    ),
     # CAST(x AS TIMESTAMP [(p)] WITH LOCAL TIME ZONE): the DDL type rewrite only
     # runs on DDL, so a query's cast is translated here (#1208).
     (
+        'cast-local-time-zone',
         re.compile(
             r'\bAS\s+TIMESTAMP\s*(\(\s*\d+\s*\))?\s+WITH\s+LOCAL\s+TIME\s+ZONE\b',
             re.IGNORECASE,
         ),
         r'AS timestamptz\1',
     ),
-    (re.compile(r'\bsysdate\b', re.IGNORECASE), 'localtimestamp(0)'),
+    ('sysdate', re.compile(r'\bsysdate\b', re.IGNORECASE), 'localtimestamp(0)'),
     # SESSIONTIMEZONE → the zone as ALTER SESSION spelled it, or, before any was
     # set, the session's current offset in Oracle's `+hh:mm` form: the zone a
     # TIMESTAMP is read in on its way into an LTZ value (#1208).
     (
+        'sessiontimezone',
         re.compile(r'\bsessiontimezone\b', re.IGNORECASE),
         "coalesce(nullif(current_setting('seerdb.time_zone', true), ''), "
         "to_char(now(), 'TZH:TZM'))",
@@ -3174,22 +3204,24 @@ _IDIOM_REWRITES: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str
     # index-organized table's ROWID is rewritten earlier, per session, from its
     # primary key (PostgresBackend._rewrite_iot_rowid), so this only sees heap
     # tables.
-    (re.compile(r'\bROWID\b', re.IGNORECASE), 'sys.ora_rowid(tableoid, ctid)'),
+    ('rowid', re.compile(r'\bROWID\b', re.IGNORECASE), 'sys.ora_rowid(tableoid, ctid)'),
     # A BINARY_DOUBLE / BINARY_FLOAT numeric literal suffix (1234.5678d, 1.5f) —
     # PostgreSQL has no such suffix, so drop it. A decimal point is required so
     # this never touches an identifier or a plain integer.
-    (re.compile(r'\b(\d+\.\d+)[dfDF]\b'), r'\1'),
+    ('float-literal-suffix', re.compile(r'\b(\d+\.\d+)[dfDF]\b'), r'\1'),
     # Oracle's MINUS set operator is PostgreSQL's EXCEPT (#759, reflection uses it).
-    (re.compile(r'\bMINUS\b', re.IGNORECASE), 'EXCEPT'),
+    ('minus', re.compile(r'\bMINUS\b', re.IGNORECASE), 'EXCEPT'),
     # Sequence pseudo-columns: Oracle's `seq.nextval` / `seq.currval` are
     # PostgreSQL's `nextval('seq')` / `currval('seq')` function calls. The captured
     # name (optionally schema-qualified) becomes the regclass argument; it is
     # created and referenced lower-case, so an unquoted regclass literal resolves.
     (
+        'nextval',
         re.compile(r'\b([A-Za-z_][\w$#.]*)\.nextval\b', re.IGNORECASE),
         r"nextval('\1')",
     ),
     (
+        'currval',
         re.compile(r'\b([A-Za-z_][\w$#.]*)\.currval\b', re.IGNORECASE),
         r"currval('\1')",
     ),
@@ -3198,10 +3230,12 @@ _IDIOM_REWRITES: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str
     # while `OFFSET (1 + 2) ROWS` is fine. Wrap the operand in parentheses (a bare
     # literal or bind is already valid, and the extra parens are harmless there).
     (
+        'offset-rows',
         re.compile(r'\bOFFSET\s+(.+?)\s+ROWS\b', re.IGNORECASE),
         r'OFFSET (\1) ROWS',
     ),
     (
+        'fetch-first',
         re.compile(r'\bFETCH\s+(FIRST|NEXT)\s+(.+?)\s+ROWS\b', re.IGNORECASE),
         r'FETCH \1 (\2) ROWS',
     ),
@@ -3210,17 +3244,30 @@ _IDIOM_REWRITES: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str
     # and drop the CHAR/BYTE length qualifier here too. VARCHAR2 / NVARCHAR2 are
     # never valid identifiers, and the qualifier shape is specific, so this is safe
     # on any statement (a DDL CAST is already varchar by the time it reaches here).
-    (re.compile(r'\bNVARCHAR2\b', re.IGNORECASE), 'varchar'),
-    (re.compile(r'\bVARCHAR2\b', re.IGNORECASE), 'varchar'),
-    (re.compile(r'\(\s*(\d+)\s+(?:CHAR|BYTE)\s*\)', re.IGNORECASE), r'(\1)'),
+    ('cast-nvarchar2', re.compile(r'\bNVARCHAR2\b', re.IGNORECASE), 'varchar'),
+    ('cast-varchar2', re.compile(r'\bVARCHAR2\b', re.IGNORECASE), 'varchar'),
+    (
+        'char-byte-length',
+        re.compile(r'\(\s*(\d+)\s+(?:CHAR|BYTE)\s*\)', re.IGNORECASE),
+        r'(\1)',
+    ),
     # A CAST to an Oracle numeric or raw type in DML (CAST(:1 AS NUMBER(15))),
     # which PostgreSQL does not know (#1329). Anchored to `AS` and, for the types
     # that are not reserved words, to the cast's closing parenthesis, so an alias
     # is left alone.
-    (re.compile(r'\bAS\s+NUMBER\b', re.IGNORECASE), 'AS numeric'),
-    (re.compile(r'\bAS\s+RAW\s*(?:\(\s*\d+\s*\))?', re.IGNORECASE), 'AS bytea'),
-    (re.compile(r'\bAS\s+BINARY_FLOAT(?=\s*\))', re.IGNORECASE), 'AS real'),
+    ('cast-number', re.compile(r'\bAS\s+NUMBER\b', re.IGNORECASE), 'AS numeric'),
     (
+        'cast-raw',
+        re.compile(r'\bAS\s+RAW\s*(?:\(\s*\d+\s*\))?', re.IGNORECASE),
+        'AS bytea',
+    ),
+    (
+        'cast-binary-float',
+        re.compile(r'\bAS\s+BINARY_FLOAT(?=\s*\))', re.IGNORECASE),
+        'AS real',
+    ),
+    (
+        'cast-binary-double',
         re.compile(r'\bAS\s+BINARY_DOUBLE(?=\s*\))', re.IGNORECASE),
         'AS double precision',
     ),
@@ -4115,30 +4162,63 @@ def _cast_literal_items(sql: str) -> str:
     return _unmask_quoted(masked, contents)
 
 
+# The translation report (#1557): the names of the translation rules that have
+# changed the statement in flight, or None while no report is being taken.
+_TRANSLATION_RULES: ContextVar[list[str] | None] = ContextVar(
+    '_TRANSLATION_RULES', default=None
+)
+
+
+def _note_rule(name: str) -> None:
+    rules = _TRANSLATION_RULES.get()
+    if rules is not None and name not in rules:
+        rules.append(name)
+
+
+def _ruled(name: str, translated: str, sql: str) -> str:
+    # `translated`, noting the rule `name` when it changed `sql` (#1557).
+    if translated != sql:
+        _note_rule(name)
+    return translated
+
+
+def _translated_batch(sql: str) -> str:
+    # An array DML statement's translation, each pass noted (#1557).
+    sql = _ruled('ddl', _translate_ddl(sql), sql)
+    sql = _ruled('routine-ddl', _translate_routine_ddl(sql), sql)
+    sql = _ruled('plsql-block', _translate_plsql_block(sql), sql)
+    return _translate_idioms(sql)
+
+
 def _translate_idioms(sql: str) -> str:
     """Rewrite the Oracle SQL functions / literal idioms the suite uses to their
-    PostgreSQL equivalents (#502). Applied to every statement."""
-    sql = _quote_hash_identifiers(sql)
+    PostgreSQL equivalents (#502). Applied to every statement. Each step that
+    changes the text is noted by name for the translation report (#1557)."""
+    sql = _ruled('hash-identifier', _quote_hash_identifiers(sql), sql)
+    # Not a rule: it types a select-list literal as Oracle describes one, which
+    # portable SQL needs as much as Oracle SQL does.
     sql = _cast_literal_items(sql)
-    sql = _translate_row_generator(sql)
-    sql = _rewrite_rownum(sql)
-    sql = _translate_deref(sql)
-    sql = _translate_connect_by(sql)
-    sql = _translate_signed_year(sql)
-    sql = _translate_decode(sql)
+    sql = _ruled('row-generator', _translate_row_generator(sql), sql)
+    sql = _ruled('rownum', _rewrite_rownum(sql), sql)
+    sql = _ruled('deref', _translate_deref(sql), sql)
+    sql = _ruled('connect-by', _translate_connect_by(sql), sql)
+    sql = _ruled('signed-year', _translate_signed_year(sql), sql)
+    sql = _ruled('decode', _translate_decode(sql), sql)
     # The rewrites change Oracle words into PostgreSQL ones, and a string
     # literal or a quoted identifier holding such a word is data, not SQL:
     # `data_type = 'VARCHAR2'` was rewritten to `= 'varchar'` and matched
     # nothing (#1481). Each rule runs with the quoted regions masked, but for one
     # whose own pattern reads into a literal (a negative INTERVAL '-...').
-    for pattern, replacement in _IDIOM_REWRITES:
+    for name, pattern, replacement in _IDIOM_REWRITES:
         if "'" in pattern.pattern:
-            sql = pattern.sub(replacement, sql)
+            sql = _ruled(name, pattern.sub(replacement, sql), sql)
             continue
         (masked, contents) = _mask_quoted(sql)
-        sql = _unmask_quoted(pattern.sub(replacement, masked), contents)
-    sql = _TSTZ_LITERAL.sub(_tstz_literal_sub, sql)
-    return _translate_cursor_expressions(sql)
+        sql = _ruled(
+            name, _unmask_quoted(pattern.sub(replacement, masked), contents), sql
+        )
+    sql = _ruled('timestamp-tz-literal', _TSTZ_LITERAL.sub(_tstz_literal_sub, sql), sql)
+    return _ruled('cursor-expression', _translate_cursor_expressions(sql), sql)
 
 
 # Column types that are Oracle-only *for the version the Mirror advertises*
@@ -5401,6 +5481,50 @@ _ALTER_SESSION_DIALECT = re.compile(
     r"\s*ALTER\s+SESSION\s+SET\s+SEERDB_DIALECT\s*=\s*'?(POSTGRES|ORACLE)'?\s*;?\s*$",
     re.IGNORECASE,
 )
+_ALTER_SESSION_REPORT = re.compile(
+    r"\s*ALTER\s+SESSION\s+SET\s+SEERDB_TRANSLATION_REPORT\s*=\s*'?(TRUE|FALSE)'?\s*;?\s*$",
+    re.IGNORECASE,
+)
+# A statement as the translation report keys it (#1557): its string and numeric
+# literals folded to `?`, a quoted identifier kept, its spacing collapsed, so
+# the runs of one statement with different values count together.
+_REPORT_LITERAL = re.compile(
+    r"(\"(?:[^\"]|\"\")*\")|'(?:[^']|'')*'"
+    r'|(?<![\w$#.:"])\d+(?:\.\d+)?(?:[eE][+-]?\d+)?'
+)
+# How many runs the report buffers before it writes them out.
+_REPORT_FLUSH_EVERY: Final = 100
+_REPORT_UPSERT: Final = (
+    'INSERT INTO sys.ora_translation_log AS l VALUES '
+    '(%s, %s, %s, %s, %s, %s, %s, now(), now()) '
+    'ON CONFLICT (statement_key) DO UPDATE SET '
+    'rules = ARRAY(SELECT DISTINCT r FROM unnest(l.rules || excluded.rules) r '
+    'ORDER BY r), runs = l.runs + excluded.runs, '
+    'failures = l.failures + excluded.failures, '
+    'last_error = coalesce(excluded.last_error, l.last_error), '
+    'native = l.native OR excluded.native, last_seen = now()'
+)
+
+
+def _normalise_statement(sql: str) -> str:
+    folded = _REPORT_LITERAL.sub(lambda m: m.group(1) or '?', sql)
+    return ' '.join(folded.split())
+
+
+@dataclass
+class _ReportEntry:
+    """One normalised statement's runs since the report last wrote (#1557)."""
+
+    rules: set[str] = field(default_factory=set)
+    runs: int = 0
+    failures: int = 0
+    last_error: str | None = None
+    native: bool = False
+
+
+_Ran = TypeVar('_Ran')
+
+
 _PG_HINT = re.compile(
     r'(?:\s|--[^\n]*(?:\n|$)|/\*(?!\+)(?:[^*]|\*(?!/))*\*/)*(?:[A-Za-z]+\s*)?'
     r'/\*\+[^*]*\bPG\b',
@@ -5651,9 +5775,21 @@ class PostgresBackend:
     server_identity = IDENTITY_12_1
 
     def __init__(
-        self, conninfo: str = '', *, credentials: Credentials | None = None
+        self,
+        conninfo: str = '',
+        *,
+        credentials: Credentials | None = None,
+        translation_report: bool = False,
     ) -> None:
         self._conn = psycopg.connect(conninfo)
+        # The translation report (#1557): whether it is on, the runs it has not
+        # written yet, and its own autocommit connection, opened when it first
+        # writes -- so writing it never joins, ends or aborts the client's
+        # transaction.
+        self._conninfo = conninfo
+        self._reporting = translation_report
+        self._report_runs: dict[str, _ReportEntry] = {}
+        self._report_conn: psycopg.Connection | None = None
         # Disable psycopg's automatic server-side prepared statements. Every
         # statement runs inside a SAVEPOINT, and a ROLLBACK TO SAVEPOINT deallocates
         # any prepared statement created after that savepoint — which desyncs
@@ -6124,6 +6260,65 @@ class PostgresBackend:
 
     @_while_connected
     def execute(self, sql: str, binds: Sequence = ()) -> Result:
+        return self._reported(sql, lambda: self._execute_statement(sql, binds))
+
+    def _reported(self, sql: str, run: Callable[[], _Ran]) -> _Ran:
+        # Run a statement, and while the translation report is on, note what
+        # translating it took and how it ended (#1557).
+        if not self._reporting:
+            return run()
+        rules: list[str] = []
+        token = _TRANSLATION_RULES.set(rules)
+        try:
+            result = run()
+        except Exception as error:
+            self._record_run(sql, rules, error)
+            raise
+        finally:
+            _TRANSLATION_RULES.reset(token)
+        self._record_run(sql, rules, None)
+        return result
+
+    def _record_run(self, sql: str, rules: list[str], error: Exception | None) -> None:
+        if _ALTER_SESSION_REPORT.match(sql) or _ALTER_SESSION_DIALECT.match(sql):
+            return
+        entry = self._report_runs.setdefault(_normalise_statement(sql), _ReportEntry())
+        entry.rules.update(rules)
+        entry.runs += 1
+        entry.native = entry.native or self._is_native(sql)
+        if error is not None:
+            entry.failures += 1
+            entry.last_error = str(error).splitlines()[0][:500] if str(error) else ''
+        if sum(e.runs for e in self._report_runs.values()) >= _REPORT_FLUSH_EVERY:
+            self._flush_report()
+
+    def _flush_report(self) -> None:
+        # Write the buffered runs out, on the report's own connection. A failure
+        # loses them rather than the client's statement.
+        if not self._report_runs:
+            return
+        rows = [
+            (
+                hashlib.sha256(statement.encode()).hexdigest(),
+                statement,
+                sorted(entry.rules),
+                entry.runs,
+                entry.failures,
+                entry.last_error,
+                entry.native,
+            )
+            for statement, entry in self._report_runs.items()
+        ]
+        self._report_runs = {}
+        try:
+            if self._report_conn is None:
+                self._report_conn = psycopg.connect(self._conninfo, autocommit=True)
+            with self._report_conn.cursor() as cursor:
+                cursor.executemany(_REPORT_UPSERT, rows)
+        except psycopg.Error:
+            pass
+
+    def _execute_statement(self, sql: str, binds: Sequence) -> Result:
         # A PL/SQL block from callproc / callfunc arrives with BindVar binds (the
         # Mirror's OUT-bind flow); run it via CALL / SELECT and return the OUT
         # values (#503). An ordinary statement's BindVar is a typed NULL, which
@@ -6131,6 +6326,12 @@ class PostgresBackend:
         switch = _ALTER_SESSION_DIALECT.match(sql)
         if switch is not None:
             self._sql_dialect = switch.group(1).lower()
+            return Result()
+        report = _ALTER_SESSION_REPORT.match(sql)
+        if report is not None:
+            self._reporting = report.group(1).upper() == 'TRUE'
+            if not self._reporting:
+                self._flush_report()
             return Result()
         native = self._is_native(sql)
         sql = _strip_leading_comments(sql)
@@ -6145,11 +6346,13 @@ class PostgresBackend:
             return self._execute_native(sql, binds)
         bare = _BARE_CALL.match(sql)
         if bare is not None and bare.group(1).upper() not in _PLSQL_WORD_STATEMENTS:
+            _note_rule('bare-call')
             # No binds, so the block would otherwise go to PostgreSQL as it
             # stands; the call path runs it as any other call (#1404).
             return self._execute_plsql(f'BEGIN {bare.group(1)}(); END;', binds)
         single = None if binds else _single_call_block(sql)
         if single is not None and self._routine_exists(single):
+            _note_rule('plsql-call')
             # A call with literal arguments and no binds -- sqlplus's
             # `DBMS_OUTPUT.ENABLE(NULL)`, a script's put_line('...'). As a DO block
             # PostgreSQL refuses a bare function call; the call path runs it,
@@ -6158,6 +6361,7 @@ class PostgresBackend:
             # translate.
             return self._execute_plsql(sql, binds)
         if binds and is_plsql(sql):
+            _note_rule('plsql-call')
             return self._collection_outs(self._execute_plsql(sql, binds), binds)
         # A `SELECT REF(alias)` object-REF fetch: PostgreSQL has no REF, so stand in
         # the row's ctid as the locator and report the referenced object type from
@@ -6166,6 +6370,7 @@ class PostgresBackend:
         # by its own version guard on the 11g Mirror.
         ref_select = _REF_SELECT.match(sql)
         if ref_select and ref_select.group(1).lower() == ref_select.group(3).lower():
+            _note_rule('ref-select')
             return self._execute_ref_select(ref_select)
         # Reject the column types that are Oracle-only for the version the Mirror
         # advertises (JSON/VECTOR/BOOLEAN), so the suite's version guards skip
@@ -6179,16 +6384,18 @@ class PostgresBackend:
         dropped = _DROP_TABLE_NAME.match(sql)
         if dropped is not None:
             self._iot_pk.pop(_bare_table(dropped.group(1)), None)
-        sql = self._rewrite_iot_rowid(sql)
+        sql = _ruled('iot-rowid', self._rewrite_iot_rowid(sql), sql)
         # INVISIBLE / VISIBLE columns (#1195): the attribute comes out of the DDL
         # and goes to the catalog; a MODIFY that only changes it has nothing left
         # to run. An INSERT with no column list and a `SELECT *` name only the
         # visible columns.
         (sql, visibility) = _column_visibility(sql)
+        if visibility is not None:
+            _note_rule('invisible-columns')
         if visibility is not None and visibility[3]:
             self._record_visibility(visibility)
             return Result()
-        sql = self._expand_visible_columns(sql)
+        sql = _ruled('invisible-columns', self._expand_visible_columns(sql), sql)
         # Oracle auto-commits DDL — decide from the original statement, before the
         # dialect rewrite reshapes it (#532).
         is_ddl = _IS_DDL.match(sql) is not None
@@ -6197,13 +6404,18 @@ class PostgresBackend:
         # column types, CREATE PROCEDURE/FUNCTION → PL/pgSQL, then the function /
         # literal idioms. This is where dialect knowledge belongs, not in the
         # generic compat shim.
-        sql = _translate_idioms(
-            _translate_plsql_block(
-                _translate_routine_ddl(_translate_ddl(_translate_admin(sql))),
-                self._routine_kind,
-            )
+        sql = _ruled('admin', _translate_admin(sql), sql)
+        sql = _ruled('ddl', _translate_ddl(sql), sql)
+        sql = _ruled('routine-ddl', _translate_routine_ddl(sql), sql)
+        sql = _ruled(
+            'plsql-block', _translate_plsql_block(sql, self._routine_kind), sql
         )
-        sql = _spell_one_element_constructors(sql, self._collection_names())
+        sql = _translate_idioms(sql)
+        sql = _ruled(
+            'one-element-constructor',
+            _spell_one_element_constructors(sql, self._collection_names()),
+            sql,
+        )
         with_rowid = self._returning_rowid(original, sql)
         if with_rowid is not None:
             sql = with_rowid
@@ -7890,6 +8102,10 @@ class PostgresBackend:
 
     @_while_connected
     def execute_many(self, sql: str, rows: Sequence[Sequence]) -> int | Result:
+        # One run of the statement in the translation report, however many rows.
+        return self._reported(sql, lambda: self._execute_batch(sql, rows))
+
+    def _execute_batch(self, sql: str, rows: Sequence[Sequence]) -> int | Result:
         # Array DML (executemany) in one round-trip: translate the statement once
         # and send every bind row through psycopg's executemany (which pipelines),
         # instead of a round-trip per row — the difference is ~7 s vs a few ms for
@@ -7902,13 +8118,7 @@ class PostgresBackend:
         rows = list(rows)
         if not rows:
             return 0
-        translated = (
-            sql
-            if native
-            else _translate_idioms(
-                _translate_plsql_block(_translate_routine_ddl(_translate_ddl(sql)))
-            )
-        )
+        translated = sql if native else _translated_batch(sql)
         with_rowid = None if native else self._returning_rowid(sql, translated)
         if with_rowid is not None:
             translated = with_rowid
@@ -7980,6 +8190,11 @@ class PostgresBackend:
     def execute_many_rowcounts(
         self, sql: str, rows: Sequence[Sequence]
     ) -> tuple[int, list[int]]:
+        return self._reported(sql, lambda: self._execute_batch_rowcounts(sql, rows))
+
+    def _execute_batch_rowcounts(
+        self, sql: str, rows: Sequence[Sequence]
+    ) -> tuple[int, list[int]]:
         """Array DML reporting the per-iteration affected-row counts (#18).
 
         The Mirror calls this only when the client asked for
@@ -8003,13 +8218,7 @@ class PostgresBackend:
         rows = list(rows)
         if not rows:
             return 0, []
-        translated = (
-            sql
-            if self._is_native(sql)
-            else _translate_idioms(
-                _translate_plsql_block(_translate_routine_ddl(_translate_ddl(sql)))
-            )
-        )
+        translated = sql if self._is_native(sql) else _translated_batch(sql)
         bound_sql, _ = _translate_binds(translated, rows[0])
         cursor = self._conn.cursor()
         counts: list[int] = []
@@ -8726,4 +8935,8 @@ class PostgresBackend:
         self._user_savepoint = False
 
     def close(self) -> None:
+        # What the translation report has not written yet goes out first (#1557).
+        self._flush_report()
+        if self._report_conn is not None:
+            self._report_conn.close()
         self._conn.close()
