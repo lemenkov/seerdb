@@ -4486,6 +4486,38 @@ def test_a_character_value_headed_for_raw_is_hex() -> None:
                 backend.execute(statement)
             except Exception:
                 backend.rollback()
+
+
+def test_type_attrs_list_char_used() -> None:
+    # all_type_attrs has CHAR_USED: C for a CHAR-semantics or national
+    # attribute, B for every other one, a number included (#1573). The rows
+    # are 23ai's; a client sizes a VARCHAR2(n CHAR) attribute by it (#1490).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE TYPE tc1573 AS OBJECT (n NUMBER, v VARCHAR2(20), '
+            'vc VARCHAR2(10 CHAR), cc CHAR(2 CHAR), nv NVARCHAR2(5), r RAW(4))'
+        )
+        backend.commit()
+        result = backend.execute(
+            'SELECT attr_name, char_used FROM user_type_attrs '
+            "WHERE type_name = 'TC1573' ORDER BY attr_no"
+        )
+        assert [tuple(r) for r in result.rows] == [
+            ('N', 'B'),
+            ('V', 'B'),
+            ('VC', 'C'),
+            ('CC', 'C'),
+            ('NV', 'C'),
+            ('R', 'B'),
+        ]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TYPE tc1573')
+            backend.commit()
+        except Exception:
+            backend.rollback()
         backend.close()
 
 

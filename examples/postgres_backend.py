@@ -1412,7 +1412,13 @@ _ORACLE_DICTIONARY_DDL = (
     "CASE WHEN o.data_type IN ('NVARCHAR2', 'NCHAR', 'NCLOB') THEN 'NCHAR_CS' "
     "WHEN a.data_type IN ('character varying', 'character', 'text') "
     f"OR a.attribute_udt_name = '{_CLOB_TYPE}' THEN 'CHAR_CS' "
-    'END::text AS character_set_name '
+    'END::text AS character_set_name, '
+    # How a character attribute's length was declared: C for CHAR semantics,
+    # recorded with the DDL (#1451), and the national types; B for every other
+    # attribute, a number or a date included -- unlike all_tab_cols, which
+    # leaves those NULL; measured on 23ai (#1573). Appended, as above.
+    "CASE WHEN o.data_type IN ('VARCHAR2', 'CHAR', 'NVARCHAR2', 'NCHAR') THEN 'C' "
+    "ELSE 'B' END::text AS char_used "
     'FROM information_schema.attributes a '
     'LEFT JOIN sys.ora_columns o ON o.relid = '
     "(quote_ident(a.udt_schema) || '.' || quote_ident(a.udt_name))::regclass "
