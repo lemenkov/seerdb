@@ -4521,6 +4521,31 @@ def test_type_attrs_list_char_used() -> None:
         backend.close()
 
 
+def test_an_application_context_reads_back_from_sys_context() -> None:
+    # The application context a client declares at login reaches the backend
+    # through set_app_context, and SYS_CONTEXT(namespace, attribute) reads it
+    # back, either name in any case, as 23ai does; an attribute not declared is
+    # NULL, and a rollback keeps it (#1581).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.set_app_context(
+            [('CLIENTCONTEXT', 'ATTR1', 'VALUE1'), ('clientcontext', 'Attr2', 'v 2')]
+        )
+        backend.rollback()
+
+        def context(namespace: str, attribute: str):
+            return backend.execute(
+                'SELECT sys_context(:1, :2) FROM dual', [namespace, attribute]
+            ).rows[0][0]
+
+        assert context('CLIENTCONTEXT', 'ATTR1') == 'VALUE1'
+        assert context('ClientContext', 'attr2') == 'v 2'
+        assert context('CLIENTCONTEXT', 'NOPE') is None
+        assert context('USERENV', 'SESSION_USER') == 'PYO'
+    finally:
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships

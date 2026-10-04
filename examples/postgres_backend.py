@@ -842,7 +842,13 @@ _ORACLE_DICTIONARY_DDL = (
     'username text, program text, machine text, terminal text, osuser text, '
     'driver text);'
     'CREATE OR REPLACE FUNCTION sys.sys_context(text, text) RETURNS text '
-    'LANGUAGE sql STABLE AS $$ SELECT CASE lower($2) '
+    # A namespace other than USERENV is an application context: what the
+    # client declared at login (`connect(appcontext=...)`), kept in a session
+    # setting as JSON, NAMESPACE.ATTRIBUTE upper-cased as Oracle names them
+    # (#1581).
+    "LANGUAGE sql STABLE AS $$ SELECT CASE WHEN upper($1) <> 'USERENV' THEN "
+    "nullif(current_setting('seerdb.app_context', true), '')::jsonb "
+    "->> (upper($1) || '.' || upper($2)) ELSE CASE lower($2) "
     # The session's SID is its backend's pid, the one the login reply names.
     "WHEN 'sid' THEN pg_backend_pid()::text "
     "WHEN 'current_schema' THEN upper(current_schema()) "
@@ -872,7 +878,7 @@ _ORACLE_DICTIONARY_DDL = (
     "nullif(current_setting('seerdb.client_identifier', true), '') "
     "WHEN 'client_info' THEN "
     "nullif(current_setting('seerdb.client_info', true), '') "
-    'ELSE NULL END $$;'
+    'ELSE NULL END END $$;'
     # XS_SYS_CONTEXT(namespace, attribute): the Real Application Security
     # context, which sqlplus reads in its login query, `DECODE(USER, 'XS$NULL',
     # XS_SYS_CONTEXT('XS$SESSION', 'USERNAME'), USER) FROM SYS.DUAL`. A session
@@ -9239,6 +9245,27 @@ class PostgresBackend:
     _END_TO_END_SETTINGS = ('client_identifier', 'module', 'action', 'client_info')
 
     @_while_connected
+    def set_app_context(self, entries: list[tuple[str, str, str]]) -> None:
+        """Keep the application context the client declared at login
+        (`connect(appcontext=[(namespace, attribute, value), ...])`), which
+        SYS_CONTEXT(namespace, attribute) reads back (#1581).
+
+        In a session setting, as the service name is, committed at once: a
+        setting made in a transaction that rolls back is undone with it.
+        """
+        context = {
+            f'{namespace.upper()}.{attribute.upper()}': value
+            for namespace, attribute, value in entries
+        }
+        try:
+            self._conn.execute(
+                "SELECT set_config('seerdb.app_context', %s, false)",
+                (json.dumps(context),),
+            )
+            self._conn.commit()
+        except psycopg.Error:
+            self._conn.rollback()
+
     def set_end_to_end(self, attrs: dict) -> None:
         """Record the session's tracing attributes (#183).
 
