@@ -463,6 +463,27 @@ def test_a_national_cast_is_found_in_the_select_list() -> None:
     ) == {0: 3, 2: 4}
 
 
+def test_a_constant_select_item_is_found() -> None:
+    # Oracle folds a select item of literals, operators and calls of literals,
+    # and a NUMBER one describes with precision 0 and scale -127; one computed
+    # from a column, a bind, a pseudo-column, a subquery or an aggregate has
+    # neither (#1444). The positions match 23ai's describes.
+    from postgres_backend import _constant_items
+
+    assert _constant_items('SELECT 1, 1.5, -2, 1e3 FROM dual') == {0, 1, 2, 3}
+    assert _constant_items('SELECT 1 + 1, count(*), 1 AS one, 2 "Two" FROM dual') == {
+        0,
+        2,
+        3,
+    }
+    assert _constant_items(
+        "SELECT n + 1, abs(-1), round(p), mod(5, 2), length('ab'), nvl(n, 0), "
+        '(SELECT 1 FROM dual) FROM t'
+    ) == {1, 3, 4}
+    assert _constant_items('SELECT rownum, level, :1, sysdate, n x FROM t') == set()
+    assert _constant_items('SELECT * FROM t') == set()
+
+
 def test_a_one_element_constructor_is_spelt_as_a_call() -> None:
     # `name('x')` for a collection type: PostgreSQL reads it as a cast to the
     # type, so it is spelt `name(VARIADIC ARRAY['x'])` (#1435). Other calls,

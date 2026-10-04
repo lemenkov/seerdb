@@ -3928,6 +3928,54 @@ _NATIONAL_CAST_TARGET = re.compile(
 )
 
 
+# A numeric literal, which is no identifier for the constant check below.
+_NUMERIC_LITERAL = re.compile(
+    r'(?<![\w$#.])\d+(?:\.\d*)?(?:[eE][+-]?\d+)?[dfDF]?\b|\.\d+'
+)
+# A select item's trailing alias, `expr [AS] name`, after an expression that
+# ends as one can -- a literal, a closing parenthesis or a quote.
+_CONSTANT_ITEM_ALIAS = re.compile(
+    r'(?<=[\w\)\'])\s+(?:AS\s+)?(?:"[^"]*"|[A-Za-z_][\w$#]*)\s*\Z|(?<=\))\s*"[^"]*"\s*\Z',
+    re.IGNORECASE,
+)
+_IDENTIFIER = re.compile(r'(?<![\w$#])[A-Za-z_][\w$#]*')
+
+
+def _constant_items(sql: str) -> set[int]:
+    """The select-list positions of an Oracle query that are constant: literals,
+    operators and calls of literals, nothing else -- no column, bind,
+    pseudo-column, subquery or aggregate. Oracle folds such an item, and a
+    NUMBER one describes with precision 0 and scale -127, where a number
+    computed from a column has neither (#1444, measured on 23ai).
+    """
+    # Positions on the masked text throughout: masking changes its length.
+    (masked, _contents) = _mask_quoted(sql)
+    words, _rownums = _top_level_words(masked)
+    if not words or words[0][1] != 'SELECT':
+        return set()
+    start = words[0][0] + len('SELECT')
+    end = next((pos for pos, word in words if word == 'FROM'), len(masked))
+    items = [masked[s:e].strip() for s, e in _top_level_items(masked, start, end)]
+    if any(item == '*' or item.endswith('.*') for item in items):
+        return set()
+    found = set()
+    for index, item in enumerate(items):
+        expression = _CONSTANT_ITEM_ALIAS.sub('', item)
+        if (
+            not expression
+            or ':' in expression
+            or '"' in expression
+            or _ROWNUM_AGGREGATES.search(expression)
+        ):
+            continue
+        bare = _NUMERIC_LITERAL.sub(' ', expression)
+        if all(
+            bare[m.end() :].lstrip().startswith('(') for m in _IDENTIFIER.finditer(bare)
+        ) and not re.search(r'\bSELECT\b', bare, re.IGNORECASE):
+            found.add(index)
+    return found
+
+
 def _computed_national_columns(sql: str) -> dict[int, int]:
     """The select-list positions of an Oracle query that CAST a value to
     NVARCHAR2(n) or NCHAR(n), each with its n (#1440), or that are a national
@@ -7549,13 +7597,18 @@ class PostgresBackend:
         # A table's unconstrained NUMBER column -- a numeric with no typmod --
         # describes with precision 0 and scale -127, as Oracle's does; a computed
         # number has neither, as on a live server, so only a column that traces
-        # to a table counts (#1421). A FLOAT record below overrides it.
+        # to a table counts (#1421). So does a constant item, which Oracle folds
+        # -- 1, 1 + 1, abs(-1) -- where one computed from a column does not
+        # (#1444). A FLOAT record below overrides it.
+        constants = _constant_items(original) if original else set()
         for i, desc in enumerate(cursor.description):
-            if (
-                desc.type_code == _NUMERIC_OID
-                and columns[i].data_type == TNS_TYPE_NUMBER
-                and cursor.pgresult.ftable(i)
-                and cursor.pgresult.fmod(i) == -1
+            if columns[i].data_type == TNS_TYPE_NUMBER and (
+                (
+                    desc.type_code == _NUMERIC_OID
+                    and cursor.pgresult.ftable(i)
+                    and cursor.pgresult.fmod(i) == -1
+                )
+                or (i in constants and not columns[i].precision)
             ):
                 columns[i] = replace(columns[i], precision=0, scale=-127)
         # An INTERVAL column describes with its declared precisions, which
