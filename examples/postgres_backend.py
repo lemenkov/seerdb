@@ -2981,6 +2981,9 @@ def _translate_ddl(sql: str) -> str:
     purged = _DROP_TABLE_PURGE.match(sql)
     if purged:
         return purged.group(1)
+    altered = _translate_alter_columns(sql)
+    if altered is not None:
+        return altered
     if _IS_SEQUENCE_DDL.match(sql):
         for pattern, replacement in _SEQUENCE_KEYWORD_REWRITES:
             sql = pattern.sub(replacement, sql)
@@ -3041,13 +3044,113 @@ def _translate_ddl(sql: str) -> str:
     out = _DDL_ORG_INDEX.sub('', out)
     out = _strip_nested_table_storage(out)
     out = _DDL_COMPRESSION.sub(')', out)
-    out = _DDL_DATE_COLUMN.sub(_DATE_TYPE, out)
+    return _translate_column_types(out)
+
+
+def _translate_column_types(text: str) -> str:
+    # A table's column types, Oracle's to PostgreSQL's: CREATE TABLE's columns
+    # and those an ALTER TABLE adds or modifies (#1414).
+    text = _DDL_DATE_COLUMN.sub(_DATE_TYPE, text)
     # Before the type rewrites: BINARY_FLOAT / BINARY_DOUBLE become real and
     # double precision there, which this would catch.
-    out = _DDL_FLOAT_COLUMN.sub('numeric', out)
+    text = _DDL_FLOAT_COLUMN.sub('numeric', text)
     for pattern, replacement in _DDL_TYPE_REWRITES:
-        out = pattern.sub(replacement, out)
-    return out
+        text = pattern.sub(replacement, text)
+    return text
+
+
+# ALTER TABLE t DROP (c1, c2): Oracle's column-list DROP (#1414).
+_ALTER_TABLE_DROP_LIST = re.compile(
+    rf'\s*ALTER\s+TABLE\s+{_TABLE_NAME}\s+DROP\s*\(', re.IGNORECASE
+)
+# An ADD item that is a table constraint, not a column.
+_ADD_CONSTRAINT_ITEM = re.compile(
+    r'\s*(?:CONSTRAINT|PRIMARY|UNIQUE|FOREIGN|CHECK)\b', re.IGNORECASE
+)
+# A MODIFY item's trailing NOT NULL / NULL.
+_TRAILING_NULLITY = re.compile(r'(?:^|\s)(NOT\s+NULL|NULL)\s*$', re.IGNORECASE)
+
+
+def _translate_alter_columns(sql: str) -> str | None:
+    """Oracle's ALTER TABLE column forms in PostgreSQL's spelling (#1414), or
+    None for any other statement or a form this does not model.
+
+    ``ADD (c1 t1, c2 t2)`` is ``ADD COLUMN c1 t1', ADD COLUMN c2 t2'``, the types
+    translated as CREATE TABLE's are, and an ADD of a constraint stays one.
+    ``MODIFY (c type DEFAULT x NOT NULL)`` is ``ALTER COLUMN c TYPE type',
+    ALTER COLUMN c SET DEFAULT x, ALTER COLUMN c SET NOT NULL`` -- each part
+    only where given, NULL dropping the constraint -- and ``DROP (c1, c2)`` is
+    ``DROP COLUMN c1, DROP COLUMN c2``. A MODIFY with anything else in it (a
+    named constraint, a CHECK) is not modelled and runs as written, to fail
+    honestly.
+    """
+    dropped = _ALTER_TABLE_DROP_LIST.match(sql)
+    if dropped is not None:
+        open_at = dropped.end() - 1
+        close = _matching_paren(sql, open_at)
+        names = [sql[a:b].strip() for a, b in _top_level_items(sql, open_at + 1, close)]
+        return f'ALTER TABLE {dropped.group(1)} ' + ', '.join(
+            f'DROP COLUMN {name}' for name in names
+        )
+    parsed = _ddl_column_spans(sql)
+    if parsed is None or _CREATE_TABLE_NAME.match(sql):
+        return None
+    (table, spans, modify) = parsed
+    actions: list[str] = []
+    for start, end in spans:
+        item = sql[start:end].strip()
+        if not item:
+            continue
+        if not modify:
+            if _ADD_CONSTRAINT_ITEM.match(item):
+                actions.append(f'ADD {item}')
+            else:
+                actions.append(
+                    f'ADD COLUMN {_translate_column_types(f"({item})")[1:-1]}'
+                )
+            continue
+        name = _COLUMN_NAME.match(item)
+        if name is None:
+            return None
+        modified = _modify_actions(name.group(1), item[name.end() :].strip())
+        if modified is None:
+            return None
+        actions.extend(modified)
+    return f'ALTER TABLE {table} ' + ', '.join(actions) if actions else None
+
+
+def _modify_actions(column: str, rest: str) -> list[str] | None:
+    # One MODIFY item's ALTER COLUMN actions (#1414): its type, default and
+    # nullity, each where given; None for a part this does not model.
+    nullity = None
+    default = None
+    at = re.search(r'\bDEFAULT\b', rest, re.IGNORECASE)
+    head = rest if at is None else rest[: at.start()]
+    tail = '' if at is None else rest[at.end() :].strip()
+    trailing = _TRAILING_NULLITY.search(tail if at is not None else head)
+    if trailing is not None and (at is None or tail[: trailing.start()].strip()):
+        nullity = trailing.group(1).upper()
+        if at is None:
+            head = head[: trailing.start()]
+        else:
+            tail = tail[: trailing.start()]
+    if at is not None:
+        default = tail.strip()
+    type_text = head.strip()
+    if re.search(
+        r'\b(?:CONSTRAINT|CHECK|UNIQUE|PRIMARY|REFERENCES)\b', rest, re.IGNORECASE
+    ):
+        return None
+    actions = []
+    if type_text:
+        typed = _translate_column_types(f'({column} {type_text})')[1:-1]
+        actions.append(f'ALTER COLUMN {column} TYPE {typed[len(column) :].strip()}')
+    if default is not None:
+        actions.append(f'ALTER COLUMN {column} SET DEFAULT {default}')
+    if nullity is not None:
+        verb = 'SET' if nullity.startswith('NOT') else 'DROP'
+        actions.append(f'ALTER COLUMN {column} {verb} NOT NULL')
+    return actions
 
 
 # `SELECT REF(<alias>) FROM <table> <alias> [rest]` — the object-REF fetch (#139).
