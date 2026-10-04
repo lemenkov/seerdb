@@ -96,5 +96,61 @@ class TestBreak(unittest.TestCase):
         )
 
 
+def _answered_break(conn, timed_out: bool):
+    # A transport-less execute whose reply is the server's ORA-01013 status,
+    # the call timeout's timer having fired first or not.
+    conn._call_timeout = 1000
+    conn.send = lambda *a, **k: None
+
+    def reply(state):
+        conn._timed_out = timed_out
+        return (0, 1013, 0, (0, None), [], 'ORA-01013: cancel', None, [], None, 0, 0)
+
+    return reply
+
+
+class TestAnsweredCallTimeout(unittest.TestCase):
+    # A call timeout's break the server answers ends the call with an ORA-01013
+    # status, which is reported as the call timeout it is, as python-oracledb's
+    # DPY-4024 does; without the timeout -- a cancel() of the caller's own --
+    # ORA-01013 stays (#1575). Sync and async alike.
+
+    def test_sync(self):
+        from seerdb.common.exceptions import OperationalError
+
+        c = _conn()
+        c._handle_response = _answered_break(c, True)
+        with self.assertRaisesRegex(OperationalError, 'call timeout of 1000 ms'):
+            c.execute('select 1 from dual')
+        c._handle_response = _answered_break(c, False)
+        self.assertEqual(c.execute('select 1 from dual')[1], 1013)
+
+    def test_async(self):
+        import asyncio
+
+        from seerdb.client.aconnection import AsyncOracleConnect
+        from seerdb.common.exceptions import OperationalError
+
+        async def run():
+            c = AsyncOracleConnect(host='x', user='u', password='p', service_name='s')
+
+            async def send(*a, **k):
+                return None
+
+            async def reply_with(timed_out):
+                c._timed_out = timed_out
+                return (0, 1013, 0, (0, None), [], 'ORA-01013', None, [], None, 0, 0)
+
+            c._call_timeout = 1000
+            c.send = send
+            c._handle_response = lambda state: reply_with(True)
+            with self.assertRaisesRegex(OperationalError, 'call timeout of 1000 ms'):
+                await c.execute('select 1 from dual')
+            c._handle_response = lambda state: reply_with(False)
+            self.assertEqual((await c.execute('select 1 from dual'))[1], 1013)
+
+        asyncio.run(run())
+
+
 if __name__ == '__main__':
     unittest.main()
