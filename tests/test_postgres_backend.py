@@ -2721,6 +2721,7 @@ class _RecordingPostgresBackend(PostgresBackend):
     # Just a connection that records what reaches it.
     def __init__(self) -> None:
         self._conn = _RecordingConn()
+        self._sql_dialect = 'oracle'
 
 
 def test_transaction_control_runs_outside_the_statement_savepoint() -> None:
@@ -4149,6 +4150,81 @@ def test_a_tstz_attributes_type_shape_takes_its_precision() -> None:
         try:
             backend.execute('DROP TYPE tz1552')
             backend.commit()
+        except Exception:
+            backend.rollback()
+        backend.close()
+
+
+def test_a_pg_hint_marks_a_native_statement() -> None:
+    # An Oracle hint naming PG, at the start or after the first keyword, marks
+    # a statement as PostgreSQL's own (#1556); any other hint, or PG inside a
+    # longer word, does not.
+    from postgres_backend import _PG_HINT
+
+    for sql in (
+        'SELECT /*+ PG */ 1',
+        '/*+ PG */ SELECT 1',
+        '  -- why\n/* plain */ insert /*+ pg */ into t values (1)',
+        'SELECT /*+ PG INDEX(t i) */ 1',
+    ):
+        assert _PG_HINT.match(sql), sql
+    for sql in (
+        'SELECT 1',
+        'SELECT /*+ INDEX(t pg_idx) */ 1',
+        'SELECT /* PG */ 1',
+        "SELECT '/*+ PG */' FROM dual",
+        'SELECT a, /*+ PG */ b FROM t',
+    ):
+        assert not _PG_HINT.match(sql), sql
+    # A comment's body cannot run past its `*/`, so a run of comments matches in
+    # linear time; a lazy body backtracked exponentially on this one.
+    assert not _PG_HINT.match('/*' + '*//*' * 100_000)
+
+
+def test_native_postgresql_over_the_oracle_connection() -> None:
+    # A statement hinted PG, or any in a session switched to the postgres
+    # dialect, runs untranslated (#1556): ROWNUM and SYSDATE are then plain
+    # column aliases the Oracle translation would rewrite or refuse. Binds stay
+    # Oracle's, DDL still commits, executemany takes the hint, and a result
+    # type with no Oracle form is refused by name.
+    from postgres_backend import UnsupportedFeature
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        result = backend.execute(
+            'SELECT /*+ PG */ x AS rownum FROM generate_series(1, 3) x WHERE x >= :1',
+            [2],
+        )
+        assert [list(r) for r in result.rows] == [[2], [3]]
+        backend.execute('/*+ PG */ CREATE TABLE nat1556 (id int PRIMARY KEY, v text)')
+        backend.rollback()  # DDL committed, as Oracle's does
+        assert (
+            backend.execute_many(
+                'INSERT /*+ PG */ INTO nat1556 VALUES (:1, :2) '
+                'ON CONFLICT (id) DO NOTHING',
+                [(1, 'a'), (2, 'b'), (1, 'again')],
+            )
+            == 2
+        )
+        assert (
+            backend.execute("ALTER SESSION SET seerdb_dialect = 'postgres'").rows == []
+        )
+        result = backend.execute(
+            "SELECT id AS sysdate FROM nat1556 WHERE v ~ '^[a-z]$' ORDER BY id"
+        )
+        assert [list(r) for r in result.rows] == [[1], [2]]
+        # Transaction control keeps its own path, outside the statement
+        # savepoint (#1181), in this dialect too.
+        backend.execute('COMMIT')
+        backend.execute("ALTER SESSION SET seerdb_dialect = 'oracle'")
+        (row,) = backend.execute('SELECT SYSDATE FROM dual').rows
+        assert isinstance(row[0], datetime.datetime)
+        with pytest.raises(UnsupportedFeature, match='not supported'):
+            backend.execute('SELECT /*+ PG */ gen_random_uuid()')
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('/*+ PG */ DROP TABLE IF EXISTS nat1556')
         except Exception:
             backend.rollback()
         backend.close()
