@@ -463,6 +463,43 @@ def test_a_national_cast_is_found_in_the_select_list() -> None:
     ) == {0: 3, 2: 4}
 
 
+def test_an_unaliased_expression_is_named_by_its_text() -> None:
+    # Oracle names an unaliased computed select item by its own text, every
+    # space dropped and the rest upper-cased -- its literals and comments too;
+    # a pseudo-column by its name; a column or an aliased item keeps its name
+    # (#1449). The names are 23ai's.
+    from postgres_backend import _expression_names
+
+    assert _expression_names(
+        "SELECT length( 'ab' ), upper(a), 1 + 2, 'lit', 'a b', n'x' FROM t"
+    ) == {
+        0: "LENGTH('AB')",
+        1: 'UPPER(A)',
+        2: '1+2',
+        3: "'LIT'",
+        4: "'AB'",
+        5: "N'X'",
+    }
+    assert _expression_names(
+        'SELECT nvl(substr(a, 1, 2), \'x\'), t.n + 1, "Mixed" + 1, n, t.a, (n), '
+        '"Mixed" FROM t'
+    ) == {0: "NVL(SUBSTR(A,1,2),'X')", 1: 'T.N+1', 2: '"MIXED"+1'}
+    assert _expression_names(
+        "SELECT sysdate - sysdate, n * 2 /* c */, n\n +\n 3, 'It''s', count(*) FROM t"
+    ) == {
+        0: 'SYSDATE-SYSDATE',
+        1: 'N*2/*C*/',
+        2: 'N+3',
+        3: "'IT''S'",
+        4: 'COUNT(*)',
+    }
+    assert _expression_names('SELECT n AS al, n "Q", n x, sysdate, user FROM t') == {
+        3: 'SYSDATE',
+        4: 'USER',
+    }
+    assert _expression_names('SELECT * FROM t') == {}
+
+
 def test_a_constant_select_item_is_found() -> None:
     # Oracle folds a select item of literals, operators and calls of literals,
     # and a NUMBER one describes with precision 0 and scale -127; one computed
