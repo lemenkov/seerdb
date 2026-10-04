@@ -1087,7 +1087,21 @@ _ORACLE_DICTIONARY_DDL = (
     "CASE WHEN c.data_type = 'ARRAY' AND c.domain_name IS NOT NULL "
     'THEN ora_owner(c.domain_schema) '
     "WHEN c.data_type = 'USER-DEFINED' AND c.udt_name <> 'ora_tstz' "
-    'THEN ora_owner(c.udt_schema) END AS data_type_owner '
+    'THEN ora_owner(c.udt_schema) END AS data_type_owner, '
+    # The declared length of a character column, in bytes for a CHAR-semantics
+    # one -- its record's 4n -- and in characters otherwise; a CLOB's 4000, an
+    # NCLOB's 2000, a LONG's 0. CHAR_USED: C for CHAR semantics and the national
+    # types, B for BYTE; NULL for anything not character (#1451, measured on
+    # 23ai). Appended, as above.
+    "(CASE WHEN o.data_type IN ('VARCHAR2', 'CHAR') THEN o.data_length "
+    "WHEN o.data_type = 'NCLOB' THEN 2000 WHEN o.data_type = 'LONG' THEN 0 "
+    f"WHEN c.domain_name = '{_CLOB_TYPE}' THEN 4000 "
+    "WHEN c.data_type IN ('character varying', 'character') "
+    'THEN c.character_maximum_length END)'
+    '::information_schema.cardinal_number AS char_col_decl_length, '
+    "CASE WHEN o.data_type IN ('VARCHAR2', 'CHAR', 'NVARCHAR2', 'NCHAR') THEN 'C' "
+    "WHEN c.data_type IN ('character varying', 'character') THEN 'B' "
+    'END::text AS char_used '
     'FROM information_schema.columns c '
     'LEFT JOIN sys.ora_invisible_columns h ON h.relid = '
     "(quote_ident(c.table_schema) || '.' || quote_ident(c.table_name))::regclass "
@@ -2099,6 +2113,13 @@ _NVARCHAR2_DECLARED = re.compile(
 _NCHAR_DECLARED = re.compile(
     r'\s*NCHAR\b(?!\s+VARYING)\s*(?:\(\s*(\d+)\s*(?:CHAR\s*)?\))?', re.IGNORECASE
 )
+# VARCHAR2(n CHAR) / CHAR(n CHAR): character-length semantics, which the rewrite's
+# varchar(n) / char(n) drop (#1451). Oracle sizes such a column at the database
+# character set's widest character, four bytes in AL32UTF8: DATA_LENGTH and
+# CHAR_COL_DECL_LENGTH are 4n, CHAR_USED is C.
+_CHAR_SEMANTICS_DECLARED = re.compile(
+    r'\s*(VARCHAR2|VARCHAR|CHARACTER|CHAR)\s*\(\s*(\d+)\s+CHAR\s*\)', re.IGNORECASE
+)
 # The national type each of PostgreSQL's character types stands for.
 _NATIONAL_OF = {TNS_TYPE_VARCHAR: 'NVARCHAR2', TNS_TYPE_CHAR: 'NCHAR'}
 _CSFRM_NATIONAL = 2
@@ -2146,6 +2167,12 @@ def _declared_type(
         return ('LONG RAW' if long.group(1) else 'LONG', 0, None, None)
     if _NCLOB_DECLARED.match(definition):
         return ('NCLOB', 4000, None, None)
+    semantics = _CHAR_SEMANTICS_DECLARED.match(definition)
+    if semantics is not None:
+        kind = (
+            'VARCHAR2' if semantics.group(1).upper().startswith('VARCHAR') else 'CHAR'
+        )
+        return (kind, 4 * int(semantics.group(2)), None, None)
     national = _NVARCHAR2_DECLARED.match(definition)
     if national is not None:
         return ('NVARCHAR2', 2 * int(national.group(1)), None, None)

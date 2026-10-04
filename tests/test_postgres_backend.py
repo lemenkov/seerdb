@@ -4413,6 +4413,44 @@ def test_oracle_alter_table_column_forms_run() -> None:
         backend.close()
 
 
+def test_tab_columns_list_char_used_and_the_declared_length() -> None:
+    # USER_TAB_COLUMNS has CHAR_USED and CHAR_COL_DECL_LENGTH, and a column
+    # declared in CHAR semantics is 4n bytes long, as 23ai lists it (#1451):
+    # the rewrite drops the CHAR qualifier, so it is recorded with the DDL.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE TABLE cu1451 (a VARCHAR2(20), b VARCHAR2(10 BYTE), '
+            'cc VARCHAR2(10 CHAR), d CHAR(4), dc CHAR(3 CHAR), e NVARCHAR2(5), '
+            'f NCHAR(3), g CLOB, h LONG, i NUMBER, n NCLOB)'
+        )
+        result = backend.execute(
+            'SELECT column_name, data_length, char_length, char_col_decl_length, '
+            "char_used FROM user_tab_columns WHERE table_name = 'CU1451' "
+            'ORDER BY column_id'
+        )
+        assert [tuple(r) for r in result.rows] == [
+            ('A', 20, 20, 20, 'B'),
+            ('B', 10, 10, 10, 'B'),
+            ('CC', 40, 10, 40, 'C'),
+            ('D', 4, 4, 4, 'B'),
+            ('DC', 12, 3, 12, 'C'),
+            ('E', 10, 5, 5, 'C'),
+            ('F', 6, 3, 3, 'C'),
+            ('G', 22, 0, 4000, None),
+            ('H', 0, 0, 0, None),
+            ('I', 22, 0, None, None),
+            ('N', 4000, 0, 2000, None),
+        ]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE cu1451')
+        except Exception:
+            backend.rollback()
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships
