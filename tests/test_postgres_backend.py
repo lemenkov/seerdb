@@ -4347,6 +4347,72 @@ def test_a_collection_of_raw_is_a_collection_of_raw() -> None:
         backend.close()
 
 
+def test_oracle_alter_table_column_forms_translate() -> None:
+    # Oracle's ADD (list), MODIFY and DROP (list) in PostgreSQL's spelling, the
+    # types as CREATE TABLE translates them (#1414).
+    from postgres_backend import _translate_ddl
+
+    assert _translate_ddl('ALTER TABLE t ADD (d DATE, e CLOB, f RAW(5))') == (
+        'ALTER TABLE t ADD COLUMN d ora_date, ADD COLUMN e ora_clob, ADD COLUMN f bytea'
+    )
+    assert _translate_ddl("ALTER TABLE t ADD (g VARCHAR2(5) DEFAULT 'q' NOT NULL)") == (
+        "ALTER TABLE t ADD COLUMN g varchar(5) DEFAULT 'q' NOT NULL"
+    )
+    assert _translate_ddl('ALTER TABLE t ADD CONSTRAINT t_pk PRIMARY KEY (id)') == (
+        'ALTER TABLE t ADD CONSTRAINT t_pk PRIMARY KEY (id)'
+    )
+    assert _translate_ddl(
+        "ALTER TABLE t MODIFY (a VARCHAR2(20) DEFAULT 'x' NOT NULL, b NULL)"
+    ) == (
+        'ALTER TABLE t ALTER COLUMN a TYPE varchar(20), '
+        "ALTER COLUMN a SET DEFAULT 'x', ALTER COLUMN a SET NOT NULL, "
+        'ALTER COLUMN b DROP NOT NULL'
+    )
+    assert _translate_ddl('ALTER TABLE t MODIFY (a DEFAULT NULL)') == (
+        'ALTER TABLE t ALTER COLUMN a SET DEFAULT NULL'
+    )
+    assert _translate_ddl('ALTER TABLE t MODIFY n NUMBER(7, 2)') == (
+        'ALTER TABLE t ALTER COLUMN n TYPE numeric(7, 2)'
+    )
+    assert _translate_ddl('ALTER TABLE t DROP (e, "F")') == (
+        'ALTER TABLE t DROP COLUMN e, DROP COLUMN "F"'
+    )
+    # Not modelled: runs as written, to fail honestly.
+    named = 'ALTER TABLE t MODIFY (a CONSTRAINT a_nn NOT NULL)'
+    assert _translate_ddl(named) == named
+
+
+def test_oracle_alter_table_column_forms_run() -> None:
+    # The forms run, and the dictionary reads what they declared (#1414).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE alt1414 (id NUMBER, a VARCHAR2(10))')
+        for statement in (
+            'ALTER TABLE alt1414 ADD (b NUMBER(5), d DATE, f RAW(5))',
+            'ALTER TABLE alt1414 MODIFY (a VARCHAR2(20) NOT NULL, b NUMBER(7, 2))',
+            'ALTER TABLE alt1414 DROP (d)',
+        ):
+            backend.execute(statement)
+        result = backend.execute(
+            'SELECT column_name, data_type, data_length, data_precision, '
+            'data_scale, nullable FROM user_tab_columns '
+            "WHERE table_name = 'ALT1414' ORDER BY column_id"
+        )
+        assert [tuple(r) for r in result.rows] == [
+            ('ID', 'NUMBER', 22, None, None, 'Y'),
+            ('A', 'VARCHAR2', 20, None, None, 'N'),
+            ('B', 'NUMBER', 22, 7, 2, 'Y'),
+            ('F', 'RAW', 5, None, None, 'Y'),
+        ]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE alt1414')
+        except Exception:
+            backend.rollback()
+        backend.close()
+
+
 def test_dbms_lock_and_dbms_session_sleep() -> None:
     # The way a client makes a call take time -- python-oracledb's cancel and
     # call-timeout tests call one or the other, by server version. orafce ships
