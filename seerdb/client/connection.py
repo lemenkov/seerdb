@@ -81,6 +81,7 @@ from seerdb.common.tns_consts import (
     ORA_DEQUEUE_TIMEOUT,
     ORA_LISTEN_TIMEOUT,
     ORA_NO_DATA_FOUND,
+    ORA_USER_REQUESTED_CANCEL,
     PURITY_DEFAULT,
     TNS_ACCEPT,
     TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE,
@@ -1862,6 +1863,13 @@ class OracleConnect(_ConnectionLogic):
             # REF CURSOR OUT bind from a scalar one.
             Result = self._handle_response((None, None, [], Bind))
             self._call_in_progress = False
+            # The server answered the call timeout's break: its ORA-01013 is the
+            # call's status, not an exception, and is reported as the timeout it
+            # is, as python-oracledb reports it (DPY-4024) (#1575). A cancel()
+            # of the caller's own keeps ORA-01013.
+            answered_timeout = (
+                self._timed_out and _error_code(Result) == ORA_USER_REQUESTED_CANCEL
+            )
         except Exception as exc:
             self._call_in_progress = False
             # If reusing a cached cursor blew up, drop it from the cache
@@ -1887,6 +1895,12 @@ class OracleConnect(_ConnectionLogic):
             self._break_in_progress = False
             self._timed_out = False
             self._call_abandoned = False
+        if answered_timeout:
+            if CachedCursor and CacheKey is not None:
+                self._cursor_cache.pop(CacheKey, None)
+            raise OperationalError(
+                f'call timeout of {self._call_timeout} ms exceeded (ORA-03136)'
+            )
         # A cached cursor whose execute failed is gone on the server side: a
         # later re-execute of the same id answers ORA-01001 for the rest of the
         # connection, whatever the values (#709). Forget it, so the next execute
