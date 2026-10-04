@@ -101,6 +101,17 @@ def test_from_dual_is_stripped_before_delegation() -> None:
     assert inner.calls == ['select 1']
 
 
+def test_from_dual_reaches_a_backend_that_has_dual() -> None:
+    # A backend with a DUAL of its own gets the statement as the client sent
+    # it (#1561).
+    class _WithDual(_FakeInner):
+        has_dual = True
+
+    inner = _WithDual()
+    OracleCompatBackend(inner).execute('select 1 from dual')
+    assert inner.calls == ['select 1 from dual']
+
+
 def test_real_statements_pass_through_untouched() -> None:
     inner = _FakeInner()
     OracleCompatBackend(inner).execute('SELECT * FROM t')
