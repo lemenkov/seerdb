@@ -1697,6 +1697,44 @@ def test_high_precision_numeric() -> None:
     )
 
 
+def test_a_quotient_keeps_oracles_digits() -> None:
+    # Oracle keeps a quotient to 20 base-100 digits, rounded half away from
+    # zero: 40 significant digits for 1/3, 39 for 10/7, where PostgreSQL keeps
+    # 16 to 20 (#1598). Integers, decimals and a column alike; the values are
+    # 23ai's. A zero divisor is still ORA-01476.
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        (row,) = backend.execute(
+            'SELECT 1/3, -2/3, 10/7, 1e30/3, 0.00001/3, 1/999999, 5/2, '
+            '123456789/0.003 FROM dual'
+        ).rows
+        assert list(row) == [
+            Decimal('0.' + '3' * 40),
+            Decimal('-0.' + '6' * 39 + '7'),
+            Decimal('1.42857142857142857142857142857142857143'),
+            Decimal('333333333333333333333333333333.3333333333'),
+            Decimal('0.00000' + '3' * 39),
+            Decimal('0.' + '000001' * 7),
+            Decimal('2.5'),
+            Decimal('41152263000'),
+        ]
+        backend.execute('CREATE TABLE dv1598 (n NUMBER)')
+        backend.execute('INSERT INTO dv1598 VALUES (100)')
+        (row,) = backend.execute('SELECT n / 7 FROM dv1598').rows
+        assert row[0] == Decimal('14.28571428571428571428571428571428571429')
+        with pytest.raises(BackendError) as exc:
+            backend.execute('SELECT n / 0 FROM dv1598')
+        assert exc.value.ora_code == 1476
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE dv1598')
+        except Exception:
+            backend.rollback()
+
+
 def test_binary_float_and_double_columns() -> None:
     # PostgreSQL float4 / float8 map to Oracle BINARY_FLOAT / BINARY_DOUBLE
     # (Python float, IEEE-exact), while numeric stays NUMBER (Decimal).
@@ -2032,8 +2070,8 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
         assert f'FUNCTION {name}(' in _HELPER_FUNCTIONS_DDL
     # 47, ora_div (#1361) and power (#1362) for each of the nine pairs of
     # integer types, sys.ora_to_raw's two overloads (#1496), sys.ora_raw_fits
-    # (#1415) and sys.ora_float_round (#1422).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 69
+    # (#1415), sys.ora_float_round (#1422) and sys.ora_numeric_div (#1598).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 70
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument

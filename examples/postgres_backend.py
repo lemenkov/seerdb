@@ -659,16 +659,39 @@ _HELPER_FUNCTIONS_DDL = (
     'CREATE OPERATOR || (LEFTARG = anynonarray, RIGHTARG = text, '
     'FUNCTION = ora_concat); '
     'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
+    # A quotient as Oracle's NUMBER holds it (#1598): 20 base-100 digits, the
+    # pairs aligned on the decimal point, rounded half away from zero -- 40
+    # significant decimal digits for 1/3, 39 for 10/7 -- where PostgreSQL keeps
+    # 16 to 20. PostgreSQL's own / divides first: it raises on a zero divisor
+    # and estimates the quotient's magnitude. div() then gives the quotient
+    # truncated past the last digit kept, so the one rounding that follows is
+    # exact; the magnitude it rounds by is read from that quotient's digits.
+    # Each / is PostgreSQL's by name, as the / below would otherwise call this,
+    # and the magnitude is a float8 log: numeric's costs 10 us a call.
+    'CREATE OR REPLACE FUNCTION sys.ora_numeric_div(numeric, numeric) '
+    'RETURNS numeric LANGUAGE plpgsql IMMUTABLE STRICT AS $$ '
+    'DECLARE q numeric := $1 OPERATOR(pg_catalog./) $2; e integer; k integer; '
+    "t numeric; BEGIN IF q = 0 OR NOT abs(q) < 'Infinity' THEN RETURN q; END IF; "
+    'e := floor(log(abs(q)::float8)); '
+    'k := 39 - 2 * floor((e - 1) * 0.5)::integer; '
+    "t := div($1 * ('1e' || k)::numeric, $2); "
+    'e := length(abs(t)::text) - 1 - k; '
+    "RETURN trim_scale(round(t * ('1e' || -k)::numeric, "
+    '38 - 2 * floor(e * 0.5)::integer)); END $$;'
+    'DO $$ BEGIN CREATE OPERATOR / (LEFTARG = numeric, RIGHTARG = numeric, '
+    'FUNCTION = sys.ora_numeric_div); '
+    'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
     # Division (#1361): Oracle's / is exact, so 3 / 2 is 1.5; PostgreSQL divides
     # two integers as integers and gives 1. An integer reaches it as a literal, an
     # int bind, or a function such as count(*), so every pair of PostgreSQL's
-    # integer types gets a / that divides as numeric, shadowing PostgreSQL's own
-    # from an earlier schema on the search path, as || does above. Each operator
-    # has its own DO block, so one already there doesn't stop the rest.
+    # integer types gets a / that divides as numeric, Oracle's way (#1598),
+    # shadowing PostgreSQL's own from an earlier schema on the search path, as ||
+    # does above. Each operator has its own DO block, so one already there doesn't
+    # stop the rest.
     + ''.join(
         f'CREATE OR REPLACE FUNCTION ora_div({left}, {right}) RETURNS numeric '
         'LANGUAGE sql IMMUTABLE STRICT AS '
-        '$$ SELECT $1::numeric OPERATOR(pg_catalog./) $2::numeric $$;'
+        '$$ SELECT sys.ora_numeric_div($1::numeric, $2::numeric) $$;'
         'DO $$ BEGIN '
         f'CREATE OPERATOR / (LEFTARG = {left}, RIGHTARG = {right}, FUNCTION = ora_div); '
         'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
