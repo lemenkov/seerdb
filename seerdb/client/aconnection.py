@@ -42,6 +42,7 @@ from seerdb.client.connection import (
     _REDIRECT_CONNECT_ATTEMPTS,
     _REDIRECT_CONNECT_DELAY,
     Xid,
+    _abandoned_call_message,
     _decode_tpc_context,
     _decode_tpc_state,
     _normalize_sessionless_txn_id,
@@ -266,6 +267,10 @@ class AsyncOracleConnect(_ConnectionLogic):
         self._break_in_progress = False
         self._call_timeout = 0
         self._timed_out = False
+        # The break's deadline, as the sync twin's (#1570).
+        self._break_deadline: asyncio.TimerHandle | None = None
+        self._call_in_progress = False
+        self._call_abandoned = False
         self._supports_oob = False  # set from the accept (#144)
         self._supports_eor = False  # end-of-response (#155/#132)
         self._large_packets = False  # 4-byte framing (#155, >=315)
@@ -1124,12 +1129,20 @@ class AsyncOracleConnect(_ConnectionLogic):
                 self._call_timeout / 1000.0, self._on_call_timeout
             )
         try:
+            self._call_in_progress = True
             # Seed the decoder with the binds so the IOV decoder can tell a
             # REF CURSOR OUT bind from a scalar one.
             Result = await self._handle_response((None, None, [], Bind))
+            self._call_in_progress = False
         except Exception as exc:
+            self._call_in_progress = False
             if CachedCursor and CacheKey is not None:
                 self._cursor_cache.pop(CacheKey, None)
+            if self._call_abandoned:
+                await self.disconnect()
+                raise OperationalError(
+                    _abandoned_call_message(self._call_timeout)
+                ) from exc
             if self._timed_out:
                 raise OperationalError(
                     f'call timeout of {self._call_timeout} ms exceeded (ORA-03136)'
@@ -1138,8 +1151,12 @@ class AsyncOracleConnect(_ConnectionLogic):
         finally:
             if Timer is not None:
                 Timer.cancel()
+            if self._break_deadline is not None:
+                self._break_deadline.cancel()
+                self._break_deadline = None
             self._break_in_progress = False
             self._timed_out = False
+            self._call_abandoned = False
         # A cached cursor whose execute failed is gone on the server side: a
         # later re-execute of the same id answers ORA-01001 for the rest of the
         # connection, whatever the values (#709). Forget it, so the next execute
@@ -2132,6 +2149,20 @@ class AsyncOracleConnect(_ConnectionLogic):
         self.password = new_password
 
     # ----- teardown -----
+
+    def _arm_break_deadline(self) -> None:
+        # Async port of `OracleConnect._arm_break_deadline` (#1570).
+        self._break_deadline = asyncio.get_running_loop().call_later(
+            self._call_timeout / 1000.0, self._abandon_call
+        )
+
+    def _abandon_call(self) -> None:
+        # Async port of `OracleConnect._abandon_call` (#1570): abort the
+        # transport, so the read awaiting the reply fails.
+        if not self._call_in_progress or self._writer is None:
+            return
+        self._call_abandoned = True
+        self._writer.transport.abort()
 
     def _send_break(self) -> None:
         # In-band INTERRUPT marker break (#144), the async port of OracleConnect.
