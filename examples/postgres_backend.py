@@ -366,6 +366,15 @@ _HELPER_FUNCTIONS_DDL = (
     "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT decode($1, 'hex') $$;"
     'CREATE OR REPLACE FUNCTION sys.ora_to_raw(bytea) RETURNS bytea '
     'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
+    # A RAW(n) column's value must fit n bytes, which a bytea does not enforce
+    # (#1415). As Oracle reports it, ORA-12899 -- SQLSTATE 22001, which the
+    # error map turns into it -- in Oracle's own wording.
+    'CREATE OR REPLACE FUNCTION sys.ora_raw_fits(bytea, integer, text, text) '
+    'RETURNS boolean LANGUAGE plpgsql STABLE AS $$ BEGIN '
+    "IF octet_length($1) > $2 THEN RAISE EXCEPTION USING ERRCODE = '22001', "
+    'MESSAGE = format(\'value too large for column "%s"."%s"."%s" '
+    "(actual: %s, maximum: %s)', sys.ora_owner(current_schema()), $3, $4, "
+    'octet_length($1), $2); END IF; RETURN true; END $$;'
     # RAWTOHEX(x) → the hex text of a bytea. Oracle returns upper-case hex.
     'CREATE OR REPLACE FUNCTION rawtohex(bytea) RETURNS text '
     "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT upper(encode($1, 'hex')) $$;"
@@ -3158,11 +3167,55 @@ def _translate_ddl(sql: str) -> str:
         return view
     if not _IS_CREATE_TABLE.match(sql):
         return sql
-    out = _DDL_GLOBAL_TEMPORARY.sub('TEMPORARY', sql)
+    out = _DDL_GLOBAL_TEMPORARY.sub('TEMPORARY', _with_raw_length_checks(sql))
     out = _DDL_ORG_INDEX.sub('', out)
     out = _strip_nested_table_storage(out)
     out = _DDL_COMPRESSION.sub(')', out)
     return _translate_column_types(out)
+
+
+def _oracle_identifier_text(name: str) -> str:
+    # A name as Oracle stores it, for a message: quoted as written, else upper.
+    name = name.strip()
+    return name[1:-1] if name.startswith('"') else name.upper()
+
+
+def _raw_check_name(column: str) -> str:
+    # The constraint holding a RAW(n) column to n bytes, named for the column so
+    # a MODIFY can find it (#1415).
+    pg = column[1:-1] if column.startswith('"') else column.lower()
+    return '"' + f'ora_raw_len_{pg}'[:63].replace('"', '""') + '"'
+
+
+def _raw_length_check(table: str, column: str, length: int) -> str:
+    table_text = _oracle_identifier_text(table.split('.')[-1]).replace("'", "''")
+    column_text = _oracle_identifier_text(column).replace("'", "''")
+    return (
+        f'CONSTRAINT {_raw_check_name(column)} CHECK (sys.ora_raw_fits('
+        f"{column}, {length}, '{table_text}', '{column_text}'))"
+    )
+
+
+def _with_raw_length_checks(sql: str) -> str:
+    # A CREATE TABLE's RAW(n) columns, each with the check that holds it to n
+    # bytes (#1415).
+    parsed = _ddl_column_spans(sql)
+    if parsed is None:
+        return sql
+    (table, spans, _modify) = parsed
+    for start, end in sorted(spans, reverse=True):
+        name = _COLUMN_NAME.match(sql, start, end)
+        if name is None:
+            continue
+        raw = _RAW_DECLARED.match(sql, name.end(), end)
+        if raw is None:
+            continue
+        check = _raw_length_check(table, name.group(1), int(raw.group(1)))
+        stop = end
+        while stop > start and sql[stop - 1].isspace():
+            stop -= 1
+        sql = f'{sql[:stop]} {check}{sql[stop:]}'
+    return sql
 
 
 def _translate_column_types(text: str) -> str:
@@ -3223,21 +3276,26 @@ def _translate_alter_columns(sql: str) -> str | None:
             if _ADD_CONSTRAINT_ITEM.match(item):
                 actions.append(f'ADD {item}')
             else:
-                actions.append(
-                    f'ADD COLUMN {_translate_column_types(f"({item})")[1:-1]}'
-                )
+                column = _translate_column_types(f'({item})')[1:-1]
+                name = _COLUMN_NAME.match(item)
+                raw = _RAW_DECLARED.match(item, name.end()) if name else None
+                if name is not None and raw is not None:
+                    # A RAW(n) column held to n bytes (#1415).
+                    check = _raw_length_check(table, name.group(1), int(raw.group(1)))
+                    column = f'{column} {check}'
+                actions.append(f'ADD COLUMN {column}')
             continue
         name = _COLUMN_NAME.match(item)
         if name is None:
             return None
-        modified = _modify_actions(name.group(1), item[name.end() :].strip())
+        modified = _modify_actions(table, name.group(1), item[name.end() :].strip())
         if modified is None:
             return None
         actions.extend(modified)
     return f'ALTER TABLE {table} ' + ', '.join(actions) if actions else None
 
 
-def _modify_actions(column: str, rest: str) -> list[str] | None:
+def _modify_actions(table: str, column: str, rest: str) -> list[str] | None:
     # One MODIFY item's ALTER COLUMN actions (#1414): its type, default and
     # nullity, each where given; None for a part this does not model.
     nullity = None
@@ -3263,6 +3321,11 @@ def _modify_actions(column: str, rest: str) -> list[str] | None:
     if type_text:
         typed = _translate_column_types(f'({column} {type_text})')[1:-1]
         actions.append(f'ALTER COLUMN {column} TYPE {typed[len(column) :].strip()}')
+        # A RAW(n) column's check follows its n; another type has none (#1415).
+        actions.append(f'DROP CONSTRAINT IF EXISTS {_raw_check_name(column)}')
+        raw = _RAW_DECLARED.match(type_text)
+        if raw is not None:
+            actions.append(f'ADD {_raw_length_check(table, column, int(raw.group(1)))}')
     if default is not None:
         actions.append(f'ALTER COLUMN {column} SET DEFAULT {default}')
     if nullity is not None:
