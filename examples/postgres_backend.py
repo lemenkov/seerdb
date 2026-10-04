@@ -4433,6 +4433,87 @@ def _translate_deref(sql: str) -> str:
     return ''.join(out) + sql[pos:]
 
 
+# A table's correlation name, in a FROM or JOIN list or an UPDATE's head (#1434);
+# the words that may follow a table in its stead.
+_CORRELATION_NAME = re.compile(
+    rf'(?:\bFROM|\bJOIN|\bUPDATE|,)\s+{_TABLE_NAME}\s+'
+    r'(?!(?:WHERE|ON|USING|JOIN|INNER|LEFT|RIGHT|FULL|CROSS|NATURAL|OUTER|SET|GROUP'
+    r'|ORDER|HAVING|CONNECT|START|UNION|MINUS|INTERSECT|EXCEPT|FOR|FETCH|OFFSET'
+    r'|PARTITION|SAMPLE|PIVOT|UNPIVOT|MODEL|WITH|RETURNING|LOG|INTO|VALUES)\b)'
+    r'([A-Za-z_][\w$#]*)',
+    re.IGNORECASE,
+)
+# alias.column.attribute[.attribute...], on masked text; a method call is not one.
+_ATTRIBUTE_PART = r'(?:[A-Za-z_][\w$#]*|"\x00\d+\x00")'
+_ATTRIBUTE_PATH = re.compile(
+    rf'(?<![\w$#."@:])([A-Za-z_][\w$#]*)\s*\.\s*({_ATTRIBUTE_PART})'
+    rf'((?:\s*\.\s*{_ATTRIBUTE_PART})+)(?![\w$#.]|\s*\(|\s*\.)'
+)
+_ATTRIBUTE_DOT = re.compile(r'\s*\.\s*')
+_UPDATE_HEAD = re.compile(r'\s*UPDATE\b', re.IGNORECASE)
+_SET_TARGET_BEFORE = re.compile(r'(?:\bSET|,)\s*$', re.IGNORECASE)
+_SET_TARGET_AFTER = re.compile(r'\s*=')
+
+
+def _translate_attribute_access(sql: str) -> str:
+    """Oracle's object attribute access, `alias.column.attribute`, in
+    PostgreSQL's spelling `(alias.column).attribute`, which reads the Oracle
+    one as schema, table and column (#1434). Oracle takes it through a table's
+    correlation name only, so only one declared in the statement is rewritten.
+    An UPDATE's SET target is `column.attribute` in PostgreSQL; an unaliased
+    select item is named as Oracle names it, the path but the alias: O.V.
+    """
+    (masked, contents) = _mask_quoted(sql)
+    aliases = {m.group(2).upper() for m in _CORRELATION_NAME.finditer(masked)}
+    if not aliases:
+        return sql
+    update = _UPDATE_HEAD.match(masked) is not None
+    words, _rownums = _top_level_words(masked)
+    where = next((p for p, w in words if w == 'WHERE'), len(masked))
+    named: dict[int, str] = {}
+    if words and words[0][1] == 'SELECT':
+        start = words[0][0] + len('SELECT')
+        if len(words) > 1 and words[1][1] in ('DISTINCT', 'UNIQUE', 'ALL'):
+            start = words[1][0] + len(words[1][1])
+        end = next((p for p, w in words if w in _SELECT_LIST_ENDS), len(masked))
+        for s_at, e_at in _top_level_items(masked, start, end):
+            item = masked[s_at:e_at]
+            path = _ATTRIBUTE_PATH.fullmatch(item.strip())
+            if path is not None:
+                named[s_at + len(item) - len(item.lstrip())] = '.'.join(
+                    part[1:-1] if part.startswith('"') else part.upper()
+                    for part in _ATTRIBUTE_DOT.split(
+                        _unmask_quoted(path.group(2) + path.group(3), contents)
+                    )
+                )
+    out: list[str] = []
+    pos = 0
+    for match in _ATTRIBUTE_PATH.finditer(masked):
+        if match.group(1).upper() not in aliases:
+            continue
+        attributes = _ATTRIBUTE_DOT.split(match.group(3))[1:]
+        if (
+            update
+            and match.start() < where
+            and _SET_TARGET_BEFORE.search(masked, 0, match.start())
+            and _SET_TARGET_AFTER.match(masked, match.end())
+        ):
+            rewritten = '.'.join([match.group(2), *attributes])
+        else:
+            rewritten = f'{match.group(1)}.{match.group(2)}'
+            for attribute in attributes:
+                rewritten = f'({rewritten}).{attribute}'
+        if match.start() in named:
+            name = named[match.start()].replace('"', '""')
+            rewritten += f' AS "\x00{len(contents)}\x00"'
+            contents.append(name)
+        out.append(masked[pos : match.start()] + rewritten)
+        pos = match.end()
+    if not out:
+        return sql
+    return _unmask_quoted(''.join(out) + masked[pos:], contents)
+
+
 # CURSOR(SELECT ...), a cursor-valued select-list item (#1461).
 _CURSOR_EXPRESSION = re.compile(r'\bCURSOR\s*\((?=\s*SELECT\b)', re.IGNORECASE)
 # A select-list item's trailing alias: `expr alias` or `expr AS alias`.
@@ -4671,6 +4752,7 @@ def _translate_idioms(sql: str) -> str:
     sql = _ruled('row-generator', _translate_row_generator(sql), sql)
     sql = _ruled('rownum', _rewrite_rownum(sql), sql)
     sql = _ruled('deref', _translate_deref(sql), sql)
+    sql = _ruled('attribute-access', _translate_attribute_access(sql), sql)
     sql = _ruled('connect-by', _translate_connect_by(sql), sql)
     sql = _ruled('signed-year', _translate_signed_year(sql), sql)
     sql = _ruled('decode', _translate_decode(sql), sql)

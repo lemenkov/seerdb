@@ -596,6 +596,58 @@ def test_deref_becomes_a_parenthesised_sys_deref() -> None:
     )
 
 
+def test_attribute_access_through_an_alias_is_a_field_selection() -> None:
+    # Oracle's alias.column.attribute is PostgreSQL's (alias.column).attribute
+    # (#1434); a bare select item is named as Oracle names it, the path but the
+    # alias; an UPDATE's SET target is column.attribute. A path not headed by
+    # a correlation name is schema.table.column, and a method call is left be.
+    assert _translate_idioms(
+        'SELECT x.o.v, x.n.s.v, LENGTH(x.o.v), x.o.v AS w FROM t x '
+        "WHERE x.o.v = 'a' ORDER BY x.o.id"
+    ) == (
+        'SELECT (x.o).v AS "O.V", ((x.n).s).v AS "N.S.V", LENGTH((x.o).v), '
+        "(x.o).v AS w FROM t x WHERE (x.o).v = 'a' ORDER BY (x.o).id"
+    )
+    assert _translate_idioms("UPDATE t x SET x.o.v = 'b', k = x.o.id") == (
+        "UPDATE t x SET o.v = 'b', k = (x.o).id"
+    )
+    assert _translate_idioms('SELECT s.t.c FROM s.t') == 'SELECT s.t.c FROM s.t'
+    assert _translate_idioms('SELECT x.o.m() FROM t x') == 'SELECT x.o.m() FROM t x'
+
+
+def test_an_object_attribute_reads_and_writes_through_an_alias() -> None:
+    # SELECT, WHERE, ORDER BY and UPDATE through alias.column.attribute, a
+    # nested object's too; the rows and names are 23ai's (#1434).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TYPE o1434 AS OBJECT (id NUMBER, v VARCHAR2(10))')
+        backend.execute('CREATE TYPE o1434n AS OBJECT (k NUMBER, sub o1434)')
+        backend.execute('CREATE TABLE t1434 (k NUMBER, o o1434, n o1434n)')
+        backend.execute(
+            "INSERT INTO t1434 VALUES (1, o1434(1, 'abc'), o1434n(5, o1434(7, 'deep')))"
+        )
+        backend.execute("INSERT INTO t1434 VALUES (2, o1434(2, 'xyz'), NULL)")
+        result = backend.execute(
+            'SELECT x.o.v, x.n.sub.v FROM t1434 x ORDER BY x.o.id DESC'
+        )
+        assert [column.name for column in result.columns] == [b'O.V', b'N.SUB.V']
+        assert [tuple(row) for row in result.rows] == [('xyz', None), ('abc', 'deep')]
+        backend.execute(
+            "UPDATE t1434 x SET x.o.v = 'new', x.n.sub.v = 'nest' WHERE x.o.id = 1"
+        )
+        result = backend.execute(
+            "SELECT x.o.v, x.n.sub.v FROM t1434 x WHERE x.o.v = 'new'"
+        )
+        assert [tuple(row) for row in result.rows] == [('new', 'nest')]
+    finally:
+        backend.rollback()
+        for statement in ('DROP TABLE t1434', 'DROP TYPE o1434n', 'DROP TYPE o1434'):
+            try:
+                backend.execute(statement)
+            except Exception:
+                backend.rollback()
+
+
 def test_numbered_placeholders_take_values_in_order_of_appearance() -> None:
     # A block's bind values fill its placeholders in the order they first
     # appear, whatever their numbers (#1380); a repeat, a `::` cast and a
