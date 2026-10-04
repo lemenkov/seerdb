@@ -4658,6 +4658,35 @@ def test_connect_by_hierarchical_query_runs() -> None:
         backend.close()
 
 
+def test_utl_raw_takes_a_character_argument_as_hex() -> None:
+    # A UTL_RAW function given a character value where it takes a RAW reads it
+    # as hex, as Oracle converts one (#1496): '414243' is ABC's bytes. RAWTOHEX
+    # does not -- Oracle gives the hex of the text's own bytes. The values are
+    # 23ai's.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+
+        def scalar(sql: str):
+            return backend.execute(sql).rows[0][0]
+
+        assert scalar("SELECT utl_raw.cast_to_varchar2('414243') FROM dual") == 'ABC'
+        assert (
+            backend.execute(
+                'SELECT utl_raw.cast_to_varchar2(:1) FROM dual', ['4142']
+            ).rows[0][0]
+            == 'AB'
+        )
+        assert scalar("SELECT utl_raw.length('41424344') FROM dual") == 4
+        assert scalar("SELECT utl_raw.substr('41424344', 2, 2) FROM dual") == b'BC'
+        assert scalar("SELECT utl_raw.concat('41', '42') FROM dual") == b'AB'
+        assert scalar("SELECT utl_raw.bit_and('FF0F', '0FFF') FROM dual") == b'\x0f\x0f'
+        assert scalar("SELECT utl_raw.bit_or('F0', '0F') FROM dual") == b'\xff'
+        assert scalar("SELECT utl_raw.bit_xor('FF', '0F') FROM dual") == b'\xf0'
+        assert scalar("SELECT rawtohex('4142') FROM dual") == '34313432'
+    finally:
+        backend.close()
+
+
 def test_utl_raw_length_does_not_recurse_with_schema_on_path() -> None:
     # utl_raw.length()'s body must call pg_catalog.length, not a bare length():
     # with utl_raw on the search path (and pg_catalog explicitly after it) a bare
