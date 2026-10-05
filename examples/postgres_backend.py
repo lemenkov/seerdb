@@ -98,9 +98,14 @@ edge of this adapter:
   ``all_plsql_coll_types`` list a spec's types. A record or an index-by table
   binds and comes back as an object, an index-by table under its own keys; a
   classic PL/SQL array (``cursor.arrayvar``) bound to an index-by table
-  parameter is keyed 1..N, and comes back as its values. Not yet: a record of a
-  table's row (``%ROWTYPE``) as a bind, a body's indexing of an index-by table,
-  package variables and an initialization section; a private member is
+  parameter is keyed 1..N, and comes back as its values. A body indexes an
+  index-by table as PL/SQL does -- ``a(k) := x``, ``a(k)``, ``COUNT``,
+  ``FIRST`` / ``LAST`` / ``NEXT`` / ``PRIOR``, ``EXISTS``, ``DELETE`` -- through
+  functions each such type has (``t$get``, ``t$set``, ...), the keys kept in
+  order; a key not there is ORA-01403. Not yet: a record of a table's row
+  (``%ROWTYPE``) as a bind, package variables and an initialization section;
+  ``DATE - DATE`` in a body is an interval, not Oracle's number of days; a
+  private member is
   callable from outside, where Oracle's is not;
   and PL/pgSQL checks an identifier when the routine runs, not when it is
   created, so a body Oracle would refuse can compile and fail on its first call
@@ -5469,7 +5474,9 @@ def _package_type(package: str, member: _PackageMember) -> str | None:
     if indexed is not None:
         element = _translate_routine_types(_DECLARED_EXTRAS.sub('', indexed.group(1)))
         key = 'text' if _STRING_KEY.match(indexed.group(2).strip()) else 'integer'
-        return f'CREATE TYPE {name} AS (keys {key}[], vals {element}[])'
+        return f'CREATE TYPE {name} AS (keys {key}[], vals {element}[]); ' + (
+            _index_table_methods(name, key, element)
+        )
     varray = _VARRAY_TYPE.fullmatch(definition)
     if varray is not None:
         element = _translate_routine_types(varray.group(2))
@@ -5615,6 +5622,179 @@ def _plsql_type_meta(
     return meta
 
 
+def _index_table_methods(name: str, key: str, element: str) -> str:
+    """The methods of an index-by table type (#1607), functions over its keys
+    and values, the keys kept sorted -- by number, or byte by byte for a string
+    key, as Oracle orders them -- so FIRST / NEXT walk them in order:
+
+    - ``$get(t, k)`` the element, ORA-01403 for a key not there;
+    - ``$set(t, k, v)`` the table with ``k`` set, NULL taken as empty;
+    - ``$count``, ``$first``, ``$last``, ``$next(t, k)``, ``$prior(t, k)``,
+      ``$exists(t, k)`` and ``$delete(t [, k])``.
+    """
+    order = ' COLLATE "C"' if key == 'text' else ''
+    # Each key with its element by subscript: a two-array unnest would spread a
+    # record element over columns of its own.
+    pairs = (
+        '(SELECT ($1).keys[sub] AS k, ($1).vals[sub] AS v '
+        'FROM generate_subscripts(($1).keys, 1) sub) u'
+    )
+    sql = 'LANGUAGE sql IMMUTABLE'
+    return '; '.join(
+        (
+            # A key's slot: by arithmetic where the keys are the dense run 1..N
+            # (or any run without a gap) a classic array or a loop builds,
+            # else by array_position -- either O(1) per element in PL/SQL's
+            # `for i in 1..a.count loop ... a(i)`, which a scan made quadratic.
+            f'CREATE FUNCTION {name}$get({name}, {key}) RETURNS {element} '
+            'LANGUAGE plpgsql IMMUTABLE AS $f$ DECLARE ks '
+            + key
+            + '[] := ($1).keys; n integer := coalesce(cardinality(ks), 0); '
+            'i integer; BEGIN '
+            + (
+                'IF n > 0 AND ks[n] - ks[1] = n - 1 THEN i := $2 - ks[1] + 1; ELSE '
+                if key == 'integer'
+                else ''
+            )
+            + 'i := array_position(ks, $2); '
+            + ('END IF; ' if key == 'integer' else '')
+            + 'IF i IS NULL OR i < 1 OR i > n OR ks[i] IS DISTINCT FROM $2 THEN '
+            "RAISE EXCEPTION USING ERRCODE = 'P0002', MESSAGE = 'no data found'; "
+            'END IF; RETURN ($1).vals[i]; END $f$',
+            # A set past the last key, or of a key there already, in place;
+            # only a key between two others rebuilds the table in order.
+            f'CREATE FUNCTION {name}$set({name}, {key}, {element}) RETURNS {name} '
+            'LANGUAGE plpgsql IMMUTABLE AS $f$ DECLARE ks '
+            + key
+            + '[] := coalesce(($1).keys, '
+            + "'{}'); vs "
+            + element
+            + "[] := coalesce(($1).vals, '{}'); n integer := cardinality(ks); "
+            'i integer; r ' + name + '; BEGIN '
+            f'IF n = 0 OR $2{order} > ks[n]{order} THEN '
+            'r.keys := ks || $2; r.vals := vs || $3; RETURN r; END IF; '
+            'i := array_position(ks, $2); '
+            'IF i IS NOT NULL THEN vs[i] := $3; r.keys := ks; r.vals := vs; '
+            'RETURN r; END IF; '
+            f'SELECT array_agg(x.k ORDER BY x.k{order}), '
+            f'array_agg(x.v ORDER BY x.k{order}) INTO r.keys, r.vals FROM '
+            f'(SELECT u.k, u.v FROM {pairs} UNION ALL SELECT $2, $3) x; '
+            'RETURN r; END $f$',
+            f'CREATE FUNCTION {name}$count({name}) RETURNS integer {sql} AS $f$ '
+            'SELECT coalesce(cardinality(($1).keys), 0) $f$',
+            f'CREATE FUNCTION {name}$first({name}) RETURNS {key} {sql} AS $f$ '
+            'SELECT ($1).keys[1] $f$',
+            f'CREATE FUNCTION {name}$last({name}) RETURNS {key} {sql} AS $f$ '
+            'SELECT ($1).keys[cardinality(($1).keys)] $f$',
+            f'CREATE FUNCTION {name}$next({name}, {key}) RETURNS {key} {sql} AS $f$ '
+            f'SELECT min(k{order}) FROM unnest(($1).keys) k WHERE k{order} > $2 $f$',
+            f'CREATE FUNCTION {name}$prior({name}, {key}) RETURNS {key} {sql} AS $f$ '
+            f'SELECT max(k{order}) FROM unnest(($1).keys) k WHERE k{order} < $2 $f$',
+            f'CREATE FUNCTION {name}$exists({name}, {key}) RETURNS boolean {sql} AS $f$ '
+            'SELECT coalesce($2 = ANY(($1).keys), false) $f$',
+            f'CREATE FUNCTION {name}$delete({name}) RETURNS {name} {sql} AS $f$ '
+            f"SELECT ROW('{{}}', '{{}}')::{name} $f$",
+            f'CREATE FUNCTION {name}$delete({name}, {key}) RETURNS {name} {sql} AS $f$ '
+            f'SELECT ROW(coalesce(array_agg(u.k ORDER BY u.k{order}), '
+            f"'{{}}'), coalesce(array_agg(u.v ORDER BY u.k{order}), '{{}}'))::{name} "
+            f'FROM {pairs} WHERE u.k <> $2 $f$',
+        )
+    )
+
+
+# A collection method a body calls on an index-by table (#1607).
+_COLLECTION_METHOD = re.compile(
+    r'\s*\.\s*(COUNT|FIRST|LAST|NEXT|PRIOR|EXISTS|DELETE)\b', re.IGNORECASE
+)
+# What a statement starts after: where an assignment `v(k) := x` can stand.
+_STATEMENT_START = re.compile(
+    r'(?is)(?:^|[;]|\b(?:BEGIN|THEN|ELSE|LOOP|DECLARE|IS|AS)\b)\s*$'
+)
+
+
+def _rewrite_index_tables(body: str, tables: dict[str, str]) -> str:
+    """A routine's body with its index-by tables' PL/SQL in PostgreSQL's
+    terms (#1607): ``v(k) := x`` an assignment of ``T$set(v, k, x)``, a read
+    ``v(k)`` ``T$get(v, k)``, ``v.COUNT`` ``T$count(v)``, ``v.DELETE`` an
+    assignment of ``T$delete(v)``, and so on -- T the variable's type, as
+    ``tables`` maps each name (lower case) to it."""
+    if not tables:
+        return body
+    (masked, contents) = _mask_quoted(body)
+    names = '|'.join(re.escape(n) for n in sorted(tables, key=len, reverse=True))
+    # Not a field of something else, `x.v`; `1..v.COUNT` is a range, not one.
+    use = re.compile(rf'(?<![\w$#])(?<![\w$#")]\.)({names})(?![\w$#])', re.IGNORECASE)
+
+    def rewrite(text: str) -> str:
+        out: list[str] = []
+        pos = 0
+        while (found := use.search(text, pos)) is not None:
+            name = found.group(1)
+            typ = tables[name.lower()]
+            after = found.end()
+            method = _COLLECTION_METHOD.match(text, after)
+            if method is not None:
+                kind = method.group(1).lower()
+                at = method.end()
+                args = ''
+                stripped = len(text) - len(text[at:].lstrip())
+                if text.startswith('(', stripped):
+                    close = _matching_paren(text, stripped)
+                    args = ', ' + rewrite(text[stripped + 1 : close])
+                    at = close + 1
+                call = f'{typ}${kind}({name}{args})'
+                if kind == 'delete':
+                    call = f'{name} := {call}'
+                out.append(text[pos : found.start()] + call)
+                pos = at
+                continue
+            stripped = len(text) - len(text[after:].lstrip())
+            if not text.startswith('(', stripped):
+                out.append(text[pos:after])
+                pos = after
+                continue
+            close = _matching_paren(text, stripped)
+            key = rewrite(text[stripped + 1 : close])
+            assign = re.compile(r'\s*:=').match(text, close + 1)
+            if assign is not None and _STATEMENT_START.search(text, 0, found.start()):
+                end = _statement_end(text, assign.end())
+                end = len(text) if end is None else end
+                value = rewrite(text[assign.end() : end]).strip()
+                out.append(
+                    text[pos : found.start()]
+                    + f'{name} := {typ}$set({name}, {key}, {value})'
+                )
+                pos = end
+                continue
+            out.append(text[pos : found.start()] + f'{typ}$get({name}, {key})')
+            pos = close + 1
+        out.append(text[pos:])
+        return ''.join(out)
+
+    return _unmask_quoted(rewrite(masked), contents)
+
+
+def _routine_index_tables(
+    package: str, member: _PackageMember, types: dict[str, str]
+) -> dict[str, str]:
+    # The parameters and locals of a member whose type is one of the package's
+    # index-by tables (#1607): name (lower case) -> the PostgreSQL type.
+    declared = (member.params or '').split(',')
+    body = member.body or ''
+    begin = next((s for w, s, _e in _words(body) if w == 'BEGIN'), None)
+    if begin is not None:
+        declared += body[:begin].split(';')
+    tables = {}
+    for declaration in declared:
+        words = _PLSQL_WORD.findall(declaration)
+        if len(words) < 2:
+            continue
+        typ = words[-1].lower()
+        if typ in types:
+            tables[words[0].lower()] = types[typ]
+    return tables
+
+
 def _package_types(package: str, members: list[_PackageMember], public: bool) -> str:
     # The DDL of a spec's or a body's types, each dropped first -- a body's
     # replace the last body's -- and each recorded with what it was declared as.
@@ -5662,11 +5842,15 @@ def _package_routine(package: str, member: _PackageMember, body: str) -> str:
 
 
 def _drop_package_routines(package: str) -> str:
-    # Every routine in the package's schema, overloads and private ones too.
+    # Every routine in the package's schema, overloads and private ones too --
+    # but its types' own: an index-by table's methods, `t$get`, and a
+    # collection's constructors, named as the type is (#1607).
     return (
         'DO $p$ DECLARE r record; BEGIN FOR r IN SELECT p.oid::regprocedure AS '
         "sig, p.prokind FROM pg_proc p WHERE p.pronamespace = '"
-        f"{package}'::regnamespace LOOP EXECUTE format('DROP %s %s', CASE "
+        f"{package}'::regnamespace AND p.proname !~ '[$]' AND NOT EXISTS "
+        '(SELECT 1 FROM pg_type t WHERE t.typnamespace = p.pronamespace '
+        "AND t.typname = p.proname) LOOP EXECUTE format('DROP %s %s', CASE "
         "r.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, r.sig); "
         'END LOOP; END $p$'
     )
@@ -5692,7 +5876,9 @@ def _package_missing(package: str, code: int, message: str) -> str:
     )
 
 
-def _translate_package_ddl(sql: str) -> str:
+def _translate_package_ddl(
+    sql: str, spec_index_types: Callable[[str], dict[str, str]] | None = None
+) -> str:
     """A PL/SQL package's DDL as a schema of its name (#1605).
 
     The spec creates the schema -- replacing it drops the old one, body and all,
@@ -5704,6 +5890,10 @@ def _translate_package_ddl(sql: str) -> str:
     the stand-ins back. A schema of that name that is no package is refused,
     ORA-00955. A private member is a routine of the schema like the others, so
     callable from outside where Oracle's is not. Other SQL is unchanged.
+
+    ``spec_index_types`` gives, for a package, the index-by table types its
+    spec declared -- name -> PostgreSQL type -- which a body indexes but does
+    not declare itself (#1607).
     """
     dropped = _DROP_PACKAGE.match(sql)
     if dropped is not None:
@@ -5739,8 +5929,23 @@ def _translate_package_ddl(sql: str) -> str:
         f"'{package}, ' || current_setting('search_path'), true)"
     )
     if body:
+        # The package's index-by table types, the spec's and the body's own:
+        # name -> the PostgreSQL type (#1607).
+        index_types = {
+            m.name.lower(): f'{package}.{m.name.lower()}'
+            for m in members
+            if m.kind == 'TYPE' and _INDEX_BY_TYPE.fullmatch(m.body or '')
+        }
+        if spec_index_types is not None:
+            index_types.update(spec_index_types(package))
         routines = [
-            _package_routine(package, m, m.body)
+            _package_routine(
+                package,
+                m,
+                _rewrite_index_tables(
+                    m.body, _routine_index_tables(package, m, index_types)
+                ),
+            )
             for m in members
             if m.kind in routine_kinds and m.body is not None
         ]
@@ -7919,7 +8124,9 @@ class PostgresBackend:
         # literal idioms. This is where dialect knowledge belongs, not in the
         # generic compat shim.
         sql = _ruled('reserved-name', _quote_reserved_names(sql), sql)
-        sql = _ruled('package-ddl', _translate_package_ddl(sql), sql)
+        sql = _ruled(
+            'package-ddl', _translate_package_ddl(sql, self._package_index_types), sql
+        )
         sql = _ruled('admin', _translate_admin(sql), sql)
         sql = _ruled('ddl', _translate_ddl(sql), sql)
         sql = _ruled('routine-ddl', _translate_routine_ddl(sql), sql)
@@ -9263,6 +9470,20 @@ class PostgresBackend:
         if row is None:
             raise UnsupportedFeature(f'type shape: no type has the oid {pg_oid}')
         return row[0]
+
+    def _package_index_types(self, package: str) -> dict[str, str]:
+        # The index-by table types a package's spec declared (#1607): name
+        # (lower case) -> the PostgreSQL type, for its body's translation.
+        if not self._has_package_catalog:
+            return {}
+        return {
+            name.lower(): f'{package}.{name.lower()}'
+            for (name,) in self._conn.execute(
+                'SELECT name FROM sys.ora_plsql_types WHERE package = %s '
+                "AND meta->>'coll_type' = 'PL/SQL INDEX TABLE'",
+                (package,),
+            ).fetchall()
+        }
 
     def _plsql_type(self, pg_oid: int) -> tuple[str, str, str, dict] | None:
         """A package's type behind a PostgreSQL type (#1607): its owner,

@@ -2892,6 +2892,101 @@ def test_a_package_types_values_bind_and_come_back() -> None:
     assert result.get('error') is None, result.get('error')
 
 
+def test_a_body_indexes_its_index_by_tables() -> None:
+    # A routine's index-by tables, its parameters' and locals', in PostgreSQL's
+    # terms (#1607): an element set and read, the collection methods called,
+    # DELETE assigned; another's field `x.v` and a range bound `1..v.COUNT`
+    # read as what they are.
+    from postgres_backend import (
+        _PackageMember,
+        _rewrite_index_tables,
+        _routine_index_tables,
+    )
+
+    member = _PackageMember(
+        'PROCEDURE', 'p', 'a IN OUT NOCOPY t, n NUMBER', None,
+        ' l t; k PLS_INTEGER; BEGIN NULL; END',
+    )  # fmt: skip
+    tables = _routine_index_tables('pk', member, {'t': 'pk.t'})
+    assert tables == {'a': 'pk.t', 'l': 'pk.t'}
+    assert _rewrite_index_tables(
+        "BEGIN a(-1) := 'x'; FOR i IN 1..a.COUNT LOOP l(i) := a(i) || 'y'; END LOOP; "
+        'k := a.FIRST; WHILE k IS NOT NULL LOOP k := a.NEXT(k); END LOOP; '
+        'IF a.EXISTS(3) THEN a.DELETE(3); END IF; l.DELETE; r := x.a; END',
+        tables,
+    ) == (
+        "BEGIN a := pk.t$set(a, -1, 'x'); FOR i IN 1..pk.t$count(a) LOOP "
+        "l := pk.t$set(l, i, pk.t$get(a, i) || 'y'); END LOOP; "
+        'k := pk.t$first(a); WHILE k IS NOT NULL LOOP k := pk.t$next(a, k); END LOOP; '
+        'IF pk.t$exists(a, 3) THEN a := pk.t$delete(a, 3); END IF; '
+        'l := pk.t$delete(l); r := x.a; END'
+    )
+    # A string literal holding the name is no use of it.
+    assert _rewrite_index_tables("x := 'a(1)';", tables) == "x := 'a(1)';"
+
+
+def test_an_index_by_tables_methods_run_as_oracles() -> None:
+    # A package body walking index-by tables as python-oracledb's test schema
+    # does (#1607): sparse keys in key order, a table keyed by a string walked
+    # FIRST / NEXT in byte order, EXISTS, DELETE, COUNT, and ORA-01403 for a key
+    # that is not there. The answers are 23ai's.
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+    from seerdb.server import BackendError
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE pi1607 AS\n'
+            '  TYPE t IS TABLE OF NUMBER INDEX BY BINARY_INTEGER;\n'
+            '  TYPE p IS TABLE OF VARCHAR2(10) INDEX BY VARCHAR2(10);\n'
+            '  FUNCTION walk RETURN VARCHAR2;\n'
+            '  FUNCTION props RETURN VARCHAR2;\n'
+            '  FUNCTION missing RETURN NUMBER;\nEND;'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE BODY pi1607 AS\n'
+            '  FUNCTION walk RETURN VARCHAR2 IS\n'
+            '    a t;\n    k PLS_INTEGER;\n    s VARCHAR2(200);\n  BEGIN\n'
+            '    a(8388608) := 4; a(-1048576) := 1; a(284) := 3; a(-576) := 2;\n'
+            '    a(284) := a(284) * 10;\n'
+            '    k := a.FIRST;\n'
+            "    WHILE k IS NOT NULL LOOP s := s || k || '=' || a(k) || ' '; "
+            'k := a.NEXT(k); END LOOP;\n'
+            "    a.DELETE(-576);\n    s := s || a.COUNT || ' ' || a.LAST || ' ' || "
+            "CASE WHEN a.EXISTS(-576) THEN 'y' ELSE 'n' END;\n"
+            '    RETURN s;\n  END;\n'
+            '  FUNCTION props RETURN VARCHAR2 IS\n'
+            '    v p;\n    k VARCHAR2(10);\n    s VARCHAR2(200);\n  BEGIN\n'
+            "    v('b') := '2'; v('B') := '1'; v('a') := '3';\n"
+            '    k := v.FIRST;\n    WHILE k IS NOT NULL LOOP s := s || k || v(k); '
+            'k := v.NEXT(k); END LOOP;\n    RETURN s;\n  END;\n'
+            '  FUNCTION missing RETURN NUMBER IS a t; BEGIN a(1) := 1; RETURN a(2); END;\n'
+            'END;'
+        )
+        assert backend.execute(
+            "SELECT spec, body FROM sys.ora_packages WHERE name = 'pi1607'"
+        ).rows == [('VALID', 'VALID')]
+        (row,) = backend.execute('SELECT pi1607.walk() FROM dual').rows
+        assert row[0] == '-1048576=1 -576=2 284=30 8388608=4 3 8388608 n'
+        (row,) = backend.execute('SELECT pi1607.props() FROM dual').rows
+        assert row[0] == 'B1a3b2'
+        # Called from PL/SQL, as a client's callfunc does; from SQL, Oracle
+        # turns NO_DATA_FOUND into NULL instead.
+        with pytest.raises(BackendError) as exc:
+            backend.execute(
+                'BEGIN :1 := pi1607.missing(); END;',
+                [BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=22)],
+            )
+        assert exc.value.ora_code == 1403
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP PACKAGE pi1607')
+        except Exception:
+            backend.rollback()
+
+
 def test_get_type_shape_of_a_rowtype_with_a_date_column() -> None:
     # A table's DATE column is the ora_date domain (#1316). As a %ROWTYPE
     # attribute it had no Oracle type at all; its TDS leaf is the DATE code
@@ -3272,7 +3367,8 @@ def test_a_packages_members_are_read_from_its_spec_and_body() -> None:
 
 def test_a_package_type_is_a_postgresql_type_of_its_schema() -> None:
     # A record a composite; an index-by table a composite of its keys and its
-    # values, keyed by text when indexed by a string; a VARRAY or nested table a
+    # values, keyed by text when indexed by a string, with its methods (the
+    # index-by tables' own test runs them); a VARRAY or nested table a
     # domain over an array with its constructors; a REF CURSOR and a SUBTYPE
     # domains (#1607).
     from postgres_backend import _package_type, _PackageMember
@@ -3289,14 +3385,20 @@ def test_a_package_type_is_a_postgresql_type_of_its_schema() -> None:
         'CREATE TYPE pk.r AS (n numeric, s varchar(30), b BOOLEAN, i integer, '
         'd timestamp(0))'
     )
-    assert declare('TYPE', 't', 'TABLE OF VARCHAR2(100) INDEX BY BINARY_INTEGER') == (
-        'CREATE TYPE pk.t AS (keys integer[], vals varchar(100)[])'
+    indexed = declare('TYPE', 't', 'TABLE OF VARCHAR2(100) INDEX BY BINARY_INTEGER')
+    assert indexed is not None and indexed.startswith(
+        'CREATE TYPE pk.t AS (keys integer[], vals varchar(100)[]); '
+        'CREATE FUNCTION pk.t$get(pk.t, integer) RETURNS varchar(100) '
     )
-    assert declare('TYPE', 'p', 'TABLE OF VARCHAR2(64) INDEX BY VARCHAR2(64)') == (
-        'CREATE TYPE pk.p AS (keys text[], vals varchar(64)[])'
+    indexed = declare('TYPE', 'p', 'TABLE OF VARCHAR2(64) INDEX BY VARCHAR2(64)')
+    assert indexed is not None and indexed.startswith(
+        'CREATE TYPE pk.p AS (keys text[], vals varchar(64)[]); '
+        'CREATE FUNCTION pk.p$get(pk.p, text) RETURNS varchar(64) '
     )
-    assert declare('TYPE', 'a', 'TABLE OF r INDEX BY PLS_INTEGER') == (
-        'CREATE TYPE pk.a AS (keys integer[], vals r[])'
+    indexed = declare('TYPE', 'a', 'TABLE OF r INDEX BY PLS_INTEGER')
+    assert indexed is not None and indexed.startswith(
+        'CREATE TYPE pk.a AS (keys integer[], vals r[]); '
+        'CREATE FUNCTION pk.a$get(pk.a, integer) RETURNS r '
     )
     varray = declare('TYPE', 'v', 'VARRAY(3) OF NUMBER')
     assert varray is not None and varray.startswith(
