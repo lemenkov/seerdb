@@ -2070,8 +2070,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
         assert f'FUNCTION {name}(' in _HELPER_FUNCTIONS_DDL
     # 47, ora_div (#1361) and power (#1362) for each of the nine pairs of
     # integer types, sys.ora_to_raw's two overloads (#1496), sys.ora_raw_fits
-    # (#1415), sys.ora_float_round (#1422) and sys.ora_numeric_div (#1598).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 70
+    # (#1415), sys.ora_float_round (#1422), sys.ora_numeric_div (#1598) and
+    # sys.ora_package_unusable (#1605).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 71
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
@@ -2972,6 +2973,139 @@ def test_a_routine_with_locals_compiles_and_runs() -> None:
             backend.execute('DROP FUNCTION f1604')
         except Exception:
             backend.rollback()
+
+
+def test_a_packages_members_are_read_from_its_spec_and_body() -> None:
+    # The routines a spec declares or a body defines, overloads too; its types
+    # and variables passed over, and a ; or an END inside a string or a comment
+    # read as nothing (#1605). An initialization section is not read.
+    from postgres_backend import _package_members
+
+    spec = (
+        'CREATE PACKAGE pk AS\n  TYPE t IS TABLE OF NUMBER INDEX BY PLS_INTEGER;\n'
+        '  FUNCTION f(a NUMBER) RETURN NUMBER;\n  FUNCTION f(a VARCHAR2) RETURN VARCHAR2;'
+        '\n  PROCEDURE p;\nEND pk;'
+    )
+    members = _package_members(spec, spec.index(' AS') + 3)
+    assert [(m.kind, m.name, m.params, m.returns, m.body) for m in members] == [
+        ('FUNCTION', 'f', 'a NUMBER', 'NUMBER', None),
+        ('FUNCTION', 'f', 'a VARCHAR2', 'VARCHAR2', None),
+        ('PROCEDURE', 'p', None, None, None),
+    ]
+    body = (
+        'CREATE PACKAGE BODY pk IS\n  g NUMBER := 1; -- not END; a comment\n'
+        '  FUNCTION f(a NUMBER) RETURN NUMBER IS\n    t NUMBER;\n  BEGIN\n'
+        '    t := CASE WHEN a > 0 THEN 1 END;\n    RETURN t;\n  END f;\n'
+        '  PROCEDURE p IS BEGIN NULL; END;\nEND;'
+    )
+    members = _package_members(body, body.index(' IS') + 3)
+    assert [(m.name, m.body) for m in members] == [
+        (
+            'f',
+            '\n    t NUMBER;\n  BEGIN\n    t := CASE WHEN a > 0 THEN 1 END;\n'
+            '    RETURN t;\n  END',
+        ),
+        ('p', ' BEGIN NULL; END'),
+    ]
+    assert members[0].body is not None
+    initialized = (
+        'CREATE PACKAGE BODY pk AS PROCEDURE p IS BEGIN NULL; END; BEGIN NULL; END;'
+    )
+    assert _package_members(initialized, initialized.index(' AS') + 3) is None
+
+
+def test_package_ddl_is_a_schema_of_its_routines() -> None:
+    # A spec is a schema of stand-ins, a body its routines in their place, each
+    # resolving names as its creator's session did, the package first (#1605).
+    from postgres_backend import _translate_package_ddl
+
+    spec = _translate_package_ddl(
+        'CREATE OR REPLACE PACKAGE pyo.pk AS FUNCTION f(a NUMBER) RETURN NUMBER; END;'
+    )
+    assert 'DROP SCHEMA IF EXISTS pk CASCADE; CREATE SCHEMA pk; ' in spec
+    assert (
+        'CREATE OR REPLACE FUNCTION pk.f(a numeric) RETURNS numeric LANGUAGE '
+        "plpgsql AS $$ BEGIN PERFORM sys.ora_package_unusable('pk'); END $$"
+    ) in spec
+    assert "VALUES ('pk', 'PYO', $stubs$CREATE OR REPLACE FUNCTION pk.f(" in spec
+    body = _translate_package_ddl(
+        'CREATE OR REPLACE PACKAGE BODY pyo.pk AS\n'
+        '  FUNCTION f(a NUMBER) RETURN NUMBER IS BEGIN RETURN a; END f;\nEND pk;'
+    )
+    assert (
+        "SELECT set_config('search_path', 'pk, ' || "
+        "current_setting('search_path'), true); "
+        'CREATE OR REPLACE FUNCTION pk.f(a numeric) RETURNS numeric LANGUAGE '
+        'plpgsql SET search_path FROM CURRENT AS $$ BEGIN RETURN a; END $$; '
+        "UPDATE sys.ora_packages SET body = 'VALID' WHERE name = 'pk'"
+    ) in body
+    assert 'DROP FUNCTION IF EXISTS' not in body  # members may share a name
+    assert _translate_package_ddl('DROP PACKAGE pk').endswith(
+        "DROP SCHEMA pk CASCADE; DELETE FROM sys.ora_packages WHERE name = 'pk'"
+    )
+    assert _translate_package_ddl('SELECT 1 FROM dual') == 'SELECT 1 FROM dual'
+
+
+def test_a_package_is_created_called_and_dropped_as_oracle_does() -> None:
+    # Through the Mirror and a client: overloads and an OUT procedure called by
+    # package.member, and every refusal measured on 23ai (#1605) -- a spec with
+    # no body ORA-04067, a body that does not compile a warning and then
+    # ORA-04063, a dropped package PLS-00201, dropping it again ORA-04043.
+    listen, server, result = _start_mirror()
+    conn = _connect(listen.getsockname()[1])
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            'CREATE OR REPLACE PACKAGE pyo.pk1605 AS\n'
+            '  FUNCTION f(a NUMBER) RETURN NUMBER;\n'
+            '  FUNCTION f(a VARCHAR2) RETURN VARCHAR2;\n'
+            '  PROCEDURE p(a NUMBER, b OUT NUMBER);\nEND;'
+        )
+        with pytest.raises(seerdb.DatabaseError) as excinfo:
+            cur.callfunc('pk1605.f', int, [1])
+        assert 'ORA-04067: not executed, package body "PYO.PK1605" does not exist' in (
+            str(excinfo.value)
+        )
+        cur.execute(
+            'CREATE OR REPLACE PACKAGE BODY pyo.pk1605 AS\n'
+            '  FUNCTION helper(a NUMBER) RETURN NUMBER IS BEGIN RETURN a * 2; END;\n'
+            '  FUNCTION f(a NUMBER) RETURN NUMBER IS\n    t NUMBER;\n  BEGIN\n'
+            '    t := helper(a);\n    RETURN t + 1;\n  END f;\n'
+            '  PROCEDURE p(a NUMBER, b OUT NUMBER) IS BEGIN b := a + 100; END;\n'
+            "  FUNCTION f(a VARCHAR2) RETURN VARCHAR2 IS BEGIN RETURN a || '!'; END;\n"
+            'END pk1605;'
+        )
+        assert cur.callfunc('pk1605.f', int, [1]) == 3
+        assert cur.callfunc('pk1605.f', str, ['x']) == 'x!'
+        out = cur.var(int)
+        cur.callproc('pk1605.p', [5, out])
+        assert out.getvalue() == 105
+        cur.execute(
+            'CREATE OR REPLACE PACKAGE BODY pyo.pk1605 AS\n'
+            '  FUNCTION f(a NUMBER) RETURN NUMBER IS BEGIN RETURN a; END;\n'
+            '  PROCEDURE p(a NUMBER, b OUT no_such_type) IS BEGIN NULL; END;\n'
+            '  FUNCTION f(a VARCHAR2) RETURN VARCHAR2 IS BEGIN RETURN a; END;\nEND;'
+        )
+        assert cur.warning is not None
+        with pytest.raises(seerdb.DatabaseError) as excinfo:
+            cur.callfunc('pk1605.f', int, [1])
+        assert 'ORA-04063: package body "PYO.PK1605" has errors' in str(excinfo.value)
+        cur.execute('DROP PACKAGE pk1605')
+        with pytest.raises(seerdb.DatabaseError) as excinfo:
+            cur.callfunc('pk1605.f', int, [1])
+        assert "PLS-00201: identifier 'PK1605.F' must be declared" in str(excinfo.value)
+        with pytest.raises(seerdb.DatabaseError) as excinfo:
+            cur.execute('DROP PACKAGE pk1605')
+        assert 'ORA-04043' in str(excinfo.value)
+    finally:
+        try:
+            conn.cursor().execute('DROP PACKAGE pk1605')
+        except Exception:
+            pass
+        conn.close()
+        server.join(timeout=5)
+        listen.close()
+    assert result.get('error') is None, result.get('error')
 
 
 # --- changepassword (#515) — credential-map only, no live PG needed -------------
