@@ -3615,6 +3615,28 @@ _IDIOM_REWRITES: list[
         re.compile(r'(?is)^(\s*DELETE(?:\s+/\*.*?\*/)?)\s+(?!FROM\b)(?=[\w"])'),
         r'\1 FROM ',
     ),
+    # A cursor's attributes in PL/SQL (#1608): c%FOUND / c%NOTFOUND are PL/pgSQL's
+    # FOUND, which a FETCH sets -- and a DML statement or SELECT INTO, so
+    # SQL%FOUND is the same. FOUND is the last statement's where Oracle keeps
+    # one per cursor; they agree on a test right after the FETCH, the usual
+    # place for one. c%ISOPEN is whether c's portal is open; SQL%ISOPEN is FALSE,
+    # as in Oracle. %ROWCOUNT is not translated.
+    (
+        'cursor-attribute',
+        re.compile(
+            r'(?<![\w$#"])([A-Za-z_][\w$#]*|"[^"]*")\s*%\s*(FOUND|NOTFOUND|ISOPEN)\b',
+            re.IGNORECASE,
+        ),
+        lambda m: (
+            'FOUND'
+            if m.group(2).upper() == 'FOUND'
+            else '(NOT FOUND)'
+            if m.group(2).upper() == 'NOTFOUND'
+            else 'FALSE'
+            if m.group(1).upper() == 'SQL'
+            else f'(SELECT count(*) > 0 FROM pg_cursors WHERE name = {m.group(1)}::text)'
+        ),
+    ),
     # x IS [NOT] JSON (#1614) as sys.ora_is_json(x): PostgreSQL 16's own takes
     # text and bytea but not a CLOB's or BLOB's domain over them, and has no
     # Oracle's FORMAT JSON or STRICT / LAX. The test is PostgreSQL's, Oracle's
