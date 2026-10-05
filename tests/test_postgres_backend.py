@@ -2978,7 +2978,8 @@ def test_a_routine_with_locals_compiles_and_runs() -> None:
 def test_a_packages_members_are_read_from_its_spec_and_body() -> None:
     # The routines a spec declares or a body defines, overloads too; its types
     # and variables passed over, and a ; or an END inside a string or a comment
-    # read as nothing (#1605). An initialization section is not read.
+    # read as nothing (#1605); a type's declaration too (#1607). An
+    # initialization section is not read.
     from postgres_backend import _package_members
 
     spec = (
@@ -2988,6 +2989,7 @@ def test_a_packages_members_are_read_from_its_spec_and_body() -> None:
     )
     members = _package_members(spec, spec.index(' AS') + 3)
     assert [(m.kind, m.name, m.params, m.returns, m.body) for m in members] == [
+        ('TYPE', 't', None, None, 'TABLE OF NUMBER INDEX BY PLS_INTEGER'),
         ('FUNCTION', 'f', 'a NUMBER', 'NUMBER', None),
         ('FUNCTION', 'f', 'a VARCHAR2', 'VARCHAR2', None),
         ('PROCEDURE', 'p', None, None, None),
@@ -2999,7 +3001,7 @@ def test_a_packages_members_are_read_from_its_spec_and_body() -> None:
         '  PROCEDURE p IS BEGIN NULL; END;\nEND;'
     )
     members = _package_members(body, body.index(' IS') + 3)
-    assert [(m.name, m.body) for m in members] == [
+    assert [(m.name, m.body) for m in members if m.kind != 'TYPE'] == [
         (
             'f',
             '\n    t NUMBER;\n  BEGIN\n    t := CASE WHEN a > 0 THEN 1 END;\n'
@@ -3012,6 +3014,89 @@ def test_a_packages_members_are_read_from_its_spec_and_body() -> None:
         'CREATE PACKAGE BODY pk AS PROCEDURE p IS BEGIN NULL; END; BEGIN NULL; END;'
     )
     assert _package_members(initialized, initialized.index(' AS') + 3) is None
+
+
+def test_a_package_type_is_a_postgresql_type_of_its_schema() -> None:
+    # A record a composite; an index-by table a composite of its keys and its
+    # values, keyed by text when indexed by a string; a VARRAY or nested table a
+    # domain over an array with its constructors; a REF CURSOR and a SUBTYPE
+    # domains (#1607).
+    from postgres_backend import _package_type, _PackageMember
+
+    def declare(kind: str, name: str, definition: str) -> str | None:
+        return _package_type('pk', _PackageMember(kind, name, None, None, definition))
+
+    assert declare(
+        'TYPE',
+        'r',
+        'RECORD (n NUMBER NOT NULL := 0, s VARCHAR2(30), b BOOLEAN, '
+        'i PLS_INTEGER, d DATE)',
+    ) == (
+        'CREATE TYPE pk.r AS (n numeric, s varchar(30), b BOOLEAN, i integer, '
+        'd timestamp(0))'
+    )
+    assert declare('TYPE', 't', 'TABLE OF VARCHAR2(100) INDEX BY BINARY_INTEGER') == (
+        'CREATE TYPE pk.t AS (keys integer[], vals varchar(100)[])'
+    )
+    assert declare('TYPE', 'p', 'TABLE OF VARCHAR2(64) INDEX BY VARCHAR2(64)') == (
+        'CREATE TYPE pk.p AS (keys text[], vals varchar(64)[])'
+    )
+    assert declare('TYPE', 'a', 'TABLE OF r INDEX BY PLS_INTEGER') == (
+        'CREATE TYPE pk.a AS (keys integer[], vals r[])'
+    )
+    varray = declare('TYPE', 'v', 'VARRAY(3) OF NUMBER')
+    assert varray is not None and varray.startswith(
+        'CREATE DOMAIN pk.v AS numeric[] CHECK '
+        '(VALUE IS NULL OR array_length(VALUE, 1) <= 3); '
+        'CREATE OR REPLACE FUNCTION pk.v(VARIADIC numeric[])'
+    )
+    nested = declare('TYPE', 'n', 'TABLE OF NUMBER')
+    assert nested is not None and nested.startswith('CREATE DOMAIN pk.n AS numeric[]; ')
+    assert declare('TYPE', 'c', 'REF CURSOR') == 'CREATE DOMAIN pk.c AS refcursor'
+    assert declare('SUBTYPE', 'w', 'TestTempTable%ROWTYPE') == (
+        'CREATE DOMAIN pk.w AS TestTempTable'
+    )
+    assert declare('TYPE', 'x', 'OBJECT (a NUMBER)') is None
+
+
+def test_a_package_declares_types_its_routines_use() -> None:
+    # A spec whose routines use its types compiles, and a body builds and reads
+    # a record; each type is recorded as it was declared -- an NVARCHAR2
+    # element stays one (#1607).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE pt1607 AS\n'
+            '  TYPE r IS RECORD (n NUMBER, s VARCHAR2(30), b BOOLEAN);\n'
+            '  TYPE t IS TABLE OF NVARCHAR2(10) INDEX BY BINARY_INTEGER;\n'
+            '  FUNCTION f(a NUMBER) RETURN NUMBER;\n'
+            '  FUNCTION g(a t) RETURN NUMBER;\nEND;'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE BODY pt1607 AS\n'
+            '  FUNCTION f(a NUMBER) RETURN NUMBER IS\n    v r;\n  BEGIN\n'
+            "    v.n := a * 2;\n    v.s := 'x';\n    v.b := TRUE;\n"
+            '    RETURN v.n;\n  END;\n'
+            '  FUNCTION g(a t) RETURN NUMBER IS BEGIN RETURN 0; END;\nEND;'
+        )
+        assert backend.execute(
+            "SELECT spec, body FROM sys.ora_packages WHERE name = 'pt1607'"
+        ).rows == [('VALID', 'VALID')]
+        (row,) = backend.execute('SELECT pt1607.f(21) FROM dual').rows
+        assert row[0] == 42
+        assert backend.execute(
+            'SELECT name, declaration FROM sys.ora_plsql_types '
+            "WHERE package = 'pt1607' ORDER BY ord"
+        ).rows == [
+            ('R', 'TYPE RECORD (n NUMBER, s VARCHAR2(30), b BOOLEAN)'),
+            ('T', 'TYPE TABLE OF NVARCHAR2(10) INDEX BY BINARY_INTEGER'),
+        ]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP PACKAGE pt1607')
+        except Exception:
+            backend.rollback()
 
 
 def test_package_ddl_is_a_schema_of_its_routines() -> None:
@@ -3027,7 +3112,12 @@ def test_package_ddl_is_a_schema_of_its_routines() -> None:
         'CREATE OR REPLACE FUNCTION pk.f(a numeric) RETURNS numeric LANGUAGE '
         "plpgsql AS $$ BEGIN PERFORM sys.ora_package_unusable('pk'); END $$"
     ) in spec
-    assert "VALUES ('pk', 'PYO', $stubs$CREATE OR REPLACE FUNCTION pk.f(" in spec
+    # The stand-ins are kept with the package's search path, as they name its
+    # types (#1607).
+    assert (
+        "VALUES ('pk', 'PYO', $stubs$SELECT set_config('search_path', 'pk, ' || "
+        "current_setting('search_path'), true); CREATE OR REPLACE FUNCTION pk.f("
+    ) in spec
     body = _translate_package_ddl(
         'CREATE OR REPLACE PACKAGE BODY pyo.pk AS\n'
         '  FUNCTION f(a NUMBER) RETURN NUMBER IS BEGIN RETURN a; END f;\nEND pk;'
@@ -3035,13 +3125,15 @@ def test_package_ddl_is_a_schema_of_its_routines() -> None:
     assert (
         "SELECT set_config('search_path', 'pk, ' || "
         "current_setting('search_path'), true); "
+        "DELETE FROM sys.ora_plsql_types WHERE package = 'pk' AND NOT public; "
         'CREATE OR REPLACE FUNCTION pk.f(a numeric) RETURNS numeric LANGUAGE '
         'plpgsql SET search_path FROM CURRENT AS $$ BEGIN RETURN a; END $$; '
         "UPDATE sys.ora_packages SET body = 'VALID' WHERE name = 'pk'"
     ) in body
     assert 'DROP FUNCTION IF EXISTS' not in body  # members may share a name
     assert _translate_package_ddl('DROP PACKAGE pk').endswith(
-        "DROP SCHEMA pk CASCADE; DELETE FROM sys.ora_packages WHERE name = 'pk'"
+        "DROP SCHEMA pk CASCADE; DELETE FROM sys.ora_packages WHERE name = 'pk'; "
+        "DELETE FROM sys.ora_plsql_types WHERE package = 'pk'"
     )
     assert _translate_package_ddl('SELECT 1 FROM dual') == 'SELECT 1 FROM dual'
 

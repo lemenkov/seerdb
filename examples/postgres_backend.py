@@ -88,11 +88,16 @@ edge of this adapter:
   routines as ``CREATE FUNCTION`` / ``PROCEDURE`` translates them, overloads
   included, each resolving names as its creator's session did, the package first.
   ``DROP PACKAGE [BODY]`` and a call into a package that is not there answer as
-  Oracle does. Not yet: package-level types, variables and an initialization
-  section (a spec whose routines use a package type is created INVALID); a
-  private member is callable from outside, where Oracle's is not; and PL/pgSQL
-  checks an identifier when the routine runs, not when it is created, so a body
-  Oracle would refuse can compile and fail on its first call instead.
+  Oracle does. A package's types are PostgreSQL types of its schema: a RECORD a
+  composite, an index-by table a composite of its keys and its values (``keys``
+  and ``vals`` arrays, so sparse keys and string keys keep their order), a
+  nested table or VARRAY a domain over an array, a SUBTYPE or a REF CURSOR a
+  domain. Not yet: a client's type lookup and binds of a package type, a body's
+  indexing of an index-by table, package variables and an initialization
+  section; a private member is callable from outside, where Oracle's is not;
+  and PL/pgSQL checks an identifier when the routine runs, not when it is
+  created, so a body Oracle would refuse can compile and fail on its first call
+  instead.
 - **Object types, partly** — ``CREATE TYPE ... AS OBJECT`` is a PostgreSQL
   composite, listed in ``all_types`` / ``all_type_attrs`` under an OID that is the
   composite's own ``pg_type`` oid, zero-padded to Oracle's 16 bytes. An object
@@ -1135,6 +1140,13 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE TABLE IF NOT EXISTS sys.ora_packages ('
     'name text PRIMARY KEY, owner text NOT NULL, stubs text NOT NULL, '
     "spec text NOT NULL DEFAULT 'VALID', body text);"
+    # The types a package declares (#1607), each a PostgreSQL type of its
+    # schema, with the PL/SQL it was declared as -- what the dictionary and a
+    # client's type metadata report -- in declaration order. A body's own types
+    # are private: the dictionary does not list them.
+    'CREATE TABLE IF NOT EXISTS sys.ora_plsql_types ('
+    'package text NOT NULL, name text NOT NULL, declaration text NOT NULL, '
+    'public boolean NOT NULL, ord integer NOT NULL, PRIMARY KEY (package, name));'
     # A column's name as the dictionary lists it: a quoted all-lower-case one as
     # written, any other as ora_name folds it (#1599).
     'CREATE OR REPLACE FUNCTION sys.ora_column_name(oid, text) RETURNS text '
@@ -5125,6 +5137,8 @@ _PARAM_IN_OUT = re.compile(r'\bIN\s+OUT\b', re.IGNORECASE)
 # PL/SQL's own integer types, which a routine's parameters and locals and a
 # block's locals use and no table column can (#1604).
 _PLSQL_INTEGER_TYPE = re.compile(r'\b(?:PLS|BINARY)_INTEGER\b', re.IGNORECASE)
+# A table's row type, `tab%ROWTYPE`: PostgreSQL's composite of the table (#1607).
+_ROWTYPE = re.compile(r'\b([A-Za-z_][\w$#.]*)%ROWTYPE\b', re.IGNORECASE)
 # A parameter's NOCOPY, a hint to Oracle to pass by reference (#1604).
 _NOCOPY = re.compile(r'\bNOCOPY\s+', re.IGNORECASE)
 # What may follow a routine body's closing END: its name, which PL/pgSQL would
@@ -5135,7 +5149,7 @@ _END_LABEL = re.compile(r'\s*(?:[A-Za-z_][\w$#]*)?\s*')
 def _translate_routine_types(text: str) -> str:
     for pattern, replacement in _DDL_TYPE_REWRITES:
         text = pattern.sub(replacement, text)
-    return _PLSQL_INTEGER_TYPE.sub('integer', text)
+    return _ROWTYPE.sub(r'\1', _PLSQL_INTEGER_TYPE.sub('integer', text))
 
 
 def _routine_body(body: str) -> str:
@@ -5216,11 +5230,17 @@ _PACKAGE_END = re.compile(r'\s*(?:[A-Za-z_][\w$#]*)?\s*;?\s*$')
 
 
 class _PackageMember(NamedTuple):
-    kind: str  # FUNCTION / PROCEDURE
+    kind: str  # FUNCTION / PROCEDURE, or TYPE / SUBTYPE
     name: str
     params: str | None
     returns: str | None
-    body: str | None  # None for a declaration
+    body: str | None  # a routine's body, None for its declaration; a type's definition
+
+
+# A package's TYPE or SUBTYPE declaration: its name, and what follows IS (#1607).
+_TYPE_DECLARATION = re.compile(
+    r'(?is)\s*(TYPE|SUBTYPE)\s+([A-Za-z_][\w$#]*)\s+IS\s+(.*?)\s*'
+)
 
 
 def _blank_plsql(text: str) -> str:
@@ -5253,10 +5273,11 @@ def _statement_end(blanked: str, pos: int) -> int | None:
 
 def _package_members(text: str, pos: int) -> list[_PackageMember] | None:
     """The routines a package spec declares or a body defines, from `pos` (past
-    AS|IS) to the package's END (#1605). The rest of a package -- its types,
-    variables, cursors, pragmas -- is passed over: a member that uses one fails
-    to compile, and the package with it. None for what this cannot read: an
-    initialization section, a member with local routines of its own."""
+    AS|IS) to the package's END (#1605), and the types it declares (#1607). The
+    rest of a package -- its variables, cursors, pragmas -- is passed over: a
+    member that uses one fails to compile, and the package with it. None for what
+    this cannot read: an initialization section, a member with local routines of
+    its own."""
     blanked = _blank_plsql(text)
     members: list[_PackageMember] = []
     while True:
@@ -5273,6 +5294,18 @@ def _package_members(text: str, pos: int) -> list[_PackageMember] | None:
             end = _statement_end(blanked, pos)
             if end is None:
                 return None
+            declared = _TYPE_DECLARATION.fullmatch(blanked, pos, end)
+            if declared is not None:
+                definition = text[declared.start(3) : declared.end(3)]
+                members.append(
+                    _PackageMember(
+                        declared.group(1).upper(),
+                        declared.group(2),
+                        None,
+                        None,
+                        definition,
+                    )
+                )
             pos = end + 1
             continue
         name = _PLSQL_WORD.match(
@@ -5317,6 +5350,104 @@ def _package_members(text: str, pos: int) -> list[_PackageMember] | None:
             )
         )
         pos = after.end()
+
+
+_RECORD_TYPE = re.compile(r'(?is)RECORD\s*\((.*)\)')
+_INDEX_BY_TYPE = re.compile(r'(?is)TABLE\s+OF\s+(.+?)\s+INDEX\s+BY\s+(.+)')
+_NESTED_TABLE_TYPE = re.compile(r'(?is)TABLE\s+OF\s+(.+?)(?:\s+NOT\s+NULL)?')
+_VARRAY_TYPE = re.compile(
+    r'(?is)(?:VARRAY|VARYING\s+ARRAY)\s*\(\s*(\d+)\s*\)\s+OF\s+(.+?)'
+    r'(?:\s+NOT\s+NULL)?'
+)
+_REF_CURSOR_TYPE = re.compile(r'(?is)REF\s+CURSOR\b.*')
+# An index-by table keyed by a string, not an integer.
+_STRING_KEY = re.compile(r'(?is)(?:N?VARCHAR2?|STRING|LONG)\b')
+# What may follow a declared type: a constraint, a default, a range.
+_DECLARED_EXTRAS = re.compile(r'(?is)\s+(?:NOT\s+NULL|RANGE|:=|DEFAULT)\b.*$')
+
+
+def _package_type(package: str, member: _PackageMember) -> str | None:
+    """A package's TYPE or SUBTYPE as a PostgreSQL type of its schema (#1607):
+
+    - a RECORD a composite of its fields;
+    - an index-by table a composite of two arrays, ``keys`` and ``vals``, the
+      keys integers or, for a table indexed by a string, text -- sparse keys,
+      ordered, the element's own type kept;
+    - a nested table or VARRAY a domain over an array, as a schema's is, with
+      its constructors;
+    - a REF CURSOR a domain over refcursor, a SUBTYPE a domain over its type.
+
+    Their parts name types as a routine's parameters do, ``tab%ROWTYPE`` the
+    table's composite; another of the package's types resolves in its schema.
+    None for a definition this does not read."""
+    name = f'{package}.{member.name}'
+    definition = member.body or ''
+    if member.kind == 'SUBTYPE':
+        base = _DECLARED_EXTRAS.sub('', definition)
+        return f'CREATE DOMAIN {name} AS {_translate_routine_types(base)}'
+    record = _RECORD_TYPE.fullmatch(definition)
+    if record is not None:
+        fields = []
+        for start, end in _top_level_items(record.group(1), 0, len(record.group(1))):
+            field = _DECLARED_EXTRAS.sub('', record.group(1)[start:end].strip())
+            field_name, _space, field_type = field.partition(' ')
+            if not field_type.strip():
+                return None
+            fields.append(
+                f'{field_name} {_translate_routine_types(field_type.strip())}'
+            )
+        return f'CREATE TYPE {name} AS ({", ".join(fields)})'
+    indexed = _INDEX_BY_TYPE.fullmatch(definition)
+    if indexed is not None:
+        element = _translate_routine_types(_DECLARED_EXTRAS.sub('', indexed.group(1)))
+        key = 'text' if _STRING_KEY.match(indexed.group(2).strip()) else 'integer'
+        return f'CREATE TYPE {name} AS (keys {key}[], vals {element}[])'
+    varray = _VARRAY_TYPE.fullmatch(definition)
+    if varray is not None:
+        element = _translate_routine_types(varray.group(2))
+        return (
+            f'CREATE DOMAIN {name} AS {element}[] CHECK '
+            f'(VALUE IS NULL OR array_length(VALUE, 1) <= {varray.group(1)})'
+            + _collection_constructors(name, element)
+        )
+    nested = _NESTED_TABLE_TYPE.fullmatch(definition)
+    if nested is not None:
+        element = _translate_routine_types(nested.group(1))
+        return f'CREATE DOMAIN {name} AS {element}[]' + _collection_constructors(
+            name, element
+        )
+    if _REF_CURSOR_TYPE.fullmatch(definition):
+        return f'CREATE DOMAIN {name} AS refcursor'
+    return None
+
+
+def _package_types(package: str, members: list[_PackageMember], public: bool) -> str:
+    # The DDL of a spec's or a body's types, each dropped first -- a body's
+    # replace the last body's -- and each recorded with what it was declared as.
+    # That is recorded hex-encoded: the rewrites that follow would make its
+    # VARCHAR2 a varchar and its NVARCHAR2 one too, which the metadata tells apart.
+    created: list[str] = []
+    recorded: list[str] = []
+    for ord_, member in enumerate(m for m in members if m.kind in ('TYPE', 'SUBTYPE')):
+        ddl = _package_type(package, member)
+        if ddl is None:
+            continue
+        created.append(f'DROP TYPE IF EXISTS {package}.{member.name} CASCADE; {ddl}')
+        declaration = f'{member.kind} {member.body}'.encode().hex()
+        recorded.append(
+            f"('{package}', '{member.name.upper()}', "
+            f"convert_from(decode('{declaration}', 'hex'), 'UTF8'), "
+            f'{"true" if public else "false"}, {ord_})'
+        )
+    forget = f"DELETE FROM sys.ora_plsql_types WHERE package = '{package}'" + (
+        '' if public else ' AND NOT public'
+    )
+    if not recorded:
+        return forget
+    return (
+        '; '.join(created) + f'; {forget}; INSERT INTO sys.ora_plsql_types '
+        '(package, name, declaration, public, ord) VALUES ' + ', '.join(recorded)
+    )
 
 
 def _package_routine(package: str, member: _PackageMember, body: str) -> str:
@@ -5386,7 +5517,8 @@ def _translate_package_ddl(sql: str) -> str:
             return f'{missing}; {_restore_package_stubs(package, "NULL")}'
         return (
             f'{missing}; DROP SCHEMA {package} CASCADE; '
-            f"DELETE FROM sys.ora_packages WHERE name = '{package}'"
+            f"DELETE FROM sys.ora_packages WHERE name = '{package}'; "
+            f"DELETE FROM sys.ora_plsql_types WHERE package = '{package}'"
         )
     head = _PACKAGE_HEAD.match(sql)
     if head is None:
@@ -5400,17 +5532,19 @@ def _translate_package_ddl(sql: str) -> str:
             'an initialization section, or a member with routines of its own',
             ora_code=ORA_PLSQL_COMPILATION_ERROR,
         )
+    routine_kinds = ('FUNCTION', 'PROCEDURE')
+    # Each name the package's DDL gives resolves in the package first: set for
+    # the statement and taken with each routine, then gone with the transaction.
+    path = (
+        "SELECT set_config('search_path', "
+        f"'{package}, ' || current_setting('search_path'), true)"
+    )
     if body:
         routines = [
-            _package_routine(package, m, m.body) for m in members if m.body is not None
+            _package_routine(package, m, m.body)
+            for m in members
+            if m.kind in routine_kinds and m.body is not None
         ]
-        # Each member resolves names as the creating session did, the package
-        # first: set for the CREATEs and taken with them, then gone with the
-        # transaction.
-        path = (
-            "SELECT set_config('search_path', "
-            f"'{package}, ' || current_setting('search_path'), true)"
-        )
         created = '; '.join(
             r.replace(
                 ' LANGUAGE plpgsql AS $$',
@@ -5422,6 +5556,7 @@ def _translate_package_ddl(sql: str) -> str:
         missing = _package_missing(package, 6550, f'package {name.upper()} has no spec')
         return (
             f'{missing}; {_drop_package_routines(package)}; {path}; '
+            f'{_package_types(package, members, public=False)}; '
             + (f'{created}; ' if created else '')
             + f"UPDATE sys.ora_packages SET body = 'VALID' WHERE name = '{package}'"
         )
@@ -5430,8 +5565,12 @@ def _translate_package_ddl(sql: str) -> str:
             package, m, f"BEGIN PERFORM sys.ora_package_unusable('{package}'); END;"
         )
         for m in members
-        if m.body is None
+        if m.kind in routine_kinds and m.body is None
     )
+    # The stand-ins are put back later, by a statement of their own: they carry
+    # the package's search path with them.
+    if stubs:
+        stubs = f'{path}; {stubs}'
     owner_name = (owner or '').upper()
     owner_sql = f"'{owner_name}'" if owner_name else 'sys.ora_owner(current_schema())'
     taken = (
@@ -5443,11 +5582,14 @@ def _translate_package_ddl(sql: str) -> str:
     )
     return (
         f'{taken}; DROP SCHEMA IF EXISTS {package} CASCADE; CREATE SCHEMA {package}; '
-        + (f'{stubs}; ' if stubs else '')
-        + 'INSERT INTO sys.ora_packages (name, owner, stubs, spec, body) VALUES '
+        # Recorded before the package's search path is set: its owner is the
+        # schema the session is in.
+        'INSERT INTO sys.ora_packages (name, owner, stubs, spec, body) VALUES '
         f"('{package}', {owner_sql}, $stubs${stubs}$stubs$, 'VALID', NULL) "
         'ON CONFLICT (name) DO UPDATE SET owner = EXCLUDED.owner, '
-        "stubs = EXCLUDED.stubs, spec = 'VALID', body = NULL"
+        "stubs = EXCLUDED.stubs, spec = 'VALID', body = NULL; "
+        f'{path}; {_package_types(package, members, public=True)}'
+        + (f'; {stubs}' if stubs else '')
     )
 
 
