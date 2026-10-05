@@ -2638,6 +2638,199 @@ def test_get_type_shape_is_answered_from_the_catalog() -> None:
         admin.close()
 
 
+def test_a_package_types_declaration_is_read_for_its_metadata() -> None:
+    # A record's fields and a collection's element as 23ai's dictionary lists
+    # them (#1607): a built-in's name, length and character set -- an NVARCHAR2
+    # counted in characters -- a PL/SQL integer by its PL/SQL name, another of
+    # the package's types by package, a SUBTYPE by what it stands for.
+    from postgres_backend import _PackageMember, _plsql_type_meta
+
+    siblings: dict[str, dict] = {}
+
+    def read(kind: str, name: str, definition: str) -> dict | None:
+        meta = _plsql_type_meta(
+            'pk', _PackageMember(kind, name, None, None, definition), siblings
+        )
+        siblings[name.upper()] = meta or {}
+        return meta
+
+    record = read(
+        'TYPE',
+        'r',
+        'RECORD (n NUMBER, s VARCHAR2(30), d DATE, t TIMESTAMP, '
+        'b BOOLEAN, i PLS_INTEGER)',
+    )
+    assert record is not None
+    assert (record['typecode'], record['attributes'], record['contains_plsql']) == (
+        'PL/SQL RECORD',
+        6,
+        'YES',
+    )
+    assert [(f['name'], f['type']) for f in record['attrs']][:2] == [
+        ('N', {'named': False, 'package': None, 'name': 'NUMBER', 'precision': None}),
+        (
+            'S',
+            {
+                'named': False, 'package': None, 'name': 'VARCHAR2', 'length': 30,
+                'charset': 'CHAR_CS', 'char_used': 'B',
+            },
+        ),
+    ]  # fmt: skip
+    assert record['attrs'][5]['type']['name'] == 'PL/SQL PLS INTEGER'
+    unicode = read('TYPE', 'u', 'TABLE OF NVARCHAR2(100) INDEX BY BINARY_INTEGER')
+    assert unicode is not None
+    assert (unicode['coll_type'], unicode['index_by'], unicode['contains_plsql']) == (
+        'PL/SQL INDEX TABLE',
+        'BINARY_INTEGER',
+        'NO',
+    )
+    assert unicode['elem'] == {
+        'named': False, 'package': None, 'name': 'NVARCHAR2', 'length': 100,
+        'charset': 'NCHAR_CS', 'char_used': 'C',
+    }  # fmt: skip
+    records = read('TYPE', 'a', 'TABLE OF r INDEX BY BINARY_INTEGER')
+    assert records is not None
+    assert records['elem'] == {'named': True, 'package': 'PK', 'name': 'R'}
+    read('SUBTYPE', 'w', 'TestTempTable%ROWTYPE')
+    rows = read('TYPE', 'c', 'TABLE OF w INDEX BY BINARY_INTEGER')
+    assert rows is not None
+    assert rows['elem'] == {
+        'named': True,
+        'package': None,
+        'name': 'TESTTEMPTABLE%ROWTYPE',
+    }
+    assert rows['contains_plsql'] == 'YES'
+
+
+def test_a_package_types_metadata_is_oracles() -> None:
+    # A client's type lookup of a package's types answered as 23ai answers it
+    # (#1607): the TDS byte for byte -- an index-by table kind 1, an index-by
+    # table of a record with a timestamp version 2 -- the attribute cursor, the
+    # type's own package, and the ALL_PLSQL_* views' rows. The bytes and rows
+    # are 23ai's, for the same declarations in python-oracledb's test schema.
+    from seerdb.common.tns_consts import (
+        TNS_TYPE_NUMBER,
+        TNS_TYPE_RAW,
+        TNS_TYPE_REFCURSOR,
+        TNS_TYPE_VARCHAR,
+    )
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE pyo.pm1607 AS\n'
+            '  TYPE udt_Record IS RECORD (NumberValue NUMBER, StringValue VARCHAR2(30), '
+            'DateValue DATE, TimestampValue TIMESTAMP, BooleanValue BOOLEAN, '
+            'PlsIntegerValue PLS_INTEGER, BinaryIntegerValue BINARY_INTEGER);\n'
+            '  TYPE udt_RecordArray IS TABLE OF udt_Record INDEX BY BINARY_INTEGER;\n'
+            '  TYPE udt_UnicodeList IS TABLE OF NVARCHAR2(100) INDEX BY BINARY_INTEGER;\n'
+            '  TYPE udt_BooleanList IS TABLE OF BOOLEAN INDEX BY BINARY_INTEGER;\n'
+            '  TYPE udt_Inner IS RECORD (Attr1 NUMBER, Attr2 NUMBER);\n'
+            '  TYPE udt_Outer IS RECORD (Inner1 udt_Inner, Inner2 udt_Inner);\nEND;'
+        )
+
+        def shape(full_name: str) -> list:
+            binds = [
+                BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=4),
+                BindVar(value=full_name, tns_type=TNS_TYPE_VARCHAR, max_size=128),
+                BindVar(value=None, tns_type=TNS_TYPE_RAW, max_size=16),
+                BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=4),
+                BindVar(value=None, tns_type=TNS_TYPE_RAW, max_size=32767),
+                BindVar(value=None, tns_type=TNS_TYPE_REFCURSOR, max_size=1),
+                BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=128),
+            ]
+            return backend.execute(_TYPE_SHAPE_SQL, binds).out_binds
+
+        captured = {
+            'UDT_RECORD': '0000002c260200010007002900000000001506008107001e010000021506'
+            '0808082a0007000a00100011001300140015',
+            'UDT_RECORDARRAY': '00000081260200010001ff290000000000761c0000001d000000'
+            '00012a1b00000023fafd0000005b0000002c260200010007002900000000001506'
+            '008107001e0100000215060808082a0007000a0010001100130014001500000027'
+            '260100010008002900000000000e1a1a1a1a1a1a1a1a2a000700080009000a000b'
+            '000c000d000e0007',
+            'UDT_UNICODELIST': '00000021260100010001ff290000000000161c0000001d0000'
+            '0000012a0700c88200000007',
+            'UDT_BOOLEANLIST': '0000001c260100010001ff290000000000111c0000001d0000'
+            '0000012a080007',
+            'UDT_OUTER': '000000272601000100040029000000000016270600810600812827060'
+            '081060081282a0008000b00100013',
+        }
+        for name, tds in captured.items():
+            (ret_val, _f, oid, version, got, _attrs, package) = shape(
+                f'"PYO"."PM1607"."{name}"'
+            )
+            assert (ret_val, version, package, len(oid)) == (0, 1, 'PM1607', 16), name
+            assert got.hex() == tds, name
+        attrs = shape('"PYO"."PM1607"."UDT_RECORD"')[5].rows
+        assert [r[1:6] + r[7:] for r in attrs] == [
+            ('NUMBERVALUE', 1, 'NUMBER', None, None, 'YES', None, None),
+            ('STRINGVALUE', 2, 'VARCHAR2', None, None, 'YES', None, None),
+            ('DATEVALUE', 3, 'DATE', None, None, 'YES', None, None),
+            ('TIMESTAMPVALUE', 4, 'TIMESTAMP', None, None, 'YES', None, None),
+            ('BOOLEANVALUE', 5, 'BOOLEAN', None, None, 'YES', None, None),
+            ('PLSINTEGERVALUE', 6, 'PL/SQL PLS INTEGER', None, None, 'YES', None, None),
+            (
+                'BINARYINTEGERVALUE', 7, 'PL/SQL BINARY INTEGER', None, None, 'YES',
+                None, None,
+            ),
+        ]  # fmt: skip
+        assert [r[6][-1] for r in attrs] == [0x0F, 0x19, 0x08, 0x3D, 0x2E, 0x33, 0x32]
+        (element,) = shape('"PYO"."PM1607"."UDT_RECORDARRAY"')[5].rows
+        assert element[1:6] + element[7:] == (
+            None,
+            1,
+            'UDT_RECORD',
+            'PYO',
+            'PM1607',
+            None,
+            None,
+            None,
+        )
+        assert backend.execute(
+            'SELECT type_name, typecode, attributes, contains_plsql '
+            "FROM all_plsql_types WHERE package_name = 'PM1607' ORDER BY type_name"
+        ).rows == [
+            ('UDT_BOOLEANLIST', 'COLLECTION', 0, 'NO'),
+            ('UDT_INNER', 'PL/SQL RECORD', 2, 'NO'),
+            ('UDT_OUTER', 'PL/SQL RECORD', 2, 'YES'),
+            ('UDT_RECORD', 'PL/SQL RECORD', 7, 'YES'),
+            ('UDT_RECORDARRAY', 'COLLECTION', 0, 'YES'),
+            ('UDT_UNICODELIST', 'COLLECTION', 0, 'NO'),
+        ]
+        assert backend.execute(
+            'SELECT type_name, coll_type, elem_type_owner, elem_type_package, '
+            'elem_type_name, length, character_set_name, char_used, index_by '
+            "FROM all_plsql_coll_types WHERE package_name = 'PM1607' "
+            'ORDER BY type_name'
+        ).rows == [
+            ('UDT_BOOLEANLIST', 'PL/SQL INDEX TABLE', None, None, 'BOOLEAN', None,
+             None, 'B', 'BINARY_INTEGER'),
+            ('UDT_RECORDARRAY', 'PL/SQL INDEX TABLE', 'PYO', 'PM1607', 'UDT_RECORD',
+             None, None, 'B', 'BINARY_INTEGER'),
+            ('UDT_UNICODELIST', 'PL/SQL INDEX TABLE', None, None, 'NVARCHAR2', 100,
+             'NCHAR_CS', 'C', 'BINARY_INTEGER'),
+        ]  # fmt: skip
+        assert backend.execute(
+            'SELECT attr_name, attr_type_owner, attr_type_package, attr_type_name, '
+            'length, scale, character_set_name, attr_no '
+            "FROM all_plsql_type_attrs WHERE package_name = 'PM1607' "
+            "AND type_name IN ('UDT_RECORD', 'UDT_OUTER') ORDER BY type_name, attr_no"
+        ).rows[:4] == [
+            ('INNER1', 'PYO', 'PM1607', 'UDT_INNER', None, None, None, 1),
+            ('INNER2', 'PYO', 'PM1607', 'UDT_INNER', None, None, None, 2),
+            ('NUMBERVALUE', None, None, 'NUMBER', None, None, None, 1),
+            ('STRINGVALUE', None, None, 'VARCHAR2', 30, None, 'CHAR_CS', 2),
+        ]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP PACKAGE pm1607')
+        except Exception:
+            backend.rollback()
+
+
 def test_get_type_shape_of_a_rowtype_with_a_date_column() -> None:
     # A table's DATE column is the ora_date domain (#1316). As a %ROWTYPE
     # attribute it had no Oracle type at all; its TDS leaf is the DATE code
