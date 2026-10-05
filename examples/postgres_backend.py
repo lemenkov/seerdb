@@ -5060,10 +5060,41 @@ _COMPILE_ERROR_CODES = frozenset(
 _PARAM_IN_OUT = re.compile(r'\bIN\s+OUT\b', re.IGNORECASE)
 
 
+# PL/SQL's own integer types, which a routine's parameters and locals and a
+# block's locals use and no table column can (#1604).
+_PLSQL_INTEGER_TYPE = re.compile(r'\b(?:PLS|BINARY)_INTEGER\b', re.IGNORECASE)
+# A parameter's NOCOPY, a hint to Oracle to pass by reference (#1604).
+_NOCOPY = re.compile(r'\bNOCOPY\s+', re.IGNORECASE)
+# What may follow a routine body's closing END: its name, which PL/pgSQL would
+# read as a block label (#1604).
+_END_LABEL = re.compile(r'\s*(?:[A-Za-z_][\w$#]*)?\s*')
+
+
 def _translate_routine_types(text: str) -> str:
     for pattern, replacement in _DDL_TYPE_REWRITES:
         text = pattern.sub(replacement, text)
-    return text
+    return _PLSQL_INTEGER_TYPE.sub('integer', text)
+
+
+def _routine_body(body: str) -> str:
+    """A routine's PL/SQL body -- its declarations, then BEGIN ... END [name]
+    -- as PL/pgSQL takes it (#1604): the declarations under DECLARE, their types
+    mapped, and the END without the routine's name. A body this cannot read --
+    a local routine among the declarations, an END not the last word -- is left
+    as it is, to fail as before."""
+    begin = next((start for word, start, _end in _words(body) if word == 'BEGIN'), None)
+    if begin is None:
+        return body
+    if any(word in ('FUNCTION', 'PROCEDURE') for word, _s, _e in _words(body[:begin])):
+        return body
+    closed = _block_end(body, begin)
+    if closed is None or _END_LABEL.fullmatch(body, closed[1]) is None:
+        return body
+    declarations = body[:begin].strip()
+    block = body[begin : closed[1]]
+    if not declarations:
+        return block
+    return f'DECLARE {_translate_routine_types(declarations)} {block}'
 
 
 def _translate_routine_ddl(sql: str) -> str:
@@ -5086,7 +5117,9 @@ def _translate_routine_ddl(sql: str) -> str:
     # Oracle allows a routine with no parameters to omit the list entirely
     # (FUNCTION f RETURN NUMBER AS …); PostgreSQL always needs the parentheses, so
     # an absent list (params is None) becomes an empty one (#530).
-    params = _translate_routine_types(_PARAM_IN_OUT.sub('INOUT', params or ''))
+    params = _translate_routine_types(
+        _NOCOPY.sub('', _PARAM_IN_OUT.sub('INOUT', params or ''))
+    )
     header = f'CREATE OR REPLACE {kind.upper()} {name}({params})'
     if kind.upper() == 'FUNCTION' and return_type:
         header += f' RETURNS {_translate_routine_types(return_type.strip())}'
@@ -5097,7 +5130,7 @@ def _translate_routine_ddl(sql: str) -> str:
     # definition first — by name (the suite never overloads, so it is unambiguous),
     # IF EXISTS so the first CREATE is fine (#521).
     drop = f'DROP {kind.upper()} IF EXISTS {name};'
-    return f'{drop} {header} LANGUAGE plpgsql AS $$ {body} $$'
+    return f'{drop} {header} LANGUAGE plpgsql AS $$ {_routine_body(body)} $$'
 
 
 # An anonymous PL/SQL block a bind-less client sends — DECLARE … BEGIN … END, or a
@@ -5399,7 +5432,9 @@ def _words(text: str, start: int = 0):
 def _block_end(text: str, begin: int) -> tuple[int, int] | None:
     # The span of the END that closes the BEGIN at `begin`. BEGIN and CASE open a
     # level, END closes one -- but END IF / END LOOP close no BEGIN, so they are
-    # passed over, and END CASE closes the CASE statement it ends.
+    # passed over, and END CASE closes the CASE statement it ends. A keyword is
+    # the END's own only right after it: `END; IF` is a CASE expression's END and
+    # the next statement's IF (#1604).
     depth = 0
     words = list(_words(text, begin))
     after_end = False
@@ -5411,8 +5446,9 @@ def _block_end(text: str, begin: int) -> tuple[int, int] | None:
         if word in ('BEGIN', 'CASE'):
             depth += 1
         elif word == 'END':
-            after_end = True
-            if i + 1 < len(words) and words[i + 1][0] in ('IF', 'LOOP'):
+            following = words[i + 1] if i + 1 < len(words) else None
+            after_end = following is not None and not text[end : following[1]].strip()
+            if after_end and following is not None and following[0] in ('IF', 'LOOP'):
                 continue
             depth -= 1
             if depth == 0:

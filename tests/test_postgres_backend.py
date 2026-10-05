@@ -2930,6 +2930,50 @@ def test_translate_routine_ddl_leaves_other_sql_unchanged() -> None:
         assert _translate_routine_ddl(sql) == sql
 
 
+def test_translate_routine_ddl_declares_a_bodys_locals() -> None:
+    # A routine's locals go under DECLARE, their types mapped, PL/SQL's integer
+    # types too; END loses the routine's name, which PL/pgSQL reads as a label;
+    # NOCOPY goes (#1604). A CASE expression's END before an IF statement closes
+    # the CASE, not an END IF.
+    out = _translate_routine_ddl(
+        'CREATE OR REPLACE FUNCTION f(a NUMBER, b IN OUT NOCOPY VARCHAR2) '
+        'RETURN NUMBER IS\n  t NUMBER;\n  i PLS_INTEGER;\n  s VARCHAR2(10);\n'
+        'BEGIN\n  t := CASE WHEN a > 0 THEN 1 ELSE 2 END;\n'
+        '  IF t > 1 THEN t := 3; END IF;\n  RETURN t;\nEND f;'
+    )
+    assert out == (
+        'DROP FUNCTION IF EXISTS f; CREATE OR REPLACE FUNCTION '
+        'f(a numeric, b INOUT varchar) RETURNS numeric LANGUAGE plpgsql AS $$ '
+        'DECLARE t numeric;\n  i integer;\n  s varchar(10); BEGIN\n'
+        '  t := CASE WHEN a > 0 THEN 1 ELSE 2 END;\n'
+        '  IF t > 1 THEN t := 3; END IF;\n  RETURN t;\nEND $$'
+    )
+    # No locals: the body as it was, its END's name gone.
+    assert _translate_routine_ddl('CREATE PROCEDURE p IS BEGIN NULL; END p;') == (
+        'DROP PROCEDURE IF EXISTS p; CREATE OR REPLACE PROCEDURE p() '
+        'LANGUAGE plpgsql AS $$ BEGIN NULL; END $$'
+    )
+
+
+def test_a_routine_with_locals_compiles_and_runs() -> None:
+    # It compiled with a warning and never existed (#1604). The value is 23ai's.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        result = backend.execute(
+            'CREATE OR REPLACE FUNCTION f1604 (a NUMBER) RETURN NUMBER IS\n'
+            '  t NUMBER;\n  i PLS_INTEGER := 2;\nBEGIN\n'
+            '  t := a * i;\n  RETURN t + 1;\nEND f1604;'
+        )
+        assert not result.compilation_warning
+        (row,) = backend.execute('SELECT f1604(20) FROM dual').rows
+        assert row[0] == 41
+    finally:
+        try:
+            backend.execute('DROP FUNCTION f1604')
+        except Exception:
+            backend.rollback()
+
+
 # --- changepassword (#515) — credential-map only, no live PG needed -------------
 
 
