@@ -81,6 +81,18 @@ edge of this adapter:
   ``SYS.XMLTYPE`` as 23ai does. An object attribute or a collection element may
   be an XMLType too: it describes as a reference to ``SYS.XMLTYPE`` and carries
   the document's text. Not yet: its methods (``EXTRACT``, ``GETCLOBVAL``).
+- **PL/SQL packages, partly** — a package is a schema of its name, so a caller's
+  ``package.member`` is PostgreSQL's ``schema.routine``. The spec puts a stand-in
+  for each routine it declares, which raises ``ORA-04067`` until a body replaces
+  it; a body that does not compile leaves them raising ``ORA-04063``. Members are
+  routines as ``CREATE FUNCTION`` / ``PROCEDURE`` translates them, overloads
+  included, each resolving names as its creator's session did, the package first.
+  ``DROP PACKAGE [BODY]`` and a call into a package that is not there answer as
+  Oracle does. Not yet: package-level types, variables and an initialization
+  section (a spec whose routines use a package type is created INVALID); a
+  private member is callable from outside, where Oracle's is not; and PL/pgSQL
+  checks an identifier when the routine runs, not when it is created, so a body
+  Oracle would refuse can compile and fail on its first call instead.
 - **Object types, partly** — ``CREATE TYPE ... AS OBJECT`` is a PostgreSQL
   composite, listed in ``all_types`` / ``all_type_attrs`` under an OID that is the
   composite's own ``pg_type`` oid, zero-padded to Oracle's 16 bytes. An object
@@ -149,7 +161,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import Final, TypeVar
+from typing import Final, NamedTuple, TypeVar
 
 import psycopg
 from psycopg import sql
@@ -391,6 +403,15 @@ _HELPER_FUNCTIONS_DDL = (
     '- floor(log(abs(v)))::integer))); END IF; END LOOP; '
     "IF rounded <> '{}' THEN NEW := jsonb_populate_record(NEW, rounded); END IF; "
     'RETURN NEW; END $$;'
+    # A call into a package with no usable body (#1605), as Oracle refuses it:
+    # ORA-04067 while there is none, ORA-04063 when it did not compile.
+    'CREATE OR REPLACE FUNCTION sys.ora_package_unusable(text) RETURNS void '
+    'LANGUAGE plpgsql AS $$ DECLARE p record; BEGIN '
+    'SELECT owner, body INTO p FROM sys.ora_packages WHERE name = $1; '
+    "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = CASE WHEN p.body = "
+    "'INVALID' THEN format('ORA-04063: package body \"%s.%s\" has errors', "
+    "p.owner, upper($1)) ELSE format('ORA-04067: not executed, package body "
+    '"%s.%s" does not exist\', p.owner, upper($1)) END; END $$;'
     # RAWTOHEX(x) → the hex text of a bytea. Oracle returns upper-case hex.
     'CREATE OR REPLACE FUNCTION rawtohex(bytea) RETURNS text '
     "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT upper(encode($1, 'hex')) $$;"
@@ -1107,6 +1128,13 @@ _ORACLE_DICTIONARY_DDL = (
     # own column identity; rows of dropped tables are pruned on the next write.
     'CREATE TABLE IF NOT EXISTS sys.ora_quoted_names ('
     'relid oid NOT NULL, attnum smallint NOT NULL, PRIMARY KEY (relid, attnum));'
+    # The PL/SQL packages (#1605), each a schema of its name: its owner, the DDL
+    # of the stand-ins its spec declares -- routines that raise until a body
+    # replaces them -- and whether its spec and body compiled. A body is NULL
+    # until there is one, INVALID when it did not compile.
+    'CREATE TABLE IF NOT EXISTS sys.ora_packages ('
+    'name text PRIMARY KEY, owner text NOT NULL, stubs text NOT NULL, '
+    "spec text NOT NULL DEFAULT 'VALID', body text);"
     # A column's name as the dictionary lists it: a quoted all-lower-case one as
     # written, any other as ora_name folds it (#1599).
     'CREATE OR REPLACE FUNCTION sys.ora_column_name(oid, text) RETURNS text '
@@ -1267,7 +1295,9 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE OR REPLACE VIEW sys.all_users AS SELECT upper(nspname) AS username, '
     'oid::bigint AS user_id, NULL::timestamp AS created FROM pg_namespace '
     "WHERE nspname NOT LIKE 'pg\\_%' "
-    "AND nspname NOT IN ('information_schema','oracle','sys');"
+    "AND nspname NOT IN ('information_schema','oracle','sys') "
+    # A package's schema is the package's, not a user (#1605).
+    'AND nspname NOT IN (SELECT name FROM sys.ora_packages);'
     # all_tab_identity_cols: an identity column is a PostgreSQL identity column
     # (pg_attribute.attidentity 'a'=ALWAYS, 'd'=BY DEFAULT). The dialect JOINs this
     # on every get_columns once it believes the server is 12c, so it must exist or
@@ -1286,7 +1316,39 @@ _ORACLE_DICTIONARY_DDL = (
     "'N' AS generated, 'N' AS secondary "
     'FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace '
     "WHERE c.relkind IN ('r','v','m','i','S') "
-    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    # A package's spec and body, VALID or INVALID as they compiled (#1605).
+    'UNION ALL SELECT k.owner, upper(k.name), NULL::text, n.oid::bigint, '
+    "t.object_type, t.status, 'N', 'N', 'N' FROM sys.ora_packages k "
+    'JOIN pg_namespace n ON n.nspname = k.name CROSS JOIN LATERAL '
+    "(VALUES ('PACKAGE', k.spec), ('PACKAGE BODY', k.body)) t(object_type, status) "
+    'WHERE t.status IS NOT NULL;'
+    # orafce has a user_objects too, which lists every schema's objects under
+    # their PostgreSQL names; this one is the current schema's, Oracle's way.
+    'CREATE OR REPLACE VIEW sys.user_objects AS SELECT * FROM all_objects '
+    'WHERE owner=upper(current_schema());'
+    # A package and the routines its spec declares, overloads numbered in the
+    # order the spec gives them (#1605). A standalone routine is not listed yet.
+    'CREATE OR REPLACE VIEW sys.all_procedures AS SELECT k.owner, '
+    'upper(k.name) AS object_name, NULL::text AS procedure_name, '
+    'n.oid::bigint AS object_id, 0 AS subprogram_id, NULL::text AS overload, '
+    "'PACKAGE' AS object_type, 'NO' AS aggregate, 'NO' AS pipelined, "
+    "'NO' AS parallel, 'NO' AS interface, 'NO' AS deterministic, "
+    "'DEFINER' AS authid FROM sys.ora_packages k "
+    'JOIN pg_namespace n ON n.nspname = k.name '
+    'UNION ALL SELECT owner, object_name, procedure_name, object_id, '
+    '(row_number() OVER (PARTITION BY object_id ORDER BY declared, oid))::integer, '
+    'CASE WHEN count(*) OVER (PARTITION BY object_id, procedure_name) > 1 THEN '
+    '(row_number() OVER (PARTITION BY object_id, procedure_name '
+    'ORDER BY declared, oid))::text END, '
+    "'PACKAGE', 'NO', 'NO', 'NO', 'NO', 'NO', 'DEFINER' FROM ("
+    'SELECT k.owner, upper(k.name) AS object_name, upper(p.proname) AS '
+    'procedure_name, n.oid::bigint AS object_id, p.oid, '
+    "position(('.' || p.proname || '(') IN lower(k.stubs)) AS declared "
+    'FROM sys.ora_packages k JOIN pg_namespace n ON n.nspname = k.name '
+    'JOIN pg_proc p ON p.pronamespace = n.oid) m WHERE declared > 0;'
+    'CREATE OR REPLACE VIEW sys.user_procedures AS SELECT * FROM all_procedures '
+    'WHERE owner=upper(current_schema());'
     'CREATE OR REPLACE VIEW sys.all_constraints AS SELECT ora_owner(tc.constraint_schema) '
     'AS owner, ora_name(tc.constraint_name) AS constraint_name, '
     "CASE tc.constraint_type WHEN 'PRIMARY KEY' THEN 'P' WHEN 'FOREIGN KEY' THEN 'R' "
@@ -5060,10 +5122,41 @@ _COMPILE_ERROR_CODES = frozenset(
 _PARAM_IN_OUT = re.compile(r'\bIN\s+OUT\b', re.IGNORECASE)
 
 
+# PL/SQL's own integer types, which a routine's parameters and locals and a
+# block's locals use and no table column can (#1604).
+_PLSQL_INTEGER_TYPE = re.compile(r'\b(?:PLS|BINARY)_INTEGER\b', re.IGNORECASE)
+# A parameter's NOCOPY, a hint to Oracle to pass by reference (#1604).
+_NOCOPY = re.compile(r'\bNOCOPY\s+', re.IGNORECASE)
+# What may follow a routine body's closing END: its name, which PL/pgSQL would
+# read as a block label (#1604).
+_END_LABEL = re.compile(r'\s*(?:[A-Za-z_][\w$#]*)?\s*')
+
+
 def _translate_routine_types(text: str) -> str:
     for pattern, replacement in _DDL_TYPE_REWRITES:
         text = pattern.sub(replacement, text)
-    return text
+    return _PLSQL_INTEGER_TYPE.sub('integer', text)
+
+
+def _routine_body(body: str) -> str:
+    """A routine's PL/SQL body -- its declarations, then BEGIN ... END [name]
+    -- as PL/pgSQL takes it (#1604): the declarations under DECLARE, their types
+    mapped, and the END without the routine's name. A body this cannot read --
+    a local routine among the declarations, an END not the last word -- is left
+    as it is, to fail as before."""
+    begin = next((start for word, start, _end in _words(body) if word == 'BEGIN'), None)
+    if begin is None:
+        return body
+    if any(word in ('FUNCTION', 'PROCEDURE') for word, _s, _e in _words(body[:begin])):
+        return body
+    closed = _block_end(body, begin)
+    if closed is None or _END_LABEL.fullmatch(body, closed[1]) is None:
+        return body
+    declarations = body[:begin].strip()
+    block = body[begin : closed[1]]
+    if not declarations:
+        return block
+    return f'DECLARE {_translate_routine_types(declarations)} {block}'
 
 
 def _translate_routine_ddl(sql: str) -> str:
@@ -5086,7 +5179,9 @@ def _translate_routine_ddl(sql: str) -> str:
     # Oracle allows a routine with no parameters to omit the list entirely
     # (FUNCTION f RETURN NUMBER AS …); PostgreSQL always needs the parentheses, so
     # an absent list (params is None) becomes an empty one (#530).
-    params = _translate_routine_types(_PARAM_IN_OUT.sub('INOUT', params or ''))
+    params = _translate_routine_types(
+        _NOCOPY.sub('', _PARAM_IN_OUT.sub('INOUT', params or ''))
+    )
     header = f'CREATE OR REPLACE {kind.upper()} {name}({params})'
     if kind.upper() == 'FUNCTION' and return_type:
         header += f' RETURNS {_translate_routine_types(return_type.strip())}'
@@ -5097,7 +5192,263 @@ def _translate_routine_ddl(sql: str) -> str:
     # definition first — by name (the suite never overloads, so it is unambiguous),
     # IF EXISTS so the first CREATE is fine (#521).
     drop = f'DROP {kind.upper()} IF EXISTS {name};'
-    return f'{drop} {header} LANGUAGE plpgsql AS $$ {body} $$'
+    return f'{drop} {header} LANGUAGE plpgsql AS $$ {_routine_body(body)} $$'
+
+
+# --- PL/SQL packages (#1605) ---------------------------------------------------
+
+# CREATE [OR REPLACE] [EDITIONABLE] PACKAGE [BODY] [owner.]name AS|IS, and DROP
+# PACKAGE [BODY] [owner.]name. A package is a schema of its name: a caller names
+# a member as package.member, which PostgreSQL reads as schema.routine.
+_PACKAGE_HEAD = re.compile(
+    r'(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:NON)?EDITIONABLE\s+)?PACKAGE\s+'
+    r'(BODY\s+)?(?:([A-Za-z_][\w$#]*)\.)?([A-Za-z_][\w$#]*)\s+(?:AS|IS)\b'
+)
+_DROP_PACKAGE = re.compile(
+    r'(?is)^\s*DROP\s+PACKAGE\s+(BODY\s+)?(?:([A-Za-z_][\w$#]*)\.)?'
+    r'([A-Za-z_][\w$#]*)\s*;?\s*$'
+)
+_PLSQL_WORD = re.compile(r'[A-Za-z_][\w$#]*')
+_MEMBER_RETURN = re.compile(r'(?is)\s*RETURN\s+(.+?)\s*(?=;|\b(?:IS|AS)\b)')
+_MEMBER_TAIL = re.compile(r'(?is)\s*(;|(?:IS|AS)\b)')
+_MEMBER_END = re.compile(r'\s*(?:[A-Za-z_][\w$#]*)?\s*;')
+_PACKAGE_END = re.compile(r'\s*(?:[A-Za-z_][\w$#]*)?\s*;?\s*$')
+
+
+class _PackageMember(NamedTuple):
+    kind: str  # FUNCTION / PROCEDURE
+    name: str
+    params: str | None
+    returns: str | None
+    body: str | None  # None for a declaration
+
+
+def _blank_plsql(text: str) -> str:
+    # `text` with each comment and string literal's contents blanked, the same
+    # length, so a ; or a parenthesis inside one is not read as structure.
+    def blank(match: re.Match) -> str:
+        token = match.group()
+        if token.startswith("'"):
+            return "'" + ' ' * (len(token) - 2) + "'"
+        if token.startswith(('--', '/*')):
+            return ' ' * len(token)
+        return token
+
+    return _PLSQL_TOKEN.sub(blank, text)
+
+
+def _statement_end(blanked: str, pos: int) -> int | None:
+    # The ; that ends the declaration at `pos`, outside parentheses.
+    depth = 0
+    for i in range(pos, len(blanked)):
+        char = blanked[i]
+        if char == '(':
+            depth += 1
+        elif char == ')':
+            depth -= 1
+        elif char == ';' and depth == 0:
+            return i
+    return None
+
+
+def _package_members(text: str, pos: int) -> list[_PackageMember] | None:
+    """The routines a package spec declares or a body defines, from `pos` (past
+    AS|IS) to the package's END (#1605). The rest of a package -- its types,
+    variables, cursors, pragmas -- is passed over: a member that uses one fails
+    to compile, and the package with it. None for what this cannot read: an
+    initialization section, a member with local routines of its own."""
+    blanked = _blank_plsql(text)
+    members: list[_PackageMember] = []
+    while True:
+        pos = len(blanked) - len(blanked[pos:].lstrip())
+        word = _PLSQL_WORD.match(blanked, pos)
+        if word is None:
+            return None
+        keyword = word.group().upper()
+        if keyword == 'END':
+            return members if _PACKAGE_END.fullmatch(blanked, word.end()) else None
+        if keyword == 'BEGIN':
+            return None  # an initialization section
+        if keyword not in ('FUNCTION', 'PROCEDURE'):
+            end = _statement_end(blanked, pos)
+            if end is None:
+                return None
+            pos = end + 1
+            continue
+        name = _PLSQL_WORD.match(
+            blanked, len(blanked) - len(blanked[word.end() :].lstrip())
+        )
+        if name is None:
+            return None
+        at = len(blanked) - len(blanked[name.end() :].lstrip())
+        params = None
+        if blanked.startswith('(', at):
+            close = _matching_paren(blanked, at)
+            params, at = text[at + 1 : close], close + 1
+        returns = _MEMBER_RETURN.match(blanked, at)
+        if returns is not None:
+            at = returns.end()
+        tail = _MEMBER_TAIL.match(blanked, at)
+        if tail is None:
+            return None
+        returned = text[returns.start(1) : returns.end(1)] if returns else None
+        if tail.group(1) == ';':
+            members.append(
+                _PackageMember(keyword, name.group(), params, returned, None)
+            )
+            pos = tail.end()
+            continue
+        begin = next(
+            (start for w, start, _e in _words(blanked, tail.end()) if w == 'BEGIN'),
+            None,
+        )
+        if begin is None or any(
+            w in ('FUNCTION', 'PROCEDURE')
+            for w, _s, _e in _words(blanked[:begin], tail.end())
+        ):
+            return None
+        closed = _block_end(blanked, begin)
+        after = _MEMBER_END.match(blanked, closed[1]) if closed else None
+        if closed is None or after is None:
+            return None
+        members.append(
+            _PackageMember(
+                keyword, name.group(), params, returned, text[tail.end() : closed[1]]
+            )
+        )
+        pos = after.end()
+
+
+def _package_routine(package: str, member: _PackageMember, body: str) -> str:
+    # One member as a routine in the package's schema: the routine translation,
+    # without its drop by name -- a package's members may share a name.
+    params = f'({member.params})' if member.params is not None else ''
+    returns = f' RETURN {member.returns}' if member.returns else ''
+    name = f'{package}.{member.name}'
+    translated = _translate_routine_ddl(
+        f'CREATE OR REPLACE {member.kind} {name}{params}{returns} IS {body}'
+    )
+    return translated.removeprefix(f'DROP {member.kind} IF EXISTS {name}; ')
+
+
+def _drop_package_routines(package: str) -> str:
+    # Every routine in the package's schema, overloads and private ones too.
+    return (
+        'DO $p$ DECLARE r record; BEGIN FOR r IN SELECT p.oid::regprocedure AS '
+        "sig, p.prokind FROM pg_proc p WHERE p.pronamespace = '"
+        f"{package}'::regnamespace LOOP EXECUTE format('DROP %s %s', CASE "
+        "r.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, r.sig); "
+        'END LOOP; END $p$'
+    )
+
+
+def _restore_package_stubs(package: str, body: str) -> str:
+    # The spec's stand-ins in place of the body's routines, the body as given.
+    state = 'NULL' if body == 'NULL' else f"'{body}'"
+    return (
+        f'{_drop_package_routines(package)}; DO $p$ DECLARE s text; BEGIN '
+        f"SELECT stubs INTO s FROM sys.ora_packages WHERE name = '{package}'; "
+        "IF s <> '' THEN EXECUTE s; END IF; END $p$; "
+        f"UPDATE sys.ora_packages SET body = {state} WHERE name = '{package}'"
+    )
+
+
+def _package_missing(package: str, code: int, message: str) -> str:
+    # A check that raises Oracle's error when the package is not there.
+    return (
+        'DO $p$ BEGIN IF NOT EXISTS (SELECT 1 FROM sys.ora_packages WHERE name = '
+        f"'{package}') THEN RAISE EXCEPTION USING ERRCODE = 'P0001', "
+        f"MESSAGE = 'ORA-{code:05d}: {message}'; END IF; END $p$"
+    )
+
+
+def _translate_package_ddl(sql: str) -> str:
+    """A PL/SQL package's DDL as a schema of its name (#1605).
+
+    The spec creates the schema -- replacing it drops the old one, body and all,
+    as Oracle invalidates the body -- and a stand-in for each routine it
+    declares, which raises ORA-04067 until a body replaces it. The body drops the
+    schema's routines and creates its members in their place, each resolving
+    names in the package first and then where its creator's session did, as a
+    definer's package does. DROP PACKAGE drops the schema; DROP PACKAGE BODY puts
+    the stand-ins back. A schema of that name that is no package is refused,
+    ORA-00955. A private member is a routine of the schema like the others, so
+    callable from outside where Oracle's is not. Other SQL is unchanged.
+    """
+    dropped = _DROP_PACKAGE.match(sql)
+    if dropped is not None:
+        body, _owner, name = dropped.groups()
+        package = name.lower()
+        missing = _package_missing(
+            package, 4043, f'object {name.upper()} does not exist'
+        )
+        if body:
+            return f'{missing}; {_restore_package_stubs(package, "NULL")}'
+        return (
+            f'{missing}; DROP SCHEMA {package} CASCADE; '
+            f"DELETE FROM sys.ora_packages WHERE name = '{package}'"
+        )
+    head = _PACKAGE_HEAD.match(sql)
+    if head is None:
+        return sql
+    body, owner, name = head.groups()
+    package = name.lower()
+    members = _package_members(sql, head.end())
+    if members is None:
+        raise BackendError(
+            f'package {name.upper()} has PL/SQL the Mirror does not translate: '
+            'an initialization section, or a member with routines of its own',
+            ora_code=ORA_PLSQL_COMPILATION_ERROR,
+        )
+    if body:
+        routines = [
+            _package_routine(package, m, m.body) for m in members if m.body is not None
+        ]
+        # Each member resolves names as the creating session did, the package
+        # first: set for the CREATEs and taken with them, then gone with the
+        # transaction.
+        path = (
+            "SELECT set_config('search_path', "
+            f"'{package}, ' || current_setting('search_path'), true)"
+        )
+        created = '; '.join(
+            r.replace(
+                ' LANGUAGE plpgsql AS $$',
+                ' LANGUAGE plpgsql SET search_path FROM CURRENT AS $$',
+                1,
+            )
+            for r in routines
+        )
+        missing = _package_missing(package, 6550, f'package {name.upper()} has no spec')
+        return (
+            f'{missing}; {_drop_package_routines(package)}; {path}; '
+            + (f'{created}; ' if created else '')
+            + f"UPDATE sys.ora_packages SET body = 'VALID' WHERE name = '{package}'"
+        )
+    stubs = '; '.join(
+        _package_routine(
+            package, m, f"BEGIN PERFORM sys.ora_package_unusable('{package}'); END;"
+        )
+        for m in members
+        if m.body is None
+    )
+    owner_name = (owner or '').upper()
+    owner_sql = f"'{owner_name}'" if owner_name else 'sys.ora_owner(current_schema())'
+    taken = (
+        'DO $p$ BEGIN IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = '
+        f"'{package}') AND NOT EXISTS (SELECT 1 FROM sys.ora_packages WHERE "
+        f"name = '{package}') THEN RAISE EXCEPTION USING ERRCODE = 'P0001', "
+        "MESSAGE = 'ORA-00955: name is already used by an existing object'; "
+        'END IF; END $p$'
+    )
+    return (
+        f'{taken}; DROP SCHEMA IF EXISTS {package} CASCADE; CREATE SCHEMA {package}; '
+        + (f'{stubs}; ' if stubs else '')
+        + 'INSERT INTO sys.ora_packages (name, owner, stubs, spec, body) VALUES '
+        f"('{package}', {owner_sql}, $stubs${stubs}$stubs$, 'VALID', NULL) "
+        'ON CONFLICT (name) DO UPDATE SET owner = EXCLUDED.owner, '
+        "stubs = EXCLUDED.stubs, spec = 'VALID', body = NULL"
+    )
 
 
 # An anonymous PL/SQL block a bind-less client sends — DECLARE … BEGIN … END, or a
@@ -5399,7 +5750,9 @@ def _words(text: str, start: int = 0):
 def _block_end(text: str, begin: int) -> tuple[int, int] | None:
     # The span of the END that closes the BEGIN at `begin`. BEGIN and CASE open a
     # level, END closes one -- but END IF / END LOOP close no BEGIN, so they are
-    # passed over, and END CASE closes the CASE statement it ends.
+    # passed over, and END CASE closes the CASE statement it ends. A keyword is
+    # the END's own only right after it: `END; IF` is a CASE expression's END and
+    # the next statement's IF (#1604).
     depth = 0
     words = list(_words(text, begin))
     after_end = False
@@ -5411,8 +5764,9 @@ def _block_end(text: str, begin: int) -> tuple[int, int] | None:
         if word in ('BEGIN', 'CASE'):
             depth += 1
         elif word == 'END':
-            after_end = True
-            if i + 1 < len(words) and words[i + 1][0] in ('IF', 'LOOP'):
+            following = words[i + 1] if i + 1 < len(words) else None
+            after_end = following is not None and not text[end : following[1]].strip()
+            if after_end and following is not None and following[0] in ('IF', 'LOOP'):
                 continue
             depth -= 1
             if depth == 0:
@@ -5833,8 +6187,9 @@ _ORA_MESSAGE = {
 
 
 # A user error raised by a translated RAISE_APPLICATION_ERROR: P0001 whose message
-# leads with its ORA code (#1323).
-_APPLICATION_ERROR = re.compile(r'ORA-(20\d{3}): (.*)', re.DOTALL)
+# leads with its ORA code (#1323). The Mirror's own PL/pgSQL raises Oracle's
+# errors the same way, a package's ORA-04067 among them (#1605).
+_APPLICATION_ERROR = re.compile(r'ORA-(\d{5}): (.*)', re.DOTALL)
 # An INSERT whose value list and column list disagree in length. PostgreSQL files
 # both under syntax_error (42601), which says nothing an Oracle client can use;
 # Oracle names them ORA-00913 / ORA-00947 (#1323).
@@ -5904,6 +6259,8 @@ _DROP_STATEMENT = re.compile(r'\s*DROP\b', re.IGNORECASE)
 _UNKNOWN_VARIABLE = re.compile(r'"([^"]+)" is not a known variable')
 _UNKNOWN_FUNCTION = re.compile(r'(?:function|procedure) ([\w.$#"]+)\(')
 _NEAR_TOKEN = re.compile(r'at or near "([^"]+)"')
+# A call into a package that is not there: PostgreSQL finds no schema (#1605).
+_UNKNOWN_SCHEMA = re.compile(r'schema "([^"]+)" does not exist')
 
 
 def _plsql_compile_error(
@@ -5915,10 +6272,22 @@ def _plsql_compile_error(
     # reports each under SQLSTATE class 42 -- 42601 / 42883 / 42703 / 42P01 --
     # which mapped to the SQL statement's codes, ORA-00900 / 00904 / 00942. The
     # position is the named thing's in the client's block, as Oracle gives it.
-    if not str(getattr(exc, 'sqlstate', None) or '').startswith('42'):
+    # A call into a package that is not there is PostgreSQL's 3F000, no such
+    # schema, and Oracle's PLS-00201 for the package.member it names (#1605).
+    sqlstate = str(getattr(exc, 'sqlstate', None) or '')
+    if not sqlstate.startswith('42') and sqlstate != '3F000':
         return None
     primary = _primary_message(exc)
-    if (variable := _UNKNOWN_VARIABLE.search(primary)) is not None:
+    if sqlstate == '3F000':
+        schema = _UNKNOWN_SCHEMA.search(primary)
+        if schema is None:
+            return None
+        qualified = re.search(
+            rf'\b{re.escape(schema.group(1))}\s*\.\s*[\w$#]+', block, re.IGNORECASE
+        )
+        name = re.sub(r'\s+', '', qualified.group()) if qualified else schema.group(1)
+        pls = f"PLS-00201: identifier '{name.upper()}' must be declared"
+    elif (variable := _UNKNOWN_VARIABLE.search(primary)) is not None:
         name = variable.group(1)
         pls = f"PLS-00201: identifier '{name.upper()}' must be declared"
     elif (function := _UNKNOWN_FUNCTION.search(primary)) is not None:
@@ -7201,6 +7570,7 @@ class PostgresBackend:
         # literal idioms. This is where dialect knowledge belongs, not in the
         # generic compat shim.
         sql = _ruled('reserved-name', _quote_reserved_names(sql), sql)
+        sql = _ruled('package-ddl', _translate_package_ddl(sql), sql)
         sql = _ruled('admin', _translate_admin(sql), sql)
         sql = _ruled('ddl', _translate_ddl(sql), sql)
         sql = _ruled('routine-ddl', _translate_routine_ddl(sql), sql)
@@ -7304,6 +7674,9 @@ class PostgresBackend:
         # would the invalid object. None for any other failure.
         if error.ora_code not in _COMPILE_ERROR_CODES:
             return None
+        package = _PACKAGE_HEAD.match(sql)
+        if package is not None:
+            return self._create_invalid_package(package)
         routine = _ROUTINE_HEAD.match(sql)
         type_ = _INVALID_TYPE_DDL.match(sql) if routine is None else None
         if routine is not None:
@@ -7319,6 +7692,38 @@ class PostgresBackend:
             stub = f'DROP TYPE IF EXISTS {name}; CREATE TYPE {name}'
         else:
             return None
+        try:
+            self._conn.execute(stub)
+        except psycopg.Error:
+            self._conn.rollback()
+            return None
+        return Result(compilation_warning=True)
+
+    def _create_invalid_package(self, head: re.Match) -> Result | None:
+        # A package spec or body that does not compile (#1605). A body that does
+        # not leaves the spec's stand-ins, which now raise ORA-04063; a spec
+        # leaves its schema empty, the package INVALID, so a call finds nothing.
+        # A body with no spec at all leaves nothing.
+        body, owner, name = head.groups()
+        package = name.lower()
+        if body:
+            known = self._conn.execute(
+                'SELECT 1 FROM sys.ora_packages WHERE name = %s', (package,)
+            ).fetchone()
+            if known is None:
+                return Result(compilation_warning=True)
+            stub = _restore_package_stubs(package, 'INVALID')
+        else:
+            owner_sql = (
+                f"'{owner.upper()}'" if owner else 'sys.ora_owner(current_schema())'
+            )
+            stub = (
+                f'DROP SCHEMA IF EXISTS {package} CASCADE; CREATE SCHEMA {package}; '
+                'INSERT INTO sys.ora_packages (name, owner, stubs, spec, body) '
+                f"VALUES ('{package}', {owner_sql}, '', 'INVALID', NULL) "
+                'ON CONFLICT (name) DO UPDATE SET owner = EXCLUDED.owner, '
+                "stubs = '', spec = 'INVALID', body = NULL"
+            )
         try:
             self._conn.execute(stub)
         except psycopg.Error:
