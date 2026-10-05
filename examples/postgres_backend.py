@@ -88,11 +88,28 @@ edge of this adapter:
   routines as ``CREATE FUNCTION`` / ``PROCEDURE`` translates them, overloads
   included, each resolving names as its creator's session did, the package first.
   ``DROP PACKAGE [BODY]`` and a call into a package that is not there answer as
-  Oracle does. Not yet: package-level types, variables and an initialization
-  section (a spec whose routines use a package type is created INVALID); a
-  private member is callable from outside, where Oracle's is not; and PL/pgSQL
-  checks an identifier when the routine runs, not when it is created, so a body
-  Oracle would refuse can compile and fail on its first call instead.
+  Oracle does. A package's types are PostgreSQL types of its schema: a RECORD a
+  composite, an index-by table a composite of its keys and its values (``keys``
+  and ``vals`` arrays, so sparse keys and string keys keep their order), a
+  nested table or VARRAY a domain over an array, a SUBTYPE or a REF CURSOR a
+  domain. A client's type lookup of one, ``"OWNER"."PACKAGE"."TYPE"`` or
+  ``PACKAGE.TYPE``, is answered as 23ai answers it, from the declaration as
+  written, and ``all_plsql_types`` / ``all_plsql_type_attrs`` /
+  ``all_plsql_coll_types`` list a spec's types. A record or an index-by table
+  binds and comes back as an object, an index-by table under its own keys; a
+  classic PL/SQL array (``cursor.arrayvar``) bound to an index-by table
+  parameter is keyed 1..N, and comes back as its values. A body indexes an
+  index-by table as PL/SQL does -- ``a(k) := x``, ``a(k)``, ``COUNT``,
+  ``FIRST`` / ``LAST`` / ``NEXT`` / ``PRIOR``, ``EXISTS``, ``DELETE`` -- through
+  functions each such type has (``t$get``, ``t$set``, ...), the keys kept in
+  order; a key not there is ORA-01403. Not yet: a record of a table's row
+  (``%ROWTYPE``) as a bind, package variables and an initialization section;
+  ``DATE - DATE`` in a body is an interval, not Oracle's number of days; a
+  private member is
+  callable from outside, where Oracle's is not;
+  and PL/pgSQL checks an identifier when the routine runs, not when it is
+  created, so a body Oracle would refuse can compile and fail on its first call
+  instead.
 - **Object types, partly** — ``CREATE TYPE ... AS OBJECT`` is a PostgreSQL
   composite, listed in ``all_types`` / ``all_type_attrs`` under an OID that is the
   composite's own ``pg_type`` oid, zero-padded to Oracle's 16 bytes. An object
@@ -113,8 +130,7 @@ edge of this adapter:
   / ``REAL`` / ``DOUBLE PRECISION`` attribute, and an ``NVARCHAR2`` /
   ``NCHAR`` / ``RAW(n)`` collection element, keep the type the DDL declared; a
   ``DATE`` attribute is ``ora_date``, as a ``DATE`` column is, and reads as
-  ``DATE``. PL/SQL package
-  types (``all_plsql_types``) are not described.
+  ``DATE``. A PL/SQL package's types are described too (see PL/SQL packages).
 - **``REF`` / ``DEREF``, with a visible object id** — an Oracle object table
   (``CREATE TABLE t OF type``) gives every row a hidden object id that a REF names.
   PostgreSQL's typed tables cannot take a column beyond their type's, and a row's
@@ -171,12 +187,14 @@ from psycopg.types.composite import CompositeInfo, register_composite
 from seerdb.common.datatypes import BcDate, IntervalYM
 from seerdb.common.dbobject import (
     COLLECTION_NESTED_TABLE,
+    COLLECTION_PLSQL_INDEX_TABLE,
     COLLECTION_VARRAY,
     DbObject,
     DbObjectType,
     DbRef,
     ObjectImage,
     decode_collection_image,
+    decode_collection_keyed,
     decode_object_image,
     map_object_lobs,
     type_name_to_tns,
@@ -192,6 +210,7 @@ from seerdb.common.sqltext import (
 from seerdb.common.tns import _AUTH_MAX_OPEN_CURSORS
 from seerdb.common.tns_consts import (
     AL16UTF16_CHARSET,
+    AL32UTF8_CHARSET,
     FIELD_VERSION_12_1,
     ORA_CANNOT_INSERT_NULL,
     ORA_CANNOT_KILL_CURRENT_SESSION,
@@ -1135,6 +1154,18 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE TABLE IF NOT EXISTS sys.ora_packages ('
     'name text PRIMARY KEY, owner text NOT NULL, stubs text NOT NULL, '
     "spec text NOT NULL DEFAULT 'VALID', body text);"
+    # The types a package declares (#1607), each a PostgreSQL type of its
+    # schema, with the PL/SQL it was declared as -- what the dictionary and a
+    # client's type metadata report -- in declaration order. A body's own types
+    # are private: the dictionary does not list them.
+    'CREATE TABLE IF NOT EXISTS sys.ora_plsql_types ('
+    'package text NOT NULL, name text NOT NULL, declaration text NOT NULL, '
+    'public boolean NOT NULL, ord integer NOT NULL, PRIMARY KEY (package, name));'
+    # What a type's declaration says, read once (#1607): a record's fields, a
+    # collection's kind, bound, key and element, each field or element a
+    # built-in's name, length, precision, scale and character set or a named
+    # type -- what the views below and GET_TYPE_SHAPE report.
+    'ALTER TABLE sys.ora_plsql_types ADD COLUMN IF NOT EXISTS meta jsonb;'
     # A column's name as the dictionary lists it: a quoted all-lower-case one as
     # written, any other as ora_name folds it (#1599).
     'CREATE OR REPLACE FUNCTION sys.ora_column_name(oid, text) RETURNS text '
@@ -1349,6 +1380,45 @@ _ORACLE_DICTIONARY_DDL = (
     'JOIN pg_proc p ON p.pronamespace = n.oid) m WHERE declared > 0;'
     'CREATE OR REPLACE VIEW sys.user_procedures AS SELECT * FROM all_procedures '
     'WHERE owner=upper(current_schema());'
+    # The types a package's spec declares (#1607), as 23ai lists them; a named
+    # field or element is the package owner's. The OID is the PostgreSQL type's,
+    # zero-padded to 16 bytes, as all_types gives a composite's.
+    'CREATE OR REPLACE VIEW sys.all_plsql_types AS SELECT k.owner, '
+    'upper(t.package) AS package_name, t.name AS type_name, '
+    "decode(lpad(to_hex(to_regtype(t.package || '.' || lower(t.name))::oid::bigint), 32, "
+    "'0'), 'hex') AS type_oid, t.meta->>'typecode' AS typecode, "
+    "(t.meta->>'attributes')::integer AS attributes, "
+    "t.meta->>'contains_plsql' AS contains_plsql "
+    'FROM sys.ora_plsql_types t JOIN sys.ora_packages k ON k.name = t.package '
+    "WHERE t.public AND t.meta ? 'typecode';"
+    'CREATE OR REPLACE VIEW sys.all_plsql_type_attrs AS SELECT k.owner, '
+    'upper(t.package) AS package_name, t.name AS type_name, '
+    "a.v->>'name' AS attr_name, NULL::text AS attr_type_mod, "
+    "CASE WHEN (a.v->'type'->>'named')::boolean THEN k.owner END AS attr_type_owner, "
+    "a.v->'type'->>'package' AS attr_type_package, "
+    "a.v->'type'->>'name' AS attr_type_name, (a.v->'type'->>'length')::integer "
+    "AS length, (a.v->'type'->>'precision')::integer AS precision, "
+    "(a.v->'type'->>'scale')::integer AS scale, "
+    "a.v->'type'->>'charset' AS character_set_name, a.n::integer AS attr_no, "
+    "coalesce(a.v->'type'->>'char_used', 'B') AS char_used "
+    'FROM sys.ora_plsql_types t JOIN sys.ora_packages k ON k.name = t.package '
+    "CROSS JOIN LATERAL jsonb_array_elements(t.meta->'attrs') "
+    'WITH ORDINALITY a(v, n) WHERE t.public;'
+    'CREATE OR REPLACE VIEW sys.all_plsql_coll_types AS SELECT k.owner, '
+    'upper(t.package) AS package_name, t.name AS type_name, '
+    "t.meta->>'coll_type' AS coll_type, (t.meta->>'upper_bound')::integer "
+    'AS upper_bound, NULL::text AS elem_type_mod, '
+    "CASE WHEN (t.meta->'elem'->>'named')::boolean THEN k.owner END "
+    "AS elem_type_owner, t.meta->'elem'->>'package' AS elem_type_package, "
+    "t.meta->'elem'->>'name' AS elem_type_name, "
+    "(t.meta->'elem'->>'length')::integer AS length, "
+    "(t.meta->'elem'->>'precision')::integer AS precision, "
+    "(t.meta->'elem'->>'scale')::integer AS scale, "
+    "t.meta->'elem'->>'charset' AS character_set_name, NULL::text AS elem_storage, "
+    "'YES' AS nulls_stored, coalesce(t.meta->'elem'->>'char_used', 'B') "
+    "AS char_used, t.meta->>'index_by' AS index_by "
+    'FROM sys.ora_plsql_types t JOIN sys.ora_packages k ON k.name = t.package '
+    "WHERE t.public AND t.meta ? 'coll_type';"
     'CREATE OR REPLACE VIEW sys.all_constraints AS SELECT ora_owner(tc.constraint_schema) '
     'AS owner, ora_name(tc.constraint_name) AS constraint_name, '
     "CASE tc.constraint_type WHEN 'PRIMARY KEY' THEN 'P' WHEN 'FOREIGN KEY' THEN 'R' "
@@ -1498,6 +1568,8 @@ _ORACLE_DICTIONARY_DDL = (
     "WHERE t.typtype = 'c' AND c.relkind = 'c' "
     f"AND t.typname <> '{_TSTZ_TYPE}' AND t.typname !~ '[$]ref$' "
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    # A package's types are its own, listed in all_plsql_types (#1607).
+    'AND n.nspname NOT IN (SELECT name FROM sys.ora_packages) '
     # A VARRAY or nested table, a domain over an array, is a COLLECTION with no
     # attributes of its own (#1206).
     'UNION ALL SELECT ora_owner(n.nspname), ora_name(d.typname), '
@@ -1505,7 +1577,8 @@ _ORACLE_DICTIONARY_DDL = (
     'FROM pg_type d JOIN pg_namespace n ON n.oid = d.typnamespace '
     "JOIN pg_type b ON b.oid = d.typbasetype AND b.typcategory = 'A' "
     "WHERE d.typtype = 'd' "
-    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    'AND n.nspname NOT IN (SELECT name FROM sys.ora_packages);'
     'CREATE OR REPLACE VIEW sys.user_types AS SELECT * FROM all_types '
     'WHERE owner=upper(current_schema());'
     'CREATE OR REPLACE VIEW sys.all_type_attrs AS SELECT '
@@ -1576,6 +1649,7 @@ _ORACLE_DICTIONARY_DDL = (
     "(quote_ident(a.udt_schema) || '.' || quote_ident(a.udt_name))::regclass "
     'AND p.attnum = a.ordinal_position '
     f"WHERE a.udt_name <> '{_TSTZ_TYPE}' AND a.udt_name !~ '[$]ref$' "
+    'AND a.udt_schema NOT IN (SELECT name FROM sys.ora_packages) '
     "AND a.udt_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
     'CREATE OR REPLACE VIEW sys.user_type_attrs AS SELECT * FROM all_type_attrs '
     'WHERE owner=upper(current_schema());'
@@ -1622,7 +1696,8 @@ _ORACLE_DICTIONARY_DDL = (
     "FROM '<=\\s*([0-9]+)')::int AS bound FROM pg_constraint c "
     'WHERE c.contypid = d.oid LIMIT 1) k ON true '
     "WHERE d.typtype = 'd' "
-    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    'AND n.nspname NOT IN (SELECT name FROM sys.ora_packages);'
     'CREATE OR REPLACE VIEW sys.user_coll_types AS SELECT * FROM all_coll_types '
     'WHERE owner=upper(current_schema());'
     # REFs (#1127): which tables are Oracle object tables, and of what type --
@@ -2616,6 +2691,8 @@ class _TdsCollection:
     varray: bool
     bound: int
     element: object
+    # A PL/SQL index-by table (#1607): kind 1, no bound.
+    index_table: bool = False
 
 
 _TDS_NULL_LEAF = _TdsLeaf(b'\x1a')
@@ -2680,7 +2757,8 @@ def _tds(shape) -> bytes:
     """The TDS of an object (_TdsObject) or a collection (_TdsCollection)."""
     if isinstance(shape, _TdsCollection):
         body = bytearray(b'\x1c' + (29).to_bytes(4, 'big'))
-        body += shape.bound.to_bytes(4, 'big') + bytes([3 if shape.varray else 2])
+        kind = 1 if shape.index_table else 3 if shape.varray else 2
+        body += shape.bound.to_bytes(4, 'big') + bytes([kind])
         body += b'\x2a'
         element = shape.element
         if isinstance(element, _TdsLeaf):
@@ -2689,7 +2767,10 @@ def _tds(shape) -> bytes:
             # The reference's block follows it directly, at 35.
             (ref, block) = _tds_reference(element, 18 + len(body) + 6)
             body += ref + block
-        return _tds_header(bytes(body), [18], collection=True, version=1)
+        # An index-by table of a record with a newer leaf is version 2, as 23ai
+        # sends one (#1607).
+        version = 2 if shape.index_table and _tds_is_newer(element) else 1
+        return _tds_header(bytes(body), [18], collection=True, version=version)
     body = bytearray()
     leaves: list[int] = []
     pending: list[tuple[int, object]] = []
@@ -2769,6 +2850,10 @@ _BUILTIN_TYPE_OID_BYTE = {
     'REAL': 0x0C,
     'DOUBLE PRECISION': 0x0D,
     'FLOAT': 0x0E,
+    # A package type's field or element, measured on 23ai (#1607).
+    'BOOLEAN': 0x2E,
+    'PL/SQL PLS INTEGER': 0x33,
+    'PL/SQL BINARY INTEGER': 0x32,
 }
 
 
@@ -5125,6 +5210,8 @@ _PARAM_IN_OUT = re.compile(r'\bIN\s+OUT\b', re.IGNORECASE)
 # PL/SQL's own integer types, which a routine's parameters and locals and a
 # block's locals use and no table column can (#1604).
 _PLSQL_INTEGER_TYPE = re.compile(r'\b(?:PLS|BINARY)_INTEGER\b', re.IGNORECASE)
+# A table's row type, `tab%ROWTYPE`: PostgreSQL's composite of the table (#1607).
+_ROWTYPE = re.compile(r'\b([A-Za-z_][\w$#.]*)%ROWTYPE\b', re.IGNORECASE)
 # A parameter's NOCOPY, a hint to Oracle to pass by reference (#1604).
 _NOCOPY = re.compile(r'\bNOCOPY\s+', re.IGNORECASE)
 # What may follow a routine body's closing END: its name, which PL/pgSQL would
@@ -5135,7 +5222,7 @@ _END_LABEL = re.compile(r'\s*(?:[A-Za-z_][\w$#]*)?\s*')
 def _translate_routine_types(text: str) -> str:
     for pattern, replacement in _DDL_TYPE_REWRITES:
         text = pattern.sub(replacement, text)
-    return _PLSQL_INTEGER_TYPE.sub('integer', text)
+    return _ROWTYPE.sub(r'\1', _PLSQL_INTEGER_TYPE.sub('integer', text))
 
 
 def _routine_body(body: str) -> str:
@@ -5216,11 +5303,17 @@ _PACKAGE_END = re.compile(r'\s*(?:[A-Za-z_][\w$#]*)?\s*;?\s*$')
 
 
 class _PackageMember(NamedTuple):
-    kind: str  # FUNCTION / PROCEDURE
+    kind: str  # FUNCTION / PROCEDURE, or TYPE / SUBTYPE
     name: str
     params: str | None
     returns: str | None
-    body: str | None  # None for a declaration
+    body: str | None  # a routine's body, None for its declaration; a type's definition
+
+
+# A package's TYPE or SUBTYPE declaration: its name, and what follows IS (#1607).
+_TYPE_DECLARATION = re.compile(
+    r'(?is)\s*(TYPE|SUBTYPE)\s+([A-Za-z_][\w$#]*)\s+IS\s+(.*?)\s*'
+)
 
 
 def _blank_plsql(text: str) -> str:
@@ -5253,10 +5346,11 @@ def _statement_end(blanked: str, pos: int) -> int | None:
 
 def _package_members(text: str, pos: int) -> list[_PackageMember] | None:
     """The routines a package spec declares or a body defines, from `pos` (past
-    AS|IS) to the package's END (#1605). The rest of a package -- its types,
-    variables, cursors, pragmas -- is passed over: a member that uses one fails
-    to compile, and the package with it. None for what this cannot read: an
-    initialization section, a member with local routines of its own."""
+    AS|IS) to the package's END (#1605), and the types it declares (#1607). The
+    rest of a package -- its variables, cursors, pragmas -- is passed over: a
+    member that uses one fails to compile, and the package with it. None for what
+    this cannot read: an initialization section, a member with local routines of
+    its own."""
     blanked = _blank_plsql(text)
     members: list[_PackageMember] = []
     while True:
@@ -5273,6 +5367,18 @@ def _package_members(text: str, pos: int) -> list[_PackageMember] | None:
             end = _statement_end(blanked, pos)
             if end is None:
                 return None
+            declared = _TYPE_DECLARATION.fullmatch(blanked, pos, end)
+            if declared is not None:
+                definition = text[declared.start(3) : declared.end(3)]
+                members.append(
+                    _PackageMember(
+                        declared.group(1).upper(),
+                        declared.group(2),
+                        None,
+                        None,
+                        definition,
+                    )
+                )
             pos = end + 1
             continue
         name = _PLSQL_WORD.match(
@@ -5319,6 +5425,410 @@ def _package_members(text: str, pos: int) -> list[_PackageMember] | None:
         pos = after.end()
 
 
+_RECORD_TYPE = re.compile(r'(?is)RECORD\s*\((.*)\)')
+_INDEX_BY_TYPE = re.compile(r'(?is)TABLE\s+OF\s+(.+?)\s+INDEX\s+BY\s+(.+)')
+_NESTED_TABLE_TYPE = re.compile(r'(?is)TABLE\s+OF\s+(.+?)(?:\s+NOT\s+NULL)?')
+_VARRAY_TYPE = re.compile(
+    r'(?is)(?:VARRAY|VARYING\s+ARRAY)\s*\(\s*(\d+)\s*\)\s+OF\s+(.+?)'
+    r'(?:\s+NOT\s+NULL)?'
+)
+_REF_CURSOR_TYPE = re.compile(r'(?is)REF\s+CURSOR\b.*')
+# An index-by table keyed by a string, not an integer.
+_STRING_KEY = re.compile(r'(?is)(?:N?VARCHAR2?|STRING|LONG)\b')
+# What may follow a declared type: a constraint, a default, a range.
+_DECLARED_EXTRAS = re.compile(r'(?is)\s+(?:NOT\s+NULL|RANGE|:=|DEFAULT)\b.*$')
+
+
+def _package_type(package: str, member: _PackageMember) -> str | None:
+    """A package's TYPE or SUBTYPE as a PostgreSQL type of its schema (#1607):
+
+    - a RECORD a composite of its fields;
+    - an index-by table a composite of two arrays, ``keys`` and ``vals``, the
+      keys integers or, for a table indexed by a string, text -- sparse keys,
+      ordered, the element's own type kept;
+    - a nested table or VARRAY a domain over an array, as a schema's is, with
+      its constructors;
+    - a REF CURSOR a domain over refcursor, a SUBTYPE a domain over its type.
+
+    Their parts name types as a routine's parameters do, ``tab%ROWTYPE`` the
+    table's composite; another of the package's types resolves in its schema.
+    None for a definition this does not read."""
+    name = f'{package}.{member.name}'
+    definition = member.body or ''
+    if member.kind == 'SUBTYPE':
+        base = _DECLARED_EXTRAS.sub('', definition)
+        return f'CREATE DOMAIN {name} AS {_translate_routine_types(base)}'
+    record = _RECORD_TYPE.fullmatch(definition)
+    if record is not None:
+        fields = []
+        for start, end in _top_level_items(record.group(1), 0, len(record.group(1))):
+            field = _DECLARED_EXTRAS.sub('', record.group(1)[start:end].strip())
+            field_name, _space, field_type = field.partition(' ')
+            if not field_type.strip():
+                return None
+            fields.append(
+                f'{field_name} {_translate_routine_types(field_type.strip())}'
+            )
+        return f'CREATE TYPE {name} AS ({", ".join(fields)})'
+    indexed = _INDEX_BY_TYPE.fullmatch(definition)
+    if indexed is not None:
+        element = _translate_routine_types(_DECLARED_EXTRAS.sub('', indexed.group(1)))
+        key = 'text' if _STRING_KEY.match(indexed.group(2).strip()) else 'integer'
+        return f'CREATE TYPE {name} AS (keys {key}[], vals {element}[]); ' + (
+            _index_table_methods(name, key, element)
+        )
+    varray = _VARRAY_TYPE.fullmatch(definition)
+    if varray is not None:
+        element = _translate_routine_types(varray.group(2))
+        return (
+            f'CREATE DOMAIN {name} AS {element}[] CHECK '
+            f'(VALUE IS NULL OR array_length(VALUE, 1) <= {varray.group(1)})'
+            + _collection_constructors(name, element)
+        )
+    nested = _NESTED_TABLE_TYPE.fullmatch(definition)
+    if nested is not None:
+        element = _translate_routine_types(nested.group(1))
+        return f'CREATE DOMAIN {name} AS {element}[]' + _collection_constructors(
+            name, element
+        )
+    if _REF_CURSOR_TYPE.fullmatch(definition):
+        return f'CREATE DOMAIN {name} AS refcursor'
+    return None
+
+
+# A built-in type as a package type's field or element names it: its name, an
+# optional (length | precision[, scale] [CHAR|BYTE]), and what follows.
+_PLSQL_BUILTIN = re.compile(
+    r'(?is)\s*(TIMESTAMP\s*(?:\(\s*\d+\s*\))?\s+WITH\s+LOCAL\s+TIME\s+ZONE'
+    r'|TIMESTAMP\s*(?:\(\s*\d+\s*\))?\s+WITH\s+TIME\s+ZONE|NUMBER|INTEGER|INT'
+    r'|SMALLINT|FLOAT|REAL|BINARY_FLOAT|BINARY_DOUBLE|N?VARCHAR2|VARCHAR|N?CHAR'
+    r'|DATE|TIMESTAMP|BOOLEAN|PLS_INTEGER|BINARY_INTEGER|N?CLOB|BLOB|RAW)\b'
+    r'\s*(?:\(\s*(\d+|\*)\s*(?:,\s*(-?\d+))?\s*(CHAR|BYTE)?\s*\))?\s*'
+)
+# The name 23ai's dictionary gives a built-in that is not its own spelling.
+_PLSQL_BUILTIN_NAMES = {
+    'PLS_INTEGER': 'PL/SQL PLS INTEGER',
+    'BINARY_INTEGER': 'PL/SQL BINARY INTEGER',
+    'VARCHAR': 'VARCHAR2',
+    'INT': 'INTEGER',
+}
+
+
+def _plsql_type_ref(text: str, package: str, siblings: dict[str, dict]) -> dict:
+    """What a package type's field or element names (#1607): a built-in -- its
+    dictionary name, length, precision, scale, character set -- or a named type,
+    another of the package's, a schema's, another package's (``pkg.t``) or a
+    table's row (``tab%ROWTYPE``). A SUBTYPE of the package stands for its base."""
+    text = _DECLARED_EXTRAS.sub('', text.strip())
+    builtin = _PLSQL_BUILTIN.fullmatch(text)
+    if builtin is not None:
+        word = re.sub(r'\s+', ' ', builtin.group(1).upper())
+        size = builtin.group(2)
+        number = int(size) if size and size != '*' else None
+        ref: dict = {'named': False, 'package': None}
+        if word.startswith('TIMESTAMP') and 'ZONE' in word:
+            ref['name'] = (
+                'TIMESTAMP WITH LOCAL TZ' if 'LOCAL' in word else 'TIMESTAMP WITH TZ'
+            )
+            precision = re.search(r'\((\d+)\)', word)
+            ref['scale'] = int(precision.group(1)) if precision else 6
+            return ref
+        ref['name'] = _PLSQL_BUILTIN_NAMES.get(word, word)
+        if word in ('VARCHAR2', 'VARCHAR', 'CHAR', 'NVARCHAR2', 'NCHAR', 'RAW'):
+            ref['length'] = number if number is not None else 1
+            if word != 'RAW':
+                national = word.startswith('N')
+                ref['charset'] = 'NCHAR_CS' if national else 'CHAR_CS'
+                ref['char_used'] = 'C' if national or builtin.group(4) else 'B'
+        elif word == 'TIMESTAMP':
+            ref['scale'] = number if number is not None else 6
+        elif word in ('NUMBER', 'FLOAT'):
+            ref['precision'] = number
+            if builtin.group(3) is not None:
+                ref['scale'] = int(builtin.group(3))
+        return ref
+    rowtype = re.fullmatch(r'(?i)([A-Za-z_][\w$#.]*)%ROWTYPE', text)
+    if rowtype is not None:
+        table = rowtype.group(1).rpartition('.')[2]
+        return {'named': True, 'package': None, 'name': f'{table.upper()}%ROWTYPE'}
+    (qualifier, _dot, name) = text.rpartition('.')
+    if not qualifier and name.upper() in siblings:
+        sibling = siblings[name.upper()]
+        if 'subtype' in sibling:
+            return sibling['subtype']
+        return {'named': True, 'package': package.upper(), 'name': name.upper()}
+    return {
+        'named': True,
+        'package': qualifier.upper() or None,
+        'name': name.upper(),
+    }
+
+
+def _plsql_ref_is_plsql(ref: dict) -> bool:
+    # Whether a field or element is PL/SQL's own: a record, a row, a PL/SQL
+    # integer -- what makes a type's CONTAINS_PLSQL YES, as 23ai reports it.
+    if not ref.get('named'):
+        return str(ref.get('name', '')).startswith('PL/SQL ')
+    return ref.get('package') is not None or str(ref['name']).endswith('%ROWTYPE')
+
+
+def _plsql_type_meta(
+    package: str, member: _PackageMember, siblings: dict[str, dict]
+) -> dict | None:
+    """A package type's declaration, read for the dictionary and a client's
+    type metadata (#1607): a record's fields, a collection's kind, bound, key
+    and element; a SUBTYPE what it stands for. None for a declaration that is
+    none of these."""
+    definition = _DECLARED_EXTRAS.sub('', member.body or '')
+    if member.kind == 'SUBTYPE':
+        return {'subtype': _plsql_type_ref(definition, package, siblings)}
+    record = _RECORD_TYPE.fullmatch(definition)
+    if record is not None:
+        fields: list[dict] = []
+        refs: list[dict] = []
+        for start, end in _top_level_items(record.group(1), 0, len(record.group(1))):
+            (name, _space, declared) = record.group(1)[start:end].strip().partition(' ')
+            ref = _plsql_type_ref(declared, package, siblings)
+            refs.append(ref)
+            fields.append({'name': name.upper(), 'type': ref})
+        plsql = any(_plsql_ref_is_plsql(r) or r.get('name') == 'BOOLEAN' for r in refs)
+        return {
+            'typecode': 'PL/SQL RECORD',
+            'attributes': len(fields),
+            'contains_plsql': 'YES' if plsql else 'NO',
+            'attrs': fields,
+        }
+    meta: dict = {'typecode': 'COLLECTION', 'attributes': 0, 'upper_bound': None}
+    indexed = _INDEX_BY_TYPE.fullmatch(definition)
+    varray = _VARRAY_TYPE.fullmatch(definition)
+    nested = _NESTED_TABLE_TYPE.fullmatch(definition)
+    if indexed is not None:
+        (element, key) = (indexed.group(1), indexed.group(2).strip())
+        key_word = _PLSQL_WORD.match(key)
+        meta.update(
+            coll_type='PL/SQL INDEX TABLE',
+            index_by=key_word.group().upper() if key_word else None,
+        )
+    elif varray is not None:
+        element = varray.group(2)
+        meta.update(coll_type='VARYING ARRAY', upper_bound=int(varray.group(1)))
+    elif nested is not None:
+        element = nested.group(1)
+        meta.update(coll_type='TABLE')
+    else:
+        return None
+    meta['elem'] = _plsql_type_ref(element, package, siblings)
+    meta['contains_plsql'] = 'YES' if _plsql_ref_is_plsql(meta['elem']) else 'NO'
+    return meta
+
+
+def _index_table_methods(name: str, key: str, element: str) -> str:
+    """The methods of an index-by table type (#1607), functions over its keys
+    and values, the keys kept sorted -- by number, or byte by byte for a string
+    key, as Oracle orders them -- so FIRST / NEXT walk them in order:
+
+    - ``$get(t, k)`` the element, ORA-01403 for a key not there;
+    - ``$set(t, k, v)`` the table with ``k`` set, NULL taken as empty;
+    - ``$count``, ``$first``, ``$last``, ``$next(t, k)``, ``$prior(t, k)``,
+      ``$exists(t, k)`` and ``$delete(t [, k])``.
+    """
+    order = ' COLLATE "C"' if key == 'text' else ''
+    # Each key with its element by subscript: a two-array unnest would spread a
+    # record element over columns of its own.
+    pairs = (
+        '(SELECT ($1).keys[sub] AS k, ($1).vals[sub] AS v '
+        'FROM generate_subscripts(($1).keys, 1) sub) u'
+    )
+    sql = 'LANGUAGE sql IMMUTABLE'
+    return '; '.join(
+        (
+            # A key's slot: by arithmetic where the keys are the dense run 1..N
+            # (or any run without a gap) a classic array or a loop builds,
+            # else by array_position -- either O(1) per element in PL/SQL's
+            # `for i in 1..a.count loop ... a(i)`, which a scan made quadratic.
+            f'CREATE FUNCTION {name}$get({name}, {key}) RETURNS {element} '
+            'LANGUAGE plpgsql IMMUTABLE AS $f$ DECLARE ks '
+            + key
+            + '[] := ($1).keys; n integer := coalesce(cardinality(ks), 0); '
+            'i integer; BEGIN '
+            + (
+                'IF n > 0 AND ks[n] - ks[1] = n - 1 THEN i := $2 - ks[1] + 1; ELSE '
+                if key == 'integer'
+                else ''
+            )
+            + 'i := array_position(ks, $2); '
+            + ('END IF; ' if key == 'integer' else '')
+            + 'IF i IS NULL OR i < 1 OR i > n OR ks[i] IS DISTINCT FROM $2 THEN '
+            "RAISE EXCEPTION USING ERRCODE = 'P0002', MESSAGE = 'no data found'; "
+            'END IF; RETURN ($1).vals[i]; END $f$',
+            # A set past the last key, or of a key there already, in place;
+            # only a key between two others rebuilds the table in order.
+            f'CREATE FUNCTION {name}$set({name}, {key}, {element}) RETURNS {name} '
+            'LANGUAGE plpgsql IMMUTABLE AS $f$ DECLARE ks '
+            + key
+            + '[] := coalesce(($1).keys, '
+            + "'{}'); vs "
+            + element
+            + "[] := coalesce(($1).vals, '{}'); n integer := cardinality(ks); "
+            'i integer; r ' + name + '; BEGIN '
+            f'IF n = 0 OR $2{order} > ks[n]{order} THEN '
+            'r.keys := ks || $2; r.vals := vs || $3; RETURN r; END IF; '
+            'i := array_position(ks, $2); '
+            'IF i IS NOT NULL THEN vs[i] := $3; r.keys := ks; r.vals := vs; '
+            'RETURN r; END IF; '
+            f'SELECT array_agg(x.k ORDER BY x.k{order}), '
+            f'array_agg(x.v ORDER BY x.k{order}) INTO r.keys, r.vals FROM '
+            f'(SELECT u.k, u.v FROM {pairs} UNION ALL SELECT $2, $3) x; '
+            'RETURN r; END $f$',
+            f'CREATE FUNCTION {name}$count({name}) RETURNS integer {sql} AS $f$ '
+            'SELECT coalesce(cardinality(($1).keys), 0) $f$',
+            f'CREATE FUNCTION {name}$first({name}) RETURNS {key} {sql} AS $f$ '
+            'SELECT ($1).keys[1] $f$',
+            f'CREATE FUNCTION {name}$last({name}) RETURNS {key} {sql} AS $f$ '
+            'SELECT ($1).keys[cardinality(($1).keys)] $f$',
+            f'CREATE FUNCTION {name}$next({name}, {key}) RETURNS {key} {sql} AS $f$ '
+            f'SELECT min(k{order}) FROM unnest(($1).keys) k WHERE k{order} > $2 $f$',
+            f'CREATE FUNCTION {name}$prior({name}, {key}) RETURNS {key} {sql} AS $f$ '
+            f'SELECT max(k{order}) FROM unnest(($1).keys) k WHERE k{order} < $2 $f$',
+            f'CREATE FUNCTION {name}$exists({name}, {key}) RETURNS boolean {sql} AS $f$ '
+            'SELECT coalesce($2 = ANY(($1).keys), false) $f$',
+            f'CREATE FUNCTION {name}$delete({name}) RETURNS {name} {sql} AS $f$ '
+            f"SELECT ROW('{{}}', '{{}}')::{name} $f$",
+            f'CREATE FUNCTION {name}$delete({name}, {key}) RETURNS {name} {sql} AS $f$ '
+            f'SELECT ROW(coalesce(array_agg(u.k ORDER BY u.k{order}), '
+            f"'{{}}'), coalesce(array_agg(u.v ORDER BY u.k{order}), '{{}}'))::{name} "
+            f'FROM {pairs} WHERE u.k <> $2 $f$',
+        )
+    )
+
+
+# A collection method a body calls on an index-by table (#1607).
+_COLLECTION_METHOD = re.compile(
+    r'\s*\.\s*(COUNT|FIRST|LAST|NEXT|PRIOR|EXISTS|DELETE)\b', re.IGNORECASE
+)
+# What a statement starts after: where an assignment `v(k) := x` can stand.
+_STATEMENT_START = re.compile(
+    r'(?is)(?:^|[;]|\b(?:BEGIN|THEN|ELSE|LOOP|DECLARE|IS|AS)\b)\s*$'
+)
+
+
+def _rewrite_index_tables(body: str, tables: dict[str, str]) -> str:
+    """A routine's body with its index-by tables' PL/SQL in PostgreSQL's
+    terms (#1607): ``v(k) := x`` an assignment of ``T$set(v, k, x)``, a read
+    ``v(k)`` ``T$get(v, k)``, ``v.COUNT`` ``T$count(v)``, ``v.DELETE`` an
+    assignment of ``T$delete(v)``, and so on -- T the variable's type, as
+    ``tables`` maps each name (lower case) to it."""
+    if not tables:
+        return body
+    (masked, contents) = _mask_quoted(body)
+    names = '|'.join(re.escape(n) for n in sorted(tables, key=len, reverse=True))
+    # Not a field of something else, `x.v`; `1..v.COUNT` is a range, not one.
+    use = re.compile(rf'(?<![\w$#])(?<![\w$#")]\.)({names})(?![\w$#])', re.IGNORECASE)
+
+    def rewrite(text: str) -> str:
+        out: list[str] = []
+        pos = 0
+        while (found := use.search(text, pos)) is not None:
+            name = found.group(1)
+            typ = tables[name.lower()]
+            after = found.end()
+            method = _COLLECTION_METHOD.match(text, after)
+            if method is not None:
+                kind = method.group(1).lower()
+                at = method.end()
+                args = ''
+                stripped = len(text) - len(text[at:].lstrip())
+                if text.startswith('(', stripped):
+                    close = _matching_paren(text, stripped)
+                    args = ', ' + rewrite(text[stripped + 1 : close])
+                    at = close + 1
+                call = f'{typ}${kind}({name}{args})'
+                if kind == 'delete':
+                    call = f'{name} := {call}'
+                out.append(text[pos : found.start()] + call)
+                pos = at
+                continue
+            stripped = len(text) - len(text[after:].lstrip())
+            if not text.startswith('(', stripped):
+                out.append(text[pos:after])
+                pos = after
+                continue
+            close = _matching_paren(text, stripped)
+            key = rewrite(text[stripped + 1 : close])
+            assign = re.compile(r'\s*:=').match(text, close + 1)
+            if assign is not None and _STATEMENT_START.search(text, 0, found.start()):
+                end = _statement_end(text, assign.end())
+                end = len(text) if end is None else end
+                value = rewrite(text[assign.end() : end]).strip()
+                out.append(
+                    text[pos : found.start()]
+                    + f'{name} := {typ}$set({name}, {key}, {value})'
+                )
+                pos = end
+                continue
+            out.append(text[pos : found.start()] + f'{typ}$get({name}, {key})')
+            pos = close + 1
+        out.append(text[pos:])
+        return ''.join(out)
+
+    return _unmask_quoted(rewrite(masked), contents)
+
+
+def _routine_index_tables(
+    package: str, member: _PackageMember, types: dict[str, str]
+) -> dict[str, str]:
+    # The parameters and locals of a member whose type is one of the package's
+    # index-by tables (#1607): name (lower case) -> the PostgreSQL type.
+    declared = (member.params or '').split(',')
+    body = member.body or ''
+    begin = next((s for w, s, _e in _words(body) if w == 'BEGIN'), None)
+    if begin is not None:
+        declared += body[:begin].split(';')
+    tables = {}
+    for declaration in declared:
+        words = _PLSQL_WORD.findall(declaration)
+        if len(words) < 2:
+            continue
+        typ = words[-1].lower()
+        if typ in types:
+            tables[words[0].lower()] = types[typ]
+    return tables
+
+
+def _package_types(package: str, members: list[_PackageMember], public: bool) -> str:
+    # The DDL of a spec's or a body's types, each dropped first -- a body's
+    # replace the last body's -- and each recorded with what it was declared as.
+    # That is recorded hex-encoded: the rewrites that follow would make its
+    # VARCHAR2 a varchar and its NVARCHAR2 one too, which the metadata tells apart.
+    created: list[str] = []
+    recorded: list[str] = []
+    siblings: dict[str, dict] = {}
+    for ord_, member in enumerate(m for m in members if m.kind in ('TYPE', 'SUBTYPE')):
+        ddl = _package_type(package, member)
+        if ddl is None:
+            continue
+        created.append(f'DROP TYPE IF EXISTS {package}.{member.name} CASCADE; {ddl}')
+        declaration = f'{member.kind} {member.body}'.encode().hex()
+        meta = _plsql_type_meta(package, member, siblings) or {}
+        siblings[member.name.upper()] = meta
+        encoded = json.dumps(meta).encode().hex()
+        recorded.append(
+            f"('{package}', '{member.name.upper()}', "
+            f"convert_from(decode('{declaration}', 'hex'), 'UTF8'), "
+            f'{"true" if public else "false"}, {ord_}, '
+            f"convert_from(decode('{encoded}', 'hex'), 'UTF8')::jsonb)"
+        )
+    forget = f"DELETE FROM sys.ora_plsql_types WHERE package = '{package}'" + (
+        '' if public else ' AND NOT public'
+    )
+    if not recorded:
+        return forget
+    return (
+        '; '.join(created) + f'; {forget}; INSERT INTO sys.ora_plsql_types '
+        '(package, name, declaration, public, ord, meta) VALUES ' + ', '.join(recorded)
+    )
+
+
 def _package_routine(package: str, member: _PackageMember, body: str) -> str:
     # One member as a routine in the package's schema: the routine translation,
     # without its drop by name -- a package's members may share a name.
@@ -5332,11 +5842,15 @@ def _package_routine(package: str, member: _PackageMember, body: str) -> str:
 
 
 def _drop_package_routines(package: str) -> str:
-    # Every routine in the package's schema, overloads and private ones too.
+    # Every routine in the package's schema, overloads and private ones too --
+    # but its types' own: an index-by table's methods, `t$get`, and a
+    # collection's constructors, named as the type is (#1607).
     return (
         'DO $p$ DECLARE r record; BEGIN FOR r IN SELECT p.oid::regprocedure AS '
         "sig, p.prokind FROM pg_proc p WHERE p.pronamespace = '"
-        f"{package}'::regnamespace LOOP EXECUTE format('DROP %s %s', CASE "
+        f"{package}'::regnamespace AND p.proname !~ '[$]' AND NOT EXISTS "
+        '(SELECT 1 FROM pg_type t WHERE t.typnamespace = p.pronamespace '
+        "AND t.typname = p.proname) LOOP EXECUTE format('DROP %s %s', CASE "
         "r.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, r.sig); "
         'END LOOP; END $p$'
     )
@@ -5362,7 +5876,9 @@ def _package_missing(package: str, code: int, message: str) -> str:
     )
 
 
-def _translate_package_ddl(sql: str) -> str:
+def _translate_package_ddl(
+    sql: str, spec_index_types: Callable[[str], dict[str, str]] | None = None
+) -> str:
     """A PL/SQL package's DDL as a schema of its name (#1605).
 
     The spec creates the schema -- replacing it drops the old one, body and all,
@@ -5374,6 +5890,10 @@ def _translate_package_ddl(sql: str) -> str:
     the stand-ins back. A schema of that name that is no package is refused,
     ORA-00955. A private member is a routine of the schema like the others, so
     callable from outside where Oracle's is not. Other SQL is unchanged.
+
+    ``spec_index_types`` gives, for a package, the index-by table types its
+    spec declared -- name -> PostgreSQL type -- which a body indexes but does
+    not declare itself (#1607).
     """
     dropped = _DROP_PACKAGE.match(sql)
     if dropped is not None:
@@ -5386,7 +5906,8 @@ def _translate_package_ddl(sql: str) -> str:
             return f'{missing}; {_restore_package_stubs(package, "NULL")}'
         return (
             f'{missing}; DROP SCHEMA {package} CASCADE; '
-            f"DELETE FROM sys.ora_packages WHERE name = '{package}'"
+            f"DELETE FROM sys.ora_packages WHERE name = '{package}'; "
+            f"DELETE FROM sys.ora_plsql_types WHERE package = '{package}'"
         )
     head = _PACKAGE_HEAD.match(sql)
     if head is None:
@@ -5400,17 +5921,34 @@ def _translate_package_ddl(sql: str) -> str:
             'an initialization section, or a member with routines of its own',
             ora_code=ORA_PLSQL_COMPILATION_ERROR,
         )
+    routine_kinds = ('FUNCTION', 'PROCEDURE')
+    # Each name the package's DDL gives resolves in the package first: set for
+    # the statement and taken with each routine, then gone with the transaction.
+    path = (
+        "SELECT set_config('search_path', "
+        f"'{package}, ' || current_setting('search_path'), true)"
+    )
     if body:
+        # The package's index-by table types, the spec's and the body's own:
+        # name -> the PostgreSQL type (#1607).
+        index_types = {
+            m.name.lower(): f'{package}.{m.name.lower()}'
+            for m in members
+            if m.kind == 'TYPE' and _INDEX_BY_TYPE.fullmatch(m.body or '')
+        }
+        if spec_index_types is not None:
+            index_types.update(spec_index_types(package))
         routines = [
-            _package_routine(package, m, m.body) for m in members if m.body is not None
+            _package_routine(
+                package,
+                m,
+                _rewrite_index_tables(
+                    m.body, _routine_index_tables(package, m, index_types)
+                ),
+            )
+            for m in members
+            if m.kind in routine_kinds and m.body is not None
         ]
-        # Each member resolves names as the creating session did, the package
-        # first: set for the CREATEs and taken with them, then gone with the
-        # transaction.
-        path = (
-            "SELECT set_config('search_path', "
-            f"'{package}, ' || current_setting('search_path'), true)"
-        )
         created = '; '.join(
             r.replace(
                 ' LANGUAGE plpgsql AS $$',
@@ -5422,6 +5960,7 @@ def _translate_package_ddl(sql: str) -> str:
         missing = _package_missing(package, 6550, f'package {name.upper()} has no spec')
         return (
             f'{missing}; {_drop_package_routines(package)}; {path}; '
+            f'{_package_types(package, members, public=False)}; '
             + (f'{created}; ' if created else '')
             + f"UPDATE sys.ora_packages SET body = 'VALID' WHERE name = '{package}'"
         )
@@ -5430,8 +5969,12 @@ def _translate_package_ddl(sql: str) -> str:
             package, m, f"BEGIN PERFORM sys.ora_package_unusable('{package}'); END;"
         )
         for m in members
-        if m.body is None
+        if m.kind in routine_kinds and m.body is None
     )
+    # The stand-ins are put back later, by a statement of their own: they carry
+    # the package's search path with them.
+    if stubs:
+        stubs = f'{path}; {stubs}'
     owner_name = (owner or '').upper()
     owner_sql = f"'{owner_name}'" if owner_name else 'sys.ora_owner(current_schema())'
     taken = (
@@ -5443,11 +5986,14 @@ def _translate_package_ddl(sql: str) -> str:
     )
     return (
         f'{taken}; DROP SCHEMA IF EXISTS {package} CASCADE; CREATE SCHEMA {package}; '
-        + (f'{stubs}; ' if stubs else '')
-        + 'INSERT INTO sys.ora_packages (name, owner, stubs, spec, body) VALUES '
+        # Recorded before the package's search path is set: its owner is the
+        # schema the session is in.
+        'INSERT INTO sys.ora_packages (name, owner, stubs, spec, body) VALUES '
         f"('{package}', {owner_sql}, $stubs${stubs}$stubs$, 'VALID', NULL) "
         'ON CONFLICT (name) DO UPDATE SET owner = EXCLUDED.owner, '
-        "stubs = EXCLUDED.stubs, spec = 'VALID', body = NULL"
+        "stubs = EXCLUDED.stubs, spec = 'VALID', body = NULL; "
+        f'{path}; {_package_types(package, members, public=True)}'
+        + (f'; {stubs}' if stubs else '')
     )
 
 
@@ -7183,6 +7729,14 @@ class PostgresBackend:
             "SELECT to_regclass('sys.ora_collection_elements') IS NOT NULL"
         ).fetchone()
         self._has_collection_elements = bool(row and row[0])
+        # A package's types (#1607): whether their catalog exists, and each
+        # PostgreSQL type's -- None for one that is no package's; any DDL starts
+        # it over.
+        row = self._conn.execute(
+            "SELECT to_regclass('sys.ora_plsql_types') IS NOT NULL"
+        ).fetchone()
+        self._has_package_catalog = bool(row and row[0])
+        self._plsql_types: dict[int, tuple[str, str, str, dict] | None] = {}
         self._column_type_cache: dict[tuple[int, int], tuple | None] = {}
         self._collection_name_cache: frozenset[str] | None = None
         # RAW targets (#1496): whether any column or attribute is a recorded
@@ -7570,7 +8124,9 @@ class PostgresBackend:
         # literal idioms. This is where dialect knowledge belongs, not in the
         # generic compat shim.
         sql = _ruled('reserved-name', _quote_reserved_names(sql), sql)
-        sql = _ruled('package-ddl', _translate_package_ddl(sql), sql)
+        sql = _ruled(
+            'package-ddl', _translate_package_ddl(sql, self._package_index_types), sql
+        )
         sql = _ruled('admin', _translate_admin(sql), sql)
         sql = _ruled('ddl', _translate_ddl(sql), sql)
         sql = _ruled('routine-ddl', _translate_routine_ddl(sql), sql)
@@ -7626,6 +8182,7 @@ class PostgresBackend:
             self._record_visibility(visibility)
             self._record_column_types(original)
             self._collection_name_cache = None  # a type may have come or gone
+            self._plsql_types.clear()
             self._forget_raw_targets()
         if with_rowid is not None:
             # The rows are the rowids of the rows touched, not a result set: a
@@ -8914,9 +9471,192 @@ class PostgresBackend:
             raise UnsupportedFeature(f'type shape: no type has the oid {pg_oid}')
         return row[0]
 
+    def _package_index_types(self, package: str) -> dict[str, str]:
+        # The index-by table types a package's spec declared (#1607): name
+        # (lower case) -> the PostgreSQL type, for its body's translation.
+        if not self._has_package_catalog:
+            return {}
+        return {
+            name.lower(): f'{package}.{name.lower()}'
+            for (name,) in self._conn.execute(
+                'SELECT name FROM sys.ora_plsql_types WHERE package = %s '
+                "AND meta->>'coll_type' = 'PL/SQL INDEX TABLE'",
+                (package,),
+            ).fetchall()
+        }
+
+    def _plsql_type(self, pg_oid: int) -> tuple[str, str, str, dict] | None:
+        """A package's type behind a PostgreSQL type (#1607): its owner,
+        package, name and what its declaration says; None for any other type."""
+        if pg_oid in self._plsql_types:
+            return self._plsql_types[pg_oid]
+        row = (
+            self._conn.execute(
+                'SELECT k.owner, upper(p.package), p.name, p.meta '
+                'FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace '
+                'JOIN sys.ora_plsql_types p ON p.package = n.nspname '
+                'AND lower(p.name) = t.typname '
+                'JOIN sys.ora_packages k ON k.name = p.package WHERE t.oid = %s',
+                (pg_oid,),
+            ).fetchone()
+            if self._has_package_catalog
+            else None
+        )
+        found = (row[0], row[1], row[2], row[3] or {}) if row is not None else None
+        self._plsql_types[pg_oid] = found
+        return found
+
+    def _plsql_named_oid(self, owner: str, ref: dict) -> int | None:
+        # The PostgreSQL type a package type's named field or element is: a
+        # package's type, a schema's, a table's row (#1607).
+        name = str(ref['name'])
+        if name.endswith('%ROWTYPE'):
+            row = self._conn.execute(
+                'SELECT t.oid FROM pg_type t JOIN pg_class c ON c.oid = t.typrelid '
+                "WHERE c.relkind = 'r' AND sys.ora_name(c.relname) = %s "
+                'ORDER BY c.relnamespace = to_regnamespace(current_schema()) DESC '
+                'LIMIT 1',
+                (name[: -len('%ROWTYPE')],),
+            ).fetchone()
+        elif ref.get('package'):
+            row = self._conn.execute(
+                'SELECT to_regtype(%s)::oid',
+                (f'{str(ref["package"]).lower()}.{name.lower()}',),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                'SELECT t.oid FROM pg_type t JOIN pg_namespace n '
+                'ON n.oid = t.typnamespace WHERE sys.ora_name(t.typname) = %s '
+                'AND sys.ora_owner(n.nspname) = %s LIMIT 1',
+                (name, owner),
+            ).fetchone()
+        return row[0] if row is not None and row[0] is not None else None
+
+    def _plsql_part_shape(self, owner: str, ref: dict):
+        # The TDS shape of a package type's field or element (#1607).
+        if ref.get('named'):
+            pg_oid = self._plsql_named_oid(owner, ref)
+            if pg_oid is None:
+                raise UnsupportedFeature(f'type shape: no type {ref["name"]}')
+            return self._type_shape(pg_oid)
+        name = str(ref['name'])
+        if name in ('BOOLEAN', 'PL/SQL PLS INTEGER', 'PL/SQL BINARY INTEGER'):
+            return _TdsLeaf(b'\x08')  # one code for all three, as 23ai sends them
+        if name in ('VARCHAR2', 'CHAR', 'NVARCHAR2', 'NCHAR'):
+            national = name.startswith('N')
+            length = int(ref.get('length') or 1)
+            code = 0x07 if 'VARCHAR' in name else 0x01
+            return _tds_chars(code, 2 * length if national else length, national)
+        if name == 'RAW':
+            return _TdsLeaf(b'\x13' + int(ref.get('length') or 1).to_bytes(2, 'big'))
+        if name in ('NUMBER', 'INTEGER', 'SMALLINT'):
+            if name != 'NUMBER':
+                return _tds_number(0, 0)
+            precision = ref.get('precision')
+            scale = ref.get('scale')
+            return _tds_number(
+                precision or 0, scale if scale is not None else 0 if precision else -127
+            )
+        if name in _FLOAT_ATTRIBUTE_TYPES:
+            return _TdsLeaf(bytes([0x05, int(ref.get('precision') or 0)]))
+        leaves = {
+            'DATE': _TdsLeaf(b'\x02'),
+            'CLOB': _TdsLeaf(b'\x1d'),
+            'NCLOB': _TdsLeaf(b'\x1d'),
+            'BLOB': _TdsLeaf(b'\x1e'),
+            'BINARY_FLOAT': _TdsLeaf(b'\x25', newer=True),
+            'BINARY_DOUBLE': _TdsLeaf(b'\x2d', newer=True),
+        }
+        if name in leaves:
+            return leaves[name]
+        fraction = ref.get('scale')
+        digits = int(fraction) if fraction is not None else 6
+        timestamp_code = {
+            'TIMESTAMP': 0x15,
+            'TIMESTAMP WITH TZ': 0x17,
+            'TIMESTAMP WITH LOCAL TZ': 0x21,
+        }.get(name)
+        if timestamp_code is None:
+            raise UnsupportedFeature(f'type shape: {name} has no TDS leaf')
+        return _tds_timestamp(timestamp_code, digits)
+
+    def _plsql_shape(self, owner: str, meta: dict):
+        # A package type's TDS shape (#1607): a record an object of its fields,
+        # a collection of its element, an index-by table kind 1.
+        if meta.get('typecode') == 'PL/SQL RECORD':
+            return _TdsObject(
+                tuple(self._plsql_part_shape(owner, f['type']) for f in meta['attrs'])
+            )
+        coll_type = meta.get('coll_type')
+        return _TdsCollection(
+            varray=coll_type == 'VARYING ARRAY',
+            bound=int(meta.get('upper_bound') or 0),
+            element=self._plsql_part_shape(owner, meta['elem']),
+            index_table=coll_type == 'PL/SQL INDEX TABLE',
+        )
+
+    def _plsql_attribute_rows(self, owner: str, meta: dict) -> list[tuple]:
+        # The attribute cursor GET_TYPE_SHAPE returns for a package type, as
+        # 23ai sends it (#1607): a record's fields, INSTANTIABLE YES; a
+        # collection's element alone, unnamed, INSTANTIABLE NULL.
+        def row(name, position, ref, instantiable) -> tuple:
+            if ref.get('named'):
+                pg_oid = self._plsql_named_oid(owner, ref)
+                toid = _object_type_oid(pg_oid) if pg_oid is not None else None
+                return (
+                    1, name, position, ref['name'], owner, ref.get('package'),
+                    toid, instantiable, None, None,
+                )  # fmt: skip
+            toid = bytes(15) + bytes([_BUILTIN_TYPE_OID_BYTE.get(ref['name'], 0)])
+            return (
+                1,
+                name,
+                position,
+                ref['name'],
+                None,
+                None,
+                toid,
+                instantiable,
+                None,
+                None,
+            )
+
+        if meta.get('typecode') == 'PL/SQL RECORD':
+            return [
+                row(f['name'], position, f['type'], 'YES')
+                for position, f in enumerate(meta['attrs'], 1)
+            ]
+        return [row(None, 1, meta['elem'], None)]
+
+    def _plsql_type_named(self, full_name: str) -> int | None:
+        # The PostgreSQL type of a package type a client names (#1607):
+        # "OWNER"."PACKAGE"."TYPE", or "PACKAGE"."TYPE" in the session's schema.
+        parts = [p.strip('"').upper() for p in full_name.split('.')]
+        if len(parts) == 3:
+            (owner, package, name) = parts
+        elif len(parts) == 2:
+            (package, name) = parts
+            owner = None
+        else:
+            return None
+        if not self._has_package_catalog:
+            return None
+        row = self._conn.execute(
+            'SELECT to_regtype(p.package || %s || lower(p.name))::oid '
+            'FROM sys.ora_plsql_types p JOIN sys.ora_packages k ON k.name = p.package '
+            'WHERE p.package = lower(%s) AND p.name = %s AND p.public '
+            "AND p.meta ? 'typecode' "
+            'AND k.owner = coalesce(%s, sys.ora_owner(current_schema()))',
+            ('.', package, name, owner),
+        ).fetchone()
+        return row[0] if row is not None else None
+
     def _type_shape(self, pg_oid: int, typmod: int = -1):
         """The TDS shape of a type (#1134): a _TdsObject of its attributes, a
         _TdsCollection of its element, or a scalar's leaf."""
+        plsql = self._plsql_type(pg_oid)
+        if plsql is not None:
+            return self._plsql_shape(plsql[0], plsql[3])
         kind = self._type_kind(pg_oid)
         if kind is None:
             if pg_oid == _XML_OID:
@@ -9117,9 +9857,43 @@ class PostgresBackend:
             'LEFT JOIN pg_class c ON c.oid = t.typrelid '
             'WHERE sys.ora_owner(n.nspname) = coalesce(%s, sys.ora_owner(current_schema())) '
             'AND sys.ora_name(coalesce(c.relname, t.typname)) = %s '
-            "AND coalesce(c.relkind = 'r', false) = %s LIMIT 1",
+            "AND coalesce(c.relkind = 'r', false) = %s "
+            # A package's schema is no owner: its types are the package's (#1607).
+            + (
+                'AND NOT EXISTS (SELECT 1 FROM sys.ora_packages k '
+                'WHERE k.name = n.nspname) '
+                if self._has_package_catalog
+                else ''
+            )
+            + 'LIMIT 1',
             (schema.strip('"') or None, name.strip('"'), row_type),
         ).fetchone()
+        # A package's type (#1607): "OWNER"."PACKAGE"."TYPE", or a two-part name
+        # no schema has a type by.
+        plsql_oid = (
+            self._plsql_type_named(full_name)
+            if not row_type and (found is None or full_name.count('.') == 2)
+            else None
+        )
+        if plsql_oid is not None:
+            plsql = self._plsql_type(plsql_oid)
+            if plsql is not None:
+                (owner, package, type_name, meta) = plsql
+                answer.update(
+                    ret_val=0,
+                    oid=_object_type_oid(plsql_oid),
+                    version=1,
+                    tds=_tds(self._plsql_shape(owner, meta)),
+                    schema=owner,
+                    package_name=package,
+                    name=type_name,
+                )
+                attrs_rc.rows.extend(self._plsql_attribute_rows(owner, meta))
+                return Result(
+                    out_binds=[
+                        answer.get(roles.get(n, n), values.get(n)) for n in names
+                    ]
+                )
         pg_oid = found[0] if found is not None else None
         kind = self._type_kind(pg_oid) if pg_oid is not None else None
         if pg_oid is not None and kind is not None:
@@ -9147,6 +9921,79 @@ class PostgresBackend:
             out_binds=[answer.get(roles.get(n, n), values.get(n)) for n in names]
         )
 
+    def _plsql_member(self, owner: str, name: str | None, ref: dict) -> dict:
+        # A package type's field or element as the image walkers lay it out
+        # (#1607): a built-in by its wire type, an NVARCHAR2 in AL16UTF16; a
+        # named type with its own DbObjectType.
+        type_name = str(ref['name'])
+        member: dict = {
+            'name': name or 'element',
+            'type_name': type_name,
+            'data_type': None if ref.get('named') else type_name_to_tns(type_name),
+            'charset': AL16UTF16_CHARSET if ref.get('charset') == 'NCHAR_CS' else None,
+        }
+        if ref.get('named'):
+            pg_oid = self._plsql_named_oid(owner, ref)
+            nested = (
+                self._nested_type(
+                    pg_oid, f'{owner}.{type_name}', member['name'], type_name
+                )
+                if pg_oid is not None
+                else None
+            )
+            if nested is None:
+                raise UnsupportedFeature(f'package type: no type {type_name}')
+            member['object_type'] = nested
+        return member
+
+    def _plsql_object_type(
+        self, pg_oid: int
+    ) -> tuple[DbObjectType, CompositeInfo] | None:
+        """A package's record or index-by table as the object or collection type
+        a client binds and reads (#1607), its fields and element as declared,
+        and the composite it is stored as -- an index-by table's ``(keys,
+        vals)`` -- registered with psycopg. None for any other type."""
+        plsql = self._plsql_type(pg_oid)
+        if plsql is None:
+            return None
+        (owner, package, name, meta) = plsql
+        oid = _object_type_oid(pg_oid)
+        if meta.get('typecode') == 'PL/SQL RECORD':
+            typ = DbObjectType(
+                owner,
+                name,
+                oid,
+                1,
+                [
+                    self._plsql_member(owner, f['name'], f['type'])
+                    for f in meta['attrs']
+                ],
+                package_name=package,
+            )
+        elif meta.get('coll_type') == 'PL/SQL INDEX TABLE':
+            typ = DbObjectType(
+                owner,
+                name,
+                oid,
+                1,
+                [],
+                is_collection=True,
+                collection_type=COLLECTION_PLSQL_INDEX_TABLE,
+                element=self._plsql_member(owner, None, meta['elem']),
+                max_elements=0,
+                package_name=package,
+            )
+        else:
+            return None
+        regtype = self._conn.execute(
+            'SELECT %s::oid::regtype::text', (pg_oid,)
+        ).fetchone()
+        info = CompositeInfo.fetch(self._conn, regtype[0]) if regtype else None
+        if info is None:
+            return None
+        register_composite(info, self._conn)
+        return (typ, info)
+
     def _object_type(self, pg_oid: int) -> tuple[DbObjectType, CompositeInfo] | None:
         """The Oracle object type a PostgreSQL composite oid stands for (#1127).
 
@@ -9159,6 +10006,11 @@ class PostgresBackend:
         """
         if pg_oid in self._object_types:
             return self._object_types[pg_oid]
+        # A package's record or index-by table (#1607).
+        plsql = self._plsql_object_type(pg_oid)
+        if plsql is not None:
+            self._object_types[pg_oid] = plsql
+            return plsql
         oid = _object_type_oid(pg_oid)
         # The catalogs rather than the sys views, though the answer is the same:
         # reading a view inside the session's open transaction holds a lock that
@@ -9308,6 +10160,13 @@ class PostgresBackend:
             value = loader(info.oid, self._conn).load(value.encode('utf-8'))
         if not isinstance(value, tuple):
             raise UnsupportedFeature(f'object type {typ.name}: not a composite value')
+        if typ.is_collection:
+            # A package's index-by table (#1607): its keys and its values, the
+            # values in key order, an element of a named type as its object.
+            (keys, vals) = value
+            element = typ.element or {}
+            vals = [self._nested_value(element, v) for v in (vals or [])]
+            return typ.newobject(vals, keys=list(keys or []))
         return typ.newobject(
             {
                 a['name']: _reconstruct_tstz(v)
@@ -9368,11 +10227,31 @@ class PostgresBackend:
                 f'object bind: no object type has the OID {oid.hex()}'
             )
         typ = entry[0]
+        if typ.is_collection:
+            # A package's index-by table (#1607): its elements under their keys.
+            (elements, keys) = decode_collection_keyed(
+                image.image, typ.element or {}, AL32UTF8_CHARSET
+            )
+            values = _served_lobs(typ.newobject(elements, keys=keys), image).aslist()
+            return self._index_table_value(
+                entry, values, keys if keys is not None else []
+            )
         value = _served_lobs(
             DbObject(typ.name, decode_object_image(image.image, typ.attrs), dbtype=typ),
             image,
         )
         return self._composite_value(entry, value.asdict())
+
+    def _index_table_value(
+        self, entry: tuple[DbObjectType, CompositeInfo], values: list, keys: list
+    ) -> object:
+        # A package's index-by table as the composite it is stored as (#1607):
+        # its keys and its values, an element of a named type as its composite.
+        (typ, info) = entry
+        factory = info.python_type
+        if factory is None:
+            raise UnsupportedFeature(f'collection type {typ.name}: not registered')
+        return factory(list(keys), self._collection_values(typ, values))
 
     def _collection_bind_value(
         self, typ: DbObjectType, image: ObjectImage
@@ -9445,6 +10324,13 @@ class PostgresBackend:
         nested = attr.get('object_type')
         if nested is None or not isinstance(value, DbObject):
             return value
+        if nested.collection_type == COLLECTION_PLSQL_INDEX_TABLE:
+            # A package's index-by table inside a record (#1607).
+            entry = self._object_type(_pg_oid_of(nested.oid) or 0)
+            if entry is not None:
+                return self._index_table_value(
+                    entry, value.aslist(), list(value._keys or [])
+                )
         if nested.is_collection:
             return self._collection_values(nested, value.aslist())
         entry = self._object_type(_pg_oid_of(nested.oid) or 0)
@@ -9860,7 +10746,55 @@ class PostgresBackend:
         # and the client keeps only the positions it bound as a Var (#483/#503).
         if _TYPE_SHAPE_BLOCK.search(sql):
             return self._execute_type_shape(sql, binds)
-        values = [b.value for b in binds]
+        # An object or collection bind arrives as the image the client packed:
+        # decoded against its type, as a statement's is (#1607). A collection
+        # goes as its array: a CALL takes the parameter's type from the routine.
+        given = [b.value if isinstance(b, BindVar) else b for b in binds]
+        values = [
+            v.value if isinstance(v, (BindVar, _CollectionBind)) else v
+            for v in self._resolve_object_binds(binds)
+        ]
+        result = self._execute_plsql_values(sql, binds, values)
+        # A bind that comes back as it went in goes back as the client sent it:
+        # an object's image as the object it is, not the composite it was
+        # decoded into -- every bind of a block goes back (#1607).
+        out: list = []
+        for at, value in enumerate(result.out_binds):
+            sent = given[at] if at < len(values) and value is values[at] else None
+            if isinstance(sent, ObjectImage):
+                out.append(self._image_object(sent))
+            elif at < len(values) and value is values[at]:
+                out.append(given[at])
+            else:
+                out.append(value)
+        return replace(result, out_binds=out)
+
+    def _image_object(self, image: ObjectImage) -> object:
+        # A bound object's or collection's image as its DbObject (#1607).
+        oid = image.type_oid or b''
+        if len(oid) >= 20:
+            oid = oid[4:20]
+        pg_oid = _pg_oid_of(oid)
+        coll = self._collection_type(pg_oid) if pg_oid is not None else None
+        if coll is not None:
+            return coll.newobject(
+                decode_collection_image(image.image, coll.element or {})
+            )
+        entry = self._object_type(pg_oid) if pg_oid is not None else None
+        if entry is None:
+            return None
+        typ = entry[0]
+        if typ.is_collection:
+            (elements, keys) = decode_collection_keyed(
+                image.image, typ.element or {}, AL32UTF8_CHARSET
+            )
+            return typ.newobject(elements, keys=keys)
+        return DbObject(
+            typ.name, decode_object_image(image.image, typ.attrs), dbtype=typ
+        )
+
+    def _execute_plsql_values(self, sql: str, binds: Sequence, values: list) -> Result:
+        # _execute_plsql's work, with the binds' values decoded.
         inner = _CALL_BLOCK.match(sql)
         statement = inner.group(1) if inner else ''
         try:
@@ -9869,7 +10803,7 @@ class PostgresBackend:
                 return self._call_function(func, values, sql)
             proc = _PROC_CALL.match(statement)
             if proc is not None:
-                return self._call_procedure(proc, values, sql)
+                return self._call_procedure(proc, values, sql, binds)
             # Not a call: a block that opens a REF CURSOR into a bind (#1456).
             if any(
                 isinstance(b, BindVar) and b.tns_type == TNS_TYPE_REFCURSOR
@@ -9914,18 +10848,74 @@ class PostgresBackend:
             ]
         slots = _bind_slots(block)
         arg_values = [values[_placeholder_slot(slots, ref)] for _name, ref in arguments]
+        arg_values = self._index_table_arguments(name, arg_values)
         cursor = self._conn.cursor()
         cursor.execute(
             f'SELECT {name}({_call_placeholders(arguments)})', tuple(arg_values) or None
         )
         row = _decode_row(cursor, cursor.fetchone(), self._tstz_oid)
         out = list(values)
-        out[_placeholder_slot(slots, _placeholder_key(ret_ref))] = (
-            row[0] if row else None
-        )
+        returned = row[0] if row else None
+        if cursor.description and returned is not None:
+            # A record or index-by table returned is the object a client reads
+            # (#1607).
+            returned = self._object_out(cursor.description[0].type_code, returned)
+        out[_placeholder_slot(slots, _placeholder_key(ret_ref))] = returned
         return Result(out_binds=out)
 
-    def _call_procedure(self, match: 're.Match', values: list, block: str) -> Result:
+    def _index_table_arguments(
+        self, name: str, values: list, types: Sequence[int] | None = None
+    ) -> list:
+        # A classic PL/SQL array bound to an index-by table parameter -- a list,
+        # as cursor.arrayvar binds one -- as the table's composite, keyed 1..N
+        # as Oracle keys it (#1607). The parameter's type is the routine's: the
+        # one routine of that name and arity, or one each overload agrees on.
+        if not any(isinstance(v, list) for v in values):
+            return values
+        if types is None:
+            schema, _dot, routine = name.lower().rpartition('.')
+            candidates = self._conn.execute(
+                'SELECT p.proargtypes::oid[] FROM pg_proc p JOIN pg_namespace n '
+                'ON n.oid = p.pronamespace WHERE p.proname = %s '
+                "AND (%s = '' OR n.nspname = %s) AND p.pronargs = %s",
+                (routine, schema, schema, len(values)),
+            ).fetchall()
+        else:
+            candidates = [(list(types),)]
+        out = list(values)
+        for at, value in enumerate(values):
+            if not isinstance(value, list):
+                continue
+            kinds = {row[0][at] for row in candidates if row[0] and at < len(row[0])}
+            if len(kinds) != 1:
+                continue
+            entry = self._object_type(next(iter(kinds)))
+            if entry is not None and entry[0].collection_type == (
+                COLLECTION_PLSQL_INDEX_TABLE
+            ):
+                out[at] = self._index_table_value(
+                    entry, value, list(range(1, len(value) + 1))
+                )
+        return out
+
+    def _object_out(self, type_oid: int, value: object, array: bool = False) -> object:
+        # An OUT or returned value of a record or index-by table type: the
+        # object a client reads -- or, for a classic array bind, the table's
+        # values in key order (#1607). Any other value as it is.
+        entry = (
+            self._object_type(type_oid)
+            if type_oid not in _BUILTIN_OIDS and type_oid != self._tstz_oid
+            else None
+        )
+        if entry is None or not isinstance(value, (tuple, str)):
+            return value
+        if array and entry[0].is_collection and isinstance(value, tuple):
+            return list(value[1] or [])
+        return self._db_object(entry[0], entry[1], value)
+
+    def _call_procedure(
+        self, match: 're.Match', values: list, block: str, binds: Sequence = ()
+    ) -> Result:
         # BEGIN name(:a, :b); END;  →  CALL name(a, b); the OUT / IN OUT arguments
         # come back as a result row, in parameter order, which we place onto their
         # bind positions.
@@ -9974,6 +10964,13 @@ class PostgresBackend:
             else values[_placeholder_slot(slots, ref)]
             for param, ref in bound.items()
         ]
+        arg_values = self._index_table_arguments(
+            name,
+            arg_values,
+            [argtypes[param] if param < len(argtypes) else 0 for param in bound]
+            if argtypes
+            else None,
+        )
         cursor = self._conn.cursor()
         if kind == 'f':
             # A routine PostgreSQL has as a function -- orafce's DBMS_OUTPUT, say
@@ -10025,6 +11022,16 @@ class PostgresBackend:
                 and argtypes[param] == self._intervalym_oid
             ):
                 value = _to_interval_ym(value)
+            elif param < len(argtypes) and value is not None:
+                # A record or index-by table OUT (#1607): an object, or for a
+                # classic array bind the table's values.
+                slot = _placeholder_slot(slots, ref)
+                bind = binds[slot] if slot < len(binds) else None
+                value = self._object_out(
+                    argtypes[param],
+                    value,
+                    array=isinstance(bind, BindVar) and bind.array_size > 0,
+                )
             out[_placeholder_slot(slots, ref)] = value
         return Result(out_binds=out)
 
@@ -10132,6 +11139,26 @@ class PostgresBackend:
         # pure OUT bind is None. So f received NULL whatever the caller passed,
         # and no error was raised (#1137).
         by_name = dict(zip(refs, values))
+        # A classic PL/SQL array passed to a routine's index-by table parameter
+        # -- python-oracledb's callfunc names its return :retval, so its call
+        # comes this way -- goes as the table's composite (#1607).
+        for _ref, expr in assignments:
+            call = _PROC_CALL.match(expr)
+            if call is None:
+                continue
+            items = [
+                call.group(2)[a:b].strip()
+                for a, b in _top_level_items(call.group(2), 0, len(call.group(2)))
+            ]
+            arg_refs = [i[1:].strip('"') for i in items if i.startswith(':')]
+            if len(arg_refs) != len(items) or not any(
+                isinstance(by_name.get(r), list) for r in arg_refs
+            ):
+                continue
+            converted = self._index_table_arguments(
+                call.group(1), [by_name.get(r) for r in arg_refs]
+            )
+            by_name.update(zip(arg_refs, converted))
         # A DATE or TIMESTAMP assigned to a TIMESTAMP WITH LOCAL TIME ZONE is read
         # in the session's zone, as Oracle converts it; the cast does that, and
         # leaves a value that is already an instant alone (#1240). The declared
@@ -10153,7 +11180,7 @@ class PostgresBackend:
         cursor.execute(sql, params)
         row = _decode_row(cursor, cursor.fetchone(), self._tstz_oid) or []
         out = list(values)
-        for (ref, _expr), result in zip(assignments, row):
+        for at, ((ref, _expr), result) in enumerate(zip(assignments, row)):
             if ref in refs:
                 # An INTERVAL YEAR TO MONTH comes out of the SELECT as a plain
                 # interval, which has no YEAR TO MONTH wire form; the bind's
@@ -10161,6 +11188,17 @@ class PostgresBackend:
                 # type does (#504, #1400).
                 if declared.get(ref) == TNS_TYPE_INTERVALYM and result is not None:
                     result = _to_interval_ym(result)
+                elif result is not None and cursor.description:
+                    # A record or index-by table returned is the object a client
+                    # reads, or a classic array's values (#1607).
+                    bind = (
+                        binds[refs.index(ref)] if refs.index(ref) < len(binds) else None
+                    )
+                    result = self._object_out(
+                        cursor.description[at].type_code,
+                        result,
+                        array=isinstance(bind, BindVar) and bind.array_size > 0,
+                    )
                 out[refs.index(ref)] = result
         return Result(out_binds=out)
 

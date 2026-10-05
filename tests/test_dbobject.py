@@ -1184,6 +1184,57 @@ _INDEX_TABLE_TYPE = DbObjectType(
 )
 
 
+class TestImageInt32Members(unittest.TestCase):
+    # In an object image a BOOLEAN, and a PL/SQL record's PLS_INTEGER /
+    # BINARY_INTEGER field, is a length 4 and a big-endian 32-bit integer -- not
+    # a NUMBER, and not the 0x0101 a BOOLEAN bind is -- as python-oracledb packs
+    # it; 23ai read these images back as bound (#1607).
+
+    def setUp(self):
+        from seerdb.common.tns_consts import TNS_TYPE_BOOLEAN, TNS_TYPE_INT
+
+        self.attrs = [
+            {'name': 'N', 'data_type': TNS_TYPE_NUMBER, 'charset': None},
+            {'name': 'B', 'data_type': TNS_TYPE_BOOLEAN, 'charset': None},
+            {'name': 'I', 'data_type': TNS_TYPE_INT, 'charset': None},
+        ]
+        self.typ = DbObjectType('PYO', 'R', bytes(16), 1, self.attrs, package_name='PK')
+
+    def test_the_dictionary_names_map_to_the_wire_types(self):
+        from seerdb.common.tns_consts import TNS_TYPE_BOOLEAN, TNS_TYPE_INT
+
+        self.assertEqual(type_name_to_tns('BOOLEAN'), TNS_TYPE_BOOLEAN)
+        self.assertEqual(type_name_to_tns('PL/SQL PLS INTEGER'), TNS_TYPE_INT)
+        self.assertEqual(type_name_to_tns('PL/SQL BINARY INTEGER'), TNS_TYPE_INT)
+
+    def test_a_record_packs_them_as_ub4(self):
+        image = encode_object_image(self.typ.newobject({'N': 25, 'B': True, 'I': -45}))
+        self.assertEqual(image.hex(), '8401fe0000001402c11a040000000104ffffffd3')
+        self.assertEqual(
+            decode_object_image(image, self.attrs), [('N', 25), ('B', True), ('I', -45)]
+        )
+
+    def test_a_null_member_is_the_null_indicator(self):
+        image = encode_object_image(self.typ.newobject({'N': None, 'B': None, 'I': 7}))
+        self.assertEqual(
+            decode_object_image(image, self.attrs), [('N', None), ('B', None), ('I', 7)]
+        )
+
+    def test_an_index_table_of_booleans(self):
+        from seerdb.common.tns_consts import TNS_TYPE_BOOLEAN
+
+        typ = DbObjectType(
+            'PYO', 'L', bytes(16), 1, [], is_collection=True,
+            collection_type=COLLECTION_PLSQL_INDEX_TABLE,
+            element={'name': 'element', 'data_type': TNS_TYPE_BOOLEAN, 'charset': None},
+        )  # fmt: skip
+        image = encode_object_image(typ.newobject([True, False, None], keys=[1, 5, 9]))
+        self.assertEqual(
+            decode_collection_keyed(image, typ.element),
+            ([True, False, None], [1, 5, 9]),
+        )
+
+
 class TestPlsqlIndexTableImage(unittest.TestCase):
     # A PL/SQL associative array (index table) sets the HAS_INDEXES flag (0x10)
     # in the collection body and prefixes each element with its int32 key; a SQL

@@ -5910,6 +5910,21 @@ on 23ai: `N'žába 猫'` stored correctly dumps as 12 bytes
 the bytes as they come, and seerdb read its own UTF-8 back as the right text, so
 only `LENGTH` / `DUMP` on the server or another client sees the corruption.
 
+Three members are **not** in their column form (#1607). A `BOOLEAN` attribute
+(23ai's SQL BOOLEAN, or a PL/SQL record's), and a PL/SQL record's `PLS_INTEGER`
+/ `BINARY_INTEGER` field, is **length 4 and a big-endian 32-bit integer**:
+`04 00 00 00 01` for TRUE, `04 ff ff ff d3` for -45. That is neither a NUMBER
+nor the `01 01` a BOOLEAN bind is. A NULL one is `0xFF` like any scalar.
+python-oracledb packs them this way (`_pack_value`, and `read_*` with
+`from_dbobject`). Their dictionary names say which they are:
+`ALL_PLSQL_TYPE_ATTRS` names the integers `PL/SQL PLS INTEGER` and
+`PL/SQL BINARY INTEGER`. Measured on 23ai with a record `(NUMBER, VARCHAR2,
+DATE, TIMESTAMP, BOOLEAN, PLS_INTEGER, BINARY_INTEGER)`: a record bound with
+`FALSE, 21, -5` in these three fields reads back in PL/SQL as `false, 21, -5`,
+and an OUT record filled with `TRUE, 45, 10` decodes as that. A PL/SQL index
+table of `BOOLEAN` keyed 1..4 with three TRUE elements counts 3 in a loop over
+it.
+
 ### 21.4 Attribute layout (data-dictionary)
 
 The ordered layout is fetched from `ALL_TYPE_ATTRS` (`attr_name`,

@@ -2638,6 +2638,355 @@ def test_get_type_shape_is_answered_from_the_catalog() -> None:
         admin.close()
 
 
+def test_a_package_types_declaration_is_read_for_its_metadata() -> None:
+    # A record's fields and a collection's element as 23ai's dictionary lists
+    # them (#1607): a built-in's name, length and character set -- an NVARCHAR2
+    # counted in characters -- a PL/SQL integer by its PL/SQL name, another of
+    # the package's types by package, a SUBTYPE by what it stands for.
+    from postgres_backend import _PackageMember, _plsql_type_meta
+
+    siblings: dict[str, dict] = {}
+
+    def read(kind: str, name: str, definition: str) -> dict | None:
+        meta = _plsql_type_meta(
+            'pk', _PackageMember(kind, name, None, None, definition), siblings
+        )
+        siblings[name.upper()] = meta or {}
+        return meta
+
+    record = read(
+        'TYPE',
+        'r',
+        'RECORD (n NUMBER, s VARCHAR2(30), d DATE, t TIMESTAMP, '
+        'b BOOLEAN, i PLS_INTEGER)',
+    )
+    assert record is not None
+    assert (record['typecode'], record['attributes'], record['contains_plsql']) == (
+        'PL/SQL RECORD',
+        6,
+        'YES',
+    )
+    assert [(f['name'], f['type']) for f in record['attrs']][:2] == [
+        ('N', {'named': False, 'package': None, 'name': 'NUMBER', 'precision': None}),
+        (
+            'S',
+            {
+                'named': False, 'package': None, 'name': 'VARCHAR2', 'length': 30,
+                'charset': 'CHAR_CS', 'char_used': 'B',
+            },
+        ),
+    ]  # fmt: skip
+    assert record['attrs'][5]['type']['name'] == 'PL/SQL PLS INTEGER'
+    unicode = read('TYPE', 'u', 'TABLE OF NVARCHAR2(100) INDEX BY BINARY_INTEGER')
+    assert unicode is not None
+    assert (unicode['coll_type'], unicode['index_by'], unicode['contains_plsql']) == (
+        'PL/SQL INDEX TABLE',
+        'BINARY_INTEGER',
+        'NO',
+    )
+    assert unicode['elem'] == {
+        'named': False, 'package': None, 'name': 'NVARCHAR2', 'length': 100,
+        'charset': 'NCHAR_CS', 'char_used': 'C',
+    }  # fmt: skip
+    records = read('TYPE', 'a', 'TABLE OF r INDEX BY BINARY_INTEGER')
+    assert records is not None
+    assert records['elem'] == {'named': True, 'package': 'PK', 'name': 'R'}
+    read('SUBTYPE', 'w', 'TestTempTable%ROWTYPE')
+    rows = read('TYPE', 'c', 'TABLE OF w INDEX BY BINARY_INTEGER')
+    assert rows is not None
+    assert rows['elem'] == {
+        'named': True,
+        'package': None,
+        'name': 'TESTTEMPTABLE%ROWTYPE',
+    }
+    assert rows['contains_plsql'] == 'YES'
+
+
+def test_a_package_types_metadata_is_oracles() -> None:
+    # A client's type lookup of a package's types answered as 23ai answers it
+    # (#1607): the TDS byte for byte -- an index-by table kind 1, an index-by
+    # table of a record with a timestamp version 2 -- the attribute cursor, the
+    # type's own package, and the ALL_PLSQL_* views' rows. The bytes and rows
+    # are 23ai's, for the same declarations in python-oracledb's test schema.
+    from seerdb.common.tns_consts import (
+        TNS_TYPE_NUMBER,
+        TNS_TYPE_RAW,
+        TNS_TYPE_REFCURSOR,
+        TNS_TYPE_VARCHAR,
+    )
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE pyo.pm1607 AS\n'
+            '  TYPE udt_Record IS RECORD (NumberValue NUMBER, StringValue VARCHAR2(30), '
+            'DateValue DATE, TimestampValue TIMESTAMP, BooleanValue BOOLEAN, '
+            'PlsIntegerValue PLS_INTEGER, BinaryIntegerValue BINARY_INTEGER);\n'
+            '  TYPE udt_RecordArray IS TABLE OF udt_Record INDEX BY BINARY_INTEGER;\n'
+            '  TYPE udt_UnicodeList IS TABLE OF NVARCHAR2(100) INDEX BY BINARY_INTEGER;\n'
+            '  TYPE udt_BooleanList IS TABLE OF BOOLEAN INDEX BY BINARY_INTEGER;\n'
+            '  TYPE udt_Inner IS RECORD (Attr1 NUMBER, Attr2 NUMBER);\n'
+            '  TYPE udt_Outer IS RECORD (Inner1 udt_Inner, Inner2 udt_Inner);\nEND;'
+        )
+
+        def shape(full_name: str) -> list:
+            binds = [
+                BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=4),
+                BindVar(value=full_name, tns_type=TNS_TYPE_VARCHAR, max_size=128),
+                BindVar(value=None, tns_type=TNS_TYPE_RAW, max_size=16),
+                BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=4),
+                BindVar(value=None, tns_type=TNS_TYPE_RAW, max_size=32767),
+                BindVar(value=None, tns_type=TNS_TYPE_REFCURSOR, max_size=1),
+                BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=128),
+            ]
+            return backend.execute(_TYPE_SHAPE_SQL, binds).out_binds
+
+        captured = {
+            'UDT_RECORD': '0000002c260200010007002900000000001506008107001e010000021506'
+            '0808082a0007000a00100011001300140015',
+            'UDT_RECORDARRAY': '00000081260200010001ff290000000000761c0000001d000000'
+            '00012a1b00000023fafd0000005b0000002c260200010007002900000000001506'
+            '008107001e0100000215060808082a0007000a0010001100130014001500000027'
+            '260100010008002900000000000e1a1a1a1a1a1a1a1a2a000700080009000a000b'
+            '000c000d000e0007',
+            'UDT_UNICODELIST': '00000021260100010001ff290000000000161c0000001d0000'
+            '0000012a0700c88200000007',
+            'UDT_BOOLEANLIST': '0000001c260100010001ff290000000000111c0000001d0000'
+            '0000012a080007',
+            'UDT_OUTER': '000000272601000100040029000000000016270600810600812827060'
+            '081060081282a0008000b00100013',
+        }
+        for name, tds in captured.items():
+            (ret_val, _f, oid, version, got, _attrs, package) = shape(
+                f'"PYO"."PM1607"."{name}"'
+            )
+            assert (ret_val, version, package, len(oid)) == (0, 1, 'PM1607', 16), name
+            assert got.hex() == tds, name
+        attrs = shape('"PYO"."PM1607"."UDT_RECORD"')[5].rows
+        assert [r[1:6] + r[7:] for r in attrs] == [
+            ('NUMBERVALUE', 1, 'NUMBER', None, None, 'YES', None, None),
+            ('STRINGVALUE', 2, 'VARCHAR2', None, None, 'YES', None, None),
+            ('DATEVALUE', 3, 'DATE', None, None, 'YES', None, None),
+            ('TIMESTAMPVALUE', 4, 'TIMESTAMP', None, None, 'YES', None, None),
+            ('BOOLEANVALUE', 5, 'BOOLEAN', None, None, 'YES', None, None),
+            ('PLSINTEGERVALUE', 6, 'PL/SQL PLS INTEGER', None, None, 'YES', None, None),
+            (
+                'BINARYINTEGERVALUE', 7, 'PL/SQL BINARY INTEGER', None, None, 'YES',
+                None, None,
+            ),
+        ]  # fmt: skip
+        assert [r[6][-1] for r in attrs] == [0x0F, 0x19, 0x08, 0x3D, 0x2E, 0x33, 0x32]
+        (element,) = shape('"PYO"."PM1607"."UDT_RECORDARRAY"')[5].rows
+        assert element[1:6] + element[7:] == (
+            None,
+            1,
+            'UDT_RECORD',
+            'PYO',
+            'PM1607',
+            None,
+            None,
+            None,
+        )
+        assert backend.execute(
+            'SELECT type_name, typecode, attributes, contains_plsql '
+            "FROM all_plsql_types WHERE package_name = 'PM1607' ORDER BY type_name"
+        ).rows == [
+            ('UDT_BOOLEANLIST', 'COLLECTION', 0, 'NO'),
+            ('UDT_INNER', 'PL/SQL RECORD', 2, 'NO'),
+            ('UDT_OUTER', 'PL/SQL RECORD', 2, 'YES'),
+            ('UDT_RECORD', 'PL/SQL RECORD', 7, 'YES'),
+            ('UDT_RECORDARRAY', 'COLLECTION', 0, 'YES'),
+            ('UDT_UNICODELIST', 'COLLECTION', 0, 'NO'),
+        ]
+        assert backend.execute(
+            'SELECT type_name, coll_type, elem_type_owner, elem_type_package, '
+            'elem_type_name, length, character_set_name, char_used, index_by '
+            "FROM all_plsql_coll_types WHERE package_name = 'PM1607' "
+            'ORDER BY type_name'
+        ).rows == [
+            ('UDT_BOOLEANLIST', 'PL/SQL INDEX TABLE', None, None, 'BOOLEAN', None,
+             None, 'B', 'BINARY_INTEGER'),
+            ('UDT_RECORDARRAY', 'PL/SQL INDEX TABLE', 'PYO', 'PM1607', 'UDT_RECORD',
+             None, None, 'B', 'BINARY_INTEGER'),
+            ('UDT_UNICODELIST', 'PL/SQL INDEX TABLE', None, None, 'NVARCHAR2', 100,
+             'NCHAR_CS', 'C', 'BINARY_INTEGER'),
+        ]  # fmt: skip
+        assert backend.execute(
+            'SELECT attr_name, attr_type_owner, attr_type_package, attr_type_name, '
+            'length, scale, character_set_name, attr_no '
+            "FROM all_plsql_type_attrs WHERE package_name = 'PM1607' "
+            "AND type_name IN ('UDT_RECORD', 'UDT_OUTER') ORDER BY type_name, attr_no"
+        ).rows[:4] == [
+            ('INNER1', 'PYO', 'PM1607', 'UDT_INNER', None, None, None, 1),
+            ('INNER2', 'PYO', 'PM1607', 'UDT_INNER', None, None, None, 2),
+            ('NUMBERVALUE', None, None, 'NUMBER', None, None, None, 1),
+            ('STRINGVALUE', None, None, 'VARCHAR2', 30, None, 'CHAR_CS', 2),
+        ]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP PACKAGE pm1607')
+        except Exception:
+            backend.rollback()
+
+
+def test_a_package_types_values_bind_and_come_back() -> None:
+    # Through the Mirror and a client (#1607): a record bound IN and filled as an
+    # OUT -- a BOOLEAN and a PLS_INTEGER field among its fields -- an index-by
+    # table bound and returned under its own sparse keys, and a classic array
+    # (cursor.arrayvar) through an IN OUT index-by table parameter.
+    listen, server, result = _start_mirror()
+    conn = _connect(listen.getsockname()[1])
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            'CREATE OR REPLACE PACKAGE pb1607 AS\n'
+            '  TYPE r IS RECORD (n NUMBER, s VARCHAR2(20), b BOOLEAN, i PLS_INTEGER);\n'
+            '  TYPE t IS TABLE OF VARCHAR2(20) INDEX BY BINARY_INTEGER;\n'
+            '  FUNCTION rep(a r) RETURN VARCHAR2;\n'
+            '  PROCEDURE make(n NUMBER, a OUT r);\n'
+            '  FUNCTION echo(a t) RETURN t;\n'
+            '  PROCEDURE pass(a IN OUT t);\nEND;'
+        )
+        cur.execute(
+            'CREATE OR REPLACE PACKAGE BODY pb1607 AS\n'
+            '  FUNCTION rep(a r) RETURN VARCHAR2 IS BEGIN\n'
+            "    RETURN a.n || ':' || a.s || ':' || CASE WHEN a.b THEN 'T' ELSE 'F' "
+            "END || ':' || a.i;\n  END;\n"
+            '  PROCEDURE make(n NUMBER, a OUT r) IS BEGIN\n'
+            "    a.n := n; a.s := 'made'; a.b := TRUE; a.i := -3;\n  END;\n"
+            '  FUNCTION echo(a t) RETURN t IS BEGIN RETURN a; END;\n'
+            '  PROCEDURE pass(a IN OUT t) IS BEGIN NULL; END;\nEND;'
+        )
+        record_type = conn.gettype('PB1607.R')
+        record = record_type.newobject()
+        record.N = 25
+        record.S = 'x'
+        record.B = True
+        record.I = -45
+        assert cur.callfunc('pb1607.rep', str, [record]) == '25:x:T:-45'
+        made = record_type.newobject()
+        cur.callproc('pb1607.make', [7, made])
+        assert (made.N, made.S, made.B, made.I) == (7, 'made', True, -3)
+        table_type = conn.gettype('PB1607.T')
+        table = table_type.newobject(['a', 'b', 'c'], keys=[-1048576, 2, 8388608])
+        echoed = cur.callfunc('pb1607.echo', table_type, [table])
+        assert echoed.aslist() == ['a', 'b', 'c']
+        assert (echoed.first(), echoed.next(2), echoed.last()) == (
+            -1048576,
+            8388608,
+            8388608,
+        )
+        array = cur.arrayvar(str, ['x', 'y'], 5)
+        cur.callproc('pb1607.pass', [array])
+        assert array.getvalue() == ['x', 'y']
+    finally:
+        try:
+            conn.cursor().execute('DROP PACKAGE pb1607')
+        except Exception:
+            pass
+        conn.close()
+        server.join(timeout=5)
+        listen.close()
+    assert result.get('error') is None, result.get('error')
+
+
+def test_a_body_indexes_its_index_by_tables() -> None:
+    # A routine's index-by tables, its parameters' and locals', in PostgreSQL's
+    # terms (#1607): an element set and read, the collection methods called,
+    # DELETE assigned; another's field `x.v` and a range bound `1..v.COUNT`
+    # read as what they are.
+    from postgres_backend import (
+        _PackageMember,
+        _rewrite_index_tables,
+        _routine_index_tables,
+    )
+
+    member = _PackageMember(
+        'PROCEDURE', 'p', 'a IN OUT NOCOPY t, n NUMBER', None,
+        ' l t; k PLS_INTEGER; BEGIN NULL; END',
+    )  # fmt: skip
+    tables = _routine_index_tables('pk', member, {'t': 'pk.t'})
+    assert tables == {'a': 'pk.t', 'l': 'pk.t'}
+    assert _rewrite_index_tables(
+        "BEGIN a(-1) := 'x'; FOR i IN 1..a.COUNT LOOP l(i) := a(i) || 'y'; END LOOP; "
+        'k := a.FIRST; WHILE k IS NOT NULL LOOP k := a.NEXT(k); END LOOP; '
+        'IF a.EXISTS(3) THEN a.DELETE(3); END IF; l.DELETE; r := x.a; END',
+        tables,
+    ) == (
+        "BEGIN a := pk.t$set(a, -1, 'x'); FOR i IN 1..pk.t$count(a) LOOP "
+        "l := pk.t$set(l, i, pk.t$get(a, i) || 'y'); END LOOP; "
+        'k := pk.t$first(a); WHILE k IS NOT NULL LOOP k := pk.t$next(a, k); END LOOP; '
+        'IF pk.t$exists(a, 3) THEN a := pk.t$delete(a, 3); END IF; '
+        'l := pk.t$delete(l); r := x.a; END'
+    )
+    # A string literal holding the name is no use of it.
+    assert _rewrite_index_tables("x := 'a(1)';", tables) == "x := 'a(1)';"
+
+
+def test_an_index_by_tables_methods_run_as_oracles() -> None:
+    # A package body walking index-by tables as python-oracledb's test schema
+    # does (#1607): sparse keys in key order, a table keyed by a string walked
+    # FIRST / NEXT in byte order, EXISTS, DELETE, COUNT, and ORA-01403 for a key
+    # that is not there. The answers are 23ai's.
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+    from seerdb.server import BackendError
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE pi1607 AS\n'
+            '  TYPE t IS TABLE OF NUMBER INDEX BY BINARY_INTEGER;\n'
+            '  TYPE p IS TABLE OF VARCHAR2(10) INDEX BY VARCHAR2(10);\n'
+            '  FUNCTION walk RETURN VARCHAR2;\n'
+            '  FUNCTION props RETURN VARCHAR2;\n'
+            '  FUNCTION missing RETURN NUMBER;\nEND;'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE BODY pi1607 AS\n'
+            '  FUNCTION walk RETURN VARCHAR2 IS\n'
+            '    a t;\n    k PLS_INTEGER;\n    s VARCHAR2(200);\n  BEGIN\n'
+            '    a(8388608) := 4; a(-1048576) := 1; a(284) := 3; a(-576) := 2;\n'
+            '    a(284) := a(284) * 10;\n'
+            '    k := a.FIRST;\n'
+            "    WHILE k IS NOT NULL LOOP s := s || k || '=' || a(k) || ' '; "
+            'k := a.NEXT(k); END LOOP;\n'
+            "    a.DELETE(-576);\n    s := s || a.COUNT || ' ' || a.LAST || ' ' || "
+            "CASE WHEN a.EXISTS(-576) THEN 'y' ELSE 'n' END;\n"
+            '    RETURN s;\n  END;\n'
+            '  FUNCTION props RETURN VARCHAR2 IS\n'
+            '    v p;\n    k VARCHAR2(10);\n    s VARCHAR2(200);\n  BEGIN\n'
+            "    v('b') := '2'; v('B') := '1'; v('a') := '3';\n"
+            '    k := v.FIRST;\n    WHILE k IS NOT NULL LOOP s := s || k || v(k); '
+            'k := v.NEXT(k); END LOOP;\n    RETURN s;\n  END;\n'
+            '  FUNCTION missing RETURN NUMBER IS a t; BEGIN a(1) := 1; RETURN a(2); END;\n'
+            'END;'
+        )
+        assert backend.execute(
+            "SELECT spec, body FROM sys.ora_packages WHERE name = 'pi1607'"
+        ).rows == [('VALID', 'VALID')]
+        (row,) = backend.execute('SELECT pi1607.walk() FROM dual').rows
+        assert row[0] == '-1048576=1 -576=2 284=30 8388608=4 3 8388608 n'
+        (row,) = backend.execute('SELECT pi1607.props() FROM dual').rows
+        assert row[0] == 'B1a3b2'
+        # Called from PL/SQL, as a client's callfunc does; from SQL, Oracle
+        # turns NO_DATA_FOUND into NULL instead.
+        with pytest.raises(BackendError) as exc:
+            backend.execute(
+                'BEGIN :1 := pi1607.missing(); END;',
+                [BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=22)],
+            )
+        assert exc.value.ora_code == 1403
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP PACKAGE pi1607')
+        except Exception:
+            backend.rollback()
+
+
 def test_get_type_shape_of_a_rowtype_with_a_date_column() -> None:
     # A table's DATE column is the ora_date domain (#1316). As a %ROWTYPE
     # attribute it had no Oracle type at all; its TDS leaf is the DATE code
@@ -2978,7 +3327,8 @@ def test_a_routine_with_locals_compiles_and_runs() -> None:
 def test_a_packages_members_are_read_from_its_spec_and_body() -> None:
     # The routines a spec declares or a body defines, overloads too; its types
     # and variables passed over, and a ; or an END inside a string or a comment
-    # read as nothing (#1605). An initialization section is not read.
+    # read as nothing (#1605); a type's declaration too (#1607). An
+    # initialization section is not read.
     from postgres_backend import _package_members
 
     spec = (
@@ -2988,6 +3338,7 @@ def test_a_packages_members_are_read_from_its_spec_and_body() -> None:
     )
     members = _package_members(spec, spec.index(' AS') + 3)
     assert [(m.kind, m.name, m.params, m.returns, m.body) for m in members] == [
+        ('TYPE', 't', None, None, 'TABLE OF NUMBER INDEX BY PLS_INTEGER'),
         ('FUNCTION', 'f', 'a NUMBER', 'NUMBER', None),
         ('FUNCTION', 'f', 'a VARCHAR2', 'VARCHAR2', None),
         ('PROCEDURE', 'p', None, None, None),
@@ -2999,7 +3350,7 @@ def test_a_packages_members_are_read_from_its_spec_and_body() -> None:
         '  PROCEDURE p IS BEGIN NULL; END;\nEND;'
     )
     members = _package_members(body, body.index(' IS') + 3)
-    assert [(m.name, m.body) for m in members] == [
+    assert [(m.name, m.body) for m in members if m.kind != 'TYPE'] == [
         (
             'f',
             '\n    t NUMBER;\n  BEGIN\n    t := CASE WHEN a > 0 THEN 1 END;\n'
@@ -3012,6 +3363,96 @@ def test_a_packages_members_are_read_from_its_spec_and_body() -> None:
         'CREATE PACKAGE BODY pk AS PROCEDURE p IS BEGIN NULL; END; BEGIN NULL; END;'
     )
     assert _package_members(initialized, initialized.index(' AS') + 3) is None
+
+
+def test_a_package_type_is_a_postgresql_type_of_its_schema() -> None:
+    # A record a composite; an index-by table a composite of its keys and its
+    # values, keyed by text when indexed by a string, with its methods (the
+    # index-by tables' own test runs them); a VARRAY or nested table a
+    # domain over an array with its constructors; a REF CURSOR and a SUBTYPE
+    # domains (#1607).
+    from postgres_backend import _package_type, _PackageMember
+
+    def declare(kind: str, name: str, definition: str) -> str | None:
+        return _package_type('pk', _PackageMember(kind, name, None, None, definition))
+
+    assert declare(
+        'TYPE',
+        'r',
+        'RECORD (n NUMBER NOT NULL := 0, s VARCHAR2(30), b BOOLEAN, '
+        'i PLS_INTEGER, d DATE)',
+    ) == (
+        'CREATE TYPE pk.r AS (n numeric, s varchar(30), b BOOLEAN, i integer, '
+        'd timestamp(0))'
+    )
+    indexed = declare('TYPE', 't', 'TABLE OF VARCHAR2(100) INDEX BY BINARY_INTEGER')
+    assert indexed is not None and indexed.startswith(
+        'CREATE TYPE pk.t AS (keys integer[], vals varchar(100)[]); '
+        'CREATE FUNCTION pk.t$get(pk.t, integer) RETURNS varchar(100) '
+    )
+    indexed = declare('TYPE', 'p', 'TABLE OF VARCHAR2(64) INDEX BY VARCHAR2(64)')
+    assert indexed is not None and indexed.startswith(
+        'CREATE TYPE pk.p AS (keys text[], vals varchar(64)[]); '
+        'CREATE FUNCTION pk.p$get(pk.p, text) RETURNS varchar(64) '
+    )
+    indexed = declare('TYPE', 'a', 'TABLE OF r INDEX BY PLS_INTEGER')
+    assert indexed is not None and indexed.startswith(
+        'CREATE TYPE pk.a AS (keys integer[], vals r[]); '
+        'CREATE FUNCTION pk.a$get(pk.a, integer) RETURNS r '
+    )
+    varray = declare('TYPE', 'v', 'VARRAY(3) OF NUMBER')
+    assert varray is not None and varray.startswith(
+        'CREATE DOMAIN pk.v AS numeric[] CHECK '
+        '(VALUE IS NULL OR array_length(VALUE, 1) <= 3); '
+        'CREATE OR REPLACE FUNCTION pk.v(VARIADIC numeric[])'
+    )
+    nested = declare('TYPE', 'n', 'TABLE OF NUMBER')
+    assert nested is not None and nested.startswith('CREATE DOMAIN pk.n AS numeric[]; ')
+    assert declare('TYPE', 'c', 'REF CURSOR') == 'CREATE DOMAIN pk.c AS refcursor'
+    assert declare('SUBTYPE', 'w', 'TestTempTable%ROWTYPE') == (
+        'CREATE DOMAIN pk.w AS TestTempTable'
+    )
+    assert declare('TYPE', 'x', 'OBJECT (a NUMBER)') is None
+
+
+def test_a_package_declares_types_its_routines_use() -> None:
+    # A spec whose routines use its types compiles, and a body builds and reads
+    # a record; each type is recorded as it was declared -- an NVARCHAR2
+    # element stays one (#1607).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE pt1607 AS\n'
+            '  TYPE r IS RECORD (n NUMBER, s VARCHAR2(30), b BOOLEAN);\n'
+            '  TYPE t IS TABLE OF NVARCHAR2(10) INDEX BY BINARY_INTEGER;\n'
+            '  FUNCTION f(a NUMBER) RETURN NUMBER;\n'
+            '  FUNCTION g(a t) RETURN NUMBER;\nEND;'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE BODY pt1607 AS\n'
+            '  FUNCTION f(a NUMBER) RETURN NUMBER IS\n    v r;\n  BEGIN\n'
+            "    v.n := a * 2;\n    v.s := 'x';\n    v.b := TRUE;\n"
+            '    RETURN v.n;\n  END;\n'
+            '  FUNCTION g(a t) RETURN NUMBER IS BEGIN RETURN 0; END;\nEND;'
+        )
+        assert backend.execute(
+            "SELECT spec, body FROM sys.ora_packages WHERE name = 'pt1607'"
+        ).rows == [('VALID', 'VALID')]
+        (row,) = backend.execute('SELECT pt1607.f(21) FROM dual').rows
+        assert row[0] == 42
+        assert backend.execute(
+            'SELECT name, declaration FROM sys.ora_plsql_types '
+            "WHERE package = 'pt1607' ORDER BY ord"
+        ).rows == [
+            ('R', 'TYPE RECORD (n NUMBER, s VARCHAR2(30), b BOOLEAN)'),
+            ('T', 'TYPE TABLE OF NVARCHAR2(10) INDEX BY BINARY_INTEGER'),
+        ]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP PACKAGE pt1607')
+        except Exception:
+            backend.rollback()
 
 
 def test_package_ddl_is_a_schema_of_its_routines() -> None:
@@ -3027,7 +3468,12 @@ def test_package_ddl_is_a_schema_of_its_routines() -> None:
         'CREATE OR REPLACE FUNCTION pk.f(a numeric) RETURNS numeric LANGUAGE '
         "plpgsql AS $$ BEGIN PERFORM sys.ora_package_unusable('pk'); END $$"
     ) in spec
-    assert "VALUES ('pk', 'PYO', $stubs$CREATE OR REPLACE FUNCTION pk.f(" in spec
+    # The stand-ins are kept with the package's search path, as they name its
+    # types (#1607).
+    assert (
+        "VALUES ('pk', 'PYO', $stubs$SELECT set_config('search_path', 'pk, ' || "
+        "current_setting('search_path'), true); CREATE OR REPLACE FUNCTION pk.f("
+    ) in spec
     body = _translate_package_ddl(
         'CREATE OR REPLACE PACKAGE BODY pyo.pk AS\n'
         '  FUNCTION f(a NUMBER) RETURN NUMBER IS BEGIN RETURN a; END f;\nEND pk;'
@@ -3035,13 +3481,15 @@ def test_package_ddl_is_a_schema_of_its_routines() -> None:
     assert (
         "SELECT set_config('search_path', 'pk, ' || "
         "current_setting('search_path'), true); "
+        "DELETE FROM sys.ora_plsql_types WHERE package = 'pk' AND NOT public; "
         'CREATE OR REPLACE FUNCTION pk.f(a numeric) RETURNS numeric LANGUAGE '
         'plpgsql SET search_path FROM CURRENT AS $$ BEGIN RETURN a; END $$; '
         "UPDATE sys.ora_packages SET body = 'VALID' WHERE name = 'pk'"
     ) in body
     assert 'DROP FUNCTION IF EXISTS' not in body  # members may share a name
     assert _translate_package_ddl('DROP PACKAGE pk').endswith(
-        "DROP SCHEMA pk CASCADE; DELETE FROM sys.ora_packages WHERE name = 'pk'"
+        "DROP SCHEMA pk CASCADE; DELETE FROM sys.ora_packages WHERE name = 'pk'; "
+        "DELETE FROM sys.ora_plsql_types WHERE package = 'pk'"
     )
     assert _translate_package_ddl('SELECT 1 FROM dual') == 'SELECT 1 FROM dual'
 
