@@ -3043,6 +3043,33 @@ def test_a_table_with_is_json_constraints_keeps_its_json() -> None:
             backend.rollback()
 
 
+def test_a_cursor_bound_in_resumes_where_the_client_stopped() -> None:
+    # A client's cursor bound IN as a REF CURSOR (#1609): its query opened as
+    # a portal past the rows the client already has, so a routine's FETCH
+    # reads the next one -- python-oracledb's test_1609 gets row 7 after its
+    # cursor prefetched 5 and 6, as from Oracle -- and the portal goes to a
+    # SYS_REFCURSOR parameter, not as text.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE OR REPLACE FUNCTION rc1609(c SYS_REFCURSOR) RETURN VARCHAR2 IS\n'
+            '  s VARCHAR2(20);\nBEGIN\n  FETCH c INTO s;\n  RETURN s;\nEND;'
+        )
+        query = "SELECT 'row ' || level FROM dual CONNECT BY level <= 5"
+        resumed = backend.open_ref_cursor(query, 2)
+        (row,) = backend.execute('SELECT rc1609(:1) FROM dual', [resumed]).rows
+        assert row[0] == 'row 3'
+        fresh = backend.open_ref_cursor(query)
+        (row,) = backend.execute('SELECT rc1609(:1) FROM dual', [fresh]).rows
+        assert row[0] == 'row 1'
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP FUNCTION rc1609')
+        except Exception:
+            backend.rollback()
+
+
 def test_get_type_shape_of_a_rowtype_with_a_date_column() -> None:
     # A table's DATE column is the ora_date domain (#1316). As a %ROWTYPE
     # attribute it had no Oracle type at all; its TDS leaf is the DATE code
