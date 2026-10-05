@@ -1924,6 +1924,19 @@ def _copy_quoted_region(sql: str, start: int, out: list[str]) -> int:
     return i  # unterminated region: copied to end of string
 
 
+class _PortalName(str):
+    """A REF CURSOR bound IN (#1609): the name of the portal the backend opened
+    for the client's cursor, sent as PostgreSQL's refcursor -- a routine's
+    SYS_REFCURSOR parameter -- not as text."""
+
+
+class _PortalNameDumper(psycopg.adapt.Dumper):
+    oid = 1790  # refcursor
+
+    def dump(self, obj: object) -> bytes:
+        return str(obj).encode('utf-8')
+
+
 @dataclass(frozen=True)
 class _CollectionBind:
     """A VARRAY / nested-table bind: the array its domain is over, and the
@@ -7554,6 +7567,9 @@ class PostgresBackend:
             self._use_pipeline = psycopg.pq.version() >= 140000
         except Exception:
             self._use_pipeline = False
+        self._conn.adapters.register_dumper(_PortalName, _PortalNameDumper)
+        # The portals opened for cursors bound IN, numbered (#1609).
+        self._portals_opened = 0
         # Lean on the `orafce` extension for Oracle-compatible SQL functions —
         # nvl, decode, to_char / to_date, add_months, instr, and much more —
         # rather than hand-rolling each rewrite. It installs those into the
@@ -7932,6 +7948,40 @@ class PostgresBackend:
             raise _session_terminated()
 
     @_while_connected
+    def open_ref_cursor(self, query: str, skip: int = 0) -> object:
+        """A cursor of the client's, bound IN as a REF CURSOR (#1609): its query
+        opened as a portal of this session, past the ``skip`` rows the client
+        has had already, and named as a SYS_REFCURSOR parameter takes it -- so
+        a routine's FETCH goes on where the client stopped, as in Oracle. The
+        portal lives as long as the transaction, or until the routine closes it.
+        """
+        translated = _translate_idioms(
+            _translate_plsql_block(
+                _translate_routine_ddl(
+                    _translate_ddl(_translate_admin(_quote_reserved_names(query)))
+                )
+            )
+        )
+        self._portals_opened += 1
+        name = f'ora_cursor_{self._portals_opened}'
+        try:
+            self._conn.execute(
+                sql.SQL('DECLARE {} CURSOR FOR ')
+                .format(sql.Identifier(name))
+                .as_string(self._conn)
+                + translated
+            )
+            if skip:
+                self._conn.execute(
+                    sql.SQL('MOVE FORWARD {} IN {}').format(
+                        sql.Literal(skip), sql.Identifier(name)
+                    )
+                )
+        except psycopg.Error as exc:
+            self._conn.rollback()
+            raise _backend_error(exc, original=query) from exc
+        return _PortalName(name)
+
     def parse(self, sql: str) -> None:
         """Validate a statement without running it -- ``cursor.parse()`` of
         anything that is not a query.
