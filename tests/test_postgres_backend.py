@@ -3070,6 +3070,50 @@ def test_a_cursor_bound_in_resumes_where_the_client_stopped() -> None:
             backend.rollback()
 
 
+def test_a_cursors_attributes_read_as_in_oracle() -> None:
+    # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
+    # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
+    # data. The answer is 23ai's.
+    from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
+    from seerdb.server.backend import BindVar
+
+    assert _translate_idioms("v := 'a%found'; w := SQL%ISOPEN;") == (
+        "v := 'a%found'; w := FALSE;"
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE ca1608t (n NUMBER)')
+        backend.execute('INSERT INTO ca1608t VALUES (1)')
+        backend.execute(
+            'CREATE OR REPLACE FUNCTION ca1608 RETURN VARCHAR2 IS\n'
+            '  c SYS_REFCURSOR;\n  v NUMBER;\n  s VARCHAR2(200);\nBEGIN\n'
+            '  OPEN c FOR SELECT level FROM dual CONNECT BY level <= 3;\n'
+            "  IF c%ISOPEN THEN s := 'open '; END IF;\n"
+            '  LOOP\n    FETCH c INTO v;\n    EXIT WHEN c%NOTFOUND;\n'
+            "    s := s || v || ' ';\n  END LOOP;\n"
+            "  IF NOT c%FOUND THEN s := s || 'done '; END IF;\n"
+            '  CLOSE c;\n'
+            "  IF NOT c%ISOPEN THEN s := s || 'closed '; END IF;\n"
+            '  UPDATE ca1608t SET n = n + 1 WHERE n = 1;\n'
+            "  IF SQL%FOUND THEN s := s || 'updated '; END IF;\n"
+            '  UPDATE ca1608t SET n = n + 1 WHERE n = 99;\n'
+            "  IF SQL%NOTFOUND THEN s := s || 'none'; END IF;\n"
+            '  RETURN s;\nEND;'
+        )
+        result = backend.execute(
+            'BEGIN :1 := ca1608(); END;',
+            [BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=200)],
+        )
+        assert result.out_binds[0] == 'open 1 2 3 done closed updated none'
+    finally:
+        backend.rollback()
+        for statement in ('DROP FUNCTION ca1608', 'DROP TABLE ca1608t'):
+            try:
+                backend.execute(statement)
+            except Exception:
+                backend.rollback()
+
+
 def test_get_type_shape_of_a_rowtype_with_a_date_column() -> None:
     # A table's DATE column is the ora_date domain (#1316). As a %ROWTYPE
     # attribute it had no Oracle type at all; its TDS leaf is the DATE code
