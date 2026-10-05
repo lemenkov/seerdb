@@ -95,10 +95,13 @@ edge of this adapter:
   domain. A client's type lookup of one, ``"OWNER"."PACKAGE"."TYPE"`` or
   ``PACKAGE.TYPE``, is answered as 23ai answers it, from the declaration as
   written, and ``all_plsql_types`` / ``all_plsql_type_attrs`` /
-  ``all_plsql_coll_types`` list a spec's types. Not yet: binds of a package
-  type, a body's indexing of an index-by table, package variables and an
-  initialization section; a private member is callable from outside, where
-  Oracle's is not;
+  ``all_plsql_coll_types`` list a spec's types. A record or an index-by table
+  binds and comes back as an object, an index-by table under its own keys; a
+  classic PL/SQL array (``cursor.arrayvar``) bound to an index-by table
+  parameter is keyed 1..N, and comes back as its values. Not yet: a record of a
+  table's row (``%ROWTYPE``) as a bind, a body's indexing of an index-by table,
+  package variables and an initialization section; a private member is
+  callable from outside, where Oracle's is not;
   and PL/pgSQL checks an identifier when the routine runs, not when it is
   created, so a body Oracle would refuse can compile and fail on its first call
   instead.
@@ -179,12 +182,14 @@ from psycopg.types.composite import CompositeInfo, register_composite
 from seerdb.common.datatypes import BcDate, IntervalYM
 from seerdb.common.dbobject import (
     COLLECTION_NESTED_TABLE,
+    COLLECTION_PLSQL_INDEX_TABLE,
     COLLECTION_VARRAY,
     DbObject,
     DbObjectType,
     DbRef,
     ObjectImage,
     decode_collection_image,
+    decode_collection_keyed,
     decode_object_image,
     map_object_lobs,
     type_name_to_tns,
@@ -200,6 +205,7 @@ from seerdb.common.sqltext import (
 from seerdb.common.tns import _AUTH_MAX_OPEN_CURSORS
 from seerdb.common.tns_consts import (
     AL16UTF16_CHARSET,
+    AL32UTF8_CHARSET,
     FIELD_VERSION_12_1,
     ORA_CANNOT_INSERT_NULL,
     ORA_CANNOT_KILL_CURRENT_SESSION,
@@ -1557,6 +1563,8 @@ _ORACLE_DICTIONARY_DDL = (
     "WHERE t.typtype = 'c' AND c.relkind = 'c' "
     f"AND t.typname <> '{_TSTZ_TYPE}' AND t.typname !~ '[$]ref$' "
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    # A package's types are its own, listed in all_plsql_types (#1607).
+    'AND n.nspname NOT IN (SELECT name FROM sys.ora_packages) '
     # A VARRAY or nested table, a domain over an array, is a COLLECTION with no
     # attributes of its own (#1206).
     'UNION ALL SELECT ora_owner(n.nspname), ora_name(d.typname), '
@@ -1564,7 +1572,8 @@ _ORACLE_DICTIONARY_DDL = (
     'FROM pg_type d JOIN pg_namespace n ON n.oid = d.typnamespace '
     "JOIN pg_type b ON b.oid = d.typbasetype AND b.typcategory = 'A' "
     "WHERE d.typtype = 'd' "
-    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    'AND n.nspname NOT IN (SELECT name FROM sys.ora_packages);'
     'CREATE OR REPLACE VIEW sys.user_types AS SELECT * FROM all_types '
     'WHERE owner=upper(current_schema());'
     'CREATE OR REPLACE VIEW sys.all_type_attrs AS SELECT '
@@ -1635,6 +1644,7 @@ _ORACLE_DICTIONARY_DDL = (
     "(quote_ident(a.udt_schema) || '.' || quote_ident(a.udt_name))::regclass "
     'AND p.attnum = a.ordinal_position '
     f"WHERE a.udt_name <> '{_TSTZ_TYPE}' AND a.udt_name !~ '[$]ref$' "
+    'AND a.udt_schema NOT IN (SELECT name FROM sys.ora_packages) '
     "AND a.udt_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
     'CREATE OR REPLACE VIEW sys.user_type_attrs AS SELECT * FROM all_type_attrs '
     'WHERE owner=upper(current_schema());'
@@ -1681,7 +1691,8 @@ _ORACLE_DICTIONARY_DDL = (
     "FROM '<=\\s*([0-9]+)')::int AS bound FROM pg_constraint c "
     'WHERE c.contypid = d.oid LIMIT 1) k ON true '
     "WHERE d.typtype = 'd' "
-    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    'AND n.nspname NOT IN (SELECT name FROM sys.ora_packages);'
     'CREATE OR REPLACE VIEW sys.user_coll_types AS SELECT * FROM all_coll_types '
     'WHERE owner=upper(current_schema());'
     # REFs (#1127): which tables are Oracle object tables, and of what type --
@@ -9689,6 +9700,79 @@ class PostgresBackend:
             out_binds=[answer.get(roles.get(n, n), values.get(n)) for n in names]
         )
 
+    def _plsql_member(self, owner: str, name: str | None, ref: dict) -> dict:
+        # A package type's field or element as the image walkers lay it out
+        # (#1607): a built-in by its wire type, an NVARCHAR2 in AL16UTF16; a
+        # named type with its own DbObjectType.
+        type_name = str(ref['name'])
+        member: dict = {
+            'name': name or 'element',
+            'type_name': type_name,
+            'data_type': None if ref.get('named') else type_name_to_tns(type_name),
+            'charset': AL16UTF16_CHARSET if ref.get('charset') == 'NCHAR_CS' else None,
+        }
+        if ref.get('named'):
+            pg_oid = self._plsql_named_oid(owner, ref)
+            nested = (
+                self._nested_type(
+                    pg_oid, f'{owner}.{type_name}', member['name'], type_name
+                )
+                if pg_oid is not None
+                else None
+            )
+            if nested is None:
+                raise UnsupportedFeature(f'package type: no type {type_name}')
+            member['object_type'] = nested
+        return member
+
+    def _plsql_object_type(
+        self, pg_oid: int
+    ) -> tuple[DbObjectType, CompositeInfo] | None:
+        """A package's record or index-by table as the object or collection type
+        a client binds and reads (#1607), its fields and element as declared,
+        and the composite it is stored as -- an index-by table's ``(keys,
+        vals)`` -- registered with psycopg. None for any other type."""
+        plsql = self._plsql_type(pg_oid)
+        if plsql is None:
+            return None
+        (owner, package, name, meta) = plsql
+        oid = _object_type_oid(pg_oid)
+        if meta.get('typecode') == 'PL/SQL RECORD':
+            typ = DbObjectType(
+                owner,
+                name,
+                oid,
+                1,
+                [
+                    self._plsql_member(owner, f['name'], f['type'])
+                    for f in meta['attrs']
+                ],
+                package_name=package,
+            )
+        elif meta.get('coll_type') == 'PL/SQL INDEX TABLE':
+            typ = DbObjectType(
+                owner,
+                name,
+                oid,
+                1,
+                [],
+                is_collection=True,
+                collection_type=COLLECTION_PLSQL_INDEX_TABLE,
+                element=self._plsql_member(owner, None, meta['elem']),
+                max_elements=0,
+                package_name=package,
+            )
+        else:
+            return None
+        regtype = self._conn.execute(
+            'SELECT %s::oid::regtype::text', (pg_oid,)
+        ).fetchone()
+        info = CompositeInfo.fetch(self._conn, regtype[0]) if regtype else None
+        if info is None:
+            return None
+        register_composite(info, self._conn)
+        return (typ, info)
+
     def _object_type(self, pg_oid: int) -> tuple[DbObjectType, CompositeInfo] | None:
         """The Oracle object type a PostgreSQL composite oid stands for (#1127).
 
@@ -9701,6 +9785,11 @@ class PostgresBackend:
         """
         if pg_oid in self._object_types:
             return self._object_types[pg_oid]
+        # A package's record or index-by table (#1607).
+        plsql = self._plsql_object_type(pg_oid)
+        if plsql is not None:
+            self._object_types[pg_oid] = plsql
+            return plsql
         oid = _object_type_oid(pg_oid)
         # The catalogs rather than the sys views, though the answer is the same:
         # reading a view inside the session's open transaction holds a lock that
@@ -9850,6 +9939,13 @@ class PostgresBackend:
             value = loader(info.oid, self._conn).load(value.encode('utf-8'))
         if not isinstance(value, tuple):
             raise UnsupportedFeature(f'object type {typ.name}: not a composite value')
+        if typ.is_collection:
+            # A package's index-by table (#1607): its keys and its values, the
+            # values in key order, an element of a named type as its object.
+            (keys, vals) = value
+            element = typ.element or {}
+            vals = [self._nested_value(element, v) for v in (vals or [])]
+            return typ.newobject(vals, keys=list(keys or []))
         return typ.newobject(
             {
                 a['name']: _reconstruct_tstz(v)
@@ -9910,11 +10006,31 @@ class PostgresBackend:
                 f'object bind: no object type has the OID {oid.hex()}'
             )
         typ = entry[0]
+        if typ.is_collection:
+            # A package's index-by table (#1607): its elements under their keys.
+            (elements, keys) = decode_collection_keyed(
+                image.image, typ.element or {}, AL32UTF8_CHARSET
+            )
+            values = _served_lobs(typ.newobject(elements, keys=keys), image).aslist()
+            return self._index_table_value(
+                entry, values, keys if keys is not None else []
+            )
         value = _served_lobs(
             DbObject(typ.name, decode_object_image(image.image, typ.attrs), dbtype=typ),
             image,
         )
         return self._composite_value(entry, value.asdict())
+
+    def _index_table_value(
+        self, entry: tuple[DbObjectType, CompositeInfo], values: list, keys: list
+    ) -> object:
+        # A package's index-by table as the composite it is stored as (#1607):
+        # its keys and its values, an element of a named type as its composite.
+        (typ, info) = entry
+        factory = info.python_type
+        if factory is None:
+            raise UnsupportedFeature(f'collection type {typ.name}: not registered')
+        return factory(list(keys), self._collection_values(typ, values))
 
     def _collection_bind_value(
         self, typ: DbObjectType, image: ObjectImage
@@ -9987,6 +10103,13 @@ class PostgresBackend:
         nested = attr.get('object_type')
         if nested is None or not isinstance(value, DbObject):
             return value
+        if nested.collection_type == COLLECTION_PLSQL_INDEX_TABLE:
+            # A package's index-by table inside a record (#1607).
+            entry = self._object_type(_pg_oid_of(nested.oid) or 0)
+            if entry is not None:
+                return self._index_table_value(
+                    entry, value.aslist(), list(value._keys or [])
+                )
         if nested.is_collection:
             return self._collection_values(nested, value.aslist())
         entry = self._object_type(_pg_oid_of(nested.oid) or 0)
@@ -10402,7 +10525,55 @@ class PostgresBackend:
         # and the client keeps only the positions it bound as a Var (#483/#503).
         if _TYPE_SHAPE_BLOCK.search(sql):
             return self._execute_type_shape(sql, binds)
-        values = [b.value for b in binds]
+        # An object or collection bind arrives as the image the client packed:
+        # decoded against its type, as a statement's is (#1607). A collection
+        # goes as its array: a CALL takes the parameter's type from the routine.
+        given = [b.value if isinstance(b, BindVar) else b for b in binds]
+        values = [
+            v.value if isinstance(v, (BindVar, _CollectionBind)) else v
+            for v in self._resolve_object_binds(binds)
+        ]
+        result = self._execute_plsql_values(sql, binds, values)
+        # A bind that comes back as it went in goes back as the client sent it:
+        # an object's image as the object it is, not the composite it was
+        # decoded into -- every bind of a block goes back (#1607).
+        out: list = []
+        for at, value in enumerate(result.out_binds):
+            sent = given[at] if at < len(values) and value is values[at] else None
+            if isinstance(sent, ObjectImage):
+                out.append(self._image_object(sent))
+            elif at < len(values) and value is values[at]:
+                out.append(given[at])
+            else:
+                out.append(value)
+        return replace(result, out_binds=out)
+
+    def _image_object(self, image: ObjectImage) -> object:
+        # A bound object's or collection's image as its DbObject (#1607).
+        oid = image.type_oid or b''
+        if len(oid) >= 20:
+            oid = oid[4:20]
+        pg_oid = _pg_oid_of(oid)
+        coll = self._collection_type(pg_oid) if pg_oid is not None else None
+        if coll is not None:
+            return coll.newobject(
+                decode_collection_image(image.image, coll.element or {})
+            )
+        entry = self._object_type(pg_oid) if pg_oid is not None else None
+        if entry is None:
+            return None
+        typ = entry[0]
+        if typ.is_collection:
+            (elements, keys) = decode_collection_keyed(
+                image.image, typ.element or {}, AL32UTF8_CHARSET
+            )
+            return typ.newobject(elements, keys=keys)
+        return DbObject(
+            typ.name, decode_object_image(image.image, typ.attrs), dbtype=typ
+        )
+
+    def _execute_plsql_values(self, sql: str, binds: Sequence, values: list) -> Result:
+        # _execute_plsql's work, with the binds' values decoded.
         inner = _CALL_BLOCK.match(sql)
         statement = inner.group(1) if inner else ''
         try:
@@ -10411,7 +10582,7 @@ class PostgresBackend:
                 return self._call_function(func, values, sql)
             proc = _PROC_CALL.match(statement)
             if proc is not None:
-                return self._call_procedure(proc, values, sql)
+                return self._call_procedure(proc, values, sql, binds)
             # Not a call: a block that opens a REF CURSOR into a bind (#1456).
             if any(
                 isinstance(b, BindVar) and b.tns_type == TNS_TYPE_REFCURSOR
@@ -10456,18 +10627,74 @@ class PostgresBackend:
             ]
         slots = _bind_slots(block)
         arg_values = [values[_placeholder_slot(slots, ref)] for _name, ref in arguments]
+        arg_values = self._index_table_arguments(name, arg_values)
         cursor = self._conn.cursor()
         cursor.execute(
             f'SELECT {name}({_call_placeholders(arguments)})', tuple(arg_values) or None
         )
         row = _decode_row(cursor, cursor.fetchone(), self._tstz_oid)
         out = list(values)
-        out[_placeholder_slot(slots, _placeholder_key(ret_ref))] = (
-            row[0] if row else None
-        )
+        returned = row[0] if row else None
+        if cursor.description and returned is not None:
+            # A record or index-by table returned is the object a client reads
+            # (#1607).
+            returned = self._object_out(cursor.description[0].type_code, returned)
+        out[_placeholder_slot(slots, _placeholder_key(ret_ref))] = returned
         return Result(out_binds=out)
 
-    def _call_procedure(self, match: 're.Match', values: list, block: str) -> Result:
+    def _index_table_arguments(
+        self, name: str, values: list, types: Sequence[int] | None = None
+    ) -> list:
+        # A classic PL/SQL array bound to an index-by table parameter -- a list,
+        # as cursor.arrayvar binds one -- as the table's composite, keyed 1..N
+        # as Oracle keys it (#1607). The parameter's type is the routine's: the
+        # one routine of that name and arity, or one each overload agrees on.
+        if not any(isinstance(v, list) for v in values):
+            return values
+        if types is None:
+            schema, _dot, routine = name.lower().rpartition('.')
+            candidates = self._conn.execute(
+                'SELECT p.proargtypes::oid[] FROM pg_proc p JOIN pg_namespace n '
+                'ON n.oid = p.pronamespace WHERE p.proname = %s '
+                "AND (%s = '' OR n.nspname = %s) AND p.pronargs = %s",
+                (routine, schema, schema, len(values)),
+            ).fetchall()
+        else:
+            candidates = [(list(types),)]
+        out = list(values)
+        for at, value in enumerate(values):
+            if not isinstance(value, list):
+                continue
+            kinds = {row[0][at] for row in candidates if row[0] and at < len(row[0])}
+            if len(kinds) != 1:
+                continue
+            entry = self._object_type(next(iter(kinds)))
+            if entry is not None and entry[0].collection_type == (
+                COLLECTION_PLSQL_INDEX_TABLE
+            ):
+                out[at] = self._index_table_value(
+                    entry, value, list(range(1, len(value) + 1))
+                )
+        return out
+
+    def _object_out(self, type_oid: int, value: object, array: bool = False) -> object:
+        # An OUT or returned value of a record or index-by table type: the
+        # object a client reads -- or, for a classic array bind, the table's
+        # values in key order (#1607). Any other value as it is.
+        entry = (
+            self._object_type(type_oid)
+            if type_oid not in _BUILTIN_OIDS and type_oid != self._tstz_oid
+            else None
+        )
+        if entry is None or not isinstance(value, (tuple, str)):
+            return value
+        if array and entry[0].is_collection and isinstance(value, tuple):
+            return list(value[1] or [])
+        return self._db_object(entry[0], entry[1], value)
+
+    def _call_procedure(
+        self, match: 're.Match', values: list, block: str, binds: Sequence = ()
+    ) -> Result:
         # BEGIN name(:a, :b); END;  →  CALL name(a, b); the OUT / IN OUT arguments
         # come back as a result row, in parameter order, which we place onto their
         # bind positions.
@@ -10516,6 +10743,13 @@ class PostgresBackend:
             else values[_placeholder_slot(slots, ref)]
             for param, ref in bound.items()
         ]
+        arg_values = self._index_table_arguments(
+            name,
+            arg_values,
+            [argtypes[param] if param < len(argtypes) else 0 for param in bound]
+            if argtypes
+            else None,
+        )
         cursor = self._conn.cursor()
         if kind == 'f':
             # A routine PostgreSQL has as a function -- orafce's DBMS_OUTPUT, say
@@ -10567,6 +10801,16 @@ class PostgresBackend:
                 and argtypes[param] == self._intervalym_oid
             ):
                 value = _to_interval_ym(value)
+            elif param < len(argtypes) and value is not None:
+                # A record or index-by table OUT (#1607): an object, or for a
+                # classic array bind the table's values.
+                slot = _placeholder_slot(slots, ref)
+                bind = binds[slot] if slot < len(binds) else None
+                value = self._object_out(
+                    argtypes[param],
+                    value,
+                    array=isinstance(bind, BindVar) and bind.array_size > 0,
+                )
             out[_placeholder_slot(slots, ref)] = value
         return Result(out_binds=out)
 
@@ -10674,6 +10918,26 @@ class PostgresBackend:
         # pure OUT bind is None. So f received NULL whatever the caller passed,
         # and no error was raised (#1137).
         by_name = dict(zip(refs, values))
+        # A classic PL/SQL array passed to a routine's index-by table parameter
+        # -- python-oracledb's callfunc names its return :retval, so its call
+        # comes this way -- goes as the table's composite (#1607).
+        for _ref, expr in assignments:
+            call = _PROC_CALL.match(expr)
+            if call is None:
+                continue
+            items = [
+                call.group(2)[a:b].strip()
+                for a, b in _top_level_items(call.group(2), 0, len(call.group(2)))
+            ]
+            arg_refs = [i[1:].strip('"') for i in items if i.startswith(':')]
+            if len(arg_refs) != len(items) or not any(
+                isinstance(by_name.get(r), list) for r in arg_refs
+            ):
+                continue
+            converted = self._index_table_arguments(
+                call.group(1), [by_name.get(r) for r in arg_refs]
+            )
+            by_name.update(zip(arg_refs, converted))
         # A DATE or TIMESTAMP assigned to a TIMESTAMP WITH LOCAL TIME ZONE is read
         # in the session's zone, as Oracle converts it; the cast does that, and
         # leaves a value that is already an instant alone (#1240). The declared
@@ -10695,7 +10959,7 @@ class PostgresBackend:
         cursor.execute(sql, params)
         row = _decode_row(cursor, cursor.fetchone(), self._tstz_oid) or []
         out = list(values)
-        for (ref, _expr), result in zip(assignments, row):
+        for at, ((ref, _expr), result) in enumerate(zip(assignments, row)):
             if ref in refs:
                 # An INTERVAL YEAR TO MONTH comes out of the SELECT as a plain
                 # interval, which has no YEAR TO MONTH wire form; the bind's
@@ -10703,6 +10967,17 @@ class PostgresBackend:
                 # type does (#504, #1400).
                 if declared.get(ref) == TNS_TYPE_INTERVALYM and result is not None:
                     result = _to_interval_ym(result)
+                elif result is not None and cursor.description:
+                    # A record or index-by table returned is the object a client
+                    # reads, or a classic array's values (#1607).
+                    bind = (
+                        binds[refs.index(ref)] if refs.index(ref) < len(binds) else None
+                    )
+                    result = self._object_out(
+                        cursor.description[at].type_code,
+                        result,
+                        array=isinstance(bind, BindVar) and bind.array_size > 0,
+                    )
                 out[refs.index(ref)] = result
         return Result(out_binds=out)
 

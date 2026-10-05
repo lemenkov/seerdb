@@ -2831,6 +2831,67 @@ def test_a_package_types_metadata_is_oracles() -> None:
             backend.rollback()
 
 
+def test_a_package_types_values_bind_and_come_back() -> None:
+    # Through the Mirror and a client (#1607): a record bound IN and filled as an
+    # OUT -- a BOOLEAN and a PLS_INTEGER field among its fields -- an index-by
+    # table bound and returned under its own sparse keys, and a classic array
+    # (cursor.arrayvar) through an IN OUT index-by table parameter.
+    listen, server, result = _start_mirror()
+    conn = _connect(listen.getsockname()[1])
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            'CREATE OR REPLACE PACKAGE pb1607 AS\n'
+            '  TYPE r IS RECORD (n NUMBER, s VARCHAR2(20), b BOOLEAN, i PLS_INTEGER);\n'
+            '  TYPE t IS TABLE OF VARCHAR2(20) INDEX BY BINARY_INTEGER;\n'
+            '  FUNCTION rep(a r) RETURN VARCHAR2;\n'
+            '  PROCEDURE make(n NUMBER, a OUT r);\n'
+            '  FUNCTION echo(a t) RETURN t;\n'
+            '  PROCEDURE pass(a IN OUT t);\nEND;'
+        )
+        cur.execute(
+            'CREATE OR REPLACE PACKAGE BODY pb1607 AS\n'
+            '  FUNCTION rep(a r) RETURN VARCHAR2 IS BEGIN\n'
+            "    RETURN a.n || ':' || a.s || ':' || CASE WHEN a.b THEN 'T' ELSE 'F' "
+            "END || ':' || a.i;\n  END;\n"
+            '  PROCEDURE make(n NUMBER, a OUT r) IS BEGIN\n'
+            "    a.n := n; a.s := 'made'; a.b := TRUE; a.i := -3;\n  END;\n"
+            '  FUNCTION echo(a t) RETURN t IS BEGIN RETURN a; END;\n'
+            '  PROCEDURE pass(a IN OUT t) IS BEGIN NULL; END;\nEND;'
+        )
+        record_type = conn.gettype('PB1607.R')
+        record = record_type.newobject()
+        record.N = 25
+        record.S = 'x'
+        record.B = True
+        record.I = -45
+        assert cur.callfunc('pb1607.rep', str, [record]) == '25:x:T:-45'
+        made = record_type.newobject()
+        cur.callproc('pb1607.make', [7, made])
+        assert (made.N, made.S, made.B, made.I) == (7, 'made', True, -3)
+        table_type = conn.gettype('PB1607.T')
+        table = table_type.newobject(['a', 'b', 'c'], keys=[-1048576, 2, 8388608])
+        echoed = cur.callfunc('pb1607.echo', table_type, [table])
+        assert echoed.aslist() == ['a', 'b', 'c']
+        assert (echoed.first(), echoed.next(2), echoed.last()) == (
+            -1048576,
+            8388608,
+            8388608,
+        )
+        array = cur.arrayvar(str, ['x', 'y'], 5)
+        cur.callproc('pb1607.pass', [array])
+        assert array.getvalue() == ['x', 'y']
+    finally:
+        try:
+            conn.cursor().execute('DROP PACKAGE pb1607')
+        except Exception:
+            pass
+        conn.close()
+        server.join(timeout=5)
+        listen.close()
+    assert result.get('error') is None, result.get('error')
+
+
 def test_get_type_shape_of_a_rowtype_with_a_date_column() -> None:
     # A table's DATE column is the ora_date domain (#1316). As a %ROWTYPE
     # attribute it had no Oracle type at all; its TDS leaf is the DATE code

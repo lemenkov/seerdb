@@ -14511,8 +14511,10 @@ def _encode_object_image(Obj: 'DbObject', *, header: bool) -> bytes:
 
 def _encode_object_member(Value: object, Attr: dict, *, in_collection: bool) -> bytes:
     from seerdb.common.dbobject import (
+        _IMAGE_INT32_TYPES,
         _OBJ_ATOMIC_NULL,
         DbObject,
+        encode_image_int32,
         encode_xmltype,
         is_xml_type,
     )
@@ -14538,6 +14540,11 @@ def _encode_object_member(Value: object, Attr: dict, *, in_collection: bool) -> 
             return _obj_write_length(len(Image)) + Image
         # An object attribute of an object: its attributes inline, no header.
         return _encode_object_image(cast(DbObject, Value), header=False)
+    if Attr.get('data_type') in _IMAGE_INT32_TYPES:
+        # A BOOLEAN or PL/SQL integer member is a ub4 in the image (#1607).
+        if Value is None:
+            return bytes([TNS_NULL_LENGTH_INDICATOR])
+        return encode_image_int32(cast(int, Value))
     return _encode_object_attr_field(
         cast(int, Attr.get('data_type')),
         Attr.get('charset') or AL32UTF8_CHARSET,

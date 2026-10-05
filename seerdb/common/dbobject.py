@@ -40,9 +40,11 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_BDOUBLE,
     TNS_TYPE_BFLOAT,
     TNS_TYPE_BLOB,
+    TNS_TYPE_BOOLEAN,
     TNS_TYPE_CHAR,
     TNS_TYPE_CLOB,
     TNS_TYPE_DATE,
+    TNS_TYPE_INT,
     TNS_TYPE_INTERVALDS,
     TNS_TYPE_INTERVALYM,
     TNS_TYPE_NUMBER,
@@ -123,7 +125,30 @@ _TYPE_NAME_TO_TNS = {
     'BINARY_DOUBLE': TNS_TYPE_BDOUBLE,
     'INTERVAL DAY TO SECOND': TNS_TYPE_INTERVALDS,
     'INTERVAL YEAR TO MONTH': TNS_TYPE_INTERVALYM,
+    # A BOOLEAN attribute (23ai) or a PL/SQL record's BOOLEAN / PLS_INTEGER /
+    # BINARY_INTEGER field (#1607): in an object image each is a ub4, not a
+    # NUMBER -- see _IMAGE_INT32_TYPES.
+    'BOOLEAN': TNS_TYPE_BOOLEAN,
+    'PL/SQL BOOLEAN': TNS_TYPE_BOOLEAN,
+    'PL/SQL PLS INTEGER': TNS_TYPE_INT,
+    'PL/SQL BINARY INTEGER': TNS_TYPE_INT,
 }
+
+# The members an object image carries as a big-endian 32-bit integer, length 4,
+# where they are no NUMBER (python-oracledb `_pack_value`): a BOOLEAN, 0 or 1,
+# and a PL/SQL integer, signed (#1607).
+_IMAGE_INT32_TYPES = frozenset({TNS_TYPE_BOOLEAN, TNS_TYPE_INT})
+
+
+def decode_image_int32(DataType: int | None, Raw: bytes) -> object:
+    """A BOOLEAN or PL/SQL integer member of an object image (#1607)."""
+    Value = int.from_bytes(Raw, 'big', signed=True)
+    return Value == 1 if DataType == TNS_TYPE_BOOLEAN else Value
+
+
+def encode_image_int32(Value: int) -> bytes:
+    """The length-prefixed form of a BOOLEAN or PL/SQL integer member (#1607)."""
+    return b'\x04' + int(Value).to_bytes(4, 'big', signed=True)
 
 
 def national_charset(character_set_name: str | None) -> int | None:
@@ -771,6 +796,8 @@ def _decode_member(
         return (None, Pos)
     Raw = bytes(Image[Pos : Pos + Length])
     Pos += Length
+    if Attr.get('data_type') in _IMAGE_INT32_TYPES:
+        return (decode_image_int32(Attr.get('data_type'), Raw), Pos)
     Col = {
         'data_type': Attr.get('data_type'),
         'charset': Attr.get('charset') or Charset,
