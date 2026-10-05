@@ -1295,7 +1295,9 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE OR REPLACE VIEW sys.all_users AS SELECT upper(nspname) AS username, '
     'oid::bigint AS user_id, NULL::timestamp AS created FROM pg_namespace '
     "WHERE nspname NOT LIKE 'pg\\_%' "
-    "AND nspname NOT IN ('information_schema','oracle','sys');"
+    "AND nspname NOT IN ('information_schema','oracle','sys') "
+    # A package's schema is the package's, not a user (#1605).
+    'AND nspname NOT IN (SELECT name FROM sys.ora_packages);'
     # all_tab_identity_cols: an identity column is a PostgreSQL identity column
     # (pg_attribute.attidentity 'a'=ALWAYS, 'd'=BY DEFAULT). The dialect JOINs this
     # on every get_columns once it believes the server is 12c, so it must exist or
@@ -1314,7 +1316,39 @@ _ORACLE_DICTIONARY_DDL = (
     "'N' AS generated, 'N' AS secondary "
     'FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace '
     "WHERE c.relkind IN ('r','v','m','i','S') "
-    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    # A package's spec and body, VALID or INVALID as they compiled (#1605).
+    'UNION ALL SELECT k.owner, upper(k.name), NULL::text, n.oid::bigint, '
+    "t.object_type, t.status, 'N', 'N', 'N' FROM sys.ora_packages k "
+    'JOIN pg_namespace n ON n.nspname = k.name CROSS JOIN LATERAL '
+    "(VALUES ('PACKAGE', k.spec), ('PACKAGE BODY', k.body)) t(object_type, status) "
+    'WHERE t.status IS NOT NULL;'
+    # orafce has a user_objects too, which lists every schema's objects under
+    # their PostgreSQL names; this one is the current schema's, Oracle's way.
+    'CREATE OR REPLACE VIEW sys.user_objects AS SELECT * FROM all_objects '
+    'WHERE owner=upper(current_schema());'
+    # A package and the routines its spec declares, overloads numbered in the
+    # order the spec gives them (#1605). A standalone routine is not listed yet.
+    'CREATE OR REPLACE VIEW sys.all_procedures AS SELECT k.owner, '
+    'upper(k.name) AS object_name, NULL::text AS procedure_name, '
+    'n.oid::bigint AS object_id, 0 AS subprogram_id, NULL::text AS overload, '
+    "'PACKAGE' AS object_type, 'NO' AS aggregate, 'NO' AS pipelined, "
+    "'NO' AS parallel, 'NO' AS interface, 'NO' AS deterministic, "
+    "'DEFINER' AS authid FROM sys.ora_packages k "
+    'JOIN pg_namespace n ON n.nspname = k.name '
+    'UNION ALL SELECT owner, object_name, procedure_name, object_id, '
+    '(row_number() OVER (PARTITION BY object_id ORDER BY declared, oid))::integer, '
+    'CASE WHEN count(*) OVER (PARTITION BY object_id, procedure_name) > 1 THEN '
+    '(row_number() OVER (PARTITION BY object_id, procedure_name '
+    'ORDER BY declared, oid))::text END, '
+    "'PACKAGE', 'NO', 'NO', 'NO', 'NO', 'NO', 'DEFINER' FROM ("
+    'SELECT k.owner, upper(k.name) AS object_name, upper(p.proname) AS '
+    'procedure_name, n.oid::bigint AS object_id, p.oid, '
+    "position(('.' || p.proname || '(') IN lower(k.stubs)) AS declared "
+    'FROM sys.ora_packages k JOIN pg_namespace n ON n.nspname = k.name '
+    'JOIN pg_proc p ON p.pronamespace = n.oid) m WHERE declared > 0;'
+    'CREATE OR REPLACE VIEW sys.user_procedures AS SELECT * FROM all_procedures '
+    'WHERE owner=upper(current_schema());'
     'CREATE OR REPLACE VIEW sys.all_constraints AS SELECT ora_owner(tc.constraint_schema) '
     'AS owner, ora_name(tc.constraint_name) AS constraint_name, '
     "CASE tc.constraint_type WHEN 'PRIMARY KEY' THEN 'P' WHEN 'FOREIGN KEY' THEN 'R' "

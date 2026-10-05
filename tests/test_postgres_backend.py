@@ -3046,6 +3046,55 @@ def test_package_ddl_is_a_schema_of_its_routines() -> None:
     assert _translate_package_ddl('SELECT 1 FROM dual') == 'SELECT 1 FROM dual'
 
 
+def test_the_dictionary_lists_a_package_and_its_members() -> None:
+    # USER_OBJECTS has a package's spec and body; USER_PROCEDURES the package
+    # and the routines its spec declares, overloads numbered, a private one not
+    # listed; a package's schema is no user. The rows are 23ai's (#1605).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE pd1605 AS\n'
+            '  FUNCTION f(a NUMBER) RETURN NUMBER;\n'
+            '  PROCEDURE p(a NUMBER, b OUT NUMBER);\n'
+            '  FUNCTION f(a VARCHAR2) RETURN VARCHAR2;\nEND;'
+        )
+        listed = (
+            'SELECT object_name, object_type, status FROM user_objects '
+            "WHERE object_name = 'PD1605' ORDER BY object_type"
+        )
+        assert backend.execute(listed).rows == [('PD1605', 'PACKAGE', 'VALID')]
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE BODY pd1605 AS\n'
+            '  FUNCTION helper(a NUMBER) RETURN NUMBER IS BEGIN RETURN a; END;\n'
+            '  FUNCTION f(a NUMBER) RETURN NUMBER IS BEGIN RETURN helper(a); END;\n'
+            '  PROCEDURE p(a NUMBER, b OUT NUMBER) IS BEGIN b := a; END;\n'
+            '  FUNCTION f(a VARCHAR2) RETURN VARCHAR2 IS BEGIN RETURN a; END;\nEND;'
+        )
+        assert backend.execute(listed).rows == [
+            ('PD1605', 'PACKAGE', 'VALID'),
+            ('PD1605', 'PACKAGE BODY', 'VALID'),
+        ]
+        assert backend.execute(
+            'SELECT object_name, procedure_name, overload, object_type '
+            "FROM user_procedures WHERE object_name = 'PD1605' "
+            'ORDER BY procedure_name, overload'
+        ).rows == [
+            ('PD1605', 'F', '1', 'PACKAGE'),
+            ('PD1605', 'F', '2', 'PACKAGE'),
+            ('PD1605', 'P', None, 'PACKAGE'),
+            ('PD1605', None, None, 'PACKAGE'),
+        ]
+        assert not backend.execute(
+            "SELECT 1 FROM all_users WHERE username = 'PD1605'"
+        ).rows
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP PACKAGE pd1605')
+        except Exception:
+            backend.rollback()
+
+
 def test_a_package_is_created_called_and_dropped_as_oracle_does() -> None:
     # Through the Mirror and a client: overloads and an OUT procedure called by
     # package.member, and every refusal measured on 23ai (#1605) -- a spec with
