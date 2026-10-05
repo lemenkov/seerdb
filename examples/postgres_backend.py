@@ -51,8 +51,11 @@ be represented faithfully behind an 11.2 Mirror on PostgreSQL. Where the 11.2 su
 has a version guard, the backend rejects the feature so the test *skips* exactly as
 it would on a server that lacks it — a SQL domain (23ai) is refused with ORA-00901,
 just as the JSON / VECTOR / BOOLEAN column types (21c/23ai) are refused with
-ORA-00902. The rest have no such guard and simply do not pass; they are the honest
-edge of this adapter:
+ORA-00902. 12.1's ``IS [NOT] JSON`` condition on a VARCHAR2 / CLOB / BLOB -- a
+CHECK constraint's, or a query's -- is no such type, and runs as PostgreSQL's,
+which tests as Oracle's STRICT does: ``{a:1}``, which Oracle's default LAX takes,
+it refuses. The rest have no such guard and simply do not pass; they are the
+honest edge of this adapter:
 
 - **``ROWNUM``, as a filter only** — a top-level ``WHERE … AND ROWNUM <= n``
   (``< n``, ``= n``; n a number or a bind) becomes ``LIMIT``, the top-N idiom over
@@ -431,6 +434,12 @@ _HELPER_FUNCTIONS_DDL = (
     "'INVALID' THEN format('ORA-04063: package body \"%s.%s\" has errors', "
     "p.owner, upper($1)) ELSE format('ORA-04067: not executed, package body "
     '"%s.%s" does not exist\', p.owner, upper($1)) END; END $$;'
+    # x IS JSON (#1614), for a value of a domain too: PostgreSQL's own condition
+    # takes text and bytea, and resolves no domain over either to it.
+    'CREATE OR REPLACE FUNCTION sys.ora_is_json(text) RETURNS boolean '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT $1 IS JSON $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_is_json(bytea) RETURNS boolean '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT $1 IS JSON $$;'
     # RAWTOHEX(x) → the hex text of a bytea. Oracle returns upper-case hex.
     'CREATE OR REPLACE FUNCTION rawtohex(bytea) RETURNS text '
     "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT upper(encode($1, 'hex')) $$;"
@@ -3593,6 +3602,21 @@ _IDIOM_REWRITES: list[
         re.compile(r'(?is)^(\s*DELETE(?:\s+/\*.*?\*/)?)\s+(?!FROM\b)(?=[\w"])'),
         r'\1 FROM ',
     ),
+    # x IS [NOT] JSON (#1614) as sys.ora_is_json(x): PostgreSQL 16's own takes
+    # text and bytea but not a CLOB's or BLOB's domain over them, and has no
+    # Oracle's FORMAT JSON or STRICT / LAX. The test is PostgreSQL's, Oracle's
+    # STRICT: Oracle's default, LAX, also takes an unquoted name or a
+    # single-quoted string ({a:1}, {'a':1}), which this refuses.
+    (
+        'is-json',
+        re.compile(
+            r'((?:"[^"]*"|[A-Za-z_][\w$#]*)(?:\s*\.\s*(?:"[^"]*"|[A-Za-z_][\w$#]*))*'
+            r'|\([^()]*\))\s+IS\s+(NOT\s+)?JSON\b(?:\s+FORMAT\s+JSON\b)?'
+            r'(?:\s+(?:STRICT|LAX)\b)?',
+            re.IGNORECASE,
+        ),
+        lambda m: f'{"NOT " if m.group(2) else ""}sys.ora_is_json({m.group(1)})',
+    ),
     # NVL is the exception: orafce offers four overloads — nvl(anyelement,
     # anyelement), nvl(bigint, integer), nvl(integer, integer) and nvl(numeric,
     # integer) — and a PostgreSQL literal starts out as `unknown`, so a call with
@@ -5145,6 +5169,11 @@ def _translate_idioms(sql: str) -> str:
 # backend can't faithfully represent (#504). This is the honest ceiling: a
 # PostgreSQL backend behind an 11.2 Mirror does not offer these types.
 _ORACLE_ONLY_DDL_TYPES = re.compile(r'\b(JSON|VECTOR|BOOLEAN)\b', re.IGNORECASE)
+# An IS [NOT] JSON condition -- a CHECK constraint's, which 12.1 has on a
+# VARCHAR2 / CLOB / BLOB column -- names no JSON column (#1614).
+_IS_JSON_PREDICATE = re.compile(
+    r'\bIS\s+(?:NOT\s+)?JSON\b(?:\s+FORMAT\s+JSON\b)?', re.IGNORECASE
+)
 
 
 # A SQL domain (CREATE DOMAIN) is 23ai — the 11.2 Mirror's server doesn't know the
@@ -5163,7 +5192,7 @@ def _reject_unsupported_ddl_types(sql: str) -> None:
         )
     if not _IS_CREATE_TABLE.match(sql):
         return
-    match = _ORACLE_ONLY_DDL_TYPES.search(sql)
+    match = _ORACLE_ONLY_DDL_TYPES.search(_IS_JSON_PREDICATE.sub(' ', sql))
     if match is not None:
         raise BackendError(
             f'invalid datatype: {match.group(1).upper()} is not available on '

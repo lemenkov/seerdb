@@ -2070,9 +2070,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
         assert f'FUNCTION {name}(' in _HELPER_FUNCTIONS_DDL
     # 47, ora_div (#1361) and power (#1362) for each of the nine pairs of
     # integer types, sys.ora_to_raw's two overloads (#1496), sys.ora_raw_fits
-    # (#1415), sys.ora_float_round (#1422), sys.ora_numeric_div (#1598) and
-    # sys.ora_package_unusable (#1605).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 71
+    # (#1415), sys.ora_float_round (#1422), sys.ora_numeric_div (#1598),
+    # sys.ora_package_unusable (#1605) and sys.ora_is_json's two (#1614).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 73
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
@@ -2983,6 +2983,62 @@ def test_an_index_by_tables_methods_run_as_oracles() -> None:
         backend.rollback()
         try:
             backend.execute('DROP PACKAGE pi1607')
+        except Exception:
+            backend.rollback()
+
+
+def test_an_is_json_condition_is_no_json_column() -> None:
+    # A CHECK (x IS JSON) on a VARCHAR2 / CLOB / BLOB column is 12.1's, not the
+    # JSON type a pre-21c server refuses (#1614); the condition is
+    # sys.ora_is_json, which takes a CLOB's or BLOB's domain, without Oracle's
+    # FORMAT JSON or STRICT / LAX. A JSON column is still refused.
+    from postgres_backend import _reject_unsupported_ddl_types
+
+    from seerdb.server import BackendError
+
+    _reject_unsupported_ddl_types(
+        'CREATE TABLE t (v VARCHAR2(10), CONSTRAINT c CHECK (v IS JSON FORMAT JSON))'
+    )
+    with pytest.raises(BackendError):
+        _reject_unsupported_ddl_types('CREATE TABLE t (j JSON)')
+    assert (
+        _translate_idioms(
+            "SELECT 1 FROM t WHERE t.v IS JSON STRICT AND ('x') IS NOT JSON LAX"
+        )
+        == "SELECT 1 FROM t WHERE sys.ora_is_json(t.v) AND NOT sys.ora_is_json(('x'))"
+    )
+
+
+def test_a_table_with_is_json_constraints_keeps_its_json() -> None:
+    # python-oracledb's TestJsonCols shape (#1614): JSON in a VARCHAR2, a CLOB
+    # and a BLOB, each checked IS JSON; text that is none is ORA-02290, a NULL
+    # passes, and IS JSON reads in a query. As 23ai answers.
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE TABLE jc1614 (id NUMBER, v VARCHAR2(100), c CLOB, b BLOB, '
+            'CONSTRAINT jc1614_v CHECK (v IS JSON FORMAT JSON), '
+            'CONSTRAINT jc1614_c CHECK (c IS JSON), '
+            'CONSTRAINT jc1614_b CHECK (b IS JSON FORMAT JSON))'
+        )
+        backend.execute(
+            "INSERT INTO jc1614 VALUES (1, '[1, 2]', '{\"a\": 1}', :1)", [b'[3]']
+        )
+        backend.execute('INSERT INTO jc1614 VALUES (2, NULL, NULL, NULL)')
+        for column in ('v', 'c'):
+            with pytest.raises(BackendError) as exc:
+                backend.execute(f"INSERT INTO jc1614 (id, {column}) VALUES (3, 'nope')")
+            assert exc.value.ora_code == 2290
+        assert backend.execute(
+            'SELECT id FROM jc1614 WHERE v IS JSON ORDER BY id'
+        ).rows == [(1,)]
+        assert backend.execute('SELECT id FROM jc1614 WHERE c IS NOT JSON').rows == []
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE jc1614')
         except Exception:
             backend.rollback()
 
