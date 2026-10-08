@@ -3699,6 +3699,73 @@ def test_a_package_function_is_called_without_parentheses() -> None:
                 backend.rollback()
 
 
+def test_a_type_is_visible_to_its_owner_and_its_grantees() -> None:
+    # A user sees another user's type only once granted EXECUTE on it (#1621):
+    # in ALL_TYPES, the OCI describe and gettype()'s GET_TYPE_SHAPE, which
+    # answers 1001 (not found) for one it may not use -- python-oracledb's
+    # test_2341 then raises DPY-2035. REVOKE takes it away again.
+    from seerdb.common.tns_consts import (
+        TNS_TYPE_NUMBER,
+        TNS_TYPE_RAW,
+        TNS_TYPE_REFCURSOR,
+        TNS_TYPE_VARCHAR,
+    )
+    from seerdb.server.backend import BindVar
+
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    for schema in ('own1621', 'oth1621'):
+        admin.execute(f'DROP SCHEMA IF EXISTS {schema} CASCADE')
+        admin.execute(f'CREATE SCHEMA {schema}')
+    owner = PostgresBackend(_CONNINFO, credentials={'OWN1621': 'x'})
+    other = PostgresBackend(_CONNINFO, credentials={'OTH1621': 'x'})
+
+    def shape(backend: PostgresBackend) -> int:
+        binds = [
+            BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=4),
+            BindVar(value='OWN1621.T1621', tns_type=TNS_TYPE_VARCHAR, max_size=128),
+            BindVar(value=None, tns_type=TNS_TYPE_RAW, max_size=16),
+            BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=4),
+            BindVar(value=None, tns_type=TNS_TYPE_RAW, max_size=32767),
+            BindVar(value=None, tns_type=TNS_TYPE_REFCURSOR, max_size=1),
+            BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=128),
+        ]
+        return backend.execute(_TYPE_SHAPE_SQL, binds).out_binds[0]
+
+    def sees(backend: PostgresBackend) -> tuple:
+        listed = backend.execute(
+            "SELECT count(*) FROM all_types WHERE owner = 'OWN1621' "
+            "AND type_name = 'T1621'"
+        ).rows[0][0]
+        backend.rollback()
+        return (
+            listed,
+            backend.describe_type('OWN1621.T1621') is not None,
+            shape(backend),
+        )
+
+    try:
+        owner.authenticate('OWN1621')
+        other.authenticate('OTH1621')
+        owner.execute('CREATE TYPE t1621 AS OBJECT (n NUMBER)')
+        assert sees(owner) == (1, True, 0)
+        assert sees(other) == (0, False, 1001)
+        owner.execute('GRANT EXECUTE ON t1621 TO oth1621')
+        assert sees(other) == (1, True, 0)
+        owner.execute('REVOKE EXECUTE ON own1621.t1621 FROM oth1621')
+        assert sees(other) == (0, False, 1001)
+        owner.execute('GRANT EXECUTE ON own1621.t1621 TO PUBLIC')
+        assert sees(other) == (1, True, 0)
+    finally:
+        owner.rollback()
+        other.rollback()
+        owner.close()
+        other.close()
+        admin.execute("DELETE FROM sys.ora_grants WHERE owner = 'OWN1621'")
+        for schema in ('own1621', 'oth1621'):
+            admin.execute(f'DROP SCHEMA IF EXISTS {schema} CASCADE')
+        admin.close()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
