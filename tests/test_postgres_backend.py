@@ -3457,6 +3457,34 @@ def test_a_function_returns_a_table_of_varrays() -> None:
                 backend.rollback()
 
 
+def test_an_is_json_column_is_described_as_json() -> None:
+    # A column with an IS JSON check constraint (#1626) is described as JSON,
+    # as 18c, 21c and 23ai describe it, so a client hands back the parsed value
+    # (python-oracledb's test_1941); an IS NOT JSON one, a plain one and a
+    # computed one are not.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE TABLE jd1626t (j CLOB, n CLOB, p CLOB, '
+            'CONSTRAINT jd1626_j CHECK (j IS JSON), '
+            'CONSTRAINT jd1626_n CHECK (n IS NOT JSON))'
+        )
+        backend.execute("INSERT INTO jd1626t VALUES ('[4, 5, 6]', 'x', 'y')")
+        result = backend.execute("SELECT j, n, p, j || '' AS c FROM jd1626t")
+        assert [column.is_json for column in result.columns] == [
+            True,
+            False,
+            False,
+            False,
+        ]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE jd1626t')
+        except Exception:
+            backend.rollback()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
