@@ -10862,7 +10862,12 @@ class PostgresBackend:
         out: list = []
         for at, value in enumerate(result.out_binds):
             sent = given[at] if at < len(values) and value is values[at] else None
-            if isinstance(sent, ObjectImage):
+            if isinstance(value, _PortalName):
+                # The portal a client's cursor bound IN was opened as (#1634):
+                # nothing to report, which the Mirror answers as the closed
+                # cursor a routine leaves (#1048). As text it garbled the reply.
+                out.append(None)
+            elif isinstance(sent, ObjectImage):
                 out.append(self._image_object(sent))
             elif at < len(values) and value is values[at]:
                 out.append(given[at])

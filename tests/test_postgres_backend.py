@@ -3070,6 +3070,33 @@ def test_a_cursor_bound_in_resumes_where_the_client_stopped() -> None:
             backend.rollback()
 
 
+def test_a_cursor_bound_in_is_not_reported_back() -> None:
+    # A procedure handed a client's cursor (#1634) reports nothing for it, as
+    # for a cursor it closed (#1048) -- not the portal's name, which the Mirror
+    # sent as text and python-oracledb read as a cursor (DPY-5002).
+    from seerdb.common.tns_consts import TNS_TYPE_REFCURSOR
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE OR REPLACE PROCEDURE rc1634(c SYS_REFCURSOR) IS\n'
+            '  n NUMBER;\nBEGIN\n  FETCH c INTO n;\n  CLOSE c;\nEND;'
+        )
+        portal = backend.open_ref_cursor('SELECT 1 FROM dual')
+        result = backend.execute(
+            'BEGIN rc1634(:1); END;',
+            [BindVar(value=portal, tns_type=TNS_TYPE_REFCURSOR, max_size=0)],
+        )
+        assert result.out_binds == [None]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP PROCEDURE rc1634')
+        except Exception:
+            backend.rollback()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
