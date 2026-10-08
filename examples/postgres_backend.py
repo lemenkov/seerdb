@@ -11392,6 +11392,10 @@ class PostgresBackend:
             else _column_meta(desc, [r[i] for r in rows], self._tstz_oid)
             for i, desc in enumerate(fetch.description or ())
         ]
+        # A column straight from a NOT NULL table column is not nullable, as a
+        # query's is (#1618): a FETCH names the table column as a SELECT does.
+        for i in self._not_null_columns(fetch.pgresult, len(columns)):
+            columns[i] = replace(columns[i], null_ok=0)
         return CursorResult(columns=columns, rows=[tuple(r) for r in rows])
 
     def _eval_out_assignments(
