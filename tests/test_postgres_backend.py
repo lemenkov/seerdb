@@ -3831,6 +3831,51 @@ def test_v_version_lists_the_presented_release() -> None:
         backend.close()
 
 
+def test_a_session_keeps_its_edition() -> None:
+    # Editions by name (#1662): ORA$BASE until one is set, CREATE EDITION's
+    # name accepted by ALTER SESSION and at login, one that does not exist
+    # ORA-38802 at either, a second CREATE ORA-00955 -- 23ai's answers.
+    from seerdb.server import BackendError
+
+    query = (
+        "SELECT sys_context('userenv', 'current_edition_name'), "
+        "sys_context('userenv', 'session_edition_name') FROM dual"
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    login = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('DROP EDITION ed1662')
+    except BackendError:
+        backend.rollback()  # not there yet
+    try:
+        assert backend.execute(query).rows == [('ORA$BASE', 'ORA$BASE')]
+        backend.execute('CREATE EDITION ed1662')
+        with pytest.raises(BackendError) as exc:
+            backend.execute('CREATE EDITION ed1662')
+        assert exc.value.ora_code == 955
+        with pytest.raises(BackendError) as exc:
+            backend.execute('ALTER SESSION SET EDITION = nosuch1662')
+        assert exc.value.ora_code == 38802
+        backend.execute('ALTER SESSION SET EDITION = ed1662')
+        assert backend.execute(query).rows == [('ED1662', 'ED1662')]
+        backend.rollback()  # an ALTER SESSION outlives a rollback
+        assert backend.execute(query).rows == [('ED1662', 'ED1662')]
+        login.authenticate('pyo')
+        with pytest.raises(BackendError) as exc:
+            login.open_session({'edition': 'nosuch1662'})
+        assert exc.value.ora_code == 38802
+        login.open_session({'edition': 'ed1662'})
+        assert login.execute(query).rows == [('ED1662', 'ED1662')]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP EDITION ed1662')
+        except BackendError:
+            backend.rollback()
+        backend.close()
+        login.close()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
