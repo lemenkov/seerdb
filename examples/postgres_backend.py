@@ -5464,6 +5464,55 @@ def _translated_batch(sql: str) -> str:
     return _translate_idioms(sql)
 
 
+# A SELECT that starts a statement of a PL/pgSQL body (#1650) -- not a
+# subquery's, not an INSERT's.
+_PLSQL_STATEMENT_SELECT = re.compile(
+    r'(?is)(?:^|;|\b(?:BEGIN|THEN|ELSE|LOOP|EXCEPTION)\b)\s*SELECT\b'
+)
+# What the scan from such a SELECT looks at: a parenthesis, the end of the
+# statement, or the select list's INTO / FROM.
+_SELECT_INTO_SCAN = re.compile(r'(?i)[();]|\bINTO\b|\bFROM\b')
+# A statement that carries a PL/pgSQL body: a DO block, a routine, or a
+# package's statements, which open with one.
+_PLPGSQL_STATEMENT = re.compile(r'(?is)^\s*(?:DO\b|CREATE\b)|\bLANGUAGE\s+plpgsql\b')
+
+
+def _strict_select_into(sql: str) -> str:
+    """A PL/SQL ``SELECT ... INTO`` as PL/pgSQL's ``INTO STRICT`` (#1650).
+
+    PL/SQL's needs exactly one row: none is NO_DATA_FOUND (ORA-01403), more
+    TOO_MANY_ROWS (ORA-01422). PL/pgSQL's plain INTO takes the first row or
+    leaves its targets NULL and raises nothing; STRICT raises the two
+    conditions Oracle does. Only a statement with a PL/pgSQL body is touched:
+    a top-level SELECT ... INTO is PostgreSQL's CREATE TABLE AS.
+    """
+    if not _PLPGSQL_STATEMENT.search(sql):
+        return sql
+    (masked, contents) = _mask_quoted(sql)
+    inserts = []
+    for start in _PLSQL_STATEMENT_SELECT.finditer(masked):
+        depth = 0
+        for token in _SELECT_INTO_SCAN.finditer(masked, start.end()):
+            word = token.group(0).upper()
+            if word == '(':
+                depth += 1
+            elif word == ')':
+                depth -= 1
+                if depth < 0:
+                    break
+            elif word == ';' or (depth == 0 and word == 'FROM'):
+                break
+            elif depth == 0 and word == 'INTO':
+                if not re.match(r'(?i)\s+STRICT\b', masked[token.end() :]):
+                    inserts.append(token.end())
+                break
+    if not inserts:
+        return sql
+    for at in reversed(inserts):
+        masked = masked[:at] + ' STRICT' + masked[at:]
+    return _unmask_quoted(masked, contents)
+
+
 def _translate_idioms(sql: str) -> str:
     """Rewrite the Oracle SQL functions / literal idioms the suite uses to their
     PostgreSQL equivalents (#502). Applied to every statement. Each step that
@@ -5494,6 +5543,7 @@ def _translate_idioms(sql: str) -> str:
             name, _unmask_quoted(pattern.sub(replacement, masked), contents), sql
         )
     sql = _ruled('timestamp-tz-literal', _TSTZ_LITERAL.sub(_tstz_literal_sub, sql), sql)
+    sql = _ruled('select-into-strict', _strict_select_into(sql), sql)
     return _ruled('cursor-expression', _translate_cursor_expressions(sql), sql)
 
 
@@ -7144,6 +7194,7 @@ _SQLSTATE_TO_ORA = {
     # #1323: the codes python-oracledb's suite checks by number.
     '22012': ORA_DIVISOR_IS_ZERO,  # division_by_zero
     'P0002': ORA_NO_DATA_FOUND,  # no_data_found (RAISE no_data_found)
+    'P0003': ORA_TOO_MANY_ROWS,  # too_many_rows (a SELECT ... INTO STRICT, #1650)
 }
 
 
@@ -7160,6 +7211,7 @@ _ORA_MESSAGE = {
     ORA_TABLE_OR_VIEW_DOES_NOT_EXIST: 'table or view does not exist',
     ORA_NOT_ENOUGH_VALUES: 'not enough values',
     ORA_NO_DATA_FOUND: 'no data found',
+    ORA_TOO_MANY_ROWS: 'exact fetch returns more than requested number of rows',
     ORA_DIVISOR_IS_ZERO: 'divisor is equal to zero',
     ORA_TYPE_HAS_DEPENDENTS: 'cannot drop or replace a type with type or table dependents',
 }
