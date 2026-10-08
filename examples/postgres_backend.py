@@ -539,6 +539,29 @@ _HELPER_FUNCTIONS_DDL = (
     f')::{_TSTZ_TYPE} FROM (SELECT CASE '
     "WHEN $2 ~ '^[+-]?[0-9]{1,2}:[0-9]{2}$' THEN $1 AT TIME ZONE ($2)::interval "
     'ELSE $1 AT TIME ZONE $2 END) AS z(i) $$;'
+    # Oracle's RR year (#1638): a two-digit year read into the century the
+    # current year puts it in -- 00-49 this century and 50-99 the last while
+    # the current year ends in 00-49, 00-49 the next and 50-99 this one after.
+    # A format's RR is parsed as YYYY, which keeps two digits as the year 0-99
+    # (00 as 1 BC), and sys.ora_rr_year moves such a year into the window; a
+    # year of three or four digits is left as it is, as Oracle leaves it. The
+    # century is c - c % 100: this backend's integer / is Oracle's exact one.
+    # The shift is that century in years: 60 + 1900 is 1960, and 1 BC (00)
+    # + 2000 is 2000, there being no year 0.
+    'CREATE OR REPLACE FUNCTION sys.ora_rr_shift(y integer) RETURNS integer '
+    'LANGUAGE sql STABLE STRICT AS $$ SELECT CASE WHEN y < -1 OR y > 99 THEN 0 '
+    'ELSE (SELECT CASE WHEN c % 100 < 50 THEN CASE WHEN yy < 50 THEN (c - c % 100) '
+    'ELSE (c - c % 100) - 100 END ELSE CASE WHEN yy < 50 THEN (c - c % 100) + 100 '
+    'ELSE (c - c % 100) END END FROM (SELECT extract(year FROM now())::integer '
+    'AS c, CASE WHEN y = -1 THEN 0 ELSE y END AS yy) w) END $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_rr_year(timestamp) RETURNS timestamp '
+    'LANGUAGE sql STABLE STRICT AS $$ SELECT $1 + make_interval(years => '
+    'sys.ora_rr_shift(extract(year FROM $1)::integer)) $$;'
+    'DO $$ BEGIN '
+    'CREATE OR REPLACE FUNCTION sys.ora_rr_year(oracle.date) RETURNS oracle.date '
+    'LANGUAGE sql STABLE STRICT AS $f$ SELECT ($1::timestamp + make_interval(years => '
+    'sys.ora_rr_shift(extract(year FROM $1)::integer)))::oracle.date $f$; '
+    'EXCEPTION WHEN undefined_object OR invalid_schema_name THEN NULL; END $$;'
     # sys.ora_rowid(tableoid, ctid): a heap row's ROWID in Oracle's extended
     # form, OOOOOO FFF BBBBBB RRR in Oracle's base64 -- the table's oid as the
     # data object, file 1, and the ctid's block (plus one: a client takes block 0
@@ -4273,6 +4296,63 @@ def _translate_signed_year(sql: str) -> str:
     return ''.join(out)
 
 
+# An RR / RRRR year in a format (#1638), outside a double-quoted text part.
+_RR_FORMAT_YEAR = re.compile(r'"[^"]*"|RR(?:RR)?', re.IGNORECASE)
+
+
+def _rr_format(fmt: str, parsing: bool) -> str:
+    # A literal format with its RR years in PostgreSQL's terms: printed, RRRR is
+    # YYYY and RR is YY; parsed, both are YYYY, the window applied after.
+    def one(m: re.Match[str]) -> str:
+        if m.group(0).startswith('"'):
+            return m.group(0)
+        return 'YYYY' if parsing or len(m.group(0)) == 4 else 'YY'
+
+    return _RR_FORMAT_YEAR.sub(one, fmt)
+
+
+def _translate_rr_year(sql: str) -> str:
+    """Give Oracle's RR and RRRR years a PostgreSQL meaning (#1638).
+
+    PostgreSQL knows neither: printing one it wrote the letters, and reading
+    one it took no year at all, year 1. TO_CHAR prints RR as YY and RRRR as
+    YYYY; TO_DATE and TO_TIMESTAMP read them as YYYY and put a two-digit year
+    into Oracle's window (``sys.ora_rr_year``). Only a format given as a
+    literal is rewritten, as for the signed year.
+    """
+    if 'rr' not in sql.lower():
+        return sql
+    (out, pos) = ([], 0)
+    in_string = False
+    i = 0
+    while i < len(sql):
+        if sql[i] == "'":
+            in_string = not in_string
+            i += 1
+            continue
+        match = None if in_string else _SIGNED_YEAR_CALL.match(sql, i)
+        if match is None or (i and (sql[i - 1].isalnum() or sql[i - 1] in '_.')):
+            i += 1
+            continue
+        found = _call_args(sql, match.end() - 1)
+        if found is None:
+            break
+        (args, end) = found
+        fmt = args[1].strip() if len(args) >= 2 else ''
+        literal = fmt.startswith("'") and fmt.endswith("'")
+        if not literal or _rr_format(fmt, True) == fmt:
+            i = match.end()
+            continue
+        inner = [_translate_rr_year(a) for a in args]
+        parsing = match.group(1).lower() != 'to_char'
+        call = f'{match.group(1)}({", ".join([inner[0], _rr_format(fmt, parsing), *inner[2:]])})'
+        out.append(sql[pos:i])
+        out.append(f'sys.ora_rr_year({call})' if parsing else call)
+        pos = i = end
+    out.append(sql[pos:])
+    return ''.join(out)
+
+
 # DECODE(expr, search1, result1, ..., [default]) becomes a CASE (#822). orafce's
 # decode is declared over polymorphic parameters, which PostgreSQL resolves from
 # the argument types: all-untyped literals give it nothing to resolve from, and
@@ -5377,6 +5457,7 @@ def _translate_idioms(sql: str) -> str:
     sql = _ruled('attribute-access', _translate_attribute_access(sql), sql)
     sql = _ruled('connect-by', _translate_connect_by(sql), sql)
     sql = _ruled('signed-year', _translate_signed_year(sql), sql)
+    sql = _ruled('rr-year', _translate_rr_year(sql), sql)
     sql = _ruled('decode', _translate_decode(sql), sql)
     # The rewrites change Oracle words into PostgreSQL ones, and a string
     # literal or a quoted identifier holding such a word is data, not SQL:
