@@ -125,6 +125,30 @@ for _test, _reason in (
 ):
     DENYLIST_TESTS[_test] = _reason
 
+# Tests that fail against ANY server before 23ai, real Oracle included, so they
+# are deselected only when the server the suite runs against reports one -- a
+# Mirror presenting 12.1, say. python-oracledb pipelines for real only with a
+# 23ai-class server; with an older one it runs a pipeline's operations one by
+# one, and two with the same SQL share a cursor, so the last one's fetch
+# settings apply to both. 18c and 21c fail these exactly as such a Mirror does
+# (#1615).
+PRE_23AI_TESTS: dict[str, str] = {
+    f'test_7600_pipelining_async.py::{test}': 'pre-23ai: no real pipelining'
+    for test in ('test_7637', 'test_7645', 'test_7646', 'test_7647', 'test_7648')
+}
+
+
+def _server_major(dsn: str, user: str, password: str) -> int | None:
+    # The major release the server reports, or None when it cannot be asked.
+    try:
+        import oracledb
+
+        with oracledb.connect(user=user, password=password, dsn=dsn) as conn:
+            return int(conn.version.split('.')[0])
+    except Exception as exc:  # the suite itself reports a server it cannot reach
+        print(f'# server version not read ({exc}); nothing deselected for it')
+        return None
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -168,15 +192,19 @@ def main() -> int:
     ]
     for filename in DENYLIST:
         cmd += ['--ignore', f'tests/{filename}']
-    for test in DENYLIST_TESTS:
+    deselected = dict(DENYLIST_TESTS)
+    major = _server_major(args.dsn, args.user, args.password)
+    if major is not None and major < 23:
+        deselected.update(PRE_23AI_TESTS)
+    for test in deselected:
         cmd += ['--deselect', f'tests/{test}']
     cmd += args.pytest_args
 
     print(f'# {len(DENYLIST)} files denylisted (out-of-scope features):')
     for filename, reason in sorted(DENYLIST.items()):
         print(f'#   {filename:<42} {reason}')
-    print(f'# {len(DENYLIST_TESTS)} individual tests deselected (cannot pass here):')
-    for test, reason in sorted(DENYLIST_TESTS.items()):
+    print(f'# {len(deselected)} individual tests deselected (cannot pass here):')
+    for test, reason in sorted(deselected.items()):
         print(f'#   {test:<52} {reason}')
     print(f'# running in {args.suite} against {args.dsn}\n', flush=True)
     return subprocess.call(cmd, cwd=args.suite, env=env)
