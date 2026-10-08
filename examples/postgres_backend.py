@@ -8241,6 +8241,8 @@ class PostgresBackend:
         self._plsql_types: dict[int, tuple[str, str, str, dict] | None] = {}
         self._column_type_cache: dict[tuple[int, int], tuple | None] = {}
         self._collection_name_cache: frozenset[str] | None = None
+        # Each package's functions a call may name without parentheses (#1651).
+        self._package_function_cache: dict[str, frozenset[str]] | None = None
         # RAW targets (#1496): whether any column or attribute is a recorded
         # RAW, each relation's column order and RAW positions, and each object
         # type's RAW attribute positions, by name; any DDL starts them over.
@@ -8675,6 +8677,7 @@ class PostgresBackend:
             return self._kill_session(kill.group(1))
         if native:
             return self._execute_native(sql, binds)
+        sql = _ruled('package-function-call', self._call_package_functions(sql), sql)
         bare = _BARE_CALL.match(sql)
         if bare is not None and bare.group(1).upper() not in _PLSQL_WORD_STATEMENTS:
             _note_rule('bare-call')
@@ -8806,6 +8809,7 @@ class PostgresBackend:
             self._record_visibility(visibility)
             self._record_column_types(original)
             self._collection_name_cache = None  # a type may have come or gone
+            self._package_function_cache = None  # and a package
             self._plsql_types.clear()
             self._forget_raw_targets()
         if with_rowid is not None:
@@ -12008,6 +12012,61 @@ class PostgresBackend:
             (routine, schema, schema),
         ).fetchone()
         return row is not None
+
+    def _package_functions(self) -> dict[str, frozenset[str]]:
+        # Each package's functions that take no argument a call must give
+        # (#1651): package name -> function names, all lower case.
+        if self._package_function_cache is None:
+            found: dict[str, set[str]] = {}
+            if self._has_package_catalog:
+                for package, name in self._conn.execute(
+                    'SELECT k.name, p.proname FROM sys.ora_packages k '
+                    'JOIN pg_namespace n ON n.nspname = k.name '
+                    'JOIN pg_proc p ON p.pronamespace = n.oid '
+                    "WHERE p.prokind = 'f' AND p.pronargs = p.pronargdefaults"
+                ).fetchall():
+                    found.setdefault(package, set()).add(name)
+            self._package_function_cache = {
+                package: frozenset(names) for package, names in found.items()
+            }
+        return self._package_function_cache
+
+    def _call_package_functions(self, sql: str) -> str:
+        """A package's function named without parentheses as the call it is
+        (#1651): ``pkg.f`` as ``pkg.f()``, as Oracle calls a function with no
+        arguments. PostgreSQL read it as column ``f`` of a table ``pkg``. Oracle
+        looks for a table or an alias first, so a statement that names ``pkg``
+        anywhere but before a dot -- ``FROM t pkg`` -- is left alone."""
+        if '.' not in sql:
+            return sql
+        (masked, contents) = _mask_quoted(sql)
+        lowered = masked.lower()
+        packages = {
+            p: names for p, names in self._package_functions().items() if p in lowered
+        }
+        if not packages:
+            return sql
+        out = masked
+        for package, names in packages.items():
+            alone = re.compile(
+                rf'(?<![\w$#."]){re.escape(package)}(?![\w$#])(?!\s*\.)', re.I
+            )
+            if alone.search(out):
+                continue  # a table or an alias of that name: Oracle's first look
+            call = re.compile(
+                rf'(?<![\w$#."])({re.escape(package)}\s*\.\s*([A-Za-z_][\w$#]*))'
+                rf'(?![\w$#])(?!\s*[(.])',
+                re.IGNORECASE,
+            )
+            out = call.sub(
+                lambda m: (
+                    f'{m.group(1)}()' if m.group(2).lower() in names else m.group(0)
+                ),
+                out,
+            )
+        if out == masked:
+            return sql
+        return _unmask_quoted(out, contents)
 
     def _user_routine_names(self) -> frozenset[str]:
         # The names of the routines a user created (#1612): every function or
