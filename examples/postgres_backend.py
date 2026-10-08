@@ -11333,10 +11333,22 @@ class PostgresBackend:
                 )
         return out
 
-    def _object_out(self, type_oid: int, value: object, array: bool = False) -> object:
+    def _object_out(
+        self, type_oid: int, value: object, array: bool = False, toid: bytes = b''
+    ) -> object:
         # An OUT or returned value of a record or index-by table type: the
         # object a client reads -- or, for a classic array bind, the table's
         # values in key order (#1607). Any other value as it is.
+        if isinstance(value, (str, list)) and toid:
+            # A collection the call returns (#1623) is built as the collection
+            # the bind names: from its array's text when psycopg met the inner
+            # collection's array type before it was registered, from the list
+            # when it had been (a NULL bind of the type registers it, #1622).
+            coll = self._collection_type(
+                _pg_oid_of(toid[4:20] if len(toid) >= 20 else toid) or 0
+            )
+            if coll is not None:
+                return self._db_collection(coll, value, type_oid)
         entry = (
             self._object_type(type_oid)
             if type_oid not in _BUILTIN_OIDS and type_oid != self._tstz_oid
@@ -11637,6 +11649,7 @@ class PostgresBackend:
                         cursor.description[at].type_code,
                         result,
                         array=isinstance(bind, BindVar) and bind.array_size > 0,
+                        toid=bind.toid if isinstance(bind, BindVar) else b'',
                     )
                 out[refs.index(ref)] = result
         return Result(out_binds=out)
