@@ -189,11 +189,12 @@ import uuid
 from collections.abc import Callable, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import Final, NamedTuple, TypeVar
+from typing import Final, NamedTuple, TypeVar, cast
 
 import psycopg
 from psycopg import sql
-from psycopg.adapt import Loader
+from psycopg.abc import DumperKey
+from psycopg.adapt import Loader, PyFormat
 from psycopg.types.composite import CompositeInfo, register_composite
 
 from seerdb.common.datatypes import BcDate, IntervalYM
@@ -2046,6 +2047,35 @@ class _PortalNameDumper(psycopg.adapt.Dumper):
 
     def dump(self, obj: object) -> bytes:
         return str(obj).encode('utf-8')
+
+
+class _TypedNull:
+    """A NULL object bind (#1622): NULL, but of the object's PostgreSQL type,
+    which the client's bind names. Untyped, the NULL resolved no overload of a
+    routine that takes several object types."""
+
+    __slots__ = ('oid',)
+
+    def __init__(self, oid: int) -> None:
+        self.oid = oid
+
+
+class _TypedNullDumper(psycopg.adapt.Dumper):
+    # One dumper per type: the NULL goes out with the type's oid. psycopg
+    # caches dumpers by this key and takes any hashable, though its type names
+    # only types.
+    def get_key(self, obj: object, format: PyFormat) -> DumperKey:
+        return cast(
+            DumperKey, (_TypedNull, obj.oid if isinstance(obj, _TypedNull) else 0)
+        )
+
+    def upgrade(self, obj: object, format: PyFormat) -> '_TypedNullDumper':
+        dumper = _TypedNullDumper(_TypedNull)
+        dumper.oid = obj.oid if isinstance(obj, _TypedNull) else 0
+        return dumper
+
+    def dump(self, obj: object) -> None:
+        return None
 
 
 @dataclass(frozen=True)
@@ -7765,6 +7795,7 @@ class PostgresBackend:
         except Exception:
             self._use_pipeline = False
         self._conn.adapters.register_dumper(_PortalName, _PortalNameDumper)
+        self._conn.adapters.register_dumper(_TypedNull, _TypedNullDumper)
         # The portals opened for cursors bound IN, numbered (#1609).
         self._portals_opened = 0
         # Lean on the `orafce` extension for Oracle-compatible SQL functions —
@@ -10562,9 +10593,27 @@ class PostgresBackend:
                 out.append(self._object_bind_value(value))
             elif isinstance(value, DbRef):
                 out.append(self._ref_bind_value(value))
+            elif (
+                isinstance(b, BindVar)
+                and value is None
+                and b.tns_type == TNS_TYPE_ADT
+                and (typed := self._null_object_type(b.toid)) is not None
+            ):
+                out.append(replace(b, value=_TypedNull(typed)))
             else:
                 out.append(b)
         return out
+
+    def _null_object_type(self, toid: bytes) -> int | None:
+        # The PostgreSQL type of a NULL object bind, from the type OID its OAC
+        # carries (#1622): one of our object or collection types, else None.
+        oid = toid[4:20] if len(toid) >= 20 else toid
+        pg_oid = _pg_oid_of(oid)
+        if pg_oid is None:
+            return None
+        if self._collection_type(pg_oid) is None and self._object_type(pg_oid) is None:
+            return None
+        return pg_oid
 
     def _object_bind_value(self, image: ObjectImage) -> object:
         oid = image.type_oid or b''
