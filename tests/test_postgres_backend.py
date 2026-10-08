@@ -3308,6 +3308,26 @@ def test_date_minus_date_is_a_number_of_days() -> None:
                 backend.rollback()
 
 
+def test_sql_monitor_reports_the_sessions_database_operation() -> None:
+    # V$SQL_MONITOR (#1619): with a database operation named (connection.dbop,
+    # in the tracing piggyback) the session's statement is EXECUTING under it,
+    # as python-oracledb's test_1103 reads it; with none there is no row.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    query = (
+        "SELECT dbop_name FROM v$sql_monitor WHERE sid = sys_context('userenv', 'sid') "
+        "AND status = 'EXECUTING'"
+    )
+    try:
+        assert backend.execute(query).rows == []
+        backend.set_end_to_end({'dbop': 'oracledb_dbop'})
+        assert backend.execute(query).rows == [('oracledb_dbop',)]
+        backend.set_end_to_end({'dbop': None})
+        assert backend.execute(query).rows == []
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
