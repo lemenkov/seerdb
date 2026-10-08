@@ -3485,6 +3485,34 @@ def test_an_is_json_column_is_described_as_json() -> None:
             backend.rollback()
 
 
+def test_a_blob_bind_describes_as_a_blob() -> None:
+    # A BLOB bind selected back (#1625) describes as a BLOB, as Oracle's does
+    # -- python-oracledb's test_3655 asks a handler for LONG RAW of it, which
+    # it refuses from a RAW -- and inserts as the same bytes.
+    from seerdb.common.tns_consts import TNS_TYPE_BLOB, TNS_TYPE_RAW
+    from seerdb.server.backend import BlobValue
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        result = backend.execute(
+            'SELECT :1, :2 FROM dual', [BlobValue(b'blob data'), b'raw data']
+        )
+        assert [c.data_type for c in result.columns] == [TNS_TYPE_BLOB, TNS_TYPE_RAW]
+        backend.execute('CREATE TABLE bb1625t (b BLOB)')
+        backend.execute('INSERT INTO bb1625t VALUES (:1)', [BlobValue(b'stored')])
+        (row,) = backend.execute(
+            'SELECT dbms_lob.getlength(b) FROM bb1625t WHERE b = :1',
+            [BlobValue(b'stored')],
+        ).rows
+        assert row[0] == 6
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE bb1625t')
+        except Exception:
+            backend.rollback()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is

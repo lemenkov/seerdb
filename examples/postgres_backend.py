@@ -291,7 +291,7 @@ from seerdb.server import (
     credential_lookup,
     stats,
 )
-from seerdb.server.backend import SessionInfo, TypeDescription
+from seerdb.server.backend import BlobValue, SessionInfo, TypeDescription
 from seerdb.server.identity import IDENTITY_12_1
 
 # The PostgreSQL composite type that backs Oracle's TIMESTAMP WITH TIME ZONE
@@ -2143,6 +2143,12 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
                 tstz_keys.add(key)
             elif isinstance(value, _CollectionBind):
                 out.append(f'%({key})s::' + value.domain.replace('%', '%%'))
+            elif isinstance(value, BlobValue):
+                # A BLOB bind -- a temporary LOB the client wrote -- describes
+                # as a BLOB, as Oracle's does, where its bytea alone describes
+                # as a RAW (#1625): TO_BLOB around it is the item the describe
+                # knows as one (_computed_column_types). The value is unchanged.
+                out.append(f'to_blob(%({key})s)')
             elif isinstance(value, IntervalYM):
                 # An IntervalYM binds an INTERVAL YEAR TO MONTH — send its whole-month
                 # count and rebuild a PostgreSQL interval, so the months survive
