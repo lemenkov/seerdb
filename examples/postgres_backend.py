@@ -1937,6 +1937,12 @@ def _copy_quoted_region(sql: str, start: int, out: list[str]) -> int:
     return i  # unterminated region: copied to end of string
 
 
+# A transaction a savepoint taken in it still belongs to: open, or failed.
+_OPEN_TRANSACTION = frozenset(
+    {psycopg.pq.TransactionStatus.INTRANS, psycopg.pq.TransactionStatus.INERROR}
+)
+
+
 class _PortalName(str):
     """A REF CURSOR bound IN (#1609): the name of the portal the backend opened
     for the client's cursor, sent as PostgreSQL's refcursor -- a routine's
@@ -10894,6 +10900,24 @@ class PostgresBackend:
         }
 
     def _execute_plsql(self, sql: str, binds: Sequence) -> Result:
+        # A call that fails undoes only itself (#1632): the caller's open work
+        # survives it, as it survives any other statement that fails, where a
+        # rollback of the whole transaction took it too.
+        self._conn.execute('SAVEPOINT _mirror_call')
+        try:
+            result = self._execute_plsql_call(sql, binds)
+        except BaseException:
+            # Unless the call ended the transaction itself, and the savepoint
+            # with it.
+            if self._conn.info.transaction_status in _OPEN_TRANSACTION:
+                self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_call')
+                self._conn.execute('RELEASE SAVEPOINT _mirror_call')
+            raise
+        if self._conn.info.transaction_status in _OPEN_TRANSACTION:
+            self._conn.execute('RELEASE SAVEPOINT _mirror_call')
+        return result
+
+    def _execute_plsql_call(self, sql: str, binds: Sequence) -> Result:
         # A callproc / callfunc block. `binds` is one BindVar per positional bind
         # (:1 → index 0), value None for a pure OUT. Run the underlying routine and
         # return every bind's value in order (input for IN, the routine's result
@@ -10989,7 +11013,9 @@ class PostgresBackend:
             self._conn.cursor().execute(_translate_idioms(sql))
             return Result(out_binds=values)
         except psycopg.Error as exc:
-            self._conn.rollback()
+            # Undone first (#1632): naming the error reads the catalog for the
+            # routine's arities, which a failed transaction refuses.
+            self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_call')
             raise _backend_error(
                 exc, original=sql, arities=self._routine_arities
             ) from exc

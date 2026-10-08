@@ -3098,6 +3098,72 @@ def test_a_cursor_bound_in_is_not_reported_back() -> None:
             backend.rollback()
 
 
+def test_a_failing_call_keeps_the_callers_open_work() -> None:
+    # A procedure or function call that fails undoes only itself (#1632): the
+    # caller's uncommitted row survives it, as 23ai's does, where a rollback of
+    # the whole transaction lost it -- a call to no such overload included.
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER, TNS_TYPE_VARCHAR
+    from seerdb.server import BackendError
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE fc1632t (n NUMBER)')
+        backend.execute(
+            'CREATE OR REPLACE PROCEDURE fc1632p(v NUMBER) IS\nBEGIN\n'
+            '  INSERT INTO fc1632t VALUES (v);\n'
+            "  raise_application_error(-20001, 'boom');\nEND;"
+        )
+        backend.execute(
+            'CREATE OR REPLACE FUNCTION fc1632f(v NUMBER) RETURN NUMBER IS\nBEGIN\n'
+            '  INSERT INTO fc1632t VALUES (v);\n'
+            "  raise_application_error(-20002, 'boom');\n  RETURN 1;\nEND;"
+        )
+        backend.execute('INSERT INTO fc1632t VALUES (3)')
+        with pytest.raises(BackendError) as exc:
+            backend.execute(
+                'BEGIN fc1632p(:1); END;',
+                [BindVar(value=4, tns_type=TNS_TYPE_NUMBER, max_size=22)],
+            )
+        assert exc.value.ora_code == 20001
+        with pytest.raises(BackendError) as exc:
+            backend.execute(
+                'BEGIN :1 := fc1632f(:2); END;',
+                [
+                    BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=22),
+                    BindVar(value=5, tns_type=TNS_TYPE_NUMBER, max_size=22),
+                ],
+            )
+        assert exc.value.ora_code == 20002
+        # A call PostgreSQL resolves to no routine, with a string argument in
+        # python-oracledb's callfunc shape, is named from the catalog -- after
+        # the failed call is undone.
+        with pytest.raises(BackendError) as exc:
+            backend.execute(
+                'BEGIN :retval := fc1632f(:1, :2, :3); END;',
+                [
+                    BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=22),
+                    BindVar(value='hi', tns_type=TNS_TYPE_VARCHAR, max_size=22),
+                    BindVar(value=7, tns_type=TNS_TYPE_NUMBER, max_size=22),
+                    BindVar(value=9, tns_type=TNS_TYPE_NUMBER, max_size=22),
+                ],
+            )
+        assert exc.value.ora_code == 6550
+        rows = backend.execute('SELECT n FROM fc1632t ORDER BY n').rows
+        assert [int(row[0]) for row in rows] == [3]
+    finally:
+        backend.rollback()
+        for statement in (
+            'DROP FUNCTION fc1632f',
+            'DROP PROCEDURE fc1632p',
+            'DROP TABLE fc1632t',
+        ):
+            try:
+                backend.execute(statement)
+            except Exception:
+                backend.rollback()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
