@@ -3411,6 +3411,52 @@ def test_a_null_object_bind_resolves_an_overloaded_routine() -> None:
                 backend.rollback()
 
 
+def test_a_function_returns_a_table_of_varrays() -> None:
+    # A nested table of VARRAYs a function returns (#1623) comes back as that
+    # collection of collections, as python-oracledb's test_2345 reads it --
+    # not empty, as its array text left it.
+    from postgres_backend import _object_type_oid
+
+    from seerdb.common.tns_consts import TNS_TYPE_ADT
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TYPE va1623 AS VARRAY(10) OF NUMBER')
+        backend.execute('CREATE TYPE tv1623 AS TABLE OF va1623')
+        backend.execute(
+            'CREATE OR REPLACE FUNCTION f1623 RETURN tv1623 IS\nBEGIN\n'
+            '  RETURN tv1623(va1623(10, 20), va1623(30, 40));\nEND;'
+        )
+        (pg_oid,) = backend.execute(
+            "SELECT 'tv1623'::regtype::oid::bigint FROM dual"
+        ).rows[0]
+        result = backend.execute(
+            'BEGIN :retval := f1623(); END;',
+            [
+                BindVar(
+                    value=None,
+                    tns_type=TNS_TYPE_ADT,
+                    max_size=0,
+                    toid=_object_type_oid(int(pg_oid)),
+                )
+            ],
+        )
+        returned = result.out_binds[0]
+        assert [inner.aslist() for inner in returned.aslist()] == [[10, 20], [30, 40]]
+    finally:
+        backend.rollback()
+        for statement in (
+            'DROP FUNCTION f1623',
+            'DROP TYPE tv1623',
+            'DROP TYPE va1623',
+        ):
+            try:
+                backend.execute(statement)
+            except Exception:
+                backend.rollback()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
