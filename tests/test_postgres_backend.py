@@ -3328,6 +3328,36 @@ def test_sql_monitor_reports_the_sessions_database_operation() -> None:
         backend.close()
 
 
+def test_a_proxy_login_is_a_session_of_the_user_it_acts_for() -> None:
+    # A proxy login, `pyo[target]` (#1620): the session is the target's, in its
+    # schema, and PROXY_USER names the user who logged in -- as Oracle reports
+    # it to python-oracledb's test_2427. A plain login has no PROXY_USER.
+    query = (
+        "SELECT sys_context('userenv', 'session_user'), "
+        "sys_context('userenv', 'proxy_user'), "
+        "sys_context('userenv', 'current_schema') FROM dual"
+    )
+    plain = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    proxied = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        plain.authenticate('pyo')
+        plain.open_session({})
+        (row,) = plain.execute(query).rows
+        assert tuple(row[:2]) == ('PYO', None)
+        proxied.authenticate('pyo')
+        proxied.execute('CREATE SCHEMA IF NOT EXISTS px1620')
+        proxied.open_session({'proxy_client_name': 'px1620'})
+        assert proxied.execute(query).rows == [('PX1620', 'PYO', 'PX1620')]
+    finally:
+        proxied.rollback()
+        try:
+            proxied.execute('DROP SCHEMA px1620')
+        except Exception:
+            proxied.rollback()
+        plain.close()
+        proxied.close()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
