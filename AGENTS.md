@@ -44,10 +44,22 @@ paths it can reach (#1470):
   backend test modules.
 - A **nightly** run takes every leg whatever changed.
 
-8i, 9i, 10g and the passthrough Mirror are **local only**. So is every Oracle leg
-for a PR the gate skips, which is why a green CI badge says little about a change
-the gate let through untested. Run the tiers your change can reach, and put the
-numbers in the PR description.
+8i, 9i, 10g, the passthrough Mirror and python-oracledb's own suite are **local
+only** per PR. Locally, run what CI never runs for the paths your PR touches,
+not the whole matrix (a PR touching several rows runs the union):
+
+| PR touches | run locally |
+|---|---|
+| anything | the static checks above, before pushing |
+| `examples/` (the Mirror-over-PG backend) | `tests/test_postgres_backend.py` before pushing, then python-oracledb's suite (`tools/run_oracledb_suite.py`) against a Mirror-over-PG |
+| `seerdb/server` | python-oracledb's suite against a passthrough Mirror over 23ai, on the branch and on its `master` base, and against a Mirror-over-PG |
+| `seerdb/client` | the integration suite on 8i, 9i and 10g |
+| `seerdb/common` | the integration suite on every bed (8i to 26ai), both Mirror legs, the offline suite, and both python-oracledb suite runs |
+
+Run these while CI runs, and put the legs you ran and their numbers in the PR.
+CI covers the rest for those paths, and the nightly run covers every CI leg
+whatever changed; 8i, 9i and 10g run nowhere but locally, which is why a client
+change still needs them.
 
 A docs-only change needs none of the test tiers; the repository's own workflows
 skip them on those paths too.
