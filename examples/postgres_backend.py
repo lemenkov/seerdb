@@ -1032,6 +1032,26 @@ CREATE OR REPLACE FUNCTION utl_raw.bit_xor(text, text) RETURNS bytea
 # COMMA_TO_TABLE / TABLE_TO_COMMA are left unimplemented: they exchange an Oracle
 # collection (DBMS_UTILITY.UNCL_ARRAY / LNAME_ARRAY), a PL/SQL table type the
 # Mirror does not model.
+# The release in the banner the backend presents (#1603), e.g. 12.1.0.2.0.
+def _banner_release(banner: bytes) -> str:
+    found = re.search(rb'Release (\S+)', banner)
+    if found is None:
+        raise ValueError(f'no release in the banner {banner!r}')
+    return found.group(1).decode()
+
+
+_PRESENTED_RELEASE = _banner_release(IDENTITY_12_1.banner)
+_V_VERSION_DDL = (
+    'CREATE OR REPLACE VIEW sys."v$version" AS SELECT banner, 0::numeric AS con_id '
+    'FROM (VALUES '
+    f"(1, '{IDENTITY_12_1.banner.decode()}'), "
+    f"(2, 'PL/SQL Release {_PRESENTED_RELEASE} - Production'), "
+    f"(3, 'CORE' || chr(9) || '{_PRESENTED_RELEASE}' || chr(9) || 'Production'), "
+    f"(4, 'TNS for Linux: Version {_PRESENTED_RELEASE} - Production'), "
+    f"(5, 'NLSRTL Version {_PRESENTED_RELEASE} - Production')) "
+    'AS v(n, banner) ORDER BY n;'
+)
+
 _DBMS_UTILITY_DDL = """
 CREATE SCHEMA IF NOT EXISTS dbms_utility;
 CREATE OR REPLACE FUNCTION dbms_utility.format_error_stack() RETURNS text
@@ -1702,7 +1722,11 @@ _ORACLE_DICTIONARY_DDL = (
     'a.backend_start AS logon_time '
     'FROM pg_stat_activity a LEFT JOIN sys.ora_sessions s ON s.pid = a.pid '
     "WHERE a.datname = current_database() AND a.backend_type = 'client backend';"
-    'CREATE OR REPLACE VIEW sys."v$session_connect_info" AS SELECT a.pid AS sid, '
+    # v$version (#1603): the release the Mirror presents, as 12.1 lists it --
+    # 11g's five component rows, and the CON_ID 12c added (18c went to one row
+    # with BANNER_FULL and BANNER_LEGACY).
+    + _V_VERSION_DDL
+    + 'CREATE OR REPLACE VIEW sys."v$session_connect_info" AS SELECT a.pid AS sid, '
     'sys.ora_serial(a.pid) AS "serial#", s.driver AS client_driver '
     'FROM pg_stat_activity a LEFT JOIN sys.ora_sessions s ON s.pid = a.pid '
     "WHERE a.datname = current_database() AND a.backend_type = 'client backend';"

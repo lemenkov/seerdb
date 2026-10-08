@@ -3800,6 +3800,37 @@ def test_a_rowid_column_refuses_a_number_and_a_bad_rowid() -> None:
             backend.rollback()
 
 
+def test_v_version_lists_the_presented_release() -> None:
+    # V$VERSION (#1603) in 12.1's shape: 11g's five component rows of the
+    # release the Mirror presents, and CON_ID 0 -- the banner sqlplus reads
+    # with `WHERE rownum = 1`.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        result = backend.execute('SELECT * FROM v$version')
+        assert [c.name for c in result.columns] == [b'BANNER', b'CON_ID']
+        assert [tuple(r) for r in result.rows] == [
+            (
+                'Oracle Database 12c Enterprise Edition Release 12.1.0.2.0 '
+                '- 64bit Production',
+                0,
+            ),
+            ('PL/SQL Release 12.1.0.2.0 - Production', 0),
+            ('CORE\t12.1.0.2.0\tProduction', 0),
+            ('TNS for Linux: Version 12.1.0.2.0 - Production', 0),
+            ('NLSRTL Version 12.1.0.2.0 - Production', 0),
+        ]
+        assert backend.execute(
+            'SELECT banner FROM v$version WHERE rownum = 1'
+        ).rows == [
+            (
+                'Oracle Database 12c Enterprise Edition Release 12.1.0.2.0 - 64bit Production',
+            )
+        ]
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
