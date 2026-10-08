@@ -237,11 +237,13 @@ from seerdb.common.tns_consts import (
     ORA_CANNOT_KILL_CURRENT_SESSION,
     ORA_CHECK_CONSTRAINT_VIOLATED,
     ORA_DIVISOR_IS_ZERO,
+    ORA_INCONSISTENT_DATATYPES,
     ORA_INVALID_BIND_VARIABLE_NAME,
     ORA_INVALID_CREATE_COMMAND,
     ORA_INVALID_DATATYPE,
     ORA_INVALID_IDENTIFIER,
     ORA_INVALID_NUMBER,
+    ORA_INVALID_ROWID,
     ORA_INVALID_SESSION_ID,
     ORA_INVALID_SQL_STATEMENT,
     ORA_INVALID_USERNAME_PASSWORD,
@@ -361,6 +363,37 @@ _INTERVALYM_TYPE_DDL = (
 _DATE_TYPE = 'ora_date'
 _DATE_TYPE_DDL = (
     'DO $$ BEGIN CREATE DOMAIN ora_date AS timestamp(0); '
+    'EXCEPTION WHEN duplicate_object THEN NULL; END $$'
+)
+
+# The statements the ROWID check reads (#1624): INSERT INTO t (cols) VALUES (,
+# and UPDATE t [alias] SET, in a statement whose quoted parts are masked.
+_ROWID_INSERT = re.compile(
+    r'(?is)\s*INSERT\s+INTO\s+("[^"]*"|[\w$#.]+)\s*\(([^()]*)\)\s*VALUES\s*\('
+)
+_ROWID_UPDATE = re.compile(
+    r'(?is)\s*UPDATE\s+("[^"]*"|[\w$#.]+)(?:\s+(?!SET\b)\w+)?\s+SET\s+'
+)
+
+
+def _pg_name(name: str) -> str:
+    # An Oracle (possibly schema-qualified) name as to_regclass reads it: an
+    # unquoted part folded to PostgreSQL's lower case, a quoted one kept.
+    return '.'.join(
+        part if part.startswith('"') else part.lower()
+        for part in re.split(r'\s*\.\s*', name.strip())
+    )
+
+
+_NUMBER_LITERAL = re.compile(r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?')
+
+# A ROWID column (#1624): its text, which must read as a rowid -- 18 of Oracle's
+# base64 characters, the form sys.ora_rowid writes -- or the INSERT / UPDATE is
+# ORA-01410, as Oracle's is. The check's name says which error it is.
+_ROWID_FORMAT = 'ora_rowid_format'
+_ROWID_TYPE_DDL = (
+    'DO $$ BEGIN CREATE DOMAIN ora_rowid AS varchar(18) '
+    f'CONSTRAINT {_ROWID_FORMAT} CHECK (VALUE ~ ' + "'^[A-Za-z0-9+/]{18}$'); "
     'EXCEPTION WHEN duplicate_object THEN NULL; END $$'
 )
 
@@ -2297,7 +2330,7 @@ _DDL_TYPE_REWRITES = [
     # SYS.XMLTYPE (#1536, #1537). The type name only: one followed by `(` is the
     # SYS.XMLTYPE(...) constructor, which a CREATE TABLE ... AS SELECT may call.
     (re.compile(r'\b(?:SYS\.)?XMLTYPE\b(?!\s*\()', re.IGNORECASE), 'xml'),
-    (re.compile(r'([(,]\s*\w+)\s+ROWID\b', re.IGNORECASE), r'\1 varchar(18)'),
+    (re.compile(r'([(,]\s*\w+)\s+ROWID\b', re.IGNORECASE), r'\1 ora_rowid'),
     (re.compile(r'\bLONG\s+RAW\b', re.IGNORECASE), 'bytea'),
     (re.compile(r'\bRAW\s*\(\s*\d+\s*\)', re.IGNORECASE), 'bytea'),
     (re.compile(r'\bRAW\b', re.IGNORECASE), 'bytea'),
@@ -7461,6 +7494,13 @@ def _backend_error(
         and _primary_message(exc).startswith('type "')
     ):
         code = ORA_INVALID_DATATYPE
+    if (
+        getattr(exc, 'sqlstate', None) == '23514'
+        and getattr(getattr(exc, 'diag', None), 'constraint_name', None)
+        == _ROWID_FORMAT
+    ):
+        # A ROWID column's text that reads as no rowid (#1624).
+        return BackendError('invalid ROWID', ora_code=ORA_INVALID_ROWID)
     application = _application_error(exc)
     if application is not None:
         # The user's own text, which the Mirror prefixes with the code.
@@ -8160,6 +8200,7 @@ class PostgresBackend:
             self._conn.execute(_INTERVALYM_TYPE_DDL)
             self._conn.execute(_DATE_TYPE_DDL)
             self._conn.execute(_DATE_ARITHMETIC_DDL)
+            self._conn.execute(_ROWID_TYPE_DDL)
             for name, tns_type in (
                 (_CLOB_TYPE, TNS_TYPE_CLOB),
                 (_BLOB_TYPE, TNS_TYPE_BLOB),
@@ -8759,6 +8800,9 @@ class PostgresBackend:
             return self._kill_session(kill.group(1))
         if native:
             return self._execute_native(sql, binds)
+        refused = self._rowid_number_error(sql, binds)
+        if refused is not None:
+            raise refused
         sql = _ruled('package-function-call', self._call_package_functions(sql), sql)
         bare = _BARE_CALL.match(sql)
         if bare is not None and bare.group(1).upper() not in _PLSQL_WORD_STATEMENTS:
@@ -12100,6 +12144,83 @@ class PostgresBackend:
             (routine, schema, schema),
         ).fetchone()
         return row is not None
+
+    def _rowid_columns(self, table: str) -> frozenset[str]:
+        # The ROWID columns of a table a statement names (#1624), lower case.
+        rows = self._conn.execute(
+            'SELECT a.attname FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid '
+            "WHERE a.attrelid = to_regclass(%s) AND t.typname = 'ora_rowid' "
+            'AND NOT a.attisdropped',
+            (table,),
+        ).fetchall()
+        return frozenset(name for (name,) in rows)
+
+    def _rowid_number_error(self, sql: str, binds: Sequence) -> BackendError | None:
+        """ORA-00932 for a number an INSERT ... VALUES or an UPDATE ... SET puts
+        in a ROWID column (#1624), as Oracle refuses one. PostgreSQL converts
+        it to its text, which the column's format check would only refuse as
+        ORA-01410. A number bind or literal is caught here; one a query
+        computes is left to that check."""
+        if 'rowid' not in sql.lower() and not self._has_rowid_columns():
+            return None
+        (masked, _contents) = _mask_quoted(sql)
+        insert = _ROWID_INSERT.match(masked)
+        update = None if insert else _ROWID_UPDATE.match(masked)
+        if insert is None and update is None:
+            return None
+        if insert is not None:
+            table = insert.group(1)
+            names = [
+                masked[a:b].strip()
+                for a, b in _top_level_items(masked, insert.start(2), insert.end(2))
+            ]
+            close = _matching_paren(masked, insert.end() - 1)
+            values = [
+                masked[a:b].strip()
+                for a, b in _top_level_items(masked, insert.end(), close)
+            ]
+            pairs = list(zip(names, values))
+        else:
+            assert update is not None
+            table = update.group(1)
+            pairs = []
+            for a, b in _top_level_items(masked, update.end(), len(masked)):
+                (column, eq, value) = masked[a:b].partition('=')
+                if eq:
+                    pairs.append(
+                        (column.strip(), re.split(r'(?i)\bWHERE\b', value)[0].strip())
+                    )
+        rowid_columns = self._rowid_columns(_pg_name(table))
+        if not rowid_columns:
+            return None
+        bind_values = dict(zip(_bind_names(sql), binds))
+        for column, value in pairs:
+            last = re.split(r'\s*\.\s*', column)[-1]
+            if (
+                last[1:-1] if last.startswith('"') else last.lower()
+            ) not in rowid_columns:
+                continue
+            ref = _BIND_REF.fullmatch(value)
+            given = bind_values.get(_bind_name(ref)) if ref is not None else None
+            number = (
+                isinstance(given, (int, float, decimal.Decimal))
+                and not isinstance(given, bool)
+            ) or (ref is None and _NUMBER_LITERAL.fullmatch(value) is not None)
+            if number:
+                return BackendError(
+                    'inconsistent datatypes: expected ROWID got NUMBER',
+                    ora_code=ORA_INCONSISTENT_DATATYPES,
+                )
+        return None
+
+    def _has_rowid_columns(self) -> bool:
+        # Whether any table has a ROWID column at all (#1624), so a statement
+        # into none costs no lookup. Read at once: ROWID columns are rare.
+        row = self._conn.execute(
+            'SELECT EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_type t '
+            "ON t.oid = a.atttypid WHERE t.typname = 'ora_rowid' AND NOT a.attisdropped)"
+        ).fetchone()
+        return bool(row and row[0])
 
     def _package_functions(self) -> dict[str, frozenset[str]]:
         # Each package's functions that take no argument a call must give
