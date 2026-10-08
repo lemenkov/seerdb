@@ -1118,6 +1118,11 @@ _DBMS_OUTPUT_LINES_DDL = (
 # the schema; the views surface UPPER-cased names and take the current schema as
 # the "owner", so a table created through the Mirror shows up under the connected
 # user's schema. Installed idempotently at connect alongside the helper functions.
+# The comment a user's standalone routine carries (#1606), with its status, so
+# ALL_OBJECTS and ALL_PROCEDURES can tell it from the backend's own helpers,
+# which share its schemas. DROP takes the comment with the routine.
+_ROUTINE_MARK: Final = 'seerdb:routine:'
+
 _ORACLE_DICTIONARY_DDL = (
     # SYS_CONTEXT('userenv', <param>) — the session context the dialect reads to
     # learn its current schema/user before it reflects anything.
@@ -1581,13 +1586,21 @@ _ORACLE_DICTIONARY_DDL = (
     "t.object_type, t.status, 'N', 'N', 'N' FROM sys.ora_packages k "
     'JOIN pg_namespace n ON n.nspname = k.name CROSS JOIN LATERAL '
     "(VALUES ('PACKAGE', k.spec), ('PACKAGE BODY', k.body)) t(object_type, status) "
-    'WHERE t.status IS NOT NULL;'
+    'WHERE t.status IS NOT NULL '
+    # A user's standalone procedure or function, VALID or INVALID (#1606).
+    'UNION ALL SELECT ora_owner(n.nspname), ora_name(p.proname), NULL::text, '
+    "p.oid::bigint, CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, "
+    f"substr(d.description, {len(_ROUTINE_MARK) + 1}), 'N', 'N', 'N' "
+    'FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace '
+    "JOIN pg_description d ON d.objoid = p.oid AND d.classoid = 'pg_proc'::regclass "
+    f"AND d.objsubid = 0 WHERE d.description LIKE '{_ROUTINE_MARK}%';"
     # orafce has a user_objects too, which lists every schema's objects under
     # their PostgreSQL names; this one is the current schema's, Oracle's way.
     'CREATE OR REPLACE VIEW sys.user_objects AS SELECT * FROM all_objects '
     'WHERE owner=upper(current_schema());'
     # A package and the routines its spec declares, overloads numbered in the
-    # order the spec gives them (#1605). A standalone routine is not listed yet.
+    # order the spec gives them (#1605), and a user's valid standalone routine,
+    # under its own name with no procedure name (#1606).
     'CREATE OR REPLACE VIEW sys.all_procedures AS SELECT k.owner, '
     'upper(k.name) AS object_name, NULL::text AS procedure_name, '
     'n.oid::bigint AS object_id, 0 AS subprogram_id, NULL::text AS overload, '
@@ -1605,7 +1618,14 @@ _ORACLE_DICTIONARY_DDL = (
     'procedure_name, n.oid::bigint AS object_id, p.oid, '
     "position(('.' || p.proname || '(') IN lower(k.stubs)) AS declared "
     'FROM sys.ora_packages k JOIN pg_namespace n ON n.nspname = k.name '
-    'JOIN pg_proc p ON p.pronamespace = n.oid) m WHERE declared > 0;'
+    'JOIN pg_proc p ON p.pronamespace = n.oid) m WHERE declared > 0 '
+    'UNION ALL SELECT ora_owner(n.nspname), ora_name(p.proname), NULL::text, '
+    'p.oid::bigint, 1, NULL::text, '
+    "CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, "
+    "'NO', 'NO', 'NO', 'NO', 'NO', 'DEFINER' "
+    'FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace '
+    "JOIN pg_description d ON d.objoid = p.oid AND d.classoid = 'pg_proc'::regclass "
+    f"AND d.objsubid = 0 WHERE d.description = '{_ROUTINE_MARK}VALID';"
     'CREATE OR REPLACE VIEW sys.user_procedures AS SELECT * FROM all_procedures '
     'WHERE owner=upper(current_schema());'
     # The types a package's spec declares (#1607), as 23ai lists them; a named
@@ -5911,8 +5931,23 @@ def _guarded_body(block: str) -> str:
     )
 
 
+def _routine_mark(name: str, status: str) -> str:
+    # The statement that marks every routine of `name` -- one, as the routine
+    # DDL drops it by name first -- as a user's, VALID or INVALID (#1606).
+    (schema, _dot, routine) = name.lower().rpartition('.')
+    namespace = (
+        f"'{schema}'::regnamespace" if schema else 'current_schema()::regnamespace'
+    )
+    return (
+        'DO $m$ DECLARE r regprocedure; BEGIN FOR r IN SELECT p.oid::regprocedure '
+        f"FROM pg_proc p WHERE p.proname = '{routine}' AND p.pronamespace = {namespace} "
+        "LOOP EXECUTE format('COMMENT ON ROUTINE %s IS %L', r, "
+        f"'{_ROUTINE_MARK}{status}'); END LOOP; END $m$"
+    )
+
+
 def _translate_routine_ddl(
-    sql: str, user_routines: frozenset[str] | None = None
+    sql: str, user_routines: frozenset[str] | None = None, mark: bool = True
 ) -> str:
     """Rewrite an Oracle ``CREATE PROCEDURE`` / ``CREATE FUNCTION`` to a PL/pgSQL
     routine (#503): translate the parameter types + ``IN OUT`` → ``INOUT``, map
@@ -5954,7 +5989,9 @@ def _translate_routine_ddl(
         and _guards_no_data_found(name, body, user_routines)
     ):
         block = _guarded_body(block)
-    return f'{drop} {header} LANGUAGE plpgsql AS $$ {block} $$'
+    created = f'{drop} {header} LANGUAGE plpgsql AS $$ {block} $$'
+    # A package's member is the package's, listed with it (#1605).
+    return f'{created}; {_routine_mark(name, "VALID")}' if mark else created
 
 
 # --- PL/SQL packages (#1605) ---------------------------------------------------
@@ -6518,6 +6555,7 @@ def _package_routine(
     translated = _translate_routine_ddl(
         f'CREATE OR REPLACE {member.kind} {name}{params}{returns} IS {body}',
         user_routines,
+        mark=False,
     )
     return translated.removeprefix(f'DROP {member.kind} IF EXISTS {name}; ')
 
@@ -9106,7 +9144,8 @@ class PostgresBackend:
             stub = (
                 f'DROP {kind} IF EXISTS {name}; CREATE {kind} {name}(){returns} '
                 'LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION USING ERRCODE = '
-                f"'42883', MESSAGE = 'function {name}() does not exist'; END $$"
+                f"'42883', MESSAGE = 'function {name}() does not exist'; END $$; "
+                + _routine_mark(name, 'INVALID')
             )
         elif type_ is not None:
             name = type_.group(1)
