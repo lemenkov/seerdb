@@ -912,6 +912,17 @@ CREATE OR REPLACE PROCEDURE dbms_session.sleep(seconds double precision)
   LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(seconds); END $$;
 """
 
+# DBMS_SQL.RETURN_RESULT (#1617): a block hands an open cursor back to its
+# client as an implicit result. orafce's DBMS_SQL has no such procedure. This
+# one names the cursor's portal in a notice, and the backend fetches the rows
+# once the block has run; TO_CLIENT is taken, and every result goes to the
+# client, as there is no caller in between to give it to.
+_DBMS_SQL_RETURN_RESULT_DDL = """
+CREATE SCHEMA IF NOT EXISTS dbms_sql;
+CREATE OR REPLACE PROCEDURE dbms_sql.return_result(rc refcursor, to_client boolean DEFAULT true)
+  LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE '%', 'seerdb: implicit result ' || rc; END $$;
+"""
+
 
 # SYS.DBMSOUTPUT_LINESARRAY (#1411): DBMS_OUTPUT.GET_LINES's collection, a
 # VARRAY(2147483647) OF VARCHAR2(32767) on Oracle. sqlplus describes it by name
@@ -2642,6 +2653,8 @@ _DDL_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '1s'"
 # its RELEASE; and a ROLLBACK TO an earlier savepoint destroys it.
 # The notice sys.ora_commit_request() raises (#1630).
 _COMMIT_REQUEST = 'seerdb: commit requested'
+# The notice dbms_sql.return_result() raises, before the portal's name (#1617).
+_IMPLICIT_RESULT = 'seerdb: implicit result '
 _TRANSACTION_END = re.compile(r'\s*(COMMIT|ROLLBACK)(?:\s+WORK)?\s*\Z', re.IGNORECASE)
 _SAVEPOINT_NAME = r'("[^"]+"|[A-Za-z][\w$]*)'
 _SAVEPOINT = re.compile(rf'\s*SAVEPOINT\s+{_SAVEPOINT_NAME}\s*\Z', re.IGNORECASE)
@@ -7619,6 +7632,9 @@ class PostgresBackend:
         # Whether a routine the running call reached asked for a commit (#1630).
         self._commit_requested = False
         self._conn.add_notice_handler(self._hear_commit_request)
+        # The portals the running call returned as implicit results (#1617).
+        self._implicit_portals: list[str] = []
+        self._conn.add_notice_handler(self._hear_implicit_result)
         # Shared, not copied, when a dict is given: the example hands one map to
         # every backend it creates, and ALTER USER ... IDENTIFIED BY rewrites an
         # entry in place so the new password reaches the next login. A read-only
@@ -7810,6 +7826,11 @@ class PostgresBackend:
         # DBMS_LOCK.SLEEP / DBMS_SESSION.SLEEP (#1511).
         try:
             self._conn.execute(_DBMS_SLEEP_DDL)
+        except psycopg.Error:
+            self._conn.rollback()
+        # DBMS_SQL.RETURN_RESULT (#1617).
+        try:
+            self._conn.execute(_DBMS_SQL_RETURN_RESULT_DDL)
         except psycopg.Error:
             self._conn.rollback()
         # DBMS_OUTPUT.GET_LINES's collection type (#1411).
@@ -8152,8 +8173,36 @@ class PostgresBackend:
     @_while_connected
     def execute(self, sql: str, binds: Sequence = ()) -> Result:
         return self._committing(
-            lambda: self._reported(sql, lambda: self._execute_statement(sql, binds))
+            lambda: self._with_implicit_results(
+                lambda: self._reported(sql, lambda: self._execute_statement(sql, binds))
+            )
         )
+
+    def _hear_implicit_result(self, diagnostic: psycopg.errors.Diagnostic) -> None:
+        message = diagnostic.message_primary or ''
+        if message.startswith(_IMPLICIT_RESULT):
+            self._implicit_portals.append(message[len(_IMPLICIT_RESULT) :])
+
+    def _with_implicit_results(self, call: Callable[[], Result]) -> Result:
+        # A call whose block returned cursors through DBMS_SQL.RETURN_RESULT
+        # (#1617) answers with their rows as implicit results, in the order it
+        # returned them, each portal fetched and closed -- before a COMMIT the
+        # block asked for, which would close them.
+        self._implicit_portals = []
+        result = call()
+        portals, self._implicit_portals = self._implicit_portals, []
+        if not portals:
+            return result
+        implicit = []
+        for portal in portals:
+            name = sql.Identifier(portal)
+            fetch = sql.SQL('FETCH ALL FROM {}').format(name)
+            with self._conn.cursor() as cursor:
+                cursor.execute(fetch)
+                fetched = self._build_result(cursor)
+                cursor.execute(sql.SQL('CLOSE {}').format(name))
+            implicit.append((fetched.columns, fetched.rows))
+        return replace(result, implicit_results=implicit)
 
     def _hear_commit_request(self, diagnostic: psycopg.errors.Diagnostic) -> None:
         if diagnostic.message_primary == _COMMIT_REQUEST:
