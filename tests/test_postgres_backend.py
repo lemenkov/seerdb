@@ -2109,8 +2109,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # integer types, sys.ora_to_raw's two overloads (#1496), sys.ora_raw_fits
     # (#1415), sys.ora_float_round (#1422), sys.ora_numeric_div (#1598),
     # sys.ora_package_unusable (#1605), sys.ora_is_json's two (#1614) and
-    # sys.ora_commit_request (#1630).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 74
+    # sys.ora_commit_request (#1630), and sys.ora_rr_shift and the two
+    # sys.ora_rr_year (#1638).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 77
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
@@ -3511,6 +3512,37 @@ def test_a_blob_bind_describes_as_a_blob() -> None:
             backend.execute('DROP TABLE bb1625t')
         except Exception:
             backend.rollback()
+
+
+def test_rr_years_print_and_parse_as_in_oracle() -> None:
+    # Oracle's RR and RRRR years (#1638): printed as YY / YYYY, read into the
+    # RR window -- 00-49 this century, 50-99 the last, while the current year
+    # ends in 00-49 (true until 2050) -- and four digits as they are. 23ai's.
+    assert _translate_idioms("SELECT TO_CHAR(d, 'DD-MON-RR') FROM t") == (
+        "SELECT TO_CHAR(d, 'DD-MON-YY') FROM t"
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for expr, expected in (
+            ("TO_CHAR(DATE '2000-12-15', 'DD-MON-RR')", '15-DEC-00'),
+            ("TO_CHAR(DATE '2000-12-15', 'DD-MON-RRRR')", '15-DEC-2000'),
+            ("TO_CHAR(TO_DATE('15-DEC-60', 'DD-MON-RR'), 'YYYY')", '1960'),
+            ("TO_CHAR(TO_DATE('15-DEC-49', 'DD-MON-RR'), 'YYYY')", '2049'),
+            ("TO_CHAR(TO_DATE('15-DEC-00', 'DD-MON-RR'), 'YYYY-MM-DD')", '2000-12-15'),
+            ("TO_CHAR(TO_DATE('15-DEC-1960', 'DD-MON-RR'), 'YYYY')", '1960'),
+            ("TO_CHAR(TO_DATE('15-DEC-60', 'DD-MON-RRRR'), 'YYYY')", '1960'),
+            ("TO_CHAR(TO_DATE('15-DEC-60', 'DD-MON-YY'), 'YYYY')", '2060'),
+            (
+                "TO_CHAR(TO_TIMESTAMP('15-DEC-75 10:00', 'DD-MON-RR HH24:MI'), "
+                "'YYYY HH24')",
+                '1975 10',
+            ),
+        ):
+            (row,) = backend.execute(f'SELECT {expr} FROM dual').rows
+            assert row[0] == expected, expr
+    finally:
+        backend.rollback()
+        backend.close()
 
 
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
