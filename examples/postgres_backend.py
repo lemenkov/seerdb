@@ -128,6 +128,10 @@ honest edge of this adapter:
   refused (``invalid byte sequence for encoding "UTF8"``) rather than stored
   and handed back for a client to replace (#1659). An application should
   check its text before writing it.
+- **Editions, by name only** -- CREATE / DROP EDITION, ALTER SESSION SET
+  EDITION and a login's edition keep the session's edition, which
+  CURRENT_EDITION_NAME reads (#1662). Objects are not versioned per edition:
+  every session sees the same ones whatever edition it is in.
 - **Privileges, for type lookup only** -- every Mirror user is the backend's
   one PostgreSQL role. A GRANT or REVOKE on an object is recorded
   (``sys.ora_grants``), and a user sees another user's type -- in ALL_TYPES,
@@ -1130,6 +1134,16 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE TABLE IF NOT EXISTS sys.ora_sessions (pid integer PRIMARY KEY, '
     'username text, program text, machine text, terminal text, osuser text, '
     'driver text);'
+    # Editions (#1662): the names CREATE EDITION made, ORA$BASE always there,
+    # and the session's own in seerdb.edition. Only the name is kept: objects
+    # are not versioned per edition.
+    'CREATE TABLE IF NOT EXISTS sys.ora_editions (name text PRIMARY KEY, parent text);'
+    "INSERT INTO sys.ora_editions VALUES ('ORA$BASE', NULL) ON CONFLICT DO NOTHING;"
+    'CREATE OR REPLACE FUNCTION sys.ora_set_edition(name text) RETURNS void '
+    'LANGUAGE plpgsql AS $$ BEGIN IF NOT EXISTS (SELECT 1 FROM sys.ora_editions e '
+    "WHERE e.name = $1) THEN RAISE EXCEPTION USING ERRCODE = 'P0001', "
+    "MESSAGE = 'ORA-38802: edition does not exist'; END IF; "
+    "PERFORM set_config('seerdb.edition', $1, false); END $$;"
     'CREATE OR REPLACE FUNCTION sys.sys_context(text, text) RETURNS text '
     # A namespace other than USERENV is an application context: what the
     # client declared at login (`connect(appcontext=...)`), kept in a session
@@ -1148,6 +1162,11 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN 'session_user' THEN coalesce(nullif(current_setting('seerdb.session_user', "
     "true), ''), upper(session_user::text)) "
     "WHEN 'proxy_user' THEN nullif(current_setting('seerdb.proxy_user', true), '') "
+    # The session's edition (#1662), ORA$BASE until one is set.
+    "WHEN 'current_edition_name' THEN coalesce(nullif(current_setting('seerdb.edition', "
+    "true), ''), 'ORA$BASE') "
+    "WHEN 'session_edition_name' THEN coalesce(nullif(current_setting('seerdb.edition', "
+    "true), ''), 'ORA$BASE') "
     "WHEN 'current_schemaid' THEN current_setting('search_path') "
     "WHEN 'db_name' THEN upper(current_database()) "
     # The service the client connected to, which the Mirror hands over (#1409).
@@ -3394,10 +3413,61 @@ def _object_grant(match: re.Match[str]) -> str:
     )
 
 
+# CREATE / DROP EDITION and ALTER SESSION SET EDITION (#1662).
+_EDITION_NAME = r'("[^"]+"|[\w$#]+)'
+_CREATE_EDITION = re.compile(
+    rf'(?is)\s*CREATE\s+EDITION\s+{_EDITION_NAME}(?:\s+AS\s+CHILD\s+OF\s+{_EDITION_NAME})?'
+    r'\s*;?\s*$'
+)
+_DROP_EDITION = re.compile(
+    rf'(?is)\s*DROP\s+EDITION\s+{_EDITION_NAME}(?:\s+CASCADE)?\s*;?\s*$'
+)
+_ALTER_SESSION_EDITION = re.compile(
+    rf'(?is)\s*ALTER\s+SESSION\s+SET\s+EDITION\s*=\s*{_EDITION_NAME}\s*;?\s*$'
+)
+
+
+def _edition_statement(sql: str) -> str | None:
+    # An edition statement as PL/pgSQL (#1662): Oracle's errors raised as its
+    # ORA text, which names the code. None for any other statement.
+    m = _CREATE_EDITION.match(sql)
+    if m:
+        name = _sql_text(_oracle_name(m.group(1)))
+        parent = _sql_text(_oracle_name(m.group(2)) if m.group(2) else 'ORA$BASE')
+        return (
+            f'DO $$ BEGIN IF EXISTS (SELECT 1 FROM sys.ora_editions WHERE name = {name}) '
+            "THEN RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = "
+            "'ORA-00955: name is already used by an existing object'; END IF; "
+            f'INSERT INTO sys.ora_editions VALUES ({name}, {parent}); END $$'
+        )
+    m = _DROP_EDITION.match(sql)
+    if m:
+        name = _sql_text(_oracle_name(m.group(1)))
+        return (
+            f'DO $$ BEGIN DELETE FROM sys.ora_editions WHERE name = {name} '
+            "AND name <> 'ORA$BASE'; IF NOT FOUND THEN RAISE EXCEPTION USING "
+            "ERRCODE = 'P0001', MESSAGE = 'ORA-38802: edition does not exist'; "
+            'END IF; END $$'
+        )
+    m = _ALTER_SESSION_EDITION.match(sql)
+    if m:
+        name = _sql_text(_oracle_name(m.group(1)))
+        return f'DO $$ BEGIN PERFORM sys.ora_set_edition({name}); END $$'
+    return None
+
+
+def _sql_text(value: str) -> str:
+    # A Python string as a PostgreSQL string literal.
+    return "'" + value.replace("'", "''") + "'"
+
+
 def _translate_admin(sql: str) -> str:
     m = _OBJECT_GRANT.match(sql)
     if m:
         return _object_grant(m)
+    edition = _edition_statement(sql)
+    if edition is not None:
+        return edition
     m = _ALTER_SESSION_SCHEMA.match(sql)
     if m:
         return f'SET search_path TO {m.group(1).lower()}, {_SEARCH_PATH_TAIL}'
@@ -8433,6 +8503,16 @@ class PostgresBackend:
         # The driver name arrives only in the second login message (#1212).
         self._client_driver = connect_attrs.get('driver_name')
         self._open_as(connect_attrs.get('proxy_client_name'))
+        edition = connect_attrs.get('edition')
+        if edition:
+            # The edition the client connected in (#1662); one that does not
+            # exist refuses the login, ORA-38802, as Oracle's does.
+            try:
+                self._conn.execute('SELECT sys.ora_set_edition(%s)', (edition.upper(),))
+                self._conn.commit()
+            except psycopg.Error as exc:
+                self._conn.rollback()
+                raise _backend_error(exc) from exc
         # The service the client connected to, for USERENV SERVICE_NAME (#1409),
         # kept in a session setting as the tracing attributes are.
         service = connect_attrs.get('service_name')
