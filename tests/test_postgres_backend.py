@@ -1308,6 +1308,43 @@ def test_translate_admin_maps_session_user_and_index() -> None:
     )
 
 
+def test_a_session_formats_dates_by_its_nls_date_format() -> None:
+    # TO_CHAR of a DATE with no format follows the session's NLS_DATE_FORMAT
+    # (#1616): Oracle's DD-MON-RR from the start, then what ALTER SESSION set,
+    # which NLS_SESSION_PARAMETERS reports. RR prints as YY does. The values
+    # are 23ai's.
+    assert _translate_admin("ALTER SESSION SET NLS_DATE_FORMAT = 'DD-MON-RRRR'") == (
+        "SET orafce.nls_date_format = 'DD-MON-YYYY'; "
+        "SET seerdb.nls_date_format = 'DD-MON-RRRR'"
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    date = "TO_DATE('2000-12-15 07:03', 'YYYY-MM-DD HH24:MI')"
+    try:
+        backend.authenticate('pyo')
+
+        def session_format() -> str:
+            return backend.execute(
+                'SELECT value FROM nls_session_parameters '
+                "WHERE parameter = 'NLS_DATE_FORMAT'"
+            ).rows[0][0]
+
+        assert backend.execute(f'SELECT TO_CHAR({date}) FROM dual').rows == [
+            ('15-DEC-00',)
+        ]
+        assert session_format() == 'DD-MON-RR'
+        backend.execute("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI'")
+        assert backend.execute(f'SELECT TO_CHAR({date}) FROM dual').rows == [
+            ('2000-12-15 07:03',)
+        ]
+        assert session_format() == 'YYYY-MM-DD HH24:MI'
+        # An ALTER SESSION outlives a rollback, as Oracle's does.
+        backend.rollback()
+        assert session_format() == 'YYYY-MM-DD HH24:MI'
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_translate_admin_sets_the_session_time_zone_without_inverting_it() -> None:
     # A 12.1+ client sends ALTER SESSION SET TIME_ZONE at login. PostgreSQL reads
     # a bare offset as POSIX and INVERTS it (`SET TIME ZONE '+05:30'` runs at
@@ -1329,7 +1366,7 @@ def test_translate_admin_sets_the_session_time_zone_without_inverting_it() -> No
         "PERFORM set_config('seerdb.time_zone', 'Europe/Moscow', false); END $$"
     )
     # Any other ALTER SESSION is still the harmless no-op it was.
-    assert _translate_admin("ALTER SESSION SET NLS_DATE_FORMAT='YYYY'") == _NO_OP
+    assert _translate_admin("ALTER SESSION SET NLS_SORT='BINARY'") == _NO_OP
 
 
 def test_sessiontimezone_reads_the_zone_the_session_was_given() -> None:
