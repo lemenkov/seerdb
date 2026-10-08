@@ -2071,8 +2071,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # 47, ora_div (#1361) and power (#1362) for each of the nine pairs of
     # integer types, sys.ora_to_raw's two overloads (#1496), sys.ora_raw_fits
     # (#1415), sys.ora_float_round (#1422), sys.ora_numeric_div (#1598),
-    # sys.ora_package_unusable (#1605) and sys.ora_is_json's two (#1614).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 73
+    # sys.ora_package_unusable (#1605), sys.ora_is_json's two (#1614) and
+    # sys.ora_commit_request (#1630).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 74
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
@@ -3112,6 +3113,69 @@ def test_a_cursors_attributes_read_as_in_oracle() -> None:
                 backend.execute(statement)
             except Exception:
                 backend.rollback()
+
+
+def test_a_commit_in_a_routine_commits_once_the_call_succeeds() -> None:
+    # A COMMIT in a procedure, a package member or a block (#1630) commits the
+    # caller's open work with the routine's, as Oracle's does, once the call
+    # has succeeded; a call that fails before it commits nothing. The rows
+    # another session sees are 23ai's.
+    from seerdb.server import BackendError
+
+    assert _translate_idioms('COMMIT') == 'COMMIT'
+    assert _translate_idioms(
+        'CREATE GLOBAL TEMPORARY TABLE t (n NUMBER) ON COMMIT DELETE ROWS'
+    ) == ('CREATE GLOBAL TEMPORARY TABLE t (n NUMBER) ON COMMIT DELETE ROWS')
+    assert _translate_idioms("BEGIN x := 'commit;'; COMMIT WORK; END;") == (
+        "BEGIN x := 'commit;'; PERFORM sys.ora_commit_request(); END;"
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    other = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+
+    def committed() -> list[int]:
+        rows = other.execute('SELECT n FROM cm1630t ORDER BY n').rows
+        other.rollback()
+        return [int(row[0]) for row in rows]
+
+    try:
+        backend.execute('CREATE TABLE cm1630t (n NUMBER)')
+        backend.execute(
+            'CREATE OR REPLACE PROCEDURE cm1630(v NUMBER, fail NUMBER) IS\nBEGIN\n'
+            '  INSERT INTO cm1630t VALUES (v);\n'
+            "  IF fail = 1 THEN raise_application_error(-20001, 'boom'); END IF;\n"
+            '  COMMIT;\nEND;'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE cm1630p AS PROCEDURE p(v NUMBER); END;'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE BODY cm1630p AS PROCEDURE p(v NUMBER) IS\n'
+            'BEGIN\n  INSERT INTO cm1630t VALUES (v);\n  COMMIT;\nEND;\nEND;'
+        )
+        backend.execute('INSERT INTO cm1630t VALUES (1)')
+        backend.execute('BEGIN cm1630(2, 0); END;')
+        assert committed() == [1, 2]
+        with pytest.raises(BackendError) as exc:
+            backend.execute('BEGIN cm1630(4, 1); END;')
+        assert exc.value.ora_code == 20001
+        assert committed() == [1, 2]
+        backend.execute('BEGIN INSERT INTO cm1630t VALUES (5); COMMIT; END;')
+        assert committed() == [1, 2, 5]
+        backend.execute('BEGIN cm1630p.p(6); END;')
+        assert committed() == [1, 2, 5, 6]
+    finally:
+        backend.rollback()
+        for statement in (
+            'DROP PACKAGE cm1630p',
+            'DROP PROCEDURE cm1630',
+            'DROP TABLE cm1630t',
+        ):
+            try:
+                backend.execute(statement)
+            except Exception:
+                backend.rollback()
+        other.close()
+        backend.close()
 
 
 def test_get_type_shape_of_a_rowtype_with_a_date_column() -> None:

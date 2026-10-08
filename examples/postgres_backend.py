@@ -113,6 +113,15 @@ honest edge of this adapter:
   and PL/pgSQL checks an identifier when the routine runs, not when it is
   created, so a body Oracle would refuse can compile and fail on its first call
   instead.
+- **A COMMIT in a routine or a block, deferred** — PostgreSQL ends no
+  transaction in a function, nor in a procedure called with one open, and the
+  Mirror always has one open. Such a COMMIT asks instead, and the backend
+  commits once the client's call has succeeded: the caller's open work and the
+  routine's, as Oracle's COMMIT does. A COMMIT that is the routine's last
+  statement behaves exactly as Oracle's; one in the middle differs in that the
+  work after it is committed too, where Oracle leaves it open, and a call that
+  fails after it commits nothing, where Oracle keeps what came before it. A
+  ROLLBACK in a routine is not translated and fails.
 - **Object types, partly** — ``CREATE TYPE ... AS OBJECT`` is a PostgreSQL
   composite, listed in ``all_types`` / ``all_type_attrs`` under an OID that is the
   composite's own ``pg_type`` oid, zero-padded to Oracle's 16 bytes. An object
@@ -434,6 +443,10 @@ _HELPER_FUNCTIONS_DDL = (
     "'INVALID' THEN format('ORA-04063: package body \"%s.%s\" has errors', "
     "p.owner, upper($1)) ELSE format('ORA-04067: not executed, package body "
     '"%s.%s" does not exist\', p.owner, upper($1)) END; END $$;'
+    # A COMMIT in a routine or a block (#1630): PostgreSQL ends no transaction
+    # there, so it asks the backend to commit once the client's call succeeds.
+    'CREATE OR REPLACE FUNCTION sys.ora_commit_request() RETURNS void '
+    "LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'seerdb: commit requested'; END $$;"
     # x IS JSON (#1614), for a value of a domain too: PostgreSQL's own condition
     # takes text and bytea, and resolves no domain over either to it.
     'CREATE OR REPLACE FUNCTION sys.ora_is_json(text) RETURNS boolean '
@@ -2618,6 +2631,8 @@ _DDL_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '1s'"
 # ROLLBACK ends the transaction and the savepoint with it, so the RELEASE after
 # it failed and the session was lost; a user SAVEPOINT taken inside it died with
 # its RELEASE; and a ROLLBACK TO an earlier savepoint destroys it.
+# The notice sys.ora_commit_request() raises (#1630).
+_COMMIT_REQUEST = 'seerdb: commit requested'
 _TRANSACTION_END = re.compile(r'\s*(COMMIT|ROLLBACK)(?:\s+WORK)?\s*\Z', re.IGNORECASE)
 _SAVEPOINT_NAME = r'("[^"]+"|[A-Za-z][\w$]*)'
 _SAVEPOINT = re.compile(rf'\s*SAVEPOINT\s+{_SAVEPOINT_NAME}\s*\Z', re.IGNORECASE)
@@ -3636,6 +3651,19 @@ _IDIOM_REWRITES: list[
             if m.group(1).upper() == 'SQL'
             else f'(SELECT count(*) > 0 FROM pg_cursors WHERE name = {m.group(1)}::text)'
         ),
+    ),
+    # A COMMIT statement in a routine or a block (#1630) as a request that the
+    # backend commit once the client's call has succeeded: PostgreSQL commits in
+    # no function, nor in a procedure CALLed in an open transaction, and the
+    # Mirror's always is. A COMMIT the client sends alone is no statement in a
+    # block, and ON COMMIT follows no statement boundary.
+    (
+        'commit-in-block',
+        re.compile(
+            r'((?:;|\b(?:BEGIN|THEN|ELSE|LOOP)\b)\s*)COMMIT(?:\s+WORK)?\s*;',
+            re.IGNORECASE,
+        ),
+        r'\1PERFORM sys.ora_commit_request();',
     ),
     # x IS [NOT] JSON (#1614) as sys.ora_is_json(x): PostgreSQL 16's own takes
     # text and bytea but not a CLOB's or BLOB's domain over them, and has no
@@ -7547,6 +7575,9 @@ class PostgresBackend:
         # _pgN_M does not exist"). A proxy backend running varied SQL gains little
         # from the cache anyway; the pipeline below is the real round-trip win.
         self._conn.prepare_threshold = None
+        # Whether a routine the running call reached asked for a commit (#1630).
+        self._commit_requested = False
+        self._conn.add_notice_handler(self._hear_commit_request)
         # Shared, not copied, when a dict is given: the example hands one map to
         # every backend it creates, and ALTER USER ... IDENTIFIED BY rewrites an
         # entry in place so the new password reaches the next login. A read-only
@@ -8079,7 +8110,28 @@ class PostgresBackend:
 
     @_while_connected
     def execute(self, sql: str, binds: Sequence = ()) -> Result:
-        return self._reported(sql, lambda: self._execute_statement(sql, binds))
+        return self._committing(
+            lambda: self._reported(sql, lambda: self._execute_statement(sql, binds))
+        )
+
+    def _hear_commit_request(self, diagnostic: psycopg.errors.Diagnostic) -> None:
+        if diagnostic.message_primary == _COMMIT_REQUEST:
+            self._commit_requested = True
+
+    def _committing(self, call: Callable[[], _Ran]) -> _Ran:
+        # A client's call, committed after it succeeds when a routine it reached
+        # ran a COMMIT (#1630). One that fails commits nothing: its savepoint
+        # undoes the work, Oracle's after the COMMIT and this one's before it too.
+        self._commit_requested = False
+        try:
+            result = call()
+        except BaseException:
+            self._commit_requested = False
+            raise
+        if self._commit_requested:
+            self._commit_requested = False
+            self.commit()
+        return result
 
     def _reported(self, sql: str, run: Callable[[], _Ran]) -> _Ran:
         # Run a statement, and while the translation report is on, note what
@@ -10525,7 +10577,9 @@ class PostgresBackend:
     @_while_connected
     def execute_many(self, sql: str, rows: Sequence[Sequence]) -> int | Result:
         # One run of the statement in the translation report, however many rows.
-        return self._reported(sql, lambda: self._execute_batch(sql, rows))
+        return self._committing(
+            lambda: self._reported(sql, lambda: self._execute_batch(sql, rows))
+        )
 
     def _execute_batch(self, sql: str, rows: Sequence[Sequence]) -> int | Result:
         # Array DML (executemany) in one round-trip: translate the statement once
