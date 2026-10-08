@@ -3599,6 +3599,60 @@ def test_no_data_found_in_a_function_sql_calls_is_null() -> None:
             backend.rollback()
 
 
+def test_a_plsql_select_into_needs_exactly_one_row() -> None:
+    # A PL/SQL SELECT ... INTO (#1650) with no row is ORA-01403 and with two
+    # ORA-01422, in a block and in a routine, as 23ai answers; one row goes
+    # through. A function a query calls makes the ORA-01403 its NULL (#1612).
+    # Only a SELECT that starts a PL/SQL statement is STRICT: not a subquery's,
+    # a FETCH's, a RETURNING's, quoted text, or a statement with no body.
+    from postgres_backend import _strict_select_into
+
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+    from seerdb.server import BackendError
+    from seerdb.server.backend import BindVar
+
+    assert _strict_select_into(
+        'DO $$ BEGIN SELECT (SELECT max(n) FROM t) INTO x FROM dual; '
+        'FETCH c INTO y; UPDATE t SET n = 1 RETURNING n INTO z; '
+        "w := 'select 1 into v'; END $$"
+    ) == (
+        'DO $$ BEGIN SELECT (SELECT max(n) FROM t) INTO STRICT x FROM dual; '
+        'FETCH c INTO y; UPDATE t SET n = 1 RETURNING n INTO z; '
+        "w := 'select 1 into v'; END $$"
+    )
+    assert _strict_select_into('SELECT a INTO b FROM t') == 'SELECT a INTO b FROM t'
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    out = BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=22)
+    two_rows = '(SELECT 1 AS n FROM dual UNION ALL SELECT 2 FROM dual)'
+    try:
+        for source, code in (('dual WHERE 1 = 0', 1403), (two_rows, 1422)):
+            with pytest.raises(BackendError) as exc:
+                backend.execute(
+                    f'DECLARE x NUMBER; BEGIN SELECT 1 INTO x FROM {source}; '
+                    ':o := x; END;',
+                    [out],
+                )
+            assert exc.value.ora_code == code
+        result = backend.execute(
+            'DECLARE x NUMBER; BEGIN SELECT 7 INTO x FROM dual; :o := x; END;', [out]
+        )
+        assert result.out_binds == [7]
+        backend.execute(
+            'CREATE OR REPLACE FUNCTION si1650 RETURN NUMBER IS x NUMBER;\n'
+            'BEGIN SELECT 1 INTO x FROM dual WHERE 1 = 0; RETURN x; END;'
+        )
+        with pytest.raises(BackendError) as exc:
+            backend.execute('BEGIN :o := si1650(); END;', [out])
+        assert exc.value.ora_code == 1403
+        assert backend.execute('SELECT si1650() FROM dual').rows == [(None,)]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP FUNCTION si1650')
+        except Exception:
+            backend.rollback()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
