@@ -3164,6 +3164,33 @@ def test_a_failing_call_keeps_the_callers_open_work() -> None:
                 backend.rollback()
 
 
+def test_a_block_returns_cursors_as_implicit_results() -> None:
+    # DBMS_SQL.RETURN_RESULT (#1617): each cursor a block hands back comes back
+    # as an implicit result, its rows and columns, in the order it was
+    # returned, the portal closed once fetched.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        result = backend.execute(
+            'DECLARE\n  c1 SYS_REFCURSOR;\n  c2 SYS_REFCURSOR;\nBEGIN\n'
+            '  OPEN c1 FOR SELECT level AS n FROM dual CONNECT BY level <= 3;\n'
+            '  DBMS_SQL.RETURN_RESULT(c1);\n'
+            "  OPEN c2 FOR SELECT 'x' AS s FROM dual;\n"
+            '  DBMS_SQL.RETURN_RESULT(c2);\nEND;'
+        )
+        assert [
+            ([c.name for c in columns], [tuple(r) for r in rows])
+            for columns, rows in result.implicit_results
+        ] == [([b'N'], [(1,), (2,), (3,)]), ([b'S'], [('x',)])]
+        (open_portals,) = backend.execute(
+            "SELECT count(*) FROM pg_cursors WHERE name LIKE '<unnamed portal%'"
+        ).rows[0]
+        assert open_portals == 0
+        assert backend.execute('BEGIN NULL; END;').implicit_results == []
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
