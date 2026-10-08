@@ -3876,6 +3876,68 @@ def test_a_session_keeps_its_edition() -> None:
         login.close()
 
 
+def test_a_standalone_routine_is_listed_with_the_objects() -> None:
+    # A user's standalone procedure and function (#1606): in ALL_OBJECTS as
+    # PROCEDURE / FUNCTION, VALID or INVALID as they compiled, and the valid
+    # ones in ALL_PROCEDURES under their own names -- 23ai's rows. A package's
+    # member is the package's, and the backend's own helpers are none.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    names = "('OB1606F', 'OB1606P', 'OB1606X', 'OB1606K', 'M')"
+    try:
+        backend.execute(
+            'CREATE OR REPLACE FUNCTION ob1606f RETURN NUMBER IS BEGIN RETURN 1; END;'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PROCEDURE ob1606p(n NUMBER) IS BEGIN NULL; END;'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PROCEDURE ob1606x IS BEGIN no_such_thing; END;'
+        )
+        backend.execute('CREATE OR REPLACE PACKAGE ob1606k AS PROCEDURE m; END;')
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE BODY ob1606k AS PROCEDURE m IS BEGIN NULL; END; END;'
+        )
+        objects = backend.execute(
+            'SELECT object_name, object_type, status FROM all_objects '
+            f'WHERE object_name IN {names} ORDER BY 1, 2'
+        ).rows
+        assert [tuple(r) for r in objects] == [
+            ('OB1606F', 'FUNCTION', 'VALID'),
+            ('OB1606K', 'PACKAGE', 'VALID'),
+            ('OB1606K', 'PACKAGE BODY', 'VALID'),
+            ('OB1606P', 'PROCEDURE', 'VALID'),
+            ('OB1606X', 'PROCEDURE', 'INVALID'),
+        ]
+        procedures = backend.execute(
+            'SELECT object_name, procedure_name, object_type, subprogram_id, overload '
+            f'FROM all_procedures WHERE object_name IN {names} ORDER BY 1, 4'
+        ).rows
+        assert [tuple(r) for r in procedures] == [
+            ('OB1606F', None, 'FUNCTION', 1, None),
+            ('OB1606K', None, 'PACKAGE', 0, None),
+            ('OB1606K', 'M', 'PACKAGE', 1, None),
+            ('OB1606P', None, 'PROCEDURE', 1, None),
+        ]
+        helpers = backend.execute(
+            "SELECT count(*) FROM all_objects WHERE object_type IN ('FUNCTION', "
+            "'PROCEDURE') AND object_name NOT LIKE 'OB1606%'"
+        ).rows[0][0]
+        assert helpers == 0
+    finally:
+        backend.rollback()
+        for statement in (
+            'DROP FUNCTION ob1606f',
+            'DROP PROCEDURE ob1606p',
+            'DROP PROCEDURE ob1606x',
+            'DROP PACKAGE ob1606k',
+        ):
+            try:
+                backend.execute(statement)
+            except Exception:
+                backend.rollback()
+        backend.close()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
@@ -4201,7 +4263,8 @@ def test_translate_routine_ddl_body_with_a_parenthesised_alias() -> None:
     # there; a parameter's own parentheses (`NUMBER(5,2)`) stay inside it (#1467).
     out = _translate_routine_ddl(
         'CREATE OR REPLACE PROCEDURE p(n OUT NUMBER, m IN NUMBER(5,2)) AS '
-        'BEGIN SELECT count(*) AS cnt INTO n FROM dual; END;'
+        'BEGIN SELECT count(*) AS cnt INTO n FROM dual; END;',
+        mark=False,
     )
     assert out == (
         'DROP PROCEDURE IF EXISTS p; CREATE OR REPLACE PROCEDURE '
@@ -4285,7 +4348,8 @@ def test_translate_routine_ddl_declares_a_bodys_locals() -> None:
         'CREATE OR REPLACE FUNCTION f(a NUMBER, b IN OUT NOCOPY VARCHAR2) '
         'RETURN NUMBER IS\n  t NUMBER;\n  i PLS_INTEGER;\n  s VARCHAR2(10);\n'
         'BEGIN\n  t := CASE WHEN a > 0 THEN 1 ELSE 2 END;\n'
-        '  IF t > 1 THEN t := 3; END IF;\n  RETURN t;\nEND f;'
+        '  IF t > 1 THEN t := 3; END IF;\n  RETURN t;\nEND f;',
+        mark=False,
     )
     assert out == (
         'DROP FUNCTION IF EXISTS f; CREATE OR REPLACE FUNCTION '
@@ -4295,7 +4359,9 @@ def test_translate_routine_ddl_declares_a_bodys_locals() -> None:
         '  IF t > 1 THEN t := 3; END IF;\n  RETURN t;\nEND $$'
     )
     # No locals: the body as it was, its END's name gone.
-    assert _translate_routine_ddl('CREATE PROCEDURE p IS BEGIN NULL; END p;') == (
+    assert _translate_routine_ddl(
+        'CREATE PROCEDURE p IS BEGIN NULL; END p;', mark=False
+    ) == (
         'DROP PROCEDURE IF EXISTS p; CREATE OR REPLACE PROCEDURE p() '
         'LANGUAGE plpgsql AS $$ BEGIN NULL; END $$'
     )
