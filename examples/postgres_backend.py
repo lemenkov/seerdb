@@ -1609,6 +1609,23 @@ _ORACLE_DICTIONARY_DDL = (
     'sys.ora_serial(a.pid) AS "serial#", s.driver AS client_driver '
     'FROM pg_stat_activity a LEFT JOIN sys.ora_sessions s ON s.pid = a.pid '
     "WHERE a.datname = current_database() AND a.backend_type = 'client backend';"
+    # v$sql_monitor (#1619): the statement a session is running under the
+    # database operation its client named (connection.dbop), EXECUTING. Only
+    # the reading session's own: another session's operation name is its own
+    # setting, which this one cannot see.
+    'CREATE OR REPLACE VIEW sys."v$sql_monitor" AS SELECT a.pid AS sid, '
+    'sys.ora_serial(a.pid) AS "session_serial#", '
+    'coalesce(s.username, upper(a.usename::text)) AS username, '
+    "'EXECUTING'::text AS status, "
+    "current_setting('seerdb.dbop') AS dbop_name, "
+    "nullif(current_setting('seerdb.module', true), '') AS module, "
+    "nullif(current_setting('seerdb.action', true), '') AS action, "
+    "nullif(current_setting('seerdb.client_info', true), '') AS client_info, "
+    "nullif(current_setting('seerdb.client_identifier', true), '') "
+    'AS client_identifier, a.query AS sql_text, a.query_start AS sql_exec_start '
+    'FROM pg_stat_activity a LEFT JOIN sys.ora_sessions s ON s.pid = a.pid '
+    "WHERE a.pid = pg_backend_pid() AND nullif(current_setting('seerdb.dbop', "
+    "true), '') IS NOT NULL;"
     # v$parameter (#1353): the instance parameters a client can also read off its
     # login, from the same sources, so the two never disagree -- open_cursors is
     # the AUTH_MAX_OPEN_CURSORS the Mirror reports, db_domain the backend's
@@ -11707,7 +11724,14 @@ class PostgresBackend:
     # SYS_CONTEXT('USERENV', ...); PostgreSQL's equivalent of session-scoped
     # state is a customised option, so each lands in `seerdb.<name>` and
     # sys_context (above) reads it back.
-    _END_TO_END_SETTINGS = ('client_identifier', 'module', 'action', 'client_info')
+    # dbop names the operation V$SQL_MONITOR reports (#1619).
+    _END_TO_END_SETTINGS = (
+        'client_identifier',
+        'module',
+        'action',
+        'client_info',
+        'dbop',
+    )
 
     @_while_connected
     def set_app_context(self, entries: list[tuple[str, str, str]]) -> None:
