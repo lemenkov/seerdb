@@ -3653,6 +3653,52 @@ def test_a_plsql_select_into_needs_exactly_one_row() -> None:
             backend.rollback()
 
 
+def test_a_package_function_is_called_without_parentheses() -> None:
+    # A package's function with no arguments, named without parentheses
+    # (#1651), is called, in a query and in PL/SQL -- not read as column f of
+    # a table pkg. A table aliased as the package keeps its column, as Oracle
+    # looks for one first. 23ai's answers.
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE bp1651 AS FUNCTION f RETURN NUMBER; '
+            'FUNCTION g(n NUMBER) RETURN NUMBER; END;'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE BODY bp1651 AS '
+            'FUNCTION f RETURN NUMBER IS BEGIN RETURN 7; END; '
+            'FUNCTION g(n NUMBER) RETURN NUMBER IS BEGIN RETURN n * 2; END; END;'
+        )
+        backend.execute('CREATE TABLE bt1651 (f NUMBER)')
+        backend.execute('INSERT INTO bt1651 VALUES (5)')
+        for query, expected in (
+            ('SELECT bp1651.f FROM dual', 7),
+            ('SELECT bp1651.f + 1 FROM dual', 8),
+            ('SELECT f FROM bt1651 WHERE f = bp1651.f - 2', 5),
+            ('SELECT bp1651.f FROM bt1651 bp1651', 5),
+            ('SELECT bp1651.g(2) FROM dual', 4),
+            ("SELECT 'bp1651.f' FROM dual", 'bp1651.f'),
+        ):
+            (row,) = backend.execute(query).rows
+            assert row[0] == expected, query
+        number = BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=22)
+        for block in (
+            'BEGIN :o := bp1651.f; END;',
+            'DECLARE x NUMBER; BEGIN x := bp1651.f; :o := x; END;',
+        ):
+            assert backend.execute(block, [number]).out_binds == [7], block
+    finally:
+        backend.rollback()
+        for statement in ('DROP TABLE bt1651', 'DROP PACKAGE bp1651'):
+            try:
+                backend.execute(statement)
+            except Exception:
+                backend.rollback()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
