@@ -122,6 +122,14 @@ honest edge of this adapter:
   work after it is committed too, where Oracle leaves it open, and a call that
   fails after it commits nothing, where Oracle keeps what came before it. A
   ROLLBACK in a routine is not translated and fails.
+- **Privileges, for type lookup only** -- every Mirror user is the backend's
+  one PostgreSQL role. A GRANT or REVOKE on an object is recorded
+  (``sys.ora_grants``), and a user sees another user's type -- in ALL_TYPES,
+  ALL_TYPE_ATTRS, ALL_COLL_TYPES and a lookup by name, as ``gettype()`` makes
+  -- only once granted EXECUTE on it. Using a type through a column or a bind
+  is not checked, and table privileges are not kept: another user's table
+  named with its schema reads as one's own. A system privilege or a role
+  granted is a no-op.
 - **Object types, partly** — ``CREATE TYPE ... AS OBJECT`` is a PostgreSQL
   composite, listed in ``all_types`` / ``all_type_attrs`` under an OID that is the
   composite's own ``pg_type`` oid, zero-padded to Oracle's 16 bytes. An object
@@ -1716,7 +1724,21 @@ _ORACLE_DICTIONARY_DDL = (
     # by a 16-byte OID; here it is PostgreSQL's own type oid, zero-padded, so the
     # backend can turn an OID a bind carries straight back into the type. A
     # built-in attribute type has no owner, as in Oracle.
-    'CREATE OR REPLACE VIEW sys.all_types AS SELECT ora_owner(n.nspname) AS owner, '
+    # Object privileges a GRANT gave (#1621): owner, object and grantee as
+    # Oracle names them. A user sees a type -- in ALL_TYPES and the views like
+    # it, and by name, as gettype() looks one up -- that is its own, PUBLIC's
+    # or SYS's, or one it or PUBLIC was granted EXECUTE on.
+    'CREATE TABLE IF NOT EXISTS sys.ora_grants (owner text, object_name text, '
+    'privilege text, grantee text, '
+    'PRIMARY KEY (owner, object_name, privilege, grantee));'
+    'CREATE OR REPLACE FUNCTION sys.ora_type_visible(owner text, type_name text) '
+    "RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT $1 IN ('PUBLIC', 'SYS', "
+    "sys.sys_context('userenv', 'session_user')) OR EXISTS (SELECT 1 FROM "
+    'sys.ora_grants g WHERE g.owner = $1 AND g.object_name = $2 '
+    "AND g.privilege IN ('EXECUTE', 'ALL') AND g.grantee IN ('PUBLIC', "
+    "sys.sys_context('userenv', 'session_user'))) $$;"
+    'CREATE OR REPLACE VIEW sys.all_types AS SELECT * FROM ('
+    'SELECT ora_owner(n.nspname) AS owner, '
     'ora_name(t.typname) AS type_name, '
     "decode(lpad(to_hex(t.oid::bigint), 32, '0'), 'hex') AS type_oid, "
     "'OBJECT'::text AS typecode, "
@@ -1737,10 +1759,11 @@ _ORACLE_DICTIONARY_DDL = (
     "JOIN pg_type b ON b.oid = d.typbasetype AND b.typcategory = 'A' "
     "WHERE d.typtype = 'd' "
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
-    'AND n.nspname NOT IN (SELECT name FROM sys.ora_packages);'
+    'AND n.nspname NOT IN (SELECT name FROM sys.ora_packages)) v WHERE sys.ora_type_visible(v.owner, v.type_name);'
     'CREATE OR REPLACE VIEW sys.user_types AS SELECT * FROM all_types '
     'WHERE owner=upper(current_schema());'
-    'CREATE OR REPLACE VIEW sys.all_type_attrs AS SELECT '
+    'CREATE OR REPLACE VIEW sys.all_type_attrs AS SELECT * FROM ('
+    'SELECT '
     'ora_owner(a.udt_schema) AS owner, ora_name(a.udt_name) AS type_name, '
     'ora_name(a.attribute_name) AS attr_name, '
     # The ora_tstz composite is this backend's TIMESTAMP WITH TIME ZONE, not an
@@ -1809,13 +1832,14 @@ _ORACLE_DICTIONARY_DDL = (
     'AND p.attnum = a.ordinal_position '
     f"WHERE a.udt_name <> '{_TSTZ_TYPE}' AND a.udt_name !~ '[$]ref$' "
     'AND a.udt_schema NOT IN (SELECT name FROM sys.ora_packages) '
-    "AND a.udt_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    "AND a.udt_schema NOT IN ('pg_catalog','information_schema','oracle','sys')) v WHERE sys.ora_type_visible(v.owner, v.type_name);"
     'CREATE OR REPLACE VIEW sys.user_type_attrs AS SELECT * FROM all_type_attrs '
     'WHERE owner=upper(current_schema());'
     # Collection types (#1134): a VARRAY or nested table is a domain over an
     # array, its bound the CHECK a VARRAY carries. A client reads the element's
     # type here once the type shape has told it the element is an object.
-    'CREATE OR REPLACE VIEW sys.all_coll_types AS SELECT ora_owner(n.nspname) AS owner, '
+    'CREATE OR REPLACE VIEW sys.all_coll_types AS SELECT * FROM ('
+    'SELECT ora_owner(n.nspname) AS owner, '
     'ora_name(d.typname) AS type_name, '
     "CASE WHEN k.bound IS NULL THEN 'TABLE' ELSE 'VARYING ARRAY' END AS coll_type, "
     'k.bound AS upper_bound, '
@@ -1856,7 +1880,7 @@ _ORACLE_DICTIONARY_DDL = (
     'WHERE c.contypid = d.oid LIMIT 1) k ON true '
     "WHERE d.typtype = 'd' "
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
-    'AND n.nspname NOT IN (SELECT name FROM sys.ora_packages);'
+    'AND n.nspname NOT IN (SELECT name FROM sys.ora_packages)) v WHERE sys.ora_type_visible(v.owner, v.type_name);'
     'CREATE OR REPLACE VIEW sys.user_coll_types AS SELECT * FROM all_coll_types '
     'WHERE owner=upper(current_schema());'
     # REFs (#1127): which tables are Oracle object tables, and of what type --
@@ -3258,7 +3282,59 @@ _ORAFCE_SESSION_SETTINGS: Final = (
 )
 
 
+# GRANT / REVOKE of privileges ON an object (#1621): what sys.ora_grants keeps.
+# A system privilege or a role (GRANT CREATE SESSION TO u) names no ON, and
+# stays the no-op every GRANT was.
+_OBJECT_GRANT = re.compile(
+    r'(?is)\s*(GRANT|REVOKE)\s+(.+?)\s+ON\s+((?:"[^"]+"|[\w$#]+)'
+    r'(?:\s*\.\s*(?:"[^"]+"|[\w$#]+))?)\s+(TO|FROM)\s+(.+?)'
+    r'(?:\s+WITH\s+(?:GRANT|HIERARCHY)\s+OPTION)?\s*;?\s*$'
+)
+
+
+def _oracle_name(name: str) -> str:
+    # An identifier as Oracle stores it: a quoted one verbatim, else upper case.
+    name = name.strip()
+    return name[1:-1] if name.startswith('"') else name.upper()
+
+
+def _object_grant(match: re.Match[str]) -> str:
+    # The rows a GRANT adds to sys.ora_grants, or a REVOKE takes away (#1621):
+    # one per privilege and grantee. ALL [PRIVILEGES] is kept as ALL.
+    (verb, privileges, target, _to, grantees) = match.groups()
+    parts = [p for p in re.split(r'\s*\.\s*', target.strip())]
+    owner_sql = (
+        sql.Literal(_oracle_name(parts[0])).as_string()
+        if len(parts) == 2
+        else 'sys.ora_owner(current_schema())'
+    )
+    name = sql.Literal(_oracle_name(parts[-1])).as_string()
+    privs = [
+        'ALL' if p.strip().upper().startswith('ALL') else p.strip().upper()
+        for p in privileges.split(',')
+    ]
+    users = [_oracle_name(g) for g in grantees.split(',')]
+    rows = [
+        f'({owner_sql}, {name}, {sql.Literal(p).as_string()}, '
+        f'{sql.Literal(u).as_string()})'
+        for p in privs
+        for u in users
+    ]
+    if verb.upper() == 'GRANT':
+        return (
+            'INSERT INTO sys.ora_grants (owner, object_name, privilege, grantee) '
+            f'VALUES {", ".join(rows)} ON CONFLICT DO NOTHING'
+        )
+    return (
+        'DELETE FROM sys.ora_grants WHERE (owner, object_name, privilege, grantee) '
+        f'IN ({", ".join(rows)})'
+    )
+
+
 def _translate_admin(sql: str) -> str:
+    m = _OBJECT_GRANT.match(sql)
+    if m:
+        return _object_grant(m)
     m = _ALTER_SESSION_SCHEMA.match(sql)
     if m:
         return f'SET search_path TO {m.group(1).lower()}, {_SEARCH_PATH_TAIL}'
@@ -8402,6 +8478,12 @@ class PostgresBackend:
                 )
             )
             self._conn.execute(_ORAFCE_SESSION_SETTINGS)
+            # The session's user from the login on (#1621: what it may see), as
+            # a proxy login then changes it (#1620).
+            self._conn.execute(
+                "SELECT set_config('seerdb.session_user', %s, false)",
+                (username.upper(),),
+            )
             self._conn.commit()
         return secret
 
@@ -10074,6 +10156,8 @@ class PostgresBackend:
             'WHERE sys.ora_name(t.typname) = %s '
             'AND (CASE WHEN %s <> %s THEN sys.ora_owner(n.nspname) = %s '
             "ELSE n.nspname = ANY(current_schemas(false)) OR n.nspname = 'sys' END) "
+            # One the session may use (#1621).
+            'AND sys.ora_type_visible(sys.ora_owner(n.nspname), sys.ora_name(t.typname)) '
             "ORDER BY n.nspname = 'sys' LIMIT 1",
             (bare, schema, '', schema),
         ).fetchone()
@@ -10514,6 +10598,10 @@ class PostgresBackend:
             'WHERE sys.ora_owner(n.nspname) = coalesce(%s, sys.ora_owner(current_schema())) '
             'AND sys.ora_name(coalesce(c.relname, t.typname)) = %s '
             "AND coalesce(c.relkind = 'r', false) = %s "
+            # A type the session may use (#1621): its own, or one granted it.
+            # A table's row type is a table's privilege, which is not kept.
+            'AND (%s OR sys.ora_type_visible(sys.ora_owner(n.nspname), '
+            'sys.ora_name(coalesce(c.relname, t.typname)))) '
             # A package's schema is no owner: its types are the package's (#1607).
             + (
                 'AND NOT EXISTS (SELECT 1 FROM sys.ora_packages k '
@@ -10522,7 +10610,7 @@ class PostgresBackend:
                 else ''
             )
             + 'LIMIT 1',
-            (schema.strip('"') or None, name.strip('"'), row_type),
+            (schema.strip('"') or None, name.strip('"'), row_type, row_type),
         ).fetchone()
         # A package's type (#1607): "OWNER"."PACKAGE"."TYPE", or a two-part name
         # no schema has a type by.
