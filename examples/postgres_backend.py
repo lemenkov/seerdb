@@ -504,6 +504,27 @@ _HELPER_FUNCTIONS_DDL = (
     # there, so it asks the backend to commit once the client's call succeeds.
     'CREATE OR REPLACE FUNCTION sys.ora_commit_request() RETURNS void '
     "LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'seerdb: commit requested'; END $$;"
+    # NO_DATA_FOUND out of a function a SQL statement called (#1612): Oracle
+    # makes it the function's NULL, where a PL/SQL expression's call raises it.
+    # A guarded function's handler asks sys.ora_ndf_to_null(), which reads the
+    # call stack: its own frame, the handler's, then the guarded function's
+    # caller -- a SQL statement (inside PL/SQL too) or a SQL function, NULL; a
+    # PL/pgSQL statement, raise; nothing, the client's own statement, NULL but
+    # for one the backend evaluates a PL/SQL expression with, which marks
+    # itself with sys.ora_plsql_call() (its statement_timestamp, so the mark
+    # dies with the statement).
+    'CREATE OR REPLACE FUNCTION sys.ora_plsql_call() RETURNS text '
+    "LANGUAGE sql VOLATILE AS $$ SELECT set_config('seerdb.plsql_call', "
+    'statement_timestamp()::text, false) $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_ndf_to_null() RETURNS boolean '
+    'LANGUAGE plpgsql VOLATILE AS $$ DECLARE ctx text; frames text[]; BEGIN '
+    'GET DIAGNOSTICS ctx = PG_CONTEXT; '
+    "frames := regexp_split_to_array(ctx, E'\\n(?=PL/pgSQL function |SQL statement "
+    '"|SQL function )\'); '
+    'IF cardinality(frames) < 3 THEN '
+    "RETURN coalesce(current_setting('seerdb.plsql_call', true), '') "
+    '<> statement_timestamp()::text; END IF; '
+    "RETURN frames[3] NOT LIKE 'PL/pgSQL function %'; END $$;"
     # x IS JSON (#1614), for a value of a domain too: PostgreSQL's own condition
     # takes text and bytea, and resolves no domain over either to it.
     'CREATE OR REPLACE FUNCTION sys.ora_is_json(text) RETURNS boolean '
@@ -5596,7 +5617,44 @@ def _routine_body(body: str) -> str:
     return f'DECLARE {_translate_routine_types(declarations)} {block}'
 
 
-def _translate_routine_ddl(sql: str) -> str:
+# The FROM of a SELECT the backend evaluates a PL/SQL expression with: it marks
+# the statement as PL/SQL's for sys.ora_ndf_to_null() (#1612).
+_PLSQL_CALL_MARK: Final = 'sys.ora_plsql_call() AS ora_plsql_call'
+
+# What lets a routine's body raise NO_DATA_FOUND by itself (#1612): a SELECT
+# ... INTO, an index-by table read (`t$get`, #1607) or a RAISE of it. A call
+# to another user routine can pass one up; those are matched by name.
+_RAISES_NO_DATA_FOUND = re.compile(
+    r'(?is)\bSELECT\b[^;]*?\bINTO\b|\$get\s*\(|\bRAISE\s+NO_DATA_FOUND\b'
+)
+_ROUTINE_NAME_WORD = re.compile(r'(?<![\w$#])[A-Za-z_][\w$#]*')
+
+
+def _guards_no_data_found(name: str, body: str, user_routines: frozenset[str]) -> bool:
+    # Whether a function's body can raise NO_DATA_FOUND, so that it needs the
+    # handler that makes it NULL in SQL (#1612): by itself, or through a call
+    # to a user routine -- or to itself -- which the handler cannot see past.
+    (masked, _contents) = _mask_quoted(body)
+    if _RAISES_NO_DATA_FOUND.search(masked):
+        return True
+    called = {w.lower() for w in _ROUTINE_NAME_WORD.findall(masked)}
+    own = name.lower().rpartition('.')[2]
+    return own in called or not called.isdisjoint(user_routines)
+
+
+def _guarded_body(block: str) -> str:
+    # A function body with the NO_DATA_FOUND handler around it (#1612). The
+    # handler is a subtransaction per call, which is why only a body that can
+    # raise one gets it.
+    return (
+        f'BEGIN {block}; EXCEPTION WHEN no_data_found THEN '
+        'IF sys.ora_ndf_to_null() THEN RETURN NULL; END IF; RAISE; END'
+    )
+
+
+def _translate_routine_ddl(
+    sql: str, user_routines: frozenset[str] | None = None
+) -> str:
     """Rewrite an Oracle ``CREATE PROCEDURE`` / ``CREATE FUNCTION`` to a PL/pgSQL
     routine (#503): translate the parameter types + ``IN OUT`` → ``INOUT``, map
     ``RETURN t`` → ``RETURNS t``, and wrap the ``BEGIN … END`` body as a
@@ -5629,7 +5687,15 @@ def _translate_routine_ddl(sql: str) -> str:
     # definition first — by name (the suite never overloads, so it is unambiguous),
     # IF EXISTS so the first CREATE is fine (#521).
     drop = f'DROP {kind.upper()} IF EXISTS {name};'
-    return f'{drop} {header} LANGUAGE plpgsql AS $$ {_routine_body(body)} $$'
+    block = _routine_body(body)
+    if (
+        kind.upper() == 'FUNCTION'
+        and user_routines is not None
+        and (block.split(None, 1) or [''])[0].upper() in ('BEGIN', 'DECLARE')
+        and _guards_no_data_found(name, body, user_routines)
+    ):
+        block = _guarded_body(block)
+    return f'{drop} {header} LANGUAGE plpgsql AS $$ {block} $$'
 
 
 # --- PL/SQL packages (#1605) ---------------------------------------------------
@@ -6179,14 +6245,20 @@ def _package_types(package: str, members: list[_PackageMember], public: bool) ->
     )
 
 
-def _package_routine(package: str, member: _PackageMember, body: str) -> str:
+def _package_routine(
+    package: str,
+    member: _PackageMember,
+    body: str,
+    user_routines: frozenset[str] | None = None,
+) -> str:
     # One member as a routine in the package's schema: the routine translation,
     # without its drop by name -- a package's members may share a name.
     params = f'({member.params})' if member.params is not None else ''
     returns = f' RETURN {member.returns}' if member.returns else ''
     name = f'{package}.{member.name}'
     translated = _translate_routine_ddl(
-        f'CREATE OR REPLACE {member.kind} {name}{params}{returns} IS {body}'
+        f'CREATE OR REPLACE {member.kind} {name}{params}{returns} IS {body}',
+        user_routines,
     )
     return translated.removeprefix(f'DROP {member.kind} IF EXISTS {name}; ')
 
@@ -6227,7 +6299,9 @@ def _package_missing(package: str, code: int, message: str) -> str:
 
 
 def _translate_package_ddl(
-    sql: str, spec_index_types: Callable[[str], dict[str, str]] | None = None
+    sql: str,
+    spec_index_types: Callable[[str], dict[str, str]] | None = None,
+    user_routines: Callable[[], frozenset[str]] | None = None,
 ) -> str:
     """A PL/SQL package's DDL as a schema of its name (#1605).
 
@@ -6288,6 +6362,14 @@ def _translate_package_ddl(
         }
         if spec_index_types is not None:
             index_types.update(spec_index_types(package))
+        # The user routines a member may call (#1612), the package's own
+        # members among them, for the members that need the NO_DATA_FOUND
+        # handler.
+        names = None
+        if user_routines is not None:
+            names = user_routines() | {
+                m.name.lower() for m in members if m.kind in routine_kinds
+            }
         routines = [
             _package_routine(
                 package,
@@ -6295,6 +6377,7 @@ def _translate_package_ddl(
                 _rewrite_index_tables(
                     m.body, _routine_index_tables(package, m, index_types)
                 ),
+                names,
             )
             for m in members
             if m.kind in routine_kinds and m.body is not None
@@ -8603,11 +8686,22 @@ class PostgresBackend:
         # generic compat shim.
         sql = _ruled('reserved-name', _quote_reserved_names(sql), sql)
         sql = _ruled(
-            'package-ddl', _translate_package_ddl(sql, self._package_index_types), sql
+            'package-ddl',
+            _translate_package_ddl(
+                sql, self._package_index_types, self._user_routine_names
+            ),
+            sql,
         )
         sql = _ruled('admin', _translate_admin(sql), sql)
         sql = _ruled('ddl', _translate_ddl(sql), sql)
-        sql = _ruled('routine-ddl', _translate_routine_ddl(sql), sql)
+        sql = _ruled(
+            'routine-ddl',
+            _translate_routine_ddl(
+                sql,
+                self._user_routine_names() if _ROUTINE_HEAD.match(sql) else None,
+            ),
+            sql,
+        )
         sql = _ruled(
             'plsql-block', _translate_plsql_block(sql, self._routine_kind), sql
         )
@@ -11402,7 +11496,8 @@ class PostgresBackend:
         arg_values = self._index_table_arguments(name, arg_values)
         cursor = self._conn.cursor()
         cursor.execute(
-            f'SELECT {name}({_call_placeholders(arguments)})', tuple(arg_values) or None
+            f'SELECT {name}({_call_placeholders(arguments)}) FROM {_PLSQL_CALL_MARK}',
+            tuple(arg_values) or None,
         )
         row = _decode_row(cursor, cursor.fetchone(), self._tstz_oid)
         out = list(values)
@@ -11739,7 +11834,9 @@ class PostgresBackend:
             else expr
             for ref, expr in assignments
         )
-        select = _translate_idioms(f'SELECT {exprs}')
+        # A PL/SQL expression, so a NO_DATA_FOUND out of a function it calls
+        # raises rather than turning NULL as in SQL (#1612).
+        select = _translate_idioms(f'SELECT {exprs} FROM {_PLSQL_CALL_MARK}')
         sql, params = _translate_binds(
             select, [by_name[ref] for ref in _distinct_bind_refs(select)]
         )
@@ -11859,6 +11956,22 @@ class PostgresBackend:
             (routine, schema, schema),
         ).fetchone()
         return row is not None
+
+    def _user_routine_names(self) -> frozenset[str]:
+        # The names of the routines a user created (#1612): every function or
+        # procedure but PostgreSQL's, the extensions' (orafce) and the backend's
+        # own sys schema -- what a function's call of one could pass a
+        # NO_DATA_FOUND up through. Read when a routine is created.
+        rows = self._conn.execute(
+            'SELECT DISTINCT p.proname FROM pg_proc p JOIN pg_namespace n '
+            'ON n.oid = p.pronamespace '
+            "WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'sys', "
+            "'oracle', 'pg_toast') AND n.nspname NOT LIKE 'pg\\_temp%%' "
+            "AND p.prokind IN ('f', 'p') AND NOT EXISTS (SELECT 1 FROM pg_depend d "
+            "WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid "
+            "AND d.deptype = 'e')"
+        ).fetchall()
+        return frozenset(name for (name,) in rows)
 
     def _routine_kind(self, name: str) -> str | None:
         """What PostgreSQL has under a routine name -- 'f' a function, 'p' a
