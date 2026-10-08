@@ -1340,8 +1340,11 @@ _ORACLE_DICTIONARY_DDL = (
     "('NLS_LENGTH_SEMANTICS', 'BYTE'), ('NLS_NCHAR_CONV_EXCP', 'FALSE'), "
     "('NLS_NCHAR_CHARACTERSET', 'AL16UTF16')"
     ') AS p(parameter, value);'
-    'CREATE OR REPLACE VIEW sys.nls_session_parameters AS SELECT * FROM '
-    'nls_database_parameters WHERE parameter NOT IN '
+    # The session's NLS_DATE_FORMAT is the one ALTER SESSION set (#1616).
+    'CREATE OR REPLACE VIEW sys.nls_session_parameters AS SELECT parameter, '
+    "CASE WHEN parameter = 'NLS_DATE_FORMAT' THEN coalesce(nullif("
+    "current_setting('seerdb.nls_date_format', true), ''), value) ELSE value END "
+    'AS value FROM nls_database_parameters WHERE parameter NOT IN '
     "('NLS_CHARACTERSET', 'NLS_NCHAR_CHARACTERSET');"
     'CREATE OR REPLACE VIEW sys.nls_instance_parameters AS SELECT * FROM '
     'nls_session_parameters;'
@@ -3052,7 +3055,36 @@ _SEARCH_PATH_TAIL: Final = 'public, sys, oracle, pg_catalog'
 # in use (above), that refusal reached clients as an error Oracle never raises,
 # so the Mirror turns it off for its sessions. It is orafce's own setting, and
 # a PostgreSQL without orafce accepts it as a harmless placeholder.
-_ORAFCE_SESSION_SETTINGS: Final = 'SET orafce.oracle_compatibility_date_limit = off'
+_ORAFCE_SESSION_SETTINGS_BASE: Final = (
+    'SET orafce.oracle_compatibility_date_limit = off'
+)
+
+# A session's NLS_DATE_FORMAT (#1616): orafce's one-argument TO_CHAR and TO_DATE
+# follow orafce.nls_date_format, and seerdb.nls_date_format keeps the format as
+# Oracle spells it, for NLS_SESSION_PARAMETERS. PostgreSQL's formats have no RR
+# or RRRR -- printed, they are the letters -- so the setting takes the YY /
+# YYYY that Oracle prints for them.
+_ALTER_SESSION_NLS_DATE_FORMAT = re.compile(
+    r"\s*ALTER\s+SESSION\s+SET\s+NLS_DATE_FORMAT\s*=\s*'((?:[^']|'')*)'\s*;?\s*$",
+    re.IGNORECASE,
+)
+_RR_YEAR = re.compile(r'RR(RR)?', re.IGNORECASE)
+
+
+def _nls_date_format_settings(oracle_format: str) -> str:
+    printed = _RR_YEAR.sub(lambda m: 'YYYY' if m.group(1) else 'YY', oracle_format)
+    quoted = oracle_format.replace("'", "''")
+    printed = printed.replace("'", "''")
+    return (
+        f"SET orafce.nls_date_format = '{printed}'; "
+        f"SET seerdb.nls_date_format = '{quoted}'"
+    )
+
+
+# Oracle's own default, which every session starts with.
+_ORAFCE_SESSION_SETTINGS: Final = (
+    f'{_ORAFCE_SESSION_SETTINGS_BASE}; {_nls_date_format_settings("DD-MON-RR")}'
+)
 
 
 def _translate_admin(sql: str) -> str:
@@ -3062,6 +3094,9 @@ def _translate_admin(sql: str) -> str:
     m = _ALTER_SESSION_TIME_ZONE.match(sql)
     if m:
         return _translate_time_zone(m.group(1))
+    m = _ALTER_SESSION_NLS_DATE_FORMAT.match(sql)
+    if m:
+        return _nls_date_format_settings(m.group(1).replace("''", "'"))
     m = _CREATE_USER.match(sql)
     if m:
         return f'CREATE SCHEMA IF NOT EXISTS {m.group(1).lower()}'
