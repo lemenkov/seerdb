@@ -2109,9 +2109,10 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # integer types, sys.ora_to_raw's two overloads (#1496), sys.ora_raw_fits
     # (#1415), sys.ora_float_round (#1422), sys.ora_numeric_div (#1598),
     # sys.ora_package_unusable (#1605), sys.ora_is_json's two (#1614) and
-    # sys.ora_commit_request (#1630), and sys.ora_rr_shift and the two
-    # sys.ora_rr_year (#1638).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 77
+    # sys.ora_commit_request (#1630), sys.ora_rr_shift and the two
+    # sys.ora_rr_year (#1638), and sys.ora_plsql_call and sys.ora_ndf_to_null
+    # (#1612).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 79
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
@@ -3543,6 +3544,59 @@ def test_rr_years_print_and_parse_as_in_oracle() -> None:
     finally:
         backend.rollback()
         backend.close()
+
+
+def test_no_data_found_in_a_function_sql_calls_is_null() -> None:
+    # NO_DATA_FOUND out of a function a SQL statement calls (#1612) is the
+    # function's NULL -- through a function that only calls it, too -- where a
+    # PL/SQL expression's call raises ORA-01403. 23ai's answers. A function
+    # that cannot raise one gets no handler, which costs a subtransaction.
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+    from seerdb.server import BackendError
+    from seerdb.server.backend import BindVar
+
+    plain = _translate_routine_ddl(
+        'CREATE OR REPLACE FUNCTION nd1612x(n NUMBER) RETURN NUMBER IS '
+        'BEGIN RETURN n + 1; END;',
+        frozenset(),
+    )
+    assert 'no_data_found' not in plain
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE nd1612 AS\n  FUNCTION f RETURN NUMBER;\n'
+            '  FUNCTION g RETURN NUMBER;\nEND;'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE BODY nd1612 AS\n'
+            '  TYPE t IS TABLE OF NUMBER INDEX BY BINARY_INTEGER;\n'
+            '  FUNCTION f RETURN NUMBER IS a t;\n'
+            '  BEGIN a(1) := 1; RETURN a(2); END;\n'
+            '  FUNCTION g RETURN NUMBER IS\n  BEGIN RETURN f() + 1; END;\nEND;'
+        )
+        for call in ('nd1612.f()', 'nd1612.g()'):
+            assert backend.execute(f'SELECT {call} FROM dual').rows == [(None,)]
+            assert backend.execute(f'SELECT nvl({call}, -1) FROM dual').rows == [(-1,)]
+            number = BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=22)
+            result = backend.execute(
+                f'DECLARE x NUMBER; BEGIN SELECT {call} INTO x FROM dual; '
+                ':o := nvl(x, -1); END;',
+                [number],
+            )
+            assert result.out_binds == [-1]
+            for block in (
+                f'DECLARE x NUMBER; BEGIN x := {call}; :o := x; END;',
+                f'BEGIN :o := {call}; END;',
+            ):
+                with pytest.raises(BackendError) as exc:
+                    backend.execute(block, [number])
+                assert exc.value.ora_code == 1403
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP PACKAGE nd1612')
+        except Exception:
+            backend.rollback()
 
 
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
