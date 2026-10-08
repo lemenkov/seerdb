@@ -2163,7 +2163,7 @@ def test_xmlelement_takes_its_name_after_name() -> None:
 
 
 def test_translate_idioms_functions_and_literals() -> None:
-    assert _translate_idioms('SELECT SYSDATE') == 'SELECT localtimestamp(0)'
+    assert _translate_idioms('SELECT SYSDATE') == 'SELECT localtimestamp(0)::ora_date'
     # HEXTORAW / RAWTOHEX, EMPTY_CLOB / EMPTY_BLOB and FROM_TZ are installed as
     # real PostgreSQL functions (_HELPER_FUNCTIONS_DDL), so their call sites
     # resolve directly and pass through the idiom translation unchanged — just
@@ -3262,6 +3262,52 @@ def test_a_ref_cursor_describes_not_null_columns_as_not_nullable() -> None:
                 backend.rollback()
 
 
+def test_date_minus_date_is_a_number_of_days() -> None:
+    # Oracle's DATE arithmetic (#1611): DATE - DATE a number of days, DATE + n
+    # still a DATE, for a table's column, TO_DATE, SYSDATE and a routine's
+    # parameters alike; TIMESTAMP - TIMESTAMP stays an interval. 23ai's answers.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE dm1611t (d0 DATE, d1 DATE)')
+        backend.execute(
+            "INSERT INTO dm1611t VALUES (TO_DATE('2020-01-01', 'YYYY-MM-DD'), "
+            "TO_DATE('2020-01-02 12:00', 'YYYY-MM-DD HH24:MI'))"
+        )
+        backend.execute(
+            'CREATE OR REPLACE FUNCTION dm1611f(n NUMBER, a DATE, b DATE) '
+            'RETURN NUMBER IS\n  v NUMBER := n;\nBEGIN\n  v := v + a - b;\n'
+            '  RETURN v;\nEND;'
+        )
+        for expr, expected in (
+            ("DATE '2020-01-02' - DATE '2020-01-01'", 1),
+            (
+                "TO_DATE('2020-01-02 12:00', 'YYYY-MM-DD HH24:MI') "
+                "- TO_DATE('2020-01-01', 'YYYY-MM-DD')",
+                Decimal('1.5'),
+            ),
+            ('d1 - d0', Decimal('1.5')),
+            ('(d0 + 1) - d0', 1),
+            ('(1 + d0) - d0', 1),
+            ('(d1 - 1.5) - d0', 0),
+            ("TO_CHAR(d0 + 1.5, 'YYYY-MM-DD HH24:MI')", '2020-01-02 12:00'),
+            ('SYSDATE - SYSDATE', 0),
+            ('dm1611f(10, d1, d0)', Decimal('11.5')),
+            (
+                "TIMESTAMP '2020-01-02 12:00:00' - TIMESTAMP '2020-01-01 00:00:00'",
+                datetime.timedelta(days=1, hours=12),
+            ),
+        ):
+            (row,) = backend.execute(f'SELECT {expr} FROM dm1611t').rows
+            assert row[0] == expected, expr
+    finally:
+        backend.rollback()
+        for statement in ('DROP FUNCTION dm1611f', 'DROP TABLE dm1611t'):
+            try:
+                backend.execute(statement)
+            except Exception:
+                backend.rollback()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
@@ -3765,7 +3811,7 @@ def test_a_package_type_is_a_postgresql_type_of_its_schema() -> None:
         'i PLS_INTEGER, d DATE)',
     ) == (
         'CREATE TYPE pk.r AS (n numeric, s varchar(30), b BOOLEAN, i integer, '
-        'd timestamp(0))'
+        'd ora_date)'
     )
     indexed = declare('TYPE', 't', 'TABLE OF VARCHAR2(100) INDEX BY BINARY_INTEGER')
     assert indexed is not None and indexed.startswith(
@@ -6430,7 +6476,7 @@ def test_idiom_rewrites_leave_quoted_text_alone() -> None:
     )
     assert out == (
         "SELECT 'VARCHAR2', 'it''s NVARCHAR2', \"MINUS\" FROM t -- don't\n"
-        "WHERE c = CAST(x AS varchar(5)) EXCEPT SELECT 'sysdate', localtimestamp(0) "
+        "WHERE c = CAST(x AS varchar(5)) EXCEPT SELECT 'sysdate', localtimestamp(0)::ora_date "
         'FROM dual'
     )
     # A rule that reads into a literal still sees it: a negative INTERVAL.

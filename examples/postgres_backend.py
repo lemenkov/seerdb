@@ -355,6 +355,62 @@ _DATE_TYPE_DDL = (
     'EXCEPTION WHEN duplicate_object THEN NULL; END $$'
 )
 
+# Oracle's DATE arithmetic (#1611): DATE - DATE is a NUMBER of days, fraction
+# and all, and DATE + n / n + DATE / DATE - n a DATE n days away. On PostgreSQL
+# a DATE is the ora_date domain, or orafce's oracle.date (TO_DATE's), both over
+# a timestamp, and the timestamp's own operators answered: an interval for the
+# difference, and a plain timestamp for the sum, which is then no DATE to take
+# a difference of. An operator on the domain itself is the exact match, so it
+# is the one taken, and TIMESTAMP - TIMESTAMP stays the interval Oracle's is.
+# Every numeric type gets its own, as a literal 1 would otherwise take the
+# timestamp's integer one. Each operator has its own DO block, so one already
+# there does not stop the rest, and one over orafce's type is skipped without
+# orafce.
+_DATE_TYPES = ('ora_date', 'oracle.date')
+_DAY_NUMBER_TYPES = ('smallint', 'integer', 'bigint', 'numeric', 'double precision')
+_DATE_ARITHMETIC_DDL = (
+    'CREATE OR REPLACE FUNCTION sys.ora_date_minus(timestamp, timestamp) '
+    'RETURNS numeric LANGUAGE sql IMMUTABLE STRICT SET search_path = pg_catalog '
+    'AS $$ SELECT trim_scale(extract(epoch FROM $1 OPERATOR(pg_catalog.-) $2) / 86400) $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_date_plus(timestamp, numeric) '
+    'RETURNS ora_date LANGUAGE sql IMMUTABLE STRICT SET search_path = pg_catalog '
+    "AS $$ SELECT ($1 OPERATOR(pg_catalog.+) $2 * interval '1 day')::timestamp(0) $$;"
+    + ''.join(
+        'DO $$ BEGIN '
+        f'CREATE FUNCTION sys.ora_date_minus({left}, {right}) RETURNS numeric '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        '$f$ SELECT sys.ora_date_minus($1::timestamp, $2::timestamp) $f$; '
+        f'CREATE OPERATOR sys.- (LEFTARG = {left}, RIGHTARG = {right}, '
+        'FUNCTION = sys.ora_date_minus); '
+        'EXCEPTION WHEN duplicate_function OR undefined_object '
+        'OR invalid_schema_name THEN NULL; END $$;'
+        for left in _DATE_TYPES
+        for right in _DATE_TYPES
+    )
+    + ''.join(
+        'DO $$ BEGIN '
+        f'CREATE FUNCTION sys.ora_date_plus({date}, {number}) RETURNS ora_date '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        '$f$ SELECT sys.ora_date_plus($1::timestamp, $2::numeric) $f$; '
+        f'CREATE FUNCTION sys.ora_days_plus({number}, {date}) RETURNS ora_date '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        '$f$ SELECT sys.ora_date_plus($2::timestamp, $1::numeric) $f$; '
+        f'CREATE FUNCTION sys.ora_date_less({date}, {number}) RETURNS ora_date '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        '$f$ SELECT sys.ora_date_plus($1::timestamp, -$2::numeric) $f$; '
+        f'CREATE OPERATOR sys.+ (LEFTARG = {date}, RIGHTARG = {number}, '
+        'FUNCTION = sys.ora_date_plus); '
+        f'CREATE OPERATOR sys.+ (LEFTARG = {number}, RIGHTARG = {date}, '
+        'FUNCTION = sys.ora_days_plus); '
+        f'CREATE OPERATOR sys.- (LEFTARG = {date}, RIGHTARG = {number}, '
+        'FUNCTION = sys.ora_date_less); '
+        'EXCEPTION WHEN duplicate_function OR undefined_object '
+        'OR invalid_schema_name THEN NULL; END $$;'
+        for date in _DATE_TYPES
+        for number in _DAY_NUMBER_TYPES
+    )
+)
+
 # Oracle scalar functions the backend installs as real PostgreSQL functions,
 # rather than rewriting each call site with a regex (#513). A parens-called Oracle
 # function — HEXTORAW('..'), EMPTY_CLOB(), FROM_TZ(ts, 'zone') — resolves
@@ -3833,7 +3889,12 @@ _IDIOM_REWRITES: list[
         ),
         r'AS timestamptz\1',
     ),
-    ('sysdate', re.compile(r'\bsysdate\b', re.IGNORECASE), 'localtimestamp(0)'),
+    # SYSDATE is a DATE, so SYSDATE - d is a number of days (#1611).
+    (
+        'sysdate',
+        re.compile(r'\bsysdate\b', re.IGNORECASE),
+        f'localtimestamp(0)::{_DATE_TYPE}',
+    ),
     # SESSIONTIMEZONE → the zone as ALTER SESSION spelled it, or, before any was
     # set, the session's current offset in Oracle's `+hh:mm` form: the zone a
     # TIMESTAMP is read in on its way into an LTZ value (#1208).
@@ -5366,6 +5427,10 @@ _END_LABEL = re.compile(r'\s*(?:[A-Za-z_][\w$#]*)?\s*')
 
 
 def _translate_routine_types(text: str) -> str:
+    # A routine's DATE -- a parameter, a local, a package type's -- is the
+    # ora_date domain, as a table's column is, so its arithmetic is Oracle's
+    # (#1611).
+    text = _DDL_DATE_COLUMN.sub(_DATE_TYPE, text)
     for pattern, replacement in _DDL_TYPE_REWRITES:
         text = pattern.sub(replacement, text)
     return _ROWTYPE.sub(r'\1', _PLSQL_INTEGER_TYPE.sub('integer', text))
@@ -7743,6 +7808,7 @@ class PostgresBackend:
             self._conn.execute(_LOB_TYPE_DDL)
             self._conn.execute(_INTERVALYM_TYPE_DDL)
             self._conn.execute(_DATE_TYPE_DDL)
+            self._conn.execute(_DATE_ARITHMETIC_DDL)
             for name, tns_type in (
                 (_CLOB_TYPE, TNS_TYPE_CLOB),
                 (_BLOB_TYPE, TNS_TYPE_BLOB),
