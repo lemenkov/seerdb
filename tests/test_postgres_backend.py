@@ -2196,7 +2196,7 @@ def test_a_rowid_column_type_is_text_and_a_dml_reports_its_rowid() -> None:
     # used to reach the column TYPE and fail the CREATE. `SELECT ROWID` in a
     # CREATE TABLE ... AS SELECT is not a column definition and is left alone.
     assert _translate_ddl('CREATE TABLE t (n NUMBER, r ROWID, u UROWID)') == (
-        'CREATE TABLE t (n numeric, r varchar(18), u varchar(4000))'
+        'CREATE TABLE t (n numeric, r ora_rowid, u varchar(4000))'
     )
     assert 'varchar' not in _translate_ddl('CREATE TABLE t AS SELECT ROWID FROM s')
 
@@ -3764,6 +3764,40 @@ def test_a_type_is_visible_to_its_owner_and_its_grantees() -> None:
         for schema in ('own1621', 'oth1621'):
             admin.execute(f'DROP SCHEMA IF EXISTS {schema} CASCADE')
         admin.close()
+
+
+def test_a_rowid_column_refuses_a_number_and_a_bad_rowid() -> None:
+    # A ROWID column (#1624): a number bound or written into it by INSERT ...
+    # VALUES or UPDATE ... SET is ORA-00932, text that reads as no rowid
+    # ORA-01410, a real rowid goes in -- 23ai's answers, which python-oracledb's
+    # test_2902 checks. A number a query computes is refused too, as ORA-01410.
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE rw1624t (n NUMBER, r ROWID, s VARCHAR2(30))')
+        backend.execute("INSERT INTO rw1624t (n, s) VALUES (1, 'x')")
+        (rowid,) = backend.execute('SELECT ROWID FROM rw1624t').rows[0]
+        for statement, binds, code in (
+            ('INSERT INTO rw1624t (n, r) VALUES (2, :1)', [12345], 932),
+            ('INSERT INTO rw1624t (n, r) VALUES (2, 12345)', [], 932),
+            ('UPDATE rw1624t SET r = :1 WHERE n = 1', [12345], 932),
+            ('INSERT INTO rw1624t (n, r) VALUES (2, :1)', ['523lkhlf'], 1410),
+            ('INSERT INTO rw1624t (n, r) SELECT 4, 12345 FROM dual', [], 1410),
+        ):
+            with pytest.raises(BackendError) as exc:
+                backend.execute(statement, binds)
+            assert exc.value.ora_code == code, statement
+        backend.execute('INSERT INTO rw1624t (n, r) VALUES (2, :1)', [rowid])
+        backend.execute('INSERT INTO rw1624t (n, s) VALUES (5, :1)', [12345])
+        rows = backend.execute('SELECT r FROM rw1624t WHERE n = 2').rows
+        assert rows == [(rowid,)]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE rw1624t')
+        except Exception:
+            backend.rollback()
 
 
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
