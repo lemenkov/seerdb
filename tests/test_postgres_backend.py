@@ -3358,6 +3358,59 @@ def test_a_proxy_login_is_a_session_of_the_user_it_acts_for() -> None:
         proxied.close()
 
 
+def test_a_null_object_bind_resolves_an_overloaded_routine() -> None:
+    # A NULL object bound to a routine overloaded on object types (#1622): the
+    # NULL goes as the type its bind names, so the overload for that type is
+    # the one called -- python-oracledb's test_2300 gets 'null' back.
+    from postgres_backend import _object_type_oid
+
+    from seerdb.common.tns_consts import TNS_TYPE_ADT, TNS_TYPE_VARCHAR
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TYPE no1622a AS OBJECT (n NUMBER)')
+        backend.execute('CREATE TYPE no1622b AS OBJECT (s VARCHAR2(10))')
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE no1622 AS\n'
+            '  FUNCTION f(x no1622a) RETURN VARCHAR2;\n'
+            '  FUNCTION f(x no1622b) RETURN VARCHAR2;\nEND;'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE BODY no1622 AS\n'
+            "  FUNCTION f(x no1622a) RETURN VARCHAR2 IS BEGIN RETURN 'a'; END;\n"
+            "  FUNCTION f(x no1622b) RETURN VARCHAR2 IS BEGIN RETURN 'b'; END;\nEND;"
+        )
+        for name, expected in (('no1622a', 'a'), ('no1622b', 'b')):
+            (pg_oid,) = backend.execute(
+                f"SELECT '{name}'::regtype::oid::bigint FROM dual"
+            ).rows[0]
+            result = backend.execute(
+                'BEGIN :retval := no1622.f(:1); END;',
+                [
+                    BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=10),
+                    BindVar(
+                        value=None,
+                        tns_type=TNS_TYPE_ADT,
+                        max_size=0,
+                        toid=_object_type_oid(int(pg_oid)),
+                    ),
+                ],
+            )
+            assert result.out_binds[0] == expected
+    finally:
+        backend.rollback()
+        for statement in (
+            'DROP PACKAGE no1622',
+            'DROP TYPE no1622b',
+            'DROP TYPE no1622a',
+        ):
+            try:
+                backend.execute(statement)
+            except Exception:
+                backend.rollback()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
