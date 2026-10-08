@@ -122,6 +122,12 @@ honest edge of this adapter:
   work after it is committed too, where Oracle leaves it open, and a call that
   fails after it commits nothing, where Oracle keeps what came before it. A
   ROLLBACK in a routine is not translated and fails.
+- **No invalid UTF-8 in a string** -- PostgreSQL never lets text hold a byte
+  sequence that is not valid UTF-8, where Oracle stores what
+  ``UTL_RAW.CAST_TO_VARCHAR2`` relabels without checking it. Such a value is
+  refused (``invalid byte sequence for encoding "UTF8"``) rather than stored
+  and handed back for a client to replace (#1659). An application should
+  check its text before writing it.
 - **Privileges, for type lookup only** -- every Mirror user is the backend's
   one PostgreSQL role. A GRANT or REVOKE on an object is recorded
   (``sys.ora_grants``), and a user sees another user's type -- in ALL_TYPES,
