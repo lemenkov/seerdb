@@ -3228,6 +3228,40 @@ def test_a_block_returns_cursors_as_implicit_results() -> None:
         backend.close()
 
 
+def test_a_ref_cursor_describes_not_null_columns_as_not_nullable() -> None:
+    # A REF CURSOR a routine opens over a table (#1618) describes a column
+    # straight from a NOT NULL one as not nullable, as a query's result does,
+    # and a computed one as nullable -- python-oracledb's test_1301 reads it.
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER, TNS_TYPE_REFCURSOR
+    from seerdb.server.backend import BindVar, CursorResult
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE rn1618t (a NUMBER(9) NOT NULL, b NUMBER(9))')
+        backend.execute('INSERT INTO rn1618t VALUES (1, 2)')
+        backend.execute(
+            'CREATE OR REPLACE PROCEDURE rn1618(n NUMBER, c OUT SYS_REFCURSOR) IS\n'
+            'BEGIN\n  OPEN c FOR SELECT a, b, a + n AS s FROM rn1618t;\nEND;'
+        )
+        result = backend.execute(
+            'BEGIN rn1618(:1, :2); END;',
+            [
+                BindVar(value=1, tns_type=TNS_TYPE_NUMBER, max_size=22),
+                BindVar(value=None, tns_type=TNS_TYPE_REFCURSOR, max_size=1),
+            ],
+        )
+        cursor = result.out_binds[1]
+        assert isinstance(cursor, CursorResult)
+        assert [c.null_ok for c in cursor.columns] == [0, 1, 1]
+    finally:
+        backend.rollback()
+        for statement in ('DROP PROCEDURE rn1618', 'DROP TABLE rn1618t'):
+            try:
+                backend.execute(statement)
+            except Exception:
+                backend.rollback()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
