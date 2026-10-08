@@ -16,6 +16,15 @@ Then point a thin-dialect Oracle client at ``127.0.0.1:PORT`` as ``PYO`` /
     cur.execute("insert into t values (1, 'alice')")
     cur.execute('select * from t')     # -> [(1, 'alice')]
 
+More users log in with MIRROR_USERS, a comma-separated list of
+``user:password`` pairs, as for the passthrough example (#1655)::
+
+    MIRROR_USERS=pythontestproxy:pythontestproxy \
+        python examples/mirror_over_postgres.py
+
+Each user's objects go to a schema of its name, which ``CREATE USER`` makes.
+PYO is always included, so existing use is unchanged.
+
 Requires the ``psycopg`` package.
 """
 
@@ -46,6 +55,11 @@ def main() -> None:
     # One shared credential map across every session's backend, so a
     # changepassword on one connection is visible to the next (#515).
     credentials = {'PYO': 'pyo123'}
+    for pair in filter(None, os.environ.get('MIRROR_USERS', '').split(',')):
+        extra_user, _, extra_password = pair.partition(':')
+        if not extra_user or not _:
+            raise SystemExit(f'MIRROR_USERS entry is not user:password: {pair!r}')
+        credentials[extra_user.strip().upper()] = extra_password
     # One PostgreSQL session per client connection, behind the OracleCompatBackend
     # so a real sqlplus can bootstrap its session (thin clients pass through).
     seerdb.serve(
