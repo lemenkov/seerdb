@@ -7990,6 +7990,7 @@ class PostgresBackend:
         # Whether a table column is NOT NULL, by (relid, attnum) (#1307); any DDL
         # starts it over, as a column's constraint may have changed.
         self._not_null_cache: dict[tuple[int, int], bool] = {}
+        self._json_col_cache: dict[tuple[int, int], bool] = {}
         # INVISIBLE columns (#1195): whether the catalog exists, whether any
         # table has one (None: not yet read; reset by any DDL), and the visible
         # columns of the tables that do.
@@ -9173,6 +9174,7 @@ class PostgresBackend:
         self._any_invisible = None
         self._visible_cache.clear()
         self._not_null_cache.clear()
+        self._json_col_cache.clear()
         self._tstz_precision_cache.clear()
         if visibility is None or not self._has_invisible_catalog:
             return
@@ -9410,6 +9412,31 @@ class PostgresBackend:
                 self._not_null_cache[key] = key in not_null
         return {index for index, key in keys.items() if self._not_null_cache[key]}
 
+    def _json_columns(self, pgresult, count: int) -> set[int]:
+        # Which result columns come straight from a table column with an IS
+        # JSON check constraint (#1626), which Oracle describes as JSON, so a
+        # client hands back the parsed value. The constraint is stored as
+        # sys.ora_is_json(column) (#1614); one with NOT before it is no such
+        # column. Traced and cached as _not_null_columns is.
+        keys = {}
+        for index in range(count):
+            relid = pgresult.ftable(index)
+            if relid:
+                keys[index] = (relid, pgresult.ftablecol(index))
+        unknown = {key for key in keys.values() if key not in self._json_col_cache}
+        if unknown:
+            found = self._conn.execute(
+                'SELECT conrelid, conkey[1] FROM pg_constraint '
+                "WHERE contype = 'c' AND conrelid = ANY(%s) "
+                'AND cardinality(conkey) = 1 '
+                "AND pg_get_constraintdef(oid) ~ '^CHECK \\(+(sys\\.)?ora_is_json\\('",
+                ([relid for relid, _attnum in unknown],),
+            ).fetchall()
+            json = {(relid, attnum) for relid, attnum in found}
+            for key in unknown:
+                self._json_col_cache[key] = key in json
+        return {index for index, key in keys.items() if self._json_col_cache[key]}
+
     def _build_result(self, cursor, sql: str = '', original: str = '') -> Result:
         # Turn an executed statement's cursor into a Result: a row count for a
         # no-row statement, else the fetched rows plus a ColumnMeta per column.
@@ -9487,6 +9514,8 @@ class PostgresBackend:
                 columns[i] = replace(columns[i], name=name)
         for i in self._not_null_columns(cursor.pgresult, len(columns)):
             columns[i] = replace(columns[i], null_ok=0)
+        for i in self._json_columns(cursor.pgresult, len(columns)):
+            columns[i] = replace(columns[i], is_json=True)
         # A RAW(n) column describes as its declared n, which bytea does not keep;
         # the values' widest stood in for it (#1386). A LONG / LONG RAW column,
         # stored as text / bytea, describes as itself, unsized (#1382). An
