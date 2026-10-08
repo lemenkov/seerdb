@@ -1030,7 +1030,12 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN 'sid' THEN pg_backend_pid()::text "
     "WHEN 'current_schema' THEN upper(current_schema()) "
     "WHEN 'current_user' THEN upper(current_user::text) "
-    "WHEN 'session_user' THEN upper(session_user::text) "
+    # The session's user is the login's, or under a proxy login the user it
+    # acts for, and PROXY_USER the one who logged in (#1620); PostgreSQL's own
+    # session_user is the backend's role, which every session shares.
+    "WHEN 'session_user' THEN coalesce(nullif(current_setting('seerdb.session_user', "
+    "true), ''), upper(session_user::text)) "
+    "WHEN 'proxy_user' THEN nullif(current_setting('seerdb.proxy_user', true), '') "
     "WHEN 'current_schemaid' THEN current_setting('search_path') "
     "WHEN 'db_name' THEN upper(current_database()) "
     # The service the client connected to, which the Mirror hands over (#1409).
@@ -8024,6 +8029,7 @@ class PostgresBackend:
     def open_session(self, connect_attrs: dict[str, str]) -> None:
         # The driver name arrives only in the second login message (#1212).
         self._client_driver = connect_attrs.get('driver_name')
+        self._open_as(connect_attrs.get('proxy_client_name'))
         # The service the client connected to, for USERENV SERVICE_NAME (#1409),
         # kept in a session setting as the tracing attributes are.
         service = connect_attrs.get('service_name')
@@ -8037,6 +8043,33 @@ class PostgresBackend:
                 self._conn.commit()
             except psycopg.Error:
                 self._conn.rollback()
+
+    def _open_as(self, target: str | None) -> None:
+        # The session's user (#1620): the login's, or under a proxy login
+        # (`user[target]`) the target's, whose schema it then starts in, with
+        # the user who logged in as its PROXY_USER. Oracle admits only a target
+        # granted CONNECT THROUGH the user; the Mirror keeps no such grant and
+        # admits any. Committed at once, as the search_path at login is.
+        login = getattr(self, '_login_user', None)
+        if login is None:
+            return
+        user = target.upper() if target else login
+        try:
+            self._conn.execute(
+                "SELECT set_config('seerdb.session_user', %s, false), "
+                "set_config('seerdb.proxy_user', %s, false)",
+                (user, login if target else ''),
+            )
+            if target:
+                self._conn.execute(
+                    sql.SQL('SET search_path TO {}, ' + _SEARCH_PATH_TAIL).format(
+                        sql.Identifier(target.lower())
+                    )
+                )
+                self._login_user = user
+            self._conn.commit()
+        except psycopg.Error:
+            self._conn.rollback()
 
     def _record_session(self) -> None:
         # This session's row in sys.ora_sessions, and none for backends that have
