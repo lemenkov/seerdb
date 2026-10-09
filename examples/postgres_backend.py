@@ -1050,7 +1050,7 @@ _HELPER_FUNCTIONS_DDL = (
     + (
         # A BOOLEAN stored into a NUMBER column (#1705): 23ai converts it, TRUE to 1
         # and FALSE to 0, as a client binding a bool at 23ai expects. An assignment
-        # cast only -- an expression mixing the two stays an error, as in Oracle.
+        # cast only; comparing the two takes the operators below (#1743).
         # Creating a cast between built-in types needs a superuser; without one a
         # BOOLEAN into a NUMBER is refused, as before.
         'CREATE OR REPLACE FUNCTION ora_boolean_number(boolean) RETURNS numeric '
@@ -1059,6 +1059,24 @@ _HELPER_FUNCTIONS_DDL = (
         'CREATE CAST (boolean AS numeric) WITH FUNCTION ora_boolean_number(boolean) '
         'AS ASSIGNMENT; '
         'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+        # A BOOLEAN compared with a number, `WHERE flag = 1` (#1743): 23ai reads
+        # the number as zero FALSE, any other TRUE. An operator needs no
+        # superuser where a cast would; an integer reaches it through
+        # PostgreSQL's implicit cast to numeric. boolean = boolean, and an
+        # untyped literal against a boolean, still take the built-in one.
+        + ''.join(
+            f'CREATE OR REPLACE FUNCTION sys.ora_boolean_{name}({left}, {right}) '
+            f'RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT {body} $$;'
+            f'DO $$ BEGIN CREATE OPERATOR sys.{op} (LEFTARG = {left}, RIGHTARG = '
+            f'{right}, FUNCTION = sys.ora_boolean_{name}); '
+            'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
+            for name, op, left, right, body in (
+                ('eq_number', '=', 'boolean', 'numeric', '$1 = ($2 <> 0)'),
+                ('ne_number', '<>', 'boolean', 'numeric', '$1 <> ($2 <> 0)'),
+                ('number_eq', '=', 'numeric', 'boolean', '($1 <> 0) = $2'),
+                ('number_ne', '<>', 'numeric', 'boolean', '($1 <> 0) <> $2'),
+            )
+        )
     )
 )
 
@@ -2591,6 +2609,23 @@ def _vector_value(value: object, code: int | None) -> object:
     if typecode in ('b', 'B'):
         return array.array(typecode, (int(v) for v in elements))
     return array.array(typecode, (float(v) for v in elements))
+
+
+# A number literal into a BOOLEAN column (#1743).
+_BOOLEAN_TARGET_LITERAL = re.compile(r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?')
+# The bind types a number arrives declared as (#1743).
+_NUMBER_BIND_TYPES = frozenset({TNS_TYPE_NUMBER, TNS_TYPE_INT})
+
+
+def _number_like(value: object) -> bool:
+    # A bind that is a number, or a NULL declared NUMBER (#1743); never a bool.
+    if isinstance(value, BindVar):
+        return value.tns_type in _NUMBER_BIND_TYPES and (
+            value.value is None or _number_like(value.value)
+        )
+    return isinstance(value, (int, float, decimal.Decimal)) and not isinstance(
+        value, bool
+    )
 
 
 # A string literal as _mask_quoted leaves it (#1709).
@@ -10285,6 +10320,10 @@ class PostgresBackend:
         # OSON columns (#1706): whether any exist, and each relation's.
         self._has_oson_cache: bool | None = None
         self._oson_layout_cache: dict[str, tuple[list[str], frozenset[int]] | None] = {}
+        # Each relation's BOOLEAN columns (#1743), until a DDL.
+        self._boolean_column_cache: dict[
+            str, tuple[list[str], frozenset[int]] | None
+        ] = {}
         self._raw_constructor_cache: dict[str, frozenset[int]] | None = None
         self._any_invisible: bool | None = None
         self._visible_cache: dict[str, list[str] | None] = {}
@@ -10756,8 +10795,11 @@ class PostgresBackend:
         refused = self._rowid_number_error(sql, binds)
         if refused is not None:
             raise refused
-        binds = self._vector_text_binds(sql, self._oson_binds(sql, binds))
+        binds = self._boolean_binds(
+            sql, self._vector_text_binds(sql, self._oson_binds(sql, binds))
+        )
         sql = _ruled('vector-literals', self._vector_text_literals(sql), sql)
+        sql = _ruled('boolean-literals', self._boolean_literals(sql), sql)
         sql = _ruled('json-dot-notation', self._json_dot_notation(sql), sql)
         sql = _ruled('package-function-call', self._call_package_functions(sql), sql)
         bare = _BARE_CALL.match(sql)
@@ -11404,6 +11446,65 @@ class PostgresBackend:
                 out[index] = JSON(decode_oson(bytes(value)))
         return out
 
+    def _boolean_columns(self, name: str) -> tuple[list[str], frozenset[int]] | None:
+        # A relation's columns, in order, and which are BOOLEAN (#1743).
+        key = name.lower()
+        if key not in self._boolean_column_cache:
+            rows = self._conn.execute(
+                'SELECT attname, atttypid = %s FROM pg_attribute WHERE attrelid = '
+                'to_regclass(%s) AND attnum > 0 AND NOT attisdropped ORDER BY attnum',
+                (_BOOLEAN_OID, name),
+            ).fetchall()
+            self._boolean_column_cache[key] = (
+                ([r[0] for r in rows], frozenset(i for i, r in enumerate(rows) if r[1]))
+                if rows
+                else None
+            )
+        return self._boolean_column_cache[key]
+
+    def _boolean_binds(self, sql: str, binds: Sequence) -> Sequence:
+        """`binds` with each one an INSERT's VALUES or an UPDATE's SET puts
+        into a BOOLEAN column, given as a number, made the boolean 23ai makes
+        of it -- zero FALSE, any other TRUE -- and a NULL declared NUMBER an
+        untyped one (#1743): PostgreSQL has no assignment from a number to a
+        boolean, and a cast between built-in types needs a superuser."""
+        if (
+            not binds
+            or self._release < (23, 0)
+            or not any(_number_like(b) for b in binds)
+        ):
+            return binds
+        aimed = self._aimed_binds(sql, self._boolean_columns)
+        if not aimed:
+            return binds
+        out = list(binds)
+        for index, name in enumerate(_bind_names(sql)):
+            if name in aimed and index < len(out) and _number_like(out[index]):
+                value = out[index]
+                if isinstance(value, BindVar):
+                    value = value.value
+                out[index] = None if value is None else value != 0
+        return out
+
+    def _boolean_literals(self, sql: str) -> str:
+        # `sql` with each number literal an INSERT's VALUES or an UPDATE's SET
+        # puts into a BOOLEAN column made TRUE or FALSE, as 23ai reads it (#1743).
+        if self._release < (23, 0) or not any(c.isdigit() for c in sql):
+            return sql
+        (masked, contents, targets) = self._aimed_items(sql, self._boolean_columns)
+        spans = []
+        for (start, stop), _column in targets:
+            item = masked[start:stop]
+            if _BOOLEAN_TARGET_LITERAL.fullmatch(item.strip()):
+                begin = start + len(item) - len(item.lstrip())
+                spans.append((begin, begin + len(item.strip()), item.strip()))
+        if not spans:
+            return sql
+        for begin, end, literal in sorted(spans, reverse=True):
+            truth = 'FALSE' if decimal.Decimal(literal) == 0 else 'TRUE'
+            masked = f'{masked[:begin]}{truth}{masked[end:]}'
+        return _unmask_quoted(masked, contents)
+
     def _vector_formats(
         self, name: str
     ) -> tuple[list[str], dict[int, tuple[int | None, bool]]] | None:
@@ -11696,6 +11797,7 @@ class PostgresBackend:
         if not self._has_column_catalog:
             return
         self._column_type_cache.clear()
+        self._boolean_column_cache.clear()
         declared = _declared_columns(statement)
         try:
             self._conn.execute(
@@ -13723,7 +13825,10 @@ class PostgresBackend:
         # The Mirror calls this only for the non-batcherrors path, where a per-row
         # failure aborts the whole batch — exactly Oracle's non-batcherrors DML.
         rows = [
-            self._vector_text_binds(sql, self._oson_binds(sql, row)) for row in rows
+            self._boolean_binds(
+                sql, self._vector_text_binds(sql, self._oson_binds(sql, row))
+            )
+            for row in rows
         ]
         native = self._is_native(sql)
         if not native:
@@ -13827,7 +13932,10 @@ class PostgresBackend:
         rows that did apply are no longer reachable.)
         """
         rows = [
-            self._vector_text_binds(sql, self._oson_binds(sql, row)) for row in rows
+            self._boolean_binds(
+                sql, self._vector_text_binds(sql, self._oson_binds(sql, row))
+            )
+            for row in rows
         ]
         rows = list(rows)
         if not rows:

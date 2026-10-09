@@ -2116,9 +2116,10 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # sys.ora_package_unusable (#1605), sys.ora_is_json's two (#1614) and
     # sys.ora_commit_request (#1630), sys.ora_rr_shift and the two
     # sys.ora_rr_year (#1638), sys.ora_plsql_call and sys.ora_ndf_to_null
-    # (#1612), ora_boolean_number (#1705), and the SQL/JSON helpers: the two
-    # sys.ora_json, six sys.ora_json_scalar and sys.ora_json_serialize (#1707).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 89
+    # (#1612), ora_boolean_number (#1705), the SQL/JSON helpers: the two
+    # sys.ora_json, six sys.ora_json_scalar and sys.ora_json_serialize (#1707),
+    # and the four BOOLEAN / number comparisons behind = and <> (#1743).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 93
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
@@ -6333,6 +6334,48 @@ def test_a_string_literal_into_every_vector_column() -> None:
         backend.rollback()
         try:
             backend.execute('DROP TABLE l1742')
+        except BackendError:
+            backend.rollback()
+        backend.close()
+
+
+def test_a_number_into_and_against_a_boolean_column() -> None:
+    # A number into a 23ai BOOLEAN column, bound or literal, and a BOOLEAN
+    # compared with one (#1743). The answers are 23ai's, measured: zero is
+    # FALSE and any other number TRUE, 0.5 and -1 among them; a NULL declared
+    # NUMBER is NULL.
+    import decimal
+
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+    from seerdb.server import BackendError, BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        backend.execute('CREATE TABLE b1743 (n NUMBER, flag BOOLEAN)')
+        for i, value in enumerate(
+            [0, 1, -1, 0.5, decimal.Decimal('0.0'), BindVar(None, TNS_TYPE_NUMBER, 22)]
+        ):
+            backend.execute('INSERT INTO b1743 VALUES (:1, :2)', [i, value])
+        backend.execute('INSERT INTO b1743 (n, flag) VALUES (10, 2)')
+        backend.execute('INSERT INTO b1743 (n, flag) VALUES (11, 0)')
+        backend.execute('UPDATE b1743 SET flag = 0 WHERE n = 1')
+        rows = backend.execute('SELECT n, flag FROM b1743 ORDER BY n').rows
+        assert [flag for _n, flag in rows] == [
+            False,
+            False,
+            True,
+            True,
+            False,
+            None,
+            True,
+            False,
+        ]
+        (count,) = backend.execute('SELECT count(*) FROM b1743 WHERE flag = 1').rows[0]
+        assert count == 3
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE b1743')
         except BackendError:
             backend.rollback()
         backend.close()
