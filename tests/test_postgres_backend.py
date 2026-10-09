@@ -51,6 +51,7 @@ from postgres_backend import (  # noqa: E402
     _parse_out_assignments,
     _pg_oid_of,
     _reject_unsupported_ddl_types,
+    _several_statements,
     _strip_leading_comments,
     _to_interval_ym,
     _translate_admin,
@@ -6055,6 +6056,55 @@ def test_json_constructor_values_keep_their_type() -> None:
                 array.array('f', [1, 2]),
                 SparseVector(4, [1], array.array('d', [2.5])),
             ]
+    finally:
+        backend.rollback()
+        backend.close()
+
+
+def test_a_block_of_several_statements_reads_and_writes_its_binds() -> None:
+    # A PL/SQL block of several statements runs whole, its binds its locals
+    # (#1723): each statement sees what the one before wrote, a SELECT ... INTO
+    # :b among them. One-statement blocks keep their own paths.
+    import decimal
+
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER, TNS_TYPE_VARCHAR
+    from seerdb.server import BindVar
+
+    assert _several_statements("select 1 into :1 from dual; :2 := ';'")
+    assert not _several_statements('select 1 into :1 from dual;')
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for sql, binds, expected in (
+            (
+                'begin select 1 + 1 into :1 from dual; :2 := 5; end;',
+                [
+                    BindVar(None, TNS_TYPE_NUMBER, 22),
+                    BindVar(None, TNS_TYPE_NUMBER, 22),
+                ],
+                [2, 5],
+            ),
+            (
+                'begin :1 := 3; :2 := :1 + 1; end;',
+                [
+                    BindVar(None, TNS_TYPE_NUMBER, 22),
+                    BindVar(None, TNS_TYPE_NUMBER, 22),
+                ],
+                [3, 4],
+            ),
+            (
+                "begin select 'x' || :1 into :2 from dual; :3 := :2 || 'y'; end;",
+                [
+                    BindVar('a', TNS_TYPE_VARCHAR, 10),
+                    BindVar(None, TNS_TYPE_VARCHAR, 10),
+                    BindVar(None, TNS_TYPE_VARCHAR, 10),
+                ],
+                ['a', 'xa', 'xay'],
+            ),
+        ):
+            out = backend.execute(sql, binds).out_binds
+            assert [
+                int(v) if isinstance(v, decimal.Decimal) else v for v in out
+            ] == expected
     finally:
         backend.rollback()
         backend.close()
