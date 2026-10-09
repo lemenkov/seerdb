@@ -3052,6 +3052,100 @@ _VECTOR_DDL = (
     "sys.ora_vector_float32(b) WHEN 'HAMMING' THEN (SELECT count(*) FROM "
     'unnest(a.elements, b.elements) AS u(p, q) WHERE p IS DISTINCT FROM q) '
     'ELSE sys.ora_vector_float32(a) <=> sys.ora_vector_float32(b) END; END $$;'
+    # A vector element as FROM_VECTOR writes it (#1726): its exact value --
+    # from its IEEE bits, as numeric holds it to 15 digits only -- to `digits`
+    # significant digits, 9 for FLOAT32 and 17 for FLOAT64, as d.dddE+nnn with
+    # the trailing zeros dropped; zero as 0. Measured on 23ai.
+     + 'CREATE OR REPLACE FUNCTION sys.ora_vector_number(x float8, digits integer) '
+    'RETURNS text LANGUAGE plpgsql IMMUTABLE STRICT AS $$ DECLARE bits bigint; '
+    'e integer; d numeric; p integer; scale numeric; t text; BEGIN '
+    "IF x = 0 THEN RETURN '0'; END IF; "
+    "IF x <> x OR x = 'Infinity'::float8 OR x = '-Infinity'::float8 THEN "
+    'RETURN x::text; END IF; '
+    "bits := ('x' || encode(float8send(abs(x)), 'hex'))::bit(64)::bigint; "
+    'e := (bits >> 52)::integer; d := (bits & 4503599627370495)::numeric; '
+    'IF e = 0 THEN e := 1; ELSE d := d + 4503599627370496; END IF; e := e - 1075; '
+    # The value is d * 2^e; as an integer times a power of ten, d * 10^p.
+    'IF e >= 0 THEN d := d * power(2::numeric, e); p := 0; '
+    'ELSE d := d * power(5::numeric, -e); p := e; END IF; '
+    't := trunc(d)::text; IF length(t) > digits THEN '
+    'scale := power(10::numeric, length(t) - digits); p := p + length(t) - digits; '
+    'd := div(trunc(d), scale) + CASE WHEN 2 * mod(trunc(d), scale) >= scale '
+    'THEN 1 ELSE 0 END; t := d::text; END IF; '
+    'p := p + length(t) - 1; '
+    "t := rtrim(t, '0'); IF length(t) = 1 THEN t := t || '.0'; "
+    "ELSE t := left(t, 1) || '.' || substr(t, 2); END IF; "
+    "RETURN CASE WHEN x < 0 THEN '-' ELSE '' END || t || 'E' || "
+    "CASE WHEN p < 0 THEN '-' ELSE '+' END || lpad(abs(p)::text, 3, '0'); END $$;"
+    # A dense vector, and a sparse one, as FROM_VECTOR's text.
+    f'CREATE OR REPLACE FUNCTION sys.ora_vector_elements(code smallint, e float8[]) '
+    "RETURNS text LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT '[' || coalesce("
+    '(SELECT string_agg(CASE WHEN code IN (4, 5) THEN x::bigint::text '
+    'WHEN code = 3 THEN sys.ora_vector_number(x, 17) '
+    "ELSE sys.ora_vector_number(x::real::float8, 9) END, ',' ORDER BY i) "
+    "FROM unnest(e) WITH ORDINALITY AS u(x, i)), '') || ']' $$;"
+    f'CREATE OR REPLACE FUNCTION sys.ora_sparse_text(v {_SPARSE_COMPOSITE}) '
+    "RETURNS text LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT '[' || v.dims || ',[' "
+    "|| coalesce(array_to_string(v.indices, ','), '') || '],' || "
+    "sys.ora_vector_elements(v.format, v.elements) || ']' $$;"
+    f'CREATE OR REPLACE FUNCTION sys.ora_from_vector(v {_SPARSE_COMPOSITE}, '
+    'fmt text DEFAULT NULL) RETURNS text LANGUAGE sql IMMUTABLE AS $$ '
+    "SELECT CASE WHEN upper(fmt) = 'DENSE' THEN (SELECT sys.ora_vector_elements("
+    'd.format, d.elements) FROM sys.ora_sparse_dense(v) AS d) '
+    'ELSE sys.ora_sparse_text(v) END $$;'
+    f'CREATE OR REPLACE FUNCTION sys.ora_from_vector(v {_VECTOR_COMPOSITE}, '
+    'fmt text DEFAULT NULL) RETURNS text LANGUAGE sql IMMUTABLE AS $$ '
+    "SELECT CASE WHEN upper(fmt) = 'SPARSE' THEN sys.ora_sparse_text("
+    'sys.ora_vector_sparse(v)) ELSE sys.ora_vector_elements(v.format, v.elements) '
+    'END $$;'
+    # Each VECTOR storage, as its composite.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.ora_from_vector(v {source}, '
+        'fmt text DEFAULT NULL) RETURNS text LANGUAGE sql IMMUTABLE AS '
+        f'$$ SELECT sys.ora_from_vector(CAST(v AS {_VECTOR_COMPOSITE}), fmt) $$;'
+        for source in ('vector', 'float8[]', 'int2[]', 'varbit')
+    )
+    # Sparse text's vector, its values exact in the format `code` names
+    # before that format's rounding (#1726): 23ai reads FLOAT64 text exactly.
+    + f'CREATE OR REPLACE FUNCTION sys.ora_sparse_parse(t text, code integer) '
+    f'RETURNS {_SPARSE_COMPOSITE} LANGUAGE sql IMMUTABLE STRICT AS $$ '
+    'SELECT sys.ora_to_vector(ROW(code, (j ->> 0)::integer, ARRAY(SELECT x::integer '
+    'FROM jsonb_array_elements_text(j -> 1) WITH ORDINALITY AS a(x, k) ORDER BY k), '
+    'ARRAY(SELECT x::float8 FROM jsonb_array_elements_text(j -> 2) WITH ORDINALITY '
+    f'AS a(x, k) ORDER BY k))::{_SPARSE_COMPOSITE}) FROM (SELECT t::jsonb) AS s(j) $$;'
+    # TO_VECTOR / VECTOR(x, n, format, SPARSE): a sparse vector, from sparse
+    # text or a vector; dense text is ORA-51833, a dimension count other than
+    # n ORA-51820, BINARY ORA-51804. Measured on 23ai.
+     + f'CREATE OR REPLACE FUNCTION sys.ora_to_sparse(v {_SPARSE_COMPOSITE}, '
+    f'n integer DEFAULT NULL, fmt text DEFAULT NULL) RETURNS {_SPARSE_COMPOSITE} '
+    'LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN IF v IS NULL THEN RETURN NULL; END IF; '
+    "IF upper(fmt) = 'BINARY' THEN RAISE EXCEPTION USING ERRCODE = 'P0001', "
+    "MESSAGE = 'ORA-51804: A sparse vector cannot have BINARY format.'; END IF; "
+    'IF n IS NOT NULL AND v.dims <> n THEN '
+    "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = format('ORA-51820: The "
+    'sparse vector dimension count (%s) does not match the specified dimension '
+    "count (%s).', v.dims, n); END IF; RETURN sys.ora_to_vector(v, n, fmt); END $$;"
+    f'CREATE OR REPLACE FUNCTION sys.ora_to_sparse(t text, n integer DEFAULT NULL, '
+    f'fmt text DEFAULT NULL) RETURNS {_SPARSE_COMPOSITE} LANGUAGE plpgsql IMMUTABLE AS '
+    '$$ BEGIN IF t IS NULL THEN RETURN NULL; END IF; '
+    "IF jsonb_typeof(t::jsonb -> 1) IS DISTINCT FROM 'array' THEN "
+    "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'ORA-51833: The text of a "
+    "sparse vector must be [dimensions, [indices], [values]].'; END IF; "
+    "RETURN sys.ora_to_sparse(sys.ora_sparse_parse(t, CASE upper(fmt) WHEN 'FLOAT64' "
+    "THEN 3 WHEN 'INT8' THEN 4 ELSE 2 END), n, fmt); END $$;"
+    f'CREATE OR REPLACE FUNCTION sys.ora_to_sparse(v {_VECTOR_COMPOSITE}, '
+    f'n integer DEFAULT NULL, fmt text DEFAULT NULL) RETURNS {_SPARSE_COMPOSITE} '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT sys.ora_to_sparse(sys.ora_vector_sparse(v), n, fmt) $$;'
+    # ... DENSE: a dense one, a sparse vector's zeros filled in.
+    f'CREATE OR REPLACE FUNCTION sys.ora_to_dense(v {_SPARSE_COMPOSITE}, '
+    f'n integer DEFAULT NULL, fmt text DEFAULT NULL) RETURNS {_VECTOR_COMPOSITE} '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT sys.ora_to_vector(sys.ora_sparse_dense(v), n, fmt) $$;'
+    f'CREATE OR REPLACE FUNCTION sys.ora_to_dense(v {_VECTOR_COMPOSITE}, '
+    f'n integer DEFAULT NULL, fmt text DEFAULT NULL) RETURNS {_VECTOR_COMPOSITE} '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT sys.ora_to_vector(v, n, fmt) $$;'
+    f'CREATE OR REPLACE FUNCTION sys.ora_to_dense(t text, '
+    f'n integer DEFAULT NULL, fmt text DEFAULT NULL) RETURNS {_VECTOR_COMPOSITE} '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT sys.ora_to_vector(t, n, fmt) $$;'
 )
 
 
@@ -5507,9 +5601,12 @@ def _translate_json_functions(sql: str) -> str:
     return _rewrite_calls(sql, _JSON_FUNCTION_NAMES, call, '_$#."')
 
 
-# Oracle's vector functions (#1708), and pgvector's operator per distance
-# metric -- COSINE when none is named, as Oracle defaults.
-_VECTOR_FUNCTION_NAMES = frozenset({'TO_VECTOR', 'VECTOR_DISTANCE'})
+# Oracle's vector functions (#1708, #1726). VECTOR(x, ...) is TO_VECTOR's
+# synonym, VECTOR_SERIALIZE FROM_VECTOR's.
+_VECTOR_FUNCTION_NAMES = frozenset(
+    {'TO_VECTOR', 'VECTOR', 'VECTOR_DISTANCE', 'FROM_VECTOR', 'VECTOR_SERIALIZE'}
+)
+_TO_VECTOR_NAMES = frozenset({'TO_VECTOR', 'VECTOR'})
 # The metrics VECTOR_DISTANCE knows (#1708, #1710).
 _VECTOR_METRICS = frozenset(
     {
@@ -5528,24 +5625,42 @@ _VECTOR_METRICS = frozenset(
 
 
 def _translate_vector_functions(sql: str) -> str:
-    """TO_VECTOR(text [, dimensions [, format]]) as sys.ora_to_vector, and
-    VECTOR_DISTANCE(a, b [, metric]) as sys.ora_vector_distance of the two as
-    the composite (#1708), which picks the metric's computation by their format
-    (#1710). A string literal is the vector it spells."""
+    """TO_VECTOR(x [, dimensions [, format [, DENSE | SPARSE]]]) and its
+    synonym VECTOR(...) as sys.ora_to_vector -- sys.ora_to_dense / _sparse
+    where the kind is named (#1726) -- VECTOR_DISTANCE(a, b [, metric]) as
+    sys.ora_vector_distance of the two as the composite (#1708), which picks
+    the metric's computation by their format (#1710), and FROM_VECTOR(v
+    [RETURNING type] [FORMAT DENSE | SPARSE]) and its synonym VECTOR_SERIALIZE
+    as sys.ora_from_vector, through TO_CLOB where it returns a CLOB (#1726).
+    A string literal operand of a distance is the vector it spells."""
     if 'vector' not in sql.lower():
         return sql
 
     def call(name: str, args: list[str]) -> str | None:
+        if name.upper() in ('FROM_VECTOR', 'VECTOR_SERIALIZE'):
+            return _from_vector_call(args)
         inner = [_translate_vector_functions(a).strip() for a in args]
-        if name.upper() == 'TO_VECTOR':
-            if len(inner) > 3 or not 1 <= len(inner) <= 3:
+        if name.upper() in _TO_VECTOR_NAMES:
+            if not 1 <= len(inner) <= 4:
+                return None
+            # VECTOR(n, format) is the type, as in a CAST: its first argument a
+            # dimension count, where the function's is a vector.
+            if inner[0] == '*' or inner[0].isdigit():
                 return None
             dims = inner[1] if len(inner) > 1 and inner[1] != '*' else 'NULL'
             fmt = inner[2].upper() if len(inner) > 2 else '*'
-            if fmt != '*' and fmt not in _VECTOR_FORMATS:
+            kind = inner[3].upper() if len(inner) > 3 else ''
+            if (
+                fmt != '*'
+                and fmt not in _VECTOR_FORMATS
+                or kind not in ('', 'DENSE', 'SPARSE')
+            ):
                 return None
             named = 'NULL' if fmt == '*' else f"'{fmt}'"
-            return f'sys.ora_to_vector({inner[0]}, {dims}, {named})'
+            function = {'': 'to_vector', 'DENSE': 'to_dense', 'SPARSE': 'to_sparse'}[
+                kind
+            ]
+            return f'sys.ora_{function}({inner[0]}, {dims}, {named})'
         if len(inner) not in (2, 3):
             return None
         metric = inner[2].upper() if len(inner) == 3 else 'COSINE'
@@ -5568,18 +5683,19 @@ _SET_OPERATORS = frozenset({'UNION', 'INTERSECT', 'MINUS', 'EXCEPT', 'ALL', 'DIS
 
 def _computed_vector_columns(
     sql: str,
-) -> dict[int, tuple[int | None, int | None]]:
+) -> dict[int, tuple[int | None, int | None, bool | None]]:
     """The select-list positions of a query whose item is a whole TO_VECTOR
     call in every branch of its set operations, each with the dimensions and
-    format code the describe owes it, None where flexible (#1708): computed,
-    a value carries only its own format. As 23ai describes them, a NULL
-    branch says nothing, and a dimension count or a format holds only where
-    every branch names the same one; a call naming neither is flexible in
-    both."""
+    format code the describe owes it, None where flexible (#1708), and whether
+    it is sparse, None where the calls do not say (#1726): computed, a value
+    carries only its own format. As 23ai describes them, a NULL branch says
+    nothing, and a dimension count or a format holds only where every branch
+    names the same one; a call naming neither is flexible in both. A sparse
+    one stays sparse only where every branch is and they agree on the count."""
     words, _rownums = _top_level_words(sql)
     cuts = [pos for pos, word in words if word in _SET_OPERATORS - {'ALL', 'DISTINCT'}]
     cuts.append(len(sql))
-    merged: dict[int, list[tuple[int | None, int | None]]] = {}
+    merged: dict[int, list[tuple[int | None, int | None, str]]] = {}
     unknown: set[int] = set()
     begin = 0
     for cut in cuts:
@@ -5606,27 +5722,55 @@ def _computed_vector_columns(
     for index, vectors in merged.items():
         if index in unknown:
             continue
-        dims = {d for d, _code in vectors}
-        codes = {code for _d, code in vectors}
+        dims = {d for d, _code, _kind in vectors}
+        codes = {code for _d, code, _kind in vectors}
+        kinds = {kind for _d, _code, kind in vectors}
         found[index] = (
-            dims.pop() if len(dims) == 1 else None,
+            next(iter(dims)) if len(dims) == 1 else None,
             codes.pop() if len(codes) == 1 else None,
+            None if '' in kinds else kinds == {'SPARSE'} and len(dims) == 1,
         )
     return found
 
 
-def _to_vector_item(item: str) -> tuple[int | None, int | None] | None:
-    # A select item that is one TO_VECTOR(x [, n|*] [, format|*]) call,
-    # optionally aliased: its dimensions and format code, None where flexible;
-    # None for anything else, BINARY and SPARSE among them (#1708).
-    calls = list(_calls(item, frozenset({'TO_VECTOR'}), '_$#."'))
+def _from_vector_call(args: list[str]) -> str | None:
+    # FROM_VECTOR(v [RETURNING type] [FORMAT DENSE | SPARSE]) (#1726): its one
+    # argument split at the two clauses' words.
+    if len(args) != 1:
+        return None
+    text = args[0]
+    words, _rownums = _top_level_words(text)
+    cuts = [(pos, word) for pos, word in words if word in ('RETURNING', 'FORMAT')]
+    value = text[: cuts[0][0]] if cuts else text
+    clauses = {
+        word: text[pos + len(word) : next_pos].strip().upper()
+        for (pos, word), next_pos in zip(cuts, [p for p, _w in cuts[1:]] + [len(text)])
+    }
+    kind = clauses.get('FORMAT', '')
+    if kind not in ('', 'DENSE', 'SPARSE'):
+        return None
+    named = f"'{kind}'" if kind else 'NULL'
+    serialized = (
+        f'sys.ora_from_vector({_translate_vector_functions(value).strip()}, {named})'
+    )
+    if clauses.get('RETURNING', '').startswith('CLOB'):
+        return f'sys.to_clob({serialized})'
+    return serialized
+
+
+def _to_vector_item(item: str) -> tuple[int | None, int | None, str] | None:
+    # A select item that is one TO_VECTOR(x [, n|*] [, format|*] [, kind]) or
+    # VECTOR(...) call, optionally aliased: its dimensions and format code,
+    # None where flexible, and the DENSE or SPARSE it names, '' for none;
+    # None for anything else (#1708, #1726).
+    calls = list(_calls(item, _TO_VECTOR_NAMES, '_$#."'))
     if not calls or calls[0].start != 0:
         return None
     call = calls[0]
     if not _ITEM_ALIAS.fullmatch(item[call.close_at + 1 :].strip()):
         return None
     args = [item[x:y].strip().upper() for x, y in call.args]
-    if not 1 <= len(args) <= 3:
+    if not 1 <= len(args) <= 4 or len(args) == 4 and args[3] not in ('DENSE', 'SPARSE'):
         return None
     dims = args[1] if len(args) > 1 else '*'
     fmt = args[2] if len(args) > 2 else '*'
@@ -5637,6 +5781,7 @@ def _to_vector_item(item: str) -> tuple[int | None, int | None] | None:
     return (
         int(dims) if dims.isdigit() else None,
         _VECTOR_FORMATS[fmt] if fmt != '*' else None,
+        args[3] if len(args) == 4 else '',
     )
 
 
@@ -11796,17 +11941,25 @@ class PostgresBackend:
                     columns[i] = replace(
                         columns[i], csfrm=_CSFRM_NATIONAL, charset=AL16UTF16_CHARSET
                     )
-        # A computed TO_VECTOR(text, n, format) item describes as that vector
-        # (#1708), where its composite says only its values' format.
+        # A computed TO_VECTOR(text, n, format [, kind]) item describes as that
+        # vector (#1708, #1726), where its composite says only its values' format.
         if original:
-            for i, (count, code) in _computed_vector_columns(original).items():
+            for i, (count, code, kind_named) in _computed_vector_columns(
+                original
+            ).items():
                 if i < len(columns) and columns[i].data_type == TNS_TYPE_VECTOR:
+                    # Sparse as the calls say, else as the value's type is.
+                    is_sparse = (
+                        bool((columns[i].vector_flags or 0) & VECTOR_FLAG_SPARSE)
+                        if kind_named is None
+                        else kind_named
+                    )
                     columns[i] = replace(
                         columns[i],
                         vector_dimensions=count or 0,
                         vector_format=code or 0,
                         vector_flags=(0 if count else VECTOR_FLAG_FLEXIBLE_DIM)
-                        | ((columns[i].vector_flags or 0) & VECTOR_FLAG_SPARSE),
+                        | (VECTOR_FLAG_SPARSE if is_sparse else 0),
                     )
         # A CAST to NVARCHAR2(n) / NCHAR(n) in the select list describes national,
         # n characters and 2n bytes, which its varchar(n) / char(n) does not say
