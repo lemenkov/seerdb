@@ -10367,7 +10367,8 @@ class PostgresBackend:
         self._raw_layout_cache: dict[str, tuple[list[str], frozenset[int]] | None] = {}
         # Which table columns are JSON, for dot notation (#1707).
         self._json_columns_cache: dict[str, bool] = {}
-        # Each relation's declared VECTOR formats (#1708), and which are sparse.
+        # Each relation's declared VECTOR formats (#1708), and which are sparse;
+        # until a DDL (#1749).
         self._vector_format_cache: dict[
             str, tuple[list[str], dict[int, tuple[int | None, bool]]] | None
         ] = {}
@@ -11851,7 +11852,12 @@ class PostgresBackend:
         if not self._has_column_catalog:
             return
         self._column_type_cache.clear()
+        # The per-relation layouts too: a DDL can drop a table and create
+        # another of its name with other columns (#1749).
         self._boolean_column_cache.clear()
+        self._vector_format_cache.clear()
+        self._oson_layout_cache.clear()
+        self._has_oson_cache = None
         declared = _declared_columns(statement)
         try:
             self._conn.execute(
