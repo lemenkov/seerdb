@@ -6296,6 +6296,48 @@ def test_a_vector_bind_in_a_plsql_block() -> None:
         backend.close()
 
 
+def test_a_string_literal_into_every_vector_column() -> None:
+    # A string literal into a VECTOR column is the vector it spells, whatever
+    # the column's storage (#1742): a FLOAT64 / INT8 one's float8[] / int2[]
+    # included, a FLOAT64 one's read exactly, in an INSERT and an UPDATE.
+    import array
+
+    from seerdb.common.vector import SparseVector
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    if not backend._has_pgvector:
+        backend.close()
+        pytest.skip('the PostgreSQL bed has no pgvector')
+    try:
+        backend.execute(
+            'CREATE TABLE l1742 (n NUMBER, f32 VECTOR(3, FLOAT32), '
+            'f64 VECTOR(3, FLOAT64), i8 VECTOR(4, INT8), fx VECTOR, '
+            'sp VECTOR(4, FLOAT64, SPARSE), bn VECTOR(16, BINARY))'
+        )
+        backend.execute(
+            "INSERT INTO l1742 VALUES (1, '[1, 2, 3]', '[0.1, 2.5, 3.5]', "
+            "'[1, -2, 3, -4]', '[7, 8]', '[4, [1], [2.5]]', '[7, 8]')"
+        )
+        backend.execute("UPDATE l1742 SET i8 = '[5, 6, 7, 8]' WHERE n = 1")
+        (row,) = backend.execute('SELECT f32, f64, i8, fx, sp, bn FROM l1742').rows
+        assert row == (
+            array.array('f', [1, 2, 3]),
+            array.array('d', [0.1, 2.5, 3.5]),
+            array.array('b', [5, 6, 7, 8]),
+            array.array('f', [7, 8]),
+            SparseVector(4, [1], array.array('d', [2.5])),
+            array.array('B', [7, 8]),
+        )
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE l1742')
+        except BackendError:
+            backend.rollback()
+        backend.close()
+
+
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
     # #1692: a `:c` in a comment was counted as a bind, so every value after it
     # shifted -- `:b` silently got the wrong one; an apostrophe in a comment
