@@ -6032,7 +6032,25 @@ _NOCOPY = re.compile(r'\bNOCOPY\s+', re.IGNORECASE)
 _END_LABEL = re.compile(r'\s*(?:[A-Za-z_][\w$#]*)?\s*')
 
 
+# An explicit cursor's declaration, `CURSOR c [(params)] [RETURN type] IS`
+# (#1665), which PL/pgSQL spells `c CURSOR [(params)] FOR`.
+_CURSOR_DECLARATION = re.compile(
+    r'(?is)\bCURSOR\s+(\w+)\s*(\((?:[^()]|\([^()]*\))*\))?\s*'
+    r'(?:RETURN\s+[\w$#.%]+\s+)?IS\b'
+)
+# A cursor parameter's IN, which PL/pgSQL's take no mode for.
+_CURSOR_PARAM_IN = re.compile(r'(?i)(\w+\s+)IN\s+(?=\w)')
+
+
+def _cursor_declaration(match: re.Match[str]) -> str:
+    params = match.group(2)
+    if params:
+        params = ' ' + _CURSOR_PARAM_IN.sub(r'\1', params)
+    return f'{match.group(1)} CURSOR{params or ""} FOR'
+
+
 def _translate_routine_types(text: str) -> str:
+    text = _CURSOR_DECLARATION.sub(_cursor_declaration, text)
     # A routine's DATE -- a parameter, a local, a package type's -- is the
     # ora_date domain, as a table's column is, so its arithmetic is Oracle's
     # (#1611).

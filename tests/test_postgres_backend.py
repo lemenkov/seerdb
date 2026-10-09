@@ -59,6 +59,7 @@ from postgres_backend import (  # noqa: E402
     _translate_idioms,
     _translate_plsql_block,
     _translate_routine_ddl,
+    _translate_routine_types,
     _translate_signed_year,
     _urowid_expression,
 )
@@ -4104,6 +4105,50 @@ def test_a_cursors_attributes_read_as_in_oracle() -> None:
     finally:
         backend.rollback()
         for statement in ('DROP FUNCTION ca1608', 'DROP TABLE ca1608t'):
+            try:
+                backend.execute(statement)
+            except Exception:
+                backend.rollback()
+
+
+def test_an_explicit_cursor_declaration_translates() -> None:
+    # CURSOR c [(params)] IS ... (#1665), in a routine and in a block: PL/pgSQL
+    # spells it c CURSOR [(params)] FOR ..., a parameter without its IN. A
+    # cursor type is no declaration. The answers are 23ai's.
+    from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
+    from seerdb.server.backend import BindVar
+
+    assert _translate_routine_types(
+        'CURSOR k (m IN NUMBER) RETURN t%ROWTYPE IS SELECT n FROM t;'
+    ) == ('k CURSOR (m numeric) FOR SELECT n FROM t;')
+    assert _translate_routine_types('c SYS_REFCURSOR;') == 'c refcursor;'
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE xc1665t (n NUMBER)')
+        for n in (1, 2, 3):
+            backend.execute(f'INSERT INTO xc1665t VALUES ({n})')
+        backend.execute(
+            'CREATE OR REPLACE FUNCTION xc1665(lo NUMBER) RETURN VARCHAR2 IS\n'
+            '  CURSOR k IS SELECT n FROM xc1665t ORDER BY n;\n'
+            '  CURSOR p (m IN NUMBER) IS\n'
+            '    SELECT n FROM xc1665t WHERE n > m ORDER BY n;\n'
+            '  v NUMBER;\n  s VARCHAR2(200);\nBEGIN\n'
+            "  OPEN k; FETCH k INTO v; s := v || ' ';\n"
+            "  FETCH k INTO v; s := s || v || ' ' || k%ROWCOUNT || ' '; CLOSE k;\n"
+            "  FOR r IN p(lo) LOOP s := s || r.n || ' '; END LOOP;\n"
+            '  RETURN s;\nEND;'
+        )
+        (row,) = backend.execute('SELECT xc1665(1) FROM dual').rows
+        assert row[0] == '1 2 2 2 3 '
+        result = backend.execute(
+            'DECLARE CURSOR k IS SELECT n FROM xc1665t ORDER BY n DESC; '
+            'v NUMBER; BEGIN OPEN k; FETCH k INTO v; CLOSE k; :1 := v; END;',
+            [BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=20)],
+        )
+        assert result.out_binds[0] == '3'
+    finally:
+        backend.rollback()
+        for statement in ('DROP FUNCTION xc1665', 'DROP TABLE xc1665t'):
             try:
                 backend.execute(statement)
             except Exception:
