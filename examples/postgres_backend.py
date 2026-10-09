@@ -956,6 +956,19 @@ _HELPER_FUNCTIONS_DDL = (
         for base in ('smallint', 'integer', 'bigint')
         for exponent in ('smallint', 'integer', 'bigint')
     )
+    + (
+        # A BOOLEAN stored into a NUMBER column (#1705): 23ai converts it, TRUE to 1
+        # and FALSE to 0, as a client binding a bool at 23ai expects. An assignment
+        # cast only -- an expression mixing the two stays an error, as in Oracle.
+        # Creating a cast between built-in types needs a superuser; without one a
+        # BOOLEAN into a NUMBER is refused, as before.
+        'CREATE OR REPLACE FUNCTION ora_boolean_number(boolean) RETURNS numeric '
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT CASE WHEN $1 THEN 1 ELSE 0 END $$;'
+        'DO $$ BEGIN '
+        'CREATE CAST (boolean AS numeric) WITH FUNCTION ora_boolean_number(boolean) '
+        'AS ASSIGNMENT; '
+        'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+    )
 )
 
 
@@ -7539,6 +7552,7 @@ def _parse_out_assignments(body: str) -> list[tuple[str, str]] | None:
 
 
 # PostgreSQL type OIDs (pg_type.oid) → Oracle wire type.
+_BOOLEAN_OID = 16  # PostgreSQL's boolean
 _NUMBER_OIDS = frozenset(
     {
         16,
@@ -7952,10 +7966,19 @@ def _intervalym_column_meta(name: str) -> ColumnMeta:
     )
 
 
-def _column_meta(desc, values: list, tstz_oid: int | None = None) -> ColumnMeta:
+def _column_meta(
+    desc, values: list, tstz_oid: int | None = None, native_boolean: bool = False
+) -> ColumnMeta:
     # `desc` is a psycopg Column (name / type_code / precision / scale / ...).
     name, oid = desc.name, desc.type_code
     ident = _oracle_column_name(name).encode('utf-8')
+    if oid == _BOOLEAN_OID and native_boolean:
+        # A boolean is 23ai's BOOLEAN when the backend presents 23ai (#1705);
+        # a release without the type gets it as the NUMBER 1 or 0, below.
+        # Its wire length the Mirror fills in, as a real server reports it.
+        return ColumnMeta(
+            name=ident, data_type=TNS_TYPE_BOOLEAN, data_length=0, max_size=0
+        )
     if tstz_oid is not None and oid == tstz_oid:
         # The ora_tstz composite backing TIMESTAMP WITH TIME ZONE — the cells are
         # reconstructed to aware datetimes by the caller (#519).
@@ -10339,7 +10362,14 @@ class PostgresBackend:
                         row[i] = self._drain_refcursor(row[i])
                 columns.append(_refcursor_column_meta(desc.name))
             else:
-                columns.append(_column_meta(desc, [r[i] for r in rows], self._tstz_oid))
+                columns.append(
+                    _column_meta(
+                        desc,
+                        [r[i] for r in rows],
+                        self._tstz_oid,
+                        native_boolean=self._release >= (23, 0),
+                    )
+                )
         if self._has_quoted_names:
             folded = [
                 i
@@ -12419,7 +12449,12 @@ class PostgresBackend:
         columns = [
             _refcursor_column_meta(desc.name)
             if desc.type_code == _REFCURSOR_OID
-            else _column_meta(desc, [r[i] for r in rows], self._tstz_oid)
+            else _column_meta(
+                desc,
+                [r[i] for r in rows],
+                self._tstz_oid,
+                native_boolean=self._release >= (23, 0),
+            )
             for i, desc in enumerate(fetch.description or ())
         ]
         # A column straight from a NOT NULL table column is not nullable, as a
