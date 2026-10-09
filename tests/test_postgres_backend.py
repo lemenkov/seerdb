@@ -5448,6 +5448,37 @@ def test_json_columns_keep_osons_types_in_extended_form() -> None:
         backend.close()
 
 
+def test_storage_clauses_go_and_an_empty_lob_is_json_enough() -> None:
+    # A JSON / LOB column's STORE AS clause is Oracle's storage, which
+    # PostgreSQL decides itself, so it goes; and an IS JSON check lets an
+    # empty LOB in, as Oracle's does (#1706).
+    from seerdb.server import BackendError
+
+    for statement in (
+        'create table t (n number(9), j json) json (j) store as (compress high)',
+        'create table t (n number, c clob) lob (c) store as securefile s (cache)',
+        'create table t (n number, c clob, d blob) lob (c, d) store as basicfile',
+    ):
+        assert 'store' not in _translate_ddl(statement).lower()
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE TABLE e1706 (n NUMBER, c CLOB CHECK (c IS JSON), '
+            'b BLOB CHECK (b IS JSON))'
+        )
+        backend.execute('INSERT INTO e1706 VALUES (1, empty_clob(), empty_blob())')
+        with pytest.raises(BackendError) as exc:
+            backend.execute("INSERT INTO e1706 VALUES (2, 'not json', empty_blob())")
+        assert exc.value.ora_code == 2290
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE e1706')
+        except BackendError:
+            backend.rollback()
+        backend.close()
+
+
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
     # #1692: a `:c` in a comment was counted as a bind, so every value after it
     # shifted -- `:b` silently got the wrong one; an apostrophe in a comment

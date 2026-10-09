@@ -610,11 +610,15 @@ _HELPER_FUNCTIONS_DDL = (
     '<> statement_timestamp()::text; END IF; '
     "RETURN frames[3] NOT LIKE 'PL/pgSQL function %'; END $$;"
     # x IS JSON (#1614), for a value of a domain too: PostgreSQL's own condition
-    # takes text and bytea, and resolves no domain over either to it.
+    # takes text and bytea, and resolves no domain over either to it. An empty
+    # LOB passes, as an Oracle IS JSON check lets EMPTY_CLOB() / EMPTY_BLOB()
+    # in (#1706): it is unknown, not false.
     'CREATE OR REPLACE FUNCTION sys.ora_is_json(text) RETURNS boolean '
-    'LANGUAGE sql IMMUTABLE AS $$ SELECT $1 IS JSON $$;'
+    "LANGUAGE sql IMMUTABLE AS $$ SELECT CASE WHEN $1 = '' THEN NULL "
+    'ELSE $1 IS JSON END $$;'
     'CREATE OR REPLACE FUNCTION sys.ora_is_json(bytea) RETURNS boolean '
-    'LANGUAGE sql IMMUTABLE AS $$ SELECT $1 IS JSON $$;'
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT CASE WHEN length($1) = 0 THEN NULL '
+    'ELSE $1 IS JSON END $$;'
     # RAWTOHEX(x) → the hex text of a bytea. Oracle returns upper-case hex.
     'CREATE OR REPLACE FUNCTION rawtohex(bytea) RETURNS text '
     "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT upper(encode($1, 'hex')) $$;"
@@ -2568,6 +2572,18 @@ _DDL_TYPE_REWRITES = [
     (re.compile(r'([(,]\s*\w+)\s+ROWID\b', re.IGNORECASE), r'\1 ora_rowid'),
     # A BFILE column holds the two names (#1669).
     (re.compile(r'([(,]\s*\w+)\s+BFILE\b', re.IGNORECASE), r'\1 ora_bfile'),
+    # A column's storage clause, `JSON (c) STORE AS (COMPRESS HIGH)` or `LOB (c)
+    # STORE AS [name] (...)` after the column list (#1706): how Oracle stores
+    # the column, which PostgreSQL decides itself.
+    (
+        re.compile(
+            r'\s+(?:JSON|LOB)\s*\(\s*[\w$#"]+(?:\s*,\s*[\w$#"]+)*\s*\)\s*STORE\s+AS'
+            r'(?:\s+(?:SECUREFILE|BASICFILE)\b)?(?:\s+(?!\()[\w$#"]+)?'
+            r'(?:\s*\((?:[^()]|\([^()]*\))*\))?',
+            re.IGNORECASE,
+        ),
+        '',
+    ),
     # A JSON column is jsonb (#1706): binary, so it is parsed once, and its
     # equality and indexing are PostgreSQL's.
     (re.compile(r'([(,]\s*\w+)\s+JSON\b(?!\s*\()', re.IGNORECASE), r'\1 jsonb'),
