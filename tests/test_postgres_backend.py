@@ -6194,6 +6194,59 @@ def test_to_vector_and_vector_distance() -> None:
         backend.close()
 
 
+def test_vector_distance_past_pgvector() -> None:
+    # VECTOR_DISTANCE of FLOAT64 / INT8 vectors, and of longer ones than
+    # pgvector's 16000 dimensions, sums the elements in float8 (#1738). The
+    # FLOAT64 answers are 23ai's exactly, measured; a zero vector's COSINE is
+    # NaN and vectors of different counts ORA-51808, as 23ai's.
+    import array
+    import math
+
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    if not backend._has_pgvector:
+        backend.close()
+        pytest.skip('the PostgreSQL bed has no pgvector')
+    try:
+        x = array.array('d', array.array('f', [0.1, 0.7, 1e-3, 3.3]))
+        y = array.array('d', array.array('f', [0.3, 0.2, 2.5, -1.1]))
+        row = backend.execute(
+            'SELECT VECTOR_DISTANCE(:1, :2, EUCLIDEAN), VECTOR_DISTANCE(:1, :2), '
+            'VECTOR_DISTANCE(:1, :2, DOT), VECTOR_DISTANCE(:1, :2, MANHATTAN) FROM dual',
+            [x, y],
+        ).rows[0]
+        assert row == (
+            5.0887130769208655,
+            1.3718599678520904,
+            3.4575000247661944,
+            7.598999971640296,
+        )
+        for typecode, high, low in (('f', 3.5, 2.5), ('d', 3.5, 2.5), ('b', 3, 2)):
+            (distance,) = backend.execute(
+                'SELECT VECTOR_DISTANCE(:1, :2, EUCLIDEAN) FROM dual',
+                [
+                    array.array(typecode, [high] * 65535),
+                    array.array(typecode, [low] * 65535),
+                ],
+            ).rows[0]
+            assert distance == pytest.approx(math.sqrt(65535))
+        (cosine,) = backend.execute(
+            'SELECT VECTOR_DISTANCE(:1, :2, COSINE) FROM dual',
+            [array.array('d', [0, 0]), array.array('d', [1, 2])],
+        ).rows[0]
+        assert math.isnan(cosine)
+        with pytest.raises(BackendError) as exc:
+            backend.execute(
+                'SELECT VECTOR_DISTANCE(:1, :2) FROM dual',
+                [array.array('d', [1, 2]), array.array('d', [1, 2, 3])],
+            )
+        assert exc.value.ora_code == 51808
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
     # #1692: a `:c` in a comment was counted as a bind, so every value after it
     # shifted -- `:b` silently got the wrong one; an apostrophe in a comment
