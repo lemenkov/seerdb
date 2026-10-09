@@ -147,7 +147,8 @@ honest edge of this adapter:
 - **VECTOR on pgvector, where installed** (#1708) -- FLOAT32 is pgvector's
   ``vector``, FLOAT64 and INT8 are ``float8[]`` / ``int2[]``, and a column of
   flexible format keeps each value's format in a composite. A FLOAT32 column
-  holds at most pgvector's 16000 dimensions, where Oracle's holds 65535.
+  holds at most pgvector's 16000 dimensions (#1734), where Oracle's holds
+  65535.
   VECTOR_DISTANCE is pgvector's operators: COSINE, EUCLIDEAN(_SQUARED), DOT
   and MANHATTAN, and HAMMING by element. A sparse column (#1709) is a
   composite of its own in every format -- pgvector's sparsevec drops an
