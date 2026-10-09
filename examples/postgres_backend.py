@@ -149,8 +149,10 @@ honest edge of this adapter:
   flexible format keeps each value's format in a composite. A FLOAT32 column
   holds at most pgvector's 16000 dimensions, where Oracle's holds 65535.
   VECTOR_DISTANCE is pgvector's operators: COSINE, EUCLIDEAN(_SQUARED), DOT
-  and MANHATTAN, not HAMMING or JACCARD. Without pgvector a VECTOR column is refused. Sparse and BINARY vectors are
-  not yet there.
+  and MANHATTAN, not HAMMING or JACCARD. A sparse column (#1709) is a
+  composite of its own in every format -- pgvector's sparsevec drops an
+  explicit zero, which Oracle keeps -- and has no pgvector index. Without
+  pgvector a VECTOR column is refused. BINARY vectors are not yet there.
 - **Privileges, for type lookup only** -- every Mirror user is the backend's
   one PostgreSQL role. A GRANT or REVOKE on an object is recorded
   (``sys.ora_grants``), and a user sees another user's type -- in ALL_TYPES,
@@ -220,6 +222,7 @@ import decimal
 import functools
 import hashlib
 import json
+import math
 import re
 import select
 import struct
@@ -306,6 +309,7 @@ from seerdb.common.tns_consts import (
     ORA_VALUE_LARGER_THAN_PRECISION,
     ORA_VALUE_TOO_LARGE_FOR_COLUMN,
     ORA_VECTOR_DIMENSION_MISMATCH,
+    ORA_VECTOR_INVALID_VALUE,
     TNS_TYPE_ADT,
     TNS_TYPE_BDOUBLE,
     TNS_TYPE_BFILE,
@@ -331,7 +335,9 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_VARCHAR,
     TNS_TYPE_VECTOR,
     VECTOR_FLAG_FLEXIBLE_DIM,
+    VECTOR_FLAG_SPARSE,
 )
+from seerdb.common.vector import SparseVector
 from seerdb.server import (
     BackendError,
     BindVar,
@@ -1599,6 +1605,8 @@ _ORACLE_DICTIONARY_DDL = (
     'WHEN o.data_type IS NULL AND c.data_type IN '
     "('timestamp without time zone', 'timestamp with time zone') "
     'THEN c.datetime_precision '
+    # A VECTOR's scale slot marks it sparse (#1709); a vector has no scale.
+    "WHEN o.data_type = 'VECTOR' THEN NULL "
     'WHEN o.data_type IS NOT NULL THEN o.data_scale ELSE c.numeric_scale END)'
     '::information_schema.cardinal_number AS data_scale, '
     # CHAR_LENGTH is 0 for a type with no character length, not NULL (#1418).
@@ -2510,6 +2518,83 @@ def _vector_value(value: object, code: int | None) -> object:
     return array.array(typecode, (float(v) for v in elements))
 
 
+# A string literal as _mask_quoted leaves it (#1709).
+_MASKED_LITERAL = re.compile("'\x00\\d+\x00'")
+
+
+def _sparse_value(value: object, code: int | None) -> SparseVector | None:
+    # A stored sparse vector as a SparseVector in `code`'s format, else its own
+    # (#1709); an INT8 value rounds half to even, as Oracle stores one.
+    if value is None:
+        return None
+    code = code or getattr(value, 'format', None) or 2
+    typecode = _VECTOR_TYPECODES.get(code, 'f')
+    elements = list(getattr(value, 'elements', None) or [])
+    values = array.array(
+        typecode,
+        (round(v) for v in elements)
+        if typecode == 'b'
+        else (float(v) for v in elements),
+    )
+    return SparseVector(
+        int(getattr(value, 'dims', 0) or 0),
+        list(getattr(value, 'indices', None) or []),
+        values,
+    )
+
+
+def _sparse_from_text(text: str, code: int | None) -> SparseVector | None:
+    # A string a client writes into a sparse column (#1709): '[dims, [indices],
+    # [values]]', or a dense '[e, ...]' of which the non-zero elements are kept;
+    # None for anything else.
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(parsed, list):
+        return None
+    typecode = _VECTOR_TYPECODES.get(code or 2, 'f')
+    cast_to = int if typecode == 'b' else float
+    if len(parsed) == 3 and isinstance(parsed[1], list) and isinstance(parsed[2], list):
+        return SparseVector(
+            int(parsed[0]), parsed[1], array.array(typecode, map(cast_to, parsed[2]))
+        )
+    pairs = [(i, v) for i, v in enumerate(parsed) if v]
+    return SparseVector(
+        len(parsed),
+        [i for i, _v in pairs],
+        array.array(typecode, (cast_to(v) for _i, v in pairs)),
+    )
+
+
+def _reject_nonfinite_sparse(binds: Sequence) -> None:
+    # A sparse vector holding inf or NaN is refused, as 23ai refuses one: it has
+    # no VECTOR text form (#1709).
+    for value in binds:
+        if isinstance(value, SparseVector) and not all(
+            math.isfinite(v) for v in value.values
+        ):
+            raise BackendError(
+                'Invalid syntax for VECTOR value. The specified dimension value '
+                'could not be converted to a number.',
+                ora_code=ORA_VECTOR_INVALID_VALUE,
+            )
+
+
+class _SparseVectorDumper(psycopg.adapt.Dumper):
+    # A sparse vector bind (#1709) as the ora_sparse_vector composite, its
+    # format the values' typecode's, whose oid each connection registers this
+    # under; assignment casts make it any VECTOR column's storage.
+    oid = 0
+
+    def dump(self, obj: SparseVector) -> bytes:
+        typecode = getattr(obj.values, 'typecode', 'f')
+        code = {'f': 2, 'd': 3, 'b': 4}.get(typecode, 2)
+        indices = ','.join(str(int(i)) for i in obj.indices)
+        elements = ','.join(repr(float(v)) for v in obj.values)
+        return f'({code},{int(obj.num_dimensions)},"{{{indices}}}","{{{elements}}}")'.encode()
+
+
 class _VectorDumper(psycopg.adapt.Dumper):
     # A vector bind (#1708), an array.array, as the ora_vector composite --
     # its format the array's typecode's -- whose oid each connection registers
@@ -2683,14 +2768,19 @@ _VARCHAR2_WORD = re.compile(r'\bVARCHAR2\b', re.IGNORECASE)
 _VECTOR_FORMATS = {'FLOAT32': 2, 'FLOAT64': 3, 'INT8': 4}
 _VECTOR_TYPECODES = {2: 'f', 3: 'd', 4: 'b'}
 _VECTOR_COMPOSITE = 'ora_vector'
+# A sparse vector (#1709): its format, dimension count, ascending 0-based indices
+# and their values. Every sparse column is one: pgvector's sparsevec drops a zero
+# a client stored, which Oracle keeps.
+_SPARSE_COMPOSITE = 'ora_sparse_vector'
 _VECTOR_DECLARED = re.compile(
-    r'\s*VECTOR\b(?:\s*\(\s*(\*|\d+)?\s*(?:,\s*(\*|FLOAT32|FLOAT64|INT8)\s*)?\))?'
-    r'(?!\s*\()',
+    r'\s*VECTOR\b(?:\s*\(\s*(\*|\d+)?\s*(?:,\s*(\*|FLOAT32|FLOAT64|INT8)\s*)?'
+    r'(?:,\s*(DENSE|SPARSE)\s*)?\))?(?!\s*\()',
     re.IGNORECASE,
 )
 _VECTOR_COLUMN = re.compile(
     r'([(,]\s*(?:"[^"]+"|[A-Za-z_][\w$#]*))\s+VECTOR\b'
-    r'(?:\s*\(\s*(\*|\d+)?\s*(?:,\s*(\*|FLOAT32|FLOAT64|INT8)\s*)?\))?(?!\s*,\s*SPARSE)',
+    r'(?:\s*\(\s*(\*|\d+)?\s*(?:,\s*(\*|FLOAT32|FLOAT64|INT8)\s*)?'
+    r'(?:,\s*(DENSE|SPARSE)\s*)?\))?',
     re.IGNORECASE,
 )
 _VECTOR_DDL = (
@@ -2783,6 +2873,87 @@ _VECTOR_DDL = (
     'DO $$ BEGIN CREATE CAST (int2[] AS vector) WITH FUNCTION '
     'sys.ora_int2_vector(int2[]); '
     'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+    # A sparse vector (#1709) and Oracle's checks on one: the column's count
+    # (ORA-51803), indices ascending (ORA-51822) and inside the count
+    # (ORA-51836), an INT8 value in range (ORA-51806).
+    f'DO $$ BEGIN CREATE TYPE {_SPARSE_COMPOSITE} AS (format smallint, dims integer, '
+    'indices integer[], elements float8[]); '
+    'EXCEPTION WHEN duplicate_object THEN NULL; END $$;'
+    f'CREATE OR REPLACE FUNCTION sys.ora_sparse_check(v {_SPARSE_COMPOSITE}, '
+    'n integer, code integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$ '
+    'BEGIN IF v IS NULL THEN RETURN true; END IF; '
+    'IF n IS NOT NULL AND v.dims <> n THEN '
+    "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = format('ORA-51803: Vector "
+    'dimension count must match the dimension count specified in the column '
+    "definition (actual: %s, required: %s).', v.dims, n); END IF; "
+    'FOR i IN 1 .. coalesce(cardinality(v.indices), 0) LOOP '
+    'IF v.indices[i] < 0 OR v.indices[i] >= v.dims THEN '
+    "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = format('ORA-51836: The "
+    "sparse dimension index value at %s is greater than total dimension count.', i); "
+    'END IF; IF i > 1 AND v.indices[i] <= v.indices[i - 1] THEN '
+    "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'ORA-51822: The index values "
+    "in sparse vector are not in strictly ascending order.'; END IF; END LOOP; "
+    'IF coalesce(code, v.format) = 4 THEN PERFORM sys.ora_vector_int2(ROW(4, '
+    f"coalesce(v.elements, '{{}}'))::{_VECTOR_COMPOSITE}); END IF; RETURN true; END $$;"
+    # A sparse vector into a dense column, or used where one is wanted: its
+    # zeros filled in, its format kept.
+    f'CREATE OR REPLACE FUNCTION sys.ora_sparse_dense(v {_SPARSE_COMPOSITE}) '
+    f'RETURNS {_VECTOR_COMPOSITE} LANGUAGE plpgsql IMMUTABLE STRICT AS $$ '
+    'DECLARE e float8[]; BEGIN PERFORM sys.ora_sparse_check(v, NULL, NULL); '
+    'e := array_fill(0::float8, ARRAY[v.dims]); '
+    'FOR i IN 1 .. coalesce(cardinality(v.indices), 0) LOOP '
+    'e[v.indices[i] + 1] := v.elements[i]; END LOOP; '
+    f'RETURN ROW(v.format, e)::{_VECTOR_COMPOSITE}; END $$;'
+    f'DO $$ BEGIN CREATE CAST ({_SPARSE_COMPOSITE} AS {_VECTOR_COMPOSITE}) WITH FUNCTION '
+    f'sys.ora_sparse_dense({_SPARSE_COMPOSITE}) AS ASSIGNMENT; '
+    'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.{function}({_SPARSE_COMPOSITE}) '
+        f'RETURNS {target} LANGUAGE sql IMMUTABLE STRICT AS '
+        f'$$ SELECT sys.{function}(sys.ora_sparse_dense($1)) $$;'
+        f'DO $$ BEGIN CREATE CAST ({_SPARSE_COMPOSITE} AS {target}) WITH FUNCTION '
+        f'sys.{function}({_SPARSE_COMPOSITE}) AS ASSIGNMENT; '
+        'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+        for target, function in (
+            ('vector', 'ora_vector_float32'),
+            ('float8[]', 'ora_vector_float8'),
+            ('int2[]', 'ora_vector_int2'),
+        )
+    )
+    # A dense vector into a sparse column: its non-zero elements.
+    + f'CREATE OR REPLACE FUNCTION sys.ora_vector_sparse(v {_VECTOR_COMPOSITE}) '
+    f'RETURNS {_SPARSE_COMPOSITE} LANGUAGE sql IMMUTABLE STRICT AS $$ '
+    'SELECT ROW(v.format, coalesce(cardinality(v.elements), 0), '
+    "coalesce(array_agg(i - 1 ORDER BY i) FILTER (WHERE e <> 0), '{}'), "
+    "coalesce(array_agg(e ORDER BY i) FILTER (WHERE e <> 0), '{}'))"
+    f'::{_SPARSE_COMPOSITE} FROM unnest(v.elements) WITH ORDINALITY AS u(e, i) $$;'
+    f'DO $$ BEGIN CREATE CAST ({_VECTOR_COMPOSITE} AS {_SPARSE_COMPOSITE}) WITH FUNCTION '
+    f'sys.ora_vector_sparse({_VECTOR_COMPOSITE}) AS ASSIGNMENT; '
+    'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+    # Text written into a sparse column: '[dims, [indices], [values]]', or a
+    # dense '[e, ...]', FLOAT32 as TO_VECTOR's default.
+    f'CREATE OR REPLACE FUNCTION sys.ora_text_sparse(t text) RETURNS {_SPARSE_COMPOSITE} '
+    'LANGUAGE plpgsql IMMUTABLE STRICT AS $$ DECLARE j jsonb := t::jsonb; BEGIN '
+    "IF jsonb_typeof(j -> 1) = 'array' THEN RETURN ROW(2, (j ->> 0)::integer, "
+    'ARRAY(SELECT x::integer FROM jsonb_array_elements_text(j -> 1) WITH ORDINALITY '
+    'AS a(x, k) ORDER BY k), ARRAY(SELECT x::real::float8 FROM '
+    'jsonb_array_elements_text(j -> 2) WITH ORDINALITY AS a(x, k) ORDER BY k))'
+    f'::{_SPARSE_COMPOSITE}; END IF; '
+    'RETURN sys.ora_vector_sparse(sys.ora_to_vector(t)); END $$;'
+    f'DO $$ BEGIN CREATE CAST (text AS {_SPARSE_COMPOSITE}) WITH FUNCTION '
+    'sys.ora_text_sparse(text) AS ASSIGNMENT; '
+    'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+    # TO_VECTOR of a sparse vector stays sparse, in the format asked for.
+    f'CREATE OR REPLACE FUNCTION sys.ora_to_vector(v {_SPARSE_COMPOSITE}, '
+    f'n integer DEFAULT NULL, fmt text DEFAULT NULL) RETURNS {_SPARSE_COMPOSITE} '
+    'LANGUAGE plpgsql IMMUTABLE AS $$ DECLARE code integer; e float8[]; BEGIN '
+    'IF v IS NULL THEN RETURN NULL; END IF; '
+    "code := CASE upper(fmt) WHEN 'FLOAT32' THEN 2 WHEN 'FLOAT64' THEN 3 "
+    "WHEN 'INT8' THEN 4 ELSE v.format END; "
+    'PERFORM sys.ora_sparse_check(v, n, code); e := v.elements; '
+    'IF code = 2 THEN e := e::real[]::float8[]; '
+    'ELSIF code = 4 THEN e := e::int2[]::float8[]; END IF; '
+    f'RETURN ROW(code, v.dims, v.indices, e)::{_SPARSE_COMPOSITE}; END $$;'
 )
 
 
@@ -2800,6 +2971,12 @@ def _vector_declaration(
 
 def _vector_storage(m: re.Match[str]) -> str:
     (count, code) = _vector_declaration(m.group(2), m.group(3))
+    if (m.group(4) or '').upper() == 'SPARSE':
+        name = m.group(1).lstrip('(,').strip()
+        return (
+            f'{m.group(1)} {_SPARSE_COMPOSITE} CHECK (sys.ora_sparse_check({name}, '
+            f'{count or "NULL"}, {code or "NULL"}))'
+        )
     if m.group(3) is None or m.group(3) == '*':
         return f'{m.group(1)} {_VECTOR_COMPOSITE}'
     if code == 2:
@@ -3295,8 +3472,14 @@ def _declared_type(
         return ('RAW', int(raw.group(1)), None, None)
     vector = _VECTOR_DECLARED.match(definition)
     if vector is not None:
-        # Its dimensions and format code, None where flexible (#1708).
-        return ('VECTOR', *_vector_declaration(vector.group(1), vector.group(2)), None)
+        # Its dimensions and format code, None where flexible (#1708), and 1 in
+        # the scale slot where it is sparse (#1709).
+        sparse = 1 if (vector.group(3) or '').upper() == 'SPARSE' else None
+        return (
+            'VECTOR',
+            *_vector_declaration(vector.group(1), vector.group(2)),
+            sparse,
+        )
     long = _LONG_DECLARED.match(definition)
     if long is not None:
         # Oracle lists a LONG / LONG RAW column with data_length 0.
@@ -9182,6 +9365,7 @@ class PostgresBackend:
         self._has_pgvector = False
         self._vector_oid: int | None = None
         self._vector_composite_oid: int | None = None
+        self._sparse_composite_oid: int | None = None
         try:
             with self._conn.transaction():
                 self._conn.execute('CREATE EXTENSION IF NOT EXISTS vector')
@@ -9204,14 +9388,21 @@ class PostgresBackend:
             pass
         # What this session has, whichever session's setup made it.
         row = self._conn.execute(
-            "SELECT to_regtype('vector')::oid, to_regtype(%s)::oid",
-            (_VECTOR_COMPOSITE,),
+            "SELECT to_regtype('vector')::oid, to_regtype(%s)::oid, to_regtype(%s)::oid",
+            (_VECTOR_COMPOSITE, _SPARSE_COMPOSITE),
         ).fetchone()
-        if row is not None and row[0] is not None and row[1] is not None:
+        if row is not None and None not in row:
             composite = CompositeInfo.fetch(self._conn, _VECTOR_COMPOSITE)
-            if composite is not None:
+            sparse = CompositeInfo.fetch(self._conn, _SPARSE_COMPOSITE)
+            if composite is not None and sparse is not None:
                 register_composite(composite, self._conn)
+                register_composite(sparse, self._conn)
                 (self._vector_oid, self._vector_composite_oid) = (row[0], row[1])
+                self._sparse_composite_oid = row[2]
+                self._conn.adapters.register_dumper(
+                    SparseVector,
+                    type('_SparseBindDumper', (_SparseVectorDumper,), {'oid': row[2]}),
+                )
                 self._has_pgvector = True
                 # A vector bind is the composite: its format travels with it,
                 # and an assignment cast makes it any VECTOR column's storage.
@@ -9450,9 +9641,9 @@ class PostgresBackend:
         self._raw_layout_cache: dict[str, tuple[list[str], frozenset[int]] | None] = {}
         # Which table columns are JSON, for dot notation (#1707).
         self._json_columns_cache: dict[str, bool] = {}
-        # Each relation's declared VECTOR formats (#1708).
+        # Each relation's declared VECTOR formats (#1708), and which are sparse.
         self._vector_format_cache: dict[
-            str, tuple[list[str], dict[int, int | None]] | None
+            str, tuple[list[str], dict[int, tuple[int | None, bool]]] | None
         ] = {}
         # OSON columns (#1706): whether any exist, and each relation's.
         self._has_oson_cache: bool | None = None
@@ -9928,6 +10119,7 @@ class PostgresBackend:
         if refused is not None:
             raise refused
         binds = self._vector_text_binds(sql, self._oson_binds(sql, binds))
+        sql = _ruled('vector-literals', self._vector_text_literals(sql), sql)
         sql = _ruled('json-dot-notation', self._json_dot_notation(sql), sql)
         sql = _ruled('package-function-call', self._call_package_functions(sql), sql)
         bare = _BARE_CALL.match(sql)
@@ -10407,25 +10599,32 @@ class PostgresBackend:
 
     def _vector_column(
         self, pgresult, index: int, oid: int
-    ) -> tuple[int | None, int | None] | None:
-        # A result column's VECTOR (dimensions, format), each None where
-        # flexible, else None (#1708): a table column recorded as VECTOR, else a
-        # pgvector value -- FLOAT32, its dimensions its typmod's -- or a
-        # flexible-format one.
+    ) -> tuple[int | None, int | None, bool] | None:
+        # A result column's VECTOR (dimensions, format, sparse), the first two
+        # None where flexible, else None (#1708): a table column recorded as
+        # VECTOR, else a pgvector value -- FLOAT32, its dimensions its typmod's
+        # -- or a flexible-format one, dense or sparse (#1709).
         if not self._has_pgvector:
             return None
         if (
-            oid in (self._vector_oid, self._vector_composite_oid)
+            oid
+            in (
+                self._vector_oid,
+                self._vector_composite_oid,
+                self._sparse_composite_oid,
+            )
             or oid in _VECTOR_ARRAY_OIDS
         ):
             declared = self._declared_column_types(pgresult, [index]).get(index)
             if declared is not None and declared[0] == 'VECTOR':
-                return (declared[1], declared[2])
+                return (declared[1], declared[2], bool(declared[3]))
         if oid == self._vector_oid:
             typmod = pgresult.fmod(index)
-            return (typmod if typmod > 0 else None, 2)
+            return (typmod if typmod > 0 else None, 2, False)
         if oid == self._vector_composite_oid:
-            return (None, None)
+            return (None, None, False)
+        if oid == self._sparse_composite_oid:
+            return (None, None, True)
         return None
 
     def _aimed_binds(
@@ -10437,6 +10636,21 @@ class PostgresBackend:
         column `layout` picks out: each bind's name to its column's position in
         the table, `layout(table)` naming the table's columns in order and the
         positions it cares about (#1706, #1708). Empty for any other statement."""
+        (masked, _contents, targets) = self._aimed_items(sql, layout)
+        return {
+            _bind_name(match): column
+            for (start, stop), column in targets
+            if (match := _BIND_REF.fullmatch(masked[start:stop].strip())) is not None
+        }
+
+    def _aimed_items(
+        self,
+        sql: str,
+        layout: Callable[[str], tuple[list[str], Collection[int]] | None],
+    ) -> tuple[str, list[str], list[tuple[tuple[int, int], int]]]:
+        # `sql` masked, the masked contents, and the span in it of each item an
+        # INSERT's VALUES or an UPDATE's SET puts into a column `layout` picks
+        # out, with that column's position (#1706, #1708).
         (masked, contents) = _mask_quoted(sql)
         targets: list[tuple[tuple[int, int], int]] = []
         insert = _INSERT_VALUES_HEAD.match(masked)
@@ -10444,7 +10658,7 @@ class PostgresBackend:
         if insert is not None:
             found = layout(_unmask_quoted(insert.group(1), contents))
             if found is None or not found[1]:
-                return {}
+                return (masked, contents, [])
             (names, picked) = found
             columns = list(range(len(names)))
             if insert.group(2) is not None:
@@ -10465,7 +10679,7 @@ class PostgresBackend:
         elif update is not None:
             found = layout(_unmask_quoted(update.group(1), contents))
             if found is None or not found[1]:
-                return {}
+                return (masked, contents, [])
             (names, picked) = found
             words, _rownums = _top_level_words(masked)
             end = next(
@@ -10481,11 +10695,36 @@ class PostgresBackend:
                 column = _pg_identifier(_unmask_quoted(masked[start:equals], contents))
                 if equals >= 0 and column in names and names.index(column) in picked:
                     targets.append(((equals + 1, stop), names.index(column)))
-        return {
-            _bind_name(match): column
-            for (start, stop), column in targets
-            if (match := _BIND_REF.fullmatch(masked[start:stop].strip())) is not None
-        }
+        return (masked, contents, targets)
+
+    def _vector_text_literals(self, sql: str) -> str:
+        """`sql` with each string literal an INSERT's VALUES or an UPDATE's SET
+        puts into a sparse VECTOR column -- '[4, [1, 3], [1.0, 2.0]]' -- typed
+        as text (#1709): untyped, PostgreSQL reads it as the composite's own
+        record syntax, and only text's cast parses the vector."""
+        if not self._has_pgvector or not self._has_column_catalog or "'" not in sql:
+            return sql
+
+        def layout(table: str) -> tuple[list[str], Collection[int]] | None:
+            found = self._vector_formats(table)
+            if found is None:
+                return None
+            return (
+                found[0],
+                frozenset(i for i, (_c, sparse) in found[1].items() if sparse),
+            )
+
+        (masked, contents, targets) = self._aimed_items(sql, layout)
+        ends = [
+            start + len(masked[start:stop].rstrip())
+            for (start, stop), _column in targets
+            if _MASKED_LITERAL.fullmatch(masked[start:stop].strip())
+        ]
+        if not ends:
+            return sql
+        for end in sorted(ends, reverse=True):
+            masked = f'{masked[:end]}::text{masked[end:]}'
+        return _unmask_quoted(masked, contents)
 
     def _oson_binds(self, sql: str, binds: Sequence) -> Sequence:
         """`binds` with each one an INSERT's VALUES or an UPDATE's SET aims at an
@@ -10509,20 +10748,24 @@ class PostgresBackend:
 
     def _vector_formats(
         self, name: str
-    ) -> tuple[list[str], dict[int, int | None]] | None:
+    ) -> tuple[list[str], dict[int, tuple[int | None, bool]]] | None:
         # A relation's columns, in order, and each declared VECTOR's format
-        # code, None where flexible (#1708).
+        # code, None where flexible (#1708), and whether it is sparse (#1709).
         key = name.lower()
         if key not in self._vector_format_cache:
             rows = self._conn.execute(
-                "SELECT a.attname, o.data_type = 'VECTOR', o.data_precision "
+                "SELECT a.attname, o.data_type = 'VECTOR', o.data_precision, "
+                'o.data_scale IS NOT NULL '
                 'FROM pg_attribute a LEFT JOIN sys.ora_columns o ON o.relid = '
                 'a.attrelid AND o.attnum = a.attnum WHERE a.attrelid = to_regclass(%s) '
                 'AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum',
                 (name,),
             ).fetchall()
             self._vector_format_cache[key] = (
-                ([r[0] for r in rows], {i: r[2] for i, r in enumerate(rows) if r[1]})
+                (
+                    [r[0] for r in rows],
+                    {i: (r[2], r[3]) for i, r in enumerate(rows) if r[1]},
+                )
                 if rows
                 else None
             )
@@ -10532,13 +10775,17 @@ class PostgresBackend:
         """`binds` with each string an INSERT's VALUES or an UPDATE's SET aims
         at a VECTOR column -- '[1, 2, 3]', as a client may write one -- as the
         vector it spells, in the column's format, FLOAT32 where the column's
-        is flexible (#1708). A string goes to PostgreSQL untyped, so no cast
-        reaches it there."""
-        if not binds or not self._has_pgvector or not self._has_column_catalog:
+        is flexible (#1708), sparse where the column is (#1709). A string goes
+        to PostgreSQL untyped, so no cast reaches it there. A sparse vector
+        holding inf or NaN is refused here, as 23ai refuses one."""
+        if not binds:
+            return binds
+        _reject_nonfinite_sparse(binds)
+        if not self._has_pgvector or not self._has_column_catalog:
             return binds
         if not any(isinstance(b, str) for b in binds):
             return binds
-        formats: dict[int, int | None] = {}
+        formats: dict[int, tuple[int | None, bool]] = {}
 
         def layout(table: str) -> tuple[list[str], Collection[int]] | None:
             found = self._vector_formats(table)
@@ -10558,12 +10805,18 @@ class PostgresBackend:
                 or not isinstance(out[index], str)
             ):
                 continue
+            (code, sparse) = formats.get(aimed[name], (None, False))
+            if sparse:
+                vector = _sparse_from_text(out[index], code)
+                if vector is not None:
+                    out[index] = vector
+                continue
             try:
                 elements = json.loads(out[index])
             except ValueError:
                 continue  # left for PostgreSQL to refuse as it is
             if isinstance(elements, list):
-                code = formats.get(aimed[name]) or 2
+                code = code or 2
                 typecode = _VECTOR_TYPECODES.get(code, 'f')
                 cast = int if typecode == 'b' else float
                 out[index] = array.array(typecode, (cast(v) for v in elements))
@@ -11227,10 +11480,12 @@ class PostgresBackend:
             ) is not None:
                 # A VECTOR (#1708): its declared dimensions and format -- a
                 # flexible one 0, any dimensions flagged -- each value an
-                # array.array of its format, which the core encodes.
-                (count, code) = vector
+                # array.array of its format, or a SparseVector (#1709), which
+                # the core encodes.
+                (count, code, sparse) = vector
+                to_value = _sparse_value if sparse else _vector_value
                 for row in rows:
-                    row[i] = _vector_value(row[i], code)
+                    row[i] = to_value(row[i], code)
                 columns.append(
                     ColumnMeta(
                         name=_oracle_column_name(desc.name).encode('utf-8'),
@@ -11241,7 +11496,8 @@ class PostgresBackend:
                         csfrm=0,
                         vector_dimensions=count or 0,
                         vector_format=code or 0,
-                        vector_flags=0 if count else VECTOR_FLAG_FLEXIBLE_DIM,
+                        vector_flags=(0 if count else VECTOR_FLAG_FLEXIBLE_DIM)
+                        | (VECTOR_FLAG_SPARSE if sparse else 0),
                     )
                 )
             elif (
@@ -11424,7 +11680,8 @@ class PostgresBackend:
                         columns[i],
                         vector_dimensions=count or 0,
                         vector_format=code or 0,
-                        vector_flags=0 if count else VECTOR_FLAG_FLEXIBLE_DIM,
+                        vector_flags=(0 if count else VECTOR_FLAG_FLEXIBLE_DIM)
+                        | ((columns[i].vector_flags or 0) & VECTOR_FLAG_SPARSE),
                     )
         # A CAST to NVARCHAR2(n) / NCHAR(n) in the select list describes national,
         # n characters and 2n bytes, which its varchar(n) / char(n) does not say

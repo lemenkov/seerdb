@@ -231,6 +231,7 @@ ORA_DEQUEUE_TIMEOUT = 25228  # timeout or end-of-fetch during message dequeue
 ORA_LISTEN_TIMEOUT = 25254  # time-out in LISTEN while waiting for a message
 ORA_NO_DATA_GUIDE = 40582  # the collection has no data-guide-enabled index
 ORA_VECTOR_DIMENSION_MISMATCH = 51803  # vector dimension count must match the column's
+ORA_VECTOR_INVALID_VALUE = 51805  # a dimension value that is not a number (inf, NaN)
 ORA_VECTOR_VALUE_OUT_OF_RANGE = 51806  # a dimension value outside the format's range
 
 # The describe's vector-metadata flags byte (23.4+). A VECTOR column that allows

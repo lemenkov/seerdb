@@ -5659,6 +5659,105 @@ def test_vector_columns_on_pgvector() -> None:
         backend.close()
 
 
+def test_sparse_vector_columns() -> None:
+    # Sparse VECTOR columns (#1709), every one the ora_sparse_vector composite,
+    # as pgvector's sparsevec drops a zero a client stored: each value back as
+    # a SparseVector of the column's format, else its own; the describe flags
+    # it sparse. A dense value into one keeps its non-zero elements, a sparse
+    # one into a dense column fills its zeros in. The answers are 23ai's,
+    # measured: an INT8 rounds half to even, an explicit zero is kept, indices
+    # out of order are ORA-51822, past the count ORA-51836, inf ORA-51805.
+    import array
+
+    from seerdb.common.tns_consts import (
+        TNS_TYPE_VECTOR,
+        VECTOR_FLAG_FLEXIBLE_DIM,
+        VECTOR_FLAG_SPARSE,
+    )
+    from seerdb.common.vector import SparseVector
+    from seerdb.server import BackendError
+
+    assert _translate_ddl(
+        'create table t (a vector(4, float64, sparse), b vector(*, *, sparse))'
+    ) == (
+        'create table t (a ora_sparse_vector CHECK (sys.ora_sparse_check(a, 4, 3)), '
+        'b ora_sparse_vector CHECK (sys.ora_sparse_check(b, NULL, NULL)))'
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    if not backend._has_pgvector:
+        backend.close()
+        pytest.skip('the PostgreSQL bed has no pgvector')
+    try:
+        backend.execute(
+            'CREATE TABLE s1709 (n NUMBER, fx VECTOR(*, *, SPARSE), '
+            'i8 VECTOR(*, INT8, SPARSE), f64 VECTOR(4, FLOAT64, SPARSE), '
+            'dense VECTOR(4, FLOAT64))'
+        )
+        value = SparseVector(4, [0, 1, 3], array.array('d', [2.5, 0.0, -2.5]))
+        backend.execute('INSERT INTO s1709 VALUES (1, :1, :2, :3, :4)', [value] * 4)
+        result = backend.execute('SELECT fx, i8, f64, dense FROM s1709')
+        assert [
+            (c.data_type, c.vector_dimensions, c.vector_format, c.vector_flags)
+            for c in result.columns
+        ] == [
+            (TNS_TYPE_VECTOR, 0, 0, VECTOR_FLAG_FLEXIBLE_DIM | VECTOR_FLAG_SPARSE),
+            (TNS_TYPE_VECTOR, 0, 4, VECTOR_FLAG_FLEXIBLE_DIM | VECTOR_FLAG_SPARSE),
+            (TNS_TYPE_VECTOR, 4, 3, VECTOR_FLAG_SPARSE),
+            (TNS_TYPE_VECTOR, 4, 3, 0),
+        ]
+        (fx, i8, f64, dense) = result.rows[0]
+        assert fx == value and fx.values.typecode == 'd'
+        assert i8 == SparseVector(4, [0, 1, 3], array.array('b', [2, 0, -2]))
+        assert f64 == value
+        assert dense == array.array('d', [2.5, 0.0, 0.0, -2.5])
+        (echo,) = backend.execute('SELECT :1 FROM dual', [value]).rows[0]
+        assert echo == value
+        (resized,) = backend.execute(
+            'SELECT TO_VECTOR(:1, 4, FLOAT32) FROM dual', [value]
+        ).rows[0]
+        assert resized == SparseVector(4, [0, 1, 3], array.array('f', [2.5, 0.0, -2.5]))
+        # A dense value, a string and a literal into a sparse column.
+        backend.execute('DELETE FROM s1709')
+        backend.execute(
+            'INSERT INTO s1709 (n, fx) VALUES (1, :1)', [array.array('b', [0, 3, 0])]
+        )
+        backend.execute(
+            'INSERT INTO s1709 (n, fx) VALUES (2, :1)', ['[4, [1, 3], [1, 2]]']
+        )
+        backend.execute("INSERT INTO s1709 (n, fx) VALUES (3, '[4, [1, 3], [1.5, 2]]')")
+        rows = [r[0] for r in backend.execute('SELECT fx FROM s1709 ORDER BY n').rows]
+        assert rows == [
+            SparseVector(3, [1], array.array('b', [3])),
+            SparseVector(4, [1, 3], array.array('f', [1, 2])),
+            SparseVector(4, [1, 3], array.array('f', [1.5, 2])),
+        ]
+        for column, bad, code in (
+            ('fx', SparseVector(4, [3, 1], array.array('d', [1, 2])), 51822),
+            ('fx', SparseVector(4, [7], array.array('d', [1])), 51836),
+            ('f64', SparseVector(5, [1], array.array('d', [1])), 51803),
+            ('i8', SparseVector(4, [1], array.array('f', [-130])), 51806),
+            ('fx', SparseVector(4, [1], array.array('d', [float('inf')])), 51805),
+        ):
+            with pytest.raises(BackendError) as exc:
+                backend.execute(
+                    f'INSERT INTO s1709 (n, {column}) VALUES (9, :1)', [bad]
+                )
+            assert exc.value.ora_code == code
+        # The dictionary lists a sparse column with no scale, as Oracle does.
+        (scale,) = backend.execute(
+            "SELECT data_scale FROM user_tab_columns WHERE table_name = 'S1709' "
+            "AND column_name = 'FX'"
+        ).rows[0]
+        assert scale is None
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE s1709')
+        except BackendError:
+            backend.rollback()
+        backend.close()
+
+
 def test_to_vector_and_vector_distance() -> None:
     # TO_VECTOR(text [, n [, format]]) and VECTOR_DISTANCE(a, b [, metric]) on
     # pgvector (#1708): a computed TO_VECTOR describes as its call says, a
