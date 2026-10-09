@@ -149,8 +149,9 @@ honest edge of this adapter:
   flexible format keeps each value's format in a composite. A FLOAT32 column
   holds at most pgvector's 16000 dimensions (#1734), where Oracle's holds
   65535.
-  VECTOR_DISTANCE is pgvector's operators: COSINE, EUCLIDEAN(_SQUARED), DOT
-  and MANHATTAN, and HAMMING by element. A sparse column (#1709) is a
+  VECTOR_DISTANCE is pgvector's operators for two FLOAT32 vectors of at most
+  16000 dimensions, which sum in single precision as Oracle does, and float8
+  sums over the elements otherwise (#1738). A sparse column (#1709) is a
   composite of its own in every format -- pgvector's sparsevec drops an
   explicit zero, which Oracle keeps -- and a BINARY one (#1710) is varbit;
   neither has a pgvector index. Without pgvector a VECTOR column is refused.
@@ -3091,16 +3092,26 @@ _VECTOR_DDL = (
             ),
         )
     )
-    # VECTOR_DISTANCE(a, b, metric) (#1708): pgvector's operator for the
-    # metric; two BINARY vectors' by their bits, as 23ai measures them (#1710),
-    # a BINARY one with another ORA-51812.
+    # VECTOR_DISTANCE(a, b, metric) (#1708): two BINARY vectors' by their bits,
+    # as 23ai measures them (#1710), a BINARY one with another ORA-51812, and
+    # vectors of different counts ORA-51808. Two FLOAT32 vectors of at most
+    # pgvector's 16000 dimensions take its operators, which sum in single
+    # precision as 23ai does; the rest -- FLOAT64, INT8, longer ones -- sum
+    # their elements in float8 (#1738), which is 23ai's FLOAT64 answer and
+    # needs no pgvector. COSINE against a zero vector is NaN, as 23ai's.
     + f'CREATE OR REPLACE FUNCTION sys.ora_vector_distance(a {_VECTOR_COMPOSITE}, '
     f'b {_VECTOR_COMPOSITE}, metric text) RETURNS float8 LANGUAGE plpgsql IMMUTABLE '
-    'STRICT AS $$ DECLARE x varbit; y varbit; shared float8; differ float8; BEGIN '
+    'STRICT AS $$ DECLARE x varbit; y varbit; shared float8; differ float8; '
+    'squares float8; dot float8; na float8; nb float8; l1 float8; BEGIN '
     'IF (a.format = 5) <> (b.format = 5) THEN '
     "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'ORA-51812: The vector SQL "
     'function VECTOR_DISTANCE() requires all input vectors to have the same '
     "dimension format.'; END IF; "
+    'IF coalesce(cardinality(a.elements), 0) <> coalesce(cardinality(b.elements), 0) '
+    "THEN RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = format('ORA-51808: "
+    'VECTOR_DISTANCE() or L2_DISTANCE() requires all vectors to have the same '
+    "dimension count. Encountered (%s, %s).', cardinality(a.elements), "
+    'cardinality(b.elements)); END IF; '
     'IF a.format = 5 THEN x := sys.ora_vector_bit(a); y := sys.ora_vector_bit(b); '
     'shared := bit_count(x & y); differ := bit_count(x # y); '
     "RETURN CASE metric WHEN 'DOT' THEN -shared "
@@ -3108,6 +3119,8 @@ _VECTOR_DDL = (
     "WHEN 'JACCARD' THEN 1 - shared / nullif(bit_count(x | y), 0) "
     "WHEN 'COSINE' THEN 1 - shared / nullif(sqrt(bit_count(x)::float8 * bit_count(y)), 0) "
     'ELSE differ END; END IF; '
+    "IF a.format = 2 AND b.format = 2 AND metric <> 'HAMMING' "
+    'AND cardinality(a.elements) <= 16000 THEN '
     "RETURN CASE metric WHEN 'EUCLIDEAN' THEN sys.ora_vector_float32(a) <-> "
     "sys.ora_vector_float32(b) WHEN 'L2' THEN sys.ora_vector_float32(a) <-> "
     "sys.ora_vector_float32(b) WHEN 'EUCLIDEAN_SQUARED' THEN "
@@ -3116,9 +3129,17 @@ _VECTOR_DDL = (
     "sys.ora_vector_float32(b), 2) WHEN 'DOT' THEN sys.ora_vector_float32(a) <#> "
     "sys.ora_vector_float32(b) WHEN 'MANHATTAN' THEN sys.ora_vector_float32(a) <+> "
     "sys.ora_vector_float32(b) WHEN 'L1' THEN sys.ora_vector_float32(a) <+> "
-    "sys.ora_vector_float32(b) WHEN 'HAMMING' THEN (SELECT count(*) FROM "
-    'unnest(a.elements, b.elements) AS u(p, q) WHERE p IS DISTINCT FROM q) '
-    'ELSE sys.ora_vector_float32(a) <=> sys.ora_vector_float32(b) END; END $$;'
+    'sys.ora_vector_float32(b) '
+    'ELSE sys.ora_vector_float32(a) <=> sys.ora_vector_float32(b) END; END IF; '
+    'SELECT coalesce(sum((p - q) * (p - q)), 0), coalesce(sum(p * q), 0), '
+    'coalesce(sum(p * p), 0), coalesce(sum(q * q), 0), coalesce(sum(abs(p - q)), 0), '
+    'count(*) FILTER (WHERE p <> q) INTO squares, dot, na, nb, l1, differ '
+    'FROM unnest(a.elements, b.elements) AS u(p, q); '
+    "RETURN CASE metric WHEN 'EUCLIDEAN' THEN sqrt(squares) WHEN 'L2' THEN sqrt(squares) "
+    "WHEN 'EUCLIDEAN_SQUARED' THEN squares WHEN 'L2_SQUARED' THEN squares "
+    "WHEN 'DOT' THEN -dot WHEN 'MANHATTAN' THEN l1 WHEN 'L1' THEN l1 "
+    "WHEN 'HAMMING' THEN differ ELSE CASE WHEN na * nb = 0 THEN 'NaN'::float8 "
+    'ELSE 1 - dot / sqrt(na * nb) END END; END $$;'
     # A vector element as FROM_VECTOR writes it (#1726): its exact value --
     # from its IEEE bits, as numeric holds it to 15 digits only -- to `digits`
     # significant digits, 9 for FLOAT32 and 17 for FLOAT64, as d.dddE+nnn with
