@@ -1,6 +1,76 @@
 Entries are sorted chronologically from oldest to youngest within each release,
 releases are sorted from youngest to oldest.
 
+version 3.0.0:
+- **Upgrading from 2.x — four changes can alter what existing code does**:
+  - **`connect()` and `connect_async()` default to `autocommit=False`**, as PEP 249 and python-oracledb do. 2.x committed every statement. Code that writes and never calls `commit()` now has its work rolled back when the connection closes, and nothing raises. Pass `autocommit=True` to keep the 2.x behaviour. Pools follow the same default (#1447).
+  - **A CLOB or BLOB fetches as a `LOB` object, not `str` / `bytes`**, because `fetch_lobs` now defaults to `True`, as in python-oracledb. Call `.read()` on the object, or pass `fetch_lobs=False` to get values as in 2.x (#964).
+  - **`Connection.session_id` is an `int`**, where 2.x gave the raw bytes (`b'135'`), and `serial_num` joins it (#1218).
+  - **A `SELECT ... INTO` that matches no row in a PL/SQL block raises ORA-01403** (`NO_DATA_FOUND`). 2.x reported success and returned a NULL the database never sent (#1039).
+- **`seerdb.__version__`** is exposed.
+- **`RETURNING ... INTO` on Oracle 9i and 8i**: served by running the statement inside a PL/SQL block with OUT binds. 2.5.0 refused it with `NotSupportedError`. A truncated returned value raises instead of returning half the value, and a NULL value is told apart from no rows returned (#802, #716, #1021, #1022, #1390).
+- **A real `LOB` object**, sync and async (#964):
+  - read in slices, `size()`, `write()`, `trim()`, `open()` / `close()`, and for a BFILE `fileexists()`, `getfilename()` and `setfilename()` (#1109);
+  - `Connection.createlob()` makes a temporary LOB to bind (#1066);
+  - a `cursor.var()` declared CLOB / BLOB binds through a temporary LOB, and an empty one binds as an empty LOB rather than NULL (#902, #903);
+  - LOB OUT binds and LOBs returned by DML `RETURNING` are read in the LOB framing (#978, #985);
+  - a fetched BFILE stays a LOB until `read()` opens its file, even with `fetch_lobs=False`, on 10g and later (#1102) and on 8i and 9i (#1103).
+- **Object types**:
+  - `cursor.var()` of an object type, for object OUT binds and typed NULLs (#888);
+  - an object bound directly as an OUT parameter (#1032);
+  - nested objects and collections in an object's image;
+  - CLOB / BLOB attributes, fetched as LOBs and bound by locator (#1262);
+  - NVARCHAR2 attributes in AL16UTF16 (#1433);
+  - collections navigated with `first()` / `last()` / `next()` / `prev()` / `exists()` / `getelement()` (#1035);
+  - associative arrays that keep their element keys (#1053, #1055);
+  - `DbObjectType.attributes` and `element_type`, as python-oracledb has them (#1490);
+  - `gettype()` resolves PL/SQL package-level types (#1030), a table's `%ROWTYPE` record type (#1476) and unqualified names in the current schema (#1140);
+  - the async client describes an object's nested object and collection attributes as the sync one does (#1254, #1268).
+- **New type constants**: `DB_TYPE_BINARY_INTEGER`, `DB_TYPE_OBJECT`, `DB_TYPE_BFILE` and `DB_TYPE_XMLTYPE` (#1044, #1478).
+- **Cursor additions**:
+  - `cursor.parse()` parses a statement without running it (#1019);
+  - `cursor.warning` reports a PL/SQL object created with compilation errors (#993);
+  - an open cursor binds as a REF CURSOR IN parameter (#1048);
+  - nested cursor columns are read, sync and async (#1462, #1464);
+  - `cursor.description` carries a 23ai column's domain and annotations (#1083);
+  - a flexible VECTOR column reports its dimensions and format as `None` (#1013);
+  - `arraydmlrowcounts` works from 12.1 (#1135);
+  - a native BOOLEAN binds through a `Var` (#870);
+  - JSON return binds are read and written as OSON.
+- **`driver_name` and `edition`** can be declared at connect.
+- **Timeouts**, as in python-oracledb:
+  - the connect timeout bounds connecting only, where it used to fail any call slower than 15 s (#1568);
+  - a `call_timeout` the server honours is reported as a call timeout (#1575);
+  - one the server leaves unanswered drops the connection (#1570).
+- **Binds**:
+  - a bind's charset form applies in every direction (#991);
+  - a PL/SQL block's real bind directions are followed, so an IN bind sends no value back, including on 9i and 8i (#1105, #1242);
+  - a variable an OUT bind filled binds back in with its value (#1505);
+  - a ROWID / UROWID variable binds as the rowid's text, on 8i and 9i too (#1399);
+  - a bool declared NUMBER is sent as 0 or 1 (#1201);
+  - an array DML bind takes its type from the first non-NULL value (#894);
+  - a batch mixing temporal values binds (#1098);
+  - a zero-fraction TIMESTAMP is sent in the 7-byte DATE form (#1337);
+  - a native VECTOR / JSON bind's image length is written in three bytes (#1008).
+- **Fixes**:
+  - a ping raises the error its reply carries, so a killed session fails `ping()` (#1095);
+  - a packet the socket takes only part of is written whole (#861);
+  - the connect fails cleanly when the server closes during login (#805);
+  - an encrypted (ANO) session survives a break / reset (#1345);
+  - `cursor.rowcount` is kept when an execute raises (#1003);
+  - no `lastrowid` is reported for DML that touched no rows (#1078), and 8i / 9i read it from the DML status (#1079);
+  - a statement's kind is read past its leading comments (#1171);
+  - long UROWIDs are encoded and decoded (#904);
+  - a BC date is reported as out of range rather than malformed (#1060);
+  - a truncated field is reported instead of misread (#849, #850);
+  - the 12.1 wire format is spoken at field version 7 (#1144).
+- **Oracle 9i and 8i fixes**:
+  - long error messages decode instead of corrupting (#810);
+  - an 8i describe that spans packets, or is cut short by an error, is read (#1226);
+  - a zero-length column on 9i reads as NULL (#1185);
+  - a declared CHAR bind on 9i is sized to its value (#737).
+- Every ORA code seerdb raises itself is named in `seerdb.common.tns_consts` (#1334).
+
 version 2.5.0:
 - **SQLAlchemy**: the `sqlalchemy-seerdb` dialect (released alongside as 0.2.0) passes SQLAlchemy's dialect compliance suite against Oracle 23ai and 11g. Running that suite is what found most of the driver fixes below.
 - **Quoted bind placeholders**: `:"name"` is recognised and matched case-sensitively; an unquoted `:name` stays case-insensitive, as in python-oracledb (#686).
