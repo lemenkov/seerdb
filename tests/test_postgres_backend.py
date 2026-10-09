@@ -47,6 +47,7 @@ from postgres_backend import (  # noqa: E402
     _iot_primary_key,
     _object_column_meta,
     _object_type_oid,
+    _occurrence_binds,
     _parse_out_assignments,
     _pg_oid_of,
     _reject_unsupported_ddl_types,
@@ -5001,6 +5002,29 @@ def test_change_password_refuses_a_password_oracle_would() -> None:
 
 
 # --- Bind translation (#516) — a pure function, no live PG needed --------------
+
+
+def test_a_sql_statement_binds_each_occurrence() -> None:
+    # Oracle binds a SQL statement's placeholders by position (#1714): with a
+    # value for each occurrence, `:1` twice is two binds. One value a name, or
+    # a PL/SQL block, binds by name as before.
+    sql = 'insert into t values (:1, f(:1, :2, :3))'
+    renamed = _occurrence_binds(sql, [[4, 1626, 1627, 1628]])
+    assert renamed.count(':1') == 1
+    assert _translate_binds(renamed, [4, 1626, 1627, 1628])[1] == {
+        'b1': 4,
+        'seerdb_occ_14': 1626,
+        'b2': 1627,
+        'b3': 1628,
+    }
+    assert _occurrence_binds(sql, [[4, 1626, 1627]]) == sql
+    block = 'begin :a := :a + 1; end;'
+    assert _occurrence_binds(block, [[1, 2]]) == block
+    # The same value at each occurrence stays one bind, typed by its other use
+    # (#15); in an executemany it splits where any row differs.
+    predicate = 'select id from t where id = :x or :x is null'
+    assert _occurrence_binds(predicate, [[1, 1]]) == predicate
+    assert _occurrence_binds(predicate, [[1, 1], [2, 3]]) != predicate
 
 
 def test_translate_binds_repeated_named_bind_is_one_value() -> None:
