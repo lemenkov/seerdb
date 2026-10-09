@@ -153,6 +153,12 @@ honest edge of this adapter:
   composite of its own in every format -- pgvector's sparsevec drops an
   explicit zero, which Oracle keeps -- and a BINARY one (#1710) is varbit;
   neither has a pgvector index. Without pgvector a VECTOR column is refused.
+- **SQL domains and annotations, on columns** (#1711) -- CREATE DOMAIN is
+  PostgreSQL's own and a column's DOMAIN its type, so the domain's
+  constraints hold; a column's ANNOTATIONS are kept for its describe. A
+  table's own annotations, ALTER ... ANNOTATIONS (ADD / DROP), a domain's
+  DISPLAY / ORDER expressions and the USER_DOMAINS / USER_ANNOTATIONS views
+  are not there.
 - **Privileges, for type lookup only** -- every Mirror user is the backend's
   one PostgreSQL role. A GRANT or REVOKE on an object is recorded
   (``sys.ora_grants``), and a user sees another user's type -- in ALL_TYPES,
@@ -1490,6 +1496,11 @@ _ORACLE_DICTIONARY_DDL = (
     'relid oid NOT NULL, attnum smallint NOT NULL, data_type text NOT NULL, '
     'data_length integer, data_precision integer, data_scale integer, '
     'PRIMARY KEY (relid, attnum));'
+    # A 23ai column's annotations (#1711), in the order declared: each name as
+    # Oracle spells it and its value, '' for none.
+    'CREATE TABLE IF NOT EXISTS sys.ora_annotations ('
+    'relid oid NOT NULL, attnum smallint NOT NULL, position integer NOT NULL, '
+    'name text NOT NULL, value text NOT NULL, PRIMARY KEY (relid, attnum, position));'
     # The type a collection's elements were declared as, where PostgreSQL keeps
     # less of it: an NVARCHAR2 / NCHAR (#1437), a RAW(n) and its n (#1545). A
     # collection is a domain over an array, with no relation for sys.ora_columns
@@ -3804,6 +3815,76 @@ def _declared_columns(sql: str) -> tuple[str, dict[str, tuple | None]] | None:
     return table, columns
 
 
+# A column's DOMAIN clause and its ANNOTATIONS (#1711).
+_COLUMN_DOMAIN = re.compile(
+    r'\bDOMAIN\s+((?:"[^"]+"|[A-Za-z_][\w$#]*)(?:\s*\.\s*(?:"[^"]+"|[A-Za-z_][\w$#]*))?)',
+    re.IGNORECASE,
+)
+_ANNOTATIONS_CLAUSE = re.compile(r'\bANNOTATIONS\s*\(', re.IGNORECASE)
+_ANNOTATION_ITEM = re.compile(
+    r'\s*(?:ADD\s+|ADD\s+IF\s+NOT\s+EXISTS\s+)?("[^"]+"|[A-Za-z_][\w$#]*)'
+    r"\s*(?:'\x00(\d+)\x00')?\s*",
+    re.IGNORECASE,
+)
+
+
+def _column_annotations(
+    sql: str,
+) -> tuple[str, tuple[str, dict[str, list[tuple[str, str]]]] | None]:
+    """The statement with each column's DOMAIN clause made its type and its
+    ANNOTATIONS taken out, and the annotations: (table, each column's
+    [(name, value)]), or None where it declares none (#1711).
+
+    `type DOMAIN d` and `DOMAIN d` alone are both column d's type, PostgreSQL
+    domain and all, so the domain's constraints hold and a describe traces the
+    column to it. An annotation's name is Oracle's spelling, upper case unless
+    quoted, its value '' where it has none. A column name is PostgreSQL's.
+    """
+    if not (_COLUMN_DOMAIN.search(sql) or _ANNOTATIONS_CLAUSE.search(sql)):
+        return sql, None
+    parsed = _ddl_column_spans(sql)
+    if parsed is None:
+        return sql, None
+    table, spans, _modify = parsed
+    found: dict[str, list[tuple[str, str]]] = {}
+    pieces: list[str] = []
+    pos = 0
+    for start, end in spans:
+        name = _COLUMN_NAME.match(sql, start, end)
+        if name is None or name.group(1).upper() in (
+            'CONSTRAINT',
+            'PRIMARY',
+            'UNIQUE',
+            'FOREIGN',
+            'CHECK',
+        ):
+            continue
+        (masked, contents) = _mask_quoted(sql[name.end() : end])
+        clause = _ANNOTATIONS_CLAUSE.search(masked)
+        if clause is not None:
+            close = _matching_paren(masked, clause.end() - 1)
+            notes = []
+            for a, b in _top_level_items(masked, clause.end(), close):
+                item = _ANNOTATION_ITEM.fullmatch(masked, a, b)
+                if item is None:
+                    continue
+                label = _unmask_quoted(item.group(1), contents)
+                label = label[1:-1] if label.startswith('"') else label.upper()
+                value = contents[int(item.group(2))] if item.group(2) else ''
+                notes.append((label, value.replace("''", "'")))
+            masked = masked[: clause.start()] + masked[close + 1 :]
+            column = name.group(1)
+            found[column[1:-1] if column.startswith('"') else column.lower()] = notes
+        domain = _COLUMN_DOMAIN.search(masked)
+        if domain is not None:
+            masked = f' {domain.group(1)}{masked[domain.end() :]}'
+        pieces.append(sql[pos : name.end()])
+        pieces.append(_unmask_quoted(masked, contents))
+        pos = end
+    pieces.append(sql[pos:])
+    return ''.join(pieces), (table, found) if found else None
+
+
 def _column_visibility(sql: str) -> tuple[str, tuple[str, list, list, bool] | None]:
     """The statement without its VISIBLE / INVISIBLE column attributes, and what
     they said: (table, columns made invisible, columns made visible, whether the
@@ -3922,6 +4003,13 @@ _CREATE_TYPE_OBJECT = re.compile(
 # PostgreSQL has no CREATE OR REPLACE DOMAIN, and emitting a plain CREATE would
 # quietly drop the replace semantics -- failing on an existing type where Oracle
 # succeeds. Better to leave that statement untranslated and let it fail honestly.
+# CREATE DOMAIN name AS ... (#1711), and the comment that marks a domain as one
+# a user declared, not one of the Mirror's own (ora_date, a VARRAY, ...).
+_CREATE_SQL_DOMAIN = re.compile(
+    r'\s*CREATE\s+DOMAIN\s+((?:"[^"]+"|[\w$#]+)(?:\s*\.\s*(?:"[^"]+"|[\w$#]+))?)\s+AS\s+',
+    re.IGNORECASE,
+)
+_SQL_DOMAIN_MARK = 'seerdb sql domain'
 _CREATE_TYPE_VARRAY = re.compile(
     r'\s*CREATE\s+TYPE\s+(\S+)\s+AS\s+VARRAY\s*\(\s*(\d+)\s*\)\s+OF\s+(.+?)\s*;?\s*$',
     re.IGNORECASE | re.DOTALL,
@@ -4804,6 +4892,18 @@ def _translate_ddl(sql: str) -> str:
             f'{replaced.group(1)} {replaced.group(2)}{sql[replaced.end() :]}'
         )
         return f'{_drop_type(replaced.group(3), if_exists=True)}; {plain}'
+    domain = _CREATE_SQL_DOMAIN.match(sql)
+    if domain:
+        # A 23ai SQL domain (#1711): PostgreSQL's own, its type mapped as a
+        # column's, and marked as one a user declared, which a column's
+        # describe names.
+        rest = sql[domain.end() :]
+        for pattern, rewrite in _DDL_TYPE_REWRITES:
+            rest = pattern.sub(rewrite, rest)
+        return (
+            f'CREATE DOMAIN {domain.group(1)} AS {rest}; '
+            f"COMMENT ON DOMAIN {domain.group(1)} IS '{_SQL_DOMAIN_MARK}'"
+        )
     varray = _CREATE_TYPE_VARRAY.match(sql)
     if varray:
         name, bound, element = varray.groups()
@@ -9631,6 +9731,11 @@ class PostgresBackend:
         self._has_pgvector = False
         self._vector_oid: int | None = None
         self._vector_composite_oid: int | None = None
+        # SQL domains and annotations (#1711).
+        self._has_sql_domains_cache: bool | None = None
+        self._sql_domain_cache: dict[
+            tuple[int, int], tuple[bytes, bytes, tuple[tuple[bytes, bytes], ...]] | None
+        ] = {}
         self._sparse_composite_oid: int | None = None
         try:
             with self._conn.transaction():
@@ -10445,6 +10550,10 @@ class PostgresBackend:
         (sql, visibility) = _column_visibility(sql)
         if visibility is not None:
             _note_rule('invisible-columns')
+        # SQL domains and annotations (#1711): a column's DOMAIN is its type,
+        # its annotations go to the catalog.
+        (stripped, annotated) = _column_annotations(sql)
+        sql = _ruled('domain-annotations', stripped, sql)
         if visibility is not None and visibility[3]:
             self._record_visibility(visibility)
             return Result()
@@ -10527,6 +10636,7 @@ class PostgresBackend:
             self._record_tstz_precisions(original)
             self._record_visibility(visibility)
             self._record_column_types(original)
+            self._record_annotations(annotated)
             self._collection_name_cache = None  # a type may have come or gone
             self._package_function_cache = None  # and a package
             self._plsql_types.clear()
@@ -11427,6 +11537,102 @@ class PostgresBackend:
             if (declared := self._column_type_cache.get(key)) is not None
         }
 
+    def _record_annotations(
+        self, annotated: tuple[str, dict[str, list[tuple[str, str]]]] | None
+    ) -> None:
+        # After a committed DDL: a column's annotations (#1711). Every DDL
+        # prunes the rows of columns that are gone; a column that declares
+        # annotations has them replaced.
+        if not self._has_column_catalog:
+            return
+        self._sql_domain_cache.clear()
+        self._has_sql_domains_cache = None
+        try:
+            self._conn.execute(
+                'DELETE FROM sys.ora_annotations o WHERE NOT EXISTS '
+                '(SELECT 1 FROM pg_attribute a WHERE a.attrelid = o.relid '
+                'AND a.attnum = o.attnum AND NOT a.attisdropped)'
+            )
+            if annotated is not None:
+                (table, columns) = annotated
+                for column, notes in columns.items():
+                    self._conn.execute(
+                        'DELETE FROM sys.ora_annotations o USING pg_attribute a '
+                        'WHERE a.attrelid = o.relid AND a.attnum = o.attnum '
+                        'AND a.attrelid = to_regclass(%s) AND a.attname = %s',
+                        (table, column),
+                    )
+                    for position, (label, value) in enumerate(notes):
+                        self._conn.execute(
+                            'INSERT INTO sys.ora_annotations SELECT attrelid, attnum, '
+                            '%s, %s, %s FROM pg_attribute WHERE attrelid = '
+                            'to_regclass(%s) AND attname = %s AND attnum > 0',
+                            (position, label, value, table, column),
+                        )
+            self._conn.commit()
+        except psycopg.Error:
+            self._conn.rollback()
+
+    def _has_sql_domains(self) -> bool:
+        # Whether any column could owe a describe a domain or annotations
+        # (#1711): a user's SQL domain, or an annotation, exists. Kept until a
+        # DDL, so a database with neither pays one query a session.
+        if self._has_sql_domains_cache is None:
+            row = self._conn.execute(
+                'SELECT EXISTS (SELECT 1 FROM sys.ora_annotations) OR EXISTS '
+                "(SELECT 1 FROM pg_type WHERE typtype = 'd' AND "
+                "obj_description(oid, 'pg_type') = %s)",
+                (_SQL_DOMAIN_MARK,),
+            ).fetchone()
+            self._has_sql_domains_cache = bool(row and row[0])
+        return self._has_sql_domains_cache
+
+    def _sql_domain_columns(
+        self, pgresult, count: int
+    ) -> dict[int, tuple[bytes, bytes, tuple[tuple[bytes, bytes], ...]]]:
+        # Each result column that comes straight from a table column with a
+        # SQL domain or annotations (#1711): the domain's owner and name, as
+        # the dictionary views spell them, and the annotations -- traced through libpq
+        # ftable / ftablecol, as a domain column describes as its base type.
+        keys = {}
+        for index in range(count):
+            relid = pgresult.ftable(index)
+            if relid:
+                keys[index] = (relid, pgresult.ftablecol(index))
+        unknown = [k for k in set(keys.values()) if k not in self._sql_domain_cache]
+        for relid, attnum in unknown:
+            row = self._conn.execute(
+                'SELECT CASE WHEN obj_description(t.oid, %s) = %s THEN '
+                'sys.ora_owner(n.nspname) END, CASE WHEN obj_description(t.oid, %s) = %s '
+                'THEN sys.ora_name(t.typname) END, ARRAY(SELECT ARRAY[o.name, o.value] '
+                'FROM sys.ora_annotations o WHERE o.relid = a.attrelid AND '
+                'o.attnum = a.attnum ORDER BY o.position) FROM pg_attribute a '
+                'JOIN pg_type t ON t.oid = a.atttypid JOIN pg_namespace n ON '
+                'n.oid = t.typnamespace WHERE a.attrelid = %s AND a.attnum = %s',
+                (
+                    'pg_type',
+                    _SQL_DOMAIN_MARK,
+                    'pg_type',
+                    _SQL_DOMAIN_MARK,
+                    relid,
+                    attnum,
+                ),
+            ).fetchone()
+            self._sql_domain_cache[(relid, attnum)] = (
+                None
+                if row is None or (row[1] is None and not row[2])
+                else (
+                    (row[0] or '').encode(),
+                    (row[1] or '').encode(),
+                    tuple((k.encode(), v.encode()) for k, v in row[2]),
+                )
+            )
+        return {
+            index: found
+            for index, key in keys.items()
+            if (found := self._sql_domain_cache.get(key)) is not None
+        }
+
     def _record_visibility(self, visibility: tuple | None) -> None:
         # Keep what a DDL said about its columns' visibility (#1195): add the
         # invisible ones, drop the ones made visible, and prune the rows of
@@ -11941,6 +12147,17 @@ class PostgresBackend:
                     columns[i] = replace(
                         columns[i], csfrm=_CSFRM_NATIONAL, charset=AL16UTF16_CHARSET
                     )
+        # A column with a SQL domain or annotations describes them (#1711).
+        if self._has_column_catalog and self._has_sql_domains():
+            for i, (schema, name, notes) in self._sql_domain_columns(
+                cursor.pgresult, len(columns)
+            ).items():
+                columns[i] = replace(
+                    columns[i],
+                    domain_schema=schema,
+                    domain_name=name,
+                    annotations=notes,
+                )
         # A computed TO_VECTOR(text, n, format [, kind]) item describes as that
         # vector (#1708, #1726), where its composite says only its values' format.
         if original:
