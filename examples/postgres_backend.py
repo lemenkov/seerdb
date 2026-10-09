@@ -1381,6 +1381,38 @@ _ORACLE_DICTIONARY_DDL = (
     'LANGUAGE sql IMMUTABLE AS $$ SELECT length($1) $$;'
     'CREATE OR REPLACE FUNCTION dbms_lob.getlength(bytea) RETURNS integer '
     'LANGUAGE sql IMMUTABLE AS $$ SELECT octet_length($1) $$;'
+    # DBMS_LOB.COPY and WRITEAPPEND (#1712): procedures on the LOB they
+    # change, which PL/pgSQL hands back to the caller's variable. COPY writes
+    # `amount` characters (bytes) of the source from src_offset over the
+    # destination from dest_offset, a gap before it spaces (zero bytes);
+    # WRITEAPPEND appends the buffer's first `amount`. A BLOB's buffer written
+    # as a string is RAW, hex, as Oracle reads it.
+    + ''.join(
+        f'CREATE OR REPLACE PROCEDURE dbms_lob.copy(INOUT dest_lob {lob}, '
+        f'src_lob {lob}, amount integer, dest_offset integer DEFAULT 1, '
+        'src_offset integer DEFAULT 1) LANGUAGE plpgsql AS $$ '
+        f'DECLARE piece {lob} := substr(src_lob, src_offset, amount); BEGIN '
+        f'dest_lob := coalesce(dest_lob, {empty}); '
+        f'IF {size}(dest_lob) < dest_offset - 1 THEN dest_lob := dest_lob || '
+        f'{pad}; END IF; '
+        'dest_lob := overlay(dest_lob PLACING piece FROM dest_offset FOR '
+        f'{size}(piece)); END $$;'
+        f'CREATE OR REPLACE PROCEDURE dbms_lob.writeappend(INOUT lob_loc {lob}, '
+        f'amount integer, buffer {lob}) LANGUAGE plpgsql AS $$ BEGIN '
+        f'lob_loc := coalesce(lob_loc, {empty}) || substr(buffer, 1, amount); END $$;'
+        for lob, empty, size, pad in (
+            ('text', "''", 'length', "repeat(' ', dest_offset - 1 - length(dest_lob))"),
+            (
+                'bytea',
+                "''::bytea",
+                'octet_length',
+                "decode(repeat('00', dest_offset - 1 - octet_length(dest_lob)), 'hex')",
+            ),
+        )
+    )
+    + 'CREATE OR REPLACE PROCEDURE dbms_lob.writeappend(INOUT lob_loc bytea, '
+    'amount integer, buffer text) LANGUAGE plpgsql AS $$ BEGIN '
+    "CALL dbms_lob.writeappend(lob_loc, amount, decode(buffer, 'hex')); END $$;"
     # TO_CLOB(x): Oracle promotes a value to a CLOB; a CLOB IS text here, so the
     # conversion is a cast and the function exists only so the name resolves
     # (#1127). Declared for text and for the untyped literal a bare
