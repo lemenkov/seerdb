@@ -8837,6 +8837,16 @@ class PostgresBackend:
             self._conn.execute('CREATE EXTENSION IF NOT EXISTS orafce')
         except psycopg.Error:
             self._conn.rollback()
+        # pgvector, which Oracle's VECTOR types map onto (#1708), where it is
+        # installed; without it a VECTOR column is refused, as before.
+        # Under a savepoint, so a server without it keeps orafce.
+        self._has_pgvector = False
+        try:
+            with self._conn.transaction():
+                self._conn.execute('CREATE EXTENSION IF NOT EXISTS vector')
+            self._has_pgvector = True
+        except psycopg.Error:
+            pass
         # The Oracle data dictionary (#759) lives in a dedicated `sys` schema —
         # like Oracle's SYS — so its views are never reflected as user objects.
         try:
