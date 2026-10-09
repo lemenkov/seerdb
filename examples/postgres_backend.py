@@ -243,6 +243,7 @@ from seerdb.common.sqltext import (
     is_plsql,
     placeholder_count,
     returning_bind_positions,
+    sql_tokens,
     strip_non_bind_text,
     strip_returning_into,
 )
@@ -2179,6 +2180,54 @@ def _bind_key(name: str) -> str:
     return name if name.isidentifier() else f'b{name}'
 
 
+def _bind_spans(sql: str) -> Iterator[tuple[str, str, str | None]]:
+    # Each span of `sql` as (kind, text, bind name) -- the name only for a bind
+    # -- read by the shared tokenizer, so a `:x` inside a comment or a literal
+    # is text and an apostrophe in a comment opens nothing (#1692). A bind the
+    # tokenizer allows but Oracle's binds here do not (a quoted name spaced off
+    # its colon) is text too.
+    for token in sql_tokens(sql):
+        text = sql[token.start : token.end]
+        match = _BIND_REF.fullmatch(text) if token.kind == 'bind' else None
+        yield (token.kind, text, _bind_name(match) if match else None)
+
+
+# An alternative-quoting literal, q'[...]', whatever its delimiter (#1692).
+_Q_LITERAL = re.compile(r"(?s)([nN]?)[qQ]'(.)(.*)(.)'")
+
+
+def _plain_quoting(sql: str) -> str:
+    """`sql` with each alternative-quoting literal -- `q'[it's]'`, Oracle's way
+    of writing an apostrophe without doubling it -- as the ordinary literal it
+    means, `'it''s'` (#1692). PostgreSQL has no such syntax, and every later
+    rewrite reads ordinary literals only, so this runs first. One that does not
+    close is left as it is, to fail as sent."""
+    if "q'" not in sql.lower():
+        return sql
+    out = []
+    for token in sql_tokens(sql):
+        text = sql[token.start : token.end]
+        match = _Q_LITERAL.fullmatch(text) if token.kind == 'string' else None
+        if match is not None:
+            (national, _opening, body, _closing) = match.groups()
+            text = national + "'" + body.replace("'", "''") + "'"
+        out.append(text)
+    return ''.join(out)
+
+
+_BackendMethod = TypeVar('_BackendMethod', bound=Callable[..., Any])
+
+
+def _plainly_quoted(method: _BackendMethod) -> _BackendMethod:
+    # A backend entry point taking the statement first: it sees the statement
+    # with its q-literals made ordinary ones (#1692), before any rewrite.
+    @functools.wraps(method)
+    def wrapper(self: Any, sql: str, *args: Any, **kwargs: Any) -> Any:
+        return method(self, _plain_quoting(sql), *args, **kwargs)
+
+    return cast(_BackendMethod, wrapper)
+
+
 # The PostgreSQL type a NULL bind is cast to, from the type the client declared
 # for it (#699). A NULL carries no type of its own: PostgreSQL either refuses a
 # parameter it cannot infer ("could not determine data type of parameter") or
@@ -2203,29 +2252,6 @@ _NULL_CASTS = {
     TNS_TYPE_BLOB: 'bytea',
     TNS_TYPE_BOOLEAN: 'boolean',
 }
-
-
-def _copy_quoted_region(sql: str, start: int, out: list[str]) -> int:
-    """Copy the quoted region at ``start`` (a ``'`` string literal or a ``\"``
-    identifier) into ``out`` verbatim and return the index just past it. A doubled
-    quote is an escaped quote that stays inside; a literal ``%`` is doubled so
-    psycopg does not read it as a placeholder."""
-    quote = sql[start]
-    out.append(quote)
-    i, n = start + 1, len(sql)
-    while i < n:
-        char = sql[i]
-        if char == quote:
-            if i + 1 < n and sql[i + 1] == quote:
-                out.append(quote)
-                out.append(quote)
-                i += 2
-                continue
-            out.append(quote)
-            return i + 1
-        out.append('%%' if char == '%' else char)
-        i += 1
-    return i  # unterminated region: copied to end of string
 
 
 # A transaction a savepoint taken in it still belongs to: open, or failed.
@@ -2302,63 +2328,50 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
     tstz_keys: set[str] = set()  # bind keys whose value is an aware datetime
     ltz_keys: set[str] = set()  # bind keys whose value is an LtzValue
     intervalym_keys: set[str] = set()  # bind keys whose value is an IntervalYM
-    i, n = 0, len(sql)
-    while i < n:
-        char = sql[i]
-        if char == "'" or char == '"':
-            # Copy a whole quoted region verbatim -- a string literal ('...') or a
-            # quoted identifier ("...") -- so a ':' inside it (a column named
-            # "col:ons") is never mistaken for a bind. A doubled quote ('' or "")
-            # is an escaped quote that stays inside the region, and a literal % is
-            # doubled for psycopg's format-string parsing.
-            i = _copy_quoted_region(sql, i, out)
+    for _kind, text, name in _bind_spans(sql):
+        if name is None:
+            # Everything that is not a bind -- a literal, a quoted identifier,
+            # a comment (a `:x` in any of them is text) -- goes as it is, its
+            # `%` doubled for psycopg's format-string parsing.
+            out.append(text.replace('%', '%%'))
             continue
-        match = _BIND_REF.match(sql, i)
-        if match is not None and (i == 0 or sql[i - 1] != ':'):
-            name = _bind_name(match)
-            if name not in names:
-                names.append(name)
-            key = _bind_key(name)
-            value = (
-                values[names.index(name)] if names.index(name) < len(values) else None
-            )
-            if isinstance(value, BindVar):
-                # A typed NULL (#699): the value is None; the cast carries the
-                # declared type, where there is a PostgreSQL type to cast to.
-                cast = _NULL_CASTS.get(value.tns_type)
-                out.append(f'%({key})s::{cast}' if cast else f'%({key})s')
-            elif isinstance(value, LtzValue):
-                # A TIMESTAMP WITH LOCAL TIME ZONE bind is the instant in the
-                # database time zone, where a TIMESTAMP bind is a wall-clock time
-                # in the session's (#1208, #1222).
-                out.append(f'%({key})s::timestamptz')
-                ltz_keys.add(key)
-            elif isinstance(value, datetime.datetime) and value.tzinfo is not None:
-                # An aware datetime binds a TIMESTAMP WITH TIME ZONE — build the
-                # offset-preserving composite so the entered offset survives the
-                # round trip rather than being normalised to UTC (#519).
-                out.append(f'ROW(%({key})s, %({key}__off)s)::{_TSTZ_TYPE}')
-                tstz_keys.add(key)
-            elif isinstance(value, _CollectionBind):
-                out.append(f'%({key})s::' + value.domain.replace('%', '%%'))
-            elif isinstance(value, BlobValue):
-                # A BLOB bind -- a temporary LOB the client wrote -- describes
-                # as a BLOB, as Oracle's does, where its bytea alone describes
-                # as a RAW (#1625): TO_BLOB around it is the item the describe
-                # knows as one (_computed_column_types). The value is unchanged.
-                out.append(f'to_blob(%({key})s)')
-            elif isinstance(value, IntervalYM):
-                # An IntervalYM binds an INTERVAL YEAR TO MONTH — send its whole-month
-                # count and rebuild a PostgreSQL interval, so the months survive
-                # (psycopg has no dumper for IntervalYM) (#504).
-                out.append(f'make_interval(months => %({key})s)')
-                intervalym_keys.add(key)
-            else:
-                out.append(f'%({key})s')
-            i = match.end()
-            continue
-        out.append(char.replace('%', '%%'))
-        i += 1
+        if name not in names:
+            names.append(name)
+        key = _bind_key(name)
+        value = values[names.index(name)] if names.index(name) < len(values) else None
+        if isinstance(value, BindVar):
+            # A typed NULL (#699): the value is None; the cast carries the
+            # declared type, where there is a PostgreSQL type to cast to.
+            cast = _NULL_CASTS.get(value.tns_type)
+            out.append(f'%({key})s::{cast}' if cast else f'%({key})s')
+        elif isinstance(value, LtzValue):
+            # A TIMESTAMP WITH LOCAL TIME ZONE bind is the instant in the
+            # database time zone, where a TIMESTAMP bind is a wall-clock time
+            # in the session's (#1208, #1222).
+            out.append(f'%({key})s::timestamptz')
+            ltz_keys.add(key)
+        elif isinstance(value, datetime.datetime) and value.tzinfo is not None:
+            # An aware datetime binds a TIMESTAMP WITH TIME ZONE — build the
+            # offset-preserving composite so the entered offset survives the
+            # round trip rather than being normalised to UTC (#519).
+            out.append(f'ROW(%({key})s, %({key}__off)s)::{_TSTZ_TYPE}')
+            tstz_keys.add(key)
+        elif isinstance(value, _CollectionBind):
+            out.append(f'%({key})s::' + value.domain.replace('%', '%%'))
+        elif isinstance(value, BlobValue):
+            # A BLOB bind -- a temporary LOB the client wrote -- describes
+            # as a BLOB, as Oracle's does, where its bytea alone describes
+            # as a RAW (#1625): TO_BLOB around it is the item the describe
+            # knows as one (_computed_column_types). The value is unchanged.
+            out.append(f'to_blob(%({key})s)')
+        elif isinstance(value, IntervalYM):
+            # An IntervalYM binds an INTERVAL YEAR TO MONTH — send its whole-month
+            # count and rebuild a PostgreSQL interval, so the months survive
+            # (psycopg has no dumper for IntervalYM) (#504).
+            out.append(f'make_interval(months => %({key})s)')
+            intervalym_keys.add(key)
+        else:
+            out.append(f'%({key})s')
     params: dict = {}
     for idx, name in enumerate(names):
         if idx >= len(values):
@@ -6925,42 +6938,26 @@ _ANON_BLOCK = re.compile(r'(?is)^\s*(DECLARE\b.*?\s)?BEGIN\b(.*)\bEND\s*;?\s*$')
 
 def _bind_names(sql: str) -> list[str]:
     # The distinct bind names of `sql` in first-appearance order -- the order the
-    # binds arrive in -- past string literals and quoted identifiers.
+    # binds arrive in -- past literals, quoted identifiers and comments.
     names: list[str] = []
-    out: list[str] = []
-    i, n = 0, len(sql)
-    while i < n:
-        if sql[i] in ("'", '"'):
-            i = _copy_quoted_region(sql, i, out)
-            continue
-        match = _BIND_REF.match(sql, i)
-        if match is not None and (i == 0 or sql[i - 1] != ':'):
-            name = _bind_name(match)
-            if name not in names:
-                names.append(name)
-            i = match.end()
-            continue
-        i += 1
+    for _kind, _text, name in _bind_spans(sql):
+        if name is not None and name not in names:
+            names.append(name)
     return names
 
 
 def _replace_binds(sql: str, replacement: dict[str, str]) -> str:
     # `sql` with each bind named in `replacement` replaced by its text, past
-    # string literals and quoted identifiers.
+    # literals, quoted identifiers and comments. A literal's or a quoted
+    # identifier's `%` is doubled, as _translate_binds doubles it.
     out: list[str] = []
-    i, n = 0, len(sql)
-    while i < n:
-        if sql[i] in ("'", '"'):
-            i = _copy_quoted_region(sql, i, out)
-            continue
-        match = _BIND_REF.match(sql, i)
-        if match is not None and (i == 0 or sql[i - 1] != ':'):
-            name = _bind_name(match)
-            out.append(replacement.get(name, match.group(0)))
-            i = match.end()
-            continue
-        out.append(sql[i])
-        i += 1
+    for kind, text, name in _bind_spans(sql):
+        if name is not None:
+            out.append(replacement.get(name, text))
+        elif kind in ('string', 'identifier'):
+            out.append(text.replace('%', '%%'))
+        else:
+            out.append(text)
     return ''.join(out)
 
 
@@ -7521,30 +7518,6 @@ _OUT_ASSIGN = re.compile(r'(?is)^\s*:(\w+)\s*:=\s*(.+?)\s*$')
 _SELECT_INTO = re.compile(
     r'(?is)^\s*(SELECT\s.+?)\s+INTO\s+(:\w+(?:\s*,\s*:\w+)*)\s+(FROM\b.*?)\s*;?\s*$'
 )
-
-
-def _distinct_bind_refs(text: str) -> list[str]:
-    # The distinct bind references in first-appearance order (their positions in
-    # the Mirror's bind list), ignoring `:` inside string literals — the same
-    # scan _translate_binds uses, so a ref's position stays consistent.
-    seen: list[str] = []
-    i, n = 0, len(text)
-    while i < n:
-        if text[i] == "'":
-            i += 1
-            while i < n and text[i] != "'":
-                i += 1
-            i += 1
-            continue
-        match = _BIND_REF.match(text, i)
-        if match is not None and (i == 0 or text[i - 1] != ':'):
-            name = _bind_name(match)
-            if name not in seen:
-                seen.append(name)
-            i = match.end()
-            continue
-        i += 1
-    return seen
 
 
 def _parse_out_assignments(body: str) -> list[tuple[str, str]] | None:
@@ -8899,6 +8872,7 @@ class PostgresBackend:
             raise _session_terminated()
 
     @_while_connected
+    @_plainly_quoted
     def open_ref_cursor(self, query: str, skip: int = 0) -> object:
         """A cursor of the client's, bound IN as a REF CURSOR (#1609): its query
         opened as a portal of this session, past the ``skip`` rows the client
@@ -8930,6 +8904,7 @@ class PostgresBackend:
                 )
         return _PortalName(name)
 
+    @_plainly_quoted
     def parse(self, sql: str) -> None:
         """Validate a statement without running it -- ``cursor.parse()`` of
         anything that is not a query.
@@ -9026,6 +9001,7 @@ class PostgresBackend:
             self._conn.commit()
 
     @_while_connected
+    @_plainly_quoted
     def execute(self, sql: str, binds: Sequence = ()) -> Result:
         return self._committing(
             lambda: self._with_implicit_results(
@@ -9470,6 +9446,7 @@ class PostgresBackend:
         return Result()
 
     @_while_connected
+    @_plainly_quoted
     def execute_returning(self, sql: str, rows: Sequence[Sequence]) -> Result:
         # DML ... RETURNING col INTO :b (#689). PostgreSQL has the feature but
         # spells it without the INTO part, handing the columns back as rows
@@ -11597,6 +11574,7 @@ class PostgresBackend:
         return self._build_result(statement, sql, original or '')
 
     @_while_connected
+    @_plainly_quoted
     def execute_many(self, sql: str, rows: Sequence[Sequence]) -> int | Result:
         # One run of the statement in the translation report, however many rows.
         return self._committing(
@@ -11681,6 +11659,7 @@ class PostgresBackend:
         return BackendError('the array statement failed', rowcount=0)
 
     @_while_connected
+    @_plainly_quoted
     def execute_many_rowcounts(
         self, sql: str, rows: Sequence[Sequence]
     ) -> tuple[int, list[int]]:
@@ -12334,7 +12313,7 @@ class PostgresBackend:
     ) -> Result:
         # BEGIN :a := <expr>; :b := <expr>; END — evaluate the right-hand sides
         # with one SELECT and place each result onto its bind position (#517).
-        refs = _distinct_bind_refs(body)
+        refs = _bind_names(body)
         # Bind the SELECT by NAME, against the block's own bind order. The SELECT
         # carries only the right-hand sides, so the OUT targets are gone from it
         # and its placeholders no longer line up with `values`, which is in the
@@ -12381,7 +12360,7 @@ class PostgresBackend:
         # raises rather than turning NULL as in SQL (#1612).
         select = _translate_idioms(f'SELECT {exprs} FROM {_PLSQL_CALL_MARK}')
         sql, params = _translate_binds(
-            select, [by_name[ref] for ref in _distinct_bind_refs(select)]
+            select, [by_name[ref] for ref in _bind_names(select)]
         )
         cursor = self._conn.cursor()
         cursor.execute(sql, params)
@@ -12416,12 +12395,10 @@ class PostgresBackend:
         # no row is ORA-01403 and more than one ORA-01422. The query goes through
         # execute(), so it is translated like any other (ROWID included).
         select, targets, rest = match.groups()
-        refs = _distinct_bind_refs(match.string)
+        refs = _bind_names(match.string)
         by_name = dict(zip(refs, values))
         query = f'{select} {rest}'
-        result = self.execute(
-            query, [by_name[ref] for ref in _distinct_bind_refs(query)]
-        )
+        result = self.execute(query, [by_name[ref] for ref in _bind_names(query)])
         if not result.rows:
             raise BackendError('no data found', ora_code=ORA_NO_DATA_FOUND)
         if len(result.rows) > 1:
@@ -12430,7 +12407,7 @@ class PostgresBackend:
                 ora_code=ORA_TOO_MANY_ROWS,
             )
         out = list(values)
-        for target, value in zip(_distinct_bind_refs(targets), result.rows[0]):
+        for target, value in zip(_bind_names(targets), result.rows[0]):
             if target in refs:
                 out[refs.index(target)] = value
         return Result(out_binds=out)
