@@ -4140,6 +4140,57 @@ _CREATE_SQL_DOMAIN = re.compile(
     re.IGNORECASE,
 )
 _SQL_DOMAIN_MARK = 'seerdb sql domain'
+# DROP DOMAIN [IF EXISTS] name [FORCE [PRESERVE]] (#1744).
+_DROP_SQL_DOMAIN = re.compile(
+    r'\s*DROP\s+DOMAIN\s+(IF\s+EXISTS\s+)?((?:"[^"]+"|[\w$#]+)(?:\s*\.\s*(?:"[^"]+"|[\w$#]+))?)'
+    r'(?:\s+(FORCE)(?:\s+(PRESERVE))?)?\s*',
+    re.IGNORECASE,
+)
+
+
+def _drop_sql_domain(
+    if_exists: str | None, name: str, force: str | None, preserve: str | None
+) -> str:
+    """DROP DOMAIN as 23ai runs it (#1744), measured: refused while a column
+    uses the domain (ORA-11502), a missing one ORA-11504 unless IF EXISTS.
+    FORCE first returns each such column to the domain's base type, its
+    length and precision kept, and drops the domain's NOT NULL from it;
+    FORCE PRESERVE keeps the NOT NULL. PostgreSQL's CASCADE would drop the
+    columns themselves."""
+    missing = (
+        'RETURN;'
+        if if_exists
+        else "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'ORA-11504: The "
+        'domain specified does not exist or the user does not have privileges on '
+        "the domain for the operation.';"
+    )
+    label = name.replace("'", "''")
+    used = (
+        "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'ORA-11502: The domain "
+        f"{label.upper()} to be dropped has dependent objects.';"
+    )
+    detach = (
+        "EXECUTE format('ALTER TABLE %s ALTER COLUMN %I TYPE %s', c.relid, c.attname, "
+        'c.base);'
+        + (
+            " IF c.notnull THEN EXECUTE format('ALTER TABLE %s ALTER COLUMN %I SET NOT "
+            "NULL', c.relid, c.attname); END IF;"
+            if preserve
+            else ''
+        )
+    )
+    return (
+        f"DO $$ DECLARE d regtype := to_regtype('{label}'); c record; BEGIN "
+        f'IF d IS NULL THEN {missing} END IF; '
+        'FOR c IN SELECT a.attrelid::regclass AS relid, a.attname, '
+        'format_type(t.typbasetype, t.typtypmod) AS base, t.typnotnull AS notnull '
+        'FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid '
+        'WHERE a.atttypid = d AND a.attnum > 0 AND NOT a.attisdropped LOOP '
+        f'{detach if force else used} END LOOP; '
+        "EXECUTE format('DROP DOMAIN %s', d); END $$"
+    )
+
+
 _CREATE_TYPE_VARRAY = re.compile(
     r'\s*CREATE\s+TYPE\s+(\S+)\s+AS\s+VARRAY\s*\(\s*(\d+)\s*\)\s+OF\s+(.+?)\s*;?\s*$',
     re.IGNORECASE | re.DOTALL,
@@ -5022,6 +5073,9 @@ def _translate_ddl(sql: str) -> str:
             f'{replaced.group(1)} {replaced.group(2)}{sql[replaced.end() :]}'
         )
         return f'{_drop_type(replaced.group(3), if_exists=True)}; {plain}'
+    dropped = _DROP_SQL_DOMAIN.fullmatch(sql.strip().rstrip(';'))
+    if dropped:
+        return _drop_sql_domain(*dropped.groups())
     domain = _CREATE_SQL_DOMAIN.match(sql)
     if domain:
         # A 23ai SQL domain (#1711): PostgreSQL's own, its type mapped as a
@@ -11972,21 +12026,25 @@ class PostgresBackend:
     ) -> dict[int, tuple[bytes, bytes, tuple[tuple[bytes, bytes], ...]]]:
         # Each result column that comes straight from a table column with a
         # SQL domain or annotations (#1711): the domain's owner and name, as
-        # the dictionary views spell them, and the annotations -- traced through libpq
-        # ftable / ftablecol, as a domain column describes as its base type.
+        # the dictionary views spell them -- one in the session's own schema
+        # owned by the user logged in, as Oracle names it (#1744) -- and the
+        # annotations, traced through libpq ftable / ftablecol, as a domain
+        # column describes as its base type.
         keys = {}
         for index in range(count):
             relid = pgresult.ftable(index)
             if relid:
                 keys[index] = (relid, pgresult.ftablecol(index))
         unknown = [k for k in set(keys.values()) if k not in self._sql_domain_cache]
+        login = getattr(self, '_login_user', None)
         for relid, attnum in unknown:
             row = self._conn.execute(
                 'SELECT CASE WHEN obj_description(t.oid, %s) = %s THEN '
                 'sys.ora_owner(n.nspname) END, CASE WHEN obj_description(t.oid, %s) = %s '
                 'THEN sys.ora_name(t.typname) END, ARRAY(SELECT ARRAY[o.name, o.value] '
                 'FROM sys.ora_annotations o WHERE o.relid = a.attrelid AND '
-                'o.attnum = a.attnum ORDER BY o.position) FROM pg_attribute a '
+                'o.attnum = a.attnum ORDER BY o.position), '
+                'n.nspname = current_schema() FROM pg_attribute a '
                 'JOIN pg_type t ON t.oid = a.atttypid JOIN pg_namespace n ON '
                 'n.oid = t.typnamespace WHERE a.attrelid = %s AND a.attnum = %s',
                 (
@@ -12002,7 +12060,7 @@ class PostgresBackend:
                 None
                 if row is None or (row[1] is None and not row[2])
                 else (
-                    (row[0] or '').encode(),
+                    ((login if row[3] and login else row[0]) or '').encode(),
                     (row[1] or '').encode(),
                     tuple((k.encode(), v.encode()) for k, v in row[2]),
                 )
