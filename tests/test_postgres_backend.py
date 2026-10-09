@@ -6381,6 +6381,44 @@ def test_a_number_into_and_against_a_boolean_column() -> None:
         backend.close()
 
 
+def test_drop_domain_as_23ai_runs_it() -> None:
+    # DROP DOMAIN (#1744), measured on 23ai: refused while a column uses the
+    # domain (ORA-11502), a missing one ORA-11504 unless IF EXISTS; FORCE
+    # returns the column to the base type, precision kept, without the
+    # domain's NOT NULL, and FORCE PRESERVE keeps it.
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+
+    def code(sql: str) -> int | None:
+        try:
+            backend.execute(sql)
+        except BackendError as exc:
+            backend.rollback()
+            return exc.ora_code
+        return None
+
+    try:
+        for mode, null_code in (('FORCE', None), ('FORCE PRESERVE', 1400)):
+            code('DROP TABLE d1744')
+            code('DROP DOMAIN d1744dom FORCE')
+            backend.execute('CREATE DOMAIN d1744dom AS NUMBER(3) NOT NULL')
+            backend.execute(
+                'CREATE TABLE d1744 (id NUMBER, v NUMBER(3) DOMAIN d1744dom)'
+            )
+            assert code('DROP DOMAIN d1744dom') == 11502
+            assert code(f'DROP DOMAIN d1744dom {mode}') is None
+            assert code('INSERT INTO d1744 VALUES (1, NULL)') == null_code
+            assert code('INSERT INTO d1744 VALUES (2, 1000)') == 1438
+        assert code('DROP DOMAIN d1744nope') == 11504
+        assert code('DROP DOMAIN IF EXISTS d1744nope') is None
+    finally:
+        backend.rollback()
+        code('DROP TABLE d1744')
+        code('DROP DOMAIN d1744dom FORCE')
+        backend.close()
+
+
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
     # #1692: a `:c` in a comment was counted as a bind, so every value after it
     # shifted -- `:b` silently got the wrong one; an apostrophe in a comment
