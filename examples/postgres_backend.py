@@ -5742,6 +5742,107 @@ def _strict_select_into(sql: str) -> str:
     return _unmask_quoted(masked, contents)
 
 
+# %ROWCOUNT (#1608) in a PL/pgSQL body: the attribute, a dollar-quoted body, a
+# SQL statement that starts a statement of one (after which SQL%ROWCOUNT is
+# its row count), and a cursor's OPEN and FETCH.
+_ROWCOUNT_ATTRIBUTE = re.compile(r'(?i)(?<![\w$#"])([A-Za-z_][\w$#]*)\s*%\s*ROWCOUNT\b')
+_DOLLAR_BODY = re.compile(r'(?s)(\$[A-Za-z_]*\$)(.*?)\1')
+_ROWCOUNT_STATEMENT = re.compile(
+    r'(?is)(?:^|;|\b(?:BEGIN|THEN|ELSE|LOOP)\b)\s*'
+    r'(INSERT|UPDATE|DELETE|MERGE|SELECT|EXECUTE|OPEN|FETCH)\b'
+)
+_ROWCOUNT_CURSOR = re.compile(r'(?is)\s*(?:OPEN|FETCH)\s+([A-Za-z_][\w$#]*)')
+
+
+def _statement_close(body: str, start: int) -> int | None:
+    # The `;` that ends the statement at `start`, past parentheses; None if none.
+    depth = 0
+    for i in range(start, len(body)):
+        if body[i] == '(':
+            depth += 1
+        elif body[i] == ')':
+            depth -= 1
+        elif body[i] == ';' and depth == 0:
+            return i
+    return None
+
+
+def _rowcount_body(body: str) -> str:
+    # One PL/pgSQL body with its %ROWCOUNT attributes kept (#1608).
+    cursors = {
+        m.group(1).lower()
+        for m in _ROWCOUNT_ATTRIBUTE.finditer(body)
+        if m.group(1).upper() != 'SQL'
+    }
+    sql_count = any(
+        m.group(1).upper() == 'SQL' for m in _ROWCOUNT_ATTRIBUTE.finditer(body)
+    )
+    inserts: list[tuple[int, str]] = []
+    for m in _ROWCOUNT_STATEMENT.finditer(body):
+        word = m.group(1).upper()
+        close = _statement_close(body, m.start(1))
+        if close is None:
+            continue
+        if word in ('OPEN', 'FETCH'):
+            cursor = _ROWCOUNT_CURSOR.match(body, m.start(1))
+            name = cursor.group(1).lower() if cursor else ''
+            if name not in cursors:
+                continue
+            counter = f'ora_rowcount_{name}'
+            if word == 'OPEN':
+                inserts.append((close + 1, f' {counter} := 0;'))
+            elif not re.search(r'(?i)\bBULK\b', body[m.start(1) : close]):
+                inserts.append(
+                    (close + 1, f' IF FOUND THEN {counter} := {counter} + 1; END IF;')
+                )
+        elif sql_count:
+            inserts.append(
+                (close + 1, ' GET DIAGNOSTICS ora_sql_rowcount = ROW_COUNT;')
+            )
+    for at, text in sorted(inserts, reverse=True):
+        body = body[:at] + text + body[at:]
+    body = _ROWCOUNT_ATTRIBUTE.sub(
+        lambda m: (
+            'ora_sql_rowcount'
+            if m.group(1).upper() == 'SQL'
+            else f'ora_rowcount_{m.group(1).lower()}'
+        ),
+        body,
+    )
+    declared = ('ora_sql_rowcount integer; ' if sql_count else '') + ''.join(
+        f'ora_rowcount_{name} integer; ' for name in sorted(cursors)
+    )
+    stripped = body.lstrip()
+    lead = body[: len(body) - len(stripped)]
+    if stripped[:7].upper() == 'DECLARE':
+        return f'{lead}DECLARE {declared}{stripped[7:]}'
+    return f'{lead}DECLARE {declared}{stripped}'
+
+
+def _rowcount_attributes(sql: str) -> str:
+    """PL/SQL's %ROWCOUNT in a PL/pgSQL body (#1608). SQL%ROWCOUNT is the row
+    count of the body's last SQL statement -- an INSERT, UPDATE, DELETE, MERGE,
+    SELECT INTO or EXECUTE -- read with GET DIAGNOSTICS after each, NULL before
+    any; a cursor's is the rows fetched since it was opened, counted after each
+    FETCH that found one. PL/pgSQL keeps neither, so the body keeps them in
+    variables of its own.
+    """
+    if not _PLPGSQL_STATEMENT.search(sql) or not _ROWCOUNT_ATTRIBUTE.search(sql):
+        return sql
+    (masked, contents) = _mask_quoted(sql)
+    rewritten = _DOLLAR_BODY.sub(
+        lambda m: (
+            m.group(1) + _rowcount_body(m.group(2)) + m.group(1)
+            if _ROWCOUNT_ATTRIBUTE.search(m.group(2))
+            else m.group(0)
+        ),
+        masked,
+    )
+    if rewritten == masked:
+        return sql
+    return _unmask_quoted(rewritten, contents)
+
+
 def _translate_idioms(sql: str) -> str:
     """Rewrite the Oracle SQL functions / literal idioms the suite uses to their
     PostgreSQL equivalents (#502). Applied to every statement. Each step that
@@ -5773,6 +5874,7 @@ def _translate_idioms(sql: str) -> str:
         )
     sql = _ruled('timestamp-tz-literal', _TSTZ_LITERAL.sub(_tstz_literal_sub, sql), sql)
     sql = _ruled('select-into-strict', _strict_select_into(sql), sql)
+    sql = _ruled('rowcount-attribute', _rowcount_attributes(sql), sql)
     return _ruled('cursor-expression', _translate_cursor_expressions(sql), sql)
 
 

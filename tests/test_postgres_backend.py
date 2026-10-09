@@ -3938,6 +3938,54 @@ def test_a_standalone_routine_is_listed_with_the_objects() -> None:
         backend.close()
 
 
+def test_rowcount_attributes_read_as_in_oracle() -> None:
+    # %ROWCOUNT (#1608): SQL%ROWCOUNT is the last SQL statement's row count --
+    # NULL before any, an UPDATE's rows, 1 for a SELECT INTO, 0 for a DELETE of
+    # none -- and a cursor's the rows fetched since it was opened. 23ai's.
+    from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE rc1608t (n NUMBER)')
+        backend.execute(
+            'INSERT INTO rc1608t SELECT level FROM dual CONNECT BY level <= 5'
+        )
+        backend.execute(
+            'CREATE OR REPLACE FUNCTION rc1608 RETURN VARCHAR2 IS\n'
+            '  k SYS_REFCURSOR; v NUMBER; s VARCHAR2(200);\nBEGIN\n'
+            "  s := 'start:' || nvl(to_char(SQL%ROWCOUNT), 'null');\n"
+            '  UPDATE rc1608t SET n = n WHERE n <= 3;\n'
+            "  s := s || ' upd:' || SQL%ROWCOUNT;\n"
+            "  IF SQL%ROWCOUNT = 3 THEN s := s || ' if3'; END IF;\n"
+            '  SELECT count(*) INTO v FROM rc1608t;\n'
+            "  s := s || ' sel:' || SQL%ROWCOUNT;\n"
+            '  DELETE FROM rc1608t WHERE n > 99;\n'
+            "  s := s || ' del:' || SQL%ROWCOUNT;\n"
+            '  OPEN k FOR SELECT n FROM rc1608t ORDER BY n;\n'
+            "  s := s || ' open:' || k%ROWCOUNT;\n"
+            "  FETCH k INTO v; FETCH k INTO v; s := s || ' f2:' || k%ROWCOUNT;\n"
+            '  LOOP FETCH k INTO v; EXIT WHEN k%NOTFOUND; END LOOP;\n'
+            "  s := s || ' end:' || k%ROWCOUNT;\n"
+            '  CLOSE k; RETURN s;\nEND;'
+        )
+        result = backend.execute(
+            'BEGIN :1 := rc1608(); END;',
+            [BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=200)],
+        )
+        assert result.out_binds[0] == (
+            'start:null upd:3 if3 sel:1 del:0 open:0 f2:2 end:5'
+        )
+    finally:
+        backend.rollback()
+        for statement in ('DROP FUNCTION rc1608', 'DROP TABLE rc1608t'):
+            try:
+                backend.execute(statement)
+            except Exception:
+                backend.rollback()
+        backend.close()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
