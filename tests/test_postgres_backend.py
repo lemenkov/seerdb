@@ -4025,6 +4025,47 @@ def test_directory_objects_are_kept_and_listed() -> None:
         backend.close()
 
 
+def test_a_bfile_names_a_file_on_the_postgresql_host() -> None:
+    # BFILE values (#1669): BFILENAME and a BFILE column carry the directory's
+    # and the file's names, described as a BFILE, and bfile_exists answers from
+    # the PostgreSQL host -- ORA-22285 for a DIRECTORY object that does not
+    # exist, as 23ai's FILEEXISTS does, else whether the file is there.
+    from seerdb.common.tns_consts import TNS_TYPE_BFILE
+    from seerdb.server import BackendError, BFile
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        result = backend.execute(
+            "SELECT BFILENAME('TEST_1936_MISSING_DIR', 'f.txt') FROM dual"
+        )
+        assert result.columns[0].data_type == TNS_TYPE_BFILE
+        assert result.rows == [(BFile('TEST_1936_MISSING_DIR', 'f.txt'),)]
+        with pytest.raises(BackendError) as exc:
+            backend.bfile_exists('TEST_1936_MISSING_DIR', 'f.txt')
+        assert exc.value.ora_code == 22285
+        try:
+            backend.execute('DROP DIRECTORY etc1669')
+        except BackendError:
+            backend.rollback()  # not there yet
+        backend.execute("CREATE DIRECTORY etc1669 AS '/etc'")
+        assert backend.bfile_exists('ETC1669', 'hostname')
+        assert not backend.bfile_exists('ETC1669', 'no_such_file_1669')
+        backend.execute('CREATE TABLE bt1669 (n NUMBER, b BFILE)')
+        backend.execute(
+            "INSERT INTO bt1669 VALUES (1, BFILENAME('ETC1669', 'hostname'))"
+        )
+        (row,) = backend.execute('SELECT b FROM bt1669').rows
+        assert row[0] == BFile('ETC1669', 'hostname')
+    finally:
+        backend.rollback()
+        for statement in ('DROP TABLE bt1669', 'DROP DIRECTORY etc1669'):
+            try:
+                backend.execute(statement)
+            except BackendError:
+                backend.rollback()
+        backend.close()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
