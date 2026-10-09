@@ -138,6 +138,17 @@ PRE_23AI_TESTS: dict[str, str] = {
 }
 
 
+# Tests that fail through a Mirror-over-PostgreSQL by what PostgreSQL itself is,
+# not by anything the Mirror leaves undone, deselected with --backend postgres.
+# A passthrough to Oracle runs them, and they pass there.
+POSTGRES_BACKEND_TESTS: dict[str, str] = {
+    # PostgreSQL text never holds bytes invalid in UTF-8, which these store
+    # through UTL_RAW.CAST_TO_VARCHAR2 and read back with encoding_errors (#1659).
+    'test_3700_var.py::test_3732': 'PostgreSQL text holds no invalid UTF-8',
+    'test_3800_typehandler.py::test_3807': 'PostgreSQL text holds no invalid UTF-8',
+}
+
+
 def _server_major(dsn: str, user: str, password: str) -> int | None:
     # The major release the server reports, or None when it cannot be asked.
     try:
@@ -162,6 +173,12 @@ def main() -> int:
     ap.add_argument('--admin-password', default='pyoadm123')
     ap.add_argument('--proxy-user', default='pythontestproxy')
     ap.add_argument('--proxy-password', default='pythontestproxy')
+    ap.add_argument(
+        '--backend',
+        choices=('oracle', 'postgres'),
+        default='oracle',
+        help='what the Mirror runs on: postgres deselects what PostgreSQL cannot do',
+    )
     ap.add_argument('pytest_args', nargs='*', help='extra args passed to pytest')
     args = ap.parse_args()
 
@@ -196,6 +213,8 @@ def main() -> int:
     major = _server_major(args.dsn, args.user, args.password)
     if major is not None and major < 23:
         deselected.update(PRE_23AI_TESTS)
+    if args.backend == 'postgres':
+        deselected.update(POSTGRES_BACKEND_TESTS)
     for test in deselected:
         cmd += ['--deselect', f'tests/{test}']
     cmd += args.pytest_args
