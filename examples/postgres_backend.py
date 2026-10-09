@@ -149,10 +149,10 @@ honest edge of this adapter:
   flexible format keeps each value's format in a composite. A FLOAT32 column
   holds at most pgvector's 16000 dimensions, where Oracle's holds 65535.
   VECTOR_DISTANCE is pgvector's operators: COSINE, EUCLIDEAN(_SQUARED), DOT
-  and MANHATTAN, not HAMMING or JACCARD. A sparse column (#1709) is a
+  and MANHATTAN, and HAMMING by element. A sparse column (#1709) is a
   composite of its own in every format -- pgvector's sparsevec drops an
-  explicit zero, which Oracle keeps -- and has no pgvector index. Without
-  pgvector a VECTOR column is refused. BINARY vectors are not yet there.
+  explicit zero, which Oracle keeps -- and a BINARY one (#1710) is varbit;
+  neither has a pgvector index. Without pgvector a VECTOR column is refused.
 - **Privileges, for type lookup only** -- every Mirror user is the backend's
   one PostgreSQL role. A GRANT or REVOKE on an object is recorded
   (``sys.ora_grants``), and a user sees another user's type -- in ALL_TYPES,
@@ -308,6 +308,7 @@ from seerdb.common.tns_consts import (
     ORA_USER_NAME_CONFLICT,
     ORA_VALUE_LARGER_THAN_PRECISION,
     ORA_VALUE_TOO_LARGE_FOR_COLUMN,
+    ORA_VECTOR_BINARY_DIMENSIONS,
     ORA_VECTOR_DIMENSION_MISMATCH,
     ORA_VECTOR_INVALID_VALUE,
     TNS_TYPE_ADT,
@@ -2495,8 +2496,10 @@ class _JsonDumper(psycopg.adapt.Dumper):
         return json.dumps(_to_extended(obj.value)).encode('utf-8')
 
 
-# float8[] and int2[], the storage of a FLOAT64 / INT8 VECTOR column (#1708).
+# float8[] and int2[], the storage of a FLOAT64 / INT8 VECTOR column (#1708), and
+# varbit, a BINARY one's (#1710).
 _VECTOR_ARRAY_OIDS = frozenset({1022, 1005})
+_VARBIT_OID = 1562
 
 
 def _vector_value(value: object, code: int | None) -> object:
@@ -2505,6 +2508,9 @@ def _vector_value(value: object, code: int | None) -> object:
     # (format, elements), which carries its own.
     if value is None:
         return None
+    if isinstance(value, str) and code == 5:
+        # A BINARY column's varbit, eight bits to a byte (#1710).
+        return array.array('B', int(value, 2).to_bytes(len(value) // 8, 'big'))
     if isinstance(value, str):
         elements = json.loads(value)
     elif isinstance(value, list):
@@ -2513,7 +2519,7 @@ def _vector_value(value: object, code: int | None) -> object:
         code = getattr(value, 'format', None) or code
         elements = list(getattr(value, 'elements', None) or [])
     typecode = _VECTOR_TYPECODES.get(code or 2, 'f')
-    if typecode == 'b':
+    if typecode in ('b', 'B'):
         return array.array(typecode, (int(v) for v in elements))
     return array.array(typecode, (float(v) for v in elements))
 
@@ -2602,7 +2608,7 @@ class _VectorDumper(psycopg.adapt.Dumper):
     oid = 0
 
     def dump(self, obj: array.array) -> bytes:
-        code = {'f': 2, 'd': 3, 'b': 4}.get(obj.typecode, 2)
+        code = {'f': 2, 'd': 3, 'b': 4, 'B': 5}.get(obj.typecode, 2)
         elements = ','.join(repr(float(v)) for v in obj)
         return f'({code},"{{{elements}}}")'.encode('utf-8')
 
@@ -2765,21 +2771,21 @@ _VARCHAR2_WORD = re.compile(r'\bVARCHAR2\b', re.IGNORECASE)
 # keeps each value's format in the ora_vector composite. sys.ora_columns records
 # the declaration -- VECTOR, its dimensions and format -- which the describe
 # reads back whatever the storage. A sparse or BINARY vector is #1709 / #1710.
-_VECTOR_FORMATS = {'FLOAT32': 2, 'FLOAT64': 3, 'INT8': 4}
-_VECTOR_TYPECODES = {2: 'f', 3: 'd', 4: 'b'}
+_VECTOR_FORMATS = {'FLOAT32': 2, 'FLOAT64': 3, 'INT8': 4, 'BINARY': 5}
+_VECTOR_TYPECODES = {2: 'f', 3: 'd', 4: 'b', 5: 'B'}
 _VECTOR_COMPOSITE = 'ora_vector'
 # A sparse vector (#1709): its format, dimension count, ascending 0-based indices
 # and their values. Every sparse column is one: pgvector's sparsevec drops a zero
 # a client stored, which Oracle keeps.
 _SPARSE_COMPOSITE = 'ora_sparse_vector'
 _VECTOR_DECLARED = re.compile(
-    r'\s*VECTOR\b(?:\s*\(\s*(\*|\d+)?\s*(?:,\s*(\*|FLOAT32|FLOAT64|INT8)\s*)?'
+    r'\s*VECTOR\b(?:\s*\(\s*(\*|\d+)?\s*(?:,\s*(\*|FLOAT32|FLOAT64|INT8|BINARY)\s*)?'
     r'(?:,\s*(DENSE|SPARSE)\s*)?\))?(?!\s*\()',
     re.IGNORECASE,
 )
 _VECTOR_COLUMN = re.compile(
     r'([(,]\s*(?:"[^"]+"|[A-Za-z_][\w$#]*))\s+VECTOR\b'
-    r'(?:\s*\(\s*(\*|\d+)?\s*(?:,\s*(\*|FLOAT32|FLOAT64|INT8)\s*)?'
+    r'(?:\s*\(\s*(\*|\d+)?\s*(?:,\s*(\*|FLOAT32|FLOAT64|INT8|BINARY)\s*)?'
     r'(?:,\s*(DENSE|SPARSE)\s*)?\))?',
     re.IGNORECASE,
 )
@@ -2806,15 +2812,24 @@ _VECTOR_DDL = (
     'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
     # A vector bind -- the composite, its own format kept -- stored into a
     # FLOAT32, FLOAT64 or INT8 column, or used where a vector is wanted.
+    # A BINARY vector takes no part with one of another format (#1710).
+    # VOLATILE, or the planner would fold the call and raise on every query.
+    'CREATE OR REPLACE FUNCTION sys.ora_binary_refused() RETURNS text '
+    "LANGUAGE plpgsql VOLATILE AS $$ BEGIN RAISE EXCEPTION USING ERRCODE = 'P0001', "
+    "MESSAGE = 'ORA-51814: Vector of BINARY format cannot have any operation "
+    "performed with vector of any other type.'; END $$;"
+    f'CREATE OR REPLACE FUNCTION sys.ora_vector_plain(v {_VECTOR_COMPOSITE}) '
+    'RETURNS float8[] LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT CASE WHEN '
+    'v.format = 5 AND sys.ora_binary_refused() IS NULL THEN NULL ELSE v.elements END $$;'
     f'CREATE OR REPLACE FUNCTION sys.ora_vector_float32({_VECTOR_COMPOSITE}) '
     'RETURNS vector LANGUAGE sql IMMUTABLE STRICT AS '
-    '$$ SELECT ($1).elements::real[]::vector $$;'
+    '$$ SELECT sys.ora_vector_plain($1)::real[]::vector $$;'
     f'CREATE OR REPLACE FUNCTION sys.ora_vector_float8({_VECTOR_COMPOSITE}) '
-    'RETURNS float8[] LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT ($1).elements $$;'
+    'RETURNS float8[] LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT sys.ora_vector_plain($1) $$;'
     # An INT8 element outside -128..127 is refused, as Oracle refuses it.
     f'CREATE OR REPLACE FUNCTION sys.ora_vector_int2({_VECTOR_COMPOSITE}) '
     'RETURNS int2[] LANGUAGE plpgsql IMMUTABLE STRICT AS $$ DECLARE v float8; BEGIN '
-    'FOREACH v IN ARRAY ($1).elements LOOP IF v < -128 OR v > 127 THEN '
+    'FOREACH v IN ARRAY sys.ora_vector_plain($1) LOOP IF v < -128 OR v > 127 THEN '
     "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = format('ORA-51806: Vector "
     'column is not properly formatted (dimension value %s is outside the allowed '
     "precision range).', v); END IF; END LOOP; RETURN ($1).elements::int2[]; END $$;"
@@ -2843,12 +2858,15 @@ _VECTOR_DDL = (
     '$$ DECLARE e float8[]; code smallint; BEGIN IF t IS NULL THEN RETURN NULL; END IF; '
     "e := coalesce(string_to_array(nullif(btrim(t, '[] '), ''), ',')::float8[], '{}'); "
     "code := CASE upper(coalesce(fmt, 'FLOAT32')) WHEN 'FLOAT64' THEN 3 "
-    "WHEN 'INT8' THEN 4 ELSE 2 END; "
-    'IF n IS NOT NULL AND cardinality(e) <> n THEN '
+    "WHEN 'INT8' THEN 4 WHEN 'BINARY' THEN 5 ELSE 2 END; "
+    # A BINARY vector's elements are bytes, its dimensions their bits (#1710).
+    'IF n IS NOT NULL AND cardinality(e) * (CASE WHEN code = 5 THEN 8 ELSE 1 END) <> n THEN '
     "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = format('ORA-51803: Vector "
     'dimension count must match the dimension count specified in the column '
-    "definition (actual: %s, required: %s).', cardinality(e), n); END IF; "
+    "definition (actual: %s, required: %s).', cardinality(e) * CASE WHEN code = 5 "
+    'THEN 8 ELSE 1 END, n); END IF; '
     'IF code = 2 THEN e := e::real[]::float8[]; END IF; '
+    'IF code = 5 THEN PERFORM sys.ora_vector_bit(ROW(5, e)::ora_vector); END IF; '
     f'IF code = 4 THEN PERFORM sys.ora_vector_int2(ROW(4, e)::{_VECTOR_COMPOSITE}); END IF; '
     f'RETURN ROW(code, e)::{_VECTOR_COMPOSITE}; END $$;'
     # TO_VECTOR of a vector -- a bind -- in the format asked for, its own when
@@ -2856,8 +2874,10 @@ _VECTOR_DDL = (
     f'CREATE OR REPLACE FUNCTION sys.ora_to_vector(v {_VECTOR_COMPOSITE}, '
     f'n integer DEFAULT NULL, fmt text DEFAULT NULL) RETURNS {_VECTOR_COMPOSITE} '
     "LANGUAGE sql IMMUTABLE AS $$ SELECT sys.ora_to_vector('[' || "
-    "array_to_string((v).elements, ',') || ']', n, coalesce(fmt, CASE (v).format "
-    "WHEN 3 THEN 'FLOAT64' WHEN 4 THEN 'INT8' ELSE 'FLOAT32' END)) $$;"
+    "array_to_string((v).elements, ',') || ']', n, CASE WHEN fmt IS NOT NULL AND "
+    "((v).format = 5) <> (upper(fmt) = 'BINARY') THEN sys.ora_binary_refused() "
+    "ELSE coalesce(fmt, CASE (v).format WHEN 3 THEN 'FLOAT64' WHEN 4 THEN 'INT8' "
+    "WHEN 5 THEN 'BINARY' ELSE 'FLOAT32' END) END) $$;"
     # Text a client writes into a VECTOR column, '[1, 2, 3]' (#1708).
     + ''.join(
         f'CREATE OR REPLACE FUNCTION sys.ora_text_{name}(text) RETURNS {target} '
@@ -2954,6 +2974,84 @@ _VECTOR_DDL = (
     'IF code = 2 THEN e := e::real[]::float8[]; '
     'ELSIF code = 4 THEN e := e::int2[]::float8[]; END IF; '
     f'RETURN ROW(code, v.dims, v.indices, e)::{_SPARSE_COMPOSITE}; END $$;'
+    # A BINARY vector (#1710) is varbit, each element a byte of eight bits:
+    # one outside 0..255 is ORA-51806, a vector of another format ORA-51814.
+    f'CREATE OR REPLACE FUNCTION sys.ora_vector_bit(v {_VECTOR_COMPOSITE}) RETURNS varbit '
+    # Built bit by byte, never through text: text's cast to varbit is the
+    # vector parser below.
+    "LANGUAGE plpgsql IMMUTABLE STRICT AS $$ DECLARE x float8; r varbit := B''; BEGIN "
+    'IF v.format <> 5 THEN PERFORM sys.ora_binary_refused(); END IF; '
+    "FOREACH x IN ARRAY coalesce(v.elements, '{}') LOOP "
+    'IF x < 0 OR x > 255 OR x <> trunc(x) THEN '
+    "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = format('ORA-51806: Vector "
+    'column is not properly formatted (dimension value %s is outside the allowed '
+    "precision range).', x); END IF; r := r || x::integer::bit(8); END LOOP; "
+    'RETURN r; END $$;'
+    f'DO $$ BEGIN CREATE CAST ({_VECTOR_COMPOSITE} AS varbit) WITH FUNCTION '
+    f'sys.ora_vector_bit({_VECTOR_COMPOSITE}) AS ASSIGNMENT; '
+    'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+    # A fixed-dimension BINARY column's check: its bits, else ORA-51803.
+    'CREATE OR REPLACE FUNCTION sys.ora_binary_dims(varbit, integer) RETURNS boolean '
+    'LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN IF $1 IS NOT NULL AND length($1) <> $2 '
+    "THEN RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = format('ORA-51803: Vector "
+    'dimension count must match the dimension count specified in the column '
+    "definition (actual: %s, required: %s).', length($1), $2); END IF; "
+    'RETURN true; END $$;'
+    # Text written into a BINARY column, '[7, 8]': its bytes.
+    'CREATE OR REPLACE FUNCTION sys.ora_text_varbit(text) RETURNS varbit '
+    'LANGUAGE sql IMMUTABLE STRICT AS '
+    "$$ SELECT sys.ora_vector_bit(sys.ora_to_vector($1, NULL, 'BINARY')) $$;"
+    'DO $$ BEGIN CREATE CAST (text AS varbit) WITH FUNCTION '
+    'sys.ora_text_varbit(text) AS ASSIGNMENT; '
+    'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+    # Each VECTOR storage as the composite, which VECTOR_DISTANCE takes.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.ora_{name}_composite({source}) '
+        f'RETURNS {_VECTOR_COMPOSITE} LANGUAGE sql IMMUTABLE STRICT AS '
+        f'$$ SELECT ROW({code}, {elements})::{_VECTOR_COMPOSITE} $$;'
+        f'DO $$ BEGIN CREATE CAST ({source} AS {_VECTOR_COMPOSITE}) WITH FUNCTION '
+        f'sys.ora_{name}_composite({source}); '
+        'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+        for name, source, code, elements in (
+            ('float8', 'float8[]', 3, '$1'),
+            ('int2', 'int2[]', 4, '$1::float8[]'),
+            (
+                'varbit',
+                'varbit',
+                5,
+                'ARRAY(SELECT substring($1 FROM k FOR 8)::bit(8)::integer::float8 '
+                'FROM generate_series(1, length($1), 8) AS g(k) ORDER BY k)',
+            ),
+        )
+    )
+    # VECTOR_DISTANCE(a, b, metric) (#1708): pgvector's operator for the
+    # metric; two BINARY vectors' by their bits, as 23ai measures them (#1710),
+    # a BINARY one with another ORA-51812.
+    + f'CREATE OR REPLACE FUNCTION sys.ora_vector_distance(a {_VECTOR_COMPOSITE}, '
+    f'b {_VECTOR_COMPOSITE}, metric text) RETURNS float8 LANGUAGE plpgsql IMMUTABLE '
+    'STRICT AS $$ DECLARE x varbit; y varbit; shared float8; differ float8; BEGIN '
+    'IF (a.format = 5) <> (b.format = 5) THEN '
+    "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'ORA-51812: The vector SQL "
+    'function VECTOR_DISTANCE() requires all input vectors to have the same '
+    "dimension format.'; END IF; "
+    'IF a.format = 5 THEN x := sys.ora_vector_bit(a); y := sys.ora_vector_bit(b); '
+    'shared := bit_count(x & y); differ := bit_count(x # y); '
+    "RETURN CASE metric WHEN 'DOT' THEN -shared "
+    "WHEN 'EUCLIDEAN' THEN sqrt(differ) WHEN 'L2' THEN sqrt(differ) "
+    "WHEN 'JACCARD' THEN 1 - shared / nullif(bit_count(x | y), 0) "
+    "WHEN 'COSINE' THEN 1 - shared / nullif(sqrt(bit_count(x)::float8 * bit_count(y)), 0) "
+    'ELSE differ END; END IF; '
+    "RETURN CASE metric WHEN 'EUCLIDEAN' THEN sys.ora_vector_float32(a) <-> "
+    "sys.ora_vector_float32(b) WHEN 'L2' THEN sys.ora_vector_float32(a) <-> "
+    "sys.ora_vector_float32(b) WHEN 'EUCLIDEAN_SQUARED' THEN "
+    'power(sys.ora_vector_float32(a) <-> sys.ora_vector_float32(b), 2) '
+    "WHEN 'L2_SQUARED' THEN power(sys.ora_vector_float32(a) <-> "
+    "sys.ora_vector_float32(b), 2) WHEN 'DOT' THEN sys.ora_vector_float32(a) <#> "
+    "sys.ora_vector_float32(b) WHEN 'MANHATTAN' THEN sys.ora_vector_float32(a) <+> "
+    "sys.ora_vector_float32(b) WHEN 'L1' THEN sys.ora_vector_float32(a) <+> "
+    "sys.ora_vector_float32(b) WHEN 'HAMMING' THEN (SELECT count(*) FROM "
+    'unnest(a.elements, b.elements) AS u(p, q) WHERE p IS DISTINCT FROM q) '
+    'ELSE sys.ora_vector_float32(a) <=> sys.ora_vector_float32(b) END; END $$;'
 )
 
 
@@ -2979,6 +3077,18 @@ def _vector_storage(m: re.Match[str]) -> str:
         )
     if m.group(3) is None or m.group(3) == '*':
         return f'{m.group(1)} {_VECTOR_COMPOSITE}'
+    if code == 5:
+        # BINARY (#1710): its dimensions are bits, eight to an element.
+        if count is not None and count % 8:
+            raise BackendError(
+                'Vector of BINARY format should have a dimension count that is a '
+                'multiple of 8.',
+                ora_code=ORA_VECTOR_BINARY_DIMENSIONS,
+            )
+        if count is None:
+            return f'{m.group(1)} varbit'
+        name = m.group(1).lstrip('(,').strip()
+        return f'{m.group(1)} varbit CHECK (sys.ora_binary_dims({name}, {count}))'
     if code == 2:
         return f'{m.group(1)} vector' + (f'({count})' if count else '')
     storage = 'float8[]' if code == 3 else 'int2[]'
@@ -5400,21 +5510,28 @@ def _translate_json_functions(sql: str) -> str:
 # Oracle's vector functions (#1708), and pgvector's operator per distance
 # metric -- COSINE when none is named, as Oracle defaults.
 _VECTOR_FUNCTION_NAMES = frozenset({'TO_VECTOR', 'VECTOR_DISTANCE'})
-_VECTOR_METRICS = {
-    'EUCLIDEAN': '<->',
-    'L2': '<->',
-    'COSINE': '<=>',
-    'DOT': '<#>',
-    'MANHATTAN': '<+>',
-    'L1': '<+>',
-}
+# The metrics VECTOR_DISTANCE knows (#1708, #1710).
+_VECTOR_METRICS = frozenset(
+    {
+        'EUCLIDEAN',
+        'L2',
+        'EUCLIDEAN_SQUARED',
+        'L2_SQUARED',
+        'COSINE',
+        'DOT',
+        'MANHATTAN',
+        'L1',
+        'HAMMING',
+        'JACCARD',
+    }
+)
 
 
 def _translate_vector_functions(sql: str) -> str:
     """TO_VECTOR(text [, dimensions [, format]]) as sys.ora_to_vector, and
-    VECTOR_DISTANCE(a, b [, metric]) as pgvector's operator for the metric on
-    the two as vectors (#1708). A sparse or BINARY one is left as written, for
-    #1709 / #1710."""
+    VECTOR_DISTANCE(a, b [, metric]) as sys.ora_vector_distance of the two as
+    the composite (#1708), which picks the metric's computation by their format
+    (#1710). A string literal is the vector it spells."""
     if 'vector' not in sql.lower():
         return sql
 
@@ -5425,18 +5542,22 @@ def _translate_vector_functions(sql: str) -> str:
                 return None
             dims = inner[1] if len(inner) > 1 and inner[1] != '*' else 'NULL'
             fmt = inner[2].upper() if len(inner) > 2 else '*'
-            if fmt not in ('FLOAT32', 'FLOAT64', 'INT8', '*'):
+            if fmt != '*' and fmt not in _VECTOR_FORMATS:
                 return None
             named = 'NULL' if fmt == '*' else f"'{fmt}'"
             return f'sys.ora_to_vector({inner[0]}, {dims}, {named})'
         if len(inner) not in (2, 3):
             return None
         metric = inner[2].upper() if len(inner) == 3 else 'COSINE'
-        (a, b) = (f'CAST({inner[0]} AS vector)', f'CAST({inner[1]} AS vector)')
-        if metric == 'EUCLIDEAN_SQUARED' or metric == 'L2_SQUARED':
-            return f'power({a} <-> {b}, 2)'
-        operator = _VECTOR_METRICS.get(metric)
-        return None if operator is None else f'({a} {operator} {b})'
+        if metric not in _VECTOR_METRICS:
+            return None
+        (a, b) = (
+            f'sys.ora_to_vector({x})'
+            if x.startswith("'")
+            else f'CAST({x} AS {_VECTOR_COMPOSITE})'
+            for x in inner[:2]
+        )
+        return f"sys.ora_vector_distance({a}, {b}, '{metric}')"
 
     return _rewrite_calls(sql, _VECTOR_FUNCTION_NAMES, call, '_$#."')
 
@@ -10614,6 +10735,7 @@ class PostgresBackend:
                 self._sparse_composite_oid,
             )
             or oid in _VECTOR_ARRAY_OIDS
+            or oid == _VARBIT_OID
         ):
             declared = self._declared_column_types(pgresult, [index]).get(index)
             if declared is not None and declared[0] == 'VECTOR':
@@ -10699,9 +10821,10 @@ class PostgresBackend:
 
     def _vector_text_literals(self, sql: str) -> str:
         """`sql` with each string literal an INSERT's VALUES or an UPDATE's SET
-        puts into a sparse VECTOR column -- '[4, [1, 3], [1.0, 2.0]]' -- typed
-        as text (#1709): untyped, PostgreSQL reads it as the composite's own
-        record syntax, and only text's cast parses the vector."""
+        puts into a sparse VECTOR column -- '[4, [1, 3], [1.0, 2.0]]' -- or a
+        BINARY one -- '[7, 8]' -- typed as text (#1709, #1710): untyped,
+        PostgreSQL reads it in the storage's own syntax, record or bit string,
+        and only text's cast parses the vector."""
         if not self._has_pgvector or not self._has_column_catalog or "'" not in sql:
             return sql
 
@@ -10711,7 +10834,9 @@ class PostgresBackend:
                 return None
             return (
                 found[0],
-                frozenset(i for i, (_c, sparse) in found[1].items() if sparse),
+                frozenset(
+                    i for i, (code, sparse) in found[1].items() if sparse or code == 5
+                ),
             )
 
         (masked, contents, targets) = self._aimed_items(sql, layout)
@@ -10818,7 +10943,7 @@ class PostgresBackend:
             if isinstance(elements, list):
                 code = code or 2
                 typecode = _VECTOR_TYPECODES.get(code, 'f')
-                cast = int if typecode == 'b' else float
+                cast = int if typecode in ('b', 'B') else float
                 out[index] = array.array(typecode, (cast(v) for v in elements))
         return out
 

@@ -233,6 +233,7 @@ ORA_NO_DATA_GUIDE = 40582  # the collection has no data-guide-enabled index
 ORA_VECTOR_DIMENSION_MISMATCH = 51803  # vector dimension count must match the column's
 ORA_VECTOR_INVALID_VALUE = 51805  # a dimension value that is not a number (inf, NaN)
 ORA_VECTOR_VALUE_OUT_OF_RANGE = 51806  # a dimension value outside the format's range
+ORA_VECTOR_BINARY_DIMENSIONS = 51813  # a BINARY vector's dimensions: a multiple of 8
 
 # The describe's vector-metadata flags byte (23.4+). A VECTOR column that allows
 # ANY number of dimensions says so HERE, not by its dimension count -- the count
