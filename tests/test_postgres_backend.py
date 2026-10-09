@@ -3037,10 +3037,11 @@ def test_an_is_json_condition_is_no_json_column() -> None:
     from seerdb.server import BackendError
 
     _reject_unsupported_ddl_types(
-        'CREATE TABLE t (v VARCHAR2(10), CONSTRAINT c CHECK (v IS JSON FORMAT JSON))'
+        'CREATE TABLE t (v VARCHAR2(10), CONSTRAINT c CHECK (v IS JSON FORMAT JSON))',
+        (12, 1),
     )
     with pytest.raises(BackendError):
-        _reject_unsupported_ddl_types('CREATE TABLE t (j JSON)')
+        _reject_unsupported_ddl_types('CREATE TABLE t (j JSON)', (12, 1))
     assert (
         _translate_idioms(
             "SELECT 1 FROM t WHERE t.v IS JSON STRICT AND ('x') IS NOT JSON LAX"
@@ -4413,12 +4414,20 @@ def test_reject_oracle_only_ddl_types_raises_ora_902() -> None:
     # which is exactly what the suite's version guards skip on.
     for coltype in ('doc JSON', 'v VECTOR(3, FLOAT32)', 'flag BOOLEAN'):
         with pytest.raises(BackendError) as exc:
-            _reject_unsupported_ddl_types(f'CREATE TABLE t (id NUMBER, {coltype})')
+            _reject_unsupported_ddl_types(
+                f'CREATE TABLE t (id NUMBER, {coltype})', (12, 1)
+            )
         assert exc.value.ora_code == 902
 
     # An ordinary CREATE TABLE — and any non-CREATE-TABLE statement — is fine.
-    _reject_unsupported_ddl_types('CREATE TABLE t (id NUMBER, v VARCHAR2(10))')
-    _reject_unsupported_ddl_types('SELECT json_col FROM t WHERE flag = 1')
+    _reject_unsupported_ddl_types('CREATE TABLE t (id NUMBER, v VARCHAR2(10))', (12, 1))
+    # At 23ai all three are taken, and JSON already at 21c (#1704).
+    for coltype in ('doc JSON', 'v VECTOR(3, FLOAT32)', 'flag BOOLEAN'):
+        _reject_unsupported_ddl_types(
+            f'CREATE TABLE t (id NUMBER, {coltype})', (23, 26)
+        )
+    _reject_unsupported_ddl_types('CREATE TABLE t (id NUMBER, doc JSON)', (21, 0))
+    _reject_unsupported_ddl_types('SELECT json_col FROM t WHERE flag = 1', (12, 1))
 
 
 def test_reject_create_domain_raises_ora_901() -> None:
@@ -4429,10 +4438,10 @@ def test_reject_create_domain_raises_ora_901() -> None:
     # skips on (#512). A domain-referencing CREATE TABLE is not itself a domain
     # definition and passes this check.
     with pytest.raises(BackendError) as exc:
-        _reject_unsupported_ddl_types('CREATE DOMAIN PYO_DOM_T AS NUMBER(3,0)')
+        _reject_unsupported_ddl_types('CREATE DOMAIN PYO_DOM_T AS NUMBER(3,0)', (12, 1))
     assert exc.value.ora_code == 901
     _reject_unsupported_ddl_types(
-        'CREATE TABLE t (id NUMBER, d NUMBER DOMAIN PYO_DOM_T)'
+        'CREATE TABLE t (id NUMBER, d NUMBER DOMAIN PYO_DOM_T)', (12, 1)
     )
 
 
@@ -5312,6 +5321,46 @@ def test_accounts_in_an_auth_database_are_out_of_sql_reach() -> None:
         for role in ('mirror_auth879', 'mirror_plain879'):
             admin.execute(f'DROP ROLE IF EXISTS {role}')
         admin.close()
+
+
+def test_the_presented_release_is_per_backend() -> None:
+    # A backend presents 12.1 or 23ai (#1704): its wire field version and
+    # identity, V$VERSION and DBMS_UTILITY.DB_VERSION follow it -- two sessions
+    # on one database each see their own -- and so do the types its DDL takes:
+    # BOOLEAN is refused at 12.1, as 12.1 refuses it, and taken at 23ai.
+    from seerdb.common.tns_consts import FIELD_VERSION_12_1, FIELD_VERSION_23_4
+    from seerdb.server import BackendError
+
+    with pytest.raises(ValueError):
+        PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='19c')
+    old = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    new = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        assert (old.field_version, new.field_version) == (
+            FIELD_VERSION_12_1,
+            FIELD_VERSION_23_4,
+        )
+        banner = 'SELECT banner FROM v$version WHERE ROWNUM = 1'
+        assert old.execute(banner).rows[0][0].startswith('Oracle Database 12c')
+        assert new.execute(banner).rows[0][0] == new.server_identity.banner.decode()
+        assert 'PL/SQL Release 23.26.2.0.0 - Production' in [
+            r[0] for r in new.execute('SELECT banner FROM v$version').rows
+        ]
+        with pytest.raises(BackendError) as exc:
+            old.execute('CREATE TABLE b1704 (b BOOLEAN)')
+        assert exc.value.ora_code == 902
+        new.execute('CREATE TABLE b1704 (n NUMBER, b BOOLEAN)')
+        new.execute('INSERT INTO b1704 VALUES (1, TRUE)')
+        assert new.execute('SELECT n FROM b1704 WHERE b').rows == [(1,)]
+    finally:
+        for backend in (old, new):
+            backend.rollback()
+        try:
+            new.execute('DROP TABLE b1704')
+        except BackendError:
+            new.rollback()
+        old.close()
+        new.close()
 
 
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
