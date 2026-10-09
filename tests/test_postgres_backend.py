@@ -2110,9 +2110,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # (#1415), sys.ora_float_round (#1422), sys.ora_numeric_div (#1598),
     # sys.ora_package_unusable (#1605), sys.ora_is_json's two (#1614) and
     # sys.ora_commit_request (#1630), sys.ora_rr_shift and the two
-    # sys.ora_rr_year (#1638), and sys.ora_plsql_call and sys.ora_ndf_to_null
-    # (#1612).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 79
+    # sys.ora_rr_year (#1638), sys.ora_plsql_call and sys.ora_ndf_to_null
+    # (#1612), and ora_boolean_number (#1705).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 80
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
@@ -5357,6 +5357,40 @@ def test_the_presented_release_is_per_backend() -> None:
             backend.rollback()
         try:
             new.execute('DROP TABLE b1704')
+        except BackendError:
+            new.rollback()
+        old.close()
+        new.close()
+
+
+def test_a_boolean_is_23ais_boolean_and_stores_as_a_number() -> None:
+    # Presenting 23ai, a boolean result describes as BOOLEAN and a bool bind
+    # into a NUMBER column stores 1 or 0, as 23ai converts it (#1705);
+    # presenting 12.1 it describes as the NUMBER 12.1 has.
+    from seerdb.common.tns_consts import TNS_TYPE_BOOLEAN, TNS_TYPE_NUMBER
+    from seerdb.server import BackendError
+
+    old = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    new = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        result = new.execute('SELECT NOT :1 FROM dual', [True])
+        assert result.columns[0].data_type == TNS_TYPE_BOOLEAN
+        assert result.rows == [(False,)]
+        assert old.execute('SELECT 1 = 1 FROM dual').columns[0].data_type == (
+            TNS_TYPE_NUMBER
+        )
+        new.execute('CREATE TABLE n1705 (n NUMBER(9), s VARCHAR2(10))')
+        new.execute('INSERT INTO n1705 VALUES (:1, :2)', [False, 'zero'])
+        new.execute('INSERT INTO n1705 VALUES (:1, :2)', [True, 'one'])
+        assert new.execute('SELECT n, s FROM n1705 ORDER BY n').rows == [
+            (0, 'zero'),
+            (1, 'one'),
+        ]
+    finally:
+        for backend in (old, new):
+            backend.rollback()
+        try:
+            new.execute('DROP TABLE n1705')
         except BackendError:
             new.rollback()
         old.close()
