@@ -41,6 +41,7 @@ from postgres_backend import (  # noqa: E402
     _bind_slots,
     _call_argument_error,
     _call_arguments,
+    _column_annotations,
     _computed_column_types,
     _declared_columns,
     _iot_primary_key,
@@ -5909,6 +5910,51 @@ def test_from_vector_and_vector_kinds() -> None:
             assert exc.value.ora_code == code
     finally:
         backend.rollback()
+        backend.close()
+
+
+def test_sql_domains_and_annotations() -> None:
+    # 23ai SQL domains and column annotations (#1711): a column's DOMAIN is its
+    # PostgreSQL type, the domain's constraints holding; its annotations go to
+    # sys.ora_annotations; the describe names both, as the client reads them.
+    from seerdb.server import BackendError
+
+    assert _column_annotations(
+        'create table t (a number, b number(3, 0) domain s.d '
+        "annotations (x 'one', \"Y\" 'it''s', z))"
+    ) == (
+        'create table t (a number, b s.d )',
+        ('t', {'b': [('X', 'one'), ('Y', "it's"), ('Z', '')]}),
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        backend.execute('CREATE DOMAIN d1711 AS NUMBER(3, 0) NOT NULL')
+        backend.execute(
+            'CREATE TABLE t1711 (id NUMBER(9), age NUMBER(3, 0) DOMAIN d1711 '
+            "ANNOTATIONS (Anno_1 'first annotation', Anno_3))"
+        )
+        backend.execute('INSERT INTO t1711 VALUES (1, 25)')
+        result = backend.execute('SELECT * FROM t1711')
+        assert [
+            (c.domain_schema, c.domain_name, c.annotations) for c in result.columns
+        ] == [
+            (b'', b'', ()),
+            (
+                b'PUBLIC',
+                b'D1711',
+                ((b'ANNO_1', b'first annotation'), (b'ANNO_3', b'')),
+            ),
+        ]
+        with pytest.raises(BackendError) as exc:
+            backend.execute('INSERT INTO t1711 VALUES (2, NULL)')
+        assert exc.value.ora_code == 1400
+    finally:
+        backend.rollback()
+        for statement in ('DROP TABLE t1711', 'DROP DOMAIN d1711'):
+            try:
+                backend.execute(statement)
+            except BackendError:
+                backend.rollback()
         backend.close()
 
 
