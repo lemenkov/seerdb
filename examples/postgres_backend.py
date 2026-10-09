@@ -4786,7 +4786,6 @@ def _translate_decode(sql: str) -> str:
 # An Oracle identifier may carry `#` (and `$`) after its first character:
 # serial#, statistic#, obj#. PostgreSQL takes `$` but not `#` (#1249).
 _HASH_IDENTIFIER = re.compile(r'[A-Za-z_][A-Za-z0-9_$#]*')
-_IDENTIFIER_CHAR = re.compile(r'[A-Za-z0-9_$#]')
 
 
 def _quote_hash_identifiers(sql: str) -> str:
@@ -4795,45 +4794,17 @@ def _quote_hash_identifiers(sql: str) -> str:
     and a column made as `obj#` reads back as OBJ# (#1249).
 
     String literals, quoted identifiers and comments are copied as they are, and
-    a bind name (`:x#`) is left to the bind rewrite.
+    a bind name (`:x#`) is left to the bind rewrite -- the shared tokenizer's
+    reading of each (#1693).
     """
     if '#' not in sql:
         return sql
     out: list[str] = []
-    i, n = 0, len(sql)
-    while i < n:
-        char = sql[i]
-        if char in ("'", '"'):
-            end = i + 1
-            while end < n:
-                if sql[end] == char:
-                    if end + 1 < n and sql[end + 1] == char:
-                        end += 2
-                        continue
-                    break
-                end += 1
-            out.append(sql[i : end + 1])
-            i = end + 1
-        elif sql.startswith('--', i):
-            end = sql.find('\n', i)
-            end = n if end < 0 else end
-            out.append(sql[i:end])
-            i = end
-        elif sql.startswith('/*', i):
-            end = sql.find('*/', i + 2)
-            end = n if end < 0 else end + 2
-            out.append(sql[i:end])
-            i = end
-        elif (match := _HASH_IDENTIFIER.match(sql, i)) and (
-            i == 0 or not _IDENTIFIER_CHAR.match(sql[i - 1])
-        ):
-            word = match.group()
-            quote = '#' in word and (i == 0 or sql[i - 1] != ':')
-            out.append(f'"{word.lower()}"' if quote else word)
-            i = match.end()
-        else:
-            out.append(char)
-            i += 1
+    for token in sql_tokens(sql):
+        text = sql[token.start : token.end]
+        if token.kind == 'word' and '#' in text:
+            text = f'"{text.lower()}"'
+        out.append(text)
     return ''.join(out)
 
 
@@ -4999,41 +4970,20 @@ _ROWNUM_AGGREGATES = re.compile(
 def _top_level_words(sql: str) -> tuple[list[tuple[int, str]], list[int]]:
     # (position, UPPER word) of every word outside parentheses, quotes and
     # comments, and the position of every ROWNUM outside quotes and comments at
-    # any depth.
+    # any depth -- the shared tokenizer's words and parentheses (#1693).
     words: list[tuple[int, str]] = []
     rownums: list[int] = []
-    depth, i, n = 0, 0, len(sql)
-    while i < n:
-        ch = sql[i]
-        if ch in '\'"':
-            end = sql.find(ch, i + 1)
-            while end != -1 and sql[end + 1 : end + 2] == ch:
-                end = sql.find(ch, end + 2)
-            i = n if end == -1 else end + 1
-        elif sql.startswith('--', i):
-            end = sql.find('\n', i)
-            i = n if end == -1 else end + 1
-        elif sql.startswith('/*', i):
-            end = sql.find('*/', i + 2)
-            i = n if end == -1 else end + 2
-        elif ch == '(':
-            depth += 1
-            i += 1
-        elif ch == ')':
-            depth -= 1
-            i += 1
-        elif ch.isalpha() or ch == '_':
-            j = i
-            while j < n and (sql[j].isalnum() or sql[j] in '_$#'):
-                j += 1
-            word = sql[i:j].upper()
+    depth = 0
+    for token in sql_tokens(sql):
+        if token.kind == 'other':
+            char = sql[token.start]
+            depth += 1 if char == '(' else -1 if char == ')' else 0
+        elif token.kind == 'word':
+            word = sql[token.start : token.end].upper()
             if word == 'ROWNUM':
-                rownums.append(i)
+                rownums.append(token.start)
             if depth == 0:
-                words.append((i, word))
-            i = j
-        else:
-            i += 1
+                words.append((token.start, word))
     return words, rownums
 
 
@@ -7111,65 +7061,49 @@ def _perform_bare_calls(body: str, routine_kind: Callable[[str], str | None]) ->
     procedure `CALL p(...)`, and the block failed to compile (#1533).
     ``routine_kind`` names what PostgreSQL has under a name -- 'f', 'p' or None --
     and a name it has nothing for is left as it was. Strings, comments and quoted
-    identifiers are skipped whole.
+    identifiers are skipped whole, as the shared tokenizer reads them (#1693).
     """
+    tokens = list(sql_tokens(body))
     out: list[str] = []
-    at, start = 0, True
-    while at < len(body):
-        char = body[at]
-        if char == "'":
-            end = at + 1
-            while end < len(body):
-                if body[end] == "'":
-                    if body[end + 1 : end + 2] == "'":
-                        end += 2
-                        continue
-                    break
-                end += 1
-            out.append(body[at : end + 1])
-            at, start = end + 1, False
-        elif body.startswith('--', at) or body.startswith('/*', at):
-            end = body.find('\n', at) if char == '-' else body.find('*/', at) + 1
-            end = len(body) - 1 if end < at else end
-            out.append(body[at : end + 1])
-            at = end + 1
-        elif char == '"':
-            end = body.find('"', at + 1)
-            end = len(body) - 1 if end < 0 else end
-            out.append(body[at : end + 1])
-            at, start = end + 1, False
-        elif char.isspace():
-            out.append(char)
-            at += 1
-        elif char == ';':
-            out.append(char)
-            at, start = at + 1, True
-        elif char.isalpha() or char == '_':
-            end = at
-            while end < len(body) and (body[end].isalnum() or body[end] in '_$#.'):
-                end += 1
-            word = body[at:end]
-            upper = word.upper()
-            rest = body[end:].lstrip()
-            if (
-                start
-                and upper not in _BLOCK_KEYWORDS
-                and upper not in _STATEMENT_OPENERS
-                and rest[:1] in ('(', ';')
-            ):
-                kind = routine_kind(word)
-                if kind == 'f':
-                    out.append('PERFORM ')
-                elif kind == 'p':
-                    out.append('CALL ')
-                if kind in ('f', 'p') and rest[:1] == ';':
-                    word += '()'
-            out.append(word)
-            at = end
-            start = upper in _STATEMENT_OPENERS
-        else:
-            out.append(char)
-            at, start = at + 1, False
+    (index, start) = (0, True)
+    while index < len(tokens):
+        token = tokens[index]
+        text = body[token.start : token.end]
+        index += 1
+        if token.kind in ('space', 'comment'):
+            out.append(text)  # neither starts nor ends a statement
+            continue
+        if token.kind != 'word':
+            out.append(text)
+            start = text == ';'
+            continue
+        # A name, dotted through as many parts as it has: pkg.proc.
+        end = token.end
+        while (
+            index + 1 < len(tokens)
+            and body[tokens[index].start : tokens[index].end] == '.'
+            and tokens[index + 1].kind == 'word'
+        ):
+            end = tokens[index + 1].end
+            index += 2
+        word = body[token.start : end]
+        upper = word.upper()
+        rest = body[end:].lstrip()
+        if (
+            start
+            and upper not in _BLOCK_KEYWORDS
+            and upper not in _STATEMENT_OPENERS
+            and rest[:1] in ('(', ';')
+        ):
+            kind = routine_kind(word)
+            if kind == 'f':
+                out.append('PERFORM ')
+            elif kind == 'p':
+                out.append('CALL ')
+            if kind in ('f', 'p') and rest[:1] == ';':
+                word += '()'
+        out.append(word)
+        start = upper in _STATEMENT_OPENERS
     return ''.join(out)
 
 
