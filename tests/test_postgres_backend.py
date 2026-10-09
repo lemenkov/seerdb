@@ -5758,6 +5758,84 @@ def test_sparse_vector_columns() -> None:
         backend.close()
 
 
+def test_binary_vector_columns() -> None:
+    # BINARY VECTOR columns (#1710) as varbit, each element a byte: back as
+    # array('B'), dimensions counted in bits, VECTOR_DISTANCE by the bits for
+    # every metric. The answers are 23ai's, measured: a count not a multiple
+    # of 8 ORA-51813, a wrong count ORA-51803, a byte out of range ORA-51806,
+    # a BINARY vector with one of another format ORA-51814 / ORA-51812.
+    import array
+
+    from seerdb.common.tns_consts import TNS_TYPE_VECTOR, VECTOR_FLAG_FLEXIBLE_DIM
+    from seerdb.server import BackendError
+
+    assert _translate_ddl(
+        'create table t (a vector(16, binary), b vector(*, binary))'
+    ) == ('create table t (a varbit CHECK (sys.ora_binary_dims(a, 16)), b varbit)')
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    if not backend._has_pgvector:
+        backend.close()
+        pytest.skip('the PostgreSQL bed has no pgvector')
+    try:
+        with pytest.raises(BackendError) as exc:
+            backend.execute('CREATE TABLE b1710 (v VECTOR(12, BINARY))')
+        assert exc.value.ora_code == 51813
+        backend.execute(
+            'CREATE TABLE b1710 (n NUMBER, v VECTOR(16, BINARY), fx VECTOR(*, BINARY), '
+            'f32 VECTOR(*, FLOAT32), flex VECTOR)'
+        )
+        value = array.array('B', [3, 255])
+        backend.execute(
+            'INSERT INTO b1710 VALUES (1, :1, :2, NULL, :3)',
+            [value, array.array('B', [1, 2, 3]), value],
+        )
+        backend.execute("INSERT INTO b1710 (n, v) VALUES (2, '[7, 8]')")
+        backend.execute('INSERT INTO b1710 (n, v) VALUES (3, :1)', ['[9, 10]'])
+        result = backend.execute('SELECT v, fx, flex FROM b1710 ORDER BY n')
+        assert [
+            (c.data_type, c.vector_dimensions, c.vector_format, c.vector_flags)
+            for c in result.columns
+        ] == [
+            (TNS_TYPE_VECTOR, 16, 5, 0),
+            (TNS_TYPE_VECTOR, 0, 5, VECTOR_FLAG_FLEXIBLE_DIM),
+            (TNS_TYPE_VECTOR, 0, 0, VECTOR_FLAG_FLEXIBLE_DIM),
+        ]
+        assert result.rows[0] == (value, array.array('B', [1, 2, 3]), value)
+        assert result.rows[0][0].typecode == 'B'
+        assert [r[0] for r in result.rows[1:]] == [
+            array.array('B', [7, 8]),
+            array.array('B', [9, 10]),
+        ]
+        other = array.array('B', [1, 255])
+        distances = backend.execute(
+            'SELECT VECTOR_DISTANCE(v, :1), VECTOR_DISTANCE(v, :1, HAMMING), '
+            'VECTOR_DISTANCE(v, :1, JACCARD), VECTOR_DISTANCE(v, :1, DOT), '
+            'VECTOR_DISTANCE(v, :1, EUCLIDEAN) FROM b1710 WHERE n = 1',
+            [other],
+        ).rows[0]
+        assert distances == pytest.approx((1 - 9 / 90**0.5, 1.0, 0.1, -9.0, 1.0))
+        (to_vector,) = backend.execute(
+            "SELECT TO_VECTOR('[3, 2, 3]', 24, BINARY) FROM dual"
+        ).rows[0]
+        assert to_vector == array.array('B', [3, 2, 3])
+        for sql, binds, code in (
+            ('INSERT INTO b1710 (v) VALUES (:1)', [array.array('B', [1])], 51803),
+            ("SELECT TO_VECTOR('[256]', 8, BINARY) FROM dual", [], 51806),
+            ('INSERT INTO b1710 (f32) VALUES (:1)', [value], 51814),
+            ("SELECT VECTOR_DISTANCE(v, TO_VECTOR('[1, 2]')) FROM b1710", [], 51812),
+        ):
+            with pytest.raises(BackendError) as exc:
+                backend.execute(sql, binds)
+            assert exc.value.ora_code == code
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE b1710')
+        except BackendError:
+            backend.rollback()
+        backend.close()
+
+
 def test_to_vector_and_vector_distance() -> None:
     # TO_VECTOR(text [, n [, format]]) and VECTOR_DISTANCE(a, b [, metric]) on
     # pgvector (#1708): a computed TO_VECTOR describes as its call says, a
@@ -5773,10 +5851,11 @@ def test_to_vector_and_vector_distance() -> None:
     from seerdb.server import BackendError
 
     assert _translate_vector_functions(
-        "select to_vector('[1]', *, int8), vector_distance(a, b) from t"
+        "select to_vector('[1]', *, int8), vector_distance(a, '[1]', dot) from t"
     ) == (
         "select sys.ora_to_vector('[1]', NULL, 'INT8'), "
-        '(CAST(a AS vector) <=> CAST(b AS vector)) from t'
+        "sys.ora_vector_distance(CAST(a AS ora_vector), sys.ora_to_vector('[1]'), 'DOT') "
+        'from t'
     )
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
     if not backend._has_pgvector:
