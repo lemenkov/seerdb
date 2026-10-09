@@ -2111,8 +2111,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # sys.ora_package_unusable (#1605), sys.ora_is_json's two (#1614) and
     # sys.ora_commit_request (#1630), sys.ora_rr_shift and the two
     # sys.ora_rr_year (#1638), sys.ora_plsql_call and sys.ora_ndf_to_null
-    # (#1612), and ora_boolean_number (#1705).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 80
+    # (#1612), ora_boolean_number (#1705), and the SQL/JSON helpers: the two
+    # sys.ora_json, six sys.ora_json_scalar and sys.ora_json_serialize (#1707).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 89
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
@@ -5428,8 +5429,11 @@ def test_json_columns_keep_osons_types_in_extended_form() -> None:
     assert extended['ym'] == {'$intervalYearMonth': 'P8Y4M'}
     back = _from_extended(extended)
     assert back['day'] == datetime.datetime(2022, 12, 5)  # a DATE, as OSON's
-    assert {k: v for k, v in back.items() if k != 'day'} == {
-        k: v for k, v in doc.items() if k != 'day'
+    # A WITH TIME ZONE value comes back naive in UTC, as a client decodes
+    # OSON's (#1707).
+    assert back['tz'] == datetime.datetime(2022, 12, 7, 22, 59, 15)
+    assert {k: v for k, v in back.items() if k not in ('day', 'tz')} == {
+        k: v for k, v in doc.items() if k not in ('day', 'tz')
     }
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
     try:
@@ -5521,6 +5525,63 @@ def test_an_oson_column_holds_the_document_and_hands_out_its_image() -> None:
         backend.rollback()
         try:
             backend.execute('DROP TABLE o1706')
+        except BackendError:
+            backend.rollback()
+        backend.close()
+
+
+def test_oracles_sql_json_over_jsonb() -> None:
+    # JSON(x [EXTENDED]), JSON_SCALAR, JSON_QUERY, JSON_EXISTS, JSON_SERIALIZE
+    # and dot notation into a JSON column, over jsonb (#1707). The answers are
+    # the ones python-oracledb's suite expects of 23ai.
+    import datetime
+
+    from seerdb.common.datatypes import JSON, IntervalYM
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        (doc,) = backend.execute(
+            """SELECT JSON('{"d": {"$oracleDate": "2022-12-05"}, """
+            """"f": {"$numberFloat": 38.75}, "l": {"$numberLong": 9}, """
+            """"z": {"$oracleTimestampTZ": "2022-12-07T22:59:15.1234Z"}}' """
+            'EXTENDED) FROM dual'
+        ).rows[0]
+        assert doc == {
+            'd': datetime.datetime(2022, 12, 5),
+            'f': 38.75,
+            'l': 9,
+            'z': datetime.datetime(2022, 12, 7, 22, 59, 15, 123400),
+        }
+        (ym,) = backend.execute(
+            "SELECT JSON(JSON_SCALAR(TO_YMINTERVAL('8-04'))) FROM dual"
+        ).rows[0]
+        assert ym == IntervalYM(8, 4)
+        backend.execute('CREATE TABLE f1707 (n NUMBER, j JSON)')
+        for n, value in enumerate(
+            [{'a': 12.5}, {'employees': ['John', 'Matthew']}, {'Permanent': True}]
+        ):
+            backend.execute('INSERT INTO f1707 VALUES (:1, :2)', [n, JSON(value)])
+        assert backend.execute(
+            'SELECT JSON_SERIALIZE(j) FROM f1707 ORDER BY n'
+        ).rows == [
+            ('{"a":12.5}',),
+            ('{"employees":["John","Matthew"]}',),
+            ('{"Permanent":true}',),
+        ]
+        assert backend.execute(
+            "SELECT COUNT(*) FROM f1707 WHERE JSON_EXISTS(j, '$.Permanent')"
+        ).rows == [(1,)]
+        assert backend.execute(
+            "SELECT JSON_QUERY(j, '$.employees') FROM f1707 WHERE n = 1"
+        ).rows == [(['John', 'Matthew'],)]
+        assert backend.execute(
+            'SELECT t.j.employees FROM f1707 t WHERE t.j.employees IS NOT NULL'
+        ).rows == [(['John', 'Matthew'],)]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE f1707')
         except BackendError:
             backend.rollback()
         backend.close()
