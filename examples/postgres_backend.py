@@ -6235,15 +6235,19 @@ _TYPE_DECLARATION = re.compile(
 def _blank_plsql(text: str) -> str:
     # `text` with each comment and string literal's contents blanked, the same
     # length, so a ; or a parenthesis inside one is not read as structure.
-    def blank(match: re.Match) -> str:
-        token = match.group()
-        if token.startswith("'"):
-            return "'" + ' ' * (len(token) - 2) + "'"
-        if token.startswith(('--', '/*')):
-            return ' ' * len(token)
-        return token
-
-    return _PLSQL_TOKEN.sub(blank, text)
+    out: list[str] = []
+    for token in sql_tokens(text):
+        piece = text[token.start : token.end]
+        if token.kind == 'comment':
+            piece = ' ' * len(piece)
+        elif token.kind == 'string':
+            # The prefix and the quotes stay, so it still reads as a literal.
+            opening = piece.index("'") + 1
+            closing = len(piece) if len(piece) > opening and piece.endswith("'") else 0
+            end = closing - 1 if closing else len(piece)
+            piece = piece[:opening] + ' ' * (end - opening) + piece[end:]
+        out.append(piece)
+    return ''.join(out)
 
 
 def _statement_end(blanked: str, pos: int) -> int | None:
@@ -7189,12 +7193,6 @@ def _translate_plsql_block(
     return f'DO $$ {declare}BEGIN {body.strip()} END $$'
 
 
-# The tokens of a PL/SQL text that matter to its block structure: a string
-# literal, a comment or a quoted identifier (skipped whole, so a keyword inside one
-# counts for nothing), or a word.
-_PLSQL_TOKEN = re.compile(
-    r"'(?:[^']|'')*'|--[^\n]*|/\*.*?\*/|\"[^\"]*\"|(\w+)", re.DOTALL
-)
 # A local function in a block's declarations: FUNCTION name [(params)] RETURN
 # type IS|AS, its own declarations up to BEGIN, then the body.
 _LOCAL_FUNCTION_HEAD = re.compile(
@@ -7203,12 +7201,18 @@ _LOCAL_FUNCTION_HEAD = re.compile(
 )
 
 
-def _words(text: str, start: int = 0):
+def _words(text: str, start: int = 0) -> Iterator[tuple[str, int, int]]:
     # (word upper-cased, start, end) for each word of `text` from `start`, past
-    # string literals, comments and quoted identifiers.
-    for match in _PLSQL_TOKEN.finditer(text, start):
-        if match.group(1) is not None:
-            yield match.group(1).upper(), match.start(), match.end()
+    # string literals, comments and quoted identifiers -- the shared
+    # tokenizer's words (#1693), so a keyword inside any of them counts for
+    # nothing, and `$` / `#` are part of a name as Oracle has them.
+    for token in sql_tokens(text[start:]):
+        (begin, end) = (start + token.start, start + token.end)
+        if token.kind == 'bind' and text[begin + 1 : begin + 2].isalpha():
+            begin += 1  # an unquoted bind's name is a word too, as it always was
+        elif token.kind != 'word':
+            continue
+        yield text[begin:end].upper(), begin, end
 
 
 def _block_end(text: str, begin: int) -> tuple[int, int] | None:
