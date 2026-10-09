@@ -3634,7 +3634,6 @@ class BindIntegration(_IntegrationBase):
         # named binds were refused: "missing bind value for :Z" (#1679).
         if self.conn.field_version < FIELD_VERSION_10_2:
             self.skipTest("alternative quoting (q'[...]') is 10g and later")
-        self._skip_if_mirror_backend('postgres', "read q'[...]' literals yet (#1692)")
         self.cur.execute("SELECT q'[it's :z]', :b /* :c */ FROM dual", {'b': 5})
         self.assertEqual(self.cur.fetchall(), [("it's :z", 5)])
 

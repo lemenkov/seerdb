@@ -43,7 +43,6 @@ from postgres_backend import (  # noqa: E402
     _call_arguments,
     _computed_column_types,
     _declared_columns,
-    _distinct_bind_refs,
     _iot_primary_key,
     _object_column_meta,
     _object_type_oid,
@@ -5069,10 +5068,45 @@ def test_parse_out_assignments_recognises_assignment_blocks() -> None:
     assert _parse_out_assignments('proc(:a, :b)') is None
 
 
-def test_distinct_bind_refs_first_appearance_order_skips_literals() -> None:
-    assert _distinct_bind_refs(':a := :b; :c := :a') == ['a', 'b', 'c']
+def test_bind_names_first_appearance_order_skips_literals() -> None:
+    from postgres_backend import _bind_names
+
+    assert _bind_names(':a := :b; :c := :a') == ['a', 'b', 'c']
     # A colon inside a string literal is not a bind ref.
-    assert _distinct_bind_refs("INSERT INTO t VALUES ('x :nope' || :v)") == ['v']
+    assert _bind_names("INSERT INTO t VALUES ('x :nope' || :v)") == ['v']
+
+
+def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
+    # #1692: a `:c` in a comment was counted as a bind, so every value after it
+    # shifted -- `:b` silently got the wrong one; an apostrophe in a comment
+    # opened a string that hid the binds after it; and PostgreSQL has no
+    # q'...' literals at all.
+    from postgres_backend import _bind_names, _plain_quoting, _replace_binds
+
+    sql = 'select 1 /* :c */ from t where x = :b'
+    assert _bind_names(sql) == ['b']
+    assert _translate_binds(sql, ['B'])[1] == {'b': 'B'}
+    sql = "select :a -- don't :c\n from t where x = :b"
+    assert _translate_binds(sql, [1, 2]) == (
+        "select %(a)s -- don't :c\n from t where x = %(b)s",
+        {'a': 1, 'b': 2},
+    )
+    assert _replace_binds("select :a /* it's */, ':b' from t", {'a': '1'}) == (
+        "select 1 /* it's */, ':b' from t"
+    )
+    assert _plain_quoting("select q'[it's :z]', NQ'!a'b!', 'q''x' from t") == (
+        "select 'it''s :z', N'a''b', 'q''x' from t"
+    )
+    assert _plain_quoting("select q'[open from t") == "select q'[open from t"
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        result = backend.execute(
+            "SELECT q'[it's :z]', :b /* :c */ FROM dual -- don't", [5]
+        )
+        assert [tuple(r) for r in result.rows] == [("it's :z", 5)]
+    finally:
+        backend.rollback()
+        backend.close()
 
 
 def test_dictionary_views_reflect_a_created_table() -> None:
