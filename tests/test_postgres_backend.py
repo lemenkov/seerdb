@@ -5479,6 +5479,53 @@ def test_storage_clauses_go_and_an_empty_lob_is_json_enough() -> None:
         backend.close()
 
 
+def test_an_oson_column_holds_the_document_and_hands_out_its_image() -> None:
+    # A BLOB with an IS JSON FORMAT OSON check is the ora_oson domain over
+    # jsonb (#1706): it takes JSON text, an OSON image as bytes or as a BLOB,
+    # or a JSON bind, and describes as a BLOB flagged OSON whose value is the
+    # document's OSON image.
+    from seerdb.common.datatypes import JSON
+    from seerdb.common.oson import decode_oson, encode_oson
+    from seerdb.common.tns_consts import TNS_TYPE_BLOB
+    from seerdb.server import BackendError
+    from seerdb.server.backend import BlobValue
+
+    assert 'ora_oson' in _translate_ddl(
+        'create table t (n number, o blob, constraint c check (o is json format oson))'
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        backend.execute(
+            'CREATE TABLE o1706 (n NUMBER, o BLOB, '
+            'CONSTRAINT o1706_ck CHECK (o IS JSON FORMAT OSON))'
+        )
+        backend.execute("""INSERT INTO o1706 VALUES (1, '{"id": 1}')""")
+        backend.execute(
+            'INSERT INTO o1706 (n, o) VALUES (2, :2)', [encode_oson({'id': 2})]
+        )
+        backend.execute(
+            'INSERT INTO o1706 VALUES (3, :1)', [BlobValue(encode_oson({'id': 3}))]
+        )
+        backend.execute('INSERT INTO o1706 VALUES (4, :1)', [JSON({'id': 4})])
+        backend.execute('UPDATE o1706 SET o = :1 WHERE n = 4', [encode_oson({'id': 5})])
+        result = backend.execute('SELECT n, o FROM o1706 ORDER BY n')
+        column = result.columns[1]
+        assert (column.data_type, column.is_oson) == (TNS_TYPE_BLOB, True)
+        assert [decode_oson(r[1]) for r in result.rows] == [
+            {'id': 1},
+            {'id': 2},
+            {'id': 3},
+            {'id': 5},
+        ]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE o1706')
+        except BackendError:
+            backend.rollback()
+        backend.close()
+
+
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
     # #1692: a `:c` in a comment was counted as a bind, so every value after it
     # shifted -- `:b` silently got the wrong one; an apostrophe in a comment
