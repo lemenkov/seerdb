@@ -11343,34 +11343,45 @@ class PostgresBackend:
 
     def _vector_text_literals(self, sql: str) -> str:
         """`sql` with each string literal an INSERT's VALUES or an UPDATE's SET
-        puts into a sparse VECTOR column -- '[4, [1, 3], [1.0, 2.0]]' -- or a
-        BINARY one -- '[7, 8]' -- typed as text (#1709, #1710): untyped,
-        PostgreSQL reads it in the storage's own syntax, record or bit string,
-        and only text's cast parses the vector."""
+        puts into a VECTOR column made the vector it spells (#1709, #1710,
+        #1742): untyped, PostgreSQL reads it in the storage's own syntax --
+        a record, a bit string, a float8[] / int2[] array. A sparse or BINARY
+        column's literal is typed as text, which casts to its storage; a dense
+        one's is TO_VECTOR's, whose composite casts to every dense storage, a
+        FLOAT64 or INT8 column's array among them."""
         if not self._has_pgvector or not self._has_column_catalog or "'" not in sql:
             return sql
+        kinds: dict[int, tuple[int | None, bool]] = {}
 
         def layout(table: str) -> tuple[list[str], Collection[int]] | None:
             found = self._vector_formats(table)
             if found is None:
                 return None
-            return (
-                found[0],
-                frozenset(
-                    i for i, (code, sparse) in found[1].items() if sparse or code == 5
-                ),
-            )
+            kinds.update(found[1])
+            return (found[0], frozenset(found[1]))
 
         (masked, contents, targets) = self._aimed_items(sql, layout)
-        ends = [
-            start + len(masked[start:stop].rstrip())
-            for (start, stop), _column in targets
+        spans = [
+            (
+                start + len(masked[start:stop]) - len(masked[start:stop].lstrip()),
+                start + len(masked[start:stop].rstrip()),
+                kinds.get(column, (None, False)),
+            )
+            for (start, stop), column in targets
             if _MASKED_LITERAL.fullmatch(masked[start:stop].strip())
         ]
-        if not ends:
+        if not spans:
             return sql
-        for end in sorted(ends, reverse=True):
-            masked = f'{masked[:end]}::text{masked[end:]}'
+        names = {code: name for name, code in _VECTOR_FORMATS.items()}
+        for begin, end, (code, sparse) in sorted(spans, reverse=True):
+            literal = masked[begin:end]
+            if sparse or code == 5:
+                typed = f'{literal}::text'
+            else:
+                # In the column's own format: FLOAT64 read exactly (#1742).
+                fmt = f"'{names[code]}'" if code in names else 'NULL'
+                typed = f'sys.ora_to_vector({literal}, NULL, {fmt})'
+            masked = masked[:begin] + typed + masked[end:]
         return _unmask_quoted(masked, contents)
 
     def _oson_binds(self, sql: str, binds: Sequence) -> Sequence:
