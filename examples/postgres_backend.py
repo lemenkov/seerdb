@@ -2399,12 +2399,17 @@ _DDL_FLOAT_COLUMN = re.compile(
     r'\b(?:FLOAT\b(?:\s*\(\s*\d+\s*\))?|REAL\b|DOUBLE\s+PRECISION\b)',
     re.IGNORECASE,
 )
+# The Oracle string types and the CHAR / BYTE length qualifier, rewritten in a
+# CREATE TABLE's columns and in a DML CAST alike.
+_CHAR_BYTE_LENGTH = re.compile(r'\(\s*(\d+)\s+(?:CHAR|BYTE)\s*\)', re.IGNORECASE)
+_NVARCHAR2_WORD = re.compile(r'\bNVARCHAR2\b', re.IGNORECASE)
+_VARCHAR2_WORD = re.compile(r'\bVARCHAR2\b', re.IGNORECASE)
 _DDL_TYPE_REWRITES = [
     # Oracle character-length semantics: VARCHAR2(20 CHAR) / CHAR(1 BYTE) — the
     # `CHAR` / `BYTE` length qualifier PostgreSQL has no syntax for; drop it so the
     # length maps to a plain varchar(n) / char(n) (#759, the reflection fixtures
     # declare columns this way).
-    (re.compile(r'\(\s*(\d+)\s+(?:CHAR|BYTE)\s*\)', re.IGNORECASE), r'(\1)'),
+    (_CHAR_BYTE_LENGTH, r'(\1)'),
     # SYS_REFCURSOR (a REF CURSOR OUT param) → PostgreSQL's refcursor (#518).
     (re.compile(r'\bSYS_REFCURSOR\b', re.IGNORECASE), 'refcursor'),
     # A `REF <object type>` column (#139): the type's companion `<type>$ref`
@@ -2465,8 +2470,8 @@ _DDL_TYPE_REWRITES = [
         re.compile(r'\bINTERVAL\s+YEAR(?:\s*\(\d+\))?\s+TO\s+MONTH\b', re.IGNORECASE),
         _INTERVALYM_TYPE,
     ),
-    (re.compile(r'\bNVARCHAR2\b', re.IGNORECASE), 'varchar'),
-    (re.compile(r'\bVARCHAR2\b', re.IGNORECASE), 'varchar'),
+    (_NVARCHAR2_WORD, 'varchar'),
+    (_VARCHAR2_WORD, 'varchar'),
     (re.compile(r'\bNCHAR\b', re.IGNORECASE), 'char'),
     # NUMBER(*) is a plain NUMBER and NUMBER(*, s) a NUMBER(38, s), as Oracle
     # reads them; PostgreSQL has no `*` precision (#1443).
@@ -4356,13 +4361,9 @@ _IDIOM_REWRITES: list[
     # and drop the CHAR/BYTE length qualifier here too. VARCHAR2 / NVARCHAR2 are
     # never valid identifiers, and the qualifier shape is specific, so this is safe
     # on any statement (a DDL CAST is already varchar by the time it reaches here).
-    ('cast-nvarchar2', re.compile(r'\bNVARCHAR2\b', re.IGNORECASE), 'varchar'),
-    ('cast-varchar2', re.compile(r'\bVARCHAR2\b', re.IGNORECASE), 'varchar'),
-    (
-        'char-byte-length',
-        re.compile(r'\(\s*(\d+)\s+(?:CHAR|BYTE)\s*\)', re.IGNORECASE),
-        r'(\1)',
-    ),
+    ('cast-nvarchar2', _NVARCHAR2_WORD, 'varchar'),
+    ('cast-varchar2', _VARCHAR2_WORD, 'varchar'),
+    ('char-byte-length', _CHAR_BYTE_LENGTH, r'(\1)'),
     # A CAST to an Oracle numeric or raw type in DML (CAST(:1 AS NUMBER(15))),
     # which PostgreSQL does not know (#1329). Anchored to `AS` and, for the types
     # that are not reserved words, to the cast's closing parenthesis, so an alias
@@ -4581,6 +4582,26 @@ def _translate_signed_year(sql: str) -> str:
     """
     if not _SIGNED_YEAR.search(sql):
         return sql
+
+    def rewrite(name: str, args: list[str], fmt: str) -> str | None:
+        if not _SIGNED_YEAR.search(fmt):
+            return None
+        inner = [_translate_signed_year(a) for a in args]
+        if name.lower() == 'to_char':
+            return f'ora_to_char_signed({inner[0]}, {fmt})'
+        parsed = _SIGNED_YEAR.sub('YYYY', fmt)
+        return f'{name}({", ".join([inner[0], parsed, *inner[2:]])})'
+
+    return _rewrite_format_calls(sql, rewrite, '_')
+
+
+def _rewrite_format_calls(
+    sql: str, rewrite: Callable[[str, list[str], str], str | None], not_after: str
+) -> str:
+    # `sql` with each TO_CHAR / TO_DATE / TO_TIMESTAMP call outside a string
+    # literal, whose format is a literal, replaced by what `rewrite(name, args,
+    # format)` makes of it; None leaves the call as it is. A call right after
+    # an alphanumeric character or one of `not_after` is part of another name.
     (out, pos) = ([], 0)
     in_string = False
     i = 0
@@ -4590,7 +4611,7 @@ def _translate_signed_year(sql: str) -> str:
             i += 1
             continue
         match = None if in_string else _SIGNED_YEAR_CALL.match(sql, i)
-        if match is None or (i and (sql[i - 1].isalnum() or sql[i - 1] == '_')):
+        if match is None or (i and (sql[i - 1].isalnum() or sql[i - 1] in not_after)):
             i += 1
             continue
         found = _call_args(sql, match.end() - 1)
@@ -4598,16 +4619,11 @@ def _translate_signed_year(sql: str) -> str:
             break
         (args, end) = found
         fmt = args[1].strip() if len(args) >= 2 else ''
-        if not (fmt.startswith("'") and fmt.endswith("'") and _SIGNED_YEAR.search(fmt)):
+        literal = fmt.startswith("'") and fmt.endswith("'")
+        call = rewrite(match.group(1), args, fmt) if literal else None
+        if call is None:
             i = match.end()
             continue
-        inner = [_translate_signed_year(a) for a in args]
-        name = match.group(1).lower()
-        if name == 'to_char':
-            call = f'ora_to_char_signed({inner[0]}, {fmt})'
-        else:
-            parsed = _SIGNED_YEAR.sub('YYYY', fmt)
-            call = f'{match.group(1)}({", ".join([inner[0], parsed, *inner[2:]])})'
         out.append(sql[pos:i])
         out.append(call)
         pos = i = end
@@ -4641,35 +4657,16 @@ def _translate_rr_year(sql: str) -> str:
     """
     if 'rr' not in sql.lower():
         return sql
-    (out, pos) = ([], 0)
-    in_string = False
-    i = 0
-    while i < len(sql):
-        if sql[i] == "'":
-            in_string = not in_string
-            i += 1
-            continue
-        match = None if in_string else _SIGNED_YEAR_CALL.match(sql, i)
-        if match is None or (i and (sql[i - 1].isalnum() or sql[i - 1] in '_.')):
-            i += 1
-            continue
-        found = _call_args(sql, match.end() - 1)
-        if found is None:
-            break
-        (args, end) = found
-        fmt = args[1].strip() if len(args) >= 2 else ''
-        literal = fmt.startswith("'") and fmt.endswith("'")
-        if not literal or _rr_format(fmt, True) == fmt:
-            i = match.end()
-            continue
+
+    def rewrite(name: str, args: list[str], fmt: str) -> str | None:
+        if _rr_format(fmt, True) == fmt:
+            return None
         inner = [_translate_rr_year(a) for a in args]
-        parsing = match.group(1).lower() != 'to_char'
-        call = f'{match.group(1)}({", ".join([inner[0], _rr_format(fmt, parsing), *inner[2:]])})'
-        out.append(sql[pos:i])
-        out.append(f'sys.ora_rr_year({call})' if parsing else call)
-        pos = i = end
-    out.append(sql[pos:])
-    return ''.join(out)
+        parsing = name.lower() != 'to_char'
+        call = f'{name}({", ".join([inner[0], _rr_format(fmt, parsing), *inner[2:]])})'
+        return f'sys.ora_rr_year({call})' if parsing else call
+
+    return _rewrite_format_calls(sql, rewrite, '_.')
 
 
 # DECODE(expr, search1, result1, ..., [default]) becomes a CASE (#822). orafce's
@@ -6095,7 +6092,6 @@ _PLSQL_CALL_MARK: Final = 'sys.ora_plsql_call() AS ora_plsql_call'
 _RAISES_NO_DATA_FOUND = re.compile(
     r'(?is)\bSELECT\b[^;]*?\bINTO\b|\$get\s*\(|\bRAISE\s+NO_DATA_FOUND\b'
 )
-_ROUTINE_NAME_WORD = re.compile(r'(?<![\w$#])[A-Za-z_][\w$#]*')
 
 
 def _guards_no_data_found(name: str, body: str, user_routines: frozenset[str]) -> bool:
@@ -6105,7 +6101,7 @@ def _guards_no_data_found(name: str, body: str, user_routines: frozenset[str]) -
     (masked, _contents) = _mask_quoted(body)
     if _RAISES_NO_DATA_FOUND.search(masked):
         return True
-    called = {w.lower() for w in _ROUTINE_NAME_WORD.findall(masked)}
+    called = {w.lower() for w in _IDENTIFIER.findall(masked)}
     own = name.lower().rpartition('.')[2]
     return own in called or not called.isdisjoint(user_routines)
 
