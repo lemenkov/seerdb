@@ -5587,6 +5587,77 @@ def test_oracles_sql_json_over_jsonb() -> None:
         backend.close()
 
 
+def test_vector_columns_on_pgvector() -> None:
+    # VECTOR columns (#1708): FLOAT32 on pgvector's vector, FLOAT64 / INT8 as
+    # float8[] / int2[], a flexible format in the ora_vector composite; each
+    # value back as the array.array of its format, the describe's dimensions
+    # and format the declaration's; a wrong count ORA-51803, an INT8 out of
+    # range ORA-51806, as 23ai raises them.
+    import array
+
+    from seerdb.common.tns_consts import TNS_TYPE_VECTOR, VECTOR_FLAG_FLEXIBLE_DIM
+    from seerdb.server import BackendError
+
+    assert _translate_ddl(
+        'create table t (a vector, b vector(2), c vector(*, int8), '
+        'd vector(16, float32), e vector(16, float64))'
+    ) == (
+        'create table t (a ora_vector, b ora_vector, c int2[], d vector(16), '
+        'e float8[] CHECK (sys.ora_vector_dims(e, 16)))'
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    if not backend._has_pgvector:
+        backend.close()
+        pytest.skip('the PostgreSQL bed has no pgvector')
+    try:
+        backend.execute(
+            'CREATE TABLE v1708 (n NUMBER, flex VECTOR, i8 VECTOR(*, INT8), '
+            'f32 VECTOR(3, FLOAT32), f64 VECTOR(3, FLOAT64))'
+        )
+        d = array.array('d', [1.0000001, -2.5, 3.25])
+        f = array.array('f', [1.5, 2.5, 3.5])
+        b = array.array('b', [-3, 0, 127])
+        backend.execute('INSERT INTO v1708 VALUES (1, :1, :2, :3, :4)', [d, b, f, d])
+        backend.execute('INSERT INTO v1708 (n, flex) VALUES (2, :1)', [b])
+        result = backend.execute('SELECT flex, i8, f32, f64 FROM v1708 ORDER BY n')
+        assert [
+            (c.data_type, c.vector_dimensions, c.vector_format, c.vector_flags)
+            for c in result.columns
+        ] == [
+            (TNS_TYPE_VECTOR, 0, 0, VECTOR_FLAG_FLEXIBLE_DIM),
+            (TNS_TYPE_VECTOR, 0, 4, VECTOR_FLAG_FLEXIBLE_DIM),
+            (TNS_TYPE_VECTOR, 3, 2, 0),
+            (TNS_TYPE_VECTOR, 3, 3, 0),
+        ]
+        (first, second) = result.rows
+        assert [(v.typecode, list(v)) for v in first] == [
+            ('d', list(d)),
+            ('b', list(b)),
+            ('f', list(f)),
+            ('d', list(d)),
+        ]
+        assert second[0] == b  # a flexible column keeps each value's format
+        (echo,) = backend.execute('SELECT :1 FROM dual', [b]).rows[0]
+        assert echo == b and echo.typecode == 'b'
+        for column, value, code in (
+            ('f32', array.array('f', [1.0] * 4), 51803),
+            ('f64', array.array('d', [1.0] * 2), 51803),
+            ('i8', array.array('f', [-130.0, 1.0]), 51806),
+        ):
+            with pytest.raises(BackendError) as exc:
+                backend.execute(
+                    f'INSERT INTO v1708 (n, {column}) VALUES (3, :1)', [value]
+                )
+            assert exc.value.ora_code == code
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE v1708')
+        except BackendError:
+            backend.rollback()
+        backend.close()
+
+
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
     # #1692: a `:c` in a comment was counted as a bind, so every value after it
     # shifted -- `:b` silently got the wrong one; an apostrophe in a comment

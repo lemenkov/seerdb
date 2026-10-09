@@ -144,6 +144,12 @@ honest edge of this adapter:
   ``auth_conninfo`` in a ``seerdb_auth.accounts`` table only that connection's
   role can read, which CREATE / ALTER / DROP USER and a password change keep
   (#879). A password is stored as it is; so is the launcher's.
+- **VECTOR on pgvector, where installed** (#1708) -- FLOAT32 is pgvector's
+  ``vector``, FLOAT64 and INT8 are ``float8[]`` / ``int2[]``, and a column of
+  flexible format keeps each value's format in a composite. A FLOAT32 column
+  holds at most pgvector's 16000 dimensions, where Oracle's holds 65535.
+  Without pgvector a VECTOR column is refused. Sparse and BINARY vectors are
+  not yet there.
 - **Privileges, for type lookup only** -- every Mirror user is the backend's
   one PostgreSQL role. A GRANT or REVOKE on an object is recorded
   (``sys.ora_grants``), and a user sees another user's type -- in ALL_TYPES,
@@ -207,6 +213,7 @@ honest edge of this adapter:
 
 from __future__ import annotations
 
+import array
 import datetime
 import decimal
 import functools
@@ -217,7 +224,7 @@ import select
 import struct
 import threading
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -297,6 +304,7 @@ from seerdb.common.tns_consts import (
     ORA_USER_NAME_CONFLICT,
     ORA_VALUE_LARGER_THAN_PRECISION,
     ORA_VALUE_TOO_LARGE_FOR_COLUMN,
+    ORA_VECTOR_DIMENSION_MISMATCH,
     TNS_TYPE_ADT,
     TNS_TYPE_BDOUBLE,
     TNS_TYPE_BFILE,
@@ -320,6 +328,8 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_TIMESTAMPLTZ,
     TNS_TYPE_TIMESTAMPTZ,
     TNS_TYPE_VARCHAR,
+    TNS_TYPE_VECTOR,
+    VECTOR_FLAG_FLEXIBLE_DIM,
 )
 from seerdb.server import (
     BackendError,
@@ -2406,6 +2416,9 @@ def _to_extended(value: object) -> object:
         return {'$intervalYearMonth': f'{sign}P{abs(value.years)}Y{abs(value.months)}M'}
     if isinstance(value, (bytes, bytearray, memoryview)):
         return {'$rawhex': bytes(value).hex().upper()}
+    if isinstance(value, array.array) and value.typecode in ('f', 'd', 'b'):
+        # A VECTOR inside a document (#1708): its format and elements.
+        return {'$vector': {'format': value.typecode, 'elements': list(value)}}
     raise TypeError(f'a {type(value).__name__} has no JSON form')
 
 
@@ -2454,6 +2467,13 @@ def _from_extended(value: object) -> object:
             if key == '$intervalYearMonth' and (m := _YEAR_MONTH.fullmatch(item)):
                 months = int(m.group(2) or 0) * 12 + int(m.group(3) or 0)
                 return IntervalYM(0, -months if m.group(1) else months)
+        if (
+            key == '$vector'
+            and isinstance(item, dict)
+            and item.get('format') in ('f', 'd', 'b')
+            and isinstance(item.get('elements'), list)
+        ):
+            return array.array(item['format'], item['elements'])
     return {key: _from_extended(item) for key, item in value.items()}
 
 
@@ -2464,6 +2484,41 @@ class _JsonDumper(psycopg.adapt.Dumper):
 
     def dump(self, obj: JSON) -> bytes:
         return json.dumps(_to_extended(obj.value)).encode('utf-8')
+
+
+# float8[] and int2[], the storage of a FLOAT64 / INT8 VECTOR column (#1708).
+_VECTOR_ARRAY_OIDS = frozenset({1022, 1005})
+
+
+def _vector_value(value: object, code: int | None) -> object:
+    # A stored VECTOR value as the array.array of its format (#1708): pgvector's
+    # text, a float8[] / int2[] list, or a flexible-format column's composite
+    # (format, elements), which carries its own.
+    if value is None:
+        return None
+    if isinstance(value, str):
+        elements = json.loads(value)
+    elif isinstance(value, list):
+        elements = value
+    else:
+        code = getattr(value, 'format', None) or code
+        elements = list(getattr(value, 'elements', None) or [])
+    typecode = _VECTOR_TYPECODES.get(code or 2, 'f')
+    if typecode == 'b':
+        return array.array(typecode, (int(v) for v in elements))
+    return array.array(typecode, (float(v) for v in elements))
+
+
+class _VectorDumper(psycopg.adapt.Dumper):
+    # A vector bind (#1708), an array.array, as the ora_vector composite --
+    # its format the array's typecode's -- whose oid each connection registers
+    # this under; assignment casts make it any VECTOR column's storage.
+    oid = 0
+
+    def dump(self, obj: array.array) -> bytes:
+        code = {'f': 2, 'd': 3, 'b': 4}.get(obj.typecode, 2)
+        elements = ','.join(repr(float(v)) for v in obj)
+        return f'({code},"{{{elements}}}")'.encode('utf-8')
 
 
 class _PortalNameDumper(psycopg.adapt.Dumper):
@@ -2618,7 +2673,110 @@ _DDL_FLOAT_COLUMN = re.compile(
 _CHAR_BYTE_LENGTH = re.compile(r'\(\s*(\d+)\s+(?:CHAR|BYTE)\s*\)', re.IGNORECASE)
 _NVARCHAR2_WORD = re.compile(r'\bNVARCHAR2\b', re.IGNORECASE)
 _VARCHAR2_WORD = re.compile(r'\bVARCHAR2\b', re.IGNORECASE)
-_DDL_TYPE_REWRITES = [
+# Oracle's VECTOR on pgvector (#1708, decided 2026-10-10): FLOAT32 is
+# pgvector's own `vector`, native and indexable; FLOAT64 and INT8, which it has
+# no element type for, are float8[] and smallint[]; a column of flexible format
+# keeps each value's format in the ora_vector composite. sys.ora_columns records
+# the declaration -- VECTOR, its dimensions and format -- which the describe
+# reads back whatever the storage. A sparse or BINARY vector is #1709 / #1710.
+_VECTOR_FORMATS = {'FLOAT32': 2, 'FLOAT64': 3, 'INT8': 4}
+_VECTOR_TYPECODES = {2: 'f', 3: 'd', 4: 'b'}
+_VECTOR_COMPOSITE = 'ora_vector'
+_VECTOR_DECLARED = re.compile(
+    r'\s*VECTOR\b(?:\s*\(\s*(\*|\d+)?\s*(?:,\s*(\*|FLOAT32|FLOAT64|INT8)\s*)?\))?'
+    r'(?!\s*\()',
+    re.IGNORECASE,
+)
+_VECTOR_COLUMN = re.compile(
+    r'([(,]\s*(?:"[^"]+"|[A-Za-z_][\w$#]*))\s+VECTOR\b'
+    r'(?:\s*\(\s*(\*|\d+)?\s*(?:,\s*(\*|FLOAT32|FLOAT64|INT8)\s*)?\))?(?!\s*,\s*SPARSE)',
+    re.IGNORECASE,
+)
+_VECTOR_DDL = (
+    f'DO $$ BEGIN CREATE TYPE {_VECTOR_COMPOSITE} AS (format smallint, elements float8[]); '
+    'EXCEPTION WHEN duplicate_object THEN NULL; END $$;'
+    # A FLOAT32 vector -- TO_VECTOR's, a pgvector literal -- stored into a
+    # FLOAT64, INT8 or flexible-format column.
+    'CREATE OR REPLACE FUNCTION sys.ora_vector_float8(vector) RETURNS float8[] '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::real[]::float8[] $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_vector_int2(vector) RETURNS smallint[] '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::real[]::smallint[] $$;'
+    f'CREATE OR REPLACE FUNCTION sys.ora_vector_flexible(vector) RETURNS {_VECTOR_COMPOSITE} '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT ROW(2, $1::real[]::float8[])'
+    f'::{_VECTOR_COMPOSITE} $$;'
+    'DO $$ BEGIN CREATE CAST (vector AS float8[]) WITH FUNCTION '
+    'sys.ora_vector_float8(vector) AS ASSIGNMENT; '
+    'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+    'DO $$ BEGIN CREATE CAST (vector AS smallint[]) WITH FUNCTION '
+    'sys.ora_vector_int2(vector) AS ASSIGNMENT; '
+    'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+    f'DO $$ BEGIN CREATE CAST (vector AS {_VECTOR_COMPOSITE}) WITH FUNCTION '
+    'sys.ora_vector_flexible(vector) AS ASSIGNMENT; '
+    'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+    # A vector bind -- the composite, its own format kept -- stored into a
+    # FLOAT32, FLOAT64 or INT8 column, or used where a vector is wanted.
+    f'CREATE OR REPLACE FUNCTION sys.ora_vector_float32({_VECTOR_COMPOSITE}) '
+    'RETURNS vector LANGUAGE sql IMMUTABLE STRICT AS '
+    '$$ SELECT ($1).elements::real[]::vector $$;'
+    f'CREATE OR REPLACE FUNCTION sys.ora_vector_float8({_VECTOR_COMPOSITE}) '
+    'RETURNS float8[] LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT ($1).elements $$;'
+    # An INT8 element outside -128..127 is refused, as Oracle refuses it.
+    f'CREATE OR REPLACE FUNCTION sys.ora_vector_int2({_VECTOR_COMPOSITE}) '
+    'RETURNS int2[] LANGUAGE plpgsql IMMUTABLE STRICT AS $$ DECLARE v float8; BEGIN '
+    'FOREACH v IN ARRAY ($1).elements LOOP IF v < -128 OR v > 127 THEN '
+    "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = format('ORA-51806: Vector "
+    'column is not properly formatted (dimension value %s is outside the allowed '
+    "precision range).', v); END IF; END LOOP; RETURN ($1).elements::int2[]; END $$;"
+    # A fixed-dimension FLOAT64 / INT8 column's check: its count, else ORA-51803.
+    'CREATE OR REPLACE FUNCTION sys.ora_vector_dims(anyarray, integer) RETURNS boolean '
+    'LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN IF $1 IS NOT NULL AND cardinality($1) <> $2 '
+    "THEN RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = format('ORA-51803: Vector "
+    'dimension count must match the dimension count specified in the column '
+    "definition (actual: %s, required: %s).', cardinality($1), $2); END IF; "
+    'RETURN true; END $$;'
+    + ''.join(
+        f'DO $$ BEGIN CREATE CAST ({_VECTOR_COMPOSITE} AS {target}) WITH FUNCTION '
+        f'sys.{function}({_VECTOR_COMPOSITE}) AS ASSIGNMENT; '
+        'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+        for target, function in (
+            ('vector', 'ora_vector_float32'),
+            ('float8[]', 'ora_vector_float8'),
+            ('int2[]', 'ora_vector_int2'),
+        )
+    )
+)
+
+
+_VECTOR_STAMP = 'seerdb vector ' + hashlib.sha256(_VECTOR_DDL.encode()).hexdigest()
+
+
+def _vector_declaration(
+    dims: str | None, fmt: str | None
+) -> tuple[int | None, int | None]:
+    # A VECTOR declaration's dimensions and format code, None where flexible.
+    count = int(dims) if dims and dims != '*' else None
+    code = _VECTOR_FORMATS.get(fmt.upper()) if fmt and fmt != '*' else None
+    return (count, code)
+
+
+def _vector_storage(m: re.Match[str]) -> str:
+    (count, code) = _vector_declaration(m.group(2), m.group(3))
+    if m.group(3) is None or m.group(3) == '*':
+        return f'{m.group(1)} {_VECTOR_COMPOSITE}'
+    if code == 2:
+        return f'{m.group(1)} vector' + (f'({count})' if count else '')
+    storage = 'float8[]' if code == 3 else 'int2[]'
+    if count is None:
+        return f'{m.group(1)} {storage}'
+    name = m.group(1).lstrip('(,').strip()
+    return f'{m.group(1)} {storage} CHECK (sys.ora_vector_dims({name}, {count}))'
+
+
+_DDL_TYPE_REWRITES: list[
+    tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]]
+] = [
+    # A VECTOR column (#1708), as its format's storage.
+    (_VECTOR_COLUMN, _vector_storage),
     # Oracle character-length semantics: VARCHAR2(20 CHAR) / CHAR(1 BYTE) — the
     # `CHAR` / `BYTE` length qualifier PostgreSQL has no syntax for; drop it so the
     # length maps to a plain varchar(n) / char(n) (#759, the reflection fixtures
@@ -3096,6 +3254,10 @@ def _declared_type(
     raw = _RAW_DECLARED.match(definition)
     if raw is not None:
         return ('RAW', int(raw.group(1)), None, None)
+    vector = _VECTOR_DECLARED.match(definition)
+    if vector is not None:
+        # Its dimensions and format code, None where flexible (#1708).
+        return ('VECTOR', *_vector_declaration(vector.group(1), vector.group(2)), None)
     long = _LONG_DECLARED.match(definition)
     if long is not None:
         # Oracle lists a LONG / LONG RAW column with data_length 0.
@@ -4219,8 +4381,8 @@ def _translate_ddl(sql: str) -> str:
     varray = _CREATE_TYPE_VARRAY.match(sql)
     if varray:
         name, bound, element = varray.groups()
-        for pattern, replacement in _DDL_TYPE_REWRITES:
-            element = pattern.sub(replacement, element)
+        for pattern, rewrite in _DDL_TYPE_REWRITES:
+            element = pattern.sub(rewrite, element)
         return (
             f'CREATE DOMAIN {name} AS {element}[] '
             f'CHECK (VALUE IS NULL OR array_length(VALUE, 1) <= {bound})'
@@ -4228,8 +4390,8 @@ def _translate_ddl(sql: str) -> str:
     nested = _CREATE_TYPE_TABLE_OF.match(sql)
     if nested:
         name, element = nested.groups()
-        for pattern, replacement in _DDL_TYPE_REWRITES:
-            element = pattern.sub(replacement, element)
+        for pattern, rewrite in _DDL_TYPE_REWRITES:
+            element = pattern.sub(rewrite, element)
         return f'CREATE DOMAIN {name} AS {element}[]' + _collection_constructors(
             name, element
         )
@@ -4247,8 +4409,8 @@ def _translate_ddl(sql: str) -> str:
         # precision, numeric as a table's column is (#1384, #1423); before the
         # type rewrites, which make BINARY_FLOAT a real.
         out = _DDL_FLOAT_COLUMN.sub('numeric', out)
-        for pattern, replacement in _DDL_TYPE_REWRITES:
-            out = pattern.sub(replacement, out)
+        for pattern, rewrite in _DDL_TYPE_REWRITES:
+            out = pattern.sub(rewrite, out)
         named = _TYPE_NAME_OF_CREATE.match(sql)
         if named is None:
             return out
@@ -8034,6 +8196,10 @@ def _plsql_compile_error(
     )
 
 
+# pgvector refusing a FLOAT32 vector of the wrong size (#1708).
+_PGVECTOR_DIMENSIONS = re.compile(r'expected (\d+) dimensions, not (\d+)')
+
+
 def _backend_error(
     exc,
     *,
@@ -8068,6 +8234,15 @@ def _backend_error(
     ):
         # A ROWID column's text that reads as no rowid (#1624).
         return BackendError('invalid ROWID', ora_code=ORA_INVALID_ROWID)
+    vector = _PGVECTOR_DIMENSIONS.match(_primary_message(exc))
+    if vector is not None:
+        # pgvector's own count check of a FLOAT32 column (#1708).
+        return BackendError(
+            'Vector dimension count must match the dimension count specified in '
+            f'the column definition (actual: {vector.group(2)}, required: '
+            f'{vector.group(1)}).',
+            ora_code=ORA_VECTOR_DIMENSION_MISMATCH,
+        )
     application = _application_error(exc)
     if application is not None:
         # The user's own text, which the Mirror prefixes with the code.
@@ -8839,14 +9014,49 @@ class PostgresBackend:
             self._conn.rollback()
         # pgvector, which Oracle's VECTOR types map onto (#1708), where it is
         # installed; without it a VECTOR column is refused, as before.
-        # Under a savepoint, so a server without it keeps orafce.
+        # Under a savepoint, so a server without it keeps orafce. Its `vector`
+        # type, and the ora_vector composite of a flexible-format column, are
+        # what a VECTOR value reads back as (#1708).
         self._has_pgvector = False
+        self._vector_oid: int | None = None
+        self._vector_composite_oid: int | None = None
         try:
             with self._conn.transaction():
                 self._conn.execute('CREATE EXTENSION IF NOT EXISTS vector')
-            self._has_pgvector = True
+                # Its helpers live in sys, which a new database does not have
+                # yet at this point of the setup; and are made once, not by
+                # every session -- sessions starting together raced on them.
+                self._conn.execute('CREATE SCHEMA IF NOT EXISTS sys')
+                # Stamped, as the dictionary is, so a changed one is installed
+                # again and an unchanged one is not.
+                stamp = self._conn.execute(
+                    'SELECT obj_description(to_regtype(%s), %s)',
+                    (_VECTOR_COMPOSITE, 'pg_type'),
+                ).fetchone()
+                if stamp is None or stamp[0] != _VECTOR_STAMP:
+                    self._conn.execute(_VECTOR_DDL)
+                    self._conn.execute(
+                        f"COMMENT ON TYPE {_VECTOR_COMPOSITE} IS '{_VECTOR_STAMP}'"
+                    )
         except psycopg.Error:
             pass
+        # What this session has, whichever session's setup made it.
+        row = self._conn.execute(
+            "SELECT to_regtype('vector')::oid, to_regtype(%s)::oid",
+            (_VECTOR_COMPOSITE,),
+        ).fetchone()
+        if row is not None and row[0] is not None and row[1] is not None:
+            composite = CompositeInfo.fetch(self._conn, _VECTOR_COMPOSITE)
+            if composite is not None:
+                register_composite(composite, self._conn)
+                (self._vector_oid, self._vector_composite_oid) = (row[0], row[1])
+                self._has_pgvector = True
+                # A vector bind is the composite: its format travels with it,
+                # and an assignment cast makes it any VECTOR column's storage.
+                self._conn.adapters.register_dumper(
+                    array.array,
+                    type('_VectorBindDumper', (_VectorDumper,), {'oid': row[1]}),
+                )
         # The Oracle data dictionary (#759) lives in a dedicated `sys` schema —
         # like Oracle's SYS — so its views are never reflected as user objects.
         try:
@@ -9586,6 +9796,15 @@ class PostgresBackend:
         # advertises (JSON/VECTOR/BOOLEAN), so the suite's version guards skip
         # rather than the backend mis-representing them (#504).
         _reject_unsupported_ddl_types(sql, self._release)
+        if (
+            not self._has_pgvector
+            and _IS_CREATE_TABLE.match(sql)
+            and _VECTOR_COLUMN.search(sql)
+        ):
+            raise BackendError(
+                'invalid datatype: VECTOR needs the pgvector extension',
+                ora_code=ORA_INVALID_DATATYPE,
+            )
         # Register / forget an index-organized table, and render ROWID on one from
         # its primary key before the generic rewrite turns ROWID into ctid.
         iot = _iot_primary_key(sql)
@@ -10020,44 +10239,68 @@ class PostgresBackend:
             )
         return self._oson_layout_cache[key]
 
-    def _oson_binds(self, sql: str, binds: Sequence) -> Sequence:
-        """`binds` with each one an INSERT's VALUES or an UPDATE's SET aims at an
-        OSON column decoded from the OSON image a client sends -- plain bytes or
-        a BLOB -- into the document the column holds (#1706). JSON text, and a
-        JSON bind, go in as they are. Any other statement's binds are unchanged.
-        """
-        if not binds or not self._has_oson_columns():
-            return binds
+    def _vector_column(
+        self, pgresult, index: int, oid: int
+    ) -> tuple[int | None, int | None] | None:
+        # A result column's VECTOR (dimensions, format), each None where
+        # flexible, else None (#1708): a table column recorded as VECTOR, else a
+        # pgvector value -- FLOAT32, its dimensions its typmod's -- or a
+        # flexible-format one.
+        if not self._has_pgvector:
+            return None
+        if (
+            oid in (self._vector_oid, self._vector_composite_oid)
+            or oid in _VECTOR_ARRAY_OIDS
+        ):
+            declared = self._declared_column_types(pgresult, [index]).get(index)
+            if declared is not None and declared[0] == 'VECTOR':
+                return (declared[1], declared[2])
+        if oid == self._vector_oid:
+            typmod = pgresult.fmod(index)
+            return (typmod if typmod > 0 else None, 2)
+        if oid == self._vector_composite_oid:
+            return (None, None)
+        return None
+
+    def _aimed_binds(
+        self,
+        sql: str,
+        layout: Callable[[str], tuple[list[str], Collection[int]] | None],
+    ) -> dict[str, int]:
+        """The binds an INSERT's VALUES or an UPDATE's SET puts straight into a
+        column `layout` picks out: each bind's name to its column's position in
+        the table, `layout(table)` naming the table's columns in order and the
+        positions it cares about (#1706, #1708). Empty for any other statement."""
         (masked, contents) = _mask_quoted(sql)
-        targets: list[tuple[int, int]] = []
+        targets: list[tuple[tuple[int, int], int]] = []
         insert = _INSERT_VALUES_HEAD.match(masked)
         update = _UPDATE_SET_HEAD.match(masked)
         if insert is not None:
-            layout = self._oson_layout(_unmask_quoted(insert.group(1), contents))
-            if layout is None or not layout[1]:
-                return binds
-            (names, oson) = layout
-            positions: set[int] | frozenset[int] = oson
+            found = layout(_unmask_quoted(insert.group(1), contents))
+            if found is None or not found[1]:
+                return {}
+            (names, picked) = found
+            columns = list(range(len(names)))
             if insert.group(2) is not None:
                 listed = [
                     _pg_identifier(_unmask_quoted(c, contents))
                     for c in insert.group(2).split(',')
                 ]
-                positions = {
-                    i
-                    for i, column in enumerate(listed)
-                    if column in names and names.index(column) in oson
-                }
+                columns = [names.index(c) if c in names else -1 for c in listed]
             open_at = insert.end() - 1
             items = _top_level_items(
                 masked, open_at + 1, _matching_paren(masked, open_at)
             )
-            targets = [items[i] for i in positions if i < len(items)]
+            targets = [
+                (items[i], column)
+                for i, column in enumerate(columns)
+                if column in picked and i < len(items)
+            ]
         elif update is not None:
-            layout = self._oson_layout(_unmask_quoted(update.group(1), contents))
-            if layout is None or not layout[1]:
-                return binds
-            (names, oson) = layout
+            found = layout(_unmask_quoted(update.group(1), contents))
+            if found is None or not found[1]:
+                return {}
+            (names, picked) = found
             words, _rownums = _top_level_words(masked)
             end = next(
                 (
@@ -10070,14 +10313,23 @@ class PostgresBackend:
             for start, stop in _top_level_items(masked, update.end(), end):
                 equals = masked.find('=', start, stop)
                 column = _pg_identifier(_unmask_quoted(masked[start:equals], contents))
-                if equals >= 0 and column in names and names.index(column) in oson:
-                    targets.append((equals + 1, stop))
-        aimed = {
-            name
-            for start, stop in targets
+                if equals >= 0 and column in names and names.index(column) in picked:
+                    targets.append(((equals + 1, stop), names.index(column)))
+        return {
+            _bind_name(match): column
+            for (start, stop), column in targets
             if (match := _BIND_REF.fullmatch(masked[start:stop].strip())) is not None
-            for name in (_bind_name(match),)
         }
+
+    def _oson_binds(self, sql: str, binds: Sequence) -> Sequence:
+        """`binds` with each one an INSERT's VALUES or an UPDATE's SET aims at an
+        OSON column decoded from the OSON image a client sends -- plain bytes or
+        a BLOB -- into the document the column holds (#1706). JSON text, and a
+        JSON bind, go in as they are. Any other statement's binds are unchanged.
+        """
+        if not binds or not self._has_oson_columns():
+            return binds
+        aimed = self._aimed_binds(sql, self._oson_layout)
         if not aimed:
             return binds
         out = list(binds)
@@ -10742,6 +10994,28 @@ class PostgresBackend:
                 columns.append(_intervalym_column_meta(desc.name))
             elif domain == TNS_TYPE_DATE:
                 columns.append(_date_column_meta(desc.name))
+            elif (
+                vector := self._vector_column(cursor.pgresult, i, desc.type_code)
+            ) is not None:
+                # A VECTOR (#1708): its declared dimensions and format -- a
+                # flexible one 0, any dimensions flagged -- each value an
+                # array.array of its format, which the core encodes.
+                (count, code) = vector
+                for row in rows:
+                    row[i] = _vector_value(row[i], code)
+                columns.append(
+                    ColumnMeta(
+                        name=_oracle_column_name(desc.name).encode('utf-8'),
+                        data_type=TNS_TYPE_VECTOR,
+                        data_length=0,
+                        max_size=0,
+                        charset=0,
+                        csfrm=0,
+                        vector_dimensions=count or 0,
+                        vector_format=code or 0,
+                        vector_flags=0 if count else VECTOR_FLAG_FLEXIBLE_DIM,
+                    )
+                )
             elif (
                 desc.type_code not in _BUILTIN_OIDS
                 and (target := self._ref_target(desc.type_code)) is not None
