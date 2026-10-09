@@ -259,6 +259,7 @@ from seerdb.common.tns_consts import (
     AL16UTF16_CHARSET,
     AL32UTF8_CHARSET,
     FIELD_VERSION_12_1,
+    FIELD_VERSION_23_4,
     ORA_CANNOT_INSERT_NULL,
     ORA_CANNOT_KILL_CURRENT_SESSION,
     ORA_CASCADE_REQUIRED,
@@ -333,7 +334,7 @@ from seerdb.server import (
     stats,
 )
 from seerdb.server.backend import BlobValue, SessionInfo, TypeDescription
-from seerdb.server.identity import IDENTITY_12_1
+from seerdb.server.identity import IDENTITY_12_1, IDENTITY_23, ServerIdentity
 
 # The PostgreSQL composite type that backs Oracle's TIMESTAMP WITH TIME ZONE
 # (#519). A native timestamptz stores UTC and hands the value back in the session
@@ -1075,15 +1076,24 @@ def _banner_release(banner: bytes) -> str:
     return found.group(1).decode()
 
 
-_PRESENTED_RELEASE = _banner_release(IDENTITY_12_1.banner)
+# What a Mirror-over-PG can present (#1704): the wire field version and the
+# server identity for each. 12.1 is the default; 23ai is the one the 23ai
+# types need (mirror-pg-23ai-types).
+_PRESENTABLE: dict[str, tuple[int, ServerIdentity]] = {
+    '12.1': (FIELD_VERSION_12_1, IDENTITY_12_1),
+    '23ai': (FIELD_VERSION_23_4, IDENTITY_23),
+}
+# The presented release, as the session's settings carry it, so the one
+# dictionary serves whichever release a session presents (#1704).
+_RELEASE_SETTING = "current_setting('seerdb.release')"
 _V_VERSION_DDL = (
     'CREATE OR REPLACE VIEW sys."v$version" AS SELECT banner, 0::numeric AS con_id '
     'FROM (VALUES '
-    f"(1, '{IDENTITY_12_1.banner.decode()}'), "
-    f"(2, 'PL/SQL Release {_PRESENTED_RELEASE} - Production'), "
-    f"(3, 'CORE' || chr(9) || '{_PRESENTED_RELEASE}' || chr(9) || 'Production'), "
-    f"(4, 'TNS for Linux: Version {_PRESENTED_RELEASE} - Production'), "
-    f"(5, 'NLSRTL Version {_PRESENTED_RELEASE} - Production')) "
+    "(1, current_setting('seerdb.banner')), "
+    f"(2, 'PL/SQL Release ' || {_RELEASE_SETTING} || ' - Production'), "
+    f"(3, 'CORE' || chr(9) || {_RELEASE_SETTING} || chr(9) || 'Production'), "
+    f"(4, 'TNS for Linux: Version ' || {_RELEASE_SETTING} || ' - Production'), "
+    f"(5, 'NLSRTL Version ' || {_RELEASE_SETTING} || ' - Production')) "
     'AS v(n, banner) ORDER BY n;'
 )
 
@@ -1096,7 +1106,8 @@ CREATE OR REPLACE FUNCTION dbms_utility.format_error_backtrace() RETURNS text
 CREATE OR REPLACE PROCEDURE dbms_utility.db_version(
     INOUT version text, INOUT compatibility text)
   LANGUAGE plpgsql AS $$ BEGIN
-    version := '12.1.0.2.0'; compatibility := '12.1.0.0.0';
+    version := current_setting('seerdb.release');
+    compatibility := current_setting('seerdb.compatibility');
   END $$;
 """
 
@@ -5983,7 +5994,11 @@ _IS_JSON_PREDICATE = re.compile(
 _IS_CREATE_DOMAIN = re.compile(r'\s*CREATE\s+DOMAIN\b', re.IGNORECASE)
 
 
-def _reject_unsupported_ddl_types(sql: str) -> None:
+def _reject_unsupported_ddl_types(sql: str, release: tuple[int, int]) -> None:
+    # What the presented release has not got (#1704): SQL domains and the
+    # VECTOR and BOOLEAN types are 23ai's, the JSON type 21c's.
+    if release >= (23, 0):
+        return
     if _IS_CREATE_DOMAIN.match(sql):
         raise BackendError(
             'invalid CREATE command: SQL domains need a 23ai server',
@@ -5992,7 +6007,9 @@ def _reject_unsupported_ddl_types(sql: str) -> None:
     if not _IS_CREATE_TABLE.match(sql):
         return
     match = _ORACLE_ONLY_DDL_TYPES.search(_IS_JSON_PREDICATE.sub(' ', sql))
-    if match is not None:
+    if match is not None and not (
+        match.group(1).upper() == 'JSON' and release >= (21, 0)
+    ):
         raise BackendError(
             f'invalid datatype: {match.group(1).upper()} is not available on '
             f'this server version',
@@ -8442,8 +8459,28 @@ class PostgresBackend:
         credentials: Credentials | None = None,
         translation_report: bool = False,
         auth_conninfo: str | None = None,
+        presents: str = '12.1',
     ) -> None:
+        if presents not in _PRESENTABLE:
+            raise ValueError(
+                f'presents must be one of {", ".join(_PRESENTABLE)}, not {presents!r}'
+            )
+        # The release this backend presents (#1704): its own wire field version
+        # and identity, which the Mirror reads off it per session.
+        (self.field_version, self.server_identity) = _PRESENTABLE[presents]
+        release = _banner_release(self.server_identity.banner)
+        (major, minor) = (int(part) for part in release.split('.')[:2])
+        self._release = (major, minor)
         self._conn = psycopg.connect(conninfo)
+        # V$VERSION and DBMS_UTILITY.DB_VERSION read the presented release from
+        # the session (#1704), so the shared dictionary serves either release.
+        for setting, value in (
+            ('seerdb.release', release),
+            ('seerdb.banner', self.server_identity.banner.decode()),
+            ('seerdb.compatibility', f'{major}.{minor if major < 18 else 0}.0.0.0'),
+        ):
+            self._conn.execute('SELECT set_config(%s, %s, false)', (setting, value))
+        self._conn.commit()
         # The translation report (#1557): whether it is on, the runs it has not
         # written yet, and its own autocommit connection, opened when it first
         # writes -- so writing it never joins, ends or aborts the client's
@@ -9254,7 +9291,7 @@ class PostgresBackend:
         # Reject the column types that are Oracle-only for the version the Mirror
         # advertises (JSON/VECTOR/BOOLEAN), so the suite's version guards skip
         # rather than the backend mis-representing them (#504).
-        _reject_unsupported_ddl_types(sql)
+        _reject_unsupported_ddl_types(sql, self._release)
         # Register / forget an index-organized table, and render ROWID on one from
         # its primary key before the generic rewrite turns ROWID into ctid.
         iot = _iot_primary_key(sql)
