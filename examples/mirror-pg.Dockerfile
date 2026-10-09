@@ -5,19 +5,22 @@
 # backend leans on for Oracle-compatible SQL functions (nvl, decode, to_char /
 # to_date, add_months, instr, …). The Alpine `postgresql-orafce` package targets
 # Alpine's own PostgreSQL major, which differs from the official image's, so
-# orafce is built from source against this image's server (PGXS).
+# orafce is built from source against this image's server (PGXS). So is
+# pgvector, which Oracle's VECTOR types map onto (#1708).
 #
 #   podman build -f examples/mirror-pg.Dockerfile -t mirror-pg .
 #   podman run -d --name mirror-pg -p 5433:5432 \
 #       -e POSTGRES_USER=pyo -e POSTGRES_PASSWORD=pyo123 -e POSTGRES_DB=mirror \
 #       mirror-pg
 #
-# The PostgresBackend runs `CREATE EXTENSION IF NOT EXISTS orafce` and puts the
-# `oracle` schema on the search_path itself, so no further setup is needed.
+# The PostgresBackend runs `CREATE EXTENSION IF NOT EXISTS orafce` (and `vector`
+# where it is installed) and puts the `oracle` schema on the search_path itself,
+# so no further setup is needed.
 
 FROM postgres:16-alpine
 
 ARG ORAFCE_VERSION=VERSION_4_16_7
+ARG PGVECTOR_VERSION=v0.8.0
 
 RUN set -eux; \
     apk add --no-cache --virtual .orafce-build \
@@ -30,3 +33,14 @@ RUN set -eux; \
     make USE_PGXS=1 with_llvm=no install; \
     cd /; rm -rf /tmp/orafce /tmp/orafce.tar.gz; \
     apk del .orafce-build
+
+RUN set -eux; \
+    apk add --no-cache --virtual .pgvector-build build-base curl; \
+    curl -fsSL -o /tmp/pgvector.tar.gz \
+        "https://github.com/pgvector/pgvector/archive/refs/tags/${PGVECTOR_VERSION}.tar.gz"; \
+    mkdir -p /tmp/pgvector && tar xzf /tmp/pgvector.tar.gz -C /tmp/pgvector --strip-components=1; \
+    cd /tmp/pgvector; \
+    make USE_PGXS=1 with_llvm=no OPTFLAGS=""; \
+    make USE_PGXS=1 with_llvm=no install; \
+    cd /; rm -rf /tmp/pgvector /tmp/pgvector.tar.gz; \
+    apk del .pgvector-build
