@@ -5619,28 +5619,33 @@ def _mask_quoted(sql: str) -> tuple[str, list[str]]:
     # `sql` with each string literal's and quoted identifier's contents replaced
     # by a numbered mask, and the contents in mask order. The quotes stay, so a
     # rewrite still sees that a literal or an identifier is there; comments are
-    # left as they are, an apostrophe in one opening nothing.
+    # left as they are, an apostrophe in one opening nothing. The spans are the
+    # shared tokenizer's (#1693): a literal's N or q prefix stays outside its
+    # mask, and a quoted bind name is masked as the identifier it is spelled as.
     out: list[str] = []
     contents: list[str] = []
-    i, n = 0, len(sql)
-    while i < n:
-        if sql.startswith('--', i) or sql.startswith('/*', i):
-            end = sql.find('\n' if sql[i] == '-' else '*/', i + 2)
-            end = n if end < 0 else end + (1 if sql[i] == '-' else 2)
-            out.append(sql[i:end])
-            i = end
-            continue
-        quote = sql[i]
-        if quote not in ("'", '"'):
-            out.append(quote)
-            i += 1
-            continue
-        j = i + 1
-        while j < n and not (sql[j] == quote and sql[j + 1 : j + 2] != quote):
-            j += 2 if sql[j] == quote else 1
-        out.append(f'{quote}\x00{len(contents)}\x00{quote}')
-        contents.append(sql[i + 1 : j])
-        i = j + 1
+
+    def mask(text: str, opening: int, closing: int) -> None:
+        # `text` with all but its first `opening` and last `closing` characters
+        # masked.
+        out.append(text[:opening])
+        out.append(f'\x00{len(contents)}\x00')
+        contents.append(text[opening : len(text) - closing])
+        out.append(text[len(text) - closing :])
+
+    for token in sql_tokens(sql):
+        text = sql[token.start : token.end]
+        if token.kind == 'string':
+            opening = text.index("'") + 1
+            closed = len(text) > opening and text.endswith("'")
+            mask(text, opening, 1 if closed else 0)
+        elif token.kind == 'identifier':
+            closed = len(text) > 1 and text.endswith('"')
+            mask(text, 1, 1 if closed else 0)
+        elif token.kind == 'bind' and text.endswith('"'):
+            mask(text, text.index('"') + 1, 1)
+        else:
+            out.append(text)
     return ''.join(out), contents
 
 

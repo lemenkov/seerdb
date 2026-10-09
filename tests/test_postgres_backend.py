@@ -5076,6 +5076,30 @@ def test_bind_names_first_appearance_order_skips_literals() -> None:
     assert _bind_names("INSERT INTO t VALUES ('x :nope' || :v)") == ['v']
 
 
+def test_masking_reads_the_text_as_the_tokenizer_does() -> None:
+    # _mask_quoted on the shared tokenizer (#1693): the mask always gives the
+    # text back exactly -- an unterminated literal used to gain a closing
+    # quote it never had -- a q-literal is masked whole, prefix outside, and a
+    # quoted bind name is masked as an identifier.
+    from postgres_backend import _mask_quoted, _unmask_quoted
+
+    for sql in (
+        "VALUES (1, 'open",
+        'SELECT "open',
+        "SELECT q'[it's :z]', NQ'!a'b!' FROM t -- don't",
+        "x := 'a' /* 'b */ || :\"q x\" || N'n'",
+    ):
+        assert _unmask_quoted(*_mask_quoted(sql)) == sql
+    assert _mask_quoted("SELECT q'[it's]' -- don't") == (
+        "SELECT q'\x000\x00' -- don't",
+        ["[it's]"],
+    )
+    assert _mask_quoted(':"q x" || N\'n\'') == (
+        ':"\x000\x00" || N\'\x001\x00\'',
+        ['q x', 'n'],
+    )
+
+
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
     # #1692: a `:c` in a comment was counted as a bind, so every value after it
     # shifted -- `:b` silently got the wrong one; an apostrophe in a comment
