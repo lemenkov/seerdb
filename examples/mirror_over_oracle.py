@@ -30,6 +30,7 @@ import logging
 import os
 import sys
 
+from mirror_launch import mirror_credentials, setup_logging
 from oracle_passthrough_backend import OraclePassthroughBackend
 
 import seerdb
@@ -44,24 +45,10 @@ def main() -> None:
     user = os.environ.get('SEERDB_TEST_USER', 'PYO')
     password = os.environ.get('SEERDB_TEST_PASSWORD', 'pyo123')
 
-    # ONE SHARED credential map, passed by reference to every session's backend.
-    # Not a copy per session, and this is not a style preference: a
-    # changepassword on one connection has to be visible to the next (#21/#486).
-    # A hand-written launcher for #826 used `credentials=dict(CREDS)` so each
-    # session got its own copy; the suite's change-password test then moved the
-    # real password upstream while every other session kept the stale one, and
-    # 2393 logins failed with ORA-01017 before anyone noticed. The cascade looks
-    # exactly like a driver bug and is not one, so keep the single dict.
-    credentials = {user.upper(): password}
-    for pair in filter(None, os.environ.get('MIRROR_USERS', '').split(',')):
-        extra_user, _, extra_password = pair.partition(':')
-        if not extra_user or not _:
-            raise SystemExit(f'MIRROR_USERS entry is not user:password: {pair!r}')
-        credentials[extra_user.strip().upper()] = extra_password
-
-    logging.basicConfig(
-        level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s'
-    )
+    # ONE SHARED credential map, passed by reference to every session's backend
+    # (see mirror_credentials for why a copy per session breaks logins).
+    credentials = mirror_credentials(user, password)
+    setup_logging()
     # The passthrough presents whatever its target speaks (§ Backend.field_version).
     # By default that is auto-detected — probe the target once at startup and let
     # the Mirror advertise the release it negotiates (11.2 -> fv6, 21c -> fv16,
