@@ -5958,6 +5958,40 @@ def test_sql_domains_and_annotations() -> None:
         backend.close()
 
 
+def test_dbms_lob_copy_and_writeappend() -> None:
+    # DBMS_LOB.COPY and WRITEAPPEND (#1712), procedures handing the LOB they
+    # change back to the caller's variable. The answers are 23ai's, measured:
+    # COPY overwrites from dest_offset, a gap before it spaces for a CLOB and
+    # zero bytes for a BLOB; a BLOB's buffer written as a string is hex.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        conn = backend._conn
+        conn.execute('CREATE TEMP TABLE r1712 (n integer, c text, b bytea)')
+        conn.execute(
+            'DO $$ DECLARE c text; b bytea; BEGIN '
+            "c := 'XY'; CALL dbms_lob.copy(c, 'abcdef', 5, 6, 2); "
+            'INSERT INTO r1712 (n, c) VALUES (1, c); '
+            "c := 'XYZWVU'; CALL dbms_lob.copy(c, 'abcdef', 2, 2, 3); "
+            'INSERT INTO r1712 (n, c) VALUES (2, c); '
+            "c := 'XY'; CALL dbms_lob.copy(c, 'abc', 10); "
+            "CALL dbms_lob.writeappend(c, 2, 'BBBB'); "
+            'INSERT INTO r1712 (n, c) VALUES (3, c); '
+            "b := '\\x11'; CALL dbms_lob.copy(b, '\\xaabbcc'::bytea, 2, 4, 2); "
+            "CALL dbms_lob.writeappend(b, 1, '5151'); "
+            'INSERT INTO r1712 (n, b) VALUES (4, b); END $$'
+        )
+        rows = conn.execute('SELECT c, b FROM r1712 ORDER BY n').fetchall()
+        assert rows == [
+            ('XY   bcdef', None),
+            ('XcdWVU', None),
+            ('abcBB', None),
+            (None, b'\x11\x00\x00\xbb\xccQ'),
+        ]
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_to_vector_and_vector_distance() -> None:
     # TO_VECTOR(text [, n [, format]]) and VECTOR_DISTANCE(a, b [, metric]) on
     # pgvector (#1708): a computed TO_VECTOR describes as its call says, a
