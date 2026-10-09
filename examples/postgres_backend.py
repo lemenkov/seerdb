@@ -128,6 +128,9 @@ honest edge of this adapter:
   refused (``invalid byte sequence for encoding "UTF8"``) rather than stored
   and handed back for a client to replace (#1659). An application should
   check its text before writing it.
+- **DIRECTORY objects, without privileges** -- CREATE / DROP DIRECTORY keep
+  a name for a path on the PostgreSQL host, which ALL_DIRECTORIES lists
+  (#1668). Any user may create one, where Oracle wants CREATE ANY DIRECTORY.
 - **Editions, by name only** -- CREATE / DROP EDITION, ALTER SESSION SET
   EDITION and a login's edition keep the session's edition, which
   CURRENT_EDITION_NAME reads (#1662). Objects are not versioned per edition:
@@ -1139,6 +1142,14 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE TABLE IF NOT EXISTS sys.ora_sessions (pid integer PRIMARY KEY, '
     'username text, program text, machine text, terminal text, osuser text, '
     'driver text);'
+    # DIRECTORY objects (#1668): a name for a path on the PostgreSQL host, which
+    # a BFILE names its file under. Oracle's are SYS's whoever made them.
+    'CREATE TABLE IF NOT EXISTS sys.ora_directories (name text PRIMARY KEY, '
+    'path text NOT NULL);'
+    "CREATE OR REPLACE VIEW sys.all_directories AS SELECT 'SYS'::text AS owner, "
+    'name AS directory_name, path AS directory_path, 0::numeric AS origin_con_id '
+    'FROM sys.ora_directories;'
+    'CREATE OR REPLACE VIEW sys.dba_directories AS SELECT * FROM sys.all_directories;'
     # Editions (#1662): the names CREATE EDITION made, ORA$BASE always there,
     # and the session's own in seerdb.edition. Only the name is kept: objects
     # are not versioned per edition.
@@ -3476,6 +3487,43 @@ def _edition_statement(sql: str) -> str | None:
     return None
 
 
+# CREATE [OR REPLACE] DIRECTORY name AS 'path' and DROP DIRECTORY name (#1668).
+_CREATE_DIRECTORY = re.compile(
+    rf'(?is)\s*CREATE\s+(OR\s+REPLACE\s+)?DIRECTORY\s+{_EDITION_NAME}\s+AS\s+'
+    r"'((?:[^']|'')*)'\s*;?\s*$"
+)
+_DROP_DIRECTORY = re.compile(rf'(?is)\s*DROP\s+DIRECTORY\s+{_EDITION_NAME}\s*;?\s*$')
+
+
+def _directory_statement(sql: str) -> str | None:
+    # A DIRECTORY statement as PL/pgSQL (#1668), Oracle's errors raised as their
+    # ORA text. None for any other statement.
+    m = _CREATE_DIRECTORY.match(sql)
+    if m:
+        name = _sql_text(_oracle_name(m.group(2)))
+        path = _sql_text(m.group(3).replace("''", "'"))
+        if m.group(1):
+            return (
+                f'INSERT INTO sys.ora_directories VALUES ({name}, {path}) '
+                'ON CONFLICT (name) DO UPDATE SET path = EXCLUDED.path'
+            )
+        return (
+            f'DO $$ BEGIN IF EXISTS (SELECT 1 FROM sys.ora_directories WHERE name = {name}) '
+            "THEN RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = "
+            "'ORA-00955: name is already used by an existing object'; END IF; "
+            f'INSERT INTO sys.ora_directories VALUES ({name}, {path}); END $$'
+        )
+    m = _DROP_DIRECTORY.match(sql)
+    if m:
+        name = _oracle_name(m.group(1))
+        return (
+            f'DO $$ BEGIN DELETE FROM sys.ora_directories WHERE name = {_sql_text(name)}; '
+            "IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = "
+            f'{_sql_text(f"ORA-04043: object {name} does not exist")}; END IF; END $$'
+        )
+    return None
+
+
 def _sql_text(value: str) -> str:
     # A Python string as a PostgreSQL string literal.
     return "'" + value.replace("'", "''") + "'"
@@ -3488,6 +3536,9 @@ def _translate_admin(sql: str) -> str:
     edition = _edition_statement(sql)
     if edition is not None:
         return edition
+    directory = _directory_statement(sql)
+    if directory is not None:
+        return directory
     m = _ALTER_SESSION_SCHEMA.match(sql)
     if m:
         return f'SET search_path TO {m.group(1).lower()}, {_SEARCH_PATH_TAIL}'

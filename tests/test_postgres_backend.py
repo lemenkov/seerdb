@@ -3986,6 +3986,45 @@ def test_rowcount_attributes_read_as_in_oracle() -> None:
         backend.close()
 
 
+def test_directory_objects_are_kept_and_listed() -> None:
+    # DIRECTORY objects (#1668): CREATE keeps a name for a path on the
+    # PostgreSQL host, ALL_DIRECTORIES lists it as SYS's, OR REPLACE moves it, a
+    # second CREATE is ORA-00955 and dropping a missing one ORA-04043.
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    query = (
+        'SELECT owner, directory_name, directory_path, origin_con_id '
+        "FROM all_directories WHERE directory_name = 'DIR1668'"
+    )
+    try:
+        try:
+            backend.execute('DROP DIRECTORY dir1668')
+        except BackendError:
+            backend.rollback()  # not there yet
+        backend.execute("CREATE DIRECTORY dir1668 AS '/tmp/one'")
+        assert [tuple(r) for r in backend.execute(query).rows] == [
+            ('SYS', 'DIR1668', '/tmp/one', 0)
+        ]
+        with pytest.raises(BackendError) as exc:
+            backend.execute("CREATE DIRECTORY dir1668 AS '/tmp/two'")
+        assert exc.value.ora_code == 955
+        backend.execute("CREATE OR REPLACE DIRECTORY dir1668 AS '/tmp/it''s'")
+        assert backend.execute(query).rows[0][2] == "/tmp/it's"
+        backend.execute('DROP DIRECTORY dir1668')
+        assert backend.execute(query).rows == []
+        with pytest.raises(BackendError) as exc:
+            backend.execute('DROP DIRECTORY dir1668')
+        assert exc.value.ora_code == 4043
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP DIRECTORY dir1668')
+        except BackendError:
+            backend.rollback()
+        backend.close()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
