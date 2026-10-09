@@ -4676,6 +4676,18 @@ class TempLobBindIntegration(_IntegrationBase):
             'BEGIN RETURN DBMS_LOB.GETLENGTH(p); END;'
         )
 
+    def tearDown(self):
+        # Left behind, they are routines in the schema a later suite lists
+        # (#1674).
+        from seerdb.common.exceptions import DatabaseError
+
+        for Name in ('PYO_CLOB_LEN', 'PYO_BLOB_LEN'):
+            try:
+                self.cur.execute(f'DROP FUNCTION {Name}')
+            except DatabaseError:
+                pass
+        super().tearDown()
+
     def test_large_clob_bind(self):
         for n in (40000, 100000, 500000):
             r = self.cur.var(seerdb.NUMBER)
