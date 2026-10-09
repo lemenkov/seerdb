@@ -244,6 +244,7 @@ from seerdb.common.dbobject import (
     map_object_lobs,
     type_name_to_tns,
 )
+from seerdb.common.oson import decode_oson, encode_oson
 from seerdb.common.sqltext import (
     SqlToken,
     bind_placeholders,
@@ -374,10 +375,15 @@ _TSTZ_TYPE_DDL = (
 # is otherwise invisible: values arrive as ordinary str / bytes.
 _CLOB_TYPE = 'ora_clob'
 _BLOB_TYPE = 'ora_blob'
+_OSON_TYPE = 'ora_oson'
 _LOB_TYPE_DDL = (
     'DO $$ BEGIN CREATE DOMAIN ora_clob AS text; '
     'EXCEPTION WHEN duplicate_object THEN NULL; END $$;'
     'DO $$ BEGIN CREATE DOMAIN ora_blob AS bytea; '
+    'EXCEPTION WHEN duplicate_object THEN NULL; END $$;'
+    # A BLOB with an IS JSON FORMAT OSON check (#1706): the document, as jsonb,
+    # handed out as its OSON image.
+    f'DO $$ BEGIN CREATE DOMAIN {_OSON_TYPE} AS jsonb; '
     'EXCEPTION WHEN duplicate_object THEN NULL; END $$;'
 )
 
@@ -4190,12 +4196,41 @@ def _translate_ddl(sql: str) -> str:
     out = _DDL_ORG_INDEX.sub('', out)
     out = _strip_nested_table_storage(out)
     out = _DDL_COMPRESSION.sub(')', out)
+    out = _oson_columns(out)
     table = _CREATE_TABLE_NAME.match(sql)
     if table is None or not _DDL_FLOAT_COLUMN.search(out):
         return _translate_column_types(out)
     return _translate_column_types(out).rstrip().rstrip(';') + _float_rounding(
         table.group(1)
     )
+
+
+# A column's IS JSON FORMAT OSON check, inline or a table constraint, named or
+# not (#1706).
+_OSON_CHECK = re.compile(
+    r'(,\s*)?(?:CONSTRAINT\s+[\w$#"]+\s+)?CHECK\s*\(\s*("?[\w$#]+"?)\s+IS\s+JSON\s+'
+    r'FORMAT\s+OSON\s*\)',
+    re.IGNORECASE,
+)
+
+
+def _oson_columns(sql: str) -> str:
+    # A CREATE TABLE's BLOB columns with an IS JSON FORMAT OSON check, as the
+    # ora_oson domain, the check gone (#1706): the column holds the document,
+    # which PostgreSQL can check and query, and hands out its OSON image. A
+    # table constraint goes with its comma; an inline one leaves its column.
+    names: list[str] = []
+
+    def drop(m: re.Match[str]) -> str:
+        names.append(m.group(2))
+        return ''
+
+    out = _OSON_CHECK.sub(drop, sql)
+    for name in names:
+        out = re.sub(
+            rf'([(,]\s*{re.escape(name)}\s+)BLOB\b', rf'\1{_OSON_TYPE}', out, flags=re.I
+        )
+    return out
 
 
 def _float_rounding(table: str) -> str:
@@ -7682,7 +7717,7 @@ _RAW_OIDS = frozenset({17})  # bytea
 # ora_blob over text / bytea (#534), ora_intervalym over interval (#504), ora_date
 # over timestamp (#1316). Only a column of one of these can be such a domain, so
 # the catalog lookup that distinguishes them is skipped for anything else.
-_DOMAIN_BASE_OIDS = frozenset({25, 17, _INTERVAL_OID, _TIMESTAMP_OID})
+_DOMAIN_BASE_OIDS = frozenset({25, 17, _INTERVAL_OID, _TIMESTAMP_OID, 3802})
 # Each PostgreSQL temporal OID maps to the Oracle type of matching precision:
 # a bare date → DATE (7 bytes), timestamp → TIMESTAMP (11), and timestamptz →
 # TIMESTAMP WITH LOCAL TIME ZONE (11), since WITH TIME ZONE is ora_tstz (#1208).
@@ -8759,6 +8794,8 @@ class PostgresBackend:
                 (_BLOB_TYPE, TNS_TYPE_BLOB),
                 (_INTERVALYM_TYPE, TNS_TYPE_INTERVALYM),
                 (_DATE_TYPE, TNS_TYPE_DATE),
+                # Traced as JSON, which the describe hands out as an OSON BLOB.
+                (_OSON_TYPE, TNS_TYPE_JSON),
             ):
                 row = self._conn.execute(
                     'SELECT oid FROM pg_type WHERE typname = %s', (name,)
@@ -8918,6 +8955,9 @@ class PostgresBackend:
         # type's RAW attribute positions, by name; any DDL starts them over.
         self._has_raw_targets_cache: bool | None = None
         self._raw_layout_cache: dict[str, tuple[list[str], frozenset[int]] | None] = {}
+        # OSON columns (#1706): whether any exist, and each relation's.
+        self._has_oson_cache: bool | None = None
+        self._oson_layout_cache: dict[str, tuple[list[str], frozenset[int]] | None] = {}
         self._raw_constructor_cache: dict[str, frozenset[int]] | None = None
         self._any_invisible: bool | None = None
         self._visible_cache: dict[str, list[str] | None] = {}
@@ -9388,6 +9428,7 @@ class PostgresBackend:
         refused = self._rowid_number_error(sql, binds)
         if refused is not None:
             raise refused
+        binds = self._oson_binds(sql, binds)
         sql = _ruled('package-function-call', self._call_package_functions(sql), sql)
         bare = _BARE_CALL.match(sql)
         if bare is not None and bare.group(1).upper() not in _PLSQL_WORD_STATEMENTS:
@@ -9790,6 +9831,102 @@ class PostgresBackend:
             ).fetchone()
             self._has_raw_targets_cache = bool(row and row[0])
         return self._has_raw_targets_cache
+
+    def _oson_layout(self, name: str) -> tuple[list[str], frozenset[int]] | None:
+        # A relation's columns, in order, and which of them are OSON (#1706).
+        key = name.lower()
+        if key not in self._oson_layout_cache:
+            rows = self._conn.execute(
+                'SELECT attname, atttypid = to_regtype(%s) FROM pg_attribute '
+                'WHERE attrelid = to_regclass(%s) AND attnum > 0 AND NOT attisdropped '
+                'ORDER BY attnum',
+                (_OSON_TYPE, name),
+            ).fetchall()
+            self._oson_layout_cache[key] = (
+                ([r[0] for r in rows], frozenset(i for i, r in enumerate(rows) if r[1]))
+                if rows
+                else None
+            )
+        return self._oson_layout_cache[key]
+
+    def _oson_binds(self, sql: str, binds: Sequence) -> Sequence:
+        """`binds` with each one an INSERT's VALUES or an UPDATE's SET aims at an
+        OSON column decoded from the OSON image a client sends -- plain bytes or
+        a BLOB -- into the document the column holds (#1706). JSON text, and a
+        JSON bind, go in as they are. Any other statement's binds are unchanged.
+        """
+        if not binds or not self._has_oson_columns():
+            return binds
+        (masked, contents) = _mask_quoted(sql)
+        targets: list[tuple[int, int]] = []
+        insert = _INSERT_VALUES_HEAD.match(masked)
+        update = _UPDATE_SET_HEAD.match(masked)
+        if insert is not None:
+            layout = self._oson_layout(_unmask_quoted(insert.group(1), contents))
+            if layout is None or not layout[1]:
+                return binds
+            (names, oson) = layout
+            positions: set[int] | frozenset[int] = oson
+            if insert.group(2) is not None:
+                listed = [
+                    _pg_identifier(_unmask_quoted(c, contents))
+                    for c in insert.group(2).split(',')
+                ]
+                positions = {
+                    i
+                    for i, column in enumerate(listed)
+                    if column in names and names.index(column) in oson
+                }
+            open_at = insert.end() - 1
+            items = _top_level_items(
+                masked, open_at + 1, _matching_paren(masked, open_at)
+            )
+            targets = [items[i] for i in positions if i < len(items)]
+        elif update is not None:
+            layout = self._oson_layout(_unmask_quoted(update.group(1), contents))
+            if layout is None or not layout[1]:
+                return binds
+            (names, oson) = layout
+            words, _rownums = _top_level_words(masked)
+            end = next(
+                (
+                    pos
+                    for pos, word in words
+                    if pos > update.end() and word in ('WHERE', 'RETURNING')
+                ),
+                len(masked.rstrip().rstrip(';')),
+            )
+            for start, stop in _top_level_items(masked, update.end(), end):
+                equals = masked.find('=', start, stop)
+                column = _pg_identifier(_unmask_quoted(masked[start:equals], contents))
+                if equals >= 0 and column in names and names.index(column) in oson:
+                    targets.append((equals + 1, stop))
+        aimed = {
+            name
+            for start, stop in targets
+            if (match := _BIND_REF.fullmatch(masked[start:stop].strip())) is not None
+            for name in (_bind_name(match),)
+        }
+        if not aimed:
+            return binds
+        out = list(binds)
+        for index, name in enumerate(_bind_names(sql)):
+            if name not in aimed or index >= len(out):
+                continue
+            value = out[index].value if isinstance(out[index], BindVar) else out[index]
+            if isinstance(value, (bytes, bytearray)) and not isinstance(value, JSON):
+                out[index] = JSON(decode_oson(bytes(value)))
+        return out
+
+    def _has_oson_columns(self) -> bool:
+        if self._has_oson_cache is None:
+            row = self._conn.execute(
+                'SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE atttypid = '
+                'to_regtype(%s) AND attnum > 0 AND NOT attisdropped)',
+                (_OSON_TYPE,),
+            ).fetchone()
+            self._has_oson_cache = bool(row and row[0])
+        return self._has_oson_cache
 
     def _raw_layout(self, name: str) -> tuple[list[str], frozenset[int]] | None:
         # A relation's columns, in order, and which of them are RAW (#1496).
@@ -10417,7 +10554,16 @@ class PostgresBackend:
             )
             if domain is None and desc.type_code in (25, 17, _INTERVAL_OID):
                 domain = computed.get(i)
-            if domain in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
+            if domain == TNS_TYPE_JSON:
+                # An IS JSON FORMAT OSON column (#1706): a BLOB flagged OSON,
+                # its value the document's OSON image, which the client decodes.
+                for row in rows:
+                    if row[i] is not None:
+                        row[i] = encode_oson(_from_extended(row[i]))
+                columns.append(
+                    replace(_lob_column_meta(desc.name, TNS_TYPE_BLOB), is_oson=True)
+                )
+            elif domain in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
                 columns.append(_lob_column_meta(desc.name, domain))
             elif domain == TNS_TYPE_INTERVALYM:
                 for row in rows:
@@ -11861,6 +12007,7 @@ class PostgresBackend:
         # 500 rows against a remote database. Returns the total affected-row count.
         # The Mirror calls this only for the non-batcherrors path, where a per-row
         # failure aborts the whole batch — exactly Oracle's non-batcherrors DML.
+        rows = [self._oson_binds(sql, row) for row in rows]
         native = self._is_native(sql)
         if not native:
             sql = self._to_raw_targets(
@@ -11961,6 +12108,7 @@ class PostgresBackend:
         cannot serve the abort case: once the batch raises, the counts for the
         rows that did apply are no longer reachable.)
         """
+        rows = [self._oson_binds(sql, row) for row in rows]
         rows = list(rows)
         if not rows:
             return 0, []
