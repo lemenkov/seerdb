@@ -5397,6 +5397,57 @@ def test_a_boolean_is_23ais_boolean_and_stores_as_a_number() -> None:
         new.close()
 
 
+def test_json_columns_keep_osons_types_in_extended_form() -> None:
+    # A JSON column is jsonb, described as 21c's native JSON when the backend
+    # presents 23ai, and a document's DATE / TIMESTAMP / interval / NUMBER /
+    # RAW values are kept in Oracle's extended JSON form and come back as the
+    # types they went in as (#1706).
+    import datetime
+    import decimal
+
+    from postgres_backend import _from_extended, _to_extended
+
+    from seerdb.common.datatypes import JSON, IntervalYM
+    from seerdb.common.tns_consts import TNS_TYPE_JSON
+    from seerdb.server import BackendError
+
+    doc = {
+        'when': datetime.datetime(2022, 12, 5, 15, 6, 5, 123000),
+        'tz': datetime.datetime(2022, 12, 7, 22, 59, 15, tzinfo=datetime.timezone.utc),
+        'day': datetime.date(2022, 12, 5),
+        'price': decimal.Decimal('319438950232418390.273596'),
+        'gap': datetime.timedelta(days=8, hours=12, seconds=1.5),
+        'back': -datetime.timedelta(days=2),
+        'ym': IntervalYM(8, 4),
+        'raw': b'\x01\xff',
+        'plain': [1, 2.5, 'x', None, True, {'k': []}],
+    }
+    extended = _to_extended(doc)
+    assert extended['price'] == {'$numberDecimal': '319438950232418390.273596'}
+    assert extended['raw'] == {'$rawhex': '01FF'}
+    assert extended['ym'] == {'$intervalYearMonth': 'P8Y4M'}
+    back = _from_extended(extended)
+    assert back['day'] == datetime.datetime(2022, 12, 5)  # a DATE, as OSON's
+    assert {k: v for k, v in back.items() if k != 'day'} == {
+        k: v for k, v in doc.items() if k != 'day'
+    }
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        backend.execute('CREATE TABLE j1706 (n NUMBER, j JSON)')
+        backend.execute('INSERT INTO j1706 VALUES (1, :1)', [JSON(doc)])
+        result = backend.execute('SELECT j FROM j1706')
+        assert result.columns[0].data_type == TNS_TYPE_JSON
+        assert result.rows[0][0]['price'] == doc['price']
+        assert result.rows[0][0]['gap'] == doc['gap']
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE j1706')
+        except BackendError:
+            backend.rollback()
+        backend.close()
+
+
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
     # #1692: a `:c` in a comment was counted as a bind, so every value after it
     # shifted -- `:b` silently got the wrong one; an apostrophe in a comment
