@@ -30,10 +30,10 @@ Requires the ``psycopg`` package.
 
 from __future__ import annotations
 
-import logging
 import os
 import sys
 
+from mirror_launch import mirror_credentials, setup_logging
 from oracle_compat_backend import OracleCompatBackend
 from postgres_backend import PostgresBackend
 
@@ -49,17 +49,10 @@ def main() -> None:
         else os.environ.get('MIRROR_PG', _DEFAULT_CONNINFO)
     )
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 1521
-    logging.basicConfig(
-        level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s'
-    )
+    setup_logging()
     # One shared credential map across every session's backend, so a
     # changepassword on one connection is visible to the next (#515).
-    credentials = {'PYO': 'pyo123'}
-    for pair in filter(None, os.environ.get('MIRROR_USERS', '').split(',')):
-        extra_user, _, extra_password = pair.partition(':')
-        if not extra_user or not _:
-            raise SystemExit(f'MIRROR_USERS entry is not user:password: {pair!r}')
-        credentials[extra_user.strip().upper()] = extra_password
+    credentials = mirror_credentials('PYO', 'pyo123')
     # One PostgreSQL session per client connection, behind the OracleCompatBackend
     # so a real sqlplus can bootstrap its session (thin clients pass through).
     seerdb.serve(

@@ -23,9 +23,9 @@ Then point any thin-dialect Oracle client at ``127.0.0.1:PORT`` as
 
 from __future__ import annotations
 
-import logging
 import sys
 
+from mirror_launch import mirror_credentials, setup_logging
 from oracle_compat_backend import OracleCompatBackend
 from sqlite_backend import SqliteBackend
 
@@ -35,9 +35,8 @@ import seerdb
 def main() -> None:
     database = sys.argv[1] if len(sys.argv) > 1 else '/tmp/mirror.db'
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 1521
-    logging.basicConfig(
-        level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s'
-    )
+    setup_logging()
+    credentials = mirror_credentials('PYO', 'pyo123')
     # A fresh SQLite session per client connection (sqlite3 objects are
     # thread-affine, so the backend must be built inside its own session). The
     # OracleCompatBackend wrapper answers sqlplus's Oracle session-bootstrap
@@ -47,7 +46,7 @@ def main() -> None:
         '127.0.0.1',
         port,
         backend_factory=lambda: OracleCompatBackend(
-            SqliteBackend(database, credentials={'PYO': 'pyo123'})
+            SqliteBackend(database, credentials=credentials)
         ),
     )
 
