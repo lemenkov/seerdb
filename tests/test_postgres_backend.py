@@ -6247,6 +6247,55 @@ def test_vector_distance_past_pgvector() -> None:
         backend.close()
 
 
+def test_a_vector_bind_in_a_plsql_block() -> None:
+    # A VECTOR bind of a PL/SQL block is the block's local as its composite,
+    # dense or sparse, and comes back as the vector it ended with (#1737):
+    # python-oracledb's test_6445-6447 block, in each format.
+    import array
+
+    from seerdb.common.tns_consts import TNS_TYPE_BDOUBLE, TNS_TYPE_VECTOR
+    from seerdb.common.vector import SparseVector
+    from seerdb.server import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    if not backend._has_pgvector:
+        backend.close()
+        pytest.skip('the PostgreSQL bed has no pgvector')
+    block = (
+        'BEGIN select vector_distance(:in_vec, :in_out_vec, euclidean) into :distance; '
+        ':output_vec := :in_out_vec; :in_out_vec := :in_vec; END;'
+    )
+    try:
+        for typecode, first, second, distance in (
+            ('f', [1, 1.5, 2, 2.5], [4, 4.5, 5, 5.5], 6.0),
+            ('d', [1, 1.5, 2, 2.5], [4, 4.5, 5, 5.5], 6.0),
+            ('b', [1, 2, 3, 4], [5, 6, 7, 8], 8.0),
+        ):
+            (a, b) = (array.array(typecode, first), array.array(typecode, second))
+            out = backend.execute(
+                block,
+                [
+                    BindVar(a, TNS_TYPE_VECTOR, 0),
+                    BindVar(b, TNS_TYPE_VECTOR, 0),
+                    BindVar(None, TNS_TYPE_BDOUBLE, 8),
+                    BindVar(None, TNS_TYPE_VECTOR, 0),
+                ],
+            ).out_binds
+            assert out == [a, a, distance, b]
+            assert [v.typecode for v in (out[1], out[3])] == [typecode, typecode]
+        sparse = SparseVector(4, [1, 3], array.array('d', [1.5, 2]))
+        # A sparse bind's local is sparse, by its value; an OUT VECTOR bind
+        # with no value says nothing of which it is, and is dense.
+        (converted,) = backend.execute(
+            'BEGIN :v := TO_VECTOR(:v, 4, FLOAT32); END;',
+            [BindVar(sparse, TNS_TYPE_VECTOR, 0)],
+        ).out_binds
+        assert converted == SparseVector(4, [1, 3], array.array('f', [1.5, 2]))
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
     # #1692: a `:c` in a comment was counted as a bind, so every value after it
     # shifted -- `:b` silently got the wrong one; an apostrophe in a comment

@@ -240,6 +240,7 @@ from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 from typing import Any, Final, NamedTuple, TypeVar, cast
 
 import psycopg
@@ -8401,7 +8402,15 @@ _BLOCK_BIND_TYPES = {
 
 
 def _block_bind_type(bind: object) -> str:
-    # A bind's local type: its declared type's, else its value's.
+    # A bind's local type: its declared type's, else its value's. A VECTOR is
+    # its composite, sparse or dense by its value (#1737).
+    value = bind.value if isinstance(bind, BindVar) else bind
+    if isinstance(value, SparseVector):
+        return _SPARSE_COMPOSITE
+    if isinstance(value, array.array) or (
+        isinstance(bind, BindVar) and bind.tns_type == TNS_TYPE_VECTOR
+    ):
+        return _VECTOR_COMPOSITE
     if isinstance(bind, BindVar):
         declared = _BLOCK_BIND_TYPES.get(bind.tns_type)
         if declared is not None:
@@ -8422,8 +8431,36 @@ def _block_bind_type(bind: object) -> str:
     return 'text'
 
 
+# A vector composite's text form, dense `(code,"{e,...}")` and sparse
+# `(code,dims,"{i,...}","{e,...}")` (#1737); an empty array is `{}`, unquoted.
+_DENSE_COMPOSITE_TEXT = re.compile(r'\((\d+),"?\{([^}]*)\}"?\)')
+_SPARSE_COMPOSITE_TEXT = re.compile(r'\((\d+),(\d+),"?\{([^}]*)\}"?,"?\{([^}]*)\}"?\)')
+
+
 def _block_bind_value(pg_type: str, text: str) -> object:
     # A bind local's value from its text form (the setting carries text).
+    if pg_type == _VECTOR_COMPOSITE and (
+        dense := _DENSE_COMPOSITE_TEXT.fullmatch(text)
+    ):
+        return _vector_value(
+            SimpleNamespace(
+                format=int(dense.group(1)),
+                elements=[float(e) for e in dense.group(2).split(',') if e],
+            ),
+            None,
+        )
+    if pg_type == _SPARSE_COMPOSITE and (
+        sparse := _SPARSE_COMPOSITE_TEXT.fullmatch(text)
+    ):
+        return _sparse_value(
+            SimpleNamespace(
+                format=int(sparse.group(1)),
+                dims=int(sparse.group(2)),
+                indices=[int(i) for i in sparse.group(3).split(',') if i],
+                elements=[float(e) for e in sparse.group(4).split(',') if e],
+            ),
+            None,
+        )
     if pg_type == 'numeric':
         return decimal.Decimal(text)
     if pg_type == 'double precision':
@@ -14068,9 +14105,11 @@ class PostgresBackend:
             proc = _PROC_CALL.match(statement)
             if proc is not None:
                 return self._call_procedure(proc, values, sql, binds)
-            # Not a call: a block that opens a REF CURSOR into a bind (#1456).
+            # Not a call: a block that opens a REF CURSOR into a bind (#1456),
+            # or one with a VECTOR bind, which only a block's local holds (#1737).
             if any(
-                isinstance(b, BindVar) and b.tns_type == TNS_TYPE_REFCURSOR
+                isinstance(b, BindVar)
+                and b.tns_type in (TNS_TYPE_REFCURSOR, TNS_TYPE_VECTOR)
                 for b in binds
             ):
                 return self._run_block(sql, binds)
