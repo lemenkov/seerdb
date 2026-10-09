@@ -5118,6 +5118,30 @@ def test_block_words_are_the_tokenizers_words() -> None:
     )
 
 
+def test_statement_scanners_read_the_tokenizers_spans() -> None:
+    # The statement-level scanners on the shared tokenizer (#1693): a bind
+    # named like a keyword is no top-level keyword, a cast's type name is a
+    # word, and `#` names are quoted past literals and comments alike.
+    from postgres_backend import (
+        _perform_bare_calls,
+        _quote_hash_identifiers,
+        _top_level_words,
+    )
+
+    (words, rownums) = _top_level_words(
+        "select :from, x::int, 'from' from t where (rownum < :order) -- order"
+    )
+    assert [w for _p, w in words] == ['SELECT', 'X', 'INT', 'FROM', 'T', 'WHERE']
+    assert len(rownums) == 1
+    assert _quote_hash_identifiers("select obj# /* x# */, 'y#' from t") == (
+        'select "obj#" /* x# */, \'y#\' from t'
+    )
+    kinds = {'p': 'p', 'f': 'f', 'pkg.q': 'p'}.get
+    assert _perform_bare_calls("p; f(1); pkg.q; x := 'p;'; -- p;\n", kinds) == (
+        "CALL p(); PERFORM f(1); CALL pkg.q(); x := 'p;'; -- p;\n"
+    )
+
+
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
     # #1692: a `:c` in a comment was counted as a bind, so every value after it
     # shifted -- `:b` silently got the wrong one; an apostrophe in a comment
