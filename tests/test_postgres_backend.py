@@ -58,6 +58,7 @@ from postgres_backend import (  # noqa: E402
     _translate_connect_by,
     _translate_ddl,
     _translate_idioms,
+    _translate_json_constructor_values,
     _translate_plsql_block,
     _translate_routine_ddl,
     _translate_routine_types,
@@ -6016,6 +6017,44 @@ def test_dbms_lob_copy_and_writeappend() -> None:
             ('abcBB', None),
             (None, b'\x11\x00\x00\xbb\xccQ'),
         ]
+    finally:
+        backend.rollback()
+        backend.close()
+
+
+def test_json_constructor_values_keep_their_type() -> None:
+    # JSON_OBJECT / JSON_ARRAY values in their extended form (#1724), so a
+    # timestamp, a RAW and a vector come back as themselves, as 23ai's do; a
+    # literal, a bind, NULL and a FORMAT JSON value go as they are.
+    import array
+    import datetime
+
+    from seerdb.common.vector import SparseVector
+
+    assert _translate_json_constructor_values(
+        "select json_object('a' : :1, 'b' : c FORMAT JSON, KEY 'k' VALUE d, "
+        "'n' : NULL ABSENT ON NULL), json_array(e, 'x', 3 returning json) from t"
+    ) == (
+        "select json_object('a' : :1, 'b' : c FORMAT JSON, KEY 'k' VALUE "
+        "sys.ora_json_scalar(d), 'n' : NULL ABSENT ON NULL), "
+        "json_array(sys.ora_json_scalar(e), 'x', 3 returning json) from t"
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        (row,) = backend.execute(
+            "SELECT JSON_OBJECT('t' : TIMESTAMP '2024-01-02 03:04:05', "
+            "'r' : HEXTORAW('AB') RETURNING JSON) FROM dual"
+        ).rows
+        assert row[0] == {'t': datetime.datetime(2024, 1, 2, 3, 4, 5), 'r': b'\xab'}
+        if backend._has_pgvector:
+            (row,) = backend.execute(
+                "SELECT JSON_ARRAY(TO_VECTOR('[1, 2]'), "
+                "TO_VECTOR('[4, [1], [2.5]]', 4, FLOAT64, SPARSE) RETURNING JSON) FROM dual"
+            ).rows
+            assert row[0] == [
+                array.array('f', [1, 2]),
+                SparseVector(4, [1], array.array('d', [2.5])),
+            ]
     finally:
         backend.rollback()
         backend.close()

@@ -2470,9 +2470,19 @@ def _to_extended(value: object) -> object:
         return {'$intervalYearMonth': f'{sign}P{abs(value.years)}Y{abs(value.months)}M'}
     if isinstance(value, (bytes, bytearray, memoryview)):
         return {'$rawhex': bytes(value).hex().upper()}
-    if isinstance(value, array.array) and value.typecode in ('f', 'd', 'b'):
+    if isinstance(value, array.array) and value.typecode in ('f', 'd', 'b', 'B'):
         # A VECTOR inside a document (#1708): its format and elements.
         return {'$vector': {'format': value.typecode, 'elements': list(value)}}
+    if isinstance(value, SparseVector):
+        # A sparse one (#1724): its dimension count and indices as well.
+        return {
+            '$vector': {
+                'format': getattr(value.values, 'typecode', 'f'),
+                'dims': value.num_dimensions,
+                'indices': list(value.indices),
+                'elements': list(value.values),
+            }
+        }
     raise TypeError(f'a {type(value).__name__} has no JSON form')
 
 
@@ -2524,10 +2534,22 @@ def _from_extended(value: object) -> object:
         if (
             key == '$vector'
             and isinstance(item, dict)
-            and item.get('format') in ('f', 'd', 'b')
+            and item.get('format') in ('f', 'd', 'b', 'B')
             and isinstance(item.get('elements'), list)
         ):
-            return array.array(item['format'], item['elements'])
+            typecode = item['format']
+            elements = (
+                [int(v) for v in item['elements']]
+                if typecode in 'bB'
+                else item['elements']
+            )
+            if isinstance(item.get('indices'), list):
+                return SparseVector(
+                    int(item.get('dims') or 0),
+                    [int(i) for i in item['indices']],
+                    array.array(typecode, elements),
+                )
+            return array.array(typecode, elements)
     return {key: _from_extended(item) for key, item in value.items()}
 
 
@@ -3122,13 +3144,30 @@ _VECTOR_DDL = (
     "RETURN CASE WHEN x < 0 THEN '-' ELSE '' END || t || 'E' || "
     "CASE WHEN p < 0 THEN '-' ELSE '+' END || lpad(abs(p)::text, 3, '0'); END $$;"
     # A dense vector, and a sparse one, as FROM_VECTOR's text.
-    f'CREATE OR REPLACE FUNCTION sys.ora_vector_elements(code smallint, e float8[]) '
+    'CREATE OR REPLACE FUNCTION sys.ora_vector_elements(code smallint, e float8[]) '
     "RETURNS text LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT '[' || coalesce("
     '(SELECT string_agg(CASE WHEN code IN (4, 5) THEN x::bigint::text '
     'WHEN code = 3 THEN sys.ora_vector_number(x, 17) '
     "ELSE sys.ora_vector_number(x::real::float8, 9) END, ',' ORDER BY i) "
     "FROM unnest(e) WITH ORDINALITY AS u(x, i)), '') || ']' $$;"
-    f'CREATE OR REPLACE FUNCTION sys.ora_sparse_text(v {_SPARSE_COMPOSITE}) '
+    # A vector inside JSON_OBJECT / JSON_ARRAY (#1724), its extended form,
+    # which the JSON decoding reads back as the vector, sparse or dense.
+     + f'CREATE OR REPLACE FUNCTION sys.ora_json_scalar(v {_VECTOR_COMPOSITE}) '
+    'RETURNS jsonb LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT jsonb_build_object('
+    "'$vector', jsonb_build_object('format', CASE v.format WHEN 3 THEN 'd' "
+    "WHEN 4 THEN 'b' WHEN 5 THEN 'B' ELSE 'f' END, 'elements', v.elements)) $$;"
+    f'CREATE OR REPLACE FUNCTION sys.ora_json_scalar(v {_SPARSE_COMPOSITE}) '
+    'RETURNS jsonb LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT jsonb_build_object('
+    "'$vector', jsonb_build_object('format', CASE v.format WHEN 3 THEN 'd' "
+    "WHEN 4 THEN 'b' ELSE 'f' END, 'dims', v.dims, 'indices', v.indices, "
+    "'elements', v.elements)) $$;"
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.ora_json_scalar(v {source}) RETURNS jsonb '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        f'$$ SELECT sys.ora_json_scalar(CAST(v AS {_VECTOR_COMPOSITE})) $$;'
+        for source in ('vector', 'varbit')
+    )
+    + f'CREATE OR REPLACE FUNCTION sys.ora_sparse_text(v {_SPARSE_COMPOSITE}) '
     "RETURNS text LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT '[' || v.dims || ',[' "
     "|| coalesce(array_to_string(v.indices, ','), '') || '],' || "
     "sys.ora_vector_elements(v.format, v.elements) || ']' $$;"
@@ -5918,6 +5957,87 @@ def _to_vector_item(item: str) -> tuple[int | None, int | None, str] | None:
     )
 
 
+# The clause words that end a JSON constructor's last value (#1724).
+_JSON_CONSTRUCTOR_ENDS = frozenset({'FORMAT', 'RETURNING', 'ABSENT', 'STRICT', 'WITH'})
+
+
+def _translate_json_constructor_values(sql: str) -> str:
+    """Each value of a JSON_OBJECT or JSON_ARRAY in its extended form,
+    through sys.ora_json_scalar (#1724): PostgreSQL's constructors write a value
+    with to_jsonb, so a timestamp, a RAW or a vector would come back a string or
+    a bare object where Oracle's keeps its type. A literal, a bind and NULL go
+    as they are -- untyped, nothing could resolve the function for them -- as
+    does a value written FORMAT JSON, already JSON."""
+    if 'json_' not in sql.lower():
+        return sql
+
+    def call(name: str, args: list[str]) -> str | None:
+        if not args or (len(args) == 1 and args[0].strip() in ('', '*')):
+            return None
+        inner = [_translate_json_constructor_values(a) for a in args]
+        if name.upper() == 'JSON_ARRAY' and inner[0].lstrip().upper().startswith(
+            'SELECT'
+        ):
+            return None
+        out = [
+            _json_constructor_value(arg, name.upper() == 'JSON_OBJECT') for arg in inner
+        ]
+        return f'{name}({",".join(out)})'
+
+    return _rewrite_calls(sql, frozenset({'JSON_OBJECT', 'JSON_ARRAY'}), call, '_$#."')
+
+
+def _json_constructor_value(arg: str, keyed: bool) -> str:
+    # One argument of a JSON constructor with its value wrapped (#1724): after
+    # the key's `:` or VALUE where `keyed`, up to FORMAT, RETURNING, ABSENT,
+    # STRICT, WITH or NULL ON NULL.
+    tokens = [t for t in sql_tokens(arg)]
+    depth = 0
+    start = 0 if not keyed else None
+    end = len(arg)
+    words = [(t, arg[t.start : t.end].upper()) for t in tokens]
+    for index, (token, text) in enumerate(words):
+        if token.kind == 'other' and text in '()':
+            depth += 1 if text == '(' else -1
+            continue
+        if depth:
+            continue
+        if start is None:
+            if (token.kind == 'other' and text == ':') or (
+                token.kind == 'word' and text == 'VALUE'
+            ):
+                start = token.end
+            continue
+        if token.kind == 'word' and token.start > start:
+            following = next(
+                (
+                    w
+                    for t, w in words[index + 1 :]
+                    if t.kind not in ('space', 'comment')
+                ),
+                '',
+            )
+            if text in _JSON_CONSTRUCTOR_ENDS or (text == 'NULL' and following == 'ON'):
+                end = token.start
+                break
+    if start is None:
+        return arg
+    value = arg[start:end]
+    bare = value.strip()
+    if (
+        not bare
+        or bare.upper() in ('NULL', 'TRUE', 'FALSE')
+        or bare[0] in "':"
+        or bare[0].isdigit()
+        or bare[:2].upper() in ("N'", "Q'")
+        or arg[end:].lstrip().upper().startswith('FORMAT')
+    ):
+        return arg
+    lead = value[: len(value) - len(value.lstrip())]
+    tail = value[len(value.rstrip()) :]
+    return f'{arg[:start]}{lead}sys.ora_json_scalar({bare}){tail}{arg[end:]}'
+
+
 def _translate_rr_year(sql: str) -> str:
     """Give Oracle's RR and RRRR years a PostgreSQL meaning (#1638).
 
@@ -7119,6 +7239,9 @@ def _translate_idioms(sql: str) -> str:
     sql = _ruled('rr-year', _translate_rr_year(sql), sql)
     sql = _ruled('decode', _translate_decode(sql), sql)
     sql = _ruled('json-functions', _translate_json_functions(sql), sql)
+    sql = _ruled(
+        'json-constructor-values', _translate_json_constructor_values(sql), sql
+    )
     sql = _ruled('vector-functions', _translate_vector_functions(sql), sql)
     # The rewrites change Oracle words into PostgreSQL ones, and a string
     # literal or a quoted identifier holding such a word is data, not SQL:
