@@ -3628,6 +3628,16 @@ class BindIntegration(_IntegrationBase):
         self.cur.execute('SELECT :"a", :"a" FROM dual', {'"a"': 5})
         self.assertEqual(self.cur.fetchall(), [(5, 5)])
 
+    def test_a_colon_word_in_a_q_literal_or_a_comment_is_no_bind(self):
+        # q'[...]' is a string literal however it is quoted, and a `:z` inside
+        # one -- or inside a comment -- is text, not a placeholder. Read as one,
+        # named binds were refused: "missing bind value for :Z" (#1679).
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            self.skipTest("alternative quoting (q'[...]') is 10g and later")
+        self._skip_if_mirror_backend('postgres', "read q'[...]' literals yet (#1692)")
+        self.cur.execute("SELECT q'[it's :z]', :b /* :c */ FROM dual", {'b': 5})
+        self.assertEqual(self.cur.fetchall(), [("it's :z", 5)])
+
     def test_quoted_bind_positional_parameters(self):
         self.cur.execute('SELECT :"p" FROM dual', [9])
         self.assertEqual(self.cur.fetchall(), [(9,)])
