@@ -148,7 +148,8 @@ honest edge of this adapter:
   ``vector``, FLOAT64 and INT8 are ``float8[]`` / ``int2[]``, and a column of
   flexible format keeps each value's format in a composite. A FLOAT32 column
   holds at most pgvector's 16000 dimensions, where Oracle's holds 65535.
-  Without pgvector a VECTOR column is refused. Sparse and BINARY vectors are
+  VECTOR_DISTANCE is pgvector's operators: COSINE, EUCLIDEAN(_SQUARED), DOT
+  and MANHATTAN, not HAMMING or JACCARD. Without pgvector a VECTOR column is refused. Sparse and BINARY vectors are
   not yet there.
 - **Privileges, for type lookup only** -- every Mirror user is the backend's
   one PostgreSQL role. A GRANT or REVOKE on an object is recorded
@@ -2744,6 +2745,44 @@ _VECTOR_DDL = (
             ('int2[]', 'ora_vector_int2'),
         )
     )
+    # TO_VECTOR(text [, dimensions [, format]]) (#1708): the text's elements in
+    # the format asked for -- FLOAT32 by default, its values rounded to one --
+    # a wrong count ORA-51803 and an INT8 out of range ORA-51806, as Oracle.
+    + 'CREATE OR REPLACE FUNCTION sys.ora_to_vector(t text, n integer DEFAULT NULL, '
+    f'fmt text DEFAULT NULL) RETURNS {_VECTOR_COMPOSITE} LANGUAGE plpgsql IMMUTABLE AS '
+    '$$ DECLARE e float8[]; code smallint; BEGIN IF t IS NULL THEN RETURN NULL; END IF; '
+    "e := coalesce(string_to_array(nullif(btrim(t, '[] '), ''), ',')::float8[], '{}'); "
+    "code := CASE upper(coalesce(fmt, 'FLOAT32')) WHEN 'FLOAT64' THEN 3 "
+    "WHEN 'INT8' THEN 4 ELSE 2 END; "
+    'IF n IS NOT NULL AND cardinality(e) <> n THEN '
+    "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = format('ORA-51803: Vector "
+    'dimension count must match the dimension count specified in the column '
+    "definition (actual: %s, required: %s).', cardinality(e), n); END IF; "
+    'IF code = 2 THEN e := e::real[]::float8[]; END IF; '
+    f'IF code = 4 THEN PERFORM sys.ora_vector_int2(ROW(4, e)::{_VECTOR_COMPOSITE}); END IF; '
+    f'RETURN ROW(code, e)::{_VECTOR_COMPOSITE}; END $$;'
+    # TO_VECTOR of a vector -- a bind -- in the format asked for, its own when
+    # none is.
+    f'CREATE OR REPLACE FUNCTION sys.ora_to_vector(v {_VECTOR_COMPOSITE}, '
+    f'n integer DEFAULT NULL, fmt text DEFAULT NULL) RETURNS {_VECTOR_COMPOSITE} '
+    "LANGUAGE sql IMMUTABLE AS $$ SELECT sys.ora_to_vector('[' || "
+    "array_to_string((v).elements, ',') || ']', n, coalesce(fmt, CASE (v).format "
+    "WHEN 3 THEN 'FLOAT64' WHEN 4 THEN 'INT8' ELSE 'FLOAT32' END)) $$;"
+    # Text a client writes into a VECTOR column, '[1, 2, 3]' (#1708).
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.ora_text_{name}(text) RETURNS {target} '
+        f'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT sys.ora_to_vector($1)::{target} $$;'
+        f'DO $$ BEGIN CREATE CAST (text AS {target}) WITH FUNCTION '
+        f'sys.ora_text_{name}(text) AS ASSIGNMENT; '
+        'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+        for name, target in (('vector', 'vector'), ('composite', _VECTOR_COMPOSITE))
+    )
+    # An INT8 column's int2[] into a distance, which takes pgvector's vector.
+    + 'CREATE OR REPLACE FUNCTION sys.ora_int2_vector(int2[]) RETURNS vector '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::real[]::vector $$;'
+    'DO $$ BEGIN CREATE CAST (int2[] AS vector) WITH FUNCTION '
+    'sys.ora_int2_vector(int2[]); '
+    'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
 )
 
 
@@ -5175,6 +5214,128 @@ def _translate_json_functions(sql: str) -> str:
     return _rewrite_calls(sql, _JSON_FUNCTION_NAMES, call, '_$#."')
 
 
+# Oracle's vector functions (#1708), and pgvector's operator per distance
+# metric -- COSINE when none is named, as Oracle defaults.
+_VECTOR_FUNCTION_NAMES = frozenset({'TO_VECTOR', 'VECTOR_DISTANCE'})
+_VECTOR_METRICS = {
+    'EUCLIDEAN': '<->',
+    'L2': '<->',
+    'COSINE': '<=>',
+    'DOT': '<#>',
+    'MANHATTAN': '<+>',
+    'L1': '<+>',
+}
+
+
+def _translate_vector_functions(sql: str) -> str:
+    """TO_VECTOR(text [, dimensions [, format]]) as sys.ora_to_vector, and
+    VECTOR_DISTANCE(a, b [, metric]) as pgvector's operator for the metric on
+    the two as vectors (#1708). A sparse or BINARY one is left as written, for
+    #1709 / #1710."""
+    if 'vector' not in sql.lower():
+        return sql
+
+    def call(name: str, args: list[str]) -> str | None:
+        inner = [_translate_vector_functions(a).strip() for a in args]
+        if name.upper() == 'TO_VECTOR':
+            if len(inner) > 3 or not 1 <= len(inner) <= 3:
+                return None
+            dims = inner[1] if len(inner) > 1 and inner[1] != '*' else 'NULL'
+            fmt = inner[2].upper() if len(inner) > 2 else '*'
+            if fmt not in ('FLOAT32', 'FLOAT64', 'INT8', '*'):
+                return None
+            named = 'NULL' if fmt == '*' else f"'{fmt}'"
+            return f'sys.ora_to_vector({inner[0]}, {dims}, {named})'
+        if len(inner) not in (2, 3):
+            return None
+        metric = inner[2].upper() if len(inner) == 3 else 'COSINE'
+        (a, b) = (f'CAST({inner[0]} AS vector)', f'CAST({inner[1]} AS vector)')
+        if metric == 'EUCLIDEAN_SQUARED' or metric == 'L2_SQUARED':
+            return f'power({a} <-> {b}, 2)'
+        operator = _VECTOR_METRICS.get(metric)
+        return None if operator is None else f'({a} {operator} {b})'
+
+    return _rewrite_calls(sql, _VECTOR_FUNCTION_NAMES, call, '_$#."')
+
+
+# The words that join, and qualify, a query's set-operation branches (#1708).
+_SET_OPERATORS = frozenset({'UNION', 'INTERSECT', 'MINUS', 'EXCEPT', 'ALL', 'DISTINCT'})
+
+
+def _computed_vector_columns(
+    sql: str,
+) -> dict[int, tuple[int | None, int | None]]:
+    """The select-list positions of a query whose item is a whole TO_VECTOR
+    call in every branch of its set operations, each with the dimensions and
+    format code the describe owes it, None where flexible (#1708): computed,
+    a value carries only its own format. As 23ai describes them, a NULL
+    branch says nothing, and a dimension count or a format holds only where
+    every branch names the same one; a call naming neither is flexible in
+    both."""
+    words, _rownums = _top_level_words(sql)
+    cuts = [pos for pos, word in words if word in _SET_OPERATORS - {'ALL', 'DISTINCT'}]
+    cuts.append(len(sql))
+    merged: dict[int, list[tuple[int | None, int | None]]] = {}
+    unknown: set[int] = set()
+    begin = 0
+    for cut in cuts:
+        branch = [
+            (pos, word)
+            for pos, word in words
+            if begin <= pos < cut and word not in _SET_OPERATORS
+        ]
+        if not branch or branch[0][1] != 'SELECT':
+            return {}
+        start = branch[0][0] + len('SELECT')
+        end = next((pos for pos, word in branch if word == 'FROM'), cut)
+        for index, (a, b) in enumerate(_top_level_items(sql, start, end)):
+            item = sql[a:b].strip()
+            if item.upper() == 'NULL':
+                continue
+            vector = _to_vector_item(item)
+            if vector is None:
+                unknown.add(index)
+            else:
+                merged.setdefault(index, []).append(vector)
+        begin = cut
+    found = {}
+    for index, vectors in merged.items():
+        if index in unknown:
+            continue
+        dims = {d for d, _code in vectors}
+        codes = {code for _d, code in vectors}
+        found[index] = (
+            dims.pop() if len(dims) == 1 else None,
+            codes.pop() if len(codes) == 1 else None,
+        )
+    return found
+
+
+def _to_vector_item(item: str) -> tuple[int | None, int | None] | None:
+    # A select item that is one TO_VECTOR(x [, n|*] [, format|*]) call,
+    # optionally aliased: its dimensions and format code, None where flexible;
+    # None for anything else, BINARY and SPARSE among them (#1708).
+    calls = list(_calls(item, frozenset({'TO_VECTOR'}), '_$#."'))
+    if not calls or calls[0].start != 0:
+        return None
+    call = calls[0]
+    if not _ITEM_ALIAS.fullmatch(item[call.close_at + 1 :].strip()):
+        return None
+    args = [item[x:y].strip().upper() for x, y in call.args]
+    if not 1 <= len(args) <= 3:
+        return None
+    dims = args[1] if len(args) > 1 else '*'
+    fmt = args[2] if len(args) > 2 else '*'
+    if not (dims == '*' or dims.isdigit()) or not (
+        fmt == '*' or fmt in _VECTOR_FORMATS
+    ):
+        return None
+    return (
+        int(dims) if dims.isdigit() else None,
+        _VECTOR_FORMATS[fmt] if fmt != '*' else None,
+    )
+
+
 def _translate_rr_year(sql: str) -> str:
     """Give Oracle's RR and RRRR years a PostgreSQL meaning (#1638).
 
@@ -6376,6 +6537,7 @@ def _translate_idioms(sql: str) -> str:
     sql = _ruled('rr-year', _translate_rr_year(sql), sql)
     sql = _ruled('decode', _translate_decode(sql), sql)
     sql = _ruled('json-functions', _translate_json_functions(sql), sql)
+    sql = _ruled('vector-functions', _translate_vector_functions(sql), sql)
     # The rewrites change Oracle words into PostgreSQL ones, and a string
     # literal or a quoted identifier holding such a word is data, not SQL:
     # `data_type = 'VARCHAR2'` was rewritten to `= 'varchar'` and matched
@@ -9288,6 +9450,10 @@ class PostgresBackend:
         self._raw_layout_cache: dict[str, tuple[list[str], frozenset[int]] | None] = {}
         # Which table columns are JSON, for dot notation (#1707).
         self._json_columns_cache: dict[str, bool] = {}
+        # Each relation's declared VECTOR formats (#1708).
+        self._vector_format_cache: dict[
+            str, tuple[list[str], dict[int, int | None]] | None
+        ] = {}
         # OSON columns (#1706): whether any exist, and each relation's.
         self._has_oson_cache: bool | None = None
         self._oson_layout_cache: dict[str, tuple[list[str], frozenset[int]] | None] = {}
@@ -9761,7 +9927,7 @@ class PostgresBackend:
         refused = self._rowid_number_error(sql, binds)
         if refused is not None:
             raise refused
-        binds = self._oson_binds(sql, binds)
+        binds = self._vector_text_binds(sql, self._oson_binds(sql, binds))
         sql = _ruled('json-dot-notation', self._json_dot_notation(sql), sql)
         sql = _ruled('package-function-call', self._call_package_functions(sql), sql)
         bare = _BARE_CALL.match(sql)
@@ -10339,6 +10505,68 @@ class PostgresBackend:
             value = out[index].value if isinstance(out[index], BindVar) else out[index]
             if isinstance(value, (bytes, bytearray)) and not isinstance(value, JSON):
                 out[index] = JSON(decode_oson(bytes(value)))
+        return out
+
+    def _vector_formats(
+        self, name: str
+    ) -> tuple[list[str], dict[int, int | None]] | None:
+        # A relation's columns, in order, and each declared VECTOR's format
+        # code, None where flexible (#1708).
+        key = name.lower()
+        if key not in self._vector_format_cache:
+            rows = self._conn.execute(
+                "SELECT a.attname, o.data_type = 'VECTOR', o.data_precision "
+                'FROM pg_attribute a LEFT JOIN sys.ora_columns o ON o.relid = '
+                'a.attrelid AND o.attnum = a.attnum WHERE a.attrelid = to_regclass(%s) '
+                'AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum',
+                (name,),
+            ).fetchall()
+            self._vector_format_cache[key] = (
+                ([r[0] for r in rows], {i: r[2] for i, r in enumerate(rows) if r[1]})
+                if rows
+                else None
+            )
+        return self._vector_format_cache[key]
+
+    def _vector_text_binds(self, sql: str, binds: Sequence) -> Sequence:
+        """`binds` with each string an INSERT's VALUES or an UPDATE's SET aims
+        at a VECTOR column -- '[1, 2, 3]', as a client may write one -- as the
+        vector it spells, in the column's format, FLOAT32 where the column's
+        is flexible (#1708). A string goes to PostgreSQL untyped, so no cast
+        reaches it there."""
+        if not binds or not self._has_pgvector or not self._has_column_catalog:
+            return binds
+        if not any(isinstance(b, str) for b in binds):
+            return binds
+        formats: dict[int, int | None] = {}
+
+        def layout(table: str) -> tuple[list[str], Collection[int]] | None:
+            found = self._vector_formats(table)
+            if found is None:
+                return None
+            formats.update(found[1])
+            return (found[0], frozenset(found[1]))
+
+        aimed = self._aimed_binds(sql, layout)
+        if not aimed:
+            return binds
+        out = list(binds)
+        for index, name in enumerate(_bind_names(sql)):
+            if (
+                name not in aimed
+                or index >= len(out)
+                or not isinstance(out[index], str)
+            ):
+                continue
+            try:
+                elements = json.loads(out[index])
+            except ValueError:
+                continue  # left for PostgreSQL to refuse as it is
+            if isinstance(elements, list):
+                code = formats.get(aimed[name]) or 2
+                typecode = _VECTOR_TYPECODES.get(code, 'f')
+                cast = int if typecode == 'b' else float
+                out[index] = array.array(typecode, (cast(v) for v in elements))
         return out
 
     def _has_oson_columns(self) -> bool:
@@ -11186,6 +11414,17 @@ class PostgresBackend:
                 if declared == 'NCLOB':
                     columns[i] = replace(
                         columns[i], csfrm=_CSFRM_NATIONAL, charset=AL16UTF16_CHARSET
+                    )
+        # A computed TO_VECTOR(text, n, format) item describes as that vector
+        # (#1708), where its composite says only its values' format.
+        if original:
+            for i, (count, code) in _computed_vector_columns(original).items():
+                if i < len(columns) and columns[i].data_type == TNS_TYPE_VECTOR:
+                    columns[i] = replace(
+                        columns[i],
+                        vector_dimensions=count or 0,
+                        vector_format=code or 0,
+                        vector_flags=0 if count else VECTOR_FLAG_FLEXIBLE_DIM,
                     )
         # A CAST to NVARCHAR2(n) / NCHAR(n) in the select list describes national,
         # n characters and 2n bytes, which its varchar(n) / char(n) does not say
@@ -12452,7 +12691,9 @@ class PostgresBackend:
         # 500 rows against a remote database. Returns the total affected-row count.
         # The Mirror calls this only for the non-batcherrors path, where a per-row
         # failure aborts the whole batch — exactly Oracle's non-batcherrors DML.
-        rows = [self._oson_binds(sql, row) for row in rows]
+        rows = [
+            self._vector_text_binds(sql, self._oson_binds(sql, row)) for row in rows
+        ]
         native = self._is_native(sql)
         if not native:
             sql = self._to_raw_targets(
@@ -12553,7 +12794,9 @@ class PostgresBackend:
         cannot serve the abort case: once the batch raises, the counts for the
         rows that did apply are no longer reachable.)
         """
-        rows = [self._oson_binds(sql, row) for row in rows]
+        rows = [
+            self._vector_text_binds(sql, self._oson_binds(sql, row)) for row in rows
+        ]
         rows = list(rows)
         if not rows:
             return 0, []

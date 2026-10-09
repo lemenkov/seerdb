@@ -60,6 +60,7 @@ from postgres_backend import (  # noqa: E402
     _translate_routine_ddl,
     _translate_routine_types,
     _translate_signed_year,
+    _translate_vector_functions,
     _urowid_expression,
 )
 
@@ -5653,6 +5654,89 @@ def test_vector_columns_on_pgvector() -> None:
         backend.rollback()
         try:
             backend.execute('DROP TABLE v1708')
+        except BackendError:
+            backend.rollback()
+        backend.close()
+
+
+def test_to_vector_and_vector_distance() -> None:
+    # TO_VECTOR(text [, n [, format]]) and VECTOR_DISTANCE(a, b [, metric]) on
+    # pgvector (#1708): a computed TO_VECTOR describes as its call says, a
+    # distance is a BINARY_DOUBLE, and a string written into a VECTOR column is
+    # the vector it spells. The answers are 23ai's.
+    import array
+
+    from seerdb.common.tns_consts import (
+        TNS_TYPE_BDOUBLE,
+        TNS_TYPE_VECTOR,
+        VECTOR_FLAG_FLEXIBLE_DIM,
+    )
+    from seerdb.server import BackendError
+
+    assert _translate_vector_functions(
+        "select to_vector('[1]', *, int8), vector_distance(a, b) from t"
+    ) == (
+        "select sys.ora_to_vector('[1]', NULL, 'INT8'), "
+        '(CAST(a AS vector) <=> CAST(b AS vector)) from t'
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    if not backend._has_pgvector:
+        backend.close()
+        pytest.skip('the PostgreSQL bed has no pgvector')
+    try:
+        result = backend.execute(
+            "SELECT TO_VECTOR('[34.6, 77.8]', 2, FLOAT64), "
+            "TO_VECTOR('[34, -77]', 2, INT8), TO_VECTOR('[1, 2]') FROM dual"
+        )
+        assert [
+            (c.data_type, c.vector_dimensions, c.vector_format) for c in result.columns
+        ][:2] == [(TNS_TYPE_VECTOR, 2, 3), (TNS_TYPE_VECTOR, 2, 4)]
+        assert [(v.typecode, list(v)) for v in result.rows[0]] == [
+            ('d', [34.6, 77.8]),
+            ('b', [34, -77]),
+            ('f', [1.0, 2.0]),
+        ]
+        # Across a UNION, a dimension count or a format holds where every
+        # branch names the same one; a NULL branch says nothing.
+        union = backend.execute(
+            "SELECT TO_VECTOR('[1, 2]', 2, FLOAT32) FROM dual UNION ALL "
+            'SELECT NULL FROM dual UNION ALL '
+            "SELECT TO_VECTOR('[1, 2, 3]', 3, FLOAT32) FROM dual"
+        )
+        assert (
+            union.columns[0].vector_dimensions,
+            union.columns[0].vector_format,
+            union.columns[0].vector_flags,
+        ) == (0, 2, VECTOR_FLAG_FLEXIBLE_DIM)
+        union = backend.execute(
+            "SELECT TO_VECTOR('[1, 2]', 2, FLOAT32) FROM dual UNION ALL "
+            "SELECT TO_VECTOR('[1, 2]', 2, FLOAT64) FROM dual"
+        )
+        assert (union.columns[0].vector_dimensions, union.columns[0].vector_format) == (
+            2,
+            0,
+        )
+        assert [r[0].typecode for r in union.rows] == ['f', 'd']
+        distance = backend.execute(
+            'SELECT VECTOR_DISTANCE(:1, :2, EUCLIDEAN) FROM dual',
+            [array.array('f', [0, 0]), array.array('d', [3, 4])],
+        )
+        assert distance.columns[0].data_type == TNS_TYPE_BDOUBLE
+        assert distance.rows == [(5.0,)]
+        with pytest.raises(BackendError) as exc:
+            backend.execute("SELECT TO_VECTOR('[1, 2]', 3, FLOAT32) FROM dual")
+        assert exc.value.ora_code == 51803
+        backend.execute('CREATE TABLE t1708 (n NUMBER, v VECTOR, i VECTOR(*, INT8))')
+        backend.execute(
+            'INSERT INTO t1708 VALUES (1, :1, :2)', ['[6427, -25.75]', '[3, -4]']
+        )
+        (row,) = backend.execute('SELECT v, i FROM t1708').rows
+        assert (row[0].typecode, list(row[0])) == ('f', [6427.0, -25.75])
+        assert (row[1].typecode, list(row[1])) == ('b', [3, -4])
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE t1708')
         except BackendError:
             backend.rollback()
         backend.close()
