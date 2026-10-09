@@ -6444,9 +6444,13 @@ class JSONIntegration(_IntegrationBase):
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class SodaIntegration(_IntegrationBase):
     # SODA collection management (#163 / #199), backed by DBMS_SODA. Needs an
-    # Oracle 18c+ server; skipped below that.
+    # Oracle 18c+ server; skipped below that, and over the Mirror's PostgreSQL
+    # backend, which has no DBMS_SODA (#1745).
     def setUp(self):
         super().setUp()
+        self._skip_if_mirror_backend(
+            'postgres', 'run DBMS_SODA, which SODA is built on'
+        )
         if (self.conn.server_version >> 24) < 18:
             self.conn.close()
             self.skipTest('SODA needs an Oracle 18c+ server (DBMS_SODA)')
@@ -10992,7 +10996,11 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     await Cur.execute(f'DROP TABLE {table}')
 
     async def test_async_soda_collections(self):
-        # SODA collection management (#163 / #199) on the async path; 18c+ only.
+        # SODA collection management (#163 / #199) on the async path; 18c+ only,
+        # and not over the Mirror's PostgreSQL backend, which has no DBMS_SODA
+        # (#1745).
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest("the Mirror's postgres backend cannot run DBMS_SODA")
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
             if (Conn.server_version >> 24) < 18:
                 self.skipTest('SODA needs an Oracle 18c+ server (DBMS_SODA)')
