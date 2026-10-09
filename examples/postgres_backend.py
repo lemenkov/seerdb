@@ -8314,6 +8314,16 @@ def _replace_binds(sql: str, replacement: dict[str, str]) -> str:
     return ''.join(out)
 
 
+def _several_statements(body: str) -> bool:
+    # Whether a block's body holds more than one statement: a `;` outside
+    # literals, quoted names and comments with more after it (#1723).
+    tokens = [t for t in sql_tokens(body) if t.kind not in ('space', 'comment')]
+    return any(
+        t.kind == 'other' and body[t.start : t.end] == ';' and i < len(tokens) - 1
+        for i, t in enumerate(tokens)
+    )
+
+
 # The setting a block leaves each bind's value in, read back after it (#1456, #1459).
 _BLOCK_BIND_SETTING = 'mirror.block_bind_{}'
 
@@ -14025,6 +14035,12 @@ class PostgresBackend:
         inner = _CALL_BLOCK.match(sql)
         statement = inner.group(1) if inner else ''
         try:
+            # A block of several statements is none of the one-statement shapes
+            # below, which would each take its first statement for the whole:
+            # a block, its binds its locals, so each statement reads and writes
+            # them in turn (#1723).
+            if inner is not None and _several_statements(statement):
+                return self._run_block(sql, binds)
             func = _FUNC_CALL.match(statement)
             if func is not None:
                 return self._call_function(func, values, sql)
