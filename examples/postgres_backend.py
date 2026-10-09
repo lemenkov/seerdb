@@ -968,6 +968,58 @@ _HELPER_FUNCTIONS_DDL = (
         for exponent in ('smallint', 'integer', 'bigint')
     )
     + (
+        # Oracle's SQL/JSON over jsonb (#1707), the values JSON has no type for
+        # in their extended form (#1706). JSON(text [EXTENDED]) parses text,
+        # extended names and all.
+        'CREATE OR REPLACE FUNCTION sys.ora_json(text) RETURNS jsonb '
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::jsonb $$;'
+        'CREATE OR REPLACE FUNCTION sys.ora_json(jsonb) RETURNS jsonb '
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
+        # JSON_SCALAR(x): x as a JSON scalar, in its extended form where JSON
+        # has no type for it.
+        'CREATE OR REPLACE FUNCTION sys.ora_json_scalar(anyelement) RETURNS jsonb '
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT to_jsonb($1) $$;'
+        'CREATE OR REPLACE FUNCTION sys.ora_json_scalar(timestamp) RETURNS jsonb '
+        "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT jsonb_build_object('$oracleTimestamp', "
+        """to_char($1, 'YYYY-MM-DD"T"HH24:MI:SS.US')) $$;"""
+        f'CREATE OR REPLACE FUNCTION sys.ora_json_scalar({_DATE_TYPE}) RETURNS jsonb '
+        "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT jsonb_build_object('$oracleDate', "
+        """to_char($1, 'YYYY-MM-DD"T"HH24:MI:SS')) $$;"""
+        f'CREATE OR REPLACE FUNCTION sys.ora_json_scalar({_INTERVALYM_TYPE}) '
+        'RETURNS jsonb LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT jsonb_build_object('
+        "'$intervalYearMonth', CASE WHEN $1 < interval '0' THEN '-' ELSE '' END || "
+        "'P' || abs(extract(year FROM $1)) || 'Y' || abs(extract(month FROM $1)) || 'M') $$;"
+        # A plain interval is YEAR TO MONTH when it has years or months --
+        # TO_YMINTERVAL gives one -- and DAY TO SECOND otherwise: an Oracle
+        # interval is one or the other.
+        'CREATE OR REPLACE FUNCTION sys.ora_json_scalar(interval) RETURNS jsonb '
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT CASE WHEN extract(year FROM $1) <> 0 '
+        f'OR extract(month FROM $1) <> 0 THEN sys.ora_json_scalar($1::{_INTERVALYM_TYPE}) '
+        "ELSE jsonb_build_object('$intervalDaySecond', "
+        "CASE WHEN $1 < interval '0' THEN '-' ELSE '' END || 'P' || "
+        "extract(day FROM abs_i) || 'DT' || extract(hour FROM abs_i) || 'H' || "
+        "extract(minute FROM abs_i) || 'M' || trim_scale(extract(second FROM abs_i)) "
+        "|| 'S') END FROM (SELECT CASE WHEN $1 < interval '0' THEN -$1 ELSE $1 END) "
+        'AS a(abs_i) $$;'
+        'CREATE OR REPLACE FUNCTION sys.ora_json_scalar(bytea) RETURNS jsonb '
+        "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT jsonb_build_object('$rawhex', "
+        "upper(encode($1, 'hex'))) $$;"
+        # JSON_SERIALIZE(x): x as compact JSON text, as Oracle writes it, each
+        # extended value as its plain JSON one -- a number unquoted, the rest
+        # as their strings.
+        'CREATE OR REPLACE FUNCTION sys.ora_json_serialize(j jsonb) RETURNS text '
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT CASE jsonb_typeof(j) '
+        "WHEN 'object' THEN CASE WHEN (SELECT count(*) FROM jsonb_object_keys(j)) = 1 "
+        "AND (SELECT k FROM jsonb_object_keys(j) k) ~ '^[$](number|oracle|interval|rawhex)' "
+        "THEN (SELECT CASE WHEN k LIKE '$number%' THEN v #>> '{}' ELSE v::text END "
+        'FROM jsonb_each(j) AS e(k, v)) '
+        "ELSE '{' || coalesce((SELECT string_agg(to_json(k)::text || ':' || "
+        "sys.ora_json_serialize(v), ',') FROM jsonb_each(j) AS e(k, v)), '') || '}' END "
+        "WHEN 'array' THEN '[' || coalesce((SELECT string_agg(sys.ora_json_serialize(v), "
+        "',' ORDER BY n) FROM jsonb_array_elements(j) WITH ORDINALITY AS a(v, n)), '') "
+        "|| ']' ELSE j::text END $$;"
+    )
+    + (
         # A BOOLEAN stored into a NUMBER column (#1705): 23ai converts it, TRUE to 1
         # and FALSE to 0, as a client binding a bool at 23ai expects. An assignment
         # cast only -- an expression mixing the two stays an error, as in Oracle.
@@ -2364,11 +2416,29 @@ def _from_extended(value: object) -> object:
         return value
     if len(value) == 1:
         ((key, item),) = value.items()
+        if isinstance(item, (int, float)) and not isinstance(item, bool):
+            # A number given as itself, as JSON(... EXTENDED) text writes one.
+            if key in ('$numberFloat', '$numberDouble'):
+                return float(item)
+            if key in ('$numberLong', '$numberInt'):
+                return int(item)
+            if key == '$numberDecimal':
+                return decimal.Decimal(str(item))
         if isinstance(item, str):
             if key == '$numberDecimal':
                 return decimal.Decimal(item)
-            if key in ('$oracleTimestamp', '$oracleTimestampTZ'):
+            if key == '$oracleTimestamp':
                 return datetime.datetime.fromisoformat(item)
+            if key == '$oracleTimestampTZ':
+                # The instant, naive in UTC, as a client decodes OSON's.
+                when = datetime.datetime.fromisoformat(item.replace('Z', '+00:00'))
+                if when.tzinfo is not None:
+                    when = when.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+                return when
+            if key in ('$numberFloat', '$numberDouble'):
+                return float(item)
+            if key in ('$numberLong', '$numberInt'):
+                return int(item)
             if key == '$oracleDate':
                 return datetime.datetime.fromisoformat(item)
             if key == '$rawhex':
@@ -4903,6 +4973,46 @@ def _rr_format(fmt: str, parsing: bool) -> str:
     return _RR_FORMAT_YEAR.sub(one, fmt)
 
 
+# Oracle's SQL/JSON functions and the PostgreSQL calls that do their work
+# over jsonb (#1707).
+_JSON_FUNCTION_NAMES = frozenset(
+    {'JSON', 'JSON_SCALAR', 'JSON_QUERY', 'JSON_EXISTS', 'JSON_SERIALIZE'}
+)
+_JSON_EXTENDED = re.compile(r'\s+EXTENDED\s*$', re.IGNORECASE)
+_JSON_RETURNING = re.compile(r'\s+RETURNING\b.*$', re.IGNORECASE | re.DOTALL)
+
+
+def _translate_json_functions(sql: str) -> str:
+    """JSON(x [EXTENDED]), JSON_SCALAR(x), JSON_QUERY(x, path),
+    JSON_EXISTS(x, path) and JSON_SERIALIZE(x) as PostgreSQL computes them over
+    jsonb (#1707). A path is SQL/JSON's on both sides. Clauses past the
+    arguments -- RETURNING, a wrapper, ON ERROR -- are not kept."""
+    if 'json' not in sql.lower():
+        return sql
+
+    def call(name: str, args: list[str]) -> str | None:
+        upper = name.upper()
+        inner = [_translate_json_functions(a) for a in args]
+        if upper == 'JSON' and len(inner) == 1:
+            return f'sys.ora_json({_JSON_EXTENDED.sub("", inner[0]).strip()})'
+        if upper == 'JSON_SCALAR' and len(inner) == 1:
+            return f'sys.ora_json_scalar({inner[0].strip()})'
+        if upper == 'JSON_SERIALIZE' and len(inner) == 1:
+            value = _JSON_RETURNING.sub('', inner[0]).strip()
+            return f'sys.ora_json_serialize(sys.ora_json({value}))'
+        if upper in ('JSON_QUERY', 'JSON_EXISTS') and len(inner) >= 2:
+            path = _JSON_RETURNING.sub('', inner[1]).strip().split()[0]
+            function = (
+                'jsonb_path_query_first'
+                if upper == 'JSON_QUERY'
+                else 'jsonb_path_exists'
+            )
+            return f'{function}(sys.ora_json({inner[0].strip()}), CAST({path} AS jsonpath))'
+        return None
+
+    return _rewrite_calls(sql, _JSON_FUNCTION_NAMES, call, '_$#."')
+
+
 def _translate_rr_year(sql: str) -> str:
     """Give Oracle's RR and RRRR years a PostgreSQL meaning (#1638).
 
@@ -6103,6 +6213,7 @@ def _translate_idioms(sql: str) -> str:
     sql = _ruled('signed-year', _translate_signed_year(sql), sql)
     sql = _ruled('rr-year', _translate_rr_year(sql), sql)
     sql = _ruled('decode', _translate_decode(sql), sql)
+    sql = _ruled('json-functions', _translate_json_functions(sql), sql)
     # The rewrites change Oracle words into PostgreSQL ones, and a string
     # literal or a quoted identifier holding such a word is data, not SQL:
     # `data_type = 'VARCHAR2'` was rewritten to `= 'varchar'` and matched
@@ -8955,6 +9066,8 @@ class PostgresBackend:
         # type's RAW attribute positions, by name; any DDL starts them over.
         self._has_raw_targets_cache: bool | None = None
         self._raw_layout_cache: dict[str, tuple[list[str], frozenset[int]] | None] = {}
+        # Which table columns are JSON, for dot notation (#1707).
+        self._json_columns_cache: dict[str, bool] = {}
         # OSON columns (#1706): whether any exist, and each relation's.
         self._has_oson_cache: bool | None = None
         self._oson_layout_cache: dict[str, tuple[list[str], frozenset[int]] | None] = {}
@@ -9429,6 +9542,7 @@ class PostgresBackend:
         if refused is not None:
             raise refused
         binds = self._oson_binds(sql, binds)
+        sql = _ruled('json-dot-notation', self._json_dot_notation(sql), sql)
         sql = _ruled('package-function-call', self._call_package_functions(sql), sql)
         bare = _BARE_CALL.match(sql)
         if bare is not None and bare.group(1).upper() not in _PLSQL_WORD_STATEMENTS:
@@ -9831,6 +9945,53 @@ class PostgresBackend:
             ).fetchone()
             self._has_raw_targets_cache = bool(row and row[0])
         return self._has_raw_targets_cache
+
+    def _json_dot_notation(self, sql: str) -> str:
+        """Oracle's simple dot notation into a JSON column, `alias.column.key
+        [.key ...]`, as PostgreSQL's `(alias.column -> 'key' ...)` (#1707). The
+        same spelling is object attribute access (#1434), so only a path whose
+        alias names a table whose column is JSON is rewritten here; the rest is
+        left to that rewrite. A key is matched as written."""
+        if '.' not in sql:
+            return sql
+        (masked, contents) = _mask_quoted(sql)
+        tables = {
+            m.group(2).upper(): _unmask_quoted(m.group(1), contents)
+            for m in _CORRELATION_NAME.finditer(masked)
+        }
+        if not tables:
+            return sql
+        out: list[str] = []
+        pos = 0
+        for match in _ATTRIBUTE_PATH.finditer(masked):
+            table = tables.get(match.group(1).upper())
+            column = _unmask_quoted(match.group(2), contents)
+            if table is None or not self._is_json_column(table, column):
+                continue
+            keys = _ATTRIBUTE_DOT.split(_unmask_quoted(match.group(3), contents))[1:]
+            path = ''
+            for key in keys:
+                name = key[1:-1] if key.startswith('"') else key
+                path += f' -> {_sql_text(name)}'
+            out.append(_unmask_quoted(masked[pos : match.start()], contents))
+            out.append(f'({match.group(1)}.{column}{path})')
+            pos = match.end()
+        if not out:
+            return sql
+        out.append(_unmask_quoted(masked[pos:], contents))
+        return ''.join(out)
+
+    def _is_json_column(self, table: str, column: str) -> bool:
+        # Whether a table's column is JSON (jsonb), cached (#1707).
+        key = f'{table.lower()}.{column.lower()}'
+        if key not in self._json_columns_cache:
+            row = self._conn.execute(
+                'SELECT atttypid = ANY(ARRAY[to_regtype(%s), to_regtype(%s)]) '
+                'FROM pg_attribute WHERE attrelid = to_regclass(%s) AND attname = %s',
+                ('jsonb', _OSON_TYPE, table, _pg_identifier(column)),
+            ).fetchone()
+            self._json_columns_cache[key] = bool(row and row[0])
+        return self._json_columns_cache[key]
 
     def _oson_layout(self, name: str) -> tuple[list[str], frozenset[int]] | None:
         # A relation's columns, in order, and which of them are OSON (#1706).
