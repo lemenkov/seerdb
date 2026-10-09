@@ -2768,9 +2768,57 @@ def _answer_bfile(
             TNS_DATA, encode_error(ORA_NONEXISTENT_FILE, _ORA_BFILE_MISSING_TEXT)
         )
         return
-    # FILE_OPEN on a file that is there, and FILE_CLOSE: the locator back, which
-    # is what the client reads and reuses for the READ that follows.
+    if request.kind == 'file_open':
+        # The locator back, which the client reuses for the READ that follows,
+        # then the mode it sent: it reads an amount back for any op that sent
+        # one, and without it took the OER's first byte for it and desynced
+        # (#1672). 23ai also sets an open flag inside the locator; nothing is
+        # held open here, so the locator goes back as it came.
+        stream.write_packet(
+            TNS_DATA,
+            encode_lobops_open_ack(
+                len(request.locator).to_bytes(2, 'big') + request.locator,
+                request.amount,
+            ),
+        )
+        return
+    # FILE_CLOSE: the locator back.
     stream.write_packet(TNS_DATA, encode_lobops_ack(request.locator))
+
+
+def _answer_bfile_content(
+    stream: PacketStream,
+    backend: Backend | None,
+    request: LobOpsRequest,
+    names: tuple[str, str],
+) -> None:
+    """A BFILE's length or bytes (#1672), as 23ai answers them: the shapes a
+    BLOB's GET_LENGTH and READ answer in. The backend reads the file --
+    ``bfile_length(directory, filename)`` and ``bfile_read(directory,
+    filename, offset, amount)``, the offset 1-based and an amount of 0 or less
+    the rest of the file. A backend without them refuses the call, as for any
+    unservable one; its own error is relayed."""
+    (directory, filename) = names
+    reads = request.kind == 'read'
+    hook = getattr(backend, 'bfile_read' if reads else 'bfile_length', None)
+    if hook is None:
+        _refuse_unhandled(stream, f'a BFILE {request.kind}')
+        return
+    try:
+        if reads:
+            data = hook(directory, filename, max(request.offset, 1), request.amount)
+        else:
+            length = hook(directory, filename)
+    except BackendError as err:
+        stream.write_packet(TNS_DATA, encode_error(err.ora_code, err.ora_message))
+        return
+    if reads:
+        stream.write_packet(
+            TNS_DATA,
+            encode_lob_read_response_thin(data, is_clob=False, locator=request.locator),
+        )
+    else:
+        stream.write_packet(TNS_DATA, encode_lobops_length(request.locator, length))
 
 
 def _answer_lobops(
@@ -2797,6 +2845,18 @@ def _answer_lobops(
     request = parse_lobops_request(body)
     if request.kind in ('file_open', 'file_close', 'file_exists', 'file_isopen'):
         _answer_bfile(stream, backend, request)
+        return lobs, current_lob, current_object_lob
+    # GET_LENGTH / READ on a BFILE locator (#1672): the file's own length and
+    # bytes, which only the backend can reach. Not one of the client's temp
+    # LOBs nor a column LOB the Mirror emitted, so the queues below have
+    # nothing for it, and answered another LOB's content or none.
+    if (
+        request.kind in ('get_length', 'read')
+        and temp_lobs.resolve(request.locator) is None
+        and _emitted_lob(lob_emit_log, request.locator) is None
+        and (names := decode_bfile_locator(request.locator)) is not None
+    ):
+        _answer_bfile_content(stream, backend, request, names)
         return lobs, current_lob, current_object_lob
     if request.kind == 'create_temp':
         locator = temp_lobs.mint(request.is_blob)

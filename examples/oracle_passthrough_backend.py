@@ -79,6 +79,10 @@ def _carries_bc_dates(method: Callable[..., _T]) -> Callable[..., _T]:
     return wrapper
 
 
+# The most DBMS_LOB.SUBSTR returns from a BFILE in one call, a RAW (#1672).
+_BFILE_READ_CHUNK = 32767
+
+
 class OraclePassthroughBackend:
     """Relays statements to a real Oracle at ``(host, port, service)``."""
 
@@ -266,6 +270,54 @@ class OraclePassthroughBackend:
             return bool(present)
         except seerdb.DatabaseError as exc:
             raise _relay_error(exc) from exc
+
+    def bfile_length(self, directory: str, filename: str) -> int:
+        """A BFILE's length upstream (#1672): DBMS_LOB.GETLENGTH, whose own error
+        for a missing directory or file reaches the client."""
+        assert self._conn is not None  # authenticate() ran before this
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(
+                'SELECT DBMS_LOB.GETLENGTH(BFILENAME(:1, :2)) FROM dual',
+                [directory, filename],
+            )
+            (length,) = cursor.fetchone()
+            return int(length or 0)
+        except seerdb.DatabaseError as exc:
+            raise _relay_error(exc) from exc
+
+    def bfile_read(
+        self, directory: str, filename: str, offset: int, amount: int
+    ) -> bytes:
+        """``amount`` bytes of a BFILE from ``offset`` (1-based), or the rest of
+        the file for an amount of 0 or less, read upstream (#1672). DBMS_LOB.SUBSTR
+        reads an opened BFILE, at most 32767 bytes a call, so a longer read takes
+        several."""
+        assert self._conn is not None  # authenticate() ran before this
+        start = max(offset, 1)
+        end = self.bfile_length(directory, filename) + 1
+        if amount > 0:
+            end = min(end, start + amount)
+        cursor = self._conn.cursor()
+        out = bytearray()
+        try:
+            while start < end:
+                chunk = min(_BFILE_READ_CHUNK, end - start)
+                receiver = cursor.var(seerdb.DB_TYPE_RAW, chunk)
+                cursor.execute(
+                    'DECLARE b BFILE := BFILENAME(:1, :2); BEGIN '
+                    'DBMS_LOB.FILEOPEN(b); :3 := DBMS_LOB.SUBSTR(b, :4, :5); '
+                    'DBMS_LOB.FILECLOSE(b); END;',
+                    [directory, filename, receiver, chunk, start],
+                )
+                data = receiver.getvalue() or b''
+                if not data:
+                    break
+                out += data
+                start += len(data)
+        except seerdb.DatabaseError as exc:
+            raise _relay_error(exc) from exc
+        return bytes(out)
 
     def ping(self) -> None:
         """Prove the UPSTREAM session is alive, not just this process (#826).

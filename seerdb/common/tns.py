@@ -2894,9 +2894,17 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
     if operation in _LOBOPS_FILE_KINDS:
         # A BFILE call: the locator carries the directory and file name, so the
         # server needs no state to answer one (#1102).
+        #
+        # FILE_OPEN also sends its mode as a trailing amount, which the reply
+        # owes back, as a LOB's OPEN does (#1672).
+        locator = _lobops_locator_after_operation(rest)
+        tail = rest[2:]
+        _, tail = decode_ub4(tail)
+        _, tail = decode_ub4(tail)
+        tail = tail[7 + 2 + len(locator) :]
+        amount, _ = decode_ub4(tail) if tail else (0, b'')
         return LobOpsRequest(
-            kind=_LOBOPS_FILE_KINDS[operation],
-            locator=_lobops_locator_after_operation(rest),
+            kind=_LOBOPS_FILE_KINDS[operation], locator=locator, amount=amount
         )
     if operation == TNS_LOB_OP_FREE_TEMP:
         return LobOpsRequest(

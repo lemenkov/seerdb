@@ -131,6 +131,10 @@ honest edge of this adapter:
 - **DIRECTORY objects, without privileges** -- CREATE / DROP DIRECTORY keep
   a name for a path on the PostgreSQL host, which ALL_DIRECTORIES lists
   (#1668). Any user may create one, where Oracle wants CREATE ANY DIRECTORY.
+- **BFILEs read by the PostgreSQL server** -- a BFILE's file is on the
+  PostgreSQL host, read through pg_stat_file and pg_read_binary_file
+  (#1669, #1672), so the backend's role needs pg_read_server_files (or to be
+  a superuser). The client reads one; DBMS_LOB's file routines are not there.
 - **Editions, by name only** -- CREATE / DROP EDITION, ALTER SESSION SET
   EDITION and a login's edition keep the session's edition, which
   CURRENT_EDITION_NAME reads (#1662). Objects are not versioned per edition:
@@ -12487,32 +12491,78 @@ class PostgresBackend:
         ).fetchone()
         return row is not None
 
-    def bfile_exists(self, directory: str, filename: str) -> bool:
-        """Whether a BFILE's file exists (#1669): ORA-22285 when its DIRECTORY
-        object does not, else whether the file is there under the directory's
-        path, on the PostgreSQL host, as pg_stat_file finds it -- the server
-        that reads it, as Oracle's does."""
+    def _bfile_path(self, directory: str, filename: str, operation: str) -> str:
+        # The path of a BFILE's file on the PostgreSQL host (#1669): under its
+        # DIRECTORY object's path, ORA-22285 when that object does not exist.
         row = self._conn.execute(
             'SELECT path FROM sys.ora_directories WHERE name = %s', (directory,)
         ).fetchone()
         if row is None:
             self._conn.rollback()
             raise BackendError(
-                'non-existent directory or file for FILEEXISTS operation',
+                f'non-existent directory or file for {operation} operation',
                 ora_code=ORA_NONEXISTENT_FILE,
             )
-        path = row[0].rstrip('/') + '/' + filename
+        return row[0].rstrip('/') + '/' + filename
+
+    def _bfile_size(self, path: str) -> int | None:
+        # The file's size, None for no such file. A missing file is a NULL
+        # record; a present one's creation time is NULL on Linux, so a
+        # whole-record test says neither.
         try:
-            found = self._conn.execute(
-                # A missing file is a NULL record; a present one's creation
-                # time is NULL on Linux, so a whole-record test says neither.
-                'SELECT (pg_stat_file(%s, true)).size IS NOT NULL',
-                (path,),
+            row = self._conn.execute(
+                'SELECT (pg_stat_file(%s, true)).size', (path,)
             ).fetchone()
         except psycopg.Error as exc:
             self._conn.rollback()
             raise _backend_error(exc) from exc
-        return bool(found and found[0])
+        return None if row is None or row[0] is None else int(row[0])
+
+    def bfile_exists(self, directory: str, filename: str) -> bool:
+        """Whether a BFILE's file exists (#1669): ORA-22285 when its DIRECTORY
+        object does not, else whether the file is there under the directory's
+        path, on the PostgreSQL host, as pg_stat_file finds it -- the server
+        that reads it, as Oracle's does."""
+        return (
+            self._bfile_size(self._bfile_path(directory, filename, 'FILEEXISTS'))
+            is not None
+        )
+
+    def bfile_length(self, directory: str, filename: str) -> int:
+        """A BFILE's length in bytes (#1672), the file's on the PostgreSQL host."""
+        size = self._bfile_size(self._bfile_path(directory, filename, 'GETLENGTH'))
+        if size is None:
+            raise BackendError(
+                'non-existent directory or file for GETLENGTH operation',
+                ora_code=ORA_NONEXISTENT_FILE,
+            )
+        return size
+
+    def bfile_read(
+        self, directory: str, filename: str, offset: int, amount: int
+    ) -> bytes:
+        """``amount`` bytes of a BFILE from ``offset`` (1-based), or the rest of
+        the file for an amount of 0 or less (#1672), read on the PostgreSQL
+        host through pg_read_binary_file."""
+        path = self._bfile_path(directory, filename, 'READ')
+        size = self._bfile_size(path)
+        if size is None:
+            raise BackendError(
+                'non-existent directory or file for READ operation',
+                ora_code=ORA_NONEXISTENT_FILE,
+            )
+        start = max(offset - 1, 0)
+        count = size - start if amount <= 0 else min(amount, size - start)
+        if count <= 0:
+            return b''
+        try:
+            row = self._conn.execute(
+                'SELECT pg_read_binary_file(%s, %s, %s)', (path, start, count)
+            ).fetchone()
+        except psycopg.Error as exc:
+            self._conn.rollback()
+            raise _backend_error(exc) from exc
+        return bytes(row[0]) if row and row[0] is not None else b''
 
     def _rowid_columns(self, table: str) -> frozenset[str]:
         # The ROWID columns of a table a statement names (#1624), lower case.

@@ -142,3 +142,152 @@ class BfileFileExistsReply(unittest.TestCase):
         body = self._reply(False)
         self.assertEqual(body[1:57], self.REQUEST[-56:])
         self.assertEqual(body[57], 0)
+
+
+class BfileFileOpenReply(unittest.TestCase):
+    """The Mirror's answer to FILE_OPEN (#1672).
+
+    The client sends the open mode as an amount and reads one back for any op
+    that sent one::
+
+        elif self.send_amount:
+            buf.read_sb8(&self.amount)
+
+    Answered with the locator alone, it took the OER's first byte for the
+    amount and desynced -- ``DPY-5000: unknown protocol message type 0`` -- so
+    no BFILE could be read.
+    """
+
+    # python-oracledb 4.0.1 opening PYO_BFILE_DIR/pyoracle_bfile_test.txt on a
+    # live 23ai, read-only (mode 11), and what 23ai answered up to its OER.
+    REQUEST = bytes.fromhex(
+        '0360070001013800000000000000020100000000000100000000000000360001080800'
+        '000001000000000000000d50594f5f4246494c455f444952001770796f7261636c655f'
+        '6266696c655f746573742e747874010b'
+    )
+    REPLY = bytes.fromhex(
+        '0800360001080800000001000100000000000d50594f5f4246494c455f444952001770'
+        '796f7261636c655f6266696c655f746573742e747874010b'
+    )
+
+    def _reply(self) -> bytes:
+        from typing import Any
+
+        from seerdb.common.tns import _DECODE_FIELD_VERSION, parse_lobops_request
+        from seerdb.server.session import _answer_bfile
+
+        class _Backend:
+            def bfile_exists(self, directory, filename):
+                return True
+
+        class _Stream:
+            def __init__(self):
+                self.body = b''
+
+            def write_packet(self, kind, body):
+                self.body = body
+
+        token = _DECODE_FIELD_VERSION.set(24)
+        try:
+            request = parse_lobops_request(self.REQUEST)
+            self.assertEqual(request.kind, 'file_open')
+            self.assertEqual(request.amount, 11)
+            stream: Any = _Stream()
+            backend: Any = _Backend()
+            _answer_bfile(stream, backend, request)
+            return stream.body
+        finally:
+            _DECODE_FIELD_VERSION.reset(token)
+
+    def test_the_mode_follows_the_locator(self):
+        body = self._reply()
+        # 23ai flags the locator open (the byte at offset 12 of the reply);
+        # the Mirror holds nothing open and hands it back as it came.
+        self.assertEqual(
+            body[:12] + body[13 : len(self.REPLY)], self.REPLY[:12] + self.REPLY[13:]
+        )
+        self.assertEqual(body[12], 0)
+        self.assertEqual(body[len(self.REPLY)], 4)  # then the OER
+
+
+class BfileContentReply(unittest.TestCase):
+    """The Mirror's answer to GET_LENGTH and READ on a BFILE (#1672), from the
+    backend's ``bfile_length`` / ``bfile_read`` hooks, in the shapes 23ai
+    answers ``size()`` and ``read()`` of PYO_BFILE_DIR/pyoracle_bfile_test.txt.
+    """
+
+    # The locator FIELD (ub2 + body) both requests carry, as the Mirror's
+    # FILE_OPEN handed it back -- 23ai's own READ carries it open-flagged.
+    FIELD = bytes.fromhex(
+        '00360001080800000001000000000000000d50594f5f4246494c455f444952001770'
+        '796f7261636c655f6266696c655f746573742e747874'
+    )
+    GET_LENGTH = bytes.fromhex('036005000101380000000000000001010000000001000000000000')
+    READ = bytes.fromhex('03600800010138000000000000000102000001010001000000000000')
+    DATA = b'hello bfile from disk'
+
+    def _reply(self, request: bytes, backend: object) -> bytes:
+        from typing import Any
+
+        from seerdb.common.tns import _DECODE_FIELD_VERSION
+        from seerdb.server.session import _answer_lobops, _TempLobs
+
+        class _Stream:
+            def __init__(self):
+                self.body = b''
+
+            def write_packet(self, kind, body):
+                self.body = body
+
+        token = _DECODE_FIELD_VERSION.set(24)
+        try:
+            stream: Any = _Stream()
+            _answer_lobops(stream, request, [], _TempLobs(), backend=backend)  # type: ignore[arg-type]
+            return stream.body
+        finally:
+            _DECODE_FIELD_VERSION.reset(token)
+
+    def _backend(self) -> object:
+        data = self.DATA
+
+        class _Backend:
+            calls: list[tuple] = []
+
+            def bfile_length(self, directory, filename):
+                self.calls.append(('length', directory, filename))
+                return len(data)
+
+            def bfile_read(self, directory, filename, offset, amount):
+                self.calls.append(('read', directory, filename, offset, amount))
+                return data[offset - 1 : offset - 1 + amount]
+
+        return _Backend()
+
+    def test_size(self):
+        backend = self._backend()
+        body = self._reply(self.GET_LENGTH + self.FIELD + b'\x00', backend)
+        self.assertEqual(
+            body[: 1 + len(self.FIELD) + 2], b'\x08' + self.FIELD + b'\x01\x15'
+        )
+        self.assertEqual(
+            backend.calls,
+            [('length', 'PYO_BFILE_DIR', 'pyoracle_bfile_test.txt')],  # type: ignore[attr-defined]
+        )
+
+    def test_read(self):
+        backend = self._backend()
+        body = self._reply(
+            self.READ + self.FIELD + bytes.fromhex('04ffffffff'), backend
+        )
+        # 23ai frames the bytes in the long form (0e fe 01 15 <data> 00); the
+        # short one every Mirror LOB read uses reads the same.
+        expected = b'\x0e\x15' + self.DATA + b'\x08' + self.FIELD + b'\x01\x15'
+        self.assertEqual(body[: len(expected)], expected)
+        self.assertEqual(
+            backend.calls,  # type: ignore[attr-defined]
+            [('read', 'PYO_BFILE_DIR', 'pyoracle_bfile_test.txt', 1, 0xFFFFFFFF)],
+        )
+
+    def test_a_backend_without_the_hooks_refuses(self):
+        body = self._reply(self.GET_LENGTH + self.FIELD + b'\x00', object())
+        self.assertNotIn(b'\x08' + self.FIELD, body)
