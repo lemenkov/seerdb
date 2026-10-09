@@ -211,10 +211,11 @@ import re
 import select
 import struct
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import Final, NamedTuple, TypeVar, cast
+from typing import Any, Final, NamedTuple, TypeVar, cast
 
 import psycopg
 from psycopg import sql
@@ -8740,12 +8741,9 @@ class PostgresBackend:
         if edition:
             # The edition the client connected in (#1662); one that does not
             # exist refuses the login, ORA-38802, as Oracle's does.
-            try:
+            with self._rolled_back_on_error():
                 self._conn.execute('SELECT sys.ora_set_edition(%s)', (edition.upper(),))
                 self._conn.commit()
-            except psycopg.Error as exc:
-                self._conn.rollback()
-                raise _backend_error(exc) from exc
         # The service the client connected to, for USERENV SERVICE_NAME (#1409),
         # kept in a session setting as the tracing attributes are.
         service = connect_attrs.get('service_name')
@@ -8917,7 +8915,7 @@ class PostgresBackend:
         )
         self._portals_opened += 1
         name = f'ora_cursor_{self._portals_opened}'
-        try:
+        with self._rolled_back_on_error(original=query):
             self._conn.execute(
                 sql.SQL('DECLARE {} CURSOR FOR ')
                 .format(sql.Identifier(name))
@@ -8930,9 +8928,6 @@ class PostgresBackend:
                         sql.Literal(skip), sql.Identifier(name)
                     )
                 )
-        except psycopg.Error as exc:
-            self._conn.rollback()
-            raise _backend_error(exc, original=query) from exc
         return _PortalName(name)
 
     def parse(self, sql: str) -> None:
@@ -8971,20 +8966,42 @@ class PostgresBackend:
         params: dict | None = None
         if placeholders:
             translated, params = _translate_binds(translated, [None] * placeholders)
-        cursor = self._conn.cursor()
-        cursor.execute('SAVEPOINT _mirror_parse')
         try:
-            cursor.execute(f'EXPLAIN {translated}', params)
+            with self._under_savepoint('_mirror_parse'):
+                self._conn.execute(f'EXPLAIN {translated}', params)
         except psycopg.Error as exc:
-            self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_parse')
-            self._conn.execute('RELEASE SAVEPOINT _mirror_parse')
             # A bind whose type only its value would settle is not an error in
             # Oracle, whose parse has no value either.
             if getattr(exc, 'sqlstate', None) == '42P18':
                 return
             raise _backend_error(exc, original=sql, translated=translated) from exc
-        self._conn.execute('RELEASE SAVEPOINT _mirror_parse')
         self._release_read_locks()
+
+    @contextmanager
+    def _under_savepoint(self, name: str = '_mirror_stmt') -> Iterator[None]:
+        # The block runs under a savepoint: one that raises is rolled back to it,
+        # leaving the rest of the transaction usable as Oracle's is, and the
+        # savepoint goes either way. The caller maps the error, AFTER the
+        # rollback here: naming it can read the catalog, which a failed
+        # transaction refuses (#1632).
+        self._conn.execute(f'SAVEPOINT {name}')
+        try:
+            yield
+        except Exception:
+            self._conn.execute(f'ROLLBACK TO SAVEPOINT {name}')
+            self._conn.execute(f'RELEASE SAVEPOINT {name}')
+            raise
+        self._conn.execute(f'RELEASE SAVEPOINT {name}')
+
+    @contextmanager
+    def _rolled_back_on_error(self, **context: Any) -> Iterator[None]:
+        # A PostgreSQL failure in the block rolls the transaction back and is
+        # raised as the ORA error it maps to, `context` passed to the mapping.
+        try:
+            yield
+        except psycopg.Error as exc:
+            self._conn.rollback()
+            raise _backend_error(exc, **context) from exc
 
     def _release_read_locks(self) -> None:
         """End the open transaction if it has written nothing (#1190).
@@ -11534,28 +11551,20 @@ class PostgresBackend:
         # SAVEPOINT + statement + RELEASE as three round-trips; the fallback path.
         # A `prelude` runs inside the savepoint first, so a SET LOCAL there is
         # undone with a statement that fails and ends with one that commits.
+        # An our-side rejection after the statement ran (UnsupportedFeature on an
+        # unmapped column type) is undone too, and left for the session to map.
         cursor = self._conn.cursor()
-        cursor.execute('SAVEPOINT _mirror_stmt')
         try:
-            if prelude is not None:
-                cursor.execute(prelude)
-            cursor.execute(sql, params)
-            result = self._build_result(cursor, sql, original or '')
+            with self._under_savepoint():
+                if prelude is not None:
+                    cursor.execute(prelude)
+                cursor.execute(sql, params)
+                result = self._build_result(cursor, sql, original or '')
         except psycopg.Error as exc:
-            self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_stmt')
-            self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
             # A PostgreSQL failure surfaces as a clean ORA error — never a desync.
             # Map the SQLSTATE to the matching Oracle code so error-conditional
             # client flows (e.g. a best-effort DROP that swallows ORA-00942) work.
             raise _backend_error(exc, original=original, translated=sql) from exc
-        except Exception:
-            # An our-side rejection (e.g. UnsupportedFeature on an unmapped column
-            # type) after the statement ran — undo it and re-raise for the session
-            # to map to an ORA error.
-            self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_stmt')
-            self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
-            raise
-        self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
         return result
 
     def _execute_pipelined(
@@ -11616,31 +11625,28 @@ class PostgresBackend:
         bound_sql, _ = _translate_binds(translated, rows[0])
         params = [_translate_binds(translated, row)[1] for row in rows]
         cursor = self._conn.cursor()
-        cursor.execute('SAVEPOINT _mirror_stmt')
         touched: list = []
         try:
-            if with_rowid is None:
-                cursor.executemany(bound_sql, params)
-                affected = cursor.rowcount
-            else:
-                # One result per iteration, each the rowids that row touched;
-                # the batch's count is all of them, its rowid the very last.
-                cursor.executemany(bound_sql, params, returning=True)
-                while True:
-                    touched.extend(r[0] for r in cursor.fetchall())
-                    if not cursor.nextset():
-                        break
-                affected = len(touched)
+            with self._under_savepoint():
+                if with_rowid is None:
+                    cursor.executemany(bound_sql, params)
+                    affected = cursor.rowcount
+                else:
+                    # One result per iteration, each the rowids that row touched;
+                    # the batch's count is all of them, its rowid the very last.
+                    cursor.executemany(bound_sql, params, returning=True)
+                    while True:
+                        touched.extend(r[0] for r in cursor.fetchall())
+                        if not cursor.nextset():
+                            break
+                    affected = len(touched)
         except psycopg.Error as exc:
-            self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_stmt')
-            self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
             # Oracle undoes only the row that failed: the rows before it stay
             # applied, and the error's rowcount says how many there were. The
             # pipelined batch cannot tell which row failed, and its savepoint
             # undid them all, so replay the rows one at a time up to the failure
             # (#1365).
             raise self._replay_until_failure(bound_sql, params) from exc
-        self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
         if with_rowid is not None:
             return Result(
                 rowcount=affected, last_rowid=touched[-1] if touched else None
@@ -11659,17 +11665,14 @@ class PostgresBackend:
         cursor.execute('SAVEPOINT _mirror_replay')
         applied = 0
         for row in params:
-            cursor.execute('SAVEPOINT _mirror_row')
             try:
-                cursor.execute(bound_sql, row)
+                with self._under_savepoint('_mirror_row'):
+                    cursor.execute(bound_sql, row)
             except psycopg.Error as exc:
-                self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_row')
-                self._conn.execute('RELEASE SAVEPOINT _mirror_row')
                 self._conn.execute('RELEASE SAVEPOINT _mirror_replay')
                 err = _backend_error(exc)
                 err.rowcount = applied
                 return err
-            self._conn.execute('RELEASE SAVEPOINT _mirror_row')
             applied += max(cursor.rowcount, 0)
         # The batch failed and no single row does: a failure only the batch as a
         # whole met. Nothing is left applied.
@@ -11720,12 +11723,10 @@ class PostgresBackend:
         total = 0
         for row in rows:
             _, params = _translate_binds(translated, row)
-            cursor.execute('SAVEPOINT _mirror_stmt')
             try:
-                cursor.execute(bound_sql, params)
+                with self._under_savepoint():
+                    cursor.execute(bound_sql, params)
             except psycopg.Error as exc:
-                self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_stmt')
-                self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
                 error = _backend_error(exc, original=sql, translated=bound_sql)
                 # What applied before the failure, and how much of it per
                 # iteration: a client that asked for the counts is owed them in
@@ -11733,7 +11734,6 @@ class PostgresBackend:
                 error.rowcount = total
                 error.row_counts = counts
                 raise error from exc
-            self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
             affected = max(cursor.rowcount, 0)
             counts.append(affected)
             total += affected
@@ -11789,16 +11789,11 @@ class PostgresBackend:
             f'SELECT {table_alias}.tableoid, {table_alias}.{_OBJECT_ID_COLUMN} '
             f'FROM {table} {table_alias}{rest}'
         )
-        cursor = self._conn.cursor()
-        cursor.execute('SAVEPOINT _mirror_stmt')
         try:
-            cursor.execute(query)
-            found = cursor.fetchall()
+            with self._under_savepoint():
+                found = self._conn.execute(query).fetchall()
         except psycopg.Error as exc:
-            self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_stmt')
-            self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
             raise _backend_error(exc) from exc
-        self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
         rows = [(self._db_ref(type_pg_oid, tab, rid),) for tab, rid in found]
         column = self._ref_column_meta(f'REF({ref_alias})', type_pg_oid)
         return Result(columns=[column], rows=rows)
@@ -12523,13 +12518,10 @@ class PostgresBackend:
         # The file's size, None for no such file. A missing file is a NULL
         # record; a present one's creation time is NULL on Linux, so a
         # whole-record test says neither.
-        try:
+        with self._rolled_back_on_error():
             row = self._conn.execute(
                 'SELECT (pg_stat_file(%s, true)).size', (path,)
             ).fetchone()
-        except psycopg.Error as exc:
-            self._conn.rollback()
-            raise _backend_error(exc) from exc
         return None if row is None or row[0] is None else int(row[0])
 
     def bfile_exists(self, directory: str, filename: str) -> bool:
@@ -12569,13 +12561,10 @@ class PostgresBackend:
         count = size - start if amount <= 0 else min(amount, size - start)
         if count <= 0:
             return b''
-        try:
+        with self._rolled_back_on_error():
             row = self._conn.execute(
                 'SELECT pg_read_binary_file(%s, %s, %s)', (path, start, count)
             ).fetchone()
-        except psycopg.Error as exc:
-            self._conn.rollback()
-            raise _backend_error(exc) from exc
         return bytes(row[0]) if row and row[0] is not None else b''
 
     def _rowid_columns(self, table: str) -> frozenset[str]:
