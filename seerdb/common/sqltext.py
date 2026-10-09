@@ -17,6 +17,77 @@ than inside it.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
+from typing import NamedTuple
+
+# The spans an Oracle statement's text is made of (#1679), tried in this order
+# at each position. A comment runs to the end of its line or its `*/`; a string
+# literal's quote is escaped by doubling it, and may carry an N prefix; a
+# quoted identifier is escaped the same way. An unterminated comment, string or
+# identifier runs to the end of the text, as the server reads it. Alternative
+# quoting -- q'[...]' -- is found by its opening here and closed by
+# `sql_tokens`, since its closing delimiter depends on its opening one.
+#
+# A bind is `:name`, `:"name"` or `:123`, never the second colon of a `::`; a
+# quoted one may have space after its colon. Its name is matched as before
+# this tokenizer: letters, digits and `_`.
+#
+# The comment body is `(?:[^*]|\*(?!/))*`, not a lazy `.*?`: CodeQL flags the
+# lazy form as a ReDoS (#1560).
+_SQL_TOKEN = re.compile(
+    r"""
+    (?P<comment>--[^\n]*|/\*(?:[^*]|\*(?!/))*(?:\*/|\Z))
+  | (?P<qstring>[nN]?[qQ]'(?P<delimiter>\S))
+  | (?P<string>[nN]?'(?:[^']|'')*(?:'|\Z))
+  | (?P<bind>(?<!:):(?:\s*"[^"\n]+"|[A-Za-z_]\w*|\d+))
+  | (?P<identifier>"(?:[^"]|"")*(?:"|\Z))
+  | (?P<word>[A-Za-z_][\w$#]*)
+  | (?P<space>\s+)
+  | (?P<other>.)
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+# The delimiters of alternative quoting that close with a different character.
+_Q_CLOSING = {'[': ']', '(': ')', '{': '}', '<': '>'}
+
+
+class SqlToken(NamedTuple):
+    """One span of a statement's text: ``kind`` is ``comment``, ``string``,
+    ``identifier``, ``bind``, ``word``, ``space`` or ``other``, and
+    ``text[start:end]`` is its text."""
+
+    kind: str
+    start: int
+    end: int
+
+
+def sql_tokens(SQL: str) -> Iterator[SqlToken]:
+    """The spans of an Oracle statement's text, in order, covering all of it.
+
+    One reading of what is a literal, a quoted identifier, a comment or a bind,
+    for every scanner that has to step past them (#1679). Hand-written scanners
+    disagreed: some skipped comments, some did not, and none knew Oracle's
+    alternative quoting, so a `:name` inside `q'[...]'` or a comment counted as
+    a bind and an apostrophe in a comment opened a string.
+    """
+    Pos = 0
+    while Pos < len(SQL):
+        M = _SQL_TOKEN.match(SQL, Pos)
+        assert M is not None  # `other` matches any one character
+        Kind = M.lastgroup
+        if Kind == 'delimiter':
+            Kind = 'qstring'
+        if Kind == 'qstring':
+            Opening = M.group('delimiter')
+            Close = SQL.find(_Q_CLOSING.get(Opening, Opening) + "'", M.end())
+            End = len(SQL) if Close < 0 else Close + 2
+            yield SqlToken('string', Pos, End)
+            Pos = End
+            continue
+        assert Kind is not None
+        yield SqlToken(Kind, Pos, M.end())
+        Pos = M.end()
+
 
 # A `:name` placeholder, in either spelling. An unquoted name follows normal SQL
 # identifier rules and is case-insensitive; pure-digit forms (`:1`, `:2`) are
@@ -48,17 +119,12 @@ def strip_non_bind_text(SQL: str) -> str:
     depends on that, and a statement carrying a comment would otherwise cut in
     the wrong place.
     """
-    Cleaned = re.sub(r"'(?:''|[^'])*'", lambda M: _blank(M.group(0)), SQL)
-    # One pass over both, so a quoted bind name is consumed whole rather than
-    # leaving its closing quote to open a spurious identifier that then swallows
-    # the rest of the statement. The first alternative wins where they overlap.
-    Cleaned = re.sub(
-        r'(:\s*"[^"\n]*")|"(?:""|[^"])*"',
-        lambda M: M.group(1) or _blank(M.group(0)),
-        Cleaned,
+    return ''.join(
+        _blank(SQL[T.start : T.end])
+        if T.kind in ('string', 'identifier', 'comment')
+        else SQL[T.start : T.end]
+        for T in sql_tokens(SQL)
     )
-    Cleaned = re.sub(r'--[^\n]*', lambda M: _blank(M.group(0)), Cleaned)
-    return re.sub(r'/\*.*?\*/', lambda M: _blank(M.group(0)), Cleaned, flags=re.S)
 
 
 def canonical_bind_key(Key: str) -> str:
@@ -87,12 +153,14 @@ def bind_placeholders(SQL: str, dedupe: bool = False) -> list[tuple[str, bool]]:
     # If `dedupe` is True (PL/SQL path), keep only the first occurrence of each.
     # Otherwise (plain SQL path) return every occurrence — Oracle expects one
     # bind value per textual occurrence in DML.
-    Cleaned = strip_non_bind_text(SQL)
     Seen: list[tuple[str, bool]] = []
     Found: set[tuple[str, bool]] = set()
-    for M in _NAMED_BIND_RE.finditer(Cleaned):
-        Quoted = M.group(1) is not None
-        Entry = (M.group(1), True) if Quoted else (M.group(2).upper(), False)
+    for T in sql_tokens(SQL):
+        if T.kind != 'bind' or not _NAMED_BIND_RE.fullmatch(SQL, T.start, T.end):
+            continue  # a numbered one, or a quoted one spaced off its colon
+        Name = SQL[T.start + 1 : T.end]
+        Quoted = Name.startswith('"')
+        Entry = (Name[1:-1], True) if Quoted else (Name.upper(), False)
         if dedupe:
             if Entry not in Found:
                 Found.add(Entry)
@@ -115,10 +183,14 @@ def placeholder_count(SQL: str) -> int:
     counted none and went to the database with its `:1` unbound (#1394).
     """
     Seen: set[str] = set()
-    for M in _PLACEHOLDER_RE.finditer(strip_non_bind_text(SQL)):
-        Seen.add(
-            M.group(1) if M.group(1) is not None else (M.group(2) or M.group(3)).upper()
-        )
+    for T in sql_tokens(SQL):
+        M = _PLACEHOLDER_RE.fullmatch(SQL, T.start, T.end) if T.kind == 'bind' else None
+        if M is not None:
+            Seen.add(
+                M.group(1)
+                if M.group(1) is not None
+                else (M.group(2) or M.group(3)).upper()
+            )
     return len(Seen)
 
 
@@ -252,9 +324,6 @@ def altered_edition(SQL: str) -> str | None:
     return match.group(2) if match else None
 
 
-_LEADING_COMMENTS_RE = re.compile(r'^\s*(?:--[^\n]*\n|/\*.*?\*/|\s)+', re.S)
-
-
 def statement_head(SQL: str) -> str:
     """The statement, upper-cased, from its first word: leading whitespace and
     SQL comments dropped.
@@ -264,7 +333,10 @@ def statement_head(SQL: str) -> str:
     off the raw text instead, `/* why */ SELECT ...` was taken for DML and its
     rows were never fetched ("no result set").
     """
-    return _LEADING_COMMENTS_RE.sub('', SQL, count=1).upper()
+    for T in sql_tokens(SQL):
+        if T.kind not in ('space', 'comment'):
+            return SQL[T.start :].upper()
+    return ''
 
 
 def is_plsql(SQL: str) -> bool:

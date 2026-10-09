@@ -19,12 +19,15 @@ import unittest
 
 from seerdb.client.cursor import _resolve_parameters
 from seerdb.common.sqltext import (
+    SqlToken,
     bind_placeholders,
     canonical_bind_key,
     extract_bind_names,
     is_plsql,
     is_reusable_dml,
+    sql_tokens,
     statement_head,
+    strip_non_bind_text,
 )
 
 
@@ -255,3 +258,102 @@ def test_placeholder_count_counts_named_and_numbered() -> None:
     assert placeholder_count('insert into t (n) values (:1)') == 1
     assert placeholder_count('select :1, :b, :"q", :1, :B from t') == 3
     assert placeholder_count("select x::int, ':9' from t -- :8") == 0
+
+
+def _kinds(sql: str) -> list[tuple[str, str]]:
+    return [(t.kind, sql[t.start : t.end]) for t in sql_tokens(sql)]
+
+
+class TestSqlTokens(unittest.TestCase):
+    """One reading of Oracle statement text for every scanner (#1679)."""
+
+    def test_the_spans_cover_the_whole_text(self):
+        sql = 'select :a, \'x\'\'y\', "Q""" -- c\n/* d */ from t where n = :1 and m::int = 2'
+        tokens = list(sql_tokens(sql))
+        self.assertEqual(''.join(sql[t.start : t.end] for t in tokens), sql)
+        self.assertEqual(tokens[0], SqlToken('word', 0, 6))
+
+    def test_kinds(self):
+        self.assertEqual(
+            _kinds('x := :a||\'b\'||"C" -- d'),
+            [
+                ('word', 'x'),
+                ('space', ' '),
+                ('other', ':'),
+                ('other', '='),
+                ('space', ' '),
+                ('bind', ':a'),
+                ('other', '|'),
+                ('other', '|'),
+                ('string', "'b'"),
+                ('other', '|'),
+                ('other', '|'),
+                ('identifier', '"C"'),
+                ('space', ' '),
+                ('comment', '-- d'),
+            ],
+        )
+
+    def test_alternative_quoting(self):
+        # q'<d>...<d>' with a bracket closing on its pair and any other
+        # delimiter on itself, N and Q in either case, an apostrophe inside.
+        for literal in (
+            "q'[it's :z]'",
+            "Q'(a)b:z)'",
+            "q'{x}'",
+            "q'<x>'",
+            "q'!it's :z!'",
+            "nq'[x]'",
+            "NQ'#x#'",
+            "N'it''s'",
+        ):
+            with self.subTest(literal=literal):
+                sql = f'select {literal} from t where x = :b'
+                self.assertIn(('string', literal), _kinds(sql))
+                self.assertEqual(bind_placeholders(sql), [('B', False)])
+
+    def test_a_comment_holds_no_bind_and_opens_no_string(self):
+        for sql in (
+            "select :a -- don't :c\n from t where x = :b",
+            "select :a /* it's :c */ from t where x = :b",
+            "select :a -- it's\n, 'a' -- don't\n from t where x = :b",
+        ):
+            with self.subTest(sql=sql):
+                self.assertEqual(bind_placeholders(sql), [('A', False), ('B', False)])
+
+    def test_a_cast_is_no_bind(self):
+        self.assertEqual(
+            bind_placeholders('select :a::int, x::text from t'), [('A', False)]
+        )
+
+    def test_a_quoted_bind_may_have_space_after_its_colon(self):
+        self.assertIn(('bind', ': "a b"'), _kinds('select : "a b" from t'))
+
+    def test_unterminated_runs_to_the_end(self):
+        for sql, kind in (
+            ("select 'abc", 'string'),
+            ('select "abc', 'identifier'),
+            ('select /* abc', 'comment'),
+            ("select q'[abc", 'string'),
+        ):
+            with self.subTest(sql=sql):
+                self.assertEqual(_kinds(sql)[-1][0], kind)
+
+    def test_blanking_keeps_offsets(self):
+        sql = "select q'[:z]', 'a' /* :c */ from t where x = :b -- :d"
+        cleaned = strip_non_bind_text(sql)
+        self.assertEqual(len(cleaned), len(sql))
+        self.assertEqual(cleaned.index(':b'), sql.index(':b'))
+        self.assertNotIn(':z', cleaned)
+        self.assertNotIn(':c', cleaned)
+        self.assertNotIn(':d', cleaned)
+
+    def test_a_long_comment_scans_in_linear_time(self):
+        # The comment pattern CodeQL accepts (#1560): '/*' then '*//*'
+        # repeated would backtrack forever under a lazy `.*?`.
+        import time
+
+        sql = '/*' + '*//*' * 100000
+        start = time.perf_counter()
+        list(sql_tokens(sql))
+        self.assertLess(time.perf_counter() - start, 2.0)
