@@ -218,7 +218,7 @@ from psycopg.abc import DumperKey
 from psycopg.adapt import Loader, PyFormat
 from psycopg.types.composite import CompositeInfo, register_composite
 
-from seerdb.common.datatypes import BcDate, IntervalYM
+from seerdb.common.datatypes import BcDate, BFile, IntervalYM
 from seerdb.common.dbobject import (
     COLLECTION_NESTED_TABLE,
     COLLECTION_PLSQL_INDEX_TABLE,
@@ -262,6 +262,7 @@ from seerdb.common.tns_consts import (
     ORA_INVALID_USERNAME_PASSWORD,
     ORA_NAME_ALREADY_USED,
     ORA_NO_DATA_FOUND,
+    ORA_NONEXISTENT_FILE,
     ORA_NOT_ENOUGH_VALUES,
     ORA_NUMERIC_OR_VALUE_ERROR,
     ORA_NUMERIC_OVERFLOW,
@@ -280,6 +281,7 @@ from seerdb.common.tns_consts import (
     ORA_VALUE_TOO_LARGE_FOR_COLUMN,
     TNS_TYPE_ADT,
     TNS_TYPE_BDOUBLE,
+    TNS_TYPE_BFILE,
     TNS_TYPE_BFLOAT,
     TNS_TYPE_BLOB,
     TNS_TYPE_BOOLEAN,
@@ -329,6 +331,16 @@ _TSTZ_TYPE = 'ora_tstz'
 # fixed zone would do; UTC is Oracle's own default.
 _DB_TIME_ZONE = datetime.timezone.utc
 _DB_TIME_ZONE_NAME = '+00:00'
+# A BFILE (#1669): the DIRECTORY object's name and the file's, which is all
+# Oracle keeps too -- the file is on the PostgreSQL host, under the directory's
+# path. BFILENAME makes one.
+_BFILE_TYPE = 'ora_bfile'
+_BFILE_TYPE_DDL = (
+    'DO $$ BEGIN CREATE TYPE ora_bfile AS (directory text, filename text); '
+    'EXCEPTION WHEN duplicate_object THEN NULL; END $$;'
+    'CREATE OR REPLACE FUNCTION bfilename(text, text) RETURNS ora_bfile '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT ROW($1, $2)::ora_bfile $$'
+)
 _TSTZ_TYPE_DDL = (
     'DO $$ BEGIN CREATE TYPE ora_tstz AS (utc timestamptz, off integer); '
     'EXCEPTION WHEN duplicate_object THEN NULL; END $$'
@@ -2411,6 +2423,8 @@ _DDL_TYPE_REWRITES = [
     # SYS.XMLTYPE(...) constructor, which a CREATE TABLE ... AS SELECT may call.
     (re.compile(r'\b(?:SYS\.)?XMLTYPE\b(?!\s*\()', re.IGNORECASE), 'xml'),
     (re.compile(r'([(,]\s*\w+)\s+ROWID\b', re.IGNORECASE), r'\1 ora_rowid'),
+    # A BFILE column holds the two names (#1669).
+    (re.compile(r'([(,]\s*\w+)\s+BFILE\b', re.IGNORECASE), r'\1 ora_bfile'),
     (re.compile(r'\bLONG\s+RAW\b', re.IGNORECASE), 'bytea'),
     (re.compile(r'\bRAW\s*\(\s*\d+\s*\)', re.IGNORECASE), 'bytea'),
     (re.compile(r'\bRAW\b', re.IGNORECASE), 'bytea'),
@@ -8476,6 +8490,16 @@ class PostgresBackend:
                 self._tstz_info = info
         except psycopg.Error:
             self._conn.rollback()
+        # The BFILE composite (#1669), read back as a tuple of the two names.
+        self._bfile_oid: int | None = None
+        try:
+            self._conn.execute(_BFILE_TYPE_DDL)
+            bfile_info = CompositeInfo.fetch(self._conn, _BFILE_TYPE)
+            if bfile_info is not None:
+                register_composite(bfile_info, self._conn)
+                self._bfile_oid = bfile_info.oid
+        except psycopg.Error:
+            self._conn.rollback()
         # Create the typed domains and map each domain's oid to the Oracle wire type
         # it stands for, so a result column tracing back to one is encoded as that
         # Oracle type — ora_clob / ora_blob as a LOB (#534), ora_intervalym as
@@ -10155,6 +10179,22 @@ class PostgresBackend:
                 for row in rows:
                     row[i] = self._db_collection(coll, row[i], desc.type_code)
                 columns.append(_object_column_meta(desc.name, coll))
+            elif self._bfile_oid is not None and desc.type_code == self._bfile_oid:
+                # A BFILE (#1669): the two names, charset and form 0, as the
+                # passthrough describes one; its cells the core's BFile.
+                for row in rows:
+                    if row[i] is not None:
+                        row[i] = BFile(row[i][0], row[i][1])
+                columns.append(
+                    ColumnMeta(
+                        name=_oracle_column_name(desc.name).encode('utf-8'),
+                        data_type=TNS_TYPE_BFILE,
+                        data_length=0,
+                        max_size=0,
+                        charset=0,
+                        csfrm=0,
+                    )
+                )
             elif (entry := self._column_object_type(desc.type_code)) is not None:
                 typ, info = entry
                 for row in rows:
@@ -12446,6 +12486,33 @@ class PostgresBackend:
             (routine, schema, schema),
         ).fetchone()
         return row is not None
+
+    def bfile_exists(self, directory: str, filename: str) -> bool:
+        """Whether a BFILE's file exists (#1669): ORA-22285 when its DIRECTORY
+        object does not, else whether the file is there under the directory's
+        path, on the PostgreSQL host, as pg_stat_file finds it -- the server
+        that reads it, as Oracle's does."""
+        row = self._conn.execute(
+            'SELECT path FROM sys.ora_directories WHERE name = %s', (directory,)
+        ).fetchone()
+        if row is None:
+            self._conn.rollback()
+            raise BackendError(
+                'non-existent directory or file for FILEEXISTS operation',
+                ora_code=ORA_NONEXISTENT_FILE,
+            )
+        path = row[0].rstrip('/') + '/' + filename
+        try:
+            found = self._conn.execute(
+                # A missing file is a NULL record; a present one's creation
+                # time is NULL on Linux, so a whole-record test says neither.
+                'SELECT (pg_stat_file(%s, true)).size IS NOT NULL',
+                (path,),
+            ).fetchone()
+        except psycopg.Error as exc:
+            self._conn.rollback()
+            raise _backend_error(exc) from exc
+        return bool(found and found[0])
 
     def _rowid_columns(self, table: str) -> frozenset[str]:
         # The ROWID columns of a table a statement names (#1624), lower case.
