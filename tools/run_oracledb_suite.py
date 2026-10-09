@@ -146,6 +146,11 @@ POSTGRES_BACKEND_TESTS: dict[str, str] = {
     # through UTL_RAW.CAST_TO_VARCHAR2 and read back with encoding_errors (#1659).
     'test_3700_var.py::test_3732': 'PostgreSQL text holds no invalid UTF-8',
     'test_3800_typehandler.py::test_3807': 'PostgreSQL text holds no invalid UTF-8',
+    # pgvector's vector, a FLOAT32 VECTOR's storage, holds at most 16000
+    # dimensions, where Oracle's holds 65535; these insert 32768 and 65535
+    # into a FLOAT32 column (#1734).
+    'test_6400_vector_var.py::test_6428': 'pgvector holds at most 16000 dimensions',
+    'test_7700_sparse_vector.py::test_7724': 'pgvector holds at most 16000 dimensions',
 }
 
 
