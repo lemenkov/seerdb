@@ -4881,7 +4881,10 @@ class _NoConnPostgresBackend(PostgresBackend):
     # Skip the psycopg connect / orafce setup — change_password only touches the
     # credential map, so no live PostgreSQL is needed to test it.
     def __init__(self, credentials: dict) -> None:
+        from postgres_backend import _AccountStore
+
         self._credentials = credentials
+        self._accounts = _AccountStore(credentials, None)
 
 
 def test_change_password_updates_the_shared_credential_map() -> None:
@@ -5196,6 +5199,119 @@ def test_calls_are_islands_in_the_token_stream() -> None:
     )
     # A call that never closes stops the search, to fail as it was sent.
     assert _translate_decode('select decode(a, b, c') == 'select decode(a, b, c'
+
+
+def test_users_are_kept_by_create_alter_and_drop_user() -> None:
+    # CREATE USER ... IDENTIFIED BY, ALTER USER ... IDENTIFIED BY [REPLACE] and
+    # DROP USER [CASCADE] keep the Mirror's accounts as well as the schemas,
+    # with Oracle's errors (#879). In the launcher's map, shared by sessions.
+    from seerdb.server import BackendError
+
+    creds = dict(_CREDS)
+    backend = PostgresBackend(_CONNINFO, credentials=creds)
+    other = PostgresBackend(_CONNINFO, credentials=creds)
+    try:
+        for statement in ('DROP USER u879 CASCADE', 'DROP USER "u879q" CASCADE'):
+            try:
+                backend.execute(statement)
+            except BackendError:
+                backend.rollback()  # not there yet
+        backend.execute('CREATE USER u879 IDENTIFIED BY Secret879')
+        assert other.authenticate('u879') == 'Secret879'  # case kept
+        backend.execute('CREATE USER "u879q" IDENTIFIED BY "p w"')
+        assert other.authenticate('u879q') == 'p w'
+        with pytest.raises(BackendError) as exc:
+            backend.execute('CREATE USER U879 IDENTIFIED BY x')
+        assert exc.value.ora_code == 1920
+        # A launcher's account with no schema yet is refused the same, and
+        # given the schema an Oracle user always has.
+        creds['ACCT879'] = 'a'
+        with pytest.raises(BackendError) as exc:
+            backend.execute('CREATE USER acct879 IDENTIFIED BY a')
+        assert exc.value.ora_code == 1920
+        backend.execute('CREATE TABLE acct879.t879 (n NUMBER)')
+        backend.execute('DROP USER acct879 CASCADE')
+        backend.execute('ALTER USER u879 IDENTIFIED BY again REPLACE Secret879')
+        assert other.authenticate('U879') == 'again'
+        with pytest.raises(BackendError) as exc:
+            backend.execute('ALTER USER u879 IDENTIFIED BY x REPLACE wrong')
+        assert exc.value.ora_code == 1017
+        backend.execute('ALTER USER u879 ACCOUNT UNLOCK')  # accepted, nothing kept
+        backend.execute('CREATE TABLE u879.t879 (n NUMBER)')
+        with pytest.raises(BackendError) as exc:
+            backend.execute('DROP USER u879')
+        assert exc.value.ora_code == 1922
+        backend.execute('DROP USER u879 CASCADE')
+        assert other.authenticate('u879') is None
+        with pytest.raises(BackendError) as exc:
+            backend.execute('DROP USER u879')
+        assert exc.value.ora_code == 1918
+        with pytest.raises(BackendError) as exc:
+            backend.execute('ALTER USER nobody879 IDENTIFIED BY x')
+        assert exc.value.ora_code == 1918
+    finally:
+        backend.rollback()
+        for statement in ('DROP USER u879 CASCADE', 'DROP USER "u879q" CASCADE'):
+            try:
+                backend.execute(statement)
+            except BackendError:
+                backend.rollback()
+        backend.close()
+        other.close()
+
+
+def test_accounts_in_an_auth_database_are_out_of_sql_reach() -> None:
+    # With an auth database the accounts live in seerdb_auth.accounts, owned by
+    # the auth role: they survive the process's map, the launcher's accounts
+    # seed it without overwriting a changed password, and a role without a
+    # grant -- what a Mirror session should run as -- cannot read them (#879).
+    import postgres_backend
+
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    dbname = admin.info.dbname
+    auth = f'{_CONNINFO} user=mirror_auth879 password=auth879'
+    try:
+        admin.execute('DROP SCHEMA IF EXISTS seerdb_auth CASCADE')
+        for role, password in (
+            ('mirror_auth879', 'auth879'),
+            ('mirror_plain879', 'plain879'),
+        ):
+            admin.execute(f'DROP ROLE IF EXISTS {role}')
+            admin.execute(f"CREATE ROLE {role} LOGIN PASSWORD '{password}'")
+        admin.execute(f'GRANT CREATE ON DATABASE "{dbname}" TO mirror_auth879')
+        postgres_backend._ACCOUNTS_READY.discard(auth)
+        backend = PostgresBackend(
+            _CONNINFO, credentials={'PYO': 'pyo123', 'SEED879': 's'}, auth_conninfo=auth
+        )
+        try:
+            assert backend.authenticate('seed879') == 's'
+            backend.change_password('SEED879', 's', 'changed')
+            backend.execute('CREATE USER db879 IDENTIFIED BY d')
+        finally:
+            backend.close()
+        postgres_backend._ACCOUNTS_READY.discard(auth)  # as a new process would
+        fresh = PostgresBackend(
+            _CONNINFO, credentials={'PYO': 'pyo123', 'SEED879': 's'}, auth_conninfo=auth
+        )
+        try:
+            assert fresh.authenticate('SEED879') == 'changed'
+            assert fresh.authenticate('DB879') == 'd'
+            fresh.execute('DROP USER db879')
+            assert fresh.authenticate('DB879') is None
+        finally:
+            fresh.close()
+        plain = psycopg.connect(f'{_CONNINFO} user=mirror_plain879 password=plain879')
+        try:
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                plain.execute('SELECT password FROM seerdb_auth.accounts')
+        finally:
+            plain.close()
+    finally:
+        admin.execute('DROP SCHEMA IF EXISTS seerdb_auth CASCADE')
+        admin.execute(f'REVOKE CREATE ON DATABASE "{dbname}" FROM mirror_auth879')
+        for role in ('mirror_auth879', 'mirror_plain879'):
+            admin.execute(f'DROP ROLE IF EXISTS {role}')
+        admin.close()
 
 
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:

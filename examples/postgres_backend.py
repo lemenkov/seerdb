@@ -139,6 +139,11 @@ honest edge of this adapter:
   EDITION and a login's edition keep the session's edition, which
   CURRENT_EDITION_NAME reads (#1662). Objects are not versioned per edition:
   every session sees the same ones whatever edition it is in.
+- **Accounts in this process unless given an auth database** -- O5LOGON needs
+  each password, so the Mirror holds them: in the launcher's map, or with
+  ``auth_conninfo`` in a ``seerdb_auth.accounts`` table only that connection's
+  role can read, which CREATE / ALTER / DROP USER and a password change keep
+  (#879). A password is stored as it is; so is the launcher's.
 - **Privileges, for type lookup only** -- every Mirror user is the backend's
   one PostgreSQL role. A GRANT or REVOKE on an object is recorded
   (``sys.ora_grants``), and a user sees another user's type -- in ALL_TYPES,
@@ -210,6 +215,7 @@ import json
 import re
 import select
 import struct
+import threading
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -255,6 +261,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_12_1,
     ORA_CANNOT_INSERT_NULL,
     ORA_CANNOT_KILL_CURRENT_SESSION,
+    ORA_CASCADE_REQUIRED,
     ORA_CHECK_CONSTRAINT_VIOLATED,
     ORA_DIVISOR_IS_ZERO,
     ORA_INCONSISTENT_DATATYPES,
@@ -284,6 +291,8 @@ from seerdb.common.tns_consts import (
     ORA_TOO_MANY_VALUES,
     ORA_TYPE_HAS_DEPENDENTS,
     ORA_UNIQUE_CONSTRAINT_VIOLATED,
+    ORA_USER_DOES_NOT_EXIST,
+    ORA_USER_NAME_CONFLICT,
     ORA_VALUE_LARGER_THAN_PRECISION,
     ORA_VALUE_TOO_LARGE_FOR_COLUMN,
     TNS_TYPE_ADT,
@@ -3646,6 +3655,34 @@ def _directory_statement(sql: str) -> str | None:
             f'{_sql_text(f"ORA-04043: object {name} does not exist")}; END IF; END $$'
         )
     return None
+
+
+# CREATE USER, ALTER USER ... IDENTIFIED BY and DROP USER (#879): the name,
+# quoted or not, and the password, quoted or not -- an unquoted one keeps its
+# case, as Oracle's has since 11g.
+_USER_NAME = r'("[^"]+"|[A-Za-z_][\w$#]*)'
+_USER_PASSWORD = r'("[^"]*"|[^\s";]+)'
+_CREATE_USER_STATEMENT = re.compile(
+    rf'(?is)\s*CREATE\s+USER\s+{_USER_NAME}\s+IDENTIFIED\s+'
+    rf'(?:BY\s+{_USER_PASSWORD}|EXTERNALLY|GLOBALLY)(?![\w$#])'
+)
+_ALTER_USER_PASSWORD = re.compile(
+    rf'(?is)\s*ALTER\s+USER\s+{_USER_NAME}\s+IDENTIFIED\s+BY\s+{_USER_PASSWORD}'
+    rf'(?:\s+REPLACE\s+{_USER_PASSWORD})?'
+)
+_DROP_USER_STATEMENT = re.compile(
+    rf'(?is)\s*DROP\s+USER\s+{_USER_NAME}(\s+CASCADE)?\s*;?\s*$'
+)
+
+
+def _user_name(written: str) -> str:
+    # An Oracle user name as written: a quoted one as it is, an unquoted one
+    # upper-cased.
+    return written[1:-1] if written.startswith('"') else written.upper()
+
+
+def _password_text(written: str) -> str:
+    return written[1:-1] if written.startswith('"') else written
 
 
 def _sql_text(value: str) -> str:
@@ -8275,6 +8312,95 @@ def _while_connected(method):
     return call
 
 
+# The schema an auth database keeps the Mirror's accounts in (#879).
+_ACCOUNTS_SCHEMA = 'seerdb_auth'
+_ACCOUNTS_DDL = (
+    f'CREATE SCHEMA IF NOT EXISTS {_ACCOUNTS_SCHEMA};'
+    f'REVOKE ALL ON SCHEMA {_ACCOUNTS_SCHEMA} FROM PUBLIC;'
+    f'CREATE TABLE IF NOT EXISTS {_ACCOUNTS_SCHEMA}.accounts '
+    '(username text PRIMARY KEY, password text NOT NULL)'
+)
+# The auth databases whose accounts table this process has made sure of, and
+# seeded from its launcher's accounts, so each is done once (#879).
+_ACCOUNTS_READY: set[str] = set()
+_ACCOUNTS_LOCK = threading.Lock()
+
+
+class _AccountStore:
+    """The accounts a Mirror-over-PG serves: each user's password (#879).
+
+    O5LOGON proves a password both ways, so the Mirror has to hold each
+    secret itself. Without an auth database they live in the map the launcher
+    gives, shared by every session, as before. With one -- `auth_conninfo`, a
+    connection as a role of its own -- they live in its `seerdb_auth.accounts`,
+    so CREATE USER, ALTER USER ... IDENTIFIED BY, DROP USER and a password
+    change persist, and a user is added with SQL, not a restart.
+
+    The role sessions run as must have no access to that schema, so no SQL a
+    client sends can read a password: PostgreSQL refuses it, dynamic SQL
+    included. Created by the auth role, the schema is that role's; it must not
+    be the session role, and a superuser session role sees everything.
+    """
+
+    def __init__(self, seed: dict[str, str], auth_conninfo: str | None) -> None:
+        self._seed = seed
+        self._auth_conninfo = auth_conninfo
+
+    def _connect(self) -> psycopg.Connection:
+        assert self._auth_conninfo is not None
+        conn = psycopg.connect(self._auth_conninfo, autocommit=True)
+        with _ACCOUNTS_LOCK:
+            if self._auth_conninfo not in _ACCOUNTS_READY:
+                # The launcher's accounts, where the store has none of that name
+                # yet: a password changed since stays changed.
+                conn.execute(_ACCOUNTS_DDL)
+                for name, password in self._seed.items():
+                    conn.execute(
+                        f'INSERT INTO {_ACCOUNTS_SCHEMA}.accounts VALUES (%s, %s) '
+                        'ON CONFLICT DO NOTHING',
+                        (name.upper(), password),
+                    )
+                _ACCOUNTS_READY.add(self._auth_conninfo)
+        return conn
+
+    def secret(self, username: str) -> str | None:
+        if self._auth_conninfo is None:
+            return credential_lookup(self._seed, username)
+        with self._connect() as conn:
+            row = conn.execute(
+                f'SELECT password FROM {_ACCOUNTS_SCHEMA}.accounts WHERE username = %s',
+                (username.upper(),),
+            ).fetchone()
+        return None if row is None else row[0]
+
+    def set(self, username: str, password: str) -> None:
+        if self._auth_conninfo is None:
+            for name in list(self._seed):
+                if name.upper() == username.upper():
+                    self._seed[name] = password
+                    return
+            self._seed[username.upper()] = password
+            return
+        with self._connect() as conn:
+            conn.execute(
+                f'INSERT INTO {_ACCOUNTS_SCHEMA}.accounts VALUES (%s, %s) '
+                'ON CONFLICT (username) DO UPDATE SET password = EXCLUDED.password',
+                (username.upper(), password),
+            )
+
+    def drop(self, username: str) -> None:
+        if self._auth_conninfo is None:
+            for name in list(self._seed):
+                if name.upper() == username.upper():
+                    del self._seed[name]
+            return
+        with self._connect() as conn:
+            conn.execute(
+                f'DELETE FROM {_ACCOUNTS_SCHEMA}.accounts WHERE username = %s',
+                (username.upper(),),
+            )
+
+
 class PostgresBackend:
     """A :class:`~seerdb.server.Backend` over a psycopg connection.
 
@@ -8315,6 +8441,7 @@ class PostgresBackend:
         *,
         credentials: Credentials | None = None,
         translation_report: bool = False,
+        auth_conninfo: str | None = None,
     ) -> None:
         self._conn = psycopg.connect(conninfo)
         # The translation report (#1557): whether it is on, the runs it has not
@@ -8345,6 +8472,8 @@ class PostgresBackend:
         self._credentials: dict[str, str] = (
             credentials if isinstance(credentials, dict) else dict(credentials or {})
         )
+        # Where the accounts live: that map, or an auth database (#879).
+        self._accounts = _AccountStore(self._credentials, auth_conninfo)
         # Index-organized tables this session created, with their primary-key
         # columns, for the logical-rowid rendering.
         self._iot_pk: dict[str, list[str]] = {}
@@ -8770,7 +8899,7 @@ class PostgresBackend:
         # The login store the Mirror authenticates clients against — separate
         # from the libpq `conninfo` the backend itself connects to PostgreSQL
         # with. A production backend might instead consult a PG table here.
-        secret = credential_lookup(self._credentials, username)
+        secret = self._accounts.secret(username)
         self._login_user = username.upper()
         if secret is not None:
             # An Oracle session's current schema starts as the login user's, so
@@ -9085,6 +9214,9 @@ class PostgresBackend:
         kill = _KILL_SESSION.match(sql)
         if kill is not None:
             return self._kill_session(kill.group(1))
+        users = self._user_statement(sql)
+        if users is not None:
+            return users
         if native:
             return self._execute_native(sql, binds)
         refused = self._rowid_number_error(sql, binds)
@@ -12682,17 +12814,105 @@ class PostgresBackend:
             return None, [], names, row[3]
         return list(row[0]), list(row[1] or ()), names, row[3]
 
+    def _user_exists(self, name: str) -> bool:
+        # A user is an account or a schema of that name: one made before the
+        # Mirror kept accounts has a schema and no password (#879).
+        if self._accounts.secret(name) is not None:
+            return True
+        row = self._conn.execute(
+            'SELECT to_regnamespace(%s) IS NOT NULL', (f'"{name.lower()}"',)
+        ).fetchone()
+        return bool(row and row[0])
+
+    def _user_statement(self, statement: str) -> Result | None:
+        """CREATE USER, ALTER USER ... IDENTIFIED BY and DROP USER, on the
+        accounts as well as the schemas (#879), with Oracle's errors. Any other
+        ALTER USER clause is accepted and does nothing, as before. None for any
+        other statement."""
+        created = _CREATE_USER_STATEMENT.match(statement)
+        if created is not None:
+            name = _user_name(created.group(1))
+            if self._user_exists(name):
+                # A launcher's account is a user with no schema yet; an Oracle
+                # user always has one, so it gets it here, and the statement is
+                # refused all the same, as Oracle refuses it.
+                self._conn.execute(
+                    sql.SQL('CREATE SCHEMA IF NOT EXISTS {}').format(
+                        sql.Identifier(name.lower())
+                    )
+                )
+                self._conn.commit()
+                raise BackendError(
+                    f"user name '{name}' conflicts with another user or role name",
+                    ora_code=ORA_USER_NAME_CONFLICT,
+                )
+            self._conn.execute(
+                sql.SQL('CREATE SCHEMA IF NOT EXISTS {}').format(
+                    sql.Identifier(name.lower())
+                )
+            )
+            self._conn.commit()
+            if created.group(2) is not None:
+                self._accounts.set(name, _password_text(created.group(2)))
+            return Result()
+        altered = _ALTER_USER_PASSWORD.match(statement)
+        if altered is not None:
+            name = _user_name(altered.group(1))
+            if not self._user_exists(name):
+                raise BackendError(
+                    f"user '{name}' does not exist", ora_code=ORA_USER_DOES_NOT_EXIST
+                )
+            current = self._accounts.secret(name)
+            replaced = altered.group(3)
+            if replaced is not None and current is not None:
+                if _password_text(replaced) != current:
+                    raise BackendError(
+                        'invalid username/password; logon denied',
+                        ora_code=ORA_INVALID_USERNAME_PASSWORD,
+                    )
+            self._accounts.set(name, _password_text(altered.group(2)))
+            return Result()
+        dropped = _DROP_USER_STATEMENT.match(statement)
+        if dropped is not None:
+            name = _user_name(dropped.group(1))
+            if not self._user_exists(name):
+                raise BackendError(
+                    f"user '{name}' does not exist", ora_code=ORA_USER_DOES_NOT_EXIST
+                )
+            schema = sql.Identifier(name.lower())
+            if dropped.group(2):
+                self._conn.execute(
+                    sql.SQL('DROP SCHEMA IF EXISTS {} CASCADE').format(schema)
+                )
+            else:
+                owns = self._conn.execute(
+                    'SELECT EXISTS (SELECT 1 FROM pg_class WHERE relnamespace = '
+                    'to_regnamespace(%s)) OR EXISTS (SELECT 1 FROM pg_proc WHERE '
+                    'pronamespace = to_regnamespace(%s))',
+                    (f'"{name.lower()}"',) * 2,
+                ).fetchone()
+                if owns and owns[0]:
+                    raise BackendError(
+                        f"CASCADE must be specified to drop '{name}'",
+                        ora_code=ORA_CASCADE_REQUIRED,
+                    )
+                self._conn.execute(sql.SQL('DROP SCHEMA IF EXISTS {}').format(schema))
+            self._conn.commit()
+            self._accounts.drop(name)
+            return Result()
+        return None
+
     def change_password(
         self, username: str, old_password: str, new_password: str
     ) -> None:
-        # The Mirror's client auth (the credential map) is separate from the
+        # The Mirror's client auth (its accounts, #879) is separate from the
         # backend's PostgreSQL connection (a fixed conninfo), so a password change
-        # updates only the map — a fresh Mirror session then authenticates with
-        # the new password and the old one is rejected — without touching a
-        # PostgreSQL role (which would break the backend's own conninfo). Oracle
-        # validates the old password (ALTER USER … REPLACE); do the same against
-        # the stored secret (#515). The map is shared across sessions.
-        current = credential_lookup(self._credentials, username)
+        # updates only the account -- a fresh Mirror session then authenticates
+        # with the new password and the old one is rejected -- without touching
+        # a PostgreSQL role (which would break the backend's own conninfo).
+        # Oracle validates the old password (ALTER USER … REPLACE); do the same
+        # against the stored secret (#515).
+        current = self._accounts.secret(username)
         if current is not None and old_password != current:
             raise BackendError(
                 'invalid username/password; logon denied',
@@ -12707,11 +12927,7 @@ class PostgresBackend:
                 'invalid username/password; logon denied',
                 ora_code=ORA_INVALID_USERNAME_PASSWORD,
             )
-        for name in list(self._credentials):
-            if name.upper() == username.upper():
-                self._credentials[name] = new_password
-                return
-        self._credentials[username.upper()] = new_password
+        self._accounts.set(username, new_password)
 
     # The end-to-end tracing attributes a client sets over the 12c piggyback
     # (#183). Oracle keeps them on the session and reports them through

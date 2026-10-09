@@ -25,6 +25,16 @@ More users log in with MIRROR_USERS, a comma-separated list of
 Each user's objects go to a schema of its name, which ``CREATE USER`` makes.
 PYO is always included, so existing use is unchanged.
 
+**Accounts in the database (#879).** With MIRROR_AUTH_PG, a libpq conninfo as
+a role of its own, the accounts live in that role's ``seerdb_auth.accounts``
+table instead of this process: CREATE USER, ALTER USER ... IDENTIFIED BY, DROP
+USER and a password change persist, and the accounts above seed it once. The
+role the Mirror's sessions run as must not be a superuser and must not own
+that schema, or a client's SQL could read the passwords::
+
+    MIRROR_AUTH_PG='host=127.0.0.1 dbname=mirror user=mirror_auth password=...' \
+        python examples/mirror_over_postgres.py
+
 Requires the ``psycopg`` package.
 """
 
@@ -65,6 +75,7 @@ def main() -> None:
                 # SEERDB_TRANSLATION_REPORT=1 logs, per statement, the Oracle
                 # translation it took, to sys.ora_translation_log (#1557).
                 translation_report=os.environ.get('SEERDB_TRANSLATION_REPORT') == '1',
+                auth_conninfo=os.environ.get('MIRROR_AUTH_PG') or None,
             )
         ),
     )
