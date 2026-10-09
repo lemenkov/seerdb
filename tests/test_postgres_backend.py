@@ -6419,6 +6419,36 @@ def test_drop_domain_as_23ai_runs_it() -> None:
         backend.close()
 
 
+def test_column_layouts_follow_a_drop_and_recreate() -> None:
+    # The per-session column layouts the bind rewrites read -- VECTOR and OSON
+    # columns -- are forgotten at a DDL (#1749): a table dropped and created
+    # again under its name, its VECTOR column moved, takes a text bind into
+    # that column where it now is.
+    import array
+
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    if not backend._has_pgvector:
+        backend.close()
+        pytest.skip('the PostgreSQL bed has no pgvector')
+    try:
+        backend.execute('CREATE TABLE c1749 (n NUMBER, v VECTOR(2, FLOAT64))')
+        backend.execute('INSERT INTO c1749 VALUES (1, :1)', ['[1.5, 2.5]'])
+        backend.execute('DROP TABLE c1749')
+        backend.execute('CREATE TABLE c1749 (v VECTOR(2, FLOAT64), n NUMBER)')
+        backend.execute('INSERT INTO c1749 VALUES (:1, 2)', ['[3.5, 4.5]'])
+        (row,) = backend.execute('SELECT v, n FROM c1749').rows
+        assert row[0] == array.array('d', [3.5, 4.5])
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE c1749')
+        except BackendError:
+            backend.rollback()
+        backend.close()
+
+
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
     # #1692: a `:c` in a comment was counted as a bind, so every value after it
     # shifted -- `:b` silently got the wrong one; an apostrophe in a comment
