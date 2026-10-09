@@ -5100,6 +5100,24 @@ def test_masking_reads_the_text_as_the_tokenizer_does() -> None:
     )
 
 
+def test_block_words_are_the_tokenizers_words() -> None:
+    # _words and _blank_plsql on the shared tokenizer (#1693): `$` and `#` are
+    # part of a name, so `x$begin` hides no BEGIN; nothing inside a literal, a
+    # quoted name or a comment is a word; a bind's name still is one.
+    from postgres_backend import _blank_plsql, _words
+
+    text = 'x$begin := \'begin\'; /* begin */ "BEGIN" := obj#; :end := 1; BEGIN'
+    assert [w for w, _s, _e in _words(text)] == ['X$BEGIN', 'OBJ#', 'END', 'BEGIN']
+    assert [w for w, _s, _e in _words(text, text.index(';'))] == [
+        'OBJ#',
+        'END',
+        'BEGIN',
+    ]
+    assert _blank_plsql("a := q'[x;y]' -- ;\n; b := 'open;") == (
+        "a := q'     '     \n; b := '     "
+    )
+
+
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
     # #1692: a `:c` in a comment was counted as a bind, so every value after it
     # shifted -- `:b` silently got the wrong one; an apostrophe in a comment
