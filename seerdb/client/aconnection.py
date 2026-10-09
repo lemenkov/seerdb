@@ -43,6 +43,7 @@ from seerdb.client.connection import (
     _REDIRECT_CONNECT_DELAY,
     Xid,
     _abandoned_call_message,
+    _check_tpc_reply,
     _decode_tpc_context,
     _decode_tpc_state,
     _error_code,
@@ -2226,7 +2227,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         if Received is False:
             raise OperationalError('connection closed during TPC operation')
         (_, Packet) = Received
-        return Packet
+        return _check_tpc_reply(Packet)
 
     async def tpc_begin(
         self, xid: Xid, flags: int = TPC_BEGIN_NEW, timeout: int = 0

@@ -8717,10 +8717,11 @@ class SessionlessTransactionIntegration(_ThrottleRetry, unittest.TestCase):
         setup = self._conn()
         self.conns.append(setup)
         # Probe support before creating anything, so a pre-23ai skip leaves no
-        # table behind (#1224).
+        # table behind (#1224). A fresh id, rolled back while active: a probe
+        # suspended under a fixed one outlived the test, and the next setUp's
+        # begin of it is ORA-26217 once the client reports it (#1755).
         try:
-            setup.begin_sessionless_transaction('probe', timeout=10)
-            setup.suspend_sessionless_transaction()
+            setup.begin_sessionless_transaction(timeout=10)
             setup.rollback()
         except NotSupportedError:
             # tearDown does not run after a skip in setUp: close the probe's
@@ -8785,6 +8786,30 @@ class SessionlessTransactionIntegration(_ThrottleRetry, unittest.TestCase):
         cur = c.cursor()
         cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
         self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_server_refusals_are_raised(self):
+        # The server's refusals reach the caller (#1755), with its own codes:
+        # beginning an id that exists (ORA-26217), resuming one that does not
+        # (ORA-26218) or is in use in another session (ORA-25351).
+        held = self._conn()
+        self.conns.append(held)
+        held.begin_sessionless_transaction('sl-it-err', timeout=60)
+        held.suspend_sessionless_transaction()
+        other = self._conn()
+        self.conns.append(other)
+        with self.assertRaises(seerdb.DatabaseError) as ctx:
+            other.begin_sessionless_transaction('sl-it-err', timeout=60)
+        self.assertEqual(ctx.exception.code, 26217)
+        with self.assertRaises(seerdb.DatabaseError) as ctx:
+            other.resume_sessionless_transaction('sl-it-unknown', timeout=1)
+        self.assertEqual(ctx.exception.code, 26218)
+        active = self._conn()
+        self.conns.append(active)
+        active.resume_sessionless_transaction('sl-it-err', timeout=5)
+        with self.assertRaises(seerdb.DatabaseError) as ctx:
+            other.resume_sessionless_transaction('sl-it-err', timeout=1)
+        self.assertEqual(ctx.exception.code, 25351)
+        active.rollback()
 
     def test_default_id_is_uuid_and_double_begin_rejected(self):
         c = self._conn()
@@ -11402,12 +11427,12 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         c1 = c2 = None
         try:
             # Probe before creating anything, so a pre-23ai skip leaves no
-            # table behind (#1224).
+            # table behind (#1224). A fresh id, rolled back while active: one
+            # suspended under a fixed id outlived the test (#1755).
             try:
-                await setup.begin_sessionless_transaction('aprobe', timeout=10)
+                await setup.begin_sessionless_transaction(timeout=10)
             except NotSupportedError:
                 self.skipTest('sessionless transactions need a 23ai+ server')
-            await setup.suspend_sessionless_transaction()
             await setup.rollback()
             scur = setup.cursor()
             try:

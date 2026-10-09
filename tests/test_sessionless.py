@@ -120,5 +120,34 @@ class TestSyncPiggybackDecode(unittest.TestCase):
         self.assertEqual(result, (True, (None, None, [], None)))
 
 
+# A 23ai (23.26) reply to resuming an unknown sessionless transaction, captured
+# 2026-10-10: a server piggyback (0x17) then the TTI_OER carrying ORA-26218.
+_RESUME_UNKNOWN_REPLY = bytes.fromhex(
+    '170501011001011600010202820101c90004010102572f0002666a000000000000000000000000'
+    '00000000000700000000000002666a0000004f4f52412d32363231383a2073657373696f6e6c65'
+    '7373207472616e73616374696f6e2077697468204754524944203733364333363244364536463730'
+    '363520646f6573206e6f742065786973742e0a1d'
+)
+
+
+class TestReplyErrors(unittest.TestCase):
+    # A TPC reply that failed is raised, not discarded (#1755): the server's
+    # ORA code and message, from a reply that opens with a piggyback.
+    def test_failed_resume_raises_its_ora_error(self):
+        from seerdb.client.connection import _check_tpc_reply
+        from seerdb.common.exceptions import DatabaseError
+
+        with self.assertRaises(DatabaseError) as ctx:
+            _check_tpc_reply(_RESUME_UNKNOWN_REPLY)
+        self.assertEqual(ctx.exception.code, 26218)
+        self.assertIn('does not exist', str(ctx.exception))
+
+    def test_return_params_pass(self):
+        from seerdb.client.connection import _check_tpc_reply
+
+        reply = bytes([0x08]) + b'\x00' * 8
+        self.assertIs(_check_tpc_reply(reply), reply)
+
+
 if __name__ == '__main__':
     unittest.main()
