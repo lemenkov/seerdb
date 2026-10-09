@@ -229,7 +229,7 @@ from psycopg.abc import DumperKey
 from psycopg.adapt import Loader, PyFormat
 from psycopg.types.composite import CompositeInfo, register_composite
 
-from seerdb.common.datatypes import BcDate, BFile, IntervalYM
+from seerdb.common.datatypes import JSON, BcDate, BFile, IntervalYM
 from seerdb.common.dbobject import (
     COLLECTION_NESTED_TABLE,
     COLLECTION_PLSQL_INDEX_TABLE,
@@ -308,6 +308,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_INT,
     TNS_TYPE_INTERVALDS,
     TNS_TYPE_INTERVALYM,
+    TNS_TYPE_JSON,
     TNS_TYPE_LONG,
     TNS_TYPE_LONGRAW,
     TNS_TYPE_NUMBER,
@@ -2300,6 +2301,91 @@ class _PortalName(str):
     SYS_REFCURSOR parameter -- not as text."""
 
 
+# A JSON document's values that JSON itself has no type for -- a DATE, a
+# TIMESTAMP, an interval, a NUMBER with digits a float would lose, a RAW --
+# stored in jsonb as Oracle's own extended JSON writes them, a one-key object
+# naming the type (#1706). A client's OSON carries these types; jsonb keeps
+# them this way and gives each back as it came. A document's own object with
+# one such key reads back as that type, as Oracle's extended JSON does.
+_JSONB_OID = 3802
+_JSON_OIDS = frozenset({114, _JSONB_OID})
+_DAY_SECOND = re.compile(
+    r'(-)?P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?'
+)
+_YEAR_MONTH = re.compile(r'(-)?P(?:(\d+)Y)?(?:(\d+)M)?')
+
+
+def _to_extended(value: object) -> object:
+    if isinstance(value, dict):
+        return {str(key): _to_extended(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_extended(item) for item in value]
+    if isinstance(value, bool) or value is None or isinstance(value, (int, float, str)):
+        return value
+    if isinstance(value, decimal.Decimal):
+        return {'$numberDecimal': str(value)}
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is not None:
+            return {'$oracleTimestampTZ': value.isoformat()}
+        return {'$oracleTimestamp': value.isoformat()}
+    if isinstance(value, datetime.date):
+        return {'$oracleDate': value.isoformat()}
+    if isinstance(value, datetime.timedelta):
+        sign = '-' if value < datetime.timedelta(0) else ''
+        whole = abs(value)
+        seconds = whole.seconds + whole.microseconds / 1_000_000
+        return {
+            '$intervalDaySecond': f'{sign}P{whole.days}DT{seconds:g}S'
+            if seconds
+            else f'{sign}P{whole.days}D'
+        }
+    if isinstance(value, IntervalYM):
+        sign = '-' if value.years < 0 or value.months < 0 else ''
+        return {'$intervalYearMonth': f'{sign}P{abs(value.years)}Y{abs(value.months)}M'}
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {'$rawhex': bytes(value).hex().upper()}
+    raise TypeError(f'a {type(value).__name__} has no JSON form')
+
+
+def _from_extended(value: object) -> object:
+    if isinstance(value, list):
+        return [_from_extended(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if len(value) == 1:
+        ((key, item),) = value.items()
+        if isinstance(item, str):
+            if key == '$numberDecimal':
+                return decimal.Decimal(item)
+            if key in ('$oracleTimestamp', '$oracleTimestampTZ'):
+                return datetime.datetime.fromisoformat(item)
+            if key == '$oracleDate':
+                return datetime.datetime.fromisoformat(item)
+            if key == '$rawhex':
+                return bytes.fromhex(item)
+            if key == '$intervalDaySecond' and (m := _DAY_SECOND.fullmatch(item)):
+                delta = datetime.timedelta(
+                    days=int(m.group(2) or 0),
+                    hours=int(m.group(3) or 0),
+                    minutes=int(m.group(4) or 0),
+                    seconds=float(m.group(5) or 0),
+                )
+                return -delta if m.group(1) else delta
+            if key == '$intervalYearMonth' and (m := _YEAR_MONTH.fullmatch(item)):
+                months = int(m.group(2) or 0) * 12 + int(m.group(3) or 0)
+                return IntervalYM(0, -months if m.group(1) else months)
+    return {key: _from_extended(item) for key, item in value.items()}
+
+
+class _JsonDumper(psycopg.adapt.Dumper):
+    # A JSON bind (#1706): its value as jsonb, the types JSON has none for in
+    # their extended form.
+    oid = _JSONB_OID
+
+    def dump(self, obj: JSON) -> bytes:
+        return json.dumps(_to_extended(obj.value)).encode('utf-8')
+
+
 class _PortalNameDumper(psycopg.adapt.Dumper):
     oid = 1790  # refcursor
 
@@ -2482,6 +2568,9 @@ _DDL_TYPE_REWRITES = [
     (re.compile(r'([(,]\s*\w+)\s+ROWID\b', re.IGNORECASE), r'\1 ora_rowid'),
     # A BFILE column holds the two names (#1669).
     (re.compile(r'([(,]\s*\w+)\s+BFILE\b', re.IGNORECASE), r'\1 ora_bfile'),
+    # A JSON column is jsonb (#1706): binary, so it is parsed once, and its
+    # equality and indexing are PostgreSQL's.
+    (re.compile(r'([(,]\s*\w+)\s+JSON\b(?!\s*\()', re.IGNORECASE), r'\1 jsonb'),
     (re.compile(r'\bLONG\s+RAW\b', re.IGNORECASE), 'bytea'),
     (re.compile(r'\bRAW\s*\(\s*\d+\s*\)', re.IGNORECASE), 'bytea'),
     (re.compile(r'\bRAW\b', re.IGNORECASE), 'bytea'),
@@ -8570,6 +8659,7 @@ class PostgresBackend:
         except Exception:
             self._use_pipeline = False
         self._conn.adapters.register_dumper(_PortalName, _PortalNameDumper)
+        self._conn.adapters.register_dumper(JSON, _JsonDumper)
         self._conn.adapters.register_dumper(_TypedNull, _TypedNullDumper)
         # The portals opened for cursors bound IN, numbered (#1609).
         self._portals_opened = 0
@@ -10334,6 +10424,23 @@ class PostgresBackend:
                 for row in rows:
                     row[i] = self._db_collection(coll, row[i], desc.type_code)
                 columns.append(_object_column_meta(desc.name, coll))
+            elif desc.type_code in _JSON_OIDS and self._release >= (21, 0):
+                # A JSON value (#1706), described as 21c's native JSON: binary,
+                # its wire length the Mirror's to fill in; each document its
+                # extended types given back.
+                for row in rows:
+                    if row[i] is not None:
+                        row[i] = _from_extended(row[i])
+                columns.append(
+                    ColumnMeta(
+                        name=_oracle_column_name(desc.name).encode('utf-8'),
+                        data_type=TNS_TYPE_JSON,
+                        data_length=0,
+                        max_size=0,
+                        charset=0,
+                        csfrm=0,
+                    )
+                )
             elif self._bfile_oid is not None and desc.type_code == self._bfile_oid:
                 # A BFILE (#1669): the two names, charset and form 0, as the
                 # passthrough describes one; its cells the core's BFile.
