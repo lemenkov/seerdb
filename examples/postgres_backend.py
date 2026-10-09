@@ -300,6 +300,7 @@ from seerdb.common.tns_consts import (
     ORA_NUMERIC_OR_VALUE_ERROR,
     ORA_NUMERIC_OVERFLOW,
     ORA_PARENT_KEY_NOT_FOUND,
+    ORA_PASSWORD_TOO_LONG,
     ORA_PLSQL_COMPILATION_ERROR,
     ORA_RESOURCE_BUSY,
     ORA_SAVEPOINT_NEVER_ESTABLISHED,
@@ -9351,8 +9352,11 @@ _NOT_EXPLAINABLE = re.compile(
 )
 
 
-# The longest password Oracle 12.2+ accepts; measured on 23ai (#1266).
+# The longest password Oracle 12.2+ accepts; measured on 23ai (#1266). Up to
+# 15 bytes past it 23ai says so (ORA-28218); further it cannot read the new
+# password at all and answers ORA-01017 (#1713).
 _MAX_PASSWORD_BYTES = 1024
+_PASSWORD_REFUSED_BYTES = 1040
 
 
 _BUILTIN_OIDS = frozenset(
@@ -14734,13 +14738,19 @@ class PostgresBackend:
                 ora_code=ORA_INVALID_USERNAME_PASSWORD,
             )
         # Oracle takes a password of at most 1024 bytes (12.2+; 11g far less).
-        # Past that, the 1500-character change a client may try draws ORA-01017
-        # from 11g and 23ai alike, so the Mirror answers the same, rather than
-        # storing a password no Oracle would (#1266).
-        if len(new_password.encode('utf-8')) > _MAX_PASSWORD_BYTES:
+        # Past that, 23ai answers ORA-28218 up to 1039 bytes (#1713) and
+        # ORA-01017 from 1040 -- the 1500-character change a client may try
+        # draws it from 11g and 23ai alike -- so the Mirror answers the same,
+        # rather than storing a password no Oracle would (#1266).
+        size = len(new_password.encode('utf-8'))
+        if size >= _PASSWORD_REFUSED_BYTES:
             raise BackendError(
                 'invalid username/password; logon denied',
                 ora_code=ORA_INVALID_USERNAME_PASSWORD,
+            )
+        if size > _MAX_PASSWORD_BYTES:
+            raise BackendError(
+                'password length more than 1024 bytes', ora_code=ORA_PASSWORD_TOO_LONG
             )
         self._accounts.set(username, new_password)
 

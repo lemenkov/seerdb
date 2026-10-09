@@ -229,6 +229,7 @@ ORA_LOB_NOT_OPENED = 22289  # cannot perform operation on an unopened file or LO
 ORA_LOB_ALREADY_OPENED = 22293  # LOB already opened in the same transaction
 ORA_DEQUEUE_TIMEOUT = 25228  # timeout or end-of-fetch during message dequeue
 ORA_LISTEN_TIMEOUT = 25254  # time-out in LISTEN while waiting for a message
+ORA_PASSWORD_TOO_LONG = 28218  # password length more than 1024 bytes
 ORA_NO_DATA_GUIDE = 40582  # the collection has no data-guide-enabled index
 ORA_VECTOR_DIMENSION_MISMATCH = 51803  # vector dimension count must match the column's
 ORA_VECTOR_INVALID_VALUE = 51805  # a dimension value that is not a number (inf, NaN)
