@@ -3680,7 +3680,15 @@ reverse-engineered byte-for-byte and verified on 10g / 11g / 21c / 23ai:
   response RPA returns an **updated locator with an "open" flag byte set** —
   `READ` and `FILE_CLOSE` must use *that* locator. A `READ` against the
   original (unopened) locator returns empty bytes — the symptom that long
-  blocked native BFILE support.
+  blocked native BFILE support. After the locator the reply **echoes the
+  mode** as the amount, as a LOB's `OPEN` does (23ai):
+
+  ```
+  08 | 00 36 <54-byte locator, open flag set> | 01 0b | 04 ... (OER)
+  ```
+
+  A client that sent an amount reads one back, so a reply without it has the
+  OER's first byte taken for the amount and desyncs (#1672).
 - **`READ`** (op `0x0002`) is the ordinary read with the ub2-prefixed (opened)
   locator; content streams back as the normal `LOB_DATA` chunk (§14.3).
 - **`FILE_CLOSE`** (op `0x0200`) sends neither amount nor data.

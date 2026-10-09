@@ -4066,6 +4066,41 @@ def test_a_bfile_names_a_file_on_the_postgresql_host() -> None:
         backend.close()
 
 
+def test_a_bfiles_bytes_are_read_on_the_postgresql_host() -> None:
+    # A BFILE's length and bytes (#1672), read through PostgreSQL: the whole
+    # file, a slice from a 1-based offset, an amount past the end cut short,
+    # and ORA-22285 for a file that is not there, as 23ai answers.
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        try:
+            backend.execute('DROP DIRECTORY etc1672')
+        except BackendError:
+            backend.rollback()  # not there yet
+        backend.execute("CREATE DIRECTORY etc1672 AS '/etc'")
+        whole = backend.bfile_read('ETC1672', 'hostname', 1, 0)
+        assert whole
+        assert backend.bfile_length('ETC1672', 'hostname') == len(whole)
+        assert backend.bfile_read('ETC1672', 'hostname', 3, 5) == whole[2:7]
+        assert backend.bfile_read('ETC1672', 'hostname', 2, 0xFFFFFFFF) == whole[1:]
+        for read in (
+            lambda: backend.bfile_length('ETC1672', 'no_such_file_1672'),
+            lambda: backend.bfile_read('ETC1672', 'no_such_file_1672', 1, 0),
+            lambda: backend.bfile_length('NO_SUCH_DIR_1672', 'hostname'),
+        ):
+            with pytest.raises(BackendError) as exc:
+                read()
+            assert exc.value.ora_code == 22285
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP DIRECTORY etc1672')
+        except BackendError:
+            backend.rollback()
+        backend.close()
+
+
 def test_a_cursors_attributes_read_as_in_oracle() -> None:
     # c%FOUND / c%NOTFOUND after a FETCH, c%ISOPEN before and after CLOSE, and
     # SQL%FOUND / SQL%NOTFOUND after an UPDATE (#1608); a string holding one is
