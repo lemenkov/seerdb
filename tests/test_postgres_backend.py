@@ -5142,6 +5142,26 @@ def test_statement_scanners_read_the_tokenizers_spans() -> None:
     )
 
 
+def test_structure_is_read_past_literals_and_comments() -> None:
+    # _matching_paren and _top_level_items on the shared tokenizer (#1695): a
+    # parenthesis or comma inside a literal (escaped quotes included), a quoted
+    # identifier or a comment is not structure, raw text or masked alike.
+    from postgres_backend import _mask_quoted, _matching_paren, _top_level_items
+
+    sql = "f('a (b', \"c)d\" /* ) */, 'it''s, x', g(1, 2)) -- )\n"
+    assert _matching_paren(sql, 1) == sql.rindex(')', 0, sql.index('--'))
+    items = _top_level_items(sql, 2, _matching_paren(sql, 1))
+    assert [sql[a:b].strip() for a, b in items] == [
+        "'a (b'",
+        '"c)d" /* ) */',
+        "'it''s, x'",
+        'g(1, 2)',
+    ]
+    masked = _mask_quoted("select 'a', 'b' -- don't\n, c from t")[0]
+    assert len(_top_level_items(masked, 7, masked.index(' from'))) == 3
+    assert _matching_paren('f(1', 1) == 3
+
+
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
     # #1692: a `:c` in a comment was counted as a bind, so every value after it
     # shifted -- `:b` silently got the wrong one; an apostrophe in a comment

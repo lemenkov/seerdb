@@ -239,6 +239,7 @@ from seerdb.common.dbobject import (
     type_name_to_tns,
 )
 from seerdb.common.sqltext import (
+    SqlToken,
     bind_placeholders,
     is_plsql,
     placeholder_count,
@@ -2674,37 +2675,54 @@ _SELECT_STAR = re.compile(
 _NESTED_QUERY = re.compile(r'\b(?:SELECT|FROM)\b', re.IGNORECASE)
 
 
+@functools.lru_cache(maxsize=32)
+def _token_tuple(text: str) -> tuple[SqlToken, ...]:
+    # The shared tokenizer's spans of `text`, kept for the next call on the same
+    # text: the structure helpers below are called many times per statement.
+    return tuple(sql_tokens(text))
+
+
+def _structure_marks(text: str, start: int, end: int) -> Iterator[tuple[int, str]]:
+    # (position, character) of each parenthesis and comma in text[start:end]
+    # that is structure: not inside a literal, a quoted identifier or a
+    # comment (#1695).
+    for token in _token_tuple(text):
+        if token.end <= start or token.kind != 'other':
+            continue
+        if token.start >= end:
+            break
+        char = text[token.start]
+        if char in '(),':
+            yield token.start, char
+
+
 def _top_level_items(text: str, start: int, end: int) -> list[tuple[int, int]]:
     # The comma-separated items of text[start:end], ignoring commas inside
-    # parentheses or quotes.
-    items, depth, item_start, i = [], 0, start, start
-    while i < end:
-        char = text[i]
-        if char in ("'", '"'):
-            close = text.find(char, i + 1)
-            i = end if close < 0 else close + 1
-            continue
+    # parentheses, literals, quoted identifiers and comments.
+    items, depth, item_start = [], 0, start
+    for at, char in _structure_marks(text, start, end):
         if char == '(':
             depth += 1
         elif char == ')':
             depth -= 1
-        elif char == ',' and depth == 0:
-            items.append((item_start, i))
-            item_start = i + 1
-        i += 1
+        elif depth == 0:
+            items.append((item_start, at))
+            item_start = at + 1
     items.append((item_start, end))
     return items
 
 
 def _matching_paren(text: str, open_at: int) -> int:
+    # The `)` closing the `(` at `open_at`, past literals, quoted identifiers
+    # and comments; the end of the text when none does.
     depth = 0
-    for i in range(open_at, len(text)):
-        if text[i] == '(':
+    for at, char in _structure_marks(text, open_at, len(text)):
+        if char == '(':
             depth += 1
-        elif text[i] == ')':
+        elif char == ')':
             depth -= 1
             if depth == 0:
-                return i
+                return at
     return len(text)
 
 
