@@ -5836,6 +5836,82 @@ def test_binary_vector_columns() -> None:
         backend.close()
 
 
+def test_from_vector_and_vector_kinds() -> None:
+    # FROM_VECTOR / VECTOR_SERIALIZE, VECTOR(...) and TO_VECTOR's DENSE /
+    # SPARSE (#1726). Every answer is 23ai's, measured: an element's exact
+    # value to 9 (FLOAT32) or 17 (FLOAT64) significant digits as d.dddE+nnn,
+    # zero as 0; a sparse vector [dims,[indices],[values]]; a UNION of sparse
+    # vectors of differing dimension counts not described sparse.
+    import array
+
+    from seerdb.common.tns_consts import (
+        TNS_TYPE_CLOB,
+        VECTOR_FLAG_FLEXIBLE_DIM,
+        VECTOR_FLAG_SPARSE,
+    )
+    from seerdb.common.vector import SparseVector
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    if not backend._has_pgvector:
+        backend.close()
+        pytest.skip('the PostgreSQL bed has no pgvector')
+    try:
+        (f32, f64, i8, b, sparse) = backend.execute(
+            "SELECT FROM_VECTOR(TO_VECTOR('[34.6, 0, 1, 1e-40, 123456789]')), "
+            "VECTOR_SERIALIZE(TO_VECTOR('[34.6, 5e-324, 0.30000000000000004]', *, FLOAT64)), "
+            "FROM_VECTOR(TO_VECTOR('[3, -4, 0]', *, INT8)), "
+            "FROM_VECTOR(TO_VECTOR('[3, 255]', *, BINARY)), "
+            "FROM_VECTOR(TO_VECTOR('[8, [0, 7], [34.6, 77.8]]', 8, FLOAT64, SPARSE)) "
+            'FROM dual'
+        ).rows[0]
+        assert f32 == '[3.45999985E+001,0,1.0E+000,9.9999461E-041,1.23456792E+008]'
+        assert f64 == (
+            '[3.4600000000000001E+001,4.9406564584124654E-324,3.0000000000000004E-001]'
+        )
+        assert (i8, b) == ('[3,-4,0]', '[3,255]')
+        assert sparse == '[8,[0,7],[3.4600000000000001E+001,7.7799999999999997E+001]]'
+        result = backend.execute(
+            "SELECT FROM_VECTOR(TO_VECTOR('[4, [0, 2], [1.5, 2]]', 4, FLOAT64, SPARSE) "
+            'RETURNING CLOB FORMAT DENSE), '
+            "FROM_VECTOR(VECTOR('[0, 1.5, 0]', 3, FLOAT64) RETURNING VARCHAR2 FORMAT SPARSE) "
+            'FROM dual'
+        )
+        assert result.columns[0].data_type == TNS_TYPE_CLOB
+        assert result.rows[0] == ('[1.5E+000,0,2.0E+000,0]', '[3,[1],[1.5E+000]]')
+        (dense, made_sparse) = backend.execute(
+            "SELECT VECTOR(TO_VECTOR('[4, [0, 2], [1.5, 2]]', 4, FLOAT32, SPARSE), "
+            "4, FLOAT64, DENSE), TO_VECTOR('[8, [0, 7], [34.6, 77.8]]', 8, FLOAT64, SPARSE) "
+            'FROM dual'
+        ).rows[0]
+        assert dense == array.array('d', [1.5, 0, 2, 0])
+        assert made_sparse == SparseVector(8, [0, 7], array.array('d', [34.6, 77.8]))
+        for sql, flags in (
+            (
+                "SELECT TO_VECTOR('[3, [0], [1]]', 3, FLOAT64, SPARSE) FROM dual UNION ALL "
+                "SELECT TO_VECTOR('[4, [0], [1]]', 4, FLOAT64, SPARSE) FROM dual",
+                VECTOR_FLAG_FLEXIBLE_DIM,
+            ),
+            (
+                "SELECT TO_VECTOR('[3, [0], [1]]', 3, FLOAT64, SPARSE) FROM dual UNION ALL "
+                "SELECT TO_VECTOR('[3, [1], [1]]', 3, FLOAT32, SPARSE) FROM dual",
+                VECTOR_FLAG_SPARSE,
+            ),
+        ):
+            assert backend.execute(sql).columns[0].vector_flags == flags
+        for sql, code in (
+            ("SELECT TO_VECTOR('[8, [0], [1]]', 4, FLOAT32, SPARSE) FROM dual", 51820),
+            ("SELECT VECTOR('[0, 1.5]', 2, FLOAT32, SPARSE) FROM dual", 51833),
+            ("SELECT TO_VECTOR('[8, [0], [3]]', 8, BINARY, SPARSE) FROM dual", 51804),
+        ):
+            with pytest.raises(BackendError) as exc:
+                backend.execute(sql)
+            assert exc.value.ora_code == code
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_to_vector_and_vector_distance() -> None:
     # TO_VECTOR(text [, n [, format]]) and VECTOR_DISTANCE(a, b [, metric]) on
     # pgvector (#1708): a computed TO_VECTOR describes as its call says, a
