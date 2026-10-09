@@ -5162,6 +5162,42 @@ def test_structure_is_read_past_literals_and_comments() -> None:
     assert _matching_paren('f(1', 1) == 3
 
 
+def test_calls_are_islands_in_the_token_stream() -> None:
+    # The call layer (#1695): a call is found as a whole, unqualified word and
+    # its `(`, outside literals and comments; its arguments split at top-level
+    # commas only; the translators built on it leave literals and comments
+    # alone.
+    from postgres_backend import (
+        _calls,
+        _rewrite_calls,
+        _translate_decode,
+        _translate_deref,
+        _translate_rr_year,
+    )
+
+    sql = "f(a, 'f(x)') /* f(y) */ || pkg.f(1) || myf(2) || f (g(3), 4)"
+    found = list(_calls(sql, frozenset({'F'}), '.'))
+    assert [(c.start, [sql[a:b] for a, b in c.args]) for c in found] == [
+        (0, ['a', " 'f(x)'"]),
+        (sql.rindex('f ('), ['g(3)', ' 4']),
+    ]
+    assert _rewrite_calls(sql, frozenset({'F'}), lambda n, a: 'X', '.') == (
+        'X /* f(y) */ || pkg.f(1) || myf(2) || X'
+    )
+    assert _translate_decode("select decode(x, 1, 'a(', /* , */ 'b') from t") == (
+        "select CASE WHEN (x) IS NOT DISTINCT FROM (1) THEN 'a(' "
+        "ELSE /* , */ 'b' END from t"
+    )
+    assert _translate_deref("select deref(r).n, 'deref(x)' from t") == (
+        "select (sys.deref(r)).n, 'deref(x)' from t"
+    )
+    assert _translate_rr_year("select 1 -- to_char(d, 'RR')\n from t") == (
+        "select 1 -- to_char(d, 'RR')\n from t"
+    )
+    # A call that never closes stops the search, to fail as it was sent.
+    assert _translate_decode('select decode(a, b, c') == 'select decode(a, b, c'
+
+
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
     # #1692: a `:c` in a comment was counted as a bind, so every value after it
     # shifted -- `:b` silently got the wrong one; an apostrophe in a comment

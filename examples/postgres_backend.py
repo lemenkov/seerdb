@@ -2726,6 +2726,75 @@ def _matching_paren(text: str, open_at: int) -> int:
     return len(text)
 
 
+class _Call(NamedTuple):
+    # One call found by _calls: its name as written, where the name starts,
+    # its `(` and `)`, and the (start, end) span of each top-level argument.
+    name: str
+    start: int
+    open_at: int
+    close_at: int
+    args: list[tuple[int, int]]
+
+
+def _calls(sql: str, names: frozenset[str], not_after: str) -> Iterator[_Call]:
+    """Each call to one of `names` (upper case) in `sql`, outermost first and
+    in text order, outside literals, quoted identifiers and comments (#1695).
+
+    A call is the name as a whole word, then only whitespace, then `(`. One
+    right after an alphanumeric character or a character of `not_after` is
+    part of something else -- a qualified `pkg.decode(`, say -- and is not
+    one. A call that never closes ends the search: the statement is left to
+    fail as it was sent.
+    """
+    tokens = _token_tuple(sql)
+    for index, token in enumerate(tokens):
+        if token.kind != 'word' or sql[token.start : token.end].upper() not in names:
+            continue
+        before = sql[token.start - 1 : token.start]
+        if before and (before.isalnum() or before in not_after):
+            continue
+        following = index + 1
+        while following < len(tokens) and tokens[following].kind == 'space':
+            following += 1
+        if following == len(tokens) or sql[tokens[following].start] != '(':
+            continue
+        open_at = tokens[following].start
+        close_at = _matching_paren(sql, open_at)
+        if close_at >= len(sql):
+            return
+        yield _Call(
+            sql[token.start : token.end],
+            token.start,
+            open_at,
+            close_at,
+            _top_level_items(sql, open_at + 1, close_at),
+        )
+
+
+def _rewrite_calls(
+    sql: str,
+    names: frozenset[str],
+    rewrite: Callable[[str, list[str]], str | None],
+    not_after: str,
+) -> str:
+    # `sql` with each call to one of `names` replaced by `rewrite(name,
+    # arguments)`, the arguments as written; None leaves the call, and the
+    # calls inside it are still visited. `rewrite` handles the calls nested in
+    # a call it replaces, which is why they are not visited again here.
+    (out, pos) = ([], 0)
+    for call in _calls(sql, names, not_after):
+        if call.start < pos:
+            continue  # inside a call already replaced
+        replacement = rewrite(call.name, [sql[a:b] for a, b in call.args])
+        if replacement is None:
+            continue
+        out.append(sql[pos : call.start])
+        out.append(replacement)
+        pos = call.close_at + 1
+    out.append(sql[pos:])
+    return ''.join(out)
+
+
 def _ddl_column_spans(sql: str) -> tuple[str, list[tuple[int, int]], bool] | None:
     # The table a CREATE TABLE or ALTER TABLE ... ADD / MODIFY names, the span of
     # each column it declares, and whether it is a MODIFY; None for anything else.
@@ -4573,33 +4642,8 @@ def _translate_connect_by(sql: str) -> str:
 
 
 # The Oracle date functions whose format can carry a signed year (SYYYY).
-_SIGNED_YEAR_CALL = re.compile(r'\b(to_char|to_date|to_timestamp)\s*\(', re.IGNORECASE)
+_FORMAT_CALL_NAMES = frozenset({'TO_CHAR', 'TO_DATE', 'TO_TIMESTAMP'})
 _SIGNED_YEAR = re.compile('syyyy', re.IGNORECASE)
-
-
-def _call_args(sql: str, start: int) -> tuple[list[str], int] | None:
-    # The top-level arguments of the call whose '(' is at `start`, and the index
-    # just past its ')'. String literals ('' escapes included) and nested
-    # parentheses are skipped over whole. None if the call never closes.
-    (depth, i, arg_start, args) = (0, start, start + 1, [])
-    while i < len(sql):
-        char = sql[i]
-        if char == "'":
-            i += 1
-            while i < len(sql) and not (sql[i] == "'" and sql[i + 1 : i + 2] != "'"):
-                i += 2 if sql[i] == "'" else 1
-        elif char == '(':
-            depth += 1
-        elif char == ')':
-            depth -= 1
-            if depth == 0:
-                args.append(sql[arg_start:i])
-                return (args, i + 1)
-        elif char == ',' and depth == 1:
-            args.append(sql[arg_start:i])
-            arg_start = i + 1
-        i += 1
-    return None
 
 
 def _translate_signed_year(sql: str) -> str:
@@ -4630,37 +4674,17 @@ def _translate_signed_year(sql: str) -> str:
 def _rewrite_format_calls(
     sql: str, rewrite: Callable[[str, list[str], str], str | None], not_after: str
 ) -> str:
-    # `sql` with each TO_CHAR / TO_DATE / TO_TIMESTAMP call outside a string
-    # literal, whose format is a literal, replaced by what `rewrite(name, args,
-    # format)` makes of it; None leaves the call as it is. A call right after
-    # an alphanumeric character or one of `not_after` is part of another name.
-    (out, pos) = ([], 0)
-    in_string = False
-    i = 0
-    while i < len(sql):
-        if sql[i] == "'":
-            in_string = not in_string
-            i += 1
-            continue
-        match = None if in_string else _SIGNED_YEAR_CALL.match(sql, i)
-        if match is None or (i and (sql[i - 1].isalnum() or sql[i - 1] in not_after)):
-            i += 1
-            continue
-        found = _call_args(sql, match.end() - 1)
-        if found is None:
-            break
-        (args, end) = found
+    # `sql` with each TO_CHAR / TO_DATE / TO_TIMESTAMP call whose format is a
+    # literal replaced by what `rewrite(name, args, format)` makes of it; None
+    # leaves the call as it is. A call right after an alphanumeric character
+    # or one of `not_after` is part of another name.
+    def one(name: str, args: list[str]) -> str | None:
         fmt = args[1].strip() if len(args) >= 2 else ''
-        literal = fmt.startswith("'") and fmt.endswith("'")
-        call = rewrite(match.group(1), args, fmt) if literal else None
-        if call is None:
-            i = match.end()
-            continue
-        out.append(sql[pos:i])
-        out.append(call)
-        pos = i = end
-    out.append(sql[pos:])
-    return ''.join(out)
+        if not (fmt.startswith("'") and fmt.endswith("'")):
+            return None
+        return rewrite(name, args, fmt)
+
+    return _rewrite_calls(sql, _FORMAT_CALL_NAMES, one, not_after)
 
 
 # An RR / RRRR year in a format (#1638), outside a double-quoted text part.
@@ -4713,7 +4737,7 @@ def _translate_rr_year(sql: str) -> str:
 # parentheses, as IS NOT DISTINCT FROM binds tighter than `=`, AND or OR.
 # PostgreSQL's own two-argument decode(data, format) is left alone, as is a
 # schema-qualified call.
-_DECODE_CALL = re.compile(r'decode\s*\(', re.IGNORECASE)
+_DECODE_NAMES = frozenset({'DECODE'})
 
 # A DECODE result that converts a literal NULL -- TO_TIMESTAMP(NULL, 'YYYYMMDD')
 # -- is a NULL of that function's type in PostgreSQL, and a CASE cannot unify
@@ -4762,25 +4786,10 @@ def _decode_results(results: list[str]) -> list[str]:
 def _translate_decode(sql: str) -> str:
     if 'decode' not in sql.lower():
         return sql
-    (out, pos) = ([], 0)
-    in_string = False
-    i = 0
-    while i < len(sql):
-        if sql[i] == "'":
-            in_string = not in_string
-            i += 1
-            continue
-        match = None if in_string else _DECODE_CALL.match(sql, i)
-        if match is None or (i and (sql[i - 1].isalnum() or sql[i - 1] in '_$#."')):
-            i += 1
-            continue
-        found = _call_args(sql, match.end() - 1)
-        if found is None:
-            break
-        (args, end) = found
+
+    def case(_name: str, args: list[str]) -> str | None:
         if len(args) < 3:
-            i = match.end()
-            continue
+            return None
         (expr, *rest) = [_translate_decode(a).strip() for a in args]
         default = rest.pop() if len(rest) % 2 else None
         results = _decode_results(
@@ -4794,11 +4803,9 @@ def _translate_decode(sql: str) -> str:
             for search, result in zip(rest[::2], rest[1::2])
         )
         otherwise = f' ELSE {default}' if default is not None else ''
-        out.append(sql[pos:i])
-        out.append(f'CASE {branches}{otherwise} END')
-        pos = i = end
-    out.append(sql[pos:])
-    return ''.join(out)
+        return f'CASE {branches}{otherwise} END'
+
+    return _rewrite_calls(sql, _DECODE_NAMES, case, '_$#."')
 
 
 # An Oracle identifier may carry `#` (and `$`) after its first character:
@@ -5400,36 +5407,19 @@ def _rewrite_rownum(sql: str) -> str:
 
 
 # Not after a `.`: the generated `sys.deref(` is already the translation.
-_DEREF_CALL = re.compile(r'(?<![.\w])DEREF\s*\(', re.IGNORECASE)
+_DEREF_NAMES = frozenset({'DEREF'})
 
 
 def _translate_deref(sql: str) -> str:
     # DEREF(x) → (sys.deref(x)) (#1127). The parentheses round the call are what
     # PostgreSQL needs before a field selection: Oracle's `DEREF(r).name` is
-    # `(sys.deref(r)).name`. The argument is copied to its matching parenthesis,
-    # a string literal inside it taken whole.
-    out: list[str] = []
-    pos = 0
-    for match in _DEREF_CALL.finditer(sql):
-        if match.start() < pos:
-            continue  # inside an argument already copied
-        depth, i, n = 1, match.end(), len(sql)
-        while i < n and depth:
-            if sql[i] == "'":
-                i = sql.find("'", i + 1)
-                if i < 0:
-                    return sql  # unbalanced: leave the statement to fail as is
-            elif sql[i] == '(':
-                depth += 1
-            elif sql[i] == ')':
-                depth -= 1
-            i += 1
-        if depth:
-            return sql
-        inner = _translate_deref(sql[match.end() : i - 1])
-        out.append(sql[pos : match.start()] + f'(sys.deref({inner}))')
-        pos = i
-    return ''.join(out) + sql[pos:]
+    # `(sys.deref(r)).name`. A DEREF inside the argument is translated too.
+    return _rewrite_calls(
+        sql,
+        _DEREF_NAMES,
+        lambda _name, args: f'(sys.deref({_translate_deref(",".join(args))}))',
+        '._',
+    )
 
 
 # A table's correlation name, in a FROM or JOIN list or an UPDATE's head (#1434);
