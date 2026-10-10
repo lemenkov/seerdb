@@ -161,6 +161,12 @@ honest edge of this adapter:
   table's own annotations, ALTER ... ANNOTATIONS (ADD / DROP), a domain's
   DISPLAY / ORDER expressions and the USER_DOMAINS / USER_ANNOTATIONS views
   are not there.
+- **Sessionless transactions within one Mirror process** (#1746) -- a
+  suspended transaction is its PostgreSQL connection, parked in the process
+  for another session to resume, so sessions of another Mirror process do not
+  see it. The session's settings (time zone, current schema) travel with the
+  transaction, where Oracle's stay with the session; one still active when its
+  session closes is rolled back.
 - **Privileges, for type lookup only** -- every Mirror user is the backend's
   one PostgreSQL role. A GRANT or REVOKE on an object is recorded
   (``sys.ora_grants``), and a user sees another user's type -- in ALL_TYPES,
@@ -235,6 +241,7 @@ import re
 import select
 import struct
 import threading
+import time
 import uuid
 from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
@@ -4146,6 +4153,47 @@ _DROP_SQL_DOMAIN = re.compile(
     r'(?:\s+(FORCE)(?:\s+(PRESERVE))?)?\s*',
     re.IGNORECASE,
 )
+
+
+@dataclass
+class _ParkedTransaction:
+    """A sessionless transaction (#1746): the PostgreSQL connection holding it
+    open, whether a session has it now, and when a suspended one lapses."""
+
+    conn: psycopg.Connection
+    active: bool
+    expires: float
+
+
+# Every session's sessionless transactions, by (database, transaction id): the
+# Mirror's sessions share one process, so a connection parked by one session's
+# suspend is there for another's resume (#1746).
+_SESSIONLESS: dict[tuple[str, bytes], _ParkedTransaction] = {}
+_SESSIONLESS_LOCK = threading.Lock()
+
+
+def _sessionless_error(code: int, txn_id: bytes) -> BackendError:
+    # 23ai's refusals, measured (#1746, #1755).
+    gtrid = txn_id.hex().upper()
+    message = {
+        26217: f'sessionless transaction with GTRID {gtrid} already exists.',
+        26218: f'sessionless transaction with GTRID {gtrid} does not exist.',
+        25351: 'transaction is currently in use',
+    }[code]
+    return BackendError(message, ora_code=code)
+
+
+def _lapse_sessionless(now: float) -> None:
+    # Roll back and forget the suspended transactions past their timeout, as
+    # 23ai lets one go; the caller holds the lock.
+    for key, parked in list(_SESSIONLESS.items()):
+        if not parked.active and parked.expires <= now:
+            del _SESSIONLESS[key]
+            try:
+                parked.conn.rollback()
+                parked.conn.close()
+            except psycopg.Error:
+                pass
 
 
 def _drop_sql_domain(
@@ -9948,6 +9996,9 @@ class PostgresBackend:
     """
 
     capabilities = frozenset({Capability.TRANSACTIONS})
+    # The sessionless transaction a session holds (#1746); none until begun,
+    # also on a backend a test builds without __init__.
+    _sessionless_id: bytes | None = None
     # This demo speaks the 12.1 WIRE protocol (field version), which is also the
     # release it reports (server_identity). Those were deliberately apart while
     # the wire was 11.2: the dialect reads the RELEASE to pick native
@@ -9987,6 +10038,15 @@ class PostgresBackend:
         (major, minor) = (int(part) for part in release.split('.')[:2])
         self._release = (major, minor)
         self._conn = psycopg.connect(conninfo)
+        # What a twin of this backend is built from: a sessionless suspend
+        # takes a fresh connection, set up as this one was, from it (#1746).
+        self._twin: Callable[[], PostgresBackend] = lambda: type(self)(
+            conninfo,
+            credentials=credentials,
+            auth_conninfo=auth_conninfo,
+            presents=presents,
+        )
+        self._sessionless_id = None
         # V$VERSION and DBMS_UTILITY.DB_VERSION read the presented release from
         # the session (#1704), so the shared dictionary serves either release.
         for setting, value in (
@@ -15252,13 +15312,90 @@ class PostgresBackend:
     def commit(self) -> None:
         self._conn.commit()
         self._user_savepoint = False
+        self._end_sessionless()
 
     @_while_connected
     def rollback(self) -> None:
         self._conn.rollback()
         self._user_savepoint = False
+        self._end_sessionless()
+
+    def sessionless_begin(self, transaction_id: bytes, timeout: int) -> None:
+        """Start a sessionless transaction on this session's connection (#1746):
+        an id another session has started, suspended or not, is ORA-26217."""
+        key = (self._conninfo, bytes(transaction_id))
+        with _SESSIONLESS_LOCK:
+            _lapse_sessionless(time.monotonic())
+            if key in _SESSIONLESS:
+                raise _sessionless_error(26217, key[1])
+            _SESSIONLESS[key] = _ParkedTransaction(self._conn, True, 0.0)
+        self._sessionless_id = key[1]
+        self._sessionless_timeout = timeout
+
+    def sessionless_suspend(self) -> None:
+        """Suspend this session's sessionless transaction (#1746): its connection,
+        the transaction open on it, is parked for another session to resume
+        until `timeout` seconds pass, and this session goes on with a fresh
+        one. Session settings travel with the connection, where Oracle's stay."""
+        if self._sessionless_id is None:
+            return
+        key = (self._conninfo, self._sessionless_id)
+        fresh = self._twin()._conn
+        with _SESSIONLESS_LOCK:
+            parked = _SESSIONLESS.get(key)
+            if parked is not None:
+                parked.active = False
+                parked.expires = time.monotonic() + max(self._sessionless_timeout, 0)
+        self._conn = fresh
+        self._sessionless_id = None
+
+    def sessionless_resume(self, transaction_id: bytes, timeout: int) -> None:
+        """Resume a suspended sessionless transaction here (#1746): its parked
+        connection becomes this session's. An unknown or lapsed id is
+        ORA-26218; one another session has active is waited for until
+        `timeout` seconds pass, then ORA-25351 -- 23ai's answers."""
+        key = (self._conninfo, bytes(transaction_id))
+        deadline = time.monotonic() + max(timeout, 0)
+        while True:
+            with _SESSIONLESS_LOCK:
+                _lapse_sessionless(time.monotonic())
+                parked = _SESSIONLESS.get(key)
+                if parked is None:
+                    raise _sessionless_error(26218, key[1])
+                if not parked.active:
+                    parked.active = True
+                    (old, self._conn) = (self._conn, parked.conn)
+                    parked.conn = self._conn
+                    break
+            if time.monotonic() >= deadline:
+                raise _sessionless_error(25351, key[1])
+            time.sleep(0.05)
+        self._sessionless_id = key[1]
+        self._sessionless_timeout = timeout
+        try:
+            old.rollback()
+            old.close()
+        except psycopg.Error:
+            pass
+
+    def _end_sessionless(self) -> None:
+        # A commit or rollback ends this session's sessionless transaction: the
+        # id is free again, and resuming it ORA-26218 (#1746).
+        if self._sessionless_id is None:
+            return
+        with _SESSIONLESS_LOCK:
+            _SESSIONLESS.pop((self._conninfo, self._sessionless_id), None)
+        self._sessionless_id = None
 
     def close(self) -> None:
+        # A sessionless transaction this session still holds ends with it,
+        # rolled back (#1746).
+        if self._sessionless_id is not None:
+            try:
+                self._conn.rollback()
+            except psycopg.Error:
+                pass
+            self._end_sessionless()
         # What the translation report has not written yet goes out first (#1557).
         self._flush_report()
         if self._report_conn is not None:
