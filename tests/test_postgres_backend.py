@@ -6449,6 +6449,52 @@ def test_column_layouts_follow_a_drop_and_recreate() -> None:
         backend.close()
 
 
+def test_sessionless_transactions_move_between_sessions() -> None:
+    # A sessionless transaction (#1746): begun and suspended on one session,
+    # invisible to others while suspended, resumed and committed on another.
+    # 23ai's refusals, measured: an id that exists ORA-26217, an unknown or
+    # finished one ORA-26218, one active elsewhere ORA-25351 after the timeout.
+    from seerdb.server import BackendError
+
+    def code(call) -> int | None:
+        try:
+            call()
+        except BackendError as exc:
+            return exc.ora_code
+        return None
+
+    (one, two, outsider) = (
+        PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+        for _ in range(3)
+    )
+    try:
+        outsider.execute('CREATE TABLE s1746 (n NUMBER)')
+        one.sessionless_begin(b'sl-1746', 60)
+        one.execute('INSERT INTO s1746 VALUES (10)')
+        assert code(lambda: two.sessionless_begin(b'sl-1746', 60)) == 26217
+        assert code(lambda: two.sessionless_resume(b'sl-1746', 0)) == 25351
+        one.sessionless_suspend()
+        assert outsider.execute('SELECT count(*) FROM s1746').rows == [(0,)]
+        assert code(lambda: two.sessionless_resume(b'sl-unknown', 1)) == 26218
+        two.sessionless_resume(b'sl-1746', 5)
+        two.execute('INSERT INTO s1746 VALUES (20)')
+        two.commit()
+        assert outsider.execute('SELECT n FROM s1746 ORDER BY n').rows == [(10,), (20,)]
+        assert code(lambda: one.sessionless_resume(b'sl-1746', 1)) == 26218
+        # The suspending session went on with a fresh connection of its own.
+        assert one.execute('SELECT count(*) FROM s1746').rows == [(2,)]
+    finally:
+        for backend in (one, two):
+            backend.rollback()
+            backend.close()
+        outsider.rollback()
+        try:
+            outsider.execute('DROP TABLE s1746')
+        except BackendError:
+            outsider.rollback()
+        outsider.close()
+
+
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
     # #1692: a `:c` in a comment was counted as a bind, so every value after it
     # shifted -- `:b` silently got the wrong one; an apostrophe in a comment
