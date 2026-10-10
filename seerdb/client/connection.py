@@ -216,21 +216,45 @@ Xid = collections.namedtuple(
 )
 
 
-def _raise_tpc_error(Packet: bytes) -> None:
-    # A TPC op that failed comes back as a TTI_OER (not the RPA return params).
-    # Pull the ORA code + message out of it and raise the matching exception.
-    from seerdb.common.exceptions import from_ora_code
+def _tpc_error_info(Packet: bytes) -> tuple[int, str | None]:
+    # The ORA code and message of a TPC reply that failed (#1755). It comes as
+    # a TTI_OER, after any server piggyback, not as the RPA return params. The
+    # message is the embedded "ORA-NNNNN:" text, as an AQ error's is: the
+    # decoder's message slot reads past a leading piggyback wrong.
     from seerdb.common.tns import decode_packet
 
+    Match = _AQ_ORA_RE.search(bytes(Packet))
+    if Match:
+        return (int(Match.group(1)), Match.group(2).rstrip().decode('utf-8', 'replace'))
     try:
         Result = decode_packet(Packet, (None, None, []))
         Code = Result[1] if isinstance(Result, tuple) and len(Result) > 1 else 0
-        Msg = Result[5] if isinstance(Result, tuple) and len(Result) > 5 else None
     except Exception:
-        Code, Msg = 0, None
+        Code = 0
+    return (Code or 0, None)
+
+
+def _raise_tpc_error(Packet: bytes) -> None:
+    # A TPC op that failed: raise the matching exception.
+    from seerdb.common.exceptions import from_ora_code
+
+    (Code, Msg) = _tpc_error_info(Packet)
     if Code:
         raise from_ora_code(Code)(Msg or f'ORA-{Code:05d}', code=Code)
     raise DatabaseError(f'unexpected TPC response 0x{Packet[:1].hex()}')
+
+
+def _check_tpc_reply(Packet: bytes) -> bytes:
+    # Every TPC reply, before its caller reads it (#1755): one that does not
+    # open with the RPA return params and carries an ORA code is a failure the
+    # server reported -- a sessionless begin of an id that exists (ORA-26217),
+    # a resume of one that does not (ORA-26218) or is in use (ORA-25351). A
+    # bare status, as a detach may send, is not.
+    if Packet and Packet[0] != TTI_RPA:
+        (Code, _Msg) = _tpc_error_info(Packet)
+        if Code:
+            _raise_tpc_error(Packet)
+    return Packet
 
 
 def _decode_tpc_context(Packet: bytes) -> bytes:
@@ -3098,7 +3122,7 @@ class OracleConnect(_ConnectionLogic):
         if Received is False:
             raise OperationalError('connection closed during TPC operation')
         (_, Packet) = Received
-        return Packet
+        return _check_tpc_reply(Packet)
 
     def tpc_begin(self, xid: Xid, flags: int = TPC_BEGIN_NEW, timeout: int = 0) -> None:
         """Begin a TPC (global) transaction branch identified by `xid`."""
