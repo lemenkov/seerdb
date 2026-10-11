@@ -153,6 +153,7 @@ from seerdb.common.tns import (
 from seerdb.common.tns_consts import (
     CCAP_LOB,
     CCAP_LOB_12C,
+    FIELD_VERSION_10_2,
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_23_1_EXT_1,
@@ -455,7 +456,7 @@ def handle_login(
     encryption: str = 'accepted',
     token_public_key: bytes | None = None,
     field_version: int = FIELD_VERSION_11_2,
-    min_field_version: int = FIELD_VERSION_11_2,
+    min_field_version: int = FIELD_VERSION_10_2,
     tns_version: int | None = None,
     identity: 'ServerIdentity | None' = None,
 ) -> tuple[str, bool, bytes | None, int | None, int]:
@@ -869,6 +870,12 @@ def _open_backend_session(
         )
 
 
+# The lowest field version the Mirror serves sqlplus / thick OCI at. A thin
+# client is served from 10g (#814), but sqlplus 10.2 logs in with an OSESSKEY
+# and a type round laid out apart from the 11.2+ ones the OCI path reads (#1764).
+_OCI_MIN_FIELD_VERSION = FIELD_VERSION_11_2
+
+
 def sqlplus_field_version(
     capabilities: bytes, field_version: int, min_field_version: int
 ) -> int:
@@ -884,10 +891,11 @@ def sqlplus_field_version(
     spoken = client_field_version(capabilities)
     if spoken is None or spoken >= field_version:
         return field_version
-    if spoken < min_field_version:
+    floor = max(min_field_version, _OCI_MIN_FIELD_VERSION)
+    if spoken < floor:
         raise InterfaceError(
             f'sqlplus speaks TTC field version {spoken}, below the '
-            f'{min_field_version} this Mirror serves'
+            f'{floor} this Mirror serves'
         )
     return spoken
 
@@ -1166,7 +1174,7 @@ def serve_session(
     encryption: str = 'accepted',
     token_public_key: bytes | None = None,
     field_version: int = FIELD_VERSION_11_2,
-    min_field_version: int = FIELD_VERSION_11_2,
+    min_field_version: int = FIELD_VERSION_10_2,
     tns_version: int | None = None,
 ) -> str:
     """Log a client in, then answer its queries until it disconnects.

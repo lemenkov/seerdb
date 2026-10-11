@@ -8,7 +8,7 @@ from __future__ import annotations
 import threading
 
 import seerdb
-from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
+from seerdb.common.tns_consts import FIELD_VERSION_10_2, TNS_TYPE_VARCHAR
 from seerdb.server import (
     ColumnMeta,
     Result,
@@ -70,3 +70,33 @@ def test_seerdb_server_serves_a_client() -> None:
         thread.join(timeout=5)
 
     assert row == ('X',)
+
+
+def test_a_10g_client_is_served() -> None:
+    # A thin client that negotiates 10g (field version 4) logs in and reads a
+    # row: the describe it gets ends each column, and the block, where a 10g
+    # describe does (#814).
+    server = seerdb.Server(host='127.0.0.1', port=0, backend_factory=_DualBackend)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = seerdb.connect(
+            host='127.0.0.1',
+            port=server.port,
+            user='PYO',
+            password='pyo123',
+            service_name='XE',
+            timeout=5000,
+            field_version=FIELD_VERSION_10_2,
+        )
+        negotiated = conn.field_version
+        cursor = conn.cursor()
+        cursor.execute('select * from dual')
+        rows = cursor.fetchall()
+        conn.close()
+    finally:
+        server.close()
+        thread.join(timeout=5)
+
+    assert negotiated == FIELD_VERSION_10_2
+    assert rows == [('X',)]

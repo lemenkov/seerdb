@@ -99,6 +99,29 @@ _DUAL_EXEC = bytes.fromhex(
 )
 
 
+def test_a_10g_describe_has_no_11g_fields() -> None:
+    # 10g's describe has no per-column `uds flags` and no `dcbqcky` query-cache
+    # key after the four flags; both are 11g additions (#84). Encoded with them,
+    # a 10g client read the key's length byte as its first row token (#814).
+    from seerdb.common.tns_consts import FIELD_VERSION_10_2
+
+    cols = [
+        ColumnMeta(name=b'N', data_type=TNS_TYPE_NUMBER, data_length=22, max_size=22),
+        ColumnMeta(name=b'S', data_type=TNS_TYPE_VARCHAR, data_length=5, max_size=5),
+    ]
+    with _at_field_version(FIELD_VERSION_11_2):
+        at_11g = encode_describe(cols)
+    with _at_field_version(FIELD_VERSION_10_2):
+        at_10g = encode_describe(cols)
+        response = encode_describe(cols) + encode_rows([(1, 'abc')], cols)
+        done, acc = decode_packet(response + bytes([TTI_STA]), (0, [], []))
+    # One ub4 per column and one empty bytes-with-length (a single 0 byte) less.
+    assert len(at_11g) - len(at_10g) == len(cols) + 1
+    assert done
+    assert [c['column_name'] for c in acc[1]] == [b'N', b'S']
+    assert acc[2] == [[1, 'abc']]
+
+
 def test_parse_real_dual_exec() -> None:
     req = parse_exec(_DUAL_EXEC)
     assert req.sql == 'select * from dual'

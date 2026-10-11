@@ -1440,9 +1440,14 @@ def _encode_dcb_column(col: ColumnMeta, position: int) -> bytes:
         + _str_with_length(col.type_schema)  # type schema (ADT owner)
         + _str_with_length(col.type_name)  # type name
         + encode_sb4(position)  # column position
-        + encode_sb4(  # uds flags (11g addition): mark a JSON / OSON column (#826)
-            (_UDS_FLAGS_IS_JSON if col.is_json else 0)
-            | (_UDS_FLAGS_IS_OSON if col.is_oson else 0)
+        + (
+            encode_sb4(  # uds flags (11g addition): mark a JSON / OSON column (#826)
+                (_UDS_FLAGS_IS_JSON if col.is_json else 0)
+                | (_UDS_FLAGS_IS_OSON if col.is_oson else 0)
+            )
+            # A 10g describe ends the column at its position (#84, #814).
+            if field_version >= FIELD_VERSION_11_2
+            else b''
         )
         + (
             _str_with_length(col.domain_schema) + _str_with_length(col.domain_name)
@@ -1483,7 +1488,10 @@ def _encode_describe_body(columns: list[ColumnMeta]) -> bytes:
         body += _encode_dcb_column(col, position)
     body += _bytes_with_length(b'')  # current date (skipped)
     body += encode_sb4(0) * 4  # dcbflag / dcbmdbz / dcbmnpr / dcbmxpr
-    body += _bytes_with_length(b'')  # dcbqcky query-cache key (11g)
+    if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2:
+        # The result cache's query key is an 11g addition; a 10g describe ends
+        # after the four flags (#84, #814).
+        body += _bytes_with_length(b'')  # dcbqcky query-cache key (11g)
     return body
 
 
