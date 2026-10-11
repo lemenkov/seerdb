@@ -246,6 +246,7 @@ from seerdb.server.framing import PacketStream
 from seerdb.server.handshake import (
     client_compile_cap,
     client_field_version,
+    connect_data_follows,
     encode_accept,
     encode_ano_null_reply,
     encode_dty_reply,
@@ -497,7 +498,13 @@ def handle_login(
     # The protocol version goes with the field version unless a caller pins it.
     if tns_version is None:
         tns_version = server_tns_version(field_version)
-    request = parse_connect(_expect(stream, TNS_CONNECT, 'CONNECT'))
+    connect = _expect(stream, TNS_CONNECT, 'CONNECT')
+    # A descriptor over 230 bytes follows the CONNECT in a DATA packet of its
+    # own; answering the bare CONNECT took that packet for the next handshake
+    # step and the login stalled (#1769).
+    if connect_data_follows(connect):
+        connect += _expect(stream, TNS_DATA, 'connect data')
+    request = parse_connect(connect)
     stream.send_raw(encode_accept(request, tns_version=tns_version))
     # Honour the SDU just negotiated in that ACCEPT. It was computed as
     # min(client, ours) and reported, but every later write still used the

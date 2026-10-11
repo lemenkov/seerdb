@@ -44,6 +44,7 @@ from seerdb.server.handshake import (
     TNS_VERSION_12_2,
     TNS_VERSION_21_1,
     TNS_VERSION_23_1,
+    connect_data_follows,
     encode_accept,
     encode_dty_reply,
     encode_pro_reply,
@@ -52,6 +53,42 @@ from seerdb.server.handshake import (
     pro_is_sqlplus,
     server_tns_version,
 )
+
+# A CONNECT whose descriptor does not fit in it, captured from python-oracledb
+# 26.0.1 (sdu=4096, a long program path): the CONNECT states 0x010a bytes of
+# connect data at offset 74 and ends there; the descriptor follows in a DATA
+# packet of its own (#1769).
+_SPLIT_CONNECT = bytes.fromhex(
+    '004a000001000000013f012c0401100010004f9800000001010a004a00000000'
+    '8484000000000000000000000000000000000000000000000000000010000000'
+    '10000000000000000001'
+)
+_SPLIT_CONNECT_DATA = bytes.fromhex(
+    '01140000060000000000284445534352495054494f4e3d285452414e53504f52'
+    '545f434f4e4e4543545f54494d454f55543d3329285344553d34303936292841'
+    '4444524553533d2850524f544f434f4c3d7463702928484f53543d3132372e30'
+    '2e302e312928504f52543d3135363032292928434f4e4e4543545f444154413d'
+    '28534552564943455f4e414d453d465245455044423129284349443d2850524f'
+    '4752414d3d2f6f70742f6170706c69636174696f6e2f76656e762f62696e2f70'
+    '7974686f6e332e31322928484f53543d636c69656e742e6578616d706c652928'
+    '555345523d617070292928434f4e4e454354494f4e5f49443d72646745647179'
+    '4d4254516e4b7830474446635846773d3d292929'
+)
+
+
+def test_a_connect_carrying_its_descriptor_needs_nothing_more() -> None:
+    assert not connect_data_follows(fx.CONNECT[8:])
+
+
+def test_a_connect_short_of_its_descriptor_waits_for_it() -> None:
+    assert connect_data_follows(_SPLIT_CONNECT[8:])
+    # read_packet strips the DATA packet's header and data flags (10 bytes).
+    req = parse_connect(_SPLIT_CONNECT[8:] + _SPLIT_CONNECT_DATA[10:])
+    assert req.service_name == 'FREEPDB1'
+    assert req.program == '/opt/application/venv/bin/python3.12'
+    assert req.user == 'app'
+    assert req.sdu == 4096
+    assert req.descriptor.endswith(b')))')
 
 
 def test_parse_real_11g_connect() -> None:
