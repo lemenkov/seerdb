@@ -19,8 +19,9 @@ from seerdb.common.exceptions import NotSupportedError
 
 
 class _FakeConn:
-    def __init__(self, major):
+    def __init__(self, major, field_version=24):
         self.server_version = major << 24
+        self.field_version = field_version
 
 
 class TestSodaHelpers(unittest.TestCase):
@@ -57,6 +58,15 @@ class TestSodaHelpers(unittest.TestCase):
                 _check_soda_supported(_FakeConn(major))
         for major in (18, 19, 21, 23):
             _check_soda_supported(_FakeConn(major))  # no raise
+
+    def test_soda_needs_a_12_1_session(self):
+        # Its document operations bind PL/SQL arrays, which a session below 12.1
+        # cannot, so an 18c+ server reached at 11.2 or 10g is refused up front
+        # rather than halfway through a call (#1763).
+        for field_version in (4, 6):
+            with self.assertRaises(NotSupportedError):
+                _check_soda_supported(_FakeConn(23, field_version))
+        _check_soda_supported(_FakeConn(23, 7))  # 12.1: no raise
 
 
 class TestSodaDocument(unittest.TestCase):
