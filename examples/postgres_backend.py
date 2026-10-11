@@ -5548,6 +5548,20 @@ _IDIOM_REWRITES: list[
         ),
         _xmlelement_name,
     ),
+    # USER is the session's user (#1751), as SYS_CONTEXT('USERENV',
+    # 'SESSION_USER') names it; PostgreSQL's own USER is the backend's role,
+    # lower case and the same for every account. CREATE / ALTER / DROP USER keep
+    # the word, as does a USER that is part of a qualified name or a call.
+    (
+        'user-pseudo-column',
+        re.compile(
+            r'(\b(?:CREATE|ALTER|DROP)\s+)?(?<![.\w$#"])\bUSER\b(?!\s*[.(]|[\w$#])',
+            re.IGNORECASE,
+        ),
+        lambda m: (
+            m.group(0) if m.group(1) else "sys.sys_context('USERENV', 'SESSION_USER')"
+        ),
+    ),
     # SYSDATE / SYSTIMESTAMP → the session clock (SYSDATE is to-the-second).
     (
         'systimestamp',
@@ -10589,6 +10603,19 @@ class PostgresBackend:
         secret = self._accounts.secret(username)
         self._login_user = username.upper()
         if secret is not None:
+            # Every Oracle user has a schema, the launcher's account too (#1751):
+            # without one its objects went to `public` and the dictionary named
+            # their owner PUBLIC. A CREATE USER account has one already; another
+            # session may be creating this one at the same moment.
+            try:
+                self._conn.execute(
+                    sql.SQL('CREATE SCHEMA IF NOT EXISTS {}').format(
+                        sql.Identifier(username.lower())
+                    )
+                )
+                self._conn.commit()
+            except psycopg.Error:
+                self._conn.rollback()
             # An Oracle session's current schema starts as the login user's, so
             # an unqualified name resolves there first (#1188) -- the path ALTER
             # SESSION SET CURRENT_SCHEMA builds. PostgreSQL skips a schema that

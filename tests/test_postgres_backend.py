@@ -2226,10 +2226,12 @@ def test_a_rowid_renders_as_the_client_renders_it() -> None:
 
 def test_unqualified_names_resolve_in_the_login_users_schema() -> None:
     # Oracle starts a session in the login user's schema, so a table created as
-    # user.t is found as plain t (#1188); a user without a schema of its own
-    # still resolves through public, as before.
+    # user.t is found as plain t (#1188). A user without a schema gets one at
+    # login, as every Oracle user has one (#1751), so its objects are its own
+    # rather than PUBLIC's.
     admin = psycopg.connect(_CONNINFO, autocommit=True)
     admin.execute('DROP SCHEMA IF EXISTS pyo_login CASCADE')
+    admin.execute('DROP SCHEMA IF EXISTS pyo_no_schema CASCADE')
     admin.execute('CREATE SCHEMA pyo_login')
     admin.execute('CREATE TABLE pyo_login.pyo_login_t (n integer)')
     admin.execute('INSERT INTO pyo_login.pyo_login_t VALUES (7)')
@@ -2243,11 +2245,12 @@ def test_unqualified_names_resolve_in_the_login_users_schema() -> None:
         assert schema == 'pyo_login'
         assert other.authenticate('PYO_NO_SCHEMA') == 'y'
         (schema,) = other._conn.execute('SELECT current_schema()').fetchone()
-        assert schema == 'public'
+        assert schema == 'pyo_no_schema'
     finally:
         backend.close()
         other.close()
         admin.execute('DROP SCHEMA pyo_login CASCADE')
+        admin.execute('DROP SCHEMA IF EXISTS pyo_no_schema CASCADE')
         admin.close()
 
 
