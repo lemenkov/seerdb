@@ -310,5 +310,40 @@ class TestNativeBindLength(unittest.TestCase):
         self.assertEqual(VECTOR_BIND_DESCRIPTOR[-1], 0)
 
 
+class PreTwelveBindRefusalTest(unittest.TestCase):
+    # A session below 12.1 cannot carry a VECTOR bind: a 23ai answers an 11.2
+    # session's with a fatal ORA-03106 (#1762). The client refuses it up front,
+    # in each form a VECTOR binds in, positional or named, single or batched.
+    def _check(self, field_version, bind, batch=None):
+        from types import SimpleNamespace
+
+        from seerdb.client.cursor import _check_object_bind_support
+
+        conn = SimpleNamespace(field_version=field_version)
+        _check_object_bind_support(conn, bind, batch)
+
+    def test_each_vector_form_is_refused_below_12_1(self):
+        from seerdb import DB_TYPE_VECTOR, NotSupportedError
+        from seerdb.common.datatypes import Var
+
+        sparse = SparseVector(4, array.array('I', [1]), array.array('f', [2.0]))
+        for bind in (
+            [[1.0, 2.0]],
+            [array.array('f', [1.0, 2.0])],
+            [sparse],
+            {'v': (1, 2, 3)},
+            [Var(DB_TYPE_VECTOR)],
+        ):
+            with self.subTest(bind=bind), self.assertRaises(NotSupportedError):
+                self._check(6, bind)
+        with self.assertRaises(NotSupportedError):
+            self._check(6, None, [[1], [[1.0, 2.0]]])
+
+    def test_a_12_1_session_and_plain_values_pass(self):
+        self._check(7, [[1.0, 2.0]])
+        self._check(6, [1, 2.5, 'x', b'y', [], [True, False]])
+        self._check(6, {'a': 1, 'b': 'x'})
+
+
 if __name__ == '__main__':
     unittest.main()

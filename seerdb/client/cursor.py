@@ -52,9 +52,11 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_RID,
     TNS_TYPE_UROWID,
     TNS_TYPE_VARCHAR,
+    TNS_TYPE_VECTOR,
     UTF8_CHARSET,
     VECTOR_FLAG_FLEXIBLE_DIM,
 )
+from seerdb.common.vector import is_vector_bind
 
 # `RETURNING col BULK COLLECT INTO :x` -- the bulk form of the clause.
 _BULK_COLLECT_RE = re.compile(r'\bBULK\s+COLLECT\b', re.I)
@@ -1339,16 +1341,23 @@ def _check_object_bind_support(Connection, Bind, Batch=None) -> None:
     # Some binds need the 12c+ bind-OAC layout and have no pre-12c reference
     # (python-oracledb is 12.1+): a SQL OBJECT (ADT) value (#116; pre-12c
     # rejects it with a fatal ORA-03106 that desyncs the connection) and a
-    # PL/SQL associative-array bind (#122; pre-12c mis-types it, PLS-00306).
-    # Refuse both up front on pre-12c with a clear error. (Object/collection
-    # *decode* works on all tiers — only these binds are 12c+.)
+    # PL/SQL associative-array bind (#122; pre-12c mis-types it, PLS-00306),
+    # and a VECTOR (#1762: a 23ai answers an 11.2 session's ORA-03106, fatal,
+    # and serves the same bind from 12.1 up). Refuse them up front on pre-12c
+    # with a clear error. (Object/collection *decode* works on all tiers --
+    # only these binds are 12c+.)
     from seerdb.common.dbobject import DbObject, DbRef
 
     if getattr(Connection, 'field_version', 0) >= FIELD_VERSION_12_1:
         return
     Rows = [Bind] + (Batch or []) if Bind else (Batch or [])
     for Row in Rows:
-        Values = Row if isinstance(Row, (list, tuple)) else [Row]
+        if isinstance(Row, dict):
+            Values = list(Row.values())
+        elif isinstance(Row, (list, tuple)):
+            Values = list(Row)
+        else:
+            Values = [Row]
         for V in Values:
             if isinstance(V, DbObject):
                 raise NotSupportedError(
@@ -1362,6 +1371,12 @@ def _check_object_bind_support(Connection, Bind, Batch=None) -> None:
                 raise NotSupportedError(
                     'binding a PL/SQL associative array (arrayvar) requires an '
                     'Oracle 12.1+ server'
+                )
+            if (
+                isinstance(V, Var) and V.dbtype.tns_type == TNS_TYPE_VECTOR
+            ) or is_vector_bind(V):
+                raise NotSupportedError(
+                    'binding a VECTOR value requires an Oracle 12.1+ session'
                 )
 
 

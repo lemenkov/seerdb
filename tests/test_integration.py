@@ -6116,8 +6116,15 @@ class VectorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT v FROM {self.TABLE}')
         return self.cur.fetchone()[0]
 
+    def _skip_below_12_1(self):
+        # A session below 12.1 cannot bind a VECTOR, and the client refuses it
+        # (#1762); test_a_vector_bind_below_12_1_is_refused checks that.
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('a VECTOR bind needs a 12.1+ session')
+
     def _bind_roundtrip(self, coltype, value):
         # Bind a Python sequence (#55) and read it back.
+        self._skip_below_12_1()
         self._setup_vec(coltype)
         self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:v)', [value])
         self.conn.commit()
@@ -6166,6 +6173,27 @@ class VectorIntegration(_IntegrationBase):
         self.assertIsNone(FlexAll.vector_dimensions)
         self.assertIsNone(FlexAll.vector_format)
 
+    def test_a_vector_bind_below_12_1_is_refused(self):
+        # A 23ai answers a VECTOR bind from an 11.2 session with a fatal
+        # ORA-03106 (#1762). The client refuses it before sending, in every
+        # form a VECTOR binds in, so this runs on any server below 12.1 -- and
+        # the session stays usable.
+        import array
+
+        if self.conn.field_version >= FIELD_VERSION_12_1:
+            self.skipTest('a 12.1+ session binds a VECTOR (the round trips cover it)')
+        Declared = self.cur.var(seerdb.DB_TYPE_VECTOR)
+        for Bind in (
+            [[1.0, 2.0]],
+            [array.array('f', [1.0, 2.0])],
+            {'v': [1.0, 2.0]},
+            [Declared],
+        ):
+            with self.assertRaises(seerdb.NotSupportedError):
+                self.cur.execute('SELECT :v FROM DUAL', Bind)
+        self.cur.execute('SELECT 1 FROM DUAL')
+        self.assertEqual(self.cur.fetchall(), [(1,)])
+
     def test_a_vector_through_a_plsql_in_out_bind(self):
         # A VECTOR OUT / IN OUT bind carries its IMAGE, not a locator (#1010).
         # Served as a locator the client ran off the end of it -- and the size
@@ -6173,6 +6201,7 @@ class VectorIntegration(_IntegrationBase):
         # of #1008 when it is a different bug entirely.
         import array
 
+        self._skip_below_12_1()
         self._setup_vec('VECTOR(4, float32)')  # the table is incidental here
         In = array.array('f', [1.0, 1.5, 2.0, 2.5])
         InOut = self.cur.var(seerdb.DB_TYPE_VECTOR)
@@ -10437,11 +10466,24 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 )
                 await Cur.execute('DROP TABLE PYORACLE_ASYNC_TEST')
 
+    async def test_a_vector_bind_below_12_1_is_refused(self):
+        # Async parity for the pre-12.1 VECTOR refusal (#1762).
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            if Conn.field_version >= FIELD_VERSION_12_1:
+                self.skipTest('a 12.1+ session binds a VECTOR')
+            async with Conn.cursor() as Cur:
+                with self.assertRaises(seerdb.NotSupportedError):
+                    await Cur.execute('SELECT :v FROM DUAL', [[1.0, 2.0]])
+                await Cur.execute('SELECT 1 FROM DUAL')
+                self.assertEqual(await Cur.fetchall(), [(1,)])
+
     async def test_vector_bind_roundtrip(self):
         # Async parity for VECTOR binds (#55): bind a sequence, read it back.
         import array
 
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            if Conn.field_version < FIELD_VERSION_12_1:
+                self.skipTest('a VECTOR bind needs a 12.1+ session (#1762)')
             async with Conn.cursor() as Cur:
                 await self._drop_async(Cur, 'PYORACLE_ASYNC_VEC')
                 try:
@@ -10468,6 +10510,8 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
 
         sv = SparseVector(8, array.array('I', [2, 5]), array.array('f', [1.5, 2.5]))
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            if Conn.field_version < FIELD_VERSION_12_1:
+                self.skipTest('a VECTOR bind needs a 12.1+ session (#1762)')
             async with Conn.cursor() as Cur:
                 await self._drop_async(Cur, 'PYORACLE_ASYNC_SPV')
                 try:
