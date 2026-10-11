@@ -76,9 +76,10 @@ def main() -> None:
                 # translation it took, to sys.ora_translation_log (#1557).
                 translation_report=os.environ.get('SEERDB_TRANSLATION_REPORT') == '1',
                 auth_conninfo=os.environ.get('MIRROR_AUTH_PG') or None,
-                # MIRROR_PRESENTS=23ai presents Oracle 23ai, field version 24,
-                # instead of 12.1 (#1704).
-                presents=os.environ.get('MIRROR_PRESENTS', '12.1'),
+                # The release it presents (#1704): Oracle 23ai, field version 24,
+                # by default (#1747); MIRROR_PRESENTS=12.1 pins the older one.
+                # A client of any version from 11.2 negotiates its own (#816).
+                presents=os.environ.get('MIRROR_PRESENTS', '23ai'),
             )
         ),
     )
