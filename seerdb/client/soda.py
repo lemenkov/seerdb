@@ -27,7 +27,7 @@ import json
 
 from seerdb.common.datatypes import DB_TYPE_NUMBER, DB_TYPE_RAW, DB_TYPE_VARCHAR
 from seerdb.common.exceptions import DatabaseError, NotSupportedError
-from seerdb.common.tns_consts import ORA_NO_DATA_GUIDE
+from seerdb.common.tns_consts import FIELD_VERSION_12_1, ORA_NO_DATA_GUIDE
 
 # DBMS_SODA / SODA shipped in Oracle 18c (server major version 18).
 _SODA_MIN_MAJOR = 18
@@ -211,6 +211,11 @@ def _names_query(start_name, limit):
 def _check_soda_supported(connection) -> None:
     if (connection.server_version >> 24) < _SODA_MIN_MAJOR:
         raise NotSupportedError('SODA requires an Oracle 18c+ server (DBMS_SODA)')
+    # The document operations bind PL/SQL associative arrays, which a session
+    # below 12.1 cannot (#122); refused here rather than halfway through a call
+    # (#1763).
+    if connection.field_version < FIELD_VERSION_12_1:
+        raise NotSupportedError('SODA requires an Oracle 12.1+ session')
 
 
 def _norm_metadata(metadata):

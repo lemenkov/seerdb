@@ -6454,6 +6454,13 @@ class SodaIntegration(_IntegrationBase):
         if (self.conn.server_version >> 24) < 18:
             self.conn.close()
             self.skipTest('SODA needs an Oracle 18c+ server (DBMS_SODA)')
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            # Refused up front below 12.1 (#1763): its document operations bind
+            # PL/SQL arrays. The refusal itself is checked here, once per test.
+            with self.assertRaises(seerdb.NotSupportedError):
+                self.conn.getSodaDatabase()
+            self.conn.close()
+            self.skipTest('SODA needs a 12.1+ session')
         self.soda = self.conn.getSodaDatabase()
         self._drop_all_collections()
 
@@ -11029,6 +11036,11 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
             if (Conn.server_version >> 24) < 18:
                 self.skipTest('SODA needs an Oracle 18c+ server (DBMS_SODA)')
+            if Conn.field_version < FIELD_VERSION_12_1:
+                # Refused up front below 12.1 (#1763).
+                with self.assertRaises(seerdb.NotSupportedError):
+                    Conn.getSodaDatabase()
+                self.skipTest('SODA needs a 12.1+ session')
             soda = Conn.getSodaDatabase()
             for n in await soda.getCollectionNames():
                 c = await soda.openCollection(n)
