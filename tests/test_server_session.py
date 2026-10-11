@@ -1958,6 +1958,27 @@ def test_sqlplus_is_served_at_the_version_it_speaks() -> None:
     assert sqlplus_field_version(b'', FIELD_VERSION_12_1, low) == FIELD_VERSION_12_1
 
 
+# sqlplus 10.2.0.5's DTY capability block (field version 4), captured from its
+# login to the 10.2.0.5 server through tools/capture_proxy.py (#814).
+_SQLPLUS_10_CAPABILITIES = bytes.fromhex(
+    '02690369030224060101010d01010401010101010101ffff0308030301003f01'
+    '473f010201010301000001050201000018800000003c3c3c80000000d007'
+)
+
+
+def test_sqlplus_10g_is_refused_while_a_thin_10g_client_is_served() -> None:
+    # The Mirror serves a thin client from 10g (#814), but sqlplus 10.2 logs in
+    # with an OSESSKEY the OCI path cannot read yet (#1764): it is refused by
+    # name rather than left to fail mid-login, whatever floor the caller sets.
+    from seerdb.common.tns_consts import FIELD_VERSION_10_2, FIELD_VERSION_12_1
+    from seerdb.server.session import sqlplus_field_version
+
+    with pytest.raises(InterfaceError, match='field version 4'):
+        sqlplus_field_version(
+            _SQLPLUS_10_CAPABILITIES, FIELD_VERSION_12_1, FIELD_VERSION_10_2
+        )
+
+
 def _run_mirror_at_tns_version(listen: socket.socket, result: dict, tns: int) -> None:
     conn, _ = listen.accept()
     try:
