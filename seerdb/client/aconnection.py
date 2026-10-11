@@ -91,6 +91,7 @@ from seerdb.common.tns import (
     set_decode_dml_rowcounts,
     set_decode_prev_row,
     set_decode_return_binds,
+    split_connect,
 )
 from seerdb.common.tns_consts import (
     CCAP_FIELD_VERSION,
@@ -389,8 +390,17 @@ class AsyncOracleConnect(_ConnectionLogic):
             except BaseException:
                 self._writer.close()
                 raise
-        Data = encode_dictionary(self._make_dict(DictionaryType.login))
-        await self.send(TNS_CONNECT, Data)
+        await self._send_connect()
+
+    async def _send_connect(self) -> None:
+        # The CONNECT, then -- past 230 bytes -- the descriptor in a DATA packet
+        # of its own: a server reads no more than that from the CONNECT (#1768).
+        Connect, Descriptor = split_connect(
+            encode_dictionary(self._make_dict(DictionaryType.login))
+        )
+        await self.send(TNS_CONNECT, Connect)
+        if Descriptor is not None:
+            await self.send(TNS_DATA, Descriptor)
 
     async def connect(self) -> bool:
         """Open the TCP (optionally TLS) connection and run the
@@ -760,8 +770,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                     )
                 case t if t == TNS_RESEND:
                     self.conn_state = CONN_STATE_AUTH_NEGOTIATE
-                    Data = encode_dictionary(self._make_dict(DictionaryType.login))
-                    await self.send(TNS_CONNECT, Data)
+                    await self._send_connect()
                     continue
                 case _:
                     logger.debug('handle_login (async): unexpected %s', Type)

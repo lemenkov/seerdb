@@ -287,6 +287,27 @@ CONNECT packet itself is sent in the legacy 16-bit-length envelope regardless.
 
 When SSL/TLS is used, `PROTOCOL=TCPS`.
 
+**A descriptor over 230 bytes** does not ride in the CONNECT (#1768). A server
+reads at most 230 bytes of connect data from the CONNECT packet. Given more, it
+waits for data that never comes and the connect hangs. The limit was measured on
+10g, 11g, 21c and 23ai: a 230-byte descriptor connects, a 231-byte one times out.
+
+A longer descriptor goes in a TNS_DATA packet sent straight after the CONNECT:
+- The CONNECT still states the full length (offset 16) and offset 74, but ends
+  at offset 74, carrying no connect data.
+- The DATA packet follows the CONNECT, with data flags `0x0000`, in the legacy
+  16-bit envelope (nothing has been negotiated yet).
+
+Captured from python-oracledb 26.0.1 with a 238-byte descriptor:
+
+```
+C2S CONNECT 0x004a bytes   ... connect data length 0x00ee, offset 0x004a
+C2S DATA    0x00f8 bytes   00f8 0000 06 00 0000 | 0000 | (DESCRIPTION=...
+```
+
+Every bed from 8i to 26ai accepts the split form. Older listeners still refuse
+a very long descriptor outright: 9i and 10g refuse a 3000-byte one.
+
 ### 2.2 TNS_ACCEPT (Server -> Client)
 
 The server responds with TNS_ACCEPT. The client extracts the negotiated SDU from offset bytes 4-5 (16-bit big-endian) of the accept body. The negotiated SDU is used for all subsequent packet fragmentation.

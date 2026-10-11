@@ -15,11 +15,13 @@ from seerdb.common.tns import (
     encode_dictionary_dty,
     encode_dictionary_login,
     encode_packet,
+    split_connect,
 )
 from seerdb.common.tns_consts import (
     CCAP_TTC4,
     TNS_CCAP_END_OF_RESPONSE,
     TNS_DATA,
+    TNS_MAX_CONNECT_DATA,
     TTI_END_OF_RESPONSE,
     DictionaryType,
 )
@@ -70,6 +72,47 @@ class TestLargePacketFraming(unittest.TestCase):
         self.assertEqual(struct.unpack('>H', out[:2])[0], 319)  # version
         self.assertEqual(struct.unpack('>H', out[2:4])[0], 300)  # compat floor
         self.assertEqual(struct.unpack('>H', out[18:20])[0], 74)  # connect-data offset
+
+
+class TestLongConnectData(unittest.TestCase):
+    # A server reads at most 230 bytes of connect data from the CONNECT; a
+    # longer descriptor hung the connect on every bed until it went out in a
+    # DATA packet of its own (#1768).
+    def _login(self, descriptor_len):
+        def body(app_name):
+            return encode_dictionary_login(
+                {
+                    'type': DictionaryType.login,
+                    'env': {
+                        'host': 'h',
+                        'port': 1,
+                        'user': 'u',
+                        'password': 'p',
+                        'sid': 'XE',
+                        'app_name': app_name,
+                    },
+                    'sdu': 8192,
+                }
+            )
+
+        short = len(body('a')) - 66
+        out = body('a' * (1 + descriptor_len - short))
+        self.assertEqual(len(out) - 66, descriptor_len)
+        return out
+
+    def test_230_bytes_stay_in_the_connect(self):
+        out = self._login(TNS_MAX_CONNECT_DATA)
+        self.assertEqual(split_connect(out), (out, None))
+
+    def test_231_bytes_follow_in_a_data_packet(self):
+        out = self._login(TNS_MAX_CONNECT_DATA + 1)
+        connect, descriptor = split_connect(out)
+        self.assertEqual(connect, out[:66])
+        self.assertEqual(descriptor, out[66:])
+        self.assertTrue(descriptor.startswith(b'(DESCRIPTION='))
+        # The CONNECT still states the full length and the usual offset.
+        self.assertEqual(struct.unpack('>H', connect[16:18])[0], 231)
+        self.assertEqual(struct.unpack('>H', connect[18:20])[0], 74)
 
 
 class TestEndOfResponseCap(unittest.TestCase):
