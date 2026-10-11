@@ -6498,6 +6498,35 @@ def test_sessionless_transactions_move_between_sessions() -> None:
         outsider.close()
 
 
+def test_a_number_as_a_condition_at_23ai() -> None:
+    # 23ai takes a number where a condition goes, zero FALSE and any other
+    # TRUE (#1760), measured: SQLAlchemy writes true() as `ON 1` there. A
+    # comparison's operand and BETWEEN's AND are left alone.
+    from postgres_backend import _number_conditions
+
+    assert _number_conditions('SELECT 1 FROM a JOIN b ON 1 WHERE 0 OR NOT 0') == (
+        'SELECT 1 FROM a JOIN b ON TRUE WHERE FALSE OR NOT FALSE'
+    )
+    for unchanged in (
+        'SELECT 1 FROM t WHERE x = 1 AND y > 0',
+        'SELECT 1 FROM t WHERE x BETWEEN 1 AND 2 ORDER BY 1',
+        'SELECT CASE x WHEN 1 THEN 2 END FROM t',
+        "SELECT 'ON 1' FROM t",
+    ):
+        assert _number_conditions(unchanged) == unchanged
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        assert backend.execute('SELECT 1 FROM dual WHERE 0.5').rows == [(1,)]
+        assert backend.execute('SELECT 1 FROM dual WHERE 0').rows == []
+        (count,) = backend.execute(
+            'SELECT count(*) FROM dual a LEFT OUTER JOIN dual b ON 0'
+        ).rows[0]
+        assert count == 1
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
     # #1692: a `:c` in a comment was counted as a bind, so every value after it
     # shifted -- `:b` silently got the wrong one; an apostrophe in a comment
