@@ -2635,6 +2635,46 @@ def _number_like(value: object) -> bool:
     )
 
 
+# A number literal standing alone as a condition (#1760): after WHERE, ON,
+# HAVING, AND, OR or NOT, and before what ends the condition. A comparison's
+# operand is followed by its operator, so it does not match.
+_NUMBER_CONDITION = re.compile(
+    r'\b(WHERE|ON|HAVING|AND|OR|NOT)(\s+)'
+    r'([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)'
+    r'(?=\s*(?:\)|;|$|\b(?:AND|OR|ORDER|GROUP|HAVING|UNION|INTERSECT|MINUS|EXCEPT|'
+    r'FETCH|OFFSET|FOR|CONNECT|START|WHERE|JOIN|LEFT|RIGHT|INNER|FULL|CROSS|'
+    r'RETURNING)\b))',
+    re.IGNORECASE,
+)
+# The keyword a condition's AND belongs to, looking back from it: BETWEEN's
+# own AND joins its bounds, not two conditions (#1760).
+_CONDITION_KEYWORD = re.compile(
+    r'\b(BETWEEN|AND|OR|WHERE|ON|HAVING|WHEN|THEN|ELSE|SELECT)\b', re.IGNORECASE
+)
+
+
+def _number_conditions(sql: str) -> str:
+    """`sql` with each number literal standing alone as a condition made TRUE
+    or FALSE, as 23ai reads one -- zero FALSE, any other number TRUE (#1760),
+    measured: `WHERE 1`, `JOIN b ON 0`, `NOT 0`. PostgreSQL wants a boolean
+    there. BETWEEN's AND, a CASE's WHEN and a parenthesised number are left
+    alone."""
+    if not any(c.isdigit() for c in sql):
+        return sql
+    (masked, contents) = _mask_quoted(sql)
+
+    def truth(m: re.Match[str]) -> str:
+        if m.group(1).upper() == 'AND':
+            before = list(_CONDITION_KEYWORD.finditer(masked, 0, m.start()))
+            if before and before[-1].group(1).upper() == 'BETWEEN':
+                return m.group(0)
+        value = 'FALSE' if decimal.Decimal(m.group(3)) == 0 else 'TRUE'
+        return f'{m.group(1)}{m.group(2)}{value}'
+
+    rewritten = _NUMBER_CONDITION.sub(truth, masked)
+    return sql if rewritten == masked else _unmask_quoted(rewritten, contents)
+
+
 # A string literal as _mask_quoted leaves it (#1709).
 _MASKED_LITERAL = re.compile("'\x00\\d+\x00'")
 
@@ -10942,6 +10982,8 @@ class PostgresBackend:
         )
         sql = _ruled('vector-literals', self._vector_text_literals(sql), sql)
         sql = _ruled('boolean-literals', self._boolean_literals(sql), sql)
+        if self._release >= (23, 0):
+            sql = _ruled('number-conditions', _number_conditions(sql), sql)
         sql = _ruled('json-dot-notation', self._json_dot_notation(sql), sql)
         sql = _ruled('package-function-call', self._call_package_functions(sql), sql)
         bare = _BARE_CALL.match(sql)
