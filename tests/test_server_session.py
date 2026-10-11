@@ -17,6 +17,7 @@ from dataclasses import replace
 from typing import Any
 
 import pytest
+from test_server_handshake import _SPLIT_CONNECT, _SPLIT_CONNECT_DATA
 
 import seerdb
 from seerdb.common.exceptions import InterfaceError, Truncated
@@ -25,10 +26,12 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_12_2,
     FIELD_VERSION_21_1,
     FIELD_VERSION_23_4,
+    TNS_ACCEPT,
     TNS_DATA,
     TNS_TYPE_VARCHAR,
     TTI_FUN,
     TTI_MSG_TYPE_PIGGYBACK,
+    TTI_PRO,
     VERSION_11_2_0_2,
     VERSION_12_1_0_2,
     VERSION_12_2_0_1,
@@ -105,6 +108,58 @@ def _run_mirror(listen: socket.socket, result: dict) -> None:
         result['error'] = exc
     finally:
         conn.close()
+
+
+# The client's PRO that follows the ACCEPT in the same capture, in the large
+# (4-byte length) framing a 23ai presentation negotiates.
+_SPLIT_CONNECT_PRO = bytes.fromhex(
+    '0000001d060000000000010600707974686f6e2d6f7261636c65646200'
+)
+
+
+def test_login_reads_a_descriptor_sent_after_the_connect() -> None:
+    # A descriptor over 230 bytes arrives in a DATA packet after the CONNECT.
+    # The Mirror answered the bare CONNECT, then took that packet for the PRO
+    # and the login stalled (#1769). Now the PRO is answered as the PRO.
+    server, client = socket.socketpair()
+    client.sendall(_SPLIT_CONNECT + _SPLIT_CONNECT_DATA + _SPLIT_CONNECT_PRO)
+    result: dict = {}
+
+    def run() -> None:
+        try:
+            handle_login(
+                PacketStream(server), _DualBackend(), field_version=FIELD_VERSION_23_4
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced to the test thread
+            result['error'] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+
+    def recv_exact(n: int) -> bytes:
+        data = b''
+        while len(data) < n:
+            chunk = client.recv(n - len(data))
+            assert chunk, 'the Mirror hung up'
+            data += chunk
+        return data
+
+    try:
+        client.settimeout(5)
+        # The ACCEPT keeps the legacy 2-byte length; the reply after it does not.
+        head = recv_exact(2)
+        accept = head + recv_exact(int.from_bytes(head, 'big') - 2)
+        assert accept[4] == TNS_ACCEPT
+        head = recv_exact(4)
+        reply = head + recv_exact(int.from_bytes(head, 'big') - 4)
+        assert reply[4] == TNS_DATA
+        assert reply[10] == TTI_PRO
+    finally:
+        client.close()
+        thread.join(5)
+        server.close()
+    # The client hung up after the PRO answer, so the login ends there.
+    assert isinstance(result.get('error'), InterfaceError)
 
 
 def test_live_seerdb_login() -> None:

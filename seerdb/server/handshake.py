@@ -232,6 +232,20 @@ def _match(pattern: re.Pattern[bytes], descriptor: bytes) -> str | None:
     return found.group(1).decode('ascii', 'replace') if found else None
 
 
+def connect_data_follows(body: bytes) -> bool:
+    """Whether a CONNECT body states connect data that is not in it.
+
+    A client sends a descriptor over 230 bytes in a ``TNS_DATA`` packet of its
+    own straight after the CONNECT, which keeps the full length and offset but
+    ends where the data would start (python-oracledb, seerdb #1768). The caller
+    reads that packet and appends its body before :func:`parse_connect` (#1769).
+    """
+    if len(body) < _MIN_HEADER:
+        return False
+    start = _u16(body, _OFF_CDATA_OFFSET) - _TNS_HEADER_LEN
+    return len(body) - start < _u16(body, _OFF_CDATA_LEN)
+
+
 def parse_connect(body: bytes) -> ConnectRequest:
     """Parse a CONNECT packet body into a :class:`ConnectRequest`.
 
