@@ -54,7 +54,7 @@ from seerdb.common.crypto import (
     pad2,
     server_proof_padded,
 )
-from seerdb.common.exceptions import InterfaceError
+from seerdb.common.exceptions import InterfaceError, Truncated
 from seerdb.common.tns import (
     _CHALLENGE_TRAILER,
     _CHALLENGE_TRAILER_12C,
@@ -402,6 +402,43 @@ def _parse_fun_auth(
     # collapsing to a dict keeps only the LAST entry (#826).
     _LAST_AUTH_PAIRS.set(list(kvs))
     return subtype, user, dict(kvs)
+
+
+def check_auth_complete(
+    payload: bytes, field_version: int = FIELD_VERSION_11_2
+) -> None:
+    """Raise ``Truncated`` unless ``payload`` holds a whole thin auth message
+    (#1770).
+
+    A client splits a long AUTH at the SDU -- below about 562 bytes its
+    AUTH_CONNECT_STRING crosses into a second packet -- and the parse above reads
+    a pair's value by slicing, so a cut one comes back short rather than failing,
+    and the login went on with the rest of the message still in the socket, read
+    next as a call. This walks the same layout with the strict primitives, every
+    pair to its end, so a split message says so and is read on.
+    """
+    if len(payload) < 4:
+        raise Truncated('auth message header')
+    rest = payload[3:]  # TTI_FUN, subtype, seq
+    if field_version >= FIELD_VERSION_23_1_EXT_1 and rest[:1] != b'\x01':
+        _has_user, rest = decode_ub4(rest)
+    rest = rest[1:]
+    userlen, rest = decode_ub4(rest)
+    _mode, rest = decode_ub4(rest)
+    rest = rest[1:]
+    numpairs, rest = decode_ub4(rest)
+    rest = rest[2:]
+    if field_version >= FIELD_VERSION_12_1:
+        rest = rest[1:]
+    if len(rest) < userlen:
+        raise Truncated('auth message user name')
+    rest = rest[userlen:]
+    for _ in range(numpairs):
+        for _field in ('key', 'value'):
+            length, rest = decode_ub4(rest)
+            if length:
+                _, rest = decode_dalc(rest)
+        _flag, rest = decode_ub4(rest)
 
 
 def parse_osesskey(payload: bytes, field_version: int = FIELD_VERSION_11_2) -> bytes:

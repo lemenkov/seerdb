@@ -219,6 +219,7 @@ from seerdb.common.tns_consts import (
 )
 from seerdb.server import stats
 from seerdb.server.auth import (
+    check_auth_complete,
     derive_conn_key,
     encode_challenge_oci,
     encode_result_oci,
@@ -715,7 +716,15 @@ def handle_login(
             )
         else:
             stream.write_packet(TNS_DATA, encode_challenge(challenge))
-        auth_body = _expect(stream, TNS_DATA, 'AUTH')
+        # A long AUTH spans packets at a small SDU (#1770): read it whole.
+        whole = _complete_message(
+            stream,
+            _expect(stream, TNS_DATA, 'AUTH'),
+            lambda body: check_auth_complete(body, field_version),
+        )
+        if whole is None:
+            raise InterfaceError('the client never completed its AUTH')
+        auth_body = whole
         _, client_sesskey, auth_password = parse_auth_response(auth_body, field_version)
         # A client may change the password AS IT CONNECTS (`newpassword=`); the
         # new one rides in this same AUTH rather than in a separate call (#826).

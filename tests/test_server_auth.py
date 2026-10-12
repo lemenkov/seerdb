@@ -45,6 +45,7 @@ from seerdb.common.tns_consts import (
     VERSION_23_1_162_0,
 )
 from seerdb.server.auth import (
+    check_auth_complete,
     derive_conn_key,
     make_challenge,
     parse_auth_response,
@@ -846,3 +847,37 @@ def test_oci_result_trailer_follows_the_field_version() -> None:
     assert old.endswith(_RESULT_TRAILER) and len(_RESULT_TRAILER) == 136
     assert new.endswith(_RESULT_TRAILER_12C) and len(_RESULT_TRAILER_12C) == 144
     assert new[2:-144] == old[2:-136]  # past the packet length, only the trailer
+
+
+def _long_auth(field_version: int) -> bytes:
+    # A thin AUTH whose last pair is a long connect string, as python-oracledb
+    # sends one (#1770): header, user, then key/value pairs with their flags.
+    from seerdb.common.tns import encode_kv, encode_sb4
+
+    pairs = [
+        (b'AUTH_SESSKEY', b'AB' * 32),
+        (b'AUTH_PASSWORD', b'CD' * 32),
+        (b'AUTH_CONNECT_STRING', b'(DESCRIPTION=' + b'x' * 300 + b')'),
+    ]
+    user = b'pyo'
+    head = bytes([0x03, TTI_AUTH, 2, 1]) + encode_sb4(len(user)) + encode_sb4(0x101)
+    head += bytes([1]) + encode_sb4(len(pairs)) + bytes([1, 1])
+    if field_version >= FIELD_VERSION_12_1:
+        head += bytes([len(user)])
+    return head + user + b''.join(encode_kv(k, v, 0) for k, v in pairs)
+
+
+@pytest.mark.parametrize('field_version', [FIELD_VERSION_11_2, FIELD_VERSION_12_1])
+def test_a_split_auth_is_known_to_be_incomplete(field_version: int) -> None:
+    # Below an SDU of about 562 a client's AUTH crosses into a second packet, cut
+    # inside its connect string; the parse reads the cut value short instead of
+    # failing, so the Mirror logged in on half a message and read the rest as
+    # the next call (#1770). The completeness check walks every pair strictly.
+    from seerdb.common.exceptions import Truncated
+
+    whole = _long_auth(field_version)
+    check_auth_complete(whole, field_version)
+    assert parse_auth_response(whole, field_version)[0] == b'pyo'
+    for cut in (len(whole) - 1, len(whole) - 40, 200, 20, 5):
+        with pytest.raises(Truncated):
+            check_auth_complete(whole[:cut], field_version)
