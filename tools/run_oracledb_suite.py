@@ -158,7 +158,6 @@ POSTGRES_OPEN_TICKET_TESTS: dict[str, str] = {
     'data_types/test_3500_dbobject_async.py::test_data_types_3516': (
         'INTERVAL in a %ROWTYPE (#1781)'
     ),
-    'data_types/test_2700_vector.py::test_data_types_2730': 'non-finite VECTOR (#1782)',
 }
 
 # Tests that fail through a Mirror-over-PostgreSQL by what PostgreSQL itself is,

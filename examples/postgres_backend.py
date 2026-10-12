@@ -335,6 +335,7 @@ from seerdb.common.tns_consts import (
     ORA_VECTOR_BINARY_DIMENSIONS,
     ORA_VECTOR_DIMENSION_MISMATCH,
     ORA_VECTOR_INVALID_VALUE,
+    ORA_VECTOR_NORM_OUT_OF_RANGE,
     TNS_TYPE_ADT,
     TNS_TYPE_BDOUBLE,
     TNS_TYPE_BFILE,
@@ -2731,18 +2732,36 @@ def _sparse_from_text(text: str, code: int | None) -> SparseVector | None:
     )
 
 
-def _reject_nonfinite_sparse(binds: Sequence) -> None:
-    # A sparse vector holding inf or NaN is refused, as 23ai refuses one: it has
-    # no VECTOR text form (#1709).
+def _reject_nonfinite_vectors(binds: Sequence) -> None:
+    # A vector bind holding inf or NaN is refused, as 23ai refuses one -- a
+    # PostgreSQL float takes either, so nothing else would. Measured on 23ai: a
+    # sparse vector is ORA-51805 for both (#1709); a dense FLOAT32 / FLOAT64 one
+    # ORA-51805 for NaN and ORA-51807 for an infinity (#1782), in a SELECT's
+    # bind and an INSERT's alike. 23ai's text names no position.
     for value in binds:
-        if isinstance(value, SparseVector) and not all(
-            math.isfinite(v) for v in value.values
-        ):
-            raise BackendError(
-                'Invalid syntax for VECTOR value. The specified dimension value '
-                'could not be converted to a number.',
-                ora_code=ORA_VECTOR_INVALID_VALUE,
-            )
+        if isinstance(value, SparseVector):
+            if not all(math.isfinite(v) for v in value.values):
+                raise BackendError(
+                    _VECTOR_NOT_A_NUMBER, ora_code=ORA_VECTOR_INVALID_VALUE
+                )
+        elif isinstance(value, array.array) and value.typecode in 'fd':
+            for v in value:
+                if math.isnan(v):
+                    raise BackendError(
+                        _VECTOR_NOT_A_NUMBER, ora_code=ORA_VECTOR_INVALID_VALUE
+                    )
+                if math.isinf(v):
+                    raise BackendError(
+                        'Vector Norm or Vector Distance value is outside the '
+                        'allowed precision range of DOUBLE data type.',
+                        ora_code=ORA_VECTOR_NORM_OUT_OF_RANGE,
+                    )
+
+
+_VECTOR_NOT_A_NUMBER = (
+    'Invalid syntax for VECTOR value. The specified dimension value at position  '
+    'could not be converted to a number.'
+)
 
 
 class _SparseVectorDumper(psycopg.adapt.Dumper):
@@ -11770,11 +11789,11 @@ class PostgresBackend:
         at a VECTOR column -- '[1, 2, 3]', as a client may write one -- as the
         vector it spells, in the column's format, FLOAT32 where the column's
         is flexible (#1708), sparse where the column is (#1709). A string goes
-        to PostgreSQL untyped, so no cast reaches it there. A sparse vector
-        holding inf or NaN is refused here, as 23ai refuses one."""
+        to PostgreSQL untyped, so no cast reaches it there. A vector holding
+        inf or NaN is refused here, as 23ai refuses one."""
         if not binds:
             return binds
-        _reject_nonfinite_sparse(binds)
+        _reject_nonfinite_vectors(binds)
         if not self._has_pgvector or not self._has_column_catalog:
             return binds
         if not any(isinstance(b, str) for b in binds):

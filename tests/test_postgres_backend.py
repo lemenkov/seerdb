@@ -10,6 +10,7 @@ skips — the same pattern as the live-Oracle integration tests.
 
 from __future__ import annotations
 
+import array
 import datetime
 import os
 import re
@@ -24,6 +25,7 @@ from typing import Any
 import pytest
 
 import seerdb
+from seerdb.common.vector import SparseVector
 from seerdb.server import PacketStream, serve_session
 
 psycopg = pytest.importorskip('psycopg')
@@ -50,6 +52,7 @@ from postgres_backend import (  # noqa: E402
     _occurrence_binds,
     _parse_out_assignments,
     _pg_oid_of,
+    _reject_nonfinite_vectors,
     _reject_unsupported_ddl_types,
     _several_statements,
     _strip_leading_comments,
@@ -1545,6 +1548,32 @@ def test_translate_ddl_leaves_non_create_table_unchanged() -> None:
         'UPDATE t SET v = :1 WHERE id = :2',
     ):
         assert _translate_ddl(sql) == sql
+
+
+@pytest.mark.parametrize(
+    ('value', 'code'),
+    [
+        # Measured on 23ai (#1782): a dense vector's infinity is ORA-51807, its
+        # NaN ORA-51805; a sparse vector's either is ORA-51805 (#1709).
+        (array.array('d', [1.0, float('inf')]), 51807),
+        (array.array('f', [float('-inf'), 1.0]), 51807),
+        (array.array('d', [float('nan'), 1.0]), 51805),
+        (SparseVector(4, [1], array.array('d', [float('inf')])), 51805),
+        (SparseVector(4, [1], array.array('f', [float('nan')])), 51805),
+    ],
+)
+def test_a_nonfinite_vector_is_refused(value, code: int) -> None:
+    from seerdb.server.backend import BackendError
+
+    with pytest.raises(BackendError) as raised:
+        _reject_nonfinite_vectors([1, value])
+    assert raised.value.ora_code == code
+
+
+def test_finite_vectors_and_other_binds_pass() -> None:
+    _reject_nonfinite_vectors(
+        [array.array('d', [1.0, -2.5]), array.array('b', [1, -1]), 'x', 3.5, None]
+    )
 
 
 @pytest.mark.parametrize(
