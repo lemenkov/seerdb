@@ -187,6 +187,8 @@ from seerdb.common.tns_consts import (
     RCAP_TTC_32K,
     RCAP_TTC_ZERO_COPY,
     TNS_AL8I4_ARRAY_DML_ROWCOUNTS,
+    TNS_APP_CONTEXT_FLAG_CLEAR,
+    TNS_APP_CONTEXT_FLAG_SET,
     TNS_AQ_ARRAY_ENQ,
     TNS_AQ_ARRAY_FLAGS_RETURN_MESSAGE_ID,
     TNS_AQ_EXT_KEYWORD_AGENT_ADDRESS,
@@ -220,6 +222,7 @@ from seerdb.common.tns_consts import (
     TNS_EXEC_OPTION_EXECUTE,
     TNS_EXEC_OPTION_FETCH,
     TNS_EXEC_OPTION_PARSE,
+    TNS_FUNC_APP_CONTEXT,
     TNS_FUNC_AQ_DEQ,
     TNS_FUNC_AQ_ENQ,
     TNS_FUNC_ARRAY_AQ,
@@ -6475,6 +6478,30 @@ def encode_end_user_sec_piggyback(
     Out += _obj_two_lengths(END_USER_SEC_CTX_KEYWORD)  # keyword
     Out += _obj_two_lengths(b'')  # text (NULL)
     Out += _obj_two_lengths(OsonBytes)  # value = OSON image
+    return Out
+
+
+def encode_app_context_piggyback(
+    Seq: int, FieldVersion: int, Namespace: bytes, Entries: list[tuple[bytes, bytes]]
+) -> bytes:
+    """Build the application-context piggyback (func 154, #1775) for one
+    namespace: set its ``Entries`` (key, value) pairs, or clear it when there
+    are none. It rides in front of the next call's message once. Layout in
+    docs/PROTOCOL.md; the zero byte before the namespace exists from field
+    version 12.1, and a server reading at 11.2 or below (10g and 11g, or 23ai
+    held there) rejects a piggyback that has it (ORA-03120)."""
+    Out = bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_APP_CONTEXT, Seq])
+    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
+        Out += encode_sb4(0)  # ub8 token (0)
+    Out += bytes([1]) + encode_sb4(len(Namespace))  # pointer, namespace length
+    Out += bytes([1 if Entries else 0]) + encode_sb4(len(Entries))  # pointer, count
+    Flags = TNS_APP_CONTEXT_FLAG_SET if Entries else TNS_APP_CONTEXT_FLAG_CLEAR
+    Out += encode_sb4(Flags)  # ub2 flags
+    if FieldVersion >= FIELD_VERSION_12_1:
+        Out += bytes([0])
+    Out += _bytes_with_length(Namespace)
+    for Key, Value in Entries:
+        Out += _obj_two_lengths(Key) + _obj_two_lengths(Value) + encode_sb4(0)
     return Out
 
 

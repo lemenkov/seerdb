@@ -287,6 +287,9 @@ class AsyncOracleConnect(_ConnectionLogic):
         # End-user security context (#460): OSON image once set, re-sent as a
         # func-205 piggyback on every call; server caps kept to gate the feature.
         self._end_user_sec_context: bytes | None = None
+        # Application context changes waiting for the next call (#1775), by
+        # namespace; an empty dict clears its namespace.
+        self._app_context: dict[str, dict[str, str]] = {}
         self._server_compile_caps: bytes = b''
         self._server_runtime_caps: bytes = b''
         # Request boundaries (#464): pooled session-state marker + in-request flag.
@@ -1129,6 +1132,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             self._flush_cursor_closes_bytes()  # close drained cursors (#191)
             + self._flush_end_to_end_bytes()  # tracing piggyback (#183)
             + self._flush_end_user_sec_bytes()  # end-user security ctx (#460)
+            + self._flush_app_context_bytes()  # application context (#1775)
             + self._flush_session_state_bytes()  # request boundary (#464)
         )
         Data = encode_dictionary(self._make_dict(DictionaryType.exec, query=QueryDict))
@@ -1408,6 +1412,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             self._flush_cursor_closes_bytes()
             + self._flush_end_to_end_bytes()
             + self._flush_end_user_sec_bytes()
+            + self._flush_app_context_bytes()
             + self._flush_session_state_bytes()
         )
         Data = encode_dictionary(self._make_dict(DictionaryType.exec, query=QueryDict))
@@ -2132,8 +2137,9 @@ class AsyncOracleConnect(_ConnectionLogic):
             return
         from seerdb.common.tns_consts import TTI_COMMIT
 
+        Pre = self._flush_app_context_bytes()  # application context (#1775)
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_COMMIT))
-        await self.send(TNS_DATA, Data)
+        await self.send(TNS_DATA, Pre + Data)
         await self._handle_response()
         # An ordinary commit ends an active sessionless transaction (#133).
         self._sessionless_txn_active = False
@@ -2145,8 +2151,9 @@ class AsyncOracleConnect(_ConnectionLogic):
             return
         from seerdb.common.tns_consts import TTI_ROLLBACK
 
+        Pre = self._flush_app_context_bytes()  # application context (#1775)
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_ROLLBACK))
-        await self.send(TNS_DATA, Data)
+        await self.send(TNS_DATA, Pre + Data)
         await self._handle_response()
         self._sessionless_txn_active = False
 
@@ -2157,8 +2164,9 @@ class AsyncOracleConnect(_ConnectionLogic):
             return
         from seerdb.common.tns_consts import TTI_PING
 
+        Pre = self._flush_app_context_bytes()  # application context (#1775)
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_PING))
-        await self.send(TNS_DATA, Data)
+        await self.send(TNS_DATA, Pre + Data)
         self._raise_reply_error(await self._handle_response())
 
     async def changepassword(self, old_password: str, new_password: str) -> None:

@@ -2363,6 +2363,40 @@ class CursorIntegration(_IntegrationBase):
             self.cur.fetchone(), (self.conn.session_id, self.conn.serial_num)
         )
 
+    def test_app_context_rides_the_next_call(self):
+        # set_app_context() / clear_app_context() reach the server with the next
+        # call, a ping included, and a namespace the session may not set fails
+        # that call (#1775). 8i and 9i ignore the piggyback, so it is refused.
+        from seerdb.common.exceptions import DatabaseError, NotSupportedError
+        from seerdb.common.tns_consts import FIELD_VERSION_10_2
+
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            with self.assertRaises(NotSupportedError):
+                self.conn.set_app_context('CLIENTCONTEXT', ATTR1='VALUE1')
+            return
+        self._skip_if_mirror('the application-context piggyback (#1778)')
+        query = (
+            "SELECT sys_context('CLIENTCONTEXT', 'ATTR1'), "
+            "sys_context('CLIENTCONTEXT', 'ATTR2') FROM dual"
+        )
+        self.conn.set_app_context('CLIENTCONTEXT', ATTR1='VALUE1')
+        self.conn.set_app_context('CLIENTCONTEXT', ATTR2='VALUE2')
+        self.cur.execute(query)
+        self.assertEqual(self.cur.fetchone(), ('VALUE1', 'VALUE2'))
+        self.conn.clear_app_context('CLIENTCONTEXT')
+        self.cur.execute(query)
+        self.assertEqual(self.cur.fetchone(), (None, None))
+        self.conn.set_app_context('CLIENTCONTEXT', ATTR1='PING')
+        self.conn.ping()
+        self.cur.execute(query)
+        self.assertEqual(self.cur.fetchone(), ('PING', None))
+        self.conn.set_app_context('NOT_A_VALID_NAMESPACE', attr='value')
+        with self.assertRaises(DatabaseError) as raised:
+            self.conn.ping()
+        self.assertEqual(raised.exception.code, 28267)
+        self.cur.execute('SELECT 1 FROM dual')
+        self.assertEqual(self.cur.fetchone(), (1,))
+
     def test_db_unique_name_is_the_one_sql_reports(self):
         # Read from the login reply alone, as python-oracledb 26 reads it, and
         # equal to what SQL reports (#1774). Before 10g USERENV has no
@@ -9179,6 +9213,44 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 self.assertEqual(
                     await Cur.fetchone(), (Conn.session_id, Conn.serial_num)
                 )
+
+    async def test_app_context_rides_the_next_call(self):
+        # Async twin of CursorIntegration's.
+        from seerdb.common.exceptions import DatabaseError, NotSupportedError
+        from seerdb.common.tns_consts import FIELD_VERSION_10_2
+
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            if Conn.field_version < FIELD_VERSION_10_2:
+                with self.assertRaises(NotSupportedError):
+                    Conn.set_app_context('CLIENTCONTEXT', ATTR1='VALUE1')
+                return
+            if os.environ.get('SEERDB_TEST_MIRROR'):
+                self.skipTest(
+                    'the Mirror does not implement the application-context '
+                    'piggyback yet (#1778)'
+                )
+            query = (
+                "SELECT sys_context('CLIENTCONTEXT', 'ATTR1'), "
+                "sys_context('CLIENTCONTEXT', 'ATTR2') FROM dual"
+            )
+            async with Conn.cursor() as Cur:
+                Conn.set_app_context('CLIENTCONTEXT', ATTR1='VALUE1')
+                Conn.set_app_context('CLIENTCONTEXT', ATTR2='VALUE2')
+                await Cur.execute(query)
+                self.assertEqual(await Cur.fetchone(), ('VALUE1', 'VALUE2'))
+                Conn.clear_app_context('CLIENTCONTEXT')
+                await Cur.execute(query)
+                self.assertEqual(await Cur.fetchone(), (None, None))
+                Conn.set_app_context('CLIENTCONTEXT', ATTR1='PING')
+                await Conn.ping()
+                await Cur.execute(query)
+                self.assertEqual(await Cur.fetchone(), ('PING', None))
+                Conn.set_app_context('NOT_A_VALID_NAMESPACE', attr='value')
+                with self.assertRaises(DatabaseError) as raised:
+                    await Conn.ping()
+                self.assertEqual(raised.exception.code, 28267)
+                await Cur.execute('SELECT 1 FROM dual')
+                self.assertEqual(await Cur.fetchone(), (1,))
 
     async def test_db_unique_name_is_the_one_sql_reports(self):
         # Async twin of CursorIntegration's.

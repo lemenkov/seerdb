@@ -28,6 +28,7 @@ from seerdb.common.end_user_sec import EndUserSecurityContext
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
 from seerdb.common.tns import (
     encode_ano_fragment,
+    encode_app_context_piggyback,
     encode_close_cursors_piggyback,
     encode_dictionary,
     encode_end_to_end_piggyback,
@@ -36,6 +37,8 @@ from seerdb.common.tns import (
     max_string_size,
 )
 from seerdb.common.tns_consts import (
+    APP_CONTEXT_KEY_MAX_LEN,
+    APP_CONTEXT_VALUE_MAX_LEN,
     CCAP_FEATURE_BACKPORT2,
     CCAP_FEATURE_BACKPORT2_END_USER_SEC,
     CCAP_FIELD_VERSION,
@@ -96,6 +99,7 @@ class _ConnectionLogic:
     _server_compile_caps: bytes
     _server_runtime_caps: bytes
     _end_user_sec_context: bytes | None
+    _app_context: dict[str, dict[str, str]]
     _session_state_desired: int
     _in_request: bool
     _supports_eor: bool
@@ -323,6 +327,62 @@ class _ConnectionLogic:
         """Clear any end-user security context previously set on the connection
         (#460), reverting to operations without an attached context."""
         self._end_user_sec_context = None
+
+    def _flush_app_context_bytes(self) -> bytes:
+        # One func-154 piggyback per namespace changed since the last call
+        # (#1775), each sent once. Empty when nothing changed.
+        Out = b''
+        for Namespace, Entries in self._app_context.items():
+            Out += encode_app_context_piggyback(
+                self._next_seq(),
+                self.field_version,
+                Namespace.encode('utf-8'),
+                [(K.encode('utf-8'), V.encode('utf-8')) for K, V in Entries.items()],
+            )
+        self._app_context = {}
+        return Out
+
+    def _check_app_context(self, namespace: str) -> None:
+        if not isinstance(namespace, str) or not namespace:
+            raise ValueError('application context namespace must be a non-empty string')
+        # 8i and 9i accept the piggyback and ignore it, so a context set there
+        # would silently never take effect (#1775).
+        if self.field_version < FIELD_VERSION_10_2:
+            raise NotSupportedError('application context requires Oracle 10g or later')
+
+    def set_app_context(self, namespace: str, **values: str) -> None:
+        """Set attributes of an application context namespace (#1775), as
+        ``DBMS_SESSION.SET_CONTEXT`` would, without a round trip of its own: the
+        change is sent with the next call. Repeated calls before that call
+        accumulate. ``CLIENTCONTEXT`` is the namespace any session may set;
+        another needs a context created for it, and the next call fails with
+        ORA-28267 when the session may not set it."""
+        self._check_app_context(namespace)
+        if not values:
+            raise ValueError(
+                'application context must contain at least one key/value pair'
+            )
+        for Key, Value in values.items():
+            if not isinstance(Value, str):
+                raise TypeError('application context values must be strings')
+            for What, Text, Limit in (
+                ('key', Key, APP_CONTEXT_KEY_MAX_LEN),
+                ('value', Value, APP_CONTEXT_VALUE_MAX_LEN),
+            ):
+                Length = len(Text.encode('utf-8'))
+                if Length > Limit:
+                    raise ValueError(
+                        f'application context {What} length ({Length} bytes) '
+                        f'exceeds the maximum allowed ({Limit} bytes)'
+                    )
+        self._app_context.setdefault(namespace, {}).update(values)
+
+    def clear_app_context(self, namespace: str) -> None:
+        """Clear every attribute of an application context namespace (#1775), as
+        ``DBMS_SESSION.CLEAR_CONTEXT`` would; sent with the next call, and
+        replacing any attributes set for it since the last one."""
+        self._check_app_context(namespace)
+        self._app_context[namespace] = {}
 
     def _supports_request_boundaries(self) -> bool:
         # Explicit request boundaries need a compile-cap bit AND a runtime-cap

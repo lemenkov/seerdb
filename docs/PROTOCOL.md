@@ -8039,3 +8039,45 @@ Against a server that cannot describe the type (ORA-03115), sqlplus falls back t
 binding `:LINES` as a plain PL/SQL VARCHAR array (`01 01 43 …`, element size
 32765) and re-executes the block by cursor id while its line count stays above
 zero (#1411, #1515).
+
+## 41. Application context — function 154 (#1775)
+
+`set_app_context(namespace, **values)` / `clear_app_context(namespace)` do what
+`DBMS_SESSION.SET_CONTEXT` / `CLEAR_CONTEXT` do without a round trip of their
+own: the change rides the next call as a piggyback (`0x11`, function `0x9A`),
+once, one piggyback per namespace. A client advertises it with bit `0x80` of its
+`OCI1` compile capability; the server advertises nothing.
+
+```
+11 9a <seq> [ub8 token 0, field version 23.1 ext 1 and up]
+01 <ub4 namespace length>              pointer, length
+01|00 <ub4 entry count>                pointer: 1 set, 0 clear
+<ub2 flags>                            0x01 set, 0x02 clear
+00                                     field version 12.1 and up only
+<namespace with its length>
+per entry: <key, two lengths> <value, two lengths> <ub4 0>
+```
+
+Captured from python-oracledb 26 on 23ai, `set_app_context('CLIENTCONTEXT',
+ATTR1='VALUE1', ATTR2='V2')`:
+
+```
+11 9a 03 00 01 01 0d 01 01 02 01 01 00 0d 43 4c 49 45 4e 54 43 4f 4e 54 45 58 54
+01 05 05 41 54 54 52 31 01 06 06 56 41 4c 55 45 31 00
+01 05 05 41 54 54 52 32 01 02 02 56 32 00
+```
+
+**The zero byte follows the negotiated field version, not the server.** At 12.1
+and up it is there; at 11.2 and below it is not, and a piggyback that has it
+fails the call with ORA-03120 (a set) or ORA-28267 (a clear, whose namespace is
+then read one byte early). Measured: 10g (field version 4) and 11g (6) take the
+old form; 23ai takes the old form when held at 11.2, and the new one at 12.1,
+12.2, 18.1 and its own. 18c and 21c take the new form.
+
+**8i and 9i take the piggyback and ignore it**: no error, and the context is not
+set. seerdb refuses `set_app_context()` / `clear_app_context()` there
+(`NotSupportedError`) rather than let a change silently not happen.
+
+A namespace the session may not set fails the call the piggyback rode in front
+of with ORA-28267, through a break/reset; the session carries on. `CLIENTCONTEXT`
+is the namespace any session may set.
