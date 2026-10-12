@@ -13,6 +13,9 @@ TNS_NULL = 7
 TNS_ABORT = 9
 TNS_RESEND = 11
 TNS_MARKER = 12
+# A server reads at most this many bytes of connect data from the CONNECT packet
+# itself; a longer descriptor follows in a DATA packet of its own (#1768).
+TNS_MAX_CONNECT_DATA = 230
 # Marker packet sub-types (#144). A break/cancel is an in-band INTERRUPT marker
 # packet (type 12, body [1, 0, marker_type]) -- the universally-honoured way to
 # interrupt a running call; the OOB urgent byte is an optimisation many servers

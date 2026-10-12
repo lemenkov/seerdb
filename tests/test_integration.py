@@ -2401,6 +2401,15 @@ class CursorIntegration(_IntegrationBase):
             )
             self.assertEqual(cur.fetchall(), [(driver,)])
 
+    def test_a_descriptor_over_230_bytes_connects(self):
+        # A server reads at most 230 bytes of connect data from the CONNECT; a
+        # longer descriptor hung the connect on every bed until it went out in
+        # a DATA packet of its own (#1768). The program name takes this one past.
+        with _connect_with(app_name='p' * 200) as conn:
+            cur = conn.cursor()
+            cur.execute('SELECT 1 FROM dual')
+            self.assertEqual(cur.fetchone(), (1,))
+
     def test_kill_session_ends_the_named_session(self):
         # ALTER SYSTEM KILL SESSION 'sid,serial' ends that session: its next call
         # fails with ORA-00028 and the connection is gone (#1212, #1367) -- even a
@@ -9191,6 +9200,15 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     else None
                 )
                 self.assertEqual(await Cur.fetchall(), [(driver,)])
+
+    async def test_a_descriptor_over_230_bytes_connects(self):
+        # Async twin of CursorIntegration's.
+        async with await seerdb.connect_async(
+            **self._kwargs(app_name='p' * 200)
+        ) as Conn:
+            async with Conn.cursor() as Cur:
+                await Cur.execute('SELECT 1 FROM dual')
+                self.assertEqual(await Cur.fetchone(), (1,))
 
     async def test_kill_session_ends_the_named_session(self):
         # Async twin of CursorIntegration's.

@@ -2028,6 +2028,7 @@ from seerdb.common.tns_consts import (
     TNS_LOB_OP_IS_OPEN,
     TNS_LOB_OP_OPEN,
     TNS_LOB_OP_TRIM,
+    TNS_MAX_CONNECT_DATA,
 )
 
 # The 11g tail between the fixed header and the SQL: a [0, 0, 1] marker and a
@@ -12531,6 +12532,11 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
     return Out
 
 
+# Where the connect data starts in a CONNECT packet: the legacy 58 plus the
+# 16 trailing bytes of the 319-era layout (large SDU/TDU + connect flags).
+_CONNECT_DATA_OFFSET = 74
+
+
 def encode_dictionary_login(Dictionary: dict) -> bytes:
     # The CONNECT packet, in the protocol-version-319 ("large SDU" / end-of-
     # response era) layout (#155). seerdb previously sent version 313 to stay
@@ -12556,7 +12562,7 @@ def encode_dictionary_login(Dictionary: dict) -> bytes:
     Endiannes = struct.pack('>h', 1)  # 1 in hardware byte order
     Data = encode_dictionary_description(Dictionary)
     DataLength = struct.pack('>H', len(Data))  # Connect Data length
-    CDO = struct.pack('>H', 74)  # Connect Data offset (legacy 58 + 16 trailing)
+    CDO = struct.pack('>H', _CONNECT_DATA_OFFSET)
     MaxConnDataRecv = bytes(4)  # Max connect data that can be received
     ANO = bytes([1, 1])  # advertise ANO (native encryption) capable (#437)
     Padding = bytes(24)
@@ -12585,6 +12591,19 @@ def encode_dictionary_login(Dictionary: dict) -> bytes:
         + Trailer
         + Data
     )
+
+
+def split_connect(Data: bytes) -> tuple[bytes, bytes | None]:
+    # A CONNECT body, split for the wire. A server reads at most
+    # TNS_MAX_CONNECT_DATA bytes of connect data from the CONNECT packet; given
+    # more, it waits for a DATA packet that never comes and the connect hangs
+    # (10g to 23ai alike). A longer descriptor goes in a DATA packet straight
+    # after the CONNECT, which keeps its stated length and offset but carries no
+    # data. Returns the CONNECT body and that descriptor, or None (#1768).
+    Offset = _CONNECT_DATA_OFFSET - 8
+    if len(Data) - Offset <= TNS_MAX_CONNECT_DATA:
+        return Data, None
+    return Data[:Offset], Data[Offset:]
 
 
 def encode_dictionary_pig(Dictionary: dict) -> bytes:
