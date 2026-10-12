@@ -4553,9 +4553,14 @@ def encode_result(
     # server omits what does not apply (a database with no domain sends no
     # AUTH_SC_DB_DOMAIN). A client reads these ONLY from here, so leaving them out
     # is what left `connection.instance_name` and friends None (#826).
+    # 21c and later send the unique name twice, the second as
+    # AUTH_SC_REAL_DBUNIQUE_NAME -- the one python-oracledb 26's
+    # `db_unique_name` reads, None without it (#1777).
+    real_db_name = db_name if version_no >> 24 >= 21 else None
     for key, value in (
         (b'AUTH_INSTANCENAME', instance_name),
         (b'AUTH_SC_DBUNIQUE_NAME', db_name),
+        (b'AUTH_SC_REAL_DBUNIQUE_NAME', real_db_name),
         (b'AUTH_SC_DB_DOMAIN', db_domain),
         (b'AUTH_SC_SERVICE_NAME', service_name),
     ):

@@ -144,8 +144,6 @@ PRE_23AI_TESTS: dict[str, str] = {
 OPEN_TICKET_TESTS: dict[str, str] = {}
 for _file, _tests, _reason in (
     # python-oracledb 26 connection APIs the Mirror does not serve yet.
-    ('connection/test_1000_basic.py', ('1062',), 'db_unique_name (#1777)'),
-    ('connection/test_1100_basic_async.py', ('1159',), 'db_unique_name (#1777)'),
     (
         'connection/test_1000_basic.py',
         ('1063', '1064'),
