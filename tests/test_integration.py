@@ -2384,7 +2384,6 @@ class CursorIntegration(_IntegrationBase):
             with self.assertRaises(NotSupportedError):
                 seerdb.connect(**kwargs, transaction_priority='low')
             return
-        self._skip_if_mirror('transaction priority (#1779)')
         P = seerdb.TransactionPriority
         default = self.conn.transaction_priority
         self.assertIsInstance(default, P)
@@ -9296,10 +9295,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                         **self._kwargs(), transaction_priority='low'
                     )
                 return
-            if os.environ.get('SEERDB_TEST_MIRROR'):
-                self.skipTest(
-                    'the Mirror does not implement transaction priority yet (#1779)'
-                )
             default = Conn.transaction_priority
             self.assertIsInstance(default, P)
             Conn.transaction_priority = 'low'

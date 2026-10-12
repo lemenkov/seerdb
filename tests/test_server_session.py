@@ -759,6 +759,110 @@ def test_skip_piggybacks_reports_a_refused_app_context() -> None:
         _DECODE_FIELD_VERSION.reset(token)
 
 
+class _PriorityBackend(_DualBackend):
+    # Transaction priority as session state; refuses 'urgent' (#1779).
+    def __init__(self) -> None:
+        super().__init__()
+        self.priority = 'HIGH'
+
+    def txn_priority(self):
+        return self.priority
+
+    def set_txn_priority(self, value):
+        from seerdb.server.backend import BackendError
+
+        if value == 'urgent':
+            raise BackendError('invalid value', ora_code=96)
+        self.priority = value or 'HIGH'
+
+
+def test_skip_piggybacks_sets_the_transaction_priority() -> None:
+    # `connection.transaction_priority = x` rides the next call as func 204
+    # (#1779): the value reaches the backend, an empty one restores the default,
+    # a refused one fails the call, and each accepted one is reported.
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, encode_alter_session_piggyback
+    from seerdb.server.session import _skip_piggybacks, _TxnPriorityReporter
+
+    body = _exec_body()
+    backend = _PriorityBackend()
+    reporter = _TxnPriorityReporter(backend.txn_priority, 'HIGH')
+    token = _DECODE_FIELD_VERSION.set(24)
+    try:
+        refused: list = []
+        low = encode_alter_session_piggyback(4, 24, 'low')
+        assert _skip_piggybacks(low + body, backend, None, refused, reporter) == body
+        assert backend.priority == 'low' and refused == []
+        assert reporter().endswith(
+            bytes.fromhex('0103036c6f7700 01cc 00'.replace(' ', ''))
+        )
+        reset = encode_alter_session_piggyback(5, 24, '')
+        assert _skip_piggybacks(reset + body, backend, None, refused, reporter) == body
+        assert backend.priority == 'HIGH'
+        bad = encode_alter_session_piggyback(6, 24, 'urgent')
+        assert _skip_piggybacks(bad + body, backend, None, refused, reporter) == body
+        assert [err.ora_code for err in refused] == [96]
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+
+
+def test_the_priority_reporter_reports_changes_and_every_client_set() -> None:
+    # A change the call made (an ALTER SESSION in SQL) is reported once; a client
+    # set is reported even when the value stays the same -- the client holds ''
+    # for a reset until the server's report replaces it (#1779).
+    from seerdb.common.tns import encode_sync_piggyback
+    from seerdb.common.tns_consts import TNS_KEYWORD_NUM_TXN_PRIORITY
+    from seerdb.server.session import _TxnPriorityReporter
+
+    backend = _PriorityBackend()
+    reporter = _TxnPriorityReporter(backend.txn_priority, 'HIGH')
+    assert reporter() == b''
+    backend.priority = 'MEDIUM'
+    assert reporter() == encode_sync_piggyback(
+        [(TNS_KEYWORD_NUM_TXN_PRIORITY, 'MEDIUM')]
+    )
+    assert reporter() == b''
+    reporter.changed()
+    assert reporter() == encode_sync_piggyback(
+        [(TNS_KEYWORD_NUM_TXN_PRIORITY, 'MEDIUM')]
+    )
+
+
+def test_the_23ai_caps_advertise_transaction_priority() -> None:
+    # Bit 0x01 of FEATURE_BACKPORT2 (byte 45) when presenting 23ai with a backend
+    # that has the hooks; the 11.2 vector grows to reach it, zero between (#1779).
+    from seerdb.common.tns import _SERVER_RUNTIME_CAPS
+    from seerdb.common.tns_consts import FIELD_VERSION_12_1, FIELD_VERSION_23_4
+    from seerdb.server.handshake import build_caps_block_reply
+
+    plain = build_caps_block_reply(FIELD_VERSION_23_4)
+    with_bit = build_caps_block_reply(FIELD_VERSION_23_4, txn_priority=True)
+    assert len(with_bit) == len(plain) + 7
+    end = len(with_bit) - len(_SERVER_RUNTIME_CAPS) - 1  # before the runtime caps
+    caps = with_bit[end - 46 : end]
+    assert with_bit[end - 47] == 46  # the compile caps' length byte
+    assert caps[45] == 0x01 and caps[39:45] == bytes(6)
+    assert build_caps_block_reply(FIELD_VERSION_12_1, txn_priority=True) == (
+        build_caps_block_reply(FIELD_VERSION_12_1)
+    )
+
+
+def test_the_login_reply_reports_the_priority() -> None:
+    # 23ai reports the session's priority after the reply's pairs, as keyword 204
+    # of a SYNC piggyback; seerdb's client reads it from there (#1779).
+    from seerdb.common.tns import (
+        decode_token_rpa,
+        encode_result,
+        recording_session_keywords,
+    )
+    from seerdb.common.tns_consts import TNS_KEYWORD_NUM_TXN_PRIORITY
+
+    payload = encode_result(bytes(24), txn_priority='HIGH')
+    sink: dict = {}
+    with recording_session_keywords(sink):
+        decode_token_rpa(payload[1:], ())
+    assert sink == {TNS_KEYWORD_NUM_TXN_PRIORITY: 'HIGH'}
+
+
 # The close-temp-LOBs piggyback a thin client sent a live 23ai in front of its
 # second large-LOB insert (fv24: the ub8 token follows the sequence byte): a
 # FREE_TEMP | ARRAY over one 40-byte (ub2-prefixed) locator, then `03 04 ...`, the

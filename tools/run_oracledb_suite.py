@@ -142,13 +142,6 @@ PRE_23AI_TESTS: dict[str, str] = {
 # the entry in the PR that closes it. OPEN_TICKET_TESTS fail through either
 # Mirror, POSTGRES_OPEN_TICKET_TESTS through a Mirror-over-PostgreSQL only.
 OPEN_TICKET_TESTS: dict[str, str] = {}
-for _file, _tests, _reason in (
-    # python-oracledb 26 connection APIs the Mirror does not serve yet.
-    ('connection/test_1000_basic.py', ('1065',), 'transaction priority (#1779)'),
-    ('connection/test_1100_basic_async.py', ('1162',), 'transaction priority (#1779)'),
-):
-    for _n in _tests:
-        OPEN_TICKET_TESTS[f'{_file}::test_connection_{_n}'] = _reason
 
 POSTGRES_OPEN_TICKET_TESTS: dict[str, str] = {
     'connection/test_1200_pipelining_async.py::test_connection_1229': (

@@ -120,6 +120,7 @@ from seerdb.common.tns import (
     encode_status,
     encode_status_oci,
     encode_status_with_rowcounts,
+    encode_sync_piggyback,
     encode_token_result,
     encode_version_banner_oci,
     inline_long_after_type_change,
@@ -156,6 +157,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_10_2,
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
+    FIELD_VERSION_23_1,
     FIELD_VERSION_23_1_EXT_1,
     ORA_INSUFFICIENT_PRIVILEGES,
     ORA_INTERNAL_ERROR,
@@ -170,6 +172,7 @@ from seerdb.common.tns_consts import (
     TNS_CONNECT,
     TNS_DATA,
     TNS_DATA_FLAGS_END_OF_REQUEST,
+    TNS_FUNC_ALTER_SESSION,
     TNS_FUNC_APP_CONTEXT,
     TNS_FUNC_PIPELINE_BEGIN,
     TNS_FUNC_PIPELINE_END,
@@ -179,6 +182,7 @@ from seerdb.common.tns_consts import (
     TNS_FUNC_SET_END_TO_END_ATTR,
     TNS_FUNC_SET_SCHEMA,
     TNS_FUNC_TPC_TXN_SWITCH,
+    TNS_KEYWORD_NUM_TXN_PRIORITY,
     TNS_MARKER,
     TNS_MARKER_TYPE_BREAK,
     TNS_MARKER_TYPE_RESET,
@@ -547,7 +551,13 @@ def handle_login(
     # reply dialect (#265). Decide on the PRO request and hold it for the DTY
     # reply so both halves speak one dialect.
     sqlplus = pro_is_sqlplus(first)
-    stream.send_raw(encode_pro_reply(sqlplus=sqlplus, field_version=field_version))
+    stream.send_raw(
+        encode_pro_reply(
+            sqlplus=sqlplus,
+            field_version=field_version,
+            txn_priority=_txn_priority_hooks(backend) is not None,
+        )
+    )
     after_pro = _expect(stream, TNS_DATA, 'DTY')
     # The client has already picked min(its own, what the PRO reply advertised)
     # and put the result in this packet's capability block, so the session's real
@@ -694,7 +704,9 @@ def handle_login(
             stream.write_packet(
                 TNS_DATA,
                 encode_fast_auth_reply(
-                    encode_challenge(challenge), field_version=field_version
+                    encode_challenge(challenge),
+                    field_version=field_version,
+                    txn_priority=_txn_priority_hooks(backend) is not None,
                 ),
             )
         else:
@@ -771,6 +783,9 @@ def handle_login(
         # service_name only from this reply, never by querying, so a placeholder
         # here is wrong for the life of the connection (#826).
         info = _backend_session_info(backend)
+        # The transaction priority the session starts at, reported where 23ai
+        # reports it (#1779).
+        reported = _backend_txn_priority(backend, field_version)
         stream.write_packet(
             TNS_DATA,
             encode_result(
@@ -784,12 +799,66 @@ def handle_login(
                 # The service the client connected to, when the backend cannot
                 # name one of its own (#1409).
                 service_name=info.service_name or request.service_name,
+                txn_priority=reported,
             ),
         )
         session_id = info.session_id
+        hooks = _txn_priority_hooks(backend)
+        if reported is not None and hooks is not None:
+            stream.reply_prefix = _TxnPriorityReporter(hooks[0], reported)
 
     logger.info('login OK: %s', user)
     return user, sqlplus, conn_key, negotiated, session_id
+
+
+def _txn_priority_hooks(
+    backend: Backend,
+) -> tuple[Callable[[], str | None], Callable[[str], None]] | None:
+    # A backend's transaction-priority hooks (#1779): `txn_priority()` reports
+    # the session's priority, `set_txn_priority(value)` changes it ('' restores
+    # the default). The Mirror advertises the feature only with both.
+    get = getattr(backend, 'txn_priority', None)
+    set_ = getattr(backend, 'set_txn_priority', None)
+    return (get, set_) if callable(get) and callable(set_) else None
+
+
+def _backend_txn_priority(backend: Backend, field_version: int) -> str | None:
+    # The priority to report at login, or None when there is none to report: a
+    # backend without the hooks, or a version below 23ai, which has no such thing.
+    hooks = _txn_priority_hooks(backend)
+    if hooks is None or field_version < FIELD_VERSION_23_1:
+        return None
+    try:
+        return hooks[0]()
+    except Exception as exc:  # noqa: BLE001 - never fail a good login
+        logger.info('transaction priority not read: %s', exc)
+        return None
+
+
+class _TxnPriorityReporter:
+    """The stream's reply prefix (#1779): a SYNC piggyback reporting the
+    session's transaction priority whenever it differs from the last one
+    reported -- an ALTER SESSION SET TXN_PRIORITY in the call being answered --
+    and after every client change (:meth:`changed`), even to the same value, as
+    23ai reports it: the client holds '' for a reset until the report comes."""
+
+    def __init__(self, get: Callable[[], str | None], reported: str) -> None:
+        self._get = get
+        self._last: str | None = reported
+
+    def changed(self) -> None:
+        self._last = None
+
+    def __call__(self) -> bytes:
+        try:
+            current = self._get()
+        except Exception as exc:  # noqa: BLE001 - a reply must still go out
+            logger.info('transaction priority not read: %s', exc)
+            return b''
+        if current is None or current == self._last:
+            return b''
+        self._last = current
+        return encode_sync_piggyback([(TNS_KEYWORD_NUM_TXN_PRIORITY, current)])
 
 
 def _backend_session_info(backend: Backend) -> SessionInfo:
@@ -1324,7 +1393,9 @@ def _serve_thin_session(
         ):
             stream.response_token, _ = decode_ub4(body[3:])
         refused: list[BackendError] = []
-        body = _skip_piggybacks(body, backend, temp_lobs, refused)  # CLOSE_CURSORS, …
+        body = _skip_piggybacks(
+            body, backend, temp_lobs, refused, stream.reply_prefix
+        )  # CLOSE_CURSORS, …
         if refused and len(body) >= 2 and body[0] == TTI_FUN:
             # A piggyback the backend refused fails the call behind it, which a
             # real server then does not run (#1778).
@@ -2223,6 +2294,7 @@ def _skip_piggybacks(
     backend: Backend | None = None,
     temp_lobs: _TempLobs | None = None,
     refused: list[BackendError] | None = None,
+    reporter: object = None,
 ) -> bytes:
     # A call can be preceded by piggybacks — CLOSE_CURSORS (105), which a client
     # sends to free the cursors it drained on the previous fetch, and, from 12.1
@@ -2269,6 +2341,23 @@ def _skip_piggybacks(
             _apply_schema(backend, schema)
         elif func == TNS_FUNC_SESSION_STATE:
             _, rest = decode_ub4(rest)  # the requested state (ignored)
+        elif func == TNS_FUNC_ALTER_SESSION:
+            # `connection.transaction_priority = x` (#1779): key-value pairs, of
+            # which TXN_PRIORITY is the one a client sends; an empty value (pair
+            # flag 1) restores the default. A refused value fails the call.
+            pairs, rest = _parse_alter_session_piggyback(rest)
+            hooks = _txn_priority_hooks(backend) if backend else None
+            for key, value in pairs:
+                if hooks is None or key.upper() != 'TXN_PRIORITY':
+                    continue
+                try:
+                    hooks[1](value)
+                except BackendError as err:
+                    if refused is not None:
+                        refused.append(err)
+                else:
+                    if isinstance(reporter, _TxnPriorityReporter):
+                        reporter.changed()
         elif func == TNS_FUNC_APP_CONTEXT:
             # set_app_context() / clear_app_context() (#1778): one namespace per
             # piggyback, applied before the call; every one in the message is,
@@ -2332,6 +2421,24 @@ def _parse_app_context_piggyback(
         _, rest = decode_ub4(rest)
         values[key] = value
     return namespace, None if flags & TNS_APP_CONTEXT_FLAG_CLEAR else values, rest
+
+
+def _parse_alter_session_piggyback(
+    rest: bytes,
+) -> tuple[list[tuple[str, str]], bytes]:
+    # The func-204 body (the inverse of the client's encode_alter_session_
+    # piggyback, docs/PROTOCOL.md §42): flags, pointer, pair count, then per
+    # pair its key and value (each with two lengths) and a flag.
+    _, rest = decode_ub4(rest)  # flags
+    rest = rest[1:]  # pointer
+    count, rest = decode_ub4(rest)
+    pairs: list[tuple[str, str]] = []
+    for _ in range(count):
+        key, rest = _two_lengths(rest)
+        value, rest = _two_lengths(rest)
+        _, rest = decode_ub4(rest)  # 1 for an empty value
+        pairs.append((key, value))
+    return pairs, rest
 
 
 def _two_lengths(rest: bytes) -> tuple[str, bytes]:

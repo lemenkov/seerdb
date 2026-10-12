@@ -238,6 +238,7 @@ from seerdb.common.tns_consts import (
     TNS_FUNC_SET_END_TO_END_ATTR,
     TNS_FUNC_TPC_TXN_CHANGE_STATE,
     TNS_FUNC_TPC_TXN_SWITCH,
+    TNS_KEYWORD_NUM_TXN_PRIORITY,
     TNS_KPD_AQ_BUFMSG,
     TNS_KPD_AQ_EITHER,
     TNS_LOB_OP_FILE_CLOSE,
@@ -4514,6 +4515,7 @@ def encode_result(
     db_name: str | None = None,
     db_domain: str | None = None,
     service_name: str | None = None,
+    txn_priority: str | None = None,
 ) -> bytes:
     """The auth-result RPA payload — the server proof, version, and session id.
 
@@ -4567,9 +4569,32 @@ def encode_result(
         if value:
             pairs.append((key, value.encode('utf-8')))
     payload = encode_rpa_kv(pairs)
+    # The session's transaction priority, reported after the pairs as 23ai
+    # reports it to a client that advertised the feature (#1779).
+    if txn_priority is not None:
+        payload += encode_sync_piggyback([(TNS_KEYWORD_NUM_TXN_PRIORITY, txn_priority)])
     if modern:
         payload += encode_status()
     return payload
+
+
+def encode_sync_piggyback(pairs: list[tuple[int, str]]) -> bytes:
+    """A SYNC server piggyback reporting session state as keyword-value pairs
+    (keyword, text value): the inverse of the client's reading of it (#1776),
+    for the Mirror (#1779). Laid out as 23ai sends it -- its DTY count and the two
+    length bytes are constants there, whatever the pairs:
+    ``17 05 01 01 10 01 01 16 01 03 03 6c 6f 77 00 01 cc 00`` reports keyword 204
+    (transaction priority) = ``low``."""
+    Out = bytes([TTI_SVR_PIGGYBACK, TNS_SERVER_PIGGYBACK_SYNC])
+    Out += encode_sb4(1) + bytes([0x10])  # number of DTYs, length of DTYs
+    Out += encode_sb4(len(pairs)) + bytes([0x16])  # number of pairs, length
+    for Keyword, Text in pairs:
+        Value = Text.encode('utf-8')
+        Out += encode_sb4(len(Value)) + (_bytes_with_length(Value) if Value else b'')
+        Out += encode_sb4(0)  # binary value length
+        Out += encode_sb4(Keyword)
+    Out += encode_sb4(0)  # flags
+    return Out
 
 
 def decode_token_iov(Data: bytes, Acc: tuple) -> tuple:

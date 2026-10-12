@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import socket
 import struct
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from seerdb.common.tns import (
@@ -89,6 +90,11 @@ class PacketStream:
         # in that call's header, which is how the client matches the N responses
         # of a burst back to its N calls (#1059). Consumed by the next DATA write.
         self.response_token: int | None = None
+        # Asked at every DATA write for bytes to lead the reply with -- session
+        # state that changed during the call, as a server piggyback (#1779). It
+        # is asked when the reply goes out, after the backend ran the call, so a
+        # change the call itself made is reported on that call's reply.
+        self.reply_prefix: Callable[[], bytes] | None = None
 
     def activate_ano(self, channel: AnoChannel) -> None:
         """Turn on per-packet encryption + MAC for every subsequent DATA packet
@@ -201,6 +207,8 @@ class PacketStream:
         (handshake replies) are small and go out whole.
         """
         if packet_type == TNS_DATA:
+            if self.reply_prefix is not None:
+                body = self.reply_prefix() + body
             if self.response_token is not None:
                 # Captured from 23ai: `21 01 01 <body> 1d` for the first call of a
                 # burst, `21 01 02 ...` for the second -- the marker, the token as
