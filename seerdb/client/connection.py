@@ -980,6 +980,9 @@ class OracleConnect(_ConnectionLogic):
         # (None otherwise), re-sent as a func-205 piggyback on every subsequent
         # call. The server's compile-cap array, kept to gate the feature.
         self._end_user_sec_context: bytes | None = None
+        # Application context changes waiting for the next call (#1775), by
+        # namespace; an empty dict clears its namespace.
+        self._app_context: dict[str, dict[str, str]] = {}
         self._server_compile_caps: bytes = b''
         self._server_runtime_caps: bytes = b''
         # Request boundaries (#464): for pooled connections, the desired
@@ -1879,6 +1882,7 @@ class OracleConnect(_ConnectionLogic):
             self._flush_cursor_closes_bytes()
             + self._flush_end_to_end_bytes()
             + self._flush_end_user_sec_bytes()
+            + self._flush_app_context_bytes()
             + self._flush_session_state_bytes()
         )
         Data = encode_dictionary(self._make_dict(DictionaryType.exec, query=QueryDict))
@@ -2044,6 +2048,7 @@ class OracleConnect(_ConnectionLogic):
             self._flush_cursor_closes_bytes()
             + self._flush_end_to_end_bytes()
             + self._flush_end_user_sec_bytes()
+            + self._flush_app_context_bytes()
             + self._flush_session_state_bytes()
         )
         Data = encode_dictionary(self._make_dict(DictionaryType.exec, query=QueryDict))
@@ -2898,8 +2903,9 @@ class OracleConnect(_ConnectionLogic):
             return
         from seerdb.common.tns_consts import TTI_COMMIT
 
+        Pre = self._flush_app_context_bytes()  # application context (#1775)
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_COMMIT))
-        self.send(TNS_DATA, Data)
+        self.send(TNS_DATA, Pre + Data)
         self._handle_response()
         # An ordinary commit ends an active sessionless transaction (#133); the
         # server confirms via a keyword-201 sync-unset pair on this response.
@@ -2912,8 +2918,9 @@ class OracleConnect(_ConnectionLogic):
             return
         from seerdb.common.tns_consts import TTI_ROLLBACK
 
+        Pre = self._flush_app_context_bytes()  # application context (#1775)
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_ROLLBACK))
-        self.send(TNS_DATA, Data)
+        self.send(TNS_DATA, Pre + Data)
         self._handle_response()
         self._sessionless_txn_active = False
 
@@ -2926,8 +2933,9 @@ class OracleConnect(_ConnectionLogic):
             return
         from seerdb.common.tns_consts import TTI_PING
 
+        Pre = self._flush_app_context_bytes()  # application context (#1775)
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_PING))
-        self.send(TNS_DATA, Data)
+        self.send(TNS_DATA, Pre + Data)
         self._raise_reply_error(self._handle_response())
 
     def changepassword(self, old_password: str, new_password: str) -> None:

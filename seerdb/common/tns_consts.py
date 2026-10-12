@@ -139,6 +139,17 @@ TNS_SECURITY_CONTEXT_ATTACH_FLAG = 0x01
 # advertises caps[45] = 0x03.
 CCAP_FEATURE_BACKPORT2_END_USER_SEC = 0x02
 
+# Application context (#1775): a piggyback (func 154) that sets or clears the
+# attributes of one namespace, as DBMS_SESSION.SET_CONTEXT / CLEAR_CONTEXT
+# would, with no round trip of its own. A client advertises it with bit 0x80 of
+# its CCAP_OCI1 capability (seerdb's 0x90 has it); the server advertises
+# nothing. The longest key and value the reference thin client accepts, in bytes.
+TNS_FUNC_APP_CONTEXT = 154  # 0x9A
+TNS_APP_CONTEXT_FLAG_SET = 0x01
+TNS_APP_CONTEXT_FLAG_CLEAR = 0x02
+APP_CONTEXT_KEY_MAX_LEN = 128
+APP_CONTEXT_VALUE_MAX_LEN = 4000
+
 # Request boundaries (#464): a SESSION_STATE piggyback (func 176) that tells the
 # server when a pooled logical request begins / ends, so it can reset or reclaim
 # session state between requests. Body is ub8(state | EXPLICIT_BOUNDARY).
