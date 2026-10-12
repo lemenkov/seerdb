@@ -154,10 +154,6 @@ POSTGRES_OPEN_TICKET_TESTS: dict[str, str] = {
     'cursor/test_2700_features_12_1.py::test_cursor_2710': 'a(k).f := x in PKG_TESTRECORDS (#1795)',
     'cursor/test_2700_features_12_1.py::test_cursor_2711': 'a(k).f := x in PKG_TESTRECORDS (#1795)',
     'cursor/test_2700_features_12_1.py::test_cursor_2712': 'a(k).f := x in PKG_TESTRECORDS (#1795)',
-    'data_types/test_1900_dbobject.py::test_data_types_1937': 'INTERVAL in a %ROWTYPE (#1781)',
-    'data_types/test_3500_dbobject_async.py::test_data_types_3516': (
-        'INTERVAL in a %ROWTYPE (#1781)'
-    ),
 }
 
 # Tests that fail through a Mirror-over-PostgreSQL by what PostgreSQL itself is,
