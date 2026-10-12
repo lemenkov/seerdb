@@ -65,6 +65,7 @@ from postgres_backend import (  # noqa: E402
     _translate_routine_types,
     _translate_signed_year,
     _translate_vector_functions,
+    _txn_priority_setting,
     _urowid_expression,
 )
 
@@ -1544,6 +1545,44 @@ def test_translate_ddl_leaves_non_create_table_unchanged() -> None:
         'UPDATE t SET v = :1 WHERE id = :2',
     ):
         assert _translate_ddl(sql) == sql
+
+
+@pytest.mark.parametrize(
+    ('sql', 'expected'),
+    [
+        # Bare, Oracle takes it in upper case; quoted, as written (#1779).
+        ('ALTER SESSION SET TXN_PRIORITY = medium', ('MEDIUM', None)),
+        ("alter session set txn_priority = 'Low'", ('Low', None)),
+        # A 12.1+ client's login puts it beside the time zone, which stays.
+        (
+            "ALTER SESSION SET TIME_ZONE='+02:00' TXN_PRIORITY='medium'",
+            ('medium', "ALTER SESSION SET TIME_ZONE='+02:00'"),
+        ),
+        ("ALTER SESSION SET TIME_ZONE='+02:00'", None),
+        ('SELECT txn_priority FROM t', None),
+    ],
+)
+def test_txn_priority_setting(sql: str, expected) -> None:
+    assert _txn_priority_setting(sql) == expected
+
+
+@pytest.mark.parametrize(
+    ('sql', 'shown'),
+    [
+        ('ALTER SESSION SET TXN_PRIORITY = urgent', 'URGENT'),
+        ("ALTER SESSION SET TXN_PRIORITY = ''", ''),
+    ],
+)
+def test_txn_priority_setting_refuses_a_bad_value(sql: str, shown: str) -> None:
+    # ORA-00096 as 23ai words it, the value as it took it.
+    from seerdb.server.backend import BackendError
+
+    with pytest.raises(BackendError) as raised:
+        _txn_priority_setting(sql)
+    assert raised.value.ora_code == 96
+    assert (
+        f'invalid value {shown} for parameter txn_priority' in raised.value.ora_message
+    )
 
 
 _CONNINFO = os.environ.get(

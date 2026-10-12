@@ -1001,6 +1001,27 @@ class OraclePassthroughBackend:
     # hands over; client_info is spelled clientinfo on the connection.
     _END_TO_END_ATTR = {'client_info': 'clientinfo'}
 
+    def txn_priority(self) -> str | None:
+        """The upstream session's transaction priority, as it last reported it,
+        or None when the upstream has no such feature (#1779)."""
+        assert self._conn is not None  # authenticate() ran before this
+        try:
+            priority = self._conn.transaction_priority
+        except seerdb.NotSupportedError:
+            return None
+        return priority.name if priority is not None else None
+
+    def set_txn_priority(self, value: str) -> None:
+        """Set the upstream session's transaction priority (#1779), flushed by a
+        ping so its report -- or its refusal -- is in before the call it rode
+        in front of runs."""
+        assert self._conn is not None  # authenticate() ran before this
+        try:
+            self._conn.transaction_priority = value or None
+            self._conn.ping()
+        except seerdb.DatabaseError as exc:
+            raise _relay_error(exc) from exc
+
     def apply_app_context(self, namespace: str, values: dict[str, str] | None) -> None:
         """Set or clear an application context namespace mid-session (#1778).
 

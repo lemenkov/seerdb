@@ -167,6 +167,12 @@ honest edge of this adapter:
   see it. The session's settings (time zone, current schema) travel with the
   transaction, where Oracle's stay with the session; one still active when its
   session closes is rolled back.
+- **Transaction priority as session state only** (#1779) -- a session's
+  TXN_PRIORITY (LOW / MEDIUM / HIGH, HIGH by default), from the login, from
+  ``ALTER SESSION SET TXN_PRIORITY`` or from a client's
+  ``connection.transaction_priority``, is kept and reported back as 23ai
+  reports it, but PostgreSQL has no priority transactions: nothing rolls back a
+  lower-priority transaction holding a lock a higher one waits on.
 - **Privileges, for type lookup only** -- every Mirror user is the backend's
   one PostgreSQL role. A GRANT or REVOKE on an object is recorded
   (``sys.ora_grants``), and a user sees another user's type -- in ALL_TYPES,
@@ -9684,6 +9690,38 @@ _ALTER_SESSION_REPORT = re.compile(
     r"\s*ALTER\s+SESSION\s+SET\s+SEERDB_TRANSLATION_REPORT\s*=\s*'?(TRUE|FALSE)'?\s*;?\s*$",
     re.IGNORECASE,
 )
+# 23ai's TXN_PRIORITY in an ALTER SESSION (#1779), alone or beside the time
+# zone, as a 12.1+ client's login sends it: a bare value, which Oracle takes in
+# upper case, or a quoted one, kept as written.
+_ALTER_SESSION_SET = re.compile(r'\s*ALTER\s+SESSION\s+SET\b', re.IGNORECASE)
+_TXN_PRIORITY_SETTING = re.compile(
+    r"\s*\bTXN_PRIORITY\s*=\s*(?:'([^']*)'|(\w*))", re.IGNORECASE
+)
+_TXN_PRIORITIES = ('LOW', 'MEDIUM', 'HIGH')
+
+
+def _txn_priority_setting(sql: str) -> tuple[str, str | None] | None:
+    """An ALTER SESSION's TXN_PRIORITY (#1779): the value, and the statement
+    without it (None when nothing else is left to run); None when it sets no
+    TXN_PRIORITY. A value Oracle does not accept is ORA-00096."""
+    if not _ALTER_SESSION_SET.match(sql):
+        return None
+    m = _TXN_PRIORITY_SETTING.search(sql)
+    if m is None:
+        return None
+    value = m.group(1) if m.group(1) is not None else m.group(2).upper()
+    if value.upper() not in _TXN_PRIORITIES:
+        raise BackendError(
+            f'invalid value {value} for parameter txn_priority, must be from '
+            'among LOW, MEDIUM, HIGH',
+            ora_code=96,
+        )
+    rest = sql[: m.start()] + sql[m.end() :]
+    if re.fullmatch(r'\s*ALTER\s+SESSION\s+SET\s*;?\s*', rest, re.IGNORECASE):
+        return value, None
+    return value, rest
+
+
 # A statement as the translation report keys it (#1557): its string and numeric
 # literals folded to `?`, a quoted identifier kept, its spacing collapsed, so
 # the runs of one statement with different values count together.
@@ -10146,6 +10184,10 @@ class PostgresBackend:
         # Whether the client has taken a SAVEPOINT in the open transaction, which
         # a transaction that has written nothing must keep for it (#1190).
         self._user_savepoint = False
+        # The session's transaction priority (#1779). PostgreSQL has no priority
+        # transactions, so it is session state only: set, kept and reported back
+        # as 23ai reports it, HIGH by default, with nothing behind it.
+        self._txn_priority = 'HIGH'
         # The SQL dialect a statement with no PG hint is in (#1556): 'oracle',
         # translated, or 'postgres', run as written.
         self._sql_dialect = 'oracle'
@@ -10954,6 +10996,12 @@ class PostgresBackend:
         if switch is not None:
             self._sql_dialect = switch.group(1).lower()
             return Result()
+        priority = _txn_priority_setting(sql)
+        if priority is not None:
+            self._txn_priority, rest = priority
+            if rest is None:
+                return Result()
+            sql = rest
         report = _ALTER_SESSION_REPORT.match(sql)
         if report is not None:
             self._reporting = report.group(1).upper() == 'TRUE'
@@ -15402,9 +15450,25 @@ class PostgresBackend:
         way. It is committed at once: a PostgreSQL SET made inside a transaction
         is undone if that transaction rolls back, and Oracle's is not.
         """
+        priority = _txn_priority_setting(statement)
+        if priority is not None:
+            self._txn_priority, rest = priority
+            if rest is None:
+                return
+            statement = rest
         with self._conn.cursor() as cur:
             cur.execute(_translate_admin(statement))
         self._conn.commit()
+
+    def txn_priority(self) -> str:
+        """The session's transaction priority, as 23ai reports it (#1779)."""
+        return self._txn_priority
+
+    def set_txn_priority(self, value: str) -> None:
+        """Set the session's transaction priority from a client's ALTER SESSION
+        piggyback (#1779); an empty value restores the default, HIGH. Session
+        state only: PostgreSQL has no priority transactions."""
+        self._txn_priority = value or 'HIGH'
 
     @_while_connected
     def commit(self) -> None:

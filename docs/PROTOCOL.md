@@ -8129,3 +8129,12 @@ feature: 23ai and 26ai send `0x03` there, 18c and 21c have no byte 45. A
 client refuses the feature against a server without the bit, as python-oracledb
 does (DPY-3043). Measured working at seerdb's own field versions down to 12.1
 against 23ai.
+
+**23ai reports after every client change, even to the same value.** A client
+holds an empty priority after a reset until the report replaces it, so a server
+that reports only what differs leaves it empty. A SQL `ALTER SESSION SET
+TXN_PRIORITY` takes a bare value in upper case (`medium` is reported as
+`MEDIUM`) and a quoted one as written (`'Low'`); anything but LOW, MEDIUM or
+HIGH, the empty string included, is `ORA-00096: invalid value URGENT for
+parameter txn_priority, must be from among LOW, MEDIUM, HIGH` (measured for
+#1779).

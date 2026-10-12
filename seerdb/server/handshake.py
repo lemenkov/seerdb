@@ -46,6 +46,8 @@ from seerdb.common.tns import (
 )
 from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
+    CCAP_FEATURE_BACKPORT2,
+    CCAP_FEATURE_BACKPORT2_TXN_PRIORITY,
     CCAP_FIELD_VERSION,
     CCAP_LOGON_O7LOGON,
     CCAP_LOGON_TYPES,
@@ -410,7 +412,10 @@ def oci_field_version(field_version: int) -> int:
 
 
 def build_caps_block_reply(
-    field_version: int = FIELD_VERSION_11_2, *, oci: bool = False
+    field_version: int = FIELD_VERSION_11_2,
+    *,
+    oci: bool = False,
+    txn_priority: bool = False,
 ) -> bytes:
     """The TTI_PRO capability block as a TTC payload (no packet header): version
     banner, charset, the charset-element array, the fixed descriptor, and the
@@ -425,12 +430,21 @@ def build_caps_block_reply(
     ``oci`` marks the sqlplus/deadbeef DTY reply, which advertises
     :func:`oci_field_version` instead. From 12.1 it also adds the O7LOGON logon
     type a 12c-band server advertises: without it a modern sqlplus cannot use
-    the 12c SHA-2 verifier the OCI challenge then offers (#1282)."""
+    the 12c SHA-2 verifier the OCI challenge then offers (#1282).
+
+    ``txn_priority`` advertises transaction priority, as 23ai does in bit 0x01 of
+    ``CCAP_FEATURE_BACKPORT2`` (#1779), when the Mirror presents a 23ai field
+    version to a thin client. The 11.2 vector stops short of that byte, so it
+    grows to reach it; the bytes between stay zero, which a client reads as the
+    features they name being absent, exactly as when the vector ended."""
     compile_caps = bytearray(_SERVER_COMPILE_CAPS)
     compile_caps[CCAP_FIELD_VERSION] = field_version
     if oci and field_version >= FIELD_VERSION_12_1:
         compile_caps[CCAP_FIELD_VERSION] = oci_field_version(field_version)
         compile_caps[CCAP_LOGON_TYPES] |= CCAP_LOGON_O7LOGON
+    if txn_priority and not oci and field_version >= FIELD_VERSION_23_1:
+        compile_caps += bytes(CCAP_FEATURE_BACKPORT2 + 1 - len(compile_caps))
+        compile_caps[CCAP_FEATURE_BACKPORT2] |= CCAP_FEATURE_BACKPORT2_TXN_PRIORITY
     return (
         # TTI_PRO, the negotiated field version (6 = 11g), a zero, then the
         # NUL-terminated version banner.
@@ -545,7 +559,9 @@ def encode_ano_null_reply(*, sdu: int = DEFAULT_SDU) -> bytes:
     return packet
 
 
-def encode_fast_auth_reply(challenge: bytes, *, field_version: int) -> bytes:
+def encode_fast_auth_reply(
+    challenge: bytes, *, field_version: int, txn_priority: bool = False
+) -> bytes:
     """The bundled reply a client\'s 23ai FAST_AUTH packet expects (§20): the PRO
     reply payload, the DTY reply payload, and the OSESSKEY auth challenge, in one
     ``DATA`` body. The client scans it for the challenge RPA
@@ -554,7 +570,7 @@ def encode_fast_auth_reply(challenge: bytes, *, field_version: int) -> bytes:
     payload; the caller frames the whole thing with ``write_packet``.
     """
     return (
-        build_caps_block_reply(field_version)
+        build_caps_block_reply(field_version, txn_priority=txn_priority)
         + build_dty_type_reply(field_version)
         + challenge
     )
@@ -565,6 +581,7 @@ def encode_pro_reply(
     sqlplus: bool = False,
     sdu: int = DEFAULT_SDU,
     field_version: int = FIELD_VERSION_11_2,
+    txn_priority: bool = False,
 ) -> bytes:
     """Build the server's PRO (protocol negotiation) reply — §4.1.
 
@@ -575,7 +592,9 @@ def encode_pro_reply(
     Returns the full TNS_DATA packet.
     """
     payload = (
-        build_pro_sqlplus_reply() if sqlplus else build_caps_block_reply(field_version)
+        build_pro_sqlplus_reply()
+        if sqlplus
+        else build_caps_block_reply(field_version, txn_priority=txn_priority)
     )
     packet, _ = encode_packet(TNS_DATA, payload, sdu)
     return packet
