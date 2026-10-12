@@ -325,6 +325,7 @@ from seerdb.common.tns_consts import (
     ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,
     ORA_TOO_MANY_ROWS,
     ORA_TOO_MANY_VALUES,
+    ORA_TRANSACTION_ROLLED_BACK,
     ORA_TYPE_HAS_DEPENDENTS,
     ORA_UNIQUE_CONSTRAINT_VIOLATED,
     ORA_USER_DOES_NOT_EXIST,
@@ -15472,9 +15473,21 @@ class PostgresBackend:
 
     @_while_connected
     def commit(self) -> None:
-        self._conn.commit()
-        self._user_savepoint = False
-        self._end_sessionless()
+        try:
+            self._conn.commit()
+        except psycopg.Error as exc:
+            # A deferred constraint is checked at COMMIT, which then rolls the
+            # transaction back; Oracle reports that as ORA-02091 over the
+            # constraint's own error (#1789).
+            self._conn.rollback()
+            cause = _backend_error(exc)
+            raise BackendError(
+                f'transaction rolled back\n{cause.ora_message}',
+                ora_code=ORA_TRANSACTION_ROLLED_BACK,
+            ) from exc
+        finally:
+            self._user_savepoint = False
+            self._end_sessionless()
 
     @_while_connected
     def rollback(self) -> None:

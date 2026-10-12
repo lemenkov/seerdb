@@ -242,6 +242,7 @@ ORA_VALUE_LARGER_THAN_PRECISION = 1438  # ... precision allowed for this column
 ORA_DIVISOR_IS_ZERO = 1476  # divisor is equal to zero
 ORA_INVALID_NUMBER = 1722
 ORA_INVALID_BIND_VARIABLE_NAME = 1745  # invalid host/bind variable name
+ORA_TRANSACTION_ROLLED_BACK = 2091  # a deferred constraint refused the COMMIT
 ORA_CHECK_CONSTRAINT_VIOLATED = 2290
 ORA_PARENT_KEY_NOT_FOUND = 2291  # integrity constraint violated - parent key not found
 ORA_TYPE_HAS_DEPENDENTS = 2303  # cannot drop or replace a type with ... dependents
