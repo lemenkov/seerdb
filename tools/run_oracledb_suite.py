@@ -147,13 +147,13 @@ POSTGRES_OPEN_TICKET_TESTS: dict[str, str] = {
     'connection/test_1200_pipelining_async.py::test_connection_1229': (
         'PL/SQL executemany in a pipeline (#1783)'
     ),
-    'cursor/test_1200_executemany.py::test_cursor_1234': 'a.last() in PKG_TESTRECORDS (#1780)',
+    'cursor/test_1200_executemany.py::test_cursor_1234': 'a(k).f := x in PKG_TESTRECORDS (#1795)',
     'cursor/test_1300_executemany_async.py::test_cursor_1330': (
-        'a.last() in PKG_TESTRECORDS (#1780)'
+        'a(k).f := x in PKG_TESTRECORDS (#1795)'
     ),
-    'cursor/test_2700_features_12_1.py::test_cursor_2710': 'a.last() in PKG_TESTRECORDS (#1780)',
-    'cursor/test_2700_features_12_1.py::test_cursor_2711': 'a.last() in PKG_TESTRECORDS (#1780)',
-    'cursor/test_2700_features_12_1.py::test_cursor_2712': 'a.last() in PKG_TESTRECORDS (#1780)',
+    'cursor/test_2700_features_12_1.py::test_cursor_2710': 'a(k).f := x in PKG_TESTRECORDS (#1795)',
+    'cursor/test_2700_features_12_1.py::test_cursor_2711': 'a(k).f := x in PKG_TESTRECORDS (#1795)',
+    'cursor/test_2700_features_12_1.py::test_cursor_2712': 'a(k).f := x in PKG_TESTRECORDS (#1795)',
     'data_types/test_1900_dbobject.py::test_data_types_1937': 'INTERVAL in a %ROWTYPE (#1781)',
     'data_types/test_3500_dbobject_async.py::test_data_types_3516': (
         'INTERVAL in a %ROWTYPE (#1781)'
