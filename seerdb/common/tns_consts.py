@@ -150,6 +150,18 @@ TNS_APP_CONTEXT_FLAG_CLEAR = 0x02
 APP_CONTEXT_KEY_MAX_LEN = 128
 APP_CONTEXT_VALUE_MAX_LEN = 4000
 
+# Transaction priority (#1776, 23ai and later): an ALTER SESSION piggyback (func
+# 204) carries TXN_PRIORITY=<value> as one keyword-value pair, flag 1 for an empty
+# value, which restores the default. A server refuses it (ORA-03115) unless the
+# client's data-type table declares TNS_DATA_TYPE_ALTSESS. The server reports
+# the session's priority as keyword 204 of a SYNC piggyback, at login and after a
+# change, to a client advertising CCAP_FEATURE_BACKPORT2_TXN_PRIORITY; it
+# advertises the same bit itself when it has the feature.
+TNS_FUNC_ALTER_SESSION = 204  # 0xCC
+TNS_DATA_TYPE_ALTSESS = 668
+TNS_KEYWORD_NUM_TXN_PRIORITY = 204
+CCAP_FEATURE_BACKPORT2_TXN_PRIORITY = 0x01
+
 # Request boundaries (#464): a SESSION_STATE piggyback (func 176) that tells the
 # server when a pooled logical request begins / ends, so it can reset or reclaim
 # session state between requests. Body is ub8(state | EXPLICIT_BOUNDARY).

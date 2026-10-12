@@ -2689,14 +2689,16 @@ class TestTnsCommandEncodersDict(unittest.TestCase):
 
     def test_capability_arrays_21_1(self):
         # The 21.1 vectors must match python-oracledb 4.0.1 captured against
-        # Oracle 21c XE (issue #27 Phase 0 reference bytes).
+        # Oracle 21c XE (issue #27 Phase 0 reference bytes), but for
+        # FEATURE_BACKPORT2 (index 45), which also advertises transaction
+        # priority (0x01) since #1776.
         from seerdb.common.tns_consts import FIELD_VERSION_21_1
 
         cc, rc = capability_arrays(FIELD_VERSION_21_1)
         self.assertEqual(
             cc.hex(),
             '06000000ea180010010100000000002990030703000100cf00'
-            '0004010000001000000c2000b80008440005003e0200000000000003',
+            '0004010000001000000c2000b80008440005003e0300000000000003',
         )
         self.assertEqual(rc.hex(), '0200000000000500000000')
         # field version lands at the documented slot
@@ -2971,13 +2973,15 @@ class TestTnsCommandEncodersDict(unittest.TestCase):
         from seerdb.common.tns import _datatype_table_12c
 
         Table = _datatype_table_12c()
-        self.assertEqual(len(Table), 2570)
-        self.assertEqual((len(Table) - 2) // 8, 321)
+        # Byte for byte python-oracledb 26's table, captured against 23ai: 322
+        # types, TNS_DATA_TYPE_ALTSESS (668) the newest (#1776).
+        self.assertEqual(len(Table), 2578)
+        self.assertEqual((len(Table) - 2) // 8, 322)
         self.assertEqual(Table[-2:], bytes([0, 0]))
         self.assertEqual(struct.unpack('>HHHH', Table[8:16])[:3], (2, 2, 10))  # NUMBER
         self.assertEqual(
             hashlib.sha256(Table).hexdigest(),
-            '11c8d115ab493105252bbf8927f7d4b62dc864b358bfa0cf700af1b7d76aa492',
+            'd5f59707b8491bc3495b3a69a118f6130046945910ff1563bc0979c49b72ee96',
         )
 
     def test_dty_12c_message_shape(self):

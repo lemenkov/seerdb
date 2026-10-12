@@ -13,6 +13,7 @@ from seerdb.client.apool import AsyncPool
 from seerdb.client.aq import DeqOptions, EnqOptions, MessageProperties, Queue
 from seerdb.client.connection import OracleConnect, Xid
 from seerdb.client.cursor import FetchInfo
+from seerdb.client.enums import TransactionPriority
 from seerdb.client.pipeline import (
     Pipeline,
     PipelineOp,
@@ -205,6 +206,7 @@ __all__ = [
     'PipelineOp',
     'PipelineOpResult',
     'PipelineOpType',
+    'TransactionPriority',
     'create_pipeline',
     'create_end_user_security_context',
     'EndUserSecurityContext',

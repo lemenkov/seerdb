@@ -24,9 +24,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from seerdb.client.dialect import Dialect, Fv2Dialect, O8iDialect
+from seerdb.client.enums import TransactionPriority
 from seerdb.common.end_user_sec import EndUserSecurityContext
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
 from seerdb.common.tns import (
+    encode_alter_session_piggyback,
     encode_ano_fragment,
     encode_app_context_piggyback,
     encode_close_cursors_piggyback,
@@ -41,6 +43,7 @@ from seerdb.common.tns_consts import (
     APP_CONTEXT_VALUE_MAX_LEN,
     CCAP_FEATURE_BACKPORT2,
     CCAP_FEATURE_BACKPORT2_END_USER_SEC,
+    CCAP_FEATURE_BACKPORT2_TXN_PRIORITY,
     CCAP_FIELD_VERSION,
     CCAP_TTC4,
     CCAP_TTC4_EXPLICIT_BOUNDARY,
@@ -51,6 +54,7 @@ from seerdb.common.tns_consts import (
     ORA_TOO_MANY_ROWS,
     RCAP_TTC,
     RCAP_TTC_SESSION_STATE_OPS,
+    TNS_KEYWORD_NUM_TXN_PRIORITY,
     TNS_SESSION_STATE_REQUEST_BEGIN,
     DictionaryType,
 )
@@ -100,6 +104,10 @@ class _ConnectionLogic:
     _server_runtime_caps: bytes
     _end_user_sec_context: bytes | None
     _app_context: dict[str, dict[str, str]]
+    _txn_priority_requested: str
+    _txn_priority: str | None
+    _txn_priority_pending: str | None
+    _session_keywords: dict[int, str | None]
     _session_state_desired: int
     _in_request: bool
     _supports_eor: bool
@@ -287,6 +295,66 @@ class _ConnectionLogic:
         return len(Caps) > CCAP_FEATURE_BACKPORT2 and bool(
             Caps[CCAP_FEATURE_BACKPORT2] & CCAP_FEATURE_BACKPORT2_END_USER_SEC
         )
+
+    def _supports_txn_priority(self) -> bool:
+        # The server advertises transaction priority via a compile-cap bit, 23ai
+        # and later (#1776).
+        Caps = self._server_compile_caps
+        return len(Caps) > CCAP_FEATURE_BACKPORT2 and bool(
+            Caps[CCAP_FEATURE_BACKPORT2] & CCAP_FEATURE_BACKPORT2_TXN_PRIORITY
+        )
+
+    def _login_txn_priority(self) -> str:
+        # The priority the login's ALTER SESSION asks for (#1776). Only for a
+        # server with the feature -- another rejects the whole statement, and so
+        # the login; connect() refuses that case once logged in. Before the
+        # server's capabilities are known (the 23ai fast-auth login) it goes.
+        if self._server_compile_caps and not self._supports_txn_priority():
+            return ''
+        return self._txn_priority_requested
+
+    def _absorb_session_keywords(self) -> None:
+        # Take the session state the last reply reported (#1776).
+        Keywords = self._session_keywords
+        if TNS_KEYWORD_NUM_TXN_PRIORITY in Keywords:
+            self._txn_priority = Keywords[TNS_KEYWORD_NUM_TXN_PRIORITY]
+        Keywords.clear()
+
+    def _require_txn_priority(self) -> None:
+        if not self._supports_txn_priority():
+            raise NotSupportedError(
+                'the database does not support transaction priority '
+                '(requires Oracle 23ai or later)'
+            )
+
+    @property
+    def transaction_priority(self) -> TransactionPriority | None:
+        """The session's priority for 23ai's priority transactions (#1776), as
+        the server last reported it: at login, after a change, and after an
+        ``ALTER SESSION SET TXN_PRIORITY``. Setting it sends the change with the
+        next call; ``''``, ``None`` or ``TransactionPriority.DEFAULT`` restores the
+        database's default. NotSupportedError before 23ai."""
+        self._require_txn_priority()
+        if not self._txn_priority:
+            return None
+        return TransactionPriority[self._txn_priority.upper()]
+
+    @transaction_priority.setter
+    def transaction_priority(self, value: str | TransactionPriority | None) -> None:
+        Priority = _transaction_priority(value)
+        self._require_txn_priority()
+        self._txn_priority = Priority.value
+        self._txn_priority_pending = Priority.value
+
+    def _flush_alter_session_bytes(self) -> bytes:
+        # One-shot ALTER SESSION piggyback for a changed priority (#1776).
+        if self._txn_priority_pending is None:
+            return b''
+        Bytes = encode_alter_session_piggyback(
+            self._next_seq(), self.field_version, self._txn_priority_pending
+        )
+        self._txn_priority_pending = None
+        return Bytes
 
     def _flush_end_user_sec_bytes(self) -> bytes:
         # func-205 piggyback re-sent in front of every call while a context is
@@ -482,6 +550,8 @@ class _ConnectionLogic:
             'field_version': self.field_version,
             'max_string_size': max_string_size(self._server_runtime_caps),
             'supports_eor': self._supports_eor,
+            # The priority the login's ALTER SESSION asks for (#1776).
+            'txn_priority': self._login_txn_priority(),
         }
         d.update(extra)
         return d
@@ -834,3 +904,19 @@ def returning_block_error(Error):
         'whose scalar INTO targets can take a single row (ORA-01422). Restrict '
         'the statement to one row, or read the rows back with a SELECT.'
     )
+
+
+def _transaction_priority(value: object) -> TransactionPriority:
+    """A transaction priority given as a TransactionPriority, its name in any
+    case, ``''`` or ``None`` (the default), as python-oracledb accepts it (#1776)."""
+    if isinstance(value, TransactionPriority):
+        return value
+    if value is None or value == '':
+        return TransactionPriority.DEFAULT
+    if isinstance(value, str):
+        try:
+            return TransactionPriority[value.upper()]
+        except KeyError:
+            pass
+        raise ValueError(f'invalid transaction priority: {value!r}')
+    raise TypeError('value must be from the enumeration seerdb.TransactionPriority')

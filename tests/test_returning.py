@@ -575,6 +575,10 @@ class TestFlushOutBindsAcknowledged(unittest.TestCase):
         def __init__(self, packets):
             self._packets = list(packets)
             self.sent = []
+            self._session_keywords = {}
+
+        def _absorb_session_keywords(self):
+            pass
 
         def _next_data_packet(self, _a, _b):
             return (TNS_DATA, self._packets.pop(0)) if self._packets else False

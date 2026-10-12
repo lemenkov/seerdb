@@ -18,6 +18,7 @@ import uuid
 from seerdb.client._conn_logic import (
     _ConnectionLogic,
     _pre10_tier_name_for,
+    _transaction_priority,
     returning_block_error,
     returning_block_request,
     returning_block_result,
@@ -28,6 +29,7 @@ from seerdb.client.dialect import (
     Dialect,
     O8iDialect,
 )
+from seerdb.client.enums import TransactionPriority
 from seerdb.common.crypto import validate
 from seerdb.common.exceptions import (
     DatabaseError,
@@ -58,6 +60,7 @@ from seerdb.common.tns import (
     find_fast_auth_rpa,
     has_long_class_bind,
     max_string_size,
+    recording_session_keywords,
     return_bind_types,
     set_decode_dml_rowcounts,
     set_decode_prev_row,
@@ -859,6 +862,7 @@ class OracleConnect(_ConnectionLogic):
         fetch_lobs: bool = True,
         driver_name: str | None = None,
         edition: str | None = None,
+        transaction_priority: str | TransactionPriority | None = None,
         field_version: int = FIELD_VERSION_23_4,
         cclass: str | None = None,
         purity: int = PURITY_DEFAULT,
@@ -928,6 +932,12 @@ class OracleConnect(_ConnectionLogic):
         # The edition this session runs in. A LOGIN-time choice: it rides in the
         # AUTH, not in a later ALTER SESSION (#826).
         self.edition = edition
+        # The transaction priority to log in at (#1776), and the one the server
+        # last reported; a change waits in _txn_priority_pending for the next call.
+        self._txn_priority_requested = _transaction_priority(transaction_priority).value
+        self._txn_priority: str | None = None
+        self._txn_priority_pending: str | None = None
+        self._session_keywords: dict[int, str | None] = {}
         # Token-based auth (#125): a JWT str (OAuth2) or (token, private_key)
         # (OCI IAM), resolved at connect time into the token + optional PEM key.
         self.access_token = access_token
@@ -1141,6 +1151,11 @@ class OracleConnect(_ConnectionLogic):
 
     def connect(self) -> bool:
         self._connect_and_login()
+        if self._txn_priority_requested and not self._supports_txn_priority():
+            # The login went without it (#1776); refuse rather than run at the
+            # default.
+            self.close()
+            self._require_txn_priority()
         # The timeout bounds connecting -- the TCP connect, the handshake, the
         # login -- and no call after it, as python-oracledb's connect timeout
         # does: a server takes as long as a query does to answer it, and a
@@ -1573,7 +1588,9 @@ class OracleConnect(_ConnectionLogic):
             return done.value
 
     def _handle_rpa(self, Data: bytes) -> int | None:
-        Result = decode_token_rpa(Data, ())
+        with recording_session_keywords(self._session_keywords):
+            Result = decode_token_rpa(Data, ())
+        self._absorb_session_keywords()
         if Result[0] == TTI_SESS:
             # Auth challenge: (TTI_SESS, SessKey, Salt, DerivedSalt, Vgen, Sder, Vfr)
             (_, SessKey, Salt, DerivedSalt, VgenCount, SderCount, VerifierType) = Result
@@ -1884,6 +1901,7 @@ class OracleConnect(_ConnectionLogic):
             + self._flush_end_user_sec_bytes()
             + self._flush_app_context_bytes()
             + self._flush_session_state_bytes()
+            + self._flush_alter_session_bytes()  # transaction priority (#1776)
         )
         Data = encode_dictionary(self._make_dict(DictionaryType.exec, query=QueryDict))
         self.send(TNS_DATA, Pre + Data)
@@ -2050,6 +2068,7 @@ class OracleConnect(_ConnectionLogic):
             + self._flush_end_user_sec_bytes()
             + self._flush_app_context_bytes()
             + self._flush_session_state_bytes()
+            + self._flush_alter_session_bytes()  # transaction priority (#1776)
         )
         Data = encode_dictionary(self._make_dict(DictionaryType.exec, query=QueryDict))
         self.send(TNS_DATA, Data if not Pre else Pre + Data)
@@ -2916,7 +2935,10 @@ class OracleConnect(_ConnectionLogic):
             return
         from seerdb.common.tns_consts import TTI_COMMIT
 
-        Pre = self._flush_app_context_bytes()  # application context (#1775)
+        Pre = (
+            self._flush_app_context_bytes()  # application context (#1775)
+            + self._flush_alter_session_bytes()  # transaction priority (#1776)
+        )
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_COMMIT))
         self.send(TNS_DATA, Pre + Data)
         try:
@@ -2935,7 +2957,10 @@ class OracleConnect(_ConnectionLogic):
             return
         from seerdb.common.tns_consts import TTI_ROLLBACK
 
-        Pre = self._flush_app_context_bytes()  # application context (#1775)
+        Pre = (
+            self._flush_app_context_bytes()  # application context (#1775)
+            + self._flush_alter_session_bytes()  # transaction priority (#1776)
+        )
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_ROLLBACK))
         self.send(TNS_DATA, Pre + Data)
         try:
@@ -2952,7 +2977,10 @@ class OracleConnect(_ConnectionLogic):
             return
         from seerdb.common.tns_consts import TTI_PING
 
-        Pre = self._flush_app_context_bytes()  # application context (#1775)
+        Pre = (
+            self._flush_app_context_bytes()  # application context (#1775)
+            + self._flush_alter_session_bytes()  # transaction priority (#1776)
+        )
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_PING))
         self.send(TNS_DATA, Pre + Data)
         self._raise_reply_error(self._handle_response())
@@ -3048,9 +3076,11 @@ class OracleConnect(_ConnectionLogic):
             (Type, Packet) = Received
             if Type != TNS_DATA:
                 raise Exception('Unexpected response type', Type)
-            Result = decode_packet(
-                Packet, Acc, self.field_version, self._server_field_version()
-            )
+            with recording_session_keywords(self._session_keywords):
+                Result = decode_packet(
+                    Packet, Acc, self.field_version, self._server_field_version()
+                )
+            self._absorb_session_keywords()
             if Result != FLUSH_OUT_BINDS:
                 return Result
             # A flush-out-binds request, not a result: echo the token back and

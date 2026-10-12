@@ -2363,6 +2363,42 @@ class CursorIntegration(_IntegrationBase):
             self.cur.fetchone(), (self.conn.session_id, self.conn.serial_num)
         )
 
+    def test_transaction_priority(self):
+        # 23ai's priority transactions (#1776): the value the server reports at
+        # login, a change sent with the next call, a reset to the default, and an
+        # ALTER SESSION in SQL, each as the server reports it back. Before 23ai
+        # the attribute and the connect option are refused.
+        from seerdb.common.exceptions import NotSupportedError
+
+        kwargs = dict(
+            host=_HOST,
+            port=_PORT,
+            user=_USER,
+            password=_PASSWORD,
+            service_name=_SERVICE,
+            **_FV_KW,
+        )
+        if not self.conn._supports_txn_priority():
+            with self.assertRaises(NotSupportedError):
+                self.conn.transaction_priority
+            with self.assertRaises(NotSupportedError):
+                seerdb.connect(**kwargs, transaction_priority='low')
+            return
+        self._skip_if_mirror('transaction priority (#1779)')
+        P = seerdb.TransactionPriority
+        default = self.conn.transaction_priority
+        self.assertIsInstance(default, P)
+        self.conn.transaction_priority = 'low'
+        self.conn.ping()
+        self.assertIs(self.conn.transaction_priority, P.LOW)
+        self.conn.transaction_priority = None
+        self.conn.ping()
+        self.assertIs(self.conn.transaction_priority, default)
+        self.cur.execute('ALTER SESSION SET TXN_PRIORITY = MEDIUM')
+        self.assertIs(self.conn.transaction_priority, P.MEDIUM)
+        with seerdb.connect(**kwargs, transaction_priority=P.LOW) as conn:
+            self.assertIs(conn.transaction_priority, P.LOW)
+
     def test_app_context_rides_the_next_call(self):
         # set_app_context() / clear_app_context() reach the server with the next
         # call, a ping included, and a namespace the session may not set fails
@@ -9246,6 +9282,40 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 self.assertEqual(
                     await Cur.fetchone(), (Conn.session_id, Conn.serial_num)
                 )
+
+    async def test_transaction_priority(self):
+        # Async twin of CursorIntegration's.
+        from seerdb.common.exceptions import NotSupportedError
+
+        P = seerdb.TransactionPriority
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            if not Conn._supports_txn_priority():
+                with self.assertRaises(NotSupportedError):
+                    Conn.transaction_priority
+                with self.assertRaises(NotSupportedError):
+                    await seerdb.connect_async(
+                        **self._kwargs(), transaction_priority='low'
+                    )
+                return
+            if os.environ.get('SEERDB_TEST_MIRROR'):
+                self.skipTest(
+                    'the Mirror does not implement transaction priority yet (#1779)'
+                )
+            default = Conn.transaction_priority
+            self.assertIsInstance(default, P)
+            Conn.transaction_priority = 'low'
+            await Conn.ping()
+            self.assertIs(Conn.transaction_priority, P.LOW)
+            Conn.transaction_priority = None
+            await Conn.ping()
+            self.assertIs(Conn.transaction_priority, default)
+            async with Conn.cursor() as Cur:
+                await Cur.execute('ALTER SESSION SET TXN_PRIORITY = MEDIUM')
+            self.assertIs(Conn.transaction_priority, P.MEDIUM)
+        async with await seerdb.connect_async(
+            **self._kwargs(), transaction_priority=P.LOW
+        ) as Conn:
+            self.assertIs(Conn.transaction_priority, P.LOW)
 
     async def test_app_context_rides_the_next_call(self):
         # Async twin of CursorIntegration's.

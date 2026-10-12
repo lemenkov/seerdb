@@ -4,7 +4,7 @@
 import base64
 import datetime
 import platform
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -126,6 +126,7 @@ def _json_oson_image(Token: object):
         return None
 
 
+import contextlib
 import contextvars
 import logging
 import math
@@ -142,6 +143,8 @@ from seerdb.common.tns_consts import (
     CCAP_DEQUEUE_WITH_SELECTOR,
     CCAP_FEATURE_BACKPORT,
     CCAP_FEATURE_BACKPORT2,
+    CCAP_FEATURE_BACKPORT2_END_USER_SEC,
+    CCAP_FEATURE_BACKPORT2_TXN_PRIORITY,
     CCAP_FIELD_VERSION,
     CCAP_LOB,
     CCAP_LOB2,
@@ -205,6 +208,7 @@ from seerdb.common.tns_consts import (
     TNS_CCAP_END_OF_RESPONSE,
     TNS_DATA,
     TNS_DATA_FLAGS_MORE,
+    TNS_DATA_TYPE_ALTSESS,
     TNS_END_TO_END_ACTION,
     TNS_END_TO_END_CLIENT_IDENTIFIER,
     TNS_END_TO_END_CLIENT_INFO,
@@ -222,6 +226,7 @@ from seerdb.common.tns_consts import (
     TNS_EXEC_OPTION_EXECUTE,
     TNS_EXEC_OPTION_FETCH,
     TNS_EXEC_OPTION_PARSE,
+    TNS_FUNC_ALTER_SESSION,
     TNS_FUNC_APP_CONTEXT,
     TNS_FUNC_AQ_DEQ,
     TNS_FUNC_AQ_ENQ,
@@ -637,6 +642,52 @@ def set_decode_dml_rowcounts(Flag: bool) -> None:
     decode_token_rpa_piggyback knows whether to expect the array-DML row-count
     block. Reset every execute so a stale flag never leaks into another call."""
     _DECODE_DML_ROWCOUNTS.set(bool(Flag))
+
+
+# Session state the server reports in a SYNC piggyback's keyword-value pairs,
+# keyword -> text value (#1776): the transaction priority, keyword 204. While a
+# connection decodes a reply it points this at a dict of its own, and the decoder
+# records each pair there; otherwise it is None and the pairs are only walked, so
+# one connection never sees another's.
+_DECODE_SESSION_KEYWORDS: contextvars.ContextVar[dict[int, str | None] | None] = (
+    contextvars.ContextVar('decode_session_keywords', default=None)
+)
+
+
+@contextlib.contextmanager
+def recording_session_keywords(Sink: dict[int, str | None]) -> Iterator[None]:
+    """Record the keyword-value pairs the replies decoded inside the block report
+    into ``Sink``, keyword -> text value (#1776)."""
+    Token = _DECODE_SESSION_KEYWORDS.set(Sink)
+    try:
+        yield
+    finally:
+        _DECODE_SESSION_KEYWORDS.reset(Token)
+
+
+def _decode_sync_pairs(Rest: bytes) -> bytes:
+    # A SYNC piggyback's body after its opcode: DTYs, then keyword-value pairs
+    # (ub2 text length + dalc / ub2 binary length + dalc / ub2 keyword), then
+    # the overall flags. Each pair's text is recorded for the connection.
+    (_, Rest) = decode_ub4(Rest)  # number of DTYs (ub2)
+    Rest = Rest[1:]  # length of DTYs (ub1)
+    (NumElements, Rest) = decode_ub4(Rest)  # number of pairs (ub2)
+    Rest = Rest[1:]  # length (ub1)
+    Sink = _DECODE_SESSION_KEYWORDS.get()
+    for _ in range(NumElements):
+        Text = None
+        (TextLen, Rest) = decode_ub4(Rest)  # text value len (ub2)
+        if TextLen > 0:
+            (Value, Rest) = decode_dalc(Rest)
+            Text = bytes(Value).decode('utf-8', 'replace')
+        (BinLen, Rest) = decode_ub4(Rest)  # binary value len (ub2)
+        if BinLen > 0:
+            (_, Rest) = decode_dalc(Rest)
+        (Keyword, Rest) = decode_ub4(Rest)  # keyword num (ub2)
+        if Sink is not None:
+            Sink[Keyword] = Text
+    (_, Rest) = decode_ub4(Rest)  # overall flags (ub4)
+    return Rest
 
 
 # DML RETURNING ... INTO (#120): the sorted return-bind positions for the next
@@ -5139,6 +5190,10 @@ def decode_token_rpa(Data: bytes, Acc: tuple) -> tuple:
             b'AUTH_SC_DBUNIQUE_NAME'
         )
         DbUniqueName = bytes(Unique).decode('utf-8') if Unique else None
+        # 23ai and later report session state after the pairs, as a SYNC
+        # piggyback: the transaction priority the session starts at (#1776).
+        if Rest1[:2] == bytes([TTI_SVR_PIGGYBACK, TNS_SERVER_PIGGYBACK_SYNC]):
+            _decode_sync_pairs(Rest1[2:])
         return (TTI_AUTH, Resp, Ver, SessId, SerialNum, DbUniqueName)
     else:
         # The 256-bit scheme carries the server's PBKDF2 iteration counts; the
@@ -5250,25 +5305,11 @@ def decode_token_server_piggyback(Data: bytes, Acc: tuple) -> tuple:
         (_, Rest) = decode_ub4(Rest)  # ub2
         (_, Rest) = decode_dalc(Rest)  # pid bytes
     elif Opcode == TNS_SERVER_PIGGYBACK_SYNC:
-        # Sessionless transactions (#133): the server reports txn-id sync state
-        # as keyword-value pairs (keyword 201 = transaction id) piggybacked on
-        # the next call response while a sessionless txn is active. seerdb
-        # tracks the active flag client-side, so the pairs are only consumed
-        # byte-for-byte here. Each pair = ub2 text-len + dalc / ub2 binary-len +
-        # dalc / ub2 keyword-num, framed like the SESS_RET pair loop.
-        (_, Rest) = decode_ub4(Rest)  # number of DTYs (ub2)
-        Rest = Rest[1:]  # length of DTYs (ub1)
-        (NumElements, Rest) = decode_ub4(Rest)  # number of pairs (ub2)
-        Rest = Rest[1:]  # length (ub1)
-        for _ in range(NumElements):
-            (TextLen, Rest) = decode_ub4(Rest)  # text value len (ub2)
-            if TextLen > 0:
-                (_, Rest) = decode_dalc(Rest)
-            (BinLen, Rest) = decode_ub4(Rest)  # binary value len (ub2)
-            if BinLen > 0:
-                (_, Rest) = decode_dalc(Rest)
-            (_, Rest) = decode_ub4(Rest)  # keyword num (ub2)
-        (_, Rest) = decode_ub4(Rest)  # overall flags (ub4)
+        # Session state as keyword-value pairs: the transaction id of a
+        # sessionless transaction (keyword 201, #133; seerdb tracks that flag
+        # client-side) and the transaction priority (keyword 204, #1776), which
+        # the connection takes from the recorded pairs.
+        Rest = _decode_sync_pairs(Rest)
     elif Opcode == TNS_SERVER_PIGGYBACK_LTXID:
         (_, Rest) = decode_dalc(Rest)  # logical transaction id
     elif Opcode in (
@@ -6134,7 +6175,9 @@ def encode_dictionary_auth(Dictionary: dict) -> tuple[bytes, bytes]:
         # no oracledb reference to match. The fv >= 23.1 EXT 1 fast-auth path already
         # carries this via _auth_session_kvs.
         if FieldVersion >= FIELD_VERSION_12_1:
-            SessionKvs = encode_kv(b'AUTH_ALTER_SESSION', _local_tz_clause(), 1)
+            SessionKvs = encode_kv(
+                b'AUTH_ALTER_SESSION', _alter_session_clause(Dictionary), 1
+            )
             NumPairs = 2 + SpeedyKeyInd + 1 + ProxyInd + DrcpInd
         else:
             SessionKvs = b''
@@ -6228,6 +6271,17 @@ def _local_tz_clause() -> bytes:
     return f"ALTER SESSION SET TIME_ZONE='{Sign}{Hh:02d}:{Mm:02d}'\x00".encode('utf-8')
 
 
+def _alter_session_clause(Dictionary: dict) -> bytes:
+    # The login's ALTER SESSION: the time zone, and a transaction priority asked
+    # for at connect, " TXN_PRIORITY='low'" as the reference client adds it
+    # (#1776).
+    Clause = _local_tz_clause()
+    if Dictionary.get('txn_priority'):
+        Priority = f" TXN_PRIORITY='{Dictionary['txn_priority']}'"
+        Clause = Clause[:-1] + Priority.encode('utf-8') + b'\x00'
+    return Clause
+
+
 def _auth_session_kv_count(Dictionary: dict) -> int:
     """How many pairs :func:`_auth_session_kvs` will emit.
 
@@ -6283,7 +6337,7 @@ def _auth_session_kvs(Dictionary: dict) -> bytes:
             str(_packed_client_version(_CLIENT_VERSION)).encode('utf-8'),
         )
         + _edition_kv(Dictionary)
-        + encode_kv(b'AUTH_ALTER_SESSION', _local_tz_clause(), 1)
+        + encode_kv(b'AUTH_ALTER_SESSION', _alter_session_clause(Dictionary), 1)
         + encode_kv(b'AUTH_CONNECT_STRING', encode_dictionary_description(Dictionary))
     )
 
@@ -6502,6 +6556,23 @@ def encode_app_context_piggyback(
     Out += _bytes_with_length(Namespace)
     for Key, Value in Entries:
         Out += _obj_two_lengths(Key) + _obj_two_lengths(Value) + encode_sb4(0)
+    return Out
+
+
+def encode_alter_session_piggyback(Seq: int, FieldVersion: int, Priority: str) -> bytes:
+    """Build the ALTER SESSION piggyback (func 204, #1776) that sets the session's
+    transaction priority, the one setting it carries: ``TXN_PRIORITY`` as a
+    single keyword-value pair whose flag is 1 for an empty value, which restores
+    the default. It rides in front of the next call's message once. A server
+    refuses it unless the client declared TNS_DATA_TYPE_ALTSESS. Layout in
+    docs/PROTOCOL.md."""
+    Out = bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_ALTER_SESSION, Seq])
+    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
+        Out += encode_sb4(0)  # ub8 token (0)
+    Out += encode_sb4(0)  # flags
+    Out += bytes([1]) + encode_sb4(1)  # pointer, one key-value pair
+    Out += _obj_two_lengths(b'TXN_PRIORITY') + _obj_two_lengths(Priority.encode())
+    Out += encode_sb4(0 if Priority else 1)
     return Out
 
 
@@ -6885,7 +6956,10 @@ _COMPILE_CAPS = {
             CCAP_TTC4: 0x44,
             CCAP_LOB2: 5,
             CCAP_TTC5: 0x3E,
-            CCAP_FEATURE_BACKPORT2: 2,
+            CCAP_FEATURE_BACKPORT2: (
+                CCAP_FEATURE_BACKPORT2_END_USER_SEC
+                | CCAP_FEATURE_BACKPORT2_TXN_PRIORITY
+            ),
             CCAP_VECTOR_FEATURES: 3,
         },
     ),
@@ -7281,6 +7355,7 @@ _DTY_12C_TYPES = [
     660,
     661,
     665,
+    TNS_DATA_TYPE_ALTSESS,  # needed for the ALTER SESSION piggyback (#1776)
     669,
     670,
 ]
