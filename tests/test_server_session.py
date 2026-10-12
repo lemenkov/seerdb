@@ -694,6 +694,71 @@ def test_skip_piggybacks_walks_the_12c_tracing_and_session_state(attrs: dict) ->
         _DECODE_FIELD_VERSION.reset(token)
 
 
+class _ContextBackend(_DualBackend):
+    # Records what apply_app_context is handed; refuses any namespace but
+    # CLIENTCONTEXT, as 23ai does one the session may not set.
+    def __init__(self) -> None:
+        super().__init__()
+        self.applied: list = []
+
+    def apply_app_context(self, namespace, values):
+        from seerdb.server.backend import BackendError
+
+        if namespace != 'CLIENTCONTEXT':
+            raise BackendError('Invalid NameSpace Value', ora_code=28267)
+        self.applied.append((namespace, values))
+
+
+@pytest.mark.parametrize('field_version', [6, 7, 24])
+def test_skip_piggybacks_applies_an_app_context(field_version: int) -> None:
+    # set_app_context() / clear_app_context() ride the next call as func 154
+    # (#1778). Below field version 12.1 the piggyback has no zero byte before the
+    # namespace; both forms land on the call and reach the backend, a clear as
+    # None.
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, encode_app_context_piggyback
+    from seerdb.server.session import _skip_piggybacks
+
+    body = _exec_body()
+    token = _DECODE_FIELD_VERSION.set(field_version)
+    try:
+        set_ = encode_app_context_piggyback(
+            4, field_version, b'CLIENTCONTEXT', [(b'ATTR1', b'VALUE1'), (b'ATTR2', b'')]
+        )
+        clear = encode_app_context_piggyback(5, field_version, b'CLIENTCONTEXT', [])
+        backend = _ContextBackend()
+        refused: list = []
+        assert _skip_piggybacks(set_ + clear + body, backend, None, refused) == body
+        assert backend.applied == [
+            ('CLIENTCONTEXT', {'ATTR1': 'VALUE1', 'ATTR2': ''}),
+            ('CLIENTCONTEXT', None),
+        ]
+        assert refused == []
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+
+
+def test_skip_piggybacks_reports_a_refused_app_context() -> None:
+    # A namespace the session may not set fails the call behind it; a good one
+    # in the same message is still applied, as 23ai does (#1778).
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, encode_app_context_piggyback
+    from seerdb.server.session import _skip_piggybacks
+
+    body = _exec_body()
+    token = _DECODE_FIELD_VERSION.set(24)
+    try:
+        good = encode_app_context_piggyback(4, 24, b'CLIENTCONTEXT', [(b'A', b'1')])
+        bad = encode_app_context_piggyback(
+            5, 24, b'NOT_A_VALID_NAMESPACE', [(b'a', b'v')]
+        )
+        backend = _ContextBackend()
+        refused: list = []
+        assert _skip_piggybacks(good + bad + body, backend, None, refused) == body
+        assert backend.applied == [('CLIENTCONTEXT', {'A': '1'})]
+        assert [err.ora_code for err in refused] == [28267]
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+
+
 # The close-temp-LOBs piggyback a thin client sent a live 23ai in front of its
 # second large-LOB insert (fv24: the ub8 token follows the sequence byte): a
 # FREE_TEMP | ARRAY over one 40-byte (ub2-prefixed) locator, then `03 04 ...`, the

@@ -144,16 +144,6 @@ PRE_23AI_TESTS: dict[str, str] = {
 OPEN_TICKET_TESTS: dict[str, str] = {}
 for _file, _tests, _reason in (
     # python-oracledb 26 connection APIs the Mirror does not serve yet.
-    (
-        'connection/test_1000_basic.py',
-        ('1063', '1064'),
-        'app context piggyback (#1778)',
-    ),
-    (
-        'connection/test_1100_basic_async.py',
-        ('1160', '1161'),
-        'app context piggyback (#1778)',
-    ),
     ('connection/test_1000_basic.py', ('1065',), 'transaction priority (#1779)'),
     ('connection/test_1100_basic_async.py', ('1162',), 'transaction priority (#1779)'),
 ):

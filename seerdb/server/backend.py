@@ -369,6 +369,14 @@ class Backend(Protocol):
         ONLY from that reply, never by querying (#826). Without it the Mirror
         reports a placeholder id of 0 and no names at all.
 
+    ``apply_app_context(namespace, values) -> None``
+        Set the attributes ``values`` (a dict) of an application context
+        namespace, or clear the namespace when ``values`` is None -- what a
+        client's ``set_app_context()`` / ``clear_app_context()`` sends with its
+        next call (#1778). A namespace the session may not set raises
+        :class:`BackendError` ORA-28267, which fails that call unrun, as a real
+        server does. Without it the change is dropped.
+
     ``describe(sql) -> list[ColumnMeta]``
         Describe a statement without running it, for ``cursor.parse()`` (#826).
         Without it the Mirror runs the query with every bind NULL and drops the
