@@ -8185,8 +8185,10 @@ def _rewrite_index_tables(body: str, tables: dict[str, str]) -> str:
                 args = ''
                 stripped = len(text) - len(text[at:].lstrip())
                 if text.startswith('(', stripped):
+                    # `v.LAST()` is `v.LAST`: empty parentheses add no argument (#1780).
                     close = _matching_paren(text, stripped)
-                    args = ', ' + rewrite(text[stripped + 1 : close])
+                    inner = rewrite(text[stripped + 1 : close]).strip()
+                    args = f', {inner}' if inner else ''
                     at = close + 1
                 call = f'{typ}${kind}({name}{args})'
                 if kind == 'delete':

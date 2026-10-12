@@ -3051,6 +3051,11 @@ def test_a_body_indexes_its_index_by_tables() -> None:
     )
     # A string literal holding the name is no use of it.
     assert _rewrite_index_tables("x := 'a(1)';", tables) == "x := 'a(1)';"
+    # Empty parentheses add no argument: `a.LAST()` is `a.LAST`, as Oracle
+    # takes it -- python-oracledb 26's PKG_TESTRECORDS writes it so (#1780).
+    assert _rewrite_index_tables(
+        'k := a.last(); n := a.COUNT( ); a.DELETE();', tables
+    ) == ('k := pk.t$last(a); n := pk.t$count(a); a := pk.t$delete(a);')
 
 
 def test_an_index_by_tables_methods_run_as_oracles() -> None:
