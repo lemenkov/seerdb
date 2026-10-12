@@ -3112,6 +3112,15 @@ def test_a_body_indexes_its_index_by_tables() -> None:
     assert _rewrite_index_tables(
         'k := a.last(); n := a.COUNT( ); a.DELETE();', tables
     ) == ('k := pk.t$last(a); n := pk.t$count(a); a := pk.t$delete(a);')
+    # An element's field assigned is the element with that field replaced,
+    # made with its other fields NULL when it is not there yet (#1795).
+    assert _rewrite_index_tables(
+        'BEGIN a(k + 1).NumberValue := n * 2; END', tables
+    ) == (
+        'BEGIN a := pk.t$set(a, k + 1, jsonb_populate_record('
+        'CASE WHEN pk.t$exists(a, k + 1) THEN pk.t$get(a, k + 1) END, '
+        "jsonb_build_object('numbervalue', n * 2))); END"
+    )
 
 
 def test_an_index_by_tables_methods_run_as_oracles() -> None:

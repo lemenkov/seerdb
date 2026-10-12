@@ -8210,6 +8210,8 @@ def _index_table_methods(name: str, key: str, element: str) -> str:
 _COLLECTION_METHOD = re.compile(
     r'\s*\.\s*(COUNT|FIRST|LAST|NEXT|PRIOR|EXISTS|DELETE)\b', re.IGNORECASE
 )
+# An element's field assigned, `v(k).f := x`, after the key's closing paren.
+_ELEMENT_FIELD_ASSIGN = re.compile(r'\s*\.\s*([A-Za-z_][\w$#]*)\s*:=')
 # What a statement starts after: where an assignment `v(k) := x` can stand.
 _STATEMENT_START = re.compile(
     r'(?is)(?:^|[;]|\b(?:BEGIN|THEN|ELSE|LOOP|DECLARE|IS|AS)\b)\s*$'
@@ -8261,6 +8263,25 @@ def _rewrite_index_tables(body: str, tables: dict[str, str]) -> str:
                 continue
             close = _matching_paren(text, stripped)
             key = rewrite(text[stripped + 1 : close])
+            field = _ELEMENT_FIELD_ASSIGN.match(text, close + 1)
+            if field is not None and _STATEMENT_START.search(text, 0, found.start()):
+                # `v(k).f := x` (#1795): the element with that one field
+                # replaced -- made, its other fields NULL, when there is no
+                # element k yet, as Oracle makes it.
+                end = _statement_end(text, field.end())
+                end = len(text) if end is None else end
+                value = rewrite(text[field.end() : end]).strip()
+                element = (
+                    f'jsonb_populate_record(CASE WHEN {typ}$exists({name}, {key}) '
+                    f'THEN {typ}$get({name}, {key}) END, '
+                    f"jsonb_build_object('{field.group(1).lower()}', {value}))"
+                )
+                out.append(
+                    text[pos : found.start()]
+                    + f'{name} := {typ}$set({name}, {key}, {element})'
+                )
+                pos = end
+                continue
             assign = re.compile(r'\s*:=').match(text, close + 1)
             if assign is not None and _STATEMENT_START.search(text, 0, found.start()):
                 end = _statement_end(text, assign.end())
