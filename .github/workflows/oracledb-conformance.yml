@@ -70,7 +70,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: oracle/python-oracledb
-          ref: v4.0.2
+          ref: v26.0.1
           path: python-oracledb
 
       # The suite's dependencies come from the suite's own `test` extra rather
@@ -82,9 +82,11 @@ jobs:
       # that happens to have pytest-asyncio installed runs them anyway.
       #
       # oracledb itself stays pinned: it is the referee whose expectations the
-      # number means something against.
+      # number means something against. So does pyarrow, which `[test]` leaves
+      # open: 26.0.0 changed how a DateOffset converts, and six of the suite's
+      # dataframe tests fail with it even directly against 23ai.
       - name: Install
-        run: pip install . "oracledb[test]==4.0.2"
+        run: pip install . "oracledb[test]==26.0.1" "pyarrow==25.0.0"
 
       # Two things the suite's schema script expects that a -slim image does not
       # provide on its own.

@@ -45,37 +45,29 @@ import sys
 # the file is out of scope in full -- not an error-mapping or fidelity gap.
 DENYLIST: dict[str, str] = {
     # Advanced Queuing: a message-broker subsystem, no Mirror surface.
-    'test_2700_aq_dbobject.py': 'Advanced Queuing (AQ)',
-    'test_2800_aq_bulk.py': 'Advanced Queuing (AQ)',
-    'test_7800_aq_raw.py': 'Advanced Queuing (AQ)',
-    'test_7900_aq_raw_async.py': 'Advanced Queuing (AQ)',
-    'test_8200_aq_bulk_async.py': 'Advanced Queuing (AQ)',
-    'test_8300_aq_json.py': 'Advanced Queuing (AQ)',
-    'test_8400_aq_dbobject_async.py': 'Advanced Queuing (AQ)',
-    'test_8500_aq_json_async.py': 'Advanced Queuing (AQ)',
-    # Continuous Query Notification: needs a server->client callback channel.
-    'test_3000_subscription.py': 'Continuous Query Notification (subscriptions)',
+    'aq': 'Advanced Queuing (AQ)',
     # SODA: a document-store API layered on DBMS_SODA, not a wire relay concern.
-    'test_3300_soda_database.py': 'SODA document store',
-    'test_3400_soda_collection.py': 'SODA document store',
+    'soda': 'SODA document store',
+    # Continuous Query Notification: needs a server->client callback channel.
+    'connection/test_1800_subscription.py': 'Continuous Query Notification',
     # Two-phase commit / XA: distributed-transaction coordination.
-    'test_4400_tpc.py': 'Two-phase commit / XA',
-    'test_7400_tpc_async.py': 'Two-phase commit / XA',
+    'connection/test_1400_tpc.py': 'Two-phase commit / XA',
+    'connection/test_1500_tpc_async.py': 'Two-phase commit / XA',
     # External / OS authentication: no password for the Mirror to verify.
-    'test_5000_externalauth.py': 'External / OS authentication',
+    'connection/test_1900_externalauth.py': 'External / OS authentication',
     # Sessionless transactions: a 23ai transaction-portability feature.
-    'test_8700_sessionless_transaction.py': 'Sessionless transactions',
-    'test_8800_sessionless_transaction_async.py': 'Sessionless transactions',
+    'connection/test_1600_sessionless_transaction.py': 'Sessionless transactions',
+    'connection/test_1700_sessionless_transaction_async.py': 'Sessionless transactions',
     # Direct path load: a dedicated bulk-load protocol, not ordinary DML.
-    'test_9600_direct_path_load.py': 'Direct path load',
-    'test_9700_direct_path_load_async.py': 'Direct path load',
+    'connection/test_2000_direct_path_load.py': 'Direct path load',
+    'connection/test_2100_direct_path_load_async.py': 'Direct path load',
 }
 
 # Individual tests that cannot pass through a Mirror **by construction**, in
 # files that otherwise do. Unlike DENYLIST above these are not whole features,
 # so each entry says exactly why it can never go green rather than what has not
-# been built yet -- something merely unimplemented belongs in a ticket and stays
-# red until it is fixed.
+# been built yet -- something merely unimplemented belongs in a ticket, and in
+# OPEN_TICKET_TESTS below until it is fixed.
 #
 # Keep this short. Every line here is a test whose signal is being given up.
 DENYLIST_TESTS: dict[str, str] = {}
@@ -87,40 +79,36 @@ for _test, _reason in (
     # parse count read from v$mystat/v$sesstat counts the Mirror's work as well
     # as the client's. There is no arrangement of the relay that makes these
     # agree: the number the test asserts is a property of a DIRECT connection.
-    ('test_4300_cursor_other.py::test_4322', 'v$mystat round-trip count'),
-    ('test_4300_cursor_other.py::test_4323', 'v$mystat round-trip count'),
-    ('test_4300_cursor_other.py::test_4333', 'v$mystat parse count'),
-    ('test_6300_cursor_other_async.py::test_6315', 'v$mystat round-trip count'),
-    ('test_6300_cursor_other_async.py::test_6316', 'v$mystat round-trip count'),
-    ('test_6300_cursor_other_async.py::test_6322', 'v$mystat parse count'),
+    ('cursor/test_1800_other.py::test_cursor_1822', 'v$mystat round-trip count'),
+    ('cursor/test_1800_other.py::test_cursor_1823', 'v$mystat round-trip count'),
+    ('cursor/test_1800_other.py::test_cursor_1833', 'v$mystat parse count'),
+    ('cursor/test_1900_other_async.py::test_cursor_1915', 'v$mystat round-trip count'),
+    ('cursor/test_1900_other_async.py::test_cursor_1916', 'v$mystat round-trip count'),
+    ('cursor/test_1900_other_async.py::test_cursor_1922', 'v$mystat parse count'),
     # The same thing through the suite's own `round_trip_checker` fixture, which
     # reads the counter before and after and asserts the difference.
-    ('test_1300_cursor_var.py::test_1306', 'round-trip count around a REF cursor'),
     (
-        'test_5800_cursor_var_async.py::test_5806',
+        'data_types/test_1000_cursor.py::test_data_types_1006',
         'round-trip count around a REF cursor',
     ),
     (
-        'test_7000_connection_async_shortcut_methods.py::test_7002',
+        'data_types/test_2600_cursor_async.py::test_data_types_2606',
+        'round-trip count around a REF cursor',
+    ),
+    (
+        'connection/test_1300_shortcut_methods_async.py::test_connection_1302',
         'round-trip count around fetchall(arraysize)',
     ),
     # Same root cause: the count comes from v$temporary_lobs for the session id
     # the CLIENT sees, which is the upstream session the Mirror shares with its
     # own temp-LOB bookkeeping.
-    ('test_1900_lob_var.py::test_1918', 'v$temporary_lobs on a shared session'),
-    ('test_5700_lob_var_async.py::test_5715', 'v$temporary_lobs on a shared session'),
-    # The bed's server is NEWER than the suite's expectation and raises a
-    # different (also correct) code; the Mirror relays it faithfully. Both fail
-    # DIRECTLY against the same server too, which is how they are told apart
-    # from a relay gap -- verified by running the whole suite direct: 2 failed
-    # out of 2134, and these are the two.
     (
-        'test_6400_vector_var.py::test_6430',
-        'server raises ORA-51807, suite wants 51805',
+        'data_types/test_1500_lobs.py::test_data_types_1518',
+        'v$temporary_lobs on a shared session',
     ),
     (
-        'test_7700_sparse_vector.py::test_7734',
-        'server raises a newer vector error code',
+        'data_types/test_2500_lobs_async.py::test_data_types_2515',
+        'v$temporary_lobs on a shared session',
     ),
 ):
     DENYLIST_TESTS[_test] = _reason
@@ -131,12 +119,66 @@ for _test, _reason in (
 # 23ai-class server; with an older one it runs a pipeline's operations one by
 # one, and two with the same SQL share a cursor, so the last one's fetch
 # settings apply to both. 18c and 21c fail these exactly as such a Mirror does
-# (#1615).
+# (#1615). The second three are new in v26 and fail the same way directly
+# against 21c: an operation after a failed one in a continue_on_error pipeline
+# is lost (1215, 1223), and a failing last operation raises StopIteration
+# (1224).
 PRE_23AI_TESTS: dict[str, str] = {
-    f'test_7600_pipelining_async.py::{test}': 'pre-23ai: no real pipelining'
-    for test in ('test_7637', 'test_7645', 'test_7646', 'test_7647', 'test_7648')
+    f'connection/test_1200_pipelining_async.py::test_connection_{n}': reason
+    for n, reason in (
+        ('1237', 'pre-23ai: no real pipelining'),
+        ('1245', 'pre-23ai: no real pipelining'),
+        ('1246', 'pre-23ai: no real pipelining'),
+        ('1247', 'pre-23ai: no real pipelining'),
+        ('1248', 'pre-23ai: no real pipelining'),
+        ('1215', 'pre-23ai: pipeline error handling'),
+        ('1223', 'pre-23ai: pipeline error handling'),
+        ('1224', 'pre-23ai: pipeline error handling'),
+    )
 }
 
+# Tests that fail for a gap with an open ticket, deselected until it is fixed so
+# a run stays clean and a new failure stands out. Each names its ticket; delete
+# the entry in the PR that closes it. OPEN_TICKET_TESTS fail through either
+# Mirror, POSTGRES_OPEN_TICKET_TESTS through a Mirror-over-PostgreSQL only.
+OPEN_TICKET_TESTS: dict[str, str] = {}
+for _file, _tests, _reason in (
+    # python-oracledb 26 connection APIs the Mirror does not serve yet.
+    ('connection/test_1000_basic.py', ('1062',), 'db_unique_name (#1777)'),
+    ('connection/test_1100_basic_async.py', ('1159',), 'db_unique_name (#1777)'),
+    (
+        'connection/test_1000_basic.py',
+        ('1063', '1064'),
+        'app context piggyback (#1778)',
+    ),
+    (
+        'connection/test_1100_basic_async.py',
+        ('1160', '1161'),
+        'app context piggyback (#1778)',
+    ),
+    ('connection/test_1000_basic.py', ('1065',), 'transaction priority (#1779)'),
+    ('connection/test_1100_basic_async.py', ('1162',), 'transaction priority (#1779)'),
+):
+    for _n in _tests:
+        OPEN_TICKET_TESTS[f'{_file}::test_connection_{_n}'] = _reason
+
+POSTGRES_OPEN_TICKET_TESTS: dict[str, str] = {
+    'connection/test_1200_pipelining_async.py::test_connection_1229': (
+        'PL/SQL executemany in a pipeline (#1783)'
+    ),
+    'cursor/test_1200_executemany.py::test_cursor_1234': 'a.last() in PKG_TESTRECORDS (#1780)',
+    'cursor/test_1300_executemany_async.py::test_cursor_1330': (
+        'a.last() in PKG_TESTRECORDS (#1780)'
+    ),
+    'cursor/test_2700_features_12_1.py::test_cursor_2710': 'a.last() in PKG_TESTRECORDS (#1780)',
+    'cursor/test_2700_features_12_1.py::test_cursor_2711': 'a.last() in PKG_TESTRECORDS (#1780)',
+    'cursor/test_2700_features_12_1.py::test_cursor_2712': 'a.last() in PKG_TESTRECORDS (#1780)',
+    'data_types/test_1900_dbobject.py::test_data_types_1937': 'INTERVAL in a %ROWTYPE (#1781)',
+    'data_types/test_3500_dbobject_async.py::test_data_types_3516': (
+        'INTERVAL in a %ROWTYPE (#1781)'
+    ),
+    'data_types/test_2700_vector.py::test_data_types_2730': 'non-finite VECTOR (#1782)',
+}
 
 # Tests that fail through a Mirror-over-PostgreSQL by what PostgreSQL itself is,
 # not by anything the Mirror leaves undone, deselected with --backend postgres.
@@ -144,13 +186,13 @@ PRE_23AI_TESTS: dict[str, str] = {
 POSTGRES_BACKEND_TESTS: dict[str, str] = {
     # PostgreSQL text never holds bytes invalid in UTF-8, which these store
     # through UTL_RAW.CAST_TO_VARCHAR2 and read back with encoding_errors (#1659).
-    'test_3700_var.py::test_3732': 'PostgreSQL text holds no invalid UTF-8',
-    'test_3800_typehandler.py::test_3807': 'PostgreSQL text holds no invalid UTF-8',
+    'cursor/test_2000_var.py::test_cursor_2032': 'PostgreSQL text holds no invalid UTF-8',
+    'hooks/test_1100_typehandler.py::test_hooks_1107': 'PostgreSQL text holds no invalid UTF-8',
     # pgvector's vector, a FLOAT32 VECTOR's storage, holds at most 16000
     # dimensions, where Oracle's holds 65535; these insert 32768 and 65535
     # into a FLOAT32 column (#1734).
-    'test_6400_vector_var.py::test_6428': 'pgvector holds at most 16000 dimensions',
-    'test_7700_sparse_vector.py::test_7724': 'pgvector holds at most 16000 dimensions',
+    'data_types/test_2700_vector.py::test_data_types_2728': 'pgvector holds at most 16000 dimensions',
+    'data_types/test_3000_sparse_vector.py::test_data_types_3024': 'pgvector holds at most 16000 dimensions',
 }
 
 
@@ -214,12 +256,13 @@ def main() -> int:
     ]
     for filename in DENYLIST:
         cmd += ['--ignore', f'tests/{filename}']
-    deselected = dict(DENYLIST_TESTS)
+    deselected = dict(DENYLIST_TESTS) | OPEN_TICKET_TESTS
     major = _server_major(args.dsn, args.user, args.password)
     if major is not None and major < 23:
         deselected.update(PRE_23AI_TESTS)
     if args.backend == 'postgres':
         deselected.update(POSTGRES_BACKEND_TESTS)
+        deselected.update(POSTGRES_OPEN_TICKET_TESTS)
     for test in deselected:
         cmd += ['--deselect', f'tests/{test}']
     cmd += args.pytest_args
