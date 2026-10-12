@@ -144,9 +144,6 @@ PRE_23AI_TESTS: dict[str, str] = {
 OPEN_TICKET_TESTS: dict[str, str] = {}
 
 POSTGRES_OPEN_TICKET_TESTS: dict[str, str] = {
-    'connection/test_1200_pipelining_async.py::test_connection_1229': (
-        'PL/SQL executemany in a pipeline (#1783)'
-    ),
 }
 
 # Tests that fail through a Mirror-over-PostgreSQL by what PostgreSQL itself is,

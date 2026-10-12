@@ -42,6 +42,7 @@ from seerdb.common.sqltext import (
     is_plsql,
     is_reusable_dml,
     placeholder_count,
+    plsql_bind_directions,
 )
 from seerdb.common.tns import (
     _CSFRM_DB,
@@ -169,6 +170,9 @@ from seerdb.common.tns_consts import (
     ORA_UNSUPPORTED_NETWORK_DATATYPE,
     ORA_USER_REQUESTED_CANCEL,
     TNS_APP_CONTEXT_FLAG_CLEAR,
+    TNS_BIND_DIR_INPUT,
+    TNS_BIND_DIR_INPUT_OUTPUT,
+    TNS_BIND_DIR_OUTPUT,
     TNS_CONNECT,
     TNS_DATA,
     TNS_DATA_FLAGS_END_OF_REQUEST,
@@ -809,6 +813,24 @@ def handle_login(
 
     logger.info('login OK: %s', user)
     return user, sqlplus, conn_key, negotiated, session_id
+
+
+def _inferred_directions(sql: str, count: int) -> tuple[int, ...]:
+    # A block's bind directions when the backend cannot ask a server for them
+    # (#1783), as plsql_bind_directions judges them conservatively; none at all
+    # -- every bind IN OUT -- when it cannot judge. They matter beyond the
+    # values: a client pipelining an executemany of a block with an IN OUT bind
+    # re-executes it row by row and walks off its own bind rows, which 23ai
+    # avoids by reporting a RETURNING's INTO target as OUT.
+    directions = plsql_bind_directions(sql, count)
+    if directions is None:
+        return ()
+    codes = {
+        'IN': TNS_BIND_DIR_INPUT,
+        'OUT': TNS_BIND_DIR_OUTPUT,
+        'IN OUT': TNS_BIND_DIR_INPUT_OUTPUT,
+    }
+    return tuple(codes[d] for d in directions)
 
 
 def _txn_priority_hooks(
@@ -3862,9 +3884,12 @@ def _answer_query(
             # the client pipelines, and then walks off the end of its own bind
             # array (#1064).
             block_id = reused_id or cursors.open_dml(sql, request.bind_types)
+            directions = result.bind_directions or _inferred_directions(
+                sql, len(result.out_binds)
+            )
             # Remember the directions with the cursor: the re-execute that id
             # invites carries values only for the binds that send one (#1064).
-            cursors.set_bind_directions(block_id, result.bind_directions)
+            cursors.set_bind_directions(block_id, directions)
             response = encode_out_bind_response_thin(
                 _out_bind_entries(
                     result.out_binds,
@@ -3873,7 +3898,7 @@ def _answer_query(
                     request.bind_arrays,
                     request.bind_types,
                 ),
-                result.bind_directions,
+                directions,
                 cursor_id=block_id,
             )
         # A query carries result columns (even with zero rows); a DDL/DML
