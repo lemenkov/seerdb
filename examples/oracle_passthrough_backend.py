@@ -1055,12 +1055,20 @@ class OraclePassthroughBackend:
                 return
 
     def commit(self) -> None:
+        # The upstream's refusal -- ORA-02091 over a deferred constraint's own
+        # error -- reaches the client as itself, not as a backend fault (#1789).
         if self._conn is not None:
-            self._conn.commit()
+            try:
+                self._conn.commit()
+            except seerdb.DatabaseError as exc:
+                raise _relay_error(exc) from exc
 
     def rollback(self) -> None:
         if self._conn is not None:
-            self._conn.rollback()
+            try:
+                self._conn.rollback()
+            except seerdb.DatabaseError as exc:
+                raise _relay_error(exc) from exc
 
     def close(self) -> None:
         if self._conn is not None:

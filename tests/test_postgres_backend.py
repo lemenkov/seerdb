@@ -1667,6 +1667,45 @@ def test_real_sql_round_trip_postgres() -> None:
     assert rows == [(1, 'alice', Decimal('9.5')), (2, 'bob', -3)]
 
 
+def test_a_refused_commit_is_ora_02091() -> None:
+    # PostgreSQL checks a deferred constraint at COMMIT and rolls back; the
+    # client gets Oracle's ORA-02091 over the constraint's own ORA-00001, not a
+    # backend fault (#1789), and the session carries on.
+    listen, server, result = _start_mirror()
+    conn = _connect(listen.getsockname()[1])
+    try:
+        cur = conn.cursor()
+        cur.execute('drop table if exists t_defer')
+        cur.execute(
+            'create table t_defer (id number constraint t_defer_pk primary key '
+            'deferrable initially deferred)'
+        )
+        conn.autocommit = False
+        cur.execute('insert into t_defer values (1)')
+        cur.execute('insert into t_defer values (1)')
+        with pytest.raises(seerdb.DatabaseError) as raised:
+            conn.commit()
+        cur.execute('select count(*) from t_defer')
+        rows = cur.fetchall()
+        cur.execute('insert into t_defer values (2)')
+        conn.commit()
+        cur.execute('drop table t_defer')
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        server.join(timeout=5)
+        listen.close()
+
+    assert result.get('error') is None, result.get('error')
+    assert raised.value.code == 2091
+    assert str(raised.value).startswith(
+        'ORA-02091: transaction rolled back\nORA-00001: '
+    )
+    assert rows == [(0,)]
+
+
 def test_unsupported_pg_type_is_an_ora_error() -> None:
     # A column type the Mirror can't yet represent (timestamp) is refused with a
     # clean ORA-03001 — the connection stays usable, per the capabilities design.

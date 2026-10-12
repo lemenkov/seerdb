@@ -2437,7 +2437,6 @@ class CursorIntegration(_IntegrationBase):
         # used to drop, reporting success for data that was gone (#1786).
         from seerdb.common.exceptions import DatabaseError
 
-        self._skip_if_mirror("a refused commit's ORA-02091 (#1789)")
         table = 'SEERDB_DEFER'
         try:
             self.cur.execute(f'DROP TABLE {table}')
@@ -9348,10 +9347,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         # Async twin of CursorIntegration's.
         from seerdb.common.exceptions import DatabaseError
 
-        if os.environ.get('SEERDB_TEST_MIRROR'):
-            self.skipTest(
-                "the Mirror does not implement a refused commit's ORA-02091 yet (#1789)"
-            )
         table = 'SEERDB_DEFER_A'
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
             async with Conn.cursor() as Cur:
