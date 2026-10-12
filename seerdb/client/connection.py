@@ -1011,6 +1011,9 @@ class OracleConnect(_ConnectionLogic):
         # whose reply carries neither (#1218).
         self.session_id: int | None = None
         self.serial_num: int | None = None
+        # SYS_CONTEXT('USERENV', 'DB_UNIQUE_NAME'), from the login reply; None
+        # before 10g, whose reply does not carry it (#1774).
+        self.db_unique_name: str | None = None
         # Negotiated TTC field version. Starts at the client's advertised max
         # (the field_version arg; 21.1 by default) and is lowered to the
         # server's during the PRO handshake — min(client, server), see
@@ -1594,8 +1597,8 @@ class OracleConnect(_ConnectionLogic):
             self.send(TNS_DATA, Data)
             return self.handle_login()
         elif Result[0] == TTI_AUTH:
-            # Auth result: (TTI_AUTH, Resp, Ver, SessId, SerialNum)
-            (_, Resp, Ver, SessId, SerialNum) = Result
+            # Auth result: (TTI_AUTH, Resp, Ver, SessId, SerialNum, DbUniqueName)
+            (_, Resp, Ver, SessId, SerialNum, DbUniqueName) = Result
             logger.debug('handle_login: auth result Ver=%s SessId=%s', Ver, SessId)
             if self._token_auth:
                 # Token auth (#125): the server grants the session with no
@@ -1604,6 +1607,7 @@ class OracleConnect(_ConnectionLogic):
                 self.server_version = Ver
                 self.session_id = SessId
                 self.serial_num = SerialNum
+                self.db_unique_name = DbUniqueName
                 self.conn_state = CONN_STATE_AUTHENTICATED
                 logger.debug('handle_login: authenticated (token)')
                 return 0
@@ -1612,6 +1616,7 @@ class OracleConnect(_ConnectionLogic):
                 self.server_version = Ver
                 self.session_id = SessId
                 self.serial_num = SerialNum
+                self.db_unique_name = DbUniqueName
                 self.conn_state = CONN_STATE_AUTHENTICATED
                 logger.debug('handle_login: authenticated')
                 # Negotiation cache (#438): record the fast-auth field version so

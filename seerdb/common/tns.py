@@ -5129,7 +5129,14 @@ def decode_token_rpa(Data: bytes, Acc: tuple) -> tuple:
         # ALTER SYSTEM KILL SESSION names (#1218). A pre-10g reply has neither.
         SessId = _auth_int(dict(KVs).get(b'AUTH_SESSION_ID'))
         SerialNum = _auth_int(dict(KVs).get(b'AUTH_SERIAL_NUM'))
-        return (TTI_AUTH, Resp, Ver, SessId, SerialNum)
+        # The database's unique name, SYS_CONTEXT('USERENV', 'DB_UNIQUE_NAME'):
+        # 21c and later send AUTH_SC_REAL_DBUNIQUE_NAME, 10g to 18c only
+        # AUTH_SC_DBUNIQUE_NAME, with the same value; 8i and 9i neither (#1774).
+        Unique = dict(KVs).get(b'AUTH_SC_REAL_DBUNIQUE_NAME') or dict(KVs).get(
+            b'AUTH_SC_DBUNIQUE_NAME'
+        )
+        DbUniqueName = bytes(Unique).decode('utf-8') if Unique else None
+        return (TTI_AUTH, Resp, Ver, SessId, SerialNum, DbUniqueName)
     else:
         # The 256-bit scheme carries the server's PBKDF2 iteration counts; the
         # client must derive the key with these, not hardcoded defaults (#309).
