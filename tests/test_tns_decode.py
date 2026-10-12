@@ -6196,6 +6196,26 @@ class TestFv2OerError(unittest.TestCase):
         self.assertEqual(code, 942)
         self.assertEqual(msg, 'ORA-00942: table or view does not exist')
 
+    # A live 9.2.0.4 server refusing a COMMIT (a deferred primary key violated,
+    # #1786): the code follows the call status directly, a field earlier than in
+    # the 10g+ OER, and the two-line message comes in the chunked form.
+    REFUSED_COMMIT = bytes.fromhex(
+        '04010102082b000000000000000000000003020df7010100'
+        '02b912010100000700010100000000fe404f52412d30323039'
+        '313a207472616e73616374696f6e20726f6c6c6564206261636b'
+        '0a4f52412d30303030313a20756e6971756520636f6e73747261'
+        '696e74201e2850594f2e50524f42455f44454645525f504b2920'
+        '76696f6c617465640a00'
+    )
+
+    def test_decodes_a_refused_commit(self):
+        from seerdb.common.tns import decode_fv2_oer_error
+
+        code, msg = decode_fv2_oer_error(self.REFUSED_COMMIT)
+        self.assertEqual(code, 2091)
+        assert msg is not None
+        self.assertTrue(msg.startswith('ORA-02091: transaction rolled back\nORA-00001'))
+
     def test_non_oer_is_no_error(self):
         from seerdb.common.tns import decode_fv2_oer_error
 

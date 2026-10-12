@@ -2397,6 +2397,39 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute('SELECT 1 FROM dual')
         self.assertEqual(self.cur.fetchone(), (1,))
 
+    def test_a_refused_commit_raises(self):
+        # A deferred constraint is checked at commit; a violation rolls the
+        # transaction back and says so only in the commit's reply, which commit()
+        # used to drop, reporting success for data that was gone (#1786).
+        from seerdb.common.exceptions import DatabaseError
+
+        self._skip_if_mirror("a refused commit's ORA-02091 (#1789)")
+        table = 'SEERDB_DEFER'
+        try:
+            self.cur.execute(f'DROP TABLE {table}')
+        except DatabaseError as exc:
+            if exc.code != 942:
+                raise
+        self.cur.execute(
+            f'CREATE TABLE {table} (id NUMBER CONSTRAINT {table}_PK PRIMARY KEY '
+            'DEFERRABLE INITIALLY DEFERRED)'
+        )
+        try:
+            self.conn.autocommit = False
+            self.cur.execute(f'INSERT INTO {table} VALUES (1)')
+            self.cur.execute(f'INSERT INTO {table} VALUES (1)')
+            with self.assertRaises(DatabaseError) as raised:
+                self.conn.commit()
+            self.assertEqual(raised.exception.code, 2091)
+            self.cur.execute(f'SELECT COUNT(*) FROM {table}')
+            self.assertEqual(self.cur.fetchone(), (0,))
+            # The session carries on: a good commit and a rollback still work.
+            self.cur.execute(f'INSERT INTO {table} VALUES (2)')
+            self.conn.commit()
+            self.conn.rollback()
+        finally:
+            self.cur.execute(f'DROP TABLE {table}')
+
     def test_db_unique_name_is_the_one_sql_reports(self):
         # Read from the login reply alone, as python-oracledb 26 reads it, and
         # equal to what SQL reports (#1774). Before 10g USERENV has no
@@ -9251,6 +9284,37 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 self.assertEqual(raised.exception.code, 28267)
                 await Cur.execute('SELECT 1 FROM dual')
                 self.assertEqual(await Cur.fetchone(), (1,))
+
+    async def test_a_refused_commit_raises(self):
+        # Async twin of CursorIntegration's.
+        from seerdb.common.exceptions import DatabaseError
+
+        if os.environ.get('SEERDB_TEST_MIRROR'):
+            self.skipTest(
+                "the Mirror does not implement a refused commit's ORA-02091 yet (#1789)"
+            )
+        table = 'SEERDB_DEFER_A'
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await self._drop_async(Cur, table)
+                await Cur.execute(
+                    f'CREATE TABLE {table} (id NUMBER CONSTRAINT {table}_PK '
+                    'PRIMARY KEY DEFERRABLE INITIALLY DEFERRED)'
+                )
+                try:
+                    Conn.autocommit = False
+                    await Cur.execute(f'INSERT INTO {table} VALUES (1)')
+                    await Cur.execute(f'INSERT INTO {table} VALUES (1)')
+                    with self.assertRaises(DatabaseError) as raised:
+                        await Conn.commit()
+                    self.assertEqual(raised.exception.code, 2091)
+                    await Cur.execute(f'SELECT COUNT(*) FROM {table}')
+                    self.assertEqual(await Cur.fetchone(), (0,))
+                    await Cur.execute(f'INSERT INTO {table} VALUES (2)')
+                    await Conn.commit()
+                    await Conn.rollback()
+                finally:
+                    await Cur.execute(f'DROP TABLE {table}')
 
     async def test_db_unique_name_is_the_one_sql_reports(self):
         # Async twin of CursorIntegration's.
