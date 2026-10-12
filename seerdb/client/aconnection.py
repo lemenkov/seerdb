@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 from seerdb.client._conn_logic import (
     _ConnectionLogic,
     _pre10_tier_name_for,
+    _transaction_priority,
     returning_block_error,
     returning_block_request,
     returning_block_result,
@@ -58,6 +59,7 @@ from seerdb.client.dialect import (
     Dialect,
     O8iDialect,
 )
+from seerdb.client.enums import TransactionPriority
 from seerdb.common.crypto import validate
 from seerdb.common.exceptions import (
     DatabaseError,
@@ -87,6 +89,7 @@ from seerdb.common.tns import (
     find_fast_auth_rpa,
     has_long_class_bind,
     max_string_size,
+    recording_session_keywords,
     return_bind_types,
     set_decode_dml_rowcounts,
     set_decode_prev_row,
@@ -184,6 +187,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         fetch_lobs: bool = True,
         driver_name: str | None = None,
         edition: str | None = None,
+        transaction_priority: str | TransactionPriority | None = None,
         field_version: int = FIELD_VERSION_23_4,
         cclass: str | None = None,
         purity: int = PURITY_DEFAULT,
@@ -249,6 +253,12 @@ class AsyncOracleConnect(_ConnectionLogic):
         # The edition this session runs in. A LOGIN-time choice: it rides in the
         # AUTH, not in a later ALTER SESSION (#826).
         self.edition = edition
+        # The transaction priority to log in at (#1776), and the one the server
+        # last reported; a change waits in _txn_priority_pending for the next call.
+        self._txn_priority_requested = _transaction_priority(transaction_priority).value
+        self._txn_priority: str | None = None
+        self._txn_priority_pending: str | None = None
+        self._session_keywords: dict[int, str | None] = {}
         # Token auth (#125), resolved at connect time.
         self.access_token = access_token
         self._token_auth = False
@@ -418,6 +428,10 @@ class AsyncOracleConnect(_ConnectionLogic):
             await self._connect_and_login()
         finally:
             self._connecting = False
+        if self._txn_priority_requested and not self._supports_txn_priority():
+            # The login went without it; refuse rather than run at the default.
+            await self.close()
+            self._require_txn_priority()
         return True
 
     async def _connect_and_login(self) -> None:
@@ -914,7 +928,9 @@ class AsyncOracleConnect(_ConnectionLogic):
     async def _handle_rpa(self, Data: bytes) -> int | None:
         from seerdb.common.tns_consts import TTI_AUTH
 
-        Result = decode_token_rpa(Data, ())
+        with recording_session_keywords(self._session_keywords):
+            Result = decode_token_rpa(Data, ())
+        self._absorb_session_keywords()
         if Result[0] == TTI_SESS:
             # First RPA: auth challenge from the server.
             (_, SessKey, Salt, DerivedSalt, VgenCount, SderCount, VerifierType) = Result
@@ -983,9 +999,11 @@ class AsyncOracleConnect(_ConnectionLogic):
             (Type, Packet) = Received
             if Type != TNS_DATA:
                 raise Exception('Unexpected response type', Type)
-            Result = decode_packet(
-                Packet, Acc, self.field_version, self._server_field_version()
-            )
+            with recording_session_keywords(self._session_keywords):
+                Result = decode_packet(
+                    Packet, Acc, self.field_version, self._server_field_version()
+                )
+            self._absorb_session_keywords()
             if Result != FLUSH_OUT_BINDS:
                 return Result
             # A flush-out-binds request, not a result: echo the token back and
@@ -1134,6 +1152,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             + self._flush_end_user_sec_bytes()  # end-user security ctx (#460)
             + self._flush_app_context_bytes()  # application context (#1775)
             + self._flush_session_state_bytes()  # request boundary (#464)
+            + self._flush_alter_session_bytes()  # transaction priority (#1776)
         )
         Data = encode_dictionary(self._make_dict(DictionaryType.exec, query=QueryDict))
         await self.send(TNS_DATA, Pre + Data)
@@ -1414,6 +1433,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             + self._flush_end_user_sec_bytes()
             + self._flush_app_context_bytes()
             + self._flush_session_state_bytes()
+            + self._flush_alter_session_bytes()  # transaction priority (#1776)
         )
         Data = encode_dictionary(self._make_dict(DictionaryType.exec, query=QueryDict))
         await self.send(TNS_DATA, Pre + Data)
@@ -2150,7 +2170,10 @@ class AsyncOracleConnect(_ConnectionLogic):
             return
         from seerdb.common.tns_consts import TTI_COMMIT
 
-        Pre = self._flush_app_context_bytes()  # application context (#1775)
+        Pre = (
+            self._flush_app_context_bytes()  # application context (#1775)
+            + self._flush_alter_session_bytes()  # transaction priority (#1776)
+        )
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_COMMIT))
         await self.send(TNS_DATA, Pre + Data)
         try:
@@ -2168,7 +2191,10 @@ class AsyncOracleConnect(_ConnectionLogic):
             return
         from seerdb.common.tns_consts import TTI_ROLLBACK
 
-        Pre = self._flush_app_context_bytes()  # application context (#1775)
+        Pre = (
+            self._flush_app_context_bytes()  # application context (#1775)
+            + self._flush_alter_session_bytes()  # transaction priority (#1776)
+        )
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_ROLLBACK))
         await self.send(TNS_DATA, Pre + Data)
         try:
@@ -2183,7 +2209,10 @@ class AsyncOracleConnect(_ConnectionLogic):
             return
         from seerdb.common.tns_consts import TTI_PING
 
-        Pre = self._flush_app_context_bytes()  # application context (#1775)
+        Pre = (
+            self._flush_app_context_bytes()  # application context (#1775)
+            + self._flush_alter_session_bytes()  # transaction priority (#1776)
+        )
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_PING))
         await self.send(TNS_DATA, Pre + Data)
         self._raise_reply_error(await self._handle_response())

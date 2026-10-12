@@ -8081,3 +8081,51 @@ set. seerdb refuses `set_app_context()` / `clear_app_context()` there
 A namespace the session may not set fails the call the piggyback rode in front
 of with ORA-28267, through a break/reset; the session carries on. `CLIENTCONTEXT`
 is the namespace any session may set.
+
+## 42. Transaction priority — ALTER SESSION, function 204 (#1776)
+
+23ai's priority transactions give a session a `TXN_PRIORITY` of `LOW`, `MEDIUM`
+or `HIGH`. A thin client sets it three ways and learns it one way.
+
+**At login** the priority joins the time-zone statement the AUTH carries as
+`AUTH_ALTER_SESSION`: `ALTER SESSION SET TIME_ZONE='+02:00' TXN_PRIORITY='medium'`.
+Only to a server with the feature, which rejects the whole statement otherwise.
+
+**Later** a change rides the next call as an ALTER SESSION piggyback (`0x11`,
+function `0xCC`), once:
+
+```
+11 cc <seq> [ub8 token 0, field version 23.1 ext 1 and up]
+<ub4 flags 0> 01 <ub4 1>               pointer, one key-value pair
+<"TXN_PRIORITY", two lengths> <value, two lengths> <ub4 flag>
+```
+
+The pair's flag is 1 for an empty value, which restores the database default,
+and 0 otherwise. Captured from python-oracledb 26 on 23ai, `'low'`:
+
+```
+11 cc 03 00 00 01 01 01 01 0c 0c 54 58 4e 5f 50 52 49 4f 52 49 54 59 01 03 03 6c 6f 77 00
+```
+
+**The piggyback needs data type 668 (`ALTSESS`) in the client's data-type
+table.** Without it 23ai fails the call with ORA-03115, whatever the client's
+capabilities say: seerdb's capability bytes were byte-for-byte python-oracledb's
+and its table differed by that one entry. python-oracledb added 668 in 26.
+
+**The server reports the priority** as keyword 204 of a SYNC server piggyback
+(`17 05`, the keyword-value pairs also used for sessionless transactions' keyword
+201): at login, after the AUTH reply's own pairs, and on the reply to any call
+that changed it, the piggyback or an `ALTER SESSION SET TXN_PRIORITY` in SQL
+alike. 23ai reports `HIGH` by default, and a value set by the client in the
+case it was sent:
+
+```
+17 05 01 01 10 01 01 16 01 03 03 6c 6f 77 00 01 cc 00
+```
+
+It does so only for a client advertising bit `0x01` of `FEATURE_BACKPORT2`
+(compile capability 45), and advertises the same bit itself when it has the
+feature: 23ai and 26ai send `0x03` there, 18c and 21c have no byte 45. A
+client refuses the feature against a server without the bit, as python-oracledb
+does (DPY-3043). Measured working at seerdb's own field versions down to 12.1
+against 23ai.
