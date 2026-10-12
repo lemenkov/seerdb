@@ -304,6 +304,9 @@ class AsyncOracleConnect(_ConnectionLogic):
         # whose reply carries neither (#1218).
         self.session_id: int | None = None
         self.serial_num: int | None = None
+        # SYS_CONTEXT('USERENV', 'DB_UNIQUE_NAME'), from the login reply; None
+        # before 10g, whose reply does not carry it (#1774).
+        self.db_unique_name: str | None = None
         # Negotiated TTC field version; see OracleConnect for the full note.
         self.field_version = field_version
         self._field_version_requested = field_version  # for the nego-cache retry
@@ -937,12 +940,13 @@ class AsyncOracleConnect(_ConnectionLogic):
             return await self.handle_login()
         elif Result[0] == TTI_AUTH:
             # Second RPA: auth result.
-            (_, Resp, Ver, SessId, SerialNum) = Result
+            (_, Resp, Ver, SessId, SerialNum, DbUniqueName) = Result
             if self._token_auth:
                 # Token auth (#125): no server proof / ConnKey; accept directly.
                 self.server_version = Ver
                 self.session_id = SessId
                 self.serial_num = SerialNum
+                self.db_unique_name = DbUniqueName
                 self.conn_state = CONN_STATE_AUTHENTICATED
                 return 0
             assert self.conn_key is not None
@@ -950,6 +954,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 self.server_version = Ver
                 self.session_id = SessId
                 self.serial_num = SerialNum
+                self.db_unique_name = DbUniqueName
                 self.conn_state = CONN_STATE_AUTHENTICATED
                 if (
                     self.negotiation_cache

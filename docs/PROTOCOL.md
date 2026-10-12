@@ -1116,6 +1116,7 @@ If successful, the server returns TTI_RPA with:
 | `AUTH_MAX_OPEN_CURSORS` | Session's max open cursors (12.1+) |
 | `AUTH_INSTANCENAME`     | Instance name                      |
 | `AUTH_SC_DBUNIQUE_NAME` | Database unique name               |
+| `AUTH_SC_REAL_DBUNIQUE_NAME` | Database unique name (21c+)   |
 | `AUTH_SC_DB_DOMAIN`     | Database domain                    |
 | `AUTH_SC_SERVICE_NAME`  | Service name                       |
 
@@ -1127,6 +1128,15 @@ however correct the session otherwise is — `sys_context('userenv', 'sid')` wil
 happily return the right value in the same breath. Measured on a live 23ai:
 `AUTH_INSTANCENAME` `FREE`, `AUTH_SC_DBUNIQUE_NAME` `FREE`,
 `AUTH_SC_SERVICE_NAME` `freepdb1` (lower case, unlike the others).
+
+The unique name is `sys_context('userenv', 'db_unique_name')`, and it comes in
+two keys (#1774). 21c and 23ai send both `AUTH_SC_DBUNIQUE_NAME` and
+`AUTH_SC_REAL_DBUNIQUE_NAME`; 10g, 11g and 18c send only the first; 8i and 9i
+send neither, and their USERENV has no `DB_UNIQUE_NAME` (ORA-02003). On every
+bed that sends them, the values equal what `sys_context` reports (11g `XE`, 18c and
+21c `XE` from an `XEPDB1` login, 23ai `FREE`). python-oracledb 26 reads only
+the REAL key, so its `db_unique_name` is None on 18c and earlier. seerdb reads
+the REAL key and falls back to the other.
 
 A server sends only the names that apply — one with no domain sends no
 `AUTH_SC_DB_DOMAIN` at all rather than an empty value.

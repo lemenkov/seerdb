@@ -2363,6 +2363,23 @@ class CursorIntegration(_IntegrationBase):
             self.cur.fetchone(), (self.conn.session_id, self.conn.serial_num)
         )
 
+    def test_db_unique_name_is_the_one_sql_reports(self):
+        # Read from the login reply alone, as python-oracledb 26 reads it, and
+        # equal to what SQL reports (#1774). Before 10g USERENV has no
+        # DB_UNIQUE_NAME (ORA-02003), and the login carries none.
+        from seerdb.common.exceptions import DatabaseError
+
+        try:
+            self.cur.execute(
+                "SELECT sys_context('userenv', 'db_unique_name') FROM dual"
+            )
+        except DatabaseError as exc:
+            if exc.code != 2003:
+                raise
+            self.assertIsNone(self.conn.db_unique_name)
+            return
+        self.assertEqual(self.conn.db_unique_name, self.cur.fetchone()[0])
+
     def test_v_session_shows_the_identity_the_client_declared(self):
         # v$session and v$session_connect_info show this session as its login
         # declared it (#1212); the terminal is left out, since a login in the
@@ -9162,6 +9179,23 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 self.assertEqual(
                     await Cur.fetchone(), (Conn.session_id, Conn.serial_num)
                 )
+
+    async def test_db_unique_name_is_the_one_sql_reports(self):
+        # Async twin of CursorIntegration's.
+        from seerdb.common.exceptions import DatabaseError
+
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                try:
+                    await Cur.execute(
+                        "SELECT sys_context('userenv', 'db_unique_name') FROM dual"
+                    )
+                except DatabaseError as exc:
+                    if exc.code != 2003:
+                        raise
+                    self.assertIsNone(Conn.db_unique_name)
+                    return
+                self.assertEqual(Conn.db_unique_name, (await Cur.fetchone())[0])
 
     async def test_v_session_shows_the_identity_the_client_declared(self):
         # Async twin of CursorIntegration's.

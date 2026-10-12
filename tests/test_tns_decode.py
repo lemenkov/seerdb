@@ -3716,8 +3716,11 @@ class TestTnsCommandDecoders(unittest.TestCase):
         Ver = VERSION_11_2_0_2
         # The SID and SERIAL#, as the numbers the captured reply carries (#1218).
         (SessId, SerialNum) = (160, 1725)
+        # AUTH_SC_DBUNIQUE_NAME; an 11g reply has no AUTH_SC_REAL_DBUNIQUE_NAME (#1774).
+        DbUniqueName = 'XE'
         self.assertEqual(
-            decode_token_rpa(Data, None), (TTI_AUTH, Resp, Ver, SessId, SerialNum)
+            decode_token_rpa(Data, None),
+            (TTI_AUTH, Resp, Ver, SessId, SerialNum, DbUniqueName),
         )
 
 
