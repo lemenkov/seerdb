@@ -367,3 +367,89 @@ def is_reusable_dml(SQL: str) -> bool:
     a re-parse; being wrong in the other loses the statement.
     """
     return _REUSABLE_DML_RE.match(strip_non_bind_text(SQL)) is not None
+
+
+# Words a PL/SQL statement starts after, besides `;` (#1783).
+_PLSQL_STATEMENT_STARTS = frozenset(
+    {'BEGIN', 'DECLARE', 'THEN', 'ELSE', 'ELSIF', 'LOOP', 'EXCEPTION'}
+)
+# What opens an embedded SQL statement, whose binds are read but for an INTO's.
+_SQL_STATEMENT_HEADS = frozenset(
+    {'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'SELECT', 'WITH'}
+)
+
+
+def plsql_bind_directions(SQL: str, num_binds: int) -> list[str] | None:
+    """Per bind position of a PL/SQL block, the direction a server would report
+    for it -- 'IN', 'OUT' or 'IN OUT' (#1783). None when it cannot say.
+
+    Conservative by design. A bind is IN where every use only reads it: inside
+    an embedded SQL statement anywhere but its INTO list, or on the right of
+    `:=` outside any parentheses. It is OUT where every use is an embedded SQL
+    statement's INTO target -- `RETURNING ... INTO :b`, `SELECT ... INTO :b` --
+    which is what 23ai reports for one, and where no input can be lost. Anything
+    else is IN OUT: a call argument or an assignment target may be written, and
+    telling a client IN for a written bind loses its value, while IN OUT costs
+    nothing (#1363). A position's binds are its name's occurrences (a block binds
+    each name once); a numbered bind, or a count other than the client's, gives
+    up.
+    """
+    Names = bind_placeholders(SQL, dedupe=True)
+    if len(Names) != num_binds or placeholder_count(SQL) != num_binds:
+        return None
+    Position = {Entry: I for I, Entry in enumerate(Names)}
+    Reads = [False] * num_binds
+    IntoWrites = [False] * num_binds
+    OtherWrites = [False] * num_binds
+    Head: str | None = None  # the current statement's first word
+    AtStart = True
+    IntoSeen = False  # inside an embedded SQL statement's INTO list
+    AfterAssign = False  # past the `:=` of the current statement
+    Depth = 0  # parentheses open since the assignment
+    Prev = ''
+    for T in sql_tokens(SQL):
+        Text = SQL[T.start : T.end]
+        if T.kind in ('space', 'comment'):
+            continue
+        Word = Text.upper() if T.kind == 'word' else ''
+        if Text == ';' or Word in _PLSQL_STATEMENT_STARTS:
+            Head, AtStart, IntoSeen, AfterAssign, Depth = None, True, False, False, 0
+            Prev = Text
+            continue
+        if AtStart:
+            Head, AtStart = (Word or Text), False
+        if Word == 'INTO' and Prev.upper() not in ('INSERT', 'MERGE'):
+            # A RETURNING's or a SELECT's INTO; `INSERT INTO` names a table.
+            IntoSeen = True
+        elif Word == 'FROM':
+            IntoSeen = False  # a SELECT's INTO list ends at its FROM
+        elif Prev == ':' and Text == '=':
+            AfterAssign, Depth = True, 0
+        elif Text == '(':
+            Depth += 1
+        elif Text == ')':
+            Depth -= 1
+        if T.kind == 'bind' and _NAMED_BIND_RE.fullmatch(SQL, T.start, T.end):
+            Name = SQL[T.start + 1 : T.end]
+            Entry = (
+                (Name[1:-1], True) if Name.startswith('"') else (Name.upper(), False)
+            )
+            At = Position[Entry]
+            if Head in _SQL_STATEMENT_HEADS:
+                if IntoSeen:
+                    IntoWrites[At] = True
+                else:
+                    Reads[At] = True
+            elif AfterAssign and Depth == 0:
+                Reads[At] = True
+            else:
+                OtherWrites[At] = True
+        Prev = Text
+    return [
+        'IN OUT'
+        if OtherWrites[I] or (Reads[I] and IntoWrites[I])
+        else 'OUT'
+        if IntoWrites[I]
+        else 'IN'
+        for I in range(num_binds)
+    ]

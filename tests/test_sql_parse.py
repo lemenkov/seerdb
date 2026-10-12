@@ -357,3 +357,63 @@ class TestSqlTokens(unittest.TestCase):
         start = time.perf_counter()
         list(sql_tokens(sql))
         self.assertLess(time.perf_counter() - start, 2.0)
+
+
+class TestPlsqlBindDirections(unittest.TestCase):
+    """The bind directions the Mirror reports for a block a backend cannot ask
+    a server about (#1783): IN only where every use reads, OUT only where every
+    use is an embedded SQL statement's INTO target, IN OUT for the rest."""
+
+    def directions(self, sql: str, count: int):
+        from seerdb.common.sqltext import plsql_bind_directions
+
+        return plsql_bind_directions(sql, count)
+
+    def test_a_returning_into_target_is_out(self):
+        # Measured on 23ai for python-oracledb's test_connection_1229 block.
+        self.assertEqual(
+            self.directions(
+                'begin insert into t (a, b) values (:int_val, :str_val) '
+                'returning a into :out_bind; end;',
+                3,
+            ),
+            ['IN', 'IN', 'OUT'],
+        )
+
+    def test_a_select_into_list_ends_at_from(self):
+        self.assertEqual(
+            self.directions('begin select c into :o from t where id = :i; end;', 2),
+            ['OUT', 'IN'],
+        )
+
+    def test_reads_in_dml_are_in(self):
+        self.assertEqual(
+            self.directions(
+                'begin update t set c = :v where id = :i; '
+                'merge into t using dual on (t.id = :k) when matched then update '
+                'set c = :v; end;',
+                3,
+            ),
+            ['IN', 'IN', 'IN'],
+        )
+
+    def test_what_might_be_written_is_in_out(self):
+        # A call argument, an assignment target, a bind both read and an INTO
+        # target, and one passed to a function on the right of `:=`.
+        self.assertEqual(self.directions('begin p(:a, :b); end;', 2), ['IN OUT'] * 2)
+        self.assertEqual(
+            self.directions('begin :x := :y + 1; end;', 2), ['IN OUT', 'IN']
+        )
+        self.assertEqual(
+            self.directions('begin select c into :o from t where id = :o; end;', 1),
+            ['IN OUT'],
+        )
+        self.assertEqual(self.directions('begin :r := f(:a); end;', 2), ['IN OUT'] * 2)
+        self.assertEqual(
+            self.directions('begin if :a > 0 then :b := :a; end if; end;', 2),
+            ['IN OUT', 'IN OUT'],
+        )
+
+    def test_it_gives_up_on_what_it_cannot_map(self):
+        self.assertIsNone(self.directions('begin :1 := 2; end;', 1))
+        self.assertIsNone(self.directions('begin :a := :b; end;', 3))
