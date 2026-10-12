@@ -166,9 +166,11 @@ from seerdb.common.tns_consts import (
     ORA_UNIQUE_CONSTRAINT_VIOLATED,
     ORA_UNSUPPORTED_NETWORK_DATATYPE,
     ORA_USER_REQUESTED_CANCEL,
+    TNS_APP_CONTEXT_FLAG_CLEAR,
     TNS_CONNECT,
     TNS_DATA,
     TNS_DATA_FLAGS_END_OF_REQUEST,
+    TNS_FUNC_APP_CONTEXT,
     TNS_FUNC_PIPELINE_BEGIN,
     TNS_FUNC_PIPELINE_END,
     TNS_FUNC_REEXECUTE,
@@ -1321,7 +1323,15 @@ def _serve_thin_session(
             and len(body) > 3
         ):
             stream.response_token, _ = decode_ub4(body[3:])
-        body = _skip_piggybacks(body, backend, temp_lobs)  # CLOSE_CURSORS, …
+        refused: list[BackendError] = []
+        body = _skip_piggybacks(body, backend, temp_lobs, refused)  # CLOSE_CURSORS, …
+        if refused and len(body) >= 2 and body[0] == TTI_FUN:
+            # A piggyback the backend refused fails the call behind it, which a
+            # real server then does not run (#1778).
+            stream.write_packet(
+                TNS_DATA, encode_error(refused[0].ora_code, refused[0].ora_message)
+            )
+            continue
         if len(body) < 2 or body[0] != TTI_FUN:
             # Piggyback processing could not reach a call. That is what happens
             # when the message leads with a piggyback the Mirror does not know:
@@ -2212,6 +2222,7 @@ def _skip_piggybacks(
     body: bytes,
     backend: Backend | None = None,
     temp_lobs: _TempLobs | None = None,
+    refused: list[BackendError] | None = None,
 ) -> bytes:
     # A call can be preceded by piggybacks — CLOSE_CURSORS (105), which a client
     # sends to free the cursors it drained on the previous fetch, and, from 12.1
@@ -2223,7 +2234,9 @@ def _skip_piggybacks(
     # module / action / client identifier reach the database behind the Mirror
     # the way they would a real server; the close-temp-LOBs piggyback (96) drops
     # the named buffers from `temp_lobs`. An unknown piggyback is left in place,
-    # so the caller ignores the message rather than mis-parsing it.
+    # so the caller ignores the message rather than mis-parsing it. An error the
+    # backend raises applying an application context (#1778) goes in `refused`,
+    # for the caller to fail the call with.
     while len(body) >= 3 and body[0] == TTI_MSG_TYPE_PIGGYBACK:
         func = body[1]
         rest = body[3:]  # skip the piggyback token, function code, sequence
@@ -2256,6 +2269,18 @@ def _skip_piggybacks(
             _apply_schema(backend, schema)
         elif func == TNS_FUNC_SESSION_STATE:
             _, rest = decode_ub4(rest)  # the requested state (ignored)
+        elif func == TNS_FUNC_APP_CONTEXT:
+            # set_app_context() / clear_app_context() (#1778): one namespace per
+            # piggyback, applied before the call; every one in the message is,
+            # as 23ai applies a good namespace beside a refused one.
+            namespace, values, rest = _parse_app_context_piggyback(rest)
+            apply_ctx = getattr(backend, 'apply_app_context', None) if backend else None
+            if apply_ctx is not None:
+                try:
+                    apply_ctx(namespace, values)
+                except BackendError as err:
+                    if refused is not None:
+                        refused.append(err)
         elif func == TTI_LOBOPS:
             # Close-temp-LOBs (#852): a FREE_TEMP over an array of locators that
             # a client rides out once the temp LOBs it created have gone out of
@@ -2281,6 +2306,42 @@ def _skip_piggybacks(
             break
         body = rest
     return body
+
+
+def _parse_app_context_piggyback(
+    rest: bytes,
+) -> tuple[str, dict[str, str] | None, bytes]:
+    # The func-154 body (the inverse of the client's encode_app_context_
+    # piggyback, docs/PROTOCOL.md §41): pointer, namespace length, pointer,
+    # entry count, flags, a zero byte from field version 12.1, the namespace,
+    # then per entry its key and value (each with two lengths) and a ub4.
+    # Returns the namespace, its values (None for a clear) and the rest.
+    rest = rest[1:]  # pointer
+    _, rest = decode_ub4(rest)  # namespace length, restated below
+    rest = rest[1:]  # entries pointer
+    count, rest = decode_ub4(rest)
+    flags, rest = decode_ub4(rest)
+    if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
+        rest = rest[1:]
+    raw, rest = decode_dalc(rest)
+    namespace = bytes(raw).decode('utf-8')
+    values: dict[str, str] = {}
+    for _ in range(count):
+        key, rest = _two_lengths(rest)
+        value, rest = _two_lengths(rest)
+        _, rest = decode_ub4(rest)
+        values[key] = value
+    return namespace, None if flags & TNS_APP_CONTEXT_FLAG_CLEAR else values, rest
+
+
+def _two_lengths(rest: bytes) -> tuple[str, bytes]:
+    # A value written with two lengths: a ub4 count, then (when non-zero) the
+    # bytes with their own length.
+    length, rest = decode_ub4(rest)
+    if not length:
+        return '', rest
+    raw, rest = decode_dalc(rest)
+    return bytes(raw).decode('utf-8'), rest
 
 
 def _parse_end_to_end_piggyback(rest: bytes) -> tuple[dict[str, str | None], bytes]:

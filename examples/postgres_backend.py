@@ -15343,6 +15343,35 @@ class PostgresBackend:
         except psycopg.Error:
             self._conn.rollback()
 
+    @_while_connected
+    def apply_app_context(self, namespace: str, values: dict[str, str] | None) -> None:
+        """Set or clear an application context namespace mid-session, what a
+        client's set_app_context() / clear_app_context() sends (#1778).
+
+        CLIENTCONTEXT is the only namespace a session can set here: there is no
+        CREATE CONTEXT, so any other is ORA-28267, as 23ai answers a namespace
+        the session may not set. Like set_end_to_end, the setting is made in
+        the session's transaction and not committed -- committing would commit
+        the client's own work -- so a rollback of that transaction undoes it.
+        """
+        if namespace.upper() != 'CLIENTCONTEXT':
+            raise BackendError(
+                'An invalid value was provided for the context namespace.',
+                ora_code=28267,
+            )
+        row = self._conn.execute(
+            "SELECT current_setting('seerdb.app_context', true)"
+        ).fetchone()
+        context = json.loads(row[0]) if row and row[0] else {}
+        prefix = 'CLIENTCONTEXT.'
+        if values is None:
+            context = {k: v for k, v in context.items() if not k.startswith(prefix)}
+        else:
+            context.update({prefix + k.upper(): v for k, v in values.items()})
+        self._conn.execute(
+            "SELECT set_config('seerdb.app_context', %s, false)", (json.dumps(context),)
+        )
+
     def set_end_to_end(self, attrs: dict) -> None:
         """Record the session's tracing attributes (#183).
 

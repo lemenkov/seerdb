@@ -1001,6 +1001,24 @@ class OraclePassthroughBackend:
     # hands over; client_info is spelled clientinfo on the connection.
     _END_TO_END_ATTR = {'client_info': 'clientinfo'}
 
+    def apply_app_context(self, namespace: str, values: dict[str, str] | None) -> None:
+        """Set or clear an application context namespace mid-session (#1778).
+
+        The client's change goes upstream the way the client sent it, as the
+        same piggyback, flushed by a ping so the upstream's verdict -- ORA-28267
+        for a namespace the session may not set -- comes back here, before the
+        call it rode in front of runs.
+        """
+        assert self._conn is not None  # authenticate() ran before this
+        try:
+            if values is None:
+                self._conn.clear_app_context(namespace)
+            else:
+                self._conn.set_app_context(namespace, **values)
+            self._conn.ping()
+        except seerdb.DatabaseError as exc:
+            raise _relay_error(exc) from exc
+
     def set_end_to_end(self, attrs: dict[str, str | None]) -> None:
         # Apply the session's end-to-end tracing attributes (module, action,
         # client_identifier, client_info, dbop) to the upstream connection, so

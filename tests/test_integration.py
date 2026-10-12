@@ -2410,7 +2410,6 @@ class CursorIntegration(_IntegrationBase):
             with self.assertRaises(NotSupportedError):
                 self.conn.set_app_context('CLIENTCONTEXT', ATTR1='VALUE1')
             return
-        self._skip_if_mirror('the application-context piggyback (#1778)')
         query = (
             "SELECT sys_context('CLIENTCONTEXT', 'ATTR1'), "
             "sys_context('CLIENTCONTEXT', 'ATTR2') FROM dual"
@@ -9327,11 +9326,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 with self.assertRaises(NotSupportedError):
                     Conn.set_app_context('CLIENTCONTEXT', ATTR1='VALUE1')
                 return
-            if os.environ.get('SEERDB_TEST_MIRROR'):
-                self.skipTest(
-                    'the Mirror does not implement the application-context '
-                    'piggyback yet (#1778)'
-                )
             query = (
                 "SELECT sys_context('CLIENTCONTEXT', 'ATTR1'), "
                 "sys_context('CLIENTCONTEXT', 'ATTR2') FROM dual"
