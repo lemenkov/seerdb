@@ -46,6 +46,7 @@ from postgres_backend import (  # noqa: E402
     _column_annotations,
     _computed_column_types,
     _declared_columns,
+    _interval_leaf,
     _iot_primary_key,
     _object_column_meta,
     _object_type_oid,
@@ -56,6 +57,7 @@ from postgres_backend import (  # noqa: E402
     _reject_unsupported_ddl_types,
     _several_statements,
     _strip_leading_comments,
+    _tds_scalar,
     _to_interval_ym,
     _translate_admin,
     _translate_binds,
@@ -1548,6 +1550,31 @@ def test_translate_ddl_leaves_non_create_table_unchanged() -> None:
         'UPDATE t SET v = :1 WHERE id = :2',
     ):
         assert _translate_ddl(sql) == sql
+
+
+@pytest.mark.parametrize(
+    ('declared', 'leaf'),
+    [
+        # An INTERVAL attribute's TDS leaf, as 23ai describes each (#1781).
+        ('INTERVAL DAY(2) TO SECOND(6)', '180a0602'),
+        ('INTERVAL DAY(7) TO SECOND(9)', '180a0907'),
+        ('INTERVAL YEAR(2) TO MONTH', '18070002'),
+        ('INTERVAL YEAR(3) TO MONTH', '18070003'),
+    ],
+)
+def test_an_interval_attribute_leaf(declared: str, leaf: str) -> None:
+    found = _interval_leaf(declared)
+    assert found is not None
+    assert found.code.hex() == leaf
+    assert found.newer  # it makes the TDS a version-2 one, as on 23ai
+
+
+def test_an_undeclared_interval_has_oracles_default_precisions() -> None:
+    assert _interval_leaf('NUMBER') is None
+    (ds, ds_name) = _tds_scalar('interval', -1)
+    (ym, ym_name) = _tds_scalar('ora_intervalym', -1)
+    assert (ds.code.hex(), ds_name) == ('180a0602', 'INTERVAL DAY TO SECOND')
+    assert (ym.code.hex(), ym_name) == ('18070002', 'INTERVAL YEAR TO MONTH')
 
 
 @pytest.mark.parametrize(

@@ -4509,6 +4509,10 @@ _BUILTIN_TYPE_OID_BYTE = {
     'NCHAR': 0x1A,  # the same as CHAR's (#1416)
     'BLOB': 0x23,
     'RAW': 0x17,  # measured on 23ai (#1544)
+    # An object type's INTERVAL attribute, measured on 23ai (#1781); a
+    # %ROWTYPE lists none.
+    'INTERVAL DAY TO SECOND': 0x40,
+    'INTERVAL YEAR TO MONTH': 0x3F,
     # Measured on 23ai, each under its own OID (#1423).
     'REAL': 0x0C,
     'DOUBLE PRECISION': 0x0D,
@@ -4545,11 +4549,40 @@ def _declared_leaf(
     if declared is None:
         return None
     (data_type, length, precision) = declared
+    interval = _interval_leaf(data_type)
+    if interval is not None:
+        return interval
     if data_type == 'RAW' and length:
         return _TdsLeaf(b'\x13' + length.to_bytes(2, 'big'))
     if data_type in _FLOAT_ATTRIBUTE_TYPES:
         return _TdsLeaf(bytes([0x05, precision or 0]))
     return _national_leaf(data_type, typmod)
+
+
+# An INTERVAL attribute's leaf, measured on 23ai (#1781): `18`, then `0a` for
+# DAY TO SECOND or `07` for YEAR TO MONTH, the fractional-seconds precision (0
+# for YEAR TO MONTH) and the leading precision -- `18 0a 06 02` for INTERVAL DAY
+# TO SECOND, `18 0a 09 07` for DAY(7) TO SECOND(9), `18 07 00 03` for YEAR(3) TO
+# MONTH. Like a TIMESTAMP's, it makes the TDS a version-2 one.
+_INTERVAL_DS_ATTRIBUTE = re.compile(r'INTERVAL DAY\((\d+)\) TO SECOND\((\d+)\)$')
+_INTERVAL_YM_ATTRIBUTE = re.compile(r'INTERVAL YEAR\((\d+)\) TO MONTH$')
+
+
+def _tds_interval(day_to_second: bool, leading: int, fraction: int) -> _TdsLeaf:
+    kind = 0x0A if day_to_second else 0x07
+    return _TdsLeaf(bytes([0x18, kind, fraction, leading]), newer=True)
+
+
+def _interval_leaf(data_type: str) -> _TdsLeaf | None:
+    # The leaf of an INTERVAL the dictionary records with its precisions, as
+    # 'INTERVAL DAY(7) TO SECOND(9)'; None for any other type.
+    ds = _INTERVAL_DS_ATTRIBUTE.match(data_type)
+    if ds is not None:
+        return _tds_interval(True, int(ds.group(1)), int(ds.group(2)))
+    ym = _INTERVAL_YM_ATTRIBUTE.match(data_type)
+    if ym is not None:
+        return _tds_interval(False, int(ym.group(1)), 0)
+    return None
 
 
 def _tds_chars(code: int, byte_length: int, national: bool) -> _TdsLeaf:
@@ -4604,6 +4637,12 @@ def _tds_scalar(pg_name: str, typmod: int) -> tuple[_TdsLeaf, str]:
         # A table's DATE column (#1316), as a %ROWTYPE attribute: the TDS code
         # alone, nothing after it, measured on 23ai (#1474).
         return (_TdsLeaf(b'\x02'), 'DATE')
+    # An INTERVAL with no recorded declaration: Oracle's default precisions
+    # (#1781). YEAR TO MONTH is its own domain over `interval`.
+    if pg_name == _INTERVALYM_TYPE:
+        return (_tds_interval(False, 2, 0), 'INTERVAL YEAR TO MONTH')
+    if pg_name == 'interval':
+        return (_tds_interval(True, 2, 6), 'INTERVAL DAY TO SECOND')
     raise UnsupportedFeature(f'type shape: {pg_name} has no Oracle attribute type')
 
 
@@ -13369,6 +13408,15 @@ class PostgresBackend:
             ).fetchall()
         }
 
+    def _is_table_rowtype(self, pg_oid: int) -> bool:
+        # Whether a composite is a table's row type, a %ROWTYPE (#1781).
+        row = self._conn.execute(
+            'SELECT c.relkind FROM pg_type t JOIN pg_class c ON c.oid = t.typrelid '
+            'WHERE t.oid = %s',
+            (pg_oid,),
+        ).fetchone()
+        return row is not None and row[0] == 'r'
+
     def _attributes(self, pg_oid: int) -> list[tuple[str, int, int]]:
         # (name, type oid, typmod) of a composite's attributes, in order.
         return self._conn.execute(
@@ -13394,10 +13442,19 @@ class PostgresBackend:
         # whether it is instantiable -- in the order the client reads them.
         rows = []
         declared = self._declared_attribute_types(pg_oid)
+        rowtype = self._is_table_rowtype(pg_oid)
         for position, (attname, atttypid, atttypmod) in enumerate(
             self._attributes(pg_oid), 1
         ):
             kind = self._type_kind(atttypid)
+            if (
+                rowtype
+                and kind is None
+                and self._pg_type_name(atttypid) in ('interval', _INTERVALYM_TYPE)
+            ):
+                # 23ai leaves a table's INTERVAL columns out of its %ROWTYPE's
+                # attribute cursor, while its TDS describes them (#1781).
+                continue
             if atttypid == _XML_OID:
                 # SYS.XMLTYPE, under its own id, as 23ai lists one (#1537).
                 (type_name, owner, toid) = ('XMLTYPE', 'SYS', _XMLTYPE_OID)
