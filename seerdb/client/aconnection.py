@@ -2130,6 +2130,19 @@ class AsyncOracleConnect(_ConnectionLogic):
 
     # ----- transaction control -----
 
+    async def _raise_txn_reply_error(self) -> None:
+        # Raise the error a commit's or rollback's reply carries (#1786). 9i
+        # answers with its short status, whose code the 10g+ decoder reads
+        # from the wrong field, so it goes through the 9i dialect's check.
+        if self.field_version < FIELD_VERSION_10_2:
+            from seerdb.client.dialect import fv2_raise_for_error
+
+            Reply = await self._next_data_packet()
+            if Reply is not False:
+                fv2_raise_for_error(Reply[1], end_of_fetch_ok=False)
+            return
+        self._raise_reply_error(await self._handle_response())
+
     async def commit(self) -> None:
         if self._dialect is not None and CAP_OWN_TXN in self._dialect.capabilities():
             await self._drive(self._dialect.txn_control('COMMIT'))  # 8i: OALL8 stmt
@@ -2140,9 +2153,13 @@ class AsyncOracleConnect(_ConnectionLogic):
         Pre = self._flush_app_context_bytes()  # application context (#1775)
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_COMMIT))
         await self.send(TNS_DATA, Pre + Data)
-        await self._handle_response()
-        # An ordinary commit ends an active sessionless transaction (#133).
-        self._sessionless_txn_active = False
+        try:
+            # A refused commit (a deferred constraint, ORA-02091) is rolled
+            # back by the server, and says so only in this reply (#1786).
+            await self._raise_txn_reply_error()
+        finally:
+            # An ordinary commit ends an active sessionless transaction (#133).
+            self._sessionless_txn_active = False
 
     async def rollback(self) -> None:
         if self._dialect is not None and CAP_OWN_TXN in self._dialect.capabilities():
@@ -2154,8 +2171,10 @@ class AsyncOracleConnect(_ConnectionLogic):
         Pre = self._flush_app_context_bytes()  # application context (#1775)
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_ROLLBACK))
         await self.send(TNS_DATA, Pre + Data)
-        await self._handle_response()
-        self._sessionless_txn_active = False
+        try:
+            await self._raise_txn_reply_error()
+        finally:
+            self._sessionless_txn_active = False
 
     async def ping(self) -> None:
         if self.field_version < FIELD_VERSION_10_2:
