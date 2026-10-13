@@ -14916,9 +14916,11 @@ def _object_oac(oid: bytes, version: int, buffer_size: int) -> bytes:
 
 
 def _encode_object_oac(Obj: 'DbObject') -> bytes:
-    # A populated object value's bind OAC: the buffer size is the image length.
+    # A populated object value's bind OAC. The buffer size is 0, as
+    # python-oracledb sends for every object bind: the image carries its own
+    # length. It was the image length, which every server accepted too (#1806).
     Typ = Obj._dbtype
-    return _object_oac(Typ.oid, Typ.version, len(encode_object_image(Obj)))
+    return _object_oac(Typ.oid, Typ.version, 0)
 
 
 # Fixed buffer size the REF bind OAC advertises (matches the Oracle JDBC thin
