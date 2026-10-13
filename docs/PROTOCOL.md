@@ -1718,17 +1718,21 @@ widest value in each column across all rows), the All8 iteration count is the
 number of rows, and each row's values follow as its own `TTI_RXD` token after
 the OAC block.
 
-Because there is one descriptor per column, **every row's value in that column
-must have the same wire width**. That is not automatic for a temporal column: a
-`datetime` carrying no sub-second part encodes as the 7-byte DATE form and one
-carrying microseconds as the 11-byte TIMESTAMP form, so a batch mixing the two
-sent both widths under one descriptor and the server answered `ORA-01483:
-invalid length for DATE or NUMBER bind variable`. seerdb widens such a column to
-the 11-byte form for every row before sizing the OAC (#1098); the values are
-unchanged, and a DATE column still truncates the sub-second part server-side.
-Aware values are left alone -- widening one would mean inventing a zone for the
-others. This concerns binds whose type
-comes from their values; a bind *declared* TIMESTAMP / LTZ follows §11.4b.
+Because there is one descriptor per column, **every row must fit the type that
+descriptor declares**. That is not automatic for a temporal column. A
+`datetime` with no sub-second part is bound as DATE, and one with microseconds
+as TIMESTAMP. A batch mixing the two was declared by one row's type, and an
+11-byte row under a DATE descriptor made the server answer `ORA-01483: invalid
+length for DATE or NUMBER bind variable`.
+
+seerdb therefore declares such a column TIMESTAMP (#1098). Only the declaration
+widens. Each whole-second row still goes out in the 7-byte form, which a
+TIMESTAMP descriptor takes as §11.4b describes, so the bytes match
+python-oracledb's and a declared bind's (#1805). The values are unchanged, and a
+DATE column still truncates the sub-second part server-side. Aware values are
+left alone: widening one would mean inventing a zone for the others. This
+concerns binds whose type comes from their values; a bind *declared* TIMESTAMP
+or LTZ follows §11.4b.
 
 **LONG-class binds come last** (#705). The server takes a character or RAW bind
 in place only up to its *maximum string size*: 32767 bytes when its runtime
@@ -3233,7 +3237,7 @@ form (#1071); a BC `TIMESTAMP WITH TIME ZONE` is not covered.
 The client binds a `BcDate` too. Declared, it takes the declared type's form.
 Undeclared, it follows a `datetime`'s rule: DATE (`12`, 7 bytes) without a
 fraction, TIMESTAMP (`180`, 11 bytes) with one. An `executemany` column that
-mixes the two is widened to 11 bytes as in §5.4 (#1098). Before #1804 an
+mixes the two is declared TIMESTAMP as in §5.4 (#1098). Before #1804 an
 undeclared one had no OAC and the bind failed before anything was sent.
 
 ### 11.3 TIMESTAMP

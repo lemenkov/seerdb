@@ -356,10 +356,4 @@ def gap(cell: Cell, part: str) -> int | None:
         if cell.seerdb_only and cell.declared == 'DB_TYPE_TIMESTAMP_TZ':
             return None
         return 1806
-    if (
-        cell.context == 'executemany_mixed'
-        and cell.declared is None
-        and part == 'bytes'
-    ):
-        return 1805  # a widened whole-second row keeps its zero fraction
     return None

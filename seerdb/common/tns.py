@@ -10643,27 +10643,28 @@ def encode_dictionary_dty(Dictionary: dict) -> bytes:
 
 
 class _WideDateTime(datetime.datetime):
-    """A datetime that must go out in the 11-byte TIMESTAMP form (#1098).
+    """A datetime whose batch column is declared TIMESTAMP (#1098).
 
-    Width is otherwise chosen per value -- 7 bytes with no sub-second part, 11
-    with one -- but every row of an ARRAY bind has to match the one descriptor
-    the OAC declares. A batch mixing the two sent rows of two widths and the
-    server rejected the call with ORA-01483.
+    The type is otherwise chosen per value -- DATE with no sub-second part,
+    TIMESTAMP with one -- but an ARRAY bind has one OAC per column. A batch
+    mixing the two was declared by one row and the server rejected the call
+    with ORA-01483. Only the declaration widens: a whole-second row still goes
+    out in the 7-byte form, as under any TIMESTAMP descriptor (#1337, #1805).
     """
 
     __slots__ = ()
 
 
 class _WideBcDate(BcDate):
-    """A date before year 1 that must go out in the 11-byte TIMESTAMP form, as
+    """A date before year 1 whose batch column is declared TIMESTAMP, as
     :class:`_WideDateTime` for a ``datetime`` (#1804)."""
 
     __slots__ = ()
 
 
 def _is_wide_datetime(DT: datetime.datetime | BcDate) -> bool:
-    # Does this value take the 11-byte TIMESTAMP form? True when it carries a
-    # sub-second part, or when a batch widened the whole column to match (#1098).
+    # Is this value bound as TIMESTAMP? True when it carries a sub-second part,
+    # or when a batch widened the whole column to match (#1098).
     return DT.microsecond > 0 or isinstance(DT, (_WideDateTime, _WideBcDate))
 
 
@@ -14139,8 +14140,9 @@ def encode_token_rxd(Token: object) -> bytes:
         )
         return bytes([len(Bytes)]) + Bytes
     if isinstance(Token, BcDate):
-        # In the form its OAC announced: TIMESTAMP when wide, else DATE (#1804).
-        Kind = TNS_TYPE_TIMESTAMP if _is_wide_datetime(Token) else TNS_TYPE_DATE
+        # 11 bytes with a fraction, else the 7-byte form, which a TIMESTAMP
+        # descriptor takes too (#1804, #1805).
+        Kind = TNS_TYPE_TIMESTAMP if Token.microsecond else TNS_TYPE_DATE
         return _bytes_with_length(_encode_temporal(Token, Kind))
     raise Exception('Unknown RXD token', Token)
 
@@ -15268,7 +15270,9 @@ def encode_token_datetime(DT: datetime.datetime) -> bytes:
         else:
             HH, MM = divmod(Total, 60)
         return Base + Nanos + bytes([HH + 20, MM + 60])
-    if _is_wide_datetime(DT):
+    # A zero fraction is the 7-byte form, even for a value whose batch is
+    # declared TIMESTAMP (#1805).
+    if DT.microsecond:
         return _encode_date_prefix(DT) + (DT.microsecond * 1000).to_bytes(4, 'big')
     return _encode_date_prefix(DT)
 
