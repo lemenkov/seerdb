@@ -10654,10 +10654,17 @@ class _WideDateTime(datetime.datetime):
     __slots__ = ()
 
 
-def _is_wide_datetime(DT: datetime.datetime) -> bool:
+class _WideBcDate(BcDate):
+    """A date before year 1 that must go out in the 11-byte TIMESTAMP form, as
+    :class:`_WideDateTime` for a ``datetime`` (#1804)."""
+
+    __slots__ = ()
+
+
+def _is_wide_datetime(DT: datetime.datetime | BcDate) -> bool:
     # Does this value take the 11-byte TIMESTAMP form? True when it carries a
     # sub-second part, or when a batch widened the whole column to match (#1098).
-    return DT.microsecond > 0 or isinstance(DT, _WideDateTime)
+    return DT.microsecond > 0 or isinstance(DT, (_WideDateTime, _WideBcDate))
 
 
 def _widen_batch_datetimes(Rows: list) -> list:
@@ -10672,8 +10679,10 @@ def _widen_batch_datetimes(Rows: list) -> list:
         return Rows
     widen = set()
     for J in range(len(Rows[0])):
-        Column = [R[J] for R in Rows if isinstance(R[J], datetime.datetime)]
-        if len(Column) < 2 or any(V.tzinfo is not None for V in Column):
+        Column = [R[J] for R in Rows if isinstance(R[J], (datetime.datetime, BcDate))]
+        if len(Column) < 2 or any(
+            getattr(V, 'tzinfo', None) is not None for V in Column
+        ):
             continue
         Widths = {V.microsecond > 0 for V in Column}
         if len(Widths) > 1:
@@ -10687,6 +10696,10 @@ def _widen_batch_datetimes(Rows: list) -> list:
             V = Row[J]
             if isinstance(V, datetime.datetime) and not isinstance(V, _WideDateTime):
                 Row[J] = _WideDateTime(
+                    V.year, V.month, V.day, V.hour, V.minute, V.second, V.microsecond
+                )
+            elif isinstance(V, BcDate) and not isinstance(V, _WideBcDate):
+                Row[J] = _WideBcDate(
                     V.year, V.month, V.day, V.hour, V.minute, V.second, V.microsecond
                 )
         Out.append(Row)
@@ -14125,6 +14138,10 @@ def encode_token_rxd(Token: object) -> bytes:
             datetime.datetime(Token.year, Token.month, Token.day)
         )
         return bytes([len(Bytes)]) + Bytes
+    if isinstance(Token, BcDate):
+        # In the form its OAC announced: TIMESTAMP when wide, else DATE (#1804).
+        Kind = TNS_TYPE_TIMESTAMP if _is_wide_datetime(Token) else TNS_TYPE_DATE
+        return _bytes_with_length(_encode_temporal(Token, Kind))
     raise Exception('Unknown RXD token', Token)
 
 
@@ -14448,6 +14465,11 @@ def encode_token_oac(Token: object) -> bytes:
             return encode_token_raw(TNS_TYPE_TIMESTAMP, 11, 0, 0, 0)
         return encode_token_raw(TNS_TYPE_DATE, 7, 0, 0, 0)
     if isinstance(Token, datetime.date):
+        return encode_token_raw(TNS_TYPE_DATE, 7, 0, 0, 0)
+    if isinstance(Token, BcDate):
+        # A date before year 1 takes a datetime's undeclared type (#1804).
+        if _is_wide_datetime(Token):
+            return encode_token_raw(TNS_TYPE_TIMESTAMP, 11, 0, 0, 0)
         return encode_token_raw(TNS_TYPE_DATE, 7, 0, 0, 0)
     raise Exception('Unknown OAC token', Token)
 
