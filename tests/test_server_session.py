@@ -29,6 +29,7 @@ from seerdb.common.tns_consts import (
     TNS_ACCEPT,
     TNS_DATA,
     TNS_TYPE_VARCHAR,
+    TTI_END_OF_RESPONSE,
     TTI_FUN,
     TTI_MSG_TYPE_PIGGYBACK,
     TTI_PRO,
@@ -2201,6 +2202,81 @@ def test_sqlplus_10g_is_refused_while_a_thin_10g_client_is_served() -> None:
         sqlplus_field_version(
             _SQLPLUS_10_CAPABILITIES, FIELD_VERSION_12_1, FIELD_VERSION_10_2
         )
+
+
+# The opening of a sqlplus 23.26 login to a Mirror presenting 23ai, captured
+# through tools/capture_proxy.py (#1822); the client's host and user names in
+# the CONNECT are replaced by neutral ones of the same length.
+_SQLPLUS_23_CONNECT = bytes.fromhex(
+    '010d0000010000000140012c0c412000ffff7f080000010000c3004a000014004141035c'
+    '000000000000000000000000000000000000000000000000200000200000000000000000'
+    '0001284445534352495054494f4e3d28434f4e4e4543545f444154413d28534552564943'
+    '455f4e414d453d584529284349443d2850524f4752414d3d73716c706c757340636c6965'
+    '6e74312928484f53543d636c69656e74312928555345523d7573657231292928434f4e4e'
+    '454354494f4e5f49443d586266464658786a567a72675a5964597070615844773d3d2929'
+    '28414444524553533d2850524f544f434f4c3d7463702928484f53543d3132372e302e30'
+    '2e312928504f52543d3135363137292929'
+)
+_SQLPLUS_23_ANO = bytes.fromhex(
+    '00000096062000000000deadbeef008c0000000000040000040003000000000004000517'
+    '1a300000080001002c573ab87e497900120001deadbeef00030000000400040001000100'
+    '02000100030000000000040005171a300000020003e0e100020006fcff00020002000000'
+    '0000040005171a3000000400010011100f000300020000000000040005171a3000000500'
+    '010005040603'
+)
+_SQLPLUS_23_PRO = bytes.fromhex(
+    '000000240600000000000108070605007838365f36342f4c696e757820322e342e787800'
+)
+
+
+def _recv_packet(sock: socket.socket, large: bool) -> bytes:
+    # One TNS packet: the 2-byte length of the legacy header, or the 4-byte one
+    # a >= 315 session switches to after the ACCEPT.
+    head = b''
+    while len(head) < 8:
+        head += sock.recv(8 - len(head))
+    length = int.from_bytes(head[:4] if large else head[:2], 'big')
+    body = b''
+    while len(head) + len(body) < length:
+        body += sock.recv(length - len(head) - len(body))
+    return head + body
+
+
+def test_sqlplus_is_served_without_end_of_response() -> None:
+    # A Mirror presenting 23ai advertises end-of-response in its ACCEPT, and a
+    # thin client waits for the marker from the PRO answer on (#1059). sqlplus
+    # 23.26 refused it on every login reply -- ORA-12699 on the first -- so
+    # its replies go out unmarked: data flags 0, no trailing 0x1d (#1822).
+    from seerdb.common.tns_consts import TNS_DATA_FLAGS_END_OF_RESPONSE
+    from seerdb.server.handshake import TNS_VERSION_23_1
+
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    result: dict = {}
+    server = threading.Thread(
+        target=_run_mirror_at_tns_version,
+        args=(listen, result, TNS_VERSION_23_1),
+        daemon=True,
+    )
+    server.start()
+    client = socket.create_connection(listen.getsockname(), timeout=10)
+    try:
+        client.sendall(_SQLPLUS_23_CONNECT)
+        accept = _recv_packet(client, large=False)
+        assert accept[4] == TNS_ACCEPT
+        for request in (_SQLPLUS_23_ANO, _SQLPLUS_23_PRO):
+            client.sendall(request)
+            reply = _recv_packet(client, large=True)
+            assert reply[4] == TNS_DATA
+            flags = int.from_bytes(reply[8:10], 'big')
+            assert not flags & TNS_DATA_FLAGS_END_OF_RESPONSE, reply.hex()
+            assert reply[-1] != TTI_END_OF_RESPONSE, reply.hex()
+    finally:
+        client.close()
+        server.join(timeout=10)
+        listen.close()
 
 
 def _run_mirror_at_tns_version(listen: socket.socket, result: dict, tns: int) -> None:
