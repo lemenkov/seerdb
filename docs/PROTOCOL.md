@@ -1138,8 +1138,12 @@ bed that sends them, the values equal what `sys_context` reports (11g `XE`, 18c 
 the REAL key, so its `db_unique_name` is None on 18c and earlier. seerdb reads
 the REAL key and falls back to the other.
 
-A server sends only the names that apply — one with no domain sends no
-`AUTH_SC_DB_DOMAIN` at all rather than an empty value.
+A server with no database domain still sends `AUTH_SC_DB_DOMAIN`, with an
+**empty** value: a zero length, which a client reads as `None`. Measured on 10g,
+11g, 18c, 21c, 23ai and 26ai, each with `sys_context('userenv', 'db_domain')`
+NULL. (8i and 9i answer the login differently and send no such pair.) This
+section once said the opposite, and the Mirror left the key out to match;
+it now sends it empty (#1820).
 
 The client validates by decrypting `AUTH_SVR_RESPONSE` with the connection key and checking for the presence of `"SERVER_TO_CLIENT"` in the plaintext.
 
