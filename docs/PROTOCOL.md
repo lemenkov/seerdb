@@ -7480,6 +7480,11 @@ encrypted path) is encrypted + MAC'd. Validated end-to-end: a seerdb client
 (sync and async) connects, authenticates, and queries a `required` Mirror over
 AES256 + SHA256.
 
+An encrypted reply is framed like a plaintext one at its end: when end-of-response
+framing is on, its last fragment carries the `0x2000` END_OF_RESPONSE data flag
+(§1), as 26ai's encrypted replies do, for a client that reads a reply to that flag
+(#1847, #1845).
+
 The classic sqlplus / thick-OCI client also negotiates ANO but stamps version
 `0x00000000`; that path is handled inline by the `deadbeef` dialect (§4.1.1) and
 is unaffected by the stance.

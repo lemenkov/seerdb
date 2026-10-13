@@ -234,3 +234,43 @@ def test_read_packet_keeps_the_data_flags() -> None:
     finally:
         left.close()
         right.close()
+
+
+def test_an_encrypted_reply_flags_its_last_packet() -> None:
+    # Under native encryption the reply's last packet carries END_OF_RESPONSE as
+    # a plaintext reply's does, and 26ai's encrypted ones do, for a client that
+    # reads a reply to that flag (#1847, #1845); only the last one carries it.
+    from seerdb.common.ano_session import AnoChannel
+    from seerdb.common.tns import assemble_packet
+    from seerdb.common.tns_consts import (
+        TNS_DATA_FLAGS_END_OF_RESPONSE,
+        TTI_END_OF_RESPONSE,
+    )
+
+    secret = bytes(range(256))
+    left, right = _pair()
+    try:
+        stream = PacketStream(right, sdu=8192)
+        stream.activate_ano(AnoChannel(17, 5, secret, bytes(16), ClientSide=False))
+        stream.end_of_response = True
+        body = bytes(range(256)) * 80  # 20 KiB: three packets
+        stream.write_packet(TNS_DATA, body)
+        right.shutdown(socket.SHUT_WR)
+        wire = b''
+        while chunk := left.recv(65536):
+            wire += chunk
+        client = AnoChannel(17, 5, secret, bytes(16), ClientSide=True)
+        marks, plain = [], b''
+        while wire:
+            flags = int.from_bytes(wire[8:10], 'big')
+            marks.append(bool(flags & TNS_DATA_FLAGS_END_OF_RESPONSE))
+            flag, _type, packet_body, rest = assemble_packet(wire, 8192)
+            assert packet_body is not None and rest is not None
+            wire = rest
+            plain += client.unwrap(packet_body)
+        assert marks == [False] * (len(marks) - 1) + [True]
+        assert len(marks) == 3
+        assert plain == body + bytes([TTI_END_OF_RESPONSE])
+    finally:
+        left.close()
+        right.close()

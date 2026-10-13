@@ -262,6 +262,16 @@ class PacketStream:
         data: bytes | None = body
         while data is not None:
             packet, data = encode_ano_fragment(data, self.sdu, self._ano, self.large)
+            if data is None and self.end_of_response:
+                # The last fragment carries END_OF_RESPONSE, as the plaintext
+                # path's last packet does and 26ai's encrypted ones do (#1847): a
+                # client reads a reply to that flag (#1845). The data flags follow
+                # the 8-byte header.
+                packet = (
+                    packet[:8]
+                    + struct.pack('>H', TNS_DATA_FLAGS_END_OF_RESPONSE)
+                    + packet[10:]
+                )
             self._sock.sendall(packet)
 
     def send_raw(self, packet: bytes) -> None:
