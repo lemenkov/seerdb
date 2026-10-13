@@ -39,8 +39,9 @@ The repository also contains **the Mirror** (`seerdb.server`) — an experimenta
 (PostgreSQL, SQLite, or a real Oracle) answer Oracle clients such as `sqlplus` or
 a thin driver. It ships in the package but is experimental: unstable, and
 outside the version promise the client keeps. `pip install "seerdb[mirror]"`
-adds what its PostgreSQL backend needs. See the `examples/mirror_over_*.py`
-launchers; its wire details live in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+adds what its PostgreSQL backend needs, and `seerdb-mirror` starts one: see
+[`docs/MIRROR.md`](docs/MIRROR.md). Its wire details live in
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 Everything below describes the client.
 
 What works:
