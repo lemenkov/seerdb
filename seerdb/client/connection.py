@@ -56,6 +56,7 @@ from seerdb.common.tns import (
     encode_pipeline_end,
     encode_tpc_change_state,
     encode_tpc_switch,
+    ends_response,
     exec_oac_signature,
     find_fast_auth_rpa,
     has_long_class_bind,
@@ -977,6 +978,9 @@ class OracleConnect(_ConnectionLogic):
         self._call_abandoned = False
         self._supports_oob = False  # set from the accept (#144)
         self._supports_eor = False  # end-of-response framing (#155/#132)
+        # Set once a reply arrived with its last packet marked END_OF_RESPONSE;
+        # from then on recv() reads every reply to that mark (#1845).
+        self._replies_marked = False
         self._large_packets = False  # 4-byte packet length (#155, ver >= 315)
         # The pre-10g wire dialect selected after login (sans-io generators driven
         # by _drive), or None for the modern 10g→23ai path (#369).
@@ -3686,9 +3690,29 @@ class OracleConnect(_ConnectionLogic):
                     # Native network encryption (#437): each DATA packet's body
                     # is independently encrypted + MAC'd, so decrypt/verify per
                     # packet, before reassembly concatenates the plaintext.
+                    Ends = Type == TNS_DATA and ends_response(Acc)
+                    if Ends:
+                        self._replies_marked = True
                     if Type == TNS_DATA and self._ano is not None and self._ano.active:
                         Body = self._ano.unwrap(Body)
                     if Rest == b'':
+                        if (
+                            Type == TNS_DATA
+                            and self._replies_marked
+                            and not Ends
+                            and not Body.endswith(bytes([TTI_FOB]))
+                        ):
+                            # The server marks the last packet of every reply, and
+                            # this is not it: the reply goes on in packets not read
+                            # yet. Running out of buffered bytes is no end of
+                            # message -- an encrypting server writes packet by
+                            # packet, and stopping here cut large replies short
+                            # (#1845). A flush-out-binds request (`07 00 13`) is
+                            # not marked either, and the server waits for its
+                            # answer, so it is handed on as it is (#697).
+                            Acc = b''
+                            Data = Data + Body
+                            break
                         return (Type, Data + Body)
                     Acc = Rest
                     Data = Data + Body

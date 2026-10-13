@@ -207,6 +207,7 @@ from seerdb.common.tns_consts import (
     TNS_BIND_USE_INDICATORS,
     TNS_CCAP_END_OF_RESPONSE,
     TNS_DATA,
+    TNS_DATA_FLAGS_END_OF_RESPONSE,
     TNS_DATA_FLAGS_MORE,
     TNS_DATA_TYPE_ALTSESS,
     TNS_END_TO_END_ACTION,
@@ -792,6 +793,14 @@ def assemble_packet(
             return (False, None, None, None)
     else:
         raise Exception('Cannot decode packet', Data, Length)
+
+
+def ends_response(Packet: bytes) -> bool:
+    # Whether the DATA packet at the start of ``Packet`` (header included) carries
+    # the END_OF_RESPONSE data flag, which a server that negotiated end-of-response
+    # framing sets on the last packet of every reply (#1845). The data flags
+    # follow the 8-byte header in both header layouts.
+    return bool(int.from_bytes(Packet[8:10], 'big') & TNS_DATA_FLAGS_END_OF_RESPONSE)
 
 
 _REDIRECT_HOST_RE = re.compile(rb'\(HOST\s*=\s*([^)\s]+)\s*\)', re.IGNORECASE)
