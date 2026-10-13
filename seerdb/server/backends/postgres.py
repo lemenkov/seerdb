@@ -1263,6 +1263,41 @@ CREATE OR REPLACE PROCEDURE dbms_session.sleep(seconds double precision)
   LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(seconds); END $$;
 """
 
+# DBMS_APPLICATION_INFO (#1840): the session's module, action and client info,
+# which sqlplus sets as it logs in (`SET_MODULE(:1, NULL)`) and SYS_CONTEXT
+# ('USERENV', 'MODULE' / 'ACTION' / 'CLIENT_INFO') and V$SESSION read back. They
+# are the same settings the tracing piggyback writes (set_end_to_end), a NULL
+# kept as the empty string that SYS_CONTEXT maps back to NULL.
+_DBMS_APPLICATION_INFO_DDL = """
+CREATE SCHEMA IF NOT EXISTS dbms_application_info;
+CREATE OR REPLACE PROCEDURE dbms_application_info.set_module(
+    module_name text, action_name text)
+  LANGUAGE plpgsql AS $$ BEGIN
+    PERFORM set_config('seerdb.module', coalesce(module_name, ''), false);
+    PERFORM set_config('seerdb.action', coalesce(action_name, ''), false);
+  END $$;
+CREATE OR REPLACE PROCEDURE dbms_application_info.set_action(action_name text)
+  LANGUAGE plpgsql AS $$ BEGIN
+    PERFORM set_config('seerdb.action', coalesce(action_name, ''), false);
+  END $$;
+CREATE OR REPLACE PROCEDURE dbms_application_info.set_client_info(client_info text)
+  LANGUAGE plpgsql AS $$ BEGIN
+    PERFORM set_config('seerdb.client_info', coalesce(client_info, ''), false);
+  END $$;
+CREATE OR REPLACE PROCEDURE dbms_application_info.read_module(
+    INOUT module_name text, INOUT action_name text)
+  LANGUAGE plpgsql AS $$ BEGIN
+    module_name := nullif(current_setting('seerdb.module', true), '');
+    action_name := nullif(current_setting('seerdb.action', true), '');
+  END $$;
+CREATE OR REPLACE PROCEDURE dbms_application_info.read_client_info(
+    INOUT client_info text)
+  LANGUAGE plpgsql AS $$ BEGIN
+    client_info := nullif(current_setting('seerdb.client_info', true), '');
+  END $$;
+"""
+
+
 # DBMS_SQL.RETURN_RESULT (#1617): a block hands an open cursor back to its
 # client as an implicit result. orafce's DBMS_SQL has no such procedure. This
 # one names the cursor's portal in a notice, and the backend fetches the rows
@@ -5657,6 +5692,8 @@ _IDIOM_REWRITES: list[
     # 'SESSION_USER') names it; PostgreSQL's own USER is the backend's role,
     # lower case and the same for every account. CREATE / ALTER / DROP USER keep
     # the word, as does a USER that is part of a qualified name or a call.
+    # Described as VARCHAR2(128), as 12.2 and later describe it (11g: 30), so
+    # sqlplus gives its column the width Oracle's does (#1840).
     (
         'user-pseudo-column',
         re.compile(
@@ -5664,7 +5701,9 @@ _IDIOM_REWRITES: list[
             re.IGNORECASE,
         ),
         lambda m: (
-            m.group(0) if m.group(1) else "sys.sys_context('USERENV', 'SESSION_USER')"
+            m.group(0)
+            if m.group(1)
+            else "CAST(sys.sys_context('USERENV', 'SESSION_USER') AS varchar(128))"
         ),
     ),
     # SYSDATE / SYSTIMESTAMP → the session clock (SYSDATE is to-the-second).
@@ -10529,6 +10568,11 @@ class PostgresBackend:
         # DBMS_LOCK.SLEEP / DBMS_SESSION.SLEEP (#1511).
         try:
             self._conn.execute(_DBMS_SLEEP_DDL)
+        except psycopg.Error:
+            self._conn.rollback()
+        # DBMS_APPLICATION_INFO (#1840).
+        try:
+            self._conn.execute(_DBMS_APPLICATION_INFO_DDL)
         except psycopg.Error:
             self._conn.rollback()
         # DBMS_SQL.RETURN_RESULT (#1617).
