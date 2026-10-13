@@ -3855,7 +3855,7 @@ def is_reexecute_oci(payload: bytes) -> bool:
         len(payload) > _OCI_ALL8_IND_OFF + 8
         and payload[0] == TTI_FUN
         and payload[1] == TTI_ALL8
-        and payload[_OCI_ALL8_IND_OFF : _OCI_ALL8_IND_OFF + 8] != oci.OCI_INDICATOR
+        and not oci.pointer_present(payload[_OCI_ALL8_IND_OFF : _OCI_ALL8_IND_OFF + 8])
     )
 
 
@@ -8765,11 +8765,23 @@ _OCI_ALL8_NARROW_12C = _OCI_ALL8_NARROW._replace(
     sql=_OCI_ALL8_NARROW.sql + _OCI_ALL8_12C_GROWTH
 )
 
+# sqlplus 10.2 sends the narrow preamble with 28 bytes fewer between the bind
+# count and the SQL, which starts at 148 in every statement it sent to 10g and
+# 11g; the bind count stays at 71 (#1764). Its pointer fields hold addresses, not
+# the indicator, and an address at 23 can leave bytes at 27 that look like one,
+# so the session's field version says which form it is, as for the 12c growth.
+_OCI_ALL8_10_2 = _OCI_ALL8_NARROW._replace(sql=148)
+
 
 def _oci_all8_layout(payload: bytes) -> _OciAll8Layout:
     """Which OALL8 preamble width ``payload`` carries, as the offsets that depend
     on it. Raises :class:`InterfaceError` when neither shape holds, so a
     differently-shaped message errors rather than yielding a garbage SQL."""
+    if _DECODE_FIELD_VERSION.get() < FIELD_VERSION_11_2:
+        for ind in (_OCI_ALL8_IND_OFF, _OCI_ALL8_IND2_OFF_NARROW):
+            if not oci.pointer_present(payload[ind : ind + 8]):
+                raise InterfaceError(f'OCI OALL8: no pointer at offset {ind}')
+        return _OCI_ALL8_10_2
     if payload[_OCI_ALL8_IND_OFF : _OCI_ALL8_IND_OFF + 8] != oci.OCI_INDICATOR:
         raise InterfaceError(f'OCI OALL8: no indicator at offset {_OCI_ALL8_IND_OFF}')
     for ind2, layout in (
