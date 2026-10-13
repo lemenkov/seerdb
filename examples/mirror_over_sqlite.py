@@ -30,7 +30,6 @@ import sys
 from sqlite_backend import SqliteBackend
 
 import seerdb
-from seerdb.server.backends.oracle_compat import OracleCompatBackend
 from seerdb.server.launcher import accounts
 
 
@@ -44,16 +43,13 @@ def main() -> None:
     # session so a changed password reaches the next login (#515).
     credentials = accounts({'PYO': 'pyo123'}, os.environ.get('MIRROR_USERS'))
     # A fresh SQLite session per client connection (sqlite3 objects are
-    # thread-affine, so the backend must be built inside its own session). The
-    # OracleCompatBackend wrapper answers sqlplus's Oracle session-bootstrap
-    # queries so a real sqlplus reaches its prompt; thin clients pass through it
-    # untouched.
+    # thread-affine, so the backend must be built inside its own session).
+    # SQLite runs no PL/SQL, so this serves thin clients; sqlplus's login
+    # needs a backend that does, such as PostgreSQL (#1840).
     seerdb.serve(
         '127.0.0.1',
         port,
-        backend_factory=lambda: OracleCompatBackend(
-            SqliteBackend(database, credentials=credentials)
-        ),
+        backend_factory=lambda: SqliteBackend(database, credentials=credentials),
     )
 
 

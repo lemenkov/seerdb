@@ -8557,6 +8557,44 @@ def test_an_application_context_reads_back_from_sys_context() -> None:
         backend.close()
 
 
+def test_dbms_application_info_sets_what_sys_context_reads() -> None:
+    # sqlplus names itself as it logs in, BEGIN DBMS_APPLICATION_INFO.SET_MODULE
+    # (:1, NULL); END;, and SYS_CONTEXT('USERENV', 'MODULE' / 'ACTION' /
+    # 'CLIENT_INFO') reads the values back. PostgreSQL answers it itself now that
+    # no shim stands in front of it (#1840); a NULL clears a value.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+
+        def userenv(attribute: str):
+            return backend.execute(
+                "SELECT sys_context('USERENV', :1) FROM dual", [attribute]
+            ).rows[0][0]
+
+        backend.execute(
+            'BEGIN DBMS_APPLICATION_INFO.SET_MODULE(:1, NULL); END;', ['SQL*Plus']
+        )
+        assert (userenv('MODULE'), userenv('ACTION')) == ('SQL*Plus', None)
+        backend.execute("BEGIN dbms_application_info.set_action('load'); END;")
+        backend.execute("BEGIN dbms_application_info.set_client_info('batch 7'); END;")
+        assert (userenv('ACTION'), userenv('CLIENT_INFO')) == ('load', 'batch 7')
+        backend.execute('BEGIN dbms_application_info.set_module(NULL, NULL); END;')
+        assert (userenv('MODULE'), userenv('ACTION')) == (None, None)
+    finally:
+        backend.close()
+
+
+def test_user_is_described_as_oracle_describes_it() -> None:
+    # USER is a VARCHAR2(128) from 12.2 on, and sqlplus sizes its column by
+    # that; PostgreSQL's text would have been described by its value (#1840).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        result = backend.execute('SELECT USER FROM DUAL')
+        assert result.rows == [('PYO',)]
+        assert result.columns[0].max_size == 128
+    finally:
+        backend.close()
+
+
 def test_a_dictionary_from_a_newer_seerdb_is_replaced() -> None:
     # A dictionary view with a column this seerdb does not define -- left by a
     # newer seerdb, or a branch's -- made CREATE OR REPLACE VIEW fail, so the

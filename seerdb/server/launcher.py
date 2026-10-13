@@ -216,18 +216,14 @@ def build(
 
         def postgres_factory() -> Backend:
             # Imported here, so naming another backend needs no psycopg.
-            from seerdb.server.backends.oracle_compat import OracleCompatBackend
             from seerdb.server.backends.postgres import PostgresBackend
 
-            # Behind the sqlplus bootstrap shim; thin clients pass through it.
-            return OracleCompatBackend(
-                PostgresBackend(
-                    conninfo,
-                    credentials=credentials,
-                    translation_report=report,
-                    auth_conninfo=auth_conninfo,
-                    presents=presents,
-                )
+            return PostgresBackend(
+                conninfo,
+                credentials=credentials,
+                translation_report=report,
+                auth_conninfo=auth_conninfo,
+                presents=presents,
             )
 
         return Launch(

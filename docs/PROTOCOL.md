@@ -2130,11 +2130,10 @@ here, versus the thin client-decode path's single indicator byte (§6.5). The
 server pointer (offset 18), the SCN, and an internal sequence counter are
 instance-specific and zeroed; everything else — bind count, define markers, the
 RXD values — is computed, not a captured blob. The single-bind case (the common
-`EXEC :key := N`) reproduces the live reply byte-for-byte. The compatibility shim
-(`seerdb/server/backends/oracle_compat.py`) evaluates the literal `:v := <literal>`
-assignments; a non-Oracle backend cannot run general PL/SQL, but this one idiom
-covers the bind-a-value-then-use-it flow, so a following `SELECT … WHERE k = :v`
-receives the value as an ordinary IN bind (§5.4).
+`EXEC :key := N`) reproduces the live reply byte-for-byte. Over PostgreSQL the
+backend runs the block as PL/pgSQL and returns the assigned values, so a
+following `SELECT … WHERE k = :v` receives the value as an ordinary IN bind
+(§5.4).
 
 **OUT-bind request marker (`fd 01`).** The `EXEC :v := 42` request is an ordinary
 `OALL8` execute carrying the `BEGIN … END;` block and one OAC per bind — but the
