@@ -8133,6 +8133,19 @@ OCI bind descriptor carries, in place of a scalar's `01 <type> 03 00 00 <size>`,
 and the type's 16-byte id, then `ub4 1`. Its IN value is the type's REF `ITEM`
 followed by `01`, twelve zeros and `01 00` — a collection carrying nothing.
 
+A pre-12c sqlplus (10.2, 11.2) writes the same call with three differences
+(#1826):
+- the descriptor has **ten** zeros before `ub4 16` and `ub1 16`, so the id sits at
+  offset 24 from the marker, not 26;
+- the IN value's empty tail has **fourteen** zeros;
+- `:NUMLINES`'s descriptor reads `01 02 01 00 00` (flag `01`, not `03`), and its IN
+  value is the whole 22-byte buffer, `16 c1 06` and then zeros, where 23.26 sends
+  `02 c1 06`. No NUMBER ends in a zero byte (its digits are 1 to 100, a negative's
+  terminator is `0x66`), so the padding is cut.
+
+The Mirror finds the id by its length pair and accepts either tail. Unread, the
+call was refused and `SET SERVEROUTPUT ON` printed nothing.
+
 The reply is the ordinary OCI OUT-bind reply (§36): the 50-byte header with the
 bind count, a **direction marker per bind** — `0x10` OUT, `0x30` IN OUT, the masks
 of the 9i bind prompt (§19.7): `10 30` here, the count being IN OUT, and `10` for
