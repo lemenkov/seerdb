@@ -23,6 +23,7 @@ import asyncio
 import logging
 import socket
 import struct
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal, cast
 
 if TYPE_CHECKING:
@@ -38,6 +39,7 @@ from seerdb.client._conn_logic import (
     returning_block_result,
 )
 from seerdb.client.connection import (
+    _CONTINUATION_SECONDS,
     _CURRENT_SCHEMA_SQL,
     _MAX_REDIRECTS,
     _REDIRECT_CONNECT_ATTEMPTS,
@@ -47,6 +49,7 @@ from seerdb.client.connection import (
     _check_tpc_reply,
     _decode_tpc_context,
     _decode_tpc_state,
+    _Decoded,
     _error_code,
     _normalize_sessionless_txn_id,
     _parse_accept_eor,
@@ -66,6 +69,7 @@ from seerdb.common.exceptions import (
     InterfaceError,
     NotSupportedError,
     OperationalError,
+    Truncated,
 )
 from seerdb.common.sqltext import is_reusable_dml, statement_head
 from seerdb.common.tns import (
@@ -1006,6 +1010,20 @@ class AsyncOracleConnect(_ConnectionLogic):
 
     # ----- response handling -----
 
+    async def _read_continuation(self, Short: Exception) -> bytes:
+        # The next DATA packet of a reply that ran past the bytes read so far,
+        # waited on for at most _CONTINUATION_SECONDS (#1845), as
+        # OracleConnect._read_continuation.
+        try:
+            Received = await asyncio.wait_for(
+                self._next_data_packet(b'', b''), _CONTINUATION_SECONDS
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            raise Short from None
+        if Received is False or Received[0] != TNS_DATA:
+            raise Short
+        return Received[1]
+
     async def _handle_response(self, Acc: tuple | None = None) -> object:
         if Acc is None:
             Acc = (None, None, [])
@@ -1016,10 +1034,27 @@ class AsyncOracleConnect(_ConnectionLogic):
             (Type, Packet) = Received
             if Type != TNS_DATA:
                 raise Exception('Unexpected response type', Type)
-            with recording_session_keywords(self._session_keywords):
-                Result = decode_packet(
-                    Packet, Acc, self.field_version, self._server_field_version()
-                )
+            # As OracleConnect._handle_response: a decode that runs past the
+            # bytes read so far is retried on the reply's next packet (#1845).
+            Rows = Acc[2] if len(Acc) > 2 and isinstance(Acc[2], list) else None
+            Kept = len(Rows) if Rows is not None else 0
+            while True:
+                try:
+                    with recording_session_keywords(self._session_keywords):
+                        Result = decode_packet(
+                            Packet,
+                            Acc,
+                            self.field_version,
+                            self._server_field_version(),
+                        )
+                    break
+                except (Truncated, IndexError) as Short:
+                    # IndexError too: a token decoder that indexes past the end
+                    # rather than saying Truncated; the wait is bounded, so a
+                    # real decode fault still surfaces.
+                    if Rows is not None:
+                        del Rows[Kept:]
+                    Packet += await self._read_continuation(Short)
             self._absorb_session_keywords()
             if Result != FLUSH_OUT_BINDS:
                 return Result
@@ -2079,93 +2114,27 @@ class AsyncOracleConnect(_ConnectionLogic):
         return Row[0]
 
     async def _read_lob_response(self) -> bytes:
-        """Async port of the sync `_read_lob_response`. Same token
-        walk; everything between TTI_LOB content and TTI_OER is RPA
-        metadata we don't decode."""
-        from seerdb.common.tns_consts import (
-            TNS_LONG_LENGTH_INDICATOR,
-            TTI_LOB,
-            TTI_OER,
-        )
+        """Async port of the sync `_read_lob_response`: the reply walked over
+        the bytes received so far and carried on packet by packet (#1845)."""
+        from seerdb.client.connection import _lob_reply_step
 
-        Buffer = b''
+        Out = bytearray()
+        Data = b''
+        Pos = 0
+        Chunked = False
         while True:
             Received = await self._next_data_packet(b'', b'')
             if Received is False:
-                raise InterfaceError('connection closed during LOBOPS response')
+                raise Exception('Connection closed during LOBOPS response')
             (Type, Packet) = Received
             if Type != TNS_DATA:
                 raise Exception('Unexpected LOBOPS response type', Type)
-            Pos = 0
-            OerSeen = False
-            while Pos < len(Packet):
-                Token = Packet[Pos]
-                if Token == TTI_LOB:
-                    Pos += 1
-                    if Pos >= len(Packet):
-                        break
-                    Length = Packet[Pos]
-                    Pos += 1
-                    if Length == 0:
-                        continue
-                    if Length == TNS_LONG_LENGTH_INDICATOR:
-                        # Chunked content. 12.1+ prefixes each chunk with a ub4
-                        # length (terminated by a zero-length chunk); 11g uses a
-                        # single length byte per chunk. Without the 12c+ branch
-                        # the chunk lengths misparse and the LOB read desyncs,
-                        # hanging the next recv (mirrors the sync handler).
-                        if self.field_version >= FIELD_VERSION_12_1:
-                            while Pos < len(Packet):
-                                NLen = Packet[Pos]
-                                Pos += 1
-                                if NLen == 0:
-                                    break
-                                ChunkLen = int.from_bytes(
-                                    Packet[Pos : Pos + NLen], 'big'
-                                )
-                                Pos += NLen
-                                Buffer += Packet[Pos : Pos + ChunkLen]
-                                Pos += ChunkLen
-                        else:
-                            while Pos < len(Packet):
-                                ChunkLen = Packet[Pos]
-                                Pos += 1
-                                if ChunkLen == 0:
-                                    break
-                                Buffer += Packet[Pos : Pos + ChunkLen]
-                                Pos += ChunkLen
-                    else:
-                        Buffer += Packet[Pos : Pos + Length]
-                        Pos += Length
-                elif Token == TTI_OER:
-                    OerSeen = True
-                    break
-                else:
-                    # Likely TTI_RPA carrying the updated locator/amount — skip
-                    # to the trailing OER. Match the stable `04 01 01` prefix as
-                    # well as the historical `04 01 XX 01` form (mirrors sync;
-                    # 12c+ uses the former, so missing it hangs the read).
-                    # call_status is a flag word, not always 1: it reads 2 while
-                    # a transaction is open and 5 after a PL/SQL execute (#712).
-                    # Accept any small value; matching only `04 01 01` left the
-                    # reader waiting for a packet that never came with autocommit off.
-                    Found = -1
-                    for I in range(Pos, len(Packet) - 3):
-                        if (
-                            Packet[I] == TTI_OER
-                            and Packet[I + 1] == 0x01
-                            and (Packet[I + 2] < 0x10 or Packet[I + 3] == 0x01)
-                        ):
-                            Found = I
-                            break
-                    if Found >= 0:
-                        Pos = Found
-                        continue
-                    break
-            if OerSeen:
-                return Buffer
-
-    # ----- transaction control -----
+            Data = Data[Pos:] + Packet
+            (Pos, Chunked, Done) = _lob_reply_step(
+                Data, 0, Out, Chunked, self.field_version >= FIELD_VERSION_12_1
+            )
+            if Done:
+                return bytes(Out)
 
     async def _raise_txn_reply_error(self) -> None:
         # Raise the error a commit's or rollback's reply carries (#1786). 9i
@@ -2689,27 +2658,35 @@ class AsyncOracleConnect(_ConnectionLogic):
             return AsyncQueue(self, name, payload_type=None, is_json=True)
         return AsyncQueue(self, name, payload_type=payload_type)
 
-    async def _aq_request(self, Data: bytes) -> bytes:
+    async def _aq_request(
+        self, Data: bytes, Decode: Callable[[bytes], _Decoded]
+    ) -> _Decoded:
+        # As OracleConnect._aq_request: decode the reply, reading on while the
+        # decode runs past the bytes received (#1845).
         await self.send(TNS_DATA, Data)
         Received = await self._next_data_packet(b'', b'')
         if Received is False:
             raise OperationalError('connection closed during AQ operation')
         (_, Packet) = Received
-        return Packet
+        while True:
+            try:
+                return Decode(Packet)
+            except Truncated as Short:
+                Packet += await self._read_continuation(Short)
 
     async def _aq_enq_one(self, queue, props) -> None:
         from seerdb.client.connection import _decode_aq_enq
         from seerdb.common.tns import encode_aq_enq
 
         Data = encode_aq_enq(self._next_seq(), self.field_version, queue, props)
-        props.msgid = _decode_aq_enq(await self._aq_request(Data))
+        props.msgid = await self._aq_request(Data, _decode_aq_enq)
 
     async def _aq_deq_one(self, queue):
         from seerdb.client.connection import _decode_aq_deq
         from seerdb.common.tns import encode_aq_deq
 
         Data = encode_aq_deq(self._next_seq(), self.field_version, queue)
-        return _decode_aq_deq(await self._aq_request(Data), queue)
+        return await self._aq_request(Data, lambda Reply: _decode_aq_deq(Reply, queue))
 
     async def _aq_enq_many(self, queue, props_list) -> None:
         from seerdb.client.connection import _decode_aq_array
@@ -2724,8 +2701,9 @@ class AsyncOracleConnect(_ConnectionLogic):
             props_list,
             len(props_list),
         )
-        _decode_aq_array(
-            await self._aq_request(Data), queue, TNS_AQ_ARRAY_ENQ, props_list
+        await self._aq_request(
+            Data,
+            lambda Reply: _decode_aq_array(Reply, queue, TNS_AQ_ARRAY_ENQ, props_list),
         )
 
     async def _aq_deq_many(self, queue, max_messages):
@@ -2743,8 +2721,11 @@ class AsyncOracleConnect(_ConnectionLogic):
             Placeholders,
             max_messages,
         )
-        return _decode_aq_array(
-            await self._aq_request(Data), queue, TNS_AQ_ARRAY_DEQ, Placeholders
+        return await self._aq_request(
+            Data,
+            lambda Reply: _decode_aq_array(
+                Reply, queue, TNS_AQ_ARRAY_DEQ, Placeholders
+            ),
         )
 
     async def close(self) -> None:

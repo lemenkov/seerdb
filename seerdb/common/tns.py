@@ -857,6 +857,10 @@ def decode_packet(
     # appears O(1) times per response and dispatches (and may recurse) below with
     # bounded depth.
     while True:
+        if not Data:
+            # A reply ends with its terminal token; running out first means it
+            # goes on in a packet not read yet (#1845).
+            raise Truncated('reply ends before its terminal token')
         Token = Data[0]
         if Token == TTI_RXD:
             (Data, Acc) = _decode_rxd_step(Data, Acc)

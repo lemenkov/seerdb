@@ -75,6 +75,18 @@ All communication is framed into TNS packets. Every packet begins with an 8- or 
 > the real reply flagged `0x2000`). seerdb therefore reads to the flag once a
 > reply has carried it (`_replies_marked`), hands on at once a packet that ends
 > in the FOB token, and reads as before until a flagged reply has arrived.
+>
+> **Below 23ai nothing marks where a reply ends** (no end-of-response framing),
+> so the reader cannot know from the wire alone. There the **decoder** decides
+> (#1845): a reply decode that runs past the bytes read so far raises `Truncated`
+> (the codec's readers do, and `decode_packet` does when it runs out before a
+> terminal token), and the reader then takes the reply's next packet, appends
+> it, and decodes again from the rows it began with. A server writes a reply
+> whole, so a real continuation is already in flight; one that does not arrive
+> within ten seconds is a decode fault and raised, never waited on. The LOB READ
+> reply is walked incrementally instead, a content chunk that straddles packets
+> carried over, so a large LOB is not decoded again per packet. The AQ replies
+> decode the same way as `decode_packet`'s.
 
 For **TNS_DATA** packets (type 6), an additional 2-byte field follows:
 
