@@ -2191,16 +2191,26 @@ _SQLPLUS_10_CAPABILITIES = bytes.fromhex(
 )
 
 
-def test_sqlplus_10g_is_refused_while_a_thin_10g_client_is_served() -> None:
-    # The Mirror serves a thin client from 10g (#814), but sqlplus 10.2 logs in
-    # with an OSESSKEY the OCI path cannot read yet (#1764): it is refused by
-    # name rather than left to fail mid-login, whatever floor the caller sets.
-    from seerdb.common.tns_consts import FIELD_VERSION_10_2, FIELD_VERSION_12_1
+def test_sqlplus_10g_is_served_at_its_own_version() -> None:
+    # sqlplus 10.2 speaks field version 4 and is served at it, as a thin 10g
+    # client is (#814, #1764). The caller's floor still holds: a Mirror that
+    # serves from 11.2 refuses it by name rather than failing mid-login.
+    from seerdb.common.tns_consts import (
+        FIELD_VERSION_10_2,
+        FIELD_VERSION_11_2,
+        FIELD_VERSION_12_1,
+    )
     from seerdb.server.session import sqlplus_field_version
 
-    with pytest.raises(InterfaceError, match='field version 4'):
+    assert (
         sqlplus_field_version(
             _SQLPLUS_10_CAPABILITIES, FIELD_VERSION_12_1, FIELD_VERSION_10_2
+        )
+        == FIELD_VERSION_10_2
+    )
+    with pytest.raises(InterfaceError, match='field version 4'):
+        sqlplus_field_version(
+            _SQLPLUS_10_CAPABILITIES, FIELD_VERSION_12_1, FIELD_VERSION_11_2
         )
 
 
