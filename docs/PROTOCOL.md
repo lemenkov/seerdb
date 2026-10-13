@@ -7248,6 +7248,24 @@ pipelined** — they passed because the fallback is equivalent for them.
    answer, *before* the client has sent the DTY that carries its CCAP opt-in.
    Turning it on after login left the client waiting for a marker the handshake
    replies never carried, and it hung before authenticating.
+
+   More precisely, measured against a live 23ai since (#1822): the reply that
+   carries the marker first is the one to the fast-auth bundle, which opens with
+   the PRO answer. python-oracledb sends nothing before the bundle. A client that
+   negotiates native services first (seerdb's thin client, sqlplus) gets that
+   reply **unmarked**: header flag `0x20`, data flags `0000`, no `0x1d`. A plain
+   PRO answer to seerdb is unmarked too, and the marker starts with the bundle
+   reply. The Mirror advertises end-of-response without fast auth, a combination
+   a real 23ai never produces, so its thin clients take the three-round login
+   and keep the marker from the PRO answer on.
+
+   **sqlplus is served unmarked.** sqlplus 23.26 opts in (`CCAP_TTC4` `0xff`),
+   and a live 23ai marks its replies once fast auth has bundled the login. But
+   on the Mirror's three-round OCI login it refuses a marked reply at every
+   step. The native-services reply draws `ORA-12699`, and each later login reply
+   draws a break. Served without end-of-response, whatever the ACCEPT said, it
+   runs a whole session: queries, DML, a CLOB, `DESCRIBE`, out binds, server
+   output (#1822).
 3. **Nothing may trail the last token.** Without end-of-response the client
    treats the OER as the end of the response and stops; with it, it reads on
    for the marker — python-oracledb:

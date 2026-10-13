@@ -556,6 +556,15 @@ def handle_login(
     # reply dialect (#265). Decide on the PRO request and hold it for the DTY
     # reply so both halves speak one dialect.
     sqlplus = pro_is_sqlplus(first)
+    if sqlplus:
+        # sqlplus is served without end-of-response, whatever the ACCEPT said.
+        # A live 23ai marks its replies to sqlplus only on the fast-auth path
+        # (the reply to the bundle and after); the Mirror's OCI login is the
+        # three-round one, and there sqlplus 23.26 refused a marked reply at
+        # every step -- ORA-12699 on the first, then a break on each one after
+        # -- and runs a whole session unmarked (#1822). Thin clients keep it:
+        # they wait for the marker from the PRO answer on (#1059).
+        stream.end_of_response = False
     stream.send_raw(
         encode_pro_reply(
             sqlplus=sqlplus,
