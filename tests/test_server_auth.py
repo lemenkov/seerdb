@@ -683,6 +683,28 @@ def test_the_osesskey_carries_the_callers_session_identity() -> None:
     }
 
 
+def test_a_long_session_value_is_chunked_at_the_negotiated_width() -> None:
+    # A value over 252 bytes is chunked: ub4 chunk lengths from 12.1, one byte
+    # before. The width came from whatever an earlier connection had left in
+    # the context, so a first login in a fresh one sent 1-byte lengths to a
+    # 12.1+ server and drew ORA-03120 (#1816). A fresh context here is that
+    # first login.
+    import contextvars
+
+    from seerdb.common.tns import encode_dictionary_sess
+    from seerdb.common.tns_consts import FIELD_VERSION_11_2, FIELD_VERSION_12_1
+
+    env = {'user': 'PYO', 'program': 'p' * 253}
+    for fv, chunks in (
+        (FIELD_VERSION_12_1, b'\xfe\x01\x40' + b'p' * 64),
+        (FIELD_VERSION_11_2, b'\xfe\x40' + b'p' * 64),
+    ):
+        payload = contextvars.Context().run(
+            encode_dictionary_sess, {'seq': 1, 'env': env, 'field_version': fv}
+        )
+        assert b'AUTH_PROGRAM_NM\x01\xfd' + chunks in payload
+
+
 def test_the_osesskey_falls_back_to_what_this_process_is() -> None:
     # A caller who sets nothing keeps the previous behaviour exactly: the
     # program is app_name, the osuser is the database user, and the machine is

@@ -12823,6 +12823,20 @@ def find_fast_auth_rpa(Body: bytes) -> int:
 
 
 def encode_dictionary_sess(Dictionary: dict) -> bytes:
+    # A value over 252 bytes is chunked at the negotiated version's width, not
+    # at whatever an earlier connection left in this context (#1816). Set for
+    # this message only, so encoding it changes nothing for anyone else.
+    Version = Dictionary.get('field_version')
+    if not Version:
+        return _encode_dictionary_sess(Dictionary)
+    Token = _ENCODE_FIELD_VERSION.set(Version)
+    try:
+        return _encode_dictionary_sess(Dictionary)
+    finally:
+        _ENCODE_FIELD_VERSION.reset(Token)
+
+
+def _encode_dictionary_sess(Dictionary: dict) -> bytes:
     # The session-identity pairs the server records in v$session: program,
     # machine, terminal and osuser. They are informational -- nothing
     # authenticates on them -- but a client can set each, and they are readable
