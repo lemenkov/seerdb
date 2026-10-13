@@ -12982,6 +12982,25 @@ def _kv8i(Key: bytes, Val: bytes) -> bytes:
     return field(Key) + field(Val) + struct.pack('>I', 0)
 
 
+# The longest value an 8i key-value field can carry: its ub1 length stops at
+# 252, as 253 to 255 are the TTC escape, long-form and NULL markers. Measured on
+# 8.1.7: a 253- or 255-byte program name failed the login, a 254-byte one broke
+# its reply, and anything longer cannot be written at all (#1773).
+_O8I_INFO_VALUE_MAX = 252
+
+
+def _o8i_info_pairs(Pairs: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
+    # The informational pairs cut to what the field can carry, on a UTF-8
+    # character boundary. Nothing is lost that the server keeps: 8.1.7 stores the
+    # first 64 characters of a program name, whatever was sent.
+    return [
+        (Key, Val[:_O8I_INFO_VALUE_MAX].decode('utf-8', 'ignore').encode('utf-8'))
+        if len(Val) > _O8I_INFO_VALUE_MAX
+        else (Key, Val)
+        for Key, Val in Pairs
+    ]
+
+
 def encode_o3logon_osesskey_phase1(
     Seq: int, User: bytes, Pairs: list[tuple[bytes, bytes]]
 ) -> bytes:
@@ -12998,7 +13017,7 @@ def encode_o3logon_osesskey_phase1(
         + bytes([1])  # has-username
         + bytes([len(User)])
         + User
-        + b''.join(_kv8i(k, v) for k, v in Pairs)
+        + b''.join(_kv8i(k, v) for k, v in _o8i_info_pairs(Pairs))
     )
 
 
@@ -13018,7 +13037,7 @@ def encode_o3logon_oauth_phase2(
         + bytes([len(User)])
         + User
         + _kv8i(b'AUTH_PASSWORD', PwdField)
-        + b''.join(_kv8i(k, v) for k, v in Pairs)
+        + b''.join(_kv8i(k, v) for k, v in _o8i_info_pairs(Pairs))
     )
 
 

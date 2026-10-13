@@ -5315,7 +5315,21 @@ default and wrongly takes the fv24 fast-auth path).
 
 **Pre-10g key-value coding.** Each `AUTH_` pair is `ub1(len) ub4be(len) <data>`
 for the key, the same for the value, then a `ub4be` padding word — distinct from
-the modern variable-length `encode_sb4` form. The two-phase exchange:
+the modern variable-length `encode_sb4` form.
+
+The `ub1` caps a value at **252 bytes**, because 253, 254 and 255 are the TTC
+escape, long-form and NULL markers. Measured on 8.1.7 with `AUTH_PROGRAM_NM`:
+
+| value length | 8.1.7 |
+|---|---|
+| up to 252 | logs in; `v$session.program` keeps the first 64 characters |
+| 253, 255 | the login fails |
+| 254 | the reply comes back broken |
+
+seerdb cuts a longer informational value (program, machine, pid) to 252 bytes on
+a character boundary. The server keeps the same 64 characters either way (#1773).
+
+The two-phase exchange:
 
 | Phase | Client `TTI_FUN` | Carries | Server `TTI_RPA` (08) |
 |-------|------------------|---------|-----------------------|
