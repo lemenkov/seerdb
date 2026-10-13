@@ -366,6 +366,97 @@ class TestFv2BindSizeGate(unittest.TestCase):
         _check_fv2_bind_sizes([])
 
 
+def _reply_packet(body: bytes, last: bool) -> bytes:
+    from seerdb.common.tns import encode_data_packet
+    from seerdb.common.tns_consts import TNS_DATA_FLAGS_END_OF_RESPONSE
+
+    return encode_data_packet(body, TNS_DATA_FLAGS_END_OF_RESPONSE if last else 0)
+
+
+class TestReadsToTheEndOfAResponse(unittest.TestCase):
+    # A reply arriving one packet per read -- as an encrypting server writes it
+    # -- is read to the packet marked END_OF_RESPONSE, not cut where the bytes
+    # read so far happen to end (#1845). A server that never marks its replies
+    # keeps the old behaviour, so nothing waits for a mark that never comes.
+    REPLY = [(b'one', False), (b'two', False), (b'three', True)]
+
+    def _sync_recv(self, packets: list[tuple[bytes, bool]]) -> bytes:
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        con = OracleConnect()
+        con.sock = ours
+
+        def write_one_per_read():
+            for body, last in packets:
+                theirs.sendall(_reply_packet(body, last))
+                time.sleep(0.05)
+
+        threading.Thread(target=write_one_per_read, daemon=True).start()
+        con._replies_marked = True  # an earlier reply carried the mark
+        received = con.recv(b'', b'')
+        assert received is not False
+        return received[1]
+
+    def test_a_marked_reply_is_read_to_its_last_packet(self):
+        self.assertEqual(self._sync_recv(self.REPLY), b'onetwothree')
+
+    def test_the_first_marked_reply_turns_reading_to_the_mark_on(self):
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        con = OracleConnect()
+        con.sock = ours
+        theirs.sendall(_reply_packet(b'login', True))
+        self.assertEqual(con.recv(b'', b''), (6, b'login'))
+        self.assertTrue(con._replies_marked)
+
+    def test_a_flush_out_binds_request_is_handed_on_unmarked(self):
+        # A failing RETURNING makes the server send `07 00 13` -- a flush-out-binds
+        # request, not marked END_OF_RESPONSE -- and wait for the client's answer;
+        # reading on for the mark deadlocked the two (#697, #1845).
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        con = OracleConnect()
+        con.sock = ours
+        con._replies_marked = True
+        theirs.sendall(_reply_packet(b'\x07\x00\x13', False))
+        ours.settimeout(5)
+        self.assertEqual(con.recv(b'', b''), (6, b'\x07\x00\x13'))
+
+    def test_a_server_that_never_marks_is_read_as_before(self):
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        con = OracleConnect()
+        con.sock = ours
+        theirs.sendall(_reply_packet(b'whole', False))
+        self.assertEqual(con.recv(b'', b''), (6, b'whole'))
+
+    def test_the_async_connection_reads_to_the_mark_too(self):
+        from seerdb.client.aconnection import AsyncOracleConnect
+
+        async def run() -> bytes:
+            con = AsyncOracleConnect(host='x', port=1, user='u', password='p')
+            reader = asyncio.StreamReader()
+            con._reader = reader
+            con._replies_marked = True
+
+            async def write_one_per_read():
+                for body, last in self.REPLY:
+                    reader.feed_data(_reply_packet(body, last))
+                    await asyncio.sleep(0.02)
+
+            writer = asyncio.ensure_future(write_one_per_read())
+            received = await con.recv(b'', b'')
+            await writer
+            assert received is not False
+            return received[1]
+
+        self.assertEqual(asyncio.run(run()), b'onetwothree')
+
+
 class TestConnection(unittest.TestCase):
     def test_empty_credentials_rejected(self):
         # Connecting with the default empty username/password must not silently

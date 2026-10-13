@@ -56,6 +56,25 @@ All communication is framed into TNS packets. Every packet begins with an 8- or 
 > bearing for request **pipelining** (#132), where several responses are stacked
 > in one stream and the 29 marks where each ends. `_supports_eor` records the
 > negotiation; `decode_packet` treats token 29 as a terminator.
+>
+> **The last packet is flagged too (#1845).** Such a server also sets the
+> `0x2000` data flag (`TNS_DATA_FLAGS_END_OF_RESPONSE`) on the **last DATA
+> packet** of a response; the packets before it carry `0x0000`, with no MORE
+> flag. A large reply is many such packets, and nothing else on the wire says
+> the message goes on: captured from 26ai with native encryption, a 51,200-character
+> CLOB read is 12 packets of 8,156 bytes, flags `0x0000`, then one of 5,340
+> bytes flagged `0x2000`. A reader must therefore read to that flag. Stopping
+> wherever the bytes read so far end loses the rest whenever a read happens to
+> end on a packet boundary. That is rare against a plaintext server, which writes
+> a reply in one go, and the norm against an encrypting one, which writes packet
+> by packet. Not every reply is flagged: 23ai starts with the fast-auth bundle
+> reply, so the login's earlier replies are not. Nor is a **flush-out-binds
+> request** (`07 00 13`, §6.9): the server sends it unflagged in the middle of a
+> call and waits for the client's answer, so a reader still waiting for the flag
+> deadlocks with it (captured from 23ai: the request with flags `0x0000`, then
+> the real reply flagged `0x2000`). seerdb therefore reads to the flag once a
+> reply has carried it (`_replies_marked`), hands on at once a packet that ends
+> in the FOB token, and reads as before until a flagged reply has arrived.
 
 For **TNS_DATA** packets (type 6), an additional 2-byte field follows:
 

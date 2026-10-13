@@ -85,6 +85,7 @@ from seerdb.common.tns import (
     encode_pipeline_end,
     encode_tpc_change_state,
     encode_tpc_switch,
+    ends_response,
     exec_oac_signature,
     find_fast_auth_rpa,
     has_long_class_bind,
@@ -288,6 +289,8 @@ class AsyncOracleConnect(_ConnectionLogic):
         self._call_abandoned = False
         self._supports_oob = False  # set from the accept (#144)
         self._supports_eor = False  # end-of-response (#155/#132)
+        # As OracleConnect._replies_marked (#1845).
+        self._replies_marked = False
         self._large_packets = False  # 4-byte framing (#155, >=315)
         # Pre-10g wire dialect selected after login (sans-io, driven by _drive),
         # or None for the modern path (#369).
@@ -547,9 +550,23 @@ class AsyncOracleConnect(_ConnectionLogic):
                     # Native network encryption (#437): each DATA packet's body is
                     # independently encrypted + MAC'd, so decrypt/verify per packet
                     # before reassembly concatenates the plaintext.
+                    Ends = Type == TNS_DATA and ends_response(Acc)
+                    if Ends:
+                        self._replies_marked = True
                     if Type == TNS_DATA and self._ano is not None and self._ano.active:
                         Body = self._ano.unwrap(Body)
                     if Rest == b'':
+                        if (
+                            Type == TNS_DATA
+                            and self._replies_marked
+                            and not Ends
+                            and not Body.endswith(bytes([TTI_FOB]))
+                        ):
+                            # Not the reply's last packet, nor a flush-out-binds
+                            # request: read on (#1845), as OracleConnect.recv does.
+                            Acc = b''
+                            Data = Data + Body
+                            break
                         return (Type, Data + Body)
                     Acc = Rest
                     Data = Data + Body
