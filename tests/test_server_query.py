@@ -2345,6 +2345,52 @@ def test_encode_dcb_column_oci_reproduces_the_live_column_block() -> None:
     assert mine == captured
 
 
+def test_sqlplus_10_2_gets_the_narrower_describe() -> None:
+    # 11g answers sqlplus 10.2 with a describe 3 + 4 per column + 4 bytes
+    # shorter than it sends 11.2 (#1764): the preamble's length is a ub1, each
+    # column's post-name block 9 bytes not 13, and the trailer lacks the zero
+    # ub4 ahead of its marker (the LOB describe's trailer too).
+    from seerdb.common.tns import (
+        _OCI_DCB_MARKER,
+        _oci_dcb_tail,
+        _oci_lob_describe_tail,
+        encode_describe_oci,
+    )
+    from seerdb.common.tns_consts import (
+        FIELD_VERSION_10_2,
+        FIELD_VERSION_11_2,
+        TNS_TYPE_CHAR,
+        TNS_TYPE_NUMBER,
+    )
+
+    cols = [
+        ColumnMeta(name=b'ONE', data_type=TNS_TYPE_NUMBER, data_length=22, max_size=22),
+        ColumnMeta(name=b'S', data_type=TNS_TYPE_CHAR, data_length=3, max_size=3),
+        ColumnMeta(name=b'N', data_type=TNS_TYPE_NUMBER, data_length=22, max_size=22),
+    ]
+    with _at_field_version(FIELD_VERSION_11_2):
+        wide = encode_describe_oci(cols)
+        wide_tail, wide_lob = _oci_dcb_tail(3), _oci_lob_describe_tail()
+    with _at_field_version(FIELD_VERSION_10_2):
+        narrow = encode_describe_oci(cols)
+        tail, lob = _oci_dcb_tail(3), _oci_lob_describe_tail()
+    assert wide[:5] == bytes.fromhex('1017000000')
+    assert narrow[:2] == bytes.fromhex('1017')
+    assert len(narrow) == len(wide) - 3 - 4 * len(cols)
+    # Column spacing as 11g sends it to 10.2: 61 bytes from ONE's name to S's,
+    # 59 from S's to N's (11.2: 65 and 63).
+    names = [
+        narrow.find(b'\x03ONE'),
+        narrow.find(b'\x01S\x00'),
+        narrow.find(b'\x01N\x00'),
+    ]
+    assert [names[1] - names[0], names[2] - names[1]] == [61, 59]
+    assert (len(wide_tail), len(tail)) == (83, 79)
+    assert tail[29 : 29 + len(_OCI_DCB_MARKER)] == _OCI_DCB_MARKER
+    assert tail[33] == 3  # the column count, four bytes earlier
+    assert (len(wide_lob), len(lob)) == (33, 29)
+
+
 def test_encode_describe_oci_maxrowsize_is_nonzero() -> None:
     # The thick/OCI client allocates a row buffer of the DCB max-row-size; a zero
     # there overflows and segfaults sqlplus, so it must sum the column widths

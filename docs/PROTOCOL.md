@@ -739,6 +739,23 @@ widenings, and the Mirror applies both at the 12c band:
 The row header and the describe tail keep their 11g length: 18c's differ only
 in instance values (an SCN).
 
+**Below 11.2 the describe narrows (#1764).** 11g answers sqlplus 10.2 with the
+same messages it sends 11.2. Rows, row headers and status frames are the same
+length, but every describe is `3 + 4 × columns + 4` bytes shorter, in three
+places:
+
+- the cursor preamble's length is a **ub1**: `10 17` and then the 23 bytes,
+  where 11.2 gets `10 17 00 00 00`;
+- each column's post-name block is **9 bytes, not 13**: column blocks 61 bytes
+  apart for a 3-character name, against 65;
+- the describe trailer lacks the zero ub4 just ahead of its marker:
+  `02000000 02000000 06…` with nothing between, so the marker and the column
+  count sit 4 bytes earlier. A CLOB select's describe trailer (no inline row)
+  loses the same ub4, its last four bytes, and is 29 bytes.
+
+A 10.2 client given the 11.2 widths crashes (sqlplus exits 139) on the first
+describe.
+
 **The `DESCRIBE <object>` reply** (§6.0) is a different message, with its own
 widening at the 12c band. Against a live 18c's describe of a NUMBER / VARCHAR2 /
 DATE table, it is the 11g reply with zero runs inserted and three carried values
