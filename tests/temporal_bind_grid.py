@@ -348,24 +348,15 @@ def gap(cell: Cell, part: str) -> int | None:
 
     ``part`` is what is compared: ``'oac'`` the bind's type and size, ``'bytes'``
     the value bytes (both offline), ``'server'`` what a live server reads."""
-    value = VALUES.get(cell.value)
-    aware = getattr(value, 'tzinfo', None) is not None
     if cell.declared is None and cell.seerdb_only:
         return 1804  # an undeclared date before year 1 has no OAC
-    if cell.context == 'object':
-        # An attribute takes the width its value would pick, not its type's.
-        by_value = (
-            not isinstance(value, datetime.datetime)
-            or (cell.declared == 'DB_TYPE_TIMESTAMP_TZ') != aware
-            or (cell.declared == 'DB_TYPE_DATE' and value.microsecond > 0)
-        )
-        if by_value and part in ('bytes', 'server'):
-            return 1803
-        if part == 'oac':
-            # Every object bind's OAC size; a crashed cell has no OAC at all.
-            return (
-                1803 if by_value and not isinstance(value, datetime.datetime) else 1806
-            )
+    if cell.context == 'object' and part == 'oac':
+        # A date before year 1 into a WITH TIME ZONE attribute is refused before
+        # there is an OAC; every other object bind's OAC carries a size where
+        # python-oracledb's is 0.
+        if cell.seerdb_only and cell.declared == 'DB_TYPE_TIMESTAMP_TZ':
+            return None
+        return 1806
     if (
         cell.context == 'executemany_mixed'
         and cell.declared is None

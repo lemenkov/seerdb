@@ -6002,7 +6002,15 @@ the exact inverse of the read path (python-oracledb `write_dbobject` /
   written long-form (`0xFE` + ub4, covering the 7-byte header) + each attribute
   length-prefixed in declaration order (`write_length`: ≤245 a single byte, else
   `0xFE` + ub4). A NULL scalar attribute is a single `0xFF`. Each scalar uses the
-  same encoder as its column-form bind. The encoder **recurses** exactly as the
+  same encoder as its column-form bind. A **temporal** attribute takes its
+  width from the attribute's **type**, not from the value, as a declared bind
+  does (§11.4b). DATE is 7 bytes. TIMESTAMP and LTZ are 11 bytes, or 7 when the
+  fraction is zero. WITH TIME ZONE is always 13. A live 23ai writes its own
+  images the same way: `SELECT T(timestamp '2020-02-29 00:00:00')` of a
+  one-TIMESTAMP-attribute type comes back `84 01 0b 07 78 78 02 1d 01 01 01`.
+  Sizing by the value instead sent a fraction into a DATE attribute, and a zone
+  into a TIMESTAMP one, as forms the server read as other values (#1803). The
+  encoder **recurses** exactly as the
   decoder frames it (§21.2 / §21.6, python-oracledb `_pack_value`): an object
   attribute of an object rides **inline, no header**; a NULL nested object is the
   atomic-null `0xFD`; a collection attribute — and any object *or* collection
