@@ -185,3 +185,80 @@ class TestDataPacketEncoder(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestEncryptedPipelineBurst(unittest.TestCase):
+    # Under native encryption a pipelined op goes out encrypted + MAC'd per
+    # packet, keeping its pipeline data flags, and a response comes back
+    # decrypted; the pipeline reader and writer bypass recv()/send(), and left
+    # both in the clear, so the server answered ORA-12599 (#1849).
+    SDU = 8192
+
+    def _channels(self):
+        from seerdb.common.ano_session import AnoChannel
+
+        secret = bytes(range(256))
+        return (
+            AnoChannel(17, 5, secret, bytes(16), ClientSide=True),
+            AnoChannel(17, 5, secret, bytes(16), ClientSide=False),
+        )
+
+    def _server_reads(self, wire: bytes, server) -> list[tuple[int, bytes]]:
+        from seerdb.common.tns import assemble_packet
+
+        packets = []
+        while wire:
+            flags = int.from_bytes(wire[8:10], 'big')
+            _flag, _type, body, rest = assemble_packet(wire, self.SDU)
+            assert body is not None and rest is not None
+            packets.append((flags, server.unwrap(body)))
+            wire = rest
+        return packets
+
+    def test_a_sync_burst_is_encrypted_with_its_flags(self):
+        from seerdb.client.connection import OracleConnect
+
+        client, server = self._channels()
+        con = OracleConnect()
+        con.sdu = self.SDU
+        con._ano = client
+        written: list[bytes] = []
+        con._write = written.append  # type: ignore[method-assign]
+        op = bytes(range(256)) * 50  # 12.5 KiB: two packets
+        con._pipeline_send_op(op, 0x0800, FirstFlags=0x1000)
+        packets = self._server_reads(b''.join(written), server)
+        self.assertEqual(b''.join(body for _flags, body in packets), op)
+        self.assertEqual([flags for flags, _body in packets], [0x1020, 0x0800])
+
+    def test_an_async_burst_is_encrypted_and_a_response_decrypted(self):
+        import asyncio
+        from typing import Any, cast
+
+        from seerdb.client.aconnection import AsyncOracleConnect
+        from seerdb.common.tns import encode_data_packet
+
+        client, server = self._channels()
+
+        async def run() -> tuple[bytes, bytes]:
+            con = AsyncOracleConnect(host='x', port=1, user='u', password='p')
+            con.sdu = self.SDU
+            con._ano = client
+
+            class _Writer:
+                def __init__(self):
+                    self.data = b''
+
+                def write(self, data):
+                    self.data += bytes(data)
+
+            writer = _Writer()
+            con._writer = cast(Any, writer)
+            await con._pipeline_send_op(b'op one', 0x0800, FirstFlags=0x1000)
+            reader = asyncio.StreamReader()
+            con._reader = reader
+            reader.feed_data(encode_data_packet(server.wrap(b'reply'), 0x2000))
+            return writer.data, await con._pipeline_recv_response()
+
+        wire, reply = asyncio.run(run())
+        self.assertEqual(self._server_reads(wire, server), [(0x1800, b'op one')])
+        self.assertEqual(reply, b'reply')
