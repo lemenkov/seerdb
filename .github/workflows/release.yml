@@ -49,8 +49,6 @@ jobs:
                 tests.test_connection
 
       - name: Build sdist + wheel
-        # The published distribution is the client driver only — the Mirror
-        # server (seerdb.server) is excluded in pyproject (#301).
         run: python -m build
 
       - name: Verify build artifacts

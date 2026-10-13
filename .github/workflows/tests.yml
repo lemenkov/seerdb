@@ -138,6 +138,22 @@ jobs:
       - run: pip install . mypy
       - run: python -m mypy
 
+  # What the built wheel and sdist contain (#1684): the whole package, the Mirror
+  # included, and nothing else; psycopg only behind the `mirror` extra; and
+  # `import seerdb` loading neither the Mirror nor a backend's driver. The tests
+  # build the distribution themselves, so nothing slips in or drops out unseen.
+  packaging:
+    name: Distribution contents
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install . build pytest "setuptools>=68"
+      - run: python -m pytest -q tests/test_packaging.py
+
   # Integration tests against a real Oracle server, run across three testbeds
   # (#28, #52): 11g (:1521/XE), 21c (:1521/XEPDB1, field version 16) and 23ai
   # Free (:1521/FREEPDB1, field version 17). fail-fast is off so a flake on one
@@ -287,7 +303,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install . pytest "psycopg[binary]"
+      - run: pip install ".[mirror]" pytest
       - name: Build and start PostgreSQL with orafce
         run: |
           docker build -f examples/mirror-pg.Dockerfile -t mirror-pg .

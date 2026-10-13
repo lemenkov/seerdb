@@ -104,9 +104,8 @@ from seerdb.common.vector import SparseVector
 
 if TYPE_CHECKING:
     # Type-checker view only. At runtime `seerdb.serve` / `seerdb.Server` are
-    # resolved lazily by __getattr__ below, so importing seerdb never requires
-    # the Mirror — and the client-only distribution (which omits seerdb.server)
-    # still imports cleanly.
+    # resolved lazily by __getattr__ below, so importing seerdb never loads
+    # the Mirror.
     from seerdb.server import Server, serve  # noqa: F401 (runtime: __getattr__)
 
 
@@ -160,9 +159,7 @@ def create_pool(*args, **kwargs) -> Pool:
 
 # The Mirror server API (`seerdb.serve` / `seerdb.Server`) is resolved on first
 # access rather than imported eagerly, so `import seerdb` never pulls in
-# seerdb.server. The released distribution omits that subpackage (it is the
-# client driver only); accessing these there raises a clear ModuleNotFoundError.
-# The Mirror is available when run from a source checkout (#301).
+# seerdb.server: a client pays nothing for the Mirror shipping beside it.
 _LAZY = frozenset({'serve', 'Server'})
 
 

@@ -102,7 +102,7 @@ jobs:
         run: |
           # Run the Mirror from the repository checkout (the launcher lives in
           # examples/, so without PYTHONPATH it would import the pip-installed
-          # wheel, which omits seerdb.server).
+          # seerdb rather than this checkout's).
           REPO="${GITHUB_WORKSPACE}"
           PYTHONPATH="$REPO" python "$REPO/examples/mirror_over_postgres.py" "$MIRROR_PG" 1521 > "$REPO/mirror.log" 2>&1 &
           MIRROR_PID=$!

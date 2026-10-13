@@ -1,18 +1,21 @@
 # SPDX-FileCopyrightText: 2019 Peter Lemenkov <lemenkov@gmail.com>
 # SPDX-License-Identifier: MIT
 
-"""The released distribution is the client driver only.
+"""What the built distribution contains, and what `import seerdb` loads.
 
-The Mirror server (``seerdb.server``) ships in the repository but must NOT land
-in the built package, and importing ``seerdb`` must never require it.
+The wheel and the sdist ship the whole package, the Mirror (``seerdb.server``)
+included, behind the ``mirror`` extra for its backends' dependencies (#1684).
+Importing ``seerdb`` must still load neither the Mirror nor those dependencies.
 """
 
 from __future__ import annotations
 
 import ast
+import email
 import subprocess
 import sys
 import tarfile
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -56,15 +59,17 @@ def _imported_subpackages(module_path: Path) -> set[str]:
 
 
 def test_import_seerdb_does_not_eagerly_load_the_mirror() -> None:
-    # A fresh interpreter: `import seerdb` must not pull in seerdb.server (so a
-    # client-only install with no server subpackage imports cleanly), yet the
-    # lazy API is still reachable when the subpackage is present.
+    # A fresh interpreter: `import seerdb` must pull in neither seerdb.server
+    # nor a backend's driver, so a client never pays for the Mirror shipping
+    # beside it. The lazy API still reaches the Mirror when asked.
     code = (
         'import sys, seerdb;'
         "assert 'seerdb.server' not in sys.modules, 'server loaded eagerly';"
+        "assert 'psycopg' not in sys.modules, 'a backend driver loaded';"
         'assert callable(seerdb.connect);'
         'assert callable(seerdb.serve) and isinstance(seerdb.Server, type);'
         "assert 'seerdb.server' in sys.modules, 'lazy access should load it';"
+        "assert 'psycopg' not in sys.modules, 'the Mirror loaded a backend';"
         "print('ok')"
     )
     result = subprocess.run(
@@ -74,37 +79,52 @@ def test_import_seerdb_does_not_eagerly_load_the_mirror() -> None:
     assert result.stdout.strip() == 'ok'
 
 
-def test_pyproject_excludes_the_mirror() -> None:
-    # A cheap tripwire so the exclusion is not silently dropped from packaging.
-    assert 'seerdb.server*' in (_ROOT / 'pyproject.toml').read_text()
+def _package_files() -> set[str]:
+    # The package as the checkout has it, the way a distribution lists it.
+    files = {p for p in _PKG.rglob('*.py') if '__pycache__' not in p.parts}
+    files.add(_PKG / 'py.typed')
+    return {p.relative_to(_ROOT).as_posix() for p in files}
 
 
-def test_built_sdist_ships_the_client_not_the_mirror(tmp_path) -> None:
+@pytest.fixture(scope='module')
+def dist(tmp_path_factory: pytest.TempPathFactory) -> Path:
     pytest.importorskip('build')
+    out = tmp_path_factory.mktemp('dist')
     subprocess.run(
-        [
-            sys.executable,
-            '-m',
-            'build',
-            '--sdist',
-            '--no-isolation',
-            '--outdir',
-            str(tmp_path),
-        ],
+        [sys.executable, '-m', 'build', '--no-isolation', '--outdir', str(out)],
         cwd=_ROOT,
         check=True,
         capture_output=True,
     )
-    (sdist,) = tmp_path.glob('*.tar.gz')
+    return out
+
+
+def test_the_wheel_ships_the_package_and_nothing_else(dist: Path) -> None:
+    (wheel,) = dist.glob('*.whl')
+    with zipfile.ZipFile(wheel) as zf:
+        names = set(zf.namelist())
+    shipped = {n for n in names if '.dist-info/' not in n}
+    assert shipped == _package_files()
+
+
+def test_the_sdist_ships_the_whole_package(dist: Path) -> None:
+    (sdist,) = dist.glob('*.tar.gz')
     with tarfile.open(sdist) as tar:
-        names = tar.getnames()
+        # Each name sits under the sdist's own top directory, seerdb-x.y.z/.
+        names = {name.split('/', 1)[1] for name in tar.getnames() if '/' in name}
+    assert _package_files() <= names
 
-    def ships(subpackage: str) -> bool:
-        return any(f'/seerdb/{subpackage}/' in name for name in names)
 
-    assert ships('client'), 'client driver missing from the sdist'
-    assert ships('common'), 'common codec missing from the sdist'
-    assert not ships('server'), 'the Mirror must NOT ship in the distribution'
+def test_the_mirror_extra_carries_the_backend_driver(dist: Path) -> None:
+    # psycopg comes with the `mirror` extra, never with a plain install.
+    (wheel,) = dist.glob('*.whl')
+    with zipfile.ZipFile(wheel) as zf:
+        (metadata,) = (n for n in zf.namelist() if n.endswith('.dist-info/METADATA'))
+        message = email.message_from_bytes(zf.read(metadata))
+    assert 'mirror' in message.get_all('Provides-Extra', [])
+    requires = message.get_all('Requires-Dist', [])
+    psycopg = [r for r in requires if r.startswith('psycopg')]
+    assert psycopg and all('extra == "mirror"' in r for r in psycopg), requires
 
 
 # Which subpackage may import which. `common` is the shared codec leaf: it must
