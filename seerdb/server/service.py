@@ -31,6 +31,13 @@ BackendFactory = Callable[[], Backend]
 
 _BACKLOG = 16
 
+# Logged as a Mirror starts serving. A WARNING reaches stderr even when the
+# application configured no logging.
+_PROVISIONAL_NOTICE = (
+    'the Mirror is provisional: it may change or break in any seerdb release, '
+    'outside the version promise the client keeps'
+)
+
 
 class Server:
     """A Mirror listening socket. Binds on construction (so ``port=0`` yields an
@@ -68,6 +75,7 @@ class Server:
 
     def serve_forever(self) -> None:
         """Accept and serve connections until :meth:`close` (or an interrupt)."""
+        logger.warning(_PROVISIONAL_NOTICE)
         logger.info('Mirror listening on %s:%d', self.host, self.port)
         while self._running:
             try:

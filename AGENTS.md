@@ -90,6 +90,9 @@ tag it. The steps:
    oldest-to-youngest). Each bullet is a short prose line — bold the headline
    phrase and cite the issue/PR as `(#NNN)`. Cover what changed since the last
    tag (`git log <last-tag>..master`), skipping dependabot / pure-CI noise.
+   Mirror (`seerdb.server`) changes are listed too, from the release that
+   first ships it (3.1.0), each bullet starting **Mirror (provisional):** so
+   nobody reads it as a promise the client keeps.
 
 4. **Open a PR** against upstream `master` following the normal fork→upstream
    flow (push the branch to your fork, open the PR against `seerdb/seerdb`).
@@ -124,7 +127,9 @@ says what the other may rely on:
 
 Follow semantic versioning against the **client (DB-API 2.0) surface**, which is
 the stable public API. Additive, backward-compatible features are a **minor**
-bump; bug fixes are a **patch**. The experimental server-side "Mirror" API is
-explicitly *not* covered by semver and may change in any release. A breaking
+bump; bug fixes are a **patch**. The server-side "Mirror" (`seerdb.server`,
+the `mirror` extra) is **provisional**: it ships with the package but is
+explicitly *not* covered by semver, and its API, command line and behaviour may
+change in any release. A breaking
 change to the client API (e.g. the `oracle` → `seerdb` package rename in 2.0.0)
 is a **major** bump.
