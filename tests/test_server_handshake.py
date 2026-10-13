@@ -258,6 +258,41 @@ def test_sqlplus_type_reply_reproduces_the_captured_packet() -> None:
     assert encode_type_reply_sqlplus() == TYPE_REPLY_SQLPLUS
 
 
+# sqlplus's type request (the ttc=02 round) and what the server answered, from
+# captures of sqlplus 10.2 and 11.2 against 11g XE (#1764). 10g answered sqlplus
+# 10.2 exactly as 11g did.
+_TYPE_REQUEST_SQLPLUS_10_2 = bytes.fromhex(
+    '02690369030224060101010d01010401010101010101ffff0308030301003f01473f0102'
+    '01010301000001050201000018800000003c3c3c80000000d007'
+)
+_TYPE_REQUEST_SQLPLUS_11_2 = bytes.fromhex(
+    '02690369030227060101010f010106010101010101017fff030a030701017f017fff0109'
+    '0101bf010506000107040702010000180003800000003c3c3c800000000000000ed007'
+)
+
+
+def test_the_type_reply_carries_a_tz_file_version_only_if_the_request_did() -> None:
+    # sqlplus 10.2 sends no timezone-file version in its type request, and the
+    # server leaves it out of the reply; the 4 bytes it does not expect drew a
+    # break (#1764). sqlplus 11.2 sends one and gets one.
+    from seerdb.server.handshake import (
+        build_type_reply_sqlplus,
+        client_sends_tz_file_version,
+    )
+
+    assert not client_sends_tz_file_version(_TYPE_REQUEST_SQLPLUS_10_2)
+    assert client_sends_tz_file_version(_TYPE_REQUEST_SQLPLUS_11_2)
+    assert build_type_reply_sqlplus(tz_file_version=False) == bytes.fromhex(
+        '02800000003c3c3c80000000'
+    )
+    assert build_type_reply_sqlplus() == bytes.fromhex(
+        '02800000003c3c3c800000000000000e'
+    )
+    # Nothing readable keeps the form every client got before.
+    assert client_sends_tz_file_version(b'')
+    assert client_sends_tz_file_version(b'\x02\x69')
+
+
 def test_dialects_are_distinct() -> None:
     # The two dialects' replies are genuinely different shapes (238/924 vs
     # 127/238), so serving the wrong one would break the handshake.

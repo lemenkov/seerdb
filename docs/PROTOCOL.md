@@ -588,6 +588,24 @@ from `encode_ano_response` (§33), together with the `0xFBFF` auth status and th
 null algorithm selections. `tests/test_handshake_generation.py` pins the built
 bytes to the live 11g capture.
 
+**What selects the OCI marshalling is the client's data-type request, not the
+server** (#1764). sqlplus and a thin client send the same `TTI_PRO` request
+shape, and get the same PRO reply. Its 100-byte FDO, including the 50-byte
+type-representation vector, is byte-identical from 10g, 11g and 23ai, to
+sqlplus 10.2, 11.2, 23.26 and a thin client alike. What differs is the data-type
+message that follows:
+
+| client | encoding flag | type table |
+|--------|---------------|------------|
+| thin (oracledb, seerdb) | `01` | each type with its representation (1137 B from seerdb) |
+| sqlplus 10.2 / 11.2 | `02` | **none** |
+
+With no table, the server uses its native representations: the fixed 4-byte
+little-endian lengths and 8-byte pointer fields of §4.1.2. In place of the table,
+sqlplus sends the time-zone block, from 11.2 a ub4 timezone-file version, and the
+national charset. This is the "extra data-type round" below. In this dialect the
+Mirror's round names run one behind, so its "TYPE" round reads this message.
+
 #### 4.1.2 The deadbeef / OCI auth phase (server-side / the Mirror)
 
 Past the handshake, sqlplus / thick OCI marshals the whole O5LOGON exchange
@@ -597,7 +615,12 @@ sqlplus 11.2 logs in — verified live. The rounds:
 
 1. **Extra data-type round.** Unlike a thin client (which jumps from DTY to
    OSESSKEY), sqlplus runs a third negotiation: a `ttc=02` request the server
-   answers with a fixed **26-byte** reply, *then* OSESSKEY.
+   answers with a fixed **26-byte** reply, *then* OSESSKEY. The reply is
+   `TTI_DTY`, the 11-byte time-zone block, then the ub4 timezone-file version,
+   but only for a client whose request carried one. sqlplus 10.2's request has
+   none (13 bytes behind its capabilities, against 11.2's 17), and 10g and 11g
+   both answer it without the ub4 (a 22-byte packet). The four bytes it doesn't
+   expect draw a break (#1764).
 2. **OCI field marshalling.** The `TTI_FUN` auth messages (OSESSKEY, AUTH)
    replace thin's `0x01` pointer bytes with an **8-byte `FE FF FF FF FF FF FF FF`
    indicator** (`0xFFFFFFFFFFFFFFFE` LE) and use **fixed 4-byte little-endian

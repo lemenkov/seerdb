@@ -257,6 +257,7 @@ from seerdb.server.framing import PacketStream
 from seerdb.server.handshake import (
     client_compile_cap,
     client_field_version,
+    client_sends_tz_file_version,
     connect_data_follows,
     encode_accept,
     encode_ano_null_reply,
@@ -612,7 +613,11 @@ def handle_login(
             # DTY (a `ttc=02` request) before it sends OSESSKEY; a thin client
             # skips it (#265).
             capabilities = _expect(stream, TNS_DATA, 'TYPE')
-            stream.send_raw(encode_type_reply_sqlplus())
+            stream.send_raw(
+                encode_type_reply_sqlplus(
+                    tz_file_version=client_sends_tz_file_version(capabilities)
+                )
+            )
             # That request is sqlplus's DTY proper (the round before it carries
             # its TTI_PRO), so its capability block says what the client reads.
             # Which LOB column form: the one with the LOB's length and chunk

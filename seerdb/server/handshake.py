@@ -524,13 +524,17 @@ def build_pro_sqlplus_reply() -> bytes:
     return ano.encode_ano(services, ContainerVersion=_DEADBEEF_CONTAINER_VERSION)
 
 
-def build_type_reply_sqlplus() -> bytes:
+def build_type_reply_sqlplus(*, tz_file_version: bool = True) -> bytes:
     """The deadbeef dialect's third-round type reply payload (#265, #565).
 
     A DTY (data-type negotiation) reply carrying the server's DB session time zone
     and its timezone-file version (§4.2): the ``TTI_DTY`` message code, an 11-byte
     time-zone block (its h/m/s offset fields at bytes 4..6, each biased by +60),
     then the timezone-file version as a big-endian ub4.
+
+    The ub4 goes only to a client whose own request carried one
+    (:func:`client_sends_tz_file_version`): sqlplus 10.2 sends none and answers
+    one with a break, and 10g and 11g both leave it out for that client (#1764).
     """
     (Hours, Minutes, Seconds) = _DB_TZ_HMS
     tz_block = (
@@ -538,7 +542,10 @@ def build_type_reply_sqlplus() -> bytes:
         + bytes([Hours + _DTY_TZ_BIAS, Minutes + _DTY_TZ_BIAS, Seconds + _DTY_TZ_BIAS])
         + _DB_TZ_FRAME_PAD
     )
-    return bytes([TTI_DTY]) + tz_block + struct.pack('>I', _TZFILE_VERSION)
+    reply = bytes([TTI_DTY]) + tz_block
+    if tz_file_version:
+        reply += struct.pack('>I', _TZFILE_VERSION)
+    return reply
 
 
 def is_ano_negotiation(pro_body: bytes) -> bool:
@@ -623,13 +630,46 @@ def encode_dty_reply(
     return packet
 
 
-def encode_type_reply_sqlplus(*, sdu: int = DEFAULT_SDU) -> bytes:
+def encode_type_reply_sqlplus(
+    *, sdu: int = DEFAULT_SDU, tz_file_version: bool = True
+) -> bytes:
     """Build the deadbeef dialect's third-round data-type reply — the 26-byte
     ``ttc=02`` confirmation sqlplus/thick OCI expects after PRO and DTY, before
-    it sends OSESSKEY (#265). Thin clients skip this round. Full TNS_DATA packet.
+    it sends OSESSKEY (#265), 22 bytes without the timezone-file version
+    (#1764). Thin clients skip this round. Full TNS_DATA packet.
     """
-    packet, _ = encode_packet(TNS_DATA, build_type_reply_sqlplus(), sdu)
+    payload = build_type_reply_sqlplus(tz_file_version=tz_file_version)
+    packet, _ = encode_packet(TNS_DATA, payload, sdu)
     return packet
+
+
+# What follows the capabilities in sqlplus's type request: the 11-byte time-zone
+# block, then a ub4 timezone-file version from 11.2 on, then the national
+# charset as a little-endian ub2.
+_TYPE_REQUEST_TZ_BLOCK = 11
+_TYPE_REQUEST_NCHARSET = 2
+
+
+def client_sends_tz_file_version(type_request: bytes) -> bool:
+    """Whether sqlplus's type request (the ``ttc=02`` round) carries a
+    timezone-file version, which says whether the reply should (#1764).
+
+    Behind the compile and runtime capabilities sqlplus 11.2 sends the time-zone
+    block, a ub4 timezone-file version and the national charset (17 bytes);
+    sqlplus 10.2 sends the block and the charset only (13). A request that cannot
+    be read keeps the 11.2 form, which every client the Mirror served before
+    received.
+    """
+    try:
+        if not type_request or type_request[0] != TTI_DTY:
+            return True
+        at = 6
+        at += 1 + type_request[at]  # compile capabilities
+        at += 1 + type_request[at]  # runtime capabilities
+    except IndexError:
+        return True
+    rest = len(type_request) - at
+    return rest != _TYPE_REQUEST_TZ_BLOCK + _TYPE_REQUEST_NCHARSET
 
 
 def client_field_version(dty_body: bytes) -> int | None:
