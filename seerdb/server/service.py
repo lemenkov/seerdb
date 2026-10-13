@@ -45,8 +45,11 @@ class Server:
         backend_factory: BackendFactory,
         field_version: int = FIELD_VERSION_11_2,
         tns_version: int | None = None,
+        encryption: str = 'accepted',
     ) -> None:
         self._backend_factory = backend_factory
+        # The Mirror's ANO stance (§33): 'accepted', 'requested' or 'required'.
+        self._encryption = encryption
         # The field version the Mirror advertises to thin clients (default the
         # pinned 11.2). Higher values unlock the 12c+ / 23ai wire formats a client
         # gates on that version; the login path handles them, the query path is
@@ -84,6 +87,7 @@ class Server:
             user = serve_session(
                 PacketStream(client),
                 backend,
+                encryption=self._encryption,
                 field_version=self._field_version,
                 tns_version=self._tns_version,
             )
@@ -111,6 +115,7 @@ def serve(
     backend_factory: BackendFactory,
     field_version: int = FIELD_VERSION_11_2,
     tns_version: int | None = None,
+    encryption: str = 'accepted',
 ) -> None:
     """Run a Mirror server until interrupted — the one-call convenience."""
     server = Server(
@@ -119,6 +124,7 @@ def serve(
         backend_factory=backend_factory,
         field_version=field_version,
         tns_version=tns_version,
+        encryption=encryption,
     )
     try:
         server.serve_forever()

@@ -16,8 +16,9 @@ and everything under ``seerdb.server`` accordingly.
 A live client logs in and runs SQL end-to-end against a pluggable
 :class:`~seerdb.server.backend.Backend`: the handshake, O5LOGON auth (both the
 thin and the sqlplus/OCI dialects), describe, rows, bind variables, DML / DDL,
-transactions, batched fetch, and LOBs. ``python -m seerdb.server`` still runs the
-observation listener that decodes and logs what a client puts on the wire.
+transactions, batched fetch, and LOBs. ``seerdb-mirror`` (or ``python -m
+seerdb.server``) starts one from the command line; ``seerdb-mirror observe`` runs
+the observation listener that decodes and logs what a client puts on the wire.
 """
 
 from __future__ import annotations

@@ -46,6 +46,9 @@ token = ["cryptography>=3.3"]
 # backend imports it, so `import seerdb` works without it.
 mirror = ["psycopg[binary]>=3.2"]
 
+[project.scripts]
+seerdb-mirror = "seerdb.server.launcher:main"
+
 [project.urls]
 Homepage = "https://github.com/seerdb/seerdb"
 
