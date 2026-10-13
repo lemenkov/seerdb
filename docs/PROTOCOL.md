@@ -5928,6 +5928,13 @@ encrypted 1500-character password), and are encoded at the session's negotiated
 version. They had taken whatever an earlier execute left, and a 10g / 11g
 server answered `ORA-03120` (#1090).
 
+The phase-one session message (OSESSKEY) is encoded at the negotiated version
+too. Its program, machine and osuser values can exceed 252 bytes. It used to
+take whatever an earlier connection had left in the thread, or a default below
+12.1. So the first login in a process, or any login after an async one, sent
+one-byte chunk lengths to a 12.1+ server, which answered `ORA-03120: two-task
+conversion routine: integer overflow` (#1816).
+
 ### 21.3 The packed image
 
 The image is the attributes serialised length-prefixed in declaration order
