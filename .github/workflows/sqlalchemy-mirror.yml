@@ -12,7 +12,7 @@
 #
 # The whole suite runs except one class that is an inherent limit of a
 # PostgreSQL backend, not a fixable gap, and is documented as such in
-# examples/postgres_backend.py: NormalizedNameTest (a quoted lower-case
+# seerdb/server/backends/postgres.py: NormalizedNameTest (a quoted lower-case
 # identifier is indistinguishable from an unquoted one once PostgreSQL folds
 # both to lower-case). This is a one-class denylist over the full suite, not a
 # curated allowlist.
@@ -23,6 +23,8 @@ on:
     branches: [master]
     paths:
       - 'seerdb/**'
+      # The passthrough backend relays to Oracle; this run never loads it.
+      - '!seerdb/server/backends/passthrough.py'
       - 'examples/**'
       - 'pyproject.toml'
       - '.github/workflows/sqlalchemy-mirror.yml'
@@ -30,6 +32,8 @@ on:
     branches: [master]
     paths:
       - 'seerdb/**'
+      # The passthrough backend relays to Oracle; this run never loads it.
+      - '!seerdb/server/backends/passthrough.py'
       - 'examples/**'
       - 'pyproject.toml'
       - '.github/workflows/sqlalchemy-mirror.yml'

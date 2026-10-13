@@ -12,22 +12,16 @@ emitted — the behaviour these tests pin without needing a database.
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import seerdb
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'examples'))
-from oracle_passthrough_backend import (  # noqa: E402
-    OraclePassthroughBackend,
-    _relay_error,
-)
-
-from seerdb.common.tns_consts import (  # noqa: E402
+from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
 )
-from seerdb.server.backend import BindVar  # noqa: E402
+from seerdb.server.backend import BindVar
+from seerdb.server.backends.passthrough import (
+    OraclePassthroughBackend,
+    _relay_error,
+)
 
 
 def test_strips_the_redundant_ora_prefix():
@@ -476,7 +470,7 @@ def test_the_login_time_zone_reaches_the_upstream_session():
     # SESSION in its login. The passthrough runs it upstream, so a client in
     # another zone than the Mirror's host sees its own offset (#1139). The offset
     # is deliberately one no test host is in.
-    from oracle_passthrough_backend import OraclePassthroughBackend
+    from seerdb.server.backends.passthrough import OraclePassthroughBackend
 
     backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
     backend._conn = _RecordingConn()

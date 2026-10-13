@@ -2131,7 +2131,7 @@ server pointer (offset 18), the SCN, and an internal sequence counter are
 instance-specific and zeroed; everything else — bind count, define markers, the
 RXD values — is computed, not a captured blob. The single-bind case (the common
 `EXEC :key := N`) reproduces the live reply byte-for-byte. The compatibility shim
-(`examples/oracle_compat_backend.py`) evaluates the literal `:v := <literal>`
+(`seerdb/server/backends/oracle_compat.py`) evaluates the literal `:v := <literal>`
 assignments; a non-Oracle backend cannot run general PL/SQL, but this one idiom
 covers the bind-a-value-then-use-it flow, so a following `SELECT … WHERE k = :v`
 receives the value as an ordinary IN bind (§5.4).
@@ -8096,7 +8096,7 @@ TDS lists exactly these ten leaves (`0e`, three `07 00 1e 01 00 00`, `0d`, `11`,
 
 The TDS in attribute 5 is **byte for byte** what the PG backend's
 `dbms_pickler.get_type_shape` answer builds (`_tds` in
-`examples/postgres_backend.py`): for `DBMSOUTPUT_LINESARRAY`,
+`seerdb/server/backends/postgres.py`): for `DBMSOUTPUT_LINESARRAY`,
 `_TdsCollection(varray=True, bound=0x7fffffff, element=_tds_chars(7, 32767, False))`.
 
 **The 12c band** (sqlplus 23.26 against a live 18c). The same exchange, but:

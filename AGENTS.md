@@ -41,7 +41,10 @@ paths it can reach (#1470):
 - **Mirror-over-PG legs** (the integration suite and SQLAlchemy through the
   Mirror) run for any change under `seerdb/` (the seerdb client drives the
   Mirror, so a client change can break it), `examples/`, or the integration and
-  backend test modules.
+  backend test modules. The passthrough backend
+  (`seerdb/server/backends/passthrough.py`) is the exception: those legs never
+  load it, and python-oracledb's suite through it runs weekly in CI and locally
+  per PR.
 - A **nightly** run takes every leg whatever changed.
 
 8i, 9i, 10g, the passthrough Mirror and python-oracledb's own suite are **local
@@ -51,8 +54,8 @@ not the whole matrix (a PR touching several rows runs the union):
 | PR touches | run locally |
 |---|---|
 | anything | the static checks above, before pushing |
-| `examples/` (the Mirror-over-PG backend) | `tests/test_postgres_backend.py` before pushing, then python-oracledb's suite (`tools/run_oracledb_suite.py`) against a Mirror-over-PG |
-| `seerdb/server` | python-oracledb's suite against a passthrough Mirror over 23ai, on the branch and on its `master` base, and against a Mirror-over-PG |
+| `seerdb/server/backends/postgres.py` (the Mirror-over-PG backend) or `examples/` | `tests/test_postgres_backend.py` before pushing, then python-oracledb's suite (`tools/run_oracledb_suite.py`) against a Mirror-over-PG |
+| the rest of `seerdb/server` | python-oracledb's suite against a passthrough Mirror over 23ai, on the branch and on its `master` base, and against a Mirror-over-PG |
 | `seerdb/client` | the integration suite on 8i, 9i and 10g |
 | `seerdb/common` | the integration suite on every bed (8i to 26ai), both Mirror legs, the offline suite, and both python-oracledb suite runs |
 

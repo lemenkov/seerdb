@@ -44,10 +44,10 @@ import os
 import sys
 
 from mirror_launch import mirror_credentials, setup_logging
-from oracle_compat_backend import OracleCompatBackend
-from postgres_backend import PostgresBackend
 
 import seerdb
+from seerdb.server.backends.oracle_compat import OracleCompatBackend
+from seerdb.server.backends.postgres import PostgresBackend
 
 _DEFAULT_CONNINFO = 'host=127.0.0.1 port=5432 user=pyo password=pyo123 dbname=mirror'
 
