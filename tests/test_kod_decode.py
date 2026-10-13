@@ -67,11 +67,8 @@ def test_kottd_describes_itself() -> None:
 def test_the_linesarray_tds_is_what_the_pg_backend_builds() -> None:
     # The type's TDS is byte for byte the GET_TYPE_SHAPE TDS the PG backend
     # already builds, so the Mirror can answer KOD from it (§40.3).
-    import os
-    import sys
 
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'examples'))
-    import postgres_backend as pb
+    from seerdb.server.backends import postgres as pb
 
     (record,) = decode_kod_reply(fx.BY_NAME_REPLY).records
     want = pb._tds(

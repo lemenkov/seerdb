@@ -26,10 +26,10 @@ from __future__ import annotations
 import sys
 
 from mirror_launch import mirror_credentials, setup_logging
-from oracle_compat_backend import OracleCompatBackend
 from sqlite_backend import SqliteBackend
 
 import seerdb
+from seerdb.server.backends.oracle_compat import OracleCompatBackend
 
 
 def main() -> None:

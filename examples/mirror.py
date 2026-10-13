@@ -52,7 +52,7 @@ def _backend_factory(
         database = section.get('database', ':memory:')
         return lambda: SqliteBackend(database, credentials=credentials)
     if kind == 'postgres':
-        from postgres_backend import PostgresBackend
+        from seerdb.server.backends.postgres import PostgresBackend
 
         conninfo = section.get('conninfo', '')
         return lambda: PostgresBackend(conninfo, credentials=credentials)

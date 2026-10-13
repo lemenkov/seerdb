@@ -11,7 +11,6 @@ wire in sight.
 
 from __future__ import annotations
 
-import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -19,9 +18,7 @@ import pytest
 
 from seerdb.server import BackendError, Result
 from seerdb.server.backend import Capability
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'examples'))
-from oracle_compat_backend import OracleCompatBackend  # noqa: E402
+from seerdb.server.backends.oracle_compat import OracleCompatBackend
 
 
 class _FakeInner:
@@ -156,8 +153,9 @@ def test_end_to_end_tracing_reaches_the_inner_backend() -> None:
     backend = OracleCompatBackend(inner)
     # The wrapper has to ADVERTISE it, not merely be able to call it: the Mirror
     # tests with getattr before calling.
-    assert getattr(backend, 'set_end_to_end', None) is not None
-    backend.set_end_to_end({'module': 'M', 'action': 'A'})
+    hook = getattr(backend, 'set_end_to_end', None)
+    assert hook is not None
+    hook({'module': 'M', 'action': 'A'})
     assert inner.attrs == {'module': 'M', 'action': 'A'}
 
 
@@ -183,7 +181,6 @@ def test_the_wrapper_forwards_every_hook_the_mirror_probes_for() -> None:
     # here, so this test fails the next time a hook is added to the server
     # without the wrapper passing it on.
     import re
-    from pathlib import Path
 
     server = Path(__file__).resolve().parent.parent / 'seerdb' / 'server'
     probed = set()

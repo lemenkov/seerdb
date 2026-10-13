@@ -10,8 +10,8 @@ column whose type the Mirror cannot yet represent is refused with a clean
 capabilities-and-errors contract SQLite uses, just with a different set of
 supported types.
 
-Requires the ``psycopg`` package. This is a demo/adapter outside ``seerdb``
-core; the driver dependency lives here, not in the library.
+Requires the ``psycopg`` package. Only this module imports it, so the rest of
+``seerdb`` (the client above all) works without it.
 
 **Requires the** `orafce <https://github.com/orafce/orafce>`_ **PostgreSQL
 extension** for Oracle-compatible SQL functions (``nvl``, ``decode``,
@@ -10258,7 +10258,7 @@ class PostgresBackend:
         # The portals the running call returned as implicit results (#1617).
         self._implicit_portals: list[str] = []
         self._conn.add_notice_handler(self._hear_implicit_result)
-        # Shared, not copied, when a dict is given: the example hands one map to
+        # Shared, not copied, when a dict is given: a launcher hands one map to
         # every backend it creates, and ALTER USER ... IDENTIFIED BY rewrites an
         # entry in place so the new password reaches the next login. A read-only
         # mapping is copied into a dict the rewrite can touch.

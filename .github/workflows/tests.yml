@@ -50,7 +50,7 @@ jobs:
   # Which integration legs this change can reach (#1470). The direct Oracle legs
   # load only the client and the codec; the Mirror legs load all of seerdb --
   # the seerdb client is what talks to the Mirror, so a client change can break
-  # one -- plus the Mirror-over-PG backend in examples/. The harness reaches
+  # one -- plus the Mirror launchers in examples/. The harness reaches
   # every leg. A change to the shared suite alone runs the Mirror leg but not
   # the Oracle ones: nearly every Mirror fix adds a test there, and gating the
   # Oracle legs on it would run them for every PR. Such a test is checked
@@ -77,6 +77,8 @@ jobs:
           SHARED='^(tests/conftest\.py|pyproject\.toml|\.github/workflows/tests\.yml)$'
           ORACLE='^(seerdb/client/|seerdb/common/|seerdb/__init__\.py$|seerdb/py\.typed$)'
           MIRROR='^(seerdb/|examples/|tests/test_integration\.py$|tests/test_postgres_backend\.py$)'
+          # The passthrough backend relays to Oracle; no Mirror-over-PG leg loads it.
+          NOT_MIRROR='^seerdb/server/backends/passthrough\.py$'
           case "$EVENT" in
             pull_request) BASE=$PR_BASE ;;
             push) BASE=$PUSH_BASE ;;
@@ -91,7 +93,7 @@ jobs:
           FILES=$(git diff --name-only "$BASE" HEAD)
           echo "$FILES"
           if echo "$FILES" | grep -Eq "$SHARED|$ORACLE"; then oracle=true; else oracle=false; fi
-          if echo "$FILES" | grep -Eq "$SHARED|$MIRROR"; then mirror=true; else mirror=false; fi
+          if echo "$FILES" | grep -Ev "$NOT_MIRROR" | grep -Eq "$SHARED|$MIRROR"; then mirror=true; else mirror=false; fi
           echo "oracle=$oracle" >> "$GITHUB_OUTPUT"
           echo "mirror=$mirror" >> "$GITHUB_OUTPUT"
           echo "Oracle legs: $oracle, Mirror legs: $mirror"

@@ -2554,11 +2554,8 @@ def test_passthrough_detect_version_reads_the_negotiated_version() -> None:
     # (OraclePassthroughBackend.detect_version). Point it at a Mirror advertising
     # 21c (fv 16) and it reads that back — the value it then presents to its own
     # clients so a Mirror in front of a real 21c server is 21c.
-    import sys
-    from pathlib import Path
 
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'examples'))
-    from oracle_passthrough_backend import OraclePassthroughBackend
+    from seerdb.server.backends.passthrough import OraclePassthroughBackend
 
     listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

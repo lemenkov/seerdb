@@ -29,10 +29,9 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path[:0] = [ROOT, os.path.join(ROOT, 'tests'), os.path.join(ROOT, 'examples')]
+sys.path[:0] = [ROOT, os.path.join(ROOT, 'tests')]
 
 import oracledb  # noqa: E402
-from oracle_passthrough_backend import OraclePassthroughBackend  # noqa: E402
 from temporal_bind_grid import (  # noqa: E402
     OBJECT_TYPE_PREFIX,
     SQL_TYPE,
@@ -44,6 +43,7 @@ from temporal_bind_grid import (  # noqa: E402
 )
 
 import seerdb  # noqa: E402
+from seerdb.server.backends.passthrough import OraclePassthroughBackend  # noqa: E402
 from seerdb.server.framing import PacketStream  # noqa: E402
 from seerdb.server.session import serve_session  # noqa: E402
 

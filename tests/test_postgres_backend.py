@@ -19,8 +19,7 @@ import sys
 import threading
 import time
 from decimal import Decimal
-from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
 
 import pytest
 
@@ -29,8 +28,7 @@ from seerdb.common.vector import SparseVector
 from seerdb.server import PacketStream, serve_session
 
 psycopg = pytest.importorskip('psycopg')
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'examples'))
-from postgres_backend import (  # noqa: E402
+from seerdb.server.backends.postgres import (  # noqa: E402
     _DICTIONARY_STAMP,
     _HELPER_FUNCTIONS_DDL,
     _IS_DDL,
@@ -73,6 +71,21 @@ from postgres_backend import (  # noqa: E402
     _txn_priority_setting,
     _urowid_expression,
 )
+
+_T = TypeVar('_T')
+
+
+def _present(value: _T | None) -> _T:
+    # What the test set up is there: a type it created, a member it declared.
+    assert value is not None
+    return value
+
+
+def _fetched_row(cursor: Any) -> tuple[Any, ...]:
+    # The one row a query that always answers returns.
+    row = cursor.fetchone()
+    assert row is not None
+    return row
 
 
 class _FakePgError(Exception):
@@ -207,7 +220,7 @@ def test_a_bare_call_statement_is_made_one_plpgsql_runs() -> None:
     # PERFORM f(...), a procedure CALL p(...) (#1533). Only statements that are a
     # call to something PostgreSQL has; strings, comments, assignments and
     # PL/SQL's own statements are left alone.
-    from postgres_backend import _perform_bare_calls
+    from seerdb.server.backends.postgres import _perform_bare_calls
 
     kinds = {'dbms_output.put_line': 'f', 'p': 'p', 'dbms_output.enable': 'f'}
 
@@ -464,7 +477,7 @@ def test_declared_columns_record_what_postgresql_keeps_less_of() -> None:
 def test_a_national_cast_is_found_in_the_select_list() -> None:
     # The select-list casts to NVARCHAR2(n) / NCHAR[(n)], each with its n, from
     # the Oracle statement (#1440); one inside an expression is not the item.
-    from postgres_backend import _computed_national_columns
+    from seerdb.server.backends.postgres import _computed_national_columns
 
     assert _computed_national_columns(
         "SELECT CAST('X' AS VARCHAR2(1)), CAST(SUBSTR(a, 1, 2) AS NVARCHAR2(5)) k, "
@@ -486,7 +499,7 @@ def test_an_unaliased_expression_is_named_by_its_text() -> None:
     # space dropped and the rest upper-cased -- its literals and comments too;
     # a pseudo-column by its name; a column or an aliased item keeps its name
     # (#1449). The names are 23ai's.
-    from postgres_backend import _expression_names
+    from seerdb.server.backends.postgres import _expression_names
 
     assert _expression_names(
         "SELECT length( 'ab' ), upper(a), 1 + 2, 'lit', 'a b', n'x' FROM t"
@@ -523,7 +536,7 @@ def test_a_constant_select_item_is_found() -> None:
     # and a NUMBER one describes with precision 0 and scale -127; one computed
     # from a column, a bind, a pseudo-column, a subquery or an aggregate has
     # neither (#1444). The positions match 23ai's describes.
-    from postgres_backend import _constant_items
+    from seerdb.server.backends.postgres import _constant_items
 
     assert _constant_items('SELECT 1, 1.5, -2, 1e3 FROM dual') == {0, 1, 2, 3}
     assert _constant_items('SELECT 1 + 1, count(*), 1 AS one, 2 "Two" FROM dual') == {
@@ -543,7 +556,7 @@ def test_a_one_element_constructor_is_spelt_as_a_call() -> None:
     # `name('x')` for a collection type: PostgreSQL reads it as a cast to the
     # type, so it is spelt `name(VARIADIC ARRAY['x'])` (#1435). Other calls,
     # unknown names and a call through an alias are left alone.
-    from postgres_backend import _spell_one_element_constructors
+    from seerdb.server.backends.postgres import _spell_one_element_constructors
 
     names = frozenset({'l', 'pyo.l'})
     assert _spell_one_element_constructors("INSERT INTO t VALUES (L('a'))", names) == (
@@ -563,7 +576,7 @@ def test_a_block_with_binds_becomes_a_do_block() -> None:
     # Each bind becomes a typed local, initialised with its value, whose value
     # the block leaves in a setting before it ends -- a REF CURSOR's its portal
     # name (#1456, #1459). Bind names are found, and replaced, past literals.
-    from postgres_backend import _bind_block, _bind_names, _replace_binds
+    from seerdb.server.backends.postgres import _bind_block, _bind_names, _replace_binds
 
     block = "BEGIN OPEN :c FOR SELECT ':x' FROM t WHERE k BETWEEN :a AND :b; END;"
     assert _bind_names(block) == ['c', 'a', 'b']
@@ -788,7 +801,7 @@ def test_a_name_postgresql_reserves_is_quoted() -> None:
     # (#1595): where declared or listed for an INSERT, after a dot, and bare where
     # what follows shows a name. Oracle's own words and PostgreSQL's keywords in
     # their places are left be.
-    from postgres_backend import _quote_reserved_names as quote
+    from seerdb.server.backends.postgres import _quote_reserved_names as quote
 
     assert quote(
         'CREATE TABLE i (inner NUMBER, end NUMBER, primary NUMBER, '
@@ -2165,9 +2178,8 @@ def test_execute_pipelined_and_sequential_agree() -> None:
     # same results and the same statement-level error isolation. Drive the backend
     # directly, forcing each path, so the fallback is exercised even where libpq is
     # new enough that the Mirror always pipelines.
-    from postgres_backend import PostgresBackend
-
     from seerdb.server import BackendError
+    from seerdb.server.backends.postgres import PostgresBackend
 
     for use_pipeline in (True, False):
         backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
@@ -2350,9 +2362,9 @@ def test_a_rowid_renders_as_the_client_renders_it() -> None:
 
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     try:
-        (got,) = backend._conn.execute(
-            "SELECT sys.ora_rowid(16384, '(12,3)'::tid)"
-        ).fetchone()
+        (got,) = _fetched_row(
+            backend._conn.execute("SELECT sys.ora_rowid(16384, '(12,3)'::tid)")
+        )
         assert got == rowid_to_string(16384, 1, 13, 3)
     finally:
         backend.close()
@@ -2375,10 +2387,10 @@ def test_unqualified_names_resolve_in_the_login_users_schema() -> None:
     try:
         assert backend.authenticate('PYO_LOGIN') == 'x'
         assert backend.execute('SELECT n FROM pyo_login_t').rows == [(7,)]
-        (schema,) = backend._conn.execute('SELECT current_schema()').fetchone()
+        (schema,) = _fetched_row(backend._conn.execute('SELECT current_schema()'))
         assert schema == 'pyo_login'
         assert other.authenticate('PYO_NO_SCHEMA') == 'y'
-        (schema,) = other._conn.execute('SELECT current_schema()').fetchone()
+        (schema,) = _fetched_row(other._conn.execute('SELECT current_schema()'))
         assert schema == 'pyo_no_schema'
     finally:
         backend.close()
@@ -2419,7 +2431,7 @@ def test_a_query_leaves_no_lock_behind() -> None:
 def test_a_column_name_folds_as_oracle_folds_it() -> None:
     # A legal unquoted lower-case name came from an unquoted one; anything else
     # was quoted and is kept (#1204). A reserved word could only be quoted.
-    from postgres_backend import _oracle_column_name
+    from seerdb.server.backends.postgres import _oracle_column_name
 
     assert _oracle_column_name('all_lowercase') == 'ALL_LOWERCASE'
     assert _oracle_column_name('a$b#1') == 'A$B#1'
@@ -2493,7 +2505,7 @@ def test_ddl_on_a_locked_table_fails_as_oracle_does() -> None:
         with pytest.raises(BackendError) as exc:
             ddl.execute('TRUNCATE TABLE pyo_ddl_nowait')
         assert exc.value.ora_code == 54
-        (timeout,) = ddl._conn.execute('SHOW lock_timeout').fetchone()
+        (timeout,) = _fetched_row(ddl._conn.execute('SHOW lock_timeout'))
         assert timeout == '0'
         holder.rollback()
         ddl.execute('TRUNCATE TABLE pyo_ddl_nowait')
@@ -2539,10 +2551,12 @@ def test_session_info_names_the_backend_and_sql_agrees() -> None:
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     try:
         info = backend.session_info()
-        (pid, sid, serial) = backend._conn.execute(
-            "SELECT pg_backend_pid(), sys.sys_context('userenv', 'sid'), "
-            'sys.ora_serial(pg_backend_pid())'
-        ).fetchone()
+        (pid, sid, serial) = _fetched_row(
+            backend._conn.execute(
+                "SELECT pg_backend_pid(), sys.sys_context('userenv', 'sid'), "
+                'sys.ora_serial(pg_backend_pid())'
+            )
+        )
         assert info.session_id == pid == int(sid)
         assert info.serial_num == serial > 0
         assert info.db_name == info.instance_name
@@ -2617,7 +2631,7 @@ def test_an_identifier_containing_a_hash_is_quoted() -> None:
     # PostgreSQL has no `#` in an unquoted name; quote it in the lower case an
     # unquoted name is stored in, and leave literals, quoted names, comments and
     # bind names alone (#1249).
-    from postgres_backend import _quote_hash_identifiers as quote
+    from seerdb.server.backends.postgres import _quote_hash_identifiers as quote
 
     assert quote('SELECT sid, serial# FROM v$session') == (
         'SELECT sid, "serial#" FROM v$session'
@@ -2659,10 +2673,10 @@ _CAPTURED_TDS = {
 
 
 def _captured_shapes() -> dict:
-    from postgres_backend import _tds_chars, _tds_number, _tds_timestamp
-    from postgres_backend import _TdsCollection as C
-    from postgres_backend import _TdsLeaf as L
-    from postgres_backend import _TdsObject as _O
+    from seerdb.server.backends.postgres import _tds_chars, _tds_number, _tds_timestamp
+    from seerdb.server.backends.postgres import _TdsCollection as C
+    from seerdb.server.backends.postgres import _TdsLeaf as L
+    from seerdb.server.backends.postgres import _TdsObject as _O
 
     def O(*attrs):  # noqa: N802 -- a constructor, as the encoder's types read
         return _O(tuple(attrs))
@@ -2726,7 +2740,7 @@ def _captured_shapes() -> dict:
 def test_the_tds_encoder_reproduces_what_23ai_sends() -> None:
     # Byte for byte, header, embedded objects, references, null images and the
     # index table included, for every captured object and collection type.
-    from postgres_backend import _tds
+    from seerdb.server.backends.postgres import _tds
 
     shapes = _captured_shapes()
     assert set(shapes) == set(_CAPTURED_TDS)
@@ -2753,8 +2767,6 @@ def test_get_type_shape_is_answered_from_the_catalog() -> None:
     # python-oracledb's type-metadata block, answered whole: the OID, the TDS,
     # the attribute cursor, the type's own schema and name -- and 1001 for a
     # type that does not exist, as GET_TYPE_SHAPE returns it.
-    from postgres_backend import _tds
-
     from seerdb.common.tns_consts import (
         TNS_TYPE_NUMBER,
         TNS_TYPE_RAW,
@@ -2762,6 +2774,7 @@ def test_get_type_shape_is_answered_from_the_catalog() -> None:
         TNS_TYPE_VARCHAR,
     )
     from seerdb.server.backend import BindVar
+    from seerdb.server.backends.postgres import _tds
 
     admin = psycopg.connect(_CONNINFO, autocommit=True)
     admin.execute('DROP SCHEMA IF EXISTS pyo_shape CASCADE')
@@ -2793,7 +2806,12 @@ def test_get_type_shape_is_answered_from_the_catalog() -> None:
         )
         assert (ret_val, version, package) == (0, 1, None)
         assert len(oid) == 16
-        from postgres_backend import _tds_chars, _tds_number, _TdsCollection, _TdsObject
+        from seerdb.server.backends.postgres import (
+            _tds_chars,
+            _tds_number,
+            _TdsCollection,
+            _TdsObject,
+        )
 
         sub = _TdsObject((_tds_number(),))
         assert tds == _tds(
@@ -2827,7 +2845,7 @@ def test_a_package_types_declaration_is_read_for_its_metadata() -> None:
     # them (#1607): a built-in's name, length and character set -- an NVARCHAR2
     # counted in characters -- a PL/SQL integer by its PL/SQL name, another of
     # the package's types by package, a SUBTYPE by what it stands for.
-    from postgres_backend import _PackageMember, _plsql_type_meta
+    from seerdb.server.backends.postgres import _PackageMember, _plsql_type_meta
 
     siblings: dict[str, dict] = {}
 
@@ -3081,7 +3099,7 @@ def test_a_body_indexes_its_index_by_tables() -> None:
     # terms (#1607): an element set and read, the collection methods called,
     # DELETE assigned; another's field `x.v` and a range bound `1..v.COUNT`
     # read as what they are.
-    from postgres_backend import (
+    from seerdb.server.backends.postgres import (
         _PackageMember,
         _rewrite_index_tables,
         _routine_index_tables,
@@ -3230,9 +3248,8 @@ def test_an_is_json_condition_is_no_json_column() -> None:
     # JSON type a pre-21c server refuses (#1614); the condition is
     # sys.ora_is_json, which takes a CLOB's or BLOB's domain, without Oracle's
     # FORMAT JSON or STRICT / LAX. A JSON column is still refused.
-    from postgres_backend import _reject_unsupported_ddl_types
-
     from seerdb.server import BackendError
+    from seerdb.server.backends.postgres import _reject_unsupported_ddl_types
 
     _reject_unsupported_ddl_types(
         'CREATE TABLE t (v VARCHAR2(10), CONSTRAINT c CHECK (v IS JSON FORMAT JSON))',
@@ -3563,10 +3580,9 @@ def test_a_null_object_bind_resolves_an_overloaded_routine() -> None:
     # A NULL object bound to a routine overloaded on object types (#1622): the
     # NULL goes as the type its bind names, so the overload for that type is
     # the one called -- python-oracledb's test_2300 gets 'null' back.
-    from postgres_backend import _object_type_oid
-
     from seerdb.common.tns_consts import TNS_TYPE_ADT, TNS_TYPE_VARCHAR
     from seerdb.server.backend import BindVar
+    from seerdb.server.backends.postgres import _object_type_oid
 
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     try:
@@ -3616,10 +3632,9 @@ def test_a_function_returns_a_table_of_varrays() -> None:
     # A nested table of VARRAYs a function returns (#1623) comes back as that
     # collection of collections, as python-oracledb's test_2345 reads it --
     # not empty, as its array text left it.
-    from postgres_backend import _object_type_oid
-
     from seerdb.common.tns_consts import TNS_TYPE_ADT
     from seerdb.server.backend import BindVar
+    from seerdb.server.backends.postgres import _object_type_oid
 
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     try:
@@ -3804,11 +3819,10 @@ def test_a_plsql_select_into_needs_exactly_one_row() -> None:
     # through. A function a query calls makes the ORA-01403 its NULL (#1612).
     # Only a SELECT that starts a PL/SQL statement is STRICT: not a subquery's,
     # a FETCH's, a RETURNING's, quoted text, or a statement with no body.
-    from postgres_backend import _strict_select_into
-
     from seerdb.common.tns_consts import TNS_TYPE_NUMBER
     from seerdb.server import BackendError
     from seerdb.server.backend import BindVar
+    from seerdb.server.backends.postgres import _strict_select_into
 
     assert _strict_select_into(
         'DO $$ BEGIN SELECT (SELECT max(n) FROM t) INTO x FROM dual; '
@@ -4541,7 +4555,7 @@ def test_the_column_visibility_attribute_comes_out_of_the_ddl() -> None:
     # INVISIBLE / VISIBLE follow a column's type in CREATE TABLE and in ALTER
     # TABLE ADD / MODIFY; the statement loses it and says which columns it named,
     # in PostgreSQL's spelling (#1195).
-    from postgres_backend import _column_visibility as visibility
+    from seerdb.server.backends.postgres import _column_visibility as visibility
 
     assert visibility('CREATE TABLE t (a NUMBER, h NUMBER INVISIBLE DEFAULT 5)') == (
         'CREATE TABLE t (a NUMBER, h NUMBER  DEFAULT 5)',
@@ -4557,7 +4571,10 @@ def test_the_column_visibility_attribute_comes_out_of_the_ddl() -> None:
         ['b'],
         True,
     )
-    assert visibility('ALTER TABLE t MODIFY (a NUMBER(10) INVISIBLE)')[1][3] is False
+    assert (
+        _present(visibility('ALTER TABLE t MODIFY (a NUMBER(10) INVISIBLE)')[1])[3]
+        is False
+    )
     # A table or column merely named so is not the attribute.
     assert visibility('CREATE TABLE invisible (visible NUMBER)')[1] is None
 
@@ -4649,7 +4666,7 @@ def test_reject_create_domain_raises_ora_901() -> None:
 def test_constructor_items_name_each_whole_call() -> None:
     # A select item that is one call, aliased or not, by the name it calls; an
     # expression around a call, or a wildcard list, names nothing (#1473).
-    from postgres_backend import _constructor_items
+    from seerdb.server.backends.postgres import _constructor_items
 
     assert _constructor_items(
         'SELECT t_arr(5, 10), s.t_arr(1) AS c, n + f(1), x FROM dual'
@@ -4805,14 +4822,14 @@ def test_a_packages_members_are_read_from_its_spec_and_body() -> None:
     # and variables passed over, and a ; or an END inside a string or a comment
     # read as nothing (#1605); a type's declaration too (#1607). An
     # initialization section is not read.
-    from postgres_backend import _package_members
+    from seerdb.server.backends.postgres import _package_members
 
     spec = (
         'CREATE PACKAGE pk AS\n  TYPE t IS TABLE OF NUMBER INDEX BY PLS_INTEGER;\n'
         '  FUNCTION f(a NUMBER) RETURN NUMBER;\n  FUNCTION f(a VARCHAR2) RETURN VARCHAR2;'
         '\n  PROCEDURE p;\nEND pk;'
     )
-    members = _package_members(spec, spec.index(' AS') + 3)
+    members = _present(_package_members(spec, spec.index(' AS') + 3))
     assert [(m.kind, m.name, m.params, m.returns, m.body) for m in members] == [
         ('TYPE', 't', None, None, 'TABLE OF NUMBER INDEX BY PLS_INTEGER'),
         ('FUNCTION', 'f', 'a NUMBER', 'NUMBER', None),
@@ -4825,7 +4842,7 @@ def test_a_packages_members_are_read_from_its_spec_and_body() -> None:
         '    t := CASE WHEN a > 0 THEN 1 END;\n    RETURN t;\n  END f;\n'
         '  PROCEDURE p IS BEGIN NULL; END;\nEND;'
     )
-    members = _package_members(body, body.index(' IS') + 3)
+    members = _present(_package_members(body, body.index(' IS') + 3))
     assert [(m.name, m.body) for m in members if m.kind != 'TYPE'] == [
         (
             'f',
@@ -4847,7 +4864,7 @@ def test_a_package_type_is_a_postgresql_type_of_its_schema() -> None:
     # index-by tables' own test runs them); a VARRAY or nested table a
     # domain over an array with its constructors; a REF CURSOR and a SUBTYPE
     # domains (#1607).
-    from postgres_backend import _package_type, _PackageMember
+    from seerdb.server.backends.postgres import _package_type, _PackageMember
 
     def declare(kind: str, name: str, definition: str) -> str | None:
         return _package_type('pk', _PackageMember(kind, name, None, None, definition))
@@ -4934,7 +4951,7 @@ def test_a_package_declares_types_its_routines_use() -> None:
 def test_package_ddl_is_a_schema_of_its_routines() -> None:
     # A spec is a schema of stand-ins, a body its routines in their place, each
     # resolving names as its creator's session did, the package first (#1605).
-    from postgres_backend import _translate_package_ddl
+    from seerdb.server.backends.postgres import _translate_package_ddl
 
     spec = _translate_package_ddl(
         'CREATE OR REPLACE PACKAGE pyo.pk AS FUNCTION f(a NUMBER) RETURN NUMBER; END;'
@@ -5088,7 +5105,7 @@ class _NoConnPostgresBackend(PostgresBackend):
     # Skip the psycopg connect / orafce setup — change_password only touches the
     # credential map, so no live PostgreSQL is needed to test it.
     def __init__(self, credentials: dict) -> None:
-        from postgres_backend import _AccountStore
+        from seerdb.server.backends.postgres import _AccountStore
 
         self._credentials = credentials
         self._accounts = _AccountStore(credentials, None)
@@ -5126,7 +5143,8 @@ class _RecordingConn:
 class _RecordingPostgresBackend(PostgresBackend):
     # Just a connection that records what reaches it.
     def __init__(self) -> None:
-        self._conn = _RecordingConn()
+        self.recording = _RecordingConn()
+        self._conn = cast(Any, self.recording)
         self._sql_dialect = 'oracle'
         self._reporting = False
 
@@ -5138,7 +5156,7 @@ def test_transaction_control_runs_outside_the_statement_savepoint() -> None:
     for statement in ('COMMIT', 'commit work', 'ROLLBACK', '-- done\nROLLBACK WORK'):
         backend.execute(statement)
     backend.execute('SAVEPOINT sp1')
-    assert backend._conn.calls == [
+    assert backend.recording.calls == [
         '<commit>',
         '<commit>',
         '<rollback>',
@@ -5154,7 +5172,7 @@ def test_rollback_to_a_savepoint_is_guarded_but_not_released() -> None:
     backend = _RecordingPostgresBackend()
     backend.execute('ROLLBACK WORK TO SAVEPOINT sp1')
     backend.execute('rollback to "Sp2"')
-    assert backend._conn.calls == [
+    assert backend.recording.calls == [
         'SAVEPOINT _mirror_stmt',
         'ROLLBACK TO SAVEPOINT sp1',
         'SAVEPOINT _mirror_stmt',
@@ -5307,7 +5325,7 @@ def test_parse_out_assignments_recognises_assignment_blocks() -> None:
 
 
 def test_bind_names_first_appearance_order_skips_literals() -> None:
-    from postgres_backend import _bind_names
+    from seerdb.server.backends.postgres import _bind_names
 
     assert _bind_names(':a := :b; :c := :a') == ['a', 'b', 'c']
     # A colon inside a string literal is not a bind ref.
@@ -5319,7 +5337,7 @@ def test_masking_reads_the_text_as_the_tokenizer_does() -> None:
     # text back exactly -- an unterminated literal used to gain a closing
     # quote it never had -- a q-literal is masked whole, prefix outside, and a
     # quoted bind name is masked as an identifier.
-    from postgres_backend import _mask_quoted, _unmask_quoted
+    from seerdb.server.backends.postgres import _mask_quoted, _unmask_quoted
 
     for sql in (
         "VALUES (1, 'open",
@@ -5342,7 +5360,7 @@ def test_block_words_are_the_tokenizers_words() -> None:
     # _words and _blank_plsql on the shared tokenizer (#1693): `$` and `#` are
     # part of a name, so `x$begin` hides no BEGIN; nothing inside a literal, a
     # quoted name or a comment is a word; a bind's name still is one.
-    from postgres_backend import _blank_plsql, _words
+    from seerdb.server.backends.postgres import _blank_plsql, _words
 
     text = 'x$begin := \'begin\'; /* begin */ "BEGIN" := obj#; :end := 1; BEGIN'
     assert [w for w, _s, _e in _words(text)] == ['X$BEGIN', 'OBJ#', 'END', 'BEGIN']
@@ -5360,7 +5378,7 @@ def test_statement_scanners_read_the_tokenizers_spans() -> None:
     # The statement-level scanners on the shared tokenizer (#1693): a bind
     # named like a keyword is no top-level keyword, a cast's type name is a
     # word, and `#` names are quoted past literals and comments alike.
-    from postgres_backend import (
+    from seerdb.server.backends.postgres import (
         _perform_bare_calls,
         _quote_hash_identifiers,
         _top_level_words,
@@ -5384,7 +5402,11 @@ def test_structure_is_read_past_literals_and_comments() -> None:
     # _matching_paren and _top_level_items on the shared tokenizer (#1695): a
     # parenthesis or comma inside a literal (escaped quotes included), a quoted
     # identifier or a comment is not structure, raw text or masked alike.
-    from postgres_backend import _mask_quoted, _matching_paren, _top_level_items
+    from seerdb.server.backends.postgres import (
+        _mask_quoted,
+        _matching_paren,
+        _top_level_items,
+    )
 
     sql = "f('a (b', \"c)d\" /* ) */, 'it''s, x', g(1, 2)) -- )\n"
     assert _matching_paren(sql, 1) == sql.rindex(')', 0, sql.index('--'))
@@ -5405,7 +5427,7 @@ def test_calls_are_islands_in_the_token_stream() -> None:
     # its `(`, outside literals and comments; its arguments split at top-level
     # commas only; the translators built on it leave literals and comments
     # alone.
-    from postgres_backend import (
+    from seerdb.server.backends.postgres import (
         _calls,
         _rewrite_calls,
         _translate_decode,
@@ -5500,7 +5522,7 @@ def test_accounts_in_an_auth_database_are_out_of_sql_reach() -> None:
     # the auth role: they survive the process's map, the launcher's accounts
     # seed it without overwriting a changed password, and a role without a
     # grant -- what a Mirror session should run as -- cannot read them (#879).
-    import postgres_backend
+    from seerdb.server.backends import postgres as postgres_backend
 
     admin = psycopg.connect(_CONNINFO, autocommit=True)
     dbname = admin.info.dbname
@@ -5631,11 +5653,10 @@ def test_json_columns_keep_osons_types_in_extended_form() -> None:
     import datetime
     import decimal
 
-    from postgres_backend import _from_extended, _to_extended
-
     from seerdb.common.datatypes import JSON, IntervalYM
     from seerdb.common.tns_consts import TNS_TYPE_JSON
     from seerdb.server import BackendError
+    from seerdb.server.backends.postgres import _from_extended, _to_extended
 
     doc = {
         'when': datetime.datetime(2022, 12, 5, 15, 6, 5, 123000),
@@ -5649,10 +5670,12 @@ def test_json_columns_keep_osons_types_in_extended_form() -> None:
         'plain': [1, 2.5, 'x', None, True, {'k': []}],
     }
     extended = _to_extended(doc)
+    assert isinstance(extended, dict)
     assert extended['price'] == {'$numberDecimal': '319438950232418390.273596'}
     assert extended['raw'] == {'$rawhex': '01FF'}
     assert extended['ym'] == {'$intervalYearMonth': 'P8Y4M'}
     back = _from_extended(extended)
+    assert isinstance(back, dict)
     assert back['day'] == datetime.datetime(2022, 12, 5)  # a DATE, as OSON's
     # A WITH TIME ZONE value comes back naive in UTC, as a client decodes
     # OSON's (#1707).
@@ -6690,7 +6713,7 @@ def test_a_number_as_a_condition_at_23ai() -> None:
     # 23ai takes a number where a condition goes, zero FALSE and any other
     # TRUE (#1760), measured: SQLAlchemy writes true() as `ON 1` there. A
     # comparison's operand and BETWEEN's AND are left alone.
-    from postgres_backend import _number_conditions
+    from seerdb.server.backends.postgres import _number_conditions
 
     assert _number_conditions('SELECT 1 FROM a JOIN b ON 1 WHERE 0 OR NOT 0') == (
         'SELECT 1 FROM a JOIN b ON TRUE WHERE FALSE OR NOT FALSE'
@@ -6720,7 +6743,11 @@ def test_a_bind_in_a_comment_or_a_q_literal_is_text() -> None:
     # shifted -- `:b` silently got the wrong one; an apostrophe in a comment
     # opened a string that hid the binds after it; and PostgreSQL has no
     # q'...' literals at all.
-    from postgres_backend import _bind_names, _plain_quoting, _replace_binds
+    from seerdb.server.backends.postgres import (
+        _bind_names,
+        _plain_quoting,
+        _replace_binds,
+    )
 
     sql = 'select 1 /* :c */ from t where x = :b'
     assert _bind_names(sql) == ['b']
@@ -6875,7 +6902,7 @@ def test_rownum_becomes_limit_only_where_it_means_limit() -> None:
     # A top-level `AND ROWNUM <= n` filter is LIMIT n (#1271); where Oracle
     # numbers rows before a sort, grouping, DISTINCT, aggregate, set operator,
     # OR or FOR UPDATE, the two differ, and ROWNUM is refused by name.
-    from postgres_backend import UnsupportedFeature, _rewrite_rownum
+    from seerdb.server.backends.postgres import UnsupportedFeature, _rewrite_rownum
 
     rewritten = {
         'select c from t where c is not null and rownum <= 1': (
@@ -6984,8 +7011,12 @@ def test_a_collection_bind_is_bound_as_its_array() -> None:
                 "WHERE type_name LIKE 'T_COLLBIND%'"
             ).rows
         )
-        va = backend._collection_type(_pg_oid_of(bytes(oids['T_COLLBIND_VA'])))
-        nt = backend._collection_type(_pg_oid_of(bytes(oids['T_COLLBIND_NT'])))
+        va = _present(
+            backend._collection_type(_present(_pg_oid_of(bytes(oids['T_COLLBIND_VA']))))
+        )
+        nt = _present(
+            backend._collection_type(_present(_pg_oid_of(bytes(oids['T_COLLBIND_NT']))))
+        )
         elem = nt.element['object_type']
         images = [
             ObjectImage(
@@ -7039,7 +7070,7 @@ def test_lob_attributes_are_clob_and_blob() -> None:
         (oid,) = backend.execute(
             "SELECT type_oid FROM all_types WHERE type_name = 'T_LOBATTR_O'"
         ).rows[0]
-        typ, _info = backend._object_type(_pg_oid_of(bytes(oid)))
+        typ, _info = _present(backend._object_type(_present(_pg_oid_of(bytes(oid)))))
         assert [a['data_type'] for a in typ.attrs][1:] == [TNS_TYPE_CLOB, TNS_TYPE_BLOB]
         obj = typ.newobject(
             {
@@ -7141,7 +7172,7 @@ def test_zoned_timestamp_attributes_take_oracle_names() -> None:
         (oid,) = backend.execute(
             "SELECT type_oid FROM all_types WHERE type_name = 'T_ZONEATTR_O'"
         ).rows[0]
-        typ, _info = backend._object_type(_pg_oid_of(bytes(oid)))
+        typ, _info = _present(backend._object_type(_present(_pg_oid_of(bytes(oid)))))
         given = datetime.datetime(2026, 9, 27, 13, 14, 15)
         obj = typ.newobject({'A': given, 'C': given})
         image = ObjectImage(
@@ -7207,7 +7238,7 @@ def test_an_array_literal_quotes_every_element() -> None:
     import datetime
     from decimal import Decimal
 
-    from postgres_backend import _array_literal
+    from seerdb.server.backends.postgres import _array_literal
 
     assert (
         _array_literal([None, Decimal('1.5'), 'a"b\\c']) == '{NULL,"1.5","a\\"b\\\\c"}'
@@ -7447,7 +7478,6 @@ def test_describe_type_answers_an_oci_type_describe() -> None:
     # for this type are the live 11g ones byte for byte (#1411). A user's types
     # describe the same way; a name that is no type is None.
     import os
-    import sys
 
     sys.path.insert(0, os.path.dirname(__file__))
     import kod_11g as fx
@@ -7635,10 +7665,9 @@ def test_the_type_shape_of_xmltype_is_oracles() -> None:
     # DBMS_PICKLER.GET_TYPE_SHAPE before reading it; SYS.XMLTYPE has no
     # PostgreSQL type to look up, and was refused as an invalid type name. It
     # answers as a live 23ai does (#1536).
-    from postgres_backend import _XMLTYPE_OID, _XMLTYPE_TDS
-
     from seerdb.common.tns_consts import TNS_TYPE_RAW, TNS_TYPE_VARCHAR
     from seerdb.server.backend import BindVar
+    from seerdb.server.backends.postgres import _XMLTYPE_OID, _XMLTYPE_TDS
 
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     try:
@@ -7666,7 +7695,7 @@ def test_an_xmltype_attribute_or_element_has_23ais_tds() -> None:
     # An XMLType attribute or element is a reference to SYS.XMLTYPE's opaque
     # descriptor: `1b <block> 3a` and the block 23ai carries, where an object's
     # reference ends fa and a collection's fb (#1537). Both measured on 23ai.
-    from postgres_backend import (
+    from seerdb.server.backends.postgres import (
         _TDS_XMLTYPE,
         _tds,
         _tds_chars,
@@ -7692,7 +7721,7 @@ def test_an_object_with_an_xmltype_attribute_fetches() -> None:
     # udt_ObjectWithXmlType -- was refused as having no Oracle attribute type
     # (#1537). It fetches with the document in the attribute, which describes
     # as SYS.XMLTYPE.
-    from postgres_backend import _XMLTYPE_OID
+    from seerdb.server.backends.postgres import _XMLTYPE_OID
 
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     try:
@@ -7707,7 +7736,7 @@ def test_an_object_with_an_xmltype_attribute_fetches() -> None:
         (obj,) = result.rows[0]
         assert obj.XMLVALUE == '<item>one</item>'
         assert (obj.NUMBERVALUE, obj.STRINGVALUE) == (1, 'abc')
-        pg_oid = backend._conn.execute("SELECT 'xa1537'::regtype::oid").fetchone()[0]
+        pg_oid = _fetched_row(backend._conn.execute("SELECT 'xa1537'::regtype::oid"))[0]
         rows = backend._attribute_rows(pg_oid)
         assert (rows[1][3], rows[1][4], rows[1][6]) == ('XMLTYPE', 'SYS', _XMLTYPE_OID)
     finally:
@@ -7747,9 +7776,8 @@ def test_a_collection_of_a_national_type_stays_national() -> None:
     # its domain has no relation for sys.ora_columns to record the element by
     # (#1437). The dictionary, the TDS and the element's character set now say
     # what 23ai does; the TDS is 23ai's byte for byte.
-    from postgres_backend import _tds
-
     from seerdb.common.tns import AL16UTF16_CHARSET
+    from seerdb.server.backends.postgres import _tds
 
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     types = {
@@ -7779,20 +7807,22 @@ def test_a_collection_of_a_national_type_stays_national() -> None:
             '07000a0100000007',
         }
         for name, tds in expected.items():
-            pg_oid = backend._conn.execute(f"SELECT '{name}'::regtype::oid").fetchone()[
-                0
-            ]
+            pg_oid = _fetched_row(
+                backend._conn.execute(f"SELECT '{name}'::regtype::oid")
+            )[0]
             assert _tds(backend._type_shape(pg_oid)).hex() == tds, name
-            element = backend._collection_type(pg_oid).element
+            element = _present(backend._collection_type(pg_oid)).element
             national = name != 'nc1437'
             assert (element['charset'] == AL16UTF16_CHARSET) is national, name
         # A type that is gone takes its record with it.
         backend.execute('DROP TYPE na1437')
         backend.commit()
-        left = backend._conn.execute(
-            'SELECT count(*) FROM sys.ora_collection_elements x '
-            'WHERE NOT EXISTS (SELECT 1 FROM pg_type t WHERE t.oid = x.typid)'
-        ).fetchone()[0]
+        left = _fetched_row(
+            backend._conn.execute(
+                'SELECT count(*) FROM sys.ora_collection_elements x '
+                'WHERE NOT EXISTS (SELECT 1 FROM pg_type t WHERE t.oid = x.typid)'
+            )
+        )[0]
         assert left == 0
     finally:
         backend.rollback()
@@ -7817,8 +7847,8 @@ def test_a_collection_bound_into_a_select_list_fetches_as_the_collection() -> No
     try:
         backend.execute('CREATE TYPE cb1541 AS VARRAY(5) OF VARCHAR2(10)')
         backend.commit()
-        pg_oid = backend._conn.execute("SELECT 'cb1541'::regtype::oid").fetchone()[0]
-        typ = backend._collection_type(pg_oid)
+        pg_oid = _fetched_row(backend._conn.execute("SELECT 'cb1541'::regtype::oid"))[0]
+        typ = _present(backend._collection_type(pg_oid))
         image = encode_object_image(typ.newobject(['a', 'é']))
         bind = ObjectImage(typ.oid, typ.schema, typ.name, 0, image)
         result = backend.execute('SELECT :o v FROM dual', [bind])
@@ -7839,7 +7869,7 @@ def test_an_objects_raw_attribute_is_raw() -> None:
     # A RAW(n) attribute, a bytea here, was described and carried as a BLOB
     # (#1544). Its record says RAW(n): the dictionary, the attribute cursor and
     # the TDS -- 23ai's byte for byte, leaf `13 0010` -- now say so too.
-    from postgres_backend import _tds
+    from seerdb.server.backends.postgres import _tds
 
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     try:
@@ -7856,7 +7886,7 @@ def test_an_objects_raw_attribute_is_raw() -> None:
             ('R', 'RAW', 16),
             ('S', 'VARCHAR2', 5),
         ]
-        pg_oid = backend._conn.execute("SELECT 'ra1544'::regtype::oid").fetchone()[0]
+        pg_oid = _fetched_row(backend._conn.execute("SELECT 'ra1544'::regtype::oid"))[0]
         assert _tds(backend._type_shape(pg_oid)).hex() == (
             '0000002126010001000300290000000000120600811300100700050100002a0007000a000d'
         )
@@ -7947,7 +7977,7 @@ def test_an_objects_float_attribute_is_a_number_of_binary_precision() -> None:
     # binary float (#1423). Oracle makes it a NUMBER of binary precision, as a
     # table's FLOAT column (#1384), listed by the name it was declared with: a
     # numeric here, its declaration recorded. The TDS is 23ai's byte for byte.
-    from postgres_backend import _tds
+    from seerdb.server.backends.postgres import _tds
 
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     try:
@@ -7967,7 +7997,7 @@ def test_an_objects_float_attribute_is_a_number_of_binary_precision() -> None:
             ('F10', 'FLOAT', None, 10, None),
             ('N', 'NUMBER', None, None, None),
         ]
-        pg_oid = backend._conn.execute("SELECT 'fa1423'::regtype::oid").fetchone()[0]
+        pg_oid = _fetched_row(backend._conn.execute("SELECT 'fa1423'::regtype::oid"))[0]
         assert _tds(backend._type_shape(pg_oid)).hex() == (
             '000000242601000100050029000000000011050005000500050a0600812a'
             '00070009000b000d000f'
@@ -7996,7 +8026,7 @@ def test_an_objects_date_attribute_is_a_date() -> None:
     # TIMESTAMP (#1548). It is the ora_date domain, as a table's DATE column
     # is (#1316): DATE in the dictionary and the attribute cursor, and its TDS
     # leaf `02` -- 23ai's TDS byte for byte -- and it fetches as a datetime.
-    from postgres_backend import _tds
+    from seerdb.server.backends.postgres import _tds
 
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     try:
@@ -8011,7 +8041,7 @@ def test_an_objects_date_attribute_is_a_date() -> None:
             ('D', 'DATE', None),
             ('T', 'TIMESTAMP', None),
         ]
-        pg_oid = backend._conn.execute("SELECT 'da1548'::regtype::oid").fetchone()[0]
+        pg_oid = _fetched_row(backend._conn.execute("SELECT 'da1548'::regtype::oid"))[0]
         assert _tds(backend._type_shape(pg_oid)).hex() == (
             '0000001b260200010003002900000000000c0600810215062a0007000a000b'
         )
@@ -8071,7 +8101,7 @@ def test_a_tstz_attributes_type_shape_takes_its_precision() -> None:
     # A TIMESTAMP(n) WITH TIME ZONE attribute is the ora_tstz composite, whose
     # leaf said precision 6 whatever n was (#1552). It takes the recorded one
     # (#1550): 23ai's TDS byte for byte, `17 02` then `17 06`.
-    from postgres_backend import _tds
+    from seerdb.server.backends.postgres import _tds
 
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     try:
@@ -8080,7 +8110,7 @@ def test_a_tstz_attributes_type_shape_takes_its_precision() -> None:
             'tz TIMESTAMP(2) WITH TIME ZONE, tzd TIMESTAMP WITH TIME ZONE)'
         )
         backend.commit()
-        pg_oid = backend._conn.execute("SELECT 'tz1552'::regtype::oid").fetchone()[0]
+        pg_oid = _fetched_row(backend._conn.execute("SELECT 'tz1552'::regtype::oid"))[0]
         assert _tds(backend._type_shape(pg_oid)).hex() == (
             '0000001c260200010003002900000000000d060081170217062a0007000a000c'
         )
@@ -8098,7 +8128,7 @@ def test_a_pg_hint_marks_a_native_statement() -> None:
     # An Oracle hint naming PG, at the start or after the first keyword, marks
     # a statement as PostgreSQL's own (#1556); any other hint, or PG inside a
     # longer word, does not.
-    from postgres_backend import _PG_HINT
+    from seerdb.server.backends.postgres import _PG_HINT
 
     for sql in (
         'SELECT /*+ PG */ 1',
@@ -8126,7 +8156,7 @@ def test_native_postgresql_over_the_oracle_connection() -> None:
     # column aliases the Oracle translation would rewrite or refuse. Binds stay
     # Oracle's, DDL still commits, executemany takes the hint, and a result
     # type with no Oracle form is refused by name.
-    from postgres_backend import UnsupportedFeature
+    from seerdb.server.backends.postgres import UnsupportedFeature
 
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     try:
@@ -8173,7 +8203,7 @@ def test_the_translation_report_names_the_rules_a_statement_needed() -> None:
     # Each translation step notes its name when it changes the text, while a
     # report is being taken (#1557); a portable statement needs none, and with
     # no report nothing is collected.
-    from postgres_backend import _TRANSLATION_RULES
+    from seerdb.server.backends.postgres import _TRANSLATION_RULES
 
     rules: list[str] = []
     token = _TRANSLATION_RULES.set(rules)
@@ -8191,7 +8221,7 @@ def test_the_translation_report_names_the_rules_a_statement_needed() -> None:
 def test_the_translation_report_folds_a_statements_literals() -> None:
     # Runs with different values count as one statement; a quoted identifier
     # and a bind stay as written (#1557).
-    from postgres_backend import _normalise_statement
+    from seerdb.server.backends.postgres import _normalise_statement
 
     assert (
         _normalise_statement(
@@ -8253,7 +8283,7 @@ def test_a_collection_of_raw_is_a_collection_of_raw() -> None:
     # recorded with the DDL, as a national element's are (#1437): the
     # dictionary, the TDS -- 23ai's byte for byte, leaf `13 0014` -- and the
     # element's description say RAW.
-    from postgres_backend import _tds
+    from seerdb.server.backends.postgres import _tds
 
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     try:
@@ -8268,11 +8298,11 @@ def test_a_collection_of_raw_is_a_collection_of_raw() -> None:
             ('RC1545', 'RAW', 20, None),
             ('RV1545', 'RAW', 4, None),
         ]
-        pg_oid = backend._conn.execute("SELECT 'rc1545'::regtype::oid").fetchone()[0]
+        pg_oid = _fetched_row(backend._conn.execute("SELECT 'rc1545'::regtype::oid"))[0]
         assert _tds(backend._type_shape(pg_oid)).hex() == (
             '0000001e260100010001ff290000000000131c0000001d00000000022a1300140007'
         )
-        element = backend._collection_type(pg_oid).element
+        element = _present(backend._collection_type(pg_oid)).element
         assert (element['type_name'], element['charset']) == ('RAW', None)
     finally:
         backend.rollback()
@@ -8288,7 +8318,7 @@ def test_a_collection_of_raw_is_a_collection_of_raw() -> None:
 def test_oracle_alter_table_column_forms_translate() -> None:
     # Oracle's ADD (list), MODIFY and DROP (list) in PostgreSQL's spelling, the
     # types as CREATE TABLE translates them (#1414).
-    from postgres_backend import _translate_ddl
+    from seerdb.server.backends.postgres import _translate_ddl
 
     assert _translate_ddl('ALTER TABLE t ADD (d DATE, e CLOB, f RAW(5))') == (
         'ALTER TABLE t ADD COLUMN d ora_date, ADD COLUMN e ora_clob, ADD COLUMN f bytea '
@@ -8532,7 +8562,7 @@ def test_a_dictionary_from_a_newer_seerdb_is_replaced() -> None:
     # newer seerdb, or a branch's -- made CREATE OR REPLACE VIEW fail, so the
     # install failed on every connection and the stamp was never written
     # (#1571). The views are dropped and created again.
-    from postgres_backend import _DICTIONARY_STAMP
+    from seerdb.server.backends.postgres import _DICTIONARY_STAMP
 
     raw = psycopg.connect(_CONNINFO, autocommit=True)
     try:
@@ -8565,7 +8595,7 @@ def test_a_type_shape_block_is_answered_by_argument_position() -> None:
     # which a hand-written block need not use (#1542). The TDS is 23ai's.
     from types import SimpleNamespace
 
-    from postgres_backend import _tds, _type_shape_roles
+    from seerdb.server.backends.postgres import _tds, _type_shape_roles
 
     block = (
         'declare i varchar2(3); o varchar2(128); m varchar2(128); s sys_refcursor; '
@@ -8600,7 +8630,7 @@ def test_a_type_shape_block_is_answered_by_argument_position() -> None:
             block, binds
         ).out_binds
         assert (ret, version) == (0, 1) and len(oid) == 16
-        pg_oid = backend._conn.execute("SELECT 'ts1542'::regtype::oid").fetchone()[0]
+        pg_oid = _fetched_row(backend._conn.execute("SELECT 'ts1542'::regtype::oid"))[0]
         assert tds == _tds(backend._type_shape(pg_oid))
         assert [(row[1], row[3]) for row in cursor.rows] == [
             ('N', 'NUMBER'),
@@ -8628,7 +8658,7 @@ def test_a_character_value_compared_with_raw_is_hex() -> None:
     # value as hex, as Oracle does (#1496): either way round, an IN list, a
     # bind, an UPDATE's and a DELETE's. A character column's comparison, and
     # one in a subquery, are left alone. The rows are 23ai's.
-    from postgres_backend import _mask_quoted
+    from seerdb.server.backends.postgres import _mask_quoted
 
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     try:
@@ -8935,7 +8965,7 @@ def test_an_object_type_is_in_the_dictionary_and_round_trips() -> None:
         ).rows
         assert attrs == [('ID', 'NUMBER', None, None), ('NAME', 'VARCHAR2', None, 40)]
 
-        typ, _info = backend._object_type(_pg_oid_of(bytes(oid)))
+        typ, _info = _present(backend._object_type(_present(_pg_oid_of(bytes(oid)))))
         obj = typ.newobject({'ID': 7, 'NAME': 'Alice'})
         image = ObjectImage(bytes(oid), owner, typ.name, None, encode_object_image(obj))
         backend.execute('INSERT INTO t_objround VALUES (1, :o)', [image])
@@ -9004,7 +9034,7 @@ def test_an_unsized_number_is_recorded_without_a_precision() -> None:
     # INTEGER, SMALLINT, a bare DECIMAL and NUMBER(*, s) are numeric(38, s) here,
     # as NUMBER(38, s) is; only the declaration says they have no precision, so
     # it is recorded (#1483). A sized NUMBER needs no record.
-    from postgres_backend import _declared_type
+    from seerdb.server.backends.postgres import _declared_type
 
     assert _declared_type('INTEGER NOT NULL') == ('NUMBER', 22, None, 0)
     assert _declared_type('smallint') == ('NUMBER', 22, None, 0)
@@ -9060,37 +9090,45 @@ def test_a_compile_time_error_in_a_block_is_ora_06550() -> None:
     # of what is wrong in the client's block. A string passed positionally where
     # a routine of that arity takes a number converts at run time: ORA-06502
     # (#1497).
-    from postgres_backend import _plsql_compile_error
+    from seerdb.server.backends.postgres import _plsql_compile_error
 
     class Failure(Exception):
         def __init__(self, sqlstate: str, message: str) -> None:
             super().__init__(message)
             self.sqlstate = sqlstate
 
-    unknown = _plsql_compile_error(
-        Failure('42601', '"t_missing" is not a known variable'),
-        'begin t_Missing := 5; end;',
+    unknown = _present(
+        _plsql_compile_error(
+            Failure('42601', '"t_missing" is not a known variable'),
+            'begin t_Missing := 5; end;',
+        )
     )
     assert (unknown.ora_code, unknown.error_offset) == (6550, 6)
     assert str(unknown).startswith('line 1, column 7:')
     assert "PLS-00201: identifier 'T_MISSING' must be declared" in str(unknown)
     call = 'begin :r := f(:1, :2, :3); end;'
-    too_many = _plsql_compile_error(
-        Failure('42883', 'function f(unknown, integer, integer) does not exist'),
-        call,
-        lambda name: {2},
+    too_many = _present(
+        _plsql_compile_error(
+            Failure('42883', 'function f(unknown, integer, integer) does not exist'),
+            call,
+            lambda name: {2},
+        )
     )
     assert too_many.ora_code == 6550 and 'PLS-00306' in str(too_many)
-    converted = _plsql_compile_error(
-        Failure('42883', 'function f(integer, text) does not exist'),
-        call,
-        lambda name: {2},
+    converted = _present(
+        _plsql_compile_error(
+            Failure('42883', 'function f(integer, text) does not exist'),
+            call,
+            lambda name: {2},
+        )
     )
     assert converted.ora_code == 6502
-    named = _plsql_compile_error(
-        Failure('42883', 'function f(text, a => boolean) does not exist'),
-        call,
-        lambda name: {2},
+    named = _present(
+        _plsql_compile_error(
+            Failure('42883', 'function f(text, a => boolean) does not exist'),
+            call,
+            lambda name: {2},
+        )
     )
     assert named.ora_code == 6550
     assert _plsql_compile_error(Failure('22012', 'division by zero'), call) is None

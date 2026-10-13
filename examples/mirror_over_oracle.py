@@ -31,9 +31,9 @@ import os
 import sys
 
 from mirror_launch import mirror_credentials, setup_logging
-from oracle_passthrough_backend import OraclePassthroughBackend
 
 import seerdb
+from seerdb.server.backends.passthrough import OraclePassthroughBackend
 
 
 def main() -> None:
