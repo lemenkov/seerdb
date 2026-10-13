@@ -14,7 +14,7 @@ the defaults; the command line wins. The config file is INI::
     [server]
     host = 127.0.0.1
     port = 1521
-    encryption = accepted       ; accepted | requested | required (ANO)
+    encryption = requested      ; accepted | requested | required (ANO)
     log_level = INFO
     ; tls_cert = server.pem     ; TCPS: the server's certificate chain
     ; tls_key = server.key      ;       and its private key
@@ -62,7 +62,7 @@ class Launch:
     log_level: str
     # None for the observer, which serves no backend.
     backend_factory: Callable[[], Backend] | None
-    encryption: str = 'accepted'
+    encryption: str = 'requested'
     field_version: int | None = None
     description: str = ''
     # TCPS (#1834): the server context, None for plain TCP.
@@ -86,8 +86,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--encryption',
         choices=_ENCRYPTION,
-        help='native network encryption (ANO): accepted (default), requested '
-        'or required',
+        help='native network encryption (ANO): requested (default) encrypts '
+        'whenever the client offers it, required refuses a client that does not, '
+        'accepted never encrypts',
     )
     parser.add_argument('--log-level', help='DEBUG, INFO (default), WARNING or ERROR')
     parser.add_argument(
@@ -204,7 +205,8 @@ def build(
 
     host = option(args.host, server, 'host', '127.0.0.1')
     port = int(option(args.port, server, 'port', '1521'))
-    encryption = option(args.encryption, server, 'encryption', 'accepted')
+    # requested by default (#1844): encrypt whenever the client offers ANO.
+    encryption = option(args.encryption, server, 'encryption', 'requested')
     if encryption not in _ENCRYPTION:
         raise SystemExit(f'encryption must be one of {", ".join(_ENCRYPTION)}')
     log_level = option(args.log_level, server, 'log_level', 'INFO').upper()

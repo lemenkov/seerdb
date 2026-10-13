@@ -32,7 +32,7 @@ def test_a_postgres_mirror_from_the_command_line() -> None:
     assert (launch.host, launch.port, launch.encryption) == (
         '127.0.0.1',
         1521,
-        'accepted',
+        'requested',
     )
     assert launch.log_level == 'INFO'
     assert launch.backend_factory is not None

@@ -62,7 +62,7 @@ Any service name is accepted.
 |---|---|---|
 | `--host` | `127.0.0.1` | listen address; give `0.0.0.0` to accept other hosts |
 | `--port` | `1521` | listen port |
-| `--encryption` | `accepted` | native network encryption (ANO): `accepted` never encrypts, `requested` encrypts whenever the client offers AES, `required` refuses a client that doesn't |
+| `--encryption` | `requested` | native network encryption (ANO): `requested` encrypts whenever the client offers AES, `required` refuses a client that doesn't, `accepted` never encrypts |
 | `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR` |
 | `--tls-cert` | | serve TCPS: the server's certificate chain, PEM (see *Encryption*) |
 | `--tls-key` | | that certificate's private key, PEM |
@@ -96,7 +96,7 @@ The command line wins over the config file, and the file over the defaults.
 [server]
 host = 127.0.0.1
 port = 1521
-encryption = accepted
+encryption = requested
 log_level = INFO
 ; tls_cert = /etc/mirror/server.pem
 ; tls_key = /etc/mirror/server.key
@@ -171,11 +171,13 @@ TLS is the way to protect a Mirror that listens beyond localhost: unlike ANO, it
 authenticates the server.
 
 **Native network encryption (ANO).** AES-128, -192 or -256 with a SHA-2
-checksum. The default stance, `accepted`, leaves every session in plaintext, and
-a client that requires encryption is refused. Give `--encryption requested` to
-encrypt whenever the client offers it, or `required` to serve only clients that
-do. ANO's key exchange does not authenticate the server, so it does not protect
-against a man in the middle; use TLS for that.
+checksum. By default (`requested`) the Mirror encrypts whenever the client
+offers ANO, and serves a client that doesn't in plaintext. Give `--encryption
+required` to serve only clients that encrypt, or `accepted` to never encrypt
+(a client that requires encryption is then refused). seerdb's client offers ANO
+by default; sqlplus and other OCI clients offer it when their `sqlnet.ora`
+asks for it. ANO's key exchange does not authenticate the server, so it does
+not protect against a man in the middle; use TLS for that.
 
 ## Mirror over PostgreSQL
 
