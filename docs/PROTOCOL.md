@@ -710,7 +710,11 @@ sqlplus's `TTI_PRO`, and the "TYPE" round the DTY proper. sqlplus does not
 come down to what the Mirror advertised, as a thin client does. sqlplus 23.26
 sends 27 and sqlplus 11.2 sends 6, so the Mirror takes the lower of the
 client's version and its own. Everything after that point follows it: the
-challenge, the result trailer, and the session's OCI layout.
+challenge, the result trailer, and the session's OCI layout. The lowest it
+serves is 10.2 (field version 4), as for a thin client. sqlplus 10.2's own
+widths are the type round, pointer fields, OALL8 preamble, describe and
+DESCRIBE reply described in this section (#1764). An older sqlplus is
+refused by name.
 
 In that layout the narrow `OALL8` preamble grows by **64
 zero bytes** ahead of the SQL, eight more 8-byte slots. The SQL text moves from

@@ -79,7 +79,7 @@ def main() -> None:
                 # The release it presents (#1704): Oracle 23ai, field version 24,
                 # by default (#1747); MIRROR_PRESENTS=12.1 pins the older one.
                 # A thin client of any version from 10.2 negotiates its own (#816,
-                # #814); sqlplus / thick OCI from 11.2 (#1764).
+                # #814); sqlplus / thick OCI from 10.2 too (#1764).
                 presents=os.environ.get('MIRROR_PRESENTS', '23ai'),
             )
         ),

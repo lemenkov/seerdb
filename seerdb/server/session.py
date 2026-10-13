@@ -993,10 +993,11 @@ def _open_backend_session(
         )
 
 
-# The lowest field version the Mirror serves sqlplus / thick OCI at. A thin
-# client is served from 10g (#814), but sqlplus 10.2 logs in with an OSESSKEY
-# and a type round laid out apart from the 11.2+ ones the OCI path reads (#1764).
-_OCI_MIN_FIELD_VERSION = FIELD_VERSION_11_2
+# The lowest field version the Mirror serves sqlplus / thick OCI at: 10.2, as
+# for a thin client (#814). sqlplus 10.2's type round, auth messages, execute,
+# describe and DESCRIBE reply each have their own widths, which the OCI path
+# follows by the session's version (#1764). An older sqlplus is refused.
+_OCI_MIN_FIELD_VERSION = FIELD_VERSION_10_2
 
 
 def sqlplus_field_version(
