@@ -9453,6 +9453,10 @@ def _oci_desc_block(col: ColumnMeta, *, last: bool, timestamp: bytes) -> bytes:
         entry = _oci_desc_ts_entry(timestamp)
         off = _OCI_DESC_BLK_TS_OFF
         post[off : off + len(entry)] = entry
+    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_11_2:
+        # sqlplus 10.2's block is a byte shorter: 11g sends it without the zero
+        # behind the 0x24 mark, where the 12c form grows (#1764).
+        del post[_OCI_DESC_12C_POST_MARK_OFF + 1]
     if _oci_desc_12c():
         pre[1] = _OCI_DESC_12C_BLK_LEAD
         mark = _OCI_DESC_12C_POST_MARK_OFF
@@ -9499,7 +9503,12 @@ def encode_describe_reply_oci(
     if _oci_desc_12c():
         out += _oci_desc_trailer(_oci_desc_trailer_frame_12c(len(columns)))
         return bytes(out)
-    trailer = bytearray(_oci_desc_trailer())
+    frame = _oci_desc_trailer_frame()
+    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_11_2:
+        # ...and its trailer frame one shorter: 120 bytes ahead of the OER, the
+        # last zero of 11.2's 121 dropped (#1764).
+        frame = frame[:-1]
+    trailer = bytearray(_oci_desc_trailer(frame))
     trailer[_OCI_DESC_TR_COUNT] = len(columns) & 0xFF
     trailer[_OCI_DESC_TR_OPAQUE] = (
         _OCI_DESC_TR_OPAQUE_BY_TYPE.get(columns[0].data_type, _OCI_DESC_TR_OPAQUE_MULTI)
