@@ -111,7 +111,7 @@ jobs:
       # Install the package so runtime deps (pycryptodome, tzdata) are present
       # for every offline module. The DB-backed integration tests skip
       # automatically without SEERDB_TEST_USER.
-      - run: pip install .
+      - run: pip install . pytest
       - run: >-
           python -m unittest -v
           tests.test_crypto
@@ -120,6 +120,8 @@ jobs:
           tests.test_tns_types
           tests.test_api_conveniences
           tests.test_connection
+      # Every temporal bind encoding against python-oracledb's (#1338).
+      - run: python -m pytest -q tests/test_temporal_bind_grid.py
 
   # Static type-check gate (#232). Enforces mypy on the already-clean modules;
   # the larger driver modules are exempt via [tool.mypy] overrides until cleaned

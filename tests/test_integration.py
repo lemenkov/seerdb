@@ -202,6 +202,7 @@ def _target_is_8i() -> bool:
 import sys as _sys
 
 _sys.path.insert(0, os.path.dirname(__file__))
+import temporal_bind_grid as _grid  # noqa: E402
 from _redirect_listener import RedirectListener  # noqa: E402
 from _tls_proxy import CERT_PATH, TLSProxy  # noqa: E402
 
@@ -8391,6 +8392,141 @@ class ObjectTimeZoneAttributeIntegration(_IntegrationBase):
         (fetched,) = self.cur.fetchone()
         self.assertEqual(fetched.TS, entered)
         self.assertEqual(fetched.TS.utcoffset(), datetime.timedelta(hours=2))
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class TemporalBindGridIntegration(_IntegrationBase):
+    """Every cell of the temporal bind grid, as the server reads it (#1338).
+
+    tests/test_temporal_bind_grid.py checks the bytes each cell sends; this
+    checks what they mean to a real server. Each value is bound in its cell's
+    context and the server prints what it received with TO_CHAR, to the
+    microsecond and the offset, for comparison with what the value should
+    mean (``expected_text`` in temporal_bind_grid). A Mirror leg is skipped:
+    the question is what Oracle reads."""
+
+    TABLE = _grid.OBJECT_TYPE_PREFIX + 'T'
+
+    def setUp(self):
+        super().setUp()
+        if os.environ.get('SEERDB_TEST_MIRROR'):
+            self.conn.close()
+            self.skipTest('the grid checks what a real Oracle server reads')
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            self.conn.close()
+            self.skipTest('the grid starts at 10g')
+        # A LOCAL TIME ZONE bind is an instant in the database's zone (#1222);
+        # printed in that zone too, it reads back as the wall clock sent.
+        self.cur.execute('ALTER SESSION SET TIME_ZONE = DBTIMEZONE')
+        self._drop_types()
+        columns = ', '.join(f'{Short} {Sql}' for Sql, Short in _grid.SQL_TYPE.values())
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (K NUMBER, {columns})')
+        if self.conn.field_version >= FIELD_VERSION_12_1:
+            for declared, (sql_type, _short) in _grid.SQL_TYPE.items():
+                self.cur.execute(
+                    f'CREATE TYPE {_grid.object_type_name(declared)} AS OBJECT (A {sql_type})'
+                )
+
+    def tearDown(self):
+        self._drop_types()
+        super().tearDown()
+
+    def _drop_types(self):
+        with self.conn.cursor() as cur:
+            for declared in _grid.SQL_TYPE:
+                try:
+                    cur.execute(f'DROP TYPE {_grid.object_type_name(declared)} FORCE')
+                except seerdb.DatabaseError:
+                    pass  # not created yet
+
+    def _each(self, context, read):
+        # Every cell of `context` that seerdb sends right, through `read`, which
+        # binds the cell's values and returns the server's TO_CHAR of each. The
+        # mismatches are collected and compared at the end, so one run reports
+        # every cell that is wrong.
+        wrong = {}
+        for cell in _grid.cells():
+            if cell.context != context or _grid.gap(cell, 'server') is not None:
+                continue
+            values = cell.values
+            fmt = _grid.TO_CHAR_FORMAT[_grid.kind(cell, values[0])]
+            if cell.seerdb_only and cell.declared == 'DB_TYPE_TIMESTAMP_TZ':
+                # A date before year 1 has no time zone rules to apply.
+                expected: object = 'DataError'
+            else:
+                expected = [_grid.expected_text(cell, V) for V in values]
+            try:
+                got: object = read(cell, fmt)
+            except seerdb.DataError:
+                got = 'DataError'
+            if got != expected:
+                wrong[cell.key] = (got, expected)
+        self.assertEqual(wrong, {})
+
+    def _declared(self, cell):
+        return getattr(seerdb, cell.declared) if cell.declared else None
+
+    def test_execute(self):
+        def read(cell, fmt):
+            declared = self._declared(cell)
+            if declared is not None:
+                self.cur.setinputsizes(declared)
+            self.cur.execute(f"SELECT TO_CHAR(:b, '{fmt}') FROM dual", cell.values)
+            return [self.cur.fetchone()[0]]
+
+        self._each('execute', read)
+
+    def _read_executemany(self, cell, fmt):
+        column = _grid.SQL_TYPE[_grid.kind(cell, cell.values[0])][1]
+        self.cur.execute(f'DELETE FROM {self.TABLE}')
+        declared = self._declared(cell)
+        if declared is not None:
+            self.cur.setinputsizes(None, declared)
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} (K, {column}) VALUES (:k, :b)',
+            [[K, V] for K, V in enumerate(cell.values)],
+        )
+        self.cur.execute(
+            f"SELECT TO_CHAR({column}, '{fmt}') FROM {self.TABLE} ORDER BY K"
+        )
+        return [R[0] for R in self.cur.fetchall()]
+
+    def test_executemany(self):
+        self._each('executemany', self._read_executemany)
+
+    def test_executemany_mixed_widths(self):
+        self._each('executemany_mixed', self._read_executemany)
+
+    def test_object_attribute(self):
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('an object bind needs the 12.1+ OAC')
+
+        def read(cell, fmt):
+            name = _grid.object_type_name(cell.declared)
+            obj = self.conn.gettype(name).newobject()
+            obj.A = cell.values[0]
+            out = self.cur.var(str)
+            self.cur.execute(
+                f"DECLARE o {name} := :b; BEGIN :r := TO_CHAR(o.A, '{fmt}'); END;",
+                [obj, out],
+            )
+            return [out.getvalue()]
+
+        self._each('object', read)
+
+    def test_in_out(self):
+        def read(cell, fmt):
+            var = self.cur.var(self._declared(cell))
+            var.setvalue(0, cell.values[0])
+            out = self.cur.var(str)
+            # Written as well as read, so the bind is IN OUT; NULL, as a value
+            # before year 1 cannot come back as a datetime.
+            self.cur.execute(
+                f"BEGIN :r := TO_CHAR(:b, '{fmt}'); :b := NULL; END;", [out, var]
+            )
+            return [out.getvalue()]
+
+        self._each('inout', read)
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
