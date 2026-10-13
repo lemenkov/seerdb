@@ -1340,11 +1340,13 @@ if __name__ == '__main__':
 
 
 class TestMixedPrecisionBatch(unittest.TestCase):
-    """One wire width per temporal column of an array bind (#1098).
+    """One declared type per temporal column of an array bind (#1098).
 
-    Width is chosen per value -- 7 bytes without a sub-second part, 11 with one
-    -- but every row of an array bind must match the single OAC. A mixed batch
-    sent both widths and the server answered ORA-01483.
+    The type is chosen per value -- DATE without a sub-second part, TIMESTAMP
+    with one -- but an array bind has a single OAC per column. A mixed batch
+    was declared by one row and the server answered ORA-01483. Only the
+    declaration widens: a whole-second row keeps the 7-byte form, which a
+    TIMESTAMP descriptor takes (#1805).
     """
 
     PLAIN = datetime.datetime(2020, 2, 29)
@@ -1355,17 +1357,23 @@ class TestMixedPrecisionBatch(unittest.TestCase):
 
         return _widen_batch_datetimes(rows)
 
-    def test_a_mixed_column_goes_out_at_one_width(self):
-        from seerdb.common.tns import encode_token_oac, encode_token_rxd
+    def test_a_mixed_column_is_declared_timestamp(self):
+        from seerdb.common.tns import encode_token_oac
 
         rows = self._widen([[1, self.PLAIN], [2, self.FRAC]])
-        widths = {len(encode_token_rxd(r[1])) for r in rows}
-        self.assertEqual(widths, {12})  # 1-byte length + the 11-byte TIMESTAMP
-        # and the descriptor says TIMESTAMP for either row's value
+        # The descriptor says TIMESTAMP for either row's value.
         self.assertEqual(
             {encode_token_oac(r[1]) for r in rows},
             {encode_token_oac(self.FRAC)},
         )
+
+    def test_a_whole_second_row_keeps_the_7_byte_form(self):
+        from seerdb.common.tns import encode_token_rxd
+
+        rows = self._widen([[1, self.PLAIN], [2, self.FRAC]])
+        # 1-byte length + 7 bytes, then 1 + the 11-byte TIMESTAMP form, as
+        # python-oracledb sends a TIMESTAMP batch (#1805).
+        self.assertEqual([len(encode_token_rxd(r[1])) for r in rows], [8, 12])
 
     def test_the_values_are_unchanged(self):
         rows = self._widen([[1, self.PLAIN], [2, self.FRAC]])
