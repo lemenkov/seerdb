@@ -6557,6 +6557,29 @@ class TestO8iOsesskeyMessages(unittest.TestCase):
             '5f41434c04000000043830303000000000',
         )
 
+    def test_a_long_program_name_is_cut_to_what_the_field_holds(self):
+        # The ub1 length stops at 252: 253-255 are TTC markers, and a longer
+        # name could not be written at all (#1773).
+        from seerdb.common.tns import (
+            encode_o3logon_oauth_phase2,
+            encode_o3logon_osesskey_phase1,
+        )
+
+        for name, sent in (
+            (b'p' * 252, b'p' * 252),
+            (b'p' * 253, b'p' * 252),
+            (b'p' * 600, b'p' * 252),
+            # Never half a character: 'é' is two bytes and would straddle 252.
+            (b'p' * 251 + 'é'.encode('utf-8') * 10, b'p' * 251),
+        ):
+            pairs = [(b'AUTH_PROGRAM_NM', name), (b'AUTH_PID', b'1')]
+            field = bytes([len(sent)]) + len(sent).to_bytes(4, 'big') + sent
+            for message in (
+                encode_o3logon_osesskey_phase1(2, b'system', pairs),
+                encode_o3logon_oauth_phase2(3, b'system', b'00', pairs),
+            ):
+                self.assertIn(field + bytes(4) + b'\x08', message)
+
     def test_parse_auth_sesskey(self):
         from binascii import hexlify
 

@@ -2590,6 +2590,17 @@ class CursorIntegration(_IntegrationBase):
             cur.execute('SELECT 1 FROM dual')
             self.assertEqual(cur.fetchone(), (1,))
 
+    def test_a_long_program_name_connects(self):
+        # 8i's login gives a program name one length byte, which stops at 252:
+        # 253 to 255 failed the login and a longer one could not be sent at all
+        # (#1773). Every other server takes these whole.
+        for length in (253, 254, 255, 600):
+            with self.subTest(length=length):
+                with _connect_with(app_name='p' * length) as conn:
+                    cur = conn.cursor()
+                    cur.execute('SELECT 1 FROM dual')
+                    self.assertEqual(cur.fetchone(), (1,))
+
     def test_kill_session_ends_the_named_session(self):
         # ALTER SYSTEM KILL SESSION 'sid,serial' ends that session: its next call
         # fails with ORA-00028 and the connection is gone (#1212, #1367) -- even a
@@ -9631,6 +9642,17 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             async with Conn.cursor() as Cur:
                 await Cur.execute('SELECT 1 FROM dual')
                 self.assertEqual(await Cur.fetchone(), (1,))
+
+    async def test_a_long_program_name_connects(self):
+        # Async twin of CursorIntegration's.
+        for length in (253, 254, 255, 600):
+            with self.subTest(length=length):
+                async with await seerdb.connect_async(
+                    **self._kwargs(app_name='p' * length)
+                ) as Conn:
+                    async with Conn.cursor() as Cur:
+                        await Cur.execute('SELECT 1 FROM dual')
+                        self.assertEqual(await Cur.fetchone(), (1,))
 
     async def test_kill_session_ends_the_named_session(self):
         # Async twin of CursorIntegration's.
