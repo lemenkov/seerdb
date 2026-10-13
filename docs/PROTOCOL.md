@@ -6028,7 +6028,13 @@ the exact inverse of the read path (python-oracledb `write_dbobject` /
   with a NULL collection written as `0xFF`.
 - **OAC** (`_encode_object_oac`): the 12c+ bind-metadata layout — `type 109`,
   flag `TNS_BIND_USE_INDICATORS`, precision/scale `0`, buffer size, the type OID
-  via `two_lengths`, and the type version (no charset). This is the **12c+** OAC;
+  via `two_lengths`, and the type version (no charset). For an object **value**,
+  the buffer size is `0`, as python-oracledb sends it for every object bind. The
+  image carries its own length. seerdb used to send the image length here, and
+  every server accepted that too. With `0`, 18c, 21c, 23ai and 26ai bind objects
+  and collections alike, up to a 400 KB nested table (#1806). A
+  `cursor.var(objtype)` keeps a fixed nonzero size for the server to return
+  into. This is the **12c+** OAC;
   there is no python-oracledb reference for a pre-12c object-bind OAC (thin needs
   12.1+) and a 12c+ OAC sent to 10g/11g is rejected with a fatal ORA-03106, so
   seerdb **gates object binds on field version ≥ 12.1** (`NotSupportedError`)

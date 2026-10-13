@@ -349,11 +349,4 @@ def gap(cell: Cell, part: str) -> int | None:
 
     ``part`` is what is compared: ``'oac'`` the bind's type and size, ``'bytes'``
     the value bytes (both offline), ``'server'`` what a live server reads."""
-    if cell.context == 'object' and part == 'oac':
-        # A date before year 1 into a WITH TIME ZONE attribute is refused before
-        # there is an OAC; every other object bind's OAC carries a size where
-        # python-oracledb's is 0.
-        if cell.seerdb_only and cell.declared == 'DB_TYPE_TIMESTAMP_TZ':
-            return None
-        return 1806
     return None
