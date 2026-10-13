@@ -104,11 +104,10 @@ jobs:
         env:
           MIRROR_PG: "host=localhost port=5433 user=pyo password=pyo123 dbname=mirror"
         run: |
-          # Run the Mirror from the repository checkout (the launcher lives in
-          # examples/, so without PYTHONPATH it would import the pip-installed
-          # seerdb rather than this checkout's).
+          # The packaged launcher of the seerdb installed above from this
+          # checkout. PYO is the suite's account (#1835).
           REPO="${GITHUB_WORKSPACE}"
-          PYTHONPATH="$REPO" python "$REPO/examples/mirror_over_postgres.py" "$MIRROR_PG" 1521 > "$REPO/mirror.log" 2>&1 &
+          MIRROR_USERS=pyo:pyo123 seerdb-mirror --port 1521 postgres "$MIRROR_PG" > "$REPO/mirror.log" 2>&1 &
           MIRROR_PID=$!
           for i in $(seq 1 30); do
             python -c "import socket; socket.create_connection(('127.0.0.1', 1521), timeout=1).close()" 2>/dev/null && break

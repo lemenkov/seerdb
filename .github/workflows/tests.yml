@@ -280,7 +280,7 @@ jobs:
         run: python -m unittest -v tests.test_integration
 
   # The same integration suite, driven through the Mirror over a PostgreSQL
-  # backend (examples/mirror_over_postgres.py): a real seerdb client talks to the
+  # backend (`seerdb-mirror postgres`): a real seerdb client talks to the
   # Mirror, which serves every statement from PostgreSQL via the dialect
   # translator. Regressions in the backend or the Mirror's thin path used to go
   # unnoticed because nothing ran the suite this way. PostgreSQL comes from the
@@ -346,9 +346,10 @@ jobs:
           if [ "$MIRROR_PRESENTS" = "23ai" ]; then
             python -m pytest -q tests/test_postgres_backend.py
           fi
-          # Run the Mirror from the checkout (the launcher lives in examples/, so
-          # without this it would import whatever `pip install .` shipped).
-          PYTHONPATH="$PWD" python examples/mirror_over_postgres.py "$MIRROR_PG" 1521 > mirror.log 2>&1 &
+          # The packaged launcher, as a user runs it: `pip install ".[mirror]"`
+          # installed this checkout. PYO is the suite's account (#1835).
+          MIRROR_USERS=pyo:pyo123 seerdb-mirror --port 1521 \
+            postgres "$MIRROR_PG" --presents "$MIRROR_PRESENTS" > mirror.log 2>&1 &
           MIRROR_PID=$!
           for i in $(seq 1 30); do
             python -c "import socket; socket.create_connection(('127.0.0.1', 1521), timeout=1).close()" 2>/dev/null && break

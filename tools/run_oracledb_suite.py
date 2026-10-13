@@ -15,7 +15,7 @@ version whose expectations you want to match). Launch a passthrough Mirror over
 a real 23ai first::
 
     MIRROR_USERS=pythontest:pythontest,pythontestproxy:pythontestproxy,pyoadm:pyoadm123 \\
-        python examples/mirror_over_oracle.py 1600 192.168.0.150:1523/FREEPDB1
+        seerdb-mirror --port 1600 passthrough 192.168.0.150:1523/FREEPDB1
 
 then::
 
