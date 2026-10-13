@@ -56,6 +56,7 @@ SEERDB_ONLY_VALUES = frozenset({'bc', 'bc_fraction'})
 MIXED_ROWS: dict[str, tuple[str, str]] = {
     'whole+fraction': ('whole', 'fraction'),
     'fraction+midnight': ('fraction', 'midnight'),
+    'bc+bc_fraction': ('bc', 'bc_fraction'),
 }
 
 # --- The declarations ------------------------------------------------------
@@ -348,8 +349,6 @@ def gap(cell: Cell, part: str) -> int | None:
 
     ``part`` is what is compared: ``'oac'`` the bind's type and size, ``'bytes'``
     the value bytes (both offline), ``'server'`` what a live server reads."""
-    if cell.declared is None and cell.seerdb_only:
-        return 1804  # an undeclared date before year 1 has no OAC
     if cell.context == 'object' and part == 'oac':
         # A date before year 1 into a WITH TIME ZONE attribute is refused before
         # there is an OAC; every other object bind's OAC carries a size where

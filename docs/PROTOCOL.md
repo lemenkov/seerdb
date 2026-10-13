@@ -3230,6 +3230,12 @@ usual. No Python `datetime` can hold such a value. The client reports it as
 hands one over as `seerdb.server.BcDate`, which the row encoder writes in this
 form (#1071); a BC `TIMESTAMP WITH TIME ZONE` is not covered.
 
+The client binds a `BcDate` too. Declared, it takes the declared type's form.
+Undeclared, it follows a `datetime`'s rule: DATE (`12`, 7 bytes) without a
+fraction, TIMESTAMP (`180`, 11 bytes) with one. An `executemany` column that
+mixes the two is widened to 11 bytes as in §5.4 (#1098). Before #1804 an
+undeclared one had no OAC and the bind failed before anything was sent.
+
 ### 11.3 TIMESTAMP
 
 11 bytes: 7-byte DATE + 4-byte nanosecond fractional seconds (big-endian unsigned integer).
