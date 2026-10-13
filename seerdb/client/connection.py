@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2019 Peter Lemenkov <lemenkov@gmail.com>
 # SPDX-License-Identifier: MIT
 
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Literal, cast
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 if TYPE_CHECKING:
     from seerdb.common.ano_session import AnoChannel
@@ -36,6 +36,7 @@ from seerdb.common.exceptions import (
     InterfaceError,
     NotSupportedError,
     OperationalError,
+    Truncated,
 )
 from seerdb.common.sqltext import is_reusable_dml, statement_head
 from seerdb.common.tns import (
@@ -149,6 +150,15 @@ _MAX_REDIRECTS = 5
 # retried: a refused address the user handed us should fail fast. (#399)
 _REDIRECT_CONNECT_ATTEMPTS = 10
 _REDIRECT_CONNECT_DELAY = 0.1
+
+# What an AQ reply decodes to (_aq_request).
+_Decoded = TypeVar('_Decoded')
+
+# How long a reply that ran past the bytes read so far may take to continue
+# (#1845). The server writes a reply whole, so its next packet is already in
+# flight; one that does not come within this is a decode fault, raised rather
+# than waited on for ever -- the hang #1846's first cut caused must not return.
+_CONTINUATION_SECONDS = 10.0
 
 # A pipelined fetchall (#158) can't interleave follow-up TTI_FETCH calls inside
 # the burst, so its execute asks for a large prefetch to pull the whole result
@@ -835,6 +845,83 @@ def _type_attr(row: 'Sequence[Any]') -> dict:
         'scale': scale,
         'max_size': attr_max_size(type_name, length, row[7] if len(row) > 7 else None),
     }
+
+
+def _lob_reply_step(
+    Data: bytes, Pos: int, Out: bytearray, Chunked: bool, Ub4Chunks: bool
+) -> tuple[int, bool, bool]:
+    """Walk a LOBOPS READ reply from ``Pos`` as far as ``Data`` allows (#1845).
+
+    The reply is TTI_LOB content -- ``<len><bytes>``, or a 0xFE run of chunks,
+    each ``<ub1 n><n-byte length><bytes>`` from 12.1 and ``<ub1 len><bytes>``
+    before, ended by an empty one -- then return parameters, then the closing
+    TTI_OER. Content goes to ``Out``. Stops before an item ``Data`` does not
+    hold whole, so the caller can append the next packet and go on from the
+    returned position: the reply spans packets, and a chunk may straddle them.
+
+    Returns ``(Pos, Chunked, Done)``: where to resume, whether that is inside a
+    chunk run, and whether the OER was reached.
+    """
+    from seerdb.common.tns_consts import TNS_LONG_LENGTH_INDICATOR, TTI_LOB, TTI_OER
+
+    End = len(Data)
+    while Pos < End:
+        if Chunked:
+            if Ub4Chunks:
+                Width = Data[Pos]
+                if Width == 0:
+                    Pos += 1
+                    Chunked = False
+                    continue
+                if Pos + 1 + Width > End:
+                    break
+                ChunkLen = int.from_bytes(Data[Pos + 1 : Pos + 1 + Width], 'big')
+                Head = 1 + Width
+            else:
+                ChunkLen = Data[Pos]
+                if ChunkLen == 0:
+                    Pos += 1
+                    Chunked = False
+                    continue
+                Head = 1
+            if Pos + Head + ChunkLen > End:
+                break
+            Out += Data[Pos + Head : Pos + Head + ChunkLen]
+            Pos += Head + ChunkLen
+            continue
+        Token = Data[Pos]
+        if Token == TTI_LOB:
+            if Pos + 2 > End:
+                break
+            Length = Data[Pos + 1]
+            if Length == TNS_LONG_LENGTH_INDICATOR:
+                Pos += 2
+                Chunked = True
+                continue
+            if Pos + 2 + Length > End:
+                break
+            Out += Data[Pos + 2 : Pos + 2 + Length]
+            Pos += 2 + Length
+            continue
+        if Token == TTI_OER:
+            return (Pos, Chunked, True)
+        # Return parameters (TTI_RPA: the updated locator, the amount read),
+        # not decoded: scan to the OER, which opens with TTI_OER + call_status
+        # (ub4 length 1, then a flag word that is not always 1 -- 2 while a
+        # transaction is open, #712) and the end-to-end sequence.
+        for I in range(Pos, End - 3):
+            if (
+                Data[I] == TTI_OER
+                and Data[I + 1] == 0x01
+                and (Data[I + 2] < 0x10 or Data[I + 3] == 0x01)
+            ):
+                Pos = I
+                break
+        else:
+            # No OER yet: keep the last bytes, which may open one the next
+            # packet completes.
+            return (max(Pos, End - 3), Chunked, False)
+    return (Pos, Chunked, False)
 
 
 class OracleConnect(_ConnectionLogic):
@@ -2822,102 +2909,27 @@ class OracleConnect(_ConnectionLogic):
         return Cur.fetchone()[0]
 
     def _read_lob_response(self) -> bytes:
-        # Walk the LOBOPS response packets, accumulating LOB_DATA chunks
-        # until we hit the trailing OER. A LOBOPS response packet on 11g
-        # carries: TTI_LOB (content) + TTI_RPA (updated locator) + TTI_OER
-        # (call status). We pull the content out of the LOB chunk(s) and
-        # use OER as the stop signal; everything between LOB and OER is
-        # RPA-shaped metadata we don't need.
-        from seerdb.common.tns_consts import (
-            TNS_LONG_LENGTH_INDICATOR,
-            TTI_LOB,
-            TTI_OER,
-        )
-
-        Buffer = b''
+        # A LOBOPS READ reply: TTI_LOB content, return parameters, the closing
+        # TTI_OER (see _lob_reply_step). It spans packets, so it is walked over
+        # the bytes received so far and carried on as each packet comes (#1845),
+        # through the same break/reset-aware receive as any response (#45).
+        Out = bytearray()
+        Data = b''
+        Pos = 0
+        Chunked = False
         while True:
-            # Same break/reset-aware receive as the main response path (#45):
-            # a LOB read that gets cancelled mid-stream must complete the reset
-            # handshake instead of echoing markers and dropping content.
             Received = self._next_data_packet(b'', b'')
             if Received is False:
                 raise Exception('Connection closed during LOBOPS response')
             (Type, Packet) = Received
             if Type != TNS_DATA:
                 raise Exception('Unexpected LOBOPS response type', Type)
-            Pos = 0
-            OerSeen = False
-            while Pos < len(Packet):
-                Token = Packet[Pos]
-                if Token == TTI_LOB:
-                    # Content chunk. Format: token + 1-byte length + data, or
-                    # token + 0xFE + chunked sequence of <ub1 len><bytes>.
-                    Pos += 1
-                    if Pos >= len(Packet):
-                        break
-                    Length = Packet[Pos]
-                    Pos += 1
-                    if Length == 0:
-                        continue
-                    if Length == TNS_LONG_LENGTH_INDICATOR:
-                        # Chunked content. 12.1+ prefixes each chunk with a ub4
-                        # length (terminated by a zero-length chunk); 11g uses a
-                        # single length byte per chunk.
-                        if self.field_version >= FIELD_VERSION_12_1:
-                            while Pos < len(Packet):
-                                NLen = Packet[Pos]
-                                Pos += 1
-                                if NLen == 0:
-                                    break
-                                ChunkLen = int.from_bytes(
-                                    Packet[Pos : Pos + NLen], 'big'
-                                )
-                                Pos += NLen
-                                Buffer += Packet[Pos : Pos + ChunkLen]
-                                Pos += ChunkLen
-                        else:
-                            while Pos < len(Packet):
-                                ChunkLen = Packet[Pos]
-                                Pos += 1
-                                if ChunkLen == 0:
-                                    break
-                                Buffer += Packet[Pos : Pos + ChunkLen]
-                                Pos += ChunkLen
-                    else:
-                        Buffer += Packet[Pos : Pos + Length]
-                        Pos += Length
-                elif Token == TTI_OER:
-                    # End of call. Anything after is fluff.
-                    OerSeen = True
-                    break
-                else:
-                    # Likely TTI_RPA (0x08) carrying the updated locator and
-                    # actual amount read — we don't decode it. Scan forward for
-                    # the OER and stop. The OER opens with TTI_OER + call_status
-                    # (ub4 len 1, then the value), then the end-to-end seq#
-                    # whose length byte (the original 11g signature's 4th byte)
-                    # varies per call. call_status is a flag word, not always 1:
-                    # it reads 2 while a transaction is open (#712), so accept
-                    # the low flag values as well as the historical `04 01 XX 01`
-                    # form. Matching only `04 01 01` left the reader waiting for
-                    # a packet that never came whenever autocommit was off.
-                    Found = -1
-                    for I in range(Pos, len(Packet) - 3):
-                        if (
-                            Packet[I] == TTI_OER
-                            and Packet[I + 1] == 0x01
-                            and (Packet[I + 2] < 0x10 or Packet[I + 3] == 0x01)
-                        ):
-                            Found = I
-                            break
-                    if Found >= 0:
-                        Pos = Found
-                        continue
-                    # No OER in this packet — fall out and recv the next one.
-                    break
-            if OerSeen:
-                return Buffer
-            # Packet exhausted without hitting OER; loop and recv the next.
+            Data = Data[Pos:] + Packet
+            (Pos, Chunked, Done) = _lob_reply_step(
+                Data, 0, Out, Chunked, self.field_version >= FIELD_VERSION_12_1
+            )
+            if Done:
+                return bytes(Out)
 
     def _raise_txn_reply_error(self) -> None:
         # Raise the error a commit's or rollback's reply carries (#1786). 9i
@@ -3080,10 +3092,30 @@ class OracleConnect(_ConnectionLogic):
             (Type, Packet) = Received
             if Type != TNS_DATA:
                 raise Exception('Unexpected response type', Type)
-            with recording_session_keywords(self._session_keywords):
-                Result = decode_packet(
-                    Packet, Acc, self.field_version, self._server_field_version()
-                )
+            # Rows decode into the caller's list in place; a decode retried on
+            # more bytes starts from the rows it began with.
+            Rows = Acc[2] if len(Acc) > 2 and isinstance(Acc[2], list) else None
+            Kept = len(Rows) if Rows is not None else 0
+            while True:
+                try:
+                    with recording_session_keywords(self._session_keywords):
+                        Result = decode_packet(
+                            Packet,
+                            Acc,
+                            self.field_version,
+                            self._server_field_version(),
+                        )
+                    break
+                except (Truncated, IndexError) as Short:
+                    # IndexError too: a token decoder that indexes past the end
+                    # rather than saying Truncated; the wait is bounded, so a
+                    # real decode fault still surfaces.
+                    # The reply runs on in a packet not read yet: recv() cannot
+                    # tell where a reply ends on a server that does not flag it,
+                    # and an encrypting one writes packet by packet (#1845).
+                    if Rows is not None:
+                        del Rows[Kept:]
+                    Packet += self._read_continuation(Short)
             self._absorb_session_keywords()
             if Result != FLUSH_OUT_BINDS:
                 return Result
@@ -3180,6 +3212,29 @@ class OracleConnect(_ConnectionLogic):
         self.send(TNS_DATA, ano.dh_public_key_round(Dh.public_key))
         self._ano = AnoChannel(EncId, IntId, Dh.session_key, ServerIv)
         logger.debug('handle_login: ANO active (enc=%d integrity=%d)', EncId, IntId)
+
+    def _read_continuation(self, Short: Exception) -> bytes:
+        # The next DATA packet of a reply that ran past the bytes read so far
+        # (#1845), waited on for at most _CONTINUATION_SECONDS: a reply that does
+        # not go on is a decode fault, raised as ``Short``.
+        Sock = self._sock
+        Previous = Sock.gettimeout()
+        Sock.settimeout(
+            _CONTINUATION_SECONDS
+            if Previous is None
+            else min(Previous, _CONTINUATION_SECONDS)
+        )
+        try:
+            Received = self._next_data_packet(b'', b'')
+        except OperationalError as exc:
+            if isinstance(exc.__cause__, TimeoutError):
+                raise Short from None
+            raise
+        finally:
+            Sock.settimeout(Previous)
+        if Received is False or Received[0] != TNS_DATA:
+            raise Short
+        return Received[1]
 
     def _timeout_error(self, op: str) -> OperationalError:
         return OperationalError(
@@ -3580,21 +3635,28 @@ class OracleConnect(_ConnectionLogic):
             return Queue(self, name, payload_type=None, is_json=True)
         return Queue(self, name, payload_type=payload_type)
 
-    def _aq_request(self, Data: bytes) -> bytes:
+    def _aq_request(self, Data: bytes, Decode: Callable[[bytes], _Decoded]) -> _Decoded:
+        # Send an AQ call and decode its reply -- read on while the decode runs
+        # past the bytes received, as a dequeued payload's reply spans packets
+        # (#1845).
         self.send(TNS_DATA, Data)
         Received = self._next_data_packet(b'', b'')
         if Received is False:
             raise OperationalError('connection closed during AQ operation')
         (_, Packet) = Received
-        return Packet
+        while True:
+            try:
+                return Decode(Packet)
+            except Truncated as Short:
+                Packet += self._read_continuation(Short)
 
     def _aq_enq_one(self, queue, props) -> None:
         Data = encode_aq_enq(self._next_seq(), self.field_version, queue, props)
-        props.msgid = _decode_aq_enq(self._aq_request(Data))
+        props.msgid = self._aq_request(Data, _decode_aq_enq)
 
     def _aq_deq_one(self, queue):
         Data = encode_aq_deq(self._next_seq(), self.field_version, queue)
-        return _decode_aq_deq(self._aq_request(Data), queue)
+        return self._aq_request(Data, lambda Reply: _decode_aq_deq(Reply, queue))
 
     def _aq_enq_many(self, queue, props_list) -> None:
         from seerdb.common.tns_consts import TNS_AQ_ARRAY_ENQ
@@ -3607,7 +3669,10 @@ class OracleConnect(_ConnectionLogic):
             props_list,
             len(props_list),
         )
-        _decode_aq_array(self._aq_request(Data), queue, TNS_AQ_ARRAY_ENQ, props_list)
+        self._aq_request(
+            Data,
+            lambda Reply: _decode_aq_array(Reply, queue, TNS_AQ_ARRAY_ENQ, props_list),
+        )
 
     def _aq_deq_many(self, queue, max_messages):
         from seerdb.client.aq import MessageProperties
@@ -3622,8 +3687,11 @@ class OracleConnect(_ConnectionLogic):
             Placeholders,
             max_messages,
         )
-        return _decode_aq_array(
-            self._aq_request(Data), queue, TNS_AQ_ARRAY_DEQ, Placeholders
+        return self._aq_request(
+            Data,
+            lambda Reply: _decode_aq_array(
+                Reply, queue, TNS_AQ_ARRAY_DEQ, Placeholders
+            ),
         )
 
     def _send_break(self) -> None:

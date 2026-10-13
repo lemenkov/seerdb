@@ -457,6 +457,94 @@ class TestReadsToTheEndOfAResponse(unittest.TestCase):
         self.assertEqual(asyncio.run(run()), b'onetwothree')
 
 
+class TestLobReplyAcrossPackets(unittest.TestCase):
+    # A LOB READ reply spans packets, and a content chunk may straddle two: the
+    # reader walks the bytes received so far and carries on, wherever a packet
+    # ends (#1845). Slicing a straddling chunk short lost all but its first part.
+    from seerdb.common.tns_consts import TNS_LONG_LENGTH_INDICATOR as _FE
+    from seerdb.common.tns_consts import TTI_LOB as _LOB
+    from seerdb.common.tns_consts import TTI_OER as _OER
+
+    OER = bytes([_OER, 0x01, 0x01, 0x01, 0x00])
+    RPA = bytes([0x08, 0x02, 0x00, 0x10])
+
+    def _walk(self, reply: bytes, split: int, ub4: bool) -> bytes:
+        from seerdb.client.connection import _lob_reply_step
+
+        out = bytearray()
+        data, pos, chunked = b'', 0, False
+        for packet in (reply[:split], reply[split:]):
+            data = data[pos:] + packet
+            pos, chunked, done = _lob_reply_step(data, 0, out, chunked, ub4)
+            if done:
+                return bytes(out)
+        raise AssertionError('no OER reached')
+
+    def test_ub4_chunks_split_anywhere(self):
+        content = bytes(range(256)) * 3
+        chunks = b''.join(
+            bytes([2]) + len(part).to_bytes(2, 'big') + part
+            for part in (content[:300], content[300:])
+        )
+        reply = bytes([self._LOB, self._FE]) + chunks + b'\x00' + self.RPA + self.OER
+        for split in range(1, len(reply)):
+            self.assertEqual(self._walk(reply, split, True), content, split)
+
+    def test_ub1_chunks_and_a_plain_value_split_anywhere(self):
+        content = b'abcdefghij' * 20
+        chunked = bytes([self._LOB, self._FE, 100]) + content[:100]
+        chunked += bytes([100]) + content[100:] + b'\x00'
+        plain = bytes([self._LOB, 5]) + b'hello'
+        for reply, want in (
+            (chunked + self.RPA + self.OER, content),
+            (plain + self.RPA + self.OER, b'hello'),
+        ):
+            for split in range(1, len(reply)):
+                self.assertEqual(self._walk(reply, split, False), want, split)
+
+
+class TestReplyContinuation(unittest.TestCase):
+    # A reply decode that runs past the bytes read so far reads the reply's next
+    # packet and decodes again from the rows it began with (#1845); a reply that
+    # does not go on raises its Truncated rather than waiting for ever.
+    def test_a_short_decode_reads_on_and_starts_over(self):
+        from seerdb.common.exceptions import Truncated
+
+        con = OracleConnect()
+        rows: list = ['earlier row']
+        seen = []
+
+        def decode(packet, acc, *_versions):
+            seen.append(packet)
+            acc[2].append('partial')
+            if packet == b'first':
+                raise Truncated('row runs off the end')
+            return ('done', list(acc[2]))
+
+        with (
+            mock.patch.object(con, '_next_data_packet', return_value=(6, b'first')),
+            mock.patch.object(con, '_read_continuation', return_value=b'second'),
+            mock.patch('seerdb.common.tns.decode_packet', decode),
+        ):
+            result = con._handle_response((None, None, rows))
+        self.assertEqual(seen, [b'first', b'firstsecond'])
+        self.assertEqual(result, ('done', ['earlier row', 'partial']))
+
+    def test_a_reply_that_does_not_go_on_raises(self):
+        from seerdb.client import connection as cm
+        from seerdb.common.exceptions import Truncated
+
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        con = OracleConnect()
+        con.sock = ours
+        with mock.patch.object(cm, '_CONTINUATION_SECONDS', 0.2):
+            with self.assertRaises(Truncated):
+                con._read_continuation(Truncated('row runs off the end'))
+        self.assertIsNone(ours.gettimeout())
+
+
 class TestConnection(unittest.TestCase):
     def test_empty_credentials_rejected(self):
         # Connecting with the default empty username/password must not silently
