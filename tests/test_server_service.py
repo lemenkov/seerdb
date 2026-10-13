@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 
 import seerdb
@@ -100,3 +101,17 @@ def test_a_10g_client_is_served() -> None:
 
     assert negotiated == FIELD_VERSION_10_2
     assert rows == [('X',)]
+
+
+def test_the_mirror_says_it_is_provisional(caplog) -> None:
+    # Outside the version promise the client keeps (#1688): the package says so
+    # to code, and a Mirror logs it, at WARNING, as it starts serving.
+    import seerdb.server
+
+    assert seerdb.server.__provisional__ is True
+    server = seerdb.Server(host='127.0.0.1', port=0, backend_factory=_DualBackend)
+    server.close()
+    with caplog.at_level(logging.WARNING, logger='seerdb.server'):
+        server.serve_forever()  # returns at once: the socket is closed
+    notices = [r for r in caplog.records if 'provisional' in r.getMessage()]
+    assert [r.levelno for r in notices] == [logging.WARNING]
