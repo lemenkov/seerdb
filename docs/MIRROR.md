@@ -3,10 +3,14 @@
 
 # The Mirror
 
-> **Provisional.** The Mirror ships with seerdb but is outside the
-> semantic-versioning promise the client (DB-API 2.0) keeps. Its Python API,
+> **A highly experimental technology preview.** The Mirror ships with seerdb so
+> you can try it, not to run production on. It is outside the
+> semantic-versioning promise the client (DB-API 2.0) keeps: its Python API,
 > its command line and its behaviour may change or break in any release, a
 > minor or patch one included. Pin an exact seerdb version if you depend on it.
+
+> **Not hardened for untrusted networks.** Run it on localhost or a network you
+> trust, for clients you trust. See *Security* below for why.
 
 The Mirror is a server that speaks Oracle's wire protocol. Oracle clients
 (python-oracledb, seerdb itself, sqlplus, SeerODBC, anything built on Oracle's
@@ -271,6 +275,27 @@ Uses:
 - **Migration.** Put the passthrough in front of the application today, and
   replace it with the PostgreSQL backend later, with no change to the
   application.
+
+## Security
+
+The Mirror is experimental, and a security review (#1687) found work still to
+do before it can face clients you don't trust. Until those fixes land:
+
+- **Who can reach it.** A client can tie the Mirror up before logging in: hold
+  connections open, or send packets it handles badly. Keep the default listen
+  address (`127.0.0.1`), or put the Mirror behind a firewall that admits only
+  your own hosts.
+- **Who logs in.** Every account can do more than an Oracle user of the same
+  name could: manage the other accounts, including their passwords, and read
+  any file the PostgreSQL role can, through DIRECTORY objects. Serve only
+  accounts that may see each other's data (*One tenant per database*).
+- **What the role may do.** Native SQL makes the PostgreSQL role the real
+  boundary (*Which role to connect as*). Never a superuser; no server-file or
+  server-program privileges unless you need them.
+- **The wire.** Use TLS (`--tls-cert`) beyond localhost. ANO alone doesn't
+  authenticate the server.
+
+This section shrinks as the fixes land.
 
 ## Known limits
 

@@ -113,5 +113,5 @@ def test_the_mirror_says_it_is_provisional(caplog) -> None:
     server.close()
     with caplog.at_level(logging.WARNING, logger='seerdb.server'):
         server.serve_forever()  # returns at once: the socket is closed
-    notices = [r for r in caplog.records if 'provisional' in r.getMessage()]
+    notices = [r for r in caplog.records if 'technology preview' in r.getMessage()]
     assert [r.levelno for r in notices] == [logging.WARNING]

@@ -40,7 +40,8 @@ _TLS_HANDSHAKE_SECONDS = 30.0
 # Logged as a Mirror starts serving. A WARNING reaches stderr even when the
 # application configured no logging.
 _PROVISIONAL_NOTICE = (
-    'the Mirror is provisional: it may change or break in any seerdb release, '
+    'the Mirror is a highly experimental technology preview, not for production: '
+    'it may change or break in any seerdb release, '
     'outside the version promise the client keeps'
 )
 
