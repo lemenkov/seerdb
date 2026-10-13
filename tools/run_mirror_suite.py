@@ -4,21 +4,27 @@
 
 """Run the integration suite THROUGH the Mirror, in one command.
 
-Starts one of the example Mirror launchers as a separate process, points the
-suite's SEERDB_TEST_* environment at it, runs pytest, and tears the Mirror down::
+Starts a Mirror (``python -m seerdb.server``, the checkout's) as a separate
+process, points the suite's SEERDB_TEST_* environment at it, runs pytest, and
+tears the Mirror down::
 
     python3 tools/run_mirror_suite.py postgres     [pytest args...]
     python3 tools/run_mirror_suite.py passthrough  [pytest args...]
 
-``postgres``    — examples/mirror_over_postgres.py: the Mirror serving every
-                  statement from PostgreSQL (needs orafce; see
-                  examples/mirror-pg.Dockerfile). Connection string from the
-                  MIRROR_PG environment variable (the same one
-                  tests/test_postgres_backend.py reads).
-``passthrough`` — examples/mirror_over_oracle.py: the Mirror relaying to a real
-                  Oracle, from SEERDB_TEST_HOST / _PORT / _SERVICE (the same
-                  variables the direct suite uses), so a failure isolates a
-                  Mirror gap rather than a backend-dialect limit.
+``postgres``    — the Mirror serving every statement from PostgreSQL (needs
+                  orafce; see examples/mirror-pg.Dockerfile). Connection string
+                  from the MIRROR_PG environment variable (the same one
+                  tests/test_postgres_backend.py reads); MIRROR_PRESENTS,
+                  MIRROR_AUTH_PG and SEERDB_TRANSLATION_REPORT=1 become its
+                  --presents, --auth-conninfo and --translation-report.
+``passthrough`` — the Mirror relaying to a real Oracle, from SEERDB_TEST_HOST /
+                  _PORT / _SERVICE (the same variables the direct suite uses),
+                  so a failure isolates a Mirror gap rather than a
+                  backend-dialect limit. MIRROR_FIELD_VERSION becomes its
+                  --field-version.
+
+The Mirror serves the suite's account (SEERDB_TEST_USER / _PASSWORD, PYO /
+pyo123 by default) and any more in MIRROR_USERS.
 
 The Mirror runs as a SEPARATE process on purpose: run in-process, the suite's
 client-side monkeypatches (send counting) would also see the passthrough's
@@ -37,22 +43,30 @@ import sys
 import time
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-_LAUNCHERS = {
-    'postgres': 'examples/mirror_over_postgres.py',
-    'passthrough': 'examples/mirror_over_oracle.py',
-}
+_BACKENDS = ('postgres', 'passthrough')
 _DEFAULT_PG = 'host=127.0.0.1 port=5433 user=pyo password=pyo123 dbname=mirror'
 
 
 def _launcher_args(backend: str, port: int) -> list[str]:
+    # The seerdb-mirror command line for this leg (#1835).
+    args = ['--port', str(port), backend]
     if backend == 'postgres':
-        return [os.environ.get('MIRROR_PG', _DEFAULT_PG), str(port)]
-    upstream = (
+        args.append(os.environ.get('MIRROR_PG', _DEFAULT_PG))
+        if os.environ.get('MIRROR_PRESENTS'):
+            args += ['--presents', os.environ['MIRROR_PRESENTS']]
+        if os.environ.get('MIRROR_AUTH_PG'):
+            args += ['--auth-conninfo', os.environ['MIRROR_AUTH_PG']]
+        if os.environ.get('SEERDB_TRANSLATION_REPORT') == '1':
+            args.append('--translation-report')
+        return args
+    args.append(
         f'{os.environ.get("SEERDB_TEST_HOST", "127.0.0.1")}:'
         f'{os.environ.get("SEERDB_TEST_PORT", "1521")}/'
         f'{os.environ.get("SEERDB_TEST_SERVICE", "XE")}'
     )
-    return [str(port), upstream]
+    if os.environ.get('MIRROR_FIELD_VERSION'):
+        args += ['--field-version', os.environ['MIRROR_FIELD_VERSION']]
+    return args
 
 
 def _wait_for(port: int, process: subprocess.Popen, seconds: float = 15.0) -> bool:
@@ -69,20 +83,23 @@ def _wait_for(port: int, process: subprocess.Popen, seconds: float = 15.0) -> bo
 
 
 def main(argv: list[str]) -> int:
-    if not argv or argv[0] not in _LAUNCHERS:
+    if not argv or argv[0] not in _BACKENDS:
         print(__doc__, file=sys.stderr)
         return 2
     backend, pytest_args = argv[0], argv[1:] or ['tests/test_integration.py']
     port = int(os.environ.get('MIRROR_PORT', '15521'))
     log_path = os.path.join(_ROOT, f'mirror-{backend}.log')
-    # The Mirror imports seerdb.server, which the published wheel omits (#301):
-    # run the launcher against the checkout, whatever is pip-installed.
+    # Run the checkout's Mirror, whatever seerdb is pip-installed.
     env = dict(os.environ, PYTHONPATH=_ROOT)
     env.setdefault('SEERDB_TEST_USER', 'PYO')
     env.setdefault('SEERDB_TEST_PASSWORD', 'pyo123')
+    # The suite's account first: the passthrough probes its upstream as the
+    # first one.
+    suite_account = f'{env["SEERDB_TEST_USER"]}:{env["SEERDB_TEST_PASSWORD"]}'
+    env['MIRROR_USERS'] = ','.join(filter(None, (suite_account, env.get('MIRROR_USERS'))))
     with open(log_path, 'w') as log:
         mirror = subprocess.Popen(
-            [sys.executable, _LAUNCHERS[backend], *_launcher_args(backend, port)],
+            [sys.executable, '-m', 'seerdb.server', *_launcher_args(backend, port)],
             cwd=_ROOT,
             env=env,
             stdout=log,

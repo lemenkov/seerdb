@@ -137,13 +137,11 @@ jobs:
 
       - name: Run the suite through a passthrough Mirror
         run: |
-          # The Mirror runs from the checkout (its launcher lives in examples/,
-          # so without PYTHONPATH it would import whatever `pip install .`
-          # shipped) and in the background of this step, so it is torn down with
-          # it.
+          # The packaged launcher of the seerdb `pip install .` installed from
+          # this checkout, in the background of this step, so it is torn down
+          # with it. The first account is the one it probes the upstream as.
           MIRROR_USERS=pythontest:pythontest,pythontestproxy:pythontestproxy,pyoadm:pyoadm123 \
-            PYTHONPATH="$PWD" python examples/mirror_over_oracle.py 1600 \
-              localhost:1521/FREEPDB1 > mirror.log 2>&1 &
+            seerdb-mirror --port 1600 passthrough localhost:1521/FREEPDB1 > mirror.log 2>&1 &
           MIRROR_PID=$!
           for i in $(seq 1 30); do
             python -c "import socket; socket.create_connection(('127.0.0.1', 1600), timeout=1).close()" 2>/dev/null && break
