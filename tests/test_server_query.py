@@ -2664,6 +2664,46 @@ def test_sqlplus_10_2s_execute_parses() -> None:
         parse_exec_oci(_OCI_ALL8_10_2_SELECT)
 
 
+# sqlplus 11.2.0.2's DBMS_OUTPUT.GET_LINES call to 11g XE, captured through a
+# logging proxy (#1826); sqlplus 10.2 sends the same bind section.
+_OCI_GET_LINES_11_2 = bytes.fromhex(
+    '035e3e2904040000000000feffffffffffffff9c00000000000000feffffffffffffff0d'
+    '00000000000000fefffffffffffffffeffffffffffffff00000000010000000000000000'
+    '000000feffffffffffffff02000000000000000000000000000000feffffffffffffff00'
+    '00000000000000fefffffffffffffffeffffffffffffff189cf639000000000000000000'
+    '000000fefffffffffffffffeffffffffffffff0000000000000000000000000000000000'
+    '00000000000000000000000000000034424547494e2044424d535f4f55545055542e4745'
+    '545f4c494e4553283a4c494e45532c203a4e554d4c494e4553293b20454e443b01000000'
+    '010000000000000000000000000000000000000000000000080000000000000000000000'
+    '000000000000000000000000006d000000d007000000000000000000001000000010ab9e'
+    'ebb9d6af92fce040e50a194e468001000000000000000001020100001600000000000000'
+    '000000000000000000000000000000000000000000000000000000000724000000240022'
+    '0208ab9eebb9d6af92fce040e50a194e4680000000000000000000000000000100010000'
+    '000000000000000000000000010016c10600000000000000000000000000000000000000'
+    '00'
+)
+
+
+def test_a_pre_12c_get_lines_call_reads_its_binds() -> None:
+    # sqlplus 11.2 and 10.2 bind GET_LINES's collection with two zeros fewer
+    # ahead of its type id and two more in its empty value, and :NUMLINES with
+    # flag 01 and its whole padded buffer. Unread, the call was refused and SET
+    # SERVEROUTPUT ON printed nothing (#1826).
+    from seerdb.common.tns import parse_exec_oci
+    from seerdb.common.tns_consts import (
+        FIELD_VERSION_11_2,
+        TNS_TYPE_ADT,
+        TNS_TYPE_NUMBER,
+    )
+
+    with _at_field_version(FIELD_VERSION_11_2):
+        call = parse_exec_oci(_OCI_GET_LINES_11_2)
+    assert call.sql == 'BEGIN DBMS_OUTPUT.GET_LINES(:LINES, :NUMLINES); END;'
+    assert call.binds == [None, 5]  # the collection OUT, the count IN OUT
+    assert call.bind_meta == [(TNS_TYPE_ADT, 2000), (TNS_TYPE_NUMBER, 22)]
+    assert call.bind_types[0][3] == bytes.fromhex('ab9eebb9d6af92fce040e50a194e4680')
+
+
 def test_is_reexecute_oci_detects_the_sql_less_reexecute() -> None:
     # A fresh OCI execute carries the SQL pointer indicator at offset 11; a
     # re-execute (the LONG fetch step) omits it (#407).

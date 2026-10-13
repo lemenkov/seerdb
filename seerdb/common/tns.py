@@ -8878,15 +8878,22 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
 # its own and is the same in both widths.
 
 
-_OCI_OAC_MARKER = re.compile(rb'\x01(.)\x03\x00\x00')
+# The flag byte behind the type is 03 for most binds; a pre-12c sqlplus
+# (10.2, 11.2) writes 01 for GET_LINES's IN OUT count (#1826).
+_OCI_OAC_MARKER = re.compile(rb'\x01(.)[\x01\x03]\x00\x00')
 # An object or collection bind's descriptor (PROTOCOL.md §40.4): `00 6d 00 00
 # 00`, the ub4 buffer size, twelve zeros, a ub4 and a ub1 16, the type's 16-byte
 # id. Captured from sqlplus 23.26 binding DBMS_OUTPUT.GET_LINES's lines (#1411).
 _OCI_ADT_MARKER = b'\x00\x6d\x00\x00\x00'
-_OCI_ADT_TOID_OFF = 26  # from the marker to the id
+# The id follows a ub4 16 and a ub1 16, after 12 zeros from 12c (sqlplus 23.26)
+# and 10 before (10.2, 11.2, #1826); found by that pair, not a fixed offset.
+_OCI_ADT_TOID_LEN_PAIR = b'\x10\x00\x00\x00\x10'
+_OCI_ADT_TOID_SEARCH = 30  # the pair lies within this many bytes of the marker
 # An object / collection IN value carrying nothing -- sqlplus's GET_LINES lines,
 # a pure OUT: the type's REF, then these 15 bytes.
 _OCI_ADT_EMPTY_TAIL = b'\x01' + bytes(12) + b'\x01\x00'
+# ...which a pre-12c sqlplus (10.2, 11.2) writes with two more zeros (#1826).
+_OCI_ADT_EMPTY_TAILS = (_OCI_ADT_EMPTY_TAIL, b'\x01' + bytes(14) + b'\x01\x00')
 
 
 _OCI_BIND_TYPES = frozenset(
@@ -8916,9 +8923,14 @@ def _oci_bind_descriptors(tail: bytes, bind_count: int) -> list[tuple[int, int, 
         if adt >= 0 and (scalar is None or adt < scalar.start()):
             end = adt + len(_OCI_ADT_MARKER)
             max_size = int.from_bytes(tail[end : end + 4], 'little')
-            toid = tail[adt + _OCI_ADT_TOID_OFF : adt + _OCI_ADT_TOID_OFF + 16]
-            meta.append((TNS_TYPE_ADT, max_size, toid))
-            at = adt + _OCI_ADT_TOID_OFF + 16
+            pair = tail.find(
+                _OCI_ADT_TOID_LEN_PAIR, end + 4, adt + _OCI_ADT_TOID_SEARCH
+            )
+            if pair < 0:
+                return []
+            toid_at = pair + len(_OCI_ADT_TOID_LEN_PAIR)
+            meta.append((TNS_TYPE_ADT, max_size, tail[toid_at : toid_at + 16]))
+            at = toid_at + 16
             continue
         if scalar is None:
             return []
@@ -8936,9 +8948,10 @@ def _oci_adt_in_value(rest: bytes) -> bytes:
     # read yet, and raising lets the statement be refused rather than run on a
     # guess (#1525).
     (_ref, after) = _kod_item(rest, 0)
-    if rest[after : after + len(_OCI_ADT_EMPTY_TAIL)] != _OCI_ADT_EMPTY_TAIL:
-        raise DataError('an object bind value of a form not read yet')
-    return rest[after + len(_OCI_ADT_EMPTY_TAIL) :]
+    for tail in _OCI_ADT_EMPTY_TAILS:
+        if rest[after : after + len(tail)] == tail:
+            return rest[after + len(tail) :]
+    raise DataError('an object bind value of a form not read yet')
 
 
 def _parse_oci_binds(
@@ -8981,6 +8994,12 @@ def _parse_oci_binds(
                 raw, rest = decode_dalc(rest)
                 # The OCI (sqlplus) bind path doesn't carry a national char form;
                 # decode ordinary char (csfrm 1) — no test client binds NCHAR here.
+                if data_type == TNS_TYPE_NUMBER and isinstance(raw, bytes):
+                    # A pre-12c sqlplus sends an IN OUT NUMBER as its whole
+                    # 22-byte buffer, the number then zeros (#1826). No NUMBER
+                    # ends in a zero byte -- its digits are 1 to 100 and a
+                    # negative ends in 0x66 -- so the padding is cut.
+                    raw = raw.rstrip(b'\x00') or raw
                 values.append(_decode_bind_value(data_type, _CSFRM_DB, raw))
         except (IndexError, DataError):
             continue
