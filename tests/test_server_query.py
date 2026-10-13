@@ -2530,6 +2530,55 @@ def test_encode_describe_oci_long_column_is_streamed() -> None:
     assert encode_describe_oci([raw_col])[36:][3] == 0x00
 
 
+# Two OALL8 executes from sqlplus 10.2.0.5 to 11g XE, captured through a logging
+# proxy (#1764): its pointer fields hold addresses, and its SQL starts at 148.
+_OCI_ALL8_10_2_SELECT = bytes.fromhex(
+    '035e06618000000000000098fd6929000000004200000034d36729000000000d00000000'
+    '0000000000000068d3672900000000000000000100000000000000000000000000000000'
+    '00000000000000000000000000000000000000000000000000000000000000000000006a'
+    'd367290000000020fe6929000000000000000000000000000000000000000080d3672900'
+    '0000001653454c45435420555345522046524f4d204455414c0001000000000000000000'
+    '000000000000000000000000000000000000010000000000000000000000000000000000'
+    '000000000000'
+)
+_OCI_ALL8_10_2_OUT_BIND = bytes.fromhex(
+    '035e342904040000000000f8036a29000000004200000034d36729000000000d00000000'
+    '0000000000000068d3672900000000000000000100000000000000c8ed69290000000001'
+    '00000000000000000000000000000000000000000000000000000000000000000000006a'
+    'd3672900000000c8ed6929000000000000000000000000000000000000000080d3672900'
+    '00000016424547494e203a72203a3d2034323b20454e443b0a0001000000010000000000'
+    '000000000000000000000000000000000000080000000000000000000000000000000000'
+    '000000000000010203000016000000000000000000000000000000000000000000000000'
+    '000000000000000000000007fd01'
+)
+
+
+def test_sqlplus_10_2s_execute_parses() -> None:
+    # sqlplus 10.2's narrow preamble puts the SQL at 148, 28 bytes ahead of the
+    # 23.26 form, and fills its pointers with addresses; the session's field
+    # version picks the layout (#1764).
+    from seerdb.common.tns import is_reexecute_oci, parse_exec_oci
+    from seerdb.common.tns_consts import FIELD_VERSION_10_2, TNS_TYPE_NUMBER
+
+    with _at_field_version(FIELD_VERSION_10_2):
+        select = parse_exec_oci(_OCI_ALL8_10_2_SELECT)
+        block = parse_exec_oci(_OCI_ALL8_10_2_OUT_BIND)
+    assert (select.sql, select.cursor, select.bind_count) == (
+        'SELECT USER FROM DUAL',
+        0,
+        0,
+    )
+    assert block.sql == 'BEGIN :r := 42; END;\n'
+    assert block.bind_count == 1
+    assert block.binds == [None]  # an OUT bind: the absent-value placeholder
+    assert block.bind_meta == [(TNS_TYPE_NUMBER, 22)]
+    # An address in the SQL pointer is a fresh execute, not a re-execute.
+    assert not is_reexecute_oci(_OCI_ALL8_10_2_SELECT)
+    # Read as 11.2 it is refused by name, not misparsed.
+    with pytest.raises(InterfaceError, match='no indicator at offset 11'):
+        parse_exec_oci(_OCI_ALL8_10_2_SELECT)
+
+
 def test_is_reexecute_oci_detects_the_sql_less_reexecute() -> None:
     # A fresh OCI execute carries the SQL pointer indicator at offset 11; a
     # re-execute (the LONG fetch step) omits it (#407).
