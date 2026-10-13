@@ -322,6 +322,15 @@ class _CaptureResult(unittest.TestResult):
     def __init__(self):
         super().__init__()
         self.outcome = ('success', None)
+        # Each failing `subTest` block, as (subtest, exc_info). unittest reports
+        # those through addSubTest alone and then calls none of the methods
+        # below for the test itself, so without this a failing subtest was
+        # forwarded as a pass (#1807).
+        self.subtests = []
+
+    def addSubTest(self, test, subtest, err):
+        if err is not None:
+            self.subtests.append((subtest, err))
 
     def addSuccess(self, test):
         self.outcome = ('success', None)
@@ -337,12 +346,13 @@ class _CaptureResult(unittest.TestResult):
 
     def is_throttle(self) -> bool:
         kind, payload = self.outcome
-        if kind not in ('error', 'failure') or not payload:
-            return False
-        exc = payload[1]
-        return (
-            isinstance(exc, seerdb.DatabaseError)
-            and getattr(exc, 'code', None) in _TRANSIENT_CODES
+        errs = [err for _, err in self.subtests]
+        if kind in ('error', 'failure') and payload:
+            errs.append(payload)
+        return any(
+            isinstance(err[1], seerdb.DatabaseError)
+            and getattr(err[1], 'code', None) in _TRANSIENT_CODES
+            for err in errs
         )
 
 
@@ -374,17 +384,69 @@ class _ThrottleRetry:
             kind, payload = capture.outcome
             result.startTest(self)
             try:
+                for subtest, err in capture.subtests:
+                    if hasattr(result, 'addSubTest'):
+                        result.addSubTest(self, subtest, err)
+                    elif issubclass(err[0], self.failureException):  # type: ignore[attr-defined]
+                        result.addFailure(self, err)
+                    else:
+                        result.addError(self, err)
                 if kind == 'error':
                     result.addError(self, payload)
                 elif kind == 'failure':
                     result.addFailure(self, payload)
                 elif kind == 'skip':
                     result.addSkip(self, payload)
-                else:
+                elif not capture.subtests:
                     result.addSuccess(self)
             finally:
                 result.stopTest(self)
         return result
+
+
+class ThrottleRetryOutcomeTests(unittest.TestCase):
+    """The outcome `_ThrottleRetry` forwards is the test's own. Needs no server."""
+
+    class _Probe(_ThrottleRetry, unittest.TestCase):
+        def test_subtest_fails(self):
+            with self.subTest(n=1):
+                self.assertEqual(1, 2)
+
+        def test_subtest_errors(self):
+            with self.subTest(n=1):
+                raise RuntimeError('boom')
+
+        def test_subtests_pass(self):
+            with self.subTest(n=1):
+                pass
+
+    class _NoSubTestResult(unittest.TestResult):
+        # A result without subtest support, as some runners' are.
+        def __getattribute__(self, name):
+            if name == 'addSubTest':
+                raise AttributeError(name)
+            return super().__getattribute__(name)
+
+    def _run(self, name, result):
+        self._Probe(name).run(result)
+        return result
+
+    def test_a_failing_subtest_fails_the_test(self):
+        result = self._run('test_subtest_fails', unittest.TestResult())
+        self.assertEqual((len(result.failures), len(result.errors)), (1, 0))
+
+    def test_an_erroring_subtest_errors_the_test(self):
+        result = self._run('test_subtest_errors', unittest.TestResult())
+        self.assertEqual((len(result.failures), len(result.errors)), (0, 1))
+
+    def test_passing_subtests_pass(self):
+        result = self._run('test_subtests_pass', unittest.TestResult())
+        self.assertTrue(result.wasSuccessful())
+        self.assertEqual(result.testsRun, 1)
+
+    def test_a_result_without_subtests_still_sees_the_failure(self):
+        result = self._run('test_subtest_fails', self._NoSubTestResult())
+        self.assertEqual((len(result.failures), len(result.errors)), (1, 0))
 
 
 class _IntegrationBase(_ThrottleRetry, unittest.TestCase):
