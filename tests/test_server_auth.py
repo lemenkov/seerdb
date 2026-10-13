@@ -218,6 +218,32 @@ def test_parse_osesskey_oci_recovers_the_username() -> None:
     assert parse_osesskey_oci(abcdefgh) == b'abcdefgh'
 
 
+# sqlplus 10.2.0.5's OSESSKEY to 11g XE, captured through a logging proxy
+# (#1764): the same layout as 11.2's, but its pointer fields carry the client's
+# own 64-bit addresses where 11.2 writes the OCI indicator.
+_OCI_OSESSKEY_10_2 = bytes.fromhex(
+    '037602f0836729000000000900000001000000f0cb725afd7f000005000000b55f389e90'
+    'c6725afd7f0000cccf725afd7f00000370796f270000000d415554485f5445524d494e41'
+    '4c00000000000000002d0000000f415554485f50524f4752414d5f4e4d60000000207371'
+    '6c706c7573403738313533366563613235312028544e532056312d563329000000002400'
+    '00000c415554485f4d414348494e45240000000c37383135333665636132353100000000'
+    '1800000008415554485f5049441200000006343533373830000000001800000008415554'
+    '485f53494412000000066f7261636c6500000000'
+)
+
+
+def test_parse_osesskey_oci_takes_sqlplus_10_2s_addresses() -> None:
+    # A pointer field is present when it is not zero: 10.2 fills it with an
+    # address, and the parser refused anything but the indicator (#1764).
+    from seerdb.server.auth import parse_osesskey_oci
+
+    assert parse_osesskey_oci(_OCI_OSESSKEY_10_2) == b'pyo'
+    # A zeroed pointer still means the message is not the shape expected.
+    null_user = _OCI_OSESSKEY_10_2[:43] + bytes(8) + _OCI_OSESSKEY_10_2[51:]
+    with pytest.raises(InterfaceError, match='no pointer at offset 43'):
+        parse_osesskey_oci(null_user)
+
+
 def test_encode_challenge_oci_substitutes_the_crypto_values() -> None:
     # The OCI challenge is the captured 390-byte template with AUTH_SESSKEY and
     # the salt substituted in place (#265). Validated live: sqlplus accepts it

@@ -627,6 +627,13 @@ sqlplus 11.2 logs in — verified live. The rounds:
    ub4** lengths (not Oracle variable-length ub4). The header up to the username
    is constant, so the ub1-length-prefixed username sits at a **fixed offset 51**
    (`parse_osesskey_oci` / `parse_auth_response_oci`).
+   The indicator is 11.2's way of filling an 8-byte **pointer field**: sqlplus
+   10.2 writes the client's own 64-bit address in the same fields (`80 a8 ba e2
+   fd 7f 00 00`), at the same offsets 3, 19, 35 and 43. What a server can rely on
+   is that a present field is non-zero (`oci.pointer_present`). With that, and
+   the type round of item 1, sqlplus 10.2 logs in to an 11.2 Mirror. It takes
+   the 11.2-sized challenge and result as they are, although 11g sends it shorter
+   ones (310 and 1653 bytes against 382 and 1757) (#1764).
 3. **Challenge** (S→C, **390 B**). A fixed template; only `AUTH_SESSKEY` (96 hex)
    and the `AUTH_VFR_DATA` salt (20 hex — a **10-byte** salt, vs thin's 16) vary.
    `encode_challenge_oci` substitutes those two fixed-size values in place.

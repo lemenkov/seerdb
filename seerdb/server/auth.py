@@ -523,13 +523,13 @@ def _parse_oci_fun_username(payload: bytes, subtype: int, what: str) -> bytes:
         raise InterfaceError('not a TTI_FUN message')
     if payload[1] != subtype:
         raise InterfaceError(f'expected {what}, got subtype {payload[1]}')
-    # Indicators sit at these offsets; between the 1st/2nd and 3rd/4th come the
-    # two ub4 length-field pairs that make up the gaps.
+    # Pointer fields sit at these offsets; between the 1st/2nd and 3rd/4th come
+    # the two ub4 length-field pairs that make up the gaps. sqlplus 11.2 fills
+    # them with the OCI indicator and sqlplus 10.2 with its own addresses, so
+    # what is checked is that each says "present" (#1764).
     for expected_ind_off in (3, 19, 35, 43):
-        if payload[expected_ind_off : expected_ind_off + 8] != oci.OCI_INDICATOR:
-            raise InterfaceError(
-                f'OCI {what}: no indicator at offset {expected_ind_off}'
-            )
+        if not oci.pointer_present(payload[expected_ind_off : expected_ind_off + 8]):
+            raise InterfaceError(f'OCI {what}: no pointer at offset {expected_ind_off}')
     user_off = 51  # 3 + 8 + (4+4) + 8 + (4+4) + 8 + 8
     userlen = payload[user_off]
     return payload[user_off + 1 : user_off + 1 + userlen]

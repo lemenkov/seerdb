@@ -27,6 +27,17 @@ from seerdb.common.tns_consts import TTI_80SES, TTI_FUN, TTI_MSG_TYPE_PIGGYBACK
 # in OSESSKEY/AUTH); it is absent on a re-execute that reuses the cursor.
 OCI_INDICATOR = b'\xfe\xff\xff\xff\xff\xff\xff\xff'
 
+
+def pointer_present(field: bytes) -> bool:
+    """Whether an 8-byte OCI pointer field says its value is present.
+
+    From 11.2 sqlplus writes :data:`OCI_INDICATOR` there. sqlplus 10.2 writes the
+    client's own 64-bit address (``80 a8 ba e2 fd 7f 00 00``) in the same field,
+    so what a server can rely on is only that the field is not zero (#1764).
+    """
+    return len(field) == 8 and field != bytes(8)
+
+
 # The TTI_80SES piggyback prefix: a thick-OCI call wrapped in a session-switch
 # preamble. The first thing sqlplus sends after login, its version call, arrives
 # this way (the server answers with its banner and sqlplus prints "Connected
