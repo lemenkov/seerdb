@@ -621,18 +621,23 @@ def test_encode_result_carries_the_session_names() -> None:
 
 
 def test_encode_result_omits_a_name_the_server_does_not_know() -> None:
-    # A real server sends only what applies -- a database with no domain sends no
-    # AUTH_SC_DB_DOMAIN -- so an unset field must be absent, not an empty string.
-    from seerdb.common.tns import _ENCODE_FIELD_VERSION
+    # A name the Mirror does not know is left out. The domain is the exception:
+    # a database with no domain still sends AUTH_SC_DB_DOMAIN, empty, on every
+    # bed from 10g to 26ai (#1820).
+    from seerdb.common.tns import _ENCODE_FIELD_VERSION, decode_kv, decode_ub4
 
     token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_12_1)
     try:
         payload = encode_result(bytes(24), session_id=245, instance_name='FREE')
+        (count, rest) = decode_ub4(payload[1:])
+        pairs = dict(decode_kv(rest, count, [], {})[0])
     finally:
         _ENCODE_FIELD_VERSION.reset(token)
-    assert b'AUTH_INSTANCENAME' in payload
-    assert b'AUTH_SC_DB_DOMAIN' not in payload
-    assert b'AUTH_SC_SERVICE_NAME' not in payload
+    assert pairs[b'AUTH_INSTANCENAME'] == b'FREE'
+    assert b'AUTH_SC_SERVICE_NAME' not in pairs
+    # Present and empty, as a real server's decodes (test_tns_decode's capture).
+    assert b'AUTH_SC_DB_DOMAIN' in pairs
+    assert pairs[b'AUTH_SC_DB_DOMAIN'] is None
 
 
 def test_a_backend_that_cannot_report_its_session_never_fails_the_login() -> None:

@@ -4551,10 +4551,11 @@ def encode_result(
     ]
     if modern:
         pairs.append((b'AUTH_MAX_OPEN_CURSORS', str(_AUTH_MAX_OPEN_CURSORS).encode()))
-    # The session's names, each sent only when the server knows it -- a real
-    # server omits what does not apply (a database with no domain sends no
-    # AUTH_SC_DB_DOMAIN). A client reads these ONLY from here, so leaving them out
-    # is what left `connection.instance_name` and friends None (#826).
+    # The session's names, each sent only when the server knows it. A client
+    # reads these ONLY from here, so leaving them out is what left
+    # `connection.instance_name` and friends None (#826). The domain always
+    # goes: a database with no domain sends AUTH_SC_DB_DOMAIN empty, on every
+    # server from 10g to 26ai (#1820).
     # 21c and later send the unique name twice, the second as
     # AUTH_SC_REAL_DBUNIQUE_NAME -- the one python-oracledb 26's
     # `db_unique_name` reads, None without it (#1777).
@@ -4568,6 +4569,8 @@ def encode_result(
     ):
         if value:
             pairs.append((key, value.encode('utf-8')))
+        elif key == b'AUTH_SC_DB_DOMAIN':
+            pairs.append((key, b''))
     payload = encode_rpa_kv(pairs)
     # The session's transaction priority, reported after the pairs as 23ai
     # reports it to a client that advertised the feature (#1779).
