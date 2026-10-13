@@ -8998,6 +8998,9 @@ _OCI_DCB_COL_PRENAME = 48
 
 
 _OCI_DCB_COL_POSTNAME = 13
+# sqlplus 10.2's post-name block is 4 bytes shorter: 11g's column blocks to it
+# are 61 bytes apart for a 3-character name, 65 to 11.2 (#1764).
+_OCI_DCB_COL_POSTNAME_10_2 = 9
 
 
 # A char type carries a charset + form-of-use and sets the pre-name char flag.
@@ -9089,6 +9092,8 @@ def _encode_dcb_column_oci(col: ColumnMeta, position: int, first: bool) -> bytes
     # The post-name block is zeroed — a live 11g describe carries no column
     # position here (verified against the captured single-column reply).
     post = bytes(_OCI_DCB_COL_POSTNAME)
+    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_11_2:
+        post = bytes(_OCI_DCB_COL_POSTNAME_10_2)
     if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
         return _widen_dcb_column_oci(bytes(pre), is_char) + name + post
     return bytes(pre) + name + post
@@ -9102,7 +9107,13 @@ def encode_describe_oci(columns: list[ColumnMeta]) -> bytes:
     count, one fixed-shape block per column, then a zeroed opaque trailer.
     """
     out = bytearray([TTI_DCB])
-    out += _oci_ub4(_OCI_DCB_PREAMBLE_LEN) + bytes(_OCI_DCB_PREAMBLE_LEN)
+    # The preamble's length is a ub4, but a ub1 to sqlplus 10.2: 11g sends it
+    # `10 17` and then the 23 bytes, where 11.2 gets `10 17 00 00 00` (#1764).
+    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_11_2:
+        out += bytes([_OCI_DCB_PREAMBLE_LEN])
+    else:
+        out += _oci_ub4(_OCI_DCB_PREAMBLE_LEN)
+    out += bytes(_OCI_DCB_PREAMBLE_LEN)
     # Max row size: the thick/OCI client allocates a row buffer of this many
     # bytes, so it must cover the widest row — a zero here overflows and crashes
     # sqlplus (unlike the thin client, which skips the field). A LONG / LONG RAW /
@@ -9137,6 +9148,11 @@ _OCI_DCB_MARKER_OFF = 33
 # many values to expect in each row, so it is load-bearing for a multi-column
 # result (verified: 1/2/3 across live 1/2/3-column describes).
 _OCI_DCB_NUMCOLS_OFF = 37
+
+
+# The zero ub4 the trailer carries from 11.2 on, just ahead of the marker: 11g
+# sends sqlplus 10.2 `02000000 02000000 06...` with nothing between (#1764).
+_OCI_DCB_10_2_GAP_OFF = 29
 
 
 # The execute return status (an OCI OER, offsets 32:65 of the status trailer):
@@ -9508,6 +9524,9 @@ def _oci_dcb_tail(numcols: int) -> bytes:
     off = _OCI_DCB_MARKER_OFF
     tail[off : off + len(_OCI_DCB_MARKER)] = _OCI_DCB_MARKER
     tail[_OCI_DCB_NUMCOLS_OFF] = numcols
+    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_11_2:
+        # The marker and the column count move back by 4 with it.
+        del tail[_OCI_DCB_10_2_GAP_OFF : _OCI_DCB_10_2_GAP_OFF + 4]
     return bytes(tail)
 
 
@@ -9531,6 +9550,10 @@ def _oci_lob_describe_tail() -> bytes:
     tail[5] = _OCI_DCB_DATE_LEN  # DALC byte length; the value stays zero
     off = _OCI_LOB_DESCRIBE_SIZE_OFF
     tail[off : off + 4] = _oci_ub4(_OCI_LOB_DESCRIBE_SIZE)
+    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_11_2:
+        # The same zero ub4 the inline-row trailer drops for sqlplus 10.2, here
+        # the last four bytes: 11g ends its CLOB describe to 10.2 at 29 (#1764).
+        del tail[_OCI_DCB_10_2_GAP_OFF : _OCI_DCB_10_2_GAP_OFF + 4]
     return bytes(tail)
 
 
@@ -9763,7 +9786,8 @@ def encode_lob_describe_oci(columns: list[ColumnMeta], *, sequence: int) -> byte
     ``sequence`` is the live per-session OER counter for the execute status."""
     return (
         bytes(encode_describe_oci(columns))
-        + _OCI_LOB_DESCRIBE_TAIL
+        # Built per reply: its width follows the session's field version.
+        + _oci_lob_describe_tail()
         + _oci_lob_describe_status(sequence)
     )
 
