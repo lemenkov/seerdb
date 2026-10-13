@@ -2131,6 +2131,45 @@ def test_encode_describe_reply_oci_multicolumn_frames_each_column() -> None:
     assert reply[25 + 8 + 6 + _OCI_DESC_COLCOUNT_OFF] == 3
 
 
+def test_sqlplus_10_2_gets_the_narrower_describe_reply() -> None:
+    # 11g's DESCRIBE <table> reply to sqlplus 10.2 is a byte shorter per column
+    # and one in the trailer frame than to 11.2 -- 1217 against 1222 bytes for
+    # a 4-column table (#1764): each block lacks the zero behind its 0x24 mark,
+    # so a non-last column's describe-time entry sits a byte earlier.
+    from seerdb.common.tns import (
+        _OCI_DESC_TS_ENTRY_PRE,
+        encode_describe_reply_oci,
+    )
+    from seerdb.common.tns_consts import (
+        FIELD_VERSION_10_2,
+        FIELD_VERSION_11_2,
+        TNS_TYPE_DATE,
+    )
+
+    cols = [
+        ColumnMeta(name=b'ID', data_type=TNS_TYPE_NUMBER, data_length=22, max_size=22),
+        ColumnMeta(name=b'V', data_type=TNS_TYPE_VARCHAR, data_length=30, max_size=30),
+        ColumnMeta(name=b'D', data_type=TNS_TYPE_DATE, data_length=7, max_size=7),
+    ]
+    stamp = bytes.fromhex('787e0a0d0b2a19')
+    replies = {}
+    for fv in (FIELD_VERSION_11_2, FIELD_VERSION_10_2):
+        with _at_field_version(fv):
+            replies[fv] = encode_describe_reply_oci(
+                cols, schema=b'PYO', table=b'T', timestamp=stamp
+            )
+    wide, narrow = replies[FIELD_VERSION_11_2], replies[FIELD_VERSION_10_2]
+    assert len(narrow) == len(wide) - len(cols) - 1
+
+    # The first column's describe-time entry, a byte nearer its name (the
+    # header carries one too, which does not move).
+    def entry_after_name(reply: bytes) -> int:
+        name = reply.find(b'ID', reply.find(b'PYO') + 40)
+        return reply.find(_OCI_DESC_TS_ENTRY_PRE, name) - name
+
+    assert entry_after_name(narrow) == entry_after_name(wide) - 1
+
+
 def test_national_char_values_and_describe_ride_as_utf16be() -> None:
     # NCHAR / NVARCHAR2 (csfrm 2) go on the wire as UTF-16BE (AL16UTF16), and the
     # describe metadata is sized so sqlplus renders NCHAR(3) and the client decodes

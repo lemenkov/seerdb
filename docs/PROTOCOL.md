@@ -751,6 +751,12 @@ changed:
 - its OER widens like every other.
 None of the changed values is decoded; they are carried.
 
+To sqlplus 10.2 the same reply is **narrower** (#1764): 1217 bytes against 11.2's
+1222 for a 4-column table. Each column block lacks one zero byte, the one right
+behind the `0x24` mark at post-name offset 34, where the 12c form inserts its 20.
+So a non-last column's describe-time entry sits a byte earlier. The trailer frame
+is 120 bytes ahead of the OER, not 121. Given the 11.2 form, sqlplus 10.2 hangs.
+
 **The end-to-end tracing piggyback** (`11 87`) sqlplus sends ahead of a call
 has a head 16 bytes longer at the 12c band, so its values start at offset 155,
 not 139. The Mirror walks it there, and lands on the call behind it.
