@@ -7462,6 +7462,12 @@ Receive reverses it: strip the flag byte, AES-CBC decrypt (removing the padding
 marker + padding), then verify and strip the trailing MAC. Each `TNS_DATA`
 packet on the wire is an independent encrypt+MAC unit, so multi-packet responses
 decrypt per packet before reassembly, and the MAC keystreams stay in lock-step.
+That includes a **pipeline's** packets (§32): each op's request fragments are
+encrypted with the pipeline's data flags (BEGIN_PIPELINE, END_OF_REQUEST) kept
+in the clear header, and each response packet is decrypted before its op's reply
+is decoded. Sent in the clear, a burst is refused op by op with ORA-12599
+(cryptographic checksum mismatch); the break marker the server interjects for a
+failing op needs no re-derivation, as no reset follows it (#1849).
 
 ### 33.4 Login sequence with ANO active
 

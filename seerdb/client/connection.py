@@ -3432,15 +3432,20 @@ class OracleConnect(_ConnectionLogic):
         # fragments at the SDU with the 0x0020 "more" flag, the final fragment
         # carries FinalFlags (END_OF_REQUEST), and the very first packet of the
         # whole burst additionally carries FirstFlags (BEGIN_PIPELINE).
-        BodyMax = self.sdu - 10
+        # Under native encryption each fragment is encrypted + MAC'd, so it takes
+        # the plaintext the cipher's padding and MAC leave room for (#1849).
+        Ano = self._ano if self._ano is not None and self._ano.active else None
+        BodyMax = self.sdu - 64 if Ano is not None else self.sdu - 10
         First = True
         while len(Data) > BodyMax:
             Flags = TNS_DATA_FLAGS_MORE | (FirstFlags if First else 0)
-            self._write(encode_data_packet(Data[:BodyMax], Flags, self._large_packets))
+            Chunk = Data[:BodyMax] if Ano is None else Ano.wrap(Data[:BodyMax])
+            self._write(encode_data_packet(Chunk, Flags, self._large_packets))
             Data = Data[BodyMax:]
             First = False
         Flags = FinalFlags | (FirstFlags if First else 0)
-        self._write(encode_data_packet(Data, Flags, self._large_packets))
+        Chunk = Data if Ano is None else Ano.wrap(Data)
+        self._write(encode_data_packet(Chunk, Flags, self._large_packets))
 
     def _pipeline_recv_response(self) -> bytes:
         # Read exactly one op's response (TOKEN + body + EOR) as a single
@@ -3464,6 +3469,11 @@ class OracleConnect(_ConnectionLogic):
                         # remaining responses, so (unlike #45) skip the marker
                         # silently and read on to the erroring op's real response.
                         continue
+                    if self._ano is not None and self._ano.active:
+                        # Each DATA packet is its own encrypt + MAC unit (#437);
+                        # this reader assembles packets itself, so it decrypts
+                        # them itself (#1849).
+                        Chunk = self._ano.unwrap(Chunk)
                     Body += Chunk
                     if Flag:
                         return Body

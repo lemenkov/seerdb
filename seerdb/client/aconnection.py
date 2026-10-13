@@ -2513,18 +2513,20 @@ class AsyncOracleConnect(_ConnectionLogic):
     async def _pipeline_send_op(
         self, Data: bytes, FinalFlags: int, FirstFlags: int = 0
     ) -> None:
-        # Async copy of OracleConnect._pipeline_send_op (#158).
-        BodyMax = self.sdu - 10
+        # Async copy of OracleConnect._pipeline_send_op (#158), encryption
+        # included (#1849).
+        Ano = self._ano if self._ano is not None and self._ano.active else None
+        BodyMax = self.sdu - 64 if Ano is not None else self.sdu - 10
         First = True
         while len(Data) > BodyMax:
             Flags = TNS_DATA_FLAGS_MORE | (FirstFlags if First else 0)
-            self._wr.write(
-                encode_data_packet(Data[:BodyMax], Flags, self._large_packets)
-            )
+            Chunk = Data[:BodyMax] if Ano is None else Ano.wrap(Data[:BodyMax])
+            self._wr.write(encode_data_packet(Chunk, Flags, self._large_packets))
             Data = Data[BodyMax:]
             First = False
         Flags = FinalFlags | (FirstFlags if First else 0)
-        self._wr.write(encode_data_packet(Data, Flags, self._large_packets))
+        Chunk = Data if Ano is None else Ano.wrap(Data)
+        self._wr.write(encode_data_packet(Chunk, Flags, self._large_packets))
 
     async def _pipeline_recv_response(self) -> bytes:
         # Async copy of OracleConnect._pipeline_recv_response (#158): read one
@@ -2540,6 +2542,9 @@ class AsyncOracleConnect(_ConnectionLogic):
                     self._pending = Rest if Rest is not None else b''
                     if Type == TNS_MARKER:
                         continue
+                    if self._ano is not None and self._ano.active:
+                        # Decrypt per packet, as the sync reader does (#1849).
+                        Chunk = self._ano.unwrap(Chunk)
                     Body += Chunk
                     if Flag:
                         return Body
