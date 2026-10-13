@@ -8212,6 +8212,8 @@ _COLLECTION_METHOD = re.compile(
 )
 # An element's field assigned, `v(k).f := x`, after the key's closing paren.
 _ELEMENT_FIELD_ASSIGN = re.compile(r'\s*\.\s*([A-Za-z_][\w$#]*)\s*:=')
+# A field read after an element, `v(k).f`; not a range, `v(1)..v(2)`.
+_ELEMENT_FIELD = re.compile(r'\s*\.\s*[A-Za-z_]')
 # What a statement starts after: where an assignment `v(k) := x` can stand.
 _STATEMENT_START = re.compile(
     r'(?is)(?:^|[;]|\b(?:BEGIN|THEN|ELSE|LOOP|DECLARE|IS|AS)\b)\s*$'
@@ -8293,7 +8295,12 @@ def _rewrite_index_tables(body: str, tables: dict[str, str]) -> str:
                 )
                 pos = end
                 continue
-            out.append(text[pos : found.start()] + f'{typ}$get({name}, {key})')
+            read = f'{typ}$get({name}, {key})'
+            if _ELEMENT_FIELD.match(text, close + 1):
+                # `v(k).f`: PostgreSQL takes a field of a call's result only
+                # with the call in parentheses (#1799).
+                read = f'({read})'
+            out.append(text[pos : found.start()] + read)
             pos = close + 1
         out.append(text[pos:])
         return ''.join(out)

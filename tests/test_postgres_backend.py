@@ -3121,6 +3121,15 @@ def test_a_body_indexes_its_index_by_tables() -> None:
         'CASE WHEN pk.t$exists(a, k + 1) THEN pk.t$get(a, k + 1) END, '
         "jsonb_build_object('numbervalue', n * 2))); END"
     )
+    # An element's field read is a field of the call's result, which
+    # PostgreSQL takes only in parentheses (#1799); a range bound is no field.
+    assert _rewrite_index_tables(
+        'x := a(k).NumberValue + a(1) . s; FOR i IN a(1)..a(2) LOOP NULL; END LOOP;',
+        tables,
+    ) == (
+        'x := (pk.t$get(a, k)).NumberValue + (pk.t$get(a, 1)) . s; '
+        'FOR i IN pk.t$get(a, 1)..pk.t$get(a, 2) LOOP NULL; END LOOP;'
+    )
 
 
 def test_an_index_by_tables_methods_run_as_oracles() -> None:
@@ -3181,6 +3190,37 @@ def test_an_index_by_tables_methods_run_as_oracles() -> None:
         backend.rollback()
         try:
             backend.execute('DROP PACKAGE pi1607')
+        except Exception:
+            backend.rollback()
+
+
+def test_an_index_by_tables_element_fields_read_as_oracles() -> None:
+    # A field of an index-by table's element, set and read in a package body
+    # (#1795, #1799). A field never set is NULL. The answer is 23ai's.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE pf1799 AS\n'
+            '  TYPE rec IS RECORD (n NUMBER, s VARCHAR2(10));\n'
+            '  TYPE arr IS TABLE OF rec INDEX BY BINARY_INTEGER;\n'
+            '  FUNCTION f RETURN VARCHAR2;\nEND;'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE BODY pf1799 AS\n'
+            '  FUNCTION f RETURN VARCHAR2 IS\n    a arr;\n  BEGIN\n'
+            "    a(1).n := 21; a(1).s := 'x'; a(2).n := 4;\n"
+            "    RETURN a(1).n * 2 || a(1).s || a(2).n || '/' || NVL(a(2).s, '-');\n"
+            '  END;\nEND;'
+        )
+        assert backend.execute(
+            "SELECT spec, body FROM sys.ora_packages WHERE name = 'pf1799'"
+        ).rows == [('VALID', 'VALID')]
+        (row,) = backend.execute('SELECT pf1799.f() FROM dual').rows
+        assert row[0] == '42x4/-'
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP PACKAGE pf1799')
         except Exception:
             backend.rollback()
 
