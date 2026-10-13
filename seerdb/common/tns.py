@@ -13939,6 +13939,23 @@ _DECLARED_TEMPORAL = (
 )
 
 
+def _encode_declared_temporal(Value: datetime.date | BcDate, DataType: int) -> bytes:
+    """A date or time value as a bind of temporal type ``DataType`` carries it,
+    without a length prefix: a declared scalar bind and an object attribute
+    alike.
+
+    The width is the type's, as in a column, except that a TIMESTAMP [WITH LOCAL
+    TIME ZONE] with no fractional seconds goes out in the 7-byte DATE form, as
+    python-oracledb sends it. The server does not read the two forms alike:
+    declared LTZ, `trunc(ltz_column) = :midnight` matched the row sent as 7 bytes
+    and nothing sent as 11 with a zero fraction (#1337)."""
+    Encoded = _encode_temporal(Value, DataType)
+    Whole = Encoded[7:] == bytes(4)
+    if Whole and DataType in (TNS_TYPE_TIMESTAMP, TNS_TYPE_TIMESTAMPLTZ):
+        return Encoded[:7]
+    return Encoded
+
+
 def _declared_value_bytes(Value: object, DataType: int) -> bytes | None:
     """A bind's value encoded as the type its `Var` declared, or None.
 
@@ -13956,17 +13973,7 @@ def _declared_value_bytes(Value: object, DataType: int) -> bytes | None:
     if Value is None:
         return None
     if isinstance(Value, (datetime.date, BcDate)) and DataType in _DECLARED_TEMPORAL:
-        Encoded = _encode_temporal(Value, DataType)
-        # A TIMESTAMP [WITH LOCAL TIME ZONE] bind with no fractional seconds goes
-        # out in the 7-byte DATE form under its 11-byte descriptor, as
-        # python-oracledb sends it. The server does not read the two forms alike:
-        # declared LTZ, `trunc(ltz_column) = :midnight` matched the row sent as 7
-        # bytes and nothing sent as 11 with a zero fraction (#1337).
-        if DataType in (TNS_TYPE_TIMESTAMP, TNS_TYPE_TIMESTAMPLTZ) and Encoded[
-            7:
-        ] == bytes(4):
-            Encoded = Encoded[:7]
-        return _bytes_with_length(Encoded)
+        return _bytes_with_length(_encode_declared_temporal(Value, DataType))
     if isinstance(Value, bool) and DataType == TNS_TYPE_NUMBER:
         # From 23.1 a bare bool goes out as a native BOOLEAN value, which a
         # NUMBER descriptor makes the server read as a non-zero NUMBER: False
@@ -14562,7 +14569,10 @@ def _encode_object_attr(DataType: int, Charset: int, Value: Any) -> bytes:
     ):
         if isinstance(Value, date):
             return encode_token_date(Value)
-        return encode_token_datetime(Value)
+        # The attribute's type sets the width, not the value: a fraction sent
+        # into a DATE attribute or a zone into a TIMESTAMP one was read as
+        # something else, and a plain date crashed the bind (#1803).
+        return _encode_declared_temporal(Value, DataType)
     if DataType == TNS_TYPE_BFLOAT:
         return encode_token_binary_float(Value)
     if DataType == TNS_TYPE_BDOUBLE:
