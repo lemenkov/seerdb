@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import socket
+import ssl
 import threading
 from collections.abc import Callable
 
@@ -30,6 +31,11 @@ logger = logging.getLogger('seerdb.server')
 BackendFactory = Callable[[], Backend]
 
 _BACKLOG = 16
+
+# How long a client has to finish the TLS handshake (#1834). The handshake runs
+# on the session's thread, so a peer that connects and says nothing holds only
+# that thread, and only this long.
+_TLS_HANDSHAKE_SECONDS = 30.0
 
 # Logged as a Mirror starts serving. A WARNING reaches stderr even when the
 # application configured no logging.
@@ -53,10 +59,15 @@ class Server:
         field_version: int = FIELD_VERSION_11_2,
         tns_version: int | None = None,
         encryption: str = 'accepted',
+        ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         self._backend_factory = backend_factory
         # The Mirror's ANO stance (§33): 'accepted', 'requested' or 'required'.
         self._encryption = encryption
+        # TCPS (#1834): with a server context, every connection is TLS from its
+        # first byte, as an Oracle TCPS listener's is; the TNS handshake runs
+        # inside it.
+        self._ssl_context = ssl_context
         # The field version the Mirror advertises to thin clients (default the
         # pinned 11.2). Higher values unlock the 12c+ / 23ai wire formats a client
         # gates on that version; the login path handles them, the query path is
@@ -76,7 +87,12 @@ class Server:
     def serve_forever(self) -> None:
         """Accept and serve connections until :meth:`close` (or an interrupt)."""
         logger.warning(_PROVISIONAL_NOTICE)
-        logger.info('Mirror listening on %s:%d', self.host, self.port)
+        logger.info(
+            'Mirror listening on %s:%d%s',
+            self.host,
+            self.port,
+            ' (TCPS)' if self._ssl_context is not None else '',
+        )
         while self._running:
             try:
                 client, addr = self._sock.accept()
@@ -89,6 +105,17 @@ class Server:
             ).start()
 
     def _handle(self, client: socket.socket, addr: tuple) -> None:
+        if self._ssl_context is not None:
+            try:
+                client.settimeout(_TLS_HANDSHAKE_SECONDS)
+                client = self._ssl_context.wrap_socket(client, server_side=True)
+                client.settimeout(None)
+            except OSError as exc:  # ssl.SSLError, a timeout, a reset
+                logger.warning(
+                    'TLS handshake with %s:%d failed: %s', addr[0], addr[1], exc
+                )
+                client.close()
+                return
         backend = None
         try:
             backend = self._backend_factory()
@@ -124,6 +151,7 @@ def serve(
     field_version: int = FIELD_VERSION_11_2,
     tns_version: int | None = None,
     encryption: str = 'accepted',
+    ssl_context: ssl.SSLContext | None = None,
 ) -> None:
     """Run a Mirror server until interrupted — the one-call convenience."""
     server = Server(
@@ -133,6 +161,7 @@ def serve(
         field_version=field_version,
         tns_version=tns_version,
         encryption=encryption,
+        ssl_context=ssl_context,
     )
     try:
         server.serve_forever()

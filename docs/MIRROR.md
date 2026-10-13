@@ -64,6 +64,9 @@ Any service name is accepted.
 | `--port` | `1521` | listen port |
 | `--encryption` | `accepted` | native network encryption (ANO): `accepted` never encrypts, `requested` encrypts whenever the client offers AES, `required` refuses a client that doesn't |
 | `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR` |
+| `--tls-cert` | | serve TCPS: the server's certificate chain, PEM (see *Encryption*) |
+| `--tls-key` | | that certificate's private key, PEM |
+| `--tls-ca` | | require client certificates issued by this CA, PEM |
 | `--config FILE` | | an INI file with the same options (below) |
 
 For `postgres`:
@@ -95,6 +98,9 @@ host = 127.0.0.1
 port = 1521
 encryption = accepted
 log_level = INFO
+; tls_cert = /etc/mirror/server.pem
+; tls_key = /etc/mirror/server.key
+; tls_ca = /etc/mirror/clients-ca.pem
 
 [clients]
 SCOTT = tiger
@@ -142,12 +148,34 @@ it, so it must be a different role, not a superuser, and not the table's owner.
 
 ### Encryption
 
-The Mirror supports Oracle native network encryption (ANO): AES-128, -192 or
--256 with a SHA-2 checksum. The default stance, `accepted`, leaves every
-session in plaintext, and a client that requires encryption is refused. Give
-`--encryption requested` to encrypt whenever the client offers it, or
-`required` to serve only clients that do. The Mirror has no TLS (TCPS)
-listener yet (#1834): a client configured for `tcps` cannot connect.
+**TLS (TCPS).** Given a certificate, the Mirror serves TCPS: every connection is
+TLS from its first byte, as an Oracle TCPS listener's is, and the Oracle
+protocol runs inside it.
+
+```sh
+seerdb-mirror --port 2484 --tls-cert server.pem --tls-key server.key postgres '...'
+```
+
+- **Versions.** TLS 1.2 and later.
+- **Client certificates.** With `--tls-ca`, a client must present a
+  certificate that CA issued (mutual TLS, as an Oracle wallet provides).
+- **The certificate itself.** Clients check its DN or host name against what
+  they expect (`ssl_server_cert_dn`, `ssl_server_dn_match`). Recent Python
+  clients, python-oracledb's thin mode among them, also refuse a certificate
+  without the standard extensions (such as an Authority Key Identifier), so
+  issue it from a proper CA.
+- **Mixing transports.** A listener serves either TCP or TCPS. Run two Mirrors
+  to offer both.
+
+TLS is the way to protect a Mirror that listens beyond localhost: unlike ANO, it
+authenticates the server.
+
+**Native network encryption (ANO).** AES-128, -192 or -256 with a SHA-2
+checksum. The default stance, `accepted`, leaves every session in plaintext, and
+a client that requires encryption is refused. Give `--encryption requested` to
+encrypt whenever the client offers it, or `required` to serve only clients that
+do. ANO's key exchange does not authenticate the server, so it does not protect
+against a man in the middle; use TLS for that.
 
 ## Mirror over PostgreSQL
 
@@ -274,8 +302,5 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
 The full list, with the reasons, is in the backend module's docstring
 (`seerdb/server/backends/postgres.py`).
 
-Two limits apply to the Mirror itself:
-
-- **TLS:** the Mirror has no TCPS listener (#1834).
-- **Clients:** thin clients from 10.2 on, and sqlplus / OCI from 10.2 on.
-  Oracle 8i and 9i clients are not served.
+One limit applies to the Mirror itself: it serves thin clients from 10.2 on,
+and sqlplus / OCI from 10.2 on. Oracle 8i and 9i clients are not served.

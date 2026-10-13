@@ -16,6 +16,9 @@ the defaults; the command line wins. The config file is INI::
     port = 1521
     encryption = accepted       ; accepted | requested | required (ANO)
     log_level = INFO
+    ; tls_cert = server.pem     ; TCPS: the server's certificate chain
+    ; tls_key = server.key      ;       and its private key
+    ; tls_ca = clients-ca.pem   ;       require client certificates from this CA
 
     [clients]                   ; the Oracle logins the Mirror accepts
     SCOTT = tiger
@@ -40,6 +43,7 @@ import argparse
 import configparser
 import logging
 import os
+import ssl
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
@@ -61,6 +65,8 @@ class Launch:
     encryption: str = 'accepted'
     field_version: int | None = None
     description: str = ''
+    # TCPS (#1834): the server context, None for plain TCP.
+    ssl_context: ssl.SSLContext | None = None
 
 
 class _Config(configparser.ConfigParser):
@@ -84,6 +90,13 @@ def _parser() -> argparse.ArgumentParser:
         'or required',
     )
     parser.add_argument('--log-level', help='DEBUG, INFO (default), WARNING or ERROR')
+    parser.add_argument(
+        '--tls-cert', help="serve TCPS: the server's certificate chain (PEM)"
+    )
+    parser.add_argument('--tls-key', help="the certificate's private key (PEM)")
+    parser.add_argument(
+        '--tls-ca', help='require client certificates issued by this CA (PEM)'
+    )
     commands = parser.add_subparsers(dest='command', metavar='BACKEND')
     postgres = commands.add_parser('postgres', help='serve from PostgreSQL')
     postgres.add_argument('conninfo', nargs='?', help='a libpq connection string')
@@ -147,6 +160,24 @@ def _flag(value: str) -> bool:
     raise SystemExit(f'not a yes/no value: {value!r}')
 
 
+def _tls_context(cert: str, key: str, ca: str) -> ssl.SSLContext | None:
+    # The TCPS server context (#1834), or None when no certificate is given.
+    if not cert:
+        if key or ca:
+            raise SystemExit('--tls-key and --tls-ca need --tls-cert')
+        return None
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        context.load_cert_chain(cert, key or None)
+        if ca:
+            context.load_verify_locations(ca)
+            context.verify_mode = ssl.CERT_REQUIRED
+    except (OSError, ssl.SSLError) as exc:
+        raise SystemExit(f'cannot load the TLS certificate or key: {exc}') from None
+    return context
+
+
 def build(
     argv: Sequence[str] | None = None, env: dict[str, str] | None = None
 ) -> Launch:
@@ -179,6 +210,12 @@ def build(
     log_level = option(args.log_level, server, 'log_level', 'INFO').upper()
     if not isinstance(logging.getLevelName(log_level), int):
         raise SystemExit(f'unknown log level {log_level!r}')
+
+    ssl_context = _tls_context(
+        option(args.tls_cert, server, 'tls_cert', ''),
+        option(args.tls_key, server, 'tls_key', ''),
+        option(args.tls_ca, server, 'tls_ca', ''),
+    )
 
     kind = args.command or str(backend.get('type', '')).strip().lower()
     if kind == 'observe':
@@ -233,6 +270,7 @@ def build(
             postgres_factory,
             encryption=encryption,
             description=f'PostgreSQL presenting {presents}',
+            ssl_context=ssl_context,
         )
 
     upstream = option(getattr(args, 'upstream', None), backend, 'upstream', '')
@@ -265,6 +303,7 @@ def build(
         encryption=encryption,
         field_version=field_version,
         description=f'passthrough to {up_host}:{up_port}/{service}',
+        ssl_context=ssl_context,
     )
     if field_version is None:
         # Present what the upstream speaks: probe it once, as the first account.
@@ -309,4 +348,5 @@ def main(argv: Sequence[str] | None = None) -> None:
         launch.port,
         backend_factory=launch.backend_factory,
         encryption=launch.encryption,
+        ssl_context=launch.ssl_context,
     )
