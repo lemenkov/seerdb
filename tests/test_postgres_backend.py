@@ -9555,3 +9555,41 @@ def test_a_prepared_query_follows_another_sessions_ddl() -> None:
             reader.rollback()
         reader.close()
         other.close()
+
+
+def test_another_sessions_ddl_reaches_what_a_session_knows_of_the_schema() -> None:
+    # A session keeps what it learnt of a table -- here whether a column may
+    # be NULL, which a query's describe reports -- until a DDL. Its own DDL
+    # always cleared that; another session's now does too, through the DDL
+    # log its event trigger keeps (#1887), read in the round trip a statement
+    # makes anyway.
+    reader = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    other = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        reader.execute('CREATE TABLE dg1887t (n NUMBER)')
+        assert reader.execute('SELECT n FROM dg1887t').columns[0].null_ok == 1
+        other.execute('ALTER TABLE dg1887t MODIFY (n NOT NULL)')
+        assert reader.execute('SELECT n FROM dg1887t').columns[0].null_ok == 0
+    finally:
+        reader.rollback()
+        try:
+            reader.execute('DROP TABLE dg1887t')
+        except Exception:
+            reader.rollback()
+        reader.close()
+        other.close()
+
+
+def test_the_mirrors_own_setup_is_not_logged_as_ddl() -> None:
+    # Every connect runs the Mirror's setup DDL again; logged, it would make
+    # every session forget its schema knowledge at every connect (#1887).
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    try:
+        if admin.execute("SELECT to_regclass('sys.ora_ddl_log')").fetchone() == (None,):
+            PostgresBackend(_CONNINFO, credentials=dict(_CREDS)).close()
+        (before,) = _fetched_row(admin.execute('SELECT count(*) FROM sys.ora_ddl_log'))
+        PostgresBackend(_CONNINFO, credentials=dict(_CREDS)).close()
+        (after,) = _fetched_row(admin.execute('SELECT count(*) FROM sys.ora_ddl_log'))
+        assert after == before
+    finally:
+        admin.close()
