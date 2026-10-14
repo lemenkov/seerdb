@@ -2487,6 +2487,7 @@ _NULL_CASTS = {
 
 
 # A transaction a savepoint taken in it still belongs to: open, or failed.
+_CALL_SAVEPOINT = 'SAVEPOINT _mirror_call'
 _OPEN_TRANSACTION = frozenset(
     {psycopg.pq.TransactionStatus.INTRANS, psycopg.pq.TransactionStatus.INERROR}
 )
@@ -10116,32 +10117,32 @@ def _while_connected(method):
 class _CountedCursor(psycopg.Cursor[Any]):
     # Counts the statements its connection sends (#1869), so an answer read in
     # one round trip is known to be still current: no statement ran since.
-    # A prelude the connection holds goes first (#1875).
+    # The prelude the connection holds goes first (#1875).
     def execute(self, query: Any, params: Any = None, **kwargs: Any) -> Any:
         conn = cast('_CountedConnection', self.connection)
-        prelude = conn.prelude
-        if prelude is not None:
-            conn.prelude = None
-            off = conn.pgconn.pipeline_status == psycopg.pq.PipelineStatus.OFF
-            if off and params is not None:
-                # In one round trip with the statement. Only a statement with
-                # parameters: it goes as the extended query protocol anyway, the
-                # only one a pipeline speaks, which refuses several commands in
-                # one string.
-                with conn.pipeline():
-                    conn.cursor().execute(prelude)
-                    conn.statements += 1
-                    super().execute(query, params, **kwargs)
-                return self
-            conn.cursor().execute(prelude)
+        (prelude, conn.prelude) = (conn.prelude, ())
+        off = conn.pgconn.pipeline_status == psycopg.pq.PipelineStatus.OFF
+        if prelude and off and params is not None:
+            # In one round trip with the statement. Only a statement with
+            # parameters: it goes as the extended query protocol anyway, the
+            # only one a pipeline speaks, which refuses several commands in
+            # one string.
+            with conn.pipeline():
+                for statement in prelude:
+                    conn.cursor().execute(statement)
+                conn.statements += 1
+                super().execute(query, params, **kwargs)
+            return self
+        for statement in prelude:
+            conn.cursor().execute(statement)
         conn.statements += 1
         return super().execute(query, params, **kwargs)
 
     def executemany(self, *args: Any, **kwargs: Any) -> None:
         conn = cast('_CountedConnection', self.connection)
-        if conn.prelude is not None:
-            (prelude, conn.prelude) = (conn.prelude, None)
-            conn.cursor().execute(prelude)
+        (prelude, conn.prelude) = (conn.prelude, ())
+        for statement in prelude:
+            conn.cursor().execute(statement)
         conn.statements += 1
         super().executemany(*args, **kwargs)
 
@@ -10152,9 +10153,18 @@ class _CountedConnection(psycopg.Connection[Any]):
     # transaction id, and the statement count it was read at (#1869). Kept
     # here so that it travels with the connection, as a parked one does.
     unwritten_at: tuple[bool, int] | None = None
-    # A statement the next one sends first, in its round trip where it can
-    # (#1875): the savepoint a PL/SQL call takes.
-    prelude: str | None = None
+    # Statements the next one sends first, in its round trip where it can
+    # (#1875): the savepoint a PL/SQL call takes and its release. The end of
+    # the transaction drops them, having released every savepoint.
+    prelude: tuple[str, ...] = ()
+
+    def commit(self) -> None:
+        self.prelude = ()
+        super().commit()
+
+    def rollback(self) -> None:
+        self.prelude = ()
+        super().rollback()
 
 
 _ACCOUNTS_SCHEMA = 'seerdb_auth'
@@ -14587,9 +14597,10 @@ class PostgresBackend:
         # A call that fails undoes only itself (#1632): the caller's open work
         # survives it, as it survives any other statement that fails, where a
         # rollback of the whole transaction took it too.
-        # The savepoint rides with the call's first statement (#1875); one
-        # still waiting when the call ends was never taken.
-        self._conn.prelude = 'SAVEPOINT _mirror_call'
+        # The savepoint rides with the call's first statement, and its release
+        # with the next statement after the call (#1875). A savepoint still
+        # waiting when the call ends was never taken.
+        self._conn.prelude += (_CALL_SAVEPOINT,)
         try:
             result = self._execute_plsql_call(sql, binds)
         except BaseException:
@@ -14600,14 +14611,16 @@ class PostgresBackend:
                 self._conn.execute('RELEASE SAVEPOINT _mirror_call')
             raise
         if self._taken_call_savepoint():
-            self._conn.execute('RELEASE SAVEPOINT _mirror_call')
+            self._conn.prelude += ('RELEASE SAVEPOINT _mirror_call',)
         return result
 
     def _taken_call_savepoint(self) -> bool:
         # Whether a PL/SQL call's savepoint was taken and still stands, and
         # the prelude that would take it dropped (#1875).
-        if self._conn.prelude is not None:
-            self._conn.prelude = None
+        if _CALL_SAVEPOINT in self._conn.prelude:
+            self._conn.prelude = tuple(
+                s for s in self._conn.prelude if s != _CALL_SAVEPOINT
+            )
             return False
         return self._conn.info.transaction_status in _OPEN_TRANSACTION
 
