@@ -15214,9 +15214,7 @@ class PostgresBackend:
         it to its text, which the column's format check would only refuse as
         ORA-01410. A number bind or literal is caught here; one a query
         computes is left to that check."""
-        if 'rowid' not in sql.lower() and not self._has_rowid_columns():
-            return None
-        (masked, _contents) = _mask_quoted(sql)
+        (masked, contents) = _mask_quoted(sql)
         insert = _ROWID_INSERT.match(masked)
         update = None if insert else _ROWID_UPDATE.match(masked)
         if insert is None and update is None:
@@ -15243,7 +15241,7 @@ class PostgresBackend:
                     pairs.append(
                         (column.strip(), re.split(r'(?i)\bWHERE\b', value)[0].strip())
                     )
-        rowid_columns = self._rowid_columns(_pg_name(table))
+        rowid_columns = self._rowid_columns(_pg_name(_unmask_quoted(table, contents)))
         if not rowid_columns:
             return None
         bind_values = dict(zip(_bind_names(sql), binds))
@@ -15265,15 +15263,6 @@ class PostgresBackend:
                     ora_code=ORA_INCONSISTENT_DATATYPES,
                 )
         return None
-
-    def _has_rowid_columns(self) -> bool:
-        # Whether any table has a ROWID column at all (#1624), so a statement
-        # into none costs no lookup. Read at once: ROWID columns are rare.
-        row = self._conn.execute(
-            'SELECT EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_type t '
-            "ON t.oid = a.atttypid WHERE t.typname = 'ora_rowid' AND NOT a.attisdropped)"
-        ).fetchone()
-        return bool(row and row[0])
 
     def _package_functions(self) -> dict[str, frozenset[str]]:
         # Each package's functions that take no argument a call must give

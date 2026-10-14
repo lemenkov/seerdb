@@ -4013,6 +4013,66 @@ def test_a_rowid_column_refuses_a_number_and_a_bad_rowid() -> None:
             backend.rollback()
 
 
+def test_only_an_insert_or_update_looks_for_rowid_columns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The ROWID-number check (#1624) applies to INSERT ... VALUES and UPDATE ...
+    # SET alone, so a query or a PL/SQL call asks PostgreSQL nothing for it
+    # (#1868): it cost every statement a round trip.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    sent: list[str] = []
+    execute = psycopg.Cursor.execute
+
+    def recorded(cursor: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
+        sent.append(str(query))
+        return execute(cursor, query, *args, **kwargs)
+
+    def looked() -> int:
+        return sum("typname = 'ora_rowid'" in query for query in sent)
+
+    try:
+        backend.execute('CREATE TABLE rw1868t (n NUMBER, r ROWID)')
+        monkeypatch.setattr(psycopg.Cursor, 'execute', recorded)
+        backend.execute('SELECT :1 FROM dual', [1])
+        backend.execute('SELECT n FROM rw1868t')
+        backend.execute('BEGIN NULL; END;')
+        assert looked() == 0
+        backend.execute('INSERT INTO rw1868t (n) VALUES (:1)', [1])
+        assert looked() == 1
+    finally:
+        monkeypatch.undo()
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE rw1868t')
+        except Exception:
+            backend.rollback()
+
+
+def test_the_rowid_check_reads_a_quoted_table_name() -> None:
+    # A quoted table name reaches the ROWID check (#1624) as itself, not as
+    # its mask: an INSERT into "_rw1868" asked PostgreSQL about a name holding
+    # NUL bytes, which it refuses (#1868).
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE "_rw1868" (n NUMBER, r ROWID)')
+        backend.execute('INSERT INTO "_rw1868" (n) VALUES (:1)', [1])
+        for statement in (
+            'INSERT INTO "_rw1868" (n, r) VALUES (2, :1)',
+            'UPDATE "_rw1868" SET r = :1 WHERE n = 1',
+        ):
+            with pytest.raises(BackendError) as exc:
+                backend.execute(statement, [12345])
+            assert exc.value.ora_code == 932, statement
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE "_rw1868"')
+        except Exception:
+            backend.rollback()
+
+
 def test_v_version_lists_the_presented_release() -> None:
     # V$VERSION (#1603) in 12.1's shape: 11g's five component rows of the
     # release the Mirror presents, and CON_ID 0 -- the banner sqlplus reads
