@@ -3475,7 +3475,8 @@ def test_a_calls_savepoint_rides_with_the_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The savepoint a PL/SQL call takes (#1632) goes in the call's own round
-    # trip, not in one of its own (#1875); none is left waiting after it.
+    # trip, and its release in the next statement's, not each in one of its
+    # own (#1875).
     from seerdb.common.tns_consts import TNS_TYPE_NUMBER
     from seerdb.server.backend import BindVar, Result
 
@@ -3499,16 +3500,61 @@ def test_a_calls_savepoint_rides_with_the_call(
         )
 
     try:
+        # A session's first query looks the catalog up without parameters, a
+        # statement no prelude rides with; warm, a query sends none.
         call(0)
+        backend.execute('SELECT :1 FROM dual', [0])
         monkeypatch.setattr(psycopg.Cursor, 'execute', recorded)
         for n in range(3):
             assert int(call(n).out_binds[0]) == n + 1
-            assert getattr(backend._conn, 'prelude', None) is None
-        taken = [p for q, p in sent if q == 'SAVEPOINT _mirror_call']
-        assert taken == [True] * 3
+        backend.execute('SELECT :1 FROM dual', [1])
+        for name in ('SAVEPOINT _mirror_call', 'RELEASE SAVEPOINT _mirror_call'):
+            assert [p for q, p in sent if q == name] == [True] * 3, name
     finally:
         monkeypatch.undo()
         backend.rollback()
+        backend.close()
+
+
+def test_a_calls_release_waits_no_longer_than_its_transaction() -> None:
+    # The release a call leaves for the next statement (#1875) goes with the
+    # transaction: a commit or a rollback drops it, and the next call or
+    # statement runs in the new transaction as usual. A client's savepoint
+    # taken before the call still undoes the call.
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+
+    def insert(n: int) -> None:
+        backend.execute(
+            'BEGIN INSERT INTO pc1875t VALUES (:1); END;',
+            [BindVar(value=n, tns_type=TNS_TYPE_NUMBER, max_size=22)],
+        )
+
+    def rows() -> list[int]:
+        found = backend.execute('SELECT n FROM pc1875t ORDER BY n').rows
+        return [int(row[0]) for row in found]
+
+    try:
+        backend.execute('CREATE TABLE pc1875t (n NUMBER)')
+        insert(1)
+        backend.commit()
+        insert(2)
+        backend.rollback()
+        insert(3)
+        backend.execute('SAVEPOINT pc1875')
+        insert(4)
+        backend.execute('ROLLBACK TO SAVEPOINT pc1875')
+        backend.execute('COMMIT')
+        insert(5)
+        assert rows() == [1, 3, 5]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE pc1875t')
+        except Exception:
+            backend.rollback()
         backend.close()
 
 
