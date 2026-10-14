@@ -2370,6 +2370,37 @@ def test_a_rowid_renders_as_the_client_renders_it() -> None:
         backend.close()
 
 
+def test_a_dmls_rowid_is_the_rowid_a_query_selects() -> None:
+    # A DML's last rowid is encoded by the backend from the row's table and
+    # ctid (#1879), a query's ROWID by sys.ora_rowid: both name the same row,
+    # for one statement and for the last row of a batch.
+    from seerdb.server.backend import Result
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+
+    def selected(n: int) -> object:
+        rows = backend.execute('SELECT ROWID FROM dr1879t WHERE n = :1', [n]).rows
+        return rows[0][0]
+
+    try:
+        backend.execute('CREATE TABLE dr1879t (n NUMBER, s VARCHAR2(10))')
+        one = backend.execute("INSERT INTO dr1879t VALUES (1, 'a')")
+        assert one.last_rowid == selected(1)
+        batch = backend.execute_many(
+            'INSERT INTO dr1879t VALUES (:1, :2)', [(n, 'b') for n in range(2, 400)]
+        )
+        assert isinstance(batch, Result)
+        assert (batch.rowcount, batch.last_rowid) == (398, selected(399))
+        moved = backend.execute("UPDATE dr1879t SET s = 'c' WHERE n = 250")
+        assert moved.last_rowid == selected(250)
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE dr1879t')
+        except Exception:
+            backend.rollback()
+
+
 def test_unqualified_names_resolve_in_the_login_users_schema() -> None:
     # Oracle starts a session in the login user's schema, so a table created as
     # user.t is found as plain t (#1188). A user without a schema gets one at

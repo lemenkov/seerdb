@@ -363,6 +363,7 @@ from seerdb.common.tns_consts import (
     VECTOR_FLAG_FLEXIBLE_DIM,
     VECTOR_FLAG_SPARSE,
 )
+from seerdb.common.types import rowid_to_string
 from seerdb.common.vector import SparseVector
 from seerdb.server import (
     BackendError,
@@ -3642,7 +3643,20 @@ _STATEMENT_TABLE = re.compile(r'\b(?:FROM|UPDATE|INTO)\s+([\w.]+)', re.IGNORECAS
 # (cursor.lastrowid), in the same form SELECT ROWID gives.
 _DML_HEAD = re.compile(r'\s*(INSERT|UPDATE|DELETE)\b', re.IGNORECASE)
 _HAS_RETURNING = re.compile(r'\bRETURNING\b', re.IGNORECASE)
-_ROWID_RETURNING = ' RETURNING sys.ora_rowid(tableoid, ctid)'
+# The row's table and heap address, encoded here rather than by sys.ora_rowid:
+# the encoding cost the server some 0.3 ms per row a DML touched (#1879).
+_ROWID_RETURNING = ' RETURNING tableoid::bigint, ctid::text'
+_CTID = re.compile(r'\((\d+),(\d+)\)')
+
+
+def _dml_rowid(table: object, ctid: object) -> str:
+    # The ROWID of a row a DML touched, from its RETURNING: what sys.ora_rowid
+    # renders for SELECT ROWID, the block one past the ctid's (#1879).
+    match = _CTID.fullmatch(str(ctid))
+    assert match is not None, ctid
+    return rowid_to_string(int(str(table)), 1, int(match[1]) + 1, int(match[2]))
+
+
 _ROWID_WORD = re.compile(r'\bROWID\b', re.IGNORECASE)
 
 
@@ -11380,9 +11394,9 @@ class PostgresBackend:
         if with_rowid is not None:
             # The rows are the rowids of the rows touched, not a result set: a
             # DML still answers with a count, and the last one is its rowid.
-            touched = [row[0] for row in result.rows]
+            rows = result.rows
             return Result(
-                rowcount=len(touched), last_rowid=touched[-1] if touched else None
+                rowcount=len(rows), last_rowid=_dml_rowid(*rows[-1]) if rows else None
             )
         if result.columns and not is_ddl:
             self._release_read_locks()
@@ -14320,7 +14334,7 @@ class PostgresBackend:
                     # the batch's count is all of them, its rowid the very last.
                     cursor.executemany(bound_sql, params, returning=True)
                     while True:
-                        touched.extend(r[0] for r in cursor.fetchall())
+                        touched.extend(cursor.fetchall())
                         if not cursor.nextset():
                             break
                     affected = len(touched)
@@ -14333,7 +14347,8 @@ class PostgresBackend:
             raise self._replay_until_failure(bound_sql, params) from exc
         if with_rowid is not None:
             return Result(
-                rowcount=affected, last_rowid=touched[-1] if touched else None
+                rowcount=affected,
+                last_rowid=_dml_rowid(*touched[-1]) if touched else None,
             )
         return max(affected, 0)
 
