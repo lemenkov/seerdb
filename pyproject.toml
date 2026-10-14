@@ -40,7 +40,7 @@ dependencies = [
 wallet = ["cryptography>=3.3"]
 # Token-based auth (#125): OAuth2 / OCI IAM sign the auth header with RSA-SHA256.
 token = ["cryptography>=3.3"]
-# The Mirror (seerdb.server), provisional: what its shipped backends need. The
+# The Mirror (seerdb.server), a technology preview: what its backends need. The
 # PostgreSQL backend speaks to PostgreSQL through psycopg 3.2 or later (it
 # renders SQL literals without a connection, which 3.1 cannot). Only that
 # backend imports it, so `import seerdb` works without it.

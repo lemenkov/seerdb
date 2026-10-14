@@ -3,8 +3,9 @@
 
 # The Mirror
 
-> **Provisional.** The Mirror ships with seerdb but is outside the
-> semantic-versioning promise the client (DB-API 2.0) keeps. Its Python API,
+> **A highly experimental technology preview.** The Mirror ships with seerdb so
+> you can try it, not to run production on. It is outside the
+> semantic-versioning promise the client (DB-API 2.0) keeps: its Python API,
 > its command line and its behaviour may change or break in any release, a
 > minor or patch one included. Pin an exact seerdb version if you depend on it.
 

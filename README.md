@@ -37,7 +37,8 @@ packet captures are fine).
 The package also contains **the Mirror** (`seerdb.server`) — a *server* side of
 the same wire protocol, which makes a non-Oracle backend (PostgreSQL, SQLite, or
 a real Oracle) answer Oracle clients such as `sqlplus` or a thin driver. It is
-**provisional**: outside the version promise the client keeps, and free to
+a **highly experimental technology preview**: offered to try, not for
+production, outside the version promise the client keeps, and free to
 change or break in any release. `pip install "seerdb[mirror]"` adds what its
 PostgreSQL backend needs, and `seerdb-mirror` starts one: see
 [`docs/MIRROR.md`](docs/MIRROR.md). Its wire details live in
