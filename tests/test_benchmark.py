@@ -30,6 +30,9 @@ class TestBenchmarkHarness(unittest.TestCase):
             'bench_executemany',
             'bench_fetch',
             'bench_fetch_df',
+            'bench_round_trip',
+            'bench_plsql',
+            'bench_lob',
             'main',
         ):
             self.assertTrue(callable(getattr(mod, fn)))
