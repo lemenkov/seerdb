@@ -10178,7 +10178,7 @@ def _while_connected(method):
 # prepared, then names a statement the server never made.
 _CONTROL_STATEMENT = re.compile(
     r'(?:SAVEPOINT|RELEASE SAVEPOINT|ROLLBACK TO SAVEPOINT) |'
-    r'SELECT pg_current_xact_id_if_assigned\(\) IS NULL$'
+    r'SELECT pg_current_xact_id_if_assigned\(\) IS NULL\b'
 )
 
 
@@ -10235,6 +10235,38 @@ class _CountedConnection(psycopg.Connection[Any]):
     def rollback(self) -> None:
         self.prelude = ()
         super().rollback()
+
+
+# Every DDL committed in the database adds a row to sys.ora_ddl_log, so that a
+# session can tell its cached knowledge of the schema is stale when ANOTHER
+# session changed it (#1887). A row per DDL rather than a counter in one row:
+# an UPDATE would hold that row until the DDL commits, making concurrent DDL
+# wait on each other. The generation is the row count with the highest id:
+# a transaction that commits late adds an id below the highest, which the
+# count still sees. The Mirror's own setup DDL, run at every connect, is not
+# logged (seerdb.installing). An event trigger needs a superuser to create;
+# without one the log is absent and nothing changes. The trigger's function
+# runs for everyone's DDL, so it may not fail: an error in an event trigger
+# fails the DDL that fired it.
+_DDL_LOG_DDL = (
+    'CREATE TABLE IF NOT EXISTS sys.ora_ddl_log (id bigserial PRIMARY KEY);'
+    'CREATE OR REPLACE FUNCTION sys.ora_ddl_logged() RETURNS event_trigger '
+    'LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$ BEGIN '
+    "IF current_setting('seerdb.installing', true) IS DISTINCT FROM 'on' THEN "
+    'INSERT INTO sys.ora_ddl_log DEFAULT VALUES; END IF; '
+    'EXCEPTION WHEN OTHERS THEN NULL; END $$;'
+    'DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_event_trigger '
+    "WHERE evtname = 'ora_ddl_log') THEN CREATE EVENT TRIGGER ora_ddl_log "
+    'ON ddl_command_end EXECUTE FUNCTION sys.ora_ddl_logged(); END IF; END $$;'
+)
+# Past this many rows the log is cut back to its last, at a connect; every
+# session then reloads its schema knowledge once.
+_DDL_LOG_KEPT = 200
+_DDL_GENERATION = (
+    "(SELECT count(*) || ':' || coalesce(max(id), 0) FROM sys.ora_ddl_log)"
+)
+# The transaction-id check (#1869), and with it the DDL generation (#1887).
+_WRITTEN_CHECK = 'SELECT pg_current_xact_id_if_assigned() IS NULL'
 
 
 _ACCOUNTS_SCHEMA = 'seerdb_auth'
@@ -10382,6 +10414,9 @@ class PostgresBackend:
         (major, minor) = (int(part) for part in release.split('.')[:2])
         self._release = (major, minor)
         self._conn = _CountedConnection.connect(conninfo, cursor_factory=_CountedCursor)
+        # The setup's own DDL is not another session's change (#1887).
+        self._conn.execute("SET seerdb.installing = 'on'")
+        self._conn.commit()
         # What a twin of this backend is built from: a sessionless suspend
         # takes a fresh connection, set up as this one was, from it (#1746).
         self._twin: Callable[[], PostgresBackend] = lambda: type(self)(
@@ -10795,7 +10830,65 @@ class PostgresBackend:
         self._raw_constructor_cache: dict[str, frozenset[int]] | None = None
         self._any_invisible: bool | None = None
         self._visible_cache: dict[str, list[str] | None] = {}
+        # The DDL generation this session last saw, None before the first;
+        # None for good where the log could not be installed (#1887).
+        self._ddl_generation: str | None = None
+        self._has_ddl_log = self._install_ddl_log()
+        self._conn.execute("SET seerdb.installing = 'off'")
         self._conn.commit()
+
+    def _install_ddl_log(self) -> bool:
+        # The DDL log and its event trigger (#1887), cut back when it has grown;
+        # whether the log is there to read.
+        try:
+            with self._conn.transaction():
+                self._conn.execute(_DDL_LOG_DDL)
+        except psycopg.Error:
+            self._conn.rollback()
+        try:
+            with self._conn.transaction():
+                row = self._conn.execute(
+                    'SELECT count(*), max(id) FROM sys.ora_ddl_log'
+                ).fetchone()
+                if row is not None and row[0] > _DDL_LOG_KEPT:
+                    self._conn.execute(
+                        'DELETE FROM sys.ora_ddl_log WHERE id < %s', (row[1],)
+                    )
+                row = self._conn.execute(
+                    "SELECT EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = 'ora_ddl_log')"
+                ).fetchone()
+            return bool(row and row[0])
+        except psycopg.Error:
+            self._conn.rollback()
+            return False
+
+    def _forget_schema(self) -> None:
+        # Drop what this session knows of the schema, for another session's DDL
+        # (#1887): each of these is read again as it is next needed. Not the
+        # index-organized tables, which only this session's own DDL records.
+        self._object_types.clear()
+        self._collection_types.clear()
+        self._array_oids.clear()
+        self._column_types.clear()
+        self._has_sql_domains_cache = None
+        self._sql_domain_cache.clear()
+        self._domain_col_cache.clear()
+        self._tstz_precision_cache.clear()
+        self._quoted_col_cache.clear()
+        self._not_null_cache.clear()
+        self._json_col_cache.clear()
+        self._plsql_types.clear()
+        self._column_type_cache.clear()
+        self._collection_name_cache = None
+        self._package_function_cache = None
+        self._forget_raw_targets()
+        self._json_columns_cache.clear()
+        self._has_oson_cache = None
+        self._oson_layout_cache.clear()
+        self._boolean_column_cache.clear()
+        self._vector_format_cache.clear()
+        self._any_invisible = None
+        self._visible_cache.clear()
 
     def _install_dictionary(self) -> None:
         row = self._conn.execute(
@@ -11134,9 +11227,7 @@ class PostgresBackend:
         if known is not None and known[1] == self._conn.statements:
             unwritten = known[0]
         else:
-            row = self._conn.execute(
-                'SELECT pg_current_xact_id_if_assigned() IS NULL'
-            ).fetchone()
+            row = self._conn.execute(_WRITTEN_CHECK).fetchone()
             unwritten = row is not None and bool(row[0])
         if unwritten:
             self._conn.commit()
@@ -14343,7 +14434,11 @@ class PostgresBackend:
                 savepoint.execute('SAVEPOINT _mirror_stmt')
                 statement.execute(sql, params)
                 release.execute('RELEASE SAVEPOINT _mirror_stmt')
-                written.execute('SELECT pg_current_xact_id_if_assigned() IS NULL')
+                written.execute(
+                    _WRITTEN_CHECK + ', ' + _DDL_GENERATION
+                    if self._has_ddl_log
+                    else _WRITTEN_CHECK
+                )
         except psycopg.Error as exc:
             # The statement failed inside the pipeline; the RELEASE that followed it
             # was discarded, so the savepoint still stands — roll the statement back
@@ -14357,6 +14452,13 @@ class PostgresBackend:
             row is not None and bool(row[0]),
             self._conn.statements,
         )
+        if self._has_ddl_log and row is not None:
+            # Another session's DDL committed since the last statement: what
+            # this session knows of the schema may be stale (#1887). The first
+            # generation seen only sets the mark.
+            if self._ddl_generation not in (None, row[1]):
+                self._forget_schema()
+            self._ddl_generation = row[1]
         # The pipeline succeeded, so the savepoint is already released and the
         # statement had its effect. Building the result can only raise on an
         # unencodable SELECT column — no side effect to undo — so let it propagate
