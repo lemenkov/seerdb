@@ -1,6 +1,34 @@
 Entries are sorted chronologically from oldest to youngest within each release,
 releases are sorted from youngest to oldest.
 
+version 3.1.0:
+- **`transaction_priority`** (23ai), as in python-oracledb 26: `connect(transaction_priority=...)`, a readable and settable `Connection.transaction_priority`, and `seerdb.TransactionPriority` (`LOW`, `MEDIUM`, `HIGH`, `DEFAULT`). Sync and async (#1790).
+- **`set_app_context()` / `clear_app_context()`** set or clear the attributes of an application context namespace, sent in front of the next call, as python-oracledb 26 does (#1787).
+- **`Connection.db_unique_name`**, read from the login reply. Where python-oracledb's is `None` before 21c, seerdb falls back to the older key and reports the name from 10g on (#1785).
+- **Fixes**:
+  - **A connect descriptor over 230 bytes** is sent after the CONNECT packet. A server reads only 230 bytes there, so a long host, service or program name hung the connect until the timeout (#1772).
+  - **A failed TPC or sessionless-transaction call raises** its error instead of reporting success (#1756).
+  - **A failed `commit()` or `rollback()` raises** the error its reply carries (#1788).
+  - **Below 12.1, a VECTOR bind and SODA are refused** with a clear error instead of failing on the wire (#1766, #1767).
+  - **Binds**: an object's temporal attribute is sized by its declared type, not its value (#1809); a date before year 1 binds as a datetime does (#1812); `executemany()` sends a whole-second row widened to TIMESTAMP in the 7-byte form (#1813); an object bind's OAC carries a zero maximum size (#1814).
+  - **8i**: a program name longer than its length byte allows is cut to fit, instead of breaking the login (#1815).
+  - **A login value over 252 bytes** (program name, machine, osuser) is chunked at the negotiated width. On 12.1+ an async login failed with `ORA-03120` (#1817).
+- **Native network encryption (ANO) lost data**, silently. An encrypting server writes a reply packet by packet, and seerdb took wherever the bytes read so far ended for the end of the reply: a 51,200-character CLOB from 26ai read back as 4,048 or 8,099 characters. The client now reads every reply to its end, on every server (#1846, #1852). And a pipeline went out unencrypted, so the server refused each operation with `ORA-12599` (#1850).
+- **A technology preview: the Mirror.** The Mirror (`seerdb.server`) is a server for Oracle's wire protocol. It answers Oracle clients (python-oracledb, seerdb, sqlplus) from PostgreSQL, or relays to a real Oracle. From this release it is in the package as a **highly experimental technology preview**: offered to try, not for production, outside the semantic-versioning promise the client keeps, free to change in any release, and **not hardened for untrusted networks** yet (#1687). `docs/MIRROR.md` is its user guide. Every Mirror entry below and in later releases is labelled so:
+  - **Mirror (tech preview): install and start it** with `pip install "seerdb[mirror]"` (psycopg 3.2 or later) and `seerdb-mirror postgres ...` / `seerdb-mirror passthrough ...` (also `python -m seerdb.server`), from the command line or an INI file. There's no default account, and it listens on 127.0.0.1 by default (#1832, #1833, #1836, #1839).
+  - **Mirror (tech preview): TLS and native encryption.** `--tls-cert` / `--tls-key` / `--tls-ca` serve TCPS. ANO is negotiated by default (`--encryption requested`): AES with a SHA-2 checksum whenever the client offers it (#1842, #1848, #1851).
+  - **Mirror (tech preview): sqlplus from 10.2**, including `SET SERVEROUTPUT ON`, and thin clients from 10g (#1765, #1823, #1824, #1825, #1827, #1828, #1829, #1830, #1831).
+  - **Mirror (tech preview): over PostgreSQL, it presents 23ai by default** (12.1 on request). 23ai features it serves:
+    - VECTOR on pgvector (dense, sparse and binary), with `TO_VECTOR`, `VECTOR_DISTANCE` and `FROM_VECTOR`;
+    - JSON and OSON columns on jsonb, with Oracle's SQL/JSON;
+    - BOOLEAN;
+    - SQL domains and column annotations;
+    - sessionless transactions and transaction priority.
+
+    Accounts can be kept in the database, out of SQL's reach (#1702, #1715, #1716, #1717, #1719, #1720, #1722, #1725, #1727, #1728, #1729, #1730, #1750, #1752, #1757, #1759, #1793).
+  - **Mirror (tech preview): sqlplus is served by the PostgreSQL backend itself.** The `oracle_compat` shim is gone, and `DBMS_APPLICATION_INFO` is a real package (#1841).
+  - **Mirror (tech preview): it says so** in code (`seerdb.server.__provisional__`), with a warning when it starts serving, and in the guide, including what not being hardened means for running one (#1837, #1838, #1853, #1854).
+
 version 3.0.0:
 - **Upgrading from 2.x — four changes can alter what existing code does**:
   - **`connect()` and `connect_async()` default to `autocommit=False`**, as PEP 249 and python-oracledb do. 2.x committed every statement. Code that writes and never calls `commit()` now has its work rolled back when the connection closes, and nothing raises. Pass `autocommit=True` to keep the 2.x behaviour. Pools follow the same default (#1447).
