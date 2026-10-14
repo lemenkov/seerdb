@@ -67,6 +67,14 @@ change still needs them.
 A docs-only change needs none of the test tiers; the repository's own workflows
 skip them on those paths too.
 
+## Merging
+
+Merging is the maintainer's, with one exception: an agent may merge a
+**docs-only** PR itself, once its checks (lint, REUSE) have passed. Docs-only
+means it touches nothing under `.github/`, `seerdb/`, `tests/`, `tools/` or
+`examples/`, and not `pyproject.toml`: README, `docs/`, the ChangeLog, this file
+and the like. Anything else waits for the maintainer, a release PR included.
+
 ## Cutting a release
 
 seerdb releases publish to PyPI automatically via GitHub Actions Trusted
