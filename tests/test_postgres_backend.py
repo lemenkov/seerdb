@@ -5555,6 +5555,18 @@ def test_masking_reads_the_text_as_the_tokenizer_does() -> None:
     )
 
 
+def test_a_kept_reading_of_the_text_is_never_changed_by_its_caller() -> None:
+    # The quoted-text mask and the bind names are kept per text, as a batch
+    # reads them once per row (#1870): each caller gets a list of its own.
+    from seerdb.server.backends.postgres import _bind_names, _mask_quoted
+
+    sql = "INSERT INTO t VALUES (:a, 'x', :b)"
+    _mask_quoted(sql)[1].append('changed')
+    _bind_names(sql).append('changed')
+    assert _mask_quoted(sql)[1] == ['x']
+    assert _bind_names(sql) == ['a', 'b']
+
+
 def test_block_words_are_the_tokenizers_words() -> None:
     # _words and _blank_plsql on the shared tokenizer (#1693): `$` and `#` are
     # part of a name, so `x$begin` hides no BEGIN; nothing inside a literal, a

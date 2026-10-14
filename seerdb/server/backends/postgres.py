@@ -2412,16 +2412,20 @@ def _bind_key(name: str) -> str:
     return name if name.isidentifier() else f'b{name}'
 
 
-def _bind_spans(sql: str) -> Iterator[tuple[str, str, str | None]]:
+@functools.lru_cache(maxsize=64)
+def _bind_spans(sql: str) -> tuple[tuple[str, str, str | None], ...]:
     # Each span of `sql` as (kind, text, bind name) -- the name only for a bind
     # -- read by the shared tokenizer, so a `:x` inside a comment or a literal
     # is text and an apostrophe in a comment opens nothing (#1692). A bind the
     # tokenizer allows but Oracle's binds here do not (a quoted name spaced off
-    # its colon) is text too.
+    # its colon) is text too. Kept for the next call on the same text: a batch
+    # reads it once per row (#1870).
+    spans = []
     for token in sql_tokens(sql):
         text = sql[token.start : token.end]
         match = _BIND_REF.fullmatch(text) if token.kind == 'bind' else None
-        yield (token.kind, text, _bind_name(match) if match else None)
+        spans.append((token.kind, text, _bind_name(match) if match else None))
+    return tuple(spans)
 
 
 # An alternative-quoting literal, q'[...]', whatever its delimiter (#1692).
@@ -7229,6 +7233,13 @@ _QUOTED_MASK = re.compile('\x00(\\d+)\x00')
 
 
 def _mask_quoted(sql: str) -> tuple[str, list[str]]:
+    # _masked_quoted's answer, the contents a list of the caller's own.
+    (masked, contents) = _masked_quoted(sql)
+    return (masked, list(contents))
+
+
+@functools.lru_cache(maxsize=64)
+def _masked_quoted(sql: str) -> tuple[str, tuple[str, ...]]:
     # `sql` with each string literal's and quoted identifier's contents replaced
     # by a numbered mask, and the contents in mask order. The quotes stay, so a
     # rewrite still sees that a literal or an identifier is there; comments are
@@ -7259,7 +7270,7 @@ def _mask_quoted(sql: str) -> tuple[str, list[str]]:
             mask(text, text.index('"') + 1, 1)
         else:
             out.append(text)
-    return ''.join(out), contents
+    return ''.join(out), tuple(contents)
 
 
 def _unmask_quoted(sql: str, contents: list[str]) -> str:
@@ -8640,11 +8651,16 @@ def _differs(a: object, b: object) -> bool:
 def _bind_names(sql: str) -> list[str]:
     # The distinct bind names of `sql` in first-appearance order -- the order the
     # binds arrive in -- past literals, quoted identifiers and comments.
+    return list(_distinct_bind_names(sql))
+
+
+@functools.lru_cache(maxsize=64)
+def _distinct_bind_names(sql: str) -> tuple[str, ...]:
     names: list[str] = []
     for _kind, _text, name in _bind_spans(sql):
         if name is not None and name not in names:
             names.append(name)
-    return names
+    return tuple(names)
 
 
 def _replace_binds(sql: str, replacement: dict[str, str]) -> str:
