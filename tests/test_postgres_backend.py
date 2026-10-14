@@ -3471,6 +3471,47 @@ def test_a_failing_call_keeps_the_callers_open_work() -> None:
                 backend.rollback()
 
 
+def test_a_calls_savepoint_rides_with_the_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The savepoint a PL/SQL call takes (#1632) goes in the call's own round
+    # trip, not in one of its own (#1875); none is left waiting after it.
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+    from seerdb.server.backend import BindVar, Result
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    sent: list[tuple[str, bool]] = []
+    execute = psycopg.Cursor.execute
+    off = psycopg.pq.PipelineStatus.OFF
+
+    def recorded(cursor: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
+        pipelined = cursor.connection.pgconn.pipeline_status != off
+        sent.append((str(query), pipelined))
+        return execute(cursor, query, *args, **kwargs)
+
+    def call(n: int) -> Result:
+        return backend.execute(
+            'BEGIN :1 := :2 + 1; END;',
+            [
+                BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=22),
+                BindVar(value=n, tns_type=TNS_TYPE_NUMBER, max_size=22),
+            ],
+        )
+
+    try:
+        call(0)
+        monkeypatch.setattr(psycopg.Cursor, 'execute', recorded)
+        for n in range(3):
+            assert int(call(n).out_binds[0]) == n + 1
+            assert getattr(backend._conn, 'prelude', None) is None
+        taken = [p for q, p in sent if q == 'SAVEPOINT _mirror_call']
+        assert taken == [True] * 3
+    finally:
+        monkeypatch.undo()
+        backend.rollback()
+        backend.close()
+
+
 def test_a_block_returns_cursors_as_implicit_results() -> None:
     # DBMS_SQL.RETURN_RESULT (#1617): each cursor a block hands back comes back
     # as an implicit result, its rows and columns, in the order it was
