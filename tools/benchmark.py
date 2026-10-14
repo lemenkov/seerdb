@@ -16,8 +16,12 @@ use a representative scale when comparing. Both fetch scenarios are dominated by
 the per-row value decode they share, so `fetch_df_all` (which builds an Arrow
 Table on top) runs close to `fetchall`; the table includes a NUMBER(p,s) column
 because that is where the Arrow build benefits most from explicit typing (#190).
-Each scenario prints one stable line — name, count, seconds, rate — so runs are
-easy to diff across changes (guards perf regressions; quantifies future work
+Round trips (a one-row query, a PL/SQL call) and a LOB written and read back
+measure what a fetch of many rows hides: the cost per call, which is where a
+Mirror in the path shows (#1866; tools/mirror_benchmark.py runs this against
+Oracle directly and through each kind of Mirror). Each scenario prints one
+stable line — name, count, seconds, rate — so runs are easy to diff across
+changes (guards perf regressions; quantifies future work
 such as the Arrow fetch fast path). Numbers are wall-clock against whatever
 server SEERDB_TEST_* points at; compare like-for-like, not across tiers.
 """
@@ -41,7 +45,7 @@ _TABLE = "PYORACLE_BENCH"
 
 def _report(name, count, seconds, unit="rows"):
     rate = count / seconds if seconds else float("inf")
-    print(f"{name:<22} {count:>9} {unit}  {seconds:8.3f}s  "
+    print(f"{name:<26} {count:>9} {unit}  {seconds:8.3f}s  "
           f"{rate:12,.0f} {unit}/s")
 
 
@@ -55,7 +59,7 @@ def bench_connect(scale):
         seerdb.connect(**_KW).close()
     elapsed = time.perf_counter() - start
     _report("connect+close", n, elapsed, "conns")
-    print(f"{'':22} {'':>9}        {elapsed / n * 1000:8.2f}ms / connect")
+    print(f"{'':26} {'':>9}        {elapsed / n * 1000:8.2f}ms / connect")
 
 
 def _setup(conn):
@@ -110,9 +114,9 @@ def bench_executemany(conn, scale):
 def bench_fetch(conn, scale):
     cur = conn.cursor()
     start = time.perf_counter()
-    cur.execute(
-        f"SELECT id, name, price FROM {_TABLE} "
-        f"WHERE ROWNUM <= {scale} ORDER BY id")
+    # The table holds exactly `scale` rows (executemany), so no ROWNUM filter:
+    # a top-N with ORDER BY is one form the Mirror over PostgreSQL refuses.
+    cur.execute(f"SELECT id, name, price FROM {_TABLE} ORDER BY id")
     rows = cur.fetchall()
     _report("fetchall (tuples)", len(rows), time.perf_counter() - start)
 
@@ -120,12 +124,63 @@ def bench_fetch(conn, scale):
 def bench_fetch_df(conn, scale):
     cur = conn.cursor()
     start = time.perf_counter()
-    cur.execute(
-        f"SELECT id, name, price FROM {_TABLE} "
-        f"WHERE ROWNUM <= {scale} ORDER BY id")
+    cur.execute(f"SELECT id, name, price FROM {_TABLE} ORDER BY id")
     table = cur.fetch_df_all()
     _report("fetch_df_all (arrow)", table.num_rows,
             time.perf_counter() - start)
+
+
+def bench_round_trip(conn, scale):
+    # One small query per call: the cost of a round trip, which a fetch of many
+    # rows amortises away.
+    n = min(max(scale // 25, 200), 2000)
+    cur = conn.cursor()
+    start = time.perf_counter()
+    for i in range(n):
+        cur.execute("SELECT :1 FROM dual", [i])
+        cur.fetchone()
+    elapsed = time.perf_counter() - start
+    _report("round trip (1-row query)", n, elapsed, "calls")
+    print(f"{'':26} {'':>9}        {elapsed / n * 1000:8.2f}ms / call")
+
+
+def bench_plsql(conn, scale):
+    # An anonymous block with an IN and an OUT bind, per call.
+    n = min(max(scale // 25, 200), 2000)
+    cur = conn.cursor()
+    out = cur.var(int)
+    start = time.perf_counter()
+    for i in range(n):
+        cur.execute("BEGIN :r := :a + 1; END;", {"r": out, "a": i})
+    elapsed = time.perf_counter() - start
+    assert out.getvalue() == n
+    _report("PL/SQL call", n, elapsed, "calls")
+
+
+def bench_lob(conn, scale):
+    # A CLOB written through a bind and read back whole: the multi-packet path.
+    size = 1 << 20
+    n = 5
+    text = ("0123456789abcdef" * (size // 16))
+    cur = conn.cursor()
+    try:
+        cur.execute(f"DROP TABLE {_TABLE}_LOB")
+    except seerdb.DatabaseError:
+        pass
+    cur.execute(f"CREATE TABLE {_TABLE}_LOB (id NUMBER, c CLOB)")
+    start = time.perf_counter()
+    for i in range(n):
+        cur.execute(f"INSERT INTO {_TABLE}_LOB VALUES (:1, :2)", [i, text])
+    conn.commit()
+    _report("CLOB write (1 MiB)", n, time.perf_counter() - start, "LOBs")
+    start = time.perf_counter()
+    cur.execute(f"SELECT c FROM {_TABLE}_LOB ORDER BY id")
+    for (value,) in cur.fetchall():
+        value = value.read() if hasattr(value, "read") else value
+        assert len(value) == size
+    _report("CLOB read (1 MiB)", n, time.perf_counter() - start, "LOBs")
+    cur.execute(f"DROP TABLE {_TABLE}_LOB")
+    conn.commit()
 
 
 def main():
@@ -140,6 +195,9 @@ def main():
         bench_executemany(conn, scale)
         bench_fetch(conn, scale)
         bench_fetch_df(conn, scale)
+        bench_round_trip(conn, scale)
+        bench_plsql(conn, scale)
+        bench_lob(conn, scale)
         conn.cursor().execute(f"DROP TABLE {_TABLE}")
         conn.commit()
 

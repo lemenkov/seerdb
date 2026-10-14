@@ -297,6 +297,49 @@ do before it can face clients you don't trust. Until those fixes land:
 
 This section shrinks as the fixes land.
 
+## Performance
+
+`tools/mirror_benchmark.py` runs `tools/benchmark.py` against Oracle directly
+and through each kind of Mirror, plaintext and with ANO, and lays the results
+side by side (#1866):
+
+```sh
+SEERDB_TEST_HOST=... SEERDB_TEST_PORT=... SEERDB_TEST_SERVICE=... \
+SEERDB_TEST_USER=... SEERDB_TEST_PASSWORD=... MIRROR_PG='host=... dbname=...' \
+    python3 tools/mirror_benchmark.py --scale 2000
+```
+
+**Baseline, 2026-10-14**, scale 2000, measured with:
+- the client and the Mirror on one host;
+- Oracle 23ai and PostgreSQL 16 on another, across a LAN (about 6.6 ms per round trip);
+- ratios to Oracle directly.
+
+| scenario | direct | passthrough | passthrough + ANO | over PG | over PG + ANO |
+|---|---|---|---|---|---|
+| connect + close (20) | 1.8 s | 1.3x | 2.3x | 7.1x | 8.4x |
+| a one-row query (200) | 1.4 s | 1.0x | 1.0x | 4.4x | 4.7x |
+| a PL/SQL call (200) | 1.2 s | 0.9x | 1.0x | 4.2x | 4.3x |
+| an insert, row by row (2000) | 12 s | 1.1x | 1.1x | 2.8x | 3.0x |
+| `executemany` (2000 rows) | 0.05 s | 3.4x | 3.1x | 32x | 32x |
+| `fetchall` (2000 rows) | 0.15 s | 1.2x | 1.1x | 0.7x | 0.9x |
+| a 1 MiB CLOB written (5) | 2.6–4.4 s | 3.9x | 3.5x | 1.8x | 1.9x |
+| a 1 MiB CLOB read (5) | 1.2–1.5 s | 1.1x | 1.6x | 0.5x | 0.6x |
+
+The passthrough and over-PG columns come from separate runs on the same hosts.
+Read them as follows:
+
+- **The passthrough costs almost nothing per call.** Its exceptions are
+  `executemany` and LOB writes.
+- **Over PostgreSQL, each Oracle call costs several PostgreSQL round trips**
+  (#1331), so a small call is about 4x Oracle's across a LAN and a connect about
+  7x, while bulk fetches and LOB reads keep pace. With PostgreSQL on the
+  Mirror's own host, small calls are fast, but `executemany` stays slow (about
+  20x).
+- **Encryption** costs most at connect (the key exchange), and little per call.
+
+These are the numbers the performance work (milestone mirror-pg-performance)
+measures against.
+
 ## Known limits
 
 The PostgreSQL backend does not reproduce all of Oracle. The main limits:
