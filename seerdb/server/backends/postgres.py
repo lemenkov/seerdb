@@ -4261,7 +4261,7 @@ class _ParkedTransaction:
     """A sessionless transaction (#1746): the PostgreSQL connection holding it
     open, whether a session has it now, and when a suspended one lapses."""
 
-    conn: psycopg.Connection
+    conn: _CountedConnection
     active: bool
     expires: float
 
@@ -10113,6 +10113,26 @@ def _while_connected(method):
 
 
 # The schema an auth database keeps the Mirror's accounts in (#879).
+class _CountedCursor(psycopg.Cursor[Any]):
+    # Counts the statements its connection sends (#1869), so an answer read in
+    # one round trip is known to be still current: no statement ran since.
+    def execute(self, *args: Any, **kwargs: Any) -> Any:
+        cast('_CountedConnection', self.connection).statements += 1
+        return super().execute(*args, **kwargs)
+
+    def executemany(self, *args: Any, **kwargs: Any) -> None:
+        cast('_CountedConnection', self.connection).statements += 1
+        super().executemany(*args, **kwargs)
+
+
+class _CountedConnection(psycopg.Connection[Any]):
+    statements = 0
+    # Whether the last pipelined statement left the transaction with no
+    # transaction id, and the statement count it was read at (#1869). Kept
+    # here so that it travels with the connection, as a parked one does.
+    unwritten_at: tuple[bool, int] | None = None
+
+
 _ACCOUNTS_SCHEMA = 'seerdb_auth'
 _ACCOUNTS_DDL = (
     f'CREATE SCHEMA IF NOT EXISTS {_ACCOUNTS_SCHEMA};'
@@ -10257,7 +10277,7 @@ class PostgresBackend:
         release = _banner_release(self.server_identity.banner)
         (major, minor) = (int(part) for part in release.split('.')[:2])
         self._release = (major, minor)
-        self._conn = psycopg.connect(conninfo)
+        self._conn = _CountedConnection.connect(conninfo, cursor_factory=_CountedCursor)
         # What a twin of this backend is built from: a sessionless suspend
         # takes a fresh connection, set up as this one was, from it (#1746).
         self._twin: Callable[[], PostgresBackend] = lambda: type(self)(
@@ -11003,10 +11023,18 @@ class PostgresBackend:
             return
         if self._conn.info.transaction_status != psycopg.pq.TransactionStatus.INTRANS:
             return
-        row = self._conn.execute(
-            'SELECT pg_current_xact_id_if_assigned() IS NULL'
-        ).fetchone()
-        if row is not None and row[0]:
+        # The pipeline that ran the statement read the answer already (#1869);
+        # it still holds if no statement has run since, as a REF CURSOR fetch
+        # could run a function that writes.
+        known = self._conn.unwritten_at
+        if known is not None and known[1] == self._conn.statements:
+            unwritten = known[0]
+        else:
+            row = self._conn.execute(
+                'SELECT pg_current_xact_id_if_assigned() IS NULL'
+            ).fetchone()
+            unwritten = row is not None and bool(row[0])
+        if unwritten:
             self._conn.commit()
 
     @_while_connected
@@ -14178,14 +14206,19 @@ class PostgresBackend:
         # pipeline. Each command uses its own cursor so the statement's cursor keeps
         # its own result (rowcount / description / rows / pgresult) after the sync —
         # a shared cursor would only retain the last command's (RELEASE) result.
+        # The transaction id check rides along too, for releasing the read
+        # locks of a query (#1190) without a round trip of its own (#1869).
         savepoint = self._conn.cursor()
         statement = self._conn.cursor()
         release = self._conn.cursor()
+        written = self._conn.cursor()
+        self._conn.unwritten_at = None
         try:
             with self._conn.pipeline():
                 savepoint.execute('SAVEPOINT _mirror_stmt')
                 statement.execute(sql, params)
                 release.execute('RELEASE SAVEPOINT _mirror_stmt')
+                written.execute('SELECT pg_current_xact_id_if_assigned() IS NULL')
         except psycopg.Error as exc:
             # The statement failed inside the pipeline; the RELEASE that followed it
             # was discarded, so the savepoint still stands — roll the statement back
@@ -14194,6 +14227,11 @@ class PostgresBackend:
             self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_stmt')
             self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
             raise _backend_error(exc, original=original, translated=sql) from exc
+        row = written.fetchone()
+        self._conn.unwritten_at = (
+            row is not None and bool(row[0]),
+            self._conn.statements,
+        )
         # The pipeline succeeded, so the savepoint is already released and the
         # statement had its effect. Building the result can only raise on an
         # unencodable SELECT column — no side effect to undo — so let it propagate

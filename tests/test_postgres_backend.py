@@ -2428,6 +2428,58 @@ def test_a_query_leaves_no_lock_behind() -> None:
         other.close()
 
 
+def test_releasing_read_locks_costs_no_round_trip_of_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Whether a query's transaction has written (#1190) is read in the
+    # pipeline that runs the query (#1869), not asked afterwards. The first
+    # query looks its column type up, so it asks afterwards: the answer the
+    # pipeline read may be stale once anything else has run.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    backend.execute('SELECT :1 FROM dual', [0])
+    sent: list[tuple[str, bool]] = []
+    execute = psycopg.Cursor.execute
+    off = psycopg.pq.PipelineStatus.OFF
+
+    def recorded(cursor: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
+        pipelined = cursor.connection.pgconn.pipeline_status != off
+        sent.append((str(query), pipelined))
+        return execute(cursor, query, *args, **kwargs)
+
+    monkeypatch.setattr(psycopg.Cursor, 'execute', recorded)
+    try:
+        for n in range(3):
+            backend.execute('SELECT :1 FROM dual', [n])
+        asked = [p for q, p in sent if 'pg_current_xact_id_if_assigned' in q]
+        assert asked == [True] * 3
+        idle = psycopg.pq.TransactionStatus.IDLE
+        assert backend._conn.info.transaction_status == idle
+    finally:
+        monkeypatch.undo()
+        backend.close()
+
+
+def test_a_write_after_the_pipeline_keeps_its_transaction() -> None:
+    # The pipeline's answer is stale once another statement has run: a REF
+    # CURSOR fetch can run a function that writes. Committing on the stale
+    # answer would commit that write behind the client's back (#1869).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE pyo_stale_unwritten (n NUMBER)')
+        backend.execute('SELECT n FROM pyo_stale_unwritten')
+        backend._conn.execute('SELECT 1')  # opens the transaction again
+        backend._conn.unwritten_at = (True, backend._conn.statements)
+        backend._conn.execute('INSERT INTO pyo_stale_unwritten VALUES (1)')
+        backend._release_read_locks()
+        backend.rollback()
+        rows = backend.execute('SELECT n FROM pyo_stale_unwritten').rows
+        assert rows == []
+    finally:
+        backend.rollback()
+        backend.execute('DROP TABLE pyo_stale_unwritten')
+        backend.close()
+
+
 def test_a_column_name_folds_as_oracle_folds_it() -> None:
     # A legal unquoted lower-case name came from an unquoted one; anything else
     # was quoted and is kept (#1204). A reserved word could only be quoted.
