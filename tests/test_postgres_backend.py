@@ -8429,6 +8429,24 @@ def test_the_translation_report_names_the_rules_a_statement_needed() -> None:
     _translate_idioms('SELECT NVL(a, 1) FROM t')  # no report: nothing to note
 
 
+def test_a_kept_translation_still_names_its_rules() -> None:
+    # A statement's rewrite is kept per text (#1884); the rules it needed are
+    # kept with it, so a report names them whenever the statement runs again,
+    # also one first translated while no report was being taken.
+    from seerdb.server.backends.postgres import _TRANSLATION_RULES
+
+    first = 'SELECT NVL(a, 2), SYSDATE FROM t1884'
+    assert _translate_idioms(first) == _translate_idioms(first)
+    for _ in range(2):
+        rules: list[str] = []
+        token = _TRANSLATION_RULES.set(rules)
+        try:
+            _translate_idioms(first)
+        finally:
+            _TRANSLATION_RULES.reset(token)
+        assert rules == ['nvl', 'sysdate']
+
+
 def test_the_translation_report_folds_a_statements_literals() -> None:
     # Runs with different values count as one statement; a quoted identifier
     # and a bind stay as written (#1557).

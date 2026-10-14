@@ -7555,7 +7555,35 @@ def _rowcount_attributes(sql: str) -> str:
 def _translate_idioms(sql: str) -> str:
     """Rewrite the Oracle SQL functions / literal idioms the suite uses to their
     PostgreSQL equivalents (#502). Applied to every statement. Each step that
-    changes the text is noted by name for the translation report (#1557)."""
+    changes the text is noted by name for the translation report (#1557).
+
+    The rewrite depends on the text alone, so it is kept per text, with the
+    rules it noted, which a later call notes again (#1884). A long text is
+    rewritten every time: one with a large literal is rarely run twice, and
+    would hold the cache's memory for nothing."""
+    if len(sql) > _KEPT_IDIOMS_TEXT:
+        return _rewritten_idioms(sql)
+    (translated, rules) = _idioms_and_rules(sql)
+    for rule in rules:
+        _note_rule(rule)
+    return translated
+
+
+_KEPT_IDIOMS_TEXT = 8192
+
+
+@functools.lru_cache(maxsize=512)
+def _idioms_and_rules(sql: str) -> tuple[str, tuple[str, ...]]:
+    # _translate_idioms' rewrite of `sql`, and the rules it noted, in order.
+    rules: list[str] = []
+    token = _TRANSLATION_RULES.set(rules)
+    try:
+        return (_rewritten_idioms(sql), tuple(rules))
+    finally:
+        _TRANSLATION_RULES.reset(token)
+
+
+def _rewritten_idioms(sql: str) -> str:
     sql = _ruled('hash-identifier', _quote_hash_identifiers(sql), sql)
     # Not a rule: it types a select-list literal as Oracle describes one, which
     # portable SQL needs as much as Oracle SQL does.
