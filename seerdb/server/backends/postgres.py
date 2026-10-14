@@ -10144,12 +10144,24 @@ def _while_connected(method):
 
 
 # The schema an auth database keeps the Mirror's accounts in (#879).
+# The Mirror's own statements around an application's, never prepared (#1885):
+# in a pipeline they follow the statement, so a statement that fails takes the
+# Parse of the one psycopg was preparing with it, and psycopg, which counts it
+# prepared, then names a statement the server never made.
+_CONTROL_STATEMENT = re.compile(
+    r'(?:SAVEPOINT|RELEASE SAVEPOINT|ROLLBACK TO SAVEPOINT) |'
+    r'SELECT pg_current_xact_id_if_assigned\(\) IS NULL$'
+)
+
+
 class _CountedCursor(psycopg.Cursor[Any]):
     # Counts the statements its connection sends (#1869), so an answer read in
     # one round trip is known to be still current: no statement ran since.
     # The prelude the connection holds goes first (#1875).
     def execute(self, query: Any, params: Any = None, **kwargs: Any) -> Any:
         conn = cast('_CountedConnection', self.connection)
+        if isinstance(query, str) and _CONTROL_STATEMENT.match(query):
+            kwargs.setdefault('prepare', False)
         (prelude, conn.prelude) = (conn.prelude, ())
         off = conn.pgconn.pipeline_status == psycopg.pq.PipelineStatus.OFF
         if prelude and off and params is not None:
@@ -10368,13 +10380,13 @@ class PostgresBackend:
         self._reporting = translation_report
         self._report_runs: dict[str, _ReportEntry] = {}
         self._report_conn: psycopg.Connection | None = None
-        # Disable psycopg's automatic server-side prepared statements. Every
-        # statement runs inside a SAVEPOINT, and a ROLLBACK TO SAVEPOINT deallocates
-        # any prepared statement created after that savepoint — which desyncs
-        # psycopg's prepared-statement cache from the server ("prepared statement
-        # _pgN_M does not exist"). A proxy backend running varied SQL gains little
-        # from the cache anyway; the pipeline below is the real round-trip win.
-        self._conn.prepare_threshold = None
+        # psycopg prepares a statement on the server from its fifth run, which
+        # saves PostgreSQL planning it again: half the cost of a query on the
+        # dictionary views (#1885). Two things kept it off before. The Mirror's
+        # own statements around an application's are never prepared
+        # (_CONTROL_STATEMENT), and a prepared statement that another session's
+        # DDL changed the shape of runs once more (_replanned).
+        self._conn.prepare_threshold = 5
         # Whether a routine the running call reached asked for a commit (#1630).
         self._commit_requested = False
         self._conn.add_notice_handler(self._hear_commit_request)
@@ -11107,9 +11119,30 @@ class PostgresBackend:
         sql = _occurrence_binds(sql, [binds])
         return self._committing(
             lambda: self._with_implicit_results(
-                lambda: self._reported(sql, lambda: self._execute_statement(sql, binds))
+                lambda: self._reported(
+                    sql,
+                    lambda: self._replanned(
+                        lambda: self._execute_statement(sql, binds)
+                    ),
+                )
             )
         )
+
+    def _replanned(self, run: Callable[[], Result]) -> Result:
+        # A prepared statement whose table another session changed fails once:
+        # "cached plan must not change result type" (#1885). PostgreSQL plans it
+        # afresh on the next run, and the failed run was undone to its savepoint,
+        # so it runs again.
+        try:
+            return run()
+        except BackendError as error:
+            cause = error.__cause__
+            if not (
+                isinstance(cause, psycopg.errors.FeatureNotSupported)
+                and 'cached plan must not change result type' in str(cause)
+            ):
+                raise
+        return run()
 
     def _hear_implicit_result(self, diagnostic: psycopg.errors.Diagnostic) -> None:
         message = diagnostic.message_primary or ''

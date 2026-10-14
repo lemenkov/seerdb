@@ -9486,3 +9486,54 @@ def test_a_cursor_expression_is_a_drained_cursor_at_every_level() -> None:
         assert inner.rows == [(20,)]
     finally:
         backend.close()
+
+
+def test_a_failing_statement_leaves_the_prepared_statements_whole() -> None:
+    # A statement that fails in its pipeline takes the commands after it with
+    # it (#1885): psycopg, preparing one of those on its fifth run, would count
+    # it prepared, and the next run named a statement the server never made --
+    # the session's transaction then stayed aborted. The Mirror's own
+    # statements are never prepared, so each failure stays its own.
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE pp1885t (n NUMBER, r ROWID)')
+        for _ in range(8):
+            with pytest.raises(BackendError) as exc:
+                backend.execute('INSERT INTO pp1885t (n, r) VALUES (2, :1)', ['bogus'])
+            assert exc.value.ora_code == 1410
+        backend.execute('INSERT INTO pp1885t (n) VALUES (1)')
+        assert backend.execute('SELECT n FROM pp1885t').rows == [(1,)]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE pp1885t')
+        except Exception:
+            backend.rollback()
+
+
+def test_a_prepared_query_follows_another_sessions_ddl() -> None:
+    # A query prepared on the server, whose table another session then gives a
+    # new column, fails once in PostgreSQL ("cached plan must not change result
+    # type") and is planned afresh on the next run (#1885); the Mirror runs it
+    # again, so the client sees the new shape and no error, as Oracle's does.
+    reader = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    other = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        reader.execute('CREATE TABLE pq1885t (n NUMBER)')
+        reader.execute('INSERT INTO pq1885t VALUES (1)')
+        reader.commit()
+        for _ in range(7):
+            assert len(reader.execute('SELECT * FROM pq1885t').columns) == 1
+        other.execute('ALTER TABLE pq1885t ADD (m NUMBER)')
+        result = reader.execute('SELECT * FROM pq1885t')
+        assert (len(result.columns), result.rows) == (2, [(1, None)])
+    finally:
+        reader.rollback()
+        try:
+            reader.execute('DROP TABLE pq1885t')
+        except Exception:
+            reader.rollback()
+        reader.close()
+        other.close()
