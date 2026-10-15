@@ -10580,6 +10580,72 @@ def _index_key_spans(
     return (masked, contents, table, keys)
 
 
+# What the installed database is stamped with, as the `system` schema's
+# comment (#1871): a digest of every DDL statement a setup runs -- the types,
+# the helpers, the packages, the dictionary, the DDL log -- and the extensions
+# present when it ran, so a seerdb whose installation differs, or a database
+# that gained or lost orafce or pgvector, installs again. A matching stamp
+# skips the installation: no CREATE OR REPLACE a connect.
+_INSTALLATION_DIGEST: Final = hashlib.sha256(
+    '\x00'.join(
+        (
+            _BFILE_TYPE_DDL,
+            _TSTZ_TYPE_DDL,
+            _LOB_TYPE_DDL,
+            _INTERVALYM_TYPE_DDL,
+            _DATE_TYPE_DDL,
+            _ROWID_TYPE_DDL,
+            _DATE_ARITHMETIC_DDL,
+            _HELPER_FUNCTIONS_DDL,
+            _ORAFCE_HELPERS_DDL,
+            _UTL_RAW_DDL,
+            _DBMS_UTILITY_DDL,
+            _DBMS_SLEEP_DDL,
+            _DBMS_APPLICATION_INFO_DDL,
+            _DBMS_SQL_RETURN_RESULT_DDL,
+            _DBMS_OUTPUT_LINES_DDL,
+            _VECTOR_DDL,
+            _DICTIONARY_STAMP,
+            _DDL_LOG_DDL,
+            _DDL_GUARD_DDL,
+        )
+    ).encode()
+).hexdigest()
+# The setup's parts that need an extension the database may not have: one
+# that failed for want of it does not keep the stamp from being written.
+_EXTENSION_PARTS: Final = {
+    'orafce': 'orafce',
+    'orafce helpers': 'orafce',
+    'vector': 'vector',
+}
+# The setup's parts that need privileges a deployment may not grant (an
+# event trigger needs a superuser): best effort, as they always were.
+_PRIVILEGED_PARTS: Final = frozenset({'ddl log', 'ddl guard'})
+
+
+def _installation_stamp(extensions: str | None) -> str:
+    return f'seerdb installation {_INSTALLATION_DIGEST} {extensions or ""}'.rstrip()
+
+
+class _Installation(NamedTuple):
+    # What a session's setup looks up in an installed database (#1871): the
+    # types it registers adapters for and the catalogs it checks for. The same
+    # for every session of one installation, so a process looks it up once.
+    vector: tuple[int, int, int, CompositeInfo, CompositeInfo] | None
+    tstz: CompositeInfo | None
+    bfile: CompositeInfo | None
+    domain_oids: dict[str, int]
+    clob: Any
+    blob: Any
+    date: Any
+    catalogs: tuple[bool, ...]
+
+
+# Each installation a process has looked up, by its connection string, the
+# database's oid and the installation stamp (#1871).
+_INSTALLATIONS: dict[tuple[str, int, str], _Installation] = {}
+
+
 class _TableColumn(NamedTuple):
     # A table column as the schema model knows it (#1887).
     name: str
@@ -10648,8 +10714,36 @@ class PostgresBackend:
         (major, minor) = (int(part) for part in release.split('.')[:2])
         self._release = (major, minor)
         self._conn = _CountedConnection.connect(conninfo, cursor_factory=_CountedCursor)
-        # The setup's own DDL is not another session's change (#1887).
-        self._conn.execute("SET seerdb.installing = 'on'")
+        # V$VERSION and DBMS_UTILITY.DB_VERSION read the presented release from
+        # the session (#1704), so the shared dictionary serves either release.
+        # In the same statement: whether the database's installation is this
+        # seerdb's (#1871), which a connect then leaves alone.
+        setup = self._conn.execute(
+            "SELECT set_config('seerdb.release', %s, false), "
+            "set_config('seerdb.banner', %s, false), "
+            "set_config('seerdb.compatibility', %s, false), "
+            "obj_description(to_regnamespace('system'), 'pg_namespace'), "
+            "obj_description(to_regnamespace('sys'), 'pg_namespace'), "
+            "(SELECT string_agg(extname, ' ' ORDER BY extname) FROM pg_extension "
+            "WHERE extname IN ('orafce', 'vector')), "
+            '(SELECT oid FROM pg_database WHERE datname = current_database())',
+            (
+                release,
+                self.server_identity.banner.decode(),
+                f'{major}.{minor if major < 18 else 0}.0.0.0',
+            ),
+        ).fetchone()
+        assert setup is not None
+        expected = _installation_stamp(setup[5])
+        installed = setup[3] == expected and setup[4] == _DICTIONARY_STAMP
+        found = (
+            _INSTALLATIONS.get((conninfo, setup[6], expected)) if installed else None
+        )
+        # The parts of the setup that failed, by name; the setup's own DDL is
+        # not another session's change (#1887).
+        self._install_failures: list[str] = []
+        if not installed:
+            self._conn.execute("SET seerdb.installing = 'on'")
         self._conn.commit()
         # What a twin of this backend is built from: a sessionless suspend
         # takes a fresh connection, set up as this one was, from it (#1746).
@@ -10660,15 +10754,6 @@ class PostgresBackend:
             presents=presents,
         )
         self._sessionless_id = None
-        # V$VERSION and DBMS_UTILITY.DB_VERSION read the presented release from
-        # the session (#1704), so the shared dictionary serves either release.
-        for setting, value in (
-            ('seerdb.release', release),
-            ('seerdb.banner', self.server_identity.banner.decode()),
-            ('seerdb.compatibility', f'{major}.{minor if major < 18 else 0}.0.0.0'),
-        ):
-            self._conn.execute('SELECT set_config(%s, %s, false)', (setting, value))
-        self._conn.commit()
         # The translation report (#1557): whether it is on, the runs it has not
         # written yet, and its own autocommit connection, opened when it first
         # writes -- so writing it never joins, ends or aborts the client's
@@ -10749,10 +10834,8 @@ class PostgresBackend:
         # requirement of this backend (see the module docstring). Best-effort so a
         # PostgreSQL without it still starts — the uncovered idioms just fail as
         # before.
-        try:
-            self._conn.execute('CREATE EXTENSION IF NOT EXISTS orafce')
-        except psycopg.Error:
-            self._conn.rollback()
+        if not installed:
+            self._install_part('orafce', 'CREATE EXTENSION IF NOT EXISTS orafce')
         # pgvector, which Oracle's VECTOR types map onto (#1708), where it is
         # installed; without it a VECTOR column is refused, as before.
         # Under a savepoint, so a server without it keeps orafce. Its `vector`
@@ -10767,62 +10850,60 @@ class PostgresBackend:
             tuple[int, int], tuple[bytes, bytes, tuple[tuple[bytes, bytes], ...]] | None
         ] = {}
         self._sparse_composite_oid: int | None = None
-        try:
-            with self._conn.transaction():
-                self._conn.execute('CREATE EXTENSION IF NOT EXISTS vector')
-                # Its helpers live in sys, which a new database does not have
-                # yet at this point of the setup; and are made once, not by
-                # every session -- sessions starting together raced on them.
-                self._conn.execute('CREATE SCHEMA IF NOT EXISTS sys')
-                # Stamped, as the dictionary is, so a changed one is installed
-                # again and an unchanged one is not.
-                stamp = self._conn.execute(
-                    'SELECT obj_description(to_regtype(%s), %s)',
-                    (_VECTOR_COMPOSITE, 'pg_type'),
-                ).fetchone()
-                if stamp is None or stamp[0] != _VECTOR_STAMP:
-                    self._conn.execute(_VECTOR_DDL)
-                    self._conn.execute(
-                        f"COMMENT ON TYPE {_VECTOR_COMPOSITE} IS '{_VECTOR_STAMP}'"
-                    )
-        except psycopg.Error:
-            pass
-        # What this session has, whichever session's setup made it.
-        row = self._conn.execute(
-            "SELECT to_regtype('vector')::oid, to_regtype(%s)::oid, to_regtype(%s)::oid",
-            (_VECTOR_COMPOSITE, _SPARSE_COMPOSITE),
-        ).fetchone()
-        if row is not None and None not in row:
-            composite = CompositeInfo.fetch(self._conn, _VECTOR_COMPOSITE)
-            sparse = CompositeInfo.fetch(self._conn, _SPARSE_COMPOSITE)
-            if composite is not None and sparse is not None:
-                register_composite(composite, self._conn)
-                register_composite(sparse, self._conn)
-                (self._vector_oid, self._vector_composite_oid) = (row[0], row[1])
-                self._sparse_composite_oid = row[2]
-                self._conn.adapters.register_dumper(
-                    SparseVector,
-                    type('_SparseBindDumper', (_SparseVectorDumper,), {'oid': row[2]}),
-                )
-                self._has_pgvector = True
-                # A vector bind is the composite: its format travels with it,
-                # and an assignment cast makes it any VECTOR column's storage.
-                self._conn.adapters.register_dumper(
-                    array.array,
-                    type('_VectorBindDumper', (_VectorDumper,), {'oid': row[1]}),
-                )
+        if not installed:
+            try:
+                with self._conn.transaction():
+                    self._conn.execute('CREATE EXTENSION IF NOT EXISTS vector')
+                    # Its helpers live in sys, which a new database does not have
+                    # yet at this point of the setup; and are made once, not by
+                    # every session -- sessions starting together raced on them.
+                    self._conn.execute('CREATE SCHEMA IF NOT EXISTS sys')
+                    # Stamped, as the dictionary is, so a changed one is installed
+                    # again and an unchanged one is not.
+                    stamp = self._conn.execute(
+                        'SELECT obj_description(to_regtype(%s), %s)',
+                        (_VECTOR_COMPOSITE, 'pg_type'),
+                    ).fetchone()
+                    if stamp is None or stamp[0] != _VECTOR_STAMP:
+                        self._conn.execute(_VECTOR_DDL)
+                        self._conn.execute(
+                            f"COMMENT ON TYPE {_VECTOR_COMPOSITE} IS '{_VECTOR_STAMP}'"
+                        )
+            except psycopg.Error:
+                self._install_failures.append('vector')
+        # What this session has, whichever session's setup made it: looked up
+        # here, before the search_path below, where the types were made.
+        vector = found.vector if found is not None else self._look_up_vector()
+        if vector is not None:
+            (vector_oid, composite_oid, sparse_oid, composite, sparse) = vector
+            register_composite(composite, self._conn)
+            register_composite(sparse, self._conn)
+            (self._vector_oid, self._vector_composite_oid) = (vector_oid, composite_oid)
+            self._sparse_composite_oid = sparse_oid
+            self._conn.adapters.register_dumper(
+                SparseVector,
+                type('_SparseBindDumper', (_SparseVectorDumper,), {'oid': sparse_oid}),
+            )
+            self._has_pgvector = True
+            # A vector bind is the composite: its format travels with it,
+            # and an assignment cast makes it any VECTOR column's storage.
+            self._conn.adapters.register_dumper(
+                array.array,
+                type('_VectorBindDumper', (_VectorDumper,), {'oid': composite_oid}),
+            )
         # The Oracle data dictionary (#759) lives in a dedicated `sys` schema —
         # like Oracle's SYS — so its views are never reflected as user objects.
-        try:
-            self._conn.execute('CREATE SCHEMA IF NOT EXISTS sys')
-            # SYSTEM is a user every Oracle database has, so a client may point
-            # its session at it (ALTER SESSION SET CURRENT_SCHEMA = SYSTEM). That
-            # becomes a search_path, and PostgreSQL's current_schema() passes
-            # over a schema that does not exist -- the session stayed where it
-            # was and SYS_CONTEXT went on naming it. An empty one is enough.
-            self._conn.execute('CREATE SCHEMA IF NOT EXISTS system')
-        except psycopg.Error:
-            self._conn.rollback()
+        # SYSTEM is a user every Oracle database has, so a client may point its
+        # session at it (ALTER SESSION SET CURRENT_SCHEMA = SYSTEM). That
+        # becomes a search_path, and PostgreSQL's current_schema() passes over
+        # a schema that does not exist -- the session stayed where it was and
+        # SYS_CONTEXT went on naming it. An empty one is enough; its comment
+        # is the installation's stamp.
+        if not installed:
+            self._install_part(
+                'schemas',
+                'CREATE SCHEMA IF NOT EXISTS sys; CREATE SCHEMA IF NOT EXISTS system',
+            )
         # `sys` ahead of `oracle`: orafce ships its own `user_tables` and
         # `user_tab_columns` in the `oracle` schema, and they select from
         # information_schema with no owner filter at all -- every base table in
@@ -10831,150 +10912,54 @@ class PostgresBackend:
         # schemas share, so this ordering changes nothing else: user objects
         # still resolve first through the schema ahead of both, and the rest of
         # orafce is still reached through `oracle` (#818).
-        self._conn.execute(f'SET search_path TO {_SEARCH_PATH_TAIL}')
-        self._conn.execute(_ORAFCE_SESSION_SETTINGS)
-        # Create + register the composite that backs TIMESTAMP WITH TIME ZONE, so
-        # its columns come back as a typed tuple the read path can re-tag with the
-        # entered offset (#519). Best-effort: a backend that can't create the type
-        # just leaves WITH TIME ZONE unsupported, like the orafce idioms above.
+        self._conn.execute(
+            f'SET search_path TO {_SEARCH_PATH_TAIL}; {_ORAFCE_SESSION_SETTINGS}'
+        )
+        # The composite that backs TIMESTAMP WITH TIME ZONE, registered so its
+        # columns come back as a typed tuple the read path can re-tag with the
+        # entered offset (#519); the BFILE composite (#1669), read back as a
+        # tuple of the two names; and the typed domains, each domain's oid mapped
+        # to the Oracle wire type it stands for, so a result column tracing back
+        # to one is encoded as that Oracle type -- ora_clob / ora_blob as a LOB
+        # (#534), ora_intervalym as INTERVAL YEAR TO MONTH (#504). Best-effort:
+        # a backend that can't create them leaves those types unsupported. The
+        # ora_intervalym oid is kept on its own for the OUT-bind path, which has
+        # no result column to trace and matches on the arg type.
         self._tstz_oid: int | None = None
         self._tstz_info: CompositeInfo | None = None
-        try:
-            self._conn.execute(_TSTZ_TYPE_DDL)
-            info = CompositeInfo.fetch(self._conn, _TSTZ_TYPE)
-            if info is not None:
-                register_composite(info, self._conn)
-                self._tstz_oid = info.oid
-                self._tstz_info = info
-        except psycopg.Error:
-            self._conn.rollback()
-        # The BFILE composite (#1669), read back as a tuple of the two names.
         self._bfile_oid: int | None = None
-        try:
-            self._conn.execute(_BFILE_TYPE_DDL)
-            bfile_info = CompositeInfo.fetch(self._conn, _BFILE_TYPE)
-            if bfile_info is not None:
-                register_composite(bfile_info, self._conn)
-                self._bfile_oid = bfile_info.oid
-        except psycopg.Error:
-            self._conn.rollback()
-        # Create the typed domains and map each domain's oid to the Oracle wire type
-        # it stands for, so a result column tracing back to one is encoded as that
-        # Oracle type — ora_clob / ora_blob as a LOB (#534), ora_intervalym as
-        # INTERVAL YEAR TO MONTH (#504). Best-effort, like the composite above;
-        # a column's declared type is the schema model's. The ora_intervalym oid
-        # is kept on its own for the OUT-bind path, which has no result column
-        # to trace and matches on the arg type.
         self._intervalym_oid: int | None = None
         self._domain_type_by_oid: dict[int, int] = {}
-        try:
-            self._conn.execute(_LOB_TYPE_DDL)
-            self._conn.execute(_INTERVALYM_TYPE_DDL)
-            self._conn.execute(_DATE_TYPE_DDL)
-            self._conn.execute(_DATE_ARITHMETIC_DDL)
-            self._conn.execute(_ROWID_TYPE_DDL)
-            for name, tns_type in (
-                (_CLOB_TYPE, TNS_TYPE_CLOB),
-                (_BLOB_TYPE, TNS_TYPE_BLOB),
-                (_INTERVALYM_TYPE, TNS_TYPE_INTERVALYM),
-                (_DATE_TYPE, TNS_TYPE_DATE),
-                # Traced as JSON, which the describe hands out as an OSON BLOB.
-                (_OSON_TYPE, TNS_TYPE_JSON),
-            ):
-                row = self._conn.execute(
-                    'SELECT oid FROM pg_type WHERE typname = %s', (name,)
-                ).fetchone()
-                if row is not None:
-                    self._domain_type_by_oid[row[0]] = tns_type
-                    if name == _INTERVALYM_TYPE:
-                        self._intervalym_oid = row[0]
-            # A LOB inside a composite or an array is typed by its domain, which
-            # psycopg does not know: a BLOB attribute came back as its hex text.
-            # Load both domains, and arrays of them, as their base types (#1256).
-            from psycopg.types import TypeInfo
-            from psycopg.types.array import register_array
-            from psycopg.types.string import (
-                ByteaBinaryLoader,
-                ByteaLoader,
-                TextBinaryLoader,
-                TextLoader,
+        if not installed:
+            self._install_part('tstz', _TSTZ_TYPE_DDL)
+            self._install_part('bfile', _BFILE_TYPE_DDL)
+            self._install_part(
+                'domains',
+                _LOB_TYPE_DDL,
+                _INTERVALYM_TYPE_DDL,
+                _DATE_TYPE_DDL,
+                _DATE_ARITHMETIC_DDL,
+                _ROWID_TYPE_DDL,
             )
-
-            for name, loaders in (
-                (_CLOB_TYPE, (TextLoader, TextBinaryLoader)),
-                (_BLOB_TYPE, (ByteaLoader, ByteaBinaryLoader)),
+            # The Oracle scalar helper functions (hextoraw, rawtohex, empty_clob
+            # / empty_blob, from_tz), so those call sites need no rewrite (#513);
+            # empty_clob / empty_blob return the LOB domains just created, so
+            # this runs after them. The helpers that need orafce go apart, so
+            # they cannot take the others down without it (#1299). Then UTL_RAW
+            # (#765), DBMS_UTILITY (#764), DBMS_LOCK.SLEEP / DBMS_SESSION.SLEEP
+            # (#1511), DBMS_APPLICATION_INFO (#1840), DBMS_SQL.RETURN_RESULT
+            # (#1617) and DBMS_OUTPUT.GET_LINES's collection type (#1411).
+            for part, ddl in (
+                ('helpers', _HELPER_FUNCTIONS_DDL),
+                ('orafce helpers', _ORAFCE_HELPERS_DDL),
+                ('utl_raw', _UTL_RAW_DDL),
+                ('dbms_utility', _DBMS_UTILITY_DDL),
+                ('dbms_sleep', _DBMS_SLEEP_DDL),
+                ('dbms_application_info', _DBMS_APPLICATION_INFO_DDL),
+                ('dbms_sql', _DBMS_SQL_RETURN_RESULT_DDL),
+                ('dbms_output', _DBMS_OUTPUT_LINES_DDL),
             ):
-                domain = TypeInfo.fetch(self._conn, name)
-                if domain is not None:
-                    for loader in loaders:
-                        self._conn.adapters.register_loader(domain.oid, loader)
-                    register_array(domain, self._conn)
-            # Preserve an interval's months through psycopg (its default loader
-            # flattens them to a timedelta), so a YEAR TO MONTH value survives (#504).
-            self._conn.adapters.register_loader('interval', _IntervalMonthsTextLoader)
-            # A date before year 1 loads as a BcDate the Mirror can serve (#1063).
-            from psycopg.types.datetime import DateLoader, TimestampLoader
-
-            self._conn.adapters.register_loader('date', _bc_date_loader(DateLoader))
-            self._conn.adapters.register_loader(
-                'timestamp', _bc_date_loader(TimestampLoader)
-            )
-            # A DATE inside a composite or an array is typed by the ora_date
-            # domain, which psycopg does not know: it came back as text. Load it,
-            # and arrays of it, as the timestamp it is over (#1548).
-            date_domain = TypeInfo.fetch(self._conn, _DATE_TYPE)
-            if date_domain is not None:
-                self._conn.adapters.register_loader(
-                    date_domain.oid, _bc_date_loader(TimestampLoader)
-                )
-                register_array(date_domain, self._conn)
-            self._conn.adapters.register_loader('interval', _IntervalMonthsBinaryLoader)
-        except psycopg.Error:
-            self._conn.rollback()
-        # Install the Oracle scalar helper functions (hextoraw, rawtohex,
-        # empty_clob / empty_blob, from_tz), so those call sites need no rewrite
-        # (#513). Best-effort like the type / domain setup above; empty_clob /
-        # empty_blob return the LOB domains just created, so this runs after them.
-        try:
-            self._conn.execute(_HELPER_FUNCTIONS_DDL)
-        except psycopg.Error:
-            self._conn.rollback()
-        # The helpers that need orafce, apart so they cannot take the others
-        # down without it (#1299).
-        try:
-            self._conn.execute(_ORAFCE_HELPERS_DDL)
-        except psycopg.Error:
-            self._conn.rollback()
-        # UTL_RAW as PostgreSQL functions (orafce ships no utl_raw) (#765).
-        try:
-            self._conn.execute(_UTL_RAW_DDL)
-        except psycopg.Error:
-            self._conn.rollback()
-        # DBMS_UTILITY entry points orafce does not ship (#764).
-        try:
-            self._conn.execute(_DBMS_UTILITY_DDL)
-        except psycopg.Error:
-            self._conn.rollback()
-        # DBMS_LOCK.SLEEP / DBMS_SESSION.SLEEP (#1511).
-        try:
-            self._conn.execute(_DBMS_SLEEP_DDL)
-        except psycopg.Error:
-            self._conn.rollback()
-        # DBMS_APPLICATION_INFO (#1840).
-        try:
-            self._conn.execute(_DBMS_APPLICATION_INFO_DDL)
-        except psycopg.Error:
-            self._conn.rollback()
-        # DBMS_SQL.RETURN_RESULT (#1617).
-        try:
-            self._conn.execute(_DBMS_SQL_RETURN_RESULT_DDL)
-        except psycopg.Error:
-            self._conn.rollback()
-        # DBMS_OUTPUT.GET_LINES's collection type (#1411).
-        try:
-            self._conn.execute(_DBMS_OUTPUT_LINES_DDL)
-        except psycopg.Error:
-            self._conn.rollback()
+                self._install_part(part, ddl)
         # Oracle data-dictionary emulation (#759): SYS_CONTEXT + catalog views.
         # Installed only when missing or changed, not on every connect: CREATE
         # OR REPLACE VIEW takes an exclusive lock, so a client reading one of the
@@ -10986,49 +10971,46 @@ class PostgresBackend:
         # connection installs them. Committed first, so a give-up here cannot
         # take the helpers above down with it.
         self._conn.commit()
-        try:
-            self._install_dictionary()
-        except psycopg.Error:
-            self._conn.rollback()
-        self._conn.commit()
+        if not installed:
+            try:
+                self._install_dictionary()
+            except psycopg.Error:
+                self._conn.rollback()
+            self._conn.commit()
+        # The DDL log (#1887), whose generation is the session's own.
+        self._ddl_generation: str | None = None
+        self._install_ddl_log(install=not installed)
+        if found is None:
+            found = self._look_up_installation(vector)
+            if installed or self._stamp_installation():
+                stamped = self._conn.execute(
+                    "SELECT obj_description(to_regnamespace('system'), 'pg_namespace')"
+                ).fetchone()
+                if stamped is not None and stamped[0] is not None:
+                    _INSTALLATIONS[(conninfo, setup[6], stamped[0])] = found
+        self._adopt_installation(found)
         # The quoted-name catalog (#1204) comes with the dictionary; a session
-        # whose dictionary could not be installed does without it.
-        row = self._conn.execute(
-            "SELECT to_regclass('sys.ora_quoted_names') IS NOT NULL"
-        ).fetchone()
-        self._has_quoted_names = bool(row and row[0])
-        row = self._conn.execute(
-            "SELECT to_regclass('sys.ora_tstz_precision') IS NOT NULL"
-        ).fetchone()
-        self._has_tstz_precision = bool(row and row[0])
+        # whose dictionary could not be installed does without it, and so with
+        # the other catalogs below.
+        (
+            self._has_quoted_names,
+            self._has_tstz_precision,
+            self._has_invisible_catalog,
+            self._has_column_catalog,
+            self._has_collection_elements,
+            self._has_package_catalog,
+            self._has_ddl_guard,
+            self._has_ddl_log,
+        ) = found.catalogs
         # The schema model (#1887): each relation's columns by attnum, as a
         # result column traced to one describes it, read in one query for the
         # relations a result names; any DDL starts it over.
         self._relations: dict[int, dict[int, _TableColumn]] = {}
-        # INVISIBLE columns (#1195): whether the catalog exists, whether any
-        # table has one (None: not yet read; reset by any DDL), and the visible
-        # columns of the tables that do.
-        row = self._conn.execute(
-            "SELECT to_regclass('sys.ora_invisible_columns') IS NOT NULL"
-        ).fetchone()
-        self._has_invisible_catalog = bool(row and row[0])
-        # Declared Oracle column types (#1386): whether the catalog exists; its
-        # rows are the schema model's.
-        row = self._conn.execute(
-            "SELECT to_regclass('sys.ora_columns') IS NOT NULL"
-        ).fetchone()
-        self._has_column_catalog = bool(row and row[0])
-        row = self._conn.execute(
-            "SELECT to_regclass('sys.ora_collection_elements') IS NOT NULL"
-        ).fetchone()
-        self._has_collection_elements = bool(row and row[0])
-        # A package's types (#1607): whether their catalog exists, and each
-        # PostgreSQL type's -- None for one that is no package's; any DDL starts
-        # it over.
-        row = self._conn.execute(
-            "SELECT to_regclass('sys.ora_plsql_types') IS NOT NULL"
-        ).fetchone()
-        self._has_package_catalog = bool(row and row[0])
+        # INVISIBLE columns (#1195): whether any table has one (None: not yet
+        # read; reset by any DDL), and the visible columns of the tables that
+        # do. Declared Oracle column types (#1386) are the schema model's. A
+        # package's types (#1607): each PostgreSQL type's -- None for one that
+        # is no package's; any DDL starts it over.
         self._plsql_types: dict[int, tuple[str, str, str, dict] | None] = {}
         self._collection_name_cache: frozenset[str] | None = None
         # Each package's functions a call may name without parentheses (#1651).
@@ -11055,55 +11037,216 @@ class PostgresBackend:
         self._raw_constructor_cache: dict[str, frozenset[int]] | None = None
         self._any_invisible: bool | None = None
         self._visible_cache: dict[str, list[str] | None] = {}
-        # The DDL generation this session last saw, from its connect on; None
-        # for good where the log could not be installed (#1887).
-        self._ddl_generation: str | None = None
         # Each table name a statement names, as its relation's oid -- None for
         # no relation -- for the schema model (#1889); any DDL starts it over.
         self._relids: dict[str, int | None] = {}
         # The ora_rowid domain's oids, read once a statement asks (#1624).
         self._rowid_type_oids: frozenset[int] | None = None
-        self._has_ddl_guard = False
-        self._has_ddl_log = self._install_ddl_log()
-        self._conn.execute("SET seerdb.installing = 'off'")
+        if not installed:
+            self._conn.execute("SET seerdb.installing = 'off'")
         self._conn.commit()
+        if not self._has_ddl_log:
+            # The DDL generation this session last saw, from its connect on;
+            # None for good where the log could not be installed (#1887).
+            self._ddl_generation = None
 
-    def _install_ddl_log(self) -> bool:
-        # The DDL log and its event trigger (#1887), cut back when it has grown,
-        # and the guard of a statement rewritten from the schema (#1889);
-        # whether the log is there to read.
+    def _install_part(self, part: str, *ddl: str) -> None:
+        # One part of the setup's installation, best effort: one that fails is
+        # rolled back and named, and the installation is not stamped (#1871).
         try:
-            with self._conn.transaction():
-                self._conn.execute(_DDL_LOG_DDL)
+            for statement in ddl:
+                self._conn.execute(statement)
         except psycopg.Error:
             self._conn.rollback()
+            self._install_failures.append(part)
+
+    def _stamp_installation(self) -> bool:
+        # Stamp the installation this setup ran, unless a part of it failed
+        # that the database should have taken: whether it is stamped (#1871).
+        # The extensions are read again, as the setup may have created them.
+        row = self._conn.execute(
+            "SELECT (SELECT string_agg(extname, ' ' ORDER BY extname) FROM pg_extension "
+            "WHERE extname IN ('orafce', 'vector')), "
+            "obj_description(to_regnamespace('sys'), 'pg_namespace')"
+        ).fetchone()
+        if row is None or row[1] != _DICTIONARY_STAMP:
+            return False
+        extensions = set((row[0] or '').split())
+        for part in self._install_failures:
+            if part in _PRIVILEGED_PARTS:
+                continue
+            if part in _EXTENSION_PARTS and _EXTENSION_PARTS[part] not in extensions:
+                continue
+            return False
         try:
-            with self._conn.transaction():
-                self._conn.execute(_DDL_GUARD_DDL)
+            stamp = _installation_stamp(row[0])
+            self._conn.execute(f"COMMENT ON SCHEMA system IS '{stamp}'")
+            self._conn.commit()
         except psycopg.Error:
             self._conn.rollback()
+            return False
+        return True
+
+    def _look_up_vector(
+        self,
+    ) -> tuple[int, int, int, CompositeInfo, CompositeInfo] | None:
+        # pgvector's `vector` and the Mirror's two vector composites (#1708),
+        # where the database has them.
+        row = self._conn.execute(
+            "SELECT to_regtype('vector')::oid, to_regtype(%s)::oid, to_regtype(%s)::oid",
+            (_VECTOR_COMPOSITE, _SPARSE_COMPOSITE),
+        ).fetchone()
+        if row is None or None in row:
+            return None
+        composite = CompositeInfo.fetch(self._conn, _VECTOR_COMPOSITE)
+        sparse = CompositeInfo.fetch(self._conn, _SPARSE_COMPOSITE)
+        if composite is None or sparse is None:
+            return None
+        return (row[0], row[1], row[2], composite, sparse)
+
+    def _look_up_installation(
+        self, vector: tuple[int, int, int, CompositeInfo, CompositeInfo] | None
+    ) -> _Installation:
+        # What a session's setup looks up in the installed database (#1871),
+        # the vector types already looked up.
+        from psycopg.types import TypeInfo
+
+        def fetched(fetch: Callable[[], Any]) -> Any:
+            try:
+                return fetch()
+            except psycopg.Error:
+                self._conn.rollback()
+                return None
+
+        tstz = fetched(lambda: CompositeInfo.fetch(self._conn, _TSTZ_TYPE))
+        bfile = fetched(lambda: CompositeInfo.fetch(self._conn, _BFILE_TYPE))
+        names = [_CLOB_TYPE, _BLOB_TYPE, _INTERVALYM_TYPE, _DATE_TYPE, _OSON_TYPE]
+        rows = fetched(
+            lambda: self._conn.execute(
+                'SELECT typname, oid FROM pg_type WHERE typname = ANY(%s)', (names,)
+            ).fetchall()
+        )
+        domain_oids = {name: oid for (name, oid) in rows or ()}
+        clob = fetched(lambda: TypeInfo.fetch(self._conn, _CLOB_TYPE))
+        blob = fetched(lambda: TypeInfo.fetch(self._conn, _BLOB_TYPE))
+        date = fetched(lambda: TypeInfo.fetch(self._conn, _DATE_TYPE))
+        catalogs = fetched(
+            lambda: self._conn.execute(
+                "SELECT to_regclass('sys.ora_quoted_names') IS NOT NULL, "
+                "to_regclass('sys.ora_tstz_precision') IS NOT NULL, "
+                "to_regclass('sys.ora_invisible_columns') IS NOT NULL, "
+                "to_regclass('sys.ora_columns') IS NOT NULL, "
+                "to_regclass('sys.ora_collection_elements') IS NOT NULL, "
+                "to_regclass('sys.ora_plsql_types') IS NOT NULL, "
+                "to_regprocedure('sys.ora_ddl_unchanged(text)') IS NOT NULL, "
+                'EXISTS (SELECT 1 FROM pg_event_trigger '
+                "WHERE evtname = 'ora_ddl_log')"
+            ).fetchone()
+        )
+        self._conn.commit()
+        return _Installation(
+            vector=vector,
+            tstz=tstz,
+            bfile=bfile,
+            domain_oids=domain_oids,
+            clob=clob,
+            blob=blob,
+            date=date,
+            catalogs=tuple(bool(flag) for flag in catalogs or (False,) * 8),
+        )
+
+    def _adopt_installation(self, found: _Installation) -> None:
+        # The adapters and oids of what the setup looked up (#1871): the same
+        # for every session of the installation, registered on this one's
+        # connection.
+        from psycopg.types.array import register_array
+        from psycopg.types.datetime import DateLoader, TimestampLoader
+        from psycopg.types.string import (
+            ByteaBinaryLoader,
+            ByteaLoader,
+            TextBinaryLoader,
+            TextLoader,
+        )
+
+        if found.tstz is not None:
+            register_composite(found.tstz, self._conn)
+            self._tstz_oid = found.tstz.oid
+            self._tstz_info = found.tstz
+        if found.bfile is not None:
+            register_composite(found.bfile, self._conn)
+            self._bfile_oid = found.bfile.oid
+        for name, tns_type in (
+            (_CLOB_TYPE, TNS_TYPE_CLOB),
+            (_BLOB_TYPE, TNS_TYPE_BLOB),
+            (_INTERVALYM_TYPE, TNS_TYPE_INTERVALYM),
+            (_DATE_TYPE, TNS_TYPE_DATE),
+            # Traced as JSON, which the describe hands out as an OSON BLOB.
+            (_OSON_TYPE, TNS_TYPE_JSON),
+        ):
+            oid = found.domain_oids.get(name)
+            if oid is not None:
+                self._domain_type_by_oid[oid] = tns_type
+                if name == _INTERVALYM_TYPE:
+                    self._intervalym_oid = oid
+        # A LOB inside a composite or an array is typed by its domain, which
+        # psycopg does not know: a BLOB attribute came back as its hex text.
+        # Load both domains, and arrays of them, as their base types (#1256).
+        for domain, loaders in (
+            (found.clob, (TextLoader, TextBinaryLoader)),
+            (found.blob, (ByteaLoader, ByteaBinaryLoader)),
+        ):
+            if domain is not None:
+                for loader in loaders:
+                    self._conn.adapters.register_loader(domain.oid, loader)
+                register_array(domain, self._conn)
+        # Preserve an interval's months through psycopg (its default loader
+        # flattens them to a timedelta), so a YEAR TO MONTH value survives (#504).
+        self._conn.adapters.register_loader('interval', _IntervalMonthsTextLoader)
+        # A date before year 1 loads as a BcDate the Mirror can serve (#1063).
+        self._conn.adapters.register_loader('date', _bc_date_loader(DateLoader))
+        self._conn.adapters.register_loader(
+            'timestamp', _bc_date_loader(TimestampLoader)
+        )
+        # A DATE inside a composite or an array is typed by the ora_date
+        # domain, which psycopg does not know: it came back as text. Load it,
+        # and arrays of it, as the timestamp it is over (#1548).
+        if found.date is not None:
+            self._conn.adapters.register_loader(
+                found.date.oid, _bc_date_loader(TimestampLoader)
+            )
+            register_array(found.date, self._conn)
+        self._conn.adapters.register_loader('interval', _IntervalMonthsBinaryLoader)
+
+    def _install_ddl_log(self, *, install: bool) -> None:
+        # The DDL log and its event trigger (#1887) and the guard of a
+        # statement rewritten from the schema (#1889), where the installation
+        # is not current; then the log cut back when it has grown, and the
+        # generation this session starts from.
+        if install:
+            for part, ddl in (('ddl log', _DDL_LOG_DDL), ('ddl guard', _DDL_GUARD_DDL)):
+                try:
+                    with self._conn.transaction():
+                        self._conn.execute(ddl)
+                except psycopg.Error:
+                    self._conn.rollback()
+                    self._install_failures.append(part)
         try:
             with self._conn.transaction():
                 row = self._conn.execute(
-                    'SELECT count(*), max(id) FROM sys.ora_ddl_log'
+                    'SELECT count(*), max(id), '
+                    + _DDL_GENERATION
+                    + ' FROM sys.ora_ddl_log'
                 ).fetchone()
                 if row is not None and row[0] > _DDL_LOG_KEPT:
                     self._conn.execute(
                         'DELETE FROM sys.ora_ddl_log WHERE id < %s', (row[1],)
                     )
-                row = self._conn.execute('SELECT ' + _DDL_GENERATION).fetchone()
-                self._ddl_generation = None if row is None else row[0]
-                row = self._conn.execute(
-                    "SELECT to_regprocedure('sys.ora_ddl_unchanged(text)') IS NOT NULL"
-                ).fetchone()
-                self._has_ddl_guard = bool(row and row[0])
-                row = self._conn.execute(
-                    "SELECT EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = 'ora_ddl_log')"
-                ).fetchone()
-            return bool(row and row[0])
+                    row = self._conn.execute(
+                        'SELECT 0, 0, ' + _DDL_GENERATION
+                    ).fetchone()
+                self._ddl_generation = None if row is None else row[2]
         except psycopg.Error:
             self._conn.rollback()
-            return False
 
     def _forget_schema(self) -> None:
         # Drop what this session knows of the schema, for another session's DDL
