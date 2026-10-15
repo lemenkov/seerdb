@@ -10382,6 +10382,15 @@ _DDL_GENERATION = (
 )
 # The transaction-id check (#1869), and with it the DDL generation (#1887).
 _WRITTEN_CHECK = 'SELECT pg_current_xact_id_if_assigned() IS NULL'
+# A query that may run with no transaction around it (#1916): a SELECT or a
+# WITH, its literals masked, that takes no row lock, writes nothing it says so
+# and opens no cursor -- whose portal would end with the transaction.
+_PLAIN_QUERY = re.compile(r'\s*\(*\s*(?:SELECT|WITH)\b', re.IGNORECASE)
+_NOT_A_PLAIN_QUERY = re.compile(
+    r'\b(?:FOR\s+(?:NO\s+KEY\s+)?UPDATE|FOR\s+(?:KEY\s+)?SHARE|INSERT|UPDATE|DELETE|'
+    r'MERGE|INTO|CURSOR)\b',
+    re.IGNORECASE,
+)
 
 
 _ACCOUNTS_SCHEMA = 'seerdb_auth'
@@ -14963,6 +14972,16 @@ class PostgresBackend:
         # schema is still the one it was read at; when another session's DDL
         # came first, it runs as `fallback`, its text before the rewrite
         # (#1889).
+        if (
+            self._conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+            and not self._user_savepoint
+            and not self._conn.prelude
+        ):
+            masked = _masked_quoted(sql)[0]
+            if _PLAIN_QUERY.match(masked) and not _NOT_A_PLAIN_QUERY.search(masked):
+                result = self._query_at_once(sql, params, original, fallback)
+                if result is not None:
+                    return result
         savepoint = self._conn.cursor()
         guard = self._conn.cursor()
         statement = self._conn.cursor()
@@ -15009,6 +15028,64 @@ class PostgresBackend:
         # statement had its effect. Building the result can only raise on an
         # unencodable SELECT column — no side effect to undo — so let it propagate
         # for the session to map to an ORA error; the connection stays usable.
+        return self._build_result(statement, sql, original or '')
+
+    def _query_at_once(
+        self,
+        sql: str,
+        params: dict | None,
+        original: str | None,
+        fallback: str | None,
+    ) -> Result | None:
+        # A query with no transaction open, in one round trip (#1916): in
+        # autocommit, with no BEGIN, SAVEPOINT or COMMIT around it. The
+        # pipeline's own implicit transaction ends at its sync, which lets the
+        # query's read locks go (#1190) as the commit after it did; the DDL
+        # generation (#1887) rides along. A failure leaves nothing to roll
+        # back, the transaction being the statement's alone. None when a
+        # result column is a REF CURSOR, whose portal ended with the
+        # transaction: the caller runs the query again in one.
+        guard = self._conn.cursor()
+        statement = self._conn.cursor()
+        generation = self._conn.cursor()
+        self._conn.autocommit = True
+        try:
+            with self._conn.pipeline():
+                # Not the query first: psycopg keeps the name of a statement
+                # that failed as it prepared it first in a pipeline, which the
+                # server never kept, and the next run fails on it.
+                generation.execute(
+                    'SELECT ' + _DDL_GENERATION if self._has_ddl_log else 'SELECT NULL'
+                )
+                if fallback is not None:
+                    guard.execute(
+                        'SELECT sys.ora_ddl_unchanged(%s)', (self._ddl_generation,)
+                    )
+                statement.execute(sql, params)
+        except psycopg.Error as exc:
+            # The failed pipeline's implicit transaction is still open, aborted:
+            # end it, so the session is as it was before the query.
+            self._conn.rollback()
+            self._conn.autocommit = False
+            if fallback is not None and exc.sqlstate == _SCHEMA_CHANGED:
+                return self._execute_pipelined(fallback, params, original)
+            if isinstance(exc, psycopg.errors.FeatureNotSupported):
+                # A prepared plan another session's DDL changed the shape of
+                # (#1885): the transactional path recovers from it.
+                return None
+            raise _backend_error(exc, original=original, translated=sql) from exc
+        self._conn.autocommit = False
+        if any(
+            desc.type_code == _REFCURSOR_OID for desc in statement.description or ()
+        ):
+            return None
+        self._conn.unwritten_at = (True, self._conn.statements)
+        if self._has_ddl_log:
+            row = generation.fetchone()
+            if row is not None and row[0] is not None:
+                if self._ddl_generation not in (None, row[0]):
+                    self._forget_schema()
+                self._ddl_generation = row[0]
         return self._build_result(statement, sql, original or '')
 
     @_while_connected
