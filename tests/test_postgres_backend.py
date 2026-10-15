@@ -9466,6 +9466,34 @@ def test_the_dictionary_lists_a_rowid_urowid_or_bfile_column_as_itself() -> None
             backend.rollback()
 
 
+def test_the_dictionary_lists_a_ref_column_by_the_type_it_points_at() -> None:
+    # A REF column (#1905) is listed by the object type it points at, owned
+    # by that type's owner (the table's here), 50 long and DATA_TYPE_MOD REF
+    # -- 23ai's answers -- not by the `<type>$ref` composite that stores it.
+    # Any other column has no DATA_TYPE_MOD.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TYPE rf1905_o AS OBJECT (n NUMBER)')
+        backend.execute('CREATE TABLE rf1905t (n NUMBER, x REF rf1905_o)')
+        rows = backend.execute(
+            'SELECT column_name, data_type, data_type_mod, data_type_owner, '
+            "data_length, owner FROM all_tab_columns WHERE table_name = 'RF1905T' "
+            'ORDER BY column_id'
+        ).rows
+        owner = rows[0][5]
+        assert rows == [
+            ('N', 'NUMBER', None, None, 22, owner),
+            ('X', 'RF1905_O', 'REF', owner, 50, owner),
+        ]
+    finally:
+        backend.rollback()
+        for statement in ('DROP TABLE rf1905t', 'DROP TYPE rf1905_o'):
+            try:
+                backend.execute(statement)
+            except Exception:
+                backend.rollback()
+
+
 def test_a_literal_select_item_is_cast_to_its_char_length() -> None:
     # A select item that is one string literal is CHAR(n) in Oracle (#1494): in
     # a query, a subquery and a cursor a block opens. So is a concatenation of
