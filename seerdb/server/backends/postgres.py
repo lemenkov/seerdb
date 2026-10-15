@@ -1344,6 +1344,10 @@ _INDEX_KEY_COLUMN: Final = (
     "= '((' || quote_ident(a.attname) || ').utc)')"
 )
 
+# A column of ALL_TAB_COLS that is a REF: its type is an object type's
+# `<type>$ref` companion (#1905).
+_REF_COLUMN: Final = "c.data_type = 'USER-DEFINED' AND right(c.udt_name, 4) = '$ref'"
+
 _ORACLE_DICTIONARY_DDL = (
     # SYS_CONTEXT('userenv', <param>) — the session context the dialect reads to
     # learn its current schema/user before it reflects anything.
@@ -1695,6 +1699,9 @@ _ORACLE_DICTIONARY_DDL = (
     # precision) has no precision in Oracle, and 4 or 8 bytes (#1480).
     "WHEN c.data_type = 'USER-DEFINED' AND c.udt_name = 'ora_tstz' "
     "THEN 'TIMESTAMP(' || coalesce(p.prec, 6) || ') WITH TIME ZONE' "
+    # A REF column, its type's `<type>$ref` companion, reads as the type it
+    # points at, DATA_TYPE_MOD saying REF (#1905).
+    f'WHEN {_REF_COLUMN} THEN ora_name(left(c.udt_name, -4)) '
     # A composite with a recorded type, a BFILE, reads as that (#1904).
     "WHEN c.data_type = 'USER-DEFINED' AND o.data_type IS NULL "
     'THEN ora_name(c.udt_name) '
@@ -1715,7 +1722,8 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN o.data_type IS NULL AND c.data_type = 'real' THEN 4 "
     "WHEN o.data_type IS NULL AND c.data_type = 'double precision' THEN 8 "
     # A NUMBER is 22 bytes whatever its precision (#1483).
-    "WHEN o.data_type IS NULL AND c.data_type = 'numeric' THEN 22 ELSE "
+    "WHEN o.data_type IS NULL AND c.data_type = 'numeric' THEN 22 "
+    f'WHEN {_REF_COLUMN} THEN 50 ELSE '
     'coalesce(o.data_length, c.character_maximum_length, c.numeric_precision, 22) '
     'END AS data_length, '
     # A type recorded as declared keeps its precision and scale as recorded, a
@@ -1765,7 +1773,9 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN c.data_type IN ('character varying', 'character') "
     "AND o.data_type IS DISTINCT FROM 'ROWID' AND o.data_type IS DISTINCT FROM 'UROWID' "
     "THEN 'B' "
-    'END::text AS char_used '
+    'END::text AS char_used, '
+    # REF for a REF column, NULL for any other (#1905). Appended, as above.
+    f"CASE WHEN {_REF_COLUMN} THEN 'REF' END::text AS data_type_mod "
     'FROM information_schema.columns c '
     'LEFT JOIN sys.ora_invisible_columns h ON h.relid = '
     "(quote_ident(c.table_schema) || '.' || quote_ident(c.table_name))::regclass "
