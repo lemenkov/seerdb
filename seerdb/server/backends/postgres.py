@@ -3501,8 +3501,14 @@ _DDL_TYPE_REWRITES: list[
     # failed. A UROWID can hold an index-organized table's logical rowid, which
     # is longer than the 18 characters of a heap one.
     # Anchored to a column definition -- after `(` or `,` -- so a `SELECT ROWID`
-    # in CREATE TABLE ... AS SELECT is left to the pseudo-column rewrite.
-    (re.compile(rf'({_DDL_COLUMN})\s+UROWID\b', re.IGNORECASE), r'\1 varchar(4000)'),
+    # in CREATE TABLE ... AS SELECT is left to the pseudo-column rewrite. A
+    # UROWID(n) holds n bytes at most (#1906).
+    (
+        re.compile(
+            rf'({_DDL_COLUMN})\s+UROWID\b(?:\s*\(\s*(\d+)\s*\))?', re.IGNORECASE
+        ),
+        lambda m: f'{m.group(1)} varchar({m.group(2) or 4000})',
+    ),
     # An XMLType -- a column's, an object attribute's, a collection's element
     # type -- is PostgreSQL's xml, which the describe reports back as
     # SYS.XMLTYPE (#1536, #1537). The type name only: one followed by `(` is the
@@ -3960,7 +3966,9 @@ _NUMBER_UNSIZED_DECLARED = re.compile(
 )
 # ROWID, UROWID and BFILE, which the rewrite stores as the ora_rowid domain,
 # varchar(4000) and the ora_bfile composite (#1904), and Oracle's lengths of them.
-_LOCATOR_DECLARED = re.compile(r'\s*(UROWID|ROWID|BFILE)\b', re.IGNORECASE)
+_LOCATOR_DECLARED = re.compile(
+    r'\s*(UROWID|ROWID|BFILE)\b(?:\s*\(\s*(\d+)\s*\))?', re.IGNORECASE
+)
 _LOCATOR_LENGTHS = {'ROWID': 10, 'UROWID': 4000, 'BFILE': 530}
 # A MODIFY that leaves the column's type alone -- a constraint, a default.
 _MODIFY_WITHOUT_TYPE = re.compile(
@@ -4022,6 +4030,8 @@ def _declared_type(
     locator = _LOCATOR_DECLARED.match(definition)
     if locator is not None:
         kind = locator.group(1).upper()
+        if kind == 'UROWID' and locator.group(2):
+            return (kind, int(locator.group(2)), None, None)
         return (kind, _LOCATOR_LENGTHS[kind], None, None)
     return None
 
