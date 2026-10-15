@@ -10117,6 +10117,59 @@ def test_a_repeated_write_reads_no_catalog(monkeypatch: pytest.MonkeyPatch) -> N
         backend.close()
 
 
+def test_the_column_readers_share_the_schema_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The features that read a table's columns -- BOOLEAN (#1743), RAW
+    # (#1496), VECTOR (#1708), OSON and JSON (#1706, #1707) and INVISIBLE
+    # (#1195) -- read them from the schema model (#1887): a table's columns
+    # are read once, where each feature read them on its own.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    if not backend._has_pgvector:
+        backend.close()
+        pytest.skip('the PostgreSQL bed has no pgvector')
+    sent: list[str] = []
+    execute = psycopg.Cursor.execute
+
+    def recorded(cursor: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
+        sent.append(str(query))
+        return execute(cursor, query, *args, **kwargs)
+
+    try:
+        backend.execute(
+            'CREATE TABLE m1887t (n NUMBER, f BOOLEAN, r RAW(4), '
+            'v VECTOR(3, FLOAT32), d JSON, h NUMBER INVISIBLE)'
+        )
+        monkeypatch.setattr(psycopg.Cursor, 'execute', recorded)
+        backend.execute(
+            'INSERT INTO m1887t (n, f, r, v, d) VALUES (:1, :2, :3, :4, :5)',
+            [1, 1, 'ABCD', '[1, 2, 3]', '{"a": 1}'],
+        )
+        backend.execute(
+            "INSERT INTO m1887t VALUES (2, 0, 'ab', '[1,2,3]', '{\"a\": 2}')"
+        )
+        rows = backend.execute('SELECT * FROM m1887t ORDER BY n').rows
+        assert [row[:3] for row in rows] == [
+            (1, True, b'\xab\xcd'),
+            (2, False, b'\xab'),
+        ]
+        assert len(rows[0]) == 5  # h is INVISIBLE
+        dotted = backend.execute('SELECT t.d.a FROM m1887t t ORDER BY n').rows
+        assert [row[0] for row in dotted] == [1, 2]
+        monkeypatch.undo()
+        assert sum('a.attrelid = ANY(' in query for query in sent) == 1
+        assert not [
+            query
+            for query in sent
+            if 'pg_attribute' in query and 'to_regclass(%s)' in query
+        ]
+    finally:
+        monkeypatch.undo()
+        backend.rollback()
+        backend.execute('DROP TABLE IF EXISTS m1887t')
+        backend.close()
+
+
 def test_a_connect_to_an_installed_database_installs_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
