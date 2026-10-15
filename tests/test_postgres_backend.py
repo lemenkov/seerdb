@@ -9494,6 +9494,40 @@ def test_the_dictionary_lists_a_ref_column_by_the_type_it_points_at() -> None:
                 backend.rollback()
 
 
+def test_the_dictionary_lists_a_vector_column_as_23ai_does() -> None:
+    # A VECTOR column (#1907) is 8200 long whatever its dimensions and format,
+    # with no precision or scale, and its dimension count -- 0 where that is
+    # flexible -- as its CHAR_LENGTH: 23ai's answers. Its record keeps the
+    # count and the format in the length and precision slots (#1708).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    if not backend._has_pgvector:
+        backend.close()
+        pytest.skip('the PostgreSQL bed has no pgvector')
+    try:
+        backend.execute(
+            'CREATE TABLE vc1907t (a VECTOR, b VECTOR(3, FLOAT32), '
+            'c VECTOR(16, BINARY), d VECTOR(*, FLOAT64), e VECTOR(3, INT8, SPARSE))'
+        )
+        rows = backend.execute(
+            'SELECT column_name, data_type, data_length, data_precision, '
+            "data_scale, char_length FROM all_tab_columns WHERE table_name = 'VC1907T' "
+            'ORDER BY column_id'
+        ).rows
+        assert rows == [
+            ('A', 'VECTOR', 8200, None, None, 0),
+            ('B', 'VECTOR', 8200, None, None, 3),
+            ('C', 'VECTOR', 8200, None, None, 16),
+            ('D', 'VECTOR', 8200, None, None, 0),
+            ('E', 'VECTOR', 8200, None, None, 3),
+        ]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE vc1907t')
+        except Exception:
+            backend.rollback()
+
+
 def test_a_literal_select_item_is_cast_to_its_char_length() -> None:
     # A select item that is one string literal is CHAR(n) in Oracle (#1494): in
     # a query, a subquery and a cursor a block opens. So is a concatenation of
