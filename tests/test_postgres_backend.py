@@ -9975,3 +9975,50 @@ def test_a_repeated_write_reads_no_catalog(monkeypatch: pytest.MonkeyPatch) -> N
         backend.rollback()
         backend.execute('DROP TABLE IF EXISTS rw1884t')
         backend.close()
+
+
+def test_a_connect_to_an_installed_database_installs_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A database stamped with this seerdb's installation is left alone: a
+    # connect sends its session settings, the DDL log's generation and no DDL
+    # (#1871). A missing stamp installs again and stamps it.
+    from seerdb.server.backends.postgres import _installation_stamp
+
+    sent: list[str] = []
+    execute = psycopg.Cursor.execute
+
+    def recorded(cursor: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
+        sent.append(str(query))
+        return execute(cursor, query, *args, **kwargs)
+
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    try:
+        admin.execute('COMMENT ON SCHEMA system IS NULL')
+        monkeypatch.setattr(psycopg.Cursor, 'execute', recorded)
+        PostgresBackend(_CONNINFO, credentials=dict(_CREDS)).close()
+        assert any('CREATE OR REPLACE FUNCTION' in s for s in sent)
+        (extensions, stamp) = admin.execute(
+            "SELECT (SELECT string_agg(extname, ' ' ORDER BY extname) FROM pg_extension "
+            "WHERE extname IN ('orafce', 'vector')), "
+            "obj_description('system'::regnamespace, 'pg_namespace')"
+        ).fetchone() or (None, None)
+        assert stamp == _installation_stamp(extensions)
+        sent.clear()
+        backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+        assert len(sent) <= 3, sent
+        assert not any(s.lstrip().startswith(('CREATE', 'DO', 'COMMENT')) for s in sent)
+        monkeypatch.undo()
+        # And the session works as one that installed: a WITH TIME ZONE value,
+        # a LOB and a DATE come back typed.
+        row = backend.execute(
+            "SELECT TIMESTAMP '2000-01-01 12:00:00 +02:00', to_clob('x'), "
+            "DATE '2000-01-02' FROM dual"
+        ).rows[0]
+        assert row[0].utcoffset() == datetime.timedelta(hours=2)
+        assert row[1] == 'x'
+        assert row[2] == datetime.datetime(2000, 1, 2)
+        backend.close()
+    finally:
+        monkeypatch.undo()
+        admin.close()
