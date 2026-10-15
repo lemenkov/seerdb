@@ -9431,6 +9431,32 @@ def test_an_unsized_number_is_recorded_without_a_precision() -> None:
     )
 
 
+def test_the_dictionary_lists_a_rowid_urowid_or_bfile_column_as_itself() -> None:
+    # A ROWID, UROWID or BFILE column (#1904) is listed by its Oracle type, at
+    # Oracle's length, with no owner and no character length -- 23ai's
+    # answers -- not by the domain, varchar or composite that stores it.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE rw1904t (r ROWID, "Rq" ROWID, u UROWID, f BFILE)')
+        rows = backend.execute(
+            'SELECT column_name, data_type, data_type_owner, data_length, '
+            'char_length, char_used, char_col_decl_length FROM all_tab_columns '
+            "WHERE table_name = 'RW1904T' ORDER BY column_id"
+        ).rows
+        assert rows == [
+            ('R', 'ROWID', None, 10, 0, None, None),
+            ('Rq', 'ROWID', None, 10, 0, None, None),
+            ('U', 'UROWID', None, 4000, 0, None, None),
+            ('F', 'BFILE', None, 530, 0, None, None),
+        ]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE rw1904t')
+        except Exception:
+            backend.rollback()
+
+
 def test_a_literal_select_item_is_cast_to_its_char_length() -> None:
     # A select item that is one string literal is CHAR(n) in Oracle (#1494): in
     # a query, a subquery and a cursor a block opens. So is a concatenation of

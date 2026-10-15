@@ -1695,7 +1695,9 @@ _ORACLE_DICTIONARY_DDL = (
     # precision) has no precision in Oracle, and 4 or 8 bytes (#1480).
     "WHEN c.data_type = 'USER-DEFINED' AND c.udt_name = 'ora_tstz' "
     "THEN 'TIMESTAMP(' || coalesce(p.prec, 6) || ') WITH TIME ZONE' "
-    "WHEN c.data_type = 'USER-DEFINED' THEN ora_name(c.udt_name) "
+    # A composite with a recorded type, a BFILE, reads as that (#1904).
+    "WHEN c.data_type = 'USER-DEFINED' AND o.data_type IS NULL "
+    'THEN ora_name(c.udt_name) '
     "WHEN o.data_type IS NULL AND c.data_type = 'timestamp without time zone' "
     "THEN 'TIMESTAMP(' || c.datetime_precision || ')' "
     "WHEN o.data_type IS NULL AND c.data_type = 'timestamp with time zone' "
@@ -1732,8 +1734,10 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN o.data_type = 'VECTOR' THEN NULL "
     'WHEN o.data_type IS NOT NULL THEN o.data_scale ELSE c.numeric_scale END)'
     '::information_schema.cardinal_number AS data_scale, '
-    # CHAR_LENGTH is 0 for a type with no character length, not NULL (#1418).
-    'coalesce(c.character_maximum_length, 0)'
+    # CHAR_LENGTH is 0 for a type with no character length, not NULL (#1418),
+    # a ROWID or UROWID's text included (#1904).
+    "(CASE WHEN o.data_type IN ('ROWID', 'UROWID') THEN 0 "
+    'ELSE coalesce(c.character_maximum_length, 0) END)'
     '::information_schema.cardinal_number AS char_length, '
     "CASE c.is_nullable WHEN 'YES' THEN 'Y' ELSE 'N' END AS nullable, "
     'c.column_default AS data_default, '
@@ -1743,6 +1747,7 @@ _ORACLE_DICTIONARY_DDL = (
     "CASE WHEN c.data_type = 'ARRAY' AND c.domain_name IS NOT NULL "
     'THEN ora_owner(c.domain_schema) '
     "WHEN c.data_type = 'USER-DEFINED' AND c.udt_name <> 'ora_tstz' "
+    'AND o.data_type IS NULL '
     'THEN ora_owner(c.udt_schema) END AS data_type_owner, '
     # The declared length of a character column, in bytes for a CHAR-semantics
     # one -- its record's 4n -- and in characters otherwise; a CLOB's 4000, an
@@ -1753,10 +1758,13 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN o.data_type = 'NCLOB' THEN 2000 WHEN o.data_type = 'LONG' THEN 0 "
     f"WHEN c.domain_name = '{_CLOB_TYPE}' THEN 4000 "
     "WHEN c.data_type IN ('character varying', 'character') "
+    "AND o.data_type IS DISTINCT FROM 'ROWID' AND o.data_type IS DISTINCT FROM 'UROWID' "
     'THEN c.character_maximum_length END)'
     '::information_schema.cardinal_number AS char_col_decl_length, '
     "CASE WHEN o.data_type IN ('VARCHAR2', 'CHAR', 'NVARCHAR2', 'NCHAR') THEN 'C' "
-    "WHEN c.data_type IN ('character varying', 'character') THEN 'B' "
+    "WHEN c.data_type IN ('character varying', 'character') "
+    "AND o.data_type IS DISTINCT FROM 'ROWID' AND o.data_type IS DISTINCT FROM 'UROWID' "
+    "THEN 'B' "
     'END::text AS char_used '
     'FROM information_schema.columns c '
     'LEFT JOIN sys.ora_invisible_columns h ON h.relid = '
@@ -3950,6 +3958,10 @@ _NUMBER_UNSIZED_DECLARED = re.compile(
     r'|NUMBER\s*\(\s*\*\s*,\s*(-?\d+)\s*\))',
     re.IGNORECASE,
 )
+# ROWID, UROWID and BFILE, which the rewrite stores as the ora_rowid domain,
+# varchar(4000) and the ora_bfile composite (#1904), and Oracle's lengths of them.
+_LOCATOR_DECLARED = re.compile(r'\s*(UROWID|ROWID|BFILE)\b', re.IGNORECASE)
+_LOCATOR_LENGTHS = {'ROWID': 10, 'UROWID': 4000, 'BFILE': 530}
 # A MODIFY that leaves the column's type alone -- a constraint, a default.
 _MODIFY_WITHOUT_TYPE = re.compile(
     r'\s*(?:$|(?:NOT|NULL|DEFAULT|CONSTRAINT|CHECK|UNIQUE|PRIMARY|REFERENCES|'
@@ -4007,6 +4019,10 @@ def _declared_type(
     unsized = _NUMBER_UNSIZED_DECLARED.match(definition)
     if unsized is not None:
         return ('NUMBER', 22, None, int(unsized.group(1) or 0))
+    locator = _LOCATOR_DECLARED.match(definition)
+    if locator is not None:
+        kind = locator.group(1).upper()
+        return (kind, _LOCATOR_LENGTHS[kind], None, None)
     return None
 
 
