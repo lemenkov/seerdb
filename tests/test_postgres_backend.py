@@ -2728,6 +2728,68 @@ def test_a_call_right_after_a_commit_keeps_its_savepoint() -> None:
     assert got == expected
 
 
+def test_a_write_opens_its_transaction_in_its_own_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A write with no transaction open sends its BEGIN with it, first in its
+    # pipeline (#1915), not as psycopg's own, which syncs: one round trip.
+    # The transaction then lasts as Oracle's does, until the commit or the
+    # rollback, which hand the connection back to psycopg's transactions. A
+    # write that fails leaves its transaction for the next one; a rollback
+    # takes them all.
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    sent: list[tuple[str, bool]] = []
+    execute = psycopg.Cursor.execute
+    off = psycopg.pq.PipelineStatus.OFF
+    idle = psycopg.pq.TransactionStatus.IDLE
+
+    def recorded(cursor: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
+        sent.append((str(query), cursor.connection.pgconn.pipeline_status != off))
+        return execute(cursor, query, *args, **kwargs)
+
+    def count() -> int:
+        (n,) = _fetched_row(backend._conn.execute('SELECT count(*) FROM tx1915t'))
+        return int(n)
+
+    try:
+        backend.execute('CREATE TABLE tx1915t (n NUMBER PRIMARY KEY)')
+        # A table's first statement reads its columns as it is translated,
+        # which opens the transaction before the pipeline: one first.
+        backend.execute('INSERT INTO tx1915t VALUES (0)')
+        backend.rollback()
+        monkeypatch.setattr(psycopg.Cursor, 'execute', recorded)
+        backend.execute('INSERT INTO tx1915t VALUES (1)')
+        monkeypatch.undo()
+        assert [piped for q, piped in sent if q == 'BEGIN'] == [True]
+        assert backend._conn.info.transaction_status != idle
+        backend.commit()
+        assert not backend._conn.autocommit
+        assert count() == 1
+        backend._conn.commit()
+        # A failing first write keeps its transaction for the next one.
+        with pytest.raises(BackendError):
+            backend.execute('INSERT INTO tx1915t VALUES (1)')
+        backend.execute('INSERT INTO tx1915t VALUES (2)')
+        backend.rollback()
+        assert not backend._conn.autocommit
+        assert count() == 1
+        backend._conn.commit()
+        # One a routine's COMMIT ended is handed back at the next call.
+        backend.execute('INSERT INTO tx1915t VALUES (3)')
+        backend._conn.execute('COMMIT')
+        assert backend._conn.autocommit
+        backend.execute('SELECT 1 FROM dual')
+        assert not backend._conn.autocommit
+        assert count() == 2
+    finally:
+        monkeypatch.undo()
+        backend.rollback()
+        backend.execute('DROP TABLE IF EXISTS tx1915t')
+        backend.close()
+
+
 def test_a_write_after_the_pipeline_keeps_its_transaction() -> None:
     # The pipeline's answer is stale once another statement has run: a REF
     # CURSOR fetch can run a function that writes. Committing on the stale
@@ -5689,6 +5751,9 @@ class _RecordingConn:
 
     def rollback(self) -> None:
         self.calls.append('<rollback>')
+
+    def end_own_transaction(self) -> None:
+        pass  # no transaction begun in a pipeline to end (#1915)
 
 
 class _RecordingPostgresBackend(PostgresBackend):
@@ -10061,6 +10126,8 @@ def _sent_statements(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         # (#1916).
         'SELECT (SELECT count(*)',
         'SELECT NULL',
+        # The BEGIN a statement opens its transaction with (#1915).
+        'BEGIN',
     )
 
     def recorded(cursor: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
