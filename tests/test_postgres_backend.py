@@ -9772,3 +9772,75 @@ def test_the_mirrors_own_setup_is_not_logged_as_ddl() -> None:
         assert after == before
     finally:
         admin.close()
+
+
+def test_a_with_time_zone_column_is_indexed_on_its_instant() -> None:
+    # The Mirror compares a WITH TIME ZONE column by its instant, (col).utc,
+    # which an index on the composite can't serve; Oracle indexes such a column
+    # on SYS_EXTRACT_UTC(col), and the dictionary says so (#1897).
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    try:
+        backend.execute(
+            'CREATE TABLE tz1897t (id NUMBER, tz TIMESTAMP(3) WITH TIME ZONE, '
+            '"Tz2" TIMESTAMP WITH TIME ZONE)'
+        )
+        backend.execute('CREATE INDEX tz1897_a ON tz1897t (tz)')
+        backend.execute('CREATE UNIQUE INDEX tz1897_b ON tz1897t (id, "Tz2" DESC)')
+        defs = admin.execute(
+            'SELECT pg_get_indexdef(indexrelid) FROM pg_index '
+            "WHERE indrelid = 'tz1897t'::regclass ORDER BY indexrelid"
+        ).fetchall()
+        assert [d.split(' USING btree ')[1] for (d,) in defs] == [
+            '(((tz).utc))',
+            '(id, (("Tz2").utc) DESC)',
+        ]
+        with admin.transaction(force_rollback=True):
+            admin.execute('SET LOCAL enable_seqscan = off')
+            plan = admin.execute(
+                "EXPLAIN SELECT id FROM tz1897t WHERE tz > timestamptz '2000-01-01'"
+            ).fetchall()
+        assert any('tz1897_a' in line for (line,) in plan), plan
+        dictionary = {
+            'SELECT index_name, index_type, uniqueness FROM all_indexes '
+            "WHERE table_name = 'TZ1897T' ORDER BY 1": [
+                ('TZ1897_A', 'FUNCTION-BASED NORMAL', 'NONUNIQUE'),
+                ('TZ1897_B', 'FUNCTION-BASED NORMAL', 'UNIQUE'),
+            ],
+            'SELECT index_name, column_name, column_position, descend '
+            "FROM all_ind_columns WHERE table_name = 'TZ1897T' ORDER BY 1, 3": [
+                ('TZ1897_A', 'SYS_NC00004$', 1, 'ASC'),
+                ('TZ1897_B', 'ID', 1, 'ASC'),
+                ('TZ1897_B', 'SYS_NC00005$', 2, 'DESC'),
+            ],
+            'SELECT index_name, column_expression, column_position '
+            "FROM all_ind_expressions WHERE table_name = 'TZ1897T' ORDER BY 1, 3": [
+                ('TZ1897_A', 'SYS_EXTRACT_UTC("TZ")', 1),
+                ('TZ1897_B', 'SYS_EXTRACT_UTC("Tz2")', 2),
+            ],
+        }
+        for query, rows in dictionary.items():
+            assert [tuple(r) for r in backend.execute(query).rows] == rows
+        # A UNIQUE index refuses two values at one instant, as Oracle does.
+        backend.execute(
+            "INSERT INTO tz1897t VALUES (1, NULL, TIMESTAMP '2000-01-01 12:00:00 +00:00')"
+        )
+        with pytest.raises(BackendError) as raised:
+            backend.execute(
+                'INSERT INTO tz1897t VALUES '
+                "(1, NULL, TIMESTAMP '2000-01-01 14:00:00 +02:00')"
+            )
+        assert raised.value.ora_code == 1
+        # Any other index, and an index on another type, stays as written.
+        backend.execute('CREATE INDEX tz1897_c ON tz1897t (id)')
+        (c,) = admin.execute(
+            "SELECT pg_get_indexdef('tz1897_c'::regclass)"
+        ).fetchone() or ('',)
+        assert c.endswith('USING btree (id)')
+    finally:
+        backend.rollback()
+        backend.execute('DROP TABLE IF EXISTS tz1897t')
+        backend.close()
+        admin.close()
