@@ -10764,6 +10764,9 @@ class PostgresBackend:
     # The sessionless transaction a session holds (#1746); none until begun,
     # also on a backend a test builds without __init__.
     _sessionless_id: bytes | None = None
+    # Whether native PostgreSQL SQL is allowed (#1859); off on a backend a
+    # test builds without __init__ too.
+    _native_sql = False
     # This demo speaks the 12.1 WIRE protocol (field version), which is also the
     # release it reports (server_identity). Those were deliberately apart while
     # the wire was 11.2: the dialect reads the RELEASE to pick native
@@ -10791,6 +10794,7 @@ class PostgresBackend:
         translation_report: bool = False,
         auth_conninfo: str | None = None,
         presents: str = '12.1',
+        native_sql: bool = False,
     ) -> None:
         if presents not in _PRESENTABLE:
             raise ValueError(
@@ -10885,6 +10889,11 @@ class PostgresBackend:
         # The SQL dialect a statement with no PG hint is in (#1556): 'oracle',
         # translated, or 'postgres', run as written.
         self._sql_dialect = 'oracle'
+        # Whether a client may run native PostgreSQL SQL at all (#1859): the
+        # operator's choice, off unless the launcher turns it on. Off, a PG
+        # hint is a hint Oracle does not know, and the session's dialect can't
+        # be switched.
+        self._native_sql = native_sql
         # The Oracle object type each PostgreSQL composite oid stands for, with
         # its registered psycopg CompositeInfo -- or None for an oid that is not
         # an object type, so a column of it is looked up once (#1127).
@@ -11878,6 +11887,9 @@ class PostgresBackend:
         # _translate_binds casts (#699).
         switch = _ALTER_SESSION_DIALECT.match(sql)
         if switch is not None:
+            if not self._native_sql:
+                # An ALTER SESSION parameter Oracle does not have (#1859).
+                raise BackendError('invalid option for ALTER SESSION', ora_code=2248)
             self._sql_dialect = switch.group(1).lower()
             return Result()
         priority = _txn_priority_setting(sql)
@@ -12106,7 +12118,10 @@ class PostgresBackend:
         return result
 
     def _is_native(self, sql: str) -> bool:
-        # Whether a statement is PostgreSQL's own, to run untranslated (#1556).
+        # Whether a statement is PostgreSQL's own, to run untranslated (#1556),
+        # where the operator allows that at all (#1859).
+        if not self._native_sql:
+            return False
         return self._sql_dialect == 'postgres' or _PG_HINT.match(sql) is not None
 
     def _execute_native(self, sql: str, binds: Sequence) -> Result:

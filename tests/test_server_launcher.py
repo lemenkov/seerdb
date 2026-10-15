@@ -167,6 +167,37 @@ class _Closable:
         pass
 
 
+def test_native_sql_is_the_operators_choice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Native PostgreSQL SQL is off unless the operator turns it on (#1859):
+    # --native-sql on the command line, native_sql in the config file.
+    pytest.importorskip('psycopg')
+    from seerdb.server.backends import postgres
+
+    seen: list[bool] = []
+
+    class _Recording:
+        def __init__(self, conninfo: str, *, native_sql: bool, **kw: Any) -> None:
+            seen.append(native_sql)
+
+    monkeypatch.setattr(postgres, 'PostgresBackend', _Recording)
+    config = _ini(
+        tmp_path,
+        '[clients]\nScott = tiger\n'
+        '[backend]\ntype = postgres\nconninfo = dbname=mirror\nnative_sql = yes\n',
+    )
+    for argv in (
+        ['postgres', 'dbname=mirror'],
+        ['postgres', 'dbname=mirror', '--native-sql'],
+        ['--config', config],
+    ):
+        launch = build(argv, env=_USERS)
+        assert launch.backend_factory is not None
+        launch.backend_factory()
+    assert seen == [False, True, True]
+
+
 def test_python_dash_m_runs_the_launcher() -> None:
     result = subprocess.run(
         [sys.executable, '-m', 'seerdb.server', '--help'],
