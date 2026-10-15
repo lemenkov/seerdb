@@ -3462,6 +3462,10 @@ def _vector_storage(m: re.Match[str]) -> str:
     return f'{m.group(1)} {storage} CHECK (sys.ora_vector_dims({name}, {count}))'
 
 
+# A column definition's name, after the `(` or `,` it follows: quoted or not
+# (#1876).
+_DDL_COLUMN = r'[(,]\s*(?:"[^"]*"|[A-Za-z_][\w$#]*)'
+
 _DDL_TYPE_REWRITES: list[
     tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]]
 ] = [
@@ -3480,22 +3484,25 @@ _DDL_TYPE_REWRITES: list[
     # kept: it anchors the match to a REF *type*, so a column merely *named* `ref`
     # (ref INTEGER) is left alone. `REF(` (a REF() call) has no space and is not
     # matched.
-    (re.compile(r'\b(\w+)\s+REF\s+(\w+)', re.IGNORECASE), r'\1 \2$ref'),
+    (
+        re.compile(r'("[^"]*"|\b\w+)\s+REF\s+(\w+)', re.IGNORECASE),
+        r'\1 \2$ref',
+    ),
     # ROWID / UROWID column types hold a rowid's text form. Without this the
     # ROWID pseudo-column rewrite reached the column's TYPE and the CREATE
     # failed. A UROWID can hold an index-organized table's logical rowid, which
     # is longer than the 18 characters of a heap one.
     # Anchored to a column definition -- after `(` or `,` -- so a `SELECT ROWID`
     # in CREATE TABLE ... AS SELECT is left to the pseudo-column rewrite.
-    (re.compile(r'([(,]\s*\w+)\s+UROWID\b', re.IGNORECASE), r'\1 varchar(4000)'),
+    (re.compile(rf'({_DDL_COLUMN})\s+UROWID\b', re.IGNORECASE), r'\1 varchar(4000)'),
     # An XMLType -- a column's, an object attribute's, a collection's element
     # type -- is PostgreSQL's xml, which the describe reports back as
     # SYS.XMLTYPE (#1536, #1537). The type name only: one followed by `(` is the
     # SYS.XMLTYPE(...) constructor, which a CREATE TABLE ... AS SELECT may call.
     (re.compile(r'\b(?:SYS\.)?XMLTYPE\b(?!\s*\()', re.IGNORECASE), 'xml'),
-    (re.compile(r'([(,]\s*\w+)\s+ROWID\b', re.IGNORECASE), r'\1 ora_rowid'),
+    (re.compile(rf'({_DDL_COLUMN})\s+ROWID\b', re.IGNORECASE), r'\1 ora_rowid'),
     # A BFILE column holds the two names (#1669).
-    (re.compile(r'([(,]\s*\w+)\s+BFILE\b', re.IGNORECASE), r'\1 ora_bfile'),
+    (re.compile(rf'({_DDL_COLUMN})\s+BFILE\b', re.IGNORECASE), r'\1 ora_bfile'),
     # A column's storage clause, `JSON (c) STORE AS (COMPRESS HIGH)` or `LOB (c)
     # STORE AS [name] (...)` after the column list (#1706): how Oracle stores
     # the column, which PostgreSQL decides itself.
@@ -3510,7 +3517,7 @@ _DDL_TYPE_REWRITES: list[
     ),
     # A JSON column is jsonb (#1706): binary, so it is parsed once, and its
     # equality and indexing are PostgreSQL's.
-    (re.compile(r'([(,]\s*\w+)\s+JSON\b(?!\s*\()', re.IGNORECASE), r'\1 jsonb'),
+    (re.compile(rf'({_DDL_COLUMN})\s+JSON\b(?!\s*\()', re.IGNORECASE), r'\1 jsonb'),
     (re.compile(r'\bLONG\s+RAW\b', re.IGNORECASE), 'bytea'),
     (re.compile(r'\bRAW\s*\(\s*\d+\s*\)', re.IGNORECASE), 'bytea'),
     (re.compile(r'\bRAW\b', re.IGNORECASE), 'bytea'),
@@ -16025,9 +16032,7 @@ class PostgresBackend:
         bind_values = dict(zip(_bind_names(sql), binds))
         for column, value in pairs:
             last = re.split(r'\s*\.\s*', column)[-1]
-            if (
-                last[1:-1] if last.startswith('"') else last.lower()
-            ) not in rowid_columns:
+            if _folded_name(last, contents) not in rowid_columns:
                 continue
             ref = _BIND_REF.fullmatch(value)
             given = bind_values.get(_bind_name(ref)) if ref is not None else None

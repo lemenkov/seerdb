@@ -2394,6 +2394,21 @@ def test_a_rowid_column_type_is_text_and_a_dml_reports_its_rowid() -> None:
     assert 'varchar' not in _translate_ddl('CREATE TABLE t AS SELECT ROWID FROM s')
 
 
+def test_a_quoted_column_name_keeps_its_column_type() -> None:
+    # A quoted column name (#1876): its ROWID, UROWID, BFILE, JSON or REF type
+    # is the column's, as an unquoted name's is, not left to the ROWID
+    # pseudo-column rewrite or as Oracle's spelling, which PostgreSQL refuses.
+    assert _translate_ddl(
+        'CREATE TABLE t (n NUMBER, "Rr" ROWID, "u v" UROWID, "F" BFILE, "J" JSON)'
+    ) == (
+        'CREATE TABLE t (n numeric, "Rr" ora_rowid, "u v" varchar(4000), '
+        '"F" ora_bfile, "J" jsonb)'
+    )
+    assert _translate_ddl('CREATE TABLE t ("Rf" REF person_t)') == (
+        'CREATE TABLE t ("Rf" person_t$ref)'
+    )
+
+
 def test_a_rowid_renders_as_the_client_renders_it() -> None:
     # The backend's sys.ora_rowid and the client's rowid_to_string must agree,
     # or a lastrowid the Mirror reports would never match a SELECT ROWID. The
@@ -4279,6 +4294,34 @@ def test_the_rowid_check_reads_a_quoted_table_name() -> None:
         backend.rollback()
         try:
             backend.execute('DROP TABLE "_rw1868"')
+        except Exception:
+            backend.rollback()
+
+
+def test_the_rowid_check_reads_a_quoted_column_name() -> None:
+    # A quoted ROWID column (#1876) is one the ROWID check (#1624) knows, by
+    # its name rather than its mask: a number put in it is ORA-00932, as an
+    # unquoted column's is.
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE rw1876t (n NUMBER, "Rr" ROWID)')
+        backend.execute('INSERT INTO rw1876t (n) VALUES (:1)', [1])
+        for statement in (
+            'INSERT INTO rw1876t (n, "Rr") VALUES (2, :1)',
+            'UPDATE rw1876t SET "Rr" = :1 WHERE n = 1',
+        ):
+            with pytest.raises(BackendError) as exc:
+                backend.execute(statement, [12345])
+            assert exc.value.ora_code == 932, statement
+        (rowid,) = backend.execute('SELECT ROWID FROM rw1876t').rows[0]
+        backend.execute('UPDATE rw1876t SET "Rr" = :1 WHERE n = 1', [rowid])
+        assert backend.execute('SELECT "Rr" FROM rw1876t').rows == [(rowid,)]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE rw1876t')
         except Exception:
             backend.rollback()
 
