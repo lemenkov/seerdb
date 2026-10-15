@@ -2573,32 +2573,159 @@ def test_a_query_leaves_no_lock_behind() -> None:
 def test_releasing_read_locks_costs_no_round_trip_of_its_own(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Whether a query's transaction has written (#1190) is read in the
-    # pipeline that runs the query (#1869), not asked afterwards. The first
-    # query looks its column type up, so it asks afterwards: the answer the
-    # pipeline read may be stale once anything else has run.
+    # A query with no transaction open runs with none around it (#1916): one
+    # pipeline in autocommit, no BEGIN, no COMMIT, and no question whether it
+    # wrote -- its implicit transaction ends, read locks and all (#1190), at
+    # the pipeline's end. Inside an open transaction a query still reads that
+    # answer in its own pipeline (#1869), and the transaction stays open for
+    # the write in it. A table's first query reads its columns into the schema
+    # model after the pipeline, so it asks again: the table's query is run
+    # once first.
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     backend.execute('SELECT :1 FROM dual', [0])
     sent: list[tuple[str, bool]] = []
+    commits: list[str] = []
     execute = psycopg.Cursor.execute
+    commit = psycopg.Connection.commit
     off = psycopg.pq.PipelineStatus.OFF
+    idle = psycopg.pq.TransactionStatus.IDLE
 
     def recorded(cursor: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
         pipelined = cursor.connection.pgconn.pipeline_status != off
         sent.append((str(query), pipelined))
         return execute(cursor, query, *args, **kwargs)
 
+    def committed(connection: Any) -> None:
+        if connection.pgconn.transaction_status != idle:
+            commits.append('commit')
+        commit(connection)
+
     monkeypatch.setattr(psycopg.Cursor, 'execute', recorded)
+    monkeypatch.setattr(psycopg.Connection, 'commit', committed)
     try:
         for n in range(3):
             backend.execute('SELECT :1 FROM dual', [n])
-        asked = [p for q, p in sent if 'pg_current_xact_id_if_assigned' in q]
-        assert asked == [True] * 3
-        idle = psycopg.pq.TransactionStatus.IDLE
+        assert [q for q, _p in sent if 'pg_current_xact_id_if_assigned' in q] == []
+        assert commits == []
+        assert all(p for _q, p in sent)
         assert backend._conn.info.transaction_status == idle
+        backend.execute('CREATE TABLE rl1916t (n NUMBER)')
+        backend.execute('SELECT n FROM rl1916t')
+        sent.clear()
+        backend.execute('INSERT INTO rl1916t VALUES (1)')
+        backend.execute('SELECT n FROM rl1916t')
+        asked = [p for q, p in sent if 'pg_current_xact_id_if_assigned' in q]
+        assert asked == [True, True]
+        assert backend._conn.info.transaction_status != idle
     finally:
         monkeypatch.undo()
+        backend.rollback()
+        backend.execute('DROP TABLE IF EXISTS rl1916t')
         backend.close()
+
+
+def test_a_query_with_no_transaction_keeps_what_needs_one() -> None:
+    # A query run with no transaction around it (#1916) is only one that
+    # needs none: SELECT ... FOR UPDATE keeps its row locks in a transaction
+    # until the commit, as Oracle's does, and a REF CURSOR a query returns --
+    # from a function or a CURSOR(...) item -- is drained from its portal
+    # before the transaction ends. A query that fails leaves no transaction.
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    idle = psycopg.pq.TransactionStatus.IDLE
+    try:
+        backend.execute('CREATE TABLE ql1916t (n NUMBER)')
+        backend.execute('INSERT INTO ql1916t VALUES (1)')
+        backend.commit()
+        backend.execute('SELECT n FROM ql1916t FOR UPDATE')
+        assert backend._conn.info.transaction_status != idle
+        backend.rollback()
+        backend.execute(
+            'CREATE OR REPLACE FUNCTION ql1916f RETURN SYS_REFCURSOR AS '
+            'c SYS_REFCURSOR; BEGIN OPEN c FOR SELECT 7 AS n FROM dual; '
+            'RETURN c; END;'
+        )
+        (cell,) = backend.execute('SELECT ql1916f() AS c FROM dual').rows[0]
+        assert cell.rows == [(7,)]
+        (cell,) = backend.execute('SELECT CURSOR(SELECT 8 FROM dual) FROM dual').rows[0]
+        assert cell.rows == [(8,)]
+        with pytest.raises(BackendError):
+            backend.execute('SELECT 1 / 0 FROM dual')
+        assert backend._conn.info.transaction_status == idle
+        assert backend.execute('SELECT n FROM ql1916t').rows == [(1,)]
+    finally:
+        backend.rollback()
+        for statement in ('DROP FUNCTION ql1916f', 'DROP TABLE ql1916t'):
+            try:
+                backend.execute(statement)
+            except Exception:
+                backend.rollback()
+        backend.close()
+
+
+def test_a_query_failing_as_it_is_prepared_leaves_no_stale_statement() -> None:
+    # psycopg prepares a statement on its fifth run (#1885). A query with no
+    # transaction open runs in a pipeline of its own (#1916), and one that
+    # failed as psycopg prepared it, first in that pipeline, left psycopg
+    # sure it had a statement the server never kept: the next run was
+    # 'prepared statement "_pg3_0" does not exist' (test_integration's
+    # test_error_then_large_lob_stays_synced). Each run still fails as
+    # itself, and the query between them still works.
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE ps1916t (id NUMBER, c VARCHAR2(10))')
+        backend.execute("INSERT INTO ps1916t VALUES (1, 'x')")
+        backend.commit()
+        for _ in range(8):
+            with pytest.raises(BackendError) as raised:
+                backend.execute('SELECT * FROM ps1916_no_such_table')
+            assert raised.value.ora_code == 942
+            assert backend.execute('SELECT c FROM ps1916t WHERE id = 1').rows == [
+                ('x',)
+            ]
+    finally:
+        backend.rollback()
+        backend.execute('DROP TABLE IF EXISTS ps1916t')
+        backend.close()
+
+
+def test_a_call_right_after_a_commit_keeps_its_savepoint() -> None:
+    # A PL/SQL call's savepoint rides with its first statement (#1875). With
+    # no transaction open that statement may be a query, which must still run
+    # in a transaction for the savepoint (#1916): a SELECT ... INTO :b right
+    # after a commit and an array insert was ORA-00900, "SAVEPOINT can only be
+    # used in transaction blocks", as python-oracledb's test_3405 found.
+    listen, server, result = _start_mirror()
+    conn = _connect(listen.getsockname()[1])
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+        cur.execute('drop table if exists t_call1916')
+        cur.execute('create table t_call1916 (n number)')
+        cur.execute('truncate table t_call1916')
+        cur.executemany('insert into t_call1916 values (:1)', [(4,), (5,)])
+        conn.commit()
+        out = cur.var(seerdb.ROWID)
+        cur.execute(
+            'begin select rowid into :1 from t_call1916 where n = 5; end;', [out]
+        )
+        got = out.getvalue()
+        cur.execute('select rowid from t_call1916 where n = 5')
+        (expected,) = cur.fetchone()
+        cur.execute('drop table t_call1916')
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        server.join(timeout=5)
+        listen.close()
+
+    assert result.get('error') is None, result.get('error')
+    assert got == expected
 
 
 def test_a_write_after_the_pipeline_keeps_its_transaction() -> None:
@@ -9930,6 +10057,10 @@ def _sent_statements(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         'ROLLBACK',
         'SELECT pg_current_xact_id_if_assigned',
         'SELECT sys.ora_ddl_unchanged',
+        # The DDL generation a query with no transaction reads on its own
+        # (#1916).
+        'SELECT (SELECT count(*)',
+        'SELECT NULL',
     )
 
     def recorded(cursor: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
