@@ -9631,6 +9631,134 @@ def test_a_describe_reads_a_tables_columns_in_one_query(
         backend.close()
 
 
+def _sent_statements(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    # Each statement the backend pipelines from here on, but its savepoints,
+    # its guard and its checks.
+    sent: list[str] = []
+    execute = psycopg.Cursor.execute
+    off = psycopg.pq.PipelineStatus.OFF
+    plumbing = (
+        'SAVEPOINT',
+        'RELEASE',
+        'ROLLBACK',
+        'SELECT pg_current_xact_id_if_assigned',
+        'SELECT sys.ora_ddl_unchanged',
+    )
+
+    def recorded(cursor: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
+        text = str(query)
+        if cursor.connection.pgconn.pipeline_status != off and not text.startswith(
+            plumbing
+        ):
+            sent.append(text)
+        return execute(cursor, query, *args, **kwargs)
+
+    monkeypatch.setattr(psycopg.Cursor, 'execute', recorded)
+    return sent
+
+
+def test_an_nvl_of_a_not_null_column_is_the_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # NVL(column, x) on a NOT NULL column always answers the column, and the
+    # bare column is what an index serves (#1889). Each query answers as the
+    # emulation as written does, for every row.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    queries = {
+        "SELECT id FROM nv1889t WHERE NVL(name, 'x') = 'b' ORDER BY id": (
+            "SELECT id FROM nv1889t WHERE name = 'b' ORDER BY id"
+        ),
+        'SELECT id FROM nv1889t t WHERE NVL(t.id, 0) > :1 ORDER BY id': (
+            'SELECT id FROM nv1889t t WHERE t.id > %(b1)s ORDER BY id'
+        ),
+        'UPDATE nv1889t SET opt = \'u\' WHERE NVL("low", :1) = :2': (
+            'UPDATE nv1889t SET opt = \'u\' WHERE "low" = %(b2)s'
+        ),
+    }
+    try:
+        backend.execute(
+            'CREATE TABLE nv1889t (id NUMBER NOT NULL, name VARCHAR2(9) NOT NULL, '
+            '"low" VARCHAR2(9) NOT NULL, opt VARCHAR2(9))'
+        )
+        backend.execute(
+            "INSERT INTO nv1889t SELECT level, chr(96 + level), 'l' || level, "
+            "CASE WHEN mod(level, 2) = 0 THEN 'o' END FROM dual CONNECT BY level <= 4"
+        )
+        backend.commit()
+        sent = _sent_statements(monkeypatch)
+        for query, rewritten in queries.items():
+            sent.clear()
+            binds = ['z', 'l2'] if ':2' in query else [1] if ':1' in query else []
+            got = backend.execute(query, binds)
+            assert sent[0].split(' RETURNING ')[0] == rewritten
+            monkeypatch.undo()
+            backend.rollback()  # its row locks, which the check below would wait on
+            # The emulation as written, NVL as COALESCE.
+            written = query.replace('NVL(', 'COALESCE(').replace(':1', '%(b1)s')
+            written = written.replace(':2', '%(b2)s')
+            params = {'b1': binds[0], 'b2': binds[1]} if len(binds) == 2 else {}
+            if len(binds) == 1:
+                params = {'b1': binds[0]}
+            with admin.transaction(force_rollback=True):
+                expected = admin.execute(written, params)
+                if expected.description is None:
+                    assert got.rowcount == expected.rowcount
+                else:
+                    assert [list(r) for r in got.rows] == [
+                        list(r) for r in expected.fetchall()
+                    ]
+            sent = _sent_statements(monkeypatch)
+        # A column that may be NULL keeps its NVL; so does one of a table
+        # that an outer join or a subquery may make NULL, and a CHAR, which
+        # compares blank-padded.
+        for kept in (
+            "SELECT id FROM nv1889t WHERE NVL(opt, 'x') = 'x'",
+            'SELECT a.id FROM nv1889t a LEFT JOIN nv1889t b ON b.opt = a.name '
+            'WHERE NVL(b.id, 0) = 0',
+            'SELECT id FROM nv1889t WHERE id IN (SELECT id FROM nv1889t) '
+            'AND NVL(id, 0) = 1',
+        ):
+            sent.clear()
+            backend.execute(kept)
+            assert 'COALESCE(' in sent[0]
+    finally:
+        monkeypatch.undo()
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE nv1889t')
+        except Exception:
+            backend.rollback()
+        backend.close()
+        admin.close()
+
+
+def test_another_sessions_ddl_undoes_an_nvl_rewrite_in_time() -> None:
+    # The NOT NULL an NVL was cut on (#1889) may be gone by the time the
+    # statement runs, and a NULL row with it: a guard in the same pipeline
+    # sees the other session's DDL, and the statement runs as written.
+    reader = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    other = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    query = "SELECT id FROM ng1889t WHERE NVL(name, 'none') = 'none'"
+    try:
+        reader.execute('CREATE TABLE ng1889t (id NUMBER, name VARCHAR2(9) NOT NULL)')
+        reader.execute("INSERT INTO ng1889t VALUES (1, 'a')")
+        reader.commit()
+        assert reader.execute(query).rows == []
+        other.execute('ALTER TABLE ng1889t MODIFY (name NULL)')
+        other.execute('INSERT INTO ng1889t VALUES (2, NULL)')
+        other.commit()
+        assert [list(r) for r in reader.execute(query).rows or []] == [[2]]
+    finally:
+        reader.rollback()
+        try:
+            reader.execute('DROP TABLE ng1889t')
+        except Exception:
+            reader.rollback()
+        reader.close()
+        other.close()
+
+
 def test_the_mirrors_own_setup_is_not_logged_as_ddl() -> None:
     # Every connect runs the Mirror's setup DDL again; logged, it would make
     # every session forget its schema knowledge at every connect (#1887).
