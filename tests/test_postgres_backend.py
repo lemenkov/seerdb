@@ -10225,6 +10225,50 @@ def test_the_column_readers_share_the_schema_model(
         backend.close()
 
 
+def test_a_ddl_prunes_its_records_and_rereads_the_schema_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # After a DDL (#1918): the records of the columns and types it took away
+    # are pruned in one round trip, not one per catalog, and the statement
+    # after it reads the schema-wide facts -- collection names, RAW columns,
+    # SQL domains -- in one query, not one each.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    sent: list[str] = []
+    execute = psycopg.Cursor.execute
+
+    def recorded(cursor: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
+        sent.append(str(query))
+        return execute(cursor, query, *args, **kwargs)
+
+    try:
+        backend.execute('CREATE TABLE pr1918t (r RAW(4), n NVARCHAR2(5))')
+        (relid,) = _fetched_row(
+            backend._conn.execute("SELECT to_regclass('pr1918t')::oid")
+        )
+        backend._conn.commit()
+        monkeypatch.setattr(psycopg.Cursor, 'execute', recorded)
+        backend.execute('DROP TABLE pr1918t')
+        prunes = [q for q in sent if 'WHERE NOT EXISTS' in q and 'DELETE' in q]
+        assert len(prunes) == 1
+        assert prunes[0].count('DELETE FROM sys.ora_') == 3
+        sent.clear()
+        backend.execute('SELECT 1 FROM dual')
+        monkeypatch.undo()
+        facts = [q for q in sent if "data_type = 'RAW'" in q or 'typcategory' in q]
+        assert len(facts) == 1, facts
+        (left,) = _fetched_row(
+            backend._conn.execute(
+                'SELECT count(*) FROM sys.ora_columns WHERE relid = %s', (relid,)
+            )
+        )
+        assert left == 0
+    finally:
+        monkeypatch.undo()
+        backend.rollback()
+        backend.execute('DROP TABLE IF EXISTS pr1918t')
+        backend.close()
+
+
 def test_a_connect_to_an_installed_database_installs_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
