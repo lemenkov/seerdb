@@ -10237,6 +10237,8 @@ class _CountedConnection(psycopg.Connection[Any]):
         super().rollback()
 
 
+# The SQLSTATE sys.ora_ddl_unchanged raises (#1889).
+_SCHEMA_CHANGED = 'SDB01'
 # Every DDL committed in the database adds a row to sys.ora_ddl_log, so that a
 # session can tell its cached knowledge of the schema is stale when ANOTHER
 # session changed it (#1887). A row per DDL rather than a counter in one row:
@@ -10258,6 +10260,17 @@ _DDL_LOG_DDL = (
     'DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_event_trigger '
     "WHERE evtname = 'ora_ddl_log') THEN CREATE EVENT TRIGGER ora_ddl_log "
     'ON ddl_command_end EXECUTE FUNCTION sys.ora_ddl_logged(); END IF; END $$;'
+)
+# A statement rewritten from the schema runs behind this (#1889): it fails when
+# the generation is no longer the one the rewrite was made at. Installed on its
+# own, as a session whose role cannot replace the trigger's function still
+# reads the log.
+_DDL_GUARD_DDL = (
+    'CREATE OR REPLACE FUNCTION sys.ora_ddl_unchanged(seen text) RETURNS void '
+    'LANGUAGE plpgsql SET search_path = pg_catalog AS $$ BEGIN '
+    "IF (SELECT count(*) || ':' || coalesce(max(id), 0) FROM sys.ora_ddl_log) "
+    "IS DISTINCT FROM seen THEN RAISE EXCEPTION 'the schema changed' "
+    f"USING ERRCODE = '{_SCHEMA_CHANGED}'; END IF; END $$;"
 )
 # Past this many rows the log is cut back to its last, at a connect; every
 # session then reloads its schema knowledge once.
@@ -10357,8 +10370,133 @@ class _AccountStore:
             )
 
 
+# A column's own value stands for NVL(column, x) only where the two compare
+# alike: not a CHAR, which compares blank-padded where COALESCE's text would
+# not, nor a domain (#1889).
+_NVL_DROPPABLE_OIDS = frozenset(
+    _NUMBER_OIDS | _BINARY_FLOAT_OIDS.keys() | _TEMPORAL_OIDS.keys() | {25, 1043}
+)
+_SQL_NAME = r'(?:"[^"]*"|[A-Za-z_][\w$#]*)'
+# A FROM / UPDATE naming one table, optionally aliased (#1889).
+_ONE_TABLE = re.compile(
+    rf'\s*({_SQL_NAME}(?:\s*\.\s*{_SQL_NAME})?)(?:\s+(?:AS\s+)?({_SQL_NAME}))?\s*',
+    re.IGNORECASE,
+)
+_COALESCE_CALL = re.compile(r'(?<![\w$#."])COALESCE\s*\(', re.IGNORECASE)
+_COLUMN_REFERENCE = re.compile(rf'\s*(?:({_SQL_NAME})\s*\.\s*)?({_SQL_NAME})\s*')
+# Any of these at the top level makes a statement more than one table's.
+_NOT_ONE_TABLE = frozenset(
+    {
+        'JOIN',
+        'UNION',
+        'INTERSECT',
+        'MINUS',
+        'EXCEPT',
+        'CONNECT',
+        'START',
+        'WITH',
+        'LATERAL',
+        'PIVOT',
+        'UNPIVOT',
+        'MODEL',
+        'MATCH_RECOGNIZE',
+    }
+)
+# The words that end a WHERE clause.
+_AFTER_WHERE = frozenset(
+    {'GROUP', 'HAVING', 'ORDER', 'FOR', 'RETURNING', 'FETCH', 'OFFSET', 'LIMIT'}
+)
+
+
+def _folded_name(name: str, contents: Sequence[str]) -> str:
+    # A masked identifier as PostgreSQL resolves it: a quoted one as written,
+    # any other folded to lower case.
+    if name.startswith('"'):
+        return _unmask_quoted(name, list(contents))[1:-1]
+    return name.lower()
+
+
+def _dead_nvl_candidates(
+    sql: str,
+) -> (
+    tuple[
+        str,
+        tuple[str, ...],
+        str,
+        set[str],
+        list[tuple[int, int, str, str | None, str]],
+    ]
+    | None
+):
+    # For a statement over one table with no subquery (#1889): the statement
+    # masked (_masked_quoted) and its masked contents, the table as written,
+    # the names its columns may be qualified by, and each COALESCE call in its
+    # WHERE clause whose first argument is a column -- the call's span in the
+    # masked text, the column as masked, its qualifier and its name, both
+    # folded. None for any other statement.
+    if 'coalesce' not in sql.lower():
+        return None
+    (masked, contents) = _masked_quoted(sql)
+    (words, _rownums) = _top_level_words(masked)
+    if not words or words[0][1] not in ('SELECT', 'UPDATE', 'DELETE'):
+        return None
+    kinds = [word for _at, word in words]
+    selects = len(re.findall(r'(?i)\bSELECT\b', masked))
+    if (
+        _NOT_ONE_TABLE.intersection(kinds)
+        or selects != (kinds[0] == 'SELECT')
+        or re.search(r'\(\s*\+\s*\)', masked)
+        or kinds.count('WHERE') != 1
+    ):
+        return None
+    where = words[kinds.index('WHERE')][0]
+    head = 'SET' if kinds[0] == 'UPDATE' else 'FROM'
+    if kinds.count(head) != 1:
+        return None
+    at = words[kinds.index(head)][0]
+    table_text = (
+        masked[words[0][0] + len('UPDATE') : at]
+        if head == 'SET'
+        else masked[at + len(head) : where]
+    )
+    if head == 'SET' and at > where or not (one := _ONE_TABLE.fullmatch(table_text)):
+        return None
+    table = _unmask_quoted(one.group(1), list(contents))
+    qualifier = one.group(2) or re.split(r'\s*\.\s*', one.group(1))[-1]
+    end = next(
+        (at for at, word in words if at > where and word in _AFTER_WHERE), len(masked)
+    )
+    calls: list[tuple[int, int, str, str | None, str]] = []
+    for call in _COALESCE_CALL.finditer(masked, where, end):
+        if calls and call.start() < calls[-1][1]:
+            continue
+        opening = call.end() - 1
+        closing = _matching_paren(masked, opening)
+        items = _top_level_items(masked, opening + 1, closing)
+        if closing >= len(masked) or len(items) < 2:
+            continue
+        reference = _COLUMN_REFERENCE.fullmatch(masked, *items[0])
+        if reference is None:
+            continue
+        calls.append(
+            (
+                call.start(),
+                closing + 1,
+                masked[items[0][0] : items[0][1]].strip(),
+                None
+                if reference.group(1) is None
+                else _folded_name(reference.group(1), contents),
+                _folded_name(reference.group(2), contents),
+            )
+        )
+    if not calls:
+        return None
+    return (masked, contents, table, {_folded_name(qualifier, contents)}, calls)
+
+
 class _TableColumn(NamedTuple):
     # A table column as the schema model knows it (#1887).
+    name: str
     type_oid: int  # its declared type: a domain, where a result reports the base
     not_null: bool
     quoted: bool  # created with a quoted all-lower-case name (#1204)
@@ -10831,19 +10969,29 @@ class PostgresBackend:
         self._raw_constructor_cache: dict[str, frozenset[int]] | None = None
         self._any_invisible: bool | None = None
         self._visible_cache: dict[str, list[str] | None] = {}
-        # The DDL generation this session last saw, None before the first;
-        # None for good where the log could not be installed (#1887).
+        # The DDL generation this session last saw, from its connect on; None
+        # for good where the log could not be installed (#1887).
         self._ddl_generation: str | None = None
+        # Each table name a statement names, as its relation's oid -- None for
+        # no relation -- for the schema model (#1889); any DDL starts it over.
+        self._relids: dict[str, int | None] = {}
+        self._has_ddl_guard = False
         self._has_ddl_log = self._install_ddl_log()
         self._conn.execute("SET seerdb.installing = 'off'")
         self._conn.commit()
 
     def _install_ddl_log(self) -> bool:
-        # The DDL log and its event trigger (#1887), cut back when it has grown;
+        # The DDL log and its event trigger (#1887), cut back when it has grown,
+        # and the guard of a statement rewritten from the schema (#1889);
         # whether the log is there to read.
         try:
             with self._conn.transaction():
                 self._conn.execute(_DDL_LOG_DDL)
+        except psycopg.Error:
+            self._conn.rollback()
+        try:
+            with self._conn.transaction():
+                self._conn.execute(_DDL_GUARD_DDL)
         except psycopg.Error:
             self._conn.rollback()
         try:
@@ -10855,6 +11003,12 @@ class PostgresBackend:
                     self._conn.execute(
                         'DELETE FROM sys.ora_ddl_log WHERE id < %s', (row[1],)
                     )
+                row = self._conn.execute('SELECT ' + _DDL_GENERATION).fetchone()
+                self._ddl_generation = None if row is None else row[0]
+                row = self._conn.execute(
+                    "SELECT to_regprocedure('sys.ora_ddl_unchanged(text)') IS NOT NULL"
+                ).fetchone()
+                self._has_ddl_guard = bool(row and row[0])
                 row = self._conn.execute(
                     "SELECT EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = 'ora_ddl_log')"
                 ).fetchone()
@@ -10871,6 +11025,7 @@ class PostgresBackend:
         self._collection_types.clear()
         self._array_oids.clear()
         self._relations.clear()
+        self._relids.clear()
         self._has_sql_domains_cache = None
         self._sql_domain_cache.clear()
         self._plsql_types.clear()
@@ -11526,8 +11681,22 @@ class PostgresBackend:
         # so the hot SELECT/DML path (single-command) is where the round-trips count.
         # A block with local functions is several commands too (#1322).
         hoisted = sql.startswith(_HOISTED_FUNCTION)
+        # A NOT NULL column's NVL cut to the column (#1889), behind a guard that
+        # the schema it was read from is still the database's.
+        fallback = None
+        if (
+            self._use_pipeline
+            and not is_ddl
+            and not hoisted
+            and self._has_ddl_log
+            and self._has_ddl_guard
+            and self._ddl_generation is not None
+        ):
+            rewritten = _ruled('not-null-nvl', self._without_dead_nvl(sql), sql)
+            if rewritten != sql:
+                (fallback, sql) = (sql, rewritten)
         if self._use_pipeline and not is_ddl and not hoisted:
-            result = self._execute_pipelined(sql, params, original)
+            result = self._execute_pipelined(sql, params, original, fallback)
         elif is_ddl:
             try:
                 result = self._execute_sequential(
@@ -11543,6 +11712,16 @@ class PostgresBackend:
         # DDL auto-commits (Oracle semantics): persist it — and any pending DML —
         # so a later rollback discards only DML, not the table (#532).
         if is_ddl:
+            if (
+                self._has_ddl_log
+                and self._conn.info.transaction_status
+                != psycopg.pq.TransactionStatus.INERROR
+            ):
+                # The generation this DDL made, read before its commit, which
+                # its own log row is in: the next statement's guard does not
+                # take it for another session's DDL (#1889).
+                row = self._conn.execute('SELECT ' + _DDL_GENERATION).fetchone()
+                self._ddl_generation = None if row is None else row[0]
             self._conn.commit()
             self._user_savepoint = False
             self._record_quoted_names(original)
@@ -11550,6 +11729,8 @@ class PostgresBackend:
             self._record_visibility(visibility)
             self._record_column_types(original)
             self._record_annotations(annotated)
+            self._relations.clear()
+            self._relids.clear()
             self._collection_name_cache = None  # a type may have come or gone
             self._package_function_cache = None  # and a package
             self._plsql_types.clear()
@@ -12869,7 +13050,7 @@ class PostgresBackend:
                 'ON p.relid = a.attrelid AND p.attnum = a.attnum'
             )
         found = self._conn.execute(
-            'SELECT a.attrelid, a.attnum, a.atttypid, a.attnotnull, '
+            'SELECT a.attrelid, a.attnum, a.attname, a.atttypid, a.attnotnull, '
             f'{quoted}, EXISTS (SELECT 1 FROM pg_constraint c '
             "WHERE c.contype = 'c' AND c.conrelid = a.attrelid "
             'AND c.conkey = ARRAY[a.attnum] '
@@ -12881,15 +13062,54 @@ class PostgresBackend:
         for relid in relids:
             self._relations[relid] = {}
         for row in found:
-            declared_type = None if row[6] is None else tuple(row[6:10])
+            declared_type = None if row[7] is None else tuple(row[7:11])
             self._relations[row[0]][row[1]] = _TableColumn(
-                type_oid=row[2],
-                not_null=row[3],
-                quoted=row[4],
-                json=row[5],
+                name=row[2],
+                type_oid=row[3],
+                not_null=row[4],
+                quoted=row[5],
+                json=row[6],
                 declared=declared_type,
-                tstz_precision=row[10],
+                tstz_precision=row[11],
             )
+
+    def _relation_columns(self, name: str) -> dict[int, _TableColumn] | None:
+        # The schema model's columns of the relation a statement names, as
+        # PostgreSQL resolves `name` (#1889); None for no relation.
+        if name not in self._relids:
+            row = self._conn.execute('SELECT to_regclass(%s)::oid', (name,)).fetchone()
+            self._relids[name] = None if row is None or row[0] is None else row[0]
+        relid = self._relids[name]
+        if relid is None:
+            return None
+        if relid not in self._relations:
+            self._read_relations({relid})
+        return self._relations[relid]
+
+    def _without_dead_nvl(self, sql: str) -> str:
+        # `sql` with each NVL / COALESCE in its WHERE clause whose first
+        # argument is a NOT NULL column of its one table cut to the column
+        # (#1889): the call always answers the column there, and PostgreSQL
+        # can use the column's index for the bare column only. Oracle's own
+        # optimizer drops these calls too. Only a single-table statement, where
+        # every column is that table's and no outer join can make one NULL.
+        found = _dead_nvl_candidates(sql)
+        if found is None:
+            return sql
+        (masked, contents, table, qualifiers, calls) = found
+        columns = self._relation_columns(table)
+        if not columns:
+            return sql
+        not_null = {
+            column.name
+            for column in columns.values()
+            if column.not_null and column.type_oid in _NVL_DROPPABLE_OIDS
+        }
+        out = masked
+        for start, end, column, qualifier, name in reversed(calls):
+            if name in not_null and (qualifier is None or qualifier in qualifiers):
+                out = out[:start] + column + out[end:]
+        return sql if out == masked else _unmask_quoted(out, list(contents))
 
     def _build_result(self, cursor, sql: str = '', original: str = '') -> Result:
         # Turn an executed statement's cursor into a Result: a row count for a
@@ -14400,7 +14620,11 @@ class PostgresBackend:
         return result
 
     def _execute_pipelined(
-        self, sql: str, params: dict | None, original: str | None = None
+        self,
+        sql: str,
+        params: dict | None,
+        original: str | None = None,
+        fallback: str | None = None,
     ) -> Result:
         # SAVEPOINT + statement + RELEASE shipped in ONE round-trip via a psycopg
         # pipeline. Each command uses its own cursor so the statement's cursor keeps
@@ -14408,7 +14632,12 @@ class PostgresBackend:
         # a shared cursor would only retain the last command's (RELEASE) result.
         # The transaction id check rides along too, for releasing the read
         # locks of a query (#1190) without a round trip of its own (#1869).
+        # A statement rewritten from the schema runs behind a guard that the
+        # schema is still the one it was read at; when another session's DDL
+        # came first, it runs as `fallback`, its text before the rewrite
+        # (#1889).
         savepoint = self._conn.cursor()
+        guard = self._conn.cursor()
         statement = self._conn.cursor()
         release = self._conn.cursor()
         written = self._conn.cursor()
@@ -14416,6 +14645,10 @@ class PostgresBackend:
         try:
             with self._conn.pipeline():
                 savepoint.execute('SAVEPOINT _mirror_stmt')
+                if fallback is not None:
+                    guard.execute(
+                        'SELECT sys.ora_ddl_unchanged(%s)', (self._ddl_generation,)
+                    )
                 statement.execute(sql, params)
                 release.execute('RELEASE SAVEPOINT _mirror_stmt')
                 written.execute(
@@ -14430,6 +14663,8 @@ class PostgresBackend:
             # error, never a desync.
             self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_stmt')
             self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
+            if fallback is not None and exc.sqlstate == _SCHEMA_CHANGED:
+                return self._execute_pipelined(fallback, params, original)
             raise _backend_error(exc, original=original, translated=sql) from exc
         row = written.fetchone()
         self._conn.unwritten_at = (
