@@ -9893,3 +9893,45 @@ def test_a_character_column_compares_byte_by_byte() -> None:
         backend.execute('DROP TABLE IF EXISTS co1896t')
         backend.close()
         admin.close()
+
+
+def test_a_repeated_write_reads_no_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An INSERT ... VALUES or an UPDATE ... SET checks the table's ROWID
+    # columns (#1624) from the schema model (#1884): a repeat sends PostgreSQL
+    # nothing but the statement, and a number into a ROWID column is still
+    # ORA-00932.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    sent: list[str] = []
+    execute = psycopg.Cursor.execute
+    off = psycopg.pq.PipelineStatus.OFF
+
+    def recorded(cursor: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
+        text = str(query)
+        if cursor.connection.pgconn.pipeline_status == off and (
+            'pg_current_xact_id_if_assigned' not in text
+        ):
+            sent.append(text)
+        return execute(cursor, query, *args, **kwargs)
+
+    writes = [
+        ('INSERT INTO rw1884t (n, s) VALUES (:1, :2)', [1, 'x']),
+        ('UPDATE rw1884t SET s = :1 WHERE n = :2', ['y', 1]),
+    ]
+    try:
+        backend.execute('CREATE TABLE rw1884t (n NUMBER, r ROWID, s VARCHAR2(30))')
+        for sql, binds in writes:
+            backend.execute(sql, binds)
+        monkeypatch.setattr(psycopg.Cursor, 'execute', recorded)
+        for sql, binds in writes:
+            backend.execute(sql, binds)
+        assert sent == []
+        with pytest.raises(BackendError) as raised:
+            backend.execute('UPDATE rw1884t SET r = :1 WHERE n = 1', [12345])
+        assert raised.value.ora_code == 932
+    finally:
+        monkeypatch.undo()
+        backend.rollback()
+        backend.execute('DROP TABLE IF EXISTS rw1884t')
+        backend.close()
