@@ -10769,7 +10769,7 @@ class PostgresBackend:
         # the session (#1704), so the shared dictionary serves either release.
         # In the same statement: whether the database's installation is this
         # seerdb's (#1871), which a connect then leaves alone.
-        setup = self._conn.execute(
+        setup = self._at_once(
             "SELECT set_config('seerdb.release', %s, false), "
             "set_config('seerdb.banner', %s, false), "
             "set_config('seerdb.compatibility', %s, false), "
@@ -10794,8 +10794,7 @@ class PostgresBackend:
         # not another session's change (#1887).
         self._install_failures: list[str] = []
         if not installed:
-            self._conn.execute("SET seerdb.installing = 'on'")
-        self._conn.commit()
+            self._at_once("SET seerdb.installing = 'on'")
         # What a twin of this backend is built from: a sessionless suspend
         # takes a fresh connection, set up as this one was, from it (#1746).
         self._twin: Callable[[], PostgresBackend] = lambda: type(self)(
@@ -10963,7 +10962,7 @@ class PostgresBackend:
         # schemas share, so this ordering changes nothing else: user objects
         # still resolve first through the schema ahead of both, and the rest of
         # orafce is still reached through `oracle` (#818).
-        self._conn.execute(
+        self._at_once(
             f'SET search_path TO {_SEARCH_PATH_TAIL}; {_ORAFCE_SESSION_SETTINGS}'
         )
         # The composite that backs TIMESTAMP WITH TIME ZONE, registered so its
@@ -11272,20 +11271,18 @@ class PostgresBackend:
                     self._conn.rollback()
                     self._install_failures.append(part)
         try:
-            with self._conn.transaction():
-                row = self._conn.execute(
-                    'SELECT count(*), max(id), '
-                    + _DDL_GENERATION
-                    + ' FROM sys.ora_ddl_log'
-                ).fetchone()
-                if row is not None and row[0] > _DDL_LOG_KEPT:
+            row = self._at_once(
+                'SELECT count(*), max(id), ' + _DDL_GENERATION + ' FROM sys.ora_ddl_log'
+            ).fetchone()
+            if row is not None and row[0] > _DDL_LOG_KEPT:
+                with self._conn.transaction():
                     self._conn.execute(
                         'DELETE FROM sys.ora_ddl_log WHERE id < %s', (row[1],)
                     )
                     row = self._conn.execute(
                         'SELECT 0, 0, ' + _DDL_GENERATION
                     ).fetchone()
-                self._ddl_generation = None if row is None else row[2]
+            self._ddl_generation = None if row is None else row[2]
         except psycopg.Error:
             self._conn.rollback()
 
@@ -11331,6 +11328,25 @@ class PostgresBackend:
             self._conn.execute(_ORACLE_DICTIONARY_DDL)
         self._conn.execute(f"COMMENT ON SCHEMA sys IS '{_DICTIONARY_STAMP}'")
 
+    def _at_once(
+        self, statement: str | sql.SQL | sql.Composed, params: Sequence | None = None
+    ) -> psycopg.Cursor:
+        # Run `statement` committed at once, as a login's settings are: a
+        # setting made in a transaction that rolls back is undone with it, and
+        # Oracle's is not. With no transaction open it runs in autocommit, one
+        # round trip with no BEGIN or COMMIT around it (#1914); inside one, it
+        # commits that transaction, as before. Several statements, joined by
+        # `;` and given no parameters, are one round trip together.
+        if self._conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+            cursor = self._conn.execute(statement, params)
+            self._conn.commit()
+            return cursor
+        self._conn.autocommit = True
+        try:
+            return self._conn.execute(statement, params)
+        finally:
+            self._conn.autocommit = False
+
     def set_client_identity(self, identity: dict[str, str]) -> None:
         # program / machine / terminal / osuser, as the client declared them in
         # its first login message; recorded for v$session (#1212).
@@ -11352,12 +11368,9 @@ class PostgresBackend:
         service = connect_attrs.get('service_name')
         if service:
             try:
-                self._conn.execute(
+                self._at_once(
                     "SELECT set_config('seerdb.service_name', %s, false)", (service,)
                 )
-                # A setting made in a transaction that rolls back is undone with
-                # it, and nothing has run yet for this session to keep open.
-                self._conn.commit()
             except psycopg.Error:
                 self._conn.rollback()
 
@@ -11371,20 +11384,23 @@ class PostgresBackend:
         if login is None:
             return
         user = target.upper() if target else login
-        try:
-            self._conn.execute(
-                "SELECT set_config('seerdb.session_user', %s, false), "
-                "set_config('seerdb.proxy_user', %s, false)",
-                (user, login if target else ''),
-            )
-            if target:
-                self._conn.execute(
+        statement = sql.SQL(
+            "SELECT set_config('seerdb.session_user', {}, false), "
+            "set_config('seerdb.proxy_user', {}, false)"
+        ).format(sql.Literal(user), sql.Literal(login if target else ''))
+        if target:
+            statement = sql.SQL('; ').join(
+                [
+                    statement,
                     sql.SQL('SET search_path TO {}, ' + _SEARCH_PATH_TAIL).format(
                         sql.Identifier(target.lower())
-                    )
-                )
+                    ),
+                ]
+            )
+        try:
+            self._at_once(statement)
+            if target:
                 self._login_user = user
-            self._conn.commit()
         except psycopg.Error:
             self._conn.rollback()
 
@@ -11393,31 +11409,41 @@ class PostgresBackend:
         # ended. Best effort: a login must not fail over its v$session row.
         identity = getattr(self, '_client_identity', {})
         program = identity.get('program')
-        try:
-            if program:
-                self._conn.execute(
-                    "SELECT set_config('application_name', %s, false)", (program[:63],)
+        statements: list[sql.Composable] = []
+        if program:
+            statements.append(
+                sql.SQL("SELECT set_config('application_name', {}, false)").format(
+                    sql.Literal(program[:63])
                 )
-            self._conn.execute(
+            )
+        statements += [
+            sql.SQL(
                 'DELETE FROM sys.ora_sessions WHERE pid NOT IN '
                 '(SELECT pid FROM pg_stat_activity)'
-            )
-            self._conn.execute(
-                'INSERT INTO sys.ora_sessions VALUES (pg_backend_pid(), %s, %s, %s, %s, %s, %s) '
+            ),
+            sql.SQL(
+                'INSERT INTO sys.ora_sessions VALUES (pg_backend_pid(), {}) '
                 'ON CONFLICT (pid) DO UPDATE SET username = excluded.username, '
                 'program = excluded.program, machine = excluded.machine, '
                 'terminal = excluded.terminal, osuser = excluded.osuser, '
-                'driver = excluded.driver',
-                (
-                    getattr(self, '_login_user', None),
-                    program,
-                    identity.get('machine'),
-                    identity.get('terminal'),
-                    identity.get('osuser'),
-                    getattr(self, '_client_driver', None),
-                ),
-            )
-            self._conn.commit()
+                'driver = excluded.driver'
+            ).format(
+                sql.SQL(', ').join(
+                    sql.Literal(value)
+                    for value in (
+                        getattr(self, '_login_user', None),
+                        program,
+                        identity.get('machine'),
+                        identity.get('terminal'),
+                        identity.get('osuser'),
+                        getattr(self, '_client_driver', None),
+                    )
+                )
+            ),
+        ]
+        try:
+            # One round trip (#1914): the statements, run as one.
+            self._at_once(sql.SQL('; ').join(statements))
         except psycopg.Error:
             self._conn.rollback()
 
@@ -11433,11 +11459,10 @@ class PostgresBackend:
         # The last login hook to run, so the session is recorded for v$session
         # here, with everything the client declared by now.
         self._record_session()
-        row = self._conn.execute(
+        row = self._at_once(
             'SELECT pg_backend_pid(), sys.ora_serial(pg_backend_pid()), '
             'upper(current_database())'
         ).fetchone()
-        self._conn.commit()
         if row is None:
             return SessionInfo()
         (pid, serial, name) = row
@@ -11456,33 +11481,31 @@ class PostgresBackend:
             # without one its objects went to `public` and the dictionary named
             # their owner PUBLIC. A CREATE USER account has one already; another
             # session may be creating this one at the same moment.
+            schema = sql.Identifier(username.lower())
             try:
-                self._conn.execute(
-                    sql.SQL('CREATE SCHEMA IF NOT EXISTS {}').format(
-                        sql.Identifier(username.lower())
-                    )
-                )
-                self._conn.commit()
+                self._at_once(sql.SQL('CREATE SCHEMA IF NOT EXISTS {}').format(schema))
             except psycopg.Error:
                 self._conn.rollback()
             # An Oracle session's current schema starts as the login user's, so
             # an unqualified name resolves there first (#1188) -- the path ALTER
             # SESSION SET CURRENT_SCHEMA builds. PostgreSQL skips a schema that
             # does not exist, so a user without one resolves as before. Committed
-            # at once: a SET inside a transaction that rolls back is undone.
-            self._conn.execute(
-                sql.SQL('SET search_path TO {}, ' + _SEARCH_PATH_TAIL).format(
-                    sql.Identifier(username.lower())
+            # at once: a SET inside a transaction that rolls back is undone. The
+            # session's user from the login on (#1621: what it may see), as a
+            # proxy login then changes it (#1620). One round trip (#1914).
+            self._at_once(
+                sql.SQL('; ').join(
+                    [
+                        sql.SQL('SET search_path TO {}, ' + _SEARCH_PATH_TAIL).format(
+                            schema
+                        ),
+                        sql.SQL(_ORAFCE_SESSION_SETTINGS),
+                        sql.SQL(
+                            "SELECT set_config('seerdb.session_user', {}, false)"
+                        ).format(sql.Literal(username.upper())),
+                    ]
                 )
             )
-            self._conn.execute(_ORAFCE_SESSION_SETTINGS)
-            # The session's user from the login on (#1621: what it may see), as
-            # a proxy login then changes it (#1620).
-            self._conn.execute(
-                "SELECT set_config('seerdb.session_user', %s, false)",
-                (username.upper(),),
-            )
-            self._conn.commit()
         return secret
 
     @property
@@ -16427,9 +16450,7 @@ class PostgresBackend:
             if rest is None:
                 return
             statement = rest
-        with self._conn.cursor() as cur:
-            cur.execute(_translate_admin(statement))
-        self._conn.commit()
+        self._at_once(_translate_admin(statement))
 
     def txn_priority(self) -> str:
         """The session's transaction priority, as 23ai reports it (#1779)."""

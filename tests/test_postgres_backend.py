@@ -1776,6 +1776,58 @@ def test_real_sql_round_trip_postgres() -> None:
     assert rows == [(1, 'alice', Decimal('9.5')), (2, 'bob', -3)]
 
 
+def test_a_login_opens_no_transaction_and_its_settings_outlast_a_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A login's settings are committed at once, so a rollback cannot undo them
+    # (#1188, #1409, #1620). They now run in autocommit, each login step one
+    # round trip with no BEGIN or COMMIT around it (#1914): no statement of the
+    # login runs inside a transaction. After a rollback the session is still
+    # the login's: its user, its schema, its service.
+    sent: list[tuple[str, bool]] = []
+    execute = psycopg.Cursor.execute
+
+    def recorded(cursor: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
+        sent.append((str(query), cursor.connection.autocommit))
+        return execute(cursor, query, *args, **kwargs)
+
+    # The first login of a process looks the installation up, once (#1871).
+    listen, server, result = _start_mirror()
+    _connect(listen.getsockname()[1]).close()
+    server.join(timeout=5)
+    listen.close()
+    listen, server, result = _start_mirror()
+    monkeypatch.setattr(psycopg.Cursor, 'execute', recorded)
+    conn = _connect(listen.getsockname()[1])
+    monkeypatch.undo()
+    try:
+        assert sent
+        assert [query for query, autocommit in sent if not autocommit] == []
+        conn.autocommit = False
+        cur = conn.cursor()
+        cur.execute('create table t_login1914 (n number)')
+        cur.execute('insert into t_login1914 values (1)')
+        conn.rollback()
+        cur.execute(
+            "select sys_context('userenv', 'session_user'), "
+            "sys_context('userenv', 'current_schema'), "
+            "sys_context('userenv', 'service_name') from dual"
+        )
+        row = cur.fetchone()
+        cur.execute('drop table t_login1914')
+    finally:
+        monkeypatch.undo()
+        try:
+            conn.close()
+        except Exception:
+            pass
+        server.join(timeout=5)
+        listen.close()
+
+    assert result.get('error') is None, result.get('error')
+    assert row == ('PYO', 'PYO', 'XE')
+
+
 def test_a_refused_commit_is_ora_02091() -> None:
     # PostgreSQL checks a deferred constraint at COMMIT and rolls back; the
     # client gets Oracle's ORA-02091 over the constraint's own ORA-00001, not a
