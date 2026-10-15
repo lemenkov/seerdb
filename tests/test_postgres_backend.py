@@ -8585,7 +8585,7 @@ def test_oracle_alter_table_column_forms_translate() -> None:
         "CONSTRAINT \"ora_raw_len_f\" CHECK (sys.ora_raw_fits(f, 5, 'T', 'F'))"
     )
     assert _translate_ddl("ALTER TABLE t ADD (g VARCHAR2(5) DEFAULT 'q' NOT NULL)") == (
-        "ALTER TABLE t ADD COLUMN g varchar(5) DEFAULT 'q' NOT NULL"
+        'ALTER TABLE t ADD COLUMN g varchar(5) COLLATE "C" DEFAULT \'q\' NOT NULL'
     )
     assert _translate_ddl('ALTER TABLE t ADD CONSTRAINT t_pk PRIMARY KEY (id)') == (
         'ALTER TABLE t ADD CONSTRAINT t_pk PRIMARY KEY (id)'
@@ -8593,7 +8593,7 @@ def test_oracle_alter_table_column_forms_translate() -> None:
     assert _translate_ddl(
         "ALTER TABLE t MODIFY (a VARCHAR2(20) DEFAULT 'x' NOT NULL, b NULL)"
     ) == (
-        'ALTER TABLE t ALTER COLUMN a TYPE varchar(20), '
+        'ALTER TABLE t ALTER COLUMN a TYPE varchar(20) COLLATE "C", '
         'DROP CONSTRAINT IF EXISTS "ora_raw_len_a", '
         "ALTER COLUMN a SET DEFAULT 'x', ALTER COLUMN a SET NOT NULL, "
         'ALTER COLUMN b DROP NOT NULL'
@@ -9842,5 +9842,54 @@ def test_a_with_time_zone_column_is_indexed_on_its_instant() -> None:
     finally:
         backend.rollback()
         backend.execute('DROP TABLE IF EXISTS tz1897t')
+        backend.close()
+        admin.close()
+
+
+def test_a_character_column_compares_byte_by_byte() -> None:
+    # A character column takes the C collation (#1896): it sorts as Oracle's
+    # default NLS_SORT BINARY does, whatever the database's collation, and an
+    # index on it serves a LIKE prefix, which no other collation's index can.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    try:
+        backend.execute(
+            'CREATE TABLE co1896t (id NUMBER, v VARCHAR2(9 CHAR), c CHAR(3), '
+            'n NCHAR(3), nv NVARCHAR2(9), "Q" VARCHAR(9), l CLOB)'
+        )
+        backend.execute('ALTER TABLE co1896t ADD (a VARCHAR2(9), b NUMBER)')
+        backend.execute('ALTER TABLE co1896t MODIFY (nv NVARCHAR2(12))')
+        collations = admin.execute(
+            'SELECT a.attname, c.collname FROM pg_attribute a '
+            'LEFT JOIN pg_collation c ON c.oid = a.attcollation '
+            "WHERE a.attrelid = 'co1896t'::regclass AND a.attnum > 0 ORDER BY a.attnum"
+        ).fetchall()
+        assert collations == [
+            ('id', None),
+            ('v', 'C'),
+            ('c', 'C'),
+            ('n', 'C'),
+            ('nv', 'C'),
+            ('Q', 'C'),
+            ('l', 'default'),
+            ('a', 'C'),
+            ('b', None),
+        ]
+        backend.execute(
+            "INSERT INTO co1896t (id, v) SELECT level, CASE level WHEN 1 THEN 'a' "
+            "WHEN 2 THEN 'B' ELSE 'k' || level END FROM dual CONNECT BY level <= 300"
+        )
+        got = backend.execute("SELECT v FROM co1896t WHERE v IN ('a', 'B') ORDER BY v")
+        assert [r[0] for r in got.rows] == ['B', 'a']
+        backend.execute('CREATE INDEX co1896_v ON co1896t (v)')
+        with admin.transaction(force_rollback=True):
+            admin.execute('SET LOCAL enable_seqscan = off')
+            plan = admin.execute(
+                "EXPLAIN SELECT id FROM co1896t WHERE v LIKE 'k5%'"
+            ).fetchall()
+        assert any("Index Cond: (((v)::text >= 'k5'" in line for (line,) in plan), plan
+    finally:
+        backend.rollback()
+        backend.execute('DROP TABLE IF EXISTS co1896t')
         backend.close()
         admin.close()
