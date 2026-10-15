@@ -6218,8 +6218,25 @@ def _translate_vector_functions(sql: str) -> str:
 
 # The words that join, and qualify, a query's set-operation branches (#1708).
 _SET_OPERATORS = frozenset({'UNION', 'INTERSECT', 'MINUS', 'EXCEPT', 'ALL', 'DISTINCT'})
+_Analysed = TypeVar('_Analysed')
 
 
+def _kept_per_text(analysis: Callable[[str], _Analysed]) -> Callable[[str], _Analysed]:
+    # `analysis`, a reading of a statement's text that depends on the text
+    # alone, kept per text (#1884): the describe reads a query's select list
+    # several ways on every call, each a pass of the tokenizer. Its answer is
+    # shared between calls, so a caller reads it and never changes it. A long
+    # text is read every time, as _translate_idioms' is.
+    kept = functools.lru_cache(maxsize=512)(analysis)
+
+    @functools.wraps(analysis)
+    def per_text(sql: str) -> _Analysed:
+        return analysis(sql) if len(sql) > _KEPT_IDIOMS_TEXT else kept(sql)
+
+    return per_text
+
+
+@_kept_per_text
 def _computed_vector_columns(
     sql: str,
 ) -> dict[int, tuple[int | None, int | None, bool | None]]:
@@ -6779,6 +6796,7 @@ _ORACLE_PSEUDO_COLUMNS = frozenset(
 )
 
 
+@_kept_per_text
 def _expression_names(sql: str) -> dict[int, str]:
     """The names Oracle gives an Oracle query's unaliased computed select items,
     by position (#1449): the item's own text, every space dropped and the rest
@@ -6811,6 +6829,7 @@ def _expression_names(sql: str) -> dict[int, str]:
     return names
 
 
+@_kept_per_text
 def _constant_items(sql: str) -> set[int]:
     """The select-list positions of an Oracle query that are constant: literals,
     operators and calls of literals, nothing else -- no column, bind,
@@ -6846,6 +6865,7 @@ def _constant_items(sql: str) -> set[int]:
     return found
 
 
+@_kept_per_text
 def _computed_national_columns(sql: str) -> dict[int, int]:
     """The select-list positions of an Oracle query that CAST a value to
     NVARCHAR2(n) or NCHAR(n), each with its n (#1440), or that are a national
@@ -6882,6 +6902,7 @@ def _computed_national_columns(sql: str) -> dict[int, int]:
     return found
 
 
+@_kept_per_text
 def _computed_column_types(sql: str) -> dict[int, int]:
     """The select-list positions of a query whose Oracle type the item says.
 
@@ -6923,6 +6944,7 @@ def _computed_column_types(sql: str) -> dict[int, int]:
     return found
 
 
+@_kept_per_text
 def _constructor_items(sql: str) -> dict[int, str]:
     """The select-list positions of a query that are one call, by the name called.
 
