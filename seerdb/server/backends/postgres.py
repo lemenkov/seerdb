@@ -1337,6 +1337,12 @@ _DBMS_OUTPUT_LINES_DDL = (
 # ALL_OBJECTS and ALL_PROCEDURES can tell it from the backend's own helpers,
 # which share its schemas. DROP takes the comment with the routine.
 _ROUTINE_MARK: Final = 'seerdb:routine:'
+# The column an index key `k` is on: its own column, or for a WITH TIME ZONE
+# column's instant, ((col).utc), the column it reads (#1897).
+_INDEX_KEY_COLUMN: Final = (
+    '(a.attnum = k.attnum OR k.attnum = 0 AND pg_get_indexdef(ix.indexrelid, k.n::int, false) '
+    "= '((' || quote_ident(a.attname) || ').utc)')"
+)
 
 _ORACLE_DICTIONARY_DDL = (
     # SYS_CONTEXT('userenv', <param>) — the session context the dialect reads to
@@ -1955,7 +1961,8 @@ _ORACLE_DICTIONARY_DDL = (
     'ora_name(ic.relname) AS index_name, ora_owner(tn.nspname) AS table_owner, '
     'ora_name(tc.relname) AS table_name, '
     "CASE WHEN ix.indisunique THEN 'UNIQUE' ELSE 'NONUNIQUE' END AS uniqueness, "
-    "'NORMAL' AS index_type, 'VALID' AS status, "
+    "CASE WHEN 0 = ANY(ix.indkey::int2[]) THEN 'FUNCTION-BASED NORMAL' "
+    "ELSE 'NORMAL' END AS index_type, 'VALID' AS status, "
     'NULL::text AS compression, NULL::int AS prefix_length, '
     'NULL::text AS tablespace_name, NULL::text AS ityp_owner, '
     'NULL::text AS ityp_name, NULL::text AS parameters '
@@ -1967,24 +1974,32 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE OR REPLACE VIEW sys.all_ind_columns AS SELECT ora_owner(n.nspname) AS index_owner, '
     'ora_name(ic.relname) AS index_name, ora_owner(tn.nspname) AS table_owner, '
     'ora_name(tc.relname) AS table_name, '
-    'ora_column_name(a.attrelid, a.attname) AS column_name, '
+    # A WITH TIME ZONE column's key is its instant (#1897), which Oracle
+    # lists under a hidden column's SYS_NC name, the expression in
+    # all_ind_expressions.
+    "CASE WHEN k.attnum = 0 THEN 'SYS_NC' || lpad((tc.relnatts + k.n)::text, 5, '0') "
+    "|| '$' ELSE ora_column_name(a.attrelid, a.attname) END AS column_name, "
     "k.n AS column_position, CASE WHEN (k.opt & 1) = 1 THEN 'DESC' ELSE 'ASC' END AS descend "
     'FROM pg_index ix JOIN pg_class ic ON ic.oid=ix.indexrelid '
     'JOIN pg_namespace n ON n.oid=ic.relnamespace '
     'JOIN pg_class tc ON tc.oid=ix.indrelid '
     'JOIN pg_namespace tn ON tn.oid=tc.relnamespace '
     'CROSS JOIN LATERAL unnest(ix.indkey::int2[], ix.indoption::int2[]) WITH ORDINALITY AS k(attnum, opt, n) '
-    'JOIN pg_attribute a ON a.attrelid=tc.oid AND a.attnum=k.attnum '
+    f'JOIN pg_attribute a ON a.attrelid=tc.oid AND {_INDEX_KEY_COLUMN} '
     "WHERE n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
     # A DESC column in an index is a function-based index in Oracle: the column
     # appears here as the quoted expression "COL" at its position, so reflection
     # (which LEFT JOINs on column_position) renders it as an expression with DESC
     # sorting. PostgreSQL stores it as a plain descending key column, so emit a row
     # only for descending columns (indoption bit 0x01), matching Oracle's shape.
+    # A WITH TIME ZONE column's key, its instant, is SYS_EXTRACT_UTC("COL")
+    # whichever way it sorts, as in Oracle (#1897).
     'CREATE OR REPLACE VIEW sys.all_ind_expressions AS SELECT '
     'ora_owner(n.nspname) AS index_owner, ora_name(ic.relname) AS index_name, '
     'ora_owner(tn.nspname) AS table_owner, ora_name(tc.relname) AS table_name, '
-    "'\"' || ora_column_name(a.attrelid, a.attname) || '\"' AS column_expression, "
+    "CASE WHEN k.attnum = 0 THEN 'SYS_EXTRACT_UTC(' ELSE '' END || "
+    "'\"' || ora_column_name(a.attrelid, a.attname) || '\"' "
+    "|| CASE WHEN k.attnum = 0 THEN ')' ELSE '' END AS column_expression, "
     'k.n AS column_position '
     'FROM pg_index ix JOIN pg_class ic ON ic.oid=ix.indexrelid '
     'JOIN pg_namespace n ON n.oid=ic.relnamespace '
@@ -1992,8 +2007,8 @@ _ORACLE_DICTIONARY_DDL = (
     'JOIN pg_namespace tn ON tn.oid=tc.relnamespace '
     'CROSS JOIN LATERAL unnest(ix.indkey::int2[], ix.indoption::int2[]) '
     'WITH ORDINALITY AS k(attnum, opt, n) '
-    'JOIN pg_attribute a ON a.attrelid=tc.oid AND a.attnum=k.attnum '
-    'WHERE (k.opt & 1) = 1 '
+    f'JOIN pg_attribute a ON a.attrelid=tc.oid AND {_INDEX_KEY_COLUMN} '
+    'WHERE ((k.opt & 1) = 1 OR k.attnum = 0) '
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
     # v$session / v$session_connect_info (#1212): the sessions of this database,
     # a SID being the backend's pid (as the login reply names it) and the
@@ -10494,6 +10509,40 @@ def _dead_nvl_candidates(
     return (masked, contents, table, {_folded_name(qualifier, contents)}, calls)
 
 
+# A CREATE INDEX up to its key list's `(` (#1897): the table it is on.
+_CREATE_INDEX_KEYS = re.compile(
+    rf'\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?{_SQL_NAME}\s+'
+    rf'ON\s+({_SQL_NAME}(?:\s*\.\s*{_SQL_NAME})?)\s*\(',
+    re.IGNORECASE,
+)
+# One key of that list that is a bare column, ASC or DESC.
+_INDEX_KEY = re.compile(rf'\s*({_SQL_NAME})(\s+(?:ASC|DESC))?\s*', re.IGNORECASE)
+
+
+def _index_key_spans(
+    sql: str,
+) -> tuple[str, tuple[str, ...], str, list[tuple[int, int, str]]] | None:
+    # For a CREATE INDEX (#1897): the statement masked (_masked_quoted) and
+    # its masked contents, the table as written, and the span in the masked
+    # text of each key that is a bare column, with that column's name as
+    # PostgreSQL resolves it. None for any other statement.
+    (masked, contents) = _masked_quoted(sql)
+    head = _CREATE_INDEX_KEYS.match(masked)
+    if head is None:
+        return None
+    table = _unmask_quoted(head.group(1), list(contents))
+    keys = []
+    for start, stop in _top_level_items(
+        masked, head.end(), _matching_paren(masked, head.end() - 1)
+    ):
+        key = _INDEX_KEY.fullmatch(masked, start, stop)
+        if key is not None:
+            keys.append(
+                (key.start(1), key.end(1), _folded_name(key.group(1), contents))
+            )
+    return (masked, contents, table, keys)
+
+
 class _TableColumn(NamedTuple):
     # A table column as the schema model knows it (#1887).
     name: str
@@ -11644,6 +11693,7 @@ class PostgresBackend:
             sql,
         )
         sql = _ruled('admin', _translate_admin(sql), sql)
+        sql = _ruled('instant-index', self._instant_index_keys(sql), sql)
         sql = _ruled('ddl', _translate_ddl(sql), sql)
         sql = _ruled(
             'routine-ddl',
@@ -13085,6 +13135,32 @@ class PostgresBackend:
         if relid not in self._relations:
             self._read_relations({relid})
         return self._relations[relid]
+
+    def _instant_index_keys(self, sql: str) -> str:
+        # `sql`, a CREATE INDEX, with each key that is a WITH TIME ZONE column
+        # made its instant, `((col).utc)` (#1897). The Mirror compares such a
+        # column by its instant, and PostgreSQL inlines that comparison to
+        # `(col).utc`, which an index on the composite can't serve. Oracle
+        # builds the index on SYS_EXTRACT_UTC(col) as well, and a UNIQUE one
+        # refuses two values at one instant.
+        if self._tstz_oid is None:
+            return sql
+        found = _index_key_spans(sql)
+        if found is None or not found[3]:
+            return sql
+        (masked, contents, table, keys) = found
+        columns = self._relation_columns(table)
+        if not columns:
+            return sql
+        instants = {
+            column.name
+            for column in columns.values()
+            if column.type_oid == self._tstz_oid
+        }
+        for start, stop, name in reversed(keys):
+            if name in instants:
+                masked = f'{masked[:start]}(({masked[start:stop]}).utc){masked[stop:]}'
+        return _unmask_quoted(masked, list(contents))
 
     def _without_dead_nvl(self, sql: str) -> str:
         # `sql` with each NVL / COALESCE in its WHERE clause whose first
