@@ -4074,7 +4074,8 @@ def test_sql_monitor_reports_the_sessions_database_operation() -> None:
 def test_a_proxy_login_is_a_session_of_the_user_it_acts_for() -> None:
     # A proxy login, `pyo[target]` (#1620): the session is the target's, in its
     # schema, and PROXY_USER names the user who logged in -- as Oracle reports
-    # it to python-oracledb's test_2427. A plain login has no PROXY_USER.
+    # it to python-oracledb's test_2427. A plain login has no PROXY_USER. The
+    # target granted CONNECT THROUGH the login first, as Oracle needs (#1860).
     query = (
         "SELECT sys_context('userenv', 'session_user'), "
         "sys_context('userenv', 'proxy_user'), "
@@ -4089,15 +4090,66 @@ def test_a_proxy_login_is_a_session_of_the_user_it_acts_for() -> None:
         assert tuple(row[:2]) == ('PYO', None)
         proxied.authenticate('pyo')
         proxied.execute('CREATE SCHEMA IF NOT EXISTS px1620')
+        proxied.execute('ALTER USER px1620 GRANT CONNECT THROUGH pyo')
         proxied.open_session({'proxy_client_name': 'px1620'})
         assert proxied.execute(query).rows == [('PX1620', 'PYO', 'PX1620')]
     finally:
         proxied.rollback()
         try:
+            proxied.execute("DELETE FROM sys.ora_proxy_grants WHERE client = 'PX1620'")
             proxied.execute('DROP SCHEMA px1620')
+            proxied.commit()
         except Exception:
             proxied.rollback()
         plain.close()
+        proxied.close()
+
+
+def test_a_proxy_login_needs_a_grant_of_connect_through() -> None:
+    # A proxy login is admitted only where the target granted CONNECT THROUGH
+    # the user logging in (#1860), as 23ai admits it: otherwise ORA-01017. The
+    # grants are PROXY_USERS's rows; ALTER USER names a user that exists, on
+    # either side (ORA-01918), REVOKE one that was granted (ORA-38470), and
+    # DROP USER takes a user's grants with it. Measured on 23ai.
+    from seerdb.server import BackendError
+
+    admin = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    proxied = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    rows = "SELECT * FROM proxy_users WHERE client = 'PX1860'"
+    try:
+        admin.authenticate('pyo')
+        admin.open_session({})
+        admin.execute('CREATE USER px1860 IDENTIFIED BY px1860pw')
+        proxied.authenticate('pyo')
+        with pytest.raises(BackendError) as refused:
+            proxied.open_session({'proxy_client_name': 'px1860'})
+        assert refused.value.ora_code == 1017
+        for statement, code in (
+            ('ALTER USER no_such_1860 GRANT CONNECT THROUGH pyo', 1918),
+            ('ALTER USER px1860 GRANT CONNECT THROUGH no_such_1860', 1918),
+            ('ALTER USER px1860 REVOKE CONNECT THROUGH pyo', 38470),
+        ):
+            with pytest.raises(BackendError) as raised:
+                admin.execute(statement)
+            assert raised.value.ora_code == code, statement
+        admin.execute('ALTER USER px1860 GRANT CONNECT THROUGH pyo')
+        assert admin.execute(rows).rows == [
+            ('PYO', 'PX1860', 'NO', 'PROXY MAY ACTIVATE ALL CLIENT ROLES')
+        ]
+        proxied.open_session({'proxy_client_name': 'px1860'})
+        admin.execute('ALTER USER px1860 REVOKE CONNECT THROUGH pyo')
+        assert admin.execute(rows).rows == []
+        admin.execute('ALTER USER px1860 GRANT CONNECT THROUGH pyo')
+        admin.execute('DROP USER px1860')
+        assert admin.execute(rows).rows == []
+    finally:
+        for backend in (proxied, admin):
+            backend.rollback()
+        try:
+            admin.execute('DROP USER px1860 CASCADE')
+        except Exception:
+            admin.rollback()
+        admin.close()
         proxied.close()
 
 

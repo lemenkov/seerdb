@@ -152,6 +152,13 @@ Mirror stops. With it, they live in the database and persist. That table
 belongs to the auth role; the role the sessions run as must not be able to read
 it, so it must be a different role, not a superuser, and not the table's owner.
 
+**Proxy logins.** A login as `user[target]` opens a session as `target`, with
+`user` as its proxy, only where `target` allowed it:
+`ALTER USER target GRANT CONNECT THROUGH user`. `REVOKE CONNECT THROUGH` takes
+that away, and `PROXY_USERS` lists the grants. Any other proxy login is refused
+with ORA-01017, as Oracle refuses it. The PostgreSQL backend keeps the grants
+in its dictionary; the passthrough leaves the decision to its upstream.
+
 ### Encryption
 
 **TLS (TCPS).** Given a certificate, the Mirror serves TCPS: every connection is
