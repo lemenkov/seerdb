@@ -2658,6 +2658,61 @@ def test_ddl_on_a_locked_table_fails_as_oracle_does() -> None:
         ddl.close()
 
 
+def test_a_block_reads_its_binds_back_in_its_own_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A block's binds (#1456, #1459) are read back by one query, in the
+    # block's own pipeline (#1917): one round trip, not one more per bind. An
+    # error the block raises is still its own ORA code, and the session goes
+    # on.
+    import decimal
+
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER, TNS_TYPE_VARCHAR
+    from seerdb.server import BackendError, BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    sent: list[tuple[str, bool]] = []
+    execute = psycopg.Cursor.execute
+    off = psycopg.pq.PipelineStatus.OFF
+
+    def recorded(cursor: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
+        piped = cursor.connection.pgconn.pipeline_status != off
+        sent.append((str(query), piped))
+        return execute(cursor, query, *args, **kwargs)
+
+    try:
+        monkeypatch.setattr(psycopg.Cursor, 'execute', recorded)
+        out = backend.execute(
+            "begin :1 := 2; :2 := :1 * 3; :3 := 'x' || :2; end;",
+            [
+                BindVar(None, TNS_TYPE_NUMBER, 22),
+                BindVar(None, TNS_TYPE_NUMBER, 22),
+                BindVar(None, TNS_TYPE_VARCHAR, 10),
+            ],
+        ).out_binds
+        assert [int(v) if isinstance(v, decimal.Decimal) else v for v in out] == [
+            2,
+            6,
+            'x6',
+        ]
+        block = [
+            (q, piped) for q, piped in sent if 'DO ' in q or 'current_setting' in q
+        ]
+        assert len(block) == 2 and all(piped for _q, piped in block)
+        assert block[1][0].count('current_setting') == 3
+        with pytest.raises(BackendError) as raised:
+            backend.execute(
+                "begin :1 := 1; raise_application_error(-20001, 'boom'); end;",
+                [BindVar(None, TNS_TYPE_NUMBER, 22)],
+            )
+        assert raised.value.ora_code == 20001
+        assert backend.execute('SELECT 1 FROM dual').rows == [(1,)]
+    finally:
+        monkeypatch.undo()
+        backend.rollback()
+        backend.close()
+
+
 def test_a_block_returning_several_rows_into_a_bind_is_ora_01422() -> None:
     # PL/SQL's single-row RETURNING INTO found two rows (#1209).
     from seerdb.common.tns_consts import TNS_TYPE_NUMBER
