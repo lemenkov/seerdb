@@ -11992,6 +11992,7 @@ class PostgresBackend:
                 self._ddl_generation = None if row is None else row[0]
             self._conn.commit()
             self._user_savepoint = False
+            self._prune_records()
             self._record_quoted_names(original)
             self._record_tstz_precisions(original)
             self._record_visibility(visibility)
@@ -12264,11 +12265,43 @@ class PostgresBackend:
 
     def _has_raw_targets(self) -> bool:
         if self._has_raw_targets_cache is None:
-            row = self._conn.execute(
-                "SELECT EXISTS (SELECT 1 FROM sys.ora_columns WHERE data_type = 'RAW')"
-            ).fetchone()
-            self._has_raw_targets_cache = bool(row and row[0])
-        return self._has_raw_targets_cache
+            self._read_schema_facts()
+        return bool(self._has_raw_targets_cache)
+
+    def _read_schema_facts(self) -> None:
+        # The facts about the whole schema that nearly every statement asks
+        # after, read together in one query (#1918), each until a DDL: the
+        # collection types' names, whether any column is a recorded RAW
+        # (#1496), and whether any column could owe a describe a SQL domain or
+        # annotations (#1711). A database with no column catalog has no RAW or
+        # annotation to find.
+        recorded = (
+            "EXISTS (SELECT 1 FROM sys.ora_columns WHERE data_type = 'RAW'), "
+            'EXISTS (SELECT 1 FROM sys.ora_annotations) OR EXISTS '
+            "(SELECT 1 FROM pg_type WHERE typtype = 'd' AND "
+            "obj_description(oid, 'pg_type') = %s)"
+            if self._has_column_catalog
+            else 'false, false'
+        )
+        row = self._conn.execute(
+            'SELECT (SELECT array_agg(ARRAY[lower(t.typname), lower(n.nspname)]) '
+            'FROM pg_type t '
+            'JOIN pg_namespace n ON n.oid = t.typnamespace '
+            "JOIN pg_type b ON b.oid = t.typbasetype AND b.typcategory = 'A' "
+            "WHERE t.typtype = 'd' "
+            "AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'oracle')), "
+            f'{recorded}',
+            (_SQL_DOMAIN_MARK,) if self._has_column_catalog else (),
+        ).fetchone()
+        assert row is not None
+        collections = row[0] or ()
+        self._collection_name_cache = frozenset(
+            name
+            for typname, schema in collections
+            for name in (typname, f'{schema}.{typname}')
+        )
+        self._has_raw_targets_cache = bool(row[1])
+        self._has_sql_domains_cache = bool(row[2])
 
     def _json_dot_notation(self, sql: str) -> str:
         """Oracle's simple dot notation into a JSON column, `alias.column.key
@@ -12807,28 +12840,45 @@ class PostgresBackend:
         # The collection types (array domains) of the user schemas, by name and
         # by schema-qualified name, lower case; read once, then after any DDL.
         if self._collection_name_cache is None:
-            rows = self._conn.execute(
-                'SELECT lower(t.typname), lower(n.nspname) FROM pg_type t '
-                'JOIN pg_namespace n ON n.oid = t.typnamespace '
-                "JOIN pg_type b ON b.oid = t.typbasetype AND b.typcategory = 'A' "
-                "WHERE t.typtype = 'd' "
-                "AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'oracle')"
-            ).fetchall()
-            self._collection_name_cache = frozenset(
-                name
-                for typname, schema in rows
-                for name in (typname, f'{schema}.{typname}')
-            )
+            self._read_schema_facts()
+        assert self._collection_name_cache is not None
         return self._collection_name_cache
 
+    def _prune_records(self) -> None:
+        # After a committed DDL: drop the records of the columns and types it
+        # took away -- a DROP TABLE or DROP COLUMN leaves its columns' rows
+        # behind otherwise -- in one round trip (#1918). On its own, like the
+        # records that follow, so a failure here cannot take the DDL with it.
+        prunes = []
+        if self._has_column_catalog:
+            prunes += [
+                'DELETE FROM sys.ora_columns o WHERE NOT EXISTS '
+                '(SELECT 1 FROM pg_attribute a WHERE a.attrelid = o.relid '
+                'AND a.attnum = o.attnum AND NOT a.attisdropped)',
+                'DELETE FROM sys.ora_annotations o WHERE NOT EXISTS '
+                '(SELECT 1 FROM pg_attribute a WHERE a.attrelid = o.relid '
+                'AND a.attnum = o.attnum AND NOT a.attisdropped)',
+            ]
+        if self._has_collection_elements:
+            prunes.append(
+                'DELETE FROM sys.ora_collection_elements x WHERE NOT EXISTS '
+                '(SELECT 1 FROM pg_type t WHERE t.oid = x.typid)'
+            )
+        if not prunes:
+            return
+        try:
+            self._conn.execute('; '.join(prunes))
+            self._conn.commit()
+        except psycopg.Error:
+            self._conn.rollback()
+
     def _record_column_types(self, statement: str) -> None:
-        # After a committed DDL: keep sys.ora_columns in step with it (#1386).
-        # Every DDL prunes the rows of columns that are gone -- a DROP TABLE or
-        # DROP COLUMN leaves its own behind otherwise -- and a CREATE TABLE or
-        # ALTER TABLE ... ADD / MODIFY records each column it declares a type
-        # for, a MODIFY to a type not recorded taking the old record away. On
-        # its own, like the other DDL records, so a failure here cannot take the
-        # table with it.
+        # After a committed DDL, its prune done (_prune_records): keep
+        # sys.ora_columns in step with it (#1386). A CREATE TABLE or ALTER
+        # TABLE ... ADD / MODIFY records each column it declares a type for, a
+        # MODIFY to a type not recorded taking the old record away. On its own,
+        # like the other DDL records, so a failure here cannot take the table
+        # with it.
         if not self._has_column_catalog:
             return
         self._relations.clear()
@@ -12837,11 +12887,6 @@ class PostgresBackend:
         self._has_oson_cache = None
         declared = _declared_columns(statement)
         try:
-            self._conn.execute(
-                'DELETE FROM sys.ora_columns o WHERE NOT EXISTS '
-                '(SELECT 1 FROM pg_attribute a WHERE a.attrelid = o.relid '
-                'AND a.attnum = o.attnum AND NOT a.attisdropped)'
-            )
             if declared is not None:
                 table, columns = declared
                 for name, detail in columns.items():
@@ -12868,14 +12913,10 @@ class PostgresBackend:
 
     def _record_collection_element(self, statement: str) -> None:
         # A collection of NVARCHAR2 / NCHAR keeps its element's national type
-        # (#1437), one of RAW(n) its n (#1545); every DDL prunes the rows of
-        # types that are gone.
+        # (#1437), one of RAW(n) its n (#1545); _prune_records drops the rows
+        # of types that are gone.
         if not self._has_collection_elements:
             return
-        self._conn.execute(
-            'DELETE FROM sys.ora_collection_elements x WHERE NOT EXISTS '
-            '(SELECT 1 FROM pg_type t WHERE t.oid = x.typid)'
-        )
         recorded = _CREATE_RECORDED_COLLECTION.match(statement)
         if recorded is not None:
             (name, data_type, length) = recorded.groups()
@@ -12941,19 +12982,14 @@ class PostgresBackend:
     def _record_annotations(
         self, annotated: tuple[str, dict[str, list[tuple[str, str]]]] | None
     ) -> None:
-        # After a committed DDL: a column's annotations (#1711). Every DDL
-        # prunes the rows of columns that are gone; a column that declares
-        # annotations has them replaced.
+        # After a committed DDL: a column's annotations (#1711). A column that
+        # declares annotations has them replaced; _prune_records drops the
+        # rows of columns that are gone.
         if not self._has_column_catalog:
             return
         self._sql_domain_cache.clear()
         self._has_sql_domains_cache = None
         try:
-            self._conn.execute(
-                'DELETE FROM sys.ora_annotations o WHERE NOT EXISTS '
-                '(SELECT 1 FROM pg_attribute a WHERE a.attrelid = o.relid '
-                'AND a.attnum = o.attnum AND NOT a.attisdropped)'
-            )
             if annotated is not None:
                 (table, columns) = annotated
                 for column, notes in columns.items():
@@ -12979,14 +13015,8 @@ class PostgresBackend:
         # (#1711): a user's SQL domain, or an annotation, exists. Kept until a
         # DDL, so a database with neither pays one query a session.
         if self._has_sql_domains_cache is None:
-            row = self._conn.execute(
-                'SELECT EXISTS (SELECT 1 FROM sys.ora_annotations) OR EXISTS '
-                "(SELECT 1 FROM pg_type WHERE typtype = 'd' AND "
-                "obj_description(oid, 'pg_type') = %s)",
-                (_SQL_DOMAIN_MARK,),
-            ).fetchone()
-            self._has_sql_domains_cache = bool(row and row[0])
-        return self._has_sql_domains_cache
+            self._read_schema_facts()
+        return bool(self._has_sql_domains_cache)
 
     def _sql_domain_columns(
         self, pgresult, count: int
