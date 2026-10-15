@@ -10705,6 +10705,7 @@ class _TableColumn(NamedTuple):
     json: bool  # checked IS JSON (#1626)
     declared: tuple | None  # sys.ora_columns: type, length, precision, scale (#1386)
     tstz_precision: int | None  # a WITH TIME ZONE column's precision (#1308)
+    invisible: bool  # INVISIBLE (#1195)
 
 
 class PostgresBackend:
@@ -10979,6 +10980,7 @@ class PostgresBackend:
         self._tstz_info: CompositeInfo | None = None
         self._bfile_oid: int | None = None
         self._intervalym_oid: int | None = None
+        self._oson_oid: int | None = None
         self._domain_type_by_oid: dict[int, int] = {}
         if not installed:
             self._install_part('tstz', _TSTZ_TYPE_DDL)
@@ -11066,27 +11068,14 @@ class PostgresBackend:
         # Each package's functions a call may name without parentheses (#1651).
         self._package_function_cache: dict[str, frozenset[str]] | None = None
         # RAW targets (#1496): whether any column or attribute is a recorded
-        # RAW, each relation's column order and RAW positions, and each object
-        # type's RAW attribute positions, by name; any DDL starts them over.
+        # RAW, and each object type's RAW attribute positions, by name; any DDL
+        # starts them over. A relation's own columns are the schema model's.
         self._has_raw_targets_cache: bool | None = None
-        self._raw_layout_cache: dict[str, tuple[list[str], frozenset[int]] | None] = {}
-        # Which table columns are JSON, for dot notation (#1707).
-        self._json_columns_cache: dict[str, bool] = {}
-        # Each relation's declared VECTOR formats (#1708), and which are sparse;
-        # until a DDL (#1749).
-        self._vector_format_cache: dict[
-            str, tuple[list[str], dict[int, tuple[int | None, bool]]] | None
-        ] = {}
-        # OSON columns (#1706): whether any exist, and each relation's.
+        # Whether any OSON column exists (#1706).
         self._has_oson_cache: bool | None = None
-        self._oson_layout_cache: dict[str, tuple[list[str], frozenset[int]] | None] = {}
-        # Each relation's BOOLEAN columns (#1743), until a DDL.
-        self._boolean_column_cache: dict[
-            str, tuple[list[str], frozenset[int]] | None
-        ] = {}
         self._raw_constructor_cache: dict[str, frozenset[int]] | None = None
+        # Whether any column is INVISIBLE (#1195).
         self._any_invisible: bool | None = None
-        self._visible_cache: dict[str, list[str] | None] = {}
         # Each table name a statement names, as its relation's oid -- None for
         # no relation -- for the schema model (#1889); any DDL starts it over.
         self._relids: dict[str, int | None] = {}
@@ -11238,6 +11227,8 @@ class PostgresBackend:
                 self._domain_type_by_oid[oid] = tns_type
                 if name == _INTERVALYM_TYPE:
                     self._intervalym_oid = oid
+                elif name == _OSON_TYPE:
+                    self._oson_oid = oid
         # A LOB inside a composite or an array is typed by its domain, which
         # psycopg does not know: a BLOB attribute came back as its hex text.
         # Load both domains, and arrays of them, as their base types (#1256).
@@ -11313,13 +11304,8 @@ class PostgresBackend:
         self._collection_name_cache = None
         self._package_function_cache = None
         self._forget_raw_targets()
-        self._json_columns_cache.clear()
         self._has_oson_cache = None
-        self._oson_layout_cache.clear()
-        self._boolean_column_cache.clear()
-        self._vector_format_cache.clear()
         self._any_invisible = None
-        self._visible_cache.clear()
 
     def _install_dictionary(self) -> None:
         row = self._conn.execute(
@@ -12274,7 +12260,6 @@ class PostgresBackend:
 
     def _forget_raw_targets(self) -> None:
         self._has_raw_targets_cache = None
-        self._raw_layout_cache = {}
         self._raw_constructor_cache = None
 
     def _has_raw_targets(self) -> bool:
@@ -12321,33 +12306,28 @@ class PostgresBackend:
         return ''.join(out)
 
     def _is_json_column(self, table: str, column: str) -> bool:
-        # Whether a table's column is JSON (jsonb), cached (#1707).
-        key = f'{table.lower()}.{column.lower()}'
-        if key not in self._json_columns_cache:
-            row = self._conn.execute(
-                'SELECT atttypid = ANY(ARRAY[to_regtype(%s), to_regtype(%s)]) '
-                'FROM pg_attribute WHERE attrelid = to_regclass(%s) AND attname = %s',
-                ('jsonb', _OSON_TYPE, table, _pg_identifier(column)),
-            ).fetchone()
-            self._json_columns_cache[key] = bool(row and row[0])
-        return self._json_columns_cache[key]
+        # Whether a table's column is JSON (jsonb), from the schema model
+        # (#1707, #1887).
+        name = _pg_identifier(column)
+        return any(
+            found.name == name and found.type_oid in (_JSONB_OID, self._oson_oid)
+            for found in (self._relation_columns(table) or {}).values()
+        )
 
     def _oson_layout(self, name: str) -> tuple[list[str], frozenset[int]] | None:
-        # A relation's columns, in order, and which of them are OSON (#1706).
-        key = name.lower()
-        if key not in self._oson_layout_cache:
-            rows = self._conn.execute(
-                'SELECT attname, atttypid = to_regtype(%s) FROM pg_attribute '
-                'WHERE attrelid = to_regclass(%s) AND attnum > 0 AND NOT attisdropped '
-                'ORDER BY attnum',
-                (_OSON_TYPE, name),
-            ).fetchall()
-            self._oson_layout_cache[key] = (
-                ([r[0] for r in rows], frozenset(i for i, r in enumerate(rows) if r[1]))
-                if rows
-                else None
-            )
-        return self._oson_layout_cache[key]
+        # A relation's columns, in order, and which of them are OSON (#1706),
+        # from the schema model (#1887).
+        columns = self._ordered_columns(name)
+        if columns is None:
+            return None
+        return (
+            [c.name for c in columns],
+            frozenset(
+                i
+                for i, c in enumerate(columns)
+                if self._oson_oid is not None and c.type_oid == self._oson_oid
+            ),
+        )
 
     def _vector_column(
         self, pgresult, index: int, oid: int
@@ -12514,20 +12494,15 @@ class PostgresBackend:
         return out
 
     def _boolean_columns(self, name: str) -> tuple[list[str], frozenset[int]] | None:
-        # A relation's columns, in order, and which are BOOLEAN (#1743).
-        key = name.lower()
-        if key not in self._boolean_column_cache:
-            rows = self._conn.execute(
-                'SELECT attname, atttypid = %s FROM pg_attribute WHERE attrelid = '
-                'to_regclass(%s) AND attnum > 0 AND NOT attisdropped ORDER BY attnum',
-                (_BOOLEAN_OID, name),
-            ).fetchall()
-            self._boolean_column_cache[key] = (
-                ([r[0] for r in rows], frozenset(i for i, r in enumerate(rows) if r[1]))
-                if rows
-                else None
-            )
-        return self._boolean_column_cache[key]
+        # A relation's columns, in order, and which are BOOLEAN (#1743), from
+        # the schema model (#1887).
+        columns = self._ordered_columns(name)
+        if columns is None:
+            return None
+        return (
+            [c.name for c in columns],
+            frozenset(i for i, c in enumerate(columns) if c.type_oid == _BOOLEAN_OID),
+        )
 
     def _boolean_binds(self, sql: str, binds: Sequence) -> Sequence:
         """`binds` with each one an INSERT's VALUES or an UPDATE's SET puts
@@ -12576,26 +12551,19 @@ class PostgresBackend:
         self, name: str
     ) -> tuple[list[str], dict[int, tuple[int | None, bool]]] | None:
         # A relation's columns, in order, and each declared VECTOR's format
-        # code, None where flexible (#1708), and whether it is sparse (#1709).
-        key = name.lower()
-        if key not in self._vector_format_cache:
-            rows = self._conn.execute(
-                "SELECT a.attname, o.data_type = 'VECTOR', o.data_precision, "
-                'o.data_scale IS NOT NULL '
-                'FROM pg_attribute a LEFT JOIN sys.ora_columns o ON o.relid = '
-                'a.attrelid AND o.attnum = a.attnum WHERE a.attrelid = to_regclass(%s) '
-                'AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum',
-                (name,),
-            ).fetchall()
-            self._vector_format_cache[key] = (
-                (
-                    [r[0] for r in rows],
-                    {i: (r[2], r[3]) for i, r in enumerate(rows) if r[1]},
-                )
-                if rows
-                else None
-            )
-        return self._vector_format_cache[key]
+        # code, None where flexible (#1708), and whether it is sparse (#1709),
+        # from the schema model (#1887).
+        columns = self._ordered_columns(name)
+        if columns is None:
+            return None
+        return (
+            [c.name for c in columns],
+            {
+                i: (c.declared[2], c.declared[3] is not None)
+                for i, c in enumerate(columns)
+                if c.declared is not None and c.declared[0] == 'VECTOR'
+            },
+        )
 
     def _vector_text_binds(self, sql: str, binds: Sequence) -> Sequence:
         """`binds` with each string an INSERT's VALUES or an UPDATE's SET aims
@@ -12659,24 +12627,24 @@ class PostgresBackend:
         return self._has_oson_cache
 
     def _raw_layout(self, name: str) -> tuple[list[str], frozenset[int]] | None:
-        # A relation's columns, in order, and which of them are RAW (#1496).
-        key = name.lower()
-        if key not in self._raw_layout_cache:
-            rows = self._conn.execute(
-                "SELECT a.attname, coalesce(o.data_type = 'RAW', false) "
-                'FROM pg_attribute a LEFT JOIN sys.ora_columns o '
-                'ON o.relid = a.attrelid AND o.attnum = a.attnum '
-                'WHERE a.attrelid = to_regclass(%s) AND a.attnum > 0 '
-                f"AND NOT a.attisdropped AND a.attname <> '{_OBJECT_ID_COLUMN}' "
-                'ORDER BY a.attnum',
-                (name,),
-            ).fetchall()
-            self._raw_layout_cache[key] = (
-                ([r[0] for r in rows], frozenset(i for i, r in enumerate(rows) if r[1]))
-                if rows
-                else None
-            )
-        return self._raw_layout_cache[key]
+        # A relation's columns, in order, and which of them are RAW (#1496),
+        # from the schema model (#1887). An object table's object id is no
+        # column of the type's.
+        columns = [
+            c
+            for c in self._ordered_columns(name) or ()
+            if c.name != _OBJECT_ID_COLUMN.strip('"')
+        ]
+        if not columns:
+            return None
+        return (
+            [c.name for c in columns],
+            frozenset(
+                i
+                for i, c in enumerate(columns)
+                if c.declared is not None and c.declared[0] == 'RAW'
+            ),
+        )
 
     def _raw_constructors(self) -> dict[str, frozenset[int]]:
         # The object types with a RAW attribute, by name and qualified name,
@@ -12866,9 +12834,6 @@ class PostgresBackend:
         self._relations.clear()
         # The per-relation layouts too: a DDL can drop a table and create
         # another of its name with other columns (#1749).
-        self._boolean_column_cache.clear()
-        self._vector_format_cache.clear()
-        self._oson_layout_cache.clear()
         self._has_oson_cache = None
         declared = _declared_columns(statement)
         try:
@@ -13079,7 +13044,6 @@ class PostgresBackend:
         # dropped tables. Any DDL may change which columns a table has, so the
         # cache of visible columns starts over either way.
         self._any_invisible = None
-        self._visible_cache.clear()
         self._relations.clear()
         if visibility is None or not self._has_invisible_catalog:
             return
@@ -13110,7 +13074,8 @@ class PostgresBackend:
 
     def _visible_columns(self, table: str) -> list[str] | None:
         # The visible columns of `table`, quoted, in order -- or None when it has
-        # no INVISIBLE column, or is not a table (#1195).
+        # no INVISIBLE column, or is not a table (#1195) -- from the schema
+        # model (#1887).
         if not self._has_invisible_catalog:
             return None
         if self._any_invisible is None:
@@ -13120,26 +13085,12 @@ class PostgresBackend:
             self._any_invisible = bool(row and row[0])
         if not self._any_invisible:
             return None
-        key = table.lower() if '"' not in table else table
-        if key not in self._visible_cache:
-            rows = self._conn.execute(
-                'SELECT a.attname, h.relid IS NOT NULL FROM pg_attribute a '
-                'LEFT JOIN sys.ora_invisible_columns h '
-                'ON h.relid = a.attrelid AND h.attnum = a.attnum '
-                'WHERE a.attrelid = to_regclass(%s) AND a.attnum > 0 '
-                'AND NOT a.attisdropped ORDER BY a.attnum',
-                (table,),
-            ).fetchall()
-            self._visible_cache[key] = (
-                [
-                    '"' + name.replace('"', '""') + '"'
-                    for name, hidden in rows
-                    if not hidden
-                ]
-                if any(hidden for _name, hidden in rows)
-                else None
-            )
-        return self._visible_cache[key]
+        columns = self._ordered_columns(table)
+        if columns is None or not any(c.invisible for c in columns):
+            return None
+        return [
+            '"' + c.name.replace('"', '""') + '"' for c in columns if not c.invisible
+        ]
 
     def _expand_visible_columns(self, sql: str) -> str:
         # Name the visible columns where a statement means "all of them": an
@@ -13306,12 +13257,13 @@ class PostgresBackend:
         # all-lower-case name (#1204) or checked IS JSON (#1626) -- stored as
         # sys.ora_is_json(column) (#1614), one with NOT before it being no such
         # column -- its declared Oracle type (#1386) and its WITH TIME ZONE
-        # precision (#1308). A catalog this session's dictionary lacks leaves
-        # its part empty.
-        quoted, declared, precision, joins = (
+        # precision (#1308), and whether it is INVISIBLE (#1195). A catalog
+        # this session's dictionary lacks leaves its part empty.
+        quoted, declared, precision, invisible, joins = (
             'false',
             'NULL, NULL, NULL, NULL',
             'NULL',
+            'false',
             '',
         )
         if self._has_quoted_names:
@@ -13331,13 +13283,18 @@ class PostgresBackend:
                 ' LEFT JOIN sys.ora_tstz_precision p '
                 'ON p.relid = a.attrelid AND p.attnum = a.attnum'
             )
+        if self._has_invisible_catalog:
+            invisible = (
+                'EXISTS (SELECT 1 FROM sys.ora_invisible_columns h '
+                'WHERE h.relid = a.attrelid AND h.attnum = a.attnum)'
+            )
         found = self._conn.execute(
             'SELECT a.attrelid, a.attnum, a.attname, a.atttypid, a.attnotnull, '
             f'{quoted}, EXISTS (SELECT 1 FROM pg_constraint c '
             "WHERE c.contype = 'c' AND c.conrelid = a.attrelid "
             'AND c.conkey = ARRAY[a.attnum] '
             "AND pg_get_constraintdef(c.oid) ~ '^CHECK \\(+(sys\\.)?ora_is_json\\('), "
-            f'{declared}, {precision} FROM pg_attribute a{joins} '
+            f'{declared}, {precision}, {invisible} FROM pg_attribute a{joins} '
             'WHERE a.attrelid = ANY(%s) AND a.attnum > 0 AND NOT a.attisdropped',
             (list(relids),),
         ).fetchall()
@@ -13353,6 +13310,7 @@ class PostgresBackend:
                 json=row[6],
                 declared=declared_type,
                 tstz_precision=row[11],
+                invisible=row[12],
             )
 
     def _relation_columns(self, name: str) -> dict[int, _TableColumn] | None:
@@ -13367,6 +13325,14 @@ class PostgresBackend:
         if relid not in self._relations:
             self._read_relations({relid})
         return self._relations[relid]
+
+    def _ordered_columns(self, name: str) -> list[_TableColumn] | None:
+        # The schema model's columns of the relation `name`, in order (#1887);
+        # None for no relation.
+        columns = self._relation_columns(name)
+        if not columns:
+            return None
+        return [columns[attnum] for attnum in sorted(columns)]
 
     def _instant_index_keys(self, sql: str) -> str:
         # `sql`, a CREATE INDEX, with each key that is a WITH TIME ZONE column
