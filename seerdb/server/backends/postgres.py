@@ -2135,6 +2135,15 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE TABLE IF NOT EXISTS sys.ora_grants (owner text, object_name text, '
     'privilege text, grantee text, '
     'PRIMARY KEY (owner, object_name, privilege, grantee));'
+    # Who may open a session as whom (#1860): ALTER USER client GRANT CONNECT
+    # THROUGH proxy, and the PROXY_USERS view of them, as 23ai lists one.
+    'CREATE TABLE IF NOT EXISTS sys.ora_proxy_grants (proxy text NOT NULL, '
+    'client text NOT NULL, PRIMARY KEY (proxy, client));'
+    'CREATE OR REPLACE VIEW sys.proxy_users AS SELECT proxy::varchar(128) AS proxy, '
+    'client::varchar(128) AS client, '
+    "'NO'::varchar(3) AS authentication, "
+    "'PROXY MAY ACTIVATE ALL CLIENT ROLES'::varchar(35) AS flags "
+    'FROM sys.ora_proxy_grants;'
     'CREATE OR REPLACE FUNCTION sys.ora_type_visible(owner text, type_name text) '
     "RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT $1 IN ('PUBLIC', 'SYS', "
     "sys.sys_context('userenv', 'session_user')) OR EXISTS (SELECT 1 FROM "
@@ -5007,6 +5016,14 @@ _ALTER_USER_PASSWORD = re.compile(
 _DROP_USER_STATEMENT = re.compile(
     rf'(?is)\s*DROP\s+USER\s+{_USER_NAME}(\s+CASCADE)?\s*;?\s*$'
 )
+# ALTER USER client GRANT | REVOKE CONNECT THROUGH proxy (#1860); whatever
+# follows -- WITH ROLE, AUTHENTICATION REQUIRED -- is not modelled.
+_ALTER_USER_PROXY = re.compile(
+    rf'(?is)\s*ALTER\s+USER\s+{_USER_NAME}\s+(GRANT|REVOKE)\s+CONNECT\s+'
+    rf'THROUGH\s+{_USER_NAME}(?![\w$#])'
+)
+# ORA-38470, a REVOKE CONNECT THROUGH of a grant there is not (#1860).
+_ORA_PROXY_NOT_GRANTED = 38470
 
 
 def _user_name(written: str) -> str:
@@ -11447,6 +11464,13 @@ class PostgresBackend:
         if login is None:
             return
         user = target.upper() if target else login
+        if target and not self._may_proxy(login, user):
+            # Oracle admits a target only where the login was granted CONNECT
+            # THROUGH it (#1860), and refuses any other as a logon denied.
+            raise BackendError(
+                'invalid username/password; logon denied',
+                ora_code=ORA_INVALID_USERNAME_PASSWORD,
+            )
         statement = sql.SQL(
             "SELECT set_config('seerdb.session_user', {}, false), "
             "set_config('seerdb.proxy_user', {}, false)"
@@ -11466,6 +11490,18 @@ class PostgresBackend:
                 self._login_user = user
         except psycopg.Error:
             self._conn.rollback()
+
+    def _may_proxy(self, proxy: str, client: str) -> bool:
+        # Whether `proxy` was granted CONNECT THROUGH to `client` (#1860). A
+        # dictionary that keeps no grants admits none.
+        if not self._has_proxy_grants():
+            return False
+        row = self._catalog_read(
+            'SELECT EXISTS (SELECT 1 FROM sys.ora_proxy_grants '
+            'WHERE proxy = %s AND client = %s)',
+            (proxy, client),
+        ).fetchone()
+        return bool(row and row[0])
 
     def _record_session(self) -> None:
         # This session's row in sys.ora_sessions, and none for backends that have
@@ -16446,6 +16482,13 @@ class PostgresBackend:
                     )
             self._accounts.set(name, _password_text(altered.group(2)))
             return Result()
+        proxied = _ALTER_USER_PROXY.match(statement)
+        if proxied is not None:
+            return self._proxy_grant(
+                _user_name(proxied.group(1)),
+                proxied.group(2).upper() == 'GRANT',
+                _user_name(proxied.group(3)),
+            )
         dropped = _DROP_USER_STATEMENT.match(statement)
         if dropped is not None:
             name = _user_name(dropped.group(1))
@@ -16471,10 +16514,53 @@ class PostgresBackend:
                         ora_code=ORA_CASCADE_REQUIRED,
                     )
                 self._conn.execute(sql.SQL('DROP SCHEMA IF EXISTS {}').format(schema))
+            if self._has_proxy_grants():
+                # Its grants go with it, on either side (#1860).
+                self._conn.execute(
+                    'DELETE FROM sys.ora_proxy_grants WHERE proxy = %s OR client = %s',
+                    (name, name),
+                )
             self._conn.commit()
             self._accounts.drop(name)
             return Result()
         return None
+
+    def _has_proxy_grants(self) -> bool:
+        # Whether the dictionary keeps proxy grants (#1860): an installation
+        # older than them, or one that failed, does not.
+        row = self._catalog_read(
+            "SELECT to_regclass('sys.ora_proxy_grants') IS NOT NULL"
+        ).fetchone()
+        return bool(row and row[0])
+
+    def _proxy_grant(self, client: str, grant: bool, proxy: str) -> Result:
+        # ALTER USER client GRANT | REVOKE CONNECT THROUGH proxy (#1860), with
+        # 23ai's errors: ORA-01918 for a user there is not, on either side, and
+        # ORA-38470 for a REVOKE of a grant there is not.
+        for name in (client, proxy):
+            if not self._user_exists(name):
+                raise BackendError(
+                    f"user '{name}' does not exist", ora_code=ORA_USER_DOES_NOT_EXIST
+                )
+        if not self._has_proxy_grants():
+            raise UnsupportedFeature('proxy grants: the dictionary has no record')
+        if grant:
+            self._at_once(
+                'INSERT INTO sys.ora_proxy_grants VALUES (%s, %s) ON CONFLICT DO NOTHING',
+                (proxy, client),
+            )
+            return Result()
+        row = self._at_once(
+            'DELETE FROM sys.ora_proxy_grants WHERE proxy = %s AND client = %s '
+            'RETURNING 1',
+            (proxy, client),
+        ).fetchone()
+        if row is None:
+            raise BackendError(
+                'A proxy connection cannot be revoked if it was not granted first.',
+                ora_code=_ORA_PROXY_NOT_GRANTED,
+            )
+        return Result()
 
     def change_password(
         self, username: str, old_password: str, new_password: str
