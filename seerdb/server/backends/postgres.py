@@ -11061,6 +11061,8 @@ class PostgresBackend:
         # Each table name a statement names, as its relation's oid -- None for
         # no relation -- for the schema model (#1889); any DDL starts it over.
         self._relids: dict[str, int | None] = {}
+        # The ora_rowid domain's oids, read once a statement asks (#1624).
+        self._rowid_type_oids: frozenset[int] | None = None
         self._has_ddl_guard = False
         self._has_ddl_log = self._install_ddl_log()
         self._conn.execute("SET seerdb.installing = 'off'")
@@ -15825,14 +15827,21 @@ class PostgresBackend:
         return bytes(row[0]) if row and row[0] is not None else b''
 
     def _rowid_columns(self, table: str) -> frozenset[str]:
-        # The ROWID columns of a table a statement names (#1624), lower case.
-        rows = self._conn.execute(
-            'SELECT a.attname FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid '
-            "WHERE a.attrelid = to_regclass(%s) AND t.typname = 'ora_rowid' "
-            'AND NOT a.attisdropped',
-            (table,),
-        ).fetchall()
-        return frozenset(name for (name,) in rows)
+        # The ROWID columns of a table a statement names (#1624), as the
+        # schema model has them (#1884): no catalog query a call.
+        columns = self._relation_columns(table)
+        if not columns:
+            return frozenset()
+        if self._rowid_type_oids is None:
+            rows = self._conn.execute(
+                "SELECT oid FROM pg_type WHERE typname = 'ora_rowid'"
+            ).fetchall()
+            self._rowid_type_oids = frozenset(oid for (oid,) in rows)
+        return frozenset(
+            column.name
+            for column in columns.values()
+            if column.type_oid in self._rowid_type_oids
+        )
 
     def _rowid_number_error(self, sql: str, binds: Sequence) -> BackendError | None:
         """ORA-00932 for a number an INSERT ... VALUES or an UPDATE ... SET puts
