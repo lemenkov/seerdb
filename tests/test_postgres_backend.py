@@ -2392,6 +2392,10 @@ def test_a_rowid_column_type_is_text_and_a_dml_reports_its_rowid() -> None:
         'CREATE TABLE t (n numeric, r ora_rowid, u varchar(4000))'
     )
     assert 'varchar' not in _translate_ddl('CREATE TABLE t AS SELECT ROWID FROM s')
+    # A UROWID(n) holds n bytes at most (#1906).
+    assert _translate_ddl('CREATE TABLE t (u UROWID ( 100 ))') == (
+        'CREATE TABLE t (u varchar(100))'
+    )
 
 
 def test_a_quoted_column_name_keeps_its_column_type() -> None:
@@ -9437,7 +9441,10 @@ def test_the_dictionary_lists_a_rowid_urowid_or_bfile_column_as_itself() -> None
     # answers -- not by the domain, varchar or composite that stores it.
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     try:
-        backend.execute('CREATE TABLE rw1904t (r ROWID, "Rq" ROWID, u UROWID, f BFILE)')
+        backend.execute(
+            'CREATE TABLE rw1904t (r ROWID, "Rq" ROWID, u UROWID, f BFILE, '
+            's UROWID(100))'
+        )
         rows = backend.execute(
             'SELECT column_name, data_type, data_type_owner, data_length, '
             'char_length, char_used, char_col_decl_length FROM all_tab_columns '
@@ -9448,6 +9455,8 @@ def test_the_dictionary_lists_a_rowid_urowid_or_bfile_column_as_itself() -> None
             ('Rq', 'ROWID', None, 10, 0, None, None),
             ('U', 'UROWID', None, 4000, 0, None, None),
             ('F', 'BFILE', None, 530, 0, None, None),
+            # A sized one is its size long (#1906).
+            ('S', 'UROWID', None, 100, 0, None, None),
         ]
     finally:
         backend.rollback()
