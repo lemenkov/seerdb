@@ -1723,12 +1723,17 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN o.data_type IS NULL AND c.data_type = 'double precision' THEN 8 "
     # A NUMBER is 22 bytes whatever its precision (#1483).
     "WHEN o.data_type IS NULL AND c.data_type = 'numeric' THEN 22 "
-    f'WHEN {_REF_COLUMN} THEN 50 ELSE '
+    f'WHEN {_REF_COLUMN} THEN 50 '
+    # A VECTOR is 8200 long whatever its dimensions and format, as 23ai lists
+    # one; its record's length slot holds the dimension count (#1907).
+    "WHEN o.data_type = 'VECTOR' THEN 8200 ELSE "
     'coalesce(o.data_length, c.character_maximum_length, c.numeric_precision, 22) '
     'END AS data_length, '
     # A type recorded as declared keeps its precision and scale as recorded, a
     # NULL one included: INTEGER is numeric(38, 0) here but has none (#1483).
-    '(CASE WHEN o.data_type IS NOT NULL THEN o.data_precision '
+    # A VECTOR's precision slot holds its format (#1708); it has no precision.
+    "(CASE WHEN o.data_type = 'VECTOR' THEN NULL "
+    'WHEN o.data_type IS NOT NULL THEN o.data_precision '
     "WHEN c.data_type IN ('real', 'double precision') "
     'THEN NULL ELSE c.numeric_precision END)'
     '::information_schema.cardinal_number AS data_precision, '
@@ -1743,8 +1748,10 @@ _ORACLE_DICTIONARY_DDL = (
     'WHEN o.data_type IS NOT NULL THEN o.data_scale ELSE c.numeric_scale END)'
     '::information_schema.cardinal_number AS data_scale, '
     # CHAR_LENGTH is 0 for a type with no character length, not NULL (#1418),
-    # a ROWID or UROWID's text included (#1904).
+    # a ROWID or UROWID's text included (#1904). A VECTOR's is its dimension
+    # count, 0 where that is flexible, as 23ai lists it (#1907).
     "(CASE WHEN o.data_type IN ('ROWID', 'UROWID') THEN 0 "
+    "WHEN o.data_type = 'VECTOR' THEN coalesce(o.data_length, 0) "
     'ELSE coalesce(c.character_maximum_length, 0) END)'
     '::information_schema.cardinal_number AS char_length, '
     "CASE c.is_nullable WHEN 'YES' THEN 'Y' ELSE 'N' END AS nullable, "
