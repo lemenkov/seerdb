@@ -15688,15 +15688,24 @@ class PostgresBackend:
             if '$$' in initial:  # it would end the DO block's quoting
                 raise UnsupportedFeature('a bind value holding $$ in a PL/SQL block')
             locals_[name] = (slot, pg_type, initial)
-        self._conn.execute(
-            _translate_idioms(_bind_block(sql, locals_, self._routine_kind))
-        )
+        block = _translate_idioms(_bind_block(sql, locals_, self._routine_kind))
+        slots = list(locals_.values())
+        # The block and the read-back of every bind's value, in one round trip
+        # (#1917).
+        kept = self._conn.cursor()
+        with self._conn.pipeline():
+            self._conn.execute(block)
+            if slots:
+                kept.execute(
+                    'SELECT '
+                    + ', '.join('current_setting(%s, true)' for _slot in slots),
+                    [_BLOCK_BIND_SETTING.format(slot) for slot, _t, _i in slots],
+                )
+        row = kept.fetchone() if slots else None
         values = [b.value if isinstance(b, BindVar) else b for b in binds]
-        for slot, pg_type, _initial in locals_.values():
-            row = self._conn.execute(
-                'SELECT current_setting(%s, true)', (_BLOCK_BIND_SETTING.format(slot),)
-            ).fetchone()
-            text = row[0][1:] if row and row[0] else None
+        for index, (slot, pg_type, _initial) in enumerate(slots):
+            setting = None if row is None else row[index]
+            text = setting[1:] if setting else None
             if pg_type != 'refcursor':
                 values[slot] = (
                     None if text is None else _block_bind_value(pg_type, text)
