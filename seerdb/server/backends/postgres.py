@@ -10263,6 +10263,10 @@ def _while_connected(method):
     def call(self, *args, **kwargs):
         if self._conn.closed:
             raise _session_terminated()
+        # A transaction begun in a pipeline (#1915) that something other
+        # than commit() or rollback() ended -- a COMMIT a routine ran -- turns
+        # autocommit off here, before the call.
+        self._conn.end_own_transaction()
         try:
             return method(self, *args, **kwargs)
         except (psycopg.Error, BackendError):
@@ -10333,10 +10337,35 @@ class _CountedConnection(psycopg.Connection[Any]):
     def commit(self) -> None:
         self.prelude = ()
         super().commit()
+        self.end_own_transaction()
 
     def rollback(self) -> None:
         self.prelude = ()
         super().rollback()
+        self.end_own_transaction()
+
+    def begin_in_pipeline(self, cursor: psycopg.Cursor[Any]) -> None:
+        # Open a transaction with the pipeline's first command (#1915), where
+        # psycopg's own BEGIN is a round trip of its own: it syncs after it.
+        # The connection is then in autocommit for as long as the transaction
+        # lasts -- psycopg's BEGIN is skipped, and autocommit cannot change
+        # inside a transaction -- until its end turns it off again. Set before
+        # the pipeline opens: inside one, setting it syncs, a round trip of its
+        # own. Past the prelude, which goes with the statement after it, inside
+        # the transaction; never prepared.
+        assert self.autocommit
+        psycopg.Cursor.execute(cursor, 'BEGIN', prepare=False)
+
+    def end_own_transaction(self) -> None:
+        # Back to psycopg's own transactions once one begun in a pipeline
+        # has ended (#1915).
+        connection: psycopg.Connection[Any] = self
+        if (
+            connection.autocommit
+            and self.pgconn.transaction_status == psycopg.pq.TransactionStatus.IDLE
+            and self.pgconn.pipeline_status == psycopg.pq.PipelineStatus.OFF
+        ):
+            connection.autocommit = False
 
 
 # The SQLSTATE sys.ora_ddl_unchanged raises (#1889).
@@ -11356,6 +11385,22 @@ class PostgresBackend:
         finally:
             self._conn.autocommit = False
 
+    def _catalog_read(
+        self, statement: str | sql.SQL | sql.Composed, params: Sequence | None = None
+    ) -> psycopg.Cursor:
+        # A read of the catalogs or the Mirror's own records, as a statement is
+        # translated or described. With no transaction open it opens none: it
+        # runs in autocommit (#1915), where psycopg's BEGIN was a round trip of
+        # its own, and the statement after it then opens its transaction in its
+        # own round trip. Each read sees the database as it is, as it did.
+        if self._conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+            return self._conn.execute(statement, params)
+        self._conn.autocommit = True
+        try:
+            return self._conn.execute(statement, params)
+        finally:
+            self._conn.autocommit = False
+
     def set_client_identity(self, identity: dict[str, str]) -> None:
         # program / machine / terminal / osuser, as the client declared them in
         # its first login message; recorded for v$session (#1212).
@@ -11628,13 +11673,26 @@ class PostgresBackend:
         self._release_read_locks()
 
     @contextmanager
-    def _under_savepoint(self, name: str = '_mirror_stmt') -> Iterator[None]:
+    def _under_savepoint(
+        self, name: str = '_mirror_stmt', then: str | None = None
+    ) -> Iterator[None]:
         # The block runs under a savepoint: one that raises is rolled back to it,
         # leaving the rest of the transaction usable as Oracle's is, and the
         # savepoint goes either way. The caller maps the error, AFTER the
         # rollback here: naming it can read the catalog, which a failed
-        # transaction refuses (#1632).
-        self._conn.execute(f'SAVEPOINT {name}')
+        # transaction refuses (#1632). With no transaction open, and no
+        # prelude to go first, the transaction opens with the savepoint, one
+        # round trip, not psycopg's synced BEGIN and then the savepoint (#1915).
+        # `then`, a statement with no parameters, goes in that round trip too.
+        opening = f'SAVEPOINT {name}' + (f'; {then}' if then is not None else '')
+        idle = psycopg.pq.TransactionStatus.IDLE
+        if self._conn.info.transaction_status == idle and not self._conn.prelude:
+            self._conn.autocommit = True
+            psycopg.Cursor.execute(
+                self._conn.cursor(), f'BEGIN; {opening}', prepare=False
+            )
+        else:
+            self._conn.execute(opening)
         try:
             yield
         except Exception:
@@ -12315,7 +12373,7 @@ class PostgresBackend:
             if self._has_column_catalog
             else 'false, false'
         )
-        row = self._conn.execute(
+        row = self._catalog_read(
             'SELECT (SELECT array_agg(ARRAY[lower(t.typname), lower(n.nspname)]) '
             'FROM pg_type t '
             'JOIN pg_namespace n ON n.oid = t.typnamespace '
@@ -12683,7 +12741,7 @@ class PostgresBackend:
 
     def _has_oson_columns(self) -> bool:
         if self._has_oson_cache is None:
-            row = self._conn.execute(
+            row = self._catalog_read(
                 'SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE atttypid = '
                 'to_regtype(%s) AND attnum > 0 AND NOT attisdropped)',
                 (_OSON_TYPE,),
@@ -12715,7 +12773,7 @@ class PostgresBackend:
         # The object types with a RAW attribute, by name and qualified name,
         # lower case, to the positions of their RAW attributes (#1496).
         if self._raw_constructor_cache is None:
-            rows = self._conn.execute(
+            rows = self._catalog_read(
                 'SELECT lower(c.relname), lower(n.nspname), array_agg(x.pos - 1) '
                 'FROM (SELECT attrelid, attnum, row_number() OVER '
                 '(PARTITION BY attrelid ORDER BY attnum) AS pos FROM pg_attribute '
@@ -12899,8 +12957,7 @@ class PostgresBackend:
         if not prunes:
             return
         try:
-            self._conn.execute('; '.join(prunes))
-            self._conn.commit()
+            self._at_once('; '.join(prunes))
         except psycopg.Error:
             self._conn.rollback()
 
@@ -13067,7 +13124,7 @@ class PostgresBackend:
         unknown = [k for k in set(keys.values()) if k not in self._sql_domain_cache]
         login = getattr(self, '_login_user', None)
         for relid, attnum in unknown:
-            row = self._conn.execute(
+            row = self._catalog_read(
                 'SELECT CASE WHEN obj_description(t.oid, %s) = %s THEN '
                 'sys.ora_owner(n.nspname) END, CASE WHEN obj_description(t.oid, %s) = %s '
                 'THEN sys.ora_name(t.typname) END, ARRAY(SELECT ARRAY[o.name, o.value] '
@@ -13141,7 +13198,7 @@ class PostgresBackend:
         if not self._has_invisible_catalog:
             return None
         if self._any_invisible is None:
-            row = self._conn.execute(
+            row = self._catalog_read(
                 'SELECT EXISTS (SELECT 1 FROM sys.ora_invisible_columns)'
             ).fetchone()
             self._any_invisible = bool(row and row[0])
@@ -13350,7 +13407,7 @@ class PostgresBackend:
                 'EXISTS (SELECT 1 FROM sys.ora_invisible_columns h '
                 'WHERE h.relid = a.attrelid AND h.attnum = a.attnum)'
             )
-        found = self._conn.execute(
+        found = self._catalog_read(
             'SELECT a.attrelid, a.attnum, a.attname, a.atttypid, a.attnotnull, '
             f'{quoted}, EXISTS (SELECT 1 FROM pg_constraint c '
             "WHERE c.contype = 'c' AND c.conrelid = a.attrelid "
@@ -13379,7 +13436,7 @@ class PostgresBackend:
         # The schema model's columns of the relation a statement names, as
         # PostgreSQL resolves `name` (#1889); None for no relation.
         if name not in self._relids:
-            row = self._conn.execute('SELECT to_regclass(%s)::oid', (name,)).fetchone()
+            row = self._catalog_read('SELECT to_regclass(%s)::oid', (name,)).fetchone()
             self._relids[name] = None if row is None or row[0] is None else row[0]
         relid = self._relids[name]
         if relid is None:
@@ -14937,15 +14994,14 @@ class PostgresBackend:
         prelude: str | None = None,
     ) -> Result:
         # SAVEPOINT + statement + RELEASE as three round-trips; the fallback path.
-        # A `prelude` runs inside the savepoint first, so a SET LOCAL there is
-        # undone with a statement that fails and ends with one that commits.
+        # A `prelude` runs inside the savepoint first, in its round trip (#1915),
+        # so a SET LOCAL there is undone with a statement that fails and ends
+        # with one that commits.
         # An our-side rejection after the statement ran (UnsupportedFeature on an
         # unmapped column type) is undone too, and left for the session to map.
         cursor = self._conn.cursor()
         try:
-            with self._under_savepoint():
-                if prelude is not None:
-                    cursor.execute(prelude)
+            with self._under_savepoint(then=prelude):
                 cursor.execute(sql, params)
                 result = self._build_result(cursor, sql, original or '')
         except psycopg.Error as exc:
@@ -14982,14 +15038,22 @@ class PostgresBackend:
                 result = self._query_at_once(sql, params, original, fallback)
                 if result is not None:
                     return result
+        begin = self._conn.cursor()
         savepoint = self._conn.cursor()
         guard = self._conn.cursor()
         statement = self._conn.cursor()
         release = self._conn.cursor()
         written = self._conn.cursor()
         self._conn.unwritten_at = None
+        idle = self._conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+        if idle:
+            self._conn.autocommit = True
         try:
             with self._conn.pipeline():
+                if idle:
+                    # The transaction this statement opens, in its round trip
+                    # (#1915).
+                    self._conn.begin_in_pipeline(begin)
                 savepoint.execute('SAVEPOINT _mirror_stmt')
                 if fallback is not None:
                     guard.execute(
@@ -15334,7 +15398,7 @@ class PostgresBackend:
             return
         found = {
             row[0]: row[1:]
-            for row in self._conn.execute(
+            for row in self._catalog_read(
                 "SELECT t.oid, t.typcategory = 'A', target.oid FROM pg_type t "
                 "LEFT JOIN pg_type target ON t.typname ~ '[$]ref$' "
                 'AND target.typnamespace = t.typnamespace '
@@ -16131,7 +16195,7 @@ class PostgresBackend:
         if not columns:
             return frozenset()
         if self._rowid_type_oids is None:
-            rows = self._conn.execute(
+            rows = self._catalog_read(
                 "SELECT oid FROM pg_type WHERE typname = 'ora_rowid'"
             ).fetchall()
             self._rowid_type_oids = frozenset(oid for (oid,) in rows)
@@ -16201,7 +16265,7 @@ class PostgresBackend:
         if self._package_function_cache is None:
             found: dict[str, set[str]] = {}
             if self._has_package_catalog:
-                for package, name in self._conn.execute(
+                for package, name in self._catalog_read(
                     'SELECT k.name, p.proname FROM sys.ora_packages k '
                     'JOIN pg_namespace n ON n.nspname = k.name '
                     'JOIN pg_proc p ON p.pronamespace = n.oid '
