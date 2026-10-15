@@ -9580,6 +9580,57 @@ def test_another_sessions_ddl_reaches_what_a_session_knows_of_the_schema() -> No
         other.close()
 
 
+def test_a_describe_reads_a_tables_columns_in_one_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # What a describe needs of a table's columns -- NOT NULL, a quoted name,
+    # an IS JSON check, the declared type, a time zone precision -- comes from
+    # the schema model, read in one query per result (#1872, #1887), with one
+    # more for the result's types; a repeat reads nothing.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    sent: list[str] = []
+    execute = psycopg.Cursor.execute
+    off = psycopg.pq.PipelineStatus.OFF
+
+    def recorded(cursor: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
+        text = str(query)
+        if cursor.connection.pgconn.pipeline_status == off and (
+            'pg_current_xact_id_if_assigned' not in text
+        ):
+            sent.append(text)
+        return execute(cursor, query, *args, **kwargs)
+
+    query = 'SELECT id, "low", doc, r, ts FROM dm1872t'
+    try:
+        backend.execute(
+            'CREATE TABLE dm1872t (id NUMBER NOT NULL, "low" NUMBER, '
+            'doc VARCHAR2(200) CHECK (doc IS JSON), r RAW(16), '
+            'ts TIMESTAMP(3) WITH TIME ZONE)'
+        )
+        # A computed item traces to no table: this reads the schema-wide
+        # facts (whether any RAW column or SQL domain exists) and no relation.
+        backend.execute('SELECT count(*) FROM dm1872t')
+        monkeypatch.setattr(psycopg.Cursor, 'execute', recorded)
+        columns = backend.execute(query).columns
+        assert len(sent) <= 2, sent
+        assert [c.null_ok for c in columns] == [0, 1, 1, 1, 1]
+        assert columns[1].name == b'low'
+        assert columns[2].is_json
+        assert columns[3].data_length == 16
+        assert columns[4].scale == 3
+        sent.clear()
+        backend.execute(query)
+        assert sent == []
+    finally:
+        monkeypatch.undo()
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE dm1872t')
+        except Exception:
+            backend.rollback()
+        backend.close()
+
+
 def test_the_mirrors_own_setup_is_not_logged_as_ddl() -> None:
     # Every connect runs the Mirror's setup DDL again; logged, it would make
     # every session forget its schema knowledge at every connect (#1887).

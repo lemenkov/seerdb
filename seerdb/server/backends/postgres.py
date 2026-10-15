@@ -249,7 +249,7 @@ import struct
 import threading
 import time
 import uuid
-from collections.abc import Callable, Collection, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -10357,6 +10357,16 @@ class _AccountStore:
             )
 
 
+class _TableColumn(NamedTuple):
+    # A table column as the schema model knows it (#1887).
+    type_oid: int  # its declared type: a domain, where a result reports the base
+    not_null: bool
+    quoted: bool  # created with a quoted all-lower-case name (#1204)
+    json: bool  # checked IS JSON (#1626)
+    declared: tuple | None  # sys.ora_columns: type, length, precision, scale (#1386)
+    tstz_precision: int | None  # a WITH TIME ZONE column's precision (#1308)
+
+
 class PostgresBackend:
     """A :class:`~seerdb.server.Backend` over a psycopg connection.
 
@@ -10487,15 +10497,13 @@ class PostgresBackend:
         self._ref_targets: dict[int, int | None] = {}
         self._ref_composites: dict[int, CompositeInfo] = {}
         # Collections (#1206): the collection type each array-domain oid stands
-        # for (None for any other type); whether a result oid is an array at all;
-        # and the declared type of each (relid, attnum) an array column traces
-        # back to -- PostgreSQL describes a domain column by its base type.
+        # for (None for any other type), and whether a result oid is an array at
+        # all; an array column's declared type is the schema model's.
         self._collection_types: dict[int, DbObjectType | None] = {}
         # The attribute types being described, so a type that reached itself
         # would be refused rather than recursed into (#1265).
         self._describing: set[int] = set()
         self._array_oids: dict[int, bool] = {}
-        self._column_types: dict[tuple[int, int], int] = {}
         # Pipeline mode ships a statement's SAVEPOINT / statement / RELEASE in one
         # network round-trip instead of three (a 3x per-statement latency cut
         # against a remote database). It needs libpq >= 14; older builds fall back
@@ -10629,13 +10637,12 @@ class PostgresBackend:
         # Create the typed domains and map each domain's oid to the Oracle wire type
         # it stands for, so a result column tracing back to one is encoded as that
         # Oracle type — ora_clob / ora_blob as a LOB (#534), ora_intervalym as
-        # INTERVAL YEAR TO MONTH (#504). Best-effort, like the composite above; a
-        # (relid, attnum) → type cache avoids re-querying the catalog for a column
-        # already seen. The ora_intervalym oid is kept on its own for the OUT-bind
-        # path, which has no result column to trace and matches on the arg type.
+        # INTERVAL YEAR TO MONTH (#504). Best-effort, like the composite above;
+        # a column's declared type is the schema model's. The ora_intervalym oid
+        # is kept on its own for the OUT-bind path, which has no result column
+        # to trace and matches on the arg type.
         self._intervalym_oid: int | None = None
         self._domain_type_by_oid: dict[int, int] = {}
-        self._domain_col_cache: dict[tuple[int, int], int | None] = {}
         try:
             self._conn.execute(_LOB_TYPE_DDL)
             self._conn.execute(_INTERVALYM_TYPE_DDL)
@@ -10770,14 +10777,10 @@ class PostgresBackend:
             "SELECT to_regclass('sys.ora_tstz_precision') IS NOT NULL"
         ).fetchone()
         self._has_tstz_precision = bool(row and row[0])
-        # A WITH TIME ZONE column's recorded precision, by (relid, attnum), None
-        # for one not recorded (#1308); any DDL starts it over.
-        self._tstz_precision_cache: dict[tuple[int, int], int | None] = {}
-        self._quoted_col_cache: dict[tuple[int, int], bool] = {}
-        # Whether a table column is NOT NULL, by (relid, attnum) (#1307); any DDL
-        # starts it over, as a column's constraint may have changed.
-        self._not_null_cache: dict[tuple[int, int], bool] = {}
-        self._json_col_cache: dict[tuple[int, int], bool] = {}
+        # The schema model (#1887): each relation's columns by attnum, as a
+        # result column traced to one describes it, read in one query for the
+        # relations a result names; any DDL starts it over.
+        self._relations: dict[int, dict[int, _TableColumn]] = {}
         # INVISIBLE columns (#1195): whether the catalog exists, whether any
         # table has one (None: not yet read; reset by any DDL), and the visible
         # columns of the tables that do.
@@ -10785,9 +10788,8 @@ class PostgresBackend:
             "SELECT to_regclass('sys.ora_invisible_columns') IS NOT NULL"
         ).fetchone()
         self._has_invisible_catalog = bool(row and row[0])
-        # Declared Oracle column types (#1386): whether the catalog exists, and its
-        # rows by (relid, attnum) -- None for a column with none; any DDL starts
-        # it over.
+        # Declared Oracle column types (#1386): whether the catalog exists; its
+        # rows are the schema model's.
         row = self._conn.execute(
             "SELECT to_regclass('sys.ora_columns') IS NOT NULL"
         ).fetchone()
@@ -10804,7 +10806,6 @@ class PostgresBackend:
         ).fetchone()
         self._has_package_catalog = bool(row and row[0])
         self._plsql_types: dict[int, tuple[str, str, str, dict] | None] = {}
-        self._column_type_cache: dict[tuple[int, int], tuple | None] = {}
         self._collection_name_cache: frozenset[str] | None = None
         # Each package's functions a call may name without parentheses (#1651).
         self._package_function_cache: dict[str, frozenset[str]] | None = None
@@ -10869,16 +10870,10 @@ class PostgresBackend:
         self._object_types.clear()
         self._collection_types.clear()
         self._array_oids.clear()
-        self._column_types.clear()
+        self._relations.clear()
         self._has_sql_domains_cache = None
         self._sql_domain_cache.clear()
-        self._domain_col_cache.clear()
-        self._tstz_precision_cache.clear()
-        self._quoted_col_cache.clear()
-        self._not_null_cache.clear()
-        self._json_col_cache.clear()
         self._plsql_types.clear()
-        self._column_type_cache.clear()
         self._collection_name_cache = None
         self._package_function_cache = None
         self._forget_raw_targets()
@@ -12405,7 +12400,7 @@ class PostgresBackend:
         # table with it.
         if not self._has_column_catalog:
             return
-        self._column_type_cache.clear()
+        self._relations.clear()
         # The per-relation layouts too: a DDL can drop a table and create
         # another of its name with other columns (#1749).
         self._boolean_column_cache.clear()
@@ -12508,27 +12503,11 @@ class PostgresBackend:
 
     def _declared_column_types(self, pgresult, indexes: list[int]) -> dict[int, tuple]:
         # The declared type recorded for each result column at `indexes` that
-        # comes straight from a table column (#1386), traced through libpq
-        # ftable / ftablecol and cached per (relid, attnum).
-        keys = {}
-        for index in indexes:
-            relid = pgresult.ftable(index)
-            if relid:
-                keys[index] = (relid, pgresult.ftablecol(index))
-        unknown = {k for k in keys.values() if k not in self._column_type_cache}
-        if unknown and self._has_column_catalog:
-            found = self._conn.execute(
-                'SELECT relid, attnum, data_type, data_length, data_precision, '
-                'data_scale FROM sys.ora_columns WHERE relid = ANY(%s)',
-                ([relid for relid, _attnum in unknown],),
-            ).fetchall()
-            recorded = {(row[0], row[1]): tuple(row[2:]) for row in found}
-            for key in unknown:
-                self._column_type_cache[key] = recorded.get(key)
+        # comes straight from a table column (#1386).
         return {
-            index: declared
-            for index, key in keys.items()
-            if (declared := self._column_type_cache.get(key)) is not None
+            index: column.declared
+            for index, column in self._table_columns(pgresult, indexes).items()
+            if column.declared is not None
         }
 
     def _record_annotations(
@@ -12638,9 +12617,7 @@ class PostgresBackend:
         # cache of visible columns starts over either way.
         self._any_invisible = None
         self._visible_cache.clear()
-        self._not_null_cache.clear()
-        self._json_col_cache.clear()
-        self._tstz_precision_cache.clear()
+        self._relations.clear()
         if visibility is None or not self._has_invisible_catalog:
             return
         (table, hidden, shown, _only) = visibility
@@ -12810,97 +12787,109 @@ class PostgresBackend:
 
     def _tstz_precisions(self, pgresult, indexes: list[int]) -> dict[int, int]:
         # The recorded precision of each WITH TIME ZONE result column at
-        # `indexes` that comes straight from a table column (#1308), traced
-        # through libpq ftable / ftablecol and cached per (relid, attnum).
-        keys = {}
-        for index in indexes:
-            relid = pgresult.ftable(index)
-            if relid:
-                keys[index] = (relid, pgresult.ftablecol(index))
-        unknown = {k for k in keys.values() if k not in self._tstz_precision_cache}
-        if unknown and self._has_tstz_precision:
-            found = self._conn.execute(
-                'SELECT relid, attnum, prec FROM sys.ora_tstz_precision '
-                'WHERE relid = ANY(%s)',
-                ([relid for relid, _attnum in unknown],),
-            ).fetchall()
-            recorded = {(relid, attnum): prec for relid, attnum, prec in found}
-            for key in unknown:
-                self._tstz_precision_cache[key] = recorded.get(key)
+        # `indexes` that comes straight from a table column (#1308).
         return {
-            index: prec
-            for index, key in keys.items()
-            if (prec := self._tstz_precision_cache.get(key)) is not None
+            index: column.tstz_precision
+            for index, column in self._table_columns(pgresult, indexes).items()
+            if column.tstz_precision is not None
         }
 
     def _quoted_lower_columns(self, pgresult, indexes: list[int]) -> set[int]:
         # Which of the result columns at `indexes` -- each one whose name the
         # folding rule would upper-case -- were created with a quoted
-        # all-lower-case name, so Oracle reports them as written (#1204). Traced
-        # through libpq ftable / ftablecol to the table column, cached per
-        # (relid, attnum); a computed column has no table and keeps the rule.
+        # all-lower-case name, so Oracle reports them as written (#1204); a
+        # computed column has no table and keeps the rule.
+        columns = self._table_columns(pgresult, indexes)
+        return {index for index, column in columns.items() if column.quoted}
+
+    def _not_null_columns(self, pgresult, count: int) -> set[int]:
+        # Which result columns come straight from a NOT NULL table column, which
+        # Oracle describes as not nullable (#1307); a computed column has no
+        # table and stays nullable, as in Oracle.
+        columns = self._table_columns(pgresult, range(count))
+        return {index for index, column in columns.items() if column.not_null}
+
+    def _json_columns(self, pgresult, count: int) -> set[int]:
+        # Which result columns come straight from a table column with an IS
+        # JSON check constraint (#1626), which Oracle describes as JSON, so a
+        # client hands back the parsed value.
+        columns = self._table_columns(pgresult, range(count))
+        return {index for index, column in columns.items() if column.json}
+
+    def _table_columns(
+        self, pgresult, indexes: Iterable[int]
+    ) -> dict[int, _TableColumn]:
+        # The table column each result column at `indexes` comes straight from,
+        # traced through libpq ftable / ftablecol, from the schema model
+        # (#1887). The relations not yet read are read together, in one query;
+        # a computed column, or one of a relation gone since, has none.
         keys = {}
         for index in indexes:
             relid = pgresult.ftable(index)
             if relid:
                 keys[index] = (relid, pgresult.ftablecol(index))
-        unknown = {key for key in keys.values() if key not in self._quoted_col_cache}
+        unknown = {relid for relid, _attnum in keys.values()} - self._relations.keys()
         if unknown:
-            found = self._conn.execute(
-                'SELECT relid, attnum FROM sys.ora_quoted_names WHERE relid = ANY(%s)',
-                ([relid for relid, _attnum in unknown],),
-            ).fetchall()
-            recorded = {(relid, attnum) for relid, attnum in found}
-            for key in unknown:
-                self._quoted_col_cache[key] = key in recorded
-        return {index for index, key in keys.items() if self._quoted_col_cache[key]}
+            self._read_relations(unknown)
+        return {
+            index: column
+            for index, (relid, attnum) in keys.items()
+            if (column := self._relations[relid].get(attnum)) is not None
+        }
 
-    def _not_null_columns(self, pgresult, count: int) -> set[int]:
-        # Which result columns come straight from a NOT NULL table column, which
-        # Oracle describes as not nullable (#1307). Traced through libpq
-        # ftable / ftablecol, cached per (relid, attnum); a computed column has
-        # no table and stays nullable, as in Oracle.
-        keys = {}
-        for index in range(count):
-            relid = pgresult.ftable(index)
-            if relid:
-                keys[index] = (relid, pgresult.ftablecol(index))
-        unknown = {key for key in keys.values() if key not in self._not_null_cache}
-        if unknown:
-            found = self._conn.execute(
-                'SELECT attrelid, attnum FROM pg_attribute '
-                'WHERE attrelid = ANY(%s) AND attnum > 0 AND attnotnull',
-                ([relid for relid, _attnum in unknown],),
-            ).fetchall()
-            not_null = {(relid, attnum) for relid, attnum in found}
-            for key in unknown:
-                self._not_null_cache[key] = key in not_null
-        return {index for index, key in keys.items() if self._not_null_cache[key]}
-
-    def _json_columns(self, pgresult, count: int) -> set[int]:
-        # Which result columns come straight from a table column with an IS
-        # JSON check constraint (#1626), which Oracle describes as JSON, so a
-        # client hands back the parsed value. The constraint is stored as
-        # sys.ora_is_json(column) (#1614); one with NOT before it is no such
-        # column. Traced and cached as _not_null_columns is.
-        keys = {}
-        for index in range(count):
-            relid = pgresult.ftable(index)
-            if relid:
-                keys[index] = (relid, pgresult.ftablecol(index))
-        unknown = {key for key in keys.values() if key not in self._json_col_cache}
-        if unknown:
-            found = self._conn.execute(
-                'SELECT conrelid, conkey[1] FROM pg_constraint '
-                "WHERE contype = 'c' AND conrelid = ANY(%s) "
-                'AND cardinality(conkey) = 1 '
-                "AND pg_get_constraintdef(oid) ~ '^CHECK \\(+(sys\\.)?ora_is_json\\('",
-                ([relid for relid, _attnum in unknown],),
-            ).fetchall()
-            json = {(relid, attnum) for relid, attnum in found}
-            for key in unknown:
-                self._json_col_cache[key] = key in json
-        return {index for index, key in keys.items() if self._json_col_cache[key]}
+    def _read_relations(self, relids: set[int]) -> None:
+        # Read these relations' columns into the schema model (#1887): each
+        # column's type, whether it is NOT NULL (#1307), created with a quoted
+        # all-lower-case name (#1204) or checked IS JSON (#1626) -- stored as
+        # sys.ora_is_json(column) (#1614), one with NOT before it being no such
+        # column -- its declared Oracle type (#1386) and its WITH TIME ZONE
+        # precision (#1308). A catalog this session's dictionary lacks leaves
+        # its part empty.
+        quoted, declared, precision, joins = (
+            'false',
+            'NULL, NULL, NULL, NULL',
+            'NULL',
+            '',
+        )
+        if self._has_quoted_names:
+            quoted = (
+                'EXISTS (SELECT 1 FROM sys.ora_quoted_names q '
+                'WHERE q.relid = a.attrelid AND q.attnum = a.attnum)'
+            )
+        if self._has_column_catalog:
+            declared = 'o.data_type, o.data_length, o.data_precision, o.data_scale'
+            joins += (
+                ' LEFT JOIN sys.ora_columns o '
+                'ON o.relid = a.attrelid AND o.attnum = a.attnum'
+            )
+        if self._has_tstz_precision:
+            precision = 'p.prec'
+            joins += (
+                ' LEFT JOIN sys.ora_tstz_precision p '
+                'ON p.relid = a.attrelid AND p.attnum = a.attnum'
+            )
+        found = self._conn.execute(
+            'SELECT a.attrelid, a.attnum, a.atttypid, a.attnotnull, '
+            f'{quoted}, EXISTS (SELECT 1 FROM pg_constraint c '
+            "WHERE c.contype = 'c' AND c.conrelid = a.attrelid "
+            'AND c.conkey = ARRAY[a.attnum] '
+            "AND pg_get_constraintdef(c.oid) ~ '^CHECK \\(+(sys\\.)?ora_is_json\\('), "
+            f'{declared}, {precision} FROM pg_attribute a{joins} '
+            'WHERE a.attrelid = ANY(%s) AND a.attnum > 0 AND NOT a.attisdropped',
+            (list(relids),),
+        ).fetchall()
+        for relid in relids:
+            self._relations[relid] = {}
+        for row in found:
+            declared_type = None if row[6] is None else tuple(row[6:10])
+            self._relations[row[0]][row[1]] = _TableColumn(
+                type_oid=row[2],
+                not_null=row[3],
+                quoted=row[4],
+                json=row[5],
+                declared=declared_type,
+                tstz_precision=row[10],
+            )
 
     def _build_result(self, cursor, sql: str = '', original: str = '') -> Result:
         # Turn an executed statement's cursor into a Result: a row count for a
@@ -12917,6 +12906,7 @@ class PostgresBackend:
             if desc.type_code in (self._tstz_oid, _TIMESTAMPTZ_OID):
                 for row in rows:
                     row[i] = _wire_cell(row[i], desc.type_code, self._tstz_oid)
+        self._learn_types({desc.type_code for desc in cursor.description})
         columns = []
         for i, desc in enumerate(cursor.description):
             # A column tracing back to a typed domain is that Oracle type — an
@@ -13227,14 +13217,8 @@ class PostgresBackend:
             return (
                 self._constructed_collection_type(constructor) if constructor else None
             )
-        key = (relid, pgresult.ftablecol(index))
-        if key not in self._column_types:
-            row = self._conn.execute(
-                'SELECT atttypid FROM pg_attribute WHERE attrelid = %s AND attnum = %s',
-                key,
-            ).fetchone()
-            self._column_types[key] = row[0] if row else 0
-        return self._collection_type(self._column_types[key])
+        column = self._table_columns(pgresult, [index]).get(index)
+        return self._collection_type(column.type_oid) if column else None
 
     def _constructed_collection_type(self, name: str) -> DbObjectType | None:
         # The collection type a constructor call names, or None when the name
@@ -14696,6 +14680,34 @@ class PostgresBackend:
             type_oid=_object_type_oid(type_pg_oid),
         )
 
+    def _learn_types(self, oids: set[int]) -> None:
+        # Whether each of these result types is an array (#1206) and what a
+        # `<type>$ref` companion's target is (#1127), read together in one query
+        # for the types not yet known; a builtin scalar is neither.
+        unknown = [
+            oid
+            for oid in oids - _BUILTIN_OIDS
+            if oid not in self._array_oids or oid not in self._ref_targets
+        ]
+        for oid in oids & _BUILTIN_OIDS:
+            self._array_oids[oid] = False
+        if not unknown:
+            return
+        found = {
+            row[0]: row[1:]
+            for row in self._conn.execute(
+                "SELECT t.oid, t.typcategory = 'A', target.oid FROM pg_type t "
+                "LEFT JOIN pg_type target ON t.typname ~ '[$]ref$' "
+                'AND target.typnamespace = t.typnamespace '
+                "AND target.typname || '$ref' = t.typname WHERE t.oid = ANY(%s)",
+                (unknown,),
+            ).fetchall()
+        }
+        for oid in unknown:
+            is_array, target = found.get(oid, (False, None))
+            self._array_oids[oid] = bool(is_array)
+            self._ref_targets[oid] = None if target is None else int(target)
+
     def _ref_target(self, pg_oid: int) -> int | None:
         # For a `<type>$ref` companion composite, the pg_type oid of <type>;
         # None for any other type. Cached per session.
@@ -14746,25 +14758,12 @@ class PostgresBackend:
         # TNS_TYPE_INTERVALYM (ora_intervalym, #504) — else None. A domain value
         # reports its base type on the wire (text / bytea / interval), so trace the
         # column back to its source table + attribute (libpq ftable / ftablecol) and
-        # read the real declared type from pg_attribute — cached per (relid, attnum).
-        # A computed column (ftable 0) isn't a domain column.
+        # take the real declared type from the schema model (#1887). A computed
+        # column (ftable 0) isn't a domain column.
         if not self._domain_type_by_oid:
             return None
-        relid = pgresult.ftable(index)
-        if not relid:
-            return None
-        attnum = pgresult.ftablecol(index)
-        key = (relid, attnum)
-        if key not in self._domain_col_cache:
-            row = self._conn.execute(
-                'SELECT atttypid FROM pg_attribute WHERE attrelid = %s AND attnum = %s',
-                (relid, attnum),
-            ).fetchone()
-            atttypid = row[0] if row else None
-            self._domain_col_cache[key] = (
-                self._domain_type_by_oid.get(atttypid) if atttypid is not None else None
-            )
-        return self._domain_col_cache[key]
+        column = self._table_columns(pgresult, [index]).get(index)
+        return self._domain_type_by_oid.get(column.type_oid) if column else None
 
     def _returns_a_value(self, name: str) -> bool:
         # Whether every function of this name returns a value of its own: not
