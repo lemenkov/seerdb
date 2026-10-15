@@ -12363,15 +12363,26 @@ class PostgresBackend:
         # after, read together in one query (#1918), each until a DDL: the
         # collection types' names, whether any column is a recorded RAW
         # (#1496), and whether any column could owe a describe a SQL domain or
-        # annotations (#1711). A database with no column catalog has no RAW or
-        # annotation to find.
+        # annotations (#1711); and the object types with a RAW attribute, each
+        # with the positions of its RAW attributes (#1496, #1331). A database
+        # with no column catalog has no RAW or annotation to find.
         recorded = (
             "EXISTS (SELECT 1 FROM sys.ora_columns WHERE data_type = 'RAW'), "
             'EXISTS (SELECT 1 FROM sys.ora_annotations) OR EXISTS '
             "(SELECT 1 FROM pg_type WHERE typtype = 'd' AND "
-            "obj_description(oid, 'pg_type') = %s)"
+            "obj_description(oid, 'pg_type') = %s), "
+            '(SELECT json_agg(json_build_array(typname, schema, positions)) FROM '
+            '(SELECT lower(c.relname) AS typname, lower(n.nspname) AS schema, '
+            'array_agg(x.pos - 1) AS positions '
+            'FROM (SELECT attrelid, attnum, row_number() OVER '
+            '(PARTITION BY attrelid ORDER BY attnum) AS pos FROM pg_attribute '
+            'WHERE attnum > 0 AND NOT attisdropped) x '
+            'JOIN sys.ora_columns o ON o.relid = x.attrelid '
+            "AND o.attnum = x.attnum AND o.data_type = 'RAW' "
+            "JOIN pg_class c ON c.oid = x.attrelid AND c.relkind = 'c' "
+            'JOIN pg_namespace n ON n.oid = c.relnamespace GROUP BY 1, 2) r)'
             if self._has_column_catalog
-            else 'false, false'
+            else 'false, false, NULL'
         )
         row = self._catalog_read(
             'SELECT (SELECT array_agg(ARRAY[lower(t.typname), lower(n.nspname)]) '
@@ -12392,6 +12403,11 @@ class PostgresBackend:
         )
         self._has_raw_targets_cache = bool(row[1])
         self._has_sql_domains_cache = bool(row[2])
+        self._raw_constructor_cache = {
+            key: frozenset(positions)
+            for typname, schema, positions in row[3] or ()
+            for key in (typname, f'{schema}.{typname}')
+        }
 
     def _json_dot_notation(self, sql: str) -> str:
         """Oracle's simple dot notation into a JSON column, `alias.column.key
@@ -12772,22 +12788,10 @@ class PostgresBackend:
     def _raw_constructors(self) -> dict[str, frozenset[int]]:
         # The object types with a RAW attribute, by name and qualified name,
         # lower case, to the positions of their RAW attributes (#1496).
+        # Read with the other schema facts (#1331).
         if self._raw_constructor_cache is None:
-            rows = self._catalog_read(
-                'SELECT lower(c.relname), lower(n.nspname), array_agg(x.pos - 1) '
-                'FROM (SELECT attrelid, attnum, row_number() OVER '
-                '(PARTITION BY attrelid ORDER BY attnum) AS pos FROM pg_attribute '
-                'WHERE attnum > 0 AND NOT attisdropped) x '
-                'JOIN sys.ora_columns o ON o.relid = x.attrelid '
-                "AND o.attnum = x.attnum AND o.data_type = 'RAW' "
-                "JOIN pg_class c ON c.oid = x.attrelid AND c.relkind = 'c' "
-                'JOIN pg_namespace n ON n.oid = c.relnamespace GROUP BY 1, 2'
-            ).fetchall()
-            self._raw_constructor_cache = {
-                key: frozenset(positions)
-                for typname, schema, positions in rows
-                for key in (typname, f'{schema}.{typname}')
-            }
+            self._read_schema_facts()
+        assert self._raw_constructor_cache is not None
         return self._raw_constructor_cache
 
     def _to_raw_targets(self, sql: str) -> str:
