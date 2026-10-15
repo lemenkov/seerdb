@@ -8778,6 +8778,28 @@ def test_a_pg_hint_marks_a_native_statement() -> None:
     assert not _PG_HINT.match('/*' + '*//*' * 100_000)
 
 
+def test_native_sql_is_off_unless_the_operator_allows_it() -> None:
+    # Native PostgreSQL SQL (#1556) is the operator's choice, off by default
+    # (#1859). Off, a /*+ PG */ hint is one Oracle does not know, so the
+    # statement is Oracle's, translated -- SYSDATE is Oracle's, where native
+    # SQL would find no such column -- and ALTER SESSION SET seerdb_dialect is
+    # a parameter Oracle does not have, ORA-02248 as 23ai answers.
+    import datetime
+
+    from seerdb.server import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        (value,) = backend.execute('SELECT /*+ PG */ sysdate FROM dual').rows[0]
+        assert isinstance(value, datetime.datetime)
+        with pytest.raises(BackendError) as raised:
+            backend.execute("ALTER SESSION SET seerdb_dialect = 'postgres'")
+        assert raised.value.ora_code == 2248
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_native_postgresql_over_the_oracle_connection() -> None:
     # A statement hinted PG, or any in a session switched to the postgres
     # dialect, runs untranslated (#1556): ROWNUM and SYSDATE are then plain
@@ -8786,7 +8808,7 @@ def test_native_postgresql_over_the_oracle_connection() -> None:
     # type with no Oracle form is refused by name.
     from seerdb.server.backends.postgres import UnsupportedFeature
 
-    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), native_sql=True)
     try:
         result = backend.execute(
             'SELECT /*+ PG */ x AS rownum FROM generate_series(1, 3) x WHERE x >= :1',
@@ -8885,7 +8907,7 @@ def test_the_translation_report_records_runs_apart_from_the_transaction() -> Non
     from seerdb.server import BackendError
 
     backend = PostgresBackend(
-        _CONNINFO, credentials=dict(_CREDS), translation_report=True
+        _CONNINFO, credentials=dict(_CREDS), translation_report=True, native_sql=True
     )
     probe = psycopg.connect(_CONNINFO, autocommit=True)
     marker = 'rep1557t'

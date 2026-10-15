@@ -29,6 +29,7 @@ the defaults; the command line wins. The config file is INI::
     presents = 23ai             ; postgres: 23ai | 12.1
     auth_conninfo = ...         ; postgres: accounts kept in the database
     translation_report = no     ; postgres: log each statement's translation
+    native_sql = no             ; postgres: let clients run native PostgreSQL SQL
     ; upstream = host:port/service   ; passthrough
     ; field_version = 24             ; passthrough: skip probing the upstream
 
@@ -113,6 +114,13 @@ def _parser() -> argparse.ArgumentParser:
         action='store_true',
         default=None,
         help="log each statement's translation to sys.ora_translation_log",
+    )
+    postgres.add_argument(
+        '--native-sql',
+        action='store_true',
+        default=None,
+        help='let clients run native PostgreSQL SQL: a /*+ PG */ hint, or '
+        "ALTER SESSION SET seerdb_dialect = 'postgres'",
     )
     passthrough = commands.add_parser(
         'passthrough', help='relay to a real Oracle database'
@@ -247,6 +255,9 @@ def build(
                 'no',
             )
         )
+        native_sql = _flag(
+            option(getattr(args, 'native_sql', None), backend, 'native_sql', 'no')
+        )
         if not credentials and auth_conninfo is None:
             raise SystemExit(
                 'no accounts to serve: list them under [clients] or in '
@@ -263,6 +274,7 @@ def build(
                 translation_report=report,
                 auth_conninfo=auth_conninfo,
                 presents=presents,
+                native_sql=native_sql,
             )
 
         return Launch(

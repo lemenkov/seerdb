@@ -81,6 +81,7 @@ For `postgres`:
 | `--presents` | `23ai` | the Oracle release the Mirror presents: `23ai` or `12.1` |
 | `--auth-conninfo` | | keep the accounts in the database, connecting as this role (see *Accounts*) |
 | `--translation-report` | off | record each statement's translation in `sys.ora_translation_log` |
+| `--native-sql` | off | let clients run native PostgreSQL SQL (see *Native PostgreSQL*) |
 
 For `passthrough`:
 
@@ -115,6 +116,7 @@ conninfo = host=db dbname=app user=mirror password=...
 presents = 23ai
 ; auth_conninfo = host=db dbname=app user=mirror_auth password=...
 ; translation_report = no
+; native_sql = no
 
 ; For a passthrough instead:
 ; type = passthrough
@@ -202,9 +204,10 @@ builds PostgreSQL 16 with both, as CI uses it.
 ### Which role to connect as
 
 **The role in the connection string is the Mirror's security boundary.** Every
-account the Mirror serves runs as that one PostgreSQL role, and a client can
-send native PostgreSQL through the Mirror (below). So whatever that role may do
-in PostgreSQL, every Mirror user may do. Give the Mirror a role of its own:
+account the Mirror serves runs as that one PostgreSQL role, and with
+`--native-sql` a client can send native PostgreSQL through the Mirror (below).
+So whatever that role may do in PostgreSQL, every Mirror user may do. Give the
+Mirror a role of its own:
 
 - **not a superuser**;
 - owning the database it serves, or at least its schemas, and nothing outside it;
@@ -240,7 +243,8 @@ separate databases, each with its own role.
 
 ### Native PostgreSQL
 
-A statement can bypass translation and run as PostgreSQL:
+With `--native-sql` (`native_sql = yes` in the config file), a statement can
+bypass translation and run as PostgreSQL:
 
 ```sql
 SELECT /*+ PG */ CAST(jsonb_build_object('a', n) AS text) FROM generate_series(1, 3) AS g(n)
@@ -253,7 +257,11 @@ statement at a time. Binds stay Oracle's (`:name`, `:1`). Since an Oracle client
 reads `::type` as a bind, write casts as `CAST(x AS type)`. A result of a type
 with no Oracle form (`jsonb`, `uuid`, arrays, ...) is refused by name.
 
-Native SQL is always available to every account, which is why the role matters.
+It is off unless the operator turns it on. Off, the `/*+ PG */` hint is ignored,
+as Oracle ignores a hint it doesn't know, so the statement is translated as
+Oracle SQL. `ALTER SESSION SET seerdb_dialect` is refused with ORA-02248, as
+Oracle refuses a parameter it doesn't have. On, it is available to every
+account, which is why the role matters.
 
 ## Passthrough
 
