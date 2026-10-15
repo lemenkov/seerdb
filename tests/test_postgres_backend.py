@@ -10481,7 +10481,8 @@ def test_a_ddl_prunes_its_records_and_rereads_the_schema_once(
     # After a DDL (#1918): the records of the columns and types it took away
     # are pruned in one round trip, not one per catalog, and the statement
     # after it reads the schema-wide facts -- collection names, RAW columns,
-    # SQL domains -- in one query, not one each.
+    # SQL domains, the object types' RAW attributes -- in one query, not one
+    # each.
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     sent: list[str] = []
     execute = psycopg.Cursor.execute
@@ -10503,9 +10504,12 @@ def test_a_ddl_prunes_its_records_and_rereads_the_schema_once(
         assert prunes[0].count('DELETE FROM sys.ora_') == 3
         sent.clear()
         backend.execute('SELECT 1 FROM dual')
+        # The object types' RAW attributes come with them (#1331).
+        backend._raw_constructors()
         monkeypatch.undo()
         facts = [q for q in sent if "data_type = 'RAW'" in q or 'typcategory' in q]
         assert len(facts) == 1, facts
+        assert [q for q in sent if 'array_agg(x.pos - 1)' in q] == facts
         (left,) = _fetched_row(
             backend._conn.execute(
                 'SELECT count(*) FROM sys.ora_columns WHERE relid = %s', (relid,)
