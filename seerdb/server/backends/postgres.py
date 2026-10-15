@@ -5452,10 +5452,25 @@ def _with_raw_length_checks(sql: str) -> str:
     return sql
 
 
+# A table's character column, with its length (#1896); not one that names a
+# collation of its own.
+_CHARACTER_COLUMN = re.compile(
+    r'([(,]\s*(?:"[^"]*"|[A-Za-z_][\w$#]*)\s+'
+    r'(?:N?VARCHAR2|VARCHAR|N?CHAR(?:ACTER)?(?:\s+VARYING)?)\b'
+    r'(?:\s*\(\s*\d+\s*(?:CHAR|BYTE)?\s*\))?)(?!\s*(?:\(|COLLATE\b))',
+    re.IGNORECASE,
+)
+
+
 def _translate_column_types(text: str) -> str:
     # A table's column types, Oracle's to PostgreSQL's: CREATE TABLE's columns
     # and those an ALTER TABLE adds or modifies (#1414).
     text = _DDL_DATE_COLUMN.sub(_DATE_TYPE, text)
+    # A character column compares and sorts byte by byte, as Oracle's default
+    # NLS_SORT BINARY does, whatever the database's collation (#1896). In the
+    # C collation an index on it also serves a LIKE prefix, which PostgreSQL
+    # serves from no other collation's index.
+    text = _CHARACTER_COLUMN.sub(r'\1 COLLATE "C"', text)
     # Before the type rewrites: BINARY_FLOAT / BINARY_DOUBLE become real and
     # double precision there, which this would catch.
     text = _DDL_FLOAT_COLUMN.sub('numeric', text)
