@@ -552,6 +552,46 @@ def test_a_constant_select_item_is_found() -> None:
     assert _constant_items('SELECT * FROM t') == set()
 
 
+def test_a_select_lists_readings_are_kept_per_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The describe reads a query's select list six ways on every call, each a
+    # pass of the tokenizer; each reading depends on the text alone, so it is
+    # kept per text (#1884). A long text is read every time.
+    import seerdb.server.backends.postgres as pg
+
+    passes: list[str] = []
+    real = pg._top_level_words
+
+    def counted(text: str, *args: Any, **kwargs: Any) -> Any:
+        passes.append(text)
+        return real(text, *args, **kwargs)
+
+    monkeypatch.setattr(pg, '_top_level_words', counted)
+    readings = (
+        pg._computed_column_types,
+        pg._computed_national_columns,
+        pg._computed_vector_columns,
+        pg._constant_items,
+        pg._constructor_items,
+        pg._expression_names,
+    )
+    sql = "SELECT n + 1, CAST(a AS NVARCHAR2(5)), t_arr(1), 'x' FROM t1884k"
+    first = [reading(sql) for reading in readings]
+    assert len(passes) >= len(readings)
+    passes.clear()
+    assert [reading(sql) for reading in readings] == first
+    assert passes == []
+    long = sql + ' WHERE ' + ' AND '.join(['n = 1'] * 2000)
+    for reading in readings:
+        reading(long)
+    passes.clear()
+    assert [reading(long) for reading in readings] == [
+        reading(sql) for reading in readings
+    ]
+    assert len(passes) >= len(readings)
+
+
 def test_a_one_element_constructor_is_spelt_as_a_call() -> None:
     # `name('x')` for a collection type: PostgreSQL reads it as a cast to the
     # type, so it is spelt `name(VARIADIC ARRAY['x'])` (#1435). Other calls,
