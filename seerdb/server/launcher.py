@@ -7,6 +7,7 @@
     seerdb-mirror passthrough db.example.com:1521/FREEPDB1
     seerdb-mirror --config mirror.ini
     seerdb-mirror observe
+    seerdb-mirror profile compare oracle.json postgres.json --html report.html
 
 Options come from the command line, then a config file (``--config``), then
 the defaults; the command line wins. The config file is INI::
@@ -47,6 +48,7 @@ import logging
 import os
 import signal
 import ssl
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
@@ -88,6 +90,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='seerdb-mirror',
         description='Serve Oracle clients from PostgreSQL or a real Oracle.',
+        epilog='seerdb-mirror profile compare BASELINE CANDIDATE compares two '
+        'profiles recorded with --profile.',
     )
     parser.add_argument('-c', '--config', help='an INI file of options')
     parser.add_argument('--host', help='listen address (default 127.0.0.1)')
@@ -348,6 +352,13 @@ def build(
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ['profile']:
+        # Not a server: the migration profile's tools (#1882).
+        from seerdb.server.profile_compare import main as profile_main
+
+        profile_main(argv[1:])
+        return
     launch = build(argv)
     logging.basicConfig(
         level=launch.log_level,
