@@ -1348,6 +1348,20 @@ _INDEX_KEY_COLUMN: Final = (
 # `<type>$ref` companion (#1905).
 _REF_COLUMN: Final = "c.data_type = 'USER-DEFINED' AND right(c.udt_name, 4) = '$ref'"
 
+# What an Oracle ALL_* view lists: what the session's user owns, or holds a
+# privilege on (#1857). PostgreSQL's catalogs show every role everything, so a
+# view on them asks the privilege functions, which answer for the session's
+# role; one on information_schema is filtered already. An index's privilege
+# is its table's.
+_ANY_TABLE_PRIVILEGE: Final = (
+    "'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'"
+)
+
+
+def _reachable_relation(relation: str) -> str:
+    return f'has_table_privilege({relation}, {_ANY_TABLE_PRIVILEGE})'
+
+
 _ORACLE_DICTIONARY_DDL = (
     # SYS_CONTEXT('userenv', <param>) — the session context the dialect reads to
     # learn its current schema/user before it reflects anything.
@@ -1596,10 +1610,12 @@ _ORACLE_DICTIONARY_DDL = (
     'max_value, increment_by, cycle_flag, order_flag, cache_size, last_number '
     'FROM all_sequences WHERE sequence_owner=upper(current_schema());'
     'CREATE OR REPLACE VIEW sys.all_mviews AS SELECT upper(schemaname) AS owner, '
-    'ora_name(matviewname) AS mview_name, definition AS query FROM pg_matviews;'
+    'ora_name(matviewname) AS mview_name, definition AS query FROM pg_matviews '
+    'WHERE ' + _reachable_relation("format('%I.%I', schemaname, matviewname)") + ';'
     'CREATE OR REPLACE VIEW sys.all_mview_comments AS SELECT upper(schemaname) AS owner, '
     "ora_name(matviewname) AS mview_name, obj_description((quote_ident(schemaname)||'.'||"
-    'quote_ident(matviewname))::regclass) AS comments FROM pg_matviews;'
+    'quote_ident(matviewname))::regclass) AS comments FROM pg_matviews '
+    'WHERE ' + _reachable_relation("format('%I.%I', schemaname, matviewname)") + ';'
     # INVISIBLE columns (#1195): a 12.1 column attribute PostgreSQL has no equal
     # for, recorded by the column's own identity so a rename keeps it.
     'CREATE TABLE IF NOT EXISTS sys.ora_invisible_columns ('
@@ -1808,14 +1824,16 @@ _ORACLE_DICTIONARY_DDL = (
     'FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace '
     'JOIN pg_attribute a ON a.attrelid=c.oid '
     "WHERE a.attnum>0 AND NOT a.attisdropped AND c.relkind IN ('r','v','m') "
-    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    f'AND {_reachable_relation("c.oid")};'
     'CREATE OR REPLACE VIEW sys.all_tab_comments AS SELECT ora_owner(n.nspname) AS owner, '
     'ora_name(c.relname) AS table_name, '
     "CASE c.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' "
     "ELSE 'TABLE' END AS table_type, obj_description(c.oid) AS comments "
     'FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace '
     "WHERE c.relkind IN ('r','v','m') "
-    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    f'AND {_reachable_relation("c.oid")};'
     # all_users: every schema is an Oracle user. get_schema_names()/has_schema()
     # read username from here; the emulation schemas (oracle, sys) and PostgreSQL's
     # own (pg_*, information_schema) are hidden, so a reflecting client sees the
@@ -1859,7 +1877,8 @@ _ORACLE_DICTIONARY_DDL = (
     # (pg_attribute.attidentity 'a'=ALWAYS, 'd'=BY DEFAULT). The dialect JOINs this
     # on every get_columns once it believes the server is 12c, so it must exist or
     # reflection raises ORA-00942. Options are reported as Oracle's defaults for now.
-    """CREATE OR REPLACE VIEW sys.all_tab_identity_cols AS SELECT ora_owner(n.nspname) AS owner, ora_name(c.relname) AS table_name, ora_column_name(a.attrelid, a.attname) AS column_name, CASE a.attidentity WHEN 'a' THEN 'ALWAYS' ELSE 'BY DEFAULT' END AS generation_type, ora_name(c.relname || '_' || a.attname || '_seq') AS sequence_name, 'START WITH: 1, INCREMENT BY: 1, MAX_VALUE: 9999999999999999999999999999, MIN_VALUE: 1, CYCLE_FLAG: N, CACHE_SIZE: 20, ORDER_FLAG: N' AS identity_options FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE a.attidentity IN ('a','d') AND NOT a.attisdropped AND a.attnum>0 AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"""
+    """CREATE OR REPLACE VIEW sys.all_tab_identity_cols AS SELECT ora_owner(n.nspname) AS owner, ora_name(c.relname) AS table_name, ora_column_name(a.attrelid, a.attname) AS column_name, CASE a.attidentity WHEN 'a' THEN 'ALWAYS' ELSE 'BY DEFAULT' END AS generation_type, ora_name(c.relname || '_' || a.attname || '_seq') AS sequence_name, 'START WITH: 1, INCREMENT BY: 1, MAX_VALUE: 9999999999999999999999999999, MIN_VALUE: 1, CYCLE_FLAG: N, CACHE_SIZE: 20, ORDER_FLAG: N' AS identity_options FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE a.attidentity IN ('a','d') AND NOT a.attisdropped AND a.attnum>0 AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') """
+    f'AND {_reachable_relation("c.oid")};'
     'CREATE OR REPLACE VIEW sys.all_objects AS SELECT '
     "CASE WHEN n.nspname LIKE 'pg_temp%' THEN upper(current_schema()) "
     'ELSE upper(n.nspname) END AS owner, '
@@ -1874,19 +1893,25 @@ _ORACLE_DICTIONARY_DDL = (
     'FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace '
     "WHERE c.relkind IN ('r','v','m','i','S') "
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    "AND CASE c.relkind WHEN 'i' THEN (SELECT "
+    + _reachable_relation('x.indrelid')
+    + ' FROM pg_index x WHERE x.indexrelid = c.oid) '
+    "WHEN 'S' THEN has_sequence_privilege(c.oid, 'USAGE,SELECT,UPDATE') "
+    f'ELSE {_reachable_relation("c.oid")} END '
     # A package's spec and body, VALID or INVALID as they compiled (#1605).
     'UNION ALL SELECT k.owner, upper(k.name), NULL::text, n.oid::bigint, '
     "t.object_type, t.status, 'N', 'N', 'N' FROM sys.ora_packages k "
     'JOIN pg_namespace n ON n.nspname = k.name CROSS JOIN LATERAL '
     "(VALUES ('PACKAGE', k.spec), ('PACKAGE BODY', k.body)) t(object_type, status) "
-    'WHERE t.status IS NOT NULL '
+    "WHERE t.status IS NOT NULL AND has_schema_privilege(n.oid, 'USAGE') "
     # A user's standalone procedure or function, VALID or INVALID (#1606).
     'UNION ALL SELECT ora_owner(n.nspname), ora_name(p.proname), NULL::text, '
     "p.oid::bigint, CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, "
     f"substr(d.description, {len(_ROUTINE_MARK) + 1}), 'N', 'N', 'N' "
     'FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace '
     "JOIN pg_description d ON d.objoid = p.oid AND d.classoid = 'pg_proc'::regclass "
-    f"AND d.objsubid = 0 WHERE d.description LIKE '{_ROUTINE_MARK}%';"
+    f"AND d.objsubid = 0 WHERE d.description LIKE '{_ROUTINE_MARK}%' "
+    "AND has_function_privilege(p.oid, 'EXECUTE');"
     # orafce has a user_objects too, which lists every schema's objects under
     # their PostgreSQL names; this one is the current schema's, Oracle's way.
     'CREATE OR REPLACE VIEW sys.user_objects AS SELECT * FROM all_objects '
@@ -1901,6 +1926,7 @@ _ORACLE_DICTIONARY_DDL = (
     "'NO' AS parallel, 'NO' AS interface, 'NO' AS deterministic, "
     "'DEFINER' AS authid FROM sys.ora_packages k "
     'JOIN pg_namespace n ON n.nspname = k.name '
+    "WHERE has_schema_privilege(n.oid, 'USAGE') "
     'UNION ALL SELECT owner, object_name, procedure_name, object_id, '
     '(row_number() OVER (PARTITION BY object_id ORDER BY declared, oid))::integer, '
     'CASE WHEN count(*) OVER (PARTITION BY object_id, procedure_name) > 1 THEN '
@@ -1912,13 +1938,15 @@ _ORACLE_DICTIONARY_DDL = (
     "position(('.' || p.proname || '(') IN lower(k.stubs)) AS declared "
     'FROM sys.ora_packages k JOIN pg_namespace n ON n.nspname = k.name '
     'JOIN pg_proc p ON p.pronamespace = n.oid) m WHERE declared > 0 '
+    "AND has_schema_privilege(object_id::oid, 'USAGE') "
     'UNION ALL SELECT ora_owner(n.nspname), ora_name(p.proname), NULL::text, '
     'p.oid::bigint, 1, NULL::text, '
     "CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, "
     "'NO', 'NO', 'NO', 'NO', 'NO', 'DEFINER' "
     'FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace '
     "JOIN pg_description d ON d.objoid = p.oid AND d.classoid = 'pg_proc'::regclass "
-    f"AND d.objsubid = 0 WHERE d.description = '{_ROUTINE_MARK}VALID';"
+    f"AND d.objsubid = 0 WHERE d.description = '{_ROUTINE_MARK}VALID' "
+    "AND has_function_privilege(p.oid, 'EXECUTE');"
     'CREATE OR REPLACE VIEW sys.user_procedures AS SELECT * FROM all_procedures '
     'WHERE owner=upper(current_schema());'
     # The types a package's spec declares (#1607), as 23ai lists them; a named
@@ -1931,7 +1959,8 @@ _ORACLE_DICTIONARY_DDL = (
     "(t.meta->>'attributes')::integer AS attributes, "
     "t.meta->>'contains_plsql' AS contains_plsql "
     'FROM sys.ora_plsql_types t JOIN sys.ora_packages k ON k.name = t.package '
-    "WHERE t.public AND t.meta ? 'typecode';"
+    "WHERE t.public AND t.meta ? 'typecode' "
+    "AND has_schema_privilege(to_regnamespace(k.name), 'USAGE');"
     'CREATE OR REPLACE VIEW sys.all_plsql_type_attrs AS SELECT k.owner, '
     'upper(t.package) AS package_name, t.name AS type_name, '
     "a.v->>'name' AS attr_name, NULL::text AS attr_type_mod, "
@@ -1944,7 +1973,8 @@ _ORACLE_DICTIONARY_DDL = (
     "coalesce(a.v->'type'->>'char_used', 'B') AS char_used "
     'FROM sys.ora_plsql_types t JOIN sys.ora_packages k ON k.name = t.package '
     "CROSS JOIN LATERAL jsonb_array_elements(t.meta->'attrs') "
-    'WITH ORDINALITY a(v, n) WHERE t.public;'
+    'WITH ORDINALITY a(v, n) WHERE t.public '
+    "AND has_schema_privilege(to_regnamespace(k.name), 'USAGE');"
     'CREATE OR REPLACE VIEW sys.all_plsql_coll_types AS SELECT k.owner, '
     'upper(t.package) AS package_name, t.name AS type_name, '
     "t.meta->>'coll_type' AS coll_type, (t.meta->>'upper_bound')::integer "
@@ -1959,7 +1989,8 @@ _ORACLE_DICTIONARY_DDL = (
     "'YES' AS nulls_stored, coalesce(t.meta->'elem'->>'char_used', 'B') "
     "AS char_used, t.meta->>'index_by' AS index_by "
     'FROM sys.ora_plsql_types t JOIN sys.ora_packages k ON k.name = t.package '
-    "WHERE t.public AND t.meta ? 'coll_type';"
+    "WHERE t.public AND t.meta ? 'coll_type' "
+    "AND has_schema_privilege(to_regnamespace(k.name), 'USAGE');"
     'CREATE OR REPLACE VIEW sys.all_constraints AS SELECT ora_owner(tc.constraint_schema) '
     'AS owner, ora_name(tc.constraint_name) AS constraint_name, '
     "CASE tc.constraint_type WHEN 'PRIMARY KEY' THEN 'P' WHEN 'FOREIGN KEY' THEN 'R' "
@@ -1995,7 +2026,8 @@ _ORACLE_DICTIONARY_DDL = (
     'JOIN pg_namespace n ON n.oid=ic.relnamespace '
     'JOIN pg_class tc ON tc.oid=ix.indrelid '
     'JOIN pg_namespace tn ON tn.oid=tc.relnamespace '
-    "WHERE n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    "WHERE n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    f'AND {_reachable_relation("tc.oid")};'
     'CREATE OR REPLACE VIEW sys.all_ind_columns AS SELECT ora_owner(n.nspname) AS index_owner, '
     'ora_name(ic.relname) AS index_name, ora_owner(tn.nspname) AS table_owner, '
     'ora_name(tc.relname) AS table_name, '
@@ -2011,7 +2043,8 @@ _ORACLE_DICTIONARY_DDL = (
     'JOIN pg_namespace tn ON tn.oid=tc.relnamespace '
     'CROSS JOIN LATERAL unnest(ix.indkey::int2[], ix.indoption::int2[]) WITH ORDINALITY AS k(attnum, opt, n) '
     f'JOIN pg_attribute a ON a.attrelid=tc.oid AND {_INDEX_KEY_COLUMN} '
-    "WHERE n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    "WHERE n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    f'AND {_reachable_relation("tc.oid")};'
     # A DESC column in an index is a function-based index in Oracle: the column
     # appears here as the quoted expression "COL" at its position, so reflection
     # (which LEFT JOINs on column_position) renders it as an expression with DESC
@@ -2034,7 +2067,8 @@ _ORACLE_DICTIONARY_DDL = (
     'WITH ORDINALITY AS k(attnum, opt, n) '
     f'JOIN pg_attribute a ON a.attrelid=tc.oid AND {_INDEX_KEY_COLUMN} '
     'WHERE ((k.opt & 1) = 1 OR k.attnum = 0) '
-    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    f'AND {_reachable_relation("tc.oid")};'
     # v$session / v$session_connect_info (#1212): the sessions of this database,
     # a SID being the backend's pid (as the login reply names it) and the
     # identity columns the ones the client declared.
@@ -2159,7 +2193,7 @@ _ORACLE_DICTIONARY_DDL = (
     'AND a.attnum > 0 AND NOT a.attisdropped) AS attributes '
     'FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace '
     'JOIN pg_class c ON c.oid = t.typrelid '
-    "WHERE t.typtype = 'c' AND c.relkind = 'c' "
+    "WHERE t.typtype = 'c' AND c.relkind = 'c' AND has_type_privilege(t.oid, 'USAGE') "
     f"AND t.typname <> '{_TSTZ_TYPE}' AND t.typname !~ '[$]ref$' "
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
     # A package's types are its own, listed in all_plsql_types (#1607).
@@ -2170,7 +2204,7 @@ _ORACLE_DICTIONARY_DDL = (
     "decode(lpad(to_hex(d.oid::bigint), 32, '0'), 'hex'), 'COLLECTION', 0 "
     'FROM pg_type d JOIN pg_namespace n ON n.oid = d.typnamespace '
     "JOIN pg_type b ON b.oid = d.typbasetype AND b.typcategory = 'A' "
-    "WHERE d.typtype = 'd' "
+    "WHERE d.typtype = 'd' AND has_type_privilege(d.oid, 'USAGE') "
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
     'AND n.nspname NOT IN (SELECT name FROM sys.ora_packages)) v WHERE sys.ora_type_visible(v.owner, v.type_name);'
     'CREATE OR REPLACE VIEW sys.user_types AS SELECT * FROM all_types '
@@ -2291,7 +2325,7 @@ _ORACLE_DICTIONARY_DDL = (
     'LEFT JOIN LATERAL (SELECT substring(pg_get_constraintdef(c.oid) '
     "FROM '<=\\s*([0-9]+)')::int AS bound FROM pg_constraint c "
     'WHERE c.contypid = d.oid LIMIT 1) k ON true '
-    "WHERE d.typtype = 'd' "
+    "WHERE d.typtype = 'd' AND has_type_privilege(d.oid, 'USAGE') "
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
     'AND n.nspname NOT IN (SELECT name FROM sys.ora_packages)) v WHERE sys.ora_type_visible(v.owner, v.type_name);'
     'CREATE OR REPLACE VIEW sys.user_coll_types AS SELECT * FROM all_coll_types '

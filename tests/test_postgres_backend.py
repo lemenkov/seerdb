@@ -34,6 +34,7 @@ from seerdb.server.backends.postgres import (  # noqa: E402
     _IS_DDL,
     _NO_OP,
     _REF_SELECT,
+    _ROUTINE_MARK,
     OraInterval,
     PostgresBackend,
     _backend_error,
@@ -1910,6 +1911,71 @@ def test_a_role_writes_only_the_records_of_what_it_owns() -> None:
         admin.execute('DELETE FROM sys.ora_packages WHERE name = %s', (role,))
         admin.execute(f'DROP TABLE IF EXISTS public.{role}_other')
         admin.execute(f'DROP SCHEMA IF EXISTS {role} CASCADE')
+        if admin.execute(
+            'SELECT 1 FROM pg_roles WHERE rolname = %s', (role,)
+        ).fetchone():
+            admin.execute(f'DROP OWNED BY {role}')
+            admin.execute(f'DROP ROLE {role}')
+        admin.close()
+
+
+def test_the_dictionary_lists_what_the_sessions_role_may_reach() -> None:
+    # Oracle's ALL_* views list what the user owns or holds a privilege on
+    # (#1857); PostgreSQL's catalogs show every role everything. A role sees
+    # the table, index, routine and type it was granted, and not the others.
+    PostgresBackend(_CONNINFO, credentials=_CREDS).close()
+    role = f'reach_probe_{os.getpid()}'
+    granted, hidden = f'{role}_granted', f'{role}_hidden'
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    # The views, and the record of grants ALL_TYPES reads with the session's
+    # rights (#1621).
+    views = (
+        'sys.all_objects, sys.all_indexes, sys.all_tab_comments, sys.all_types, '
+        'sys.ora_grants'
+    )
+    try:
+        admin.execute(f'CREATE ROLE {role}')
+        admin.execute(f'GRANT USAGE ON SCHEMA sys TO {role}')
+        admin.execute(f'GRANT SELECT ON {views} TO {role}')
+        for name in (granted, hidden):
+            admin.execute(f'CREATE TABLE public.{name} (a int PRIMARY KEY)')
+            admin.execute(
+                f'CREATE FUNCTION public.{name}_f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$'
+            )
+            admin.execute(f'REVOKE EXECUTE ON FUNCTION public.{name}_f() FROM PUBLIC')
+            admin.execute(
+                f"COMMENT ON FUNCTION public.{name}_f() IS '{_ROUTINE_MARK}VALID'"
+            )
+            admin.execute(f'CREATE TYPE public.{name}_t AS (a int)')
+            admin.execute(f'REVOKE USAGE ON TYPE public.{name}_t FROM PUBLIC')
+        admin.execute(f'GRANT SELECT ON public.{granted} TO {role}')
+        admin.execute(f'GRANT EXECUTE ON FUNCTION public.{granted}_f() TO {role}')
+        admin.execute(f'GRANT USAGE ON TYPE public.{granted}_t TO {role}')
+        with psycopg.connect(_CONNINFO, autocommit=True) as conn:
+            conn.execute(f'SET ROLE {role}')
+
+            def names(query: str) -> set[str]:
+                return {
+                    row[0].lower() for row in conn.execute(query, (f'{role.upper()}%',))
+                }
+
+            assert names(
+                'SELECT object_name FROM sys.all_objects WHERE object_name LIKE %s'
+            ) == {granted, f'{granted}_pkey', f'{granted}_f'}
+            assert names(
+                'SELECT index_name FROM sys.all_indexes WHERE index_name LIKE %s'
+            ) == {f'{granted}_pkey'}
+            assert names(
+                'SELECT table_name FROM sys.all_tab_comments WHERE table_name LIKE %s'
+            ) == {granted}
+            assert names(
+                'SELECT type_name FROM sys.all_types WHERE type_name LIKE %s'
+            ) == {f'{granted}_t'}
+    finally:
+        for name in (granted, hidden):
+            admin.execute(f'DROP TABLE IF EXISTS public.{name}')
+            admin.execute(f'DROP FUNCTION IF EXISTS public.{name}_f()')
+            admin.execute(f'DROP TYPE IF EXISTS public.{name}_t')
         if admin.execute(
             'SELECT 1 FROM pg_roles WHERE rolname = %s', (role,)
         ).fetchone():
