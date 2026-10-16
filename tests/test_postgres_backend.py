@@ -11,6 +11,7 @@ skips — the same pattern as the live-Oracle integration tests.
 from __future__ import annotations
 
 import array
+import contextlib
 import datetime
 import os
 import re
@@ -18,6 +19,7 @@ import socket
 import sys
 import threading
 import time
+from collections.abc import Callable, Iterator
 from decimal import Decimal
 from typing import Any, TypeVar, cast
 
@@ -28,6 +30,8 @@ from seerdb.common.vector import SparseVector
 from seerdb.server import PacketStream, serve_session
 
 psycopg = pytest.importorskip('psycopg')
+from psycopg.conninfo import make_conninfo  # noqa: E402
+
 from seerdb.server.backends.postgres import (  # noqa: E402
     _DICTIONARY_STAMP,
     _HELPER_FUNCTIONS_DDL,
@@ -357,7 +361,11 @@ def test_an_object_type_brings_its_ref_companions() -> None:
     out = _translate_ddl('CREATE TYPE person_t AS OBJECT (id NUMBER)')
     assert out.startswith('CREATE TYPE person_t AS (id numeric); ')
     assert 'CREATE TYPE person_t$ref AS (tab oid, id uuid)' in out
-    assert 'CREATE FUNCTION sys.deref(r person_t$ref) RETURNS person_t' in out
+    # Its sys.deref() overload, made as the installer for the session's own
+    # type (#1857).
+    assert (
+        "SELECT sys.ora_make_deref('person_t$ref'::regtype, 'person_t'::regtype)" in out
+    )
     # Dropped first, without CASCADE: a REF column still holding the type keeps
     # the drop refused, as Oracle's ORA-02303 does.
     drop = _translate_ddl('DROP TYPE person_t')
@@ -1243,7 +1251,8 @@ def test_a_replaced_type_is_dropped_and_created() -> None:
     # exist, and a replaced object type gets new ones (#1127).
     companions_first = (
         "DO $$ BEGIN IF to_regtype('s.o$ref') IS NOT NULL THEN "
-        'DROP FUNCTION sys.deref(s.o$ref); DROP TYPE s.o$ref; END IF; END $$'
+        "PERFORM sys.ora_drop_deref(to_regtype('s.o$ref')); DROP TYPE s.o$ref; "
+        'END IF; END $$'
         '; DROP TYPE IF EXISTS s.o; CREATE TYPE s.o AS (a numeric)'
     )
     replaced_object = _type_ddl('CREATE OR REPLACE TYPE s.o AS OBJECT (a NUMBER)')
@@ -1982,6 +1991,209 @@ def test_the_dictionary_lists_what_the_sessions_role_may_reach() -> None:
             admin.execute(f'DROP OWNED BY {role}')
             admin.execute(f'DROP ROLE {role}')
         admin.close()
+
+
+def test_the_users_group_may_use_every_schema_the_installation_makes() -> None:
+    # A user's role reaches the installation through its group (#1857): every
+    # schema the backend creates for it must be in the group's grants.
+    import inspect
+
+    from seerdb.server.backends import postgres as postgres_backend
+
+    made = {
+        name.lower()
+        for name in re.findall(
+            r'CREATE SCHEMA IF NOT EXISTS ([a-z_]+)',
+            inspect.getsource(postgres_backend),
+            re.IGNORECASE,
+        )
+    }
+    assert made == set(postgres_backend._INSTALLED_SCHEMAS)
+
+
+@contextlib.contextmanager
+def _per_user_mirror(conninfo: str, admin: str) -> Iterator[Callable[..., Any]]:
+    # A Mirror in per-user mode (#1857) over `conninfo`, with one configured
+    # account, `admin`, serving each connection on a thread of its own; yields
+    # the login function. Sessions that failed are reported as it ends.
+    from seerdb.server.backends import postgres as postgres_backend
+
+    auth = f'{conninfo} application_name=auth1857'
+    postgres_backend._ACCOUNTS_READY.discard(auth)
+    postgres_backend._USER_GROUP_READY.pop(conninfo, None)
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(8)
+    errors: list[BaseException] = []
+
+    def serve_one(conn: socket.socket) -> None:
+        try:
+            backend = PostgresBackend(
+                conninfo,
+                credentials={admin.upper(): 'adm123'},
+                auth_conninfo=auth,
+                per_user_roles=True,
+            )
+            try:
+                serve_session(PacketStream(conn), backend)
+            finally:
+                backend.close()
+        except Exception as exc:  # noqa: BLE001 - surfaced to the test thread
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    def accept() -> None:
+        while True:
+            try:
+                conn, _ = listen.accept()
+            except OSError:
+                return
+            threading.Thread(target=serve_one, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=accept, daemon=True).start()
+    port = listen.getsockname()[1]
+
+    def login(user: str, password: str) -> Any:
+        return seerdb.connect(
+            host='127.0.0.1',
+            port=port,
+            user=user,
+            password=password,
+            service_name='XE',
+            timeout=20000,
+        )
+
+    try:
+        yield login
+    finally:
+        listen.close()
+    assert errors == []
+
+
+def _drop_mirror_roles(pg: Any, *names: str) -> None:
+    # The roles per-user mode made for `names` (#1857), once their sessions are
+    # gone, with their schemas and accounts.
+    for name in names:
+        pg.execute(f'DROP SCHEMA IF EXISTS {name} CASCADE')
+        if pg.execute('SELECT 1 FROM pg_roles WHERE rolname = %s', (name,)).fetchone():
+            _wait_sessions_gone(pg, name)
+            pg.execute(f'DROP OWNED BY {name} CASCADE')
+            pg.execute(f'DROP ROLE {name}')
+        if pg.execute("SELECT to_regclass('seerdb_auth.accounts')").fetchone()[0]:
+            pg.execute(
+                'DELETE FROM seerdb_auth.accounts WHERE username = %s', (name.upper(),)
+            )
+
+
+def _wait_sessions_gone(pg: Any, role: str) -> None:
+    for _ in range(50):
+        if not pg.execute(
+            'SELECT 1 FROM pg_stat_activity WHERE usename = %s', (role,)
+        ).fetchone():
+            return
+        time.sleep(0.1)
+
+
+def _users_kept_apart(
+    login: Callable[..., Any], pg: Any, admin: str, user: str
+) -> None:
+    # What per-user mode promises (#1857): each session is its user's own
+    # role; a user it creates sees only what is its own, makes an object type
+    # of its own, and may not run a DBA's statement. A user with a session
+    # open is not dropped (ORA-01940); once it has none, DROP USER takes its
+    # role.
+    adm = login(admin, 'adm123')
+    cur = adm.cursor()
+    cur.execute('create table secret (n number)')
+    cur.execute(f'create user {user} identified by pw123')
+    session = login(user, 'pw123')
+    mine = session.cursor()
+    mine.execute('create table mine (a number)')
+    mine.execute('insert into mine values (1)')
+    mine.execute('select a from mine')
+    assert mine.fetchall() == [(1,)]
+    mine.execute('create type mine_t as object (n number)')
+    mine.execute('drop type mine_t')
+    assert pg.execute(
+        'SELECT usename FROM pg_stat_activity WHERE usename IN (%s, %s) '
+        'ORDER BY usename',
+        (admin, user),
+    ).fetchall() == [(admin,), (user,)]
+    for statement, code in (
+        (f'select * from {admin}.secret', 942),
+        ('create user pu_evil identified by x', 1031),
+        ("create directory pu_dir as '/tmp'", 1031),
+    ):
+        with pytest.raises(seerdb.DatabaseError) as raised:
+            mine.execute(statement)
+        assert raised.value.code == code, statement
+    mine.execute("select count(*) from all_objects where object_name = 'SECRET'")
+    assert mine.fetchall() == [(0,)]
+    with pytest.raises(seerdb.DatabaseError) as raised:
+        cur.execute(f'drop user {user} cascade')
+    assert str(raised.value) == (
+        'ORA-01940: cannot drop a user who is currently connected'
+    )
+    session.close()
+    _wait_sessions_gone(pg, user)
+    cur.execute(f'drop user {user} cascade')
+    assert (
+        pg.execute('SELECT 1 FROM pg_roles WHERE rolname = %s', (user,)).fetchone()
+        is None
+    )
+    cur.execute('drop table secret')
+    adm.close()
+
+
+def test_per_user_roles_keep_the_users_apart() -> None:
+    admin, user = f'pu_adm_{os.getpid()}', f'pu_user_{os.getpid()}'
+    pg = psycopg.connect(_CONNINFO, autocommit=True)
+    try:
+        with _per_user_mirror(_CONNINFO, admin) as login:
+            _users_kept_apart(login, pg, admin, user)
+            # A role that is no member of the group -- made with another
+            # installation's grants, say -- is made one again as it logs in.
+            group = f'{pg.info.user}_mirror_users'
+            pg.execute(f'REVOKE {group} FROM {admin}')
+            again = login(admin, 'adm123')
+            again.cursor().execute('select count(*) from all_objects')
+            again.close()
+            assert pg.execute(
+                "SELECT pg_has_role(%s, %s, 'MEMBER')", (admin, group)
+            ).fetchone() == (True,)
+    finally:
+        _drop_mirror_roles(pg, user, admin)
+        pg.close()
+
+
+def test_per_user_roles_with_an_installer_that_is_no_superuser() -> None:
+    # As a deployment runs it (#1857): the Mirror's role owns its database and
+    # may make roles, but is no superuser; a superuser made the extensions.
+    pid = os.getpid()
+    (installer, database) = (f'pu_inst_{pid}', f'pu_db_{pid}')
+    admin, user = f'pu_iadm_{pid}', f'pu_iuser_{pid}'
+    pg = psycopg.connect(_CONNINFO, autocommit=True)
+    conninfo = make_conninfo(
+        _CONNINFO, user=installer, password='inst123', dbname=database
+    )
+    try:
+        pg.execute(f"CREATE ROLE {installer} LOGIN CREATEROLE PASSWORD 'inst123'")
+        pg.execute(f'CREATE DATABASE {database} OWNER {installer}')
+        with psycopg.connect(
+            make_conninfo(_CONNINFO, dbname=database), autocommit=True
+        ) as fresh:
+            fresh.execute('CREATE EXTENSION orafce')
+            fresh.execute('CREATE EXTENSION vector')
+        with psycopg.connect(conninfo, autocommit=True) as inst:
+            with _per_user_mirror(conninfo, admin) as login:
+                _users_kept_apart(login, inst, admin, user)
+            _drop_mirror_roles(inst, user, admin)
+    finally:
+        pg.execute(f'DROP DATABASE IF EXISTS {database} WITH (FORCE)')
+        for role in (user, admin, f'{installer}_mirror_users', installer):
+            pg.execute(f'DROP ROLE IF EXISTS {role}')
+        pg.close()
 
 
 def test_a_profiled_mirror_records_each_statement_over_postgresql(

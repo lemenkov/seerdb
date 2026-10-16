@@ -244,6 +244,7 @@ import hashlib
 import json
 import math
 import re
+import secrets
 import select
 import struct
 import threading
@@ -260,6 +261,7 @@ import psycopg
 from psycopg import sql
 from psycopg.abc import DumperKey
 from psycopg.adapt import Loader, PyFormat
+from psycopg.conninfo import make_conninfo
 from psycopg.types.composite import CompositeInfo, register_composite
 
 from seerdb.common.datatypes import JSON, BcDate, BFile, IntervalYM
@@ -300,6 +302,7 @@ from seerdb.common.tns_consts import (
     ORA_CHECK_CONSTRAINT_VIOLATED,
     ORA_DIVISOR_IS_ZERO,
     ORA_INCONSISTENT_DATATYPES,
+    ORA_INSUFFICIENT_PRIVILEGES,
     ORA_INVALID_BIND_VARIABLE_NAME,
     ORA_INVALID_CREATE_COMMAND,
     ORA_INVALID_DATATYPE,
@@ -2345,19 +2348,33 @@ _ORACLE_DICTIONARY_DDL = (
     'WHERE oid = typ) AND attnum > 0 AND NOT attisdropped; '
     'EXECUTE format(\'SELECT ROW(%s)::%s::text FROM %s WHERE "sys_nc_oid$" = $1\', '
     'cols, typ, tab::regclass) INTO res USING id; RETURN res; END $$;'
+    # Each object type's sys.deref() overload, which CREATE TYPE makes and DROP
+    # TYPE takes away (#1127). In sys, where a user's role may make nothing
+    # (#1857): an overload of its own there could stand in for a dictionary
+    # function in another user's statement. So these make and drop it as the
+    # installer, from a fixed text, for the types of the session's own role.
+    'CREATE OR REPLACE FUNCTION sys.ora_make_deref(ref regtype, typ regtype) '
+    'RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog '
+    'AS $$ BEGIN IF NOT (SELECT bool_and(pg_has_role(session_user, typowner, '
+    "'USAGE')) FROM pg_type WHERE oid IN (ref, typ)) THEN RAISE EXCEPTION USING "
+    "ERRCODE = '42501', MESSAGE = 'permission denied for type ' || typ; END IF; "
+    "EXECUTE format('CREATE FUNCTION sys.deref(r %s) RETURNS %s LANGUAGE sql "
+    "STABLE AS $f$ SELECT sys.ora_deref_row(r.tab, r.id, %L::regtype)::%s $f$', "
+    'ref, typ, typ::text, typ); END $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_drop_deref(ref regtype) RETURNS void '
+    'LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$ BEGIN '
+    'IF ref IS NULL THEN RETURN; END IF; '
+    "IF NOT (SELECT pg_has_role(session_user, typowner, 'USAGE') FROM pg_type "
+    "WHERE oid = ref) THEN RAISE EXCEPTION USING ERRCODE = '42501', "
+    "MESSAGE = 'permission denied for type ' || ref; END IF; "
+    "EXECUTE format('DROP FUNCTION IF EXISTS sys.deref(%s)', ref); END $$;"
 )
 
 
-def _record_policies() -> str:
-    # Row-level security on the Mirror's own records (#1857): a role that is
-    # not their owner -- the role that installed them, which policies do not
-    # bind -- may read them all, and write only the records of what it owns
-    # itself: a table's or a type's of its own, a package's or a grant's of
-    # its own schema, its own session's. A record whose object is gone may be
-    # deleted by anyone, as the prune after a DROP does. The DBA's records --
-    # directories, editions, proxy grants -- and the translation report get no
-    # write policy at all. Each owner test is a subquery bound when the policy
-    # is made, so no search_path can stand another function in for it.
+def _record_owner_tests() -> dict[str, str | None]:
+    # Each of the Mirror's record tables, and the test of whether a role owns
+    # one of its records: None for a table only the installer writes, and for
+    # ora_sessions, whose rows are each session's own (_record_policies).
     def owner(catalog: str, owner_column: str, key: str, value: str) -> str:
         return (
             f"(SELECT pg_catalog.pg_has_role(o.{owner_column}, 'USAGE') "
@@ -2382,8 +2399,21 @@ def _record_policies() -> str:
         'ora_proxy_grants': None,
         'ora_translation_log': None,
     }
+    return owned
+
+
+def _record_policies() -> str:
+    # Row-level security on the Mirror's own records (#1857): a role that is
+    # not their owner -- the role that installed them, which policies do not
+    # bind -- may read them all, and write only the records of what it owns
+    # itself: a table's or a type's of its own, a package's or a grant's of
+    # its own schema, its own session's. A record whose object is gone may be
+    # deleted by anyone, as the prune after a DROP does. The DBA's records --
+    # directories, editions, proxy grants -- and the translation report get no
+    # write policy at all. Each owner test is a subquery bound when the policy
+    # is made, so no search_path can stand another function in for it.
     ddl = []
-    for table, test in owned.items():
+    for table, test in _record_owner_tests().items():
         name = f'sys.{table}'
         ddl += [
             f'ALTER TABLE {name} ENABLE ROW LEVEL SECURITY',
@@ -2410,6 +2440,26 @@ def _record_policies() -> str:
 
 
 _ORACLE_DICTIONARY_DDL += _record_policies()
+# The relation a name a client wrote resolves to, or NULL for none: also where
+# it names a schema the session's role may not use, for which to_regclass
+# raises (#1857). The statement then fails as PostgreSQL refuses it -- the
+# Oracle error that the object is not there -- rather than the lookup ahead of
+# it, which would abort the client's transaction.
+_ORACLE_DICTIONARY_DDL += (
+    'CREATE OR REPLACE FUNCTION sys.ora_regclass(name text) RETURNS oid '
+    # The caller's rights and search_path: the name resolves as the client's
+    # statement would.
+    'LANGUAGE plpgsql STABLE AS $$ BEGIN '
+    'RETURN to_regclass(name)::oid; '
+    'EXCEPTION WHEN insufficient_privilege THEN RETURN NULL; END $$;'
+)
+# The record tables a Mirror user's role writes, under _record_policies's
+# policies (#1857): those of what it owns, and its own session's row.
+_USER_WRITTEN_RECORDS: Final = tuple(
+    table
+    for table, test in _record_owner_tests().items()
+    if test is not None or table == 'ora_sessions'
+)
 
 # What the installed dictionary is stamped with, as the `sys` schema's comment:
 # a digest of the DDL itself, so any change to a view or function reinstalls it
@@ -5295,9 +5345,8 @@ def _object_type_companions(type_name: str) -> str:
     ref = _ref_type_name(type_name)
     return (
         f'; CREATE TYPE {ref} AS (tab oid, id uuid)'
-        f'; CREATE FUNCTION sys.deref(r {ref}) RETURNS {type_name} LANGUAGE sql '
-        f"STABLE AS $$ SELECT sys.ora_deref_row(r.tab, r.id, '{type_name}'::regtype)"
-        f'::{type_name} $$'
+        f'; SELECT sys.ora_make_deref({_sql_text(ref)}::regtype, '
+        f'{_sql_text(type_name)}::regtype)'
     )
 
 
@@ -5313,7 +5362,8 @@ def _drop_type(type_name: str, *, if_exists: bool = False) -> str:
     exists = ' IF EXISTS' if if_exists else ''
     return (
         f"DO $$ BEGIN IF to_regtype('{ref}') IS NOT NULL THEN "
-        f'DROP FUNCTION sys.deref({ref}); DROP TYPE {ref}; END IF; END $$'
+        f"PERFORM sys.ora_drop_deref(to_regtype('{ref}')); DROP TYPE {ref}; "
+        'END IF; END $$'
         '; DO $$ DECLARE f regprocedure; BEGIN FOR f IN SELECT p.oid::regprocedure '
         f"FROM pg_proc p WHERE p.prorettype = to_regtype('{literal}') "
         f"AND p.oid::regprocedure::text LIKE split_part(to_regtype('{literal}')::text, "
@@ -9622,6 +9672,7 @@ _ORA_MESSAGE = {
     ORA_TOO_MANY_VALUES: 'too many values',
     ORA_INVALID_DATATYPE: 'invalid datatype',
     ORA_TABLE_OR_VIEW_DOES_NOT_EXIST: 'table or view does not exist',
+    ORA_INSUFFICIENT_PRIVILEGES: 'insufficient privileges',
     ORA_NOT_ENOUGH_VALUES: 'not enough values',
     ORA_NO_DATA_FOUND: 'no data found',
     ORA_TOO_MANY_ROWS: 'exact fetch returns more than requested number of rows',
@@ -9663,6 +9714,15 @@ def _ora_code_for(exc) -> int:
     application = _application_error(exc)
     if application is not None:
         return application[0]
+    if sqlstate == '42501':
+        # A privilege PostgreSQL refused, which per-user mode meets between
+        # users (#1857). Without USAGE on another user's schema, the user holds
+        # no privilege on anything in it: Oracle says the object is not there,
+        # ORA-00942. A privilege missing on an object of a schema it may use
+        # is ORA-01031.
+        if _primary_message(exc).startswith('permission denied for schema'):
+            return ORA_TABLE_OR_VIEW_DOES_NOT_EXIST
+        return ORA_INSUFFICIENT_PRIVILEGES
     if sqlstate == '42601':
         primary = _primary_message(exc)
         for text, code in _INSERT_ARITY:
@@ -10552,7 +10612,10 @@ _ACCOUNTS_DDL = (
     f'CREATE SCHEMA IF NOT EXISTS {_ACCOUNTS_SCHEMA};'
     f'REVOKE ALL ON SCHEMA {_ACCOUNTS_SCHEMA} FROM PUBLIC;'
     f'CREATE TABLE IF NOT EXISTS {_ACCOUNTS_SCHEMA}.accounts '
-    '(username text PRIMARY KEY, password text NOT NULL)'
+    '(username text PRIMARY KEY, password text NOT NULL);'
+    # In per-user mode (#1857), the password of the user's PostgreSQL role,
+    # which the Mirror makes up and logs the user's sessions in with.
+    f'ALTER TABLE {_ACCOUNTS_SCHEMA}.accounts ADD COLUMN IF NOT EXISTS role_password text'
 )
 # The auth databases whose accounts table this process has made sure of, and
 # seeded from its launcher's accounts, so each is done once (#879).
@@ -10579,6 +10642,10 @@ class _AccountStore:
     def __init__(self, seed: dict[str, str], auth_conninfo: str | None) -> None:
         self._seed = seed
         self._auth_conninfo = auth_conninfo
+
+    @property
+    def auth_conninfo(self) -> str | None:
+        return self._auth_conninfo
 
     def _connect(self) -> psycopg.Connection:
         assert self._auth_conninfo is not None
@@ -10622,6 +10689,33 @@ class _AccountStore:
                 (username.upper(), password),
             )
 
+    def configured(self, username: str) -> bool:
+        """Whether the operator configured the account -- in the config file
+        or MIRROR_USERS -- rather than a CREATE USER made it: in per-user mode,
+        the administrators (#1857)."""
+        return any(name.upper() == username.upper() for name in self._seed)
+
+    def role_password(self, username: str) -> str | None:
+        """The password of the user's PostgreSQL role, in per-user mode
+        (#1857); None while it has none."""
+        assert self._auth_conninfo is not None
+        with self._connect() as conn:
+            row = conn.execute(
+                f'SELECT role_password FROM {_ACCOUNTS_SCHEMA}.accounts '
+                'WHERE username = %s',
+                (username.upper(),),
+            ).fetchone()
+        return None if row is None else row[0]
+
+    def set_role_password(self, username: str, password: str) -> None:
+        assert self._auth_conninfo is not None
+        with self._connect() as conn:
+            conn.execute(
+                f'UPDATE {_ACCOUNTS_SCHEMA}.accounts SET role_password = %s '
+                'WHERE username = %s',
+                (password, username.upper()),
+            )
+
     def drop(self, username: str) -> None:
         if self._auth_conninfo is None:
             for name in list(self._seed):
@@ -10633,6 +10727,75 @@ class _AccountStore:
                 f'DELETE FROM {_ACCOUNTS_SCHEMA}.accounts WHERE username = %s',
                 (username.upper(),),
             )
+
+
+# Per-user mode (#1857): each Mirror user's session logs in to PostgreSQL as a
+# role of its own, named as its schema is, which the Mirror makes on CREATE
+# USER -- or at a configured account's first login -- and marks as its own.
+# Every such role is a member of one group, which holds what they all may use
+# of the installation: the dictionary to read, the records of their own to
+# write (_USER_WRITTEN_RECORDS), a schema of its own for a package. Not the
+# DBA's views and records, nor the translation report. PostgreSQL 16 is the
+# floor: from it, a role with CREATEROLE manages only the roles it made. So
+# the group is the installer's own, named after it: roles belong to the whole
+# server, and another installer's group is not this one's to add members to.
+_USER_GROUP_SUFFIX: Final = '_mirror_users'
+_USER_ROLE_MARK: Final = 'seerdb mirror user'
+_PER_USER_FLOOR: Final = 160000
+# The schemas the installation makes: the dictionary's, and those of the Oracle
+# packages it emulates, which a user's statements call into.
+_INSTALLED_SCHEMAS: Final = (
+    'sys',
+    'system',
+    'dbms_application_info',
+    'dbms_debug_jdwp',
+    'dbms_lob',
+    'dbms_lock',
+    'dbms_session',
+    'dbms_sql',
+    'dbms_utility',
+    'utl_raw',
+)
+
+
+def _user_group_grants(group: str) -> str:
+    # The group's grants on what this installation has: a part of it that
+    # failed to install -- one that needs a superuser, say -- made no schema or
+    # table to grant.
+    def names(values: Iterable[str]) -> str:
+        return 'ARRAY[' + ', '.join(_sql_text(value) for value in values) + ']'
+
+    private = (
+        'dba_directories',
+        'proxy_users',
+        'ora_proxy_grants',
+        'ora_translation_log',
+    )
+    return (
+        f'DO $$ DECLARE g text := {_sql_text(group)}; s text; t text; BEGIN '
+        f'FOREACH s IN ARRAY {names(_INSTALLED_SCHEMAS)} LOOP '
+        'IF to_regnamespace(quote_ident(s)) IS NOT NULL THEN '
+        "EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I', s, g); END IF; END LOOP; "
+        "EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA sys TO %I', g); "
+        "EXECUTE format('GRANT USAGE ON ALL SEQUENCES IN SCHEMA sys TO %I', g); "
+        f'FOREACH t IN ARRAY {names(private)} LOOP '
+        "IF to_regclass('sys.' || quote_ident(t)) IS NOT NULL THEN "
+        "EXECUTE format('REVOKE SELECT ON sys.%I FROM %I', t, g); END IF; END LOOP; "
+        f'FOREACH t IN ARRAY {names(_USER_WRITTEN_RECORDS)} LOOP '
+        "IF to_regclass('sys.' || quote_ident(t)) IS NOT NULL THEN "
+        "EXECUTE format('GRANT INSERT, UPDATE, DELETE ON sys.%I TO %I', t, g); "
+        'END IF; END LOOP; '
+        "EXECUTE format('GRANT CREATE ON DATABASE %I TO %I', current_database(), g); "
+        'END $$'
+    )
+
+
+# The databases whose group grants this process has made, so each is done once
+# per process: a later process makes them again, after a dictionary that may
+# have new tables.
+_USER_GROUP_READY: dict[str, str] = {}
+# ORA-01940, a DROP USER of a user with a session open (#1857).
+_ORA_USER_CONNECTED = 1940
 
 
 # A column's own value stands for NVL(column, x) only where the two compare
@@ -10922,7 +11085,11 @@ class PostgresBackend:
         auth_conninfo: str | None = None,
         presents: str = '12.1',
         native_sql: bool = False,
+        per_user_roles: bool = False,
     ) -> None:
+        if per_user_roles and auth_conninfo is None:
+            # A role's password is kept with its account (#1857).
+            raise ValueError('per-user roles need an auth database (auth_conninfo)')
         if presents not in _PRESENTABLE:
             raise ValueError(
                 f'presents must be one of {", ".join(_PRESENTABLE)}, not {presents!r}'
@@ -11003,6 +11170,25 @@ class PostgresBackend:
         )
         # Where the accounts live: that map, or an auth database (#879).
         self._accounts = _AccountStore(self._credentials, auth_conninfo)
+        # Per-user mode (#1857): each session runs as its user's own role once
+        # the login checks out (open_session), and the connection string's
+        # role -- the installer's -- does on its own connection only what a
+        # DBA may: users, proxy grants, directories, editions, killing a
+        # session. It needs PostgreSQL 16 and a role that may make roles.
+        self._per_user = per_user_roles
+        self._admin_conninfo = conninfo
+        self._presents = presents
+        if per_user_roles:
+            row = self._at_once(
+                "SELECT current_setting('server_version_num')::int, "
+                'rolsuper OR rolcreaterole FROM pg_roles WHERE rolname = current_user'
+            ).fetchone()
+            if row is None or row[0] < _PER_USER_FLOOR:
+                raise UnsupportedFeature('per-user roles need PostgreSQL 16 or later')
+            if not row[1]:
+                raise UnsupportedFeature(
+                    'per-user roles need a connection role with CREATEROLE'
+                )
         # Index-organized tables this session created, with their primary-key
         # columns, for the logical-rowid rendering.
         self._iot_pk: dict[str, list[str]] = {}
@@ -11555,7 +11741,12 @@ class PostgresBackend:
     def open_session(self, connect_attrs: dict[str, str]) -> None:
         # The driver name arrives only in the second login message (#1212).
         self._client_driver = connect_attrs.get('driver_name')
-        self._open_as(connect_attrs.get('proxy_client_name'))
+        target = connect_attrs.get('proxy_client_name')
+        login = getattr(self, '_login_user', None)
+        self._open_as(target)
+        if self._per_user and login is not None:
+            # From here on, the session is its user's own role (#1857).
+            self._become(self._login_user, login if target else '')
         edition = connect_attrs.get('edition')
         if edition:
             # The edition the client connected in (#1662); one that does not
@@ -12030,7 +12221,10 @@ class PostgresBackend:
         self._report_runs = {}
         try:
             if self._report_conn is None:
-                self._report_conn = psycopg.connect(self._conninfo, autocommit=True)
+                # The installer's role, whose record the report is (#1857).
+                self._report_conn = psycopg.connect(
+                    self._admin_conninfo, autocommit=True
+                )
             with self._report_conn.cursor() as cursor:
                 cursor.executemany(_REPORT_UPSERT, rows)
         except psycopg.Error:
@@ -12069,6 +12263,9 @@ class PostgresBackend:
         kill = _KILL_SESSION.match(sql)
         if kill is not None:
             return self._kill_session(kill.group(1))
+        dba = self._dba_statement(sql)
+        if dba is not None:
+            return dba
         users = self._user_statement(sql)
         if users is not None:
             return users
@@ -12377,6 +12574,7 @@ class PostgresBackend:
         # session is not killed in its place. The victim learns of it on its next
         # call, its connection gone, as a killed Oracle session's is. Like any
         # ALTER SYSTEM it leaves the caller's transaction alone.
+        self._require_administrator()
         ids = _KILL_SESSION_ID.match(session)
         if ids is None:
             raise BackendError(
@@ -12399,9 +12597,12 @@ class PostgresBackend:
             )
         # Wait for the victim's backend to exit before answering, as Oracle's kill
         # does, or the victim's next call could still run on it (#1367).
-        self._conn.execute(
-            'SELECT pg_terminate_backend(%s, %s)', (sid, _KILL_SESSION_WAIT_MS)
-        )
+        # In per-user mode the victim may be another user's role, which only
+        # the installer's may end (#1857).
+        with self._administering() as conn:
+            conn.execute(
+                'SELECT pg_terminate_backend(%s, %s)', (sid, _KILL_SESSION_WAIT_MS)
+            )
         return Result()
 
     def _execute_transaction_control(self, sql: str) -> Result | None:
@@ -13612,7 +13813,7 @@ class PostgresBackend:
         # The schema model's columns of the relation a statement names, as
         # PostgreSQL resolves `name` (#1889); None for no relation.
         if name not in self._relids:
-            row = self._catalog_read('SELECT to_regclass(%s)::oid', (name,)).fetchone()
+            row = self._catalog_read('SELECT sys.ora_regclass(%s)', (name,)).fetchone()
             self._relids[name] = None if row is None or row[0] is None else row[0]
         relid = self._relids[name]
         if relid is None:
@@ -15493,7 +15694,8 @@ class PostgresBackend:
         # The pg_type oid of an Oracle object table's type (CREATE TABLE t OF
         # type), from the registry the CREATE filled; None for any other table.
         row = self._conn.execute(
-            'SELECT o.typ FROM sys.ora_object_tables o WHERE o.relid = to_regclass(%s)',
+            'SELECT o.typ FROM sys.ora_object_tables o '
+            'WHERE o.relid = sys.ora_regclass(%s)',
             (table,),
         ).fetchone()
         return None if row is None else int(row[0])
@@ -16546,6 +16748,212 @@ class PostgresBackend:
             return None, [], names, row[3]
         return list(row[0]), list(row[1] or ()), names, row[3]
 
+    def _require_administrator(self) -> None:
+        # A DBA's statement in per-user mode: only an account the operator
+        # configured may run it (#1857), as only a DBA may in Oracle. In
+        # single-role mode the database is one tenant, and anyone may.
+        user = getattr(self, '_login_user', None) or ''
+        if self._per_user and not self._accounts.configured(user):
+            raise BackendError(
+                'insufficient privileges', ora_code=ORA_INSUFFICIENT_PRIVILEGES
+            )
+
+    @contextmanager
+    def _administering(self) -> Iterator[psycopg.Connection]:
+        # The connection a DBA's statement runs on. In per-user mode it is the
+        # installer's own (#1857), opened for the statement and committed as
+        # it ends; a user's role may not write what it writes. Otherwise it is
+        # the session's, which the statement commits itself.
+        if not self._per_user:
+            yield self._conn
+            return
+        with psycopg.connect(self._admin_conninfo) as conn:
+            yield conn
+
+    def _ensure_user_group(self, conn: psycopg.Connection) -> str:
+        # The group every user's role is a member of, and what it may use of
+        # this database's installation (#1857): made once per process and
+        # database, after the dictionary, whose tables it grants. Its name.
+        ready = _USER_GROUP_READY.get(self._admin_conninfo)
+        if ready is not None:
+            return ready
+        row = conn.execute(
+            'SELECT current_user || %s, EXISTS (SELECT 1 FROM pg_roles '
+            'WHERE rolname = current_user || %s)',
+            (_USER_GROUP_SUFFIX,) * 2,
+        ).fetchone()
+        assert row is not None
+        (group, exists) = row
+        if not exists:
+            conn.execute(
+                sql.SQL('CREATE ROLE {} NOLOGIN').format(sql.Identifier(group))
+            )
+        conn.execute(_user_group_grants(group))
+        _USER_GROUP_READY[self._admin_conninfo] = group
+        return group
+
+    def _ensure_user_role(self, conn: psycopg.Connection, name: str) -> str:
+        """The PostgreSQL role user `name` logs in as in per-user mode (#1857),
+        made if it is not there yet, and its password.
+
+        It is named as the user's schema, which it owns; it is marked as the
+        Mirror's and is a member of the users' group. What it makes is its own:
+        PostgreSQL grants a function's EXECUTE and a type's USAGE to PUBLIC,
+        which an Oracle routine or type is not, so those are taken back. A role
+        of that name the Mirror did not make is another's: ORA-01920.
+        """
+        role = sql.Identifier(name.lower())
+        group = self._ensure_user_group(conn)
+        # Ours only if marked so and made by this installer, whose privileges
+        # it lent it: another's mark is another installation's user.
+        # And a member of the group, which it may not be if it was made with
+        # another installation's grants, or before the group was.
+        row = conn.execute(
+            "SELECT shobj_description(oid, 'pg_authid') = %s "
+            "AND pg_has_role(current_user, oid, 'USAGE'), "
+            "pg_has_role(oid, %s, 'MEMBER') FROM pg_roles WHERE rolname = %s",
+            (_USER_ROLE_MARK, group, name.lower()),
+        ).fetchone()
+        if row is not None and not row[0]:
+            raise BackendError(
+                f"user name '{name}' conflicts with another user or role name",
+                ora_code=ORA_USER_NAME_CONFLICT,
+            )
+        if row is not None and not row[1]:
+            conn.execute(sql.SQL('GRANT {} TO {}').format(sql.Identifier(group), role))
+        password = self._accounts.role_password(name)
+        if row is not None and password is not None:
+            # The user's role as it was made: a login's usual case.
+            return password
+        if row is None:
+            password = secrets.token_urlsafe(32)
+            # The installer gets the role's privileges, so it can set the
+            # role's defaults now and drop what it owns with it later.
+            conn.execute("SET LOCAL createrole_self_grant = 'set, inherit'")
+            conn.execute(
+                sql.SQL('CREATE ROLE {} LOGIN PASSWORD {} IN ROLE {}').format(
+                    role, sql.Literal(password), sql.Identifier(group)
+                )
+            )
+            conn.execute(
+                sql.SQL('COMMENT ON ROLE {} IS {}').format(
+                    role, sql.Literal(_USER_ROLE_MARK)
+                )
+            )
+            conn.execute(
+                sql.SQL(
+                    'ALTER DEFAULT PRIVILEGES FOR ROLE {0} REVOKE EXECUTE ON '
+                    'FUNCTIONS FROM PUBLIC; ALTER DEFAULT PRIVILEGES FOR ROLE {0} '
+                    'REVOKE USAGE ON TYPES FROM PUBLIC'
+                ).format(role)
+            )
+        elif password is None:
+            # A role whose password the accounts no longer have gets a new one.
+            password = secrets.token_urlsafe(32)
+            conn.execute(
+                sql.SQL('ALTER ROLE {} PASSWORD {}').format(role, sql.Literal(password))
+            )
+        conn.execute(
+            sql.SQL(
+                'CREATE SCHEMA IF NOT EXISTS {0} AUTHORIZATION {0}; '
+                'ALTER SCHEMA {0} OWNER TO {0}'
+            ).format(role)
+        )
+        self._accounts.set_role_password(name, password)
+        return password
+
+    def _refuse_connected(self, conn: psycopg.Connection, name: str) -> None:
+        # Oracle refuses to drop a user with a session open, ORA-01940; in
+        # per-user mode a user's sessions are its role's (#1857).
+        row = conn.execute(
+            'SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE usename = %s)',
+            (name.lower(),),
+        ).fetchone()
+        if row is not None and row[0]:
+            raise BackendError(
+                'cannot drop a user who is currently connected',
+                ora_code=_ORA_USER_CONNECTED,
+            )
+
+    def _drop_user_role(self, conn: psycopg.Connection, name: str) -> None:
+        # DROP USER in per-user mode (#1857): the user's role, and what it
+        # still owns, once its schema has gone -- if the Mirror made it.
+        row = conn.execute(
+            "SELECT shobj_description(oid, 'pg_authid') = %s FROM pg_roles "
+            'WHERE rolname = %s',
+            (_USER_ROLE_MARK, name.lower()),
+        ).fetchone()
+        if row is None or not row[0]:
+            return
+        role = sql.Identifier(name.lower())
+        conn.execute(sql.SQL('DROP OWNED BY {} CASCADE').format(role))
+        conn.execute(sql.SQL('DROP ROLE {}').format(role))
+
+    def _become(self, user: str, proxy: str) -> None:
+        # Per-user mode, once the login checked out (#1857): the session goes
+        # on as its user's own role, on a connection of its own set up as the
+        # installer's was, which is closed. The session's settings follow it:
+        # the user's schema first on the path, the user and the proxy user.
+        try:
+            password = self._ensure_user_role(self._conn, user)
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        conninfo = make_conninfo(
+            self._admin_conninfo, user=user.lower(), password=password
+        )
+        twin = type(self)(
+            conninfo,
+            credentials=self._credentials,
+            auth_conninfo=self._accounts.auth_conninfo,
+            presents=self._presents,
+        )
+        (installer, self._conn) = (self._conn, twin._conn)
+        installer.close()
+        self._conninfo = conninfo
+        self._twin = lambda: type(self)(
+            conninfo,
+            credentials=self._credentials,
+            auth_conninfo=self._accounts.auth_conninfo,
+            presents=self._presents,
+        )
+        self._at_once(
+            sql.SQL('; ').join(
+                [
+                    sql.SQL('SET search_path TO {}, ' + _SEARCH_PATH_TAIL).format(
+                        sql.Identifier(user.lower())
+                    ),
+                    sql.SQL(
+                        "SELECT set_config('seerdb.session_user', {}, false), "
+                        "set_config('seerdb.proxy_user', {}, false)"
+                    ).format(sql.Literal(user), sql.Literal(proxy)),
+                ]
+            )
+        )
+
+    def _dba_statement(self, statement: str) -> Result | None:
+        # CREATE / DROP DIRECTORY and EDITION in per-user mode (#1857): a
+        # DBA's, so an administrator's only, run on the installer's connection,
+        # whose records they write. In single-role mode they translate as any
+        # other statement does. None for any other statement.
+        if not self._per_user:
+            return None
+        translated = _directory_statement(statement)
+        if translated is None and _ALTER_SESSION_EDITION.match(statement) is None:
+            translated = _edition_statement(statement)
+        if translated is None:
+            return None
+        self._require_administrator()
+        try:
+            with self._administering() as conn:
+                conn.execute(translated)
+        except psycopg.Error as exc:
+            raise _backend_error(
+                exc, original=statement, translated=translated
+            ) from None
+        return Result()
+
     def _user_exists(self, name: str) -> bool:
         # A user is an account or a schema of that name: one made before the
         # Mirror kept accounts has a schema and no password (#879).
@@ -16564,20 +16972,37 @@ class PostgresBackend:
         created = _CREATE_USER_STATEMENT.match(statement)
         if created is not None:
             name = _user_name(created.group(1))
+            self._require_administrator()
             if self._user_exists(name):
                 # A launcher's account is a user with no schema yet; an Oracle
                 # user always has one, so it gets it here, and the statement is
                 # refused all the same, as Oracle refuses it.
-                self._conn.execute(
-                    sql.SQL('CREATE SCHEMA IF NOT EXISTS {}').format(
-                        sql.Identifier(name.lower())
+                with self._administering() as conn:
+                    conn.execute(
+                        sql.SQL('CREATE SCHEMA IF NOT EXISTS {}').format(
+                            sql.Identifier(name.lower())
+                        )
                     )
-                )
-                self._conn.commit()
+                    conn.commit()
                 raise BackendError(
                     f"user name '{name}' conflicts with another user or role name",
                     ora_code=ORA_USER_NAME_CONFLICT,
                 )
+            if self._per_user:
+                # The account first: its role's password is kept with it.
+                self._accounts.set(
+                    name,
+                    _password_text(created.group(2))
+                    if created.group(2) is not None
+                    else secrets.token_urlsafe(32),
+                )
+                try:
+                    with self._administering() as conn:
+                        self._ensure_user_role(conn, name)
+                except BaseException:
+                    self._accounts.drop(name)
+                    raise
+                return Result()
             self._conn.execute(
                 sql.SQL('CREATE SCHEMA IF NOT EXISTS {}').format(
                     sql.Identifier(name.lower())
@@ -16590,6 +17015,9 @@ class PostgresBackend:
         altered = _ALTER_USER_PASSWORD.match(statement)
         if altered is not None:
             name = _user_name(altered.group(1))
+            if name != getattr(self, '_login_user', None):
+                # A user changes its own password; another's is a DBA's.
+                self._require_administrator()
             if not self._user_exists(name):
                 raise BackendError(
                     f"user '{name}' does not exist", ora_code=ORA_USER_DOES_NOT_EXIST
@@ -16606,6 +17034,7 @@ class PostgresBackend:
             return Result()
         proxied = _ALTER_USER_PROXY.match(statement)
         if proxied is not None:
+            self._require_administrator()
             return self._proxy_grant(
                 _user_name(proxied.group(1)),
                 proxied.group(2).upper() == 'GRANT',
@@ -16614,35 +17043,42 @@ class PostgresBackend:
         dropped = _DROP_USER_STATEMENT.match(statement)
         if dropped is not None:
             name = _user_name(dropped.group(1))
+            self._require_administrator()
             if not self._user_exists(name):
                 raise BackendError(
                     f"user '{name}' does not exist", ora_code=ORA_USER_DOES_NOT_EXIST
                 )
             schema = sql.Identifier(name.lower())
-            if dropped.group(2):
-                self._conn.execute(
-                    sql.SQL('DROP SCHEMA IF EXISTS {} CASCADE').format(schema)
-                )
-            else:
-                owns = self._conn.execute(
-                    'SELECT EXISTS (SELECT 1 FROM pg_class WHERE relnamespace = '
-                    'to_regnamespace(%s)) OR EXISTS (SELECT 1 FROM pg_proc WHERE '
-                    'pronamespace = to_regnamespace(%s))',
-                    (f'"{name.lower()}"',) * 2,
-                ).fetchone()
-                if owns and owns[0]:
-                    raise BackendError(
-                        f"CASCADE must be specified to drop '{name}'",
-                        ora_code=ORA_CASCADE_REQUIRED,
+            proxy_grants = self._has_proxy_grants()
+            with self._administering() as conn:
+                if self._per_user:
+                    self._refuse_connected(conn, name)
+                if dropped.group(2):
+                    conn.execute(
+                        sql.SQL('DROP SCHEMA IF EXISTS {} CASCADE').format(schema)
                     )
-                self._conn.execute(sql.SQL('DROP SCHEMA IF EXISTS {}').format(schema))
-            if self._has_proxy_grants():
-                # Its grants go with it, on either side (#1860).
-                self._conn.execute(
-                    'DELETE FROM sys.ora_proxy_grants WHERE proxy = %s OR client = %s',
-                    (name, name),
-                )
-            self._conn.commit()
+                else:
+                    owns = conn.execute(
+                        'SELECT EXISTS (SELECT 1 FROM pg_class WHERE relnamespace = '
+                        'to_regnamespace(%s)) OR EXISTS (SELECT 1 FROM pg_proc WHERE '
+                        'pronamespace = to_regnamespace(%s))',
+                        (f'"{name.lower()}"',) * 2,
+                    ).fetchone()
+                    if owns and owns[0]:
+                        raise BackendError(
+                            f"CASCADE must be specified to drop '{name}'",
+                            ora_code=ORA_CASCADE_REQUIRED,
+                        )
+                    conn.execute(sql.SQL('DROP SCHEMA IF EXISTS {}').format(schema))
+                if proxy_grants:
+                    # Its grants go with it, on either side (#1860).
+                    conn.execute(
+                        'DELETE FROM sys.ora_proxy_grants WHERE proxy = %s OR client = %s',
+                        (name, name),
+                    )
+                if self._per_user:
+                    self._drop_user_role(conn, name)
+                conn.commit()
             self._accounts.drop(name)
             return Result()
         return None
@@ -16666,17 +17102,33 @@ class PostgresBackend:
                 )
         if not self._has_proxy_grants():
             raise UnsupportedFeature('proxy grants: the dictionary has no record')
-        if grant:
+        if self._per_user:
+            # The DBA's record, on the installer's connection (#1857).
+            with self._administering() as conn:
+                if grant:
+                    conn.execute(
+                        'INSERT INTO sys.ora_proxy_grants VALUES (%s, %s) '
+                        'ON CONFLICT DO NOTHING',
+                        (proxy, client),
+                    )
+                    return Result()
+                row = conn.execute(
+                    'DELETE FROM sys.ora_proxy_grants WHERE proxy = %s AND client = %s '
+                    'RETURNING 1',
+                    (proxy, client),
+                ).fetchone()
+        elif grant:
             self._at_once(
                 'INSERT INTO sys.ora_proxy_grants VALUES (%s, %s) ON CONFLICT DO NOTHING',
                 (proxy, client),
             )
             return Result()
-        row = self._at_once(
-            'DELETE FROM sys.ora_proxy_grants WHERE proxy = %s AND client = %s '
-            'RETURNING 1',
-            (proxy, client),
-        ).fetchone()
+        else:
+            row = self._at_once(
+                'DELETE FROM sys.ora_proxy_grants WHERE proxy = %s AND client = %s '
+                'RETURNING 1',
+                (proxy, client),
+            ).fetchone()
         if row is None:
             raise BackendError(
                 'A proxy connection cannot be revoked if it was not granted first.',

@@ -32,6 +32,7 @@ the defaults; the command line wins. The config file is INI::
     auth_conninfo = ...         ; postgres: accounts kept in the database
     translation_report = no     ; postgres: log each statement's translation
     native_sql = no             ; postgres: let clients run native PostgreSQL SQL
+    per_user_roles = no         ; postgres: each user its own PostgreSQL role
     ; upstream = host:port/service   ; passthrough
     ; field_version = 24             ; passthrough: skip probing the upstream
 
@@ -132,6 +133,13 @@ def _parser() -> argparse.ArgumentParser:
         action='store_true',
         default=None,
         help="log each statement's translation to sys.ora_translation_log",
+    )
+    postgres.add_argument(
+        '--per-user-roles',
+        action='store_true',
+        default=None,
+        help="run each user's sessions as a PostgreSQL role of its own "
+        '(needs --auth-conninfo and PostgreSQL 16)',
     )
     postgres.add_argument(
         '--native-sql',
@@ -277,6 +285,14 @@ def build(
         native_sql = _flag(
             option(getattr(args, 'native_sql', None), backend, 'native_sql', 'no')
         )
+        per_user_roles = _flag(
+            option(
+                getattr(args, 'per_user_roles', None), backend, 'per_user_roles', 'no'
+            )
+        )
+        if per_user_roles and auth_conninfo is None:
+            # Each role's password is kept with its account (#1857).
+            raise SystemExit('--per-user-roles needs --auth-conninfo')
         if not credentials and auth_conninfo is None:
             raise SystemExit(
                 'no accounts to serve: list them under [clients] or in '
@@ -294,6 +310,7 @@ def build(
                 auth_conninfo=auth_conninfo,
                 presents=presents,
                 native_sql=native_sql,
+                per_user_roles=per_user_roles,
             )
 
         return Launch(

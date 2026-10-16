@@ -79,6 +79,30 @@ def test_a_mirror_with_no_accounts_does_not_start() -> None:
     assert launch.backend_factory is not None
 
 
+def test_per_user_roles_need_an_auth_database(tmp_path: Path) -> None:
+    # Each user's role password is kept with its account (#1857), so per-user
+    # mode needs the accounts in the database, on the command line or in the
+    # config file.
+    users = {'MIRROR_USERS': 'scott:tiger'}
+    with pytest.raises(SystemExit, match='needs --auth-conninfo'):
+        build(['postgres', 'dbname=mirror', '--per-user-roles'], env=users)
+    launch = build(
+        [
+            'postgres',
+            'dbname=mirror',
+            '--per-user-roles',
+            '--auth-conninfo',
+            'dbname=a',
+        ],
+        env=users,
+    )
+    assert launch.backend_factory is not None
+    ini = tmp_path / 'mirror.ini'
+    ini.write_text('[backend]\ntype = postgres\nconninfo = x\nper_user_roles = yes\n')
+    with pytest.raises(SystemExit, match='needs --auth-conninfo'):
+        build(['--config', str(ini)], env=users)
+
+
 @pytest.mark.parametrize(
     ('argv', 'message'),
     [
