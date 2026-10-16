@@ -131,6 +131,46 @@ class TestWalletWiring(unittest.TestCase):
         self.assertEqual(Ctx.verify_mode, ssl.CERT_REQUIRED)
 
 
+class TestStrictVerification(unittest.TestCase):
+    # The fixture's certificates pass a strict X.509 verifier (#1843): Python
+    # 3.13's default context sets VERIFY_X509_STRICT and refused a server
+    # certificate with no Authority Key Identifier, which python-oracledb's
+    # thin mode, using that context, met against the Mirror's TLS listener.
+    # Strict here on every Python: the server's certificate verifies for
+    # localhost, and the client's, which the server asks for, verifies too.
+    def test_the_fixture_handshakes_under_strict_verification(self):
+        Strict = getattr(ssl, 'VERIFY_X509_STRICT', 0)
+        Client = ssl.create_default_context(cafile=CA_CERT)
+        Client.verify_flags |= Strict
+        Client.load_cert_chain(os.path.join(WALLET_DIR, 'ewallet.pem'))
+        Server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        Server.load_cert_chain(SERVER_CERT, SERVER_KEY)
+        Server.load_verify_locations(CA_CERT)
+        Server.verify_mode = ssl.CERT_REQUIRED
+        Server.verify_flags |= Strict
+        (ClientIn, ClientOut, ServerIn, ServerOut) = (ssl.MemoryBIO() for _ in range(4))
+        ClientSide = Client.wrap_bio(ClientIn, ClientOut, server_hostname='localhost')
+        ServerSide = Server.wrap_bio(ServerIn, ServerOut, server_side=True)
+        Done = {id(ClientSide): False, id(ServerSide): False}
+        for _round in range(10):
+            for Side in (ClientSide, ServerSide):
+                if not Done[id(Side)]:
+                    try:
+                        Side.do_handshake()
+                        Done[id(Side)] = True
+                    except ssl.SSLWantReadError:
+                        pass
+            ServerIn.write(ClientOut.read())
+            ClientIn.write(ServerOut.read())
+            if all(Done.values()):
+                break
+        self.assertTrue(all(Done.values()))
+        self.assertEqual(
+            dict(x[0] for x in ServerSide.getpeercert()['subject'])['commonName'],
+            'seerdb-test-client',
+        )
+
+
 class TestLiveTlsPath(unittest.TestCase):
     def setUp(self):
         self.echo = _EchoServer()
