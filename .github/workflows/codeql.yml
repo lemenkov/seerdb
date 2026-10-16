@@ -19,6 +19,9 @@ on:
       - '.git-blame-ignore-revs'
       - '.github/dependabot.yml'
   pull_request:
+    # ready_for_review: a draft skips the heavy jobs below, which run once it
+    # is undrafted (#1942).
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [master]
     paths-ignore:
       - '**.md'
@@ -41,6 +44,8 @@ permissions:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
+    # A draft waits for ready_for_review (#1942).
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     permissions:
       security-events: write

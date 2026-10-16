@@ -22,6 +22,9 @@ on:
       - 'pyproject.toml'
       - '.github/workflows/sqlalchemy.yml'
   pull_request:
+    # ready_for_review: a draft skips the heavy jobs below, which run once it
+    # is undrafted (#1942).
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [master]
     paths:
       - 'seerdb/client/**'
@@ -60,6 +63,8 @@ env:
 jobs:
   compliance:
     name: SQLAlchemy compliance (${{ matrix.db.name }}, driver ${{ inputs.driver || (github.event_name == 'schedule' && 'tag') || 'checkout' }}, dialect ${{ inputs.dialect || (github.event_name == 'schedule' && 'pypi') || 'tag' }})
+    # A draft waits for ready_for_review (#1942).
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
