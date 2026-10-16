@@ -19,6 +19,7 @@ the defaults; the command line wins. The config file is INI::
     ; tls_cert = server.pem     ; TCPS: the server's certificate chain
     ; tls_key = server.key      ;       and its private key
     ; tls_ca = clients-ca.pem   ;       require client certificates from this CA
+    ; profile = profile.json    ; record per-statement statistics (SIGUSR1 writes)
 
     [clients]                   ; the Oracle logins the Mirror accepts
     SCOTT = tiger
@@ -44,11 +45,16 @@ import argparse
 import configparser
 import logging
 import os
+import signal
 import ssl
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, cast
 
 from seerdb.server.backend import Backend
+
+if TYPE_CHECKING:
+    from seerdb.server.profile import Profile
 
 _ENCRYPTION = ('accepted', 'requested', 'required')
 _BACKENDS = ('postgres', 'passthrough')
@@ -68,6 +74,8 @@ class Launch:
     description: str = ''
     # TCPS (#1834): the server context, None for plain TCP.
     ssl_context: ssl.SSLContext | None = None
+    # Where a migration profile is written (#1881), None for no profile.
+    profile: str | None = None
 
 
 class _Config(configparser.ConfigParser):
@@ -92,6 +100,12 @@ def _parser() -> argparse.ArgumentParser:
         'accepted never encrypts',
     )
     parser.add_argument('--log-level', help='DEBUG, INFO (default), WARNING or ERROR')
+    parser.add_argument(
+        '--profile',
+        metavar='FILE',
+        help='record per-statement statistics, written to FILE as JSON at stop, '
+        'on SIGUSR1 and as sessions end',
+    )
     parser.add_argument(
         '--tls-cert', help="serve TCPS: the server's certificate chain (PEM)"
     )
@@ -226,6 +240,7 @@ def build(
         option(args.tls_key, server, 'tls_key', ''),
         option(args.tls_ca, server, 'tls_ca', ''),
     )
+    profile = option(args.profile, server, 'profile', '') or None
 
     kind = args.command or str(backend.get('type', '')).strip().lower()
     if kind == 'observe':
@@ -285,6 +300,7 @@ def build(
             encryption=encryption,
             description=f'PostgreSQL presenting {presents}',
             ssl_context=ssl_context,
+            profile=profile,
         )
 
     upstream = option(getattr(args, 'upstream', None), backend, 'upstream', '')
@@ -318,6 +334,7 @@ def build(
         field_version=field_version,
         description=f'passthrough to {up_host}:{up_port}/{service}',
         ssl_context=ssl_context,
+        profile=profile,
     )
     if field_version is None:
         # Present what the upstream speaks: probe it once, as the first account.
@@ -357,10 +374,46 @@ def main(argv: Sequence[str] | None = None) -> None:
         presenting,
         launch.encryption,
     )
-    serve(
-        launch.host,
-        launch.port,
-        backend_factory=launch.backend_factory,
-        encryption=launch.encryption,
-        ssl_context=launch.ssl_context,
+    backend_factory = launch.backend_factory
+    profile = None
+    if launch.profile is not None:
+        backend_factory, profile = _profiled(launch, backend_factory)
+    try:
+        serve(
+            launch.host,
+            launch.port,
+            backend_factory=backend_factory,
+            encryption=launch.encryption,
+            ssl_context=launch.ssl_context,
+        )
+    finally:
+        if profile is not None:
+            profile.dump()
+
+
+def _stop(_signum: int, _frame: object) -> None:
+    raise SystemExit(0)
+
+
+def _profiled(
+    launch: Launch, factory: Callable[[], Backend]
+) -> tuple[Callable[[], Backend], Profile]:
+    # Every session's backend recorded into one migration profile (#1881),
+    # written on SIGUSR1 as well as when the server stops.
+    from seerdb.server.profile import Profile, ProfilingBackend
+
+    assert launch.profile is not None
+    profile = Profile(launch.profile, launch.description)
+    if hasattr(signal, 'SIGUSR1'):
+        signal.signal(signal.SIGUSR1, lambda _signum, _frame: profile.dump())
+    # A stop by SIGTERM -- kill, a service manager -- unwinds as an interrupt
+    # does, so the profile is written then too.
+    signal.signal(signal.SIGTERM, _stop)
+    logging.getLogger('seerdb.server').info(
+        'recording a migration profile to %s (SIGUSR1 writes it)', launch.profile
     )
+
+    def profiled() -> Backend:
+        return cast(Backend, ProfilingBackend(factory(), profile))
+
+    return (profiled, profile)
