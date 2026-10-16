@@ -10350,6 +10350,16 @@ class _CountedConnection(psycopg.Connection[Any]):
     # (#1875): the savepoint a PL/SQL call takes and its release. The end of
     # the transaction drops them, having released every savepoint.
     prelude: tuple[str, ...] = ()
+    # The seconds spent waiting on PostgreSQL, every exchange psycopg makes
+    # (#1881): what a migration profile tells apart from the Mirror's own time.
+    wait_seconds = 0.0
+
+    def wait(self, *args: Any, **kwargs: Any) -> Any:
+        began = time.perf_counter()
+        try:
+            return super().wait(*args, **kwargs)
+        finally:
+            self.wait_seconds += time.perf_counter() - began
 
     def commit(self) -> None:
         self.prelude = ()
@@ -10784,6 +10794,8 @@ class PostgresBackend:
     # Whether native PostgreSQL SQL is allowed (#1859); off on a backend a
     # test builds without __init__ too.
     _native_sql = False
+    # The PostgreSQL text of the statement last run (#1881).
+    _last_translated: str | None = None
     # This demo speaks the 12.1 WIRE protocol (field version), which is also the
     # release it reports (server_identity). Those were deliberately apart while
     # the wire was 11.2: the dialect reads the RELEASE to pick native
@@ -11391,6 +11403,13 @@ class PostgresBackend:
             )
             self._conn.execute(_ORACLE_DICTIONARY_DDL)
         self._conn.execute(f"COMMENT ON SCHEMA sys IS '{_DICTIONARY_STAMP}'")
+
+    def profile_counters(self) -> tuple[int, float, str | None]:
+        # What a migration profile reads around each call (#1881): the
+        # statements sent PostgreSQL so far, the seconds spent waiting on it,
+        # and the PostgreSQL text of the statement last run.
+        conn = cast(_CountedConnection, self._conn)
+        return (conn.statements, conn.wait_seconds, self._last_translated)
 
     def _at_once(
         self, statement: str | sql.SQL | sql.Composed, params: Sequence | None = None
@@ -12101,6 +12120,7 @@ class PostgresBackend:
             rewritten = _ruled('not-null-nvl', self._without_dead_nvl(sql), sql)
             if rewritten != sql:
                 (fallback, sql) = (sql, rewritten)
+        self._last_translated = sql
         if self._use_pipeline and not is_ddl and not hoisted:
             result = self._execute_pipelined(sql, params, original, fallback)
         elif is_ddl:
@@ -15243,6 +15263,7 @@ class PostgresBackend:
             translated = with_rowid
         bound_sql, _ = _translate_binds(translated, rows[0])
         params = [_translate_binds(translated, row)[1] for row in rows]
+        self._last_translated = bound_sql
         cursor = self._conn.cursor()
         touched: list = []
         try:

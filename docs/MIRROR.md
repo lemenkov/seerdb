@@ -71,6 +71,7 @@ Any service name is accepted.
 | `--tls-cert` | | serve TCPS: the server's certificate chain, PEM (see *Encryption*) |
 | `--tls-key` | | that certificate's private key, PEM |
 | `--tls-ca` | | require client certificates issued by this CA, PEM |
+| `--profile FILE` | | record per-statement statistics to FILE (see *Migration profile*) |
 | `--config FILE` | | an INI file with the same options (below) |
 
 For `postgres`:
@@ -106,6 +107,7 @@ log_level = INFO
 ; tls_cert = /etc/mirror/server.pem
 ; tls_key = /etc/mirror/server.key
 ; tls_ca = /etc/mirror/clients-ca.pem
+; profile = /var/lib/mirror/profile.json
 
 [clients]
 SCOTT = tiger
@@ -311,6 +313,42 @@ do before it can face clients you don't trust. Until those fixes land:
   authenticate the server.
 
 This section shrinks as the fixes land.
+
+## Migration profile
+
+`--profile FILE` records what every session runs, statement by statement, with
+either backend. Run the application once through a passthrough Mirror in
+front of Oracle and once through the Mirror over PostgreSQL, and the two
+recordings say where PostgreSQL is slower.
+
+Statements are grouped by a fingerprint: the text with its literals and binds
+each a `?`, comments dropped, words in upper case and spacing ignored. So
+`WHERE id = 1` and `WHERE id = :x` are one statement. For each one the profile
+keeps:
+
+- calls, rows in and out, total and mean time, and p50 / p95 / p99 from a
+  sample of up to 1000 calls;
+- errors by ORA code, and the kind of call: `execute`, `plsql`, `executemany`,
+  or `lob` for a BFILE read;
+- one example of the statement as the client sent it;
+- over PostgreSQL, the statements the Mirror sent PostgreSQL per call, the
+  time spent waiting on PostgreSQL apart from the Mirror's own, and the
+  PostgreSQL text the statement ran as.
+
+Fetches are served from what the statement already fetched, so their rows
+count toward it. The Mirror serves LOB reads itself, except a BFILE's.
+
+The file is JSON, written whole. It is written when the Mirror stops (an
+interrupt or SIGTERM), on `SIGUSR1`, and as sessions end, at most every 10
+seconds:
+
+```sh
+kill -USR1 $(pgrep -f seerdb-mirror)    # write the profile now
+```
+
+It also records the time the profiler itself took (`profiler_seconds`). Over
+seerdb's integration suite through the Mirror over PostgreSQL that was under 1% of
+the time recorded.
 
 ## Performance
 

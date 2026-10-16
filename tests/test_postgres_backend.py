@@ -1828,6 +1828,66 @@ def test_a_login_opens_no_transaction_and_its_settings_outlast_a_rollback(
     assert row == ('PYO', 'PYO', 'XE')
 
 
+def test_a_profiled_mirror_records_each_statement_over_postgresql(
+    tmp_path: Any,
+) -> None:
+    # A migration profile over PostgreSQL (#1881): each statement a client
+    # runs through the Mirror, by fingerprint, with the statements the backend
+    # sent PostgreSQL for it, its time split between waiting on PostgreSQL and
+    # the Mirror's own, and the PostgreSQL text it ran as. An error is counted
+    # by its ORA code; an array insert counts its rows.
+    from seerdb.server.profile import Profile, ProfilingBackend
+
+    profile = Profile(str(tmp_path / 'profile.json'), 'PostgreSQL')
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    result: dict = {}
+
+    def serve() -> None:
+        conn, _ = listen.accept()
+        backend = ProfilingBackend(
+            PostgresBackend(_CONNINFO, credentials=_CREDS), profile
+        )
+        try:
+            result['user'] = serve_session(PacketStream(conn), backend)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the test thread
+            result['error'] = exc
+        finally:
+            backend.close()
+            conn.close()
+
+    server = threading.Thread(target=serve, daemon=True)
+    server.start()
+    conn = _connect(listen.getsockname()[1])
+    try:
+        cur = conn.cursor()
+        cur.execute('drop table if exists t_prof1881')
+        cur.execute('create table t_prof1881 (n number)')
+        cur.executemany('insert into t_prof1881 values (:1)', [(1,), (2,), (3,)])
+        for n in (1, 2):
+            cur.execute('select sysdate, n from t_prof1881 where n = :1', [n])
+            cur.fetchall()
+        with pytest.raises(seerdb.DatabaseError):
+            cur.execute('select * from no_such_table_1881')
+        cur.execute('drop table t_prof1881')
+    finally:
+        conn.close()
+        server.join(timeout=5)
+        listen.close()
+    assert result.get('error') is None, result.get('error')
+    statements = {s['fingerprint']: s for s in profile.snapshot()['statements']}
+    query = statements['SELECT SYSDATE,N FROM T_PROF1881 WHERE N=?']
+    assert (query['calls'], query['rows_out']) == (2, 2)
+    assert query['backend']['statements_per_call'] >= 1
+    assert query['backend']['database_ms'] > 0
+    assert 'localtimestamp' in query['translated']
+    insert = statements['INSERT INTO T_PROF1881 VALUES(?)']
+    assert (insert['kinds'], insert['rows_in']) == ({'executemany': 1}, 3)
+    assert statements['SELECT * FROM NO_SUCH_TABLE_1881']['errors'] == {'ORA-00942': 1}
+    assert profile.snapshot()['sessions_ended'] == 1
+
+
 def test_a_refused_commit_is_ora_02091() -> None:
     # PostgreSQL checks a deferred constraint at COMMIT and rolls back; the
     # client gets Oracle's ORA-02091 over the constraint's own ORA-00001, not a
