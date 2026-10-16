@@ -12525,8 +12525,11 @@ class PostgresBackend:
                 + _routine_mark(name, 'INVALID')
             )
         elif type_ is not None:
+            # An object type with no attributes, as Oracle's ALL_TYPES lists an
+            # invalid one; not a shell type, which only a superuser may make
+            # (#1937).
             name = type_.group(1)
-            stub = f'DROP TYPE IF EXISTS {name}; CREATE TYPE {name}'
+            stub = f'DROP TYPE IF EXISTS {name}; CREATE TYPE {name} AS ()'
         else:
             return None
         try:

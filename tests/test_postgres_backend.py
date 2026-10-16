@@ -10451,6 +10451,53 @@ def test_a_create_that_does_not_compile_leaves_an_invalid_object() -> None:
         backend.close()
 
 
+def test_an_invalid_type_stands_in_whoever_the_connection_role_is() -> None:
+    # The stand-in for an object type that does not compile (#1499) is one any
+    # role may make, not a shell type, which only a superuser may (#1937). It
+    # is listed as Oracle lists an invalid type, an OBJECT of no attributes,
+    # and a clean CREATE OR REPLACE replaces it.
+    role = f'inv_probe_{os.getpid()}'
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    try:
+        admin.execute(f"CREATE ROLE {role} LOGIN PASSWORD 'inv123'")
+        admin.execute(f'CREATE SCHEMA {role} AUTHORIZATION {role}')
+        # What a Mirror user's role gets from its group (#1857).
+        from seerdb.server.backends.postgres import _USER_WRITTEN_RECORDS
+
+        admin.execute(f'GRANT USAGE ON SCHEMA sys TO {role}')
+        admin.execute(f'GRANT SELECT ON ALL TABLES IN SCHEMA sys TO {role}')
+        records = ', '.join(f'sys.{table}' for table in _USER_WRITTEN_RECORDS)
+        admin.execute(f'GRANT INSERT, UPDATE, DELETE ON {records} TO {role}')
+        backend = PostgresBackend(
+            make_conninfo(_CONNINFO, user=role, password='inv123'),
+            credentials=dict(_CREDS),
+        )
+        try:
+            backend.execute(f'ALTER SESSION SET CURRENT_SCHEMA = {role}')
+            assert backend.execute(
+                'CREATE OR REPLACE TYPE inv_t AS OBJECT (x no_such_type)'
+            ).compilation_warning
+            listed = backend.execute(
+                "SELECT typecode, attributes FROM all_types WHERE type_name = 'INV_T'"
+            )
+            assert [tuple(row) for row in listed.rows] == [('OBJECT', 0)]
+            assert not backend.execute(
+                'CREATE OR REPLACE TYPE inv_t AS OBJECT (x NUMBER)'
+            ).compilation_warning
+            listed = backend.execute(
+                "SELECT attributes FROM all_types WHERE type_name = 'INV_T'"
+            )
+            assert [tuple(row) for row in listed.rows] == [(1,)]
+            backend.execute('DROP TYPE inv_t')
+        finally:
+            backend.close()
+    finally:
+        admin.execute(f'DROP SCHEMA IF EXISTS {role} CASCADE')
+        admin.execute(f'DROP OWNED BY {role}')
+        admin.execute(f'DROP ROLE {role}')
+        admin.close()
+
+
 def test_raise_application_error_becomes_a_coded_raise() -> None:
     # RAISE_APPLICATION_ERROR raises P0001 with its ORA code as the message's
     # prefix, which the error mapping reads back (#1323); the message may itself
