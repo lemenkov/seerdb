@@ -83,6 +83,7 @@ For `postgres`:
 | `--auth-conninfo` | | keep the accounts in the database, connecting as this role (see *Accounts*) |
 | `--translation-report` | off | record each statement's translation in `sys.ora_translation_log` |
 | `--native-sql` | off | let clients run native PostgreSQL SQL (see *Native PostgreSQL*) |
+| `--per-user-roles` | off | run each user's sessions as a PostgreSQL role of its own (see *Per-user roles*) |
 
 For `passthrough`:
 
@@ -122,6 +123,7 @@ presents = 23ai
 ; auth_conninfo = host=db dbname=app user=mirror_auth password=...
 ; translation_report = no
 ; native_sql = no
+; per_user_roles = no
 
 ; For a passthrough instead:
 ; type = passthrough
@@ -215,8 +217,9 @@ builds PostgreSQL 16 with both, as CI uses it.
 
 ### Which role to connect as
 
-**The role in the connection string is the Mirror's security boundary.** Every
-account the Mirror serves runs as that one PostgreSQL role, and with
+**The role in the connection string is the Mirror's security boundary.** Unless
+the Mirror runs with `--per-user-roles` (see *Per-user roles*), every account it
+serves runs as that one PostgreSQL role, and with
 `--native-sql` a client can send native PostgreSQL through the Mirror (below).
 So whatever that role may do in PostgreSQL, every Mirror user may do. Give the
 Mirror a role of its own:
@@ -239,19 +242,64 @@ Prefer the restricted role and accept these.
 
 ### One tenant per database
 
-All Mirror accounts share the one PostgreSQL role, so they share its
-privileges:
+Without `--per-user-roles`, all Mirror accounts share the one PostgreSQL role,
+so they share its privileges:
 
 - **Schemas.** Each account gets a schema of its name, and its unqualified names
   resolve there, as an Oracle user's do. But a user can read and change another
   user's tables by naming the schema, whatever was granted. A `GRANT` on a type
   only decides whether another user can look the type up.
-- **Accounts.** Today any account can manage accounts with `CREATE USER`,
+- **Accounts.** Any account can manage accounts with `CREATE USER`,
   `ALTER USER` and `DROP USER`, including other users' passwords.
 
 Treat one Mirror over one database as **one tenant**: users who would trust each
 other with each other's data. Serve separate tenants from separate Mirrors over
-separate databases, each with its own role.
+separate databases, each with its own role, or use per-user roles.
+
+### Per-user roles
+
+With `--per-user-roles` (`per_user_roles = yes`), each Mirror user's sessions
+run as a PostgreSQL role of its own, so PostgreSQL's own privilege checks keep
+users apart, as Oracle's do between schemas. It needs:
+
+- **PostgreSQL 16 or later.** From 16, a role with `CREATEROLE` manages only
+  the roles it made.
+- **A connection role with `CREATEROLE`.** It installs the dictionary as before,
+  and makes and drops the users' roles.
+- **`--auth-conninfo`.** Each user's role has a password the Mirror makes up,
+  kept with the account. The auth role may be the connection role here, since
+  no session runs as it.
+
+**What a user is.** Each user's role is named as its schema: user `SCOTT` logs
+in as role `scott`, which owns schema `scott`. The role is made by `CREATE USER`,
+or for an account from the config file or `MIRROR_USERS` at its first login. A
+proxy login runs as the target's role. PostgreSQL roles belong to the whole
+server, not to one database, so two Mirror databases on one PostgreSQL server
+can't both have a user of the same name. A `CREATE USER` or a first login whose
+role already exists, made by something other than the Mirror, is refused with
+ORA-01920.
+
+**What a user sees and may do:**
+- its own objects, and others' only as PostgreSQL privileges allow; otherwise
+  ORA-00942;
+- in `ALL_*` views, only what it owns or holds a privilege on;
+- routines and types of its own that are private to it: the Mirror takes back
+  the EXECUTE and USAGE PostgreSQL grants to PUBLIC on what the role makes;
+- its own password changed with `ALTER USER ... IDENTIFIED BY`.
+
+**Administrators.** The accounts the operator configures (`[clients]`,
+`MIRROR_USERS`) are the administrators. Only they may run a DBA's statements:
+- `CREATE USER`, `DROP USER`, and `ALTER USER` on another user;
+- `ALTER USER ... GRANT` or `REVOKE CONNECT THROUGH`;
+- `CREATE` or `DROP DIRECTORY`, and `CREATE` or `DROP EDITION`;
+- `ALTER SYSTEM KILL SESSION`.
+
+A user created with SQL gets ORA-01031 for these. The Mirror runs them on a
+connection of the connection role. `DROP USER` drops the user's role and what it
+owns, and refuses a user with a session open (ORA-01940), as Oracle does.
+
+A login connects to PostgreSQL twice, as the connection role and then as the
+user's, so it takes longer than in single-role mode.
 
 ### Native PostgreSQL
 
