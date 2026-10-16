@@ -1871,6 +1871,10 @@ def test_a_profiled_mirror_records_each_statement_over_postgresql(
         with pytest.raises(seerdb.DatabaseError):
             cur.execute('select * from no_such_table_1881')
         cur.execute('drop table t_prof1881')
+        # A block the Mirror answers without translating anything has no
+        # PostgreSQL text: not the drop's before it (#1931).
+        out = cur.var(int)
+        cur.execute('begin :1 := :2; end;', [out, 5])
     finally:
         conn.close()
         server.join(timeout=5)
@@ -1885,6 +1889,8 @@ def test_a_profiled_mirror_records_each_statement_over_postgresql(
     insert = statements['INSERT INTO T_PROF1881 VALUES(?)']
     assert (insert['kinds'], insert['rows_in']) == ({'executemany': 1}, 3)
     assert statements['SELECT * FROM NO_SUCH_TABLE_1881']['errors'] == {'ORA-00942': 1}
+    assert 'DROP' in statements['DROP TABLE T_PROF1881']['translated'].upper()
+    assert 'translated' not in statements['BEGIN ?:=?;END']
     assert profile.snapshot()['sessions_ended'] == 1
 
 
