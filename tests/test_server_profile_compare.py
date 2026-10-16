@@ -128,3 +128,49 @@ def test_seerdb_mirror_profile_compare(
     (tmp_path / 'other.json').write_text('{"format": "something else"}')
     with pytest.raises(SystemExit, match='is not a Mirror profile'):
         main(['profile', 'compare', str(profiles[0]), str(tmp_path / 'other.json')])
+
+
+def test_the_reports_suggest_for_the_statements_that_lose_time(
+    tmp_path: Path,
+) -> None:
+    # The suggestions (#1883) come with the statements that lose time, with
+    # whose fix each is and the PostgreSQL text the statement ran as; a
+    # statement that got faster has none, whatever its text.
+    def run(name: str, seconds: dict[str, float], translated: bool) -> Path:
+        profile = Profile(str(tmp_path / name), name)
+        for sql, each in seconds.items():
+            for _ in range(20):
+                profile.record(
+                    sql,
+                    'execute',
+                    each,
+                    rows_in=1,
+                    rows_out=1,
+                    error=None,
+                    backend_statements=2 if translated else None,
+                    backend_seconds=each / 2 if translated else None,
+                    translated=sql.lower().replace(':d', '%(b1)s')
+                    if translated
+                    else None,
+                )
+        profile.dump()
+        return tmp_path / name
+
+    slow = 'SELECT id FROM t WHERE TRUNC(d) < :d'
+    quick = 'SELECT id FROM u WHERE UPPER(n) = :d'
+    comparison = compare(
+        load(str(run('oracle.json', {slow: 0.001, quick: 0.002}, False))),
+        load(str(run('postgres.json', {slow: 0.003, quick: 0.001}, True))),
+    )
+    assert [row.fingerprint for row in comparison.suggested] == [
+        'SELECT ID FROM T WHERE TRUNC(D)<?'
+    ]
+    text = text_report(comparison)
+    assert 'Suggestions (top 1):' in text
+    assert 'application: trunc(d) in a condition keeps PostgreSQL' in text
+    assert 'PostgreSQL: select id from t where trunc(d) < %(b1)s' in text
+    assert 'UPPER(N)' not in text.split('Suggestions')[1]
+    page = html_report(comparison)
+    assert '<h2>Suggestions</h2>' in page
+    assert 'select id from t where trunc(d) &lt; %(b1)s' in page
+    assert '<span class="owner">application</span> (index)' in page
