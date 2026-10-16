@@ -2313,6 +2313,70 @@ _ORACLE_DICTIONARY_DDL = (
     'cols, typ, tab::regclass) INTO res USING id; RETURN res; END $$;'
 )
 
+
+def _record_policies() -> str:
+    # Row-level security on the Mirror's own records (#1857): a role that is
+    # not their owner -- the role that installed them, which policies do not
+    # bind -- may read them all, and write only the records of what it owns
+    # itself: a table's or a type's of its own, a package's or a grant's of
+    # its own schema, its own session's. A record whose object is gone may be
+    # deleted by anyone, as the prune after a DROP does. The DBA's records --
+    # directories, editions, proxy grants -- and the translation report get no
+    # write policy at all. Each owner test is a subquery bound when the policy
+    # is made, so no search_path can stand another function in for it.
+    def owner(catalog: str, owner_column: str, key: str, value: str) -> str:
+        return (
+            f"(SELECT pg_catalog.pg_has_role(o.{owner_column}, 'USAGE') "
+            f'FROM pg_catalog.{catalog} o WHERE o.{key} = {value})'
+        )
+
+    relation = owner('pg_class', 'relowner', 'oid', '{t}.relid')
+    owned: dict[str, str | None] = {
+        'ora_columns': relation,
+        'ora_annotations': relation,
+        'ora_invisible_columns': relation,
+        'ora_tstz_precision': relation,
+        'ora_quoted_names': relation,
+        'ora_object_tables': relation,
+        'ora_collection_elements': owner('pg_type', 'typowner', 'oid', '{t}.typid'),
+        'ora_packages': owner('pg_namespace', 'nspowner', 'nspname', '{t}.name'),
+        'ora_plsql_types': owner('pg_namespace', 'nspowner', 'nspname', '{t}.package'),
+        'ora_grants': owner('pg_namespace', 'nspowner', 'nspname', 'lower({t}.owner)'),
+        'ora_sessions': None,
+        'ora_directories': None,
+        'ora_editions': None,
+        'ora_proxy_grants': None,
+        'ora_translation_log': None,
+    }
+    ddl = []
+    for table, test in owned.items():
+        name = f'sys.{table}'
+        ddl += [
+            f'ALTER TABLE {name} ENABLE ROW LEVEL SECURITY',
+            f'DROP POLICY IF EXISTS ora_read ON {name}',
+            f'CREATE POLICY ora_read ON {name} FOR SELECT USING (true)',
+            f'DROP POLICY IF EXISTS ora_write ON {name}',
+        ]
+        if table == 'ora_sessions':
+            # Its own session's row, and a row whose session has ended.
+            ddl.append(
+                f'CREATE POLICY ora_write ON {name} USING (pid = pg_catalog.pg_backend_pid() '
+                'OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity a '
+                'WHERE a.pid = ora_sessions.pid)) WITH CHECK (pid = pg_catalog.pg_backend_pid())'
+            )
+        elif test is not None:
+            # The record's own columns named by its table, so none can be
+            # taken for a catalog's column in the subquery.
+            test = test.format(t=table)
+            ddl.append(
+                f'CREATE POLICY ora_write ON {name} USING ({test} IS NOT FALSE) '
+                f'WITH CHECK ({test} IS TRUE)'
+            )
+    return ''.join(f'{statement};' for statement in ddl)
+
+
+_ORACLE_DICTIONARY_DDL += _record_policies()
+
 # What the installed dictionary is stamped with, as the `sys` schema's comment:
 # a digest of the DDL itself, so any change to a view or function reinstalls it
 # and an unchanged one is left alone (#1152).

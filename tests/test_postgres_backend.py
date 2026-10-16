@@ -1828,6 +1828,96 @@ def test_a_login_opens_no_transaction_and_its_settings_outlast_a_rollback(
     assert row == ('PYO', 'PYO', 'XE')
 
 
+def test_a_role_writes_only_the_records_of_what_it_owns() -> None:
+    # Row-level security on the Mirror's records (#1857): a role that is not
+    # the installer reads every record, but writes only those of the tables,
+    # packages and session that are its own. Another's record it cannot add,
+    # change or delete; one whose object is gone it may delete; a DBA's
+    # record -- a proxy grant -- it cannot write at all.
+    PostgresBackend(_CONNINFO, credentials=_CREDS).close()
+    role = f'rls_probe_{os.getpid()}'
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    tables = (
+        'sys.ora_quoted_names, sys.ora_packages, sys.ora_sessions, sys.ora_proxy_grants'
+    )
+    try:
+        admin.execute(f'CREATE ROLE {role}')
+        admin.execute(f'GRANT USAGE ON SCHEMA sys TO {role}')
+        admin.execute(f'GRANT SELECT, INSERT, UPDATE, DELETE ON {tables} TO {role}')
+        admin.execute(f'CREATE SCHEMA {role} AUTHORIZATION {role}')
+        admin.execute(f'CREATE TABLE {role}.mine (a int)')
+        admin.execute(f'ALTER TABLE {role}.mine OWNER TO {role}')
+        admin.execute(f'CREATE TABLE public.{role}_other (a int)')
+        (mine,) = admin.execute(f"SELECT '{role}.mine'::regclass::oid").fetchone()
+        (other,) = admin.execute(
+            f"SELECT 'public.{role}_other'::regclass::oid"
+        ).fetchone()
+        # The installer's own writes are not bound by the policies.
+        admin.execute(
+            'INSERT INTO sys.ora_quoted_names VALUES (%s, 1), (0, 1)', (other,)
+        )
+        with psycopg.connect(_CONNINFO, autocommit=True) as conn:
+            conn.execute(f'SET ROLE {role}')
+            conn.execute('INSERT INTO sys.ora_quoted_names VALUES (%s, 1)', (mine,))
+            assert conn.execute(
+                'SELECT count(*) FROM sys.ora_quoted_names WHERE relid IN (%s, %s)',
+                (mine, other),
+            ).fetchone() == (2,)
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(
+                    'INSERT INTO sys.ora_quoted_names VALUES (%s, 2)', (other,)
+                )
+            assert (
+                conn.execute(
+                    'UPDATE sys.ora_quoted_names SET attnum = 3 WHERE relid = %s',
+                    (other,),
+                ).rowcount
+                == 0
+            )
+            assert (
+                conn.execute(
+                    'DELETE FROM sys.ora_quoted_names WHERE relid = %s', (other,)
+                ).rowcount
+                == 0
+            )
+            # Relation 0 is none: its record is an orphan's.
+            assert (
+                conn.execute(
+                    'DELETE FROM sys.ora_quoted_names WHERE relid = 0'
+                ).rowcount
+                == 1
+            )
+            conn.execute("INSERT INTO sys.ora_packages VALUES (%s, 'X', '')", (role,))
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute("INSERT INTO sys.ora_packages VALUES ('sys', 'X', '')")
+            conn.execute(
+                'INSERT INTO sys.ora_sessions (pid) VALUES (pg_backend_pid()) '
+                'ON CONFLICT (pid) DO UPDATE SET username = NULL'
+            )
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(
+                    'INSERT INTO sys.ora_sessions (pid) '
+                    'SELECT pg_backend_pid() + 1000000'
+                )
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute("INSERT INTO sys.ora_proxy_grants VALUES ('A', 'B')")
+            conn.execute('DELETE FROM sys.ora_sessions WHERE pid = pg_backend_pid()')
+    finally:
+        admin.execute(
+            f'DELETE FROM sys.ora_quoted_names WHERE relid IN '
+            f"(to_regclass('{role}.mine'), to_regclass('public.{role}_other'), 0)"
+        )
+        admin.execute('DELETE FROM sys.ora_packages WHERE name = %s', (role,))
+        admin.execute(f'DROP TABLE IF EXISTS public.{role}_other')
+        admin.execute(f'DROP SCHEMA IF EXISTS {role} CASCADE')
+        if admin.execute(
+            'SELECT 1 FROM pg_roles WHERE rolname = %s', (role,)
+        ).fetchone():
+            admin.execute(f'DROP OWNED BY {role}')
+            admin.execute(f'DROP ROLE {role}')
+        admin.close()
+
+
 def test_a_profiled_mirror_records_each_statement_over_postgresql(
     tmp_path: Any,
 ) -> None:
