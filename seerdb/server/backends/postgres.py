@@ -11407,9 +11407,12 @@ class PostgresBackend:
     def profile_counters(self) -> tuple[int, float, str | None]:
         # What a migration profile reads around each call (#1881): the
         # statements sent PostgreSQL so far, the seconds spent waiting on it,
-        # and the PostgreSQL text of the statement last run.
+        # and the PostgreSQL text of the statement last run since the last
+        # read. Read before a call too, so a call that translates nothing
+        # reports nothing rather than the call before's text (#1931).
         conn = cast(_CountedConnection, self._conn)
-        return (conn.statements, conn.wait_seconds, self._last_translated)
+        (translated, self._last_translated) = (self._last_translated, None)
+        return (conn.statements, conn.wait_seconds, translated)
 
     def _at_once(
         self, statement: str | sql.SQL | sql.Composed, params: Sequence | None = None
