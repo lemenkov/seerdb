@@ -94,6 +94,9 @@ For `passthrough`:
 `seerdb-mirror observe` runs a bring-up tool instead: it accepts a client and
 logs every packet the client sends, in hex. It answers nothing.
 
+`seerdb-mirror profile compare` compares two migration profiles; it starts no
+server (see *Comparing two profiles*).
+
 The command line wins over the config file, and the file over the defaults.
 
 ### The config file
@@ -349,6 +352,41 @@ kill -USR1 $(pgrep -f seerdb-mirror)    # write the profile now
 It also records the time the profiler itself took (`profiler_seconds`). Over
 seerdb's integration suite through the Mirror over PostgreSQL that was under 1% of
 the time recorded.
+
+### Comparing two profiles
+
+```sh
+seerdb-mirror profile compare oracle.json postgres.json --html report.html
+```
+
+The first profile is the baseline (the run against Oracle), the second the
+candidate (the run over PostgreSQL). The two are joined by fingerprint. A
+statement that only one run saw, such as one that failed on one side, is
+listed apart.
+
+Statements are ranked by the time the candidate loses on them: the difference
+in mean time per call, times the candidate's calls. They are not ranked by the
+ratio: twice as slow on a statement called a million times outranks fifty
+times as slow on one called twice. The ratio is shown alongside.
+
+For each statement the report gives:
+- calls, mean, total and p95 time on each side;
+- errors by ORA code on each side;
+- over PostgreSQL, the statements the Mirror sent PostgreSQL per call, and a
+  call's time split between waiting on PostgreSQL and the Mirror's own.
+
+That split says where to look. The **fix** column names the larger part of the
+loss:
+- **Mirror:** the Mirror's own time per call, so its emulation is the cost;
+- **SQL:** PostgreSQL's time beyond Oracle's whole call, so the statement itself is the cost.
+
+The command prints a plain-text summary of the top statements (`--top N`,
+default 20). `--html FILE` also writes a self-contained HTML report of all of
+them.
+
+Two runs compare only on similar hardware, network and data volume. Both
+reports say so, and show what the recordings can about each run: sessions,
+calls, the time recorded, and the rows read and written.
 
 ## Performance
 
