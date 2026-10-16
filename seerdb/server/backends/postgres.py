@@ -1340,6 +1340,9 @@ _DBMS_OUTPUT_LINES_DDL = (
 # ALL_OBJECTS and ALL_PROCEDURES can tell it from the backend's own helpers,
 # which share its schemas. DROP takes the comment with the routine.
 _ROUTINE_MARK: Final = 'seerdb:routine:'
+# The comment an object type's stand-in carries when it did not compile
+# (#1937), so ALL_OBJECTS lists it INVALID (#1940).
+_TYPE_MARK: Final = 'seerdb:type:'
 # The column an index key `k` is on: its own column, or for a WITH TIME ZONE
 # column's instant, ((col).utc), the column it reads (#1897).
 _INDEX_KEY_COLUMN: Final = (
@@ -1882,6 +1885,19 @@ _ORACLE_DICTIONARY_DDL = (
     # reflection raises ORA-00942. Options are reported as Oracle's defaults for now.
     """CREATE OR REPLACE VIEW sys.all_tab_identity_cols AS SELECT ora_owner(n.nspname) AS owner, ora_name(c.relname) AS table_name, ora_column_name(a.attrelid, a.attname) AS column_name, CASE a.attidentity WHEN 'a' THEN 'ALWAYS' ELSE 'BY DEFAULT' END AS generation_type, ora_name(c.relname || '_' || a.attname || '_seq') AS sequence_name, 'START WITH: 1, INCREMENT BY: 1, MAX_VALUE: 9999999999999999999999999999, MIN_VALUE: 1, CYCLE_FLAG: N, CACHE_SIZE: 20, ORDER_FLAG: N' AS identity_options FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE a.attidentity IN ('a','d') AND NOT a.attisdropped AND a.attnum>0 AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') """
     f'AND {_reachable_relation("c.oid")};'
+    # Object privileges a GRANT gave (#1621): owner, object and grantee as
+    # Oracle names them. A user sees a type -- in ALL_TYPES and the views like
+    # it, and by name, as gettype() looks one up -- that is its own, PUBLIC's
+    # or SYS's, or one it or PUBLIC was granted EXECUTE on.
+    'CREATE TABLE IF NOT EXISTS sys.ora_grants (owner text, object_name text, '
+    'privilege text, grantee text, '
+    'PRIMARY KEY (owner, object_name, privilege, grantee));'
+    'CREATE OR REPLACE FUNCTION sys.ora_type_visible(owner text, type_name text) '
+    "RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT $1 IN ('PUBLIC', 'SYS', "
+    "sys.sys_context('userenv', 'session_user')) OR EXISTS (SELECT 1 FROM "
+    'sys.ora_grants g WHERE g.owner = $1 AND g.object_name = $2 '
+    "AND g.privilege IN ('EXECUTE', 'ALL') AND g.grantee IN ('PUBLIC', "
+    "sys.sys_context('userenv', 'session_user'))) $$;"
     'CREATE OR REPLACE VIEW sys.all_objects AS SELECT '
     "CASE WHEN n.nspname LIKE 'pg_temp%' THEN upper(current_schema()) "
     'ELSE upper(n.nspname) END AS owner, '
@@ -1914,7 +1930,24 @@ _ORACLE_DICTIONARY_DDL = (
     'FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace '
     "JOIN pg_description d ON d.objoid = p.oid AND d.classoid = 'pg_proc'::regclass "
     f"AND d.objsubid = 0 WHERE d.description LIKE '{_ROUTINE_MARK}%' "
-    "AND has_function_privilege(p.oid, 'EXECUTE');"
+    "AND has_function_privilege(p.oid, 'EXECUTE') "
+    # A user's object type or collection type, as ALL_TYPES lists them, INVALID
+    # when it is a stand-in for one that did not compile (#1940). A package's
+    # types are not listed, as Oracle does not list them.
+    'UNION ALL SELECT * FROM (SELECT ora_owner(n.nspname) AS owner, '
+    "ora_name(t.typname) AS object_name, NULL::text, t.oid::bigint, 'TYPE', "
+    f"CASE WHEN obj_description(t.oid, 'pg_type') = '{_TYPE_MARK}INVALID' "
+    "THEN 'INVALID' ELSE 'VALID' END, 'N', 'N', 'N' "
+    'FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace '
+    'LEFT JOIN pg_class c ON c.oid = t.typrelid '
+    'LEFT JOIN pg_type b ON b.oid = t.typbasetype '
+    "WHERE (t.typtype = 'c' AND c.relkind = 'c' "
+    f"AND t.typname <> '{_TSTZ_TYPE}' AND t.typname !~ '[$]ref$' "
+    "OR t.typtype = 'd' AND b.typcategory = 'A') "
+    "AND has_type_privilege(t.oid, 'USAGE') "
+    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    'AND n.nspname NOT IN (SELECT name FROM sys.ora_packages)) v '
+    'WHERE sys.ora_type_visible(v.owner, v.object_name);'
     # orafce has a user_objects too, which lists every schema's objects under
     # their PostgreSQL names; this one is the current schema's, Oracle's way.
     'CREATE OR REPLACE VIEW sys.user_objects AS SELECT * FROM all_objects '
@@ -2165,13 +2198,6 @@ _ORACLE_DICTIONARY_DDL = (
     # by a 16-byte OID; here it is PostgreSQL's own type oid, zero-padded, so the
     # backend can turn an OID a bind carries straight back into the type. A
     # built-in attribute type has no owner, as in Oracle.
-    # Object privileges a GRANT gave (#1621): owner, object and grantee as
-    # Oracle names them. A user sees a type -- in ALL_TYPES and the views like
-    # it, and by name, as gettype() looks one up -- that is its own, PUBLIC's
-    # or SYS's, or one it or PUBLIC was granted EXECUTE on.
-    'CREATE TABLE IF NOT EXISTS sys.ora_grants (owner text, object_name text, '
-    'privilege text, grantee text, '
-    'PRIMARY KEY (owner, object_name, privilege, grantee));'
     # Who may open a session as whom (#1860): ALTER USER client GRANT CONNECT
     # THROUGH proxy, and the PROXY_USERS view of them, as 23ai lists one.
     'CREATE TABLE IF NOT EXISTS sys.ora_proxy_grants (proxy text NOT NULL, '
@@ -2181,12 +2207,6 @@ _ORACLE_DICTIONARY_DDL = (
     "'NO'::varchar(3) AS authentication, "
     "'PROXY MAY ACTIVATE ALL CLIENT ROLES'::varchar(35) AS flags "
     'FROM sys.ora_proxy_grants;'
-    'CREATE OR REPLACE FUNCTION sys.ora_type_visible(owner text, type_name text) '
-    "RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT $1 IN ('PUBLIC', 'SYS', "
-    "sys.sys_context('userenv', 'session_user')) OR EXISTS (SELECT 1 FROM "
-    'sys.ora_grants g WHERE g.owner = $1 AND g.object_name = $2 '
-    "AND g.privilege IN ('EXECUTE', 'ALL') AND g.grantee IN ('PUBLIC', "
-    "sys.sys_context('userenv', 'session_user'))) $$;"
     'CREATE OR REPLACE VIEW sys.all_types AS SELECT * FROM ('
     'SELECT ora_owner(n.nspname) AS owner, '
     'ora_name(t.typname) AS type_name, '
@@ -12527,9 +12547,12 @@ class PostgresBackend:
         elif type_ is not None:
             # An object type with no attributes, as Oracle's ALL_TYPES lists an
             # invalid one; not a shell type, which only a superuser may make
-            # (#1937).
+            # (#1937). Marked, so ALL_OBJECTS lists it INVALID (#1940).
             name = type_.group(1)
-            stub = f'DROP TYPE IF EXISTS {name}; CREATE TYPE {name} AS ()'
+            stub = (
+                f'DROP TYPE IF EXISTS {name}; CREATE TYPE {name} AS (); '
+                f"COMMENT ON TYPE {name} IS '{_TYPE_MARK}INVALID'"
+            )
         else:
             return None
         try:

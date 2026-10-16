@@ -1970,7 +1970,7 @@ def test_the_dictionary_lists_what_the_sessions_role_may_reach() -> None:
 
             assert names(
                 'SELECT object_name FROM sys.all_objects WHERE object_name LIKE %s'
-            ) == {granted, f'{granted}_pkey', f'{granted}_f'}
+            ) == {granted, f'{granted}_pkey', f'{granted}_f', f'{granted}_t'}
             assert names(
                 'SELECT index_name FROM sys.all_indexes WHERE index_name LIKE %s'
             ) == {f'{granted}_pkey'}
@@ -10448,6 +10448,56 @@ def test_a_create_that_does_not_compile_leaves_an_invalid_object() -> None:
         with pytest.raises(BackendError):
             backend.execute('CREATE TABLE pyo_invalid_tab bogus')
     finally:
+        backend.close()
+
+
+def test_all_objects_lists_types_valid_or_invalid() -> None:
+    # An object type, a VARRAY and a nested table are each a TYPE in
+    # ALL_OBJECTS, and one that did not compile is INVALID until a clean
+    # CREATE OR REPLACE; a package's types are not listed, only the package
+    # (#1940, measured on 23ai).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    names = ('ao_obj_t', 'ao_va_t', 'ao_nt_t', 'ao_bad_t')
+    try:
+        backend.execute('CREATE TYPE ao_obj_t AS OBJECT (a NUMBER)')
+        backend.execute('CREATE TYPE ao_va_t AS VARRAY(3) OF NUMBER')
+        backend.execute('CREATE TYPE ao_nt_t AS TABLE OF VARCHAR2(10)')
+        assert backend.execute(
+            'CREATE TYPE ao_bad_t AS OBJECT (a no_such_type)'
+        ).compilation_warning
+        backend.execute(
+            'CREATE PACKAGE ao_pk AS TYPE rec IS RECORD (a NUMBER); '
+            'TYPE tab IS TABLE OF NUMBER; END;'
+        )
+        query = (
+            'SELECT object_name, subobject_name, object_type, status, temporary, '
+            "generated, secondary FROM user_objects WHERE object_name LIKE 'AO\\_%' "
+            "ESCAPE '\\' OR object_name IN ('REC', 'TAB') ORDER BY 1, 3"
+        )
+        assert [tuple(row) for row in backend.execute(query).rows] == [
+            ('AO_BAD_T', None, 'TYPE', 'INVALID', 'N', 'N', 'N'),
+            ('AO_NT_T', None, 'TYPE', 'VALID', 'N', 'N', 'N'),
+            ('AO_OBJ_T', None, 'TYPE', 'VALID', 'N', 'N', 'N'),
+            ('AO_PK', None, 'PACKAGE', 'VALID', 'N', 'N', 'N'),
+            ('AO_VA_T', None, 'TYPE', 'VALID', 'N', 'N', 'N'),
+        ]
+        assert not backend.execute(
+            'CREATE OR REPLACE TYPE ao_bad_t AS OBJECT (a NUMBER)'
+        ).compilation_warning
+        status = backend.execute(
+            "SELECT status FROM user_objects WHERE object_name = 'AO_BAD_T'"
+        )
+        assert [tuple(row) for row in status.rows] == [('VALID',)]
+    finally:
+        for name in names:
+            try:
+                backend.execute(f'DROP TYPE {name}')
+            except Exception:
+                pass
+        try:
+            backend.execute('DROP PACKAGE ao_pk')
+        except Exception:
+            pass
         backend.close()
 
 
