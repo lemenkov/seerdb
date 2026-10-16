@@ -18,6 +18,11 @@ It builds one CA that signs *both* halves of the handshake:
 
 Validity is pinned to a fixed, far-future window so the committed certs are
 stable and do not expire during the project's lifetime.
+
+The certificates carry the extensions a strict verifier asks for (#1843):
+Python 3.13's default context (VERIFY_X509_STRICT) refuses a leaf without an
+Authority Key Identifier, and the CA has Subject Key Identifier and keyUsage,
+each leaf keyUsage and the extendedKeyUsage of its side of the handshake.
 """
 
 import datetime
@@ -28,7 +33,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.serialization import pkcs12
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 WALLET_DIR = os.path.join(os.path.dirname(__file__), 'wallet')
 
@@ -69,12 +74,29 @@ def _gen_ca():
         .not_valid_before(NOT_BEFORE)
         .not_valid_after(NOT_AFTER)
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(Key.public_key()), critical=False
+        )
         .sign(Key, hashes.SHA256())
     )
     return (Key, Cert)
 
 
-def _gen_leaf(Cn, CaKey, CaCert, Sans=None):
+def _gen_leaf(Cn, CaKey, CaCert, Usage, Sans=None):
     Key = ec.generate_private_key(ec.SECP256R1())
     Builder = (
         x509.CertificateBuilder()
@@ -85,6 +107,28 @@ def _gen_leaf(Cn, CaKey, CaCert, Sans=None):
         .not_valid_before(NOT_BEFORE)
         .not_valid_after(NOT_AFTER)
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=True,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(x509.ExtendedKeyUsage([Usage]), critical=False)
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(Key.public_key()), critical=False
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(CaKey.public_key()),
+            critical=False,
+        )
     )
     if Sans:
         Builder = Builder.add_extension(
@@ -120,12 +164,15 @@ def main():
         SERVER_CN,
         CaKey,
         CaCert,
+        ExtendedKeyUsageOID.SERVER_AUTH,
         Sans=[
             x509.DNSName('localhost'),
             x509.IPAddress(ipaddress.IPv4Address('127.0.0.1')),
         ],
     )
-    (ClientKey, ClientCert) = _gen_leaf(CLIENT_CN, CaKey, CaCert)
+    (ClientKey, ClientCert) = _gen_leaf(
+        CLIENT_CN, CaKey, CaCert, ExtendedKeyUsageOID.CLIENT_AUTH
+    )
 
     _write('ca_cert.pem', _pem_cert(CaCert))
     _write('server_cert.pem', _pem_cert(ServerCert))
