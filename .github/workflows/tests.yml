@@ -22,6 +22,9 @@ on:
       - '.git-blame-ignore-revs'
       - '.github/dependabot.yml'
   pull_request:
+    # ready_for_review: a draft skips the heavy jobs below, which run once it
+    # is undrafted (#1942).
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [master]
     paths-ignore:
       - '**.md'
@@ -164,7 +167,7 @@ jobs:
   integration:
     name: Integration tests (${{ matrix.db.name }})
     needs: changes
-    if: needs.changes.outputs.oracle == 'true'
+    if: needs.changes.outputs.oracle == 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
@@ -293,7 +296,7 @@ jobs:
   mirror-postgres:
     name: Integration tests (Mirror over PostgreSQL, ${{ matrix.presents }})
     needs: changes
-    if: needs.changes.outputs.mirror == 'true'
+    if: needs.changes.outputs.mirror == 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:

@@ -29,6 +29,9 @@ on:
       - 'pyproject.toml'
       - '.github/workflows/sqlalchemy-mirror.yml'
   pull_request:
+    # ready_for_review: a draft skips the heavy jobs below, which run once it
+    # is undrafted (#1942).
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [master]
     paths:
       - 'seerdb/**'
@@ -52,6 +55,8 @@ env:
 jobs:
   mirror-compliance:
     name: SQLAlchemy compliance (Mirror over PostgreSQL)
+    # A draft waits for ready_for_review (#1942).
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:

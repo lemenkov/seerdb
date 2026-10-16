@@ -59,10 +59,21 @@ not the whole matrix (a PR touching several rows runs the union):
 | `seerdb/client` | the integration suite on 8i, 9i and 10g |
 | `seerdb/common` | the integration suite on every bed (8i to 26ai), both Mirror legs, the offline suite, and both python-oracledb suite runs |
 
-Run these while CI runs, and put the legs you ran and their numbers in the PR.
-CI covers the rest for those paths, and the nightly run covers every CI leg
-whatever changed; 8i, 9i and 10g run nowhere but locally, which is why a client
-change still needs them.
+Run these before the first push, and put the legs you ran and their numbers in
+the PR. CI covers the rest for those paths, and the nightly run covers every CI
+leg whatever changed; 8i, 9i and 10g run nowhere but locally, which is why a
+client change still needs them.
+
+CI minutes are a limited quota and local runs are free, and every push to a PR
+re-runs every leg its paths reach (#1942). So:
+
+- Push once the local legs are green, so the first CI run is the only one.
+- Collect review fixes into one amend and one push.
+- When two PRs touch the same code, open the second after the first merges,
+  rebased once. Don't rebase a PR that still merges cleanly.
+- A **draft** PR runs only the offline suite, typecheck, packaging, lint and
+  REUSE. The Oracle and Mirror integration legs, both SQLAlchemy runs and
+  CodeQL wait until it is marked ready for review, then run on every push.
 
 A docs-only change needs none of the test tiers; the repository's own workflows
 skip them on those paths too.
