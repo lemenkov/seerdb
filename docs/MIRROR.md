@@ -388,6 +388,28 @@ Two runs compare only on similar hardware, network and data volume. Both
 reports say so, and show what the recordings can about each run: sessions,
 calls, the time recorded, and the rows read and written.
 
+### Suggestions
+
+For each statement that loses time, both reports suggest how to win it back.
+Each suggestion shows the statement as the client sent it, beside the
+PostgreSQL text it ran as, as a starting point for a native rewrite. Each
+suggestion also says whose fix it is:
+- **application:** a rewrite the application can send over the same
+  connection (see *Native PostgreSQL*);
+- **Mirror:** a cost of the Mirror's emulation that every application pays.
+  That's a Mirror performance issue to report, not a rewrite.
+
+| rule | when | fix |
+|---|---|---|
+| index | a function around a column in a condition (`trunc(d) = :x`, `upper(name) = :x`): PostgreSQL cannot use an index on the column | application: compare the column itself (a range in place of `trunc`), or index the expression |
+| anonymous block | a PL/SQL block that runs as a PostgreSQL `DO` block, planned afresh on every call | application: create it once as a PostgreSQL function and call that |
+| helper per row | a query of 10 rows or more per call that runs one of the Mirror's `sys.*` helpers per row (`sys.deref`, `sys.ora_rowid`) | application: a rewrite without the Oracle feature, such as a join in place of a DEREF |
+| statements per call | the Mirror sends PostgreSQL more than 1.5 statements per call above the usual (about 2 for a query, 4 for anything else), over at least 10 calls | Mirror |
+| ROWID | an INSERT that asks PostgreSQL for the new row's ROWID, for the reply Oracle gives, whether or not the application reads it | Mirror |
+
+The rules start from what the Mirror's own performance work measured, and
+grow with the patterns that real recordings show.
+
 ## Performance
 
 `tools/mirror_benchmark.py` runs `tools/benchmark.py` against Oracle directly

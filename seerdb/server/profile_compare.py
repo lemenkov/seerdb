@@ -21,9 +21,12 @@ import argparse
 import html
 import json
 import math
+import textwrap
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
+
+from seerdb.server.profile_suggest import Suggestion, suggest
 
 FORMAT = 'seerdb-mirror-profile/1'
 
@@ -127,6 +130,12 @@ class Compared:
         (_, database, mirror) = split
         return 'Mirror' if mirror >= database - self.baseline['mean_ms'] else 'SQL'
 
+    @property
+    def suggestions(self) -> list[Suggestion]:
+        """How to win the lost time back (#1883), for a statement that
+        loses any."""
+        return suggest(self.candidate) if self.lost_ms > 0 else []
+
 
 @dataclass
 class Comparison:
@@ -143,6 +152,12 @@ class Comparison:
     @property
     def won_ms(self) -> float:
         return -sum(c.lost_ms for c in self.compared if c.lost_ms < 0)
+
+    @property
+    def suggested(self) -> list[Compared]:
+        """The statements that lose time and have a suggestion, by time
+        lost."""
+        return [c for c in self.compared if c.suggestions]
 
 
 def compare(baseline: Run, candidate: Run) -> Comparison:
@@ -220,6 +235,21 @@ def text_report(comparison: Comparison, top: int = 20) -> str:
                 f'{(f"{split[0]:.1f}" if split else ""):>5} {row.fix:<6} '
                 f'{_clip(row.fingerprint, 70)}'
             )
+    suggested = c.suggested
+    if suggested:
+        lines += ['', f'Suggestions (top {min(top, len(suggested))}):']
+        for row in suggested[:top]:
+            lines.append(f'{_ms(row.lost_ms):>10} ms  {_clip(row.fingerprint, 90)}')
+            for suggestion in row.suggestions:
+                lines += textwrap.wrap(
+                    f'{suggestion.owner}: {suggestion.text}',
+                    width=100,
+                    initial_indent=' ' * 14,
+                    subsequent_indent=' ' * 16,
+                )
+            translated = row.candidate.get('translated')
+            if translated:
+                lines.append(' ' * 14 + f'PostgreSQL: {_clip(translated, 200)}')
     for title, alone in (
         ('Only in the baseline', c.only_baseline),
         ('Only in the candidate', c.only_candidate),
@@ -260,6 +290,10 @@ code, pre { font: 12px/1.4 ui-monospace, monospace; }
 pre { white-space: pre-wrap; margin: 4px 0; color: var(--muted); }
 .lost { color: var(--lost); } .won { color: var(--won); }
 .muted { color: var(--muted); }
+.suggested { border-top: 1px solid var(--line); padding: 8px 0; }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 700px) { .pair { grid-template-columns: 1fr; } }
+.owner { font-weight: 600; }
 """
 
 
@@ -340,6 +374,7 @@ def html_report(comparison: Comparison) -> str:
             + '</tr>'
         )
     out.append('</table></div>')
+    out += _html_suggestions(c.suggested)
     for title, alone in (
         ('Only in the baseline', c.only_baseline),
         ('Only in the candidate', c.only_candidate),
@@ -361,6 +396,43 @@ def html_report(comparison: Comparison) -> str:
         out.append('</table></div>')
     out.append('</body></html>\n')
     return '\n'.join(out)
+
+
+def _html_suggestions(suggested: list[Compared]) -> list[str]:
+    # Each statement that loses time and has a suggestion: the suggestions,
+    # whose fix each is, and the statement as the client sent it beside the
+    # PostgreSQL text it ran as -- a starting point for a native rewrite.
+    if not suggested:
+        return []
+    e = html.escape
+    out = [
+        '<h2>Suggestions</h2>',
+        '<p class="muted">For the statements that lose time, by time lost. '
+        'An <em>application</em> fix is a native rewrite the application can '
+        "send over the same connection; a <em>Mirror</em> fix is the Mirror's "
+        'own cost, which every application pays: a Mirror performance issue '
+        'to report, not a rewrite.</p>',
+    ]
+    for row in suggested:
+        k = row.candidate
+        out.append(
+            f'<div class="suggested"><p><span class="lost">'
+            f'{_ms(row.lost_ms)} ms lost</span> '
+            f'<code>{e(row.fingerprint)}</code></p><ul>'
+        )
+        for suggestion in row.suggestions:
+            out.append(
+                f'<li><span class="owner">{e(suggestion.owner)}</span> '
+                f'({e(suggestion.rule)}): {e(suggestion.text)}</li>'
+            )
+        out.append(
+            '</ul><div class="pair"><div>as the client sent it'
+            f'<pre>{e(k.get("example") or row.fingerprint)}</pre></div>'
+            '<div>as it ran on PostgreSQL'
+            f'<pre>{e(k.get("translated") or "(not recorded)")}</pre></div>'
+            '</div></div>'
+        )
+    return out
 
 
 def main(argv: Sequence[str] | None = None) -> None:
