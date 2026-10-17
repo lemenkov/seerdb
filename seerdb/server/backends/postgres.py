@@ -175,7 +175,8 @@ honest edge of this adapter:
   lower-priority transaction holding a lock a higher one waits on.
 - **Object privileges** -- a GRANT or REVOKE on an object is checked and
   recorded as Oracle keys it (``sys.ora_grants``: grantor, GRANT OPTION, kind
-  of object), and a user sees another user's type -- in ALL_TYPES,
+  of object) and listed in ALL_TAB_PRIVS and the views like it, and a user
+  sees another user's type -- in ALL_TYPES,
   ALL_TYPE_ATTRS, ALL_COLL_TYPES and a lookup by name, as ``gettype()`` makes
   -- only once granted EXECUTE on it. With per-user roles (#1857) it is
   PostgreSQL's own GRANT or REVOKE too, so another user's object needs one
@@ -1923,6 +1924,36 @@ _ORACLE_DICTIONARY_DDL = (
     'sys.ora_grants g WHERE g.owner = $1 AND g.object_name = $2 '
     "AND g.privilege IN ('EXECUTE', 'ALL') AND g.grantee IN ('PUBLIC', "
     "sys.sys_context('userenv', 'session_user'))) $$;"
+    # The object grants a user may see (#1858), in 23ai's shape, which 21c's
+    # is too: ALL_TAB_PRIVS those it owns, made or received, and PUBLIC's;
+    # the _MADE and _RECD views each side of that; USER_TAB_PRIVS without
+    # PUBLIC's, USER_TAB_PRIVS_MADE only what it owns.
+    'CREATE OR REPLACE VIEW sys.ora_tab_privs AS SELECT '
+    'grantee::varchar(128) AS grantee, owner::varchar(128) AS owner, '
+    'object_name::varchar(128) AS table_name, grantor::varchar(128) AS grantor, '
+    'privilege::varchar(40) AS privilege, grantable::varchar(3) AS grantable, '
+    "'NO'::varchar(3) AS hierarchy, 'NO'::varchar(3) AS common, "
+    "object_type::varchar(24) AS type, 'NO'::varchar(3) AS inherited, "
+    "sys.sys_context('userenv', 'session_user') AS me FROM sys.ora_grants;"
+    'CREATE OR REPLACE VIEW sys.all_tab_privs AS SELECT grantor, grantee, '
+    'owner AS table_schema, table_name, privilege, grantable, hierarchy, common, '
+    'type, inherited FROM sys.ora_tab_privs WHERE me IN (owner, grantor, grantee) '
+    "OR grantee = 'PUBLIC';"
+    'CREATE OR REPLACE VIEW sys.all_tab_privs_made AS SELECT grantee, owner, '
+    'table_name, grantor, privilege, grantable, hierarchy, common, type, '
+    'inherited FROM sys.ora_tab_privs WHERE me IN (owner, grantor);'
+    'CREATE OR REPLACE VIEW sys.all_tab_privs_recd AS SELECT grantee, owner, '
+    'table_name, grantor, privilege, grantable, hierarchy, common, type, '
+    "inherited FROM sys.ora_tab_privs WHERE grantee IN (me, 'PUBLIC');"
+    'CREATE OR REPLACE VIEW sys.user_tab_privs AS SELECT grantee, owner, '
+    'table_name, grantor, privilege, grantable, hierarchy, common, type, '
+    'inherited FROM sys.ora_tab_privs WHERE me IN (owner, grantor, grantee);'
+    'CREATE OR REPLACE VIEW sys.user_tab_privs_made AS SELECT grantee, '
+    'table_name, grantor, privilege, grantable, hierarchy, common, type, '
+    'inherited FROM sys.ora_tab_privs WHERE owner = me;'
+    'CREATE OR REPLACE VIEW sys.user_tab_privs_recd AS SELECT owner, '
+    'table_name, grantor, privilege, grantable, hierarchy, common, type, '
+    'inherited FROM sys.ora_tab_privs WHERE grantee = me;'
     'CREATE OR REPLACE VIEW sys.all_objects AS SELECT '
     "CASE WHEN n.nspname LIKE 'pg_temp%' THEN upper(current_schema()) "
     'ELSE upper(n.nspname) END AS owner, '

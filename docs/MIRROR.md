@@ -322,6 +322,8 @@ needs a grant, as on Oracle:
   and takes only what one granted oneself (ORA-01927).
 - **Replacing an object:** a grant survives `CREATE OR REPLACE`. A `DROP`
   takes it.
+- **Listing grants:** `ALL_TAB_PRIVS`, `USER_TAB_PRIVS` and their `_MADE` and
+  `_RECD` forms list them, as 23ai does, in either mode.
 - **Errors:** a user with no privilege on another user's table gets ORA-00942.
   With some privilege but not the one used, it gets ORA-41900 when the Mirror
   presents 23ai (`missing INSERT privilege on "A"."T"`), and ORA-01031 when it
