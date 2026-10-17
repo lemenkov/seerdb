@@ -137,7 +137,8 @@ For `passthrough`:
 | option | default | meaning |
 |---|---|---|
 | `UPSTREAM` | | `host:port/service` of the Oracle database |
-| `--field-version` | probed | the protocol field version to present; by default the Mirror logs in to the upstream once at start-up and presents what it negotiates |
+| `--field-version` | probed | the protocol field version to present; by default the Mirror logs in to the upstream once at start-up, with the first configured account, and presents what it negotiates |
+| `--auth-conninfo` | | keep the accounts in a PostgreSQL database, connecting as this role (see *Passthrough*) |
 
 `seerdb-mirror observe` runs a bring-up tool instead: it accepts a client and
 logs every packet the client sends, in hex. It answers nothing.
@@ -557,8 +558,16 @@ with the first account and presents the protocol version it negotiates, unless
 
 Each client session opens its own upstream session, with the same user name and
 password the client logged in with. So every account the Mirror serves must
-exist upstream with the same password. Where else it could get its accounts is
-open (#1703).
+exist upstream with the same password.
+
+The Mirror keeps those accounts as the PostgreSQL backend does (*Accounts*):
+from `[clients]` and `MIRROR_USERS`, or with `--auth-conninfo` in a PostgreSQL
+database's `seerdb_auth.accounts`. That needs psycopg (`seerdb[mirror]`). It
+follows what the upstream accepts: once `CREATE USER ... IDENTIFIED BY`,
+`ALTER USER ... IDENTIFIED BY` or `DROP USER` succeeds upstream through the
+Mirror, or a client changes its password, the Mirror's accounts change too. With
+an auth database those changes outlive a restart. A user created upstream some
+other way has to be added to the Mirror's accounts too.
 
 Uses:
 
