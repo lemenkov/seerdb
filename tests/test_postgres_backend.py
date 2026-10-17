@@ -2269,6 +2269,11 @@ def test_per_user_roles_enforce_object_grants(presents: str) -> None:
             b.execute(f'grant select on {t} to {third}')
             c.execute(f'select count(*) from {t}')
             assert c.fetchall() == [(1,)]
+            # Each user's role reads the views of its grants.
+            c.execute(
+                "select grantor, privilege from user_tab_privs_recd where table_name = 'T'"
+            )
+            assert c.fetchall() == [(user.upper(), 'SELECT')]
             assert code(a, f'revoke select on t from {third}').startswith('ORA-01927')
             a.execute(f'revoke all on t from {user}')
             assert code(c, f'select * from {t}').startswith('ORA-00942')
@@ -5150,6 +5155,86 @@ def test_a_grant_is_recorded_as_oracle_keys_it(presents: str, all_count: int) ->
         other.close()
         admin.execute("DELETE FROM sys.ora_grants WHERE owner = 'OWN1858'")
         for schema in ('own1858', 'oth1858'):
+            admin.execute(f'DROP SCHEMA IF EXISTS {schema} CASCADE')
+        admin.close()
+
+
+def test_the_tab_privs_views_list_each_users_grants() -> None:
+    # The six *_TAB_PRIVS views (#1858), as 23ai lists them: owner A grants
+    # B SELECT WITH GRANT OPTION, B grants C, A grants PUBLIC INSERT; each of
+    # A, B and C sees the rows the measurement on 23ai showed it.
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    users = ('tpa1858', 'tpb1858', 'tpc1858')
+    for schema in users:
+        admin.execute(f'DROP SCHEMA IF EXISTS {schema} CASCADE')
+        admin.execute(f'CREATE SCHEMA {schema}')
+    (a, b, c) = (
+        PostgresBackend(_CONNINFO, credentials={u.upper(): 'x'}) for u in users
+    )
+    (A, B, C) = (u.upper() for u in users)
+    to_b = (A, B, 'SELECT', 'YES')
+    to_c = (B, C, 'SELECT', 'NO')
+    to_public = (A, 'PUBLIC', 'INSERT', 'NO')
+    views = {
+        'all_tab_privs': 'grantor, grantee',
+        'all_tab_privs_made': 'grantor, grantee',
+        'all_tab_privs_recd': 'grantor, grantee',
+        'user_tab_privs': 'grantor, grantee',
+        'user_tab_privs_made': 'grantor, grantee',
+        'user_tab_privs_recd': "grantor, ''",
+    }
+    seen = {
+        A: [
+            [to_public, to_b, to_c],
+            [to_public, to_b, to_c],
+            [to_public],
+            [to_public, to_b, to_c],
+            [to_public, to_b, to_c],
+            [],
+        ],
+        B: [
+            [to_public, to_b, to_c],
+            [to_c],
+            [to_public, to_b],
+            [to_b, to_c],
+            [],
+            [(A, '', 'SELECT', 'YES')],
+        ],
+        C: [
+            [to_public, to_c],
+            [],
+            [to_public, to_c],
+            [to_c],
+            [],
+            [(B, '', 'SELECT', 'NO')],
+        ],
+    }
+    try:
+        for backend, user in ((a, A), (b, B), (c, C)):
+            backend.authenticate(user)
+        a.execute('CREATE TABLE tp1858 (n NUMBER)')
+        a.execute(f'GRANT SELECT ON tp1858 TO {B} WITH GRANT OPTION')
+        b.execute(f'GRANT SELECT ON {A}.tp1858 TO {C}')
+        a.execute('GRANT INSERT ON tp1858 TO PUBLIC')
+        for backend, user in ((a, A), (b, B), (c, C)):
+            for (view, columns), expected in zip(views.items(), seen[user]):
+                listed = backend.execute(
+                    f'SELECT {columns}, privilege, grantable FROM {view} '
+                    "WHERE table_name = 'TP1858' ORDER BY 1, 2"
+                ).rows
+                backend.rollback()
+                assert [tuple(r) for r in listed] == expected, (user, view)
+        kind = a.execute(
+            'SELECT DISTINCT type, hierarchy, common, inherited FROM user_tab_privs '
+            "WHERE table_name = 'TP1858'"
+        ).rows
+        assert [tuple(r) for r in kind] == [('TABLE', 'NO', 'NO', 'NO')]
+    finally:
+        for backend in (a, b, c):
+            backend.rollback()
+            backend.close()
+        admin.execute("DELETE FROM sys.ora_grants WHERE owner = 'TPA1858'")
+        for schema in users:
             admin.execute(f'DROP SCHEMA IF EXISTS {schema} CASCADE')
         admin.close()
 
