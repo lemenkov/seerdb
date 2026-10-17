@@ -273,6 +273,7 @@ from seerdb.server.handshake import (
     server_tns_version,
 )
 from seerdb.server.identity import IDENTITY_11_2, ServerIdentity, server_identity
+from seerdb.server.redact import redact_passwords
 
 _T = TypeVar('_T')
 _P = ParamSpec('_P')
@@ -3752,7 +3753,7 @@ def _answer_query(
         request.iterations,
         len(request.bind_rows),
         reused_id,
-        sql,
+        redact_passwords(sql),
     )
     try:
         if request.parse_only:
