@@ -233,3 +233,78 @@ def test_python_dash_m_runs_the_launcher() -> None:
     assert 'seerdb-mirror' in result.stdout
     for command in ('postgres', 'passthrough', 'observe'):
         assert command in result.stdout
+
+
+def test_a_renamed_option_keeps_working_and_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The deprecation policy (#1863): a renamed command-line option or config
+    # key still works as its replacement, and says so, naming the replacement
+    # and the release that removes it. The new spelling wins over the old.
+    from seerdb.server import launcher
+
+    old = launcher._Deprecation('--presents', '9.9.0')
+    monkeypatch.setitem(launcher._DEPRECATED_OPTIONS, '--release', old)
+    monkeypatch.setitem(
+        launcher._DEPRECATED_KEYS,
+        ('backend', 'release'),
+        launcher._Deprecation('presents', '9.9.0'),
+    )
+    monkeypatch.setitem(
+        launcher._DEPRECATED_OPTIONS,
+        '--log-level',
+        launcher._Deprecation(None, '9.9.0'),
+    )
+    for argv in (
+        ['postgres', 'dbname=mirror', '--release', '12.1'],
+        ['postgres', 'dbname=mirror', '--release=12.1'],
+    ):
+        launch = build(argv, env=_USERS)
+        assert launch.description == 'PostgreSQL presenting 12.1'
+        assert launch.warnings == [
+            '--release is deprecated: use --presents instead; it will be '
+            'removed in seerdb 9.9.0'
+        ]
+    config = _ini(
+        tmp_path,
+        '[backend]\ntype = postgres\nconninfo = dbname=mirror\nrelease = 12.1\n',
+    )
+    launch = build(['--config', config], env=_USERS)
+    assert launch.description == 'PostgreSQL presenting 12.1'
+    assert launch.warnings == [
+        '[backend] release is deprecated: use presents instead; it will be '
+        'removed in seerdb 9.9.0'
+    ]
+    both = _ini(
+        tmp_path,
+        '[backend]\ntype = postgres\nconninfo = dbname=mirror\nrelease = 12.1\n'
+        'presents = 23ai\n',
+    )
+    assert build(['--config', both], env=_USERS).description == (
+        'PostgreSQL presenting 23ai'
+    )
+    # One removed with nothing in its place still works, and warns.
+    launch = build(['--log-level', 'debug', 'postgres', 'dbname=mirror'], env=_USERS)
+    assert launch.log_level == 'DEBUG'
+    assert launch.warnings == [
+        '--log-level is deprecated: it will be removed in seerdb 9.9.0'
+    ]
+    # Logged at WARNING as the Mirror starts.
+    monkeypatch.setattr(service, 'serve', lambda *a, **k: None)
+    monkeypatch.setenv('MIRROR_USERS', 'scott:tiger')
+    with caplog.at_level('WARNING', logger='seerdb.server'):
+        launcher.main(['postgres', 'dbname=mirror', '--release', '12.1'])
+    assert '--release is deprecated' in caplog.text
+
+
+def test_every_deprecation_is_in_the_changelog() -> None:
+    # Each deprecated option or key is named in the ChangeLog, with the word
+    # deprecated (#1863).
+    from seerdb.server import launcher
+
+    lines = (_ROOT / 'ChangeLog').read_text().lower().splitlines()
+    names = [*launcher._DEPRECATED_OPTIONS] + [
+        f'[{section}] {key}' for (section, key) in launcher._DEPRECATED_KEYS
+    ]
+    for name in names:
+        assert any(f'`{name}`' in line and 'deprecated' in line for line in lines), name

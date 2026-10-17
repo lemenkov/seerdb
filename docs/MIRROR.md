@@ -138,6 +138,23 @@ seerdb-mirror --config mirror.ini
 The file holds passwords, so keep it readable only by the account that runs
 the Mirror.
 
+### Deprecations
+
+From general availability on, the launcher's options and the config file's keys
+change only this way:
+
+- **A renamed or removed option keeps working** for at least one minor release.
+  A renamed one acts as its replacement. Where both spellings are given, the new
+  one wins.
+- **Each use is logged at start-up** as a warning that names the replacement and
+  the release that removes the old spelling, for example: `--old is deprecated:
+  use --new instead; it will be removed in seerdb 4.2.0`.
+- **The ChangeLog lists every deprecation.**
+
+Nothing is deprecated yet. What general availability promises is being decided
+in [#1861](https://github.com/seerdb/seerdb/issues/1861); until then the Mirror
+is a technology preview, and anything may change in any release.
+
 ### Accounts
 
 Oracle's login (O5LOGON) is mutual: the server proves it knows the password as
