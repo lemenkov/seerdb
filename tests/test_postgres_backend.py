@@ -2348,6 +2348,126 @@ def test_per_user_roles_enforce_object_grants(presents: str) -> None:
         pg.close()
 
 
+@pytest.mark.parametrize('presents', ['12.1', '23ai'])
+def test_per_user_roles_enforce_column_grants(presents: str) -> None:
+    # Column grants between users, as 23ai and 21c have them (#1946): INSERT,
+    # UPDATE and REFERENCES by column, used only on those columns; an UPDATE
+    # or DELETE that may write but not read names SELECT as missing; a REVOKE
+    # by column is refused, a revoke of the whole privilege takes its column
+    # grants, its cascade what was granted on, and DROP COLUMN its column's.
+    pid = os.getpid()
+    admin = f'cg_adm_{pid}'
+    (owner, user, third) = (f'cg_own_{pid}', f'cg_b_{pid}', f'cg_c_{pid}')
+    pg = psycopg.connect(_CONNINFO, autocommit=True)
+    opened: list[Any] = []
+
+    def code(cursor: Any, statement: str) -> str:
+        with pytest.raises(seerdb.DatabaseError) as raised:
+            cursor.execute(statement)
+        return str(raised.value)
+
+    try:
+        with _per_user_mirror(_CONNINFO, admin, presents) as base:
+
+            def login(name: str, password: str) -> Any:
+                opened.append(base(name, password))
+                return opened[-1]
+
+            adm = login(admin, 'adm123')
+            for name in (owner, user, third):
+                adm.cursor().execute(f'create user {name} identified by pw123')
+            a = login(owner, 'pw123').cursor()
+            b = login(user, 'pw123').cursor()
+            c = login(third, 'pw123').cursor()
+            a.execute('create table t (id number primary key, c1 number, c2 number)')
+            a.execute('insert into t values (1, 10, 20)')
+            a.execute('commit')
+            t = f'{owner}.t'
+            o = owner.upper()
+
+            def missing(privilege: str) -> str:
+                if presents == '12.1':
+                    return 'ORA-01031: insufficient privileges'
+                return f'ORA-41900: missing {privilege} privilege on "{o}"."T"'
+
+            a.execute(f'grant insert (id, c1) on t to {user}')
+            b.execute(f'insert into {t} (id, c1) values (2, 11)')
+            assert code(b, f'insert into {t} (id, c2) values (3, 21)') == missing(
+                'INSERT'
+            )
+            assert code(b, f'select * from {t}') == missing('READ')
+            b.execute('rollback')
+            a.execute(f'grant update (c1) on t to {user}')
+            b.execute(f'update {t} set c1 = 99')
+            assert code(b, f'update {t} set c2 = 99') == missing('UPDATE')
+            assert code(b, f'update {t} set c1 = 5 where id = 1') == missing('SELECT')
+            b.execute('rollback')
+            a.execute(f'grant delete on t to {user}')
+            assert code(b, f'delete from {t} where id = 1') == missing('SELECT')
+            b.execute(f'delete from {t}')
+            b.execute('rollback')
+            a.execute(f'revoke delete on t from {user}')
+            for statement, expected in (
+                (f'grant select (c1) on t to {user}', 'ORA-00969'),
+                (f'grant delete (c1) on t to {user}', 'ORA-00969'),
+                (f'grant all (c1) on t to {user}', 'ORA-00969'),
+                (f'grant update (nope) on t to {user}', 'ORA-00904: "NOPE"'),
+                (f'grant update (c1, c1) on t to {user}', 'ORA-00957'),
+                (f'revoke update (c1) on t from {user}', 'ORA-01750'),
+            ):
+                assert code(a, statement).startswith(expected), statement
+            # A column grant WITH GRANT OPTION passes on; revoking the whole
+            # privilege takes it, and what was passed on.
+            a.execute(f'grant update (c2) on t to {user} with grant option')
+            b.execute(f'grant update (c2) on {t} to {third}')
+            c.execute(f'update {t} set c2 = 7')
+            c.execute('rollback')
+            c.execute(
+                'select grantor, column_name, privilege from user_col_privs_recd '
+                "where table_name = 'T'"
+            )
+            assert c.fetchall() == [(user.upper(), 'C2', 'UPDATE')]
+            a.execute(f'revoke update on t from {user}')
+            assert code(c, f'update {t} set c2 = 7').startswith('ORA-00942')
+            assert code(b, f'update {t} set c1 = 7') == missing('UPDATE')
+            # Held only by column, INSERT revokes from the whole table.
+            a.execute(f'revoke insert on t from {user}')
+            assert code(b, f'insert into {t} (id, c1) values (4, 1)').startswith(
+                'ORA-00942'
+            )
+            a.execute(f'grant select, references (id), update (c1, c2) on t to {user}')
+            a.execute(
+                'select privilege, column_name from user_col_privs '
+                "where table_name = 'T' order by 1, 2"
+            )
+            assert a.fetchall() == [
+                ('REFERENCES', 'ID'),
+                ('UPDATE', 'C1'),
+                ('UPDATE', 'C2'),
+            ]
+            a.execute('alter table t drop column c1')
+            a.execute(
+                'select privilege, column_name from user_col_privs '
+                "where table_name = 'T' order by 1, 2"
+            )
+            assert a.fetchall() == [('REFERENCES', 'ID'), ('UPDATE', 'C2')]
+            a.execute('drop table t')
+            assert pg.execute(
+                'SELECT count(*) FROM sys.ora_col_grants WHERE owner = %s', (o,)
+            ).fetchone() == (0,)
+            for session in opened[1:]:
+                session.close()
+            for name in (owner, user, third):
+                _wait_sessions_gone(pg, name)
+                adm.cursor().execute(f'drop user {name} cascade')
+    finally:
+        for session in opened:
+            with contextlib.suppress(Exception):
+                session.close()
+        _drop_mirror_roles(pg, owner, user, third, admin)
+        pg.close()
+
+
 def test_a_profiled_mirror_records_each_statement_over_postgresql(
     tmp_path: Any,
 ) -> None:
@@ -5348,6 +5468,90 @@ def test_a_routine_runs_with_its_owners_rights_unless_authid_current_user() -> N
         other.close()
         admin.execute("DELETE FROM sys.ora_packages WHERE name IN ('k1945', 'j1945')")
         for schema in ('own1945', 'oth1945', 'k1945', 'j1945'):
+            admin.execute(f'DROP SCHEMA IF EXISTS {schema} CASCADE')
+        admin.close()
+
+
+def test_the_col_privs_views_list_each_users_column_grants() -> None:
+    # The six *_COL_PRIVS views (#1946), by the rules the *_TAB_PRIVS views
+    # list grants by: owner A grants B UPDATE (c1) WITH GRANT OPTION, B grants
+    # C, A grants PUBLIC INSERT (c2). Column grants are not table grants.
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    users = ('cpa1946', 'cpb1946', 'cpc1946')
+    for schema in users:
+        admin.execute(f'DROP SCHEMA IF EXISTS {schema} CASCADE')
+        admin.execute(f'CREATE SCHEMA {schema}')
+    (a, b, c) = (
+        PostgresBackend(_CONNINFO, credentials={u.upper(): 'x'}) for u in users
+    )
+    (A, B, C) = (u.upper() for u in users)
+    to_b = (A, B, 'C1', 'UPDATE', 'YES')
+    to_c = (B, C, 'C1', 'UPDATE', 'NO')
+    to_public = (A, 'PUBLIC', 'C2', 'INSERT', 'NO')
+    views = (
+        'all_col_privs',
+        'all_col_privs_made',
+        'all_col_privs_recd',
+        'user_col_privs',
+        'user_col_privs_made',
+        'user_col_privs_recd',
+    )
+    seen = {
+        A: [
+            [to_public, to_b, to_c],
+            [to_public, to_b, to_c],
+            [to_public],
+            [to_public, to_b, to_c],
+            [to_public, to_b, to_c],
+            [],
+        ],
+        B: [
+            [to_public, to_b, to_c],
+            [to_c],
+            [to_public, to_b],
+            [to_b, to_c],
+            [],
+            [(A, '', 'C1', 'UPDATE', 'YES')],
+        ],
+        C: [
+            [to_public, to_c],
+            [],
+            [to_public, to_c],
+            [to_c],
+            [],
+            [(B, '', 'C1', 'UPDATE', 'NO')],
+        ],
+    }
+    try:
+        for backend, user in ((a, A), (b, B), (c, C)):
+            backend.authenticate(user)
+        a.execute('CREATE TABLE cp1946 (c1 NUMBER, c2 NUMBER)')
+        a.execute(f'GRANT UPDATE (c1) ON cp1946 TO {B} WITH GRANT OPTION')
+        b.execute(f'GRANT UPDATE (c1) ON {A}.cp1946 TO {C}')
+        a.execute('GRANT INSERT (c2) ON cp1946 TO PUBLIC')
+        for backend, user in ((a, A), (b, B), (c, C)):
+            for view, expected in zip(views, seen[user]):
+                grantee = "''" if view == 'user_col_privs_recd' else 'grantee'
+                listed = backend.execute(
+                    f'SELECT grantor, {grantee}, column_name, privilege, grantable '
+                    f"FROM {view} WHERE table_name = 'CP1946' ORDER BY 1, 2"
+                ).rows
+                backend.rollback()
+                assert sorted(tuple(r) for r in listed) == sorted(expected), (
+                    user,
+                    view,
+                )
+        tables = a.execute(
+            "SELECT count(*) FROM user_tab_privs WHERE table_name = 'CP1946'"
+        ).rows
+        a.rollback()
+        assert [tuple(r) for r in tables] == [(0,)]
+    finally:
+        for backend in (a, b, c):
+            backend.rollback()
+            backend.close()
+        admin.execute("DELETE FROM sys.ora_col_grants WHERE owner = 'CPA1946'")
+        for schema in users:
             admin.execute(f'DROP SCHEMA IF EXISTS {schema} CASCADE')
         admin.close()
 
@@ -11475,7 +11679,8 @@ def test_a_ddl_prunes_its_records_and_rereads_the_schema_once(
         backend.execute('DROP TABLE pr1918t')
         prunes = [q for q in sent if 'WHERE NOT EXISTS' in q and 'DELETE' in q]
         assert len(prunes) == 1
-        assert prunes[0].count('DELETE FROM sys.ora_') == 3
+        # Columns, annotations, collection elements and column grants (#1946).
+        assert prunes[0].count('DELETE FROM sys.ora_') == 4
         sent.clear()
         backend.execute('SELECT 1 FROM dual')
         # The object types' RAW attributes come with them (#1331).
