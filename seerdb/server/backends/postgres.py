@@ -11079,6 +11079,19 @@ class _AccountStore:
                 _ACCOUNTS_READY.add(self._auth_conninfo)
         return conn
 
+    def secrets(self, username: str) -> tuple[str | None, str | None]:
+        """The account's secret and its PostgreSQL role's password, read
+        together for a per-user login (#1939); either None where there is
+        none."""
+        assert self._auth_conninfo is not None
+        with self._connect() as conn:
+            row = conn.execute(
+                f'SELECT password, role_password FROM {_ACCOUNTS_SCHEMA}.accounts '
+                'WHERE username = %s',
+                (username.upper(),),
+            ).fetchone()
+        return (None, None) if row is None else (row[0], row[1])
+
     def secret(self, username: str) -> str | None:
         if self._auth_conninfo is None:
             return credential_lookup(self._seed, username)
@@ -11171,6 +11184,13 @@ _INSTALLED_SCHEMAS: Final = (
     'dbms_utility',
     'utl_raw',
 )
+
+
+class _RoleUnverified(Exception):
+    # A per-user login's role that its own connection could not verify, or an
+    # installation not there to use (#1939): the login goes the installer's
+    # way instead, which makes or repairs the role.
+    pass
 
 
 def _user_group_grants(group: str) -> str:
@@ -11515,67 +11535,6 @@ class PostgresBackend:
         release = _banner_release(self.server_identity.banner)
         (major, minor) = (int(part) for part in release.split('.')[:2])
         self._release = (major, minor)
-        self._conn = _CountedConnection.connect(conninfo, cursor_factory=_CountedCursor)
-        # V$VERSION and DBMS_UTILITY.DB_VERSION read the presented release from
-        # the session (#1704), so the shared dictionary serves either release.
-        # In the same statement: whether the database's installation is this
-        # seerdb's (#1871), which a connect then leaves alone.
-        setup = self._at_once(
-            "SELECT set_config('seerdb.release', %s, false), "
-            "set_config('seerdb.banner', %s, false), "
-            "set_config('seerdb.compatibility', %s, false), "
-            "obj_description(to_regnamespace('system'), 'pg_namespace'), "
-            "obj_description(to_regnamespace('sys'), 'pg_namespace'), "
-            "(SELECT string_agg(extname, ' ' ORDER BY extname) FROM pg_extension "
-            "WHERE extname IN ('orafce', 'vector')), "
-            '(SELECT oid FROM pg_database WHERE datname = current_database())',
-            (
-                release,
-                self.server_identity.banner.decode(),
-                f'{major}.{minor if major < 18 else 0}.0.0.0',
-            ),
-        ).fetchone()
-        assert setup is not None
-        expected = _installation_stamp(setup[5])
-        installed = setup[3] == expected and setup[4] == _DICTIONARY_STAMP
-        found = (
-            _INSTALLATIONS.get((conninfo, setup[6], expected)) if installed else None
-        )
-        # The parts of the setup that failed, by name; the setup's own DDL is
-        # not another session's change (#1887).
-        self._install_failures: list[str] = []
-        if not installed:
-            self._at_once("SET seerdb.installing = 'on'")
-        # What a twin of this backend is built from: a sessionless suspend
-        # takes a fresh connection, set up as this one was, from it (#1746).
-        self._twin: Callable[[], PostgresBackend] = lambda: type(self)(
-            conninfo,
-            credentials=credentials,
-            auth_conninfo=auth_conninfo,
-            presents=presents,
-        )
-        self._sessionless_id = None
-        # The translation report (#1557): whether it is on, the runs it has not
-        # written yet, and its own autocommit connection, opened when it first
-        # writes -- so writing it never joins, ends or aborts the client's
-        # transaction.
-        self._conninfo = conninfo
-        self._reporting = translation_report
-        self._report_runs: dict[str, _ReportEntry] = {}
-        self._report_conn: psycopg.Connection | None = None
-        # psycopg prepares a statement on the server from its fifth run, which
-        # saves PostgreSQL planning it again: half the cost of a query on the
-        # dictionary views (#1885). Two things kept it off before. The Mirror's
-        # own statements around an application's are never prepared
-        # (_CONTROL_STATEMENT), and a prepared statement that another session's
-        # DDL changed the shape of runs once more (_replanned).
-        self._conn.prepare_threshold = 5
-        # Whether a routine the running call reached asked for a commit (#1630).
-        self._commit_requested = False
-        self._conn.add_notice_handler(self._hear_commit_request)
-        # The portals the running call returned as implicit results (#1617).
-        self._implicit_portals: list[str] = []
-        self._conn.add_notice_handler(self._hear_implicit_result)
         # Shared, not copied, when a dict is given: a launcher hands one map to
         # every backend it creates, and ALTER USER ... IDENTIFIED BY rewrites an
         # entry in place so the new password reaches the next login. A read-only
@@ -11593,7 +11552,117 @@ class PostgresBackend:
         self._per_user = per_user_roles
         self._admin_conninfo = conninfo
         self._presents = presents
-        if per_user_roles:
+        # The translation report's switch, and whether a client may run
+        # native PostgreSQL SQL at all (#1859): the operator's choice, off
+        # unless the launcher turns it on. Off, a PG hint is a hint Oracle does
+        # not know, and the session's dialect can't be switched.
+        self._options = (translation_report, native_sql)
+        # Whether the session has its PostgreSQL connection yet, and whether
+        # it is the login user's own role's, made at login (#1939).
+        self._connected = False
+        self._became = False
+        if per_user_roles and conninfo in _USER_GROUP_READY:
+            # Per-user mode, once this process has set the installation up
+            # and the users' group (#1939): the session connects at login,
+            # straight as its user's role (authenticate), not first as the
+            # installer only to swap the connection for the user's.
+            self._conninfo = conninfo
+            return
+        self._connect(conninfo)
+
+    def _connect(self, conninfo: str, role: str | None = None) -> None:
+        """The session's PostgreSQL connection, set up: the presented
+        release in its settings, the installation checked -- installed where
+        it is missing or changed -- and what the session reads of it.
+
+        With ``role``, per-user mode's login user (#1939), the connection is
+        that user's role's, and the role is checked in the same round trip:
+        marked as the Mirror's, made by this installer, a member of the
+        users' group. A role that is not, or an installation that is not
+        there, raises ``_RoleUnverified`` before anything is installed, for
+        the installer's connection to put right."""
+        release = _banner_release(self.server_identity.banner)
+        (major, minor) = self._release
+        group = _USER_GROUP_READY.get(self._admin_conninfo, '')
+        self._conn = _CountedConnection.connect(conninfo, cursor_factory=_CountedCursor)
+        # V$VERSION and DBMS_UTILITY.DB_VERSION read the presented release from
+        # the session (#1704), so the shared dictionary serves either release.
+        # In the same statement: whether the database's installation is this
+        # seerdb's (#1871), which a connect then leaves alone.
+        setup = self._at_once(
+            "SELECT set_config('seerdb.release', %s, false), "
+            "set_config('seerdb.banner', %s, false), "
+            "set_config('seerdb.compatibility', %s, false), "
+            "obj_description(to_regnamespace('system'), 'pg_namespace'), "
+            "obj_description(to_regnamespace('sys'), 'pg_namespace'), "
+            "(SELECT string_agg(extname, ' ' ORDER BY extname) FROM pg_extension "
+            "WHERE extname IN ('orafce', 'vector')), "
+            '(SELECT oid FROM pg_database WHERE datname = current_database()), '
+            # The login user's role, checked as _ensure_user_role's fast path
+            # checks it (#1939); any connection's is good.
+            'CASE WHEN %s THEN coalesce((SELECT shobj_description(r.oid, '
+            "'pg_authid') = %s AND pg_has_role(%s::text, r.oid, 'USAGE') AND "
+            "pg_has_role(r.oid, %s::text, 'MEMBER') FROM pg_roles r "
+            'WHERE r.rolname = current_user), false) ELSE true END',
+            (
+                release,
+                self.server_identity.banner.decode(),
+                f'{major}.{minor if major < 18 else 0}.0.0.0',
+                role is not None,
+                _USER_ROLE_MARK,
+                group.removesuffix(_USER_GROUP_SUFFIX),
+                group,
+            ),
+        ).fetchone()
+        assert setup is not None
+        expected = _installation_stamp(setup[5])
+        installed = setup[3] == expected and setup[4] == _DICTIONARY_STAMP
+        if role is not None and not (installed and setup[7]):
+            self._conn.close()
+            raise _RoleUnverified(role)
+        # Keyed by the installer's connection string, so each user's role's
+        # session finds the one installation too (#1939).
+        found = (
+            _INSTALLATIONS.get((self._admin_conninfo, setup[6], expected))
+            if installed
+            else None
+        )
+        # The parts of the setup that failed, by name; the setup's own DDL is
+        # not another session's change (#1887).
+        self._install_failures: list[str] = []
+        if not installed:
+            self._at_once("SET seerdb.installing = 'on'")
+        # What a twin of this backend is built from: a sessionless suspend
+        # takes a fresh connection, set up as this one was, from it (#1746).
+        self._twin: Callable[[], PostgresBackend] = lambda: type(self)(
+            conninfo,
+            credentials=self._credentials,
+            auth_conninfo=self._accounts.auth_conninfo,
+            presents=self._presents,
+        )
+        self._sessionless_id = None
+        # The translation report (#1557): whether it is on, the runs it has not
+        # written yet, and its own autocommit connection, opened when it first
+        # writes -- so writing it never joins, ends or aborts the client's
+        # transaction.
+        self._conninfo = conninfo
+        (self._reporting, self._native_sql) = self._options
+        self._report_runs: dict[str, _ReportEntry] = {}
+        self._report_conn: psycopg.Connection | None = None
+        # psycopg prepares a statement on the server from its fifth run, which
+        # saves PostgreSQL planning it again: half the cost of a query on the
+        # dictionary views (#1885). Two things kept it off before. The Mirror's
+        # own statements around an application's are never prepared
+        # (_CONTROL_STATEMENT), and a prepared statement that another session's
+        # DDL changed the shape of runs once more (_replanned).
+        self._conn.prepare_threshold = 5
+        # Whether a routine the running call reached asked for a commit (#1630).
+        self._commit_requested = False
+        self._conn.add_notice_handler(self._hear_commit_request)
+        # The portals the running call returned as implicit results (#1617).
+        self._implicit_portals: list[str] = []
+        self._conn.add_notice_handler(self._hear_implicit_result)
+        if self._per_user and role is None:
             row = self._at_once(
                 "SELECT current_setting('server_version_num')::int, "
                 'rolsuper OR rolcreaterole FROM pg_roles WHERE rolname = current_user'
@@ -11617,11 +11686,6 @@ class PostgresBackend:
         # The SQL dialect a statement with no PG hint is in (#1556): 'oracle',
         # translated, or 'postgres', run as written.
         self._sql_dialect = 'oracle'
-        # Whether a client may run native PostgreSQL SQL at all (#1859): the
-        # operator's choice, off unless the launcher turns it on. Off, a PG
-        # hint is a hint Oracle does not know, and the session's dialect can't
-        # be switched.
-        self._native_sql = native_sql
         # The Oracle object type each PostgreSQL composite oid stands for, with
         # its registered psycopg CompositeInfo -- or None for an oid that is not
         # an object type, so a column of it is looked up once (#1127).
@@ -11813,7 +11877,7 @@ class PostgresBackend:
                     "SELECT obj_description(to_regnamespace('system'), 'pg_namespace')"
                 ).fetchone()
                 if stamped is not None and stamped[0] is not None:
-                    _INSTALLATIONS[(conninfo, setup[6], stamped[0])] = found
+                    _INSTALLATIONS[(self._admin_conninfo, setup[6], stamped[0])] = found
         self._adopt_installation(found)
         # The quoted-name catalog (#1204) comes with the dictionary; a session
         # whose dictionary could not be installed does without it, and so with
@@ -11862,6 +11926,7 @@ class PostgresBackend:
             # The DDL generation this session last saw, from its connect on;
             # None for good where the log could not be installed (#1887).
             self._ddl_generation = None
+        self._connected = True
 
     def _install_part(self, part: str, *ddl: str) -> None:
         # One part of the setup's installation, best effort: one that fails is
@@ -12159,8 +12224,10 @@ class PostgresBackend:
         target = connect_attrs.get('proxy_client_name')
         login = getattr(self, '_login_user', None)
         self._open_as(target)
-        if self._per_user and login is not None:
-            # From here on, the session is its user's own role (#1857).
+        if self._per_user and login is not None and not (self._became and not target):
+            # From here on, the session is its user's own role (#1857) --
+            # which it already is when it connected as that role at login,
+            # but under a proxy login, whose target only now is known (#1939).
             self._become(self._login_user, login if target else '')
         edition = connect_attrs.get('edition')
         if edition:
@@ -12222,11 +12289,17 @@ class PostgresBackend:
         # dictionary that keeps no grants admits none.
         if not self._has_proxy_grants():
             return False
-        row = self._catalog_read(
+        query = (
             'SELECT EXISTS (SELECT 1 FROM sys.ora_proxy_grants '
-            'WHERE proxy = %s AND client = %s)',
-            (proxy, client),
-        ).fetchone()
+            'WHERE proxy = %s AND client = %s)'
+        )
+        if self._became:
+            # A DBA's record, which the login user's role does not read: the
+            # installer's connection does (#1939).
+            with self._administering() as admin:
+                row = admin.execute(query, (proxy, client)).fetchone()
+        else:
+            row = self._catalog_read(query, (proxy, client)).fetchone()
         return bool(row and row[0])
 
     def _record_session(self) -> None:
@@ -12299,6 +12372,8 @@ class PostgresBackend:
         # The login store the Mirror authenticates clients against — separate
         # from the libpq `conninfo` the backend itself connects to PostgreSQL
         # with. A production backend might instead consult a PG table here.
+        if not self._connected:
+            return self._authenticate_as_role(username)
         secret = self._accounts.secret(username)
         self._login_user = username.upper()
         if secret is not None:
@@ -12333,6 +12408,50 @@ class PostgresBackend:
             )
         return secret
 
+    def _authenticate_as_role(self, username: str) -> str | None:
+        # A per-user login whose session has no connection yet (#1939): the
+        # account's secret and its role's password in one read, and the
+        # session connected straight as the role, set up as a login sets it
+        # up, in the same round trips. Where the role has no password yet, or
+        # its connection or its checks fail, the session connects as the
+        # installer and the login goes on as it does in per-user mode
+        # otherwise: open_session makes the session the role's (_become).
+        (secret, role_password) = self._accounts.secrets(username)
+        self._login_user = username.upper()
+        if secret is None:
+            return None
+        if role_password is not None:
+            conninfo = make_conninfo(
+                self._admin_conninfo, user=username.lower(), password=role_password
+            )
+            try:
+                self._connect(conninfo, role=username)
+            except (psycopg.Error, _RoleUnverified):
+                # A connection made before the setup failed is not the
+                # session's.
+                if getattr(self, '_conn', None) is not None:
+                    self._conn.close()
+            else:
+                self._became = True
+                self._conninfo = conninfo
+                self._at_once(
+                    sql.SQL('; ').join(
+                        [
+                            sql.SQL(
+                                'SET search_path TO {}, ' + _SEARCH_PATH_TAIL
+                            ).format(sql.Identifier(username.lower())),
+                            sql.SQL(_ORAFCE_SESSION_SETTINGS),
+                            sql.SQL(
+                                "SELECT set_config('seerdb.session_user', {}, false), "
+                                "set_config('seerdb.proxy_user', '', false)"
+                            ).format(sql.Literal(username.upper())),
+                        ]
+                    )
+                )
+                return secret
+        self._connect(self._admin_conninfo)
+        return self.authenticate(username)
+
     @property
     def closed(self) -> bool:
         # The PostgreSQL connection is gone: ALTER SYSTEM KILL SESSION ended it, or
@@ -12343,6 +12462,8 @@ class PostgresBackend:
         # -- so while the socket is readable its input is fed to libpq: the first
         # read takes the FATAL, the next meets the end of the stream, and libpq
         # marks the connection bad. No round trip.
+        if not self._connected:
+            return False
         try:
             for _read in range(4):
                 if self._conn.closed:
@@ -17410,12 +17531,19 @@ class PostgresBackend:
         # on as its user's own role, on a connection of its own set up as the
         # installer's was, which is closed. The session's settings follow it:
         # the user's schema first on the path, the user and the proxy user.
-        try:
-            password = self._ensure_user_role(self._conn, user)
-            self._conn.commit()
-        except BaseException:
-            self._conn.rollback()
-            raise
+        if self._became:
+            # The session is the login user's role already (#1939), which
+            # may not make another's: the installer's connection does.
+            with self._administering() as admin:
+                password = self._ensure_user_role(admin, user)
+                admin.commit()
+        else:
+            try:
+                password = self._ensure_user_role(self._conn, user)
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
         conninfo = make_conninfo(
             self._admin_conninfo, user=user.lower(), password=password
         )
@@ -18327,6 +18455,10 @@ class PostgresBackend:
         self._sessionless_id = None
 
     def close(self) -> None:
+        # A per-user login that ended before it connected has nothing to
+        # close (#1939).
+        if not self._connected:
+            return
         # A sessionless transaction this session still holds ends with it,
         # rolled back (#1746).
         if self._sessionless_id is not None:

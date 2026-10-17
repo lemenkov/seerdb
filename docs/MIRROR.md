@@ -363,8 +363,13 @@ the owner's tables.
 In single-role mode, grants are checked and recorded the same way, but every
 user is the one role, so they enforce nothing beyond who sees a type.
 
-A login connects to PostgreSQL twice, as the connection role and then as the
-user's, so it takes longer than in single-role mode.
+A login connects to PostgreSQL once, straight as the user's role, and costs no
+more than in single-role mode. The exceptions connect as the connection role
+first, which makes or repairs the user's role, and then as the user's:
+- a process's first login;
+- a user's first login;
+- a proxy login, whose target is only known later;
+- a login whose role fails its checks.
 
 ### Native PostgreSQL
 

@@ -2468,6 +2468,68 @@ def test_per_user_roles_enforce_column_grants(presents: str) -> None:
         pg.close()
 
 
+def test_a_per_user_login_connects_to_postgresql_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Once the process has set the installation and the users' group up, a
+    # per-user login connects to PostgreSQL once, straight as its user's role,
+    # not first as the installer (#1939). A proxy login, whose target is known
+    # only later, still goes the installer's way, and runs as the target's.
+    from seerdb.server.backends import postgres as postgres_backend
+
+    pid = os.getpid()
+    admin = f'oc_adm_{pid}'
+    (user, target) = (f'oc_b_{pid}', f'oc_t_{pid}')
+    pg = psycopg.connect(_CONNINFO, autocommit=True)
+    opened: list[Any] = []
+    connects: list[str] = []
+    connect = postgres_backend._CountedConnection.connect
+
+    def counted(conninfo: str, **kwargs: Any) -> Any:
+        connects.append(conninfo)
+        return connect(conninfo, **kwargs)
+
+    try:
+        with _per_user_mirror(_CONNINFO, admin) as base:
+
+            def login(name: str, password: str) -> Any:
+                opened.append(base(name, password))
+                return opened[-1]
+
+            adm = login(admin, 'adm123').cursor()
+            for name in (user, target):
+                adm.execute(f'create user {name} identified by pw123')
+            adm.execute(f'alter user {target} grant connect through {user}')
+            monkeypatch.setattr(postgres_backend._CountedConnection, 'connect', counted)
+            session = login(user, 'pw123')
+            cursor = session.cursor()
+            cursor.execute(
+                "select user, sys_context('userenv', 'current_user') from dual"
+            )
+            assert cursor.fetchall() == [(user.upper(), user.upper())]
+            assert len(connects) == 1
+            assert f'user={user}' in connects[0]
+            proxied = login(f'{user}[{target}]', 'pw123').cursor()
+            proxied.execute(
+                "select user, sys_context('userenv', 'proxy_user'), "
+                "sys_context('userenv', 'current_user') from dual"
+            )
+            assert proxied.fetchall() == [
+                (target.upper(), user.upper(), target.upper())
+            ]
+            for session in opened[1:]:
+                session.close()
+            for name in (target, user):
+                _wait_sessions_gone(pg, name)
+                adm.execute(f'drop user {name} cascade')
+    finally:
+        for session in opened:
+            with contextlib.suppress(Exception):
+                session.close()
+        _drop_mirror_roles(pg, user, target, admin)
+        pg.close()
+
+
 def test_a_profiled_mirror_records_each_statement_over_postgresql(
     tmp_path: Any,
 ) -> None:
