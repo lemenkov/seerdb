@@ -8,6 +8,7 @@
 > semantic-versioning promise the client (DB-API 2.0) keeps: its Python API,
 > its command line and its behaviour may change or break in any release, a
 > minor or patch one included. Pin an exact seerdb version if you depend on it.
+> What it will promise from general availability is under *Stability* below.
 
 > **Not hardened for untrusted networks.** Run it on localhost or a network you
 > trust, for clients you trust. See *Security* below for why.
@@ -27,6 +28,50 @@ answers them from a backend:
 
 Its protocol details are in [PROTOCOL.md](PROTOCOL.md). This guide is about
 running one.
+
+## Stability
+
+Until general availability, nothing is promised: anything may change in any
+release. From general availability on, the Mirror follows the package's
+semantic versioning for what this list promises. A breaking change to any of it
+needs a major release, and a rename or removal goes through *Deprecations*
+first. Decided in [#1861](https://github.com/seerdb/seerdb/issues/1861).
+
+**Promised:**
+- **The launcher, `seerdb-mirror`:** the server and `profile compare` commands,
+  with their options (*Options*).
+- **The config file:** its `[server]`, `[clients]` and `[backend]` sections and
+  their keys, and the `MIRROR_USERS` variable.
+- **The defaults:** listening on `127.0.0.1:1521`, encryption `requested`, and
+  presenting 23ai. A default that loosens security is a breaking change. One
+  that tightens it is not, but the ChangeLog lists it.
+- **The Python entry points:** `seerdb.serve()` and `seerdb.Server`.
+- **The backend protocol,** so that backends of your own are supported:
+  - `Backend`, with its required methods and the optional ones it documents;
+  - the types it takes and returns: `BackendFactory`, `Result`, `CursorResult`,
+    `ColumnMeta`, `BindVar`, `BackendError`, `UnsupportedFeature`, `Capability`,
+    `Credentials` and `credential_lookup`;
+  - the value types `BlobValue`, `ClobValue`, `BFile`, `LtzValue` and `BcDate`.
+- **A deployment's data across upgrades:** a database that a released Mirror
+  over PostgreSQL set up keeps working when a newer release of the same major
+  version connects to it. That covers its accounts, roles, recorded grants,
+  invisible columns, object tables and the like. A Mirror older than the
+  database refuses to start. Databases from the preview releases get no
+  upgrade path: set them up afresh.
+- **The migration profile:** a profile file one release records can be read by
+  `profile compare` of any later release of the same major version.
+
+**Not promised:**
+- **The wire-level names `seerdb.server` also exports:** `PacketStream`,
+  `Listener`, the `*Request` classes and the `encode_*` helpers. Neither is
+  anything else under `seerdb.server` outside the list above.
+- **What the Mirror keeps in PostgreSQL:** the `sys`, `system` and
+  `seerdb_auth` schemas, the `sys.ora_*` records and the translation log's
+  columns. Only the upgrade promise above covers them.
+- **The SQL the Mirror sends PostgreSQL**, its log messages, and
+  `seerdb-mirror observe`, a bring-up tool.
+- **Oracle compatibility itself.** It grows release by release. A feature this
+  guide lists as supported that stops working is a bug, not a broken promise.
 
 ## Installing
 
@@ -151,9 +196,9 @@ change only this way:
   use --new instead; it will be removed in seerdb 4.2.0`.
 - **The ChangeLog lists every deprecation.**
 
-Nothing is deprecated yet. What general availability promises is being decided
-in [#1861](https://github.com/seerdb/seerdb/issues/1861); until then the Mirror
-is a technology preview, and anything may change in any release.
+Nothing is deprecated yet. What general availability promises is under
+*Stability*. Until then the Mirror is a technology preview, and anything may
+change in any release.
 
 ### Accounts
 
