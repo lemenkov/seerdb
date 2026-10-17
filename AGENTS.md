@@ -146,12 +146,22 @@ says what the other may rely on:
 
 Follow semantic versioning against the **client (DB-API 2.0) surface**, which is
 the stable public API. Additive, backward-compatible features are a **minor**
-bump; bug fixes are a **patch**. The server-side "Mirror" (`seerdb.server`,
-the `mirror` extra) is a **highly experimental technology preview**: it ships
-with the package but is explicitly *not* covered by semver, and its API, command
-line and behaviour may change in any release. A breaking
-change to the client API (e.g. the `oracle` → `seerdb` package rename in 2.0.0)
-is a **major** bump.
+bump; bug fixes are a **patch**. A breaking change to the client API (e.g.
+the `oracle` → `seerdb` package rename in 2.0.0) is a **major** bump.
+
+The server-side "Mirror" (`seerdb.server`, the `mirror` extra) is a **highly
+experimental technology preview** until its general availability: it ships with
+the package but is *not* covered by semver, and its API, command line and
+behaviour may change in any release. From GA on, semver covers the list in
+docs/MIRROR.md *Stability* (#1861):
+- the launcher's options and config keys, its defaults, and `seerdb.serve` /
+  `seerdb.Server`;
+- the `Backend` protocol and the types it exchanges;
+- a deployment's database across upgrades within a major release;
+- the migration profile's format.
+
+The wire-level helpers `seerdb.server` exports, and what the backend keeps in
+PostgreSQL, stay outside it.
 
 **Renaming or removing a Mirror launcher option or config key** follows the
 deprecation policy in docs/MIRROR.md (*Deprecations*, #1863). It binds from the
