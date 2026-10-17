@@ -327,11 +327,22 @@ needs a grant, as on Oracle:
 - **Errors:** a user with no privilege on another user's table gets ORA-00942.
   With some privilege but not the one used, it gets ORA-41900 when the Mirror
   presents 23ai (`missing INSERT privilege on "A"."T"`), and ORA-01031 when it
-  presents 12.1.
+  presents 12.1. An `UPDATE` or `DELETE` that may write but not read the
+  columns its `WHERE` names lacks `SELECT`, which 23ai names so.
 - **ROWID:** an `INSERT`, `UPDATE` or `DELETE` on a table where the user lacks
   `SELECT` reports no ROWID, because PostgreSQL's `RETURNING` needs `SELECT`.
-- **Not yet:** column grants
-  ([#1946](https://github.com/seerdb/seerdb/issues/1946)).
+- **Column grants:** `INSERT`, `UPDATE` and `REFERENCES` may be granted on
+  columns, `GRANT UPDATE (c1, c2) ON t TO u`, and become PostgreSQL's column
+  privileges.
+  - A list may mix them with table privileges:
+    `GRANT SELECT, UPDATE (c1) ON t`.
+  - Errors: another privilege with a column list is ORA-00969, an unknown
+    column ORA-00904, and a column named twice ORA-00957.
+  - A `REVOKE` naming columns is ORA-01750, as on Oracle. Revoking the
+    privilege from the whole table takes its column grants too, and
+    `DROP COLUMN` takes the column's.
+  - `ALL_COL_PRIVS`, `USER_COL_PRIVS` and their `_MADE` and `_RECD` forms
+    list them.
 
 **Whose rights a routine runs with.** As on Oracle, a procedure, function or
 package runs with its owner's rights unless it says `AUTHID CURRENT_USER`. A
