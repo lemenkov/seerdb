@@ -1350,6 +1350,9 @@ _DBMS_OUTPUT_LINES_DDL = (
 # ALL_OBJECTS and ALL_PROCEDURES can tell it from the backend's own helpers,
 # which share its schemas. DROP takes the comment with the routine.
 _ROUTINE_MARK: Final = 'seerdb:routine:'
+# The comment that marks a per-user role as the Mirror's (#1857), which only a
+# role that may manage roles can set: SYS_CONTEXT tells a user's own role by it.
+_USER_ROLE_MARK: Final = 'seerdb mirror user'
 # The comment an object type's stand-in carries when it did not compile
 # (#1937), so ALL_OBJECTS lists it INVALID (#1940).
 _TYPE_MARK: Final = 'seerdb:type:'
@@ -1416,6 +1419,20 @@ _ORACLE_DICTIONARY_DDL = (
     "WHERE e.name = $1) THEN RAISE EXCEPTION USING ERRCODE = 'P0001', "
     "MESSAGE = 'ORA-38802: edition does not exist'; END IF; "
     "PERFORM set_config('seerdb.edition', $1, false); END $$;"
+    # Who a per-user session's proxy is (#1620, #1857): written by the
+    # installer only, as the login sets it, and keyed by the backend and when
+    # it started, so a pid used again does not inherit it. A session setting
+    # would be the client's to change (GHSA-336m-cp9c-m2fw).
+    'CREATE TABLE IF NOT EXISTS sys.ora_session_proxies (pid integer NOT NULL, '
+    'started timestamptz NOT NULL, proxy text NOT NULL, PRIMARY KEY (pid, started));'
+    # Read through a function of the installer's, for the calling backend
+    # only: a role that may not read the table still asks SYS_CONTEXT, whose
+    # plan names every table a branch of it reads.
+    'CREATE OR REPLACE FUNCTION sys.ora_session_proxy() RETURNS text '
+    'LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$ '
+    'SELECT x.proxy FROM sys.ora_session_proxies x JOIN pg_stat_activity a '
+    'ON a.pid = x.pid AND a.backend_start = x.started '
+    'WHERE x.pid = pg_backend_pid() $$;'
     'CREATE OR REPLACE FUNCTION sys.sys_context(text, text) RETURNS text '
     # A namespace other than USERENV is an application context: what the
     # client declared at login (`connect(appcontext=...)`), kept in a session
@@ -1429,11 +1446,24 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN 'current_schema' THEN upper(current_schema()) "
     "WHEN 'current_user' THEN upper(current_user::text) "
     # The session's user is the login's, or under a proxy login the user it
-    # acts for, and PROXY_USER the one who logged in (#1620); PostgreSQL's own
-    # session_user is the backend's role, which every session shares.
-    "WHEN 'session_user' THEN coalesce(nullif(current_setting('seerdb.session_user', "
-    "true), ''), upper(session_user::text)) "
-    "WHEN 'proxy_user' THEN nullif(current_setting('seerdb.proxy_user', true), '') "
+    # acts for, and PROXY_USER the one who logged in (#1620). In single-role
+    # mode PostgreSQL's session_user is the backend's role, which every
+    # session shares, so the login's name is kept in a session setting. A
+    # per-user session (#1857) is its user's own role, marked as the Mirror's,
+    # which a client cannot change, as it can a setting: the role is the
+    # answer, the setting only spelling the same name in its case, and the
+    # proxy the installer's record (GHSA-336m-cp9c-m2fw).
+    "WHEN 'session_user' THEN CASE WHEN EXISTS (SELECT 1 FROM pg_roles r "
+    "WHERE r.rolname = session_user AND shobj_description(r.oid, 'pg_authid') = "
+    f"'{_USER_ROLE_MARK}') THEN CASE WHEN lower(current_setting('seerdb.session_user', "
+    "true)) = session_user::text THEN current_setting('seerdb.session_user', true) "
+    'ELSE upper(session_user::text) END '
+    "ELSE coalesce(nullif(current_setting('seerdb.session_user', "
+    "true), ''), upper(session_user::text)) END "
+    "WHEN 'proxy_user' THEN CASE WHEN EXISTS (SELECT 1 FROM pg_roles r "
+    "WHERE r.rolname = session_user AND shobj_description(r.oid, 'pg_authid') = "
+    f"'{_USER_ROLE_MARK}') THEN sys.ora_session_proxy() "
+    "ELSE nullif(current_setting('seerdb.proxy_user', true), '') END "
     # The session's edition (#1662), ORA$BASE until one is set.
     "WHEN 'current_edition_name' THEN coalesce(nullif(current_setting('seerdb.edition', "
     "true), ''), 'ORA$BASE') "
@@ -11027,7 +11057,11 @@ _DDL_LOG_DDL = (
     'CREATE TABLE IF NOT EXISTS sys.ora_ddl_log (id bigserial PRIMARY KEY);'
     'CREATE OR REPLACE FUNCTION sys.ora_ddl_logged() RETURNS event_trigger '
     'LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$ BEGIN '
-    "IF current_setting('seerdb.installing', true) IS DISTINCT FROM 'on' THEN "
+    # Only the installer's own setup DDL goes unlogged: the setting is any
+    # session's to change (GHSA-336m-cp9c-m2fw).
+    "IF current_setting('seerdb.installing', true) IS DISTINCT FROM 'on' OR "
+    'session_user IS DISTINCT FROM (SELECT r.rolname FROM pg_roles r JOIN '
+    "pg_namespace n ON n.nspowner = r.oid WHERE n.nspname = 'sys') THEN "
     'INSERT INTO sys.ora_ddl_log DEFAULT VALUES; END IF; '
     'EXCEPTION WHEN OTHERS THEN NULL; END $$;'
     'DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_event_trigger '
@@ -11210,7 +11244,6 @@ class _AccountStore:
 # the group is the installer's own, named after it: roles belong to the whole
 # server, and another installer's group is not this one's to add members to.
 _USER_GROUP_SUFFIX: Final = '_mirror_users'
-_USER_ROLE_MARK: Final = 'seerdb mirror user'
 _PER_USER_FLOOR: Final = 160000
 # The schemas the installation makes: the dictionary's, and those of the Oracle
 # packages it emulates, which a user's statements call into.
@@ -17660,6 +17693,22 @@ class PostgresBackend:
                 ]
             )
         )
+        if proxy:
+            # Who the session's proxy is, as the installer records it: the
+            # session's setting is the client's to change, the record not
+            # (GHSA-336m-cp9c-m2fw). Records of ended backends go with it.
+            with self._administering() as admin:
+                admin.execute(
+                    'DELETE FROM sys.ora_session_proxies x WHERE NOT EXISTS (SELECT 1 '
+                    'FROM pg_stat_activity a WHERE a.pid = x.pid '
+                    'AND a.backend_start = x.started)'
+                )
+                admin.execute(
+                    'INSERT INTO sys.ora_session_proxies SELECT pid, backend_start, %s '
+                    'FROM pg_stat_activity WHERE pid = %s ON CONFLICT DO NOTHING',
+                    (proxy, self._conn.info.backend_pid),
+                )
+                admin.commit()
 
     def _dba_statement(self, statement: str) -> Result | None:
         # CREATE / DROP DIRECTORY and EDITION in per-user mode (#1857): a
@@ -17712,7 +17761,9 @@ class PostgresBackend:
             'sys.ora_owner(current_schema())'
         ).fetchone()
         assert row is not None
-        (me, here) = row
+        # The grantor is the login's user, which the Mirror knows itself, not
+        # a session setting (GHSA-336m-cp9c-m2fw).
+        (me, here) = (getattr(self, '_login_user', None) or row[0], row[1])
         parts = re.split(r'\s*\.\s*', target.strip())
         owner = _oracle_name(parts[0]) if len(parts) == 2 else here
         name = _oracle_name(parts[-1])

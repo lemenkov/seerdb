@@ -2600,6 +2600,73 @@ def test_the_records_are_upgraded_in_order_and_a_newer_database_refused(
         pg.close()
 
 
+def test_a_per_user_session_cannot_forge_who_it_is() -> None:
+    # The session's user, its proxy, and whether its DDL is the installer's
+    # unlogged setup come from what a client cannot change in per-user mode:
+    # its own role, the installer's record of its proxy, the installer's
+    # name (GHSA-336m-cp9c-m2fw). A session setting is any client's to set.
+    pid = os.getpid()
+    admin = f'sid_adm_{pid}'
+    (user, other) = (f'sid_b_{pid}', f'sid_o_{pid}')
+    pg = psycopg.connect(_CONNINFO, autocommit=True)
+    opened: list[Any] = []
+    try:
+        with _per_user_mirror(_CONNINFO, admin) as base:
+
+            def login(name: str, password: str) -> Any:
+                opened.append(base(name, password))
+                return opened[-1]
+
+            adm = login(admin, 'adm123').cursor()
+            for name in (user, other):
+                adm.execute(f'create user {name} identified by pw123')
+            adm.execute(f'alter user {other} grant connect through {user}')
+            cur = login(user, 'pw123').cursor()
+            cur.execute(
+                f"select set_config('seerdb.session_user', '{other.upper()}', false), "
+                f"set_config('seerdb.proxy_user', '{admin.upper()}', false) from dual"
+            )
+            cur.execute(
+                "select user, sys_context('userenv', 'session_user'), "
+                "sys_context('userenv', 'proxy_user') from dual"
+            )
+            assert cur.fetchall() == [(user.upper(), user.upper(), None)]
+            # A proxy login's proxy is the installer's record.
+            proxied = login(f'{user}[{other}]', 'pw123').cursor()
+            proxied.execute(
+                f"select set_config('seerdb.proxy_user', '{admin.upper()}', false) from dual"
+            )
+            proxied.execute(
+                "select user, sys_context('userenv', 'proxy_user') from dual"
+            )
+            assert proxied.fetchall() == [(other.upper(), user.upper())]
+            # A user's DDL is logged, whatever its session says.
+            logged = pg.execute('SELECT count(*) FROM sys.ora_ddl_log').fetchone()
+            cur.execute("select set_config('seerdb.installing', 'on', false) from dual")
+            cur.execute('create table sid_t (n number)')
+            if (
+                logged is not None
+                and pg.execute(
+                    "SELECT 1 FROM pg_event_trigger WHERE evtname = 'ora_ddl_log'"
+                ).fetchone()
+            ):
+                assert (
+                    pg.execute('SELECT count(*) FROM sys.ora_ddl_log').fetchone()[0]
+                    > logged[0]
+                )
+            for session in opened[1:]:
+                session.close()
+            for name in (other, user):
+                _wait_sessions_gone(pg, name)
+                adm.execute(f'drop user {name} cascade')
+    finally:
+        for session in opened:
+            with contextlib.suppress(Exception):
+                session.close()
+        _drop_mirror_roles(pg, user, other, admin)
+        pg.close()
+
+
 def test_a_profiled_mirror_records_each_statement_over_postgresql(
     tmp_path: Any,
 ) -> None:
