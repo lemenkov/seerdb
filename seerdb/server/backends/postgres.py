@@ -2612,6 +2612,48 @@ _USER_WRITTEN_RECORDS: Final = tuple(
     if test is not None or table == 'ora_sessions'
 )
 
+# The data the database keeps for the Mirror -- accounts, roles, recorded
+# grants and columns, object tables -- versioned apart from the dictionary,
+# which is installed afresh whenever it changes (#1862). From the Mirror's
+# general availability on, a change to what the records hold comes with an
+# upgrade step: the version it brings the data to, and the SQL, idempotent.
+# A release upgrades from _DATA_BASELINE on, refuses a database older than
+# that, and refuses a newer one, which it would misread. A database with a
+# dictionary but no version is a preview release's: adopted until GA, when
+# the release sets the baseline to its own version and adoption off.
+_DATA_VERSION = 1
+_DATA_BASELINE = 1
+_DATA_UPGRADES: tuple[tuple[int, str], ...] = ()
+_ADOPT_UNVERSIONED = True
+
+
+def _refused_data_version(
+    recorded: str | None, has_dictionary: bool
+) -> int | str | None:
+    # The database's data version as a number, None for one that has none
+    # yet, or why a release may not serve it (#1862).
+    if recorded is None:
+        if has_dictionary and not _ADOPT_UNVERSIONED:
+            return (
+                'this database was set up by a seerdb preview release, which '
+                'later releases do not upgrade: set it up afresh'
+            )
+        return None
+    version = int(recorded)
+    if version > _DATA_VERSION:
+        return (
+            f'this database was set up by a newer seerdb (data version {version}; '
+            f'this release knows up to {_DATA_VERSION}): upgrade the Mirror'
+        )
+    if version < _DATA_BASELINE:
+        return (
+            f'this database is at data version {version}, older than this '
+            f'release upgrades from ({_DATA_BASELINE}): set it up afresh, or '
+            'upgrade through an earlier release'
+        )
+    return version
+
+
 # What the installed dictionary is stamped with, as the `sys` schema's comment:
 # a digest of the DDL itself, so any change to a view or function reinstalls it
 # and an unchanged one is left alone (#1152).
@@ -11603,7 +11645,9 @@ class PostgresBackend:
             'CASE WHEN %s THEN coalesce((SELECT shobj_description(r.oid, '
             "'pg_authid') = %s AND pg_has_role(%s::text, r.oid, 'USAGE') AND "
             "pg_has_role(r.oid, %s::text, 'MEMBER') FROM pg_roles r "
-            'WHERE r.rolname = current_user), false) ELSE true END',
+            'WHERE r.rolname = current_user), false) ELSE true END, '
+            # The data version the database's records are at (#1862).
+            "obj_description(to_regclass('sys.ora_data_version'), 'pg_class')",
             (
                 release,
                 self.server_identity.banner.decode(),
@@ -11616,7 +11660,17 @@ class PostgresBackend:
         ).fetchone()
         assert setup is not None
         expected = _installation_stamp(setup[5])
-        installed = setup[3] == expected and setup[4] == _DICTIONARY_STAMP
+        data_version = _refused_data_version(setup[8], setup[4] is not None)
+        if isinstance(data_version, str):
+            self._conn.close()
+            raise UnsupportedFeature(data_version)
+        # A database whose records are due an upgrade goes the installation's
+        # way too, which runs it, the dictionary unchanged or not (#1862).
+        installed = (
+            setup[3] == expected
+            and setup[4] == _DICTIONARY_STAMP
+            and (data_version is None or data_version >= _DATA_VERSION)
+        )
         if role is not None and not (installed and setup[7]):
             self._conn.close()
             raise _RoleUnverified(role)
@@ -11632,6 +11686,10 @@ class PostgresBackend:
         self._install_failures: list[str] = []
         if not installed:
             self._at_once("SET seerdb.installing = 'on'")
+            if data_version is not None and data_version < _DATA_VERSION:
+                # Before the dictionary is installed again, which may need
+                # the records in their new shape (#1862).
+                self._upgrade_data(data_version)
         # What a twin of this backend is built from: a sessionless suspend
         # takes a fresh connection, set up as this one was, from it (#1746).
         self._twin: Callable[[], PostgresBackend] = lambda: type(self)(
@@ -11938,6 +11996,27 @@ class PostgresBackend:
             self._conn.rollback()
             self._install_failures.append(part)
 
+    def _upgrade_data(self, version: int) -> None:
+        # The steps that bring the records from `version` to this release's,
+        # in order, each in a transaction of its own that records the version
+        # it reached; idempotent, so a step a crash cut short runs again
+        # (#1862). One that fails leaves the database where it was, and the
+        # session is refused: it would misread the records.
+        for target, ddl in sorted(_DATA_UPGRADES):
+            if not version < target <= _DATA_VERSION:
+                continue
+            try:
+                with self._conn.transaction():
+                    self._conn.execute(ddl)
+                    self._conn.execute(
+                        f"COMMENT ON TABLE sys.ora_data_version IS '{target}'"
+                    )
+            except psycopg.Error as exc:
+                self._conn.close()
+                raise UnsupportedFeature(
+                    f'upgrading the database to data version {target} failed: {exc}'
+                ) from exc
+
     def _stamp_installation(self) -> bool:
         # Stamp the installation this setup ran, unless a part of it failed
         # that the database should have taken: whether it is stamped (#1871).
@@ -11959,6 +12038,12 @@ class PostgresBackend:
         try:
             stamp = _installation_stamp(row[0])
             self._conn.execute(f"COMMENT ON SCHEMA system IS '{stamp}'")
+            # The records' data version (#1862): a fresh database's, or one
+            # adopted or upgraded, is this release's.
+            self._conn.execute(
+                'CREATE TABLE IF NOT EXISTS sys.ora_data_version (); '
+                f"COMMENT ON TABLE sys.ora_data_version IS '{_DATA_VERSION}'"
+            )
             self._conn.commit()
         except psycopg.Error:
             self._conn.rollback()

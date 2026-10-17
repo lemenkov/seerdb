@@ -163,6 +163,22 @@ docs/MIRROR.md *Stability* (#1861):
 The wire-level helpers `seerdb.server` exports, and what the backend keeps in
 PostgreSQL, stay outside it.
 
+**The Mirror-over-PG data version** (#1862) lives in
+`seerdb/server/backends/postgres.py`:
+- `_DATA_VERSION`: the version this release writes;
+- `_DATA_BASELINE`: the oldest version it upgrades from;
+- `_DATA_UPGRADES`: the steps, each `(version, SQL)` and idempotent;
+- `_ADOPT_UNVERSIONED`: whether a database with no version is adopted.
+
+How to use them:
+- **The GA release** sets `_DATA_BASELINE = _DATA_VERSION`, bumped to a number
+  of its own, and `_ADOPT_UNVERSIONED = False`. A preview database is then
+  refused with "set it up afresh".
+- **From GA on**, a change to what the records hold (a `sys.ora_*` table's
+  columns or rows, the accounts) bumps `_DATA_VERSION` and adds the step that
+  brings an existing database there, with a test that upgrades one.
+- **Before GA**, the no-compatibility rule stands: no steps are written.
+
 **Renaming or removing a Mirror launcher option or config key** follows the
 deprecation policy in docs/MIRROR.md (*Deprecations*, #1863). It binds from the
 Mirror's general availability on:
