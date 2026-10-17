@@ -20,7 +20,9 @@ from __future__ import annotations
 import contextvars
 import datetime
 import functools
+import hmac
 import logging
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from secrets import token_bytes
@@ -217,7 +219,7 @@ from seerdb.common.tns_consts import (
     TTI_ROLLBACK,
     TTI_STA,
 )
-from seerdb.server import stats
+from seerdb.server import lockout, stats
 from seerdb.server.auth import (
     check_auth_complete,
     derive_conn_key,
@@ -307,6 +309,8 @@ _LOGIN_MAX_CONTINUATIONS = 8
 # a client and the Mirror a login is a few round trips, never a wait on the
 # client.
 LOGIN_SECONDS = 60.0
+# ORA-28000, a login to a name locked after too many failures (GHSA-742q-fjfr-w5x3).
+ORA_ACCOUNT_LOCKED = 28000
 
 
 def _expect_login_message(stream: PacketStream, what: str) -> bytes:
@@ -686,14 +690,23 @@ def handle_login(
                 set_identity(identity_kvs)
             except Exception as exc:  # noqa: BLE001 - never fail a login over this
                 logger.warning('backend refused the client identity: %s', exc)
-    secret = backend.authenticate(user)
-    if secret is None:
+    if lockout.is_locked(user):
         _deny_login(
             stream,
-            f'unknown user: {user!r}',
+            f'locked: {user!r}',
+            ora_code=ORA_ACCOUNT_LOCKED,
+            message=f'ORA-{ORA_ACCOUNT_LOCKED:05d}: The account is locked.',
             sqlplus=sqlplus,
             call_sequence=osesskey[2] if sqlplus else 0,
         )
+    secret = backend.authenticate(user)
+    # A name that is no account's is challenged as an account's would be, with
+    # a secret of its own that no password matches, and refused at the same
+    # point with the same error, as Oracle refuses it: the answers tell no
+    # account from no account (GHSA-742q-fjfr-w5x3).
+    known = secret is not None
+    if secret is None:
+        secret = _decoy_secret(user)
 
     # The thin AUTH may omit AUTH_PASSWORD (bytes | None); the OCI AUTH always
     # carries it. Declare the wider type so both branches unpack cleanly.
@@ -752,13 +765,19 @@ def handle_login(
     # Verify the client's password proof (AUTH_PASSWORD) against the account
     # secret — the server half of O5LOGON's mutual auth. Without it the Mirror
     # would serve any client that ignores the server proof it can't validate.
-    if not verify_password(conn_key, auth_password, secret.encode('utf-8')):
+    if not known or not verify_password(
+        conn_key, auth_password, secret.encode('utf-8')
+    ):
+        # Each failure in a row waits longer, and enough of them lock the
+        # name (GHSA-742q-fjfr-w5x3).
+        time.sleep(lockout.failed(user))
         _deny_login(
             stream,
-            f'wrong password for user: {user!r}',
+            f'wrong password or no such user: {user!r}',
             sqlplus=sqlplus,
             call_sequence=auth_body[2] if sqlplus else 0,
         )
+    lockout.succeeded(user)
     # The proof checked out, so a new password carried alongside it is a genuine
     # request from an authenticated user. Applying it here rather than ignoring
     # it is what makes `connect(newpassword=...)` mean anything: without this the
@@ -1026,6 +1045,15 @@ def sqlplus_field_version(
             f'{floor} this Mirror serves'
         )
     return spoken
+
+
+# The key a name that is no account's gets its challenge's secret from, the
+# same for that name on every attempt within the process.
+_DECOY_KEY = token_bytes(32)
+
+
+def _decoy_secret(user: str) -> str:
+    return hmac.new(_DECOY_KEY, user.upper().encode('utf-8'), 'sha256').hexdigest()
 
 
 def _deny_login(

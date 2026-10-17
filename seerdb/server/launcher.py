@@ -54,6 +54,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, cast
 
+from seerdb.server import lockout
 from seerdb.server.backend import Backend
 
 if TYPE_CHECKING:
@@ -148,6 +149,8 @@ class Launch:
     # How many connections are served at once (GHSA-5827-wqfh-x2v3), None
     # for no limit.
     max_sessions: int | None = None
+    # Failed logins in a row that lock a name (GHSA-742q-fjfr-w5x3); 0 never.
+    failed_login_attempts: int = 10
     # A deprecated option or key the command line or the config file gave
     # (#1863), each to be logged as the Mirror starts.
     warnings: list[str] = field(default_factory=list)
@@ -194,6 +197,12 @@ def _parser() -> argparse.ArgumentParser:
         '--max-sessions',
         type=int,
         help='serve at most this many connections at once (default: no limit)',
+    )
+    parser.add_argument(
+        '--failed-login-attempts',
+        type=int,
+        help='lock a user name after this many failed logins in a row '
+        '(default 10; 0 never locks)',
     )
     commands = parser.add_subparsers(dest='command', metavar='BACKEND')
     postgres = commands.add_parser('postgres', help='serve from PostgreSQL')
@@ -336,6 +345,16 @@ def build(
     max_sessions = int(sessions) if sessions else None
     if max_sessions is not None and max_sessions < 1:
         raise SystemExit('max_sessions must be at least 1')
+    attempts = int(
+        option(
+            args.failed_login_attempts,
+            server,
+            'failed_login_attempts',
+            str(lockout.DEFAULT_ATTEMPTS),
+        )
+    )
+    if attempts < 0:
+        raise SystemExit('failed_login_attempts must be 0 or more')
 
     kind = args.command or str(backend.get('type', '')).strip().lower()
     if kind == 'observe':
@@ -408,6 +427,7 @@ def build(
             ssl_context=ssl_context,
             profile=profile,
             max_sessions=max_sessions,
+            failed_login_attempts=attempts,
             warnings=warnings,
         )
 
@@ -444,6 +464,7 @@ def build(
         ssl_context=ssl_context,
         profile=profile,
         max_sessions=max_sessions,
+        failed_login_attempts=attempts,
         warnings=warnings,
     )
     if field_version is None:
@@ -472,6 +493,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     for warning in launch.warnings:
         logging.getLogger('seerdb.server').warning('%s', warning)
+    lockout.configure(launch.failed_login_attempts)
     if launch.backend_factory is None:
         from seerdb.server.listener import serve_observer
 

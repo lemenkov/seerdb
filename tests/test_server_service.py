@@ -170,3 +170,68 @@ def test_a_client_that_does_not_log_in_is_dropped(monkeypatch) -> None:
     finally:
         server.close()
         thread.join(timeout=5)
+
+
+def _serving(server):  # a started server's thread
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return thread
+
+
+def _login_error(port: int, user: str, password: str) -> str:
+    try:
+        seerdb.connect(
+            host='127.0.0.1',
+            port=port,
+            user=user,
+            password=password,
+            service_name='XE',
+            timeout=5000,
+        ).close()
+    except seerdb.DatabaseError as exc:
+        return str(exc).split(':')[0]
+    return 'connected'
+
+
+def test_an_unknown_user_is_refused_as_a_wrong_password_is(monkeypatch) -> None:
+    # GHSA-742q-fjfr-w5x3: a name that is no account's is challenged and
+    # refused with the same ORA-01017 as a wrong password.
+    from seerdb.server import lockout
+
+    monkeypatch.setattr(lockout, '_failures', {})
+    monkeypatch.setattr(lockout, '_DELAY_STEP', 0.0)
+    server = seerdb.Server(host='127.0.0.1', port=0, backend_factory=_DualBackend)
+    thread = _serving(server)
+    try:
+        assert _login_error(server.port, 'NO_SUCH_USER', 'x') == 'ORA-01017'
+        assert _login_error(server.port, 'PYO', 'wrong') == 'ORA-01017'
+        assert _login_error(server.port, 'PYO', 'pyo123') == 'connected'
+    finally:
+        server.close()
+        thread.join(timeout=5)
+
+
+def test_failed_logins_lock_a_name_until_it_is_unlocked(monkeypatch) -> None:
+    # GHSA-742q-fjfr-w5x3: enough failures in a row lock the name, an
+    # account's or not, with ORA-28000; unlocking it lets it log in again.
+    from seerdb.server import lockout
+
+    monkeypatch.setattr(lockout, '_failures', {})
+    monkeypatch.setattr(lockout, '_DELAY_STEP', 0.0)
+    monkeypatch.setattr(lockout, '_attempts', 3)
+    server = seerdb.Server(host='127.0.0.1', port=0, backend_factory=_DualBackend)
+    thread = _serving(server)
+    try:
+        for name in ('PYO', 'NO_SUCH_USER'):
+            for _ in range(3):
+                assert _login_error(server.port, name, 'wrong') == 'ORA-01017'
+            assert _login_error(server.port, name, 'pyo123') == 'ORA-28000'
+        lockout.unlock('PYO')
+        assert _login_error(server.port, 'PYO', 'pyo123') == 'connected'
+        # A good login starts the count over.
+        assert _login_error(server.port, 'PYO', 'wrong') == 'ORA-01017'
+        assert _login_error(server.port, 'PYO', 'pyo123') == 'connected'
+        assert not lockout.is_locked('PYO')
+    finally:
+        server.close()
+        thread.join(timeout=5)
