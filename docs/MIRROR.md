@@ -330,12 +330,24 @@ needs a grant, as on Oracle:
   presents 12.1.
 - **ROWID:** an `INSERT`, `UPDATE` or `DELETE` on a table where the user lacks
   `SELECT` reports no ROWID, because PostgreSQL's `RETURNING` needs `SELECT`.
-- **Not yet:**
-  - a routine runs with its caller's rights, not its owner's as Oracle's
-    does by default
-    ([#1945](https://github.com/seerdb/seerdb/issues/1945));
-  - column grants
-    ([#1946](https://github.com/seerdb/seerdb/issues/1946)).
+- **Not yet:** column grants
+  ([#1946](https://github.com/seerdb/seerdb/issues/1946)).
+
+**Whose rights a routine runs with.** As on Oracle, a procedure, function or
+package runs with its owner's rights unless it says `AUTHID CURRENT_USER`. A
+user granted EXECUTE on it reaches what the owner may, even without a grant on
+the owner's tables.
+- **Unqualified names:** the routine is created with its owner's schema first
+  on its search path, so an unqualified name means the owner's object, in
+  either mode.
+- **`USER` and `SESSION_USER`:** the caller, as on Oracle.
+- **`CURRENT_USER` and `CURRENT_SCHEMA`:** the owner. In single-role mode,
+  `CURRENT_USER` is the one role.
+- **`AUTHID CURRENT_USER`:** the caller's rights and search path. One
+  difference remains for packages: an invoker-rights package still resolves
+  unqualified names on its owner's path, because its members find each other
+  through it.
+- **`ALL_PROCEDURES.AUTHID`** shows which.
 
 In single-role mode, grants are checked and recorded the same way, but every
 user is the one role, so they enforce nothing beyond who sees a type.
