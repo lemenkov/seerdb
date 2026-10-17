@@ -51,8 +51,8 @@ import signal
 import ssl
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 from seerdb.server.backend import Backend
 
@@ -61,6 +61,72 @@ if TYPE_CHECKING:
 
 _ENCRYPTION = ('accepted', 'requested', 'required')
 _BACKENDS = ('postgres', 'passthrough')
+
+
+class _Deprecation(NamedTuple):
+    # What a deprecated option or config key gave way to -- None for one
+    # removed with nothing in its place -- and the release that removes it.
+    replacement: str | None
+    removed_in: str
+
+
+# The deprecated spellings (#1863): command-line options, as `--name`, and
+# config-file keys, as (section, key). Each keeps working, with a warning, for
+# at least one minor release, and the ChangeLog names it (docs/MIRROR.md,
+# *Deprecations*). A renamed one becomes its replacement; a removed one stays
+# defined where it was, and only warns.
+_DEPRECATED_OPTIONS: dict[str, _Deprecation] = {}
+_DEPRECATED_KEYS: dict[tuple[str, str], _Deprecation] = {}
+
+
+def _deprecation_warning(old: str, deprecation: _Deprecation) -> str:
+    instead = (
+        f'use {deprecation.replacement} instead; '
+        if deprecation.replacement is not None
+        else ''
+    )
+    return (
+        f'{old} is deprecated: {instead}it will be removed in seerdb '
+        f'{deprecation.removed_in}'
+    )
+
+
+def _undeprecated_argv(argv: Sequence[str]) -> tuple[list[str], list[str]]:
+    # The command line with each renamed option spelled as its replacement,
+    # `--old` and `--old=value` alike, and a warning for each deprecated one
+    # given (#1863). Nothing after `--` is an option.
+    out: list[str] = []
+    warnings: list[str] = []
+    options = True
+    for arg in argv:
+        if arg == '--':
+            options = False
+        (name, equals, value) = arg.partition('=')
+        deprecation = _DEPRECATED_OPTIONS.get(name) if options else None
+        if deprecation is None:
+            out.append(arg)
+            continue
+        warnings.append(_deprecation_warning(name, deprecation))
+        new = deprecation.replacement or name
+        out.append(f'{new}{equals}{value}')
+    return out, warnings
+
+
+def _undeprecated_config(config: configparser.ConfigParser) -> list[str]:
+    # The config file with each renamed key's value under its replacement --
+    # the new key wins where both are set -- and a warning for each
+    # deprecated key it sets (#1863).
+    warnings: list[str] = []
+    for (section, key), deprecation in _DEPRECATED_KEYS.items():
+        if not config.has_option(section, key):
+            continue
+        warnings.append(_deprecation_warning(f'[{section}] {key}', deprecation))
+        new = deprecation.replacement
+        if new is not None:
+            if not config.has_option(section, new):
+                config.set(section, new, config.get(section, key))
+            config.remove_option(section, key)
+    return warnings
 
 
 @dataclass
@@ -79,6 +145,9 @@ class Launch:
     ssl_context: ssl.SSLContext | None = None
     # Where a migration profile is written (#1881), None for no profile.
     profile: str | None = None
+    # A deprecated option or key the command line or the config file gave
+    # (#1863), each to be logged as the Mirror starts.
+    warnings: list[str] = field(default_factory=list)
 
 
 class _Config(configparser.ConfigParser):
@@ -218,10 +287,12 @@ def build(
 ) -> Launch:
     """Parse a command line (and its config file) into a :class:`Launch`."""
     env = dict(os.environ) if env is None else env
-    args = _parser().parse_args(argv)
+    (given_argv, warnings) = _undeprecated_argv(sys.argv[1:] if argv is None else argv)
+    args = _parser().parse_args(given_argv)
     config = _Config(interpolation=None)
     if args.config is not None and not config.read(args.config):
         raise SystemExit(f'cannot read config file {args.config!r}')
+    warnings += _undeprecated_config(config)
     no_section: dict[str, str] = {}
     server: Mapping[str, str] = (
         config['server'] if config.has_section('server') else no_section
@@ -256,7 +327,9 @@ def build(
 
     kind = args.command or str(backend.get('type', '')).strip().lower()
     if kind == 'observe':
-        return Launch(host, port, log_level, None, description='observer')
+        return Launch(
+            host, port, log_level, None, description='observer', warnings=warnings
+        )
     if kind not in _BACKENDS:
         raise SystemExit(
             'name a backend: postgres or passthrough (or observe), on the '
@@ -322,6 +395,7 @@ def build(
             description=f'PostgreSQL presenting {presents}',
             ssl_context=ssl_context,
             profile=profile,
+            warnings=warnings,
         )
 
     upstream = option(getattr(args, 'upstream', None), backend, 'upstream', '')
@@ -356,6 +430,7 @@ def build(
         description=f'passthrough to {up_host}:{up_port}/{service}',
         ssl_context=ssl_context,
         profile=profile,
+        warnings=warnings,
     )
     if field_version is None:
         # Present what the upstream speaks: probe it once, as the first account.
@@ -381,6 +456,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         level=launch.log_level,
         format='%(asctime)s %(name)s %(levelname)s %(message)s',
     )
+    for warning in launch.warnings:
+        logging.getLogger('seerdb.server').warning('%s', warning)
     if launch.backend_factory is None:
         from seerdb.server.listener import serve_observer
 

@@ -152,3 +152,15 @@ with the package but is explicitly *not* covered by semver, and its API, command
 line and behaviour may change in any release. A breaking
 change to the client API (e.g. the `oracle` → `seerdb` package rename in 2.0.0)
 is a **major** bump.
+
+**Renaming or removing a Mirror launcher option or config key** follows the
+deprecation policy in docs/MIRROR.md (*Deprecations*, #1863). It binds from the
+Mirror's general availability on:
+
+1. Add the old spelling to `_DEPRECATED_OPTIONS` (`--old`) or `_DEPRECATED_KEYS`
+   (`(section, key)`) in `seerdb/server/launcher.py`. Name its replacement, or
+   `None` for an option removed with nothing in its place, which then stays
+   defined. Name the release that removes it, at least one minor release away.
+2. Add a ChangeLog bullet naming it in backquotes with the word *deprecated*.
+   `tests/test_server_launcher.py` checks that it is there.
+3. Remove the entry and the old spelling in the release it names.
