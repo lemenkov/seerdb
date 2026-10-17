@@ -253,7 +253,7 @@ from seerdb.server.backend import (
     SessionInfo,
     UnsupportedFeature,
 )
-from seerdb.server.framing import PacketStream
+from seerdb.server.framing import SESSION_MESSAGE_LIMIT, PacketStream
 from seerdb.server.handshake import (
     client_compile_cap,
     client_field_version,
@@ -303,6 +303,10 @@ _ALL_ROWS = 2**31
 # client may negotiate is 512, so six fragments is already the worst case; the
 # cap exists so a client sending something else entirely still fails fast.
 _LOGIN_MAX_CONTINUATIONS = 8
+# How long a client has to finish logging in (GHSA-5827-wqfh-x2v3): between
+# a client and the Mirror a login is a few round trips, never a wait on the
+# client.
+LOGIN_SECONDS = 60.0
 
 
 def _expect_login_message(stream: PacketStream, what: str) -> bytes:
@@ -1329,6 +1333,10 @@ def serve_session(
     declared_identity = getattr(backend, 'server_identity', None)
     identity = declared_identity or server_identity(field_version)
     backend = _IsolatedBackend(backend)
+    # A client has this long to log in, and may send only the small messages
+    # a login needs until it has: a connection that stalls or floods before
+    # authenticating is dropped (GHSA-5827-wqfh-x2v3).
+    stream.settimeout(LOGIN_SECONDS)
     user, sqlplus, conn_key, negotiated, session_id = handle_login(
         stream,
         backend,
@@ -1339,6 +1347,8 @@ def serve_session(
         tns_version=tns_version,
         identity=identity,
     )
+    stream.settimeout(None)
+    stream.max_message = SESSION_MESSAGE_LIMIT
     advertised = field_version
     # Serve the session at the version the client actually negotiated, not the
     # one this Mirror advertises. A client above the advertised version comes

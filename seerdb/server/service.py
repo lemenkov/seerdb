@@ -61,8 +61,12 @@ class Server:
         tns_version: int | None = None,
         encryption: str = 'accepted',
         ssl_context: ssl.SSLContext | None = None,
+        max_sessions: int | None = None,
     ) -> None:
         self._backend_factory = backend_factory
+        # How many connections are served at once (GHSA-5827-wqfh-x2v3); one
+        # more is closed as it arrives. None serves any number, as before.
+        self._slots = threading.BoundedSemaphore(max_sessions) if max_sessions else None
         # The Mirror's ANO stance (§33): 'accepted', 'requested' or 'required'.
         self._encryption = encryption
         # TCPS (#1834): with a server context, every connection is TLS from its
@@ -101,11 +105,26 @@ class Server:
                 continue  # poll the running flag
             except OSError:
                 break  # the socket was closed
+            if self._slots is not None and not self._slots.acquire(blocking=False):
+                logger.warning(
+                    'refused %s:%d: already serving the most sessions allowed', *addr
+                )
+                client.close()
+                continue
             threading.Thread(
                 target=self._handle, args=(client, addr), daemon=True
             ).start()
 
     def _handle(self, client: socket.socket, addr: tuple) -> None:
+        # The connection's slot is free again however it ends, a failed TLS
+        # handshake included.
+        try:
+            self._serve(client, addr)
+        finally:
+            if self._slots is not None:
+                self._slots.release()
+
+    def _serve(self, client: socket.socket, addr: tuple) -> None:
         if self._ssl_context is not None:
             try:
                 client.settimeout(_TLS_HANDSHAKE_SECONDS)
@@ -153,6 +172,7 @@ def serve(
     tns_version: int | None = None,
     encryption: str = 'accepted',
     ssl_context: ssl.SSLContext | None = None,
+    max_sessions: int | None = None,
 ) -> None:
     """Run a Mirror server until interrupted — the one-call convenience."""
     server = Server(
@@ -163,6 +183,7 @@ def serve(
         tns_version=tns_version,
         encryption=encryption,
         ssl_context=ssl_context,
+        max_sessions=max_sessions,
     )
     try:
         server.serve_forever()

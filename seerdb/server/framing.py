@@ -54,6 +54,20 @@ __all__ = ['DEFAULT_SDU', 'PacketStream']
 _HEADER_LEGACY = struct.Struct('>HhBBh')  # size, cksum, type, flags, hdr-cksum
 _HEADER_LARGE = struct.Struct('>IBBh')  # size, type, flags, hdr-cksum
 _DATA_FLAGS = struct.Struct('>H')
+# The bounds a client's input is held to (GHSA-5827-wqfh-x2v3). A packet no
+# longer than the 16-bit legacy limit is always accepted, whatever the SDU: a
+# CONNECT uses it before one is agreed. Before login a message is the
+# handshake's, ANO's or O5LOGON's, all small; after it, a call's, which an
+# array of binds can make large.
+LEGACY_PACKET_LIMIT = 0xFFFF
+PRE_LOGIN_MESSAGE_LIMIT = 1 << 20
+SESSION_MESSAGE_LIMIT = 1 << 30
+
+
+class ProtocolLimitError(ConnectionError):
+    # Input past what the Mirror accepts: the session is closed, as for a
+    # connection the client dropped.
+    pass
 
 
 class PacketStream:
@@ -71,7 +85,12 @@ class PacketStream:
         self._sock = sock
         self.sdu = sdu
         self.large = large
-        self._acc = b''
+        self._acc = bytearray()
+        # The most a reassembled message may hold (GHSA-5827-wqfh-x2v3): what
+        # a login needs before authentication, raised once the session has
+        # logged in (session.serve_session). A client that sends more is
+        # refused rather than buffered.
+        self.max_message = PRE_LOGIN_MESSAGE_LIMIT
         # Native network encryption (#448). Set by activate_ano() once the ANO
         # negotiation selects a cipher; each TNS_DATA fragment is then decrypted
         # on read and encrypted on write. None means plaintext framing.
@@ -124,9 +143,23 @@ class PacketStream:
             self._acc += chunk
         return True
 
+    def settimeout(self, seconds: float | None) -> None:
+        """Bound every later read to ``seconds`` (None: wait for ever), as a
+        login's deadline does (GHSA-5827-wqfh-x2v3)."""
+        self._sock.settimeout(seconds)
+
+    def _check_size(self, size: int) -> None:
+        # A packet's length as its header gives it (GHSA-5827-wqfh-x2v3): no
+        # shorter than the header, no longer than the negotiated SDU -- never
+        # under the 16-bit legacy limit, which a CONNECT may use before the SDU
+        # is agreed. The large header would otherwise let a client claim 4 GB
+        # that the reader then waits to buffer.
+        if size < 8 or size > max(self.sdu, LEGACY_PACKET_LIMIT):
+            raise ProtocolLimitError(f'packet length {size} out of bounds')
+
     def _header(self) -> tuple[int, int]:
         # Parse (packet_size, type) from the 8-byte header at the front of _acc.
-        head = self._acc[:8]
+        head = bytes(self._acc[:8])
         if self.large:
             size, packet_type, _flags, _zero = _HEADER_LARGE.unpack(head)
         else:
@@ -161,17 +194,18 @@ class PacketStream:
         """
         if within is not None:
             return self._read_packet_within(within)
-        body = b''
+        body = bytearray()
         while True:
             if not self._fill(8):
-                self._acc = b''
+                self._acc = bytearray()
                 return None
             size, packet_type = self._header()
+            self._check_size(size)
             if not self._fill(size):
-                self._acc = b''
+                self._acc = bytearray()
                 return None
-            packet = self._acc[:size]
-            self._acc = self._acc[size:]
+            packet = bytes(self._acc[:size])
+            del self._acc[:size]
             if packet_type == TNS_DATA:
                 (data_flags,) = _DATA_FLAGS.unpack(packet[8:10])
                 # Kept for the caller: a pipelined burst is marked in these
@@ -185,9 +219,13 @@ class PacketStream:
                 if self._ano is not None and self._ano.active:
                     fragment = self._ano.unwrap(fragment)
                 body += fragment
+                if len(body) > self.max_message:
+                    raise ProtocolLimitError(
+                        f'message of more than {self.max_message} bytes'
+                    )
                 if data_flags & TNS_DATA_FLAGS_MORE:
                     continue
-                return (TNS_DATA, body)
+                return (TNS_DATA, bytes(body))
             return (packet_type, packet[8:size])
 
     def write_packet(self, packet_type: int, body: bytes) -> None:
