@@ -54,6 +54,7 @@ from seerdb.server.backends.postgres import (  # noqa: E402
     _object_column_meta,
     _object_type_oid,
     _occurrence_binds,
+    _package_rights,
     _parse_out_assignments,
     _pg_oid_of,
     _reject_nonfinite_vectors,
@@ -2217,8 +2218,16 @@ def test_per_user_roles_enforce_object_grants(presents: str) -> None:
             cursor.execute(statement)
         return str(raised.value)
 
+    # Every session this test opens, closed however it ends: an open one
+    # holds locks the roles' cleanup would wait on for ever.
+    opened: list[Any] = []
     try:
-        with _per_user_mirror(_CONNINFO, admin, presents) as login:
+        with _per_user_mirror(_CONNINFO, admin, presents) as base:
+
+            def login(name: str, password: str) -> Any:
+                opened.append(base(name, password))
+                return opened[-1]
+
             adm = login(admin, 'adm123')
             for name in (owner, user, third):
                 adm.cursor().execute(f'create user {name} identified by pw123')
@@ -2265,6 +2274,25 @@ def test_per_user_roles_enforce_object_grants(presents: str) -> None:
             # A replace keeps the grant, as Oracle's does.
             a.execute('create or replace procedure p as begin null; end;')
             b.execute(f'begin {owner}.p; end;')
+            # A's procedure runs with A's rights (#1945): B, holding nothing on
+            # A's table, writes it through the procedure; one with AUTHID
+            # CURRENT_USER runs with B's, and the table is not there for it.
+            a.execute('create table w (n number)')
+            a.execute('create procedure pw as begin insert into w values (1); end;')
+            a.execute(
+                'create procedure pi authid current_user as '
+                f'begin insert into {owner}.w values (2); end;'
+            )
+            a.execute(f'grant execute on pw to {user}')
+            a.execute(f'grant execute on pi to {user}')
+            b.execute(f'begin {owner}.pw; end;')
+            b.execute('commit')
+            assert code(b, f'begin {owner}.pi; end;').startswith('ORA-00942')
+            a.execute('select n from w')
+            assert a.fetchall() == [(1,)]
+            a.execute('drop procedure pi')
+            a.execute('drop procedure pw')
+            a.execute('drop table w')
             a.execute(f'grant all on t to {user} with grant option')
             b.execute(f'grant select on {t} to {third}')
             c.execute(f'select count(*) from {t}')
@@ -2313,6 +2341,9 @@ def test_per_user_roles_enforce_object_grants(presents: str) -> None:
                 'SELECT count(*) FROM sys.ora_grants WHERE owner = %s', (o,)
             ).fetchone() == (0,)
     finally:
+        for session in opened:
+            with contextlib.suppress(Exception):
+                session.close()
         _drop_mirror_roles(pg, owner, user, third, admin)
         pg.close()
 
@@ -5239,6 +5270,88 @@ def test_the_tab_privs_views_list_each_users_grants() -> None:
         admin.close()
 
 
+def test_a_routine_runs_with_its_owners_rights_unless_authid_current_user() -> None:
+    # Definer and invoker rights (#1945), as 23ai has them: another user's
+    # call of a routine without AUTHID, or AUTHID DEFINER, reads the owner's
+    # table, and CURRENT_SCHEMA is the owner's; AUTHID CURRENT_USER reads the
+    # caller's. USER is the caller either way. ALL_PROCEDURES lists which.
+    from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
+    from seerdb.server.backend import BindVar
+
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    for schema in ('own1945', 'oth1945'):
+        admin.execute(f'DROP SCHEMA IF EXISTS {schema} CASCADE')
+        admin.execute(f'CREATE SCHEMA {schema}')
+    owner = PostgresBackend(_CONNINFO, credentials={'OWN1945': 'x'})
+    other = PostgresBackend(_CONNINFO, credentials={'OTH1945': 'x'})
+    body = (
+        '(r OUT VARCHAR2) {authid} AS n NUMBER; BEGIN '
+        'SELECT count(*) INTO n FROM t1945; '
+        "r := USER || ',' || sys_context('userenv', 'current_schema') || ',' || n; "
+        'END;'
+    )
+
+    def call(name: str) -> str:
+        out = BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=200)
+        result = other.execute(f'BEGIN own1945.{name}(:r); END;', [out])
+        return result.out_binds[0]
+
+    try:
+        owner.authenticate('OWN1945')
+        other.authenticate('OTH1945')
+        owner.execute('CREATE TABLE t1945 (n NUMBER)')
+        owner.execute('INSERT INTO t1945 VALUES (1)')
+        owner.commit()
+        other.execute('CREATE TABLE t1945 (n NUMBER)')
+        other.execute('INSERT INTO t1945 VALUES (7)')
+        other.execute('INSERT INTO t1945 VALUES (8)')
+        other.commit()
+        for name, authid in (
+            ('p_none', ''),
+            ('p_definer', 'AUTHID DEFINER'),
+            ('p_invoker', 'AUTHID CURRENT_USER'),
+        ):
+            owner.execute(f'CREATE PROCEDURE {name} ' + body.format(authid=authid))
+        assert call('p_none') == 'OTH1945,OWN1945,1'
+        assert call('p_definer') == 'OTH1945,OWN1945,1'
+        assert call('p_invoker') == 'OTH1945,OTH1945,2'
+        # A COMMIT in a definer's routine, which PostgreSQL refuses in a
+        # SECURITY DEFINER one, is the Mirror's deferred COMMIT as before.
+        owner.execute(
+            'CREATE PROCEDURE p_commit AS BEGIN INSERT INTO t1945 VALUES (5); '
+            'COMMIT; END;'
+        )
+        other.execute('BEGIN own1945.p_commit; END;')
+        other.rollback()
+        counted = owner.execute('SELECT count(*) FROM t1945').rows
+        owner.rollback()
+        assert [tuple(r) for r in counted] == [(2,)]
+        owner.execute('CREATE PACKAGE k1945 AUTHID CURRENT_USER AS PROCEDURE p; END;')
+        owner.execute('CREATE PACKAGE j1945 AS PROCEDURE p; END;')
+        listed = owner.execute(
+            'SELECT object_name, authid FROM user_procedures WHERE procedure_name '
+            "IS NULL AND (object_name LIKE '%1945' OR object_name LIKE 'P!_%' "
+            "ESCAPE '!') ORDER BY 1"
+        ).rows
+        assert [tuple(r) for r in listed] == [
+            ('J1945', 'DEFINER'),
+            ('K1945', 'CURRENT_USER'),
+            ('P_COMMIT', 'DEFINER'),
+            ('P_DEFINER', 'DEFINER'),
+            ('P_INVOKER', 'CURRENT_USER'),
+            ('P_NONE', 'DEFINER'),
+        ]
+    finally:
+        owner.rollback()
+        other.rollback()
+        owner.close()
+        other.close()
+        admin.execute("DELETE FROM sys.ora_packages WHERE name IN ('k1945', 'j1945')")
+        for schema in ('own1945', 'oth1945', 'k1945', 'j1945'):
+            admin.execute(f'DROP SCHEMA IF EXISTS {schema} CASCADE')
+        admin.close()
+
+
 def test_a_rowid_column_refuses_a_number_and_a_bad_rowid() -> None:
     # A ROWID column (#1624): a number bound or written into it by INSERT ...
     # VALUES or UPDATE ... SET is ORA-00932, text that reads as no rowid
@@ -6022,6 +6135,10 @@ def test_constructor_items_name_each_whole_call() -> None:
     assert _constructor_items('SELECT * FROM t') == {}
 
 
+# A standalone routine's default rights: its owner's (#1945).
+_DEFINER = 'SECURITY DEFINER SET search_path FROM CURRENT '
+
+
 def test_translate_routine_ddl_procedure() -> None:
     out = _translate_routine_ddl(
         'CREATE OR REPLACE PROCEDURE p '
@@ -6033,7 +6150,9 @@ def test_translate_routine_ddl_procedure() -> None:
     assert 'p_in IN numeric' in out
     assert 'p_out OUT numeric' in out
     assert 'p_io INOUT varchar' in out  # IN OUT -> INOUT
-    assert 'LANGUAGE plpgsql AS $$ BEGIN p_out := p_in * 2; END $$' in out
+    assert (
+        'LANGUAGE plpgsql ' + _DEFINER + 'AS $$ BEGIN p_out := p_in * 2; END $$' in out
+    )
 
 
 def test_translate_routine_ddl_body_with_a_parenthesised_alias() -> None:
@@ -6061,7 +6180,7 @@ def test_translate_routine_ddl_function() -> None:
         'DROP FUNCTION IF EXISTS f; '
         'CREATE OR REPLACE FUNCTION f(p IN numeric) RETURNS numeric'
     )
-    assert 'LANGUAGE plpgsql AS $$ BEGIN RETURN p + 100; END $$' in out
+    assert 'LANGUAGE plpgsql ' + _DEFINER + 'AS $$ BEGIN RETURN p + 100; END $$' in out
 
 
 def test_translate_routine_ddl_parameterless_function() -> None:
@@ -6072,7 +6191,7 @@ def test_translate_routine_ddl_parameterless_function() -> None:
         'CREATE OR REPLACE FUNCTION f RETURN BINARY_DOUBLE AS BEGIN RETURN 2.25; END;'
     )
     assert 'CREATE OR REPLACE FUNCTION f() RETURNS double precision' in out
-    assert 'LANGUAGE plpgsql AS $$ BEGIN RETURN 2.25; END $$' in out
+    assert 'LANGUAGE plpgsql ' + _DEFINER + 'AS $$ BEGIN RETURN 2.25; END $$' in out
     withbody = _translate_routine_ddl(
         'CREATE OR REPLACE FUNCTION g(x IN NUMBER) RETURN NUMBER '
         'AS BEGIN RETURN x * (x + 1); END;'
@@ -6325,7 +6444,8 @@ def test_package_ddl_is_a_schema_of_its_routines() -> None:
         "DELETE FROM sys.ora_plsql_types WHERE package = 'pk' AND NOT public; "
         'CREATE OR REPLACE FUNCTION pk.f(a numeric) RETURNS numeric LANGUAGE '
         'plpgsql SET search_path FROM CURRENT AS $$ BEGIN RETURN a; END $$; '
-        "UPDATE sys.ora_packages SET body = 'VALID' WHERE name = 'pk'"
+        + _package_rights('pk')
+        + "; UPDATE sys.ora_packages SET body = 'VALID' WHERE name = 'pk'"
     ) in body
     assert 'DROP FUNCTION IF EXISTS' not in body  # members may share a name
     assert _translate_package_ddl('DROP PACKAGE pk').endswith(

@@ -181,9 +181,14 @@ honest edge of this adapter:
   -- only once granted EXECUTE on it. With per-user roles (#1857) it is
   PostgreSQL's own GRANT or REVOKE too, so another user's object needs one
   (#1858); without them every user is the one role, and another user's table
-  named with its schema reads as one's own. A routine runs with its caller's
-  rights, not its owner's (#1945), and a column grant is not kept (#1946). A
-  system privilege or a role granted is a no-op.
+  named with its schema reads as one's own. A column grant is not kept
+  (#1946). A system privilege or a role granted is a no-op.
+- **Definer and invoker rights** (#1945) -- a routine or package without
+  AUTHID, or with AUTHID DEFINER, is SECURITY DEFINER with its owner's
+  schema first on its path, so it runs as its owner's role in per-user mode,
+  and an unqualified name is the owner's in either mode; USER stays the
+  caller. AUTHID CURRENT_USER runs with the caller's rights and path, but for
+  a package, whose members find each other on their creator's path.
 - **Object types, partly** — ``CREATE TYPE ... AS OBJECT`` is a PostgreSQL
   composite, listed in ``all_types`` / ``all_type_attrs`` under an OID that is the
   composite's own ``pg_type`` oid, zero-padded to Oracle's 16 bytes. An object
@@ -1679,6 +1684,9 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE TABLE IF NOT EXISTS sys.ora_packages ('
     'name text PRIMARY KEY, owner text NOT NULL, stubs text NOT NULL, '
     "spec text NOT NULL DEFAULT 'VALID', body text);"
+    # Whose rights its routines run with, as its spec said (#1945).
+    'ALTER TABLE sys.ora_packages ADD COLUMN IF NOT EXISTS authid text NOT NULL '
+    "DEFAULT 'DEFINER';"
     # The types a package declares (#1607), each a PostgreSQL type of its
     # schema, with the PL/SQL it was declared as -- what the dictionary and a
     # client's type metadata report -- in declaration order. A body's own types
@@ -2016,7 +2024,7 @@ _ORACLE_DICTIONARY_DDL = (
     'n.oid::bigint AS object_id, 0 AS subprogram_id, NULL::text AS overload, '
     "'PACKAGE' AS object_type, 'NO' AS aggregate, 'NO' AS pipelined, "
     "'NO' AS parallel, 'NO' AS interface, 'NO' AS deterministic, "
-    "'DEFINER' AS authid FROM sys.ora_packages k "
+    'k.authid FROM sys.ora_packages k '
     'JOIN pg_namespace n ON n.nspname = k.name '
     "WHERE has_schema_privilege(n.oid, 'USAGE') "
     'UNION ALL SELECT owner, object_name, procedure_name, object_id, '
@@ -2024,8 +2032,8 @@ _ORACLE_DICTIONARY_DDL = (
     'CASE WHEN count(*) OVER (PARTITION BY object_id, procedure_name) > 1 THEN '
     '(row_number() OVER (PARTITION BY object_id, procedure_name '
     'ORDER BY declared, oid))::text END, '
-    "'PACKAGE', 'NO', 'NO', 'NO', 'NO', 'NO', 'DEFINER' FROM ("
-    'SELECT k.owner, upper(k.name) AS object_name, upper(p.proname) AS '
+    "'PACKAGE', 'NO', 'NO', 'NO', 'NO', 'NO', authid FROM ("
+    'SELECT k.owner, k.authid, upper(k.name) AS object_name, upper(p.proname) AS '
     'procedure_name, n.oid::bigint AS object_id, p.oid, '
     "position(('.' || p.proname || '(') IN lower(k.stubs)) AS declared "
     'FROM sys.ora_packages k JOIN pg_namespace n ON n.nspname = k.name '
@@ -2034,7 +2042,9 @@ _ORACLE_DICTIONARY_DDL = (
     'UNION ALL SELECT ora_owner(n.nspname), ora_name(p.proname), NULL::text, '
     'p.oid::bigint, 1, NULL::text, '
     "CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, "
-    "'NO', 'NO', 'NO', 'NO', 'NO', 'DEFINER' "
+    "'NO', 'NO', 'NO', 'NO', 'NO', "
+    # A standalone routine's rights are its own (#1945).
+    "CASE WHEN p.prosecdef THEN 'DEFINER' ELSE 'CURRENT_USER' END "
     'FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace '
     "JOIN pg_description d ON d.objoid = p.oid AND d.classoid = 'pg_proc'::regclass "
     f"AND d.objsubid = 0 WHERE d.description = '{_ROUTINE_MARK}VALID' "
@@ -8194,7 +8204,8 @@ _ROUTINE_HEAD = re.compile(
     r'(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(PROCEDURE|FUNCTION)\s+([\w.]+)\s*'
 )
 _ROUTINE_TAIL = re.compile(
-    r'(?is)\s*(?:RETURN\s+([\w ]+?)\s+)?(?:AS|IS)\s+(.*?)\s*;?\s*$'
+    r'(?is)\s*(?:RETURN\s+([\w ]+?)\s+)?(?:AUTHID\s+(DEFINER|CURRENT_USER)\s+)?'
+    r'(?:AS|IS)\s+(.*?)\s*;?\s*$'
 )
 # CREATE [OR REPLACE] TYPE t ... -- not a TYPE BODY -- whose failure to compile
 # leaves an invalid type behind in Oracle (#1499).
@@ -8327,6 +8338,22 @@ def _routine_mark(name: str, status: str) -> str:
     )
 
 
+def _routine_rights(name: str, authid: str | None) -> str:
+    # Whose rights a standalone routine runs with (#1945). Oracle's default,
+    # AUTHID DEFINER, is its owner's: SECURITY DEFINER, which per-user roles
+    # (#1857) make the owner's role, and the owner's schema first on the path,
+    # so a name the body leaves unqualified is the owner's object in either
+    # mode -- the schema it is created in, or the one its name gives. AUTHID
+    # CURRENT_USER is the caller's rights and path, as PostgreSQL's default.
+    if authid is not None and authid.upper() == 'CURRENT_USER':
+        return ''
+    (schema, _dot, _routine) = name.lower().rpartition('.')
+    path = f'{schema}, {_SEARCH_PATH_TAIL}' if schema else None
+    return ' SECURITY DEFINER SET search_path ' + (
+        f'= {path}' if path else 'FROM CURRENT'
+    )
+
+
 def _translate_routine_ddl(
     sql: str, user_routines: frozenset[str] | None = None, mark: bool = True
 ) -> str:
@@ -8345,7 +8372,7 @@ def _translate_routine_ddl(
     tail = _ROUTINE_TAIL.match(sql, rest)
     if tail is None:
         return sql
-    return_type, body = tail.groups()
+    return_type, authid, body = tail.groups()
     # Oracle allows a routine with no parameters to omit the list entirely
     # (FUNCTION f RETURN NUMBER AS …); PostgreSQL always needs the parentheses, so
     # an absent list (params is None) becomes an empty one (#530).
@@ -8370,7 +8397,9 @@ def _translate_routine_ddl(
         and _guards_no_data_found(name, body, user_routines)
     ):
         block = _guarded_body(block)
-    created = f'{drop} {header} LANGUAGE plpgsql AS $$ {block} $$'
+    # A package's members take the package's rights, not their own.
+    rights = _routine_rights(name, authid) if mark else ''
+    created = f'{drop} {header} LANGUAGE plpgsql{rights} AS $$ {block} $$'
     # A package's member is the package's, listed with it (#1605).
     return f'{created}; {_routine_mark(name, "VALID")}' if mark else created
 
@@ -8382,7 +8411,8 @@ def _translate_routine_ddl(
 # a member as package.member, which PostgreSQL reads as schema.routine.
 _PACKAGE_HEAD = re.compile(
     r'(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:NON)?EDITIONABLE\s+)?PACKAGE\s+'
-    r'(BODY\s+)?(?:([A-Za-z_][\w$#]*)\.)?([A-Za-z_][\w$#]*)\s+(?:AS|IS)\b'
+    r'(BODY\s+)?(?:([A-Za-z_][\w$#]*)\.)?([A-Za-z_][\w$#]*)'
+    r'(?:\s+AUTHID\s+(DEFINER|CURRENT_USER))?\s+(?:AS|IS)\b'
 )
 _DROP_PACKAGE = re.compile(
     r'(?is)^\s*DROP\s+PACKAGE\s+(BODY\s+)?(?:([A-Za-z_][\w$#]*)\.)?'
@@ -8975,6 +9005,19 @@ def _package_routine(
     return translated.removeprefix(f'DROP {member.kind} IF EXISTS {name}; ')
 
 
+def _package_rights(package: str) -> str:
+    # A package's routines run with its owner's rights unless its spec said
+    # AUTHID CURRENT_USER (#1945): each is SECURITY DEFINER then. Every member
+    # already resolves names in the package and then on its creator's path.
+    return (
+        'DO $r$ DECLARE r regprocedure; BEGIN IF (SELECT authid FROM '
+        f"sys.ora_packages WHERE name = '{package}') = 'DEFINER' THEN FOR r IN "
+        'SELECT p.oid::regprocedure FROM pg_proc p WHERE p.pronamespace = '
+        f"'{package}'::regnamespace LOOP EXECUTE format('ALTER ROUTINE %s "
+        "SECURITY DEFINER', r); END LOOP; END IF; END $r$"
+    )
+
+
 def _drop_package_routines(package: str) -> str:
     # Every routine in the package's schema, overloads and private ones too --
     # but its types' own: an index-by table's methods, `t$get`, and a
@@ -9048,7 +9091,7 @@ def _translate_package_ddl(
     head = _PACKAGE_HEAD.match(sql)
     if head is None:
         return sql
-    body, owner, name = head.groups()
+    body, owner, name, authid = head.groups()
     package = name.lower()
     members = _package_members(sql, head.end())
     if members is None:
@@ -9107,6 +9150,7 @@ def _translate_package_ddl(
             f'{missing}; {_drop_package_routines(package)}; {path}; '
             f'{_package_types(package, members, public=False)}; '
             + (f'{created}; ' if created else '')
+            + f'{_package_rights(package)}; '
             + f"UPDATE sys.ora_packages SET body = 'VALID' WHERE name = '{package}'"
         )
     stubs = '; '.join(
@@ -9133,10 +9177,12 @@ def _translate_package_ddl(
         f'{taken}; DROP SCHEMA IF EXISTS {package} CASCADE; CREATE SCHEMA {package}; '
         # Recorded before the package's search path is set: its owner is the
         # schema the session is in.
-        'INSERT INTO sys.ora_packages (name, owner, stubs, spec, body) VALUES '
-        f"('{package}', {owner_sql}, $stubs${stubs}$stubs$, 'VALID', NULL) "
+        'INSERT INTO sys.ora_packages (name, owner, stubs, spec, body, authid) VALUES '
+        f"('{package}', {owner_sql}, $stubs${stubs}$stubs$, 'VALID', NULL, "
+        f"'{(authid or 'DEFINER').upper()}') "
         'ON CONFLICT (name) DO UPDATE SET owner = EXCLUDED.owner, '
-        "stubs = EXCLUDED.stubs, spec = 'VALID', body = NULL; "
+        "stubs = EXCLUDED.stubs, spec = 'VALID', body = NULL, "
+        'authid = EXCLUDED.authid; '
         f'{path}; {_package_types(package, members, public=True)}'
         + (f'; {stubs}' if stubs else '')
     )
@@ -10015,6 +10061,11 @@ def _plsql_compile_error(
     if not sqlstate.startswith('42') and sqlstate != '3F000':
         return None
     primary = _primary_message(exc)
+    if sqlstate == '42501' and _DENIED_RELATION.match(primary):
+        # A table one may not use, met as the block runs, as an invoker's
+        # routine meets another user's (#1945): ORA-00942 or ORA-01031, not
+        # a compile error.
+        return None
     if sqlstate == '3F000':
         schema = _UNKNOWN_SCHEMA.search(primary)
         if schema is None:
@@ -12855,7 +12906,7 @@ class PostgresBackend:
         # not leaves the spec's stand-ins, which now raise ORA-04063; a spec
         # leaves its schema empty, the package INVALID, so a call finds nothing.
         # A body with no spec at all leaves nothing.
-        body, owner, name = head.groups()
+        body, owner, name, _authid = head.groups()
         package = name.lower()
         if body:
             known = self._conn.execute(
