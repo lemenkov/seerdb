@@ -2012,7 +2012,9 @@ def test_the_users_group_may_use_every_schema_the_installation_makes() -> None:
 
 
 @contextlib.contextmanager
-def _per_user_mirror(conninfo: str, admin: str) -> Iterator[Callable[..., Any]]:
+def _per_user_mirror(
+    conninfo: str, admin: str, presents: str = '12.1'
+) -> Iterator[Callable[..., Any]]:
     # A Mirror in per-user mode (#1857) over `conninfo`, with one configured
     # account, `admin`, serving each connection on a thread of its own; yields
     # the login function. Sessions that failed are reported as it ends.
@@ -2033,9 +2035,12 @@ def _per_user_mirror(conninfo: str, admin: str) -> Iterator[Callable[..., Any]]:
                 credentials={admin.upper(): 'adm123'},
                 auth_conninfo=auth,
                 per_user_roles=True,
+                presents=presents,
             )
             try:
-                serve_session(PacketStream(conn), backend)
+                serve_session(
+                    PacketStream(conn), backend, field_version=backend.field_version
+                )
             finally:
                 backend.close()
         except Exception as exc:  # noqa: BLE001 - surfaced to the test thread
@@ -2193,6 +2198,117 @@ def test_per_user_roles_with_an_installer_that_is_no_superuser() -> None:
         pg.execute(f'DROP DATABASE IF EXISTS {database} WITH (FORCE)')
         for role in (user, admin, f'{installer}_mirror_users', installer):
             pg.execute(f'DROP ROLE IF EXISTS {role}')
+        pg.close()
+
+
+@pytest.mark.parametrize('presents', ['12.1', '23ai'])
+def test_per_user_roles_enforce_object_grants(presents: str) -> None:
+    # Object privileges between users, as 23ai has them (#1858): none, and
+    # another user's table is not there; one, and the others are missing by
+    # name; a grant is the owner's to make, or a WITH GRANT OPTION holder's,
+    # and a revoke only of what one granted, cascading down the chain.
+    pid = os.getpid()
+    admin = f'og_adm_{pid}'
+    (owner, user, third) = (f'og_own_{pid}', f'og_b_{pid}', f'og_c_{pid}')
+    pg = psycopg.connect(_CONNINFO, autocommit=True)
+
+    def code(cursor: Any, statement: str) -> str:
+        with pytest.raises(seerdb.DatabaseError) as raised:
+            cursor.execute(statement)
+        return str(raised.value)
+
+    try:
+        with _per_user_mirror(_CONNINFO, admin, presents) as login:
+            adm = login(admin, 'adm123')
+            for name in (owner, user, third):
+                adm.cursor().execute(f'create user {name} identified by pw123')
+            a = login(owner, 'pw123').cursor()
+            b = login(user, 'pw123').cursor()
+            c = login(third, 'pw123').cursor()
+            a.execute('create table t (id number)')
+            a.execute('insert into t values (1)')
+            a.execute('commit')
+            a.execute('create sequence s')
+            a.execute('create procedure p as begin null; end;')
+            t = f'{owner}.t'
+            o = owner.upper()
+
+            def missing(privilege: str) -> str:
+                # 23ai names the privilege; 12.1 says ORA-01031.
+                if presents == '12.1':
+                    return 'ORA-01031: insufficient privileges'
+                return f'ORA-41900: missing {privilege} privilege on "{o}"."T"'
+
+            assert code(b, f'select * from {t}').startswith('ORA-00942')
+            assert code(b, f'insert into {t} values (9)').startswith('ORA-00942')
+            assert code(b, f'select {owner}.s.nextval from dual').startswith(
+                'ORA-00942'
+            )
+            a.execute(f'grant select on t to {user}')
+            b.execute(f'select id from {t}')
+            assert b.fetchall() == [(1,)]
+            assert code(b, f'insert into {t} values (9)') == missing('INSERT')
+            assert code(b, f'grant select on {t} to {third}').startswith('ORA-01031')
+            a.execute(f'revoke select on t from {user}')
+            a.execute(f'grant insert on t to {user}')
+            assert code(b, f'select * from {t}') == missing('READ')
+            b.execute(f'insert into {t} values (2)')
+            b.execute('rollback')
+            a.execute(f'revoke insert on t from {user}')
+            assert code(b, f'select * from {t}').startswith('ORA-00942')
+            a.execute(f'grant select on s to {user}')
+            b.execute(f'select {owner}.s.nextval from dual')
+            assert b.fetchall() == [(1,)]
+            assert code(b, f'begin {owner}.p; end;').startswith('ORA-')
+            a.execute(f'grant execute on p to {user}')
+            b.execute(f'begin {owner}.p; end;')
+            # A replace keeps the grant, as Oracle's does.
+            a.execute('create or replace procedure p as begin null; end;')
+            b.execute(f'begin {owner}.p; end;')
+            a.execute(f'grant all on t to {user} with grant option')
+            b.execute(f'grant select on {t} to {third}')
+            c.execute(f'select count(*) from {t}')
+            assert c.fetchall() == [(1,)]
+            assert code(a, f'revoke select on t from {third}').startswith('ORA-01927')
+            a.execute(f'revoke all on t from {user}')
+            assert code(c, f'select * from {t}').startswith('ORA-00942')
+            assert pg.execute(
+                'SELECT count(*) FROM sys.ora_grants WHERE owner = %s '
+                "AND object_name = 'T'",
+                (o,),
+            ).fetchone() == (0,)
+            a.execute('grant select on t to public')
+            c.execute(f'select count(*) from {t}')
+            assert c.fetchall() == [(1,)]
+            a.execute('revoke select on t from public')
+            for statement, expected in (
+                (f'grant select on t to nobody_{pid}', 'ORA-01917'),
+                (f'grant execute on t to {user}', 'ORA-02224'),
+                (f'grant insert on s to {user}', 'ORA-02205'),
+                (f'grant select on p to {user}', 'ORA-02225'),
+                (f'grant select on not_there to {user}', 'ORA-00942'),
+                (f'grant frobnicate on t to {user}', 'ORA-00990'),
+                (f'grant select, select on t to {user}', 'ORA-01711'),
+                (f'grant select on t to {user}, {user}', 'ORA-01700'),
+                (f'revoke select on t from {user}', 'ORA-01927'),
+            ):
+                assert code(a, statement).startswith(expected), statement
+            a.execute(f'grant select on t to {user}')
+            a.execute('drop table t')
+            assert pg.execute(
+                'SELECT count(*) FROM sys.ora_grants WHERE owner = %s', (o,)
+            ).fetchone() == (2,)
+            for cursor in (a, b, c):
+                cursor.connection.close()
+            for name in (owner, user, third):
+                _wait_sessions_gone(pg, name)
+                adm.cursor().execute(f'drop user {name} cascade')
+            adm.close()
+            assert pg.execute(
+                'SELECT count(*) FROM sys.ora_grants WHERE owner = %s', (o,)
+            ).fetchone() == (0,)
+    finally:
+        _drop_mirror_roles(pg, owner, user, third, admin)
         pg.close()
 
 
@@ -4986,6 +5102,54 @@ def test_a_type_is_visible_to_its_owner_and_its_grantees() -> None:
         other.close()
         admin.execute("DELETE FROM sys.ora_grants WHERE owner = 'OWN1621'")
         for schema in ('own1621', 'oth1621'):
+            admin.execute(f'DROP SCHEMA IF EXISTS {schema} CASCADE')
+        admin.close()
+
+
+@pytest.mark.parametrize(('presents', 'all_count'), [('12.1', 12), ('23ai', 13)])
+def test_a_grant_is_recorded_as_oracle_keys_it(presents: str, all_count: int) -> None:
+    # A grant's record (#1858): its grantor, whether it may be granted on,
+    # the kind of object, and ALL as the privileges the presented release
+    # lists for it -- 23ai adds ASSERTION REFERENCES. A grantee holding one
+    # WITH GRANT OPTION grants it on; revoking it from that grantee takes
+    # what it granted, as Oracle's cascade does.
+    from seerdb.server.backend import BackendError
+
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    for schema in ('own1858', 'oth1858'):
+        admin.execute(f'DROP SCHEMA IF EXISTS {schema} CASCADE')
+        admin.execute(f'CREATE SCHEMA {schema}')
+    owner = PostgresBackend(_CONNINFO, credentials={'OWN1858': 'x'}, presents=presents)
+    other = PostgresBackend(_CONNINFO, credentials={'OTH1858': 'x'}, presents=presents)
+
+    def recorded() -> list[tuple]:
+        return admin.execute(
+            'SELECT grantee, grantor, grantable, object_type, count(*) '
+            "FROM sys.ora_grants WHERE owner = 'OWN1858' "
+            'GROUP BY 1, 2, 3, 4 ORDER BY 1'
+        ).fetchall()
+
+    try:
+        owner.authenticate('OWN1858')
+        other.authenticate('OTH1858')
+        owner.execute('CREATE TABLE t1858 (n NUMBER)')
+        owner.execute('GRANT ALL ON t1858 TO oth1858 WITH GRANT OPTION')
+        assert recorded() == [('OTH1858', 'OWN1858', 'YES', 'TABLE', all_count)]
+        other.execute('GRANT SELECT ON own1858.t1858 TO PUBLIC')
+        assert recorded() == [
+            ('OTH1858', 'OWN1858', 'YES', 'TABLE', all_count),
+            ('PUBLIC', 'OTH1858', 'NO', 'TABLE', 1),
+        ]
+        with pytest.raises(BackendError) as raised:
+            owner.execute('REVOKE SELECT ON t1858 FROM PUBLIC')
+        assert raised.value.ora_code == 1927
+        owner.execute('REVOKE ALL ON t1858 FROM oth1858')
+        assert recorded() == []
+    finally:
+        owner.close()
+        other.close()
+        admin.execute("DELETE FROM sys.ora_grants WHERE owner = 'OWN1858'")
+        for schema in ('own1858', 'oth1858'):
             admin.execute(f'DROP SCHEMA IF EXISTS {schema} CASCADE')
         admin.close()
 

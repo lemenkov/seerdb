@@ -298,6 +298,46 @@ A user created with SQL gets ORA-01031 for these. The Mirror runs them on a
 connection of the connection role. `DROP USER` drops the user's role and what it
 owns, and refuses a user with a session open (ORA-01940), as Oracle does.
 
+**Object grants.** `GRANT` and `REVOKE` on a table, view, sequence, procedure,
+function, package or type become PostgreSQL's own, so another user's object
+needs a grant, as on Oracle:
+
+| Oracle privilege | on | in PostgreSQL |
+|---|---|---|
+| `SELECT`, `READ` | table, view | `SELECT` |
+| `INSERT`, `UPDATE`, `DELETE`, `REFERENCES` | table, view | the same |
+| `SELECT` | sequence | `USAGE, SELECT` |
+| `EXECUTE` | procedure, function | `EXECUTE` on every overload |
+| `EXECUTE` | package | `USAGE` on its schema, `EXECUTE` on its routines, `USAGE` on its types |
+| `EXECUTE` | type | `USAGE` |
+
+- **What is only recorded:** the privileges PostgreSQL has no counterpart
+  for (`ALTER`, `INDEX`, `DEBUG`, `FLASHBACK`, …).
+- **Schema access:** a grant also gives `USAGE` on the owner's schema, taken
+  back once the grantee holds nothing else there from that grantor.
+- **`ALL`:** recorded as the privileges the presented release lists for the
+  object.
+- **`WITH GRANT OPTION`:** a user may pass on a privilege it holds this way.
+  `REVOKE` takes away what the grantee passed on, as Oracle's cascade does,
+  and takes only what one granted oneself (ORA-01927).
+- **Replacing an object:** a grant survives `CREATE OR REPLACE`. A `DROP`
+  takes it.
+- **Errors:** a user with no privilege on another user's table gets ORA-00942.
+  With some privilege but not the one used, it gets ORA-41900 when the Mirror
+  presents 23ai (`missing INSERT privilege on "A"."T"`), and ORA-01031 when it
+  presents 12.1.
+- **ROWID:** an `INSERT`, `UPDATE` or `DELETE` on a table where the user lacks
+  `SELECT` reports no ROWID, because PostgreSQL's `RETURNING` needs `SELECT`.
+- **Not yet:**
+  - a routine runs with its caller's rights, not its owner's as Oracle's
+    does by default
+    ([#1945](https://github.com/seerdb/seerdb/issues/1945));
+  - column grants
+    ([#1946](https://github.com/seerdb/seerdb/issues/1946)).
+
+In single-role mode, grants are checked and recorded the same way, but every
+user is the one role, so they enforce nothing beyond who sees a type.
+
 A login connects to PostgreSQL twice, as the connection role and then as the
 user's, so it takes longer than in single-role mode.
 
