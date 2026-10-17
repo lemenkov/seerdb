@@ -263,6 +263,39 @@ not protect against a man in the middle; use TLS for that.
 
 ## Mirror over PostgreSQL
 
+### Choosing a mode
+
+| | single-role (the default) | per-user roles (`--per-user-roles`) |
+|---|---|---|
+| PostgreSQL role of a session | the connection string's, shared by every account | the user's own, one per Mirror user |
+| who sees whose objects | everyone everything, by naming the schema | as `GRANT` allows, enforced by PostgreSQL |
+| who may manage accounts, directories, editions | every account | the configured accounts only |
+| needs | PostgreSQL with orafce | PostgreSQL 16+, a `CREATEROLE` connection role, `--auth-conninfo` |
+| fits | one application, or users who trust each other | users who must not see each other's data |
+
+Both modes translate the same SQL and PL/SQL; only who may do what differs.
+
+### A deployment, step by step
+
+1. **A database** with orafce, and pgvector if the application uses `VECTOR`
+   (*What the database needs*).
+2. **The connection role:** the Mirror's own, owning that database, not a
+   superuser (*Which role to connect as*). Give it `CREATEROLE` for per-user
+   roles.
+3. **The auth role**, for `--auth-conninfo`: where the accounts are kept, in a
+   schema the connection role cannot read (*Accounts*). It may be the
+   connection role in per-user mode, where no session runs as it.
+4. **The accounts:** the administrators in the config file's `[clients]`. The
+   other users are made with `CREATE USER` through the Mirror.
+5. **TLS:** a certificate from a proper CA (`--tls-cert`, `--tls-key`),
+   because the Mirror listens beyond localhost. Add `--encryption required` if
+   no plaintext client may connect at all.
+6. **The listen address:** a trusted network only, until the security review
+   closes (*Security*).
+7. **The config file,** readable by the account that runs the Mirror only, and
+   the Mirror run under a service manager that restarts it.
+8. **Limits** on the PostgreSQL side (*Resource limits*).
+
 ### What the database needs
 
 - **PostgreSQL**, tested on 16.
@@ -433,6 +466,48 @@ first, which makes or repairs the user's role, and then as the user's:
 - a proxy login, whose target is only known later;
 - a login whose role fails its checks.
 
+### Upgrades
+
+The Mirror keeps two things in its database:
+- the dictionary: views, helper functions and types;
+- the data: accounts, users' roles, recorded grants and columns, object
+  tables.
+
+A newer release connecting to the database installs its own dictionary, and
+brings the data up to date in steps, each recorded in the database. So upgrading
+is installing the new seerdb and restarting the Mirror, with nothing to run by
+hand.
+
+- **One release per database at a time.** Two releases sharing a database
+  each install their own dictionary in turn. Once a newer one has moved the
+  data on, the older refuses its sessions rather than misread it. Upgrade every
+  Mirror serving a database together.
+- **Within a major release:** a database set up by a released Mirror keeps
+  working after every upgrade (*Stability*).
+- **From the preview releases:** there is no upgrade path. Once general
+  availability arrives, a database a preview release set up is refused with
+  *set it up afresh*.
+
+Take a backup of the database before upgrading, as for any schema change.
+
+### Resource limits
+
+The Mirror bounds nothing of its own yet: the number of sessions, the size of a
+statement and the size of a LOB are open items of the security review (#1687).
+Bound them on the PostgreSQL side meanwhile:
+
+- **Sessions:** each Mirror session holds one PostgreSQL connection, and a
+  login also opens short-lived ones to the auth database. `max_connections`
+  caps them all. In single-role mode, so does `CONNECTION LIMIT` on the
+  connection role. With per-user roles, each session runs as its user's role
+  instead.
+- **Long statements and idle transactions:** set `statement_timeout` and
+  `idle_in_transaction_session_timeout` on the database
+  (`ALTER DATABASE app SET ...`), so they apply to every user's role.
+- **Memory:** a statement's rows and a LOB's value pass through the Mirror's
+  process; bound it with the service manager (for example `MemoryMax=` under
+  systemd).
+
 ### Native PostgreSQL
 
 With `--native-sql` (`native_sql = yes` in the config file), a statement can
@@ -478,24 +553,31 @@ Uses:
 
 ## Security
 
-The Mirror is experimental, and a security review (#1687) found work still to
-do before it can face clients you don't trust. Until those fixes land:
+General availability waits on a security review (#1687), and the fixes it
+brings, each filed as an issue of the milestone
+[mirror-security-hardening](https://github.com/seerdb/seerdb/milestone/52).
+Until it closes, run the Mirror as follows:
 
 - **Who can reach it.** A client can tie the Mirror up before logging in: hold
-  connections open, or send packets it handles badly. Keep the default listen
-  address (`127.0.0.1`), or put the Mirror behind a firewall that admits only
-  your own hosts.
-- **Who logs in.** Every account can do more than an Oracle user of the same
-  name could: manage the other accounts, including their passwords, and read
-  any file the PostgreSQL role can, through DIRECTORY objects. Serve only
-  accounts that may see each other's data (*One tenant per database*).
-- **What the role may do.** Native SQL makes the PostgreSQL role the real
-  boundary (*Which role to connect as*). Never a superuser; no server-file or
+  connections open, or send packets it handles badly. Nothing in the Mirror
+  bounds that yet (*Resource limits*). Keep the default listen address
+  (`127.0.0.1`), or put the Mirror behind a firewall that admits only your own
+  hosts.
+- **Who logs in.**
+  - In single-role mode, every account can do more than an Oracle user of the
+    same name could: manage the other accounts, including their passwords, and
+    read any file the PostgreSQL role can, through DIRECTORY objects. Serve
+    only accounts that may see each other's data (*One tenant per database*).
+  - With per-user roles, those are the configured administrators' alone, and
+    PostgreSQL keeps the users apart (*Per-user roles*).
+- **What the role may do.** The connection role is the boundary of
+  single-role mode, and with native SQL a client can use whatever it may
+  (*Which role to connect as*). Never a superuser; no server-file or
   server-program privileges unless you need them.
 - **The wire.** Use TLS (`--tls-cert`) beyond localhost. ANO alone doesn't
   authenticate the server.
 
-This section shrinks as the fixes land.
+This section is revised when the review closes.
 
 ## Migration profile
 
@@ -602,36 +684,33 @@ SEERDB_TEST_USER=... SEERDB_TEST_PASSWORD=... MIRROR_PG='host=... dbname=...' \
     python3 tools/mirror_benchmark.py --scale 2000
 ```
 
-**Baseline, 2026-10-14**, scale 2000, measured with:
+**Measured 2026-10-17**, scale 2000, with:
 - the client and the Mirror on one host;
-- Oracle 23ai and PostgreSQL 16 on another, across a LAN (about 6.6 ms per round trip);
+- Oracle 23ai and PostgreSQL 16 on another, across a LAN;
 - ratios to Oracle directly.
 
 | scenario | direct | passthrough | passthrough + ANO | over PG | over PG + ANO |
 |---|---|---|---|---|---|
-| connect + close (20) | 1.8 s | 1.3x | 2.3x | 7.1x | 8.4x |
-| a one-row query (200) | 1.4 s | 1.0x | 1.0x | 4.4x | 4.7x |
-| a PL/SQL call (200) | 1.2 s | 0.9x | 1.0x | 4.2x | 4.3x |
-| an insert, row by row (2000) | 12 s | 1.1x | 1.1x | 2.8x | 3.0x |
-| `executemany` (2000 rows) | 0.05 s | 3.4x | 3.1x | 32x | 32x |
-| `fetchall` (2000 rows) | 0.15 s | 1.2x | 1.1x | 0.7x | 0.9x |
-| a 1 MiB CLOB written (5) | 2.6–4.4 s | 3.9x | 3.5x | 1.8x | 1.9x |
-| a 1 MiB CLOB read (5) | 1.2–1.5 s | 1.1x | 1.6x | 0.5x | 0.6x |
+| connect + close (20) | 1.9 s | 1.1x | 2.1x | 1.9x | 2.4x |
+| a one-row query (200) | 1.3 s | 1.1x | 1.0x | 1.1x | 1.1x |
+| a PL/SQL call (200) | 1.1 s | 1.3x | 1.1x | 1.1x | 1.5x |
+| an insert, row by row (2000) | 11.7 s | 1.0x | 1.1x | 1.3x | 1.2x |
+| `executemany` (2000 rows) | 0.05 s | 3.0x | 2.7x | 5.0x | 5.2x |
+| `fetchall` (2000 rows) | 0.16 s | 1.1x | 1.1x | 0.3x | 0.3x |
+| a 1 MiB CLOB written (5) | 3.3 s | 3.0x | 3.0x | 2.5x | 3.1x |
+| a 1 MiB CLOB read (5) | 1.0 s | 1.4x | 1.5x | 0.7x | 0.8x |
 
-The passthrough and over-PG columns come from separate runs on the same hosts.
 Read them as follows:
 
 - **The passthrough costs almost nothing per call.** Its exceptions are
   `executemany` and LOB writes.
-- **Over PostgreSQL, each Oracle call costs several PostgreSQL round trips**
-  (#1331), so a small call is about 4x Oracle's across a LAN and a connect about
-  7x, while bulk fetches and LOB reads keep pace. With PostgreSQL on the
-  Mirror's own host, small calls are fast, but `executemany` stays slow (about
-  20x).
+- **Over PostgreSQL, a small call now costs about what Oracle's does.** On
+  2026-10-14, on the same hosts, a one-row query took 4.4x and a connect 7.1x,
+  because each Oracle call cost several PostgreSQL round trips. The work of
+  milestone mirror-pg-performance brought that to about one (#1331, #1939).
+  `executemany` is still 5x, and bulk fetches and LOB reads are faster than
+  Oracle's.
 - **Encryption** costs most at connect (the key exchange), and little per call.
-
-These are the numbers the performance work (milestone mirror-pg-performance)
-measures against.
 
 ## Known limits
 
@@ -650,8 +729,10 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
   inside one fails.
 - **Object types** have no methods. A collection computed in a query fetches as
   a plain array.
-- **Privileges** cover type lookup only (see *One tenant per database*).
-  System privileges and roles are accepted and do nothing.
+- **Privileges.** Object grants are enforced with per-user roles only. In
+  single-role mode they are recorded, and decide only who sees a type (*One
+  tenant per database*). System privileges and roles are accepted and do
+  nothing.
 - **DIRECTORY and BFILE.** Files are read on the PostgreSQL host. `DBMS_LOB`'s
   file routines are not there.
 - **Editions** are kept by name only; objects are not versioned per edition.
