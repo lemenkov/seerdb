@@ -173,14 +173,16 @@ honest edge of this adapter:
   ``connection.transaction_priority``, is kept and reported back as 23ai
   reports it, but PostgreSQL has no priority transactions: nothing rolls back a
   lower-priority transaction holding a lock a higher one waits on.
-- **Privileges, for type lookup only** -- every Mirror user is the backend's
-  one PostgreSQL role. A GRANT or REVOKE on an object is recorded
-  (``sys.ora_grants``), and a user sees another user's type -- in ALL_TYPES,
+- **Object privileges** -- a GRANT or REVOKE on an object is checked and
+  recorded as Oracle keys it (``sys.ora_grants``: grantor, GRANT OPTION, kind
+  of object), and a user sees another user's type -- in ALL_TYPES,
   ALL_TYPE_ATTRS, ALL_COLL_TYPES and a lookup by name, as ``gettype()`` makes
-  -- only once granted EXECUTE on it. Using a type through a column or a bind
-  is not checked, and table privileges are not kept: another user's table
-  named with its schema reads as one's own. A system privilege or a role
-  granted is a no-op.
+  -- only once granted EXECUTE on it. With per-user roles (#1857) it is
+  PostgreSQL's own GRANT or REVOKE too, so another user's object needs one
+  (#1858); without them every user is the one role, and another user's table
+  named with its schema reads as one's own. A routine runs with its caller's
+  rights, not its owner's (#1945), and a column grant is not kept (#1946). A
+  system privilege or a role granted is a no-op.
 - **Object types, partly** — ``CREATE TYPE ... AS OBJECT`` is a PostgreSQL
   composite, listed in ``all_types`` / ``all_type_attrs`` under an OID that is the
   composite's own ``pg_type`` oid, zero-padded to Oracle's 16 bytes. An object
@@ -1885,13 +1887,36 @@ _ORACLE_DICTIONARY_DDL = (
     # reflection raises ORA-00942. Options are reported as Oracle's defaults for now.
     """CREATE OR REPLACE VIEW sys.all_tab_identity_cols AS SELECT ora_owner(n.nspname) AS owner, ora_name(c.relname) AS table_name, ora_column_name(a.attrelid, a.attname) AS column_name, CASE a.attidentity WHEN 'a' THEN 'ALWAYS' ELSE 'BY DEFAULT' END AS generation_type, ora_name(c.relname || '_' || a.attname || '_seq') AS sequence_name, 'START WITH: 1, INCREMENT BY: 1, MAX_VALUE: 9999999999999999999999999999, MIN_VALUE: 1, CYCLE_FLAG: N, CACHE_SIZE: 20, ORDER_FLAG: N' AS identity_options FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE a.attidentity IN ('a','d') AND NOT a.attisdropped AND a.attnum>0 AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') """
     f'AND {_reachable_relation("c.oid")};'
-    # Object privileges a GRANT gave (#1621): owner, object and grantee as
-    # Oracle names them. A user sees a type -- in ALL_TYPES and the views like
-    # it, and by name, as gettype() looks one up -- that is its own, PUBLIC's
-    # or SYS's, or one it or PUBLIC was granted EXECUTE on.
+    # Object privileges a GRANT gave (#1621): owner, object, grantee and
+    # grantor as Oracle names them, whether the grantee may grant it on, and
+    # the kind of object (#1858). A user sees a type -- in ALL_TYPES and the
+    # views like it, and by name, as gettype() looks one up -- that is its
+    # own, PUBLIC's or SYS's, or one it or PUBLIC was granted EXECUTE on.
     'CREATE TABLE IF NOT EXISTS sys.ora_grants (owner text, object_name text, '
     'privilege text, grantee text, '
     'PRIMARY KEY (owner, object_name, privilege, grantee));'
+    # A record from before #1858 has no grantor: its owner's.
+    'ALTER TABLE sys.ora_grants ADD COLUMN IF NOT EXISTS grantor text, '
+    "ADD COLUMN IF NOT EXISTS grantable text NOT NULL DEFAULT 'NO', "
+    'ADD COLUMN IF NOT EXISTS object_type text;'
+    'UPDATE sys.ora_grants SET grantor = owner WHERE grantor IS NULL;'
+    'DO $g$ BEGIN IF (SELECT array_length(conkey, 1) FROM pg_constraint WHERE '
+    "conrelid = 'sys.ora_grants'::regclass AND contype = 'p') = 4 THEN "
+    'ALTER TABLE sys.ora_grants DROP CONSTRAINT ora_grants_pkey, '
+    'ALTER COLUMN grantor SET NOT NULL, ADD CONSTRAINT ora_grants_pkey '
+    'PRIMARY KEY (owner, object_name, privilege, grantee, grantor); '
+    'END IF; END $g$;'
+    # A REVOKE's cascade (#1858): the grants made further down the chain, by
+    # a grantor that holds the privilege WITH GRANT OPTION no more. Neither
+    # the revoker nor the owner made those, so no write policy lets the
+    # session's role delete them; and only those go.
+    'CREATE OR REPLACE FUNCTION sys.ora_grants_cascade(owner text, name text) '
+    'RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog '
+    'AS $$ BEGIN LOOP DELETE FROM sys.ora_grants g WHERE g.owner = $1 '
+    'AND g.object_name = $2 AND g.grantor <> $1 AND NOT EXISTS (SELECT 1 '
+    'FROM sys.ora_grants h WHERE h.owner = $1 AND h.object_name = $2 '
+    "AND h.privilege = g.privilege AND h.grantee IN (g.grantor, 'PUBLIC') "
+    "AND h.grantable = 'YES'); EXIT WHEN NOT FOUND; END LOOP; END $$;"
     'CREATE OR REPLACE FUNCTION sys.ora_type_visible(owner text, type_name text) '
     "RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT $1 IN ('PUBLIC', 'SYS', "
     "sys.sys_context('userenv', 'session_user')) OR EXISTS (SELECT 1 FROM "
@@ -2412,7 +2437,16 @@ def _record_owner_tests() -> dict[str, str | None]:
         'ora_collection_elements': owner('pg_type', 'typowner', 'oid', '{t}.typid'),
         'ora_packages': owner('pg_namespace', 'nspowner', 'nspname', '{t}.name'),
         'ora_plsql_types': owner('pg_namespace', 'nspowner', 'nspname', '{t}.package'),
-        'ora_grants': owner('pg_namespace', 'nspowner', 'nspname', 'lower({t}.owner)'),
+        # The owner's, or the grantor's own grant: one it may make, holding
+        # USAGE on the owner's schema WITH GRANT OPTION, as a grant made WITH
+        # GRANT OPTION gives it (#1858).
+        'ora_grants': '('
+        + owner('pg_namespace', 'nspowner', 'nspname', 'lower({t}.owner)')
+        + " OR (SELECT pg_catalog.pg_has_role(r.oid, 'USAGE') AND "
+        "pg_catalog.has_schema_privilege(r.oid, n.oid, 'USAGE WITH GRANT OPTION') "
+        'FROM pg_catalog.pg_roles r, pg_catalog.pg_namespace n '
+        'WHERE r.rolname = pg_catalog.lower({t}.grantor) '
+        'AND n.nspname = pg_catalog.lower({t}.owner)))',
         'ora_sessions': None,
         'ora_directories': None,
         'ora_editions': None,
@@ -5039,14 +5073,86 @@ _ORAFCE_SESSION_SETTINGS: Final = (
 )
 
 
-# GRANT / REVOKE of privileges ON an object (#1621): what sys.ora_grants keeps.
-# A system privilege or a role (GRANT CREATE SESSION TO u) names no ON, and
-# stays the no-op every GRANT was.
+# GRANT / REVOKE of privileges ON an object (#1621, #1858): recorded in
+# sys.ora_grants, as Oracle keys a grant -- object, privilege, grantee and
+# grantor -- and in per-user mode run as PostgreSQL's own (#1857). A system
+# privilege or a role (GRANT CREATE SESSION TO u) names no ON, and stays the
+# no-op every GRANT was.
 _OBJECT_GRANT = re.compile(
     r'(?is)\s*(GRANT|REVOKE)\s+(.+?)\s+ON\s+((?:"[^"]+"|[\w$#]+)'
     r'(?:\s*\.\s*(?:"[^"]+"|[\w$#]+))?)\s+(TO|FROM)\s+(.+?)'
-    r'(?:\s+WITH\s+(?:GRANT|HIERARCHY)\s+OPTION)?\s*;?\s*$'
+    r'(\s+WITH\s+(?:GRANT|HIERARCHY)\s+OPTION)?\s*;?\s*$'
 )
+# The errors a GRANT or REVOKE gives, measured on 23ai and 21c (#1858).
+_ORA_INVALID_PRIVILEGE = 990
+_ORA_DUPLICATE_USERNAME = 1700
+_ORA_DUPLICATE_PRIVILEGE = 1711
+_ORA_UNKNOWN_GRANTEE = 1917
+_ORA_NOT_GRANTED_BY_YOU = 1927
+_ORA_SEQUENCE_PRIVILEGE = 2205
+_ORA_TABLE_PRIVILEGE = 2224
+_ORA_EXECUTABLE_PRIVILEGE = 2225
+# 23ai's error for a privilege missing on an object one holds another on;
+# before, ORA-01031.
+_ORA_MISSING_PRIVILEGE = 41900
+# What ALL [PRIVILEGES] stands for on each kind of object: the privileges
+# Oracle lists for it, and the only ones it may be granted. 23ai adds
+# ASSERTION REFERENCES to a table's.
+_OBJECT_PRIVILEGES: Final = {
+    'TABLE': (
+        'ALTER',
+        'DEBUG',
+        'DELETE',
+        'FLASHBACK',
+        'INDEX',
+        'INSERT',
+        'ON COMMIT REFRESH',
+        'QUERY REWRITE',
+        'READ',
+        'REFERENCES',
+        'SELECT',
+        'UPDATE',
+    ),
+    'VIEW': (
+        'DEBUG',
+        'DELETE',
+        'FLASHBACK',
+        'INSERT',
+        'MERGE VIEW',
+        'ON COMMIT REFRESH',
+        'QUERY REWRITE',
+        'READ',
+        'REFERENCES',
+        'SELECT',
+        'UPDATE',
+    ),
+    'SEQUENCE': ('ALTER', 'SELECT'),
+    'PROCEDURE': ('DEBUG', 'EXECUTE'),
+    'FUNCTION': ('DEBUG', 'EXECUTE'),
+    'PACKAGE': ('DEBUG', 'EXECUTE'),
+    'TYPE': ('DEBUG', 'EXECUTE'),
+}
+_ASSERTION_REFERENCES: Final = 'ASSERTION REFERENCES'
+# Every object privilege Oracle knows, valid on some kind of object or not.
+_KNOWN_PRIVILEGES: Final = frozenset(
+    {p for privileges in _OBJECT_PRIVILEGES.values() for p in privileges}
+    | {_ASSERTION_REFERENCES, 'UNDER', 'WRITE', 'KEEP SEQUENCE', 'USE'}
+)
+# What an Oracle privilege is in PostgreSQL, by the kind of object; one with
+# no counterpart there (ALTER, INDEX, DEBUG, ...) is recorded only.
+_PG_PRIVILEGES: Final = {
+    'TABLE': {
+        'SELECT': 'SELECT',
+        'READ': 'SELECT',
+        'INSERT': 'INSERT',
+        'UPDATE': 'UPDATE',
+        'DELETE': 'DELETE',
+        'REFERENCES': 'REFERENCES',
+    },
+    'SEQUENCE': {'SELECT': 'USAGE, SELECT'},
+    'EXECUTABLE': {'EXECUTE': 'EXECUTE'},
+}
+_PG_PRIVILEGES['VIEW'] = _PG_PRIVILEGES['TABLE']
 
 
 def _oracle_name(name: str) -> str:
@@ -5055,37 +5161,116 @@ def _oracle_name(name: str) -> str:
     return name[1:-1] if name.startswith('"') else name.upper()
 
 
-def _object_grant(match: re.Match[str]) -> str:
-    # The rows a GRANT adds to sys.ora_grants, or a REVOKE takes away (#1621):
-    # one per privilege and grantee. ALL [PRIVILEGES] is kept as ALL.
-    (verb, privileges, target, _to, grantees) = match.groups()
-    parts = [p for p in re.split(r'\s*\.\s*', target.strip())]
-    owner_sql = (
-        sql.Literal(_oracle_name(parts[0])).as_string()
-        if len(parts) == 2
-        else 'sys.ora_owner(current_schema())'
-    )
-    name = sql.Literal(_oracle_name(parts[-1])).as_string()
-    privs = [
-        'ALL' if p.strip().upper().startswith('ALL') else p.strip().upper()
-        for p in privileges.split(',')
-    ]
-    users = [_oracle_name(g) for g in grantees.split(',')]
-    rows = [
-        f'({owner_sql}, {name}, {sql.Literal(p).as_string()}, '
-        f'{sql.Literal(u).as_string()})'
-        for p in privs
-        for u in users
-    ]
-    if verb.upper() == 'GRANT':
-        return (
-            'INSERT INTO sys.ora_grants (owner, object_name, privilege, grantee) '
-            f'VALUES {", ".join(rows)} ON CONFLICT DO NOTHING'
+def _privilege_kind_error(kind: str, release: tuple[int, int]) -> BackendError:
+    # A privilege the kind of object cannot be granted, in the presented
+    # release's words.
+    late = release >= (23, 0)
+    if kind in ('TABLE', 'VIEW'):
+        return BackendError(
+            'invalid privilege on a table'
+            if late
+            else 'EXECUTE privilege not allowed for tables',
+            ora_code=_ORA_TABLE_PRIVILEGE,
         )
-    return (
-        'DELETE FROM sys.ora_grants WHERE (owner, object_name, privilege, grantee) '
-        f'IN ({", ".join(rows)})'
+    if kind == 'SEQUENCE':
+        return BackendError(
+            'Only SELECT and ALTER object privileges are valid for sequences.'
+            if late
+            else 'only SELECT and ALTER privileges are valid for sequences',
+            ora_code=_ORA_SEQUENCE_PRIVILEGE,
+        )
+    return BackendError(
+        'You can only grant or revoke EXECUTE and DEBUG object privileges for '
+        'this object.'
+        if late
+        else 'only EXECUTE and DEBUG privileges are valid for procedures',
+        ora_code=_ORA_EXECUTABLE_PRIVILEGE,
     )
+
+
+def _not_granted_by_you(release: tuple[int, int]) -> BackendError:
+    return BackendError(
+        'A privilege cannot be revoked if you did not grant it.'
+        if release >= (23, 0)
+        else 'cannot REVOKE privileges you did not grant',
+        ora_code=_ORA_NOT_GRANTED_BY_YOU,
+    )
+
+
+def _granted_privileges(written: str) -> list[str] | None:
+    # The privileges a GRANT or REVOKE lists, upper-cased and their spaces
+    # made single; None for ALL [PRIVILEGES]. ORA-00990 for one Oracle does
+    # not know, ORA-01711 for one listed twice.
+    listed = [' '.join(p.split()).upper() for p in written.split(',')]
+    if listed in (['ALL'], ['ALL PRIVILEGES']):
+        return None
+    for privilege in listed:
+        if privilege not in _KNOWN_PRIVILEGES:
+            raise BackendError(
+                'missing or invalid privilege', ora_code=_ORA_INVALID_PRIVILEGE
+            )
+    if len(set(listed)) != len(listed):
+        raise BackendError(
+            'duplicate privilege listed', ora_code=_ORA_DUPLICATE_PRIVILEGE
+        )
+    return listed
+
+
+def _grantees(written: str) -> list[str]:
+    # The users a GRANT or REVOKE names, as Oracle names them; ORA-01700 for
+    # one named twice.
+    names = [_oracle_name(g) for g in written.split(',')]
+    if len(set(names)) != len(names):
+        raise BackendError(
+            'duplicate username in list', ora_code=_ORA_DUPLICATE_USERNAME
+        )
+    return names
+
+
+# The object a GRANT names, in its owner's schema: its kind, as Oracle's
+# ALL_TAB_PRIVS lists it, and what PostgreSQL grants on -- a relation, each
+# overload of a routine, a type and its REF companion, a package's schema.
+# A name as written or folded, as the DDL that made it left it.
+_GRANTED_OBJECT: Final = (
+    "SELECT kind, target, grant_on FROM (SELECT CASE c.relkind WHEN 'v' THEN "
+    "'VIEW' WHEN 'S' THEN 'SEQUENCE' ELSE 'TABLE' END AS kind, "
+    'c.oid::regclass::text AS target, '
+    "CASE c.relkind WHEN 'S' THEN 'SEQUENCE' ELSE 'TABLE' END AS grant_on, "
+    '1 AS rank FROM pg_class c WHERE c.relnamespace = '
+    'to_regnamespace(%(schema)s::text) AND c.relname IN (%(name)s::text, lower(%(name)s::text)) '
+    "AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f') "
+    "UNION ALL SELECT 'PACKAGE', quote_ident(k.name), 'SCHEMA', 2 "
+    'FROM sys.ora_packages k '
+    'WHERE k.owner = %(owner)s::text AND upper(k.name) = upper(%(name)s::text) '
+    "UNION ALL SELECT CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' "
+    "END, p.oid::regprocedure::text, 'ROUTINE', 3 FROM pg_proc p "
+    'JOIN pg_description d ON '
+    "d.objoid = p.oid AND d.classoid = 'pg_proc'::regclass AND d.objsubid = 0 "
+    f"AND d.description LIKE '{_ROUTINE_MARK}%%' WHERE p.pronamespace = "
+    'to_regnamespace(%(schema)s::text) AND p.proname IN (%(name)s::text, lower(%(name)s::text)) '
+    "UNION ALL SELECT 'TYPE', t.oid::regtype::text, CASE t.typtype WHEN 'd' "
+    "THEN 'DOMAIN' ELSE 'TYPE' END, 4 + (t.typname LIKE "
+    "'%%$ref')::int FROM pg_type t LEFT JOIN pg_class c ON c.oid = t.typrelid "
+    'LEFT JOIN pg_type b ON b.oid = t.typbasetype WHERE t.typnamespace = '
+    'to_regnamespace(%(schema)s::text) AND t.typname IN (%(name)s::text, lower(%(name)s::text), '
+    "%(name)s::text || '$ref', lower(%(name)s::text) || '$ref') AND (t.typtype = 'c' AND "
+    "c.relkind = 'c' OR t.typtype = 'd' AND b.typcategory = 'A')) o "
+    'ORDER BY rank, target'
+)
+
+
+# The DDL after which an object's grants need following (#1858): a CREATE
+# OR REPLACE, which PostgreSQL makes a DROP and a CREATE that lose them, and
+# a DROP, whose object's grants go with it in Oracle. A body is its spec's.
+_GRANT_NAME = r'((?:"[^"]+"|[\w$#]+)(?:\s*\.\s*(?:"[^"]+"|[\w$#]+))?)'
+_REPLACED_OBJECT = re.compile(
+    r'(?is)\s*CREATE\s+OR\s+REPLACE\s+(?:(?:NON)?EDITIONABLE\s+)?'
+    rf'(?:PROCEDURE|FUNCTION|PACKAGE(?:\s+BODY)?|TYPE(?:\s+BODY)?)\s+{_GRANT_NAME}'
+)
+_DROPPED_OBJECT = re.compile(
+    r'(?is)\s*DROP\s+(?:TABLE|VIEW|MATERIALIZED\s+VIEW|SEQUENCE|PROCEDURE|'
+    rf'FUNCTION|PACKAGE|TYPE)\s+(?!BODY\b){_GRANT_NAME}'
+)
 
 
 # CREATE / DROP EDITION and ALTER SESSION SET EDITION (#1662).
@@ -5210,9 +5395,6 @@ def _sql_text(value: str) -> str:
 
 
 def _translate_admin(sql: str) -> str:
-    m = _OBJECT_GRANT.match(sql)
-    if m:
-        return _object_grant(m)
     edition = _edition_statement(sql)
     if edition is not None:
         return edition
@@ -9855,6 +10037,23 @@ def _plsql_compile_error(
 _PGVECTOR_DIMENSIONS = re.compile(r'expected (\d+) dimensions, not (\d+)')
 
 
+# A relation's privilege PostgreSQL refused: "permission denied for table t".
+_DENIED_RELATION = re.compile(
+    r'permission denied for (?:table|view|materialized view|sequence) (.+)$'
+)
+
+
+class _PrivilegeDenied(BackendError):
+    # ORA-01031 for a relation's privilege PostgreSQL refused, the relation
+    # named, so a per-user session can tell, once the statement is undone,
+    # whether the user holds any privilege on it at all (#1858).
+    def __init__(self, relation: str) -> None:
+        super().__init__(
+            'insufficient privileges', ora_code=ORA_INSUFFICIENT_PRIVILEGES
+        )
+        self.relation = relation
+
+
 def _backend_error(
     exc,
     *,
@@ -9902,6 +10101,9 @@ def _backend_error(
     if application is not None:
         # The user's own text, which the Mirror prefixes with the code.
         return BackendError(application[1], ora_code=code, error_offset=None)
+    denied = _DENIED_RELATION.match(_primary_message(exc))
+    if code == ORA_INSUFFICIENT_PRIVILEGES and denied is not None:
+        return _PrivilegeDenied(denied.group(1))
     return BackendError(
         _ORA_MESSAGE.get(code, str(exc).strip()),
         ora_code=code,
@@ -12124,10 +12326,61 @@ class PostgresBackend:
                 lambda: self._reported(
                     sql,
                     lambda: self._replanned(
-                        lambda: self._execute_statement(sql, binds)
+                        lambda: self._privilege_refined(
+                            sql, lambda: self._execute_statement(sql, binds)
+                        )
                     ),
                 )
             )
+        )
+
+    def _privilege_refined(self, statement: str, run: Callable[[], Result]) -> Result:
+        # A privilege refused on another user's relation in per-user mode
+        # (#1858), as Oracle tells it: ORA-00942 when the user holds no
+        # privilege on it at all, else 23ai's ORA-41900 naming the privilege
+        # the statement needed, or before 23ai ORA-01031.
+        try:
+            return run()
+        except _PrivilegeDenied as error:
+            if not self._per_user or (
+                self._conn.info.transaction_status
+                == psycopg.pq.TransactionStatus.INERROR
+            ):
+                raise
+            refined = self._privilege_error(statement, error.relation)
+            raise refined from error.__cause__
+
+    def _privilege_error(self, statement: str, relation: str) -> BackendError:
+        held = self._conn.execute(
+            'SELECT sys.ora_owner(n.nspname), sys.ora_name(c.relname), '
+            "c.relkind = 'S', CASE WHEN c.relkind = 'S' THEN "
+            "has_sequence_privilege(c.oid, 'USAGE,SELECT,UPDATE') ELSE "
+            f'has_table_privilege(c.oid, {_ANY_TABLE_PRIVILEGE}) END '
+            'FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace '
+            "WHERE c.relname = %s AND has_schema_privilege(n.oid, 'USAGE') "
+            'ORDER BY 4 DESC LIMIT 1',
+            (relation,),
+        ).fetchone()
+        if held is None or not held[3]:
+            return BackendError(
+                'table or view does not exist',
+                ora_code=ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,
+            )
+        verb = statement.split(None, 1)[0].upper() if statement.strip() else ''
+        # Oracle names a query's privilege READ.
+        needed = {
+            'SELECT': 'READ',
+            'INSERT': 'INSERT',
+            'UPDATE': 'UPDATE',
+            'DELETE': 'DELETE',
+        }
+        if self._release < (23, 0) or held[2] or verb not in needed:
+            return BackendError(
+                'insufficient privileges', ora_code=ORA_INSUFFICIENT_PRIVILEGES
+            )
+        return BackendError(
+            f'missing {needed[verb]} privilege on "{held[0]}"."{held[1]}"',
+            ora_code=_ORA_MISSING_PRIVILEGE,
         )
 
     def _replanned(self, run: Callable[[], Result]) -> Result:
@@ -12289,6 +12542,9 @@ class PostgresBackend:
         users = self._user_statement(sql)
         if users is not None:
             return users
+        granted = self._object_grant_statement(sql)
+        if granted is not None:
+            return granted
         if native:
             return self._execute_native(sql, binds)
         refused = self._rowid_number_error(sql, binds)
@@ -12469,6 +12725,7 @@ class PostgresBackend:
             self._conn.commit()
             self._user_savepoint = False
             self._prune_records()
+            self._follow_grants(original)
             self._record_quoted_names(original)
             self._record_tstz_precisions(original)
             self._record_visibility(visibility)
@@ -12732,6 +12989,16 @@ class PostgresBackend:
         table = _STATEMENT_TABLE.search(original)
         if table is not None and _bare_table(table.group(1)) in self._iot_pk:
             return None
+        if self._per_user and table is not None and '.' in table.group(1):
+            # Another user's table, which one may be granted INSERT, UPDATE
+            # or DELETE on and not SELECT, which PostgreSQL's RETURNING needs
+            # (#1858): the statement runs, its ROWID unknown.
+            row = self._conn.execute(
+                "SELECT has_table_privilege(sys.ora_regclass(%s), 'SELECT')",
+                (table.group(1),),
+            ).fetchone()
+            if row is not None and row[0] is False:
+                return None
         return translated.rstrip().rstrip(';') + _ROWID_RETURNING
 
     def _rewrite_iot_rowid(self, sql: str) -> str:
@@ -16980,6 +17247,334 @@ class PostgresBackend:
             ) from None
         return Result()
 
+    def _object_grant_statement(self, statement: str) -> Result | None:
+        """GRANT or REVOKE of object privileges (#1621, #1858), with Oracle's
+        checks: the object must be there, the privilege one its kind takes, the
+        grantee a user; a grant is its owner's to make, or one's who holds the
+        privilege WITH GRANT OPTION, and a revoke only of what one granted, its
+        cascade taking what the grantee granted on. Recorded in either mode; in
+        per-user mode PostgreSQL's own GRANT or REVOKE enforces it (#1857).
+        DDL, so the transaction is committed first. None for any other
+        statement."""
+        m = _OBJECT_GRANT.match(statement)
+        if m is None:
+            return None
+        (verb, written, target, _to, listed, option) = m.groups()
+        granting = verb.upper() == 'GRANT'
+        privileges = _granted_privileges(written)
+        grantees = _grantees(listed)
+        self.commit()
+        row = self._conn.execute(
+            "SELECT sys.sys_context('userenv', 'session_user'), "
+            'sys.ora_owner(current_schema())'
+        ).fetchone()
+        assert row is not None
+        (me, here) = row
+        parts = re.split(r'\s*\.\s*', target.strip())
+        owner = _oracle_name(parts[0]) if len(parts) == 2 else here
+        name = _oracle_name(parts[-1])
+        found = self._conn.execute(
+            _GRANTED_OBJECT,
+            {'schema': f'"{owner.lower()}"', 'name': name, 'owner': owner},
+        ).fetchall()
+        if not found:
+            self._conn.rollback()
+            raise BackendError(
+                'table or view does not exist',
+                ora_code=ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,
+            )
+        kind = found[0][0]
+        if kind in ('PROCEDURE', 'FUNCTION'):
+            kinds = {'PROCEDURE', 'FUNCTION'}
+        else:
+            kinds = {kind}
+        targets = [(t, on) for (k, t, on) in found if k in kinds]
+        allowed = _OBJECT_PRIVILEGES[kind]
+        if kind == 'TABLE' and self._release >= (23, 0):
+            allowed = tuple(sorted((*allowed, _ASSERTION_REFERENCES)))
+        if privileges is not None and any(p not in allowed for p in privileges):
+            self._conn.rollback()
+            raise _privilege_kind_error(kind, self._release)
+        for grantee in grantees:
+            if grantee != 'PUBLIC' and not self._user_exists(grantee):
+                self._conn.rollback()
+                raise BackendError(
+                    f"user or role '{grantee}' does not exist",
+                    ora_code=_ORA_UNKNOWN_GRANTEE,
+                )
+        key = (owner, name)
+        try:
+            if granting:
+                self._grant_object(
+                    key,
+                    kind,
+                    targets,
+                    privileges or list(allowed),
+                    grantees,
+                    me,
+                    option is not None,
+                )
+            else:
+                self._revoke_object(key, kind, targets, privileges, grantees, me)
+            self._conn.commit()
+        except psycopg.Error as exc:
+            self._conn.rollback()
+            raise _backend_error(exc, original=statement) from exc
+        except BaseException:
+            self._conn.rollback()
+            raise
+        self._collection_name_cache = None
+        return Result()
+
+    def _grant_object(
+        self,
+        key: tuple[str, str],
+        kind: str,
+        targets: list[tuple[str, str]],
+        privileges: list[str],
+        grantees: list[str],
+        me: str,
+        grantable: bool,
+    ) -> None:
+        (owner, name) = key
+        if me != owner:
+            # Not the owner's: each privilege one holds WITH GRANT OPTION, or
+            # ORA-01031 -- ORA-00942 if one holds nothing on the object.
+            held = dict(
+                self._conn.execute(
+                    "SELECT privilege, bool_or(grantable = 'YES') FROM sys.ora_grants "
+                    'WHERE owner = %s AND object_name = %s '
+                    "AND grantee IN (%s, 'PUBLIC') GROUP BY privilege",
+                    (owner, name, me),
+                ).fetchall()
+            )
+            if not held:
+                raise BackendError(
+                    'table or view does not exist',
+                    ora_code=ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,
+                )
+            if not all(held.get(p) for p in privileges):
+                raise BackendError(
+                    'insufficient privileges', ora_code=ORA_INSUFFICIENT_PRIVILEGES
+                )
+        # A grant to oneself does nothing, as Oracle's does.
+        grantees = [g for g in grantees if g != me]
+        if not grantees:
+            return
+        flag = 'YES' if grantable else 'NO'
+        with self._conn.cursor() as cursor:
+            cursor.executemany(
+                'INSERT INTO sys.ora_grants (owner, object_name, privilege, grantee, '
+                'grantor, grantable, object_type) VALUES (%s, %s, %s, %s, %s, %s, %s) '
+                'ON CONFLICT (owner, object_name, privilege, grantee, grantor) '
+                "DO UPDATE SET grantable = CASE WHEN excluded.grantable = 'YES' "
+                "THEN 'YES' ELSE sys.ora_grants.grantable END, "
+                'object_type = excluded.object_type',
+                [
+                    (owner, name, p, g, me, flag, kind)
+                    for g in grantees
+                    for p in privileges
+                ],
+            )
+        if self._per_user:
+            self._pg_object_grants(
+                owner, kind, targets, privileges, grantees, grantable
+            )
+
+    def _revoke_object(
+        self,
+        key: tuple[str, str],
+        kind: str,
+        targets: list[tuple[str, str]],
+        privileges: list[str] | None,
+        grantees: list[str],
+        me: str,
+    ) -> None:
+        (owner, name) = key
+        for grantee in grantees:
+            mine = {
+                r[0]
+                for r in self._conn.execute(
+                    'SELECT privilege FROM sys.ora_grants WHERE owner = %s '
+                    'AND object_name = %s AND grantee = %s AND grantor = %s',
+                    (owner, name, grantee, me),
+                )
+            }
+            # Only what one granted, or ORA-01927; ALL is all of it.
+            revoked = sorted(mine) if privileges is None else privileges
+            if not revoked or any(p not in mine for p in revoked):
+                raise _not_granted_by_you(self._release)
+            self._conn.execute(
+                'DELETE FROM sys.ora_grants WHERE owner = %s AND object_name = %s '
+                'AND grantee = %s AND grantor = %s AND privilege = ANY(%s)',
+                (owner, name, grantee, me, revoked),
+            )
+            if self._per_user:
+                self._pg_object_revokes(key, kind, targets, revoked, grantee, me)
+        self._conn.execute('SELECT sys.ora_grants_cascade(%s, %s)', (owner, name))
+
+    def _follow_grants(self, statement: str) -> None:
+        # After a committed DDL (#1858): a replaced object gets its grants
+        # back in per-user mode, as Oracle keeps them; a dropped one's go.
+        replaced = _REPLACED_OBJECT.match(statement)
+        dropped = None if replaced else _DROPPED_OBJECT.match(statement)
+        named = replaced or dropped
+        if named is None:
+            return
+        parts = re.split(r'\s*\.\s*', named.group(1).strip())
+        try:
+            row = self._conn.execute(
+                'SELECT sys.ora_owner(current_schema())'
+            ).fetchone()
+            assert row is not None
+            owner = _oracle_name(parts[0]) if len(parts) == 2 else row[0]
+            name = _oracle_name(parts[-1])
+            found = self._conn.execute(
+                _GRANTED_OBJECT,
+                {'schema': f'"{owner.lower()}"', 'name': name, 'owner': owner},
+            ).fetchall()
+            if dropped is not None:
+                if not found:
+                    self._conn.execute(
+                        'DELETE FROM sys.ora_grants WHERE owner = %s AND object_name = %s',
+                        (owner, name),
+                    )
+            elif found and self._per_user:
+                kind = found[0][0]
+                targets = [(t, on) for (k, t, on) in found if k == kind]
+                grants = self._conn.execute(
+                    "SELECT grantee, grantable = 'YES', array_agg(privilege) "
+                    'FROM sys.ora_grants WHERE owner = %s AND object_name = %s '
+                    "GROUP BY grantee, grantable = 'YES'",
+                    (owner, name),
+                ).fetchall()
+                for grantee, grantable, privileges in grants:
+                    self._pg_object_grants(
+                        owner, kind, targets, privileges, [grantee], grantable
+                    )
+            self._conn.commit()
+        except psycopg.Error:
+            self._conn.rollback()
+
+    def _grantee_role(self, grantee: str) -> sql.Composable:
+        # The PostgreSQL role a grant goes to in per-user mode (#1858): PUBLIC,
+        # or the user's own role, made now for a user that never logged in.
+        if grantee == 'PUBLIC':
+            return sql.SQL('PUBLIC')
+        role = grantee.lower()
+        exists = self._conn.execute(
+            'SELECT 1 FROM pg_roles WHERE rolname = %s', (role,)
+        ).fetchone()
+        if exists is None:
+            with self._administering() as conn:
+                self._ensure_user_role(conn, grantee)
+                conn.commit()
+        return sql.Identifier(role)
+
+    def _pg_object_targets(
+        self, kind: str, targets: list[tuple[str, str]], privileges: Iterable[str]
+    ) -> list[sql.Composed]:
+        # What PostgreSQL grants for the privileges on the object: one
+        # `privileges ON object` per target, none for privileges with no
+        # counterpart there. A package's EXECUTE is its schema's USAGE and its
+        # routines' and types' (#1858).
+        mapping = _PG_PRIVILEGES.get(kind, _PG_PRIVILEGES['EXECUTABLE'])
+        mapped = sorted({mapping[p] for p in privileges if p in mapping})
+        if not mapped:
+            return []
+        if kind == 'PACKAGE':
+            schema = targets[0][0]
+            on = [sql.SQL('USAGE ON SCHEMA {}').format(sql.SQL(schema))]
+            on.append(
+                sql.SQL('EXECUTE ON ALL ROUTINES IN SCHEMA {}').format(sql.SQL(schema))
+            )
+            for target, kw in self._conn.execute(
+                "SELECT t.oid::regtype::text, CASE t.typtype WHEN 'd' THEN 'DOMAIN' "
+                "ELSE 'TYPE' END FROM pg_type t LEFT JOIN pg_class c ON c.oid = t.typrelid "
+                'WHERE t.typnamespace = to_regnamespace(%s) '
+                "AND (t.typtype = 'd' OR t.typtype = 'c' AND c.relkind = 'c')",
+                (schema,),
+            ):
+                on.append(
+                    sql.SQL('USAGE ON {} {}').format(sql.SQL(kw), sql.SQL(target))
+                )
+            return on
+        if kind in ('PROCEDURE', 'FUNCTION', 'TYPE'):
+            verb = 'EXECUTE' if kind != 'TYPE' else 'USAGE'
+            return [
+                sql.SQL('{} ON {} {}').format(sql.SQL(verb), sql.SQL(kw), sql.SQL(t))
+                for (t, kw) in targets
+            ]
+        return [
+            sql.SQL('{} ON {} {}').format(
+                sql.SQL(', '.join(mapped)), sql.SQL(kw), sql.SQL(t)
+            )
+            for (t, kw) in targets
+        ]
+
+    def _pg_object_grants(
+        self,
+        owner: str,
+        kind: str,
+        targets: list[tuple[str, str]],
+        privileges: Iterable[str],
+        grantees: list[str],
+        grantable: bool,
+    ) -> None:
+        # The grant as PostgreSQL's, made as the session's role, so its
+        # grantor is too; with USAGE on the owner's schema, without which the
+        # grantee could reach nothing in it.
+        roles = sql.SQL(', ').join(self._grantee_role(g) for g in grantees)
+        tail = sql.SQL(' WITH GRANT OPTION' if grantable else '')
+        on = [
+            sql.SQL('USAGE ON SCHEMA {}').format(sql.Identifier(owner.lower())),
+            *self._pg_object_targets(kind, targets, privileges),
+        ]
+        for target in on:
+            self._conn.execute(sql.SQL('GRANT {} TO {}{}').format(target, roles, tail))
+
+    def _pg_object_revokes(
+        self,
+        key: tuple[str, str],
+        kind: str,
+        targets: list[tuple[str, str]],
+        privileges: Iterable[str],
+        grantee: str,
+        me: str,
+    ) -> None:
+        # PostgreSQL's REVOKE, cascading to what the grantee granted on; and
+        # the schema's USAGE once the grantee holds nothing of one's in it.
+        (owner, name) = key
+        role = self._grantee_role(grantee)
+        # A privilege that maps to one the grantee still holds of this
+        # grantor stays: READ and SELECT are both SELECT.
+        kept = {
+            r[0]
+            for r in self._conn.execute(
+                'SELECT privilege FROM sys.ora_grants WHERE owner = %s '
+                'AND object_name = %s AND grantee = %s AND grantor = %s',
+                (owner, name, grantee, me),
+            )
+        }
+        mapping = _PG_PRIVILEGES.get(kind, _PG_PRIVILEGES['EXECUTABLE'])
+        still = {mapping[p] for p in kept if p in mapping}
+        gone = [p for p in privileges if p in mapping and mapping[p] not in still]
+        for target in self._pg_object_targets(kind, targets, gone):
+            self._conn.execute(
+                sql.SQL('REVOKE {} FROM {} CASCADE').format(target, role)
+            )
+        rest = self._conn.execute(
+            'SELECT 1 FROM sys.ora_grants WHERE owner = %s AND grantee = %s '
+            'AND grantor = %s LIMIT 1',
+            (owner, grantee, me),
+        ).fetchone()
+        if rest is None:
+            self._conn.execute(
+                sql.SQL('REVOKE USAGE ON SCHEMA {} FROM {} CASCADE').format(
+                    sql.Identifier(owner.lower()), role
+                )
+            )
+
     def _user_exists(self, name: str) -> bool:
         # A user is an account or a schema of that name: one made before the
         # Mirror kept accounts has a schema and no password (#879).
@@ -17096,6 +17691,13 @@ class PostgresBackend:
                             ora_code=ORA_CASCADE_REQUIRED,
                         )
                     conn.execute(sql.SQL('DROP SCHEMA IF EXISTS {}').format(schema))
+                # Its object grants too, made, received or on what it owned
+                # (#1858).
+                conn.execute(
+                    'DELETE FROM sys.ora_grants WHERE owner = %s OR grantee = %s '
+                    'OR grantor = %s',
+                    (name,) * 3,
+                )
                 if proxy_grants:
                     # Its grants go with it, on either side (#1860).
                     conn.execute(
