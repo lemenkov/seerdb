@@ -2530,6 +2530,76 @@ def test_a_per_user_login_connects_to_postgresql_once(
         pg.close()
 
 
+def test_the_records_are_upgraded_in_order_and_a_newer_database_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The records' data version (#1862): a fresh database is stamped with this
+    # release's; a newer release runs each step from there once, in order, and
+    # records how far it got; a release older than the database, or newer than
+    # its baseline allows, refuses it before installing anything; and once
+    # adoption is off (GA), a preview database with no version is refused.
+    from seerdb.server.backend import UnsupportedFeature
+    from seerdb.server.backends import postgres as postgres_backend
+
+    database = f'dv_{os.getpid()}'
+    pg = psycopg.connect(_CONNINFO, autocommit=True)
+    conninfo = make_conninfo(_CONNINFO, dbname=database)
+
+    def recorded() -> tuple[str | None, int | None]:
+        with psycopg.connect(conninfo) as conn:
+            row = conn.execute(
+                "SELECT obj_description(to_regclass('sys.ora_data_version'), "
+                "'pg_class'), (SELECT count(*) FROM pg_class WHERE relname = 'dv_step')"
+            ).fetchone()
+            assert row is not None
+            steps = None
+            if row[1]:
+                counted = conn.execute('SELECT count(*) FROM sys.dv_step').fetchone()
+                steps = counted[0] if counted else None
+            return (row[0], steps)
+
+    try:
+        pg.execute(f'CREATE DATABASE {database}')
+        with psycopg.connect(conninfo, autocommit=True) as fresh:
+            fresh.execute('CREATE EXTENSION orafce')
+            fresh.execute('CREATE EXTENSION vector')
+        PostgresBackend(conninfo, credentials=dict(_CREDS)).close()
+        assert recorded() == ('1', None)
+        steps = (
+            (2, 'CREATE TABLE IF NOT EXISTS sys.dv_step (n int)'),
+            (
+                3,
+                'INSERT INTO sys.dv_step SELECT 3 WHERE NOT EXISTS (SELECT 1 FROM sys.dv_step)',
+            ),
+        )
+        monkeypatch.setattr(postgres_backend, '_DATA_VERSION', 3)
+        monkeypatch.setattr(postgres_backend, '_DATA_UPGRADES', steps)
+        PostgresBackend(conninfo, credentials=dict(_CREDS)).close()
+        assert recorded() == ('3', 1)
+        PostgresBackend(conninfo, credentials=dict(_CREDS)).close()
+        assert recorded() == ('3', 1)
+        monkeypatch.setattr(postgres_backend, '_DATA_VERSION', 2)
+        with pytest.raises(UnsupportedFeature, match='set up by a newer seerdb'):
+            PostgresBackend(conninfo, credentials=dict(_CREDS))
+        monkeypatch.setattr(postgres_backend, '_DATA_VERSION', 5)
+        monkeypatch.setattr(postgres_backend, '_DATA_BASELINE', 4)
+        with pytest.raises(UnsupportedFeature, match='older than this release'):
+            PostgresBackend(conninfo, credentials=dict(_CREDS))
+        assert recorded() == ('3', 1)
+        monkeypatch.setattr(postgres_backend, '_DATA_VERSION', 3)
+        monkeypatch.setattr(postgres_backend, '_DATA_BASELINE', 1)
+        monkeypatch.setattr(postgres_backend, '_ADOPT_UNVERSIONED', False)
+        with psycopg.connect(conninfo, autocommit=True) as conn:
+            conn.execute('DROP TABLE sys.ora_data_version')
+        with pytest.raises(UnsupportedFeature, match='preview release'):
+            PostgresBackend(conninfo, credentials=dict(_CREDS))
+        # A fresh database, which has no dictionary yet, is stamped anyway.
+        assert postgres_backend._refused_data_version(None, False) is None
+    finally:
+        pg.execute(f'DROP DATABASE IF EXISTS {database} WITH (FORCE)')
+        pg.close()
+
+
 def test_a_profiled_mirror_records_each_statement_over_postgresql(
     tmp_path: Any,
 ) -> None:

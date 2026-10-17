@@ -56,8 +56,8 @@ first. Decided in [#1861](https://github.com/seerdb/seerdb/issues/1861).
   over PostgreSQL set up keeps working when a newer release of the same major
   version connects to it. That covers its accounts, roles, recorded grants,
   invisible columns, object tables and the like. A Mirror older than the
-  database refuses to start. Databases from the preview releases get no
-  upgrade path: set them up afresh.
+  database refuses its sessions, rather than misread it. Databases from the
+  preview releases get no upgrade path: set them up afresh.
 - **The migration profile:** a profile file one release records can be read by
   `profile compare` of any later release of the same major version.
 
