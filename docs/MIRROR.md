@@ -118,6 +118,7 @@ Any service name is accepted.
 | `--tls-ca` | | require client certificates issued by this CA, PEM |
 | `--profile FILE` | | record per-statement statistics to FILE (see *Migration profile*) |
 | `--max-sessions` | no limit | serve at most this many connections at once; one more is closed as it arrives (see *Resource limits*) |
+| `--failed-login-attempts` | `10` | lock a user name after this many failed logins in a row; `0` never locks (see *Accounts*) |
 | `--config FILE` | | an INI file with the same options (below) |
 
 For `postgres`:
@@ -159,6 +160,7 @@ log_level = INFO
 ; tls_ca = /etc/mirror/clients-ca.pem
 ; profile = /var/lib/mirror/profile.json
 ; max_sessions = 200
+; failed_login_attempts = 10
 
 [clients]
 SCOTT = tiger
@@ -222,6 +224,15 @@ changed by a client, or a user created with `CREATE USER`, lasts until the
 Mirror stops. With it, they live in the database and persist. That table
 belongs to the auth role; the role the sessions run as must not be able to read
 it, so it must be a different role, not a superuser, and not the table's owner.
+
+**Failed logins.** As Oracle's default profile does, the Mirror counts failed
+logins per user name:
+- Each failure's reply is delayed, the longer the more failures in a row.
+- After 10 in a row (`--failed-login-attempts`), the name is locked, and a login
+  gets ORA-28000 until an administrator runs `ALTER USER name ACCOUNT UNLOCK`, or
+  the Mirror restarts.
+- A name that is no account's is counted, challenged and refused just as an
+  account's is, so the answers don't tell which accounts exist.
 
 **Proxy logins.** A login as `user[target]` opens a session as `target`, with
 `user` as its proxy, only where `target` allowed it:

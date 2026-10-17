@@ -392,6 +392,7 @@ from seerdb.server import (
     UnsupportedFeature,
     as_declared_type,
     credential_lookup,
+    lockout,
     stats,
 )
 from seerdb.server.backend import BlobValue, SessionInfo, TypeDescription
@@ -5577,6 +5578,11 @@ _DROP_USER_STATEMENT = re.compile(
 )
 # ALTER USER client GRANT | REVOKE CONNECT THROUGH proxy (#1860); whatever
 # follows -- WITH ROLE, AUTHENTICATION REQUIRED -- is not modelled.
+# ALTER USER u ACCOUNT UNLOCK: the Mirror's count of u's failed logins
+# starts over (GHSA-742q-fjfr-w5x3).
+_ALTER_USER_UNLOCK = re.compile(
+    rf'(?is)\s*ALTER\s+USER\s+{_USER_NAME}\s+ACCOUNT\s+UNLOCK\s*;?\s*$'
+)
 _ALTER_USER_PROXY = re.compile(
     rf'(?is)\s*ALTER\s+USER\s+{_USER_NAME}\s+(GRANT|REVOKE)\s+CONNECT\s+'
     rf'THROUGH\s+{_USER_NAME}(?![\w$#])'
@@ -18267,6 +18273,16 @@ class PostgresBackend:
                         ora_code=ORA_INVALID_USERNAME_PASSWORD,
                     )
             self._accounts.set(name, _password_text(altered.group(2)))
+            return Result()
+        unlocked = _ALTER_USER_UNLOCK.match(statement)
+        if unlocked is not None:
+            name = _user_name(unlocked.group(1))
+            self._require_administrator()
+            if not self._user_exists(name):
+                raise BackendError(
+                    f"user '{name}' does not exist", ora_code=ORA_USER_DOES_NOT_EXIST
+                )
+            lockout.unlock(name)
             return Result()
         proxied = _ALTER_USER_PROXY.match(statement)
         if proxied is not None:

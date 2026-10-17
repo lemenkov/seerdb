@@ -322,3 +322,16 @@ def test_max_sessions_comes_from_the_command_line_or_the_config(tmp_path: Path) 
     assert build(['--config', config], env=_USERS).max_sessions == 7
     with pytest.raises(SystemExit):
         build(['--max-sessions', '0', 'postgres', 'dbname=mirror'], env=_USERS)
+
+
+def test_failed_login_attempts_default_to_oracles(tmp_path: Path) -> None:
+    # GHSA-742q-fjfr-w5x3: 10, as Oracle's default profile; 0 never locks.
+    assert build(['postgres', 'dbname=mirror'], env=_USERS).failed_login_attempts == 10
+    launch = build(
+        ['--failed-login-attempts', '0', 'postgres', 'dbname=mirror'], env=_USERS
+    )
+    assert launch.failed_login_attempts == 0
+    with pytest.raises(SystemExit):
+        build(
+            ['--failed-login-attempts', '-1', 'postgres', 'dbname=mirror'], env=_USERS
+        )
