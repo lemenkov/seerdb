@@ -35,6 +35,7 @@ from typing import Any
 
 from seerdb.common.sqltext import is_plsql, sql_tokens
 from seerdb.server.backend import Backend, BackendError
+from seerdb.server.redact import redact_passwords
 
 # The timings kept per statement for its percentiles: every one up to this
 # many, then a uniform sample of them all.
@@ -130,6 +131,10 @@ class Profile:
         """Add one call of ``sql`` to its statement's statistics; ``named``
         for an operation recorded by its name, which is its own key."""
         begun = time.perf_counter()
+        # Kept as the client sent it, but for its passwords
+        # (GHSA-27rj-h7p6-pmqf), which a quoted name's form leaves even in
+        # the fingerprint.
+        sql = redact_passwords(sql)
         key = sql if named else fingerprint(sql)
         with self._lock:
             entry = self._statements.get(key)

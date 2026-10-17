@@ -202,3 +202,27 @@ def test_the_launcher_takes_a_profile_and_sigusr1_writes_it(
         ]
     finally:
         signal.signal(signal.SIGUSR1, previous)
+
+
+def test_a_profile_keeps_no_password(tmp_path: Path) -> None:
+    # A statement that carries a password is kept without it, in its example
+    # and its fingerprint alike (GHSA-27rj-h7p6-pmqf).
+    profile = Profile(str(tmp_path / 'p.json'))
+    for statement in (
+        'create user u identified by "S3cretProbe"',
+        'alter user u identified by Other1 replace S3cretProbe',
+    ):
+        profile.record(
+            statement,
+            'execute',
+            0.001,
+            rows_in=0,
+            rows_out=0,
+            error=None,
+            backend_statements=None,
+            backend_seconds=None,
+            translated=None,
+        )
+    text = json.dumps(profile.snapshot())
+    assert 'S3cretProbe' not in text and 'Other1' not in text
+    assert 'identified by ***' in text

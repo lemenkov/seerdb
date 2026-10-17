@@ -247,10 +247,12 @@ honest edge of this adapter:
 from __future__ import annotations
 
 import array
+import base64
 import datetime
 import decimal
 import functools
 import hashlib
+import hmac
 import json
 import math
 import re
@@ -394,6 +396,7 @@ from seerdb.server import (
 )
 from seerdb.server.backend import BlobValue, SessionInfo, TypeDescription
 from seerdb.server.identity import IDENTITY_12_1, IDENTITY_23, ServerIdentity
+from seerdb.server.redact import redact_passwords
 
 # The PostgreSQL composite type that backs Oracle's TIMESTAMP WITH TIME ZONE
 # (#519). A native timestamptz stores UTC and hands the value back in the session
@@ -11261,6 +11264,25 @@ _INSTALLED_SCHEMAS: Final = (
 )
 
 
+def _scram_verifier(password: str, iterations: int = 4096) -> str:
+    """A role's SCRAM-SHA-256 verifier, as PostgreSQL stores it (RFC 7677).
+
+    Handed to CREATE / ALTER ROLE in place of the plaintext, which a server
+    that logs its DDL would otherwise write down (GHSA-27rj-h7p6-pmqf). The
+    Mirror's role passwords are its own, URL-safe ASCII, so SASLprep leaves
+    them as they are.
+    """
+    salt = secrets.token_bytes(16)
+    salted = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, iterations)
+    stored = hashlib.sha256(hmac.new(salted, b'Client Key', 'sha256').digest()).digest()
+    server = hmac.new(salted, b'Server Key', 'sha256').digest()
+    encode = base64.b64encode
+    return (
+        f'SCRAM-SHA-256${iterations}:{encode(salt).decode()}$'
+        f'{encode(stored).decode()}:{encode(server).decode()}'
+    )
+
+
 class _RoleUnverified(Exception):
     # A per-user login's role that its own connection could not verify, or an
     # installation not there to use (#1939): the login goes the installer's
@@ -12918,6 +12940,9 @@ class PostgresBackend:
         return result
 
     def _record_run(self, sql: str, rules: list[str], error: Exception | None) -> None:
+        # The report keeps the statement but for its passwords
+        # (GHSA-27rj-h7p6-pmqf).
+        sql = redact_passwords(sql)
         if _ALTER_SESSION_REPORT.match(sql) or _ALTER_SESSION_DIALECT.match(sql):
             return
         entry = self._report_runs.setdefault(_normalise_statement(sql), _ReportEntry())
@@ -17587,7 +17612,7 @@ class PostgresBackend:
             conn.execute("SET LOCAL createrole_self_grant = 'set, inherit'")
             conn.execute(
                 sql.SQL('CREATE ROLE {} LOGIN PASSWORD {} IN ROLE {}').format(
-                    role, sql.Literal(password), sql.Identifier(group)
+                    role, sql.Literal(_scram_verifier(password)), sql.Identifier(group)
                 )
             )
             conn.execute(
@@ -17606,7 +17631,9 @@ class PostgresBackend:
             # A role whose password the accounts no longer have gets a new one.
             password = secrets.token_urlsafe(32)
             conn.execute(
-                sql.SQL('ALTER ROLE {} PASSWORD {}').format(role, sql.Literal(password))
+                sql.SQL('ALTER ROLE {} PASSWORD {}').format(
+                    role, sql.Literal(_scram_verifier(password))
+                )
             )
         conn.execute(
             sql.SQL(

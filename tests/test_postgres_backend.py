@@ -2667,6 +2667,39 @@ def test_a_per_user_session_cannot_forge_who_it_is() -> None:
         pg.close()
 
 
+def test_a_users_role_is_made_with_a_verifier_not_its_password() -> None:
+    # A per-user role's password reaches PostgreSQL as a SCRAM verifier the
+    # Mirror computes, which a server logging its DDL writes down instead of
+    # the password (GHSA-27rj-h7p6-pmqf). The role logs in with the password.
+    from psycopg import sql
+
+    from seerdb.server.backends.postgres import _scram_verifier
+
+    role = f'scram_probe_{os.getpid()}'
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    try:
+        verifier = _scram_verifier('Pw-for-the-probe')
+        assert verifier.startswith('SCRAM-SHA-256$4096:')
+        assert 'Pw-for-the-probe' not in verifier
+        admin.execute(
+            sql.SQL('CREATE ROLE {} LOGIN PASSWORD {}').format(
+                sql.Identifier(role), sql.Literal(verifier)
+            )
+        )
+        with psycopg.connect(
+            make_conninfo(_CONNINFO, user=role, password='Pw-for-the-probe')
+        ) as conn:
+            assert conn.execute('SELECT current_user').fetchone() == (role,)
+        stored = admin.execute(
+            'SELECT rolpassword FROM pg_authid WHERE rolname = %s', (role,)
+        ).fetchone()
+        if stored is not None:
+            assert stored[0] == verifier
+    finally:
+        admin.execute(f'DROP ROLE IF EXISTS {role}')
+        admin.close()
+
+
 def test_a_profiled_mirror_records_each_statement_over_postgresql(
     tmp_path: Any,
 ) -> None:
