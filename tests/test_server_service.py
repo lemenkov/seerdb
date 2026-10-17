@@ -115,3 +115,58 @@ def test_the_mirror_says_it_is_provisional(caplog) -> None:
         server.serve_forever()  # returns at once: the socket is closed
     notices = [r for r in caplog.records if 'technology preview' in r.getMessage()]
     assert [r.levelno for r in notices] == [logging.WARNING]
+
+
+def test_a_mirror_serves_at_most_max_sessions() -> None:
+    # GHSA-5827-wqfh-x2v3: with max_sessions, a connection past the limit is
+    # closed as it arrives, and the slot frees when a session ends.
+    import socket
+    import time
+
+    server = seerdb.Server(
+        host='127.0.0.1', port=0, backend_factory=_DualBackend, max_sessions=1
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        first = socket.create_connection(('127.0.0.1', server.port))
+        time.sleep(0.3)
+        second = socket.create_connection(('127.0.0.1', server.port))
+        second.settimeout(5)
+        assert second.recv(1) == b''
+        second.close()
+        first.close()
+        time.sleep(0.3)
+        conn = seerdb.connect(
+            host='127.0.0.1',
+            port=server.port,
+            user='PYO',
+            password='pyo123',
+            service_name='XE',
+            timeout=5000,
+        )
+        conn.close()
+    finally:
+        server.close()
+        thread.join(timeout=5)
+
+
+def test_a_client_that_does_not_log_in_is_dropped(monkeypatch) -> None:
+    # GHSA-5827-wqfh-x2v3: a connection that stalls before logging in is
+    # dropped once the login's deadline passes.
+    import socket
+
+    from seerdb.server import session
+
+    monkeypatch.setattr(session, 'LOGIN_SECONDS', 0.3)
+    server = seerdb.Server(host='127.0.0.1', port=0, backend_factory=_DualBackend)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        idle = socket.create_connection(('127.0.0.1', server.port))
+        idle.settimeout(5)
+        assert idle.recv(1) == b''
+        idle.close()
+    finally:
+        server.close()
+        thread.join(timeout=5)

@@ -274,3 +274,66 @@ def test_an_encrypted_reply_flags_its_last_packet() -> None:
     finally:
         left.close()
         right.close()
+
+
+def test_a_packet_shorter_than_its_header_is_refused() -> None:
+    # GHSA-5827-wqfh-x2v3: a length below the header's own is no packet.
+    import struct
+
+    import pytest
+
+    from seerdb.server.framing import ProtocolLimitError
+
+    left, right = _pair()
+    try:
+        left.sendall(struct.pack('>HHBBH', 4, 0, TNS_CONNECT, 0, 0))
+        with pytest.raises(ProtocolLimitError):
+            PacketStream(right, sdu=8192).read_packet()
+    finally:
+        left.close()
+        right.close()
+
+
+def test_a_packet_longer_than_the_sdu_is_refused_unread() -> None:
+    # GHSA-5827-wqfh-x2v3: the large header can claim 4 GB; the reader refuses
+    # a length past the negotiated SDU at once, rather than wait to buffer it.
+    import struct
+
+    import pytest
+
+    from seerdb.server.framing import ProtocolLimitError
+
+    left, right = _pair()
+    try:
+        left.sendall(struct.pack('>IBBh', 1 << 30, TNS_DATA, 0, 0))
+        right.settimeout(5)
+        with pytest.raises(ProtocolLimitError):
+            PacketStream(right, sdu=8192, large=True).read_packet()
+    finally:
+        left.close()
+        right.close()
+
+
+def test_a_message_past_its_limit_is_refused() -> None:
+    # GHSA-5827-wqfh-x2v3: DATA fragments flagged "more" were reassembled
+    # without end; a message past the stream's limit is refused.
+    import struct
+
+    import pytest
+
+    from seerdb.server.framing import PRE_LOGIN_MESSAGE_LIMIT, ProtocolLimitError
+
+    left, right = _pair()
+    try:
+        stream = PacketStream(right, sdu=8192)
+        assert stream.max_message == PRE_LOGIN_MESSAGE_LIMIT
+        stream.max_message = 1000
+        fragment = b'x' * 400
+        packet = struct.pack('>HHBBH', 8 + 2 + len(fragment), 0, TNS_DATA, 0, 0)
+        packet += struct.pack('>H', 0x0020) + fragment
+        left.sendall(packet * 3)
+        with pytest.raises(ProtocolLimitError):
+            stream.read_packet()
+    finally:
+        left.close()
+        right.close()

@@ -308,3 +308,17 @@ def test_every_deprecation_is_in_the_changelog() -> None:
     ]
     for name in names:
         assert any(f'`{name}`' in line and 'deprecated' in line for line in lines), name
+
+
+def test_max_sessions_comes_from_the_command_line_or_the_config(tmp_path: Path) -> None:
+    # GHSA-5827-wqfh-x2v3: no limit unless the operator sets one.
+    assert build(['postgres', 'dbname=mirror'], env=_USERS).max_sessions is None
+    launch = build(['--max-sessions', '50', 'postgres', 'dbname=mirror'], env=_USERS)
+    assert launch.max_sessions == 50
+    config = _ini(
+        tmp_path,
+        '[server]\nmax_sessions = 7\n[backend]\ntype = postgres\nconninfo = dbname=m\n',
+    )
+    assert build(['--config', config], env=_USERS).max_sessions == 7
+    with pytest.raises(SystemExit):
+        build(['--max-sessions', '0', 'postgres', 'dbname=mirror'], env=_USERS)

@@ -145,6 +145,9 @@ class Launch:
     ssl_context: ssl.SSLContext | None = None
     # Where a migration profile is written (#1881), None for no profile.
     profile: str | None = None
+    # How many connections are served at once (GHSA-5827-wqfh-x2v3), None
+    # for no limit.
+    max_sessions: int | None = None
     # A deprecated option or key the command line or the config file gave
     # (#1863), each to be logged as the Mirror starts.
     warnings: list[str] = field(default_factory=list)
@@ -186,6 +189,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--tls-key', help="the certificate's private key (PEM)")
     parser.add_argument(
         '--tls-ca', help='require client certificates issued by this CA (PEM)'
+    )
+    parser.add_argument(
+        '--max-sessions',
+        type=int,
+        help='serve at most this many connections at once (default: no limit)',
     )
     commands = parser.add_subparsers(dest='command', metavar='BACKEND')
     postgres = commands.add_parser('postgres', help='serve from PostgreSQL')
@@ -324,6 +332,10 @@ def build(
         option(args.tls_ca, server, 'tls_ca', ''),
     )
     profile = option(args.profile, server, 'profile', '') or None
+    sessions = option(args.max_sessions, server, 'max_sessions', '')
+    max_sessions = int(sessions) if sessions else None
+    if max_sessions is not None and max_sessions < 1:
+        raise SystemExit('max_sessions must be at least 1')
 
     kind = args.command or str(backend.get('type', '')).strip().lower()
     if kind == 'observe':
@@ -395,6 +407,7 @@ def build(
             description=f'PostgreSQL presenting {presents}',
             ssl_context=ssl_context,
             profile=profile,
+            max_sessions=max_sessions,
             warnings=warnings,
         )
 
@@ -430,6 +443,7 @@ def build(
         description=f'passthrough to {up_host}:{up_port}/{service}',
         ssl_context=ssl_context,
         profile=profile,
+        max_sessions=max_sessions,
         warnings=warnings,
     )
     if field_version is None:
@@ -490,6 +504,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             backend_factory=backend_factory,
             encryption=launch.encryption,
             ssl_context=launch.ssl_context,
+            max_sessions=launch.max_sessions,
         )
     finally:
         if profile is not None:

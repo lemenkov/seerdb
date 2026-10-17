@@ -117,6 +117,7 @@ Any service name is accepted.
 | `--tls-key` | | that certificate's private key, PEM |
 | `--tls-ca` | | require client certificates issued by this CA, PEM |
 | `--profile FILE` | | record per-statement statistics to FILE (see *Migration profile*) |
+| `--max-sessions` | no limit | serve at most this many connections at once; one more is closed as it arrives (see *Resource limits*) |
 | `--config FILE` | | an INI file with the same options (below) |
 
 For `postgres`:
@@ -157,6 +158,7 @@ log_level = INFO
 ; tls_key = /etc/mirror/server.key
 ; tls_ca = /etc/mirror/clients-ca.pem
 ; profile = /var/lib/mirror/profile.json
+; max_sessions = 200
 
 [clients]
 SCOTT = tiger
@@ -492,9 +494,15 @@ Take a backup of the database before upgrading, as for any schema change.
 
 ### Resource limits
 
-The Mirror bounds nothing of its own yet: the number of sessions, the size of a
-statement and the size of a LOB are open items of the security review (#1687).
-Bound them on the PostgreSQL side meanwhile:
+What the Mirror bounds itself:
+- **Packets:** a packet longer than the negotiated SDU closes the connection.
+  So does a message longer than 1 MiB before login, or 1 GiB after it.
+- **Logins:** a client has 60 seconds to log in, or the connection is closed.
+- **Sessions:** `--max-sessions` caps the connections served at once. It is
+  off by default; set it to what the database can take.
+
+The size of a single statement's result and of a LOB are not bounded. Bound
+the rest on the PostgreSQL side:
 
 - **Sessions:** each Mirror session holds one PostgreSQL connection, and a
   login also opens short-lived ones to the auth database. `max_connections`
