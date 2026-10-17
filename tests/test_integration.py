@@ -22,12 +22,15 @@
 
 import array
 import datetime
+import functools
+import inspect
 import math
 import os
 import re
 import ssl
 import unittest
 from decimal import Decimal
+from typing import NamedTuple
 
 import seerdb
 from seerdb.common.tns_consts import (
@@ -194,6 +197,243 @@ def _target_is_8i() -> bool:
             except Exception:
                 _TARGET_IS_8I = False
     return _TARGET_IS_8I
+
+
+# What the server a test runs against can do (#1339): one table of the facts
+# the suite used to restate in each test body, each with the server or field
+# version that has it and the error or reason that rules it out. A test or a
+# whole class declares what it needs with @_requires(...); the check runs when
+# the test does, against its own connection, or a probe one for a class that
+# makes its own. What a test meets at run time -- a privilege the bed's user
+# lacks, an ORA code the server answers -- stays a skip in the test body.
+class _Target(NamedTuple):
+    field_version: int
+    is_8i: bool
+    # The server's major release, from its banner: 23 for 23ai.
+    server_major: int
+    # The Mirror leg this is (SEERDB_TEST_MIRROR): 'postgres', 'passthrough',
+    # '1' for a runner that does not name its backend, or '' for none.
+    mirror: str
+
+
+def _target_of(conn) -> _Target:
+    return _Target(
+        conn.field_version,
+        _conn_is_8i(conn),
+        conn.server_version >> 24,
+        os.environ.get('SEERDB_TEST_MIRROR', ''),
+    )
+
+
+_PROBED_TARGET: _Target | None = None
+
+
+def _probed_target() -> _Target:
+    # The configured server, probed once and cached, for a test with no
+    # connection of the suite's own: one built as the suite builds them.
+    global _PROBED_TARGET
+    if _PROBED_TARGET is None:
+        conn = _connect()
+        try:
+            _PROBED_TARGET = _target_of(conn)
+        finally:
+            conn.close()
+    return _PROBED_TARGET
+
+
+class _Need(NamedTuple):
+    # A capability: why a server without it skips, and what it takes. Every
+    # condition named must hold.
+    reason: str
+    # The field version a session needs at least, or stays below (a pre-X
+    # behaviour the test is about).
+    min_fv: int = 0
+    below_fv: int = 0
+    # The server's major release it needs at least.
+    min_server: int = 0
+    # Whether 8i lacks it, or only 8i has it.
+    not_8i: bool = False
+    only_8i: bool = False
+    # The Mirror legs that lack it: '*' for any Mirror, else backend names. A
+    # runner that names no backend ('1') lacks what any backend lacks.
+    not_mirror: tuple[str, ...] = ()
+
+    def missing(self, target: _Target) -> bool:
+        fv = target.field_version
+        if self.min_fv and fv < self.min_fv:
+            return True
+        if self.below_fv and fv >= self.below_fv:
+            return True
+        if self.min_server and target.server_major < self.min_server:
+            return True
+        if (self.not_8i and target.is_8i) or (self.only_8i and not target.is_8i):
+            return True
+        leg = target.mirror
+        return (
+            bool(leg)
+            and bool(self.not_mirror)
+            and ('*' in self.not_mirror or leg in self.not_mirror or leg == '1')
+        )
+
+
+def _postgres_cannot(feature: str) -> _Need:
+    # What the Mirror's postgres backend cannot do, while the passthrough,
+    # which asks a real server, does (#1019).
+    return _Need(
+        f"the Mirror's postgres backend cannot {feature}", not_mirror=('postgres',)
+    )
+
+
+def _mirror_lacks(feature: str) -> _Need:
+    # What no Mirror leg serves yet, whatever its backend; each caller names
+    # the follow-up ticket.
+    return _Need(f'the Mirror does not implement {feature} yet', not_mirror=('*',))
+
+
+def _skip_unless(test: unittest.TestCase, *needs: _Need) -> None:
+    # The check @_requires makes, for a helper that sets a test up and skips
+    # on its way (#1339).
+    conn = getattr(test, 'conn', None)
+    target = _target_of(conn) if conn is not None else _probed_target()
+    for need in needs:
+        if need.missing(target):
+            test.skipTest(need.reason)
+
+
+def _requires(*needs: _Need):
+    """Skip a test, or every test of a class, on a server without ``needs``.
+
+    On a test, checked as it runs, against ``self.conn`` where the test has
+    one -- set up by _IntegrationBase -- and the probed target otherwise. On a
+    class of _IntegrationBase, checked in its setUp right after connecting,
+    before the class's own setUp makes anything a server without it lacks.
+    """
+
+    def decorate(item):
+        if isinstance(item, type):
+            item._NEEDS = (*getattr(item, '_NEEDS', ()), *needs)
+            return item
+
+        if inspect.iscoroutinefunction(item):
+
+            @functools.wraps(item)
+            async def run_async(test_self, *args, **kwargs):
+                _skip_unless(test_self, *needs)
+                return await item(test_self, *args, **kwargs)
+
+            return run_async
+
+        @functools.wraps(item)
+        def run(test_self, *args, **kwargs):
+            _skip_unless(test_self, *needs)
+            return item(test_self, *args, **kwargs)
+
+        return run
+
+    return decorate
+
+
+# The capabilities, by the field version that brings them.
+_FV = FIELD_VERSION_10_2
+_TRUNC_TIMESTAMP = _Need(
+    "9i's TRUNC and ROUND take no TIMESTAMP (ORA-00932)", min_fv=_FV
+)
+_Q_QUOTING = _Need("alternative quoting (q'[...]') is 10g and later", min_fv=_FV)
+_LTZ_SESSION_ARITHMETIC = _Need(
+    '9i PL/SQL does LTZ + n on the database clock (#1241)', min_fv=_FV
+)
+_PING_ROUND_TRIP = _Need('9i pings with a query, which already raises', min_fv=_FV)
+_BINARY_DOUBLE_AND_INTERVAL = _Need(
+    'BINARY_DOUBLE / INTERVAL are 10g+ types; Oracle 9i lacks them', min_fv=_FV
+)
+_BINARY_FLOAT = _Need('BINARY_FLOAT / BINARY_DOUBLE are 10g+', min_fv=_FV)
+_BINARY_FLOAT_SERVER = _Need(
+    'BINARY_FLOAT / BINARY_DOUBLE are Oracle 10g+', min_server=10
+)
+_LOB_READ_IN_TRANSACTION = _Need(
+    'LOB reads inside a transaction are not exercised on fv2', min_fv=_FV
+)
+_STREAMED_LOB_BIND = _Need(
+    'Oracle 9i has no streamed LOB/LONG bind path (#169)', min_fv=_FV
+)
+_NATIONAL_OUT_BIND = _Need(
+    'a national OUT bind is refused on fv2 (ORA-03120)', min_fv=_FV
+)
+_CHANGE_PASSWORD = _Need('changepassword is not supported on Oracle 9i', min_fv=_FV)
+_PARSE = _Need('cursor.parse() needs 10g+', min_fv=_FV)
+_ARRAY_DML = _Need('executemany (array DML) is a 10g+ path', min_fv=_FV)
+_FV2_EXECUTE_PATH = _Need('fv2 (9i) uses a separate execute path', min_fv=_FV)
+_PROXY_AUTH = _Need('proxy authentication needs a 10g+ server', min_fv=_FV)
+_SERVER_SCROLL = _Need(
+    'server-side scroll needs 10g+ (9i uses buffered scroll)', min_fv=_FV
+)
+_LOBOPS = _Need('the LOB object needs the 10g+ LOBOPS path', min_fv=_FV)
+_OER_WARN_BYTE = _Need('the OER warn byte is not located on fv2', min_fv=_FV)
+_BLOCK_IOV = _Need('the fv2 block reply carries no IOV directions', min_fv=_FV)
+_PRE10_PARSE_REFUSAL = _Need(
+    '10g+ sends a real parse; this is the pre-10g refusal', below_fv=_FV
+)
+_PRE10_RETURNING = _Need(
+    'RETURNING ... INTO takes the native path from 10g', below_fv=_FV
+)
+_FV = FIELD_VERSION_11_2
+_EDITIONS = _Need('editions need 11g or later', min_fv=_FV)
+_LOB_MODIFY = _Need(
+    'modifying a LOB needs 11g+ (10g closes the connection)', min_fv=_FV
+)
+_FV = FIELD_VERSION_12_1
+_INVISIBLE_COLUMNS = _Need('INVISIBLE columns are 12.1+', min_fv=_FV)
+_REF_BIND = _Need('REF bind needs a 12.1+ server', min_fv=_FV)
+_LOB_VAR_BIND = _Need(
+    'a LOB Var bind needs the 12.1+ OAC and temp-LOB path (#902)', min_fv=_FV
+)
+_REFCURSOR_IN_BIND = _Need('a REF CURSOR IN bind needs the 12c+ bind OAC', min_fv=_FV)
+_VECTOR_BIND = _Need('a VECTOR bind needs a 12.1+ session (#1762)', min_fv=_FV)
+_PACKAGE_TYPE_BIND = _Need(
+    'a package-level type needs the 12.1+ bind support', min_fv=_FV
+)
+_TYPED_BIND = _Need('a typed bind needs the 12c+ bind OAC', min_fv=_FV)
+_ASSOC_ARRAY_BIND = _Need('an associative-array bind needs 12.1+ (#122)', min_fv=_FV)
+_OBJECT_BIND = _Need('an object bind needs the 12.1+ OAC', min_fv=_FV)
+_ARRAY_DML_ROWCOUNTS = _Need('arraydmlrowcounts needs a 12.1+ server', min_fv=_FV)
+_TIME_ZONE_SYNC = _Need(
+    'client time-zone sync is 12c+ (AUTH_ALTER_SESSION)', min_fv=_FV
+)
+_TEMP_LOB = _Need('a temporary LOB needs a 12c+ server (CREATE_TEMP)', min_fv=_FV)
+_END_TO_END = _Need('end-to-end tracing requires 12c+', min_fv=_FV)
+_PRE12_VECTOR_REFUSAL = _Need('a 12.1+ session binds a VECTOR', below_fv=_FV)
+_CURSOR_CACHE = _Need(
+    'cursor cache is disabled on 12c+ (re-parse each execute)', below_fv=_FV
+)
+_PRE12_ROWCOUNTS_REFUSAL = _Need('server supports arraydmlrowcounts', below_fv=_FV)
+_JSON = _Need(
+    'native JSON needs a session at field version 20.1+', min_fv=FIELD_VERSION_20_1
+)
+_BOOLEAN = _Need(
+    'native BOOLEAN needs a session at field version 23.1+', min_fv=FIELD_VERSION_23_1
+)
+_SESSION_CONTEXT = _Need(
+    'session-context pairs need the fv > 23.1 FAST_AUTH',
+    min_fv=FIELD_VERSION_23_1_EXT_1,
+)
+_DOMAINS = _Need('column domains and annotations are 23ai', min_fv=FIELD_VERSION_23_4)
+del _FV
+# By the server.
+_SODA = _Need('SODA needs an Oracle 18c+ server (DBMS_SODA)', min_server=18)
+_LTZ = _Need('8i has no TIMESTAMP WITH LOCAL TIME ZONE', not_8i=True)
+_TSTZ = _Need('8i has no TIMESTAMP WITH TIME ZONE', not_8i=True)
+_INTERVAL = _Need('INTERVAL is a 9i+ type; Oracle 8i lacks it', not_8i=True)
+_CHAR_LENGTH = _Need('Oracle 8i has no USER_TAB_COLUMNS.CHAR_LENGTH', not_8i=True)
+_8I_DESCRIBE_SPANS_PACKETS = _Need('a describe outgrows a packet on 8i', only_8i=True)
+_ONLY_8I = _Need('not an Oracle 8i server', only_8i=True)
+_GRID_10G = _Need('the grid starts at 10g', min_fv=FIELD_VERSION_10_2)
+# By the Mirror leg.
+_REAL_SERVER_REPORT = _Need(
+    'a Mirror reports whatever its backend knows', not_mirror=('*',)
+)
+_REAL_SERVER_READS = _Need(
+    'the grid checks what a real Oracle server reads', not_mirror=('*',)
+)
 
 
 # Resolve the TLS proxy fixture without depending on the `tests` package
@@ -486,6 +726,7 @@ class _IntegrationBase(_ThrottleRetry, unittest.TestCase):
                 self.conn = _connect(getattr(self, '_fetch_lobs', True))
                 self.cur = self.conn.cursor()
                 self._skip_if_fv2_unsupported()
+                self._skip_if_class_needs_unmet()
                 self._drop_silently(self.cur)
                 return
             except seerdb.DatabaseError as e:
@@ -503,6 +744,16 @@ class _IntegrationBase(_ThrottleRetry, unittest.TestCase):
 
                 time.sleep(0.05)
         raise Last
+
+    def _skip_if_class_needs_unmet(self):
+        # A class's @_requires (#1339): checked before the class's own setUp
+        # makes anything; the connection is closed first, as a skip from setUp
+        # runs no tearDown.
+        target = _target_of(self.conn)
+        for need in getattr(type(self), '_NEEDS', ()):
+            if need.missing(target):
+                self.conn.close()
+                self.skipTest(need.reason)
 
     def _skip_if_fv2_unsupported(self):
         # On a 9i (fv2) connection, skip the tests whose feature the 9i server
@@ -534,26 +785,6 @@ class _IntegrationBase(_ThrottleRetry, unittest.TestCase):
                         raise
         finally:
             self.conn.close()
-
-    def _skip_if_mirror(self, feature: str):
-        # A Mirror leg runs the same suite against seerdb's own server, which
-        # trails the client on some features -- a column LOB's mutation (#964).
-        # Skip rather than fail, so a Mirror gap does not read as a client
-        # regression. Each caller names the follow-up ticket.
-        if os.environ.get('SEERDB_TEST_MIRROR'):
-            self.skipTest(f'the Mirror does not implement {feature} yet')
-
-    def _skip_if_mirror_backend(self, backend: str, feature: str):
-        # Narrower than _skip_if_mirror: what this leg cannot do belongs to the
-        # BACKEND, not to the Mirror, so only the named one skips. PostgreSQL
-        # cannot parse Oracle SQL and serves no non-query `cursor.parse()`,
-        # while the passthrough asks a real server and does (#1019).
-        leg = os.environ.get('SEERDB_TEST_MIRROR')
-        # A leg that does not name its backend -- '1', which is what a runner
-        # predating the named value sets, including the CI job that starts its
-        # own Mirror -- gets the conservative answer rather than a guess.
-        if leg and leg in (backend, '1'):
-            self.skipTest(f"the Mirror's {backend} backend cannot {feature}")
 
     def _drop_silently(self, cur):
         try:
@@ -807,12 +1038,11 @@ class TypesIntegration(_IntegrationBase):
             self.cur.execute(f"BEGIN :v := TO_YMINTERVAL('{text}'); END;", [v])
             self.assertEqual(v.getvalue(), expected)
 
+    @_requires(_INTERVAL)
     def test_an_interval_ym_bound_into_a_select_list(self):
         # An IntervalYM bound into a select list comes back as one. The Mirror
         # over PostgreSQL described it as DAY TO SECOND and read its months as
         # days (#1401).
-        if _conn_is_8i(self.conn):
-            self.skipTest('INTERVAL is a 9i+ type; Oracle 8i lacks it')
         for value in (seerdb.IntervalYM(-12, -5), seerdb.IntervalYM(3, 2)):
             self.cur.execute('SELECT :1 FROM dual', [value])
             self.assertEqual(self.cur.fetchone(), (value,))
@@ -854,13 +1084,12 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id FROM {self.TABLE} WHERE ROWID = :r', [rid])
         self.assertEqual(self.cur.fetchone(), (1,))
 
+    @_requires(_INTERVAL)
     def test_interval_columns_describe_their_precisions(self):
         # An INTERVAL column describes its leading-field precision and its
         # fractional-seconds precision, declared or Oracle's default, with rows
         # or without, and USER_TAB_COLUMNS spells them in the type. The Mirror
         # over PostgreSQL dropped both (#1381).
-        if _conn_is_8i(self.conn):
-            self.skipTest('INTERVAL is a 9i+ type; Oracle 8i lacks it')
         self.cur.execute(
             f'CREATE TABLE {self.TABLE} (a INTERVAL DAY TO SECOND, '
             'b INTERVAL DAY(3) TO SECOND(2), c INTERVAL YEAR TO MONTH, '
@@ -1505,13 +1734,12 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), (0,))
 
+    @_requires(_CHAR_LENGTH)
     def test_char_length_is_zero_for_a_type_without_one(self):
         # USER_TAB_COLUMNS.CHAR_LENGTH is a character column's declared length
         # and 0 for any other type, never NULL. The Mirror over PostgreSQL gave
         # NULL (#1418). 8i has no CHAR_LENGTH; 9i gives a RAW its length, so the
         # test keeps to types every version agrees on.
-        if _conn_is_8i(self.conn):
-            self.skipTest('Oracle 8i has no USER_TAB_COLUMNS.CHAR_LENGTH')
         self.cur.execute(
             f'CREATE TABLE {self.TABLE} (n NUMBER, v VARCHAR2(20), d DATE)'
         )
@@ -1522,14 +1750,13 @@ class TypesIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.fetchall(), [('N', 0), ('V', 20), ('D', 0)])
 
+    @_requires(_BINARY_FLOAT_SERVER)
     def test_tab_columns_describe_binary_and_timestamp_types_as_oracle(self):
         # A TIMESTAMP's type name carries its fractional-seconds precision, which
         # is also its DATA_SCALE, and its length is that of its wire form; a
         # BINARY_FLOAT / BINARY_DOUBLE has no precision and 4 / 8 bytes. The
         # Mirror over PostgreSQL reported PostgreSQL's float precision and lost
         # the timestamps' (#1480). BINARY_FLOAT is 10g+.
-        if (self.conn.server_version >> 24) < 10:
-            self.skipTest('BINARY_FLOAT / BINARY_DOUBLE are Oracle 10g+')
         self.cur.execute(
             f'CREATE TABLE {self.TABLE} (bf BINARY_FLOAT, bd BINARY_DOUBLE, '
             'ts TIMESTAMP, ts3 TIMESTAMP(3), ts0 TIMESTAMP(0), '
@@ -2118,14 +2345,13 @@ class CursorIntegration(_IntegrationBase):
         self.cur.fetchone()
         self.assertEqual(self.cur.fetchall(), [(2,), (3,), (4,), (5,)])
 
+    @_requires(_TIME_ZONE_SYNC)
     def test_session_timezone_synced_to_client(self):
         # #307: on 12c+ the driver sends AUTH_ALTER_SESSION at login to pin the
         # session time zone to the client's UTC offset (as oracledb / OCI /
         # sqlplus do), so SESSIONTIMEZONE / CURRENT_TIMESTAMP reflect the client,
         # not the server default. Gated to 12c+ (10g/11g's stricter auth parse
         # rejects the extra pair; no oracledb reference to match there).
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('client time-zone sync is 12c+ (AUTH_ALTER_SESSION)')
         off = datetime.datetime.now().astimezone().utcoffset() or datetime.timedelta(0)
         total = int(off.total_seconds())
         sign = '+' if total >= 0 else '-'
@@ -2159,12 +2385,11 @@ class CursorIntegration(_IntegrationBase):
         (n, text) = self.cur.fetchone()
         self.assertEqual((float(n), text), (1.5, 'a'))
 
+    @_requires(_BINARY_FLOAT)
     def test_the_conversion_functions(self):
         # TO_BINARY_FLOAT / _DOUBLE, TO_DSINTERVAL / TO_YMINTERVAL, TO_BLOB and
         # TO_NCLOB -- a backend without them answered "function ... does not
         # exist" to the reference thin client's own suite.
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            self.skipTest('BINARY_FLOAT / BINARY_DOUBLE are 10g+')
         self.cur.execute(
             "SELECT TO_BINARY_DOUBLE(1.5), TO_BINARY_FLOAT('2.5'), "
             "TO_DSINTERVAL('1 02:03:04') FROM dual"
@@ -2178,13 +2403,13 @@ class CursorIntegration(_IntegrationBase):
         self.assertEqual(blob.read() if hasattr(blob, 'read') else blob, b'\xab\xcd')
         self.assertEqual(nclob.read() if hasattr(nclob, 'read') else nclob, 'n')
 
+    @_requires(
+        _postgres_cannot('tell a computed YEAR TO MONTH interval from DAY TO SECOND')
+    )
     def test_a_computed_year_to_month_interval(self):
         # PostgreSQL reports a computed domain-typed value as its base type, so
         # that backend can tell a YEAR TO MONTH interval from a DAY TO SECOND one
         # only when it comes from a column of that type.
-        self._skip_if_mirror_backend(
-            'postgres', 'tell a computed YEAR TO MONTH interval from DAY TO SECOND'
-        )
         self.cur.execute("SELECT TO_YMINTERVAL('01-02') FROM dual")
         (ym,) = self.cur.fetchone()
         self.assertEqual((ym.years, ym.months), (1, 2))
@@ -2644,14 +2869,13 @@ class CursorIntegration(_IntegrationBase):
                 self.cur.execute(f"ALTER SYSTEM KILL SESSION '{session}'")
             self.assertEqual(caught.exception.code, code)
 
+    @_requires(_LTZ)
     def test_timestamp_with_local_time_zone(self):
         # TIMESTAMP WITH LOCAL TIME ZONE (#1208), as measured on 9i to 23ai: a value
         # bound as LTZ is the instant in the database zone and round-trips as it
         # is; a TIMESTAMP bound into one is read in the session zone and comes
         # back in the database's; a precision truncates; a CAST does the same
         # conversions; SYSTIMESTAMP / CURRENT_TIMESTAMP are WITH TIME ZONE.
-        if _conn_is_8i(self.conn):
-            self.skipTest('8i has no TIMESTAMP WITH LOCAL TIME ZONE')
         self.cur.execute('SELECT sessiontimezone, dbtimezone FROM dual')
         (session, database) = (_tz_offset(z) for z in self.cur.fetchone())
         if session is None or database is None:
@@ -2700,6 +2924,7 @@ class CursorIntegration(_IntegrationBase):
             ],
         )
 
+    @_requires(_8I_DESCRIBE_SPANS_PACKETS)
     def test_a_describe_wider_than_a_packet(self):
         # V$SESSION's 45 columns describe to more than an 8i packet holds, and
         # the server pauses between the packets, so the client sees the
@@ -2709,8 +2934,6 @@ class CursorIntegration(_IntegrationBase):
         # suite's user (SYSTEM) may read V$SESSION.
         from seerdb.common.exceptions import DatabaseError
 
-        if not _conn_is_8i(self.conn):
-            self.skipTest('a describe outgrows a packet on 8i')
         self.cur.execute("SELECT * FROM v$session WHERE audsid = userenv('sessionid')")
         self.assertGreater(len(self.cur.description), 40)
         self.assertEqual(len(self.cur.fetchall()), 1)
@@ -2723,11 +2946,10 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute('SELECT 1 FROM dual')
         self.assertEqual(self.cur.fetchall(), [(1,)])
 
+    @_requires(_TSTZ)
     def test_timestamp_with_time_zone_compares_by_instant(self):
         # Equal, ordered and counted by the instant, whatever the offset each
         # value was written at; a NULL bind matches nothing (#1239).
-        if _conn_is_8i(self.conn):
-            self.skipTest('8i has no TIMESTAMP WITH TIME ZONE')
         self.cur.execute(
             f'CREATE TABLE {self.TABLE} (k NUMBER, t TIMESTAMP WITH TIME ZONE)'
         )
@@ -2750,12 +2972,11 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT COUNT(DISTINCT t) FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchall(), [(2,)])
 
+    @_requires(_LTZ, _LTZ_SESSION_ARITHMETIC)
     def test_days_added_to_a_timestamp_with_local_time_zone(self):
         # LTZ + n is a DATE on the session's clock, its fractional seconds
         # dropped; assigned back to an LTZ it is read in the session zone again,
         # so a PL/SQL in/out round trip moves the value by exactly n days (#1240).
-        if _conn_is_8i(self.conn):
-            self.skipTest('8i has no TIMESTAMP WITH LOCAL TIME ZONE')
         self.cur.execute('SELECT sessiontimezone, dbtimezone FROM dual')
         (session, database) = (_tz_offset(z) for z in self.cur.fetchone())
         if session is None or database is None:
@@ -2771,23 +2992,18 @@ class CursorIntegration(_IntegrationBase):
                 on_session_clock - datetime.timedelta(days=0.5),
             ),
         )
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            self.skipTest('9i PL/SQL does LTZ + n on the database clock (#1241)')
         var = self.cur.var(seerdb.DB_TYPE_TIMESTAMP_LTZ)
         var.setvalue(0, value.replace(microsecond=0))
         self.cur.execute('begin :value := :value + 5.25; end;', {'value': var})
         self.assertEqual(var.getvalue(), datetime.datetime(2022, 5, 15, 18, 0, 0))
 
+    @_requires(_LTZ, _TRUNC_TIMESTAMP)
     def test_a_midnight_ltz_bind_matches_a_truncated_ltz_column(self):
         # A TIMESTAMP WITH LOCAL TIME ZONE bind with no fractional seconds goes
         # out in the 7-byte DATE form, as python-oracledb sends it: the server
         # compared the 11-byte form with a zero fraction to trunc() of an LTZ
         # column and matched nothing (#1337). The session runs in the database's
         # zone, as python-oracledb's own suite pins it.
-        if _conn_is_8i(self.conn):
-            self.skipTest('8i has no TIMESTAMP WITH LOCAL TIME ZONE')
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            self.skipTest("9i's TRUNC takes no TIMESTAMP (ORA-00932)")
         self.cur.execute('SELECT sessiontimezone, dbtimezone FROM dual')
         (session, database) = self.cur.fetchone()
         self.cur.execute(f"ALTER SESSION SET TIME_ZONE = '{database}'")
@@ -2865,12 +3081,11 @@ class CursorIntegration(_IntegrationBase):
             self._drop_silently(self.cur)
             self.cur.execute(f'DROP TYPE {Type}')
 
+    @_requires(_INVISIBLE_COLUMNS)
     def test_an_invisible_column(self):
         # An INVISIBLE column (12.1+) is left out of `*` and of an INSERT with no
         # column list, works when named, and has no COLUMN_ID; USER_TAB_COLS
         # marks it HIDDEN (#1195). Measured on 23ai.
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('INVISIBLE columns are 12.1+')
         T = self.TABLE
         self.cur.execute(f'CREATE TABLE {T} (a NUMBER, h NUMBER INVISIBLE, b NUMBER)')
         self.cur.execute(f'INSERT INTO {T} VALUES (1, 2)')
@@ -3099,12 +3314,11 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), (7,))
 
+    @_requires(_TYPED_BIND)
     def test_binary_integer_out_bind_is_an_int(self):
         # BINARY_INTEGER / PLS_INTEGER travels as an Oracle NUMBER, so the bytes
         # for `:v := 2.9` are the same either way -- the DECLARED type is what
         # makes the value an integer, and the truncation is the client's (#1044).
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('a typed BINARY_INTEGER bind needs the 12c+ bind OAC')
         for expr, want in (('2.9', 2), ('-2.9', -2), ('5', 5), ('0', 0)):
             with self.subTest(expr=expr):
                 got = self.cur.var(seerdb.DB_TYPE_BINARY_INTEGER)
@@ -3113,22 +3327,21 @@ class CursorIntegration(_IntegrationBase):
                 self.assertIsInstance(value, int)
                 self.assertEqual(value, want)
 
+    @_requires(_TYPED_BIND)
     def test_a_number_out_bind_is_still_not_truncated(self):
         # The companion: the same statement through a NUMBER var keeps its
         # fraction, so the coercion belongs to the declared type and not to the
         # wire form the two share.
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('a typed bind needs the 12c+ bind OAC')
         got = self.cur.var(seerdb.DB_TYPE_NUMBER)
         self.cur.execute('BEGIN :value := 2.9; END;', [got])
         self.assertEqual(float(got.getvalue()), 2.9)
 
+    @_requires(_postgres_cannot('run a PL/SQL block'))
     def test_select_into_with_no_rows_raises(self):
         # ORA-01403 is the end-of-fetch sentinel a query's last FETCH ends on,
         # AND the error a PL/SQL `SELECT ... INTO` raises when it matches
         # nothing. Masking it for both turned every such block into a silent
         # success handing back NULL (#1039).
-        self._skip_if_mirror_backend('postgres', 'run a PL/SQL block')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
         got = self.cur.var(int)
         with self.assertRaises(seerdb.DatabaseError) as ctx:
@@ -3151,10 +3364,10 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id FROM {self.TABLE} WHERE 1 = 0')
         self.assertIsNone(self.cur.fetchone())
 
+    @_requires(_postgres_cannot('run a PL/SQL block'))
     def test_select_into_that_finds_a_row_is_unaffected(self):
         # The block still works when it does find its row -- the guard must not
         # turn a success into an error either.
-        self._skip_if_mirror_backend('postgres', 'run a PL/SQL block')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
         self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (7)')
         got = self.cur.var(int)
@@ -3421,18 +3634,10 @@ class CursorIntegration(_IntegrationBase):
 
     # ----- executemany arraydmlrowcounts (12c+) -----
 
-    def _require_12c(self):
-        # arraydmlrowcounts is a 12.1+ server feature (it rides the 12c+ OALL8
-        # al8pidmlrc block); skip the positive tests on an 11g server.
-        from seerdb.common.tns_consts import FIELD_VERSION_12_1
-
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('arraydmlrowcounts needs a 12.1+ server')
-
+    @_requires(_ARRAY_DML_ROWCOUNTS)
     def test_executemany_arraydmlrowcounts_update(self):
         # Per-iteration affected-row counts: UPDATE g=1 hits 3 rows, g=2 hits 1,
         # g=3 hits 2, g=9 hits none -> [3, 1, 2, 0]. Matches oracledb (#18).
-        self._require_12c()
         self.cur.execute(f'CREATE TABLE {self.TABLE} (g NUMBER, v NUMBER)')
         self.cur.executemany(
             f'INSERT INTO {self.TABLE} VALUES (:1, :2)',
@@ -3445,12 +3650,12 @@ class CursorIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.getarraydmlrowcounts(), [3, 1, 2, 0])
 
+    @_requires(_ARRAY_DML_ROWCOUNTS)
     def test_arraydmlrowcounts_survive_a_batch_that_aborts(self):
         # A batch that fails part-way really applied the earlier rows, and a
         # client that asked for the per-iteration counts is owed them in the
         # ERROR reply too. Without them it reports the mode as never enabled --
         # a worse answer than the failure it is also being told about (#1031).
-        self._require_12c()
         self.cur.execute(
             f'CREATE TABLE {self.TABLE} (id NUMBER PRIMARY KEY, v VARCHAR2(10))'
         )
@@ -3462,12 +3667,12 @@ class CursorIntegration(_IntegrationBase):
             )
         self.assertEqual(self.cur.getarraydmlrowcounts(), [1, 1])
 
+    @_requires(_ARRAY_DML_ROWCOUNTS)
     def test_batcherrors_and_arraydmlrowcounts_together(self):
         # They are not alternatives: one execute may ask for both, and then the
         # batcherrors reply owes the counts as well (#1031). A row that failed
         # affected nothing and still holds its slot, or every count after it
         # shifts.
-        self._require_12c()
         self.cur.execute(
             f'CREATE TABLE {self.TABLE} (id NUMBER PRIMARY KEY, v VARCHAR2(10))'
         )
@@ -3482,13 +3687,13 @@ class CursorIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.getarraydmlrowcounts(), [1, 1, 0, 1])
 
+    @_requires(_ARRAY_DML_ROWCOUNTS)
     def test_batch_errors_report_index_failures_last(self):
         # Not row order: a real server evaluates the row (conversion, NOT NULL,
         # CHECK) as it goes and maintains the unique index afterwards, so the
         # unique violations come after every other failure, each group still
         # ascending. Measured on a live 23ai with the orders deliberately
         # reversed against each other (#1031).
-        self._require_12c()
         self.cur.execute(
             f'CREATE TABLE {self.TABLE} '
             '(id NUMBER PRIMARY KEY, v NUMBER(3), c NUMBER CHECK (c < 100))'
@@ -3505,9 +3710,9 @@ class CursorIntegration(_IntegrationBase):
             [(2, 2290), (3, 1438), (1, 1)],
         )
 
+    @_requires(_ARRAY_DML_ROWCOUNTS)
     def test_executemany_arraydmlrowcounts_insert(self):
         # Each INSERT iteration affects exactly one row.
-        self._require_12c()
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
         self.cur.executemany(
             f'INSERT INTO {self.TABLE} VALUES (:1)',
@@ -3516,10 +3721,10 @@ class CursorIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.getarraydmlrowcounts(), [1, 1, 1, 1, 1])
 
+    @_requires(_ARRAY_DML_ROWCOUNTS)
     def test_arraydmlrowcounts_empty_without_request(self):
         # Without arraydmlrowcounts the list stays empty, and a prior request's
         # counts don't leak into a later plain executemany.
-        self._require_12c()
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
         self.cur.executemany(
             f'INSERT INTO {self.TABLE} VALUES (:1)',
@@ -3530,12 +3735,10 @@ class CursorIntegration(_IntegrationBase):
         self.cur.executemany(f'INSERT INTO {self.TABLE} VALUES (:1)', [(3,), (4,)])
         self.assertEqual(self.cur.getarraydmlrowcounts(), [])
 
+    @_requires(_PRE12_ROWCOUNTS_REFUSAL)
     def test_arraydmlrowcounts_unsupported_on_11g(self):
         # On an 11g server the feature is rejected up front (oracledb-compatible).
-        from seerdb.common.tns_consts import FIELD_VERSION_12_1
 
-        if self.conn.field_version >= FIELD_VERSION_12_1:
-            self.skipTest('server supports arraydmlrowcounts')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
         with self.assertRaises(seerdb.NotSupportedError):
             self.cur.executemany(
@@ -3828,12 +4031,11 @@ class BindIntegration(_IntegrationBase):
         self.cur.execute('SELECT :"a", :"a" FROM dual', {'"a"': 5})
         self.assertEqual(self.cur.fetchall(), [(5, 5)])
 
+    @_requires(_Q_QUOTING)
     def test_a_colon_word_in_a_q_literal_or_a_comment_is_no_bind(self):
         # q'[...]' is a string literal however it is quoted, and a `:z` inside
         # one -- or inside a comment -- is text, not a placeholder. Read as one,
         # named binds were refused: "missing bind value for :Z" (#1679).
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            self.skipTest("alternative quoting (q'[...]') is 10g and later")
         self.cur.execute("SELECT q'[it's :z]', :b /* :c */ FROM dual", {'b': 5})
         self.assertEqual(self.cur.fetchall(), [("it's :z", 5)])
 
@@ -3915,6 +4117,7 @@ class BindIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT v FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchall(), [(val,)])
 
+    @_requires(_NATIONAL_OUT_BIND)
     def test_national_scalar_out_bind(self):
         # A national OUT bind arrives as AL16UTF16, and the Var's charset form is
         # what says so. Without it the value came back as its raw UTF-16BE bytes
@@ -3924,21 +4127,18 @@ class BindIntegration(_IntegrationBase):
         # outright with ORA-03120 "two-task conversion routine: integer
         # overflow", before any value comes back. That is a tier limitation, not
         # this decode -- the request bytes are identical either way.
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            self.skipTest('a national OUT bind is refused on fv2 (ORA-03120)')
         Var = self.cur.var(seerdb.DB_TYPE_NVARCHAR)
         self.cur.execute("BEGIN :v := N'nat \u00fcn\u00ee \u4e2d'; END;", [Var])
         self.assertEqual(Var.getvalue(), 'nat ünî 中')
 
+    @_requires(_postgres_cannot('run PL/SQL'))
+    @_requires(_ASSOC_ARRAY_BIND)
     def test_national_array_bind_round_trip(self):
         # PL/SQL-bound: an associative array lives in a PL/SQL PACKAGE (#1127).
-        self._skip_if_mirror_backend('postgres', 'run PL/SQL')
         # An associative array of NVARCHAR2 in both directions (#991). The
         # element is encoded as a bare value, so it never saw the bind's charset
         # form: going out it went as UTF-8 and the server read those bytes as
         # UTF-16BE, silently halving every string.
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('an associative-array bind needs 12.1+ (#122)')
         Proc = 'PYORACLE_NARR'
         self.cur.execute(
             f"""CREATE OR REPLACE PACKAGE {Proc} AS
@@ -4173,12 +4373,11 @@ class BindIntegration(_IntegrationBase):
         self.assertEqual(got, [datetime.datetime(2022, 6, 3, 10, 0, tzinfo=Tz), None])
         self.assertEqual(got[0].utcoffset(), datetime.timedelta(hours=3))
 
+    @_requires(_TRUNC_TIMESTAMP)
     def test_trunc_and_round_of_a_timestamptz(self):
         # TRUNC and ROUND of a WITH TIME ZONE value work on its own wall-clock
         # time and give a DATE. 2022-06-08 00:00:10 +05:30 is 2022-06-07 in UTC,
         # which a Mirror-over-PG used to truncate in a UTC session (#1313).
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            self.skipTest("9i's TRUNC and ROUND take no TIMESTAMP (ORA-00932)")
         self.cur.execute('SELECT sessiontimezone FROM dual')
         (zone,) = self.cur.fetchone()
         self.cur.execute("ALTER SESSION SET TIME_ZONE = '+00:00'")
@@ -4496,9 +4695,8 @@ class LastRowidIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT n FROM {self.TABLE} WHERE ROWID = :1', [rowid])
         return [r[0] for r in self.cur.fetchall()]
 
+    @_requires(_ARRAY_DML)
     def test_lastrowid_follows_the_touched_row(self):
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            self.skipTest('executemany (array DML) is a 10g+ path')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, s VARCHAR2(10))')
         self.assertIsNone(self.cur.lastrowid)  # DDL
         self.cur.execute(f"INSERT INTO {self.TABLE} VALUES (1, 'a')")
@@ -4557,6 +4755,7 @@ class ZeroRowDmlIntegration(_IntegrationBase):
         self.assertIsNone(self.cur.lastrowid)
 
 
+@_requires(_DOMAINS)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class ColumnDomainIntegration(_IntegrationBase):
     """A 23ai column's SQL domain and annotations on ``cursor.description`` (#1083)."""
@@ -4565,8 +4764,6 @@ class ColumnDomainIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        if self.conn.field_version < FIELD_VERSION_23_4:
-            self.skipTest('column domains and annotations are 23ai')
         self._drop_domain()
 
     def tearDown(self):
@@ -4614,6 +4811,7 @@ class ColumnDomainIntegration(_IntegrationBase):
 class PhysicalUrowidIntegration(_IntegrationBase):
     """A physical rowid stored in a UROWID column (#1086)."""
 
+    @_requires(_postgres_cannot('keep a row at one address across an UPDATE'))
     def test_it_reads_back_as_the_same_rowid(self):
         # A UROWID value is tagged 0x01 when it holds a physical rowid; it used to
         # render in the '*' logical form, unlike the same row's ROWID column and
@@ -4621,9 +4819,6 @@ class PhysicalUrowidIntegration(_IntegrationBase):
         # PostgreSQL writes an UPDATEd row as a new version at a new address, so
         # the rowid `SET r = ROWID` stores names the version it replaced; an
         # Oracle ROWID does not move on UPDATE.
-        self._skip_if_mirror_backend(
-            'postgres', 'keep a row at one address across an UPDATE'
-        )
         self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, r ROWID, u UROWID)')
         self.cur.execute(f'INSERT INTO {self.TABLE} (n) VALUES (1)')
         self.cur.execute(f'UPDATE {self.TABLE} SET r = ROWID, u = ROWID')
@@ -4660,6 +4855,7 @@ def _kill_session(sid) -> None:
 class PingKilledSessionIntegration(_ThrottleRetry, unittest.TestCase):
     """A ping on a session the server killed raises, as the server says (#1095)."""
 
+    @_requires(_PING_ROUND_TRIP)
     def test_ping_raises_on_a_killed_session(self):
         conn = seerdb.connect(
             host=_HOST,
@@ -4670,8 +4866,6 @@ class PingKilledSessionIntegration(_ThrottleRetry, unittest.TestCase):
             **_FV_KW,
         )
         try:
-            if conn.field_version < FIELD_VERSION_10_2:
-                self.skipTest('9i pings with a query, which already raises')
             cur = conn.cursor()
             cur.execute("SELECT SYS_CONTEXT('userenv', 'sid') FROM dual")
             _kill_session(int(cur.fetchone()[0]))
@@ -4693,6 +4887,7 @@ class ProxyLoginIntegration(_ThrottleRetry, unittest.TestCase):
     account has no such grant, so without it the test says so and skips.
     """
 
+    @_requires(_PROXY_AUTH)
     def test_the_session_runs_as_the_proxied_user(self):
         proxy = os.environ.get('SEERDB_TEST_PROXY_USER')
         if not proxy:
@@ -4707,8 +4902,6 @@ class ProxyLoginIntegration(_ThrottleRetry, unittest.TestCase):
             service_name=_SERVICE,
             **_FV_KW,
         ) as conn:
-            if conn.field_version < FIELD_VERSION_10_2:
-                self.skipTest('proxy authentication needs a 10g+ server')
             cur = conn.cursor()
             cur.execute(
                 "SELECT SYS_CONTEXT('userenv', 'session_user'), "
@@ -4748,11 +4941,11 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
     selecting the locator works and only reading it fails.
     """
 
+    @_requires(_postgres_cannot('serve a BFILE column'))
     def test_bfile_missing_directory_fetches_and_only_the_read_fails(self):
         # fetch_lobs=False used to materialise the BFILE at fetch time, which
         # opens the file -- so the SELECT itself raised ORA-22285 where
         # python-oracledb hands back the locator.
-        self._skip_if_mirror_backend('postgres', 'serve a BFILE column')
         Conn = _connect(fetch_lobs=False)
         try:
             Cur = Conn.cursor()
@@ -4769,13 +4962,13 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
         finally:
             Conn.close()
 
+    @_requires(_postgres_cannot('serve a BFILE column'))
     def test_bfile_methods_on_a_missing_directory(self):
         # getfilename() answers from the locator, so it works for a file that is
         # not there and a DIRECTORY that was never created. fileexists() asks
         # the server, and a missing alias is ORA-22285 rather than False --
         # "there is no such alias" and "the file is missing" are different
         # answers (#1109).
-        self._skip_if_mirror_backend('postgres', 'serve a BFILE column')
         Conn = _connect(fetch_lobs=False)
         try:
             Cur = Conn.cursor()
@@ -4799,17 +4992,14 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
         finally:
             Conn.close()
 
+    @_requires(_postgres_cannot('create a temp LOB'), _TEMP_LOB)
     def test_bfile_methods_refuse_a_non_bfile_lob(self):
         # The three are meaningless on a CLOB / BLOB and are refused there, as
         # the reference client refuses them (DPY-3026) rather than answering
         # something (#1109). Needs a temp LOB to have a non-BFILE to refuse, and
         # CREATE_TEMP is 12c+ -- 11g refuses it (#91), so there is nothing to
         # build the CLOB / BLOB out of there.
-        self._skip_if_mirror_backend('postgres', 'create a temp LOB')
         Conn = _connect()
-        if Conn.field_version < FIELD_VERSION_12_1:
-            Conn.close()
-            self.skipTest('createlob() needs a 12c+ server (CREATE_TEMP)')
         try:
             for Kind in (seerdb.DB_TYPE_CLOB, seerdb.DB_TYPE_BLOB):
                 Lob = Conn.createlob(Kind)
@@ -4823,18 +5013,15 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
             Conn.close()
 
 
+@_requires(_postgres_cannot("know a block's bind directions"))
+@_requires(_BLOCK_IOV)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class BindDirectionIntegration(_IntegrationBase):
     """``cursor.bind_directions``: what the server said each bind was (#1064)."""
 
-    def setUp(self):
-        super().setUp()
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            self.skipTest('the fv2 block reply carries no IOV directions')
-        # Only a backend with a real server behind it can know the directions;
-        # one that cannot reports every bind OUT, which is the documented
-        # fallback rather than a gap (#1064).
-        self._skip_if_mirror_backend('postgres', "know a block's bind directions")
+    # Only a backend with a real server behind it can know the directions;
+    # one that cannot reports every bind OUT, which is the documented
+    # fallback rather than a gap (#1064).
 
     def test_a_block_reports_its_bind_directions(self):
         # The wire carries no direction on the way in, so the reply is the only
@@ -4861,6 +5048,7 @@ class BindDirectionIntegration(_IntegrationBase):
         self.assertIsNone(self.cur.bind_directions)
 
 
+@_requires(_TEMP_LOB)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class TempLobBindIntegration(_IntegrationBase):
     """Large CLOB / BLOB into a PL/SQL locator param (#91).
@@ -4874,8 +5062,6 @@ class TempLobBindIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('temp-LOB bind needs a 12c+ server (CREATE_TEMP)')
         self.cur.execute(
             'CREATE OR REPLACE FUNCTION pyo_clob_len(p CLOB) RETURN NUMBER IS '
             'BEGIN RETURN DBMS_LOB.GETLENGTH(p); END;'
@@ -4933,17 +5119,13 @@ class TempLobBindIntegration(_IntegrationBase):
             self.assertEqual(r.getvalue(), n)
 
 
+@_requires(_TEMP_LOB)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class CreateLobIntegration(_IntegrationBase):
     """``connection.createlob()``: a temp LOB the caller makes and binds (#1066).
 
     12c+ only, like every temp LOB: 11g refuses CREATE_TEMP (#91).
     """
-
-    def setUp(self):
-        super().setUp()
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('createlob() needs a 12c+ server (CREATE_TEMP)')
 
     def test_each_lob_type_round_trips_through_a_bind(self):
         self.cur.execute(
@@ -4969,10 +5151,10 @@ class CreateLobIntegration(_IntegrationBase):
         self.assertEqual((c.read(), n.read(), b.read()), (Text, Text, Data))
         self.assertEqual(n_len, len(Text))
 
+    @_requires(_postgres_cannot('build an XMLType'))
     def test_a_large_clob_into_xmltype(self):
         # What the method is for: sys.xmltype() needs a genuine LOB argument,
         # and refuses the same 32 KB as a plain string with ORA-01461.
-        self._skip_if_mirror_backend('postgres', 'build an XMLType')
         Xml = '<data>' + 'x' * 32768 + '</data>'
         self.cur.execute(
             'SELECT XMLSERIALIZE(CONTENT sys.xmltype(:1) AS CLOB) FROM dual',
@@ -5205,12 +5387,8 @@ class CursorCacheIntegration(_IntegrationBase):
         handles = [v for k, v in self.conn._cursor_cache.items() if k[0] == sql]
         return handles[0] if handles else None
 
+    @_requires(_CURSOR_CACHE)
     def test_repeated_dml_reuses_cursor(self):
-        if self.conn.field_version >= FIELD_VERSION_12_1:
-            # The cache is disabled on the *negotiated* 12c+ connection, so gate
-            # on that — not on SEERDB_TEST_FIELD_VERSION, which is unset when
-            # the suite simply points at a 21c server (#81).
-            self.skipTest('cursor cache is disabled on 12c+ (re-parse each execute)')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, v VARCHAR2(10))')
         Sql = f'INSERT INTO {self.TABLE} VALUES (:id, :v)'
         # First execute: parses + caches.
@@ -5230,11 +5408,10 @@ class CursorCacheIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id, v FROM {self.TABLE} ORDER BY id')
         self.assertEqual(self.cur.fetchall(), [(1, 'z'), (2, 'b')])
 
+    @_requires(_CURSOR_CACHE)
     def test_a_failed_execute_forgets_the_cached_cursor(self):
         # The server drops a cursor whose execute failed. Keeping its id made
         # every later execute of the same statement answer ORA-01001 (#709).
-        if self.conn.field_version >= FIELD_VERSION_12_1:
-            self.skipTest('cursor cache is disabled on 12c+ (re-parse each execute)')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER PRIMARY KEY)')
         Sql = f'INSERT INTO {self.TABLE} VALUES (:id)'
         self.cur.execute(Sql, {'id': 1})
@@ -5246,13 +5423,12 @@ class CursorCacheIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), (2,))
 
+    @_requires(_CURSOR_CACHE)
     def test_ddl_forgets_the_cached_cursors(self):
         # A cached cursor re-executed after its table was dropped and
         # re-created made the server reuse the previous execution's value for
         # a NULL LONG-class bind: ORA-12899 here, silent corruption into a
         # wider column (#720). DDL flushes the cache.
-        if self.conn.field_version >= FIELD_VERSION_12_1:
-            self.skipTest('cursor cache is disabled on 12c+ (re-parse each execute)')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, d CLOB)')
         Sql = f'INSERT INTO {self.TABLE} (id, d) VALUES (:id, :d)'
         Wide = self.cur.var(str)
@@ -5265,13 +5441,12 @@ class CursorCacheIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id, d FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchall(), [(2, None)])
 
+    @_requires(_PRE10_RETURNING)
     def test_pre_10g_serves_the_into_clause_through_a_block(self):
         # Below 10g the 10g+ request form is refused by the server (9i answers
         # ORA-00439), but the identical statement runs inside a PL/SQL block
         # where the INTO targets are ordinary OUT binds, so the driver rewrites
         # it there (#801). 8i keeps refusing (#802).
-        if self.conn.field_version >= FIELD_VERSION_10_2:
-            self.skipTest('RETURNING ... INTO takes the native path from 10g')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
         Sql = f'INSERT INTO {self.TABLE} (id) VALUES (:1) RETURNING id INTO :2'
         Got = self.cur.var(int)
@@ -5296,11 +5471,10 @@ class CursorCacheIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id FROM {self.TABLE} ORDER BY id')
         self.assertIn((2,), self.cur.fetchall())
 
+    @_requires(_CURSOR_CACHE)
     def test_a_wide_bind_is_never_cached(self):
         # DDL from another session would leave the same stale buffer behind,
         # so a statement with a LONG-class bind parses afresh every time (#720).
-        if self.conn.field_version >= FIELD_VERSION_12_1:
-            self.skipTest('cursor cache is disabled on 12c+ (re-parse each execute)')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, d VARCHAR2(50))')
         Sql = f'INSERT INTO {self.TABLE} (id, d) VALUES (:id, :d)'
         Wide = self.cur.var(str)
@@ -5325,9 +5499,8 @@ class CursorCacheIntegration(_IntegrationBase):
         self.assertEqual(self.cur.fetchall(), [(2,)])
         self.assertNotIn(Sql, self.conn._cursor_cache)
 
+    @_requires(_CURSOR_CACHE)
     def test_cache_evicts_oldest_when_full(self):
-        if self.conn.field_version >= FIELD_VERSION_12_1:  # cache off on 12c+ (#81)
-            self.skipTest('cursor cache is disabled on 12c+ (re-parse each execute)')
         # Drive past `_cursor_cache_max` distinct DML statements and
         # confirm the cache stays bounded and keeps the most recent.
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
@@ -5358,18 +5531,16 @@ class ParseIntegration(_IntegrationBase):
     def _pre10(self):
         return self.conn.field_version < FIELD_VERSION_10_2
 
+    @_requires(_PRE10_PARSE_REFUSAL)
     def test_parse_is_refused_on_pre10(self):
-        if not self._pre10():
-            self.skipTest('10g+ sends a real parse; this is the pre-10g refusal')
         with self.assertRaises(seerdb.NotSupportedError):
             self.cur.parse('SELECT 1 FROM DUAL')
         # The connection is untouched by the refusal — nothing went on the wire.
         self.cur.execute('SELECT 1 FROM DUAL')
         self.assertEqual(self.cur.fetchone(), (1,))
 
+    @_requires(_PARSE)
     def test_parse_describes_a_query_without_fetching_it(self):
-        if self._pre10():
-            self.skipTest('cursor.parse() needs 10g+')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, name VARCHAR2(40))')
         self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1, %s)' % "'a'")
         self.cur.parse(f'SELECT id, name FROM {self.TABLE}')
@@ -5378,28 +5549,25 @@ class ParseIntegration(_IntegrationBase):
         # is what ORA-01002 (fetch out of sequence) came from.
         self.assertEqual(self.cur.fetchall(), [])
 
+    @_requires(_PARSE)
     def test_parse_does_not_run_the_statement(self):
-        if self._pre10():
-            self.skipTest('cursor.parse() needs 10g+')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
         self.cur.parse(f'INSERT INTO {self.TABLE} (id) VALUES (:v)')
         self.assertIsNone(self.cur.description)  # not a query
         self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), (0,))
 
+    @_requires(_PARSE)
     def test_parse_reports_an_unknown_column(self):
-        if self._pre10():
-            self.skipTest('cursor.parse() needs 10g+')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
         with self.assertRaises(seerdb.DatabaseError) as ctx:
             self.cur.parse(f'SELECT nonexistent_col FROM {self.TABLE}')
         self.assertEqual(ctx.exception.code, 904)  # ORA-00904
 
+    @_requires(_PARSE)
     def test_parse_reports_an_invalid_bind_name(self):
         # The motivating case (#826): a RETURNING clause whose INTO target names
         # a reserved word is rejected at parse time and at no other time.
-        if self._pre10():
-            self.skipTest('cursor.parse() needs 10g+')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
         with self.assertRaises(seerdb.DatabaseError) as ctx:
             self.cur.parse(
@@ -5420,35 +5588,31 @@ class ParseIntegration(_IntegrationBase):
             self.cur.parse('SELECT :ROWID FROM dual')
         self.assertEqual(parsed.exception.code, 1745)
 
+    @_requires(_PARSE)
     def test_parse_takes_numbered_placeholders(self):
         # A parse carries no values, so its statement is checked with a NULL for
         # each placeholder -- numbered ones too. The Mirror counted only named
         # ones and sent `values (:1)` to the database unbound (#1394).
-        if self._pre10():
-            self.skipTest('cursor.parse() needs 10g+')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
         self.cur.parse(f'INSERT INTO {self.TABLE} (id) VALUES (:1)')
         self.cur.parse(f'SELECT id FROM {self.TABLE} WHERE id = :1')
         self.assertEqual([d[0] for d in self.cur.description], ['ID'])
 
+    @_requires(_PARSE)
     def test_parse_reports_a_statement_that_is_not_sql(self):
-        if self._pre10():
-            self.skipTest('cursor.parse() needs 10g+')
         with self.assertRaises(seerdb.DatabaseError) as ctx:
             self.cur.parse('this is not sql')
         self.assertEqual(ctx.exception.code, 900)  # ORA-00900
 
+    @_requires(_PARSE)
     def test_parse_accepts_a_plsql_block(self):
-        if self._pre10():
-            self.skipTest('cursor.parse() needs 10g+')
         self.cur.parse('BEGIN NULL; END;')
         self.assertIsNone(self.cur.description)
 
+    @_requires(_PARSE)
     def test_the_cursor_is_usable_after_a_failed_parse(self):
         # A parse that raised must leave the session in step — the whole point
         # of validating without running.
-        if self._pre10():
-            self.skipTest('cursor.parse() needs 10g+')
         with self.assertRaises(seerdb.DatabaseError):
             self.cur.parse('this is not sql')
         self.cur.execute('SELECT 1 FROM DUAL')
@@ -5540,14 +5704,13 @@ class FetchFlowIntegration(_IntegrationBase):
         sc.scroll(mode='first')
         self.assertEqual(sc.fetchone(), (1,))
 
+    @_requires(_SERVER_SCROLL)
     def test_scrollable_lazy_fetch_on_demand(self):
         # Server-side scrollable cursor (#181), 10g+: rows are pulled lazily from
         # a kept-open cursor in arraysize batches (here prefetchrows=2,
         # arraysize=3 over 10 rows forces several positioned re-executes), and
         # scroll() repositions server-side. 9i has no OALL8 scroll and falls back
         # to the buffered path (covered by test_scrollable_cursor).
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            self.skipTest('server-side scroll needs 10g+ (9i uses buffered scroll)')
         self._populate(10)
         sc = self.conn.cursor(scrollable=True)
         sc.prefetchrows = 2
@@ -5561,11 +5724,10 @@ class FetchFlowIntegration(_IntegrationBase):
         sc.scroll(mode='first')
         self.assertEqual([r[0] for r in sc.fetchall()], list(range(1, 11)))
 
+    @_requires(_SERVER_SCROLL)
     def test_scrollable_scroll_off_end_and_back(self):
         # Scrolling past the end (#181) leaves the cursor empty (next fetchone is
         # None), and a later scroll repositions back into the result set.
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            self.skipTest('server-side scroll needs 10g+')
         self._populate(5)
         sc = self.conn.cursor(scrollable=True)
         sc.prefetchrows = 2
@@ -5576,14 +5738,13 @@ class FetchFlowIntegration(_IntegrationBase):
         sc.scroll(mode='first')
         self.assertEqual(sc.fetchone(), (1,))
 
+    @_requires(_SERVER_SCROLL)
     def test_scrollable_last_after_eof_duplicate_value(self):
         # LAST after the buffer already reached EOF with arraysize >= row count
         # (#181): the server repositions onto the last row, whose value equals the
         # one just returned, so it omits the value and flags "reuse previous" in
         # the row-header bit vector. Exercises decode_token_rxh's bit-vector pass
         # + the previous-row seed (this used to desync / crash on token 0x0a).
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            self.skipTest('server-side scroll needs 10g+')
         self._populate(6)
         sc = self.conn.cursor(scrollable=True)
         sc.prefetchrows = 2
@@ -5657,24 +5818,22 @@ class FetchFlowIntegration(_IntegrationBase):
         self.assertEqual(self.cur.fetchone(), (1,))
         self.assertEqual(self.conn.dbop, 'PYODBOP')
 
+    @_requires(_END_TO_END)
     def test_module_alone(self):
         # Setting module without action must not malform the piggyback — Oracle
         # requires both together, so a module-only flush carries action too
         # (#184). 12c+ only.
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('end-to-end tracing requires 12c+')
         self.conn.module = 'SOLOMOD'
         self.cur.execute("SELECT SYS_CONTEXT('USERENV','MODULE') FROM dual")
         self.assertEqual(self.cur.fetchone(), ('SOLOMOD',))
 
+    @_requires(_FV2_EXECUTE_PATH)
     def test_repeated_execute_no_cursor_leak(self):
         # #191: repeated execute() of one statement must not leak server
         # cursors. Pre-fix this tripped ORA-01000 after ~300 executes on 12c+
         # (cache off); the drained cursor is now freed by an OCCA piggyback in
         # front of the next call. 400 > the typical OPEN_CURSORS, so this would
         # fail on 12c+ without the fix.
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            self.skipTest('fv2 (9i) uses a separate execute path')
         t = 'PYO_LEAK191'
         try:
             self.cur.execute(f'DROP TABLE {t}')
@@ -5714,12 +5873,11 @@ class LOBIntegration(_IntegrationBase):
         self._fetch_lobs = False
         super().setUp()
 
+    @_requires(_LOB_READ_IN_TRANSACTION)
     def test_lob_columns_are_readable_inside_an_open_transaction(self):
         # call_status reads 2 while a transaction is open; keyed on the value 1,
         # the drain never fetched the row the server had deferred (pre-12c) and
         # the LOB reader never saw the end of call (12c+) (#712).
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            self.skipTest('LOB reads inside a transaction are not exercised on fv2')
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, t CLOB, b BLOB)')
         Conn = seerdb.connect(
             host=_HOST,
@@ -6013,6 +6171,7 @@ class LOBIntegration(_IntegrationBase):
             self.assertEqual(Got, Big)
 
 
+@_requires(_LOBOPS)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class LOBObjectIntegration(_IntegrationBase):
     """The LOB OBJECT a fetch returns by default (#964).
@@ -6038,8 +6197,6 @@ class LOBObjectIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            self.skipTest('the LOB object needs the 10g+ LOBOPS path')
         self.conn.autocommit = False
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, c CLOB)')
         self.cur.execute(f"INSERT INTO {self.TABLE} VALUES (1, 'hello world')")
@@ -6076,6 +6233,7 @@ class LOBObjectIntegration(_IntegrationBase):
         self.assertTrue(hasattr(lob, 'read'), f'expected a LOB, got {type(lob)}')
         self.assertEqual(lob.read(), 'hello world')
 
+    @_requires(_mirror_lacks('GET_LENGTH / GET_CHUNK_SIZE on a column locator'))
     def test_size_and_chunk_size_come_from_the_server(self):
         # Against a Mirror both of these answer 0: it recovers a column
         # locator from a GET_LENGTH only in the ub2-PREFIXED form, while a real
@@ -6083,7 +6241,6 @@ class LOBObjectIntegration(_IntegrationBase):
         # with an error), so the Mirror never finds the locator the client
         # actually sent. GET_CHUNK_SIZE it acks without a value at all. Both are
         # Mirror-side follow-ups to #964.
-        self._skip_if_mirror('GET_LENGTH / GET_CHUNK_SIZE on a column locator')
         lob = self._fetch_lob()
         self.assertEqual(lob.size(), 11)
         self.assertGreater(lob.getchunksize(), 0)
@@ -6101,27 +6258,22 @@ class LOBObjectIntegration(_IntegrationBase):
         with self.assertRaises(Exception):
             lob.read(1, 0)
 
-    def _skip_if_immutable(self):
-        if self.conn.field_version < FIELD_VERSION_11_2:
-            self.skipTest('modifying a LOB needs 11g+ (10g closes the connection)')
-        self._skip_if_mirror('serving LOB writes on a column locator')
-
+    @_requires(_LOB_MODIFY, _mirror_lacks('serving LOB writes on a column locator'))
     def test_write_applies_and_the_size_follows(self):
-        self._skip_if_immutable()
         lob = self._fetch_lob()
         lob.write('WORLD', 7)
         self.assertEqual(lob.read(), 'hello WORLD')
         self.assertEqual(lob.size(), 11)
 
+    @_requires(_LOB_MODIFY, _mirror_lacks('serving LOB writes on a column locator'))
     def test_write_past_the_end_extends_the_lob(self):
-        self._skip_if_immutable()
         lob = self._fetch_lob()
         lob.write('!', 12)
         self.assertEqual(lob.read(), 'hello world!')
         self.assertEqual(lob.size(), 12)
 
+    @_requires(_LOB_MODIFY, _mirror_lacks('serving LOB writes on a column locator'))
     def test_trim_shortens_it(self):
-        self._skip_if_immutable()
         lob = self._fetch_lob()
         lob.trim(5)
         self.assertEqual(lob.read(), 'hello')
@@ -6135,8 +6287,8 @@ class LOBObjectIntegration(_IntegrationBase):
         lob.close()
         self.assertFalse(lob.isopen())
 
+    @_requires(_LOB_MODIFY, _mirror_lacks('serving LOB writes on a column locator'))
     def test_writing_the_wrong_python_type_is_a_type_error(self):
-        self._skip_if_immutable()
         lob = self._fetch_lob()
         self.assertRaises(TypeError, lob.write, 1000, 1)
         self.assertRaises(TypeError, lob.write, b'bytes-into-a-clob', 1)
@@ -6151,6 +6303,7 @@ class LOBObjectIntegration(_IntegrationBase):
         self.assertIsInstance(value, str)
 
 
+@_requires(_LOB_VAR_BIND)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class LOBOutBindIntegration(_IntegrationBase):
     """A LOB-class Var bound OUT / IN OUT to a PL/SQL block (#978).
@@ -6165,11 +6318,6 @@ class LOBOutBindIntegration(_IntegrationBase):
     which is a separate gap -- the block never gets as far as a reply.
     """
 
-    def setUp(self):
-        super().setUp()
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('a LOB Var bind needs the 12.1+ temp-LOB path (#902)')
-
     def test_out_clob_var(self):
         # Pure OUT: the block creates the LOB, the bind brings back its locator.
         Var = self.cur.var(seerdb.DB_TYPE_CLOB)
@@ -6182,18 +6330,18 @@ class LOBOutBindIntegration(_IntegrationBase):
         self.cur.execute('BEGIN :d := NULL; END;', [Var])
         self.assertIsNone(Var.getvalue())
 
+    @_requires(_postgres_cannot('run PL/SQL'))
     def test_inout_clob_var_small(self):
         # PL/SQL-bound: DBMS_LOB.WRITEAPPEND is a PL/SQL procedure with an IN OUT LOB (#1127).
-        self._skip_if_mirror_backend('postgres', 'run PL/SQL')
         # Under the 32767-byte promotion threshold, so the bind stays a Var.
         Var = self.cur.var(seerdb.DB_TYPE_CLOB)
         Var.setvalue(0, 'small')
         self.cur.execute("BEGIN DBMS_LOB.WRITEAPPEND(:d, 3, 'END'); END;", [Var])
         self.assertEqual(Var.getvalue().read(), 'smallEND')
 
+    @_requires(_postgres_cannot('run PL/SQL'))
     def test_inout_clob_var_over_the_promotion_threshold(self):
         # PL/SQL-bound: the IN OUT LOB is filled by a multi-statement DECLARE block (#1127).
-        self._skip_if_mirror_backend('postgres', 'run PL/SQL')
         # Over it, so the Var is promoted to a temp-LOB marker on the way out
         # (#902). The marker has to carry the Var, or the returned value has
         # neither a type to decode against nor anywhere to land.
@@ -6213,9 +6361,9 @@ class LOBOutBindIntegration(_IntegrationBase):
         self.assertEqual(len(Value), 50005)
         self.assertEqual(Value, 'A' * 50000 + 'B' * 5)
 
+    @_requires(_postgres_cannot('run PL/SQL'))
     def test_inout_blob_var_over_the_promotion_threshold(self):
         # PL/SQL-bound: the IN OUT LOB is filled by a multi-statement DECLARE block (#1127).
-        self._skip_if_mirror_backend('postgres', 'run PL/SQL')
         Var = self.cur.var(seerdb.DB_TYPE_BLOB)
         Var.setvalue(0, b'L' * 52345)
         self.cur.execute(
@@ -6230,13 +6378,12 @@ class LOBOutBindIntegration(_IntegrationBase):
         )
         self.assertEqual(Var.getvalue().read(), b'L' * 52345 + b'Q' * 6)
 
+    @_requires(_LOB_VAR_BIND)
     def test_fetch_lobs_false_materialises_an_out_bind(self):
         # `fetch_lobs=False` applies to an OUT bind's LOB the same way it does
         # to a fetched cell.
         with _connect(fetch_lobs=False) as Conn:
             Cur = Conn.cursor()
-            if Conn.field_version < FIELD_VERSION_12_1:
-                self.skipTest('a LOB Var bind needs the 12.1+ temp-LOB path (#902)')
             Var = Cur.var(seerdb.DB_TYPE_CLOB)
             Cur.execute("BEGIN :d := TO_CLOB('materialised'); END;", [Var])
             self.assertEqual(Var.getvalue(), 'materialised')
@@ -6249,10 +6396,9 @@ class BooleanIntegration(_IntegrationBase):
     def _setup_bool(self):
         from seerdb.common.exceptions import DatabaseError
 
-        if self.conn.field_version < FIELD_VERSION_23_1:
-            # As for JSON: a 23ai server carries BOOLEAN natively only to a
-            # session that negotiated 23.1+ (#1149).
-            self.skipTest('native BOOLEAN needs a session at field version 23.1+')
+        # As for JSON: a 23ai server carries BOOLEAN natively only to a
+        # session that negotiated 23.1+ (#1149).
+        _skip_unless(self, _BOOLEAN)
         try:
             self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, flag BOOLEAN)')
         except DatabaseError as exc:
@@ -6319,8 +6465,7 @@ class VectorIntegration(_IntegrationBase):
     def _skip_below_12_1(self):
         # A session below 12.1 cannot bind a VECTOR, and the client refuses it
         # (#1762); test_a_vector_bind_below_12_1_is_refused checks that.
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('a VECTOR bind needs a 12.1+ session')
+        _skip_unless(self, _VECTOR_BIND)
 
     def _bind_roundtrip(self, coltype, value):
         # Bind a Python sequence (#55) and read it back.
@@ -6373,6 +6518,7 @@ class VectorIntegration(_IntegrationBase):
         self.assertIsNone(FlexAll.vector_dimensions)
         self.assertIsNone(FlexAll.vector_format)
 
+    @_requires(_PRE12_VECTOR_REFUSAL)
     def test_a_vector_bind_below_12_1_is_refused(self):
         # A 23ai answers a VECTOR bind from an 11.2 session with a fatal
         # ORA-03106 (#1762). The client refuses it before sending, in every
@@ -6380,8 +6526,6 @@ class VectorIntegration(_IntegrationBase):
         # the session stays usable.
         import array
 
-        if self.conn.field_version >= FIELD_VERSION_12_1:
-            self.skipTest('a 12.1+ session binds a VECTOR (the round trips cover it)')
         Declared = self.cur.var(seerdb.DB_TYPE_VECTOR)
         for Bind in (
             [[1.0, 2.0]],
@@ -6544,12 +6688,11 @@ class JSONIntegration(_IntegrationBase):
     def _setup_json(self):
         from seerdb.common.exceptions import DatabaseError
 
-        if self.conn.field_version < FIELD_VERSION_20_1:
-            # The server may have the type and still not hand it to this
-            # session natively: 23ai sends a JSON column to a session that
-            # negotiated below 20.1 as a plain BLOB, as it would to a real
-            # client of that release (#1149).
-            self.skipTest('native JSON needs a session at field version 20.1+')
+        # The server may have the type and still not hand it to this session
+        # natively: 23ai sends a JSON column to a session that negotiated
+        # below 20.1 as a plain BLOB, as it would to a real client of that
+        # release (#1149).
+        _skip_unless(self, _JSON)
         try:
             self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, doc JSON)')
         except DatabaseError as exc:
@@ -6670,6 +6813,7 @@ class JSONIntegration(_IntegrationBase):
             self.assertEqual(got, v, f'case {n}')
 
 
+@_requires(_postgres_cannot('run DBMS_SODA, which SODA is built on'), _SODA)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class SodaIntegration(_IntegrationBase):
     # SODA collection management (#163 / #199), backed by DBMS_SODA. Needs an
@@ -6677,12 +6821,6 @@ class SodaIntegration(_IntegrationBase):
     # backend, which has no DBMS_SODA (#1745).
     def setUp(self):
         super().setUp()
-        self._skip_if_mirror_backend(
-            'postgres', 'run DBMS_SODA, which SODA is built on'
-        )
-        if (self.conn.server_version >> 24) < 18:
-            self.conn.close()
-            self.skipTest('SODA needs an Oracle 18c+ server (DBMS_SODA)')
         if self.conn.field_version < FIELD_VERSION_12_1:
             # Refused up front below 12.1 (#1763): its document operations bind
             # PL/SQL arrays. The refusal itself is checked here, once per test.
@@ -6988,9 +7126,7 @@ class ChangePasswordIntegration(_ThrottleRetry, unittest.TestCase):
     def setUp(self):
         # changepassword is gated on Oracle 9i (its O3LOGON password change
         # differs); skip the live tests there (#168).
-        with seerdb.connect(**self._kwargs(_PASSWORD)) as conn:
-            if conn.field_version < FIELD_VERSION_10_2:
-                self.skipTest('changepassword is not supported on Oracle 9i')
+        _skip_unless(self, _CHANGE_PASSWORD)
 
     def test_a_rejected_change_reports_the_servers_code(self):
         # python-oracledb's test_1108: an over-long new password, with the right
@@ -7185,15 +7321,8 @@ class ConnectAttributeIntegration(_IntegrationBase):
     upstream connect until that message has been read (#826).
     """
 
-    def _skip_unless_session_kvs(self):
-        # The session-context pairs (driver banner, edition) ride only on the
-        # FAST_AUTH path, fv > 23.1 -- below that the server is never told, so
-        # there is nothing to assert rather than something that fails.
-        if self.conn.field_version < FIELD_VERSION_23_1_EXT_1:
-            self.skipTest('session-context pairs need the fv > 23.1 FAST_AUTH')
-
+    @_requires(_SESSION_CONTEXT)
     def test_driver_name_defaults_to_our_own_banner(self):
-        self._skip_unless_session_kvs()
         self.cur.execute(
             'select distinct client_driver from v$session_connect_info '
             "where sid = sys_context('userenv', 'sid')"
@@ -7201,8 +7330,8 @@ class ConnectAttributeIntegration(_IntegrationBase):
         (driver,) = self.cur.fetchone()
         self.assertIn('seerdb', driver)
 
+    @_requires(_SESSION_CONTEXT)
     def test_driver_name_can_be_declared(self):
-        self._skip_unless_session_kvs()
         with _connect_with(driver_name='newdriver') as conn:
             cur = conn.cursor()
             cur.execute(
@@ -7211,21 +7340,19 @@ class ConnectAttributeIntegration(_IntegrationBase):
             )
             self.assertEqual(cur.fetchone()[0], 'newdriver')
 
+    @_requires(_EDITIONS, _REAL_SERVER_REPORT)
     def test_edition_is_ora_base_unless_asked_for(self):
         # Editions arrived in 11gR2; older tiers have no such context value.
-        if self.conn.field_version < FIELD_VERSION_11_2:
-            self.skipTest('editions need 11g or later')
         # Through a Mirror the answer is the BACKEND's: one over PostgreSQL has
         # no notion of editions and returns NULL, which is correct for it. The
         # six-tier matrix covers the real-server behaviour.
-        if os.environ.get('SEERDB_TEST_MIRROR'):
-            self.skipTest('a Mirror reports whatever its backend knows')
         self.cur.execute(
             "select sys_context('USERENV','CURRENT_EDITION_NAME') from dual"
         )
         self.assertEqual(self.cur.fetchone()[0], 'ORA$BASE')
 
 
+@_requires(_ARRAY_DML)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class PartialBatchRowcountIntegration(_IntegrationBase):
     """`cursor.rowcount` after an executemany that failed part-way (#998/#1003).
@@ -7241,11 +7368,6 @@ class PartialBatchRowcountIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            # fv2 (9i / 8i) has no array DML at all -- the client refuses the
-            # call before a batch can partly apply, so there is no partial count
-            # to report.
-            self.skipTest('executemany (array DML) is not supported on fv2')
         self.conn.autocommit = False
         self.cur.execute(
             f'CREATE TABLE {self.TABLE} (n NUMBER CONSTRAINT {self.TABLE}_pk PRIMARY KEY)'
@@ -7288,6 +7410,7 @@ class PartialBatchRowcountIntegration(_IntegrationBase):
         self.assertEqual(self.cur.rowcount, 0)
 
 
+@_requires(_OER_WARN_BYTE)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class CursorWarningIntegration(_IntegrationBase):
     """`cursor.warning` for a PL/SQL object created with compilation errors.
@@ -7298,17 +7421,6 @@ class CursorWarningIntegration(_IntegrationBase):
     live 23ai's reply to the same CREATE compiled clean and broken: identical
     but for the sequence fields and that byte, 0x21 against 0x00 (#993).
     """
-
-    def setUp(self):
-        super().setUp()
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            # fv2 (9i / 8i) answers a CREATE on its own dialect path, whose
-            # reply does not carry this byte where the 10g+ OER does -- a broken
-            # CREATE there comes back as a bare token, with nothing to read. Not
-            # gated because the decode is wrong on those tiers; gated because
-            # the signal has not been located on them, and claiming coverage
-            # would be worse than admitting the gap (#993).
-            self.skipTest('the OER warn byte is not located on fv2')
 
     def _bad_procedure(self, name: str) -> None:
         # Creating an object that does NOT compile is the precondition of this
@@ -7381,6 +7493,7 @@ class CursorWarningIntegration(_IntegrationBase):
         self.assertIsNone(self.cur.warning)
 
 
+@_requires(_LOB_VAR_BIND)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class LOBReturningIntegration(_IntegrationBase):
     """`DML ... RETURNING <lob column> INTO :b` (#985).
@@ -7397,8 +7510,6 @@ class LOBReturningIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('a LOB Var bind needs the 12.1+ OAC (#902)')
         self.conn.autocommit = False
         self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, c CLOB, b BLOB)')
 
@@ -7449,12 +7560,11 @@ class LOBReturningIntegration(_IntegrationBase):
         )
         self.assertEqual(Var.getvalue(), [None])
 
+    @_requires(_LOB_VAR_BIND)
     def test_fetch_lobs_false_materialises_a_returned_lob(self):
         self.conn.rollback()
         with _connect(fetch_lobs=False) as Conn:
             Cur = Conn.cursor()
-            if Conn.field_version < FIELD_VERSION_12_1:
-                self.skipTest('a LOB Var bind needs the 12.1+ OAC (#902)')
             Var = Cur.var(seerdb.DB_TYPE_CLOB)
             Cur.execute(
                 f'INSERT INTO {self.TABLE} (n, c) VALUES (2, :a) RETURNING c INTO :b',
@@ -7512,6 +7622,8 @@ class GettypeCurrentSchemaIntegration(_IntegrationBase):
             self.cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = {self.owner}')
 
 
+@_requires(_postgres_cannot('create a PL/SQL package'))
+@_requires(_PACKAGE_TYPE_BIND)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class PlsqlTypeIntegration(_IntegrationBase):
     """`gettype()` of a PL/SQL **package-level** type (#1030).
@@ -7527,14 +7639,11 @@ class PlsqlTypeIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('a package-level type needs the 12.1+ bind support')
         # A package-level type lives in a PL/SQL PACKAGE, so this class cannot
         # run against a backend with no PL/SQL at all. It skipped on the
         # PostgreSQL leg only by accident until that Mirror reached 12.1: the
         # version gate above was doing the work. The capability is what actually
         # decides it (#1127).
-        self._skip_if_mirror_backend('postgres', 'create a PL/SQL package')
         self._drop_objects()
         # A schema-level type of the SAME shape, so the two-part name
         # `PKG.TYPE` cannot be confused with `SCHEMA.TYPE` by accident.
@@ -7675,6 +7784,8 @@ class PlsqlTypeIntegration(_IntegrationBase):
         self.assertEqual(int(Total), 10)
 
 
+@_requires(_postgres_cannot('create a PL/SQL package'))
+@_requires(_REFCURSOR_IN_BIND)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class RefCursorInBindIntegration(_IntegrationBase):
     """Binding an OPEN cursor as a REF CURSOR IN parameter (#1047).
@@ -7690,13 +7801,10 @@ class RefCursorInBindIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('a REF CURSOR IN bind needs the 12c+ bind OAC')
         # The cursor is drained by a PL/SQL procedure in a PACKAGE, and the whole
         # class is built on one, so a backend with no PL/SQL cannot run it. It
         # skipped on the PostgreSQL leg only because that Mirror was below 12.1;
         # the capability is what actually decides it (#1127).
-        self._skip_if_mirror_backend('postgres', 'create a PL/SQL package')
         try:
             self.cur.execute(f'DROP PACKAGE {self.PKG}')
         except seerdb.DatabaseError:
@@ -7773,6 +7881,8 @@ class RefCursorInBindIntegration(_IntegrationBase):
                 pass
 
 
+@_requires(_postgres_cannot('create a PL/SQL package'))
+@_requires(_OBJECT_BIND)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class ObjectOutBindIntegration(_IntegrationBase):
     """An object bound DIRECTLY as an OUT / IN OUT parameter (#1029).
@@ -7791,14 +7901,11 @@ class ObjectOutBindIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('an object bind needs the 12.1+ OAC')
         # The object OUT binds are filled by procedures in a PL/SQL PACKAGE this
         # setUp builds and every test calls into, so a backend with no PL/SQL
         # cannot run the class. It was hidden twice over on the PostgreSQL leg:
         # first by the 12.1 version gate above, then by the VARRAY it declares,
         # which PostgreSQL could not parse until that was translated (#1127).
-        self._skip_if_mirror_backend('postgres', 'create a PL/SQL package')
         self._drop_objects()
         self.cur.execute(f'CREATE TYPE {self.TYPE} AS VARRAY(10) OF NUMBER')
         self.cur.execute(
@@ -7898,6 +8005,7 @@ class ObjectOutBindIntegration(_IntegrationBase):
         self.assertEqual(int(tail.getvalue()), 4242)
 
 
+@_requires(_OBJECT_BIND)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class ObjectReturningIntegration(_IntegrationBase):
     """`DML ... RETURNING <object column> INTO :b` (#826).
@@ -7914,8 +8022,6 @@ class ObjectReturningIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('an object bind needs the 12.1+ OAC')
         from seerdb.common.exceptions import DatabaseError
 
         for stmt in (f'DROP TABLE {self.TABLE}', f'DROP TYPE {self.TYPE}'):
@@ -8078,7 +8184,7 @@ class NationalAttributeIntegration(_IntegrationBase):
         # taken as AL16UTF16 are 5 characters, not 7. The Mirror over PostgreSQL
         # cannot select an attribute in SQL yet (#1434).
         # A leg that names no backend ('1', the CI job) gets the conservative
-        # answer, as _skip_if_mirror_backend gives it.
+        # answer, as _postgres_cannot gives it.
         if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
             return len(self.BOUND)
         self.cur.execute(f'SELECT LENGTH(x.o.v) FROM {self.TABLE} x WHERE k = :1', [k])
@@ -8182,10 +8288,6 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT {column} FROM {self.TABLE} WHERE k = :1', [k])
         return self.cur.fetchone()[0]
 
-    def _skip_before_12_1(self):
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('an object bind needs the 12.1+ OAC')
-
     def test_a_lob_attribute_fetches_as_a_lob(self):
         from seerdb.common.lob import LOB
 
@@ -8253,8 +8355,8 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
         (value,) = self.cur.fetchone()
         self.assertEqual([e.read() for e in value.aslist()], ['a', 'bc'])
 
+    @_requires(_OBJECT_BIND)
     def test_a_lob_attribute_binds_from_str_and_bytes(self):
-        self._skip_before_12_1()
         typ = self.conn.gettype(self.TYPE)
         obj = typ.newobject({'ID': 3, 'C': 'bound text', 'B': b'\x07'})
         nobj = self.conn.gettype(self.NTYPE).newobject({'ID': 3, 'N': self.TEXT})
@@ -8265,16 +8367,16 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
         # The caller's object keeps what it was set to.
         self.assertEqual(obj.C, 'bound text')
 
+    @_requires(_OBJECT_BIND)
     def test_a_lob_attribute_binds_a_temporary_lob(self):
-        self._skip_before_12_1()
         typ = self.conn.gettype(self.TYPE)
         obj = typ.newobject({'ID': 4})
         obj.C = self.conn.createlob(seerdb.DB_TYPE_CLOB, 'temp lob')
         self.cur.execute(f'INSERT INTO {self.TABLE} (k, o) VALUES (4, :1)', [obj])
         self.assertEqual(self._fetched(4).C.read(), 'temp lob')
 
+    @_requires(_OBJECT_BIND)
     def test_a_fetched_lob_attribute_binds_back(self):
-        self._skip_before_12_1()
         self.cur.execute(
             f"INSERT INTO {self.TABLE} (k, o) VALUES (5, {self.TYPE}(5, 'fetched', NULL))"
         )
@@ -8284,6 +8386,7 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
         self.assertEqual(self._fetched(6).C.read(), 'fetched')
 
 
+@_requires(_postgres_cannot('fetch a computed collection'))
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class ObjectCollectionFetchIntegration(_IntegrationBase):
     """A collection of an object type fetches its elements as objects (#1254)."""
@@ -8293,7 +8396,6 @@ class ObjectCollectionFetchIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        self._skip_if_mirror_backend('postgres', 'fetch a computed collection')
         self._drop()
         self.cur.execute(
             f'CREATE TYPE {self.ELEM} AS OBJECT (id NUMBER, name VARCHAR2(40))'
@@ -8383,9 +8485,8 @@ class NestedAttributeIntegration(_IntegrationBase):
             rows, [(1, (7, 'seven'), [(1, 'a'), (2, 'b')]), (2, None, None)]
         )
 
+    @_requires(_OBJECT_BIND)
     def test_a_nested_attribute_binds_and_returns(self):
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('an object bind needs the 12.1+ OAC')
         sub = self.conn.gettype(self.SUB)
         outer = self.conn.gettype(self.OUTER)
         arr = self.conn.gettype(self.ARR)
@@ -8408,6 +8509,7 @@ class NestedAttributeIntegration(_IntegrationBase):
         )
 
 
+@_requires(_OBJECT_BIND)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class ObjectTimeZoneAttributeIntegration(_IntegrationBase):
     # An object whose attribute is TIMESTAMP WITH TIME ZONE binds and returns
@@ -8418,8 +8520,6 @@ class ObjectTimeZoneAttributeIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('an object bind needs the 12.1+ OAC')
         from seerdb.common.exceptions import DatabaseError
 
         for stmt in (f'DROP TABLE {self.TABLE}', f'DROP TYPE {self.TYPE}'):
@@ -8468,6 +8568,7 @@ class ObjectTimeZoneAttributeIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+@_requires(_REAL_SERVER_READS, _GRID_10G)
 class TemporalBindGridIntegration(_IntegrationBase):
     """Every cell of the temporal bind grid, as the server reads it (#1338).
 
@@ -8482,12 +8583,6 @@ class TemporalBindGridIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        if os.environ.get('SEERDB_TEST_MIRROR'):
-            self.conn.close()
-            self.skipTest('the grid checks what a real Oracle server reads')
-        if self.conn.field_version < FIELD_VERSION_10_2:
-            self.conn.close()
-            self.skipTest('the grid starts at 10g')
         # A LOCAL TIME ZONE bind is an instant in the database's zone (#1222);
         # printed in that zone too, it reads back as the wall clock sent.
         self.cur.execute('ALTER SESSION SET TIME_ZONE = DBTIMEZONE')
@@ -8570,9 +8665,8 @@ class TemporalBindGridIntegration(_IntegrationBase):
     def test_executemany_mixed_widths(self):
         self._each('executemany_mixed', self._read_executemany)
 
+    @_requires(_OBJECT_BIND)
     def test_object_attribute(self):
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('an object bind needs the 12.1+ OAC')
 
         def read(cell, fmt):
             name = _grid.object_type_name(cell.declared)
@@ -8764,10 +8858,10 @@ class CollectionTypeIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT {self.NUMS}(1, 2) FROM dual')
         self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_OBJECT)
 
+    @_requires(_postgres_cannot('serve BFILE or XMLType'))
     def test_a_collection_value_of_bfile_or_xmltype_describes_as_its_dbtype(self):
         # A BFILE's type_code is DB_TYPE_BFILE and an XMLType's -- an object of
         # type SYS.XMLTYPE on the wire -- DB_TYPE_XMLTYPE, not 114 and 109 (#1478).
-        self._skip_if_mirror_backend('postgres', 'serve BFILE or XMLType')
         self.cur.execute("SELECT bfilename('X', 'y'), sys.xmltype('<a/>') FROM dual")
         self.assertEqual(
             [d[1] for d in self.cur.description],
@@ -8797,9 +8891,8 @@ class CollectionTypeIntegration(_IntegrationBase):
             self._drop()
             self.cur.execute(f'DROP TYPE {words}')
 
+    @_requires(_OBJECT_BIND)
     def test_a_collection_value_binds(self):
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('an object bind needs the 12.1+ OAC')
         self.cur.execute(
             f'CREATE TABLE {self.TABLE} (id NUMBER, v {self.NUMS}, w {self.ELEMS}) '
             f'NESTED TABLE w STORE AS {self.TABLE}_W'
@@ -8829,6 +8922,7 @@ class CollectionTypeIntegration(_IntegrationBase):
         self.assertEqual((v2.aslist(), w2), ([], None))
 
 
+@_requires(_OBJECT_BIND)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class ObjectLocalTimeZoneAttributeIntegration(_IntegrationBase):
     # An object's TIMESTAMP WITH LOCAL TIME ZONE attribute binds and returns as
@@ -8840,8 +8934,6 @@ class ObjectLocalTimeZoneAttributeIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('an object bind needs the 12.1+ OAC')
         self._drop()
         self.cur.execute(
             f'CREATE TYPE {self.TYPE} AS OBJECT '
@@ -8941,9 +9033,8 @@ class CollectionOfCollectionsIntegration(_IntegrationBase):
             (self._lists(tc), self._lists(vc)), ([[1, 2], [3], None, []], [[4]])
         )
 
+    @_requires(_OBJECT_BIND)
     def test_a_collection_of_collections_binds(self):
-        if self.conn.field_version < FIELD_VERSION_12_1:
-            self.skipTest('an object bind needs the 12.1+ OAC')
         inner = self.conn.gettype(self.INNER)
         tt = self.conn.gettype(self.TABLE_OF)
         vt = self.conn.gettype(self.VARRAY_OF)
@@ -9008,13 +9099,12 @@ class RefBindIntegration(_IntegrationBase):
         finally:
             super().tearDown()
 
+    @_requires(_REF_BIND)
     def test_ref_bind_roundtrip(self):
         self._setup_schema()
         self.cur.execute(f'SELECT REF(p) FROM {self.PEOPLE} p WHERE p.id = 1')
         ref = self.cur.fetchone()[0]
         self.assertEqual(ref.type_name, self.TYPE)
-        if getattr(self.conn, 'field_version', 0) < FIELD_VERSION_12_1:
-            self.skipTest('REF bind needs a 12.1+ server')
         # Bind into an INSERT, then DEREF the stored REF back to the object.
         self.cur.execute(f'INSERT INTO {self.REFS} (id, r) VALUES (:1, :2)', [100, ref])
         self.cur.execute(f'SELECT id, DEREF(r).name FROM {self.REFS} WHERE id = 100')
@@ -9305,14 +9395,13 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
+    @_requires(_PING_ROUND_TRIP)
     async def test_ping_raises_on_a_killed_session(self):
         # Async twin of PingKilledSessionIntegration (#1095).
         if not _ADMIN_USER:
             self.skipTest('set SEERDB_TEST_ADMIN_USER (a DBA) to kill a session')
         Conn = await seerdb.connect_async(**self._kwargs())
         try:
-            if Conn.field_version < FIELD_VERSION_10_2:
-                self.skipTest('9i pings with a query, which already raises')
             Cur = Conn.cursor()
             await Cur.execute("SELECT SYS_CONTEXT('userenv', 'sid') FROM dual")
             _kill_session(int((await Cur.fetchone())[0]))
@@ -9324,12 +9413,11 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             except Exception:  # noqa: BLE001 - the session is gone
                 pass
 
+    @_requires(_TEMP_LOB)
     async def test_createlob_binds_as_a_lob(self):
         # Async twin of CreateLobIntegration (#1066).
         Conn = await seerdb.connect_async(**self._kwargs())
         try:
-            if Conn.field_version < FIELD_VERSION_12_1:
-                self.skipTest('createlob() needs a 12c+ server (CREATE_TEMP)')
             Cur = Conn.cursor()
             Text = 'async createlob \u3042 ' * 3000
             Nclob = await Conn.createlob(seerdb.DB_TYPE_NCLOB, Text)
@@ -9339,11 +9427,10 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
+    @_requires(_postgres_cannot('run a PL/SQL block'))
     async def test_select_into_with_no_rows_raises(self):
         # Async twin of the ORA-01403 tests (#1039).
         Table = 'PYO_ASYNC_NODATA'
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest("the Mirror's postgres backend cannot run a PL/SQL block")
         Conn = await seerdb.connect_async(**self._kwargs())
         try:
             Cur = Conn.cursor()
@@ -9698,10 +9785,9 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                         await Cur.execute(f"ALTER SYSTEM KILL SESSION '{session}'")
                     self.assertEqual(caught.exception.code, code)
 
+    @_requires(_LTZ)
     async def test_timestamp_with_local_time_zone(self):
         # Async twin of CursorIntegration's.
-        if _target_is_8i():
-            self.skipTest('8i has no TIMESTAMP WITH LOCAL TIME ZONE')
         Table = 'PYO_ASYNC_LTZ'
         Conn = await seerdb.connect_async(**self._kwargs())
         try:
@@ -9759,15 +9845,12 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
+    @_requires(_LTZ, _TRUNC_TIMESTAMP)
     async def test_a_midnight_ltz_bind_matches_a_truncated_ltz_column(self):
         # Async twin of CursorIntegration's (#1337).
-        if _target_is_8i():
-            self.skipTest('8i has no TIMESTAMP WITH LOCAL TIME ZONE')
         Table = 'PYO_ASYNC_LTZ_TRUNC'
         Conn = await seerdb.connect_async(**self._kwargs())
         try:
-            if Conn.field_version < FIELD_VERSION_10_2:
-                self.skipTest("9i's TRUNC takes no TIMESTAMP (ORA-00932)")
             Cur = Conn.cursor()
             await Cur.execute('SELECT dbtimezone FROM dual')
             (database,) = await Cur.fetchone()
@@ -9789,12 +9872,11 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
+    @_requires(_8I_DESCRIBE_SPANS_PACKETS)
     async def test_a_describe_wider_than_a_packet(self):
         # Async twin of CursorIntegration's.
         from seerdb.common.exceptions import DatabaseError
 
-        if not _target_is_8i():
-            self.skipTest('a describe outgrows a packet on 8i')
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
             async with Conn.cursor() as Cur:
                 await Cur.execute(
@@ -9810,10 +9892,9 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 await Cur.execute('SELECT 1 FROM dual')
                 self.assertEqual(await Cur.fetchall(), [(1,)])
 
+    @_requires(_TSTZ)
     async def test_timestamp_with_time_zone_compares_by_instant(self):
         # Async twin of CursorIntegration's.
-        if _target_is_8i():
-            self.skipTest('8i has no TIMESTAMP WITH TIME ZONE')
         Table = 'PYO_ASYNC_TSTZ_CMP'
         Conn = await seerdb.connect_async(**self._kwargs())
         try:
@@ -9844,10 +9925,9 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
+    @_requires(_LTZ, _LTZ_SESSION_ARITHMETIC)
     async def test_days_added_to_a_timestamp_with_local_time_zone(self):
         # Async twin of CursorIntegration's.
-        if _target_is_8i():
-            self.skipTest('8i has no TIMESTAMP WITH LOCAL TIME ZONE')
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
             async with Conn.cursor() as Cur:
                 await Cur.execute('SELECT sessiontimezone, dbtimezone FROM dual')
@@ -9865,10 +9945,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                         on_session_clock - datetime.timedelta(days=0.5),
                     ),
                 )
-                if Conn.field_version < FIELD_VERSION_10_2:
-                    self.skipTest(
-                        '9i PL/SQL does LTZ + n on the database clock (#1241)'
-                    )
                 var = Cur.var(seerdb.DB_TYPE_TIMESTAMP_LTZ)
                 var.setvalue(0, value.replace(microsecond=0))
                 await Cur.execute('begin :value := :value + 5.25; end;', {'value': var})
@@ -9985,11 +10061,10 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     await self._drop_async(Cur, Table)
                     await Cur.execute(f'DROP TYPE {otype}')
 
+    @_requires(_INVISIBLE_COLUMNS)
     async def test_an_invisible_column(self):
         # Async twin of CursorIntegration's.
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
-            if Conn.field_version < FIELD_VERSION_12_1:
-                self.skipTest('INVISIBLE columns are 12.1+')
             T = 'PYO_ASYNC_INVISIBLE'
             async with Conn.cursor() as Cur:
                 await self._drop_async(Cur, T)
@@ -10247,6 +10322,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                         except seerdb.DatabaseError:
                             pass  # a CREATE above failed, so nothing to drop
 
+    @_requires(_OBJECT_BIND)
     async def test_a_local_time_zone_attribute_round_trips(self):
         # Async twin of ObjectLocalTimeZoneAttributeIntegration's (#1270).
         import datetime
@@ -10255,8 +10331,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         Drops = (f'DROP TABLE {Table}', f'DROP TYPE {Typ}')
         Given = datetime.datetime(2026, 9, 27, 13, 14, 15)
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
-            if Conn.field_version < FIELD_VERSION_12_1:
-                self.skipTest('an object bind needs the 12.1+ OAC')
             async with Conn.cursor() as Cur:
                 for Stmt in Drops:
                     try:
@@ -10425,14 +10499,11 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                         except seerdb.DatabaseError:
                             pass  # a CREATE above failed, so nothing to drop
 
+    @_requires(_postgres_cannot('fetch a computed collection'))
     async def test_a_collection_of_objects_fetches_objects(self):
         # Async twin of ObjectCollectionFetchIntegration: the async describe
         # left the element's object type out, so each element came back as its
         # raw image (#1254).
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest(
-                "the Mirror's postgres backend cannot fetch a computed collection"
-            )
         Elem, Elems = 'PYO_AOCOLL_ELEM_T', 'PYO_AOCOLL_ELEMS_T'
         Drops = (f'DROP TYPE {Elems}', f'DROP TYPE {Elem}')
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
@@ -10487,16 +10558,13 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
+    @_requires(_postgres_cannot('run PL/SQL'), _PACKAGE_TYPE_BIND)
     async def test_gettype_resolves_a_package_level_type(self):
         # PL/SQL-bound: a package-level type lives in a PL/SQL PACKAGE (#1127).
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest("the Mirror's postgres backend cannot run PL/SQL")
         # Async twin of PlsqlTypeIntegration (#1030).
         Pkg = 'PYO_ASYNC_PLSQLTYPE_PKG'
         Conn = await seerdb.connect_async(**self._kwargs())
         try:
-            if Conn.field_version < FIELD_VERSION_12_1:
-                self.skipTest('a package-level type needs the 12.1+ bind support')
             Cur = Conn.cursor()
             try:
                 await Cur.execute(f'DROP PACKAGE {Pkg}')
@@ -10530,6 +10598,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
+    @_requires(_OBJECT_BIND)
     async def test_a_collection_value_binds(self):
         # Async twin of CollectionTypeIntegration's.
         Elem, Nums, Elems = 'PYO_ACOLB_ELEM_T', 'PYO_ACOLB_NUMS_T', 'PYO_ACOLB_ELEMS_T'
@@ -10541,8 +10610,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             f'DROP TYPE {Elem}',
         )
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
-            if Conn.field_version < FIELD_VERSION_12_1:
-                self.skipTest('an object bind needs the 12.1+ OAC')
             async with Conn.cursor() as Cur:
                 for Stmt in Drops:
                     try:
@@ -10691,18 +10758,15 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                         except seerdb.DatabaseError:
                             pass  # a CREATE above failed, so nothing to drop
 
+    @_requires(_postgres_cannot('run PL/SQL'), _OBJECT_BIND)
     async def test_a_bare_object_out_bind_takes_its_value(self):
         # PL/SQL-bound: the object OUT bind is filled by a PL/SQL PACKAGE (#1127).
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest("the Mirror's postgres backend cannot run PL/SQL")
         # Async twin of ObjectOutBindIntegration (#1029): an object handed to
         # callproc with no Var around it takes the OUT value in place.
         Typ = 'PYO_ASYNC_OUTBIND_T'
         Pkg = 'PYO_ASYNC_OUTBIND_PKG'
         Conn = await seerdb.connect_async(**self._kwargs())
         try:
-            if Conn.field_version < FIELD_VERSION_12_1:
-                self.skipTest('an object bind needs the 12.1+ OAC')
             Cur = Conn.cursor()
             for Stmt in (f'DROP PACKAGE {Pkg}', f'DROP TYPE {Typ}'):
                 try:
@@ -10767,13 +10831,12 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
+    @_requires(_LOB_READ_IN_TRANSACTION)
     async def test_lob_columns_are_readable_inside_an_open_transaction(self):
         # The async twin of LOBIntegration's test (#712).
         Table = 'PYO_ASYNC_LOB_TXN'
         Conn = await seerdb.connect_async(**{**self._kwargs(), 'autocommit': False})
         try:
-            if Conn.field_version < FIELD_VERSION_10_2:
-                self.skipTest('LOB reads inside a transaction are not exercised on fv2')
             Cur = Conn.cursor()
             try:
                 await Cur.execute(f'DROP TABLE {Table}')
@@ -10798,17 +10861,14 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
+    @_requires(_postgres_cannot('run PL/SQL'), _LOB_VAR_BIND)
     async def test_inout_clob_var(self):
         # PL/SQL-bound: the IN OUT LOB is filled by a multi-statement DECLARE block (#1127).
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest("the Mirror's postgres backend cannot run PL/SQL")
         # The async twin of LOBOutBindIntegration (#978): a LOB OUT bind's value
         # arrives in the LOB framing, and the read that materialises it is
         # awaited. 12.1+ only, like the sync class.
         Conn = await seerdb.connect_async(**self._kwargs())
         try:
-            if Conn.field_version < FIELD_VERSION_12_1:
-                self.skipTest('a LOB Var bind needs the 12.1+ temp-LOB path (#902)')
             Cur = Conn.cursor()
             Var = Cur.var(seerdb.DB_TYPE_CLOB)
             Var.setvalue(0, 'A' * 50000)
@@ -10826,14 +10886,13 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
+    @_requires(_LOB_VAR_BIND)
     async def test_returning_a_clob(self):
         # The async twin of LOBReturningIntegration (#985): the read that
         # materialises a returned LOB is awaited. 12.1+ only, like the sync class.
         Table = 'PYO_ASYNC_LOBRET'
         Conn = await seerdb.connect_async(**{**self._kwargs(), 'autocommit': False})
         try:
-            if Conn.field_version < FIELD_VERSION_12_1:
-                self.skipTest('a LOB Var bind needs the 12.1+ OAC (#902)')
             Cur = Conn.cursor()
             try:
                 await Cur.execute(f'DROP TABLE {Table}')
@@ -10935,24 +10994,22 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 )
                 await Cur.execute('DROP TABLE PYORACLE_ASYNC_TEST')
 
+    @_requires(_PRE12_VECTOR_REFUSAL)
     async def test_a_vector_bind_below_12_1_is_refused(self):
         # Async parity for the pre-12.1 VECTOR refusal (#1762).
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
-            if Conn.field_version >= FIELD_VERSION_12_1:
-                self.skipTest('a 12.1+ session binds a VECTOR')
             async with Conn.cursor() as Cur:
                 with self.assertRaises(seerdb.NotSupportedError):
                     await Cur.execute('SELECT :v FROM DUAL', [[1.0, 2.0]])
                 await Cur.execute('SELECT 1 FROM DUAL')
                 self.assertEqual(await Cur.fetchall(), [(1,)])
 
+    @_requires(_VECTOR_BIND)
     async def test_vector_bind_roundtrip(self):
         # Async parity for VECTOR binds (#55): bind a sequence, read it back.
         import array
 
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
-            if Conn.field_version < FIELD_VERSION_12_1:
-                self.skipTest('a VECTOR bind needs a 12.1+ session (#1762)')
             async with Conn.cursor() as Cur:
                 await self._drop_async(Cur, 'PYORACLE_ASYNC_VEC')
                 try:
@@ -10973,14 +11030,13 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 )
                 await self._drop_async(Cur, 'PYORACLE_ASYNC_VEC')
 
+    @_requires(_VECTOR_BIND)
     async def test_sparse_vector_bind_roundtrip(self):
         # Async parity for SPARSE vectors (#68).
         from seerdb.common.vector import SparseVector
 
         sv = SparseVector(8, array.array('I', [2, 5]), array.array('f', [1.5, 2.5]))
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
-            if Conn.field_version < FIELD_VERSION_12_1:
-                self.skipTest('a VECTOR bind needs a 12.1+ session (#1762)')
             async with Conn.cursor() as Cur:
                 await self._drop_async(Cur, 'PYORACLE_ASYNC_SPV')
                 try:
@@ -10996,11 +11052,10 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 self.assertEqual(await Cur.fetchone(), (sv,))
                 await self._drop_async(Cur, 'PYORACLE_ASYNC_SPV')
 
+    @_requires(_JSON)
     async def test_json_bind_roundtrip(self):
         # Async parity for JSON binds (#50): bind a dict, read it back.
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
-            if Conn.field_version < FIELD_VERSION_20_1:
-                self.skipTest('native JSON needs a session at field version 20.1+')
             async with Conn.cursor() as Cur:
                 await self._drop_async(Cur, 'PYORACLE_ASYNC_JSON')
                 try:
@@ -11345,14 +11400,13 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 )
                 await Cur.execute('DROP TABLE PYORACLE_ASYNC_LOB')
 
+    @_requires(_STREAMED_LOB_BIND)
     async def test_error_then_large_lob_stays_synced(self):
         # #45 (async parity): errored calls leave break/reset markers; a few of
         # them followed by a large CLOB read must not desync the stream.
         from seerdb.common.exceptions import DatabaseError
 
         async with await seerdb.connect_async(**self._kwargs(fetch_lobs=False)) as Conn:
-            if Conn.field_version < FIELD_VERSION_10_2:
-                self.skipTest('Oracle 9i has no streamed LOB/LONG bind path (#169)')
             async with Conn.cursor() as Cur:
                 await self._drop_async(Cur, 'PYORACLE_ASYNC_LOB45')
                 await Cur.execute(
@@ -11412,13 +11466,10 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 await Cur.execute('BEGIN :y := 7 * 6; END;', [y])
                 self.assertEqual(y.getvalue(), 42)
 
+    @_requires(_BINARY_DOUBLE_AND_INTERVAL)
     async def test_async_out_extended_types(self):
         # OUT binds for the extended scalar types (issue #17), async path.
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
-            if Conn.field_version < FIELD_VERSION_10_2:
-                self.skipTest(
-                    'BINARY_DOUBLE / INTERVAL are 10g+ types; Oracle 9i lacks them'
-                )
             async with Conn.cursor() as Cur:
                 await Cur.execute(
                     'CREATE OR REPLACE PROCEDURE PYORACLE_ASYNC_OUTX'
@@ -11479,13 +11530,12 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 finally:
                     await Cur.execute('DROP TABLE PYORACLE_ASYNC_SCROLL')
 
+    @_requires(_SERVER_SCROLL)
     async def test_async_scrollable_lazy(self):
         # Server-side lazy scrollable cursor on the async path (#181), 10g+:
         # fetch-on-demand across batches + scroll modes + the LAST-after-EOF
         # duplicate-value (bit-vector reuse) case.
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
-            if Conn.field_version < FIELD_VERSION_10_2:
-                self.skipTest('server-side scroll needs 10g+')
             async with Conn.cursor(scrollable=True) as Cur:
                 Cur.prefetchrows = 2
                 Cur.arraysize = 3
@@ -11533,15 +11583,12 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 finally:
                     await Cur.execute(f'DROP TABLE {table}')
 
+    @_requires(_postgres_cannot('run DBMS_SODA'), _SODA)
     async def test_async_soda_collections(self):
         # SODA collection management (#163 / #199) on the async path; 18c+ only,
         # and not over the Mirror's PostgreSQL backend, which has no DBMS_SODA
         # (#1745).
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest("the Mirror's postgres backend cannot run DBMS_SODA")
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
-            if (Conn.server_version >> 24) < 18:
-                self.skipTest('SODA needs an Oracle 18c+ server (DBMS_SODA)')
             if Conn.field_version < FIELD_VERSION_12_1:
                 # Refused up front below 12.1 (#1763).
                 with self.assertRaises(seerdb.NotSupportedError):
@@ -11753,13 +11800,11 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 finally:
                     await Cur.execute('DROP TABLE PYORACLE_ASYNC_BE')
 
+    @_requires(_ARRAY_DML_ROWCOUNTS)
     async def test_async_executemany_arraydmlrowcounts(self):
         # Async mirror of test_executemany_arraydmlrowcounts_update (#18).
-        from seerdb.common.tns_consts import FIELD_VERSION_12_1
 
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
-            if Conn.field_version < FIELD_VERSION_12_1:
-                self.skipTest('arraydmlrowcounts needs a 12.1+ server')
             async with Conn.cursor() as Cur:
                 await Cur.execute(
                     'CREATE TABLE PYORACLE_ASYNC_ADR (g NUMBER, v NUMBER)'
@@ -11789,13 +11834,11 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 finally:
                     await Cur.execute('DROP TABLE PYORACLE_ASYNC_ADR')
 
+    @_requires(_PRE12_ROWCOUNTS_REFUSAL)
     async def test_async_arraydmlrowcounts_unsupported_on_11g(self):
         # On an 11g server the async feature is rejected up front, same as sync.
-        from seerdb.common.tns_consts import FIELD_VERSION_12_1
 
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
-            if Conn.field_version >= FIELD_VERSION_12_1:
-                self.skipTest('server supports arraydmlrowcounts')
             async with Conn.cursor() as Cur:
                 await Cur.execute('CREATE TABLE PYORACLE_ASYNC_NS (id NUMBER)')
                 try:
@@ -11889,9 +11932,9 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             self.assertTrue(all(r.error is None for r in results))
             await cur.execute(f'DROP TABLE {table}')
 
+    @_requires(_REF_BIND)
     async def test_async_ref_bind(self):
         # Async mirror of RefBindIntegration (#139): fetch a REF, bind it back.
-        from seerdb.common.tns_consts import FIELD_VERSION_12_1 as _FV12
 
         TYPE, PEOPLE, REFS = (
             'PYORACLE_AREF_T',
@@ -11903,8 +11946,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         try:
             # Checked before creating anything, so a skip leaves nothing behind
             # (#1224).
-            if getattr(Conn, 'field_version', 0) < _FV12:
-                self.skipTest('REF bind needs a 12.1+ server')
             cur = Conn.cursor()
             for s in drops:
                 try:
@@ -12733,10 +12774,8 @@ class O8iSelectIntegration(_ThrottleRetry, unittest.TestCase):
     # data dictionary view. The class self-skips unless the target the SEERDB_TEST_*
     # env points at is actually an 8i server, so it is inert on every other tier.
     def setUp(self):
+        _skip_unless(self, _ONLY_8I)
         self.conn = _connect()
-        if not _conn_is_8i(self.conn):
-            self.conn.close()
-            self.skipTest('not an Oracle 8i server')
         self.cur = self.conn.cursor()
 
     def tearDown(self):
@@ -12831,10 +12870,8 @@ class O8iDmlIntegration(_ThrottleRetry, unittest.TestCase):
     TABLE = 'zz_seerdb_o8i_dml'
 
     def setUp(self):
+        _skip_unless(self, _ONLY_8I)
         self.conn = _connect()
-        if not _conn_is_8i(self.conn):
-            self.conn.close()
-            self.skipTest('not an Oracle 8i server')
         self.conn.autocommit = False
         self.cur = self.conn.cursor()
         self._drop()
@@ -13062,11 +13099,8 @@ class AsyncO8iIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
         )
 
     async def _connect_8i(self):
-        conn = await seerdb.connect_async(**self._kwargs())
-        if not _conn_is_8i(conn):
-            await conn.close()
-            self.skipTest('not an Oracle 8i server')
-        return conn
+        _skip_unless(self, _ONLY_8I)
+        return await seerdb.connect_async(**self._kwargs())
 
     async def test_async_8i_select_dml_plsql_lob(self):
         conn = await self._connect_8i()
