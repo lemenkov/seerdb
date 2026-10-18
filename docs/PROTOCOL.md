@@ -988,9 +988,16 @@ is the way to test it, since that is exactly what a real 12.1 client does.
 > from 45 bytes (21c) to **54**, `runtime_caps` from 7 to **13**, with new bits
 > in `LOGON_TYPES` (#4 `0xEF`), `OCI3` (#35), `TTC4` (#40 `0xFF`), `LOB2` (#42),
 > `TTC5` (#44 `0xFF`), and 9 new trailing slots (45–53, incl. `FEATURE_BACKPORT2`
-> at 45 and `VECTOR_FEATURES` at 52). What those fv-25–27 additions actually
-> unlock is unknown from the capability bits alone and needs a fv-27-capable
-> reference-client capture — tracked as exploratory, non-blocking work in #458.
+> at 45 and `VECTOR_FEATURES` at 52). The reference thin client also caps at 24
+> and has no code path for 25–27. Measured live on 26ai: advertising field
+> version 25 or 26 changes nothing (login, describe and fetch are identical to
+> 24); advertising 27 keeps login and fast-auth working, but the fv24-shaped
+> OALL8 execute then gets no reply at all, so 27 changes the request
+> marshalling. Of the new capability bits, three have a known meaning:
+> `FEATURE_BACKPORT2` bit `0x02` (end-user security context, §34), bit `0x01`
+> (transaction priority, §42) and `TTC4` bit `0x40` (explicit request
+> boundaries). Slot 51 (`0x07`) and slot 53 (`0x02`) are set but named by no thin
+> client, and `TTC6` (index 54, HA readiness) lies beyond the 54-byte array (#458).
 
 > **12c+ support (issue #27) — RESOLVED.** Advertising a 12c+ field version is
 > necessary for 21c login but not sufficient: it changes how the server frames
@@ -1766,7 +1773,18 @@ Bind values are encoded inline following OAC descriptors:
 | `None`                  | Single `0x00` byte                                     |
 | `seerdb.Var` (OUT/IN OUT) | the seeded value, or `0x00` (NULL) for a pure OUT; OAC driven by the Var's declared type |
 | `Var(seerdb.ROWID)` / `Var(DB_TYPE_UROWID)` | the rowid's text; OAC a VARCHAR of 5267 characters, the longest universal rowid, on every tier from 8i (#1397, #1399) |
-| `seerdb.cursor.cursor` / `Var(seerdb.CURSOR)` | `0x01, 0x00` (REF CURSOR placeholder); value returned in the IOV (§6.5) |
+| `seerdb.cursor.cursor` / `Var(seerdb.CURSOR)` | a `ub4` count, then that many `ub4` cursor ids; OAC type 102, buffer 4, charset 0, the same for IN and OUT (below) |
+
+**A REF CURSOR bind carries cursor ids, not a DALC** (#1047). The OAC is the
+same for IN and OUT (`66 01 00 00 01 04 00 00 00 00 00 00 00`); only the value
+differs: `07 00` for OUT (count 0, "open one for me") and `07 01 01 01 03` for an
+IN bind of cursor 3 (count 1, id 3). A narrower OAC (buffer 1, the database
+charset) is harmless for OUT, where the server fills the slot, but for IN the
+server sizes its buffer from the OAC and then waits for bytes that do not fit: a
+hang, not an error. A server that reads the value as a DALC gets the count where
+it wanted the id, and the two are often both 1. The bound cursor must still be
+open on the server with rows unread; one already fetched to its end is answered
+`ORA-01007`.
 
 **A NULL bind still has to declare a type** (#696). The row data for one is the
 same single `0x00` whatever it stands for, so the OAC in front of it is the only
@@ -1849,8 +1867,9 @@ what lets a plain string over 4000 bytes reach a CLOB on 11g through the regular
 bind path (its OAC is sized to the value, so it is LONG-class there). PL/SQL
 blocks are exempt: their values always ride in place. So are associative-array
 binds. python-oracledb applies exactly this rule; the Mirror reads rows by it.
-8i applies the same 4000-byte rule through its own request form (§19.11), so
-the 8i builder writes rows the same way (#714); 9i is unverified until #711.
+8i and 9i apply the same 4000-byte rule through their own request forms
+(§19.11, §19.3), so their builders write rows the same way (#714, #723). A 9i
+PL/SQL block keeps every value in place.
 
 ## 6. Response Processing
 
@@ -2114,6 +2133,14 @@ shorter** overall — but they are spread through the header, so each field behi
 them moves by a **different** amount, the running total of the slots ahead of it:
 the second indicator by 4, the bind count by 12, the SQL text by the full 20.
 The cursor id and the SQL length sit ahead of all five and do not move.
+
+sqlplus 10.2 sends a third form: the narrow preamble with the bind count still
+at 71 but the SQL text at **148**, 28 bytes earlier, in every statement it sent
+to 10g and 11g (#1764). That is 48 bytes shorter than the wide form, and its
+close-cursors piggyback is 48 bytes shorter too. Its pointer fields hold real
+addresses rather than the indicator, and an address at 23 can leave bytes at 27
+that look like one, so the session's field version, not the wire, says which
+form it is.
 
 **The SQL length depends on the client's character set** (#1427). A client in
 AL32UTF8, the database's own, declares the SQL's byte length. One in any other
@@ -2510,6 +2537,13 @@ convention:
 | BINARY_DOUBLE        | 101 | 1 |
 | REF                  | 111 | 2000 |
 | CLOB / BLOB          | 112 / 113 | 4000 |
+| BOOLEAN              | 252 | 1 |
+| ROWID                | 11  | 1 |
+| UROWID               | 208 | 292 |
+| object (ADT, XMLType) | 109 | 2000 |
+| JSON / VECTOR        | 119 / 127 | 8200 (§14.5e) |
+| nested cursor (REF CURSOR column) | 102 | 5 |
+| BFILE                | 114 | 530 |
 
 A character or RAW column is absent from that list on purpose: zero is a
 truthful answer there, and it is exactly what `SELECT NULL AS x` describes.
@@ -5195,8 +5229,19 @@ client drops it, exactly as it does for 10g+ (#1078).
 `RETURNING ... INTO` cannot be carried in this form: the 9.2 server answers
 `ORA-00439: feature not enabled: RETURNING clause from this client type`, and
 the 8i OALL8 form (§19.12) returns no value and drops the connection when the
-statement fails. The client refuses the clause below 10g (#716); the native 9.2
-client's request for it is not captured yet. The pre-10 error reply (§19.2)
+statement fails. The client therefore runs the statement as an anonymous block,
+`BEGIN <dml> RETURNING ... INTO :n; END;`, whose INTO targets are ordinary OUT
+binds (§19.7), on 8i and 9i alike (#801, #802; §22). Multi-column RETURNING,
+UPDATE, DELETE and `SQL%ROWCOUNT` all work; a multi-row RETURNING into a scalar
+raises `ORA-01422` as on any Oracle, and a failing statement is an ordinary
+PL/SQL error with the session intact.
+
+The capability route does not work. Setting `compile_caps[CCAP_FIELD_VERSION]`
+to 2, as the native 9.2 OCI client does, clears ORA-00439, but every bind then
+fails with `ORA-03120`: the server parses binds in the native OCI marshalling
+(64-bit pointer and length fields). Adding the runtime word-size capability
+(`02 01`) commits the session to the full native OCI login, and 9.2.0.4 closes
+the connection after the thin data-type table (#716, #790). The pre-10 error reply (§19.2)
 carries the code and text but no error position.
 
 The RPA piggyback is `08`, a `ub4` parameter count, then exactly that many
