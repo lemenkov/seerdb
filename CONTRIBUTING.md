@@ -90,8 +90,45 @@ contributing rather than after.
 - Keep the existing MIT / SPDX header on new source files. The project
   is [REUSE](https://reuse.software/) compliant — see `REUSE.toml`.
 - Add tests for new behavior. The offline test suite runs without a
-  database; integration tests gated on `PYORACLE_TEST_USER` are the
-  right place for anything that needs to talk to a real Oracle.
+  database; integration tests gated on `SEERDB_TEST_USER` are the
+  right place for anything that needs to talk to a real Oracle. Cover every
+  supported server version the feature reaches; where a version cannot have
+  the scenario, skip the test there explicitly, with the reason, so it does
+  not pass silently.
+- **Keep `docs/PROTOCOL.md` current.** A change that fixes a codec, or adds,
+  tightens or clarifies a wire layout, limit or edge case, updates the
+  relevant section of `docs/PROTOCOL.md` in the same PR. It is the reference
+  other implementations build on.
+- **Link the issue so it closes itself.** Put `Closes #N` in the PR
+  description and the commit message, one keyword per issue
+  (`Closes #9, closes #15`; `Closes #9 and #15` closes only #9). A PR that
+  only partly addresses an issue, or one of several PRs for it, says
+  `Refs #N`, and the issue is closed by hand when the last one lands.
+
+## Code conventions
+
+- **When behaviour is ambiguous, match python-oracledb (thin):** API names,
+  defaults, edge cases. The deliberate exceptions are listed in the README
+  under *Intentional differences from python-oracledb*; a new one is added
+  there, not left implicit.
+- **Sync and async stay in step.** A feature added to `Connection`/`Cursor`
+  lands in `AsyncConnection`/`AsyncCursor` in the same PR, with the same
+  signature, defaults and exceptions, and with tests on both.
+- **Field-version constants** are spelled `FIELD_VERSION_<major>_<minor>` and,
+  for an extension, `FIELD_VERSION_<major>_<minor>_EXT_<n>`
+  (`FIELD_VERSION_12_2_EXT_1`), even where another driver spells a name
+  differently.
+- **Pick a number's base from what it is.** Bit flags, masks, wire markers,
+  type codes and packed versions are hex (`0x20`, `0x0B200200`); ORA error
+  codes, lengths, counts, ports and field versions are decimal
+  (`ORA_NO_DATA_FOUND = 1403`). Don't mix bases within one kind of value.
+- **Move or remove code cleanly.** When a name moves or is deleted, leave no
+  comment at the old place pointing to its new home.
+- **Regexes that run on statement text must not backtrack.** The Mirror
+  applies them to SQL from clients, so a catastrophic pattern is a denial of
+  service, and CodeQL fails the PR on it. Write a block-comment body as
+  `/\*(?:[^*]|\*(?!/))*\*/`, never a lazy `.*?` inside a repeated group, and
+  time the pattern on pathological input such as `'/*' + '*//*' * 100_000`.
 
 ## Branches and pull-request scope
 
@@ -108,6 +145,10 @@ contributing rather than after.
   the diff narrows to just the follow-up. Basing a PR on another feature branch
   invites merging it into that branch by mistake instead of `master`, stranding
   the work off `master`.
+- **One commit per PR, kept that way.** Fixes found while it is open, from
+  review, CI or a failing test leg, are amended into that commit and
+  force-pushed, not added as extra commits or a follow-up PR. A separate
+  problem found along the way gets its own issue and its own PR.
 
 ## Developer Certificate of Origin
 

@@ -4,6 +4,13 @@ This file collects repeatable procedures for automated / AI agents working
 on seerdb. For the project's clean-room posture and contribution rules, read
 [`CONTRIBUTING.md`](CONTRIBUTING.md) first — those requirements always apply.
 
+## Layout
+
+`seerdb/` has three subpackages: `common/` is the wire codec and the types both
+sides share (`tns.py`, `tns_consts.py`, `crypto.py`, ...), `client/` the DB-API
+driver, and `server/` the Mirror, with its backends under `server/backends/`.
+The root `__init__.py` re-exports the public API.
+
 ## Before you open a PR
 
 Linting and type checking are expensive to run on GitHub, so they are **not**
@@ -18,7 +25,7 @@ reuse lint
 
 All four, every time, including before amending onto a PR that is already open.
 
-Two things bite repeatedly:
+These bite repeatedly:
 
 - **`python -m mypy` takes no path.** Bare, it checks every file including the
   tests; `mypy seerdb` checks a third of them and has passed while the real gate
@@ -28,6 +35,18 @@ Two things bite repeatedly:
   `mirror-passthrough.log` and `mirror-postgres.log` beside the checkout, and
   `reuse` flags them even though git ignores them. Delete them before linting,
   and never stage them.
+- **CI's mypy runs without the `mirror` extra.** There `psycopg` is `Any`, so
+  code that passes locally with psycopg installed can fail with `[has-type]`.
+  To reproduce, use a venv with only `pip install . mypy`.
+- **CI runs Python 3.10 to 3.14.** An annotation that 3.10 evaluates eagerly (a
+  name shadowed by a class attribute breaks `X | None` at import) and an
+  `await` inside a nested comprehension (a `SyntaxError` before 3.12) both pass
+  a newer local interpreter. Use `from __future__ import annotations`, write
+  await-loops as plain `for` loops, and check `gh pr checks` after opening.
+- **Grep before adding a module-level name to a large module.** In
+  `seerdb/server/backends/postgres.py` and the big test modules, a new constant
+  or helper with an existing name silently rebinds it, and neither ruff nor
+  mypy flags a reassigned constant.
 
 ### Tests
 
@@ -77,8 +96,62 @@ re-runs every leg its paths reach (#1942). So:
 - When two PRs touch the same code, open the second after the first merges,
   rebased once. Don't rebase a PR that still merges cleanly.
 
+The offline suite means all of it, `python -m pytest -q tests`. CI also runs
+its codec modules under `unittest`, in a different order (the `unittest` step
+in `.github/workflows/tests.yml`); run that too, so state a test leaves behind
+shows up locally. If a leg is red for a reason unrelated to the change, show it
+with the same run on the `master` base and say so in the PR.
+
 A docs-only change needs none of the test tiers; the repository's own workflows
 skip them on those paths too.
+
+### Proving a test
+
+- **A new test must fail without the fix.** pytest puts the test file's own
+  tree on `sys.path` ahead of `PYTHONPATH`, so
+  `PYTHONPATH=<base> pytest <branch>/tests/test_x.py` still imports the branch.
+  Copy the test into the base's checkout and run it there.
+- **seerdb's own decoder proves nothing about its encoder**, and neither does a
+  hand-written wire fixture: each holds the same assumption. Where the server
+  interprets what was written (a JSON image's hash array, an index, a sort
+  order), check that the server acts on it, and diff against a server-built
+  image of the same value. When a live run disagrees with a fixture, fix the
+  fixture from a capture.
+- **A direct call into the codec runs at the field-version defaults**
+  (`_DECODE_FIELD_VERSION` / `_ENCODE_FIELD_VERSION` in `seerdb/common/tns.py`).
+  Before reporting a codec or Mirror bug from such a call, set them as the
+  session that makes the call does, or reproduce it live.
+- **A Mirror performance or caching change** is timed by running
+  python-oracledb's suite alone, on the branch and on its merge base. A
+  per-call benchmark of a short statement cannot see a cost that grows with the
+  statement's length.
+
+### Sharing a database or a bed
+
+- **One suite per database or bed at a time.** The Mirror-over-PG legs,
+  `tests/test_postgres_backend.py` and a hand-started Mirror each install their
+  own checkout's dictionary into the database they connect to and create and
+  drop objects there, so two runs against one database break each other. An
+  Oracle bed is the same: the SQLAlchemy dialect's schema reset drops tables
+  from under a running integration suite. A leg that failed while something
+  else ran is rerun alone before it counts as a regression.
+- **The offline leg must not inherit `MIRROR_PG`** while a Mirror-over-PG leg
+  runs: with it set, `pytest tests` also runs the live backend module against
+  the same database. Run it with `env -u MIRROR_PG`.
+- **Test against CI's PostgreSQL.** CI builds its database from
+  `examples/mirror-pg.Dockerfile`, with orafce and pgvector pinned, and orafce
+  changes behaviour between versions. A change to which orafce function runs is
+  checked against an image built from that file.
+- **A change to how the backend wraps statements in transactions** runs on a
+  fresh database and through `tools/run_mirror_suite.py postgres` at both
+  `MIRROR_PRESENTS=23ai` and `12.1`, not only the backend module: psycopg's
+  prepared-statement cache and the connection's prelude break in ways only the
+  integration suite reaches.
+- **A fail-without check on a used database proves little.** A branch that adds
+  a view, function or column leaves it behind, and the base never drops it, so
+  the new test passes on the base too. Drop the object first, and clear the
+  installation stamp so the next connect reinstalls:
+  `COMMENT ON SCHEMA system IS NULL`.
 
 ## Merging
 
@@ -113,7 +186,9 @@ tag it. The steps:
    tag (`git log <last-tag>..master`), skipping dependabot / pure-CI noise.
    Mirror (`seerdb.server`) changes are listed too, from the release that
    first ships it (3.1.0), each bullet starting **Mirror (tech preview):** so
-   nobody reads it as a promise the client keeps.
+   nobody reads it as a promise the client keeps. Bring `README.md` up to date
+   in the same PR: the Compatibility table, the Feature matrix and the Status
+   list.
 
 4. **Open a PR** against upstream `master` following the normal fork→upstream
    flow (push the branch to your fork, open the PR against `seerdb/seerdb`).
