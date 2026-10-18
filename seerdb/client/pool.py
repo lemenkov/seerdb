@@ -23,12 +23,16 @@ Usage:
     pool.close()
 """
 
+import base64
+import secrets
 import threading
 import time
 from collections import deque
 
+from seerdb.client._conn_logic import _ConnectionLogic
 from seerdb.client.connection import OracleConnect
 from seerdb.common.exceptions import InterfaceError
+from seerdb.common.tns_consts import PURITY_DEFAULT, PURITY_SELF
 
 
 class _PoolEntry:
@@ -58,6 +62,28 @@ class _PooledConnectionGuard:
         # connection got into a bad state the next acquire's health-check
         # will catch it and discard the entry.
         self._pool.release(self._conn)
+
+
+def drcp_pool_class() -> str:
+    """A connection class for one DRCP pool: a prefix and the base64 of 16
+    random bytes, the shape python-oracledb gives its own pools (`DPY:` and 24
+    characters, new for each pool, measured) under seerdb's prefix, so the
+    server's DRCP statistics name the driver that made it (#2006)."""
+    return 'SEERDB:' + base64.b64encode(secrets.token_bytes(16)).decode('ascii')
+
+
+def apply_drcp_pool_defaults(conn: _ConnectionLogic, cclass: str) -> None:
+    """What a pool sets on a connection that asks for a pooled server (#2006):
+    the pool's own class when the connection names none, and purity SELF when
+    it is left at the default -- as python-oracledb's pools do, where a
+    standalone pooled connection sends NEW and no class. Applied after the
+    connection reads its dsn, so `:pooled` there counts too."""
+    if conn.server_type != 'pooled':
+        return
+    if not conn.cclass:
+        conn.cclass = cclass
+    if conn.purity == PURITY_DEFAULT:
+        conn.purity = PURITY_SELF
 
 
 class Pool:
@@ -96,6 +122,8 @@ class Pool:
         self._idle_timeout = idle_timeout
         self._health_check = health_check
         self._connect_kwargs = connect_kwargs
+        # The connection class this pool's DRCP sessions share (#2006).
+        self._drcp_class = drcp_pool_class()
 
         # `_free` holds available entries; `_in_use` tracks acquired ones
         # so close() can finalise them.
@@ -212,6 +240,7 @@ class Pool:
 
     def _open_connection(self) -> OracleConnect:
         Conn = OracleConnect(**self._connect_kwargs)
+        apply_drcp_pool_defaults(Conn, self._drcp_class)
         Conn.connect()
         return Conn
 

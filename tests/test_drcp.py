@@ -6,9 +6,14 @@
 # the response decoder skips the server-side piggyback DRCP sessions carry. The
 # live cclass/purity auth round-trip is covered on 21c/23ai.
 
+import asyncio
 import unittest
+from unittest import mock
 
+from seerdb.client.aconnection import AsyncOracleConnect
+from seerdb.client.apool import AsyncPool
 from seerdb.client.connection import OracleConnect
+from seerdb.client.pool import Pool
 from seerdb.common.tns import (
     decode_packet,
     encode_dictionary_auth,
@@ -16,6 +21,7 @@ from seerdb.common.tns import (
 )
 from seerdb.common.tns_consts import (
     FIELD_VERSION_12_1,
+    PURITY_NEW,
     PURITY_SELF,
     TTI_STA,
     TTI_SVR_PIGGYBACK,
@@ -141,3 +147,53 @@ class TestPiggyback(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestDrcpPool(unittest.TestCase):
+    # A DRCP pool's connections (#2006), as python-oracledb's pools send them:
+    # the pool's own generated class when none is given (`DPY:` and 24 base64
+    # characters there, new per pool; `SEERDB:` here), and purity SELF.
+    def setUp(self):
+        patcher = mock.patch.object(OracleConnect, 'connect', lambda self: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _pool(self, **kwargs):
+        return Pool(min=0, max=2, user='u', password='p', host='h', **kwargs)
+
+    def test_a_pooled_pool_gives_its_connections_a_class_and_self(self):
+        pool = self._pool(server_type='pooled')
+        (a, b) = (pool._open_connection(), pool._open_connection())
+        self.assertRegex(a.cclass, r'^SEERDB:[A-Za-z0-9+/]{22}==$')
+        self.assertEqual(a.cclass, b.cclass)
+        self.assertEqual(a.purity, PURITY_SELF)
+        other = self._pool(server_type='pooled')._open_connection()
+        self.assertNotEqual(other.cclass, a.cclass)
+
+    def test_a_class_or_purity_given_is_kept(self):
+        conn = self._pool(
+            server_type='pooled', cclass='MINE', purity=PURITY_NEW
+        )._open_connection()
+        self.assertEqual((conn.cclass, conn.purity), ('MINE', PURITY_NEW))
+
+    def test_a_pool_not_asking_for_drcp_is_untouched(self):
+        conn = self._pool()._open_connection()
+        self.assertEqual((conn.cclass, conn.purity), (None, 0))
+
+    def test_a_pooled_dsn_counts(self):
+        conn = Pool(
+            min=0, user='u', password='p', dsn='db/svc:pooled'
+        )._open_connection()
+        self.assertTrue(conn.cclass.startswith('SEERDB:'))
+
+    def test_the_async_pool_does_the_same(self):
+        async def run():
+            with mock.patch.object(AsyncOracleConnect, 'connect', mock.AsyncMock()):
+                pool = AsyncPool(
+                    min=0, max=2, user='u', password='p', host='h', server_type='pooled'
+                )
+                return await pool._open_connection()
+
+        conn = asyncio.run(run())
+        self.assertTrue(conn.cclass.startswith('SEERDB:'))
+        self.assertEqual(conn.purity, PURITY_SELF)

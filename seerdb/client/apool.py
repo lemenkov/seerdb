@@ -26,6 +26,7 @@ import time
 from collections import deque
 
 from seerdb.client.aconnection import AsyncOracleConnect
+from seerdb.client.pool import apply_drcp_pool_defaults, drcp_pool_class
 from seerdb.common.exceptions import InterfaceError
 
 
@@ -93,6 +94,8 @@ class AsyncPool:
         self._idle_timeout = idle_timeout
         self._health_check = health_check
         self._connect_kwargs = connect_kwargs
+        # The connection class this pool's DRCP sessions share (#2006).
+        self._drcp_class = drcp_pool_class()
 
         # asyncio.Condition wraps an asyncio.Lock; same usage as the
         # sync Pool but everything is await-based. Created lazily so
@@ -236,6 +239,7 @@ class AsyncPool:
 
     async def _open_connection(self) -> AsyncOracleConnect:
         Conn = AsyncOracleConnect(**self._connect_kwargs)
+        apply_drcp_pool_defaults(Conn, self._drcp_class)
         await Conn.connect()
         return Conn
 
