@@ -529,6 +529,22 @@ def _alias_entry(alias: str) -> str:
     )
 
 
+# Three groups, the last all NULL: the shape a live 11g's reply was misread on
+# (#1995); two groups did not trip it.
+_NULL_GROUP_ROWS = (
+    (1, '12345678901234567890.123'),
+    (1, '12345678901234567890.125'),
+    (2, '12345678901234567890.127'),
+    (2, '12345678901234567890.131'),
+    (3, 'NULL'),
+)
+_NULL_GROUP_AVERAGES = [
+    (1, Decimal('12345678901234567890.124'), 2),
+    (2, Decimal('12345678901234567890.129'), 2),
+    (3, None, 0),
+]
+
+
 _LTZ_VALUE = datetime.datetime(2026, 9, 25, 13, 45, 6, 123456)
 _LTZ_TABLE_DDL = (
     'CREATE TABLE {} (k NUMBER, a TIMESTAMP WITH LOCAL TIME ZONE, '
@@ -2909,6 +2925,22 @@ class CursorIntegration(_IntegrationBase):
                     cur = conn.cursor()
                     cur.execute('SELECT 1 FROM dual')
                     self.assertEqual(cur.fetchone(), (1,))
+
+    def test_an_aggregate_over_a_null_group(self):
+        # An aggregate that skipped NULLs makes the server set a warning in the
+        # closing status, a field that before 12.1 is a ub2; read as one byte
+        # it desynced the reply on 11g (#1995).
+        t = self.TABLE
+        self.cur.execute(f'CREATE TABLE {t} (g NUMBER, n NUMBER)')
+        for g, n in _NULL_GROUP_ROWS:
+            self.cur.execute(f'INSERT INTO {t} VALUES ({g}, {n})')
+        self.cur.execute(f'SELECT g, AVG(n), COUNT(n) FROM {t} GROUP BY g ORDER BY g')
+        self.assertEqual(
+            self.cur.fetchall(),
+            _NULL_GROUP_AVERAGES,
+        )
+        self.cur.execute('SELECT 1 FROM dual')  # and the session reads on
+        self.assertEqual(self.cur.fetchone(), (1,))
 
     def test_a_long_program_name_connects(self):
         # 8i's login gives a program name one length byte, which stops at 252:
@@ -9965,6 +9997,30 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     async with Conn.cursor() as Cur:
                         await Cur.execute('SELECT 1 FROM dual')
                         self.assertEqual(await Cur.fetchone(), (1,))
+
+    async def test_an_aggregate_over_a_null_group(self):
+        # Async twin of CursorIntegration's (#1995).
+        Table = 'PYO_ASYNC_NULL_AGG'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            try:
+                await Cur.execute(f'DROP TABLE {Table}')
+            except seerdb.DatabaseError:
+                pass
+            await Cur.execute(f'CREATE TABLE {Table} (g NUMBER, n NUMBER)')
+            for G, N in _NULL_GROUP_ROWS:
+                await Cur.execute(f'INSERT INTO {Table} VALUES ({G}, {N})')
+            await Cur.execute(
+                f'SELECT g, AVG(n), COUNT(n) FROM {Table} GROUP BY g ORDER BY g'
+            )
+            self.assertEqual(
+                await Cur.fetchall(),
+                _NULL_GROUP_AVERAGES,
+            )
+            await Cur.execute(f'DROP TABLE {Table}')
+        finally:
+            await Conn.close()
 
     async def test_a_long_program_name_connects(self):
         # Async twin of CursorIntegration's.

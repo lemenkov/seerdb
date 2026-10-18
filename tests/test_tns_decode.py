@@ -1997,6 +1997,43 @@ class TestTnsCommandDecoders(unittest.TestCase):
             ),
         )
 
+    def test_an_aggregate_warning_keeps_the_oer_aligned(self):
+        # A GROUP BY whose aggregate skipped NULLs sets the OER `flags` field,
+        # which before 12.1 is a variable-length ub2 (`01 20`) and from 12.1 a
+        # single byte (`20`). Read as one byte, 11g's reply misread the rowid
+        # and everything after it, and failed (#1995). Both frames are captured
+        # from live servers: 11g at fv 6, 23ai at fv 24.
+        from seerdb.common.tns import _DECODE_FIELD_VERSION
+        from seerdb.common.types import rowid_to_string
+
+        captured = (
+            (
+                6,
+                '040102010f010302057b000001080116030001200000050305eeef0104000201'
+                '4d010400001200010100000000194f52412d30313430333a206e6f2064617461'
+                '20666f756e640a',
+                (0x05EEEF, 4, 0x14D, 4),
+            ),
+            (
+                24,
+                '04010202f1b5010302057b000001050116030020000005030b31c30204000002'
+                'cf2d01040000170001010000000002057b0103010300194f52412d3031343033'
+                '3a206e6f206461746120666f756e640a',
+                (0x0B31C3, 1024, 0xCF2D, 4),  # relative file 1024: a bigfile tablespace
+            ),
+        )
+        for field_version, frame, rowid in captured:
+            with self.subTest(field_version=field_version):
+                token = _DECODE_FIELD_VERSION.set(field_version)
+                try:
+                    result = decode_token_oer(bytes.fromhex(frame), (None, None, []))
+                finally:
+                    _DECODE_FIELD_VERSION.reset(token)
+                self.assertEqual(result[1], 1403)
+                self.assertEqual(result[5], 'ORA-01403: no data found')
+                self.assertEqual(result[6], rowid_to_string(*rowid))
+                self.assertEqual(result[10], 5)  # warn flags, now read in place
+
     def test_tns_decode_token_oer_rowid(self):
         # Same OER frame as _04 but with a real (non-zero) rowid in the
         # rowid slot, so the decoder must render it as the trailing lastrowid.

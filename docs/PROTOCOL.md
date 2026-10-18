@@ -2979,7 +2979,8 @@ TTI_OER |
   cursor_id (ub2) |
   error_position (sb2)         -- the parse offset; surfaced as DatabaseError.offset (oracledb parity) |
   sql_type, fatal, flags, user_cursor_options, upi_param,
-    warn_flags (6 x ub1)      -- see 6.3a: warn_flags carries a real signal |
+    warn_flags (6 x ub1; flags is a ub2 below 12.1, see 6.3a)
+                              -- warn_flags carries a real signal |
   rowid (ub4 data_object + ub2 rel_file + ub1 + ub4 block + ub2 slot) |
   os_error (ub4, skipped) |
   statement_number (ub1, skipped) | call_number (ub1, skipped) |
@@ -3053,7 +3054,23 @@ carry on; a client whose connection was dropped mid-suite cannot.
 
 #### 6.3a `warn_flags`: a warning on a call that SUCCEEDED (#993)
 
-Five of those six single-byte fields are diagnostic and skipped. The **last** one
+**Below 12.1, `flags`, the third of the six, is a variable-length ub2, not a
+byte** (#1995). It is `00` when zero, so an ordinary reply looks like six single
+bytes, but a warning sets it, and then it takes two. An aggregate that skipped
+NULLs (`SELECT g, AVG(n) ... GROUP BY g` over an all-NULL group) is one such
+warning, captured from live servers:
+
+| server | sql_type … warn_flags |
+|---|---|
+| 10g, 11g | `03 00 01 20 00 00 05` |
+| 18c, 21c, 23ai, and 23ai negotiated at 12.1 or 12.2 | `03 00 20 00 00 05` |
+| no warning, any server | `03 00 00 00 00 00` |
+
+Read as one byte, the 10g/11g form leaves the reader one byte early: the rowid
+starts on `05`, and every field after it is misread. 11g then failed on the
+batch-error arrays, while 10g happened to come through.
+
+Five of those six fields are diagnostic and skipped. The **last** one
 is not. Bit `0x20` says the statement created a PL/SQL object that **compiled
 with errors** — a `CREATE PROCEDURE` with a syntax error *succeeds*, the object
 exists in an invalid state, `ora_error_code` is 0 and the reply is otherwise
