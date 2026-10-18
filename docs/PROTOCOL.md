@@ -2488,12 +2488,29 @@ re-execute after EOF (`§5.2.1`).
 
 Contains the actual column values for one row, encoded according to each column's data type from the describe information.
 
-A character / RAW value longer than the single-byte DALC length (253 bytes) is
-**chunked**, and the chunk framing is field-version-specific (§6.4): 11g uses
-single-byte chunk lengths, 12c+ uses ub4 chunk lengths. A server must encode row
-values with the *negotiated* form — `seerdb/server/query.py` uses `encode_chr`
-(field-version-aware), not the always-12c+ `_bytes_with_length`, or an 11g client
-decodes a value past 253 bytes as a "truncated DALC field".
+A character / RAW value longer than **252 bytes**, the largest single-byte DALC
+length (§12.2), is **chunked**, and the chunk framing is field-version-specific:
+before 12.1 each chunk has a single length byte, from 12.1 a `ub4`. A server must
+encode row values with the *negotiated* form — `seerdb/server/query.py` uses
+`encode_chr` (field-version-aware), not the always-12c+ `_bytes_with_length`, or
+an 11g client decodes a value past 252 bytes as a "truncated DALC field".
+
+What a real server sends for a VARCHAR2 or RAW column, measured on 11g (fv 6) and
+23ai (fv 24):
+
+| value length | 11g | 23ai |
+|---|---|---|
+| 252 | `fc` + 252 bytes | `fc` + 252 bytes |
+| 253 | `fe fd` + 253 bytes, `00` | `fe 01 fd` + 253 bytes, `00` |
+| 255 | `fe ff` + 255 bytes, `00` | `fe 01 ff` + 255 bytes, `00` |
+| 256 | `fe ff` + 255 bytes, `01` + 1 byte, `00` | `fe 02 01 00` + 256 bytes, `00` |
+
+So 253 is the first length that is chunked, and **inside the run a chunk length
+is a plain count**: `fd`, `fe` and `ff` are markers only as the value's first
+length byte. Before 12.1 a chunk is at most 255 bytes; from 12.1 its length is a
+`ub4` and one chunk can hold the whole value. LOB content (`TTI_LOB`, §14.3)
+is chunked the same way but sooner: a 252-byte BLOB read already arrives as
+`0e fe fc` + 252 bytes + `00` on 11g and `0e fe 01 fc` … on 23ai.
 
 **A column described with a zero data length carries no bytes at all** — not
 even the empty DALC an ordinary NULL sends — and its value is always NULL. The
@@ -3594,7 +3611,8 @@ else            ub1 length + that many bytes
 ub4 ub4         two trailing indicators (skip)
 ```
 
-Large values are split into many ≤253-byte chunks (XE uses 64-byte chunks),
+Large values are split into many chunks of at most 255 bytes, each with its
+own length byte (XE uses 64-byte chunks for LONG; §6.2 has the general rule),
 not one big chunk. LONG decodes to `str` (charset-aware), LONG RAW to `bytes`,
 NULL to `None`. Confirmed against XE 11g (NULL, single-chunk, a 700-byte
 multi-chunk value, and a LONG that is not the last column).
@@ -3630,7 +3648,8 @@ scalar types use:
 (seerdb / oracledb-thin) needs no streaming dance: the LONG / LONG RAW value
 rides **inline in the ordinary execute reply**, in the same `TTI_RXD` as the
 other columns (`encode_long_value_thin`). The value is the `0xFE`-chunked form
-(chunks ≤ 253 bytes, terminated by a zero-length chunk), and — unlike the OCI
+(chunks ≤ 252 bytes as the Mirror writes them, terminated by a zero-length
+chunk; a chunk could be up to 255, §6.2), and — unlike the OCI
 path — it carries **both** trailing `ub4` indicators (`0` / `0`) that
 `_read_long_column` consumes. A NULL is a bare `0x00` marker still followed by
 those two indicators, so it can **not** take the empty-DALC NULL path the scalar
@@ -3669,7 +3688,7 @@ Variable-length data with a length prefix:
 | `0x00` (empty) | nothing follows                                          |
 | `0x01`..`0xFC` | `<length>, <data>` — **252 is the largest real length**   |
 | `0xFD` (253)   | **escape / absent value**: the 2-byte placeholder `FD 01`, no data. Not a length. |
-| `0xFE` (254)   | chunked: repeated `<chunk_len>, <chunk_data>` (max 64 bytes per chunk), terminated by `0x00` |
+| `0xFE` (254)   | chunked: repeated `<chunk_len>, <chunk_data>`, terminated by a zero chunk length. A chunk length is a plain count, a single byte up to 255 before 12.1 and a `ub4` from 12.1 (§6.2); seerdb writes 64-byte chunks |
 | `0xFF` (255)   | null marker, no data follows                             |
 
 **The top three bytes are markers, not lengths**, and getting that wrong is not
@@ -6015,7 +6034,7 @@ proof-less result (a `TTI_SESS` challenge always carries `AUTH_SESSKEY`; a resul
 carries `AUTH_VERSION_NO`) and authenticates without validating a proof.
 
 Because the RSA signature is ~344 base64 bytes, this is the first auth pair whose
-value exceeds 253 bytes, so `encode_kv` uses the chunked
+value exceeds 252 bytes, so `encode_kv` uses the chunked
 `write_bytes_with_length` form (the `254` marker + ub4-length chunks) that the
 short single-byte-length form could not carry.
 
