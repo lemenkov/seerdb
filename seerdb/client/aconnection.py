@@ -406,26 +406,37 @@ class AsyncOracleConnect(_ConnectionLogic):
 
     # ----- I/O primitives -----
 
+    async def _connect_socket(self, Loop: asyncio.AbstractEventLoop) -> socket.socket:
+        # The sync connection's _connect_socket: the first address the host
+        # resolves to that answers, in getaddrinfo's order, each in its own
+        # family (#2000).
+        Last: OSError = OSError(f'{self.host!r} resolves to no address')
+        for Family, Type, Proto, _, Address in await Loop.getaddrinfo(
+            self.host, self.port, type=socket.SOCK_STREAM
+        ):
+            Sock = socket.socket(Family, Type, Proto)
+            Sock.setblocking(False)
+            try:
+                await Loop.sock_connect(Sock, Address)
+                return Sock
+            except OSError as E:
+                Sock.close()
+                Last = E
+        raise Last
+
     async def _open_transport(self) -> None:
         # Open the TCP (optionally TLS) socket to the current host/port and send
         # the initial CONNECT. Shared by connect() and the TNS_REDIRECT handler.
         SslArg = self._ssl_kwarg()
-        # Force IPv4 to match the sync path. asyncio.open_connection
-        # otherwise defers to getaddrinfo's default ordering, which
-        # often hands back ::1 first; some Oracle listener configs
-        # only bind IPv4 and silently drop IPv6 connects.
         Loop = asyncio.get_running_loop()
         # Following a redirect (self._redirects > 0), retry a refused connect —
         # the dispatcher / dedicated server may still be binding its port (#399).
         Attempts = _REDIRECT_CONNECT_ATTEMPTS if getattr(self, '_redirects', 0) else 1
         for Attempt in range(Attempts):
-            Sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            Sock.setblocking(False)
             try:
-                await Loop.sock_connect(Sock, (self.host, self.port))
+                Sock = await self._connect_socket(Loop)
                 break
             except ConnectionRefusedError:
-                Sock.close()
                 if Attempt + 1 >= Attempts:
                     raise
                 await asyncio.sleep(_REDIRECT_CONNECT_DELAY)
