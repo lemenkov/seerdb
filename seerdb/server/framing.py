@@ -340,3 +340,18 @@ class PacketStream:
                 self._write_data(body)
             return
         self._sock.sendall(packet)
+
+
+def listen_socket(host: str, port: int, backlog: int) -> socket.socket:
+    """A listening socket for ``host``, in the family the host resolves to, so an
+    IPv6 address binds (#2001). A wildcard (``''`` or ``'::'``) binds one
+    dual-stack socket that serves IPv4 and IPv6 alike where the system can;
+    ``'0.0.0.0'`` stays IPv4-only."""
+    if host in ('', '::') and socket.has_dualstack_ipv6():
+        return socket.create_server(
+            ('', port), family=socket.AF_INET6, backlog=backlog, dualstack_ipv6=True
+        )
+    (family, *_) = socket.getaddrinfo(
+        host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+    )[0]
+    return socket.create_server((host, port), family=family, backlog=backlog)

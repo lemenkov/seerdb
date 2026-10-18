@@ -31,7 +31,7 @@ from seerdb.common.tns_consts import (
     TNS_REFUSE,
     TNS_RESEND,
 )
-from seerdb.server.framing import DEFAULT_SDU, PacketStream
+from seerdb.server.framing import DEFAULT_SDU, PacketStream, listen_socket
 
 logger = logging.getLogger('seerdb.server')
 
@@ -103,16 +103,13 @@ class Listener:
 
     def serve_forever(self) -> None:
         """Bind, listen, and handle connections until interrupted."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((self.host, self.port))
-        sock.listen(1)
+        sock = listen_socket(self.host, self.port, 1)
         self._sock = sock
         logger.info('listening on %s:%d', self.host, self.port)
         try:
             while True:
                 client, addr = sock.accept()
-                logger.info('accepted connection from %s:%d', *addr)
+                logger.info('accepted connection from %s:%d', addr[0], addr[1])
                 try:
                     self.handler(PacketStream(client, sdu=self.sdu))
                 except OSError as exc:

@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: 2019 Peter Lemenkov <lemenkov@gmail.com>
 # SPDX-License-Identifier: MIT
-"""The client reaches each address its host resolves to (#2000).
+"""The client reaches each address its host resolves to (#2000), and the
+Mirror listens on IPv6 (#2001).
 
 Both connection classes forced their socket to IPv4, so an IPv6 host could not
 be reached at all. They now try the addresses getaddrinfo returns, in order and
-each in its own family, as python-oracledb does. An in-process Mirror listens on
-127.0.0.1; a relay on [::1] in front of it is the IPv6 server.
+each in its own family, as python-oracledb does. The Mirror bound IPv4 only; it
+now binds the family its host resolves to, and a wildcard serves both.
 """
 
 from __future__ import annotations
@@ -67,41 +68,22 @@ def mirror() -> Iterator[seerdb.Server]:
     thread.join(timeout=5)
 
 
+def _serve(host: str) -> Iterator[seerdb.Server]:
+    server = seerdb.Server(host=host, port=0, backend_factory=_DualBackend)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server
+    server.close()
+    thread.join(timeout=5)
+
+
 @pytest.fixture
-def ipv6_port(mirror: seerdb.Server) -> Iterator[int]:
-    # A relay accepting on [::1] and piping each connection to the Mirror.
+def ipv6_port() -> Iterator[int]:
+    # The Mirror itself on [::1], which it can bind since #2001.
     if not _has_ipv6_loopback():
         pytest.skip('this host has no IPv6 loopback')
-    listener = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-    listener.bind(('::1', 0))
-    listener.listen()
-
-    def pipe(src: socket.socket, dst: socket.socket) -> None:
-        try:
-            while data := src.recv(65536):
-                dst.sendall(data)
-        except OSError:
-            pass
-        finally:
-            for s in (src, dst):
-                try:
-                    s.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-
-    def serve() -> None:
-        while True:
-            try:
-                (client, _) = listener.accept()
-            except OSError:
-                return
-            upstream = socket.create_connection(('127.0.0.1', mirror.port))
-            for a, b in ((client, upstream), (upstream, client)):
-                threading.Thread(target=pipe, args=(a, b), daemon=True).start()
-
-    threading.Thread(target=serve, daemon=True).start()
-    yield listener.getsockname()[1]
-    listener.close()
+    for server in _serve('::1'):
+        yield server.port
 
 
 def _kwargs(**extra) -> dict:
@@ -157,3 +139,21 @@ def test_localhost_still_reaches_an_ipv4_only_listener(mirror: seerdb.Server) ->
     start = time.monotonic()
     asyncio.run(run())
     assert time.monotonic() - start < 3
+
+
+def test_a_wildcard_mirror_serves_ipv4_and_ipv6() -> None:
+    # '::' binds one dual-stack socket: the same Mirror answers on 127.0.0.1
+    # and on ::1 (#2001).
+    if not (_has_ipv6_loopback() and socket.has_dualstack_ipv6()):
+        pytest.skip('this host has no dual-stack IPv6')
+    for server in _serve('::'):
+        for host in ('127.0.0.1', '::1'):
+            conn = seerdb.connect(
+                **_kwargs(host=host, port=server.port, service_name='XE')
+            )
+            try:
+                cur = conn.cursor()
+                cur.execute('select * from dual')
+                assert cur.fetchone() == ('X',)
+            finally:
+                conn.close()

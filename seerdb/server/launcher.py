@@ -170,7 +170,10 @@ def _parser() -> argparse.ArgumentParser:
         'profiles recorded with --profile.',
     )
     parser.add_argument('-c', '--config', help='an INI file of options')
-    parser.add_argument('--host', help='listen address (default 127.0.0.1)')
+    parser.add_argument(
+        '--host',
+        help='listen address, IPv4 or IPv6; :: serves both (default 127.0.0.1)',
+    )
     parser.add_argument('--port', type=int, help='listen port (default 1521)')
     parser.add_argument(
         '--encryption',
