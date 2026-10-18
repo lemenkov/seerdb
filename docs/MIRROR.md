@@ -747,6 +747,9 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
 - **Invalid UTF-8** cannot be stored in a string column (#1659).
 - **Fractional seconds** stop at six digits; a `TIMESTAMP(9)` is a
   `TIMESTAMP(6)`.
+- **`MEDIAN`** works as an aggregate, exact over a `NUMBER` and a `DATE`. As an
+  analytic function (`MEDIAN(x) OVER (PARTITION BY ...)`) it is refused, since
+  PostgreSQL has no exact median it can window.
 - **`ROWNUM`** works as a top-N filter only. With `ORDER BY`, `GROUP BY`,
   `DISTINCT`, an aggregate, a set operator or `OR` at the same level, it is
   refused by name.

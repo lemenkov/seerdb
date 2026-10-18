@@ -428,6 +428,10 @@ _CHAR_LENGTH = _Need('Oracle 8i has no USER_TAB_COLUMNS.CHAR_LENGTH', not_8i=Tru
 _8I_DESCRIBE_SPANS_PACKETS = _Need('a describe outgrows a packet on 8i', only_8i=True)
 _ONLY_8I = _Need('not an Oracle 8i server', only_8i=True)
 _GRID_10G = _Need('the grid starts at 10g', min_fv=FIELD_VERSION_10_2)
+_MEDIAN_FUNCTION = _Need('MEDIAN is a 10g function', min_fv=FIELD_VERSION_10_2)
+_MEDIAN_ANALYTIC = _postgres_cannot(
+    'window MEDIAN: PostgreSQL has no exact one (#1992)'
+)
 # By the Mirror leg.
 _REAL_SERVER_REPORT = _Need(
     'a Mirror reports whatever its backend knows', not_mirror=('*',)
@@ -834,6 +838,95 @@ class _IntegrationBase(_ThrottleRetry, unittest.TestCase):
             # ORA-00942: table or view does not exist — expected on first run.
             if e.code != 942:
                 raise
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class MedianIntegration(_IntegrationBase):
+    """MEDIAN over a NUMBER is exact and over a DATE stays a DATE (#1994).
+
+    Through Mirror-over-PG it resolved to orafce's double precision median and
+    came back a rounded float, and a DATE had no median at all."""
+
+    _N = (
+        '12345678901234567890.123',
+        '12345678901234567890.125',
+        '12345678901234567890.127',
+        '12345678901234567890.130',
+    )
+    _D = ('2024-01-01', '2024-01-03', '2024-01-10', '2024-01-11')
+
+    def setUp(self):
+        super().setUp()
+        _skip_unless(self, _MEDIAN_FUNCTION)
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (k NUMBER, g NUMBER, n NUMBER, d DATE)'
+        )
+        for k, (n, d) in enumerate(zip(self._N, self._D), start=1):
+            self.cur.execute(
+                f"INSERT INTO {self.TABLE} VALUES ({k}, {(k + 1) // 2}, {n}, DATE '{d}')"
+            )
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (5, 3, NULL, NULL)')
+
+    def _one(self, sql):
+        self.cur.execute(sql)
+        return self.cur.fetchone()[0]
+
+    def test_median_is_exact_and_keeps_its_type(self):
+        t = self.TABLE
+        # An odd count is its middle row, an even one the two middle rows'
+        # midpoint; NULLs are ignored, and no rows at all is NULL.
+        self.assertEqual(
+            self._one(f'SELECT MEDIAN(n) FROM {t} WHERE k <= 3'),
+            Decimal('12345678901234567890.125'),
+        )
+        self.assertEqual(
+            self._one(f'SELECT MEDIAN(n) FROM {t}'), Decimal('12345678901234567890.126')
+        )
+        # The midpoint of a wide spread keeps every digit.
+        self.assertEqual(
+            self._one(
+                'SELECT MEDIAN(x) FROM (SELECT 0 x FROM dual UNION ALL '
+                'SELECT 12345678901234567891 FROM dual)'
+            ),
+            Decimal('6172839450617283945.5'),
+        )
+        self.assertIsNone(self._one(f'SELECT MEDIAN(n) FROM {t} WHERE k = 5'))
+        self.assertIsNone(self._one(f'SELECT MEDIAN(n) FROM {t} WHERE k > 9'))
+        self.assertEqual(
+            self._one(f'SELECT MEDIAN(d) FROM {t} WHERE k <= 3'),
+            datetime.datetime(2024, 1, 3),
+        )
+        self.assertEqual(
+            self._one(f'SELECT MEDIAN(d) FROM {t}'), datetime.datetime(2024, 1, 6, 12)
+        )
+        self.cur.execute(f'SELECT g, MEDIAN(n) FROM {t} GROUP BY g ORDER BY g')
+        self.assertEqual(
+            self.cur.fetchall(),
+            [
+                (1, Decimal('12345678901234567890.124')),
+                (2, Decimal('12345678901234567890.1285')),
+                (3, None),
+            ],
+        )
+
+    @_requires(_MEDIAN_ANALYTIC)
+    def test_median_as_an_analytic_function(self):
+        self.cur.execute(
+            f'SELECT k, MEDIAN(n) OVER (PARTITION BY g) FROM {self.TABLE} '
+            'WHERE k <= 4 ORDER BY k'
+        )
+        self.assertEqual(
+            [m for _, m in self.cur.fetchall()],
+            [Decimal('12345678901234567890.124')] * 2
+            + [Decimal('12345678901234567890.1285')] * 2,
+        )
+
+    def test_an_order_by_in_its_window_is_refused(self):
+        # Its window takes only PARTITION BY: ORA-30487 on Oracle, and so on
+        # the Mirror.
+        with self.assertRaises(seerdb.DatabaseError) as ctx:
+            self.cur.execute(f'SELECT MEDIAN(n) OVER (ORDER BY k) FROM {self.TABLE}')
+        self.assertEqual(ctx.exception.code, 30487)
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)

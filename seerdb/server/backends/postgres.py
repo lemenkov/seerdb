@@ -7139,6 +7139,58 @@ def _translate_decode(sql: str) -> str:
     return _rewrite_calls(sql, _DECODE_NAMES, case, '_$#."')
 
 
+# ORA-30487: what Oracle answers for MEDIAN ... OVER (... ORDER BY ...), whose
+# window takes only a PARTITION BY (#1994).
+_ORA_ORDER_BY_NOT_ALLOWED = 30487
+_MEDIAN_NAMES = frozenset({'MEDIAN'})
+_OVER_FOLLOWS = re.compile(r'\s*OVER\s*\(', re.IGNORECASE)
+_ORDER_BY_WORDS = re.compile(r'\bORDER\s+BY\b', re.IGNORECASE)
+
+
+def _translate_median(sql: str) -> str:
+    """Oracle's MEDIAN as an exact PostgreSQL expression (#1994).
+
+    orafce's median takes double precision only, so a NUMBER was cast and
+    rounded, and percentile_cont is double precision or interval too. Each
+    percentile_disc returns a row's own value, so the midpoint of the lower and
+    the upper middle row is exact for a number and a datetime alike -- taken as
+    `* 0.5`, which keeps every digit, where numeric `/ 2` keeps only 16
+    significant ones (#1997): one row for
+    an odd count, the two middle rows' midpoint for an even one, NULLs ignored,
+    NULL for none -- Oracle's MEDIAN. An ordered-set aggregate cannot be
+    windowed, so the analytic form is refused until an exact ordinary aggregate
+    exists (#1992); with an ORDER BY in its window it is ORA-30487, as on
+    Oracle.
+    """
+    if 'median' not in sql.lower():
+        return sql
+    (out, pos) = ([], 0)
+    for call in _calls(sql, _MEDIAN_NAMES, '_$#."'):
+        if call.start < pos:
+            continue  # inside a call already replaced
+        over = _OVER_FOLLOWS.match(sql, call.close_at + 1)
+        if over is not None:
+            open_at = over.end() - 1
+            (window, _) = _mask_quoted(sql[open_at : _matching_paren(sql, open_at)])
+            if _ORDER_BY_WORDS.search(window):
+                raise BackendError(
+                    'ORDER BY not allowed here', ora_code=_ORA_ORDER_BY_NOT_ALLOWED
+                )
+            raise UnsupportedFeature(
+                'MEDIAN as an analytic function (OVER) is not translated yet'
+            )
+        if len(call.args) != 1:
+            continue  # left to fail as Oracle would
+        (start, end) = call.args[0]
+        value = _translate_median(sql[start:end]).strip()
+        lower = f'percentile_disc(0.5) WITHIN GROUP (ORDER BY ({value}))'
+        upper = f'percentile_disc(0.5) WITHIN GROUP (ORDER BY ({value}) DESC)'
+        out += [sql[pos : call.start], f'({lower} + ({upper} - {lower}) * 0.5)']
+        pos = call.close_at + 1
+    out.append(sql[pos:])
+    return ''.join(out)
+
+
 # An Oracle identifier may carry `#` (and `$`) after its first character:
 # serial#, statistic#, obj#. PostgreSQL takes `$` but not `#` (#1249).
 _HASH_IDENTIFIER = re.compile(r'[A-Za-z_][A-Za-z0-9_$#]*')
@@ -8273,6 +8325,7 @@ def _rewritten_idioms(sql: str) -> str:
     sql = _ruled('signed-year', _translate_signed_year(sql), sql)
     sql = _ruled('rr-year', _translate_rr_year(sql), sql)
     sql = _ruled('decode', _translate_decode(sql), sql)
+    sql = _ruled('median', _translate_median(sql), sql)
     sql = _ruled('json-functions', _translate_json_functions(sql), sql)
     sql = _ruled(
         'json-constructor-values', _translate_json_constructor_values(sql), sql
