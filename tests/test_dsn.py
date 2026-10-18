@@ -15,9 +15,137 @@ from unittest import mock
 
 from seerdb.client.aconnection import AsyncOracleConnect
 from seerdb.client.connection import OracleConnect
-from seerdb.client.dsn import DsnTarget, parse_dsn, resolve_dsn_arguments
+from seerdb.client.dsn import (
+    ConnectArguments,
+    DsnTarget,
+    parse_dsn,
+    resolve_dsn_arguments,
+)
 from seerdb.client.netconfig import NetConfigError
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
+from seerdb.common.tns_consts import PURITY_NEW, PURITY_SELF
+
+
+def _resolve(dsn, *positional, config_dir=None):
+    # resolve_dsn_arguments with the arguments given positionally, in the order
+    # host, port, service_name, sid, user, password, ssl, server_type; the
+    # rest at their defaults. The first eight fields come back.
+    names = (
+        'host',
+        'port',
+        'service_name',
+        'sid',
+        'user',
+        'password',
+        'ssl',
+        'server_type',
+    )
+    given = {
+        'host': 'localhost',
+        'port': 1521,
+        'service_name': '',
+        'sid': '',
+        'user': '',
+        'password': '',
+        'ssl': None,
+        'server_type': None,
+        'sdu': 8192,
+        'cclass': None,
+        'purity': 0,
+        'timeout': 15000,
+    }
+    given.update(zip(names, positional))
+    resolved = resolve_dsn_arguments(dsn, ConnectArguments(**given), config_dir)
+    return resolved.as_tuple()[:8]
+
+
+class Parameters(unittest.TestCase):
+    # Easy Connect ? parameters (#1977), read as python-oracledb 26.0.1 reads
+    # them: the DSN's value wins, names are case-insensitive, the last repeat
+    # wins; those with a seerdb argument are applied, the rest refused by name.
+    def _args(self, dsn, **given):
+        base = {
+            'host': 'localhost',
+            'port': 1521,
+            'service_name': '',
+            'sid': '',
+            'user': 'u',
+            'password': 'p',
+            'ssl': None,
+            'server_type': None,
+            'sdu': 8192,
+            'cclass': None,
+            'purity': 0,
+            'timeout': 15000,
+            **given,
+        }
+        return resolve_dsn_arguments(dsn, ConnectArguments(**base))
+
+    def test_the_parameters_with_a_seerdb_argument(self):
+        args = self._args(
+            'db:1521/svc?SDU=32768 & pool_connection_class=K&pool_purity=self'
+            '&transport_connect_timeout=3',
+            sdu=16384,
+            cclass='C',
+        )
+        self.assertEqual(
+            (args.service_name, args.sdu, args.cclass, args.purity, args.timeout),
+            ('svc', 32768, 'K', PURITY_SELF, 3000),
+        )
+        self.assertEqual(self._args('db/s?sdu=1000&sdu=2000').sdu, 2000)
+        self.assertEqual(self._args('db/s?pool_purity=NEW').purity, PURITY_NEW)
+
+    def test_a_timeout_takes_a_unit(self):
+        for value, ms in (
+            ('3', 3000),
+            ('1.5', 1500),
+            ('500ms', 500),
+            ('2min', 120000),
+            ('4 sec', 4000),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    self._args(f'db/s?transport_connect_timeout={value}').timeout, ms
+                )
+
+    def test_a_quoted_value_and_the_other_forms(self):
+        args = self._args('tcps://db:2484/svc:pooled?pool_connection_class="A B"')
+        self.assertEqual(
+            (args.ssl, args.server_type, args.cclass), (True, 'pooled', 'A B')
+        )
+
+    def test_the_rest_are_refused_by_name(self):
+        for name in (
+            'retry_count',
+            'https_proxy',
+            'expire_time',
+            'connect_timeout',
+            'wallet_location',
+            'frobnicate',
+        ):
+            with self.subTest(name=name), self.assertRaises(NotSupportedError) as ctx:
+                self._args(f'db/s?{name}=1')
+            self.assertIn(name, str(ctx.exception))
+
+    def test_a_malformed_value_is_a_programming_error(self):
+        for dsn in (
+            'db/s?sdu=abc',
+            'db/s?pool_purity=x',
+            'db/s?transport_connect_timeout=soon',
+            'db/s?bad',
+        ):
+            with self.subTest(dsn=dsn), self.assertRaises(ProgrammingError):
+                self._args(dsn)
+
+    def test_both_connection_classes_apply_them(self):
+        for cls in (OracleConnect, AsyncOracleConnect):
+            with self.subTest(cls=cls.__name__):
+                conn = cls(
+                    user='u',
+                    password='p',
+                    dsn='db/s?sdu=32768&transport_connect_timeout=2',
+                )
+                self.assertEqual((conn.sdu, conn.timeout), (32768, 2000))
 
 
 class ParseDsn(unittest.TestCase):
@@ -42,12 +170,6 @@ class ParseDsn(unittest.TestCase):
         for dsn, expected in cases.items():
             with self.subTest(dsn=dsn):
                 self.assertEqual(parse_dsn(dsn), expected)
-
-    def test_a_form_not_read_yet_is_refused_not_dropped(self):
-        for dsn in ('db:1523/FREEPDB1?connect_timeout=2',):
-            with self.subTest(dsn=dsn), self.assertRaises(NotSupportedError) as ctx:
-                parse_dsn(dsn)
-            self.assertIn(dsn, str(ctx.exception))
 
     def test_a_malformed_dsn_is_a_programming_error(self):
         for dsn in ('db:x/FREEPDB1', '@db/FREEPDB1', '[::1/FREEPDB1', ''):
@@ -124,7 +246,7 @@ class ParseDescriptor(unittest.TestCase):
 
     def test_a_sid_in_the_descriptor_replaces_a_service_passed(self):
         self.assertEqual(
-            resolve_dsn_arguments(
+            _resolve(
                 f'(DESCRIPTION={_ADDR}(CONNECT_DATA=(SID=ORCL)))',
                 'localhost',
                 1521,
@@ -251,12 +373,10 @@ class Tcps(unittest.TestCase):
 
     def test_tcps_turns_tls_on_and_keeps_a_configuration_passed(self):
         args = ('localhost', 1521, '', '', 'u', 'p', None)
-        self.assertIs(resolve_dsn_arguments('tcps://db:2484/svc', *args)[6], True)
-        self.assertIsNone(resolve_dsn_arguments('tcp://db:1521/svc', *args)[6])
+        self.assertIs(_resolve('tcps://db:2484/svc', *args)[6], True)
+        self.assertIsNone(_resolve('tcp://db:1521/svc', *args)[6])
         config = {'ca_certs': '/ca.pem'}
-        self.assertIs(
-            resolve_dsn_arguments('tcps://db/svc', *args[:-1], None, config)[6], config
-        )
+        self.assertIs(_resolve('tcps://db/svc', *args[:-1], config)[6], config)
 
     def test_both_connection_classes_turn_tls_on(self):
         for cls in (OracleConnect, AsyncOracleConnect):
@@ -292,9 +412,9 @@ class ServerType(unittest.TestCase):
                 cls(server_type='bogus')
 
     def test_the_dsn_wins_over_the_argument(self):
-        args = ('localhost', 1521, '', '', 'u', 'p', None, None, 'shared')
-        self.assertEqual(resolve_dsn_arguments('db/s:pooled', *args)[7], 'pooled')
-        self.assertEqual(resolve_dsn_arguments('db/s', *args)[7], 'shared')
+        args = ('localhost', 1521, '', '', 'u', 'p', None, 'shared')
+        self.assertEqual(_resolve('db/s:pooled', *args)[7], 'pooled')
+        self.assertEqual(_resolve('db/s', *args)[7], 'shared')
 
     def test_both_connection_classes_take_it(self):
         for cls in (OracleConnect, AsyncOracleConnect):
@@ -307,39 +427,37 @@ class ServerType(unittest.TestCase):
 class ResolveDsnArguments(unittest.TestCase):
     def test_the_dsn_wins_over_host_port_and_service_passed_beside_it(self):
         self.assertEqual(
-            resolve_dsn_arguments('db:1523/A', 'other', 2, 'B', '', 'u', 'p'),
+            _resolve('db:1523/A', 'other', 2, 'B', '', 'u', 'p'),
             ('db', 1523, 'A', '', 'u', 'p', None, None),
         )
 
     def test_a_dsn_without_a_port_means_1521(self):
         self.assertEqual(
-            resolve_dsn_arguments('db/A', 'localhost', 2, '', '', 'u', 'p')[:2],
+            _resolve('db/A', 'localhost', 2, '', '', 'u', 'p')[:2],
             ('db', 1521),
         )
 
     def test_a_dsn_without_a_service_keeps_the_one_passed(self):
         self.assertEqual(
-            resolve_dsn_arguments('db:1523', 'localhost', 1521, 'B', '', 'u', 'p'),
+            _resolve('db:1523', 'localhost', 1521, 'B', '', 'u', 'p'),
             ('db', 1523, 'B', '', 'u', 'p', None, None),
         )
 
     def test_a_service_in_the_dsn_replaces_a_sid(self):
         self.assertEqual(
-            resolve_dsn_arguments('db/A', 'localhost', 1521, '', 'ORCL', 'u', 'p')[2:4],
+            _resolve('db/A', 'localhost', 1521, '', 'ORCL', 'u', 'p')[2:4],
             ('A', ''),
         )
 
     def test_credentials_in_the_dsn_fill_an_absent_user(self):
         self.assertEqual(
-            resolve_dsn_arguments(
-                'scott/tiger@db/A', 'localhost', 1521, '', '', '', ''
-            ),
+            _resolve('scott/tiger@db/A', 'localhost', 1521, '', '', '', ''),
             ('db', 1521, 'A', '', 'scott', 'tiger', None, None),
         )
 
     def test_a_user_in_the_dsn_and_in_user_is_refused(self):
         with self.assertRaises(ProgrammingError):
-            resolve_dsn_arguments('scott@db/A', 'localhost', 1521, '', '', 'u', '')
+            _resolve('scott@db/A', 'localhost', 1521, '', '', 'u', '')
 
 
 class ConnectionTakesTheDsn(unittest.TestCase):

@@ -3035,6 +3035,22 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute('SELECT 1 FROM dual')  # and the session reads on
         self.assertEqual(self.cur.fetchone(), (1,))
 
+    def test_easy_connect_parameters_apply(self):
+        # ? parameters with a seerdb argument (#1977): sdu, the transport
+        # timeout, a connection class and purity.
+        with seerdb.connect(
+            user=_USER,
+            password=_PASSWORD,
+            dsn=f'{_HOST}:{_PORT}/{_SERVICE}?sdu=16384&transport_connect_timeout=10',
+            **_FV_KW,
+        ) as conn:
+            # The SDU is what the server agreed to, at most the one asked for.
+            self.assertEqual(conn.timeout, 10000)
+            self.assertLessEqual(conn.sdu, 16384)
+            cur = conn.cursor()
+            cur.execute('SELECT 1 FROM dual')
+            self.assertEqual(cur.fetchone(), (1,))
+
     def test_a_long_program_name_connects(self):
         # 8i's login gives a program name one length byte, which stops at 252:
         # 253 to 255 failed the login and a longer one could not be sent at all
@@ -10114,6 +10130,20 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await Cur.execute(f'DROP TABLE {Table}')
         finally:
             await Conn.close()
+
+    async def test_easy_connect_parameters_apply(self):
+        # Async twin of CursorIntegration's (#1977).
+        Kwargs = self._kwargs(
+            dsn=f'{_HOST}:{_PORT}/{_SERVICE}?sdu=16384&transport_connect_timeout=10'
+        )
+        for Key in ('host', 'port', 'service_name'):
+            Kwargs.pop(Key)
+        async with await seerdb.connect_async(**Kwargs) as Conn:
+            self.assertEqual(Conn.timeout, 10000)
+            self.assertLessEqual(Conn.sdu, 16384)
+            async with Conn.cursor() as Cur:
+                await Cur.execute('SELECT 1 FROM dual')
+                self.assertEqual(await Cur.fetchone(), (1,))
 
     async def test_a_long_program_name_connects(self):
         # Async twin of CursorIntegration's.
