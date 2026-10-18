@@ -30,174 +30,22 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import TypeAlias
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import pkcs12
 
-# A parsed descriptor node is either a leaf string or a *branch*: a list of
-# ``(key, node)`` pairs. Keys are lower-cased; the list preserves order and
-# duplicates (an ADDRESS_LIST may repeat ADDRESS), which a plain dict could not.
-Node: TypeAlias = 'str | list[tuple[str, Node]]'
+from seerdb.client.netconfig import (
+    NetConfigError,
+    Node,
+    _find_all,
+    _find_first,
+    parse_sqlnet,
+    parse_tnsnames,
+)
 
 
-class WalletError(Exception):
+class WalletError(NetConfigError):
     """A wallet directory / descriptor / identity could not be read."""
-
-
-# --------------------------------------------------------------------------- #
-# tnsnames.ora / sqlnet.ora descriptor grammar
-# --------------------------------------------------------------------------- #
-#
-# Both files are the same nested S-expression-ish syntax Oracle Net uses
-# everywhere::
-#
-#     alias = (DESCRIPTION = (ADDRESS = (PROTOCOL = tcps)(HOST = h)(PORT = 1522))
-#                            (CONNECT_DATA = (SERVICE_NAME = svc)))
-#
-# A parameter is ``(NAME = VALUE)`` where VALUE is either a run of child
-# parameters or a single atom (bareword or double-quoted string — the server
-# certificate DN arrives quoted because it is full of spaces and commas).
-
-
-def _tokenize(Text: str) -> list[tuple[str, str]]:
-    """Split descriptor text into ``(kind, value)`` tokens.
-
-    ``kind`` is one of ``lparen`` / ``rparen`` / ``eq`` / ``comma`` / ``atom``.
-    ``#`` starts a comment to end-of-line; whitespace is insignificant.
-    """
-    Tokens: list[tuple[str, str]] = []
-    i = 0
-    N = len(Text)
-    Punct = {'(': 'lparen', ')': 'rparen', '=': 'eq', ',': 'comma'}
-    while i < N:
-        Ch = Text[i]
-        if Ch.isspace():
-            i += 1
-            continue
-        if Ch == '#':
-            # Comment: skip to (and including) the newline.
-            End = Text.find('\n', i)
-            i = N if End < 0 else End + 1
-            continue
-        if Ch in Punct:
-            Tokens.append((Punct[Ch], Ch))
-            i += 1
-            continue
-        if Ch == '"':
-            End = Text.find('"', i + 1)
-            if End < 0:
-                raise WalletError('unterminated quoted string in descriptor')
-            Tokens.append(('atom', Text[i + 1 : End]))
-            i = End + 1
-            continue
-        # Bareword: everything up to whitespace or a structural character.
-        Start = i
-        while i < N and not Text[i].isspace() and Text[i] not in '()=,#"':
-            i += 1
-        Tokens.append(('atom', Text[Start:i]))
-    return Tokens
-
-
-def _parse_value(Tokens: list[tuple[str, str]], i: int) -> tuple[Node, int]:
-    """Parse the VALUE that follows an ``=`` at ``Tokens[i]``.
-
-    A value is either a sequence of child parameters (when it opens with
-    ``(``) or a single atom. Returns ``(node, next_index)``.
-    """
-    if i < len(Tokens) and Tokens[i][0] == 'lparen':
-        Children: list[tuple[str, Node]] = []
-        while i < len(Tokens) and Tokens[i][0] == 'lparen':
-            (Param, i) = _parse_param(Tokens, i)
-            Children.append(Param)
-        return (Children, i)
-    if i < len(Tokens) and Tokens[i][0] == 'atom':
-        return (Tokens[i][1], i + 1)
-    raise WalletError('expected a value in descriptor')
-
-
-def _parse_param(Tokens: list[tuple[str, str]], i: int) -> tuple[tuple[str, Node], int]:
-    """Parse one ``(NAME = VALUE)`` parameter. Returns ``((name, node), next)``."""
-    if i >= len(Tokens) or Tokens[i][0] != 'lparen':
-        raise WalletError("expected '(' in descriptor")
-    i += 1
-    if i >= len(Tokens) or Tokens[i][0] != 'atom':
-        raise WalletError('expected a parameter name in descriptor')
-    Name = Tokens[i][1].lower()
-    i += 1
-    if i >= len(Tokens) or Tokens[i][0] != 'eq':
-        raise WalletError(f"expected '=' after {Name!r} in descriptor")
-    i += 1
-    (Value, i) = _parse_value(Tokens, i)
-    if i >= len(Tokens) or Tokens[i][0] != 'rparen':
-        raise WalletError(f"expected ')' closing {Name!r} in descriptor")
-    return ((Name, Value), i + 1)
-
-
-def parse_tnsnames(Text: str) -> dict[str, Node]:
-    """Parse a ``tnsnames.ora`` into ``{alias: descriptor_node}``.
-
-    Aliases are lower-cased. A comma-separated alias list (``a, b = (...)``)
-    binds every name to the same descriptor.
-    """
-    Tokens = _tokenize(Text)
-    Entries: dict[str, Node] = {}
-    i = 0
-    while i < len(Tokens):
-        # Left-hand side: one or more comma-separated alias names.
-        Names: list[str] = []
-        if Tokens[i][0] != 'atom':
-            raise WalletError('expected an alias name in tnsnames.ora')
-        Names.append(Tokens[i][1].lower())
-        i += 1
-        while i < len(Tokens) and Tokens[i][0] == 'comma':
-            i += 1
-            if i >= len(Tokens) or Tokens[i][0] != 'atom':
-                raise WalletError('expected an alias name after comma')
-            Names.append(Tokens[i][1].lower())
-            i += 1
-        if i >= len(Tokens) or Tokens[i][0] != 'eq':
-            raise WalletError(f"expected '=' after alias {Names[-1]!r}")
-        i += 1
-        (Value, i) = _parse_value(Tokens, i)
-        for Name in Names:
-            Entries[Name] = Value
-    return Entries
-
-
-def parse_sqlnet(Text: str) -> dict[str, Node]:
-    """Parse a ``sqlnet.ora`` into ``{param: node}`` (params lower-cased)."""
-    Tokens = _tokenize(Text)
-    Params: dict[str, Node] = {}
-    i = 0
-    while i < len(Tokens):
-        if Tokens[i][0] != 'atom':
-            raise WalletError('expected a parameter name in sqlnet.ora')
-        Name = Tokens[i][1].lower()
-        i += 1
-        if i >= len(Tokens) or Tokens[i][0] != 'eq':
-            raise WalletError(f"expected '=' after {Name!r} in sqlnet.ora")
-        i += 1
-        (Value, i) = _parse_value(Tokens, i)
-        Params[Name] = Value
-    return Params
-
-
-def _find_all(Node_: Node, Key: str) -> list[Node]:
-    """Every value bound to ``Key`` anywhere in the subtree, in document order."""
-    Found: list[Node] = []
-    if isinstance(Node_, list):
-        for K, V in Node_:
-            if K == Key:
-                Found.append(V)
-            Found.extend(_find_all(V, Key))
-    return Found
-
-
-def _find_first(Node_: Node, Key: str) -> Node | None:
-    """The first value bound to ``Key`` in the subtree, or ``None``."""
-    Matches = _find_all(Node_, Key)
-    return Matches[0] if Matches else None
 
 
 # --------------------------------------------------------------------------- #

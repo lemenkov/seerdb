@@ -21,14 +21,13 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.x509.oid import NameOID
 
+from seerdb.client.netconfig import NetConfigError, parse_sqlnet, parse_tnsnames
 from seerdb.client.wallet import (
     ConnectInfo,
     WalletError,
     load_identity_pem,
     load_identity_pkcs12,
     open_wallet,
-    parse_sqlnet,
-    parse_tnsnames,
     resolve_dsn,
 )
 
@@ -186,7 +185,8 @@ class TestDescriptorParsing(unittest.TestCase):
         self.assertIsInstance(Params.get('wallet_location'), list)
 
     def test_unterminated_quote_raises(self):
-        with self.assertRaises(WalletError):
+        # A grammar error, raised by the shared descriptor reader (#1976).
+        with self.assertRaises(NetConfigError):
             parse_tnsnames('a = (b = "oops)')
 
 

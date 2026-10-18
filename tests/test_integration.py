@@ -2846,6 +2846,19 @@ class CursorIntegration(_IntegrationBase):
             cur.execute('SELECT 1 FROM dual')
             self.assertEqual(cur.fetchone(), (1,))
 
+    def test_a_connect_descriptor_dsn_names_the_address(self):
+        # A descriptor with one address, as python-oracledb reads it (#1976).
+        descriptor = (
+            f'(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={_HOST})(PORT={_PORT}))'
+            f'(CONNECT_DATA=(SERVICE_NAME={_SERVICE})(CID=(PROGRAM=pyo))))'
+        )
+        with seerdb.connect(
+            user=_USER, password=_PASSWORD, dsn=descriptor, **_FV_KW
+        ) as conn:
+            cur = conn.cursor()
+            cur.execute('SELECT 1 FROM dual')
+            self.assertEqual(cur.fetchone(), (1,))
+
     def test_a_long_program_name_connects(self):
         # 8i's login gives a program name one length byte, which stops at 252:
         # 253 to 255 failed the login and a longer one could not be sent at all
@@ -9854,6 +9867,19 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
     async def test_an_easy_connect_dsn_names_the_address(self):
         # Async twin of CursorIntegration's (#1972).
         Kwargs = self._kwargs(dsn=f'{_HOST}:{_PORT}/{_SERVICE}')
+        for Key in ('host', 'port', 'service_name'):
+            Kwargs.pop(Key)
+        async with await seerdb.connect_async(**Kwargs) as Conn:
+            async with Conn.cursor() as Cur:
+                await Cur.execute('SELECT 1 FROM dual')
+                self.assertEqual(await Cur.fetchone(), (1,))
+
+    async def test_a_connect_descriptor_dsn_names_the_address(self):
+        # Async twin of CursorIntegration's (#1976).
+        Kwargs = self._kwargs(
+            dsn=f'(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={_HOST})(PORT={_PORT}))'
+            f'(CONNECT_DATA=(SERVICE_NAME={_SERVICE})))'
+        )
         for Key in ('host', 'port', 'service_name'):
             Kwargs.pop(Key)
         async with await seerdb.connect_async(**Kwargs) as Conn:
