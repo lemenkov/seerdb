@@ -2191,11 +2191,15 @@ _OCI_LOB_CHUNK = 0xFF  # content bytes per 11g LOB_DATA chunk (matches live 11g)
 
 
 def _oci_lob_data(content: bytes) -> bytes:
-    # TTI_LOB content: token + single-byte-length chunks (the 11g form). Content up
-    # to one chunk is a plain <len><data>; larger content uses the 0xFE chunked
-    # form, a run of <ub1 len><bytes> terminated by a zero-length chunk.
-    if len(content) <= _OCI_LOB_CHUNK:
-        return bytes([TTI_LOB, len(content)]) + content
+    # TTI_LOB content: token + single-byte-length chunks (the 11g form). Oracle
+    # sends content of ANY length chunked, a 1-byte read included: the 0xFE
+    # marker, a run of <ub1 len><bytes> terminated by a zero-length chunk. A plain
+    # <len><data> is not a form it uses, and lengths 253-255 cannot be one:
+    # those bytes are markers, so a 254-byte read sent plain opened a chunked run
+    # at its first content byte and hung the client (#1970). Empty content stays
+    # the bare `0e 00`.
+    if not content:
+        return bytes([TTI_LOB, 0])
     out = bytearray([TTI_LOB, TNS_LONG_LENGTH_INDICATOR])
     for start in range(0, len(content), _OCI_LOB_CHUNK):
         chunk = content[start : start + _OCI_LOB_CHUNK]
@@ -2736,15 +2740,15 @@ def encode_lob_read_response_thin(
 
 
 def _lob_data_thin(content: bytes) -> bytes:
-    # LOB_DATA in the negotiated version's chunk framing. A short value is one
-    # length byte + data at every version. A longer one is the 0xFE-marked run of
-    # chunks: 11g prefixes each chunk with a single length byte, a 12.1+ client
-    # reads a variable-width big-endian length (the ub4 form) per chunk — the
-    # same framing its own writer uses for a long bind — and a zero terminator.
+    # LOB_DATA in the negotiated version's chunk framing: always the 0xFE-marked
+    # run of chunks, as Oracle sends it whatever the length (#1970). 11g prefixes
+    # each chunk with a single length byte, a 12.1+ client reads a variable-width
+    # big-endian length (the ub4 form) per chunk — the same framing its own
+    # writer uses for a long bind — and a zero terminator.
     if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_12_1:
         return _oci_lob_data(content)
-    if len(content) < TNS_LONG_LENGTH_INDICATOR:
-        return bytes([TTI_LOB, len(content)]) + content
+    if not content:
+        return bytes([TTI_LOB, 0])
     out = bytearray([TTI_LOB, TNS_LONG_LENGTH_INDICATOR])
     for start in range(0, len(content), _OCI_LOB_CHUNK):
         chunk = content[start : start + _OCI_LOB_CHUNK]
@@ -14014,7 +14018,7 @@ def encode_kv(Key: bytes, Val: bytes, Padding: int = 0) -> bytes:
         if Size == 0:
             return bytes([0])
         # ub4 total length + the value in write_bytes_with_length form: a 1-byte
-        # length for short values, or the 254 chunked marker for values >= 254
+        # length for short values, or the 254 chunked marker for values >= 253
         # (e.g. an RSA token signature, #125) — the single-byte length prefix the
         # old code used could not carry a value longer than 255 bytes.
         return encode_sb4(Size) + _bytes_with_length(Data)

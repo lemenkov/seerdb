@@ -2360,8 +2360,9 @@ The full server side, reduced from live 11g out-of-line CLOB captures:
    `SET LONGCHUNKSIZE`-sized slices, each read carrying a 1-based **source offset**
    (`ub8`-LE at request offset 91) and **amount** (`ub8`-LE at offset 269), both
    counts (characters for a CLOB, bytes for a BLOB). The Mirror
-   (`parse_lobops_read`) serves exactly that slice as `LOB_DATA` (`0e` + `0xFF`-byte
-   chunks) + the echoed-locator RPA + OER; a read returning fewer units than
+   (`parse_lobops_read`) serves exactly that slice as `LOB_DATA` (`0e fe` +
+   `0xFF`-byte chunks, chunked at every length, §14.3) + the echoed-locator RPA +
+   OER; a read returning fewer units than
    requested ends the loop. The row locator and the READ reply come from one
    capture, so they echo the same opaque locator and stay consistent.
 
@@ -2429,8 +2430,8 @@ reads a LOB the same shape as sqlplus — locator in the row, content over
    form) to reach the trailing amount — reading the first two locator bytes as a
    length overshot, threw, and dropped every read to a "whole LOB from offset 1"
    fallback that served the wrong row's queue entry (#903). The Mirror answers
-   with `encode_lob_read_response_thin` — the slice as `LOB_DATA` (`0e` +
-   `0xFF`-byte chunks, §14) followed by a **success OER** `04 01 <status>`
+   with `encode_lob_read_response_thin` — the slice as `LOB_DATA` (`0e fe` +
+   `0xFF`-byte chunks, §14.3) followed by a **success OER** `04 01 <status>`
    (`_encode_oer(1,0,0,b'')`). The client reads the content, scans to the OER, and
    stops; CLOB content is UTF-16BE (decoded to `str`), BLOB is raw `bytes`.
 
@@ -3944,9 +3945,15 @@ operations declared with `send_amount`, an `sb8` carrying the actual
 amount read/written. `IS_OPEN`, `FILE_EXISTS`, `FILE_ISOPEN` add a
 trailing `ub1` boolean flag.
 
-The `LOB_DATA` chunk is length-prefixed with the version-gated
-`bytes_with_length` form (§6.4): 11g uses single-byte chunk lengths,
-12c+ a `0xFE` marker with `ub4` chunk lengths and a zero terminator.
+The `LOB_DATA` content is **always chunked**, whatever its length: a `0xFE`
+marker, the chunks, and a zero terminator. Before 12.1 each chunk has a single
+length byte (up to 255), from 12.1 a `ub4`. Measured on 11g and 23ai, a 1-byte
+BLOB read is `0e fe 01 71 00` (11g) and `0e fe 01 01 71 00` (23ai). A plain
+`<len><data>` is not a form the server uses; for 253–255 bytes it cannot work,
+since those length bytes are the escape, chunked and NULL markers. The Mirror
+once sent short content that way, and a 254-byte read below 12.1 hung the client
+(#1970). An empty LOB carries no `TTI_LOB` at all on a real server; the Mirror
+sends `0e 00`, which clients read as empty.
 `_read_lob_response` walks tokens until the trailing OER; that OER opens
 with `04 01 XX` (TTI_OER + `call_status` ub4) and then a per-call
 end-to-end seq#. Without the `ub4` chunk-length handling on 12c the

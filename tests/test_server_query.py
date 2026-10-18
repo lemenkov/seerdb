@@ -3303,6 +3303,44 @@ def test_encode_lob_read_response_thin_carries_content_then_a_success_oer() -> N
     assert encode_lob_read_response_thin(b'').startswith(_oci_lob_data(b''))
 
 
+def test_lob_data_is_chunked_at_every_length_as_oracle_sends_it() -> None:
+    # Oracle frames TTI_LOB content chunked whatever its length (#1970). The
+    # expected frames are what live 11g (fv 6) and 23ai (fv 24) sent for BLOB
+    # reads of these lengths. A plain <len><data> for 254 bytes put the 0xFE
+    # marker in the length byte, so the client read the first content byte as a
+    # chunk length and hung.
+    from seerdb.common.tns import _ENCODE_FIELD_VERSION, _lob_data_thin
+    from seerdb.common.tns_consts import FIELD_VERSION_11_2, FIELD_VERSION_23_4
+
+    def x(n: int) -> bytes:
+        return b'x' * n
+
+    tok = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
+    try:
+        for n in (1, 10, 252, 253, 254, 255):
+            assert _lob_data_thin(x(n)) == b'\x0e\xfe' + bytes([n]) + x(n) + b'\x00'
+        assert _lob_data_thin(x(256)) == (
+            b'\x0e\xfe\xff' + x(255) + b'\x01' + x(1) + b'\x00'
+        )
+        assert _lob_data_thin(b'') == b'\x0e\x00'
+    finally:
+        _ENCODE_FIELD_VERSION.reset(tok)
+
+    tok = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_23_4)
+    try:
+        for n in (1, 10, 252, 253, 254, 255):
+            assert _lob_data_thin(x(n)) == (
+                b'\x0e\xfe\x01' + bytes([n]) + x(n) + b'\x00'
+            )
+        # 23ai sends 256 bytes as one chunk; the Mirror's 255-byte chunks read
+        # the same.
+        assert _lob_data_thin(x(256)) == (
+            b'\x0e\xfe\x01\xff' + x(255) + b'\x01\x01' + x(1) + b'\x00'
+        )
+    finally:
+        _ENCODE_FIELD_VERSION.reset(tok)
+
+
 def test_lob_read_reply_chunks_in_the_negotiated_versions_framing() -> None:
     # A LOB read reply longer than one chunk uses the negotiated version's chunk
     # framing: 11g a single length byte per chunk, a 12.2+ client the variable-

@@ -6171,6 +6171,57 @@ class LOBIntegration(_IntegrationBase):
             self.assertEqual(Got, Big)
 
 
+# LOB content lengths around the single-byte length's markers (253-255 are not
+# lengths): BLOBs in bytes, CLOBs in characters, which travel as UTF-16, so 127
+# characters are the 254 bytes that hung a pre-12.1 session (#1970).
+_LOB_EDGE_BLOB_LENGTHS = (1, 250, 251, 252, 253, 254, 255, 256, 257)
+_LOB_EDGE_CLOB_LENGTHS = (1, 125, 126, 127, 128, 129)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class LOBReadLengthIntegration(_IntegrationBase):
+    """A LOB read of every length around the length-byte markers comes back
+    whole, at the default field version and at 11.2 (#1970). Before 10g a LOB
+    column arrives as its value rather than a LOB object, so both are read."""
+
+    TABLE = 'PYO_LOB_EDGE'
+
+    def _read_all(self, field_version=None):
+        kwargs = dict(_FV_KW)
+        if field_version is not None:
+            kwargs['field_version'] = field_version
+        conn = seerdb.connect(
+            host=_HOST,
+            port=_PORT,
+            user=_USER,
+            password=_PASSWORD,
+            service_name=_SERVICE,
+            autocommit=True,
+            **kwargs,
+        )
+        try:
+            cur = conn.cursor()
+            cur.execute(f'SELECT id, b, c FROM {self.TABLE} ORDER BY id')
+            return [
+                (i, *(v.read() if hasattr(v, 'read') else v for v in (b, c)))
+                for i, b, c in cur.fetchall()
+            ]
+        finally:
+            conn.close()
+
+    def test_lob_reads_around_the_length_markers_come_back_whole(self):
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, b BLOB, c CLOB)')
+        rows = [
+            (n, b'x' * n, 'y' * min(n, _LOB_EDGE_CLOB_LENGTHS[-1]))
+            for n in _LOB_EDGE_BLOB_LENGTHS
+        ] + [(1000 + n, b'w', 'z' * n) for n in _LOB_EDGE_CLOB_LENGTHS]
+        for row in rows:
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1, :2, :3)', list(row))
+        for fv in (None, FIELD_VERSION_11_2):
+            with self.subTest(field_version=fv or 'default'):
+                self.assertEqual(self._read_all(fv), rows)
+
+
 @_requires(_LOBOPS)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class LOBObjectIntegration(_IntegrationBase):
@@ -9322,6 +9373,43 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         await Conn.close()
         if Fv < FIELD_VERSION_10_2:
             self.skipTest(Reason)
+
+    async def test_lob_reads_around_the_length_markers_come_back_whole(self):
+        # Async twin of LOBReadLengthIntegration (#1970).
+        Table = 'PYO_ASYNC_LOB_EDGE'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            try:
+                await Cur.execute(f'DROP TABLE {Table}')
+            except seerdb.DatabaseError:
+                pass
+            await Cur.execute(f'CREATE TABLE {Table} (id NUMBER, b BLOB, c CLOB)')
+            Rows = [
+                (n, b'x' * n, 'y' * min(n, 129)) for n in _LOB_EDGE_BLOB_LENGTHS
+            ] + [(1000 + n, b'w', 'z' * n) for n in _LOB_EDGE_CLOB_LENGTHS]
+            for Row in Rows:
+                await Cur.execute(f'INSERT INTO {Table} VALUES (:1, :2, :3)', list(Row))
+            for Fv in (None, FIELD_VERSION_11_2):
+                Extra = {} if Fv is None else {'field_version': Fv}
+                Kwargs = {**self._kwargs(), **Extra}
+                Reader = await seerdb.connect_async(**Kwargs)
+                try:
+                    RCur = Reader.cursor()
+                    await RCur.execute(f'SELECT id, b, c FROM {Table} ORDER BY id')
+                    Got = []
+                    for I, B, C in await RCur.fetchall():
+                        # Before 10g a LOB column arrives as its value.
+                        Values = []
+                        for V in (B, C):
+                            Values.append(await V.read() if hasattr(V, 'read') else V)
+                        Got.append((I, *Values))
+                finally:
+                    await Reader.close()
+                self.assertEqual(Got, Rows, f'field_version={Fv or "default"}')
+            await Cur.execute(f'DROP TABLE {Table}')
+        finally:
+            await Conn.close()
 
     async def test_lastrowid_follows_the_touched_row(self):
         # Async twin of LastRowidIntegration (#1077).
