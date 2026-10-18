@@ -380,12 +380,17 @@ exact bytes live in `tests/handshake_11g.py`. This is what the Mirror server
 | 2 | S→C | RESEND   | 8    | header only — asks the client to re-send CONNECT  |
 | 3 | C→S | CONNECT  | 212  | identical re-send                                 |
 | 4 | S→C | ACCEPT   | 32   | negotiated **version 0x013a = 314**               |
-| 5 | C→S | DATA/PRO | 161  | protocol negotiation (§4.1), body marker `dead…`  |
-| 6 | S→C | DATA/PRO | 127  | server PRO reply (version banner)                 |
-| 7 | C→S | DATA/DTY | 38   | data-type negotiation (§4.2)                      |
-| 8 | S→C | DATA/DTY | 238  | server DTY reply (type capabilities)              |
+| 5 | C→S | DATA/ANO | 161  | Native Services negotiation, a `deadbeef` container (§33.2) |
+| 6 | S→C | DATA/ANO | 127  | its null-negotiation reply: no cipher, no checksum (§4.1.1) |
+| 7 | C→S | DATA/PRO | 38   | `TTI_PRO` request: versions `06…00` + the platform (§4.1) |
+| 8 | S→C | DATA/PRO | 238  | `TTI_PRO` reply: version, banner, capability block (§4.1) |
 
-then the O5LOGON auth rounds (§4) and the query.
+then the data-type round (§4.2.1), the O5LOGON auth rounds (§4) and the query.
+This is the sqlplus (OCI) client: it opens with an ANO round, which a thin client
+skips (its first DATA packet is the `TTI_PRO` request, and its PRO reply is the
+same 238 bytes). The Mirror's code still names these rounds one behind:
+`encode_pro_reply(sqlplus=True)` sends the ANO reply and `encode_dty_reply(sqlplus=True)`
+the PRO reply.
 
 **Auth lives with the backend.** O5LOGON is *mutual* — the server must itself
 know the client's secret to prove itself (it never sees the client's password,
@@ -568,34 +573,36 @@ arrives later in the auth result (`AUTH_VERSION_NO`).
 
 #### 4.1.1 PRO dialects — the server mirrors the client (server-side / the Mirror)
 
-The layout above is the **oracledb / seerdb dialect**: the request leads with
-the `TTI_PRO` (`0x01`) token. **Old clients (sqlplus 11.2) speak a different
-PRO dialect** whose request leads with a `DE AD BE EF` magic. Verified by
-capturing both against the same 11g XE listener:
+The two clients do not speak different PRO dialects: **sqlplus (thick OCI)
+runs one more round first**. Its first DATA packet is a `DE AD BE EF` Native
+Services (ANO) negotiation, and only then the same `TTI_PRO` request a thin
+client opens with (§2.6 has the 11g capture). Captured against the same 11g XE
+listener, round by round:
 
-| Client PRO request | Server PRO reply | Server DTY reply |
-|--------------------|------------------|------------------|
-| `TTI_PRO 0x01 …` (oracledb, seerdb) | `TTI_PRO`-form, **238 B** | **924 B** |
-| `DE AD BE EF …` (sqlplus 11.2)      | `DEADBEEF`-form, **127 B** | 238 B |
+| round | thin (oracledb, seerdb) | sqlplus 11.2 |
+|-------|-------------------------|--------------|
+| ANO negotiation | — | request 161 B, null reply **127 B** |
+| `TTI_PRO` | reply **238 B** | the same reply, **238 B** |
+| data type | flag `01` + type table; reply **924 B** | flag `02`, no table; the 16-byte reply of §4.2.1 |
 
-**The server replies in the client's dialect** — a `0x01` request gets a
-`TTI_PRO` reply, a `deadbeef` request gets a `deadbeef` reply. Both negotiate
-the same field version (`6` for 11g), but the two reply shapes are not
-interchangeable: `decode_token_pro` only understands the `TTI_PRO` form, so
-replaying a `deadbeef` reply to seerdb (or vice-versa) fails to parse. A server
-(the Mirror, `seerdb/server/`) must therefore answer in whichever dialect the
-client's PRO request used.
+So the first message a server reads tells it which client it has: a
+`deadbeef` container means sqlplus / thick OCI, a `TTI_PRO` token a thin client.
+A server must answer the ANO round when it comes, then the same PRO round for
+both, and the data-type round in the form the client's flag asks for.
+`decode_token_pro` reads only a `TTI_PRO` reply, so sending the ANO reply where a
+thin client expects PRO fails to parse.
 
-seerdb's server (the Mirror) serves **both** dialects (#265). `serve_login`
-inspects the PRO request — `pro_is_sqlplus` checks whether its TTC payload leads
-with the `deadbeef` magic — and holds that verdict so both `encode_pro_reply`
-and `encode_dty_reply` answer in one dialect: the `TTI_PRO` reply (238 B / 924 B)
-for a thin client, or the `deadbeef` reply (127 B / 238 B) for sqlplus / thick
-OCI. Both replay the captured 11g bytes so the client negotiates field version 6.
-The `deadbeef` DTY reply (238 B) carries the same capability block the `TTI_PRO`
-dialect puts in its PRO reply, just packaged into the other message.
+seerdb's server (the Mirror) serves **both** clients (#265). `serve_login`
+inspects the first message — `pro_is_sqlplus` checks whether its TTC payload
+leads with the `deadbeef` magic — and its round names follow the thin client's
+order, so for sqlplus they run one behind: `encode_pro_reply(sqlplus=True)` sends
+the ANO reply (127 B), `encode_dty_reply(sqlplus=True)` the `TTI_PRO` reply
+(238 B, the same capability block a thin client gets), and
+`encode_type_reply_sqlplus` the data-type reply (§4.2.1). A thin client gets the
+`TTI_PRO` reply (238 B) and then the DTY reply (924 B). All of them are built so
+the client negotiates field version 6.
 
-**The 127 B `deadbeef` PRO reply is an ANO null-negotiation response** (#564). The
+**The 127 B `deadbeef` reply is an ANO null-negotiation response** (#564). The
 name is not incidental: `0xDEADBEEF` is the ANO / Native Services container magic
 (§33.2). sqlplus / thick OCI opens its login with an ANO negotiation, and the
 server answers by selecting the *null* algorithm for every service, so no cipher
@@ -1009,8 +1016,10 @@ is the way to test it, since that is exactly what a real 12.1 client does.
 
 #### 4.2.1 The deadbeef third-round type reply (server-side / the Mirror)
 
-sqlplus / thick OCI runs an **extra data-type round** after DTY, before it sends
-OSESSKEY (a thin client jumps straight to OSESSKEY — §4.1.2). The server answers
+sqlplus / thick OCI's **data-type round** is its third, after ANO and PRO, and
+comes before it sends OSESSKEY. Its request carries encoding flag `02` and no
+type table (§4.1.1), and the Mirror's code calls it the "type" round, since it
+names the PRO round "DTY". The server answers
 that third `ttc=02` request with a fixed **16-byte TTC payload** (a 26-byte DATA
 packet). Despite living outside the ordinary DTY exchange, it is an ordinary
 **data-type reply carrying the DB session time zone and the server's
