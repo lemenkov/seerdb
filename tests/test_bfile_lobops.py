@@ -279,9 +279,11 @@ class BfileContentReply(unittest.TestCase):
         body = self._reply(
             self.READ + self.FIELD + bytes.fromhex('04ffffffff'), backend
         )
-        # 23ai frames the bytes in the long form (0e fe 01 15 <data> 00); the
-        # short one every Mirror LOB read uses reads the same.
-        expected = b'\x0e\x15' + self.DATA + b'\x08' + self.FIELD + b'\x01\x15'
+        # Chunked, as Oracle frames LOB content of any length (#1970): at 11.2
+        # one single-byte-length chunk, then the zero terminator.
+        expected = (
+            b'\x0e\xfe\x15' + self.DATA + b'\x00' + b'\x08' + self.FIELD + b'\x01\x15'
+        )
         self.assertEqual(body[: len(expected)], expected)
         self.assertEqual(
             backend.calls,  # type: ignore[attr-defined]
