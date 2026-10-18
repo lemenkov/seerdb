@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: 2019 Peter Lemenkov <lemenkov@gmail.com>
 # SPDX-License-Identifier: MIT
 
-"""The ``dsn`` connect argument without a wallet: an Easy Connect string (#1972).
+"""The ``dsn`` connect argument without a wallet: an Easy Connect string
+(#1972) or a connect descriptor (#1976).
 
 ``connect(dsn='db.example.com:1521/FREEPDB1')`` is how most python-oracledb code
 connects. Without a wallet seerdb used to drop the argument and dial
@@ -9,49 +10,59 @@ connects. Without a wallet seerdb used to drop the argument and dial
 
     [user[/password]@][//]host[:port][/service_name]
 
+or a connect descriptor with one address,
+``[user[/password]@](DESCRIPTION=(ADDRESS=...)(CONNECT_DATA=...))``
+(:func:`seerdb.client.netconfig.parse_descriptor`).
+
 The host may be a bracketed IPv6 address, the port defaults to 1521, and what
 the string names wins over ``host`` / ``port`` / ``service_name`` passed beside
-it, as it does in python-oracledb. A form seerdb does not read yet -- a connect
-descriptor, a tnsnames alias (which needs ``config_dir``), a protocol prefix,
-``?`` parameters or a ``:server_type`` -- raises NotSupportedError naming it,
-rather than being ignored.
+it, as it does in python-oracledb. A form seerdb does not read yet -- a tnsnames
+alias (which needs ``config_dir``), a protocol prefix, ``?`` parameters, a
+``:server_type``, or a descriptor parameter seerdb does not act on -- raises
+NotSupportedError naming it, rather than being ignored.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+from seerdb.client.netconfig import parse_descriptor
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
 
 _DEFAULT_PORT = 1521
 
 
 @dataclass(frozen=True)
-class EasyConnect:
-    """What an Easy Connect string names."""
+class DsnTarget:
+    """What a dsn names."""
 
     host: str
     port: int
     service_name: str
     user: str | None = None
     password: str | None = None
+    sid: str = ''
 
 
-def parse_easy_connect(dsn: str) -> EasyConnect:
-    """Parse ``[user[/password]@][//]host[:port][/service_name]``."""
+def parse_dsn(dsn: str) -> DsnTarget:
+    """Parse an Easy Connect string or a connect descriptor, either behind an
+    optional ``user[/password]@``."""
     text = dsn.strip()
     user = password = None
-    if '@' in text:
-        # The address cannot hold an '@', a password can: split at the last one.
-        credentials, _, text = text.rpartition('@')
+    # The credentials end at the last '@' before any descriptor: a password can
+    # hold an '@', the address cannot, and a descriptor's quoted values might.
+    head = text[: text.find('(')] if '(' in text else text
+    if '@' in head:
+        credentials, _, _rest = head.rpartition('@')
+        text = text[len(credentials) + 1 :]
         user, slash, secret = credentials.partition('/')
         password = secret if slash else None
         if not user:
             raise ProgrammingError(f'dsn {dsn!r} has an "@" but no user name before it')
     if text.startswith('('):
-        raise NotSupportedError(
-            f'dsn {dsn!r}: a connect descriptor is not supported yet; '
-            'pass host, port and service_name'
+        found = parse_descriptor(text)
+        return DsnTarget(
+            found.host, found.port, found.service_name, user, password, found.sid
         )
     if '://' in text:
         raise NotSupportedError(
@@ -95,7 +106,7 @@ def parse_easy_connect(dsn: str) -> EasyConnect:
             )
     elif rest:
         raise ProgrammingError(f'dsn {dsn!r} is not [//]host[:port][/service_name]')
-    return EasyConnect(host, port, service_name, user, password)
+    return DsnTarget(host, port, service_name, user, password)
 
 
 def resolve_dsn_arguments(
@@ -110,9 +121,11 @@ def resolve_dsn_arguments(
     """The connect arguments once ``dsn`` is applied: the DSN wins over host,
     port and service_name passed beside it, and supplies the credentials only
     when no ``user`` was passed."""
-    info = parse_easy_connect(dsn)
+    info = parse_dsn(dsn)
     if info.service_name:
         service_name, sid = info.service_name, ''
+    elif info.sid:
+        service_name, sid = '', info.sid
     if info.user is not None:
         if user:
             raise ProgrammingError(
