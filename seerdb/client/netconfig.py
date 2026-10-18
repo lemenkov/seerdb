@@ -16,7 +16,11 @@ import re
 from dataclasses import dataclass, replace
 from typing import TypeAlias
 
-from seerdb.common.exceptions import NotSupportedError, ProgrammingError
+from seerdb.common.exceptions import (
+    NotSupportedError,
+    OperationalError,
+    ProgrammingError,
+)
 
 # A parsed descriptor node is either a leaf string or a *branch*: a list of
 # ``(key, node)`` pairs. Keys are lower-cased; the list preserves order and
@@ -201,6 +205,9 @@ class DescriptorTarget:
     # Every address the descriptor names, when there are several or it asks for
     # retries; the fields above are the first one's (#1983).
     route: Route | None = None
+    # The HTTPS proxy a TCPS address is reached through (#1993).
+    https_proxy: str = ''
+    https_proxy_port: int = 0
 
 
 @dataclass(frozen=True)
@@ -213,6 +220,8 @@ class Address:
     service_name: str = ''
     sid: str = ''
     server_type: str | None = None
+    https_proxy: str = ''
+    https_proxy_port: int = 0
 
 
 @dataclass(frozen=True)
@@ -264,7 +273,9 @@ _DESCRIPTION_KEYS = _ROUTE_KEYS | {
     'retry_delay',
 }
 _ADDRESS_LIST_KEYS = _ROUTE_KEYS | {'address'}
-_ADDRESS_KEYS = frozenset({'protocol', 'host', 'port'})
+_ADDRESS_KEYS = frozenset(
+    {'protocol', 'host', 'port', 'https_proxy', 'https_proxy_port'}
+)
 _CONNECT_DATA_KEYS = frozenset({'service_name', 'sid', 'cid', 'server'})
 _DEFAULT_PORT = 1521
 
@@ -348,7 +359,30 @@ def _address(node: Node, data: Address) -> Address:
         port_number = int(port)
     else:
         raise NetConfigError(f'PORT={port!r} in the connect descriptor is not a number')
-    return replace(data, host=host, port=port_number, protocol=protocol)
+    (proxy, proxy_port) = proxy_address(
+        _find_first(address, 'https_proxy'), _find_first(address, 'https_proxy_port')
+    )
+    return replace(
+        data,
+        host=host,
+        port=port_number,
+        protocol=protocol,
+        https_proxy=proxy,
+        https_proxy_port=proxy_port,
+    )
+
+
+def proxy_address(proxy: Node | None, port: Node | None) -> tuple[str, int]:
+    """An HTTPS proxy as given, checked: a host and a port, both or neither
+    (#1993). python-oracledb took a proxy without a port as port 0 and failed
+    at connect; this says so when the DSN is read."""
+    if proxy is None or proxy == '':
+        if port not in (None, ''):
+            raise NetConfigError('HTTPS_PROXY_PORT without an HTTPS_PROXY')
+        return ('', 0)
+    if not isinstance(proxy, str) or not isinstance(port, str) or not port.isdigit():
+        raise NetConfigError(f'HTTPS_PROXY={proxy!r} needs an HTTPS_PROXY_PORT')
+    return (proxy, int(port))
 
 
 def _connect_data(description: list[tuple[str, Node]]) -> Address:
@@ -434,6 +468,8 @@ def descriptor_target(name: str, value: Node) -> DescriptorTarget:
         first.protocol,
         first.server_type,
         route,
+        first.https_proxy,
+        first.https_proxy_port,
     )
 
 
@@ -501,3 +537,32 @@ def holds_wallet(directory: str) -> bool:
         os.path.isfile(os.path.join(directory, name))
         for name in ('ewallet.pem', 'ewallet.p12')
     )
+
+
+# --------------------------------------------------------------------------- #
+# The HTTP CONNECT tunnel to a TCPS address behind an HTTPS proxy (#1993)
+# --------------------------------------------------------------------------- #
+
+
+def proxy_connect_request(host: str, port: int) -> bytes:
+    """The request python-oracledb sends an HTTPS proxy, byte for byte (measured):
+    HTTP/1.0, no Host header, no proxy authentication."""
+    target = f'[{host}]' if ':' in host else host
+    return f'CONNECT {target}:{port} HTTP/1.0\r\n\r\n'.encode('ascii')
+
+
+def check_proxy_reply(head: bytes, proxy: str, proxy_port: int) -> None:
+    """Raise unless the proxy's reply opens the tunnel: a 2xx status line. A
+    403 or a 407 (python-oracledb sends no credentials) fails at once."""
+    line = head.split(b'\r\n', 1)[0].decode('latin-1').strip()
+    parts = line.split(None, 2)
+    if (
+        b'\r\n\r\n' not in head
+        or len(parts) < 2
+        or not parts[0].startswith('HTTP/')
+        or not parts[1].startswith('2')
+    ):
+        raise OperationalError(
+            f'the HTTPS proxy {proxy}:{proxy_port} did not open a tunnel: '
+            f'{line or "no reply"}'
+        )

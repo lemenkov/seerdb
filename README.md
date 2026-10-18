@@ -419,7 +419,11 @@ So does a `tnsnames.ora` alias (`dsn="mydb"`), read from `config_dir=`, else
 `config_dir` is taken as a wallet location only when it holds `ewallet.pem` or
 `ewallet.p12`. A `tcps://` prefix, or `PROTOCOL=TCPS` in a descriptor or
 alias, turns TLS on as `ssl=True` does; an `ssl=` configuration passed beside it
-is kept. A `:server_type` suffix (`dbhost/MYDB:pooled`) or `(SERVER=...)` in a
+is kept. A TCPS address can be reached through an HTTPS proxy, as with
+python-oracledb: `https_proxy` / `https_proxy_port` as arguments, as `?`
+parameters or as `HTTPS_PROXY` / `HTTPS_PROXY_PORT` in a descriptor `ADDRESS`
+open an HTTP `CONNECT` tunnel, and TLS then verifies the database server through
+it; a proxy beside a plain TCP address is not used. A `:server_type` suffix (`dbhost/MYDB:pooled`) or `(SERVER=...)` in a
 descriptor sets `server_type`, which `connect()` also takes: `dedicated`,
 `shared` or `pooled`, the last asking for DRCP (`cclass` and `purity` only label
 the session, as in python-oracledb). A
@@ -427,7 +431,7 @@ descriptor parameter seerdb does not act on yet (`SDU`, `SECURITY`, …) is
 refused with `NotSupportedError` for now. Of Easy Connect's `?` parameters, `sdu`, `pool_connection_class`
 (`cclass`), `pool_purity` (`new` / `self`), `transport_connect_timeout`
 (seconds, or `ms` / `sec` / `min`; it sets `timeout`, which also bounds the
-login) and `retry_count` / `retry_delay` are read and win over the arguments beside them; any other is refused by
+login), `retry_count` / `retry_delay` and `https_proxy` / `https_proxy_port` are read and win over the arguments beside them; any other is refused by
 name, where python-oracledb ignores the ones it does not know. python-oracledb
 ignores descriptor parameters it does not know; seerdb refuses them by name.
 

@@ -31,7 +31,14 @@ from seerdb.client.dialect import (
 )
 from seerdb.client.dsn import ConnectArguments, resolve_dsn_arguments
 from seerdb.client.enums import TransactionPriority
-from seerdb.client.netconfig import Address, Route, holds_wallet, server_type_value
+from seerdb.client.netconfig import (
+    Address,
+    Route,
+    check_proxy_reply,
+    holds_wallet,
+    proxy_connect_request,
+    server_type_value,
+)
 from seerdb.common.crypto import validate
 from seerdb.common.exceptions import (
     DatabaseError,
@@ -685,6 +692,10 @@ def _normalize_sessionless_txn_id(transaction_id) -> bytes:
     return bytes(transaction_id)
 
 
+# How much of an HTTPS proxy's reply is read looking for its end (#1993).
+_PROXY_REPLY_LIMIT = 16384
+
+
 def _split_proxy_user(user: str) -> tuple[str, str | None]:
     # Proxy auth (#126): `proxy_user[schema]` -> (proxy_user, schema). A plain
     # user name (or None) returns (user, None). Mirrors python-oracledb
@@ -957,6 +968,8 @@ class OracleConnect(_ConnectionLogic):
         cclass: str | None = None,
         purity: int = PURITY_DEFAULT,
         server_type: str | None = None,
+        https_proxy: str | None = None,
+        https_proxy_port: int = 0,
         wallet_location: str | None = None,
         wallet_password: str | None = None,
         config_dir: str | None = None,
@@ -996,6 +1009,8 @@ class OracleConnect(_ConnectionLogic):
                 purity,
                 timeout,
                 None,
+                https_proxy,
+                https_proxy_port,
             )
             (
                 host,
@@ -1011,6 +1026,8 @@ class OracleConnect(_ConnectionLogic):
                 purity,
                 timeout,
                 route,
+                https_proxy,
+                https_proxy_port,
             ) = resolve_dsn_arguments(dsn, given, config_dir).as_tuple()
         # field_version is the highest TTC field version seerdb advertises;
         # the server negotiates it down (min(client, server)). The default is the
@@ -1036,6 +1053,10 @@ class OracleConnect(_ConnectionLogic):
         self.service_name = service_name
         self.ssl = ssl
         self._route = route
+        # The HTTPS proxy a TCPS address is reached through, as python-oracledb's
+        # https_proxy / https_proxy_port; ignored for plain TCP (#1993).
+        self.https_proxy = https_proxy or ''
+        self.https_proxy_port = https_proxy_port
         # Set when a listener refused the connect, which a route fails over on.
         self._listener_refused = False
         self.socket_options = socket_options
@@ -1245,14 +1266,16 @@ class OracleConnect(_ConnectionLogic):
         if self.sock is not None:
             self.sock.settimeout(self.timeout / 1000 if self.timeout else None)
 
-    def _connect_socket(self) -> socket.socket:
+    def _connect_socket(self, Host: str | None = None, Port: int = 0) -> socket.socket:
         # A TCP socket connected to the first address the host resolves to that
         # answers, in getaddrinfo's order and each in its own family, as
         # python-oracledb tries them: ::1 then 127.0.0.1 for localhost. A socket
-        # forced to IPv4 could not reach an IPv6 host at all (#2000).
-        Last: OSError = OSError(f'{self.host!r} resolves to no address')
+        # forced to IPv4 could not reach an IPv6 host at all (#2000). The server,
+        # or the HTTPS proxy in front of it when Host / Port name one (#1993).
+        (Host, Port) = (self.host, self.port) if Host is None else (Host, Port)
+        Last: OSError = OSError(f'{Host!r} resolves to no address')
         for Family, Type, Proto, _, Sockaddr in socket.getaddrinfo(
-            self.host, self.port, type=socket.SOCK_STREAM
+            Host, Port, type=socket.SOCK_STREAM
         ):
             sock = socket.socket(Family, Type, Proto)
             self.sock = sock
@@ -1274,14 +1297,35 @@ class OracleConnect(_ConnectionLogic):
         # Following a redirect (self._redirects > 0), retry a refused connect —
         # the dispatcher / dedicated server may still be binding its port (#399).
         Attempts = _REDIRECT_CONNECT_ATTEMPTS if getattr(self, '_redirects', 0) else 1
+        # A TCPS address with an HTTPS proxy is reached through an HTTP CONNECT
+        # tunnel; a proxy beside plain TCP is not used, as in python-oracledb
+        # (#1993).
+        Proxied = bool(self.ssl and self.https_proxy)
         for Attempt in range(Attempts):
             try:
-                sock = self._connect_socket()
+                if Proxied:
+                    sock = self._connect_socket(self.https_proxy, self.https_proxy_port)
+                else:
+                    sock = self._connect_socket()
                 break
             except ConnectionRefusedError:
                 if Attempt + 1 >= Attempts:
                     raise
                 time.sleep(_REDIRECT_CONNECT_DELAY)
+        if Proxied:
+            try:
+                sock.sendall(proxy_connect_request(self.host, self.port))
+                Head = bytearray()
+                while b'\r\n\r\n' not in Head:
+                    Chunk = sock.recv(4096)
+                    if not Chunk or len(Head) > _PROXY_REPLY_LIMIT:
+                        break
+                    Head += Chunk
+                check_proxy_reply(bytes(Head), self.https_proxy, self.https_proxy_port)
+            except BaseException:
+                sock.close()
+                self.sock = None
+                raise
         if self.ssl:
             try:
                 sock = self._wrap_socket_tls(sock)
@@ -1359,6 +1403,11 @@ class OracleConnect(_ConnectionLogic):
         (self.service_name, self.sid) = (address.service_name, address.sid)
         if address.server_type is not None:
             self.server_type = address.server_type
+        if address.https_proxy:
+            (self.https_proxy, self.https_proxy_port) = (
+                address.https_proxy,
+                address.https_proxy_port,
+            )
         if address.protocol == 'tcps':
             self.ssl = self._ssl_given or True
         else:

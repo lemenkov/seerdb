@@ -42,6 +42,7 @@ from seerdb.client.connection import (
     _CONTINUATION_SECONDS,
     _CURRENT_SCHEMA_SQL,
     _MAX_REDIRECTS,
+    _PROXY_REPLY_LIMIT,
     _REDIRECT_CONNECT_ATTEMPTS,
     _REDIRECT_CONNECT_DELAY,
     Xid,
@@ -64,7 +65,14 @@ from seerdb.client.dialect import (
 )
 from seerdb.client.dsn import ConnectArguments, resolve_dsn_arguments
 from seerdb.client.enums import TransactionPriority
-from seerdb.client.netconfig import Address, Route, holds_wallet, server_type_value
+from seerdb.client.netconfig import (
+    Address,
+    Route,
+    check_proxy_reply,
+    holds_wallet,
+    proxy_connect_request,
+    server_type_value,
+)
 from seerdb.common.crypto import validate
 from seerdb.common.exceptions import (
     DatabaseError,
@@ -199,6 +207,8 @@ class AsyncOracleConnect(_ConnectionLogic):
         cclass: str | None = None,
         purity: int = PURITY_DEFAULT,
         server_type: str | None = None,
+        https_proxy: str | None = None,
+        https_proxy_port: int = 0,
         wallet_location: str | None = None,
         wallet_password: str | None = None,
         config_dir: str | None = None,
@@ -240,6 +250,8 @@ class AsyncOracleConnect(_ConnectionLogic):
                 purity,
                 timeout,
                 None,
+                https_proxy,
+                https_proxy_port,
             )
             (
                 host,
@@ -255,6 +267,8 @@ class AsyncOracleConnect(_ConnectionLogic):
                 purity,
                 timeout,
                 route,
+                https_proxy,
+                https_proxy_port,
             ) = resolve_dsn_arguments(dsn, given, config_dir).as_tuple()
         # Negotiation cache (#438): opt-in reconnect optimization, sharing the
         # process-level cache with the sync connection.
@@ -277,6 +291,10 @@ class AsyncOracleConnect(_ConnectionLogic):
         self.service_name = service_name
         self.ssl = ssl
         self._route = route
+        # The HTTPS proxy a TCPS address is reached through, as python-oracledb's
+        # https_proxy / https_proxy_port; ignored for plain TCP (#1993).
+        self.https_proxy = https_proxy or ''
+        self.https_proxy_port = https_proxy_port
         # Set when a listener refused the connect, which a route fails over on.
         self._listener_refused = False
         self.socket_options = socket_options
@@ -430,13 +448,16 @@ class AsyncOracleConnect(_ConnectionLogic):
 
     # ----- I/O primitives -----
 
-    async def _connect_socket(self, Loop: asyncio.AbstractEventLoop) -> socket.socket:
+    async def _connect_socket(
+        self, Loop: asyncio.AbstractEventLoop, Host: str | None = None, Port: int = 0
+    ) -> socket.socket:
         # The sync connection's _connect_socket: the first address the host
         # resolves to that answers, in getaddrinfo's order, each in its own
-        # family (#2000).
-        Last: OSError = OSError(f'{self.host!r} resolves to no address')
+        # family (#2000) -- the server's, or the HTTPS proxy's (#1993).
+        (Host, Port) = (self.host, self.port) if Host is None else (Host, Port)
+        Last: OSError = OSError(f'{Host!r} resolves to no address')
         for Family, Type, Proto, _, Sockaddr in await Loop.getaddrinfo(
-            self.host, self.port, type=socket.SOCK_STREAM
+            Host, Port, type=socket.SOCK_STREAM
         ):
             Sock = socket.socket(Family, Type, Proto)
             Sock.setblocking(False)
@@ -456,14 +477,36 @@ class AsyncOracleConnect(_ConnectionLogic):
         # Following a redirect (self._redirects > 0), retry a refused connect —
         # the dispatcher / dedicated server may still be binding its port (#399).
         Attempts = _REDIRECT_CONNECT_ATTEMPTS if getattr(self, '_redirects', 0) else 1
+        # The sync connection's HTTPS-proxy tunnel for a TCPS address (#1993).
+        Proxied = bool(SslArg is not None and self.https_proxy)
         for Attempt in range(Attempts):
             try:
-                Sock = await self._connect_socket(Loop)
+                if Proxied:
+                    Sock = await self._connect_socket(
+                        Loop, self.https_proxy, self.https_proxy_port
+                    )
+                else:
+                    Sock = await self._connect_socket(Loop)
                 break
             except ConnectionRefusedError:
                 if Attempt + 1 >= Attempts:
                     raise
                 await asyncio.sleep(_REDIRECT_CONNECT_DELAY)
+        if Proxied:
+            try:
+                await Loop.sock_sendall(
+                    Sock, proxy_connect_request(self.host, self.port)
+                )
+                Head = bytearray()
+                while b'\r\n\r\n' not in Head:
+                    Chunk = await Loop.sock_recv(Sock, 4096)
+                    if not Chunk or len(Head) > _PROXY_REPLY_LIMIT:
+                        break
+                    Head += Chunk
+                check_proxy_reply(bytes(Head), self.https_proxy, self.https_proxy_port)
+            except BaseException:
+                Sock.close()
+                raise
         self._reader, self._writer = await asyncio.open_connection(
             sock=Sock,
             ssl=SslArg,
@@ -539,6 +582,11 @@ class AsyncOracleConnect(_ConnectionLogic):
         (self.service_name, self.sid) = (address.service_name, address.sid)
         if address.server_type is not None:
             self.server_type = address.server_type
+        if address.https_proxy:
+            (self.https_proxy, self.https_proxy_port) = (
+                address.https_proxy,
+                address.https_proxy_port,
+            )
         if address.protocol == 'tcps':
             self.ssl = self._ssl_given or True
         else:
