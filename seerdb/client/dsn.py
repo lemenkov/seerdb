@@ -16,17 +16,19 @@ or a connect descriptor with one address,
 
 The host may be a bracketed IPv6 address, the port defaults to 1521, and what
 the string names wins over ``host`` / ``port`` / ``service_name`` passed beside
-it, as it does in python-oracledb. A form seerdb does not read yet -- a tnsnames
-alias (which needs ``config_dir``), a protocol prefix, ``?`` parameters, a
-``:server_type``, or a descriptor parameter seerdb does not act on -- raises
-NotSupportedError naming it, rather than being ignored.
+it, as it does in python-oracledb. A bare word is a tnsnames alias, read from
+``config_dir``, ``TNS_ADMIN`` or ``$ORACLE_HOME/network/admin``
+(:func:`seerdb.client.netconfig.resolve_alias`). A form seerdb does not read
+yet -- a protocol prefix, ``?`` parameters, a ``:server_type``, or a descriptor
+parameter seerdb does not act on -- raises NotSupportedError naming it, rather
+than being ignored.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from seerdb.client.netconfig import parse_descriptor
+from seerdb.client.netconfig import parse_descriptor, resolve_alias
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
 
 _DEFAULT_PORT = 1521
@@ -44,9 +46,10 @@ class DsnTarget:
     sid: str = ''
 
 
-def parse_dsn(dsn: str) -> DsnTarget:
-    """Parse an Easy Connect string or a connect descriptor, either behind an
-    optional ``user[/password]@``."""
+def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
+    """Parse an Easy Connect string, a connect descriptor or a tnsnames alias
+    (looked up from ``config_dir``, ``TNS_ADMIN`` or ``ORACLE_HOME``), each behind
+    an optional ``user[/password]@``."""
     text = dsn.strip()
     user = password = None
     # The credentials end at the last '@' before any descriptor: a password can
@@ -84,11 +87,11 @@ def parse_dsn(dsn: str) -> DsnTarget:
         host, rest = text[:cut], text[cut:]
     if not host:
         raise ProgrammingError(f'dsn {dsn!r} names no host')
-    # A bare word is a tnsnames alias in python-oracledb, not a host name.
+    # A bare word is a tnsnames alias, as in python-oracledb, not a host name.
     if not (easy or rest or text.startswith('[')):
-        raise NotSupportedError(
-            f'dsn {dsn!r} looks like a tnsnames alias, which needs config_dir= '
-            '(or wallet_location=); pass host:port/service_name otherwise'
+        found = resolve_alias(text, config_dir)
+        return DsnTarget(
+            found.host, found.port, found.service_name, user, password, found.sid
         )
     port = _DEFAULT_PORT
     if rest.startswith(':'):
@@ -117,11 +120,12 @@ def resolve_dsn_arguments(
     sid: str,
     user: str,
     password: str,
+    config_dir: str | None = None,
 ) -> tuple[str, int, str, str, str, str]:
     """The connect arguments once ``dsn`` is applied: the DSN wins over host,
     port and service_name passed beside it, and supplies the credentials only
     when no ``user`` was passed."""
-    info = parse_dsn(dsn)
+    info = parse_dsn(dsn, config_dir)
     if info.service_name:
         service_name, sid = info.service_name, ''
     elif info.sid:

@@ -31,6 +31,7 @@ from seerdb.client.dialect import (
 )
 from seerdb.client.dsn import resolve_dsn_arguments
 from seerdb.client.enums import TransactionPriority
+from seerdb.client.netconfig import holds_wallet
 from seerdb.common.crypto import validate
 from seerdb.common.exceptions import (
     DatabaseError,
@@ -967,12 +968,16 @@ class OracleConnect(_ConnectionLogic):
         # Sharding keys are an OCI-only routing capability (#164); accept the
         # oracledb-compatible parameters but reject them with NotSupportedError.
         _reject_sharding(shardingkey, supershardingkey)
-        # An Easy Connect dsn without a wallet names the address, and wins over
-        # host / port / service_name passed beside it, as in python-oracledb
-        # (#1972). With a wallet, dsn is a tnsnames alias (_apply_wallet).
-        if dsn is not None and wallet_location is None and config_dir is None:
+        # Without a wallet, dsn names the address -- an Easy Connect string, a
+        # descriptor or a tnsnames alias -- and wins over host / port /
+        # service_name passed beside it, as in python-oracledb (#1972, #1976).
+        # config_dir is a wallet location only when it holds a client identity.
+        use_wallet = wallet_location is not None or (
+            config_dir is not None and holds_wallet(config_dir)
+        )
+        if dsn is not None and not use_wallet:
             (host, port, service_name, sid, user, password) = resolve_dsn_arguments(
-                dsn, host, port, service_name, sid, user, password
+                dsn, host, port, service_name, sid, user, password, config_dir
             )
         # field_version is the highest TTC field version seerdb advertises;
         # the server negotiates it down (min(client, server)). The default is the
@@ -1044,7 +1049,7 @@ class OracleConnect(_ConnectionLogic):
         # from the wallet identity; the expected server certificate DN is kept
         # for the post-handshake SSL_SERVER_DN_MATCH check in _wrap_socket_tls.
         self._wallet_server_dn: str | None = None
-        if wallet_location is not None or config_dir is not None:
+        if use_wallet:
             self._apply_wallet(wallet_location, wallet_password, config_dir, dsn)
 
         self.sock: socket.socket | None = None

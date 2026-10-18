@@ -408,10 +408,13 @@ The form is `[user[/password]@][//]host[:port][/service_name]`; the port
 defaults to 1521, and the DSN wins over `host` / `port` / `service_name` passed
 beside it. A connect descriptor with one address works as well
 (`dsn="(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=dbhost)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=MYDB)))"`).
-A descriptor with several addresses, or with a parameter seerdb does not act on
-yet (`RETRY_COUNT`, `SDU`, `SECURITY`, `PROTOCOL=TCPS`, …), a `tnsnames.ora`
-alias without `config_dir=`, a `tcps://` prefix, `?` parameters and
-`:server_type` are refused with `NotSupportedError` for now. python-oracledb
+So does a `tnsnames.ora` alias (`dsn="mydb"`), read from `config_dir=`, else
+`TNS_ADMIN`, else `$ORACLE_HOME/network/admin`, with `IFILE` includes followed;
+`config_dir` is taken as a wallet location only when it holds `ewallet.pem` or
+`ewallet.p12`. A descriptor with several addresses, or with a parameter seerdb
+does not act on yet (`RETRY_COUNT`, `SDU`, `SECURITY`, `PROTOCOL=TCPS`, …), a
+`tcps://` prefix, `?` parameters and `:server_type` are refused with
+`NotSupportedError` for now. python-oracledb
 ignores descriptor parameters it does not know; seerdb refuses them by name.
 
 ## Quick start (async)
