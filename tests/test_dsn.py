@@ -54,6 +54,8 @@ def _resolve(dsn, *positional, config_dir=None):
         'purity': 0,
         'timeout': 15000,
         'route': None,
+        'https_proxy': None,
+        'https_proxy_port': 0,
     }
     given.update(zip(names, positional))
     resolved = resolve_dsn_arguments(dsn, ConnectArguments(**given), config_dir)
@@ -79,6 +81,8 @@ class Parameters(unittest.TestCase):
             'purity': 0,
             'timeout': 15000,
             'route': None,
+            'https_proxy': None,
+            'https_proxy_port': 0,
             **given,
         }
         return resolve_dsn_arguments(dsn, ConnectArguments(**base))
@@ -118,7 +122,6 @@ class Parameters(unittest.TestCase):
 
     def test_the_rest_are_refused_by_name(self):
         for name in (
-            'https_proxy',
             'expire_time',
             'connect_timeout',
             'wallet_location',
@@ -223,7 +226,6 @@ class ParseDescriptor(unittest.TestCase):
     def test_what_seerdb_would_have_to_act_on_is_refused_by_name(self):
         cases = {
             f'(DESCRIPTION={_ADDR}(SECURITY=(SSL_SERVER_DN_MATCH=yes)))': 'SECURITY',
-            '(DESCRIPTION=(ADDRESS=(HOST=db)(HTTPS_PROXY=p)))': 'HTTPS_PROXY',
         }
         for dsn, named in cases.items():
             with self.subTest(dsn=dsn), self.assertRaises(NotSupportedError) as ctx:
@@ -238,6 +240,7 @@ class ParseDescriptor(unittest.TestCase):
             '(DESCRIPTION=(ADDRESS=(HOST=db)(PORT=x)))',
             f'(DESCRIPTION={_ADDR}) trailing',
             f'(ADDRESS_LIST={_ADDR})',  # not a DESCRIPTION
+            '(DESCRIPTION=(ADDRESS=(HOST=db)(HTTPS_PROXY=p)))',  # a proxy, no port
         ):
             with self.subTest(dsn=dsn), self.assertRaises(ProgrammingError):
                 parse_dsn(dsn)
@@ -420,6 +423,67 @@ class ServerType(unittest.TestCase):
                 self.assertEqual(cls(server_type='Dedicated').server_type, 'dedicated')
                 self.assertEqual(cls(dsn='db/svc:pooled').server_type, 'pooled')
                 self.assertIsNone(cls().server_type)
+
+
+class HttpsProxy(unittest.TestCase):
+    # An HTTPS proxy in front of a TCPS address (#1993), named as
+    # python-oracledb names it: arguments, ? parameters, descriptor ADDRESS.
+    def test_every_form_names_it(self):
+        info = parse_dsn('tcps://db:2484/s?https_proxy=px&https_proxy_port=8080')
+        self.assertEqual(
+            (info.parameters['https_proxy'], info.parameters['https_proxy_port']),
+            ('px', '8080'),
+        )
+        target = parse_dsn(
+            '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=db)(PORT=2484)'
+            '(HTTPS_PROXY=px)(HTTPS_PROXY_PORT=8080))(CONNECT_DATA=(SERVICE_NAME=s)))'
+        )
+        self.assertEqual((target.https_proxy, target.https_proxy_port), ('px', 8080))
+        for cls in (OracleConnect, AsyncOracleConnect):
+            with self.subTest(cls=cls.__name__):
+                conn = cls(
+                    user='u',
+                    password='p',
+                    dsn='tcps://db:2484/s?https_proxy=px&https_proxy_port=8080',
+                )
+                self.assertEqual(
+                    (conn.https_proxy, conn.https_proxy_port, conn.ssl),
+                    ('px', 8080, True),
+                )
+                conn = cls(
+                    user='u',
+                    password='p',
+                    host='db',
+                    https_proxy='px',
+                    https_proxy_port=3128,
+                )
+                self.assertEqual(
+                    (conn.https_proxy, conn.https_proxy_port), ('px', 3128)
+                )
+
+    def test_a_proxy_without_a_port_is_refused(self):
+        with self.assertRaises(ProgrammingError):
+            resolve_dsn_arguments('tcps://db/s?https_proxy=px', _resolve_args())
+
+
+def _resolve_args() -> ConnectArguments:
+    return ConnectArguments(
+        'localhost',
+        1521,
+        '',
+        '',
+        'u',
+        'p',
+        None,
+        None,
+        8192,
+        None,
+        0,
+        15000,
+        None,
+        None,
+        0,
+    )
 
 
 class ResolveDsnArguments(unittest.TestCase):

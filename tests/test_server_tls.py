@@ -180,6 +180,145 @@ def test_a_tcps_dsn_alone_verifies_against_the_system_trust_store(
         )
 
 
+class _ConnectProxy:
+    """An HTTPS (CONNECT) proxy: records each request, then either answers 200
+    and relays both ways, or answers its configured status and closes (#1993)."""
+
+    def __init__(self, status: bytes = b'HTTP/1.0 200 Connection established') -> None:
+        self.status = status
+        self.requests: list[bytes] = []
+        self._listener = socket.socket()
+        self._listener.bind(('127.0.0.1', 0))
+        self._listener.listen()
+        self.port = self._listener.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                (client, _) = self._listener.accept()
+            except OSError:
+                return
+            head = b''
+            while b'\r\n\r\n' not in head:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                head += chunk
+            self.requests.append(head)
+            if not self.status.split()[1].startswith(b'2'):
+                client.sendall(self.status + b'\r\n\r\n')
+                client.close()
+                continue
+            (host, port) = head.split()[1].decode().rsplit(':', 1)
+            upstream = socket.create_connection((host, int(port)))
+            client.sendall(self.status + b'\r\n\r\n')
+            for a, b in ((client, upstream), (upstream, client)):
+                threading.Thread(target=_pipe, args=(a, b), daemon=True).start()
+
+    def close(self) -> None:
+        self._listener.close()
+
+
+def _pipe(src: socket.socket, dst: socket.socket) -> None:
+    try:
+        while data := src.recv(65536):
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for s in (src, dst):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def _through(proxy: _ConnectProxy, port: int, protocol: str = 'tcps') -> dict:
+    return {
+        'user': 'PYO',
+        'password': 'pyo123',
+        'dsn': f'{protocol}://127.0.0.1:{port}/XE'
+        f'?https_proxy=127.0.0.1&https_proxy_port={proxy.port}',
+        'ssl': {'ca_certs': _CA, 'check_hostname': False},
+        'timeout': 5000,
+    }
+
+
+def test_a_tcps_dsn_reaches_the_server_through_an_https_proxy(
+    tls_mirror: seerdb.Server,
+) -> None:
+    proxy = _ConnectProxy()
+    try:
+        conn = seerdb.connect(**_through(proxy, tls_mirror.port))
+        try:
+            cur = conn.cursor()
+            cur.execute('select * from dual')
+            assert cur.fetchone() == ('X',)
+        finally:
+            conn.close()
+        # python-oracledb's request, byte for byte: HTTP/1.0, no Host header.
+        assert proxy.requests == [
+            f'CONNECT 127.0.0.1:{tls_mirror.port} HTTP/1.0\r\n\r\n'.encode()
+        ]
+    finally:
+        proxy.close()
+
+
+def test_an_async_tcps_dsn_reaches_the_server_through_an_https_proxy(
+    tls_mirror: seerdb.Server,
+) -> None:
+    proxy = _ConnectProxy()
+
+    async def run() -> tuple:
+        conn = await seerdb.connect_async(**_through(proxy, tls_mirror.port))
+        async with conn:
+            cur = conn.cursor()
+            await cur.execute('select * from dual')
+            return await cur.fetchone()
+
+    try:
+        assert asyncio.run(run()) == ('X',)
+        assert len(proxy.requests) == 1
+    finally:
+        proxy.close()
+
+
+def test_a_proxy_refusing_the_tunnel_is_a_clear_error(
+    tls_mirror: seerdb.Server,
+) -> None:
+    proxy = _ConnectProxy(b'HTTP/1.1 403 Forbidden')
+    try:
+        with pytest.raises(seerdb.OperationalError, match='403 Forbidden'):
+            seerdb.connect(**_through(proxy, tls_mirror.port))
+
+        async def run() -> None:
+            await seerdb.connect_async(**_through(proxy, tls_mirror.port))
+
+        with pytest.raises(seerdb.OperationalError, match='403 Forbidden'):
+            asyncio.run(run())
+    finally:
+        proxy.close()
+
+
+def test_a_proxy_beside_plain_tcp_is_not_used() -> None:
+    # As in python-oracledb: the proxy is for a TCPS address only.
+    server = seerdb.Server(host='127.0.0.1', port=0, backend_factory=_DualBackend)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    proxy = _ConnectProxy()
+    try:
+        kwargs = _through(proxy, server.port, protocol='tcp')
+        del kwargs['ssl']
+        conn = seerdb.connect(**kwargs)
+        conn.close()
+        assert proxy.requests == []
+    finally:
+        proxy.close()
+        server.close()
+        thread.join(timeout=5)
+
+
 def test_the_launcher_builds_a_tls_context_from_its_options() -> None:
     launch = build(
         ['--tls-cert', _CERT, '--tls-key', _KEY, '--tls-ca', _CA, 'observe'], env={}

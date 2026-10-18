@@ -32,8 +32,10 @@ from dataclasses import dataclass, field, fields, replace
 
 from seerdb.client.netconfig import (
     Address,
+    NetConfigError,
     Route,
     parse_descriptor,
+    proxy_address,
     resolve_alias,
     server_type_value,
 )
@@ -57,6 +59,8 @@ class DsnTarget:
     server_type: str | None = None
     parameters: dict[str, str] = field(default_factory=dict)
     route: Route | None = None
+    https_proxy: str = ''
+    https_proxy_port: int = 0
 
 
 @dataclass(frozen=True)
@@ -76,6 +80,8 @@ class ConnectArguments:
     purity: int
     timeout: int
     route: Route | None
+    https_proxy: str | None
+    https_proxy_port: int
 
     def as_tuple(self) -> tuple:
         # In field order, for a constructor to unpack into its own arguments.
@@ -128,6 +134,8 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
             found.protocol,
             found.server_type,
             route=found.route,
+            https_proxy=found.https_proxy,
+            https_proxy_port=found.https_proxy_port,
         )
     protocol = 'tcp'
     scheme, separator, after = text.partition('://')
@@ -165,6 +173,8 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
             found.protocol,
             found.server_type,
             route=found.route,
+            https_proxy=found.https_proxy,
+            https_proxy_port=found.https_proxy_port,
         )
     port = _DEFAULT_PORT
     if rest.startswith(':'):
@@ -214,6 +224,8 @@ def _apply_parameters(
             'transport_connect_timeout',
             'retry_count',
             'retry_delay',
+            'https_proxy',
+            'https_proxy_port',
         }
     )
     if unread:
@@ -239,6 +251,14 @@ def _apply_parameters(
         args = replace(
             args, timeout=_timeout_ms(dsn, parameters['transport_connect_timeout'])
         )
+    if 'https_proxy' in parameters or 'https_proxy_port' in parameters:
+        try:
+            (proxy, proxy_port) = proxy_address(
+                parameters.get('https_proxy'), parameters.get('https_proxy_port')
+            )
+        except NetConfigError as e:
+            raise ProgrammingError(f'dsn {dsn!r}: {e}') from None
+        args = replace(args, https_proxy=proxy, https_proxy_port=proxy_port)
     if 'retry_count' in parameters or 'retry_delay' in parameters:
         # Retries of the one address Easy Connect names (#1983).
         count = parameters.get('retry_count', '0')
@@ -254,6 +274,8 @@ def _apply_parameters(
             args.service_name,
             args.sid,
             args.server_type,
+            args.https_proxy or '',
+            args.https_proxy_port,
         )
         args = replace(
             args,
@@ -272,6 +294,10 @@ def resolve_dsn_arguments(
     parameters set ``sdu``, ``cclass``, ``purity`` and ``timeout``."""
     info = parse_dsn(dsn, config_dir)
     args = replace(args, host=info.host, port=info.port, route=info.route)
+    if info.https_proxy:
+        args = replace(
+            args, https_proxy=info.https_proxy, https_proxy_port=info.https_proxy_port
+        )
     if info.protocol == 'tcps' and not args.ssl:
         args = replace(args, ssl=True)
     if info.server_type is not None:
