@@ -7332,6 +7332,12 @@ say which session it should be. Two small additions to the existing connect flow
 | `server_type='pooled'` | `pooled` | `PURITY`=1 |
 | `server_type='pooled'`, `cclass='C1'` | `pooled` | `CONN_CLASS`=C1, `PURITY`=1 |
 
+A **pool** asking for a pooled server differs again (#2006): python-oracledb
+gives it a class of its own, `DPY:` plus the base64 of 16 random bytes, new for
+each pool, and defaults purity to SELF, so the pool's sessions are reused by it
+alone. seerdb's pools do the same under the prefix `SEERDB:`; a class or a
+purity given is kept.
+
 The DRCP capability itself is already advertised (`compile_caps[CCAP_OCI2]` has
 the `0x10` DRCP bit at field version ≥ 21.1), so no handshake change is needed.
 

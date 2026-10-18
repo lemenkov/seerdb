@@ -295,7 +295,7 @@ the 12c+ protocol the 21c tier exercises.
 | **Statement validation** — `cursor.parse()` parses a statement on the server without running it (10g+) | ✅ |
 | **Arrow / DataFrame fetch** — `cursor.fetch_df_all` / `fetch_df_batches` (pyarrow `Table` / record batches) | ✅ |
 | **SODA** — document store over `DBMS_SODA`: collections, documents, query-by-example (with streaming), insert / read / upsert / update / delete / bulk, indexing + data guide (18c+) | ✅ |
-| **Connection** — pool (warm sessions + idle health-check), statement cache, `changepassword`, TLS, wallet mTLS, DRCP (`server_type='pooled'`, with `cclass` / `purity`), proxy auth, an opt-in negotiation cache that skips a round trip on fast-auth reconnects | ✅ |
+| **Connection** — pool (warm sessions + idle health-check), statement cache, `changepassword`, TLS, wallet mTLS, DRCP (`server_type='pooled'`, with `cclass` / `purity`; a DRCP pool generates its own class, as in python-oracledb), proxy auth, an opt-in negotiation cache that skips a round trip on fast-auth reconnects | ✅ |
 | **Authentication** — O3LOGON (8i / 9i) and O5LOGON (10g+, 128 / 192 / 256-bit); token-based auth — OAuth2 (bare JWT) and OCI IAM (signed) for Autonomous Database | ✅ |
 | **Native network encryption** — Advanced Networking (ANO): AES-CBC encryption + SHA-2 data-integrity negotiated at connect, for a server with `SQLNET.ENCRYPTION_SERVER` / `CRYPTO_CHECKSUM_SERVER` set | ✅ |
 | **Advanced Queuing (AQ)** — enqueue / dequeue over `DBMS_AQ`, including JSON payloads | ✅ |

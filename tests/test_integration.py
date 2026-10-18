@@ -3151,6 +3151,35 @@ class CursorIntegration(_IntegrationBase):
             cur.execute('SELECT 1 FROM dual')
             self.assertEqual(cur.fetchone(), (1,))
 
+    def test_a_drcp_pool_connects_with_its_own_class(self):
+        # A pool asking for a pooled server gives its sessions a generated class
+        # and purity SELF, as python-oracledb's pools do (#2006). A server whose
+        # DRCP pool is not started refuses it (ORA-12520).
+        try:
+            pool = seerdb.create_pool(
+                user=_USER,
+                password=_PASSWORD,
+                host=_HOST,
+                port=_PORT,
+                service_name=_SERVICE,
+                server_type='pooled',
+                min=1,
+                max=2,
+                **_FV_KW,
+            )
+        except seerdb.DatabaseError as e:
+            if getattr(e, 'code', None) == 12520:
+                self.skipTest('the DRCP pool is not started on this server')
+            raise
+        try:
+            with pool.acquire() as conn:
+                self.assertTrue(conn.cclass.startswith('SEERDB:'))
+                cur = conn.cursor()
+                cur.execute('SELECT 1 FROM dual')
+                self.assertEqual(cur.fetchone(), (1,))
+        finally:
+            pool.close()
+
     def test_a_long_program_name_connects(self):
         # 8i's login gives a program name one length byte, which stops at 252:
         # 253 to 255 failed the login and a longer one could not be sent at all
@@ -10265,6 +10294,25 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             async with Conn.cursor() as Cur:
                 await Cur.execute('SELECT 1 FROM dual')
                 self.assertEqual(await Cur.fetchone(), (1,))
+
+    async def test_a_drcp_pool_connects_with_its_own_class(self):
+        # Async twin of CursorIntegration's (#2006).
+        try:
+            Pool = await seerdb.create_pool_async(
+                **self._kwargs(server_type='pooled'), min=1, max=2
+            )
+        except seerdb.DatabaseError as E:
+            if getattr(E, 'code', None) == 12520:
+                self.skipTest('the DRCP pool is not started on this server')
+            raise
+        try:
+            async with Pool.acquire() as Conn:
+                self.assertTrue(Conn.cclass.startswith('SEERDB:'))
+                async with Conn.cursor() as Cur:
+                    await Cur.execute('SELECT 1 FROM dual')
+                    self.assertEqual(await Cur.fetchone(), (1,))
+        finally:
+            await Pool.close()
 
     async def test_a_long_program_name_connects(self):
         # Async twin of CursorIntegration's.
