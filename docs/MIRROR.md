@@ -109,7 +109,7 @@ Any service name is accepted.
 
 | option | default | meaning |
 |---|---|---|
-| `--host` | `127.0.0.1` | listen address; give `0.0.0.0` to accept other hosts |
+| `--host` | `127.0.0.1` | listen address, IPv4 or IPv6 (`::1`); give `0.0.0.0` (IPv4) or `::` (IPv4 and IPv6 on one socket) to accept other hosts |
 | `--port` | `1521` | listen port |
 | `--encryption` | `requested` | native network encryption (ANO): `requested` encrypts whenever the client offers AES, `required` refuses a client that doesn't, `accepted` never encrypts |
 | `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR` |

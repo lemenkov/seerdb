@@ -20,7 +20,7 @@ from collections.abc import Callable
 
 from seerdb.common.tns_consts import FIELD_VERSION_11_2
 from seerdb.server.backend import Backend
-from seerdb.server.framing import PacketStream
+from seerdb.server.framing import PacketStream, listen_socket
 from seerdb.server.session import serve_session
 
 logger = logging.getLogger('seerdb.server')
@@ -80,14 +80,12 @@ class Server:
         self._field_version = field_version
         self._tns_version = tns_version
         self._running = True
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind((host, port))
-        self._sock.listen(_BACKLOG)
+        self._sock = listen_socket(host, port, _BACKLOG)
         # A short accept timeout lets close() stop the loop promptly (a plain
         # close() does not reliably wake a thread blocked in accept()).
         self._sock.settimeout(0.5)
-        self.host, self.port = self._sock.getsockname()
+        # An IPv6 address names itself in four fields, IPv4 in two (#2001).
+        (self.host, self.port) = self._sock.getsockname()[:2]
 
     def serve_forever(self) -> None:
         """Accept and serve connections until :meth:`close` (or an interrupt)."""
@@ -107,7 +105,9 @@ class Server:
                 break  # the socket was closed
             if self._slots is not None and not self._slots.acquire(blocking=False):
                 logger.warning(
-                    'refused %s:%d: already serving the most sessions allowed', *addr
+                    'refused %s:%d: already serving the most sessions allowed',
+                    addr[0],
+                    addr[1],
                 )
                 client.close()
                 continue
@@ -148,7 +148,7 @@ class Server:
             )
             logger.info('%s:%d session ended (%s)', addr[0], addr[1], user)
         except Exception:
-            logger.exception('session error from %s:%d', *addr)
+            logger.exception('session error from %s:%d', addr[0], addr[1])
         finally:
             if backend is not None:
                 try:
