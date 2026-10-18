@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import socket
 import threading
 from collections.abc import Iterator
 
 import pytest
+from _tls_proxy import wallet_naming_port
 
 import seerdb
 from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
@@ -71,21 +73,26 @@ def tcps_mirror() -> Iterator[seerdb.Server]:
     thread.join(timeout=5)
 
 
-def _wallet_kwargs(port: int) -> dict:
+@pytest.fixture
+def wallet(tcps_mirror: seerdb.Server) -> Iterator[str]:
+    # A wallet dsn names the address, so its alias names the Mirror (#1975).
+    path = wallet_naming_port(tcps_mirror.port)
+    yield path
+    shutil.rmtree(path)
+
+
+def _wallet_kwargs(wallet: str) -> dict:
     return {
-        'host': '127.0.0.1',
-        'port': port,
         'user': 'PYO',
         'password': 'pyo123',
-        'service_name': 'XE',
-        'wallet_location': _WALLET,
+        'wallet_location': wallet,
         'dsn': 'seerdb_test',
         'timeout': 5000,
     }
 
 
-def _select_dual(port: int) -> tuple:
-    conn = seerdb.connect(**_wallet_kwargs(port))
+def _select_dual(wallet: str) -> tuple:
+    conn = seerdb.connect(**_wallet_kwargs(wallet))
     try:
         cur = conn.cursor()
         cur.execute('select * from dual')
@@ -94,15 +101,13 @@ def _select_dual(port: int) -> tuple:
         conn.close()
 
 
-def test_a_wallet_client_runs_sql_over_the_mirrors_own_tls(
-    tcps_mirror: seerdb.Server,
-) -> None:
-    assert _select_dual(tcps_mirror.port) == ('X',)
+def test_a_wallet_client_runs_sql_over_the_mirrors_own_tls(wallet: str) -> None:
+    assert _select_dual(wallet) == ('X',)
 
 
-def test_an_async_wallet_client_runs_sql_over_it(tcps_mirror: seerdb.Server) -> None:
+def test_an_async_wallet_client_runs_sql_over_it(wallet: str) -> None:
     async def run() -> tuple:
-        conn = await seerdb.connect_async(**_wallet_kwargs(tcps_mirror.port))
+        conn = await seerdb.connect_async(**_wallet_kwargs(wallet))
         async with conn:
             cur = conn.cursor()
             await cur.execute('select * from dual')
@@ -112,7 +117,7 @@ def test_an_async_wallet_client_runs_sql_over_it(tcps_mirror: seerdb.Server) -> 
 
 
 def test_a_client_that_does_not_speak_tls_is_dropped_and_the_mirror_serves_on(
-    tcps_mirror: seerdb.Server,
+    tcps_mirror: seerdb.Server, wallet: str
 ) -> None:
     # Plain TNS bytes where a TLS ClientHello belongs: that connection fails its
     # handshake and closes, and the listener goes on serving TLS clients.
@@ -124,7 +129,7 @@ def test_a_client_that_does_not_speak_tls_is_dropped_and_the_mirror_serves_on(
                 pass
         except ConnectionResetError:
             pass
-    assert _select_dual(tcps_mirror.port) == ('X',)
+    assert _select_dual(wallet) == ('X',)
 
 
 def test_the_launcher_builds_a_tls_context_from_its_options() -> None:

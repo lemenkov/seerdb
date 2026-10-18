@@ -15,8 +15,10 @@
 # pair of pump threads; the proxy stops cleanly when stop() is called.
 
 import os
+import shutil
 import socket
 import ssl
+import tempfile
 import threading
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), 'fixtures')
@@ -32,6 +34,33 @@ _RDN_SHORT = {
     'stateOrProvinceName': 'ST',
     'localityName': 'L',
 }
+
+
+WALLET_DIR = os.path.join(FIXTURES_DIR, 'wallet')
+
+
+def wallet_naming_port(port: int, host: str = '127.0.0.1', service: str = '') -> str:
+    """A copy of the fixture wallet whose `seerdb_test` alias names
+    `host`:`port` (and `service`, when given); the caller removes the directory.
+    A wallet dsn names the address, so a test reaches its server through the
+    alias (#1975)."""
+    path = tempfile.mkdtemp()
+    shutil.copytree(WALLET_DIR, path, dirs_exist_ok=True)
+    tns = os.path.join(path, 'tnsnames.ora')
+    with open(tns) as f:
+        text = f.read()
+    named = text.replace(
+        '(host = localhost)(port = 1522)', f'(host = {host})(port = {port})'
+    )
+    if service:
+        named = named.replace(
+            '(service_name = seerdb_test_svc)', f'(service_name = {service})'
+        )
+    if named == text or (service and service not in named):
+        raise RuntimeError('the fixture tnsnames.ora no longer has the expected alias')
+    with open(tns, 'w') as f:
+        f.write(named)
+    return path
 
 
 def _format_subject(cert: dict | None) -> str | None:

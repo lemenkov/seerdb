@@ -139,7 +139,8 @@ What works:
   `ewallet.pem`) and, optionally, `dsn="mydb_high"` to resolve the
   host / port / service and the server-certificate DN from the wallet's
   `tnsnames.ora` / `sqlnet.ora` (`SSL_SERVER_DN_MATCH` is enforced after
-  the handshake). Needs the `wallet` extra — `pip install seerdb[wallet]`
+  the handshake). What the alias names wins over `host` / `port` /
+  `service_name` passed beside it, as in python-oracledb. Needs the `wallet` extra — `pip install seerdb[wallet]`
   — which pulls in `cryptography` for the X.509 / PKCS#12 decode
 - Native network encryption (Advanced Networking / ANO): when the server sets
   `SQLNET.ENCRYPTION_SERVER` and/or `SQLNET.CRYPTO_CHECKSUM_SERVER`, the
