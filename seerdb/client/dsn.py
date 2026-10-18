@@ -19,9 +19,10 @@ the string names wins over ``host`` / ``port`` / ``service_name`` passed beside
 it, as it does in python-oracledb. A bare word is a tnsnames alias, read from
 ``config_dir``, ``TNS_ADMIN`` or ``$ORACLE_HOME/network/admin``
 (:func:`seerdb.client.netconfig.resolve_alias`). A form seerdb does not read
-yet -- a protocol prefix, ``?`` parameters, a ``:server_type``, or a descriptor
-parameter seerdb does not act on -- raises NotSupportedError naming it, rather
-than being ignored.
+yet -- ``?`` parameters, a ``:server_type``, or a descriptor parameter seerdb
+does not act on -- raises NotSupportedError naming it, rather than being
+ignored. A ``tcps://`` prefix, or PROTOCOL=TCPS in a descriptor, turns TLS on
+(#1977).
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ class DsnTarget:
     user: str | None = None
     password: str | None = None
     sid: str = ''
+    protocol: str = 'tcp'
 
 
 def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
@@ -65,12 +67,21 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
     if text.startswith('('):
         found = parse_descriptor(text)
         return DsnTarget(
-            found.host, found.port, found.service_name, user, password, found.sid
+            found.host,
+            found.port,
+            found.service_name,
+            user,
+            password,
+            found.sid,
+            found.protocol,
         )
-    if '://' in text:
-        raise NotSupportedError(
-            f'dsn {dsn!r}: a protocol prefix is not supported yet; use ssl= for TCPS'
-        )
+    protocol = 'tcp'
+    scheme, separator, after = text.partition('://')
+    if separator:
+        protocol = scheme.lower()
+        if protocol not in ('tcp', 'tcps'):
+            raise ProgrammingError(f'dsn {dsn!r}: {scheme!r} is not tcp or tcps')
+        text = after
     if '?' in text:
         raise NotSupportedError(f'dsn {dsn!r}: "?" parameters are not supported yet')
     easy = text.startswith('//')  # only Easy Connect opens with '//'
@@ -91,7 +102,13 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
     if not (easy or rest or text.startswith('[')):
         found = resolve_alias(text, config_dir)
         return DsnTarget(
-            found.host, found.port, found.service_name, user, password, found.sid
+            found.host,
+            found.port,
+            found.service_name,
+            user,
+            password,
+            found.sid,
+            found.protocol,
         )
     port = _DEFAULT_PORT
     if rest.startswith(':'):
@@ -109,7 +126,7 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
             )
     elif rest:
         raise ProgrammingError(f'dsn {dsn!r} is not [//]host[:port][/service_name]')
-    return DsnTarget(host, port, service_name, user, password)
+    return DsnTarget(host, port, service_name, user, password, '', protocol)
 
 
 def resolve_dsn_arguments(
@@ -121,11 +138,15 @@ def resolve_dsn_arguments(
     user: str,
     password: str,
     config_dir: str | None = None,
-) -> tuple[str, int, str, str, str, str]:
+    ssl: object = None,
+) -> tuple[str, int, str, str, str, str, object]:
     """The connect arguments once ``dsn`` is applied: the DSN wins over host,
     port and service_name passed beside it, and supplies the credentials only
-    when no ``user`` was passed."""
+    when no ``user`` was passed. A TCPS address turns TLS on as ``ssl=True``
+    does, and keeps an ``ssl=`` configuration passed beside it."""
     info = parse_dsn(dsn, config_dir)
+    if info.protocol == 'tcps' and not ssl:
+        ssl = True
     if info.service_name:
         service_name, sid = info.service_name, ''
     elif info.sid:
@@ -138,4 +159,4 @@ def resolve_dsn_arguments(
         user = info.user
         if info.password is not None:
             password = info.password
-    return info.host, info.port, service_name, sid, user, password
+    return info.host, info.port, service_name, sid, user, password, ssl

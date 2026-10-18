@@ -45,7 +45,6 @@ class ParseDsn(unittest.TestCase):
 
     def test_a_form_not_read_yet_is_refused_not_dropped(self):
         for dsn in (
-            'tcps://db:2484/FREEPDB1',
             'db:1523/FREEPDB1?connect_timeout=2',
             'db:1523/FREEPDB1:dedicated',
         ):
@@ -105,7 +104,6 @@ class ParseDescriptor(unittest.TestCase):
         cases = {
             f'(DESCRIPTION={_ADDR}{_ADDR}(CONNECT_DATA=(SERVICE_NAME=s)))': 'several',
             f'(DESCRIPTION_LIST=(DESCRIPTION={_ADDR})(DESCRIPTION={_ADDR}))': 'several',
-            '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=db)(PORT=2484)))': 'TCPS',
             f'(DESCRIPTION=(RETRY_COUNT=3){_ADDR})': 'RETRY_COUNT',
             f'(DESCRIPTION={_ADDR}(SECURITY=(SSL_SERVER_DN_MATCH=yes)))': 'SECURITY',
             f'(DESCRIPTION={_ADDR}(CONNECT_DATA=(SERVICE_NAME=s)(SERVER=DEDICATED)))': (
@@ -141,7 +139,7 @@ class ParseDescriptor(unittest.TestCase):
                 'u',
                 'p',
             ),
-            ('db', 1523, '', 'ORCL', 'u', 'p'),
+            ('db', 1523, '', 'ORCL', 'u', 'p', None),
         )
 
 
@@ -234,11 +232,50 @@ class ResolveAlias(unittest.TestCase):
                 self.assertIsNone(conn.ssl)
 
 
+class Tcps(unittest.TestCase):
+    # tcps:// or PROTOCOL=TCPS names a TLS address (#1977); python-oracledb
+    # 26.0.1 reads the prefix case-insensitively and refuses any other.
+    def test_the_protocol_is_read_from_every_form(self):
+        for dsn, protocol in (
+            ('tcps://db:2484/svc', 'tcps'),
+            ('TCPS://db:2484/svc', 'tcps'),
+            ('tcp://db:1521/svc', 'tcp'),
+            ('u/p@tcps://db:2484/svc', 'tcps'),
+            ('db:1521/svc', 'tcp'),
+            ('(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=db)(PORT=2484)))', 'tcps'),
+        ):
+            with self.subTest(dsn=dsn):
+                self.assertEqual(parse_dsn(dsn).protocol, protocol)
+
+    def test_another_protocol_is_refused(self):
+        for dsn in (
+            'http://db:1521/svc',
+            '(DESCRIPTION=(ADDRESS=(PROTOCOL=IPC)(HOST=db)))',
+        ):
+            with self.subTest(dsn=dsn), self.assertRaises(ProgrammingError):
+                parse_dsn(dsn)
+
+    def test_tcps_turns_tls_on_and_keeps_a_configuration_passed(self):
+        args = ('localhost', 1521, '', '', 'u', 'p', None)
+        self.assertIs(resolve_dsn_arguments('tcps://db:2484/svc', *args)[-1], True)
+        self.assertIsNone(resolve_dsn_arguments('tcp://db:1521/svc', *args)[-1])
+        config = {'ca_certs': '/ca.pem'}
+        self.assertIs(
+            resolve_dsn_arguments('tcps://db/svc', *args[:-1], None, config)[-1], config
+        )
+
+    def test_both_connection_classes_turn_tls_on(self):
+        for cls in (OracleConnect, AsyncOracleConnect):
+            with self.subTest(cls=cls.__name__):
+                conn = cls(user='pyo', password='p', dsn='tcps://db:2484/svc')
+                self.assertEqual((conn.host, conn.port, conn.ssl), ('db', 2484, True))
+
+
 class ResolveDsnArguments(unittest.TestCase):
     def test_the_dsn_wins_over_host_port_and_service_passed_beside_it(self):
         self.assertEqual(
             resolve_dsn_arguments('db:1523/A', 'other', 2, 'B', '', 'u', 'p'),
-            ('db', 1523, 'A', '', 'u', 'p'),
+            ('db', 1523, 'A', '', 'u', 'p', None),
         )
 
     def test_a_dsn_without_a_port_means_1521(self):
@@ -250,7 +287,7 @@ class ResolveDsnArguments(unittest.TestCase):
     def test_a_dsn_without_a_service_keeps_the_one_passed(self):
         self.assertEqual(
             resolve_dsn_arguments('db:1523', 'localhost', 1521, 'B', '', 'u', 'p'),
-            ('db', 1523, 'B', '', 'u', 'p'),
+            ('db', 1523, 'B', '', 'u', 'p', None),
         )
 
     def test_a_service_in_the_dsn_replaces_a_sid(self):
@@ -264,7 +301,7 @@ class ResolveDsnArguments(unittest.TestCase):
             resolve_dsn_arguments(
                 'scott/tiger@db/A', 'localhost', 1521, '', '', '', ''
             ),
-            ('db', 1521, 'A', '', 'scott', 'tiger'),
+            ('db', 1521, 'A', '', 'scott', 'tiger', None),
         )
 
     def test_a_user_in_the_dsn_and_in_user_is_refused(self):

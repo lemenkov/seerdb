@@ -195,6 +195,7 @@ class DescriptorTarget:
     port: int
     service_name: str = ''
     sid: str = ''
+    protocol: str = 'tcp'
 
 
 # The keys read, at each level. CID only describes the client, which seerdb
@@ -268,12 +269,10 @@ def descriptor_target(name: str, value: Node) -> DescriptorTarget:
         )
     address = _branch(addresses[0], 'address')
     _refuse_unread(address, _ADDRESS_KEYS, 'ADDRESS parameter')
-    protocol = _find_first(address, 'protocol')
-    if isinstance(protocol, str) and protocol.lower() != 'tcp':
-        raise NotSupportedError(
-            f'PROTOCOL={protocol} in a connect descriptor is not supported yet; '
-            'use ssl= for TCPS'
-        )
+    found_protocol = _find_first(address, 'protocol')
+    protocol = found_protocol.lower() if isinstance(found_protocol, str) else 'tcp'
+    if protocol not in ('tcp', 'tcps'):
+        raise NetConfigError(f'PROTOCOL={found_protocol} is not TCP or TCPS')
     host = _find_first(address, 'host')
     if not isinstance(host, str) or not host:
         raise NetConfigError('the connect descriptor names no HOST')
@@ -293,7 +292,7 @@ def descriptor_target(name: str, value: Node) -> DescriptorTarget:
         service_name = found if isinstance(found, str) else ''
         found = _find_first(data, 'sid')
         sid = found if isinstance(found, str) else ''
-    return DescriptorTarget(host, port_number, service_name, sid)
+    return DescriptorTarget(host, port_number, service_name, sid, protocol)
 
 
 # --------------------------------------------------------------------------- #

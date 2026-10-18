@@ -220,8 +220,10 @@ class AsyncOracleConnect(_ConnectionLogic):
             config_dir is not None and holds_wallet(config_dir)
         )
         if dsn is not None and not use_wallet:
-            (host, port, service_name, sid, user, password) = resolve_dsn_arguments(
-                dsn, host, port, service_name, sid, user, password, config_dir
+            (host, port, service_name, sid, user, password, ssl) = (
+                resolve_dsn_arguments(
+                    dsn, host, port, service_name, sid, user, password, config_dir, ssl
+                )
             )
         # Negotiation cache (#438): opt-in reconnect optimization, sharing the
         # process-level cache with the sync connection.
