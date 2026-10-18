@@ -64,7 +64,7 @@ from seerdb.client.dialect import (
 )
 from seerdb.client.dsn import ConnectArguments, resolve_dsn_arguments
 from seerdb.client.enums import TransactionPriority
-from seerdb.client.netconfig import holds_wallet, server_type_value
+from seerdb.client.netconfig import Address, Route, holds_wallet, server_type_value
 from seerdb.common.crypto import validate
 from seerdb.common.exceptions import (
     DatabaseError,
@@ -220,6 +220,11 @@ class AsyncOracleConnect(_ConnectionLogic):
         use_wallet = wallet_location is not None or (
             config_dir is not None and holds_wallet(config_dir)
         )
+        # The addresses to try and how (#1983): None for the one address host /
+        # port name. The ssl given is kept apart, so an address's own protocol
+        # can turn TLS on for it alone.
+        route: Route | None = None
+        self._ssl_given = ssl
         if dsn is not None and not use_wallet:
             given = ConnectArguments(
                 host,
@@ -234,6 +239,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 cclass,
                 purity,
                 timeout,
+                None,
             )
             (
                 host,
@@ -248,6 +254,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 cclass,
                 purity,
                 timeout,
+                route,
             ) = resolve_dsn_arguments(dsn, given, config_dir).as_tuple()
         # Negotiation cache (#438): opt-in reconnect optimization, sharing the
         # process-level cache with the sync connection.
@@ -269,6 +276,9 @@ class AsyncOracleConnect(_ConnectionLogic):
         self.sid = sid
         self.service_name = service_name
         self.ssl = ssl
+        self._route = route
+        # Set when a listener refused the connect, which a route fails over on.
+        self._listener_refused = False
         self.socket_options = socket_options
         self.conn_state = CONN_STATE_DISCONNECTED
         self.timeout = timeout
@@ -425,13 +435,13 @@ class AsyncOracleConnect(_ConnectionLogic):
         # resolves to that answers, in getaddrinfo's order, each in its own
         # family (#2000).
         Last: OSError = OSError(f'{self.host!r} resolves to no address')
-        for Family, Type, Proto, _, Address in await Loop.getaddrinfo(
+        for Family, Type, Proto, _, Sockaddr in await Loop.getaddrinfo(
             self.host, self.port, type=socket.SOCK_STREAM
         ):
             Sock = socket.socket(Family, Type, Proto)
             Sock.setblocking(False)
             try:
-                await Loop.sock_connect(Sock, Address)
+                await Loop.sock_connect(Sock, Sockaddr)
                 return Sock
             except OSError as E:
                 Sock.close()
@@ -495,6 +505,46 @@ class AsyncOracleConnect(_ConnectionLogic):
         return True
 
     async def _connect_and_login(self) -> None:
+        # One address, or each of a route's in turn (#1983): the next is tried
+        # when the TCP connect fails or the listener refuses, as python-oracledb
+        # does, and the whole list again RETRY_COUNT times. Anything else -- a
+        # failed login, a protocol error -- is raised at once.
+        route = self._route
+        if route is None:
+            await self._connect_once()
+            return
+        last: Exception = OperationalError('the connect descriptor names no address')
+        for attempt in range(route.retry_count + 1):
+            if attempt:
+                await asyncio.sleep(route.retry_delay)
+            for address in route.order():
+                self._use_address(address)
+                self._listener_refused = False
+                try:
+                    await self._connect_once()
+                    return
+                except OSError as e:
+                    last = e
+                except DatabaseError as e:
+                    if not self._listener_refused:
+                        raise
+                    last = e
+                await self.disconnect()  # what the attempt left open
+        raise last
+
+    def _use_address(self, address: Address) -> None:
+        # Point the connection at one of its route's addresses: its host and
+        # port, its connect data, and TLS when it is a TCPS address.
+        (self.host, self.port) = (address.host, address.port)
+        (self.service_name, self.sid) = (address.service_name, address.sid)
+        if address.server_type is not None:
+            self.server_type = address.server_type
+        if address.protocol == 'tcps':
+            self.ssl = self._ssl_given or True
+        else:
+            self.ssl = self._ssl_given
+
+    async def _connect_once(self) -> None:
         self._redirects = 0
         await self._open_transport()
         try:
@@ -851,6 +901,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                     from seerdb.client.connection import _parse_refuse_code
 
                     Code = _parse_refuse_code(Packet)
+                    self._listener_refused = True
                     await self.disconnect()
                     if Code:
                         from seerdb.common.exceptions import from_ora_code

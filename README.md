@@ -406,8 +406,14 @@ An Easy Connect string works too, as in python-oracledb:
 `seerdb.connect(user="scott", password="tiger", dsn="dbhost:1521/MYDB")`.
 The form is `[user[/password]@][//]host[:port][/service_name]`; the port
 defaults to 1521, and the DSN wins over `host` / `port` / `service_name` passed
-beside it. A connect descriptor with one address works as well
+beside it. A connect descriptor works as well
 (`dsn="(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=dbhost)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=MYDB)))"`).
+With several addresses (`ADDRESS`es, `ADDRESS_LIST`s, a `DESCRIPTION_LIST`)
+they are tried as python-oracledb tries them: in order, the next when the TCP
+connect fails or the listener refuses; only the first with `FAILOVER=OFF`;
+shuffled with `LOAD_BALANCE=ON`; the whole list again `RETRY_COUNT` times,
+`RETRY_DELAY` seconds apart. A `FAILOVER` or `LOAD_BALANCE` on any level applies
+to the whole list, coarser than Oracle Net's per-list nesting.
 So does a `tnsnames.ora` alias (`dsn="mydb"`), read from `config_dir=`, else
 `TNS_ADMIN`, else `$ORACLE_HOME/network/admin`, with `IFILE` includes followed;
 `config_dir` is taken as a wallet location only when it holds `ewallet.pem` or
@@ -416,12 +422,11 @@ alias, turns TLS on as `ssl=True` does; an `ssl=` configuration passed beside it
 is kept. A `:server_type` suffix (`dbhost/MYDB:pooled`) or `(SERVER=...)` in a
 descriptor sets `server_type`, which `connect()` also takes: `dedicated`,
 `shared` or `pooled`, the last asking for DRCP as `cclass`/`purity` do. A
-descriptor with several addresses, or with a parameter seerdb does not act on
-yet (`RETRY_COUNT`, `SDU`, `SECURITY`, …) is refused with `NotSupportedError`
-for now. Of Easy Connect's `?` parameters, `sdu`, `pool_connection_class`
-(`cclass`), `pool_purity` (`new` / `self`) and `transport_connect_timeout`
+descriptor parameter seerdb does not act on yet (`SDU`, `SECURITY`, …) is
+refused with `NotSupportedError` for now. Of Easy Connect's `?` parameters, `sdu`, `pool_connection_class`
+(`cclass`), `pool_purity` (`new` / `self`), `transport_connect_timeout`
 (seconds, or `ms` / `sec` / `min`; it sets `timeout`, which also bounds the
-login) are read and win over the arguments beside them; any other is refused by
+login) and `retry_count` / `retry_delay` are read and win over the arguments beside them; any other is refused by
 name, where python-oracledb ignores the ones it does not know. python-oracledb
 ignores descriptor parameters it does not know; seerdb refuses them by name.
 

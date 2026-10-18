@@ -27,6 +27,7 @@ import inspect
 import math
 import os
 import re
+import socket
 import ssl
 import tempfile
 import unittest
@@ -547,6 +548,28 @@ _NULL_GROUP_AVERAGES = [
     (2, Decimal('12345678901234567890.129'), 2),
     (3, None, 0),
 ]
+
+
+def _failover_descriptors() -> list[tuple[str, str]]:
+    """Two descriptors that reach the bed only by failing over (#1983): a dead
+    address ahead of it, and a service its listener refuses (ORA-12514) ahead of
+    the real one."""
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        dead = probe.getsockname()[1]
+    bed = f'(ADDRESS=(PROTOCOL=TCP)(HOST={_HOST})(PORT={_PORT}))'
+    return [
+        (
+            'dead address first',
+            f'(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=127.0.0.1)(PORT={dead}))'
+            f'{bed}(CONNECT_DATA=(SERVICE_NAME={_SERVICE})))',
+        ),
+        (
+            'refused service first',
+            f'(DESCRIPTION_LIST=(DESCRIPTION={bed}(CONNECT_DATA=(SERVICE_NAME=PYO_NO_SUCH)))'
+            f'(DESCRIPTION={bed}(CONNECT_DATA=(SERVICE_NAME={_SERVICE}))))',
+        ),
+    ]
 
 
 _LTZ_VALUE = datetime.datetime(2026, 9, 25, 13, 45, 6, 123456)
@@ -3097,6 +3120,18 @@ class CursorIntegration(_IntegrationBase):
             cur = conn.cursor()
             cur.execute('SELECT 1 FROM dual')
             self.assertEqual(cur.fetchone(), (1,))
+
+    def test_a_descriptor_fails_over_to_the_bed(self):
+        for name, descriptor in _failover_descriptors():
+            with (
+                self.subTest(name),
+                seerdb.connect(
+                    user=_USER, password=_PASSWORD, dsn=descriptor, **_FV_KW
+                ) as conn,
+            ):
+                cur = conn.cursor()
+                cur.execute('SELECT 1 FROM dual')
+                self.assertEqual(cur.fetchone(), (1,))
 
     def test_a_long_program_name_connects(self):
         # 8i's login gives a program name one length byte, which stops at 252:
@@ -10191,6 +10226,18 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             async with Conn.cursor() as Cur:
                 await Cur.execute('SELECT 1 FROM dual')
                 self.assertEqual(await Cur.fetchone(), (1,))
+
+    async def test_a_descriptor_fails_over_to_the_bed(self):
+        # Async twin of CursorIntegration's (#1983).
+        for Name, Descriptor in _failover_descriptors():
+            Kwargs = self._kwargs(dsn=Descriptor)
+            for Key in ('host', 'port', 'service_name'):
+                Kwargs.pop(Key)
+            with self.subTest(Name):
+                async with await seerdb.connect_async(**Kwargs) as Conn:
+                    async with Conn.cursor() as Cur:
+                        await Cur.execute('SELECT 1 FROM dual')
+                        self.assertEqual(await Cur.fetchone(), (1,))
 
     async def test_a_long_program_name_connects(self):
         # Async twin of CursorIntegration's.

@@ -30,7 +30,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field, fields, replace
 
-from seerdb.client.netconfig import parse_descriptor, resolve_alias, server_type_value
+from seerdb.client.netconfig import (
+    Address,
+    Route,
+    parse_descriptor,
+    resolve_alias,
+    server_type_value,
+)
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
 from seerdb.common.tns_consts import PURITY_DEFAULT, PURITY_NEW, PURITY_SELF
 
@@ -50,6 +56,7 @@ class DsnTarget:
     protocol: str = 'tcp'
     server_type: str | None = None
     parameters: dict[str, str] = field(default_factory=dict)
+    route: Route | None = None
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,7 @@ class ConnectArguments:
     cclass: str | None
     purity: int
     timeout: int
+    route: Route | None
 
     def as_tuple(self) -> tuple:
         # In field order, for a constructor to unpack into its own arguments.
@@ -119,6 +127,7 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
             found.sid,
             found.protocol,
             found.server_type,
+            route=found.route,
         )
     protocol = 'tcp'
     scheme, separator, after = text.partition('://')
@@ -155,6 +164,7 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
             found.sid,
             found.protocol,
             found.server_type,
+            route=found.route,
         )
     port = _DEFAULT_PORT
     if rest.startswith(':'):
@@ -178,6 +188,7 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
 
 # The ? parameters with a seerdb argument, and how each value reads (#1977).
 _PURITIES = {'default': PURITY_DEFAULT, 'new': PURITY_NEW, 'self': PURITY_SELF}
+_NUMBER = re.compile(r'\d+(?:\.\d+)?')
 _TIMEOUT_UNITS = {'': 1000, 'sec': 1000, 'ms': 1, 'min': 60000}
 _TIMEOUT_VALUE = re.compile(r'(\d+(?:\.\d+)?)\s*(ms|sec|min)?', re.IGNORECASE)
 
@@ -196,7 +207,14 @@ def _apply_parameters(
 ) -> ConnectArguments:
     unread = sorted(
         set(parameters)
-        - {'sdu', 'pool_connection_class', 'pool_purity', 'transport_connect_timeout'}
+        - {
+            'sdu',
+            'pool_connection_class',
+            'pool_purity',
+            'transport_connect_timeout',
+            'retry_count',
+            'retry_delay',
+        }
     )
     if unread:
         raise NotSupportedError(
@@ -221,6 +239,26 @@ def _apply_parameters(
         args = replace(
             args, timeout=_timeout_ms(dsn, parameters['transport_connect_timeout'])
         )
+    if 'retry_count' in parameters or 'retry_delay' in parameters:
+        # Retries of the one address Easy Connect names (#1983).
+        count = parameters.get('retry_count', '0')
+        delay = parameters.get('retry_delay', '1')
+        if not count.isdigit() or not _NUMBER.fullmatch(delay):
+            raise ProgrammingError(
+                f'dsn {dsn!r}: retry_count={count!r}, retry_delay={delay!r}'
+            )
+        address = Address(
+            args.host,
+            args.port,
+            'tcps' if args.ssl else 'tcp',
+            args.service_name,
+            args.sid,
+            args.server_type,
+        )
+        args = replace(
+            args,
+            route=Route((address,), retry_count=int(count), retry_delay=float(delay)),
+        )
     return args
 
 
@@ -233,7 +271,7 @@ def resolve_dsn_arguments(
     does, and keeps an ``ssl=`` configuration passed beside it. Its ``?``
     parameters set ``sdu``, ``cclass``, ``purity`` and ``timeout``."""
     info = parse_dsn(dsn, config_dir)
-    args = replace(args, host=info.host, port=info.port)
+    args = replace(args, host=info.host, port=info.port, route=info.route)
     if info.protocol == 'tcps' and not args.ssl:
         args = replace(args, ssl=True)
     if info.server_type is not None:
