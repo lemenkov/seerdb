@@ -32,6 +32,7 @@ from seerdb.server import PacketStream, serve_session
 psycopg = pytest.importorskip('psycopg')
 from psycopg.conninfo import make_conninfo  # noqa: E402
 
+from seerdb.server.accounts import _ACCOUNTS_READY  # noqa: E402
 from seerdb.server.backends.postgres import (  # noqa: E402
     _DICTIONARY_STAMP,
     _HELPER_FUNCTIONS_DDL,
@@ -2022,7 +2023,7 @@ def _per_user_mirror(
     from seerdb.server.backends import postgres as postgres_backend
 
     auth = f'{conninfo} application_name=auth1857'
-    postgres_backend._ACCOUNTS_READY.discard(auth)
+    _ACCOUNTS_READY.discard(auth)
     postgres_backend._USER_GROUP_READY.pop(conninfo, None)
     listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listen.bind(('127.0.0.1', 0))
@@ -7009,7 +7010,7 @@ class _NoConnPostgresBackend(PostgresBackend):
     # Skip the psycopg connect / orafce setup — change_password only touches the
     # credential map, so no live PostgreSQL is needed to test it.
     def __init__(self, credentials: dict) -> None:
-        from seerdb.server.backends.postgres import _AccountStore
+        from seerdb.server.accounts import _AccountStore
 
         self._credentials = credentials
         self._accounts = _AccountStore(credentials, None)
@@ -7441,7 +7442,6 @@ def test_accounts_in_an_auth_database_are_out_of_sql_reach() -> None:
     # the auth role: they survive the process's map, the launcher's accounts
     # seed it without overwriting a changed password, and a role without a
     # grant -- what a Mirror session should run as -- cannot read them (#879).
-    from seerdb.server.backends import postgres as postgres_backend
 
     admin = psycopg.connect(_CONNINFO, autocommit=True)
     dbname = admin.info.dbname
@@ -7455,7 +7455,7 @@ def test_accounts_in_an_auth_database_are_out_of_sql_reach() -> None:
             admin.execute(f'DROP ROLE IF EXISTS {role}')
             admin.execute(f"CREATE ROLE {role} LOGIN PASSWORD '{password}'")
         admin.execute(f'GRANT CREATE ON DATABASE "{dbname}" TO mirror_auth879')
-        postgres_backend._ACCOUNTS_READY.discard(auth)
+        _ACCOUNTS_READY.discard(auth)
         backend = PostgresBackend(
             _CONNINFO, credentials={'PYO': 'pyo123', 'SEED879': 's'}, auth_conninfo=auth
         )
@@ -7465,7 +7465,7 @@ def test_accounts_in_an_auth_database_are_out_of_sql_reach() -> None:
             backend.execute('CREATE USER db879 IDENTIFIED BY d')
         finally:
             backend.close()
-        postgres_backend._ACCOUNTS_READY.discard(auth)  # as a new process would
+        _ACCOUNTS_READY.discard(auth)  # as a new process would
         fresh = PostgresBackend(
             _CONNINFO, credentials={'PYO': 'pyo123', 'SEED879': 's'}, auth_conninfo=auth
         )

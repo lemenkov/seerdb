@@ -45,6 +45,14 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_REFCURSOR,
 )
 from seerdb.common.types import reset_decode_bc_dates, set_decode_bc_dates
+from seerdb.server.accounts import (
+    _ALTER_USER_PASSWORD,
+    _CREATE_USER_STATEMENT,
+    _DROP_USER_STATEMENT,
+    _AccountStore,
+    _password_text,
+    _user_name,
+)
 from seerdb.server.backend import (
     BackendError,
     BindVar,
@@ -135,6 +143,7 @@ class OraclePassthroughBackend:
         credentials: dict[str, str],
         field_version: int | None = None,
         tns_version: int | None = None,
+        auth_conninfo: str | None = None,
     ) -> None:
         # The Oracle release this passthrough presents to its own clients — set
         # it to match the target so the Mirror advertises what the real server
@@ -154,12 +163,16 @@ class OraclePassthroughBackend:
         for name in list(self._credentials):
             if name != name.upper():
                 self._credentials[name.upper()] = self._credentials.pop(name)
+        # Where the accounts live (#1703): that map, or with an auth database
+        # its seerdb_auth.accounts, as the PostgreSQL backend keeps them, so a
+        # user created or a password changed through the Mirror persists.
+        self._accounts = _AccountStore(self._credentials, auth_conninfo)
         self._conn: seerdb.OracleConnect | None = None
         self._username = ''
         self._password = ''
 
     def authenticate(self, username: str) -> str | None:
-        password = self._credentials.get(username.upper())
+        password = self._accounts.secret(username)
         if password is None:
             return None
         # The upstream connection is NOT opened here. It used to be, but the
@@ -656,6 +669,33 @@ class OraclePassthroughBackend:
 
     @_carries_bc_dates
     def execute(self, sql: str, binds: Sequence = ()) -> Result:
+        result = self._execute_upstream(sql, binds)
+        self._follow_accounts(sql)
+        return result
+
+    def _follow_accounts(self, sql: str) -> None:
+        # The upstream accepted a statement that changes an account: the
+        # Mirror's own record of the accounts follows it (#1703), so a user
+        # created through the Mirror can log in through it, a changed password
+        # is the one it checks, and a dropped user can no longer log in. The
+        # upstream is the authority; nothing it refused gets this far.
+        created = _CREATE_USER_STATEMENT.match(sql)
+        if created is not None and created.group(2) is not None:
+            self._accounts.set(
+                _user_name(created.group(1)), _password_text(created.group(2))
+            )
+            return
+        altered = _ALTER_USER_PASSWORD.match(sql)
+        if altered is not None:
+            self._accounts.set(
+                _user_name(altered.group(1)), _password_text(altered.group(2))
+            )
+            return
+        dropped = _DROP_USER_STATEMENT.match(sql)
+        if dropped is not None:
+            self._accounts.drop(_user_name(dropped.group(1)))
+
+    def _execute_upstream(self, sql: str, binds: Sequence = ()) -> Result:
         assert self._conn is not None  # authenticate() ran before any execute
         cursor = self._conn.cursor()
         binds = self._resolve_object_binds(binds)
@@ -995,7 +1035,7 @@ class OraclePassthroughBackend:
             self._conn.changepassword(old_password, new_password)
         except seerdb.DatabaseError as exc:
             raise _relay_error(exc) from exc
-        self._credentials[username.upper()] = new_password
+        self._accounts.set(username, new_password)
 
     # The client's attribute names for the end-to-end tracing slots the Mirror
     # hands over; client_info is spelled clientinfo on the connection.

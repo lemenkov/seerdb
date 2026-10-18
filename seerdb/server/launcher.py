@@ -243,6 +243,10 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         help="present this field version instead of probing the upstream's",
     )
+    passthrough.add_argument(
+        '--auth-conninfo',
+        help='keep the accounts in a PostgreSQL database, connecting as this role',
+    )
     commands.add_parser(
         'observe', help='log what a client puts on the wire (bring-up tool)'
     )
@@ -435,12 +439,31 @@ def build(
     if not upstream:
         raise SystemExit('passthrough needs an upstream host:port/service')
     up_host, up_port, service = _upstream(upstream)
-    if not credentials:
+    # Where the accounts live (#1703): the launcher's, or an auth database's.
+    pass_auth = (
+        option(getattr(args, 'auth_conninfo', None), backend, 'auth_conninfo', '')
+        or None
+    )
+    if not credentials and pass_auth is None:
         raise SystemExit(
-            'no accounts to serve: list them under [clients] or in MIRROR_USERS'
+            'no accounts to serve: list them under [clients] or in MIRROR_USERS, '
+            'or keep them in a database with --auth-conninfo'
         )
+    if pass_auth is not None:
+        try:
+            import psycopg  # noqa: F401
+        except ImportError:
+            raise SystemExit(
+                '--auth-conninfo needs psycopg: pip install "seerdb[mirror]"'
+            ) from None
     given = option(getattr(args, 'field_version', None), backend, 'field_version', '')
     field_version = int(given) if given else None
+    if field_version is None and not credentials:
+        # The version is probed with a configured account.
+        raise SystemExit(
+            'give --field-version, or an account in [clients] or MIRROR_USERS '
+            'for the Mirror to probe the upstream with'
+        )
 
     def passthrough_factory() -> Backend:
         from seerdb.server.backends.passthrough import OraclePassthroughBackend
@@ -451,6 +474,7 @@ def build(
             service=service,
             credentials=credentials,
             field_version=launch.field_version,
+            auth_conninfo=pass_auth,
         )
 
     launch = Launch(
