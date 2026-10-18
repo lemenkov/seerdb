@@ -16,6 +16,7 @@ import asyncio
 import os
 import shutil
 import socket
+import ssl
 import threading
 from collections.abc import Iterator
 
@@ -130,6 +131,53 @@ def test_a_client_that_does_not_speak_tls_is_dropped_and_the_mirror_serves_on(
         except ConnectionResetError:
             pass
     assert _select_dual(wallet) == ('X',)
+
+
+@pytest.fixture
+def tls_mirror() -> Iterator[seerdb.Server]:
+    # TLS without a client certificate: what a tcps:// dsn alone reaches.
+    server = seerdb.Server(
+        host='127.0.0.1',
+        port=0,
+        backend_factory=_DualBackend,
+        ssl_context=_tls_context(_CERT, _KEY, ''),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server
+    server.close()
+    thread.join(timeout=5)
+
+
+def test_a_tcps_dsn_runs_sql_over_tls(tls_mirror: seerdb.Server) -> None:
+    # tcps:// turns TLS on; an ssl= configuration beside it is kept (#1977).
+    conn = seerdb.connect(
+        user='PYO',
+        password='pyo123',
+        dsn=f'tcps://127.0.0.1:{tls_mirror.port}/XE',
+        ssl={'ca_certs': _CA, 'check_hostname': False},
+        timeout=5000,
+    )
+    try:
+        cur = conn.cursor()
+        cur.execute('select * from dual')
+        assert cur.fetchone() == ('X',)
+    finally:
+        conn.close()
+
+
+def test_a_tcps_dsn_alone_verifies_against_the_system_trust_store(
+    tls_mirror: seerdb.Server,
+) -> None:
+    # Without ssl=, tcps:// is ssl=True: the fixture CA is not trusted, so the
+    # handshake is refused -- it was attempted (#1977).
+    with pytest.raises(ssl.SSLCertVerificationError):
+        seerdb.connect(
+            user='PYO',
+            password='pyo123',
+            dsn=f'tcps://127.0.0.1:{tls_mirror.port}/XE',
+            timeout=5000,
+        )
 
 
 def test_the_launcher_builds_a_tls_context_from_its_options() -> None:
