@@ -413,9 +413,12 @@ So does a `tnsnames.ora` alias (`dsn="mydb"`), read from `config_dir=`, else
 `config_dir` is taken as a wallet location only when it holds `ewallet.pem` or
 `ewallet.p12`. A `tcps://` prefix, or `PROTOCOL=TCPS` in a descriptor or
 alias, turns TLS on as `ssl=True` does; an `ssl=` configuration passed beside it
-is kept. A descriptor with several addresses, or with a parameter seerdb does
-not act on yet (`RETRY_COUNT`, `SDU`, `SECURITY`, …), `?` parameters and
-`:server_type` are refused with `NotSupportedError` for now. python-oracledb
+is kept. A `:server_type` suffix (`dbhost/MYDB:pooled`) or `(SERVER=...)` in a
+descriptor sets `server_type`, which `connect()` also takes: `dedicated`,
+`shared` or `pooled`, the last asking for DRCP as `cclass`/`purity` do. A
+descriptor with several addresses, or with a parameter seerdb does not act on
+yet (`RETRY_COUNT`, `SDU`, `SECURITY`, …), and `?` parameters are refused with
+`NotSupportedError` for now. python-oracledb
 ignores descriptor parameters it does not know; seerdb refuses them by name.
 
 ## Quick start (async)

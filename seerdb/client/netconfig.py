@@ -196,6 +196,21 @@ class DescriptorTarget:
     service_name: str = ''
     sid: str = ''
     protocol: str = 'tcp'
+    server_type: str | None = None
+
+
+_SERVER_TYPES = frozenset({'dedicated', 'shared', 'pooled'})
+
+
+def server_type_value(value: str | None) -> str | None:
+    """A server type as the reference client writes it into (SERVER=...):
+    dedicated, shared or pooled, lower-cased; None for none (#1977)."""
+    if value is None:
+        return None
+    lowered = value.strip().lower()
+    if lowered not in _SERVER_TYPES:
+        raise ProgrammingError(f'invalid server_type: {value}')
+    return lowered
 
 
 # The keys read, at each level. CID only describes the client, which seerdb
@@ -204,7 +219,7 @@ class DescriptorTarget:
 # (RETRY_COUNT, SDU, SECURITY, ...), so dropping one would connect differently.
 _DESCRIPTION_KEYS = frozenset({'address', 'address_list', 'connect_data', 'failover'})
 _ADDRESS_KEYS = frozenset({'protocol', 'host', 'port'})
-_CONNECT_DATA_KEYS = frozenset({'service_name', 'sid', 'cid'})
+_CONNECT_DATA_KEYS = frozenset({'service_name', 'sid', 'cid', 'server'})
 _DEFAULT_PORT = 1521
 
 
@@ -285,6 +300,7 @@ def descriptor_target(name: str, value: Node) -> DescriptorTarget:
         raise NetConfigError(f'PORT={port!r} in the connect descriptor is not a number')
     connect_data = [v for k, v in description if k == 'connect_data']
     service_name = sid = ''
+    server_type = None
     if connect_data:
         data = _branch(connect_data[0], 'connect_data')
         _refuse_unread(data, _CONNECT_DATA_KEYS, 'CONNECT_DATA parameter')
@@ -292,7 +308,12 @@ def descriptor_target(name: str, value: Node) -> DescriptorTarget:
         service_name = found if isinstance(found, str) else ''
         found = _find_first(data, 'sid')
         sid = found if isinstance(found, str) else ''
-    return DescriptorTarget(host, port_number, service_name, sid, protocol)
+        found = _find_first(data, 'server')
+        if found is not None:
+            if not isinstance(found, str):
+                raise NetConfigError('SERVER in CONNECT_DATA must be a word')
+            server_type = server_type_value(found)
+    return DescriptorTarget(host, port_number, service_name, sid, protocol, server_type)
 
 
 # --------------------------------------------------------------------------- #
