@@ -504,6 +504,22 @@ def _tz_offset(zone: str) -> datetime.timedelta | None:
     return -offset if m.group(1) == '-' else offset
 
 
+def _session_zone_apart_from(
+    database: datetime.timedelta,
+) -> tuple[datetime.timedelta, str]:
+    """A session zone five hours from the database's, and its ALTER SESSION
+    spelling. With the two zones equal, an LTZ bind and a TIMESTAMP bind read
+    alike, and a test could not tell the database zone from the session's
+    (#1967)."""
+    shift = datetime.timedelta(
+        hours=5 if database <= datetime.timedelta(hours=9) else -5
+    )
+    zone = database + shift
+    minutes = int(zone.total_seconds()) // 60
+    sign = '-' if minutes < 0 else '+'
+    return zone, f'{sign}{abs(minutes) // 60:02d}:{abs(minutes) % 60:02d}'
+
+
 _LTZ_VALUE = datetime.datetime(2026, 9, 25, 13, 45, 6, 123456)
 _LTZ_TABLE_DDL = (
     'CREATE TABLE {} (k NUMBER, a TIMESTAMP WITH LOCAL TIME ZONE, '
@@ -2895,6 +2911,8 @@ class CursorIntegration(_IntegrationBase):
         (session, database) = (_tz_offset(z) for z in self.cur.fetchone())
         if session is None or database is None:
             self.skipTest('a named time zone')
+        (session, zone) = _session_zone_apart_from(database)
+        self.cur.execute(f"ALTER SESSION SET TIME_ZONE = '{zone}'")
         value = _LTZ_VALUE
         local = value - session + database
         self.cur.execute(_LTZ_TABLE_DDL.format(self.TABLE))
@@ -9909,6 +9927,8 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             (session, database) = (_tz_offset(z) for z in await Cur.fetchone())
             if session is None or database is None:
                 self.skipTest('a named time zone')
+            (session, zone) = _session_zone_apart_from(database)
+            await Cur.execute(f"ALTER SESSION SET TIME_ZONE = '{zone}'")
             value = _LTZ_VALUE
             local = value - session + database
             await self._drop_async(Cur, Table)
