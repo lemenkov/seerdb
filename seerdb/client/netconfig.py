@@ -11,8 +11,9 @@ read without the ``wallet`` extra; :mod:`seerdb.client.wallet` builds on them.
 from __future__ import annotations
 
 import os
+import random
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TypeAlias
 
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
@@ -197,6 +198,42 @@ class DescriptorTarget:
     sid: str = ''
     protocol: str = 'tcp'
     server_type: str | None = None
+    # Every address the descriptor names, when there are several or it asks for
+    # retries; the fields above are the first one's (#1983).
+    route: Route | None = None
+
+
+@dataclass(frozen=True)
+class Address:
+    """One address a connection can try, with the connect data it goes with."""
+
+    host: str
+    port: int
+    protocol: str = 'tcp'
+    service_name: str = ''
+    sid: str = ''
+    server_type: str | None = None
+
+
+@dataclass(frozen=True)
+class Route:
+    """The addresses a connection tries and how, as python-oracledb tries them
+    (#1983): in order; shuffled once per connect with LOAD_BALANCE; only the
+    first with FAILOVER off; the whole list again RETRY_COUNT times, RETRY_DELAY
+    seconds apart."""
+
+    addresses: tuple[Address, ...]
+    failover: bool = True
+    load_balance: bool = False
+    retry_count: int = 0
+    retry_delay: float = 1.0
+
+    def order(self) -> list[Address]:
+        # The addresses one round tries.
+        order = list(self.addresses)
+        if self.load_balance:
+            random.shuffle(order)
+        return order if self.failover else order[:1]
 
 
 _SERVER_TYPES = frozenset({'dedicated', 'shared', 'pooled'})
@@ -217,7 +254,16 @@ def server_type_value(value: str | None) -> str | None:
 # reports itself, and FAILOVER means nothing with one address. Anything else is
 # refused by name rather than ignored -- python-oracledb acts on most of them
 # (RETRY_COUNT, SDU, SECURITY, ...), so dropping one would connect differently.
-_DESCRIPTION_KEYS = frozenset({'address', 'address_list', 'connect_data', 'failover'})
+_ROUTE_KEYS = frozenset({'failover', 'load_balance'})
+_DESCRIPTION_LIST_KEYS = _ROUTE_KEYS | {'description'}
+_DESCRIPTION_KEYS = _ROUTE_KEYS | {
+    'address',
+    'address_list',
+    'connect_data',
+    'retry_count',
+    'retry_delay',
+}
+_ADDRESS_LIST_KEYS = _ROUTE_KEYS | {'address'}
 _ADDRESS_KEYS = frozenset({'protocol', 'host', 'port'})
 _CONNECT_DATA_KEYS = frozenset({'service_name', 'sid', 'cid', 'server'})
 _DEFAULT_PORT = 1521
@@ -250,39 +296,43 @@ def parse_descriptor(text: str) -> DescriptorTarget:
     return descriptor_target(name, value)
 
 
-def descriptor_target(name: str, value: Node) -> DescriptorTarget:
-    """What a parsed ``(NAME = VALUE)`` descriptor names; the checks of
-    :func:`parse_descriptor`, for a descriptor already read (a tnsnames alias)."""
-    if name == 'description_list':
-        descriptions = [v for k, v in _branch(value, name) if k == 'description']
-        if len(descriptions) != 1:
-            raise NotSupportedError(
-                'a DESCRIPTION_LIST of several descriptions is not supported yet (#1983)'
-            )
-        (name, value) = ('description', descriptions[0])
-    if name != 'description':
-        raise NetConfigError(
-            f'a connect descriptor opens with DESCRIPTION, not {name.upper()}'
-        )
-    description = _branch(value, name)
-    _refuse_unread(description, _DESCRIPTION_KEYS, 'DESCRIPTION parameter')
-    addresses: list[Node] = []
-    for key, child in description:
-        if key == 'address':
-            addresses.append(child)
-        elif key == 'address_list':
-            entries = _branch(child, key)
-            _refuse_unread(
-                entries, frozenset({'address', 'failover'}), 'ADDRESS_LIST parameter'
-            )
-            addresses.extend(v for k, v in entries if k == 'address')
-    if not addresses:
-        raise NetConfigError('the connect descriptor names no ADDRESS')
-    if len(addresses) > 1:
-        raise NotSupportedError(
-            'a connect descriptor with several addresses is not supported yet (#1983)'
-        )
-    address = _branch(addresses[0], 'address')
+def _on_off(value: Node, key: str) -> bool:
+    if isinstance(value, str) and value.strip().lower() in ('on', 'yes', 'true'):
+        return True
+    if isinstance(value, str) and value.strip().lower() in ('off', 'no', 'false'):
+        return False
+    raise NetConfigError(f'{key.upper()}={value!r} is not ON or OFF')
+
+
+def _number(value: Node, key: str) -> float:
+    try:
+        return float(value) if isinstance(value, str) else float('nan')
+    except ValueError:
+        return float('nan')
+
+
+@dataclass
+class _RouteOptions:
+    # What a descriptor's levels say about the route, as read.
+    failover: bool = True
+    load_balance: bool = False
+    retry_count: int | None = None
+    retry_delay: float | None = None
+
+
+def _route_options(entries: list[tuple[str, Node]], options: _RouteOptions) -> None:
+    # FAILOVER / LOAD_BALANCE at this level. Any level turning failover off, or
+    # load balancing on, decides it for the whole route -- coarser than Oracle
+    # Net's per-list nesting, which applies each to its own list only.
+    for key, value in entries:
+        if key == 'failover' and not _on_off(value, key):
+            options.failover = False
+        elif key == 'load_balance' and _on_off(value, key):
+            options.load_balance = True
+
+
+def _address(node: Node, data: Address) -> Address:
+    address = _branch(node, 'address')
     _refuse_unread(address, _ADDRESS_KEYS, 'ADDRESS parameter')
     found_protocol = _find_first(address, 'protocol')
     protocol = found_protocol.lower() if isinstance(found_protocol, str) else 'tcp'
@@ -298,6 +348,11 @@ def descriptor_target(name: str, value: Node) -> DescriptorTarget:
         port_number = int(port)
     else:
         raise NetConfigError(f'PORT={port!r} in the connect descriptor is not a number')
+    return replace(data, host=host, port=port_number, protocol=protocol)
+
+
+def _connect_data(description: list[tuple[str, Node]]) -> Address:
+    # The description's CONNECT_DATA, as an Address its addresses fill in.
     connect_data = [v for k, v in description if k == 'connect_data']
     service_name = sid = ''
     server_type = None
@@ -313,7 +368,73 @@ def descriptor_target(name: str, value: Node) -> DescriptorTarget:
             if not isinstance(found, str):
                 raise NetConfigError('SERVER in CONNECT_DATA must be a word')
             server_type = server_type_value(found)
-    return DescriptorTarget(host, port_number, service_name, sid, protocol, server_type)
+    return Address('', 0, 'tcp', service_name, sid, server_type)
+
+
+def descriptor_target(name: str, value: Node) -> DescriptorTarget:
+    """What a parsed ``(NAME = VALUE)`` descriptor names; the checks of
+    :func:`parse_descriptor`, for a descriptor already read (a tnsnames alias).
+
+    Every address is read, in order, across ADDRESS_LISTs and a
+    DESCRIPTION_LIST, each with its description's CONNECT_DATA (#1983)."""
+    options = _RouteOptions()
+    if name == 'description_list':
+        entries = _branch(value, name)
+        _refuse_unread(entries, _DESCRIPTION_LIST_KEYS, 'DESCRIPTION_LIST parameter')
+        _route_options(entries, options)
+        descriptions = [v for k, v in entries if k == 'description']
+    elif name == 'description':
+        descriptions = [value]
+    else:
+        raise NetConfigError(
+            f'a connect descriptor opens with DESCRIPTION, not {name.upper()}'
+        )
+    addresses: list[Address] = []
+    for node in descriptions:
+        description = _branch(node, 'description')
+        _refuse_unread(description, _DESCRIPTION_KEYS, 'DESCRIPTION parameter')
+        _route_options(description, options)
+        for key, child in description:
+            if key in ('retry_count', 'retry_delay'):
+                number = _number(child, key)
+                if not number >= 0:
+                    raise NetConfigError(f'{key.upper()}={child!r} is not a number')
+                if key == 'retry_count' and options.retry_count is None:
+                    options.retry_count = int(number)
+                elif key == 'retry_delay' and options.retry_delay is None:
+                    options.retry_delay = number
+        data = _connect_data(description)
+        for key, child in description:
+            if key == 'address':
+                addresses.append(_address(child, data))
+            elif key == 'address_list':
+                entries = _branch(child, key)
+                _refuse_unread(entries, _ADDRESS_LIST_KEYS, 'ADDRESS_LIST parameter')
+                _route_options(entries, options)
+                addresses.extend(
+                    _address(v, data) for k, v in entries if k == 'address'
+                )
+    if not addresses:
+        raise NetConfigError('the connect descriptor names no ADDRESS')
+    first = addresses[0]
+    route = None
+    if len(addresses) > 1 or options.retry_count:
+        route = Route(
+            tuple(addresses),
+            failover=options.failover,
+            load_balance=options.load_balance,
+            retry_count=options.retry_count or 0,
+            retry_delay=1.0 if options.retry_delay is None else options.retry_delay,
+        )
+    return DescriptorTarget(
+        first.host,
+        first.port,
+        first.service_name,
+        first.sid,
+        first.protocol,
+        first.server_type,
+        route,
+    )
 
 
 # --------------------------------------------------------------------------- #

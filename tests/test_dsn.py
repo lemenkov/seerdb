@@ -53,6 +53,7 @@ def _resolve(dsn, *positional, config_dir=None):
         'cclass': None,
         'purity': 0,
         'timeout': 15000,
+        'route': None,
     }
     given.update(zip(names, positional))
     resolved = resolve_dsn_arguments(dsn, ConnectArguments(**given), config_dir)
@@ -77,6 +78,7 @@ class Parameters(unittest.TestCase):
             'cclass': None,
             'purity': 0,
             'timeout': 15000,
+            'route': None,
             **given,
         }
         return resolve_dsn_arguments(dsn, ConnectArguments(**base))
@@ -116,7 +118,6 @@ class Parameters(unittest.TestCase):
 
     def test_the_rest_are_refused_by_name(self):
         for name in (
-            'retry_count',
             'https_proxy',
             'expire_time',
             'connect_timeout',
@@ -221,9 +222,6 @@ class ParseDescriptor(unittest.TestCase):
 
     def test_what_seerdb_would_have_to_act_on_is_refused_by_name(self):
         cases = {
-            f'(DESCRIPTION={_ADDR}{_ADDR}(CONNECT_DATA=(SERVICE_NAME=s)))': 'several',
-            f'(DESCRIPTION_LIST=(DESCRIPTION={_ADDR})(DESCRIPTION={_ADDR}))': 'several',
-            f'(DESCRIPTION=(RETRY_COUNT=3){_ADDR})': 'RETRY_COUNT',
             f'(DESCRIPTION={_ADDR}(SECURITY=(SSL_SERVER_DN_MATCH=yes)))': 'SECURITY',
             '(DESCRIPTION=(ADDRESS=(HOST=db)(HTTPS_PROXY=p)))': 'HTTPS_PROXY',
         }
