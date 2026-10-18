@@ -29,7 +29,7 @@ from seerdb.client.dialect import (
     Dialect,
     O8iDialect,
 )
-from seerdb.client.dsn import resolve_dsn_arguments
+from seerdb.client.dsn import ConnectArguments, resolve_dsn_arguments
 from seerdb.client.enums import TransactionPriority
 from seerdb.client.netconfig import holds_wallet, server_type_value
 from seerdb.common.crypto import validate
@@ -977,20 +977,34 @@ class OracleConnect(_ConnectionLogic):
             config_dir is not None and holds_wallet(config_dir)
         )
         if dsn is not None and not use_wallet:
-            (host, port, service_name, sid, user, password, ssl, server_type) = (
-                resolve_dsn_arguments(
-                    dsn,
-                    host,
-                    port,
-                    service_name,
-                    sid,
-                    user,
-                    password,
-                    config_dir,
-                    ssl,
-                    server_type,
-                )
+            given = ConnectArguments(
+                host,
+                port,
+                service_name,
+                sid,
+                user,
+                password,
+                ssl,
+                server_type,
+                sdu,
+                cclass,
+                purity,
+                timeout,
             )
+            (
+                host,
+                port,
+                service_name,
+                sid,
+                user,
+                password,
+                ssl,
+                server_type,
+                sdu,
+                cclass,
+                purity,
+                timeout,
+            ) = resolve_dsn_arguments(dsn, given, config_dir).as_tuple()
         # field_version is the highest TTC field version seerdb advertises;
         # the server negotiates it down (min(client, server)). The default is the
         # 23ai max (24), reached via fast-auth (#89) — older servers settle at

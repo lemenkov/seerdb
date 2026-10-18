@@ -27,10 +27,12 @@ suffix or (SERVER=...) in CONNECT_DATA sets the server type (#1977).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field, fields, replace
 
 from seerdb.client.netconfig import parse_descriptor, resolve_alias, server_type_value
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
+from seerdb.common.tns_consts import PURITY_DEFAULT, PURITY_NEW, PURITY_SELF
 
 _DEFAULT_PORT = 1521
 
@@ -47,6 +49,47 @@ class DsnTarget:
     sid: str = ''
     protocol: str = 'tcp'
     server_type: str | None = None
+    parameters: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ConnectArguments:
+    """The connect arguments a dsn can name, as passed and once it is applied."""
+
+    host: str
+    port: int
+    service_name: str
+    sid: str
+    user: str
+    password: str
+    ssl: object
+    server_type: str | None
+    sdu: int
+    cclass: str | None
+    purity: int
+    timeout: int
+
+    def as_tuple(self) -> tuple:
+        # In field order, for a constructor to unpack into its own arguments.
+        return tuple(getattr(self, f.name) for f in fields(self))
+
+
+def _parse_parameters(dsn: str, text: str) -> dict[str, str]:
+    # Easy Connect `?` parameters: name=value pairs joined by '&', the names
+    # case-insensitive, spaces around them free, a value optionally in double
+    # quotes, and a repeated name taking its last value -- python-oracledb's
+    # reading, measured (#1977).
+    parameters: dict[str, str] = {}
+    for item in text.split('&'):
+        (name, equals, value) = item.partition('=')
+        name = name.strip().lower()
+        if not name or not equals:
+            raise ProgrammingError(f'dsn {dsn!r}: {item.strip()!r} is not name=value')
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            value = value[1:-1]
+        parameters[name] = value
+    return parameters
 
 
 def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
@@ -84,8 +127,8 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
         if protocol not in ('tcp', 'tcps'):
             raise ProgrammingError(f'dsn {dsn!r}: {scheme!r} is not tcp or tcps')
         text = after
-    if '?' in text:
-        raise NotSupportedError(f'dsn {dsn!r}: "?" parameters are not supported yet')
+    (text, question, query) = text.partition('?')
+    parameters = _parse_parameters(dsn, query) if question else {}
     easy = text.startswith('//')  # only Easy Connect opens with '//'
     text = text.removeprefix('//')
     if text.startswith('['):
@@ -129,51 +172,82 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
     elif rest:
         raise ProgrammingError(f'dsn {dsn!r} is not [//]host[:port][/service_name]')
     return DsnTarget(
-        host, port, service_name, user, password, '', protocol, server_type
+        host, port, service_name, user, password, '', protocol, server_type, parameters
     )
+
+
+# The ? parameters with a seerdb argument, and how each value reads (#1977).
+_PURITIES = {'default': PURITY_DEFAULT, 'new': PURITY_NEW, 'self': PURITY_SELF}
+_TIMEOUT_UNITS = {'': 1000, 'sec': 1000, 'ms': 1, 'min': 60000}
+_TIMEOUT_VALUE = re.compile(r'(\d+(?:\.\d+)?)\s*(ms|sec|min)?', re.IGNORECASE)
+
+
+def _timeout_ms(dsn: str, value: str) -> int:
+    # transport_connect_timeout: seconds, or a number with ms / sec / min.
+    match = _TIMEOUT_VALUE.fullmatch(value)
+    if match is None:
+        raise ProgrammingError(f'dsn {dsn!r}: transport_connect_timeout={value!r}')
+    unit = _TIMEOUT_UNITS[(match.group(2) or '').lower()]
+    return round(float(match.group(1)) * unit)
+
+
+def _apply_parameters(
+    dsn: str, parameters: dict[str, str], args: ConnectArguments
+) -> ConnectArguments:
+    unread = sorted(
+        set(parameters)
+        - {'sdu', 'pool_connection_class', 'pool_purity', 'transport_connect_timeout'}
+    )
+    if unread:
+        raise NotSupportedError(
+            f'dsn {dsn!r}: the ? parameter {", ".join(unread)} is not supported yet'
+        )
+    if 'sdu' in parameters:
+        if not parameters['sdu'].isdigit():
+            raise ProgrammingError(
+                f'dsn {dsn!r}: sdu={parameters["sdu"]!r} is not a number'
+            )
+        args = replace(args, sdu=int(parameters['sdu']))
+    if 'pool_connection_class' in parameters:
+        args = replace(args, cclass=parameters['pool_connection_class'])
+    if 'pool_purity' in parameters:
+        purity = _PURITIES.get(parameters['pool_purity'].lower())
+        if purity is None:
+            raise ProgrammingError(
+                f'dsn {dsn!r}: pool_purity={parameters["pool_purity"]!r}'
+            )
+        args = replace(args, purity=purity)
+    if 'transport_connect_timeout' in parameters:
+        args = replace(
+            args, timeout=_timeout_ms(dsn, parameters['transport_connect_timeout'])
+        )
+    return args
 
 
 def resolve_dsn_arguments(
-    dsn: str,
-    host: str,
-    port: int,
-    service_name: str,
-    sid: str,
-    user: str,
-    password: str,
-    config_dir: str | None = None,
-    ssl: object = None,
-    server_type: str | None = None,
-) -> tuple[str, int, str, str, str, str, object, str | None]:
-    """The connect arguments once ``dsn`` is applied: the DSN wins over host,
-    port and service_name passed beside it, and supplies the credentials only
+    dsn: str, args: ConnectArguments, config_dir: str | None = None
+) -> ConnectArguments:
+    """The connect arguments once ``dsn`` is applied: what the DSN names wins
+    over the arguments passed beside it, and it supplies the credentials only
     when no ``user`` was passed. A TCPS address turns TLS on as ``ssl=True``
-    does, and keeps an ``ssl=`` configuration passed beside it; a server type
-    it names wins over ``server_type=``."""
+    does, and keeps an ``ssl=`` configuration passed beside it. Its ``?``
+    parameters set ``sdu``, ``cclass``, ``purity`` and ``timeout``."""
     info = parse_dsn(dsn, config_dir)
-    if info.protocol == 'tcps' and not ssl:
-        ssl = True
+    args = replace(args, host=info.host, port=info.port)
+    if info.protocol == 'tcps' and not args.ssl:
+        args = replace(args, ssl=True)
     if info.server_type is not None:
-        server_type = info.server_type
+        args = replace(args, server_type=info.server_type)
     if info.service_name:
-        service_name, sid = info.service_name, ''
+        args = replace(args, service_name=info.service_name, sid='')
     elif info.sid:
-        service_name, sid = '', info.sid
+        args = replace(args, service_name='', sid=info.sid)
     if info.user is not None:
-        if user:
+        if args.user:
             raise ProgrammingError(
                 f'dsn {dsn!r} carries a user name, and user= was passed too'
             )
-        user = info.user
+        args = replace(args, user=info.user)
         if info.password is not None:
-            password = info.password
-    return (
-        info.host,
-        info.port,
-        service_name,
-        sid,
-        user,
-        password,
-        ssl,
-        server_type,
-    )
+            args = replace(args, password=info.password)
+    return _apply_parameters(dsn, info.parameters, args)

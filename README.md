@@ -417,8 +417,12 @@ is kept. A `:server_type` suffix (`dbhost/MYDB:pooled`) or `(SERVER=...)` in a
 descriptor sets `server_type`, which `connect()` also takes: `dedicated`,
 `shared` or `pooled`, the last asking for DRCP as `cclass`/`purity` do. A
 descriptor with several addresses, or with a parameter seerdb does not act on
-yet (`RETRY_COUNT`, `SDU`, `SECURITY`, …), and `?` parameters are refused with
-`NotSupportedError` for now. python-oracledb
+yet (`RETRY_COUNT`, `SDU`, `SECURITY`, …) is refused with `NotSupportedError`
+for now. Of Easy Connect's `?` parameters, `sdu`, `pool_connection_class`
+(`cclass`), `pool_purity` (`new` / `self`) and `transport_connect_timeout`
+(seconds, or `ms` / `sec` / `min`; it sets `timeout`, which also bounds the
+login) are read and win over the arguments beside them; any other is refused by
+name, where python-oracledb ignores the ones it does not know. python-oracledb
 ignores descriptor parameters it does not know; seerdb refuses them by name.
 
 ## Quick start (async)
