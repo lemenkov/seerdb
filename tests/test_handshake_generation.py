@@ -50,13 +50,13 @@ DTY_REPLY = bytes.fromhex(
     'b60100b7b70100b800b900ba00bb00bc00bd00be00bf00c000c300c400c500d0d00100d100e7'
     'e70100e800e9e90100f10000'
 )
-PRO_REPLY_SQLPLUS = bytes.fromhex(
+ANO_REPLY_SQLPLUS = bytes.fromhex(
     '007f0000060000000000deadbeef0075000000000004000004000300000000000400050b2002'
     '0000020006001f000e0001deadbeef000300000002000400010001000200000000000400050b'
     '20020000020006fbff0002000200000000000400050b20020000010002000003000200000000'
     '000400050b2002000001000200'
 )
-DTY_REPLY_SQLPLUS = bytes.fromhex(
+PRO_REPLY_SQLPLUS = bytes.fromhex(
     '00ee00000600000000000106007838365f36342f4c696e757820322e342e7878006903010a00'
     '6603400301400366030166034803014803660301660352030152036603016603610301610366'
     '030166031f03081f0366030100640000006001240f050b0c030c0c0504050d06090708050505'
@@ -65,7 +65,7 @@ DTY_REPLY_SQLPLUS = bytes.fromhex(
     '27060101010f010106010101010101017fff030a030301007f017fff010601013f0103060001'
     '03020702010001180003'
 )
-TYPE_REPLY_SQLPLUS = bytes.fromhex(
+DTY_REPLY_SQLPLUS = bytes.fromhex(
     '001a000006000000000002800000003c3c3c800000000000000e'
 )
 
@@ -81,17 +81,17 @@ class TestHandshakeGeneration(unittest.TestCase):
 
     def test_caps_block_is_sqlplus_dty_reply(self):
         # the same capability block serves the sqlplus DTY reply (de-duped)
-        self.assertEqual(_framed(H.build_caps_block_reply()), DTY_REPLY_SQLPLUS)
-        self.assertEqual(PRO_REPLY, DTY_REPLY_SQLPLUS)
+        self.assertEqual(_framed(H.build_caps_block_reply()), PRO_REPLY_SQLPLUS)
+        self.assertEqual(PRO_REPLY, PRO_REPLY_SQLPLUS)
 
     def test_dty_type_reply(self):
         self.assertEqual(_framed(H.build_dty_type_reply()), DTY_REPLY)
 
     def test_pro_sqlplus_reply(self):
-        self.assertEqual(_framed(H.build_pro_sqlplus_reply()), PRO_REPLY_SQLPLUS)
+        self.assertEqual(_framed(H.build_ano_null_reply()), ANO_REPLY_SQLPLUS)
 
     def test_type_reply_sqlplus(self):
-        self.assertEqual(_framed(H.build_type_reply_sqlplus()), TYPE_REPLY_SQLPLUS)
+        self.assertEqual(_framed(H.build_oci_dty_reply()), DTY_REPLY_SQLPLUS)
 
     def test_banner_is_readable(self):
         self.assertIn(b'x86_64/Linux', H.build_caps_block_reply())

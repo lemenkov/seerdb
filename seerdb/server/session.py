@@ -265,13 +265,13 @@ from seerdb.server.handshake import (
     encode_ano_null_reply,
     encode_dty_reply,
     encode_fast_auth_reply,
+    encode_oci_dty_reply,
     encode_pro_reply,
-    encode_type_reply_sqlplus,
     is_ano_negotiation,
     negotiated_tns_version,
     oci_field_version,
+    opens_with_oci_ano,
     parse_connect,
-    pro_is_sqlplus,
     server_tns_version,
 )
 from seerdb.server.identity import IDENTITY_11_2, ServerIdentity, server_identity
@@ -561,11 +561,12 @@ def handle_login(
     if is_ano_negotiation(first):
         _negotiate_ano_server(stream, first, encryption)
         first = _expect(stream, TNS_DATA, 'PRO')
-    # A thin (oracledb/seerdb) client leads its PRO with TTI_PRO; classic
-    # sqlplus / thick OCI leads with the `deadbeef` magic and needs the matching
-    # reply dialect (#265). Decide on the PRO request and hold it for the DTY
-    # reply so both halves speak one dialect.
-    sqlplus = pro_is_sqlplus(first)
+    # A thin (oracledb/seerdb) client's first message is its PRO request, led by
+    # TTI_PRO. sqlplus / thick OCI opens with one more round, an ANO negotiation
+    # in a `deadbeef` container, and then sends the same PRO request and its own
+    # form of the data-type round (#265, §4.1.1). Each reply below answers the
+    # round it is named for.
+    sqlplus = opens_with_oci_ano(first)
     if sqlplus:
         # sqlplus is served without end-of-response, whatever the ACCEPT said.
         # A live 23ai marks its replies to sqlplus only on the fast-auth path
@@ -575,14 +576,17 @@ def handle_login(
         # -- and runs a whole session unmarked (#1822). Thin clients keep it:
         # they wait for the marker from the PRO answer on (#1059).
         stream.end_of_response = False
-    stream.send_raw(
-        encode_pro_reply(
-            sqlplus=sqlplus,
-            field_version=field_version,
-            txn_priority=_txn_priority_hooks(backend) is not None,
+    if sqlplus:
+        stream.send_raw(encode_ano_null_reply())  # its ANO round
+    else:
+        stream.send_raw(
+            encode_pro_reply(
+                field_version=field_version,
+                txn_priority=_txn_priority_hooks(backend) is not None,
+            )
         )
-    )
-    after_pro = _expect(stream, TNS_DATA, 'DTY')
+    # A thin client's DTY request, or sqlplus's PRO request.
+    after_pro = _expect(stream, TNS_DATA, 'PRO' if sqlplus else 'DTY')
     # The client has already picked min(its own, what the PRO reply advertised)
     # and put the result in this packet's capability block, so the session's real
     # version is readable here rather than assumed (#816). None for the fast-auth
@@ -624,20 +628,19 @@ def handle_login(
             raise InterfaceError('fast-auth bundle carried no OSESSKEY')
         osesskey = after_pro[offset:]
     else:
-        # Legacy: the packet just read is the DTY; answer it and read OSESSKEY next.
-        stream.send_raw(encode_dty_reply(sqlplus=sqlplus, field_version=field_version))
+        # Legacy: answer the packet just read -- a thin client's DTY request, or
+        # sqlplus's PRO request -- then, for sqlplus, its data-type round (a
+        # `ttc=02` request, no type table) before OSESSKEY (#265).
         if sqlplus:
-            # sqlplus / thick OCI runs a third data-type negotiation round after
-            # DTY (a `ttc=02` request) before it sends OSESSKEY; a thin client
-            # skips it (#265).
-            capabilities = _expect(stream, TNS_DATA, 'TYPE')
+            stream.send_raw(encode_pro_reply(oci=True, field_version=field_version))
+            capabilities = _expect(stream, TNS_DATA, 'DTY')
             stream.send_raw(
-                encode_type_reply_sqlplus(
+                encode_oci_dty_reply(
                     tz_file_version=client_sends_tz_file_version(capabilities)
                 )
             )
-            # That request is sqlplus's DTY proper (the round before it carries
-            # its TTI_PRO), so its capability block says what the client reads.
+            # sqlplus's data-type request carries the capability block that says
+            # what the client reads.
             # Which LOB column form: the one with the LOB's length and chunk
             # size, if it offered CCAP_LOB_12C (#1287).
             lob_caps = client_compile_cap(capabilities, CCAP_LOB) or 0
@@ -654,6 +657,8 @@ def handle_login(
                 field_version = negotiated = spoken
                 _DECODE_FIELD_VERSION.set(field_version)
                 _ENCODE_FIELD_VERSION.set(field_version)
+        else:
+            stream.send_raw(encode_dty_reply(field_version=field_version))
         osesskey = _expect_login_message(stream, 'OSESSKEY')
 
     # --- O5LOGON (§4) ---

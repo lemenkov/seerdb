@@ -187,7 +187,7 @@ def encode_ano(
     defaults to :data:`VERSION_11_2_0_2` (what a modern thin client sends). The classic
     sqlplus / thick-OCI null-negotiation reply stamps ``0x00000000`` here instead
     (its per-service versions stay :data:`VERSION_11_2_0_2`) — see the Mirror's
-    ``build_pro_sqlplus_reply``.
+    ``build_ano_null_reply``.
     """
     Body = b''.join(Services)
     Total = _HEADER_LEN + len(Body)

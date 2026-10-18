@@ -388,9 +388,9 @@ exact bytes live in `tests/handshake_11g.py`. This is what the Mirror server
 then the data-type round (§4.2.1), the O5LOGON auth rounds (§4) and the query.
 This is the sqlplus (OCI) client: it opens with an ANO round, which a thin client
 skips (its first DATA packet is the `TTI_PRO` request, and its PRO reply is the
-same 238 bytes). The Mirror's code still names these rounds one behind:
-`encode_pro_reply(sqlplus=True)` sends the ANO reply and `encode_dty_reply(sqlplus=True)`
-the PRO reply.
+same 238 bytes). The Mirror names its replies by these rounds:
+`encode_ano_null_reply`, `encode_pro_reply` (`oci=True` for sqlplus's form of the
+capability block) and `encode_oci_dty_reply` (#1979).
 
 **Auth lives with the backend.** O5LOGON is *mutual* — the server must itself
 know the client's secret to prove itself (it never sees the client's password,
@@ -593,14 +593,13 @@ both, and the data-type round in the form the client's flag asks for.
 thin client expects PRO fails to parse.
 
 seerdb's server (the Mirror) serves **both** clients (#265). `serve_login`
-inspects the first message — `pro_is_sqlplus` checks whether its TTC payload
-leads with the `deadbeef` magic — and its round names follow the thin client's
-order, so for sqlplus they run one behind: `encode_pro_reply(sqlplus=True)` sends
-the ANO reply (127 B), `encode_dty_reply(sqlplus=True)` the `TTI_PRO` reply
-(238 B, the same capability block a thin client gets), and
-`encode_type_reply_sqlplus` the data-type reply (§4.2.1). A thin client gets the
-`TTI_PRO` reply (238 B) and then the DTY reply (924 B). All of them are built so
-the client negotiates field version 6.
+inspects the first message — `opens_with_oci_ano` checks whether its TTC payload
+leads with the `deadbeef` magic — and answers each round with the reply named
+for it (#1979). sqlplus gets `encode_ano_null_reply` (127 B), then
+`encode_pro_reply(oci=True)` (238 B, the same capability block a thin client
+gets) and `encode_oci_dty_reply` for its data-type round (§4.2.1). A thin client
+gets `encode_pro_reply` (238 B) and then `encode_dty_reply` (924 B). All of them
+are built so the client negotiates field version 6.
 
 **The 127 B `deadbeef` reply is an ANO null-negotiation response** (#564). The
 name is not incidental: `0xDEADBEEF` is the ANO / Native Services container magic
@@ -609,7 +608,7 @@ server answers by selecting the *null* algorithm for every service, so no cipher
 or MAC is activated and the session stays plaintext. This is the byte-identical
 twin of the reply the thin ANO path (§33) replays as its null response — it *is*
 that response. The Mirror builds it field-by-field from the ANO codec
-(`build_pro_sqlplus_reply`), no longer a verbatim blob. Its 117 B TTC payload
+(`build_ano_null_reply`), no longer a verbatim blob. Its 117 B TTC payload
 decodes (via the project's own `decode_ano`) as a container plus four services:
 
 | Field | Value | Note |
@@ -641,8 +640,7 @@ message that follows:
 With no table, the server uses its native representations: the fixed 4-byte
 little-endian lengths and 8-byte pointer fields of §4.1.2. In place of the table,
 sqlplus sends the time-zone block, from 11.2 a ub4 timezone-file version, and the
-national charset. This is the "extra data-type round" below. In this dialect the
-Mirror's round names run one behind, so its "TYPE" round reads this message.
+national charset. This is sqlplus's data-type round, §4.2.1.
 
 #### 4.1.2 The deadbeef / OCI auth phase (server-side / the Mirror)
 
@@ -1018,13 +1016,12 @@ is the way to test it, since that is exactly what a real 12.1 client does.
 
 sqlplus / thick OCI's **data-type round** is its third, after ANO and PRO, and
 comes before it sends OSESSKEY. Its request carries encoding flag `02` and no
-type table (§4.1.1), and the Mirror's code calls it the "type" round, since it
-names the PRO round "DTY". The server answers
+type table (§4.1.1); the Mirror answers it with `encode_oci_dty_reply`. The server answers
 that third `ttc=02` request with a fixed **16-byte TTC payload** (a 26-byte DATA
 packet). Despite living outside the ordinary DTY exchange, it is an ordinary
 **data-type reply carrying the DB session time zone and the server's
 timezone-file version** (#565) — not an opaque blob. The Mirror builds it
-field-by-field (`build_type_reply_sqlplus`):
+field-by-field (`build_oci_dty_reply`):
 
 ```
 02                       TTI_DTY message code

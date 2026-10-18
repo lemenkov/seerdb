@@ -8,8 +8,9 @@ listener. These are the server->client bytes the Mirror server must reproduce,
 plus the client->server packets it must parse. Protocol version negotiated is
 0x013a = 314 (< 315), i.e. legacy 2-byte packet framing, no large SDU.
 
-Exchange: CONNECT -> RESEND -> CONNECT -> ACCEPT, then PRO and DTY as TTC DATA
-messages. See docs/PROTOCOL.md (server-side handshake).
+Exchange: CONNECT -> RESEND -> CONNECT -> ACCEPT, then sqlplus's ANO round and its
+PRO round as TTC DATA messages; its data-type round follows (§4.2.1). See
+docs/PROTOCOL.md §2.6 and §4.1.1.
 """
 
 # C2S: client CONNECT (connect descriptor)
@@ -27,8 +28,8 @@ ACCEPT = bytes.fromhex(
     '0020000002000000013a0c412000ffff01000000002041410000000000000000'
 )
 
-# C2S: protocol-negotiation (PRO) request
-PRO_CLIENT = bytes.fromhex(
+# C2S: ANO negotiation request, a `deadbeef` Native Services container (§33.2)
+ANO_CLIENT = bytes.fromhex(
     '00a10000060000000000deadbeef0097000000000004000004000300000000000400050b2004'
     '00000800010012527d9724a35b00120001deadbeef0003000000040004000100010002000100'
     '0300000000000400050b20040000020003e0e100020006fcff0002000300000000000400050b'
@@ -36,21 +37,21 @@ PRO_CLIENT = bytes.fromhex(
     '040000030001000301'
 )
 
-# S2C: PRO reply (server version banner)
-PRO_SERVER = bytes.fromhex(
+# S2C: ANO null-negotiation reply: no cipher, no checksum (§4.1.1)
+ANO_SERVER = bytes.fromhex(
     '007f0000060000000000deadbeef0075000000000004000004000300000000000400050b2002'
     '0000020006001f000e0001deadbeef000300000002000400010001000200000000000400050b'
     '20020000020006fbff0002000200000000000400050b20020000010002000003000200000000'
     '000400050b2002000001000200'
 )
 
-# C2S: data-type-negotiation (DTY) request
-DTY_CLIENT = bytes.fromhex(
+# C2S: TTI_PRO request: versions 06..00 and the platform (§4.1)
+PRO_CLIENT = bytes.fromhex(
     '0026000006000000000001060504030201007838365f36342f4c696e757820322e342e787800'
 )
 
-# S2C: DTY reply (server type capabilities)
-DTY_SERVER = bytes.fromhex(
+# S2C: TTI_PRO reply: version, banner, capability block (§4.1)
+PRO_SERVER = bytes.fromhex(
     '00ee00000600000000000106007838365f36342f4c696e757820322e342e7878006903010a00'
     '6603400301400366030166034803014803660301660352030152036603016603610301610366'
     '030166031f03081f0366030100640000006001240f050b0c030c0c0504050d06090708050505'
