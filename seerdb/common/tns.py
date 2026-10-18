@@ -4912,15 +4912,24 @@ def decode_token_oer(Data: bytes, Acc: tuple) -> tuple:
     (_, Rest) = decode_ub4(Rest)  # array elem error #2
     (CursorId, Rest) = decode_ub4(Rest)  # current cursor id
     (ErrorPos, Rest) = decode_ub4(Rest)  # error position (parse offset into the SQL)
-    # 6 single-byte fields: sql_type, fatal, flags, user_cursor_opts, upi_param,
-    # warn_flags. The LAST one is read: bit 0x20 says the statement created a
-    # PL/SQL object that compiled with errors -- the object exists, the call
+    # Six fields: sql_type, fatal, flags, user_cursor_opts, upi_param,
+    # warn_flags, each a single byte -- except that below 12.1 `flags` is a
+    # variable-length ub2: `00` when zero, `01 20` when a warning sets it, as
+    # an aggregate that skipped NULLs does. Read as one byte, 10g's and 11g's
+    # reply ended one byte early and everything after it was misread (#1995).
+    # The LAST field is read: bit 0x20 says the statement created a PL/SQL
+    # object that compiled with errors -- the object exists, the call
     # succeeded, and only this bit says anything is wrong (#993). Measured by
     # diffing a live 23ai's reply to the same CREATE compiled clean and broken:
     # the two are identical but for the sequence fields and this byte, 0x21
     # against 0x00.
-    WarnFlags = Rest[5] if len(Rest) > 5 else 0
-    Rest = Rest[6:]
+    Rest = Rest[2:]  # sql_type, fatal
+    if _DECODE_FIELD_VERSION.get() < FIELD_VERSION_12_1:
+        (_, Rest) = decode_ub4(Rest)  # flags, a ub2 before 12.1
+    else:
+        Rest = Rest[1:]  # flags
+    WarnFlags = Rest[2] if len(Rest) > 2 else 0
+    Rest = Rest[3:]  # user_cursor_opts, upi_param, warn_flags
     # rowid of the (last) row the statement touched — same physical-rowid
     # layout as a ROWID column (see _read_rowid_column): data object number,
     # relative file number, an unused byte, block number, slot number.
