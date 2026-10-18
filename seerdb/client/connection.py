@@ -29,6 +29,7 @@ from seerdb.client.dialect import (
     Dialect,
     O8iDialect,
 )
+from seerdb.client.dsn import resolve_dsn_arguments
 from seerdb.client.enums import TransactionPriority
 from seerdb.common.crypto import validate
 from seerdb.common.exceptions import (
@@ -966,6 +967,13 @@ class OracleConnect(_ConnectionLogic):
         # Sharding keys are an OCI-only routing capability (#164); accept the
         # oracledb-compatible parameters but reject them with NotSupportedError.
         _reject_sharding(shardingkey, supershardingkey)
+        # An Easy Connect dsn without a wallet names the address, and wins over
+        # host / port / service_name passed beside it, as in python-oracledb
+        # (#1972). With a wallet, dsn is a tnsnames alias (_apply_wallet).
+        if dsn is not None and wallet_location is None and config_dir is None:
+            (host, port, service_name, sid, user, password) = resolve_dsn_arguments(
+                dsn, host, port, service_name, sid, user, password
+            )
         # field_version is the highest TTC field version seerdb advertises;
         # the server negotiates it down (min(client, server)). The default is the
         # 23ai max (24), reached via fast-auth (#89) — older servers settle at
