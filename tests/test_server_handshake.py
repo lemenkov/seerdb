@@ -14,8 +14,8 @@ import pytest
 # The captured PRO/DTY replies now live as golden fixtures alongside the
 # generation test (the server module builds them from named pieces).
 from test_handshake_generation import (
+    ANO_REPLY_SQLPLUS,
     DTY_REPLY,
-    DTY_REPLY_SQLPLUS,
     PRO_REPLY,
     PRO_REPLY_SQLPLUS,
 )
@@ -46,11 +46,13 @@ from seerdb.server.handshake import (
     TNS_VERSION_23_1,
     connect_data_follows,
     encode_accept,
+    encode_ano_null_reply,
     encode_dty_reply,
+    encode_oci_dty_reply,
     encode_pro_reply,
     negotiated_tns_version,
+    opens_with_oci_ano,
     parse_connect,
-    pro_is_sqlplus,
     server_tns_version,
 )
 
@@ -201,7 +203,7 @@ def test_pro_reply_field_version_is_negotiable() -> None:
 
 def _read_packet_body(raw: bytes) -> tuple[int, bytes]:
     # Drive raw wire bytes through the real PacketStream.read_packet, so the body
-    # is exactly what the serve loop feeds pro_is_sqlplus (header + data-flags
+    # is exactly what the serve loop feeds opens_with_oci_ano (header + data-flags
     # stripped) — not a hand-sliced approximation.
     import socket
 
@@ -219,43 +221,43 @@ def _read_packet_body(raw: bytes) -> tuple[int, bytes]:
         b.close()
 
 
-def test_pro_is_sqlplus_detects_the_deadbeef_dialect() -> None:
+def test_opens_with_oci_ano_detects_the_deadbeef_round() -> None:
     # Run the captured sqlplus PRO through read_packet — the exact path a live
     # client exercises. read_packet strips the 8-byte header AND the 2-byte
     # data-flags, so the deadbeef magic must be at the very start of the body.
-    # (Feeding a hand-sliced PRO_CLIENT[8:] hid an off-by-two here; a live
+    # (Feeding a hand-sliced ANO_CLIENT[8:] hid an off-by-two here; a live
     # sqlplus 11.2 caught it — #265.)
-    typ, body = _read_packet_body(fx.PRO_CLIENT)
+    typ, body = _read_packet_body(fx.ANO_CLIENT)
     assert typ == TNS_DATA
-    assert pro_is_sqlplus(body) is True
+    assert opens_with_oci_ano(body) is True
 
     # A thin (TTI_PRO) PRO through the same path is not the sqlplus dialect.
     thin_raw = struct.pack('>HHBBH', 8 + 2 + 8, 0, TNS_DATA, 0, 0)
     thin_raw += b'\x00\x00' + bytes([TTI_PRO, 6, 5, 4, 3, 2, 1, 0])
     _typ, thin_body = _read_packet_body(thin_raw)
-    assert pro_is_sqlplus(thin_body) is False
+    assert opens_with_oci_ano(thin_body) is False
+
+
+def test_sqlplus_ano_reply_reproduces_the_captured_packet() -> None:
+    # Re-wrapping the stored deadbeef payload reproduces the real server's reply
+    # to sqlplus's ANO round (127B) exactly.
+    assert encode_ano_null_reply() == fx.ANO_SERVER
+    assert ANO_REPLY_SQLPLUS == fx.ANO_SERVER
 
 
 def test_sqlplus_pro_reply_reproduces_the_captured_packet() -> None:
-    # Re-wrapping the stored deadbeef payload reproduces the real sqlplus-dialect
-    # server PRO packet (127B) exactly.
-    assert encode_pro_reply(sqlplus=True) == fx.PRO_SERVER
+    assert encode_pro_reply(oci=True) == fx.PRO_SERVER
     assert PRO_REPLY_SQLPLUS == fx.PRO_SERVER
 
 
 def test_sqlplus_dty_reply_reproduces_the_captured_packet() -> None:
-    assert encode_dty_reply(sqlplus=True) == fx.DTY_SERVER
-    assert DTY_REPLY_SQLPLUS == fx.DTY_SERVER
-
-
-def test_sqlplus_type_reply_reproduces_the_captured_packet() -> None:
-    # The deadbeef dialect's third round: the built ttc=02 reply reproduces the
+    # sqlplus's data-type round, its third: the built ttc=02 reply reproduces the
     # real server packet (#265).
-    from test_handshake_generation import TYPE_REPLY_SQLPLUS
+    from test_handshake_generation import DTY_REPLY_SQLPLUS
 
-    from seerdb.server.handshake import encode_type_reply_sqlplus
+    from seerdb.server.handshake import encode_oci_dty_reply
 
-    assert encode_type_reply_sqlplus() == TYPE_REPLY_SQLPLUS
+    assert encode_oci_dty_reply() == DTY_REPLY_SQLPLUS
 
 
 # sqlplus's type request (the ttc=02 round) and what the server answered, from
@@ -276,18 +278,16 @@ def test_the_type_reply_carries_a_tz_file_version_only_if_the_request_did() -> N
     # server leaves it out of the reply; the 4 bytes it does not expect drew a
     # break (#1764). sqlplus 11.2 sends one and gets one.
     from seerdb.server.handshake import (
-        build_type_reply_sqlplus,
+        build_oci_dty_reply,
         client_sends_tz_file_version,
     )
 
     assert not client_sends_tz_file_version(_TYPE_REQUEST_SQLPLUS_10_2)
     assert client_sends_tz_file_version(_TYPE_REQUEST_SQLPLUS_11_2)
-    assert build_type_reply_sqlplus(tz_file_version=False) == bytes.fromhex(
+    assert build_oci_dty_reply(tz_file_version=False) == bytes.fromhex(
         '02800000003c3c3c80000000'
     )
-    assert build_type_reply_sqlplus() == bytes.fromhex(
-        '02800000003c3c3c800000000000000e'
-    )
+    assert build_oci_dty_reply() == bytes.fromhex('02800000003c3c3c800000000000000e')
     # Nothing readable keeps the form every client got before.
     assert client_sends_tz_file_version(b'')
     assert client_sends_tz_file_version(b'\x02\x69')
@@ -296,8 +296,8 @@ def test_the_type_reply_carries_a_tz_file_version_only_if_the_request_did() -> N
 def test_dialects_are_distinct() -> None:
     # The two dialects' replies are genuinely different shapes (238/924 vs
     # 127/238), so serving the wrong one would break the handshake.
-    assert encode_pro_reply(sqlplus=True) != encode_pro_reply(sqlplus=False)
-    assert encode_dty_reply(sqlplus=True) != encode_dty_reply(sqlplus=False)
+    assert encode_ano_null_reply() != encode_pro_reply()
+    assert encode_oci_dty_reply() != encode_dty_reply()
 
 
 def test_too_short_raises() -> None:

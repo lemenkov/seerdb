@@ -41,5 +41,5 @@ def test_accept_is_version_314_legacy_framing() -> None:
 
 def test_pro_and_dty_are_ttc_data_messages() -> None:
     # On 11g these are DATA-framed, not distinct TNS packet types.
-    for packet in (fx.PRO_CLIENT, fx.PRO_SERVER, fx.DTY_CLIENT, fx.DTY_SERVER):
+    for packet in (fx.ANO_CLIENT, fx.ANO_SERVER, fx.PRO_CLIENT, fx.PRO_SERVER):
         assert _packet_type(packet) == TNS_DATA

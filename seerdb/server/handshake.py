@@ -190,18 +190,19 @@ _ACCEPT_CONN_ID_LEN = 16
 # that request in the matching `deadbeef` dialect (#265).
 
 
-def pro_is_sqlplus(pro_body: bytes) -> bool:
-    """Whether a PRO request is the classic sqlplus/thick `deadbeef` dialect
-    (vs the oracledb/seerdb ``TTI_PRO`` dialect, which leads with the TTI_PRO
-    ``0x01`` token).
+def opens_with_oci_ano(first: bytes) -> bool:
+    """Whether a client's first DATA message is sqlplus / thick OCI's ANO
+    negotiation, the ``deadbeef`` container it opens with before its PRO
+    request (§4.1.1). A thin client opens with the PRO request itself, led by
+    the ``TTI_PRO`` ``0x01`` token.
 
-    ``pro_body`` is what :meth:`PacketStream.read_packet` yields for the PRO
+    ``first`` is what :meth:`PacketStream.read_packet` yields for the PRO
     ``TNS_DATA``: the TTC payload with **both** the 8-byte TNS header and the
     2-byte data-flags already stripped (``read_packet`` returns ``packet[10:]``
     for a DATA packet), so the magic sits at the very start — verified against a
     live sqlplus 11.2, which is exactly where a wrong offset misfires (#265).
     """
-    return pro_body[:4] == ano.ANO_MAGIC_BYTES
+    return first[:4] == ano.ANO_MAGIC_BYTES
 
 
 _SERVICE_RE = re.compile(rb'\(SERVICE_NAME\s*=\s*([^)\s]+)', re.IGNORECASE)
@@ -489,7 +490,7 @@ def build_dty_type_reply(field_version: int = FIELD_VERSION_11_2) -> bytes:
     return bytes([TTI_DTY]) + table
 
 
-def build_pro_sqlplus_reply() -> bytes:
+def build_ano_null_reply() -> bytes:
     """The sqlplus/deadbeef PRO reply payload — an ANO null-negotiation response
     (§4.1.1), built field-by-field from the ANO codec (#564).
 
@@ -524,7 +525,7 @@ def build_pro_sqlplus_reply() -> bytes:
     return ano.encode_ano(services, ContainerVersion=_DEADBEEF_CONTAINER_VERSION)
 
 
-def build_type_reply_sqlplus(*, tz_file_version: bool = True) -> bytes:
+def build_oci_dty_reply(*, tz_file_version: bool = True) -> bytes:
     """The deadbeef dialect's third-round type reply payload (#265, #565).
 
     A DTY (data-type negotiation) reply carrying the server's DB session time zone
@@ -559,10 +560,10 @@ def encode_ano_null_reply(*, sdu: int = DEFAULT_SDU) -> bytes:
 
     Replays the real 11g server's response to a modern client's ANO request:
     every service selects the null algorithm, so no cipher/MAC is activated and
-    the session stays plaintext. (These are the same bytes the sqlplus/OCI path
-    replays as its first `deadbeef` reply — it *is* the ANO response.)
+    the session stays plaintext. sqlplus / thick OCI opens with an ANO round too,
+    and gets these same bytes as its first reply (§4.1.1).
     """
-    packet, _ = encode_packet(TNS_DATA, build_pro_sqlplus_reply(), sdu)
+    packet, _ = encode_packet(TNS_DATA, build_ano_null_reply(), sdu)
     return packet
 
 
@@ -585,60 +586,46 @@ def encode_fast_auth_reply(
 
 def encode_pro_reply(
     *,
-    sqlplus: bool = False,
+    oci: bool = False,
     sdu: int = DEFAULT_SDU,
     field_version: int = FIELD_VERSION_11_2,
     txn_priority: bool = False,
 ) -> bytes:
     """Build the server's PRO (protocol negotiation) reply — §4.1.
 
-    Reproduces the real 11g server's PRO reply, whose capability array pins the
-    negotiated field version to 6. ``sqlplus`` selects the classic
-    ``deadbeef`` dialect (127B) over the oracledb/seerdb ``TTI_PRO`` dialect
-    (238B); pass whatever :func:`pro_is_sqlplus` reported for the request.
-    Returns the full TNS_DATA packet.
+    The ``TTI_PRO`` reply both kinds of client get, 238 bytes against an 11g
+    capture: its capability array pins the negotiated field version. ``oci``
+    builds sqlplus / thick OCI's form of the same block. Returns the full
+    TNS_DATA packet.
     """
-    payload = (
-        build_pro_sqlplus_reply()
-        if sqlplus
-        else build_caps_block_reply(field_version, txn_priority=txn_priority)
-    )
+    payload = build_caps_block_reply(field_version, txn_priority=txn_priority, oci=oci)
     packet, _ = encode_packet(TNS_DATA, payload, sdu)
     return packet
 
 
 def encode_dty_reply(
     *,
-    sqlplus: bool = False,
     sdu: int = DEFAULT_SDU,
     field_version: int = FIELD_VERSION_11_2,
 ) -> bytes:
-    """Build the server's DTY (data-type negotiation) reply — §4.2.
-
-    Reproduces the real 11g server's DTY reply as a full TNS_DATA packet.
-    ``sqlplus`` selects the ``deadbeef`` dialect (238B — the same capability
-    block as the thin PRO reply) over the oracledb/seerdb dialect (924B
-    type-conversion table); use the same value the PRO reply used so both halves
-    of the handshake speak one dialect.
+    """Build the server's DTY (data-type negotiation) reply to a thin client —
+    §4.2: the type-conversion table, 924 bytes against an 11g capture. sqlplus /
+    thick OCI asks without a table and gets :func:`encode_oci_dty_reply`.
+    Returns the full TNS_DATA packet.
     """
-    payload = (
-        build_caps_block_reply(field_version, oci=True)
-        if sqlplus
-        else build_dty_type_reply(field_version)
-    )
-    packet, _ = encode_packet(TNS_DATA, payload, sdu)
+    packet, _ = encode_packet(TNS_DATA, build_dty_type_reply(field_version), sdu)
     return packet
 
 
-def encode_type_reply_sqlplus(
+def encode_oci_dty_reply(
     *, sdu: int = DEFAULT_SDU, tz_file_version: bool = True
 ) -> bytes:
-    """Build the deadbeef dialect's third-round data-type reply — the 26-byte
-    ``ttc=02`` confirmation sqlplus/thick OCI expects after PRO and DTY, before
-    it sends OSESSKEY (#265), 22 bytes without the timezone-file version
-    (#1764). Thin clients skip this round. Full TNS_DATA packet.
+    """Build sqlplus / thick OCI's data-type reply (§4.2.1) — the 26-byte
+    ``ttc=02`` answer to its data-type round, its third after ANO and PRO and
+    before OSESSKEY (#265); 22 bytes without the timezone-file version (#1764).
+    Full TNS_DATA packet.
     """
-    payload = build_type_reply_sqlplus(tz_file_version=tz_file_version)
+    payload = build_oci_dty_reply(tz_file_version=tz_file_version)
     packet, _ = encode_packet(TNS_DATA, payload, sdu)
     return packet
 
