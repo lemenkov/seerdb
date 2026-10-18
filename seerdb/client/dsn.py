@@ -19,17 +19,17 @@ the string names wins over ``host`` / ``port`` / ``service_name`` passed beside
 it, as it does in python-oracledb. A bare word is a tnsnames alias, read from
 ``config_dir``, ``TNS_ADMIN`` or ``$ORACLE_HOME/network/admin``
 (:func:`seerdb.client.netconfig.resolve_alias`). A form seerdb does not read
-yet -- ``?`` parameters, a ``:server_type``, or a descriptor parameter seerdb
-does not act on -- raises NotSupportedError naming it, rather than being
-ignored. A ``tcps://`` prefix, or PROTOCOL=TCPS in a descriptor, turns TLS on
-(#1977).
+yet -- ``?`` parameters, or a descriptor parameter seerdb does not act on --
+raises NotSupportedError naming it, rather than being ignored. A ``tcps://``
+prefix, or PROTOCOL=TCPS in a descriptor, turns TLS on, and a ``:server_type``
+suffix or (SERVER=...) in CONNECT_DATA sets the server type (#1977).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from seerdb.client.netconfig import parse_descriptor, resolve_alias
+from seerdb.client.netconfig import parse_descriptor, resolve_alias, server_type_value
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
 
 _DEFAULT_PORT = 1521
@@ -46,6 +46,7 @@ class DsnTarget:
     password: str | None = None
     sid: str = ''
     protocol: str = 'tcp'
+    server_type: str | None = None
 
 
 def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
@@ -74,6 +75,7 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
             password,
             found.sid,
             found.protocol,
+            found.server_type,
         )
     protocol = 'tcp'
     scheme, separator, after = text.partition('://')
@@ -109,6 +111,7 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
             password,
             found.sid,
             found.protocol,
+            found.server_type,
         )
     port = _DEFAULT_PORT
     if rest.startswith(':'):
@@ -118,15 +121,16 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
         port = int(digits)
         rest = slash + after
     service_name = ''
+    server_type = None
     if rest.startswith('/'):
-        service_name = rest[1:]
-        if ':' in service_name:
-            raise NotSupportedError(
-                f'dsn {dsn!r}: a ":server_type" is not supported yet'
-            )
+        (service_name, colon, kind) = rest[1:].partition(':')
+        if colon:
+            server_type = server_type_value(kind)
     elif rest:
         raise ProgrammingError(f'dsn {dsn!r} is not [//]host[:port][/service_name]')
-    return DsnTarget(host, port, service_name, user, password, '', protocol)
+    return DsnTarget(
+        host, port, service_name, user, password, '', protocol, server_type
+    )
 
 
 def resolve_dsn_arguments(
@@ -139,14 +143,18 @@ def resolve_dsn_arguments(
     password: str,
     config_dir: str | None = None,
     ssl: object = None,
-) -> tuple[str, int, str, str, str, str, object]:
+    server_type: str | None = None,
+) -> tuple[str, int, str, str, str, str, object, str | None]:
     """The connect arguments once ``dsn`` is applied: the DSN wins over host,
     port and service_name passed beside it, and supplies the credentials only
     when no ``user`` was passed. A TCPS address turns TLS on as ``ssl=True``
-    does, and keeps an ``ssl=`` configuration passed beside it."""
+    does, and keeps an ``ssl=`` configuration passed beside it; a server type
+    it names wins over ``server_type=``."""
     info = parse_dsn(dsn, config_dir)
     if info.protocol == 'tcps' and not ssl:
         ssl = True
+    if info.server_type is not None:
+        server_type = info.server_type
     if info.service_name:
         service_name, sid = info.service_name, ''
     elif info.sid:
@@ -159,4 +167,13 @@ def resolve_dsn_arguments(
         user = info.user
         if info.password is not None:
             password = info.password
-    return info.host, info.port, service_name, sid, user, password, ssl
+    return (
+        info.host,
+        info.port,
+        service_name,
+        sid,
+        user,
+        password,
+        ssl,
+        server_type,
+    )

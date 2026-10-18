@@ -64,7 +64,7 @@ from seerdb.client.dialect import (
 )
 from seerdb.client.dsn import resolve_dsn_arguments
 from seerdb.client.enums import TransactionPriority
-from seerdb.client.netconfig import holds_wallet
+from seerdb.client.netconfig import holds_wallet, server_type_value
 from seerdb.common.crypto import validate
 from seerdb.common.exceptions import (
     DatabaseError,
@@ -198,6 +198,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         field_version: int = FIELD_VERSION_23_4,
         cclass: str | None = None,
         purity: int = PURITY_DEFAULT,
+        server_type: str | None = None,
         wallet_location: str | None = None,
         wallet_password: str | None = None,
         config_dir: str | None = None,
@@ -220,9 +221,18 @@ class AsyncOracleConnect(_ConnectionLogic):
             config_dir is not None and holds_wallet(config_dir)
         )
         if dsn is not None and not use_wallet:
-            (host, port, service_name, sid, user, password, ssl) = (
+            (host, port, service_name, sid, user, password, ssl, server_type) = (
                 resolve_dsn_arguments(
-                    dsn, host, port, service_name, sid, user, password, config_dir, ssl
+                    dsn,
+                    host,
+                    port,
+                    service_name,
+                    sid,
+                    user,
+                    password,
+                    config_dir,
+                    ssl,
+                    server_type,
                 )
             )
         # Negotiation cache (#438): opt-in reconnect optimization, sharing the
@@ -238,6 +248,9 @@ class AsyncOracleConnect(_ConnectionLogic):
         (self.user, self.proxy_user) = _split_proxy_user(user)
         self.cclass = cclass  # DRCP (#130)
         self.purity = purity
+        # dedicated / shared / pooled, written into (SERVER=...); pooled also asks
+        # for DRCP, as in python-oracledb (#1977).
+        self.server_type = server_type_value(server_type)
         self.password = password
         self.sid = sid
         self.service_name = service_name

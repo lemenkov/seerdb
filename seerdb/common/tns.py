@@ -6167,7 +6167,10 @@ def encode_dictionary_auth(Dictionary: dict) -> tuple[bytes, bytes]:
     # python-oracledb). cclass -> AUTH_KPPL_CONN_CLASS, purity -> AUTH_KPPL_PURITY.
     CClass = Dictionary['env'].get('cclass')
     Purity = Dictionary['env'].get('purity', 0) or 0
-    if (CClass or Purity) and Purity == 0:
+    # server_type='pooled' asks for DRCP too, with no class or purity: the
+    # reference client then sends AUTH_KPPL_PURITY = NEW alone (#1977).
+    Pooled = Dictionary['env'].get('server_type') == 'pooled'
+    if (CClass or Purity or Pooled) and Purity == 0:
         Purity = 1  # PURITY_NEW
     CClassKv = (
         encode_kv(b'AUTH_KPPL_CONN_CLASS', CClass.encode('utf-8')) if CClass else b''
@@ -6892,13 +6895,17 @@ def encode_dictionary_description(Dictionary: dict) -> bytes:
         else b'SERVICE_NAME=' + ServiceName.encode('utf-8')
     )
     Proto = b'TCP' if SslOpts is None else b'TCPS'
-    # DRCP (#130): a connection class or non-default purity requests a pooled
-    # server from the connection broker via (SERVER=POOLED) in the CONNECT_DATA.
-    Drcp = (
-        b'(SERVER=POOLED)'
-        if (Dictionary['env'].get('cclass') or Dictionary['env'].get('purity'))
-        else b''
-    )
+    # The server type the caller asked for, written as the reference client
+    # writes it, (SERVER=dedicated|shared|pooled) (#1977). Without one, DRCP
+    # (#130) -- a connection class or non-default purity -- requests a pooled
+    # server from the connection broker via (SERVER=POOLED).
+    ServerType = Dictionary['env'].get('server_type')
+    if ServerType:
+        Drcp = b'(SERVER=' + ServerType.encode('ascii') + b')'
+    elif Dictionary['env'].get('cclass') or Dictionary['env'].get('purity'):
+        Drcp = b'(SERVER=POOLED)'
+    else:
+        Drcp = b''
     return (
         b'(DESCRIPTION=(CONNECT_DATA=('
         + Sn

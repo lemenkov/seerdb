@@ -44,10 +44,7 @@ class ParseDsn(unittest.TestCase):
                 self.assertEqual(parse_dsn(dsn), expected)
 
     def test_a_form_not_read_yet_is_refused_not_dropped(self):
-        for dsn in (
-            'db:1523/FREEPDB1?connect_timeout=2',
-            'db:1523/FREEPDB1:dedicated',
-        ):
+        for dsn in ('db:1523/FREEPDB1?connect_timeout=2',):
             with self.subTest(dsn=dsn), self.assertRaises(NotSupportedError) as ctx:
                 parse_dsn(dsn)
             self.assertIn(dsn, str(ctx.exception))
@@ -106,9 +103,6 @@ class ParseDescriptor(unittest.TestCase):
             f'(DESCRIPTION_LIST=(DESCRIPTION={_ADDR})(DESCRIPTION={_ADDR}))': 'several',
             f'(DESCRIPTION=(RETRY_COUNT=3){_ADDR})': 'RETRY_COUNT',
             f'(DESCRIPTION={_ADDR}(SECURITY=(SSL_SERVER_DN_MATCH=yes)))': 'SECURITY',
-            f'(DESCRIPTION={_ADDR}(CONNECT_DATA=(SERVICE_NAME=s)(SERVER=DEDICATED)))': (
-                'SERVER'
-            ),
             '(DESCRIPTION=(ADDRESS=(HOST=db)(HTTPS_PROXY=p)))': 'HTTPS_PROXY',
         }
         for dsn, named in cases.items():
@@ -139,7 +133,7 @@ class ParseDescriptor(unittest.TestCase):
                 'u',
                 'p',
             ),
-            ('db', 1523, '', 'ORCL', 'u', 'p', None),
+            ('db', 1523, '', 'ORCL', 'u', 'p', None, None),
         )
 
 
@@ -257,11 +251,11 @@ class Tcps(unittest.TestCase):
 
     def test_tcps_turns_tls_on_and_keeps_a_configuration_passed(self):
         args = ('localhost', 1521, '', '', 'u', 'p', None)
-        self.assertIs(resolve_dsn_arguments('tcps://db:2484/svc', *args)[-1], True)
-        self.assertIsNone(resolve_dsn_arguments('tcp://db:1521/svc', *args)[-1])
+        self.assertIs(resolve_dsn_arguments('tcps://db:2484/svc', *args)[6], True)
+        self.assertIsNone(resolve_dsn_arguments('tcp://db:1521/svc', *args)[6])
         config = {'ca_certs': '/ca.pem'}
         self.assertIs(
-            resolve_dsn_arguments('tcps://db/svc', *args[:-1], None, config)[-1], config
+            resolve_dsn_arguments('tcps://db/svc', *args[:-1], None, config)[6], config
         )
 
     def test_both_connection_classes_turn_tls_on(self):
@@ -271,11 +265,50 @@ class Tcps(unittest.TestCase):
                 self.assertEqual((conn.host, conn.port, conn.ssl), ('db', 2484, True))
 
 
+class ServerType(unittest.TestCase):
+    # server_type as python-oracledb 26.0.1 reads it (#1977): dedicated, shared
+    # or pooled, case-insensitive, from the argument, a :server_type suffix or
+    # (SERVER=...) in CONNECT_DATA; anything else is refused (DPY-4028).
+    def test_every_form_names_it(self):
+        for dsn, kind in (
+            ('db:1521/svc:dedicated', 'dedicated'),
+            ('db/svc:POOLED', 'pooled'),
+            ('tcps://db:2484/svc:shared', 'shared'),
+            ('db/svc', None),
+            (
+                f'(DESCRIPTION={_ADDR}(CONNECT_DATA=(SERVICE_NAME=s)(SERVER=DEDICATED)))',
+                'dedicated',
+            ),
+        ):
+            with self.subTest(dsn=dsn):
+                self.assertEqual(parse_dsn(dsn).server_type, kind)
+
+    def test_an_unknown_type_is_refused(self):
+        for dsn in ('db/svc:bogus', f'(DESCRIPTION={_ADDR}(CONNECT_DATA=(SERVER=x)))'):
+            with self.subTest(dsn=dsn), self.assertRaises(ProgrammingError):
+                parse_dsn(dsn)
+        for cls in (OracleConnect, AsyncOracleConnect):
+            with self.subTest(cls=cls.__name__), self.assertRaises(ProgrammingError):
+                cls(server_type='bogus')
+
+    def test_the_dsn_wins_over_the_argument(self):
+        args = ('localhost', 1521, '', '', 'u', 'p', None, None, 'shared')
+        self.assertEqual(resolve_dsn_arguments('db/s:pooled', *args)[7], 'pooled')
+        self.assertEqual(resolve_dsn_arguments('db/s', *args)[7], 'shared')
+
+    def test_both_connection_classes_take_it(self):
+        for cls in (OracleConnect, AsyncOracleConnect):
+            with self.subTest(cls=cls.__name__):
+                self.assertEqual(cls(server_type='Dedicated').server_type, 'dedicated')
+                self.assertEqual(cls(dsn='db/svc:pooled').server_type, 'pooled')
+                self.assertIsNone(cls().server_type)
+
+
 class ResolveDsnArguments(unittest.TestCase):
     def test_the_dsn_wins_over_host_port_and_service_passed_beside_it(self):
         self.assertEqual(
             resolve_dsn_arguments('db:1523/A', 'other', 2, 'B', '', 'u', 'p'),
-            ('db', 1523, 'A', '', 'u', 'p', None),
+            ('db', 1523, 'A', '', 'u', 'p', None, None),
         )
 
     def test_a_dsn_without_a_port_means_1521(self):
@@ -287,7 +320,7 @@ class ResolveDsnArguments(unittest.TestCase):
     def test_a_dsn_without_a_service_keeps_the_one_passed(self):
         self.assertEqual(
             resolve_dsn_arguments('db:1523', 'localhost', 1521, 'B', '', 'u', 'p'),
-            ('db', 1523, 'B', '', 'u', 'p', None),
+            ('db', 1523, 'B', '', 'u', 'p', None, None),
         )
 
     def test_a_service_in_the_dsn_replaces_a_sid(self):
@@ -301,7 +334,7 @@ class ResolveDsnArguments(unittest.TestCase):
             resolve_dsn_arguments(
                 'scott/tiger@db/A', 'localhost', 1521, '', '', '', ''
             ),
-            ('db', 1521, 'A', '', 'scott', 'tiger', None),
+            ('db', 1521, 'A', '', 'scott', 'tiger', None, None),
         )
 
     def test_a_user_in_the_dsn_and_in_user_is_refused(self):

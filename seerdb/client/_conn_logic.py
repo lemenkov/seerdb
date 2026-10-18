@@ -81,6 +81,7 @@ class _ConnectionLogic:
     password: str
     cclass: str | None
     purity: int
+    server_type: str | None
     socket_options: object
     conn_state: int
     timeout: int
@@ -518,6 +519,7 @@ class _ConnectionLogic:
                 'proxy_user': self.proxy_user,
                 'cclass': self.cclass,
                 'purity': self.purity,
+                'server_type': self.server_type,
                 'password': self.password,
                 'sid': self.sid,
                 'service_name': self.service_name,
