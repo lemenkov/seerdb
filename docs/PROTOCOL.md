@@ -3431,19 +3431,36 @@ original offset.
 ### 11.4a TIMESTAMP WITH LOCAL TIME ZONE
 
 11 bytes — the **same** shape as a plain TIMESTAMP (§11.3), not the 13-byte TZ
-form. The server normalises the value to the session's time zone on the way in
-and renders it back in the session zone on the way out, so nothing on the wire
-identifies a zone and no offset bytes are carried. Its describe length is 11
-accordingly (§6.2), which is the giveaway: a 13-byte frame is always a real
-TIMESTAMP WITH TIME ZONE.
+form: no zone travels on the wire and no offset bytes are carried. Its describe
+length is 11 accordingly (§6.2), which is the giveaway: a 13-byte frame is always
+a real TIMESTAMP WITH TIME ZONE.
+
+**The wire value is the instant in the database time zone** (`DBTIMEZONE`), not
+the session's. A fetched LTZ value arrives in the database zone, and a bind
+declared LTZ (type 231) is read as an instant in that zone and round-trips
+unchanged. Only a plain TIMESTAMP going into an LTZ column (a TIMESTAMP bind, a
+`TIMESTAMP '…'` literal, or `CAST(ts AS TIMESTAMP WITH LOCAL TIME ZONE)`) is read
+as a wall-clock time in the **session** zone, and it comes back converted to
+the database zone. Measured with seerdb and the reference thin client side by
+side, identical (#1208, #1967), binding 13:45 into an LTZ column:
+
+| bed | database / session zone | LTZ bind fetches | TIMESTAMP bind fetches |
+|---|---|---|---|
+| 23ai | `+00:00` / `+05:00` | 13:45 | 08:45 |
+| 9i | `-08:00` / `+00:00` | 13:45 | 05:45 |
+
+The two bind kinds decode to the same naive `datetime`, so a server has to keep
+the bind's declared type to tell them apart; the Mirror hands its backend an
+`LtzValue` for an LTZ bind (#1222). `SYSTIMESTAMP` and `CURRENT_TIMESTAMP` are
+TIMESTAMP WITH TIME ZONE, `LOCALTIMESTAMP` is TIMESTAMP.
 
 The consequence for an encoder is that dispatch must be on the column's
 `data_type`, and TIMESTAMPLTZ (231) must land on the 11-byte branch. Falling
 through to the 7-byte DATE form produces a frame the client reads without
 complaint and **silently drops the fractional seconds** — `22:30:02.5` arrives
 as `22:30:02` with no error anywhere (seerdb#826). A `datetime`'s `tzinfo`, if
-any, is discarded rather than applied: the wall clock is already session-local
-by the time it reaches the wire.
+any, is discarded rather than applied: the value on the wire is already the
+instant in the database zone.
 
 ### 11.4b A declared TIMESTAMP / LTZ bind with no fractional seconds
 
