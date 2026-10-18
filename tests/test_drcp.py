@@ -36,13 +36,11 @@ def _env(**extra):
 
 
 class TestDescriptor(unittest.TestCase):
-    def test_pooled_when_drcp(self):
-        self.assertIn(
-            b'(SERVER=POOLED)', encode_dictionary_description(_env(cclass='APP'))
-        )
-        self.assertIn(
-            b'(SERVER=POOLED)', encode_dictionary_description(_env(purity=PURITY_SELF))
-        )
+    def test_a_class_or_purity_alone_requests_no_pooled_server(self):
+        # As in python-oracledb: only server_type='pooled' does (#1990).
+        for env in (_env(cclass='APP'), _env(purity=PURITY_SELF)):
+            with self.subTest(env=env):
+                self.assertNotIn(b'(SERVER=', encode_dictionary_description(env))
 
     def test_no_pooled_otherwise(self):
         self.assertNotIn(b'(SERVER=POOLED)', encode_dictionary_description(_env()))
@@ -93,6 +91,27 @@ class TestServerType(unittest.TestCase):
     def test_no_drcp_pairs_without_it(self):
         self.assertNotIn(b'AUTH_KPPL', _auth_request(server_type='dedicated'))
         self.assertNotIn(b'AUTH_KPPL', _auth_request())
+
+
+# What python-oracledb 26.0.1 sent to 23ai with a connection class or a purity
+# and no server type: each pair as given, and no purity it was not given (#1990).
+_CONN_CLASS_C1 = b'AUTH_KPPL_CONN_CLASS' + bytes.fromhex('0102024331')
+_PURITY_SELF = b'AUTH_KPPL_PURITY' + bytes.fromhex('010101320101')
+
+
+class TestDrcpPairs(unittest.TestCase):
+    def test_a_class_alone_labels_the_session(self):
+        request = _auth_request(cclass='C1')
+        self.assertIn(_CONN_CLASS_C1, request)
+        self.assertNotIn(b'AUTH_KPPL_PURITY', request)
+
+    def test_a_purity_goes_out_as_given(self):
+        request = _auth_request(purity=PURITY_SELF)
+        self.assertIn(_PURITY_SELF, request)
+        self.assertNotIn(b'AUTH_KPPL_CONN_CLASS', request)
+
+    def test_pooled_still_defaults_to_new(self):
+        self.assertIn(_PURITY_NEW, _auth_request(server_type='pooled', cclass='C1'))
 
 
 class TestParams(unittest.TestCase):

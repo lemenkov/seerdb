@@ -7310,17 +7310,27 @@ tracked in #88.
 
 ## 30. DRCP / implicit connection pooling (#130)
 
-`connect(..., cclass=..., purity=...)` requests a Database Resident Connection
-Pool server. Two small additions to the existing connect flow:
+`connect(..., server_type='pooled')` (or `:pooled` / `(SERVER=POOLED)` in the
+DSN) requests a Database Resident Connection Pool server; `cclass` and `purity`
+say which session it should be. Two small additions to the existing connect flow:
 
-- **Connect descriptor** — when a connection class or non-default purity is
-  given, the `CONNECT_DATA` gains `(SERVER=POOLED)`, which tells the listener to
-  route to the connection broker instead of a dedicated server.
+- **Connect descriptor** — `server_type` puts `(SERVER=<type>)` in the
+  `CONNECT_DATA`, and `pooled` tells the listener to route to the connection
+  broker instead of a dedicated server. A connection class or a purity alone adds
+  nothing here: it labels the session and requests no pooled server, as in
+  python-oracledb (#1990).
 - **Auth pairs** — the final auth message carries `AUTH_KPPL_CONN_CLASS` (the
-  connection class) and `AUTH_KPPL_PURITY` (the purity as a decimal string), the
-  same way proxy auth (§27) adds its pair. Purity is `seerdb.PURITY_NEW` (1) or
-  `PURITY_SELF` (2); when DRCP is requested with `PURITY_DEFAULT` a standalone
-  connection defaults to `NEW` (matching python-oracledb).
+  connection class) and `AUTH_KPPL_PURITY` (the purity as a decimal string), each
+  only when given, the same way proxy auth (§27) adds its pair. Purity is
+  `seerdb.PURITY_NEW` (1) or `PURITY_SELF` (2); a pooled standalone connection
+  left at `PURITY_DEFAULT` sends `NEW`. Measured from python-oracledb 26.0.1:
+
+| arguments | `(SERVER=…)` | auth pairs |
+|---|---|---|
+| `cclass='C1'` | none | `CONN_CLASS`=C1 |
+| `purity=SELF` | none | `PURITY`=2 |
+| `server_type='pooled'` | `pooled` | `PURITY`=1 |
+| `server_type='pooled'`, `cclass='C1'` | `pooled` | `CONN_CLASS`=C1, `PURITY`=1 |
 
 The DRCP capability itself is already advertised (`compile_caps[CCAP_OCI2]` has
 the `0x10` DRCP bit at field version ≥ 21.1), so no handshake change is needed.
