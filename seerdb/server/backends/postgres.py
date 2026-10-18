@@ -7191,6 +7191,45 @@ def _translate_median(sql: str) -> str:
     return ''.join(out)
 
 
+_AVG_NAMES = frozenset({'AVG'})
+
+
+def _translate_avg(sql: str) -> str:
+    """Oracle's AVG as SUM / COUNT through the Mirror's exact division (#1997).
+
+    PostgreSQL's avg(numeric) divides with numeric division's own scale -- 16
+    significant digits, no more decimals than its input -- so AVG over a wide
+    NUMBER lost its last digits and 1, 2, 2 averaged to 1.6666666666666667.
+    SUM and COUNT skip NULLs as AVG does, an empty set's NULL sum gives NULL,
+    and the / is sys.ora_numeric_div for a number (the native one for a float
+    or an interval). DISTINCT and an analytic window go to both halves.
+    """
+    if 'avg' not in sql.lower():
+        return sql
+    (out, pos) = ([], 0)
+    for call in _calls(sql, _AVG_NAMES, '_$#."'):
+        if call.start < pos:
+            continue  # inside a call already replaced
+        if len(call.args) != 1:
+            continue  # left to fail as Oracle would
+        (start, end) = call.args[0]
+        value = _translate_avg(sql[start:end]).strip()
+        over = _OVER_FOLLOWS.match(sql, call.close_at + 1)
+        window = ''
+        close = call.close_at
+        if over is not None:
+            open_at = over.end() - 1
+            close = _matching_paren(sql, open_at)
+            window = ' OVER ' + sql[open_at : close + 1]
+        out += [
+            sql[pos : call.start],
+            f'(SUM({value}){window} / COUNT({value}){window})',
+        ]
+        pos = close + 1
+    out.append(sql[pos:])
+    return ''.join(out)
+
+
 # An Oracle identifier may carry `#` (and `$`) after its first character:
 # serial#, statistic#, obj#. PostgreSQL takes `$` but not `#` (#1249).
 _HASH_IDENTIFIER = re.compile(r'[A-Za-z_][A-Za-z0-9_$#]*')
@@ -8326,6 +8365,7 @@ def _rewritten_idioms(sql: str) -> str:
     sql = _ruled('rr-year', _translate_rr_year(sql), sql)
     sql = _ruled('decode', _translate_decode(sql), sql)
     sql = _ruled('median', _translate_median(sql), sql)
+    sql = _ruled('avg', _translate_avg(sql), sql)
     sql = _ruled('json-functions', _translate_json_functions(sql), sql)
     sql = _ruled(
         'json-constructor-values', _translate_json_constructor_values(sql), sql
