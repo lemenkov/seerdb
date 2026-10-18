@@ -1221,6 +1221,27 @@ class OracleConnect(_ConnectionLogic):
         if self.sock is not None:
             self.sock.settimeout(self.timeout / 1000 if self.timeout else None)
 
+    def _connect_socket(self) -> socket.socket:
+        # A TCP socket connected to the first address the host resolves to that
+        # answers, in getaddrinfo's order and each in its own family, as
+        # python-oracledb tries them: ::1 then 127.0.0.1 for localhost. A socket
+        # forced to IPv4 could not reach an IPv6 host at all (#2000).
+        Last: OSError = OSError(f'{self.host!r} resolves to no address')
+        for Family, Type, Proto, _, Address in socket.getaddrinfo(
+            self.host, self.port, type=socket.SOCK_STREAM
+        ):
+            sock = socket.socket(Family, Type, Proto)
+            self.sock = sock
+            self._apply_socket_timeout()
+            try:
+                sock.connect(Address)
+                return sock
+            except OSError as e:
+                sock.close()
+                self.sock = None
+                Last = e
+        raise Last
+
     def _open_transport(self) -> None:
         # Open the TCP (and optional TLS) socket to the current host/port and
         # send the initial CONNECT. Shared by connect() and the TNS_REDIRECT
@@ -1230,15 +1251,10 @@ class OracleConnect(_ConnectionLogic):
         # the dispatcher / dedicated server may still be binding its port (#399).
         Attempts = _REDIRECT_CONNECT_ATTEMPTS if getattr(self, '_redirects', 0) else 1
         for Attempt in range(Attempts):
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock = sock
-            self._apply_socket_timeout()
             try:
-                sock.connect((self.host, self.port))
+                sock = self._connect_socket()
                 break
             except ConnectionRefusedError:
-                sock.close()
-                self.sock = None
                 if Attempt + 1 >= Attempts:
                     raise
                 time.sleep(_REDIRECT_CONNECT_DELAY)
