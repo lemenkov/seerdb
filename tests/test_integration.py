@@ -3133,6 +3133,24 @@ class CursorIntegration(_IntegrationBase):
                 cur.execute('SELECT 1 FROM dual')
                 self.assertEqual(cur.fetchone(), (1,))
 
+    def test_a_connection_class_alone_requests_no_pooled_server(self):
+        # A class and a purity only label the session, as in python-oracledb:
+        # no SERVER=POOLED, so a server without a DRCP pool started connects
+        # instead of refusing with ORA-12520 (#1990).
+        with seerdb.connect(
+            user=_USER,
+            password=_PASSWORD,
+            host=_HOST,
+            port=_PORT,
+            service_name=_SERVICE,
+            cclass='PYO_LABEL',
+            purity=seerdb.PURITY_SELF,
+            **_FV_KW,
+        ) as conn:
+            cur = conn.cursor()
+            cur.execute('SELECT 1 FROM dual')
+            self.assertEqual(cur.fetchone(), (1,))
+
     def test_a_long_program_name_connects(self):
         # 8i's login gives a program name one length byte, which stops at 252:
         # 253 to 255 failed the login and a longer one could not be sent at all
@@ -10238,6 +10256,15 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     async with Conn.cursor() as Cur:
                         await Cur.execute('SELECT 1 FROM dual')
                         self.assertEqual(await Cur.fetchone(), (1,))
+
+    async def test_a_connection_class_alone_requests_no_pooled_server(self):
+        # Async twin of CursorIntegration's (#1990).
+        async with await seerdb.connect_async(
+            **self._kwargs(cclass='PYO_LABEL', purity=seerdb.PURITY_SELF)
+        ) as Conn:
+            async with Conn.cursor() as Cur:
+                await Cur.execute('SELECT 1 FROM dual')
+                self.assertEqual(await Cur.fetchone(), (1,))
 
     async def test_a_long_program_name_connects(self):
         # Async twin of CursorIntegration's.

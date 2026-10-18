@@ -6171,15 +6171,15 @@ def encode_dictionary_auth(Dictionary: dict) -> tuple[bytes, bytes]:
     )
     ProxyInd = 1 if ProxyUser else 0
 
-    # DRCP (#130): a connection class and/or session purity. When DRCP is used
-    # but no purity was given, a standalone connection defaults to NEW (matching
-    # python-oracledb). cclass -> AUTH_KPPL_CONN_CLASS, purity -> AUTH_KPPL_PURITY.
+    # DRCP (#130): a connection class and a session purity go out as given:
+    # cclass -> AUTH_KPPL_CONN_CLASS, purity -> AUTH_KPPL_PURITY. Only
+    # server_type='pooled' asks for a pooled server, and then a purity left at
+    # its default is NEW. A class alone labels the session and requests nothing,
+    # as in python-oracledb (#1990, #1977).
     CClass = Dictionary['env'].get('cclass')
     Purity = Dictionary['env'].get('purity', 0) or 0
-    # server_type='pooled' asks for DRCP too, with no class or purity: the
-    # reference client then sends AUTH_KPPL_PURITY = NEW alone (#1977).
     Pooled = Dictionary['env'].get('server_type') == 'pooled'
-    if (CClass or Purity or Pooled) and Purity == 0:
+    if Pooled and Purity == 0:
         Purity = 1  # PURITY_NEW
     CClassKv = (
         encode_kv(b'AUTH_KPPL_CONN_CLASS', CClass.encode('utf-8')) if CClass else b''
@@ -6905,16 +6905,10 @@ def encode_dictionary_description(Dictionary: dict) -> bytes:
     )
     Proto = b'TCP' if SslOpts is None else b'TCPS'
     # The server type the caller asked for, written as the reference client
-    # writes it, (SERVER=dedicated|shared|pooled) (#1977). Without one, DRCP
-    # (#130) -- a connection class or non-default purity -- requests a pooled
-    # server from the connection broker via (SERVER=POOLED).
+    # writes it, (SERVER=dedicated|shared|pooled) (#1977), and only then: a
+    # connection class or a purity requests no pooled server by itself (#1990).
     ServerType = Dictionary['env'].get('server_type')
-    if ServerType:
-        Drcp = b'(SERVER=' + ServerType.encode('ascii') + b')'
-    elif Dictionary['env'].get('cclass') or Dictionary['env'].get('purity'):
-        Drcp = b'(SERVER=POOLED)'
-    else:
-        Drcp = b''
+    Drcp = b'(SERVER=' + ServerType.encode('ascii') + b')' if ServerType else b''
     return (
         b'(DESCRIPTION=(CONNECT_DATA=('
         + Sn

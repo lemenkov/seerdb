@@ -295,7 +295,7 @@ the 12c+ protocol the 21c tier exercises.
 | **Statement validation** — `cursor.parse()` parses a statement on the server without running it (10g+) | ✅ |
 | **Arrow / DataFrame fetch** — `cursor.fetch_df_all` / `fetch_df_batches` (pyarrow `Table` / record batches) | ✅ |
 | **SODA** — document store over `DBMS_SODA`: collections, documents, query-by-example (with streaming), insert / read / upsert / update / delete / bulk, indexing + data guide (18c+) | ✅ |
-| **Connection** — pool (warm sessions + idle health-check), statement cache, `changepassword`, TLS, wallet mTLS, DRCP (`cclass` / `purity`), proxy auth, an opt-in negotiation cache that skips a round trip on fast-auth reconnects | ✅ |
+| **Connection** — pool (warm sessions + idle health-check), statement cache, `changepassword`, TLS, wallet mTLS, DRCP (`server_type='pooled'`, with `cclass` / `purity`), proxy auth, an opt-in negotiation cache that skips a round trip on fast-auth reconnects | ✅ |
 | **Authentication** — O3LOGON (8i / 9i) and O5LOGON (10g+, 128 / 192 / 256-bit); token-based auth — OAuth2 (bare JWT) and OCI IAM (signed) for Autonomous Database | ✅ |
 | **Native network encryption** — Advanced Networking (ANO): AES-CBC encryption + SHA-2 data-integrity negotiated at connect, for a server with `SQLNET.ENCRYPTION_SERVER` / `CRYPTO_CHECKSUM_SERVER` set | ✅ |
 | **Advanced Queuing (AQ)** — enqueue / dequeue over `DBMS_AQ`, including JSON payloads | ✅ |
@@ -421,7 +421,8 @@ So does a `tnsnames.ora` alias (`dsn="mydb"`), read from `config_dir=`, else
 alias, turns TLS on as `ssl=True` does; an `ssl=` configuration passed beside it
 is kept. A `:server_type` suffix (`dbhost/MYDB:pooled`) or `(SERVER=...)` in a
 descriptor sets `server_type`, which `connect()` also takes: `dedicated`,
-`shared` or `pooled`, the last asking for DRCP as `cclass`/`purity` do. A
+`shared` or `pooled`, the last asking for DRCP (`cclass` and `purity` only label
+the session, as in python-oracledb). A
 descriptor parameter seerdb does not act on yet (`SDU`, `SECURITY`, …) is
 refused with `NotSupportedError` for now. Of Easy Connect's `?` parameters, `sdu`, `pool_connection_class`
 (`cclass`), `pool_purity` (`new` / `self`), `transport_connect_timeout`
