@@ -841,6 +841,53 @@ class _IntegrationBase(_ThrottleRetry, unittest.TestCase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class AvgIntegration(_IntegrationBase):
+    """AVG over a NUMBER keeps Oracle's precision (#1997).
+
+    Through Mirror-over-PG it went through PostgreSQL's numeric division: 16
+    significant digits, and no more decimals than its input."""
+
+    def setUp(self):
+        super().setUp()
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (k NUMBER, g NUMBER, n NUMBER)')
+        for k, g, n in (
+            (1, 1, '12345678901234567890.127'),
+            (2, 1, '12345678901234567890.130'),
+            (3, 2, '1'),
+            (4, 2, '2'),
+            (5, 2, '2'),
+            (6, 3, 'NULL'),
+        ):
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES ({k}, {g}, {n})')
+
+    def test_avg_keeps_every_digit(self):
+        t = self.TABLE
+        self.cur.execute(f'SELECT g, AVG(n) FROM {t} GROUP BY g ORDER BY g')
+        self.assertEqual(
+            self.cur.fetchall(),
+            [
+                (1, Decimal('12345678901234567890.1285')),
+                (2, Decimal('1.66666666666666666666666666666666666667')),
+                (3, None),
+            ],
+        )
+        self.cur.execute(f'SELECT AVG(DISTINCT n) FROM {t} WHERE g = 2')
+        self.assertEqual(self.cur.fetchone(), (Decimal('1.5'),))
+        self.cur.execute(f'SELECT AVG(n) FROM {t} WHERE k > 99')
+        self.assertEqual(self.cur.fetchone(), (None,))
+
+    def test_avg_as_an_analytic_function(self):
+        self.cur.execute(
+            f'SELECT k, AVG(n) OVER (PARTITION BY g) FROM {self.TABLE} '
+            'WHERE g = 2 ORDER BY k'
+        )
+        self.assertEqual(
+            [a for _, a in self.cur.fetchall()],
+            [Decimal('1.66666666666666666666666666666666666667')] * 3,
+        )
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class MedianIntegration(_IntegrationBase):
     """MEDIAN over a NUMBER is exact and over a DATE stays a DATE (#1994).
 
