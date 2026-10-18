@@ -16,10 +16,11 @@ just a bare handshake. Sync and async both covered.
 
 import asyncio
 import os
+import shutil
 import threading
 import unittest
 
-from _tls_proxy import TLSProxy
+from _tls_proxy import TLSProxy, wallet_naming_port
 
 import seerdb
 from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
@@ -77,6 +78,9 @@ class TestWalletEndToEnd(unittest.TestCase):
         )
         self.proxy.start()
         self.addCleanup(self._teardown)
+        # The wallet dsn names the address, so its alias names the proxy (#1975).
+        self.wallet = wallet_naming_port(self.proxy.listen_port)
+        self.addCleanup(shutil.rmtree, self.wallet)
 
     def _teardown(self):
         self.proxy.stop()
@@ -85,12 +89,9 @@ class TestWalletEndToEnd(unittest.TestCase):
 
     def _kwargs(self):
         return {
-            'host': '127.0.0.1',
-            'port': self.proxy.listen_port,
             'user': 'PYO',
             'password': 'pyo123',
-            'service_name': 'XE',
-            'wallet_location': WALLET_DIR,
+            'wallet_location': self.wallet,
             'dsn': 'seerdb_test',
             'timeout': 5000,
         }

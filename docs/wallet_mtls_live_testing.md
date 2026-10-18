@@ -92,7 +92,9 @@ DSN `seerdb_test`, wallet `tests/fixtures/wallet`) match the steps above. The
 test opens a wallet mTLS connection — presenting the client certificate,
 matching the server DN `CN=seerdb-test-server` — and runs a real `SELECT`, sync
 and async. Override any piece with the `SEERDB_LIVE_*` variables documented at
-the top of `tests/test_wallet_live.py`.
+the top of `tests/test_wallet_live.py`. The wallet's alias names the address: the
+test writes host, port and service into a copy of the fixture wallet, and a wallet
+of your own (`SEERDB_LIVE_WALLET`) is used as it is.
 
 ## Optional: certificate-only login (externally identified user)
 

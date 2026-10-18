@@ -14,13 +14,14 @@ Two layers, all offline:
 
 import asyncio
 import os
+import shutil
 import socket
 import ssl
 import threading
 import time
 import unittest
 
-from _tls_proxy import TLSProxy
+from _tls_proxy import TLSProxy, wallet_naming_port
 
 from seerdb.client.aconnection import AsyncOracleConnect
 from seerdb.client.connection import OracleConnect
@@ -111,14 +112,23 @@ class TestWalletWiring(unittest.TestCase):
         self.assertEqual(Conn._wallet_server_dn, SERVER_DN)
         self.assertIsInstance(Conn.ssl, ssl.SSLContext)
 
-    def test_explicit_host_port_override_dsn(self):
-        Conn = OracleConnect(
-            host='10.0.0.9', port=9999, wallet_location=WALLET_DIR, dsn='seerdb_test'
-        )
-        # Explicit host/port win; the wallet still supplies the server DN.
-        self.assertEqual(Conn.host, '10.0.0.9')
-        self.assertEqual(Conn.port, 9999)
-        self.assertEqual(Conn._wallet_server_dn, SERVER_DN)
+    def test_the_dsn_wins_over_host_port_and_service_passed_beside_it(self):
+        # As in python-oracledb, and as an Easy Connect dsn does (#1975, #1972).
+        for Cls in (OracleConnect, AsyncOracleConnect):
+            with self.subTest(cls=Cls.__name__):
+                Conn = Cls(
+                    host='10.0.0.9',
+                    port=9999,
+                    service_name='other',
+                    sid='ORCL',
+                    wallet_location=WALLET_DIR,
+                    dsn='seerdb_test',
+                )
+                self.assertEqual(
+                    (Conn.host, Conn.port, Conn.service_name, Conn.sid),
+                    ('localhost', 1522, 'seerdb_test_svc', ''),
+                )
+                self.assertEqual(Conn._wallet_server_dn, SERVER_DN)
 
     def test_wallet_without_dsn_sets_context_only(self):
         Conn = OracleConnect(wallet_location=WALLET_DIR)
@@ -185,6 +195,9 @@ class TestLiveTlsPath(unittest.TestCase):
         self.proxy.start()
         self.addCleanup(self.echo.stop)
         self.addCleanup(self.proxy.stop)
+        # The dsn names the address, so the alias has to name the proxy.
+        self.wallet = wallet_naming_port(self.proxy.listen_port)
+        self.addCleanup(shutil.rmtree, self.wallet)
 
     def _wait_client_dn(self, dn: str, timeout: float = 2.0) -> bool:
         # The proxy records the verified client DN from its own worker thread,
@@ -199,9 +212,7 @@ class TestLiveTlsPath(unittest.TestCase):
 
     def test_sync_wallet_handshake_and_dn(self):
         Conn = OracleConnect(
-            host='127.0.0.1',
-            port=self.proxy.listen_port,
-            wallet_location=WALLET_DIR,
+            wallet_location=self.wallet,
             dsn='seerdb_test',
         )
         # Runs the real _wrap_socket_tls (mTLS + DN check), then sends CONNECT.
@@ -211,9 +222,7 @@ class TestLiveTlsPath(unittest.TestCase):
 
     def test_sync_wrong_server_dn_rejected(self):
         Conn = OracleConnect(
-            host='127.0.0.1',
-            port=self.proxy.listen_port,
-            wallet_location=WALLET_DIR,
+            wallet_location=self.wallet,
             dsn='seerdb_test',
         )
         Conn._wallet_server_dn = 'CN=not-the-server'
@@ -223,9 +232,7 @@ class TestLiveTlsPath(unittest.TestCase):
     def test_async_wallet_handshake_and_dn(self):
         async def run():
             Conn = AsyncOracleConnect(
-                host='127.0.0.1',
-                port=self.proxy.listen_port,
-                wallet_location=WALLET_DIR,
+                wallet_location=self.wallet,
                 dsn='seerdb_test',
             )
             await Conn._open_transport()
@@ -238,9 +245,7 @@ class TestLiveTlsPath(unittest.TestCase):
     def test_async_wrong_server_dn_rejected(self):
         async def run():
             Conn = AsyncOracleConnect(
-                host='127.0.0.1',
-                port=self.proxy.listen_port,
-                wallet_location=WALLET_DIR,
+                wallet_location=self.wallet,
                 dsn='seerdb_test',
             )
             Conn._wallet_server_dn = 'CN=not-the-server'

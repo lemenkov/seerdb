@@ -576,17 +576,15 @@ class _ConnectionLogic:
         Wal = _wallet.open_wallet(Location, WalletPassword, Dsn)
         Info = Wal.connect
         if Info is not None:
-            # A resolved DSN supplies host/port/service — but an explicitly
-            # passed host/port/service still wins (left at the constructor
-            # defaults means "take it from the wallet").
-            if self.host == 'localhost':
-                self.host = Info.host
-            if self.port == 1521:
-                self.port = Info.port
-            if not self.service_name and Info.service_name:
-                self.service_name = Info.service_name
-            if not self.sid and Info.sid:
-                self.sid = Info.sid
+            # What the alias names wins over host / port / service_name passed
+            # beside it, as in python-oracledb and as an Easy Connect dsn does
+            # (#1975, #1972).
+            self.host = Info.host
+            self.port = Info.port
+            if Info.service_name:
+                (self.service_name, self.sid) = (Info.service_name, '')
+            elif Info.sid:
+                (self.service_name, self.sid) = ('', Info.sid)
             if Info.dn_match and Info.server_dn:
                 self._wallet_server_dn = Info.server_dn
         self.ssl = _wallet.build_client_context(Wal)
