@@ -10,6 +10,8 @@ read without the ``wallet`` extra; :mod:`seerdb.client.wallet` builds on them.
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass
 from typing import TypeAlias
 
@@ -229,6 +231,12 @@ def parse_descriptor(text: str) -> DescriptorTarget:
     ((name, value), end) = _parse_param(tokens, 0)
     if end != len(tokens):
         raise NetConfigError('text follows the connect descriptor')
+    return descriptor_target(name, value)
+
+
+def descriptor_target(name: str, value: Node) -> DescriptorTarget:
+    """What a parsed ``(NAME = VALUE)`` descriptor names; the checks of
+    :func:`parse_descriptor`, for a descriptor already read (a tnsnames alias)."""
     if name == 'description_list':
         descriptions = [v for k, v in _branch(value, name) if k == 'description']
         if len(descriptions) != 1:
@@ -286,3 +294,69 @@ def parse_descriptor(text: str) -> DescriptorTarget:
         found = _find_first(data, 'sid')
         sid = found if isinstance(found, str) else ''
     return DescriptorTarget(host, port_number, service_name, sid)
+
+
+# --------------------------------------------------------------------------- #
+# A tnsnames alias passed as dsn, without a wallet
+# --------------------------------------------------------------------------- #
+
+_IFILE = re.compile(r'^\s*ifile\s*=\s*(\S+)\s*$', re.IGNORECASE | re.MULTILINE)
+
+
+def config_directory(config_dir: str | None) -> str:
+    """Where ``tnsnames.ora`` is looked for: ``config_dir``, else ``TNS_ADMIN``,
+    else ``$ORACLE_HOME/network/admin`` -- python-oracledb's order. Read at
+    connect time, where python-oracledb reads the environment once, at import."""
+    if config_dir:
+        return config_dir
+    if os.environ.get('TNS_ADMIN'):
+        return os.environ['TNS_ADMIN']
+    if os.environ.get('ORACLE_HOME'):
+        return os.path.join(os.environ['ORACLE_HOME'], 'network', 'admin')
+    raise NetConfigError(
+        'a tnsnames alias needs a configuration directory: pass config_dir= '
+        'or set TNS_ADMIN'
+    )
+
+
+def read_tnsnames(path: str, _seen: frozenset[str] = frozenset()) -> dict[str, Node]:
+    """The aliases in the ``tnsnames.ora`` at ``path``, following its ``IFILE``
+    includes (a relative one is relative to the including file). An alias the
+    file defines itself wins over an included one."""
+    real = os.path.realpath(path)
+    if real in _seen:
+        raise NetConfigError(f'{path} includes itself through IFILE')
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            text = f.read()
+    except OSError as e:
+        raise NetConfigError(f'cannot read {path}: {e.strerror}') from e
+    includes = _IFILE.findall(text)
+    entries = parse_tnsnames(_IFILE.sub('', text))
+    for include in includes:
+        target = os.path.join(os.path.dirname(path), include.strip('"'))
+        for alias, node in read_tnsnames(target, _seen | {real}).items():
+            entries.setdefault(alias, node)
+    return entries
+
+
+def resolve_alias(alias: str, config_dir: str | None) -> DescriptorTarget:
+    """What tnsnames alias ``alias`` names, from the configuration directory."""
+    path = os.path.join(config_directory(config_dir), 'tnsnames.ora')
+    entries = read_tnsnames(path)
+    node = entries.get(alias.lower())
+    if node is None:
+        raise NetConfigError(f'alias {alias!r} is not in {path}')
+    if not isinstance(node, list) or len(node) != 1:
+        raise NetConfigError(f'alias {alias!r} in {path} is not one connect descriptor')
+    ((name, value),) = node
+    return descriptor_target(name, value)
+
+
+def holds_wallet(directory: str) -> bool:
+    """Whether ``directory`` holds a client identity (``ewallet.pem`` or
+    ``ewallet.p12``), which makes ``config_dir`` a wallet location too."""
+    return any(
+        os.path.isfile(os.path.join(directory, name))
+        for name in ('ewallet.pem', 'ewallet.p12')
+    )

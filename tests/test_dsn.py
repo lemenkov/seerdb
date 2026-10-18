@@ -7,15 +7,20 @@ it. The precedence -- the DSN over host / port / service_name passed beside it
 -- is what python-oracledb 26.0.1 does, measured with its ConnectParams.
 """
 
+import os
+import shutil
+import tempfile
 import unittest
+from unittest import mock
 
 from seerdb.client.aconnection import AsyncOracleConnect
 from seerdb.client.connection import OracleConnect
 from seerdb.client.dsn import DsnTarget, parse_dsn, resolve_dsn_arguments
+from seerdb.client.netconfig import NetConfigError
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
 
 
-class ParseDsnTarget(unittest.TestCase):
+class ParseDsn(unittest.TestCase):
     def test_the_forms_it_reads(self):
         cases = {
             'db:1523/FREEPDB1': DsnTarget('db', 1523, 'FREEPDB1'),
@@ -40,7 +45,6 @@ class ParseDsnTarget(unittest.TestCase):
 
     def test_a_form_not_read_yet_is_refused_not_dropped(self):
         for dsn in (
-            'mydb',  # a tnsnames alias
             'tcps://db:2484/FREEPDB1',
             'db:1523/FREEPDB1?connect_timeout=2',
             'db:1523/FREEPDB1:dedicated',
@@ -139,6 +143,95 @@ class ParseDescriptor(unittest.TestCase):
             ),
             ('db', 1523, '', 'ORCL', 'u', 'p'),
         )
+
+
+_TNS = """# a comment
+mydb, other =
+  (DESCRIPTION = (ADDRESS = (PROTOCOL = TCP)(HOST = db)(PORT = 1523))
+                 (CONNECT_DATA = (SERVICE_NAME = svc)))
+IFILE = more.ora
+"""
+
+
+class ResolveAlias(unittest.TestCase):
+    # A tnsnames alias without a wallet (#1976), looked up as python-oracledb
+    # 26.0.1 does: config_dir, then TNS_ADMIN, then $ORACLE_HOME/network/admin.
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+        with open(os.path.join(self.dir, 'tnsnames.ora'), 'w') as f:
+            f.write(_TNS)
+        with open(os.path.join(self.dir, 'more.ora'), 'w') as f:
+            f.write(
+                'inc = (DESCRIPTION=(ADDRESS=(HOST=h2)(PORT=1))(CONNECT_DATA=(SID=S)))\n'
+            )
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for name in ('TNS_ADMIN', 'ORACLE_HOME'):
+            os.environ.pop(name, None)
+
+    def test_an_alias_from_config_dir(self):
+        self.assertEqual(parse_dsn('mydb', self.dir), DsnTarget('db', 1523, 'svc'))
+        # Case-insensitive, a shared definition, credentials in front.
+        self.assertEqual(parse_dsn('OTHER', self.dir), DsnTarget('db', 1523, 'svc'))
+        self.assertEqual(
+            parse_dsn('u/p@mydb', self.dir), DsnTarget('db', 1523, 'svc', 'u', 'p')
+        )
+
+    def test_an_ifile_include_is_followed(self):
+        self.assertEqual(parse_dsn('inc', self.dir), DsnTarget('h2', 1, '', sid='S'))
+
+    def test_tns_admin_then_oracle_home(self):
+        os.environ['TNS_ADMIN'] = self.dir
+        self.assertEqual(parse_dsn('mydb').host, 'db')
+        del os.environ['TNS_ADMIN']
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home)
+        os.makedirs(os.path.join(home, 'network', 'admin'))
+        for name in ('tnsnames.ora', 'more.ora'):
+            shutil.copy(
+                os.path.join(self.dir, name), os.path.join(home, 'network', 'admin')
+            )
+        os.environ['ORACLE_HOME'] = home
+        self.assertEqual(parse_dsn('mydb').host, 'db')
+
+    def test_config_dir_comes_first_and_does_not_fall_back(self):
+        os.environ['TNS_ADMIN'] = self.dir
+        empty = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, empty)
+        with self.assertRaises(NetConfigError):
+            parse_dsn('mydb', empty)
+
+    def test_the_failures_name_what_is_missing(self):
+        with self.assertRaises(NetConfigError) as ctx:
+            parse_dsn('mydb')
+        self.assertIn('config_dir', str(ctx.exception))
+        with self.assertRaises(NetConfigError) as ctx:
+            parse_dsn('nope', self.dir)
+        self.assertIn("'nope'", str(ctx.exception))
+
+    def test_an_include_cycle_is_refused(self):
+        with open(os.path.join(self.dir, 'more.ora'), 'w') as f:
+            f.write('IFILE = tnsnames.ora\n')
+        with self.assertRaises(NetConfigError):
+            parse_dsn('mydb', self.dir)
+
+    def test_the_alias_wins_and_config_dir_without_a_wallet_is_not_one(self):
+        for cls in (OracleConnect, AsyncOracleConnect):
+            with self.subTest(cls=cls.__name__):
+                conn = cls(
+                    user='pyo',
+                    password='p',
+                    dsn='mydb',
+                    config_dir=self.dir,
+                    host='other',
+                    port=2,
+                )
+                self.assertEqual(
+                    (conn.host, conn.port, conn.service_name), ('db', 1523, 'svc')
+                )
+                self.assertIsNone(conn.ssl)
 
 
 class ResolveDsnArguments(unittest.TestCase):

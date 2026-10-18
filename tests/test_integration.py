@@ -28,6 +28,7 @@ import math
 import os
 import re
 import ssl
+import tempfile
 import unittest
 from decimal import Decimal
 from typing import NamedTuple
@@ -518,6 +519,14 @@ def _session_zone_apart_from(
     minutes = int(zone.total_seconds()) // 60
     sign = '-' if minutes < 0 else '+'
     return zone, f'{sign}{abs(minutes) // 60:02d}:{abs(minutes) % 60:02d}'
+
+
+def _alias_entry(alias: str) -> str:
+    """A tnsnames.ora entry naming the bed the suite runs against (#1976)."""
+    return (
+        f'{alias} = (DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={_HOST})(PORT={_PORT}))'
+        f'(CONNECT_DATA=(SERVICE_NAME={_SERVICE})))\n'
+    )
 
 
 _LTZ_VALUE = datetime.datetime(2026, 9, 25, 13, 45, 6, 123456)
@@ -2858,6 +2867,23 @@ class CursorIntegration(_IntegrationBase):
             cur = conn.cursor()
             cur.execute('SELECT 1 FROM dual')
             self.assertEqual(cur.fetchone(), (1,))
+
+    def test_a_tnsnames_alias_dsn_names_the_address(self):
+        # A tnsnames alias from config_dir, no wallet, as python-oracledb reads
+        # it (#1976).
+        with tempfile.TemporaryDirectory() as config_dir:
+            with open(os.path.join(config_dir, 'tnsnames.ora'), 'w') as f:
+                f.write(_alias_entry('pyo_bed'))
+            with seerdb.connect(
+                user=_USER,
+                password=_PASSWORD,
+                dsn='pyo_bed',
+                config_dir=config_dir,
+                **_FV_KW,
+            ) as conn:
+                cur = conn.cursor()
+                cur.execute('SELECT 1 FROM dual')
+                self.assertEqual(cur.fetchone(), (1,))
 
     def test_a_long_program_name_connects(self):
         # 8i's login gives a program name one length byte, which stops at 252:
@@ -9886,6 +9912,19 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             async with Conn.cursor() as Cur:
                 await Cur.execute('SELECT 1 FROM dual')
                 self.assertEqual(await Cur.fetchone(), (1,))
+
+    async def test_a_tnsnames_alias_dsn_names_the_address(self):
+        # Async twin of CursorIntegration's (#1976).
+        with tempfile.TemporaryDirectory() as ConfigDir:
+            with open(os.path.join(ConfigDir, 'tnsnames.ora'), 'w') as F:
+                F.write(_alias_entry('pyo_bed'))
+            Kwargs = self._kwargs(dsn='pyo_bed', config_dir=ConfigDir)
+            for Key in ('host', 'port', 'service_name'):
+                Kwargs.pop(Key)
+            async with await seerdb.connect_async(**Kwargs) as Conn:
+                async with Conn.cursor() as Cur:
+                    await Cur.execute('SELECT 1 FROM dual')
+                    self.assertEqual(await Cur.fetchone(), (1,))
 
     async def test_a_long_program_name_connects(self):
         # Async twin of CursorIntegration's.
