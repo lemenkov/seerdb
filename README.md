@@ -401,6 +401,14 @@ with seerdb.connect(host="dbhost", port=1521, user="scott",
             print(row)
 ```
 
+An Easy Connect string works too, as in python-oracledb:
+`seerdb.connect(user="scott", password="tiger", dsn="dbhost:1521/MYDB")`.
+The form is `[user[/password]@][//]host[:port][/service_name]`; the port
+defaults to 1521, and the DSN wins over `host` / `port` / `service_name` passed
+beside it. A connect descriptor, a `tnsnames.ora` alias without `config_dir=`, a
+`tcps://` prefix, `?` parameters and `:server_type` are refused with
+`NotSupportedError` for now.
+
 ## Quick start (async)
 
 ```python
