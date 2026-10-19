@@ -3854,6 +3854,44 @@ def test_encode_ddl_status_oci_carries_the_command_type() -> None:
     assert ddl_command_type('begin null; end;') is None
 
 
+@pytest.mark.parametrize(
+    ('sql', 'command_type'),
+    [
+        # sqlplus prints its feedback line from this code; each of these fell
+        # back to TABLE or to the PL/SQL code before (#2012). The codes are
+        # V$SQLCOMMAND's on a live 23ai.
+        ("comment on table t is 'x'", 29),
+        ('create or replace procedure p as begin null; end;', 24),
+        ('CREATE OR REPLACE EDITIONABLE FUNCTION f RETURN NUMBER AS', 91),
+        ('create or replace package pk as end;', 94),
+        ('create or replace package body pk as end;', 97),
+        ('create or replace trigger tr before insert on t begin null; end;', 59),
+        ('create or replace type ty as object (a number)', 77),
+        ('create or replace type body ty as end;', 81),
+        ('create or replace force view v as select 1 x from dual', 21),
+        ('create unique index i on t (x)', 9),
+        ('create global temporary table g (x int)', 1),
+        ("alter session set nls_date_format = 'YYYY-MM-DD'", 42),
+        ('alter user u identified by x', 43),
+        ('drop procedure p', 68),
+        ('drop function f', 93),
+        ('drop package pk', 96),
+        ('drop public synonym s', 20),
+        ('create public database link l connect to u identified by x', 32),
+        ('create materialized view log on t', 71),
+        ('savepoint a', 46),
+        ('set transaction read only', 48),
+        ('rename a to b', 28),
+        ('call p()', 170),
+        ('revoke select on t from bob', 18),
+    ],
+)
+def test_ddl_command_type_follows_v_sqlcommand(sql: str, command_type: int) -> None:
+    from seerdb.common.tns import ddl_command_type
+
+    assert ddl_command_type(sql) == command_type
+
+
 def test_oci_no_row_status_tags_commit_and_rollback() -> None:
     # A bare COMMIT / ROLLBACK typed in sqlplus is executed as a SQL statement
     # (not OCITransCommit), so it reaches the OCI execute path. The Mirror must

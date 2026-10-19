@@ -9933,32 +9933,52 @@ _OCI_DML_CMD = {
 }
 
 
-# DDL / no-row statements, keyed by (verb, object). sqlplus prints e.g. "Index
-# created.", "Table altered.", "View dropped." from the command type. Verbs with
-# no object (GRANT/REVOKE) map on the verb alone. Verified live against sqlplus.
-_OCI_DDL_COMMAND_TYPE = {
-    ('CREATE', 'TABLE'): oci.OCI_CMD_CREATE_TABLE,
-    ('CREATE', 'INDEX'): oci.OCI_CMD_CREATE_INDEX,
-    ('CREATE', 'SEQUENCE'): oci.OCI_CMD_CREATE_SEQUENCE,
-    ('CREATE', 'SYNONYM'): oci.OCI_CMD_CREATE_SYNONYM,
-    ('CREATE', 'VIEW'): oci.OCI_CMD_CREATE_VIEW,
-    ('ALTER', 'INDEX'): oci.OCI_CMD_ALTER_INDEX,
-    ('ALTER', 'SEQUENCE'): oci.OCI_CMD_ALTER_SEQUENCE,
-    ('ALTER', 'TABLE'): oci.OCI_CMD_ALTER_TABLE,
-    ('DROP', 'INDEX'): oci.OCI_CMD_DROP_INDEX,
-    ('DROP', 'TABLE'): oci.OCI_CMD_DROP_TABLE,
-    ('DROP', 'SEQUENCE'): oci.OCI_CMD_DROP_SEQUENCE,
-    ('DROP', 'SYNONYM'): oci.OCI_CMD_DROP_SYNONYM,
-    ('DROP', 'VIEW'): oci.OCI_CMD_DROP_VIEW,
-    ('LOCK', 'TABLE'): oci.OCI_CMD_LOCK_TABLE,
-    ('TRUNCATE', 'TABLE'): oci.OCI_CMD_TRUNCATE_TABLE,
+# The words that may stand between a DDL verb and the object kind it names,
+# which a V$SQLCOMMAND name leaves out: "CREATE OR REPLACE EDITIONABLE PROCEDURE"
+# is a CREATE PROCEDURE, "CREATE UNIQUE INDEX" a CREATE INDEX, "DROP PUBLIC
+# SYNONYM" a DROP SYNONYM (#2012).
+_DDL_MODIFIERS = frozenset(
+    {
+        'OR',
+        'REPLACE',
+        'EDITIONABLE',
+        'NONEDITIONABLE',
+        'EDITIONING',
+        'FORCE',
+        'NOFORCE',
+        'NO',
+        'PUBLIC',
+        'UNIQUE',
+        'BITMAP',
+        'MULTIVALUE',
+        'GLOBAL',
+        'PRIVATE',
+        'TEMPORARY',
+        'SHARED',
+        'DUPLICATED',
+        'AND',
+        'RESOLVE',
+        'COMPILE',
+    }
+)
+
+
+# The verbs V$SQLCOMMAND lists under a name of their own.
+_SQL_VERB_COMMAND_NAME = {
+    'GRANT': 'GRANT OBJECT',
+    'REVOKE': 'REVOKE OBJECT',
+    'AUDIT': 'AUDIT OBJECT',
+    'NOAUDIT': 'NOAUDIT OBJECT',
+    'CALL': 'CALL METHOD',
 }
 
 
-# Object-less verbs, and the object each bare verb falls back to.
-_OCI_DDL_VERB_COMMAND_TYPE = {'GRANT': oci.OCI_CMD_GRANT, 'REVOKE': oci.OCI_CMD_REVOKE}
+# The longest V$SQLCOMMAND name, in words.
+_SQL_COMMAND_MAX_WORDS = max(len(name.split()) for name in oci.SQL_COMMAND_TYPES)
 
 
+# A bare DDL verb whose object is not one Oracle names falls back to the TABLE
+# variant (#479).
 _OCI_DDL_VERB_DEFAULT_OBJECT = {
     'CREATE': 'TABLE',
     'ALTER': 'TABLE',
@@ -9971,20 +9991,29 @@ _OCI_DDL_VERB_DEFAULT_OBJECT = {
 def ddl_command_type(sql: str) -> int | None:
     """The V$SQL command type for a DDL / session statement, or None if it is not
     one the Mirror recognises (so it falls back to the generic no-row status).
-    sqlplus turns this into the completion message ("Table created.", "Index
-    dropped.", "Grant succeeded.", …)."""
-    parts = sql.strip().upper().split()
-    if not parts:
+    sqlplus turns this into the completion message ("Table created.", "Session
+    altered.", "Procedure created.", …). The statement resolves by its longest
+    leading phrase that V$SQLCOMMAND names, its modifiers skipped (#2012)."""
+    words = re.split(r'[\s(;]+', sql.strip().upper(), maxsplit=12)
+    words = [w for w in words if w]
+    if not words:
         return None
-    verb = parts[0]
-    if verb in _OCI_DDL_VERB_COMMAND_TYPE:
-        return _OCI_DDL_VERB_COMMAND_TYPE[verb]
-    if verb not in _OCI_DDL_VERB_DEFAULT_OBJECT:
-        return None
-    obj = parts[1] if len(parts) > 1 else _OCI_DDL_VERB_DEFAULT_OBJECT[verb]
-    return _OCI_DDL_COMMAND_TYPE.get(
-        (verb, obj), _OCI_DDL_COMMAND_TYPE[(verb, _OCI_DDL_VERB_DEFAULT_OBJECT[verb])]
-    )
+    verb = words[0]
+    if verb in _SQL_VERB_COMMAND_NAME and (
+        len(words) < 3 or ' '.join(words[:3]) not in oci.SQL_COMMAND_TYPES
+    ):
+        return oci.SQL_COMMAND_TYPES[_SQL_VERB_COMMAND_NAME[verb]]
+    rest = words[1:]
+    while rest and rest[0] in _DDL_MODIFIERS:
+        rest = rest[1:]
+    phrase = [verb, *rest]
+    for n in range(min(len(phrase), _SQL_COMMAND_MAX_WORDS), 0, -1):
+        code = oci.SQL_COMMAND_TYPES.get(' '.join(phrase[:n]))
+        if code is not None:
+            return code
+    if verb in _OCI_DDL_VERB_DEFAULT_OBJECT:
+        return oci.SQL_COMMAND_TYPES[f'{verb} {_OCI_DDL_VERB_DEFAULT_OBJECT[verb]}']
+    return None
 
 
 def encode_dml_status_oci(keyword: str, rowcount: int, *, sequence: int) -> bytes:

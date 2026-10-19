@@ -8028,6 +8028,22 @@ LID in §14.6). **Verified live** against sqlplus over the
 Mirror: `insert/update/delete` print the right verb and count, `create/drop`
 print `Table created.` / `Table dropped.` (and, via the resolved command type, `Index created.`, `Table altered.`, `View dropped.`, `Table truncated.`, and the rest).
 
+**The command type is V$SQLCOMMAND's** (#2012). The code a server puts at OER
+offset 22 is the statement kind's `COMMAND_TYPE` in `V$SQLCOMMAND`, whose 238 rows
+on a 23ai name each kind by its statement's own leading words: `CREATE PACKAGE
+BODY` 97, `ALTER SESSION` 42, `COMMENT` 29, `DROP FUNCTION` 93. A statement
+resolves by its longest leading phrase that is a name, with the modifiers that
+can stand between the verb and the object kind skipped (`OR REPLACE`,
+`EDITIONABLE`, `FORCE`, `PUBLIC`, `UNIQUE`, `GLOBAL TEMPORARY`, ...). `GRANT`,
+`REVOKE`, `AUDIT` and `NOAUDIT` are listed as `<verb> OBJECT`, and `CALL` as `CALL
+METHOD`.
+
+`SHOW ERRORS` is a separate matter. Direct to a 23ai, after a `CREATE` that
+compiled with errors, sqlplus queries `ALL_ERRORS` with the object's kind and
+its name bound (`:NMBIND_SHOW_OBJ`). Through a Mirror that does not report the
+compile warning, it sends no query at all and prints "No errors." itself, so it
+depends on that warning (#2013), not on the command type.
+
 A bare `COMMIT` / `ROLLBACK` typed in sqlplus is executed as a SQL statement (`OCIStmtExecute`), not `OCITransCommit` / `OCITransRollback`, so it reaches the OCI **execute** path rather than the `TTI_COMMIT` / `TTI_ROLLBACK` piggyback. Its reply is the same no-row command-complete OER, tagged with the transaction-control command type — **`COMMIT` = 44**, **`ROLLBACK` = 45** (captured live from 11g) — from which sqlplus renders `Commit complete.` / `Rollback complete.` The live-server frame also carries a session cursor id and SCN region, but sqlplus renders the message from the command type alone, so the Mirror reuses `encode_ddl_status_oci` and does not fabricate those.
 
 Every OCI reply that carries an OER draws the live counter, including the
