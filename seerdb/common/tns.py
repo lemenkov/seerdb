@@ -10356,6 +10356,23 @@ def _oci_object_image(obj: 'DbObject') -> bytes:
     )
 
 
+def _oci_value_bytes(data: bytes) -> bytes:
+    """A value as OCI frames it (#2042): a ub1 length, or past 252 bytes 0xFE
+    and chunks whose lengths are fixed-width, a ub4 LE from 12.1 and a ub1
+    below, ending at a zero length. The thin form's chunk lengths are TTC's
+    variable-width ones, which sqlplus misreads: a DBMS_OUTPUT.GET_LINES batch
+    past 252 bytes hung it. Live 18c sends chunks of up to 2000 bytes, a
+    3026-byte image as 2000 + 1026 (`fe d0 07 00 00` ... `00 00 00 00`); live
+    11g sends 255-byte ones (`fe ff` ... `00`)."""
+    if len(data) <= TNS_MAX_SHORT_LENGTH:
+        return bytes([len(data)]) + data
+    out = bytearray(b'\xfe')
+    for at in range(0, len(data), 0xFF):
+        chunk = data[at : at + 0xFF]
+        out += bytes([len(chunk)]) + chunk
+    return bytes(out) + b'\x00'
+
+
 def _oci_out_object_value(value: object, toid: bytes) -> bytes:
     from seerdb.common.dbobject import DbObject
 
@@ -10363,10 +10380,7 @@ def _oci_out_object_value(value: object, toid: bytes) -> bytes:
         image = _oci_object_image(value)
     else:
         image = getattr(value, 'image', b'') or b''
-    if len(image) <= TNS_MAX_SHORT_LENGTH:
-        framed = bytes([len(image)]) + image
-    else:
-        framed = _bytes_with_length(image)
+    framed = _oci_value_bytes(image)
     return (
         _kod_item_bytes(_kod_ref(toid, system=False))
         + (
