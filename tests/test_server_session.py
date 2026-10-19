@@ -2955,6 +2955,45 @@ def test_sqlplus_10_2_gets_the_nls_parameters_in_the_frame() -> None:
     assert reply[29 + len(_OCI_LIVE_NLS_10_2)] == 0x04  # the OER follows
 
 
+# A DBMS_OUTPUT.GET_LINES image as a live 11g frames it to sqlplus 23.26
+# (#2042), compressed: three 200-character lines, 615 bytes, in 255-byte
+# chunks with ub1 lengths, ending at a zero length. A server that does not
+# advertise BIG_CHUNK_CLR in its compile capabilities -- 11g, the Mirror --
+# frames every value this way, whatever the field version; a live 18c, which
+# does, sends ub4-length chunks of up to 2000 bytes instead, and then reads
+# them back that way too.
+_OCI_LIVE_IMAGE_11G = zlib.decompress(
+    base64.b64decode('eNr797+D8R8DA1M6IzMDy4nyquEBSPDI/2HjE/JAJr188p8BAECuJqs=')
+)
+
+
+def _unchunk(framed: bytes) -> bytes:
+    data, at = b'', 1
+    while size := framed[at]:
+        data += framed[at + 1 : at + 1 + size]
+        at += 1 + size
+    return data
+
+
+@pytest.mark.parametrize(
+    'field_version', ['FIELD_VERSION_11_2', 'FIELD_VERSION_18_1_EXT_1']
+)
+def test_a_long_oci_value_is_chunked_as_a_live_11g_does(field_version: str) -> None:
+    # In the 12c band the thin form's chunks have ub4 lengths, which sqlplus
+    # reads only from a server advertising BIG_CHUNK_CLR, and it hung; below
+    # 12.1 they are already the ub1 ones.
+    from seerdb.common import tns_consts
+    from seerdb.common.tns import _ENCODE_FIELD_VERSION, _oci_value_bytes
+
+    image = _unchunk(_OCI_LIVE_IMAGE_11G)
+    assert len(image) == 615
+    token = _ENCODE_FIELD_VERSION.set(getattr(tns_consts, field_version))
+    try:
+        assert _oci_value_bytes(image) == _OCI_LIVE_IMAGE_11G
+    finally:
+        _ENCODE_FIELD_VERSION.reset(token)
+
+
 # The capability block each sqlplus sends (its DTY proper, one round after its
 # TTI_PRO): sqlplus 23.26 and sqlplus 11.2.0.2, captured against live 11g.
 _SQLPLUS_23_CAPABILITIES = bytes.fromhex(

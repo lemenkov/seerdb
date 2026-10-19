@@ -8553,6 +8553,28 @@ batch comes back short. The Mirror keeps the last block that handed OUT values
 back and runs it again with the new IN values. Before that, it refused the call,
 and sqlplus printed the first 30 lines and dropped the rest, over every backend.
 
+**A batch past 252 bytes (#2042).** The lines collection's image is a value
+like any other, and past 252 bytes it is chunked: `0xFE`, then chunks, then a
+zero length. The chunk lengths' width is set by one compile capability:
+**BIG_CHUNK_CLR**, bit `0x20` of `CCAP_TTC3` (python-oracledb's
+`TNS_CCAP_BIG_CHUNK_CLR`).
+- A server that advertises it, as a live 18c does, sends ub4 LE lengths in
+  chunks of up to 2000 bytes: a 3026-byte image as `fe d0 07 00 00` + 2000,
+  `02 04 00 00` + 1026, `00 00 00 00`.
+- One that doesn't, as 11g and the Mirror don't, sends ub1 lengths in 255-byte
+  chunks, whatever the field version: a 615-byte image as `fe ff` + 255, `ff`
+  + 255, `69` + 105, `00`. Live 11g sends this even to sqlplus 23.26.
+
+The bit sets the width in both directions. Against a server that advertises it,
+sqlplus also sends its long SQL text and bind values in ub4 chunks, which is why
+#2015 saw a 4000-byte LOB buffer arrive with ub4 lengths at a live 18c and ub1
+lengths at the Mirror. The Mirror keeps the bit clear and sends ub1 chunks
+(`_oci_value_bytes`). Before, it sent the thin form, whose chunk lengths are ub4
+in the 12c band, and sqlplus misread the image and hung. Setting the bit instead
+was tried. Every GET_LINES batch then printed, but sqlplus also switched its LOB
+reads and its long SQL text to big chunks, which the Mirror doesn't read, and
+`SHOW ERRORS` and a 5000-byte CLOB select broke.
+
 The Mirror reads the bind (`_oci_bind_descriptors`, the type id riding on
 `bind_types` to the backend as `BindVar.toid`) and writes the value
 (`encode_out_bind_response_oci` with `types` / `inputs`); against the captures the
