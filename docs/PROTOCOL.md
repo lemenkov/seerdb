@@ -8575,6 +8575,16 @@ was tried. Every GET_LINES batch then printed, but sqlplus also switched its LOB
 reads and its long SQL text to big chunks, which the Mirror doesn't read, and
 `SHOW ERRORS` and a 5000-byte CLOB select broke.
 
+**Every value, both ways (#2053).** The framing is not GET_LINES's own. It
+covers every OCI value past 252 bytes: a scalar OUT value, a character or RAW
+row cell, and an IN value. sqlplus sends a 300-character VARCHAR2 variable's
+value back to the Mirror as `fe ff` + 255, `2d` + 45, `00`, and a live 18c sends
+the OUT value as one big `fe 2c 01 00 00` chunk, since it advertises the bit.
+In the thin form a long OUT value or row cell hung sqlplus, a `select rpad('x',
+1000, 'y')` among them. Read with the thin decoder, a long IN value lost its
+start. The Mirror reads IN values in ub1 chunks (`_oci_read_value`) and frames
+OUT values and character, CHAR and RAW cells in them.
+
 The Mirror reads the bind (`_oci_bind_descriptors`, the type id riding on
 `bind_types` to the backend as `BindVar.toid`) and writes the value
 (`encode_out_bind_response_oci` with `types` / `inputs`); against the captures the

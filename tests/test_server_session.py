@@ -2994,6 +2994,59 @@ def test_a_long_oci_value_is_chunked_as_a_live_11g_does(field_version: str) -> N
         _ENCODE_FIELD_VERSION.reset(token)
 
 
+# sqlplus 23.26 printing a 300-character VARCHAR2 variable through a Mirror
+# (#2053): `SELECT :v v FROM SYS.DUAL`, the value as an IN bind in 255-byte
+# chunks with ub1 lengths -- `fe ff` ... `00` -- since the Mirror does not
+# advertise big chunks. Its piggyback is still on, as the session strips it.
+_OCI_SELECT_LONG_VARCHAR = zlib.decompress(
+    base64.b64decode(
+        'eNpjjmPLbGAAg3//IcAPic2LxIbRILWMDKh6YHxkMXQ+NnMYcJhPKyAV7Orj6hyiYFWmUKbgFuTvqxAcGaznEurow8CIRxtcrgFNnJGZgeGBHn47M5kRRrP/+19YNKKBLkmqGQD8E+oc'
+    )
+)
+
+
+def test_a_long_in_value_is_read_in_ub1_chunks() -> None:
+    # Read with the thin decoder, whose chunk lengths are ub4 in the 12c band,
+    # it lost its start and arrived short.
+    from seerdb.common.tns import parse_exec_oci, strip_oci_piggyback
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1
+
+    request = _at_field_version(
+        FIELD_VERSION_18_1_EXT_1,
+        parse_exec_oci,
+        strip_oci_piggyback(_OCI_SELECT_LONG_VARCHAR),
+    )
+    assert request.binds == ['q' + 'r' * 299]
+
+
+@pytest.mark.parametrize('size', [253, 300, 3000])
+def test_a_long_out_value_and_row_cell_go_in_ub1_chunks(size: int) -> None:
+    # An OUT value and a row cell past 252 bytes went in the thin form's
+    # chunks, ub4 lengths in the 12c band, and sqlplus hung on them (#2053).
+    from seerdb.common.tns import (
+        _ENCODE_FIELD_VERSION,
+        _encode_oci_value,
+        _oci_scalar_out_value,
+        _oci_value_bytes,
+    )
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1, TNS_TYPE_VARCHAR
+
+    text = 'x' * size
+    col = ColumnMeta(
+        name=b'V', data_type=TNS_TYPE_VARCHAR, data_length=4000, max_size=4000
+    )
+    token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT_1)
+    try:
+        framed = _oci_value_bytes(text.encode())
+        assert framed[0] == 0xFE and framed[1] == min(size, 255) and framed[-1] == 0
+        assert _oci_scalar_out_value(text) == framed
+        assert _encode_oci_value(text, col) == framed
+        # A short value keeps its one-byte length.
+        assert _encode_oci_value('short', col) == b'\x05short'
+    finally:
+        _ENCODE_FIELD_VERSION.reset(token)
+
+
 # The capability block each sqlplus sends (its DTY proper, one round after its
 # TTI_PRO): sqlplus 23.26 and sqlplus 11.2.0.2, captured against live 11g.
 _SQLPLUS_23_CAPABILITIES = bytes.fromhex(
