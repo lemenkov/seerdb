@@ -2308,6 +2308,13 @@ thin figure, §6.2). It counts them in the max row size as 11 (DAY TO SECOND),
 5 (YEAR TO MONTH) and 16 (ROWID), one single-column SELECT apiece. The Mirror
 falls back to those figures where the backend gives none.
 
+BINARY_FLOAT and BINARY_DOUBLE are fixed-width, and a live 18c describes them so
+whatever their source (#2018). Each has a data length of 1 and no max size, and
+counts its 4 or 8 bytes toward the max row size. A passthrough's PEP 249 tuple
+gives both a display size of 127. Described with that length, sqlplus refused
+the column with ORA-03115 and printed "no rows selected". The row cells were
+already right: `04 bf c0 00 00` and `08 c0 04 00 00 00 00 00 00` for 1.5 and 2.5.
+
 The ROWID cell is not the thin form either. OCI reads 16 bytes, the data object
 number, relative file number, block number and row number, each a ub4 LE. Four
 rows of one table, against a live 18c:
