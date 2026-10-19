@@ -2355,6 +2355,47 @@ AABAomAAMAAAACLAEr  10  26 0a 04 00  0c 00 00 00  8b 00 00 00  2b 01 00 00
                         object 264742  file 12   block 139    row 299
 ```
 
+**NLS parameters (the Mirror, OCI dialect, #2020).** sqlplus formats DATE,
+TIMESTAMP and NUMBER columns itself: it is sent a DATE's seven bytes and renders
+them by the session's NLS parameters. It learns those from the server. After an
+`ALTER SESSION SET NLS_…` a live 18c's reply carries a **SYNC server piggyback**
+(`17 05`), between the status frame and its OER. It is the thin form's fields
+(§31) in fixed widths: a ub2 count of DTYs (1) and their length byte (`0x10`), a
+ub4 count of pairs (18) and their length byte (`0x16`), then per pair a ub4
+binary length, a ub4 text length, the text as a value and a ub2 keyword, and a
+ub4 of flags last. The keywords, one `ALTER SESSION` per parameter, in the order
+a live server sends them:
+
+| kw | parameter | kw | parameter |
+|---|---|---|---|
+| 16 | NLS_LANGUAGE | 11 | NLS_SORT |
+| 9 | NLS_TERRITORY | 57 | NLS_TIME_FORMAT |
+| 0 | NLS_CURRENCY | 58 | NLS_TIMESTAMP_FORMAT |
+| 1 | NLS_ISO_CURRENCY | 59 | NLS_TIME_TZ_FORMAT |
+| 2 | NLS_NUMERIC_CHARACTERS | 60 | NLS_TIMESTAMP_TZ_FORMAT |
+| 10 | NLS_CHARACTERSET | 52 | NLS_DUAL_CURRENCY |
+| 12 | NLS_CALENDAR | 50 | NLS_COMP |
+| 7 | NLS_DATE_FORMAT | 61 | NLS_LENGTH_SEMANTICS |
+| 8 | NLS_DATE_LANGUAGE | 62 | NLS_NCHAR_CONV_EXCP |
+
+The order matters. sqlplus applies the pairs in turn, and a territory resets
+the formats it implies, so a date format sent before the territory is lost.
+Every reply carries all of them, since one parameter implies others: setting the
+territory to GERMANY changes nine.
+
+sqlplus 10.2 gets the same pairs another way: inside the status frame, not as a
+piggyback. A live 11g's 10.2 frame has, from byte 29, a **ub2** count of pairs,
+the pairs as above and the ub4 of flags. The Mirror's 35-byte frame ends in
+exactly that region, empty (a zero count and zero flags), which is why an
+ordinary status already reads right to 10.2. The `17 05` piggyback instead made
+10.2 drop the connection.
+
+The Mirror reads them back from the backend's `NLS_SESSION_PARAMETERS` after the
+statement, adds the character set (AL32UTF8) that view leaves out, and sends the
+piggyback in that order. sqlplus 23.26, 11.2 and 10.2 then print what a live
+server prints. `ALTER SESSION SET TIME_ZONE` gets a piggyback of its own, keyword
+163 with a binary value, which isn't sent yet.
+
 **`DESCRIBE <object>` (the Mirror, OCI dialect).** sqlplus `DESC table` sends a
 dedicated describe call — `TTI_FUN 0x77` carrying the object name as the trailing
 length-prefixed token (`… 02 00 00 00 <ub1 namelen> <name>`) — and expects a

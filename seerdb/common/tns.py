@@ -10199,8 +10199,74 @@ _OCI_OER_WARN_OFF = 27
 _OCI_OER_WARN_COMPILATION = 0x21
 
 
+# The NLS parameters an OCI SYNC piggyback reports, by the keyword number a
+# live 18c gives each (#2020): one ALTER SESSION per parameter, the changed pair
+# read off each reply. In the order it sends them, which matters: sqlplus
+# applies them in turn, and a territory resets the formats it implies, so a
+# date format sent before it is lost.
+OCI_NLS_KEYWORDS = {
+    'NLS_LANGUAGE': 16,
+    'NLS_TERRITORY': 9,
+    'NLS_CURRENCY': 0,
+    'NLS_ISO_CURRENCY': 1,
+    'NLS_NUMERIC_CHARACTERS': 2,
+    'NLS_CHARACTERSET': 10,
+    'NLS_CALENDAR': 12,
+    'NLS_DATE_FORMAT': 7,
+    'NLS_DATE_LANGUAGE': 8,
+    'NLS_SORT': 11,
+    'NLS_TIME_FORMAT': 57,
+    'NLS_TIMESTAMP_FORMAT': 58,
+    'NLS_TIME_TZ_FORMAT': 59,
+    'NLS_TIMESTAMP_TZ_FORMAT': 60,
+    'NLS_DUAL_CURRENCY': 52,
+    'NLS_COMP': 50,
+    'NLS_LENGTH_SEMANTICS': 61,
+    'NLS_NCHAR_CONV_EXCP': 62,
+}
+
+
+# Where the session-state pairs sit in the DDL status frame below 11.2 (#2020).
+_OCI_DDL_SESSION_STATE_OFF = 29
+
+
+def _oci_session_pairs(pairs: list[tuple[int, str]], *, count_width: int) -> bytes:
+    # The pairs as OCI writes them: a count, then per pair a ub4 binary length,
+    # a ub4 text length and the text as a value, and the ub2 keyword; a ub4 of
+    # flags last.
+    out = bytearray(len(pairs).to_bytes(count_width, 'little'))
+    for keyword, text in pairs:
+        value = text.encode('utf-8')
+        out += bytes(4)  # binary value length
+        out += _oci_ub4(len(value))
+        if value:
+            out += bytes([len(value)]) + value
+        out += keyword.to_bytes(2, 'little')
+    out += bytes(4)  # flags
+    return bytes(out)
+
+
+def encode_sync_piggyback_oci(pairs: list[tuple[int, str]]) -> bytes:
+    """The SYNC server piggyback in the OCI dialect (#2020): the thin form's
+    fields (:func:`encode_sync_piggyback`), fixed-width. A ub2 count of DTYs and
+    their length, a ub4 count of pairs and their length byte, then per pair a
+    ub4 binary length, a ub4 text length and the text as a value, and the ub2
+    keyword; a ub4 of flags last. A live 18c reports the session's NLS
+    parameters this way after an ALTER SESSION SET NLS_..., and sqlplus formats
+    its DATE, TIMESTAMP and NUMBER columns by them."""
+    head = bytes([TTI_SVR_PIGGYBACK, TNS_SERVER_PIGGYBACK_SYNC])
+    head += (1).to_bytes(2, 'little') + bytes([0x10])  # one DTY, its length
+    pairs_bytes = _oci_session_pairs(pairs, count_width=4)
+    # The count, then the pairs' length byte (constant), then the pairs.
+    return head + pairs_bytes[:4] + bytes([0x16]) + pairs_bytes[4:]
+
+
 def encode_ddl_status_oci(
-    command_type: int, *, sequence: int, compilation_warning: bool = False
+    command_type: int,
+    *,
+    sequence: int,
+    compilation_warning: bool = False,
+    session_pairs: list[tuple[int, str]] | None = None,
 ) -> bytes:
     """OCI reply for a DDL / no-row statement — success so sqlplus prints the
     matching message ("Table created.", "Index dropped.", "Table truncated.", …).
@@ -10221,7 +10287,24 @@ def encode_ddl_status_oci(
     oer[18] = 1
     if compilation_warning:
         oer[_OCI_OER_WARN_OFF] = _OCI_OER_WARN_COMPILATION
-    return _OCI_DDL_FRAME_PREFIX + bytes(oer)
+    if not session_pairs:
+        return _OCI_DDL_FRAME_PREFIX + bytes(oer)
+    if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2:
+        # The session's NLS parameters, as a SYNC piggyback between the frame
+        # and its OER, where a live 18c puts them (#2020).
+        return (
+            _OCI_DDL_FRAME_PREFIX
+            + encode_sync_piggyback_oci(session_pairs)
+            + bytes(oer)
+        )
+    # Below 11.2 they ride in the frame itself: its last six bytes are a ub2
+    # count of pairs and a ub4 of flags, the pairs between them. A live 11g to
+    # sqlplus 10.2 (#2020).
+    return (
+        _OCI_DDL_FRAME_PREFIX[:_OCI_DDL_SESSION_STATE_OFF]
+        + _oci_session_pairs(session_pairs, count_width=2)
+        + bytes(oer)
+    )
 
 
 _OCI_OUTBIND_DEFINE_MARKER = 0x10

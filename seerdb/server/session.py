@@ -22,6 +22,7 @@ import datetime
 import functools
 import hmac
 import logging
+import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import replace
@@ -63,6 +64,7 @@ from seerdb.common.tns import (
     AUTH_SERIAL_NUM,
     LOBOPS_ERR_ALREADY_OPEN,
     LOBOPS_ERR_NOT_OPENED,
+    OCI_NLS_KEYWORDS,
     ArrayOutBind,
     ColumnMeta,
     ExecRequest,
@@ -2074,8 +2076,50 @@ def _mark_transaction(sql: str, autocommit: bool) -> None:
         _ENCODE_TXN_IN_PROGRESS.set(True)
 
 
+# An ALTER SESSION that sets an NLS parameter (#2020).
+_ALTER_SESSION_NLS = re.compile(r'\s*ALTER\s+SESSION\s+SET\s+NLS_', re.IGNORECASE)
+
+
+def _oci_nls_pairs(backend: Backend) -> list[tuple[int, str]]:
+    """The session's NLS parameters, for the reply to an NLS ALTER SESSION (#2020).
+
+    A live server sends them all after an ALTER SESSION SET NLS_..., and sqlplus
+    formats its DATE, TIMESTAMP and NUMBER columns by them -- it is sent a DATE's
+    seven bytes and renders them itself. Without them `alter session set
+    nls_date_format = 'YYYY-MM-DD'` changed nothing sqlplus printed. Read from
+    the backend's NLS_SESSION_PARAMETERS, so a parameter another one implies (a
+    territory's date format) is reported as the backend has it; nothing when the
+    backend cannot say."""
+    try:
+        rows = backend.execute(
+            'SELECT parameter, value FROM nls_session_parameters'
+        ).rows
+    except BackendError as err:
+        logger.debug('NLS parameters for sqlplus: %s', err)
+        return []
+    values = {
+        str(name).upper(): '' if value is None else str(value) for (name, value) in rows
+    }
+    # The character set is the database's, which the session view leaves out;
+    # the Mirror speaks AL32UTF8.
+    values.setdefault('NLS_CHARACTERSET', 'AL32UTF8')
+    # In OCI_NLS_KEYWORDS's order, a live server's: a territory first, then
+    # the formats that override what it implies.
+    pairs = [
+        (keyword, values[name])
+        for (name, keyword) in OCI_NLS_KEYWORDS.items()
+        if name in values
+    ]
+    return pairs
+
+
 def _oci_no_row_status(
-    sql: str, rowcount: int, seq: '_OciSequence', *, compilation_warning: bool = False
+    sql: str,
+    rowcount: int,
+    seq: '_OciSequence',
+    *,
+    compilation_warning: bool = False,
+    session_pairs: list[tuple[int, str]] | None = None,
 ) -> bytes:
     # Pick the OCI success reply for a statement that returned no columns, so
     # sqlplus renders the right message (#348 / #349): DML carries the affected row
@@ -2099,6 +2143,7 @@ def _oci_no_row_status(
             command_type,
             sequence=seq.next(),
             compilation_warning=compilation_warning,
+            session_pairs=session_pairs,
         )
     return encode_status_oci(seq.next())
 
@@ -2234,6 +2279,11 @@ def _answer_query_oci(
                 result.rowcount,
                 seq,
                 compilation_warning=result.compilation_warning,
+                session_pairs=(
+                    _oci_nls_pairs(backend)
+                    if _ALTER_SESSION_NLS.match(request.sql)
+                    else None
+                ),
             ),
         )
         return None, [], {}

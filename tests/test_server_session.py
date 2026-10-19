@@ -2778,6 +2778,136 @@ def test_printing_an_unset_clob_variable_is_refused() -> None:
     assert backend.calls == []
 
 
+# The SYNC piggyback a live 18c sends sqlplus 23.26 after `alter session set
+# nls_date_format = 'YYYY-MM-DD'` (#2020): the session's NLS parameters, in
+# this order, each a fixed-width pair. sqlplus formats DATE, TIMESTAMP and
+# NUMBER columns by them; without it the ALTER changed nothing it printed.
+_OCI_LIVE_NLS_PIGGYBACK = bytes.fromhex(
+    '17050100101200000016000000000800000008414d45524943414e1000000000'
+    '000700000007414d455249434109000000000001000000012400000000000007'
+    '00000007414d455249434101000000000002000000022e2c0200000000000800'
+    '000008414c3332555446380a00000000000900000009475245474f5249414e0c'
+    '00000000000a0000000a595959592d4d4d2d4444070000000000080000000841'
+    '4d45524943414e080000000000060000000642494e4152590b00000000000e00'
+    '00000e48482e4d492e535358464620414d390000000000180000001844442d4d'
+    '4f4e2d52522048482e4d492e535358464620414d3a0000000000120000001248'
+    '482e4d492e535358464620414d20545a523b00000000001c0000001c44442d4d'
+    '4f4e2d52522048482e4d492e535358464620414d20545a523c00000000000100'
+    '00000124340000000000060000000642494e4152593200000000000400000004'
+    '425954453d0000000000050000000546414c53453e0000000000'
+)
+_LIVE_NLS_SESSION = [
+    ('NLS_LANGUAGE', 'AMERICAN'),
+    ('NLS_TERRITORY', 'AMERICA'),
+    ('NLS_CURRENCY', '$'),
+    ('NLS_ISO_CURRENCY', 'AMERICA'),
+    ('NLS_NUMERIC_CHARACTERS', '.,'),
+    ('NLS_CALENDAR', 'GREGORIAN'),
+    ('NLS_DATE_FORMAT', 'YYYY-MM-DD'),
+    ('NLS_DATE_LANGUAGE', 'AMERICAN'),
+    ('NLS_SORT', 'BINARY'),
+    ('NLS_TIME_FORMAT', 'HH.MI.SSXFF AM'),
+    ('NLS_TIMESTAMP_FORMAT', 'DD-MON-RR HH.MI.SSXFF AM'),
+    ('NLS_TIME_TZ_FORMAT', 'HH.MI.SSXFF AM TZR'),
+    ('NLS_TIMESTAMP_TZ_FORMAT', 'DD-MON-RR HH.MI.SSXFF AM TZR'),
+    ('NLS_DUAL_CURRENCY', '$'),
+    ('NLS_COMP', 'BINARY'),
+    ('NLS_LENGTH_SEMANTICS', 'BYTE'),
+    ('NLS_NCHAR_CONV_EXCP', 'FALSE'),
+]
+
+
+class _OciNlsBackend(_OciCountingBackend):
+    def execute(self, sql: str, binds=()) -> Result:
+        self.calls.append(sql)
+        if 'nls_session_parameters' in sql:
+            # Not in the live order: the reply puts them in it.
+            return Result(
+                columns=[_REFCURSOR_COLUMNS[1], _REFCURSOR_COLUMNS[1]],
+                rows=list(reversed(_LIVE_NLS_SESSION)),
+            )
+        return Result()
+
+
+def _oci_alter_session(sql: str) -> bytes:
+    # The captured sqlplus OALL8 of a short statement, its SQL swapped.
+    body = bytearray(_OCI_EXEC_INSERT)
+    old = b'insert into sp_ac values (4242)'
+    at = body.index(old)
+    body[at - 1] = len(sql)
+    body[at : at + len(old)] = sql.encode()
+    body[19:23] = len(sql).to_bytes(4, 'little')
+    return bytes(body)
+
+
+def test_the_nls_piggyback_matches_the_live_one() -> None:
+    from seerdb.common.tns import OCI_NLS_KEYWORDS, encode_sync_piggyback_oci
+
+    values = dict(_LIVE_NLS_SESSION, NLS_CHARACTERSET='AL32UTF8')
+    pairs = [(kw, values[name]) for (name, kw) in OCI_NLS_KEYWORDS.items()]
+    assert encode_sync_piggyback_oci(pairs) == _OCI_LIVE_NLS_PIGGYBACK
+
+
+@pytest.mark.parametrize(
+    ('sql', 'reported'),
+    [
+        ("alter session set nls_date_format = 'YYYY-MM-DD'", True),
+        ("ALTER SESSION SET NLS_TERRITORY = 'GERMANY'", True),
+        ('alter session set current_schema = pyo', False),
+    ],
+)
+def test_an_nls_alter_session_reports_the_session_parameters(sql, reported) -> None:
+    from seerdb.server.session import _serve_oci_session
+
+    stream: Any = _OciOneCallStream(_oci_alter_session(sql))
+    backend: Any = _OciNlsBackend()
+    _serve_oci_session(stream, backend, 'PYO')
+    [reply] = stream.sent
+    assert (_OCI_LIVE_NLS_PIGGYBACK in reply) is reported
+    if reported:
+        # Between the status frame and its OER, as a live 18c puts it.
+        assert reply.index(_OCI_LIVE_NLS_PIGGYBACK) == 35
+        assert reply[35 + len(_OCI_LIVE_NLS_PIGGYBACK)] == 0x04
+
+
+# The same parameters as a live 11g reports them to sqlplus 10.2 (#2020): not a
+# piggyback but inside the status frame, from byte 29, a ub2 count of pairs,
+# the pairs, then a ub4 of flags.
+_OCI_LIVE_NLS_10_2 = bytes.fromhex(
+    '1200000000000800000008414d45524943414e1000000000000700000007414d'
+    '45524943410900000000000100000001240000000000000700000007414d4552'
+    '49434101000000000002000000022e2c0200000000000800000008414c333255'
+    '5446380a00000000000900000009475245474f5249414e0c00000000000a0000'
+    '000a595959592d4d4d2d44440700000000000800000008414d45524943414e08'
+    '0000000000060000000642494e4152590b00000000000e0000000e48482e4d49'
+    '2e535358464620414d390000000000180000001844442d4d4f4e2d5252204848'
+    '2e4d492e535358464620414d3a0000000000120000001248482e4d492e535358'
+    '464620414d20545a523b00000000001c0000001c44442d4d4f4e2d5252204848'
+    '2e4d492e535358464620414d20545a523c000000000001000000012434000000'
+    '0000060000000642494e4152593200000000000400000004425954453d000000'
+    '0000050000000546414c53453e0000000000'
+)
+
+
+def test_sqlplus_10_2_gets_the_nls_parameters_in_the_frame() -> None:
+    from seerdb.common.tns import (
+        _ENCODE_FIELD_VERSION,
+        OCI_NLS_KEYWORDS,
+        encode_ddl_status_oci,
+    )
+    from seerdb.common.tns_consts import FIELD_VERSION_10_2
+
+    values = dict(_LIVE_NLS_SESSION, NLS_CHARACTERSET='AL32UTF8')
+    pairs = [(kw, values[name]) for (name, kw) in OCI_NLS_KEYWORDS.items()]
+    token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_10_2)
+    try:
+        reply = encode_ddl_status_oci(42, sequence=1, session_pairs=pairs)
+    finally:
+        _ENCODE_FIELD_VERSION.reset(token)
+    assert reply[29 : 29 + len(_OCI_LIVE_NLS_10_2)] == _OCI_LIVE_NLS_10_2
+    assert reply[29 + len(_OCI_LIVE_NLS_10_2)] == 0x04  # the OER follows
+
+
 # The capability block each sqlplus sends (its DTY proper, one round after its
 # TTI_PRO): sqlplus 23.26 and sqlplus 11.2.0.2, captured against live 11g.
 _SQLPLUS_23_CAPABILITIES = bytes.fromhex(
