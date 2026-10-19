@@ -7163,22 +7163,60 @@ def test_a_sql_statement_binds_each_occurrence() -> None:
     # value for each occurrence, `:1` twice is two binds. One value a name, or
     # a PL/SQL block, binds by name as before.
     sql = 'insert into t values (:1, f(:1, :2, :3))'
-    renamed = _occurrence_binds(sql, [[4, 1626, 1627, 1628]])
+    (renamed, rows) = _occurrence_binds(sql, [[4, 1626, 1627, 1628]])
     assert renamed.count(':1') == 1
-    assert _translate_binds(renamed, [4, 1626, 1627, 1628])[1] == {
+    assert _translate_binds(renamed, rows[0])[1] == {
         'b1': 4,
         'seerdb_occ_14': 1626,
         'b2': 1627,
         'b3': 1628,
     }
-    assert _occurrence_binds(sql, [[4, 1626, 1627]]) == sql
+    assert _occurrence_binds(sql, [[4, 1626, 1627]]) == (sql, [[4, 1626, 1627]])
     block = 'begin :a := :a + 1; end;'
-    assert _occurrence_binds(block, [[1, 2]]) == block
+    assert _occurrence_binds(block, [[1, 2]]) == (block, [[1, 2]])
     # The same value at each occurrence stays one bind, typed by its other use
     # (#15); in an executemany it splits where any row differs.
     predicate = 'select id from t where id = :x or :x is null'
-    assert _occurrence_binds(predicate, [[1, 1]]) == predicate
-    assert _occurrence_binds(predicate, [[1, 1], [2, 3]]) != predicate
+    assert _occurrence_binds(predicate, [[1, 1]]) == (predicate, [[1]])
+    assert _occurrence_binds(predicate, [[1, 1], [2, 3]])[0] != predicate
+
+
+def test_a_repeat_before_another_name_keeps_the_values_in_place() -> None:
+    # A repeat with its first's value stays one bind, and its value left the
+    # rows with it: kept, it took the next name's place, and `:n` read 'x'
+    # (#2066).
+    sql = 'select :s || :s || :n || :s d from dual where :n = 7'
+    (merged, rows) = _occurrence_binds(sql, [['x', 'x', 7, 'x', 7]])
+    assert merged == sql
+    assert rows == [['x', 7]]
+    assert _translate_binds(merged, rows[0])[1] == {'s': 'x', 'n': 7}
+
+
+def test_a_repeat_before_another_name_runs_through_the_mirror() -> None:
+    # The client sends one value per occurrence, for the positional and the
+    # named form alike; both failed with ORA-01722, `:n` reading 'x' (#2066).
+    sql = 'select :s || :s || :n || :s d from dual where :n = 7'
+    listen, server, result = _start_mirror()
+    conn = _connect(listen.getsockname()[1])
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, ['x', 'x', 7, 'x', 7])
+        positional = cur.fetchall()
+        cur.execute(sql, {'s': 'x', 'n': 7})
+        named = cur.fetchall()
+        cur.execute(sql, ['x', 'y', 7, 'x', 7])
+        differing = cur.fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        server.join(timeout=5)
+        listen.close()
+
+    assert result.get('error') is None, result.get('error')
+    assert positional == named == [('xx7x',)]
+    assert differing == [('xy7x',)]
 
 
 def test_translate_binds_repeated_named_bind_is_one_value() -> None:
