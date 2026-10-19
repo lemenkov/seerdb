@@ -8391,7 +8391,16 @@ either band. `kod_system_record` holds SYS.KOTTD's description of itself, and
 `kod_type_record` / `encode_kod_named_reply` describe a user type from what a
 backend's `describe_type(name)` returns -- schema, name, id, kind and the TDS pair.
 The Mirror-over-PG backend answers it from the catalog, with
-`DBMSOUTPUT_LINESARRAY` a VARRAY domain in `sys`. Against the captures both
+`DBMSOUTPUT_LINESARRAY` a VARRAY domain in `sys`. A passthrough answers it for a
+collection type from its upstream (#2016). It gets the id and TDS from
+`DBMS_PICKLER.GET_TYPE_SHAPE(schema, name, …)`, the form 11g has as well as 23ai,
+and the owner and kind from `ALL_COLL_TYPES`, resolving a bare name to the
+current schema and then a public synonym. Its null-image TDS is the one every
+collection has, a single null leaf. A live 23ai's TDS for
+`DBMSOUTPUT_LINESARRAY` is byte for byte the one the PG backend builds. An object
+type isn't served by a passthrough yet: its null-image TDS needs the attribute
+tree, and `GET_TYPE_SHAPE`'s other output, the `LDS`, is a layout descriptor, not
+that tree. Against the captures both
 bands' replies are byte for byte the live ones, but for the instance marker every
 Mirror OER carries.
 
