@@ -544,6 +544,18 @@ class RefCursorOutBind:
 
 
 @dataclass(frozen=True)
+class LobOutBind:
+    """A LOB OUT bind in the OCI reply (#2015): the value a block assigned to a
+    sqlplus ``CLOB`` / ``BLOB`` variable, and the id the Mirror keeps it under.
+    It goes out as a locator naming that id, which sqlplus binds back to read
+    the value."""
+
+    value: object
+    is_clob: bool
+    lob_id: int
+
+
+@dataclass(frozen=True)
 class FetchRequest:
     """A parsed ``TTI_FETCH``: which cursor, and how many rows to return."""
 
@@ -8978,8 +8990,46 @@ _OCI_BIND_TYPES = frozenset(
         # A sqlplus REFCURSOR variable, `01 66 01 00 00` and a ub4 size of 1; its
         # value is a cursor id, zero for one the block is to open (#2014).
         TNS_TYPE_REFCURSOR,
+        # A sqlplus CLOB / BLOB variable, `01 70 01 00 00 50 00 00 00` for a
+        # CLOB; its value is a locator (#2015).
+        TNS_TYPE_CLOB,
+        TNS_TYPE_BLOB,
     }
 )
+
+
+def _oci_read_lob_bind(data: bytes) -> tuple[bytes | None, bytes]:
+    # A LOB bind's value (#2015): a ub4 LE length, then the locator, zero length
+    # for a NULL. The locator is a ub1 length and its bytes, or 0xFE and chunks
+    # ending at a zero one -- sqlplus 23.26's unset 4000-byte buffer. Those chunk
+    # lengths are fixed-width, but which width does not follow the field
+    # version: a ub4 LE to a live 18c (`fe a0 0f 00 00`), a ub1 to 11g and to a
+    # Mirror at the same field version as that 18c (`fe ff`). The length in front
+    # says how long the locator is, so the reading that adds up to it is the one.
+    if len(data) < 4:
+        raise DataError('OCI LOB bind: no length')
+    length = int.from_bytes(data[:4], 'little')
+    data = data[4:]
+    if not length:
+        return None, data
+    if not data:
+        raise DataError('OCI LOB bind: no locator')
+    if data[0] != TNS_LONG_LENGTH_INDICATOR:
+        return data[1 : 1 + data[0]], data[1 + data[0] :]
+    for width in (4, 1):
+        out = bytearray()
+        at = 1
+        size = -1
+        while at + width <= len(data):
+            size = int.from_bytes(data[at : at + width], 'little')
+            at += width
+            if not size or len(out) + size > length:
+                break
+            out += data[at : at + size]
+            at += size
+        if size == 0 and len(out) == length:
+            return bytes(out), data[at:]
+    raise DataError('OCI LOB bind: chunks do not add up to its length')
 
 
 def _oci_bind_descriptors(tail: bytes, bind_count: int) -> list[tuple[int, int, bytes]]:
@@ -9061,6 +9111,20 @@ def _parse_oci_binds(
                 if data_type == TNS_TYPE_ADT:
                     rest = _oci_adt_in_value(rest)
                     values.append(None)
+                    continue
+                if data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
+                    # A ub4 length, then the locator as a DALC: one the Mirror
+                    # handed out, or sqlplus's own unset 4000-byte buffer while
+                    # the variable holds no value (#2015). The session tells
+                    # which.
+                    locator, rest = _oci_read_lob_bind(rest)
+                    values.append(
+                        None
+                        if locator is None
+                        else TempLobRef(
+                            locator=locator, is_blob=data_type == TNS_TYPE_BLOB
+                        )
+                    )
                     continue
                 raw, rest = decode_dalc(rest)
                 if data_type == TNS_TYPE_REFCURSOR:
@@ -10124,6 +10188,7 @@ _OCI_OUTBIND_DEFINE_MARKER = 0x10
 
 
 _OCI_OUTBIND_RETCODE = b'\x00\x00'
+_OCI_OUTBIND_NULL_RETCODE = b'\xff\xff'
 
 
 # An object / collection OUT value in the OCI reply (PROTOCOL.md §40.4): the
@@ -10219,6 +10284,51 @@ def _oci_refcursor_out_value(bind: RefCursorOutBind) -> bytes:
     )
 
 
+# Which sqlplus LOB variable a locator names (#2015): its id, plus one so zero
+# stays "none", in four more bytes of the locator's all-zero run, beside the row
+# slot (#1430). A client echoes the locator without reading it (§14.6).
+_OCI_LOB_LOCATOR_VAR_OFF = 44
+_OCI_LOB_LOCATOR_FLAGS_OFF = 4
+
+
+def _oci_lob_out_value(bind: LobOutBind) -> bytes:
+    # The value as a LOB column's cell goes out, which sqlplus already reads,
+    # naming the variable; then the return code every OUT value ends on.
+    if bind.value is None:
+        # A NULL: no locator, and the return code -1 a live server sends for
+        # one (18c, `exec :vc := null`).
+        return encode_lob_locator_oci(None, bind.is_clob) + _OCI_OUTBIND_NULL_RETCODE
+    cell = bytearray(encode_lob_locator_oci(bind.value, bind.is_clob))
+    locator = len(cell) - len(_oci_lob_locator(bind.is_clob))
+    struct.pack_into('>I', cell, locator + _OCI_LOB_LOCATOR_VAR_OFF, bind.lob_id + 1)
+    return bytes(cell) + _OCI_OUTBIND_RETCODE
+
+
+def oci_lob_var_id(locator: bytes, is_blob: bool) -> int | None:
+    """The sqlplus LOB variable a bound locator names, or None for a locator the
+    Mirror did not hand out -- sqlplus's unset buffer among them (#2015)."""
+    size = len(_oci_lob_locator(not is_blob))
+    if len(locator) < size:
+        return None
+    tail = locator[-size:]
+    template = bytearray(_oci_lob_locator(not is_blob))
+    # The fields a cell patches per value -- the content size and the variable
+    # id -- and the two header flag bytes, of which sqlplus 23.26 clears bit 0x08
+    # of the second when it binds the locator back (`0c 88` returns `0c 80`).
+    for off, width in (
+        (_OCI_LOB_ROW_SIZE_OFF - 6, 4),
+        (_OCI_LOB_LOCATOR_VAR_OFF, 4),
+        (_OCI_LOB_LOCATOR_FLAGS_OFF, 2),
+    ):
+        template[off : off + width] = tail[off : off + width]
+    if tail != bytes(template):
+        return None
+    lob_id = int.from_bytes(
+        tail[_OCI_LOB_LOCATOR_VAR_OFF : _OCI_LOB_LOCATOR_VAR_OFF + 4], 'big'
+    )
+    return lob_id - 1 if lob_id else None
+
+
 def encode_out_bind_response_oci(
     values: list[object],
     *,
@@ -10250,6 +10360,8 @@ def encode_out_bind_response_oci(
         if t == TNS_TYPE_ADT
         else _oci_refcursor_out_value(v)
         if isinstance(v, RefCursorOutBind)
+        else _oci_lob_out_value(v)
+        if isinstance(v, LobOutBind)
         else encode_value(v, 0) + _OCI_OUTBIND_RETCODE
         for v, (t, toid) in zip(values, types)
     )

@@ -68,6 +68,7 @@ from seerdb.common.tns import (
     FetchRequest,
     LobEmitLog,
     LobOpsRequest,
+    LobOutBind,
     NestedCursor,
     ReexecuteRequest,
     RefCursorOutBind,
@@ -138,6 +139,7 @@ from seerdb.common.tns import (
     oci_lob_contents,
     oci_lob_reads,
     oci_lob_row_cells,
+    oci_lob_var_id,
     parse_describe_oci,
     parse_exec,
     parse_exec_oci,
@@ -166,6 +168,7 @@ from seerdb.common.tns_consts import (
     ORA_INSUFFICIENT_PRIVILEGES,
     ORA_INTERNAL_ERROR,
     ORA_INVALID_CURSOR,
+    ORA_INVALID_LOB_LOCATOR,
     ORA_INVALID_USERNAME_PASSWORD,
     ORA_NONEXISTENT_FILE,
     ORA_ORACLE_NOT_AVAILABLE,
@@ -1713,6 +1716,9 @@ def _serve_oci_session(
     # The REF CURSORs blocks opened, by the id their OUT value named; sqlplus
     # re-executes each by that id to fetch its rows (#2014).
     ref_cursors = _OciRefCursors()
+    # The values blocks assigned to sqlplus CLOB / BLOB variables, by the id the
+    # locator each went out as names (#2015).
+    lob_vars = _OciLobVars()
     # LOB contents (wire bytes + is_clob + national) the current statement's rows
     # carry, in the order their locators went out; sqlplus drains them with
     # TTI_LOBOPS reads, slicing the current LOB per each read's offset/amount (#405).
@@ -1807,7 +1813,7 @@ def _serve_oci_session(
                     parked = _serve_oci_long_row(stream, parked, seq, reexecute=True)
                     continue
                 parked, lobs, slot_lobs = _answer_query_oci(
-                    stream, backend, body, seq, ref_cursors
+                    stream, backend, body, seq, ref_cursors, lob_vars
                 )
                 current_lob = None
                 slot_current = {}
@@ -2087,6 +2093,7 @@ def _answer_query_oci(
     body: bytes,
     seq: '_OciSequence',
     ref_cursors: '_OciRefCursors | None' = None,
+    lob_vars: '_OciLobVars | None' = None,
 ) -> tuple[
     tuple[list[ColumnMeta], list[tuple]] | None,
     list[tuple[bytes, bool, bool]],
@@ -2110,6 +2117,27 @@ def _answer_query_oci(
         # startup and everyday statements never reach here.
         _refuse_unhandled_oci(stream, f'OALL8: {err}', seq)
         return None, [], {}
+    if lob_vars is None:
+        lob_vars = _OciLobVars()
+    if any(isinstance(value, TempLobRef) for value in request.binds):
+        # A LOB variable's locator becomes the value it names (#2015).
+        binds = [lob_vars.resolve(value) for value in request.binds]
+        if not is_plsql(request.sql) and any(
+            isinstance(value, TempLobRef) for value in binds
+        ):
+            # sqlplus's own buffer for a variable that holds nothing yet: a
+            # block assigns it, anything else is refused as a live server does.
+            stream.write_packet(
+                TNS_DATA,
+                encode_error_oci(
+                    ORA_INVALID_LOB_LOCATOR,
+                    'ORA-22275: invalid LOB locator specified',
+                    sequence=seq.next(),
+                ),
+            )
+            return None, [], {}
+        binds = [None if isinstance(value, TempLobRef) else value for value in binds]
+        request = replace(request, binds=binds, bind_rows=[binds])
     try:
         # A PL/SQL block (sqlplus VARIABLE / EXEC :v := …) hands its binds over as
         # BindVar so the backend registers them OUT-capable and returns the assigned
@@ -2158,7 +2186,12 @@ def _answer_query_oci(
         stream.write_packet(
             TNS_DATA,
             encode_out_bind_response_oci(
-                [ref_cursors.park(value) for value in result.out_binds],
+                [
+                    lob_vars.keep(ref_cursors.park(value), t)
+                    for value, (t, _cs, _size, _toid) in zip(
+                        result.out_binds, request.bind_types
+                    )
+                ],
                 sequence=seq.next(),
                 # Each bind's type -- an object / collection goes back in its
                 # own framing -- and whether it came in with a value, which the
@@ -2640,6 +2673,41 @@ _END_TO_END_ATTRS = frozenset(
 # carry (0, 0x5be8, 0x5beb), so a re-execute of a statement's own cursor is never
 # taken for one (#2014).
 _OCI_REF_CURSOR_FIRST_ID = 0x100
+
+
+class _OciLobVars:
+    """The values PL/SQL blocks assigned to sqlplus CLOB / BLOB variables in one
+    session (#2015).
+
+    The OUT value goes back as a locator naming its id here; sqlplus binds that
+    locator to read the variable (``PRINT`` runs ``SELECT :v FROM SYS.DUAL``)
+    or to pass it on, and each time it resolves to the value. sqlplus's own
+    buffer for a variable that holds nothing yet stays a TempLobRef, for the
+    caller to tell apart."""
+
+    def __init__(self) -> None:
+        self._values: list[object] = []
+
+    def keep(self, value: object, tns_type: int) -> object:
+        if tns_type not in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
+            return value
+        is_clob = tns_type == TNS_TYPE_CLOB
+        if value is None:
+            return LobOutBind(value=None, is_clob=is_clob, lob_id=0)
+        self._values.append(value)
+        return LobOutBind(value=value, is_clob=is_clob, lob_id=len(self._values) - 1)
+
+    def resolve(self, value: object) -> object:
+        if not isinstance(value, TempLobRef):
+            return value
+        lob_id = oci_lob_var_id(value.locator, value.is_blob)
+        if lob_id is None or lob_id >= len(self._values):
+            # Not one the Mirror handed out: sqlplus's unset buffer.
+            return value
+        kept = self._values[lob_id]
+        if value.is_blob:
+            return BlobValue(kept if isinstance(kept, (bytes, bytearray)) else b'')
+        return ClobValue(kept if isinstance(kept, str) else str(kept))
 
 
 class _OciRefCursors:
