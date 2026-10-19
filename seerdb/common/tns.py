@@ -9003,6 +9003,27 @@ _OCI_BIND_TYPES = frozenset(
 )
 
 
+def _oci_read_value(data: bytes) -> tuple[bytes | list, bytes]:
+    """An IN value as sqlplus sends it to the Mirror (#2053). Past 252 bytes it
+    is 0xFE and chunks with ub1 lengths, ending at a zero one: the Mirror does
+    not advertise BIG_CHUNK_CLR, and sqlplus sends ub4-length chunks only to a
+    server that does (#2042). Read with the thin decoder, whose chunk lengths
+    are ub4 in the 12c band, a 300-character VARCHAR2 lost its start. Anything
+    else is an ordinary value."""
+    if data[:1] != bytes([TNS_LONG_LENGTH_INDICATOR]):
+        return decode_dalc(data)
+    out = bytearray()
+    at = 1
+    while at < len(data):
+        size = data[at]
+        at += 1
+        if not size:
+            return bytes(out), data[at:]
+        out += data[at : at + size]
+        at += size
+    raise DataError('OCI value: chunks run past the message')
+
+
 def _oci_read_lob_bind(data: bytes) -> tuple[bytes | None, bytes]:
     # A LOB bind's value (#2015): a ub4 LE length, then the locator, zero length
     # for a NULL. The locator is a ub1 length and its bytes, or 0xFE and chunks
@@ -9131,7 +9152,7 @@ def _parse_oci_binds(
                         )
                     )
                     continue
-                raw, rest = decode_dalc(rest)
+                raw, rest = _oci_read_value(rest)
                 if data_type == TNS_TYPE_REFCURSOR:
                     # A ub4 LE cursor id, zero when the block opens the cursor:
                     # then it is an OUT bind like any other (#2014).
@@ -10356,6 +10377,10 @@ def _oci_object_image(obj: 'DbObject') -> bytes:
     )
 
 
+# The cell types whose value is the bytes themselves, framed as one value (#2053).
+_OCI_CHUNKED_CELL_TYPES = frozenset({TNS_TYPE_VARCHAR, TNS_TYPE_CHAR, TNS_TYPE_RAW})
+
+
 def _oci_value_bytes(data: bytes) -> bytes:
     """A value as OCI frames it (#2042): a ub1 length, or past 252 bytes 0xFE
     and chunks whose lengths are fixed-width, a ub4 LE from 12.1 and a ub1
@@ -10510,9 +10535,20 @@ def _oci_outbind_rxd(values: list[object], types: list[tuple[int, bytes]]) -> by
         if isinstance(v, RefCursorOutBind)
         else _oci_lob_out_value(v)
         if isinstance(v, LobOutBind)
-        else encode_value(v, 0) + _OCI_OUTBIND_RETCODE
+        else _oci_scalar_out_value(v) + _OCI_OUTBIND_RETCODE
         for v, (t, toid) in zip(values, types)
     )
+
+
+def _oci_scalar_out_value(value: object) -> bytes:
+    # A scalar OUT value: text or bytes past 252 in OCI's own chunks
+    # (_oci_value_bytes), not the thin form's -- a 300-character VARCHAR2
+    # variable went out as `fe 01 40 ...` and sqlplus never read it (#2053).
+    if isinstance(value, (str, bytes)):
+        raw = value.encode('utf-8') if isinstance(value, str) else value
+        if len(raw) > TNS_MAX_SHORT_LENGTH:
+            return _oci_value_bytes(raw)
+    return encode_value(value, 0)
 
 
 # An OCI execute by cursor id, TTI_EXEC (function 4, #2041): a block already
@@ -10865,6 +10901,14 @@ def _encode_oci_value(value: object, col: ColumnMeta, slot: int | None = None) -
         return encode_object_column_value(value, col.type_oid)
     if col.data_type == TNS_TYPE_RID and isinstance(value, str):
         return _oci_rowid_value(value)
+    if col.data_type in _OCI_CHUNKED_CELL_TYPES and isinstance(value, (str, bytes)):
+        # A character or RAW cell past 252 bytes goes in OCI's chunks, not the
+        # thin form's: `print` of a 300-character VARCHAR2 variable, which
+        # sqlplus runs as a SELECT, hung on its row (#2053).
+        wire = _national_wire_value(value, col)
+        raw = wire.encode('utf-8') if isinstance(wire, str) else wire
+        if isinstance(raw, bytes) and len(raw) > TNS_MAX_SHORT_LENGTH:
+            return _oci_value_bytes(raw)
     if (
         col.data_type == TNS_TYPE_TIMESTAMPTZ
         and isinstance(value, datetime.datetime)
