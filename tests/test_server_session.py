@@ -2820,6 +2820,42 @@ def test_sqlplus_is_served_at_the_version_it_speaks() -> None:
     assert sqlplus_field_version(b'', FIELD_VERSION_12_1, low) == FIELD_VERSION_12_1
 
 
+def test_which_sqlplus_reads_the_local_timestamp_with_time_zone_form() -> None:
+    # A live 11g sends sqlplus 23.26 the wall-clock cell with the 0x40 flag and
+    # sqlplus 11.2 the UTC one; given the flagged cell, sqlplus 11.2 printed
+    # 03:04 +02:00 as 21:04 +66:00 (#2018).
+    from seerdb.server.session import sqlplus_reads_local_tstz
+
+    assert sqlplus_reads_local_tstz(_SQLPLUS_23_CAPABILITIES)
+    assert not sqlplus_reads_local_tstz(_SQLPLUS_11_CAPABILITIES)
+    assert sqlplus_reads_local_tstz(b'')
+
+
+def test_an_older_sqlplus_gets_the_utc_timestamp_with_time_zone_cell() -> None:
+    from seerdb.common.tns import (
+        _ENCODE_OCI_TSTZ_LOCAL,
+        _encode_oci_value,
+        encode_value,
+    )
+    from seerdb.common.tns_consts import TNS_TYPE_TIMESTAMPTZ
+
+    col = ColumnMeta(
+        name=b'TZ', data_type=TNS_TYPE_TIMESTAMPTZ, data_length=13, max_size=13
+    )
+    value = datetime.datetime(
+        2024, 1, 2, 3, 4, 5, tzinfo=datetime.timezone(datetime.timedelta(hours=2))
+    )
+    token = _ENCODE_OCI_TSTZ_LOCAL.set(False)
+    try:
+        # 11g to sqlplus 11.2: 01:04 UTC, the offset with no flag.
+        thin = encode_value(value, TNS_TYPE_TIMESTAMPTZ)
+        assert _encode_oci_value(value, col) == thin
+        assert thin[-2:] == b'\x16\x3c'
+    finally:
+        _ENCODE_OCI_TSTZ_LOCAL.reset(token)
+    assert _encode_oci_value(value, col)[-2:] == b'\x56\x3c'
+
+
 # sqlplus 10.2.0.5's DTY capability block (field version 4), captured from its
 # login to the 10.2.0.5 server through tools/capture_proxy.py (#814).
 _SQLPLUS_10_CAPABILITIES = bytes.fromhex(

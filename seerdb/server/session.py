@@ -52,6 +52,7 @@ from seerdb.common.tns import (
     _ENCODE_FIELD_VERSION,
     _ENCODE_OCI_CALL_SEQ,
     _ENCODE_OCI_LOB_12C,
+    _ENCODE_OCI_TSTZ_LOCAL,
     _ENCODE_OER_SEQ,
     _ENCODE_SERVER_FIELD_VERSION,
     _ENCODE_TXN_IN_PROGRESS,
@@ -649,6 +650,8 @@ def handle_login(
             # size, if it offered CCAP_LOB_12C (#1287).
             lob_caps = client_compile_cap(capabilities, CCAP_LOB) or 0
             _ENCODE_OCI_LOB_12C.set(bool(lob_caps & CCAP_LOB_12C))
+            # Which TIMESTAMP WITH TIME ZONE cell this sqlplus reads (#2018).
+            _ENCODE_OCI_TSTZ_LOCAL.set(sqlplus_reads_local_tstz(capabilities))
             # And what version it speaks. sqlplus does not come down to what the
             # Mirror advertised, as a thin client does -- sqlplus 23.26 sends 27
             # -- but an OLDER one sends its own, lower, and must be served at
@@ -1031,6 +1034,19 @@ def _open_backend_session(
 # describe and DESCRIBE reply each have their own widths, which the OCI path
 # follows by the session's version (#1764). An older sqlplus is refused.
 _OCI_MIN_FIELD_VERSION = FIELD_VERSION_10_2
+
+
+def sqlplus_reads_local_tstz(capabilities: bytes) -> bool:
+    """Whether a sqlplus reads a TIMESTAMP WITH TIME ZONE cell as the wall clock
+    with the 0x40 flag, from the capability block it sent (#2018).
+
+    A live 11g sends that form to sqlplus 23.26 and the UTC form to sqlplus
+    11.2, and the Mirror's pre-12c replies imitate 11g. Told apart here by the
+    field version the client's own block names, 12.1 or later; the capability
+    bit the server keys on is not pinned down. A block that cannot be read
+    keeps the newer form."""
+    spoken = client_field_version(capabilities)
+    return spoken is None or spoken >= FIELD_VERSION_12_1
 
 
 def sqlplus_field_version(
