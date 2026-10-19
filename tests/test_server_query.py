@@ -40,6 +40,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_NUMBER,
     TNS_TYPE_RAW,
     TNS_TYPE_REF,
+    TNS_TYPE_RID,
     TNS_TYPE_TIMESTAMP,
     TNS_TYPE_TIMESTAMPLTZ,
     TNS_TYPE_TIMESTAMPTZ,
@@ -3943,6 +3944,93 @@ def test_oci_status_frame_prefixes_share_one_builder() -> None:
         _oci_status_frame_prefix(0x5BE8, row_producing=True, dml=True)
         == _OCI_DML_FRAME_PREFIX
     )
+
+
+# A single INTERVAL DAY TO SECOND, INTERVAL YEAR TO MONTH or ROWID column's
+# describe from a live 18c to sqlplus 23.26, from the max row size through the
+# column's name (#2017). The PEP 249 tuple a passthrough reads gives these no
+# length; described with 0, sqlplus sized its row buffer at nothing and crashed.
+_OCI_LIVE_DESCRIBE_BODY = {
+    'interval_ds': bytes.fromhex(
+        '0b000000010000005c01b7000206010000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000010303000000'
+        '03494453'
+    ),
+    'interval_ym': bytes.fromhex(
+        '05000000010000005c01b6000200010000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000010303000000'
+        '0349594d'
+    ),
+    'rowid': bytes.fromhex(
+        '10000000010000005c010b000000010000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000303000000'
+        '03524944'
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ('kind', 'column'),
+    [
+        (
+            'interval_ds',
+            ColumnMeta(
+                name=b'IDS',
+                data_type=TNS_TYPE_INTERVALDS,
+                data_length=0,
+                max_size=0,
+                precision=2,
+                scale=6,
+            ),
+        ),
+        (
+            'interval_ym',
+            ColumnMeta(
+                name=b'IYM',
+                data_type=TNS_TYPE_INTERVALYM,
+                data_length=0,
+                max_size=0,
+                precision=2,
+            ),
+        ),
+        (
+            'rowid',
+            ColumnMeta(
+                name=b'RID',
+                data_type=TNS_TYPE_RID,
+                data_length=0,
+                max_size=0,
+                null_ok=0,
+            ),
+        ),
+    ],
+)
+def test_an_unsized_column_describes_as_a_live_server_does(kind, column) -> None:
+    from seerdb.common.tns import _ENCODE_FIELD_VERSION, _oci_describe_body
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1
+
+    token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT_1)
+    try:
+        body = _oci_describe_body([column])
+    finally:
+        _ENCODE_FIELD_VERSION.reset(token)
+    live = _OCI_LIVE_DESCRIBE_BODY[kind]
+    assert body[: len(live)] == live
+
+
+def test_a_rowid_cell_is_four_ub4s() -> None:
+    # sqlplus reads a ROWID cell as its four parts, each a ub4 LE; the thin
+    # form crashed it (#2017). Four rows of one table, as a live 18c sent them.
+    from seerdb.common.tns import _oci_rowid_value
+
+    live = {
+        'AABAomAAMAAAACLAAA': '260a04000c0000008b00000000000000',
+        'AABAomAAMAAAACLAAB': '260a04000c0000008b00000001000000',
+        'AABAomAAMAAAACLAEr': '260a04000c0000008b0000002b010000',
+        'AABAomAAMAAAACMAAp': '260a04000c0000008c00000029000000',
+    }
+    for rowid, image in live.items():
+        assert _oci_rowid_value(rowid) == b'\x10' + bytes.fromhex(image)
 
 
 def test_read_chunked_sql_reassembles_the_chunks() -> None:
