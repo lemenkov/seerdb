@@ -3110,6 +3110,11 @@ raises the bit; everything else about the reply is unchanged, because the call
 straight off its own upstream cursor, and a backend that cannot leaves it unset,
 which is what the client saw before any of this existed.
 
+The OCI reply carries the same signal in its own OER, at offset `27` (§36.1),
+and sqlplus prints "Warning: Procedure created with compilation errors." from it.
+The Mirror's OCI DDL status set it from #2013 on; before, sqlplus printed a plain
+"Procedure created." for an object that did not compile.
+
 **11g rowcount quirk.** The field labelled "current row number" in
 newer Oracle (and in python-oracledb's source) doubles as the affected
 row count on 11g: an UPDATE / DELETE / INSERT writes the number of
@@ -7866,6 +7871,7 @@ to real 11g, varying one thing at a time. Offsets are from the `0x04` token:
 | `20` | 1 | error position (parse offset; the column sqlplus draws its caret under) | ORA-00942 → `0x0e`; the Mirror emits the backend-supplied offset (`encode_error_oci(error_pos=...)`), clamped to one byte, or `0x0e` when unknown |
 | `22` | 1 | **V$SQL command type** | INSERT=2, UPDATE=6, DELETE=7, SELECT=3, CREATE TABLE=1, DROP TABLE=12, PL/SQL=47 |
 | `27..40` | | rowid of the touched row (DML only) | capture-specific; the Mirror reuses a fixed frame |
+| `27` | 1 | **warning flags** on a DDL status — `0x21` when a `CREATE` made a PL/SQL object that compiled with errors, `0` otherwise | the same `CREATE PROCEDURE` compiled clean and broken, sqlplus 23.26 against 11g and 18c: the only difference but the counters (#2013). The thin OER carries the same value (§6.3a) |
 | `49..51` | ub2 LE | **sequence of the call being answered** — the client's own `03 <func> <seq>` byte | decoded across every reply kind in one live 11g session and confirmed on 10g; *not* an echo of offset `5` (§36.1a) |
 | `52` | 1 | constant `0x01` | constant across captures |
 | `56..58` | ub2 LE | fixed 11g constant — `0x0136` (310) | **not** the TTC version (disproven by differential capture: absent from 21c/23ai, which replace the whole trailer); an 11g OER-format constant, carried |

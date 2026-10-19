@@ -2239,6 +2239,74 @@ def test_oci_autocommit_relays_a_failed_commit() -> None:
     assert b'ORA-02091' in reply
 
 
+# sqlplus 23.26's `create or replace procedure sp_c2013 as begin nosuch; end;`
+# and a live 11g's reply, which sqlplus prints as "Warning: Procedure created
+# with compilation errors." (#2013).
+_OCI_EXEC_CREATE_BROKEN = bytes.fromhex(
+    '035e0b2180000000000000feffffffffffffffae000000feffffffffffffff0d'
+    '000000fefffffffffffffffeffffffffffffff00000000010000000000000000'
+    '00000000000000000000000000000000000000feffffffffffffff0000000000'
+    '000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000000000000'
+    '0000000000000000000000000000003a637265617465206f72207265706c6163'
+    '652070726f6365647572652073705f633230313320617320626567696e206e6f'
+    '737563683b20656e643b01000000010000000000000000000000000000000000'
+    '000000000000050000000000000000800000000000000000000000000000'
+)
+_OCI_CREATE_BROKEN_REPLY = bytes.fromhex(
+    '0806002aaa230100000000010000000000000000000000000000000000000000'
+    '0000000401000000080001000000000000000000000100000018000000002100'
+    '00000000000000000000000000000000000000000b0000010000003601000000'
+    '000000000000000000000020f6310a0000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000'
+)
+_OCI_STATUS_PREFIX_LEN = 35
+_OCI_OER_SEQUENCE = slice(5, 7)
+
+
+class _OciCompileBackend(_OciCountingBackend):
+    def __init__(self, compilation_warning: bool) -> None:
+        super().__init__()
+        self.compilation_warning = compilation_warning
+
+    def execute(self, sql: str, binds=()) -> Result:
+        self.calls.append(sql)
+        return Result(compilation_warning=self.compilation_warning)
+
+
+def _oci_reply_oer(reply: bytes) -> bytearray:
+    oer = bytearray(reply[_OCI_STATUS_PREFIX_LEN:])
+    oer[_OCI_OER_SEQUENCE] = bytes(2)
+    return oer
+
+
+def test_oci_create_with_compilation_errors_warns() -> None:
+    # The create succeeds; only the OER's warning byte says the object does not
+    # compile. Without it sqlplus printed "Procedure created." (#2013). The OER
+    # is the live server's but for its sequence counter.
+    from seerdb.server.session import _serve_oci_session
+
+    stream: Any = _OciOneCallStream(_OCI_EXEC_CREATE_BROKEN)
+    backend: Any = _OciCompileBackend(True)
+    _serve_oci_session(stream, backend, 'PYO')
+    [reply] = stream.sent
+    assert _oci_reply_oer(reply) == _oci_reply_oer(_OCI_CREATE_BROKEN_REPLY)
+
+
+def test_oci_clean_create_does_not_warn() -> None:
+    from seerdb.server.session import _serve_oci_session
+
+    stream: Any = _OciOneCallStream(_OCI_EXEC_CREATE_BROKEN)
+    backend: Any = _OciCompileBackend(False)
+    _serve_oci_session(stream, backend, 'PYO')
+    [reply] = stream.sent
+    oer = _oci_reply_oer(reply)
+    assert oer[27] == 0
+    oer[27] = _OCI_CREATE_BROKEN_REPLY[_OCI_STATUS_PREFIX_LEN + 27]
+    assert oer == _oci_reply_oer(_OCI_CREATE_BROKEN_REPLY)
+
+
 # The capability block each sqlplus sends (its DTY proper, one round after its
 # TTI_PRO): sqlplus 23.26 and sqlplus 11.2.0.2, captured against live 11g.
 _SQLPLUS_23_CAPABILITIES = bytes.fromhex(
