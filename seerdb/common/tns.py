@@ -9307,7 +9307,8 @@ _OCI_ROW_BUFFER_LENGTH = {
 # length 1 and no max size, and counts its 4 or 8 bytes toward the max row size,
 # whatever the backend says. A passthrough's PEP 249 tuple gives them their
 # display size, 127, and sqlplus refused that column with ORA-03115 (#2018).
-_OCI_FIXED_WIDTH = {TNS_TYPE_BFLOAT: 4, TNS_TYPE_BDOUBLE: 8}
+# TIMESTAMP WITH TIME ZONE likewise: length 1, 13 bytes (#2018).
+_OCI_FIXED_WIDTH = {TNS_TYPE_BFLOAT: 4, TNS_TYPE_BDOUBLE: 8, TNS_TYPE_TIMESTAMPTZ: 13}
 
 
 def _oci_describe_length(col: ColumnMeta) -> int:
@@ -10714,7 +10715,54 @@ def _encode_oci_value(value: object, col: ColumnMeta, slot: int | None = None) -
         return encode_object_column_value(value, col.type_oid)
     if col.data_type == TNS_TYPE_RID and isinstance(value, str):
         return _oci_rowid_value(value)
+    if (
+        col.data_type == TNS_TYPE_TIMESTAMPTZ
+        and isinstance(value, datetime.datetime)
+        and _ENCODE_OCI_TSTZ_LOCAL.get()
+    ):
+        return _oci_timestamptz_value(value)
     return encode_value(_national_wire_value(value, col), col.data_type)
+
+
+# The flag a TIMESTAMP WITH TIME ZONE cell's offset-hour byte carries to OCI:
+# the date and time before it are the wall clock at that offset, not UTC (#2018).
+_OCI_TSTZ_LOCAL_FLAG = 0x40
+# Whether this sqlplus reads that form. Which client gets it, measured against a
+# live 11g (the server the Mirror's pre-12c OCI replies imitate): sqlplus 23.26
+# does, and sqlplus 11.2 gets the thin form, the time in UTC and no flag. Sent
+# the local form, sqlplus 11.2 printed 03:04 +02:00 as 21:04 +66:00. Set per
+# session from the field version the client's own capability block names
+# (12.1 or later); the capability bit the server keys on is not pinned down.
+_ENCODE_OCI_TSTZ_LOCAL: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    'encode_oci_tstz_local', default=True
+)
+
+
+def _oci_timestamptz_value(value: datetime.datetime) -> bytes:
+    # A TIMESTAMP WITH TIME ZONE cell as OCI reads it (#2018): the wall-clock
+    # date and time, the nanoseconds, then the offset's hour + 20 with 0x40 set
+    # and its minutes + 60. The thin form sends the time in UTC and no flag.
+    # Live 18c to sqlplus 23.26: 2024-01-02 03:04:05.5 -05:30 is
+    # `78 7c 01 02 04 05 06 1d cd 65 00 4f 1e`; 2024-01-01 00:30 +02:00 keeps its
+    # own date, `78 7c 01 01 01 1f 01 00 00 00 00 56 3c`. A value with no zone is
+    # taken as UTC, as on the thin path.
+    aware = (
+        value
+        if value.tzinfo is not None
+        else value.replace(tzinfo=datetime.timezone.utc)
+    )
+    offset = aware.utcoffset()
+    assert offset is not None
+    total = int(offset.total_seconds() // 60)
+    hours, minutes = divmod(abs(total), 60)
+    if total < 0:
+        hours, minutes = -hours, -minutes
+    image = (
+        _encode_date_prefix(aware.replace(tzinfo=None))
+        + (aware.microsecond * 1000).to_bytes(4, 'big')
+        + bytes([(hours + 20) | _OCI_TSTZ_LOCAL_FLAG, minutes + 60])
+    )
+    return bytes([len(image)]) + image
 
 
 def _oci_rowid_value(rowid: str) -> bytes:

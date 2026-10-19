@@ -2315,6 +2315,36 @@ gives both a display size of 127. Described with that length, sqlplus refused
 the column with ORA-03115 and printed "no rows selected". The row cells were
 already right: `04 bf c0 00 00` and `08 c0 04 00 00 00 00 00 00` for 1.5 and 2.5.
 
+TIMESTAMP WITH TIME ZONE is described the same way, length 1 and 13 toward the
+max row size. Its cell differs from the thin form: OCI is sent the **wall clock**
+at the value's own offset, and bit `0x40` of the offset-hour byte says so. The
+thin form sends the time in UTC and no flag. Live 18c:
+
+```
+2024-01-02 03:04:05.5 -05:30   78 7c 01 02 04 05 06 1d cd 65 00 4f 1e
+2024-01-01 00:30:00   +02:00   78 7c 01 01 01 1f 01 00 00 00 00 56 3c   (its own date)
+2024-07-01 12:00 Europe/Prague 78 7c 07 01 0d 01 01 00 00 00 00 85 eb   (a region id, no 0x40)
+```
+
+**Which client gets that form.** A live 11g sends it to sqlplus 23.26 and the thin
+form to sqlplus 11.2 and 10.2:
+
+```
+11g -> sqlplus 11.2   78 7c 01 02 09 23 06 1d cd 65 00 0f 1e   (08:34 UTC, no flag)
+11g -> sqlplus 23.26  78 7c 01 02 04 05 06 1d cd 65 00 4f 1e
+```
+
+Sent the flagged cell, sqlplus 11.2 reads it as UTC and prints 03:04 +02:00 as
+21:04 +66:00. A live 18c sends sqlplus 11.2 the flagged form too, but it
+describes every column with a first byte of `0x59` (bit `0x08` set), where 11g
+and the Mirror's pre-12c describe send `0x51`. The Mirror follows 11g. It sends
+the flagged form to a client whose own capability block names field version 12.1
+or later, and the thin form to an older one. That cut is inferred from the
+captures: the capability bit the server keys on is not pinned down.
+
+A passthrough gets a region-named value from the client as its offset, as the
+thin path does, so it prints as `+02:00` where a live server prints the name.
+
 The ROWID cell is not the thin form either. OCI reads 16 bytes, the data object
 number, relative file number, block number and row number, each a ub4 LE. Four
 rows of one table, against a live 18c:

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import array
+import datetime
 
 import pytest
 
@@ -4066,6 +4067,73 @@ def test_binary_float_and_double_describe_as_a_live_server_does() -> None:
         _ENCODE_FIELD_VERSION.reset(token)
     live = _OCI_LIVE_BINARY_FLOAT_DESCRIBE
     assert body[: len(live)] == live
+
+
+# `timestamp '2024-01-02 03:04:05 +02:00' tz` described by a live 18c to
+# sqlplus 23.26 (#2018): length 1, no max size, 13 toward the max row size.
+# A passthrough's PEP 249 tuple gives it a display size of 23.
+_OCI_LIVE_TIMESTAMPTZ_DESCRIBE = bytes.fromhex(
+    '0d000000010000005c01b5000009010000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000010202000000'
+    '02545a'
+)
+
+
+def test_timestamp_with_time_zone_describes_as_a_live_server_does() -> None:
+    from seerdb.common.tns import _ENCODE_FIELD_VERSION, _oci_describe_body
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1
+
+    column = ColumnMeta(
+        name=b'TZ',
+        data_type=TNS_TYPE_TIMESTAMPTZ,
+        data_length=23,
+        max_size=23,
+        scale=9,
+    )
+    token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT_1)
+    try:
+        body = _oci_describe_body([column])
+    finally:
+        _ENCODE_FIELD_VERSION.reset(token)
+    live = _OCI_LIVE_TIMESTAMPTZ_DESCRIBE
+    assert body[: len(live)] == live
+
+
+@pytest.mark.parametrize(
+    ('value', 'image'),
+    [
+        # The wall clock at the offset, the offset hour with 0x40 set (#2018).
+        (
+            datetime.datetime(
+                2024,
+                1,
+                2,
+                3,
+                4,
+                5,
+                500000,
+                tzinfo=datetime.timezone(-datetime.timedelta(hours=5, minutes=30)),
+            ),
+            '787c01020405061dcd65004f1e',
+        ),
+        (
+            datetime.datetime(2024, 7, 1, 12, 0, tzinfo=datetime.timezone.utc),
+            '787c07010d010100000000543c',
+        ),
+        # Just after midnight local is the previous day in UTC; the cell keeps
+        # its own date.
+        (
+            datetime.datetime(
+                2024, 1, 1, 0, 30, tzinfo=datetime.timezone(datetime.timedelta(hours=2))
+            ),
+            '787c0101011f0100000000563c',
+        ),
+    ],
+)
+def test_a_timestamp_with_time_zone_cell_is_its_wall_clock(value, image) -> None:
+    from seerdb.common.tns import _oci_timestamptz_value
+
+    assert _oci_timestamptz_value(value) == b'\x0d' + bytes.fromhex(image)
 
 
 def test_read_chunked_sql_reassembles_the_chunks() -> None:
