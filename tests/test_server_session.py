@@ -2017,6 +2017,90 @@ def test_a_long_bound_statement_is_read() -> None:
     assert request.bind_meta == [(TNS_TYPE_VARCHAR, 24)]
 
 
+# sqlplus 23.26 selecting a variable twice, `select :n a, :n b from dual`, and
+# a repeat after another name, `select :s a, :n b, :s c from dual`, captured
+# against 18c (#2034). A repeat has a descriptor of its own, `01 01 80 00 00`
+# and a zero size, and no value in the RXD row.
+_OCI_REPEATED_BIND = bytes.fromhex(
+    '035e0d6980000000000000feffffffffffffff51000000feffffffffffffff0d'
+    '000000fefffffffffffffffeffffffffffffff000000000100000000000000fe'
+    'ffffffffffffff020000000000000000000000feffffffffffffff0000000000'
+    '000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000001b73656c656374203a6e20612c203a6e20'
+    '622066726f6d206475616c010000000000000000000000000000000000000000'
+    '0000000000000001000000000000000080000000000000000000000000000001'
+    '0203000016000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000001018000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '000702c108'
+)
+_OCI_REPEAT_AFTER_ANOTHER = bytes.fromhex(
+    '035e126980000000000000feffffffffffffff63000000feffffffffffffff0d'
+    '000000fefffffffffffffffeffffffffffffff000000000100000000000000fe'
+    'ffffffffffffff030000000000000000000000feffffffffffffff0000000000'
+    '000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000002173656c656374203a7320612c203a6e20'
+    '622c203a7320632066726f6d206475616c010000000000000000000000000000'
+    '0000000000000000000000000001000000000000000080000000000000000000'
+    '000000000001010300001e000000000000000000000000000000000000000000'
+    '0000000000000000000069030100000000000000000001020300001600000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000001018000000000000000000000000000000000000000000000'
+    '00000000000000000000000000000000000000000000000007017802c108'
+)
+
+
+def test_a_repeated_bind_name_takes_its_first_value() -> None:
+    # Refused with "2 bind(s) of a form not read yet" (#2034). Each placeholder
+    # gets a value and a type, a repeat its name's first, as a thin client
+    # sends them for a SQL statement.
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, parse_exec_oci
+    from seerdb.common.tns_consts import (
+        FIELD_VERSION_18_1_EXT_1,
+        TNS_TYPE_NUMBER,
+        TNS_TYPE_VARCHAR,
+    )
+
+    token = _DECODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT_1)
+    try:
+        twice = parse_exec_oci(_OCI_REPEATED_BIND)
+        after = parse_exec_oci(_OCI_REPEAT_AFTER_ANOTHER)
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+    assert twice.sql == 'select :n a, :n b from dual'
+    assert twice.binds == [7, 7]
+    assert twice.bind_meta == [(TNS_TYPE_NUMBER, 22)] * 2
+    assert after.sql == 'select :s a, :n b, :s c from dual'
+    assert after.binds == ['x', 7, 'x']
+    assert after.bind_meta == [
+        (TNS_TYPE_VARCHAR, 30),
+        (TNS_TYPE_NUMBER, 22),
+        (TNS_TYPE_VARCHAR, 30),
+    ]
+
+
+def test_a_repeat_the_statement_does_not_name_is_refused() -> None:
+    # A repeat descriptor where the statement repeats no name: the values
+    # cannot be placed, so the request is refused rather than guessed at.
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, parse_exec_oci
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1
+
+    sql = b'select :n a, :n b from dual'
+    unnamed = _OCI_REPEATED_BIND.replace(sql, sql.replace(b':n b', b':m b'))
+    token = _DECODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT_1)
+    try:
+        with pytest.raises(InterfaceError, match='bind'):
+            parse_exec_oci(unnamed)
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+
+
 def test_oci_loop_answers_a_break_marker() -> None:
     """A break / reset marker gets a marker back, not silence.
 
