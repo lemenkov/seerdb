@@ -251,6 +251,7 @@ ORA_PLSQL_COMPILATION_ERROR = 6550  # line %s, column %s: <the PLS- error>
 ORA_UNIMPLEMENTED_FEATURE = 3001
 ORA_UNSUPPORTED_NETWORK_DATATYPE = 3115  # ... datatype or representation
 ORA_VALUE_TOO_LARGE_FOR_COLUMN = 12899
+ORA_INVALID_LOB_LOCATOR = 22275  # invalid LOB locator specified
 ORA_NONEXISTENT_FILE = 22285  # non-existent directory or file for FILEOPEN
 ORA_LOB_NOT_OPENED = 22289  # cannot perform operation on an unopened file or LOB
 ORA_LOB_ALREADY_OPENED = 22293  # LOB already opened in the same transaction

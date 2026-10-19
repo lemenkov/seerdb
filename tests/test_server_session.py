@@ -10,9 +10,11 @@ O5LOGON) against a real client.
 
 from __future__ import annotations
 
+import base64
 import datetime
 import socket
 import threading
+import zlib
 from dataclasses import replace
 from typing import Any
 
@@ -2588,6 +2590,192 @@ def test_a_refcursor_with_a_lob_column_is_refused() -> None:
     [reply] = stream.sent
     assert b'ORA-03115' in reply
     assert b'REF CURSOR with LOB or LONG columns' in reply
+
+
+# sqlplus 23.26's CLOB variable against a live 18c (#2015): `variable vc clob`,
+# `exec :vc := 'clob var'`, then `print vc`, which binds the locator the block
+# handed back in `SELECT :vc vc FROM SYS.DUAL`. While the variable holds nothing
+# its bind is sqlplus's own 4000-byte buffer, and once it holds NULL just a zero
+# length. The exec and the unset print each carry that 4000-byte buffer, so
+# they are kept compressed.
+_OCI_EXEC_ASSIGN_CLOB = zlib.decompress(
+    base64.b64decode(
+        'eNpjjuPVZGFhAIF//yEgConNi8SG0SC1jAwMKHpgfGQxdD42cxhwmE8rIOfk6u7pp2BVlqxgZaugnpyTn6RQllikbq3g6udizcWI5DV0wAFjNKCKMxYAdQSgijGha85kRhjLvoAf6GkQwT8PyJVgGAWjYBSMglEwCkbBKBgFo2AUjIJRMApGwQADANjiZcQ='
+    )
+)
+_OCI_SELECT_UNSET_CLOB = zlib.decompress(
+    base64.b64decode(
+        'eNpjjuPNbGAAg3//ISAEic2LxIbRILWMDKh6YHxkMXQ+NnMYcJhPKyAT7Orj6hyiYFWWrABEbkH+vgrBkcF6LqGOPgyMeDTC5RrQxAuAMgGoYkzomjOZEUazL+AHehlE8M8DciUYRsEoGAWjYBSMglEwCkbBKBgFo2AUjIJRMMAAALiXZgI='
+    )
+)
+# The same exec through a Mirror, at the field version that 18c speaks: the
+# buffer's chunk lengths are a ub1 here, not a ub4.
+_OCI_EXEC_ASSIGN_CLOB_VIA_MIRROR = zlib.decompress(
+    base64.b64decode(
+        'eNpjjmPTZGFhAIF//yEgConNi8SG0SC1jAwMKHpgfGQxdD42cxhwmE8rIOfk6u7pp2BVlqxgZaugnpyTn6RQllikbq3g6udizcWI5DV0wAFjNKCKMxYAdQSgijGha85kRhjLvoAf5Gn+eQwjGfxnYBj1/6j/R/0/6v9R/4/6f9T/o/4f9f+o/0f9P+r/Uf+PALB+qDkYACHLdJY='
+    )
+)
+_OCI_SELECT_NULL_CLOB = bytes.fromhex(
+    '035e126980000000000000feffffffffffffff54000000feffffffffffffff0d'
+    '000000fefffffffffffffffeffffffffffffff000000000100000000000000fe'
+    'ffffffffffffff010000000000000000000000feffffffffffffff0000000000'
+    '000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000001c53454c454354203a7663207663204652'
+    '4f4d205359532e4455414c000100000000000000000000000000000000000000'
+    '0000000000000000010000000000000000800000000000000000000000000000'
+    '0170010000500000000000000000000000000000020000000000000000000000'
+    '00000000006903010000000000000000000700000000'
+)
+# The live reply to `exec :vc := null`: the OUT-bind header, the IN OUT marker
+# and RXD, then the NULL -- a zero length and the return code -1.
+_OCI_ASSIGN_NULL_CLOB_REPLY = bytes.fromhex(
+    '0b01056101000000000001000000000000000000000000000000000011aebb7f'
+    '0000186111aebb7f00000000799400000000100700000000ffff080600d90eac'
+    '0000000000010000000000000000000000000000000000000000000000040100'
+    '0000a9950101000000000000000000010000002f000000000000000000000000'
+    '0000000000000000000000000000100000010000003601000000000000000000'
+    '0000000000401ec8b4bb7f000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '00000000000100000000000000'
+)
+# `print vc` through a Mirror, binding the locator the Mirror handed back.
+_OCI_SELECT_MIRROR_CLOB = bytes.fromhex(
+    '035e086980000000000000feffffffffffffff54000000feffffffffffffff0d'
+    '000000fefffffffffffffffeffffffffffffff000000000100000000000000fe'
+    'ffffffffffffff010000000000000000000000feffffffffffffff0000000000'
+    '000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000001c53454c454354203a7663207663204652'
+    '4f4d205359532e4455414c000100000000000000000000000000000000000000'
+    '0000000000000000010000000000000000800000000000000000000000000000'
+    '0170010000500000000000000000000000000000020000000000000000000000'
+    '0000000000690301000000000000000000076a0000006a00680001020c800000'
+    '0200000001000000560000000100000001000000020002036900020000000000'
+    '0000000000000002000000000000000000000000000000000000000000000000'
+    '0000000001000000000000000000140500000000000010000000000002000000'
+    '00'
+)
+
+
+class _OciClobBackend(_OciCountingBackend):
+    def __init__(self, value: object) -> None:
+        super().__init__()
+        self.value = value
+        self.binds: list = []
+
+    def execute(self, sql: str, binds=()) -> Result:
+        self.calls.append(sql)
+        self.binds.append(list(binds))
+        if sql.lstrip().upper().startswith('BEGIN'):
+            return Result(out_binds=[self.value])
+        return Result(rowcount=0)
+
+
+def test_a_clob_variable_bind_is_read() -> None:
+    # The bind used to be refused, ORA-03115 (#2015). Its value is a locator:
+    # sqlplus's unset buffer here, or a zero length for a NULL.
+    from seerdb.common.tns import TempLobRef, parse_exec_oci
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1, TNS_TYPE_CLOB
+
+    request = _at_field_version(
+        FIELD_VERSION_18_1_EXT_1, parse_exec_oci, _OCI_EXEC_ASSIGN_CLOB
+    )
+    assert request.sql.startswith("BEGIN :vc := 'clob var';")
+    assert request.bind_meta == [(TNS_TYPE_CLOB, 80)]
+    [unset] = request.binds
+    assert isinstance(unset, TempLobRef) and len(unset.locator) == 4000
+    # Through a Mirror the buffer's chunk lengths are a ub1, and it is the same
+    # 4000 bytes.
+    via_mirror = _at_field_version(
+        FIELD_VERSION_18_1_EXT_1, parse_exec_oci, _OCI_EXEC_ASSIGN_CLOB_VIA_MIRROR
+    )
+    [unset] = via_mirror.binds
+    assert isinstance(unset, TempLobRef) and len(unset.locator) == 4000
+    null = _at_field_version(
+        FIELD_VERSION_18_1_EXT_1, parse_exec_oci, _OCI_SELECT_NULL_CLOB
+    )
+    assert null.binds == [None]
+
+
+def test_a_null_clob_out_value_matches_the_live_reply() -> None:
+    from seerdb.common.tns import LobOutBind, encode_out_bind_response_oci
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1
+
+    reply = _at_field_version(
+        FIELD_VERSION_18_1_EXT_1,
+        lambda: encode_out_bind_response_oci(
+            [LobOutBind(value=None, is_clob=True, lob_id=0)],
+            sequence=1,
+            inputs=[False],
+        ),
+    )
+    assert reply[50:58] == _OCI_ASSIGN_NULL_CLOB_REPLY[50:58]  # 10 07 00000000 ffff
+
+
+def _oci_sent_locator(reply: bytes) -> bytes:
+    # The locator the OUT value carries, as sqlplus binds it back: the ub2 and
+    # the locator after the 12c LOB metadata, with the flag bit it clears.
+    value = reply[52:]
+    locator = bytearray(value[4 + 12 + 1 : 4 + 12 + 1 + 106])
+    locator[1 + 5] &= ~0x08
+    return bytes(locator)
+
+
+def test_print_binds_the_value_the_block_assigned() -> None:
+    # The OUT value is a locator naming the value; `print vc` binds it, and the
+    # backend is handed the value as a CLOB (#2015).
+    from seerdb.common.tns import _ENCODE_OCI_LOB_12C
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1, TNS_DATA
+    from seerdb.server.backend import ClobValue
+    from seerdb.server.session import _serve_oci_session
+
+    first: Any = _OciOneCallStream(_OCI_EXEC_ASSIGN_CLOB)
+    backend: Any = _OciClobBackend('clob var')
+    token = _ENCODE_OCI_LOB_12C.set(True)
+    try:
+        _serve_oci_session(
+            first, backend, 'PYO', field_version=FIELD_VERSION_18_1_EXT_1
+        )
+    finally:
+        _ENCODE_OCI_LOB_12C.reset(token)
+    [reply] = first.sent
+    locator = _oci_sent_locator(reply)
+    # Replay the print the Mirror's own locator went into.
+    select = bytearray(_OCI_SELECT_MIRROR_CLOB)
+    at = select.rfind(b'\x6a\x00\x68')
+    select[at + 1 : at + 1 + 106] = locator
+    stream: Any = _OciOneCallStream(_OCI_EXEC_ASSIGN_CLOB)
+    stream.inbox[1:1] = [(TNS_DATA, bytes(select))]
+    backend = _OciClobBackend('clob var')
+    token = _ENCODE_OCI_LOB_12C.set(True)
+    try:
+        _serve_oci_session(
+            stream, backend, 'PYO', field_version=FIELD_VERSION_18_1_EXT_1
+        )
+    finally:
+        _ENCODE_OCI_LOB_12C.reset(token)
+    assert backend.calls[1] == 'SELECT :vc vc FROM SYS.DUAL'
+    [bound] = backend.binds[1]
+    assert isinstance(bound, ClobValue) and bound == 'clob var'
+
+
+def test_printing_an_unset_clob_variable_is_refused() -> None:
+    # sqlplus's own buffer names no value; outside a block a live server
+    # refuses it with ORA-22275.
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1
+    from seerdb.server.session import _serve_oci_session
+
+    stream: Any = _OciOneCallStream(_OCI_SELECT_UNSET_CLOB)
+    backend: Any = _OciClobBackend(None)
+    _serve_oci_session(stream, backend, 'PYO', field_version=FIELD_VERSION_18_1_EXT_1)
+    [reply] = stream.sent
+    assert b'ORA-22275' in reply
+    assert backend.calls == []
 
 
 # The capability block each sqlplus sends (its DTY proper, one round after its

@@ -2268,6 +2268,37 @@ other OCI replies carry (0, `0x5be8`, `0x5beb`), so a re-execute of a
 statement's own cursor is never served from one. A block that does not open the
 cursor answers id 0 and no columns, and `print` reports ORA-24338, as live.
 
+**`CLOB` / `BLOB` variables (the Mirror, OCI dialect, #2015).** `variable vc
+clob`, `exec :vc := 'clob var'` and `print vc`, captured from sqlplus 23.26 against
+11g and 18c:
+
+- **The bind** is type 112 (113 for a BLOB), its descriptor `01 70 01 00 00 50 00
+  00 00`. Its value is a ub4 length and then the locator as a value. While the
+  variable holds nothing, that locator is sqlplus's own 4000-byte buffer, chunked
+  with fixed-width chunk lengths like every OCI length. The width does not follow
+  the field version: `fe a0 0f 00 00 …` (a ub4 LE) to a live 18c, but `fe ff …`
+  (a ub1) to 11g and to a Mirror at that same field version. The ub4 in front
+  gives the locator's length, so the Mirror takes whichever reading adds up to it.
+  Once the variable holds NULL, the value is just the zero length.
+- **The OUT value** is the locator of a temporary LOB, in the same form as a LOB
+  column's cell. A NULL is the zero length with the return code `ff ff`. The marker
+  before it is `10` while the variable held nothing and `30` once it did. Before
+  the first `print` or assignment, sqlplus runs `BEGIN :vc := empty_clob(); END;`
+  itself.
+- **`print vc`** runs `SELECT :vc vc FROM SYS.DUAL`, binding that locator, and
+  reads the column like any LOB (§36). With the unset buffer bound instead, a live
+  server returns the buffer as the row's locator, and sqlplus refuses it with
+  ORA-22275.
+
+The Mirror writes the OUT value as its own CLOB cell. The locator names the
+variable's value by an id in four bytes of its zero run (offset 44, beside the row
+slot at 40). When sqlplus binds the locator back, the Mirror finds that id. sqlplus
+does not echo the locator byte for byte: it clears bit `0x08` of the second header
+flag byte (`0c 88` comes back `0c 80`). So the match ignores the two flag bytes, as
+well as the id and the content size the cell patches. The value goes to the
+backend as a `ClobValue`. The unset buffer outside a block is answered
+ORA-22275 at once, the error a live server's client ends on.
+
 **`DESCRIBE <object>` (the Mirror, OCI dialect).** sqlplus `DESC table` sends a
 dedicated describe call — `TTI_FUN 0x77` carrying the object name as the trailing
 length-prefixed token (`… 02 00 00 00 <ub1 namelen> <name>`) — and expects a
