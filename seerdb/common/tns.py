@@ -8733,6 +8733,7 @@ def _oci_lob_read_tail(
 # --- Mirror deadbeef/OCI codec (parse/describe/rows/status/LOB, #265) ---
 
 
+_OCI_ALL8_OPTIONS_OFF = 3  # ub4 LE: the options word, the thin form's bits
 _OCI_ALL8_CURSOR_OFF = 7  # ub4 LE; 0 = a new statement
 
 
@@ -8844,6 +8845,12 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
     bind_count_off = layout.bind_count
     if len(payload) < sql_off:
         raise InterfaceError('not an OCI OALL8 execute')
+    # The options word carries the thin form's bits, little-endian: sqlplus's SET
+    # AUTOCOMMIT ON sets the commit bit and sends no COMMIT of its own, so the
+    # server commits (sqlplus 10.2 and 23.26, #2011).
+    options = int.from_bytes(
+        payload[_OCI_ALL8_OPTIONS_OFF : _OCI_ALL8_OPTIONS_OFF + 4], 'little'
+    )
     cursor = int.from_bytes(
         payload[_OCI_ALL8_CURSOR_OFF : _OCI_ALL8_CURSOR_OFF + 4], 'little'
     )
@@ -8893,6 +8900,7 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
         bind_rows=[binds] if binds else [],
         bind_meta=bind_meta,
         bind_types=bind_types,
+        autocommit=bool(options & _EXEC_OPTION_COMMIT),
     )
 
 

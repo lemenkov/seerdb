@@ -2128,6 +2128,7 @@ and which one a client sends is fixed for the life of its connection:
 | field | wide (sqlplus 11.2-era) | narrow (sqlplus 23.26) |
 | --- | --- | --- |
 | scalar slots | `ub8` | `ub4` |
+| options (`ub4`) | 3 | 3 |
 | cursor id (`ub4`) | 7 | 7 |
 | SQL length (`ub4`), see below | 19 | 19 |
 | second indicator | 27 | 23 |
@@ -2139,6 +2140,16 @@ shorter** overall — but they are spread through the header, so each field behi
 them moves by a **different** amount, the running total of the slots ahead of it:
 the second indicator by 4, the bind count by 12, the SQL text by the full 20.
 The cursor id and the SQL length sit ahead of all five and do not move.
+
+**The options word** is the thin form's, little-endian, in every width
+(sqlplus 10.2 and 23.26 alike). Its commit bit `0x100` is how `SET AUTOCOMMIT ON`
+asks for a commit: sqlplus sets it on each statement, sends no COMMIT call of its
+own, and prints "Commit complete." on the success reply, so the server commits
+after a statement that succeeds (#2011). Measured against live 11g and 23ai: the
+`INSERT` captured with the setting off and on differs in that bit alone, and the
+row survives a later `ROLLBACK` only with it on. At field version 24, as sqlplus
+23.26 speaks to a 23ai directly, 14 bytes more sit between the sequence number
+and the options word; the Mirror never negotiates that layout with sqlplus.
 
 sqlplus 10.2 sends a third form: the narrow preamble with the bind count still
 at 71 but the SQL text at **148**, 28 bytes earlier, in every statement it sent
