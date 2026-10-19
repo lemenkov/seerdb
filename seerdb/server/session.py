@@ -143,9 +143,11 @@ from seerdb.common.tns import (
     is_version_call_oci,
     kod_system_record,
     kod_type_record,
+    kod_xmltype_record,
     max_string_size,
     mint_temp_lob_locator,
     object_lob_contents,
+    oci_is_xmltype,
     oci_lob_contents,
     oci_lob_reads,
     oci_lob_row_cells,
@@ -1301,6 +1303,19 @@ def _answer_kod_oci(
         request = parse_kod_request(body)
     except InterfaceError:
         request = None
+    if request is not None and (request.schema, request.name) == ('SYS', 'XMLTYPE'):
+        # A system type, the same in every database: answered whatever the
+        # backend, under the schema asked for, as a live server does (#2050).
+        stream.write_packet(
+            TNS_DATA,
+            encode_kod_named_reply(
+                schema='SYS',
+                name='XMLTYPE',
+                record=kod_xmltype_record(),
+                sequence=seq.next(),
+            ),
+        )
+        return
     describe_type = getattr(backend, 'describe_type', None)
     if request is not None and request.name is not None and describe_type:
         try:
@@ -2325,7 +2340,10 @@ def _answer_query_oci(
     has_lob = any(
         col.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB) for col in result.columns
     )
-    if has_lob:
+    # An XMLTYPE column too: a live server answers its execute with the
+    # describe alone, as for a LOB, and sends the row on the fetch, after
+    # sqlplus has described the type (#2050).
+    if has_lob or any(oci_is_xmltype(col) for col in result.columns):
         # A LOB result: sqlplus sets up its LOB define from the describe, then
         # fetches the locator rows. The LOB describe reply has its own shape (a
         # 33-byte tail + a LOB execute status, not the ordinary inline-row DCB

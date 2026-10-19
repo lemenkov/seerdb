@@ -284,6 +284,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_LONG,
     TNS_TYPE_LONGRAW,
     TNS_TYPE_NUMBER,
+    TNS_TYPE_OPAQUE,
     TNS_TYPE_RAW,
     TNS_TYPE_REF,
     TNS_TYPE_REFCURSOR,
@@ -4066,12 +4067,18 @@ def parse_kod_request(payload: bytes) -> KodRequest:
     opcode = int.from_bytes(payload[3:7], 'little')
     if opcode == KOD_BY_NAME:
         at = _KOD_NAME_OFF + 4
+        # The schema's buffer length (3 x its characters), then the schema as a
+        # ub1 length and its bytes -- absent when the buffer is empty, as for a
+        # type of the user's own -- and four zero bytes. sqlplus names SYS for
+        # an XMLTYPE column's type (#2050).
         schema_len = int.from_bytes(payload[at : at + 4], 'little')
-        at += 8
+        at += 4
         schema = None
         if schema_len:
-            # Not seen yet: sqlplus names no schema. Refused rather than guessed.
-            raise InterfaceError('KOD by name with a schema is not decoded yet')
+            size = payload[at]
+            schema = payload[at + 1 : at + 1 + size].decode('utf-8')
+            at += 1 + size
+        at += 4
         at += 4  # the name's buffer length, 3 x its characters
         name_len = payload[at]
         name = payload[at + 1 : at + 1 + name_len].decode('utf-8')
@@ -4173,7 +4180,9 @@ def _kod_item_bytes(data: bytes) -> bytes:
     return len(data).to_bytes(4, 'little') + data
 
 
-def encode_kod_image(values: list[bytes | None]) -> bytes:
+def encode_kod_image(
+    values: list[bytes | None], *, flags: int = _KOD_IMAGE_FLAGS
+) -> bytes:
     """A type-descriptor image from its attribute values; :func:`decode_kod_image`
     reversed. Each value is a ub1 length, or ``fe`` + ub4 BE beyond 245 bytes,
     or ``ff`` for NULL; the length after ``85 01`` counts the whole image."""
@@ -4188,7 +4197,7 @@ def encode_kod_image(values: list[bytes | None]) -> bytes:
             body += value
     total = 2 + 5 + len(body)
     return (
-        bytes([_KOD_IMAGE_FLAGS, _KOD_IMAGE_VERSION, TNS_LONG_LENGTH_INDICATOR])
+        bytes([flags, _KOD_IMAGE_VERSION, TNS_LONG_LENGTH_INDICATOR])
         + total.to_bytes(4, 'big')
         + bytes(body)
     )
@@ -4333,6 +4342,53 @@ def kod_type_record(
         _KOD_IMAGE_REF_HEAD + _kod_part_id(oid) + _KOD_IMAGE_REF_TAIL,
     ]
     return KodRecord(KOD_KOTTD, oid, encode_kod_image(values))
+
+
+# SYS.XMLTYPE as a live server describes it to an OCI client by name (#2050):
+# its own flags, version and typecode 58 (opaque), its TDS and null TDS, a kind
+# word, and a REF to the type's version. The TDS is the same from 11g and 18c;
+# the version is `$8.0` from 11g and `$VSN_1` from 18c, and the version's id is
+# the database's own -- the Mirror carries the one each capture had.
+_KOD_XMLTYPE_FLAGS = bytes.fromhex('ae9a0101')
+_KOD_XMLTYPE_TDS = bytes.fromhex(
+    '00000029260100010001ff2900000000001e1b000000193a2afd0000000d01000000'
+    '0700000000000000090007'
+)
+_KOD_XMLTYPE_NULL_TDS = bytes.fromhex('00000012260100010001ff290000000000071a2a0007')
+_KOD_XMLTYPE_KIND = bytes.fromhex('5000')
+# Its image is flagged 0x84, where a user type's is 0x85 (§21.3).
+_KOD_XMLTYPE_IMAGE_FLAGS = 0x84
+_KOD_XMLTYPE_VERSION = (b'$8.0', bytes.fromhex('ab9eebb9da3692fce040e50a194e4680'))
+_KOD_XMLTYPE_VERSION_12C = (
+    b'$VSN_1',
+    bytes.fromhex('787d0d2b1c4d6933e0530caae80a12fb'),
+)
+
+
+def kod_xmltype_record() -> KodRecord:
+    """SYS.XMLTYPE described as a SYS.KOTTD instance (§40.3, #2050)."""
+    (version, version_id) = (
+        _KOD_XMLTYPE_VERSION_12C
+        if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+        else _KOD_XMLTYPE_VERSION
+    )
+    values: list[bytes | None] = [
+        _KOD_XMLTYPE_FLAGS,
+        b'SYS',
+        b'XMLTYPE',
+        version,
+        TNS_TYPE_OPAQUE.to_bytes(2, 'big'),
+        _KOD_XMLTYPE_TDS,
+        _KOD_XMLTYPE_NULL_TDS,
+        _KOD_XMLTYPE_KIND,
+        _KOD_TYPE_UB2,
+        _KOD_IMAGE_REF_HEAD + version_id + _KOD_IMAGE_REF_TAIL,
+    ]
+    return KodRecord(
+        KOD_KOTTD,
+        _OCI_XMLTYPE_OID,
+        encode_kod_image(values, flags=_KOD_XMLTYPE_IMAGE_FLAGS),
+    )
 
 
 def _kod_text_bytes(text: str) -> bytes:
@@ -9294,11 +9350,57 @@ def _widen_dcb_column_oci(pre: bytes, is_char: bool) -> bytes:
     return bytes(out)
 
 
+# SYS.XMLTYPE as an OCI client is told it (#2050): a live 11g and 18c describe
+# the column as type 58, an opaque type, where a thin client is told 109, with a
+# data length of 2000 and the type's id, schema and name. The id is the same in
+# every database.
+_OCI_XMLTYPE_OID = bytes(13) + b'\x02\x01\x00'
+_OCI_XMLTYPE_LENGTH = 2000
+_OCI_XMLTYPE_VERSION = 1
+
+
+def oci_is_xmltype(col: ColumnMeta) -> bool:
+    return (
+        col.data_type == TNS_TYPE_ADT
+        and col.type_schema == b'SYS'
+        and col.type_name == b'XMLTYPE'
+    )
+
+
+def _oci_typed_column(pre: bytes, col: ColumnMeta) -> bytes:
+    # A column of a named type carries the type's id where a plain column has
+    # its length zero, and then its version: `10 00 00 00`, `10` and the 16
+    # bytes, `01 00`. What a plain column has from there to the null flag --
+    # zero for an opaque type -- shrinks to 7 bytes, 11 in the 12c band.
+    wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+    (at, null_at, gap) = (22, 50, 11) if wide else (18, 42, 7)
+    oid = _OCI_XMLTYPE_OID
+    typed = (
+        _oci_ub4(len(oid))
+        + bytes([len(oid)])
+        + oid
+        + _OCI_XMLTYPE_VERSION.to_bytes(2, 'little')
+    )
+    return pre[:at] + typed + bytes(gap) + pre[null_at:]
+
+
+def _oci_type_names(col: ColumnMeta, size: int) -> bytes:
+    # The post-name block of a typed column: the type's schema and name, each a
+    # ub4 length then a ub1 length and the bytes, where a plain column has two
+    # zero ub4s; the rest of the block as it is.
+    names = b''.join(
+        _oci_ub4(len(part)) + bytes([len(part)]) + part
+        for part in (col.type_schema, col.type_name)
+    )
+    return names + bytes(size - 8)
+
+
 def _encode_dcb_column_oci(col: ColumnMeta, position: int, first: bool) -> bytes:
+    xmltype = oci_is_xmltype(col)
     pre = bytearray(_OCI_DCB_COL_PRENAME)
     pre[0] = _OCI_DCB_FIRST_COL_11G if first else 0x00  # a first-column marker byte
-    pre[1] = 0x01
-    pre[2] = col.data_type
+    pre[1] = 0x00 if xmltype else 0x01
+    pre[2] = TNS_TYPE_OPAQUE if xmltype else col.data_type
     is_char = col.data_type in _OCI_CHAR_TYPES
     pre[3] = _OCI_DCB_CHAR_FLAG if is_char else 0x00
     pre[4] = col.precision & 0xFF
@@ -9306,7 +9408,7 @@ def _encode_dcb_column_oci(col: ColumnMeta, position: int, first: bool) -> bytes
     # A backend that cannot size the column (the PEP 249 tuple reports none for
     # an interval or a ROWID) gets the length a live server describes it with,
     # as on the thin path (#2017).
-    pre[6:10] = _oci_ub4(_oci_describe_length(col))
+    pre[6:10] = _oci_ub4(_OCI_XMLTYPE_LENGTH if xmltype else _oci_describe_length(col))
     if is_char and col.csfrm == _CSFRM_NCHAR:
         pre[_OCI_DCB_CHAR_SEMANTICS_OFF] = _OCI_DCB_CHAR_SEMANTICS_FLAG
     if is_char:
@@ -9316,7 +9418,10 @@ def _encode_dcb_column_oci(col: ColumnMeta, position: int, first: bool) -> bytes
     # an inline stream, unbounded — so a live 11g describe leaves this zero (like
     # the data length the backend already sets to 0). Only fixed-width columns fill
     # it (#405, #407).
-    if col.data_type not in _OCI_UNSIZED_TYPES | _OCI_FIXED_WIDTH.keys():
+    if (
+        col.data_type not in _OCI_UNSIZED_TYPES | _OCI_FIXED_WIDTH.keys()
+        and not xmltype
+    ):
         pre[34:38] = _oci_ub4(col.max_size)
     pre[42] = col.null_ok
     pre[43] = len(col.name)
@@ -9327,9 +9432,13 @@ def _encode_dcb_column_oci(col: ColumnMeta, position: int, first: bool) -> bytes
     post = bytes(_OCI_DCB_COL_POSTNAME)
     if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_11_2:
         post = bytes(_OCI_DCB_COL_POSTNAME_10_2)
+    block = bytes(pre)
     if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
-        return _widen_dcb_column_oci(bytes(pre), is_char) + name + post
-    return bytes(pre) + name + post
+        block = _widen_dcb_column_oci(block, is_char)
+    if xmltype:
+        block = _oci_typed_column(block, col)
+        post = _oci_type_names(col, len(post))
+    return block + name + post
 
 
 def encode_describe_oci(columns: list[ColumnMeta]) -> bytes:
@@ -9397,7 +9506,7 @@ def _oci_describe_body(columns: list[ColumnMeta]) -> bytes:
         sum(
             _oci_row_buffer_length(c)
             for c in columns
-            if c.data_type not in _OCI_UNSIZED_TYPES
+            if c.data_type not in _OCI_UNSIZED_TYPES and not oci_is_xmltype(c)
         )
     )
     out += _oci_ub4(len(columns))
@@ -10437,7 +10546,13 @@ def _oci_out_object_value(value: object, toid: bytes) -> bytes:
         image = _oci_object_image(value)
     else:
         image = getattr(value, 'image', b'') or b''
-    framed = _oci_value_bytes(image)
+    return _oci_object_frame(toid, image)
+
+
+def _oci_object_frame(toid: bytes, image: bytes | None) -> bytes:
+    # An object value as OCI frames it, an OUT bind's and a row cell's alike
+    # (§40.4): the type's REF, the lead, the image's length, `01 00`, the image.
+    # A NULL cell stops after the `01 00`, its length 0 (#2050).
     return (
         _kod_item_bytes(_kod_ref(toid, system=False))
         + (
@@ -10445,10 +10560,24 @@ def _oci_out_object_value(value: object, toid: bytes) -> bytes:
             if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
             else _OCI_OUTBIND_ADT_LEAD
         )
-        + len(image).to_bytes(4, 'little')
+        + len(image or b'').to_bytes(4, 'little')
         + _OCI_OUTBIND_ADT_IMAGE
-        + framed
+        + (b'' if image is None else _oci_value_bytes(image))
     )
+
+
+# The flag word of an XMLTYPE image a live 11g and 18c send to sqlplus: STRING
+# (0x04) and a 0x10 bit no reader acts on (#2050).
+_OCI_XML_FLAGS = 0x14
+
+
+def _oci_xmltype_value(value: object) -> bytes:
+    # An XMLTYPE row cell to sqlplus (#2050): the document's image in the object
+    # frame, under SYS.XMLTYPE's id.
+    from seerdb.common.dbobject import encode_xmltype
+
+    image = None if value is None else encode_xmltype(value, Flags=_OCI_XML_FLAGS)
+    return _oci_object_frame(_OCI_XMLTYPE_OID, image)
 
 
 # A REF CURSOR OUT value in the OCI reply (#2014): a lead byte, the cursor's
@@ -10936,6 +11065,8 @@ def _encode_oci_value(value: object, col: ColumnMeta, slot: int | None = None) -
         )
     if col.data_type in _OCI_LONG_TYPES:
         return encode_long_value_oci(value)
+    if oci_is_xmltype(col):
+        return _oci_xmltype_value(value)
     if col.data_type == TNS_TYPE_ADT:
         return encode_object_column_value(value, col.type_oid)
     if col.data_type == TNS_TYPE_RID and isinstance(value, str):

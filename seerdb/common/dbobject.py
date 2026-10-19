@@ -1030,7 +1030,9 @@ def decode_xmltype(Image: bytes, Charset: int = AL32UTF8_CHARSET) -> tuple:
 _XML_IMAGE_FLAGS = 0x85
 
 
-def encode_xmltype(Value: object, Charset: int = AL32UTF8_CHARSET) -> bytes:
+def encode_xmltype(
+    Value: object, Charset: int = AL32UTF8_CHARSET, Flags: int = _XML_TYPE_STRING
+) -> bytes:
     """Encode an inline XMLType document into its image — the inverse of
     :func:`decode_xmltype` for the ``STRING`` form.
 
@@ -1046,7 +1048,7 @@ def encode_xmltype(Value: object, Charset: int = AL32UTF8_CHARSET) -> bytes:
     chunked column bytes; no LOB is involved (#1073).
     """
     content = str(Value).encode('utf-8')
-    tail = bytes([1]) + _XML_TYPE_STRING.to_bytes(4, 'big') + content
+    tail = bytes([1]) + Flags.to_bytes(4, 'big') + content
     # flags + version + image length + tail; the length spans the whole image,
     # its own field included, as the server writes it.
     if len(tail) + 3 <= TNS_MAX_SHORT_LENGTH:
