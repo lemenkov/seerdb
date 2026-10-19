@@ -2173,6 +2173,16 @@ continues `FF`, so an indicator at 23 puts `FF` at 27). The bind section behind
 the SQL is read by scanning from the end of the SQL text, so it is the same in
 both widths and needs no offset of its own.
 
+**A statement longer than 252 bytes is chunked**, as on the thin path: the length
+prefix is `0xFE`, then `<ub1 len><bytes>` runs end at a zero length. The bind
+section starts after the chunks, the same as after a short statement. sqlplus's
+`SHOW ERRORS` query is one (#2028): `SELECT … FROM ALL_ERRORS A WHERE A.NAME =
+UPPER(:NMBIND_SHOW_OBJ) …`, longer than 252 bytes with one bind. Its descriptor
+reads `01 01 20 00 00 18 00 00 00`, a VARCHAR2 of 24 bytes with the flag byte
+`0x20` where an ordinary bind has `0x03`; its value is a plain DALC all the same.
+sqlplus 23.26 sends the same bytes direct to 18c. The Mirror read binds only after
+a short statement, refused this one with ORA-03115, and `SHOW ERRORS` failed.
+
 `_oci_all8_layout` picks the width from the wire on every execute rather than
 assuming one, and raises when neither shape holds. Read with the wide offsets, a
 narrow execute lands 20 bytes past the SQL length prefix, and the Mirror then

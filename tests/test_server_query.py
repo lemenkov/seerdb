@@ -3947,11 +3947,13 @@ def test_oci_status_frame_prefixes_share_one_builder() -> None:
 
 def test_read_chunked_sql_reassembles_the_chunks() -> None:
     # Long OCI SQL is chunked: 0xFE marker, then <ub1 len><chunk> runs. The reader
-    # reassembles them up to the declared total (#265).
+    # reassembles them up to the declared total (#265), and says where the last
+    # one ends, which is where a bound statement's binds are looked for (#2028).
     from seerdb.common.tns import _read_chunked_sql
 
     data = b'\xfe\x03abc\x02de\x00tail'
-    assert _read_chunked_sql(data, 5) == b'abcde'
+    assert _read_chunked_sql(data, 5) == (b'abcde', 8)
+    assert _read_chunked_sql(data, 9) == (b'abcde', 9)
 
 
 def test_encode_error_oci_matches_the_captured_ora_error() -> None:
