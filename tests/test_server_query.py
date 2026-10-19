@@ -4136,6 +4136,51 @@ def test_a_timestamp_with_time_zone_cell_is_its_wall_clock(value, image) -> None
     assert _oci_timestamptz_value(value) == b'\x0d' + bytes.fromhex(image)
 
 
+# A CLOB and a BLOB column's describe from a live 18c to sqlplus 23.26, from
+# the max row size through the name (#2019): a data length of 4000. The PEP 249
+# tuple a passthrough reads gives a LOB no size; described with 0, sqlplus took
+# the column for one that sends nothing and hung on the row. Fixed by the
+# wire-length fallback of #2044; kept here as that ticket's regression test.
+_OCI_LIVE_LOB_DESCRIBE = {
+    'clob': bytes.fromhex(
+        '00000000010000005c0170800000a00f00000000000000000000000000000000'
+        '00000000000000000000000000006903010000000000fe3f0000010101000000'
+        '0143'
+    ),
+    'blob': bytes.fromhex(
+        '00000000010000005c0171000000a00f00000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000010101000000'
+        '0142'
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ('kind', 'column'),
+    [
+        (
+            'clob',
+            ColumnMeta(name=b'C', data_type=TNS_TYPE_CLOB, data_length=0, max_size=0),
+        ),
+        (
+            'blob',
+            ColumnMeta(name=b'B', data_type=TNS_TYPE_BLOB, data_length=0, max_size=0),
+        ),
+    ],
+)
+def test_a_passthrough_lob_column_describes_as_a_live_server_does(kind, column) -> None:
+    from seerdb.common.tns import _ENCODE_FIELD_VERSION, _oci_describe_body
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1
+
+    token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT_1)
+    try:
+        body = _oci_describe_body([column])
+    finally:
+        _ENCODE_FIELD_VERSION.reset(token)
+    live = _OCI_LIVE_LOB_DESCRIBE[kind]
+    assert body[: len(live)] == live
+
+
 def test_read_chunked_sql_reassembles_the_chunks() -> None:
     # Long OCI SQL is chunked: 0xFE marker, then <ub1 len><chunk> runs. The reader
     # reassembles them up to the declared total (#265), and says where the last
