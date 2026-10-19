@@ -75,6 +75,7 @@ not the whole matrix (a PR touching several rows runs the union):
 | anything | the static checks above, before pushing |
 | `seerdb/server/backends/postgres.py` (the Mirror-over-PG backend) or `examples/` | `tests/test_postgres_backend.py` before pushing, then python-oracledb's suite (`tools/run_oracledb_suite.py`) against a Mirror-over-PG |
 | the rest of `seerdb/server` | python-oracledb's suite against a passthrough Mirror over 23ai, on the branch and on its `master` base, and against a Mirror-over-PG |
+| the Mirror's OCI (sqlplus) dialect: the OCI code in `seerdb/server/session.py`, `seerdb/common/oci.py` or the OCI codec in `seerdb/common/tns.py` | `tools/sqlplus_survey.py` with sqlplus 23.26, direct to 23ai and through a passthrough Mirror over it, compared on the branch and on its `master` base |
 | `seerdb/client` | the integration suite on 8i, 9i and 10g |
 | `seerdb/common` | the integration suite on every bed (8i to 26ai), both Mirror legs, the offline suite, and both python-oracledb suite runs |
 
