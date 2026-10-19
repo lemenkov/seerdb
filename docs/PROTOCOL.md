@@ -248,6 +248,24 @@ The receive-side handshake that keeps the stream in sync (#45):
   the next operation reads it misframed. (Preserving *without* the one-reset
   rule above was a dead end — the still-storming bytes crash the packet parser;
   both halves are required.)
+
+**The server side for sqlplus (the Mirror, #2036).** The same rule applies with
+the roles swapped. Ctrl-C in sqlplus 23.26 against a live 18c went like this:
+1. The break goes out of band (TCP urgent data).
+2. The client sends a reset in band.
+3. The server answers with **one** reset and then the ORA-01013 OER (`user
+   requested cancel of current operation`, no error position, so the caret sits
+   at column 0).
+4. sqlplus pings (`TTI_PING`, function `0x93`), and the server acks with a
+   TTI_STA (`09 01 00 00 00 <seq>`).
+5. The next statement runs.
+
+Through the Mirror the interrupt arrives in band (`01 00 03`) ahead of the
+reset. The OCI loop used to answer every marker with a reset, so the client's
+own reset drew another, and the two sides exchanged resets without end. Now an
+interrupt or break gets one reset, and the client's reset is awaited, whatever
+it sends first dropped. A lone reset gets the one reset. Either way the cancel's
+OER follows, and the ping is relayed to the backend and acknowledged.
 - seerdb implements both in `OracleConnect._next_data_packet` (and its async
   twin), with a `self._in_break` latch so at most one reset is sent per episode,
   cleared when a real DATA packet returns. `_handle_response`, `_read_lob_response`
