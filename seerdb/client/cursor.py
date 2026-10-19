@@ -1346,7 +1346,7 @@ def _check_object_bind_support(Connection, Bind, Batch=None) -> None:
     # and serves the same bind from 12.1 up). Refuse them up front on pre-12c
     # with a clear error. (Object/collection *decode* works on all tiers --
     # only these binds are 12c+.)
-    from seerdb.common.dbobject import DbObject, DbRef
+    from seerdb.common.dbobject import DbObject, DbObjectType, DbRef
 
     if getattr(Connection, 'field_version', 0) >= FIELD_VERSION_12_1:
         return
@@ -1359,7 +1359,12 @@ def _check_object_bind_support(Connection, Bind, Batch=None) -> None:
         else:
             Values = [Row]
         for V in Values:
-            if isinstance(V, DbObject):
+            # An object or collection Var -- the OUT bind -- is the same bind on
+            # the wire as an object value, and pre-12c answers it with the same
+            # fatal ORA-03106 (#2039).
+            if isinstance(V, DbObject) or (
+                isinstance(V, Var) and isinstance(V.dbtype, DbObjectType)
+            ):
                 raise NotSupportedError(
                     'binding a SQL OBJECT value requires an Oracle 12.1+ server'
                 )

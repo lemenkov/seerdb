@@ -13751,5 +13751,34 @@ class AsyncO8iIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
             await conn.close()
 
 
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class PreTwelveObjectOutBindIntegration(unittest.TestCase):
+    # Before 12.1 an object or collection OUT bind is refused up front, as an
+    # object value already is (#116): pre-12c answers it with a fatal ORA-03106
+    # that lost the connection (#2039). From 12.1 it is an ordinary bind.
+    TYPE = 'zz_seerdb_2039_list'
+
+    def test_an_object_out_bind_is_refused_and_the_session_lives(self):
+        from seerdb.common.tns_consts import FIELD_VERSION_12_1
+
+        conn = _connect()
+        try:
+            if conn.field_version >= FIELD_VERSION_12_1:
+                self.skipTest('an object OUT bind is served from 12.1')
+            cur = conn.cursor()
+            cur.execute(
+                f'create or replace type {self.TYPE} as varray(5) of varchar2(10)'
+            )
+            try:
+                out = cur.var(conn.gettype(self.TYPE.upper()))
+                with self.assertRaises(seerdb.NotSupportedError):
+                    cur.execute(f"begin :1 := {self.TYPE}('a'); end;", [out])
+                self.assertEqual(cur.execute('select 1 from dual').fetchone(), (1,))
+            finally:
+                cur.execute(f'drop type {self.TYPE}')
+        finally:
+            conn.close()
+
+
 if __name__ == '__main__':
     unittest.main()
