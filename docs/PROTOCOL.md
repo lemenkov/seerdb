@@ -2299,6 +2299,25 @@ well as the id and the content size the cell patches. The value goes to the
 backend as a `ClobValue`. The unset buffer outside a block is answered
 ORA-22275 at once, the error a live server's client ends on.
 
+**INTERVAL and ROWID columns (the Mirror, OCI dialect, #2017).** sqlplus sizes
+its row buffer from the describe's max row size, so a column counted as 0 there
+crashes it (SIGSEGV) as soon as the row arrives. A backend can't always size a
+column: the PEP 249 tuple a passthrough reads reports no size for an interval or
+a ROWID. A live 18c describes each of the three with a data length of 1 (the
+thin figure, §6.2). It counts them in the max row size as 11 (DAY TO SECOND),
+5 (YEAR TO MONTH) and 16 (ROWID), one single-column SELECT apiece. The Mirror
+falls back to those figures where the backend gives none.
+
+The ROWID cell is not the thin form either. OCI reads 16 bytes, the data object
+number, relative file number, block number and row number, each a ub4 LE. Four
+rows of one table, against a live 18c:
+
+```
+AABAomAAMAAAACLAAA  10  26 0a 04 00  0c 00 00 00  8b 00 00 00  00 00 00 00
+AABAomAAMAAAACLAEr  10  26 0a 04 00  0c 00 00 00  8b 00 00 00  2b 01 00 00
+                        object 264742  file 12   block 139    row 299
+```
+
 **`DESCRIBE <object>` (the Mirror, OCI dialect).** sqlplus `DESC table` sends a
 dedicated describe call — `TTI_FUN 0x77` carrying the object name as the trailing
 length-prefixed token (`… 02 00 00 00 <ub1 namelen> <name>`) — and expects a

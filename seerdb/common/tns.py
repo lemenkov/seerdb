@@ -9245,7 +9245,10 @@ def _encode_dcb_column_oci(col: ColumnMeta, position: int, first: bool) -> bytes
     pre[3] = _OCI_DCB_CHAR_FLAG if is_char else 0x00
     pre[4] = col.precision & 0xFF
     pre[5] = col.scale & 0xFF  # signed byte (e.g. -127 for a NUMBER literal)
-    pre[6:10] = _oci_ub4(col.data_length)
+    # A backend that cannot size the column (the PEP 249 tuple reports none for
+    # an interval or a ROWID) gets the length a live server describes it with,
+    # as on the thin path (#2017).
+    pre[6:10] = _oci_ub4(describe_wire_length(col))
     if is_char and col.csfrm == _CSFRM_NCHAR:
         pre[_OCI_DCB_CHAR_SEMANTICS_OFF] = _OCI_DCB_CHAR_SEMANTICS_FLAG
     if is_char:
@@ -9289,6 +9292,23 @@ def encode_describe_oci(columns: list[ColumnMeta]) -> bytes:
     return bytes(out) + _oci_describe_body(columns)
 
 
+# The bytes sqlplus's row buffer needs for a column the backend gives no length:
+# what a live 18c's max row size counts for each, a single-column SELECT apiece
+# (#2017). Its describe gives each a length of 1, which would undersize the
+# buffer, and a zero crashes sqlplus.
+_OCI_ROW_BUFFER_LENGTH = {
+    TNS_TYPE_INTERVALDS: 11,
+    TNS_TYPE_INTERVALYM: 5,
+    TNS_TYPE_RID: 16,
+}
+
+
+def _oci_row_buffer_length(col: ColumnMeta) -> int:
+    if col.data_length:
+        return col.data_length
+    return _OCI_ROW_BUFFER_LENGTH.get(col.data_type, describe_wire_length(col))
+
+
 def _oci_describe_body(columns: list[ColumnMeta]) -> bytes:
     # The describe from the max row size on: what a query's DCB carries after its
     # preamble, and a REF CURSOR's OUT value inline (#2014).
@@ -9300,7 +9320,11 @@ def _oci_describe_body(columns: list[ColumnMeta]) -> bytes:
     # the fixed row buffer (its data_length is 0 anyway); it is excluded to match a
     # live 11g describe, which reports max-row-size 0 for such a result (#405, #407).
     out += _oci_ub4(
-        sum(c.data_length for c in columns if c.data_type not in _OCI_UNSIZED_TYPES)
+        sum(
+            _oci_row_buffer_length(c)
+            for c in columns
+            if c.data_type not in _OCI_UNSIZED_TYPES
+        )
     )
     out += _oci_ub4(len(columns))
     for position, col in enumerate(columns, start=1):
@@ -10673,7 +10697,23 @@ def _encode_oci_value(value: object, col: ColumnMeta, slot: int | None = None) -
         return encode_long_value_oci(value)
     if col.data_type == TNS_TYPE_ADT:
         return encode_object_column_value(value, col.type_oid)
+    if col.data_type == TNS_TYPE_RID and isinstance(value, str):
+        return _oci_rowid_value(value)
     return encode_value(_national_wire_value(value, col), col.data_type)
+
+
+def _oci_rowid_value(rowid: str) -> bytes:
+    # A ROWID cell as OCI reads it (#2017): 16 bytes, the data object number,
+    # relative file number, block number and row number, each a ub4 LE, not the
+    # thin form's packed fields. sqlplus 23.26 against a live 18c, four rows of
+    # one table: `26 0a 04 00 0c 00 00 00 8b 00 00 00 2b 01 00 00` is
+    # AABAomAAMAAAACLAEr, object 264742, file 12, block 139, row 299. A value
+    # that is no physical rowid goes as the thin path sends it.
+    parts = _physical_rowid(rowid)
+    if parts == (0, 0, 0, 0):
+        return encode_value(rowid, TNS_TYPE_RID)
+    image = struct.pack('<IIII', *parts)
+    return bytes([len(image)]) + image
 
 
 # The OER status that trails a LOB locator row on the fetch — NOT the 1403
