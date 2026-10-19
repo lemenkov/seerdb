@@ -10037,12 +10037,27 @@ def encode_dml_status_oci(keyword: str, rowcount: int, *, sequence: int) -> byte
     return bytes(status)
 
 
-def encode_ddl_status_oci(command_type: int, *, sequence: int) -> bytes:
+# The OCI OER's warning flags (§36.1): `0x21` when a CREATE made a PL/SQL object
+# that compiled with errors, `0` otherwise. The thin OER carries the same value in
+# its last warn byte (§6.3a). Captured from sqlplus 23.26 against 11g and 18c, the
+# same CREATE PROCEDURE compiled clean and broken: this byte is all that differs
+# but for the counters.
+_OCI_OER_WARN_OFF = 27
+_OCI_OER_WARN_COMPILATION = 0x21
+
+
+def encode_ddl_status_oci(
+    command_type: int, *, sequence: int, compilation_warning: bool = False
+) -> bytes:
     """OCI reply for a DDL / no-row statement — success so sqlplus prints the
     matching message ("Table created.", "Index dropped.", "Table truncated.", …).
     ``command_type`` is the V$SQL command type (see :func:`ddl_command_type`);
     DDL affects no rows, so nothing but that field varies. ``sequence`` is the
-    live per-session OER counter."""
+    live per-session OER counter.
+
+    ``compilation_warning`` says the statement created a PL/SQL object that
+    compiled with errors; sqlplus then prints "Warning: Procedure created with
+    compilation errors." and lets ``SHOW ERRORS`` look them up (#2013)."""
     oer = bytearray(
         encode_oci_oer(
             oci.OCI_OER_STATUS_SUCCESS, sequence=sequence, command_type=command_type
@@ -10051,6 +10066,8 @@ def encode_ddl_status_oci(command_type: int, *, sequence: int) -> bytes:
     # FIXME: DDL sets offset 18 to 1 (query / PL-SQL leave the envelope's 2);
     # the field's meaning is unknown — carried from the capture.
     oer[18] = 1
+    if compilation_warning:
+        oer[_OCI_OER_WARN_OFF] = _OCI_OER_WARN_COMPILATION
     return _OCI_DDL_FRAME_PREFIX + bytes(oer)
 
 

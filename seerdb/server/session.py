@@ -2040,7 +2040,9 @@ def _mark_transaction(sql: str, autocommit: bool) -> None:
         _ENCODE_TXN_IN_PROGRESS.set(True)
 
 
-def _oci_no_row_status(sql: str, rowcount: int, seq: '_OciSequence') -> bytes:
+def _oci_no_row_status(
+    sql: str, rowcount: int, seq: '_OciSequence', *, compilation_warning: bool = False
+) -> bytes:
     # Pick the OCI success reply for a statement that returned no columns, so
     # sqlplus renders the right message (#348 / #349): DML carries the affected row
     # count ("N rows created/updated/deleted"); DDL / session verbs (CREATE / DROP
@@ -2057,7 +2059,13 @@ def _oci_no_row_status(sql: str, rowcount: int, seq: '_OciSequence') -> bytes:
         )
     command_type = ddl_command_type(sql)
     if command_type is not None:
-        return encode_ddl_status_oci(command_type, sequence=seq.next())
+        # A CREATE whose PL/SQL object compiled with errors succeeds with a
+        # warning, as on the thin path (#2013).
+        return encode_ddl_status_oci(
+            command_type,
+            sequence=seq.next(),
+            compilation_warning=compilation_warning,
+        )
     return encode_status_oci(seq.next())
 
 
@@ -2135,7 +2143,13 @@ def _answer_query_oci(
         return None, [], {}
     if not result.columns:
         stream.write_packet(
-            TNS_DATA, _oci_no_row_status(request.sql, result.rowcount, seq)
+            TNS_DATA,
+            _oci_no_row_status(
+                request.sql,
+                result.rowcount,
+                seq,
+                compilation_warning=result.compilation_warning,
+            ),
         )
         return None, [], {}
     rows = list(result.rows)
