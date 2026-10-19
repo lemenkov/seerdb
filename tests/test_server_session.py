@@ -28,6 +28,8 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_23_4,
     TNS_ACCEPT,
     TNS_DATA,
+    TNS_TYPE_CHAR,
+    TNS_TYPE_NUMBER,
     TNS_TYPE_VARCHAR,
     TTI_END_OF_RESPONSE,
     TTI_FUN,
@@ -41,6 +43,7 @@ from seerdb.common.tns_consts import (
 from seerdb.server import stats
 from seerdb.server.backend import (
     Capability,
+    CursorResult,
     Result,
     SessionInfo,
     UnsupportedFeature,
@@ -2352,6 +2355,239 @@ def test_oci_clean_create_does_not_warn() -> None:
     assert oer[27] == 0
     oer[27] = _OCI_CREATE_BROKEN_REPLY[_OCI_STATUS_PREFIX_LEN + 27]
     assert oer == _oci_reply_oer(_OCI_CREATE_BROKEN_REPLY)
+
+
+# sqlplus 23.26's REFCURSOR flow against a live 18c (#2014): `variable rc
+# refcursor`, then `begin open :rc for select 1 as id, 'a' as name from dual
+# union all select 2, 'bb' from dual; end;` and `print rc`. The block binds :rc
+# as type 102 with a zero cursor id; the server's OUT value names cursor 3, and
+# sqlplus re-executes cursor 3 with no SQL and room for 15 rows.
+_OCI_EXEC_OPEN_REFCURSOR = bytes.fromhex(
+    '035e0b2904040000000000feffffffffffffff23010000feffffffffffffff0d'
+    '000000fefffffffffffffffeffffffffffffff000000000100000000000000fe'
+    'ffffffffffffff010000000000000000000000feffffffffffffff0000000000'
+    '000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '00000000000000000000000000000061626567696e206f70656e203a72632066'
+    '6f722073656c65637420312061732069642c20276127206173206e616d652066'
+    '726f6d206475616c20756e696f6e20616c6c2073656c65637420322c20276262'
+    '272066726f6d206475616c3b20656e643b010000000100000000000000000000'
+    '0000000000000000000000000008000000000000000080000000000000000000'
+    '0000000000016601000001000000000000000000000000000000000000000000'
+    '00000000000000000000000000000000000000000000070400000000'
+)
+_OCI_OPEN_REFCURSOR_REPLY = bytes.fromhex(
+    '0b0105c3010000000000010000000000000000000000000000000000a52d6e7f'
+    '0000a0c3a52d6e7f0000000057930000000030074c04000000020000005c0102'
+    '0000810200000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000102020000000249440000000000000000'
+    '0000000000000101800000020000000000000000000000000000000000000000'
+    '00000000000000000000006903010002000000fe3f0000010404000000044e41'
+    '4d4500000000000000000100000000000700000007000000000a200800000000'
+    '00000000000000000000000000000000030000000000080600dba2ab00000000'
+    '000100000000000000000000000000000000000000000000000401000000717b'
+    '0101000000000000000000010000002f00000000000000000000000000000000'
+    '000000000000000000000b000001000000360100000000000000000000000000'
+    '00407e60346e7f00000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '000100000000000000'
+)
+_OCI_REEXEC_REFCURSOR = bytes.fromhex(
+    '035e0d4000000003000000000000000000000000000000feffffffffffffff0d'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000300000000'
+    '00000000000000000000000000000000000000feffffffffffffff0000000000'
+    '000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '000000000000000000000000000000000000000f000000000000000000000000'
+    '0000000000000000000000010000000000000000000000000000000000000000'
+    '000000'
+)
+# The same re-execute from sqlplus 10.2 (cursor 1) and 11.2 (cursor 2), both
+# against a live 11g: the narrow 10.2 preamble and the wide one.
+_OCI_REEXEC_REFCURSOR_10_2 = bytes.fromhex(
+    '035e17400000000100000000000000000000000000000034431033000000000d'
+    '0000000000000000000000684310330000000000000000000000000300000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '00000000000000000000006a43103300000000c85d1233000000000000000000'
+    '00000000000000000000008043103300000000000000000f0000000000000000'
+    '0000000000000000000000000000000100000000000000000000000000000000'
+    '00000000000000'
+)
+_OCI_REEXEC_REFCURSOR_11_2 = bytes.fromhex(
+    '035e17400000000200000000000000000000000000000000000000feffffffff'
+    'ffffff0d00000000000000fefffffffffffffffeffffffffffffff0000000000'
+    '0000000300000000000000000000000000000000000000000000000000000000'
+    '000000feffffffffffffff0000000000000000fefffffffffffffffeffffffff'
+    'ffffffd86a923a000000000000000000000000fefffffffffffffffeffffffff'
+    'ffffff0000000000000000000000000000000000000000000000000000000000'
+    '000000000000000f000000000000000000000000000000000000000000000001'
+    '0000000000000000000000000000000000000000000000'
+)
+_REFCURSOR_COLUMNS = [
+    ColumnMeta(name=b'ID', data_type=TNS_TYPE_NUMBER, data_length=22, max_size=22),
+    ColumnMeta(name=b'NAME', data_type=TNS_TYPE_CHAR, data_length=2, max_size=2),
+]
+
+
+def _at_field_version(fv: int, fn, *args):
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, _ENCODE_FIELD_VERSION
+
+    decode = _DECODE_FIELD_VERSION.set(fv)
+    encode = _ENCODE_FIELD_VERSION.set(fv)
+    try:
+        return fn(*args)
+    finally:
+        _ENCODE_FIELD_VERSION.reset(encode)
+        _DECODE_FIELD_VERSION.reset(decode)
+
+
+def test_a_refcursor_bind_is_read() -> None:
+    # The bind used to be refused, ORA-03115 (#2014). Its zero cursor id makes
+    # it an OUT bind for the block to open.
+    from seerdb.common.tns import parse_exec_oci
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1, TNS_TYPE_REFCURSOR
+
+    request = _at_field_version(
+        FIELD_VERSION_18_1_EXT_1, parse_exec_oci, _OCI_EXEC_OPEN_REFCURSOR
+    )
+    assert request.sql.startswith('begin open :rc for select 1 as id')
+    assert request.binds == [None]
+    assert request.bind_meta == [(TNS_TYPE_REFCURSOR, 1)]
+
+
+@pytest.mark.parametrize(
+    ('body', 'field_version', 'cursor'),
+    [
+        (_OCI_REEXEC_REFCURSOR, 'FIELD_VERSION_18_1_EXT_1', 3),
+        (_OCI_REEXEC_REFCURSOR_11_2, 'FIELD_VERSION_11_2', 2),
+        (_OCI_REEXEC_REFCURSOR_10_2, 'FIELD_VERSION_10_2', 1),
+    ],
+    ids=['23.26', '11.2', '10.2'],
+)
+def test_a_reexecute_names_its_cursor_and_fetch_count(
+    body: bytes, field_version: str, cursor: int
+) -> None:
+    from seerdb.common import tns_consts
+    from seerdb.common.tns import parse_reexecute_oci
+
+    fv = getattr(tns_consts, field_version)
+    assert _at_field_version(fv, parse_reexecute_oci, body) == (cursor, 15)
+
+
+def test_the_refcursor_out_value_matches_the_live_reply() -> None:
+    # The value's frame -- lead byte, describe-time tail, cursor id, return code
+    # -- is the live server's, with the date the Mirror zeroes. The describe in
+    # between is the Mirror's own, the one its queries carry.
+    from seerdb.common.tns import (
+        RefCursorOutBind,
+        _oci_describe_body,
+        encode_out_bind_response_oci,
+    )
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1
+
+    live = _OCI_OPEN_REFCURSOR_REPLY[52:]
+    live = live[: live.find(bytes.fromhex('080600'))]
+    live_tail = bytearray(live[live.find(bytes.fromhex('0700000007')) - 1 :])
+    live_tail[6:13] = bytes(7)  # the describe-time date
+
+    bind = RefCursorOutBind(columns=_REFCURSOR_COLUMNS, cursor_id=3)
+    reply = _at_field_version(
+        FIELD_VERSION_18_1_EXT_1,
+        lambda: encode_out_bind_response_oci([bind], sequence=1, inputs=[True]),
+    )
+    body = _at_field_version(
+        FIELD_VERSION_18_1_EXT_1, _oci_describe_body, _REFCURSOR_COLUMNS
+    )
+    value = reply[52:]
+    assert reply[50:52] == _OCI_OPEN_REFCURSOR_REPLY[50:52]  # IN OUT, then RXD
+    assert value[0] == live[0] == 0x4C
+    assert value[1 : 1 + len(body)] == body
+    assert value[1 + len(body) : 1 + len(body) + len(live_tail)] == live_tail
+
+
+class _OciRefCursorBackend(_OciCountingBackend):
+    def __init__(self, rows: int) -> None:
+        super().__init__()
+        self.rows = [(n, 'r') for n in range(1, rows + 1)]
+
+    def execute(self, sql: str, binds=()) -> Result:
+        self.calls.append(sql)
+        return Result(
+            out_binds=[CursorResult(columns=_REFCURSOR_COLUMNS, rows=self.rows)]
+        )
+
+
+def _oci_fetch(cursor: int, rows: int) -> bytes:
+    return b'\x03\x05\x10' + cursor.to_bytes(4, 'little') + rows.to_bytes(4, 'little')
+
+
+def test_print_refcursor_fetches_its_rows() -> None:
+    # The block's reply names a cursor; sqlplus re-executes it for as many rows
+    # as it has room for, then fetches the rest. 40 rows go out as 15, 15, 10,
+    # the last answer ending the fetch.
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1, TNS_DATA
+    from seerdb.server.session import _OCI_REF_CURSOR_FIRST_ID, _serve_oci_session
+
+    cursor = _OCI_REF_CURSOR_FIRST_ID
+    reexec = bytearray(_OCI_REEXEC_REFCURSOR)
+    reexec[7:11] = cursor.to_bytes(4, 'little')
+    stream: Any = _OciOneCallStream(_OCI_EXEC_OPEN_REFCURSOR)
+    stream.inbox[1:1] = [
+        (TNS_DATA, bytes(reexec)),
+        (TNS_DATA, _oci_fetch(cursor, 15)),
+        (TNS_DATA, _oci_fetch(cursor, 15)),
+    ]
+    backend: Any = _OciRefCursorBackend(40)
+    _serve_oci_session(stream, backend, 'PYO', field_version=FIELD_VERSION_18_1_EXT_1)
+    opened, first, second, last = stream.sent
+    assert cursor.to_bytes(4, 'little') + b'\x00\x00\x08\x06' in opened
+    assert [reply.count(b'\x07\x02\xc1') for reply in (first, second, last)] == [
+        15,
+        15,
+        10,
+    ]
+    assert b'ORA-01403' not in first + second
+    assert b'ORA-01403' in last
+
+
+def test_a_drained_refcursor_is_forgotten() -> None:
+    # A re-execute of a cursor already drained is not served from it again.
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1, TNS_DATA
+    from seerdb.server.session import _OCI_REF_CURSOR_FIRST_ID, _serve_oci_session
+
+    reexec = bytearray(_OCI_REEXEC_REFCURSOR)
+    reexec[7:11] = _OCI_REF_CURSOR_FIRST_ID.to_bytes(4, 'little')
+    stream: Any = _OciOneCallStream(_OCI_EXEC_OPEN_REFCURSOR)
+    stream.inbox[1:1] = [(TNS_DATA, bytes(reexec)), (TNS_DATA, bytes(reexec))]
+    backend: Any = _OciRefCursorBackend(2)
+    _serve_oci_session(stream, backend, 'PYO', field_version=FIELD_VERSION_18_1_EXT_1)
+    _opened, served, again = stream.sent
+    assert served.count(b'\x07\x02\xc1') == 2
+    assert b'\x07\x02\xc1' not in again
+
+
+def test_a_refcursor_with_a_lob_column_is_refused() -> None:
+    # A LOB column's rows stream over calls this path does not serve yet; sent
+    # the plain way they hung sqlplus. Refused, the session carries on (#2014).
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1, TNS_TYPE_CLOB
+    from seerdb.server.session import _serve_oci_session
+
+    clob = ColumnMeta(name=b'C', data_type=TNS_TYPE_CLOB, data_length=4000, max_size=0)
+
+    class _LobCursor(_OciCountingBackend):
+        def execute(self, sql: str, binds=()) -> Result:
+            return Result(out_binds=[CursorResult(columns=[clob], rows=[('hello',)])])
+
+    stream: Any = _OciOneCallStream(_OCI_EXEC_OPEN_REFCURSOR)
+    backend: Any = _LobCursor()
+    _serve_oci_session(stream, backend, 'PYO', field_version=FIELD_VERSION_18_1_EXT_1)
+    [reply] = stream.sent
+    assert b'ORA-03115' in reply
+    assert b'REF CURSOR with LOB or LONG columns' in reply
 
 
 # The capability block each sqlplus sends (its DTY proper, one round after its

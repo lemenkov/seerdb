@@ -149,6 +149,7 @@ from seerdb.common.tns import (
     parse_lobops_request,
     parse_lobops_slot,
     parse_reexecute,
+    parse_reexecute_oci,
     parse_tpc_switch,
     peek_exec_cursor,
     scroll_start_row,
@@ -1709,6 +1710,9 @@ def _serve_oci_session(
     # Rows a multi-row execute delivered only the first of; the rest wait here
     # for the follow-up fetch (the OCI analogue of the thin _Cursors).
     parked: tuple[list[ColumnMeta], list[tuple]] | None = None
+    # The REF CURSORs blocks opened, by the id their OUT value named; sqlplus
+    # re-executes each by that id to fetch its rows (#2014).
+    ref_cursors = _OciRefCursors()
     # LOB contents (wire bytes + is_clob + national) the current statement's rows
     # carry, in the order their locators went out; sqlplus drains them with
     # TTI_LOBOPS reads, slicing the current LOB per each read's offset/amount (#405).
@@ -1784,6 +1788,10 @@ def _serve_oci_session(
             _ENCODE_OCI_CALL_SEQ.set(body[2])
         if len(body) >= 2 and body[0] == TTI_FUN:
             if body[1] == TTI_ALL8:
+                if is_reexecute_oci(body) and ref_cursors.serve_reexecute(
+                    stream, body, seq
+                ):
+                    continue
                 if parked is not None and is_reexecute_oci(body):
                     # sqlplus re-executes the described cursor to pull LONG rows
                     # once its streaming define is set up. LONG rows stream one per
@@ -1798,7 +1806,9 @@ def _serve_oci_session(
                         continue
                     parked = _serve_oci_long_row(stream, parked, seq, reexecute=True)
                     continue
-                parked, lobs, slot_lobs = _answer_query_oci(stream, backend, body, seq)
+                parked, lobs, slot_lobs = _answer_query_oci(
+                    stream, backend, body, seq, ref_cursors
+                )
                 current_lob = None
                 slot_current = {}
                 continue
@@ -1855,7 +1865,9 @@ def _serve_oci_session(
                 )
                 continue
             if body[1] == TTI_FETCH:
-                if parked is not None and _is_long_result(parked[0]):
+                if ref_cursors.serve_fetch(stream, body, seq):
+                    pass
+                elif parked is not None and _is_long_result(parked[0]):
                     # A LONG result drains one row per fetch (each with "more"),
                     # the last fetch drawing the 1403 terminator below (#407).
                     parked = _serve_oci_long_row(stream, parked, seq, reexecute=False)
@@ -2070,7 +2082,11 @@ def _oci_no_row_status(
 
 
 def _answer_query_oci(
-    stream: PacketStream, backend: Backend, body: bytes, seq: '_OciSequence'
+    stream: PacketStream,
+    backend: Backend,
+    body: bytes,
+    seq: '_OciSequence',
+    ref_cursors: '_OciRefCursors | None' = None,
 ) -> tuple[
     tuple[list[ColumnMeta], list[tuple]] | None,
     list[tuple[bytes, bool, bool]],
@@ -2124,20 +2140,40 @@ def _answer_query_oci(
             ),
         )
         return None, [], {}
+    if any(
+        isinstance(value, CursorResult)
+        and (_is_lob_result(value.columns) or _is_long_result(value.columns))
+        for value in result.out_binds
+    ):
+        # A REF CURSOR whose rows carry a LOB or LONG streams them over calls of
+        # their own, which this path does not serve yet. Its rows sent the plain
+        # way hung sqlplus; refused, the session carries on (#2014).
+        _refuse_unhandled_oci(stream, 'a REF CURSOR with LOB or LONG columns', seq)
+        return None, [], {}
     if result.out_binds:
         # A PL/SQL block that assigned OUT binds (sqlplus VARIABLE / EXEC) — return
         # the values so the client reads them back into its bound buffers.
+        if ref_cursors is None:
+            ref_cursors = _OciRefCursors()
         stream.write_packet(
             TNS_DATA,
             encode_out_bind_response_oci(
-                result.out_binds,
+                [ref_cursors.park(value) for value in result.out_binds],
                 sequence=seq.next(),
                 # Each bind's type -- an object / collection goes back in its
                 # own framing -- and whether it came in with a value, which the
                 # reply reports as its direction (#1411).
                 types=[(t, toid) for (t, _cs, _size, toid) in request.bind_types]
                 or None,
-                inputs=[value is not None for value in request.binds] or None,
+                # A REFCURSOR comes in with a value, its zero cursor id, and a
+                # live server reports it IN OUT (#2014).
+                inputs=[
+                    value is not None or t == TNS_TYPE_REFCURSOR
+                    for value, (t, _cs, _size, _toid) in zip(
+                        request.binds, request.bind_types
+                    )
+                ]
+                or None,
             ),
         )
         return None, [], {}
@@ -2598,6 +2634,73 @@ def _parse_end_to_end_piggyback(rest: bytes) -> tuple[dict[str, str | None], byt
 _END_TO_END_ATTRS = frozenset(
     {'client_identifier', 'module', 'action', 'client_info', 'dbop'}
 )
+
+
+# REF CURSOR ids start clear of the fixed ids the Mirror's other OCI replies
+# carry (0, 0x5be8, 0x5beb), so a re-execute of a statement's own cursor is never
+# taken for one (#2014).
+_OCI_REF_CURSOR_FIRST_ID = 0x100
+
+
+class _OciRefCursors:
+    """The REF CURSORs PL/SQL blocks opened in one sqlplus session (#2014).
+
+    A block's OUT value names a cursor id; sqlplus re-executes that id with no
+    SQL to fetch the rows, and fetches again while rows remain. Each answer
+    carries at most the rows the call has room for, since sqlplus sized its
+    buffer to that count (#1284), and the last one ends the fetch."""
+
+    def __init__(self) -> None:
+        self._open: dict[int, tuple[list[ColumnMeta], list[tuple]]] = {}
+        self._next_id = _OCI_REF_CURSOR_FIRST_ID
+
+    def park(self, value: object) -> object:
+        # A cursor the block opened becomes the OUT value naming it; one it
+        # never opened has no columns and id 0, as on the thin path (#1016).
+        if not isinstance(value, CursorResult):
+            return value
+        if not value.columns:
+            return RefCursorOutBind(columns=[], cursor_id=0)
+        cursor_id = self._next_id
+        self._next_id += 1
+        self._open[cursor_id] = (list(value.columns), list(value.rows))
+        return RefCursorOutBind(columns=list(value.columns), cursor_id=cursor_id)
+
+    def serve_reexecute(
+        self, stream: PacketStream, body: bytes, seq: '_OciSequence'
+    ) -> bool:
+        cursor_id = int.from_bytes(body[7:11], 'little')
+        if cursor_id not in self._open:
+            return False
+        _cursor_id, count = parse_reexecute_oci(body)
+        self._serve(stream, cursor_id, count, seq)
+        return True
+
+    def serve_fetch(
+        self, stream: PacketStream, body: bytes, seq: '_OciSequence'
+    ) -> bool:
+        cursor_id = int.from_bytes(body[3:7], 'little')
+        if cursor_id not in self._open:
+            return False
+        self._serve(stream, cursor_id, parse_fetch_oci(body), seq)
+        return True
+
+    def _serve(
+        self, stream: PacketStream, cursor_id: int, count: int, seq: '_OciSequence'
+    ) -> None:
+        columns, rows = self._open[cursor_id]
+        count = max(1, count)
+        more = len(rows) > count
+        stream.write_packet(
+            TNS_DATA,
+            encode_fetch_batch_oci(
+                columns, rows[:count], sequence=seq.next(), more=more
+            ),
+        )
+        if more:
+            self._open[cursor_id] = (columns, rows[count:])
+        else:
+            del self._open[cursor_id]
 
 
 class _OciSequence:

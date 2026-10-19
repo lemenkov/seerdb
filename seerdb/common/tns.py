@@ -3879,6 +3879,26 @@ def is_reexecute_oci(payload: bytes) -> bool:
     )
 
 
+# A re-execute by cursor id carries no SQL, and the thin al8i4 array starts where
+# the SQL's length would be: its first element 0 (no parse), its second the rows
+# the client has room for. sqlplus 23.26 fetching a REF CURSOR, 11g and 18c
+# alike: `00 00 00 00 0f 00 00 00` there, 15 rows (#2014).
+_OCI_REEXEC_ROWS_FROM_SQL = 3
+
+
+def parse_reexecute_oci(payload: bytes) -> tuple[int, int]:
+    """The cursor id and the number of rows an OCI re-execute asks for (#2014)."""
+    if not is_reexecute_oci(payload):
+        raise InterfaceError('not an OCI re-execute')
+    cursor = int.from_bytes(
+        payload[_OCI_ALL8_CURSOR_OFF : _OCI_ALL8_CURSOR_OFF + 4], 'little'
+    )
+    at = _oci_all8_layout(payload, sql_present=False).sql + _OCI_REEXEC_ROWS_FROM_SQL
+    if len(payload) < at + 4:
+        raise InterfaceError('OCI re-execute: no fetch count')
+    return cursor, int.from_bytes(payload[at : at + 4], 'little')
+
+
 # The OCI fetch is `03 05 <seq>`, then the cursor id and the number of rows the
 # client has room for, each a fixed ub4 LE (live 11g/18c: `03 05 0f 02 00 00 00
 # 0f 00 00 00` asks cursor 2 for 15 rows).
@@ -8804,16 +8824,22 @@ _OCI_ALL8_NARROW_12C = _OCI_ALL8_NARROW._replace(
 _OCI_ALL8_10_2 = _OCI_ALL8_NARROW._replace(sql=148)
 
 
-def _oci_all8_layout(payload: bytes) -> _OciAll8Layout:
+def _oci_all8_layout(payload: bytes, *, sql_present: bool = True) -> _OciAll8Layout:
     """Which OALL8 preamble width ``payload`` carries, as the offsets that depend
     on it. Raises :class:`InterfaceError` when neither shape holds, so a
-    differently-shaped message errors rather than yielding a garbage SQL."""
+    differently-shaped message errors rather than yielding a garbage SQL.
+    ``sql_present`` is False for a re-execute by cursor id, whose SQL pointer at
+    offset 11 is absent; the second indicator still tells the width (#2014)."""
     if _DECODE_FIELD_VERSION.get() < FIELD_VERSION_11_2:
-        for ind in (_OCI_ALL8_IND_OFF, _OCI_ALL8_IND2_OFF_NARROW):
+        pointers = (_OCI_ALL8_IND_OFF, _OCI_ALL8_IND2_OFF_NARROW)
+        for ind in pointers if sql_present else pointers[1:]:
             if not oci.pointer_present(payload[ind : ind + 8]):
                 raise InterfaceError(f'OCI OALL8: no pointer at offset {ind}')
         return _OCI_ALL8_10_2
-    if payload[_OCI_ALL8_IND_OFF : _OCI_ALL8_IND_OFF + 8] != oci.OCI_INDICATOR:
+    if (
+        sql_present
+        and payload[_OCI_ALL8_IND_OFF : _OCI_ALL8_IND_OFF + 8] != oci.OCI_INDICATOR
+    ):
         raise InterfaceError(f'OCI OALL8: no indicator at offset {_OCI_ALL8_IND_OFF}')
     for ind2, layout in (
         (_OCI_ALL8_IND2_OFF, _OCI_ALL8_WIDE),
@@ -8949,6 +8975,9 @@ _OCI_BIND_TYPES = frozenset(
         TNS_TYPE_TIMESTAMPTZ,
         TNS_TYPE_BFLOAT,
         TNS_TYPE_BDOUBLE,
+        # A sqlplus REFCURSOR variable, `01 66 01 00 00` and a ub4 size of 1; its
+        # value is a cursor id, zero for one the block is to open (#2014).
+        TNS_TYPE_REFCURSOR,
     }
 )
 
@@ -9034,6 +9063,12 @@ def _parse_oci_binds(
                     values.append(None)
                     continue
                 raw, rest = decode_dalc(rest)
+                if data_type == TNS_TYPE_REFCURSOR:
+                    # A ub4 LE cursor id, zero when the block opens the cursor:
+                    # then it is an OUT bind like any other (#2014).
+                    cursor_id = int.from_bytes(raw or b'', 'little')
+                    values.append(cursor_id or None)
+                    continue
                 # The OCI (sqlplus) bind path doesn't carry a national char form;
                 # decode ordinary char (csfrm 1) — no test client binds NCHAR here.
                 if data_type == TNS_TYPE_NUMBER and isinstance(raw, bytes):
@@ -9187,6 +9222,13 @@ def encode_describe_oci(columns: list[ColumnMeta]) -> bytes:
     else:
         out += _oci_ub4(_OCI_DCB_PREAMBLE_LEN)
     out += bytes(_OCI_DCB_PREAMBLE_LEN)
+    return bytes(out) + _oci_describe_body(columns)
+
+
+def _oci_describe_body(columns: list[ColumnMeta]) -> bytes:
+    # The describe from the max row size on: what a query's DCB carries after its
+    # preamble, and a REF CURSOR's OUT value inline (#2014).
+    out = bytearray()
     # Max row size: the thick/OCI client allocates a row buffer of this many
     # bytes, so it must cover the widest row — a zero here overflows and crashes
     # sqlplus (unlike the thin client, which skips the field). A LONG / LONG RAW /
@@ -10145,6 +10187,38 @@ def _oci_out_object_value(value: object, toid: bytes) -> bytes:
     )
 
 
+# A REF CURSOR OUT value in the OCI reply (#2014): a lead byte, the cursor's
+# describe from the max row size on, the describe-time tail, the cursor id (ub4)
+# and the return code every OUT value ends on. The lead byte is 0x4c from 11g and
+# 18c to sqlplus 10.2, 11.2 and 23.26 alike, whatever the cursor's columns; a 10g
+# server sends 0x3c, but it is not what the Mirror presents.
+_OCI_REFCURSOR_LEAD = 0x4C
+# The describe-time tail: a zero byte, the date's ub4 and ub1 lengths (7), the
+# date, four ub4 flags and, from 11.2, the ub4 length of an empty query-cache key
+# -- the fields the thin decoder skips there. A live server fills in the date, and
+# for a DATE column one of the flags; the Mirror zeroes them, as it does in a
+# query's own describe tail.
+_OCI_REFCURSOR_TAIL_LEN = 33
+_OCI_REFCURSOR_TAIL_10_2_LEN = 29
+
+
+def _oci_refcursor_out_value(bind: RefCursorOutBind) -> bytes:
+    tail = bytearray(
+        _OCI_REFCURSOR_TAIL_LEN
+        if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2
+        else _OCI_REFCURSOR_TAIL_10_2_LEN
+    )
+    tail[1:5] = _oci_ub4(_OCI_DCB_DATE_LEN)
+    tail[5] = _OCI_DCB_DATE_LEN
+    return (
+        bytes([_OCI_REFCURSOR_LEAD])
+        + _oci_describe_body(bind.columns)
+        + bytes(tail)
+        + _oci_ub4(bind.cursor_id)
+        + _OCI_OUTBIND_RETCODE
+    )
+
+
 def encode_out_bind_response_oci(
     values: list[object],
     *,
@@ -10161,7 +10235,8 @@ def encode_out_bind_response_oci(
     ``types`` is each bind's (tns type, type id): an object or collection bind
     (109) goes back in its own framing, its value the backend's image.
     ``inputs`` says which binds came in with a value -- IN OUT, not pure OUT --
-    which the marker before the values reports.
+    which the marker before the values reports. A :class:`RefCursorOutBind`
+    value is a cursor the block opened, its rows parked under its id (#2014).
     """
     types = types or [(0, b'')] * len(values)
     inputs = inputs or [False] * len(values)
@@ -10173,6 +10248,8 @@ def encode_out_bind_response_oci(
     rxd = bytes([TTI_RXD]) + b''.join(
         _oci_out_object_value(v, toid)
         if t == TNS_TYPE_ADT
+        else _oci_refcursor_out_value(v)
+        if isinstance(v, RefCursorOutBind)
         else encode_value(v, 0) + _OCI_OUTBIND_RETCODE
         for v, (t, toid) in zip(values, types)
     )
