@@ -478,3 +478,73 @@ def test_the_login_time_zone_reaches_the_upstream_session():
     backend.alter_session(statement)
     assert backend._conn.statements == [statement]
     assert backend._conn.closed_cursors == 1
+
+
+# DBMSOUTPUT_LINESARRAY as a live 23ai describes it: its id, and the type
+# descriptor DBMS_PICKLER.GET_TYPE_SHAPE returns -- a VARRAY, bound 7fffffff,
+# of VARCHAR2(32767) (#2016).
+_LINESARRAY_OID = bytes.fromhex('508dca8ad30fc26ae06304bf6b64fdd6')
+_LINESARRAY_TDS = bytes.fromhex(
+    '00000021260100010001ff290000000000161c0000001d7fffffff032a077fff0100000007'
+)
+
+
+class _TypeShapeCursor:
+    """Answers describe_type's catalog query and its DBMS_PICKLER block."""
+
+    def __init__(self, row):
+        self._row = row
+        self.calls: list = []
+
+    def var(self, dbtype, size=None):
+        return _FakeVar()
+
+    def execute(self, sql, variables):
+        self.calls.append((sql, dict(variables)))
+        if 'get_type_shape' in sql:
+            variables['oid'].setvalue(0, _LINESARRAY_OID)
+            variables['tds'].setvalue(0, _LINESARRAY_TDS)
+            variables['status'].setvalue(0, 0)
+
+    def fetchone(self):
+        return self._row
+
+
+def _type_backend(row):
+    backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
+    cursor = _TypeShapeCursor(row)
+    backend._conn = type('Conn', (), {'cursor': lambda self: cursor})()
+    return backend, cursor
+
+
+def test_a_collection_type_is_described_from_upstream():
+    # sqlplus describes DBMSOUTPUT_LINESARRAY before it reads SERVEROUTPUT's
+    # lines; refused, it printed nothing through a passthrough (#2016). The id
+    # and descriptor come from the upstream, the null-image descriptor is the
+    # one every collection has.
+    backend, cursor = _type_backend(('SYS', 'DBMSOUTPUT_LINESARRAY', 'VARYING ARRAY'))
+    described = backend.describe_type('dbmsoutput_linesarray')
+    assert described is not None
+    assert (described.schema, described.name, described.kind) == (
+        'SYS',
+        'DBMSOUTPUT_LINESARRAY',
+        'varray',
+    )
+    assert described.oid == _LINESARRAY_OID
+    assert described.tds == _LINESARRAY_TDS
+    assert described.null_tds == bytes.fromhex(
+        '0000001226010001000100290000000000071a2a0007'
+    )
+    # A bare name: no schema, the type's own looked up by name.
+    (_sql, binds) = cursor.calls[0]
+    assert binds == {'type_owner': None, 'type_name': 'DBMSOUTPUT_LINESARRAY'}
+    (_sql, binds) = cursor.calls[1]
+    assert (binds['type_owner'], binds['type_name']) == ('SYS', 'DBMSOUTPUT_LINESARRAY')
+
+
+def test_a_type_that_is_no_collection_is_not_described():
+    # An object type, or no type at all, is not in ALL_COLL_TYPES; the describe
+    # is then refused as before.
+    backend, cursor = _type_backend(None)
+    assert backend.describe_type('SCOTT.NO_SUCH_TYPE') is None
+    assert cursor.calls[0][1] == {'type_owner': 'SCOTT', 'type_name': 'NO_SUCH_TYPE'}

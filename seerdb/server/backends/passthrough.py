@@ -63,9 +63,33 @@ from seerdb.server.backend import (
     LtzValue,
     Result,
     SessionInfo,
+    TypeDescription,
 )
 
 _T = TypeVar('_T')
+
+# A type's id and descriptor for an OCI client's type describe (#2016): the
+# (schema, name) form of DBMS_PICKLER.GET_TYPE_SHAPE, the one 11g has too.
+_TYPE_SHAPE_SQL = (
+    'DECLARE v BINARY_INTEGER; l RAW(2000); '
+    'BEGIN :status := dbms_pickler.get_type_shape('
+    ':type_owner, :type_name, :oid, v, :tds, l); END;'
+)
+# A collection type by schema and name, or by a bare name as Oracle resolves it:
+# the current schema first, then a public synonym.
+_COLLECTION_TYPE_SQL = (
+    'SELECT c.owner, c.type_name, c.coll_type FROM all_coll_types c '
+    'WHERE c.type_name = :type_name AND c.owner = COALESCE(:type_owner, '
+    "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')) "
+    'UNION ALL '
+    'SELECT c.owner, c.type_name, c.coll_type FROM all_synonyms s '
+    'JOIN all_coll_types c ON c.owner = s.table_owner AND c.type_name = s.table_name '
+    "WHERE :type_owner IS NULL AND s.owner = 'PUBLIC' AND s.synonym_name = :type_name"
+)
+# A collection's null-image descriptor: one null leaf (0x1a) inside a TDS
+# header, the same for every collection -- what the Mirror-over-PG backend
+# builds as `_tds(_TdsObject((_TDS_NULL_LEAF,)))` (PROTOCOL.md §40).
+_COLLECTION_NULL_TDS = bytes.fromhex('0000001226010001000100290000000000071a2a0007')
 
 
 def _carries_bc_dates(method: Callable[..., _T]) -> Callable[..., _T]:
@@ -402,6 +426,53 @@ class OraclePassthroughBackend:
             db_name=db_name,
             db_domain=db_domain,
             service_name=service,
+        )
+
+    def describe_type(self, name: str) -> TypeDescription | None:
+        """A collection type for an OCI client's type describe (#2016), from
+        the upstream: its id and type descriptor from DBMS_PICKLER, its owner,
+        name and kind from the catalog. sqlplus asks for SYS's
+        DBMSOUTPUT_LINESARRAY before it reads SERVEROUTPUT's lines. An object
+        type is not served yet: its null-image descriptor needs the attribute
+        tree, which the upstream does not hand back. None for anything not
+        served, and the describe is refused as before."""
+        assert self._conn is not None
+        probe = self._conn.cursor()
+        (schema, _dot, bare) = name.upper().rpartition('.')
+        # A bare name as Oracle resolves it: the current schema, then a public
+        # synonym.
+        probe.execute(
+            _COLLECTION_TYPE_SQL, {'type_owner': schema or None, 'type_name': bare}
+        )
+        row = probe.fetchone()
+        if row is None:
+            return None
+        (owner, type_name, coll_type) = row
+        oid = probe.var(bytes)
+        tds = probe.var(bytes)
+        status = probe.var(int)
+        try:
+            probe.execute(
+                _TYPE_SHAPE_SQL,
+                {
+                    'type_owner': owner,
+                    'type_name': type_name,
+                    'oid': oid,
+                    'tds': tds,
+                    'status': status,
+                },
+            )
+        except seerdb.DatabaseError:
+            return None
+        if status.getvalue() != 0 or not oid.getvalue() or not tds.getvalue():
+            return None
+        return TypeDescription(
+            schema=owner,
+            name=type_name,
+            oid=bytes(oid.getvalue()),
+            kind='varray' if coll_type == 'VARYING ARRAY' else 'nested_table',
+            tds=bytes(tds.getvalue()),
+            null_tds=_COLLECTION_NULL_TDS,
         )
 
     def _gettype_by_oid(self, oid: bytes) -> DbObjectType | None:
