@@ -9475,22 +9475,26 @@ def _translate_package_ddl(
 _ANON_BLOCK = re.compile(r'(?is)^\s*(DECLARE\b.*?\s)?BEGIN\b(.*)\bEND\s*;?\s*$')
 
 
-def _occurrence_binds(sql: str, rows: Sequence[Sequence]) -> str:
-    """`sql` with a bind name that repeats given a fresh name at a later
-    occurrence whose value differs from the first's, where a SQL statement
-    came with one value per occurrence (#1714): Oracle binds a SQL statement's
-    placeholders by position, so in `VALUES (:1, t(:1, :2, :3))` with four
-    values the two `:1` are two binds. An occurrence every row gives the same
-    value stays the one bind, which PostgreSQL types from wherever it can --
-    `id = :x OR :x IS NULL` (#15). A PL/SQL block binds by name, as does a
-    client sending one value a name; either is left as it is."""
+def _occurrence_binds(
+    sql: str, rows: Sequence[Sequence]
+) -> tuple[str, Sequence[Sequence]]:
+    """`sql` and `rows` with a bind name that repeats given a fresh name at a
+    later occurrence whose value differs from the first's, where a SQL
+    statement came with one value per occurrence (#1714): Oracle binds a SQL
+    statement's placeholders by position, so in `VALUES (:1, t(:1, :2, :3))`
+    with four values the two `:1` are two binds. An occurrence every row gives
+    the same value stays the one bind, which PostgreSQL types from wherever it
+    can -- `id = :x OR :x IS NULL` (#15) -- and its value leaves the rows,
+    which then hold one value a name, as the binds are read (#2066). A PL/SQL
+    block binds by name, as does a client sending one value a name; either is
+    left as it is."""
     if not rows or _ANON_BLOCK.match(sql):
-        return sql
+        return (sql, rows)
     spans = list(_bind_spans(sql))
     occurrences = [name for _kind, _text, name in spans if name is not None]
     if len(rows[0]) != len(occurrences) or len(set(occurrences)) == len(occurrences):
-        return sql
-    (out, first, position) = ([], {}, 0)
+        return (sql, rows)
+    (out, first, position, merged) = ([], {}, 0, set())
     for index, (_kind, text, name) in enumerate(spans):
         if name is None:
             out.append(text)
@@ -9499,9 +9503,12 @@ def _occurrence_binds(sql: str, rows: Sequence[Sequence]) -> str:
             first[name] = position
         elif any(_differs(row[position], row[first[name]]) for row in rows):
             text = f':seerdb_occ_{index}'
+        else:
+            merged.add(position)
         out.append(text)
         position += 1
-    return ''.join(out)
+    kept = [[v for i, v in enumerate(row) if i not in merged] for row in rows]
+    return (''.join(out), kept)
 
 
 def _differs(a: object, b: object) -> bool:
@@ -12730,7 +12737,7 @@ class PostgresBackend:
     @_while_connected
     @_plainly_quoted
     def execute(self, sql: str, binds: Sequence = ()) -> Result:
-        sql = _occurrence_binds(sql, [binds])
+        (sql, [binds]) = _occurrence_binds(sql, [binds])
         return self._committing(
             lambda: self._with_implicit_results(
                 lambda: self._reported(
@@ -16269,7 +16276,7 @@ class PostgresBackend:
     @_plainly_quoted
     def execute_many(self, sql: str, rows: Sequence[Sequence]) -> int | Result:
         # One run of the statement in the translation report, however many rows.
-        sql = _occurrence_binds(sql, rows)
+        (sql, rows) = _occurrence_binds(sql, rows)
         return self._committing(
             lambda: self._reported(sql, lambda: self._execute_batch(sql, rows))
         )
@@ -16364,7 +16371,7 @@ class PostgresBackend:
     def execute_many_rowcounts(
         self, sql: str, rows: Sequence[Sequence]
     ) -> tuple[int, list[int]]:
-        sql = _occurrence_binds(sql, rows)
+        (sql, rows) = _occurrence_binds(sql, rows)
         return self._reported(sql, lambda: self._execute_batch_rowcounts(sql, rows))
 
     def _execute_batch_rowcounts(
