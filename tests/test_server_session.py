@@ -1918,6 +1918,53 @@ def test_a_statement_whose_binds_are_not_read_is_refused() -> None:
         _DECODE_FIELD_VERSION.reset(token)
 
 
+# sqlplus 23.26's SHOW ERRORS query after a create that compiled with errors,
+# through a Mirror, its piggyback stripped (#2028). The SQL is longer than 252
+# bytes, so it is chunked, and its one bind's descriptor carries the flag byte
+# 0x20.
+_OCI_SHOW_ERRORS_QUERY = bytes.fromhex(
+    '035e066980000000000000feffffffffffffff57030000feffffffffffffff0d'
+    '000000fefffffffffffffffeffffffffffffff000000000100000000000000fe'
+    'ffffffffffffff010000000000000000000000feffffffffffffff0000000000'
+    '000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '000000000000000000000000000000feff53454c45435420544f5f4348415228'
+    '4c494e45297c7c272f277c7c544f5f4348415228504f534954494f4e2920224c'
+    '494e452f434f4c222c205445585420224552524f52222046524f4d20414c4c5f'
+    '4552524f5253204120574845524520412e4e414d45203d205550504552283a4e'
+    '4d42494e445f53484f575f4f424a2920414e4420412e54595045203d20275052'
+    '4f4345445552452720414e4420412e4f574e4552203d202853454c4543542028'
+    '5359535f434f4e54455854282755534552454e56272c202743555252454e545f'
+    '534348454d412729292046524f4d205359532e4455414c29204f524445522042'
+    '59204c494e452c20504f534954494f4e1e2c204154545249425554452c204d45'
+    '53534147455f4e554d4245520000000001000000000000000000000000000000'
+    '0000000000000000000000000100000000000000008000000000000000000000'
+    '0000000001012000001800000000000000000000000000000000000000000000'
+    '000000000000000000690301000000000000000000070873705f6332303133'
+)
+
+
+def test_a_long_bound_statement_is_read() -> None:
+    # Binds were read only after a short statement, so this one was refused
+    # with ORA-03115 and SHOW ERRORS failed (#2028).
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, parse_exec_oci
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1, TNS_TYPE_VARCHAR
+
+    token = _DECODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT_1)
+    try:
+        request = parse_exec_oci(_OCI_SHOW_ERRORS_QUERY)
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+    assert len(request.sql) > 252
+    assert request.sql.startswith('SELECT ')
+    assert 'A.NAME = UPPER(:NMBIND_SHOW_OBJ)' in request.sql
+    assert request.sql.endswith('ORDER BY LINE, POSITION, ATTRIBUTE, MESSAGE_NUMBER')
+    assert request.binds == ['sp_c2013']
+    assert request.bind_meta == [(TNS_TYPE_VARCHAR, 24)]
+
+
 def test_oci_loop_answers_a_break_marker() -> None:
     """A break / reset marker gets a marker back, not silence.
 

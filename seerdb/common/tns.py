@@ -2654,9 +2654,12 @@ def _read_bind_rows(
     return bind_rows, after
 
 
-def _read_chunked_sql(data: bytes, total_len: int) -> bytes:
+def _read_chunked_sql(data: bytes, total_len: int) -> tuple[bytes, int]:
     # `data` starts at the 0xFE chunk marker; collect <ub1 len><chunk> runs until
-    # the declared total is reached or a zero-length chunk terminates it.
+    # the declared total is reached or a zero-length chunk terminates it. Returns
+    # the SQL and the offset in `data` just past the last chunk read (and past
+    # the zero length, when that is what ended it), where a bound statement's
+    # bind section is looked for (#2028).
     out = bytearray()
     i = 1  # skip the 0xFE marker
     while len(out) < total_len and i < len(data):
@@ -2666,7 +2669,7 @@ def _read_chunked_sql(data: bytes, total_len: int) -> bytes:
             break
         out += data[i : i + chunk_len]
         i += chunk_len
-    return bytes(out[:total_len])
+    return bytes(out[:total_len]), i
 
 
 def parse_lobops_read(body: bytes) -> tuple[int, int]:
@@ -8831,10 +8834,10 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
 
     The OCI counterpart of :func:`parse_exec`. Extracts the SQL text and cursor
     id from the fixed-shape OCI header, in either preamble width (see
-    :func:`_oci_all8_layout`). Scope: a single statement with no binds and SQL up
-    to 253 bytes (the ub1 length prefix) — binds and chunked/long SQL are a
-    follow-up, gated by the length cross-check below. Raises
-    :class:`InterfaceError` if the message is not an OCI OALL8 in that shape.
+    :func:`_oci_all8_layout`). Scope: a single statement, its SQL either behind a
+    ub1 length or chunked when longer, and its binds. Raises
+    :class:`InterfaceError` if the message is not an OCI OALL8 in that shape, or
+    carries binds of a form not read yet.
     """
     if len(payload) < 12 or payload[0] != TTI_FUN or payload[1] != TTI_ALL8:
         raise InterfaceError('not an OCI OALL8 execute')
@@ -8862,11 +8865,13 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
         # Long SQL — chunked from the marker: 0xFE, then <ub1 len><chunk> repeated
         # until a zero length. The declared length is the byte length or three
         # times it, never less, so it only caps the read.
-        raw_sql = _read_chunked_sql(payload[sql_off - 1 :], declared)
+        raw_sql, chunks_len = _read_chunked_sql(payload[sql_off - 1 :], declared)
+        sql_end = sql_off - 1 + chunks_len
     elif marker in (declared, declared // 3):
         # The byte length, as an AL32UTF8 client declares it, or a third of the
         # conversion-buffer length any other client declares (#1427).
         raw_sql = payload[sql_off : sql_off + marker]
+        sql_end = sql_off + marker
     else:
         # The two lengths disagree only for a bound statement (the bind section
         # shifts things) — out of this increment's scope, a clean error.
@@ -8879,8 +8884,9 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
     binds: list = []
     bind_meta: list[tuple[int, int]] = []
     bind_types: list[tuple[int, int, int, bytes]] = []
-    if bind_count and marker != TNS_LONG_LENGTH_INDICATOR:
-        (binds, described) = _parse_oci_binds(payload, sql_off + marker, bind_count)
+    if bind_count:
+        # After a long statement too: sqlplus's SHOW ERRORS query is one (#2028).
+        (binds, described) = _parse_oci_binds(payload, sql_end, bind_count)
         bind_meta = [(t, size) for (t, size, _toid) in described]
         # An object / collection bind's type id rides here, as on the thin path,
         # so the backend can register a variable of its type (#1411).
@@ -8914,8 +8920,9 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
 
 
 # The flag byte behind the type is 03 for most binds; a pre-12c sqlplus
-# (10.2, 11.2) writes 01 for GET_LINES's IN OUT count (#1826).
-_OCI_OAC_MARKER = re.compile(rb'\x01(.)[\x01\x03]\x00\x00')
+# (10.2, 11.2) writes 01 for GET_LINES's IN OUT count (#1826), and sqlplus 23.26
+# 20 for SHOW ERRORS's object name, its value a plain DALC all the same (#2028).
+_OCI_OAC_MARKER = re.compile(rb'\x01(.)[\x01\x03\x20]\x00\x00')
 # An object or collection bind's descriptor (PROTOCOL.md §40.4): `00 6d 00 00
 # 00`, the ub4 buffer size, twelve zeros, a ub4 and a ub1 16, the type's 16-byte
 # id. Captured from sqlplus 23.26 binding DBMS_OUTPUT.GET_LINES's lines (#1411).
