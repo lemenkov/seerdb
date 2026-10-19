@@ -9248,7 +9248,7 @@ def _encode_dcb_column_oci(col: ColumnMeta, position: int, first: bool) -> bytes
     # A backend that cannot size the column (the PEP 249 tuple reports none for
     # an interval or a ROWID) gets the length a live server describes it with,
     # as on the thin path (#2017).
-    pre[6:10] = _oci_ub4(describe_wire_length(col))
+    pre[6:10] = _oci_ub4(_oci_describe_length(col))
     if is_char and col.csfrm == _CSFRM_NCHAR:
         pre[_OCI_DCB_CHAR_SEMANTICS_OFF] = _OCI_DCB_CHAR_SEMANTICS_FLAG
     if is_char:
@@ -9258,7 +9258,7 @@ def _encode_dcb_column_oci(col: ColumnMeta, position: int, first: bool) -> bytes
     # an inline stream, unbounded — so a live 11g describe leaves this zero (like
     # the data length the backend already sets to 0). Only fixed-width columns fill
     # it (#405, #407).
-    if col.data_type not in _OCI_UNSIZED_TYPES:
+    if col.data_type not in _OCI_UNSIZED_TYPES | _OCI_FIXED_WIDTH.keys():
         pre[34:38] = _oci_ub4(col.max_size)
     pre[42] = col.null_ok
     pre[43] = len(col.name)
@@ -9303,7 +9303,22 @@ _OCI_ROW_BUFFER_LENGTH = {
 }
 
 
+# BINARY_FLOAT and BINARY_DOUBLE are fixed-width: a live 18c describes each with
+# length 1 and no max size, and counts its 4 or 8 bytes toward the max row size,
+# whatever the backend says. A passthrough's PEP 249 tuple gives them their
+# display size, 127, and sqlplus refused that column with ORA-03115 (#2018).
+_OCI_FIXED_WIDTH = {TNS_TYPE_BFLOAT: 4, TNS_TYPE_BDOUBLE: 8}
+
+
+def _oci_describe_length(col: ColumnMeta) -> int:
+    if col.data_type in _OCI_FIXED_WIDTH:
+        return _DESCRIBE_WIRE_LENGTH[col.data_type]
+    return describe_wire_length(col)
+
+
 def _oci_row_buffer_length(col: ColumnMeta) -> int:
+    if col.data_type in _OCI_FIXED_WIDTH:
+        return _OCI_FIXED_WIDTH[col.data_type]
     if col.data_length:
         return col.data_length
     return _OCI_ROW_BUFFER_LENGTH.get(col.data_type, describe_wire_length(col))

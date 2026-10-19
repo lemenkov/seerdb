@@ -4033,6 +4033,41 @@ def test_a_rowid_cell_is_four_ub4s() -> None:
         assert _oci_rowid_value(rowid) == b'\x10' + bytes.fromhex(image)
 
 
+# `cast(1.5 as binary_float) bf, cast(2.5 as binary_double) bd` described by a
+# live 18c to sqlplus 23.26, from the max row size through the second name
+# (#2018): each column length 1 with no max size, and 4 + 8 toward the max row
+# size. A passthrough's PEP 249 tuple gives both their display size, 127, and
+# sqlplus refused the column with ORA-03115.
+_OCI_LIVE_BINARY_FLOAT_DESCRIBE = bytes.fromhex(
+    '0c000000020000005c0164000000010000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000010202000000'
+    '0242460000000000000000000000000000016500000001000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000010202000000024244'
+)
+
+
+def test_binary_float_and_double_describe_as_a_live_server_does() -> None:
+    from seerdb.common.tns import _ENCODE_FIELD_VERSION, _oci_describe_body
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1
+
+    columns = [
+        ColumnMeta(
+            name=b'BF', data_type=TNS_TYPE_BFLOAT, data_length=127, max_size=127
+        ),
+        ColumnMeta(
+            name=b'BD', data_type=TNS_TYPE_BDOUBLE, data_length=127, max_size=127
+        ),
+    ]
+    token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT_1)
+    try:
+        body = _oci_describe_body(columns)
+    finally:
+        _ENCODE_FIELD_VERSION.reset(token)
+    live = _OCI_LIVE_BINARY_FLOAT_DESCRIBE
+    assert body[: len(live)] == live
+
+
 def test_read_chunked_sql_reassembles_the_chunks() -> None:
     # Long OCI SQL is chunked: 0xFE marker, then <ub1 len><chunk> runs. The reader
     # reassembles them up to the declared total (#265), and says where the last
