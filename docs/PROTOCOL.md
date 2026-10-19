@@ -2235,6 +2235,39 @@ directionless-bind handling the thin exec uses, §5.4); an ordinary IN bind in t
 same slot is a normal DALC (`:x = 7` → `07 02 c1 08`). The OAC is identical for IN
 and OUT — the `fd 01` value marker is the only direction signal on the wire.
 
+**`REFCURSOR` (the Mirror, OCI dialect, #2014).** `variable rc refcursor`, a
+block that opens it, and `print rc` take three calls. Captured from sqlplus
+23.26 against 11g and 18c, and from 10.2 and 11.2 against 11g:
+
+1. The block binds `:rc` as type **102**: the descriptor `01 66 01 00 00` and a
+   ub4 size of 1, the value `04 00 00 00 00`, a cursor id of 0.
+2. The reply is the OUT-bind reply above, its marker `30` (the bind came in with
+   a value), and the cursor's OUT value is
+   ```
+   4c                          # lead byte
+   <max row size ub4> <column count ub4> <column blocks>   # the describe body
+   00 07 00 00 00 07 <date, 7 B>   # the describe-time date
+   <4 x ub4> [<ub4 0>]         # flags, then from 11.2 an empty query-cache key
+   <cursor id ub4> 00 00       # and the return code every OUT value ends on
+   ```
+   That is the thin REF CURSOR value (§6.5) in fixed widths. The describe body is
+   byte-identical to the one the same query's own execute reply carries. The lead
+   byte is `4c` from 11g and 18c to every sqlplus; a live 10g sends `3c`. A live
+   server fills in the date, and for a DATE column one of the flags (8168); the
+   Mirror zeroes both, as in its queries' describe tail, and sqlplus accepts it.
+3. `print rc` re-executes the cursor by id: an OALL8 with no SQL (no pointer at
+   offset 11), the options word `0x40` and the id at offset 7. The thin `al8i4`
+   array starts where the SQL length would be, so the second element, the rows
+   sqlplus has room for, sits at the SQL offset plus 3: `0f 00 00 00` in every
+   capture, at 243 in the 12c narrow preamble, 199 in the wide one and 151 in
+   sqlplus 10.2's. The reply is the rows, with a fetch reply's framing; while
+   rows remain sqlplus fetches by the same id (`03 05`).
+
+The Mirror numbers these cursors from `0x100` up, clear of the fixed ids its
+other OCI replies carry (0, `0x5be8`, `0x5beb`), so a re-execute of a
+statement's own cursor is never served from one. A block that does not open the
+cursor answers id 0 and no columns, and `print` reports ORA-24338, as live.
+
 **`DESCRIBE <object>` (the Mirror, OCI dialect).** sqlplus `DESC table` sends a
 dedicated describe call — `TTI_FUN 0x77` carrying the object name as the trailing
 length-prefixed token (`… 02 00 00 00 <ub1 namelen> <name>`) — and expects a
