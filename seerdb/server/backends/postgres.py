@@ -403,7 +403,7 @@ from seerdb.server.accounts import (
     _password_text,
     _user_name,
 )
-from seerdb.server.backend import BlobValue, SessionInfo, TypeDescription
+from seerdb.server.backend import BlobValue, ClobValue, SessionInfo, TypeDescription
 from seerdb.server.identity import IDENTITY_12_1, IDENTITY_23, ServerIdentity
 from seerdb.server.redact import redact_passwords
 
@@ -3336,7 +3336,12 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
             names.append(name)
         key = _bind_key(name)
         value = values[names.index(name)] if names.index(name) < len(values) else None
-        if isinstance(value, BindVar):
+        if isinstance(value, BindVar) and value.tns_type == TNS_TYPE_CLOB:
+            # A NULL CLOB describes as a CLOB, as one with a value does
+            # (#2035). A cast to the ora_clob domain would not: PostgreSQL
+            # reports a domain by its base type, text.
+            out.append(f'to_clob(%({key})s::text)')
+        elif isinstance(value, BindVar):
             # A typed NULL (#699): the value is None; the cast carries the
             # declared type, where there is a PostgreSQL type to cast to.
             cast = _NULL_CASTS.get(value.tns_type)
@@ -3361,6 +3366,11 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
             # as a RAW (#1625): TO_BLOB around it is the item the describe
             # knows as one (_computed_column_types). The value is unchanged.
             out.append(f'to_blob(%({key})s)')
+        elif isinstance(value, ClobValue):
+            # A CLOB bind, the same way (#2035): as bare text it describes as a
+            # VARCHAR2, which a sqlplus CLOB variable's `print` cannot take.
+            # TO_CLOB around it is the item the describe knows as a CLOB.
+            out.append(f'to_clob(%({key})s)')
         elif isinstance(value, IntervalYM):
             # An IntervalYM binds an INTERVAL YEAR TO MONTH — send its whole-month
             # count and rebuild a PostgreSQL interval, so the months survive

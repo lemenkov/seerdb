@@ -5245,6 +5245,40 @@ def test_a_blob_bind_describes_as_a_blob() -> None:
             backend.rollback()
 
 
+def test_a_clob_bind_describes_as_a_clob() -> None:
+    # A CLOB bind (#2035) -- a sqlplus CLOB variable, a client's temp LOB --
+    # describes as a CLOB, as Oracle's does, and is still the same text to a
+    # function. As bare text it described as a VARCHAR2, which crashed sqlplus
+    # printing an empty one; a NULL CLOB, the same.
+    from seerdb.common.tns_consts import TNS_TYPE_CLOB, TNS_TYPE_VARCHAR
+    from seerdb.server.backend import BindVar, ClobValue
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        result = backend.execute(
+            'SELECT :1, :2, :3, :4 FROM dual',
+            [
+                ClobValue('clob data'),
+                ClobValue(''),
+                BindVar(value=None, tns_type=TNS_TYPE_CLOB, max_size=0),
+                'text',
+            ],
+        )
+        assert [c.data_type for c in result.columns] == [
+            TNS_TYPE_CLOB,
+            TNS_TYPE_CLOB,
+            TNS_TYPE_CLOB,
+            TNS_TYPE_VARCHAR,
+        ]
+        assert result.rows[0][2] is None
+        (row,) = backend.execute(
+            'SELECT dbms_lob.getlength(:1) FROM dual', [ClobValue('clob data')]
+        ).rows
+        assert row == (9,)
+    finally:
+        backend.rollback()
+
+
 def test_rr_years_print_and_parse_as_in_oracle() -> None:
     # Oracle's RR and RRRR years (#1638): printed as YY / YYYY, read into the
     # RR window -- 00-49 this century, 50-99 the last, while the current year
