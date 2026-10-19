@@ -77,12 +77,15 @@ not the whole matrix (a PR touching several rows runs the union):
 | the rest of `seerdb/server` | python-oracledb's suite against a passthrough Mirror over 23ai, on the branch and on its `master` base, and against a Mirror-over-PG |
 | the Mirror's OCI (sqlplus) dialect: the OCI code in `seerdb/server/session.py`, `seerdb/common/oci.py` or the OCI codec in `seerdb/common/tns.py` | `tools/sqlplus_survey.py` with sqlplus 23.26, direct to 23ai and through a passthrough Mirror over it, compared on the branch and on its `master` base |
 | `seerdb/client` | the integration suite on 8i, 9i and 10g |
-| `seerdb/common` | the integration suite on every bed (8i to 26ai), both Mirror legs, the offline suite, and both python-oracledb suite runs |
+| `seerdb/common` | the integration suite on 8i, 9i and 10g, on the 26ai bed under required native encryption, and through a passthrough Mirror over 23ai; and both python-oracledb suite runs |
 
 Run these while the PR is a draft, and put the legs you ran and their numbers
 in the PR. CI covers the rest for those paths, and the nightly run covers every CI
 leg whatever changed; 8i, 9i and 10g run nowhere but locally, which is why a
-client change still needs them.
+client change still needs them. Don't repeat a CI leg locally (#2046): the 11g,
+18c, 21c and 23ai beds, 23ai at 12.1 and both Mirror-over-PG legs all run once
+the PR is ready. A leg on its own bed or database can run alongside the others;
+two on one bed cannot.
 
 CI minutes are a limited quota and local runs are free, and every push to a PR
 re-runs every leg its paths reach (#1942). So:
@@ -97,11 +100,13 @@ re-runs every leg its paths reach (#1942). So:
 - When two PRs touch the same code, open the second after the first merges,
   rebased once. Don't rebase a PR that still merges cleanly.
 
-The offline suite means all of it, `python -m pytest -q tests`. CI also runs
-its codec modules under `unittest`, in a different order (the `unittest` step
-in `.github/workflows/tests.yml`); run that too, so state a test leaves behind
-shows up locally. If a leg is red for a reason unrelated to the change, show it
-with the same run on the `master` base and say so in the PR.
+CI runs the offline suite on every push, drafts included, and its codec modules
+under `unittest` in a different order (the `unittest` step in
+`.github/workflows/tests.yml`). So the whole offline suite isn't a local leg.
+While working, run the modules you touched, and run the `unittest` step too when
+a test changes shared state, so state it leaves behind shows up before the push.
+If a leg is red for a reason unrelated to the change, show it with the same run
+on the `master` base and say so in the PR.
 
 A docs-only change needs none of the test tiers; the repository's own workflows
 skip them on those paths too.
