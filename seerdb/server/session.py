@@ -121,6 +121,7 @@ from seerdb.common.tns import (
     encode_out_bind_reexecute_thin,
     encode_out_bind_response_oci,
     encode_out_bind_response_thin,
+    encode_ping_status_oci,
     encode_query_response,
     encode_query_response_oci,
     encode_reexec_row_oci,
@@ -1775,15 +1776,9 @@ def _serve_oci_session(
             return user
         packet_type, body = received
         if packet_type == TNS_MARKER:
-            # A break / reset marker. The client sends one to resynchronise the
-            # line — after a cancelled call, or a reply it could not line up —
-            # and then WAITS for the server's marker before saying anything
-            # else. A real server always answers. This loop used to fall into
-            # the "not DATA, ignore it" branch below, so the client sat there
-            # until its own timeout with the session wedged. Answer with a
-            # single reset: the client side replies once per break episode too,
-            # because echoing every marker ping-pongs into a reset storm.
-            stream.write_packet(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
+            # A break / reset marker: sqlplus cancelling a call (Ctrl-C), or
+            # resynchronising after a reply it could not line up (#2036).
+            _answer_marker_oci(stream, body, seq)
             continue
         if packet_type != TNS_DATA:
             continue
@@ -1853,6 +1848,12 @@ def _serve_oci_session(
                 _answer_exec_by_cursor_oci(
                     stream, backend, body, seq, blocks, ref_cursors, lob_vars
                 )
+                continue
+            if body[1] == TTI_PING:
+                # sqlplus pings after a cancel, to see the session is alive
+                # (#2036). Relayed when the backend can be pinged, as on the
+                # thin path, and acknowledged as a live 18c does.
+                _answer_ping_oci(stream, backend, seq)
                 continue
             if body[1] == TTI_KOD:
                 # An object-type describe (§40). sqlplus asks for a collection
@@ -2419,6 +2420,52 @@ def _apply_schema(backend: Backend | None, schema: bytes | list) -> None:
         backend.execute(f'ALTER SESSION SET CURRENT_SCHEMA = {name}')
     except Exception as exc:  # noqa: BLE001 - see the docstring
         logger.info('set current_schema %r refused by the backend: %s', name, exc)
+
+
+def _answer_ping_oci(
+    stream: PacketStream, backend: Backend, seq: '_OciSequence'
+) -> None:
+    ping = getattr(backend, 'ping', None)
+    if ping is not None:
+        try:
+            ping()
+        except BackendError as err:
+            stream.write_packet(
+                TNS_DATA, encode_error_oci(err.ora_code, str(err), sequence=seq.next())
+            )
+            return
+    stream.write_packet(TNS_DATA, encode_ping_status_oci(seq.next()))
+
+
+def _answer_marker_oci(stream: PacketStream, body: bytes, seq: '_OciSequence') -> None:
+    """Close a sqlplus break episode as a live 18c does (#2036).
+
+    Ctrl-C on a sqlplus 23.26 against a live 18c: the break goes out of band,
+    then the client sends a reset marker, and the server answers with ONE reset
+    and the ORA-01013 OER, after which the session carries on. Through the
+    Mirror the interrupt arrives in band (a `03` marker) ahead of the reset.
+
+    This loop used to answer every marker with a reset. The client's own reset
+    then drew another, which it answered in turn, without end: the session hung
+    and the log filled. Now an interrupt or break is answered with one reset
+    and the client's reset is waited for, whatever it sends before it dropped,
+    as the thin loop does (:func:`_answer_marker`); a lone reset gets the one
+    reset. Either way the cancel's OER follows."""
+    marker_type = body[2] if len(body) >= 3 else 0
+    stream.write_packet(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
+    if marker_type != TNS_MARKER_TYPE_RESET:
+        _await_reset_marker(stream)
+    stream.write_packet(
+        TNS_DATA,
+        encode_error_oci(
+            ORA_USER_REQUESTED_CANCEL,
+            # The text a live 18c sends sqlplus; the encoder adds the code.
+            'user requested cancel of current operation',
+            sequence=seq.next(),
+            # A live 18c reports no position, so sqlplus puts its caret at 0.
+            error_pos=0,
+        ),
+    )
 
 
 def _answer_marker(stream: PacketStream, body: bytes) -> None:

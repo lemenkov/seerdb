@@ -2041,9 +2041,13 @@ def test_oci_loop_answers_a_break_marker() -> None:
     stream: Any = _Stream()
     backend: Any = object()
     assert _serve_oci_session(stream, backend, 'PYO') == 'PYO'
-    # Exactly one reply, and it is a reset marker: replying to every marker
-    # ping-pongs the two ends into a reset storm.
-    assert stream.sent == [(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))]
+    # One reset marker -- replying to every marker ping-pongs the two ends into
+    # a reset storm -- and then the cancel's OER, as a live 18c sends it (#2036).
+    from seerdb.common.tns_consts import TNS_DATA
+
+    (reset, cancel) = stream.sent
+    assert reset == (TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
+    assert cancel[0] == TNS_DATA and b'ORA-01013' in cancel[1]
 
 
 # sqlplus 23.26's execute of a 30-row query, then its two follow-up fetches,
@@ -3045,6 +3049,50 @@ def test_a_long_out_value_and_row_cell_go_in_ub1_chunks(size: int) -> None:
         assert _encode_oci_value('short', col) == b'\x05short'
     finally:
         _ENCODE_FIELD_VERSION.reset(token)
+
+
+class _OciMarkerStream:
+    # Feeds the OCI loop packets of any type and records what it sends back.
+    def __init__(self, inbox: list) -> None:
+        self.inbox = [*inbox, None]
+        self.sent: list[tuple[int, bytes]] = []
+
+    def read_packet(self, **_kw):
+        return self.inbox.pop(0)
+
+    def write_packet(self, ptype: int, body: bytes, **_kw) -> None:
+        self.sent.append((ptype, body))
+
+
+@pytest.mark.parametrize(
+    'markers',
+    [
+        # Through the Mirror the interrupt comes in band ahead of the reset.
+        [b'\x01\x00\x03', b'\x01\x00\x02'],
+        # To a live 18c the break goes out of band and only the reset arrives.
+        [b'\x01\x00\x02'],
+    ],
+    ids=['interrupt-then-reset', 'reset-only'],
+)
+def test_a_sqlplus_cancel_gets_one_reset_and_the_cancel(markers: list) -> None:
+    # Every marker used to draw a reset, the client answered each, and the two
+    # sides exchanged resets without end (#2036). A live 18c answers with one
+    # reset and ORA-01013, and the session carries on.
+    from seerdb.common.tns_consts import TNS_DATA, TNS_MARKER
+    from seerdb.server.session import _serve_oci_session
+
+    ping = (TNS_DATA, bytes.fromhex('03930c'))
+    stream: Any = _OciMarkerStream([*((TNS_MARKER, m) for m in markers), ping])
+    backend: Any = _OciCountingBackend()
+    _serve_oci_session(stream, backend, 'PYO')
+    (reset, cancel, pong) = stream.sent
+    assert reset == (TNS_MARKER, b'\x01\x00\x02')
+    assert cancel[0] == TNS_DATA
+    assert cancel[1][12:16] == (1013).to_bytes(4, 'little')
+    assert b'ORA-01013: user requested cancel of current operation' in cancel[1]
+    assert b'ORA-01013: ORA-01013' not in cancel[1]
+    # And the ping sqlplus sends after it: a TTI_STA, as a live 18c answers.
+    assert pong[0] == TNS_DATA and pong[1][:5] == b'\x09\x01\x00\x00\x00'
 
 
 # The capability block each sqlplus sends (its DTY proper, one round after its

@@ -9932,9 +9932,9 @@ def _oci_error_text(text: bytes) -> bytes:
     A live 18c sent the same message as one chunk with ub4 LE lengths instead
     (``fe 4d 01 00 00 <333 bytes> 00 00 00 00``). That is not the field version:
     the Mirror speaks 18c's to sqlplus, and sqlplus hangs on that form from the
-    Mirror while it reads this one. It follows a capability the two negotiate
-    differently, not yet identified, so the Mirror sends the form its own
-    sessions read.
+    Mirror while it reads this one. It follows BIG_CHUNK_CLR, which 18c
+    advertises and the Mirror does not (#2042), so the Mirror sends the form
+    its own sessions read.
     """
     if len(text) <= TNS_MAX_SHORT_LENGTH:
         return bytes([len(text)]) + text
@@ -10598,6 +10598,13 @@ def encode_commit_status_oci(sequence: int) -> bytes:
     """OCI reply to a bare commit / rollback — a TTI_STA acknowledgement carrying
     the session's OER sequence, like every other reply on this path (§36.2)."""
     return _oci_tti_sta(_OCI_STA_CALL_STATUS_COMMIT, sequence)
+
+
+def encode_ping_status_oci(sequence: int) -> bytes:
+    """OCI reply to a TTI_PING (#2036): a TTI_STA with call status 1 and the
+    session's OER sequence, as a live 18c answers sqlplus's ping after a
+    cancel (`09 01 00 00 00 2f fa`)."""
+    return _oci_tti_sta(_OCI_STA_CALL_STATUS_LOGOFF, sequence)
 
 
 def encode_logoff_status_oci() -> bytes:
