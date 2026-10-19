@@ -2201,6 +2201,19 @@ reads `01 01 20 00 00 18 00 00 00`, a VARCHAR2 of 24 bytes with the flag byte
 sqlplus 23.26 sends the same bytes direct to 18c. The Mirror read binds only after
 a short statement, refused this one with ORA-03115, and `SHOW ERRORS` failed.
 
+**A placeholder name used twice in a SQL statement** (`select :n a, :n b from
+dual`) counts in the bind count once per occurrence, and each occurrence has a
+descriptor. A repeat's descriptor is `01 01 80 00 00` with a zero size: type byte
+1, flag byte `0x80`, and nothing that says which earlier name it repeats. The RXD
+row then holds one value per distinct name, in first-appearance order. For
+`select :s a, :n b, :s c from dual`, the descriptors are VARCHAR2 30, NUMBER 22
+and the repeat, and the row is `07 01 78 02 c1 08`: two values for three
+placeholders. sqlplus 23.26 sends this to 18c (#2034); sqlplus 11.2, through a
+Mirror that reads it so, prints what it prints direct. The reader matches each repeat to its name by the statement's
+placeholders, in order. It hands the backend one value per occurrence, as a thin
+client sends for a SQL statement. The Mirror refused these statements until then.
+A PL/SQL block (`exec :n := :n + :n`) counts each name once and has no repeats.
+
 `_oci_all8_layout` picks the width from the wire on every execute rather than
 assuming one, and raises when neither shape holds. Read with the wide offsets, a
 narrow execute lands 20 bytes past the SQL length prefix, and the Mirror then

@@ -42,7 +42,11 @@ from seerdb.common.exceptions import (
     NotSupportedError,
     Truncated,
 )
-from seerdb.common.sqltext import is_plsql, returning_bind_positions
+from seerdb.common.sqltext import (
+    bind_placeholders,
+    is_plsql,
+    returning_bind_positions,
+)
 from seerdb.common.vector import (
     VECTOR_BIND_DESCRIPTOR,
     SparseVector,
@@ -8929,7 +8933,7 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
     bind_types: list[tuple[int, int, int, bytes]] = []
     if bind_count:
         # After a long statement too: sqlplus's SHOW ERRORS query is one (#2028).
-        (binds, described) = _parse_oci_binds(payload, sql_end, bind_count)
+        (binds, described) = _parse_oci_binds(payload, sql_end, bind_count, sql)
         bind_meta = [(t, size) for (t, size, _toid) in described]
         # An object / collection bind's type id rides here, as on the thin path,
         # so the backend can register a variable of its type (#1411).
@@ -8970,6 +8974,11 @@ _OCI_OAC_MARKER = re.compile(rb'\x01(.)[\x01\x03\x20]\x00\x00')
 # 00`, the ub4 buffer size, twelve zeros, a ub4 and a ub1 16, the type's 16-byte
 # id. Captured from sqlplus 23.26 binding DBMS_OUTPUT.GET_LINES's lines (#1411).
 _OCI_ADT_MARKER = b'\x00\x6d\x00\x00\x00'
+# A placeholder whose name came earlier in the statement (`select :n, :n`): a
+# descriptor of its own, flag 0x80 and size 0, but no value in the RXD row --
+# it takes its name's first value (#2034). Captured from sqlplus 23.26.
+_OCI_REPEAT_MARKER = b'\x01\x01\x80\x00\x00'
+_OCI_BIND_REPEAT = -1  # a repeat's place in the descriptor list
 # The id follows a ub4 16 and a ub1 16, after 12 zeros from 12c (sqlplus 23.26)
 # and 10 before (10.2, 11.2, #1826); found by that pair, not a fixed offset.
 _OCI_ADT_TOID_LEN_PAIR = b'\x10\x00\x00\x00\x10'
@@ -9060,13 +9069,21 @@ def _oci_read_lob_bind(data: bytes) -> tuple[bytes | None, bytes]:
 
 def _oci_bind_descriptors(tail: bytes, bind_count: int) -> list[tuple[int, int, bytes]]:
     # Each bind's (tns_type, max_size, toid), in order: a scalar's OAC marker
-    # (``01 <type> 03 00 00``) or an object / collection's (§40.4), whichever
-    # comes next. Empty if they do not add up to ``bind_count``.
+    # (``01 <type> 03 00 00``), an object / collection's (§40.4) or a repeated
+    # name's, whichever comes next; a repeat is ``_OCI_BIND_REPEAT``. Empty if
+    # they do not add up to ``bind_count``.
     meta: list[tuple[int, int, bytes]] = []
     at = 0
     while len(meta) < bind_count:
         scalar = _OCI_OAC_MARKER.search(tail, at)
         adt = tail.find(_OCI_ADT_MARKER, at)
+        repeat = tail.find(_OCI_REPEAT_MARKER, at)
+        if repeat >= 0 and all(
+            nxt < 0 or repeat < nxt for nxt in (adt, scalar.start() if scalar else -1)
+        ):
+            meta.append((_OCI_BIND_REPEAT, 0, b''))
+            at = repeat + len(_OCI_REPEAT_MARKER)
+            continue
         if adt >= 0 and (scalar is None or adt < scalar.start()):
             end = adt + len(_OCI_ADT_MARKER)
             max_size = int.from_bytes(tail[end : end + 4], 'little')
@@ -9102,7 +9119,7 @@ def _oci_adt_in_value(rest: bytes) -> bytes:
 
 
 def _parse_oci_binds(
-    payload: bytes, sql_end: int, bind_count: int
+    payload: bytes, sql_end: int, bind_count: int, sql: str
 ) -> tuple[list, list[tuple[int, int, bytes]]]:
     # Read the bind values AND their (tns_type, max_size) metadata from the OCI
     # bind section. Each bind's OAC marker (``01 <type> 03 00 00``) carries the TNS
@@ -9114,7 +9131,19 @@ def _parse_oci_binds(
     meta = _oci_bind_descriptors(tail, bind_count)
     if len(meta) != bind_count:
         return [], []
-    types = [t for t, _s, _o in meta]
+    # A repeated name has a descriptor but no value; it takes its name's first
+    # occurrence, found by the statement's placeholders in order (#2034).
+    first: list[int] = list(range(bind_count))
+    if any(t == _OCI_BIND_REPEAT for t, _s, _o in meta):
+        names = bind_placeholders(sql)
+        if len(names) != bind_count:
+            return [], []
+        for i, name in enumerate(names):
+            first[i] = names.index(name)
+            if (meta[i][0] == _OCI_BIND_REPEAT) != (first[i] != i):
+                return [], []
+        meta = [meta[j] for j in first]
+    types = [t for i, (t, _s, _o) in enumerate(meta) if first[i] == i]
     # The RXD row is the 0x07 token whose following DALCs decode cleanly into one
     # value per bind — a position robust to 0x07 bytes appearing in the OAC area.
     for i, byte in enumerate(tail):
@@ -9170,7 +9199,10 @@ def _parse_oci_binds(
                 values.append(_decode_bind_value(data_type, _CSFRM_DB, raw))
         except (IndexError, DataError):
             continue
-        if len(values) == bind_count:
+        if len(values) == len(types):
+            given = iter(values)
+            values = [next(given) if j == i else None for i, j in enumerate(first)]
+            values = [values[j] for j in first]
             return values, meta
     return [], []
 
