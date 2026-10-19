@@ -2094,6 +2094,11 @@ def _answer_query_oci(
         # pass through unchanged, except a NULL, which goes over with its declared
         # type (#699).
         result = backend.execute(request.sql, _bind_vars(request))
+        if request.autocommit:
+            # SET AUTOCOMMIT ON: the client asked for a commit on success and
+            # sends none of its own, then prints "Commit complete." (#2011). A
+            # commit that fails is the statement's error, as on a live server.
+            backend.commit()
     except BackendError as err:
         # A statement the backend can't run comes back as its ORA error, as a
         # live server's does, and the session continues. Only a SELECT's error

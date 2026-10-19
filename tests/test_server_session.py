@@ -2141,6 +2141,104 @@ def test_oci_relays_a_failed_ddl_as_its_error() -> None:
     assert b'ORA-00955: name is already used by an existing object' in reply
 
 
+# sqlplus 23.26's `insert into sp_ac values (4242)` under SET AUTOCOMMIT ON,
+# captured against a live 11g. With autocommit off it sends the same bytes with
+# 0x80 at offset 4: the commit bit (0x100) of the options word at offset 3 is
+# the only difference, and no COMMIT call follows either way (#2011).
+_OCI_EXEC_INSERT_AUTOCOMMIT = bytes.fromhex(
+    '035e0b2181000000000000feffffffffffffff5d000000feffffffffffffff0d'
+    '000000fefffffffffffffffeffffffffffffff00000000010000000000000000'
+    '00000000000000000000000000000000000000feffffffffffffff0000000000'
+    '000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000000000000'
+    '0000000000000000000000000000001f696e7365727420696e746f2073705f61'
+    '632076616c756573202834323432290100000001000000000000000000000000'
+    '0000000000000000000000040000000000000000800000000000000000000000'
+    '000000'
+)
+_OCI_EXEC_INSERT = (
+    _OCI_EXEC_INSERT_AUTOCOMMIT[:4] + b'\x80' + _OCI_EXEC_INSERT_AUTOCOMMIT[5:]
+)
+
+
+class _OciOneCallStream:
+    def __init__(self, body: bytes) -> None:
+        from seerdb.common.tns_consts import TNS_DATA
+
+        self.inbox = [(TNS_DATA, body), None]
+        self.sent: list[bytes] = []
+
+    def read_packet(self, **_kw):
+        return self.inbox.pop(0)
+
+    def write_packet(self, _ptype: int, body: bytes, **_kw) -> None:
+        self.sent.append(body)
+
+
+class _OciCountingBackend:
+    capabilities: frozenset[Capability] = frozenset()
+
+    def __init__(self, commit_error: Exception | None = None) -> None:
+        self.calls: list[str] = []
+        self.commit_error = commit_error
+
+    def execute(self, sql: str, binds=()) -> Result:
+        self.calls.append(sql)
+        return Result(rowcount=1)
+
+    def commit(self) -> None:
+        self.calls.append('COMMIT')
+        if self.commit_error is not None:
+            raise self.commit_error
+
+    def rollback(self) -> None:
+        self.calls.append('ROLLBACK')
+
+
+def test_oci_parses_the_autocommit_bit() -> None:
+    from seerdb.common.tns import parse_exec_oci
+
+    assert parse_exec_oci(_OCI_EXEC_INSERT_AUTOCOMMIT).autocommit
+    assert not parse_exec_oci(_OCI_EXEC_INSERT).autocommit
+    assert parse_exec_oci(_OCI_EXEC_INSERT).sql == 'insert into sp_ac values (4242)'
+
+
+@pytest.mark.parametrize(
+    ('body', 'committed'),
+    [(_OCI_EXEC_INSERT_AUTOCOMMIT, True), (_OCI_EXEC_INSERT, False)],
+    ids=['autocommit', 'no-autocommit'],
+)
+def test_oci_autocommit_commits_the_statement(body: bytes, committed: bool) -> None:
+    # sqlplus's SET AUTOCOMMIT ON asks the server to commit each statement and
+    # prints "Commit complete." without sending a COMMIT. Ignoring the bit left
+    # the row uncommitted, so a later ROLLBACK lost it (#2011). The session's
+    # end is a dropped connection here, which commits nothing.
+    from seerdb.server.session import _serve_oci_session
+
+    stream: Any = _OciOneCallStream(body)
+    backend: Any = _OciCountingBackend()
+    _serve_oci_session(stream, backend, 'PYO')
+    expected = ['insert into sp_ac values (4242)'] + (['COMMIT'] if committed else [])
+    assert backend.calls == expected
+    [reply] = stream.sent
+    assert b'ORA-' not in reply
+
+
+def test_oci_autocommit_relays_a_failed_commit() -> None:
+    # A commit that fails (a deferred constraint) is the statement's error, as on
+    # a live server, not a success sqlplus reports as committed.
+    from seerdb.server.backend import BackendError
+    from seerdb.server.session import _serve_oci_session
+
+    stream: Any = _OciOneCallStream(_OCI_EXEC_INSERT_AUTOCOMMIT)
+    backend: Any = _OciCountingBackend(
+        BackendError('transaction rolled back', ora_code=2091)
+    )
+    _serve_oci_session(stream, backend, 'PYO')
+    [reply] = stream.sent
+    assert b'ORA-02091' in reply
+
+
 # The capability block each sqlplus sends (its DTY proper, one round after its
 # TTI_PRO): sqlplus 23.26 and sqlplus 11.2.0.2, captured against live 11g.
 _SQLPLUS_23_CAPABILITIES = bytes.fromhex(
