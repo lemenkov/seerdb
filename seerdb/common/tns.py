@@ -301,6 +301,7 @@ from seerdb.common.tns_consts import (
     TTI_DNY,
     TTI_DTY,
     TTI_END_OF_RESPONSE,
+    TTI_EXEC,
     TTI_FETCH,
     TTI_FOB,
     TTI_FUN,
@@ -8144,7 +8145,11 @@ def _oci_outbind_header(bind_count: int) -> bytes:
 # `begin :n := 42; end;` shows it carrying the call's sequence (11) like every
 # other reply, so it now takes the shared builder unmodified (#884).
 def _oci_outbind_tail(sequence: int) -> bytes:
-    return _OCI_STATUS_FRAME_PREFIX + encode_oci_oer(
+    return _OCI_STATUS_FRAME_PREFIX + _oci_outbind_oer(sequence)
+
+
+def _oci_outbind_oer(sequence: int) -> bytes:
+    return encode_oci_oer(
         oci.OCI_OER_STATUS_SUCCESS,
         sequence=sequence,
         row_kind=oci.OCI_OER_ROW_KIND_LOB,
@@ -10478,7 +10483,13 @@ def encode_out_bind_response_oci(
         _OCI_OUTBIND_IN_OUT_MARKER if given else _OCI_OUTBIND_DEFINE_MARKER
         for given in inputs
     )
-    rxd = bytes([TTI_RXD]) + b''.join(
+    rxd = _oci_outbind_rxd(values, types)
+    return header + define_markers + rxd + _oci_outbind_tail(sequence)
+
+
+def _oci_outbind_rxd(values: list[object], types: list[tuple[int, bytes]]) -> bytes:
+    # The OUT values as an RXD row, each in its own framing.
+    return bytes([TTI_RXD]) + b''.join(
         _oci_out_object_value(v, toid)
         if t == TNS_TYPE_ADT
         else _oci_refcursor_out_value(v)
@@ -10488,7 +10499,49 @@ def encode_out_bind_response_oci(
         else encode_value(v, 0) + _OCI_OUTBIND_RETCODE
         for v, (t, toid) in zip(values, types)
     )
-    return header + define_markers + rxd + _oci_outbind_tail(sequence)
+
+
+# An OCI execute by cursor id, TTI_EXEC (function 4, #2041): a block already
+# parsed, run again with new IN values. sqlplus fetches SERVEROUTPUT's lines
+# this way, DBMS_OUTPUT.GET_LINES re-executed for each batch after the first:
+# `03 04 <seq>`, the cursor id and the iteration count (ub4 LE each), eight
+# zero bytes, then an RXD row of the values of the binds that came in with one.
+_OCI_EXEC_CURSOR_OFF = 3
+_OCI_EXEC_VALUES_OFF = 19
+
+
+def parse_exec_by_cursor_oci(payload: bytes, types: list[int]) -> tuple[int, list]:
+    """The cursor id and the IN values of an OCI ``TTI_EXEC`` (#2041), one per
+    entry of ``types`` -- the TNS types of the binds that came in with a value,
+    in order."""
+    if len(payload) < _OCI_EXEC_VALUES_OFF + 1 or payload[1] != TTI_EXEC:
+        raise InterfaceError('not an OCI TTI_EXEC')
+    cursor = int.from_bytes(
+        payload[_OCI_EXEC_CURSOR_OFF : _OCI_EXEC_CURSOR_OFF + 4], 'little'
+    )
+    rest = payload[_OCI_EXEC_VALUES_OFF:]
+    if not types:
+        return cursor, []
+    if rest[:1] != bytes([TTI_RXD]):
+        raise InterfaceError('OCI TTI_EXEC: no value row')
+    rest = rest[1:]
+    values: list = []
+    for data_type in types:
+        raw, rest = decode_dalc(rest)
+        if data_type == TNS_TYPE_NUMBER and isinstance(raw, bytes):
+            raw = raw.rstrip(b'\x00') or raw  # a pre-12c sqlplus pads (#1826)
+        values.append(_decode_bind_value(data_type, _CSFRM_DB, raw))
+    return cursor, values
+
+
+def encode_exec_by_cursor_reply_oci(
+    values: list[object], *, sequence: int, types: list[tuple[int, bytes]]
+) -> bytes:
+    """The reply to an OCI ``TTI_EXEC`` (#2041): the OUT values as the first
+    execute's reply carries them, and its OER, with neither the OUT-bind header
+    nor the status frame -- a live 18c, sqlplus 23.26 fetching SERVEROUTPUT's
+    second and third batch."""
+    return _oci_outbind_rxd(values, types) + _oci_outbind_oer(sequence)
 
 
 def encode_commit_status_oci(sequence: int) -> bytes:

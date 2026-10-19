@@ -8537,6 +8537,22 @@ the pickle of §21.6: `88 01 13 01 03 00 02 0a 'from plsql' ff` for one line,
 `88 01 09 01 03 00 02 ff ff` for none. The count follows as an ordinary NUMBER
 with its return code.
 
+**The batches after the first (#2041).** GET_LINES hands back at most as many
+lines as `:NUMLINES` asks, 15 for sqlplus 23.26. For the next batch sqlplus
+doesn't send the block again. It runs the same cursor with **`TTI_EXEC`**
+(function 4): `03 04 <seq>`, the cursor id and an iteration count (ub4 LE
+each), eight zero bytes, then an RXD row holding the values of the binds that
+came in with one, `:NUMLINES` alone (`07 02 c1 10`). The pure-OUT lines
+collection carries nothing. The cursor id is the one the first reply's status
+frame names at offset 11: a live 18c sent 4, and the Mirror's frames have always
+carried 2 there.
+
+The reply is the first execute's RXD row of OUT values and its OER, with neither
+the 50-byte OUT-bind header nor the status frame. sqlplus repeats it until a
+batch comes back short. The Mirror keeps the last block that handed OUT values
+back and runs it again with the new IN values. Before that, it refused the call,
+and sqlplus printed the first 30 lines and dropped the rest, over every backend.
+
 The Mirror reads the bind (`_oci_bind_descriptors`, the type id riding on
 `bind_types` to the backend as `BindVar.toid`) and writes the value
 (`encode_out_bind_response_oci` with `types` / `inputs`); against the captures the

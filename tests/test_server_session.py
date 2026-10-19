@@ -1901,6 +1901,53 @@ def test_the_get_lines_collection_bind_is_read() -> None:
     assert [bt[3] for bt in request.bind_types] == [toid, b'']
 
 
+# sqlplus 23.26 asking a live 18c for SERVEROUTPUT's second batch (#2041):
+# TTI_EXEC by cursor id 4 (the id the first reply's status frame named), one
+# iteration, and an RXD row with the one bind that came in with a value,
+# :NUMLINES = 15.
+_OCI_EXEC_GET_LINES = bytes.fromhex('030411040000000100000000000000000000000702c110')
+
+
+def test_an_exec_by_cursor_names_its_cursor_and_in_values() -> None:
+    from seerdb.common.tns import parse_exec_by_cursor_oci
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+
+    assert parse_exec_by_cursor_oci(_OCI_EXEC_GET_LINES, [TNS_TYPE_NUMBER]) == (4, [15])
+
+
+def test_get_lines_runs_again_by_cursor_for_each_batch() -> None:
+    # After the first GET_LINES, sqlplus fetches the next batch by cursor id;
+    # it was refused, and SERVEROUTPUT stopped after 30 lines (#2041). The block
+    # runs again with the new count, and the reply is its OUT values and OER --
+    # no OUT-bind header, no status frame, as a live 18c answers.
+    from types import SimpleNamespace
+
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1, TNS_DATA
+    from seerdb.server.session import _serve_oci_session
+
+    class _GetLines(_OciCountingBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.binds: list = []
+
+        def execute(self, sql: str, binds=()) -> Result:
+            self.calls.append(sql)
+            self.binds.append([getattr(b, 'value', b) for b in binds])
+            return Result(out_binds=[SimpleNamespace(image=b'\x01\x02'), 15])
+
+    stream: Any = _OciOneCallStream(_OCI_GET_LINES_COLLECTION_BIND)
+    stream.inbox[1:1] = [(TNS_DATA, _OCI_EXEC_GET_LINES)]
+    backend: Any = _GetLines()
+    _serve_oci_session(stream, backend, 'PYO', field_version=FIELD_VERSION_18_1_EXT_1)
+    first, again = stream.sent
+    assert first[:2] == b'\x0b\x01'  # the OUT-bind reply
+    assert len(backend.calls) == 2 and backend.calls[0] == backend.calls[1]
+    assert backend.binds[1] == [None, 15]
+    assert again[0] == 0x07  # the values straight away
+    assert b'\x0b\x01\x05' not in again and b'\x08\x06\x00' not in again
+    assert again[again.index(b'\x02\xc1\x10\x00\x00') + 5] == 0x04  # then the OER
+
+
 def test_a_statement_whose_binds_are_not_read_is_refused() -> None:
     # A bind the section cannot be read for -- here the same collection bind
     # with an IN value of a form not read yet -- used to come back as no binds,

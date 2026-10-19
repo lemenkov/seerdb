@@ -31,7 +31,12 @@ from typing import NoReturn, ParamSpec, TypeVar
 
 from seerdb.common.crypto import VFR_12C_SHA2, decrypt_password
 from seerdb.common.dbobject import ObjectImage
-from seerdb.common.exceptions import InterfaceError, NotSupportedError, Truncated
+from seerdb.common.exceptions import (
+    DataError,
+    InterfaceError,
+    NotSupportedError,
+    Truncated,
+)
 from seerdb.common.oci import (
     OCI_CMD_COMMIT,
     OCI_CMD_ROLLBACK,
@@ -92,6 +97,7 @@ from seerdb.common.tns import (
     encode_dml_status_oci,
     encode_error,
     encode_error_oci,
+    encode_exec_by_cursor_reply_oci,
     encode_fetch_batch_oci,
     encode_fetch_response,
     encode_fetch_terminator_oci,
@@ -145,6 +151,7 @@ from seerdb.common.tns import (
     oci_lob_var_id,
     parse_describe_oci,
     parse_exec,
+    parse_exec_by_cursor_oci,
     parse_exec_oci,
     parse_fetch,
     parse_fetch_oci,
@@ -215,6 +222,7 @@ from seerdb.common.tns_consts import (
     TTI_AUTH,
     TTI_COMMIT,
     TTI_DESCRIBE,
+    TTI_EXEC,
     TTI_FETCH,
     TTI_FUN,
     TTI_KOD,
@@ -1737,6 +1745,9 @@ def _serve_oci_session(
     # The values blocks assigned to sqlplus CLOB / BLOB variables, by the id the
     # locator each went out as names (#2015).
     lob_vars = _OciLobVars()
+    # The last PL/SQL block that handed OUT values back, for sqlplus to run
+    # again by cursor id with new IN values (#2041).
+    blocks = _OciBlocks()
     # LOB contents (wire bytes + is_clob + national) the current statement's rows
     # carry, in the order their locators went out; sqlplus drains them with
     # TTI_LOBOPS reads, slicing the current LOB per each read's offset/amount (#405).
@@ -1831,10 +1842,17 @@ def _serve_oci_session(
                     parked = _serve_oci_long_row(stream, parked, seq, reexecute=True)
                     continue
                 parked, lobs, slot_lobs = _answer_query_oci(
-                    stream, backend, body, seq, ref_cursors, lob_vars
+                    stream, backend, body, seq, ref_cursors, lob_vars, blocks
                 )
                 current_lob = None
                 slot_current = {}
+                continue
+            if body[1] == TTI_EXEC:
+                # A block run again by cursor id, with new IN values: sqlplus
+                # fetching SERVEROUTPUT's lines after the first batch (#2041).
+                _answer_exec_by_cursor_oci(
+                    stream, backend, body, seq, blocks, ref_cursors, lob_vars
+                )
                 continue
             if body[1] == TTI_KOD:
                 # An object-type describe (§40). sqlplus asks for a collection
@@ -2155,6 +2173,7 @@ def _answer_query_oci(
     seq: '_OciSequence',
     ref_cursors: '_OciRefCursors | None' = None,
     lob_vars: '_OciLobVars | None' = None,
+    blocks: '_OciBlocks | None' = None,
 ) -> tuple[
     tuple[list[ColumnMeta], list[tuple]] | None,
     list[tuple[bytes, bool, bool]],
@@ -2242,6 +2261,8 @@ def _answer_query_oci(
     if result.out_binds:
         # A PL/SQL block that assigned OUT binds (sqlplus VARIABLE / EXEC) — return
         # the values so the client reads them back into its bound buffers.
+        if blocks is not None:
+            blocks.remember(request)
         if ref_cursors is None:
             ref_cursors = _OciRefCursors()
         stream.write_packet(
@@ -2739,6 +2760,79 @@ _END_TO_END_ATTRS = frozenset(
 # carry (0, 0x5be8, 0x5beb), so a re-execute of a statement's own cursor is never
 # taken for one (#2014).
 _OCI_REF_CURSOR_FIRST_ID = 0x100
+
+
+class _OciBlocks:
+    """The last PL/SQL block in a sqlplus session that handed OUT values back
+    (#2041). sqlplus runs such a block again with TTI_EXEC, by the cursor id the
+    reply named and with values for the binds that came in with one -- how it
+    fetches SERVEROUTPUT's lines, DBMS_OUTPUT.GET_LINES once per batch. The
+    Mirror names every statement's cursor 2, so the last block is the one."""
+
+    def __init__(self) -> None:
+        self.request: ExecRequest | None = None
+
+    def remember(self, request: ExecRequest) -> None:
+        self.request = request
+
+    @staticmethod
+    def given(request: ExecRequest) -> list[bool]:
+        # Which binds came in with a value -- IN or IN OUT, not pure OUT.
+        return [
+            value is not None or t == TNS_TYPE_REFCURSOR
+            for value, (t, _cs, _size, _toid) in zip(request.binds, request.bind_types)
+        ]
+
+
+def _answer_exec_by_cursor_oci(
+    stream: PacketStream,
+    backend: Backend,
+    body: bytes,
+    seq: '_OciSequence',
+    blocks: _OciBlocks,
+    ref_cursors: '_OciRefCursors',
+    lob_vars: '_OciLobVars',
+) -> None:
+    # Run the remembered block again with the call's IN values, and answer with
+    # its OUT values the way the first execute did, less the OUT-bind header and
+    # the status frame, as a live 18c does (#2041).
+    request = blocks.request
+    if request is None:
+        _refuse_unhandled_oci(stream, 'OCI call 0304: no block to run again', seq)
+        return
+    given = _OciBlocks.given(request)
+    in_types = [t for (t, _cs, _size, _toid), g in zip(request.bind_types, given) if g]
+    try:
+        _cursor, values = parse_exec_by_cursor_oci(body, in_types)
+    except (InterfaceError, DataError) as err:
+        _refuse_unhandled_oci(stream, f'OCI call 0304: {err}', seq)
+        return
+    supplied = iter(values)
+    binds = [next(supplied) if g else None for g in given]
+    request = replace(request, binds=binds, bind_rows=[binds])
+    try:
+        result = backend.execute(request.sql, _bind_vars(request))
+    except BackendError as err:
+        stream.write_packet(
+            TNS_DATA,
+            encode_error_oci(
+                err.ora_code, str(err), sequence=seq.next(), error_pos=err.error_offset
+            ),
+        )
+        return
+    stream.write_packet(
+        TNS_DATA,
+        encode_exec_by_cursor_reply_oci(
+            [
+                lob_vars.keep(ref_cursors.park(value), t)
+                for value, (t, _cs, _size, _toid) in zip(
+                    result.out_binds, request.bind_types
+                )
+            ],
+            sequence=seq.next(),
+            types=[(t, toid) for (t, _cs, _size, toid) in request.bind_types],
+        ),
+    )
 
 
 class _OciLobVars:
