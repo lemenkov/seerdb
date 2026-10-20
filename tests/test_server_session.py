@@ -2707,24 +2707,99 @@ def test_a_drained_refcursor_is_forgotten() -> None:
     assert b'\x07\x02\xc1' not in again
 
 
-def test_a_refcursor_with_a_lob_column_is_refused() -> None:
-    # A LOB column's rows stream over calls this path does not serve yet; sent
-    # the plain way they hung sqlplus. Refused, the session carries on (#2014).
-    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1, TNS_TYPE_CLOB
-    from seerdb.server.session import _serve_oci_session
+# sqlplus 23.26 reading a REF CURSOR's CLOB from a live 18c (#2033): a TTI_LOBOPS
+# read from offset 1 for 80 characters, the locator the row carried.
+_OCI_REFCURSOR_LOB_READ = bytes.fromhex(
+    '03600efeffffffffffffff280000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000200000000'
+    '000000000000000000000001000000000000000400000000000000feffffffff'
+    'ffffff0000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000260000c20880000002459f00000113000000010369000a00'
+    '0000000002f0bc50a70000000000005000000000000000'
+)
+
+
+def test_a_refcursor_with_a_lob_column_streams_its_rows() -> None:
+    # Its rows were refused, ORA-03115: sent the plain way they hung sqlplus
+    # (#2014). They stream as a query's do: the re-execute answers the first
+    # row, its CLOB's content follows the read, the fetch answers the next row,
+    # and the last fetch ends it (#2033).
+    from seerdb.common.tns_consts import (
+        FIELD_VERSION_18_1_EXT_1,
+        TNS_DATA,
+        TNS_TYPE_CLOB,
+    )
+    from seerdb.server.session import _OCI_REF_CURSOR_FIRST_ID, _serve_oci_session
 
     clob = ColumnMeta(name=b'C', data_type=TNS_TYPE_CLOB, data_length=4000, max_size=0)
 
     class _LobCursor(_OciCountingBackend):
         def execute(self, sql: str, binds=()) -> Result:
-            return Result(out_binds=[CursorResult(columns=[clob], rows=[('hello',)])])
+            return Result(
+                out_binds=[CursorResult(columns=[clob], rows=[('hello',), ('again',)])]
+            )
 
+    cursor = _OCI_REF_CURSOR_FIRST_ID
+    reexec = bytearray(_OCI_REEXEC_REFCURSOR)
+    reexec[7:11] = cursor.to_bytes(4, 'little')
     stream: Any = _OciOneCallStream(_OCI_EXEC_OPEN_REFCURSOR)
+    stream.inbox[1:1] = [
+        (TNS_DATA, bytes(reexec)),
+        (TNS_DATA, _OCI_REFCURSOR_LOB_READ),
+        (TNS_DATA, _oci_fetch(cursor, 15)),
+        (TNS_DATA, _OCI_REFCURSOR_LOB_READ),
+        (TNS_DATA, _oci_fetch(cursor, 15)),
+    ]
     backend: Any = _LobCursor()
     _serve_oci_session(stream, backend, 'PYO', field_version=FIELD_VERSION_18_1_EXT_1)
-    [reply] = stream.sent
-    assert b'ORA-03115' in reply
-    assert b'REF CURSOR with LOB or LONG columns' in reply
+    opened, first, hello, second, again, last = stream.sent
+    assert b'ORA-03115' not in opened
+    assert cursor.to_bytes(4, 'little') + b'\x00\x00\x08\x06' in opened
+    assert 'hello'.encode('utf-16-be') in hello
+    assert 'again'.encode('utf-16-be') in again
+    assert b'ORA-01403' not in first + second
+    assert b'ORA-01403' in last
+
+
+def test_a_refcursor_with_a_long_column_streams_a_row_per_call() -> None:
+    # A LONG streams a row per call too: the re-execute answers the first, each
+    # fetch the next, and the fetch after the last ends it (#2033).
+    from seerdb.common.tns_consts import (
+        FIELD_VERSION_18_1_EXT_1,
+        TNS_DATA,
+        TNS_TYPE_LONG,
+    )
+    from seerdb.server.session import _OCI_REF_CURSOR_FIRST_ID, _serve_oci_session
+
+    long_col = ColumnMeta(name=b'T', data_type=TNS_TYPE_LONG, data_length=0, max_size=0)
+
+    class _LongCursor(_OciCountingBackend):
+        def execute(self, sql: str, binds=()) -> Result:
+            return Result(
+                out_binds=[
+                    CursorResult(
+                        columns=[long_col], rows=[('text one',), ('text two',)]
+                    )
+                ]
+            )
+
+    cursor = _OCI_REF_CURSOR_FIRST_ID
+    reexec = bytearray(_OCI_REEXEC_REFCURSOR)
+    reexec[7:11] = cursor.to_bytes(4, 'little')
+    stream: Any = _OciOneCallStream(_OCI_EXEC_OPEN_REFCURSOR)
+    stream.inbox[1:1] = [
+        (TNS_DATA, bytes(reexec)),
+        (TNS_DATA, _oci_fetch(cursor, 15)),
+        (TNS_DATA, _oci_fetch(cursor, 15)),
+    ]
+    backend: Any = _LongCursor()
+    _serve_oci_session(stream, backend, 'PYO', field_version=FIELD_VERSION_18_1_EXT_1)
+    opened, first, second, last = stream.sent
+    assert b'ORA-03115' not in opened
+    assert b'text one' in first and b'text two' not in first
+    assert b'text two' in second
+    assert b'ORA-01403' not in first + second
+    assert b'ORA-01403' in last
 
 
 # sqlplus 23.26's CLOB variable against a live 18c (#2015): `variable vc clob`,

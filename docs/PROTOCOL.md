@@ -2294,6 +2294,14 @@ block that opens it, and `print rc` take three calls. Captured from sqlplus
    sqlplus 10.2's. The reply is the rows, with a fetch reply's framing; while
    rows remain sqlplus fetches by the same id (`03 05`).
 
+   A cursor whose columns hold a CLOB, a BLOB or a LONG streams its rows the way
+   that query's own execute does (#2033). The re-execute is answered with the
+   first row, a LOB as its locator. sqlplus reads each LOB's content over
+   TTI_LOBOPS (§14), and fetches the next row by the cursor's id; the fetch after
+   the last row ends with ORA-01403. sqlplus 23.26 and 11.2 print it through the
+   Mirror as they do direct to 18c. The Mirror refused such a cursor until then.
+   Sent in one plain reply, its rows hung sqlplus.
+
 The Mirror numbers these cursors from `0x100` up, clear of the fixed ids its
 other OCI replies carry (0, `0x5be8`, `0x5beb`), so a re-execute of a
 statement's own cursor is never served from one. A block that does not open the
