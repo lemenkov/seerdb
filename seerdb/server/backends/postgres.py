@@ -17505,37 +17505,22 @@ class PostgresBackend:
         # returned. Fetch all its rows (still inside this transaction) and hand them
         # back as a CursorResult the Mirror parks and serves as a nested cursor —
         # re-tagging any ora_tstz cells the same way the top-level read path does.
+        # Its columns are described as a query's are, from the statement the
+        # portal runs: a CLOB, BLOB, DATE or NVARCHAR2 table column, a
+        # TO_CLOB(...) item, read through its domain or its call, where the bare
+        # PostgreSQL types described a VARCHAR2, a RAW, a TIMESTAMP (#2071). The
+        # client's own text is not known here, so what only it says (a
+        # TIMESTAMP literal's nine digits, an unaliased item's name) is not.
+        opened = self._conn.execute(
+            'SELECT statement FROM pg_cursors WHERE name = %s', (portal,)
+        ).fetchone()
         fetch = self._conn.cursor()
         fetch.execute(sql.SQL('FETCH ALL FROM {}').format(sql.Identifier(portal)))
-        rows = [list(r) for r in fetch.fetchall()]
+        result = self._build_result(fetch, opened[0] if opened else '')
         # Drained, so close it: an open portal holds its tables, and PostgreSQL
         # refuses DDL on them in this session ("being used by active queries").
         self._conn.execute(sql.SQL('CLOSE {}').format(sql.Identifier(portal)))
-        for i, desc in enumerate(fetch.description or ()):
-            if desc.type_code in (self._tstz_oid, _TIMESTAMPTZ_OID):
-                for row in rows:
-                    row[i] = _wire_cell(row[i], desc.type_code, self._tstz_oid)
-            elif desc.type_code == _REFCURSOR_OID:
-                # A nested CURSOR(...) item (#1461): its own portal, drained.
-                for row in rows:
-                    if row[i] is not None:
-                        row[i] = self._drain_refcursor(row[i])
-        columns = [
-            _refcursor_column_meta(desc.name)
-            if desc.type_code == _REFCURSOR_OID
-            else _column_meta(
-                desc,
-                [r[i] for r in rows],
-                self._tstz_oid,
-                native_boolean=self._release >= (23, 0),
-            )
-            for i, desc in enumerate(fetch.description or ())
-        ]
-        # A column straight from a NOT NULL table column is not nullable, as a
-        # query's is (#1618): a FETCH names the table column as a SELECT does.
-        for i in self._not_null_columns(fetch.pgresult, len(columns)):
-            columns[i] = replace(columns[i], null_ok=0)
-        return CursorResult(columns=columns, rows=[tuple(r) for r in rows])
+        return CursorResult(columns=result.columns, rows=result.rows)
 
     def _eval_out_assignments(
         self, body: str, assignments: list, binds: Sequence, values: list
