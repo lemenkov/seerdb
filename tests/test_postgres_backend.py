@@ -7314,6 +7314,38 @@ def test_nine_digit_items_are_whole_items_only() -> None:
     assert _nine_digit_items('update t set x = 1') == set()
 
 
+@pytest.mark.parametrize(
+    ('sql', 'offset'),
+    [
+        ('  drop   table   nosuch_2074', 17),
+        ('/* c */ select * from nosuch_2074', 22),
+        ('-- x\nselect nosuch from dual', 12),
+        ('\n\n  select 1 from nosuch_2074', 18),
+        ('select * from nosuch_2074', 14),
+    ],
+)
+def test_an_error_offset_counts_the_leading_text(sql: str, offset: int) -> None:
+    # Oracle counts from the start of the statement as sent; the backend runs
+    # it past its leading whitespace and comments, and counted from there
+    # (#2074). The offsets are 18c's.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        with pytest.raises(BackendError) as raised:
+            backend.execute(sql)
+        assert raised.value.error_offset == offset
+        if not sql.lstrip().lower().startswith('drop'):
+            # A parse alone reports the same place.
+            with pytest.raises(BackendError) as parsed:
+                backend.parse(sql)
+            assert parsed.value.error_offset == offset
+    finally:
+        backend.close()
+
+
 def test_a_sql_statement_binds_each_occurrence() -> None:
     # Oracle binds a SQL statement's placeholders by position (#1714): with a
     # value for each occurrence, `:1` twice is two binds. One value a name, or

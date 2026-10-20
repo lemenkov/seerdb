@@ -10950,6 +10950,23 @@ def _strip_leading_comments(sql: str) -> str:
     return _LEADING_COMMENTS.sub('', sql, count=1)
 
 
+# What a parse runs in front of the statement (#2074).
+_EXPLAIN_PREFIX = 'EXPLAIN '
+
+
+@contextmanager
+def _offset_from_start(stripped: int) -> Iterator[None]:
+    # Oracle counts an error's offset from the start of the statement as sent;
+    # an error raised past the leading whitespace and comments a run strips is
+    # counted from after them, and moved back by as much (#2074).
+    try:
+        yield
+    except BackendError as err:
+        if err.error_offset is not None:
+            err.error_offset += stripped
+        raise
+
+
 # Oracle's reserved words, which cannot name a bind: `:ROWID` is refused
 # ORA-01745 at parse. Unquoted names only -- a quoted one may be anything.
 _ORACLE_RESERVED_WORDS = frozenset(
@@ -12758,7 +12775,12 @@ class PostgresBackend:
         and keep the bare success they had.
         """
         native = self._is_native(sql)
-        sql = _strip_leading_comments(sql)
+        stripped = _strip_leading_comments(sql)
+        with _offset_from_start(len(sql) - len(stripped)):
+            self._parse_stripped(stripped, native)
+
+    def _parse_stripped(self, sql: str, native: bool) -> None:
+        # The statement past its leading whitespace and comments.
         _refuse_reserved_bind_names(sql)
         if is_plsql(sql) or _NOT_EXPLAINABLE.match(sql):
             return
@@ -12783,13 +12805,23 @@ class PostgresBackend:
             translated, params = _translate_binds(translated, [None] * placeholders)
         try:
             with self._under_savepoint('_mirror_parse'):
-                self._conn.execute(f'EXPLAIN {translated}', params)
+                self._conn.execute(_EXPLAIN_PREFIX + translated, params)
         except psycopg.Error as exc:
             # A bind whose type only its value would settle is not an error in
             # Oracle, whose parse has no value either.
             if getattr(exc, 'sqlstate', None) == '42P18':
                 return
-            raise _backend_error(exc, original=sql, translated=translated) from exc
+            # PostgreSQL counts the position into the EXPLAIN it ran, the
+            # prefix included: mapped against that text, then moved back past
+            # it (#2074).
+            err = _backend_error(
+                exc,
+                original=_EXPLAIN_PREFIX + sql,
+                translated=_EXPLAIN_PREFIX + translated,
+            )
+            if err.error_offset is not None:
+                err.error_offset = max(err.error_offset - len(_EXPLAIN_PREFIX), 0)
+            raise err from exc
         self._release_read_locks()
 
     @contextmanager
@@ -13097,7 +13129,12 @@ class PostgresBackend:
                 self._flush_report()
             return Result()
         native = self._is_native(sql)
-        sql = _strip_leading_comments(sql)
+        stripped = _strip_leading_comments(sql)
+        with _offset_from_start(len(sql) - len(stripped)):
+            return self._execute_stripped(stripped, binds, native)
+
+    def _execute_stripped(self, sql: str, binds: Sequence, native: bool) -> Result:
+        # The statement past its leading whitespace and comments.
         _refuse_reserved_bind_names(sql)
         transaction_control = self._execute_transaction_control(sql)
         if transaction_control is not None:
