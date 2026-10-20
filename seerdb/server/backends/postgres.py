@@ -1155,13 +1155,29 @@ _HELPER_FUNCTIONS_DDL = (
 _ORAFCE_HELPERS_DDL = (
     'CREATE OR REPLACE FUNCTION to_date(numeric, text) RETURNS oracle.date '
     'LANGUAGE sql STABLE STRICT AS $$ SELECT oracle.to_date($1::text, $2) $$;'
+    # TRUNC / ROUND of a DATE or a TIMESTAMP return a DATE (#2076), so the
+    # difference of two is a number of days. orafce's return a timestamp, which
+    # the DATE operators (#1611) do not take, and the difference was an
+    # interval. The DATE domain reaches these through its base type, and they
+    # come before orafce's on the search path.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION {fn}(timestamp{arg}) RETURNS {_DATE_TYPE} '
+        f'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT oracle.{fn}($1{use}) $$;'
+        for fn in ('trunc', 'round')
+        for arg, use in (('', ''), (', text', ', $2'))
+    )
     # TRUNC / ROUND of a WITH TIME ZONE value (#1313) work on the value's OWN
     # wall-clock time and return a DATE: TRUNC of 2022-06-08 00:00:10 +05:30 is
     # 2022-06-08. Left to orafce, the ora_tstz composite reached its trunc /
     # round only through the implicit cast to timestamptz, which truncated the
-    # instant in the SESSION's zone -- 2022-06-07 in a UTC session.
+    # instant in the SESSION's zone -- 2022-06-07 in a UTC session. One an
+    # earlier release made returns a timestamp, and no CREATE OR REPLACE
+    # changes a return type, so it goes first (#2076).
     + ''.join(
-        f'CREATE OR REPLACE FUNCTION {fn}({_TSTZ_TYPE}{arg}) RETURNS timestamp '
+        'DO $$ BEGIN IF (SELECT prorettype FROM pg_proc WHERE oid = '
+        f"to_regprocedure('{fn}({_TSTZ_TYPE}{arg})')) = 'timestamp'::regtype "
+        f'THEN DROP FUNCTION {fn}({_TSTZ_TYPE}{arg}); END IF; END $$;'
+        f'CREATE OR REPLACE FUNCTION {fn}({_TSTZ_TYPE}{arg}) RETURNS {_DATE_TYPE} '
         f'LANGUAGE sql IMMUTABLE STRICT AS $$ '
         f'SELECT oracle.{fn}(ora_tstz_local($1){use}) $$;'
         for fn in ('trunc', 'round')
