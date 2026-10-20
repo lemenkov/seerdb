@@ -7656,6 +7656,47 @@ def _computed_column_types(sql: str) -> dict[int, int]:
     return found
 
 
+# A select-list item Oracle describes with nine fractional digits, where a
+# system value or a bare CAST gets six: a TIMESTAMP literal, or one call of
+# TO_TIMESTAMP, TO_TIMESTAMP_TZ or FROM_TZ, optionally aliased (#2062).
+_NINE_DIGIT_LITERAL = re.compile(r"TIMESTAMP\s*'[^']*'", re.IGNORECASE)
+_NINE_DIGIT_CALL = re.compile(
+    r'(to_timestamp|to_timestamp_tz|from_tz)\s*\(', re.IGNORECASE
+)
+_NINE_FRACTIONAL_DIGITS = 9
+
+
+def _nine_digit_items(sql: str) -> set[int]:
+    """The select-list positions of a query Oracle describes with nine
+    fractional digits (#2062). PostgreSQL keeps six at most, and so described
+    every timestamp with six. Read off the statement the client sent: the
+    dialect rewrites a TIMESTAMP literal."""
+    words, _rownums = _top_level_words(sql)
+    if not words or words[0][1] != 'SELECT':
+        return set()
+    start = words[0][0] + len('SELECT')
+    end = next((pos for pos, word in words if word == 'FROM'), len(sql))
+    items = [sql[s:e].strip() for s, e in _top_level_items(sql, start, end)]
+    if any(item == '*' or item.endswith('.*') for item in items):
+        return set()  # the positions are the expanded columns', not the items'
+    found = set()
+    for index, item in enumerate(items):
+        literal = _NINE_DIGIT_LITERAL.match(item)
+        if literal is not None:
+            rest = item[literal.end() :]
+        else:
+            call = _NINE_DIGIT_CALL.match(item)
+            if call is None:
+                continue
+            close = _matching_paren(item, call.end() - 1)
+            if close >= len(item):
+                continue
+            rest = item[close + 1 :]
+        if _ITEM_ALIAS.fullmatch(rest.strip()):
+            found.add(index)
+    return found
+
+
 @_kept_per_text
 def _constructor_items(sql: str) -> dict[int, str]:
     """The select-list positions of a query that are one call, by the name called.
@@ -14824,6 +14865,13 @@ class PostgresBackend:
                 columns[i] = replace(columns[i], name=name)
         for i in self._not_null_columns(cursor.pgresult, len(columns)):
             columns[i] = replace(columns[i], null_ok=0)
+        for i in _nine_digit_items(original) if original else ():
+            if (
+                i < len(columns)
+                and columns[i].data_type in (TNS_TYPE_TIMESTAMP, TNS_TYPE_TIMESTAMPTZ)
+                and not cursor.pgresult.ftable(i)
+            ):
+                columns[i] = replace(columns[i], scale=_NINE_FRACTIONAL_DIGITS)
         for i in self._json_columns(cursor.pgresult, len(columns)):
             columns[i] = replace(columns[i], is_json=True)
         # A RAW(n) column describes as its declared n, which bytea does not keep;
