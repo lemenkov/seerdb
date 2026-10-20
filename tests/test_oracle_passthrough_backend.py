@@ -36,6 +36,39 @@ def test_a_release_packs_by_its_own_layout():
     assert _packed_release('23.0.0.0.0') == 0x17000000
 
 
+def test_a_character_bind_is_declared_with_its_buffer():
+    # A character bind's declared buffer goes upstream with it (#2106): bound by
+    # its value, a sqlplus VARCHAR2(30) variable (120 bytes) described at 32
+    # where Oracle gives 128. The widest buffer a position is given across rows
+    # is the one declared; an LTZ value is still declared LTZ (#1225), and a
+    # plain value is left alone.
+    import datetime
+
+    import seerdb
+    from seerdb.server import LtzValue, VarcharValue
+    from seerdb.server.backends.passthrough import OraclePassthroughBackend
+
+    class Cursor:
+        declared = None
+
+        def setinputsizes(self, *sizes):
+            self.declared = sizes
+
+    cursor = Cursor()
+    ltz = LtzValue.of(datetime.datetime(2024, 1, 2))
+    OraclePassthroughBackend._declare_value_binds(
+        cursor,
+        [
+            [VarcharValue.of('hello', 120), ltz, 'plain', 5],
+            [VarcharValue.of('x', 1012), ltz, 'plain', 6],
+        ],
+    )
+    assert cursor.declared == (1012, seerdb.DB_TYPE_TIMESTAMP_LTZ, None, None)
+    nothing = Cursor()
+    OraclePassthroughBackend._declare_value_binds(nothing, [['plain', 5]])
+    assert nothing.declared is None
+
+
 def test_strips_the_redundant_ora_prefix():
     exc = seerdb.DatabaseError('ORA-00904: "X": invalid identifier', 904)
     err = _relay_error(exc)

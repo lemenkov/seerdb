@@ -64,6 +64,7 @@ from seerdb.server.backend import (
     Result,
     SessionInfo,
     TypeDescription,
+    VarcharValue,
 )
 from seerdb.server.identity import ServerIdentity, server_identity
 
@@ -737,24 +738,29 @@ class OraclePassthroughBackend:
         ]
 
     @staticmethod
-    def _declare_ltz_binds(cursor: object, rows: Sequence[Sequence]) -> None:
+    def _declare_value_binds(cursor: object, rows: Sequence[Sequence]) -> None:
+        # Declare the binds whose value alone would bind as something else.
         # A TIMESTAMP WITH LOCAL TIME ZONE bind arrives as an LtzValue (#1222).
         # Bound on as a bare datetime it would be a TIMESTAMP, which the upstream
         # reads in the session zone rather than the database's, so declare each
-        # position that holds one as LTZ again (#1225).
+        # position that holds one as LTZ again (#1225). A character bind arrives
+        # as a VarcharValue, with the buffer the client declared, which the
+        # upstream describes the bind by (#2106): bound by its value, a sqlplus
+        # VARCHAR2(30) variable printed 32 wide where Oracle gives 128. A size
+        # declares the buffer in bytes, as the client declared it.
         width = max((len(row) for row in rows), default=0)
-        ltz = {
-            i
-            for row in rows
-            for i, value in enumerate(row)
-            if isinstance(value, LtzValue)
-        }
-        if ltz:
+        declared: dict[int, object] = {}
+        for row in rows:
+            for i, value in enumerate(row):
+                if isinstance(value, LtzValue):
+                    declared[i] = seerdb.DB_TYPE_TIMESTAMP_LTZ
+                elif isinstance(value, VarcharValue) and value.max_size > 0:
+                    known = declared.get(i)
+                    if not isinstance(known, int) or value.max_size > known:
+                        declared[i] = value.max_size
+        if declared:
             cursor.setinputsizes(  # type: ignore[attr-defined]
-                *(
-                    seerdb.DB_TYPE_TIMESTAMP_LTZ if i in ltz else None
-                    for i in range(width)
-                )
+                *(declared.get(i) for i in range(width))
             )
 
     def _resolve_object_binds(self, binds: Sequence) -> list:
@@ -866,6 +872,10 @@ class OraclePassthroughBackend:
                 elif isinstance(b, BindVar):
                     sizes.append(dbtype_for_oracle_type(b.tns_type, b.csfrm))
                     resolved.append(b.value)
+                elif isinstance(b, VarcharValue) and b.max_size > 0:
+                    # As _declare_value_binds declares it (#2106).
+                    sizes.append(b.max_size)
+                    resolved.append(b)
                 else:
                     sizes.append(
                         seerdb.DB_TYPE_TIMESTAMP_LTZ
@@ -876,7 +886,7 @@ class OraclePassthroughBackend:
             cursor.setinputsizes(*sizes)
             binds = resolved
         else:
-            self._declare_ltz_binds(cursor, [binds])
+            self._declare_value_binds(cursor, [binds])
         try:
             cursor.execute(sql, list(binds))
         except seerdb.DatabaseError as exc:
@@ -933,7 +943,7 @@ class OraclePassthroughBackend:
         # own non-batcherrors semantics.
         assert self._conn is not None  # authenticate() ran before any execute
         cursor = self._conn.cursor()
-        self._declare_ltz_binds(cursor, rows)
+        self._declare_value_binds(cursor, rows)
         try:
             cursor.executemany(sql, [list(row) for row in rows])
         except seerdb.DatabaseError as exc:
@@ -956,7 +966,7 @@ class OraclePassthroughBackend:
         # the count list the client reads back through getarraydmlrowcounts().
         assert self._conn is not None  # authenticate() ran before any execute
         cursor = self._conn.cursor()
-        self._declare_ltz_binds(cursor, rows)
+        self._declare_value_binds(cursor, rows)
         try:
             cursor.executemany(sql, [list(row) for row in rows], arraydmlrowcounts=True)
         except seerdb.DatabaseError as exc:
@@ -1019,7 +1029,7 @@ class OraclePassthroughBackend:
             )
             for row in rows
         ]
-        self._declare_ltz_binds(cursor, batch)
+        self._declare_value_binds(cursor, batch)
         try:
             if len(batch) > 1:
                 cursor.executemany(sql, batch)
