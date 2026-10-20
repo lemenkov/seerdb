@@ -7963,6 +7963,9 @@ def _lob_substr_items(sql: str) -> set[int]:
 _BIND_DESCRIBE_SIZES = (32, 128, 2000, 4000, 8192, 16386)
 # The longest VARCHAR2, which a concatenation describes as at most.
 _VARCHAR_LIMIT = 32767
+# The characters a NUMBER converts to at most (#2140), measured on 23ai: a
+# NUMBER bind or column concatenated with 'x' describes as 41.
+_NUMBER_TEXT_WIDTH = 40
 # SYS_CONTEXT's width given a length argument, whatever it is (#2109).
 _SYS_CONTEXT_LENGTH_WIDTH = 4000
 
@@ -7986,6 +7989,13 @@ def _bind_sizes(sql: str, params: dict) -> dict[str, int]:
             TNS_TYPE_CHAR,
         ):
             sizes[name] = _bind_describe_size(value.max_size)
+        elif (
+            isinstance(value, (int, float, decimal.Decimal))
+            and not isinstance(value, bool)
+        ) or (isinstance(value, BindVar) and value.tns_type == TNS_TYPE_NUMBER):
+            # A NUMBER converts to at most 40 characters, which is what
+            # Oracle counts for one in a concatenation (#2140).
+            sizes[name] = _NUMBER_TEXT_WIDTH
     return sizes
 
 
@@ -8019,6 +8029,21 @@ def _concat_width(item: str, sizes: dict[str, int]) -> tuple[int, bool]:
         if kind == 'string' and word.startswith("'"):
             at += 1
             return len(word[1:-1].replace("''", "'").encode('utf-8')), True
+        if word.isdigit() or (word == '.' and text(1).isdigit()):
+            # A number literal, its digits a token each: as many characters
+            # as Oracle prints for it, `123.45` six and `1.50` three (#2140).
+            digits = ''
+            while text() and (text().isdigit() or text() == '.'):
+                digits += text()
+                at += 1
+            if re.fullmatch(r'[eE][-+]?\d+', text()):
+                digits += text()
+                at += 1
+            try:
+                number = decimal.Decimal(digits).normalize()
+            except decimal.InvalidOperation:
+                return 0, False
+            return len(format(number, 'f')), True
         if word == '(':
             at += 1
             width, complete = expression()

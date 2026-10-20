@@ -8241,6 +8241,30 @@ def test_sys_context_describes_as_oracle_sizes_it() -> None:
         backend.close()
 
 
+def test_a_number_in_a_concatenation_counts_as_oracle_counts_it() -> None:
+    # A NUMBER bind concatenated described as its value's width, `5x` as 2,
+    # where Oracle counts a NUMBER's 40 characters: 41 (#2140). A number
+    # literal counts the digits Oracle prints for it. Measured on 23ai.
+    import decimal
+
+    from seerdb.server.backends.postgres import _concat_width
+
+    assert _concat_width("123.45 || 'x'", {}) == (7, True)
+    assert _concat_width("1.50 || 'x'", {}) == (4, True)
+    assert _concat_width("5 || 'x'", {}) == (2, True)
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        for value in (5, 5.5, decimal.Decimal('12345.678')):
+            result = backend.execute("SELECT :v || 'x' a FROM dual", [value])
+            assert result.columns[0].data_length == 41, value
+        result = backend.execute("SELECT 5 || 'x' a, 123.45 || 'x' b FROM dual")
+        assert [c.data_length for c in result.columns] == [2, 7]
+    finally:
+        backend.close()
+
+
 def test_a_concatenation_of_a_bind_describes_by_its_declared_size() -> None:
     # A concatenation over a bind described by its longest value, so sqlplus
     # printed `:w || '!'` under a 4-character heading where Oracle gives 2001
