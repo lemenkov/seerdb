@@ -220,6 +220,69 @@ def test_a_missing_object_is_pointed_at_by_its_name(
     assert err.error_offset == offset
 
 
+@pytest.mark.parametrize(
+    ('sql', 'message', 'position', 'offset'),
+    [
+        ('drop sequence nosuch', 'sequence "nosuch" does not exist', None, 14),
+        (
+            'select nosuch.nextval from dual',
+            'relation "nosuch" does not exist',
+            '16',
+            7,
+        ),
+        (
+            'select nosuch.currval from dual',
+            'relation "nosuch" does not exist',
+            '16',
+            7,
+        ),
+        (
+            'alter sequence nosuch increment by 2',
+            'relation "nosuch" does not exist',
+            None,
+            0,
+        ),
+        (
+            'select pyo.nosuch.nextval from dual',
+            'relation "pyo.nosuch" does not exist',
+            '16',
+            11,
+        ),
+    ],
+)
+def test_a_missing_sequence_is_ora_02289(
+    sql: str, message: str, position: str | None, offset: int
+) -> None:
+    # PostgreSQL's 42P01 is ORA-00942 for every relation; Oracle says a
+    # sequence does not exist, and points at its name as 18c does, NEXTVAL or
+    # not, and at 0 for an ALTER SEQUENCE (#2073).
+    class _Diag:
+        def __init__(self) -> None:
+            self.statement_position = position
+            self.message_primary = message
+
+    class _PgError(_FakePgError):
+        def __init__(self) -> None:
+            super().__init__('42P01', message)
+            self.diag = _Diag()
+
+    translated = sql.replace('nosuch.nextval', "nextval('nosuch')")
+    err = _backend_error(_PgError(), original=sql, translated=translated)
+    assert (err.ora_code, err.error_offset) == (2289, offset)
+    assert str(err) == 'sequence does not exist'
+
+
+def test_a_missing_table_read_as_a_qualifier_stays_ora_00942() -> None:
+    # A name followed by a dot that is not NEXTVAL / CURRVAL is a schema or a
+    # table qualifier, and the relation a table.
+    class _PgError(_FakePgError):
+        def __init__(self) -> None:
+            super().__init__('42P01', 'relation "nosuch" does not exist')
+
+    sql = 'select nosuch.x from nosuch'
+    assert _backend_error(_PgError(), original=sql, translated=sql).ora_code == 942
+
+
 def test_iot_primary_key_is_read_from_organization_index_ddl() -> None:
     # Inline and constraint forms; a heap table or an IOT without a recognised
     # key registers nothing.
