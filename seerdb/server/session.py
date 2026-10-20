@@ -2316,7 +2316,7 @@ def _answer_query_oci(
                 err.ora_code,
                 str(err),
                 sequence=seq.next(),
-                error_pos=err.error_offset,
+                error_pos=_oci_error_pos(err),
             ),
         )
         return None, [], {}
@@ -2456,7 +2456,7 @@ def _answer_describe_oci(
                 code,
                 str(err),
                 sequence=seq.next(),
-                error_pos=getattr(err, 'error_offset', None),
+                error_pos=_oci_error_pos(err),
             ),
         )
         return
@@ -2934,7 +2934,10 @@ def _answer_exec_by_cursor_oci(
         stream.write_packet(
             TNS_DATA,
             encode_error_oci(
-                err.ora_code, str(err), sequence=seq.next(), error_pos=err.error_offset
+                err.ora_code,
+                str(err),
+                sequence=seq.next(),
+                error_pos=_oci_error_pos(err),
             ),
         )
         return
@@ -5135,6 +5138,16 @@ def _answer_txn(stream: PacketStream, backend: Backend, *, commit: bool) -> None
     else:
         response = encode_status(0)
     stream.write_packet(TNS_DATA, response)
+
+
+def _oci_error_pos(err: Exception) -> int:
+    # Where sqlplus draws its `*` for a statement's error: the backend's
+    # offset, or 0 when it has none, Oracle's place for an error that has no
+    # place in the text, a constraint violation's (#2111). Left to the codec,
+    # a missing one was a captured ORA-00942's 14, and every such error
+    # pointed into the middle of its statement.
+    offset = getattr(err, 'error_offset', None)
+    return offset if isinstance(offset, int) else 0
 
 
 def _answer_txn_oci(

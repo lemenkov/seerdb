@@ -1890,6 +1890,18 @@ def test_oci_commit_and_rollback_calls_run_on_the_backend() -> None:
     assert b'ORA-02091' in stream.sent[2]
 
 
+def test_an_error_with_no_position_points_sqlplus_at_column_0() -> None:
+    # A backend error with no offset went to sqlplus as the captured 14, so
+    # every such error's `*` stood in the middle of its statement (#2111).
+    # Oracle's place for an error that has none is 0.
+    from seerdb.server.backend import BackendError
+    from seerdb.server.session import _oci_error_pos
+
+    assert _oci_error_pos(BackendError('x', ora_code=1)) == 0
+    assert _oci_error_pos(BackendError('x', ora_code=955, error_offset=13)) == 13
+    assert _oci_error_pos(RuntimeError('no offset at all')) == 0
+
+
 # sqlplus 23.26 re-executing DBMS_OUTPUT.GET_LINES by cursor id, with no SQL,
 # as captured against Mirror-over-PG (#1411 / #1515).
 _OCI_REEXECUTE_GET_LINES = bytes.fromhex(

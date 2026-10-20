@@ -547,6 +547,23 @@ def test_a_missing_table_is_named_as_23ai_names_it() -> None:
             backend.close()
 
 
+def test_an_error_with_no_postgresql_position_is_placed_as_23ai_places_it() -> None:
+    # PostgreSQL gives no position for these, and sqlplus drew its `*` at a
+    # fixed column (#2111). 23ai points an ORA-00955 at the name the CREATE
+    # gives and an ORA-01476 at the first `/`, past a literal's; a constraint's
+    # error has none, which the session sends as 0.
+    from seerdb.server.backends.postgres import _placed_offset
+
+    assert _placed_offset(955, 'create table t2111 (x number)') == 13
+    assert _placed_offset(955, 'CREATE OR REPLACE VIEW v2111 AS SELECT 1 x') == 23
+    assert _placed_offset(955, 'create unique index i2111 on t(x)') == 20
+    assert _placed_offset(1476, 'select 1/0 from dual') == 8
+    assert _placed_offset(1476, 'select id, 10/(id-1) from t2111') == 13
+    assert _placed_offset(1476, "select '/' || 1/0 from dual") == 15
+    assert _placed_offset(1476, 'select /* a/b */ 1/0 from dual') == 18
+    assert _placed_offset(1, 'insert into t values (1)') is None
+
+
 def test_all_errors_lists_an_invalid_objects_error() -> None:
     # sqlplus's SHOW ERRORS reads ALL_ERRORS, which did not exist (#2060). A
     # CREATE that does not compile lists its error at the line and column

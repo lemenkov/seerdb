@@ -11180,6 +11180,35 @@ def _missing_object_offset(exc, original: str | None) -> int | None:
     return None
 
 
+# A CREATE up to the name of what it creates (#2111): where 23ai points an
+# ORA-00955.
+_CREATED_NAME = re.compile(
+    r'\s*CREATE\s+(?:OR\s+REPLACE\s+)?'
+    r'(?:(?:GLOBAL\s+)?TEMPORARY\s+|UNIQUE\s+|BITMAP\s+|(?:NO)?FORCE\s+)*'
+    r'(?:TABLE|VIEW|MATERIALIZED\s+VIEW|INDEX|SEQUENCE|SYNONYM|TYPE)\s+',
+    re.IGNORECASE,
+)
+
+
+def _placed_offset(code: int, original: str) -> int | None:
+    """Where 23ai points an error PostgreSQL gives no position for (#2111):
+    an ORA-00955 at the name the CREATE gives, an ORA-01476 at the statement's
+    first `/` outside literals and comments. None for any other."""
+    if code == ORA_NAME_ALREADY_USED:
+        created = _CREATED_NAME.match(original)
+        return created.end() if created is not None else None
+    if code == ORA_DIVISOR_IS_ZERO:
+        return next(
+            (
+                token.start
+                for token in sql_tokens(original)
+                if token.kind == 'other' and original[token.start : token.end] == '/'
+            ),
+            None,
+        )
+    return None
+
+
 def _error_offset(exc, original: str | None, translated: str | None) -> int | None:
     # PostgreSQL reports where a parse error sits as a 1-based character position
     # into the statement it received — the dialect-rewritten one. Oracle's offset
@@ -13529,18 +13558,26 @@ class PostgresBackend:
     @_plainly_quoted
     def execute(self, sql: str, binds: Sequence = ()) -> Result:
         (sql, [binds]) = _occurrence_binds(sql, [binds])
-        return self._committing(
-            lambda: self._with_implicit_results(
-                lambda: self._reported(
-                    sql,
-                    lambda: self._replanned(
-                        lambda: self._privilege_refined(
-                            sql, lambda: self._execute_statement(sql, binds)
-                        )
-                    ),
+        try:
+            return self._committing(
+                lambda: self._with_implicit_results(
+                    lambda: self._reported(
+                        sql,
+                        lambda: self._replanned(
+                            lambda: self._privilege_refined(
+                                sql, lambda: self._execute_statement(sql, binds)
+                            )
+                        ),
+                    )
                 )
             )
-        )
+        except BackendError as error:
+            # An error PostgreSQL gave no position for, placed as 23ai places
+            # it (#2111). A single statement's only: an array's error offset
+            # is the row that failed, and a block's errors are its own.
+            if error.error_offset is None and not is_plsql(sql):
+                error.error_offset = _placed_offset(error.ora_code, sql)
+            raise
 
     def _unique_worded(self, violation: _UniqueViolation) -> BackendError:
         # ORA-00001 as 23ai says it (#2120): the table and columns, then the
