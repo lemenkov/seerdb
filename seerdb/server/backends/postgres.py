@@ -10967,6 +10967,34 @@ class _UniqueViolation(BackendError):
         )
 
 
+# ORA-01407: an UPDATE's NOT NULL violation, where an INSERT's is ORA-01400.
+_ORA_CANNOT_UPDATE_TO_NULL = 1407
+_UPDATE_STATEMENT = re.compile(r'\s*UPDATE\b', re.IGNORECASE)
+
+
+class _NullViolation(BackendError):
+    # A NOT NULL column given NULL, worded as Oracle words it in every release
+    # (#2134): ORA-01400 `cannot insert NULL into ("PYO"."T"."N")` for an
+    # INSERT, ORA-01407 `cannot update ("PYO"."T"."N") to NULL` for an UPDATE,
+    # from what PostgreSQL's error names. The column rides along, for the
+    # backend to place the error at its value.
+    def __init__(self, diag: Any, update: bool) -> None:
+        self.column = getattr(diag, 'column_name', None) or ''
+        named = '"{}"."{}"."{}"'.format(
+            (getattr(diag, 'schema_name', None) or '').upper(),
+            (getattr(diag, 'table_name', None) or '').upper(),
+            self.column.upper(),
+        )
+        if update:
+            super().__init__(
+                f'cannot update ({named}) to NULL', ora_code=_ORA_CANNOT_UPDATE_TO_NULL
+            )
+        else:
+            super().__init__(
+                f'cannot insert NULL into ({named})', ora_code=ORA_CANNOT_INSERT_NULL
+            )
+
+
 class _ObjectMissing(BackendError):
     # ORA-00942 with the table or view PostgreSQL could not find, for 23ai's
     # wording, which names it (#2110): `table or view "PYO"."T" does not
@@ -11049,6 +11077,13 @@ def _backend_error(
     offset = _missing_object_offset(exc, original)
     if offset is None:
         offset = _error_offset(exc, original, translated)
+    if getattr(exc, 'sqlstate', None) == '23502' and getattr(
+        getattr(exc, 'diag', None), 'column_name', None
+    ):
+        return _NullViolation(
+            exc.diag,
+            original is not None and _UPDATE_STATEMENT.match(original) is not None,
+        )
     missing = _MISSING_RELATION.match(_primary_message(exc))
     if code == ORA_TABLE_OR_VIEW_DOES_NOT_EXIST and missing is not None:
         return _ObjectMissing(missing.group(1), offset)
@@ -11186,6 +11221,15 @@ _CREATED_NAME = re.compile(
     r'\s*CREATE\s+(?:OR\s+REPLACE\s+)?'
     r'(?:(?:GLOBAL\s+)?TEMPORARY\s+|UNIQUE\s+|BITMAP\s+|(?:NO)?FORCE\s+)*'
     r'(?:TABLE|VIEW|MATERIALIZED\s+VIEW|INDEX|SEQUENCE|SYNONYM|TYPE)\s+',
+    re.IGNORECASE,
+)
+
+
+# An UPDATE up to its SET list, and an INSERT up to its VALUES list's `(` or
+# its query's select list, its table and column list caught (#2134).
+_NULL_UPDATE = re.compile(r'\s*UPDATE\s+[\w$#."]+(?:\s+\w+)?\s+SET\s+', re.IGNORECASE)
+_NULL_INSERT = re.compile(
+    r'\s*INSERT\s+INTO\s+([\w$#."]+)\s*(?:\(([^)]*)\))?\s*(VALUES\s*\(|SELECT\s+)',
     re.IGNORECASE,
 )
 
@@ -13576,7 +13620,11 @@ class PostgresBackend:
             # it (#2111). A single statement's only: an array's error offset
             # is the row that failed, and a block's errors are its own.
             if error.error_offset is None and not is_plsql(sql):
-                error.error_offset = _placed_offset(error.ora_code, sql)
+                error.error_offset = (
+                    self._null_offset(sql, error.column)
+                    if isinstance(error, _NullViolation)
+                    else _placed_offset(error.ora_code, sql)
+                )
             raise
 
     def _unique_worded(self, violation: _UniqueViolation) -> BackendError:
@@ -13627,6 +13675,64 @@ class PostgresBackend:
             ora_code=ORA_UNIQUE_CONSTRAINT_VIOLATED,
             error_offset=violation.error_offset,
         )
+
+    def _null_offset(self, sql: str, column: str) -> int | None:
+        # Where 23ai points a NOT NULL violation (#2134): an UPDATE at the
+        # column in its SET, an INSERT at the VALUES item -- or the query's
+        # select item -- that fills the column, by the column list or else the
+        # table's column order, and at 0 when the list leaves the column out.
+        update = _NULL_UPDATE.match(sql)
+        if update is not None:
+            end = len(sql)
+            for item_start, item_end in _top_level_items(sql, update.end(), end):
+                item = sql[item_start:item_end]
+                target = re.match(r'\s*"?([\w$#]+)"?\s*=', item)
+                if target is not None and target.group(1).lower() == column.lower():
+                    return item_start + item.index(target.group(1))
+                if re.search(r'(?i)\bWHERE\b', item):
+                    break
+            return None
+        insert = _NULL_INSERT.match(sql)
+        if insert is None:
+            return None
+        if insert.group(2) is not None:
+            names = [n.strip().strip('"').lower() for n in insert.group(2).split(',')]
+        else:
+            names = self._column_order(insert.group(1))
+        if column.lower() not in names:
+            return 0 if insert.group(2) is not None else None
+        index = names.index(column.lower())
+        if insert.group(3).upper() == 'VALUES':
+            open_at = insert.end() - 1
+            close = _matching_paren(sql, open_at)
+            items = _top_level_items(sql, open_at + 1, close)
+        else:
+            start = insert.end()
+            words, _rownums = _top_level_words(sql[start:])
+            end = next((start + p for p, w in words if w == 'FROM'), len(sql))
+            items = _top_level_items(sql, start, end)
+        if index >= len(items):
+            return None
+        (item_start, item_end) = items[index]
+        return item_start + (
+            len(sql[item_start:item_end]) - len(sql[item_start:item_end].lstrip())
+        )
+
+    def _column_order(self, table: str) -> list[str]:
+        # A table's columns in their order, lower-cased, for placing an
+        # INSERT's error without a column list (#2134); none when unknown.
+        if self._conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
+            return []
+        try:
+            rows = self._catalog_read(
+                'SELECT a.attname FROM pg_attribute a WHERE a.attrelid = '
+                'to_regclass(%s) AND a.attnum > 0 AND NOT a.attisdropped '
+                'ORDER BY a.attnum',
+                (table.lower(),),
+            ).fetchall()
+        except psycopg.Error:
+            return []
+        return [name.lower() for (name,) in rows]
 
     def _missing_named(self, missing: _ObjectMissing) -> BackendError:
         # ORA-00942 as the release presented says it (#2110): 23ai names the
