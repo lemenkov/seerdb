@@ -276,6 +276,50 @@ def test_a_plsql_lob_bind_below_12_1_is_a_plsql_string():
     assert result.out_binds == ['clob var', 'in', b'\x01']
 
 
+def test_serveroutput_below_12_1_is_read_a_line_at_a_time():
+    # sqlplus reads SERVEROUTPUT with DBMS_OUTPUT.GET_LINES into a collection,
+    # which the client cannot bind below 12.1 (#2039), so sqlplus printed
+    # nothing (#2104). The passthrough reads the lines with GET_LINE instead,
+    # up to the count asked for, and hands them back as the collection.
+    from seerdb.common.tns_consts import (
+        FIELD_VERSION_11_2,
+        TNS_TYPE_ADT,
+        TNS_TYPE_NUMBER,
+    )
+    from seerdb.server.backend import BindVar
+
+    class _LinesCursor(_FakeCursor):
+        def __init__(self, lines):
+            super().__init__()
+            self.lines = list(lines)
+            self.calls = 0
+
+        def execute(self, sql, variables):
+            assert sql == 'BEGIN DBMS_OUTPUT.GET_LINE(:1, :2); END;'
+            self.calls += 1
+            (line, status) = variables
+            if self.lines:
+                line.setvalue(0, self.lines.pop(0))
+                status.setvalue(0, 0)
+            else:
+                status.setvalue(0, 1)
+
+    backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
+    backend._conn = type('Conn', (), {'field_version': FIELD_VERSION_11_2})()
+    backend._gettype_by_oid = lambda oid: None
+    binds = [
+        BindVar(value=None, tns_type=TNS_TYPE_ADT, max_size=2000, toid=b'x' * 16),
+        BindVar(value=2, tns_type=TNS_TYPE_NUMBER, max_size=22),
+    ]
+    call = 'BEGIN DBMS_OUTPUT.GET_LINES(:LINES, :NUMLINES); END;'
+    cursor = _LinesCursor(['one', 'two', 'three'])
+    assert backend._execute_plsql(cursor, call, binds).out_binds == [['one', 'two'], 2]
+    assert cursor.calls == 2
+    binds[1] = BindVar(value=5, tns_type=TNS_TYPE_NUMBER, max_size=22)
+    assert backend._execute_plsql(cursor, call, binds).out_binds == [['three'], 1]
+    assert backend._execute_plsql(cursor, call, binds).out_binds == [[], 0]
+
+
 def test_a_lob_bound_into_plain_sql_is_bound_upstream_as_a_lob():
     # A LOB the client bound arrives as a ClobValue / BlobValue (#1067). Bound on
     # as a str it would be a VARCHAR2, which a real server refuses past 32 KB
