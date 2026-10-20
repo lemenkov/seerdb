@@ -1996,6 +1996,51 @@ def test_an_interval_literal_is_oracles() -> None:
         backend.close()
 
 
+# A NUMBER's text as 23ai writes it, for TO_CHAR(n) and in a concatenation
+# (#2146): no leading zero, no trailing ones, 40 characters at most --
+# rounded, else scientific, the mantissa filling the 40.
+_ORACLE_NUMBER_TEXT = (
+    ('1.50', '1.5'),
+    ('0.5', '.5'),
+    ('-0.5', '-.5'),
+    ('-12.340', '-12.34'),
+    ('0', '0'),
+    ('1e21', '1000000000000000000000'),
+    ('1e39', '1000000000000000000000000000000000000000'),
+    ('1e40', '1.0000000000000000000000000000000000E+40'),
+    ('-1e39', '-1.000000000000000000000000000000000E+39'),
+    ('1e125', '1.000000000000000000000000000000000E+125'),
+    ('-1e-130', '-1.00000000000000000000000000000000E-130'),
+    ('1e-39', '.000000000000000000000000000000000000001'),
+    ('1e-40', '1.0000000000000000000000000000000000E-40'),
+    ('1.23456789e-30', '.00000000000000000000000000000123456789'),
+    ('1.23456789e-35', '1.2345678900000000000000000000000000E-35'),
+    (
+        '123456789012345678901234567890123456789012',
+        '1.2345678901234567890123456789012346E+41',
+    ),
+    ('1/3', '.333333333333333333333333333333333333333'),
+    ('-1/3', '-.33333333333333333333333333333333333333'),
+    ('2/3', '.666666666666666666666666666666666666667'),
+)
+
+
+@pytest.mark.parametrize(('expression', 'text'), _ORACLE_NUMBER_TEXT)
+def test_a_number_is_written_out_as_oracle_writes_it(expression, text) -> None:
+    # PostgreSQL's text of a numeric kept its scale and its leading zero and
+    # never went scientific: `1.50 || 'x'` was `1.50x` (#2146).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        assert backend.execute(
+            f"SELECT TO_CHAR({expression}), {expression} || 'x', "
+            f"CONCAT('x', {expression}) FROM dual"
+        ).rows == [(text, text + 'x', 'x' + text)]
+    finally:
+        backend.close()
+
+
 def test_translate_binds_wraps_aware_datetime_as_composite() -> None:
     # An aware datetime bind carries a WITH TIME ZONE value: it becomes a ROW cast
     # with the offset in seconds alongside the instant, so the offset round-trips
@@ -3839,8 +3884,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # sys.ora_json, six sys.ora_json_scalar and sys.ora_json_serialize (#1707),
     # the four BOOLEAN / number comparisons behind = and <> (#1743), and
     # PL/SQL's sys.ora_plsql_pad with its rpad / lpad (#2061), and the three
-    # two-argument concat (#2093), and sys.ora_late's two (#2138).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 101
+    # two-argument concat (#2093), sys.ora_late's two (#2138), and
+    # sys.ora_number_text, sys.ora_text and to_char(numeric) (#2146).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 104
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
