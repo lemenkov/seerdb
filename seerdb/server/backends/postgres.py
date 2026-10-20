@@ -7887,6 +7887,8 @@ def _lob_substr_items(sql: str) -> set[int]:
 _BIND_DESCRIBE_SIZES = (32, 128, 2000, 4000, 8192, 16386)
 # The longest VARCHAR2, which a concatenation describes as at most.
 _VARCHAR_LIMIT = 32767
+# SYS_CONTEXT's width given a length argument, whatever it is (#2109).
+_SYS_CONTEXT_LENGTH_WIDTH = 4000
 
 
 def _bind_describe_size(declared: int) -> int:
@@ -7917,7 +7919,8 @@ def _concat_width(item: str, sizes: dict[str, int]) -> tuple[int, bool]:
 
     Oracle sizes a concatenation as the sum of its operands, `||` and CONCAT
     alike, up to the longest VARCHAR2. A bind in `sizes` counts its describe
-    size, a literal its length in bytes, a parenthesized operand its own.
+    size, a literal its length in bytes, a SYS_CONTEXT call 256 (#2109), a
+    parenthesized operand its own.
     Anything else -- a column, a call -- counts nothing, and the item is not
     complete. An optional alias ends the item."""
     tokens = [span for span in _bind_spans(item) if span[0] not in ('space', 'comment')]
@@ -7956,6 +7959,19 @@ def _concat_width(item: str, sizes: dict[str, int]) -> tuple[int, bool]:
                 if text() == ')':
                     at += 1
                     return first + second, first_complete and second_complete
+        if kind == 'word' and word.upper() == 'SYS_CONTEXT' and text(1) == '(':
+            # VARCHAR2(256), or 4000 given a length, whatever the length is
+            # (#2109). Measured on 23ai and 11g.
+            at += 2
+            (depth, commas) = (0, 0)
+            while at < len(tokens) and not (depth == 0 and text() == ')'):
+                depth += (text() == '(') - (text() == ')')
+                commas += depth == 0 and text() == ','
+                at += 1
+            if text() == ')':
+                at += 1
+                return (_SYS_CONTEXT_LENGTH_WIDTH if commas >= 2 else 256), True
+            return 0, False
         # Something else: past it, up to the next `||`, `,` or `)` outside it.
         depth = 0
         while at < len(tokens) and not (
@@ -15476,15 +15492,19 @@ class PostgresBackend:
             ):
                 columns[i] = replace(columns[i], scale=_NINE_FRACTIONAL_DIGITS)
         sizes = _bind_sizes(original, params) if original and params else {}
-        for i, item in enumerate(_select_list_items(original) if sizes else ()):
-            if (
-                i < len(columns)
-                and columns[i].data_type == TNS_TYPE_VARCHAR
-                and not cursor.description[i].display_size
-                and not cursor.pgresult.ftable(i)
-            ):
+        unsized = [
+            i
+            for i, col in enumerate(columns)
+            if col.data_type == TNS_TYPE_VARCHAR
+            and not cursor.description[i].display_size
+            and not cursor.pgresult.ftable(i)
+        ]
+        items = _select_list_items(original) if original and unsized else []
+        for i, item in enumerate(items):
+            if i in unsized:
                 # An expression over a character bind describes by the bind's
-                # declared size, as Oracle's does, not by the values (#2063).
+                # declared size, as Oracle's does, not by the values (#2063),
+                # and SYS_CONTEXT by its own (#2109).
                 described, complete = _concat_width(item, sizes)
                 if described:
                     if not complete:
