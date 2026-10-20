@@ -14691,6 +14691,18 @@ class PostgresBackend:
             )
             if domain is None and desc.type_code in (25, 17, _INTERVAL_OID):
                 domain = computed.get(i)
+            if (
+                domain is None
+                and desc.type_code == _TIMESTAMP_OID
+                and desc.precision == 0
+                and not cursor.pgresult.ftable(i)
+            ):
+                # A computed timestamp(0) -- SYSDATE, TO_DATE, a DATE literal --
+                # reports the domain's base type, not ora_date, and described
+                # as a TIMESTAMP (#2058). Oracle's DATE is the only thing the
+                # dialect makes a timestamp(0) of; a table's TIMESTAMP(0) column
+                # has its table, and stays a TIMESTAMP.
+                domain = TNS_TYPE_DATE
             if domain == TNS_TYPE_JSON:
                 # An IS JSON FORMAT OSON column (#1706): a BLOB flagged OSON,
                 # its value the document's OSON image, which the client decodes.

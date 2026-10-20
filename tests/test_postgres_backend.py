@@ -7190,6 +7190,32 @@ def test_change_password_refuses_a_password_oracle_would() -> None:
 # --- Bind translation (#516) — a pure function, no live PG needed --------------
 
 
+def test_a_computed_date_describes_as_a_date() -> None:
+    # SYSDATE, TO_DATE and a DATE literal are timestamp(0) values that report
+    # the ora_date domain's base type, and described as a TIMESTAMP; sqlplus
+    # then printed them with NLS_TIMESTAMP_FORMAT (#2058). A table's DATE
+    # column was a DATE already, and its TIMESTAMP(0) column stays a TIMESTAMP.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        computed = backend.execute(
+            "SELECT DATE '2024-05-06' a, TO_DATE('2024-05-06', 'YYYY-MM-DD') b, "
+            "SYSDATE c, DATE '2024-05-06' + 1 d, LOCALTIMESTAMP e FROM dual"
+        )
+        assert [c.data_type for c in computed.columns] == [12, 12, 12, 12, 180]
+        assert computed.rows[0][0] == datetime.datetime(2024, 5, 6)
+        try:
+            backend.execute('CREATE TABLE t_2058 (d DATE, t0 TIMESTAMP(0))')
+            backend.execute('INSERT INTO t_2058 VALUES (SYSDATE, LOCALTIMESTAMP)')
+            stored = backend.execute('SELECT d, t0 FROM t_2058')
+            assert [c.data_type for c in stored.columns] == [12, 180]
+        finally:
+            backend.execute('DROP TABLE t_2058 PURGE')
+    finally:
+        backend.close()
+
+
 def test_a_sql_statement_binds_each_occurrence() -> None:
     # Oracle binds a SQL statement's placeholders by position (#1714): with a
     # value for each occurrence, `:1` twice is two binds. One value a name, or
