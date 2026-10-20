@@ -442,6 +442,57 @@ def test_the_sqlplus_product_profile_is_there_and_empty() -> None:
         backend.close()
 
 
+def test_a_value_too_large_names_its_column_and_points_at_it() -> None:
+    # ORA-12899 carried PostgreSQL's `value too long for type character
+    # varying(3)`, naming no column, at no position (#2137). Oracle's, in every
+    # release, names the column, the value's length in bytes and the column's,
+    # and points at the value -- a bind at its name. Measured on 23ai.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute(
+            'CREATE TABLE t2137 (id NUMBER, n VARCHAR2(3), m VARCHAR2(5), k NUMBER(3))'
+        )
+        try:
+            backend.execute("INSERT INTO t2137 VALUES (1, 'a', 'b', 1)")
+            for statement, binds, column, actual, maximum, offset in (
+                ("insert into t2137 values (2, 'abcd', 'x', 1)", [], 'N', 4, 3, 29),
+                ("insert into t2137 (m, n) values ('toolong', 'a')", [], 'M', 7, 5, 33),
+                ("insert into t2137 values (3, :1, 'x', 1)", ['abcdef'], 'N', 6, 3, 30),
+                ("update t2137 set n = 'abcdef' where id = 1", [], 'N', 6, 3, 21),
+                ("update t2137 set m = 'b', n = :1", ['wxyz'], 'N', 4, 3, 31),
+                ("insert into t2137 values (4, 'é€ab', 'x', 1)", [], 'N', 7, 3, 29),
+                (
+                    "insert into t2137 select 5, 'abcd', 'x', 1 from dual",
+                    [],
+                    'N',
+                    4,
+                    3,
+                    28,
+                ),
+            ):
+                with pytest.raises(BackendError) as raised:
+                    backend.execute(statement, binds)
+                assert (
+                    raised.value.ora_code,
+                    str(raised.value),
+                    raised.value.error_offset,
+                ) == (
+                    12899,
+                    f'value too large for column "PYO"."T2137"."{column}" '
+                    f'(actual: {actual}, maximum: {maximum})',
+                    offset,
+                ), statement
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2137')
+    finally:
+        backend.close()
+
+
 def test_a_unique_violation_is_worded_as_oracle_words_it() -> None:
     # ORA-00001 carried PostgreSQL's `duplicate key value violates unique
     # constraint` and its DETAIL line (#2120). Before 23ai Oracle's names the
