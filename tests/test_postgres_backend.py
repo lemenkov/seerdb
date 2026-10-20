@@ -7856,6 +7856,37 @@ def test_concat_takes_a_bind_and_reads_a_null_as_empty() -> None:
         backend.close()
 
 
+def test_sys_context_describes_as_oracle_sizes_it() -> None:
+    # SYS_CONTEXT(ns, attr) is a VARCHAR2(256), and 4000 given a length,
+    # whatever the length (#2109). It described as its value's width, so
+    # sqlplus cut the column's heading to `SYS`. A concatenation adds it up
+    # as any operand. Measured on 23ai and 11g.
+    from seerdb.server.backends.postgres import _concat_width
+
+    assert _concat_width("sys_context('USERENV','SESSION_USER')", {}) == (256, True)
+    assert _concat_width("SYS_CONTEXT('USERENV', 'SESSION_USER', 10) x", {}) == (
+        4000,
+        True,
+    )
+    assert _concat_width("sys_context('USERENV','SESSION_USER') || 'x'", {}) == (
+        257,
+        True,
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        result = backend.execute(
+            "SELECT sys_context('USERENV','SESSION_USER'), "
+            "sys_context('USERENV','SESSION_USER') || 'x' c FROM dual"
+        )
+        assert result.rows == [('PYO', 'PYOx')]
+        assert [c.data_length for c in result.columns] == [256, 257]
+        assert result.columns[0].name == b"SYS_CONTEXT('USERENV','SESSION_USER')"
+    finally:
+        backend.close()
+
+
 def test_a_concatenation_of_a_bind_describes_by_its_declared_size() -> None:
     # A concatenation over a bind described by its longest value, so sqlplus
     # printed `:w || '!'` under a 4-character heading where Oracle gives 2001
