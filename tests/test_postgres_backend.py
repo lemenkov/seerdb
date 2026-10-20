@@ -384,6 +384,45 @@ def test_lob_substr_items_are_whole_items_only() -> None:
     assert _lob_substr_items('select * from t') == set()
 
 
+def test_all_errors_lists_an_invalid_objects_error() -> None:
+    # sqlplus's SHOW ERRORS reads ALL_ERRORS, which did not exist (#2060). A
+    # CREATE that does not compile lists its error at the line and column
+    # Oracle counts from the object's keyword -- 18c says 1/31 for P2060 and 4/1
+    # for the second, and this name is a character longer -- while
+    # the object stays INVALID; a CREATE that compiles, or a DROP, lists none.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    query = (
+        'SELECT name, type, sequence, line, position, attribute FROM all_errors '
+        "WHERE name LIKE 'P_2060%' ORDER BY name"
+    )
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        assert backend.execute(
+            'CREATE OR REPLACE PROCEDURE p_2060 AS BEGIN NULL END;'
+        ).compilation_warning
+        assert backend.execute(
+            'CREATE OR REPLACE PROCEDURE p_2060b AS\nBEGIN\n  NULL\nEND;'
+        ).compilation_warning
+        assert backend.execute(query).rows == [
+            ('P_2060', 'PROCEDURE', 1, 1, 32, 'ERROR'),
+            ('P_2060B', 'PROCEDURE', 1, 4, 1, 'ERROR'),
+        ]
+        assert backend.execute(
+            "SELECT name, line FROM user_errors WHERE name LIKE 'P_2060%' ORDER BY name"
+        ).rows == [('P_2060', 1), ('P_2060B', 4)]
+        backend.execute('CREATE OR REPLACE PROCEDURE p_2060 AS BEGIN NULL; END;')
+        backend.execute('DROP PROCEDURE p_2060b')
+        assert backend.execute(query).rows == []
+    finally:
+        for name in ('p_2060', 'p_2060b'):
+            try:
+                backend.execute(f'DROP PROCEDURE {name}')
+            except Exception:
+                pass
+        backend.close()
+
+
 def test_iot_primary_key_is_read_from_organization_index_ddl() -> None:
     # Inline and constraint forms; a heap table or an IOT without a recognised
     # key registers nothing.

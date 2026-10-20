@@ -1748,6 +1748,15 @@ _ORACLE_DICTIONARY_DDL = (
     # Whose rights its routines run with, as its spec said (#1945).
     'ALTER TABLE sys.ora_packages ADD COLUMN IF NOT EXISTS authid text NOT NULL '
     "DEFAULT 'DEFINER';"
+    # The compile errors of the objects a CREATE left INVALID (#2060), which
+    # ALL_ERRORS lists while the object stays INVALID: one row each, at the
+    # line and column of the source it names, from the object's keyword on.
+    'CREATE TABLE IF NOT EXISTS sys.ora_errors ('
+    'owner text NOT NULL, name text NOT NULL, type text NOT NULL, '
+    'sequence integer NOT NULL, line integer NOT NULL, position integer NOT NULL, '
+    "text text NOT NULL, attribute text NOT NULL DEFAULT 'ERROR', "
+    'message_number integer NOT NULL DEFAULT 0, '
+    'PRIMARY KEY (owner, name, type, sequence));'
     # The types a package declares (#1607), each a PostgreSQL type of its
     # schema, with the PL/SQL it was declared as -- what the dictionary and a
     # client's type metadata report -- in declaration order. A body's own types
@@ -2122,6 +2131,18 @@ _ORACLE_DICTIONARY_DDL = (
     # their PostgreSQL names; this one is the current schema's, Oracle's way.
     'CREATE OR REPLACE VIEW sys.user_objects AS SELECT * FROM all_objects '
     'WHERE owner=upper(current_schema());'
+    # ALL_ERRORS, USER_ERRORS and DBA_ERRORS (#2060): an object's errors while
+    # it is INVALID, so a CREATE that compiles, or a DROP, leaves none; what
+    # sqlplus's SHOW ERRORS reads.
+    'CREATE OR REPLACE VIEW sys.all_errors AS SELECT e.owner, e.name, e.type, '
+    'e.sequence, e.line, e.position, e.text, e.attribute, e.message_number '
+    'FROM sys.ora_errors e WHERE EXISTS (SELECT 1 FROM all_objects o '
+    'WHERE o.owner = e.owner AND o.object_name = e.name '
+    "AND o.object_type = e.type AND o.status = 'INVALID');"
+    'CREATE OR REPLACE VIEW sys.dba_errors AS SELECT * FROM sys.all_errors;'
+    'CREATE OR REPLACE VIEW sys.user_errors AS SELECT name, type, sequence, '
+    'line, position, text, attribute, message_number FROM sys.all_errors '
+    'WHERE owner = upper(current_schema());'
     # A package and the routines its spec declares, overloads numbered in the
     # order the spec gives them (#1605), and a user's valid standalone routine,
     # under its own name with no procedure name (#1606).
@@ -2596,6 +2617,8 @@ def _record_owner_tests() -> dict[str, str | None]:
         'ora_collection_elements': owner('pg_type', 'typowner', 'oid', '{t}.typid'),
         'ora_packages': owner('pg_namespace', 'nspowner', 'nspname', '{t}.name'),
         'ora_plsql_types': owner('pg_namespace', 'nspowner', 'nspname', '{t}.package'),
+        # An object's compile errors, its schema owner's (#2060).
+        'ora_errors': owner('pg_namespace', 'nspowner', 'nspname', 'lower({t}.owner)'),
         'ora_grants': grants,
         # A column's, the same (#1946).
         'ora_col_grants': grants,
@@ -8700,6 +8723,46 @@ def _guarded_body(block: str) -> str:
     )
 
 
+# The object keyword a CREATE's source starts at, which Oracle counts the
+# lines of its errors from (#2060).
+_SOURCE_START = re.compile(
+    r'(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:NON)?EDITIONABLE\s+)?'
+)
+# A PL/SQL compile error the backend wrote as Oracle does (#1497).
+_PLS_PLACE = re.compile(r'line (\d+), column (\d+):\n(PLS-(\d+): .*)', re.DOTALL)
+
+
+def _compile_error_place(
+    sql: str, kind: str, error: BackendError
+) -> tuple[int, int, str, int]:
+    # (line, position, text, message number) of a compile error, as ALL_ERRORS
+    # lists it (#2060): line 1 is the line the object's keyword is on and the
+    # position is 1-based. The backend's own PLS form says where; PostgreSQL's
+    # syntax error names the token it stopped at, found in the source after
+    # the header. Anything else is placed at 1/1.
+    message = str(error)
+    pls = _PLS_PLACE.match(message)
+    if pls is not None:
+        return (int(pls.group(1)), int(pls.group(2)), pls.group(3), int(pls.group(4)))
+    text = message.split('\n', 1)[0]
+    head = _SOURCE_START.match(sql)
+    source = sql[head.end() if head else 0 :]
+    near = _NEAR_TOKEN.search(message)
+    at = -1
+    if near is not None:
+        body = re.search(r'(?i)\b(?:AS|IS)\b', source)
+        start = body.end() if body else 0
+        found = re.search(
+            rf'(?i)(?<![\w$#]){re.escape(near.group(1))}(?![\w$#])', source[start:]
+        )
+        at = start + found.start() if found else -1
+    if at < 0:
+        return (1, 1, text, 0)
+    line = source.count('\n', 0, at) + 1
+    position = at - (source.rfind('\n', 0, at) + 1) + 1
+    return (line, position, text, 0)
+
+
 def _routine_mark(name: str, status: str) -> str:
     # The statement that marks every routine of `name` -- one, as the routine
     # DDL drops it by name first -- as a user's, VALID or INVALID (#1606).
@@ -13502,6 +13565,33 @@ class PostgresBackend:
             self._release_read_locks()
         return result
 
+    def _record_compile_error(
+        self, sql: str, owner: str | None, name: str, kind: str, error: BackendError
+    ) -> None:
+        # The error ALL_ERRORS lists for the object (#2060), in place of any it
+        # had: where it is in the source, from the object's keyword on, as
+        # Oracle counts, and its text.
+        (line, position, text, number) = _compile_error_place(sql, kind, error)
+        owner_sql = '%s' if owner else 'sys.ora_owner(current_schema())'
+        params: list = [owner.upper()] if owner else []
+        self._conn.execute(
+            f'DELETE FROM sys.ora_errors WHERE owner = {owner_sql} AND name = %s '
+            'AND type = %s',
+            (*params, name, kind),
+        )
+        # Rows of objects no longer INVALID, dropped or recompiled, go too.
+        self._conn.execute(
+            'DELETE FROM sys.ora_errors e WHERE NOT EXISTS (SELECT 1 FROM '
+            'all_objects o WHERE o.owner = e.owner AND o.object_name = e.name '
+            "AND o.object_type = e.type AND o.status = 'INVALID')"
+        )
+        self._conn.execute(
+            'INSERT INTO sys.ora_errors (owner, name, type, sequence, line, '
+            f'position, text, message_number) VALUES ({owner_sql}, %s, %s, 1, %s, '
+            '%s, %s, %s)',
+            (*params, name, kind, line, position, text, number),
+        )
+
     def _create_invalid(self, sql: str, error: BackendError) -> Result | None:
         # A CREATE PROCEDURE / FUNCTION / TYPE that does not compile SUCCEEDS in
         # Oracle: the object exists, INVALID, and the reply says so with the
@@ -13514,7 +13604,7 @@ class PostgresBackend:
             return None
         package = _PACKAGE_HEAD.match(sql)
         if package is not None:
-            return self._create_invalid_package(package)
+            return self._create_invalid_package(package, sql, error)
         routine = _ROUTINE_HEAD.match(sql)
         type_ = _INVALID_TYPE_DDL.match(sql) if routine is None else None
         if routine is not None:
@@ -13539,12 +13629,26 @@ class PostgresBackend:
             return None
         try:
             self._conn.execute(stub)
+            (schema, _dot, bare) = (
+                (routine.group(2) if routine is not None else name)
+                .upper()
+                .rpartition('.')
+            )
+            self._record_compile_error(
+                sql,
+                schema or None,
+                bare,
+                routine.group(1).upper() if routine is not None else 'TYPE',
+                error,
+            )
         except psycopg.Error:
             self._conn.rollback()
             return None
         return Result(compilation_warning=True)
 
-    def _create_invalid_package(self, head: re.Match) -> Result | None:
+    def _create_invalid_package(
+        self, head: re.Match, sql: str, error: BackendError
+    ) -> Result | None:
         # A package spec or body that does not compile (#1605). A body that does
         # not leaves the spec's stand-ins, which now raise ORA-04063; a spec
         # leaves its schema empty, the package INVALID, so a call finds nothing.
@@ -13571,6 +13675,13 @@ class PostgresBackend:
             )
         try:
             self._conn.execute(stub)
+            self._record_compile_error(
+                sql,
+                owner,
+                name.upper(),
+                'PACKAGE BODY' if body else 'PACKAGE',
+                error,
+            )
         except psycopg.Error:
             self._conn.rollback()
             return None
