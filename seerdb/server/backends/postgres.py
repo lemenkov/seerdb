@@ -11004,6 +11004,27 @@ class _NullViolation(BackendError):
             )
 
 
+# A number PostgreSQL could not read: its message quotes the value (#2136).
+_INVALID_NUMBER = re.compile(
+    r'invalid input syntax for type '
+    r'(?:numeric|integer|bigint|smallint|double precision|real): "(.*)"$',
+    re.DOTALL,
+)
+# What a number's text may hold, the rest being what 23ai's ORA-01722 names.
+_NUMBER_CHARACTERS = frozenset('0123456789.+-eE')
+
+
+class _InvalidNumber(BackendError):
+    # ORA-01722 with the value PostgreSQL could not read, for 23ai's wording
+    # (#2136), which names the first character that cannot be in a number and
+    # gives the value on an ORA-03302 line. Before 23ai the text is this one.
+    def __init__(self, value: str, error_offset: int | None) -> None:
+        super().__init__(
+            'invalid number', ora_code=ORA_INVALID_NUMBER, error_offset=error_offset
+        )
+        self.value = value
+
+
 class _ObjectMissing(BackendError):
     # ORA-00942 with the table or view PostgreSQL could not find, for 23ai's
     # wording, which names it (#2110): `table or view "PYO"."T" does not
@@ -11093,6 +11114,14 @@ def _backend_error(
             exc.diag,
             original is not None and _UPDATE_STATEMENT.match(original) is not None,
         )
+    number = _INVALID_NUMBER.match(_primary_message(exc))
+    if code == ORA_INVALID_NUMBER and number is not None:
+        value = number.group(1)
+        if offset is None and original is not None:
+            # A literal's own place, as 23ai points TO_NUMBER('x') (#2126).
+            quoted = original.find("'" + value.replace("'", "''") + "'")
+            offset = quoted if quoted >= 0 else None
+        return _InvalidNumber(value, offset)
     missing = _MISSING_RELATION.match(_primary_message(exc))
     if code == ORA_TABLE_OR_VIEW_DOES_NOT_EXIST and missing is not None:
         return _ObjectMissing(missing.group(1), offset)
@@ -11909,12 +11938,14 @@ def _while_connected(method):
         self._conn.end_own_transaction()
         try:
             return method(self, *args, **kwargs)
-        except (_ObjectMissing, _UniqueViolation) as error:
+        except (_ObjectMissing, _UniqueViolation, _InvalidNumber) as error:
             if self._conn.closed:
                 raise _session_terminated() from None
             worded = (
                 self._missing_named(error)
                 if isinstance(error, _ObjectMissing)
+                else self._number_worded(error)
+                if isinstance(error, _InvalidNumber)
                 else self._unique_worded(error)
             )
             if worded is error:
@@ -13694,6 +13725,21 @@ class PostgresBackend:
                     else _placed_offset(error.ora_code, sql)
                 )
             raise
+
+    def _number_worded(self, invalid: _InvalidNumber) -> BackendError:
+        # ORA-01722 as 23ai says it (#2136): the first character that cannot
+        # be in a number, then the value on an ORA-03302 line -- `'12z'` names
+        # 'z', `'1,5'` names ','. Before 23ai, `invalid number`.
+        if self._release < (23, 0):
+            return invalid
+        value = invalid.value
+        bad = next((c for c in value if c not in _NUMBER_CHARACTERS), ' ')
+        return BackendError(
+            f"unable to convert string value containing '{bad}' to a number: \n"
+            + f'ORA-03302: (ORA-01722 details) invalid string value: {value}'.rstrip(),
+            ora_code=ORA_INVALID_NUMBER,
+            error_offset=invalid.error_offset,
+        )
 
     def _unique_worded(self, violation: _UniqueViolation) -> BackendError:
         # ORA-00001 as 23ai says it (#2120): the table and columns, then the
