@@ -1573,6 +1573,14 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN 'client_info' THEN "
     "nullif(current_setting('seerdb.client_info', true), '') "
     'ELSE NULL END END $$;'
+    # SYS_CONTEXT(namespace, attribute, length) (#2116): the value cut to the
+    # length, from 1 to 4000; another length is the whole value, a NULL one
+    # NULL. Measured on 23ai.
+    'CREATE OR REPLACE FUNCTION sys.sys_context(text, text, numeric) '
+    'RETURNS text LANGUAGE sql STABLE AS $$ SELECT CASE WHEN $3 IS NULL THEN NULL '
+    'WHEN trunc($3) BETWEEN 1 AND 4000 THEN '
+    'substr(sys.sys_context($1, $2), 1, trunc($3)::integer) '
+    'ELSE sys.sys_context($1, $2) END $$;'
     # XS_SYS_CONTEXT(namespace, attribute): the Real Application Security
     # context, which sqlplus reads in its login query, `DECODE(USER, 'XS$NULL',
     # XS_SYS_CONTEXT('XS$SESSION', 'USERNAME'), USER) FROM SYS.DUAL`. A session
