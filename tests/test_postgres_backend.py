@@ -3930,6 +3930,45 @@ def test_a_query_failing_as_it_is_prepared_leaves_no_stale_statement() -> None:
         backend.close()
 
 
+def test_a_select_into_as_the_first_statement_keeps_its_savepoint() -> None:
+    # A session's first statement a SELECT ... INTO :b (#2103): the query's
+    # catalog reads ran in autocommit with the call's savepoint waiting, which
+    # went with them and met no transaction. sqlplus lost its session
+    # (ORA-03113), a thin client got ORA-00600. The savepoint now waits for the
+    # query itself, against DUAL and against a table alike.
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+    from seerdb.server.backend import BindVar
+
+    def session() -> PostgresBackend:
+        backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+        backend.authenticate('PYO')
+        backend.open_session({})
+        return backend
+
+    setup = session()
+    try:
+        setup.execute('CREATE TABLE t_into2103 (n NUMBER)')
+        setup.execute('INSERT INTO t_into2103 VALUES (7)')
+        setup.commit()
+        got = []
+        for block in (
+            'begin select count(*) into :1 from dual; end;',
+            'begin select n into :1 from t_into2103; end;',
+        ):
+            backend = session()
+            try:
+                result = backend.execute(block, [BindVar(None, TNS_TYPE_NUMBER, 22)])
+                got.append(result.out_binds[0])
+                assert backend.execute('SELECT 1 FROM dual').rows == [(1,)]
+            finally:
+                backend.close()
+        assert got == [1, 7]
+    finally:
+        setup.rollback()
+        setup.execute('DROP TABLE t_into2103')
+        setup.close()
+
+
 def test_a_call_right_after_a_commit_keeps_its_savepoint() -> None:
     # A PL/SQL call's savepoint rides with its first statement (#1875). With
     # no transaction open that statement may be a query, which must still run
