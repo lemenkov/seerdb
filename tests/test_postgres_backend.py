@@ -3491,8 +3491,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # sys.ora_rr_year (#1638), sys.ora_plsql_call and sys.ora_ndf_to_null
     # (#1612), ora_boolean_number (#1705), the SQL/JSON helpers: the two
     # sys.ora_json, six sys.ora_json_scalar and sys.ora_json_serialize (#1707),
-    # and the four BOOLEAN / number comparisons behind = and <> (#1743).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 93
+    # the four BOOLEAN / number comparisons behind = and <> (#1743), and
+    # PL/SQL's sys.ora_plsql_pad with its rpad / lpad (#2061).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 96
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
@@ -7886,6 +7887,43 @@ def test_accounts_in_an_auth_database_are_out_of_sql_reach() -> None:
         for role in ('mirror_auth879', 'mirror_plain879'):
             admin.execute(f'DROP ROLE IF EXISTS {role}')
         admin.close()
+
+
+def test_plsql_pads_run_to_32767_and_sqls_stop_at_4000() -> None:
+    # RPAD / LPAD stopped at 4000 characters in PL/SQL too, orafce's SQL limit
+    # (#2061). Measured on 18c: 5000 in a PL/SQL assignment, ORA-06502 past
+    # 32767, and 4000 in SQL.
+    from seerdb.server.backend import BackendError, BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+
+    def out(block: str, tns_type: int = 1):
+        result = backend.execute(
+            block, [BindVar(value=None, tns_type=tns_type, max_size=32767)]
+        )
+        return result.out_binds[0]
+
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        assert len(out("BEGIN :v := RPAD('x', 5000, 'y'); END;")) == 5000
+        assert len(out("BEGIN :v := lpad('x', 5000) || 'z'; END;")) == 5001
+        assert (
+            out(
+                'DECLARE s VARCHAR2(32767); BEGIN '
+                "s := RPAD('x', 6000, 'y'); :v := LENGTH(s); END;",
+                2,
+            )
+            == 6000
+        )
+        with pytest.raises(BackendError) as raised:
+            out("BEGIN :v := RPAD('x', 40000, 'y'); END;")
+        assert raised.value.ora_code == 6502
+        assert backend.execute(
+            "SELECT LENGTH(RPAD('x', 5000, 'y')), 'rpad(' FROM dual"
+        ).rows == [(4000, 'rpad(')]
+    finally:
+        backend.close()
 
 
 def test_the_presented_release_is_per_backend() -> None:
