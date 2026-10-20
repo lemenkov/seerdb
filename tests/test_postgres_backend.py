@@ -7279,6 +7279,41 @@ def test_a_computed_date_describes_as_a_date() -> None:
         backend.close()
 
 
+def test_a_timestamp_literal_and_its_calls_describe_nine_digits() -> None:
+    # Oracle describes a TIMESTAMP literal, TO_TIMESTAMP, TO_TIMESTAMP_TZ and
+    # FROM_TZ with nine fractional digits, and SYSTIMESTAMP, LOCALTIMESTAMP and
+    # a bare CAST with six; PostgreSQL keeps six at most, and every one
+    # described with six, so sqlplus printed `.500000` for `.500000000`
+    # (#2062). Measured against 23ai.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        result = backend.execute(
+            "SELECT TIMESTAMP '2024-01-02 03:04:05.5' a, "
+            "TIMESTAMP '2024-01-02 03:04:05.5 -05:30' AS b, "
+            "TO_TIMESTAMP('2024', 'YYYY') c, "
+            "FROM_TZ(TIMESTAMP '2024-01-02 03:04:05', '+01:00') d, "
+            'SYSTIMESTAMP e, LOCALTIMESTAMP f, CAST(SYSDATE AS TIMESTAMP(3)) g '
+            'FROM dual'
+        )
+        assert [c.scale for c in result.columns] == [9, 9, 9, 9, 6, 6, 3]
+    finally:
+        backend.close()
+
+
+def test_nine_digit_items_are_whole_items_only() -> None:
+    # A literal or call inside an expression is not the item; `*` expands.
+    from seerdb.server.backends.postgres import _nine_digit_items
+
+    assert _nine_digit_items(
+        "select to_timestamp_tz(x, 'f') z, to_timestamp(x) + 1, y from t"
+    ) == {0}
+    assert _nine_digit_items("select timestamp '2024-01-02' from dual") == {0}
+    assert _nine_digit_items("select *, timestamp '2024-01-02' from t") == set()
+    assert _nine_digit_items('update t set x = 1') == set()
+
+
 def test_a_sql_statement_binds_each_occurrence() -> None:
     # Oracle binds a SQL statement's placeholders by position (#1714): with a
     # value for each occurrence, `:1` twice is two binds. One value a name, or
