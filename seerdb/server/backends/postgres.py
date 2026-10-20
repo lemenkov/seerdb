@@ -1006,6 +1006,16 @@ _HELPER_FUNCTIONS_DDL = (
     'CREATE OPERATOR || (LEFTARG = anynonarray, RIGHTARG = text, '
     'FUNCTION = ora_concat); '
     'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
+    # CONCAT(a, b) is || by name (#2093). PostgreSQL's concat is variadic
+    # "any", which a bind's untyped parameter cannot resolve to (ORA-00900),
+    # and which reads CONCAT(NULL, NULL) as ''. These two-argument forms come
+    # first and are Oracle's.
+    'CREATE OR REPLACE FUNCTION concat(text, text) RETURNS text '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT ora_concat($1, $2) $$;'
+    'CREATE OR REPLACE FUNCTION concat(text, anynonarray) RETURNS text '
+    'LANGUAGE sql STABLE AS $$ SELECT ora_concat($1, $2::text) $$;'
+    'CREATE OR REPLACE FUNCTION concat(anynonarray, text) RETURNS text '
+    'LANGUAGE sql STABLE AS $$ SELECT ora_concat($1::text, $2) $$;'
     # A quotient as Oracle's NUMBER holds it (#1598): 20 base-100 digits, the
     # pairs aligned on the decimal point, rounded half away from zero -- 40
     # significant decimal digits for 1/3, 39 for 10/7 -- where PostgreSQL keeps
