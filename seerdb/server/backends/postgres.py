@@ -10470,11 +10470,47 @@ def _backend_error(
     denied = _DENIED_RELATION.match(_primary_message(exc))
     if code == ORA_INSUFFICIENT_PRIVILEGES and denied is not None:
         return _PrivilegeDenied(denied.group(1))
+    offset = _missing_object_offset(exc, original)
+    if offset is None:
+        offset = _error_offset(exc, original, translated)
     return BackendError(
         _ORA_MESSAGE.get(code, str(exc).strip()),
         ora_code=code,
-        error_offset=_error_offset(exc, original, translated),
+        error_offset=offset,
     )
+
+
+# PostgreSQL naming the object a statement refers to that is not there.
+_MISSING_OBJECT = re.compile(
+    r'(?:relation|table|view|sequence) "([^"]+)" does not exist'
+)
+_DROP_VIEW = re.compile(r'\s*DROP\s+VIEW\b', re.IGNORECASE)
+
+
+def _missing_object_offset(exc, original: str | None) -> int | None:
+    # Where Oracle points for an object that is not there: at its name, past
+    # any schema -- 11 in `drop table nosuch purge`, 18 in `select * from
+    # pyo.nosuch` -- and at 0 for a DROP VIEW, as 18c and 23ai do. PostgreSQL
+    # gives no position for a DROP, and for a qualified name the schema's; the
+    # caret sqlplus drew from that was off (#2021). None when the name is not
+    # found in the statement the client sent.
+    named = _MISSING_OBJECT.fullmatch(_primary_message(exc))
+    if named is None or original is None:
+        return None
+    if _DROP_VIEW.match(original):
+        return 0
+    name = named.group(1).rsplit('.', 1)[-1]
+    tokens = list(sql_tokens(original))
+    for index, token in enumerate(tokens):
+        text = original[token.start : token.end]
+        if token.kind == 'identifier':
+            matches = text[1:-1] == name or text[1:-1].lower() == name
+        else:
+            matches = token.kind == 'word' and text.lower() == name.lower()
+        after = tokens[index + 1] if index + 1 < len(tokens) else None
+        if matches and not (after and original[after.start : after.end] == '.'):
+            return token.start
+    return None
 
 
 def _error_offset(exc, original: str | None, translated: str | None) -> int | None:
