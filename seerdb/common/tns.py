@@ -3949,12 +3949,13 @@ def is_version_call_oci(payload: bytes) -> bool:
     )
 
 
-def encode_version_banner_oci(banner: bytes) -> bytes:
+def encode_version_banner_oci(banner: bytes, release: int = VERSION_11_2_0_2) -> bytes:
     """Build the sqlplus / thick-OCI version reply — the server's banner (#265).
 
     Returns the TTC payload from the TTI_RPA token: the banner as a DALC value
     (ub2 count + single ub1 chunk, since the banner is well under 254 bytes) and
-    the fixed packed-version trailer.
+    the trailer: the packed ``release``, which sqlplus prints for SHOW RELEASE
+    (#2024), and the capability word.
     """
     return (
         bytes([TTI_RPA])
@@ -3962,7 +3963,7 @@ def encode_version_banner_oci(banner: bytes) -> bytes:
         + bytes([len(banner)])
         + banner
         + b'\x00'  # DALC terminator
-        + _OCI_VERSION_TRAILER
+        + _oci_version_trailer(release)
     )
 
 
@@ -7901,19 +7902,13 @@ _DTY_8I = _DTY_8I_HEADER + encode_dty_table(_DTY_8I_ENTRIES)
 _OCI_VERSION_CAPS = bytes.fromhex('09010000000300')
 
 
-def _oci_version_trailer(
-    major: int, minor: int, component: int, patchset: int
-) -> bytes:
+def _oci_version_trailer(release: int) -> bytes:
     """The packed-version + capability trailer sqlplus reads after the banner.
-    The version is the low three bytes of Oracle's packed version word in
-    little-endian order — patchset, ``(minor << 4) | component``, major — then
-    the capability word. Confirmed live: 10.2.0.5 → ``05 20 0a``, 11.2.0.2 →
-    ``02 20 0b``, 21.0.0.0 → ``00 00 15``."""
-    packed = (major << 24) | (minor << 20) | (component << 12) | (patchset << 8)
-    return packed.to_bytes(4, 'big')[:3][::-1] + _OCI_VERSION_CAPS
-
-
-_OCI_VERSION_TRAILER = _oci_version_trailer(11, 2, 0, 2)  # XE 11.2.0.2.0
+    The version is the high three bytes of Oracle's packed version word in
+    little-endian order, then the capability word. Confirmed live: 10.2.0.5 →
+    ``05 20 0a``, 11.2.0.2 → ``02 20 0b``, and in the 18c layout 18.4.0.0 →
+    ``00 04 12``, 23.26.2.0 → ``20 1a 17`` (#2024)."""
+    return release.to_bytes(4, 'big')[:3][::-1] + _OCI_VERSION_CAPS
 
 
 # A 3-byte marker in the describe-column trailer. Load-bearing by position — the
