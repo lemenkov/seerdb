@@ -5281,6 +5281,7 @@ _ORA_DUPLICATE_PRIVILEGE = 1711
 _ORA_UNKNOWN_GRANTEE = 1917
 _ORA_NOT_GRANTED_BY_YOU = 1927
 _ORA_SEQUENCE_PRIVILEGE = 2205
+_ORA_SEQUENCE_DOES_NOT_EXIST = 2289
 _ORA_TABLE_PRIVILEGE = 2224
 _ORA_EXECUTABLE_PRIVILEGE = 2225
 # 23ai's error for a privilege missing on an object one holds another on;
@@ -10235,6 +10236,7 @@ _ORA_MESSAGE = {
     ORA_TOO_MANY_VALUES: 'too many values',
     ORA_INVALID_DATATYPE: 'invalid datatype',
     ORA_TABLE_OR_VIEW_DOES_NOT_EXIST: 'table or view does not exist',
+    _ORA_SEQUENCE_DOES_NOT_EXIST: 'sequence does not exist',
     ORA_INSUFFICIENT_PRIVILEGES: 'insufficient privileges',
     ORA_NOT_ENOUGH_VALUES: 'not enough values',
     ORA_NO_DATA_FOUND: 'no data found',
@@ -10434,6 +10436,8 @@ def _backend_error(
         if compile_error is not None:
             return compile_error
     code = _ora_code_for(exc)
+    if code == ORA_TABLE_OR_VIEW_DOES_NOT_EXIST and _names_a_sequence(exc, original):
+        code = _ORA_SEQUENCE_DOES_NOT_EXIST
     if (
         getattr(exc, 'sqlstate', None) == '2BP01'
         and original is not None
@@ -10484,7 +10488,39 @@ def _backend_error(
 _MISSING_OBJECT = re.compile(
     r'(?:relation|table|view|sequence) "([^"]+)" does not exist'
 )
-_DROP_VIEW = re.compile(r'\s*DROP\s+VIEW\b', re.IGNORECASE)
+# The statements 18c reports a missing object of at offset 0.
+_AT_START_ON_MISSING = re.compile(
+    r'\s*(?:DROP\s+VIEW|ALTER\s+SEQUENCE)\b', re.IGNORECASE
+)
+_SEQUENCE_STATEMENT = re.compile(r'\s*(?:ALTER|DROP)\s+SEQUENCE\b', re.IGNORECASE)
+_SEQUENCE_PSEUDO_COLUMNS = ('NEXTVAL', 'CURRVAL')
+
+
+def _names_a_sequence(exc, original: str | None) -> bool:
+    # Whether the missing relation is a sequence, which Oracle reports as
+    # ORA-02289 where PostgreSQL's 42P01 maps to ORA-00942 for every relation
+    # (#2073): one a DROP SEQUENCE names, an ALTER SEQUENCE, or one read for
+    # its NEXTVAL / CURRVAL.
+    message = _primary_message(exc)
+    if message.startswith('sequence "'):
+        return True
+    if original is None:
+        return False
+    if _SEQUENCE_STATEMENT.match(original):
+        return True
+    named = _MISSING_OBJECT.fullmatch(message)
+    if named is None:
+        return False
+    name = named.group(1).rsplit('.', 1)[-1]
+    pseudo = '|'.join(_SEQUENCE_PSEUDO_COLUMNS)
+    return (
+        re.search(
+            rf'(?<![\w$#]){re.escape(name)}"?\s*\.\s*(?:{pseudo})\b',
+            original,
+            re.IGNORECASE,
+        )
+        is not None
+    )
 
 
 def _missing_object_offset(exc, original: str | None) -> int | None:
@@ -10497,7 +10533,7 @@ def _missing_object_offset(exc, original: str | None) -> int | None:
     named = _MISSING_OBJECT.fullmatch(_primary_message(exc))
     if named is None or original is None:
         return None
-    if _DROP_VIEW.match(original):
+    if _AT_START_ON_MISSING.match(original):
         return 0
     name = named.group(1).rsplit('.', 1)[-1]
     tokens = list(sql_tokens(original))
@@ -10507,8 +10543,20 @@ def _missing_object_offset(exc, original: str | None) -> int | None:
             matches = text[1:-1] == name or text[1:-1].lower() == name
         else:
             matches = token.kind == 'word' and text.lower() == name.lower()
+        # A name followed by a dot is a schema, unless what follows is a
+        # sequence's NEXTVAL / CURRVAL (#2073).
         after = tokens[index + 1] if index + 1 < len(tokens) else None
-        if matches and not (after and original[after.start : after.end] == '.'):
+        beyond = tokens[index + 2] if index + 2 < len(tokens) else None
+        qualifies = (
+            after is not None
+            and original[after.start : after.end] == '.'
+            and not (
+                beyond is not None
+                and original[beyond.start : beyond.end].upper()
+                in _SEQUENCE_PSEUDO_COLUMNS
+            )
+        )
+        if matches and not qualifies:
             return token.start
     return None
 
