@@ -154,6 +154,38 @@ def test_backend_error_uses_oracle_canonical_text_for_mapped_code() -> None:
 # --- DDL type translation (#500) — a pure function, no live PostgreSQL needed ---
 
 
+@pytest.mark.parametrize(
+    ('sql', 'offset'),
+    [
+        ('update dual set dummy = dummy where 1 = 0', 7),
+        ("update sys.dual set dummy = 'Y'", 11),
+        ('delete from dual where 1 = 0', 12),
+        ('delete dual where 1 = 0', 7),
+        ("insert into dual values ('Y')", 12),
+        (
+            'merge into dual d using (select 1 x from dual) s on (1 = 0) '
+            "when not matched then insert values ('Y')",
+            11,
+        ),
+    ],
+)
+def test_dml_on_dual_is_refused_as_oracle_refuses_it(sql: str, offset: int) -> None:
+    # It failed on the tableoid the DML rewrite reads back, DUAL being a view
+    # here; 18c answers a user ORA-01031 at DUAL's name (#2084).
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        with pytest.raises(BackendError) as raised:
+            backend.execute(sql)
+        assert (raised.value.ora_code, raised.value.error_offset) == (1031, offset)
+        assert backend.execute('SELECT dummy FROM dual').rows == [('X',)]
+    finally:
+        backend.close()
+
+
 def test_backend_error_relays_the_parse_position_as_the_offset() -> None:
     # PostgreSQL's 1-based statement_position becomes Oracle's 0-based offset, but
     # only where the dialect rewrite left the prefix before the error untouched.

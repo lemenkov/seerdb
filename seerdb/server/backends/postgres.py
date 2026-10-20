@@ -11222,6 +11222,26 @@ _PG_HINT = re.compile(
 )
 
 
+# DML on DUAL, which Oracle refuses a user other than SYS (#2084).
+_DML_ON_DUAL = re.compile(
+    r'(?is)\s*(?:UPDATE|DELETE(?:\s+FROM)?|INSERT\s+INTO|MERGE\s+INTO)\s+'
+    r'(?:SYS\s*\.\s*)?(DUAL)\b'
+)
+
+
+def _refuse_dml_on_dual(sql: str) -> None:
+    # An UPDATE, DELETE, INSERT or MERGE of DUAL: ORA-01031 at its name, as 18c
+    # answers a user. DUAL is a view here, and the statement failed on the
+    # ROWID the DML rewrite reads back, ORA-00904 for tableoid.
+    dual = _DML_ON_DUAL.match(sql)
+    if dual is not None:
+        raise BackendError(
+            'insufficient privileges',
+            ora_code=ORA_INSUFFICIENT_PRIVILEGES,
+            error_offset=dual.start(1),
+        )
+
+
 def _strip_leading_comments(sql: str) -> str:
     return _LEADING_COMMENTS.sub('', sql, count=1)
 
@@ -13412,6 +13432,7 @@ class PostgresBackend:
     def _execute_stripped(self, sql: str, binds: Sequence, native: bool) -> Result:
         # The statement past its leading whitespace and comments.
         _refuse_reserved_bind_names(sql)
+        _refuse_dml_on_dual(sql)
         transaction_control = self._execute_transaction_control(sql)
         if transaction_control is not None:
             return transaction_control
