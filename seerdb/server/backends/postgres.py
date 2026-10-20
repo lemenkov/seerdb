@@ -11286,6 +11286,46 @@ def _late_constants(sql: str) -> str | None:
     return ''.join(out)
 
 
+# PostgreSQL's length check, which names the length only (#2137).
+_VALUE_TOO_LONG = re.compile(r'value too long for type character(?: varying)?\((\d+)\)')
+_UPDATE_TABLE = re.compile(r'\s*UPDATE\s+([\w$#."]+)', re.IGNORECASE)
+
+
+def _assigned_values(sql: str) -> tuple[str, list[tuple[str | None, int, int]]] | None:
+    """The table a statement writes and the values it assigns, each with its
+    column -- None for an INSERT's without a column list, which the table's
+    order gives -- and its span (#2137): an UPDATE's SET items, an INSERT's
+    VALUES or its query's select items. None for any other statement."""
+    update = _NULL_UPDATE.match(sql)
+    if update is not None:
+        table = _UPDATE_TABLE.match(sql)
+        where = re.search(r'(?i)\bWHERE\b', sql[update.end() :])
+        end = update.end() + where.start() if where else len(sql)
+        out: list[tuple[str | None, int, int]] = []
+        for item_start, item_end in _top_level_items(sql, update.end(), end):
+            target = re.match(r'\s*"?([\w$#]+)"?\s*=', sql[item_start:item_end])
+            if target is not None:
+                out.append((target.group(1), item_start + target.end(), item_end))
+        return (table.group(1) if table else '', out)
+    insert = _NULL_INSERT.match(sql)
+    if insert is None:
+        return None
+    if insert.group(3).upper().startswith('VALUES'):
+        open_at = insert.end() - 1
+        items = _top_level_items(sql, open_at + 1, _matching_paren(sql, open_at))
+    else:
+        start = insert.end()
+        words, _rownums = _top_level_words(sql[start:])
+        end = next((start + p for p, w in words if w == 'FROM'), len(sql))
+        items = _top_level_items(sql, start, end)
+    columns: list[str | None] = (
+        [n.strip().strip('"') for n in insert.group(2).split(',')]
+        if insert.group(2) is not None
+        else [None] * len(items)
+    )
+    return (insert.group(1), [(c, s, e) for c, (s, e) in zip(columns, items)])
+
+
 def _placed_offset(code: int, original: str) -> int | None:
     """Where 23ai points an error PostgreSQL gives no position for (#2111):
     an ORA-00955 at the name the CREATE gives, an ORA-01476 at the statement's
@@ -13684,6 +13724,12 @@ class PostgresBackend:
                     return self.execute(late, binds)
                 except BackendError:
                     pass
+            if error.ora_code == ORA_VALUE_TOO_LARGE_FOR_COLUMN:
+                worded = self._too_large_worded(sql, binds, error)
+                if worded is not None:
+                    worded.rowcount = error.rowcount
+                    worded.row_counts = list(error.row_counts)
+                    raise worded from error
             # An error PostgreSQL gave no position for, placed as 23ai places
             # it (#2111). A single statement's only: an array's error offset
             # is the row that failed, and a block's errors are its own.
@@ -13785,6 +13831,65 @@ class PostgresBackend:
         return item_start + (
             len(sql[item_start:item_end]) - len(sql[item_start:item_end].lstrip())
         )
+
+    def _too_large_worded(
+        self, sql: str, binds: Sequence, error: BackendError
+    ) -> BackendError | None:
+        # ORA-12899 as Oracle says it, in every release (#2137): `value too
+        # large for column "PYO"."T"."N" (actual: 4, maximum: 3)`, the actual
+        # in bytes, at the value. PostgreSQL names only the length, so the
+        # value is found: the first literal or bind the statement assigns that
+        # is longer than its column, among the columns that long. None when
+        # none is, and the error stays as it was.
+        too_long = _VALUE_TOO_LONG.search(str(error))
+        assigned = _assigned_values(sql)
+        if too_long is None or assigned is None:
+            return None
+        if self._conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
+            return None
+        (table, items) = assigned
+        maximum = int(too_long.group(1))
+        try:
+            rows = self._catalog_read(
+                'SELECT n.nspname, c.relname, a.attname, a.atttypmod - 4 '
+                'FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid '
+                'JOIN pg_namespace n ON n.oid = c.relnamespace '
+                'WHERE a.attrelid = to_regclass(%s) AND a.attnum > 0 '
+                'AND NOT a.attisdropped ORDER BY a.attnum',
+                (table.lower(),),
+            ).fetchall()
+        except psycopg.Error:
+            return None
+        if not rows:
+            return None
+        (schema, relation) = (rows[0][0], rows[0][1])
+        order = [name.lower() for (_s, _r, name, _l) in rows]
+        lengths = {name.lower(): length for (_s, _r, name, length) in rows}
+        names = _bind_names(sql)
+        for index, (named, start, end) in enumerate(items):
+            column = (named or (order[index] if index < len(order) else '')).lower()
+            if lengths.get(column) != maximum:
+                continue
+            text = sql[start:end].strip()
+            value: object = None
+            if text.startswith("'") and text.endswith("'"):
+                value = text[1:-1].replace("''", "'")
+            elif text.startswith(':') and text[1:] in names:
+                at = names.index(text[1:])
+                value = binds[at] if at < len(binds) else None
+            if not isinstance(value, str) or len(value) <= maximum:
+                continue
+            lead = len(sql[start:end]) - len(sql[start:end].lstrip())
+            if text.startswith(':'):
+                lead += 1  # a bind's place is its name's, past the colon
+            return BackendError(
+                f'value too large for column "{schema.upper()}"."{relation.upper()}".'
+                f'"{column.upper()}" (actual: {len(value.encode("utf-8"))}, '
+                f'maximum: {maximum})',
+                ora_code=ORA_VALUE_TOO_LARGE_FOR_COLUMN,
+                error_offset=start + lead,
+            )
+        return None
 
     def _column_order(self, table: str) -> list[str]:
         # A table's columns in their order, lower-cased, for placing an
