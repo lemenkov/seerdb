@@ -12894,13 +12894,19 @@ class PostgresBackend:
         # runs in autocommit (#1915), where psycopg's BEGIN was a round trip of
         # its own, and the statement after it then opens its transaction in its
         # own round trip. Each read sees the database as it is, as it did.
+        # A prelude waiting for the next statement -- a PL/SQL call's
+        # savepoint -- waits past it: in autocommit, the savepoint met no
+        # transaction, and a SELECT INTO as a session's first statement failed
+        # and took the session with it (#2103).
         if self._conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
             return self._conn.execute(statement, params)
+        (waiting, self._conn.prelude) = (self._conn.prelude, ())
         self._conn.autocommit = True
         try:
             return self._conn.execute(statement, params)
         finally:
             self._conn.autocommit = False
+            self._conn.prelude = waiting + self._conn.prelude
 
     def set_client_identity(self, identity: dict[str, str]) -> None:
         # program / machine / terminal / osuser, as the client declared them in
