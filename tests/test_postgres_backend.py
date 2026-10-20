@@ -341,6 +341,49 @@ def test_an_unknown_column_is_named_as_oracle_names_it(
     assert str(err) == f'{text}: invalid identifier'
 
 
+def test_dbms_lob_substr_reads_as_oracle_reads_it() -> None:
+    # DBMS_LOB.SUBSTR did not exist (#2056). Measured on 18c: `amount` from
+    # `offset`, both truncated, by default 32767 from 1; NULL for an amount
+    # below 1 or past 32767, an offset below 1 or past the end; a CLOB's
+    # VARCHAR2(4000), a BLOB's RAW(2000).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        clob = "TO_CLOB('hello world')"
+        cases = {
+            f'DBMS_LOB.SUBSTR({clob}, 5, 1)': 'hello',
+            f'DBMS_LOB.SUBSTR({clob}, 5, 7)': 'world',
+            f'DBMS_LOB.SUBSTR({clob})': 'hello world',
+            f'DBMS_LOB.SUBSTR({clob}, 100, 7)': 'world',
+            f'DBMS_LOB.SUBSTR({clob}, 3, 20)': None,
+            f'DBMS_LOB.SUBSTR({clob}, 0, 1)': None,
+            f'DBMS_LOB.SUBSTR({clob}, 3, 0)': None,
+            f'DBMS_LOB.SUBSTR({clob}, 32768, 1)': None,
+            f'DBMS_LOB.SUBSTR({clob}, 2.7, 1.2)': 'he',
+        }
+        for call, expected in cases.items():
+            result = backend.execute(f'SELECT {call} r FROM dual')
+            assert result.rows == [(expected,)], call
+            assert result.columns[0].data_length == 4000
+        raw = backend.execute(
+            "SELECT DBMS_LOB.SUBSTR(TO_BLOB(HEXTORAW('0102030405')), 2, 2) r FROM dual"
+        )
+        assert raw.rows == [(b'\x02\x03',)]
+        assert raw.columns[0].data_length == 2000
+    finally:
+        backend.close()
+
+
+def test_lob_substr_items_are_whole_items_only() -> None:
+    from seerdb.server.backends.postgres import _lob_substr_items
+
+    assert _lob_substr_items(
+        'select dbms_lob.substr(c, 1) a, dbms_lob.substr(c) || 1, x from t'
+    ) == {0}
+    assert _lob_substr_items('select * from t') == set()
+
+
 def test_iot_primary_key_is_read_from_organization_index_ddl() -> None:
     # Inline and constraint forms; a heap table or an IOT without a recognised
     # key registers nothing.
