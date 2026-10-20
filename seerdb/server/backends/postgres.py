@@ -10924,6 +10924,32 @@ _DENIED_RELATION = re.compile(
 _MISSING_RELATION = re.compile(r'(?:relation|table|view) "([^"]+)" does not exist')
 
 
+# A unique violation's detail: `Key (n, d)=(a'b, 2024-01-02) already exists.`
+_UNIQUE_DETAIL = re.compile(r'Key \((.*)\)=\((.*)\) already exists\.$', re.DOTALL)
+
+
+class _UniqueViolation(BackendError):
+    # ORA-00001 with what PostgreSQL's error names: the constraint, its table
+    # and the key, for Oracle's wording (#2120). Before 23ai that is `unique
+    # constraint (PYO.T_PKEY) violated`; 23ai's names the table and columns
+    # and gives the row's values on an ORA-03301 line, which the backend adds,
+    # knowing the release and the columns' types.
+    def __init__(self, diag: Any, error_offset: int | None) -> None:
+        self.schema = (getattr(diag, 'schema_name', None) or '').upper()
+        self.table = (getattr(diag, 'table_name', None) or '').upper()
+        self.constraint = (getattr(diag, 'constraint_name', None) or '').upper()
+        detail = _UNIQUE_DETAIL.match(getattr(diag, 'message_detail', None) or '')
+        self.columns = [c.strip() for c in detail.group(1).split(',')] if detail else []
+        values = detail.group(2).split(', ') if detail else []
+        # A value holding `, ` splits wrongly; then there are no values.
+        self.values = values if len(values) == len(self.columns) else []
+        super().__init__(
+            f'unique constraint ({self.schema}.{self.constraint}) violated',
+            ora_code=ORA_UNIQUE_CONSTRAINT_VIOLATED,
+            error_offset=error_offset,
+        )
+
+
 class _ObjectMissing(BackendError):
     # ORA-00942 with the table or view PostgreSQL could not find, for 23ai's
     # wording, which names it (#2110): `table or view "PYO"."T" does not
@@ -11009,6 +11035,10 @@ def _backend_error(
     missing = _MISSING_RELATION.match(_primary_message(exc))
     if code == ORA_TABLE_OR_VIEW_DOES_NOT_EXIST and missing is not None:
         return _ObjectMissing(missing.group(1), offset)
+    if getattr(exc, 'sqlstate', None) == '23505' and getattr(
+        getattr(exc, 'diag', None), 'constraint_name', None
+    ):
+        return _UniqueViolation(exc.diag, offset)
     message = _ORA_MESSAGE.get(code, str(exc).strip())
     if code == ORA_INVALID_IDENTIFIER and getattr(exc, 'sqlstate', None) == '42703':
         message = _invalid_identifier_text(exc, original, offset) or message
@@ -11737,13 +11767,21 @@ def _while_connected(method):
         self._conn.end_own_transaction()
         try:
             return method(self, *args, **kwargs)
-        except _ObjectMissing as missing:
+        except (_ObjectMissing, _UniqueViolation) as error:
             if self._conn.closed:
                 raise _session_terminated() from None
-            named = self._missing_named(missing)
-            if named is missing:
+            worded = (
+                self._missing_named(error)
+                if isinstance(error, _ObjectMissing)
+                else self._unique_worded(error)
+            )
+            if worded is error:
                 raise
-            raise named from missing
+            # An array's error keeps the rows it applied before it failed,
+            # and their counts (#998, #1031): only the words change.
+            worded.rowcount = error.rowcount
+            worded.row_counts = list(error.row_counts)
+            raise worded from error
         except (psycopg.Error, BackendError):
             if self._conn.closed:
                 raise _session_terminated() from None
@@ -13485,6 +13523,55 @@ class PostgresBackend:
                     ),
                 )
             )
+        )
+
+    def _unique_worded(self, violation: _UniqueViolation) -> BackendError:
+        # ORA-00001 as 23ai says it (#2120): the table and columns, then the
+        # row's values on an ORA-03301 line, a character value quoted as
+        # Oracle quotes it, its own quotes as they are. Before 23ai, and when
+        # the key's columns cannot be read, the older text stands.
+        if self._release < (23, 0) or not violation.columns:
+            return violation
+        columns = ', '.join(c.upper() for c in violation.columns)
+        text = (
+            f'unique constraint ({violation.schema}.{violation.constraint}) '
+            f'violated on table {violation.schema}.{violation.table} '
+            f'columns ({columns})'
+        )
+        if violation.values:
+            textual: set[str] = set()
+            if (
+                self._conn.info.transaction_status
+                != psycopg.pq.TransactionStatus.INERROR
+            ):
+                try:
+                    textual = {
+                        name
+                        for (name,) in self._catalog_read(
+                            'SELECT a.attname FROM pg_attribute a '
+                            'JOIN pg_type t ON t.oid = a.atttypid '
+                            'JOIN pg_class c ON c.oid = a.attrelid '
+                            'JOIN pg_namespace n ON n.oid = c.relnamespace '
+                            'WHERE lower(n.nspname) = lower(%s) '
+                            'AND lower(c.relname) = lower(%s) '
+                            "AND t.typcategory = 'S' AND a.attname = ANY(%s)",
+                            (violation.schema, violation.table, violation.columns),
+                        ).fetchall()
+                    }
+                except psycopg.Error:
+                    textual = set()
+            shown = ', '.join(
+                f"{c.upper()}:'{v}'" if c in textual else f'{c.upper()}:{v}'
+                for c, v in zip(violation.columns, violation.values)
+            )
+            text += (
+                f'\nORA-03301: (ORA-00001 details) row with column values ({shown}) '
+                'already exists'
+            )
+        return BackendError(
+            text,
+            ora_code=ORA_UNIQUE_CONSTRAINT_VIOLATED,
+            error_offset=violation.error_offset,
         )
 
     def _missing_named(self, missing: _ObjectMissing) -> BackendError:
