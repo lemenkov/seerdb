@@ -7584,6 +7584,38 @@ def test_a_repeat_before_another_name_runs_through_the_mirror() -> None:
     assert differing == [('xy7x',)]
 
 
+def test_to_nchar_is_to_char_in_the_national_set() -> None:
+    # TO_NCHAR did not exist (#2057). It converts as TO_CHAR does, and its
+    # value is an NVARCHAR2 of the result's length: n characters, 2n bytes.
+    # Measured on 18c.
+    from seerdb.common.tns_consts import AL16UTF16_CHARSET
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        result = backend.execute(
+            "SELECT TO_NCHAR('abc') a, TO_NCHAR(RPAD('n', 300, 'm')) b, "
+            "TO_NCHAR(123.5, '0000.00') c, "
+            "to_nchar(DATE '2024-05-06', 'YYYY-MM-DD') AS d FROM dual"
+        )
+        assert result.rows == [('abc', 'n' + 'm' * 299, ' 0123.50', '2024-05-06')]
+        assert [
+            (c.csfrm, c.charset, c.data_length, c.max_size) for c in result.columns
+        ] == [
+            (2, AL16UTF16_CHARSET, 6, 3),
+            (2, AL16UTF16_CHARSET, 600, 300),
+            (2, AL16UTF16_CHARSET, 16, 8),
+            (2, AL16UTF16_CHARSET, 20, 10),
+        ]
+        # In a literal it is text, not the call.
+        assert backend.execute("SELECT 'to_nchar(1)' FROM dual").rows == [
+            ('to_nchar(1)',)
+        ]
+    finally:
+        backend.close()
+
+
 def test_translate_binds_repeated_named_bind_is_one_value() -> None:
     # `:x` twice is one Oracle value → one psycopg parameter reused, not two.
     sql, params = _translate_binds('SELECT id FROM t WHERE id = :x OR :x IS NULL', [1])
