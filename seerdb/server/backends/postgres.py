@@ -9035,6 +9035,11 @@ _SOURCE_START = re.compile(
 _PLS_PLACE = re.compile(r'line (\d+), column (\d+):\n(PLS-(\d+): .*)', re.DOTALL)
 
 
+# The source just before a statement's first token: a `;`, or a keyword a
+# statement follows (#2121).
+_STATEMENT_START = re.compile(r'(?i)(?:;|\b(?:BEGIN|THEN|ELSE|LOOP|AS|IS))\s*$')
+
+
 def _compile_error_place(
     sql: str, kind: str, error: BackendError
 ) -> tuple[int, int, str, int]:
@@ -9048,9 +9053,10 @@ def _compile_error_place(
     if pls is not None:
         return (int(pls.group(1)), int(pls.group(2)), pls.group(3), int(pls.group(4)))
     text = message.split('\n', 1)[0]
+    number = 0
     head = _SOURCE_START.match(sql)
     source = sql[head.end() if head else 0 :]
-    near = _NEAR_TOKEN.search(message)
+    near = _NEAR_TOKEN.search(message) or _UNKNOWN_VARIABLE.search(message)
     at = -1
     if near is not None:
         body = re.search(r'(?i)\b(?:AS|IS)\b', source)
@@ -9059,11 +9065,22 @@ def _compile_error_place(
             rf'(?i)(?<![\w$#]){re.escape(near.group(1))}(?![\w$#])', source[start:]
         )
         at = start + found.start() if found else -1
+        if (
+            at >= 0
+            and _STATEMENT_START.search(source[:at])
+            and re.fullmatch(r'[A-Za-z][\w$#]*', near.group(1))
+        ):
+            # A statement that starts with a name no declaration gives -- a
+            # bare call, an assignment to an undeclared variable -- is
+            # Oracle's PLS-00201 at the name (#2121), where PostgreSQL said
+            # syntax error or not a known variable.
+            text = f"PLS-00201: identifier '{near.group(1).upper()}' must be declared"
+            number = 201
     if at < 0:
         return (1, 1, text, 0)
     line = source.count('\n', 0, at) + 1
     position = at - (source.rfind('\n', 0, at) + 1) + 1
-    return (line, position, text, 0)
+    return (line, position, text, number)
 
 
 def _routine_mark(name: str, status: str) -> str:
@@ -14016,12 +14033,19 @@ class PostgresBackend:
             'all_objects o WHERE o.owner = e.owner AND o.object_name = e.name '
             "AND o.object_type = e.type AND o.status = 'INVALID')"
         )
-        self._conn.execute(
-            'INSERT INTO sys.ora_errors (owner, name, type, sequence, line, '
-            f'position, text, message_number) VALUES ({owner_sql}, %s, %s, 1, %s, '
-            '%s, %s, %s)',
-            (*params, name, kind, line, position, text, number),
-        )
+        rows = [(1, text, number)]
+        if number == 201:
+            # Oracle lists the statement it then ignored, at its start, which
+            # is where the undeclared name stands in the statements read so far
+            # (#2121).
+            rows.append((2, 'PL/SQL: Statement ignored', 0))
+        for sequence, row_text, row_number in rows:
+            self._conn.execute(
+                'INSERT INTO sys.ora_errors (owner, name, type, sequence, line, '
+                f'position, text, message_number) VALUES ({owner_sql}, %s, %s, '
+                '%s, %s, %s, %s, %s)',
+                (*params, name, kind, sequence, line, position, row_text, row_number),
+            )
 
     def _create_invalid(self, sql: str, error: BackendError) -> Result | None:
         # A CREATE PROCEDURE / FUNCTION / TYPE that does not compile SUCCEEDS in
