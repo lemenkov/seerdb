@@ -6232,6 +6232,41 @@ def _xmlelement_name(match: re.Match[str]) -> str:
 # call or a literal keyword the suite uses; the rewrites are anchored on the
 # call's `(` or a word boundary, so ordinary identifiers are left alone. Applied
 # to every statement (a DEFAULT SYSDATE in DDL is rewritten too).
+# A ROWID pseudo-column, with the qualifiers in front of it, if any.
+_ROWID_ITEM = re.compile(r'((?:[A-Za-z_][\w$#]*\s*\.\s*)+)?\bROWID\b', re.IGNORECASE)
+
+
+def _rowid_sub(match: 're.Match[str]') -> str:
+    qualifier = re.sub(r'\s+', '', match.group(1) or '')
+    return f'sys.ora_rowid({qualifier}tableoid, {qualifier}ctid)'
+
+
+# DUAL's one row as a ROWID (#2059): DUAL is a view over orafce's, with no
+# tableoid or ctid to read, and Oracle gives it a fixed ROWID. This is the
+# same function over a fixed table and row, so it describes as every ROWID.
+_DUAL_ROWID = "sys.ora_rowid(0::oid, '(0,1)'::tid)"
+_ENDS_FROM = r'(?:WHERE|GROUP|ORDER|CONNECT|START|UNION|INTERSECT|MINUS|FETCH|FOR)'
+_FROM_DUAL_ONLY = re.compile(
+    r'\bFROM\s+(?:SYS\s*\.\s*)?DUAL\b'
+    rf'(?:\s+(?!{_ENDS_FROM}\b)[A-Za-z_][\w$#]*)?'
+    rf'\s*(?:$|;|\)|\b{_ENDS_FROM}\b)',
+    re.IGNORECASE,
+)
+
+
+def _rowid_of_dual(sql: str) -> str:
+    """`sql` with a ROWID read from DUAL as DUAL's fixed one (#2059), where the
+    statement reads DUAL and nothing else."""
+    (masked, contents) = _mask_quoted(sql)
+    if not re.search(r'\bROWID\b', masked, re.IGNORECASE):
+        return sql
+    if len(re.findall(r'\bFROM\b', masked, re.IGNORECASE)) != 1:
+        return sql
+    if not _FROM_DUAL_ONLY.search(masked):
+        return sql
+    return _unmask_quoted(_ROWID_ITEM.sub(_DUAL_ROWID, masked), contents)
+
+
 _IDIOM_REWRITES: list[
     tuple[str, re.Pattern[str], str | Callable[[re.Match[str]], str]]
 ] = [
@@ -6442,7 +6477,10 @@ _IDIOM_REWRITES: list[
     # index-organized table's ROWID is rewritten earlier, per session, from its
     # primary key (PostgresBackend._rewrite_iot_rowid), so this only sees heap
     # tables.
-    ('rowid', re.compile(r'\bROWID\b', re.IGNORECASE), 'sys.ora_rowid(tableoid, ctid)'),
+    # A qualified one, `t.rowid` or `s.t.rowid`, reads that relation's columns;
+    # the qualifier was left in front of the function, `t.sys.ora_rowid(...)`,
+    # which PostgreSQL refused as a cross-database reference (#2082).
+    ('rowid', _ROWID_ITEM, _rowid_sub),
     # A BINARY_DOUBLE / BINARY_FLOAT numeric literal suffix (1234.5678d, 1.5f) —
     # PostgreSQL has no such suffix, so drop it. A decimal point is required so
     # this never touches an identifier or a plain integer.
@@ -8423,6 +8461,7 @@ def _rewritten_idioms(sql: str) -> str:
         'json-constructor-values', _translate_json_constructor_values(sql), sql
     )
     sql = _ruled('vector-functions', _translate_vector_functions(sql), sql)
+    sql = _ruled('rowid-of-dual', _rowid_of_dual(sql), sql)
     # The rewrites change Oracle words into PostgreSQL ones, and a string
     # literal or a quoted identifier holding such a word is data, not SQL:
     # `data_type = 'VARCHAR2'` was rewritten to `= 'varchar'` and matched

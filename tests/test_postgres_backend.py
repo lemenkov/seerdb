@@ -7346,6 +7346,43 @@ def test_an_error_offset_counts_the_leading_text(sql: str, offset: int) -> None:
         backend.close()
 
 
+def test_a_rowid_reads_dual_and_a_qualified_relation() -> None:
+    # DUAL is a view, with no tableoid or ctid: its ROWID failed with
+    # ORA-00904 where Oracle has a fixed one (#2059). A qualified ROWID left
+    # its qualifier in front of the function, `t.sys.ora_rowid(...)`, which
+    # PostgreSQL refused as a cross-database reference (#2082).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        dual = 'AAAAAAAABAAAAABAAB'
+        assert backend.execute('SELECT ROWID FROM dual').rows == [(dual,)]
+        assert backend.execute('SELECT d.rowid, dummy FROM sys.dual d').rows == [
+            (dual, 'X')
+        ]
+        assert backend.execute(
+            "SELECT 'rowid' FROM dual WHERE ROWID IS NOT NULL"
+        ).rows == [('rowid',)]
+        try:
+            backend.execute('CREATE TABLE t_2082 (a NUMBER)')
+            backend.execute('INSERT INTO t_2082 VALUES (1)')
+            [(plain,)] = backend.execute('SELECT ROWID FROM t_2082').rows
+            for qualified in (
+                'SELECT t.rowid FROM t_2082 t',
+                'SELECT t_2082.rowid FROM t_2082',
+                'SELECT pyo.t_2082.rowid FROM pyo.t_2082',
+            ):
+                assert backend.execute(qualified).rows == [(plain,)]
+            # A ROWID from a table beside DUAL is the table's.
+            assert backend.execute(
+                'SELECT a FROM t_2082 WHERE ROWID = (SELECT ROWID FROM t_2082)'
+            ).rows == [(1,)]
+        finally:
+            backend.execute('DROP TABLE t_2082 PURGE')
+    finally:
+        backend.close()
+
+
 def test_a_sql_statement_binds_each_occurrence() -> None:
     # Oracle binds a SQL statement's placeholders by position (#1714): with a
     # value for each occurrence, `:1` twice is two binds. One value a name, or
