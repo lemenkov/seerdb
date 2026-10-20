@@ -1004,10 +1004,51 @@ _HELPER_FUNCTIONS_DDL = (
     'CREATE OR REPLACE FUNCTION ora_concat(text, text) RETURNS text '
     'LANGUAGE sql IMMUTABLE AS $$ SELECT CASE WHEN $1 IS NULL THEN $2 '
     'WHEN $2 IS NULL THEN $1 ELSE $1 OPERATOR(pg_catalog.||) $2 END $$;'
+    # A NUMBER as Oracle writes it out (#2146), as TO_CHAR(n) does and a
+    # concatenation does: no leading zero (`.5`), no trailing ones (`1.5` for
+    # 1.50), in 40 characters at most -- a fraction rounded to fit while that
+    # keeps as many significant digits as scientific notation would, else
+    # scientific notation, its mantissa filling the 40 (`1.0000...E+40`).
+    # Measured on 23ai. PostgreSQL's text kept the scale and the leading zero
+    # and never went scientific.
+    'CREATE OR REPLACE FUNCTION sys.ora_number_text(n numeric) RETURNS text '
+    'LANGUAGE plpgsql IMMUTABLE STRICT SET search_path = pg_catalog AS $f$ '
+    'DECLARE a numeric := abs(n); sign int := CASE WHEN n < 0 THEN 1 ELSE 0 END; '
+    't text; e int; ex text; k int; m numeric; d int; r numeric; fx text; '
+    'actual int; kept int; BEGIN '
+    "IF n = 0 THEN RETURN '0'; END IF; "
+    "t := regexp_replace(trim_scale(n)::text, '^(-?)0[.]', '\\1.'); "
+    'IF length(t) <= 40 THEN RETURN t; END IF; '
+    'e := floor(log(10, a))::int; '
+    'FOR attempt IN 1..2 LOOP '
+    "ex := 'E' || CASE WHEN e < 0 THEN '-' ELSE '+' END "
+    "|| CASE WHEN abs(e) < 10 THEN '0' ELSE '' END || abs(e)::text; "
+    'k := 40 - sign - length(ex) - 2; '
+    # Multiplied, not divided: a numeric division keeps as few as 16
+    # significant digits.
+    'm := round(a * power(10::numeric, -e), k); '
+    'EXIT WHEN m < 10; e := e + 1; END LOOP; '
+    "actual := length(ltrim(replace(trim_scale(a)::text, '.', ''), '0')); "
+    'd := 40 - sign - 1 - CASE WHEN a >= 1 THEN length(trunc(a)::text) ELSE 0 END; '
+    'IF d >= 0 THEN r := round(a, d); '
+    "kept := length(ltrim(replace(trim_scale(r)::text, '.', ''), '0')); "
+    "fx := regexp_replace(trim_scale(round(n, d))::text, '^(-?)0[.]', '\\1.'); "
+    'IF r <> 0 AND length(fx) <= 40 AND kept >= least(actual, k + 1) THEN '
+    'RETURN fx; END IF; END IF; '
+    "RETURN CASE WHEN sign = 1 THEN '-' ELSE '' END || m::text || ex; END $f$;"
+    # A value as its Oracle text, a NUMBER as above and anything else as
+    # PostgreSQL's (#2146): what || and CONCAT write out.
+    # One polymorphic function: a numeric overload beside it made a bigint
+    # ambiguous between the two.
+    'CREATE OR REPLACE FUNCTION sys.ora_text(anynonarray) RETURNS text '
+    "LANGUAGE sql STABLE AS $$ SELECT CASE WHEN pg_typeof($1) = 'numeric'::regtype "
+    'THEN sys.ora_number_text($1::text::numeric) ELSE $1::text END $$;'
+    'CREATE OR REPLACE FUNCTION to_char(numeric) RETURNS text '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT sys.ora_number_text($1) $$;'
     'CREATE OR REPLACE FUNCTION ora_concat(text, anynonarray) RETURNS text '
-    'LANGUAGE sql STABLE AS $$ SELECT ora_concat($1, $2::text) $$;'
+    'LANGUAGE sql STABLE AS $$ SELECT ora_concat($1, sys.ora_text($2)) $$;'
     'CREATE OR REPLACE FUNCTION ora_concat(anynonarray, text) RETURNS text '
-    'LANGUAGE sql STABLE AS $$ SELECT ora_concat($1::text, $2) $$;'
+    'LANGUAGE sql STABLE AS $$ SELECT ora_concat(sys.ora_text($1), $2) $$;'
     'DO $$ BEGIN '
     'CREATE OPERATOR || (LEFTARG = text, RIGHTARG = text, FUNCTION = ora_concat); '
     'CREATE OPERATOR || (LEFTARG = text, RIGHTARG = anynonarray, '
@@ -1022,9 +1063,9 @@ _HELPER_FUNCTIONS_DDL = (
     'CREATE OR REPLACE FUNCTION concat(text, text) RETURNS text '
     'LANGUAGE sql IMMUTABLE AS $$ SELECT ora_concat($1, $2) $$;'
     'CREATE OR REPLACE FUNCTION concat(text, anynonarray) RETURNS text '
-    'LANGUAGE sql STABLE AS $$ SELECT ora_concat($1, $2::text) $$;'
+    'LANGUAGE sql STABLE AS $$ SELECT ora_concat($1, sys.ora_text($2)) $$;'
     'CREATE OR REPLACE FUNCTION concat(anynonarray, text) RETURNS text '
-    'LANGUAGE sql STABLE AS $$ SELECT ora_concat($1::text, $2) $$;'
+    'LANGUAGE sql STABLE AS $$ SELECT ora_concat(sys.ora_text($1), $2) $$;'
     # A quotient as Oracle's NUMBER holds it (#1598): 20 base-100 digits, the
     # pairs aligned on the decimal point, rounded half away from zero -- 40
     # significant decimal digits for 1/3, 39 for 10/7 -- where PostgreSQL keeps
