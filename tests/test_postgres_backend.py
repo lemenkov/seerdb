@@ -7484,6 +7484,49 @@ def test_a_rowid_reads_dual_and_a_qualified_relation() -> None:
         backend.close()
 
 
+def test_a_refcursor_describes_its_columns_as_the_query_does() -> None:
+    # A REF CURSOR's columns were described from the bare PostgreSQL types:
+    # a CLOB, BLOB, DATE or NVARCHAR2 table column and a TO_CLOB item as a
+    # VARCHAR2, RAW, TIMESTAMP or VARCHAR2, where the same query described
+    # them right (#2071).
+    listen, server, result = _start_mirror()
+    conn = _connect(listen.getsockname()[1])
+    try:
+        cur = conn.cursor()
+        cur.execute('drop table if exists t_2071')
+        cur.execute('create table t_2071 (c clob, b blob, d date, n nvarchar2(5))')
+        cur.execute("insert into t_2071 values ('x', hextoraw('01'), sysdate, 'ab')")
+        query = "select c, b, d, n, to_clob('y') tc, sysdate s from t_2071"
+        cur.execute(query)
+        plain = [d[1] for d in cur.description]
+        rc = cur.var(seerdb.DB_TYPE_CURSOR)
+        cur.execute(f'begin open :rc for {query}; end;', {'rc': rc})
+        opened = rc.getvalue()
+        through_cursor = [d[1] for d in opened.description]
+        rows = opened.fetchall()
+        first = rows[0][0].read()
+        cur.execute('drop table t_2071')
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        server.join(timeout=5)
+        listen.close()
+
+    assert result.get('error') is None, result.get('error')
+    assert plain == [
+        seerdb.DB_TYPE_CLOB,
+        seerdb.DB_TYPE_BLOB,
+        seerdb.DB_TYPE_DATE,
+        seerdb.DB_TYPE_NVARCHAR,
+        seerdb.DB_TYPE_CLOB,
+        seerdb.DB_TYPE_DATE,
+    ]
+    assert through_cursor == plain
+    assert first == 'x'
+
+
 def test_a_sql_statement_binds_each_occurrence() -> None:
     # Oracle binds a SQL statement's placeholders by position (#1714): with a
     # value for each occurrence, `:1` twice is two binds. One value a name, or
