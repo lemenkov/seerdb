@@ -160,6 +160,7 @@ from seerdb.common.tns import (
     parse_fetch_oci,
     parse_free_temp_lobs_piggyback,
     parse_kod_request,
+    parse_lobops_locator,
     parse_lobops_read,
     parse_lobops_request,
     parse_lobops_slot,
@@ -1945,7 +1946,19 @@ def _serve_oci_session(
                 # read loop terminates when a read returns less than it asked (#405).
                 offset, amount = parse_lobops_read(body)
                 slot = parse_lobops_slot(body)
-                if slot is not None and slot in slot_lobs:
+                # A row LOB's locator names its slot; a variable's names none.
+                variable = (
+                    lob_vars.content(parse_lobops_locator(body))
+                    if slot is None
+                    else None
+                )
+                if variable is not None:
+                    # A CLOB / BLOB variable's locator: sqlplus 10.2 reads the
+                    # value this way to print it, where later ones select it
+                    # (#2123).
+                    (content, is_clob, national) = variable
+                    slot = None
+                elif slot is not None and slot in slot_lobs:
                     # The locator names its column: a read from the start takes
                     # that column's next LOB, a later one continues it, whatever
                     # was read in between (#1430).
@@ -2977,6 +2990,23 @@ class _OciLobVars:
             return LobOutBind(value=None, is_clob=is_clob, lob_id=0)
         self._values.append(value)
         return LobOutBind(value=value, is_clob=is_clob, lob_id=len(self._values) - 1)
+
+    def content(self, locator: bytes | None) -> tuple[bytes, bool, bool] | None:
+        # A variable's value as a LOB read serves it -- UTF-16BE for a CLOB --
+        # when `locator` is one the Mirror handed out (#2123), else None.
+        for is_blob in (False, True):
+            lob_id = oci_lob_var_id(locator, is_blob) if locator else None
+            if lob_id is not None and lob_id < len(self._values):
+                kept = self._values[lob_id]
+                if is_blob:
+                    return (
+                        bytes(kept) if isinstance(kept, (bytes, bytearray)) else b'',
+                        False,
+                        False,
+                    )
+                text = kept if isinstance(kept, str) else str(kept)
+                return (text.encode('utf-16-be'), True, False)
+        return None
 
     def resolve(self, value: object) -> object:
         if not isinstance(value, TempLobRef):
