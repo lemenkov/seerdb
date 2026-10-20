@@ -3593,8 +3593,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # (#1612), ora_boolean_number (#1705), the SQL/JSON helpers: the two
     # sys.ora_json, six sys.ora_json_scalar and sys.ora_json_serialize (#1707),
     # the four BOOLEAN / number comparisons behind = and <> (#1743), and
-    # PL/SQL's sys.ora_plsql_pad with its rpad / lpad (#2061).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 96
+    # PL/SQL's sys.ora_plsql_pad with its rpad / lpad (#2061), and the three
+    # two-argument concat (#2093).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 99
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
@@ -7827,6 +7828,32 @@ def test_concat_width_sums_the_operands_oracle_counts() -> None:
         '|| :w || :w || :w || :w || :w || :w || :w',
         sizes,
     ) == (32767, True)
+
+
+def test_concat_takes_a_bind_and_reads_a_null_as_empty() -> None:
+    # CONCAT(:v, 'xy') failed with ORA-00900: PostgreSQL's concat is variadic
+    # "any", which an untyped parameter cannot resolve to (#2093). Oracle's
+    # CONCAT is ||: a NULL operand reads as '', and only two NULLs are NULL,
+    # where PostgreSQL's gave ''. A sqlplus VARCHAR2(253) bind describes as
+    # 2001 wide, as `:v || 'xy'` does (#2063).
+    from seerdb.server import VarcharValue
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        result = backend.execute(
+            "SELECT CONCAT(:v, 'xy') a, CONCAT('x', :v) b, CONCAT(NULL, 'x') c, "
+            "CONCAT(NULL, NULL) d, CONCAT(5, 'x') e FROM dual",
+            [VarcharValue.of('abc', 1012)],
+        )
+        assert result.rows == [('abcxy', 'xabc', 'x', None, '5x')]
+        assert [c.data_length for c in result.columns[:2]] == [2002, 2001]
+        assert backend.execute("SELECT CONCAT(:v, 'xy') FROM dual", ['q']).rows == [
+            ('qxy',)
+        ]
+    finally:
+        backend.close()
 
 
 def test_a_concatenation_of_a_bind_describes_by_its_declared_size() -> None:
