@@ -283,6 +283,64 @@ def test_a_missing_table_read_as_a_qualifier_stays_ora_00942() -> None:
     assert _backend_error(_PgError(), original=sql, translated=sql).ora_code == 942
 
 
+@pytest.mark.parametrize(
+    ('sql', 'message', 'position', 'text'),
+    [
+        (
+            'select nosuchcol from dual',
+            'column "nosuchcol" does not exist',
+            '8',
+            '"NOSUCHCOL"',
+        ),
+        (
+            'select d.nosuch from dual d',
+            'column d.nosuch does not exist',
+            '8',
+            '"D"."NOSUCH"',
+        ),
+        (
+            'select "MixedCase" from dual',
+            'column "MixedCase" does not exist',
+            '8',
+            '"MixedCase"',
+        ),
+        (
+            'select 1 from dual order by nosuch',
+            'column "nosuch" does not exist',
+            '29',
+            '"NOSUCH"',
+        ),
+        (
+            'select sys.dual.nosuch from sys.dual',
+            'column dual.nosuch does not exist',
+            '8',
+            '"SYS"."DUAL"."NOSUCH"',
+        ),
+        # No position to read the statement at: the message's name.
+        ('select nosuch from dual', 'column "nosuch" does not exist', None, '"NOSUCH"'),
+    ],
+)
+def test_an_unknown_column_is_named_as_oracle_names_it(
+    sql: str, message: str, position: str | None, text: str
+) -> None:
+    # Oracle names the identifier as the statement has it, each part quoted
+    # and an unquoted one upper-cased, where PostgreSQL said `column "x" does
+    # not exist` and its LINE context came along (#2072). Measured on 18c.
+    class _Diag:
+        def __init__(self) -> None:
+            self.statement_position = position
+            self.message_primary = message
+
+    class _PgError(_FakePgError):
+        def __init__(self) -> None:
+            super().__init__('42703', f'{message}\nLINE 1: {sql}\n       ^')
+            self.diag = _Diag()
+
+    err = _backend_error(_PgError(), original=sql, translated=sql)
+    assert err.ora_code == 904
+    assert str(err) == f'{text}: invalid identifier'
+
+
 def test_iot_primary_key_is_read_from_organization_index_ddl() -> None:
     # Inline and constraint forms; a heap table or an IOT without a recognised
     # key registers nothing.
@@ -10487,7 +10545,7 @@ def test_the_translation_report_records_runs_apart_from_the_transaction() -> Non
             (f'SELECT NVL(NULL, ?) AS {marker} FROM dual', ['nvl'], 2, 0, False),
             (f'SELECT no_such_column AS {marker} FROM dual', [], 1, 1, False),
         ]
-        assert 'no_such_column' in logged[2][5]
+        assert 'NO_SUCH_COLUMN' in logged[2][5].upper()
     finally:
         probe.execute(
             'DELETE FROM sys.ora_translation_log WHERE statement LIKE %s',

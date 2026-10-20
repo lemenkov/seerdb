@@ -10518,11 +10518,10 @@ def _backend_error(
     offset = _missing_object_offset(exc, original)
     if offset is None:
         offset = _error_offset(exc, original, translated)
-    return BackendError(
-        _ORA_MESSAGE.get(code, str(exc).strip()),
-        ora_code=code,
-        error_offset=offset,
-    )
+    message = _ORA_MESSAGE.get(code, str(exc).strip())
+    if code == ORA_INVALID_IDENTIFIER and getattr(exc, 'sqlstate', None) == '42703':
+        message = _invalid_identifier_text(exc, original, offset) or message
+    return BackendError(message, ora_code=code, error_offset=offset)
 
 
 # PostgreSQL naming the object a statement refers to that is not there.
@@ -10562,6 +10561,47 @@ def _names_a_sequence(exc, original: str | None) -> bool:
         )
         is not None
     )
+
+
+# PostgreSQL naming a column that is not there: `column "x"` or `column t.x`.
+_MISSING_COLUMN = re.compile(r'column ("[^"]+"|\S+) does not exist')
+
+
+def _invalid_identifier_text(exc, original: str | None, offset: int | None) -> str:
+    # Oracle's ORA-00904 text names the identifier as the statement has it,
+    # each part quoted, an unquoted one folded to upper case:
+    # `"D"."NOSUCH": invalid identifier`. PostgreSQL said `column d.nosuch
+    # does not exist`, and its LINE context came along (#2072). Read at the
+    # offset in the statement the client sent, or failing that off the
+    # message; empty when neither names it.
+    parts: list[str] = []
+    if original is not None and offset is not None:
+        tokens = [t for t in sql_tokens(original) if t.kind != 'space']
+        at = next((i for i, t in enumerate(tokens) if t.start == offset), None)
+        while at is not None and at < len(tokens):
+            token = tokens[at]
+            text = original[token.start : token.end]
+            if token.kind == 'identifier':
+                parts.append(text[1:-1])
+            elif token.kind == 'word':
+                parts.append(text.upper())
+            else:
+                break
+            dot = tokens[at + 1] if at + 1 < len(tokens) else None
+            if dot is None or original[dot.start : dot.end] != '.':
+                break
+            at += 2
+    if not parts:
+        named = _MISSING_COLUMN.match(_primary_message(exc))
+        if named is None:
+            return ''
+        # PostgreSQL quotes an unqualified name whatever the statement did,
+        # and folds an unquoted one to lower case: fold it back as a column
+        # name is (#1204).
+        name = named.group(1)
+        names = [name[1:-1]] if name.startswith('"') else name.split('.')
+        parts = [_oracle_column_name(part) for part in names]
+    return '.'.join(f'"{part}"' for part in parts) + ': invalid identifier'
 
 
 def _missing_object_offset(exc, original: str | None) -> int | None:
