@@ -672,7 +672,25 @@ _HELPER_FUNCTIONS_DDL = (
     # for one the backend evaluates a PL/SQL expression with, which marks
     # itself with sys.ora_plsql_call() (its statement_timestamp, so the mark
     # dies with the statement).
-    'CREATE OR REPLACE FUNCTION sys.ora_plsql_call() RETURNS text '
+    # RPAD / LPAD in PL/SQL (#2061): a PL/SQL string runs to 32767 characters,
+    # where orafce's, Oracle's SQL ones, stop at 4000; past 32767 a PL/SQL
+    # assignment fails ORA-06502, as 18c's does. NULL for a NULL or empty
+    # string or pad, or a length below 1; the length truncated.
+    'CREATE OR REPLACE FUNCTION sys.ora_plsql_pad(s text, n numeric, p text, '
+    'lft boolean) RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN '
+    "IF s IS NULL OR s = '' OR n IS NULL OR p IS NULL OR p = '' OR trunc(n) < 1 "
+    'THEN RETURN NULL; END IF; IF trunc(n) > 32767 THEN RAISE EXCEPTION USING '
+    "ERRCODE = 'P0001', MESSAGE = 'ORA-06502: PL/SQL: numeric or value error: "
+    "character string buffer too small'; END IF; RETURN CASE WHEN lft THEN "
+    'pg_catalog.lpad(s, trunc(n)::integer, p) ELSE '
+    'pg_catalog.rpad(s, trunc(n)::integer, p) END; END $$;'
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.ora_plsql_{side}pad(text, numeric, '
+        "text DEFAULT ' ') RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT "
+        f'sys.ora_plsql_pad($1, $2, $3, {left}) $$;'
+        for side, left in (('r', 'false'), ('l', 'true'))
+    )
+    + 'CREATE OR REPLACE FUNCTION sys.ora_plsql_call() RETURNS text '
     "LANGUAGE sql VOLATILE AS $$ SELECT set_config('seerdb.plsql_call', "
     'statement_timestamp()::text, false) $$;'
     'CREATE OR REPLACE FUNCTION sys.ora_ndf_to_null() RETURNS boolean '
@@ -8538,6 +8556,7 @@ def _rewritten_idioms(sql: str) -> str:
     # portable SQL needs as much as Oracle SQL does.
     sql = _cast_literal_items(sql)
     sql = _ruled('row-generator', _translate_row_generator(sql), sql)
+    sql = _ruled('plsql-pads', _plsql_pads(sql), sql)
     sql = _ruled('rownum', _rewrite_rownum(sql), sql)
     sql = _ruled('deref', _translate_deref(sql), sql)
     sql = _ruled('attribute-access', _translate_attribute_access(sql), sql)
@@ -9993,6 +10012,27 @@ def _perform_bare_calls(body: str, routine_kind: Callable[[str], str | None]) ->
         out.append(word)
         start = upper in _STATEMENT_OPENERS
     return ''.join(out)
+
+
+# Text that runs as PL/SQL by the time the idioms see it: an anonymous block
+# as a DO, a routine's PL/pgSQL, or the SELECT a PL/SQL expression is
+# evaluated with (_PLSQL_CALL_MARK).
+_PLPGSQL_TEXT = re.compile(
+    r'(?is)^\s*DO\s+\$\$|\bLANGUAGE\s+plpgsql\b|\bsys\.ora_plsql_call\(\)'
+)
+_PAD_CALL = re.compile(r'(?<![\w$#.])(r|l)pad(\s*\()', re.IGNORECASE)
+
+
+def _plsql_pads(sql: str) -> str:
+    # RPAD / LPAD in PL/SQL text are PL/SQL's, to 32767 characters (#2061). A
+    # SQL statement inside the block is rewritten too, where Oracle would stop
+    # it at 4000 -- the text here does not tell the two apart.
+    if not _PLPGSQL_TEXT.search(sql):
+        return sql
+    (masked, contents) = _mask_quoted(sql)
+    if not _PAD_CALL.search(masked):
+        return sql
+    return _unmask_quoted(_PAD_CALL.sub(r'sys.ora_plsql_\1pad\2', masked), contents)
 
 
 def _translate_plsql_block(
