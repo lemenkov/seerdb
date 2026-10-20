@@ -610,6 +610,15 @@ _TSTZ_OPERATORS = (
     ('ge', '>=', '<=', '<', 'scalargesel', 'scalargejoinsel', ''),
 )
 _HELPER_FUNCTIONS_DDL = (
+    # A constant checked against its column per row, as Oracle checks it
+    # (#2138): PostgreSQL coerces a bare literal to varchar(n) / numeric(p)
+    # as it plans, and an UPDATE or INSERT ... SELECT that touched no row
+    # failed on a value too long for the column. PL/pgSQL, so that it is not
+    # inlined back into the constant; used only to run such a statement again.
+    'CREATE OR REPLACE FUNCTION sys.ora_late(text) RETURNS text LANGUAGE plpgsql '
+    'STABLE AS $$ BEGIN RETURN $1; END $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_late(numeric) RETURNS numeric LANGUAGE '
+    'plpgsql STABLE AS $$ BEGIN RETURN $1; END $$;'
     # TO_CHAR(d, '..SYYYY..') → the year signed as Oracle prints it: '-' before
     # a BC year, a space before any other (#1063). The sign goes where SYYYY
     # stood, as quoted literal text in PostgreSQL's format.
@@ -11234,6 +11243,49 @@ _NULL_INSERT = re.compile(
 )
 
 
+# A bare value: a string or a number literal, or a bind, which PostgreSQL
+# coerces to the column's type as it plans a statement for its value (#2138).
+_BARE_LITERAL = re.compile(
+    r"\s*(?:'(?:[^']|'')*'|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+    r'|:[\w$#]+)\s*'
+)
+
+
+def _late_constants(sql: str) -> str | None:
+    """`sql` with each bare literal or bind its UPDATE assigns, or its INSERT ...
+    SELECT's query selects, passed through sys.ora_late, so its column checks
+    it per row as Oracle does (#2138); None for any other statement, or one
+    with no such literal."""
+    spans: list[tuple[int, int]] = []
+    update = _NULL_UPDATE.match(sql)
+    insert = _NULL_INSERT.match(sql)
+    if update is not None:
+        where = re.search(r'(?i)\bWHERE\b', sql[update.end() :])
+        end = update.end() + where.start() if where else len(sql)
+        for item_start, item_end in _top_level_items(sql, update.end(), end):
+            equals = sql.find('=', item_start, item_end)
+            if equals >= 0:
+                spans.append((equals + 1, item_end))
+    elif insert is not None and insert.group(3).upper().startswith('SELECT'):
+        words, _rownums = _top_level_words(sql[insert.end() :])
+        end = next((insert.end() + p for p, w in words if w == 'FROM'), len(sql))
+        spans = _top_level_items(sql, insert.end(), end)
+    late = [(s, e) for s, e in spans if _BARE_LITERAL.fullmatch(sql[s:e]) is not None]
+    if not late:
+        return None
+    out = []
+    at = 0
+    for s, e in late:
+        value = sql[s:e]
+        lead = len(value) - len(value.lstrip())
+        out.append(sql[at : s + lead])
+        out.append(f'sys.ora_late({value.strip()})')
+        out.append(sql[s + lead + len(value.strip()) : e])
+        at = e
+    out.append(sql[at:])
+    return ''.join(out)
+
+
 def _placed_offset(code: int, original: str) -> int | None:
     """Where 23ai points an error PostgreSQL gives no position for (#2111):
     an ORA-00955 at the name the CREATE gives, an ORA-01476 at the statement's
@@ -13616,6 +13668,22 @@ class PostgresBackend:
                 )
             )
         except BackendError as error:
+            if (
+                error.ora_code
+                in (
+                    ORA_VALUE_TOO_LARGE_FOR_COLUMN,
+                    ORA_VALUE_LARGER_THAN_PRECISION,
+                )
+                and (late := _late_constants(sql)) is not None
+            ):
+                # A constant too long for its column, which PostgreSQL checks
+                # as it plans, before it touches a row; Oracle checks each row
+                # it changes, and with none it succeeds (#2138). Once more with
+                # the constants checked per row: with a row it fails as before.
+                try:
+                    return self.execute(late, binds)
+                except BackendError:
+                    pass
             # An error PostgreSQL gave no position for, placed as 23ai places
             # it (#2111). A single statement's only: an array's error offset
             # is the row that failed, and a block's errors are its own.

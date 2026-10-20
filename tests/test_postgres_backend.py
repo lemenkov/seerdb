@@ -3793,8 +3793,8 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # sys.ora_json, six sys.ora_json_scalar and sys.ora_json_serialize (#1707),
     # the four BOOLEAN / number comparisons behind = and <> (#1743), and
     # PL/SQL's sys.ora_plsql_pad with its rpad / lpad (#2061), and the three
-    # two-argument concat (#2093).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 99
+    # two-argument concat (#2093), and sys.ora_late's two (#2138).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 101
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
@@ -8256,6 +8256,59 @@ def test_a_not_null_violation_is_worded_and_placed_as_oracle_does() -> None:
         finally:
             backend.rollback()
             backend.execute('DROP TABLE t2134')
+    finally:
+        backend.close()
+
+
+def test_a_constant_too_long_fails_only_on_a_row_it_changes() -> None:
+    # An UPDATE or INSERT ... SELECT that touched no row failed on a constant
+    # or bind too long for its column: PostgreSQL coerces it as it plans,
+    # where Oracle checks each row it changes (#2138). Measured on 23ai: every
+    # statement here succeeds with 0 rows on the empty table, and fails once a
+    # row is there to change.
+    from decimal import Decimal
+
+    from seerdb.server.backend import BackendError
+    from seerdb.server.backends.postgres import _late_constants
+
+    assert _late_constants("UPDATE t SET n = 'abcdef', k = k + 1 WHERE id = 1") == (
+        "UPDATE t SET n = sys.ora_late('abcdef'), k = k + 1 WHERE id = 1"
+    )
+    assert _late_constants('INSERT INTO t (id, n) SELECT 1, :1 FROM dual') == (
+        'INSERT INTO t (id, n) SELECT sys.ora_late(1), sys.ora_late(:1) FROM dual'
+    )
+    assert _late_constants("UPDATE t SET n = upper('x')") is None
+    assert _late_constants("SELECT 'abcdef' FROM dual") is None
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2138 (id NUMBER, n VARCHAR2(3), k NUMBER(3))')
+        try:
+            cases: tuple[tuple[str, list[object], int], ...] = (
+                ("update t2138 set n = 'abcdef'", [], 12899),
+                ('update t2138 set k = 12345', [], 1438),
+                ("update t2138 set n = 'abcdef' where id = 1", [], 12899),
+                ('update t2138 set n = :1 where id = 1', ['abcdef'], 12899),
+                ('update t2138 set k = :1', [Decimal('12345.5')], 1438),
+            )
+            for statement, binds, _code in cases:
+                assert backend.execute(statement, binds).rowcount == 0, statement
+            assert (
+                backend.execute(
+                    "insert into t2138 (id, n) select 1, 'abcdef' from dual where 1 = 0"
+                ).rowcount
+                == 0
+            )
+            backend.execute("INSERT INTO t2138 VALUES (1, 'a', 1)")
+            for statement, binds, code in cases:
+                with pytest.raises(BackendError) as raised:
+                    backend.execute(statement, binds)
+                assert raised.value.ora_code == code, statement
+            assert backend.execute("update t2138 set n = 'xy'").rowcount == 1
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2138')
     finally:
         backend.close()
 
