@@ -6335,6 +6335,40 @@ _REF_SELECT = re.compile(
 )
 
 
+# An INTERVAL literal: its text, the leading field with its precision (and a
+# SECOND's fractional one), and the trailing field with its own (#2108).
+_INTERVAL_LITERAL = re.compile(
+    r"\bINTERVAL\s*'([^']*)'\s*(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND)\b"
+    r'(?:\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\))?'
+    r'(?:\s+TO\s+(MONTH|HOUR|MINUTE|SECOND)\b(?:\s*\(\s*(\d+)\s*\))?)?',
+    re.IGNORECASE,
+)
+
+
+# A YEAR TO MONTH literal as _interval_literal writes it, which PostgreSQL
+# describes by the domain's base type (#2108).
+_INTERVALYM_LITERAL_ITEM = re.compile(
+    rf"\(INTERVAL '[^']*' (?:YEAR|MONTH)(?: TO MONTH)?\)::{_INTERVALYM_TYPE}"
+)
+
+
+def _interval_literal(match: re.Match[str]) -> str:
+    """An INTERVAL literal as PostgreSQL takes it (#2108): a YEAR TO MONTH one
+    as the ora_intervalym domain, so it is one with its months, where it was a
+    DAY TO SECOND of 425 days; a leading field's precision dropped, which
+    PostgreSQL's syntax has no place for. A SECOND's fractional precision
+    stays."""
+    (text, lead, _precision, lead_scale, last, last_scale) = match.groups()
+    out = f"INTERVAL '{text}' {lead.upper()}"
+    if lead.upper() == 'SECOND' and lead_scale:
+        out += f'({lead_scale})'
+    if last:
+        out += f' TO {last.upper()}' + (f'({last_scale})' if last_scale else '')
+    if lead.upper() in ('YEAR', 'MONTH'):
+        return f'({out})::{_INTERVALYM_TYPE}'
+    return out
+
+
 def _xmlelement_name(match: re.Match[str]) -> str:
     # XMLElement's name as PostgreSQL's NAME takes it: quoted as written, or an
     # unquoted one upper-cased, as Oracle folds it (#1554).
@@ -6497,6 +6531,8 @@ _IDIOM_REWRITES: list[
         ),
         r"- INTERVAL '\1' \2",
     ),
+    # Every INTERVAL literal, after the negative one is lifted (#2108).
+    ('interval-literal', _INTERVAL_LITERAL, _interval_literal),
     # XMLElement("name", ...) / XMLElement(name, ...): PostgreSQL's XMLELEMENT
     # takes the name after the NAME keyword (#1554). Oracle folds an unquoted
     # name to upper case, as it does any identifier, where PostgreSQL would
@@ -7798,7 +7834,7 @@ def _computed_column_types(sql: str) -> dict[int, int]:
         return {}  # the positions are the expanded columns', not the items'
     found = {}
     for index, item in enumerate(items):
-        ym = _INTERVALYM_BIND_ITEM.match(item)
+        ym = _INTERVALYM_BIND_ITEM.match(item) or _INTERVALYM_LITERAL_ITEM.match(item)
         if ym is not None and _ITEM_ALIAS.fullmatch(item[ym.end() :].strip()):
             found[index] = TNS_TYPE_INTERVALYM
             continue
@@ -7863,6 +7899,29 @@ def _nchar_items(sql: str) -> set[int]:
         close = _matching_paren(item, call.end() - 1)
         if close < len(item) and _ITEM_ALIAS.fullmatch(item[close + 1 :].strip()):
             found.add(index)
+    return found
+
+
+def _interval_literal_items(sql: str) -> dict[int, tuple[int, int]]:
+    """The select-list positions of a query that are one INTERVAL literal,
+    optionally aliased, with the precision and scale Oracle describes it by
+    (#2108): the leading field's precision, 2 unless given, and when it ends in
+    SECOND that field's fractional precision, 6 unless given, else 0.
+    Measured on 23ai."""
+    found = {}
+    for index, item in enumerate(_select_list_items(sql)):
+        match = _INTERVAL_LITERAL.match(item)
+        if match is None or not _ITEM_ALIAS.fullmatch(item[match.end() :].strip()):
+            continue
+        (_text, lead, precision, lead_scale, last, last_scale) = match.groups()
+        ends = (last or lead).upper()
+        scale = (
+            (lead_scale if last is None else last_scale) if ends == 'SECOND' else None
+        )
+        found[index] = (
+            int(precision or 2),
+            int(scale or 6) if ends == 'SECOND' else 0,
+        )
     return found
 
 
@@ -15627,6 +15686,16 @@ class PostgresBackend:
                     columns[i] = replace(
                         columns[i], precision=precision, scale=scale or 0
                     )
+            # An INTERVAL literal, by its own qualifiers (#2108).
+            literals = _interval_literal_items(original) if original else {}
+            for i, (precision, scale) in literals.items():
+                if (
+                    i < len(columns)
+                    and columns[i].data_type
+                    in (TNS_TYPE_INTERVALDS, TNS_TYPE_INTERVALYM)
+                    and not cursor.pgresult.ftable(i)
+                ):
+                    columns[i] = replace(columns[i], precision=precision, scale=scale)
         # An NCLOB column, an ora_clob like a CLOB, describes in the national
         # character set form (#1369).
         clob = [i for i, col in enumerate(columns) if col.data_type == TNS_TYPE_CLOB]

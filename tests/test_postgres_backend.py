@@ -1770,11 +1770,62 @@ def test_translate_idioms_negates_whole_day_to_second_interval() -> None:
         "INSERT INTO t VALUES (INTERVAL '-0 00:00:01.5' DAY TO SECOND)"
     )
     assert "(- INTERVAL '0 00:00:01.5' DAY TO SECOND)" in neg
-    # Precision qualifiers ride along; a positive literal is left untouched.
+    # The seconds' precision rides along, the leading field's goes, which
+    # PostgreSQL's syntax has no place for (#2108); a positive literal is left
+    # untouched.
     prec = _translate_idioms("p := INTERVAL '-1 02:03:04.5' DAY(4) TO SECOND(6)")
-    assert "- INTERVAL '1 02:03:04.5' DAY(4) TO SECOND(6)" in prec
+    assert "- INTERVAL '1 02:03:04.5' DAY TO SECOND(6)" in prec
     pos = _translate_idioms("INTERVAL '5 04:03:02.123456' DAY TO SECOND")
     assert pos == "INTERVAL '5 04:03:02.123456' DAY TO SECOND"
+
+
+def test_an_interval_literal_is_oracles() -> None:
+    # A YEAR TO MONTH literal is one, with its months, where it was a DAY TO
+    # SECOND of 425 days; a leading precision PostgreSQL's syntax refuses goes;
+    # a literal item describes with the precisions 23ai gives it (#2108).
+    from seerdb.common.datatypes import IntervalYM
+    from seerdb.common.tns_consts import TNS_TYPE_INTERVALDS, TNS_TYPE_INTERVALYM
+    from seerdb.server.backends.postgres import _interval_literal_items
+
+    assert _translate_idioms("SELECT INTERVAL '1-2' YEAR TO MONTH FROM dual") == (
+        "SELECT (INTERVAL '1-2' YEAR TO MONTH)::ora_intervalym FROM dual"
+    )
+    assert _translate_idioms("SELECT interval '7' month(3) FROM dual") == (
+        "SELECT (INTERVAL '7' MONTH)::ora_intervalym FROM dual"
+    )
+    assert _translate_idioms(
+        "SELECT INTERVAL '123 03:04:05.12' DAY(3) TO SECOND(2) FROM dual"
+    ) == ("SELECT INTERVAL '123 03:04:05.12' DAY TO SECOND(2) FROM dual")
+    assert _translate_idioms("SELECT INTERVAL '5.25' SECOND(3,2) FROM dual") == (
+        "SELECT INTERVAL '5.25' SECOND(2) FROM dual"
+    )
+    assert _interval_literal_items(
+        "SELECT INTERVAL '2 03:04:05' DAY TO SECOND, INTERVAL '1-2' YEAR(3) "
+        "TO MONTH a, INTERVAL '5' MINUTE(3), INTERVAL '5.25' SECOND(3,2) AS s, "
+        "INTERVAL '2 03:04:05' DAY TO SECOND(3), INTERVAL '5' HOUR, "
+        "INTERVAL '5' DAY + 1, x FROM dual"
+    ) == {0: (2, 6), 1: (3, 0), 2: (3, 0), 3: (3, 2), 4: (2, 3), 5: (2, 0)}
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        result = backend.execute(
+            "SELECT INTERVAL '2 03:04:05' DAY TO SECOND ids, "
+            "INTERVAL '1-2' YEAR TO MONTH iym, INTERVAL '-1-2' YEAR TO MONTH n, "
+            "INTERVAL '123 03:04:05.12' DAY(3) TO SECOND(2) d3 FROM dual"
+        )
+        assert [(c.data_type, c.precision, c.scale) for c in result.columns] == [
+            (TNS_TYPE_INTERVALDS, 2, 6),
+            (TNS_TYPE_INTERVALYM, 2, 0),
+            (TNS_TYPE_INTERVALYM, 2, 0),
+            (TNS_TYPE_INTERVALDS, 3, 2),
+        ]
+        assert result.rows[0][1:3] == (IntervalYM(1, 2), IntervalYM(-1, -2))
+        assert result.rows[0][3] == datetime.timedelta(
+            days=123, hours=3, minutes=4, seconds=5.12
+        )
+    finally:
+        backend.close()
 
 
 def test_translate_binds_wraps_aware_datetime_as_composite() -> None:
