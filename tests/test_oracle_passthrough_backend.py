@@ -145,6 +145,7 @@ class _FakeCursor:
         # under test for a national bind (#990).
         var = _FakeVar()
         var.dbtype = dbtype
+        var.size = size
         return var
 
     def arrayvar(self, dbtype, value_or_numelements, size=None):
@@ -244,6 +245,35 @@ class _FakeLobConn:
 
     def write_temp_lob(self, locator, data, is_blob=False):
         self.written.append((locator, data, is_blob))
+
+
+def test_a_plsql_lob_bind_below_12_1_is_a_plsql_string():
+    # Below 12.1 the client has no LOB Var bind (#902), and a sqlplus CLOB
+    # variable failed through the passthrough with "no bind encoding for data
+    # type 112" (#2105). A block's CLOB / BLOB bind goes as PL/SQL's longest
+    # VARCHAR2 / RAW instead, IN and OUT, which PL/SQL converts in an
+    # assignment.
+    from seerdb.common.tns_consts import (
+        FIELD_VERSION_11_2,
+        TNS_TYPE_BLOB,
+        TNS_TYPE_CLOB,
+    )
+
+    backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
+    cursor = _FakeCursor(out_values={0: 'clob var'})
+    backend._conn = _FakeLobConn(cursor, FIELD_VERSION_11_2)
+    binds = _plsql_binds(
+        (None, TNS_TYPE_CLOB, 4000),
+        ('in', TNS_TYPE_CLOB, 4000),
+        (b'\x01', TNS_TYPE_BLOB, 4000),
+    )
+    result = backend._execute_plsql(cursor, 'BEGIN :1 := :2 || :3; END;', binds)
+    assert [(v.dbtype, v.size) for v in cursor.bound] == [
+        (str, 32767),
+        (str, 32767),
+        (bytes, 32767),
+    ]
+    assert result.out_binds == ['clob var', 'in', b'\x01']
 
 
 def test_a_lob_bound_into_plain_sql_is_bound_upstream_as_a_lob():

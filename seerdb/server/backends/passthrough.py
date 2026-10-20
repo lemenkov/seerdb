@@ -70,6 +70,20 @@ from seerdb.server.identity import ServerIdentity, server_identity
 
 _T = TypeVar('_T')
 
+# PL/SQL's longest VARCHAR2 and RAW, in bytes: what a LOB bind goes as to an
+# upstream before 12.1, which has no LOB bind (#2105).
+_PLSQL_STRING_LIMIT = 32767
+
+
+def _plsql_string_bytes(value: object) -> int:
+    # The bytes a LOB bind's value takes as a PL/SQL VARCHAR2 / RAW (#2105).
+    if isinstance(value, str):
+        return len(value.encode('utf-8'))
+    if isinstance(value, (bytes, bytearray)):
+        return len(value)
+    return 0
+
+
 # The upstream's release, base and full, and its banners (#2024): version_full
 # and banner_full are 18c's, so an older server answers the second query.
 _RELEASE_QUERIES = (
@@ -1056,15 +1070,29 @@ class OraclePassthroughBackend:
         for bind in binds:
             if (
                 bind.tns_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB)
-                and bind.value is not None
+                and getattr(self._conn, 'field_version', 0) < FIELD_VERSION_12_1
             ):
-                if getattr(self._conn, 'field_version', 0) < FIELD_VERSION_12_1:
-                    # Below 12.1 a LOB Var has no bind encoding at all (#902),
-                    # so bind the plain str / bytes. That is IN-only -- an
-                    # IN OUT LOB is simply out of reach on such an upstream --
-                    # but it is what the server can take.
+                # Below 12.1 a LOB Var has no bind encoding at all (#902), and
+                # a sqlplus CLOB variable failed with "no bind encoding for data
+                # type 112" (#2105). PL/SQL converts a VARCHAR2 / RAW to and
+                # from a LOB in an assignment, so the bind goes as PL/SQL's
+                # longest of those, IN and OUT: up to 32767 bytes. A longer IN
+                # value goes as the plain str / bytes, IN only, as it did.
+                if _plsql_string_bytes(bind.value) > _PLSQL_STRING_LIMIT:
                     variables.append(bind.value)
                     continue
+                Var = cursor.var(
+                    bytes if bind.tns_type == TNS_TYPE_BLOB else str,
+                    _PLSQL_STRING_LIMIT,
+                )
+                if bind.value is not None:
+                    Var.setvalue(0, bind.value)
+                variables.append(Var)
+                continue
+            if (
+                bind.tns_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB)
+                and bind.value is not None
+            ):
                 Var = cursor.var(
                     seerdb.DB_TYPE_BLOB
                     if bind.tns_type == TNS_TYPE_BLOB
