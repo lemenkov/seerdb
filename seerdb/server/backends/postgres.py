@@ -1166,6 +1166,26 @@ _ORAFCE_HELPERS_DDL = (
         for fn in ('trunc', 'round')
         for arg, use in (('', ''), (', text', ', $2'))
     )
+    # ADD_MONTHS, LAST_DAY and NEXT_DAY of a DATE return a DATE, its time of
+    # day kept (#2095). orafce's take a date, losing the time, or a
+    # timestamptz, returning a timestamp the DATE operators (#1611) do not
+    # take; the DATE domain reached the second. These run orafce's on the day
+    # and add the time back, so no session time zone comes into it. A
+    # fractional month count is truncated, as Oracle's is.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION {fn}(timestamp, {arg}) RETURNS {_DATE_TYPE} '
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT '
+        f"(oracle.{fn}($1::pg_catalog.date, {use}) + date_trunc('second', $1)::time) $$;"
+        for fn, arg, use in (
+            ('add_months', 'integer', '$2'),
+            ('add_months', 'numeric', 'trunc($2)::integer'),
+            ('next_day', 'text', '$2'),
+            ('next_day', 'integer', '$2'),
+        )
+    )
+    + f'CREATE OR REPLACE FUNCTION last_day(timestamp) RETURNS {_DATE_TYPE} '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT '
+    "(oracle.last_day($1::pg_catalog.date) + date_trunc('second', $1)::time) $$;"
     # TRUNC / ROUND of a WITH TIME ZONE value (#1313) work on the value's OWN
     # wall-clock time and return a DATE: TRUNC of 2022-06-08 00:00:10 +05:30 is
     # 2022-06-08. Left to orafce, the ora_tstz composite reached its trunc /

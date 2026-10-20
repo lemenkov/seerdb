@@ -5324,6 +5324,43 @@ def test_trunc_and_round_of_a_datetime_are_dates() -> None:
         backend.close()
 
 
+def test_add_months_last_day_and_next_day_of_a_date_are_dates() -> None:
+    # ADD_MONTHS, LAST_DAY and NEXT_DAY of a DATE return a DATE, its time of
+    # day kept, so a difference with one is a number of days (#2095). orafce's
+    # returned a timestamp, and the difference was an interval. 23ai's answers.
+    from seerdb.common.tns_consts import TNS_TYPE_DATE
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        d = "TO_DATE('2024-01-31 13:14:15', 'YYYY-MM-DD HH24:MI:SS')"
+        for expr, expected in (
+            (f'ADD_MONTHS({d}, 1) - {d}', 29),
+            (f'LAST_DAY({d}) - {d}', 0),
+            (f"NEXT_DAY({d}, 'MONDAY') - {d}", 5),
+        ):
+            (row,) = backend.execute(f'SELECT {expr} FROM dual').rows
+            assert row[0] == expected, expr
+        result = backend.execute(
+            f'SELECT ADD_MONTHS({d}, 1) a, ADD_MONTHS({d}, 1.9) b, '
+            f'ADD_MONTHS({d}, -1) c, LAST_DAY({d} + 1) e, '
+            f"NEXT_DAY({d}, 'MONDAY') f, "
+            "ADD_MONTHS(TIMESTAMP '2024-02-29 10:00:00.7', 12) g FROM dual"
+        )
+        assert [c.data_type for c in result.columns] == [TNS_TYPE_DATE] * 6
+        assert result.rows[0] == (
+            datetime.datetime(2024, 2, 29, 13, 14, 15),
+            datetime.datetime(2024, 2, 29, 13, 14, 15),
+            datetime.datetime(2023, 12, 31, 13, 14, 15),
+            datetime.datetime(2024, 2, 29, 13, 14, 15),
+            datetime.datetime(2024, 2, 5, 13, 14, 15),
+            datetime.datetime(2025, 2, 28, 10, 0, 0),
+        )
+    finally:
+        backend.close()
+
+
 def test_sql_monitor_reports_the_sessions_database_operation() -> None:
     # V$SQL_MONITOR (#1619): with a database operation named (connection.dbop,
     # in the tracing piggyback) the session's statement is EXECUTING under it,
