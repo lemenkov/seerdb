@@ -1540,6 +1540,19 @@ _ORACLE_DICTIONARY_DDL = (
     'LANGUAGE sql IMMUTABLE AS $$ SELECT length($1) $$;'
     'CREATE OR REPLACE FUNCTION dbms_lob.getlength(bytea) RETURNS integer '
     'LANGUAGE sql IMMUTABLE AS $$ SELECT octet_length($1) $$;'
+    # DBMS_LOB.SUBSTR(lob, amount, offset) (#2056): `amount` characters
+    # (bytes) from `offset`, both truncated to whole numbers, by default 32767
+    # from 1. Measured on 18c: NULL for an amount below 1 or past 32767, an
+    # offset below 1, or an offset past the end.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION dbms_lob.substr(lob_loc {lob}, '
+        'amount numeric DEFAULT 32767, "offset" numeric DEFAULT 1) '
+        f'RETURNS {lob} LANGUAGE sql IMMUTABLE AS $$ SELECT CASE WHEN '
+        'trunc(amount) BETWEEN 1 AND 32767 AND trunc("offset") >= 1 AND '
+        f'trunc("offset") <= {size}(lob_loc) THEN substr(lob_loc, '
+        'trunc("offset")::integer, trunc(amount)::integer) END $$;'
+        for lob, size in (('text', 'length'), ('bytea', 'octet_length'))
+    )
     # DBMS_LOB.COPY and WRITEAPPEND (#1712): procedures on the LOB they
     # change, which PL/pgSQL hands back to the caller's variable. COPY writes
     # `amount` characters (bytes) of the source from src_offset over the
@@ -7667,21 +7680,48 @@ _NINE_DIGIT_CALL = re.compile(
 _NINE_FRACTIONAL_DIGITS = 9
 
 
+def _select_list_items(sql: str) -> list[str]:
+    # A query's select-list items as written, or none where the positions are
+    # not the items' -- a `*` expands -- or the statement is no query.
+    words, _rownums = _top_level_words(sql)
+    if not words or words[0][1] != 'SELECT':
+        return []
+    start = words[0][0] + len('SELECT')
+    end = next((pos for pos, word in words if word == 'FROM'), len(sql))
+    items = [sql[s:e].strip() for s, e in _top_level_items(sql, start, end)]
+    if any(item == '*' or item.endswith('.*') for item in items):
+        return []
+    return items
+
+
+# DBMS_LOB.SUBSTR's result, as Oracle describes it (#2056): a VARCHAR2(4000)
+# of a CLOB, a RAW(2000) of a BLOB. PostgreSQL drops a function result's
+# length, and the width came from the values.
+_LOB_SUBSTR_CALL = re.compile(r'dbms_lob\s*\.\s*substr\s*\(', re.IGNORECASE)
+_LOB_SUBSTR_WIDTH = {TNS_TYPE_VARCHAR: 4000, TNS_TYPE_RAW: 2000}
+
+
+def _lob_substr_items(sql: str) -> set[int]:
+    """The select-list positions of a query that are one DBMS_LOB.SUBSTR call,
+    optionally aliased (#2056)."""
+    found = set()
+    for index, item in enumerate(_select_list_items(sql)):
+        call = _LOB_SUBSTR_CALL.match(item)
+        if call is None:
+            continue
+        close = _matching_paren(item, call.end() - 1)
+        if close < len(item) and _ITEM_ALIAS.fullmatch(item[close + 1 :].strip()):
+            found.add(index)
+    return found
+
+
 def _nine_digit_items(sql: str) -> set[int]:
     """The select-list positions of a query Oracle describes with nine
     fractional digits (#2062). PostgreSQL keeps six at most, and so described
     every timestamp with six. Read off the statement the client sent: the
     dialect rewrites a TIMESTAMP literal."""
-    words, _rownums = _top_level_words(sql)
-    if not words or words[0][1] != 'SELECT':
-        return set()
-    start = words[0][0] + len('SELECT')
-    end = next((pos for pos, word in words if word == 'FROM'), len(sql))
-    items = [sql[s:e].strip() for s, e in _top_level_items(sql, start, end)]
-    if any(item == '*' or item.endswith('.*') for item in items):
-        return set()  # the positions are the expanded columns', not the items'
     found = set()
-    for index, item in enumerate(items):
+    for index, item in enumerate(_select_list_items(sql)):
         literal = _NINE_DIGIT_LITERAL.match(item)
         if literal is not None:
             rest = item[literal.end() :]
@@ -14997,6 +15037,14 @@ class PostgresBackend:
                 and not cursor.pgresult.ftable(i)
             ):
                 columns[i] = replace(columns[i], scale=_NINE_FRACTIONAL_DIGITS)
+        for i in _lob_substr_items(original) if original else ():
+            width = (
+                _LOB_SUBSTR_WIDTH.get(columns[i].data_type)
+                if i < len(columns)
+                else None
+            )
+            if width is not None and not cursor.pgresult.ftable(i):
+                columns[i] = replace(columns[i], data_length=width, max_size=width)
         for i in self._json_columns(cursor.pgresult, len(columns)):
             columns[i] = replace(columns[i], is_json=True)
         # A RAW(n) column describes as its declared n, which bytea does not keep;
