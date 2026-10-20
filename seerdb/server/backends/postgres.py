@@ -7739,6 +7739,20 @@ _LOB_SUBSTR_CALL = re.compile(r'dbms_lob\s*\.\s*substr\s*\(', re.IGNORECASE)
 _LOB_SUBSTR_WIDTH = {TNS_TYPE_VARCHAR: 4000, TNS_TYPE_RAW: 2000}
 
 
+def _nchar_items(sql: str) -> set[int]:
+    """The select-list positions of a query that are one TO_NCHAR call,
+    optionally aliased (#2057): an NVARCHAR2, which PostgreSQL's text is not."""
+    found = set()
+    for index, item in enumerate(_select_list_items(sql)):
+        call = _TO_NCHAR_CALL.match(item)
+        if call is None:
+            continue
+        close = _matching_paren(item, call.end() - 1)
+        if close < len(item) and _ITEM_ALIAS.fullmatch(item[close + 1 :].strip()):
+            found.add(index)
+    return found
+
+
 def _lob_substr_items(sql: str) -> set[int]:
     """The select-list positions of a query that are one DBMS_LOB.SUBSTR call,
     optionally aliased (#2056)."""
@@ -8481,7 +8495,21 @@ def _idioms_and_rules(sql: str) -> tuple[str, tuple[str, ...]]:
         _TRANSLATION_RULES.reset(token)
 
 
+# TO_NCHAR(x [, fmt [, nls]]) is TO_CHAR's text in the national character set
+# (#2057). Text is text here, so it is TO_CHAR, rewritten first so every later
+# TO_CHAR step sees it; the describe says national (_nchar_items).
+_TO_NCHAR_CALL = re.compile(r'\bTO_NCHAR(\s*\()', re.IGNORECASE)
+
+
+def _to_nchar_as_to_char(sql: str) -> str:
+    (masked, contents) = _mask_quoted(sql)
+    if not _TO_NCHAR_CALL.search(masked):
+        return sql
+    return _unmask_quoted(_TO_NCHAR_CALL.sub(r'to_char\1', masked), contents)
+
+
 def _rewritten_idioms(sql: str) -> str:
+    sql = _ruled('to-nchar', _to_nchar_as_to_char(sql), sql)
     sql = _ruled('hash-identifier', _quote_hash_identifiers(sql), sql)
     # Not a rule: it types a select-list literal as Oracle describes one, which
     # portable SQL needs as much as Oracle SQL does.
@@ -15076,6 +15104,22 @@ class PostgresBackend:
                 and not cursor.pgresult.ftable(i)
             ):
                 columns[i] = replace(columns[i], scale=_NINE_FRACTIONAL_DIGITS)
+        for i in _nchar_items(original) if original else ():
+            if (
+                i < len(columns)
+                and columns[i].data_type == TNS_TYPE_VARCHAR
+                and not cursor.pgresult.ftable(i)
+            ):
+                # National: n characters of AL16UTF16, 2n bytes, as a
+                # declared NVARCHAR2 column describes (#1383).
+                chars = columns[i].data_length
+                columns[i] = replace(
+                    columns[i],
+                    csfrm=_CSFRM_NATIONAL,
+                    charset=AL16UTF16_CHARSET,
+                    data_length=2 * chars,
+                    max_size=chars,
+                )
         for i in _lob_substr_items(original) if original else ():
             width = (
                 _LOB_SUBSTR_WIDTH.get(columns[i].data_type)
