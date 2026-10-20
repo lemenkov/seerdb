@@ -2470,6 +2470,31 @@ def test_encode_version_banner_oci_matches_the_captured_reply() -> None:
     assert is_version_call_oci(b'\x03\x5e\x06') is False
 
 
+def test_the_version_reply_carries_the_release_it_is_given() -> None:
+    # The trailer is the packed release sqlplus prints for SHOW RELEASE (#2024):
+    # 23ai's two-line banner_full and 23.26.2.0.0, 18c's and 18.4.0.0.0, as
+    # live servers sent them to sqlplus 23.26. The two bytes after 09 01 00 00
+    # 00 change from session to session there, and stay the Mirror's own.
+    from seerdb.common.tns import encode_version_banner_oci
+
+    banner = (
+        b'Oracle AI Database 26ai Free Release 23.26.2.0.0 - Develop, Learn, and '
+        b'Run for Free\nVersion 23.26.2.0.0'
+    )
+    reply = encode_version_banner_oci(banner, 0x171A2000)
+    assert reply[:-2] == b'\x08\x67\x00\x67' + banner + bytes.fromhex(
+        '00201a170901000000'
+    )
+    banner = (
+        b'Oracle Database 18c Express Edition Release 18.0.0.0.0 - Production\n'
+        b'Version 18.4.0.0.0'
+    )
+    reply = encode_version_banner_oci(banner, 0x12040000)
+    assert reply[:-2] == b'\x08\x56\x00\x56' + banner + bytes.fromhex(
+        '000004120901000000'
+    )
+
+
 def test_encode_query_response_oci_structure() -> None:
     # The OCI execute response: describe + DCB tail + RXD row + status, computed
     # (not a captured blob). Renders live in sqlplus 11.2 (validated by replay

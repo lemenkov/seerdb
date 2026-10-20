@@ -654,6 +654,10 @@ VERSION_12_1_0_2 = 0x0C100200
 VERSION_12_2_0_1 = 0x0C200100
 VERSION_21_3_0_0 = 0x15030000
 VERSION_23_26_2_0 = 0x171A2000
+# The base releases a 21c and a 23ai name to a client before 18c, in sqlplus's
+# version call (#2024).
+VERSION_21_0_0_0 = 0x15000000
+VERSION_23_0_0_0 = 0x17000000
 
 # Default Session Data Unit (0x2000). The negotiated packet payload size; both
 # the client connect defaults and the server (Mirror) framing start here.

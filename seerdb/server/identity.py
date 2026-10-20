@@ -36,7 +36,9 @@ from seerdb.common.tns_consts import (
     VERSION_11_2_0_2,
     VERSION_12_1_0_2,
     VERSION_12_2_0_1,
+    VERSION_21_0_0_0,
     VERSION_21_3_0_0,
+    VERSION_23_0_0_0,
     VERSION_23_26_2_0,
 )
 
@@ -56,6 +58,30 @@ class ServerIdentity:
 
     banner: bytes
     """What sqlplus prints after "Connected to:"."""
+
+    # What sqlplus's version call is answered with (#2024). A server tells an
+    # 18c or later client its full release and the two-line banner_full, an
+    # older one its base release and the one-line banner: measured, 23ai sends
+    # sqlplus 23.26 23.26.2.0.0 and "...\nVersion 23.26.2.0.0", and sqlplus 11.2
+    # 23.0.0.0.0 and the banner alone.
+    release: int = 0
+    """The packed base release (``product_component_version.version``) the
+    version call carries to a client before 18c; 0 for ``version_no``."""
+
+    release_full: int = 0
+    """The packed full release (``version_full``), in the 18c layout, the
+    version call carries to an 18c or later client; 0 for ``version_no``."""
+
+    banner_full: bytes = b''
+    """``v$version.banner_full``, what an 18c or later sqlplus prints; empty
+    for ``banner``."""
+
+    def version_reply(self, full: bool) -> tuple[bytes, int]:
+        """The banner and packed release sqlplus's version call is answered
+        with, for an 18c or later client (``full``) or an older one."""
+        if full:
+            return self.banner_full or self.banner, self.release_full or self.version_no
+        return self.banner, self.release or self.version_no
 
 
 IDENTITY_11_2 = ServerIdentity(
@@ -90,6 +116,11 @@ IDENTITY_21 = ServerIdentity(
     version_sql=b'25',
     version_string=b'- Production',
     banner=b'Oracle Database 21c Express Edition Release 21.0.0.0.0 - Production',
+    release=VERSION_21_0_0_0,
+    banner_full=(
+        b'Oracle Database 21c Express Edition Release 21.0.0.0.0 - Production\n'
+        b'Version 21.3.0.0.0'
+    ),
 )
 
 IDENTITY_23 = ServerIdentity(
@@ -99,6 +130,11 @@ IDENTITY_23 = ServerIdentity(
     banner=(
         b'Oracle AI Database 26ai Free Release 23.26.2.0.0 '
         b'- Develop, Learn, and Run for Free'
+    ),
+    release=VERSION_23_0_0_0,
+    banner_full=(
+        b'Oracle AI Database 26ai Free Release 23.26.2.0.0 '
+        b'- Develop, Learn, and Run for Free\nVersion 23.26.2.0.0'
     ),
 )
 

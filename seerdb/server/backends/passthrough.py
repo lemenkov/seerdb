@@ -65,8 +65,36 @@ from seerdb.server.backend import (
     SessionInfo,
     TypeDescription,
 )
+from seerdb.server.identity import ServerIdentity, server_identity
 
 _T = TypeVar('_T')
+
+# The upstream's release, base and full, and its banners (#2024): version_full
+# and banner_full are 18c's, so an older server answers the second query.
+_RELEASE_QUERIES = (
+    'SELECT version, version_full FROM product_component_version '
+    "WHERE product LIKE 'Oracle%'",
+    'SELECT version, version FROM product_component_version '
+    "WHERE product LIKE 'Oracle%'",
+)
+_BANNER_QUERIES = (
+    'SELECT banner, banner_full FROM v$version WHERE ROWNUM = 1',
+    'SELECT banner, banner FROM v$version WHERE ROWNUM = 1',
+)
+# The build suffix a banner ends with, what AUTH_VERSION_STRING carries:
+# "- 64bit Production", "- Develop, Learn, and Run for Free".
+_BANNER_SUFFIX = re.compile(r'Release \S+ (- [^\n]+)')
+
+
+def _packed_release(text: str) -> int:
+    """A dotted release as Oracle packs it: the 18c layout from 18 on (major,
+    update, revision, increment, extension), the older one before (#2097)."""
+    parts = [int(part) for part in text.split('.')[:5]]
+    major, a, b, c, d = parts + [0] * (5 - len(parts))
+    if major >= 18:
+        return major << 24 | a << 16 | b << 12 | c << 4 | d
+    return major << 24 | a << 20 | b << 12 | c << 8 | d
+
 
 # A type's id and descriptor for an OCI client's type describe (#2016): the
 # (schema, name) form of DBMS_PICKLER.GET_TYPE_SHAPE, the one 11g has too.
@@ -194,6 +222,8 @@ class OraclePassthroughBackend:
         self._conn: seerdb.OracleConnect | None = None
         self._username = ''
         self._password = ''
+        # The upstream's release, read once a session asks (#2024).
+        self._release: ServerIdentity | None = None
 
     def authenticate(self, username: str) -> str | None:
         password = self._accounts.secret(username)
@@ -427,6 +457,44 @@ class OraclePassthroughBackend:
             db_domain=db_domain,
             service_name=service,
         )
+
+    def session_release(self) -> ServerIdentity | None:
+        """The upstream's own release, which the Mirror presents (#2024): its
+        packed release as the login reported it, its base and full releases and
+        banners for sqlplus's version call. None when the upstream will not say,
+        and the Mirror keeps the identity of its field version."""
+        assert self._conn is not None  # authenticate() ran before this
+        if self._release is not None:
+            return self._release
+        cursor = self._conn.cursor()
+        rows = []
+        for queries in (_RELEASE_QUERIES, _BANNER_QUERIES):
+            for query in queries:
+                try:
+                    cursor.execute(query)
+                    row = cursor.fetchone()
+                except seerdb.DatabaseError:
+                    continue
+                if row is not None:
+                    rows.append(row)
+                    break
+        if len(rows) != 2:
+            return None
+        (base, full), (banner, banner_full) = rows
+        tier = server_identity(self._conn.field_version)
+        suffix = _BANNER_SUFFIX.search(banner)
+        self._release = ServerIdentity(
+            version_no=self._conn.server_version,
+            version_sql=tier.version_sql,
+            version_string=(
+                suffix.group(1).encode() if suffix else tier.version_string
+            ),
+            banner=banner.encode(),
+            release=_packed_release(base),
+            release_full=_packed_release(full),
+            banner_full=banner_full.encode(),
+        )
+        return self._release
 
     def describe_type(self, name: str) -> TypeDescription | None:
         """A collection type for an OCI client's type describe (#2016), from

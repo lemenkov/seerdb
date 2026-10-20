@@ -388,6 +388,14 @@ class Backend(Protocol):
         ONLY from that reply, never by querying (#826). Without it the Mirror
         reports a placeholder id of 0 and no names at all.
 
+    ``session_release() -> ServerIdentity | None``
+        The release of the server the session runs on, asked after
+        :meth:`authenticate`: the packed release the login reports, and the
+        banner and release sqlplus's version call is answered with (#2024). A
+        passthrough answers with its upstream's, so a client sees the release
+        it would see direct. Without it, or answering None, the Mirror presents
+        the identity of its field version.
+
     ``apply_app_context(namespace, values) -> None``
         Set the attributes ``values`` (a dict) of an application context
         namespace, or clear the namespace when ``values`` is None -- what a

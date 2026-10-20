@@ -47,6 +47,22 @@ def test_a_release_from_18c_on_decodes_by_its_own_layout() -> None:
     assert _format_version(0) is None
 
 
+def test_the_version_call_names_the_release_each_client_is_told() -> None:
+    # An 18c or later sqlplus is told the full release and banner_full, an older
+    # one the base release and the banner, as 23ai and 21c tell sqlplus 23.26
+    # and 11.2 (#2024). An identity with neither keeps its login release.
+    assert IDENTITY_23.version_reply(True) == (
+        b'Oracle AI Database 26ai Free Release 23.26.2.0.0 - Develop, Learn, and '
+        b'Run for Free\nVersion 23.26.2.0.0',
+        0x171A2000,
+    )
+    assert IDENTITY_23.version_reply(False) == (IDENTITY_23.banner, 0x17000000)
+    assert IDENTITY_21.version_reply(True)[1] == 0x15030000
+    assert IDENTITY_21.version_reply(False)[1] == 0x15000000
+    assert IDENTITY_11_2.version_reply(True) == (IDENTITY_11_2.banner, 0x0B200200)
+    assert IDENTITY_11_2.version_reply(False) == (IDENTITY_11_2.banner, 0x0B200200)
+
+
 def test_11_2_field_version_keeps_the_captured_11g_identity() -> None:
     assert server_identity(FIELD_VERSION_11_2) is IDENTITY_11_2
     assert b'11g' in IDENTITY_11_2.banner

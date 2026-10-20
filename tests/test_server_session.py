@@ -3341,6 +3341,41 @@ def test_which_sqlplus_reads_the_local_timestamp_with_time_zone_form() -> None:
     assert sqlplus_reads_local_tstz(b'')
 
 
+def test_which_sqlplus_is_told_the_full_release() -> None:
+    # 18c, 21c and 23ai tell sqlplus 23.26 the full release and banner_full,
+    # and sqlplus 11.2 the base release and the banner (#2024).
+    from seerdb.server.session import sqlplus_reads_full_release
+
+    assert sqlplus_reads_full_release(_SQLPLUS_23_CAPABILITIES)
+    assert not sqlplus_reads_full_release(_SQLPLUS_11_CAPABILITIES)
+    assert sqlplus_reads_full_release(b'')
+
+
+def test_a_backend_names_the_release_its_session_runs_on() -> None:
+    # A passthrough's session runs on the upstream, whose release the Mirror
+    # presents (#2024). A backend without the hook, one that cannot say and one
+    # that fails keep the identity the field version gave.
+    from seerdb.server.identity import IDENTITY_11_2, IDENTITY_23
+    from seerdb.server.session import _backend_identity
+
+    class Names:
+        def session_release(self):
+            return IDENTITY_23
+
+    class CannotSay:
+        def session_release(self):
+            return None
+
+    class Fails:
+        def session_release(self):
+            raise RuntimeError('no upstream')
+
+    assert _backend_identity(Names(), IDENTITY_11_2) is IDENTITY_23
+    assert _backend_identity(CannotSay(), IDENTITY_11_2) is IDENTITY_11_2
+    assert _backend_identity(Fails(), IDENTITY_11_2) is IDENTITY_11_2
+    assert _backend_identity(object(), IDENTITY_11_2) is IDENTITY_11_2
+
+
 def test_an_older_sqlplus_gets_the_utc_timestamp_with_time_zone_cell() -> None:
     from seerdb.common.tns import (
         _ENCODE_OCI_TSTZ_LOCAL,

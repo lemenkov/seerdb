@@ -24,6 +24,18 @@ from seerdb.server.backends.passthrough import (
 )
 
 
+def test_a_release_packs_by_its_own_layout():
+    # The upstream's release as Oracle packs it, for the login and sqlplus's
+    # version call (#2024): what 10g, 11g, 18c and 23ai report.
+    from seerdb.server.backends.passthrough import _packed_release
+
+    assert _packed_release('10.2.0.5.0') == 0x0A200500
+    assert _packed_release('11.2.0.2.0') == 0x0B200200
+    assert _packed_release('18.4.0.0.0') == 0x12040000
+    assert _packed_release('23.26.2.0.0') == 0x171A2000
+    assert _packed_release('23.0.0.0.0') == 0x17000000
+
+
 def test_strips_the_redundant_ora_prefix():
     exc = seerdb.DatabaseError('ORA-00904: "X": invalid identifier', 904)
     err = _relay_error(exc)

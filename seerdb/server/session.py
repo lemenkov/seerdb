@@ -176,6 +176,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_10_2,
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
+    FIELD_VERSION_18_1,
     FIELD_VERSION_23_1,
     FIELD_VERSION_23_1_EXT_1,
     ORA_INSUFFICIENT_PRIVILEGES,
@@ -668,6 +669,8 @@ def handle_login(
             _ENCODE_OCI_LOB_12C.set(bool(lob_caps & CCAP_LOB_12C))
             # Which TIMESTAMP WITH TIME ZONE cell this sqlplus reads (#2018).
             _ENCODE_OCI_TSTZ_LOCAL.set(sqlplus_reads_local_tstz(capabilities))
+            # Which release and banner its version call is answered with (#2024).
+            _OCI_FULL_RELEASE.set(sqlplus_reads_full_release(capabilities))
             # And what version it speaks. sqlplus does not come down to what the
             # Mirror advertised, as a thin client does -- sqlplus 23.26 sends 27
             # -- but an OLDER one sends its own, lower, and must be served at
@@ -851,6 +854,8 @@ def handle_login(
                 logger.info('login ALTER SESSION refused: %s', exc)
     if not sqlplus and new_password_cipher:
         _apply_new_password(backend, user, secret, conn_key, new_password_cipher)
+    # The release the backend's session really runs on, where it can say (#2024).
+    identity = _backend_identity(backend, identity)
     session_id = 0
     if sqlplus:
         stream.send_raw(
@@ -1063,6 +1068,41 @@ def sqlplus_reads_local_tstz(capabilities: bytes) -> bool:
     keeps the newer form."""
     spoken = client_field_version(capabilities)
     return spoken is None or spoken >= FIELD_VERSION_12_1
+
+
+# Whether this sqlplus's version call is answered with the full release and
+# banner_full, set per session at login (#2024).
+_OCI_FULL_RELEASE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    'oci_full_release', default=True
+)
+
+
+def sqlplus_reads_full_release(capabilities: bytes) -> bool:
+    """Whether a sqlplus is told the server's full release and banner_full in
+    its version call, from the capability block it sent (#2024).
+
+    Measured against 18c, 21c and 23ai: sqlplus 23.26 is sent the full release
+    (SHOW RELEASE 2326020000) and the two-line banner_full, sqlplus 11.2 the base
+    release (2300000000) and the one-line banner. banner_full is 18c's, so the
+    line is drawn at a client of 18.1 or later, by the field version its own
+    block names; no client between 11.2 and 23.26 has been tried. A block that
+    cannot be read keeps the newer form."""
+    spoken = client_field_version(capabilities)
+    return spoken is None or spoken >= FIELD_VERSION_18_1
+
+
+def _backend_identity(backend: object, identity: ServerIdentity) -> ServerIdentity:
+    # The release the backend's session runs on, or `identity` when it cannot
+    # say. Asked after authenticate(), which opens a passthrough's upstream
+    # session, so it is that server's own; metadata never fails a login.
+    hook = getattr(backend, 'session_release', None)
+    if hook is None:
+        return identity
+    try:
+        return hook() or identity
+    except Exception as exc:  # noqa: BLE001 - metadata must never fail a login
+        logger.warning('backend could not report its release: %s', exc)
+        return identity
 
 
 def sqlplus_field_version(
@@ -1432,6 +1472,7 @@ def serve_session(
     )
     stream.settimeout(None)
     stream.max_message = SESSION_MESSAGE_LIMIT
+    identity = _backend_identity(backend, identity)
     advertised = field_version
     # Serve the session at the version the client actually negotiated, not the
     # one this Mirror advertises. A client above the advertised version comes
@@ -1804,7 +1845,8 @@ def _serve_oci_session(
             # What sqlplus prints after "Connected to:" — the release this
             # session introduced itself as (naming the Mirror itself is a
             # separate discussion).
-            stream.write_packet(TNS_DATA, encode_version_banner_oci(identity.banner))
+            banner, release = identity.version_reply(_OCI_FULL_RELEASE.get())
+            stream.write_packet(TNS_DATA, encode_version_banner_oci(banner, release))
             continue
         # Every statement past the first arrives wrapped in an OCCA close-cursors
         # piggyback; unwrap it to reach the execute.
