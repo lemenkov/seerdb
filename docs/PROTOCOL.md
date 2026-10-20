@@ -8415,10 +8415,14 @@ variable-length form.
 - **By name** (opcode `3`; what sqlplus sends):
 
   ```
-  03 5c <seq> 03 00 00 00 | 92 x 00 | ub4 2 | ub4 schema length (0: none)
-  | ub4 0 | ub4 name buffer length (3 x the name's characters, 63 for 21)
+  03 5c <seq> 03 00 00 00 | 92 x 00 | ub4 2 | ub4 schema buffer length
+  (3 x its characters; 0: none) | [ub1 length + schema] | ub4 0
+  | ub4 name buffer length (3 x the name's characters, 63 for 21)
   | ub1 length + name | 00 00 00 00 00 01
   ```
+
+  The schema is there when the client names one: `09 00 00 00 03 'SYS'` for
+  SYS.XMLTYPE (§40.5). With none, its bytes are absent, not a zero length.
 
 - **By REF** (opcode `4`; thick `gettype()` after resolving the name with a
   describe of its own, and sqlplus for the system types of §40.3): the same frame
@@ -8636,6 +8640,45 @@ Against a server that cannot describe the type (ORA-03115), sqlplus falls back t
 binding `:LINES` as a plain PL/SQL VARCHAR array (`01 01 43 …`, element size
 32765) and re-executes the block by cursor id while its line count stays above
 zero (#1411, #1515).
+
+### 40.5 An XMLTYPE column (#2050)
+
+A live 11g and 18c tell an OCI client that an XMLTYPE column is type **58**, an
+opaque type, where a thin client is told 109. sqlplus 11.2 against 11g and 23.26
+against 18c were captured.
+
+- **The describe column** carries the type. Its second byte is `00` (`01` for a
+  plain column), the length is 2000, and there is no max size. Where a plain
+  column has the type id's ub4 length 0 (offset 18, 22 in the 12c band), this
+  one has `10 00 00 00`, then `10` and the 16-byte id
+  `00 x 13 02 01 00`, then the ub2 version 1. From there to the null flag it
+  has 7 zero bytes (11 in the 12c band), where a plain column has 20 (24). After
+  the name, the schema and the type name each go as a ub4 length then a ub1
+  length and the bytes (`03 00 00 00 03 'SYS' 07 00 00 00 07 'XMLTYPE'`), where
+  a plain column has two zero ub4s. The column adds nothing to the max row size.
+- **The execute reply is the describe alone**, as for a LOB (§6.0), with the LOB
+  describe tail and status. sqlplus then describes SYS.XMLTYPE by name and
+  SYS.KOTTD by REF (§40.3), and only then fetches.
+- **The type's record** is a KOTTD instance unlike a user type's. Its image is
+  flagged `84` (a user type's `85`), and its values are:
+  - the flags `ae 9a 01 01`;
+  - SYS, XMLTYPE, and the version, `$8.0` from 11g and `$VSN_1` from 18c;
+  - typecode `00 3a`;
+  - a TDS and a null TDS, the same from both servers;
+  - the kind word `50 00` and the ub2 1;
+  - a REF to the type's version, under an id of the database's own.
+
+  The header names the type under SYS, as asked, not under the user.
+- **A row cell** is the object frame of §40.4, under XMLTYPE's id. The image
+  inside is the thin form's (§24) with the flag word `00 00 00 14` (STRING
+  and a 0x10 bit). A NULL has image length 0 and ends at the `01 00`. Past 252
+  bytes the image is chunked: in 255-byte ub1 chunks from 11g, and in ub4
+  chunks of 2000 from 18c, which advertises BIG_CHUNK_CLR (§40.4).
+
+Through the Mirror, sqlplus broke off after a 109 describe, and the session
+ended in the reset-marker loop. The Mirror now answers each step as above. It
+serves SYS.XMLTYPE's record itself, whatever the backend, carrying each
+capture's version id.
 
 ## 41. Application context — function 154 (#1775)
 
