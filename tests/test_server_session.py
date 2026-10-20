@@ -40,7 +40,7 @@ from seerdb.common.tns_consts import (
     VERSION_11_2_0_2,
     VERSION_12_1_0_2,
     VERSION_12_2_0_1,
-    VERSION_23_1_162_0,
+    VERSION_23_26_2_0,
 )
 from seerdb.server import stats
 from seerdb.server.backend import (
@@ -3716,7 +3716,7 @@ def test_live_seerdb_fast_auth_login_at_23ai() -> None:
     )
     try:
         assert conn.field_version == FIELD_VERSION_23_4
-        assert conn.server_version == VERSION_23_1_162_0
+        assert conn.server_version == VERSION_23_26_2_0
     finally:
         try:
             conn.close()
