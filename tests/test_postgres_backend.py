@@ -508,6 +508,52 @@ def test_a_unique_violation_is_worded_as_oracle_words_it() -> None:
             backend.close()
 
 
+def test_an_invalid_number_is_worded_and_placed_as_oracle_does() -> None:
+    # ORA-01722 carried PostgreSQL's `invalid input syntax for type numeric`
+    # (#2136), and TO_NUMBER('x') no position (#2126). 23ai names the first
+    # character that cannot be in a number and gives the value on an ORA-03302
+    # line; earlier releases say `invalid number`. Both point at the literal.
+    # Measured on 23ai.
+    from seerdb.server.backend import BackendError
+
+    cases = (
+        ("select to_number('x') from dual", 'x', 'x', 17),
+        ("select to_number('12z') from dual", 'z', '12z', 17),
+        ("select to_number('1,5') from dual", ',', '1,5', 17),
+        ("insert into t2136 values ('x1', 1)", 'x', 'x1', 26),
+        ("select 1 + 'q' from dual", 'q', 'q', 11),
+    )
+    for presents in ('23ai', '12.1'):
+        backend = PostgresBackend(
+            _CONNINFO, credentials=dict(_CREDS), presents=presents
+        )
+        try:
+            backend.authenticate('PYO')
+            backend.open_session({})
+            backend.execute('CREATE TABLE t2136 (id NUMBER, k NUMBER)')
+            try:
+                for statement, bad, value, offset in cases:
+                    with pytest.raises(BackendError) as raised:
+                        backend.execute(statement)
+                    expected = (
+                        f"unable to convert string value containing '{bad}' to a "
+                        'number: \nORA-03302: (ORA-01722 details) invalid string '
+                        f'value: {value}'
+                        if presents == '23ai'
+                        else 'invalid number'
+                    )
+                    assert (
+                        raised.value.ora_code,
+                        str(raised.value),
+                        raised.value.error_offset,
+                    ) == (1722, expected, offset), (presents, statement)
+            finally:
+                backend.rollback()
+                backend.execute('DROP TABLE t2136')
+        finally:
+            backend.close()
+
+
 def test_a_missing_table_is_named_as_23ai_names_it() -> None:
     # 23ai's ORA-00942 names the table or view, schema and all, where the
     # statement may name neither; earlier releases' does not (#2110). ORA-00955
