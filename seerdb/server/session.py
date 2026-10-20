@@ -2024,7 +2024,7 @@ def _serve_oci_session(
                     )
                 continue
             if body[1] in (TTI_COMMIT, TTI_ROLLBACK):
-                stream.write_packet(TNS_DATA, encode_commit_status_oci(seq.next()))
+                _answer_txn_oci(stream, backend, seq, commit=body[1] == TTI_COMMIT)
                 continue
             if body[1] == TTI_AUTH:
                 # A post-login TTI_AUTH is a password change: sqlplus's PASSWORD
@@ -5134,6 +5134,35 @@ def _answer_txn(stream: PacketStream, backend: Backend, *, commit: bool) -> None
         response = _backend_fault_error(exc)
     else:
         response = encode_status(0)
+    stream.write_packet(TNS_DATA, response)
+
+
+def _answer_txn_oci(
+    stream: PacketStream, backend: Backend, seq: _OciSequence, *, commit: bool
+) -> None:
+    # An OCI commit or rollback call (OCITransCommit / -Rollback): sqlplus 10.2
+    # and 11.2 send one after each statement under SET AUTOCOMMIT ON, where
+    # 23.26 sets the commit bit in the execute (#2011). It used to be answered
+    # without running, so sqlplus printed "Commit complete." and a later
+    # rollback took the row (#2102). As the thin loop's _answer_txn: drive the
+    # backend, and a failure is the call's ORA error.
+    try:
+        if commit:
+            backend.commit()
+        else:
+            backend.rollback()
+        _ENCODE_TXN_IN_PROGRESS.set(False)
+    except BackendError as err:
+        response = encode_error_oci(err.ora_code, str(err), sequence=seq.next())
+    except Exception as exc:  # noqa: BLE001 - the session survives it
+        logger.warning('backend raised a non-ORA error: %s', exc)
+        response = encode_error_oci(
+            ORA_INTERNAL_ERROR,
+            f'ORA-{ORA_INTERNAL_ERROR:05d}: backend error: {exc}',
+            sequence=seq.next(),
+        )
+    else:
+        response = encode_commit_status_oci(seq.next())
     stream.write_packet(TNS_DATA, response)
 
 

@@ -1842,6 +1842,54 @@ def test_oci_loop_refuses_an_unknown_call_instead_of_closing_the_session() -> No
         assert b'ORA-03115' in body
 
 
+def test_oci_commit_and_rollback_calls_run_on_the_backend() -> None:
+    # sqlplus 10.2 and 11.2 send an OCI commit call (03 0e, captured against
+    # 11g) after each statement under SET AUTOCOMMIT ON. It was acknowledged
+    # without running, so sqlplus printed "Commit complete." and a later
+    # rollback took the row (#2102). Each call now runs, and a backend failure
+    # is the call's error rather than a success.
+    from seerdb.common.tns import encode_commit_status_oci
+    from seerdb.common.tns_consts import TNS_DATA, TTI_COMMIT, TTI_ROLLBACK
+    from seerdb.server.backend import BackendError
+    from seerdb.server.session import _serve_oci_session
+
+    calls = [
+        bytes([TTI_FUN, TTI_COMMIT, 3]),
+        bytes([TTI_FUN, TTI_ROLLBACK, 4]),
+        bytes([TTI_FUN, TTI_COMMIT, 5]),
+    ]
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.inbox = [(TNS_DATA, call) for call in calls] + [None]
+            self.sent: list[bytes] = []
+
+        def read_packet(self, **_kw):
+            return self.inbox.pop(0)
+
+        def write_packet(self, _ptype: int, body: bytes, **_kw) -> None:
+            self.sent.append(body)
+
+    class _Backend:
+        def __init__(self) -> None:
+            self.ran: list[str] = []
+
+        def commit(self) -> None:
+            self.ran.append('commit')
+            if len(self.ran) == 3:
+                raise BackendError('ORA-02091: transaction rolled back', ora_code=2091)
+
+        def rollback(self) -> None:
+            self.ran.append('rollback')
+
+    stream: Any = _Stream()
+    backend: Any = _Backend()
+    assert _serve_oci_session(stream, backend, 'PYO') == 'PYO'
+    assert backend.ran == ['commit', 'rollback', 'commit']
+    assert stream.sent[:2] == [encode_commit_status_oci(1), encode_commit_status_oci(2)]
+    assert b'ORA-02091' in stream.sent[2]
+
+
 # sqlplus 23.26 re-executing DBMS_OUTPUT.GET_LINES by cursor id, with no SQL,
 # as captured against Mirror-over-PG (#1411 / #1515).
 _OCI_REEXECUTE_GET_LINES = bytes.fromhex(
