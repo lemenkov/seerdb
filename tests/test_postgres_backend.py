@@ -7972,6 +7972,25 @@ def test_concat_takes_a_bind_and_reads_a_null_as_empty() -> None:
         backend.close()
 
 
+def test_sys_context_takes_a_length() -> None:
+    # SYS_CONTEXT(namespace, attribute, length) did not exist (#2116). On 23ai
+    # the value is cut to the length, from 1 to 4000; another length is the
+    # whole value, and a NULL one NULL.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        result = backend.execute(
+            "SELECT sys_context('USERENV','SESSION_USER', 2) a, "
+            "sys_context('USERENV','SESSION_USER', 0) b, "
+            "sys_context('USERENV','SESSION_USER', 5000) c, "
+            "sys_context('USERENV','SESSION_USER', NULL) d FROM dual"
+        )
+        assert result.rows == [('PY', 'PYO', 'PYO', None)]
+    finally:
+        backend.close()
+
+
 def test_sys_context_describes_as_oracle_sizes_it() -> None:
     # SYS_CONTEXT(ns, attr) is a VARCHAR2(256), and 4000 given a length,
     # whatever the length (#2109). It described as its value's width, so
