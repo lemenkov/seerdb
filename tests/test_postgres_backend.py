@@ -188,6 +188,38 @@ def test_backend_error_relays_the_parse_position_as_the_offset() -> None:
     assert _backend_error(_PgError('8')).error_offset is None
 
 
+@pytest.mark.parametrize(
+    ('sql', 'message', 'position', 'offset'),
+    [
+        ('drop table nosuch purge', 'table "nosuch" does not exist', None, 11),
+        ('drop table pyo.nosuch', 'table "nosuch" does not exist', None, 15),
+        ('drop table "NOSUCH"', 'table "NOSUCH" does not exist', None, 11),
+        ('drop sequence nosuch', 'sequence "nosuch" does not exist', None, 14),
+        ('drop view nosuch', 'view "nosuch" does not exist', None, 0),
+        ('select * from pyo.nosuch', 'relation "pyo.nosuch" does not exist', '15', 18),
+        ('select * from nosuch', 'relation "nosuch" does not exist', '15', 14),
+    ],
+)
+def test_a_missing_object_is_pointed_at_by_its_name(
+    sql: str, message: str, position: str | None, offset: int
+) -> None:
+    # Where 18c points: at the name, past a schema, and at 0 for a DROP VIEW.
+    # PostgreSQL gives a DROP no position, and a qualified name the schema's;
+    # sqlplus drew its caret where the default put it (#2021).
+    class _Diag:
+        def __init__(self) -> None:
+            self.statement_position = position
+            self.message_primary = message
+
+    class _PgError(_FakePgError):
+        def __init__(self) -> None:
+            super().__init__('42P01', message)
+            self.diag = _Diag()
+
+    err = _backend_error(_PgError(), original=sql, translated=sql)
+    assert err.error_offset == offset
+
+
 def test_iot_primary_key_is_read_from_organization_index_ddl() -> None:
     # Inline and constraint forms; a heap table or an IOT without a recognised
     # key registers nothing.
