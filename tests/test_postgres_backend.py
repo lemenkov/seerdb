@@ -442,6 +442,45 @@ def test_the_sqlplus_product_profile_is_there_and_empty() -> None:
         backend.close()
 
 
+def test_a_missing_table_is_named_as_23ai_names_it() -> None:
+    # 23ai's ORA-00942 names the table or view, schema and all, where the
+    # statement may name neither; earlier releases' does not (#2110). ORA-00955
+    # is Oracle's text in every release, where PostgreSQL's named the relation.
+    # Measured on 23ai.
+    from seerdb.server.backend import BackendError
+
+    for presents, missing in (
+        ('23ai', 'table or view "{}"."{}" does not exist'),
+        ('12.1', 'table or view does not exist'),
+    ):
+        backend = PostgresBackend(
+            _CONNINFO, credentials=dict(_CREDS), presents=presents
+        )
+        try:
+            backend.authenticate('PYO')
+            backend.open_session({})
+            for statement, schema, name in (
+                ('SELECT * FROM no_such_2110', 'PYO', 'NO_SUCH_2110'),
+                ('SELECT * FROM sys.no_such_2110', 'SYS', 'NO_SUCH_2110'),
+                ('SELECT * FROM "MixedCase2110"', 'PYO', 'MixedCase2110'),
+                ('DROP TABLE no_such_2110', 'PYO', 'NO_SUCH_2110'),
+            ):
+                with pytest.raises(BackendError) as raised:
+                    backend.execute(statement)
+                assert raised.value.ora_code == 942
+                assert str(raised.value) == missing.format(schema, name), statement
+            backend.execute('CREATE TABLE t_dup2110 (x NUMBER)')
+            try:
+                with pytest.raises(BackendError) as raised:
+                    backend.execute('CREATE TABLE t_dup2110 (x NUMBER)')
+                assert raised.value.ora_code == 955
+                assert str(raised.value) == 'name is already used by an existing object'
+            finally:
+                backend.execute('DROP TABLE t_dup2110')
+        finally:
+            backend.close()
+
+
 def test_all_errors_lists_an_invalid_objects_error() -> None:
     # sqlplus's SHOW ERRORS reads ALL_ERRORS, which did not exist (#2060). A
     # CREATE that does not compile lists its error at the line and column
