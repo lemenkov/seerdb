@@ -5288,6 +5288,42 @@ def test_date_minus_date_is_a_number_of_days() -> None:
                 backend.rollback()
 
 
+def test_trunc_and_round_of_a_datetime_are_dates() -> None:
+    # TRUNC / ROUND of a DATE, a TIMESTAMP or a TIMESTAMP WITH TIME ZONE
+    # return a DATE (#2076), so the difference of two is a number of days and
+    # the column describes as a DATE. orafce's returned a timestamp, and the
+    # difference was an interval. 23ai's answers.
+    from seerdb.common.tns_consts import TNS_TYPE_DATE
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        d = "TO_DATE('2024-05-06 13:14:15', 'YYYY-MM-DD HH24:MI:SS')"
+        for expr, expected in (
+            ('TRUNC(SYSDATE) - TRUNC(SYSDATE)', 0),
+            (f"TRUNC({d}, 'MM') - TRUNC({d}, 'YYYY')", 121),
+            (f'{d} - TRUNC({d})', Decimal('0.551562500000000000')),
+            (f'ROUND({d}) - TRUNC({d})', 1),
+            (f"ROUND(CAST({d} AS TIMESTAMP), 'DD') - TRUNC({d})", 1),
+            ('TRUNC(SYSTIMESTAMP) - TRUNC(SYSDATE)', 0),
+        ):
+            (row,) = backend.execute(f'SELECT {expr} FROM dual').rows
+            assert row[0] == expected, expr
+        result = backend.execute(
+            f"SELECT TRUNC({d}) a, ROUND({d}, 'HH') b, TRUNC(LOCALTIMESTAMP) c, "
+            "TRUNC(SYSTIMESTAMP, 'MM') e, TRUNC(1.57, 1) f FROM dual"
+        )
+        assert [c.data_type for c in result.columns[:4]] == [TNS_TYPE_DATE] * 4
+        assert result.rows[0][:2] == (
+            datetime.datetime(2024, 5, 6),
+            datetime.datetime(2024, 5, 6, 13),
+        )
+        assert result.rows[0][4] == Decimal('1.5')
+    finally:
+        backend.close()
+
+
 def test_sql_monitor_reports_the_sessions_database_operation() -> None:
     # V$SQL_MONITOR (#1619): with a database operation named (connection.dbop,
     # in the tracing piggyback) the session's statement is EXECUTING under it,
