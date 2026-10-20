@@ -8213,6 +8213,53 @@ def test_an_undeclared_name_is_pls_00201_with_its_statement_ignored() -> None:
             backend.close()
 
 
+def test_a_not_null_violation_is_worded_and_placed_as_oracle_does() -> None:
+    # A NOT NULL column given NULL carried PostgreSQL's text, no position, and
+    # ORA-01400 for an UPDATE too (#2134). Oracle's, in every release, is
+    # ORA-01400 for an INSERT, at the value that fills the column (0 when the
+    # column list leaves it out), and ORA-01407 for an UPDATE, at the column
+    # in SET. Measured on 23ai.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute(
+            'CREATE TABLE t2134 (id NUMBER PRIMARY KEY, n VARCHAR2(3) NOT NULL, '
+            'k NUMBER)'
+        )
+        try:
+            backend.execute("INSERT INTO t2134 VALUES (1, 'a', 1)")
+            inserted = 'cannot insert NULL into ("PYO"."T2134"."N")'
+            updated = 'cannot update ("PYO"."T2134"."N") to NULL'
+            for statement, code, text, offset in (
+                ('insert into t2134 values (2, null, 1)', 1400, inserted, 29),
+                (
+                    'insert into t2134 (k, n, id) values (1, null, 5)',
+                    1400,
+                    inserted,
+                    40,
+                ),
+                ('insert into t2134 (id, k) values (6, 1)', 1400, inserted, 0),
+                ('insert into t2134 select 7, null, 1 from dual', 1400, inserted, 28),
+                ('update t2134 set n = null where id = 1', 1407, updated, 17),
+                ('update t2134 set k = 2, n = null', 1407, updated, 24),
+            ):
+                with pytest.raises(BackendError) as raised:
+                    backend.execute(statement)
+                assert (
+                    raised.value.ora_code,
+                    str(raised.value),
+                    raised.value.error_offset,
+                ) == (code, text, offset), statement
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2134')
+    finally:
+        backend.close()
+
+
 def test_translate_binds_repeated_named_bind_is_one_value() -> None:
     # `:x` twice is one Oracle value → one psycopg parameter reused, not two.
     sql, params = _translate_binds('SELECT id FROM t WHERE id = :x OR :x IS NULL', [1])
