@@ -392,6 +392,7 @@ from seerdb.server import (
     LtzValue,
     Result,
     UnsupportedFeature,
+    VarcharValue,
     as_declared_type,
     lockout,
     stats,
@@ -7822,6 +7823,107 @@ def _lob_substr_items(sql: str) -> set[int]:
     return found
 
 
+# The size Oracle describes a character bind at, from the buffer the client
+# declared for it in bytes (#2063): up to 32 bytes is 32, up to 128 is 128, and
+# so on, then the longest VARCHAR2. Measured on 23ai, each statement text
+# fresh: a cursor child built for a longer bind is reused for a shorter one.
+_BIND_DESCRIBE_SIZES = (32, 128, 2000, 4000, 8192, 16386)
+# The longest VARCHAR2, which a concatenation describes as at most.
+_VARCHAR_LIMIT = 32767
+
+
+def _bind_describe_size(declared: int) -> int:
+    return next(
+        (size for size in _BIND_DESCRIBE_SIZES if declared <= size), _VARCHAR_LIMIT
+    )
+
+
+def _bind_sizes(sql: str, params: dict) -> dict[str, int]:
+    """The describe size of each character bind of `sql` the client declared a
+    buffer for (#2063), by bind name."""
+    sizes = {}
+    for name in _bind_names(sql):
+        value = params.get(_bind_key(name))
+        if isinstance(value, VarcharValue):
+            sizes[name] = _bind_describe_size(value.max_size)
+        elif isinstance(value, BindVar) and value.tns_type in (
+            TNS_TYPE_VARCHAR,
+            TNS_TYPE_CHAR,
+        ):
+            sizes[name] = _bind_describe_size(value.max_size)
+    return sizes
+
+
+def _concat_width(item: str, sizes: dict[str, int]) -> tuple[int, bool]:
+    """The width Oracle describes a select-list item at, as far as it can be
+    read: the width and whether every operand counted (#2063).
+
+    Oracle sizes a concatenation as the sum of its operands, `||` and CONCAT
+    alike, up to the longest VARCHAR2. A bind in `sizes` counts its describe
+    size, a literal its length in bytes, a parenthesized operand its own.
+    Anything else -- a column, a call -- counts nothing, and the item is not
+    complete. An optional alias ends the item."""
+    tokens = [span for span in _bind_spans(item) if span[0] not in ('space', 'comment')]
+    at = 0
+
+    def text(offset: int = 0) -> str:
+        return tokens[at + offset][1] if at + offset < len(tokens) else ''
+
+    def concat_next() -> bool:
+        return text() == '|' and text(1) == '|'
+
+    def operand() -> tuple[int, bool]:
+        nonlocal at
+        if at >= len(tokens):
+            return 0, False
+        kind, word, name = tokens[at]
+        if name is not None and name in sizes:
+            at += 1
+            return sizes[name], True
+        if kind == 'string' and word.startswith("'"):
+            at += 1
+            return len(word[1:-1].replace("''", "'").encode('utf-8')), True
+        if word == '(':
+            at += 1
+            width, complete = expression()
+            if text() == ')':
+                at += 1
+                return width, complete
+            return width, False
+        if kind == 'word' and word.upper() == 'CONCAT' and text(1) == '(':
+            at += 2
+            first, first_complete = expression()
+            if text() == ',':
+                at += 1
+                second, second_complete = expression()
+                if text() == ')':
+                    at += 1
+                    return first + second, first_complete and second_complete
+        # Something else: past it, up to the next `||`, `,` or `)` outside it.
+        depth = 0
+        while at < len(tokens) and not (
+            depth == 0 and (text() in (',', ')') or concat_next())
+        ):
+            depth += (text() == '(') - (text() == ')')
+            at += 1
+        return 0, False
+
+    def expression() -> tuple[int, bool]:
+        nonlocal at
+        width, complete = operand()
+        while concat_next():
+            at += 2
+            more, more_complete = operand()
+            width, complete = width + more, complete and more_complete
+        return width, complete
+
+    width, complete = expression()
+    rest = ' '.join(word for _kind, word, _name in tokens[at:])
+    if not _ITEM_ALIAS.fullmatch(rest):
+        return 0, False
+    return min(width, _VARCHAR_LIMIT), complete
+
+
 def _nine_digit_items(sql: str) -> set[int]:
     """The select-list positions of a query Oracle describes with nine
     fractional digits (#2062). PostgreSQL keeps six at most, and so described
@@ -15131,11 +15233,14 @@ class PostgresBackend:
                 out = out[:start] + column + out[end:]
         return sql if out == masked else _unmask_quoted(out, list(contents))
 
-    def _build_result(self, cursor, sql: str = '', original: str = '') -> Result:
+    def _build_result(
+        self, cursor, sql: str = '', original: str = '', params: dict | None = None
+    ) -> Result:
         # Turn an executed statement's cursor into a Result: a row count for a
         # no-row statement, else the fetched rows plus a ColumnMeta per column.
         # `sql` is the statement as run, read for the select-list items whose
-        # type only the item says (a LOB call, an IntervalYM bind).
+        # type only the item says (a LOB call, an IntervalYM bind); `params`
+        # its binds, whose declared sizes an expression over them describes by.
         if cursor.description is None:
             return Result(rowcount=max(cursor.rowcount, 0))
         computed = _computed_column_types(sql) if sql else {}
@@ -15304,6 +15409,23 @@ class PostgresBackend:
                 and not cursor.pgresult.ftable(i)
             ):
                 columns[i] = replace(columns[i], scale=_NINE_FRACTIONAL_DIGITS)
+        sizes = _bind_sizes(original, params) if original and params else {}
+        for i, item in enumerate(_select_list_items(original) if sizes else ()):
+            if (
+                i < len(columns)
+                and columns[i].data_type == TNS_TYPE_VARCHAR
+                and not cursor.description[i].display_size
+                and not cursor.pgresult.ftable(i)
+            ):
+                # An expression over a character bind describes by the bind's
+                # declared size, as Oracle's does, not by the values (#2063).
+                described, complete = _concat_width(item, sizes)
+                if described:
+                    if not complete:
+                        described = max(described, columns[i].data_length)
+                    columns[i] = replace(
+                        columns[i], data_length=described, max_size=described
+                    )
         for i in _nchar_items(original) if original else ():
             if (
                 i < len(columns)
@@ -16685,7 +16807,7 @@ class PostgresBackend:
         try:
             with self._under_savepoint(then=prelude):
                 cursor.execute(sql, params)
-                result = self._build_result(cursor, sql, original or '')
+                result = self._build_result(cursor, sql, original or '', params)
         except psycopg.Error as exc:
             # A PostgreSQL failure surfaces as a clean ORA error — never a desync.
             # Map the SQLSTATE to the matching Oracle code so error-conditional
@@ -16774,7 +16896,7 @@ class PostgresBackend:
         # statement had its effect. Building the result can only raise on an
         # unencodable SELECT column — no side effect to undo — so let it propagate
         # for the session to map to an ORA error; the connection stays usable.
-        return self._build_result(statement, sql, original or '')
+        return self._build_result(statement, sql, original or '', params)
 
     def _query_at_once(
         self,
@@ -16832,7 +16954,7 @@ class PostgresBackend:
                 if self._ddl_generation not in (None, row[0]):
                     self._forget_schema()
                 self._ddl_generation = row[0]
-        return self._build_result(statement, sql, original or '')
+        return self._build_result(statement, sql, original or '', params)
 
     @_while_connected
     @_plainly_quoted

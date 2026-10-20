@@ -1518,6 +1518,40 @@ def test_bind_vars_wraps_only_a_null_of_an_ordinary_statement() -> None:
     assert _bind_vars(mismatched) == [None, 'x']
 
 
+def test_bind_vars_marks_a_character_value_with_its_declared_size() -> None:
+    # Oracle describes a character bind, and a concatenation over one, by the
+    # buffer the client declared, so the size goes over with the value (#2063).
+    # A CLOB's content and a value of any other type stay as they are.
+    from seerdb.common.tns import ExecRequest
+    from seerdb.common.tns_consts import (
+        TNS_TYPE_CHAR,
+        TNS_TYPE_NUMBER,
+        TNS_TYPE_VARCHAR,
+    )
+    from seerdb.server.backend import ClobValue, VarcharValue
+    from seerdb.server.session import _bind_vars
+
+    clob = ClobValue('c')
+    select = ExecRequest(
+        sql='SELECT :1 || :2 || :3 || :4 FROM dual',
+        cursor=0,
+        bind_count=4,
+        fetch=0,
+        binds=['abc', 'd', clob, 5],
+        bind_meta=[
+            (TNS_TYPE_VARCHAR, 1012),
+            (TNS_TYPE_CHAR, 4),
+            (TNS_TYPE_VARCHAR, 4),
+            (TNS_TYPE_NUMBER, 22),
+        ],
+    )
+    wrapped = _bind_vars(select)
+    assert wrapped == ['abc', 'd', 'c', 5]
+    assert [type(v) for v in wrapped] == [VarcharValue, VarcharValue, ClobValue, int]
+    assert [v.max_size for v in wrapped[:2]] == [1012, 4]
+    assert wrapped[2] is clob
+
+
 def test_oci_sequence_advances_per_reply() -> None:
     # The per-session OER end-to-end sequence counter yields a fresh, advancing
     # value on each call, starting at 1 — the Mirror threads seq.next() into every
