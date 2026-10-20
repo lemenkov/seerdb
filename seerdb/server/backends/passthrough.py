@@ -71,6 +71,12 @@ from seerdb.server.identity import ServerIdentity, server_identity
 
 _T = TypeVar('_T')
 
+# A query of one bind, aliased or not, from DUAL: sqlplus's PRINT (#2124).
+_LONE_BIND_QUERY = re.compile(
+    r'\s*SELECT\s+(:\w+)(?:\s+(?:AS\s+)?\w+)?\s+FROM\s+(?:SYS\.)?DUAL\s*$',
+    re.IGNORECASE,
+)
+
 # PL/SQL's longest VARCHAR2 and RAW, in bytes: what a LOB bind goes as to an
 # upstream before 12.1, which has no LOB bind (#2105).
 _PLSQL_STRING_LIMIT = 32767
@@ -740,6 +746,26 @@ class OraclePassthroughBackend:
             self._conn.write_temp_lob(locator, value, is_blob=is_blob)
         return TempLob(locator, is_blob)
 
+    def _lob_select_item(self, sql: str, binds: Sequence) -> str:
+        # sqlplus prints a CLOB / BLOB variable with `SELECT :v v FROM DUAL`
+        # (#2124). Below 12.1 the value goes upstream as a plain str / bytes
+        # (#91), which the upstream describes as a VARCHAR2 / RAW: the column
+        # printed 32 wide where Oracle's CLOB is 80. The lone bind goes as
+        # TO_CLOB / TO_BLOB of itself, a LOB again; a select list compares
+        # nothing, so the wrapper changes only the type.
+        if getattr(self._conn, 'field_version', 0) >= FIELD_VERSION_12_1:
+            return sql
+        match = _LONE_BIND_QUERY.match(sql)
+        if match is None or len(binds) != 1:
+            return sql
+        if isinstance(binds[0], ClobValue):
+            call = 'TO_CLOB'
+        elif isinstance(binds[0], BlobValue):
+            call = 'TO_BLOB'
+        else:
+            return sql
+        return f'{sql[: match.start(1)]}{call}({match.group(1)}){sql[match.end(1) :]}'
+
     def _upstream_lob_binds(self, binds: Sequence) -> list:
         # A LOB the client bound into an ordinary statement arrives as its
         # content, marked ClobValue / BlobValue (#1067). Bound on as a str it
@@ -865,6 +891,7 @@ class OraclePassthroughBackend:
         assert self._conn is not None  # authenticate() ran before any execute
         cursor = self._conn.cursor()
         binds = self._resolve_object_binds(binds)
+        sql = self._lob_select_item(sql, binds)
         binds = self._upstream_lob_binds(binds)
         # A PL/SQL block hands its binds over as BindVar (value + type + buffer
         # size) so OUT binds can be registered correctly (#483). Bind each as an

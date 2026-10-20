@@ -478,6 +478,37 @@ def test_large_lob_in_bind_is_registered_as_a_lob_var():
     assert result.out_binds == ['X' * 40000, 42]
 
 
+def test_a_printed_lob_variable_below_12_1_is_selected_as_a_lob():
+    # sqlplus prints a CLOB variable with `SELECT :vc vc FROM DUAL`. Below 12.1
+    # the value goes upstream as a plain str, which the upstream describes as
+    # a VARCHAR2, and the column printed 32 wide, not a CLOB's 80 (#2124). The
+    # lone bind goes as TO_CLOB / TO_BLOB of itself; anything else is left.
+    from seerdb.common.tns_consts import FIELD_VERSION_11_2
+    from seerdb.server.backend import BlobValue, ClobValue
+
+    backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
+    backend._conn = type('Conn', (), {'field_version': FIELD_VERSION_11_2})()
+    clob, blob = ClobValue('clob var'), BlobValue(b'\x01')
+    assert (
+        backend._lob_select_item('SELECT :vc vc FROM DUAL', [clob])
+        == 'SELECT TO_CLOB(:vc) vc FROM DUAL'
+    )
+    assert (
+        backend._lob_select_item('select :b from sys.dual', [blob])
+        == 'select TO_BLOB(:b) from sys.dual'
+    )
+    for sql, binds in (
+        ('SELECT :vc vc FROM DUAL', ['plain']),
+        ('SELECT :a, :b FROM DUAL', [clob, clob]),
+        ('SELECT :vc FROM t', [clob]),
+    ):
+        assert backend._lob_select_item(sql, binds) == sql
+    backend._conn = type('Conn', (), {'field_version': FIELD_VERSION_12_1})()
+    assert backend._lob_select_item('SELECT :vc vc FROM DUAL', [clob]) == (
+        'SELECT :vc vc FROM DUAL'
+    )
+
+
 def test_large_lob_in_bind_stays_a_plain_value_below_12_1():
     # Below 12.1 a LOB Var has no bind encoding at all (#902), so the plain
     # str / bytes is all the upstream can take. IN-only, and its OUT slot is
