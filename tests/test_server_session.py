@@ -3378,6 +3378,48 @@ def test_sqlplus_is_served_at_the_version_it_speaks() -> None:
     assert sqlplus_field_version(b'', FIELD_VERSION_12_1, low) == FIELD_VERSION_12_1
 
 
+# sqlplus 10.2 reading its CLOB variable with a LOB read, captured against
+# Mirror-over-PG (#2123): the narrow layout, its pointers' own values where a
+# later sqlplus writes the indicator.
+_OCI_LOB_READ_10_2 = bytes.fromhex(
+    '036006e812a23c000000006a000000000000000000000000000000000000000000000000'
+    '000000000000000000000000000000000000000000000002000000000000000000000000'
+    '0000000100000000000000040000000000000080e3a13c00000000000000000000000000'
+    '00000000000000000000000000000000000000000000000000000000680001020c880000'
+    '020000000100000056000000010000000100000002000203690002000000000000000000'
+    '000000010000000000000000000000000000000000000000000000000000000001000000'
+    '000000000000140500000000000010000000000002000000005000000000000000'
+)
+
+
+def test_sqlplus_10_2_reads_a_clob_variable_with_a_lob_read() -> None:
+    # sqlplus 10.2 prints a CLOB variable by reading its locator, where later
+    # ones select it, and printed it empty: its LOB read did not parse, and the
+    # read was not served from the variable (#2123). At 10.2's field version
+    # it reads as the narrow form; its locator names the variable.
+    from seerdb.common.tns import (
+        _DECODE_FIELD_VERSION,
+        parse_lobops_locator,
+        parse_lobops_read,
+    )
+    from seerdb.common.tns_consts import FIELD_VERSION_10_2, TNS_TYPE_CLOB
+    from seerdb.server.session import _OciLobVars
+
+    assert parse_lobops_locator(_OCI_LOB_READ_10_2) is None  # at a later version
+    token = _DECODE_FIELD_VERSION.set(FIELD_VERSION_10_2)
+    try:
+        assert parse_lobops_read(_OCI_LOB_READ_10_2) == (1, 80)
+        locator = parse_lobops_locator(_OCI_LOB_READ_10_2)
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+    assert locator is not None and len(locator) == 106
+    lob_vars = _OciLobVars()
+    lob_vars.keep('clob var', TNS_TYPE_CLOB)
+    assert lob_vars.content(locator) == ('clob var'.encode('utf-16-be'), True, False)
+    assert _OciLobVars().content(locator) is None
+    assert lob_vars.content(None) is None
+
+
 def test_which_sqlplus_reads_the_local_timestamp_with_time_zone_form() -> None:
     # A live 11g sends sqlplus 23.26 the wall-clock cell with the 0x40 flag and
     # sqlplus 11.2 the UTC one; given the flagged cell, sqlplus 11.2 printed

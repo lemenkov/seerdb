@@ -2690,12 +2690,26 @@ def _read_chunked_sql(data: bytes, total_len: int) -> tuple[bytes, int]:
     return bytes(out[:total_len]), i
 
 
+def _oci_lobops_narrow(body: bytes) -> bool:
+    """Whether an OCI TTI_LOBOPS READ is in the narrow form (#1287): an
+    indicator at 91 where the wide form has its offset. sqlplus 10.2 lays the
+    request out the same way, but writes its pointers' own values where later
+    clients write the indicator -- the offset at 75, the locator at 135, the
+    amount after it, captured against Mirror-over-PG -- so a session at 10.2's
+    field version reads it as narrow too (#2123)."""
+    ind = _OCI_LOBOPS_NARROW_IND_OFF
+    if body[ind : ind + 8] == oci.OCI_INDICATOR:
+        return True
+    return _DECODE_FIELD_VERSION.get() <= FIELD_VERSION_10_2 and any(
+        body[ind : ind + 8]
+    )
+
+
 def parse_lobops_read(body: bytes) -> tuple[int, int]:
     """Extract ``(source_offset, amount)`` from an OCI TTI_LOBOPS READ (#405) —
     both 1-based counts (characters for a CLOB, bytes for a BLOB). A malformed /
     short request falls back to reading the whole LOB from the start."""
-    ind = _OCI_LOBOPS_NARROW_IND_OFF
-    if body[ind : ind + 8] == oci.OCI_INDICATOR:
+    if _oci_lobops_narrow(body):
         loclen_off = _OCI_LOBOPS_NARROW_LOCLEN_OFF
         loclen = int.from_bytes(body[loclen_off : loclen_off + 4], 'little')
         offset_off = _OCI_LOBOPS_NARROW_OFFSET_OFF
@@ -2710,12 +2724,22 @@ def parse_lobops_read(body: bytes) -> tuple[int, int]:
     return max(offset, 1), amount
 
 
+def parse_lobops_locator(body: bytes) -> bytes | None:
+    """The locator an OCI TTI_LOBOPS READ names, in the narrow form, or None for
+    a request in the wide form (#2123): sqlplus 10.2 reads a CLOB variable's
+    value this way, where later ones select it."""
+    if not _oci_lobops_narrow(body):
+        return None
+    loclen_off = _OCI_LOBOPS_NARROW_LOCLEN_OFF
+    loclen = int.from_bytes(body[loclen_off : loclen_off + 4], 'little')
+    return body[_OCI_LOBOPS_NARROW_HEADER : _OCI_LOBOPS_NARROW_HEADER + loclen]
+
+
 def parse_lobops_slot(body: bytes) -> int | None:
     """The row slot the locator of an OCI TTI_LOBOPS READ names (#1430), or None
     for a request that carries none -- the wide form, whose locator this does not
     locate, or a locator minted without a slot."""
-    ind = _OCI_LOBOPS_NARROW_IND_OFF
-    if body[ind : ind + 8] != oci.OCI_INDICATOR:
+    if not _oci_lobops_narrow(body):
         return None
     loclen_off = _OCI_LOBOPS_NARROW_LOCLEN_OFF
     loclen = int.from_bytes(body[loclen_off : loclen_off + 4], 'little')
