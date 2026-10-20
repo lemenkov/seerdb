@@ -10742,6 +10742,8 @@ _ORA_MESSAGE = {
     ORA_TOO_MANY_ROWS: 'exact fetch returns more than requested number of rows',
     ORA_DIVISOR_IS_ZERO: 'divisor is equal to zero',
     ORA_TYPE_HAS_DEPENDENTS: 'cannot drop or replace a type with type or table dependents',
+    # The same in every release (#2110).
+    ORA_NAME_ALREADY_USED: 'name is already used by an existing object',
 }
 
 
@@ -10910,6 +10912,26 @@ _DENIED_RELATION = re.compile(
 )
 
 
+# The relation PostgreSQL could not find, as its message names it.
+_MISSING_RELATION = re.compile(r'(?:relation|table|view) "([^"]+)" does not exist')
+
+
+class _ObjectMissing(BackendError):
+    # ORA-00942 with the table or view PostgreSQL could not find, for 23ai's
+    # wording, which names it (#2110): `table or view "PYO"."T" does not
+    # exist`. Earlier releases' is what this says until the backend, which
+    # knows the release it presents, names the object.
+    def __init__(self, name: str, error_offset: int | None) -> None:
+        super().__init__(
+            'table or view does not exist',
+            ora_code=ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,
+            error_offset=error_offset,
+        )
+        (schema, _dot, relation) = name.rpartition('.')
+        self.schema = schema or None
+        self.relation = relation
+
+
 class _PrivilegeDenied(BackendError):
     # ORA-01031 for a relation's privilege PostgreSQL refused, the relation
     # named, so a per-user session can tell, once the statement is undone,
@@ -10976,6 +10998,9 @@ def _backend_error(
     offset = _missing_object_offset(exc, original)
     if offset is None:
         offset = _error_offset(exc, original, translated)
+    missing = _MISSING_RELATION.match(_primary_message(exc))
+    if code == ORA_TABLE_OR_VIEW_DOES_NOT_EXIST and missing is not None:
+        return _ObjectMissing(missing.group(1), offset)
     message = _ORA_MESSAGE.get(code, str(exc).strip())
     if code == ORA_INVALID_IDENTIFIER and getattr(exc, 'sqlstate', None) == '42703':
         message = _invalid_identifier_text(exc, original, offset) or message
@@ -11704,6 +11729,13 @@ def _while_connected(method):
         self._conn.end_own_transaction()
         try:
             return method(self, *args, **kwargs)
+        except _ObjectMissing as missing:
+            if self._conn.closed:
+                raise _session_terminated() from None
+            named = self._missing_named(missing)
+            if named is missing:
+                raise
+            raise named from missing
         except (psycopg.Error, BackendError):
             if self._conn.closed:
                 raise _session_terminated() from None
@@ -13445,6 +13477,39 @@ class PostgresBackend:
                     ),
                 )
             )
+        )
+
+    def _missing_named(self, missing: _ObjectMissing) -> BackendError:
+        # ORA-00942 as the release presented says it (#2110): 23ai names the
+        # table or view, schema and all, where the statement may name neither
+        # (`table or view "PYO"."T" does not exist`); earlier ones do not. An
+        # unquoted name is upper-cased, as Oracle folds one; the schema the
+        # statement did not give is the session's current one.
+        if self._release < (23, 0):
+            return missing
+        schema = missing.schema
+        if schema is None:
+            if (
+                self._conn.info.transaction_status
+                == psycopg.pq.TransactionStatus.INERROR
+            ):
+                return missing
+            try:
+                row = self._catalog_read('SELECT current_schema()').fetchone()
+            except psycopg.Error:
+                return missing
+            if row is None or row[0] is None:
+                return missing
+            schema = row[0]
+
+        def oracle(name: str) -> str:
+            return name.upper() if name == name.lower() else name
+
+        return BackendError(
+            f'table or view "{oracle(schema)}"."{oracle(missing.relation)}" '
+            'does not exist',
+            ora_code=ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,
+            error_offset=missing.error_offset,
         )
 
     def _privilege_refined(self, statement: str, run: Callable[[], Result]) -> Result:
