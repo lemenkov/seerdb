@@ -2210,6 +2210,15 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE OR REPLACE VIEW sys.user_errors AS SELECT name, type, sequence, '
     'line, position, text, attribute, message_number FROM sys.all_errors '
     'WHERE owner = upper(current_schema());'
+    # SYSTEM.PRODUCT_PRIVS (#2107): the SQL*Plus product profile that sqlplus
+    # 10.2 and 11.2 read at login, with its columns and no rows, as a database
+    # whose administrator restricted nothing has it. Without it every session
+    # opened with ORA-00942 and "Product user profile information not loaded!".
+    'CREATE OR REPLACE VIEW system.product_privs AS SELECT '
+    'NULL::varchar(30) AS product, NULL::varchar(128) AS userid, '
+    'NULL::varchar(240) AS attribute, NULL::varchar(240) AS scope, '
+    'NULL::numeric(15, 2) AS numeric_value, NULL::varchar(240) AS char_value, '
+    'NULL::timestamp(0) AS date_value, NULL::text AS long_value WHERE false;'
     # A package and the routines its spec declares, overloads numbered in the
     # order the spec gives them (#1605), and a user's valid standalone routine,
     # under its own name with no procedure name (#1606).
@@ -2808,7 +2817,9 @@ _DICTIONARY_STAMP = (
 # The views the dictionary script defines, in the order it creates them (#1571).
 _DICTIONARY_VIEWS: Final = tuple(
     dict.fromkeys(
-        re.findall(r'CREATE OR REPLACE VIEW (sys\.\w+)', _ORACLE_DICTIONARY_DDL)
+        re.findall(
+            r'CREATE OR REPLACE VIEW ((?:sys|system)\.\w+)', _ORACLE_DICTIONARY_DDL
+        )
     )
 )
 
@@ -11858,6 +11869,9 @@ def _user_group_grants(group: str) -> str:
         'IF to_regnamespace(quote_ident(s)) IS NOT NULL THEN '
         "EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I', s, g); END IF; END LOOP; "
         "EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA sys TO %I', g); "
+        # The product profile sqlplus reads at login (#2107).
+        "IF to_regclass('system.product_privs') IS NOT NULL THEN "
+        "EXECUTE format('GRANT SELECT ON system.product_privs TO %I', g); END IF; "
         "EXECUTE format('GRANT USAGE ON ALL SEQUENCES IN SCHEMA sys TO %I', g); "
         f'FOREACH t IN ARRAY {names(private)} LOOP '
         "IF to_regclass('sys.' || quote_ident(t)) IS NOT NULL THEN "
