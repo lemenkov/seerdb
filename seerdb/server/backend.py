@@ -127,6 +127,25 @@ class BlobValue(bytes):
     __slots__ = ()
 
 
+class VarcharValue(str):
+    """A character bind's value: a ``str`` that carries the buffer size the
+    client declared for it (#2063).
+
+    Oracle describes a bind, and an expression over one, from that size rather
+    than from the value: a sqlplus ``VARIABLE w VARCHAR2(253)`` declares 1012
+    bytes, and ``SELECT :w || '!'`` describes 2001 wide however short ``:w`` is.
+    It IS a ``str``, so a backend that does not care needs nothing new.
+    """
+
+    max_size: int
+
+    @classmethod
+    def of(cls, value: str, max_size: int) -> VarcharValue:
+        text = cls(value)
+        text.max_size = max_size
+        return text
+
+
 class LtzValue(datetime.datetime):
     """A TIMESTAMP WITH LOCAL TIME ZONE bind's value: a naive ``datetime`` that
     says it was bound as LTZ (#1222).

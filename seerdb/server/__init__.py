@@ -58,6 +58,7 @@ from seerdb.server.backend import (
     LtzValue,
     Result,
     UnsupportedFeature,
+    VarcharValue,
     as_declared_type,
     credential_lookup,
 )
@@ -95,6 +96,7 @@ __all__ = [
     'Result',
     'Server',
     'UnsupportedFeature',
+    'VarcharValue',
     'as_declared_type',
     'credential_lookup',
     'encode_accept',

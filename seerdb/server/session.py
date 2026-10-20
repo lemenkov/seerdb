@@ -212,12 +212,14 @@ from seerdb.common.tns_consts import (
     TNS_MSG_TYPE_FAST_AUTH,
     TNS_TYPE_BFILE,
     TNS_TYPE_BLOB,
+    TNS_TYPE_CHAR,
     TNS_TYPE_CLOB,
     TNS_TYPE_JSON,
     TNS_TYPE_LONG,
     TNS_TYPE_LONGRAW,
     TNS_TYPE_REFCURSOR,
     TNS_TYPE_TIMESTAMPLTZ,
+    TNS_TYPE_VARCHAR,
     TNS_TYPE_VECTOR,
     TNS_VERSION_MIN_LARGE_SDU,
     TNS_VERSION_MIN_OOB_CHECK,
@@ -272,6 +274,7 @@ from seerdb.server.backend import (
     Result,
     SessionInfo,
     UnsupportedFeature,
+    VarcharValue,
 )
 from seerdb.server.framing import SESSION_MESSAGE_LIMIT, PacketStream
 from seerdb.server.handshake import (
@@ -3974,8 +3977,9 @@ def _bind_vars(request: ExecRequest) -> list:
     # positions it bound as a Var. For any other statement it is a NULL bind: a
     # NULL carries no type, the client may have declared one (setinputsizes)
     # for exactly that reason, and a backend that cannot infer it has nothing
-    # else to go on (#699). A non-NULL value passes through unchanged, as does
-    # everything on a shape mismatch.
+    # else to go on (#699). A character value carries the buffer size the client
+    # declared, which Oracle describes a bind by (#2063). Any other value passes
+    # through unchanged, as does everything on a shape mismatch.
     if not request.binds or len(request.bind_meta) != len(request.binds):
         return request.binds
     block = is_plsql(request.sql)
@@ -4001,6 +4005,8 @@ def _bind_vars(request: ExecRequest) -> list:
             toid=toid,
         )
         if block or value is None
+        else VarcharValue.of(value, size)
+        if type(value) is str and tns_type in (TNS_TYPE_VARCHAR, TNS_TYPE_CHAR)
         else value
         for value, (tns_type, size), capacity, csfrm, toid in zip(
             request.binds, request.bind_meta, arrays, forms, toids

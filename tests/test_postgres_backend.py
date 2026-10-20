@@ -7722,6 +7722,72 @@ def test_to_nchar_is_to_char_in_the_national_set() -> None:
         backend.close()
 
 
+def test_concat_width_sums_the_operands_oracle_counts() -> None:
+    # Oracle sizes a concatenation as its operands' sum (#2063): a bind by its
+    # describe size, a literal by its bytes, CONCAT as `||`. A column or a
+    # call counts nothing and leaves the item incomplete. Measured on 23ai.
+    from seerdb.server.backends.postgres import _bind_describe_size, _concat_width
+
+    assert [_bind_describe_size(n) for n in (4, 32, 33, 128, 1012, 2001, 4001)] == [
+        32,
+        32,
+        128,
+        128,
+        2000,
+        4000,
+        8192,
+    ]
+    assert _bind_describe_size(40000) == 32767
+    sizes = {'w': 2000, '1': 32}
+    assert _concat_width(":w || '!' x", sizes) == (2001, True)
+    assert _concat_width(':w', sizes) == (2000, True)
+    assert _concat_width("'abc' || :w AS x", sizes) == (2003, True)
+    assert _concat_width(':w || :w "X"', sizes) == (4000, True)
+    assert _concat_width("concat(:w, '!')", sizes) == (2001, True)
+    assert _concat_width("(:1 || 'é') || :1", sizes) == (66, True)
+    assert _concat_width("'it''s'", sizes) == (4, True)
+    assert _concat_width('dummy || :w x', sizes) == (2000, False)
+    assert _concat_width("upper(:w) || 'x'", sizes) == (1, False)
+    assert _concat_width(':w + 1', sizes) == (0, False)
+    assert _concat_width(
+        ':w || :w || :w || :w || :w || :w || :w || :w || :w || :w '
+        '|| :w || :w || :w || :w || :w || :w || :w',
+        sizes,
+    ) == (32767, True)
+
+
+def test_a_concatenation_of_a_bind_describes_by_its_declared_size() -> None:
+    # A concatenation over a bind described by its longest value, so sqlplus
+    # printed `:w || '!'` under a 4-character heading where Oracle gives 2001
+    # (#2063). A table's column still describes as declared.
+    from seerdb.server import VarcharValue
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        result = backend.execute(
+            "SELECT :w || '!' a, :w b, 'abc' || :w c, :w || :w d, dummy || :w e, "
+            "'xy' f FROM dual",
+            [VarcharValue.of('abc', 1012)],
+        )
+        assert result.rows == [('abc!', 'abc', 'abcabc', 'abcabc', 'Xabc', 'xy')]
+        assert [c.data_length for c in result.columns] == [
+            2001,
+            2000,
+            2003,
+            4000,
+            2000,
+            2,
+        ]
+        # A bare value, as a backend caller other than the Mirror hands one,
+        # still describes by the values.
+        result = backend.execute("SELECT :w || '!' a FROM dual", ['abc'])
+        assert [c.data_length for c in result.columns] == [4]
+    finally:
+        backend.close()
+
+
 def test_translate_binds_repeated_named_bind_is_one_value() -> None:
     # `:x` twice is one Oracle value → one psycopg parameter reused, not two.
     sql, params = _translate_binds('SELECT id FROM t WHERE id = :x OR :x IS NULL', [1])
