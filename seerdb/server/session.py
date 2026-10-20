@@ -1833,7 +1833,18 @@ def _serve_oci_session(
             _ENCODE_OCI_CALL_SEQ.set(body[2])
         if len(body) >= 2 and body[0] == TTI_FUN:
             if body[1] == TTI_ALL8:
-                if is_reexecute_oci(body) and ref_cursors.serve_reexecute(
+                streamed = (
+                    ref_cursors.take_streamed(body) if is_reexecute_oci(body) else None
+                )
+                if streamed is not None:
+                    # A REF CURSOR whose rows carry a LOB or LONG: they stream as
+                    # a query's do, one row per call and each LOB's content over
+                    # TTI_LOBOPS, from this re-execute on (#2033).
+                    parked = streamed
+                    (lobs, slot_lobs) = _oci_lob_queues(*streamed)
+                    current_lob = None
+                    slot_current = {}
+                elif is_reexecute_oci(body) and ref_cursors.serve_reexecute(
                     stream, body, seq
                 ):
                     continue
@@ -2264,16 +2275,6 @@ def _answer_query_oci(
             ),
         )
         return None, [], {}
-    if any(
-        isinstance(value, CursorResult)
-        and (_is_lob_result(value.columns) or _is_long_result(value.columns))
-        for value in result.out_binds
-    ):
-        # A REF CURSOR whose rows carry a LOB or LONG streams them over calls of
-        # their own, which this path does not serve yet. Its rows sent the plain
-        # way hung sqlplus; refused, the session carries on (#2014).
-        _refuse_unhandled_oci(stream, 'a REF CURSOR with LOB or LONG columns', seq)
-        return None, [], {}
     if result.out_binds:
         # A PL/SQL block that assigned OUT binds (sqlplus VARIABLE / EXEC) — return
         # the values so the client reads them back into its bound buffers.
@@ -2325,15 +2326,7 @@ def _answer_query_oci(
         )
         return None, [], {}
     rows = list(result.rows)
-    # Every LOB cell across the whole result queues its content now, row-major, so
-    # the follow-up TTI_LOBOPS reads drain it in the order the locators went out.
-    # This is the OCI path, which reads JSON and VECTOR that way too -- unlike the
-    # thin path, which carries their images in the row (#826/#887).
-    lobs = oci_lob_reads(result.columns, rows)
-    slot_lobs: dict[int, list[tuple[bytes, bool, bool]]] = {}
-    for row in rows:
-        for slot, cell in oci_lob_row_cells(result.columns, row).items():
-            slot_lobs.setdefault(slot, []).append(cell)
+    (lobs, slot_lobs) = _oci_lob_queues(result.columns, rows)
     has_long = any(
         col.data_type in (TNS_TYPE_LONG, TNS_TYPE_LONGRAW) for col in result.columns
     )
@@ -2383,6 +2376,21 @@ def _answer_query_oci(
         ),
     )
     return (result.columns, rows[1:]), lobs, slot_lobs
+
+
+def _oci_lob_queues(
+    columns: list[ColumnMeta], rows: list[tuple]
+) -> tuple[list[tuple[bytes, bool, bool]], dict[int, list[tuple[bytes, bool, bool]]]]:
+    # Every LOB cell across the whole result queues its content now, row-major, so
+    # the follow-up TTI_LOBOPS reads drain it in the order the locators went out.
+    # This is the OCI path, which reads JSON and VECTOR that way too -- unlike the
+    # thin path, which carries their images in the row (#826/#887).
+    lobs = oci_lob_reads(columns, rows)
+    slot_lobs: dict[int, list[tuple[bytes, bool, bool]]] = {}
+    for row in rows:
+        for slot, cell in oci_lob_row_cells(columns, row).items():
+            slot_lobs.setdefault(slot, []).append(cell)
+    return (lobs, slot_lobs)
 
 
 def _answer_describe_oci(
@@ -2958,6 +2966,18 @@ class _OciRefCursors:
         self._next_id += 1
         self._open[cursor_id] = (list(value.columns), list(value.rows))
         return RefCursorOutBind(columns=list(value.columns), cursor_id=cursor_id)
+
+    def take_streamed(self, body: bytes) -> tuple[list[ColumnMeta], list[tuple]] | None:
+        # A re-executed cursor whose rows carry a LOB or LONG, handed over whole:
+        # those stream over calls of their own, as a query's do (#2033).
+        cursor_id = int.from_bytes(body[7:11], 'little')
+        opened = self._open.get(cursor_id)
+        if opened is None or not (
+            _is_lob_result(opened[0]) or _is_long_result(opened[0])
+        ):
+            return None
+        del self._open[cursor_id]
+        return opened
 
     def serve_reexecute(
         self, stream: PacketStream, body: bytes, seq: '_OciSequence'
