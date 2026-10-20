@@ -442,6 +442,72 @@ def test_the_sqlplus_product_profile_is_there_and_empty() -> None:
         backend.close()
 
 
+def test_a_unique_violation_is_worded_as_oracle_words_it() -> None:
+    # ORA-00001 carried PostgreSQL's `duplicate key value violates unique
+    # constraint` and its DETAIL line (#2120). Before 23ai Oracle's names the
+    # constraint; 23ai's names the table and columns too, and gives the row's
+    # values on an ORA-03301 line, a character value quoted, its own quote as
+    # it is. Measured on 23ai.
+    from seerdb.server.backend import BackendError
+
+    for presents, expected in (
+        (
+            '23ai',
+            [
+                'unique constraint (PYO.T2120_PKEY) violated on table PYO.T2120 '
+                'columns (ID)\nORA-03301: (ORA-00001 details) row with column '
+                'values (ID:1) already exists',
+                'unique constraint (PYO.U2120) violated on table PYO.T2120 '
+                'columns (N, K)\nORA-03301: (ORA-00001 details) row with column '
+                "values (N:'a'b', K:2) already exists",
+            ],
+        ),
+        (
+            '12.1',
+            [
+                'unique constraint (PYO.T2120_PKEY) violated',
+                'unique constraint (PYO.U2120) violated',
+            ],
+        ),
+    ):
+        backend = PostgresBackend(
+            _CONNINFO, credentials=dict(_CREDS), presents=presents
+        )
+        try:
+            backend.authenticate('PYO')
+            backend.open_session({})
+            backend.execute(
+                'CREATE TABLE t2120 (id NUMBER PRIMARY KEY, n VARCHAR2(10), '
+                'k NUMBER, CONSTRAINT u2120 UNIQUE (n, k))'
+            )
+            try:
+                backend.execute("INSERT INTO t2120 VALUES (1, 'a''b', 2)")
+                got = []
+                for statement in (
+                    "INSERT INTO t2120 VALUES (1, 'x', 3)",
+                    "INSERT INTO t2120 VALUES (2, 'a''b', 2)",
+                ):
+                    with pytest.raises(BackendError) as raised:
+                        backend.execute(statement)
+                    assert raised.value.ora_code == 1
+                    got.append(str(raised.value))
+                assert got == expected
+                # An array's error keeps the rows it applied before it failed:
+                # only the words change (#998).
+                with pytest.raises(BackendError) as raised:
+                    backend.execute_many(
+                        "INSERT INTO t2120 VALUES (:1, 'r', :1)",
+                        [[10], [20], [30], [20], [50]],
+                    )
+                assert raised.value.rowcount == 3
+                assert str(raised.value).startswith(expected[0][:17])
+            finally:
+                backend.rollback()
+                backend.execute('DROP TABLE t2120')
+        finally:
+            backend.close()
+
+
 def test_a_missing_table_is_named_as_23ai_names_it() -> None:
     # 23ai's ORA-00942 names the table or view, schema and all, where the
     # statement may name neither; earlier releases' does not (#2110). ORA-00955
