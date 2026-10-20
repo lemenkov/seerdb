@@ -29,9 +29,22 @@ def test_packed_versions_decode_to_the_releases_they_name() -> None:
     # decoder, so this is what a client would actually report.
     assert _format_version(IDENTITY_11_2.version_no) == '11.2.0.2.0'
     assert _format_version(IDENTITY_12_2.version_no) == '12.2.0.1.0'
-    # Measured: what a client's connection.version shows against the testbeds.
-    assert _format_version(IDENTITY_21.version_no) == '21.0.48.0.0'
-    assert _format_version(IDENTITY_23.version_no) == '23.1.162.0.0'
+    # Measured: what python-oracledb's connection.version shows against the
+    # testbeds.
+    assert _format_version(IDENTITY_21.version_no) == '21.3.0.0.0'
+    assert _format_version(IDENTITY_23.version_no) == '23.26.2.0.0'
+
+
+def test_a_release_from_18c_on_decodes_by_its_own_layout() -> None:
+    # From 18c the packed release is major, update, revision, increment,
+    # extension; the older layout made 23ai 23.1.162.0.0 (#2097). What each
+    # testbed sends, and what python-oracledb reports for it.
+    assert _format_version(0x0A200500) == '10.2.0.5.0'
+    assert _format_version(0x0B200200) == '11.2.0.2.0'
+    assert _format_version(0x12000000) == '18.0.0.0.0'
+    assert _format_version(0x15030000) == '21.3.0.0.0'
+    assert _format_version(0x171A2000) == '23.26.2.0.0'
+    assert _format_version(0) is None
 
 
 def test_11_2_field_version_keeps_the_captured_11g_identity() -> None:

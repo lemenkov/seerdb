@@ -1002,8 +1002,7 @@ is the way to test it, since that is exactly what a real 12.1 client does.
 
 > **Oracle 26ai advertises field version 27 (#458).** The
 > `container-registry.oracle.com/database/free:latest` image — branded **26ai**
-> (`ORACLE_HOME=.../26ai/dbhomeFree`), though the engine still reports
-> `23.1.162.0.0` via `v$version` — sends `compile_caps[7] = 27` in its PRO,
+> (`ORACLE_HOME=.../26ai/dbhomeFree`), release 23.26.2.0.0 — sends `compile_caps[7] = 27` in its PRO,
 > above the 23ai fast-auth maximum of 24. seerdb caps its own advertised field
 > version at 24 (`FIELD_VERSION_23_4`) and so negotiates `min(24, 27) = 24`,
 > connecting and running the full 23ai surface (auth, ANO native encryption,
@@ -1282,11 +1281,14 @@ used to send it from 12.1 only, which left a pre-12.1 client with no serial
 (#1234). A 9i reply carries neither.
 
 `AUTH_VERSION_NO` is a decimal string of a single packed integer holding
-the server's release. Decode it as `major` (bits 24-31), `minor`
+the server's release. Before 18c, decode it as `major` (bits 24-31), `minor`
 (20-23), `update` (12-19), `patch` (8-11), `port-specific update`
 (0-7) — e.g. `186647040` = `0x0B200200` = `11.2.0.2.0`, matching
-`product_component_version` on XE. seerdb exposes the dotted form as
-`Connection.version` and masks the major release out for its protocol
+`product_component_version` on XE. From 18c the fields are the release
+update's: `major` (24-31), `update` (16-23), `revision` (12-15), `increment`
+(4-11), `extension` (0-3), the reading python-oracledb gives (#2097). The
+older layout read 23ai's word as 23.1.162.0.0. seerdb exposes the dotted form
+as `Connection.version` and masks the major release out for its protocol
 version gate.
 
 Decoding what three live servers send confirms the layout across releases:
@@ -1294,8 +1296,12 @@ Decoding what three live servers send confirms the layout across releases:
 | Server | `AUTH_VERSION_NO` | Packed | Decodes to | `AUTH_VERSION_SQL` |
 |--------|-------------------|--------|------------|--------------------|
 | XE 11.2   | `186647040` | `0x0B200200` | 11.2.0.2.0   | `22` |
-| XE 21c    | `352518144` | `0x15030000` | 21.0.48.0.0  | `25` |
-| 23ai/26ai | `387588096` | `0x171A2000` | 23.1.162.0.0 | `26` |
+| XE 18c    | `301989888` | `0x12000000` | 18.0.0.0.0   | |
+| XE 21c    | `352518144` | `0x15030000` | 21.3.0.0.0   | `25` |
+| 23ai/26ai | `387588096` | `0x171A2000` | 23.26.2.0.0  | `26` |
+
+18c's word names the base release; its `product_component_version` says
+18.4.0.0.0.
 
 `AUTH_VERSION_SQL` is a small counter that moves with the release. Nothing reads
 it back — a client decodes only `AUTH_VERSION_NO` into its version property — so

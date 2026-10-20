@@ -10,8 +10,9 @@ advertising a 12c field version still introduced itself as 11.2.0.2.0. They now
 follow the advertised field version instead.
 
 **The packed release format**: ``major<<24 | minor<<20 | update<<12 | patch<<8 |
-port``. Verified by decoding what three live servers send — XE 11.2 ->
-11.2.0.2.0, XE 21c -> 21.0.48.0.0, 23ai -> 23.1.162.0.0.
+port`` before 18c, ``major<<24 | update<<16 | revision<<12 | increment<<4 |
+extension`` from it (#2097). Verified by decoding what three live servers send —
+XE 11.2 -> 11.2.0.2.0, XE 21c -> 21.3.0.0.0, 23ai -> 23.26.2.0.0.
 
 ``AUTH_VERSION_SQL`` is a small counter that moves with the release; the captured
 anchors are 11.2 -> 22, 21c -> 25, 23ai -> 26. **12.2's value is not captured**
@@ -21,9 +22,7 @@ its version property — so it is descriptive, not load-bearing.
 
 The 21c and 23ai banners are what those two testbeds print after "Connected
 to:" (``v$version``), measured 2026-09-06. The 23ai testbed is the 26ai Free
-build of the 23 lineage, whose engine still reports the 23.1.162 release the
-client decodes while its banner names the 23.26.2 build; both are kept as sent,
-that mismatch being what the real server does.
+build of the 23 lineage, release 23.26.2.
 """
 
 from __future__ import annotations
@@ -38,7 +37,7 @@ from seerdb.common.tns_consts import (
     VERSION_12_1_0_2,
     VERSION_12_2_0_1,
     VERSION_21_3_0_0,
-    VERSION_23_1_162_0,
+    VERSION_23_26_2_0,
 )
 
 
@@ -87,14 +86,14 @@ IDENTITY_12_2 = ServerIdentity(
 )
 
 IDENTITY_21 = ServerIdentity(
-    version_no=VERSION_21_3_0_0,  # 21.3.0.0.0, which a client renders as 21.0.48.0.0
+    version_no=VERSION_21_3_0_0,  # 21.3.0.0.0
     version_sql=b'25',
     version_string=b'- Production',
     banner=b'Oracle Database 21c Express Edition Release 21.0.0.0.0 - Production',
 )
 
 IDENTITY_23 = ServerIdentity(
-    version_no=VERSION_23_1_162_0,  # 23.1.162.0.0
+    version_no=VERSION_23_26_2_0,  # 23.26.2.0.0
     version_sql=b'26',
     version_string=b'- Develop, Learn, and Run for Free',
     banner=(

@@ -42,7 +42,7 @@ from seerdb.common.tns_consts import (
     TTI_SESS,
     VERSION_11_2_0_2,
     VERSION_12_2_0_1,
-    VERSION_23_1_162_0,
+    VERSION_23_26_2_0,
 )
 from seerdb.server.auth import (
     check_auth_complete,
@@ -127,7 +127,7 @@ def test_a_21c_result_also_sends_the_real_unique_name() -> None:
     # Presenting 21c or later, the reply carries the unique name a second time
     # as AUTH_SC_REAL_DBUNIQUE_NAME, as 21c and 23ai do; python-oracledb 26
     # reads only that one (#1777). Before 21c only the first.
-    modern = encode_result(bytes(24), version_no=VERSION_23_1_162_0, db_name='FREE')
+    modern = encode_result(bytes(24), version_no=VERSION_23_26_2_0, db_name='FREE')
     older = encode_result(bytes(24), version_no=VERSION_12_2_0_1, db_name='FREE')
     assert b'AUTH_SC_REAL_DBUNIQUE_NAME' in modern
     assert b'AUTH_SC_REAL_DBUNIQUE_NAME' not in older

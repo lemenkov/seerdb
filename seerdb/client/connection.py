@@ -220,8 +220,20 @@ def _format_version(Packed: int) -> str | None:
     # Oracle packs the release into a single integer: major (8 bits),
     # minor (4), update (8), patch (4), port-specific update (8). Verified
     # against product_component_version on XE 11.2.0.2.0 (0x0b200200).
+    # From 18c the fields are the release update's: major (8), update (8),
+    # revision (4), increment (8), extension (4). 23ai's 0x171a2000 is
+    # 23.26.2.0.0 and 21c's 0x15030000 21.3.0.0.0, as python-oracledb reads
+    # them, where the older layout made them 23.1.162 and 21.0.48 (#2097).
     if not Packed:
         return None
+    if (Packed >> 24) & 0xFF >= 18:
+        return '%d.%d.%d.%d.%d' % (
+            (Packed >> 24) & 0xFF,
+            (Packed >> 16) & 0xFF,
+            (Packed >> 12) & 0x0F,
+            (Packed >> 4) & 0xFF,
+            Packed & 0x0F,
+        )
     return '%d.%d.%d.%d.%d' % (
         (Packed >> 24) & 0xFF,
         (Packed >> 20) & 0x0F,
