@@ -416,6 +416,32 @@ def test_lob_substr_items_are_whole_items_only() -> None:
     assert _lob_substr_items('select * from t') == set()
 
 
+def test_the_sqlplus_product_profile_is_there_and_empty() -> None:
+    # sqlplus 10.2 and 11.2 read SYSTEM.PRODUCT_PRIVS at login, which did not
+    # exist, so every session opened with ORA-00942 and "Product user profile
+    # information not loaded!" (#2107). This is their query, as captured; the
+    # profile restricts nothing, so it has no rows.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        result = backend.execute(
+            'SELECT ATTRIBUTE,SCOPE,NUMERIC_VALUE,CHAR_VALUE,DATE_VALUE '
+            "FROM SYSTEM.PRODUCT_PRIVS WHERE (UPPER('SQL*Plus') LIKE UPPER(PRODUCT)) "
+            'AND (USER LIKE USERID)'
+        )
+        assert result.rows == []
+        assert [c.name for c in result.columns] == [
+            b'ATTRIBUTE',
+            b'SCOPE',
+            b'NUMERIC_VALUE',
+            b'CHAR_VALUE',
+            b'DATE_VALUE',
+        ]
+    finally:
+        backend.close()
+
+
 def test_all_errors_lists_an_invalid_objects_error() -> None:
     # sqlplus's SHOW ERRORS reads ALL_ERRORS, which did not exist (#2060). A
     # CREATE that does not compile lists its error at the line and column
