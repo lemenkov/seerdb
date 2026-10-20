@@ -370,9 +370,11 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_RAW,
     TNS_TYPE_REF,
     TNS_TYPE_REFCURSOR,
+    TNS_TYPE_RID,
     TNS_TYPE_TIMESTAMP,
     TNS_TYPE_TIMESTAMPLTZ,
     TNS_TYPE_TIMESTAMPTZ,
+    TNS_TYPE_UROWID,
     TNS_TYPE_VARCHAR,
     TNS_TYPE_VECTOR,
     VECTOR_FLAG_FLEXIBLE_DIM,
@@ -6298,7 +6300,9 @@ def _rowid_sub(match: 're.Match[str]') -> str:
 # DUAL's one row as a ROWID (#2059): DUAL is a view over orafce's, with no
 # tableoid or ctid to read, and Oracle gives it a fixed ROWID. This is the
 # same function over a fixed table and row, so it describes as every ROWID.
-_DUAL_ROWID = "sys.ora_rowid(0::oid, '(0,1)'::tid)"
+# The data object is 143, Oracle's own DUAL's: sqlplus prints a ROWID of
+# object 0 in the restricted form, 00000001.0001.0001 (#2083).
+_DUAL_ROWID = "sys.ora_rowid(143::oid, '(0,1)'::tid)"
 _ENDS_FROM = r'(?:WHERE|GROUP|ORDER|CONNECT|START|UNION|INTERSECT|MINUS|FETCH|FOR)'
 _FROM_DUAL_ONLY = re.compile(
     r'\bFROM\s+(?:SYS\s*\.\s*)?DUAL\b'
@@ -7541,6 +7545,8 @@ def _top_level_words(sql: str) -> tuple[list[tuple[int, str]], list[int]]:
 _LOB_CALL_ITEM = re.compile(
     r'(?:sys\s*\.\s*)?(to_clob|empty_clob|to_blob|empty_blob)\s*\(', re.IGNORECASE
 )
+# The ROWID pseudo-column as its rule writes it (_rowid_sub, _DUAL_ROWID).
+_ROWID_CALL_ITEM = re.compile(r'sys\s*\.\s*ora_rowid\s*\(', re.IGNORECASE)
 # An IntervalYM bind as the translation writes it (_translate_binds).
 _INTERVALYM_BIND_ITEM = re.compile(r'make_interval\(months => %\(\w+\)s\)')
 _ITEM_ALIAS = re.compile(r'(?:AS\s+)?(?:"[^"]*"|[A-Za-z_][\w$#]*)?', re.IGNORECASE)
@@ -7737,6 +7743,14 @@ def _computed_column_types(sql: str) -> dict[int, int]:
         ym = _INTERVALYM_BIND_ITEM.match(item)
         if ym is not None and _ITEM_ALIAS.fullmatch(item[ym.end() :].strip()):
             found[index] = TNS_TYPE_INTERVALYM
+            continue
+        rowid = _ROWID_CALL_ITEM.match(item)
+        if rowid is not None:
+            # The ROWID pseudo-column, as the rewrite writes it: text here, a
+            # ROWID to Oracle (#2083).
+            close = _matching_paren(item, rowid.end() - 1)
+            if close < len(item) and _ITEM_ALIAS.fullmatch(item[close + 1 :].strip()):
+                found[index] = TNS_TYPE_RID
             continue
         call = _LOB_CALL_ITEM.match(item)
         if call is None:
@@ -10963,6 +10977,18 @@ def _refcursor_column_meta(name: str) -> ColumnMeta:
         data_type=TNS_TYPE_REFCURSOR,
         data_length=0,
         max_size=0,
+    )
+
+
+def _rowid_column_meta(name: str, data_type: int = TNS_TYPE_RID) -> ColumnMeta:
+    # A ROWID (or UROWID) result column: the rowid's text, which the core
+    # encodes as Oracle's ROWID (#2083).
+    width = _LOCATOR_LENGTHS['ROWID' if data_type == TNS_TYPE_RID else 'UROWID']
+    return ColumnMeta(
+        name=_oracle_column_name(name).encode('utf-8'),
+        data_type=data_type,
+        data_length=width,
+        max_size=width,
     )
 
 
@@ -15144,6 +15170,8 @@ class PostgresBackend:
                 columns.append(_intervalym_column_meta(desc.name))
             elif domain == TNS_TYPE_DATE:
                 columns.append(_date_column_meta(desc.name))
+            elif domain == TNS_TYPE_RID:
+                columns.append(_rowid_column_meta(desc.name))
             elif (
                 vector := self._vector_column(cursor.pgresult, i, desc.type_code)
             ) is not None:
@@ -15294,7 +15322,17 @@ class PostgresBackend:
             for i, (declared, length, _p, _s) in self._declared_column_types(
                 cursor.pgresult, plain
             ).items():
-                if declared in _LONG_TYPES:
+                if declared in ('ROWID', 'UROWID'):
+                    # A ROWID / UROWID column, a varchar here (#2083).
+                    columns[i] = replace(
+                        _rowid_column_meta(
+                            cursor.description[i].name,
+                            TNS_TYPE_RID if declared == 'ROWID' else TNS_TYPE_UROWID,
+                        ),
+                        name=columns[i].name,
+                        null_ok=columns[i].null_ok,
+                    )
+                elif declared in _LONG_TYPES:
                     columns[i] = replace(
                         columns[i],
                         data_type=_LONG_TYPES[declared],
