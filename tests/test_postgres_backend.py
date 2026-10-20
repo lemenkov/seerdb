@@ -8159,6 +8159,43 @@ def test_a_concatenation_of_a_bind_describes_by_its_declared_size() -> None:
         backend.close()
 
 
+def test_an_undeclared_name_is_pls_00201_with_its_statement_ignored() -> None:
+    # A routine whose statement starts with a name no declaration gives -- a
+    # bare call, an assignment to an undeclared variable -- lists PostgreSQL's
+    # syntax error or `not a known variable` (#2121). 23ai lists PLS-00201 at
+    # the name, then the statement it ignored, at the same place.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        for source, line, position, name in (
+            ('begin nosuch; end;', 1, 26, 'NOSUCH'),
+            ('begin nosuch(1); end;', 1, 26, 'NOSUCH'),
+            ('begin x := 1; end;', 1, 26, 'X'),
+            ('begin\n  null;\n  nosuch;\nend;', 3, 3, 'NOSUCH'),
+        ):
+            result = backend.execute(f'create or replace procedure p2121 as {source}')
+            assert result.compilation_warning
+            assert backend.execute(
+                'SELECT sequence, line, position, text, message_number '
+                "FROM user_errors WHERE name = 'P2121' ORDER BY sequence"
+            ).rows == [
+                (
+                    1,
+                    line,
+                    position,
+                    f"PLS-00201: identifier '{name}' must be declared",
+                    201,
+                ),
+                (2, line, position, 'PL/SQL: Statement ignored', 0),
+            ], source
+    finally:
+        try:
+            backend.execute('drop procedure p2121')
+        finally:
+            backend.close()
+
+
 def test_translate_binds_repeated_named_bind_is_one_value() -> None:
     # `:x` twice is one Oracle value → one psycopg parameter reused, not two.
     sql, params = _translate_binds('SELECT id FROM t WHERE id = :x OR :x IS NULL', [1])
