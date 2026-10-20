@@ -21,6 +21,7 @@ import re
 import struct
 from collections.abc import Callable, Sequence
 from dataclasses import replace
+from decimal import Decimal
 from typing import TypeVar
 
 import seerdb
@@ -84,6 +85,12 @@ def _plsql_string_bytes(value: object) -> int:
     return 0
 
 
+# sqlplus's SERVEROUTPUT fetch (#2104): its lines into a collection, and how
+# many it wants (captured from sqlplus 23.26).
+_GET_LINES_CALL = re.compile(
+    r'\s*BEGIN\s+DBMS_OUTPUT\.GET_LINES\s*\(\s*:\w+\s*,\s*:\w+\s*\)\s*;\s*END\s*;\s*',
+    re.IGNORECASE,
+)
 # The upstream's release, base and full, and its banners (#2024): version_full
 # and banner_full are 18c's, so an older server answers the second query.
 _RELEASE_QUERIES = (
@@ -1061,6 +1068,13 @@ class OraclePassthroughBackend:
         return Result(rowcount=cursor.rowcount or 0, returned_rows=returned)
 
     def _execute_plsql(self, cursor, sql: str, binds: Sequence) -> Result:
+        if (
+            getattr(self._conn, 'field_version', 0) < FIELD_VERSION_12_1
+            and _GET_LINES_CALL.fullmatch(sql)
+            and len(binds) == 2
+            and binds[0].tns_type == TNS_TYPE_ADT
+        ):
+            return self._get_lines_by_line(cursor, binds)
         # Each PL/SQL bind is registered as an OUT-capable Var (the wire carries
         # no direction), including a resolved temp-LOB CLOB / BLOB value (#91):
         # a block that WRITES to such a bind needs its new content back, and a
@@ -1172,6 +1186,34 @@ class OraclePassthroughBackend:
             # bind OUT (#1064).
             bind_directions=tuple(getattr(cursor, 'bind_directions', None) or ()),
         )
+
+    def _get_lines_by_line(self, cursor, binds: Sequence) -> Result:
+        # SERVEROUTPUT's lines from an upstream before 12.1 (#2104). sqlplus
+        # reads them with DBMS_OUTPUT.GET_LINES into a DBMSOUTPUT_LINESARRAY,
+        # which below 12.1 the client cannot bind (#2039), so sqlplus printed
+        # nothing. GET_LINE, one VARCHAR2 at a time, reads the same lines, up
+        # to the count sqlplus asked for; they go back as the collection it
+        # bound, and the count as the number read.
+        wanted = binds[1].value
+        count = int(wanted) if isinstance(wanted, (int, float, Decimal)) else 0
+        lines: list = []
+        try:
+            while len(lines) < count:
+                line = cursor.var(str, _PLSQL_STRING_LIMIT)
+                status = cursor.var(int)
+                cursor.execute(
+                    'BEGIN DBMS_OUTPUT.GET_LINE(:1, :2); END;', [line, status]
+                )
+                if status.getvalue() != 0:
+                    break
+                lines.append(line.getvalue())
+        except seerdb.DatabaseError as exc:
+            raise _relay_error(exc) from exc
+        typ = self._gettype_by_oid(binds[0].toid)
+        value = (
+            DbObject(typ.name, elements=lines, dbtype=typ) if typ is not None else lines
+        )
+        return Result(out_binds=[value, len(lines)])
 
     def sessionless_begin(self, transaction_id: bytes, timeout: int) -> None:
         # Start a sessionless transaction on the upstream connection so the
