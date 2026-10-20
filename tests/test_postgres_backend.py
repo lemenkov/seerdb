@@ -1984,6 +1984,36 @@ def test_real_sql_round_trip_postgres() -> None:
     assert rows == [(1, 'alice', Decimal('9.5')), (2, 'bob', -3)]
 
 
+def test_a_rowid_describes_as_a_rowid() -> None:
+    # The ROWID pseudo-column, and a ROWID or UROWID column, described as a
+    # VARCHAR2 -- their text here -- where 18c describes each as itself (#2083).
+    from seerdb.common.tns_consts import TNS_TYPE_RID, TNS_TYPE_UROWID
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        try:
+            backend.execute('CREATE TABLE t_2083 (r ROWID, u UROWID, a NUMBER)')
+            backend.execute('INSERT INTO t_2083 (a) VALUES (1)')
+            result = backend.execute(
+                'SELECT r, u, ROWID, t.rowid q, ROWIDTOCHAR(ROWID) c FROM t_2083 t'
+            )
+            assert [c.data_type for c in result.columns] == [
+                TNS_TYPE_RID,
+                TNS_TYPE_UROWID,
+                TNS_TYPE_RID,
+                TNS_TYPE_RID,
+                1,
+            ]
+        finally:
+            backend.execute('DROP TABLE t_2083 PURGE')
+        dual = backend.execute('SELECT ROWID FROM dual')
+        assert dual.columns[0].data_type == TNS_TYPE_RID
+    finally:
+        backend.close()
+
+
 def test_a_login_opens_no_transaction_and_its_settings_outlast_a_rollback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7456,7 +7486,7 @@ def test_a_rowid_reads_dual_and_a_qualified_relation() -> None:
     try:
         backend.authenticate('PYO')
         backend.open_session({})
-        dual = 'AAAAAAAABAAAAABAAB'
+        dual = 'AAAACPAABAAAAABAAB'
         assert backend.execute('SELECT ROWID FROM dual').rows == [(dual,)]
         assert backend.execute('SELECT d.rowid, dummy FROM sys.dual d').rows == [
             (dual, 'X')
