@@ -9384,7 +9384,8 @@ def _reject_unsupported_ddl_types(sql: str, release: tuple[int, int]) -> None:
 # from the pattern: a greedy `\((.*)\)` ran on to the last `) AS` of the BODY --
 # `count(*) AS n` -- and split the routine there (#1467).
 _ROUTINE_HEAD = re.compile(
-    r'(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(PROCEDURE|FUNCTION)\s+([\w.]+)\s*'
+    r'(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(PROCEDURE|FUNCTION)\s+'
+    r'((?:"[^"]+"|[\w$#]+)(?:\s*\.\s*(?:"[^"]+"|[\w$#]+))?)\s*'
 )
 _ROUTINE_TAIL = re.compile(
     r'(?is)\s*(?:RETURN\s+([\w ]+?)\s+)?(?:AUTHID\s+(DEFINER|CURRENT_USER)\s+)?'
@@ -9589,12 +9590,30 @@ def _compile_error_place(
     return (line, position, text, number)
 
 
+# A name, perhaps schema-qualified, either part perhaps quoted (#2176).
+_QUALIFIED_NAME = re.compile(r'\s*(?:("[^"]+"|[\w$#]+)\s*\.\s*)?("[^"]+"|[\w$#]+)\s*$')
+
+
+def _pg_routine_name(name: str) -> tuple[str, str]:
+    # A routine's name as PostgreSQL stores it, (schema or '', routine): a
+    # quoted part as written, another in lower case (#2176). A name of more
+    # parts is split at its last dot, as before.
+    parts = _QUALIFIED_NAME.match(name)
+    if parts is None:
+        (schema, _dot, routine) = name.lower().rpartition('.')
+        return (schema, routine)
+    return (_pg_identifier(parts.group(1) or ''), _pg_identifier(parts.group(2)))
+
+
 def _routine_mark(name: str, status: str) -> str:
     # The statement that marks every routine of `name` -- one, as the routine
     # DDL drops it by name first -- as a user's, VALID or INVALID (#1606).
-    (schema, _dot, routine) = name.lower().rpartition('.')
+    (schema, routine) = _pg_routine_name(name)
+    routine = routine.replace("'", "''")
     namespace = (
-        f"'{schema}'::regnamespace" if schema else 'current_schema()::regnamespace'
+        '\'"{}"\'::regnamespace'.format(schema.replace('"', '""').replace("'", "''"))
+        if schema
+        else 'current_schema()::regnamespace'
     )
     return (
         'DO $m$ DECLARE r regprocedure; BEGIN FOR r IN SELECT p.oid::regprocedure '
@@ -10800,16 +10819,17 @@ def _perform_bare_calls(body: str, routine_kind: Callable[[str], str | None]) ->
         if token.kind in ('space', 'comment'):
             out.append(text)  # neither starts nor ends a statement
             continue
-        if token.kind != 'word':
+        if token.kind not in ('word', 'identifier'):
             out.append(text)
             start = text == ';'
             continue
-        # A name, dotted through as many parts as it has: pkg.proc.
+        # A name, dotted through as many parts as it has: pkg.proc, any part
+        # quoted (#2176).
         end = token.end
         while (
             index + 1 < len(tokens)
             and body[tokens[index].start : tokens[index].end] == '.'
-            and tokens[index + 1].kind == 'word'
+            and tokens[index + 1].kind in ('word', 'identifier')
         ):
             end = tokens[index + 1].end
             index += 2
@@ -11015,7 +11035,8 @@ _CALL_BLOCK = re.compile(r'(?is)^\s*BEGIN\s+(.*?)\s*;?\s*END\s*;?\s*$')
 # `BEGIN p(); END;` -- python-oracledb's callproc of one sends the former, with no
 # binds (#1404).
 _BARE_CALL = re.compile(
-    r'(?is)^\s*BEGIN\s+([\w.$#]+)\s*(?:\(\s*\))?\s*;\s*END\s*;?\s*$'
+    r'(?is)^\s*BEGIN\s+((?:"[^"]+"|[\w$#]+)(?:\s*\.\s*(?:"[^"]+"|[\w$#]+))*)'
+    r'\s*(?:\(\s*\))?\s*;\s*END\s*;?\s*$'
 )
 
 
@@ -11040,7 +11061,9 @@ def _single_call_block(sql: str) -> str | None:
 _PLSQL_WORD_STATEMENTS = frozenset(
     {'NULL', 'COMMIT', 'ROLLBACK', 'RETURN', 'EXIT', 'CONTINUE', 'RAISE'}
 )
-_FUNC_CALL = re.compile(r'(?is)^\s*:(\d+)\s*:=\s*([\w.]+)\s*\((.*)\)\s*$')
+# A called routine's name, dotted, any part quoted (#2176).
+_CALLED_NAME = r'(?:"[^"]+"|[\w$#]+)(?:\s*\.\s*(?:"[^"]+"|[\w$#]+))*'
+_FUNC_CALL = re.compile(rf'(?is)^\s*:(\d+)\s*:=\s*({_CALLED_NAME})\s*\((.*)\)\s*$')
 # A placeholder in a call, numbered `:3` or named `:lines` -- not the second colon
 # of `::`. A client sends a block's values one per distinct placeholder, in the
 # order they first appear, numbered or named alike (#1380, #1529). A quoted name
@@ -11199,7 +11222,7 @@ def _call_argument_error(
     )
 
 
-_PROC_CALL = re.compile(r'(?is)^\s*([\w.]+)\s*\((.*)\)\s*$')
+_PROC_CALL = re.compile(rf'(?is)^\s*({_CALLED_NAME})\s*\((.*)\)\s*$')
 # A scalar OUT-bind assignment inside a block: `:ref := <expr>` (#517).
 _OUT_ASSIGN = re.compile(r'(?is)^\s*:(\w+)\s*:=\s*(.+?)\s*$')
 
@@ -19004,7 +19027,7 @@ class PostgresBackend:
         if not any(isinstance(v, list) for v in values):
             return values
         if types is None:
-            schema, _dot, routine = name.lower().rpartition('.')
+            (schema, routine) = _pg_routine_name(name)
             candidates = self._conn.execute(
                 'SELECT p.proargtypes::oid[] FROM pg_proc p JOIN pg_namespace n '
                 'ON n.oid = p.pronamespace WHERE p.proname = %s '
@@ -19431,7 +19454,7 @@ class PostgresBackend:
     def _routine_exists(self, name: str) -> bool:
         """Whether PostgreSQL has a routine of this name, in the schema the name
         gives if it gives one."""
-        schema, _dot, routine = name.lower().rpartition('.')
+        (schema, routine) = _pg_routine_name(name)
         row = self._conn.execute(
             'SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace '
             "WHERE p.proname = %s AND (%s = '' OR n.nspname = %s) LIMIT 1",
@@ -19651,8 +19674,8 @@ class PostgresBackend:
     def _routine_kind(self, name: str) -> str | None:
         """What PostgreSQL has under a routine name -- 'f' a function, 'p' a
         procedure -- in the schema the name gives if it gives one; None for
-        nothing (#1533)."""
-        schema, _dot, routine = name.lower().rpartition('.')
+        nothing (#1533). A quoted part is as written (#2176)."""
+        (schema, routine) = _pg_routine_name(name)
         row = self._conn.execute(
             'SELECT p.prokind FROM pg_proc p JOIN pg_namespace n '
             'ON n.oid = p.pronamespace '
@@ -19672,7 +19695,7 @@ class PostgresBackend:
         # positions; the types let the OUT-bind path spot an ora_intervalym argument
         # (which has no result column to trace). Modes are None for an all-IN routine
         # (PostgreSQL leaves proargmodes — and proallargtypes — NULL then).
-        schema, _dot, routine = name.lower().rpartition('.')
+        (schema, routine) = _pg_routine_name(name)
         row = self._conn.execute(
             'SELECT p.proargmodes, p.proallargtypes, p.proargnames, p.prokind '
             'FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace '

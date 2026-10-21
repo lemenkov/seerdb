@@ -9192,6 +9192,43 @@ def test_block_words_are_the_tokenizers_words() -> None:
     )
 
 
+def test_a_routine_with_a_quoted_name_is_created_and_called() -> None:
+    # CREATE PROCEDURE "MixedP" was a syntax error (#2176): the routine
+    # translation read a name as letters and dots only. 23ai creates it as
+    # MixedP, callable as "MixedP" from a block, from SQL and from another
+    # routine, and lists it so.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE OR REPLACE PROCEDURE "Mixed2176" AS BEGIN NULL; END;')
+        backend.execute(
+            'CREATE OR REPLACE FUNCTION pyo."Fn2176" RETURN NUMBER IS BEGIN RETURN 5; END;'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PROCEDURE plain2176 AS BEGIN "Mixed2176"; END;'
+        )
+        try:
+            backend.execute('BEGIN "Mixed2176"; END;')
+            backend.execute('BEGIN plain2176; END;')
+            assert backend.execute('SELECT "Fn2176"() FROM dual').rows == [(5,)]
+            assert backend.execute(
+                'SELECT object_name, status FROM user_objects '
+                "WHERE object_name IN ('Mixed2176', 'Fn2176', 'PLAIN2176') "
+                'ORDER BY object_name'
+            ).rows == [
+                ('Fn2176', 'VALID'),
+                ('Mixed2176', 'VALID'),
+                ('PLAIN2176', 'VALID'),
+            ]
+        finally:
+            backend.execute('DROP PROCEDURE plain2176')
+            backend.execute('DROP FUNCTION pyo."Fn2176"')
+            backend.execute('DROP PROCEDURE "Mixed2176"')
+    finally:
+        backend.close()
+
+
 def test_a_routine_calls_a_routine_as_a_statement() -> None:
     # A stored routine whose body called a routine as a statement -- `callee;`,
     # `callee1(1);`, DBMS_OUTPUT.PUT_LINE -- compiled INVALID, PLS-00201 at the
