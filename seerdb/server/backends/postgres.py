@@ -5711,6 +5711,25 @@ _DROPPED_OBJECT = re.compile(
 )
 
 
+# EDITIONABLE or NONEDITIONABLE in a CREATE, which PostgreSQL has no word
+# for (#2175).
+_EDITIONABLE = re.compile(
+    r'(?is)^(\s*CREATE\s+(?:OR\s+REPLACE\s+)?)((?:NON)?EDITIONABLE)(?=\s+'
+    r'(?:PROCEDURE|FUNCTION|PACKAGE|TYPE|TRIGGER|VIEW|SYNONYM|LIBRARY)\b)'
+)
+
+
+def _without_editionable(sql: str) -> str:
+    """`sql` with a CREATE's EDITIONABLE or NONEDITIONABLE blanked out
+    (#2175): an object's editioning is Oracle's, and DDL tools write it --
+    `CREATE OR REPLACE EDITIONABLE PROCEDURE`. Spaces of its length keep
+    every later position, as an error's offset counts it, where it was."""
+    found = _EDITIONABLE.match(sql)
+    if found is None:
+        return sql
+    return found.group(1) + ' ' * len(found.group(2)) + sql[found.end() :]
+
+
 # CREATE / DROP EDITION and ALTER SESSION SET EDITION (#1662).
 _EDITION_NAME = r'("[^"]+"|[\w$#]+)'
 _CREATE_EDITION = re.compile(
@@ -14017,6 +14036,7 @@ class PostgresBackend:
 
     def _parse_stripped(self, sql: str, native: bool) -> None:
         # The statement past its leading whitespace and comments.
+        sql = _ruled('editionable', _without_editionable(sql), sql)
         _refuse_reserved_bind_names(sql)
         if is_plsql(sql) or _NOT_EXPLAINABLE.match(sql):
             return
@@ -14716,6 +14736,7 @@ class PostgresBackend:
 
     def _execute_stripped(self, sql: str, binds: Sequence, native: bool) -> Result:
         # The statement past its leading whitespace and comments.
+        sql = _ruled('editionable', _without_editionable(sql), sql)
         _refuse_reserved_bind_names(sql)
         _refuse_dml_on_dual(sql)
         transaction_control = self._execute_transaction_control(sql)
