@@ -7861,6 +7861,115 @@ def test_a_plsql_trigger_fires_as_oracles_does() -> None:
         backend.close()
 
 
+def test_user_triggers_lists_a_trigger_as_oracles_does() -> None:
+    # USER_TRIGGERS did not list a PL/SQL trigger, and ALTER TRIGGER failed
+    # (#2174). 23ai's columns: the kind and events, REFERENCING names in upper
+    # case, WHEN and the body as written, DESCRIPTION from the trigger's name
+    # to its WHEN or block; ALTER TRIGGER DISABLE / ENABLE and ALTER TABLE ...
+    # DISABLE / ENABLE ALL TRIGGERS switch them, COMPILE does nothing, and
+    # ORA-04080 for no such trigger.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+
+    def listed(columns: str) -> list:
+        return backend.execute(
+            f'SELECT {columns} FROM user_triggers ORDER BY trigger_name'
+        ).rows
+
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE trg_u (a NUMBER, b NUMBER, c VARCHAR2(10))')
+        try:
+            backend.execute(
+                'create or replace trigger trg1 before insert on trg_u for each row '
+                'begin :new.b := :new.a * 2; end;'
+            )
+            backend.execute(
+                'create or replace trigger trg4 before update of c, b on trg_u '
+                'referencing new as nn old as oo for each row when (nn.a > 5) '
+                'begin :nn.c := upper(:nn.c); end;'
+            )
+            backend.execute(
+                'create or replace trigger trg3 after insert or delete on trg_u '
+                'begin null; end;'
+            )
+            assert listed(
+                'trigger_name, trigger_type, triggering_event, table_owner, '
+                'base_object_type, table_name, column_name, referencing_names, '
+                'when_clause, status, description, action_type, trigger_body'
+            ) == [
+                (
+                    'TRG1',
+                    'BEFORE EACH ROW',
+                    'INSERT',
+                    'PYO',
+                    'TABLE',
+                    'TRG_U',
+                    None,
+                    'REFERENCING NEW AS NEW OLD AS OLD',
+                    None,
+                    'ENABLED',
+                    'trg1 before insert on trg_u for each row ',
+                    'PL/SQL     ',
+                    'begin :new.b := :new.a * 2; end;',
+                ),
+                (
+                    'TRG3',
+                    'AFTER STATEMENT',
+                    'INSERT OR DELETE',
+                    'PYO',
+                    'TABLE',
+                    'TRG_U',
+                    None,
+                    'REFERENCING NEW AS NEW OLD AS OLD',
+                    None,
+                    'ENABLED',
+                    'trg3 after insert or delete on trg_u ',
+                    'PL/SQL     ',
+                    'begin null; end;',
+                ),
+                (
+                    'TRG4',
+                    'BEFORE EACH ROW',
+                    'UPDATE',
+                    'PYO',
+                    'TABLE',
+                    'TRG_U',
+                    None,
+                    'REFERENCING NEW AS NN OLD AS OO',
+                    'nn.a > 5',
+                    'ENABLED',
+                    'trg4 before update of c, b on trg_u referencing new as nn '
+                    'old as oo for each row ',
+                    'PL/SQL     ',
+                    'begin :nn.c := upper(:nn.c); end;',
+                ),
+            ]
+            backend.execute("INSERT INTO trg_u (a, c) VALUES (7, 'x')")
+            backend.execute("UPDATE trg_u SET c = 'y'")
+            assert backend.execute('SELECT b, c FROM trg_u').rows == [(14, 'Y')]
+            backend.execute('ALTER TRIGGER trg1 DISABLE')
+            backend.execute('INSERT INTO trg_u (a) VALUES (1)')
+            assert backend.execute('SELECT b FROM trg_u WHERE a = 1').rows == [(None,)]
+            backend.execute('ALTER TRIGGER trg1 ENABLE')
+            backend.execute('ALTER TRIGGER trg1 COMPILE')
+            backend.execute('ALTER TABLE trg_u DISABLE ALL TRIGGERS')
+            assert set(listed('status')) == {('DISABLED',)}
+            backend.execute('ALTER TABLE trg_u ENABLE ALL TRIGGERS')
+            assert set(listed('status')) == {('ENABLED',)}
+            with pytest.raises(BackendError) as raised:
+                backend.execute('ALTER TRIGGER nosuch2174 ENABLE')
+            assert raised.value.ora_code == 4080
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE trg_u')
+        assert listed('trigger_name') == []
+    finally:
+        backend.close()
+
+
 def test_a_standalone_routine_is_listed_with_the_objects() -> None:
     # A user's standalone procedure and function (#1606): in ALL_OBJECTS as
     # PROCEDURE / FUNCTION, VALID or INVALID as they compiled, and the valid
@@ -15078,9 +15187,9 @@ def test_a_ddl_prunes_its_records_and_rereads_the_schema_once(
         backend.execute('DROP TABLE pr1918t')
         prunes = [q for q in sent if 'WHERE NOT EXISTS' in q and 'DELETE' in q]
         assert len(prunes) == 1
-        # Columns, annotations, collection elements, CHECK conditions (#2171)
-        # and column grants (#1946).
-        assert prunes[0].count('DELETE FROM sys.ora_') == 5
+        # Columns, annotations, collection elements, CHECK conditions (#2171),
+        # triggers' text (#2174) and column grants (#1946).
+        assert prunes[0].count('DELETE FROM sys.ora_') == 6
         sent.clear()
         backend.execute('SELECT 1 FROM dual')
         # The object types' RAW attributes come with them (#1331).
