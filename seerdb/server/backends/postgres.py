@@ -8628,6 +8628,90 @@ def _converted_columns(sql: str) -> list[tuple[int, int, list[str]]]:
     return found
 
 
+# A TIMESTAMP literal with a zone in its text, which Oracle reads as
+# TIMESTAMP WITH TIME ZONE.
+_ZONED_LITERAL = re.compile(r"(?i)'.*(?:[+-]\d{1,2}:\d{2}|[a-z]\w*/\w+|\bUTC)\s*'$")
+
+
+@_kept_per_text
+def _typed_datetime_operands(sql: str) -> list[tuple[int, int, int]]:
+    """The DATE and TIMESTAMP values `sql` converts to text without a
+    format whose type the text says -- a DATE or TIMESTAMP literal, SYSDATE,
+    TO_DATE(...), CAST(... AS DATE | TIMESTAMP[(p)]) -- each as the first and
+    last of its spans in _bind_spans(sql) and its precision, -1 for a DATE
+    and 9 for a TIMESTAMP literal (#2162). Where: an operand of ||, an
+    argument of two-argument CONCAT, the argument of TO_CHAR(x)."""
+    spans = _bind_spans(sql)
+    sig = [i for i, span in enumerate(spans) if span[0] not in ('space', 'comment')]
+
+    def text(k: int) -> str:
+        return spans[sig[k]][1] if 0 <= k < len(sig) else ''
+
+    def closing(k: int) -> int | None:
+        depth = 0
+        for close in range(k, len(sig)):
+            depth += (text(close) == '(') - (text(close) == ')')
+            if depth == 0:
+                return close
+        return None
+
+    calls: list[str] = []
+    inside: list[str] = []  # the call each token is directly inside
+    for k in range(len(sig)):
+        if text(k) == ')' and calls:
+            calls.pop()
+        inside.append(calls[-1] if calls else '')
+        if text(k) == '(':
+            calls.append(text(k - 1).upper())
+    found: list[tuple[int, int, int]] = []
+    for k in range(len(sig)):
+        word = text(k).upper()
+        if text(k - 1) == '.':
+            continue
+        typed: tuple[int, int] | None = None
+        if word in ('DATE', 'TIMESTAMP') and spans[sig[k]][0] != 'string':
+            literal = text(k + 1)
+            if literal.startswith("'") and not (
+                word == 'TIMESTAMP' and _ZONED_LITERAL.match(literal)
+            ):
+                typed = (k + 1, -1 if word == 'DATE' else 9)
+        elif word == 'SYSDATE' and text(k + 1) != '(':
+            typed = (k, -1)
+        elif word in ('TO_DATE', 'CAST') and text(k + 1) == '(':
+            close = closing(k + 1)
+            if close is not None and word == 'TO_DATE':
+                typed = (close, -1)
+            elif close is not None and text(close - 2).upper() == 'AS':
+                if text(close - 1).upper() == 'DATE':
+                    typed = (close, -1)
+                elif text(close - 1).upper() == 'TIMESTAMP':
+                    typed = (close, 6)
+            elif (
+                close is not None
+                and text(close - 1) == ')'
+                and text(close - 3) == '('
+                and text(close - 2).isdigit()
+                and text(close - 4).upper() == 'TIMESTAMP'
+                and text(close - 5).upper() == 'AS'
+            ):
+                typed = (close, int(text(close - 2)))
+        if typed is None:
+            continue
+        (last, precision) = typed
+        joined = (text(k - 2), text(k - 1)) == ('|', '|') or (
+            text(last + 1),
+            text(last + 2),
+        ) == ('|', '|')
+        argument = (
+            inside[k] == 'CONCAT'
+            and text(k - 1) in ('(', ',')
+            and text(last + 1) in (',', ')')
+        ) or (inside[k] == 'TO_CHAR' and text(k - 1) == '(' and text(last + 1) == ')')
+        if joined or argument:
+            found.append((sig[k], sig[last], precision))
+    return found
+
+
 def _concat_width(
     item: str, sizes: dict[str, int], columns: dict[str, int] | None = None
 ) -> tuple[int, bool]:
@@ -8717,11 +8801,18 @@ def _concat_width(
         ):
             # A DATE or TIMESTAMP column made its text (#2162) counts as the
             # column does.
-            at += 4
-            width, complete = operand()
-            while at < len(tokens) and text() != ')':
-                at += 1
+            at += 3
+            close = at
+            depth = 0
+            while close < len(tokens):
+                depth += (tokens[close][1] == '(') - (tokens[close][1] == ')')
+                if depth == 0:
+                    break
+                close += 1
             at += 1
+            width, complete = operand()
+            complete = complete and text() == ','
+            at = close + 1
             return width, complete
         if kind == 'word' and word.upper() == 'CONCAT' and text(1) == '(':
             at += 2
@@ -15846,7 +15937,7 @@ class PostgresBackend:
         """`sql` with each DATE or TIMESTAMP column it converts to text
         without a format -- an operand of || or CONCAT, the argument of
         TO_CHAR(c) -- as Oracle's text of it, sys.ora_datetime_text(col, p)
-        (#2162). PostgreSQL's text was its own, `2024-01-02 13:14:15`, and
+        (#2162), and each value whose type its text says. PostgreSQL's text was its own, `2024-01-02 13:14:15`, and
         orafce's TO_CHAR(ts) printed a TIMESTAMP as a DATE. A function over
         the value sees neither the DATE domain nor the precision, so the
         column's type comes from the schema model. A name that is no column
@@ -15854,26 +15945,25 @@ class PostgresBackend:
         lowered = sql.lower()
         if '||' not in sql and 'concat' not in lowered and 'to_char' not in lowered:
             return sql
+        # A literal, SYSDATE, TO_DATE or CAST says its own type.
+        wraps = list(_typed_datetime_operands(sql))
         operands = _converted_columns(sql)
         tables = _from_tables(sql) if operands else []
-        if not tables:
-            return sql
-        out = [span[1] for span in _bind_spans(sql)]
-        changed = False
-        for first, last, parts in operands:
+        for first, last, parts in operands if tables else []:
             column = self._concatenated_column(tables, parts)
             if column is None:
                 continue
             if self._domain_type_by_oid.get(column.type_oid) == TNS_TYPE_DATE:
-                precision = -1
+                wraps.append((first, last, -1))
             elif column.type_oid == _TIMESTAMP_OID:
-                precision = 6 if column.typmod < 0 else column.typmod
-            else:
-                continue
+                wraps.append((first, last, 6 if column.typmod < 0 else column.typmod))
+        if not wraps:
+            return sql
+        out = [span[1] for span in _bind_spans(sql)]
+        for first, last, precision in wraps:
             out[first] = 'sys.ora_datetime_text(' + out[first]
             out[last] += f', {precision})'
-            changed = True
-        return ''.join(out) if changed else sql
+        return ''.join(out)
 
     def _concatenated_type(
         self, tables: list[tuple[str | None, str, str | None]], parts: list[str]

@@ -76,6 +76,7 @@ from seerdb.server.backends.postgres import (  # noqa: E402
     _translate_signed_year,
     _translate_vector_functions,
     _txn_priority_setting,
+    _typed_datetime_operands,
     _urowid_expression,
 )
 
@@ -2225,6 +2226,43 @@ def test_a_datetime_converted_to_text_follows_the_sessions_nls_formats() -> None
         finally:
             backend.rollback()
             backend.execute('DROP TABLE t2162')
+    finally:
+        backend.close()
+
+
+def test_a_datetime_whose_text_says_its_type_follows_the_nls_formats() -> None:
+    # A DATE or TIMESTAMP literal, SYSDATE, TO_DATE and CAST made text came out
+    # as PostgreSQL's (#2162). 23ai's: a TIMESTAMP literal at precision 9, a
+    # CAST at its own; one with a zone is no TIMESTAMP and is left.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        assert backend.execute(
+            "SELECT DATE '2024-01-02' || 'x', "
+            "'x' || TIMESTAMP '2024-01-02 13:14:15.5', "
+            "to_char(TIMESTAMP '2024-01-02 13:14:15.5'), "
+            "concat(TIMESTAMP '2024-01-02 13:14:15', 'x'), "
+            "to_date('2024-01-02', 'YYYY-MM-DD') || 'x', "
+            "CAST(TIMESTAMP '2024-01-02 13:14:15.5' AS TIMESTAMP(3)) || 'x', "
+            "length(sysdate || 'x') FROM dual"
+        ).rows == [
+            (
+                '02-JAN-24x',
+                'x02-JAN-24 01.14.15.500000000 PM',
+                '02-JAN-24 01.14.15.500000000 PM',
+                '02-JAN-24 01.14.15.000000000 PMx',
+                '02-JAN-24x',
+                '02-JAN-24 01.14.15.500 PMx',
+                10,
+            )
+        ]
+        assert (
+            _typed_datetime_operands(
+                "SELECT TIMESTAMP '2024-01-02 13:14:15 +01:00' || 'x' FROM dual"
+            )
+            == []
+        )
     finally:
         backend.close()
 
