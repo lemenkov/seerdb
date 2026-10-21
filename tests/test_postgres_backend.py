@@ -7916,6 +7916,43 @@ def test_translate_routine_ddl_declares_a_bodys_locals() -> None:
     )
 
 
+def test_editionable_is_accepted_in_a_create() -> None:
+    # CREATE OR REPLACE EDITIONABLE PROCEDURE, as DDL tools write it, was a
+    # syntax error, and so were a function, view and type (#2175). Oracle
+    # takes EDITIONABLE and NONEDITIONABLE before the object; the Mirror has
+    # no editions to give it, so blanks it out, every position kept.
+    from seerdb.server.backends.postgres import _without_editionable
+
+    assert _without_editionable('create or replace editionable view v') == (
+        'create or replace             view v'
+    )
+    assert _without_editionable("select 'editionable view' from dual") == (
+        "select 'editionable view' from dual"
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute(
+            'CREATE OR REPLACE EDITIONABLE PROCEDURE e2175 AS BEGIN NULL; END;'
+        )
+        backend.execute(
+            'CREATE NONEDITIONABLE FUNCTION f2175 RETURN NUMBER IS BEGIN RETURN 7; END;'
+        )
+        backend.execute(
+            'CREATE OR REPLACE EDITIONABLE VIEW v2175 AS SELECT 1 a FROM dual'
+        )
+        try:
+            assert backend.execute('SELECT f2175(), a FROM v2175').rows == [(7, 1)]
+            backend.execute('BEGIN e2175; END;')
+        finally:
+            backend.execute('DROP VIEW v2175')
+            backend.execute('DROP FUNCTION f2175')
+            backend.execute('DROP PROCEDURE e2175')
+    finally:
+        backend.close()
+
+
 def test_a_routine_with_locals_compiles_and_runs() -> None:
     # It compiled with a warning and never existed (#1604). The value is 23ai's.
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
