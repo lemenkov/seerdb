@@ -1646,6 +1646,22 @@ def _reachable_relation(relation: str) -> str:
     )
 
 
+def _pg_name_sql(name: str) -> str:
+    # SQL for the PostgreSQL spelling of an Oracle name held in `name`: an
+    # ordinary upper-case one in lower case, any other as it is (#2179).
+    return (
+        f"CASE WHEN {name} ~ '^[A-Z][A-Z0-9_$#]*$' THEN lower({name}) ELSE {name} END"
+    )
+
+
+# Whether the relation an owner and a name (SQL, Oracle's spelling) give is a
+# synonym's stand-in view (#2179); .format(owner=..., name=...).
+_SYNONYM_STAND_IN = (
+    '(EXISTS (SELECT 1 FROM sys.ora_synonyms ss WHERE ss.owner = {owner} '
+    'AND ss.name = {name}))'
+)
+
+
 _ORACLE_DICTIONARY_DDL = (
     # SYS_CONTEXT('userenv', <param>) — the session context the dialect reads to
     # learn its current schema/user before it reflects anything.
@@ -1926,10 +1942,17 @@ _ORACLE_DICTIONARY_DDL = (
     "WHERE table_type='LOCAL TEMPORARY';"
     'CREATE OR REPLACE VIEW sys.user_tables AS SELECT table_name, tablespace_name, '
     'iot_name, duration FROM all_tables WHERE owner=upper(current_schema());'
+    # A synonym (#2179): its owner and name and its target's, as Oracle spells
+    # them. One for a table or view is a view of its name over the target,
+    # which the dictionary lists as the synonym it stands in for.
+    'CREATE TABLE IF NOT EXISTS sys.ora_synonyms (owner text NOT NULL, '
+    'name text NOT NULL, table_owner text NOT NULL, table_name text NOT NULL, '
+    'PRIMARY KEY (owner, name));'
     'CREATE OR REPLACE VIEW sys.all_views AS SELECT upper(table_schema) AS owner, '
     'ora_name(table_name) AS view_name, length(view_definition) AS text_length, '
     'view_definition AS text FROM information_schema.views '
-    "WHERE table_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    "WHERE table_schema NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    f'AND NOT {_SYNONYM_STAND_IN.format(owner="upper(views.table_schema)", name="ora_name(views.table_name)")};'
     'CREATE OR REPLACE VIEW sys.all_sequences AS SELECT upper(sequence_schema) AS '
     'sequence_owner, ora_name(sequence_name) AS sequence_name, '
     'minimum_value::numeric AS min_value, maximum_value::numeric AS max_value, '
@@ -2168,7 +2191,9 @@ _ORACLE_DICTIONARY_DDL = (
     'LEFT JOIN sys.ora_tstz_precision p ON p.relid = '
     "(quote_ident(c.table_schema) || '.' || quote_ident(c.table_name))::regclass "
     'AND p.attnum = c.ordinal_position '
-    "WHERE c.table_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    "WHERE c.table_schema NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    # A synonym's stand-in view has no columns of its own to Oracle (#2179).
+    f'AND NOT {_SYNONYM_STAND_IN.format(owner="upper(c.table_schema)", name="ora_name(c.table_name)")};'
     'CREATE OR REPLACE VIEW sys.user_tab_cols AS SELECT * FROM all_tab_cols '
     'WHERE owner=upper(current_schema());'
     # Both list an INVISIBLE column, with no COLUMN_ID; only *_TAB_COLS say
@@ -2373,6 +2398,17 @@ _ORACLE_DICTIONARY_DDL = (
     + ' FROM pg_index x WHERE x.indexrelid = c.oid) '
     "WHEN 'S' THEN has_sequence_privilege(c.oid, 'USAGE,SELECT,UPDATE') "
     f'ELSE {_reachable_relation("c.oid")} END '
+    # A synonym's stand-in view is listed as the synonym, below (#2179).
+    "AND NOT (c.relkind = 'v' AND "
+    f'{_SYNONYM_STAND_IN.format(owner="upper(n.nspname)", name="ora_name(c.relname)")}) '
+    # A synonym, VALID while its target is there (#2179).
+    'UNION ALL SELECT s.owner, s.name, NULL::text, '
+    "coalesce(to_regclass(quote_ident(lower(s.owner)) || '.' || "
+    f"quote_ident({_pg_name_sql('s.name')}))::oid, 0)::bigint, 'SYNONYM', "
+    "CASE WHEN to_regclass(quote_ident(lower(s.table_owner)) || '.' || "
+    f"quote_ident({_pg_name_sql('s.table_name')})) IS NULL THEN 'INVALID' "
+    "ELSE 'VALID' END, 'N', 'N', 'N' FROM sys.ora_synonyms s "
+    "WHERE has_schema_privilege(lower(s.owner), 'USAGE') "
     # A package's spec and body, VALID or INVALID as they compiled (#1605).
     'UNION ALL SELECT k.owner, upper(k.name), NULL::text, n.oid::bigint, '
     "t.object_type, t.status, 'N', 'N', 'N' FROM sys.ora_packages k "
@@ -2404,6 +2440,16 @@ _ORACLE_DICTIONARY_DDL = (
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
     'AND n.nspname NOT IN (SELECT name FROM sys.ora_packages)) v '
     'WHERE sys.ora_type_visible(v.owner, v.object_name);'
+    # ALL_SYNONYMS, USER_SYNONYMS and DBA_SYNONYMS (#2179), as 23ai's: no
+    # database links, the container 3, a PDB's.
+    'CREATE OR REPLACE VIEW sys.all_synonyms AS SELECT s.owner, s.name AS '
+    'synonym_name, s.table_owner, s.table_name, NULL::text AS db_link, '
+    '3::numeric AS origin_con_id FROM sys.ora_synonyms s '
+    "WHERE has_schema_privilege(lower(s.owner), 'USAGE');"
+    'CREATE OR REPLACE VIEW sys.dba_synonyms AS SELECT * FROM sys.all_synonyms;'
+    'CREATE OR REPLACE VIEW sys.user_synonyms AS SELECT synonym_name, table_owner, '
+    'table_name, db_link, origin_con_id FROM sys.all_synonyms '
+    'WHERE owner = upper(current_schema());'
     # orafce has a user_objects too, which lists every schema's objects under
     # their PostgreSQL names; this one is the current schema's, Oracle's way.
     'CREATE OR REPLACE VIEW sys.user_objects AS SELECT * FROM all_objects '
@@ -2968,6 +3014,10 @@ def _record_owner_tests() -> dict[str, str | None]:
         'ora_errors': owner('pg_namespace', 'nspowner', 'nspname', 'lower({t}.owner)'),
         # A unit's source, the same (#2172).
         'ora_source': owner('pg_namespace', 'nspowner', 'nspname', 'lower({t}.owner)'),
+        # A synonym, the same (#2179).
+        'ora_synonyms': owner(
+            'pg_namespace', 'nspowner', 'nspname', 'lower({t}.owner)'
+        ),
         'ora_grants': grants,
         # A column's, the same (#1946).
         'ora_col_grants': grants,
@@ -5759,6 +5809,33 @@ def _oracle_name(name: str) -> str:
     # An identifier as Oracle stores it: a quoted one verbatim, else upper case.
     name = name.strip()
     return name[1:-1] if name.startswith('"') else name.upper()
+
+
+# CREATE [OR REPLACE] [PUBLIC] SYNONYM name FOR target[@link] and DROP
+# [PUBLIC] SYNONYM name [FORCE] (#2179); EDITIONABLE is gone by now (#2178).
+_SYNONYM_NAME = r'(?:"[^"]+"|[\w$#]+)(?:\s*\.\s*(?:"[^"]+"|[\w$#]+))?'
+_CREATE_SYNONYM = re.compile(
+    rf'(?is)\s*CREATE\s+(OR\s+REPLACE\s+)?(PUBLIC\s+)?SYNONYM\s+({_SYNONYM_NAME})'
+    rf'\s+FOR\s+({_SYNONYM_NAME})(\s*@\s*[\w$#.]+)?\s*;?\s*$'
+)
+_DROP_SYNONYM = re.compile(
+    rf'(?is)\s*DROP\s+(PUBLIC\s+)?SYNONYM\s+({_SYNONYM_NAME})(?:\s+FORCE)?\s*;?\s*$'
+)
+# ORA-01471 and ORA-01434 (#2179), measured on 23ai.
+_ORA_SYNONYM_OF_ITSELF = 1471
+_ORA_NO_SUCH_SYNONYM = 1434
+# The kinds of object a synonym's name may not be taken by: Oracle's one
+# namespace for them.
+_SYNONYM_NAMESPACE = (
+    'TABLE',
+    'VIEW',
+    'MATERIALIZED VIEW',
+    'SEQUENCE',
+    'PROCEDURE',
+    'FUNCTION',
+    'PACKAGE',
+    'TYPE',
+)
 
 
 def _privilege_kind_error(kind: str, release: tuple[int, int]) -> BackendError:
@@ -15546,6 +15623,9 @@ class PostgresBackend:
         users = self._user_statement(sql)
         if users is not None:
             return users
+        synonym = self._synonym_statement(sql)
+        if synonym is not None:
+            return synonym
         granted = self._object_grant_statement(sql)
         if granted is not None:
             return granted
@@ -20862,6 +20942,106 @@ class PostgresBackend:
             raise _backend_error(
                 exc, original=statement, translated=translated
             ) from None
+        return Result()
+
+    def _synonym_statement(self, statement: str) -> Result | None:
+        """CREATE or DROP of a private synonym for a table or view (#2179),
+        with Oracle's checks: the name not another object's (ORA-00955) nor
+        its own target's (ORA-01471), a DROP's synonym there (ORA-01434). The
+        synonym is recorded in sys.ora_synonyms, and is a view of its name
+        over its target, which DML goes through as PostgreSQL updates a simple
+        view; one whose target is not there is recorded with no view. DDL, so
+        the transaction is committed first. None for any other statement."""
+        created = _CREATE_SYNONYM.match(statement)
+        dropped = None if created else _DROP_SYNONYM.match(statement)
+        if created is None and dropped is None:
+            return None
+        public = created.group(2) if created else dropped and dropped.group(1)
+        if public:
+            raise UnsupportedFeature('PUBLIC synonyms are not supported yet')
+        self.commit()
+        row = self._conn.execute('SELECT sys.ora_owner(current_schema())').fetchone()
+        assert row is not None
+        here = row[0]
+
+        def named(written: str) -> tuple[str, str, str]:
+            # An owner and a name as Oracle spells them, and as written.
+            parts = re.split(r'\s*\.\s*', written.strip())
+            owner = _oracle_name(parts[0]) if len(parts) == 2 else here
+            return (owner, _oracle_name(parts[-1]), written.strip())
+
+        def recorded(owner: str, name: str) -> bool:
+            return (
+                self._conn.execute(
+                    'SELECT 1 FROM sys.ora_synonyms WHERE owner = %s AND name = %s',
+                    (owner, name),
+                ).fetchone()
+                is not None
+            )
+
+        if dropped is not None:
+            (owner, name, written) = named(dropped.group(2))
+            if not recorded(owner, name):
+                raise BackendError(
+                    'private synonym to be dropped does not exist',
+                    ora_code=_ORA_NO_SUCH_SYNONYM,
+                )
+            pg_name = name.lower() if re.fullmatch(r'[A-Z][A-Z0-9_$#]*', name) else name
+            if self._conn.execute(
+                "SELECT to_regclass(quote_ident(lower(%s)) || '.' || quote_ident(%s))",
+                (owner, pg_name),
+            ).fetchone() != (None,):
+                self.execute(f'DROP VIEW {written}')
+            self._conn.execute(
+                'DELETE FROM sys.ora_synonyms WHERE owner = %s AND name = %s',
+                (owner, name),
+            )
+            self._conn.commit()
+            return Result()
+        assert created is not None
+        if created.group(5):
+            raise UnsupportedFeature('a synonym for a remote object is not supported')
+        (owner, name, written) = named(created.group(3))
+        (target_owner, target, target_written) = named(created.group(4))
+        if (owner, name) == (target_owner, target):
+            raise BackendError(
+                'cannot create a synonym with same name as object',
+                ora_code=_ORA_SYNONYM_OF_ITSELF,
+            )
+        taken = self._conn.execute(
+            'SELECT 1 FROM all_objects WHERE owner = %s AND object_name = %s '
+            'AND object_type = ANY(%s)',
+            (owner, name, list(_SYNONYM_NAMESPACE)),
+        ).fetchone()
+        if taken is not None or (not created.group(1) and recorded(owner, name)):
+            self._conn.rollback()
+            raise BackendError(
+                _ORA_MESSAGE[ORA_NAME_ALREADY_USED], ora_code=ORA_NAME_ALREADY_USED
+            )
+        kind = self._conn.execute(
+            'SELECT object_type FROM all_objects WHERE owner = %s AND object_name = %s '
+            "AND object_type <> 'SYNONYM' ORDER BY object_type <> 'TABLE' LIMIT 1",
+            (target_owner, target),
+        ).fetchone()
+        self._conn.rollback()
+        if kind is not None and kind[0] not in ('TABLE', 'VIEW', 'MATERIALIZED VIEW'):
+            raise UnsupportedFeature(
+                f'a synonym for a {kind[0].lower()} is not supported yet'
+            )
+        if kind is not None:
+            self.execute(
+                f'CREATE OR REPLACE VIEW {written} AS SELECT * FROM {target_written}'
+            )
+        elif recorded(owner, name):
+            # Replaced by one whose target is not there: the old view goes.
+            self.execute(f'DROP VIEW IF EXISTS {written}')
+        self._conn.execute(
+            'INSERT INTO sys.ora_synonyms (owner, name, table_owner, table_name) '
+            'VALUES (%s, %s, %s, %s) ON CONFLICT (owner, name) DO UPDATE SET '
+            'table_owner = EXCLUDED.table_owner, table_name = EXCLUDED.table_name',
+            (owner, name, target_owner, target),
+        )
+        self._conn.commit()
         return Result()
 
     def _object_grant_statement(self, statement: str) -> Result | None:

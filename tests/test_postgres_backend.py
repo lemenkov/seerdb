@@ -11261,6 +11261,65 @@ def test_dictionary_views_reflect_a_created_table() -> None:
         backend.close()
 
 
+def test_a_private_synonym_reaches_its_table_as_oracles_does() -> None:
+    # CREATE / DROP SYNONYM were syntax errors and USER_SYNONYMS missing
+    # (#2179). 23ai's: the synonym reads and writes its table; USER_SYNONYMS
+    # and ALL_SYNONYMS list it, USER_OBJECTS as a SYNONYM, USER_VIEWS and
+    # USER_TAB_COLUMNS not at all; ORA-00955, ORA-01471 and ORA-01434.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2179 (id NUMBER, v VARCHAR2(5))')
+        try:
+            backend.execute("INSERT INTO t2179 VALUES (1, 'a')")
+            backend.execute('CREATE SYNONYM s2179 FOR t2179')
+            backend.execute('CREATE OR REPLACE SYNONYM s2179 FOR pyo.t2179')
+            assert backend.execute('SELECT id, v FROM s2179').rows == [(1, 'a')]
+            backend.execute("INSERT INTO s2179 VALUES (2, 'b')")
+            assert backend.execute('SELECT count(*) FROM t2179').rows == [(2,)]
+
+            def one(sql: str) -> list:
+                return backend.execute(sql).rows
+
+            assert one("SELECT * FROM user_synonyms WHERE synonym_name = 'S2179'") == [
+                ('S2179', 'PYO', 'T2179', None, 3)
+            ]
+            assert one(
+                'SELECT owner, synonym_name, table_owner, table_name FROM all_synonyms '
+                "WHERE synonym_name = 'S2179'"
+            ) == [('PYO', 'S2179', 'PYO', 'T2179')]
+            assert one(
+                "SELECT object_type, status FROM user_objects WHERE object_name = 'S2179'"
+            ) == [('SYNONYM', 'VALID')]
+            assert one("SELECT 1 FROM user_views WHERE view_name = 'S2179'") == []
+            assert (
+                one("SELECT 1 FROM user_tab_columns WHERE table_name = 'S2179'") == []
+            )
+            for statement, code in (
+                ('CREATE SYNONYM s2179 FOR t2179', 955),
+                ('CREATE SYNONYM t2179 FOR t2179', 1471),
+                ('CREATE SYNONYM t2179 FOR s2179', 955),
+            ):
+                with pytest.raises(BackendError) as raised:
+                    backend.execute(statement)
+                assert raised.value.ora_code == code, statement
+            backend.execute('DROP SYNONYM s2179')
+            assert one("SELECT 1 FROM user_synonyms WHERE synonym_name = 'S2179'") == []
+            with pytest.raises(BackendError) as raised:
+                backend.execute('DROP SYNONYM s2179')
+            assert raised.value.ora_code == 1434
+        finally:
+            backend.rollback()
+            with contextlib.suppress(BackendError):
+                backend.execute('DROP SYNONYM s2179')  # left by a failed assert
+            backend.execute('DROP TABLE t2179')
+    finally:
+        backend.close()
+
+
 def test_all_constraints_gives_a_checks_condition_as_written() -> None:
     # A CHECK's SEARCH_CONDITION was NULL (#2171). 23ai's: the text between
     # its parentheses as written, spaces and case kept, inline or out of line,
