@@ -63,6 +63,7 @@ from seerdb.server.backends.postgres import (  # noqa: E402
     _several_statements,
     _strip_leading_comments,
     _tds_scalar,
+    _through_synonyms,
     _to_interval_ym,
     _translate_admin,
     _translate_binds,
@@ -11517,6 +11518,93 @@ def test_a_public_synonym_reaches_its_table_as_oracles_does() -> None:
         finally:
             backend.rollback()
             for leftover in ('PUBLIC SYNONYM ps2179', 'TABLE p2179', 'TABLE q2179'):
+                with contextlib.suppress(BackendError):
+                    backend.execute(f'DROP {leftover}')
+    finally:
+        backend.close()
+
+
+def test_a_synonym_reaches_a_sequence_routine_or_package_as_oracles_does() -> None:
+    # A synonym for a sequence, function, procedure or package was ORA-03001
+    # (#2179). 23ai's: sq.NEXTVAL and CURRVAL, in a DEFAULT too, f(n), a call
+    # of p, k.member, and a procedure using them all compiles VALID. Its name
+    # is rewritten to its target where only such a name stands: not as a FROM
+    # alias, not where a DDL names an object, not after a dot.
+    synonyms = {
+        'SQ4': ('SEQUENCE', 'PYO.SQ_T4'),
+        'F4': ('FUNCTION', 'PYO.F_T4'),
+        'K4': ('PACKAGE', 'K_T4'),
+    }
+    assert _through_synonyms(
+        'select sq4.nextval, f4(1), k4.g, x.f4 from dual', synonyms
+    ) == ('select PYO.SQ_T4.nextval, PYO.F_T4(1), K_T4.g, x.f4 from dual')
+    for unchanged in (
+        'select k4.id from t k4',
+        'create or replace function f4(n number) return number as begin return n; end;',
+        'drop synonym f4',
+        'select f4 from t',
+    ):
+        assert _through_synonyms(unchanged, synonyms) == unchanged, unchanged
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    made = []
+
+    def make(statement: str, drop: str) -> None:
+        backend.execute(statement)
+        made.append(drop)
+
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        try:
+            make('CREATE SEQUENCE sq_t2179 START WITH 10', 'SEQUENCE sq_t2179')
+            make('CREATE SYNONYM sq2179 FOR sq_t2179', 'SYNONYM sq2179')
+            assert backend.execute('SELECT sq2179.NEXTVAL FROM dual').rows == [(10,)]
+            assert backend.execute('SELECT sq2179.CURRVAL FROM dual').rows == [(10,)]
+            make(
+                'CREATE TABLE t2179s (id NUMBER DEFAULT sq2179.NEXTVAL, v NUMBER)',
+                'TABLE t2179s',
+            )
+            backend.execute('INSERT INTO t2179s (v) VALUES (1)')
+            assert backend.execute('SELECT id FROM t2179s').rows == [(11,)]
+            make(
+                'CREATE OR REPLACE FUNCTION f_t2179(n NUMBER) RETURN NUMBER AS '
+                'BEGIN RETURN n * 2; END;',
+                'FUNCTION f_t2179',
+            )
+            make('CREATE SYNONYM f2179 FOR f_t2179', 'SYNONYM f2179')
+            assert backend.execute('SELECT f2179(21) FROM dual').rows == [(42,)]
+            make(
+                'CREATE OR REPLACE PACKAGE k_t2179 AS FUNCTION g RETURN NUMBER; END;',
+                'PACKAGE k_t2179',
+            )
+            backend.execute(
+                'CREATE OR REPLACE PACKAGE BODY k_t2179 AS FUNCTION g RETURN NUMBER '
+                'IS BEGIN RETURN 7; END; END;'
+            )
+            make('CREATE SYNONYM k2179 FOR k_t2179', 'SYNONYM k2179')
+            assert backend.execute('SELECT k2179.g FROM dual').rows == [(7,)]
+            make(
+                'CREATE OR REPLACE PROCEDURE p_t2179(r OUT NUMBER) AS BEGIN '
+                'r := f2179(1) + k2179.g + sq2179.NEXTVAL; END;',
+                'PROCEDURE p_t2179',
+            )
+            make('CREATE SYNONYM p2179 FOR p_t2179', 'SYNONYM p2179')
+            backend.execute('DECLARE r NUMBER; BEGIN p2179(r); END;')
+            assert backend.execute(
+                'SELECT object_name, status FROM user_objects WHERE object_name IN '
+                "('SQ2179', 'F2179', 'K2179', 'P2179', 'P_T2179') ORDER BY 1"
+            ).rows == [
+                ('F2179', 'VALID'),
+                ('K2179', 'VALID'),
+                ('P2179', 'VALID'),
+                ('P_T2179', 'VALID'),
+                ('SQ2179', 'VALID'),
+            ]
+        finally:
+            backend.rollback()
+            for leftover in reversed(made):
                 with contextlib.suppress(BackendError):
                     backend.execute(f'DROP {leftover}')
     finally:

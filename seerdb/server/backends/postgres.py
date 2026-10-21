@@ -1662,6 +1662,43 @@ _SYNONYM_STAND_IN = (
 )
 
 
+# The synonyms a session's names are rewritten through (#2179): its own, and
+# PUBLIC ones where it has no object of the name, each with its target's kind.
+# PL/pgSQL plans a query when it runs it, so a session with no synonyms to
+# find pays for none of it: a plain query was planned whole on every session's
+# first statement, some milliseconds each.
+_ROUTINE_SYNONYMS = 'SELECT sys.ora_routine_synonyms()'
+_ROUTINE_SYNONYMS_DDL = (
+    'CREATE OR REPLACE FUNCTION sys.ora_routine_synonyms() RETURNS json '
+    'LANGUAGE plpgsql STABLE AS $f$ DECLARE r json; BEGIN '
+    'IF NOT EXISTS (SELECT 1 FROM sys.ora_synonyms) THEN RETURN NULL; END IF; '
+    + (
+        'SELECT json_agg(json_build_array(y.owner, y.name, y.table_owner, y.table_name, '
+        'y.kind)) FROM (SELECT s.*, CASE '
+        'WHEN (SELECT c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace '
+        f'WHERE n.nspname = lower(s.table_owner) AND c.relname = {_pg_name_sql("s.table_name")}) '
+        "= 'S' THEN 'SEQUENCE' "
+        f'WHEN EXISTS (SELECT 1 FROM sys.ora_packages k WHERE k.name = {_pg_name_sql("s.table_name")}) '
+        "THEN 'PACKAGE' "
+        "WHEN (SELECT bool_or(p.prokind = 'p') FROM pg_proc p JOIN pg_namespace n "
+        'ON n.oid = p.pronamespace WHERE n.nspname = lower(s.table_owner) '
+        f"AND p.proname = {_pg_name_sql('s.table_name')}) THEN 'PROCEDURE' "
+        'WHEN EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace '
+        'WHERE n.nspname = lower(s.table_owner) '
+        f"AND p.proname = {_pg_name_sql('s.table_name')}) THEN 'FUNCTION' END AS kind "
+        'FROM sys.ora_synonyms s '
+        "WHERE s.owner = upper(current_schema()) OR s.owner = 'PUBLIC' "
+        # A PUBLIC one gives way to the session's own relation or routine.
+        'AND to_regclass(quote_ident(current_schema()) || '
+        f"'.' || quote_ident({_pg_name_sql('s.name')})) IS NULL "
+        'AND NOT EXISTS (SELECT 1 FROM pg_proc p WHERE p.pronamespace = '
+        f'current_schema()::regnamespace AND p.proname = {_pg_name_sql("s.name")})) y '
+        'WHERE y.kind IS NOT NULL'
+    )
+    + ' INTO r; RETURN r; END $f$;'
+)
+
+
 _ORACLE_DICTIONARY_DDL = (
     # SYS_CONTEXT('userenv', <param>) — the session context the dialect reads to
     # learn its current schema/user before it reflects anything.
@@ -1948,7 +1985,8 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE TABLE IF NOT EXISTS sys.ora_synonyms (owner text NOT NULL, '
     'name text NOT NULL, table_owner text NOT NULL, table_name text NOT NULL, '
     'PRIMARY KEY (owner, name));'
-    'CREATE OR REPLACE VIEW sys.all_views AS SELECT upper(table_schema) AS owner, '
+    + _ROUTINE_SYNONYMS_DDL
+    + 'CREATE OR REPLACE VIEW sys.all_views AS SELECT upper(table_schema) AS owner, '
     'ora_name(table_name) AS view_name, length(view_definition) AS text_length, '
     'view_definition AS text FROM information_schema.views '
     "WHERE table_schema NOT IN ('pg_catalog','information_schema','oracle','sys') "
@@ -2435,8 +2473,12 @@ _ORACLE_DICTIONARY_DDL = (
     "coalesce(to_regclass(quote_ident(lower(s.owner)) || '.' || "
     f"quote_ident({_pg_name_sql('s.name')}))::oid, 0)::bigint, 'SYNONYM', "
     "CASE WHEN to_regclass(quote_ident(lower(s.table_owner)) || '.' || "
-    f"quote_ident({_pg_name_sql('s.table_name')})) IS NULL THEN 'INVALID' "
-    "ELSE 'VALID' END, 'N', 'N', 'N' FROM sys.ora_synonyms s "
+    f'quote_ident({_pg_name_sql("s.table_name")})) IS NOT NULL '
+    # A routine's or a package's (#2179).
+    'OR EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace pn ON pn.oid = p.pronamespace '
+    f'WHERE pn.nspname = lower(s.table_owner) AND p.proname = {_pg_name_sql("s.table_name")}) '
+    f'OR EXISTS (SELECT 1 FROM sys.ora_packages k WHERE k.name = {_pg_name_sql("s.table_name")}) '
+    "THEN 'VALID' ELSE 'INVALID' END, 'N', 'N', 'N' FROM sys.ora_synonyms s "
     "WHERE has_schema_privilege(lower(s.owner), 'USAGE') "
     # A package's spec and body, VALID or INVALID as they compiled (#1605).
     'UNION ALL SELECT k.owner, upper(k.name), NULL::text, n.oid::bigint, '
@@ -5182,7 +5224,10 @@ _PENDING_VIEWS = (
     'FROM synonym y CROSS JOIN LATERAL (SELECT '
     "to_regclass(quote_ident(y.owner) || '.' || quote_ident(y.name))::oid AS oid, "
     "to_regclass(quote_ident(y.target_owner) || '.' || quote_ident(y.target))::oid "
-    'AS target) v WHERE v.target IS NOT NULL AND (v.oid IS NULL OR ARRAY(SELECT '
+    'AS target) v WHERE v.target IS NOT NULL '
+    # A sequence's synonym has no view; its name is rewritten (#2179).
+    "AND (SELECT relkind FROM pg_class WHERE oid = v.target) IN ('r', 'v', 'm', 'p', 'f') "
+    'AND (v.oid IS NULL OR ARRAY(SELECT '
     'attname FROM pg_attribute WHERE attrelid = v.oid AND attnum > 0 '
     'AND NOT attisdropped ORDER BY attnum) IS DISTINCT FROM ARRAY(SELECT attname '
     'FROM pg_attribute WHERE attrelid = v.target AND attnum > 0 '
@@ -5912,6 +5957,84 @@ _ORA_SYNONYM_OF_ITSELF = 1471
 _ORA_NO_SUCH_SYNONYM = 1434
 # ORA-01432, a DROP PUBLIC SYNONYM of none (#2179).
 _ORA_NO_SUCH_PUBLIC_SYNONYM = 1432
+# The kinds of target a synonym's name is rewritten to, where no view can
+# stand in (#2179).
+_REWRITTEN_SYNONYM_KINDS = ('SEQUENCE', 'FUNCTION', 'PROCEDURE', 'PACKAGE')
+# The words before a name that a DDL makes or drops, which a synonym's name
+# there is not rewritten after: CREATE FUNCTION f4 is no call of f4.
+_NAMING_KEYWORDS = frozenset(
+    {
+        'FUNCTION',
+        'PROCEDURE',
+        'PACKAGE',
+        'BODY',
+        'SEQUENCE',
+        'TRIGGER',
+        'TABLE',
+        'VIEW',
+        'SYNONYM',
+        'TYPE',
+    }
+)
+
+
+def _oracle_reference(owner: str | None, name: str) -> str:
+    # An owner and a name as Oracle spells them, written as a statement would
+    # name them: an ordinary name as it is, any other quoted.
+    def part(word: str) -> str:
+        return word if re.fullmatch(r'[A-Z][A-Z0-9_$#]*', word) else f'"{word}"'
+
+    return f'{part(owner)}.{part(name)}' if owner else part(name)
+
+
+def _through_synonyms(sql: str, synonyms: dict[str, tuple[str, str]]) -> str:
+    """`sql` with each name a synonym gives for a sequence, routine or
+    package replaced by its target, where only such a name can stand
+    (#2179): a sequence's before .NEXTVAL or .CURRVAL, a routine's before
+    `(` or as a call of its own, a package's before `.member`. `synonyms`
+    maps each name, upper case, to its target's kind and reference. A name
+    the statement uses as a FROM table or alias, one a DDL makes or drops,
+    and one after a `.` are left."""
+    if _CREATE_SYNONYM.match(sql) or _DROP_SYNONYM.match(sql):
+        return sql
+    spans = _bind_spans(sql)
+    sig = [i for i, span in enumerate(spans) if span[0] not in ('space', 'comment')]
+
+    def text(k: int) -> str:
+        return spans[sig[k]][1] if 0 <= k < len(sig) else ''
+
+    avoid = {
+        name.upper()
+        for (_schema, table, alias) in _from_tables(sql)
+        for name in (table, alias)
+        if name
+    }
+    out = [span[1] for span in spans]
+    changed = False
+    for k, index in enumerate(sig):
+        if spans[index][0] != 'word':
+            continue
+        found = synonyms.get(spans[index][1].upper())
+        if (
+            found is None
+            or text(k - 1) == '.'
+            or text(k - 1).upper() in _NAMING_KEYWORDS
+        ):
+            continue
+        (kind, target) = found
+        following = text(k + 1)
+        if kind == 'SEQUENCE':
+            fits = following == '.' and text(k + 2).upper() in ('NEXTVAL', 'CURRVAL')
+        elif kind == 'PACKAGE':
+            fits = following == '.' and spans[index][1].upper() not in avoid
+        else:
+            fits = following in ('(', ';') or (following == '' and kind == 'PROCEDURE')
+        if fits:
+            out[index] = target
+            changed = True
+    return ''.join(out) if changed else sql
+
+
 # ORA-00980, a synonym whose target is not there (#2179).
 _ORA_SYNONYM_TRANSLATION = 980
 # The kinds of object a synonym's name may not be taken by: Oracle's one
@@ -14323,6 +14446,9 @@ class PostgresBackend:
         self._collection_name_cache: frozenset[str] | None = None
         # Each package's functions a call may name without parentheses (#1651).
         self._package_function_cache: dict[str, frozenset[str]] | None = None
+        # The names synonyms give for sequences, routines and packages, and
+        # what each is rewritten to (#2179); read with the schema facts.
+        self._routine_synonym_cache: dict[str, tuple[str, str]] | None = None
         # RAW targets (#1496): whether any column or attribute is a recorded
         # RAW, and each object type's RAW attribute positions, by name; any DDL
         # starts them over. A relation's own columns are the schema model's.
@@ -14586,6 +14712,7 @@ class PostgresBackend:
         self._sql_domain_cache.clear()
         self._plsql_types.clear()
         self._collection_name_cache = None
+        self._routine_synonym_cache = None
         self._package_function_cache = None
         self._forget_raw_targets()
         self._has_oson_cache = None
@@ -15750,6 +15877,9 @@ class PostgresBackend:
             return granted
         if native:
             return self._execute_native(sql, binds)
+        synonyms = self._routine_synonyms()
+        if synonyms:
+            sql = _ruled('synonym-names', _through_synonyms(sql, synonyms), sql)
         refused = self._rowid_number_error(sql, binds)
         if refused is not None:
             raise refused
@@ -15958,6 +16088,7 @@ class PostgresBackend:
             self._relations.clear()
             self._relids.clear()
             self._collection_name_cache = None  # a type may have come or gone
+            self._routine_synonym_cache = None  # and a synonym
             self._package_function_cache = None  # and a package
             self._plsql_types.clear()
             self._forget_raw_targets()
@@ -15996,6 +16127,7 @@ class PostgresBackend:
             self._conn.commit()
             self._user_savepoint = False
             self._collection_name_cache = None
+            self._routine_synonym_cache = None
             self._forget_raw_targets()
         elif result.columns:
             self._release_read_locks()
@@ -17159,6 +17291,33 @@ class PostgresBackend:
                     masked, open_at + 1, _matching_paren(masked, open_at)
                 )
         return spans
+
+    def _routine_synonyms(self) -> dict[str, tuple[str, str]]:
+        # The synonyms whose names are rewritten (#2179): the session's own,
+        # and PUBLIC ones where the session has no object of the name, read
+        # once, then after any DDL. A read of its own, cheap while there are
+        # none: the schema facts' costs more than every statement may pay.
+        if self._routine_synonym_cache is None:
+            if (
+                self._conn.info.transaction_status
+                == psycopg.pq.TransactionStatus.INERROR
+            ):
+                return {}
+            found = self._catalog_read(_ROUTINE_SYNONYMS).fetchone()
+            synonyms: dict[str, tuple[str, str]] = {}
+            # The session's own last, so it wins over a PUBLIC one.
+            for owner, name, target_owner, target, kind in sorted(
+                (found[0] if found else None) or (),
+                key=lambda entry: entry[0] != 'PUBLIC',
+            ):
+                synonyms[name] = (
+                    kind,
+                    _oracle_reference(
+                        None if kind == 'PACKAGE' else target_owner, target
+                    ),
+                )
+            self._routine_synonym_cache = synonyms
+        return self._routine_synonym_cache
 
     def _collection_names(self) -> frozenset[str]:
         # The collection types (array domains) of the user schemas, by name and
@@ -21255,10 +21414,18 @@ class PostgresBackend:
             (target_owner, target),
         ).fetchone()
         self._conn.rollback()
-        if kind is not None and kind[0] not in ('TABLE', 'VIEW', 'MATERIALIZED VIEW'):
+        if kind is not None and kind[0] not in (
+            'TABLE',
+            'VIEW',
+            'MATERIALIZED VIEW',
+            *_REWRITTEN_SYNONYM_KINDS,
+        ):
             raise UnsupportedFeature(
                 f'a synonym for a {kind[0].lower()} is not supported yet'
             )
+        if kind is not None and kind[0] in _REWRITTEN_SYNONYM_KINDS:
+            # No view stands in for it: its name is rewritten (#2179).
+            kind = None
         previous = self._conn.execute(
             'SELECT table_owner, table_name FROM sys.ora_synonyms '
             'WHERE owner = %s AND name = %s',
@@ -21391,6 +21558,7 @@ class PostgresBackend:
             self._conn.rollback()
             raise
         self._collection_name_cache = None
+        self._routine_synonym_cache = None
         return Result()
 
     def _grant_object(
