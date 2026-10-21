@@ -660,7 +660,9 @@ _HELPER_FUNCTIONS_DDL = (
     # PostgreSQL prints as written: FFn is n digits, truncated -- PostgreSQL's
     # own up to 6, and zeros past its microseconds -- FF alone the value's
     # precision, $3, and X the radix point, left out at precision 0. FX is
-    # the format-exact modifier, and quoted text stays as it is.
+    # the format-exact modifier, and quoted text stays as it is. RR and RRRR
+    # print as YY and YYYY, as TO_CHAR prints them (#1638): a call made this
+    # one is no longer a to_char for that rewrite to find.
     'CREATE OR REPLACE FUNCTION sys.ora_to_char(timestamp, text, integer) '
     'RETURNS text LANGUAGE plpgsql STABLE AS $$ DECLARE f text := $2; '
     "o text := ''; i integer := 1; j integer; d integer; BEGIN "
@@ -668,6 +670,8 @@ _HELPER_FUNCTIONS_DDL = (
     "IF substr(f, i, 1) = '\"' THEN j := strpos(substr(f, i + 1), '\"'); "
     'IF j = 0 THEN o := o || substr(f, i); EXIT; END IF; '
     'o := o || substr(f, i, j + 1); i := i + j + 1; '
+    "ELSIF upper(substr(f, i, 4)) = 'RRRR' THEN o := o || 'YYYY'; i := i + 4; "
+    "ELSIF upper(substr(f, i, 2)) = 'RR' THEN o := o || 'YY'; i := i + 2; "
     "ELSIF upper(substr(f, i, 2)) = 'FX' THEN o := o || substr(f, i, 2); i := i + 2; "
     "ELSIF upper(substr(f, i, 2)) = 'FF' THEN d := $3; i := i + 2; "
     "IF substr(f, i, 1) ~ '[1-9]' THEN d := substr(f, i, 1)::integer; i := i + 1; "
@@ -8805,6 +8809,45 @@ _GROUP_KEYWORDS = frozenset(
 
 
 @_kept_per_text
+def _formatted_datetimes(sql: str) -> list[tuple[int, int, str]]:
+    """Each two-argument TO_CHAR(x, fmt) in `sql` whose format has FF or X --
+    a literal that does, or a bind -- as the spans in _bind_spans(sql) of its
+    name and its closing parenthesis, and x's text (#2167)."""
+    spans = _bind_spans(sql)
+    sig = [i for i, span in enumerate(spans) if span[0] not in ('space', 'comment')]
+
+    def text(k: int) -> str:
+        return spans[sig[k]][1] if 0 <= k < len(sig) else ''
+
+    found: list[tuple[int, int, str]] = []
+    for k in range(len(sig) - 1):
+        if text(k).upper() != 'TO_CHAR' or text(k + 1) != '(' or text(k - 1) == '.':
+            continue
+        (depth, comma, close) = (0, None, None)
+        for j in range(k + 1, len(sig)):
+            depth += (text(j) == '(') - (text(j) == ')')
+            if depth == 1 and text(j) == ',':
+                if comma is not None:
+                    break  # an NLS argument too
+                comma = j
+            if depth == 0:
+                close = j
+                break
+        if comma is None or close is None or close != comma + 2:
+            continue
+        fmt = spans[sig[comma + 1]]
+        if not (
+            fmt[2] is not None
+            or fmt[0] == 'string'
+            and re.search(r'(?i)ff|x', re.sub(r'"[^"]*"', '', fmt[1]))
+        ):
+            continue
+        first = ''.join(span[1] for span in spans[sig[k + 2] : sig[comma]])
+        found.append((sig[k], sig[close], first.strip()))
+    return found
+
+
+@_kept_per_text
 def _computed_operands(sql: str) -> list[tuple[int, int]]:
     """The parenthesized groups and calls `sql` converts to text without a
     format, in the places _typed_datetime_operands looks, each as the first
@@ -15518,6 +15561,7 @@ class PostgresBackend:
             sql = _ruled('number-conditions', _number_conditions(sql), sql)
         sql = _ruled('json-dot-notation', self._json_dot_notation(sql), sql)
         sql = _ruled('raw-concatenation', self._hex_raw_operands(sql), sql)
+        sql = _ruled('timestamp-fraction', self._formatted_fractions(sql), sql)
         sql = _ruled('datetime-text', self._datetime_text_operands(sql), sql)
         sql = _ruled('datetime-assignment', self._datetime_assignments(sql), sql)
         sql = _ruled('package-function-call', self._call_package_functions(sql), sql)
@@ -16291,6 +16335,44 @@ class PostgresBackend:
             precision = column.tstz_precision
             return (_TSTZ_TEXT, 6 if precision is None else precision)
         return None
+
+    def _formatted_fractions(self, sql: str) -> str:
+        """`sql` with each TO_CHAR(x, fmt) whose format has FF or X, where x
+        is a TIMESTAMP, as sys.ora_to_char(x, fmt, p): FF prints p digits,
+        the value's precision -- a column's own, 9 for a TIMESTAMP literal or
+        a TIMESTAMP with an interval, n for CAST(... AS TIMESTAMP(n)) -- where
+        to_char(timestamp, text) prints 6 (#2167). Measured on 23ai."""
+        if 'to_char' not in sql.lower():
+            return sql
+        found = _formatted_datetimes(sql)
+        if not found:
+            return sql
+        tables = _from_tables(sql)
+        spans = _bind_spans(sql)
+        out = [span[1] for span in spans]
+        changed = False
+        for name, close, value in found:
+            converted = _typed_datetime_value(value)
+            if converted is None and re.fullmatch(
+                r'(?:"[^"]+"|[\w$#]+)(?:\s*\.\s*(?:"[^"]+"|[\w$#]+)){0,2}', value
+            ):
+                converted = self._datetime_text_call(
+                    self._concatenated_column(
+                        tables, [p.strip() for p in value.split('.')]
+                    )
+                    if tables
+                    else None
+                )
+            if converted is None:
+                computed = self._computed_precision(value, tables)
+                if computed is not None:
+                    converted = (_DATETIME_TEXT, computed)
+            if converted is None or converted[0] != _DATETIME_TEXT or converted[1] < 0:
+                continue
+            out[name] = 'sys.ora_to_char'
+            out[close] = f', {converted[1]})'
+            changed = True
+        return ''.join(out) if changed else sql
 
     def _datetime_assignments(self, sql: str) -> str:
         """`sql`, an UPDATE or INSERT, with each DATE or TIMESTAMP it assigns
