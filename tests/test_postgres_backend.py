@@ -2448,6 +2448,49 @@ def test_a_zoned_timestamp_made_text_follows_the_nls_formats() -> None:
         backend.close()
 
 
+def test_a_computed_datetime_made_text_follows_the_nls_formats() -> None:
+    # A computed DATE or TIMESTAMP made text was PostgreSQL's text (#2162).
+    # 23ai's, d at 13:14:15 and each TIMESTAMP at 13:14:15.5: a DATE with a
+    # number or an interval, a TIMESTAMP with a number and TRUNC / ADD_MONTHS
+    # of either are DATEs; a TIMESTAMP with an interval a TIMESTAMP(9); NVL
+    # and MAX keep their operand's type; a difference stays a number.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute(
+            'CREATE TABLE t2162g (d DATE, ts TIMESTAMP, t3 TIMESTAMP(3), '
+            'v VARCHAR2(40))'
+        )
+        try:
+            backend.execute(
+                "INSERT INTO t2162g (d, ts, t3) VALUES (TIMESTAMP '2024-01-02 13:14:15', "
+                "TIMESTAMP '2024-01-02 13:14:15.5', TIMESTAMP '2024-01-02 13:14:15.5')"
+            )
+            for item, shown in (
+                ('(d + 1)', '03-JAN-24'),
+                ("(d + interval '1' hour)", '02-JAN-24'),
+                ('(ts + 1)', '03-JAN-24'),
+                ("(t3 + interval '1' day)", '03-JAN-24 01.14.15.500000000 PM'),
+                ('add_months(d, 1)', '02-FEB-24'),
+                ('trunc(ts)', '02-JAN-24'),
+                ('nvl(ts, ts)', '02-JAN-24 01.14.15.500000 PM'),
+                ('max(t3)', '02-JAN-24 01.14.15.500 PM'),
+                ("(date '2024-01-02' + 1)", '03-JAN-24'),
+                ('(d - d)', '0'),
+            ):
+                assert backend.execute(f"SELECT {item} || 'x' FROM t2162g").rows == [
+                    (shown + 'x',)
+                ], item
+            backend.execute('UPDATE t2162g SET v = d + 1')
+            assert backend.execute('SELECT v FROM t2162g').rows == [('03-JAN-24',)]
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2162g')
+    finally:
+        backend.close()
+
+
 def test_translate_admin_sets_the_session_time_zone_without_inverting_it() -> None:
     # A 12.1+ client sends ALTER SESSION SET TIME_ZONE at login. PostgreSQL reads
     # a bare offset as POSIX and INVERTS it (`SET TIME ZONE '+05:30'` runs at
@@ -4676,8 +4719,8 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # sys.ora_to_char and to_char(timestamp, text) (#2167), and
     # sys.ora_plsql_number_text with DBMS_OUTPUT's PUT_LINE and PUT of a
     # number (#2181), and sys.ora_datetime_text, sys.ora_zone_text,
-    # sys.ora_tstz_text and sys.ora_ltz_text (#2162).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 115
+    # sys.ora_tstz_text, sys.ora_ltz_text and sys.ora_computed_text (#2162).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 116
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
