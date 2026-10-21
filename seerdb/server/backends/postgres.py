@@ -8182,6 +8182,31 @@ def _from_tables(sql: str) -> list[tuple[str | None, str, str | None]]:
     return out
 
 
+def _column_operands(item: str) -> list[str]:
+    # The names a select-list item reads as columns -- `c`, `t.c`, `s.t.c`,
+    # lower-cased and unquoted -- leaving out a name that is called (#2152).
+    tokens = [span for span in _bind_spans(item) if span[0] not in ('space', 'comment')]
+    names: list[str] = []
+    at = 0
+    while at < len(tokens):
+        if tokens[at][0] not in ('word', 'identifier'):
+            at += 1
+            continue
+        parts = [tokens[at][1]]
+        at += 1
+        while (
+            at + 1 < len(tokens)
+            and tokens[at][1] == '.'
+            and tokens[at + 1][0] in ('word', 'identifier')
+        ):
+            parts.append(tokens[at + 1][1])
+            at += 2
+        if at < len(tokens) and tokens[at][1] == '(':
+            continue
+        names.append('.'.join(part.strip('"').lower() for part in parts))
+    return names
+
+
 def _concat_width(
     item: str, sizes: dict[str, int], columns: dict[str, int] | None = None
 ) -> tuple[int, bool]:
@@ -14248,16 +14273,16 @@ class PostgresBackend:
             )
         return None
 
-    def _operand_widths(self, sql: str) -> dict[str, int]:
-        # The width each column of a query's FROM tables adds to a
-        # concatenation (#2147), keyed by its name and by its table's name or
-        # alias and its name, lower-cased; empty when it cannot be read.
+    def _operand_types(self, sql: str) -> dict[str, tuple[str, int]]:
+        # The Oracle type and length of each column of a query's FROM tables,
+        # keyed by its name and by its table's name or alias and its name,
+        # lower-cased; empty when it cannot be read (#2147, #2152).
         tables = _from_tables(sql)
         if not tables or (
             self._conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR
         ):
             return {}
-        widths: dict[str, int] = {}
+        types: dict[str, tuple[str, int]] = {}
         for schema, table, alias in tables:
             try:
                 rows = self._catalog_read(
@@ -14269,14 +14294,22 @@ class PostgresBackend:
             except psycopg.Error:
                 return {}
             for column, data_type, data_length in rows:
-                width = _column_text_width(data_type, data_length or 0)
-                if width is None:
-                    continue
                 name = column.lower()
-                widths.setdefault(name, width)
-                widths[f'{table}.{name}'] = width
+                typed = (data_type, data_length or 0)
+                types.setdefault(name, typed)
+                types[f'{table}.{name}'] = typed
                 if alias:
-                    widths[f'{alias}.{name}'] = width
+                    types[f'{alias}.{name}'] = typed
+        return types
+
+    def _operand_widths(self, sql: str) -> dict[str, int]:
+        # The width each column of a query's FROM tables adds to a
+        # concatenation (#2147), keyed as _operand_types keys it.
+        widths = {}
+        for key, (data_type, data_length) in self._operand_types(sql).items():
+            width = _column_text_width(data_type, data_length)
+            if width is not None:
+                widths[key] = width
         return widths
 
     def _column_order(self, table: str) -> list[str]:
@@ -16281,6 +16314,8 @@ class PostgresBackend:
                 for row in rows:
                     row[i] = _wire_cell(row[i], desc.type_code, self._tstz_oid)
         self._learn_types({desc.type_code for desc in cursor.description})
+        ym_types: dict[str, tuple[str, int]] | None = None
+        ym_items: list[str] = []
         columns = []
         for i, desc in enumerate(cursor.description):
             # A column tracing back to a typed domain is that Oracle type — an
@@ -16296,6 +16331,24 @@ class PostgresBackend:
             )
             if domain is None and desc.type_code in (25, 17, _INTERVAL_OID):
                 domain = computed.get(i)
+            if (
+                domain is None
+                and desc.type_code == _INTERVAL_OID
+                and original
+                and not cursor.pgresult.ftable(i)
+            ):
+                # A computed interval over a YEAR TO MONTH column -- `iym + iym`,
+                # SUM(iym) -- reports the domain's base type. Oracle mixes no
+                # DAY TO SECOND into one, so a YEAR TO MONTH operand makes the
+                # item YEAR TO MONTH (#2152).
+                if ym_types is None:
+                    ym_types = self._operand_types(original)
+                    ym_items = _select_list_items(original)
+                if i < len(ym_items) and any(
+                    ym_types.get(name, ('', 0))[0].startswith('INTERVAL YEAR')
+                    for name in _column_operands(ym_items[i])
+                ):
+                    domain = TNS_TYPE_INTERVALYM
             if (
                 domain is None
                 and desc.type_code == _TIMESTAMP_OID
