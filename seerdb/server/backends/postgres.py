@@ -632,6 +632,33 @@ _HELPER_FUNCTIONS_DDL = (
     'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT to_char($1, regexp_replace($2, '
     "'syyyy', CASE WHEN $1 < '0001-01-01'::timestamp THEN '\"-\"YYYY' "
     "ELSE '\" \"YYYY' END, 'gi')) $$;"
+    # TO_CHAR(ts, fmt) with Oracle's fractional-second elements (#2167), which
+    # PostgreSQL prints as written: FFn is n digits, truncated -- PostgreSQL's
+    # own up to 6, and zeros past its microseconds -- FF alone the value's
+    # precision, $3, and X the radix point, left out at precision 0. FX is
+    # the format-exact modifier, and quoted text stays as it is.
+    'CREATE OR REPLACE FUNCTION sys.ora_to_char(timestamp, text, integer) '
+    'RETURNS text LANGUAGE plpgsql STABLE AS $$ DECLARE f text := $2; '
+    "o text := ''; i integer := 1; j integer; d integer; BEGIN "
+    'WHILE i <= length(f) LOOP '
+    "IF substr(f, i, 1) = '\"' THEN j := strpos(substr(f, i + 1), '\"'); "
+    'IF j = 0 THEN o := o || substr(f, i); EXIT; END IF; '
+    'o := o || substr(f, i, j + 1); i := i + j + 1; '
+    "ELSIF upper(substr(f, i, 2)) = 'FX' THEN o := o || substr(f, i, 2); i := i + 2; "
+    "ELSIF upper(substr(f, i, 2)) = 'FF' THEN d := $3; i := i + 2; "
+    "IF substr(f, i, 1) ~ '[1-9]' THEN d := substr(f, i, 1)::integer; i := i + 1; "
+    'END IF; '
+    "IF d > 0 THEN o := o || 'FF' || least(d, 6); END IF; "
+    "IF d > 6 THEN o := o || '\"' || repeat('0', d - 6) || '\"'; END IF; "
+    "ELSIF upper(substr(f, i, 1)) = 'X' THEN "
+    'IF $3 > 0 THEN o := o || \'"."\'; END IF; i := i + 1; '
+    'ELSE o := o || substr(f, i, 1); i := i + 1; END IF; END LOOP; '
+    'RETURN pg_catalog.to_char($1, o); END $$;'
+    # PostgreSQL's to_char(timestamp, text) but for those elements, ahead of
+    # it on the search path: a TIMESTAMP's FF at its default precision, 6.
+    'CREATE OR REPLACE FUNCTION to_char(timestamp, text) RETURNS text '
+    "LANGUAGE sql STABLE AS $$ SELECT CASE WHEN $2 ~* 'ff|x' "
+    'THEN sys.ora_to_char($1, $2, 6) ELSE pg_catalog.to_char($1, $2) END $$;'
     # HEXTORAW('DEADBEEF') → the RAW/bytea value of a hex string.
     'CREATE OR REPLACE FUNCTION hextoraw(text) RETURNS bytea '
     "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT decode($1, 'hex') $$;"

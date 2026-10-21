@@ -2095,6 +2095,39 @@ def test_sessiontimezone_reads_the_zone_the_session_was_given() -> None:
     assert _translate_admin('SELECT 1 FROM dual') == 'SELECT 1 FROM dual'
 
 
+def test_to_char_prints_a_timestamp_fraction_as_oracle_does() -> None:
+    # X, FF and FF7-FF9 printed as written, `SSXFF` as `15XFF` (#2167).
+    # Measured on 23ai, a TIMESTAMP at 13:14:15.5: FFn n digits truncated, FF
+    # the precision's, X the radix point; FX and quoted text stay themselves.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2167 (ts TIMESTAMP)')
+        try:
+            backend.execute(
+                "INSERT INTO t2167 VALUES (TIMESTAMP '2024-01-02 13:14:15.5')"
+            )
+            for fmt, printed in (
+                ('DD-MON-RR HH.MI.SSXFF AM', '02-JAN-24 01.14.15.500000 PM'),
+                ('SS.FF', '15.500000'),
+                ('SS.FF9', '15.500000000'),
+                ('SS.FF1', '15.5'),
+                ('SS.ff3', '15.500'),
+                ('SSX', '15.'),
+                ('SS"X"FF', '15X500000'),
+                ('FXDD-MON-YYYY', '02-JAN-2024'),
+                ('YYYY-MM-DD"T"HH24:MI:SS', '2024-01-02T13:14:15'),
+            ):
+                result = backend.execute(f"SELECT to_char(ts, '{fmt}') FROM t2167")
+                assert result.rows == [(printed,)], fmt
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2167')
+    finally:
+        backend.close()
+
+
 def test_translate_idioms_rewrites_offset_bearing_timestamp_literal() -> None:
     # TIMESTAMP '<ts> ±HH:MM' is a WITH TIME ZONE value — build the composite so
     # the offset survives, rather than PostgreSQL's WITHOUT-time-zone parse dropping
@@ -4183,8 +4216,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # PL/SQL's sys.ora_plsql_pad with its rpad / lpad (#2061), and the three
     # two-argument concat (#2093), sys.ora_late's two (#2138),
     # sys.ora_number_text, sys.ora_text and to_char(numeric) (#2146), and
-    # sys.ora_late_number (#2143), and numtoyminterval (#2153).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 106
+    # sys.ora_late_number (#2143), and numtoyminterval (#2153), and
+    # sys.ora_to_char and to_char(timestamp, text) (#2167).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 108
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
