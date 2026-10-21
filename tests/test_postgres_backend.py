@@ -10870,6 +10870,33 @@ def test_dictionary_views_reflect_a_created_table() -> None:
         backend.close()
 
 
+def test_all_constraints_says_whose_name_a_constraint_has() -> None:
+    # ALL_CONSTRAINTS had no GENERATED column (#2141). 23ai's: GENERATED NAME
+    # for each unnamed constraint, a NOT NULL among them, USER NAME otherwise.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute(
+            'CREATE TABLE t2141g (id NUMBER PRIMARY KEY, n NUMBER NOT NULL, '
+            'k NUMBER, CONSTRAINT named_u UNIQUE (k))'
+        )
+        try:
+            assert backend.execute(
+                'SELECT constraint_type, generated FROM user_constraints '
+                "WHERE table_name = 'T2141G' ORDER BY constraint_type"
+            ).rows == [
+                ('C', 'GENERATED NAME'),
+                ('P', 'GENERATED NAME'),
+                ('U', 'USER NAME'),
+            ]
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2141g')
+    finally:
+        backend.close()
+
+
 def test_all_constraints_lists_a_not_null_as_oracle_does() -> None:
     # A primary key's own NOT NULL was listed as a constraint, and a NOT
     # NULL's SEARCH_CONDITION was NULL (#2171): PostgreSQL 16 has no NOT NULL
