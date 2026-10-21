@@ -1646,6 +1646,11 @@ def _reachable_relation(relation: str) -> str:
     )
 
 
+# The name of the trigger function a PL/SQL trigger runs is this and the
+# trigger's (#2174); `$` keeps it from any name a user's routine is given.
+_TRIGGER_FUNCTION_PREFIX = 'ora$trg_'
+
+
 def _pg_name_sql(name: str) -> str:
     # SQL for the PostgreSQL spelling of an Oracle name held in `name`: an
     # ordinary upper-case one in lower case, any other as it is (#2179).
@@ -2500,6 +2505,14 @@ _ORACLE_DICTIONARY_DDL = (
     "JOIN pg_description d ON d.objoid = p.oid AND d.classoid = 'pg_proc'::regclass "
     f"AND d.objsubid = 0 WHERE d.description LIKE '{_ROUTINE_MARK}%' "
     "AND has_function_privilege(p.oid, 'EXECUTE') "
+    # A PL/SQL trigger (#2174): a PostgreSQL trigger running its trigger
+    # function, which only such a trigger has.
+    'UNION ALL SELECT upper(n.nspname), ora_name(t.tgname), NULL::text, '
+    "t.oid::bigint, 'TRIGGER', 'VALID', 'N', 'N', 'N' FROM pg_trigger t "
+    'JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace '
+    'JOIN pg_proc f ON f.oid = t.tgfoid '
+    f"WHERE NOT t.tgisinternal AND f.proname LIKE '{_TRIGGER_FUNCTION_PREFIX}%' "
+    f'AND {_reachable_relation("c.oid")} '
     # A user's object type or collection type, as ALL_TYPES lists them, INVALID
     # when it is a stand-in for one that did not compile (#1940). A package's
     # types are not listed, as Oracle does not list them.
@@ -5196,6 +5209,89 @@ _DDL_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '1s'"
 _DROP_RELATION = re.compile(r'(?is)\s*DROP\s+(?:TABLE|VIEW)\s+([\w$#.]+)')
 # ORA-04063, a view that does not compile (#2201).
 _ORA_VIEW_HAS_ERRORS = 4063
+# CREATE [OR REPLACE] TRIGGER on a table, row or statement, BEFORE or AFTER
+# (#2174): its name, timing, events, table, REFERENCING names, FOR EACH ROW,
+# WHEN condition and PL/SQL block.
+_TRIGGER_NAME = r'(?:"[^"]+"|[\w$#]+)(?:\s*\.\s*(?:"[^"]+"|[\w$#]+))?'
+_CREATE_TRIGGER = re.compile(
+    rf'(?is)\s*CREATE\s+(OR\s+REPLACE\s+)?TRIGGER\s+({_TRIGGER_NAME})\s+'
+    r'(BEFORE|AFTER)\s+(.+?)\s+ON\s+'
+    rf'({_TRIGGER_NAME})\s+'
+    r'(REFERENCING\s+(?:(?:NEW|OLD|PARENT)\s+(?:AS\s+)?[\w$#]+\s*)+)?'
+    r'(FOR\s+EACH\s+ROW\s+)?(?:WHEN\s*\((.*?)\)\s*)?((?:DECLARE|BEGIN)\b.*?)\s*;?\s*$'
+)
+_REFERENCING_NAME = re.compile(r'(?i)\b(NEW|OLD|PARENT)\s+(?:AS\s+)?([\w$#]+)')
+_DROP_TRIGGER = re.compile(rf'(?is)\s*DROP\s+TRIGGER\s+({_TRIGGER_NAME})\s*;?\s*$')
+# ORA-04080, a DROP TRIGGER of none (#2174).
+_ORA_NO_SUCH_TRIGGER = 4080
+# INSERTING, UPDATING and DELETING, a trigger's tests of its event.
+_TRIGGER_PREDICATE = re.compile(
+    r'(?i)(?<![\w$#.:])(INSERTING|UPDATING|DELETING)(?![\w$#(])'
+)
+_TRIGGER_EVENTS = {'INSERTING': 'INSERT', 'UPDATING': 'UPDATE', 'DELETING': 'DELETE'}
+# ORA-04081, a CREATE TRIGGER of one there is (#2174).
+_ORA_TRIGGER_EXISTS = 4081
+
+
+def _trigger_function_name(trigger: str) -> str:
+    # The trigger function a PL/SQL trigger runs, in its trigger's schema.
+    (schema, _dot, name) = trigger.rpartition('.')
+    function = f'"{_TRIGGER_FUNCTION_PREFIX}{_pg_identifier(name)}"'
+    return f'{schema}.{function}' if schema else function
+
+
+def _translate_trigger(
+    sql: str, routine_kind: Callable[[str], str | None] | None = None
+) -> str:
+    """A CREATE TRIGGER with a PL/SQL block as a trigger function and the
+    PostgreSQL trigger that runs it (#2174); any other statement unchanged.
+
+    The block is a routine's body to the routine translator, `:new` and
+    `:old` -- or the REFERENCING names -- PL/pgSQL's NEW and OLD, and
+    INSERTING, UPDATING and DELETING tests of TG_OP. A BEFORE row trigger
+    returns the row, OLD for a DELETE, as the event goes ahead; any other
+    returns nothing. Timing, events, UPDATE OF, FOR EACH ROW and WHEN carry
+    over, NEW and OLD in WHEN as they are."""
+    m = _CREATE_TRIGGER.match(sql)
+    if m is None:
+        return sql
+    (replace, name, timing, events, table, referencing, row, when, block) = m.groups()
+    aliases = {'new': 'new', 'old': 'old'}
+    for kind, alias in _REFERENCING_NAME.findall(referencing or ''):
+        if kind.lower() in aliases:
+            aliases[alias.lower()] = kind.lower()
+    (masked, contents) = _mask_quoted(block)
+    masked = re.sub(
+        r'(?i):([\w$#]+)\b',
+        lambda found: aliases.get(found.group(1).lower(), found.group(0)),
+        masked,
+    )
+    masked = _TRIGGER_PREDICATE.sub(
+        lambda found: f"(TG_OP = '{_TRIGGER_EVENTS[found.group(1).upper()]}')", masked
+    )
+    block = _unmask_quoted(masked, contents)
+    if block.upper().startswith('DECLARE'):
+        block = block[len('DECLARE') :]
+    body = _routine_body(block)
+    if routine_kind is not None:
+        body = _perform_bare_calls(body, routine_kind)
+    if row and timing.upper() == 'BEFORE':
+        returned = "IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; RETURN NEW;"
+    else:
+        returned = 'RETURN NULL;'
+    function = _trigger_function_name(name)
+    rights = _routine_rights(name, None)
+    condition = f' WHEN ({when})' if when else ''
+    scope = 'ROW' if row else 'STATEMENT'
+    create = 'CREATE OR REPLACE' if replace else 'CREATE'
+    return (
+        f'CREATE OR REPLACE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql'
+        f'{rights} AS $$ BEGIN {body}; {returned} END $$; '
+        f'{create} TRIGGER {name.rpartition(".")[2]} {timing.upper()} {events} '
+        f'ON {table} FOR EACH {scope}{condition} EXECUTE FUNCTION {function}()'
+    )
+
+
 # DROP VIEW name, of a view a DROP left INVALID (#2201).
 _DROP_VIEW = re.compile(
     r'(?is)\s*DROP\s+VIEW\s+([\w$#.]+)(?:\s+CASCADE\s+CONSTRAINTS)?\s*;?\s*$'
@@ -15986,6 +16082,8 @@ class PostgresBackend:
         sql = _ruled('constraint-names', self._named_constraints(sql), sql)
         checks = _check_conditions(sql)
         sql = _ruled('ddl', _translate_ddl(sql), sql)
+        sql = _ruled('trigger-ddl', self._created_trigger(sql), sql)
+        sql = _ruled('drop-trigger', self._dropped_trigger(sql), sql)
         sql = _ruled(
             'routine-ddl',
             _translate_routine_ddl(
@@ -17352,6 +17450,15 @@ class PostgresBackend:
             'DELETE FROM sys.ora_check_conditions k WHERE NOT EXISTS (SELECT 1 '
             'FROM pg_constraint c WHERE c.conrelid = k.relid AND c.conname = k.conname)'
         )
+        # A trigger's function goes with its trigger, which its table takes
+        # (#2174): the session's own, as only those it may drop.
+        prunes.append(
+            'DO $p$ DECLARE f regprocedure; BEGIN FOR f IN SELECT p.oid::regprocedure '
+            "FROM pg_proc p WHERE p.proname LIKE 'ora$trg\\_%' "
+            "AND pg_has_role(p.proowner, 'USAGE') "
+            'AND NOT EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid = p.oid) LOOP '
+            "EXECUTE 'DROP FUNCTION ' || f; END LOOP; END $p$"
+        )
         # A column grant goes with its column, and its table (#1946).
         prunes.append(
             'DELETE FROM sys.ora_col_grants g WHERE NOT EXISTS (SELECT 1 '
@@ -17432,6 +17539,58 @@ class PostgresBackend:
             (pg_oid,),
         ).fetchone()
         return (row[0], row[1]) if row else None
+
+    def _created_trigger(self, sql: str) -> str:
+        # A CREATE TRIGGER translated (_translate_trigger), ORA-04081 for one
+        # of a trigger there is when it does not say OR REPLACE (#2174).
+        m = _CREATE_TRIGGER.match(sql)
+        if m is None:
+            return sql
+        if not m.group(1) and self._trigger_table(m.group(2)) is not None:
+            raise BackendError(
+                f"trigger '{_oracle_name(m.group(2).rpartition('.')[2])}' already exists",
+                ora_code=_ORA_TRIGGER_EXISTS,
+            )
+        return _translate_trigger(sql, self._routine_kind)
+
+    def _trigger_table(self, name: str) -> str | None:
+        # The table a PL/SQL trigger of this name is on, in its schema or the
+        # session's (#2174), or None for no such trigger.
+        (schema, _dot, trigger) = name.rpartition('.')
+        row = self._conn.execute(
+            'SELECT t.tgrelid::regclass::text FROM pg_trigger t '
+            'JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_proc f ON f.oid = t.tgfoid '
+            'WHERE NOT t.tgisinternal AND t.tgname = %s AND f.proname LIKE %s '
+            'AND c.relnamespace = coalesce(to_regnamespace(%s), '
+            'current_schema()::regnamespace)',
+            (
+                _pg_identifier(trigger),
+                f'{_TRIGGER_FUNCTION_PREFIX}%',
+                _pg_identifier(schema) if schema else None,
+            ),
+        ).fetchone()
+        return None if row is None else row[0]
+
+    def _dropped_trigger(self, sql: str) -> str:
+        # DROP TRIGGER name as PostgreSQL's, which names the trigger's table, and
+        # its trigger function with it (#2174); ORA-04080 for no such trigger.
+        # Any other statement unchanged.
+        dropped = _DROP_TRIGGER.match(sql)
+        if dropped is None:
+            return sql
+        name = dropped.group(1)
+        trigger = name.rpartition('.')[2]
+        table = self._trigger_table(name)
+        if table is None:
+            self._conn.rollback()
+            raise BackendError(
+                f"trigger '{_oracle_name(trigger)}' does not exist",
+                ora_code=_ORA_NO_SUCH_TRIGGER,
+            )
+        return (
+            f'DROP TRIGGER {trigger} ON {table}; '
+            f'DROP FUNCTION IF EXISTS {_trigger_function_name(name)}()'
+        )
 
     def _dropped_invalid_view(self, statement: str) -> Result | None:
         # DROP VIEW of a view a DROP left INVALID (#2201): there is no view to
