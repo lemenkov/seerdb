@@ -2312,6 +2312,40 @@ def test_a_datetime_whose_text_says_its_type_follows_the_nls_formats() -> None:
         backend.close()
 
 
+def test_a_datetime_cast_to_a_character_type_follows_the_nls_formats() -> None:
+    # CAST(x AS VARCHAR2(n)) of a DATE or TIMESTAMP gave PostgreSQL's text
+    # (#2162). 23ai's, d at 13:14:15 and each TIMESTAMP at 13:14:15.5: as ||
+    # gives it, a CHAR blank-padded to its length.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2162c (d DATE, ts TIMESTAMP, t3 TIMESTAMP(3))')
+        try:
+            backend.execute(
+                "INSERT INTO t2162c VALUES (TIMESTAMP '2024-01-02 13:14:15', "
+                "TIMESTAMP '2024-01-02 13:14:15.5', TIMESTAMP '2024-01-02 13:14:15.5')"
+            )
+            assert backend.execute(
+                'SELECT CAST(d AS VARCHAR2(30)), CAST(ts AS VARCHAR2(40)), '
+                'CAST(t3 AS VARCHAR(40)), CAST(d AS CHAR(12)), '
+                "CAST(DATE '2024-01-02' AS VARCHAR2(20)) FROM t2162c"
+            ).rows == [
+                (
+                    '02-JAN-24',
+                    '02-JAN-24 01.14.15.500000 PM',
+                    '02-JAN-24 01.14.15.500 PM',
+                    '02-JAN-24   ',
+                    '02-JAN-24',
+                )
+            ]
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2162c')
+    finally:
+        backend.close()
+
+
 def test_translate_admin_sets_the_session_time_zone_without_inverting_it() -> None:
     # A 12.1+ client sends ALTER SESSION SET TIME_ZONE at login. PostgreSQL reads
     # a bare offset as POSIX and INVERTS it (`SET TIME ZONE '+05:30'` runs at
