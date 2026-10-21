@@ -14108,29 +14108,40 @@ class PostgresBackend:
         )
         if violation.values:
             textual: set[str] = set()
+            values = dict(zip(violation.columns, violation.values))
             if (
                 self._conn.info.transaction_status
                 != psycopg.pq.TransactionStatus.INERROR
             ):
                 try:
-                    textual = {
-                        name
-                        for (name,) in self._catalog_read(
-                            'SELECT a.attname FROM pg_attribute a '
-                            'JOIN pg_type t ON t.oid = a.atttypid '
-                            'JOIN pg_class c ON c.oid = a.attrelid '
-                            'JOIN pg_namespace n ON n.oid = c.relnamespace '
-                            'WHERE lower(n.nspname) = lower(%s) '
-                            'AND lower(c.relname) = lower(%s) '
-                            "AND t.typcategory = 'S' AND a.attname = ANY(%s)",
-                            (violation.schema, violation.table, violation.columns),
-                        ).fetchall()
-                    }
+                    for name, category, type_name in self._catalog_read(
+                        'SELECT a.attname, t.typcategory, t.typname '
+                        'FROM pg_attribute a '
+                        'JOIN pg_type t ON t.oid = a.atttypid '
+                        'JOIN pg_class c ON c.oid = a.attrelid '
+                        'JOIN pg_namespace n ON n.oid = c.relnamespace '
+                        'WHERE lower(n.nspname) = lower(%s) '
+                        'AND lower(c.relname) = lower(%s) AND a.attname = ANY(%s)',
+                        (violation.schema, violation.table, violation.columns),
+                    ).fetchall():
+                        if category == 'S':
+                            textual.add(name)
+                        elif type_name == _DATE_TYPE:
+                            # A DATE in the session's NLS_DATE_FORMAT, as
+                            # TO_CHAR(d) gives it (#2141).
+                            row = self._catalog_read(
+                                'SELECT to_char(%s::timestamp)', (values[name],)
+                            ).fetchone()
+                            if row is not None:
+                                values[name] = row[0]
                 except psycopg.Error:
                     textual = set()
+                    values = dict(zip(violation.columns, violation.values))
             shown = ', '.join(
-                f"{c.upper()}:'{v}'" if c in textual else f'{c.upper()}:{v}'
-                for c, v in zip(violation.columns, violation.values)
+                f"{c.upper()}:'{values[c]}'"
+                if c in textual
+                else f'{c.upper()}:{values[c]}'
+                for c in violation.columns
             )
             text += (
                 f'\nORA-03301: (ORA-00001 details) row with column values ({shown}) '
