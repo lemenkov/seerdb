@@ -2537,6 +2537,43 @@ _ORACLE_DICTIONARY_DDL = (
     '3::numeric AS origin_con_id FROM sys.ora_synonyms s '
     "WHERE has_schema_privilege(lower(s.owner), 'USAGE');"
     'CREATE OR REPLACE VIEW sys.dba_synonyms AS SELECT * FROM sys.all_synonyms;'
+    # What a PL/SQL trigger was written as (#2174), which PostgreSQL's keeps
+    # none of: its DESCRIPTION, REFERENCING names, WHEN condition and body.
+    'CREATE TABLE IF NOT EXISTS sys.ora_triggers (owner text NOT NULL, '
+    'name text NOT NULL, description text, referencing text, when_clause text, '
+    'body text, PRIMARY KEY (owner, name));'
+    # ALL_TRIGGERS, USER_TRIGGERS and DBA_TRIGGERS (#2174), 23ai's columns:
+    # the kind and events from PostgreSQL's trigger, the text as written from
+    # the record; the flags a compound trigger sets are NO.
+    'CREATE OR REPLACE VIEW sys.all_triggers AS SELECT upper(n.nspname) AS owner, '
+    'ora_name(t.tgname) AS trigger_name, '
+    "CASE WHEN t.tgtype & 2 = 2 THEN 'BEFORE' ELSE 'AFTER' END || "
+    "CASE WHEN t.tgtype & 1 = 1 THEN ' EACH ROW' ELSE ' STATEMENT' END AS trigger_type, "
+    "concat_ws(' OR ', CASE WHEN t.tgtype & 4 = 4 THEN 'INSERT' END, "
+    "CASE WHEN t.tgtype & 16 = 16 THEN 'UPDATE' END, "
+    "CASE WHEN t.tgtype & 8 = 8 THEN 'DELETE' END) AS triggering_event, "
+    "upper(n.nspname) AS table_owner, 'TABLE' AS base_object_type, "
+    'ora_name(c.relname) AS table_name, NULL::text AS column_name, '
+    "coalesce(r.referencing, 'REFERENCING NEW AS NEW OLD AS OLD') AS referencing_names, "
+    'r.when_clause, '
+    "CASE t.tgenabled WHEN 'D' THEN 'DISABLED' ELSE 'ENABLED' END AS status, "
+    "r.description, 'PL/SQL     '::text AS action_type, r.body AS trigger_body, "
+    "'NO'::text AS crossedition, 'NO'::text AS before_statement, "
+    "'NO'::text AS before_row, 'NO'::text AS after_row, 'NO'::text AS after_statement, "
+    "'NO'::text AS instead_of_row, 'YES'::text AS fire_once, "
+    "'NO'::text AS apply_server_only FROM pg_trigger t "
+    'JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace '
+    'JOIN pg_proc f ON f.oid = t.tgfoid LEFT JOIN sys.ora_triggers r '
+    'ON r.owner = upper(n.nspname) AND r.name = ora_name(t.tgname) '
+    f"WHERE NOT t.tgisinternal AND f.proname LIKE '{_TRIGGER_FUNCTION_PREFIX}%' "
+    f'AND {_reachable_relation("c.oid")};'
+    'CREATE OR REPLACE VIEW sys.dba_triggers AS SELECT * FROM sys.all_triggers;'
+    'CREATE OR REPLACE VIEW sys.user_triggers AS SELECT trigger_name, trigger_type, '
+    'triggering_event, table_owner, base_object_type, table_name, column_name, '
+    'referencing_names, when_clause, status, description, action_type, trigger_body, '
+    'crossedition, before_statement, before_row, after_row, after_statement, '
+    'instead_of_row, fire_once, apply_server_only FROM sys.all_triggers '
+    'WHERE owner = upper(current_schema());'
     'CREATE OR REPLACE VIEW sys.user_synonyms AS SELECT synonym_name, table_owner, '
     'table_name, db_link, origin_con_id FROM sys.all_synonyms '
     'WHERE owner = upper(current_schema());'
@@ -3096,6 +3133,10 @@ def _record_owner_tests() -> dict[str, str | None]:
         'ora_tstz_precision': relation,
         'ora_quoted_names': relation,
         'ora_object_tables': relation,
+        # A trigger's text as written, its schema owner's (#2174).
+        'ora_triggers': owner(
+            'pg_namespace', 'nspowner', 'nspname', 'lower({t}.owner)'
+        ),
         'ora_check_conditions': relation,
         'ora_collection_elements': owner('pg_type', 'typowner', 'oid', '{t}.typid'),
         'ora_packages': owner('pg_namespace', 'nspowner', 'nspname', '{t}.name'),
@@ -5229,6 +5270,16 @@ _TRIGGER_PREDICATE = re.compile(
     r'(?i)(?<![\w$#.:])(INSERTING|UPDATING|DELETING)(?![\w$#(])'
 )
 _TRIGGER_EVENTS = {'INSERTING': 'INSERT', 'UPDATING': 'UPDATE', 'DELETING': 'DELETE'}
+# ALTER TRIGGER name ENABLE | DISABLE | COMPILE, and ALTER TABLE t ENABLE |
+# DISABLE ALL TRIGGERS (#2174).
+_ALTER_TRIGGER = re.compile(
+    rf'(?is)\s*ALTER\s+TRIGGER\s+({_TRIGGER_NAME})\s+(ENABLE|DISABLE|COMPILE)\b'
+    r'(?:\s+DEBUG)?\s*;?\s*$'
+)
+_ALTER_ALL_TRIGGERS = re.compile(
+    rf'(?is)\s*ALTER\s+TABLE\s+({_TRIGGER_NAME})\s+(ENABLE|DISABLE)\s+ALL\s+TRIGGERS'
+    r'\s*;?\s*$'
+)
 # ORA-04081, a CREATE TRIGGER of one there is (#2174).
 _ORA_TRIGGER_EXISTS = 4081
 
@@ -5281,6 +5332,15 @@ def _translate_trigger(
         returned = 'RETURN NULL;'
     function = _trigger_function_name(name)
     rights = _routine_rights(name, None)
+    if when:
+        # NEW and OLD by the names REFERENCING gave them, as PostgreSQL knows them.
+        (masked_when, when_contents) = _mask_quoted(when)
+        masked_when = re.sub(
+            r'(?i)(?<![\w$#.])([\w$#]+)(?=\s*\.)',
+            lambda found: aliases.get(found.group(1).lower(), found.group(1)),
+            masked_when,
+        )
+        when = _unmask_quoted(masked_when, when_contents)
     condition = f' WHEN ({when})' if when else ''
     scope = 'ROW' if row else 'STATEMENT'
     create = 'CREATE OR REPLACE' if replace else 'CREATE'
@@ -16084,6 +16144,7 @@ class PostgresBackend:
         sql = _ruled('ddl', _translate_ddl(sql), sql)
         sql = _ruled('trigger-ddl', self._created_trigger(sql), sql)
         sql = _ruled('drop-trigger', self._dropped_trigger(sql), sql)
+        sql = _ruled('alter-trigger', self._altered_trigger(sql), sql)
         sql = _ruled(
             'routine-ddl',
             _translate_routine_ddl(
@@ -16182,6 +16243,7 @@ class PostgresBackend:
             self._record_column_types(original)
             self._record_annotations(annotated)
             self._record_check_conditions(checks)
+            self._record_trigger(original)
             self._revalidate_views()
             self._relations.clear()
             self._relids.clear()
@@ -17445,11 +17507,15 @@ class PostgresBackend:
                 'DELETE FROM sys.ora_collection_elements x WHERE NOT EXISTS '
                 '(SELECT 1 FROM pg_type t WHERE t.oid = x.typid)'
             )
-        # A CHECK's condition goes with its constraint (#2171).
-        prunes.append(
+        # A CHECK's condition goes with its constraint (#2171), and a trigger's
+        # text with its trigger (#2174).
+        prunes += [
             'DELETE FROM sys.ora_check_conditions k WHERE NOT EXISTS (SELECT 1 '
-            'FROM pg_constraint c WHERE c.conrelid = k.relid AND c.conname = k.conname)'
-        )
+            'FROM pg_constraint c WHERE c.conrelid = k.relid AND c.conname = k.conname)',
+            'DELETE FROM sys.ora_triggers r WHERE NOT EXISTS (SELECT 1 FROM pg_trigger t '
+            'JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace '
+            'WHERE upper(n.nspname) = r.owner AND ora_name(t.tgname) = r.name)',
+        ]
         # A trigger's function goes with its trigger, which its table takes
         # (#2174): the session's own, as only those it may drop.
         prunes.append(
@@ -17552,6 +17618,86 @@ class PostgresBackend:
                 ora_code=_ORA_TRIGGER_EXISTS,
             )
         return _translate_trigger(sql, self._routine_kind)
+
+    def _altered_trigger(self, sql: str) -> str:
+        # ALTER TRIGGER ENABLE / DISABLE as PostgreSQL's, which names the
+        # trigger's table, and COMPILE as nothing, as a trigger here is never
+        # INVALID; ALTER TABLE ... ALL TRIGGERS as its user triggers, a
+        # foreign key's own being PostgreSQL's (#2174). ORA-04080 for no such
+        # trigger; any other statement unchanged.
+        every = _ALTER_ALL_TRIGGERS.match(sql)
+        if every is not None:
+            # Its PL/SQL triggers by name: PostgreSQL's TRIGGER USER would meet
+            # the USER pseudo-column's rewrite.
+            names = self._conn.execute(
+                'SELECT t.tgname FROM pg_trigger t JOIN pg_proc f ON f.oid = t.tgfoid '
+                'WHERE NOT t.tgisinternal AND f.proname LIKE %s '
+                'AND t.tgrelid = sys.ora_regclass(%s) ORDER BY t.tgname',
+                (f'{_TRIGGER_FUNCTION_PREFIX}%', every.group(1)),
+            ).fetchall()
+            if not names:
+                return _NO_OP
+            return '; '.join(
+                f'ALTER TABLE {every.group(1)} {every.group(2).upper()} TRIGGER '
+                f'{_quoted_identifier(tgname)}'
+                for (tgname,) in names
+            )
+        altered = _ALTER_TRIGGER.match(sql)
+        if altered is None:
+            return sql
+        (name, action) = (altered.group(1), altered.group(2).upper())
+        table = self._trigger_table(name)
+        if table is None:
+            self._conn.rollback()
+            raise BackendError(
+                f"trigger '{_oracle_name(name.rpartition('.')[2])}' does not exist",
+                ora_code=_ORA_NO_SUCH_TRIGGER,
+            )
+        if action == 'COMPILE':
+            return _NO_OP
+        return f'ALTER TABLE {table} {action} TRIGGER {name.rpartition(".")[2]}'
+
+    def _record_trigger(self, statement: str) -> None:
+        # After a committed CREATE TRIGGER: keep what it was written as for
+        # ALL_TRIGGERS (#2174) -- its DESCRIPTION, from its name to its WHEN
+        # or block, its REFERENCING names, WHEN condition and block. On its
+        # own, like the other records, so a failure here cannot take the
+        # trigger with it.
+        m = _CREATE_TRIGGER.match(statement)
+        if m is None:
+            return
+        name = m.group(2)
+        end = m.start(9)
+        if m.group(8) is not None:
+            end = statement.lower().rfind('when', m.start(2), m.start(8))
+        aliases = dict(
+            (kind.upper(), alias.upper())
+            for kind, alias in _REFERENCING_NAME.findall(m.group(6) or '')
+        )
+        referencing = (
+            f'REFERENCING NEW AS {aliases.get("NEW", "NEW")} '
+            f'OLD AS {aliases.get("OLD", "OLD")}'
+        )
+        (schema, _dot, trigger) = name.rpartition('.')
+        try:
+            self._conn.execute(
+                'INSERT INTO sys.ora_triggers (owner, name, description, referencing, '
+                'when_clause, body) VALUES (coalesce(%s, upper(current_schema())), '
+                '%s, %s, %s, %s, %s) ON CONFLICT (owner, name) DO UPDATE SET '
+                'description = EXCLUDED.description, referencing = EXCLUDED.referencing, '
+                'when_clause = EXCLUDED.when_clause, body = EXCLUDED.body',
+                (
+                    _oracle_name(schema) if schema else None,
+                    _oracle_name(trigger),
+                    statement[m.start(2) : end],
+                    referencing,
+                    m.group(8),
+                    statement[m.start(9) :].strip(),
+                ),
+            )
+            self._conn.commit()
+        except psycopg.Error:
+            self._conn.rollback()
 
     def _trigger_table(self, name: str) -> str | None:
         # The table a PL/SQL trigger of this name is on, in its schema or the
