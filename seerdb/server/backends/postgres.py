@@ -14168,6 +14168,8 @@ class PostgresBackend:
         # Each table name a statement names, as its relation's oid -- None for
         # no relation -- for the schema model (#1889); any DDL starts it over.
         self._relids: dict[str, int | None] = {}
+        # Which of the schema model's relations are views (#2202).
+        self._view_relids: set[int] = set()
         # The ora_rowid domain's oids, read once a statement asks (#1624).
         self._rowid_type_oids: frozenset[int] | None = None
         if not installed:
@@ -16051,13 +16053,17 @@ class PostgresBackend:
     def _returning_rowid(self, original: str, translated: str) -> str | None:
         # The translated DML with the rowid RETURNING added, or None where it
         # does not apply: not an INSERT / UPDATE / DELETE, one that returns
-        # something already, or one on an index-organized table, whose ROWID is
-        # its primary key rather than a heap address.
+        # something already, one on an index-organized table, whose ROWID is
+        # its primary key rather than a heap address, or one through a view,
+        # which has no heap address of its own to return (#2202).
         if not _DML_HEAD.match(translated) or _HAS_RETURNING.search(translated):
             return None
         table = _STATEMENT_TABLE.search(original)
         if table is not None and _bare_table(table.group(1)) in self._iot_pk:
             return None
+        if table is not None and self._relation_columns(table.group(1)) is not None:
+            if self._relids.get(table.group(1)) in self._view_relids:
+                return None
         if self._per_user and table is not None and '.' in table.group(1):
             # Another user's table, which one may be granted INSERT, UPDATE
             # or DELETE on and not SELECT, which PostgreSQL's RETURNING needs
@@ -17510,14 +17516,18 @@ class PostgresBackend:
             "WHERE c.contype = 'c' AND c.conrelid = a.attrelid "
             'AND c.conkey = ARRAY[a.attnum] '
             "AND pg_get_constraintdef(c.oid) ~ '^CHECK \\(+(sys\\.)?ora_is_json\\('), "
-            f'{declared}, {precision}, {invisible}, a.atttypmod '
+            f'{declared}, {precision}, {invisible}, a.atttypmod, '
+            "(SELECT r.relkind = 'v' FROM pg_class r WHERE r.oid = a.attrelid) "
             f'FROM pg_attribute a{joins} '
             'WHERE a.attrelid = ANY(%s) AND a.attnum > 0 AND NOT a.attisdropped',
             (list(relids),),
         ).fetchall()
         for relid in relids:
             self._relations[relid] = {}
+        self._view_relids -= relids
         for row in found:
+            if row[14]:
+                self._view_relids.add(row[0])
             declared_type = None if row[7] is None else tuple(row[7:11])
             self._relations[row[0]][row[1]] = _TableColumn(
                 name=row[2],

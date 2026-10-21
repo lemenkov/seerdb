@@ -187,6 +187,32 @@ def test_dml_on_dual_is_refused_as_oracle_refuses_it(sql: str, offset: int) -> N
         backend.close()
 
 
+def test_dml_through_a_view_reaches_its_table() -> None:
+    # INSERT, UPDATE and DELETE through a view failed on the tableoid the DML
+    # rewrite reads back, which a view has none of (#2202). 23ai's: each
+    # changes the table's row; a view gives no ROWID here, its table's heap
+    # address not being one PostgreSQL returns through it.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2202 (id NUMBER, v VARCHAR2(5))')
+        backend.execute('CREATE VIEW v2202 AS SELECT * FROM t2202')
+        try:
+            assert backend.execute("INSERT INTO v2202 VALUES (1, 'a')").rowcount == 1
+            assert backend.execute("UPDATE v2202 SET v = 'b'").rowcount == 1
+            assert backend.execute('SELECT id, v FROM t2202').rows == [(1, 'b')]
+            assert backend.execute('DELETE FROM v2202 WHERE id = 1').rowcount == 1
+            inserted = backend.execute("INSERT INTO t2202 VALUES (2, 'c')")
+            assert inserted.last_rowid is not None
+        finally:
+            backend.rollback()
+            backend.execute('DROP VIEW v2202')
+            backend.execute('DROP TABLE t2202')
+    finally:
+        backend.close()
+
+
 def test_backend_error_relays_the_parse_position_as_the_offset() -> None:
     # PostgreSQL's 1-based statement_position becomes Oracle's 0-based offset, but
     # only where the dialect rewrite left the prefix before the error untouched.
