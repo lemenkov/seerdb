@@ -10720,6 +10720,35 @@ def test_dictionary_views_reflect_a_created_table() -> None:
         backend.close()
 
 
+def test_all_constraints_lists_a_not_null_as_oracle_does() -> None:
+    # A primary key's own NOT NULL was listed as a constraint, and a NOT
+    # NULL's SEARCH_CONDITION was NULL (#2171): PostgreSQL 16 has no NOT NULL
+    # constraint, and information_schema makes one up for every such column.
+    # 23ai lists a declared NOT NULL only, its condition `"N" IS NOT NULL`.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute(
+            'CREATE TABLE t2171 (id NUMBER PRIMARY KEY, n NUMBER NOT NULL, '
+            '"MixedC" NUMBER NOT NULL, o NUMBER)'
+        )
+        try:
+            assert backend.execute(
+                'SELECT constraint_type, search_condition FROM user_constraints '
+                "WHERE table_name = 'T2171' ORDER BY constraint_type, search_condition"
+            ).rows == [
+                ('C', '"MixedC" IS NOT NULL'),
+                ('C', '"N" IS NOT NULL'),
+                ('P', None),
+            ]
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2171')
+    finally:
+        backend.close()
+
+
 def test_the_user_dictionary_views_have_oracles_columns() -> None:
     # USER_CONSTRAINTS, USER_CONS_COLUMNS, USER_IND_COLUMNS and USER_VIEWS were
     # orafce's oracle.user_*, without Oracle's columns and with TABLE_NAME a
