@@ -2189,6 +2189,74 @@ def test_arithmetic_on_a_year_to_month_column_is_year_to_month() -> None:
         backend.close()
 
 
+def test_datetime_arithmetic_describes_as_its_operands_say() -> None:
+    # A DATE or TIMESTAMP plus an interval described as TIMESTAMP(6), as did
+    # MAX(d) (#2160): PostgreSQL computes a timestamp. Measured on 23ai: a
+    # DATE operand keeps a DATE, its fraction dropped; a TIMESTAMP one makes a
+    # TIMESTAMP(9); MAX / MIN keep the column's type and precision.
+    import datetime
+
+    from seerdb.common.tns_consts import TNS_TYPE_DATE, TNS_TYPE_TIMESTAMP
+    from seerdb.server.backends.postgres import _datetime_result
+
+    assert _datetime_result('cast(d AS timestamp) + iym', ['DATE']) == (None, None)
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute(
+            'CREATE TABLE t2160 (d DATE, ts TIMESTAMP, ts3 TIMESTAMP(3), '
+            'iym INTERVAL YEAR(4) TO MONTH, ids INTERVAL DAY(3) TO SECOND(2))'
+        )
+        try:
+            backend.execute(
+                "INSERT INTO t2160 VALUES (TO_DATE('2020-01-31 10:00:00', "
+                "'YYYY-MM-DD HH24:MI:SS'), TIMESTAMP '2020-01-31 10:00:00.5', "
+                "TIMESTAMP '2020-01-31 10:00:00.5', INTERVAL '1-2' YEAR TO MONTH, "
+                "INTERVAL '1 2:03:04.5' DAY TO SECOND)"
+            )
+            for expression, kind, scale, value in (
+                ('d + iym', TNS_TYPE_DATE, 0, datetime.datetime(2021, 3, 31, 10)),
+                ('iym + x.d', TNS_TYPE_DATE, 0, datetime.datetime(2021, 3, 31, 10)),
+                ('d + ids', TNS_TYPE_DATE, 0, datetime.datetime(2020, 2, 1, 12, 3, 4)),
+                (
+                    'd - ids',
+                    TNS_TYPE_DATE,
+                    0,
+                    datetime.datetime(2020, 1, 30, 7, 56, 55),
+                ),
+                ('max(d) m', TNS_TYPE_DATE, 0, datetime.datetime(2020, 1, 31, 10)),
+                (
+                    'ts3 + iym',
+                    TNS_TYPE_TIMESTAMP,
+                    9,
+                    datetime.datetime(2021, 3, 31, 10, 0, 0, 500000),
+                ),
+                (
+                    'ts - ids',
+                    TNS_TYPE_TIMESTAMP,
+                    9,
+                    datetime.datetime(2020, 1, 30, 7, 56, 56),
+                ),
+                (
+                    'max(ts3)',
+                    TNS_TYPE_TIMESTAMP,
+                    3,
+                    datetime.datetime(2020, 1, 31, 10, 0, 0, 500000),
+                ),
+            ):
+                source = 't2160 x' if 'x.' in expression else 't2160'
+                result = backend.execute(f'SELECT {expression} FROM {source}')
+                (column,) = result.columns
+                assert (column.data_type, column.scale) == (kind, scale), expression
+                assert result.rows == [(value,)], expression
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2160')
+    finally:
+        backend.close()
+
+
 def test_translate_idioms_negates_whole_day_to_second_interval() -> None:
     # Oracle's leading `-` negates the whole DAY TO SECOND interval; PostgreSQL
     # applies it only to the days, so lift it to a unary minus on the literal (#520).
