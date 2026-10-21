@@ -788,6 +788,48 @@ def test_an_error_with_no_postgresql_position_is_placed_as_23ai_places_it() -> N
     assert _placed_offset(1, 'insert into t values (1)') is None
 
 
+def test_user_source_lists_a_units_source_by_line() -> None:
+    # USER_SOURCE was orafce's, and empty for the Mirror's routines; there was
+    # no ALL_SOURCE (#2172). Measured on 23ai: the source from its keyword on,
+    # a row a line, each but the last ending in its newline; a unit created
+    # with compilation errors keeps it, and a DROP takes it.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE OR REPLACE PROCEDURE s2172 AS\nBEGIN\n  NULL;\nEND;')
+        backend.execute('CREATE OR REPLACE PACKAGE p2172 AS\n  x NUMBER;\nEND p2172;')
+        assert backend.execute(
+            'CREATE OR REPLACE PROCEDURE i2172 AS BEGIN nosuch; END;'
+        ).compilation_warning
+        try:
+            assert backend.execute(
+                'SELECT name, type, line, text, origin_con_id FROM user_source '
+                "WHERE name IN ('S2172', 'P2172', 'I2172') ORDER BY name, line"
+            ).rows == [
+                ('I2172', 'PROCEDURE', 1, 'PROCEDURE i2172 AS BEGIN nosuch; END;', 0),
+                ('P2172', 'PACKAGE', 1, 'PACKAGE p2172 AS\n', 0),
+                ('P2172', 'PACKAGE', 2, '  x NUMBER;\n', 0),
+                ('P2172', 'PACKAGE', 3, 'END p2172;', 0),
+                ('S2172', 'PROCEDURE', 1, 'PROCEDURE s2172 AS\n', 0),
+                ('S2172', 'PROCEDURE', 2, 'BEGIN\n', 0),
+                ('S2172', 'PROCEDURE', 3, '  NULL;\n', 0),
+                ('S2172', 'PROCEDURE', 4, 'END;', 0),
+            ]
+            assert backend.execute(
+                "SELECT owner, count(*) FROM all_source WHERE name = 'S2172' "
+                'GROUP BY owner'
+            ).rows == [('PYO', 4)]
+        finally:
+            for unit in ('PROCEDURE s2172', 'PACKAGE p2172', 'PROCEDURE i2172'):
+                backend.execute(f'DROP {unit}')
+        assert backend.execute(
+            "SELECT count(*) FROM user_source WHERE name IN ('S2172', 'P2172', 'I2172')"
+        ).rows == [(0,)]
+    finally:
+        backend.close()
+
+
 def test_all_errors_lists_an_invalid_objects_error() -> None:
     # sqlplus's SHOW ERRORS reads ALL_ERRORS, which did not exist (#2060). A
     # CREATE that does not compile lists its error at the line and column
