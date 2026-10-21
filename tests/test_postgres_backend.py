@@ -7758,6 +7758,109 @@ def test_a_session_keeps_its_edition() -> None:
         login.close()
 
 
+def test_a_plsql_trigger_fires_as_oracles_does() -> None:
+    # CREATE TRIGGER with a PL/SQL block was a syntax error (#2174). 23ai's,
+    # on trg_t (a, b, c): a BEFORE row trigger sets :new; INSERTING, UPDATING
+    # and DELETING tell its events apart with :new and :old; a statement
+    # trigger fires once a statement; UPDATE OF and WHEN choose the rows;
+    # REFERENCING renames :new. USER_OBJECTS lists each trigger VALID and
+    # USER_SOURCE its text; ORA-04081 for a second CREATE, ORA-04080 for a
+    # DROP of none.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE trg_t (a NUMBER, b NUMBER, c VARCHAR2(10))')
+        backend.execute('CREATE TABLE trg_log (what VARCHAR2(20), n NUMBER)')
+        try:
+            for trigger in (
+                'CREATE OR REPLACE TRIGGER trg1 BEFORE INSERT ON trg_t FOR EACH ROW '
+                'BEGIN :new.b := :new.a * 2; END;',
+                'CREATE OR REPLACE TRIGGER trg2 AFTER INSERT OR UPDATE OR DELETE '
+                'ON trg_t FOR EACH ROW BEGIN IF inserting THEN '
+                "INSERT INTO trg_log VALUES ('I', :new.a); ELSIF updating THEN "
+                "INSERT INTO trg_log VALUES ('U', :old.a); ELSE "
+                "INSERT INTO trg_log VALUES ('D', :old.a); END IF; END;",
+                'CREATE OR REPLACE TRIGGER trg3 AFTER INSERT ON trg_t '
+                "BEGIN INSERT INTO trg_log VALUES ('S', NULL); END;",
+                'CREATE OR REPLACE TRIGGER trg4 BEFORE UPDATE OF c ON trg_t '
+                'FOR EACH ROW WHEN (new.a > 5) BEGIN :new.c := upper(:new.c); END;',
+            ):
+                backend.execute(trigger)
+            backend.execute("INSERT INTO trg_t (a, c) VALUES (3, 'x')")
+            backend.execute("INSERT INTO trg_t (a, c) VALUES (7, 'y')")
+            assert backend.execute('SELECT a, b, c FROM trg_t ORDER BY a').rows == [
+                (3, 6, 'x'),
+                (7, 14, 'y'),
+            ]
+            backend.execute("UPDATE trg_t SET c = 'z'")
+            assert backend.execute('SELECT a, c FROM trg_t ORDER BY a').rows == [
+                (3, 'z'),
+                (7, 'Z'),
+            ]
+            backend.execute('UPDATE trg_t SET b = 0 WHERE a = 7')
+            backend.execute('DELETE FROM trg_t WHERE a = 3')
+            assert backend.execute('SELECT what, n FROM trg_log').rows == [
+                ('I', 3),
+                ('S', None),
+                ('I', 7),
+                ('S', None),
+                ('U', 3),
+                ('U', 7),
+                ('U', 7),
+                ('D', 3),
+            ]
+            assert backend.execute(
+                'SELECT object_name, status FROM user_objects '
+                "WHERE object_type = 'TRIGGER' ORDER BY 1"
+            ).rows == [
+                ('TRG1', 'VALID'),
+                ('TRG2', 'VALID'),
+                ('TRG3', 'VALID'),
+                ('TRG4', 'VALID'),
+            ]
+            assert backend.execute(
+                "SELECT text FROM user_source WHERE name = 'TRG1'"
+            ).rows == [
+                (
+                    'TRIGGER trg1 BEFORE INSERT ON trg_t FOR EACH ROW '
+                    'BEGIN :new.b := :new.a * 2; END;',
+                )
+            ]
+            backend.execute('DROP TRIGGER trg1')
+            backend.execute(
+                'CREATE TRIGGER trg5 BEFORE INSERT ON trg_t REFERENCING NEW AS nn '
+                'FOR EACH ROW DECLARE k NUMBER := 99; BEGIN :nn.b := k; END;'
+            )
+            backend.execute('INSERT INTO trg_t (a) VALUES (2)')
+            assert backend.execute('SELECT b FROM trg_t WHERE a = 2').rows == [(99,)]
+            for statement, code in (
+                (
+                    'CREATE TRIGGER trg5 BEFORE INSERT ON trg_t FOR EACH ROW '
+                    'BEGIN NULL; END;',
+                    4081,
+                ),
+                ('DROP TRIGGER trg1', 4080),
+            ):
+                with pytest.raises(BackendError) as raised:
+                    backend.execute(statement)
+                assert raised.value.ora_code == code, statement
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE trg_t')
+            backend.execute('DROP TABLE trg_log')
+        assert backend.execute(
+            "SELECT count(*) FROM user_objects WHERE object_type = 'TRIGGER'"
+        ).rows == [(0,)]
+        assert backend._conn.execute(
+            "SELECT count(*) FROM pg_proc WHERE proname LIKE 'ora$trg%'"
+        ).fetchone() == (0,)
+    finally:
+        backend.close()
+
+
 def test_a_standalone_routine_is_listed_with_the_objects() -> None:
     # A user's standalone procedure and function (#1606): in ALL_OBJECTS as
     # PROCEDURE / FUNCTION, VALID or INVALID as they compiled, and the valid
