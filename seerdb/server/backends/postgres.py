@@ -8644,6 +8644,69 @@ def _converted_columns(sql: str) -> list[tuple[int, int, list[str]]]:
 _ZONED_LITERAL = re.compile(r"(?i)'.*(?:[+-]\d{1,2}:\d{2}|[a-z]\w*/\w+|\bUTC)\s*'$")
 
 
+def _typed_datetime_at(text: Callable[[int], str], k: int) -> tuple[int, int] | None:
+    """Whether the significant token `k` that `text` gives starts a DATE or
+    TIMESTAMP value whose type the text says -- a DATE or TIMESTAMP literal,
+    SYSDATE, TO_DATE(...), CAST(... AS DATE | TIMESTAMP[(p)]) -- and if so,
+    its last token and its precision, -1 for a DATE and 9 for a TIMESTAMP
+    literal (#2162). A literal with a zone is no TIMESTAMP."""
+
+    def closing(start: int) -> int | None:
+        depth = 0
+        close = start
+        while text(close):
+            depth += (text(close) == '(') - (text(close) == ')')
+            if depth == 0:
+                return close
+            close += 1
+        return None
+
+    word = text(k).upper()
+    if word in ('DATE', 'TIMESTAMP'):
+        literal = text(k + 1)
+        if literal.startswith("'") and not (
+            word == 'TIMESTAMP' and _ZONED_LITERAL.match(literal)
+        ):
+            return (k + 1, -1 if word == 'DATE' else 9)
+        return None
+    if word == 'SYSDATE':
+        return None if text(k + 1) == '(' else (k, -1)
+    if word not in ('TO_DATE', 'CAST') or text(k + 1) != '(':
+        return None
+    close = closing(k + 1)
+    if close is None:
+        return None
+    if word == 'TO_DATE':
+        return (close, -1)
+    if text(close - 2).upper() == 'AS':
+        if text(close - 1).upper() == 'DATE':
+            return (close, -1)
+        if text(close - 1).upper() == 'TIMESTAMP':
+            return (close, 6)
+    if (
+        text(close - 1) == ')'
+        and text(close - 3) == '('
+        and text(close - 2).isdigit()
+        and text(close - 4).upper() == 'TIMESTAMP'
+        and text(close - 5).upper() == 'AS'
+    ):
+        return (close, int(text(close - 2)))
+    return None
+
+
+def _typed_datetime_value(item: str) -> int | None:
+    # The precision of the DATE or TIMESTAMP value `item` is whole, where its
+    # text says its type (_typed_datetime_at), else None (#2162).
+    spans = _bind_spans(item)
+    sig = [span[1] for span in spans if span[0] not in ('space', 'comment')]
+
+    def text(k: int) -> str:
+        return sig[k] if 0 <= k < len(sig) else ''
+
+    typed = _typed_datetime_at(text, 0) if sig else None
+    return typed[1] if typed is not None and typed[0] == len(sig) - 1 else None
+
+
 @_kept_per_text
 def _typed_datetime_operands(sql: str) -> list[tuple[int, int, int]]:
     """The DATE and TIMESTAMP values `sql` converts to text without a
@@ -8658,14 +8721,6 @@ def _typed_datetime_operands(sql: str) -> list[tuple[int, int, int]]:
     def text(k: int) -> str:
         return spans[sig[k]][1] if 0 <= k < len(sig) else ''
 
-    def closing(k: int) -> int | None:
-        depth = 0
-        for close in range(k, len(sig)):
-            depth += (text(close) == '(') - (text(close) == ')')
-            if depth == 0:
-                return close
-        return None
-
     calls: list[str] = []
     inside: list[str] = []  # the call each token is directly inside
     for k in range(len(sig)):
@@ -8676,36 +8731,9 @@ def _typed_datetime_operands(sql: str) -> list[tuple[int, int, int]]:
             calls.append(text(k - 1).upper())
     found: list[tuple[int, int, int]] = []
     for k in range(len(sig)):
-        word = text(k).upper()
         if text(k - 1) == '.':
             continue
-        typed: tuple[int, int] | None = None
-        if word in ('DATE', 'TIMESTAMP') and spans[sig[k]][0] != 'string':
-            literal = text(k + 1)
-            if literal.startswith("'") and not (
-                word == 'TIMESTAMP' and _ZONED_LITERAL.match(literal)
-            ):
-                typed = (k + 1, -1 if word == 'DATE' else 9)
-        elif word == 'SYSDATE' and text(k + 1) != '(':
-            typed = (k, -1)
-        elif word in ('TO_DATE', 'CAST') and text(k + 1) == '(':
-            close = closing(k + 1)
-            if close is not None and word == 'TO_DATE':
-                typed = (close, -1)
-            elif close is not None and text(close - 2).upper() == 'AS':
-                if text(close - 1).upper() == 'DATE':
-                    typed = (close, -1)
-                elif text(close - 1).upper() == 'TIMESTAMP':
-                    typed = (close, 6)
-            elif (
-                close is not None
-                and text(close - 1) == ')'
-                and text(close - 3) == '('
-                and text(close - 2).isdigit()
-                and text(close - 4).upper() == 'TIMESTAMP'
-                and text(close - 5).upper() == 'AS'
-            ):
-                typed = (close, int(text(close - 2)))
+        typed = _typed_datetime_at(text, k)
         if typed is None:
             continue
         (last, precision) = typed
@@ -15314,6 +15342,7 @@ class PostgresBackend:
         sql = _ruled('json-dot-notation', self._json_dot_notation(sql), sql)
         sql = _ruled('raw-concatenation', self._hex_raw_operands(sql), sql)
         sql = _ruled('datetime-text', self._datetime_text_operands(sql), sql)
+        sql = _ruled('datetime-assignment', self._datetime_assignments(sql), sql)
         sql = _ruled('package-function-call', self._call_package_functions(sql), sql)
         bare = _BARE_CALL.match(sql)
         if bare is not None and bare.group(1).upper() not in _PLSQL_WORD_STATEMENTS:
@@ -15994,6 +16023,73 @@ class PostgresBackend:
             out[first] = 'sys.ora_datetime_text(' + out[first]
             out[last] += f', {precision})'
         return ''.join(out)
+
+    def _datetime_assignments(self, sql: str) -> str:
+        """`sql`, an UPDATE or INSERT, with each DATE or TIMESTAMP it assigns
+        to a character column as Oracle's text of it, the session's NLS
+        format: sys.ora_datetime_text(value, p), as in a concatenation
+        (#2162). PostgreSQL's assignment stored its own text,
+        `2024-01-02 13:14:15`. The value is a column -- the UPDATE's table's,
+        or one of an INSERT's query's FROM tables -- or one whose text says
+        its type; anything else is left."""
+        if not re.match(r'\s*(?:UPDATE|INSERT)\b', sql, re.IGNORECASE):
+            return sql
+        assigned = _assigned_values(sql)
+        if assigned is None or not assigned[1]:
+            return sql
+        (table, items) = assigned
+        targets = self._relation_columns(table) if table else None
+        if not targets:
+            return sql
+        by_name = {column.name: column for column in targets.values()}
+        # Without a column list, the visible columns in their order.
+        order = [
+            targets[attnum].name
+            for attnum in sorted(targets)
+            if not targets[attnum].invisible
+        ]
+        sources: list[tuple[str | None, str, str | None]]
+        if _NULL_UPDATE.match(sql):
+            qualified = [part.strip('"').lower() for part in table.split('.')]
+            sources = [
+                (qualified[0] if len(qualified) == 2 else None, qualified[-1], None)
+            ]
+        else:
+            sources = _from_tables(sql)
+        out = sql
+        for index, (named, start, end) in reversed(list(enumerate(items))):
+            if named is not None:
+                target = by_name.get(_pg_identifier(named))
+            else:
+                target = by_name.get(order[index]) if index < len(order) else None
+            if target is None or target.type_oid not in _TEXT_OIDS:
+                continue
+            value = sql[start:end].strip()
+            precision = _typed_datetime_value(value)
+            if (
+                precision is None
+                and sources
+                and re.fullmatch(
+                    r'(?:"[^"]+"|[\w$#]+)(?:\s*\.\s*(?:"[^"]+"|[\w$#]+)){0,2}', value
+                )
+            ):
+                parts = [part.strip() for part in value.split('.')]
+                column = self._concatenated_column(sources, parts)
+                if column is None:
+                    pass
+                elif self._domain_type_by_oid.get(column.type_oid) == TNS_TYPE_DATE:
+                    precision = -1
+                elif column.type_oid == _TIMESTAMP_OID:
+                    precision = 6 if column.typmod < 0 else column.typmod
+            if precision is None:
+                continue
+            at = start + sql[start:end].index(value)
+            out = (
+                out[:at]
+                + f'sys.ora_datetime_text({value}, {precision})'
+                + out[at + len(value) :]
+            )
+        return out
 
     def _concatenated_type(
         self, tables: list[tuple[str | None, str, str | None]], parts: list[str]

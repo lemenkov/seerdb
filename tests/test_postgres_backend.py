@@ -2346,6 +2346,52 @@ def test_a_datetime_cast_to_a_character_type_follows_the_nls_formats() -> None:
         backend.close()
 
 
+def test_a_datetime_assigned_to_a_character_column_follows_the_nls_formats() -> None:
+    # A DATE or TIMESTAMP that an UPDATE or INSERT stored in a VARCHAR2 column
+    # was PostgreSQL's text (#2162). 23ai's: the session's NLS format, FF at
+    # the value's precision, by SET, by an INSERT's query or VALUES, with or
+    # without a column list. A DATE column given a DATE stays one.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute(
+            'CREATE TABLE t2162a (d DATE, ts TIMESTAMP, t3 TIMESTAMP(3), '
+            'v VARCHAR2(40), d2 DATE)'
+        )
+        try:
+            backend.execute(
+                "INSERT INTO t2162a (d, ts, t3) VALUES (TIMESTAMP '2024-01-02 13:14:15', "
+                "TIMESTAMP '2024-01-02 13:14:15.5', TIMESTAMP '2024-01-02 13:14:15.5')"
+            )
+
+            def stored() -> list:
+                return backend.execute('SELECT v FROM t2162a WHERE d IS NOT NULL').rows
+
+            backend.execute('UPDATE t2162a SET v = d, d2 = d')
+            assert stored() == [('02-JAN-24',)]
+            backend.execute('UPDATE t2162a SET v = ts')
+            assert stored() == [('02-JAN-24 01.14.15.500000 PM',)]
+            backend.execute("UPDATE t2162a SET v = DATE '2024-01-03'")
+            assert stored() == [('03-JAN-24',)]
+            backend.execute('INSERT INTO t2162a (v) SELECT t3 FROM t2162a')
+            backend.execute(
+                "INSERT INTO t2162a VALUES (NULL, NULL, NULL, DATE '2024-01-04', NULL)"
+            )
+            assert sorted(
+                backend.execute('SELECT v FROM t2162a WHERE d IS NULL').rows
+            ) == [('02-JAN-24 01.14.15.500 PM',), ('04-JAN-24',)]
+            assert backend.execute(
+                "SELECT to_char(d2, 'YYYY-MM-DD HH24:MI:SS') FROM t2162a "
+                'WHERE d IS NOT NULL'
+            ).rows == [('2024-01-02 13:14:15',)]
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2162a')
+    finally:
+        backend.close()
+
+
 def test_translate_admin_sets_the_session_time_zone_without_inverting_it() -> None:
     # A 12.1+ client sends ALTER SESSION SET TIME_ZONE at login. PostgreSQL reads
     # a bare offset as POSIX and INVERTS it (`SET TIME ZONE '+05:30'` runs at
