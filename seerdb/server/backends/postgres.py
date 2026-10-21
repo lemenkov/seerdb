@@ -1974,6 +1974,9 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE TABLE IF NOT EXISTS sys.ora_source ('
     'owner text NOT NULL, name text NOT NULL, type text NOT NULL, '
     'text text NOT NULL, PRIMARY KEY (owner, name, type));'
+    # The numbers of the names Oracle gives a constraint the DDL does not
+    # name, SYS_C and seven digits, one counter for all (#2141).
+    'CREATE SEQUENCE IF NOT EXISTS sys.ora_constraint_names;'
     # The types a package declares (#1607), each a PostgreSQL type of its
     # schema, with the PL/SQL it was declared as -- what the dictionary and a
     # client's type metadata report -- in declaration order. A body's own types
@@ -6225,6 +6228,62 @@ def _type_shape_roles(sql: str) -> tuple[dict[str, str], str | None]:
         elif position == 0 and argument.startswith("'") and argument.endswith("'"):
             literal = argument[1:-1].replace("''", "'")
     return (roles, literal)
+
+
+# A CREATE TABLE, or an ALTER TABLE that adds or modifies, whose unnamed
+# constraints Oracle names (#2141).
+_CONSTRAINT_DDL = re.compile(
+    r'(?is)^\s*(?:CREATE\s+(?:GLOBAL\s+TEMPORARY\s+)?TABLE|ALTER\s+TABLE)\b'
+)
+_CONSTRAINT_KINDS = frozenset({'PRIMARY', 'UNIQUE', 'CHECK', 'REFERENCES', 'FOREIGN'})
+
+
+def _unnamed_constraints(sql: str) -> list[int]:
+    """Where each constraint a CREATE TABLE or ALTER TABLE ... ADD / MODIFY
+    declares without a name starts, as offsets into `sql` (#2141): a PRIMARY
+    KEY, UNIQUE, CHECK, REFERENCES or FOREIGN KEY, inline or out of line, one
+    parenthesis deep in a CREATE TABLE's columns -- or at the top, or one deep,
+    in an ALTER's. One that CONSTRAINT names, the REFERENCES of a FOREIGN KEY,
+    and anything in a CREATE TABLE ... AS SELECT or an ALTER that drops are
+    left out."""
+    if not _CONSTRAINT_DDL.match(sql):
+        return []
+    tokens = [
+        (token.kind, sql[token.start : token.end].upper(), token.start)
+        for token in sql_tokens(sql)
+        if token.kind not in ('space', 'comment')
+    ]
+    words = [text for kind, text, _at in tokens if kind == 'word']
+    create = words[0] == 'CREATE'
+    if (
+        create
+        and 'SELECT' in words
+        or not create
+        and ('DROP' in words or not ({'ADD', 'MODIFY'} & set(words)))
+    ):
+        return []
+    found: list[int] = []
+    (depth, foreign) = (0, False)
+    for index, (kind, text, at) in enumerate(tokens):
+        if text == '(':
+            depth += 1
+            continue
+        if text == ')':
+            depth -= 1
+            continue
+        if text == ',' and depth <= 1:
+            foreign = False
+        if kind != 'word' or text not in _CONSTRAINT_KINDS:
+            continue
+        if not (depth == 1 if create else depth <= 1):
+            continue
+        if text == 'REFERENCES' and foreign:
+            continue
+        foreign = text == 'FOREIGN'
+        if index >= 2 and tokens[index - 2][1] == 'CONSTRAINT':
+            continue
+        found.append(at)
+    return found
 
 
 def _translate_ddl(sql: str) -> str:
@@ -15074,6 +15133,7 @@ class PostgresBackend:
         )
         sql = _ruled('admin', _translate_admin(sql), sql)
         sql = _ruled('instant-index', self._instant_index_keys(sql), sql)
+        sql = _ruled('constraint-names', self._named_constraints(sql), sql)
         sql = _ruled('ddl', _translate_ddl(sql), sql)
         sql = _ruled(
             'routine-ddl',
@@ -16455,6 +16515,22 @@ class PostgresBackend:
                 f'{star.group(1)}{", ".join(items)}{star.group(3)}'
                 + sql[star.start(4) :]
             )
+        return sql
+
+    def _named_constraints(self, sql: str) -> str:
+        # `sql` with each constraint it declares without a name named as
+        # Oracle names it, SYS_C and seven digits from one counter (#2141), so
+        # PostgreSQL's constraint and index carry it: the dictionary lists it,
+        # ORA-00001 names it.
+        starts = _unnamed_constraints(sql)
+        if not starts:
+            return sql
+        numbers = self._conn.execute(
+            "SELECT nextval('sys.ora_constraint_names') FROM generate_series(1, %s)",
+            (len(starts),),
+        ).fetchall()
+        for at, (number,) in zip(reversed(starts), reversed(numbers)):
+            sql = f'{sql[:at]}CONSTRAINT SYS_C{number:07d} {sql[at:]}'
         return sql
 
     def _record_source(self, statement: str) -> None:
