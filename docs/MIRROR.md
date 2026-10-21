@@ -321,9 +321,17 @@ Both modes translate the same SQL and PL/SQL; only who may do what differs.
   create extensions, have an administrator create it in the database first.
 - **[pgvector](https://github.com/pgvector/pgvector)**, optional, for Oracle's
   `VECTOR` type. Without it a `VECTOR` column is refused.
+- **[plpgsql_check](https://github.com/okbob/plpgsql_check)**, optional, so that
+  a PL/SQL procedure or function that names an undeclared variable, an unknown
+  column or table, or a call no routine takes is created INVALID with Oracle's
+  errors, as Oracle's compiler makes it. Without it such a routine is created
+  VALID and fails when it runs. Its creation needs a superuser; the Mirror runs
+  `CREATE EXTENSION IF NOT EXISTS plpgsql_check` as it installs its dictionary.
+  CI pins v2.10.11: v2.10.12 crashes the server on a function that fetches from
+  a cursor parameter, and a crash in it restarts every session.
 
 The repository's [`examples/mirror-pg.Dockerfile`](../examples/mirror-pg.Dockerfile)
-builds PostgreSQL 16 with both, as CI uses it.
+builds PostgreSQL 16 with all three, as CI uses it.
 
 ### Which role to connect as
 

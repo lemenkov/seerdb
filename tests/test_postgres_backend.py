@@ -47,6 +47,7 @@ from seerdb.server.backends.postgres import (  # noqa: E402
     _bind_slots,
     _call_argument_error,
     _call_arguments,
+    _checked_error_rows,
     _column_annotations,
     _computed_column_types,
     _declared_columns,
@@ -9747,6 +9748,122 @@ def test_an_undeclared_name_is_pls_00201_with_its_statement_ignored() -> None:
     finally:
         try:
             backend.execute('drop procedure p2121')
+        finally:
+            backend.close()
+
+
+def test_a_check_finds_what_a_routine_names_that_does_not_resolve() -> None:
+    # plpgsql_check's errors as ALL_ERRORS lists 23ai's (#2129): each at its
+    # name, after the routine's BEGIN, then the statement Oracle ignored, at
+    # its start; an error whose name the source does not show is left.
+    sql = (
+        'create or replace procedure p as x number; '
+        'begin x := length(1, 2); select nosuchcol into x from nosuchtab; end;'
+    )
+    assert _checked_error_rows(
+        sql,
+        [
+            ('assignment', '42883', 'function length(integer, integer) does not exist'),
+            ('SQL statement', '42703', 'column "nosuchcol" does not exist'),
+            ('SQL statement', '42P01', 'relation "nosuchtab" does not exist'),
+            ('assignment', '42703', 'column "elsewhere" does not exist'),
+        ],
+        frozenset({'length'}),
+    ) == [
+        (
+            1,
+            37,
+            "PLS-00306: wrong number or types of arguments in call to 'LENGTH'",
+            306,
+        ),
+        (1, 32, 'PL/SQL: Statement ignored', 0),
+        (1, 58, 'PL/SQL: ORA-00904: "NOSUCHCOL": invalid identifier', 904),
+        (1, 51, 'PL/SQL: SQL Statement ignored', 0),
+        (1, 80, 'PL/SQL: ORA-00942: table or view does not exist', 942),
+        (1, 51, 'PL/SQL: SQL Statement ignored', 0),
+    ]
+
+
+def test_a_routine_naming_what_does_not_resolve_is_created_invalid() -> None:
+    # A routine whose body named an undeclared variable, an unknown column or
+    # table, or a call no function takes compiled VALID: PL/pgSQL resolves
+    # names only when it runs a statement (#2129). With plpgsql_check, 23ai's
+    # ALL_ERRORS rows, positions from the routine's keyword on.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        if not backend._has_plpgsql_check():
+            pytest.skip('the PostgreSQL bed has no plpgsql_check')
+        for body, rows in (
+            (
+                'x := nosuch;',
+                [
+                    (1, 42, "PLS-00201: identifier 'NOSUCH' must be declared"),
+                    (1, 37, 'PL/SQL: Statement ignored'),
+                ],
+            ),
+            (
+                'select nosuchcol into x from dual;',
+                [
+                    (1, 44, 'PL/SQL: ORA-00904: "NOSUCHCOL": invalid identifier'),
+                    (1, 37, 'PL/SQL: SQL Statement ignored'),
+                ],
+            ),
+            (
+                'select count(*) into x from nosuchtab;',
+                [
+                    (1, 65, 'PL/SQL: ORA-00942: table or view does not exist'),
+                    (1, 37, 'PL/SQL: SQL Statement ignored'),
+                ],
+            ),
+            (
+                'x := length(1, 2, 3);',
+                [
+                    (
+                        1,
+                        42,
+                        "PLS-00306: wrong number or types of arguments in call to 'LENGTH'",
+                    ),
+                    (1, 37, 'PL/SQL: Statement ignored'),
+                ],
+            ),
+            (
+                'if y > 1 then null; end if;',
+                [
+                    (1, 40, "PLS-00201: identifier 'Y' must be declared"),
+                    (1, 37, 'PL/SQL: Statement ignored'),
+                ],
+            ),
+        ):
+            result = backend.execute(
+                f'create or replace procedure p2129a as x number; begin {body} end;'
+            )
+            assert result.compilation_warning, body
+            assert backend.execute(
+                "SELECT status FROM user_objects WHERE object_name = 'P2129A'"
+            ).rows == [('INVALID',)], body
+            assert (
+                backend.execute(
+                    "SELECT line, position, text FROM user_errors WHERE name = 'P2129A' "
+                    'ORDER BY sequence'
+                ).rows
+                == rows
+            ), body
+        result = backend.execute(
+            'create or replace procedure p2129a as x number; '
+            "begin x := length('ab'); end;"
+        )
+        assert not result.compilation_warning
+        assert backend.execute(
+            "SELECT status FROM user_objects WHERE object_name = 'P2129A'"
+        ).rows == [('VALID',)]
+    finally:
+        try:
+            with contextlib.suppress(BackendError):  # none where it was skipped
+                backend.execute('drop procedure p2129a')
         finally:
             backend.close()
 

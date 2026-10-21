@@ -10646,6 +10646,87 @@ def _compile_error_place(
     return (line, position, text, number)
 
 
+# What plpgsql_check says it could not resolve (#2129).
+_CHECK_COLUMN = re.compile(r'column "([^"]+)" does not exist')
+_CHECK_RELATION = re.compile(r'relation "([^"]+)" does not exist')
+_CHECK_FUNCTION = re.compile(r'function ([\w$#.]+)\(.*\) does not exist')
+# What a PL/SQL statement follows: the end of one, or a keyword one comes after.
+_BEFORE_STATEMENT = re.compile(r'(?i)(?:;|\b(?:BEGIN|THEN|ELSE|LOOP|DECLARE)\b)')
+
+
+def _checked_error_rows(
+    sql: str, found: list[tuple[str, str, str]], routines: frozenset[str]
+) -> list[tuple[int, int, str, int]]:
+    """ALL_ERRORS's rows for what plpgsql_check found in a unit (#2129):
+    each error at its name, as found in the source after the routine's BEGIN,
+    and the statement Oracle then ignores, at its start; lines from the
+    unit's keyword on, positions 1-based. An error whose name the source does
+    not show is left out."""
+    head = _SOURCE_START.match(sql)
+    source = sql[head.end() if head else 0 :]
+    (masked, _contents) = _mask_quoted(source)
+    begin = re.search(r'(?i)\bBEGIN\b', masked)
+    offset = begin.end() if begin else 0
+
+    def place(at: int) -> tuple[int, int]:
+        return (
+            masked.count('\n', 0, at) + 1,
+            at - (masked.rfind('\n', 0, at) + 1) + 1,
+        )
+
+    rows: list[tuple[int, int, str, int]] = []
+    for statement, sqlstate, message in found:
+        sql_statement = 'SQL' in statement or 'SELECT' in statement.upper()
+        if (
+            column := _CHECK_COLUMN.search(message)
+        ) is not None and sqlstate == '42703':
+            name = column.group(1)
+            if sql_statement:
+                (text, number) = (
+                    f'PL/SQL: ORA-00904: "{name.upper()}": invalid identifier',
+                    904,
+                )
+            else:
+                (text, number) = (
+                    f"PLS-00201: identifier '{name.upper()}' must be declared",
+                    201,
+                )
+        elif (relation := _CHECK_RELATION.search(message)) is not None:
+            name = relation.group(1).rpartition('.')[2]
+            (text, number) = ('PL/SQL: ORA-00942: table or view does not exist', 942)
+        elif (function := _CHECK_FUNCTION.search(message)) is not None:
+            name = function.group(1).rpartition('.')[2]
+            if name.lower() in routines:
+                (text, number) = (
+                    'PLS-00306: wrong number or types of arguments in call to '
+                    f"'{name.upper()}'",
+                    306,
+                )
+            else:
+                (text, number) = (
+                    f"PLS-00201: identifier '{name.upper()}' must be declared",
+                    201,
+                )
+        else:
+            continue
+        at = re.search(rf'(?i)(?<![\w$#.]){re.escape(name)}(?![\w$#])', masked[offset:])
+        if at is None:
+            continue
+        where = offset + at.start()
+        before = list(_BEFORE_STATEMENT.finditer(masked, 0, where))
+        start = before[-1].end() if before else 0
+        start += len(masked[start:where]) - len(masked[start:where].lstrip())
+        ignored = (
+            'PL/SQL: SQL Statement ignored'
+            if number in (904, 942)
+            else ('PL/SQL: Statement ignored')
+        )
+        rows.append((*place(where), text, number))
+        rows.append((*place(start), ignored, 0))
+        offset = where + len(name)
+    return rows
+
+
 # A name, perhaps schema-qualified, either part perhaps quoted (#2176).
 _QUALIFIED_NAME = re.compile(r'\s*(?:("[^"]+"|[\w$#]+)\s*\.\s*)?("[^"]+"|[\w$#]+)\s*$')
 
@@ -12643,6 +12724,14 @@ class _InvalidNumber(BackendError):
         self.value = value
 
 
+class _CheckedErrors(BackendError):
+    # The compile errors a check found in a unit PostgreSQL created (#2129),
+    # each as ALL_ERRORS lists it: (line, position, text, message number).
+    def __init__(self, rows: list[tuple[int, int, str, int]]) -> None:
+        super().__init__(rows[0][2], ora_code=ORA_INVALID_IDENTIFIER)
+        self.rows = rows
+
+
 class _ObjectMissing(BackendError):
     # ORA-00942 with the table or view PostgreSQL could not find, for 23ai's
     # wording, which names it (#2110): `table or view "PYO"."T" does not
@@ -14457,6 +14546,14 @@ class PostgresBackend:
                         )
             except psycopg.Error:
                 self._install_failures.append('vector')
+            # plpgsql_check, where it is installed (#2129), which resolves a
+            # PL/SQL unit's names when it is created, as Oracle's compiler
+            # does. Optional: without it a unit compiles as before.
+            try:
+                with self._conn.transaction():
+                    self._conn.execute('CREATE EXTENSION IF NOT EXISTS plpgsql_check')
+            except psycopg.Error:
+                pass
         # What this session has, whichever session's setup made it: looked up
         # here, before the search_path below, where the types were made.
         vector = found.vector if found is not None else self._look_up_vector()
@@ -14617,6 +14714,8 @@ class PostgresBackend:
         # Each table name a statement names, as its relation's oid -- None for
         # no relation -- for the schema model (#1889); any DDL starts it over.
         self._relids: dict[str, int | None] = {}
+        # Whether the database has plpgsql_check (#2129), once asked.
+        self._plpgsql_check: bool | None = None
         # Which of the schema model's relations are views (#2202).
         self._view_relids: set[int] = set()
         # The ora_rowid domain's oids, read once a statement asks (#1624).
@@ -16217,6 +16316,10 @@ class PostgresBackend:
                 if invalid is None:
                     raise
                 result = invalid
+            else:
+                checked = self._compile_checked(original)
+                if checked is not None:
+                    result = checked
         else:
             result = self._execute_sequential(sql, params, original)
         # DDL auto-commits (Oracle semantics): persist it — and any pending DML —
@@ -16299,7 +16402,17 @@ class PostgresBackend:
         # The error ALL_ERRORS lists for the object (#2060), in place of any it
         # had: where it is in the source, from the object's keyword on, as
         # Oracle counts, and its text.
-        (line, position, text, number) = _compile_error_place(sql, kind, error)
+        rows: list[tuple[int, int, str, int]]
+        if isinstance(error, _CheckedErrors):
+            rows = list(error.rows)
+        else:
+            (line, position, text, number) = _compile_error_place(sql, kind, error)
+            rows = [(line, position, text, number)]
+            if number == 201:
+                # Oracle lists the statement it then ignored, at its start, which
+                # is where the undeclared name stands in the statements read so
+                # far (#2121).
+                rows.append((line, position, 'PL/SQL: Statement ignored', 0))
         owner_sql = '%s' if owner else 'sys.ora_owner(current_schema())'
         params: list = [owner.upper()] if owner else []
         self._conn.execute(
@@ -16313,19 +16426,63 @@ class PostgresBackend:
             'all_objects o WHERE o.owner = e.owner AND o.object_name = e.name '
             "AND o.object_type = e.type AND o.status = 'INVALID')"
         )
-        rows = [(1, text, number)]
-        if number == 201:
-            # Oracle lists the statement it then ignored, at its start, which
-            # is where the undeclared name stands in the statements read so far
-            # (#2121).
-            rows.append((2, 'PL/SQL: Statement ignored', 0))
-        for sequence, row_text, row_number in rows:
+        for sequence, (line, position, row_text, row_number) in enumerate(rows, 1):
             self._conn.execute(
                 'INSERT INTO sys.ora_errors (owner, name, type, sequence, line, '
                 f'position, text, message_number) VALUES ({owner_sql}, %s, %s, '
                 '%s, %s, %s, %s, %s)',
                 (*params, name, kind, sequence, line, position, row_text, row_number),
             )
+
+    def _compile_checked(self, sql: str) -> Result | None:
+        """A standalone procedure or function PostgreSQL created whose body
+        names what does not resolve, made INVALID as Oracle's compiler makes
+        it (#2129): plpgsql_check, where it is installed, resolves the names
+        PL/pgSQL leaves to the first call. Each error ALL_ERRORS lists as
+        23ai does -- an undeclared name PLS-00201, a call no routine takes
+        PLS-00306, a column or table an SQL statement names ORA-00904 or
+        ORA-00942 -- at the name, then the statement it ignored, at its
+        start. An error it cannot place is left: the routine stays VALID, as
+        before. None where nothing is wrong, or nothing checks."""
+        routine = _ROUTINE_HEAD.match(sql)
+        if routine is None or not self._has_plpgsql_check():
+            return None
+        (schema, name) = _pg_routine_name(routine.group(2))
+        try:
+            with self._conn.transaction():
+                found = self._conn.execute(
+                    'SELECT c.statement, c.sqlstate, c.message FROM pg_proc p '
+                    'CROSS JOIN LATERAL plpgsql_check_function_tb(p.oid, '
+                    'fatal_errors => false) c WHERE p.proname = %s '
+                    "AND p.pronamespace = coalesce(to_regnamespace(nullif(%s, '')), "
+                    "current_schema()::regnamespace) AND c.level = 'error' "
+                    'ORDER BY c.lineno, c.position',
+                    (name, schema),
+                ).fetchall()
+        except psycopg.Error:
+            return None
+        rows = _checked_error_rows(sql, found, self._routine_names_known())
+        if not rows:
+            return None
+        return self._create_invalid(sql, _CheckedErrors(rows))
+
+    def _has_plpgsql_check(self) -> bool:
+        # Whether the database has plpgsql_check (#2129), looked up once.
+        if self._plpgsql_check is None:
+            row = self._conn.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'plpgsql_check')"
+            ).fetchone()
+            self._plpgsql_check = bool(row and row[0])
+        return self._plpgsql_check
+
+    def _routine_names_known(self) -> frozenset[str]:
+        # The names of the functions a session's statements can call, lower
+        # case: a call one of them refuses is PLS-00306, not PLS-00201 (#2129).
+        rows = self._conn.execute(
+            'SELECT DISTINCT p.proname FROM pg_proc p WHERE p.pronamespace = ANY('
+            'current_schemas(true)::regnamespace[])'
+        ).fetchall()
+        return frozenset(name for (name,) in rows)
 
     def _create_invalid(self, sql: str, error: BackendError) -> Result | None:
         # A CREATE PROCEDURE / FUNCTION / TYPE that does not compile SUCCEEDS in
