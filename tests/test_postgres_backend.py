@@ -2278,7 +2278,7 @@ def test_a_datetime_converted_to_text_follows_the_sessions_nls_formats() -> None
 def test_a_datetime_whose_text_says_its_type_follows_the_nls_formats() -> None:
     # A DATE or TIMESTAMP literal, SYSDATE, TO_DATE and CAST made text came out
     # as PostgreSQL's (#2162). 23ai's: a TIMESTAMP literal at precision 9, a
-    # CAST at its own; one with a zone is no TIMESTAMP and is left.
+    # CAST at its own; one with a zone is a TIMESTAMP WITH TIME ZONE.
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     try:
         backend.authenticate('PYO')
@@ -2302,12 +2302,12 @@ def test_a_datetime_whose_text_says_its_type_follows_the_nls_formats() -> None:
                 10,
             )
         ]
-        assert (
-            _typed_datetime_operands(
+        assert [
+            found[2:]
+            for found in _typed_datetime_operands(
                 "SELECT TIMESTAMP '2024-01-02 13:14:15 +01:00' || 'x' FROM dual"
             )
-            == []
-        )
+        ] == [('sys.ora_tstz_text', 9)]
     finally:
         backend.close()
 
@@ -2388,6 +2388,62 @@ def test_a_datetime_assigned_to_a_character_column_follows_the_nls_formats() -> 
         finally:
             backend.rollback()
             backend.execute('DROP TABLE t2162a')
+    finally:
+        backend.close()
+
+
+def test_a_zoned_timestamp_made_text_follows_the_nls_formats() -> None:
+    # A TIMESTAMP WITH TIME ZONE made text was the composite that holds it,
+    # `("2024-01-02 16:14:15.5+05",7200)`, and TO_CHAR(tz) failed; a WITH
+    # LOCAL TIME ZONE one was PostgreSQL's text (#2162). 23ai's, the session
+    # at +05:00: WITH TIME ZONE in NLS_TIMESTAMP_TZ_FORMAT at its own offset,
+    # WITH LOCAL TIME ZONE in NLS_TIMESTAMP_FORMAT at the session's zone.
+    assert _translate_admin(
+        "ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT = 'RR-MM-DD TZH:TZM'"
+    ) == (
+        "SET seerdb.nls_timestamp_tz_print = 'YY-MM-DD TZH:TZM'; "
+        "SET seerdb.nls_timestamp_tz_format = 'RR-MM-DD TZH:TZM'"
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute("ALTER SESSION SET TIME_ZONE = '+05:00'")
+        backend.execute(
+            'CREATE TABLE t2162z (tz TIMESTAMP WITH TIME ZONE, '
+            'tz3 TIMESTAMP(3) WITH TIME ZONE, lz TIMESTAMP WITH LOCAL TIME ZONE)'
+        )
+        try:
+            value = "TIMESTAMP '2024-01-02 13:14:15.5 +02:00'"
+            backend.execute(f'INSERT INTO t2162z VALUES ({value}, {value}, {value})')
+            assert backend.execute(
+                "SELECT tz || 'x', concat(tz3, 'x'), lz || 'x', to_char(tz), "
+                "CAST(tz AS VARCHAR2(60)), TIMESTAMP '2024-01-02 13:14:15 -05:30' "
+                "|| 'x' FROM t2162z"
+            ).rows == [
+                (
+                    '02-JAN-24 01.14.15.500000 PM +02:00x',
+                    '02-JAN-24 01.14.15.500 PM +02:00x',
+                    '02-JAN-24 04.14.15.500000 PMx',
+                    '02-JAN-24 01.14.15.500000 PM +02:00',
+                    '02-JAN-24 01.14.15.500000 PM +02:00',
+                    '02-JAN-24 01.14.15.000000000 PM -05:30x',
+                )
+            ]
+            backend.execute(
+                'ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT = '
+                "'YYYY-MM-DD HH24:MI:SSXFF TZH:TZM'"
+            )
+            assert backend.execute("SELECT tz || 'x' FROM t2162z").rows == [
+                ('2024-01-02 13:14:15.500000 +02:00x',)
+            ]
+            assert backend.execute(
+                'SELECT value FROM nls_session_parameters '
+                "WHERE parameter = 'NLS_TIMESTAMP_TZ_FORMAT'"
+            ).rows == [('YYYY-MM-DD HH24:MI:SSXFF TZH:TZM',)]
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2162z')
     finally:
         backend.close()
 
@@ -4619,8 +4675,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # sys.ora_late_number (#2143), and numtoyminterval (#2153), and
     # sys.ora_to_char and to_char(timestamp, text) (#2167), and
     # sys.ora_plsql_number_text with DBMS_OUTPUT's PUT_LINE and PUT of a
-    # number (#2181), and sys.ora_datetime_text (#2162).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 112
+    # number (#2181), and sys.ora_datetime_text, sys.ora_zone_text,
+    # sys.ora_tstz_text and sys.ora_ltz_text (#2162).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 115
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
