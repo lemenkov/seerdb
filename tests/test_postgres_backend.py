@@ -2028,6 +2028,39 @@ def test_translate_idioms_rewrites_offset_bearing_timestamp_literal() -> None:
     assert plain == "TIMESTAMP '2026-06-07 13:14:15.5'"
 
 
+def test_numtoyminterval_and_to_yminterval_are_year_to_month() -> None:
+    # NUMTOYMINTERVAL did not exist (#2153), and TO_YMINTERVAL described as
+    # DAY TO SECOND, its months read as days (#2152). Measured on 23ai: n
+    # months, or n years of twelve, rounded half up; any other unit ORA-01760.
+    from seerdb.common.datatypes import IntervalYM
+    from seerdb.common.tns_consts import TNS_TYPE_INTERVALYM
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        for expression, expected in (
+            ("numtoyminterval(14, 'MONTH')", IntervalYM(1, 2)),
+            ("numtoyminterval(1.5, 'YEAR')", IntervalYM(1, 6)),
+            ("numtoyminterval(14.6, 'MONTH')", IntervalYM(1, 3)),
+            ("numtoyminterval(14.4, 'month')", IntervalYM(1, 2)),
+            ("numtoyminterval(-14, 'MONTH')", IntervalYM(-1, -2)),
+            ("numtoyminterval(1.99, 'YEAR')", IntervalYM(2, 0)),
+            ("numtoyminterval(null, 'YEAR')", None),
+            ("to_yminterval('1-2')", IntervalYM(1, 2)),
+            ("to_yminterval('P1Y2M') x", IntervalYM(1, 2)),
+        ):
+            result = backend.execute(f'SELECT {expression} FROM dual')
+            assert result.columns[0].data_type == TNS_TYPE_INTERVALYM, expression
+            assert result.rows == [(expected,)], expression
+        with pytest.raises(BackendError) as raised:
+            backend.execute("SELECT numtoyminterval(1, 'DAY') FROM dual")
+        assert raised.value.ora_code == 1760
+    finally:
+        backend.close()
+
+
 def test_translate_idioms_negates_whole_day_to_second_interval() -> None:
     # Oracle's leading `-` negates the whole DAY TO SECOND interval; PostgreSQL
     # applies it only to the days, so lift it to a unary minus on the literal (#520).
@@ -4022,8 +4055,8 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # PL/SQL's sys.ora_plsql_pad with its rpad / lpad (#2061), and the three
     # two-argument concat (#2093), sys.ora_late's two (#2138),
     # sys.ora_number_text, sys.ora_text and to_char(numeric) (#2146), and
-    # sys.ora_late_number (#2143).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 105
+    # sys.ora_late_number (#2143), and numtoyminterval (#2153).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 106
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
