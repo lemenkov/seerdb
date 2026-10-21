@@ -10925,6 +10925,41 @@ def test_dictionary_views_reflect_a_created_table() -> None:
         backend.close()
 
 
+def test_all_constraints_gives_a_checks_condition_as_written() -> None:
+    # A CHECK's SEARCH_CONDITION was NULL (#2171). 23ai's: the text between
+    # its parentheses as written, spaces and case kept, inline or out of line,
+    # in CREATE TABLE or ALTER TABLE ... ADD, named or not.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute(
+            'CREATE TABLE t2171c (c NUMBER CHECK (c > 0), '
+            'd NUMBER CONSTRAINT d_ok CHECK ( D>0  and d<10 ), e VARCHAR2(5), '
+            "CONSTRAINT e_ok CHECK (e in ('a','b')))"
+        )
+        try:
+            backend.execute('ALTER TABLE t2171c ADD CHECK (c<100)')
+            backend.execute('ALTER TABLE t2171c ADD CONSTRAINT c_lo CHECK(c   >= 1)')
+            assert sorted(
+                backend.execute(
+                    'SELECT search_condition FROM user_constraints '
+                    "WHERE table_name = 'T2171C'"
+                ).rows
+            ) == [
+                (' D>0  and d<10 ',),
+                ('c   >= 1',),
+                ('c > 0',),
+                ('c<100',),
+                ("e in ('a','b')",),
+            ]
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2171c')
+    finally:
+        backend.close()
+
+
 def test_all_constraints_says_whose_name_a_constraint_has() -> None:
     # ALL_CONSTRAINTS had no GENERATED column (#2141). 23ai's: GENERATED NAME
     # for each unnamed constraint, a NOT NULL among them, USER NAME otherwise.
@@ -14254,8 +14289,9 @@ def test_a_ddl_prunes_its_records_and_rereads_the_schema_once(
         backend.execute('DROP TABLE pr1918t')
         prunes = [q for q in sent if 'WHERE NOT EXISTS' in q and 'DELETE' in q]
         assert len(prunes) == 1
-        # Columns, annotations, collection elements and column grants (#1946).
-        assert prunes[0].count('DELETE FROM sys.ora_') == 4
+        # Columns, annotations, collection elements, CHECK conditions (#2171)
+        # and column grants (#1946).
+        assert prunes[0].count('DELETE FROM sys.ora_') == 5
         sent.clear()
         backend.execute('SELECT 1 FROM dual')
         # The object types' RAW attributes come with them (#1331).
