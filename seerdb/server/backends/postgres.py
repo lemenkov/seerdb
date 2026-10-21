@@ -14770,8 +14770,8 @@ class PostgresBackend:
                 != psycopg.pq.TransactionStatus.INERROR
             ):
                 try:
-                    for name, category, type_name in self._catalog_read(
-                        'SELECT a.attname, t.typcategory, t.typname '
+                    for name, category, type_name, typmod in self._catalog_read(
+                        'SELECT a.attname, t.typcategory, t.typname, a.atttypmod '
                         'FROM pg_attribute a '
                         'JOIN pg_type t ON t.oid = a.atttypid '
                         'JOIN pg_class c ON c.oid = a.attrelid '
@@ -14787,6 +14787,15 @@ class PostgresBackend:
                             # TO_CHAR(d) gives it (#2141).
                             row = self._catalog_read(
                                 'SELECT to_char(%s::timestamp)', (values[name],)
+                            ).fetchone()
+                            if row is not None:
+                                values[name] = row[0]
+                        elif type_name == 'timestamp':
+                            # A TIMESTAMP in the session's NLS_TIMESTAMP_FORMAT,
+                            # FF at the column's precision (#2162).
+                            row = self._catalog_read(
+                                'SELECT sys.ora_datetime_text(%s::timestamp, %s)',
+                                (values[name], 6 if typmod < 0 else typmod),
                             ).fetchone()
                             if row is not None:
                                 values[name] = row[0]
