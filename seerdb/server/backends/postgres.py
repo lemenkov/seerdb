@@ -1143,6 +1143,15 @@ _HELPER_FUNCTIONS_DDL = (
     'CREATE OR REPLACE FUNCTION sys.ora_text(anynonarray) RETURNS text '
     "LANGUAGE sql STABLE AS $$ SELECT CASE WHEN pg_typeof($1) = 'numeric'::regtype "
     'THEN sys.ora_number_text($1::text::numeric) ELSE $1::text END $$;'
+    # A computed value that may be a DATE or a TIMESTAMP (#2162): a timestamp
+    # in its NLS format at the precision $2 the statement's text gave it, -1
+    # for a DATE; any other value as || writes it. Inlined, the argument keeps
+    # the DATE domain as its type.
+    'CREATE OR REPLACE FUNCTION sys.ora_computed_text(anynonarray, integer) '
+    'RETURNS text LANGUAGE sql STABLE AS $$ SELECT CASE WHEN pg_typeof($1) IN '
+    f"('timestamp'::regtype, '{_DATE_TYPE}'::regtype) "
+    'THEN sys.ora_datetime_text($1::text::timestamp, $2) '
+    'ELSE sys.ora_text($1) END $$;'
     'CREATE OR REPLACE FUNCTION to_char(numeric) RETURNS text '
     'LANGUAGE sql IMMUTABLE AS $$ SELECT sys.ora_number_text($1) $$;'
     # A NUMBER as PL/SQL converts it to text (#2181), which is not SQL's
@@ -8751,6 +8760,122 @@ def _typed_datetime_value(item: str) -> tuple[str, int] | None:
     return (typed[1], typed[2])
 
 
+# The calls whose value is a DATE, whatever datetime they are given (#2162).
+_DATE_RESULT_CALLS = frozenset({'TRUNC', 'ROUND', 'ADD_MONTHS', 'LAST_DAY', 'NEXT_DAY'})
+# The calls that make an interval, which a TIMESTAMP keeps its type with.
+_INTERVAL_CALLS = frozenset(
+    {'NUMTODSINTERVAL', 'NUMTOYMINTERVAL', 'TO_DSINTERVAL', 'TO_YMINTERVAL'}
+)
+# The calls a computed operand is not: those the other rewrites handle, and
+# what is no value of its own.
+_NOT_COMPUTED_CALLS = frozenset(
+    {'CAST', 'TO_CHAR', 'CONCAT', 'TO_DATE', 'IN', 'EXISTS', 'VALUES', 'OVER'}
+)
+# The words a bare parenthesized group may follow, which are no call.
+_GROUP_KEYWORDS = frozenset(
+    {
+        'SELECT',
+        'WHERE',
+        'AND',
+        'OR',
+        'NOT',
+        'THEN',
+        'ELSE',
+        'WHEN',
+        'ON',
+        'BY',
+        'SET',
+        'AS',
+        'IS',
+        'FROM',
+        'HAVING',
+        'CASE',
+        'DISTINCT',
+        'ALL',
+        'ANY',
+        'SOME',
+        'RETURN',
+        'INTO',
+        'LIKE',
+        'BETWEEN',
+        'PRIOR',
+        'USING',
+    }
+)
+
+
+@_kept_per_text
+def _computed_operands(sql: str) -> list[tuple[int, int]]:
+    """The parenthesized groups and calls `sql` converts to text without a
+    format, in the places _typed_datetime_operands looks, each as the first
+    and last of its spans in _bind_spans(sql) (#2162). Whether one is a
+    datetime is the caller's to say."""
+    spans = _bind_spans(sql)
+    sig = [i for i, span in enumerate(spans) if span[0] not in ('space', 'comment')]
+
+    def text(k: int) -> str:
+        return spans[sig[k]][1] if 0 <= k < len(sig) else ''
+
+    calls: list[str] = []
+    inside: list[str] = []
+    closes: dict[int, int] = {}
+    opens: list[int] = []
+    for k in range(len(sig)):
+        if text(k) == ')':
+            if calls:
+                calls.pop()
+            if opens:
+                closes[opens.pop()] = k
+        inside.append(calls[-1] if calls else '')
+        if text(k) == '(':
+            calls.append(text(k - 1).upper())
+            opens.append(k)
+    found: list[tuple[int, int]] = []
+    for k in range(len(sig)):
+        if text(k) == '(':
+            before = spans[sig[k - 1]][0] if k else ''
+            if (
+                before in ('word', 'identifier')
+                and text(k - 1).upper() not in _GROUP_KEYWORDS
+            ):
+                continue  # a call's own parenthesis
+            (first, open_at) = (k, k)
+        elif (
+            spans[sig[k]][0] in ('word', 'identifier')
+            and text(k + 1) == '('
+            and text(k - 1) != '.'
+            and text(k).upper() not in _NOT_COMPUTED_CALLS
+            and text(k).upper() not in _GROUP_KEYWORDS
+        ):
+            (first, open_at) = (k, k + 1)
+        else:
+            continue
+        last = closes.get(open_at)
+        if last is None:
+            continue
+        joined = (text(first - 2), text(first - 1)) == ('|', '|') or (
+            text(last + 1),
+            text(last + 2),
+        ) == ('|', '|')
+        argument = (
+            inside[first] == 'CONCAT'
+            and text(first - 1) in ('(', ',')
+            and text(last + 1) in (',', ')')
+        ) or (
+            inside[first] in ('TO_CHAR', 'CAST')
+            and text(first - 1) == '('
+            and (
+                text(last + 1) == ')'
+                if inside[first] == 'TO_CHAR'
+                else text(last + 1).upper() == 'AS'
+                and text(last + 2).upper() in _CHARACTER_CASTS
+            )
+        )
+        if joined or argument:
+            found.append((sig[first], sig[last]))
+    return found
+
+
 @_kept_per_text
 def _typed_datetime_operands(sql: str) -> list[tuple[int, int, str, int]]:
     """The DATE and TIMESTAMP values `sql` converts to text without a
@@ -8888,7 +9013,12 @@ def _concat_width(
             and word.lower() == 'sys'
             and text(1) == '.'
             and text(2).lower()
-            in ('ora_datetime_text', 'ora_tstz_text', 'ora_ltz_text')
+            in (
+                'ora_datetime_text',
+                'ora_tstz_text',
+                'ora_ltz_text',
+                'ora_computed_text',
+            )
             and text(3) == '('
         ):
             # A datetime column made its text (#2162) counts as the column
@@ -16061,13 +16191,87 @@ class PostgresBackend:
             )
             if converted is not None:
                 wraps.append((first, last, *converted))
+        spans = _bind_spans(sql)
+        for first, last in _computed_operands(sql):
+            precision = self._computed_precision(
+                ''.join(span[1] for span in spans[first : last + 1]),
+                tables or _from_tables(sql),
+            )
+            if precision is not None:
+                wraps.append((first, last, 'sys.ora_computed_text', precision))
         if not wraps:
             return sql
-        out = [span[1] for span in _bind_spans(sql)]
+        out = [span[1] for span in spans]
         for first, last, call, precision in wraps:
             out[first] = f'{call}({out[first]}'
             out[last] += f', {precision})'
         return ''.join(out)
+
+    def _computed_precision(
+        self, expression: str, tables: list[tuple[str | None, str, str | None]]
+    ) -> int | None:
+        """The precision Oracle gives a computed DATE or TIMESTAMP, a group or
+        a call, by its operands (#2162), -1 for a DATE; None where none of
+        its operands is one, or one is zoned. Measured on 23ai: a TIMESTAMP
+        with an interval is a TIMESTAMP(9); with a number, or under TRUNC,
+        ROUND, ADD_MONTHS, LAST_DAY or NEXT_DAY, a DATE; under NVL, GREATEST,
+        MAX and the like, its own precision. With only DATE operands, a DATE."""
+        spans = _bind_spans(expression)
+        sig = [span[1] for span in spans if span[0] not in ('space', 'comment')]
+
+        def text(k: int) -> str:
+            return sig[k] if 0 <= k < len(sig) else ''
+
+        (dates, stamps, interval) = (False, [], False)
+        for k in range(len(sig)):
+            word = text(k).upper()
+            if (word == 'INTERVAL' and text(k + 1).startswith("'")) or (
+                word in _INTERVAL_CALLS and text(k + 1) == '('
+            ):
+                interval = True
+            typed = _typed_datetime_at(text, k) if text(k - 1) != '.' else None
+            if typed is not None:
+                if typed[1] != _DATETIME_TEXT:
+                    return None
+                if typed[2] < 0:
+                    dates = True
+                else:
+                    stamps.append(typed[2])
+        for name in _column_operands(expression):
+            column = (
+                self._concatenated_column(tables, name.split('.')) if tables else None
+            )
+            if column is None:
+                continue
+            if column.type_oid == _INTERVAL_OID or (
+                self._intervalym_oid is not None
+                and column.type_oid == self._intervalym_oid
+            ):
+                interval = True
+                continue
+            converted = self._datetime_text_call(column)
+            if converted is None:
+                continue
+            if converted[0] != _DATETIME_TEXT:
+                return None
+            if converted[1] < 0:
+                dates = True
+            else:
+                stamps.append(converted[1])
+        if not dates and not stamps:
+            return None
+        if text(0).upper() in _DATE_RESULT_CALLS:
+            return -1
+        if not stamps:
+            return -1
+        if interval:
+            return 9
+        depth = 0
+        for word in sig:
+            depth += (word == '(') - (word == ')')
+            if depth <= 1 and word in ('+', '-'):
+                return -1
+        return max(stamps)
 
     def _datetime_text_call(
         self, column: _TableColumn | None
@@ -16141,6 +16345,11 @@ class PostgresBackend:
                 converted = self._datetime_text_call(
                     self._concatenated_column(sources, parts)
                 )
+            if converted is None:
+                # A computed one, the whole value made text (#2162).
+                computed = self._computed_precision(value, sources)
+                if computed is not None:
+                    converted = ('sys.ora_computed_text', computed)
             if converted is None:
                 continue
             at = start + sql[start:end].index(value)
