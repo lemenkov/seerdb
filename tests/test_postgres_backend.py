@@ -651,6 +651,41 @@ def test_a_unique_violation_is_worded_as_oracle_words_it() -> None:
             backend.close()
 
 
+def test_a_unique_violation_shows_a_date_in_the_session_format() -> None:
+    # A DATE on the ORA-03301 line printed as PostgreSQL prints it,
+    # `D:2024-01-02 13:14:15` (#2141). Measured on 23ai: it follows the
+    # session's NLS_DATE_FORMAT, `D:02-JAN-24` by default.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2141 (d DATE, n NUMBER, PRIMARY KEY (d, n))')
+        try:
+            insert = (
+                "INSERT INTO t2141 VALUES (TO_DATE('2024-01-02 13:14:15', "
+                "'YYYY-MM-DD HH24:MI:SS'), 1)"
+            )
+            backend.execute(insert)
+            for setting, shown in (
+                (None, 'D:02-JAN-24, N:1'),
+                ("'YYYY-MM-DD HH24:MI:SS'", 'D:2024-01-02 13:14:15, N:1'),
+            ):
+                if setting:
+                    backend.execute(f'ALTER SESSION SET NLS_DATE_FORMAT = {setting}')
+                with pytest.raises(BackendError) as raised:
+                    backend.execute(insert)
+                assert str(raised.value).endswith(
+                    f'row with column values ({shown}) already exists'
+                ), setting
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2141')
+    finally:
+        backend.close()
+
+
 def test_an_invalid_number_is_worded_and_placed_as_oracle_does() -> None:
     # ORA-01722 carried PostgreSQL's `invalid input syntax for type numeric`
     # (#2136), and TO_NUMBER('x') no position (#2126). 23ai names the first
