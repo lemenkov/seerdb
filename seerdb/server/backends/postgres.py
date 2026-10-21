@@ -694,6 +694,28 @@ _HELPER_FUNCTIONS_DDL = (
     'ELSE sys.ora_to_char($1, coalesce(nullif(current_setting('
     "'seerdb.nls_timestamp_print', true), ''), 'DD-MON-YY HH.MI.SSXFF AM'), $2) "
     'END $$;'
+    # A wall clock $1 at offset $2 (seconds) in the format $3, FF as $4 digits:
+    # TZR, TZH and TZM the offset's, `+02:00`, `+02` and `00` -- no region
+    # survives into the value, so TZR is the offset, as Oracle prints one --
+    # and TZD nothing (#2162). div(), as the Mirror's own / is NUMBER's.
+    'CREATE OR REPLACE FUNCTION sys.ora_zone_text(timestamp, integer, text, integer) '
+    'RETURNS text LANGUAGE sql STABLE AS $$ SELECT sys.ora_to_char($1, '
+    'regexp_replace(regexp_replace(regexp_replace(regexp_replace($3, '
+    "'TZR', '\"' || z.h || ':' || z.m || '\"', 'gi'), 'TZH', '\"' || z.h || '\"', "
+    "'gi'), 'TZM', '\"' || z.m || '\"', 'gi'), 'TZD', '', 'gi'), $4) FROM (SELECT "
+    "CASE WHEN $2 < 0 THEN '-' ELSE '+' END || lpad(div(abs($2), 3600)::text, 2, '0') "
+    "AS h, lpad(div(abs($2) % 3600, 60)::text, 2, '0') AS m) z $$;"
+    # A TIMESTAMP WITH TIME ZONE's text, in NLS_TIMESTAMP_TZ_FORMAT at its own
+    # offset, and a WITH LOCAL TIME ZONE one's, in NLS_TIMESTAMP_FORMAT at the
+    # session's zone (#2162).
+    f'CREATE OR REPLACE FUNCTION sys.ora_tstz_text({_TSTZ_TYPE}, integer) '
+    'RETURNS text LANGUAGE sql STABLE AS $$ SELECT sys.ora_zone_text(('
+    '$1).utc AT TIME ZONE make_interval(secs => ($1).off), ($1).off, '
+    "coalesce(nullif(current_setting('seerdb.nls_timestamp_tz_print', true), ''), "
+    "'DD-MON-YY HH.MI.SSXFF AM TZR'), $2) $$;"
+    'CREATE OR REPLACE FUNCTION sys.ora_ltz_text(timestamptz, integer) '
+    'RETURNS text LANGUAGE sql STABLE AS $$ '
+    'SELECT sys.ora_datetime_text($1::timestamp, $2) $$;'
     # HEXTORAW('DEADBEEF') → the RAW/bytea value of a hex string.
     'CREATE OR REPLACE FUNCTION hextoraw(text) RETURNS bytea '
     "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT decode($1, 'hex') $$;"
@@ -2183,13 +2205,15 @@ _ORACLE_DICTIONARY_DDL = (
     "('NLS_LENGTH_SEMANTICS', 'BYTE'), ('NLS_NCHAR_CONV_EXCP', 'FALSE'), "
     "('NLS_NCHAR_CHARACTERSET', 'AL16UTF16')"
     ') AS p(parameter, value);'
-    # The session's NLS_DATE_FORMAT and NLS_TIMESTAMP_FORMAT are the ones
-    # ALTER SESSION set (#1616, #2162).
+    # The session's NLS_DATE_FORMAT, NLS_TIMESTAMP_FORMAT and
+    # NLS_TIMESTAMP_TZ_FORMAT are the ones ALTER SESSION set (#1616, #2162).
     'CREATE OR REPLACE VIEW sys.nls_session_parameters AS SELECT parameter, '
     "CASE WHEN parameter = 'NLS_DATE_FORMAT' THEN coalesce(nullif("
     "current_setting('seerdb.nls_date_format', true), ''), value) "
     "WHEN parameter = 'NLS_TIMESTAMP_FORMAT' THEN coalesce(nullif("
-    "current_setting('seerdb.nls_timestamp_format', true), ''), value) ELSE value END "
+    "current_setting('seerdb.nls_timestamp_format', true), ''), value) "
+    "WHEN parameter = 'NLS_TIMESTAMP_TZ_FORMAT' THEN coalesce(nullif("
+    "current_setting('seerdb.nls_timestamp_tz_format', true), ''), value) ELSE value END "
     'AS value FROM nls_database_parameters WHERE parameter NOT IN '
     "('NLS_CHARACTERSET', 'NLS_NCHAR_CHARACTERSET');"
     'CREATE OR REPLACE VIEW sys.nls_instance_parameters AS SELECT * FROM '
@@ -5611,26 +5635,27 @@ def _nls_date_format_settings(oracle_format: str) -> str:
 # A session's NLS_TIMESTAMP_FORMAT (#2162), which sys.ora_datetime_text
 # follows: seerdb.nls_timestamp_format as Oracle spells it, and
 # seerdb.nls_timestamp_print as PostgreSQL prints it.
+# NLS_TIMESTAMP_TZ_FORMAT the same, its settings seerdb.nls_timestamp_tz_*.
 _ALTER_SESSION_NLS_TIMESTAMP_FORMAT = re.compile(
-    r"\s*ALTER\s+SESSION\s+SET\s+NLS_TIMESTAMP_FORMAT\s*=\s*'((?:[^']|'')*)'\s*;?\s*$",
+    r'\s*ALTER\s+SESSION\s+SET\s+NLS_TIMESTAMP(_TZ)?_FORMAT\s*=\s*'
+    r"'((?:[^']|'')*)'\s*;?\s*$",
     re.IGNORECASE,
 )
 
 
-def _nls_timestamp_format_settings(oracle_format: str) -> str:
+def _nls_timestamp_format_settings(oracle_format: str, zoned: bool = False) -> str:
     printed = _RR_YEAR.sub(lambda m: 'YYYY' if m.group(1) else 'YY', oracle_format)
     quoted = oracle_format.replace("'", "''")
     printed = printed.replace("'", "''")
-    return (
-        f"SET seerdb.nls_timestamp_print = '{printed}'; "
-        f"SET seerdb.nls_timestamp_format = '{quoted}'"
-    )
+    name = 'seerdb.nls_timestamp_tz' if zoned else 'seerdb.nls_timestamp'
+    return f"SET {name}_print = '{printed}'; SET {name}_format = '{quoted}'"
 
 
 # Oracle's own defaults, which every session starts with.
 _ORAFCE_SESSION_SETTINGS: Final = (
     f'{_ORAFCE_SESSION_SETTINGS_BASE}; {_nls_date_format_settings("DD-MON-RR")}; '
-    f'{_nls_timestamp_format_settings("DD-MON-RR HH.MI.SSXFF AM")}'
+    f'{_nls_timestamp_format_settings("DD-MON-RR HH.MI.SSXFF AM")}; '
+    f'{_nls_timestamp_format_settings("DD-MON-RR HH.MI.SSXFF AM TZR", zoned=True)}'
 )
 
 
@@ -6006,7 +6031,9 @@ def _translate_admin(sql: str) -> str:
         return _nls_date_format_settings(m.group(1).replace("''", "'"))
     m = _ALTER_SESSION_NLS_TIMESTAMP_FORMAT.match(sql)
     if m:
-        return _nls_timestamp_format_settings(m.group(1).replace("''", "'"))
+        return _nls_timestamp_format_settings(
+            m.group(2).replace("''", "'"), zoned=m.group(1) is not None
+        )
     m = _CREATE_USER.match(sql)
     if m:
         return f'CREATE SCHEMA IF NOT EXISTS {m.group(1).lower()}'
@@ -8644,12 +8671,22 @@ def _converted_columns(sql: str) -> list[tuple[int, int, list[str]]]:
 _ZONED_LITERAL = re.compile(r"(?i)'.*(?:[+-]\d{1,2}:\d{2}|[a-z]\w*/\w+|\bUTC)\s*'$")
 
 
-def _typed_datetime_at(text: Callable[[int], str], k: int) -> tuple[int, int] | None:
-    """Whether the significant token `k` that `text` gives starts a DATE or
-    TIMESTAMP value whose type the text says -- a DATE or TIMESTAMP literal,
-    SYSDATE, TO_DATE(...), CAST(... AS DATE | TIMESTAMP[(p)]) -- and if so,
-    its last token and its precision, -1 for a DATE and 9 for a TIMESTAMP
-    literal (#2162). A literal with a zone is no TIMESTAMP."""
+# The calls that make a DATE or TIMESTAMP (-1 for a DATE), a TIMESTAMP WITH
+# TIME ZONE and a WITH LOCAL TIME ZONE value Oracle's text (#2162).
+_DATETIME_TEXT = 'sys.ora_datetime_text'
+_TSTZ_TEXT = 'sys.ora_tstz_text'
+_LTZ_TEXT = 'sys.ora_ltz_text'
+
+
+def _typed_datetime_at(
+    text: Callable[[int], str], k: int
+) -> tuple[int, str, int] | None:
+    """Whether the significant token `k` that `text` gives starts a datetime
+    value whose type the text says -- a DATE or TIMESTAMP literal, SYSDATE,
+    SYSTIMESTAMP, TO_DATE(...), CAST(... AS DATE | TIMESTAMP[(p)]) -- and if
+    so, its last token, the call that makes it text and its precision: -1 for
+    a DATE, 9 for a TIMESTAMP literal (#2162). A literal with a zone is a
+    TIMESTAMP WITH TIME ZONE, as SYSTIMESTAMP is."""
 
     def closing(start: int) -> int | None:
         depth = 0
@@ -8664,25 +8701,29 @@ def _typed_datetime_at(text: Callable[[int], str], k: int) -> tuple[int, int] | 
     word = text(k).upper()
     if word in ('DATE', 'TIMESTAMP'):
         literal = text(k + 1)
-        if literal.startswith("'") and not (
-            word == 'TIMESTAMP' and _ZONED_LITERAL.match(literal)
-        ):
-            return (k + 1, -1 if word == 'DATE' else 9)
-        return None
-    if word == 'SYSDATE':
-        return None if text(k + 1) == '(' else (k, -1)
+        if not literal.startswith("'"):
+            return None
+        if word == 'DATE':
+            return (k + 1, _DATETIME_TEXT, -1)
+        if _ZONED_LITERAL.match(literal):
+            return (k + 1, _TSTZ_TEXT, 9)
+        return (k + 1, _DATETIME_TEXT, 9)
+    if word in ('SYSDATE', 'SYSTIMESTAMP'):
+        if text(k + 1) == '(':
+            return None
+        return (k, _DATETIME_TEXT, -1) if word == 'SYSDATE' else (k, _TSTZ_TEXT, 6)
     if word not in ('TO_DATE', 'CAST') or text(k + 1) != '(':
         return None
     close = closing(k + 1)
     if close is None:
         return None
     if word == 'TO_DATE':
-        return (close, -1)
+        return (close, _DATETIME_TEXT, -1)
     if text(close - 2).upper() == 'AS':
         if text(close - 1).upper() == 'DATE':
-            return (close, -1)
+            return (close, _DATETIME_TEXT, -1)
         if text(close - 1).upper() == 'TIMESTAMP':
-            return (close, 6)
+            return (close, _DATETIME_TEXT, 6)
     if (
         text(close - 1) == ')'
         and text(close - 3) == '('
@@ -8690,13 +8731,14 @@ def _typed_datetime_at(text: Callable[[int], str], k: int) -> tuple[int, int] | 
         and text(close - 4).upper() == 'TIMESTAMP'
         and text(close - 5).upper() == 'AS'
     ):
-        return (close, int(text(close - 2)))
+        return (close, _DATETIME_TEXT, int(text(close - 2)))
     return None
 
 
-def _typed_datetime_value(item: str) -> int | None:
-    # The precision of the DATE or TIMESTAMP value `item` is whole, where its
-    # text says its type (_typed_datetime_at), else None (#2162).
+def _typed_datetime_value(item: str) -> tuple[str, int] | None:
+    # The call that makes the datetime value `item` is whole text, and its
+    # precision, where its text says its type (_typed_datetime_at), else None
+    # (#2162).
     spans = _bind_spans(item)
     sig = [span[1] for span in spans if span[0] not in ('space', 'comment')]
 
@@ -8704,16 +8746,18 @@ def _typed_datetime_value(item: str) -> int | None:
         return sig[k] if 0 <= k < len(sig) else ''
 
     typed = _typed_datetime_at(text, 0) if sig else None
-    return typed[1] if typed is not None and typed[0] == len(sig) - 1 else None
+    if typed is None or typed[0] != len(sig) - 1:
+        return None
+    return (typed[1], typed[2])
 
 
 @_kept_per_text
-def _typed_datetime_operands(sql: str) -> list[tuple[int, int, int]]:
+def _typed_datetime_operands(sql: str) -> list[tuple[int, int, str, int]]:
     """The DATE and TIMESTAMP values `sql` converts to text without a
     format whose type the text says -- a DATE or TIMESTAMP literal, SYSDATE,
     TO_DATE(...), CAST(... AS DATE | TIMESTAMP[(p)]) -- each as the first and
-    last of its spans in _bind_spans(sql) and its precision, -1 for a DATE
-    and 9 for a TIMESTAMP literal (#2162). Where: an operand of ||, an
+    last of its spans in _bind_spans(sql), the call that makes it text and
+    its precision, as _typed_datetime_at gives them (#2162). Where: an operand of ||, an
     argument of two-argument CONCAT, the argument of TO_CHAR(x)."""
     spans = _bind_spans(sql)
     sig = [i for i, span in enumerate(spans) if span[0] not in ('space', 'comment')]
@@ -8729,14 +8773,14 @@ def _typed_datetime_operands(sql: str) -> list[tuple[int, int, int]]:
         inside.append(calls[-1] if calls else '')
         if text(k) == '(':
             calls.append(text(k - 1).upper())
-    found: list[tuple[int, int, int]] = []
+    found: list[tuple[int, int, str, int]] = []
     for k in range(len(sig)):
         if text(k - 1) == '.':
             continue
         typed = _typed_datetime_at(text, k)
         if typed is None:
             continue
-        (last, precision) = typed
+        (last, call, precision) = typed
         joined = (text(k - 2), text(k - 1)) == ('|', '|') or (
             text(last + 1),
             text(last + 2),
@@ -8753,7 +8797,7 @@ def _typed_datetime_operands(sql: str) -> list[tuple[int, int, int]]:
             and text(last + 2).upper() in _CHARACTER_CASTS
         )
         if joined or argument or cast:
-            found.append((sig[k], sig[last], precision))
+            found.append((sig[k], sig[last], call, precision))
     return found
 
 
@@ -8842,10 +8886,13 @@ def _concat_width(
         if (
             kind == 'word'
             and word.lower() == 'sys'
-            and (text(1), text(2).lower(), text(3)) == ('.', 'ora_datetime_text', '(')
+            and text(1) == '.'
+            and text(2).lower()
+            in ('ora_datetime_text', 'ora_tstz_text', 'ora_ltz_text')
+            and text(3) == '('
         ):
-            # A DATE or TIMESTAMP column made its text (#2162) counts as the
-            # column does.
+            # A datetime column made its text (#2162) counts as the column
+            # does.
             at += 3
             close = at
             depth = 0
@@ -16009,20 +16056,37 @@ class PostgresBackend:
         operands = _converted_columns(sql)
         tables = _from_tables(sql) if operands else []
         for first, last, parts in operands if tables else []:
-            column = self._concatenated_column(tables, parts)
-            if column is None:
-                continue
-            if self._domain_type_by_oid.get(column.type_oid) == TNS_TYPE_DATE:
-                wraps.append((first, last, -1))
-            elif column.type_oid == _TIMESTAMP_OID:
-                wraps.append((first, last, 6 if column.typmod < 0 else column.typmod))
+            converted = self._datetime_text_call(
+                self._concatenated_column(tables, parts)
+            )
+            if converted is not None:
+                wraps.append((first, last, *converted))
         if not wraps:
             return sql
         out = [span[1] for span in _bind_spans(sql)]
-        for first, last, precision in wraps:
-            out[first] = 'sys.ora_datetime_text(' + out[first]
+        for first, last, call, precision in wraps:
+            out[first] = f'{call}({out[first]}'
             out[last] += f', {precision})'
         return ''.join(out)
+
+    def _datetime_text_call(
+        self, column: _TableColumn | None
+    ) -> tuple[str, int] | None:
+        # The call that makes a datetime column's value Oracle's text, and the
+        # column's precision, -1 for a DATE; None for any other column (#2162).
+        if column is None:
+            return None
+        default = 6 if column.typmod < 0 else column.typmod
+        if self._domain_type_by_oid.get(column.type_oid) == TNS_TYPE_DATE:
+            return (_DATETIME_TEXT, -1)
+        if column.type_oid == _TIMESTAMP_OID:
+            return (_DATETIME_TEXT, default)
+        if column.type_oid == _TIMESTAMPTZ_OID:
+            return (_LTZ_TEXT, default)
+        if self._tstz_oid is not None and column.type_oid == self._tstz_oid:
+            precision = column.tstz_precision
+            return (_TSTZ_TEXT, 6 if precision is None else precision)
+        return None
 
     def _datetime_assignments(self, sql: str) -> str:
         """`sql`, an UPDATE or INSERT, with each DATE or TIMESTAMP it assigns
@@ -16065,28 +16129,24 @@ class PostgresBackend:
             if target is None or target.type_oid not in _TEXT_OIDS:
                 continue
             value = sql[start:end].strip()
-            precision = _typed_datetime_value(value)
+            converted = _typed_datetime_value(value)
             if (
-                precision is None
+                converted is None
                 and sources
                 and re.fullmatch(
                     r'(?:"[^"]+"|[\w$#]+)(?:\s*\.\s*(?:"[^"]+"|[\w$#]+)){0,2}', value
                 )
             ):
                 parts = [part.strip() for part in value.split('.')]
-                column = self._concatenated_column(sources, parts)
-                if column is None:
-                    pass
-                elif self._domain_type_by_oid.get(column.type_oid) == TNS_TYPE_DATE:
-                    precision = -1
-                elif column.type_oid == _TIMESTAMP_OID:
-                    precision = 6 if column.typmod < 0 else column.typmod
-            if precision is None:
+                converted = self._datetime_text_call(
+                    self._concatenated_column(sources, parts)
+                )
+            if converted is None:
                 continue
             at = start + sql[start:end].index(value)
             out = (
                 out[:at]
-                + f'sys.ora_datetime_text({value}, {precision})'
+                + f'{converted[0]}({value}, {converted[1]})'
                 + out[at + len(value) :]
             )
         return out
