@@ -8113,6 +8113,38 @@ _TYPE_TEXT_WIDTH = {
 }
 # SYSDATE and SYSTIMESTAMP, which take no parentheses.
 _PSEUDO_COLUMN_WIDTH = {'SYSDATE': 18, 'SYSTIMESTAMP': 73}
+# The pseudo-columns an item's operands may name, by their Oracle type (#2160).
+_PSEUDO_COLUMN_TYPE = {'sysdate': 'DATE'}
+# An item that converts a datetime itself -- a CAST, a TIMESTAMP literal,
+# TO_TIMESTAMP, FROM_TZ -- whose type its column operands do not say (#2160).
+_DATETIME_CONVERTED = re.compile(
+    r'\b(?:CAST|TIMESTAMP|TO_TIMESTAMP\w*|FROM_TZ)\b', re.IGNORECASE
+)
+# MIN(c) or MAX(c), optionally aliased: the column's own type (#2160).
+_MIN_MAX_ITEM = re.compile(
+    r'(?:MIN|MAX)\s*\(\s*[\w$#."]+\s*\)\s*(?:(?:AS\s+)?(?:"[^"]*"|[A-Za-z_][\w$#]*))?$',
+    re.IGNORECASE,
+)
+_TIMESTAMP_PRECISION = re.compile(r'TIMESTAMP\((\d)\)$')
+
+
+def _datetime_result(item: str, types: list[str]) -> tuple[int | None, int | None]:
+    """What a computed timestamp over a DATE or TIMESTAMP is to Oracle: DATE
+    or none, and a TIMESTAMP's fractional digits or none (#2160).
+
+    `types` are the item's column operands' Oracle types. On 23ai a DATE plus
+    or minus an interval stays a DATE; with a TIMESTAMP among the operands the
+    result is a TIMESTAMP(9), and MIN / MAX keep the column's own precision."""
+    if _DATETIME_CONVERTED.search(item):
+        return None, None
+    stamps = [m for m in map(_TIMESTAMP_PRECISION.match, types) if m is not None]
+    if stamps:
+        if _MIN_MAX_ITEM.match(item) and len(types) == 1:
+            return None, int(stamps[0].group(1))
+        return None, _NINE_FRACTIONAL_DIGITS
+    if 'DATE' in types:
+        return TNS_TYPE_DATE, None
+    return None, None
 
 
 def _column_text_width(data_type: str, data_length: int) -> int | None:
@@ -16314,8 +16346,27 @@ class PostgresBackend:
                 for row in rows:
                     row[i] = _wire_cell(row[i], desc.type_code, self._tstz_oid)
         self._learn_types({desc.type_code for desc in cursor.description})
-        ym_types: dict[str, tuple[str, int]] | None = None
-        ym_items: list[str] = []
+        typed: tuple[dict[str, tuple[str, int]], list[str]] | None = None
+
+        def item_text(i: int) -> str:
+            nonlocal typed
+            if typed is None:
+                typed = (self._operand_types(original), _select_list_items(original))
+            return typed[1][i] if i < len(typed[1]) else ''
+
+        def operand_types(i: int) -> list[str]:
+            # The Oracle types of select-list item i's column operands, read
+            # once per result and only when an item needs them (#2152, #2160).
+            text = item_text(i)
+            assert typed is not None
+            types = typed[0]
+            return [
+                types[name][0] if name in types else _PSEUDO_COLUMN_TYPE[name]
+                for name in _column_operands(text)
+                if name in types or name in _PSEUDO_COLUMN_TYPE
+            ]
+
+        timestamp_scales: dict[int, int] = {}
         columns = []
         for i, desc in enumerate(cursor.description):
             # A column tracing back to a typed domain is that Oracle type — an
@@ -16341,14 +16392,27 @@ class PostgresBackend:
                 # SUM(iym) -- reports the domain's base type. Oracle mixes no
                 # DAY TO SECOND into one, so a YEAR TO MONTH operand makes the
                 # item YEAR TO MONTH (#2152).
-                if ym_types is None:
-                    ym_types = self._operand_types(original)
-                    ym_items = _select_list_items(original)
-                if i < len(ym_items) and any(
-                    ym_types.get(name, ('', 0))[0].startswith('INTERVAL YEAR')
-                    for name in _column_operands(ym_items[i])
-                ):
+                if any(t.startswith('INTERVAL YEAR') for t in operand_types(i)):
                     domain = TNS_TYPE_INTERVALYM
+            if (
+                domain is None
+                and desc.type_code == _TIMESTAMP_OID
+                and desc.precision != 0
+                and original
+                and not cursor.pgresult.ftable(i)
+            ):
+                # A computed timestamp over a DATE or a TIMESTAMP -- `d + iym`,
+                # `ts - ids`, MAX(d) -- reports timestamp, unsized (#2160). On
+                # 23ai a DATE operand keeps it a DATE, its fraction dropped; a
+                # TIMESTAMP one makes a TIMESTAMP(9), and MAX / MIN keep the
+                # column's own precision.
+                (domain, scale) = _datetime_result(item_text(i), operand_types(i))
+                if scale is not None:
+                    timestamp_scales[i] = scale
+                if domain == TNS_TYPE_DATE:
+                    for row in rows:
+                        if row[i] is not None:
+                            row[i] = row[i].replace(microsecond=0)
             if (
                 domain is None
                 and desc.type_code == _TIMESTAMP_OID
@@ -16491,6 +16555,9 @@ class PostgresBackend:
                 and not cursor.pgresult.ftable(i)
             ):
                 columns[i] = replace(columns[i], scale=_NINE_FRACTIONAL_DIGITS)
+        for i, scale in timestamp_scales.items():
+            if columns[i].data_type == TNS_TYPE_TIMESTAMP:
+                columns[i] = replace(columns[i], scale=scale)
         sizes = _bind_sizes(original, params) if original and params else {}
         unsized = [
             i
