@@ -9868,6 +9868,136 @@ def test_a_routine_naming_what_does_not_resolve_is_created_invalid() -> None:
             backend.close()
 
 
+def test_a_name_the_unit_declares_is_no_compile_error() -> None:
+    # What plpgsql_check finds of a name the unit declares -- a collection
+    # parameter's a(i), a.COUNT -- is the Mirror's translation, which Oracle
+    # compiles: left, so nothing that works is made INVALID (#2212).
+    sql = (
+        'create or replace procedure p(a_array udt_objectarray) as n number; '
+        'begin n := a_array.count; n := a_array(1); n := nosuch; end;'
+    )
+    assert [
+        row[2]
+        for row in _checked_error_rows(
+            sql,
+            [
+                ('assignment', '42703', 'column "a_array" does not exist'),
+                ('assignment', '42883', 'function a_array(integer) does not exist'),
+                ('assignment', '42703', 'column "nosuch" does not exist'),
+            ],
+            frozenset(),
+        )
+    ] == [
+        "PLS-00201: identifier 'NOSUCH' must be declared",
+        'PL/SQL: Statement ignored',
+    ]
+
+
+def test_a_package_body_or_trigger_naming_what_does_not_resolve_is_invalid() -> None:
+    # A package body or a trigger whose code named what does not resolve was
+    # created VALID (#2212). 23ai's: the body INVALID, the spec VALID, its
+    # errors placed from PACKAGE on, a call ORA-04063; the trigger INVALID but
+    # ENABLED, its errors placed from its block on, a DML of its table
+    # ORA-04098, and VALID again once it compiles.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+
+    def errors(name: str) -> list:
+        return backend.execute(
+            'SELECT type, line, position, text FROM user_errors '
+            f"WHERE name = '{name}' ORDER BY sequence"
+        ).rows
+
+    def status(name: str) -> list:
+        return backend.execute(
+            'SELECT object_type, status FROM user_objects '
+            f"WHERE object_name = '{name}' ORDER BY 1"
+        ).rows
+
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        if not backend._has_plpgsql_check():
+            pytest.skip('the PostgreSQL bed has no plpgsql_check')
+        backend.execute('CREATE TABLE t2212 (a NUMBER, b NUMBER)')
+        try:
+            backend.execute(
+                'create or replace package k2212 as '
+                'function f(n number) return number; procedure p; end;'
+            )
+            result = backend.execute(
+                'create or replace package body k2212 as\n'
+                '  function f(n number) return number is\n'
+                '  begin\n'
+                '    return n * nosuch;\n'
+                '  end;\n'
+                '  procedure p is\n'
+                '    x number;\n'
+                '  begin\n'
+                '    select nosuchcol into x from dual;\n'
+                '  end;\n'
+                'end;'
+            )
+            assert result.compilation_warning
+            assert status('K2212') == [
+                ('PACKAGE', 'VALID'),
+                ('PACKAGE BODY', 'INVALID'),
+            ]
+            assert errors('K2212') == [
+                (
+                    'PACKAGE BODY',
+                    4,
+                    16,
+                    "PLS-00201: identifier 'NOSUCH' must be declared",
+                ),
+                ('PACKAGE BODY', 4, 5, 'PL/SQL: Statement ignored'),
+                (
+                    'PACKAGE BODY',
+                    9,
+                    12,
+                    'PL/SQL: ORA-00904: "NOSUCHCOL": invalid identifier',
+                ),
+                ('PACKAGE BODY', 9, 5, 'PL/SQL: SQL Statement ignored'),
+            ]
+            with pytest.raises(BackendError) as raised:
+                backend.execute('SELECT k2212.f(1) FROM dual')
+            assert raised.value.ora_code == 4063
+            result = backend.execute(
+                'create or replace trigger trg2212 before insert on t2212 for each row '
+                'begin :new.b := nosuch; end;'
+            )
+            assert result.compilation_warning
+            assert status('TRG2212') == [('TRIGGER', 'INVALID')]
+            assert errors('TRG2212') == [
+                ('TRIGGER', 1, 17, "PLS-00201: identifier 'NOSUCH' must be declared"),
+                ('TRIGGER', 1, 7, 'PL/SQL: Statement ignored'),
+            ]
+            assert backend.execute(
+                "SELECT status FROM user_triggers WHERE trigger_name = 'TRG2212'"
+            ).rows == [('ENABLED',)]
+            with pytest.raises(BackendError) as raised:
+                backend.execute('INSERT INTO t2212 (a) VALUES (1)')
+            assert (raised.value.ora_code, str(raised.value)) == (
+                4098,
+                "trigger 'PYO.TRG2212' is invalid and failed re-validation",
+            )
+            backend.execute(
+                'create or replace trigger trg2212 before insert on t2212 for each row '
+                'begin :new.b := 1; end;'
+            )
+            assert status('TRG2212') == [('TRIGGER', 'VALID')]
+            backend.execute('INSERT INTO t2212 (a) VALUES (1)')
+            assert backend.execute('SELECT b FROM t2212').rows == [(1,)]
+        finally:
+            backend.rollback()
+            for leftover in ('PACKAGE k2212', 'TABLE t2212'):
+                with contextlib.suppress(BackendError):
+                    backend.execute(f'DROP {leftover}')
+    finally:
+        backend.close()
+
+
 def test_a_not_null_violation_is_worded_and_placed_as_oracle_does() -> None:
     # A NOT NULL column given NULL carried PostgreSQL's text, no position, and
     # ORA-01400 for an UPDATE too (#2134). Oracle's, in every release, is

@@ -1649,6 +1649,8 @@ def _reachable_relation(relation: str) -> str:
 # The name of the trigger function a PL/SQL trigger runs is this and the
 # trigger's (#2174); `$` keeps it from any name a user's routine is given.
 _TRIGGER_FUNCTION_PREFIX = 'ora$trg_'
+# A trigger that did not compile is marked so (#2212).
+_TRIGGER_MARK = 'seerdb:trigger:'
 
 
 def _pg_name_sql(name: str) -> str:
@@ -2508,7 +2510,9 @@ _ORACLE_DICTIONARY_DDL = (
     # A PL/SQL trigger (#2174): a PostgreSQL trigger running its trigger
     # function, which only such a trigger has.
     'UNION ALL SELECT upper(n.nspname), ora_name(t.tgname), NULL::text, '
-    "t.oid::bigint, 'TRIGGER', 'VALID', 'N', 'N', 'N' FROM pg_trigger t "
+    "t.oid::bigint, 'TRIGGER', CASE WHEN obj_description(t.oid, 'pg_trigger') = "
+    f"'{_TRIGGER_MARK}INVALID' THEN 'INVALID' ELSE 'VALID' END, 'N', 'N', 'N' "
+    'FROM pg_trigger t '
     'JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace '
     'JOIN pg_proc f ON f.oid = t.tgfoid '
     f"WHERE NOT t.tgisinternal AND f.proname LIKE '{_TRIGGER_FUNCTION_PREFIX}%' "
@@ -5348,7 +5352,9 @@ def _translate_trigger(
         f'CREATE OR REPLACE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql'
         f'{rights} AS $$ BEGIN {body}; {returned} END $$; '
         f'{create} TRIGGER {name.rpartition(".")[2]} {timing.upper()} {events} '
-        f'ON {table} FOR EACH {scope}{condition} EXECUTE FUNCTION {function}()'
+        f'ON {table} FOR EACH {scope}{condition} EXECUTE FUNCTION {function}(); '
+        # One that did not compile before does now (#2212).
+        f'COMMENT ON TRIGGER {name.rpartition(".")[2]} ON {table} IS NULL'
     )
 
 
@@ -10650,20 +10656,51 @@ def _compile_error_place(
 _CHECK_COLUMN = re.compile(r'column "([^"]+)" does not exist')
 _CHECK_RELATION = re.compile(r'relation "([^"]+)" does not exist')
 _CHECK_FUNCTION = re.compile(r'function ([\w$#.]+)\(.*\) does not exist')
+# The words after a name that make it no declaration of the name: a use, as in
+# `a IS NULL` or `x NOT IN (...)` (#2212).
+_NOT_A_TYPE = (
+    'IS|NOT|LIKE|BETWEEN|AND|OR|THEN|LOOP|ELSE|ELSIF|END|MEMBER|OF|AS|FROM|INTO|'
+    'WHERE|USING|RETURNING|BULK|WHEN'
+)
+
+
+def _declared_in(masked: str, name: str) -> bool:
+    # Whether a PL/SQL unit's source declares `name` (#2212): a parameter or
+    # variable, `name [IN] [OUT] [NOCOPY] [CONSTANT] type`, or a cursor, type
+    # or subtype of that name.
+    word = re.escape(name)
+    return (
+        re.search(
+            rf'(?i)(?<![\w$#.]){word}\s+(?:IN\s+OUT\s+|IN\s+|OUT\s+)?(?:NOCOPY\s+)?'
+            rf'(?:CONSTANT\s+)?(?!(?:{_NOT_A_TYPE})\b)[A-Za-z_]',
+            masked,
+        )
+        is not None
+        or re.search(rf'(?i)\b(?:CURSOR|TYPE|SUBTYPE)\s+{word}(?![\w$#])', masked)
+        is not None
+    )
+
+
 # What a PL/SQL statement follows: the end of one, or a keyword one comes after.
 _BEFORE_STATEMENT = re.compile(r'(?i)(?:;|\b(?:BEGIN|THEN|ELSE|LOOP|DECLARE)\b)')
 
 
 def _checked_error_rows(
-    sql: str, found: list[tuple[str, str, str]], routines: frozenset[str]
+    sql: str,
+    found: list[tuple[str, str, str]],
+    routines: frozenset[str],
+    source: str | None = None,
 ) -> list[tuple[int, int, str, int]]:
     """ALL_ERRORS's rows for what plpgsql_check found in a unit (#2129):
-    each error at its name, as found in the source after the routine's BEGIN,
-    and the statement Oracle then ignores, at its start; lines from the
-    unit's keyword on, positions 1-based. An error whose name the source does
-    not show is left out."""
-    head = _SOURCE_START.match(sql)
-    source = sql[head.end() if head else 0 :]
+    each error at its name, as found in the source after the unit's first
+    BEGIN, and the statement Oracle then ignores, at its start, in the
+    order the names stand in the source -- a package body's members are
+    checked one by one (#2212). Lines from the unit's keyword on, or from
+    the start of `source` where one is given (a trigger's block), positions
+    1-based. An error whose name the source does not show is left out."""
+    if source is None:
+        head = _SOURCE_START.match(sql)
+        source = sql[head.end() if head else 0 :]
     (masked, _contents) = _mask_quoted(source)
     begin = re.search(r'(?i)\bBEGIN\b', masked)
     offset = begin.end() if begin else 0
@@ -10674,7 +10711,8 @@ def _checked_error_rows(
             at - (masked.rfind('\n', 0, at) + 1) + 1,
         )
 
-    rows: list[tuple[int, int, str, int]] = []
+    placed: list[tuple[int, list[tuple[int, int, str, int]]]] = []
+    taken: set[int] = set()
     for statement, sqlstate, message in found:
         sql_statement = 'SQL' in statement or 'SELECT' in statement.upper()
         if (
@@ -10709,10 +10747,26 @@ def _checked_error_rows(
                 )
         else:
             continue
-        at = re.search(rf'(?i)(?<![\w$#.]){re.escape(name)}(?![\w$#])', masked[offset:])
-        if at is None:
+        if _declared_in(masked, name):
+            # A name the unit declares is no error to Oracle: what failed is
+            # the Mirror's translation of a use of it, as of a collection's
+            # a(i) or a.COUNT, which a call of the unit meets as before. Left,
+            # so it costs nothing that works (#2212).
             continue
-        where = offset + at.start()
+        # The name's first place after BEGIN that no other error took.
+        where = next(
+            (
+                offset + at.start()
+                for at in re.finditer(
+                    rf'(?i)(?<![\w$#.]){re.escape(name)}(?![\w$#])', masked[offset:]
+                )
+                if offset + at.start() not in taken
+            ),
+            None,
+        )
+        if where is None:
+            continue
+        taken.add(where)
         before = list(_BEFORE_STATEMENT.finditer(masked, 0, where))
         start = before[-1].end() if before else 0
         start += len(masked[start:where]) - len(masked[start:where].lstrip())
@@ -10721,10 +10775,10 @@ def _checked_error_rows(
             if number in (904, 942)
             else ('PL/SQL: Statement ignored')
         )
-        rows.append((*place(where), text, number))
-        rows.append((*place(start), ignored, 0))
-        offset = where + len(name)
-    return rows
+        placed.append(
+            (where, [(*place(where), text, number), (*place(start), ignored, 0)])
+        )
+    return [row for _where, pair in sorted(placed) for row in pair]
 
 
 # A name, perhaps schema-qualified, either part perhaps quoted (#2176).
@@ -16445,26 +16499,101 @@ class PostgresBackend:
         start. An error it cannot place is left: the routine stays VALID, as
         before. None where nothing is wrong, or nothing checks."""
         routine = _ROUTINE_HEAD.match(sql)
-        if routine is None or not self._has_plpgsql_check():
+        package = None if routine else _PACKAGE_HEAD.match(sql)
+        trigger = None if routine or package else _CREATE_TRIGGER.match(sql)
+        if routine is None and package is None and trigger is None:
             return None
-        (schema, name) = _pg_routine_name(routine.group(2))
+        if package is not None and not package.group(1):
+            return None  # a spec has no code to check
+        if not self._has_plpgsql_check():
+            return None
+        source = None
+        if routine is not None:
+            (schema, name) = _pg_routine_name(routine.group(2))
+            query = (
+                'SELECT c.statement, c.sqlstate, c.message FROM pg_proc p '
+                'CROSS JOIN LATERAL plpgsql_check_function_tb(p.oid, '
+                'fatal_errors => false) c WHERE p.proname = %s '
+                "AND p.pronamespace = coalesce(to_regnamespace(nullif(%s, '')), "
+                "current_schema()::regnamespace) AND c.level = 'error'"
+            )
+            params: tuple = (name, schema)
+        elif package is not None:
+            # A package body's members, each its schema's function (#2212).
+            query = (
+                'SELECT c.statement, c.sqlstate, c.message FROM pg_proc p '
+                'JOIN pg_language l ON l.oid = p.prolang '
+                'CROSS JOIN LATERAL plpgsql_check_function_tb(p.oid, '
+                'fatal_errors => false) c WHERE p.pronamespace = to_regnamespace(%s) '
+                "AND l.lanname = 'plpgsql' AND p.prorettype <> 'trigger'::regtype "
+                "AND c.level = 'error'"
+            )
+            params = (package.group(3).lower(),)
+        else:
+            # A trigger's function, checked against its table; Oracle counts
+            # its errors' places from its block (#2212).
+            assert trigger is not None
+            table = self._trigger_table(trigger.group(2))
+            if table is None:
+                return None
+            query = (
+                'SELECT c.statement, c.sqlstate, c.message FROM '
+                'plpgsql_check_function_tb(to_regprocedure(%s), to_regclass(%s), '
+                "fatal_errors => false) c WHERE c.level = 'error'"
+            )
+            params = (f'{_trigger_function_name(trigger.group(2))}()', table)
+            source = sql[trigger.start(9) :]
         try:
             with self._conn.transaction():
-                found = self._conn.execute(
-                    'SELECT c.statement, c.sqlstate, c.message FROM pg_proc p '
-                    'CROSS JOIN LATERAL plpgsql_check_function_tb(p.oid, '
-                    'fatal_errors => false) c WHERE p.proname = %s '
-                    "AND p.pronamespace = coalesce(to_regnamespace(nullif(%s, '')), "
-                    "current_schema()::regnamespace) AND c.level = 'error' "
-                    'ORDER BY c.lineno, c.position',
-                    (name, schema),
-                ).fetchall()
+                found = self._conn.execute(query, params).fetchall()
         except psycopg.Error:
             return None
-        rows = _checked_error_rows(sql, found, self._routine_names_known())
+        rows = _checked_error_rows(sql, found, self._routine_names_known(), source)
         if not rows:
             return None
+        if trigger is not None:
+            return self._invalid_trigger(trigger, sql, _CheckedErrors(rows))
         return self._create_invalid(sql, _CheckedErrors(rows))
+
+    def _invalid_trigger(
+        self, trigger: re.Match, sql: str, error: BackendError
+    ) -> Result | None:
+        # A trigger that does not compile (#2212): it stays, ENABLED, and
+        # INVALID -- its function raises ORA-04098 as the trigger fires, as
+        # Oracle's does -- with its errors in ALL_ERRORS.
+        name = trigger.group(2)
+        (schema, _dot, bare) = name.rpartition('.')
+        table = self._trigger_table(name)
+        if table is None:
+            return None
+        try:
+            row = self._conn.execute(
+                'SELECT upper(coalesce(%s, current_schema()))',
+                (_pg_identifier(schema) if schema else None,),
+            ).fetchone()
+            owner = row[0] if row else ''
+            message = (
+                f"ORA-04098: trigger '{owner}.{_oracle_name(bare)}' is invalid and "
+                'failed re-validation'
+            ).replace("'", "''")
+            self._conn.execute(
+                f'CREATE OR REPLACE FUNCTION {_trigger_function_name(name)}() '
+                'RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION USING '
+                f"ERRCODE = 'P0001', MESSAGE = '{message}'; END $$; "
+                f'COMMENT ON TRIGGER {bare} ON {table} IS '
+                f"'{_TRIGGER_MARK}INVALID'"
+            )
+            self._record_compile_error(
+                sql,
+                _oracle_name(schema) if schema else None,
+                _oracle_name(bare),
+                'TRIGGER',
+                error,
+            )
+        except psycopg.Error:
+            self._conn.rollback()
+            return None
+        return Result(compilation_warning=True)
 
     def _has_plpgsql_check(self) -> bool:
         # Whether the database has plpgsql_check (#2129), looked up once.
@@ -16549,10 +16678,13 @@ class PostgresBackend:
         package = name.lower()
         if body:
             known = self._conn.execute(
-                'SELECT 1 FROM sys.ora_packages WHERE name = %s', (package,)
+                'SELECT owner FROM sys.ora_packages WHERE name = %s', (package,)
             ).fetchone()
             if known is None:
                 return Result(compilation_warning=True)
+            # The owner its spec recorded: a body PostgreSQL created leaves the
+            # package's schema first on the transaction's path (#2212).
+            owner = owner or known[0]
             stub = _restore_package_stubs(package, 'INVALID')
         else:
             owner_sql = (
