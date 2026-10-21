@@ -3054,9 +3054,12 @@ def _record_owner_tests() -> dict[str, str | None]:
         # A unit's source, the same (#2172).
         'ora_source': owner('pg_namespace', 'nspowner', 'nspname', 'lower({t}.owner)'),
         # A synonym, the same (#2179).
-        'ora_synonyms': owner(
-            'pg_namespace', 'nspowner', 'nspname', 'lower({t}.owner)'
-        ),
+        # A PUBLIC one is the record of whoever may create in PostgreSQL's
+        # public schema, where its view is.
+        'ora_synonyms': "(CASE WHEN {t}.owner = 'PUBLIC' THEN "
+        "pg_catalog.has_schema_privilege('public', 'CREATE') ELSE "
+        + owner('pg_namespace', 'nspowner', 'nspname', 'lower({t}.owner)')
+        + ' END)',
         'ora_grants': grants,
         # A column's, the same (#1946).
         'ora_col_grants': grants,
@@ -5907,6 +5910,8 @@ _DROP_SYNONYM = re.compile(
 # ORA-01471 and ORA-01434 (#2179), measured on 23ai.
 _ORA_SYNONYM_OF_ITSELF = 1471
 _ORA_NO_SUCH_SYNONYM = 1434
+# ORA-01432, a DROP PUBLIC SYNONYM of none (#2179).
+_ORA_NO_SUCH_PUBLIC_SYNONYM = 1432
 # ORA-00980, a synonym whose target is not there (#2179).
 _ORA_SYNONYM_TRANSLATION = 980
 # The kinds of object a synonym's name may not be taken by: Oracle's one
@@ -15448,11 +15453,13 @@ class PostgresBackend:
         try:
             row = self._catalog_read(
                 'SELECT current_schema(), EXISTS (SELECT 1 FROM sys.ora_synonyms '
-                'WHERE owner = upper(coalesce(%s, current_schema())) '
+                'WHERE (owner = upper(coalesce(%s, current_schema())) '
+                "OR %s::text IS NULL AND owner = 'PUBLIC') "
                 'AND name = %s), EXISTS (SELECT 1 FROM sys.ora_invalid_views '
                 'WHERE schema_name = coalesce(%s, current_schema()) '
                 'AND view_name = %s)',
                 (
+                    missing.schema,
                     missing.schema,
                     relation.upper() if relation == relation.lower() else relation,
                     missing.schema,
@@ -21162,18 +21169,31 @@ class PostgresBackend:
         dropped = None if created else _DROP_SYNONYM.match(statement)
         if created is None and dropped is None:
             return None
-        public = created.group(2) if created else dropped and dropped.group(1)
-        if public:
-            raise UnsupportedFeature('PUBLIC synonyms are not supported yet')
+        public = bool(created.group(2) if created else dropped and dropped.group(1))
         self.commit()
-        row = self._conn.execute('SELECT sys.ora_owner(current_schema())').fetchone()
+        row = self._conn.execute(
+            "SELECT sys.ora_owner(current_schema()), has_schema_privilege('public', 'CREATE')"
+        ).fetchone()
         assert row is not None
-        here = row[0]
+        (here, may_publish) = row
+        if public and not may_publish:
+            # CREATE / DROP PUBLIC SYNONYM: a system privilege the Mirror does
+            # not model, so CREATE on PostgreSQL's public schema, where the
+            # view goes, stands for it.
+            raise BackendError(
+                'insufficient privileges', ora_code=ORA_INSUFFICIENT_PRIVILEGES
+            )
 
-        def named(written: str) -> tuple[str, str, str]:
-            # An owner and a name as Oracle spells them, and as written.
+        def named(written: str, synonym: bool = False) -> tuple[str, str, str]:
+            # An owner and a name as Oracle spells them, and as written; a
+            # PUBLIC synonym's owner is PUBLIC, its view in public, and its
+            # target's schema, where the statement gives none, the creator's.
             parts = re.split(r'\s*\.\s*', written.strip())
+            if synonym and public:
+                return ('PUBLIC', _oracle_name(parts[-1]), f'public.{parts[-1]}')
             owner = _oracle_name(parts[0]) if len(parts) == 2 else here
+            if public and len(parts) == 1:
+                return (owner, _oracle_name(parts[0]), f'{here}.{parts[0]}')
             return (owner, _oracle_name(parts[-1]), written.strip())
 
         def recorded(owner: str, name: str) -> bool:
@@ -21186,11 +21206,14 @@ class PostgresBackend:
             )
 
         if dropped is not None:
-            (owner, name, written) = named(dropped.group(2))
+            (owner, name, written) = named(dropped.group(2), synonym=True)
             if not recorded(owner, name):
                 raise BackendError(
-                    'private synonym to be dropped does not exist',
-                    ora_code=_ORA_NO_SUCH_SYNONYM,
+                    f'{"public" if public else "private"} synonym to be dropped '
+                    'does not exist',
+                    ora_code=_ORA_NO_SUCH_PUBLIC_SYNONYM
+                    if public
+                    else _ORA_NO_SUCH_SYNONYM,
                 )
             # The record first: the DROP VIEW's own DDL would otherwise find a
             # synonym without its view, and make it again.
@@ -21209,7 +21232,7 @@ class PostgresBackend:
         assert created is not None
         if created.group(5):
             raise UnsupportedFeature('a synonym for a remote object is not supported')
-        (owner, name, written) = named(created.group(3))
+        (owner, name, written) = named(created.group(3), synonym=True)
         (target_owner, target, target_written) = named(created.group(4))
         if (owner, name) == (target_owner, target):
             raise BackendError(
