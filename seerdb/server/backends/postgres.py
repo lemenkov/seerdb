@@ -11503,6 +11503,16 @@ def _late_number(sql: str, binds: Sequence, value: str) -> str | None:
     return ''.join(out) if changed else None
 
 
+# PostgreSQL refusing to assign a value of one type to a column of another:
+# the column and its type (#2150).
+_REFUSED_ASSIGNMENT = re.compile(
+    r'column "([^"]+)" is of type (numeric|integer|bigint|smallint|ora_date|'
+    r'double precision|real) but expression is of type '
+    r'(?:character|character varying|text)'
+)
+_DATE_TARGETS = frozenset({'ora_date'})
+
+
 def _placed_offset(code: int, original: str) -> int | None:
     """Where 23ai points an error PostgreSQL gives no position for (#2111):
     an ORA-00955 at the name the CREATE gives, an ORA-01476 at the statement's
@@ -13903,6 +13913,11 @@ class PostgresBackend:
                     return self.execute(late, binds)
                 except BackendError:
                     pass
+            if (converted := self._converted_select(sql, error)) is not None:
+                # An INSERT ... SELECT's literal its column's type refuses as
+                # PostgreSQL types it, which Oracle converts (#2150). Once more
+                # with it converted as Oracle does: TO_NUMBER, TO_DATE.
+                return self.execute(converted, binds)
             if (
                 isinstance(error, _InvalidNumber)
                 and (late := _late_number(sql, binds, error.value)) is not None
@@ -14094,6 +14109,36 @@ class PostgresBackend:
                 f'maximum: {maximum})',
                 ora_code=ORA_VALUE_TOO_LARGE_FOR_COLUMN,
                 error_offset=start + lead,
+            )
+        return None
+
+    def _converted_select(self, sql: str, error: BackendError) -> str | None:
+        # `sql` with the INSERT ... SELECT literal in the column PostgreSQL
+        # refused it for passed through TO_NUMBER or TO_DATE (#2150), or None
+        # when the error is not that one or the literal cannot be found.
+        refused = _REFUSED_ASSIGNMENT.search(str(error))
+        assigned = _assigned_values(sql) if refused is not None else None
+        if refused is None or assigned is None:
+            return None
+        insert = _NULL_INSERT.match(sql)
+        if insert is None or not insert.group(3).upper().startswith('SELECT'):
+            return None
+        (table, items) = assigned
+        (column, target) = (refused.group(1).lower(), refused.group(2))
+        call = 'TO_DATE' if target in _DATE_TARGETS else 'TO_NUMBER'
+        order = self._column_order(table) if items and items[0][0] is None else []
+        for index, (named, start, end) in enumerate(items):
+            name = (named or (order[index] if index < len(order) else '')).lower()
+            if name != column:
+                continue
+            value = sql[start:end]
+            if not re.fullmatch(r"\s*'(?:[^']|'')*'\s*", value):
+                return None
+            lead = len(value) - len(value.lstrip())
+            return (
+                sql[: start + lead]
+                + f'{call}({value.strip()})'
+                + sql[start + lead + len(value.strip()) :]
             )
         return None
 

@@ -493,6 +493,52 @@ def test_a_value_too_large_names_its_column_and_points_at_it() -> None:
         backend.close()
 
 
+def test_an_insert_select_literal_converts_to_its_columns_type() -> None:
+    # An INSERT ... SELECT's string literal for a NUMBER or a DATE column
+    # failed: PostgreSQL types it as character and assigns that to neither
+    # (#2150). Oracle converts it -- a DATE by NLS_DATE_FORMAT. Measured on
+    # 23ai, as are the rows below.
+    import datetime
+
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2150 (id NUMBER, k NUMBER, i INTEGER, d DATE)')
+        try:
+            for statement in (
+                "insert into t2150 select 1, '5', null, null from dual",
+                "insert into t2150 (id, k) select 2, '7' from dual",
+                "insert into t2150 (id, i) select 3, '42' from dual",
+                "insert into t2150 (id, d) select 4, '06-MAY-24' from dual",
+                "insert into t2150 (id, k, i) select 5, '8', '9' from dual",
+            ):
+                assert backend.execute(statement).rowcount == 1, statement
+            assert (
+                backend.execute(
+                    "insert into t2150 select 6, 'abc', null, null from dual where 1 = 0"
+                ).rowcount
+                == 0
+            )
+            with pytest.raises(BackendError) as raised:
+                backend.execute("insert into t2150 (id, k) select 7, 'x' from dual")
+            assert raised.value.ora_code == 1722
+            assert backend.execute('SELECT * FROM t2150 ORDER BY id').rows == [
+                (1, 5, None, None),
+                (2, 7, None, None),
+                (3, None, 42, None),
+                (4, None, None, datetime.datetime(2024, 5, 6)),
+                (5, 8, 9, None),
+            ]
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2150')
+    finally:
+        backend.close()
+
+
 def test_a_value_that_is_no_number_fails_only_on_a_row() -> None:
     # A comparison or an assignment with a value that is no number failed on
     # an empty table: PostgreSQL converts it as it plans, where Oracle converts
