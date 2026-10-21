@@ -597,7 +597,7 @@ def test_a_unique_violation_is_worded_as_oracle_words_it() -> None:
         (
             '23ai',
             [
-                'unique constraint (PYO.T2120_PKEY) violated on table PYO.T2120 '
+                'unique constraint (PYO.SYS_C#######) violated on table PYO.T2120 '
                 'columns (ID)\nORA-03301: (ORA-00001 details) row with column '
                 'values (ID:1) already exists',
                 'unique constraint (PYO.U2120) violated on table PYO.T2120 '
@@ -608,7 +608,7 @@ def test_a_unique_violation_is_worded_as_oracle_words_it() -> None:
         (
             '12.1',
             [
-                'unique constraint (PYO.T2120_PKEY) violated',
+                'unique constraint (PYO.SYS_C#######) violated',
                 'unique constraint (PYO.U2120) violated',
             ],
         ),
@@ -634,7 +634,10 @@ def test_a_unique_violation_is_worded_as_oracle_words_it() -> None:
                         backend.execute(statement)
                     assert raised.value.ora_code == 1
                     got.append(str(raised.value))
-                assert got == expected
+                # The primary key Oracle names, SYS_C and seven digits (#2141).
+                assert [
+                    re.sub(r'SYS_C\d{7}', 'SYS_C#######', g) for g in got
+                ] == expected
                 # An array's error keeps the rows it applied before it failed:
                 # only the words change (#998).
                 with pytest.raises(BackendError) as raised:
@@ -649,6 +652,75 @@ def test_a_unique_violation_is_worded_as_oracle_words_it() -> None:
                 backend.execute('DROP TABLE t2120')
         finally:
             backend.close()
+
+
+def test_an_unnamed_constraint_is_named_as_oracle_names_it() -> None:
+    # An unnamed constraint had PostgreSQL's name, T_PKEY or T_U_KEY, in the
+    # dictionary and in ORA-00001 (#2141). 23ai names each PRIMARY KEY,
+    # UNIQUE, CHECK and REFERENCES the DDL leaves unnamed SYS_C and seven
+    # digits, inline or not, in CREATE TABLE and ALTER TABLE ... ADD; a key's
+    # index has its name. A named one, and a FOREIGN KEY's REFERENCES, keep
+    # theirs.
+    from seerdb.server.backend import BackendError
+    from seerdb.server.backends.postgres import _unnamed_constraints
+
+    sql = (
+        'create table t (a number primary key, b number constraint nb unique, '
+        "c varchar2(5) check (c <> 'unique'), foreign key (a) references p (id))"
+    )
+    assert [sql[at : at + 7] for at in _unnamed_constraints(sql)] == [
+        'primary',
+        'check (',
+        'foreign',
+    ]
+    assert _unnamed_constraints('alter table t drop primary key') == []
+    assert _unnamed_constraints('create table t2 as select * from t') == []
+    generated = re.compile(r'SYS_C\d{7}$')
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE p2141 (id NUMBER PRIMARY KEY)')
+        backend.execute(
+            'CREATE TABLE t2141 (id NUMBER, u VARCHAR2(5) UNIQUE, '
+            'c NUMBER CHECK (c > 0), r NUMBER REFERENCES p2141, k NUMBER, '
+            'CONSTRAINT named_2141 UNIQUE (k), PRIMARY KEY (id))'
+        )
+        try:
+            backend.execute('ALTER TABLE t2141 ADD (z NUMBER)')
+            backend.execute('ALTER TABLE t2141 ADD UNIQUE (z)')
+            rows = backend.execute(
+                'SELECT constraint_name, constraint_type FROM user_constraints '
+                "WHERE table_name = 'T2141' AND lower(constraint_name) NOT LIKE '%not_null'"
+            ).rows
+            assert sorted(t for n, t in rows if generated.match(n)) == [
+                'C',
+                'P',
+                'R',
+                'U',
+                'U',
+            ]
+            assert [n for n, _t in rows if not generated.match(n)] == ['NAMED_2141']
+            indexes = {
+                n
+                for (n,) in backend.execute(
+                    "SELECT index_name FROM all_indexes WHERE owner = 'PYO' "
+                    "AND table_name = 'T2141'"
+                ).rows
+            }
+            keys = {n for n, t in rows if t in ('P', 'U')}
+            assert indexes == keys
+            backend.execute("INSERT INTO t2141 (id, u) VALUES (1, 'a')")
+            with pytest.raises(BackendError) as raised:
+                backend.execute("INSERT INTO t2141 (id, u) VALUES (2, 'a')")
+            named = re.search(r'\(PYO\.(\w+)\)', str(raised.value))
+            assert named is not None and generated.match(named.group(1))
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2141')
+            backend.execute('DROP TABLE p2141')
+    finally:
+        backend.close()
 
 
 def test_a_unique_violation_shows_a_date_in_the_session_format() -> None:
