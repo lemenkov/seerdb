@@ -3689,6 +3689,50 @@ def _users_kept_apart(
     adm.close()
 
 
+def test_a_public_synonym_needs_create_on_postgresqls_public_schema() -> None:
+    # CREATE / DROP PUBLIC SYNONYM need a system privilege the Mirror does
+    # not model; CREATE on PostgreSQL's public schema, where the synonym's
+    # view goes, stands for it (#2179): without it ORA-01031, as 23ai answers
+    # a user without CREATE PUBLIC SYNONYM, and with it the record is the
+    # user's to write under per-user mode's row-level security (#1857).
+    admin, user = f'ps_adm_{os.getpid()}', f'ps_user_{os.getpid()}'
+    pg = psycopg.connect(_CONNINFO, autocommit=True)
+    try:
+        with _per_user_mirror(_CONNINFO, admin) as login:
+            adm = login(admin, 'adm123')
+            adm.cursor().execute(f'create user {user} identified by pw123')
+            session = login(user, 'pw123')
+            # Both closed whatever fails: an open session holds the locks
+            # that dropping its role waits for.
+            try:
+                mine = session.cursor()
+                mine.execute('create table ps_t (id number)')
+                mine.execute('insert into ps_t values (1)')
+                with pytest.raises(seerdb.DatabaseError) as raised:
+                    mine.execute('create public synonym ps_p for ps_t')
+                assert raised.value.code == 1031
+                pg.execute(f'GRANT CREATE ON SCHEMA public TO {user}')
+                try:
+                    mine.execute('create public synonym ps_p for ps_t')
+                    mine.execute(
+                        'select table_owner, table_name from all_synonyms '
+                        "where owner = 'PUBLIC' and synonym_name = 'PS_P'"
+                    )
+                    assert mine.fetchall() == [(user.upper(), 'PS_T')]
+                    mine.execute('select id from ps_p')
+                    assert mine.fetchall() == [(1,)]
+                    mine.execute('drop public synonym ps_p')
+                finally:
+                    pg.execute(f'REVOKE CREATE ON SCHEMA public FROM {user}')
+                mine.execute('drop table ps_t')
+            finally:
+                session.close()
+                adm.close()
+    finally:
+        _drop_mirror_roles(pg, user, admin)
+        pg.close()
+
+
 def test_per_user_roles_keep_the_users_apart() -> None:
     admin, user = f'pu_adm_{os.getpid()}', f'pu_user_{os.getpid()}'
     pg = psycopg.connect(_CONNINFO, autocommit=True)
@@ -11416,6 +11460,63 @@ def test_a_synonym_follows_its_target_as_oracles_does() -> None:
                 'TABLE t2179b',
                 'TABLE u2179c',
             ):
+                with contextlib.suppress(BackendError):
+                    backend.execute(f'DROP {leftover}')
+    finally:
+        backend.close()
+
+
+def test_a_public_synonym_reaches_its_table_as_oracles_does() -> None:
+    # CREATE PUBLIC SYNONYM was ORA-03001 (#2179). 23ai's: ALL_SYNONYMS and
+    # ALL_OBJECTS list it under PUBLIC and USER_SYNONYMS does not; a target
+    # with no schema is the creator's; a private synonym of its name wins;
+    # ORA-00955 again without OR REPLACE, ORA-01432 for a DROP of none, and
+    # ORA-00980 while its target is gone.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE p2179 (id NUMBER)')
+        backend.execute('CREATE TABLE q2179 (k NUMBER)')
+        try:
+            backend.execute('INSERT INTO p2179 VALUES (1)')
+            backend.execute('INSERT INTO q2179 VALUES (2)')
+            backend.execute('CREATE PUBLIC SYNONYM ps2179 FOR p2179')
+            assert backend.execute(
+                'SELECT owner, table_owner, table_name FROM all_synonyms '
+                "WHERE synonym_name = 'PS2179'"
+            ).rows == [('PUBLIC', 'PYO', 'P2179')]
+            assert backend.execute(
+                "SELECT owner, object_type FROM all_objects WHERE object_name = 'PS2179'"
+            ).rows == [('PUBLIC', 'SYNONYM')]
+            assert (
+                backend.execute(
+                    "SELECT 1 FROM user_synonyms WHERE synonym_name = 'PS2179'"
+                ).rows
+                == []
+            )
+            assert backend.execute('SELECT * FROM ps2179').rows == [(1,)]
+            backend.execute('CREATE SYNONYM ps2179 FOR q2179')
+            assert backend.execute('SELECT * FROM ps2179').rows == [(2,)]
+            backend.execute('DROP SYNONYM ps2179')
+            with pytest.raises(BackendError) as raised:
+                backend.execute('CREATE PUBLIC SYNONYM ps2179 FOR p2179')
+            assert raised.value.ora_code == 955
+            backend.execute('CREATE OR REPLACE PUBLIC SYNONYM ps2179 FOR q2179')
+            assert backend.execute('SELECT * FROM ps2179').rows == [(2,)]
+            backend.execute('DROP TABLE q2179')
+            with pytest.raises(BackendError) as raised:
+                backend.execute('SELECT * FROM ps2179')
+            assert raised.value.ora_code == 980
+            backend.execute('DROP PUBLIC SYNONYM ps2179')
+            with pytest.raises(BackendError) as raised:
+                backend.execute('DROP PUBLIC SYNONYM ps2179')
+            assert raised.value.ora_code == 1432
+        finally:
+            backend.rollback()
+            for leftover in ('PUBLIC SYNONYM ps2179', 'TABLE p2179', 'TABLE q2179'):
                 with contextlib.suppress(BackendError):
                     backend.execute(f'DROP {leftover}')
     finally:
