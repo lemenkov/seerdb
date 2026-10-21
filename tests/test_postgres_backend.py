@@ -8908,6 +8908,45 @@ def test_a_concatenation_of_a_bind_describes_by_its_declared_size() -> None:
         backend.close()
 
 
+def test_a_nested_blocks_declarations_take_oracles_types() -> None:
+    # A block nested in a block or a routine declared its variables in
+    # Oracle's types as written: `type "number" does not exist` (#2182). Only
+    # the outermost declarations were mapped. 23ai runs each of these; a
+    # DECLARE in a comment or a string is no block.
+    from seerdb.server.backends.postgres import _nested_declarations
+
+    assert _nested_declarations(' x := 1; /* declare n number; begin */ END') == (
+        ' x := 1; /* declare n number; begin */ END'
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('BEGIN DECLARE x NUMBER; BEGIN x := 1; END; END;')
+        backend.execute(
+            'BEGIN DECLARE x NUMBER; BEGIN DECLARE n PLS_INTEGER := 4; '
+            'BEGIN x := n; END; END; END;'
+        )
+        backend.execute(
+            'BEGIN FOR i IN 1..2 LOOP DECLARE t NUMBER := i * 10; '
+            'BEGIN NULL; END; END LOOP; END;'
+        )
+        result = backend.execute(
+            'CREATE OR REPLACE PROCEDURE n2182 (r OUT NUMBER) AS BEGIN '
+            "DECLARE x NUMBER := 6; d DATE := DATE '2024-01-02'; "
+            'BEGIN r := x * 7 + (d - d); END; END;'
+        )
+        try:
+            assert not result.compilation_warning
+            assert backend.execute(
+                "SELECT status FROM user_objects WHERE object_name = 'N2182'"
+            ).rows == [('VALID',)]
+        finally:
+            backend.execute('DROP PROCEDURE n2182')
+    finally:
+        backend.close()
+
+
 def test_an_undeclared_name_is_pls_00201_with_its_statement_ignored() -> None:
     # A routine whose statement starts with a name no declaration gives -- a
     # bare call, an assignment to an undeclared variable -- lists PostgreSQL's

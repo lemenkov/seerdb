@@ -9468,9 +9468,37 @@ def _routine_body(body: str) -> str:
         return body
     declarations = body[:begin].strip()
     block = body[begin : closed[1]]
+    # The blocks nested in it declare their own (#2182).
+    block = block[: len('BEGIN')] + _nested_declarations(block[len('BEGIN') :])
     if not declarations:
         return block
     return f'DECLARE {_translate_routine_types(declarations)} {block}'
+
+
+def _nested_declarations(body: str) -> str:
+    """`body`, a block's statements past its BEGIN, with the declarations of
+    each block nested in it -- DECLARE ... BEGIN -- mapped as the outermost
+    ones are (#2182): `x NUMBER` there reached PL/pgSQL as written, `type
+    "number" does not exist`. A nested block declaring a routine of its own is
+    left as it is, as _routine_body leaves a routine's."""
+    words = list(_words(body))
+    (out, pos) = ([], 0)
+    for index, (word, _start, end) in enumerate(words):
+        if word != 'DECLARE' or end <= pos:
+            continue
+        opened = next(
+            (
+                (found, start)
+                for found, start, _e in words[index + 1 :]
+                if found in ('BEGIN', 'FUNCTION', 'PROCEDURE')
+            ),
+            None,
+        )
+        if opened is None or opened[0] != 'BEGIN':
+            continue
+        out += [body[pos:end], _translate_routine_types(body[end : opened[1]])]
+        pos = opened[1]
+    return ''.join(out) + body[pos:]
 
 
 # The FROM of a SELECT the backend evaluates a PL/SQL expression with: it marks
@@ -10890,6 +10918,7 @@ def _translate_plsql_block(
         return sql
     declare_part, body = match.groups()
     declare = _translate_routine_types(declare_part) if declare_part else ''
+    body = _nested_declarations(body)
     if routine_kind is not None:
         body = _perform_bare_calls(body, routine_kind)
     return f'DO $$ {declare}BEGIN {body.strip()} END $$'
