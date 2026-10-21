@@ -2472,7 +2472,11 @@ _ORACLE_DICTIONARY_DDL = (
     'END::text AS search_condition, '
     'upper(rc.unique_constraint_schema) AS r_owner, '
     'ora_name(rc.unique_constraint_name) AS r_constraint_name, '
-    "'NO ACTION' AS delete_rule, 'ENABLED' AS status, 'VALIDATED' AS validated "
+    "'NO ACTION' AS delete_rule, 'ENABLED' AS status, 'VALIDATED' AS validated, "
+    # An unnamed constraint is named SYS_Cnnnnnnn (#2141), and a NOT NULL
+    # keeps information_schema's made-up name: Oracle's GENERATED NAME both.
+    "CASE WHEN nn.attnum IS NOT NULL OR tc.constraint_name ~* '^sys_c[0-9]{7}$' "
+    "THEN 'GENERATED NAME' ELSE 'USER NAME' END AS generated "
     'FROM information_schema.table_constraints tc '
     'LEFT JOIN information_schema.referential_constraints rc '
     'ON rc.constraint_schema=tc.constraint_schema '
@@ -2538,7 +2542,7 @@ _ORACLE_DICTIONARY_DDL = (
     # USER_CONSTRAINTS and USER_CONS_COLUMNS, no owner in the other two.
     'CREATE OR REPLACE VIEW sys.user_constraints AS SELECT owner, constraint_name, '
     'constraint_type, table_name, search_condition, r_owner, r_constraint_name, '
-    'delete_rule, status, validated FROM sys.all_constraints '
+    'delete_rule, status, validated, generated FROM sys.all_constraints '
     'WHERE owner = ora_owner(current_schema());'
     'CREATE OR REPLACE VIEW sys.user_cons_columns AS SELECT owner, constraint_name, '
     'table_name, column_name, position FROM sys.all_cons_columns '
