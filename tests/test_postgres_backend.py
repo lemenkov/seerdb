@@ -8556,6 +8556,52 @@ def test_a_column_in_a_concatenation_counts_as_oracle_counts_it() -> None:
         backend.close()
 
 
+def test_a_raw_in_a_concatenation_is_its_hex_text() -> None:
+    # A RAW concatenated stayed bytes, `r || 'x'` the RAW b'\n\x1bx' (#2158):
+    # PostgreSQL's || joins bytea, its untyped literal taking the RAW's type.
+    # Measured on 23ai, r RAW(4) = 0A1B: the hex text, a VARCHAR2 counting
+    # two characters a byte, as RAWTOHEX(r) is.
+    from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
+    from seerdb.server.backends.postgres import _concatenated_columns
+
+    assert [
+        parts
+        for _f, _l, parts in _concatenated_columns(
+            "SELECT a || 'x', concat(t.b, c), f(d) || e, 'g||h' FROM t"
+        )
+    ] == [['a'], ['t', 'b'], ['c'], ['e']]
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2158 (r RAW(4), v VARCHAR2(10))')
+        try:
+            backend.execute("INSERT INTO t2158 VALUES (hextoraw('0A1B'), 'ab')")
+            for expression, width, value in (
+                ("r || 'x'", 9, '0A1Bx'),
+                ("'x' || r", 9, 'x0A1B'),
+                ('r || r', 16, '0A1B0A1B'),
+                ("concat(r, 'x')", 9, '0A1Bx'),
+                ("concat(concat(r, 'a'), r)", 17, '0A1Ba0A1B'),
+                ('x.r || v', 18, '0A1Bab'),
+                ('rawtohex(r)', 8, '0A1B'),
+                ("v || 'x'", 11, 'abx'),
+            ):
+                source = 't2158 x' if 'x.' in expression else 't2158'
+                result = backend.execute(f'SELECT {expression} FROM {source}')
+                (column,) = result.columns
+                assert (column.data_type, column.data_length) == (
+                    TNS_TYPE_VARCHAR,
+                    width,
+                ), expression
+                assert result.rows == [(value,)], expression
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2158')
+    finally:
+        backend.close()
+
+
 def test_sys_context_describes_as_oracle_sizes_it() -> None:
     # SYS_CONTEXT(ns, attr) is a VARCHAR2(256), and 4000 given a length,
     # whatever the length (#2109). It described as its value's width, so

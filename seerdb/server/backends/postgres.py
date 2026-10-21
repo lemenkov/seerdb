@@ -8207,6 +8207,57 @@ def _column_operands(item: str) -> list[str]:
     return names
 
 
+@_kept_per_text
+def _concatenated_columns(sql: str) -> list[tuple[int, int, list[str]]]:
+    """The names `sql` concatenates as columns -- an operand of `||` or an
+    argument of two-argument CONCAT, `c`, `t.c` or `s.t.c` -- each as the
+    first and last of its spans in _bind_spans(sql) and its parts as written
+    (#2158). A name that is called is no column."""
+    spans = _bind_spans(sql)
+    sig = [i for i, span in enumerate(spans) if span[0] not in ('space', 'comment')]
+
+    def text(k: int) -> str:
+        return spans[sig[k]][1] if 0 <= k < len(sig) else ''
+
+    found: list[tuple[int, int, list[str]]] = []
+    calls: list[str] = []  # the name before each open parenthesis
+    k = 0
+    while k < len(sig):
+        word = text(k)
+        if word == '(':
+            calls.append(text(k - 1).upper())
+        elif word == ')':
+            if calls:
+                calls.pop()
+        if spans[sig[k]][0] not in ('word', 'identifier'):
+            k += 1
+            continue
+        first = k
+        parts = [word]
+        while (
+            text(k + 1) == '.'
+            and k + 2 < len(sig)
+            and (spans[sig[k + 2]][0] in ('word', 'identifier'))
+        ):
+            parts.append(text(k + 2))
+            k += 2
+        after = text(k + 1)
+        if after != '(':
+            joined = (text(first - 2), text(first - 1)) == ('|', '|') or (
+                after == '|' and text(k + 2) == '|'
+            )
+            argument = (
+                bool(calls)
+                and calls[-1] == 'CONCAT'
+                and text(first - 1) in ('(', ',')
+                and after in (',', ')')
+            )
+            if joined or argument:
+                found.append((sig[first], sig[k], parts))
+        k += 1
+    return found
+
+
 def _concat_width(
     item: str, sizes: dict[str, int], columns: dict[str, int] | None = None
 ) -> tuple[int, bool]:
@@ -8275,6 +8326,16 @@ def _concat_width(
         if word == '(':
             at += 1
             width, complete = expression()
+            if text() == ')':
+                at += 1
+                return width, complete
+            return width, False
+        if kind == 'word' and word.upper() == 'RAWTOHEX' and text(1) == '(':
+            # RAWTOHEX of a RAW column counts as the column concatenated
+            # does, two characters a byte: 23ai describes RAWTOHEX(r) of a
+            # RAW(4) as 8 (#2158).
+            at += 2
+            width, complete = operand()
             if text() == ')':
                 at += 1
                 return width, complete
@@ -14629,6 +14690,7 @@ class PostgresBackend:
         if self._release >= (23, 0):
             sql = _ruled('number-conditions', _number_conditions(sql), sql)
         sql = _ruled('json-dot-notation', self._json_dot_notation(sql), sql)
+        sql = _ruled('raw-concatenation', self._hex_raw_operands(sql), sql)
         sql = _ruled('package-function-call', self._call_package_functions(sql), sql)
         bare = _BARE_CALL.match(sql)
         if bare is not None and bare.group(1).upper() not in _PLSQL_WORD_STATEMENTS:
@@ -15244,6 +15306,47 @@ class PostgresBackend:
             found.name == name and found.type_oid in (_JSONB_OID, self._oson_oid)
             for found in (self._relation_columns(table) or {}).values()
         )
+
+    def _hex_raw_operands(self, sql: str) -> str:
+        """`sql` with each RAW column it concatenates as its hex text,
+        RAWTOHEX(col) (#2158). Oracle converts a RAW operand of || or CONCAT
+        to its hex, `0A1Bx`; PostgreSQL's || joined the bytes, and its untyped
+        literal took the RAW's type. A name that is no column of the query's
+        FROM tables, or is one of more than one, is left as it is."""
+        if '||' not in sql and 'concat' not in sql.lower():
+            return sql
+        operands = _concatenated_columns(sql)
+        tables = _from_tables(sql) if operands else []
+        if not tables:
+            return sql
+        out = [span[1] for span in _bind_spans(sql)]
+        changed = False
+        for first, last, parts in operands:
+            if self._concatenated_type(tables, parts) in _RAW_OIDS:
+                out[first] = 'rawtohex(' + out[first]
+                out[last] += ')'
+                changed = True
+        return ''.join(out) if changed else sql
+
+    def _concatenated_type(
+        self, tables: list[tuple[str | None, str, str | None]], parts: list[str]
+    ) -> int | None:
+        # The declared type of the one FROM table column `parts` names --
+        # `c`, `t.c`, `s.t.c` -- from the schema model; None for none, or for
+        # a name more than one table has (#2158).
+        name = _pg_identifier(parts[-1])
+        qualifier = [part.strip('"').lower() for part in parts[:-1]]
+        found: list[int] = []
+        for schema, table, alias in tables:
+            if len(qualifier) == 1 and qualifier[0] not in (alias, table):
+                continue
+            if len(qualifier) == 2 and qualifier != [schema, table]:
+                continue
+            if len(qualifier) > 2:
+                continue
+            columns = self._relation_columns(f'{schema}.{table}' if schema else table)
+            found.extend(c.type_oid for c in (columns or {}).values() if c.name == name)
+        return found[0] if len(found) == 1 else None
 
     def _oson_layout(self, name: str) -> tuple[list[str], frozenset[int]] | None:
         # A relation's columns, in order, and which of them are OSON (#1706),
