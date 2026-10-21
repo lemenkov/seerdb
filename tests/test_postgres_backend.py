@@ -2559,6 +2559,53 @@ def test_to_char_prints_a_timestamp_fraction_as_oracle_does() -> None:
         backend.close()
 
 
+def test_to_char_prints_ff_at_the_values_own_precision() -> None:
+    # FF printed six digits whatever the TIMESTAMP's precision (#2167). 23ai's,
+    # each at 13:14:15.5 but ts0 at 13:14:15: a column's own precision, X left
+    # out at 0, 9 for a literal or a TIMESTAMP with an interval, n for a CAST
+    # to TIMESTAMP(n), MAX its column's.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute(
+            'CREATE TABLE t2167p (ts TIMESTAMP, ts3 TIMESTAMP(3), ts0 TIMESTAMP(0))'
+        )
+        try:
+            backend.execute(
+                "INSERT INTO t2167p VALUES (TIMESTAMP '2024-01-02 13:14:15.5', "
+                "TIMESTAMP '2024-01-02 13:14:15.5', TIMESTAMP '2024-01-02 13:14:15')"
+            )
+            assert backend.execute(
+                "SELECT to_char(ts, 'SS.FF'), to_char(ts3, 'SS.FF'), "
+                "to_char(t.ts0, 'SS.FF'), to_char(ts0, 'SSXFF'), "
+                "to_char(ts3, 'SS\"X\"FF'), to_char(ts0, 'SS.FF3'), "
+                "to_char(TIMESTAMP '2024-01-02 13:14:15.5', 'SS.FF'), "
+                "to_char(ts3 + interval '1' day, 'SS.FF'), "
+                "to_char(CAST(ts AS TIMESTAMP(2)), 'SS.FF') FROM t2167p t"
+            ).rows == [
+                (
+                    '15.500000',
+                    '15.500',
+                    '15.',
+                    '15',
+                    '15X500',
+                    '15.000',
+                    '15.500000000',
+                    '15.500000000',
+                    '15.50',
+                )
+            ]
+            assert backend.execute(
+                "SELECT to_char(max(ts3), 'SS.FF') FROM t2167p"
+            ).rows == [('15.500',)]
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2167p')
+    finally:
+        backend.close()
+
+
 def test_translate_idioms_rewrites_offset_bearing_timestamp_literal() -> None:
     # TIMESTAMP '<ts> ±HH:MM' is a WITH TIME ZONE value — build the composite so
     # the offset survives, rather than PostgreSQL's WITHOUT-time-zone parse dropping
