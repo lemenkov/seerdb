@@ -8421,6 +8421,59 @@ def test_sys_context_takes_a_length() -> None:
         backend.close()
 
 
+def test_a_column_in_a_concatenation_counts_as_oracle_counts_it() -> None:
+    # A column, or SYSDATE, concatenated described as its values' width
+    # (#2147). Oracle counts what the column's type converts to: 40 for a
+    # NUMBER or a TIMESTAMP, a VARCHAR2's length in bytes, 18 for a DATE, 73
+    # for a TIMESTAMP WITH TIME ZONE. Measured on 23ai, `<operand> || 'x'`.
+    from seerdb.server.backends.postgres import _from_tables
+
+    assert _from_tables('select a from t x, s.u join v on 1 = 1 where 1 = 1') == [
+        (None, 't', 'x'),
+        ('s', 'u', None),
+        (None, 'v', None),
+    ]
+    assert _from_tables('select a from (select 1 a from dual)') == []
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute(
+            'CREATE TABLE t2147 (id NUMBER, p NUMBER(5), n VARCHAR2(7), d DATE, '
+            'ts TIMESTAMP, tz TIMESTAMP WITH TIME ZONE, '
+            'iym INTERVAL YEAR(4) TO MONTH, ids INTERVAL DAY TO SECOND, '
+            'nb VARCHAR2(7 CHAR), bd BINARY_DOUBLE)'
+        )
+        try:
+            for operand, width in (
+                ('id', 41),
+                ('p', 41),
+                ('n', 8),
+                ('d', 19),
+                ('ts', 41),
+                ('tz', 74),
+                ('iym', 10),
+                ('ids', 21),
+                ('nb', 29),
+                ('bd', 41),
+                ('sysdate', 19),
+                ('systimestamp', 74),
+                ('n || n', 15),
+                ('t2147.n', 8),
+                ('x.n', 8),
+            ):
+                source = 't2147 x' if operand.startswith('x.') else 't2147'
+                (column,) = backend.execute(
+                    f"SELECT {operand} || 'x' a FROM {source}"
+                ).columns
+                assert column.data_length == width, operand
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2147')
+    finally:
+        backend.close()
+
+
 def test_sys_context_describes_as_oracle_sizes_it() -> None:
     # SYS_CONTEXT(ns, attr) is a VARCHAR2(256), and 4000 given a length,
     # whatever the length (#2109). It described as its value's width, so

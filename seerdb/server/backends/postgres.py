@@ -8096,14 +8096,103 @@ def _bind_sizes(sql: str, params: dict) -> dict[str, int]:
     return sizes
 
 
-def _concat_width(item: str, sizes: dict[str, int]) -> tuple[int, bool]:
+# The characters a column of each type adds to a concatenation, by its
+# dictionary DATA_TYPE (#2147); a character or RAW column's own length is its
+# DATA_LENGTH, below. Measured on 23ai.
+_TYPE_TEXT_WIDTH = {
+    'NUMBER': 40,
+    'FLOAT': 40,
+    'BINARY_FLOAT': 40,
+    'BINARY_DOUBLE': 40,
+    'DATE': 18,
+    'TIMESTAMP': 40,
+    'TIMESTAMP WITH TIME ZONE': 73,
+    'TIMESTAMP WITH LOCAL TIME ZONE': 40,
+    'INTERVAL YEAR TO MONTH': 9,
+    'INTERVAL DAY TO SECOND': 20,
+}
+# SYSDATE and SYSTIMESTAMP, which take no parentheses.
+_PSEUDO_COLUMN_WIDTH = {'SYSDATE': 18, 'SYSTIMESTAMP': 73}
+
+
+def _column_text_width(data_type: str, data_length: int) -> int | None:
+    """The characters a column adds to a concatenation (#2147), or None for a
+    type that is not counted: a national one, a LOB."""
+    if data_type in ('VARCHAR2', 'CHAR'):
+        return data_length
+    if data_type == 'RAW':
+        return 2 * data_length
+    plain = re.sub(r'\(\d+\)', '', data_type)
+    return _TYPE_TEXT_WIDTH.get(plain)
+
+
+def _from_tables(sql: str) -> list[tuple[str | None, str, str | None]]:
+    """A query's FROM tables as (schema, table, alias), lower-cased: comma
+    separated or joined; none for a subquery among them (#2147)."""
+    words, _rownums = _top_level_words(sql)
+    start = next((pos for pos, word in words if word == 'FROM'), None)
+    if start is None:
+        return []
+    stop = next(
+        (
+            pos
+            for pos, word in words
+            if pos > start
+            and word
+            in (
+                'WHERE',
+                'GROUP',
+                'ORDER',
+                'HAVING',
+                'CONNECT',
+                'START',
+                'UNION',
+                'INTERSECT',
+                'MINUS',
+                'FETCH',
+                'OFFSET',
+                'FOR',
+            )
+        ),
+        len(sql),
+    )
+    body = sql[start + len('FROM') : stop]
+    if '(' in body:
+        return []
+    refs = re.split(
+        r'(?i),|\b(?:(?:LEFT|RIGHT|FULL|INNER|CROSS)\s+(?:OUTER\s+)?)?JOIN\b', body
+    )
+    out: list[tuple[str | None, str, str | None]] = []
+    for ref in refs:
+        ref = re.split(r'(?i)\bON\b|\bUSING\b', ref)[0].strip()
+        match = re.fullmatch(
+            r'(?:([A-Za-z_][\w$#]*)\.)?([A-Za-z_][\w$#]*)(?:\s+(?:AS\s+)?([A-Za-z_][\w$#]*))?',
+            ref,
+        )
+        if match is None:
+            return []
+        schema, table, alias = match.groups()
+        out.append(
+            (
+                schema.lower() if schema else None,
+                table.lower(),
+                alias.lower() if alias else None,
+            )
+        )
+    return out
+
+
+def _concat_width(
+    item: str, sizes: dict[str, int], columns: dict[str, int] | None = None
+) -> tuple[int, bool]:
     """The width Oracle describes a select-list item at, as far as it can be
     read: the width and whether every operand counted (#2063).
 
     Oracle sizes a concatenation as the sum of its operands, `||` and CONCAT
     alike, up to the longest VARCHAR2. A bind in `sizes` counts its describe
     size, a literal its length in bytes, a SYS_CONTEXT call 256 (#2109), a
-    parenthesized operand its own.
+    column in `columns` -- by its name, or table or alias and name -- its
+    type's width (#2147), a parenthesized operand its own.
     Anything else -- a column, a call -- counts nothing, and the item is not
     complete. An optional alias ends the item."""
     tokens = [span for span in _bind_spans(item) if span[0] not in ('space', 'comment')]
@@ -8126,6 +8215,23 @@ def _concat_width(item: str, sizes: dict[str, int]) -> tuple[int, bool]:
         if kind == 'string' and word.startswith("'"):
             at += 1
             return len(word[1:-1].replace("''", "'").encode('utf-8')), True
+        if kind in ('word', 'identifier') and text(1) != '(':
+            # A column, perhaps qualified, or SYSDATE / SYSTIMESTAMP (#2147).
+            (names, step) = ([word], 1)
+            while (
+                text(step) == '.'
+                and at + step + 1 < len(tokens)
+                and tokens[at + step + 1][0] in ('word', 'identifier')
+            ):
+                names.append(text(step + 1))
+                step += 2
+            qualified = '.'.join(n.strip('"').lower() for n in names)
+            width = (columns or {}).get(qualified)
+            if width is None and len(names) == 1:
+                width = _PSEUDO_COLUMN_WIDTH.get(word.upper())
+            if width is not None:
+                at += step
+                return width, True
         if word.isdigit() or (word == '.' and text(1).isdigit()):
             # A number literal, its digits a token each: as many characters
             # as Oracle prints for it, `123.45` six and `1.50` three (#2140).
@@ -14142,6 +14248,37 @@ class PostgresBackend:
             )
         return None
 
+    def _operand_widths(self, sql: str) -> dict[str, int]:
+        # The width each column of a query's FROM tables adds to a
+        # concatenation (#2147), keyed by its name and by its table's name or
+        # alias and its name, lower-cased; empty when it cannot be read.
+        tables = _from_tables(sql)
+        if not tables or (
+            self._conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR
+        ):
+            return {}
+        widths: dict[str, int] = {}
+        for schema, table, alias in tables:
+            try:
+                rows = self._catalog_read(
+                    'SELECT column_name, data_type, data_length FROM all_tab_columns '
+                    "WHERE owner = coalesce(upper(%s), sys_context('USERENV', "
+                    "'CURRENT_SCHEMA')) AND table_name = upper(%s)",
+                    (schema, table),
+                ).fetchall()
+            except psycopg.Error:
+                return {}
+            for column, data_type, data_length in rows:
+                width = _column_text_width(data_type, data_length or 0)
+                if width is None:
+                    continue
+                name = column.lower()
+                widths.setdefault(name, width)
+                widths[f'{table}.{name}'] = width
+                if alias:
+                    widths[f'{alias}.{name}'] = width
+        return widths
+
     def _column_order(self, table: str) -> list[str]:
         # A table's columns in their order, lower-cased, for placing an
         # INSERT's error without a column list (#2134); none when unknown.
@@ -16310,12 +16447,15 @@ class PostgresBackend:
             and not cursor.pgresult.ftable(i)
         ]
         items = _select_list_items(original) if original and unsized else []
+        operands: dict[str, int] | None = None
         for i, item in enumerate(items):
             if i in unsized:
                 # An expression over a character bind describes by the bind's
                 # declared size, as Oracle's does, not by the values (#2063),
                 # and SYS_CONTEXT by its own (#2109).
-                described, complete = _concat_width(item, sizes)
+                if operands is None:
+                    operands = self._operand_widths(original)
+                described, complete = _concat_width(item, sizes, operands)
                 if described:
                     if not complete:
                         described = max(described, columns[i].data_length)
