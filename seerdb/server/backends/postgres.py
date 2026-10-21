@@ -1811,8 +1811,8 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE OR REPLACE VIEW sys.user_tables AS SELECT table_name, tablespace_name, '
     'iot_name, duration FROM all_tables WHERE owner=upper(current_schema());'
     'CREATE OR REPLACE VIEW sys.all_views AS SELECT upper(table_schema) AS owner, '
-    'ora_name(table_name) AS view_name, view_definition AS text '
-    'FROM information_schema.views '
+    'ora_name(table_name) AS view_name, length(view_definition) AS text_length, '
+    'view_definition AS text FROM information_schema.views '
     "WHERE table_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
     'CREATE OR REPLACE VIEW sys.all_sequences AS SELECT upper(sequence_schema) AS '
     'sequence_owner, ora_name(sequence_name) AS sequence_name, '
@@ -2424,6 +2424,22 @@ _ORACLE_DICTIONARY_DDL = (
     f'JOIN pg_attribute a ON a.attrelid=tc.oid AND {_INDEX_KEY_COLUMN} '
     "WHERE n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys') "
     f'AND {_reachable_relation("tc.oid")};'
+    # The USER_ views of these, which otherwise resolve to orafce's own
+    # oracle.user_* -- other columns, TABLE_NAME a regclass -- so Oracle's
+    # queries failed (#2169). Each has Oracle's columns: OWNER in
+    # USER_CONSTRAINTS and USER_CONS_COLUMNS, no owner in the other two.
+    'CREATE OR REPLACE VIEW sys.user_constraints AS SELECT owner, constraint_name, '
+    'constraint_type, table_name, search_condition, r_owner, r_constraint_name, '
+    'delete_rule, status, validated FROM sys.all_constraints '
+    'WHERE owner = ora_owner(current_schema());'
+    'CREATE OR REPLACE VIEW sys.user_cons_columns AS SELECT owner, constraint_name, '
+    'table_name, column_name, position FROM sys.all_cons_columns '
+    'WHERE owner = ora_owner(current_schema());'
+    'CREATE OR REPLACE VIEW sys.user_ind_columns AS SELECT index_name, table_name, '
+    'column_name, column_position, descend FROM sys.all_ind_columns '
+    'WHERE index_owner = ora_owner(current_schema());'
+    'CREATE OR REPLACE VIEW sys.user_views AS SELECT view_name, text_length, text '
+    'FROM sys.all_views WHERE owner = upper(current_schema());'
     # A DESC column in an index is a function-based index in Oracle: the column
     # appears here as the quoted expression "COL" at its position, so reflection
     # (which LEFT JOINs on column_position) renders it as an expression with DESC

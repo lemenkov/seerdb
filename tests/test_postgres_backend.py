@@ -10401,6 +10401,45 @@ def test_dictionary_views_reflect_a_created_table() -> None:
         backend.close()
 
 
+def test_the_user_dictionary_views_have_oracles_columns() -> None:
+    # USER_CONSTRAINTS, USER_CONS_COLUMNS, USER_IND_COLUMNS and USER_VIEWS were
+    # orafce's oracle.user_*, without Oracle's columns and with TABLE_NAME a
+    # regclass (#2169). 23ai's answers to the queries below.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2169 (id NUMBER PRIMARY KEY, u VARCHAR2(5))')
+        try:
+            backend.execute('CREATE INDEX i2169 ON t2169 (u)')
+            backend.execute('CREATE VIEW v2169 AS SELECT id FROM t2169')
+            assert backend.execute(
+                'SELECT constraint_type, table_name, owner, status '
+                "FROM user_constraints WHERE table_name = 'T2169' "
+                "AND constraint_type = 'P'"
+            ).rows == [('P', 'T2169', 'PYO', 'ENABLED')]
+            assert backend.execute(
+                'SELECT column_name, position, table_name, owner '
+                "FROM user_cons_columns WHERE table_name = 'T2169'"
+            ).rows == [('ID', 1, 'T2169', 'PYO')]
+            assert backend.execute(
+                'SELECT index_name, column_name, column_position '
+                "FROM user_ind_columns WHERE table_name = 'T2169' "
+                "AND index_name = 'I2169'"
+            ).rows == [('I2169', 'U', 1)]
+            ((name, length, text),) = backend.execute(
+                'SELECT view_name, text_length, text FROM user_views '
+                "WHERE view_name = 'V2169'"
+            ).rows
+            assert (name, length) == ('V2169', len(text))
+        finally:
+            backend.rollback()
+            backend.execute('DROP VIEW v2169')
+            backend.execute('DROP TABLE t2169')
+    finally:
+        backend.close()
+
+
 def _hold_a_dictionary_read() -> Any:
     # A client mid-transaction that has read a dictionary view: its lock on the
     # view is what a CREATE OR REPLACE VIEW has to wait for (#1152).
