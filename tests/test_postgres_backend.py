@@ -2107,6 +2107,53 @@ def test_numtoyminterval_and_to_yminterval_are_year_to_month() -> None:
         backend.close()
 
 
+def test_arithmetic_on_a_year_to_month_column_is_year_to_month() -> None:
+    # `iym + iym` described as DAY TO SECOND, its months read as days (#2152):
+    # PostgreSQL reports a computed value of the domain by its base type.
+    # Measured on 23ai: arithmetic and SUM / AVG over a YEAR TO MONTH column
+    # are INTERVAL YEAR(9) TO MONTH; DAY TO SECOND stays DAY TO SECOND.
+    from seerdb.common.datatypes import IntervalYM
+    from seerdb.common.tns_consts import TNS_TYPE_INTERVALDS, TNS_TYPE_INTERVALYM
+    from seerdb.server.backends.postgres import _column_operands
+
+    assert _column_operands("x.iym + sum(t.i2) * 2 || 'iym'") == ['x.iym', 't.i2']
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute(
+            'CREATE TABLE t2152 (iym INTERVAL YEAR(4) TO MONTH, '
+            'i2 INTERVAL YEAR(2) TO MONTH, ids INTERVAL DAY TO SECOND)'
+        )
+        try:
+            backend.execute(
+                "INSERT INTO t2152 VALUES (INTERVAL '1-2' YEAR TO MONTH, "
+                "INTERVAL '3-4' YEAR TO MONTH, INTERVAL '1 0:0:0' DAY TO SECOND)"
+            )
+            for expression, expected in (
+                ('iym + iym', IntervalYM(2, 4)),
+                ('iym - i2', IntervalYM(-2, -2)),
+                ('2 * iym', IntervalYM(2, 4)),
+                ('iym / 2', IntervalYM(0, 7)),
+                ('(x.iym + x.iym) * 2', IntervalYM(4, 8)),
+                ('t2152.i2 + iym d', IntervalYM(4, 6)),
+                ('sum(iym)', IntervalYM(1, 2)),
+                ('avg(i2)', IntervalYM(3, 4)),
+            ):
+                source = 't2152 x' if 'x.' in expression else 't2152'
+                result = backend.execute(f'SELECT {expression} FROM {source}')
+                assert result.columns[0].data_type == TNS_TYPE_INTERVALYM, expression
+                assert result.columns[0].precision == 9, expression
+                assert result.rows == [(expected,)], expression
+            result = backend.execute('SELECT ids + ids FROM t2152')
+            assert result.columns[0].data_type == TNS_TYPE_INTERVALDS
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2152')
+    finally:
+        backend.close()
+
+
 def test_translate_idioms_negates_whole_day_to_second_interval() -> None:
     # Oracle's leading `-` negates the whole DAY TO SECOND interval; PostgreSQL
     # applies it only to the days, so lift it to a unary minus on the literal (#520).
