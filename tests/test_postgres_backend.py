@@ -493,6 +493,52 @@ def test_a_value_too_large_names_its_column_and_points_at_it() -> None:
         backend.close()
 
 
+def test_a_value_that_is_no_number_fails_only_on_a_row() -> None:
+    # A comparison or an assignment with a value that is no number failed on
+    # an empty table: PostgreSQL converts it as it plans, where Oracle converts
+    # it for each row (#2143). Measured on 23ai: each succeeds on the empty
+    # table, and fails with ORA-01722 once a row is there.
+    from seerdb.server.backend import BackendError
+    from seerdb.server.backends.postgres import _late_number
+
+    assert _late_number("select * from t where k = 'abc'", [], 'abc') == (
+        "select * from t where k = sys.ora_late_number('abc')"
+    )
+    assert _late_number('select * from t where k = :1', ['abc'], 'abc') == (
+        'select * from t where k = sys.ora_late_number(:1)'
+    )
+    assert (
+        _late_number("select * from t where k = sys.ora_late_number('abc')", [], 'abc')
+        is None
+    )
+    assert _late_number("create table t (x number default 'abc')", [], 'abc') is None
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2143 (id NUMBER, k NUMBER)')
+        try:
+            cases: tuple[tuple[str, list[object]], ...] = (
+                ("select * from t2143 where k = 'abc'", []),
+                ('select * from t2143 where k = :1', ['abc']),
+                ("update t2143 set k = 'abc'", []),
+                ("delete from t2143 where k = 'abc'", []),
+                ("select count(*) from t2143 where k in ('1', 'x')", []),
+            )
+            for statement, binds in cases:
+                backend.execute(statement, binds)
+            backend.execute('INSERT INTO t2143 VALUES (1, 1)')
+            for statement, binds in cases:
+                with pytest.raises(BackendError) as raised:
+                    backend.execute(statement, binds)
+                assert raised.value.ora_code == 1722, statement
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2143')
+    finally:
+        backend.close()
+
+
 def test_a_unique_violation_is_worded_as_oracle_words_it() -> None:
     # ORA-00001 carried PostgreSQL's `duplicate key value violates unique
     # constraint` and its DETAIL line (#2120). Before 23ai Oracle's names the
@@ -3935,9 +3981,10 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # sys.ora_json, six sys.ora_json_scalar and sys.ora_json_serialize (#1707),
     # the four BOOLEAN / number comparisons behind = and <> (#1743), and
     # PL/SQL's sys.ora_plsql_pad with its rpad / lpad (#2061), and the three
-    # two-argument concat (#2093), sys.ora_late's two (#2138), and
-    # sys.ora_number_text, sys.ora_text and to_char(numeric) (#2146).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 104
+    # two-argument concat (#2093), sys.ora_late's two (#2138),
+    # sys.ora_number_text, sys.ora_text and to_char(numeric) (#2146), and
+    # sys.ora_late_number (#2143).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 105
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument

@@ -619,6 +619,12 @@ _HELPER_FUNCTIONS_DDL = (
     'STABLE AS $$ BEGIN RETURN $1; END $$;'
     'CREATE OR REPLACE FUNCTION sys.ora_late(numeric) RETURNS numeric LANGUAGE '
     'plpgsql STABLE AS $$ BEGIN RETURN $1; END $$;'
+    # The same for a value that is to be a number (#2143): converted per row,
+    # so a comparison with a value that is no number fails only on a row.
+    # VOLATILE, where sys.ora_late is STABLE: the planner evaluates a STABLE
+    # call in a WHERE clause to estimate its selectivity, and failed there.
+    'CREATE OR REPLACE FUNCTION sys.ora_late_number(text) RETURNS numeric '
+    'LANGUAGE plpgsql VOLATILE AS $$ BEGIN RETURN $1::numeric; END $$;'
     # TO_CHAR(d, '..SYYYY..') → the year signed as Oracle prints it: '-' before
     # a BC year, a space before any other (#1063). The sign goes where SYYYY
     # stood, as quoted literal text in PostgreSQL's format.
@@ -11421,6 +11427,32 @@ def _assigned_values(sql: str) -> tuple[str, list[tuple[str | None, int, int]]] 
     return (insert.group(1), [(c, s, e) for c, (s, e) in zip(columns, items)])
 
 
+def _late_number(sql: str, binds: Sequence, value: str) -> str | None:
+    """`sql` with each literal holding `value`, and each bind bound to it,
+    passed through sys.ora_late_number, so it is converted per row (#2143);
+    None when the statement holds neither, or is no query or DML."""
+    if not re.match(r'\s*(?:SELECT|UPDATE|DELETE|INSERT|WITH)\b', sql, re.IGNORECASE):
+        return None
+    if 'sys.ora_late_number(' in sql:
+        return None  # already the second run, which failed on a row
+    names = _bind_names(sql)
+    literal = "'" + value.replace("'", "''") + "'"
+    (out, changed) = ([], False)
+    for kind, text, name in _bind_spans(sql):
+        bound = (
+            name is not None
+            and name in names
+            and names.index(name) < len(binds)
+            and binds[names.index(name)] == value
+        )
+        if (kind == 'string' and text == literal) or bound:
+            out.append(f'sys.ora_late_number({text})')
+            changed = True
+        else:
+            out.append(text)
+    return ''.join(out) if changed else None
+
+
 def _placed_offset(code: int, original: str) -> int | None:
     """Where 23ai points an error PostgreSQL gives no position for (#2111):
     an ORA-00955 at the name the CREATE gives, an ORA-01476 at the statement's
@@ -13817,6 +13849,18 @@ class PostgresBackend:
                 # as it plans, before it touches a row; Oracle checks each row
                 # it changes, and with none it succeeds (#2138). Once more with
                 # the constants checked per row: with a row it fails as before.
+                try:
+                    return self.execute(late, binds)
+                except BackendError:
+                    pass
+            if (
+                isinstance(error, _InvalidNumber)
+                and (late := _late_number(sql, binds, error.value)) is not None
+            ):
+                # A value that is no number, which PostgreSQL converts as it
+                # plans; Oracle converts it for each row it compares or
+                # changes, and with none it succeeds (#2143). Once more with
+                # the value converted per row: with a row it fails as before.
                 try:
                     return self.execute(late, binds)
                 except BackendError:
