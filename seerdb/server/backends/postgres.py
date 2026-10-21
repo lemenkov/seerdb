@@ -2463,7 +2463,10 @@ _ORACLE_DICTIONARY_DDL = (
     "CASE tc.constraint_type WHEN 'PRIMARY KEY' THEN 'P' WHEN 'FOREIGN KEY' THEN 'R' "
     "WHEN 'UNIQUE' THEN 'U' WHEN 'CHECK' THEN 'C' ELSE '?' END AS constraint_type, "
     'ora_owner(tc.table_schema) AS table_schema, ora_name(tc.table_name) AS table_name, '
-    'NULL::text AS search_condition, '
+    # A NOT NULL's condition as Oracle writes it, the column quoted (#2171).
+    "CASE WHEN nn.attnum IS NOT NULL THEN '\"' || "
+    "ora_column_name(nn.attrelid::regclass, nn.attname) || '\" IS NOT NULL' "
+    'END::text AS search_condition, '
     'upper(rc.unique_constraint_schema) AS r_owner, '
     'ora_name(rc.unique_constraint_name) AS r_constraint_name, '
     "'NO ACTION' AS delete_rule, 'ENABLED' AS status, 'VALIDATED' AS validated "
@@ -2471,7 +2474,21 @@ _ORACLE_DICTIONARY_DDL = (
     'LEFT JOIN information_schema.referential_constraints rc '
     'ON rc.constraint_schema=tc.constraint_schema '
     'AND rc.constraint_name=tc.constraint_name '
-    "WHERE tc.constraint_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    # A NOT NULL is no constraint in PostgreSQL 16: information_schema makes
+    # one up, named <schema oid>_<table oid>_<attnum>_not_null (#2171). Its
+    # column; and one on a primary key's column, which Oracle does not list.
+    # The casts behind a CASE: a condition's order is not the order
+    # PostgreSQL evaluates it in, and `tnn_c_check` is no oid.
+    'LEFT JOIN LATERAL (SELECT a.attrelid, a.attnum, a.attname FROM pg_attribute a, '
+    "(SELECT tc.constraint_type = 'CHECK' AND tc.constraint_name "
+    "~ '^[0-9]+_[0-9]+_[0-9]+_not_null$' AS made_up) m "
+    'WHERE m.made_up AND a.attrelid = CASE WHEN m.made_up THEN '
+    "split_part(tc.constraint_name, '_', 2)::oid END "
+    'AND a.attnum = CASE WHEN m.made_up THEN '
+    "split_part(tc.constraint_name, '_', 3)::smallint END) nn ON true "
+    "WHERE tc.constraint_schema NOT IN ('pg_catalog','information_schema','oracle','sys') "
+    'AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE nn.attnum IS NOT NULL '
+    'AND i.indrelid = nn.attrelid AND i.indisprimary AND nn.attnum = ANY(i.indkey));'
     'CREATE OR REPLACE VIEW sys.all_cons_columns AS SELECT ora_owner(kcu.constraint_schema) '
     'AS owner, ora_name(kcu.constraint_name) AS constraint_name, '
     'ora_name(kcu.table_name) AS table_name, ora_column_name((quote_ident('
