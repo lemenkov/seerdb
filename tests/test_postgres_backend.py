@@ -9190,6 +9190,62 @@ def test_block_words_are_the_tokenizers_words() -> None:
     )
 
 
+def test_a_routine_calls_a_routine_as_a_statement() -> None:
+    # A stored routine whose body called a routine as a statement -- `callee;`,
+    # `callee1(1);`, DBMS_OUTPUT.PUT_LINE -- compiled INVALID, PLS-00201 at the
+    # call (#2180): PL/pgSQL wants CALL or PERFORM, which #1533 wrote for
+    # blocks only. 23ai: all VALID, a procedure calling itself too, and a
+    # package's members calling each other, the private ones among them.
+    # An element assigned to is no call, whatever routine shares its name.
+    from seerdb.server.backends.postgres import _perform_bare_calls
+
+    assert _perform_bare_calls('a(1) := 2; a(1).n := 3; a(1); a;', {'a': 'p'}.get) == (
+        'a(1) := 2; a(1).n := 3; CALL a(1); CALL a();'
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE OR REPLACE PROCEDURE callee2180 AS BEGIN NULL; END;')
+        backend.execute(
+            'CREATE OR REPLACE PROCEDURE callee2180a (a NUMBER) AS BEGIN NULL; END;'
+        )
+        try:
+            for body in (
+                'callee2180;',
+                'callee2180();',
+                'callee2180a(1);',
+                "dbms_output.put_line('x');",
+                'IF 1 = 0 THEN caller2180; END IF;',
+            ):
+                result = backend.execute(
+                    f'CREATE OR REPLACE PROCEDURE caller2180 AS BEGIN {body} END;'
+                )
+                assert not result.compilation_warning, body
+                backend.execute('BEGIN caller2180; END;')
+            backend.execute(
+                'CREATE OR REPLACE PACKAGE pk2180 AS PROCEDURE a; PROCEDURE b; END;'
+            )
+            result = backend.execute(
+                'CREATE OR REPLACE PACKAGE BODY pk2180 AS '
+                'PROCEDURE h IS BEGIN NULL; END; '
+                "PROCEDURE a IS BEGIN h; callee2180; dbms_output.put_line('x'); END; "
+                'PROCEDURE b IS BEGIN a; pk2180.a; END; END pk2180;'
+            )
+            assert not result.compilation_warning
+            backend.execute('BEGIN pk2180.b; END;')
+        finally:
+            for unit in (
+                'PACKAGE pk2180',
+                'PROCEDURE caller2180',
+                'PROCEDURE callee2180a',
+                'PROCEDURE callee2180',
+            ):
+                backend.execute(f'DROP {unit}')
+    finally:
+        backend.close()
+
+
 def test_statement_scanners_read_the_tokenizers_spans() -> None:
     # The statement-level scanners on the shared tokenizer (#1693): a bind
     # named like a keyword is no top-level keyword, a cast's type name is a
