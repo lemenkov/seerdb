@@ -213,6 +213,53 @@ def test_dml_through_a_view_reaches_its_table() -> None:
         backend.close()
 
 
+def test_a_dropped_tables_views_stay_invalid_until_it_is_back() -> None:
+    # A DROP TABLE under a view failed: `cannot drop table because other
+    # objects depend on it` (#2201). 23ai's: the table goes, the views over
+    # it -- and over them -- stay INVALID, ORA-04063 `view "PYO.V" has
+    # errors`, and are VALID again once the table is back; DROP VIEW of one
+    # drops it.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+
+    def states() -> list:
+        return backend.execute(
+            'SELECT object_name, status FROM user_objects '
+            "WHERE object_name IN ('V2201', 'W2201') ORDER BY 1"
+        ).rows
+
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2201 (id NUMBER)')
+        backend.execute('CREATE VIEW v2201 AS SELECT * FROM t2201')
+        backend.execute('CREATE VIEW w2201 AS SELECT id FROM v2201')
+        try:
+            backend.execute('DROP TABLE t2201')
+            assert states() == [('V2201', 'INVALID'), ('W2201', 'INVALID')]
+            with pytest.raises(BackendError) as raised:
+                backend.execute('SELECT * FROM w2201')
+            assert (raised.value.ora_code, str(raised.value)) == (
+                4063,
+                'view "PYO.W2201" has errors',
+            )
+            backend.execute('CREATE TABLE t2201 (id NUMBER)')
+            backend.execute('INSERT INTO t2201 VALUES (1)')
+            assert backend.execute('SELECT id FROM w2201').rows == [(1,)]
+            assert states() == [('V2201', 'VALID'), ('W2201', 'VALID')]
+            backend.execute('DROP TABLE t2201')
+            backend.execute('DROP VIEW w2201')
+            assert states() == [('V2201', 'INVALID')]
+        finally:
+            backend.rollback()
+            for leftover in ('VIEW w2201', 'VIEW v2201', 'TABLE t2201'):
+                with contextlib.suppress(BackendError):
+                    backend.execute(f'DROP {leftover}')
+    finally:
+        backend.close()
+
+
 def test_backend_error_relays_the_parse_position_as_the_offset() -> None:
     # PostgreSQL's 1-based statement_position becomes Oracle's 0-based offset, but
     # only where the dialect rewrite left the prefix before the error untouched.

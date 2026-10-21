@@ -2023,6 +2023,35 @@ _ORACLE_DICTIONARY_DDL = (
     # The numbers of the names Oracle gives a constraint the DDL does not
     # name, SYS_C and seven digits, one counter for all (#2141).
     'CREATE SEQUENCE IF NOT EXISTS sys.ora_constraint_names;'
+    # A view that a DROP took the object it reads from (#2201): Oracle keeps
+    # it, INVALID, until it compiles again. Its schema and name as PostgreSQL
+    # spells them, and PostgreSQL's definition, to make it again from.
+    'CREATE TABLE IF NOT EXISTS sys.ora_invalid_views (schema_name text NOT NULL, '
+    'view_name text NOT NULL, definition text NOT NULL, '
+    'PRIMARY KEY (schema_name, view_name));'
+    # Before a DROP TABLE or DROP VIEW: each view that reads the object, itself
+    # or through another view, recorded and dropped, so the DROP goes ahead and
+    # the views stay, INVALID (#2201). A materialized view among them leaves
+    # the DROP to refuse, as anything else that depends on the object does.
+    'CREATE OR REPLACE FUNCTION sys.ora_invalidate_dependents(target oid) '
+    'RETURNS void LANGUAGE plpgsql AS $$ DECLARE v record; names text; BEGIN '
+    'IF target IS NULL THEN RETURN; END IF; '
+    'FOR v IN WITH RECURSIVE deps(oid) AS (SELECT r.ev_class FROM pg_depend d '
+    'JOIN pg_rewrite r ON r.oid = d.objid '
+    "WHERE d.classid = 'pg_rewrite'::regclass AND d.refclassid = 'pg_class'::regclass "
+    'AND d.refobjid = target AND r.ev_class <> target '
+    'UNION SELECT r.ev_class FROM deps JOIN pg_depend d ON d.refobjid = deps.oid '
+    "AND d.refclassid = 'pg_class'::regclass JOIN pg_rewrite r ON r.oid = d.objid "
+    "WHERE d.classid = 'pg_rewrite'::regclass AND r.ev_class <> deps.oid) "
+    'SELECT n.nspname, c.relname, c.relkind, pg_get_viewdef(c.oid) AS definition '
+    'FROM deps JOIN pg_class c ON c.oid = deps.oid '
+    'JOIN pg_namespace n ON n.oid = c.relnamespace LOOP '
+    "IF v.relkind <> 'v' THEN RETURN; END IF; "
+    'INSERT INTO sys.ora_invalid_views VALUES (v.nspname, v.relname, v.definition) '
+    'ON CONFLICT (schema_name, view_name) DO UPDATE SET definition = EXCLUDED.definition; '
+    "names := concat_ws(', ', names, format('%I.%I', v.nspname, v.relname)); "
+    "END LOOP; IF names IS NOT NULL THEN EXECUTE 'DROP VIEW ' || names; END IF; "
+    'END $$;'
     # A CHECK constraint's condition as its DDL wrote it (#2171), which
     # ALL_CONSTRAINTS gives as SEARCH_CONDITION: PostgreSQL keeps its own
     # rendering of the expression only.
@@ -2379,6 +2408,10 @@ _ORACLE_DICTIONARY_DDL = (
     'JOIN pg_namespace n ON n.nspname = k.name CROSS JOIN LATERAL '
     "(VALUES ('PACKAGE', k.spec), ('PACKAGE BODY', k.body)) t(object_type, status) "
     "WHERE t.status IS NOT NULL AND has_schema_privilege(n.oid, 'USAGE') "
+    # A view a DROP left INVALID (#2201).
+    'UNION ALL SELECT upper(r.schema_name), ora_name(r.view_name), NULL::text, '
+    "0::bigint, 'VIEW', 'INVALID', 'N', 'N', 'N' FROM sys.ora_invalid_views r "
+    "WHERE has_schema_privilege(r.schema_name, 'USAGE') "
     # A user's standalone procedure or function, VALID or INVALID (#1606).
     'UNION ALL SELECT ora_owner(n.nspname), ora_name(p.proname), NULL::text, '
     "p.oid::bigint, CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, "
@@ -2964,6 +2997,10 @@ def _record_owner_tests() -> dict[str, str | None]:
         'ora_collection_elements': owner('pg_type', 'typowner', 'oid', '{t}.typid'),
         'ora_packages': owner('pg_namespace', 'nspowner', 'nspname', '{t}.name'),
         'ora_plsql_types': owner('pg_namespace', 'nspowner', 'nspname', '{t}.package'),
+        # A view a DROP left INVALID, its schema owner's (#2201).
+        'ora_invalid_views': owner(
+            'pg_namespace', 'nspowner', 'nspname', '{t}.schema_name'
+        ),
         # An object's compile errors, its schema owner's (#2060).
         'ora_errors': owner('pg_namespace', 'nspowner', 'nspname', 'lower({t}.owner)'),
         # A unit's source, the same (#2172).
@@ -5058,6 +5095,20 @@ _IS_DDL = re.compile(
 # PostgreSQL waits for ever (#1191). The wait is bounded, briefly rather than not
 # at all, so a lock being released that very moment does not fail the DDL.
 _DDL_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '1s'"
+# A DROP TABLE or DROP VIEW, and the object it drops (#2201).
+_DROP_RELATION = re.compile(r'(?is)\s*DROP\s+(?:TABLE|VIEW)\s+([\w$#.]+)')
+# ORA-04063, a view that does not compile (#2201).
+_ORA_VIEW_HAS_ERRORS = 4063
+# DROP VIEW name, of a view a DROP left INVALID (#2201).
+_DROP_VIEW = re.compile(
+    r'(?is)\s*DROP\s+VIEW\s+([\w$#.]+)(?:\s+CASCADE\s+CONSTRAINTS)?\s*;?\s*$'
+)
+
+
+def _quoted_identifier(name: str) -> str:
+    # A PostgreSQL name as a quoted identifier.
+    return '"' + name.replace('"', '""') + '"'
+
 
 # Transaction control sent as SQL text (#1181). Every other statement runs inside
 # the `_mirror_stmt` savepoint (see execute), and these cannot: a COMMIT or
@@ -15276,7 +15327,11 @@ class PostgresBackend:
         # table or view, schema and all, where the statement may name neither
         # (`table or view "PYO"."T" does not exist`); earlier ones do not. An
         # unquoted name is upper-cased, as Oracle folds one; the schema the
-        # statement did not give is the session's current one.
+        # statement did not give is the session's current one. A view a DROP
+        # left INVALID is ORA-04063, `view "PYO.V" has errors` (#2201).
+        invalid = self._invalid_view(missing)
+        if invalid is not None:
+            return invalid
         if self._release < (23, 0):
             return missing
         schema = missing.schema
@@ -15543,6 +15598,8 @@ class PostgresBackend:
         dba = self._dba_statement(sql)
         if dba is not None:
             return dba
+        if (gone := self._dropped_invalid_view(sql)) is not None:
+            return gone
         users = self._user_statement(sql)
         if users is not None:
             return users
@@ -15712,9 +15769,17 @@ class PostgresBackend:
         if self._use_pipeline and not is_ddl and not hoisted:
             result = self._execute_pipelined(sql, params, original, fallback)
         elif is_ddl:
+            prelude = _DDL_LOCK_TIMEOUT
+            dropping = _DROP_RELATION.match(sql)
+            if dropping is not None:
+                # The views over it stay, INVALID (#2201).
+                prelude += (
+                    '; SELECT sys.ora_invalidate_dependents('
+                    f'sys.ora_regclass({_sql_text(dropping.group(1))}))'
+                )
             try:
                 result = self._execute_sequential(
-                    sql, params, original, prelude=_DDL_LOCK_TIMEOUT
+                    sql, params, original, prelude=prelude
                 )
             except BackendError as error:
                 invalid = self._create_invalid(original, error)
@@ -15747,6 +15812,7 @@ class PostgresBackend:
             self._record_column_types(original)
             self._record_annotations(annotated)
             self._record_check_conditions(checks)
+            self._revalidate_views()
             self._relations.clear()
             self._relids.clear()
             self._collection_name_cache = None  # a type may have come or gone
@@ -17065,6 +17131,98 @@ class PostgresBackend:
             (pg_oid,),
         ).fetchone()
         return (row[0], row[1]) if row else None
+
+    def _dropped_invalid_view(self, statement: str) -> Result | None:
+        # DROP VIEW of a view a DROP left INVALID (#2201): there is no view to
+        # drop, only its record, which goes as Oracle drops an invalid view.
+        # None for any other statement, or a view that is there.
+        dropped = _DROP_VIEW.match(statement)
+        if dropped is None:
+            return None
+        row = self._conn.execute(
+            'SELECT sys.ora_regclass(%s) IS NULL', (dropped.group(1),)
+        ).fetchone()
+        if row is None or not row[0]:
+            return None
+        parts = dropped.group(1).lower().split('.')
+        deleted = self._conn.execute(
+            'DELETE FROM sys.ora_invalid_views WHERE schema_name = '
+            'coalesce(%s, current_schema()) AND view_name = %s',
+            (parts[0] if len(parts) == 2 else None, parts[-1]),
+        ).rowcount
+        if not deleted:
+            self._conn.rollback()
+            return None
+        self.commit()
+        return Result()
+
+    def _invalid_view(self, missing: _ObjectMissing) -> BackendError | None:
+        # ORA-04063 for a relation that is a view a DROP left INVALID (#2201),
+        # else None.
+        if self._conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
+            return None
+        try:
+            row = self._catalog_read(
+                'SELECT r.schema_name, r.view_name FROM sys.ora_invalid_views r '
+                'WHERE r.schema_name = coalesce(%s, current_schema()) '
+                'AND r.view_name = %s',
+                (missing.schema, missing.relation),
+            ).fetchone()
+        except psycopg.Error:
+            return None
+        if row is None:
+            return None
+        (schema, name) = (
+            row[0].upper(),
+            row[1].upper() if row[1] == row[1].lower() else row[1],
+        )
+        return BackendError(
+            f'view "{schema}.{name}" has errors',
+            ora_code=_ORA_VIEW_HAS_ERRORS,
+            error_offset=missing.error_offset,
+        )
+
+    def _revalidate_views(self) -> None:
+        # After a committed DDL: each view a DROP left INVALID made again from
+        # its definition where it compiles now -- its objects are back -- and
+        # VALID, its record gone; one a CREATE took the name of goes too
+        # (#2201). Again until none more compiles, for a view over another. On
+        # its own, like the other records, so a failure here cannot take the
+        # DDL with it.
+        try:
+            pending = self._conn.execute(
+                'SELECT schema_name, view_name, definition, '
+                "to_regclass(quote_ident(schema_name) || '.' || quote_ident(view_name)) "
+                'IS NOT NULL FROM sys.ora_invalid_views'
+            ).fetchall()
+            self._conn.commit()
+        except psycopg.Error:
+            self._conn.rollback()
+            return
+        made = True
+        while pending and made:
+            made = False
+            for entry in list(pending):
+                (schema, name, definition, taken) = entry
+                qualified = f'{_quoted_identifier(schema)}.{_quoted_identifier(name)}'
+                try:
+                    if not taken:
+                        self._conn.execute(
+                            f'CREATE VIEW {qualified} AS {definition.strip().rstrip(";")}'
+                        )
+                    self._conn.execute(
+                        'DELETE FROM sys.ora_invalid_views '
+                        'WHERE schema_name = %s AND view_name = %s',
+                        (schema, name),
+                    )
+                    if not taken:
+                        self._record_view_column_types(qualified)
+                    self._conn.commit()
+                except psycopg.Error:
+                    self._conn.rollback()
+                    continue
+                pending.remove(entry)
+                made = True
 
     def _record_view_column_types(self, name: str) -> None:
         # A view's columns take the records of the columns they come from
