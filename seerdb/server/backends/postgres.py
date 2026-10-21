@@ -1922,6 +1922,12 @@ _ORACLE_DICTIONARY_DDL = (
     "text text NOT NULL, attribute text NOT NULL DEFAULT 'ERROR', "
     'message_number integer NOT NULL DEFAULT 0, '
     'PRIMARY KEY (owner, name, type, sequence));'
+    # Each stored unit's source as it was created (#2172), from its keyword
+    # on, which ALL_SOURCE lists a line at a time; a unit created with
+    # compilation errors keeps its source, as Oracle's does.
+    'CREATE TABLE IF NOT EXISTS sys.ora_source ('
+    'owner text NOT NULL, name text NOT NULL, type text NOT NULL, '
+    'text text NOT NULL, PRIMARY KEY (owner, name, type));'
     # The types a package declares (#1607), each a PostgreSQL type of its
     # schema, with the PL/SQL it was declared as -- what the dictionary and a
     # client's type metadata report -- in declaration order. A body's own types
@@ -2308,6 +2314,18 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE OR REPLACE VIEW sys.user_errors AS SELECT name, type, sequence, '
     'line, position, text, attribute, message_number FROM sys.all_errors '
     'WHERE owner = upper(current_schema());'
+    # ALL_SOURCE (#2172): a unit's source a line at a time, each line but the
+    # last ending in its newline, for the units ALL_OBJECTS still lists -- so
+    # a DROP takes its rows, and the session's privileges apply.
+    'CREATE OR REPLACE VIEW sys.all_source AS SELECT s.owner, s.name, s.type, '
+    'l.n::integer AS line, l.m[1] AS text, 0 AS origin_con_id FROM sys.ora_source s '
+    "CROSS JOIN LATERAL regexp_matches(s.text, '[^' || chr(10) || ']*' || chr(10) "
+    "|| '|[^' || chr(10) || ']+$', 'g') WITH ORDINALITY AS l(m, n) "
+    'WHERE EXISTS (SELECT 1 FROM all_objects o WHERE o.owner = s.owner '
+    'AND o.object_name = s.name AND o.object_type = s.type);'
+    'CREATE OR REPLACE VIEW sys.dba_source AS SELECT * FROM sys.all_source;'
+    'CREATE OR REPLACE VIEW sys.user_source AS SELECT name, type, line, text, '
+    'origin_con_id FROM sys.all_source WHERE owner = upper(current_schema());'
     # SYSTEM.PRODUCT_PRIVS (#2107): the SQL*Plus product profile that sqlplus
     # 10.2 and 11.2 read at login, with its columns and no rows, as a database
     # whose administrator restricted nothing has it. Without it every session
@@ -2793,6 +2811,8 @@ def _record_owner_tests() -> dict[str, str | None]:
         'ora_plsql_types': owner('pg_namespace', 'nspowner', 'nspname', '{t}.package'),
         # An object's compile errors, its schema owner's (#2060).
         'ora_errors': owner('pg_namespace', 'nspowner', 'nspname', 'lower({t}.owner)'),
+        # A unit's source, the same (#2172).
+        'ora_source': owner('pg_namespace', 'nspowner', 'nspname', 'lower({t}.owner)'),
         'ora_grants': grants,
         # A column's, the same (#1946).
         'ora_col_grants': grants,
@@ -9410,6 +9430,32 @@ def _guarded_body(block: str) -> str:
 _SOURCE_START = re.compile(
     r'(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:NON)?EDITIONABLE\s+)?'
 )
+# A stored unit, past _SOURCE_START: its kind and its name, perhaps the
+# schema's too (#2172).
+_STORED_UNIT_HEAD = re.compile(
+    r'(?is)(PROCEDURE|FUNCTION|PACKAGE\s+BODY|PACKAGE|TYPE\s+BODY|TYPE|TRIGGER)\s+'
+    r'(?:("[^"]+"|[A-Za-z_][\w$#]*)\s*\.\s*)?("[^"]+"|[A-Za-z_][\w$#]*)'
+)
+
+
+def _stored_unit(sql: str) -> tuple[str | None, str, str, str] | None:
+    """A CREATE of a stored unit as ALL_SOURCE lists it -- owner or None for
+    the session's schema, name, type and the source from its keyword on -- or
+    None for any other statement (#2172). A name is Oracle's: upper case
+    unless quoted."""
+    start = _SOURCE_START.match(sql)
+    head = _STORED_UNIT_HEAD.match(sql, start.end()) if start else None
+    if head is None:
+        return None
+
+    def oracle_name(name: str) -> str:
+        return name[1:-1] if name.startswith('"') else name.upper()
+
+    owner = oracle_name(head.group(2)) if head.group(2) else None
+    kind = ' '.join(head.group(1).upper().split())
+    return (owner, oracle_name(head.group(3)), kind, sql[head.start() :])
+
+
 # A PL/SQL compile error the backend wrote as Oracle does (#1497).
 _PLS_PLACE = re.compile(r'line (\d+), column (\d+):\n(PLS-(\d+): .*)', re.DOTALL)
 
@@ -14915,6 +14961,7 @@ class PostgresBackend:
             self._user_savepoint = False
             self._prune_records()
             self._follow_grants(original)
+            self._record_source(original)
             self._record_quoted_names(original)
             self._record_tstz_precisions(original)
             self._record_visibility(visibility)
@@ -16212,6 +16259,33 @@ class PostgresBackend:
                 + sql[star.start(4) :]
             )
         return sql
+
+    def _record_source(self, statement: str) -> None:
+        # After a committed CREATE of a stored unit, valid or created with
+        # compilation errors: keep its source for ALL_SOURCE (#2172), in place
+        # of what it had. Done after the commit and on its own, so a failure
+        # here cannot take the unit with it; a dropped unit's rows go too.
+        unit = _stored_unit(statement)
+        if unit is None:
+            return
+        (owner, name, kind, source) = unit
+        owner_sql = '%s' if owner else 'sys.ora_owner(current_schema())'
+        params: list = [owner] if owner else []
+        try:
+            self._conn.execute(
+                'DELETE FROM sys.ora_source s WHERE NOT EXISTS (SELECT 1 FROM '
+                'all_objects o WHERE o.owner = s.owner AND o.object_name = s.name '
+                'AND o.object_type = s.type)'
+            )
+            self._conn.execute(
+                'INSERT INTO sys.ora_source (owner, name, type, text) '
+                f'VALUES ({owner_sql}, %s, %s, %s) ON CONFLICT (owner, name, type) '
+                'DO UPDATE SET text = EXCLUDED.text',
+                (*params, name, kind, source),
+            )
+            self._conn.commit()
+        except psycopg.Error:
+            self._conn.rollback()
 
     def _record_quoted_names(self, statement: str) -> None:
         # After a committed CREATE TABLE: note which of its columns were created
