@@ -2044,6 +2044,45 @@ def test_translate_idioms_negates_whole_day_to_second_interval() -> None:
     assert pos == "INTERVAL '5 04:03:02.123456' DAY TO SECOND"
 
 
+def test_a_computed_interval_has_oracles_precisions() -> None:
+    # A computed interval described with precision and scale 0 (#2139).
+    # Oracle gives every one a leading precision of 9, and a DAY TO SECOND
+    # 6 fractional digits for a difference of timestamps, 9 for the rest. A
+    # column and a literal keep their own. Measured on 23ai.
+    from seerdb.server.backends.postgres import _top_level_subtraction
+
+    assert _top_level_subtraction('ts - ts')
+    assert _top_level_subtraction('(a + b) - c x')
+    assert not _top_level_subtraction('-ts')
+    assert not _top_level_subtraction("numtodsinterval(1 - 2, 'DAY')")
+    assert not _top_level_subtraction("'a-b'")
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute(
+            'CREATE TABLE t2139 (ts TIMESTAMP, ids INTERVAL DAY(3) TO SECOND(2))'
+        )
+        try:
+            for expression, expected in (
+                ('systimestamp - systimestamp', (9, 6)),
+                ('ts - ts', (9, 6)),
+                ("numtodsinterval(1.5, 'DAY')", (9, 9)),
+                ("interval '1' day + interval '2' hour", (9, 9)),
+                ('ids * 2', (9, 9)),
+                ("to_dsinterval('1 02:03:04')", (9, 9)),
+                ('ids', (3, 2)),
+                ("interval '2 03:04:05' day to second", (2, 6)),
+            ):
+                (column,) = backend.execute(f'SELECT {expression} FROM t2139').columns
+                assert (column.precision, column.scale) == expected, expression
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2139')
+    finally:
+        backend.close()
+
+
 def test_an_interval_literal_is_oracles() -> None:
     # A YEAR TO MONTH literal is one, with its months, where it was a DAY TO
     # SECOND of 425 days; a leading precision PostgreSQL's syntax refuses goes;

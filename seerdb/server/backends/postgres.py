@@ -7989,6 +7989,35 @@ def _interval_literal_items(sql: str) -> dict[int, tuple[int, int]]:
     return found
 
 
+# A computed interval's leading precision, and the fractional digits of one
+# that is no difference of timestamps (#2139).
+_COMPUTED_INTERVAL_DIGITS = 9
+
+
+def _top_level_subtraction(item: str) -> bool:
+    """Whether a select-list item subtracts at its top level: a `-` outside
+    parentheses, literals and comments that follows an operand (#2139)."""
+    depth = 0
+    operand = False
+    for token in sql_tokens(item):
+        text = item[token.start : token.end]
+        if token.kind in ('space', 'comment'):
+            continue
+        if text == '(':
+            depth += 1
+        elif text == ')':
+            depth -= 1
+            operand = depth == 0
+            continue
+        if depth == 0:
+            if text == '-' and operand:
+                return True
+            operand = token.kind in ('word', 'identifier', 'string', 'bind') or (
+                token.kind == 'other' and text.isdigit()
+            )
+    return False
+
+
 def _lob_substr_items(sql: str) -> set[int]:
     """The select-list positions of a query that are one DBMS_LOB.SUBSTR call,
     optionally aliased (#2056)."""
@@ -16341,6 +16370,27 @@ class PostgresBackend:
                 elif precision is not None:
                     columns[i] = replace(
                         columns[i], precision=precision, scale=scale or 0
+                    )
+            # A computed interval, neither a column nor a literal (#2139): a
+            # leading precision of 9, as Oracle gives every one, and for a DAY
+            # TO SECOND 6 fractional digits for a difference -- of timestamps,
+            # the only subtraction that gives one -- and 9 for the rest.
+            # Measured on 23ai.
+            items = _select_list_items(original) if original else []
+            for i, col in enumerate(columns):
+                if (
+                    col.data_type in (TNS_TYPE_INTERVALDS, TNS_TYPE_INTERVALYM)
+                    and not cursor.pgresult.ftable(i)
+                    and not col.precision
+                ):
+                    if col.data_type == TNS_TYPE_INTERVALYM:
+                        scale = 0
+                    elif i < len(items) and _top_level_subtraction(items[i]):
+                        scale = _DEFAULT_FRACTIONAL_PRECISION
+                    else:
+                        scale = _COMPUTED_INTERVAL_DIGITS
+                    columns[i] = replace(
+                        col, precision=_COMPUTED_INTERVAL_DIGITS, scale=scale
                     )
             # An INTERVAL literal, by its own qualifiers (#2108).
             literals = _interval_literal_items(original) if original else {}
