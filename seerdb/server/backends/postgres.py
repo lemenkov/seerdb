@@ -1112,6 +1112,25 @@ _HELPER_FUNCTIONS_DDL = (
     'THEN sys.ora_number_text($1::text::numeric) ELSE $1::text END $$;'
     'CREATE OR REPLACE FUNCTION to_char(numeric) RETURNS text '
     'LANGUAGE sql IMMUTABLE AS $$ SELECT sys.ora_number_text($1) $$;'
+    # A NUMBER as PL/SQL converts it to text (#2181), which is not SQL's
+    # TO_CHAR: no 40-character limit -- 1/3 is forty 3s, 1e40 its 41 digits --
+    # the plain form up to 100 characters, as 23ai prints it; past that,
+    # SQL's scientific form, where 23ai pads the mantissa out to 100.
+    'CREATE OR REPLACE FUNCTION sys.ora_plsql_number_text(numeric) RETURNS text '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT CASE WHEN length(t) <= 100 '
+    'THEN t ELSE sys.ora_number_text($1) END FROM (SELECT regexp_replace('
+    "trim_scale($1)::text, '^(-?)0[.]', '\\1.') AS t) s $$;"
+    # DBMS_OUTPUT.PUT_LINE / PUT of a number: orafce's take text, which an
+    # integer has no implicit cast to, so `put_line(1)` was PLS-00306.
+    # Oracle converts it as above: `1.50` as `1.5`, `-0.5` as `-.5`. Beside
+    # orafce's, where it is installed.
+    'DO $d$ BEGIN '
+    'CREATE OR REPLACE FUNCTION dbms_output.put_line(numeric) RETURNS void '
+    'LANGUAGE sql AS $f$ SELECT dbms_output.put_line('
+    'sys.ora_plsql_number_text($1)) $f$; '
+    'CREATE OR REPLACE FUNCTION dbms_output.put(numeric) RETURNS void '
+    'LANGUAGE sql AS $f$ SELECT dbms_output.put(sys.ora_plsql_number_text($1)) $f$; '
+    'EXCEPTION WHEN invalid_schema_name THEN NULL; END $d$;'
     'CREATE OR REPLACE FUNCTION ora_concat(text, anynonarray) RETURNS text '
     'LANGUAGE sql STABLE AS $$ SELECT ora_concat($1, sys.ora_text($2)) $$;'
     'CREATE OR REPLACE FUNCTION ora_concat(anynonarray, text) RETURNS text '

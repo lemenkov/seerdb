@@ -4327,8 +4327,10 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # two-argument concat (#2093), sys.ora_late's two (#2138),
     # sys.ora_number_text, sys.ora_text and to_char(numeric) (#2146), and
     # sys.ora_late_number (#2143), and numtoyminterval (#2153), and
-    # sys.ora_to_char and to_char(timestamp, text) (#2167).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 108
+    # sys.ora_to_char and to_char(timestamp, text) (#2167), and
+    # sys.ora_plsql_number_text with DBMS_OUTPUT's PUT_LINE and PUT of a
+    # number (#2181).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 111
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
@@ -11532,6 +11534,35 @@ def test_a_call_with_literal_arguments_passes_them() -> None:
             for _ in range(3)
         ]
         assert lines == [["it's literal", 0], ['bound', 0], [None, 1]]
+    finally:
+        backend.close()
+
+
+def test_put_line_prints_a_number_as_plsql_converts_it() -> None:
+    # DBMS_OUTPUT.PUT_LINE(1) was PLS-00306: orafce's takes text (#2181).
+    # 23ai converts the NUMBER as PL/SQL does, not as SQL's TO_CHAR: no
+    # leading zero, no trailing zeros, and no 40-character limit.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('BEGIN DBMS_OUTPUT.ENABLE(NULL); END;', [])
+        backend.execute(
+            'BEGIN DBMS_OUTPUT.PUT_LINE(1); DBMS_OUTPUT.PUT_LINE(1.50); '
+            'DBMS_OUTPUT.PUT_LINE(-0.5); DBMS_OUTPUT.PUT_LINE(1e40); '
+            'DBMS_OUTPUT.PUT_LINE(1/3); DBMS_OUTPUT.PUT(7); DBMS_OUTPUT.PUT(8.0); '
+            'DBMS_OUTPUT.NEW_LINE; END;',
+            [],
+        )
+        ((lines,),) = backend.execute(
+            "SELECT array_to_string(lines, '|') FROM dbms_output.get_lines(10)"
+        ).rows
+        assert lines.split('|') == [
+            '1',
+            '1.5',
+            '-.5',
+            '1' + '0' * 40,
+            '.' + '3' * 40,
+            '78',
+        ]
     finally:
         backend.close()
 
