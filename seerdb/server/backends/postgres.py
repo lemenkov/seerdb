@@ -8597,11 +8597,16 @@ def _concatenated_columns(sql: str) -> list[tuple[int, int, list[str]]]:
     return found
 
 
+# The character types a CAST makes a DATE or TIMESTAMP text as (#2162).
+_CHARACTER_CASTS = frozenset({'VARCHAR2', 'VARCHAR', 'CHAR', 'NVARCHAR2', 'NCHAR'})
+
+
 @_kept_per_text
 def _converted_columns(sql: str) -> list[tuple[int, int, list[str]]]:
     """The names `sql` converts to text without a format, as
-    _concatenated_columns gives them: those, and the one argument of
-    TO_CHAR(c) (#2162)."""
+    _concatenated_columns gives them: those, the one argument of TO_CHAR(c),
+    and the value of CAST(c AS VARCHAR2(n)) or another character type
+    (#2162)."""
     spans = _bind_spans(sql)
     sig = [i for i, span in enumerate(spans) if span[0] not in ('space', 'comment')]
 
@@ -8610,7 +8615,8 @@ def _converted_columns(sql: str) -> list[tuple[int, int, list[str]]]:
 
     found = list(_concatenated_columns(sql))
     for k in range(len(sig) - 3):
-        if text(k).upper() != 'TO_CHAR' or text(k + 1) != '(' or text(k - 1) == '.':
+        call = text(k).upper()
+        if call not in ('TO_CHAR', 'CAST') or text(k + 1) != '(' or text(k - 1) == '.':
             continue
         last = k + 2
         if spans[sig[last]][0] not in ('word', 'identifier'):
@@ -8623,7 +8629,12 @@ def _converted_columns(sql: str) -> list[tuple[int, int, list[str]]]:
         ):
             parts.append(text(last + 2))
             last += 2
-        if text(last + 1) == ')':
+        if (
+            text(last + 1) == ')'
+            if call == 'TO_CHAR'
+            else text(last + 1).upper() == 'AS'
+            and text(last + 2).upper() in _CHARACTER_CASTS
+        ):
             found.append((sig[k + 2], sig[last], parts))
     return found
 
@@ -8707,7 +8718,13 @@ def _typed_datetime_operands(sql: str) -> list[tuple[int, int, int]]:
             and text(k - 1) in ('(', ',')
             and text(last + 1) in (',', ')')
         ) or (inside[k] == 'TO_CHAR' and text(k - 1) == '(' and text(last + 1) == ')')
-        if joined or argument:
+        cast = (
+            inside[k] == 'CAST'
+            and text(k - 1) == '('
+            and text(last + 1).upper() == 'AS'
+            and text(last + 2).upper() in _CHARACTER_CASTS
+        )
+        if joined or argument or cast:
             found.append((sig[k], sig[last], precision))
     return found
 
@@ -15945,14 +15962,18 @@ class PostgresBackend:
     def _datetime_text_operands(self, sql: str) -> str:
         """`sql` with each DATE or TIMESTAMP column it converts to text
         without a format -- an operand of || or CONCAT, the argument of
-        TO_CHAR(c) -- as Oracle's text of it, sys.ora_datetime_text(col, p)
-        (#2162), and each value whose type its text says. PostgreSQL's text was its own, `2024-01-02 13:14:15`, and
-        orafce's TO_CHAR(ts) printed a TIMESTAMP as a DATE. A function over
-        the value sees neither the DATE domain nor the precision, so the
-        column's type comes from the schema model. A name that is no column
-        of the query's FROM tables, or is one of more than one, is left."""
+        TO_CHAR(c), the value of a CAST to a character type -- as Oracle's
+        text of it, sys.ora_datetime_text(col, p) (#2162), and each value
+        whose type its text says. PostgreSQL's text was its own,
+        `2024-01-02 13:14:15`, and orafce's TO_CHAR(ts) printed a TIMESTAMP as
+        a DATE. A function over the value sees neither the DATE domain nor the
+        precision, so the column's type comes from the schema model. A name
+        that is no column of the query's FROM tables, or is one of more than
+        one, is left."""
         lowered = sql.lower()
-        if '||' not in sql and 'concat' not in lowered and 'to_char' not in lowered:
+        if '||' not in sql and not any(
+            word in lowered for word in ('concat', 'to_char', 'cast')
+        ):
             return sql
         # A literal, SYSDATE, TO_DATE or CAST says its own type.
         wraps = list(_typed_datetime_operands(sql))
