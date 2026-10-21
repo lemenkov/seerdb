@@ -1988,6 +1988,12 @@ _ORACLE_DICTIONARY_DDL = (
     # The numbers of the names Oracle gives a constraint the DDL does not
     # name, SYS_C and seven digits, one counter for all (#2141).
     'CREATE SEQUENCE IF NOT EXISTS sys.ora_constraint_names;'
+    # A CHECK constraint's condition as its DDL wrote it (#2171), which
+    # ALL_CONSTRAINTS gives as SEARCH_CONDITION: PostgreSQL keeps its own
+    # rendering of the expression only.
+    'CREATE TABLE IF NOT EXISTS sys.ora_check_conditions ('
+    'relid oid NOT NULL, conname text NOT NULL, condition text NOT NULL, '
+    'PRIMARY KEY (relid, conname));'
     # The types a package declares (#1607), each a PostgreSQL type of its
     # schema, with the PL/SQL it was declared as -- what the dictionary and a
     # client's type metadata report -- in declaration order. A body's own types
@@ -2483,6 +2489,11 @@ _ORACLE_DICTIONARY_DDL = (
     # A NOT NULL's condition as Oracle writes it, the column quoted (#2171).
     "CASE WHEN nn.attnum IS NOT NULL THEN '\"' || "
     "ora_column_name(nn.attrelid::regclass, nn.attname) || '\" IS NOT NULL' "
+    # A CHECK's as written (#2171).
+    "WHEN tc.constraint_type = 'CHECK' THEN (SELECT k.condition "
+    'FROM sys.ora_check_conditions k WHERE k.relid = to_regclass('
+    "quote_ident(tc.table_schema) || '.' || quote_ident(tc.table_name)) "
+    'AND k.conname = tc.constraint_name) '
     'END::text AS search_condition, '
     'upper(rc.unique_constraint_schema) AS r_owner, '
     'ora_name(rc.unique_constraint_name) AS r_constraint_name, '
@@ -2912,6 +2923,7 @@ def _record_owner_tests() -> dict[str, str | None]:
         'ora_tstz_precision': relation,
         'ora_quoted_names': relation,
         'ora_object_tables': relation,
+        'ora_check_conditions': relation,
         'ora_collection_elements': owner('pg_type', 'typowner', 'oid', '{t}.typid'),
         'ora_packages': owner('pg_namespace', 'nspowner', 'nspname', '{t}.name'),
         'ora_plsql_types': owner('pg_namespace', 'nspowner', 'nspname', '{t}.package'),
@@ -6331,6 +6343,53 @@ def _unnamed_constraints(sql: str) -> list[int]:
             continue
         found.append(at)
     return found
+
+
+def _check_conditions(sql: str) -> tuple[str, list[tuple[str, str]]] | None:
+    """The table a CREATE TABLE or ALTER TABLE names, as written, and each
+    CHECK constraint it declares -- its name as PostgreSQL spells it and its
+    condition as written between the parentheses, as Oracle keeps it (#2171).
+    Run once _named_constraints has named every constraint; None for no
+    CHECK."""
+    if not _CONSTRAINT_DDL.match(sql):
+        return None
+    tokens = [
+        token for token in sql_tokens(sql) if token.kind not in ('space', 'comment')
+    ]
+
+    def text(k: int) -> str:
+        return sql[tokens[k].start : tokens[k].end] if 0 <= k < len(tokens) else ''
+
+    at = next((k + 1 for k in range(len(tokens)) if text(k).upper() == 'TABLE'), None)
+    if at is None or at >= len(tokens):
+        return None
+    last = at
+    while text(last + 1) == '.' and last + 2 < len(tokens):
+        last += 2
+    table = sql[tokens[at].start : tokens[last].end]
+    found: list[tuple[str, str]] = []
+    for k in range(last + 1, len(tokens) - 3):
+        if not (
+            text(k).upper() == 'CONSTRAINT'
+            and text(k + 2).upper() == 'CHECK'
+            and text(k + 3) == '('
+        ):
+            continue
+        depth = 0
+        for close in range(k + 3, len(tokens)):
+            depth += (text(close) == '(') - (text(close) == ')')
+            if depth == 0:
+                break
+        else:
+            continue
+        name = text(k + 1)
+        found.append(
+            (
+                name[1:-1] if name.startswith('"') else name.lower(),
+                sql[tokens[k + 3].end : tokens[close].start],
+            )
+        )
+    return (table, found) if found else None
 
 
 def _translate_ddl(sql: str) -> str:
@@ -15227,6 +15286,7 @@ class PostgresBackend:
         sql = _ruled('admin', _translate_admin(sql), sql)
         sql = _ruled('instant-index', self._instant_index_keys(sql), sql)
         sql = _ruled('constraint-names', self._named_constraints(sql), sql)
+        checks = _check_conditions(sql)
         sql = _ruled('ddl', _translate_ddl(sql), sql)
         sql = _ruled(
             'routine-ddl',
@@ -15317,6 +15377,7 @@ class PostgresBackend:
             self._record_visibility(visibility)
             self._record_column_types(original)
             self._record_annotations(annotated)
+            self._record_check_conditions(checks)
             self._relations.clear()
             self._relids.clear()
             self._collection_name_cache = None  # a type may have come or gone
@@ -16346,6 +16407,11 @@ class PostgresBackend:
                 'DELETE FROM sys.ora_collection_elements x WHERE NOT EXISTS '
                 '(SELECT 1 FROM pg_type t WHERE t.oid = x.typid)'
             )
+        # A CHECK's condition goes with its constraint (#2171).
+        prunes.append(
+            'DELETE FROM sys.ora_check_conditions k WHERE NOT EXISTS (SELECT 1 '
+            'FROM pg_constraint c WHERE c.conrelid = k.relid AND c.conname = k.conname)'
+        )
         # A column grant goes with its column, and its table (#1946).
         prunes.append(
             'DELETE FROM sys.ora_col_grants g WHERE NOT EXISTS (SELECT 1 '
@@ -16665,6 +16731,29 @@ class PostgresBackend:
         for at, (number,) in zip(reversed(starts), reversed(numbers)):
             sql = f'{sql[:at]}CONSTRAINT SYS_C{number:07d} {sql[at:]}'
         return sql
+
+    def _record_check_conditions(
+        self, checks: tuple[str, list[tuple[str, str]]] | None
+    ) -> None:
+        # After a committed CREATE TABLE or ALTER TABLE: keep each CHECK's
+        # condition as written (#2171), in place of what a constraint of its
+        # name had. On its own, so a failure here cannot take the table with it.
+        if checks is None:
+            return
+        (table, found) = checks
+        try:
+            for name, condition in found:
+                self._conn.execute(
+                    'INSERT INTO sys.ora_check_conditions (relid, conname, condition) '
+                    'SELECT c.conrelid, c.conname, %s FROM pg_constraint c '
+                    'WHERE c.conrelid = to_regclass(%s) AND c.conname = %s '
+                    'ON CONFLICT (relid, conname) DO UPDATE '
+                    'SET condition = EXCLUDED.condition',
+                    (condition, table, name),
+                )
+            self._conn.commit()
+        except psycopg.Error:
+            self._conn.rollback()
 
     def _record_source(self, statement: str) -> None:
         # After a committed CREATE of a stored unit, valid or created with
