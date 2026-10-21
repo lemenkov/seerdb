@@ -9558,12 +9558,18 @@ def _routine_rights(name: str, authid: str | None) -> str:
 
 
 def _translate_routine_ddl(
-    sql: str, user_routines: frozenset[str] | None = None, mark: bool = True
+    sql: str,
+    user_routines: frozenset[str] | None = None,
+    mark: bool = True,
+    routine_kind: Callable[[str], str | None] | None = None,
 ) -> str:
     """Rewrite an Oracle ``CREATE PROCEDURE`` / ``CREATE FUNCTION`` to a PL/pgSQL
     routine (#503): translate the parameter types + ``IN OUT`` → ``INOUT``, map
     ``RETURN t`` → ``RETURNS t``, and wrap the ``BEGIN … END`` body as a
-    ``LANGUAGE plpgsql`` dollar-quoted body. Non-routine SQL is unchanged."""
+    ``LANGUAGE plpgsql`` dollar-quoted body. Non-routine SQL is unchanged.
+    With ``routine_kind``, a statement of the body that is a bare call becomes
+    one PL/pgSQL runs (:func:`_perform_bare_calls`), a call of the routine
+    itself among them (#2180)."""
     head = _ROUTINE_HEAD.match(sql)
     if head is None:
         return sql
@@ -9593,6 +9599,15 @@ def _translate_routine_ddl(
     # IF EXISTS so the first CREATE is fine (#521).
     drop = f'DROP {kind.upper()} IF EXISTS {name};'
     block = _routine_body(body)
+    if routine_kind is not None:
+        # The routine itself may not exist yet, a first CREATE's: its own
+        # name is its own kind.
+        own = {name.lower(), name.lower().rpartition('.')[2]}
+        itself = 'f' if kind.upper() == 'FUNCTION' else 'p'
+        block = _perform_bare_calls(
+            block,
+            lambda word: itself if word.lower() in own else routine_kind(word),
+        )
     if (
         kind.upper() == 'FUNCTION'
         and user_routines is not None
@@ -10194,6 +10209,7 @@ def _package_routine(
     member: _PackageMember,
     body: str,
     user_routines: frozenset[str] | None = None,
+    routine_kind: Callable[[str], str | None] | None = None,
 ) -> str:
     # One member as a routine in the package's schema: the routine translation,
     # without its drop by name -- a package's members may share a name.
@@ -10204,6 +10220,7 @@ def _package_routine(
         f'CREATE OR REPLACE {member.kind} {name}{params}{returns} IS {body}',
         user_routines,
         mark=False,
+        routine_kind=routine_kind,
     )
     return translated.removeprefix(f'DROP {member.kind} IF EXISTS {name}; ')
 
@@ -10260,6 +10277,7 @@ def _translate_package_ddl(
     sql: str,
     spec_index_types: Callable[[str], dict[str, str]] | None = None,
     user_routines: Callable[[], frozenset[str]] | None = None,
+    routine_kind: Callable[[str], str | None] | None = None,
 ) -> str:
     """A PL/SQL package's DDL as a schema of its name (#1605).
 
@@ -10276,6 +10294,10 @@ def _translate_package_ddl(
     ``spec_index_types`` gives, for a package, the index-by table types its
     spec declared -- name -> PostgreSQL type -- which a body indexes but does
     not declare itself (#1607).
+
+    ``routine_kind`` gives what PostgreSQL has under a name a member calls as
+    a statement; the body's own members, which may not exist yet, are their
+    own kinds (#2180).
     """
     dropped = _DROP_PACKAGE.match(sql)
     if dropped is not None:
@@ -10328,6 +10350,15 @@ def _translate_package_ddl(
             names = user_routines() | {
                 m.name.lower() for m in members if m.kind in routine_kinds
             }
+        member_kind = None
+        if routine_kind is not None:
+            kinds = {}
+            for m in members:
+                if m.kind in routine_kinds:
+                    called = 'f' if m.kind == 'FUNCTION' else 'p'
+                    kinds[m.name.lower()] = called
+                    kinds[f'{package}.{m.name.lower()}'] = called
+            member_kind = lambda word: kinds.get(word.lower()) or routine_kind(word)  # noqa: E731
         routines = [
             _package_routine(
                 package,
@@ -10336,6 +10367,7 @@ def _translate_package_ddl(
                     m.body, _routine_index_tables(package, m, index_types)
                 ),
                 names,
+                member_kind,
             )
             for m in members
             if m.kind in routine_kinds and m.body is not None
@@ -10655,6 +10687,15 @@ _BLOCK_KEYWORDS = frozenset(
 )
 
 
+def _call_ends(body: str, end: int) -> bool:
+    # Whether the argument list after a name at `end` ends its statement, as a
+    # call's does: `p(1);`, where `a(1) := 2;` and `a(1).n := 2;` assign to an
+    # element (#2180).
+    open_at = body.index('(', end)
+    close = _matching_paren(body, open_at)
+    return body[close + 1 :].lstrip()[:1] == ';'
+
+
 def _perform_bare_calls(body: str, routine_kind: Callable[[str], str | None]) -> str:
     """``body`` with each statement that is a bare call made one PL/pgSQL runs.
 
@@ -10695,7 +10736,7 @@ def _perform_bare_calls(body: str, routine_kind: Callable[[str], str | None]) ->
             start
             and upper not in _BLOCK_KEYWORDS
             and upper not in _STATEMENT_OPENERS
-            and rest[:1] in ('(', ';')
+            and (rest[:1] == ';' or (rest[:1] == '(' and _call_ends(body, end)))
         ):
             kind = routine_kind(word)
             if kind == 'f':
@@ -14869,7 +14910,10 @@ class PostgresBackend:
         sql = _ruled(
             'package-ddl',
             _translate_package_ddl(
-                sql, self._package_index_types, self._user_routine_names
+                sql,
+                self._package_index_types,
+                self._user_routine_names,
+                self._routine_kind,
             ),
             sql,
         )
@@ -14881,6 +14925,7 @@ class PostgresBackend:
             _translate_routine_ddl(
                 sql,
                 self._user_routine_names() if _ROUTINE_HEAD.match(sql) else None,
+                routine_kind=self._routine_kind,
             ),
             sql,
         )
