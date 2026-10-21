@@ -572,6 +572,30 @@ _DATE_ARITHMETIC_DDL = (
         for date in _DATE_TYPES
         for number in _DAY_NUMBER_TYPES
     )
+    # TIMESTAMP + n, n + TIMESTAMP and TIMESTAMP - n are DATEs (#2164): the
+    # TIMESTAMP becomes a DATE first, its fraction dropped, as 23ai has
+    # `10:00:00.9 + 1` at 10:00:00 the next day. Without an exact operator
+    # PostgreSQL found the DATE ones above and orafce's all equally near.
+    + ''.join(
+        'DO $$ BEGIN '
+        f'CREATE FUNCTION sys.ora_stamp_plus(timestamp, {number}) RETURNS ora_date '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        "$f$ SELECT sys.ora_date_plus(date_trunc('second', $1), $2::numeric) $f$; "
+        f'CREATE FUNCTION sys.ora_days_stamp_plus({number}, timestamp) '
+        'RETURNS ora_date LANGUAGE sql IMMUTABLE STRICT AS '
+        "$f$ SELECT sys.ora_date_plus(date_trunc('second', $2), $1::numeric) $f$; "
+        f'CREATE FUNCTION sys.ora_stamp_less(timestamp, {number}) RETURNS ora_date '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        "$f$ SELECT sys.ora_date_plus(date_trunc('second', $1), -$2::numeric) $f$; "
+        f'CREATE OPERATOR sys.+ (LEFTARG = timestamp, RIGHTARG = {number}, '
+        'FUNCTION = sys.ora_stamp_plus); '
+        f'CREATE OPERATOR sys.+ (LEFTARG = {number}, RIGHTARG = timestamp, '
+        'FUNCTION = sys.ora_days_stamp_plus); '
+        f'CREATE OPERATOR sys.- (LEFTARG = timestamp, RIGHTARG = {number}, '
+        'FUNCTION = sys.ora_stamp_less); '
+        'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
+        for number in _DAY_NUMBER_TYPES
+    )
 )
 
 # Oracle scalar functions the backend installs as real PostgreSQL functions,

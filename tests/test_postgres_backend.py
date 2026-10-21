@@ -5985,6 +5985,42 @@ def test_date_minus_date_is_a_number_of_days() -> None:
                 backend.rollback()
 
 
+def test_a_timestamp_plus_a_number_is_a_date() -> None:
+    # TIMESTAMP + n failed, `operator is not unique` (#2164). On 23ai it is a
+    # DATE: the TIMESTAMP becomes a DATE first, its fraction dropped, and the
+    # sum is rounded to the second.
+    import datetime
+
+    from seerdb.common.tns_consts import TNS_TYPE_DATE
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2164 (ts TIMESTAMP, ts3 TIMESTAMP(3))')
+        try:
+            backend.execute(
+                "INSERT INTO t2164 VALUES (TIMESTAMP '2020-01-31 10:00:00.9', "
+                "TIMESTAMP '2020-01-31 10:00:00.5')"
+            )
+            for expression, binds, value in (
+                ('ts + 1', [], datetime.datetime(2020, 2, 1, 10)),
+                ('1 + ts', [], datetime.datetime(2020, 2, 1, 10)),
+                ('ts - 1', [], datetime.datetime(2020, 1, 30, 10)),
+                ('ts3 + 1.5', [], datetime.datetime(2020, 2, 1, 22)),
+                ('ts + 0.5 / 86400', [], datetime.datetime(2020, 1, 31, 10, 0, 1)),
+                ('ts + :1', [2], datetime.datetime(2020, 2, 2, 10)),
+            ):
+                result = backend.execute(f'SELECT {expression} FROM t2164', binds)
+                assert result.columns[0].data_type == TNS_TYPE_DATE, expression
+                assert result.rows == [(value,)], expression
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2164')
+    finally:
+        backend.close()
+
+
 def test_trunc_and_round_of_a_datetime_are_dates() -> None:
     # TRUNC / ROUND of a DATE, a TIMESTAMP or a TIMESTAMP WITH TIME ZONE
     # return a DATE (#2076), so the difference of two is a number of days and
