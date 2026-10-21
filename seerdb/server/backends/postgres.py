@@ -826,6 +826,16 @@ _HELPER_FUNCTIONS_DDL = (
     'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::interval $$;'
     'CREATE OR REPLACE FUNCTION to_yminterval(text) RETURNS interval '
     'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::interval $$;'
+    # NUMTOYMINTERVAL(n, unit) (#2153): n months, or n years of twelve,
+    # rounded half up -- (14.6, 'MONTH') is 1-3 -- and ORA-01760 for any
+    # other unit. Measured on 23ai.
+    'CREATE OR REPLACE FUNCTION numtoyminterval(numeric, text) RETURNS interval '
+    'LANGUAGE plpgsql IMMUTABLE STRICT AS $$ BEGIN '
+    "IF upper(trim($2)) = 'YEAR' THEN "
+    'RETURN make_interval(months => round($1 * 12)::integer); '
+    "ELSIF upper(trim($2)) = 'MONTH' THEN "
+    'RETURN make_interval(months => round($1)::integer); END IF; '
+    "RAISE EXCEPTION 'ORA-01760: illegal argument for function'; END $$;"
     'CREATE OR REPLACE FUNCTION to_blob(bytea) RETURNS bytea '
     'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
     'CREATE OR REPLACE FUNCTION to_nclob(text) RETURNS text '
@@ -7707,6 +7717,11 @@ _LOB_CALL_ITEM = re.compile(
 _ROWID_CALL_ITEM = re.compile(r'sys\s*\.\s*ora_rowid\s*\(', re.IGNORECASE)
 # An IntervalYM bind as the translation writes it (_translate_binds).
 _INTERVALYM_BIND_ITEM = re.compile(r'make_interval\(months => %\(\w+\)s\)')
+# A call that gives a YEAR TO MONTH, which PostgreSQL describes as its base
+# type (#2152, #2153).
+_INTERVALYM_CALL_ITEM = re.compile(
+    r'(?:to_yminterval|numtoyminterval)\s*\(', re.IGNORECASE
+)
 _ITEM_ALIAS = re.compile(r'(?:AS\s+)?(?:"[^"]*"|[A-Za-z_][\w$#]*)?', re.IGNORECASE)
 # A select-list item that is one call, `name(...)` or `schema.name(...)`,
 # optionally aliased: a type constructor when `name` is a type (#1473).
@@ -7902,6 +7917,12 @@ def _computed_column_types(sql: str) -> dict[int, int]:
         if ym is not None and _ITEM_ALIAS.fullmatch(item[ym.end() :].strip()):
             found[index] = TNS_TYPE_INTERVALYM
             continue
+        call = _INTERVALYM_CALL_ITEM.match(item)
+        if call is not None:
+            close = _matching_paren(item, call.end() - 1)
+            if close < len(item) and _ITEM_ALIAS.fullmatch(item[close + 1 :].strip()):
+                found[index] = TNS_TYPE_INTERVALYM
+                continue
         rowid = _ROWID_CALL_ITEM.match(item)
         if rowid is not None:
             # The ROWID pseudo-column, as the rewrite writes it: text here, a
