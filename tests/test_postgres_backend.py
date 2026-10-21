@@ -11367,6 +11367,61 @@ def test_a_private_synonym_reaches_its_table_as_oracles_does() -> None:
         backend.close()
 
 
+def test_a_synonym_follows_its_target_as_oracles_does() -> None:
+    # A synonym's view kept the columns its target had when it was made, and
+    # one whose target went was a missing table (#2179). 23ai's: a column the
+    # target gains shows through; with the target gone the synonym is
+    # INVALID and ORA-00980, and VALID once a table of its name is back; one
+    # made for a target not yet there works once it is; OR REPLACE retargets.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+
+    def status() -> list:
+        return backend.execute(
+            "SELECT status FROM user_objects WHERE object_name = 'S2179B'"
+        ).rows
+
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2179b (id NUMBER)')
+        try:
+            backend.execute('INSERT INTO t2179b VALUES (1)')
+            backend.execute('CREATE SYNONYM s2179b FOR t2179b')
+            backend.execute('ALTER TABLE t2179b ADD (w NUMBER)')
+            assert backend.execute('SELECT * FROM s2179b').rows == [(1, None)]
+            backend.execute('DROP TABLE t2179b')
+            assert status() == [('INVALID',)]
+            with pytest.raises(BackendError) as raised:
+                backend.execute('SELECT * FROM s2179b')
+            assert raised.value.ora_code == 980
+            backend.execute('CREATE TABLE t2179b (k VARCHAR2(5))')
+            assert backend.execute('SELECT * FROM s2179b').rows == []
+            assert status() == [('VALID',)]
+            backend.execute('CREATE SYNONYM s2179c FOR u2179c')
+            with pytest.raises(BackendError) as raised:
+                backend.execute('SELECT * FROM s2179c')
+            assert raised.value.ora_code == 980
+            backend.execute('CREATE TABLE u2179c (z NUMBER)')
+            backend.execute('INSERT INTO u2179c VALUES (7)')
+            assert backend.execute('SELECT z FROM s2179c').rows == [(7,)]
+            backend.execute('CREATE OR REPLACE SYNONYM s2179b FOR u2179c')
+            assert backend.execute('SELECT * FROM s2179b').rows == [(7,)]
+        finally:
+            backend.rollback()
+            for leftover in (
+                'SYNONYM s2179b',
+                'SYNONYM s2179c',
+                'TABLE t2179b',
+                'TABLE u2179c',
+            ):
+                with contextlib.suppress(BackendError):
+                    backend.execute(f'DROP {leftover}')
+    finally:
+        backend.close()
+
+
 def test_all_constraints_gives_a_checks_condition_as_written() -> None:
     # A CHECK's SEARCH_CONDITION was NULL (#2171). 23ai's: the text between
     # its parentheses as written, spaces and case kept, inline or out of line,

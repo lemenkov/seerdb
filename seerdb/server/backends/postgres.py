@@ -2448,6 +2448,8 @@ _ORACLE_DICTIONARY_DDL = (
     'UNION ALL SELECT upper(r.schema_name), ora_name(r.view_name), NULL::text, '
     "0::bigint, 'VIEW', 'INVALID', 'N', 'N', 'N' FROM sys.ora_invalid_views r "
     "WHERE has_schema_privilege(r.schema_name, 'USAGE') "
+    # A synonym's stand-in is the synonym, INVALID itself (#2179).
+    f'AND NOT {_SYNONYM_STAND_IN.format(owner="upper(r.schema_name)", name="ora_name(r.view_name)")} '
     # A user's standalone procedure or function, VALID or INVALID (#1606).
     'UNION ALL SELECT ora_owner(n.nspname), ora_name(p.proname), NULL::text, '
     "p.oid::bigint, CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, "
@@ -5160,6 +5162,36 @@ def _quoted_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+# What a committed DDL leaves to do to views (#2179, #2201), one statement:
+# the synonyms whose view is missing or no longer has its target's columns,
+# as ('synonym', owner, name, target owner, target, whether the view is
+# there), and the INVALID views, ('view', schema, name, definition, NULL,
+# whether a CREATE took the name). A synonym's view is no INVALID view: its
+# record goes, here.
+_PENDING_VIEWS = (
+    'WITH synonym AS (SELECT lower(s.owner) AS owner, '
+    f'{_pg_name_sql("s.name")} AS name, lower(s.table_owner) AS target_owner, '
+    f'{_pg_name_sql("s.table_name")} AS target FROM sys.ora_synonyms s), '
+    'gone AS (DELETE FROM sys.ora_invalid_views r USING synonym y '
+    'WHERE r.schema_name = y.owner AND r.view_name = y.name '
+    'RETURNING r.schema_name, r.view_name) '
+    "SELECT 'synonym', y.owner, y.name, y.target_owner, y.target, v.oid IS NOT NULL "
+    'FROM synonym y CROSS JOIN LATERAL (SELECT '
+    "to_regclass(quote_ident(y.owner) || '.' || quote_ident(y.name))::oid AS oid, "
+    "to_regclass(quote_ident(y.target_owner) || '.' || quote_ident(y.target))::oid "
+    'AS target) v WHERE v.target IS NOT NULL AND (v.oid IS NULL OR ARRAY(SELECT '
+    'attname FROM pg_attribute WHERE attrelid = v.oid AND attnum > 0 '
+    'AND NOT attisdropped ORDER BY attnum) IS DISTINCT FROM ARRAY(SELECT attname '
+    'FROM pg_attribute WHERE attrelid = v.target AND attnum > 0 '
+    "AND NOT attisdropped ORDER BY attnum)) AND has_schema_privilege(y.owner, 'CREATE') "
+    "UNION ALL SELECT 'view', r.schema_name, r.view_name, r.definition, NULL, "
+    "to_regclass(quote_ident(r.schema_name) || '.' || quote_ident(r.view_name)) "
+    'IS NOT NULL FROM sys.ora_invalid_views r LEFT JOIN gone g '
+    'ON g.schema_name = r.schema_name AND g.view_name = r.view_name '
+    'WHERE g.view_name IS NULL'
+)
+
+
 # Transaction control sent as SQL text (#1181). Every other statement runs inside
 # the `_mirror_stmt` savepoint (see execute), and these cannot: a COMMIT or
 # ROLLBACK ends the transaction and the savepoint with it, so the RELEASE after
@@ -5875,6 +5907,8 @@ _DROP_SYNONYM = re.compile(
 # ORA-01471 and ORA-01434 (#2179), measured on 23ai.
 _ORA_SYNONYM_OF_ITSELF = 1471
 _ORA_NO_SUCH_SYNONYM = 1434
+# ORA-00980, a synonym whose target is not there (#2179).
+_ORA_SYNONYM_TRANSLATION = 980
 # The kinds of object a synonym's name may not be taken by: Oracle's one
 # namespace for them.
 _SYNONYM_NAMESPACE = (
@@ -15405,29 +15439,50 @@ class PostgresBackend:
         # (`table or view "PYO"."T" does not exist`); earlier ones do not. An
         # unquoted name is upper-cased, as Oracle folds one; the schema the
         # statement did not give is the session's current one. A view a DROP
-        # left INVALID is ORA-04063, `view "PYO.V" has errors` (#2201).
-        invalid = self._invalid_view(missing)
-        if invalid is not None:
-            return invalid
-        if self._release < (23, 0):
+        # left INVALID is ORA-04063, `view "PYO.V" has errors` (#2201), and a
+        # synonym whose target is not there ORA-00980 (#2179). One read says
+        # all three.
+        if self._conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
             return missing
-        schema = missing.schema
-        if schema is None:
-            if (
-                self._conn.info.transaction_status
-                == psycopg.pq.TransactionStatus.INERROR
-            ):
-                return missing
-            try:
-                row = self._catalog_read('SELECT current_schema()').fetchone()
-            except psycopg.Error:
-                return missing
-            if row is None or row[0] is None:
-                return missing
-            schema = row[0]
+        relation = missing.relation
+        try:
+            row = self._catalog_read(
+                'SELECT current_schema(), EXISTS (SELECT 1 FROM sys.ora_synonyms '
+                'WHERE owner = upper(coalesce(%s, current_schema())) '
+                'AND name = %s), EXISTS (SELECT 1 FROM sys.ora_invalid_views '
+                'WHERE schema_name = coalesce(%s, current_schema()) '
+                'AND view_name = %s)',
+                (
+                    missing.schema,
+                    relation.upper() if relation == relation.lower() else relation,
+                    missing.schema,
+                    relation,
+                ),
+            ).fetchone()
+        except psycopg.Error:
+            return missing
+        if row is None or row[0] is None:
+            return missing
+        (current, synonym, invalid) = row
+        schema = missing.schema or current
 
         def oracle(name: str) -> str:
             return name.upper() if name == name.lower() else name
+
+        if synonym:
+            return BackendError(
+                'synonym translation is no longer valid',
+                ora_code=_ORA_SYNONYM_TRANSLATION,
+                error_offset=missing.error_offset,
+            )
+        if invalid:
+            return BackendError(
+                f'view "{oracle(schema)}.{oracle(relation)}" has errors',
+                ora_code=_ORA_VIEW_HAS_ERRORS,
+                error_offset=missing.error_offset,
+            )
+        if self._release < (23, 0):
+            return missing
 
         return BackendError(
             f'table or view "{oracle(schema)}"."{oracle(missing.relation)}" '
@@ -17236,49 +17291,42 @@ class PostgresBackend:
         self.commit()
         return Result()
 
-    def _invalid_view(self, missing: _ObjectMissing) -> BackendError | None:
-        # ORA-04063 for a relation that is a view a DROP left INVALID (#2201),
-        # else None.
-        if self._conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
-            return None
-        try:
-            row = self._catalog_read(
-                'SELECT r.schema_name, r.view_name FROM sys.ora_invalid_views r '
-                'WHERE r.schema_name = coalesce(%s, current_schema()) '
-                'AND r.view_name = %s',
-                (missing.schema, missing.relation),
-            ).fetchone()
-        except psycopg.Error:
-            return None
-        if row is None:
-            return None
-        (schema, name) = (
-            row[0].upper(),
-            row[1].upper() if row[1] == row[1].lower() else row[1],
-        )
-        return BackendError(
-            f'view "{schema}.{name}" has errors',
-            ora_code=_ORA_VIEW_HAS_ERRORS,
-            error_offset=missing.error_offset,
-        )
-
     def _revalidate_views(self) -> None:
-        # After a committed DDL: each view a DROP left INVALID made again from
-        # its definition where it compiles now -- its objects are back -- and
-        # VALID, its record gone; one a CREATE took the name of goes too
-        # (#2201). Again until none more compiles, for a view over another. On
-        # its own, like the other records, so a failure here cannot take the
-        # DDL with it.
+        """After a committed DDL, in one round trip while nothing needs doing:
+        each synonym's view as its target now is (#2179), and each view a DROP
+        left INVALID made again where it compiles (#2201). On its own, like the
+        other records, so a failure here cannot take the DDL with it.
+
+        A synonym's view is made from its record where its target is back or
+        came to be, and made again where the target's columns are no longer
+        the view's, as a column ALTER TABLE adds shows through a synonym; it is
+        never one of the INVALID views. An INVALID view that compiles is VALID
+        again, its record gone, and one a CREATE took the name of goes too --
+        again until none more compiles, for a view over another."""
         try:
-            pending = self._conn.execute(
-                'SELECT schema_name, view_name, definition, '
-                "to_regclass(quote_ident(schema_name) || '.' || quote_ident(view_name)) "
-                'IS NOT NULL FROM sys.ora_invalid_views'
-            ).fetchall()
+            found = self._conn.execute(_PENDING_VIEWS).fetchall()
             self._conn.commit()
         except psycopg.Error:
             self._conn.rollback()
             return
+        for kind, owner, name, target_owner, target, exists in found:
+            if kind != 'synonym':
+                continue
+            view = f'{_quoted_identifier(owner)}.{_quoted_identifier(name)}'
+            source = f'{_quoted_identifier(target_owner)}.{_quoted_identifier(target)}'
+            try:
+                if exists:
+                    self._conn.execute(f'DROP VIEW {view}')
+                self._conn.execute(f'CREATE VIEW {view} AS SELECT * FROM {source}')
+                self._record_view_column_types(view)
+                self._conn.commit()
+            except psycopg.Error:
+                self._conn.rollback()
+        pending = [
+            (schema, name, definition, taken)
+            for kind, schema, name, definition, _target, taken in found
+            if kind == 'view'
+        ]
         made = True
         while pending and made:
             made = False
@@ -21144,17 +21192,19 @@ class PostgresBackend:
                     'private synonym to be dropped does not exist',
                     ora_code=_ORA_NO_SUCH_SYNONYM,
                 )
+            # The record first: the DROP VIEW's own DDL would otherwise find a
+            # synonym without its view, and make it again.
+            self._conn.execute(
+                'DELETE FROM sys.ora_synonyms WHERE owner = %s AND name = %s',
+                (owner, name),
+            )
+            self._conn.commit()
             pg_name = name.lower() if re.fullmatch(r'[A-Z][A-Z0-9_$#]*', name) else name
             if self._conn.execute(
                 "SELECT to_regclass(quote_ident(lower(%s)) || '.' || quote_ident(%s))",
                 (owner, pg_name),
             ).fetchone() != (None,):
                 self.execute(f'DROP VIEW {written}')
-            self._conn.execute(
-                'DELETE FROM sys.ora_synonyms WHERE owner = %s AND name = %s',
-                (owner, name),
-            )
-            self._conn.commit()
             return Result()
         assert created is not None
         if created.group(5):
@@ -21186,20 +21236,42 @@ class PostgresBackend:
             raise UnsupportedFeature(
                 f'a synonym for a {kind[0].lower()} is not supported yet'
             )
-        if kind is not None:
-            self.execute(
-                f'CREATE OR REPLACE VIEW {written} AS SELECT * FROM {target_written}'
+        previous = self._conn.execute(
+            'SELECT table_owner, table_name FROM sys.ora_synonyms '
+            'WHERE owner = %s AND name = %s',
+            (owner, name),
+        ).fetchone()
+
+        def record(target_of: tuple[str, str]) -> None:
+            self._conn.execute(
+                'INSERT INTO sys.ora_synonyms (owner, name, table_owner, table_name) '
+                'VALUES (%s, %s, %s, %s) ON CONFLICT (owner, name) DO UPDATE SET '
+                'table_owner = EXCLUDED.table_owner, table_name = EXCLUDED.table_name',
+                (owner, name, *target_of),
             )
-        elif recorded(owner, name):
-            # Replaced by one whose target is not there: the old view goes.
-            self.execute(f'DROP VIEW IF EXISTS {written}')
-        self._conn.execute(
-            'INSERT INTO sys.ora_synonyms (owner, name, table_owner, table_name) '
-            'VALUES (%s, %s, %s, %s) ON CONFLICT (owner, name) DO UPDATE SET '
-            'table_owner = EXCLUDED.table_owner, table_name = EXCLUDED.table_name',
-            (owner, name, target_owner, target),
-        )
-        self._conn.commit()
+            self._conn.commit()
+
+        # The record first, so the view's own DDL, which makes each synonym's
+        # view as its record says, finds the new target (#2179).
+        record((target_owner, target))
+        try:
+            if kind is not None:
+                self.execute(
+                    f'CREATE OR REPLACE VIEW {written} AS SELECT * FROM {target_written}'
+                )
+            elif previous is not None:
+                # Replaced by one whose target is not there: the old view goes.
+                self.execute(f'DROP VIEW IF EXISTS {written}')
+        except BackendError:
+            if previous is None:
+                self._conn.execute(
+                    'DELETE FROM sys.ora_synonyms WHERE owner = %s AND name = %s',
+                    (owner, name),
+                )
+                self._conn.commit()
+            else:
+                record(previous)
+            raise
         return Result()
 
     def _object_grant_statement(self, statement: str) -> Result | None:
