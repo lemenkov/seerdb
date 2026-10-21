@@ -2174,6 +2174,61 @@ def test_a_session_formats_dates_by_its_nls_date_format() -> None:
         backend.close()
 
 
+def test_a_datetime_converted_to_text_follows_the_sessions_nls_formats() -> None:
+    # A DATE or TIMESTAMP made text without a format -- by ||, CONCAT or
+    # TO_CHAR(x) -- came out as PostgreSQL's text, and TO_CHAR(ts) as a DATE
+    # (#2162). 23ai's, d at 13:14:15 and each TIMESTAMP at 13:14:15.5: a DATE
+    # in NLS_DATE_FORMAT, a TIMESTAMP in NLS_TIMESTAMP_FORMAT, FF as many
+    # digits as its precision, and no radix point at precision 0.
+    assert _translate_admin(
+        "ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'RR-MM-DD HH24:MI:SSXFF'"
+    ) == (
+        "SET seerdb.nls_timestamp_print = 'YY-MM-DD HH24:MI:SSXFF'; "
+        "SET seerdb.nls_timestamp_format = 'RR-MM-DD HH24:MI:SSXFF'"
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute(
+            'CREATE TABLE t2162 (d DATE, ts TIMESTAMP, ts3 TIMESTAMP(3), '
+            'ts0 TIMESTAMP(0))'
+        )
+        try:
+            backend.execute(
+                "INSERT INTO t2162 VALUES (TIMESTAMP '2024-01-02 13:14:15', "
+                "TIMESTAMP '2024-01-02 13:14:15.5', TIMESTAMP '2024-01-02 13:14:15.5', "
+                "TIMESTAMP '2024-01-02 13:14:15')"
+            )
+            assert backend.execute(
+                "SELECT d || 'x', to_char(t.ts), ts || 'x', concat(ts3, 'x'), "
+                "'x' || ts0 FROM t2162 t"
+            ).rows == [
+                (
+                    '02-JAN-24x',
+                    '02-JAN-24 01.14.15.500000 PM',
+                    '02-JAN-24 01.14.15.500000 PMx',
+                    '02-JAN-24 01.14.15.500 PMx',
+                    'x02-JAN-24 01.14.15 PM',
+                )
+            ]
+            backend.execute(
+                "ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SSXFF'"
+            )
+            assert backend.execute("SELECT ts || 'x' FROM t2162").rows == [
+                ('2024-01-02 13:14:15.500000x',)
+            ]
+            assert backend.execute(
+                'SELECT value FROM nls_session_parameters '
+                "WHERE parameter = 'NLS_TIMESTAMP_FORMAT'"
+            ).rows == [('YYYY-MM-DD HH24:MI:SSXFF',)]
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2162')
+    finally:
+        backend.close()
+
+
 def test_translate_admin_sets_the_session_time_zone_without_inverting_it() -> None:
     # A 12.1+ client sends ALTER SESSION SET TIME_ZONE at login. PostgreSQL reads
     # a bare offset as POSIX and INVERTS it (`SET TIME ZONE '+05:30'` runs at
@@ -4401,8 +4456,8 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # sys.ora_late_number (#2143), and numtoyminterval (#2153), and
     # sys.ora_to_char and to_char(timestamp, text) (#2167), and
     # sys.ora_plsql_number_text with DBMS_OUTPUT's PUT_LINE and PUT of a
-    # number (#2181).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 111
+    # number (#2181), and sys.ora_datetime_text (#2162).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 112
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument

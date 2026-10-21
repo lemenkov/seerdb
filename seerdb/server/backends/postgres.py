@@ -683,6 +683,17 @@ _HELPER_FUNCTIONS_DDL = (
     'CREATE OR REPLACE FUNCTION to_char(timestamp, text) RETURNS text '
     "LANGUAGE sql STABLE AS $$ SELECT CASE WHEN $2 ~* 'ff|x' "
     'THEN sys.ora_to_char($1, $2, 6) ELSE pg_catalog.to_char($1, $2) END $$;'
+    # A DATE's or a TIMESTAMP(p)'s text where Oracle converts it without a
+    # format (#2162): a DATE, $2 = -1, in the session's NLS_DATE_FORMAT, a
+    # TIMESTAMP in its NLS_TIMESTAMP_FORMAT, FF as p digits. The settings hold
+    # the formats as PostgreSQL prints them, YY for RR.
+    'CREATE OR REPLACE FUNCTION sys.ora_datetime_text(timestamp, integer) '
+    'RETURNS text LANGUAGE sql STABLE AS $$ SELECT CASE WHEN $2 < 0 THEN '
+    'pg_catalog.to_char($1, coalesce(nullif(current_setting('
+    "'orafce.nls_date_format', true), ''), 'DD-MON-YY')) "
+    'ELSE sys.ora_to_char($1, coalesce(nullif(current_setting('
+    "'seerdb.nls_timestamp_print', true), ''), 'DD-MON-YY HH.MI.SSXFF AM'), $2) "
+    'END $$;'
     # HEXTORAW('DEADBEEF') → the RAW/bytea value of a hex string.
     'CREATE OR REPLACE FUNCTION hextoraw(text) RETURNS bytea '
     "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT decode($1, 'hex') $$;"
@@ -2166,10 +2177,13 @@ _ORACLE_DICTIONARY_DDL = (
     "('NLS_LENGTH_SEMANTICS', 'BYTE'), ('NLS_NCHAR_CONV_EXCP', 'FALSE'), "
     "('NLS_NCHAR_CHARACTERSET', 'AL16UTF16')"
     ') AS p(parameter, value);'
-    # The session's NLS_DATE_FORMAT is the one ALTER SESSION set (#1616).
+    # The session's NLS_DATE_FORMAT and NLS_TIMESTAMP_FORMAT are the ones
+    # ALTER SESSION set (#1616, #2162).
     'CREATE OR REPLACE VIEW sys.nls_session_parameters AS SELECT parameter, '
     "CASE WHEN parameter = 'NLS_DATE_FORMAT' THEN coalesce(nullif("
-    "current_setting('seerdb.nls_date_format', true), ''), value) ELSE value END "
+    "current_setting('seerdb.nls_date_format', true), ''), value) "
+    "WHEN parameter = 'NLS_TIMESTAMP_FORMAT' THEN coalesce(nullif("
+    "current_setting('seerdb.nls_timestamp_format', true), ''), value) ELSE value END "
     'AS value FROM nls_database_parameters WHERE parameter NOT IN '
     "('NLS_CHARACTERSET', 'NLS_NCHAR_CHARACTERSET');"
     'CREATE OR REPLACE VIEW sys.nls_instance_parameters AS SELECT * FROM '
@@ -5582,9 +5596,29 @@ def _nls_date_format_settings(oracle_format: str) -> str:
     )
 
 
-# Oracle's own default, which every session starts with.
+# A session's NLS_TIMESTAMP_FORMAT (#2162), which sys.ora_datetime_text
+# follows: seerdb.nls_timestamp_format as Oracle spells it, and
+# seerdb.nls_timestamp_print as PostgreSQL prints it.
+_ALTER_SESSION_NLS_TIMESTAMP_FORMAT = re.compile(
+    r"\s*ALTER\s+SESSION\s+SET\s+NLS_TIMESTAMP_FORMAT\s*=\s*'((?:[^']|'')*)'\s*;?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _nls_timestamp_format_settings(oracle_format: str) -> str:
+    printed = _RR_YEAR.sub(lambda m: 'YYYY' if m.group(1) else 'YY', oracle_format)
+    quoted = oracle_format.replace("'", "''")
+    printed = printed.replace("'", "''")
+    return (
+        f"SET seerdb.nls_timestamp_print = '{printed}'; "
+        f"SET seerdb.nls_timestamp_format = '{quoted}'"
+    )
+
+
+# Oracle's own defaults, which every session starts with.
 _ORAFCE_SESSION_SETTINGS: Final = (
-    f'{_ORAFCE_SESSION_SETTINGS_BASE}; {_nls_date_format_settings("DD-MON-RR")}'
+    f'{_ORAFCE_SESSION_SETTINGS_BASE}; {_nls_date_format_settings("DD-MON-RR")}; '
+    f'{_nls_timestamp_format_settings("DD-MON-RR HH.MI.SSXFF AM")}'
 )
 
 
@@ -5958,6 +5992,9 @@ def _translate_admin(sql: str) -> str:
     m = _ALTER_SESSION_NLS_DATE_FORMAT.match(sql)
     if m:
         return _nls_date_format_settings(m.group(1).replace("''", "'"))
+    m = _ALTER_SESSION_NLS_TIMESTAMP_FORMAT.match(sql)
+    if m:
+        return _nls_timestamp_format_settings(m.group(1).replace("''", "'"))
     m = _CREATE_USER.match(sql)
     if m:
         return f'CREATE SCHEMA IF NOT EXISTS {m.group(1).lower()}'
@@ -8501,6 +8538,37 @@ def _concatenated_columns(sql: str) -> list[tuple[int, int, list[str]]]:
     return found
 
 
+@_kept_per_text
+def _converted_columns(sql: str) -> list[tuple[int, int, list[str]]]:
+    """The names `sql` converts to text without a format, as
+    _concatenated_columns gives them: those, and the one argument of
+    TO_CHAR(c) (#2162)."""
+    spans = _bind_spans(sql)
+    sig = [i for i, span in enumerate(spans) if span[0] not in ('space', 'comment')]
+
+    def text(k: int) -> str:
+        return spans[sig[k]][1] if 0 <= k < len(sig) else ''
+
+    found = list(_concatenated_columns(sql))
+    for k in range(len(sig) - 3):
+        if text(k).upper() != 'TO_CHAR' or text(k + 1) != '(' or text(k - 1) == '.':
+            continue
+        last = k + 2
+        if spans[sig[last]][0] not in ('word', 'identifier'):
+            continue
+        parts = [text(last)]
+        while (
+            text(last + 1) == '.'
+            and last + 2 < len(sig)
+            and spans[sig[last + 2]][0] in ('word', 'identifier')
+        ):
+            parts.append(text(last + 2))
+            last += 2
+        if text(last + 1) == ')':
+            found.append((sig[k + 2], sig[last], parts))
+    return found
+
+
 def _concat_width(
     item: str, sizes: dict[str, int], columns: dict[str, int] | None = None
 ) -> tuple[int, bool]:
@@ -8583,6 +8651,19 @@ def _concat_width(
                 at += 1
                 return width, complete
             return width, False
+        if (
+            kind == 'word'
+            and word.lower() == 'sys'
+            and (text(1), text(2).lower(), text(3)) == ('.', 'ora_datetime_text', '(')
+        ):
+            # A DATE or TIMESTAMP column made its text (#2162) counts as the
+            # column does.
+            at += 4
+            width, complete = operand()
+            while at < len(tokens) and text() != ')':
+                at += 1
+            at += 1
+            return width, complete
         if kind == 'word' and word.upper() == 'CONCAT' and text(1) == '(':
             at += 2
             first, first_complete = expression()
@@ -13205,6 +13286,7 @@ class _TableColumn(NamedTuple):
     declared: tuple | None  # sys.ora_columns: type, length, precision, scale (#1386)
     tstz_precision: int | None  # a WITH TIME ZONE column's precision (#1308)
     invisible: bool  # INVISIBLE (#1195)
+    typmod: int  # PostgreSQL's: a TIMESTAMP(p)'s p, -1 for none (#2162)
 
 
 class PostgresBackend:
@@ -15055,6 +15137,7 @@ class PostgresBackend:
             sql = _ruled('number-conditions', _number_conditions(sql), sql)
         sql = _ruled('json-dot-notation', self._json_dot_notation(sql), sql)
         sql = _ruled('raw-concatenation', self._hex_raw_operands(sql), sql)
+        sql = _ruled('datetime-text', self._datetime_text_operands(sql), sql)
         sql = _ruled('package-function-call', self._call_package_functions(sql), sql)
         bare = _BARE_CALL.match(sql)
         if bare is not None and bare.group(1).upper() not in _PLSQL_WORD_STATEMENTS:
@@ -15698,15 +15781,55 @@ class PostgresBackend:
                 changed = True
         return ''.join(out) if changed else sql
 
+    def _datetime_text_operands(self, sql: str) -> str:
+        """`sql` with each DATE or TIMESTAMP column it converts to text
+        without a format -- an operand of || or CONCAT, the argument of
+        TO_CHAR(c) -- as Oracle's text of it, sys.ora_datetime_text(col, p)
+        (#2162). PostgreSQL's text was its own, `2024-01-02 13:14:15`, and
+        orafce's TO_CHAR(ts) printed a TIMESTAMP as a DATE. A function over
+        the value sees neither the DATE domain nor the precision, so the
+        column's type comes from the schema model. A name that is no column
+        of the query's FROM tables, or is one of more than one, is left."""
+        lowered = sql.lower()
+        if '||' not in sql and 'concat' not in lowered and 'to_char' not in lowered:
+            return sql
+        operands = _converted_columns(sql)
+        tables = _from_tables(sql) if operands else []
+        if not tables:
+            return sql
+        out = [span[1] for span in _bind_spans(sql)]
+        changed = False
+        for first, last, parts in operands:
+            column = self._concatenated_column(tables, parts)
+            if column is None:
+                continue
+            if self._domain_type_by_oid.get(column.type_oid) == TNS_TYPE_DATE:
+                precision = -1
+            elif column.type_oid == _TIMESTAMP_OID:
+                precision = 6 if column.typmod < 0 else column.typmod
+            else:
+                continue
+            out[first] = 'sys.ora_datetime_text(' + out[first]
+            out[last] += f', {precision})'
+            changed = True
+        return ''.join(out) if changed else sql
+
     def _concatenated_type(
         self, tables: list[tuple[str | None, str, str | None]], parts: list[str]
     ) -> int | None:
-        # The declared type of the one FROM table column `parts` names --
-        # `c`, `t.c`, `s.t.c` -- from the schema model; None for none, or for
-        # a name more than one table has (#2158).
+        # The declared type of the one FROM table column `parts` names (#2158).
+        column = self._concatenated_column(tables, parts)
+        return None if column is None else column.type_oid
+
+    def _concatenated_column(
+        self, tables: list[tuple[str | None, str, str | None]], parts: list[str]
+    ) -> _TableColumn | None:
+        # The one FROM table column `parts` names -- `c`, `t.c`, `s.t.c` --
+        # from the schema model; None for none, or for a name more than one
+        # table has (#2158).
         name = _pg_identifier(parts[-1])
         qualifier = [part.strip('"').lower() for part in parts[:-1]]
-        found: list[int] = []
+        found: list[_TableColumn] = []
         for schema, table, alias in tables:
             if len(qualifier) == 1 and qualifier[0] not in (alias, table):
                 continue
@@ -15715,7 +15838,7 @@ class PostgresBackend:
             if len(qualifier) > 2:
                 continue
             columns = self._relation_columns(f'{schema}.{table}' if schema else table)
-            found.extend(c.type_oid for c in (columns or {}).values() if c.name == name)
+            found.extend(c for c in (columns or {}).values() if c.name == name)
         return found[0] if len(found) == 1 else None
 
     def _oson_layout(self, name: str) -> tuple[list[str], frozenset[int]] | None:
@@ -16731,7 +16854,8 @@ class PostgresBackend:
             "WHERE c.contype = 'c' AND c.conrelid = a.attrelid "
             'AND c.conkey = ARRAY[a.attnum] '
             "AND pg_get_constraintdef(c.oid) ~ '^CHECK \\(+(sys\\.)?ora_is_json\\('), "
-            f'{declared}, {precision}, {invisible} FROM pg_attribute a{joins} '
+            f'{declared}, {precision}, {invisible}, a.atttypmod '
+            f'FROM pg_attribute a{joins} '
             'WHERE a.attrelid = ANY(%s) AND a.attnum > 0 AND NOT a.attisdropped',
             (list(relids),),
         ).fetchall()
@@ -16748,6 +16872,7 @@ class PostgresBackend:
                 declared=declared_type,
                 tstz_precision=row[11],
                 invisible=row[12],
+                typmod=row[13],
             )
 
     def _relation_columns(self, name: str) -> dict[int, _TableColumn] | None:
