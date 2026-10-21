@@ -759,6 +759,51 @@ def test_a_unique_violation_shows_a_date_in_the_session_format() -> None:
         backend.close()
 
 
+def test_a_unique_violation_shows_a_timestamp_in_the_session_format() -> None:
+    # A TIMESTAMP on the ORA-03301 line printed as PostgreSQL prints it,
+    # `TS:2024-01-02 13:14:15.5` (#2162). Measured on 23ai: it follows the
+    # session's NLS_TIMESTAMP_FORMAT, FF at the column's precision.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute(
+            'CREATE TABLE t2162u (ts TIMESTAMP, t3 TIMESTAMP(3), PRIMARY KEY (ts, t3))'
+        )
+        try:
+            insert = (
+                "INSERT INTO t2162u VALUES (TIMESTAMP '2024-01-02 13:14:15.5', "
+                "TIMESTAMP '2024-01-02 13:14:15.25')"
+            )
+            backend.execute(insert)
+            for setting, shown in (
+                (
+                    None,
+                    'TS:02-JAN-24 01.14.15.500000 PM, T3:02-JAN-24 01.14.15.250 PM',
+                ),
+                (
+                    "'YYYY-MM-DD HH24:MI:SSXFF'",
+                    'TS:2024-01-02 13:14:15.500000, T3:2024-01-02 13:14:15.250',
+                ),
+            ):
+                if setting:
+                    backend.execute(
+                        f'ALTER SESSION SET NLS_TIMESTAMP_FORMAT = {setting}'
+                    )
+                with pytest.raises(BackendError) as raised:
+                    backend.execute(insert)
+                assert str(raised.value).endswith(
+                    f'row with column values ({shown}) already exists'
+                ), setting
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2162u')
+    finally:
+        backend.close()
+
+
 def test_an_invalid_number_is_worded_and_placed_as_oracle_does() -> None:
     # ORA-01722 carried PostgreSQL's `invalid input syntax for type numeric`
     # (#2136), and TO_NUMBER('x') no position (#2126). 23ai names the first
