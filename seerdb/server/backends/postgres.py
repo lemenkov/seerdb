@@ -2546,6 +2546,12 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE OR REPLACE VIEW sys.user_ind_columns AS SELECT index_name, table_name, '
     'column_name, column_position, descend FROM sys.all_ind_columns '
     'WHERE index_owner = ora_owner(current_schema());'
+    # USER_INDEXES (#2188), which neither the dictionary nor orafce had:
+    # ALL_INDEXES' columns but its OWNER, TABLE_OWNER kept, as Oracle's has.
+    'CREATE OR REPLACE VIEW sys.user_indexes AS SELECT index_name, index_type, '
+    'table_owner, table_name, uniqueness, status, compression, prefix_length, '
+    'tablespace_name, ityp_owner, ityp_name, parameters FROM sys.all_indexes '
+    'WHERE owner = ora_owner(current_schema());'
     'CREATE OR REPLACE VIEW sys.user_views AS SELECT view_name, text_length, text '
     'FROM sys.all_views WHERE owner = upper(current_schema());'
     # A DESC column in an index is a function-based index in Oracle: the column

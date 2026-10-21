@@ -10899,6 +10899,31 @@ def test_all_constraints_lists_a_not_null_as_oracle_does() -> None:
         backend.close()
 
 
+def test_user_indexes_lists_the_sessions_indexes() -> None:
+    # USER_INDEXES did not exist (#2188): the dictionary had ALL_INDEXES only,
+    # and orafce has none. 23ai's: the session's indexes, without OWNER.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2188 (id NUMBER, u VARCHAR2(5))')
+        try:
+            backend.execute('CREATE UNIQUE INDEX i2188u ON t2188 (u)')
+            backend.execute('CREATE INDEX i2188 ON t2188 (id)')
+            assert backend.execute(
+                'SELECT index_name, table_owner, uniqueness, index_type '
+                "FROM user_indexes WHERE table_name = 'T2188' ORDER BY index_name"
+            ).rows == [
+                ('I2188', 'PYO', 'NONUNIQUE', 'NORMAL'),
+                ('I2188U', 'PYO', 'UNIQUE', 'NORMAL'),
+            ]
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2188')
+    finally:
+        backend.close()
+
+
 def test_the_user_dictionary_views_have_oracles_columns() -> None:
     # USER_CONSTRAINTS, USER_CONS_COLUMNS, USER_IND_COLUMNS and USER_VIEWS were
     # orafce's oracle.user_*, without Oracle's columns and with TABLE_NAME a
