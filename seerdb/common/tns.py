@@ -1100,6 +1100,17 @@ class _ThinCodec:
             return decode_ub4(data)
         return None, data
 
+    @staticmethod
+    def ptr(value: bool) -> bytes:
+        return b'\x01' if value else b'\x00'
+
+    @staticmethod
+    def read_ptr(data: bytes) -> tuple[bool, bytes]:
+        return data[0] != 0, data[1:]
+
+    wn4 = n4
+    read_wn4 = read_n4
+
 
 class _OciCodec:
     """The OCI dialect's primitives (#2064), as sqlplus reads them: fixed-width
@@ -1178,9 +1189,35 @@ class _OciCodec:
     def read_token(data: bytes) -> tuple[int | None, bytes]:
         return None, data
 
+    @staticmethod
+    def ptr(value: bool) -> bytes:
+        # The indicator stands for a pointer; sqlplus 10.2 sends the address.
+        return oci.OCI_INDICATOR if value else bytes(8)
+
+    @staticmethod
+    def read_ptr(data: bytes) -> tuple[bool, bytes]:
+        return oci.pointer_present(data[:8]), data[8:]
+
+    wn4 = n4
+    read_wn4 = read_n4
+
+
+class _OciWideCodec(_OciCodec):
+    """The OCI dialect as an older sqlplus writes its OALL8 preamble (#866):
+    five of its counts are ub8, where a modern one's are ub4."""
+
+    @staticmethod
+    def wn4(value: int) -> bytes:
+        return value.to_bytes(8, 'little')
+
+    @staticmethod
+    def read_wn4(data: bytes) -> tuple[int, bytes]:
+        return int.from_bytes(data[:8], 'little'), data[8:]
+
 
 _THIN = _ThinCodec()
 _OCI = _OciCodec()
+_OCI_WIDE = _OciWideCodec()
 _bytes_with_length = _THIN.value
 _oci_value_bytes = _OCI.value
 
@@ -1238,7 +1275,40 @@ _EXEC_BY_CURSOR: wire_schema.Schema = (
     ('n4', 'options'),
     ('n4', 'options_2'),
 )
+# OALL8, the execute, through its define count (#2064): the same fields in
+# both dialects, as python-oracledb writes them, measured against sqlplus 10.2,
+# 11g, 18c and 23.26 captures. What follows the define count differs by form.
+# In a wide OCI preamble one of prefetch_rows and max_long is the ub8; every
+# capture has 1 and 0 there, which can't tell which, and nothing reads them.
+_ALL8_HEAD: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN, TTI_ALL8])),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+    ('n4', 'options'),
+    ('n4', 'cursor'),
+    ('ptr', 'sql_present'),
+    ('wn4', 'sql_length'),
+    ('ptr', 'al8i4_present'),
+    ('wn4', 'al8i4_length'),
+    ('ptr', 'al8o4'),
+    ('ptr', 'al8o4l'),
+    ('n4', 'prefetch_size'),
+    ('wn4', 'prefetch_rows'),
+    ('n4', 'max_long'),
+    ('ptr', 'binds_present'),
+    ('wn4', 'bind_count'),
+    ('ptr', 'al8app'),
+    ('ptr', 'al8txn'),
+    ('ptr', 'al8txl'),
+    ('ptr', 'al8kv'),
+    ('ptr', 'al8kvl'),
+    ('ptr', 'defines_present'),
+    ('wn4', 'define_count'),
+)
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+_ALL8_HEAD_FROM_THIN = wire_schema.compile_decoder(_ALL8_HEAD, _THIN)
+_ALL8_HEAD_FROM_OCI = wire_schema.compile_decoder(_ALL8_HEAD, _OCI)
+_ALL8_HEAD_FROM_OCI_WIDE = wire_schema.compile_decoder(_ALL8_HEAD, _OCI_WIDE)
 _FETCH_THIN = wire_schema.compile_encoder(_FETCH, _THIN)
 _FETCH_FROM_THIN = wire_schema.compile_decoder(_FETCH, _THIN)
 _FETCH_FROM_OCI = wire_schema.compile_decoder(_FETCH, _OCI)
@@ -2595,11 +2665,8 @@ def peek_exec_cursor(payload: bytes) -> tuple[int, bool]:
     :func:`parse_exec`. Returns ``(0, True)`` for anything that isn't an OALL8."""
     if len(payload) < 3 or payload[0] != TTI_FUN or payload[1] != TTI_ALL8:
         return (0, True)
-    rest = _skip_fun_header(payload)
-    _options, rest = decode_ub4(rest)
-    cursor, rest = decode_ub4(rest)
-    query_flag = rest[0] if rest else 0
-    return (cursor, bool(query_flag))
+    (head, _rest) = _ALL8_HEAD_FROM_THIN(payload)
+    return (head['cursor'], head['sql_present'])
 
 
 def _skip_exec_middle_12c(rest: bytes, field_version: int) -> bytes:
@@ -2648,25 +2715,18 @@ def parse_exec(
     if len(payload) < 3 or payload[0] != TTI_FUN or payload[1] != TTI_ALL8:
         raise InterfaceError('not an OALL8 execute')
 
-    rest = _skip_fun_header(payload)  # TTI_FUN, TTI_ALL8, seq (+ fv24 token)
-    options, rest = decode_ub4(rest)
+    (head, rest) = _ALL8_HEAD_FROM_THIN(payload)
+    options = head['options']
     autocommit = bool(options & _EXEC_OPTION_COMMIT)
     batcherrors = bool(options & TNS_EXEC_OPTION_BATCH_ERRORS)
     parse_only, describe_only = parse_options(options)
-    cursor, rest = decode_ub4(rest)
-    query_flag, rest = rest[0], rest[1:]
-    query_len, rest = decode_ub4(rest)
-    _all8_flag, rest = rest[0], rest[1:]
-    all8_len, rest = decode_ub4(rest)
-    rest = rest[2:]  # two reserved bytes
-    _lmax, rest = decode_ub4(rest)
-    fetch, rest = decode_ub4(rest)
-    _max, rest = decode_ub4(rest)
-    _bind_flag, rest = rest[0], rest[1:]
-    bind_count, rest = decode_ub4(rest)
-    rest = rest[5:]  # five reserved bytes
-    _def_flag, rest = rest[0], rest[1:]
-    define_count, rest = decode_ub4(rest)
+    (cursor, query_flag, query_len) = (
+        head['cursor'],
+        head['sql_present'],
+        head['sql_length'],
+    )
+    (all8_len, fetch) = (head['al8i4_length'], head['prefetch_rows'])
+    (bind_count, define_count) = (head['bind_count'], head['define_count'])
 
     field_version = _DECODE_FIELD_VERSION.get()
     if field_version >= FIELD_VERSION_12_1:
@@ -4144,10 +4204,8 @@ def parse_reexecute_oci(payload: bytes) -> tuple[int, int]:
     """The cursor id and the number of rows an OCI re-execute asks for (#2014)."""
     if not is_reexecute_oci(payload):
         raise InterfaceError('not an OCI re-execute')
-    cursor = int.from_bytes(
-        payload[_OCI_ALL8_CURSOR_OFF : _OCI_ALL8_CURSOR_OFF + 4], 'little'
-    )
-    at = _oci_all8_layout(payload, sql_present=False).sql + _OCI_REEXEC_ROWS_FROM_SQL
+    (cursor, length_at) = _oci_all8_head(payload, sql_present=False)[:2]
+    at = length_at + 1 + _OCI_REEXEC_ROWS_FROM_SQL
     if len(payload) < at + 4:
         raise InterfaceError('OCI re-execute: no fetch count')
     return cursor, int.from_bytes(payload[at : at + 4], 'little')
@@ -9046,20 +9104,6 @@ def _oci_lob_read_tail(
 # --- Mirror deadbeef/OCI codec (parse/describe/rows/status/LOB, #265) ---
 
 
-_OCI_ALL8_OPTIONS_OFF = 3  # ub4 LE: the options word, the thin form's bits
-_OCI_ALL8_CURSOR_OFF = 7  # ub4 LE; 0 = a new statement
-
-
-# ub4 LE: the SQL's length, measured for the client's character set. A client in
-# AL32UTF8, the database's own, sends the byte length; one in any other set
-# (UTF8, US7ASCII, ...) sends three times it, a conversion buffer's worth
-# (measured, sqlplus 23.26, #1427).
-_OCI_ALL8_SQLLEN3_OFF = 19
-
-
-_OCI_ALL8_SQL_OFF = 196  # SQL text; the ub1 length prefix is the byte before it
-
-
 # The OALL8 preamble comes in two widths, and which one a client sends is fixed
 # for the life of its connection (#866). Between the 8-byte pointer indicators
 # sit scalar slots that an older sqlplus writes as ub8 and a modern one (23.26
@@ -9086,37 +9130,36 @@ _OCI_ALL8_IND2_OFF = 27  # second indicator, wide preamble
 _OCI_ALL8_IND2_OFF_NARROW = 23  # ... and narrow: one shrinking slot sits ahead
 
 
-class _OciAll8Layout(NamedTuple):
-    """Where the width-dependent OALL8 header fields sit in one preamble form."""
+class _OciAll8Form(NamedTuple):
+    """One OCI preamble form: its header's decoder, through the define count
+    (_ALL8_HEAD), and how many bytes follow it before the SQL's length byte."""
 
-    sql: int  # SQL text; the ub1 length prefix is the byte before it
-    bind_count: int  # ub4 LE number of binds
-
-
-_OCI_ALL8_WIDE = _OciAll8Layout(sql=_OCI_ALL8_SQL_OFF, bind_count=83)
-_OCI_ALL8_NARROW = _OciAll8Layout(sql=176, bind_count=71)
-
-# From the 12c band the narrow preamble grows by 64 bytes, all of them ahead of
-# the SQL and behind the bind count (eight more 8-byte slots, zero in every
-# capture; sqlplus 23.26 against a live 18c, #1282). The width tests above still
-# hold, and the inserted bytes are zeros a wire test could only guess at, so the
-# session's field version says which form it is.
-_OCI_ALL8_12C_GROWTH = 64
-_OCI_ALL8_NARROW_12C = _OCI_ALL8_NARROW._replace(
-    sql=_OCI_ALL8_NARROW.sql + _OCI_ALL8_12C_GROWTH
-)
-
-# sqlplus 10.2 sends the narrow preamble with 28 bytes fewer between the bind
-# count and the SQL, which starts at 148 in every statement it sent to 10g and
-# 11g; the bind count stays at 71 (#1764). Its pointer fields hold addresses, not
-# the indicator, and an address at 23 can leave bytes at 27 that look like one,
-# so the session's field version says which form it is, as for the 12c growth.
-_OCI_ALL8_10_2 = _OCI_ALL8_NARROW._replace(sql=148)
+    decode: wire_schema.Decoder
+    after_defines: int
 
 
-def _oci_all8_layout(payload: bytes, *, sql_present: bool = True) -> _OciAll8Layout:
-    """Which OALL8 preamble width ``payload`` carries, as the offsets that depend
-    on it. Raises :class:`InterfaceError` when neither shape holds, so a
+# Behind the define count, wide and narrow alike, 48 bytes stand where thin
+# writes its registration and SQL-signature fields.
+_OCI_ALL8_WIDE = _OciAll8Form(_ALL8_HEAD_FROM_OCI_WIDE, 48)
+_OCI_ALL8_NARROW = _OciAll8Form(_ALL8_HEAD_FROM_OCI, 48)
+
+# From the 12c band the narrow preamble grows by 64 bytes there (eight more
+# 8-byte slots, zero in every capture; sqlplus 23.26 against a live 18c, #1282).
+# The width tests below still hold, and the inserted bytes are zeros a wire
+# test could only guess at, so the session's field version says which form it
+# is.
+_OCI_ALL8_NARROW_12C = _OCI_ALL8_NARROW._replace(after_defines=48 + 64)
+
+# sqlplus 10.2 sends the narrow preamble with 28 bytes fewer there, the SQL at
+# 148 in every statement it sent to 10g and 11g (#1764). Its pointer fields hold
+# addresses, not the indicator, and an address at 23 can leave bytes at 27 that
+# look like one, so the session's field version says which form it is, as for
+# the 12c growth.
+_OCI_ALL8_10_2 = _OCI_ALL8_NARROW._replace(after_defines=48 - 28)
+
+
+def _oci_all8_form(payload: bytes, *, sql_present: bool = True) -> _OciAll8Form:
+    """Which OALL8 preamble form ``payload`` carries. Raises :class:`InterfaceError` when neither shape holds, so a
     differently-shaped message errors rather than yielding a garbage SQL.
     ``sql_present`` is False for a re-execute by cursor id, whose SQL pointer at
     offset 11 is absent; the second indicator still tells the width (#2014)."""
@@ -9145,12 +9188,23 @@ def _oci_all8_layout(payload: bytes, *, sql_present: bool = True) -> _OciAll8Lay
     raise InterfaceError(f'OCI OALL8: no indicator at offset {_OCI_ALL8_IND2_OFF}')
 
 
+def _oci_all8_head(
+    payload: bytes, *, sql_present: bool = True
+) -> tuple[int, int, dict[str, Any]]:
+    # An OCI OALL8's cursor id, where its SQL's length byte is, and its header
+    # fields through the define count (_ALL8_HEAD), in its preamble's form.
+    form = _oci_all8_form(payload, sql_present=sql_present)
+    (head, rest) = form.decode(payload)
+    length_at = len(payload) - len(rest) + form.after_defines
+    return head['cursor'], length_at, head
+
+
 def parse_exec_oci(payload: bytes) -> ExecRequest:
     """Parse a sqlplus / thick-OCI (deadbeef dialect) OALL8 execute (#265).
 
     The OCI counterpart of :func:`parse_exec`. Extracts the SQL text and cursor
     id from the fixed-shape OCI header, in either preamble width (see
-    :func:`_oci_all8_layout`). Scope: a single statement, its SQL either behind a
+    :func:`_oci_all8_form`). Scope: a single statement, its SQL either behind a
     ub1 length or chunked when longer, and its binds. Raises
     :class:`InterfaceError` if the message is not an OCI OALL8 in that shape, or
     carries binds of a form not read yet.
@@ -9159,24 +9213,20 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
         raise InterfaceError('not an OCI OALL8 execute')
     # Validate the indicators where the thin form has 0x01 flags, so a
     # differently-shaped message errors rather than yielding a garbage SQL.
-    layout = _oci_all8_layout(payload)
-    sql_off = layout.sql
-    bind_count_off = layout.bind_count
-    if len(payload) < sql_off:
+    (cursor, length_at, head) = _oci_all8_head(payload)
+    if len(payload) <= length_at:
         raise InterfaceError('not an OCI OALL8 execute')
-    # The options word carries the thin form's bits, little-endian: sqlplus's SET
-    # AUTOCOMMIT ON sets the commit bit and sends no COMMIT of its own, so the
-    # server commits (sqlplus 10.2 and 23.26, #2011).
-    options = int.from_bytes(
-        payload[_OCI_ALL8_OPTIONS_OFF : _OCI_ALL8_OPTIONS_OFF + 4], 'little'
-    )
-    cursor = int.from_bytes(
-        payload[_OCI_ALL8_CURSOR_OFF : _OCI_ALL8_CURSOR_OFF + 4], 'little'
-    )
-    marker = payload[sql_off - 1]  # ub1 length prefix (0xFE = chunked)
-    declared = int.from_bytes(
-        payload[_OCI_ALL8_SQLLEN3_OFF : _OCI_ALL8_SQLLEN3_OFF + 4], 'little'
-    )
+    sql_off = length_at + 1
+    # The options word carries the thin form's bits: sqlplus's SET AUTOCOMMIT ON
+    # sets the commit bit and sends no COMMIT of its own, so the server commits
+    # (sqlplus 10.2 and 23.26, #2011).
+    options = head['options']
+    marker = payload[length_at]  # ub1 length prefix (0xFE = chunked)
+    # The SQL's length, measured for the client's character set: a client in
+    # AL32UTF8, the database's own, sends the byte length; one in any other set
+    # (UTF8, US7ASCII, ...) three times it, a conversion buffer's worth
+    # (measured, sqlplus 23.26, #1427).
+    declared = head['sql_length']
     if marker == TNS_LONG_LENGTH_INDICATOR:
         # Long SQL — chunked from the marker: 0xFE, then <ub1 len><chunk> repeated
         # until a zero length. The declared length is the byte length or three
@@ -9196,7 +9246,7 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
     # a user-typed statement has none. Strip trailing NULs so the backend sees
     # clean SQL either way.
     sql = raw_sql.rstrip(b'\x00').decode('utf-8')
-    bind_count = int.from_bytes(payload[bind_count_off : bind_count_off + 4], 'little')
+    bind_count = head['bind_count']
     binds: list = []
     bind_meta: list[tuple[int, int]] = []
     bind_types: list[tuple[int, int, int, bytes]] = []
@@ -9227,7 +9277,7 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
 
 
 # The bind count sits at a fixed ub4 in the OCI OALL8 header, at whichever offset
-# the preamble width puts it (:class:`_OciAll8Layout`). After the SQL come an
+# the preamble width puts it (:class:`_OciAll8Form`). After the SQL come an
 # option array, one OAC type-descriptor per bind (each led by
 # ``01 <TNS type> 03 00 00``), and an RXD row (``0x07`` + one DALC value per
 # bind) — the same value framing the thin form uses (#265, #347). That bind
