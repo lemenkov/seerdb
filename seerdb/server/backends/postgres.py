@@ -14032,6 +14032,9 @@ def _user_group_grants(group: str) -> str:
         'dba_directories',
         'proxy_users',
         'ora_proxy_grants',
+        # Who each open proxy session's proxy is: a session reads its own
+        # through sys.ora_session_proxy() (GHSA-6qw5-v992-69fx).
+        'ora_session_proxies',
         'ora_translation_log',
     )
     return (
