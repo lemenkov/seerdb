@@ -405,6 +405,13 @@ ORA-01920.
   the EXECUTE and USAGE PostgreSQL grants to PUBLIC on what the role makes;
 - its own password changed with `ALTER USER ... IDENTIFIED BY`.
 
+**What it can't hide: source text.** Every user can read the text of every
+user's PL/SQL units, triggers and views. PostgreSQL shows any role the source
+of every function (`pg_proc.prosrc`) and the definition of every view
+(`pg_views`), and the Mirror's own records of the Oracle source are readable
+alike. On Oracle, a user sees only the source of what it may run. So don't put
+secrets in source: keep them in a table, behind a grant.
+
 **Administrators.** The accounts the operator configures (`[clients]`,
 `MIRROR_USERS`) are the administrators. Only they may run a DBA's statements:
 - `CREATE USER`, `DROP USER`, and `ALTER USER` on another user;
