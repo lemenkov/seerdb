@@ -257,3 +257,27 @@ def test_an_oci_column_is_48_bytes_ahead_of_its_name_and_8_more_from_12c() -> No
                 block = tns._encode_dcb_column_oci(col, 1, first=False)
                 name_at = block.index(bytes([len(col.name)]) + col.name)
                 assert name_at == ahead + extra
+
+
+def test_a_rowid_cell_is_one_schema_in_both_dialects() -> None:
+    # Thin: the present indicator and five fields, one unused. OCI: the length
+    # 16 and four ub4s -- sqlplus 23.26 against a live 18c (#2017).
+    rowid = 'AABAomAAMAAAACLAEr'  # object 264742, file 12, block 139, row 299
+    assert tns.encode_rowid_value(rowid, tns._OCI) == bytes.fromhex(
+        '10260a04000c0000008b0000002b010000'
+    )
+    assert tns.encode_rowid_value(rowid) == bytes.fromhex(
+        '0a0304 0a26010c0001 8b02 012b'.replace(' ', '')
+    )
+
+
+@pytest.mark.parametrize('version', (6, 7))
+def test_text_is_framed_as_each_dialect_frames_it(version: int) -> None:
+    # The same up to 252 bytes; past them, OCI's 255-byte chunks with ub1
+    # lengths, which sqlplus reads (#2053).
+    with _field_version(version):
+        for size in (0, 64, 65, 252):
+            assert tns._OCI.chr(b'x' * size) == tns._THIN.chr(b'x' * size)
+        assert tns._OCI.chr(b'x' * 300) == (
+            b'\xfe\xff' + b'x' * 255 + b'\x2d' + b'x' * 45 + b'\x00'
+        )
