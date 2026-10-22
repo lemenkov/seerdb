@@ -1526,7 +1526,31 @@ _LOB_CELL: wire_schema.Schema = (
         ),
     ),
 )
+# An object (ADT) value, a row cell's and an OUT bind's (#116, §40.4): a head
+# each dialect writes its own way, then the image's length, the TOP_LEVEL flags
+# and -- unless the value is NULL -- the image. Thin's head is the type id, an
+# empty object OID, the snapshot and the version; OCI's is the type's REF and a
+# lead of `01` and zeros (ten from a live 11g, eight from a live 18c).
+_OBJECT_FRAME: wire_schema.Schema = (
+    (
+        'only',
+        'thin',
+        (
+            ('n4', 'toid_length'),
+            ('when', 'toid_length', (('value', 'toid'),)),
+            ('n4', 'oid_length'),
+            ('n4', 'snapshot'),
+            ('n4', 'version'),
+        ),
+    ),
+    ('only', 'oci', (('raw', 'type_ref'), ('raw', 'lead'))),
+    ('n4', 'image_length'),
+    ('n2', 'flags'),
+    ('when', 'has_image', (('value', 'image'),)),
+)
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+_OBJECT_FRAME_THIN = wire_schema.compile_encoder(_OBJECT_FRAME, _THIN)
+_OBJECT_FRAME_OCI = wire_schema.compile_encoder(_OBJECT_FRAME, _OCI)
 _LOB_CELL_THIN = wire_schema.compile_encoder(_LOB_CELL, _THIN)
 _LOB_CELL_OCI = wire_schema.compile_encoder(_LOB_CELL, _OCI)
 _ROWID_CELL_THIN = wire_schema.compile_encoder(_ROWID_CELL, _THIN)
@@ -11004,18 +11028,18 @@ def _oci_out_object_value(value: object, toid: bytes) -> bytes:
 
 def _oci_object_frame(toid: bytes, image: bytes | None) -> bytes:
     # An object value as OCI frames it, an OUT bind's and a row cell's alike
-    # (§40.4): the type's REF, the lead, the image's length, `01 00`, the image.
-    # A NULL cell stops after the `01 00`, its length 0 (#2050).
-    return (
-        _kod_item_bytes(_kod_ref(toid, system=False))
-        + (
-            _OCI_OUTBIND_ADT_LEAD_12C
+    # (_OBJECT_FRAME). A NULL cell stops after the flags, its length 0 (#2050).
+    return _OBJECT_FRAME_OCI(
+        {
+            'type_ref': _kod_item_bytes(_kod_ref(toid, system=False)),
+            'lead': _OCI_OUTBIND_ADT_LEAD_12C
             if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
-            else _OCI_OUTBIND_ADT_LEAD
-        )
-        + len(image or b'').to_bytes(4, 'little')
-        + _OCI_OUTBIND_ADT_IMAGE
-        + (b'' if image is None else _oci_value_bytes(image))
+            else _OCI_OUTBIND_ADT_LEAD,
+            'image_length': len(image or b''),
+            'flags': _OBJ_TOP_LEVEL,
+            'has_image': image is not None,
+            'image': image,
+        }
     )
 
 
@@ -16068,18 +16092,23 @@ def _member_lob_contents(Value: object, Attr: dict) -> list[tuple[bytes, bool]]:
     return []
 
 
-def _encode_object_frame(Toid: bytes, Image: bytes) -> bytes:
-    # The frame every populated ADT value rides in, whatever the image inside it
-    # is: the constructed toid, an empty object OID, zero snapshot/version, the
-    # image length, the TOP_LEVEL flags, then the image.
-    return (
-        _obj_two_lengths(Toid)
-        + _obj_two_lengths(b'')  # object OID (empty for new)
-        + encode_sb4(0)  # snapshot
-        + encode_sb4(0)  # version
-        + encode_sb4(len(Image))  # image length
-        + encode_sb4(_OBJ_TOP_LEVEL)  # flags
-        + _bytes_with_length(Image)
+def _encode_object_frame(Toid: bytes, Image: bytes | None) -> bytes:
+    # The frame every ADT value rides in, whatever the image inside it is
+    # (_OBJECT_FRAME): the constructed toid, an empty object OID, zero
+    # snapshot / version, the image length, the TOP_LEVEL flags, then the image
+    # -- none for a NULL, whose length gate is zero (#116).
+    return _OBJECT_FRAME_THIN(
+        {
+            'toid_length': len(Toid),
+            'toid': Toid,
+            'oid_length': 0,  # object OID (empty for new)
+            'snapshot': 0,
+            'version': 0,
+            'image_length': len(Image or b''),
+            'flags': _OBJ_TOP_LEVEL,
+            'has_image': Image is not None,
+            'image': Image,
+        }
     )
 
 
@@ -16117,14 +16146,7 @@ def encode_object_column_value(Value: object, TypeOid: bytes = b'') -> bytes:
     if Value is not None:
         return _encode_object_bind_value(cast('DbObject', Value))
     Toid = _OBJ_TOID_PREFIX + TypeOid + _OBJ_EXTENT_OID if TypeOid else b''
-    return (
-        _obj_two_lengths(Toid)  # type OID
-        + _obj_two_lengths(b'')  # object OID (empty)
-        + encode_sb4(0)  # snapshot
-        + encode_sb4(0)  # version
-        + encode_sb4(0)  # image length gate = 0 => NULL
-        + encode_sb4(_OBJ_TOP_LEVEL)  # flags
-    )
+    return _encode_object_frame(Toid, None)
 
 
 # Buffer size the OAC of an object OUT bind advertises when there is no value to
