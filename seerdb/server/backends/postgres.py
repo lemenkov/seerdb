@@ -1750,7 +1750,7 @@ _ORACLE_DICTIONARY_DDL = (
     # only: a role that may not read the table still asks SYS_CONTEXT, whose
     # plan names every table a branch of it reads.
     'CREATE OR REPLACE FUNCTION sys.ora_session_proxy() RETURNS text '
-    'LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$ '
+    'LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ '
     'SELECT x.proxy FROM sys.ora_session_proxies x JOIN pg_stat_activity a '
     'ON a.pid = x.pid AND a.backend_start = x.started '
     'WHERE x.pid = pg_backend_pid() $$;'
@@ -2373,7 +2373,7 @@ _ORACLE_DICTIONARY_DDL = (
     # revoker nor the owner made those, so no write policy lets the session's
     # role delete them; and only those go.
     'CREATE OR REPLACE FUNCTION sys.ora_grants_cascade(owner text, name text) '
-    'RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog '
+    'RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp '
     'AS $$ DECLARE gone bigint; more bigint; BEGIN LOOP '
     'DELETE FROM sys.ora_grants g WHERE g.owner = $1 '
     'AND g.object_name = $2 AND g.grantor <> $1 AND NOT EXISTS (SELECT 1 '
@@ -3090,7 +3090,7 @@ _ORACLE_DICTIONARY_DDL = (
     # function in another user's statement. So these make and drop it as the
     # installer, from a fixed text, for the types of the session's own role.
     'CREATE OR REPLACE FUNCTION sys.ora_make_deref(ref regtype, typ regtype) '
-    'RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog '
+    'RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp '
     'AS $$ BEGIN IF NOT (SELECT bool_and(pg_has_role(session_user, typowner, '
     "'USAGE')) FROM pg_type WHERE oid IN (ref, typ)) THEN RAISE EXCEPTION USING "
     "ERRCODE = '42501', MESSAGE = 'permission denied for type ' || typ; END IF; "
@@ -3098,7 +3098,7 @@ _ORACLE_DICTIONARY_DDL = (
     "STABLE AS $f$ SELECT sys.ora_deref_row(r.tab, r.id, %L::regtype)::%s $f$', "
     'ref, typ, typ::text, typ); END $$;'
     'CREATE OR REPLACE FUNCTION sys.ora_drop_deref(ref regtype) RETURNS void '
-    'LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$ BEGIN '
+    'LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN '
     'IF ref IS NULL THEN RETURN; END IF; '
     "IF NOT (SELECT pg_has_role(session_user, typowner, 'USAGE') FROM pg_type "
     "WHERE oid = ref) THEN RAISE EXCEPTION USING ERRCODE = '42501', "
@@ -5956,8 +5956,11 @@ _ADMIN_NOOP = re.compile(
 # wherever both define a function with the same signature: TO_DATE came back as
 # PostgreSQL's date-only one, and every time of day was silently dropped
 # (#1305). Named after `oracle`, orafce's Oracle versions win, as orafce's own
-# documentation sets it up.
-_SEARCH_PATH_TAIL: Final = 'public, sys, oracle, pg_catalog'
+# documentation sets it up. `pg_temp` comes after it for the same reason: not
+# named, the session's temporary schema is searched first for a table, and a
+# caller's temporary table stood in for the one a definer-rights routine reads
+# (GHSA-24v6-492m-6mg7). A GLOBAL TEMPORARY table is still found by its name.
+_SEARCH_PATH_TAIL: Final = 'public, sys, oracle, pg_catalog, pg_temp'
 
 # orafce's TO_DATE refuses a date before 1100-03-01 (or 1582-10-05 for 'J'),
 # because it cannot VERIFY such dates against Oracle, not because Oracle
@@ -13920,7 +13923,7 @@ _SCHEMA_CHANGED = 'SDB01'
 _DDL_LOG_DDL = (
     'CREATE TABLE IF NOT EXISTS sys.ora_ddl_log (id bigserial PRIMARY KEY);'
     'CREATE OR REPLACE FUNCTION sys.ora_ddl_logged() RETURNS event_trigger '
-    'LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$ BEGIN '
+    'LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN '
     # Only the installer's own setup DDL goes unlogged: the setting is any
     # session's to change (GHSA-336m-cp9c-m2fw).
     "IF current_setting('seerdb.installing', true) IS DISTINCT FROM 'on' OR "

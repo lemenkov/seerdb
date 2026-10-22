@@ -2245,7 +2245,7 @@ def test_translate_admin_maps_session_user_and_index() -> None:
     # session could not find the table it had just created (#818).
     assert (
         _translate_admin('ALTER SESSION SET CURRENT_SCHEMA = TEST_SCHEMA')
-        == 'SET search_path TO test_schema, public, sys, oracle, pg_catalog'
+        == 'SET search_path TO test_schema, public, sys, oracle, pg_catalog, pg_temp'
     )
     assert (
         _translate_admin('CREATE USER test_schema IDENTIFIED BY secret')
@@ -3754,6 +3754,89 @@ def test_per_user_roles_keep_the_users_apart() -> None:
             ).fetchone() == (True,)
     finally:
         _drop_mirror_roles(pg, user, admin)
+        pg.close()
+
+
+def test_a_callers_temporary_table_stands_in_for_no_definers_table() -> None:
+    # A definer-rights routine reads its owner's table, and the DDL log's
+    # trigger PostgreSQL's catalog, whatever temporary tables the caller has
+    # of their names: the temporary schema is last on every path
+    # (GHSA-24v6-492m-6mg7).
+    pid = os.getpid()
+    admin = f'tt_adm_{pid}'
+    (owner, caller) = (f'tt_a_{pid}', f'tt_b_{pid}')
+    pg = psycopg.connect(_CONNINFO, autocommit=True)
+    opened: list[Any] = []
+    try:
+        with _per_user_mirror(_CONNINFO, admin, native_sql=True) as base:
+
+            def login(name: str, password: str = 'pw123') -> Any:
+                opened.append(base(name, password))
+                return opened[-1]
+
+            adm = login(admin, 'adm123').cursor()
+            for name in (owner, caller):
+                adm.execute(f'create user {name} identified by pw123')
+            cur = login(owner).cursor()
+            cur.execute('create table tt_cfg (v varchar2(20))')
+            cur.execute("insert into tt_cfg values ('real')")
+            cur.connection.commit()
+            cur.execute(
+                'create or replace function tt_get return varchar2 is r varchar2(20); '
+                'begin select v into r from tt_cfg; return r; end;'
+            )
+            cur.execute(f'grant execute on tt_get to {caller}')
+            other = login(caller).cursor()
+            other.execute(
+                'create global temporary table tt_cfg (v varchar2(20)) '
+                'on commit preserve rows'
+            )
+            other.execute("insert into tt_cfg values ('fake')")
+            other.execute("alter session set seerdb_dialect = 'postgres'")
+            other.execute(
+                "DO $$ BEGIN EXECUTE format('GRANT SELECT ON pg_temp.tt_cfg TO %I', "
+                f"'{owner}'); END $$"
+            )
+            other.execute(
+                'CREATE TEMP TABLE pg_roles AS SELECT * FROM pg_catalog.pg_roles'
+            )
+            other.execute(
+                'INSERT INTO pg_temp.pg_roles (oid, rolname) '
+                'VALUES (CAST(1 AS oid), CAST(current_user AS name))'
+            )
+            other.execute(
+                'CREATE TEMP TABLE pg_namespace AS SELECT * FROM pg_catalog.pg_namespace'
+            )
+            other.execute(
+                "UPDATE pg_temp.pg_namespace SET nspowner = CAST(1 AS oid) WHERE nspname = 'sys'"
+            )
+            other.execute("alter session set seerdb_dialect = 'oracle'")
+            other.connection.commit()
+            other.execute(f'select {owner}.tt_get() from dual')
+            assert other.fetchall() == [('real',)]
+            # The session's own unqualified name is still its temporary table.
+            other.execute('select v from tt_cfg')
+            assert other.fetchall() == [('fake',)]
+            other.execute(
+                "select set_config('seerdb.installing', 'on', false) from dual"
+            )
+            logged = pg.execute('SELECT count(*) FROM sys.ora_ddl_log').fetchone()
+            other.execute('create table tt_t (n number)')
+            if (
+                logged is not None
+                and pg.execute(
+                    "SELECT 1 FROM pg_event_trigger WHERE evtname = 'ora_ddl_log'"
+                ).fetchone()
+            ):
+                assert (
+                    pg.execute('SELECT count(*) FROM sys.ora_ddl_log').fetchone()[0]
+                    > logged[0]
+                )
+    finally:
+        for session in opened:
+            with contextlib.suppress(Exception):
+                session.close()
+        _drop_mirror_roles(pg, caller, owner, admin)
         pg.close()
 
 
