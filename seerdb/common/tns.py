@@ -1548,7 +1548,21 @@ _OBJECT_FRAME: wire_schema.Schema = (
     ('n2', 'flags'),
     ('when', 'has_image', (('value', 'image'),)),
 )
+# The CLOSE_CURSORS (OCCA) piggyback (#191, #1517): the cursors a client
+# frees, in front of its next call. Live 11g, sqlplus closing cursors 3 and 1:
+# `11 69 11 | fe ff..ff | 02 00 00 00 00 00 00 00 | 03 00 00 00 01 00 00 00`.
+_CLOSE_CURSORS: wire_schema.Schema = (
+    ('const', bytes([TTI_MSG_TYPE_PIGGYBACK, TTI_OCCA])),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+    ('ptr', 'cursors_present'),
+    ('n8', 'count'),
+    ('each', 'cursors', 'count', (('n4', 'cursor'),)),
+)
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+_CLOSE_CURSORS_THIN = wire_schema.compile_encoder(_CLOSE_CURSORS, _THIN)
+_CLOSE_CURSORS_FROM_THIN = wire_schema.compile_decoder(_CLOSE_CURSORS, _THIN)
+_CLOSE_CURSORS_FROM_OCI = wire_schema.compile_decoder(_CLOSE_CURSORS, _OCI)
 _OBJECT_FRAME_THIN = wire_schema.compile_encoder(_OBJECT_FRAME, _THIN)
 _OBJECT_FRAME_OCI = wire_schema.compile_encoder(_OBJECT_FRAME, _OCI)
 _LOB_CELL_THIN = wire_schema.compile_encoder(_LOB_CELL, _THIN)
@@ -4555,9 +4569,6 @@ def encode_version_banner_oci(banner: bytes, release: int = VERSION_11_2_0_2) ->
 _OCI_PIGGYBACK = bytes([TTI_MSG_TYPE_PIGGYBACK, TTI_OCCA])
 
 
-_OCI_PIGGYBACK_FIXED = 3 + 8 + 8  # 0x11 0x69 seq | indicator | count
-
-
 # The version call and sqlplus PASSWORD changepassword instead arrive wrapped in
 # a TTI_80SES (0x11 0x6b) piggyback: a fixed 15-byte prefix (0x11 0x6b, a seq
 # byte, and a 12-byte session-switch preamble) then the real TTI_FUN call. The
@@ -5019,8 +5030,7 @@ def strip_oci_piggyback(body: bytes) -> bytes:
     TTI_80SES (``0x11 0x6b``) piggyback around the version call and the
     changepassword (:func:`is_version_call_oci` splits those two apart)."""
     if body[:2] == _OCI_PIGGYBACK:
-        count = int.from_bytes(body[11:15], 'little')
-        return body[_OCI_PIGGYBACK_FIXED + count * 4 :]
+        return _CLOSE_CURSORS_FROM_OCI(body)[1]
     if body[:2] == oci.OCI_PIGGYBACK_80SES:
         return body[_OCI_80SES_FIXED:]
     return body
@@ -7168,17 +7178,26 @@ def _e2e_header(Modified: bool, Value: bytes | None) -> bytes:
 
 def encode_close_cursors_piggyback(Seq: int, FieldVersion: int, Cursors: list) -> bytes:
     """Build the CLOSE_CURSORS (OCCA, func 105) piggyback that frees a batch of
-    server cursors (#191). Rides in front of the next call's message; the server
-    closes the listed cursors before processing that call. Mirrors oracledb's
-    _write_close_cursors_piggyback — note the ub8 token at fv24, which the older
-    encode_dictionary_pig path omitted (it was never exercised on 12c+)."""
-    Out = bytes([TTI_MSG_TYPE_PIGGYBACK, TTI_OCCA, Seq])
-    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
-        Out += encode_sb4(0)  # ub8 token (0)
-    Out += bytes([1]) + encode_sb4(len(Cursors))  # pointer + count
-    for C in Cursors:
-        Out += encode_sb4(C)
-    return Out
+    server cursors (#191, _CLOSE_CURSORS). Rides in front of the next call's
+    message; the server closes the listed cursors before processing that call.
+    Mirrors oracledb's _write_close_cursors_piggyback -- note the ub8 token at
+    fv24, which the older encode_dictionary_pig path omitted (it was never
+    exercised on 12c+)."""
+    return _CLOSE_CURSORS_THIN(
+        {
+            'seq': Seq,
+            'token_number': 0 if FieldVersion >= FIELD_VERSION_23_1_EXT_1 else None,
+            'cursors_present': True,
+            'count': len(Cursors),
+            'cursors': [{'cursor': c} for c in Cursors],
+        }
+    )
+
+
+def skip_close_cursors_piggyback(body: bytes) -> bytes:
+    """What follows a thin CLOSE_CURSORS piggyback at the start of ``body``
+    (_CLOSE_CURSORS): the Mirror keeps no cursor state to free."""
+    return _CLOSE_CURSORS_FROM_THIN(body)[1]
 
 
 def encode_end_to_end_piggyback(Seq: int, FieldVersion: int, Attrs: dict) -> bytes:
