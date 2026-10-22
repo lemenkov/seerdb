@@ -18,6 +18,8 @@ A schema is a tuple of fields:
   variable-width in thin, a ub4 / ub2 little-endian in OCI;
 - ``('value', name)``: bytes with their length, chunked past 252 bytes;
 - ``('lob', name)``: LOB_DATA content, always chunked unless empty;
+- ``('token', name)``: a function call's token number, which thin sends from
+  23ai (``None`` for none) and OCI never;
 - ``('when', name, fields)``: ``fields`` only when the integer ``name`` is not
   zero;
 - ``('each', name, count, fields)``: ``fields`` once per item of the list
@@ -25,8 +27,8 @@ A schema is a tuple of fields:
 - ``('only', dialect, fields)``: ``fields`` in that dialect alone.
 
 A codec has a ``name`` (``'thin'`` or ``'oci'``) and the primitives ``n4``,
-``n2``, ``value`` and ``lob``, and to decode ``read_n4``, ``read_n2``,
-``read_value`` and ``read_lob``, each taking the bytes and returning the value
+``n2``, ``value``, ``lob`` and ``token``, and to decode ``read_n4``,
+``read_n2``, ``read_value``, ``read_lob`` and ``read_token``, each taking the bytes and returning the value
 and the rest. This module knows no codec: :mod:`seerdb.common.tns` defines
 them, beside the encoders they replaced.
 """
@@ -37,6 +39,8 @@ from collections.abc import Callable
 from typing import Any, Protocol
 
 Schema = tuple[tuple[Any, ...], ...]
+# The field kinds a codec packs itself.
+_PRIMITIVES = ('n4', 'n2', 'value', 'lob', 'token')
 Encoder = Callable[[dict[str, Any]], bytes]
 Decoder = Callable[[bytes], tuple[dict[str, Any], bytes]]
 
@@ -48,10 +52,12 @@ class Codec(Protocol):
     def n2(self, value: int) -> bytes: ...
     def value(self, data: bytes) -> bytes: ...
     def lob(self, data: bytes) -> bytes: ...
+    def token(self, value: int | None) -> bytes: ...
     def read_n4(self, data: bytes) -> tuple[int, bytes]: ...
     def read_n2(self, data: bytes) -> tuple[int, bytes]: ...
     def read_value(self, data: bytes) -> tuple[bytes, bytes]: ...
     def read_lob(self, data: bytes) -> tuple[bytes, bytes]: ...
+    def read_token(self, data: bytes) -> tuple[int | None, bytes]: ...
 
 
 def _encode_part(field: tuple[Any, ...], codec: Codec) -> Callable[[dict], bytes]:
@@ -62,7 +68,7 @@ def _encode_part(field: tuple[Any, ...], codec: Codec) -> Callable[[dict], bytes
     if kind == 'u8':
         name = field[1]
         return lambda values: bytes((values[name],))
-    if kind in ('n4', 'n2', 'value', 'lob'):
+    if kind in _PRIMITIVES:
         (pack, name) = (getattr(codec, kind), field[1])
         return lambda values: pack(values[name])
     if kind == 'when':
@@ -101,7 +107,7 @@ def compile_decoder(schema: Schema, codec: Codec) -> Decoder:
                 data = data[len(field[1]) :]
             elif kind == 'u8':
                 (values[field[1]], data) = (data[0], data[1:])
-            elif kind in ('n4', 'n2', 'value', 'lob'):
+            elif kind in _PRIMITIVES:
                 (values[field[1]], data) = getattr(codec, 'read_' + kind)(data)
             elif kind == 'when':
                 if values[field[1]]:

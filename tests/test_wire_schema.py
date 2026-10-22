@@ -101,3 +101,35 @@ def test_sta_decodes_back_in_both_dialects() -> None:
 def test_an_unknown_field_kind_is_refused() -> None:
     with pytest.raises(ValueError, match='unknown field kind'):
         wire_schema.compile_encoder((('ub3', 'x'),), tns._THIN)
+
+
+@pytest.mark.parametrize('version', (6, 24))
+def test_fetch_and_exec_by_cursor_decode_back_in_both_dialects(version: int) -> None:
+    # Thin sends a call's token number from 23ai, OCI never (#2064).
+    fetch = {'seq': 15, 'cursor': 2, 'rows': 15}
+    execute = {
+        'function': 4,
+        'seq': 8,
+        'cursor': 3,
+        'iterations': 1,
+        'options': 0x20,
+        'options_2': 0,
+    }
+    with _field_version(version):
+        for codec in CODECS:
+            token = 0 if codec is tns._THIN and version >= 24 else None
+            for schema, fields in ((tns._FETCH, fetch), (tns._EXEC_BY_CURSOR, execute)):
+                values = fields | {'token_number': token}
+                wire = wire_schema.compile_encoder(schema, codec)(values)
+                decode = wire_schema.compile_decoder(schema, codec)
+                assert decode(wire + b'rest') == (values, b'rest')
+
+
+def test_an_oci_fetch_is_the_thin_fields_at_fixed_width() -> None:
+    # Live 11g / 18c: `03 05 0f 02 00 00 00 0f 00 00 00` asks cursor 2 for 15 rows.
+    wire = bytes.fromhex('03050f020000000f000000')
+    assert tns.parse_fetch_oci(wire) == 15
+    with _field_version(6):
+        assert tns.encode_dictionary_fetch(
+            {'seq': 15, 'cursor': 2, 'fetch': 15, 'field_version': 6}
+        ) == bytes.fromhex('03050f0102010f')
