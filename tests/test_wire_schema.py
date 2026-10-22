@@ -133,3 +133,43 @@ def test_an_oci_fetch_is_the_thin_fields_at_fixed_width() -> None:
         assert tns.encode_dictionary_fetch(
             {'seq': 15, 'cursor': 2, 'fetch': 15, 'field_version': 6}
         ) == bytes.fromhex('03050f0102010f')
+
+
+@pytest.mark.parametrize('version', FIELD_VERSIONS)
+@pytest.mark.parametrize(
+    'content', (None, b'', b'x', bytes(252), bytes(253), bytes(600))
+)
+def test_a_long_cell_decodes_back_in_both_dialects(
+    version: int, content: bytes | None
+) -> None:
+    # Thin's trailer has two indicators, OCI's one (#2064).
+    with _field_version(version):
+        for codec in CODECS:
+            values = {'content': content, 'actual_length': 0, 'return_code': 0}
+            if codec is tns._OCI:
+                del values['return_code']
+            wire = wire_schema.compile_encoder(tns._LONG_CELL, codec)(values)
+            decode = wire_schema.compile_decoder(tns._LONG_CELL, codec)
+            assert decode(wire) == (values, b'')
+
+
+def test_the_describe_trailer_is_the_same_fields_in_both_dialects() -> None:
+    # OCI's 33 bytes: a lead byte, the 7-byte date in the two-length form, four
+    # ub4 flags and the query key's ub4 length; sqlplus 10.2's 29 lack the key.
+    # A LOB describe sets the second flag (#405).
+    with _field_version(24):
+        oci = tns._describe_trailer(oci=True)
+        assert oci == b'\x00\x07\x00\x00\x00\x07' + bytes(7) + bytes(16) + bytes(4)
+        assert tns._describe_trailer(oci=False) == bytes(6)
+        lob = tns._describe_trailer(oci=True, mdbz=8168)
+        assert lob[17:21] == (8168).to_bytes(4, 'little')
+    with _field_version(4):
+        assert len(tns._describe_trailer(oci=True)) == 29
+        assert tns._describe_trailer(oci=False) == bytes(5)
+
+
+def test_a_ref_cursor_value_is_one_schema_with_its_dialects_lead() -> None:
+    values = {'lead': 1, 'describe': b'D', 'cursor': 300, 'return_code': 0}
+    assert tns._REFCURSOR_OUT_THIN(values) == b'\x01D\x02\x01\x2c\x00'
+    values['lead'] = 0x4C
+    assert tns._REFCURSOR_OUT_OCI(values) == b'\x4cD\x2c\x01\x00\x00\x00\x00'
