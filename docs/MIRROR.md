@@ -419,9 +419,38 @@ secrets in source: keep them in a table, behind a grant.
 - `CREATE` or `DROP DIRECTORY`, and `CREATE` or `DROP EDITION`;
 - `ALTER SYSTEM KILL SESSION`.
 
-A user created with SQL gets ORA-01031 for these. The Mirror runs them on a
-connection of the connection role. `DROP USER` drops the user's role and what it
-owns, and refuses a user with a session open (ORA-01940), as Oracle does.
+A user created with SQL gets ORA-01031 for these, unless it holds the system
+privilege the statement needs, or the `DBA` role:
+
+| statement | privilege |
+|---|---|
+| `CREATE USER` / `DROP USER` | `CREATE USER` / `DROP USER` |
+| `ALTER USER` on another user, `CONNECT THROUGH` | `ALTER USER` |
+| `CREATE` / `DROP DIRECTORY` | `CREATE ANY DIRECTORY` / `DROP ANY DIRECTORY` |
+| `CREATE` / `DROP EDITION` | `CREATE ANY EDITION` / `DROP ANY EDITION` |
+| `ALTER SYSTEM KILL SESSION` | `ALTER SYSTEM` |
+
+`GRANT p TO u [WITH ADMIN OPTION]` and `REVOKE p FROM u` give and take them, as
+on Oracle:
+- **Who may grant or revoke:** an administrator, a `DBA`, or a holder of the
+  privilege `WITH ADMIN OPTION`.
+- **Revoking doesn't cascade.**
+- **Errors:** ORA-01917 for an unknown grantee; ORA-01951 or ORA-01952 for a
+  revoke of what wasn't granted.
+- **Listing them:** `USER_SYS_PRIVS`, `USER_ROLE_PRIVS`, `SESSION_PRIVS` and
+  `SESSION_ROLES` list a user's own and `PUBLIC`'s. `DBA_SYS_PRIVS` and
+  `DBA_ROLE_PRIVS` list all; in per-user mode, like the other `DBA_` views,
+  only the connection role reads them.
+- **Other privileges and roles:** any other system privilege or role
+  (`CREATE SESSION`, `CONNECT`, `RESOURCE`, …) is accepted and does nothing.
+- **The administrators themselves:** their right comes from the
+  configuration, not a grant, so `SESSION_PRIVS` doesn't list it.
+
+In single-role mode, grants are recorded and listed but enforce nothing.
+
+The Mirror runs these statements on a connection of the connection role.
+`DROP USER` drops the user's role and what it owns, along with the user's
+grants, and refuses a user with a session open (ORA-01940), as Oracle does.
 
 **Object grants.** `GRANT` and `REVOKE` on a table, view, sequence, procedure,
 function, package or type become PostgreSQL's own, so another user's object
