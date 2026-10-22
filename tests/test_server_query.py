@@ -4047,7 +4047,7 @@ def test_an_unsized_column_describes_as_a_live_server_does(kind, column) -> None
 def test_a_rowid_cell_is_four_ub4s() -> None:
     # sqlplus reads a ROWID cell as its four parts, each a ub4 LE; the thin
     # form crashed it (#2017). Four rows of one table, as a live 18c sent them.
-    from seerdb.common.tns import _oci_rowid_value
+    from seerdb.common.tns import _OCI, encode_rowid_value
 
     live = {
         'AABAomAAMAAAACLAAA': '260a04000c0000008b00000000000000',
@@ -4056,7 +4056,7 @@ def test_a_rowid_cell_is_four_ub4s() -> None:
         'AABAomAAMAAAACMAAp': '260a04000c0000008c00000029000000',
     }
     for rowid, image in live.items():
-        assert _oci_rowid_value(rowid) == b'\x10' + bytes.fromhex(image)
+        assert encode_rowid_value(rowid, _OCI) == b'\x10' + bytes.fromhex(image)
 
 
 # `cast(1.5 as binary_float) bf, cast(2.5 as binary_double) bd` described by a

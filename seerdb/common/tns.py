@@ -1089,6 +1089,14 @@ class _ThinCodec:
     read_lob = read_value
 
     @staticmethod
+    def chr(data: str | bytes) -> bytes:
+        # Text and RAW as thin frames them (encode_chr): from 12.1 as any value,
+        # before it in 64-byte chunks past 64 bytes.
+        return encode_chr(data)
+
+    read_chr = read_value
+
+    @staticmethod
     def long(data: bytes | None) -> bytes:
         # A LONG / LONG RAW cell (#484): chunked even when it fits one chunk,
         # 252 bytes at most, in the chunk framing of the negotiated version;
@@ -1190,6 +1198,20 @@ class _OciCodec:
         if not data:
             return b'\x00'
         return _OciCodec._chunked(data)
+
+    @staticmethod
+    def chr(data: str | bytes) -> bytes:
+        # Text and RAW: as thin frames them up to 252 bytes, in OCI's chunks
+        # past them -- the thin form's chunk lengths hung sqlplus on a
+        # 300-character VARCHAR2 (#2053).
+        raw = data.encode('utf-8') if isinstance(data, str) else data
+        if len(raw) > TNS_MAX_SHORT_LENGTH:
+            return _OciCodec._chunked(raw)
+        return encode_chr(raw)
+
+    @staticmethod
+    def read_chr(data: bytes) -> tuple[bytes, bytes]:
+        return _OciCodec.read_value(data)
 
     @staticmethod
     def long(data: bytes | None) -> bytes:
@@ -1469,7 +1491,20 @@ _DCB_COLUMN: wire_schema.Schema = (
         ),
     ),
 )
+# A physical ROWID cell (#484, #2017): a lead byte -- thin's present
+# indicator, OCI's length -- then the data object, relative file, block and
+# row numbers, with an unused field behind the file in thin only.
+_ROWID_CELL: wire_schema.Schema = (
+    ('u8', 'lead'),
+    ('n4', 'object'),
+    ('n4', 'file'),
+    ('only', 'thin', (('n4', 'unused'),)),
+    ('n4', 'block'),
+    ('n4', 'row'),
+)
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+_ROWID_CELL_THIN = wire_schema.compile_encoder(_ROWID_CELL, _THIN)
+_ROWID_CELL_OCI = wire_schema.compile_encoder(_ROWID_CELL, _OCI)
 _DCB_COLUMN_THIN = wire_schema.compile_encoder(_DCB_COLUMN, _THIN)
 _DCB_COLUMN_OCI = wire_schema.compile_encoder(_DCB_COLUMN, _OCI)
 _LONG_CELL_THIN = wire_schema.compile_encoder(_LONG_CELL, _THIN)
@@ -10935,10 +10970,6 @@ def _oci_object_image(obj: 'DbObject') -> bytes:
     )
 
 
-# The cell types whose value is the bytes themselves, framed as one value (#2053).
-_OCI_CHUNKED_CELL_TYPES = frozenset({TNS_TYPE_VARCHAR, TNS_TYPE_CHAR, TNS_TYPE_RAW})
-
-
 def _oci_out_object_value(value: object, toid: bytes) -> bytes:
     from seerdb.common.dbobject import DbObject
 
@@ -11430,22 +11461,17 @@ def _encode_oci_value(value: object, col: ColumnMeta, slot: int | None = None) -
     if col.data_type == TNS_TYPE_ADT:
         return encode_object_column_value(value, col.type_oid)
     if col.data_type == TNS_TYPE_RID and isinstance(value, str):
-        return _oci_rowid_value(value)
-    if col.data_type in _OCI_CHUNKED_CELL_TYPES and isinstance(value, (str, bytes)):
-        # A character or RAW cell past 252 bytes goes in OCI's chunks, not the
-        # thin form's: `print` of a 300-character VARCHAR2 variable, which
-        # sqlplus runs as a SELECT, hung on its row (#2053).
-        wire = _national_wire_value(value, col)
-        raw = wire.encode('utf-8') if isinstance(wire, str) else wire
-        if isinstance(raw, bytes) and len(raw) > TNS_MAX_SHORT_LENGTH:
-            return _oci_value_bytes(raw)
+        # A value that is no physical rowid goes as the thin path sends it.
+        if _physical_rowid(value) == (0, 0, 0, 0):
+            return encode_value(value, TNS_TYPE_RID)
+        return encode_rowid_value(value, _OCI)
     if (
         col.data_type == TNS_TYPE_TIMESTAMPTZ
         and isinstance(value, datetime.datetime)
         and _ENCODE_OCI_TSTZ_LOCAL.get()
     ):
         return _oci_timestamptz_value(value)
-    return encode_value(_national_wire_value(value, col), col.data_type)
+    return encode_value(_national_wire_value(value, col), col.data_type, _OCI)
 
 
 # The flag a TIMESTAMP WITH TIME ZONE cell's offset-hour byte carries to OCI:
@@ -11486,20 +11512,6 @@ def _oci_timestamptz_value(value: datetime.datetime) -> bytes:
         + (aware.microsecond * 1000).to_bytes(4, 'big')
         + bytes([(hours + 20) | _OCI_TSTZ_LOCAL_FLAG, minutes + 60])
     )
-    return bytes([len(image)]) + image
-
-
-def _oci_rowid_value(rowid: str) -> bytes:
-    # A ROWID cell as OCI reads it (#2017): 16 bytes, the data object number,
-    # relative file number, block number and row number, each a ub4 LE, not the
-    # thin form's packed fields. sqlplus 23.26 against a live 18c, four rows of
-    # one table: `26 0a 04 00 0c 00 00 00 8b 00 00 00 2b 01 00 00` is
-    # AABAomAAMAAAACLAEr, object 264742, file 12, block 139, row 299. A value
-    # that is no physical rowid goes as the thin path sends it.
-    parts = _physical_rowid(rowid)
-    if parts == (0, 0, 0, 0):
-        return encode_value(rowid, TNS_TYPE_RID)
-    image = struct.pack('<IIII', *parts)
     return bytes([len(image)]) + image
 
 
@@ -14448,25 +14460,24 @@ _UROWID_LOGICAL_TAG = 0x02
 _UROWID_PHYSICAL_TAG = 0x01
 
 
-def encode_rowid_value(Value: object) -> bytes:
+def encode_rowid_value(
+    Value: object, Codec: _ThinCodec | _OciCodec | None = None
+) -> bytes:
     """The physical ROWID (RID, type 11) RXD value (#484), the inverse of
-    :func:`_read_rowid_column`: a present-indicator byte then the structured rowid
-    — data object / relative file / an unused field / block / slot, each a ub4.
-    ``Value`` is the 18-char extended ROWID string; ``None`` (or empty) is a bare
-    ``0x00`` indicator (NULL)."""
+    :func:`_read_rowid_column` (_ROWID_CELL). ``Value`` is the 18-char extended
+    ROWID string; ``None`` (or empty) is a bare ``0x00`` indicator (NULL). OCI
+    reads it as 16 bytes, its fields each a ub4 LE (#2017): sqlplus 23.26
+    against a live 18c, `26 0a 04 00 0c 00 00 00 8b 00 00 00 2b 01 00 00` is
+    AABAomAAMAAAACLAEr, object 264742, file 12, block 139, row 299."""
     from seerdb.common.types import string_to_rowid
 
     if Value is None or Value == '':
         return bytes([0])
-    Obj, File, Block, Slot = string_to_rowid(str(Value))
-    return (
-        bytes([_RID_PRESENT])
-        + encode_sb4(Obj)
-        + encode_sb4(File)
-        + encode_sb4(0)  # unused field between file and block
-        + encode_sb4(Block)
-        + encode_sb4(Slot)
-    )
+    (obj, file, block, row) = string_to_rowid(str(Value))
+    fields = {'object': obj, 'file': file, 'block': block, 'row': row}
+    if Codec is _OCI:
+        return _ROWID_CELL_OCI(fields | {'lead': 16})
+    return _ROWID_CELL_THIN(fields | {'lead': _RID_PRESENT, 'unused': 0})
 
 
 def encode_urowid_value(Value: object) -> bytes:
@@ -14837,7 +14848,9 @@ def decode_bfile_locator(Locator: bytes) -> tuple[str, str] | None:
         return None
 
 
-def encode_value(Value: object, DataType: int) -> bytes:
+def encode_value(
+    Value: object, DataType: int, Codec: _ThinCodec | _OciCodec | None = None
+) -> bytes:
     """A scalar column value as its RXD wire form — the inverse of
     :func:`~seerdb.common.types.decode_value`.
 
@@ -14845,7 +14858,10 @@ def encode_value(Value: object, DataType: int) -> bytes:
     UTF-8, a number is Oracle's base-100 NUMBER encoding, a datetime/date per the
     column's temporal type. ROWID / UROWID / LONG carry their own framing (a NULL
     still carries it, so they skip the bare-0x00 NULL path), and a LOB rides as a
-    minted locator with its content following over TTI_LOBOPS."""
+    minted locator with its content following over TTI_LOBOPS.
+
+    ``Codec`` frames the value as its dialect does (#2064), thin's by default."""
+    Codec = Codec or _THIN
 
     if DataType == TNS_TYPE_BFILE:
         # A BFILE names a file on the server; the locator carries the two names
@@ -14863,7 +14879,7 @@ def encode_value(Value: object, DataType: int) -> bytes:
             locator=encode_bfile_locator(Value.directory, Value.filename)
         )
     if DataType == TNS_TYPE_RID:
-        return encode_rowid_value(Value)
+        return encode_rowid_value(Value, Codec)
     if DataType == TNS_TYPE_UROWID:
         return encode_urowid_value(Value)
     if DataType in (TNS_TYPE_LONG, TNS_TYPE_LONGRAW):
@@ -14873,11 +14889,11 @@ def encode_value(Value: object, DataType: int) -> bytes:
     if DataType == TNS_TYPE_REF:
         # An object REF (#119/#494) rides as a plain DALC of its opaque locator
         # bytes; the type identity travels in the describe, not the value.
-        return _bytes_with_length(getattr(Value, 'bytes', b''))
+        return Codec.value(getattr(Value, 'bytes', b''))
     if DataType == TNS_TYPE_INTERVALDS and isinstance(Value, datetime.timedelta):
-        return _bytes_with_length(encode_token_interval_ds(Value))
+        return Codec.value(encode_token_interval_ds(Value))
     if DataType == TNS_TYPE_INTERVALYM and isinstance(Value, IntervalYM):
-        return _bytes_with_length(encode_token_interval_ym(Value))
+        return Codec.value(encode_token_interval_ym(Value))
     if DataType in (TNS_TYPE_CLOB, TNS_TYPE_BLOB, TNS_TYPE_JSON, TNS_TYPE_VECTOR):
         # A thin CLOB / BLOB / JSON / VECTOR value is delivered as an opaque
         # locator; the content follows over TTI_LOBOPS (#413). JSON content is the
@@ -14901,31 +14917,31 @@ def encode_value(Value: object, DataType: int) -> bytes:
         # FALSE, which the client reads by its last byte (Data[-1] != 0). This must
         # come before the bool branch below — a bool encoded as a NUMBER would make
         # FALSE (NUMBER 0 -> 0x80) read back as TRUE.
-        return _bytes_with_length(bytes([1 if Value else 0]))
+        return Codec.value(bytes([1 if Value else 0]))
     if isinstance(Value, bool):
         # No 11g BOOLEAN type; a bool is a NUMBER 0/1 (bool is an int subclass, so
         # match it before the int branch would silently swallow it).
-        return _bytes_with_length(encode_token_num(int(Value)))
+        return Codec.value(encode_token_num(int(Value)))
     if isinstance(Value, (int, float)):
         # A BINARY_FLOAT / BINARY_DOUBLE column carries the IEEE-754 value in
         # Oracle's order-preserving form, not base-100 NUMBER.
         if DataType == TNS_TYPE_BDOUBLE:
-            return _bytes_with_length(encode_token_binary_double(float(Value)))
+            return Codec.value(encode_token_binary_double(float(Value)))
         if DataType == TNS_TYPE_BFLOAT:
-            return _bytes_with_length(encode_token_binary_float(float(Value)))
-        return _bytes_with_length(encode_token_num(Value))
+            return Codec.value(encode_token_binary_float(float(Value)))
+        return Codec.value(encode_token_num(Value))
     if isinstance(Value, Decimal):
         # NUMBER via the exact base-100 Decimal encoder: high-precision values
         # (beyond float's ~15 significant digits) round-trip unchanged.
-        return _bytes_with_length(encode_token_decimal(Value))
+        return Codec.value(encode_token_decimal(Value))
     if isinstance(Value, (datetime.date, BcDate)):
         # datetime is a date subclass, so this covers both; the column's data_type
         # decides DATE / TIMESTAMP / TIMESTAMPTZ width.
-        return _bytes_with_length(_encode_temporal(Value, DataType))
+        return Codec.value(_encode_temporal(Value, DataType))
     if isinstance(Value, (str, bytes)):
         # A VARCHAR2 / RAW column value: length-prefixed data, chunked when it
         # exceeds the single-byte length, honouring the negotiated field version.
-        return encode_chr(Value)
+        return Codec.chr(Value)
     raise NotSupportedError(
         f'no wire encoding for a column value of type {type(Value).__name__}'
     )
