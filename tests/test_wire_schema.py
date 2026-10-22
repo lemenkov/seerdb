@@ -385,3 +385,26 @@ def test_an_error_message_is_framed_by_each_dialects_value(version: int) -> None
     assert tns._oci_error_text(message) == (
         b'\xfe\xff' + message[:255] + b'\x4e' + message[255:] + b'\x00'
     )
+
+
+def test_an_oci_login_request_is_thins_fields_at_fixed_width() -> None:
+    # sqlplus 11.2's and 10.2's OSESSKEY and 11.2's AUTH: 8-byte pointers (10.2
+    # writes addresses), ub4 lengths declared at three times the characters, a
+    # ub8 pair count, the user as a value (#265, #1764).
+    import sys
+
+    sys.path.insert(0, 'tests')
+    from test_server_auth import _OCI_AUTH_SEEDED, _OCI_OSESSKEY_10_2
+
+    head = tns.decode_auth_oci_head(_OCI_OSESSKEY_10_2)
+    assert (head['subtype'], head['user'], head['user_length']) == (0x76, b'pyo', 9)
+    assert all(head[f'pointer_{n}'] for n in (1, 2, 3, 4))
+    fields = tns.decode_auth_oci(_OCI_AUTH_SEEDED)
+    assert (fields['subtype'], fields['user'], fields['pair_count']) == (
+        0x73,
+        b'pyo',
+        len(fields['pairs']),
+    )
+    keys = {pair.get('key'): pair for pair in fields['pairs']}
+    assert keys[b'AUTH_SESSKEY']['key_length'] == 3 * len(b'AUTH_SESSKEY')
+    assert len(keys[b'AUTH_SESSKEY']['value']) == 96  # 48 bytes as hex

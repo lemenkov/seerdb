@@ -64,15 +64,18 @@ from seerdb.common.tns import (
     AUTH_GLOBALLY_UNIQUE_DBID,
     Challenge,
     _hexval,
+    decode_auth_head,
+    decode_auth_oci,
+    decode_auth_oci_head,
     decode_dalc,
     decode_kv,
     decode_ub4,
+    encode_auth_pair_oci,
 )
 from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_12_2,
-    FIELD_VERSION_23_1_EXT_1,
     TTI_AUTH,
     TTI_FUN,
     TTI_RPA,
@@ -269,17 +272,11 @@ def _result_params(identity: ServerIdentity) -> tuple[tuple[bytes, bytes], ...]:
 
 
 def encode_kv_oci(key: bytes, val: bytes, flags: int = 0) -> bytes:
-    """One OCI-dialect (deadbeef) key-value pair: a little-endian ub4 declared
-    length + short DALC for the key and the value (an empty value is the ub4
-    length 0 with no data byte), then a ub4 flags field (the verifier type for
+    """One OCI-dialect (deadbeef) key-value pair (tns._AUTH_PAIR): a ub4
+    declared length and the value for the key and for the value (an empty one is
+    the ub4 length 0 alone), then a ub4 flags field (the verifier type for
     AUTH_VFR_DATA, else 0). The write inverse of :func:`_oci_auth_value`."""
-
-    def field(data: bytes) -> bytes:
-        if not data:
-            return struct.pack('<I', 0)
-        return struct.pack('<I', len(data)) + bytes([len(data)]) + data
-
-    return field(key) + field(val) + struct.pack('<I', flags)
+    return encode_auth_pair_oci(key, val, flags)
 
 
 def _oci_auth_packet(pairs: list[tuple[bytes, bytes, int]], trailer: bytes) -> bytes:
@@ -377,26 +374,9 @@ def _parse_fun_auth(
     # the 12c form as 11g yields b'\x03PYO'-style garbage and a rejected login.
     if len(payload) < 4 or payload[0] != TTI_FUN:
         raise InterfaceError('not a TTI_FUN message')
-    subtype = payload[1]
-    rest = payload[3:]  # skip TTI_FUN, subtype, seq
-    # At fv >= 23.1 EXT 1 the OAUTH (phase-two AUTH) header carries a `0` has-user pointer
-    # byte before the `0x01` marker (PROTOCOL.md §20.3), which the phase-one
-    # OSESSKEY does not — so detect it rather than assume by subtype: when the
-    # byte after the sequence is not the `0x01` marker, it is that extra pointer,
-    # consume it. Below fv 18 there is never one, so this reduces to the
-    # historical single-byte skip (payload[4:]).
-    if field_version >= FIELD_VERSION_23_1_EXT_1 and rest[:1] != b'\x01':
-        _has_user, rest = decode_ub4(rest)
-    rest = rest[1:]  # skip the 0x01 marker
-    userlen, rest = decode_ub4(rest)
-    _mode, rest = decode_ub4(rest)
-    rest = rest[1:]  # skip the 0x01 has-more byte
-    numpairs, rest = decode_ub4(rest)
-    rest = rest[2:]  # skip the 0x01 0x01 pointer pair
-    if field_version >= FIELD_VERSION_12_1:
-        rest = rest[1:]  # the 12.1+ length byte in front of the username
-    user = rest[:userlen]
-    kvs, _ = decode_kv(rest[userlen:], numpairs, [])
+    (head, rest) = decode_auth_head(payload, field_version)
+    (subtype, user) = (head['subtype'], head['user'])
+    kvs, _ = decode_kv(rest, head['pair_count'], [])
     # The ORDERED pairs are kept alongside the dict: application context arrives
     # as repeated NSPACE / ATTR / VALUE triples under the same three keys, so
     # collapsing to a dict keeps only the LAST entry (#826).
@@ -419,21 +399,10 @@ def check_auth_complete(
     """
     if len(payload) < 4:
         raise Truncated('auth message header')
-    rest = payload[3:]  # TTI_FUN, subtype, seq
-    if field_version >= FIELD_VERSION_23_1_EXT_1 and rest[:1] != b'\x01':
-        _has_user, rest = decode_ub4(rest)
-    rest = rest[1:]
-    userlen, rest = decode_ub4(rest)
-    _mode, rest = decode_ub4(rest)
-    rest = rest[1:]
-    numpairs, rest = decode_ub4(rest)
-    rest = rest[2:]
-    if field_version >= FIELD_VERSION_12_1:
-        rest = rest[1:]
-    if len(rest) < userlen:
+    (head, rest) = decode_auth_head(payload, field_version)
+    if len(head['user']) < head['user_length']:
         raise Truncated('auth message user name')
-    rest = rest[userlen:]
-    for _ in range(numpairs):
+    for _ in range(head['pair_count']):
         for _field in ('key', 'value'):
             length, rest = decode_ub4(rest)
             if length:
@@ -523,16 +492,24 @@ def _parse_oci_fun_username(payload: bytes, subtype: int, what: str) -> bytes:
         raise InterfaceError('not a TTI_FUN message')
     if payload[1] != subtype:
         raise InterfaceError(f'expected {what}, got subtype {payload[1]}')
-    # Pointer fields sit at these offsets; between the 1st/2nd and 3rd/4th come
-    # the two ub4 length-field pairs that make up the gaps. sqlplus 11.2 fills
-    # them with the OCI indicator and sqlplus 10.2 with its own addresses, so
-    # what is checked is that each says "present" (#1764).
-    for expected_ind_off in (3, 19, 35, 43):
-        if not oci.pointer_present(payload[expected_ind_off : expected_ind_off + 8]):
-            raise InterfaceError(f'OCI {what}: no pointer at offset {expected_ind_off}')
-    user_off = 51  # 3 + 8 + (4+4) + 8 + (4+4) + 8 + 8
-    userlen = payload[user_off]
-    return payload[user_off + 1 : user_off + 1 + userlen]
+    # The four pointers (decode_auth_oci): sqlplus 11.2 fills them with the OCI
+    # indicator and sqlplus 10.2 with its own addresses, so what is checked is
+    # that each says "present" (#1764), naming where it sits.
+    head = decode_auth_oci_head(payload)
+    for name, offset in _OCI_AUTH_POINTERS:
+        if not head[name]:
+            raise InterfaceError(f'OCI {what}: no pointer at offset {offset}')
+    return head['user']
+
+
+# Where an OCI OSESSKEY's or AUTH's four pointers sit: behind the header, the
+# user length and mode, the pair count.
+_OCI_AUTH_POINTERS = (
+    ('pointer_1', 3),
+    ('pointer_2', 19),
+    ('pointer_3', 35),
+    ('pointer_4', 43),
+)
 
 
 def parse_osesskey_oci(payload: bytes) -> bytes:
@@ -550,15 +527,15 @@ def _oci_auth_value(payload: bytes, key: bytes) -> bytes:
     # value>``: a fixed 4-byte little-endian length precedes the DALC-chunked
     # value (0xFE-marked chunks — the same encoding seerdb's client decoder
     # reads). The value is uppercase-hex ASCII, so unhexlify recovers the bytes.
-    i = payload.find(key)
-    if i < 0:
-        raise InterfaceError(f'OCI AUTH: missing {key.decode()}')
-    hexval, _ = decode_dalc(payload[i + len(key) + 4 :])
-    # decode_dalc reports an empty/null value as []; a real AUTH_SESSKEY /
-    # AUTH_PASSWORD is always non-empty hex bytes.
-    if not isinstance(hexval, bytes):
-        raise InterfaceError(f'OCI AUTH: empty {key.decode()}')
-    return unhexlify(hexval)
+    for pair in decode_auth_oci(payload)['pairs']:
+        if pair.get('key') != key:
+            continue
+        hexval = pair.get('value')
+        # A real AUTH_SESSKEY / AUTH_PASSWORD is always non-empty hex bytes.
+        if not hexval:
+            raise InterfaceError(f'OCI AUTH: empty {key.decode()}')
+        return unhexlify(hexval)
+    raise InterfaceError(f'OCI AUTH: missing {key.decode()}')
 
 
 def parse_auth_response_oci(payload: bytes) -> tuple[bytes, bytes, bytes]:

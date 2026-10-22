@@ -1589,14 +1589,17 @@ def _oci_changepassword_frame(
     from seerdb.server.auth import encode_kv_oci
 
     ind = oci.OCI_INDICATOR
-    # header: TTI_FUN + AUTH subtype, indicators at offsets 3/19/35/43, then the
-    # ub1-length username at offset 51 (see auth._parse_oci_fun_username).
+    # The login AUTH's head (tns._AUTH_HEAD): TTI_FUN + AUTH subtype, a pointer,
+    # the user's length declared at three times its characters and the mode, a
+    # pointer, the ub8 pair count, two pointers, the user as a value -- as
+    # sqlplus's login AUTH carries them; no changepassword capture survives.
     header = (
         b'\x03\x73\x00'
         + ind
-        + b'\x00' * 8
+        + (3 * len(user)).to_bytes(4, 'little')
+        + bytes(4)
         + ind
-        + b'\x00' * 8
+        + (2).to_bytes(8, 'little')
         + ind
         + ind
         + bytes([len(user)])
