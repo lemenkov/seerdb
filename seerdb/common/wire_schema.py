@@ -32,6 +32,8 @@ A schema is a tuple of fields:
   little-endian in OCI;
 - ``('wn4', name)``: a count that a wide OCI preamble writes as a ub8, and is
   an ``n4`` otherwise;
+- ``('bytes', name, length)``: as many bytes as the integer ``length``
+  says, as they are;
 - ``('raw', name)``: bytes already encoded, written as they are; a schema
   that has one encodes only;
 - ``('when', name, fields)``: ``fields`` only when the integer ``name`` is not
@@ -106,7 +108,7 @@ def _encode_part(field: tuple[Any, ...], codec: Codec) -> Callable[[dict], bytes
     if kind == 'u8':
         name = field[1]
         return lambda values: bytes((values[name],))
-    if kind == 'raw':
+    if kind in ('raw', 'bytes'):
         name = field[1]
         return lambda values: values[name]
     if kind in _PRIMITIVES:
@@ -154,6 +156,9 @@ def compile_decoder(schema: Schema, codec: Codec) -> Decoder:
                 (values[field[1]], data) = (data[0], data[1:])
             elif kind == 'raw':
                 raise ValueError('a raw field has no length to decode by')
+            elif kind == 'bytes':
+                size = values[field[2]]
+                (values[field[1]], data) = (bytes(data[:size]), data[size:])
             elif kind in _PRIMITIVES:
                 (values[field[1]], data) = getattr(codec, 'read_' + kind)(data)
             elif kind == 'when':
