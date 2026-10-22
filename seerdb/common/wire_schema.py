@@ -20,6 +20,10 @@ A schema is a tuple of fields:
 - ``('lob', name)``: LOB_DATA content, always chunked unless empty;
 - ``('token', name)``: a function call's token number, which thin sends from
   23ai (``None`` for none) and OCI never;
+- ``('ptr', name)``: whether a pointer is present, a flag byte in thin, an
+  8-byte pointer in OCI;
+- ``('wn4', name)``: a count that a wide OCI preamble writes as a ub8, and is
+  an ``n4`` otherwise;
 - ``('when', name, fields)``: ``fields`` only when the integer ``name`` is not
   zero;
 - ``('each', name, count, fields)``: ``fields`` once per item of the list
@@ -27,8 +31,8 @@ A schema is a tuple of fields:
 - ``('only', dialect, fields)``: ``fields`` in that dialect alone.
 
 A codec has a ``name`` (``'thin'`` or ``'oci'``) and the primitives ``n4``,
-``n2``, ``value``, ``lob`` and ``token``, and to decode ``read_n4``,
-``read_n2``, ``read_value``, ``read_lob`` and ``read_token``, each taking the bytes and returning the value
+``n2``, ``value``, ``lob``, ``token``, ``ptr`` and ``wn4``, and to decode the
+same names after ``read_``, each taking the bytes and returning the value
 and the rest. This module knows no codec: :mod:`seerdb.common.tns` defines
 them, beside the encoders they replaced.
 """
@@ -40,7 +44,7 @@ from typing import Any, Protocol
 
 Schema = tuple[tuple[Any, ...], ...]
 # The field kinds a codec packs itself.
-_PRIMITIVES = ('n4', 'n2', 'value', 'lob', 'token')
+_PRIMITIVES = ('n4', 'n2', 'value', 'lob', 'token', 'ptr', 'wn4')
 Encoder = Callable[[dict[str, Any]], bytes]
 Decoder = Callable[[bytes], tuple[dict[str, Any], bytes]]
 
@@ -53,11 +57,15 @@ class Codec(Protocol):
     def value(self, data: bytes) -> bytes: ...
     def lob(self, data: bytes) -> bytes: ...
     def token(self, value: int | None) -> bytes: ...
+    def ptr(self, value: bool) -> bytes: ...
+    def wn4(self, value: int) -> bytes: ...
     def read_n4(self, data: bytes) -> tuple[int, bytes]: ...
     def read_n2(self, data: bytes) -> tuple[int, bytes]: ...
     def read_value(self, data: bytes) -> tuple[bytes, bytes]: ...
     def read_lob(self, data: bytes) -> tuple[bytes, bytes]: ...
     def read_token(self, data: bytes) -> tuple[int | None, bytes]: ...
+    def read_ptr(self, data: bytes) -> tuple[bool, bytes]: ...
+    def read_wn4(self, data: bytes) -> tuple[int, bytes]: ...
 
 
 def _encode_part(field: tuple[Any, ...], codec: Codec) -> Callable[[dict], bytes]:
