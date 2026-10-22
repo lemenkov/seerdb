@@ -5398,7 +5398,10 @@ _PENDING_VIEWS = (
     "to_regclass(quote_ident(r.schema_name) || '.' || quote_ident(r.view_name)) "
     'IS NOT NULL FROM sys.ora_invalid_views r LEFT JOIN gone g '
     'ON g.schema_name = r.schema_name AND g.view_name = r.view_name '
-    'WHERE g.view_name IS NULL'
+    # Its schema owner's session only: the record is the owner's to write, so
+    # its text runs where the owner could run it anyway (GHSA-jf99-3g55-98cc).
+    'WHERE g.view_name IS NULL AND EXISTS (SELECT 1 FROM pg_namespace n '
+    "WHERE n.nspname = r.schema_name AND pg_has_role(n.nspowner, 'USAGE'))"
 )
 
 
