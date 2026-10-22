@@ -372,3 +372,16 @@ def test_a_truncated_thin_lobops_says_read_more() -> None:
     # A request spanning packets is parsed short first: Truncated, not a crash.
     with pytest.raises(tns.Truncated):
         tns.parse_lobops_request(b'\x03\x60\x01')
+
+
+@pytest.mark.parametrize('version', (6, 7, 24))
+def test_an_error_message_is_framed_by_each_dialects_value(version: int) -> None:
+    # Thin's message is its codec's value, absent on success from 12.1; OCI's is
+    # its own -- the 333-byte message a live 11g sends sqlplus (#734, #1520).
+    message = b'x' * 333
+    with _field_version(version):
+        assert tns._oer_message(20001, message) == tns._THIN.value(message)
+        assert tns._oer_message(0, b'') == (b'' if version >= 7 else b'\x00')
+    assert tns._oci_error_text(message) == (
+        b'\xfe\xff' + message[:255] + b'\x4e' + message[255:] + b'\x00'
+    )
