@@ -1146,7 +1146,9 @@ class _ThinCodec:
 
     @staticmethod
     def read_ptr(data: bytes) -> tuple[bool, bytes]:
-        return data[0] != 0, data[1:]
+        # A message cut short here says so at the next count, which raises
+        # Truncated, as a half-arrived one must (#1000).
+        return bool(data[:1] != b'\x00' and data[:1]), data[1:]
 
     wn4 = n4
     read_wn4 = read_n4
@@ -1559,7 +1561,59 @@ _CLOSE_CURSORS: wire_schema.Schema = (
     ('n8', 'count'),
     ('each', 'cursors', 'count', (('n4', 'cursor'),)),
 )
+# TTI_LOBOPS (96), the head every operation shares (#412, #2064): the source
+# and destination locators' pointers and lengths, the short offsets, three
+# pointer flags, the operation. OCI sends thin's fields with 8-byte pointers
+# and ub4 counts, measured against sqlplus 10.2, 11g and 23.26 READs.
+_LOBOPS_HEAD: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN, TTI_LOBOPS])),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+    ('ptr', 'source_present'),
+    ('wn4', 'source_length'),
+    ('ptr', 'dest_present'),
+    ('wn4', 'dest_length'),
+    ('wn4', 'short_source_offset'),
+    ('wn4', 'short_dest_offset'),
+    ('ptr', 'charset_present'),
+    ('ptr', 'short_amount_present'),
+    ('ptr', 'null_lob_present'),
+    ('n4', 'operation'),
+)
+# A READ, after the head: the SCN array's pointer and length, the source and
+# destination offsets, the amount's pointer, three array-LOB slots, then the
+# source locator and -- if its pointer said so -- the amount.
+_LOBOPS_READ: wire_schema.Schema = (
+    *_LOBOPS_HEAD,
+    ('ptr', 'scn_present'),
+    ('n4', 'scn_length'),
+    ('n8', 'source_offset'),
+    ('n8', 'dest_offset'),
+    ('ptr', 'amount_present'),
+    ('ptr', 'array_slot_1'),
+    ('wn4', 'array_length_1'),
+    ('ptr', 'array_slot_2'),
+    ('wn4', 'array_length_2'),
+    ('ptr', 'array_slot_3'),
+    ('wn4', 'array_length_3'),
+    ('bytes', 'locator', 'source_length'),
+    ('when', 'amount_present', (('n8', 'amount'),)),
+)
+# Its reply: the content as LOB_DATA, then the return parameters -- the
+# locator echoed and the amount read, in the LOB's own units -- then the
+# status (#405, #413, #903).
+_LOB_READ_REPLY: wire_schema.Schema = (
+    ('raw', 'lob_data'),
+    ('const', bytes([TTI_RPA])),
+    ('raw', 'locator'),
+    ('n8', 'amount'),
+    ('raw', 'status'),
+)
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+_LOBOPS_HEAD_FROM_THIN = wire_schema.compile_decoder(_LOBOPS_HEAD, _THIN)
+_LOBOPS_READ_FROM_OCI = wire_schema.compile_decoder(_LOBOPS_READ, _OCI)
+_LOB_READ_REPLY_THIN = wire_schema.compile_encoder(_LOB_READ_REPLY, _THIN)
+_LOB_READ_REPLY_OCI = wire_schema.compile_encoder(_LOB_READ_REPLY, _OCI)
 _CLOSE_CURSORS_THIN = wire_schema.compile_encoder(_CLOSE_CURSORS, _THIN)
 _CLOSE_CURSORS_FROM_THIN = wire_schema.compile_decoder(_CLOSE_CURSORS, _THIN)
 _CLOSE_CURSORS_FROM_OCI = wire_schema.compile_decoder(_CLOSE_CURSORS, _OCI)
@@ -2808,12 +2862,11 @@ _OCI_LOBOPS_AMOUNT_OFF = 269
 # A modern sqlplus (23.26) writes the request's scalar slots narrower, as it
 # does its OALL8 (#866), so the fields move (#1287). Measured against a live
 # 11g: a 135-byte header with the ub4 locator length at 11, the ub8 offset at 75
-# and a second pointer indicator at 91, then the locator, then the ub8 amount.
-# An indicator at 91 marks the narrow form: in the wide one that is where the
-# offset sits, and no offset reads as `fe ff ff ff ff ff ff ff`.
+# and a second pointer indicator at 91, then the locator, then the ub8 amount --
+# thin's fields (_LOBOPS_READ), as OCI packs them. An indicator at 91 marks the
+# narrow form: in the wide one that is where the offset sits, and no offset
+# reads as `fe ff ff ff ff ff ff ff`.
 _OCI_LOBOPS_NARROW_IND_OFF = 91
-_OCI_LOBOPS_NARROW_OFFSET_OFF = 75
-_OCI_LOBOPS_NARROW_LOCLEN_OFF = 11
 _OCI_LOBOPS_NARROW_HEADER = 135
 
 
@@ -3297,20 +3350,30 @@ def _oci_lobops_narrow(body: bytes) -> bool:
 def parse_lobops_read(body: bytes) -> tuple[int, int]:
     """Extract ``(source_offset, amount)`` from an OCI TTI_LOBOPS READ (#405) —
     both 1-based counts (characters for a CLOB, bytes for a BLOB). A malformed /
-    short request falls back to reading the whole LOB from the start."""
+    short request falls back to reading the whole LOB from the start. The
+    narrow form is read by its schema (_LOBOPS_READ); the wide one, of which no
+    capture survives, by its offsets."""
     if _oci_lobops_narrow(body):
-        loclen_off = _OCI_LOBOPS_NARROW_LOCLEN_OFF
-        loclen = int.from_bytes(body[loclen_off : loclen_off + 4], 'little')
-        offset_off = _OCI_LOBOPS_NARROW_OFFSET_OFF
-        amount_off = _OCI_LOBOPS_NARROW_HEADER + loclen
-    else:
-        offset_off = _OCI_LOBOPS_OFFSET_OFF
-        amount_off = _OCI_LOBOPS_AMOUNT_OFF
+        read = _oci_lobops_read(body)
+        if read is None:
+            return 1, 2**31
+        return max(read['source_offset'], 1), read['amount']
+    amount_off = _OCI_LOBOPS_AMOUNT_OFF
     if len(body) < amount_off + 8:
         return 1, 2**31
+    offset_off = _OCI_LOBOPS_OFFSET_OFF
     offset = int.from_bytes(body[offset_off : offset_off + 8], 'little')
     amount = int.from_bytes(body[amount_off : amount_off + 8], 'little')
     return max(offset, 1), amount
+
+
+def _oci_lobops_read(body: bytes) -> dict[str, Any] | None:
+    # A narrow OCI TTI_LOBOPS READ's fields (_LOBOPS_READ), or None for one too
+    # short to hold its locator and amount.
+    (read, _rest) = _LOBOPS_READ_FROM_OCI(body)
+    if len(body) < _OCI_LOBOPS_NARROW_HEADER + read['source_length'] + 8:
+        return None
+    return read
 
 
 def parse_lobops_locator(body: bytes) -> bytes | None:
@@ -3319,20 +3382,16 @@ def parse_lobops_locator(body: bytes) -> bytes | None:
     value this way, where later ones select it."""
     if not _oci_lobops_narrow(body):
         return None
-    loclen_off = _OCI_LOBOPS_NARROW_LOCLEN_OFF
-    loclen = int.from_bytes(body[loclen_off : loclen_off + 4], 'little')
-    return body[_OCI_LOBOPS_NARROW_HEADER : _OCI_LOBOPS_NARROW_HEADER + loclen]
+    return _LOBOPS_READ_FROM_OCI(body)[0]['locator']
 
 
 def parse_lobops_slot(body: bytes) -> int | None:
     """The row slot the locator of an OCI TTI_LOBOPS READ names (#1430), or None
     for a request that carries none -- the wide form, whose locator this does not
     locate, or a locator minted without a slot."""
-    if not _oci_lobops_narrow(body):
+    region = parse_lobops_locator(body)
+    if region is None:
         return None
-    loclen_off = _OCI_LOBOPS_NARROW_LOCLEN_OFF
-    loclen = int.from_bytes(body[loclen_off : loclen_off + 4], 'little')
-    region = body[_OCI_LOBOPS_NARROW_HEADER : _OCI_LOBOPS_NARROW_HEADER + loclen]
     start = region.find(b'\x68\x00\x01', 0, 4)
     at = start + _OCI_LOB_LOCATOR_SLOT_OFF
     if start < 0 or len(region) < at + 4:
@@ -3359,17 +3418,19 @@ def encode_lob_read_response_thin(
     # Defaulted here, not in the signature: _THIN_LOB_LOCATOR is defined further
     # down the module, and a default argument is evaluated at def time.
     echo = _THIN_LOB_LOCATOR if locator is None else locator
-    return (
-        _lob_data_thin(content)
-        + bytes([TTI_RPA])
-        # The locator rides RAW here, not length-prefixed: the client reads back
-        # exactly as many bytes as the locator it sent, then the amount. Which is
-        # why it has to be the locator the client ACTUALLY sent for a temp LOB it
-        # created itself -- the placeholder is only right for a column LOB the
-        # Mirror minted, where the client ignores what comes back (#826).
-        + echo
-        + encode_sb4(amount)
-        + _encode_oer(1, 0, 0, b'')
+    return _LOB_READ_REPLY_THIN(
+        {
+            'lob_data': _lob_data_thin(content),
+            # The locator rides RAW here, not length-prefixed: the client reads
+            # back exactly as many bytes as the locator it sent, then the
+            # amount. Which is why it has to be the locator the client ACTUALLY
+            # sent for a temp LOB it created itself -- the placeholder is only
+            # right for a column LOB the Mirror minted, where the client ignores
+            # what comes back (#826).
+            'locator': echo,
+            'amount': amount,
+            'status': _encode_oer(1, 0, 0, b''),
+        }
     )
 
 
@@ -3539,22 +3600,15 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
     temp LOB and the OPEN / CLOSE / TRIM / GET_CHUNK_SIZE state ops are
     acknowledged (#417); anything else (a READ of an emitted column locator) is
     served by the #413 read path."""
-    payload = _skip_fun_header(body)  # TTI_FUN, TTI_LOBOPS, seq (+ fv24 token)
-    # The common request layout (§14.1); walk the fields to the operation, then to
-    # the ub2-prefixed locator (and, for a WRITE, the 0x0E payload). CREATE_TEMP
-    # shares the layout up to the operation, so it is classified there too.
-    rest = payload[1:]  # source_pointer_flag
-    # The declared source-locator-length (§14.1). It equals the locator byte
-    # count for a raw locator (a persistent / column-LOB op) and that count + 2
-    # for a ub2-length-prefixed one (a temp-LOB op), so skipping this many bytes
-    # steps over the whole locator field either way.
-    source_loc_len, rest = decode_ub4(rest)
-    rest = rest[1:]  # dest_pointer_flag
-    _dest_length, rest = decode_ub4(rest)
-    _short_src_off, rest = decode_ub4(rest)
-    _short_dst_off, rest = decode_ub4(rest)
-    rest = rest[3:]  # charset / short-amount / null-lob pointer flags
-    operation, rest = decode_ub4(rest)
+    # The common request layout (§14.1, _LOBOPS_HEAD); then each operation's
+    # own fields, to the ub2-prefixed locator (and, for a WRITE, the 0x0E
+    # payload). CREATE_TEMP shares the layout up to the operation, so it is
+    # classified there too. The declared source-locator-length equals the
+    # locator byte count for a raw locator (a persistent / column-LOB op) and
+    # that count + 2 for a ub2-length-prefixed one (a temp-LOB op), so skipping
+    # this many bytes steps over the whole locator field either way.
+    (head, rest) = _LOBOPS_HEAD_FROM_THIN(body)
+    (source_loc_len, operation) = (head['source_length'], head['operation'])
     if operation == TNS_LOB_OP_CREATE_TEMP:
         # Classified by the OPERATION, not by the opening bytes. CREATE_TEMP used
         # to be recognised by the prefix 01 01 28, on the belief that no other
@@ -9376,15 +9430,9 @@ def _oci_lob_locator_with_slot(locator: bytes, slot: int | None) -> bytes:
 _OCI_LOB_ROW_LOCATOR_AT = 5
 
 
-def _oci_lob_read_tail(
-    is_clob: bool, sequence: int, national: bool = False, slot: int | None = None
-) -> bytes:
-    # The TTI_LOBOPS READ reply tail after the LOB_DATA content: a TTI_RPA (0x08
-    # 0x00, the echoed locator, then the ub4 LE amount read — characters for a
-    # CLOB, bytes for a BLOB) then the LOB-row OER call status. The echoed
-    # locator's byte size (offset 93) and the amount (offset 107) are patched to
-    # stay consistent with the content delivered. ``sequence`` is the live
-    # per-session OER counter (§36) for the trailing status OER.
+def _oci_lob_read_status(sequence: int) -> bytes:
+    # The status a TTI_LOBOPS READ reply ends on: the LOB-row OER call status.
+    # ``sequence`` is the live per-session OER counter (§36).
     oer = bytearray(
         encode_oci_oer(
             oci.OCI_OER_STATUS_SUCCESS,
@@ -9394,14 +9442,7 @@ def _oci_lob_read_tail(
         )
     )
     oer[18] = 0  # FIXME: the LOB read-status OER zeroes offset 18 (see §36.1)
-    amount = 2000 if is_clob else 4000
-    return (
-        b'\x08\x00'
-        + _oci_lob_locator_with_slot(_oci_lob_locator(is_clob, national), slot)
-        + struct.pack('<I', amount)
-        + b'\x00' * 4
-        + bytes(oer)
-    )
+    return bytes(oer)
 
 
 # --- Mirror deadbeef/OCI codec (parse/describe/rows/status/LOB, #265) ---
@@ -11392,24 +11433,32 @@ def encode_lob_read_response_oci(
     slot: int | None = None,
     sequence: int,
 ) -> bytes:
-    """The TTI_LOBOPS READ reply (#405): the LOB content slice (LOB_DATA) then the
-    TTI_RPA + OER tail. ``content`` is the UTF-16BE (CLOB) / raw (BLOB) bytes read
-    this call; ``amount`` is that read's count (characters for a CLOB, bytes for a
-    BLOB); ``total_bytes`` is the whole LOB's byte size the echoed locator reports
+    """The TTI_LOBOPS READ reply (#405, _LOB_READ_REPLY): the LOB content slice
+    (LOB_DATA), the echoed locator and the amount, then the status.
+    ``content`` is the UTF-16BE (CLOB) / raw (BLOB) bytes read this call;
+    ``amount`` is that read's count (characters for a CLOB, bytes for a BLOB);
+    ``total_bytes`` is the whole LOB's byte size the echoed locator reports
     (defaults to this slice, for a single read-it-all call). ``is_clob`` selects
     the echoed-locator template (character vs binary, #406), and ``national`` its
     NCLOB form (#1369). ``sequence`` is the live per-session OER counter for the
     trailing status."""
     if total_bytes is None:
         total_bytes = len(content)
-    tail = bytearray(_oci_lob_read_tail(is_clob, sequence, national, slot))
-    tail[_OCI_LOB_TAIL_SIZE_OFF : _OCI_LOB_TAIL_SIZE_OFF + 4] = total_bytes.to_bytes(
-        4, 'big'
+    # The echoed locator, its zero byte ahead of it, as the row cell's carries
+    # it; its byte size is patched to stay consistent with the content.
+    locator = bytearray(
+        b'\x00' + _oci_lob_locator_with_slot(_oci_lob_locator(is_clob, national), slot)
     )
-    tail[_OCI_LOB_TAIL_AMOUNT_OFF : _OCI_LOB_TAIL_AMOUNT_OFF + 4] = amount.to_bytes(
-        4, 'little'
+    at = _OCI_LOB_TAIL_SIZE_OFF - 1
+    locator[at : at + 4] = total_bytes.to_bytes(4, 'big')
+    return _LOB_READ_REPLY_OCI(
+        {
+            'lob_data': _oci_lob_data(content),
+            'locator': bytes(locator),
+            'amount': amount,
+            'status': _oci_lob_read_status(sequence),
+        }
     )
-    return _oci_lob_data(content) + bytes(tail)
 
 
 def oci_lob_contents(

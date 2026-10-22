@@ -344,3 +344,31 @@ def test_close_cursors_is_one_schema_in_both_dialects(version: int) -> None:
         assert tns.skip_close_cursors_piggyback(thin + call) == call
         (fields, _rest) = tns._CLOSE_CURSORS_FROM_OCI(live)
         assert [c['cursor'] for c in fields['cursors']] == [3, 1]
+
+
+def test_an_oci_lobops_read_is_thins_fields_at_fixed_width() -> None:
+    # sqlplus 23.26 against 11g and Mirror-over-PG, and 10.2, whose pointers hold
+    # addresses: the 135-byte head, the 106-byte locator, the ub8 amount
+    # (#405, #1287, #2123).
+    import sys
+
+    sys.path.insert(0, 'tests')
+    from test_server_query import _OCI_LOBOPS_READ_NARROW, _OCI_LOBOPS_READ_TWO_CLOBS
+    from test_server_session import _OCI_LOB_READ_10_2
+
+    for body, offset, amount in (
+        (_OCI_LOBOPS_READ_TWO_CLOBS, 1, 7),
+        (_OCI_LOBOPS_READ_NARROW, 51, 50),
+        (_OCI_LOB_READ_10_2, 1, 80),
+    ):
+        (read, rest) = tns._LOBOPS_READ_FROM_OCI(body)
+        assert rest == b''
+        assert (read['operation'], read['source_length']) == (2, 106)
+        assert (read['source_offset'], read['amount']) == (offset, amount)
+        assert read['locator'][1:4] == b'\x68\x00\x01'
+
+
+def test_a_truncated_thin_lobops_says_read_more() -> None:
+    # A request spanning packets is parsed short first: Truncated, not a crash.
+    with pytest.raises(tns.Truncated):
+        tns.parse_lobops_request(b'\x03\x60\x01')
