@@ -1150,6 +1150,8 @@ class _ThinCodec:
 
     wn4 = n4
     read_wn4 = read_n4
+    n8 = n4
+    read_n8 = read_n4
 
 
 class _OciCodec:
@@ -1276,6 +1278,14 @@ class _OciCodec:
 
     wn4 = n4
     read_wn4 = read_n4
+
+    @staticmethod
+    def n8(value: int) -> bytes:
+        return value.to_bytes(8, 'little')
+
+    @staticmethod
+    def read_n8(data: bytes) -> tuple[int, bytes]:
+        return int.from_bytes(data[:8], 'little'), data[8:]
 
 
 class _OciWideCodec(_OciCodec):
@@ -1502,7 +1512,23 @@ _ROWID_CELL: wire_schema.Schema = (
     ('n4', 'block'),
     ('n4', 'row'),
 )
+# A LOB column's cell (#405, #413, #853, #1287): the locator's length, then --
+# for a client that reads them -- the LOB's size and chunk size, then the
+# locator. NULL to OCI is the length at zero and nothing more.
+_LOB_CELL: wire_schema.Schema = (
+    ('n4', 'locator_length'),
+    (
+        'when',
+        'locator_length',
+        (
+            ('when', 'has_metadata', (('n8', 'size'), ('n4', 'chunk_size'))),
+            ('value', 'locator'),
+        ),
+    ),
+)
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+_LOB_CELL_THIN = wire_schema.compile_encoder(_LOB_CELL, _THIN)
+_LOB_CELL_OCI = wire_schema.compile_encoder(_LOB_CELL, _OCI)
 _ROWID_CELL_THIN = wire_schema.compile_encoder(_ROWID_CELL, _THIN)
 _ROWID_CELL_OCI = wire_schema.compile_encoder(_ROWID_CELL, _OCI)
 _DCB_COLUMN_THIN = wire_schema.compile_encoder(_DCB_COLUMN, _THIN)
@@ -9300,15 +9326,11 @@ def _oci_lob_locator_with_slot(locator: bytes, slot: int | None) -> bytes:
     return bytes(out)
 
 
-# The RXD value for a LOB column: a ub4 LE + ub2 LE length (both 106) then the
-# locator. The content byte size at offset 97 is patched per value.
-_OCI_LOB_ROW_VALUE = {
-    (is_clob, national): struct.pack('<I', 106)
-    + struct.pack('<H', 106)
-    + _oci_lob_locator(is_clob, national)
-    for is_clob in (True, False)
-    for national in (True, False)
-}
+# A LOB column's cell (_LOB_CELL) to an 11.2 client: the locator's ub4 length
+# (106), then the locator as a value, its ub1 length (106) and a zero byte
+# ahead of the 105-byte locator -- which reads as a ub2 106 -- so the locator
+# value starts 5 bytes in.
+_OCI_LOB_ROW_LOCATOR_AT = 5
 
 
 def _oci_lob_read_tail(
@@ -11298,19 +11320,23 @@ def encode_lob_locator_oci(
     bytes of it, and draws no read. ``slot`` names the LOB among its row's
     (#1430)."""
     if value is None:
-        return bytes(4)
-    byte_size = _oci_lob_byte_size(value, is_clob)
-    loc = bytearray(_OCI_LOB_ROW_VALUE[is_clob, national])
+        return _LOB_CELL_OCI({'locator_length': 0})
+    # The locator as the cell carries it: a zero byte, then the 105-byte
+    # locator, which names the LOB's slot and carries its byte size.
+    locator = bytearray(b'\x00' + _oci_lob_locator(is_clob, national))
     if slot is not None:
-        # The row value is its two lengths (ub4 + ub2) then the locator.
-        struct.pack_into('>I', loc, 6 + _OCI_LOB_LOCATOR_SLOT_OFF, slot + 1)
-    loc[_OCI_LOB_ROW_SIZE_OFF : _OCI_LOB_ROW_SIZE_OFF + 4] = byte_size.to_bytes(
-        4, 'big'
+        struct.pack_into('>I', locator, 1 + _OCI_LOB_LOCATOR_SLOT_OFF, slot + 1)
+    at = _OCI_LOB_ROW_SIZE_OFF - _OCI_LOB_ROW_LOCATOR_AT
+    locator[at : at + 4] = _oci_lob_byte_size(value, is_clob).to_bytes(4, 'big')
+    return _LOB_CELL_OCI(
+        {
+            'locator_length': len(locator),
+            'has_metadata': _ENCODE_OCI_LOB_12C.get(),
+            'size': _lob_value_size(value),
+            'chunk_size': _OCI_LOB_CHUNK_SIZE,
+            'locator': bytes(locator),
+        }
     )
-    if not _ENCODE_OCI_LOB_12C.get():
-        return bytes(loc)
-    metadata = struct.pack('<QI', _lob_value_size(value), _OCI_LOB_CHUNK_SIZE)
-    return bytes(loc[:4]) + metadata + bytes(loc[4:])
 
 
 def encode_lob_read_response_oci(
@@ -14731,10 +14757,15 @@ def encode_lob_locator_thin(
     which is what the stricter reader demands, and :func:`_read_lob_column`
     accepts either so seerdb's own client reads the Mirror and a real server
     alike."""
-    head = encode_sb4(len(locator))
-    if with_metadata:
-        head += encode_sb4(size) + encode_sb4(_THIN_LOB_CHUNK_SIZE)
-    return head + _bytes_with_length(locator)
+    return _LOB_CELL_THIN(
+        {
+            'locator_length': len(locator),
+            'has_metadata': with_metadata,
+            'size': size,
+            'chunk_size': _THIN_LOB_CHUNK_SIZE,
+            'locator': locator,
+        }
+    )
 
 
 def _encode_temporal(Value: datetime.date | BcDate, DataType: int) -> bytes:

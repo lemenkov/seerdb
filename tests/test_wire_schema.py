@@ -281,3 +281,35 @@ def test_text_is_framed_as_each_dialect_frames_it(version: int) -> None:
         assert tns._OCI.chr(b'x' * 300) == (
             b'\xfe\xff' + b'x' * 255 + b'\x2d' + b'x' * 45 + b'\x00'
         )
+
+
+@pytest.mark.parametrize('metadata', (False, True))
+def test_a_lob_cell_is_one_schema_in_both_dialects(metadata: bool) -> None:
+    # The locator's length, the size and chunk size a client may read, then the
+    # locator as a value (#405, #853, #1287).
+    values = {
+        'locator_length': 6,
+        'has_metadata': metadata,
+        'size': 3000,
+        'chunk_size': 8132,
+        'locator': b'\x00locat',
+    }
+    for codec in CODECS:
+        wire = wire_schema.compile_encoder(tns._LOB_CELL, codec)(values)
+        decode = wire_schema.compile_decoder(tns._LOB_CELL, codec)
+        (fields, rest) = decode(wire, {'has_metadata': metadata})
+        assert rest == b''
+        assert fields['locator'] == values['locator']
+        assert (fields.get('size'), fields.get('chunk_size')) == (
+            (3000, 8132) if metadata else (None, None)
+        )
+
+
+def test_an_oci_lob_cell_reads_as_its_captured_lengths() -> None:
+    # NULL is the length at zero, all four bytes; a value is 106, then -- to an
+    # 11.2 client -- the locator's ub1 length 106 and its zero byte, which a
+    # capture reads as a ub2 106 (#405, #1287).
+    assert tns.encode_lob_locator_oci(None, True) == bytes(4)
+    cell = tns.encode_lob_locator_oci('abc', True)
+    assert cell[:6] == bytes.fromhex('6a000000 6a00'.replace(' ', ''))
+    assert len(cell) == 4 + 1 + 106
