@@ -1706,6 +1706,22 @@ _ROUTINE_SYNONYMS_DDL = (
 )
 
 
+# The system privileges the Mirror models (#1936), each what lets a user run
+# a DBA's statement in per-user mode; the DBA role holds them all. Any other
+# privilege or role a GRANT names is the no-op every GRANT without ON was.
+_SYSTEM_PRIVILEGES: Final = (
+    'ALTER SYSTEM',
+    'ALTER USER',
+    'CREATE ANY DIRECTORY',
+    'CREATE ANY EDITION',
+    'CREATE USER',
+    'DROP ANY DIRECTORY',
+    'DROP ANY EDITION',
+    'DROP USER',
+)
+_DBA_ROLE: Final = 'DBA'
+
+
 _ORACLE_DICTIONARY_DDL = (
     # SYS_CONTEXT('userenv', <param>) — the session context the dialect reads to
     # learn its current schema/user before it reflects anything.
@@ -2923,6 +2939,38 @@ _ORACLE_DICTIONARY_DDL = (
     "'NO'::varchar(3) AS authentication, "
     "'PROXY MAY ACTIVATE ALL CLIENT ROLES'::varchar(35) AS flags "
     'FROM sys.ora_proxy_grants;'
+    # System privileges and the DBA role a GRANT gave (#1936), the
+    # installer's to write, as a DBA's statement writes them: DBA_SYS_PRIVS and
+    # DBA_ROLE_PRIVS list them, the USER_ views and the SESSION_ ones a user's
+    # own and PUBLIC's, in 23ai's shape. DBA is the one role kept here.
+    'CREATE TABLE IF NOT EXISTS sys.ora_sys_privs (grantee text NOT NULL, '
+    'privilege text NOT NULL, admin_option boolean NOT NULL DEFAULT false, '
+    'PRIMARY KEY (grantee, privilege));'
+    'CREATE OR REPLACE VIEW sys.dba_sys_privs AS SELECT grantee::varchar(128) '
+    'AS grantee, privilege::varchar(40) AS privilege, '
+    "(CASE WHEN admin_option THEN 'YES' ELSE 'NO' END)::varchar(3) AS admin_option, "
+    "'NO'::varchar(3) AS common, 'NO'::varchar(3) AS inherited "
+    "FROM sys.ora_sys_privs WHERE privilege <> 'DBA';"
+    'CREATE OR REPLACE VIEW sys.dba_role_privs AS SELECT grantee::varchar(128) '
+    'AS grantee, privilege::varchar(128) AS granted_role, '
+    "(CASE WHEN admin_option THEN 'YES' ELSE 'NO' END)::varchar(3) AS admin_option, "
+    "'NO'::varchar(3) AS delegate_option, 'YES'::varchar(3) AS default_role, "
+    "'NO'::varchar(3) AS common, 'NO'::varchar(3) AS inherited "
+    "FROM sys.ora_sys_privs WHERE privilege = 'DBA';"
+    'CREATE OR REPLACE VIEW sys.user_sys_privs AS SELECT grantee AS username, '
+    'privilege, admin_option, common, inherited FROM sys.dba_sys_privs '
+    "WHERE grantee IN (sys.sys_context('userenv', 'session_user'), 'PUBLIC');"
+    'CREATE OR REPLACE VIEW sys.user_role_privs AS SELECT grantee AS username, '
+    'granted_role, admin_option, delegate_option, default_role, '
+    "'NO'::varchar(3) AS os_granted, common, inherited FROM sys.dba_role_privs "
+    "WHERE grantee IN (sys.sys_context('userenv', 'session_user'), 'PUBLIC');"
+    'CREATE OR REPLACE VIEW sys.session_roles AS SELECT DISTINCT '
+    'granted_role::varchar(128) AS role FROM sys.user_role_privs;'
+    'CREATE OR REPLACE VIEW sys.session_privs AS SELECT DISTINCT '
+    'privilege::varchar(40) AS privilege FROM (SELECT privilege '
+    'FROM sys.user_sys_privs UNION ALL SELECT unnest(ARRAY['
+    + ', '.join(f"'{p}'" for p in _SYSTEM_PRIVILEGES)
+    + "]) FROM sys.session_roles WHERE role = 'DBA') p;"
     'CREATE OR REPLACE VIEW sys.all_types AS SELECT * FROM ('
     'SELECT ora_owner(n.nspname) AS owner, '
     'ora_name(t.typname) AS type_name, '
@@ -3167,6 +3215,7 @@ def _record_owner_tests() -> dict[str, str | None]:
         'ora_directories': None,
         'ora_editions': None,
         'ora_proxy_grants': None,
+        'ora_sys_privs': None,
         'ora_translation_log': None,
     }
     return owned
@@ -6031,7 +6080,15 @@ _OBJECT_GRANT = re.compile(
     r'(?:\s*\.\s*(?:"[^"]+"|[\w$#]+))?)\s+(TO|FROM)\s+(.+?)'
     r'(\s+WITH\s+(?:GRANT|HIERARCHY)\s+OPTION)?\s*;?\s*$'
 )
+# GRANT / REVOKE of system privileges or a role (#1936): no ON, which an
+# object's grant has.
+_SYSTEM_GRANT = re.compile(
+    r'(?is)\s*(GRANT|REVOKE)\s+((?:(?!\bON\b).)+?)\s+(?:TO|FROM)\s+(.+?)'
+    r'(\s+WITH\s+ADMIN\s+OPTION)?\s*;?\s*$'
+)
 # The errors a GRANT or REVOKE gives, measured on 23ai and 21c (#1858).
+_ORA_ROLE_NOT_GRANTED = 1951
+_ORA_SYSTEM_PRIVILEGE_NOT_GRANTED = 1952
 _ORA_INVALID_PRIVILEGE = 990
 _ORA_DUPLICATE_USERNAME = 1700
 _ORA_DUPLICATE_PRIVILEGE = 1711
@@ -14032,6 +14089,9 @@ def _user_group_grants(group: str) -> str:
         'dba_directories',
         'proxy_users',
         'ora_proxy_grants',
+        'ora_sys_privs',
+        'dba_sys_privs',
+        'dba_role_privs',
         # Who each open proxy session's proxy is: a session reads its own
         # through sys.ora_session_proxy() (GHSA-6qw5-v992-69fx).
         'ora_session_proxies',
@@ -16192,6 +16252,9 @@ class PostgresBackend:
         synonym = self._synonym_statement(sql)
         if synonym is not None:
             return synonym
+        system = self._system_grant_statement(sql)
+        if system is not None:
+            return system
         granted = self._object_grant_statement(sql)
         if granted is not None:
             return granted
@@ -16729,7 +16792,7 @@ class PostgresBackend:
         # session is not killed in its place. The victim learns of it on its next
         # call, its connection gone, as a killed Oracle session's is. Like any
         # ALTER SYSTEM it leaves the caller's transaction alone.
-        self._require_administrator()
+        self._require_administrator('ALTER SYSTEM')
         ids = _KILL_SESSION_ID.match(session)
         if ids is None:
             raise BackendError(
@@ -21709,15 +21772,103 @@ class PostgresBackend:
                 'insufficient privileges', ora_code=ORA_INSUFFICIENT_PRIVILEGES
             )
 
-    def _require_administrator(self) -> None:
-        # A DBA's statement in per-user mode: only an account the operator
-        # configured may run it (#1857), as only a DBA may in Oracle. In
+    def _require_administrator(self, privilege: str) -> None:
+        # A DBA's statement in per-user mode: an account the operator
+        # configured may run it (#1857), and a user holding the system
+        # privilege it needs, or the DBA role (#1936), as on Oracle. In
         # single-role mode the database is one tenant, and anyone may.
         user = getattr(self, '_login_user', None) or ''
-        if self._per_user and not self._accounts.configured(user):
+        if not self._per_user or self._accounts.configured(user):
+            return
+        if privilege in self._held_privileges():
+            return
+        raise BackendError(
+            'insufficient privileges', ora_code=ORA_INSUFFICIENT_PRIVILEGES
+        )
+
+    def _held_privileges(self) -> dict[str, bool]:
+        # The modelled system privileges the session's user holds (#1936),
+        # directly, through PUBLIC or through DBA, each with whether it may
+        # grant it on: WITH ADMIN OPTION, or as a DBA, who may grant any.
+        if not self._has_sys_privs():
+            return {}
+        held: dict[str, bool] = {}
+        for privilege, admin in self._conn.execute(
+            'SELECT privilege, admin_option FROM sys.user_sys_privs UNION ALL '
+            'SELECT granted_role, admin_option FROM sys.user_role_privs'
+        ).fetchall():
+            held[privilege] = held.get(privilege, False) or admin == 'YES'
+        if _DBA_ROLE in held:
+            held.update(dict.fromkeys(_SYSTEM_PRIVILEGES, True))
+            held[_DBA_ROLE] = True
+        return held
+
+    def _system_grant_statement(self, statement: str) -> Result | None:
+        """GRANT or REVOKE of the system privileges the Mirror models, or the
+        DBA role (#1936), recorded in sys.ora_sys_privs on the installer's
+        connection. Any other system privilege or role is the no-op it was;
+        named beside a modelled one, it is passed over. Who may: an account
+        the operator configured, a DBA, or one holding the privilege WITH
+        ADMIN OPTION -- in per-user mode; anyone in single-role mode, where a
+        grant enforces nothing. None for any other statement."""
+        m = _SYSTEM_GRANT.match(statement)
+        if m is None:
+            return None
+        (verb, written, listed, option) = m.groups()
+        named = [' '.join(p.split()).upper() for p in written.split(',')]
+        modelled = [p for p in named if p in (*_SYSTEM_PRIVILEGES, _DBA_ROLE)]
+        if not modelled or not self._has_sys_privs():
+            return None
+        if len(set(named)) != len(named):
             raise BackendError(
-                'insufficient privileges', ora_code=ORA_INSUFFICIENT_PRIVILEGES
+                'duplicate privilege listed', ora_code=_ORA_DUPLICATE_PRIVILEGE
             )
+        grantees = _grantees(listed)
+        granting = verb.upper() == 'GRANT'
+        user = getattr(self, '_login_user', None) or ''
+        if self._per_user and not self._accounts.configured(user):
+            held = self._held_privileges()
+            if not all(held.get(p, False) for p in modelled):
+                raise BackendError(
+                    'insufficient privileges', ora_code=ORA_INSUFFICIENT_PRIVILEGES
+                )
+        for grantee in grantees:
+            if grantee != 'PUBLIC' and not self._user_exists(grantee):
+                raise BackendError(
+                    f"user or role '{grantee}' does not exist",
+                    ora_code=_ORA_UNKNOWN_GRANTEE,
+                )
+        self.commit()
+        with self._administering() as conn:
+            if granting:
+                conn.cursor().executemany(
+                    'INSERT INTO sys.ora_sys_privs VALUES (%s, %s, %s) '
+                    'ON CONFLICT (grantee, privilege) DO UPDATE SET admin_option = '
+                    'sys.ora_sys_privs.admin_option OR EXCLUDED.admin_option',
+                    [(g, p, option is not None) for g in grantees for p in modelled],
+                )
+            else:
+                for grantee in grantees:
+                    for privilege in modelled:
+                        gone = conn.execute(
+                            'DELETE FROM sys.ora_sys_privs '
+                            'WHERE grantee = %s AND privilege = %s',
+                            (grantee, privilege),
+                        ).rowcount
+                        if gone:
+                            continue
+                        conn.rollback()
+                        if privilege == _DBA_ROLE:
+                            raise BackendError(
+                                f"ROLE '{privilege}' not granted to '{grantee}'",
+                                ora_code=_ORA_ROLE_NOT_GRANTED,
+                            )
+                        raise BackendError(
+                            f"system privileges not granted to '{grantee}'",
+                            ora_code=_ORA_SYSTEM_PRIVILEGE_NOT_GRANTED,
+                        )
+            conn.commit()
+        return Result()
 
     @contextmanager
     def _administering(self) -> Iterator[psycopg.Connection]:
@@ -21930,7 +22081,9 @@ class PostgresBackend:
             translated = _edition_statement(statement)
         if translated is None:
             return None
-        self._require_administrator()
+        verb = 'CREATE' if statement.lstrip()[:6].upper() == 'CREATE' else 'DROP'
+        kind = 'DIRECTORY' if _directory_statement(statement) else 'EDITION'
+        self._require_administrator(f'{verb} ANY {kind}')
         try:
             with self._administering() as conn:
                 conn.execute(translated)
@@ -22538,7 +22691,7 @@ class PostgresBackend:
         created = _CREATE_USER_STATEMENT.match(statement)
         if created is not None:
             name = _user_name(created.group(1))
-            self._require_administrator()
+            self._require_administrator('CREATE USER')
             if self._user_exists(name):
                 # A launcher's account is a user with no schema yet; an Oracle
                 # user always has one, so it gets it here, and the statement is
@@ -22583,7 +22736,7 @@ class PostgresBackend:
             name = _user_name(altered.group(1))
             if name != getattr(self, '_login_user', None):
                 # A user changes its own password; another's is a DBA's.
-                self._require_administrator()
+                self._require_administrator('ALTER USER')
             if not self._user_exists(name):
                 raise BackendError(
                     f"user '{name}' does not exist", ora_code=ORA_USER_DOES_NOT_EXIST
@@ -22601,7 +22754,7 @@ class PostgresBackend:
         unlocked = _ALTER_USER_UNLOCK.match(statement)
         if unlocked is not None:
             name = _user_name(unlocked.group(1))
-            self._require_administrator()
+            self._require_administrator('ALTER USER')
             if not self._user_exists(name):
                 raise BackendError(
                     f"user '{name}' does not exist", ora_code=ORA_USER_DOES_NOT_EXIST
@@ -22610,7 +22763,7 @@ class PostgresBackend:
             return Result()
         proxied = _ALTER_USER_PROXY.match(statement)
         if proxied is not None:
-            self._require_administrator()
+            self._require_administrator('ALTER USER')
             return self._proxy_grant(
                 _user_name(proxied.group(1)),
                 proxied.group(2).upper() == 'GRANT',
@@ -22619,13 +22772,14 @@ class PostgresBackend:
         dropped = _DROP_USER_STATEMENT.match(statement)
         if dropped is not None:
             name = _user_name(dropped.group(1))
-            self._require_administrator()
+            self._require_administrator('DROP USER')
             if not self._user_exists(name):
                 raise BackendError(
                     f"user '{name}' does not exist", ora_code=ORA_USER_DOES_NOT_EXIST
                 )
             schema = sql.Identifier(name.lower())
             proxy_grants = self._has_proxy_grants()
+            sys_privs = self._has_sys_privs()
             with self._administering() as conn:
                 if self._per_user:
                     self._refuse_connected(conn, name)
@@ -22660,6 +22814,11 @@ class PostgresBackend:
                         'DELETE FROM sys.ora_proxy_grants WHERE proxy = %s OR client = %s',
                         (name, name),
                     )
+                if sys_privs:
+                    # And its system privileges and role (#1936).
+                    conn.execute(
+                        'DELETE FROM sys.ora_sys_privs WHERE grantee = %s', (name,)
+                    )
                 if self._per_user:
                     self._drop_user_role(conn, name)
                 conn.commit()
@@ -22672,6 +22831,14 @@ class PostgresBackend:
         # older than them, or one that failed, does not.
         row = self._catalog_read(
             "SELECT to_regclass('sys.ora_proxy_grants') IS NOT NULL"
+        ).fetchone()
+        return bool(row and row[0])
+
+    def _has_sys_privs(self) -> bool:
+        # Whether the dictionary keeps system privileges (#1936): an
+        # installation older than them, or one that failed, does not.
+        row = self._catalog_read(
+            "SELECT to_regclass('sys.ora_sys_privs') IS NOT NULL"
         ).fetchone()
         return bool(row and row[0])
 

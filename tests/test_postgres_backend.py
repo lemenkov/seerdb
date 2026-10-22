@@ -3868,6 +3868,117 @@ def test_a_users_group_reads_no_dbas_record() -> None:
         pg.close()
 
 
+def test_a_system_privilege_lets_a_user_run_a_dbas_statement() -> None:
+    # GRANT of a system privilege or the DBA role (#1936): it lets a user run
+    # the DBA's statement it names, as on Oracle; it is granted on only by an
+    # administrator, a DBA, or a holder WITH ADMIN OPTION; USER_SYS_PRIVS,
+    # USER_ROLE_PRIVS and the SESSION_ views list it; DROP USER takes it.
+    pid = os.getpid()
+    admin = f'sp_adm_{pid}'
+    (user, other, made) = (f'sp_a_{pid}', f'sp_b_{pid}', f'sp_c_{pid}')
+    pg = psycopg.connect(_CONNINFO, autocommit=True)
+    opened: list[Any] = []
+    try:
+        with _per_user_mirror(_CONNINFO, admin) as base:
+
+            def login(name: str, password: str = 'pw123') -> Any:
+                opened.append(base(name, password))
+                return opened[-1]
+
+            adm = login(admin, 'adm123').cursor()
+            for name in (user, other):
+                adm.execute(f'create user {name} identified by pw123')
+            cur = login(user).cursor()
+            theirs = login(other).cursor()
+
+            def refused(cursor: Any, statement: str, code: str) -> None:
+                with pytest.raises(seerdb.DatabaseError, match=code):
+                    cursor.execute(statement)
+
+            refused(cur, f'create user {made} identified by pw123', 'ORA-01031')
+            adm.execute(f'grant create user to {user}')
+            cur.execute('select privilege, admin_option from user_sys_privs')
+            assert cur.fetchall() == [('CREATE USER', 'NO')]
+            cur.execute('select privilege from session_privs')
+            assert cur.fetchall() == [('CREATE USER',)]
+            cur.execute(f'create user {made} identified by pw123')
+            # Granting it on needs ADMIN OPTION.
+            refused(cur, f'grant create user to {other}', 'ORA-01031')
+            adm.execute(f'grant create user to {user} with admin option')
+            cur.execute(f'grant create user to {other}')
+            theirs.execute('select privilege, admin_option from user_sys_privs')
+            assert theirs.fetchall() == [('CREATE USER', 'NO')]
+            # A REVOKE takes it, and doesn't cascade, as on Oracle.
+            adm.execute(f'revoke create user from {user}')
+            refused(cur, f'drop user {made}', 'ORA-01031')
+            refused(adm, f'revoke create user from {user}', 'ORA-01952')
+            theirs.execute('select count(*) from user_sys_privs')
+            assert theirs.fetchall() == [(1,)]
+            # The DBA role holds every modelled privilege, and grants any.
+            adm.execute(f'grant dba to {user}')
+            cur.execute('select granted_role, admin_option from user_role_privs')
+            assert cur.fetchall() == [('DBA', 'NO')]
+            cur.execute('select role from session_roles')
+            assert cur.fetchall() == [('DBA',)]
+            cur.execute('select count(*) from session_privs')
+            assert cur.fetchall() == [(8,)]
+            cur.execute(f'alter user {other} account unlock')
+            cur.execute(f'grant drop user to {other}')
+            theirs.execute(f'drop user {made}')
+            refused(adm, f'revoke dba from {other}', 'ORA-01951')
+            refused(adm, 'grant create user to nobody_here', 'ORA-01917')
+            refused(adm, f'grant drop user, drop user to {other}', 'ORA-01711')
+            # A privilege the Mirror doesn't model is the no-op it was.
+            theirs.execute(f'grant create session, connect to {user}')
+            for session in opened[1:]:
+                session.close()
+            _wait_sessions_gone(pg, other)
+            adm.execute(f'drop user {other} cascade')
+            assert pg.execute(
+                'SELECT count(*) FROM sys.ora_sys_privs WHERE grantee = %s',
+                (other.upper(),),
+            ).fetchone() == (0,)
+    finally:
+        for session in opened:
+            with contextlib.suppress(Exception):
+                session.close()
+        pg.execute(
+            'DELETE FROM sys.ora_sys_privs WHERE grantee = ANY(%s)',
+            ([n.upper() for n in (user, other, made)],),
+        )
+        _drop_mirror_roles(pg, made, other, user, admin)
+        pg.close()
+
+
+def test_a_system_privilege_is_recorded_in_single_role_mode() -> None:
+    # In single-role mode anyone may run a DBA's statement, so a GRANT of a
+    # system privilege enforces nothing, but it is recorded and listed, as
+    # object grants are (#1936).
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+
+        def rows(sql: str) -> list:
+            return backend.execute(sql).rows
+
+        try:
+            backend.execute('GRANT ALTER SYSTEM TO pyo WITH ADMIN OPTION')
+            assert rows(
+                'SELECT privilege, admin_option FROM user_sys_privs '
+                "WHERE privilege = 'ALTER SYSTEM'"
+            ) == [('ALTER SYSTEM', 'YES')]
+            assert rows(
+                "SELECT grantee FROM dba_sys_privs WHERE privilege = 'ALTER SYSTEM'"
+            ) == [('PYO',)]
+            assert rows('SELECT privilege FROM session_privs') == [('ALTER SYSTEM',)]
+        finally:
+            backend.execute('REVOKE ALTER SYSTEM FROM pyo')
+        assert rows('SELECT count(*) FROM user_sys_privs') == [(0,)]
+    finally:
+        backend.close()
+
+
 def test_per_user_roles_with_an_installer_that_is_no_superuser() -> None:
     # As a deployment runs it (#1857): the Mirror's role owns its database and
     # may make roles, but is no superuser; a superuser made the extensions.
