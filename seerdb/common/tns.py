@@ -1089,6 +1089,21 @@ class _ThinCodec:
     read_lob = read_value
 
     @staticmethod
+    def long(data: bytes | None) -> bytes:
+        # A LONG / LONG RAW cell (#484): chunked even when it fits one chunk,
+        # 252 bytes at most, in the chunk framing of the negotiated version;
+        # NULL a bare zero.
+        return (
+            b'\x00' if data is None else _ThinCodec._chunked(data, TNS_MAX_SHORT_LENGTH)
+        )
+
+    @staticmethod
+    def read_long(data: bytes) -> tuple[bytes | None, bytes]:
+        if data[0] == 0:
+            return None, data[1:]
+        return _ThinCodec.read_value(data)
+
+    @staticmethod
     def token(value: int | None) -> bytes:
         # A function call's token number, from 23ai (_fun_header): the caller
         # gives None below it, where there is none.
@@ -1160,10 +1175,24 @@ class _OciCodec:
         return _OciCodec._chunked(data)
 
     @staticmethod
-    def _chunked(data: bytes) -> bytes:
+    def long(data: bytes | None) -> bytes:
+        # A LONG / LONG RAW cell (#407), chunked as thin's at 252 bytes.
+        if data is None:
+            return b'\x00'
+        return _OciCodec._chunked(data, TNS_MAX_SHORT_LENGTH)
+
+    @staticmethod
+    def read_long(data: bytes) -> tuple[bytes | None, bytes]:
+        if data[0] == 0:
+            return None, data[1:]
+        return _OciCodec.read_value(data)
+
+    @staticmethod
+    def _chunked(data: bytes, size: int | None = None) -> bytes:
+        size = size or _OCI_LOB_CHUNK
         out = bytearray([TNS_LONG_LENGTH_INDICATOR])
-        for at in range(0, len(data), _OCI_LOB_CHUNK):
-            chunk = data[at : at + _OCI_LOB_CHUNK]
+        for at in range(0, len(data), size):
+            chunk = data[at : at + size]
             out += bytes([len(chunk)]) + chunk
         return bytes(out + b'\x00')
 
@@ -1305,7 +1334,93 @@ _ALL8_HEAD: wire_schema.Schema = (
     ('ptr', 'defines_present'),
     ('wn4', 'define_count'),
 )
+# The end of a describe (TTI_DCB), and of a REF CURSOR's inline one: the
+# describe time, four flags (dcbflag, dcbmdbz, dcbmnpr, dcbmxpr) and, from
+# 11.2, the result cache's query key. Thin sends an empty date and key; OCI a
+# lead byte, a 7-byte date in the two-length form (zero, as the Mirror leaves
+# it) and the key's ub4 length. A LOB describe sets dcbmdbz (#405).
+_DESCRIBE_TRAILER: wire_schema.Schema = (
+    ('only', 'oci', (('u8', 'date_lead'), ('n4', 'date_length'))),
+    ('value', 'date'),
+    ('n4', 'dcbflag'),
+    ('n4', 'dcbmdbz'),
+    ('n4', 'dcbmnpr'),
+    ('n4', 'dcbmxpr'),
+    (
+        'when',
+        'has_query_key',
+        (
+            ('only', 'thin', (('value', 'query_key'),)),
+            ('only', 'oci', (('n4', 'query_key_length'),)),
+        ),
+    ),
+)
+# A REF CURSOR OUT value (#483, #2014): a lead byte -- 0x01 in thin, 0x4c in
+# OCI -- the cursor's describe, its id and the return code every OUT value
+# ends on.
+_REFCURSOR_OUT: wire_schema.Schema = (
+    ('u8', 'lead'),
+    ('raw', 'describe'),
+    ('n4', 'cursor'),
+    ('n2', 'return_code'),
+)
+# A LONG / LONG RAW cell: the content, then its trailing indicators -- the
+# actual length and, in thin only, the return code -- zero for an ordinary
+# value (#407, #484).
+_LONG_CELL: wire_schema.Schema = (
+    ('long', 'content'),
+    ('n4', 'actual_length'),
+    ('only', 'thin', (('n4', 'return_code'),)),
+)
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+_LONG_CELL_THIN = wire_schema.compile_encoder(_LONG_CELL, _THIN)
+_LONG_CELL_OCI = wire_schema.compile_encoder(_LONG_CELL, _OCI)
+
+
+def _long_content(value: object) -> bytes | None:
+    # A LONG cell's content: str as UTF-8 (LONG), bytes as they are (LONG RAW).
+    if value is None or isinstance(value, (bytes, bytearray)):
+        return None if value is None else bytes(value)
+    return (value if isinstance(value, str) else str(value)).encode('utf-8')
+
+
+_DESCRIBE_TRAILER_THIN = wire_schema.compile_encoder(_DESCRIBE_TRAILER, _THIN)
+_DESCRIBE_TRAILER_OCI = wire_schema.compile_encoder(_DESCRIBE_TRAILER, _OCI)
+_REFCURSOR_OUT_THIN = wire_schema.compile_encoder(_REFCURSOR_OUT, _THIN)
+_REFCURSOR_OUT_OCI = wire_schema.compile_encoder(_REFCURSOR_OUT, _OCI)
+
+
+def _describe_trailer(*, oci: bool, mdbz: int = 0) -> bytes:
+    # The describe's trailer (_DESCRIBE_TRAILER) as the session's field version
+    # has it, in either dialect.
+    has_key = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2
+    if not oci:
+        return _DESCRIBE_TRAILER_THIN(
+            {
+                'date': b'',
+                'dcbflag': 0,
+                'dcbmdbz': mdbz,
+                'dcbmnpr': 0,
+                'dcbmxpr': 0,
+                'has_query_key': has_key,
+                'query_key': b'',
+            }
+        )
+    return _DESCRIBE_TRAILER_OCI(
+        {
+            'date_lead': 0,
+            'date_length': _OCI_DCB_DATE_LEN,
+            'date': bytes(_OCI_DCB_DATE_LEN),
+            'dcbflag': 0,
+            'dcbmdbz': mdbz,
+            'dcbmnpr': 0,
+            'dcbmxpr': 0,
+            'has_query_key': has_key,
+            'query_key_length': 0,
+        }
+    )
+
+
 _ALL8_HEAD_FROM_THIN = wire_schema.compile_decoder(_ALL8_HEAD, _THIN)
 _ALL8_HEAD_FROM_OCI = wire_schema.compile_decoder(_ALL8_HEAD, _OCI)
 _ALL8_HEAD_FROM_OCI_WIDE = wire_schema.compile_decoder(_ALL8_HEAD, _OCI_WIDE)
@@ -1884,13 +1999,9 @@ def _encode_describe_body(columns: list[ColumnMeta]) -> bytes:
         body += bytes([0])  # reserved
     for position, col in enumerate(columns, start=1):
         body += _encode_dcb_column(col, position)
-    body += _bytes_with_length(b'')  # current date (skipped)
-    body += encode_sb4(0) * 4  # dcbflag / dcbmdbz / dcbmnpr / dcbmxpr
-    if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2:
-        # The result cache's query key is an 11g addition; a 10g describe ends
-        # after the four flags (#84, #814).
-        body += _bytes_with_length(b'')  # dcbqcky query-cache key (11g)
-    return body
+    # The current date, four flags and, from 11g, the result cache's query key:
+    # a 10g describe ends after the flags (#84, #814).
+    return body + _describe_trailer(oci=False)
 
 
 def _encode_annotations(annotations: tuple[tuple[bytes, bytes], ...]) -> bytes:
@@ -3577,11 +3688,13 @@ def _encode_refcursor_out(bind: RefCursorOutBind) -> bytes:
     # is one `0x00` byte, which the client's reader skips as its indicator all
     # the same, so both dialects stay in sync. A middle REF CURSOR OUT bind (the
     # object-type metadata cursor's `attrs_rc`) desynced every following bind.
-    return (
-        bytes([1])  # length prefix (skipped by the client)
-        + _encode_describe_body(bind.columns)
-        + encode_sb4(bind.cursor_id)
-        + encode_sb4(0)  # per-value return code (actual_num_bytes = 0)
+    return _REFCURSOR_OUT_THIN(
+        {
+            'lead': 1,  # a length prefix the client skips
+            'describe': _encode_describe_body(bind.columns),
+            'cursor': bind.cursor_id,
+            'return_code': 0,  # actual_num_bytes
+        }
     )
 
 
@@ -9799,9 +9912,8 @@ _OCI_DCB_MARKER_OFF = 33
 _OCI_DCB_NUMCOLS_OFF = 37
 
 
-# The zero ub4 the trailer carries from 11.2 on, just ahead of the marker: 11g
-# sends sqlplus 10.2 `02000000 02000000 06...` with nothing between (#1764).
-_OCI_DCB_10_2_GAP_OFF = 29
+# The trailer's query-key length is an 11.2 field: 11g sends sqlplus 10.2
+# `02000000 02000000 06...` with nothing between (#1764).
 
 
 # The execute return status (an OCI OER, offsets 32:65 of the status trailer):
@@ -10176,16 +10288,12 @@ _OCI_ROW_STATUS_LEN = 171
 
 
 def _oci_dcb_tail(numcols: int) -> bytes:
-    tail = bytearray(_OCI_DCB_TAIL_LEN)
-    tail[1:5] = _oci_ub4(_OCI_DCB_DATE_LEN)  # describe-time DALC char length
-    tail[5] = _OCI_DCB_DATE_LEN  # DALC byte length; the value stays zero
-    off = _OCI_DCB_MARKER_OFF
-    tail[off : off + len(_OCI_DCB_MARKER)] = _OCI_DCB_MARKER
-    tail[_OCI_DCB_NUMCOLS_OFF] = numcols
-    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_11_2:
-        # The marker and the column count move back by 4 with it.
-        del tail[_OCI_DCB_10_2_GAP_OFF : _OCI_DCB_10_2_GAP_OFF + 4]
-    return bytes(tail)
+    # The describe's trailer (_DESCRIBE_TRAILER), then the row header the
+    # inline row follows: the DCB marker and the column count.
+    rxh = bytearray(_OCI_DCB_TAIL_LEN - _OCI_DCB_MARKER_OFF)
+    rxh[: len(_OCI_DCB_MARKER)] = _OCI_DCB_MARKER
+    rxh[_OCI_DCB_NUMCOLS_OFF - _OCI_DCB_MARKER_OFF] = numcols
+    return _describe_trailer(oci=True) + bytes(rxh)
 
 
 # The execute reply for a LOB SELECT is a describe with NO row inline — sqlplus
@@ -10197,22 +10305,13 @@ def _oci_dcb_tail(numcols: int) -> bytes:
 # instance-specific (a real reply zeroes the timestamp / SCN but not this), so it
 # is a stable structural value; its exact meaning is unpinned, carried from the
 # live 11g CLOB describe capture (#405).
-_OCI_LOB_DESCRIBE_TAIL_LEN = 33
 _OCI_LOB_DESCRIBE_SIZE_OFF = 17
 _OCI_LOB_DESCRIBE_SIZE = 8168  # 0x1fe8, ub4 LE — carried ground truth
 
 
 def _oci_lob_describe_tail() -> bytes:
-    tail = bytearray(_OCI_LOB_DESCRIBE_TAIL_LEN)
-    tail[1:5] = _oci_ub4(_OCI_DCB_DATE_LEN)  # describe-time DALC char length
-    tail[5] = _OCI_DCB_DATE_LEN  # DALC byte length; the value stays zero
-    off = _OCI_LOB_DESCRIBE_SIZE_OFF
-    tail[off : off + 4] = _oci_ub4(_OCI_LOB_DESCRIBE_SIZE)
-    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_11_2:
-        # The same zero ub4 the inline-row trailer drops for sqlplus 10.2, here
-        # the last four bytes: 11g ends its CLOB describe to 10.2 at 29 (#1764).
-        del tail[_OCI_DCB_10_2_GAP_OFF : _OCI_DCB_10_2_GAP_OFF + 4]
-    return bytes(tail)
+    # The describe's trailer (_DESCRIBE_TRAILER) alone, its dcbmdbz set.
+    return _describe_trailer(oci=True, mdbz=_OCI_LOB_DESCRIBE_SIZE)
 
 
 _OCI_LOB_DESCRIBE_TAIL = _oci_lob_describe_tail()
@@ -10822,29 +10921,19 @@ def _oci_xmltype_value(value: object) -> bytes:
 # 18c to sqlplus 10.2, 11.2 and 23.26 alike, whatever the cursor's columns; a 10g
 # server sends 0x3c, but it is not what the Mirror presents.
 _OCI_REFCURSOR_LEAD = 0x4C
-# The describe-time tail: a zero byte, the date's ub4 and ub1 lengths (7), the
-# date, four ub4 flags and, from 11.2, the ub4 length of an empty query-cache key
-# -- the fields the thin decoder skips there. A live server fills in the date, and
-# for a DATE column one of the flags; the Mirror zeroes them, as it does in a
-# query's own describe tail.
-_OCI_REFCURSOR_TAIL_LEN = 33
-_OCI_REFCURSOR_TAIL_10_2_LEN = 29
+# The describe-time tail is the describe's trailer (_DESCRIBE_TRAILER). A live
+# server fills in the date, and for a DATE column one of the flags; the Mirror
+# zeroes them, as it does in a query's own describe tail.
 
 
 def _oci_refcursor_out_value(bind: RefCursorOutBind) -> bytes:
-    tail = bytearray(
-        _OCI_REFCURSOR_TAIL_LEN
-        if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2
-        else _OCI_REFCURSOR_TAIL_10_2_LEN
-    )
-    tail[1:5] = _oci_ub4(_OCI_DCB_DATE_LEN)
-    tail[5] = _OCI_DCB_DATE_LEN
-    return (
-        bytes([_OCI_REFCURSOR_LEAD])
-        + _oci_describe_body(bind.columns)
-        + bytes(tail)
-        + _oci_ub4(bind.cursor_id)
-        + _OCI_OUTBIND_RETCODE
+    return _REFCURSOR_OUT_OCI(
+        {
+            'lead': _OCI_REFCURSOR_LEAD,
+            'describe': _oci_describe_body(bind.columns) + _describe_trailer(oci=True),
+            'cursor': bind.cursor_id,
+            'return_code': 0,
+        }
     )
 
 
@@ -11058,28 +11147,12 @@ def _decode_describe_oci(payload: bytes) -> list[dict]:
 # content is UTF-8, LONG RAW is raw bytes.
 
 
-_OCI_LONG_TRAILER = bytes(4)  # trailing ub4 indicator (actual/return length = 0)
-
-
 def encode_long_value_oci(value: object) -> bytes:
     """The RXD value for a LONG / LONG RAW column (#407): the content streamed
-    inline as 0xFE-chunked bytes + a zero trailing indicator. NULL is an empty
-    value (0x00) still followed by the trailing indicator. ``str`` content is
-    UTF-8 (LONG), ``bytes`` is raw (LONG RAW)."""
-    if value is None:
-        return bytes([0]) + _OCI_LONG_TRAILER
-    if isinstance(value, str):
-        content = value.encode('utf-8')
-    elif isinstance(value, (bytes, bytearray)):
-        content = bytes(value)
-    else:
-        content = str(value).encode('utf-8')
-    out = bytearray([TNS_LONG_LENGTH_INDICATOR])
-    for start in range(0, len(content), TNS_MAX_SHORT_LENGTH):
-        chunk = content[start : start + TNS_MAX_SHORT_LENGTH]
-        out += bytes([len(chunk)]) + chunk
-    out += bytes([0])  # zero-length chunk terminates the run
-    return bytes(out) + _OCI_LONG_TRAILER
+    inline as 0xFE-chunked bytes + a zero trailing indicator (_LONG_CELL). NULL
+    is an empty value (0x00) still followed by the trailing indicator. ``str``
+    content is UTF-8 (LONG), ``bytes`` is raw (LONG RAW)."""
+    return _LONG_CELL_OCI({'content': _long_content(value), 'actual_length': 0})
 
 
 _OCI_LOB_ROW_SIZE_OFF = 97  # ub4 BE content byte size inside the row locator value
@@ -14385,32 +14458,15 @@ def encode_urowid_value(Value: object) -> bytes:
 # sqlplus / OCI dialect frames it with a single ub4 trailer instead. Character LONG
 # content is UTF-8, LONG RAW is raw bytes. Chunks stay within the single-length
 # DALC boundary used throughout this codec.
-_THIN_LONG_TRAILER = encode_sb4(0) + encode_sb4(0)  # two ub4 indicators (0, 0)
 
 
 def encode_long_value_thin(Value: object) -> bytes:
     """The thin RXD value for a LONG / LONG RAW column (#484): the content streamed
     inline as 0xFE-chunked bytes (NULL is a bare 0x00), followed by the two zero
-    trailing indicators :func:`_read_long_column` consumes."""
-    if Value is None:
-        return bytes([0]) + _THIN_LONG_TRAILER
-    if isinstance(Value, str):
-        Content = Value.encode('utf-8')
-    elif isinstance(Value, (bytes, bytearray)):
-        Content = bytes(Value)
-    else:
-        Content = str(Value).encode('utf-8')
-    # 11g frames each inline LONG chunk with a single length byte; a 12.1+ client
-    # reads a ub4 length per chunk (its _read_long_column), so chunk in the
-    # session's negotiated version — the same split as the LOB read reply.
-    wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
-    encode_len = encode_sb4 if wide else (lambda n: bytes([n]))
-    Out = bytearray([TNS_LONG_LENGTH_INDICATOR])
-    for Start in range(0, len(Content), TNS_MAX_SHORT_LENGTH):
-        Chunk = Content[Start : Start + TNS_MAX_SHORT_LENGTH]
-        Out += encode_len(len(Chunk)) + Chunk
-    Out += encode_len(0)  # zero-length chunk terminates the run
-    return bytes(Out) + _THIN_LONG_TRAILER
+    trailing indicators :func:`_read_long_column` consumes (_LONG_CELL)."""
+    return _LONG_CELL_THIN(
+        {'content': _long_content(Value), 'actual_length': 0, 'return_code': 0}
+    )
 
 
 # The RXD value the Mirror mints for a thin LOB column: an opaque locator the
