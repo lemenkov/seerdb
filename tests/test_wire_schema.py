@@ -330,3 +330,17 @@ def test_an_object_frame_ends_the_same_way_in_both_dialects() -> None:
         assert oci.endswith(b'\x05\x00\x00\x00' + b'\x01\x00' + b'\x05' + image)
         null = tns._oci_object_frame(bytes(16), None)
         assert null.endswith(b'\x00\x00\x00\x00' + b'\x01\x00')
+
+
+@pytest.mark.parametrize('version', (6, 24))
+def test_close_cursors_is_one_schema_in_both_dialects(version: int) -> None:
+    # Thin's pointer flag and variable-width count, OCI's indicator and ub8
+    # count, each closed cursor's id; the call behind it untouched (#191, #1517).
+    call = bytes.fromhex('035e0799')
+    live = bytes.fromhex('116911fe' + 'ff' * 7 + '02' + '00' * 7 + '0300000001000000')
+    assert tns.strip_oci_piggyback(live + call) == call
+    with _field_version(version):
+        thin = tns.encode_close_cursors_piggyback(0x11, version, [3, 1])
+        assert tns.skip_close_cursors_piggyback(thin + call) == call
+        (fields, _rest) = tns._CLOSE_CURSORS_FROM_OCI(live)
+        assert [c['cursor'] for c in fields['cursors']] == [3, 1]

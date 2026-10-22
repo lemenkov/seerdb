@@ -169,6 +169,7 @@ from seerdb.common.tns import (
     parse_tpc_switch,
     peek_exec_cursor,
     scroll_start_row,
+    skip_close_cursors_piggyback,
     strip_oci_piggyback,
 )
 from seerdb.common.tns_consts import (
@@ -2711,10 +2712,7 @@ def _skip_piggybacks(
         if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_23_1_EXT_1:
             _, rest = decode_ub4(rest)  # the fv24 ub8 token
         if func == TTI_OCCA:  # CLOSE_CURSORS
-            rest = rest[1:]  # pointer byte
-            count, rest = decode_ub4(rest)
-            for _ in range(count):
-                _, rest = decode_ub4(rest)  # each closed cursor id (ignored)
+            rest = skip_close_cursors_piggyback(body)
         elif func == TNS_FUNC_SET_END_TO_END_ATTR:
             attrs, rest = _parse_end_to_end_piggyback(rest)
             apply = getattr(backend, 'set_end_to_end', None) if backend else None
