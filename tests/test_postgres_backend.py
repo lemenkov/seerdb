@@ -4379,6 +4379,67 @@ def test_a_users_invalid_view_record_runs_in_no_other_session() -> None:
         pg.close()
 
 
+def test_another_users_package_is_not_this_users_to_create_or_drop() -> None:
+    # A package's records are its owner's to write, and dropping or
+    # compiling its body runs their text: another user's CREATE or DROP of
+    # it, or of its body, is ORA-01031, before anything runs
+    # (GHSA-qmx7-qr2x-76r7). Its owner's are as they were.
+    pid = os.getpid()
+    admin = f'pk_adm_{pid}'
+    (user, other) = (f'pk_a_{pid}', f'pk_b_{pid}')
+    package = f'pk_pkg_{pid}'
+    pg = psycopg.connect(_CONNINFO, autocommit=True)
+    opened: list[Any] = []
+    try:
+        with _per_user_mirror(_CONNINFO, admin) as base:
+
+            def login(name: str, password: str = 'pw123') -> Any:
+                opened.append(base(name, password))
+                return opened[-1]
+
+            adm = login(admin, 'adm123').cursor()
+            for name in (user, other):
+                adm.execute(f'create user {name} identified by pw123')
+            cur = login(user).cursor()
+            cur.execute('create table pk_seen (who varchar2(64))')
+            cur.execute(f'grant insert on pk_seen to {other}')
+            cur.execute(f'create or replace package {package} as x number := 1; end;')
+            cur.execute(
+                f"update sys.ora_packages set stubs = 'INSERT INTO {user}.pk_seen "
+                f"SELECT current_user' where name = '{package}'"
+            )
+            cur.connection.commit()
+            theirs = login(other).cursor()
+            for statement in (
+                f'drop package body {package}',
+                f'drop package {package}',
+                f'create or replace package body {package} as begin null; end;',
+                f'create or replace package {package} as y number := 2; end;',
+            ):
+                with pytest.raises(seerdb.DatabaseError, match='ORA-01031'):
+                    theirs.execute(statement)
+            assert pg.execute(f'SELECT who FROM {user}.pk_seen').fetchall() == []
+            cur.execute(
+                f"update sys.ora_packages set stubs = '' where name = '{package}'"
+            )
+            cur.connection.commit()
+            cur.execute(f'drop package {package}')
+            assert (
+                pg.execute(
+                    'SELECT 1 FROM pg_namespace WHERE nspname = %s', (package,)
+                ).fetchone()
+                is None
+            )
+    finally:
+        for session in opened:
+            with contextlib.suppress(Exception):
+                session.close()
+        pg.execute(f'DROP SCHEMA IF EXISTS {package} CASCADE')
+        pg.execute('DELETE FROM sys.ora_packages WHERE name = %s', (package,))
+        _drop_mirror_roles(pg, other, user, admin)
+        pg.close()
+
+
 def test_a_users_role_is_made_with_a_verifier_not_its_password() -> None:
     # A per-user role's password reaches PostgreSQL as a SCRAM verifier the
     # Mirror computes, which a server logging its DDL writes down instead of

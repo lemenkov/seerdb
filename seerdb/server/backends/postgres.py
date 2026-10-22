@@ -16281,6 +16281,7 @@ class PostgresBackend:
         # dialect rewrite reshapes it (#532).
         is_ddl = _IS_DDL.match(sql) is not None
         original = sql
+        self._require_package_owner(sql)
         # Translate Oracle SQL to PostgreSQL's dialect (#500/#502/#503) — DDL
         # column types, CREATE PROCEDURE/FUNCTION → PL/pgSQL, then the function /
         # literal idioms. This is where dialect knowledge belongs, not in the
@@ -21684,6 +21685,24 @@ class PostgresBackend:
         if not row[0]:
             return None, [], names, row[3]
         return list(row[0]), list(row[1] or ()), names, row[3]
+
+    def _require_package_owner(self, sql: str) -> None:
+        # A CREATE or DROP of a package, or of its body, that another user's
+        # role owns: Oracle's needs an ANY privilege, which the Mirror does not
+        # model (#1936), so ORA-01031. Refused before the package's records,
+        # its owner's to write, are read and their text run on this session's
+        # connection (GHSA-qmx7-qr2x-76r7).
+        m = _PACKAGE_HEAD.match(sql) or _DROP_PACKAGE.match(sql)
+        if m is None:
+            return
+        row = self._conn.execute(
+            "SELECT pg_has_role(nspowner, 'USAGE') FROM pg_namespace WHERE nspname = %s",
+            (m.group(3).lower(),),
+        ).fetchone()
+        if row is not None and not row[0]:
+            raise BackendError(
+                'insufficient privileges', ora_code=ORA_INSUFFICIENT_PRIVILEGES
+            )
 
     def _require_administrator(self) -> None:
         # A DBA's statement in per-user mode: only an account the operator
