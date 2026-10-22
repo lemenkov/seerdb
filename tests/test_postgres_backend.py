@@ -3840,6 +3840,33 @@ def test_a_callers_temporary_table_stands_in_for_no_definers_table() -> None:
         pg.close()
 
 
+def test_a_users_group_reads_no_dbas_record() -> None:
+    # The group every per-user role is in reads the dictionary, but not a
+    # DBA's records: the proxy grants, nor who each open proxy session's proxy
+    # is, which a session asks of sys.ora_session_proxy() for its own
+    # (GHSA-6qw5-v992-69fx).
+    admin = f'gp_adm_{os.getpid()}'
+    pg = psycopg.connect(_CONNINFO, autocommit=True)
+    try:
+        with _per_user_mirror(_CONNINFO, admin) as login:
+            session = login(admin, 'adm123')
+            cur = session.cursor()
+            cur.execute("select sys_context('userenv', 'proxy_user') from dual")
+            assert cur.fetchall() == [(None,)]
+            session.close()
+        group = f'{pg.info.user}_mirror_users'
+        for table in ('sys.ora_session_proxies', 'sys.ora_proxy_grants'):
+            assert pg.execute(
+                "SELECT has_table_privilege(%s, %s, 'SELECT')", (group, table)
+            ).fetchone() == (False,)
+        assert pg.execute(
+            "SELECT has_table_privilege(%s, 'sys.ora_sessions', 'SELECT')", (group,)
+        ).fetchone() == (True,)
+    finally:
+        _drop_mirror_roles(pg, admin)
+        pg.close()
+
+
 def test_per_user_roles_with_an_installer_that_is_no_superuser() -> None:
     # As a deployment runs it (#1857): the Mirror's role owns its database and
     # may make roles, but is no superuser; a superuser made the extensions.
