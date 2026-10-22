@@ -1088,6 +1088,18 @@ class _ThinCodec:
 
     read_lob = read_value
 
+    @staticmethod
+    def token(value: int | None) -> bytes:
+        # A function call's token number, from 23ai (_fun_header): the caller
+        # gives None below it, where there is none.
+        return b'' if value is None else encode_sb4(value)
+
+    @staticmethod
+    def read_token(data: bytes) -> tuple[int | None, bytes]:
+        if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_23_1_EXT_1:
+            return decode_ub4(data)
+        return None, data
+
 
 class _OciCodec:
     """The OCI dialect's primitives (#2064), as sqlplus reads them: fixed-width
@@ -1157,6 +1169,15 @@ class _OciCodec:
 
     read_lob = read_value
 
+    @staticmethod
+    def token(value: int | None) -> bytes:
+        # sqlplus speaks the 18c layout to a 12c+ server, which has none.
+        return b''
+
+    @staticmethod
+    def read_token(data: bytes) -> tuple[int | None, bytes]:
+        return None, data
+
 
 _THIN = _ThinCodec()
 _OCI = _OciCodec()
@@ -1196,7 +1217,33 @@ _SYNC: wire_schema.Schema = (
     ('each', 'pairs', 'pair_count', _SYNC_PAIR),
     ('n4', 'flags'),
 )
+# TTI_FETCH: the cursor and the rows the client has room for.
+_FETCH: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN, TTI_FETCH])),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+    ('n4', 'cursor'),
+    ('n4', 'rows'),
+)
+# An execute by cursor id, TTI_EXEC (function 4), and the fetch-carrying form
+# (78): the cursor, the iterations, two option words, then -- with binds -- an
+# RXD row of values, which each dialect reads its own way.
+_EXEC_BY_CURSOR: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN])),
+    ('u8', 'function'),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+    ('n4', 'cursor'),
+    ('n4', 'iterations'),
+    ('n4', 'options'),
+    ('n4', 'options_2'),
+)
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+_FETCH_THIN = wire_schema.compile_encoder(_FETCH, _THIN)
+_FETCH_FROM_THIN = wire_schema.compile_decoder(_FETCH, _THIN)
+_FETCH_FROM_OCI = wire_schema.compile_decoder(_FETCH, _OCI)
+_EXEC_BY_CURSOR_FROM_THIN = wire_schema.compile_decoder(_EXEC_BY_CURSOR, _THIN)
+_EXEC_BY_CURSOR_FROM_OCI = wire_schema.compile_decoder(_EXEC_BY_CURSOR, _OCI)
 _LOGOFF_REPLY_THIN = wire_schema.compile_encoder(_LOGOFF_REPLY, _THIN)
 _LOB_DATA_THIN = wire_schema.compile_encoder(_LOB_DATA, _THIN)
 _LOB_DATA_OCI = wire_schema.compile_encoder(_LOB_DATA, _OCI)
@@ -3965,10 +4012,8 @@ def parse_fetch(payload: bytes) -> FetchRequest:
     id + ub4 row count (the inverse of ``encode_dictionary_fetch``)."""
     if len(payload) < 3 or payload[0] != TTI_FUN or payload[1] != TTI_FETCH:
         raise InterfaceError('not a TTI_FETCH')
-    rest = _skip_fun_header(payload)  # TTI_FUN, TTI_FETCH, seq (+ fv24 token)
-    cursor, rest = decode_ub4(rest)
-    fetch, _rest = decode_ub4(rest)
-    return FetchRequest(cursor=cursor, fetch=fetch)
+    (fields, _rest) = _FETCH_FROM_THIN(payload)
+    return FetchRequest(cursor=fields['cursor'], fetch=fields['rows'])
 
 
 def parse_reexecute(
@@ -4022,11 +4067,9 @@ def parse_reexecute(
     """
     if len(payload) < 3 or payload[0] != TTI_FUN:
         raise InterfaceError('not a re-execute')
-    rest = _skip_fun_header(payload)  # TTI_FUN, func, seq (+ fv24 token)
-    cursor, rest = decode_ub4(rest)
-    iterations, rest = decode_ub4(rest)
-    options, rest = decode_ub4(rest)
-    options_2, rest = decode_ub4(rest)
+    (fields, rest) = _EXEC_BY_CURSOR_FROM_THIN(payload)
+    (cursor, iterations) = (fields['cursor'], fields['iterations'])
+    (options, options_2) = (fields['options'], fields['options_2'])
     bind_rows: list = []
     if bind_types:
         types = list(bind_types)
@@ -4110,22 +4153,17 @@ def parse_reexecute_oci(payload: bytes) -> tuple[int, int]:
     return cursor, int.from_bytes(payload[at : at + 4], 'little')
 
 
-# The OCI fetch is `03 05 <seq>`, then the cursor id and the number of rows the
-# client has room for, each a fixed ub4 LE (live 11g/18c: `03 05 0f 02 00 00 00
-# 0f 00 00 00` asks cursor 2 for 15 rows).
-_OCI_FETCH_ROWS_OFF = 7
-
-
 def parse_fetch_oci(payload: bytes) -> int:
-    """How many rows an OCI ``TTI_FETCH`` asks for.
+    """How many rows an OCI ``TTI_FETCH`` asks for: `03 05 <seq>`, then the
+    cursor id and the rows the client has room for, each a ub4 LE (live
+    11g/18c: `03 05 0f 02 00 00 00 0f 00 00 00` asks cursor 2 for 15 rows).
 
     sqlplus sizes its fetch buffer to this count, so a reply carrying more rows
     than it asked for overruns that buffer and crashes it (#1284).
     """
-    end = _OCI_FETCH_ROWS_OFF + 4
-    if len(payload) < end or payload[0] != TTI_FUN or payload[1] != TTI_FETCH:
+    if len(payload) < 11 or payload[0] != TTI_FUN or payload[1] != TTI_FETCH:
         raise InterfaceError('not an OCI TTI_FETCH')
-    return int.from_bytes(payload[_OCI_FETCH_ROWS_OFF:end], 'little')
+    return _FETCH_FROM_OCI(payload)[0]['rows']
 
 
 def is_version_call_oci(payload: bytes) -> bool:
@@ -10860,25 +10898,17 @@ def _oci_scalar_out_value(value: object) -> bytes:
     return encode_value(value, 0)
 
 
-# An OCI execute by cursor id, TTI_EXEC (function 4, #2041): a block already
-# parsed, run again with new IN values. sqlplus fetches SERVEROUTPUT's lines
-# this way, DBMS_OUTPUT.GET_LINES re-executed for each batch after the first:
-# `03 04 <seq>`, the cursor id and the iteration count (ub4 LE each), eight
-# zero bytes, then an RXD row of the values of the binds that came in with one.
-_OCI_EXEC_CURSOR_OFF = 3
-_OCI_EXEC_VALUES_OFF = 19
-
-
 def parse_exec_by_cursor_oci(payload: bytes, types: list[int]) -> tuple[int, list]:
     """The cursor id and the IN values of an OCI ``TTI_EXEC`` (#2041), one per
     entry of ``types`` -- the TNS types of the binds that came in with a value,
-    in order."""
-    if len(payload) < _OCI_EXEC_VALUES_OFF + 1 or payload[1] != TTI_EXEC:
+    in order. sqlplus fetches SERVEROUTPUT's lines this way, DBMS_OUTPUT.
+    GET_LINES re-executed for each batch after the first: the thin execute by
+    cursor's fields (_EXEC_BY_CURSOR) at fixed width, its option words zero,
+    then an RXD row of the values."""
+    if len(payload) < 20 or payload[1] != TTI_EXEC:
         raise InterfaceError('not an OCI TTI_EXEC')
-    cursor = int.from_bytes(
-        payload[_OCI_EXEC_CURSOR_OFF : _OCI_EXEC_CURSOR_OFF + 4], 'little'
-    )
-    rest = payload[_OCI_EXEC_VALUES_OFF:]
+    (fields, rest) = _EXEC_BY_CURSOR_FROM_OCI(payload)
+    cursor = fields['cursor']
     if not types:
         return cursor, []
     if rest[:1] != bytes([TTI_RXD]):
@@ -11994,11 +12024,15 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
 
 
 def encode_dictionary_fetch(Dictionary: dict) -> bytes:
-    Tseq = Dictionary['seq']
-    Cursor = encode_sb4(Dictionary['cursor'])
-    Fetch = encode_sb4(Dictionary['fetch'])
     FieldVersion = Dictionary.get('field_version', FIELD_VERSION_11_2)
-    return _fun_header(TTI_FETCH, Tseq, FieldVersion) + Cursor + Fetch
+    return _FETCH_THIN(
+        {
+            'seq': Dictionary['seq'],
+            'token_number': 0 if FieldVersion >= FIELD_VERSION_23_1_EXT_1 else None,
+            'cursor': Dictionary['cursor'],
+            'rows': Dictionary['fetch'],
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
