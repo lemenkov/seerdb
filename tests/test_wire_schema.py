@@ -313,3 +313,20 @@ def test_an_oci_lob_cell_reads_as_its_captured_lengths() -> None:
     cell = tns.encode_lob_locator_oci('abc', True)
     assert cell[:6] == bytes.fromhex('6a000000 6a00'.replace(' ', ''))
     assert len(cell) == 4 + 1 + 106
+
+
+def test_an_object_frame_ends_the_same_way_in_both_dialects() -> None:
+    # Each dialect's own head, then the image's length, the TOP_LEVEL flags and
+    # the image -- none for a NULL (#116, #2050).
+    image = b'\x84\x01\x05\x00\x00'
+    thin = tns._encode_object_frame(b'', image)
+    (fields, rest) = wire_schema.compile_decoder(tns._OBJECT_FRAME, tns._THIN)(
+        thin, {'has_image': True}
+    )
+    assert rest == b''
+    assert (fields['image_length'], fields['flags'], fields['image']) == (5, 1, image)
+    with _field_version(7):
+        oci = tns._oci_object_frame(bytes(16), image)
+        assert oci.endswith(b'\x05\x00\x00\x00' + b'\x01\x00' + b'\x05' + image)
+        null = tns._oci_object_frame(bytes(16), None)
+        assert null.endswith(b'\x00\x00\x00\x00' + b'\x01\x00')
