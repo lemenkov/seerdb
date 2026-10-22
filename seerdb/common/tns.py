@@ -1104,6 +1104,23 @@ class _ThinCodec:
         return _ThinCodec.read_value(data)
 
     @staticmethod
+    def scale(value: int) -> bytes:
+        # One signed byte from 12.1; the 11g describe's variable-width signed
+        # integer before.
+        if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
+            return bytes([value & 0xFF])
+        return _encode_signed_sb4(value)
+
+    @staticmethod
+    def read_scale(data: bytes) -> tuple[int, bytes]:
+        if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
+            return int.from_bytes(data[:1], 'big', signed=True), data[1:]
+        if data[0] & 0x80:
+            size = data[0] & 0x7F
+            return -int.from_bytes(data[1 : 1 + size], 'big'), data[1 + size :]
+        return decode_ub4(data)
+
+    @staticmethod
     def token(value: int | None) -> bytes:
         # A function call's token number, from 23ai (_fun_header): the caller
         # gives None below it, where there is none.
@@ -1186,6 +1203,14 @@ class _OciCodec:
         if data[0] == 0:
             return None, data[1:]
         return _OciCodec.read_value(data)
+
+    @staticmethod
+    def scale(value: int) -> bytes:
+        return bytes([value & 0xFF])
+
+    @staticmethod
+    def read_scale(data: bytes) -> tuple[int, bytes]:
+        return int.from_bytes(data[:1], 'big', signed=True), data[1:]
 
     @staticmethod
     def _chunked(data: bytes, size: int | None = None) -> bytes:
@@ -1372,7 +1397,81 @@ _LONG_CELL: wire_schema.Schema = (
     ('n4', 'actual_length'),
     ('only', 'thin', (('n4', 'return_code'),)),
 )
+# A describe column (TTI_DCB), in thin's field order, which OCI keeps (#2064).
+# OCI's own parts, measured against live 11g and 18c describes (#265, #1282,
+# #2050):
+# - a first-column marker and a lead byte (0x00 for a typed column, as in a
+#   bind descriptor);
+# - from the 12c band, two inserted 4-byte slots, ahead of the continuation
+#   flags and of the character set;
+# - in a plain column, zero runs a typed one lacks: six bytes behind the
+#   version, one behind the form, and the oaccolid slot, which thin carries
+#   from 12.2 and 18c fills on a character column;
+# - one byte at the end.
+# Thin's own: the column position, which OCI doesn't carry, and 23ai's domain,
+# annotations and vector descriptor.
+_DCB_COLUMN: wire_schema.Schema = (
+    ('only', 'oci', (('u8', 'marker'), ('u8', 'lead'))),
+    ('u8', 'data_type'),
+    ('u8', 'flags'),
+    ('u8', 'precision'),
+    ('scale', 'scale'),
+    ('n4', 'buffer_size'),
+    ('n4', 'max_array'),
+    ('only', 'oci', (('when', 'oci_12c', (('const', bytes(4)),)),)),
+    ('n4', 'cont_flags'),
+    ('n4', 'toid_length'),
+    ('when', 'toid_length', (('value', 'toid'),)),
+    ('n2', 'version'),
+    ('only', 'oci', (('when', 'oci_plain', (('const', bytes(6)),)),)),
+    ('only', 'oci', (('when', 'oci_12c', (('const', bytes(4)),)),)),
+    ('n2', 'charset'),
+    ('u8', 'csfrm'),
+    ('only', 'oci', (('when', 'oci_plain', (('const', bytes(1)),)),)),
+    ('n4', 'max_size'),
+    ('when', 'has_oaccolid', (('n4', 'oaccolid'),)),
+    ('u8', 'null_ok'),
+    ('u8', 'v7_name_length'),
+    ('n4', 'name_length'),
+    ('only', 'thin', (('when', 'name_length', (('value', 'name'),)),)),
+    ('only', 'oci', (('value', 'name'),)),
+    ('n4', 'type_schema_length'),
+    ('when', 'type_schema_length', (('value', 'type_schema'),)),
+    ('n4', 'type_name_length'),
+    ('when', 'type_name_length', (('value', 'type_name'),)),
+    ('only', 'thin', (('n4', 'position'),)),
+    ('when', 'has_uds', (('n4', 'uds_flags'),)),
+    ('only', 'oci', (('u8', 'reserved'),)),
+    (
+        'only',
+        'thin',
+        (
+            (
+                'when',
+                'has_domain',
+                (
+                    ('n4', 'domain_schema_length'),
+                    ('when', 'domain_schema_length', (('value', 'domain_schema'),)),
+                    ('n4', 'domain_name_length'),
+                    ('when', 'domain_name_length', (('value', 'domain_name'),)),
+                ),
+            ),
+            (
+                'when',
+                'has_vector',
+                (
+                    ('raw', 'annotations'),
+                    ('n4', 'vector_dimensions'),
+                    ('u8', 'vector_format'),
+                    ('u8', 'vector_flags'),
+                ),
+            ),
+        ),
+    ),
+)
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+_DCB_COLUMN_THIN = wire_schema.compile_encoder(_DCB_COLUMN, _THIN)
+_DCB_COLUMN_OCI = wire_schema.compile_encoder(_DCB_COLUMN, _OCI)
 _LONG_CELL_THIN = wire_schema.compile_encoder(_LONG_CELL, _THIN)
 _LONG_CELL_OCI = wire_schema.compile_encoder(_LONG_CELL, _OCI)
 
@@ -1924,68 +2023,59 @@ def _mark_inline_long(
 
 
 def _encode_dcb_column(col: ColumnMeta, position: int) -> bytes:
-    # Inverse of _decode_dcb_column, in the layout the negotiated field version's
-    # client reads: 12.2+ carries the scale as one signed byte and appends an
-    # oaccolid after max_size; 23ai (17) adds the SQL-domain schema + name (empty
-    # for a plain column). Fields the client skips are written as well-formed
-    # zeros; only type/precision/scale/length/charset/csfrm/max_size/null_ok/name
-    # carry meaning.
+    # Inverse of _decode_dcb_column (_DCB_COLUMN), in the layout the negotiated
+    # field version's client reads: 12.1 carries the scale as one signed byte,
+    # 12.2 adds the oaccolid, 11.2 the uds flags (a 10g describe ends the
+    # column at its position, #84, #814), 23.1 the SQL domain and 23.1 EXT 1
+    # (23ai fv24) the annotations and vector descriptor (§20.5). Fields the
+    # client skips are well-formed zeros.
     field_version = _ENCODE_FIELD_VERSION.get()
-    # The one-byte scale is 12.1's already; only the oaccolid waits for 12.2
-    # (#1144).
-    is_12c = field_version >= FIELD_VERSION_12_1
-    has_oac_col_id = field_version >= FIELD_VERSION_12_2
-    return (
-        bytes([col.data_type, 0, col.precision & 0xFF])
-        + (bytes([col.scale & 0xFF]) if is_12c else _encode_signed_sb4(col.scale))
-        + encode_sb4(describe_wire_length(col))  # buffer size
-        + encode_sb4(0)  # max array elements
-        + encode_sb4(0)  # cont flags
-        # For an ADT / REF column the referenced type's OID (else absent) (#494).
-        + _str_with_length(col.type_oid)
-        + encode_sb4(0)  # version
-        + encode_sb4(col.charset)
-        + bytes([col.csfrm])
-        + encode_sb4(describe_max_size(col))
-        + (encode_sb4(0) if has_oac_col_id else b'')  # oaccolid (12.2+)
-        + bytes([col.null_ok, 0])  # null_ok + (skipped) v7 name length
-        + _str_with_length(col.name)
-        + _str_with_length(col.type_schema)  # type schema (ADT owner)
-        + _str_with_length(col.type_name)  # type name
-        + encode_sb4(position)  # column position
-        + (
-            encode_sb4(  # uds flags (11g addition): mark a JSON / OSON column (#826)
-                (_UDS_FLAGS_IS_JSON if col.is_json else 0)
-                | (_UDS_FLAGS_IS_OSON if col.is_oson else 0)
-            )
-            # A 10g describe ends the column at its position (#84, #814).
-            if field_version >= FIELD_VERSION_11_2
-            else b''
-        )
-        + (
-            _str_with_length(col.domain_schema) + _str_with_length(col.domain_name)
-            if field_version >= FIELD_VERSION_23_1
-            else b''
-        )
-        + (
-            # fv >= 23.1 EXT 1 (23ai fv24): each column also carries its annotation map and
-            # a vector descriptor after the domain fields (§20.5); the client
-            # consumes both or the row stream desyncs. The Mirror emits the
-            # column's annotations (#1082) and a descriptor from the column's own vector
-            # metadata. The flags byte is RELAYED, not zeroed: a flexible
-            # column says it allows any dimensions there, and a zero told
-            # the client it allows exactly none (#1013).
-            _encode_annotations(col.annotations)
-            + encode_sb4(col.vector_dimensions or 0)  # vector_dimensions
-            + bytes(
-                [
-                    (col.vector_format or 0) & 0xFF,
-                    (col.vector_flags or 0) & 0xFF,
-                ]
-            )  # vector_format, flags
-            if field_version >= FIELD_VERSION_23_1_EXT_1
-            else b''
-        )
+    return _DCB_COLUMN_THIN(
+        {
+            'data_type': col.data_type,
+            'flags': 0,
+            'precision': col.precision & 0xFF,
+            'scale': col.scale,
+            'buffer_size': describe_wire_length(col),
+            'max_array': 0,
+            'cont_flags': 0,
+            # For an ADT / REF column the referenced type's OID (#494).
+            'toid_length': len(col.type_oid),
+            'toid': col.type_oid,
+            'version': 0,
+            'charset': col.charset,
+            'csfrm': col.csfrm,
+            'max_size': describe_max_size(col),
+            'has_oaccolid': field_version >= FIELD_VERSION_12_2,
+            'oaccolid': 0,
+            'null_ok': col.null_ok,
+            'v7_name_length': 0,
+            'name_length': len(col.name),
+            'name': col.name,
+            'type_schema_length': len(col.type_schema),  # an ADT's owner
+            'type_schema': col.type_schema,
+            'type_name_length': len(col.type_name),
+            'type_name': col.type_name,
+            'position': position,
+            # The uds flags (11g) mark a JSON / OSON column (#826).
+            'has_uds': field_version >= FIELD_VERSION_11_2,
+            'uds_flags': (_UDS_FLAGS_IS_JSON if col.is_json else 0)
+            | (_UDS_FLAGS_IS_OSON if col.is_oson else 0),
+            'has_domain': field_version >= FIELD_VERSION_23_1,
+            'domain_schema_length': len(col.domain_schema),
+            'domain_schema': col.domain_schema,
+            'domain_name_length': len(col.domain_name),
+            'domain_name': col.domain_name,
+            # The column's annotations (#1082) and a descriptor from its own
+            # vector metadata. The flags byte is RELAYED, not zeroed: a flexible
+            # column says it allows any dimensions there, and a zero told the
+            # client it allows exactly none (#1013).
+            'has_vector': field_version >= FIELD_VERSION_23_1_EXT_1,
+            'annotations': _encode_annotations(col.annotations),
+            'vector_dimensions': col.vector_dimensions or 0,
+            'vector_format': (col.vector_format or 0) & 0xFF,
+            'vector_flags': (col.vector_flags or 0) & 0xFF,
+        }
     )
 
 
@@ -9656,13 +9746,13 @@ def _oci_ub4(n: int) -> bytes:
 _OCI_DCB_PREAMBLE_LEN = 23  # cursor-uuid preamble (zeroed; the client skips it)
 
 
+# A column's length in an 11g describe ahead of its name, and behind it, as the
+# test-only reader (_decode_describe_oci) walks it; the encoder is _DCB_COLUMN.
+# sqlplus 10.2's is 4 bytes shorter behind it, without the uds flags: 11g's
+# column blocks to it are 61 bytes apart for a 3-character name, 65 to 11.2
+# (#1764).
 _OCI_DCB_COL_PRENAME = 48
-
-
 _OCI_DCB_COL_POSTNAME = 13
-# sqlplus 10.2's post-name block is 4 bytes shorter: 11g's column blocks to it
-# are 61 bytes apart for a 3-character name, 65 to 11.2 (#1764).
-_OCI_DCB_COL_POSTNAME_10_2 = 9
 
 
 # A char type carries a charset + form-of-use and sets the pre-name char flag.
@@ -9698,32 +9788,17 @@ _OCI_DCB_CHAR_SEMANTICS_OFF = 15
 _OCI_DCB_CHAR_SEMANTICS_FLAG = 0x10
 
 
-# From the 12c band each column's pre-name block is 8 bytes longer: 4 zero bytes
-# ahead of the char-semantics flag (so it moves from 15 to 19) and 4 more ahead
-# of the charset (30 to 38), which pushes everything from there on 8 bytes along
-# (measured against a live 18c for NUMBER, DATE, VARCHAR2, NCHAR and NVARCHAR2
-# columns, #1282). Two values change too: the first column's leading byte, and
-# a ub4 behind max_size that 18c sets on a character column and 11g leaves
-# zero; its meaning is unpinned, carried from the capture.
-_OCI_DCB_COL_12C_SPLITS = (14, 30)
-_OCI_DCB_COL_12C_GROWTH = 4
+# From the 12c band each column is 8 bytes longer ahead of its name: 4 zero
+# bytes ahead of the continuation flags (so the char-semantics flag moves from 15
+# to 19) and 4 more ahead of the charset (30 to 38), measured against a live 18c
+# for NUMBER, DATE, VARCHAR2, NCHAR and NVARCHAR2 columns (#1282; the
+# oci_12c slots of _DCB_COLUMN). Two values change too: the first column's
+# leading byte, and the oaccolid slot behind max_size, which 18c sets on a
+# character column and 11g leaves zero; its meaning is unpinned, carried from
+# the capture.
 _OCI_DCB_FIRST_COL_11G = 0x51
 _OCI_DCB_FIRST_COL_12C = 0x5C
-_OCI_DCB_CHAR_12C_OFF = 46
 _OCI_DCB_CHAR_12C_VALUE = 0x3FFE
-
-
-def _widen_dcb_column_oci(pre: bytes, is_char: bool) -> bytes:
-    # The 11g pre-name block, laid out as the 12c band's (see above).
-    a, b = _OCI_DCB_COL_12C_SPLITS
-    pad = bytes(_OCI_DCB_COL_12C_GROWTH)
-    out = bytearray(pre[:a] + pad + pre[a:b] + pad + pre[b:])
-    if out[0] == _OCI_DCB_FIRST_COL_11G:
-        out[0] = _OCI_DCB_FIRST_COL_12C
-    if is_char:
-        off = _OCI_DCB_CHAR_12C_OFF
-        out[off : off + 4] = _oci_ub4(_OCI_DCB_CHAR_12C_VALUE)
-    return bytes(out)
 
 
 # SYS.XMLTYPE as an OCI client is told it (#2050): a live 11g and 18c describe
@@ -9743,78 +9818,68 @@ def oci_is_xmltype(col: ColumnMeta) -> bool:
     )
 
 
-def _oci_typed_column(pre: bytes, col: ColumnMeta) -> bytes:
-    # A column of a named type carries the type's id where a plain column has
-    # its length zero, and then its version: `10 00 00 00`, `10` and the 16
-    # bytes, `01 00`. What a plain column has from there to the null flag --
-    # zero for an opaque type -- shrinks to 7 bytes, 11 in the 12c band.
-    wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
-    (at, null_at, gap) = (22, 50, 11) if wide else (18, 42, 7)
-    oid = _OCI_XMLTYPE_OID
-    typed = (
-        _oci_ub4(len(oid))
-        + bytes([len(oid)])
-        + oid
-        + _OCI_XMLTYPE_VERSION.to_bytes(2, 'little')
-    )
-    return pre[:at] + typed + bytes(gap) + pre[null_at:]
-
-
-def _oci_type_names(col: ColumnMeta, size: int) -> bytes:
-    # The post-name block of a typed column: the type's schema and name, each a
-    # ub4 length then a ub1 length and the bytes, where a plain column has two
-    # zero ub4s; the rest of the block as it is.
-    names = b''.join(
-        _oci_ub4(len(part)) + bytes([len(part)]) + part
-        for part in (col.type_schema, col.type_name)
-    )
-    return names + bytes(size - 8)
-
-
 def _encode_dcb_column_oci(col: ColumnMeta, position: int, first: bool) -> bytes:
+    # A describe column as sqlplus reads it (_DCB_COLUMN). SYS.XMLTYPE is the
+    # one typed column (#2050): an opaque type, with the type's id, version,
+    # schema and name.
+    del position  # OCI's column carries none
+    field_version = _ENCODE_FIELD_VERSION.get()
+    wide = field_version >= FIELD_VERSION_12_1
     xmltype = oci_is_xmltype(col)
-    pre = bytearray(_OCI_DCB_COL_PRENAME)
-    pre[0] = _OCI_DCB_FIRST_COL_11G if first else 0x00  # a first-column marker byte
-    pre[1] = 0x00 if xmltype else 0x01
-    pre[2] = TNS_TYPE_OPAQUE if xmltype else col.data_type
     is_char = col.data_type in _OCI_CHAR_TYPES
-    pre[3] = _OCI_DCB_CHAR_FLAG if is_char else 0x00
-    pre[4] = col.precision & 0xFF
-    pre[5] = col.scale & 0xFF  # signed byte (e.g. -127 for a NUMBER literal)
-    # A backend that cannot size the column (the PEP 249 tuple reports none for
-    # an interval or a ROWID) gets the length a live server describes it with,
-    # as on the thin path (#2017).
-    pre[6:10] = _oci_ub4(_OCI_XMLTYPE_LENGTH if xmltype else _oci_describe_length(col))
-    if is_char and col.csfrm == _CSFRM_NCHAR:
-        pre[_OCI_DCB_CHAR_SEMANTICS_OFF] = _OCI_DCB_CHAR_SEMANTICS_FLAG
-    if is_char:
-        pre[30:32] = int(col.charset).to_bytes(2, 'little')
-        pre[32] = col.csfrm
-    # A LONG / LONG RAW / LOB carries no fixed max size — the value is a locator or
-    # an inline stream, unbounded — so a live 11g describe leaves this zero (like
-    # the data length the backend already sets to 0). Only fixed-width columns fill
-    # it (#405, #407).
-    if (
-        col.data_type not in _OCI_UNSIZED_TYPES | _OCI_FIXED_WIDTH.keys()
-        and not xmltype
-    ):
-        pre[34:38] = _oci_ub4(col.max_size)
-    pre[42] = col.null_ok
-    pre[43] = len(col.name)
-    pre[44:48] = _oci_ub4(len(col.name))
-    name = bytes([len(col.name)]) + col.name
-    # The post-name block is zeroed — a live 11g describe carries no column
-    # position here (verified against the captured single-column reply).
-    post = bytes(_OCI_DCB_COL_POSTNAME)
-    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_11_2:
-        post = bytes(_OCI_DCB_COL_POSTNAME_10_2)
-    block = bytes(pre)
-    if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
-        block = _widen_dcb_column_oci(block, is_char)
-    if xmltype:
-        block = _oci_typed_column(block, col)
-        post = _oci_type_names(col, len(post))
-    return block + name + post
+    marker = 0
+    if first:
+        marker = _OCI_DCB_FIRST_COL_12C if wide else _OCI_DCB_FIRST_COL_11G
+    # A LONG / LONG RAW / LOB carries no fixed max size -- the value is a locator
+    # or an inline stream, unbounded -- so a live 11g describe leaves it zero, as
+    # it does the data length. Only fixed-width columns fill it (#405, #407).
+    sized = col.data_type not in _OCI_UNSIZED_TYPES | _OCI_FIXED_WIDTH.keys()
+    oid = _OCI_XMLTYPE_OID if xmltype else b''
+    return _DCB_COLUMN_OCI(
+        {
+            'marker': marker,
+            'lead': 0x00 if xmltype else 0x01,
+            'data_type': TNS_TYPE_OPAQUE if xmltype else col.data_type,
+            'flags': _OCI_DCB_CHAR_FLAG if is_char else 0,
+            'precision': col.precision & 0xFF,
+            'scale': col.scale,  # a signed byte (-127 for a NUMBER literal)
+            # A backend that cannot size the column (the PEP 249 tuple reports
+            # none for an interval or a ROWID) gets the length a live server
+            # describes it with, as on the thin path (#2017).
+            'buffer_size': _OCI_XMLTYPE_LENGTH
+            if xmltype
+            else _oci_describe_length(col),
+            'max_array': 0,
+            'oci_12c': wide,
+            # Character-length semantics (#1282): sqlplus sizes an NCHAR or
+            # NVARCHAR2 column by its character max size.
+            'cont_flags': _OCI_DCB_CHAR_SEMANTICS_FLAG << 8
+            if is_char and col.csfrm == _CSFRM_NCHAR
+            else 0,
+            'toid_length': len(oid),
+            'toid': oid,
+            'version': _OCI_XMLTYPE_VERSION if xmltype else 0,
+            'oci_plain': not xmltype,
+            'charset': int(col.charset) if is_char else 0,
+            'csfrm': col.csfrm if is_char else 0,
+            'max_size': col.max_size if sized and not xmltype else 0,
+            # 18c sets it on a character column, 11g leaves it zero; its
+            # meaning is unpinned, carried from the capture.
+            'has_oaccolid': not xmltype,
+            'oaccolid': _OCI_DCB_CHAR_12C_VALUE if wide and is_char else 0,
+            'null_ok': col.null_ok,
+            'v7_name_length': len(col.name),
+            'name_length': len(col.name),
+            'name': col.name,
+            'type_schema_length': len(col.type_schema) if xmltype else 0,
+            'type_schema': col.type_schema,
+            'type_name_length': len(col.type_name) if xmltype else 0,
+            'type_name': col.type_name,
+            'has_uds': field_version >= FIELD_VERSION_11_2,
+            'uds_flags': 0,
+            'reserved': 0,
+        }
+    )
 
 
 def encode_describe_oci(columns: list[ColumnMeta]) -> bytes:

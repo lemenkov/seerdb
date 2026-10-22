@@ -173,3 +173,87 @@ def test_a_ref_cursor_value_is_one_schema_with_its_dialects_lead() -> None:
     assert tns._REFCURSOR_OUT_THIN(values) == b'\x01D\x02\x01\x2c\x00'
     values['lead'] = 0x4C
     assert tns._REFCURSOR_OUT_OCI(values) == b'\x4cD\x2c\x01\x00\x00\x00\x00'
+
+
+def _columns() -> list:
+    from seerdb.common.tns_consts import (
+        TNS_TYPE_ADT,
+        TNS_TYPE_CHAR,
+        TNS_TYPE_NUMBER,
+        TNS_TYPE_VARCHAR,
+    )
+
+    column = tns.ColumnMeta
+    return [
+        column(name=b'N', data_type=TNS_TYPE_NUMBER, data_length=22, max_size=22),
+        column(name=b'NAME', data_type=TNS_TYPE_VARCHAR, data_length=80, max_size=20),
+        column(
+            name=b'NC',
+            data_type=TNS_TYPE_CHAR,
+            data_length=10,
+            max_size=5,
+            csfrm=2,
+            charset=2000,
+        ),
+        column(
+            name=b'XML',
+            data_type=TNS_TYPE_ADT,
+            data_length=0,
+            max_size=0,
+            type_schema=b'SYS',
+            type_name=b'XMLTYPE',
+        ),
+    ]
+
+
+@pytest.mark.parametrize('version', (6, 7, 8, 11, 17))
+def test_a_describe_column_decodes_back_in_both_dialects(version: int) -> None:
+    # One schema, _DCB_COLUMN, reads what each dialect's encoder writes; the
+    # flags its `when`s test aren't on the wire, so the reader is given them,
+    # as the encoder was (#2064).
+    from seerdb.common.tns_consts import (
+        FIELD_VERSION_11_2,
+        FIELD_VERSION_12_2,
+        FIELD_VERSION_23_1,
+    )
+
+    with _field_version(version):
+        for col in _columns():
+            thin = tns._encode_dcb_column(col, 3)
+            given = {
+                'has_oaccolid': version >= FIELD_VERSION_12_2,
+                'has_uds': version >= FIELD_VERSION_11_2,
+                'has_domain': version >= FIELD_VERSION_23_1,
+                'has_vector': False,
+            }
+            decode = wire_schema.compile_decoder(tns._DCB_COLUMN, tns._THIN)
+            (fields, rest) = decode(thin, given)
+            assert rest == b''
+            assert (fields['position'], fields['name']) == (3, col.name)
+            assert fields['charset'] == col.charset
+            oci = tns._encode_dcb_column_oci(col, 3, first=True)
+            typed = tns.oci_is_xmltype(col)
+            given = {
+                'oci_12c': version >= 7,
+                'oci_plain': not typed,
+                'has_oaccolid': not typed,
+                'has_uds': version >= FIELD_VERSION_11_2,
+            }
+            decode = wire_schema.compile_decoder(tns._DCB_COLUMN, tns._OCI)
+            (fields, rest) = decode(oci, given)
+            assert rest == b''
+            assert fields['name'] == col.name
+            assert fields.get('type_name', b'') == (col.type_name if typed else b'')
+
+
+def test_an_oci_column_is_48_bytes_ahead_of_its_name_and_8_more_from_12c() -> None:
+    # The 11g block ahead of the name is 48 bytes, 56 from the 12c band, and a
+    # typed column's is 6 bytes longer: its type id and version, without the
+    # zero runs a plain column has (#265, #1282, #2050).
+    plain, typed = _columns()[0], _columns()[3]
+    for version, ahead in ((6, 48), (7, 56)):
+        with _field_version(version):
+            for col, extra in ((plain, 0), (typed, 6)):
+                block = tns._encode_dcb_column_oci(col, 1, first=False)
+                name_at = block.index(bytes([len(col.name)]) + col.name)
+                assert name_at == ahead + extra

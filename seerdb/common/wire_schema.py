@@ -18,6 +18,8 @@ A schema is a tuple of fields:
   variable-width in thin, a ub4 / ub2 little-endian in OCI;
 - ``('value', name)``: bytes with their length, chunked past 252 bytes;
 - ``('lob', name)``: LOB_DATA content, always chunked unless empty;
+- ``('scale', name)``: a describe column's scale, one signed byte, which thin
+  before 12.1 writes in its variable-width signed form;
 - ``('long', name)``: a LONG / LONG RAW cell's content, always chunked, and
   ``None`` for NULL;
 - ``('token', name)``: a function call's token number, which thin sends from
@@ -48,9 +50,9 @@ from typing import Any, Protocol
 
 Schema = tuple[tuple[Any, ...], ...]
 # The field kinds a codec packs itself.
-_PRIMITIVES = ('n4', 'n2', 'value', 'lob', 'long', 'token', 'ptr', 'wn4')
+_PRIMITIVES = ('n4', 'n2', 'value', 'lob', 'long', 'scale', 'token', 'ptr', 'wn4')
 Encoder = Callable[[dict[str, Any]], bytes]
-Decoder = Callable[[bytes], tuple[dict[str, Any], bytes]]
+Decoder = Callable[..., tuple[dict[str, Any], bytes]]
 
 
 class Codec(Protocol):
@@ -61,6 +63,7 @@ class Codec(Protocol):
     def value(self, data: bytes) -> bytes: ...
     def lob(self, data: bytes) -> bytes: ...
     def long(self, data: bytes | None) -> bytes: ...
+    def scale(self, value: int) -> bytes: ...
     def token(self, value: int | None) -> bytes: ...
     def ptr(self, value: bool) -> bytes: ...
     def wn4(self, value: int) -> bytes: ...
@@ -69,6 +72,7 @@ class Codec(Protocol):
     def read_value(self, data: bytes) -> tuple[bytes, bytes]: ...
     def read_lob(self, data: bytes) -> tuple[bytes, bytes]: ...
     def read_long(self, data: bytes) -> tuple[bytes | None, bytes]: ...
+    def read_scale(self, data: bytes) -> tuple[int, bytes]: ...
     def read_token(self, data: bytes) -> tuple[int | None, bytes]: ...
     def read_ptr(self, data: bytes) -> tuple[bool, bytes]: ...
     def read_wn4(self, data: bytes) -> tuple[int, bytes]: ...
@@ -112,10 +116,14 @@ def compile_encoder(schema: Schema, codec: Codec) -> Encoder:
 
 def compile_decoder(schema: Schema, codec: Codec) -> Decoder:
     """The decoder of ``schema`` in ``codec``'s dialect: the fields' values
-    and the bytes that follow the message."""
+    and the bytes that follow the message. A ``when`` that tests what isn't on
+    the wire -- the session's field version, say -- reads it from ``given``,
+    which the result includes."""
 
-    def decode(data: bytes) -> tuple[dict[str, Any], bytes]:
-        values: dict[str, Any] = {}
+    def decode(
+        data: bytes, given: dict[str, Any] | None = None
+    ) -> tuple[dict[str, Any], bytes]:
+        values: dict[str, Any] = dict(given or {})
         for field in schema:
             kind = field[0]
             if kind == 'const':
@@ -130,7 +138,7 @@ def compile_decoder(schema: Schema, codec: Codec) -> Decoder:
                 (values[field[1]], data) = getattr(codec, 'read_' + kind)(data)
             elif kind == 'when':
                 if values[field[1]]:
-                    (more, data) = compile_decoder(field[2], codec)(data)
+                    (more, data) = compile_decoder(field[2], codec)(data, values)
                     values.update(more)
             elif kind == 'each':
                 inner = compile_decoder(field[3], codec)
@@ -141,7 +149,7 @@ def compile_decoder(schema: Schema, codec: Codec) -> Decoder:
                 values[field[1]] = items
             elif kind == 'only':
                 if field[1] == codec.name:
-                    (more, data) = compile_decoder(field[2], codec)(data)
+                    (more, data) = compile_decoder(field[2], codec)(data, values)
                     values.update(more)
             else:
                 raise ValueError(f'unknown field kind {kind!r}')
