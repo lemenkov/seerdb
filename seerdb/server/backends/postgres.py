@@ -14035,6 +14035,16 @@ _NOT_A_PLAIN_QUERY = re.compile(
 # the group is the installer's own, named after it: roles belong to the whole
 # server, and another installer's group is not this one's to add members to.
 _USER_GROUP_SUFFIX: Final = '_mirror_users'
+# The group that reads the DBA's views (#2223): an administrator's role, and a
+# role granted DBA (#1936), are members. The views run with the installer's
+# rights, so they are all it needs, not the records under them.
+_DBA_GROUP_SUFFIX: Final = '_mirror_dbas'
+_DBA_VIEWS: Final = (
+    'dba_directories',
+    'proxy_users',
+    'dba_sys_privs',
+    'dba_role_privs',
+)
 _PER_USER_FLOOR: Final = 160000
 # The schemas the installation makes: the dictionary's, and those of the Oracle
 # packages it emulates, which a user's statements call into.
@@ -14117,6 +14127,23 @@ def _user_group_grants(group: str) -> str:
         "EXECUTE format('GRANT CREATE ON DATABASE %I TO %I', current_database(), g); "
         'END $$'
     )
+
+
+def _dba_group_grants(group: str) -> str:
+    # The DBAs' group's grants: SELECT on each DBA view this installation has.
+    views = 'ARRAY[' + ', '.join(_sql_text(v) for v in _DBA_VIEWS) + ']'
+    return (
+        f'DO $$ DECLARE g text := {_sql_text(group)}; v text; BEGIN '
+        f'FOREACH v IN ARRAY {views} LOOP '
+        "IF to_regclass('sys.' || quote_ident(v)) IS NOT NULL THEN "
+        "EXECUTE format('GRANT SELECT ON sys.%I TO %I', v, g); END IF; END LOOP; "
+        'END $$'
+    )
+
+
+def _dba_group(group: str) -> str:
+    # The DBAs' group's name, from the users' group's: both the installer's.
+    return group.removesuffix(_USER_GROUP_SUFFIX) + _DBA_GROUP_SUFFIX
 
 
 # The databases whose group grants this process has made, so each is done once
@@ -21867,6 +21894,13 @@ class PostgresBackend:
                             f"system privileges not granted to '{grantee}'",
                             ora_code=_ORA_SYSTEM_PRIVILEGE_NOT_GRANTED,
                         )
+            if self._per_user and _DBA_ROLE in modelled:
+                group = self._ensure_user_group(conn)
+                for grantee in grantees:
+                    if granting:
+                        self._join_dbas(conn, group, grantee)
+                    else:
+                        self._leave_dbas(conn, group, grantee)
             conn.commit()
         return Result()
 
@@ -21901,6 +21935,13 @@ class PostgresBackend:
                 sql.SQL('CREATE ROLE {} NOLOGIN').format(sql.Identifier(group))
             )
         conn.execute(_user_group_grants(group))
+        dbas = _dba_group(group)
+        row = conn.execute(
+            'SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)', (dbas,)
+        ).fetchone()
+        if not (row and row[0]):
+            conn.execute(sql.SQL('CREATE ROLE {} NOLOGIN').format(sql.Identifier(dbas)))
+        conn.execute(_dba_group_grants(dbas))
         _USER_GROUP_READY[self._admin_conninfo] = group
         return group
 
@@ -21923,8 +21964,9 @@ class PostgresBackend:
         row = conn.execute(
             "SELECT shobj_description(oid, 'pg_authid') = %s "
             "AND pg_has_role(current_user, oid, 'USAGE'), "
-            "pg_has_role(oid, %s, 'MEMBER') FROM pg_roles WHERE rolname = %s",
-            (_USER_ROLE_MARK, group, name.lower()),
+            "pg_has_role(oid, %s, 'MEMBER'), pg_has_role(oid, %s, 'MEMBER') "
+            'FROM pg_roles WHERE rolname = %s',
+            (_USER_ROLE_MARK, group, _dba_group(group), name.lower()),
         ).fetchone()
         if row is not None and not row[0]:
             raise BackendError(
@@ -21933,6 +21975,9 @@ class PostgresBackend:
             )
         if row is not None and not row[1]:
             conn.execute(sql.SQL('GRANT {} TO {}').format(sql.Identifier(group), role))
+        if row is not None and not row[2] and self._accounts.configured(name):
+            # An administrator reads the DBA's views (#2223).
+            self._join_dbas(conn, group, name)
         password = self._accounts.role_password(name)
         if row is not None and password is not None:
             # The user's role as it was made: a login's usual case.
@@ -21959,6 +22004,8 @@ class PostgresBackend:
                     'REVOKE USAGE ON TYPES FROM PUBLIC'
                 ).format(role)
             )
+            if self._accounts.configured(name):
+                self._join_dbas(conn, group, name)
         elif password is None:
             # A role whose password the accounts no longer have gets a new one.
             password = secrets.token_urlsafe(32)
@@ -21975,6 +22022,29 @@ class PostgresBackend:
         )
         self._accounts.set_role_password(name, password)
         return password
+
+    def _join_dbas(self, conn: psycopg.Connection, group: str, name: str) -> None:
+        # Make user `name`'s role -- or, for PUBLIC, the users' group -- a
+        # member of the DBAs' group, which reads the DBA's views (#2223). It
+        # inherits the group's SELECT; it may not act as the group.
+        member = group if name == 'PUBLIC' else name.lower()
+        conn.execute(
+            sql.SQL('GRANT {} TO {} WITH INHERIT TRUE, SET FALSE').format(
+                sql.Identifier(_dba_group(group)), sql.Identifier(member)
+            )
+        )
+
+    def _leave_dbas(self, conn: psycopg.Connection, group: str, name: str) -> None:
+        # Take that membership back: on REVOKE DBA, unless the account is an
+        # administrator, whose right the configuration gives.
+        if name != 'PUBLIC' and self._accounts.configured(name):
+            return
+        member = group if name == 'PUBLIC' else name.lower()
+        conn.execute(
+            sql.SQL('REVOKE {} FROM {}').format(
+                sql.Identifier(_dba_group(group)), sql.Identifier(member)
+            )
+        )
 
     def _refuse_connected(self, conn: psycopg.Connection, name: str) -> None:
         # Oracle refuses to drop a user with a session open, ORA-01940; in

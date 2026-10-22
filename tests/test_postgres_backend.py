@@ -3950,6 +3950,47 @@ def test_a_system_privilege_lets_a_user_run_a_dbas_statement() -> None:
         pg.close()
 
 
+def test_an_administrator_or_a_dba_reads_the_dba_views() -> None:
+    # In per-user mode the DBA's views are an administrator's to read, and a
+    # DBA's (#2223): a configured account's role reads them, a user's doesn't
+    # until GRANT DBA, at once in its open session, and not after REVOKE.
+    pid = os.getpid()
+    admin = f'dv_adm_{pid}'
+    user = f'dv_a_{pid}'
+    pg = psycopg.connect(_CONNINFO, autocommit=True)
+    opened: list[Any] = []
+    try:
+        with _per_user_mirror(_CONNINFO, admin) as base:
+
+            def login(name: str, password: str = 'pw123') -> Any:
+                opened.append(base(name, password))
+                return opened[-1]
+
+            adm = login(admin, 'adm123').cursor()
+            adm.execute(f'create user {user} identified by pw123')
+            for view in ('dba_sys_privs', 'dba_role_privs', 'proxy_users'):
+                adm.execute(f'select count(*) from {view}')
+            cur = login(user).cursor()
+            with pytest.raises(seerdb.DatabaseError):
+                cur.execute('select count(*) from dba_sys_privs')
+            adm.execute(f'grant dba to {user}')
+            cur.execute(
+                'select granted_role from dba_role_privs where grantee = :1',
+                [user.upper()],
+            )
+            assert cur.fetchall() == [('DBA',)]
+            adm.execute(f'revoke dba from {user}')
+            with pytest.raises(seerdb.DatabaseError):
+                cur.execute('select count(*) from dba_role_privs')
+    finally:
+        for session in opened:
+            with contextlib.suppress(Exception):
+                session.close()
+        pg.execute('DELETE FROM sys.ora_sys_privs WHERE grantee = %s', (user.upper(),))
+        _drop_mirror_roles(pg, user, admin)
+        pg.close()
+
+
 def test_a_system_privilege_is_recorded_in_single_role_mode() -> None:
     # In single-role mode anyone may run a DBA's statement, so a GRANT of a
     # system privilege enforces nothing, but it is recorded and listed, as

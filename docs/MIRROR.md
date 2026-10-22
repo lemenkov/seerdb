@@ -439,14 +439,24 @@ on Oracle:
   revoke of what wasn't granted.
 - **Listing them:** `USER_SYS_PRIVS`, `USER_ROLE_PRIVS`, `SESSION_PRIVS` and
   `SESSION_ROLES` list a user's own and `PUBLIC`'s. `DBA_SYS_PRIVS` and
-  `DBA_ROLE_PRIVS` list all; in per-user mode, like the other `DBA_` views,
-  only the connection role reads them.
+  `DBA_ROLE_PRIVS` list all.
 - **Other privileges and roles:** any other system privilege or role
   (`CREATE SESSION`, `CONNECT`, `RESOURCE`, …) is accepted and does nothing.
 - **The administrators themselves:** their right comes from the
   configuration, not a grant, so `SESSION_PRIVS` doesn't list it.
 
 In single-role mode, grants are recorded and listed but enforce nothing.
+
+**The DBA's views.** In per-user mode, `DBA_SYS_PRIVS`, `DBA_ROLE_PRIVS`,
+`DBA_DIRECTORIES` and `PROXY_USERS` are for the administrators and the users
+granted `DBA`. Other users get an error, as on Oracle.
+- **How:** these roles are members of a group, `<connection role>_mirror_dbas`,
+  which may read the views.
+- **Timing:** `GRANT DBA` and `REVOKE DBA` take effect at once, open sessions
+  included.
+- **A limit:** an account taken out of the configuration keeps reading the
+  views until its role is next repaired or the user is dropped. Its DBA
+  statements are refused at once all the same.
 
 The Mirror runs these statements on a connection of the connection role.
 `DROP USER` drops the user's role and what it owns, along with the user's
