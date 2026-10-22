@@ -2408,12 +2408,9 @@ def _encode_oer(
 
 def _oer_message(ora_code: int, message: bytes) -> bytes:
     # The message DALC, which a client reads ONLY when the error number is
-    # nonzero. A message over 252 bytes is chunked, and the chunk framing depends
-    # on the field version the session negotiated: single-byte chunk lengths
-    # below 12.2, ub4 ones from it on. encode_chr picks the form the client will
-    # read (#734); a short message frames the same either way, and stays on the
-    # plain path so the captured terminator built at import time needs nothing
-    # defined later.
+    # nonzero: a value as thin frames one (_ThinCodec.value), chunked past 252
+    # bytes in the field version's framing (#734) -- what OCI's message is in
+    # its own (_oci_error_text, #2064).
     #
     # On SUCCESS, from 12.1, nothing at all is written. A 12.1+ client reads the
     # message only `if error_num != 0`, so the empty-length byte written here
@@ -2426,9 +2423,7 @@ def _oer_message(ora_code: int, message: bytes) -> bytes:
     # and end-of-response cannot be negotiated there anyway.
     if not ora_code and _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
         return b''
-    if len(message) <= TNS_MAX_SHORT_LENGTH:
-        return _bytes_with_length(message)
-    return encode_chr(message)
+    return _THIN.value(message)
 
 
 def _oer_version_tail(ora_code: int, rowcount: int) -> bytes:
@@ -10631,12 +10626,13 @@ def encode_long_fetch_row_oci(
 def _oci_error_text(text: bytes) -> bytes:
     """An OCI error OER's message, length-prefixed.
 
-    A message up to 252 bytes takes a one-byte length. A longer one follows a
-    0xFE marker in chunks of up to 255 bytes, each with a one-byte length, and
-    ends with a zero-length chunk -- as a live 11g sends it (sqlplus 23.26, a
-    333-byte RAISE_APPLICATION_ERROR message: ``fe ff <255 bytes> 4e <78 bytes>
-    00``). A one-byte length could not hold a longer message at all: encoding it
-    raised, and the session died (#1520).
+    A value as OCI frames one (_OciCodec.value, #2064): up to 252 bytes a
+    one-byte length; a longer one follows a 0xFE marker in chunks of up to 255
+    bytes, each with a one-byte length, and ends with a zero-length chunk -- as
+    a live 11g sends it (sqlplus 23.26, a 333-byte RAISE_APPLICATION_ERROR
+    message: ``fe ff <255 bytes> 4e <78 bytes> 00``). A one-byte length could
+    not hold a longer message at all: encoding it raised, and the session died
+    (#1520).
 
     A live 18c sent the same message as one chunk with ub4 LE lengths instead
     (``fe 4d 01 00 00 <333 bytes> 00 00 00 00``). That is not the field version:
@@ -10645,14 +10641,7 @@ def _oci_error_text(text: bytes) -> bytes:
     advertises and the Mirror does not (#2042), so the Mirror sends the form
     its own sessions read.
     """
-    if len(text) <= TNS_MAX_SHORT_LENGTH:
-        return bytes([len(text)]) + text
-    out = bytearray([TNS_LONG_LENGTH_INDICATOR])
-    for at in range(0, len(text), 0xFF):
-        chunk = text[at : at + 0xFF]
-        out += bytes([len(chunk)]) + chunk
-    out.append(0)
-    return bytes(out)
+    return _OCI.value(text)
 
 
 def encode_error_oci(
