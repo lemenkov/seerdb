@@ -56,6 +56,7 @@ from seerdb.server.backends.postgres import (  # noqa: E402
     _object_column_meta,
     _object_type_oid,
     _occurrence_binds,
+    _oracle_reference,
     _package_rights,
     _parse_out_assignments,
     _pg_oid_of,
@@ -12171,6 +12172,16 @@ def test_a_public_synonym_reaches_its_table_as_oracles_does() -> None:
                     backend.execute(f'DROP {leftover}')
     finally:
         backend.close()
+
+
+def test_a_synonym_target_is_written_as_its_name_whatever_it_holds() -> None:
+    # A target named in a rewritten statement is the name its record gives:
+    # an ordinary one as it is, any other quoted, a double quote in it doubled
+    # (#2179).
+    assert _oracle_reference('PYO', 'NEXT_ID') == 'PYO.NEXT_ID'
+    assert _oracle_reference('PYO', 'next id') == 'PYO."next id"'
+    assert _oracle_reference(None, 'say "hi"') == '"say ""hi"""'
+    assert _oracle_reference('o"wner', 'N') == '"o""wner".N'
 
 
 def test_a_synonym_reaches_a_sequence_routine_or_package_as_oracles_does() -> None:

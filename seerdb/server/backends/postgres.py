@@ -6150,7 +6150,9 @@ def _oracle_reference(owner: str | None, name: str) -> str:
     # An owner and a name as Oracle spells them, written as a statement would
     # name them: an ordinary name as it is, any other quoted.
     def part(word: str) -> str:
-        return word if re.fullmatch(r'[A-Z][A-Z0-9_$#]*', word) else f'"{word}"'
+        if re.fullmatch(r'[A-Z][A-Z0-9_$#]*', word):
+            return word
+        return _quoted_identifier(word)
 
     return f'{part(owner)}.{part(name)}' if owner else part(name)
 
