@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from seerdb.common.dbobject import DbObject, DbRef
 from functools import reduce
 
-from seerdb.common import oci
+from seerdb.common import oci, wire_schema
 from seerdb.common.crypto import (
     PBKDF2_SDER_COUNT,
     PBKDF2_VGEN_COUNT,
@@ -1020,22 +1020,217 @@ def _skip_bytes_with_length(Data: bytes) -> bytes:
     return Rest
 
 
-def _bytes_with_length(Data: bytes) -> bytes:
-    # Inverse of `_skip_chunked_bytes` (oracledb write_bytes_with_length): a
-    # 1-byte length + data for short values (<= 252 bytes), or the 254 LONG
-    # marker followed by length-prefixed chunks terminated by a zero-length
-    # chunk -- a ub4 length from 12.1, a single byte before, as an 11g server
-    # writes them and as _chunk_length reads them (#1261).
-    if len(Data) <= TNS_MAX_SHORT_LENGTH:
-        return bytes([len(Data)]) + Data
-    wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
-    encode_len = encode_sb4 if wide else (lambda n: bytes([n]))
-    Out = bytearray([TNS_LONG_LENGTH_INDICATOR])
-    for I in range(0, len(Data), 0x40):
-        Chunk = Data[I : I + 0x40]
-        Out += encode_len(len(Chunk)) + Chunk
-    Out += encode_len(0)
-    return bytes(Out)
+class _ThinCodec:
+    """The thin dialect's primitives (#2064): TTC's variable-width integers,
+    and long values chunked as python-oracledb writes them."""
+
+    name = 'thin'
+
+    @staticmethod
+    def n4(value: int) -> bytes:
+        return encode_sb4(value)
+
+    n2 = n4
+
+    @staticmethod
+    def read_n4(data: bytes) -> tuple[int, bytes]:
+        return decode_ub4(data)
+
+    read_n2 = read_n4
+
+    @staticmethod
+    def value(data: bytes) -> bytes:
+        # Inverse of `_skip_chunked_bytes` (oracledb write_bytes_with_length):
+        # a 1-byte length + data for short values (<= 252 bytes), or the 254
+        # LONG marker followed by length-prefixed chunks terminated by a
+        # zero-length chunk -- a ub4 length from 12.1, a single byte before,
+        # as an 11g server writes them and as _chunk_length reads them (#1261).
+        if len(data) <= TNS_MAX_SHORT_LENGTH:
+            return bytes([len(data)]) + data
+        return _ThinCodec._chunked(data, 0x40)
+
+    @staticmethod
+    def lob(data: bytes) -> bytes:
+        # LOB_DATA content in the negotiated version's chunk framing: always
+        # the 0xFE-marked run of chunks, as Oracle sends it whatever the length
+        # (#1970). 11g prefixes each chunk with a single length byte, a 12.1+
+        # client reads a variable-width length (the ub4 form) per chunk -- the
+        # same framing its own writer uses for a long bind -- and a zero
+        # terminator. Empty content is a bare zero length.
+        if not data:
+            return b'\x00'
+        return _ThinCodec._chunked(data, _OCI_LOB_CHUNK)
+
+    @staticmethod
+    def _chunked(data: bytes, size: int) -> bytes:
+        wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+        encode_len = encode_sb4 if wide else (lambda n: bytes([n]))
+        out = bytearray([TNS_LONG_LENGTH_INDICATOR])
+        for at in range(0, len(data), size):
+            chunk = data[at : at + size]
+            out += encode_len(len(chunk)) + chunk
+        out += encode_len(0)
+        return bytes(out)
+
+    @staticmethod
+    def read_value(data: bytes) -> tuple[bytes, bytes]:
+        if data[0] != TNS_LONG_LENGTH_INDICATOR:
+            return bytes(data[1 : 1 + data[0]]), data[1 + data[0] :]
+        wide = _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+        data = data[1:]
+        out = bytearray()
+        while True:
+            (length, data) = decode_ub4(data) if wide else (data[0], data[1:])
+            if not length:
+                return bytes(out), data
+            out += data[:length]
+            data = data[length:]
+
+    read_lob = read_value
+
+
+class _OciCodec:
+    """The OCI dialect's primitives (#2064), as sqlplus reads them: fixed-width
+    little-endian integers, and long values in chunks with a ub1 length."""
+
+    name = 'oci'
+
+    @staticmethod
+    def n4(value: int) -> bytes:
+        return value.to_bytes(4, 'little')
+
+    @staticmethod
+    def n2(value: int) -> bytes:
+        return value.to_bytes(2, 'little')
+
+    @staticmethod
+    def read_n4(data: bytes) -> tuple[int, bytes]:
+        return int.from_bytes(data[:4], 'little'), data[4:]
+
+    @staticmethod
+    def read_n2(data: bytes) -> tuple[int, bytes]:
+        return int.from_bytes(data[:2], 'little'), data[2:]
+
+    @staticmethod
+    def value(data: bytes) -> bytes:
+        # A value as OCI frames it (#2042): a ub1 length, or past 252 bytes
+        # 0xFE and chunks of up to 255 bytes, each with a ub1 length, ending at
+        # a zero length -- as live 11g sends them (`fe ff` ... `00`). A server
+        # that advertises BIG_CHUNK_CLR, as live 18c does, may send ub4 lengths
+        # and chunks of up to 2000 bytes; the Mirror doesn't advertise it. The
+        # thin form's variable-width chunk lengths, which sqlplus misreads,
+        # hung it on a DBMS_OUTPUT.GET_LINES batch past 252 bytes.
+        if len(data) <= TNS_MAX_SHORT_LENGTH:
+            return bytes([len(data)]) + data
+        return _OciCodec._chunked(data)
+
+    @staticmethod
+    def lob(data: bytes) -> bytes:
+        # TTI_LOB content, the 11g form: Oracle sends content of ANY length
+        # chunked, a 1-byte read included -- 0xFE, a run of <ub1 len><bytes>,
+        # a zero-length chunk. A plain <len><data> is not a form it uses, and
+        # lengths 253-255 cannot be one: those bytes are markers, so a 254-byte
+        # read sent plain opened a chunked run at its first content byte and
+        # hung the client (#1970). Empty content is a bare zero length.
+        if not data:
+            return b'\x00'
+        return _OciCodec._chunked(data)
+
+    @staticmethod
+    def _chunked(data: bytes) -> bytes:
+        out = bytearray([TNS_LONG_LENGTH_INDICATOR])
+        for at in range(0, len(data), _OCI_LOB_CHUNK):
+            chunk = data[at : at + _OCI_LOB_CHUNK]
+            out += bytes([len(chunk)]) + chunk
+        return bytes(out + b'\x00')
+
+    @staticmethod
+    def read_value(data: bytes) -> tuple[bytes, bytes]:
+        if data[0] != TNS_LONG_LENGTH_INDICATOR:
+            return bytes(data[1 : 1 + data[0]]), data[1 + data[0] :]
+        data = data[1:]
+        out = bytearray()
+        while data[0]:
+            out += data[1 : 1 + data[0]]
+            data = data[1 + data[0] :]
+        return bytes(out), data[1:]
+
+    read_lob = read_value
+
+
+_THIN = _ThinCodec()
+_OCI = _OciCodec()
+_bytes_with_length = _THIN.value
+_oci_value_bytes = _OCI.value
+
+# The messages both dialects write with the same fields (#2064), one schema
+# each, compiled for each dialect once (seerdb.common.wire_schema).
+# TTI_STA: the OER call status and the end-to-end sequence.
+_STA: wire_schema.Schema = (
+    ('const', bytes([TTI_STA])),
+    ('n4', 'call_status'),
+    ('n2', 'sequence'),
+)
+# A logoff's reply: the STA, and in thin the end-of-response marker.
+_LOGOFF_REPLY: wire_schema.Schema = (
+    *_STA,
+    ('only', 'thin', (('const', bytes([TTI_END_OF_RESPONSE])),)),
+)
+# TTI_LOB: LOB_DATA.
+_LOB_DATA: wire_schema.Schema = (('const', bytes([TTI_LOB])), ('lob', 'content'))
+# The SYNC server piggyback (#1776, #2020): its DTYs, then keyword-value pairs,
+# each a text value and a binary value, either of them empty, and its flags.
+_SYNC_PAIR: wire_schema.Schema = (
+    ('n4', 'text_length'),
+    ('when', 'text_length', (('value', 'text'),)),
+    ('n4', 'binary_length'),
+    ('when', 'binary_length', (('value', 'binary'),)),
+    ('n2', 'keyword'),
+)
+_SYNC: wire_schema.Schema = (
+    ('const', bytes([TTI_SVR_PIGGYBACK, TNS_SERVER_PIGGYBACK_SYNC])),
+    ('n2', 'dty_count'),
+    ('u8', 'dty_length'),
+    ('n4', 'pair_count'),
+    ('u8', 'pairs_length'),
+    ('each', 'pairs', 'pair_count', _SYNC_PAIR),
+    ('n4', 'flags'),
+)
+_STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+_LOGOFF_REPLY_THIN = wire_schema.compile_encoder(_LOGOFF_REPLY, _THIN)
+_LOB_DATA_THIN = wire_schema.compile_encoder(_LOB_DATA, _THIN)
+_LOB_DATA_OCI = wire_schema.compile_encoder(_LOB_DATA, _OCI)
+_SYNC_THIN = wire_schema.compile_encoder(_SYNC, _THIN)
+_SYNC_OCI = wire_schema.compile_encoder(_SYNC, _OCI)
+_SYNC_PAIR_OCI = wire_schema.compile_encoder(_SYNC_PAIR, _OCI)
+
+
+def _sync_pairs(pairs: list[tuple[int, str]], slot: str) -> list[dict[str, Any]]:
+    # The SYNC pairs' fields for (keyword, text) pairs: thin carries the value
+    # as text, OCI -- as sqlplus reads it -- as binary (#2064).
+    other = 'binary' if slot == 'text' else 'text'
+    items = []
+    for keyword, text in pairs:
+        value = text.encode('utf-8')
+        item: dict[str, Any] = {f'{slot}_length': len(value), f'{other}_length': 0}
+        if value:
+            item[slot] = value
+        item['keyword'] = keyword
+        items.append(item)
+    return items
+
+
+def _sync_fields(pairs: list[tuple[int, str]], slot: str) -> dict[str, Any]:
+    # The SYNC piggyback's fields: one DTY and the two length bytes, constants
+    # as 23ai and 18c send them, whatever the pairs.
+    return {
+        'dty_count': 1,
+        'dty_length': 0x10,
+        'pair_count': len(pairs),
+        'pairs_length': 0x16,
+        'pairs': _sync_pairs(pairs, slot),
+        'flags': 0,
+    }
 
 
 def _read_str_with_length(Data: bytes) -> tuple[bytes, bytes]:
@@ -2209,21 +2404,8 @@ _OCI_LOB_CHUNK = 0xFF  # content bytes per 11g LOB_DATA chunk (matches live 11g)
 
 
 def _oci_lob_data(content: bytes) -> bytes:
-    # TTI_LOB content: token + single-byte-length chunks (the 11g form). Oracle
-    # sends content of ANY length chunked, a 1-byte read included: the 0xFE
-    # marker, a run of <ub1 len><bytes> terminated by a zero-length chunk. A plain
-    # <len><data> is not a form it uses, and lengths 253-255 cannot be one:
-    # those bytes are markers, so a 254-byte read sent plain opened a chunked run
-    # at its first content byte and hung the client (#1970). Empty content stays
-    # the bare `0e 00`.
-    if not content:
-        return bytes([TTI_LOB, 0])
-    out = bytearray([TTI_LOB, TNS_LONG_LENGTH_INDICATOR])
-    for start in range(0, len(content), _OCI_LOB_CHUNK):
-        chunk = content[start : start + _OCI_LOB_CHUNK]
-        out += bytes([len(chunk)]) + chunk
-    out += bytes([0])  # zero-length chunk terminates the run
-    return bytes(out)
+    # TTI_LOB content, the 11g form (_OciCodec.lob).
+    return _LOB_DATA_OCI({'content': content})
 
 
 # --- Mirror thin request parsers + LOB / out-bind / scroll codec ---
@@ -2785,21 +2967,8 @@ def encode_lob_read_response_thin(
 
 
 def _lob_data_thin(content: bytes) -> bytes:
-    # LOB_DATA in the negotiated version's chunk framing: always the 0xFE-marked
-    # run of chunks, as Oracle sends it whatever the length (#1970). 11g prefixes
-    # each chunk with a single length byte, a 12.1+ client reads a variable-width
-    # big-endian length (the ub4 form) per chunk — the same framing its own
-    # writer uses for a long bind — and a zero terminator.
-    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_12_1:
-        return _oci_lob_data(content)
-    if not content:
-        return bytes([TTI_LOB, 0])
-    out = bytearray([TTI_LOB, TNS_LONG_LENGTH_INDICATOR])
-    for start in range(0, len(content), _OCI_LOB_CHUNK):
-        chunk = content[start : start + _OCI_LOB_CHUNK]
-        out += encode_sb4(len(chunk)) + chunk
-    out += encode_sb4(0)
-    return bytes(out)
+    # LOB_DATA in the negotiated version's chunk framing (_ThinCodec.lob).
+    return _LOB_DATA_THIN({'content': content})
 
 
 # A temp LOB locator is 40 bytes on the wire: a ub2 length and 38 bytes. The
@@ -4726,16 +4895,7 @@ def encode_sync_piggyback(pairs: list[tuple[int, str]]) -> bytes:
     length bytes are constants there, whatever the pairs:
     ``17 05 01 01 10 01 01 16 01 03 03 6c 6f 77 00 01 cc 00`` reports keyword 204
     (transaction priority) = ``low``."""
-    Out = bytes([TTI_SVR_PIGGYBACK, TNS_SERVER_PIGGYBACK_SYNC])
-    Out += encode_sb4(1) + bytes([0x10])  # number of DTYs, length of DTYs
-    Out += encode_sb4(len(pairs)) + bytes([0x16])  # number of pairs, length
-    for Keyword, Text in pairs:
-        Value = Text.encode('utf-8')
-        Out += encode_sb4(len(Value)) + (_bytes_with_length(Value) if Value else b'')
-        Out += encode_sb4(0)  # binary value length
-        Out += encode_sb4(Keyword)
-    Out += encode_sb4(0)  # flags
-    return Out
+    return _SYNC_THIN(_sync_fields(pairs, 'text'))
 
 
 def decode_token_iov(Data: bytes, Acc: tuple) -> tuple:
@@ -8242,11 +8402,7 @@ def _oci_tti_sta(call_status: int, sequence: int) -> bytes:
     per-session server counter the full OER carries at offset 5 (§36), not a row
     count or a length. The commit and logoff acks sqlplus waits for share this
     shape."""
-    return (
-        bytes([TTI_STA])
-        + call_status.to_bytes(4, 'little')
-        + sequence.to_bytes(2, 'little')
-    )
+    return _STA_OCI({'call_status': call_status, 'sequence': sequence})
 
 
 # The TTI_STA call status is the OER's flag word, NOT the OER status byte at
@@ -10417,34 +10573,24 @@ _OCI_DDL_SESSION_STATE_OFF = 29
 
 
 def _oci_session_pairs(pairs: list[tuple[int, str]], *, count_width: int) -> bytes:
-    # The pairs as OCI writes them: a count, then per pair a ub4 binary length,
-    # a ub4 text length and the text as a value, and the ub2 keyword; a ub4 of
-    # flags last.
-    out = bytearray(len(pairs).to_bytes(count_width, 'little'))
-    for keyword, text in pairs:
-        value = text.encode('utf-8')
-        out += bytes(4)  # binary value length
-        out += _oci_ub4(len(value))
-        if value:
-            out += bytes([len(value)]) + value
-        out += keyword.to_bytes(2, 'little')
-    out += bytes(4)  # flags
-    return bytes(out)
+    # The pairs as OCI writes them: a count, then each pair of the SYNC
+    # piggyback's (_SYNC_PAIR) with its value as binary, and a ub4 of flags
+    # last.
+    items = _sync_pairs(pairs, 'binary')
+    return (
+        len(pairs).to_bytes(count_width, 'little')
+        + b''.join([_SYNC_PAIR_OCI(item) for item in items])
+        + bytes(4)
+    )
 
 
 def encode_sync_piggyback_oci(pairs: list[tuple[int, str]]) -> bytes:
     """The SYNC server piggyback in the OCI dialect (#2020): the thin form's
-    fields (:func:`encode_sync_piggyback`), fixed-width. A ub2 count of DTYs and
-    their length, a ub4 count of pairs and their length byte, then per pair a
-    ub4 binary length, a ub4 text length and the text as a value, and the ub2
-    keyword; a ub4 of flags last. A live 18c reports the session's NLS
-    parameters this way after an ALTER SESSION SET NLS_..., and sqlplus formats
-    its DATE, TIMESTAMP and NUMBER columns by them."""
-    head = bytes([TTI_SVR_PIGGYBACK, TNS_SERVER_PIGGYBACK_SYNC])
-    head += (1).to_bytes(2, 'little') + bytes([0x10])  # one DTY, its length
-    pairs_bytes = _oci_session_pairs(pairs, count_width=4)
-    # The count, then the pairs' length byte (constant), then the pairs.
-    return head + pairs_bytes[:4] + bytes([0x16]) + pairs_bytes[4:]
+    fields, fixed-width, with each value in the pair's binary slot and its text
+    slot empty (#2064) -- as a live 18c reports the session's NLS parameters
+    after an ALTER SESSION SET NLS_..., by which sqlplus formats its DATE,
+    TIMESTAMP and NUMBER columns."""
+    return _SYNC_OCI(_sync_fields(pairs, 'binary'))
 
 
 def encode_ddl_status_oci(
@@ -10539,23 +10685,6 @@ def _oci_object_image(obj: 'DbObject') -> bytes:
 
 # The cell types whose value is the bytes themselves, framed as one value (#2053).
 _OCI_CHUNKED_CELL_TYPES = frozenset({TNS_TYPE_VARCHAR, TNS_TYPE_CHAR, TNS_TYPE_RAW})
-
-
-def _oci_value_bytes(data: bytes) -> bytes:
-    """A value as OCI frames it (#2042): a ub1 length, or past 252 bytes 0xFE
-    and chunks whose lengths are fixed-width, a ub4 LE from 12.1 and a ub1
-    below, ending at a zero length. The thin form's chunk lengths are TTC's
-    variable-width ones, which sqlplus misreads: a DBMS_OUTPUT.GET_LINES batch
-    past 252 bytes hung it. Live 18c sends chunks of up to 2000 bytes, a
-    3026-byte image as 2000 + 1026 (`fe d0 07 00 00` ... `00 00 00 00`); live
-    11g sends 255-byte ones (`fe ff` ... `00`)."""
-    if len(data) <= TNS_MAX_SHORT_LENGTH:
-        return bytes([len(data)]) + data
-    out = bytearray(b'\xfe')
-    for at in range(0, len(data), 0xFF):
-        chunk = data[at : at + 0xFF]
-        out += bytes([len(chunk)]) + chunk
-    return bytes(out) + b'\x00'
 
 
 def _oci_out_object_value(value: object, toid: bytes) -> bytes:
@@ -10796,8 +10925,7 @@ def encode_logoff_status_thin() -> bytes:
     """The thin reply to ``TTI_LOGOFF``: a ``TTI_STA`` status token (OER call
     status 1, end-to-end sequence 0) followed by the per-response
     ``END_OF_RESPONSE`` marker. The integers are the thin protocol's
-    variable-length form (``encode_sb4``), not the OCI fixed-width LE the sqlplus
-    ack uses.
+    variable-length form, not the OCI fixed-width LE the sqlplus ack uses.
 
     python-oracledb 26.0.0's ``LogoffMessage`` sends ``LOGOFF`` and then **reads
     a reply** before closing; earlier clients closed the socket without reading,
@@ -10805,12 +10933,7 @@ def encode_logoff_status_thin() -> bytes:
     unexpected EOF -- ``DPY-4011``. A ``STATUS`` token does not by itself end a
     response for a client that negotiated end-of-response, so the marker is
     required; byte-identical to a live 23ai's logoff reply (``09 01 01 00 1d``)."""
-    return (
-        bytes([TTI_STA])
-        + encode_sb4(1)  # OER call status (1 = logoff, per the OER flag word)
-        + encode_sb4(0)  # end-to-end sequence
-        + bytes([TTI_END_OF_RESPONSE])
-    )
+    return _LOGOFF_REPLY_THIN({'call_status': 1, 'sequence': 0})
 
 
 def _decode_describe_oci(payload: bytes) -> list[dict]:

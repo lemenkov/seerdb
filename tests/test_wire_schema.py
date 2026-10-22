@@ -1,0 +1,103 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: MIT
+
+"""One message schema, two serialisations (#2064): the messages written from a
+schema keep their wire bytes, in both dialects, and decode back."""
+
+from __future__ import annotations
+
+import contextlib
+import random
+from collections.abc import Iterator
+
+import pytest
+
+from seerdb.common import tns, wire_schema
+
+FIELD_VERSIONS = (6, 7, 24)  # 11g, 12.1, 23ai
+LENGTHS = (0, 1, 63, 64, 65, 252, 253, 254, 255, 256, 510, 511, 3026, 70000)
+CODECS = (tns._THIN, tns._OCI)
+
+
+@contextlib.contextmanager
+def _field_version(version: int) -> Iterator[None]:
+    tokens = (
+        tns._ENCODE_FIELD_VERSION.set(version),
+        tns._DECODE_FIELD_VERSION.set(version),
+    )
+    try:
+        yield
+    finally:
+        tns._ENCODE_FIELD_VERSION.reset(tokens[0])
+        tns._DECODE_FIELD_VERSION.reset(tokens[1])
+
+
+def test_the_live_captures_are_written_as_they_were() -> None:
+    # 23ai's logoff reply, 18c's answer to sqlplus's ping after a cancel, and
+    # 23ai's SYNC reporting transaction priority `low`.
+    assert tns.encode_logoff_status_thin() == bytes.fromhex('090101001d')
+    assert tns.encode_ping_status_oci(0xFA2F) == bytes.fromhex('09010000002ffa')
+    assert tns.encode_sync_piggyback([(204, 'low')]) == bytes.fromhex(
+        '17050101100101160103036c6f770001cc00'
+    )
+
+
+def test_a_long_value_is_chunked_as_each_dialect_reads_it() -> None:
+    # 253 bytes: thin's 64-byte chunks with a ub1 length below 12.1 and a
+    # variable-width one from it; OCI's 255-byte chunks with a ub1 length.
+    data = bytes(253)
+    with _field_version(6):
+        assert tns._bytes_with_length(data) == (
+            b'\xfe' + (b'\x40' + bytes(64)) * 3 + b'\x3d' + bytes(61) + b'\x00'
+        )
+    with _field_version(7):
+        assert tns._bytes_with_length(data) == (
+            b'\xfe' + (b'\x01\x40' + bytes(64)) * 3 + b'\x01\x3d' + bytes(61) + b'\x00'
+        )
+    assert tns._oci_value_bytes(data) == b'\xfe\xfd' + data + b'\x00'
+
+
+@pytest.mark.parametrize('version', FIELD_VERSIONS)
+@pytest.mark.parametrize('length', LENGTHS)
+def test_values_and_lob_data_decode_back(version: int, length: int) -> None:
+    data = random.Random(length).randbytes(length)
+    with _field_version(version):
+        for codec in CODECS:
+            for schema in ((('value', 'v'),), tns._LOB_DATA):
+                key = schema[-1][1]
+                wire = wire_schema.compile_encoder(schema, codec)({key: data})
+                decode = wire_schema.compile_decoder(schema, codec)
+                assert decode(wire + b'rest') == ({key: data}, b'rest')
+
+
+@pytest.mark.parametrize('version', FIELD_VERSIONS)
+def test_sync_decodes_back_in_both_dialects(version: int) -> None:
+    pairs = [(0x10, 'AMERICAN'), (7, ''), (0x23, 'x' * 300)]
+    with _field_version(version):
+        for codec, slot in ((tns._THIN, 'text'), (tns._OCI, 'binary')):
+            fields = tns._sync_fields(pairs, slot)
+            wire = wire_schema.compile_encoder(tns._SYNC, codec)(fields)
+            assert wire_schema.compile_decoder(tns._SYNC, codec)(wire) == (
+                fields,
+                b'',
+            )
+
+
+def test_an_oci_sync_value_past_255_bytes_is_chunked() -> None:
+    # A bare ub1 length couldn't frame it, and raised (#2064).
+    wire = tns.encode_sync_piggyback_oci([(1, 'y' * 300)])
+    (fields, rest) = wire_schema.compile_decoder(tns._SYNC, tns._OCI)(wire)
+    assert rest == b''
+    assert fields['pairs'][0]['binary'] == b'y' * 300
+
+
+def test_sta_decodes_back_in_both_dialects() -> None:
+    values = {'call_status': 5, 'sequence': 0xFA2F}
+    for codec in CODECS:
+        wire = wire_schema.compile_encoder(tns._STA, codec)(values)
+        assert wire_schema.compile_decoder(tns._STA, codec)(wire) == (values, b'')
+
+
+def test_an_unknown_field_kind_is_refused() -> None:
+    with pytest.raises(ValueError, match='unknown field kind'):
+        wire_schema.compile_encoder((('ub3', 'x'),), tns._THIN)
