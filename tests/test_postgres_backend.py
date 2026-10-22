@@ -3553,7 +3553,7 @@ def test_the_users_group_may_use_every_schema_the_installation_makes() -> None:
 
 @contextlib.contextmanager
 def _per_user_mirror(
-    conninfo: str, admin: str, presents: str = '12.1'
+    conninfo: str, admin: str, presents: str = '12.1', native_sql: bool = False
 ) -> Iterator[Callable[..., Any]]:
     # A Mirror in per-user mode (#1857) over `conninfo`, with one configured
     # account, `admin`, serving each connection on a thread of its own; yields
@@ -3576,6 +3576,7 @@ def _per_user_mirror(
                 auth_conninfo=auth,
                 per_user_roles=True,
                 presents=presents,
+                native_sql=native_sql,
             )
             try:
                 serve_session(
@@ -4247,6 +4248,51 @@ def test_a_per_user_session_cannot_forge_who_it_is() -> None:
             with contextlib.suppress(Exception):
                 session.close()
         _drop_mirror_roles(pg, user, other, admin)
+        pg.close()
+
+
+def test_a_users_invalid_view_record_runs_in_no_other_session() -> None:
+    # A view a DROP left INVALID is made again from its record by a session of
+    # its schema's owner only (GHSA-jf99-3g55-98cc). The record is the user's
+    # to write, so its text is what that user could run anyway; another
+    # user's session, though it may create in the schema, never runs it.
+    pid = os.getpid()
+    admin = f'iv_adm_{pid}'
+    (user, other) = (f'iv_a_{pid}', f'iv_b_{pid}')
+    pg = psycopg.connect(_CONNINFO, autocommit=True)
+    opened: list[Any] = []
+    try:
+        with _per_user_mirror(_CONNINFO, admin, native_sql=True) as base:
+
+            def login(name: str, password: str = 'pw123') -> Any:
+                opened.append(base(name, password))
+                return opened[-1]
+
+            adm = login(admin, 'adm123').cursor()
+            for name in (user, other):
+                adm.execute(f'create user {name} identified by pw123')
+            cur = login(user).cursor()
+            cur.execute('create table iv_seen (who varchar2(64))')
+            cur.execute("alter session set seerdb_dialect = 'postgres'")
+            cur.execute(f'GRANT INSERT ON iv_seen TO {other}')
+            cur.execute(f'GRANT USAGE, CREATE ON SCHEMA {user} TO {other}')
+            cur.execute("alter session set seerdb_dialect = 'oracle'")
+            cur.execute(
+                f"insert into sys.ora_invalid_views values ('{user}', 'iv_v', "
+                f"'SELECT 1 AS n; INSERT INTO {user}.iv_seen SELECT current_user')"
+            )
+            cur.connection.commit()
+            login(other).cursor().execute('create table iv_t (n number)')
+            assert pg.execute(f'SELECT who FROM {user}.iv_seen').fetchall() == []
+            assert pg.execute(f"SELECT to_regclass('{user}.iv_v')").fetchone() == (
+                None,
+            )
+    finally:
+        for session in opened:
+            with contextlib.suppress(Exception):
+                session.close()
+        pg.execute('DELETE FROM sys.ora_invalid_views WHERE schema_name = %s', (user,))
+        _drop_mirror_roles(pg, other, user, admin)
         pg.close()
 
 
