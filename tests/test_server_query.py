@@ -2816,27 +2816,33 @@ def test_long_row_replies_carry_the_right_status() -> None:
     assert fetch[-136:][:2] == b'\x04\x01'  # OER "more rows" status, no 1403 body
 
 
+def _cell_locator(cell: bytes) -> dict:
+    # The locator a LOB cell carries to an 11.2 client, behind its ub4 and ub1
+    # lengths, read back by its schema (_OCI_LOB_LOCATOR).
+    from seerdb.common.tns import _OCI_LOB_LOCATOR_FROM_OCI
+
+    (fields, rest) = _OCI_LOB_LOCATOR_FROM_OCI(cell[5:])
+    assert rest == b''
+    return fields
+
+
 def test_lob_locator_carries_the_content_byte_size() -> None:
     # The row locator's size field is the content BYTE count (big-endian): a CLOB
     # is UTF-16 (2 bytes per char), a BLOB is its raw bytes. NULL is a zero
     # length, all four bytes of it (no read, #1287). This unit is what makes
     # sqlplus accept the locator (#405).
-    from seerdb.common.tns import (
-        _OCI_LOB_ROW_SIZE_OFF,
-        encode_lob_locator_oci,
-    )
+    from seerdb.common.tns import encode_lob_locator_oci
 
-    off = _OCI_LOB_ROW_SIZE_OFF
     clob = encode_lob_locator_oci('A' * 2000, is_clob=True)
-    assert int.from_bytes(clob[off : off + 4], 'big') == 4000  # 2000 chars * 2
+    assert _cell_locator(clob)['byte_size'] == 4000  # 2000 chars * 2
     blob = encode_lob_locator_oci(b'\x00' * 2500, is_clob=False)
-    assert int.from_bytes(blob[off : off + 4], 'big') == 2500  # raw bytes
+    assert _cell_locator(blob)['byte_size'] == 2500  # raw bytes
     assert encode_lob_locator_oci(None, is_clob=True) == bytes(4)
     # CLOB and BLOB use different locator templates: the type bytes and the charset
     # differ (a CLOB is AL32UTF8 characters, a BLOB is binary) so sqlplus does not
     # decode a BLOB's raw bytes as text (#406).
-    assert clob[9] == 0x02 and blob[9] == 0x01  # LOB type byte
-    assert clob[37] == 0x03 and blob[37] == 0x00  # charset (873 vs binary 0)
+    assert (_cell_locator(clob)['lob_kind'], _cell_locator(blob)['lob_kind']) == (2, 1)
+    assert (_cell_locator(clob)['charset'], _cell_locator(blob)['charset']) == (873, 0)
 
 
 def test_lob_read_response_selects_clob_or_blob_locator() -> None:
@@ -2861,7 +2867,6 @@ def test_nclob_locator_carries_the_national_form() -> None:
     # sqlplus 23.26. A CLOB-form locator under an NCLOB describe makes sqlplus
     # refuse the value with ORA-24806 (#1369).
     from seerdb.common.tns import (
-        _OCI_LOB_CHARSET_ID_OFF,
         _oci_lob_locator,
         encode_lob_locator_oci,
         encode_lob_read_response_oci,
@@ -2870,10 +2875,9 @@ def test_nclob_locator_carries_the_national_form() -> None:
     nclob = _oci_lob_locator(True, national=True)
     assert nclob[3:6] == bytes.fromhex('044c08')
     assert _oci_lob_locator(True)[3:6] == bytes.fromhex('020c88')
-    charset = 9 + _OCI_LOB_CHARSET_ID_OFF
-    assert nclob[charset : charset + 2] == (2000).to_bytes(2, 'big')
-    assert nclob[8] == 0x02  # still a character LOB
     row = encode_lob_locator_oci('nat', is_clob=True, national=True)
+    assert _cell_locator(row)['charset'] == 2000  # AL16UTF16
+    assert nclob[8] == 0x02  # still a character LOB
     assert row[6:].startswith(nclob[:9])
     reply = encode_lob_read_response_oci(
         b'\x00n', 1, 2, is_clob=True, national=True, sequence=17
@@ -3049,26 +3053,20 @@ def test_oci_lob_describe_tail_is_built_from_fields() -> None:
     # The 33-byte LOB describe tail (#405) is built field-by-field, not stored:
     # the describe-time DALC head (ub4 char-length 7 + byte-length 7) + one carried
     # ub4 at offset 17. It must stay byte-identical to the live 11g capture.
-    from seerdb.common.tns import (
-        _OCI_LOB_DESCRIBE_SIZE_OFF,
-        _OCI_LOB_DESCRIBE_TAIL,
-        _oci_lob_describe_tail,
-    )
+    from seerdb.common.tns import _OCI_LOB_DESCRIBE_TAIL, _oci_lob_describe_tail
 
     assert _OCI_LOB_DESCRIBE_TAIL == bytes.fromhex(
         '0007000000070000000000000000000000e81f0000000000000000000000000000'
     )
     assert _oci_lob_describe_tail() == _OCI_LOB_DESCRIBE_TAIL
-    off = _OCI_LOB_DESCRIBE_SIZE_OFF
-    assert int.from_bytes(_OCI_LOB_DESCRIBE_TAIL[off : off + 4], 'little') == 8168
+    assert (8168).to_bytes(4, 'little') in _OCI_LOB_DESCRIBE_TAIL
 
 
 def test_encode_lob_read_response_slices_and_reports_totals() -> None:
     # The READ reply carries the requested slice as LOB_DATA and reports the whole
     # LOB's byte size in the echoed locator plus this read's amount (#405).
     from seerdb.common.tns import (
-        _OCI_LOB_TAIL_AMOUNT_OFF,
-        _OCI_LOB_TAIL_SIZE_OFF,
+        _OCI_LOB_LOCATOR_FROM_OCI,
         encode_lob_read_response_oci,
     )
 
@@ -3077,17 +3075,11 @@ def test_encode_lob_read_response_slices_and_reports_totals() -> None:
         content, amount=5, total_bytes=4000, sequence=17
     )
     assert reply[0] == TTI_LOB
+    # The return parameters: the RPA token, the echoed locator, the ub8 amount.
     tail = reply[-251:]
-    assert (
-        int.from_bytes(tail[_OCI_LOB_TAIL_SIZE_OFF : _OCI_LOB_TAIL_SIZE_OFF + 4], 'big')
-        == 4000
-    )
-    assert (
-        int.from_bytes(
-            tail[_OCI_LOB_TAIL_AMOUNT_OFF : _OCI_LOB_TAIL_AMOUNT_OFF + 4], 'little'
-        )
-        == 5
-    )
+    (locator, rest) = _OCI_LOB_LOCATOR_FROM_OCI(tail[1:])
+    assert locator['byte_size'] == 4000
+    assert int.from_bytes(rest[:8], 'little') == 5
 
 
 def test_oci_lob_contents_reports_type_and_wire_bytes() -> None:

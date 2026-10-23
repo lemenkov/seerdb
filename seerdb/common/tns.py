@@ -3526,14 +3526,10 @@ def parse_lobops_slot(body: bytes) -> int | None:
     for a request that carries none -- the wide form, whose locator this does not
     locate, or a locator minted without a slot."""
     region = parse_lobops_locator(body)
-    if region is None:
+    locator = None if region is None else _oci_lob_locator_from(region)
+    if locator is None or not locator['slot']:
         return None
-    start = region.find(b'\x68\x00\x01', 0, 4)
-    at = start + _OCI_LOB_LOCATOR_SLOT_OFF
-    if start < 0 or len(region) < at + 4:
-        return None
-    slot = int.from_bytes(region[at : at + 4], 'big')
-    return slot - 1 if slot else None
+    return locator['slot'] - 1
 
 
 def encode_lob_read_response_thin(
@@ -9504,59 +9500,104 @@ _SERVER_DTY_TABLE = encode_dty_table(_SERVER_DTY_ENTRIES)  # 913-byte type table
 # BLOB counts its raw bytes. The content never rides in the locator (out-of-line):
 # it returns in the READ reply's LOB_DATA. A ub4-LE num_bytes frames the locator
 # in the row; a NULL LOB is num_bytes 0, no READ.
-# The body of the 105-byte persistent-LOB locator (offset 9 onward). Its physical
-# **LOB Locator ID** — the object id, three segment DBAs and an SCN of a real LOB
-# in the source database — is opaque to the client, which only echoes the locator
-# on each LOB op. The Mirror has no such segment, so it emits a **synthetic LID of
-# zeros**: verified live against sqlplus 11.2 over the Mirror, which reads the CLOB
-# and BLOB content back correctly with the physical fields zeroed (drivers such as
+# The persistent-LOB locator as a LOB cell carries it, 106 bytes: the ub2 BE
+# length of what follows (104) -- whose high byte the cell writes as the zero
+# ahead of the 105 bytes sqlplus echoes -- a version, the four flag bytes every
+# locator has (the third's 0x80 the variable-width charset bit, as a thin
+# client reads it), the LOB type, then the body. Its physical **LOB Locator ID**
+# -- the object id, three segment DBAs and an SCN of a real LOB in the source
+# database -- is opaque to the client, which only echoes the locator on each LOB
+# op. The Mirror has no such segment, so it emits a **synthetic LID of zeros**:
+# verified live against sqlplus 11.2 over the Mirror, which reads the CLOB and
+# BLOB content back correctly with the physical fields zeroed (drivers such as
 # go-ora only interpret the header flag bits, never the LID). With the physical
 # LID gone the CLOB and BLOB bodies are identical bar the charset id, so one
-# template serves both; the charset id (offset 31, ub2 BE) is generated. The
-# content byte-size slot (offset 91, ub4 BE) is patched per value.
-_OCI_LOB_LOCATOR_BODY = bytes.fromhex(
-    '00000001000000560000000100000001000000020002000000020000000000000000'
-    '00000000000000000000000000000000000000000000000000000000000000000001'
-    '000000000000000000140500000000000fa000000000000200000000'
+# layout serves both. The LID's zero run carries the Mirror's own two names,
+# which a client echoes without reading (§14.6): the LOB's row slot (#1430) and
+# its sqlplus variable (#2015), each plus one so zero stays "none". The content
+# byte size sqlplus sizes its READ by is a field too.
+_OCI_LOB_LOCATOR: wire_schema.Schema = (
+    ('be2', 'length'),
+    ('be2', 'version'),
+    ('u8', 'lob_kind'),  # 0x02 CLOB, 0x04 NCLOB, 0x01 BLOB
+    ('u8', 'flags_2'),  # bit 0x40 = national form
+    ('u8', 'flags_3'),  # bit 0x80 = variable-width charset (AL16UTF16 is fixed)
+    ('u8', 'flags_4'),
+    ('pad', 1),
+    ('u8', 'lob_type'),
+    ('const', bytes.fromhex('0000000100000056000000010000000100000002')),
+    ('const', bytes.fromhex('0002')),
+    ('be2', 'charset'),
+    ('const', bytes.fromhex('0002')),
+    ('pad', 5),
+    ('be4', 'slot'),
+    ('be4', 'lob_var'),
+    ('pad', 25),
+    ('const', bytes.fromhex('00000001')),
+    ('pad', 9),
+    ('const', bytes.fromhex('1405')),
+    ('pad', 3),
+    ('be4', 'byte_size'),
+    ('pad', 5),
+    ('const', b'\x02'),
+    ('pad', 4),
 )
+_OCI_LOB_LOCATOR_OCI = wire_schema.compile_encoder(_OCI_LOB_LOCATOR, _OCI)
+_OCI_LOB_LOCATOR_FROM_OCI = wire_schema.compile_decoder(_OCI_LOB_LOCATOR, _OCI)
+# What sqlplus is told a minted LOB holds, until the cell says: 4000 bytes.
+_OCI_LOB_TEMPLATE_SIZE = 4000
 
-_OCI_LOB_CHARSET_ID_OFF = 31 - 9  # charset id ub2 BE, within the body
 
-
-def _oci_lob_locator(is_clob: bool, national: bool = False) -> bytes:
-    """The 105-byte persistent-LOB locator sqlplus binds and echoes (§14.6),
-    generated field by field. The 9-byte header carries the LOB kind (charset
-    form, flags, LOB type); the body is the shared structural template with the
-    charset id set for a CLOB and a zeroed synthetic LID.
+def _oci_lob_locator_fields(
+    is_clob: bool,
+    national: bool = False,
+    *,
+    slot: int | None = None,
+    lob_var: int | None = None,
+    byte_size: int = _OCI_LOB_TEMPLATE_SIZE,
+) -> dict:
+    """The fields of a persistent-LOB locator the Mirror mints (_OCI_LOB_LOCATOR).
 
     An NCLOB (``national``) is a CLOB whose header says so and whose charset is
     AL16UTF16, fixed width (§14.6). Measured against a live 11g: sqlplus refuses
     a CLOB-form locator under an NCLOB describe with ORA-24806."""
-    body = bytearray(_OCI_LOB_LOCATOR_BODY)
-    if is_clob:
-        struct.pack_into(
-            '>H',
-            body,
-            _OCI_LOB_CHARSET_ID_OFF,
-            AL16UTF16_CHARSET if national else AL32UTF8_CHARSET,
-        )
     national = is_clob and national
-    header = bytes(
-        [
-            0x68,
-            0x00,
-            0x01,  # locator length + version
-            # LOB kind: 0x02 CLOB, 0x04 NCLOB, 0x01 BLOB
-            0x04 if national else 0x02 if is_clob else 0x01,
-            0x4C if national else 0x0C,  # flags -- bit 0x40 = national form
-            # flags -- bit 0x80 = variable-width charset (AL16UTF16 is fixed)
-            0x88 if is_clob and not national else 0x08,
-            0x00,
-            0x00,
-            0x02 if is_clob else 0x01,  # LOB type
-        ]
+    return {
+        'length': 104,
+        'version': 1,
+        'lob_kind': 0x04 if national else 0x02 if is_clob else 0x01,
+        'flags_2': 0x4C if national else 0x0C,
+        'flags_3': 0x88 if is_clob and not national else 0x08,
+        'flags_4': 0,
+        'lob_type': 0x02 if is_clob else 0x01,
+        'charset': (AL16UTF16_CHARSET if national else AL32UTF8_CHARSET)
+        if is_clob
+        else 0,
+        'slot': 0 if slot is None else slot + 1,
+        'lob_var': 0 if lob_var is None else lob_var + 1,
+        'byte_size': byte_size,
+    }
+
+
+def _oci_lob_locator_cell(
+    is_clob: bool,
+    national: bool = False,
+    *,
+    slot: int | None = None,
+    lob_var: int | None = None,
+    byte_size: int = _OCI_LOB_TEMPLATE_SIZE,
+) -> bytes:
+    # The locator with its length's zero high byte, as a cell carries it.
+    return _OCI_LOB_LOCATOR_OCI(
+        _oci_lob_locator_fields(
+            is_clob, national, slot=slot, lob_var=lob_var, byte_size=byte_size
+        )
     )
-    return header + bytes(body)
+
+
+def _oci_lob_locator(is_clob: bool, national: bool = False) -> bytes:
+    """The 105-byte persistent-LOB locator sqlplus binds and echoes (§14.6)."""
+    return _oci_lob_locator_cell(is_clob, national)[1:]
 
 
 # Which of a row's LOBs a locator names (#1430): sqlplus reads a row's LOBs
@@ -9565,22 +9606,16 @@ def _oci_lob_locator(is_clob: bool, national: bool = False) -> bytes:
 # column index, plus one so zero stays "none") rides four bytes of the
 # template's all-zero run (locator offsets 35..75, inside the synthetic LID),
 # which a client echoes without reading (§14.6).
-_OCI_LOB_LOCATOR_SLOT_OFF = 40
-
-
-def _oci_lob_locator_with_slot(locator: bytes, slot: int | None) -> bytes:
-    if slot is None:
-        return locator
-    out = bytearray(locator)
-    struct.pack_into('>I', out, _OCI_LOB_LOCATOR_SLOT_OFF, slot + 1)
-    return bytes(out)
-
-
-# A LOB column's cell (_LOB_CELL) to an 11.2 client: the locator's ub4 length
-# (106), then the locator as a value, its ub1 length (106) and a zero byte
-# ahead of the 105-byte locator -- which reads as a ub2 106 -- so the locator
-# value starts 5 bytes in.
-_OCI_LOB_ROW_LOCATOR_AT = 5
+def _oci_lob_locator_from(region: bytes) -> dict | None:
+    # The fields of a locator the Mirror minted, found in an echoed region by
+    # its length and version, or None.
+    start = region.find(b'\x68\x00\x01', 0, 4)
+    if start < 0:
+        return None
+    try:
+        return _OCI_LOB_LOCATOR_FROM_OCI(b'\x00' + region[start:])[0]
+    except (IndexError, ValueError):
+        return None
 
 
 def _oci_lob_read_status(sequence: int) -> bytes:
@@ -10597,11 +10632,10 @@ def _oci_dcb_tail(numcols: int) -> bytes:
 # of the 83-byte inline-row DCB tail it carries a 33-byte describe-timestamp tail
 # (no DCB marker): the same describe-time DALC head as _oci_dcb_tail (a ub4 char
 # length of 7 + the byte-length 7, the timestamp value itself zeroed), all zero
-# except one ub4 the LOB describe carries at offset 17. That ub4 is NOT
+# except the ub4 dcbmdbz the LOB describe carries. That ub4 is NOT
 # instance-specific (a real reply zeroes the timestamp / SCN but not this), so it
 # is a stable structural value; its exact meaning is unpinned, carried from the
 # live 11g CLOB describe capture (#405).
-_OCI_LOB_DESCRIBE_SIZE_OFF = 17
 _OCI_LOB_DESCRIBE_SIZE = 8168  # 0x1fe8, ub4 LE — carried ground truth
 
 
@@ -11189,13 +11223,6 @@ def _oci_refcursor_out_value(bind: RefCursorOutBind) -> bytes:
     )
 
 
-# Which sqlplus LOB variable a locator names (#2015): its id, plus one so zero
-# stays "none", in four more bytes of the locator's all-zero run, beside the row
-# slot (#1430). A client echoes the locator without reading it (§14.6).
-_OCI_LOB_LOCATOR_VAR_OFF = 44
-_OCI_LOB_LOCATOR_FLAGS_OFF = 4
-
-
 def _oci_lob_out_value(bind: LobOutBind) -> bytes:
     # The value as a LOB column's cell goes out, which sqlplus already reads,
     # naming the variable; then the return code every OUT value ends on.
@@ -11203,35 +11230,28 @@ def _oci_lob_out_value(bind: LobOutBind) -> bytes:
         # A NULL: no locator, and the return code -1 a live server sends for
         # one (18c, `exec :vc := null`).
         return encode_lob_locator_oci(None, bind.is_clob) + _OCI_OUTBIND_NULL_RETCODE
-    cell = bytearray(encode_lob_locator_oci(bind.value, bind.is_clob))
-    locator = len(cell) - len(_oci_lob_locator(bind.is_clob))
-    struct.pack_into('>I', cell, locator + _OCI_LOB_LOCATOR_VAR_OFF, bind.lob_id + 1)
-    return bytes(cell) + _OCI_OUTBIND_RETCODE
+    cell = encode_lob_locator_oci(bind.value, bind.is_clob, lob_var=bind.lob_id)
+    return cell + _OCI_OUTBIND_RETCODE
 
 
 def oci_lob_var_id(locator: bytes, is_blob: bool) -> int | None:
     """The sqlplus LOB variable a bound locator names, or None for a locator the
     Mirror did not hand out -- sqlplus's unset buffer among them (#2015)."""
-    size = len(_oci_lob_locator(not is_blob))
-    if len(locator) < size:
+    cell = b'\x00' + locator[-(len(_oci_lob_locator(not is_blob))) :]
+    try:
+        (bound, _rest) = _OCI_LOB_LOCATOR_FROM_OCI(cell)
+    except (IndexError, ValueError):
         return None
-    tail = locator[-size:]
-    template = bytearray(_oci_lob_locator(not is_blob))
-    # The fields a cell patches per value -- the content size and the variable
-    # id -- and the two header flag bytes, of which sqlplus 23.26 clears bit 0x08
-    # of the second when it binds the locator back (`0c 88` returns `0c 80`).
-    for off, width in (
-        (_OCI_LOB_ROW_SIZE_OFF - 6, 4),
-        (_OCI_LOB_LOCATOR_VAR_OFF, 4),
-        (_OCI_LOB_LOCATOR_FLAGS_OFF, 2),
-    ):
-        template[off : off + width] = tail[off : off + width]
-    if tail != bytes(template):
+    # A minted locator but for what a cell sets per value -- the content size
+    # and the variable id -- and two of the flag bytes, of which sqlplus 23.26
+    # clears bit 0x08 of the third when it binds the locator back (`0c 88`
+    # returns `0c 80`).
+    minted = _oci_lob_locator_fields(not is_blob)
+    for name in ('byte_size', 'lob_var', 'flags_2', 'flags_3'):
+        minted[name] = bound[name]
+    if _OCI_LOB_LOCATOR_OCI(minted) != cell:
         return None
-    lob_id = int.from_bytes(
-        tail[_OCI_LOB_LOCATOR_VAR_OFF : _OCI_LOB_LOCATOR_VAR_OFF + 4], 'big'
-    )
-    return lob_id - 1 if lob_id else None
+    return bound['lob_var'] - 1 if bound['lob_var'] else None
 
 
 def encode_out_bind_response_oci(
@@ -11400,15 +11420,6 @@ def encode_long_value_oci(value: object) -> bytes:
     return _LONG_CELL_OCI({'content': _long_content(value), 'actual_length': 0})
 
 
-_OCI_LOB_ROW_SIZE_OFF = 97  # ub4 BE content byte size inside the row locator value
-
-
-_OCI_LOB_TAIL_SIZE_OFF = 93  # ub4 BE byte size in the echoed locator
-
-
-_OCI_LOB_TAIL_AMOUNT_OFF = 107  # ub4 LE amount read (characters for CLOB / bytes)
-
-
 # The LOB's length (ub8) and chunk size (ub4) a LOB column value carries between
 # its locator length and the locator (#1287); the chunk size is 11g's.
 _OCI_LOB_CHUNK_SIZE = 8132
@@ -11433,7 +11444,11 @@ def _oci_lob_byte_size(value: object, is_clob: bool) -> int:
 
 
 def encode_lob_locator_oci(
-    value: object, is_clob: bool, national: bool = False, slot: int | None = None
+    value: object,
+    is_clob: bool,
+    national: bool = False,
+    slot: int | None = None,
+    lob_var: int | None = None,
 ) -> bytes:
     """The RXD value for a LOB column (#405): a minted opaque locator carrying the
     content **byte** size so sqlplus issues a TTI_LOBOPS READ.
@@ -11445,23 +11460,23 @@ def encode_lob_locator_oci(
     the locator straight away and cannot parse it with them. A live 11g answers
     each in its own form (#1287). NULL is that leading length at zero, all four
     bytes of it, and draws no read. ``slot`` names the LOB among its row's
-    (#1430)."""
+    (#1430), and ``lob_var`` the sqlplus variable it is bound to (#2015)."""
     if value is None:
         return _LOB_CELL_OCI({'locator_length': 0})
-    # The locator as the cell carries it: a zero byte, then the 105-byte
-    # locator, which names the LOB's slot and carries its byte size.
-    locator = bytearray(b'\x00' + _oci_lob_locator(is_clob, national))
-    if slot is not None:
-        struct.pack_into('>I', locator, 1 + _OCI_LOB_LOCATOR_SLOT_OFF, slot + 1)
-    at = _OCI_LOB_ROW_SIZE_OFF - _OCI_LOB_ROW_LOCATOR_AT
-    locator[at : at + 4] = _oci_lob_byte_size(value, is_clob).to_bytes(4, 'big')
+    locator = _oci_lob_locator_cell(
+        is_clob,
+        national,
+        slot=slot,
+        lob_var=lob_var,
+        byte_size=_oci_lob_byte_size(value, is_clob),
+    )
     return _LOB_CELL_OCI(
         {
             'locator_length': len(locator),
             'has_metadata': _ENCODE_OCI_LOB_12C.get(),
             'size': _lob_value_size(value),
             'chunk_size': _OCI_LOB_CHUNK_SIZE,
-            'locator': bytes(locator),
+            'locator': locator,
         }
     )
 
@@ -11487,13 +11502,9 @@ def encode_lob_read_response_oci(
     trailing status."""
     if total_bytes is None:
         total_bytes = len(content)
-    # The echoed locator, its zero byte ahead of it, as the row cell's carries
-    # it; its byte size is patched to stay consistent with the content.
-    locator = bytearray(
-        b'\x00' + _oci_lob_locator_with_slot(_oci_lob_locator(is_clob, national), slot)
-    )
-    at = _OCI_LOB_TAIL_SIZE_OFF - 1
-    locator[at : at + 4] = total_bytes.to_bytes(4, 'big')
+    # The echoed locator as the row cell carries it, its byte size consistent
+    # with the content.
+    locator = _oci_lob_locator_cell(is_clob, national, slot=slot, byte_size=total_bytes)
     return _LOB_READ_REPLY_OCI(
         {
             'lob_data': _oci_lob_data(content),
