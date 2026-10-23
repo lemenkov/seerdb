@@ -12438,6 +12438,7 @@ def encode_dictionary_fetch(Dictionary: dict) -> bytes:
 # every fv2 path on `field_version < FIELD_VERSION_10_2`.
 # ---------------------------------------------------------------------------
 _O7_CLOSE_FUNC = 0x14  # close cursor
+_O7_FREE_FUNC = 0x08  # free it (#2261)
 
 
 def encode_o7_open(Seq: int) -> bytes:
@@ -12574,6 +12575,8 @@ def encode_o7_parse(
     Binds: list | None = None,
     Batch: list | None = None,
     BatchErrors: bool = False,
+    Cursor: int = 1,
+    Reexecute: bool = False,
 ) -> bytes:
     # Call 1: TTI_ALL7 parse. The SQL is carried inline, sb4-length-prefixed,
     # between two fixed option blocks. With input binds (#100) the option word
@@ -12592,10 +12595,18 @@ def encode_o7_parse(
     Opt = 0x8029 if Binds else 0x8021
     if BatchErrors:
         Opt |= TNS_EXEC_OPTION_BATCH_ERRORS
+    # `Cursor` is the server cursor the call names, the ub4 after the option
+    # word: 1 for every statement seerdb does not cache, which re-parses it,
+    # or the one OOPEN gave a cached statement (#2261). Re-executing that one
+    # clears the parse bit (0x8029 -> 0x8028) and sends no SQL, as ojdbc14's
+    # statement cache does: the server keeps the parse and the defines.
+    if Reexecute:
+        (Opt, SqlBytes) = (Opt & ~0x01, b'')
     Out = (
         bytes([TTI_FUN, TTI_ALL7, Seq])
         + encode_sb4(Opt)
-        + bytes([0x01, 0x01, 0x01])
+        + encode_sb4(Cursor)
+        + bytes([0x00 if Reexecute else 0x01])  # the SQL's pointer
         + encode_sb4(len(SqlBytes))
         + _O7_PARSE_MID
         + _o7_bind_count(Binds)
@@ -12713,8 +12724,22 @@ def encode_o7_exec(Seq: int, Columns: list, Cursor: int = 1) -> bytes:
 
 
 def encode_o7_close(Seq: int, Cursor: int = 1) -> bytes:
-    # Call 4: close the cursor (`Cursor` as for encode_o7_describe, #2246).
+    # Call 4: close the cursor (`Cursor` as for encode_o7_describe, #2246). It
+    # stays parsed: a re-execute by its id still runs it (#2261).
     return bytes([TTI_FUN, _O7_CLOSE_FUNC, Seq]) + encode_sb4(Cursor)
+
+
+def encode_o7_free(Seq: int, Cursor: int) -> bytes:
+    # Free a server cursor (03 08): after it, a re-execute of its id answers
+    # ORA-01001. What a cached cursor gets when it is evicted or flushed (#2261).
+    return bytes([TTI_FUN, _O7_FREE_FUNC, Seq]) + encode_sb4(Cursor)
+
+
+def decode_fv2_opened_cursor(Packet: bytes) -> int:
+    # The id an OOPEN reply hands out: `08 <ub4 id> 09` (#2261).
+    if not Packet or Packet[0] != TTI_RPA:
+        return 0
+    return decode_ub4(Packet[1:])[0]
 
 
 # ---------------------------------------------------------------------------

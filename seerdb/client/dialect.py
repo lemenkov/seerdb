@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from typing import Callable, Protocol
 
+from seerdb.common.sqltext import is_reusable_dml
 from seerdb.common.tns import (
     FV2_BIND_IN,
     FV2_BIND_OUT,
@@ -51,6 +52,7 @@ from seerdb.common.tns import (
     decode_fv2_lob_getlen,
     decode_fv2_lob_value,
     decode_fv2_oer_error,
+    decode_fv2_opened_cursor,
     decode_fv2_opened_locator,
     decode_fv2_warn_flags,
     decode_o8i_bfile_getlen,
@@ -65,6 +67,7 @@ from seerdb.common.tns import (
     encode_o7_close,
     encode_o7_describe,
     encode_o7_exec,
+    encode_o7_free,
     encode_o7_lob_getlen,
     encode_o7_lob_read,
     encode_o7_lobop,
@@ -74,6 +77,8 @@ from seerdb.common.tns import (
     encode_o8i_bfile_getlen,
     encode_o8i_bfile_open,
     encode_tokens_rxd,
+    exec_oac_signature,
+    has_long_class_bind,
     o8i_stmt_type,
 )
 from seerdb.common.tns_consts import (
@@ -140,10 +145,16 @@ class Dialect(Protocol):
     def capabilities(self) -> frozenset[str]: ...
     def execute_query(self, sql: str, bind: list | None, fetch: int): ...
     def execute_dml(
-        self, sql: str, bind: list | None, batch: list | None, batcherrors: bool
+        self,
+        sql: str,
+        bind: list | None,
+        batch: list | None,
+        batcherrors: bool,
+        cache: dict | None,
     ): ...
     def execute_block(self, sql: str, bind: list | None): ...
     def txn_control(self, statement: str): ...  # only when CAP_OWN_TXN is set
+    def flush_cursors(self, cache: dict): ...  # free the cached cursors (#2261)
     def bfile_read(self, locator: bytes): ...
 
 
@@ -160,6 +171,27 @@ CAP_LOB_OBJECT = 'lob_object'
 # The dialect drives its own COMMIT / ROLLBACK (8i has no modern TTI_COMMIT); a
 # dialect without this capability leaves transaction control to the modern path.
 CAP_OWN_TXN = 'own_txn'
+
+
+# The cursor cache's cap, as on 10g+ (OracleConnect._cursor_cache_max).
+_FV2_CURSOR_CACHE_MAX = 32
+
+
+def _fv2_cache_key(
+    sql: str, bind: list | None, batch: list | None, batcherrors: bool
+) -> tuple | None:
+    # A 9i statement's cursor-cache key, or None when it is never cached: as on
+    # 10g+, only a reusable DML without a LONG-class bind (#703, #720), and on
+    # 9i not an array DML, whose re-execute is not captured (#2261).
+    if batch or batcherrors or not is_reusable_dml(sql):
+        return None
+    if has_long_class_bind(bind or [], [], _FV2_MAX_STRING_SIZE):
+        return None
+    return (sql, exec_oac_signature(bind or [], []))
+
+
+# The widest value 9i takes in place: a pre-12c server's 4000 bytes.
+_FV2_MAX_STRING_SIZE = 4000
 
 
 def _is_cursor_var(value: object) -> bool:
@@ -278,6 +310,7 @@ class Fv2Dialect:
         bind: list | None = None,
         batch: list | None = None,
         batcherrors: bool = False,
+        cache: dict | None = None,
     ):
         # 9i DML over TTI_ALL7 (#101): OOPEN, then a single parse that also
         # executes (option 02 80 21) — no describe/fetch. The affected-row count
@@ -285,9 +318,30 @@ class Fv2Dialect:
         # An executemany's further rows ride the same call (#2245), and the
         # count is then the whole batch's. In `batcherrors` mode the server
         # applies the good rows and lists the failures (#2247).
-        yield Send(encode_o7_open(0))
-        yield RECV  # OOPEN RPA
-        yield Send(encode_o7_parse(0, sql, bind, batch, batcherrors))
+        # The connection's cursor cache (#2261), keyed and kept as on 10g+:
+        # DDL flushes it, a cacheable DML is parsed into a cursor of its own
+        # and then re-executed by its id.
+        key = None if cache is None else _fv2_cache_key(sql, bind, batch, batcherrors)
+        if cache is not None and not is_reusable_dml(sql):
+            yield from self.flush_cursors(cache)
+        cursor = cache.get(key, 0) if cache is not None and key is not None else 0
+        if not cursor:
+            yield Send(encode_o7_open(0))
+            resp = yield RECV  # OOPEN RPA, the cursor's id
+            if key is not None:
+                cursor = yield from self._own_cursor(resp)
+        reexecute = cache is not None and key is not None and key in cache
+        yield Send(
+            encode_o7_parse(
+                0,
+                sql,
+                bind,
+                batch,
+                batcherrors,
+                Cursor=cursor or 1,
+                Reexecute=reexecute,
+            )
+        )
         resp = yield RECV
         if resp is False:
             raise Exception('Connection closed during 9i DML')
@@ -300,11 +354,47 @@ class Fv2Dialect:
         rowid = None if err_code else decode_fv2_dml_rowid(resp[1])  # #1079
         batch_errors = decode_fv2_batch_errors(resp[1]) if batcherrors else []
         offset = decode_fv2_error_position(resp[1]) if err_code else 0  # #2263
-        yield Send(encode_o7_close(0))
+        yield Send(encode_o7_close(0, cursor or 1))  # still parsed, if cached
         yield RECV  # close STA
         status: tuple = (0, err_code, 0, (row_count, None), [], message, rowid)
         warnings = decode_fv2_warn_flags(resp[1])  # cursor.warning (#2262)
+        if key is not None and cache is not None:
+            yield from self._keep(cache, key, cursor, failed=bool(err_code))
         return (*status, batch_errors, None, offset, warnings)
+
+    def _own_cursor(self, opened):
+        # A cursor for a statement to cache: the one OOPEN gave, unless that is
+        # 1, which every uncached statement re-parses -- then open another.
+        cursor = decode_fv2_opened_cursor(opened[1]) if opened else 0
+        if cursor == 1:
+            yield Send(encode_o7_open(0))
+            resp = yield RECV
+            cursor = decode_fv2_opened_cursor(resp[1]) if resp else 0
+        return cursor
+
+    def _keep(self, cache: dict, key: tuple, cursor: int, failed: bool):
+        # Remember a cached statement's cursor (LRU, the 10g+ cap), or forget it
+        # if its execute failed: the server has dropped it (#709). An evicted
+        # cursor is freed, so its slot comes back.
+        cache.pop(key, None)
+        if failed or cursor <= 1:
+            return
+        cache[key] = cursor
+        while len(cache) > _FV2_CURSOR_CACHE_MAX:
+            oldest = next(iter(cache))
+            yield from self._free(cache.pop(oldest))
+
+    def flush_cursors(self, cache: dict):
+        # Free every cached cursor: DDL or a PL/SQL block may invalidate them,
+        # and a stale one re-executed reused an old LONG-class value (#720).
+        cursors = list(cache.values())
+        cache.clear()
+        for cursor in cursors:
+            yield from self._free(cursor)
+
+    def _free(self, cursor: int):
+        yield Send(encode_o7_free(0, cursor))
+        yield RECV
 
     def execute_block(self, sql: str, bind: list | None = None):
         # Anonymous PL/SQL block over the fv2 TTI_ALL7 block path (#102, PROTOCOL
@@ -515,6 +605,14 @@ class O8iDialect:
     # dialect serves no LOB object calls (#2259).
     keep_lobs = False
 
+    def flush_cursors(self, cache: dict):
+        # 8i keeps no cursor cache of its own (#2261), and the connection's map
+        # is not this dialect's to clear: emptied before every PL/SQL block, the
+        # 8i suite broke -- a DROP later answered ORA-01403 -- so it is left
+        # exactly as it was.
+        return
+        yield  # unreachable -- makes this a generator, as the protocol has it
+
     def capabilities(self) -> frozenset[str]:
         # 8i does query / DML / PL/SQL / LOB and drives its own COMMIT / ROLLBACK
         # (no modern TTI_COMMIT); no array DML.
@@ -633,6 +731,7 @@ class O8iDialect:
         bind: list | None = None,
         batch: list | None = None,
         batcherrors: bool = False,
+        cache: dict | None = None,
     ):
         # 8i INSERT/UPDATE/DELETE and DDL (#360, §19.12): the same OALL8 as a
         # SELECT but with the statement-type option word and no fetch. The

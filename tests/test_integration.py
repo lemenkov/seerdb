@@ -86,10 +86,6 @@ _FV2_UNSUPPORTED = (
     ('national_attribute', 'object types are not supported on Oracle 9i'),
     ('collection_value', 'object types are not supported on Oracle 9i'),
     ('changepassword', 'changepassword is not supported on Oracle 9i'),
-    ('cache_evicts', 'the cursor cache is a fv4+ feature; 9i re-parses'),
-    ('reuses_cursor', 'the cursor cache is a fv4+ feature; 9i re-parses'),
-    ('forgets_the_cached_cursor', 'the cursor cache is a fv4+ feature; 9i re-parses'),
-    ('never_cached', 'the cursor cache is a fv4+ feature; 9i re-parses'),
     # The 9i test DB is WE8ISO8859P1 (Latin-1). #174 made representable VARCHAR2
     # text round-trip (see test_db_charset_varchar_roundtrip) and full Unicode
     # work through DB_TYPE_NVARCHAR / DB_TYPE_NCHAR (test_national_char_var_bind,
@@ -167,6 +163,10 @@ _8I_UNSUPPORTED = (
     ('refcursor', 'REF CURSOR is not supported on Oracle 8i'),
     ('batcherror', 'executemany (array DML) is not supported on Oracle 8i'),
     ('error_offset', 'the 8i error reply carries no offset (#719)'),
+    ('cache_evicts', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
+    ('reuses_cursor', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
+    ('forgets_the_cached_cursor', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
+    ('never_cached', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
 )
 
 

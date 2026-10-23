@@ -6978,6 +6978,90 @@ class TestFv2WarnFlags(unittest.TestCase):
         self.assertEqual(decode_fv2_warn_flags(insert), 0)
 
 
+class TestFv2CursorCache(unittest.TestCase):
+    """9i's cursor cache (#2261), from ojdbc14 on 9.2.0.4 with its statement
+    cache on: a cached INSERT run twice is parsed once, then re-executed by its
+    cursor with the parse bit cleared (0x8028) and no SQL. `03 14` keeps the
+    cursor parsed and `03 08` frees it. Replies are the captured ones."""
+
+    # ojdbc14's second run of `insert into t2248 (n, v) values (?, ?)`.
+    REEXECUTE = bytes.fromhex(
+        '03470002802801010000000001010701010200000001010201010101000000000006'
+        '010000011600000000011f0101010000020fa000000000011f010703c20202086361'
+        '636865642031'
+    )
+    OOPEN_1 = bytes.fromhex('08010109')
+    OOPEN_2 = bytes.fromhex('08010209')
+    INSERTED = bytes.fromhex(
+        '08010204020447d90004010100000001010002000000000003028b6b01010002b912'
+        '0106000000000101'
+    )
+
+    def test_a_reexecute_is_the_parse_without_its_sql(self):
+        from seerdb.common.tns import encode_o7_parse
+
+        built = encode_o7_parse(
+            0,
+            'insert into t2248 (n, v) values (:1, :2)',
+            [101, 'cached 1'],
+            Cursor=1,
+            Reexecute=True,
+        )
+        # The same up to the bind descriptors, where seerdb declares AL32UTF8
+        # for a str and ojdbc14 the database charset.
+        head = 3 + 3 + 2 + 1 + 1 + 11 + 3 + 9
+        self.assertEqual(built[:head].hex(), self.REEXECUTE[:head].hex())
+        self.assertEqual(built[3:6].hex(), '028028')
+
+    def _drive(self, gen, replies):
+        from seerdb.client.dialect import RECV, Send
+
+        sent = []
+        replies = iter(replies)
+        try:
+            step = next(gen)
+            while True:
+                if isinstance(step, Send):
+                    sent.append(step.data)
+                    step = gen.send(None)
+                else:
+                    self.assertIs(step, RECV)
+                    step = gen.send((6, next(replies)))
+        except StopIteration as done:
+            return (sent, done.value)
+
+    def test_a_cached_dml_is_parsed_once_then_reexecuted_by_its_cursor(self):
+        from seerdb.client.dialect import Fv2Dialect
+        from seerdb.common.tns import encode_o7_close, encode_o7_free
+
+        sql = 'insert into t2248 (n, v) values (:1, :2)'
+        cache: dict = {}
+        # First run: OOPEN gives 1, which uncached statements re-parse, so the
+        # dialect opens another (2) and parses into it.
+        (sent, result) = self._drive(
+            Fv2Dialect().execute_dml(sql, [100, 'cached 0'], cache=cache),
+            [self.OOPEN_1, self.OOPEN_2, self.INSERTED, b'\x09'],
+        )
+        self.assertEqual(result[3][0], 1)
+        self.assertEqual(list(cache.values()), [2])
+        self.assertEqual(sent[2][3:9].hex(), '028029010201')  # parse into 2
+        # Second run: no OOPEN, no SQL, cursor 2.
+        (sent, result) = self._drive(
+            Fv2Dialect().execute_dml(sql, [101, 'cached 1'], cache=cache),
+            [self.INSERTED, b'\x09'],
+        )
+        self.assertEqual(sent[0][3:8].hex(), '0280280102')
+        self.assertNotIn(sql.encode(), sent[0])
+        self.assertEqual(sent[1], encode_o7_close(0, 2))
+        # DDL flushes the cache and frees the cursor.
+        (sent, _) = self._drive(
+            Fv2Dialect().execute_dml('drop table t2248', cache=cache),
+            [b'\x09', self.OOPEN_1, self.INSERTED, b'\x09'],
+        )
+        self.assertEqual(sent[0], encode_o7_free(0, 2))
+        self.assertEqual(cache, {})
+
+
 class TestFv2Bfile(unittest.TestCase):
     """Oracle 9i BFILE read (#102, PROTOCOL §19.8): FILE_OPEN -> GETLEN -> READ
     -> FILE_CLOSE over TTI_LOBOPS, where FILE_OPEN returns an open-flagged

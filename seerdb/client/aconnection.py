@@ -1271,6 +1271,8 @@ class AsyncOracleConnect(_ConnectionLogic):
                     )
                 )
             if Head.startswith('BEGIN') or Head.startswith('DECLARE'):
+                # A block may invalidate the cached cursors, as DDL does (#720).
+                await self._drive(self._dialect.flush_cursors(self._cursor_cache))
                 Result = await self._drive(self._dialect.execute_block(Query, Bind))
             elif ReturnBinds:
                 # Pre-10g DML ... RETURNING (#801) -- see the sync twin.
@@ -1284,7 +1286,9 @@ class AsyncOracleConnect(_ConnectionLogic):
                 Result = returning_block_result(Raw, len(Bind))
             else:  # DML (INSERT/UPDATE/DELETE)
                 Result = await self._drive(
-                    self._dialect.execute_dml(Query, Bind, Batch, BatchErrors)
+                    self._dialect.execute_dml(
+                        Query, Bind, Batch, BatchErrors, self._cursor_cache
+                    )
                 )
             if self.autocommit and pre10_dml_applied(Result, BatchErrors):
                 await self.commit()
