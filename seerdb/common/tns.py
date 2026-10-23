@@ -1158,6 +1158,16 @@ class _ThinCodec:
     read_n1 = read_n4
 
 
+def _oci_fixed(data: bytes, width: int, kind: str) -> bytes:
+    # A fixed-width OCI field's bytes. One past the end of the message raises,
+    # as the schema's big-endian kinds do: read as 0 or "absent", an exhausted
+    # buffer let a count the message did not back decode empty items until the
+    # count -- billions of them, before the password was checked (#2272).
+    if len(data) < width:
+        raise IndexError(f'{kind} past the end of the message')
+    return data[:width]
+
+
 class _OciCodec:
     """The OCI dialect's primitives (#2064), as sqlplus reads them: fixed-width
     little-endian integers, and long values in chunks with a ub1 length."""
@@ -1174,11 +1184,11 @@ class _OciCodec:
 
     @staticmethod
     def read_n4(data: bytes) -> tuple[int, bytes]:
-        return int.from_bytes(data[:4], 'little'), data[4:]
+        return int.from_bytes(_oci_fixed(data, 4, 'n4'), 'little'), data[4:]
 
     @staticmethod
     def read_n2(data: bytes) -> tuple[int, bytes]:
-        return int.from_bytes(data[:2], 'little'), data[2:]
+        return int.from_bytes(_oci_fixed(data, 2, 'n2'), 'little'), data[2:]
 
     @staticmethod
     def value(data: bytes) -> bytes:
@@ -1238,7 +1248,9 @@ class _OciCodec:
 
     @staticmethod
     def read_scale(data: bytes) -> tuple[int, bytes]:
-        return int.from_bytes(data[:1], 'big', signed=True), data[1:]
+        return int.from_bytes(_oci_fixed(data, 1, 'scale'), 'big', signed=True), data[
+            1:
+        ]
 
     @staticmethod
     def _chunked(data: bytes, size: int | None = None) -> bytes:
@@ -1278,7 +1290,7 @@ class _OciCodec:
 
     @staticmethod
     def read_ptr(data: bytes) -> tuple[bool, bytes]:
-        return oci.pointer_present(data[:8]), data[8:]
+        return oci.pointer_present(_oci_fixed(data, 8, 'ptr')), data[8:]
 
     wn4 = n4
     read_wn4 = read_n4
@@ -1289,7 +1301,7 @@ class _OciCodec:
 
     @staticmethod
     def read_n8(data: bytes) -> tuple[int, bytes]:
-        return int.from_bytes(data[:8], 'little'), data[8:]
+        return int.from_bytes(_oci_fixed(data, 8, 'n8'), 'little'), data[8:]
 
     @staticmethod
     def n1(value: int) -> bytes:
@@ -1312,7 +1324,7 @@ class _OciWideCodec(_OciCodec):
 
     @staticmethod
     def read_wn4(data: bytes) -> tuple[int, bytes]:
-        return int.from_bytes(data[:8], 'little'), data[8:]
+        return int.from_bytes(_oci_fixed(data, 8, 'wn4'), 'little'), data[8:]
 
 
 _THIN = _ThinCodec()
@@ -3505,7 +3517,10 @@ def _oci_lobops_read(body: bytes) -> dict[str, Any] | None:
         (decode, header) = (_LOBOPS_READ_FROM_OCI_WIDE, _OCI_LOBOPS_WIDE_HEADER)
     if len(body) < header:
         return None
-    (read, _rest) = decode(body)
+    try:
+        (read, _rest) = decode(body)
+    except IndexError:
+        return None  # its amount, or its locator, runs past the end (#2272)
     if len(body) < header + read['source_length'] + 8:
         return None
     return read
