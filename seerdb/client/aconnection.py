@@ -34,6 +34,8 @@ from seerdb.client._conn_logic import (
     _ConnectionLogic,
     _pre10_tier_name_for,
     _transaction_priority,
+    dialect_lob_objects,
+    fv2_lob_payload,
     pre10_dml_applied,
     refuse_pre10_batch,
     returning_block_error,
@@ -1248,6 +1250,8 @@ class AsyncOracleConnect(_ConnectionLogic):
         if self._dialect is not None:
             from seerdb.client.connection import _check_fv2_bind_sizes
 
+            # Whether the fetch keeps LOB objects or reads their content (#2259).
+            self._dialect.keep_lobs = self.fetch_lobs
             if ParseOnly:
                 # No parse-without-execute shape exists on these tiers -- see
                 # the sync twin.
@@ -1684,11 +1688,18 @@ class AsyncOracleConnect(_ConnectionLogic):
         prefixed: bool = False,
         offset: int = 1,
         amount: int | None = None,
+        charset: int | None = None,
     ) -> str | bytes:
         """Async port of the sync `lob_read`. See its docstring for
         the wire format we walk through. `prefixed` opts into the
         ub2-length-prefixed locator form required for temp LOBs (#91);
         `offset` / `amount` select a slice (#964)."""
+        if dialect_lob_objects(self._dialect):
+            # 9i reads through its own LOBOPS form (#2259); see the sync twin.
+            from seerdb.common.types import decode_fv2_lob
+
+            Content = await self._drive(self._dialect.lob_read(Locator, offset, amount))
+            return decode_fv2_lob(DataType, cast(bytes, Content), charset or 0)
         from seerdb.common.tns_consts import TNS_TYPE_CLOB
 
         Extra: dict = {'source_offset': offset}
@@ -2135,12 +2146,25 @@ class AsyncOracleConnect(_ConnectionLogic):
         Data: str | bytes,
         is_blob: bool = False,
         offset: int = 1,
+        charset: int | None = None,
     ) -> bytes | None:
         """Async port of the sync :meth:`lob_write` (#964)."""
         from typing import cast
 
         from seerdb.common.tns import decode_lobops_locator
         from seerdb.common.tns_consts import TNS_LOB_OP_WRITE
+
+        if dialect_lob_objects(self._dialect):
+            (Bytes, Amount) = fv2_lob_payload(Data, is_blob, charset)
+            (_, Updated) = cast(
+                tuple,
+                await self._drive(
+                    self._dialect.lob_operation(
+                        Locator, TNS_LOB_OP_WRITE, Amount, offset, Bytes
+                    )
+                ),
+            )
+            return cast('bytes | None', Updated)
 
         Payload = Data if is_blob else cast(str, Data).encode('utf-16-be')
         Dict = self._make_dict(
@@ -2163,6 +2187,14 @@ class AsyncOracleConnect(_ConnectionLogic):
     ) -> tuple[int | None, bytes | None]:
         """Async port of the sync :meth:`lob_operation` (#964): one
         value-returning TTI_LOBOPS operation, returning its ``ub4``."""
+        if dialect_lob_objects(self._dialect):
+            # 9i's own LOBOPS form (#2259).
+            return cast(
+                'tuple[int | None, bytes | None]',
+                await self._drive(
+                    self._dialect.lob_operation(Locator, Operation, Amount)
+                ),
+            )
         if self.field_version < FIELD_VERSION_10_2:
             # This is the 10g+ LOBOPS form, which 8i and 9i do not take; a BFILE
             # fetched there is a LOB now, so fileexists() reaches here (#1103).

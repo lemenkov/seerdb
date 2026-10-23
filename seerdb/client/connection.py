@@ -19,6 +19,8 @@ from seerdb.client._conn_logic import (
     _ConnectionLogic,
     _pre10_tier_name_for,
     _transaction_priority,
+    dialect_lob_objects,
+    fv2_lob_payload,
     pre10_dml_applied,
     refuse_pre10_batch,
     returning_block_error,
@@ -2023,6 +2025,8 @@ class OracleConnect(_ConnectionLogic):
         # driven by _drive; the connection is a thin orchestrator (#369). Neither
         # tier carries an autocommit bit, so commit is explicit.
         if self._dialect is not None:
+            # Whether the fetch keeps LOB objects or reads their content (#2259).
+            self._dialect.keep_lobs = self.fetch_lobs
             if ParseOnly:
                 # The pre-10g dialects build their own request (TTI_ALL7 / the
                 # 8i OALL8), and both hard-wire PARSE|EXECUTE — there is no
@@ -2457,6 +2461,7 @@ class OracleConnect(_ConnectionLogic):
         prefixed: bool = False,
         offset: int = 1,
         amount: int | None = None,
+        charset: int | None = None,
     ) -> str | bytes:
         # Send TTI_LOBOPS READ for the given locator and decode the response.
         # The response carries:
@@ -2468,6 +2473,13 @@ class OracleConnect(_ConnectionLogic):
         #
         # CLOB / NCLOB content is sent as UTF-16BE on the wire; BLOB / BFILE
         # is raw bytes. We decode CLOB to `str` and surface BLOB as `bytes`.
+        if dialect_lob_objects(self._dialect):
+            # 9i reads through its own LOBOPS form, CLOB text in the column's
+            # database charset (#2259).
+            from seerdb.common.types import decode_fv2_lob
+
+            Content = self._drive(self._dialect.lob_read(Locator, offset, amount))
+            return decode_fv2_lob(DataType, cast(bytes, Content), charset or 0)
         from seerdb.common.tns_consts import TNS_TYPE_CLOB
 
         Extra: dict = {'source_offset': offset}
@@ -2902,6 +2914,7 @@ class OracleConnect(_ConnectionLogic):
         Data: str | bytes,
         is_blob: bool = False,
         offset: int = 1,
+        charset: int | None = None,
     ) -> bytes | None:
         """Write into a persistent LOB at ``offset`` (1-based), the write half
         of the LOB object (#964). Returns the UPDATED locator.
@@ -2910,6 +2923,18 @@ class OracleConnect(_ConnectionLogic):
         ``SELECT ... FOR UPDATE`` in an open transaction answers ORA-22920."""
         from seerdb.common.tns import decode_lobops_locator
         from seerdb.common.tns_consts import TNS_LOB_OP_WRITE
+
+        if dialect_lob_objects(self._dialect):
+            (Bytes, Amount) = fv2_lob_payload(Data, is_blob, charset)
+            (_, Updated) = cast(
+                tuple,
+                self._drive(
+                    self._dialect.lob_operation(
+                        Locator, TNS_LOB_OP_WRITE, Amount, offset, Bytes
+                    )
+                ),
+            )
+            return cast('bytes | None', Updated)
 
         Payload = Data if is_blob else cast(str, Data).encode('utf-16-be')
         Dict = self._make_dict(
@@ -2968,6 +2993,12 @@ class OracleConnect(_ConnectionLogic):
         ORA-22289 on a second close, ORA-22920 when the row was never locked --
         so those reach the caller as ordinary errors (#964).
         """
+        if dialect_lob_objects(self._dialect):
+            # 9i's own LOBOPS form (#2259).
+            return cast(
+                'tuple[int | None, bytes | None]',
+                self._drive(self._dialect.lob_operation(Locator, Operation, Amount)),
+            )
         if self.field_version < FIELD_VERSION_10_2:
             # This is the 10g+ LOBOPS form, which 8i and 9i do not take; a BFILE
             # fetched there is a LOB now, so fileexists() reaches here (#1103).
