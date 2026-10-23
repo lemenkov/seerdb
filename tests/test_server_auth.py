@@ -314,6 +314,20 @@ def test_parse_auth_response_oci_recovers_the_secrets() -> None:
     assert len(password) == 32  # AUTH_PASSWORD proof, 64 hex on the wire
 
 
+def test_an_oci_pair_count_is_a_ub4_whatever_follows_it() -> None:
+    # The count's slot is eight bytes and the client sets only the low four:
+    # 10.2 leaves address bytes above them, 11.2 whatever its buffer held. Read
+    # as a ub8 they made a count in the billions and a login that never
+    # finished (#2249).
+    from seerdb.common.tns import decode_auth_oci_head
+    from seerdb.server.auth import parse_auth_response_oci
+
+    assert decode_auth_oci_head(_OCI_OSESSKEY_10_2)['pair_count'] == 5
+    unset = _OCI_AUTH_SEEDED[:31] + bytes.fromhex('b55f389e') + _OCI_AUTH_SEEDED[35:]
+    assert decode_auth_oci_head(unset)['pair_count'] == 18
+    assert parse_auth_response_oci(unset) == parse_auth_response_oci(_OCI_AUTH_SEEDED)
+
+
 def test_server_proof_oci_is_the_48_byte_deadbeef_form() -> None:
     from seerdb.server.auth import server_proof_oci
 

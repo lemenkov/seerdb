@@ -1635,9 +1635,12 @@ _LOB_READ_REPLY: wire_schema.Schema = (
 # A login's OSESSKEY or AUTH request (TTI_SESS 118 / TTI_AUTH 115, #2064): a
 # pointer, the user's length, the mode, a pointer, the pair count, two
 # pointers, the user, then the key-value pairs. sqlplus 10.2 and 11.2 send
-# thin's fields with 8-byte pointers, ub4 lengths and a ub8 count, declaring
-# each length at three times the character count, a conversion buffer's worth;
-# the value behind it carries the real one (#265, #1764). Not on the wire, so
+# thin's fields with 8-byte pointers and ub4 lengths, declaring each length at
+# three times the character count, a conversion buffer's worth; the value
+# behind it carries the real one (#265, #1764). Their count is a ub4 in a ub8's
+# slot, and its upper four bytes are left unset: 10.2 writes address bytes
+# there and 11.2 whatever its buffer held, so they are skipped, never read as
+# part of the count (#2249). Not on the wire, so
 # given to the decoder: whether a 23ai OAUTH carries its has-user pointer (thin
 # only, detected by its first byte), and whether the user is length-prefixed
 # (thin from 12.1, OCI always) or raw.
@@ -1657,7 +1660,8 @@ _AUTH_HEAD: wire_schema.Schema = (
     ('n4', 'user_length'),
     ('n4', 'mode'),
     ('ptr', 'pointer_2'),
-    ('n8', 'pair_count'),
+    ('only', 'thin', (('n8', 'pair_count'),)),
+    ('only', 'oci', (('n4', 'pair_count'), ('pad', 4))),
     ('ptr', 'pointer_3'),
     ('ptr', 'pointer_4'),
     ('when', 'user_prefixed', (('value', 'user'),)),
