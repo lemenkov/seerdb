@@ -616,14 +616,16 @@ def _nego_cache_del(key: tuple[str, int, str]) -> None:
         _NEGOTIATION_CACHE.pop(key, None)
 
 
-# Oracle 9i (fv2 / TTI_ALL7) binds a value inline with no piecewise LONG/LOB
-# send protocol, so a bind can be no larger than the SQL inline limits: 2000
-# bytes for RAW (a `bytes` value) and 4000 bytes for VARCHAR2 (a `str` value).
-# Past those, the 9i server either closes the connection mid-DML (BLOB target,
-# leaving a zombie lock — #168/#169), raises ORA-00600 (CLOB), or ORA-01461.
-# Reject such binds up front with a clean NotSupportedError so the connection
-# survives and stays usable. (Streamed large LOB/LONG binds exist only on the
-# fv4+ path.)
+# Oracle 9i (fv2 / TTI_ALL7) binds a value inline, so a plain `str` / `bytes`
+# bind can be no larger than the SQL inline limits: 2000 bytes for RAW and
+# 4000 for VARCHAR2. Past those, into a LOB column the 9i server closes the
+# connection mid-DML (leaving a zombie lock -- #168/#169) or raises ORA-00600,
+# and ojdbc14, 9.2's own thin driver, refuses such a value too or has the
+# server reset it the same way when streamed (#2260). Into a LONG / LONG RAW
+# column a large value works when it is declared so (a DB_TYPE_LONG /
+# DB_TYPE_LONG_RAW Var, which this check does not see): it goes inline as a
+# LONG-class bind. The driver cannot tell the column type from the SQL, so an
+# undeclared value past the limits is refused up front, naming both routes.
 _FV2_MAX_RAW_BIND = 2000
 _FV2_MAX_VARCHAR_BIND = 4000
 
@@ -644,15 +646,17 @@ def _check_fv2_bind_sizes(Bind, Batch=None) -> None:
                 if len(Value) > _FV2_MAX_RAW_BIND:
                     raise NotSupportedError(
                         f'Oracle 9i cannot bind a bytes value larger than '
-                        f'{_FV2_MAX_RAW_BIND} bytes (got {len(Value)}); 9i has '
-                        f'no streamed LOB/LONG bind path'
+                        f'{_FV2_MAX_RAW_BIND} bytes (got {len(Value)}): declare a '
+                        f"LONG RAW column's value DB_TYPE_LONG_RAW, and write a "
+                        f'BLOB through its locator (#2260)'
                     )
             elif isinstance(Value, str):
                 if len(Value.encode('utf-8')) > _FV2_MAX_VARCHAR_BIND:
                     raise NotSupportedError(
                         f'Oracle 9i cannot bind a str value larger than '
-                        f'{_FV2_MAX_VARCHAR_BIND} bytes (utf-8); 9i has no '
-                        f'streamed LOB/LONG bind path'
+                        f'{_FV2_MAX_VARCHAR_BIND} bytes (utf-8): declare a LONG '
+                        f"column's value DB_TYPE_LONG, and write a CLOB through "
+                        f'its locator (#2260)'
                     )
 
 

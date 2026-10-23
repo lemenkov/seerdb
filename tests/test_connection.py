@@ -330,11 +330,12 @@ class TestShardingRejected(unittest.TestCase):
 
 
 class TestFv2BindSizeGate(unittest.TestCase):
-    # 9i (fv2) has no streamed LOB/LONG bind path, so a bind is capped at the
-    # SQL inline limits: 2000 bytes (RAW) / 4000 bytes (VARCHAR2). Past those the
-    # 9i server kills the connection (BLOB) or errors; reject up front so the
-    # connection survives (#168/#169). Verified live on 9i in the integration
-    # suite; this guards the limits + boundary offline.
+    # 9i (fv2) caps a plain str / bytes bind at the SQL inline limits: 2000
+    # bytes (RAW) / 4000 bytes (VARCHAR2). Past those, into a LOB column the 9i
+    # server kills the connection or errors, as it does for ojdbc14 (#2260);
+    # reject up front so the connection survives (#168/#169). A declared LONG
+    # Var is not capped. Verified live on 9i; this guards the limits + boundary
+    # offline.
     def test_bytes_within_cap_ok(self):
         _check_fv2_bind_sizes([b'x' * _FV2_MAX_RAW_BIND])  # exactly 2000
 
@@ -348,6 +349,24 @@ class TestFv2BindSizeGate(unittest.TestCase):
     def test_str_over_cap_raises(self):
         with self.assertRaises(NotSupportedError):
             _check_fv2_bind_sizes(['x' * (_FV2_MAX_VARCHAR_BIND + 1)])
+
+    def test_the_refusal_names_both_routes(self):
+        # A LONG column takes the value declared DB_TYPE_LONG; a LOB column
+        # through its locator (#2260).
+        with self.assertRaises(NotSupportedError) as raised:
+            _check_fv2_bind_sizes(['x' * (_FV2_MAX_VARCHAR_BIND + 1)])
+        self.assertIn('DB_TYPE_LONG', str(raised.exception))
+        self.assertIn('locator', str(raised.exception))
+        with self.assertRaises(NotSupportedError) as raised:
+            _check_fv2_bind_sizes([b'x' * (_FV2_MAX_RAW_BIND + 1)])
+        self.assertIn('DB_TYPE_LONG_RAW', str(raised.exception))
+
+    def test_a_declared_long_var_is_not_capped(self):
+        import seerdb.common.datatypes as dt
+
+        v = dt.Var(dt.DB_TYPE_LONG, 50000)
+        v.setvalue(0, 'q' * 50000)
+        _check_fv2_bind_sizes([v])  # the server takes it inline
 
     def test_str_counts_utf8_bytes_not_chars(self):
         # A multibyte char string under 4000 chars can exceed 4000 utf-8 bytes.
