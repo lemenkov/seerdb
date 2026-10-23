@@ -506,3 +506,25 @@ def test_an_oci_describe_reads_back_by_its_own_schema(version: int) -> None:
     assert back[0]['charset'] == 873
     assert back[1]['type_name'] == b'XMLTYPE'
     assert (back[2]['precision'], back[2]['scale']) == (5, -127)
+
+
+@pytest.mark.parametrize('version', (6, 7, 24))
+def test_an_oci_oer_decodes_back_at_each_width(version: int) -> None:
+    # The OCI OER every status ends on: 136 bytes to 11g, 144 from 12.1, which
+    # repeats the error number and adds the row count (#1282, #2064).
+    with _field_version(version):
+        oer = tns.encode_oci_oer(5, sequence=0x1234, error_code=942, rowcount=9)
+    wide = version >= 7
+    assert len(oer) == (144 if wide else 136)
+    (fields, rest) = tns._OCI_OER_FROM_OCI(
+        oer, {'oci_12c': wide, 'oci_pre12c': not wide}
+    )
+    assert rest == b''
+    assert (fields['status'], fields['sequence'], fields['error_code']) == (
+        5,
+        0x1234,
+        942,
+    )
+    assert fields['marker'] == bytes.fromhex('20f6310a')
+    if wide:
+        assert (fields['ext_error_code'], fields['rowcount']) == (942, 9)

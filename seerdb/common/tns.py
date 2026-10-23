@@ -5017,18 +5017,15 @@ def encode_kod_reply(records: list[KodRecord], *, sequence: int) -> bytes:
     Two of the OER's bytes follow the band: the row kind (offset 8) and offset
     52 are 1 from a live 11g and 0 from a live 18c."""
     wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
-    oer = bytearray(
-        encode_oci_oer(
-            oci.OCI_OER_STATUS_SUCCESS,
-            sequence=sequence,
-            row_kind=oci.OCI_OER_ROW_KIND_NONE if wide else oci.OCI_OER_ROW_KIND_LOB,
-            command_type=0,
-            category=0,
-        )
+    oer = encode_oci_oer(
+        oci.OCI_OER_STATUS_SUCCESS,
+        sequence=sequence,
+        row_kind=oci.OCI_OER_ROW_KIND_NONE if wide else oci.OCI_OER_ROW_KIND_LOB,
+        command_type=0,
+        category=0,
+        unpinned_52=0 if wide else 1,
     )
-    if wide:
-        oer[_OCI_OER_LOGIN_REFUSAL_ZERO] = 0
-    return b''.join(_kod_record(r) for r in records) + bytes(oer)
+    return b''.join(_kod_record(r) for r in records) + oer
 
 
 # SYS.KOTTD's description of itself, the answer to every client that has just
@@ -5229,33 +5226,26 @@ def strip_oci_piggyback(body: bytes) -> bytes:
 _OCI_END_OF_FETCH_MSG = b'ORA-01403: no data found\n'
 
 
-_OCI_FETCH_CONST_OFF = 73
-
-
 # The OCI end-of-fetch terminator sqlplus reads after the execute's rows: an OER
 # carrying ORA-01403 ("no data found"), which the client treats as "cursor
 # drained" rather than an error (the thin path keeps the same thing as its
-# captured _END_OF_FETCH). Reduced to structure by live bisection (#265): a
-# 24-byte OER header (call status + the 1403 code) and one instance constant,
-# the rest zero, then the message computed.
-_OCI_FETCH_OER_LEN = 136
-
-
+# captured _END_OF_FETCH). Reduced to structure by live bisection (#265): the
+# row statuses' OER with the 1403 code and the 11g marker, then the message.
 def encode_fetch_terminator_oci(sequence: int, *, rowcount: int = 0) -> bytes:
     """The sqlplus / thick-OCI end-of-fetch reply (ORA-01403 = cursor drained).
 
     ``rowcount`` is the rows the cursor delivered in all, which the 12c band's
     OER carries (#1282)."""
-    header = _oci_fetch_oer_header(sequence)
-    oer = bytearray(_OCI_FETCH_OER_LEN)
-    oer[0 : len(header)] = header
-    off = _OCI_FETCH_CONST_OFF
-    oer[off : off + len(_OCI_FETCH_CONST)] = _OCI_FETCH_CONST
-    return (
-        _oci_oer_tail(bytes(oer), error_code=ORA_NO_DATA_FOUND, rowcount=rowcount)
-        + bytes([len(_OCI_END_OF_FETCH_MSG)])
-        + _OCI_END_OF_FETCH_MSG
+    oer = _oci_oer(
+        {
+            **_OCI_OER_ROWS,
+            'sequence': sequence,
+            'error_code': ORA_NO_DATA_FOUND,
+            'marker': b'\x00' + _OCI_OER_MARKER[1:],
+            'rowcount': rowcount,
+        }
     )
+    return oer + bytes([len(_OCI_END_OF_FETCH_MSG)]) + _OCI_END_OF_FETCH_MSG
 
 
 # On the wire the auth-result values (session key, salt, proof) are
@@ -8674,75 +8664,98 @@ def _oci_version_trailer(release: int) -> bytes:
 _OCI_DCB_MARKER = bytes.fromhex('060122')
 
 
-# The compact 24-byte OCI OER token — the short form of _OCI_OER_ENVELOPE (§36)
-# used by the simple exec / fetch-terminator / no-row status replies. Same
-# logical fields as the envelope (status success at 1, sequence ub2 at 5,
-# error_code ub4 at 12, statement category at 18, V$SQL command type at 22),
-# packed into 24 bytes; offsets 7 and 8 are the constant 0x01.
-_OCI_OER_SHORT = bytes.fromhex('040100000000000101000000000000000000000000000000')
-
-
-def _oci_oer_short(
-    *, sequence: int, command_type: int, category: int, error_code: int = 0
-) -> bytes:
-    oer = bytearray(_OCI_OER_SHORT)
-    struct.pack_into('<H', oer, 5, sequence)
-    struct.pack_into('<I', oer, 12, error_code)
-    # FIXME: `category` at offset 18 (2 = row/value-producing, 1 = no-row) is the
-    # same murky field as the envelope's offset 18; carried from the capture.
-    oer[18] = category
-    oer[22] = command_type
-    return bytes(oer)
-
-
-def _oci_exec_oer(sequence: int) -> bytes:
-    # A SELECT execute's return status, wrapped in the exec-reply's zero padding.
-    # ``sequence`` is the live per-session OER end-to-end counter (§36).
-    return (
-        b'\x00\x00\x00'
-        + _oci_oer_short(sequence=sequence, command_type=oci.OCI_CMD_SELECT, category=2)
-        + b'\x00' * 6
-    )
-
-
-# The 136-byte OCI OER return-status token, reverse-engineered against live 11g
-# (docs/PROTOCOL.md §36). All three of the Mirror's OER status trailers — the
-# error OER, the LONG-row fetch status, and the LOB-row fetch status — are this
-# one envelope differing only in a handful of named fields, so build them rather
-# than storing three near-identical blobs. The bulk (SCN/rowid/instance region,
-# the 0x20f6310a marker at offset 72) is the same fixed frame; the fields below
-# vary. Differential capture settled the once-mysterious fields (sqlplus through
-# tools/capture_proxy.py against 11g, 21c and 23ai, 2026-09-07): the offset-56
-# ub2 0x0136 (310) and the offset-72 0x20f6310a marker are FIXED 11g OER-trailer
-# constants — byte-identical across every 11g reply (SELECT / DML / DDL / fetch)
-# and ABSENT from 21c / 23ai, which replace the whole trailer with a different
-# one. So 310 is NOT the negotiated TTC protocol version (the earlier guess): it
-# does not track the server, it is an 11g-format constant, correctly carried.
-# Offsets 7 and 52 (both 0x01) are likewise fixed 11g constants. See §36.1.
-_OCI_OER_ENVELOPE = bytes.fromhex(
-    '04000000000000010000000000000000000002000000030000000000000000000000'
-    '00000000000000000000000000000000000001000000360100000000000000000000'
-    '0000000020f6310a0000000000000000000000000000000000000000000000000000'
-    '00000000000000000000000000000000000000000000000000000000000000000000'
+# The OCI OER return-status token (§36), reverse-engineered against live 11g:
+# 136 bytes to 11g, 144 from the 12c band, which repeats the error number at
+# offset 132 and adds a ub8 row count -- the fields a 12.1+ thin OER adds too,
+# captured from 18c for every reply kind (#1282). Every OCI status ends on one.
+# Its fields are fixed-width; one whose meaning is unpinned is named for its
+# offset and carries the value each reply was captured with (§36.1).
+#
+# Differential capture (sqlplus through tools/capture_proxy.py against 11g, 21c
+# and 23ai, 2026-09-07) settled two of them: the offset-56 ub2 0x0136 (310) and
+# the offset-72 `20 f6 31 0a` marker are fixed 11g OER constants, byte-identical
+# across every 11g reply (SELECT / DML / DDL / fetch) and absent from 21c and
+# 23ai, which replace the whole trailer with a different one. So 310 is not the
+# negotiated TTC protocol version (the earlier guess) (§39.2). The end-of-fetch
+# OER carries the marker without its 0x20, and the row statuses neither.
+_OCI_OER: wire_schema.Schema = (
+    ('const', b'\x04'),
+    ('u8', 'status'),  # SUCCESS 0x01, ERROR 0x05; 2 on a DML
+    ('pad', 3),
+    ('n2', 'sequence'),  # the end-to-end sequence
+    ('const', b'\x01'),
+    # 1 on a LOB / LONG-row status, 2 on a LONG; a DML carries its row count.
+    ('n4', 'row_kind'),
+    ('n4', 'error_code'),
+    ('pad', 2),
+    ('u8', 'category'),  # 2 row/value-producing, 1 DDL, 0 none
+    ('pad', 1),
+    ('u8', 'error_pos'),  # the column sqlplus draws its caret under
+    ('pad', 1),
+    ('u8', 'command_type'),  # the V$SQL command type
+    ('pad', 4),
+    ('u8', 'warn_flags'),  # 0x21: a PL/SQL object compiled with errors
+    ('bytes', 'rowid', 13),  # a DML's touched row
+    ('pad', 8),
+    ('n2', 'call_sequence'),  # the answered call's own sequence
+    ('pad', 1),
+    ('u8', 'unpinned_52'),
+    ('pad', 3),
+    ('n2', 'unpinned_56'),
+    ('pad', 14),
+    ('bytes', 'marker', 4),
+    ('pad', 4),
+    ('u8', 'unpinned_80'),
+    ('pad', 51),
+    ('when', 'oci_12c', (('n4', 'ext_error_code'), ('n8', 'rowcount'))),
+    ('when', 'oci_pre12c', (('pad', 4),)),
 )
+_OCI_OER_OCI = wire_schema.compile_encoder(_OCI_OER, _OCI)
+_OCI_OER_FROM_OCI = wire_schema.compile_decoder(_OCI_OER, _OCI)
+_OCI_OER_MARKER = bytes.fromhex('20f6310a')
+# A statement's OER as a live 11g sends it: SELECT, with the 11g constants.
+_OCI_OER_STATEMENT = {
+    'status': 0,
+    'sequence': 0,
+    'row_kind': oci.OCI_OER_ROW_KIND_NONE,
+    'error_code': 0,
+    'category': 2,
+    'error_pos': 0,
+    'command_type': oci.OCI_CMD_SELECT,
+    'warn_flags': 0,
+    'rowid': bytes(13),
+    'call_sequence': 0,
+    'unpinned_52': 1,
+    'unpinned_56': 0x0136,
+    'marker': _OCI_OER_MARKER,
+    'unpinned_80': 0,
+    'rowcount': 0,
+}
+# The row statuses' and the end-of-fetch OER: a success over one row and
+# nothing behind it, reduced to that by live bisection (#265).
+_OCI_OER_ROWS = {
+    **_OCI_OER_STATEMENT,
+    'status': 1,
+    'row_kind': oci.OCI_OER_ROW_KIND_LOB,
+    'unpinned_52': 0,
+    'unpinned_56': 0,
+    'marker': bytes(4),
+}
 
 
-# From the 12c band the OCI OER is 144 bytes, not 136: the same frame, with the
-# error number repeated at offset 132 (the extended error number) and a ub8 row
-# count after it. Both are the fields a 12.1+ thin OER adds too. Captured from
-# 18c for every reply kind (#1282): 1403 there at the end of a fetch and 942 on
-# a failed parse; the row count is the rows fetched so far, or the rows a DML
-# statement touched.
-_OCI_OER_EXT_ERROR_OFF = 132
-
-
-def _oci_oer_tail(oer: bytes, *, error_code: int = 0, rowcount: int = 0) -> bytes:
-    """Widen a 136-byte OCI OER to the band the session speaks (#1282)."""
-    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_12_1:
-        return oer
-    out = bytearray(oer)
-    struct.pack_into('<I', out, _OCI_OER_EXT_ERROR_OFF, error_code)
-    return bytes(out) + struct.pack('<Q', rowcount)
+def _oci_oer(fields: dict, *, wide: bool | None = None) -> bytes:
+    """An OCI OER (_OCI_OER) from ``fields``, in the band the session speaks
+    unless ``wide`` says which."""
+    if wide is None:
+        wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+    return _OCI_OER_OCI(
+        {
+            **fields,
+            'ext_error_code': fields['error_code'],
+            'oci_12c': wide,
+            'oci_pre12c': not wide,
+        }
+    )
 
 
 def encode_oci_oer(
@@ -8755,15 +8768,15 @@ def encode_oci_oer(
     command_type: int = oci.OCI_CMD_SELECT,
     category: int | None = None,
     rowcount: int = 0,
+    warn_flags: int = 0,
+    unpinned_52: int = 1,
 ) -> bytes:
-    """Build a 136-byte OCI OER return-status token (§36) over
-    :data:`_OCI_OER_ENVELOPE`. ``status`` is SUCCESS (0x01) or ERROR (0x05);
-    ``row_kind`` marks a LOB/LONG-row status; ``error_pos`` and ``error_code``
-    (ub4 LE at offset 12) carry an ORA error; ``command_type`` is the V$SQL
-    command type at offset 22 (SELECT by default — the envelope's value).
-    ``sequence`` is the OER's **end-to-end sequence number** (a ub2 LE at offset
-    5); its echo (ub2 LE at offset 49) is ``sequence + 2`` for the row/return
-    statuses. The caller appends the ``ORA-…`` message DALC for the error case.
+    """A statement's OCI OER return-status token (§36, _OCI_OER). ``status`` is
+    SUCCESS (0x01) or ERROR (0x05); ``row_kind`` marks a LOB/LONG-row status;
+    ``error_pos`` and ``error_code`` carry an ORA error; ``command_type`` is the
+    V$SQL command type (SELECT by default). ``sequence`` is the OER's
+    **end-to-end sequence number**. The caller appends the ``ORA-…`` message
+    DALC for the error case.
 
     The field is a diagnostic/tracing counter, not a protocol-correctness field:
     both reference clients (thin and thick) read it and discard it — never
@@ -8771,79 +8784,68 @@ def encode_oci_oer(
     per-session counter (:class:`~seerdb.server.session._OciSequence`) so its
     replies look like a live server's rather than emitting the frozen value each
     status was captured with; the start/step is Mirror policy (§36.1)."""
-    oer = bytearray(_OCI_OER_ENVELOPE)
-    oer[1] = status
-    struct.pack_into('<H', oer, 5, sequence)
-    oer[8] = row_kind
-    # The OCI frame's error-position field is a single byte; clamp a larger
-    # parse offset rather than overflow the assignment (the caret then lands at
-    # the last column it can express).
-    oer[20] = min(max(error_pos, 0), 0xFF)
-    oer[22] = command_type
-    if category is not None:
-        # The statement-category byte (offset 18; 2 row/value-producing, 1 DDL,
-        # 0 on the DESCRIBE status). Left at the envelope's value when not given.
-        oer[18] = category
-    # Offset 49 carries the sequence of the CALL being answered, not an echo of
-    # the counter above: the client's own `03 <func> <seq>` byte, published by
-    # the OCI session loop (§36.1). Decoded across every reply kind in one live
-    # 11g session and confirmed on 10g; `sequence + 2` was a coincidence of the
-    # early-session captures it was read off, where the two counters had not yet
-    # diverged.
-    struct.pack_into('<H', oer, 49, _ENCODE_OCI_CALL_SEQ.get())
-    struct.pack_into('<I', oer, 12, error_code)
-    return _oci_oer_tail(bytes(oer), error_code=error_code, rowcount=rowcount)
+    fields = {
+        **_OCI_OER_STATEMENT,
+        'status': status,
+        'sequence': sequence,
+        'row_kind': row_kind,
+        # The error position is a single byte; a larger parse offset is clamped
+        # rather than overflowing it (the caret then lands at the last column
+        # it can express).
+        'error_pos': min(max(error_pos, 0), 0xFF),
+        'error_code': error_code,
+        'command_type': command_type,
+        # The statement category; 2 when not given.
+        'category': 2 if category is None else category,
+        # The sequence of the CALL being answered, not an echo of the counter
+        # above: the client's own `03 <func> <seq>` byte, published by the OCI
+        # session loop (§36.1). Decoded across every reply kind in one live 11g
+        # session and confirmed on 10g; `sequence + 2` was a coincidence of the
+        # early-session captures it was read off, where the two counters had not
+        # yet diverged.
+        'call_sequence': _ENCODE_OCI_CALL_SEQ.get(),
+        'rowcount': rowcount,
+        'warn_flags': warn_flags,
+        'unpinned_52': unpinned_52,
+    }
+    return _oci_oer(fields)
 
 
 # The 35-byte `08 06` OCI exec-status frame preamble, shared by the describe /
-# outbind / DDL / DML statuses. It is all zero (the Mirror has no live
-# per-statement session counters) but for the header, a ub2-LE **cursor id** at
-# offset 4 (the DDL / DML statuses carry a live cursor id here; the describe /
-# outbind status carries none), and two small marker bytes whose values track the
-# statement kind but whose exact meaning is unpinned, carried from the capture:
-# offset 11 is `0x02` on a value/row-producing status (describe / outbind / DML)
-# and `0` on DDL; offset 15 is `0x01` on the DML status and `0` otherwise.
-_OCI_STATUS_FRAME_PREFIX_LEN = 35
-_OCI_STATUS_FRAME_HEADER = bytes([0x08, 0x06])
-_OCI_STATUS_FRAME_CURSOR_OFF = 4  # ub2 LE cursor id
-_OCI_STATUS_FRAME_ROWS_OFF = 11  # 0x02 on a value/row-producing status
-_OCI_STATUS_FRAME_DML_OFF = 15  # 0x01 on the DML status
+# outbind / DDL / DML statuses and the row statuses. It is all zero (the Mirror
+# has no live per-statement session counters) but for the header, a ub2-LE
+# **cursor id** (the DDL / DML statuses carry a live cursor id here; the others
+# none), and two small marker bytes whose values track the statement kind but
+# whose exact meaning is unpinned, carried from the capture: offset 11 is `0x02`
+# on a value/row-producing status (describe / outbind / DML / rows), `0x01` on
+# the no-row status and `0` on DDL; offset 15 is `0x01` on the DML status and
+# `0` otherwise.
+_OCI_STATUS_FRAME: wire_schema.Schema = (
+    ('const', b'\x08\x06'),
+    ('pad', 2),
+    ('n2', 'cursor_id'),
+    ('pad', 5),
+    ('u8', 'statement_mark'),
+    ('pad', 3),
+    ('u8', 'dml_mark'),
+    ('pad', 19),
+)
+_OCI_STATUS_FRAME_OCI = wire_schema.compile_encoder(_OCI_STATUS_FRAME, _OCI)
 
 
 def _oci_status_frame_prefix(
-    cursor_id: int = 0, *, row_producing: bool = False, dml: bool = False
+    cursor_id: int = 0, *, row_producing: bool = False, dml: bool = False, mark: int = 0
 ) -> bytes:
-    pre = bytearray(_OCI_STATUS_FRAME_PREFIX_LEN)
-    pre[0:2] = _OCI_STATUS_FRAME_HEADER
-    struct.pack_into('<H', pre, _OCI_STATUS_FRAME_CURSOR_OFF, cursor_id)
-    if row_producing:
-        pre[_OCI_STATUS_FRAME_ROWS_OFF] = 0x02
-    if dml:
-        pre[_OCI_STATUS_FRAME_DML_OFF] = 0x01
-    return bytes(pre)
-
-
-_OCI_STATUS_FRAME_PREFIX = _oci_status_frame_prefix(row_producing=True)
-
-
-def _oci_fetch_oer_header(sequence: int) -> bytes:
-    # The fetch-terminator OER: a compact OER carrying ORA-01403 (no data found).
-    return _oci_oer_short(
-        sequence=sequence,
-        command_type=oci.OCI_CMD_SELECT,
-        category=2,
-        error_code=ORA_NO_DATA_FOUND,
+    return _OCI_STATUS_FRAME_OCI(
+        {
+            'cursor_id': cursor_id,
+            'statement_mark': 0x02 if row_producing else mark,
+            'dml_mark': 0x01 if dml else 0,
+        }
     )
 
 
-# The one instance constant inside the end-of-fetch OER (§36) — the same
-# `f6 31 0a` marker that recurs as `20 f6 31 0a` in _OCI_OER_ENVELOPE. Carried
-# verbatim as capture ground truth; its meaning is unpinned, not decoded (§39.2).
-# The 3-byte marker in the 11g OER trailer (as 0x20f6310a at envelope offset 72,
-# and standalone in the end-of-fetch OER). A fixed 11g OER-format constant —
-# differential capture (2026-09-07) shows it byte-identical across every 11g
-# reply and absent from 21c / 23ai (§39.2); carried, meaning opaque.
-_OCI_FETCH_CONST = bytes.fromhex('f6310a')
+_OCI_STATUS_FRAME_PREFIX = _oci_status_frame_prefix(row_producing=True)
 
 
 # The describe-only reply's trailing execute status (§36.3): the shared status
@@ -8856,66 +8858,68 @@ def _oci_lob_describe_status(sequence: int) -> bytes:
     )
 
 
-# The reply for a statement that returns no rows — a PL/SQL block or DDL: a
-# compact PL/SQL-block OER (category 1 = no rows), wrapped in the exec-reply's
-# zero padding. Structure only; the SCN / counts a live reply carries are zero
-# (#265).
-def _oci_status_oer(sequence: int) -> bytes:
-    return (
-        b'\x00\x00\x00'
-        + _oci_oer_short(sequence=sequence, command_type=oci.OCI_CMD_PLSQL, category=1)
-        + b'\x00' * 6
-    )
-
-
 # The DML execute-status frame (§36.3): the 35-byte preamble (its cursor id
 # `0x5be8` carried from the capture, plus the row-producing and DML markers) +
-# the 136-byte OER + a 16-byte trailer. Unlike the describe/DDL/outbind statuses
-# its OER embeds the touched row's physical **rowid** (offsets 27..40 within the
-# OER, echoed byte-swapped in the trailer) — capture-specific, opaque to sqlplus
-# (which renders "N rows created" from only the rowcount and command type). The
-# rowcount (OER offset 8) and command type (OER offset 22) are patched per call.
+# the OER + a 16-byte trailer. Unlike the describe/DDL/outbind statuses its OER
+# carries the touched row's physical **rowid**, echoed in the trailer --
+# capture-specific, opaque to sqlplus (which renders "N rows created" from only
+# the row count and command type).
 _OCI_DML_FRAME_PREFIX = _oci_status_frame_prefix(0x5BE8, row_producing=True, dml=True)
 
 
-# The captured touched-row rowid (OER offsets 27..40). FIXME: real physical row
-# identity from the capture; carried, like the LOB LID (§14.6) — a synthetic
-# value would need live 11g validation.
-_OCI_DML_ROWID = bytes.fromhex('007fb5010001000000b1b4000000')
+# The captured touched-row rowid. FIXME: real physical row identity from the
+# capture; carried, like the LOB LID (§14.6) — a synthetic value would need live
+# 11g validation.
+_OCI_DML_ROWID = bytes.fromhex('7fb5010001000000b1b4000000')
+
+
+# The 16-byte DML status trailer is NOT independent of the rowid: it carries two
+# of the rowid's big-endian words as ub2s -- the first at offset 6 (7f b5 →
+# b5 7f) and the fifth at offset 12 (b1 b4 → b4 b1) -- inside an otherwise fixed
+# frame. Both come from the same captured row; the physical fields' meaning
+# stays unpinned.
+_OCI_DML_TRAILER: wire_schema.Schema = (
+    ('const', bytes.fromhex('0d000d010001')),
+    ('n2', 'rowid_word_0'),
+    ('const', bytes.fromhex('00010000')),
+    ('n2', 'rowid_word_4'),
+    ('const', bytes(2)),
+)
+_OCI_DML_TRAILER_OCI = wire_schema.compile_encoder(_OCI_DML_TRAILER, _OCI)
 
 
 def _oci_dml_frame_trailer(rowid: bytes) -> bytes:
-    # The 16-byte DML status trailer is NOT independent of the rowid: it splices
-    # two of the rowid's 2-byte words back in byte-swapped — rowid[1:3] lands at
-    # offset 6 (7f b5 → b5 7f) and rowid[9:11] at offset 12 (b1 b4 → b4 b1) —
-    # inside an otherwise fixed frame. Both come from the same captured row, so
-    # derive the trailer rather than store a second blob; the physical fields'
-    # meaning stays unpinned.
-    return (
-        bytes([0x0D, 0x00, 0x0D, 0x01, 0x00, 0x01])
-        + rowid[1:3][::-1]
-        + bytes([0x00, 0x01, 0x00, 0x00])
-        + rowid[9:11][::-1]
-        + bytes([0x00, 0x00])
+    return _OCI_DML_TRAILER_OCI(
+        {
+            'rowid_word_0': int.from_bytes(rowid[0:2], 'big'),
+            'rowid_word_4': int.from_bytes(rowid[8:10], 'big'),
+        }
     )
 
 
 _OCI_DML_FRAME_TRAILER = _oci_dml_frame_trailer(_OCI_DML_ROWID)
 
 
-def _oci_dml_status_frame(sequence: int, rowcount: int = 0) -> bytes:
+def _oci_dml_status_frame(
+    sequence: int, rowcount: int = 0, command_type: int = 0
+) -> bytes:
     # status 2 is the DML call status (not the fetch/exec 1); offset-20 carries a
     # non-zero value under it (the same murky field as the describe status, §36.1).
-    # From the 12c band sqlplus reads the affected-row count from the OER's ub8
-    # row count, not from the frame (#1282).
-    oer = bytearray(
-        encode_oci_oer(
-            2, sequence=sequence, error_pos=12, command_type=0, rowcount=rowcount
-        )
-    )
-    oer[27 : 27 + len(_OCI_DML_ROWID)] = _OCI_DML_ROWID
-    oer[80] = 0x0D  # carried row/SCN byte
-    return _OCI_DML_FRAME_PREFIX + bytes(oer) + _OCI_DML_FRAME_TRAILER
+    # The row count rides where other OERs put the row kind; from the 12c band
+    # sqlplus reads it from the OER's ub8 row count instead (#1282).
+    fields = {
+        **_OCI_OER_STATEMENT,
+        'status': 2,
+        'sequence': sequence,
+        'row_kind': rowcount,
+        'error_pos': 12,
+        'command_type': command_type,
+        'rowid': _OCI_DML_ROWID,
+        'call_sequence': _ENCODE_OCI_CALL_SEQ.get(),
+        'unpinned_80': 0x0D,  # carried row/SCN byte
+        'rowcount': rowcount,
+    }
+    return _OCI_DML_FRAME_PREFIX + _oci_oer(fields) + _OCI_DML_FRAME_TRAILER
 
 
 # The DDL execute-status preamble (§36.3): the shared status prefix carrying a
@@ -8935,17 +8939,24 @@ _OCI_DDL_FRAME_PREFIX = _oci_status_frame_prefix(0x5BEB)
 # (single NUMBER, two NUMBERs, VARCHAR): the server pointer (@18), SCN and an
 # internal sequence counter are instance-specific and zeroed; everything else is
 # computed from the OUT values (#347).
+_OCI_OUTBIND_HEADER: wire_schema.Schema = (
+    ('const', bytes.fromhex('0b0105cc')),  # the TTC out-bind opcode, two fixed
+    ('u8', 'bind_count'),
+    ('pad', 5),
+    ('const', b'\x01'),  # a fixed 11.2 identity byte
+    ('pad', 17),
+    ('n2', 'row_buffer_size'),
+    ('pad', 20),
+)
+_OCI_OUTBIND_HEADER_OCI = wire_schema.compile_encoder(_OCI_OUTBIND_HEADER, _OCI)
+
+
 def _oci_outbind_header(bind_count: int) -> bytes:
-    """The 50-byte OCI OUT-bind reply header (#347): the TTC out-bind opcode
-    (0b 01) and two fixed bytes, the bind count at offset 4, and the fixed 11.2
-    identity bytes at offsets 10 and 28..29 (a row-buffer size). The rest is the
-    instance state (server pointer, SCN, sequence) the Mirror leaves zeroed."""
-    header = bytearray(50)
-    header[0:4] = b'\x0b\x01\x05\xcc'
-    header[4] = bind_count
-    header[10] = 0x01
-    header[28:30] = b'\xe8\x07'
-    return bytes(header)
+    """The 50-byte OCI OUT-bind reply header (#347): the TTC out-bind opcode and
+    two fixed bytes, the bind count, and the fixed 11.2 identity bytes, a
+    row-buffer size among them. The rest is the instance state (server pointer,
+    SCN, sequence) the Mirror leaves zeroed."""
+    return _OCI_OUTBIND_HEADER_OCI({'bind_count': bind_count, 'row_buffer_size': 2024})
 
 
 # The outbind (PL/SQL OUT-bind) reply's trailing execute status: the shared
@@ -8990,31 +9001,33 @@ _OCI_STA_CALL_STATUS_LOGOFF = 1
 _OCI_LOGOFF_STATUS = _oci_tti_sta(_OCI_STA_CALL_STATUS_LOGOFF, 0)
 
 
-def _oci_auth_trailer(sequence: int) -> bytes:
-    """The 136-byte OER-shaped status block trailing an OCI auth key-value list.
+def _oci_auth_trailer(sequence: int, *, wide: bool = False) -> bytes:
+    """The OER-shaped status block trailing an OCI auth key-value list.
 
-    It is the same OER frame as :data:`_OCI_OER_ENVELOPE` (§36.1) with the
-    auth-reply fields set: success status (offset 1), the reply sequence (offset
-    5, echoed at offset 49 *as-is* — the return-status OER instead echoes it as
-    ``+2``), and no command type. The sequence is the only thing distinguishing
-    the challenge reply (2) from the result reply (3).
+    It is the statement OER (_OCI_OER, §36.1) with the auth-reply fields set:
+    success status, the reply sequence as the sequence and the call sequence
+    alike, and no category or command type. The sequence is the only thing
+    distinguishing the challenge reply (2) from the result reply (3). From 12.1
+    it is 8 bytes longer, as every OER is (captured from 18c): sqlplus reads the
+    12c-band length, and the 136-byte form leaves it short and the login stalls
+    (#1282).
     """
-    trailer = bytearray(_OCI_OER_ENVELOPE)
-    trailer[1] = oci.OCI_OER_STATUS_SUCCESS
-    trailer[5] = trailer[49] = sequence
-    trailer[18] = trailer[22] = trailer[52] = 0
-    return bytes(trailer)
+    fields = {
+        **_OCI_OER_STATEMENT,
+        'status': oci.OCI_OER_STATUS_SUCCESS,
+        'sequence': sequence,
+        'call_sequence': sequence,
+        'category': 0,
+        'command_type': 0,
+        'unpinned_52': 0,
+    }
+    return _oci_oer(fields, wide=wide)
 
 
 _CHALLENGE_TRAILER = _oci_auth_trailer(2)
 _RESULT_TRAILER = _oci_auth_trailer(3)
-
-# From 12.1 the auth trailer is 8 bytes longer: the same frame, then eight zero
-# bytes (captured from 18c). sqlplus reads the 12c-band length; the 136-byte form
-# leaves it short and the login stalls (#1282).
-_OCI_AUTH_TRAILER_12C_TAIL = bytes(8)
-_CHALLENGE_TRAILER_12C = _CHALLENGE_TRAILER + _OCI_AUTH_TRAILER_12C_TAIL
-_RESULT_TRAILER_12C = _RESULT_TRAILER + _OCI_AUTH_TRAILER_12C_TAIL
+_CHALLENGE_TRAILER_12C = _oci_auth_trailer(2, wide=True)
+_RESULT_TRAILER_12C = _oci_auth_trailer(3, wide=True)
 
 
 # --- Captured 11g handshake-identity blobs (opaque, staged here) ---
@@ -9546,16 +9559,14 @@ _OCI_LOB_ROW_LOCATOR_AT = 5
 def _oci_lob_read_status(sequence: int) -> bytes:
     # The status a TTI_LOBOPS READ reply ends on: the LOB-row OER call status.
     # ``sequence`` is the live per-session OER counter (§36).
-    oer = bytearray(
-        encode_oci_oer(
-            oci.OCI_OER_STATUS_SUCCESS,
-            sequence=sequence,
-            row_kind=oci.OCI_OER_ROW_KIND_LOB,
-            command_type=0,
-        )
+    # FIXME: the LOB read-status OER has no category (see §36.1).
+    return encode_oci_oer(
+        oci.OCI_OER_STATUS_SUCCESS,
+        sequence=sequence,
+        row_kind=oci.OCI_OER_ROW_KIND_LOB,
+        command_type=0,
+        category=0,
     )
-    oer[18] = 0  # FIXME: the LOB read-status OER zeroes offset 18 (see §36.1)
-    return bytes(oer)
 
 
 # --- Mirror deadbeef/OCI codec (parse/describe/rows/status/LOB, #265) ---
@@ -10356,7 +10367,7 @@ def _oci_desc_trailer_frame() -> bytes:
 #   - the trailer frame is 137 bytes, not 121: 8 zero bytes in front and 8 at
 #     the end, with byte 4 reading 0x05 instead of 0x04 and the type-dependent
 #     bytes (8, 9, 11) left zero, as 18c leaves them.
-# The OER behind the frame widens like every other (_oci_oer_tail). None of the
+# The OER behind the frame widens like every other (_OCI_OER). None of the
 # changed values is decoded; they are carried from the capture.
 _OCI_DESC_12C_HDR_GROWTH = 8
 _OCI_DESC_12C_BLK_LEAD = 0x7A
@@ -10570,12 +10581,6 @@ def parse_describe_oci(body: bytes) -> str:
     raise InterfaceError('OCI DESCRIBE: could not find the object name')
 
 
-_OCI_EXEC_OER_OFF = 32
-
-
-_OCI_ROW_STATUS_LEN = 171
-
-
 def _oci_dcb_tail(numcols: int) -> bytes:
     # The describe's trailer (_DESCRIBE_TRAILER), then the row header the
     # inline row follows: the DCB marker and the column count.
@@ -10606,27 +10611,24 @@ def _oci_lob_describe_tail() -> bytes:
 _OCI_LOB_DESCRIBE_TAIL = _oci_lob_describe_tail()
 
 
-# When the execute delivers fewer rows than the result holds, this byte in the
-# status is non-zero — the client reads it as "more rows, issue a fetch" (0 =
-# the cursor is already drained). The exact value is not load-bearing beyond
-# non-zero; 0x1e is what a live reply carries.
-_OCI_MORE_ROWS_OFF = 55
-
-
+# When the execute delivers fewer rows than the result holds, the OER's error
+# position byte is non-zero -- the client reads it as "more rows, issue a fetch"
+# (0 = the cursor is already drained). The exact value is not load-bearing
+# beyond non-zero; 0x1e is what a live reply carries.
 _OCI_MORE_ROWS_FLAG = 0x1E
 
 
 def _oci_row_status(sequence: int, *, more: bool = False, rowcount: int = 0) -> bytes:
-    status = bytearray(_OCI_ROW_STATUS_LEN)
-    status[0:3] = b'\x08\x06\x00'  # return marker
-    status[11] = 0x02  # a required sentinel
-    exec_oer = _oci_exec_oer(sequence)
-    off = _OCI_EXEC_OER_OFF
-    status[off : off + len(exec_oer)] = exec_oer
-    if more:
-        status[_OCI_MORE_ROWS_OFF] = _OCI_MORE_ROWS_FLAG
-    # The frame ends with its OER, which the 12c band widens (#1282).
-    return _oci_oer_tail(bytes(status), rowcount=rowcount)
+    # The status frame (offset 11 a required sentinel), then the rows OER, which
+    # the 12c band widens (#1282).
+    return _OCI_STATUS_FRAME_PREFIX + _oci_oer(
+        {
+            **_OCI_OER_ROWS,
+            'sequence': sequence,
+            'error_pos': _OCI_MORE_ROWS_FLAG if more else 0,
+            'rowcount': rowcount,
+        }
+    )
 
 
 # The row-header (TTI_RXH) that leads a fetch batch: a small fixed frame plus the
@@ -10774,25 +10776,20 @@ def encode_login_refusal_oci(
     """
     token = _ENCODE_OCI_CALL_SEQ.set(call_sequence)
     try:
-        oer = bytearray(
-            encode_oci_oer(
-                oci.OCI_OER_STATUS_SUCCESS,
-                sequence=0,
-                error_code=ora_code,
-                command_type=0,
-                category=0,
-            )
+        # The one byte a login refusal leaves zero that the statement OERs
+        # carry as 0x01 is offset 52 (§36.1).
+        oer = encode_oci_oer(
+            oci.OCI_OER_STATUS_SUCCESS,
+            sequence=0,
+            error_code=ora_code,
+            command_type=0,
+            category=0,
+            unpinned_52=0,
         )
     finally:
         _ENCODE_OCI_CALL_SEQ.reset(token)
-    oer[_OCI_OER_LOGIN_REFUSAL_ZERO] = 0
     text = f'{message}\n'.encode('utf-8')
-    return bytes(oer) + _oci_error_text(text)
-
-
-# The one envelope byte a login refusal leaves zero that the statement OERs
-# carry as 0x01 (§36.1).
-_OCI_OER_LOGIN_REFUSAL_ZERO = 52
+    return oer + _oci_error_text(text)
 
 
 def encode_query_response_oci(
@@ -10834,66 +10831,54 @@ def encode_lob_describe_oci(columns: list[ColumnMeta], *, sequence: int) -> byte
 
 def encode_status_oci(sequence: int) -> bytes:
     """OCI reply for a no-row statement (PL/SQL / DDL): success, nothing to fetch."""
-    status = bytearray(_OCI_ROW_STATUS_LEN)
-    status[0:3] = b'\x08\x06\x00'
-    status[11] = 0x01
-    status_oer = _oci_status_oer(sequence)
-    off = _OCI_EXEC_OER_OFF
-    status[off : off + len(status_oer)] = status_oer
-    return _oci_oer_tail(bytes(status))
+    # A PL/SQL-block OER, category 1 = no rows; its frame is marked 1.
+    return _oci_status_frame_prefix(mark=0x01) + _oci_oer(
+        {
+            **_OCI_OER_ROWS,
+            'sequence': sequence,
+            'command_type': oci.OCI_CMD_PLSQL,
+            'category': 1,
+        }
+    )
 
 
 # The sqlplus PASSWORD success reply (OCIPasswordChange complete, #21): an empty
 # RPA return-parameter envelope followed by an OER return-status token, from
-# which sqlplus renders "Password changed". Its body is the shared
-# :data:`_OCI_OER_ENVELOPE` — the same OER frame every OCI status carries,
-# including the fixed 0x20f6310a instance marker — so it is built on that rather
-# than stored as a second copy of the frame. Six bytes differ from the envelope;
-# all are fixed values carried from the capture, so they are set by raw offset
-# rather than through :func:`encode_oci_oer`'s named fields, whose meanings do
-# not hold for this reply (the status byte reads the ERROR marker even though the
-# change succeeded; offset 8 is not a LOB row-kind here).
+# which sqlplus renders "Password changed". Its body is the statement OER
+# (_OCI_OER) -- the same frame every OCI status carries, including the fixed
+# 0x20f6310a instance marker -- with six fields of its own. All are fixed values
+# carried from the capture; the names they have in a statement's OER do not hold
+# for this reply (the status reads the ERROR marker even though the change
+# succeeded; the row kind is not a LOB row's).
 #
 # Verified byte-identical across FOUR independent live 11g password changes in
 # separate sessions: the whole reply is a constant. There is no per-session
 # counter — the offset-5 value and its offset-49 echo, live sequence fields in
 # the query-path OERs, are fixed here — so the Mirror emits it verbatim (§36.1).
 _OCI_RPA_EMPTY = bytes([TTI_RPA, 0, 0])  # RPA return with zero parameters
-
-
-def _build_changepassword_status_oci() -> bytes:
-    oer = bytearray(_OCI_OER_ENVELOPE)
-    oer[1] = 0x05  # status byte (the ERROR marker, though the change succeeded)
-    oer[5] = 0x13  # offset-5 field — a fixed value here, not a live sequence
-    oer[8] = 0x01  # marker whose meaning is unpinned (§36.1)
-    oer[18] = 0x00  # this reply zeroes the envelope's offset-18 marker (§36.1)
-    oer[22] = 0x00  # command-type field: none
-    oer[49] = 0x16  # offset-49 echo — a fixed value here, not sequence + 2
-    return _OCI_RPA_EMPTY + bytes(oer)
-
-
-_OCI_CHANGEPASSWORD_STATUS = _build_changepassword_status_oci()
+_OCI_CHANGEPASSWORD_OER = {
+    **_OCI_OER_STATEMENT,
+    'status': 0x05,  # the ERROR marker, though the change succeeded
+    'sequence': 0x13,  # a fixed value here, not a live sequence
+    'row_kind': 0x01,  # its meaning here is unpinned (§36.1)
+    'category': 0,
+    'command_type': 0,
+    'call_sequence': 0x16,  # a fixed value here
+}
 
 
 def encode_changepassword_status_oci() -> bytes:
     """The sqlplus / thick-OCI reply that completes an OCIPasswordChange (#21)."""
-    return _oci_oer_tail(_OCI_CHANGEPASSWORD_STATUS)
+    return _OCI_RPA_EMPTY + _oci_oer(_OCI_CHANGEPASSWORD_OER)
 
 
 # OCI DML execute-status reply (#348/#349). sqlplus renders the completion
-# message ("N rows updated.") from two fields of this frame: the V$SQL **command
-# type** at body offset 57 (= the embedded OER's offset 22) and the affected-row
-# **count** (ub4 LE) at offset 43. The rest is the fixed execute-status frame
-# around the embedded OER (SCN region, cursor/rowid trailer, the 0x20f6310a
-# marker); unlike the describe/DDL/outbind statuses it carries live row/rowid
-# data, so it is kept as one frame rather than built on _OCI_OER_ENVELOPE.
-# Validated live — sqlplus prints the right verb and count for insert/update/
-# delete. The frame is one live 11g INSERT reply with the capture-order session
-# counters (offsets 3, 75, 186) zeroed, since the Mirror has no such sequence.
-_OCI_DML_ROWCOUNT_OFF = 43
-
-
-_OCI_CMD_TYPE_OFF = 57
+# message ("N rows updated.") from two fields of its OER: the V$SQL **command
+# type** and the affected-row **count**, which rides where other OERs put the
+# row kind (_oci_dml_status_frame). Validated live — sqlplus prints the right
+# verb and count for insert/update/delete. The frame is one live 11g INSERT
+# reply with the capture-order session counters zeroed, since the Mirror has no
+# such sequence.
 
 
 # The Mirror's SQL-verb → V$SQL command-type mapping — response-generation policy
@@ -10994,12 +10979,9 @@ def encode_dml_status_oci(keyword: str, rowcount: int, *, sequence: int) -> byte
     prints ``N rows created/updated/deleted``. ``keyword`` (INSERT/UPDATE/DELETE)
     selects the V$SQL command type; MERGE and anything else fall back to INSERT.
     ``sequence`` is the live per-session OER counter."""
-    status = bytearray(_oci_dml_status_frame(sequence, rowcount))
-    status[_OCI_DML_ROWCOUNT_OFF : _OCI_DML_ROWCOUNT_OFF + 4] = rowcount.to_bytes(
-        4, 'little'
+    return _oci_dml_status_frame(
+        sequence, rowcount, _OCI_DML_CMD.get(keyword, oci.OCI_CMD_INSERT)
     )
-    status[_OCI_CMD_TYPE_OFF] = _OCI_DML_CMD.get(keyword, oci.OCI_CMD_INSERT)
-    return bytes(status)
 
 
 # The OCI OER's warning flags (§36.1): `0x21` when a CREATE made a PL/SQL object
@@ -11007,7 +10989,6 @@ def encode_dml_status_oci(keyword: str, rowcount: int, *, sequence: int) -> byte
 # its last warn byte (§6.3a). Captured from sqlplus 23.26 against 11g and 18c, the
 # same CREATE PROCEDURE compiled clean and broken: this byte is all that differs
 # but for the counters.
-_OCI_OER_WARN_OFF = 27
 _OCI_OER_WARN_COMPILATION = 0x21
 
 
@@ -11079,16 +11060,15 @@ def encode_ddl_status_oci(
     ``compilation_warning`` says the statement created a PL/SQL object that
     compiled with errors; sqlplus then prints "Warning: Procedure created with
     compilation errors." and lets ``SHOW ERRORS`` look them up (#2013)."""
-    oer = bytearray(
-        encode_oci_oer(
-            oci.OCI_OER_STATUS_SUCCESS, sequence=sequence, command_type=command_type
-        )
+    oer = encode_oci_oer(
+        oci.OCI_OER_STATUS_SUCCESS,
+        sequence=sequence,
+        command_type=command_type,
+        # FIXME: DDL's category is 1 (query / PL-SQL leave 2); the field's
+        # meaning is unknown -- carried from the capture.
+        category=1,
+        warn_flags=_OCI_OER_WARN_COMPILATION if compilation_warning else 0,
     )
-    # FIXME: DDL sets offset 18 to 1 (query / PL-SQL leave the envelope's 2);
-    # the field's meaning is unknown — carried from the capture.
-    oer[18] = 1
-    if compilation_warning:
-        oer[_OCI_OER_WARN_OFF] = _OCI_OER_WARN_COMPILATION
     if not session_pairs:
         return _OCI_DDL_FRAME_PREFIX + bytes(oer)
     if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2:

@@ -21,8 +21,7 @@ from seerdb.common.oci import (
 )
 from seerdb.common.tns import (
     _ENCODE_OCI_CALL_SEQ,
-    _OCI_CMD_TYPE_OFF,
-    _OCI_DML_ROWCOUNT_OFF,
+    _OCI_OER_FROM_OCI,
     encode_changepassword_status_oci,
     encode_ddl_status_oci,
     encode_dml_status_oci,
@@ -49,6 +48,21 @@ LOB_FETCH_STATUS = bytes.fromhex(
     '0000000020f6310a0000000000000000000000000000000000000000000000000000'
     '00000000000000000000000000000000000000000000000000000000000000000000'
 )
+
+
+def _status_oer(frame: bytes) -> dict:
+    # The OER behind a status frame's 35-byte preamble, at 11g's width.
+    (fields, _rest) = _OCI_OER_FROM_OCI(
+        frame[35:], {'oci_12c': False, 'oci_pre12c': True}
+    )
+    return fields
+
+
+def _differing(a: bytes, b: bytes) -> list[str]:
+    # The OER fields two status frames differ in, their preambles alike.
+    assert a[:35] == b[:35]
+    (x, y) = (_status_oer(a), _status_oer(b))
+    return sorted(k for k in x if x[k] != y[k])
 
 
 class _CallSeq:
@@ -166,8 +180,8 @@ class TestOciOerGeneration(unittest.TestCase):
 
 class TestExecuteStatusGeneration(unittest.TestCase):
     """The DML/DDL execute-status replies are generated from one frame each,
-    varying only the V$SQL command type (offset 57) and — for DML — the rowcount
-    (offset 43). Validated live against sqlplus (see PROTOCOL.md §36)."""
+    varying only the V$SQL command type and — for DML — the rowcount, fields of
+    their OER. Validated live against sqlplus (see PROTOCOL.md §36)."""
 
     def test_dml_verbs_share_frame_and_carry_command_type(self):
         codes = {'INSERT': 2, 'UPDATE': 6, 'DELETE': 7}
@@ -175,28 +189,17 @@ class TestExecuteStatusGeneration(unittest.TestCase):
         # verbs' frames identical bar the command type.
         bodies = {kw: encode_dml_status_oci(kw, 5, sequence=19) for kw in codes}
         for kw, code in codes.items():
-            self.assertEqual(bodies[kw][_OCI_CMD_TYPE_OFF], code)
-            self.assertEqual(
-                int.from_bytes(
-                    bodies[kw][_OCI_DML_ROWCOUNT_OFF : _OCI_DML_ROWCOUNT_OFF + 4],
-                    'little',
-                ),
-                5,
-            )
+            self.assertEqual(_status_oer(bodies[kw])['command_type'], code)
+            # The row count rides where other OERs put the row kind.
+            self.assertEqual(_status_oer(bodies[kw])['row_kind'], 5)
         # all three differ only at the command-type and rowcount offsets
         ins = bodies['INSERT']
         for kw in ('UPDATE', 'DELETE'):
-            diffs = [i for i in range(len(ins)) if ins[i] != bodies[kw][i]]
-            self.assertEqual(diffs, [_OCI_CMD_TYPE_OFF])
+            self.assertEqual(_differing(ins, bodies[kw]), ['command_type'])
 
     def test_dml_rowcount(self):
         body = encode_dml_status_oci('UPDATE', 42, sequence=19)
-        self.assertEqual(
-            int.from_bytes(
-                body[_OCI_DML_ROWCOUNT_OFF : _OCI_DML_ROWCOUNT_OFF + 4], 'little'
-            ),
-            42,
-        )
+        self.assertEqual(_status_oer(body)['row_kind'], 42)
 
     def test_dml_unknown_verb_falls_back_to_insert(self):
         self.assertEqual(
@@ -207,10 +210,9 @@ class TestExecuteStatusGeneration(unittest.TestCase):
     def test_ddl_verbs_share_frame_and_carry_command_type(self):
         create = encode_ddl_status_oci(1, sequence=17)  # CREATE TABLE
         drop = encode_ddl_status_oci(12, sequence=17)  # DROP TABLE
-        self.assertEqual(create[_OCI_CMD_TYPE_OFF], 1)
-        self.assertEqual(drop[_OCI_CMD_TYPE_OFF], 12)
-        diffs = [i for i in range(len(create)) if create[i] != drop[i]]
-        self.assertEqual(diffs, [_OCI_CMD_TYPE_OFF])
+        self.assertEqual(_status_oer(create)['command_type'], 1)
+        self.assertEqual(_status_oer(drop)['command_type'], 12)
+        self.assertEqual(_differing(create, drop), ['command_type'])
 
     def test_status_replies_carry_the_live_sequence(self):
         # The OER sequence is a per-session counter threaded in, not a frozen
@@ -238,17 +240,31 @@ class ChangePasswordStatusGolden(unittest.TestCase):
     def test_matches_the_live_capture(self):
         self.assertEqual(encode_changepassword_status_oci(), self._CAPTURE)
 
-    def test_is_the_shared_oer_envelope_plus_an_empty_rpa(self):
-        # The reply is an empty RPA return envelope (08 00 00) + the shared OER
-        # envelope: only six fixed bytes of the 136-byte OER body differ from it.
-        from seerdb.common.tns import _OCI_OER_ENVELOPE
+    def test_is_the_statement_oer_plus_an_empty_rpa(self):
+        # The reply is an empty RPA return envelope (08 00 00) + the statement
+        # OER (_OCI_OER): only six of its fields differ.
+        from seerdb.common.tns import _OCI_OER_FROM_OCI, _OCI_OER_STATEMENT
 
         reply = encode_changepassword_status_oci()
         self.assertEqual(reply[:3], bytes([8, 0, 0]))
-        body = reply[3:]
-        self.assertEqual(len(body), len(_OCI_OER_ENVELOPE))
-        diffs = [i for i in range(len(body)) if body[i] != _OCI_OER_ENVELOPE[i]]
-        self.assertEqual(diffs, [1, 5, 8, 18, 22, 49])
+        (fields, rest) = _OCI_OER_FROM_OCI(
+            reply[3:], {'oci_12c': False, 'oci_pre12c': True}
+        )
+        self.assertEqual(rest, b'')
+        diffs = sorted(
+            k for k, v in _OCI_OER_STATEMENT.items() if k in fields and fields[k] != v
+        )
+        self.assertEqual(
+            diffs,
+            [
+                'call_sequence',
+                'category',
+                'command_type',
+                'row_kind',
+                'sequence',
+                'status',
+            ],
+        )
 
 
 class ErrorPositionOverride(unittest.TestCase):
