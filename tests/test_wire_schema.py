@@ -467,3 +467,42 @@ def test_an_oci_bind_descriptor_is_thins_fields_at_fixed_width(
         (1, 18, 2),
         (2, 22, 0),
     ]
+
+
+@pytest.mark.parametrize('version', (4, 6, 7, 11, 24))  # 10.2 to 23ai
+def test_an_oci_describe_reads_back_by_its_own_schema(version: int) -> None:
+    # Every column of sqlplus's describe, an XMLTYPE among them, decodes back
+    # at each field version the Mirror speaks to sqlplus in (#265, #1764, #2050).
+    columns = [
+        tns.ColumnMeta(
+            name=b'DUMMY',
+            data_type=tns.TNS_TYPE_VARCHAR,
+            data_length=1,
+            max_size=1,
+            charset=873,
+            csfrm=1,
+        ),
+        tns.ColumnMeta(
+            name=b'DOC',
+            data_type=tns.TNS_TYPE_ADT,
+            data_length=0,
+            max_size=0,
+            type_schema=b'SYS',
+            type_name=b'XMLTYPE',
+        ),
+        tns.ColumnMeta(
+            name=b'N',
+            data_type=tns.TNS_TYPE_NUMBER,
+            data_length=22,
+            max_size=22,
+            precision=5,
+            scale=-127,
+        ),
+    ]
+    with _field_version(version):
+        back = tns._decode_describe_oci(tns.encode_describe_oci(columns))
+    assert [c['name'] for c in back] == [b'DUMMY', b'DOC', b'N']
+    assert [c['lead'] for c in back] == [1, 0, 1]
+    assert back[0]['charset'] == 873
+    assert back[1]['type_name'] == b'XMLTYPE'
+    assert (back[2]['precision'], back[2]['scale']) == (5, -127)

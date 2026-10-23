@@ -8366,7 +8366,7 @@ because the Mirror pins 11.2, not because their meaning is unknown.
 | Constant | Size | What it is | Status |
 |----------|-----:|------------|--------|
 | `_oci_version_trailer` | 10 B | packed release + capability word on the post-login version-call reply (`encode_version_banner_oci`) | **computed** — the release is the session's identity's, by client (§39.3); the capability word is the pinned 11.2 value |
-| OCI describe column trailer | 13 B + 23 B | the zeroed post-name block (`_OCI_DCB_COL_POSTNAME`) and cursor-uuid preamble on `encode_describe_oci` | **computed** — every meaningful field (type/precision/scale/length/charset/csfrm/max_size/null_ok/name) is built; only the describe-timestamp / instance-id region the client skips is emitted as zeros |
+| OCI describe column trailer | 13 B + 23 B | the zeroed post-name block (`_DCB_COLUMN`) and cursor-uuid preamble on `encode_describe_oci` | **computed** — every meaningful field (type/precision/scale/length/charset/csfrm/max_size/null_ok/name) is built; only the describe-timestamp / instance-id region the client skips is emitted as zeros |
 | OER return-status trailers | var | the execute / DML / DDL / fetch / commit / logoff status envelopes | **computed** — reduced to load-bearing structure (§36); meaningful fields parameterized. Opaque regions are mostly **zeroed** (a real reply's describe timestamp, SCN and counts, which the client skips), but a few are **carried verbatim** because zeroing them breaks the client — see below |
 
 Not every opaque byte can be zeroed. Three small markers are **carried** —
