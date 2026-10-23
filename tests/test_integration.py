@@ -123,7 +123,6 @@ _FV2_UNSUPPORTED = (
         'a quoted bind cannot ride the pre-10g block rewrite',
     ),
     # The pre-10 error reply carries the code and text but no position.
-    ('error_offset', 'the 9i/8i error reply carries no offset (#719)'),
 )
 
 
@@ -164,6 +163,7 @@ _8I_UNSUPPORTED = (
     # 9i reads a REF CURSOR by its id over TTI_ALL7 (#2246); 8i's dialect does not.
     ('refcursor', 'REF CURSOR is not supported on Oracle 8i'),
     ('batcherror', 'executemany (array DML) is not supported on Oracle 8i'),
+    ('error_offset', 'the 8i error reply carries no offset (#719)'),
 )
 
 

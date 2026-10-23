@@ -13719,6 +13719,16 @@ def decode_fv2_dml_rowid(Data: bytes) -> str | None:
     )
 
 
+def decode_fv2_error_position(Data: bytes) -> int:
+    """The 0-based offset in the SQL text of the error a 9i status reports,
+    0 when there is none (#2263): the ub4 after the cursor id, as on 10g+.
+    Measured on 9.2.0.4: `select 1 frm dual` answers ORA-00923 at 13 (`dual`),
+    `select nosuch from dual` ORA-00904 at 7. 8i's status does not say (#719).
+    """
+    Status = _fv2_status(Data)
+    return 0 if Status is None else Status['position']
+
+
 def decode_fv2_batch_errors(Data: bytes) -> list[dict]:
     """The per-row errors a 9i array DML collected in `batcherrors` mode
     (#2247), as {offset, code, message}, or [] for a reply with none.
@@ -13746,8 +13756,9 @@ def _fv2_status(Data: bytes) -> dict | None:
         return None
     try:
         (_, ErrCode, Rest) = _decode_fv2_oer(Rest)
-        for _ in range(4):  # array elem error x2, cursor id, error position
+        for _ in range(3):  # array elem error x2, cursor id
             (_, Rest) = decode_ub4(Rest)
+        (Position, Rest) = decode_ub4(Rest)  # the error's offset in the SQL
         Rest = Rest[6:]  # sql type, fatal, flags, cursor opts, upi param, warnings
         (Obj, Rest) = decode_ub4(Rest)
         (File, Rest) = decode_ub4(Rest)
@@ -13757,7 +13768,7 @@ def _fv2_status(Data: bytes) -> dict | None:
     except (IndexError, Truncated, DataError):
         return None
     Status: dict = {'code': ErrCode, 'object': Obj, 'file': File, 'block': Block}
-    Status.update(slot=Slot, batch_errors=[])
+    Status.update(slot=Slot, position=Position, batch_errors=[])
     try:
         (_, Rest) = decode_ub4(Rest)  # os error
         Rest = Rest[2:]  # statement #, call #
