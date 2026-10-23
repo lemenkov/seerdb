@@ -3879,17 +3879,20 @@ def test_parse_exec_decodes_a_temp_lob_bind_as_a_reference() -> None:
 
 
 def test_encode_dml_status_oci_carries_the_verb_and_rowcount() -> None:
-    # Each DML verb has its own captured template (sqlplus reads the verb from the
-    # statement-type fields), and the affected-row count is injected as a ub4-LE at
-    # offset 43 of the body so sqlplus prints "N rows created/updated/deleted".
-    from seerdb.common.tns import _OCI_DML_ROWCOUNT_OFF, encode_dml_status_oci
+    # Each DML verb has its own command type (sqlplus reads the verb from the
+    # statement-type fields), and the affected-row count rides in the OER where
+    # other OERs put the row kind, so sqlplus prints "N rows created/updated/
+    # deleted".
+    from seerdb.common.tns import _OCI_OER_FROM_OCI, encode_dml_status_oci
 
-    off = _OCI_DML_ROWCOUNT_OFF
     for keyword in ('INSERT', 'UPDATE', 'DELETE'):
         status = encode_dml_status_oci(keyword, 7, sequence=19)
         assert status[:3] == b'\x08\x06\x00'
         assert len(status) == 187
-        assert int.from_bytes(status[off : off + 4], 'little') == 7
+        (oer, _rest) = _OCI_OER_FROM_OCI(
+            status[35:], {'oci_12c': False, 'oci_pre12c': True}
+        )
+        assert oer['row_kind'] == 7
 
     # The verb templates are distinct — the command-code byte differs per verb.
     codes = {
@@ -3904,18 +3907,15 @@ def test_encode_dml_status_oci_carries_the_verb_and_rowcount() -> None:
     )
 
     # Zero rows is representable (DML matching no rows).
-    assert (
-        int.from_bytes(
-            encode_dml_status_oci('DELETE', 0, sequence=19)[off : off + 4], 'little'
-        )
-        == 0
-    )
+    none = encode_dml_status_oci('DELETE', 0, sequence=19)
+    pre_12c = {'oci_12c': False, 'oci_pre12c': True}
+    assert _OCI_OER_FROM_OCI(none[35:], pre_12c)[0]['row_kind'] == 0
 
 
 def test_oci_dml_frame_trailer_is_derived_from_the_rowid() -> None:
-    # The 16-byte DML status trailer is not stored independently: it splices two of
-    # the rowid's 2-byte words back in byte-swapped, inside a fixed frame. It must
-    # stay byte-identical to the capture and track the rowid.
+    # The 16-byte DML status trailer is not stored independently: it carries two
+    # of the rowid's big-endian words as ub2s, inside a fixed frame. It must stay
+    # byte-identical to the capture and track the rowid.
     from seerdb.common.tns import (
         _OCI_DML_FRAME_TRAILER,
         _OCI_DML_ROWID,
@@ -3925,8 +3925,8 @@ def test_oci_dml_frame_trailer_is_derived_from_the_rowid() -> None:
     assert _OCI_DML_FRAME_TRAILER.hex() == '0d000d010001b57f00010000b4b10000'
     assert _oci_dml_frame_trailer(_OCI_DML_ROWID) == _OCI_DML_FRAME_TRAILER
     # The two byte-swapped rowid words really do come from the rowid.
-    assert _OCI_DML_FRAME_TRAILER[6:8] == _OCI_DML_ROWID[1:3][::-1]
-    assert _OCI_DML_FRAME_TRAILER[12:14] == _OCI_DML_ROWID[9:11][::-1]
+    assert _OCI_DML_FRAME_TRAILER[6:8] == _OCI_DML_ROWID[0:2][::-1]
+    assert _OCI_DML_FRAME_TRAILER[12:14] == _OCI_DML_ROWID[8:10][::-1]
 
 
 def test_encode_ddl_status_oci_carries_the_command_type() -> None:
@@ -4332,20 +4332,18 @@ def test_oci_dcb_tail_is_column_aware() -> None:
 
 
 def test_encode_query_response_oci_signals_more_rows() -> None:
-    # more=True flips the status byte sqlplus reads as "fetch for the rest" (#351).
-    from seerdb.common.tns import (
-        _OCI_MORE_ROWS_OFF,
-        _OCI_ROW_STATUS_LEN,
-        encode_query_response_oci,
-    )
+    # more=True sets the status's error-position byte, which sqlplus reads as
+    # "fetch for the rest" (#351).
+    from seerdb.common.tns import _OCI_OER_FROM_OCI, encode_query_response_oci
 
     col = ColumnMeta(
         name=b'N', data_type=TNS_TYPE_NUMBER, data_length=2, max_size=0, scale=-127
     )
     done = encode_query_response_oci([col], [(1,)], sequence=19, more=False)
     more = encode_query_response_oci([col], [(1,)], sequence=19, more=True)
-    i = len(done) - _OCI_ROW_STATUS_LEN + _OCI_MORE_ROWS_OFF
-    assert more[i] == 0x1E and done[i] == 0x00
+    pre_12c = {'oci_12c': False, 'oci_pre12c': True}
+    assert _OCI_OER_FROM_OCI(more[-136:], pre_12c)[0]['error_pos'] == 0x1E
+    assert _OCI_OER_FROM_OCI(done[-136:], pre_12c)[0]['error_pos'] == 0
 
 
 def test_encode_fetch_batch_oci_carries_rows_and_terminator() -> None:

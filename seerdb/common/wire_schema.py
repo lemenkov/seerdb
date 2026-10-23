@@ -34,8 +34,8 @@ A schema is a tuple of fields:
   little-endian in OCI;
 - ``('wn4', name)``: a count that a wide OCI preamble writes as a ub8, and is
   an ``n4`` otherwise;
-- ``('bytes', name, length)``: as many bytes as the integer ``length``
-  says, as they are;
+- ``('bytes', name, length)``: as many bytes as the integer field
+  ``length`` says, or ``length`` itself when it is a number, as they are;
 - ``('pad', size)``: ``size`` bytes no field is known for, zero when written
   and passed over when read;
 - ``('derive', name, function)``: no bytes; reading sets ``name`` to
@@ -177,7 +177,7 @@ def compile_decoder(schema: Schema, codec: Codec) -> Decoder:
             elif kind == 'derive':
                 values[field[1]] = field[2](values)
             elif kind == 'bytes':
-                size = values[field[2]]
+                size = field[2] if isinstance(field[2], int) else values[field[2]]
                 (values[field[1]], data) = (bytes(data[:size]), data[size:])
             elif kind in _PRIMITIVES:
                 (values[field[1]], data) = getattr(codec, 'read_' + kind)(data)
