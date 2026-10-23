@@ -6827,6 +6827,134 @@ class TestFv2ErrorOffset(unittest.TestCase):
         self.assertEqual(ctx.exception.offset, 0)
 
 
+class TestFv2LobOperations(unittest.TestCase):
+    """A 9i LOB object's calls (#2259), from ojdbc14 on 9.2.0.4: each is the
+    GET_LENGTH request's shape with its own operation, offset, flags and
+    trailer. Requests and replies are the captured ones."""
+
+    GETLEN_REQ = bytes.fromhex(
+        '036000010156000000000001000101000000540001020c000000010000000100'
+        '000008e10d000286f2000286f100020002001f00000000000000000000000000'
+        '00000000000202f17b000000070000000071c800000000000000000000000286'
+        'f10040b92a000000'
+    )
+    READ_REQ = bytes.fromhex(
+        '03600001015600000107000001000102000000540001020c0000000100000001'
+        '00000008e10d000286f2000286f100020002001f000000000000000000000000'
+        '0000000000000202f17b000000070000000071c8000000000000000000000002'
+        '86f10040b92a00000103'
+    )
+    WRITE_REQ = bytes.fromhex(
+        '03600001015600000102000001000140000000540001010c0000000100000001'
+        '00000008e10e000286f4000286f1000300030000000000000000000000000000'
+        '0000000000000202f17b000000070000000071c8000000000000000000000002'
+        '86f10040b92a000001020e020909'
+    )
+    TRIM_REQ = bytes.fromhex(
+        '036000010156000000000001000120000000540001020c000000010000000100'
+        '000008e10d000286f2000286f100020002001f00000000000000000000000000'
+        '00000000000202f17b000000070000000071c800000000000000000000000286'
+        'f10040b92a00000105'
+    )
+    CHUNK_REQ = bytes.fromhex(
+        '03600001015600000000000100024000000000540001020c0000000100000001'
+        '00000008f5c100028b5500028b5400020002001f000000000000000000000000'
+        '0000000000000203712b000000050004000097b7000000000000000000000002'
+        '8b540040b92a000000'
+    )
+    CHUNK_REP = bytes.fromhex(
+        '0800540001020c000000010000000100000008f5c100028b5500028b54000200'
+        '02001f0000000000000000000000000000000000000203712b00000005000400'
+        '0097b70000000000000000000000028b540040b92a0000021fc4040101000000'
+        '000000000000000003028b5401010002b92a00000000000101'
+    )
+    OPEN_REQ = bytes.fromhex(
+        '03600001015600000000000100028000000000540001010c0000000100000001'
+        '00000008f5c200028b5700028b54000300030000000000000000000000000000'
+        '0000000000000203712b000000050004000097b7000000000000000000000002'
+        '8b540040b92a00000102'
+    )
+    ISOPEN_REQ = bytes.fromhex(
+        '0360000101560000000000000103011000000000540001010c00000001000000'
+        '0100000008f5c200028b5700028b540003000300000000000000000000000000'
+        '000000000000000203712b000000050004000097b70000000000000000000000'
+        '028b540040b92a0000'
+    )
+    ISOPEN_REP = bytes.fromhex(
+        '0800540001010c000000010000000100000008f5c200028b5700028b54000300'
+        '0300000000000000000000000000000000000000000203712b00000005000400'
+        '0097b70000000000000000000000028b540040b92a0000010104010100000000'
+        '0000000000000003028b5401010002b92a00000000000101'
+    )
+    CLOSE_REQ = bytes.fromhex(
+        '0360000101560000000000000003010000000000540001010c00000001000000'
+        '0100000008f5c200028b5700028b540003000300000000000000000000000000'
+        '000000000000000203712b000000050004000097b70000000000000000000000'
+        '028b540040b92a0000'
+    )
+
+    @staticmethod
+    def _locator(request: bytes) -> bytes:
+        # The locator as a fetched 9i LOB holds it: a 0x00, then the ub1
+        # length and the body the request carries.
+        at = request.find(bytes.fromhex('540001'))
+        return bytes([0]) + request[at : at + 85]
+
+    def test_each_call_is_built_as_ojdbc14_builds_it(self):
+        from seerdb.common.tns import encode_o7_lobop
+        from seerdb.common.tns_consts import (
+            TNS_LOB_OP_CLOSE,
+            TNS_LOB_OP_GET_CHUNK_SIZE,
+            TNS_LOB_OP_GET_LENGTH,
+            TNS_LOB_OP_IS_OPEN,
+            TNS_LOB_OP_OPEN,
+            TNS_LOB_OP_READ,
+            TNS_LOB_OP_TRIM,
+            TNS_LOB_OP_WRITE,
+        )
+
+        for request, operation, kw in (
+            (self.GETLEN_REQ, TNS_LOB_OP_GET_LENGTH, {}),
+            (self.READ_REQ, TNS_LOB_OP_READ, {'Offset': 7, 'Amount': 3}),
+            (
+                self.WRITE_REQ,
+                TNS_LOB_OP_WRITE,
+                {'Offset': 2, 'Amount': 2, 'Data': b'\x09\x09'},
+            ),
+            (self.TRIM_REQ, TNS_LOB_OP_TRIM, {'Amount': 5}),
+            (self.CHUNK_REQ, TNS_LOB_OP_GET_CHUNK_SIZE, {}),
+            (self.OPEN_REQ, TNS_LOB_OP_OPEN, {'Amount': 2}),
+            (self.ISOPEN_REQ, TNS_LOB_OP_IS_OPEN, {}),
+            (self.CLOSE_REQ, TNS_LOB_OP_CLOSE, {}),
+        ):
+            built = encode_o7_lobop(request[2], self._locator(request), operation, **kw)
+            self.assertEqual(built.hex(), request.hex(), hex(operation))
+
+    def test_a_long_write_is_chunked_as_ojdbc14_chunks_it(self):
+        # 3000 characters: the 0xFE marker, 252-byte chunks and a zero.
+        from seerdb.common.tns import _o7_lob_value
+
+        value = _o7_lob_value(b'w' * 3000)
+        self.assertEqual(value[:2].hex(), 'fefc')
+        self.assertEqual(value[-1:], b'\x00')
+        self.assertEqual(len(value), 1 + 11 * 253 + 1 + 228 + 1)
+        self.assertEqual(_o7_lob_value(b'\x09\x09').hex(), '020909')
+
+    def test_the_reply_gives_the_value_and_the_locator_to_keep(self):
+        from seerdb.common.lob import LOB
+        from seerdb.common.tns import decode_fv2_lob_value
+
+        (chunk, body) = decode_fv2_lob_value(self.CHUNK_REP)
+        self.assertEqual(chunk, 8132)
+        self.assertEqual(decode_fv2_lob_value(self.ISOPEN_REP)[0], 1)
+        # Kept, the locator is the fetched form again, so the next call works:
+        # prefixed twice, it answered ORA-22275.
+        fetched = self._locator(self.CHUNK_REQ)
+        lob = LOB(112, fetched)
+        lob._refresh(body)
+        self.assertEqual(lob.raw, fetched)
+
+
 class TestFv2Bfile(unittest.TestCase):
     """Oracle 9i BFILE read (#102, PROTOCOL §19.8): FILE_OPEN -> GETLEN -> READ
     -> FILE_CLOSE over TTI_LOBOPS, where FILE_OPEN returns an open-flagged

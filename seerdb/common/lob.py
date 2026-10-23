@@ -89,6 +89,7 @@ class LOB:
         '_is_open',
         '_temp',
         '_csfrm',
+        'charset',
     )
 
     def __init__(
@@ -100,6 +101,7 @@ class LOB:
         *,
         temp: bool = False,
         csfrm: int = 1,
+        charset: int | None = None,
     ):
         # `data_type` is the column's TNS data type code (112 CLOB, 113 BLOB,
         # 114 BFILE; NCLOB shares 112 + a national charset form). `raw` is
@@ -114,6 +116,10 @@ class LOB:
         self.data_type = data_type
         self.raw = bytes(raw)
         self._connection = connection
+        # A 9i CLOB's content travels in its column's database charset, not the
+        # UTF-16 the 10g+ path uses, so a 9i LOB keeps it for its reads and
+        # writes (#2259). None elsewhere.
+        self.charset = charset
         self._prefetched = None if prefetched is None else bytes(prefetched)
         # Whether open() was called through this object and not yet closed. The
         # server owns the real state -- a second open answers ORA-22293 and a
@@ -215,7 +221,7 @@ class LOB:
         if self.is_file:
             return self._connection.bfile_read_native(self.raw)
         return self._connection.lob_read(
-            self.raw, self.data_type, offset=offset, amount=amount
+            self.raw, self.data_type, offset=offset, amount=amount, **self._charset()
         )
 
     def size(self) -> int:
@@ -239,7 +245,11 @@ class LOB:
         _check_write_value(self.is_character, value, offset)
         self._refresh(
             self._require_mutable().lob_write(
-                self.raw, value, is_blob=not self.is_character, offset=offset
+                self.raw,
+                value,
+                is_blob=not self.is_character,
+                offset=offset,
+                **self._charset(),
             )
         )
 
@@ -358,12 +368,20 @@ class LOB:
         from seerdb.common.tns_consts import FIELD_VERSION_11_2
 
         conn = self._require_connection()
+        native = getattr(conn, 'dialect_serves_lobs', None)
+        if native is not None and native():
+            return conn  # 9i writes through its own LOBOPS form (#2259)
         if getattr(conn, 'field_version', FIELD_VERSION_11_2) < FIELD_VERSION_11_2:
             raise NotSupportedError(
                 'modifying a LOB needs Oracle 11g or later; on 10g the server '
                 'closes the connection on a persistent-LOB write'
             )
         return conn
+
+    def _charset(self) -> dict:
+        # A 9i LOB's column charset for the connection's read and write, which
+        # carry its text in it (#2259); nothing for any other LOB.
+        return {} if self.charset is None else {'charset': self.charset}
 
     def _operation(self, operation: int, amount: int = 0) -> int | None:
         (value, locator) = self._require_connection().lob_operation(
@@ -443,7 +461,7 @@ class LOB:
         if self.is_file:
             return await self._connection.bfile_read_native(self.raw)
         return await self._connection.lob_read(
-            self.raw, self.data_type, offset=offset, amount=amount
+            self.raw, self.data_type, offset=offset, amount=amount, **self._charset()
         )
 
     async def asize(self) -> int:
@@ -463,7 +481,11 @@ class LOB:
         _check_write_value(self.is_character, value, offset)
         self._refresh(
             await self._require_mutable().lob_write(
-                self.raw, value, is_blob=not self.is_character, offset=offset
+                self.raw,
+                value,
+                is_blob=not self.is_character,
+                offset=offset,
+                **self._charset(),
             )
         )
 

@@ -254,8 +254,10 @@ class _Need(NamedTuple):
     # behaviour the test is about).
     min_fv: int = 0
     below_fv: int = 0
-    # The server's major release it needs at least.
+    # The server's major release it needs at least, or the one release that
+    # lacks it.
     min_server: int = 0
+    not_server: int = 0
     # Whether 8i lacks it, or only 8i has it.
     not_8i: bool = False
     only_8i: bool = False
@@ -270,6 +272,8 @@ class _Need(NamedTuple):
         if self.below_fv and fv >= self.below_fv:
             return True
         if self.min_server and target.server_major < self.min_server:
+            return True
+        if self.not_server and target.server_major == self.not_server:
             return True
         if (self.not_8i and target.is_8i) or (self.only_8i and not target.is_8i):
             return True
@@ -369,7 +373,7 @@ _PROXY_AUTH = _Need('proxy authentication needs a 10g+ server', min_fv=_FV)
 _SERVER_SCROLL = _Need(
     'server-side scroll needs 10g+ (9i uses buffered scroll)', min_fv=_FV
 )
-_LOBOPS = _Need('the LOB object needs the 10g+ LOBOPS path', min_fv=_FV)
+_LOBOPS = _Need('the 8i LOB object has no LOBOPS calls (9i: #2259)', not_8i=True)
 _OER_WARN_BYTE = _Need('the OER warn byte is not located on fv2', min_fv=_FV)
 _BLOCK_IOV = _Need(
     'the 8i block reply carries no IOV directions (9i: #2264)', not_8i=True
@@ -382,8 +386,12 @@ _PRE10_RETURNING = _Need(
 )
 _FV = FIELD_VERSION_11_2
 _EDITIONS = _Need('editions need 11g or later', min_fv=_FV)
+# 10g closes the connection on a persistent-LOB write (#964), and 8i's dialect
+# serves no LOB object calls; 9i writes through its own LOBOPS form (#2259).
 _LOB_MODIFY = _Need(
-    'modifying a LOB needs 11g+ (10g closes the connection)', min_fv=_FV
+    'modifying a LOB: 10g closes the connection, 8i has no LOB calls',
+    not_server=10,
+    not_8i=True,
 )
 _FV = FIELD_VERSION_12_1
 _INVISIBLE_COLUMNS = _Need('INVISIBLE columns are 12.1+', min_fv=_FV)

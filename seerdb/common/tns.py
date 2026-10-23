@@ -12738,10 +12738,69 @@ def encode_o7_lob_getlen(Seq: int, Locator: bytes) -> bytes:
     return _encode_o7_lobop(Seq, Locator, _LOBOP_GETLEN_MID, bytes([0]))
 
 
-def encode_o7_lob_read(Seq: int, Locator: bytes, Amount: int) -> bytes:
-    # READ: pull `Amount` chars/bytes (the value GETLEN returned) starting at
-    # offset 1. Response is `0e fe <chunks>` then an RPA + OER.
-    return _encode_o7_lobop(Seq, Locator, _LOBOP_READ_MID, encode_sb4(Amount))
+def encode_o7_lob_read(Seq: int, Locator: bytes, Amount: int, Offset: int = 1) -> bytes:
+    # READ: pull `Amount` chars/bytes from 1-based `Offset`. Response is
+    # `0e fe <chunks>` then an RPA + OER.
+    return encode_o7_lobop(Seq, Locator, TNS_LOB_OP_READ, Offset=Offset, Amount=Amount)
+
+
+# How each 9i LOB operation differs from GET_LENGTH's request, captured from
+# ojdbc14 on 9.2.0.4 (#2259): IS_OPEN and CLOSE ask no reply value and carry
+# no trailer, and IS_OPEN sets the middle's null-o2u flag.
+_O7_LOBOP_FLAGS = {
+    TNS_LOB_OP_IS_OPEN: {'has_reply': 0, 'null_o2u': 1},
+    TNS_LOB_OP_CLOSE: {'has_reply': 0},
+}
+
+
+def encode_o7_lobop(
+    Seq: int,
+    Locator: bytes,
+    Operation: int,
+    *,
+    Offset: int = 0,
+    Amount: int = 0,
+    Data: bytes | None = None,
+) -> bytes:
+    """A 9i TTI_LOBOPS request for `Operation` on `Locator` (#2259): every one
+    is GET_LENGTH's shape, differing in the middle's operation, its source
+    offset (READ and WRITE) and flags, and the trailer -- the amount for the
+    rest (a READ's or WRITE's count, TRIM's new length, OPEN's mode, 0 for the
+    sizes), a WRITE's data behind it as TTI_LOB content, and none for IS_OPEN
+    and CLOSE."""
+    Flags = _O7_LOBOP_FLAGS.get(Operation, {})
+    Middle = _o7_lobop_mid(Operation, source_offset=Offset, **Flags)
+    if Operation in _O7_LOBOP_FLAGS:
+        Trailer = b''
+    else:
+        Trailer = encode_sb4(Amount)
+    if Data is not None:
+        Trailer += bytes([TTI_LOB]) + _o7_lob_value(Data)
+    return _encode_o7_lobop(Seq, Locator, Middle, Trailer)
+
+
+def _o7_lob_value(Data: bytes) -> bytes:
+    # A 9i WRITE's data as ojdbc14 sends it: a ub1 length and the bytes up to
+    # 252, past that the 0xFE marker, ub1-length chunks of 252 and a zero.
+    if len(Data) <= TNS_MAX_SHORT_LENGTH:
+        return bytes([len(Data)]) + Data
+    Out = bytearray([TNS_LONG_LENGTH_INDICATOR])
+    for At in range(0, len(Data), TNS_MAX_SHORT_LENGTH):
+        Chunk = Data[At : At + TNS_MAX_SHORT_LENGTH]
+        Out += bytes([len(Chunk)]) + Chunk
+    return bytes(Out + b'\x00')
+
+
+def decode_fv2_lob_value(Packet: bytes) -> tuple[int, bytes | None]:
+    """A 9i LOB operation's reply value and the locator it echoes (#2259):
+    the length for GET_LENGTH, the chunk size, the amount a WRITE wrote,
+    OPEN's mode, IS_OPEN's 1 or 0. The locator is the one later calls use --
+    a write updates it -- as its body: a 9i locator as fetched is `00 <len>`
+    and the body, which is a ub2 length, and LOB._refresh puts that back on.
+    Returned with it, the locator was prefixed twice and the next call
+    answered ORA-22275."""
+    Opened = decode_fv2_opened_locator(Packet)
+    return (decode_fv2_lob_getlen(Packet), None if Opened is None else Opened[2:])
 
 
 def encode_o7_bfile_open(Seq: int, Locator: bytes) -> bytes:
@@ -13639,7 +13698,9 @@ def decode_fv2_exec_response(Data: bytes, Columns: list) -> tuple[list, int]:
                         (Locator, Rest) = _read_lob_column(Rest)
                         Rest = Rest[1:]  # present indicator (0x00)
                         Row.append(
-                            LOB(DataType, Locator) if Locator is not None else None
+                            LOB(DataType, Locator, charset=Col.get('charset'))
+                            if Locator is not None
+                            else None
                         )
                     continue
                 if (
@@ -14652,7 +14713,7 @@ def _end_of_fetch(cursor_id: int = 1) -> bytes:
 
 
 def _o7_lobop_mid(
-    operation: int, *, source_offset: int = 0, has_reply: int = 1
+    operation: int, *, source_offset: int = 0, has_reply: int = 1, null_o2u: int = 0
 ) -> bytes:
     """The fv2 (9i) TTI_LOBOPS request middle (§19.5) — the flag block between the
     locator length and the locator, sb4-encoded (go-ora's LOB request layout):
@@ -14665,7 +14726,7 @@ def _o7_lobop_mid(
         + encode_sb4(0)  # dest length
         + encode_sb4(source_offset)
         + encode_sb4(0)  # dest offset
-        + bytes([0, has_reply, 0])  # charset-present, reply flag, null-o2u
+        + bytes([0, has_reply, null_o2u])  # charset-present, reply flag, null-o2u
         + encode_sb4(operation)
         + bytes([0])  # has_scn
         + encode_sb4(0)  # scn length

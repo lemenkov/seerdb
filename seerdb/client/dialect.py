@@ -49,6 +49,7 @@ from seerdb.common.tns import (
     decode_fv2_exec_response,
     decode_fv2_lob_chunks,
     decode_fv2_lob_getlen,
+    decode_fv2_lob_value,
     decode_fv2_oer_error,
     decode_fv2_opened_locator,
     decode_o8i_bfile_getlen,
@@ -65,6 +66,7 @@ from seerdb.common.tns import (
     encode_o7_exec,
     encode_o7_lob_getlen,
     encode_o7_lob_read,
+    encode_o7_lobop,
     encode_o7_open,
     encode_o7_parse,
     encode_o8i_bfile_close,
@@ -132,6 +134,8 @@ class Dialect(Protocol):
     :class:`Send` / :data:`RECV` intents and returns the same 9-tuple the modern
     execute path produces, so ``_drain_cursor`` and the cursor are unchanged."""
 
+    keep_lobs: bool  # the connection's fetch_lobs, set per statement (#2259)
+
     def capabilities(self) -> frozenset[str]: ...
     def execute_query(self, sql: str, bind: list | None, fetch: int): ...
     def execute_dml(
@@ -149,6 +153,9 @@ CAP_DML = 'dml'
 CAP_BLOCK = 'block'
 CAP_LOB = 'lob'
 CAP_ARRAY_DML = 'array_dml'
+# The dialect serves a LOB object's calls -- read at an offset, write, trim,
+# size, chunk size, open / close -- through its own LOBOPS form (#2259).
+CAP_LOB_OBJECT = 'lob_object'
 # The dialect drives its own COMMIT / ROLLBACK (8i has no modern TTI_COMMIT); a
 # dialect without this capability leaves transaction control to the modern path.
 CAP_OWN_TXN = 'own_txn'
@@ -190,7 +197,14 @@ class Fv2Dialect:
         # 9i does query / DML / PL/SQL blocks / LOB, and array DML over
         # TTI_ALL7 (#2245). It uses the modern commit path, so it does NOT
         # advertise CAP_OWN_TXN.
-        return frozenset({CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_LOB, CAP_ARRAY_DML})
+        return frozenset(
+            {CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_LOB, CAP_ARRAY_DML, CAP_LOB_OBJECT}
+        )
+
+    # Whether a fetch keeps its LOB cells as LOB objects -- the connection's
+    # fetch_lobs, set before each statement -- rather than reading their content
+    # while the cursor is open (#2259).
+    keep_lobs = False
 
     def txn_control(self, statement: str):
         # 9i commits via the modern TTI_COMMIT path (CAP_OWN_TXN absent), so this
@@ -376,6 +390,8 @@ class Fv2Dialect:
         from seerdb.common.lob import LOB
         from seerdb.common.types import decode_fv2_lob
 
+        if self.keep_lobs:
+            return  # LOB objects, read through their own calls (#2259)
         for row in rows:
             for i, val in enumerate(row):
                 if isinstance(val, LOB) and val.data_type != TNS_TYPE_BFILE:
@@ -386,19 +402,44 @@ class Fv2Dialect:
                         columns[i].get('charset') or 0,
                     )
 
-    def lob_read(self, locator: bytes):
+    def lob_read(self, locator: bytes, offset: int = 1, amount: int | None = None):
         # 9i CLOB/BLOB content read: the two-call TTI_LOBOPS GETLEN + READ
         # (PROTOCOL.md §19.5). Returns raw bytes (CLOB decoding happens in the
         # caller with the column charset). An empty LOB (amount 0) reads nothing.
-        yield Send(encode_o7_lob_getlen(0, locator))
-        resp = yield RECV
-        if resp is False:
-            raise Exception('Connection closed during 9i LOB GETLEN')
-        amount = decode_fv2_lob_getlen(resp[1])
+        # A LOB object's read names its offset and amount (#2259); with no
+        # amount, it reads to the end.
+        if amount is None:
+            yield Send(encode_o7_lob_getlen(0, locator))
+            resp = yield RECV
+            if resp is False:
+                raise Exception('Connection closed during 9i LOB GETLEN')
+            amount = decode_fv2_lob_getlen(resp[1]) - offset + 1
         if amount <= 0:
             return b''
-        yield Send(encode_o7_lob_read(0, locator, amount))
+        yield Send(encode_o7_lob_read(0, locator, amount, offset))
         return (yield from self.read_lob_content())
+
+    def lob_operation(
+        self,
+        locator: bytes,
+        operation: int,
+        amount: int = 0,
+        offset: int = 0,
+        data: bytes | None = None,
+    ):
+        # One 9i LOB call (#2259): its reply value -- a size, the amount a write
+        # wrote, OPEN's mode, IS_OPEN's 1 or 0 -- and the locator it echoes, as
+        # the server now sees it. An error comes back as a bare status.
+        yield Send(
+            encode_o7_lobop(
+                0, locator, operation, Offset=offset, Amount=amount, Data=data
+            )
+        )
+        resp = yield RECV
+        if resp is False:
+            raise Exception('Connection closed during 9i LOB call')
+        fv2_raise_for_error(resp[1])
+        return decode_fv2_lob_value(resp[1])
 
     def bfile_read(self, locator: bytes):
         # 9i BFILE read: FILE_OPEN → GETLEN → READ → FILE_CLOSE over TTI_LOBOPS
@@ -467,6 +508,10 @@ class O8iDialect:
 
     def __init__(self, next_seq: Callable[[], int]) -> None:
         self._next_seq = next_seq
+
+    # 8i reads every LOB's content at fetch time whatever fetch_lobs says: its
+    # dialect serves no LOB object calls (#2259).
+    keep_lobs = False
 
     def capabilities(self) -> frozenset[str]:
         # 8i does query / DML / PL/SQL / LOB and drives its own COMMIT / ROLLBACK

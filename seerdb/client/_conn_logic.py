@@ -21,7 +21,7 @@ the pure methods here.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeGuard
 
 from seerdb.client.dialect import Dialect, Fv2Dialect, O8iDialect
 from seerdb.client.enums import TransactionPriority
@@ -773,6 +773,11 @@ class _ConnectionLogic:
             recipients=recipients,
         )
 
+    def dialect_serves_lobs(self) -> bool:
+        """Whether this session's pre-10g dialect serves a LOB object's calls
+        itself -- 9i's LOBOPS form, persistent-LOB writes included (#2259)."""
+        return dialect_lob_objects(getattr(self, '_dialect', None))
+
     def _raise_lobops_error(self, Packet: bytes) -> None:
         # Decode the OER trailing a content-free LOBOPS response and raise on a
         # real ORA error. decode_lobops_oer skips the RPA's binary locator and
@@ -796,6 +801,29 @@ def _pre10_tier_name_for(Dialect) -> str:
     from seerdb.client.dialect import O8iDialect
 
     return '8i' if isinstance(Dialect, O8iDialect) else '9i'
+
+
+def dialect_lob_objects(Dialect) -> 'TypeGuard[Fv2Dialect]':
+    """Whether a pre-10g dialect serves a LOB object's calls itself (9i, #2259)."""
+    from seerdb.client.dialect import CAP_LOB_OBJECT
+
+    return Dialect is not None and CAP_LOB_OBJECT in Dialect.capabilities()
+
+
+def fv2_lob_payload(
+    Data: str | bytes, is_blob: bool, charset: int | None
+) -> tuple[bytes, int]:
+    """A 9i LOB write's bytes and its amount (#2259): a BLOB's bytes, or a
+    CLOB's text in its column's database charset, which 9i carries -- not the
+    10g+ UTF-16 -- counted in characters."""
+    from typing import cast
+
+    from seerdb.common.types import _CHARSET_PYTHON_NAME
+
+    if is_blob:
+        return (cast(bytes, Data), len(Data))
+    Text = cast(str, Data)
+    return (Text.encode(_CHARSET_PYTHON_NAME.get(charset or 0, 'utf-8')), len(Text))
 
 
 def pre10_dml_applied(Result: object, BatchErrors: bool) -> bool:
