@@ -56,20 +56,23 @@ _FV2_UNSUPPORTED = (
     ('methods_on_a_missing_directory', 'fileexists() has no pre-10g LOBOPS form'),
     ('binary_double', 'BINARY_DOUBLE is a 10g+ type; Oracle 9i lacks it'),
     ('binary_float', 'BINARY_FLOAT is a 10g+ type; Oracle 9i lacks it'),
-    ('kib', 'Oracle 9i has no streamed LOB/LONG bind path (#169)'),
+    ('kib', '9i takes no bind over 4000 bytes into a LOB column (#2260)'),
     (
         'clob_bind_above_varchar2_cap',
-        'Oracle 9i has no streamed LOB/LONG bind path (#169)',
+        '9i takes no bind over 4000 bytes into a LOB column (#2260)',
     ),
     (
         'clob_bind_spans_multiple_packets',
-        'Oracle 9i has no streamed LOB/LONG bind path (#169)',
+        '9i takes no bind over 4000 bytes into a LOB column (#2260)',
     ),
     (
         'blob_bind_round_trip_all_byte_values',
-        'Oracle 9i has no streamed LOB/LONG bind path (#169)',
+        '9i takes no bind over 4000 bytes into a LOB column (#2260)',
     ),
-    ('error_then_large_lob', 'Oracle 9i has no streamed LOB/LONG bind path (#169)'),
+    (
+        'error_then_large_lob',
+        '9i takes no bind over 4000 bytes into a LOB column (#2260)',
+    ),
     # Behavioural features the fv2 path does not implement (#168): they now
     # raise a clean NotSupportedError or exercise a capability 9i lacks, rather
     # than silently misbehaving, so the tests skip on 9i.
@@ -360,7 +363,7 @@ _BINARY_FLOAT_SERVER = _Need(
     'BINARY_FLOAT / BINARY_DOUBLE are Oracle 10g+', min_server=10
 )
 _STREAMED_LOB_BIND = _Need(
-    'Oracle 9i has no streamed LOB/LONG bind path (#169)', min_fv=_FV
+    '9i takes no bind over 4000 bytes into a LOB column (#2260)', min_fv=_FV
 )
 _NATIONAL_OUT_BIND = _Need(
     'a national OUT bind is refused on fv2 (ORA-03120)', min_fv=_FV
@@ -1364,6 +1367,24 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT l FROM {self.TABLE} WHERE id = 1')
         v = self.cur.fetchone()[0]
         self.assertEqual(v, 'X' * 4000 + 'Y' * 1000)
+
+    def test_a_declared_long_bind_takes_a_large_value(self):
+        # Declared DB_TYPE_LONG / DB_TYPE_LONG_RAW, a value past 4000 bytes goes
+        # in -- on 9i too, where an undeclared one is refused because a LOB
+        # column would cost the session (#2260).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, l LONG)')
+        text = self.cur.var(seerdb.DB_TYPE_LONG, 50000)
+        text.setvalue(0, 'q' * 50000)
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1, :1)', [text])
+        self.cur.execute(f'SELECT l FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone()[0], 'q' * 50000)
+        self.cur.execute(f'DROP TABLE {self.TABLE}')
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, r LONG RAW)')
+        raw = self.cur.var(seerdb.DB_TYPE_LONG_RAW, 50000)
+        raw.setvalue(0, bytes(range(256)) * 195)
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1, :1)', [raw])
+        self.cur.execute(f'SELECT r FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone()[0], bytes(range(256)) * 195)
 
     def test_long_null(self):
         self.assertIsNone(self._round_trip('LONG', 'NULL'))
