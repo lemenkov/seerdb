@@ -371,7 +371,9 @@ _SERVER_SCROLL = _Need(
 )
 _LOBOPS = _Need('the LOB object needs the 10g+ LOBOPS path', min_fv=_FV)
 _OER_WARN_BYTE = _Need('the OER warn byte is not located on fv2', min_fv=_FV)
-_BLOCK_IOV = _Need('the fv2 block reply carries no IOV directions', min_fv=_FV)
+_BLOCK_IOV = _Need(
+    'the 8i block reply carries no IOV directions (9i: #2264)', not_8i=True
+)
 _PRE10_PARSE_REFUSAL = _Need(
     '10g+ sends a real parse; this is the pre-10g refusal', below_fv=_FV
 )

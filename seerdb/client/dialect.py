@@ -323,7 +323,9 @@ class Fv2Dialect:
         # bytes as the wrong type (#1242). Its prompt names each bind's
         # direction, in bind order, so follow that.
         directions = decode_fv2_bind_directions(packet)
-        if directions is not None and len(directions) == len(bind):
+        if directions is not None and len(directions) != len(bind):
+            directions = None  # not this block's prompt: keep the guess
+        if directions is not None:
             input_values = [
                 _block_input(b) for b, d in zip(bind, directions) if d & FV2_BIND_IN
             ]
@@ -354,9 +356,16 @@ class Fv2Dialect:
                 cursor_id = decode_ub4(out_values[i])[0]
                 (columns, rows) = yield from self._drain(cursor_id)
                 out_values[i] = _cursor_marker(cursor_id, columns, rows)
+        # The prompt's masks are the 10g+ IOV's (OUT 0x10, IN 0x20), and they
+        # are what cursor.bind_directions reports, for a block whose binds are
+        # all IN too (#1064, #2264).
         if out_positions:
-            record = {'out_positions': out_positions, 'out_values': out_values}
+            record: dict = {'out_positions': out_positions, 'out_values': out_values}
+            record['directions'] = directions
             return (0, 0, 0, (None, None), [record], None, None, [], None)
+        if directions:
+            record = {'out_positions': [], 'out_values': [], 'directions': directions}
+            return (0, 0, 0, (row_count, None), [record], None, None, [], None)
         return (0, 0, 0, (row_count, None), [], None, None, [], None)
 
     def resolve_lobs(self, rows: list, columns: list):
