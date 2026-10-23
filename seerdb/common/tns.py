@@ -13790,6 +13790,14 @@ def decode_fv2_error_position(Data: bytes) -> int:
     return 0 if Status is None else Status['position']
 
 
+def decode_fv2_warn_flags(Data: bytes) -> int:
+    """The warning flags of a 9i status (#2262), 0 for a reply without one:
+    bit 0x20 (TNS_OER_WARN_COMPILATION_ERROR) for a CREATE whose object
+    compiled with errors, which the call otherwise reports as a success."""
+    Status = _fv2_status(Data)
+    return 0 if Status is None else Status['warnings']
+
+
 def decode_fv2_batch_errors(Data: bytes) -> list[dict]:
     """The per-row errors a 9i array DML collected in `batcherrors` mode
     (#2247), as {offset, code, message}, or [] for a reply with none.
@@ -13820,7 +13828,11 @@ def _fv2_status(Data: bytes) -> dict | None:
         for _ in range(3):  # array elem error x2, cursor id
             (_, Rest) = decode_ub4(Rest)
         (Position, Rest) = decode_ub4(Rest)  # the error's offset in the SQL
-        Rest = Rest[6:]  # sql type, fatal, flags, cursor opts, upi param, warnings
+        # SQL type, fatal, flags, cursor opts, UPI param, then the warning
+        # flags: 0x20 says a CREATE made an object that compiled with errors,
+        # as on 10g+ (#993). Captured on 9.2.0.4: `18 00 00 00 00 21` (#2262).
+        Warnings = Rest[5] if len(Rest) > 5 else 0
+        Rest = Rest[6:]
         (Obj, Rest) = decode_ub4(Rest)
         (File, Rest) = decode_ub4(Rest)
         Rest = Rest[1:]  # reserved byte
@@ -13829,7 +13841,7 @@ def _fv2_status(Data: bytes) -> dict | None:
     except (IndexError, Truncated, DataError):
         return None
     Status: dict = {'code': ErrCode, 'object': Obj, 'file': File, 'block': Block}
-    Status.update(slot=Slot, position=Position, batch_errors=[])
+    Status.update(slot=Slot, position=Position, warnings=Warnings, batch_errors=[])
     try:
         (_, Rest) = decode_ub4(Rest)  # os error
         Rest = Rest[2:]  # statement #, call #

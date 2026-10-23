@@ -52,6 +52,7 @@ from seerdb.common.tns import (
     decode_fv2_lob_value,
     decode_fv2_oer_error,
     decode_fv2_opened_locator,
+    decode_fv2_warn_flags,
     decode_o8i_bfile_getlen,
     decode_ub4,
     encode_8i_lob_read,
@@ -302,7 +303,8 @@ class Fv2Dialect:
         yield Send(encode_o7_close(0))
         yield RECV  # close STA
         status: tuple = (0, err_code, 0, (row_count, None), [], message, rowid)
-        return (*status, batch_errors, None, offset)
+        warnings = decode_fv2_warn_flags(resp[1])  # cursor.warning (#2262)
+        return (*status, batch_errors, None, offset, warnings)
 
     def execute_block(self, sql: str, bind: list | None = None):
         # Anonymous PL/SQL block over the fv2 TTI_ALL7 block path (#102, PROTOCOL
