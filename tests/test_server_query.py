@@ -2119,19 +2119,31 @@ def test_encode_describe_reply_oci_matches_live_11g() -> None:
     assert reply == _OCI_DESCRIBE_SEER_N
 
 
+def _desc_block(col: ColumnMeta) -> dict:
+    # A DESCRIBE reply's block for ``col`` as its last column, read back by its
+    # schema (_OCI_DESC_BLOCK) at 11.2.
+    from seerdb.common.tns import _OCI_DESC_BLOCK_FROM_OCI, _oci_desc_block
+
+    block = _oci_desc_block(col, last=True, timestamp=bytes(7))
+    given = {'has_mark_zero': True, 'oci_12c': False, 'more': 0, 'last': True}
+    (fields, rest) = _OCI_DESC_BLOCK_FROM_OCI(block, given)
+    assert rest == b''
+    return fields
+
+
 def test_encode_describe_reply_oci_multicolumn_frames_each_column() -> None:
     # A multi-column reply carries the column count (header N+1, trailer N) and one
     # block per column, with the meaningful fields per type.
-    from seerdb.common.tns import _OCI_DESC_COLCOUNT_OFF, encode_describe_reply_oci
+    from seerdb.common.tns import _OCI_DESC_HEAD_FROM_OCI, encode_describe_reply_oci
 
     cols = [
         ColumnMeta(name=b'ID', data_type=TNS_TYPE_NUMBER, data_length=22, max_size=22),
         ColumnMeta(name=b'V', data_type=TNS_TYPE_VARCHAR, data_length=30, max_size=30),
     ]
     reply = encode_describe_reply_oci(cols, schema=b'PYO', table=b'T')
-    # header column-count field is N+1 (it sits inside the header-post segment,
-    # after HDR_PRE 25 B + schema DALC 8 B + table DALC 6 B)
-    assert reply[25 + 8 + 6 + _OCI_DESC_COLCOUNT_OFF] == 3
+    # The header's column-count field is N+1.
+    (head, _rest) = _OCI_DESC_HEAD_FROM_OCI(reply, {'oci_12c': False})
+    assert (head['table'], head['column_count_plus_one']) == (b'T', 3)
 
 
 def test_sqlplus_10_2_gets_the_narrower_describe_reply() -> None:
@@ -2180,12 +2192,9 @@ def test_national_char_values_and_describe_ride_as_utf16be() -> None:
     from seerdb.common.tns import (
         _OCI_DCB_CHAR_SEMANTICS_FLAG,
         _OCI_DCB_CHAR_SEMANTICS_OFF,
-        _OCI_DESC_POST_PREC,
-        _OCI_DESC_POST_SCALE,
         AL16UTF16_CHARSET,
         _encode_dcb_column_oci,
         _national_wire_value,
-        _oci_desc_block,
     )
     from seerdb.common.tns_consts import TNS_TYPE_CHAR
 
@@ -2218,17 +2227,12 @@ def test_national_char_values_and_describe_ride_as_utf16be() -> None:
     assert dcb_p[_OCI_DCB_CHAR_SEMANTICS_OFF] == 0
 
     # 3) the DESCRIBE reply carries the byte length + national flag + char length.
-    def post(col: ColumnMeta) -> tuple[int, bytes]:
-        block = _oci_desc_block(col, last=True, timestamp=bytes(7))
-        return block[2], block[6 + 4 + 1 + len(col.name) :]
-
-    n_size, n_post = post(nchar)
-    p_size, p_post = post(plain)
-    assert n_size == 10  # byte length; sqlplus halves it via the flag
-    assert n_post[_OCI_DESC_POST_PREC] == 0x80  # national flag
-    assert n_post[_OCI_DESC_POST_SCALE] == 5  # character length
-    assert p_size == 4  # ordinary char keeps its byte size unchanged
-    assert p_post[_OCI_DESC_POST_PREC] == 0
+    n_block, p_block = _desc_block(nchar), _desc_block(plain)
+    assert n_block['size'] == 10  # byte length; sqlplus halves it via the flag
+    assert n_block['precision'] == 0x80  # national flag
+    assert n_block['scale'] == 5  # character length
+    assert p_block['size'] == 4  # ordinary char keeps its byte size unchanged
+    assert p_block['precision'] == 0
 
 
 def test_describe_reply_lays_out_interval_precisions() -> None:
@@ -2237,16 +2241,7 @@ def test_describe_reply_lays_out_interval_precisions() -> None:
     #   YEAR TO MONTH -> the year precision in BOTH bytes (YEAR(3) -> 03 03);
     #   DAY TO SECOND -> swapped: precision = SECOND fractional (col.scale),
     #                    scale = DAY leading (col.precision) (DAY(2) SEC(6) -> 06 02).
-    from seerdb.common.tns import (
-        _OCI_DESC_POST_PREC,
-        _OCI_DESC_POST_SCALE,
-        _oci_desc_block,
-    )
     from seerdb.common.tns_consts import TNS_TYPE_INTERVALDS, TNS_TYPE_INTERVALYM
-
-    def post(col: ColumnMeta) -> bytes:
-        block = _oci_desc_block(col, last=True, timestamp=bytes(7))
-        return block[6 + 4 + 1 + len(col.name) :]
 
     # INTERVAL YEAR(3) TO MONTH: client carries the year precision in `precision`.
     ym = ColumnMeta(
@@ -2257,9 +2252,7 @@ def test_describe_reply_lays_out_interval_precisions() -> None:
         precision=3,
         scale=0,
     )
-    ym_post = post(ym)
-    assert ym_post[_OCI_DESC_POST_PREC] == 3
-    assert ym_post[_OCI_DESC_POST_SCALE] == 3
+    assert (_desc_block(ym)['precision'], _desc_block(ym)['scale']) == (3, 3)
 
     # INTERVAL DAY(2) TO SECOND(6): client carries day in `precision`, second in
     # `scale`; the describe swaps them.
@@ -2271,9 +2264,8 @@ def test_describe_reply_lays_out_interval_precisions() -> None:
         precision=2,
         scale=6,
     )
-    ds_post = post(ds)
-    assert ds_post[_OCI_DESC_POST_PREC] == 6  # SECOND fractional
-    assert ds_post[_OCI_DESC_POST_SCALE] == 2  # DAY leading
+    assert _desc_block(ds)['precision'] == 6  # SECOND fractional
+    assert _desc_block(ds)['scale'] == 2  # DAY leading
 
 
 def test_describe_reply_puts_timestamp_precision_in_the_precision_field() -> None:
@@ -2282,11 +2274,6 @@ def test_describe_reply_puts_timestamp_precision_in_the_precision_field() -> Non
     # from it. The client carries that precision in `scale` (precision 0), so the
     # describe block mirrors scale into precision for TIMESTAMP types — while a
     # NUMBER keeps its own precision and scale distinct.
-    from seerdb.common.tns import (
-        _OCI_DESC_POST_PREC,
-        _OCI_DESC_POST_SCALE,
-        _oci_desc_block,
-    )
     from seerdb.common.tns_consts import TNS_TYPE_TIMESTAMP
 
     ts = ColumnMeta(
@@ -2306,17 +2293,9 @@ def test_describe_reply_puts_timestamp_precision_in_the_precision_field() -> Non
         scale=2,
     )
 
-    def post(col: ColumnMeta) -> bytes:
-        block = _oci_desc_block(col, last=True, timestamp=bytes(7))
-        # The post-name region starts after the 6-byte pre + the name DALC
-        # (a ub4 char length + a ub1 byte length + the name bytes).
-        return block[6 + 4 + 1 + len(col.name) :]
-
-    ts_post, num_post = post(ts), post(num)
-    assert ts_post[_OCI_DESC_POST_PREC] == 6  # mirrored from scale for TIMESTAMP
-    assert ts_post[_OCI_DESC_POST_SCALE] == 6
-    assert num_post[_OCI_DESC_POST_PREC] == 8  # NUMBER keeps its own precision
-    assert num_post[_OCI_DESC_POST_SCALE] == 2
+    # Mirrored from scale for TIMESTAMP; NUMBER keeps its own precision.
+    assert (_desc_block(ts)['precision'], _desc_block(ts)['scale']) == (6, 6)
+    assert (_desc_block(num)['precision'], _desc_block(num)['scale']) == (8, 2)
 
 
 def test_parse_describe_oci_extracts_the_object_name() -> None:
@@ -2393,7 +2372,7 @@ def test_sqlplus_10_2_gets_the_narrower_describe() -> None:
     # column's post-name block 9 bytes not 13, and the trailer lacks the zero
     # ub4 ahead of its marker (the LOB describe's trailer too).
     from seerdb.common.tns import (
-        _OCI_DCB_MARKER,
+        _OCI_RXH_FROM_OCI,
         _oci_dcb_tail,
         _oci_lob_describe_tail,
         encode_describe_oci,
@@ -2428,8 +2407,9 @@ def test_sqlplus_10_2_gets_the_narrower_describe() -> None:
     ]
     assert [names[1] - names[0], names[2] - names[1]] == [61, 59]
     assert (len(wide_tail), len(tail)) == (83, 79)
-    assert tail[29 : 29 + len(_OCI_DCB_MARKER)] == _OCI_DCB_MARKER
-    assert tail[33] == 3  # the column count, four bytes earlier
+    # The row header, carrying the column count, four bytes earlier.
+    (rxh, rest) = _OCI_RXH_FROM_OCI(tail[29:])
+    assert (rxh['unpinned_2'], rxh['unpinned_4'], rest) == (0x22, 3, b'')
     assert (len(wide_lob), len(lob)) == (33, 29)
 
 
@@ -4319,16 +4299,13 @@ def test_encode_error_oci_matches_the_captured_ora_error() -> None:
 def test_oci_dcb_tail_is_column_aware() -> None:
     # The DCB tail carries the column count; the client reads it to parse each
     # row, so it is load-bearing for a multi-column result (#265, #346).
-    from seerdb.common.tns import (
-        _OCI_DCB_MARKER_OFF,
-        _OCI_DCB_NUMCOLS_OFF,
-        _oci_dcb_tail,
-    )
+    from seerdb.common.tns import _OCI_RXH_FROM_OCI, _oci_dcb_tail
 
-    assert _oci_dcb_tail(3)[_OCI_DCB_NUMCOLS_OFF] == 3
-    assert _oci_dcb_tail(1)[_OCI_DCB_NUMCOLS_OFF] == 1
-    off = _OCI_DCB_MARKER_OFF
-    assert _oci_dcb_tail(2)[off : off + 3] == bytes.fromhex('060122')
+    for count in (1, 3):
+        (rxh, rest) = _OCI_RXH_FROM_OCI(_oci_dcb_tail(count)[33:])
+        assert (rxh['unpinned_4'], rest) == (count, b'')
+    # Its `06 01 22` head, which the client cannot do without.
+    assert _oci_dcb_tail(2)[33:36] == bytes.fromhex('060122')
 
 
 def test_encode_query_response_oci_signals_more_rows() -> None:
