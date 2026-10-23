@@ -8655,13 +8655,40 @@ def _oci_version_trailer(release: int) -> bytes:
     return release.to_bytes(4, 'big')[:3][::-1] + _OCI_VERSION_CAPS
 
 
-# A 3-byte marker in the describe-column trailer. Load-bearing by position — the
-# client draws ORA-03113 if it is zeroed (§36). Its byte values' meaning stays
-# opaque, but differential capture (11g / 21c / 23ai, 2026-09-07) confirms it is
-# a FIXED marker: byte-identical in the describe reply of all three, with the
-# same preceding frame — a stable protocol constant, not version-specific, so it
-# is correctly carried (§39.2).
-_OCI_DCB_MARKER = bytes.fromhex('060122')
+# The OCI row header (TTI_RXH) that leads the rows: 50 bytes, the token and its
+# flags then single bytes at fixed offsets, the rest zero. The query describe's
+# tail, a fetch batch and a LOB-locator fetch each carry one with values of its
+# own. Their meaning is unpinned: offset 4 is the describe's column count, and
+# reads 2 in the fetch's and 1 in the LOB fetch's; the describe's `06 01 22`
+# head is byte-identical in the 11g, 21c and 23ai replies (differential
+# capture, 2026-09-07) and the client draws ORA-03113 if it is zeroed (§36,
+# §39.2). Reduced to these from live replies (#265, #351, #405).
+_OCI_RXH: wire_schema.Schema = (
+    ('const', bytes([TTI_RXH])),
+    ('u8', 'flags'),
+    ('u8', 'unpinned_2'),
+    ('u8', 'unpinned_3'),
+    ('u8', 'unpinned_4'),
+    ('pad', 5),
+    ('u8', 'unpinned_10'),
+    ('pad', 39),
+)
+_OCI_RXH_OCI = wire_schema.compile_encoder(_OCI_RXH, _OCI)
+_OCI_RXH_FROM_OCI = wire_schema.compile_decoder(_OCI_RXH, _OCI)
+
+
+def _oci_rxh_of(
+    unpinned_2: int, unpinned_3: int, unpinned_4: int, unpinned_10: int
+) -> bytes:
+    return _OCI_RXH_OCI(
+        {
+            'flags': 0x01,
+            'unpinned_2': unpinned_2,
+            'unpinned_3': unpinned_3,
+            'unpinned_4': unpinned_4,
+            'unpinned_10': unpinned_10,
+        }
+    )
 
 
 # The OCI OER return-status token (§36), reverse-engineered against live 11g:
@@ -10197,19 +10224,7 @@ def _oci_describe_body(columns: list[ColumnMeta]) -> bytes:
 # the field *framing* and a few structural constants matter (zeroing them
 # segfaults sqlplus or draws ORA-03113). So both are computed as mostly-zero with
 # those constants in place, not replayed from a capture.
-_OCI_DCB_TAIL_LEN = 83
-
-
 _OCI_DCB_DATE_LEN = 7  # describe-time DALC: length is load-bearing, value is not
-
-
-_OCI_DCB_MARKER_OFF = 33
-
-
-# The column count sits one byte past the marker; the client reads it to know how
-# many values to expect in each row, so it is load-bearing for a multi-column
-# result (verified: 1/2/3 across live 1/2/3-column describes).
-_OCI_DCB_NUMCOLS_OFF = 37
 
 
 # The trailer's query-key length is an 11.2 field: 11g sends sqlplus 10.2
@@ -10253,87 +10268,126 @@ def _oci_desc_timestamp() -> bytes:
 # the capture (a synthetic id would need live validation, like the DML rowid);
 # naming them turns the header's recurring `be010000` / `44c50100` runs into
 # "object id" / "data-object id" rather than opaque bytes (§39.2).
-_OCI_DESC_OBJECT_ID = struct.pack('<I', 446)  # be 01 00 00
-_OCI_DESC_DATA_OBJECT_ID = struct.pack('<I', 116036)  # 44 c5 01 00
+_OCI_DESC_OBJECT_ID = 446  # be 01 00 00
+_OCI_DESC_DATA_OBJECT_ID = 116036  # 44 c5 01 00
 
-# The header's fixed framing, split around the three describe-time DALCs it carries
-# (`27 01` / `27 0b` / `27 00` — see below) and the object numbers above; the runs
-# between are opaque object-metadata framing.
-_OCI_DESC_HDR_PRE_A = bytes.fromhex('0801000100000027010700000007')
-_OCI_DESC_HDR_PRE_B = bytes.fromhex('00000000')
-_OCI_DESC_HDR_POST_SEGMENTS = (
-    _OCI_DESC_DATA_OBJECT_ID
-    + bytes.fromhex('0000000000000000000100000072')
-    + _OCI_DESC_DATA_OBJECT_ID
-    + bytes.fromhex('0000000001000000')
-    + _OCI_DESC_OBJECT_ID
-    + bytes.fromhex('00270b0700000007'),
-    bytes.fromhex('000000000000000000000000000000000000000000010000000b0102000000')
-    + _OCI_DESC_OBJECT_ID
-    + bytes.fromhex('0027000700000007'),
-    bytes.fromhex(
-        '020000000000000000000000000000000000000000000000000000000000000000000000'
-        '000000000000000000000000000000000000000000000000000000000000000000000000'
-        '000000000000000000000000000000000000000000000000000100000027090700000007'
-    ),
-    bytes.fromhex(
-        '020000000000000000000000000000000000000000000000000000000000000000000000'
-        '00000000000000000000000000010000'
-    ),
-)
+
+# A DESCRIBE name (schema, table or column): a ub4 character length, a ub1 byte
+# length, then the bytes.
+def _oci_desc_name(field: str) -> wire_schema.Schema:
+    return (
+        ('n4', f'{field}_chars'),
+        ('u8', f'{field}_length'),
+        ('bytes', field, f'{field}_length'),
+    )
+
+
+# The describe-time entry: a `27 09` tag and the date as a describe-time DALC
+# (`ub4 len 7 | ub1 len 7 | date`), then `02`.
 _OCI_DESC_TS_ENTRY_PRE = bytes.fromhex('0100000027090700000007')
-_OCI_DESC_TS_ENTRY_POST = bytes.fromhex('02')
 
 
-def _oci_desc_hdr_pre(timestamp: bytes) -> bytes:
-    return _OCI_DESC_HDR_PRE_A + timestamp + _OCI_DESC_HDR_PRE_B
-
-
-def _oci_desc_hdr_post(timestamp: bytes) -> bytes:
-    return timestamp.join(_OCI_DESC_HDR_POST_SEGMENTS)
-
-
-def _oci_desc_hdr_third_entry_end(timestamp: bytes) -> int:
-    # Where the header's third segment starts plus its leading `02` byte: the
-    # two segments ahead of it, each followed by a describe time.
-    head = _OCI_DESC_HDR_POST_SEGMENTS[:2]
-    return sum(len(seg) for seg in head) + 2 * len(timestamp) + 1
-
-
-def _oci_desc_ts_entry(timestamp: bytes) -> bytes:
-    # The describe-time entry a non-last column block carries (§39.2).
-    return _OCI_DESC_TS_ENTRY_PRE + timestamp + _OCI_DESC_TS_ENTRY_POST
-
-
-_OCI_DESC_BLK = bytes.fromhex(
-    '005c160002000100000001430a0201000000000000000000000000000000000000000000'
-    '000000000000000000002400000000000000000000000000000000000000000000000000'
-    '000000000000000000000000000000000000000000000000000000000000000000000000'
-    '000000000000000000000000000000000000000000000000000000000000000000000000'
-    '00000000000000000000000000000000000000'
+# The DESCRIBE reply's header: its fixed framing around three describe-time
+# entries (`27 01` / `27 0b` / `27 00`), the schema and table names, the object
+# numbers above and the column count plus one; the runs between are opaque
+# object-metadata framing (differential-mapped). The 12c band inserts 8 zero
+# bytes after the third entry's `02` (#1282).
+_OCI_DESC_HEAD: wire_schema.Schema = (
+    ('const', bytes.fromhex('0801000100000027010700000007')),
+    ('bytes', 'time', 7),
+    ('pad', 4),
+    *_oci_desc_name('schema'),
+    *_oci_desc_name('table'),
+    ('n4', 'data_object_id'),
+    ('const', bytes.fromhex('0000000000000000000100000072')),
+    ('n4', 'data_object_id'),
+    ('const', bytes.fromhex('0000000001000000')),
+    ('n4', 'object_id'),
+    ('const', bytes.fromhex('00270b0700000007')),
+    ('bytes', 'time', 7),
+    ('pad', 21),
+    ('const', bytes.fromhex('010000000b01')),
+    ('u8', 'column_count_plus_one'),
+    ('pad', 3),
+    ('n4', 'object_id'),
+    ('const', bytes.fromhex('0027000700000007')),
+    ('bytes', 'time', 7),
+    ('const', b'\x02'),
+    ('when', 'oci_12c', (('pad', 8),)),
+    ('pad', 96),
+    ('const', _OCI_DESC_TS_ENTRY_PRE),
+    ('bytes', 'time', 7),
+    ('const', b'\x02'),
+    ('pad', 48),
+    ('const', b'\x01'),
+    ('pad', 2),
 )
-# Meaningful-field offsets within the segments (differential-mapped).
-_OCI_DESC_COLCOUNT_OFF = 76  # HDR_POST: column count + 1
-_OCI_DESC_BLK_SIZE = 2  # BLK pre-name: data length (single byte)
-_OCI_DESC_BLK_TYPE = 4  # BLK pre-name: TNS data type
-_OCI_DESC_BLK_PRENAME = 6  # BLK: length before the column-name DALC
-_OCI_DESC_POST_PREC = 0  # BLK post-name: precision
-_OCI_DESC_POST_SCALE = 1  # BLK post-name: scale (NUMBER) / length (char)
-_OCI_DESC_POST_NULL = 2  # BLK post-name: 1 nullable, 0 NOT NULL
-_OCI_DESC_POST_CSLO = 15  # BLK post-name: charset ub2 LE (low byte)
-_OCI_DESC_POST_CSHI = 16
-_OCI_DESC_POST_CSFRM = 17
-_OCI_DESC_BLK_CONT = 3  # BLK: `1` at (len - 3) on a non-last column, else `0`
-_OCI_DESC_TR_COUNT = 2  # TRAILER: column count
-_OCI_DESC_TR_OPAQUE = 8  # TRAILER: a type-dependent opaque byte (carried)
+_OCI_DESC_HEAD_OCI = wire_schema.compile_encoder(_OCI_DESC_HEAD, _OCI)
+_OCI_DESC_HEAD_FROM_OCI = wire_schema.compile_decoder(_OCI_DESC_HEAD, _OCI)
+
+
+# One column's block: its length, type and name, then precision, scale,
+# nullability, charset and form, a mark (0x24, 0x04 from 12c), and on every
+# column but the last a describe-time entry and a `1` continuation flag 3
+# bytes before its end. sqlplus hangs on a multi-column reply whose non-last
+# blocks omit the entry. The lead byte reads 0x5c, 0x7a from 12c. sqlplus
+# 10.2's block is a byte shorter, without the zero behind the mark, where the
+# 12c form grows 20 zero bytes (#1282, #1764).
+_OCI_DESC_BLOCK: wire_schema.Schema = (
+    ('pad', 1),
+    ('u8', 'lead'),
+    ('u8', 'size'),  # the data length, a single byte
+    ('pad', 1),
+    ('u8', 'data_type'),
+    ('pad', 1),
+    *_oci_desc_name('name'),
+    ('u8', 'precision'),
+    ('u8', 'scale'),  # a NUMBER's scale, a char column's length
+    ('u8', 'nullable'),
+    ('pad', 12),
+    ('n2', 'charset'),
+    ('u8', 'csfrm'),
+    ('pad', 16),
+    ('u8', 'mark'),
+    ('when', 'has_mark_zero', (('pad', 1),)),
+    ('when', 'oci_12c', (('pad', 20),)),
+    ('pad', 45),
+    ('when', 'more', (('const', _OCI_DESC_TS_ENTRY_PRE), ('bytes', 'time', 7))),
+    ('when', 'more', (('const', b'\x02'),)),
+    ('when', 'last', (('pad', 19),)),
+    ('pad', 48),
+    ('u8', 'more'),
+    ('pad', 2),
+)
+_OCI_DESC_BLOCK_OCI = wire_schema.compile_encoder(_OCI_DESC_BLOCK, _OCI)
+_OCI_DESC_BLOCK_FROM_OCI = wire_schema.compile_decoder(_OCI_DESC_BLOCK, _OCI)
 
 # The DESCRIBE reply's 257-byte trailer, decoded: a 121-byte describe-specific
-# frame, then a standard 136-byte OCI OER return status (the same envelope every
-# other reply ends with, built by encode_oci_oer — its offset-56 `36 01` and
-# offset-72 `20 f6 31 0a` are the fixed 11g OER constants, §36). The frame is
-# zero but for the column count and the type-dependent opaque byte (both patched
-# per reply) and four carried framing constants.
-_OCI_DESC_TRAILER_FRAME_LEN = 121
+# frame, then a standard OCI OER return status (the same envelope every other
+# reply ends with, built by encode_oci_oer — its offset-56 `36 01` and offset-72
+# `20 f6 31 0a` are the fixed 11g OER constants, §36). The frame is zero but for
+# the column count, a type-dependent opaque byte and three carried values.
+# sqlplus 10.2's is a byte shorter (#1764). From 12.1 it is 137 bytes: 8 zero
+# bytes in front and 8 at the end, byte 4 reading 0x05 instead of 0x04 and the
+# type-dependent bytes (8, 9, 11) left zero, as 18c leaves them (#1282).
+_OCI_DESC_TRAILER_FRAME: wire_schema.Schema = (
+    ('when', 'oci_12c', (('pad', 8),)),
+    ('pad', 2),
+    ('u8', 'column_count'),
+    ('pad', 1),
+    ('u8', 'unpinned_4'),
+    ('pad', 3),
+    ('u8', 'opaque'),
+    ('u8', 'unpinned_9'),
+    ('pad', 1),
+    ('u8', 'unpinned_11'),
+    ('pad', 4),
+    ('const', b'\x09'),
+    ('pad', 103),
+    ('when', 'has_last_zero', (('pad', 1),)),
+    ('when', 'oci_12c', (('pad', 8),)),
+)
+_OCI_DESC_TRAILER_FRAME_OCI = wire_schema.compile_encoder(_OCI_DESC_TRAILER_FRAME, _OCI)
 # The OER's carried fields. The status byte is 0x05 — the value the execute
 # path names OCI_OER_STATUS_ERROR — yet this is a *successful* DESCRIBE with
 # error code 0, so it is carried as the describe's terminal status rather than
@@ -10346,59 +10400,37 @@ _OCI_DESC_OER_ROW_FIELD = 1  # offset 8, the dual row-kind / rowcount slot: one
 _OCI_DESC_OER_CATEGORY = 0
 
 
-def _oci_desc_trailer_frame() -> bytes:
-    frame = bytearray(_OCI_DESC_TRAILER_FRAME_LEN)
-    frame[_OCI_DESC_TR_COUNT] = 0x01
-    frame[4] = 0x04
-    frame[_OCI_DESC_TR_OPAQUE] = 0xCA
-    frame[9] = 0x14
-    frame[11] = 0x01
-    frame[16] = 0x09
-    return bytes(frame)
+def _oci_desc_trailer_frame(column_count: int, opaque: int) -> bytes:
+    field_version = _ENCODE_FIELD_VERSION.get()
+    wide = field_version >= FIELD_VERSION_12_1
+    return _OCI_DESC_TRAILER_FRAME_OCI(
+        {
+            'oci_12c': wide,
+            'column_count': column_count & 0xFF,
+            'unpinned_4': _OCI_DESC_12C_TR_MARK if wide else 0x04,
+            'opaque': 0 if wide else opaque,
+            'unpinned_9': 0 if wide else 0x14,
+            'unpinned_11': 0 if wide else 0x01,
+            'has_last_zero': field_version >= FIELD_VERSION_11_2,
+        }
+    )
 
 
 # The DESCRIBE reply at the 12c band (#1282), measured against a live 18c's
-# describe of a NUMBER / VARCHAR2 / DATE table. It is the 11g reply with zero
-# runs inserted and three carried values changed:
-#   - the header gains 8 zero bytes after the third describe-time entry;
-#   - each column block gains 20 zero bytes after its post-name byte 34, which
-#     reads 0x04 instead of 0x24, and its leading length-like byte reads 0x7a
-#     instead of 0x5c;
-#   - the trailer frame is 137 bytes, not 121: 8 zero bytes in front and 8 at
-#     the end, with byte 4 reading 0x05 instead of 0x04 and the type-dependent
-#     bytes (8, 9, 11) left zero, as 18c leaves them.
-# The OER behind the frame widens like every other (_OCI_OER). None of the
-# changed values is decoded; they are carried from the capture.
-_OCI_DESC_12C_HDR_GROWTH = 8
-_OCI_DESC_12C_BLK_LEAD = 0x7A
-_OCI_DESC_12C_POST_MARK_OFF = 34
-_OCI_DESC_12C_POST_MARK = 0x04
-_OCI_DESC_12C_BLK_GROWTH = 20
-_OCI_DESC_12C_TR_PAD = 8
+# describe of a NUMBER / VARCHAR2 / DATE table: the 11g reply with zero runs
+# inserted in the header, each column block and the trailer frame, and three
+# carried values changed (the schemas above say where). The OER behind the
+# frame widens like every other (_OCI_OER). None of the changed values is
+# decoded; they are carried from the capture.
 _OCI_DESC_12C_TR_MARK = 0x05
 
 
-def _oci_desc_12c() -> bool:
-    return _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
-
-
-def _oci_desc_trailer_frame_12c(column_count: int) -> bytes:
-    frame = bytearray(_OCI_DESC_TRAILER_FRAME_LEN)
-    frame[_OCI_DESC_TR_COUNT] = column_count & 0xFF
-    frame[4] = _OCI_DESC_12C_TR_MARK
-    frame[16] = 0x09
-    pad = bytes(_OCI_DESC_12C_TR_PAD)
-    return pad + bytes(frame) + pad
-
-
-def _oci_desc_trailer(frame: bytes | None = None) -> bytes:
+def _oci_desc_trailer(column_count: int, opaque: int) -> bytes:
     # Built per reply, not once at import: the OER's offset-49 field carries the
     # sequence of the call being answered, which is only known per message
     # (#884). Freezing it at import would pin every DESCRIBE reply to whatever
     # the context held when the module loaded.
-    if frame is None:
-        frame = _oci_desc_trailer_frame()
-    return frame + encode_oci_oer(
+    return _oci_desc_trailer_frame(column_count, opaque) + encode_oci_oer(
         _OCI_DESC_STATUS,
         sequence=_OCI_DESC_OER_SEQUENCE,
         row_kind=_OCI_DESC_OER_ROW_FIELD,
@@ -10435,17 +10467,6 @@ _OCI_DESC_CHAR_TYPES = frozenset({TNS_TYPE_VARCHAR, TNS_TYPE_CHAR})
 _OCI_DESC_TIMESTAMP_TYPES = frozenset(
     {TNS_TYPE_TIMESTAMP, TNS_TYPE_TIMESTAMPTZ, TNS_TYPE_TIMESTAMPLTZ}
 )
-# Every column block but the LAST carries a describe-timestamp entry (a fixed frame
-# around the 7-byte date, built by _oci_desc_ts_entry) in its post-name region;
-# the last block leaves it zero. sqlplus hangs on a multi-column reply whose
-# non-last blocks omit it.
-_OCI_DESC_BLK_TS_OFF = 81  # offset of the entry within a block's post-name region
-
-
-def _oci_desc_dalc(name: bytes) -> bytes:
-    # The describe-reply name form: a ub4 LE char length, a ub1 byte length, then
-    # the bytes. (Schema, table and column names all use it.)
-    return struct.pack('<I', len(name)) + bytes([len(name)]) + name
 
 
 def _oci_desc_precision_scale(col: ColumnMeta) -> tuple[int, int]:
@@ -10472,52 +10493,38 @@ def _oci_desc_precision_scale(col: ColumnMeta) -> tuple[int, int]:
 
 
 def _oci_desc_block(col: ColumnMeta, *, last: bool, timestamp: bytes) -> bytes:
-    pre = bytearray(_OCI_DESC_BLK[:_OCI_DESC_BLK_PRENAME])
+    field_version = _ENCODE_FIELD_VERSION.get()
+    wide = field_version >= FIELD_VERSION_12_1
     is_char = col.data_type in _OCI_DESC_CHAR_TYPES
     national = is_char and col.csfrm == _CSFRM_NCHAR
     size = _OCI_DESC_WIRE_SIZE.get(col.data_type, col.max_size)
-    if national:
-        # NCHAR / NVARCHAR2: the size field is the UTF-16 byte length, which
-        # sqlplus halves (via the 0x80 flag below) to the character count.
-        size = col.data_length
-    pre[_OCI_DESC_BLK_SIZE] = size & 0xFF
-    pre[_OCI_DESC_BLK_TYPE] = col.data_type
-    post = bytearray(_OCI_DESC_BLK[_OCI_DESC_BLK_PRENAME + 6 :])
     precision, scale = _oci_desc_precision_scale(col)
-    post[_OCI_DESC_POST_PREC] = precision & 0xFF
-    post[_OCI_DESC_POST_SCALE] = scale & 0xFF
-    post[_OCI_DESC_POST_NULL] = 1 if col.null_ok else 0
-    if is_char:
-        post[_OCI_DESC_POST_CSLO] = col.charset & 0xFF
-        post[_OCI_DESC_POST_CSHI] = (col.charset >> 8) & 0xFF
-        post[_OCI_DESC_POST_CSFRM] = col.csfrm
-        if national:
-            # The national flag makes sqlplus halve the byte size to the declared
-            # character count; the character length itself goes in the scale byte.
-            post[_OCI_DESC_POST_PREC] = 0x80
-            post[_OCI_DESC_POST_SCALE] = col.max_size & 0xFF
-    if not last:
-        # A non-last column carries a describe-timestamp entry in its post-name
-        # region (the last column leaves it zero).
-        entry = _oci_desc_ts_entry(timestamp)
-        off = _OCI_DESC_BLK_TS_OFF
-        post[off : off + len(entry)] = entry
-    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_11_2:
-        # sqlplus 10.2's block is a byte shorter: 11g sends it without the zero
-        # behind the 0x24 mark, where the 12c form grows (#1764).
-        del post[_OCI_DESC_12C_POST_MARK_OFF + 1]
-    if _oci_desc_12c():
-        pre[1] = _OCI_DESC_12C_BLK_LEAD
-        mark = _OCI_DESC_12C_POST_MARK_OFF
-        post[mark] = _OCI_DESC_12C_POST_MARK
-        post[mark + 1 : mark + 1] = bytes(_OCI_DESC_12C_BLK_GROWTH)
-    block = bytes(pre) + _oci_desc_dalc(col.name) + bytes(post)
-    if not last:
-        # …and a `1` continuation flag 3 bytes before its end.
-        marked = bytearray(block)
-        marked[-_OCI_DESC_BLK_CONT] = 1
-        block = bytes(marked)
-    return block
+    if national:
+        # NCHAR / NVARCHAR2: the size field is the UTF-16 byte length, and the
+        # national flag in the precision makes sqlplus halve it to the declared
+        # character count; the character length itself goes in the scale.
+        (size, precision, scale) = (col.data_length, 0x80, col.max_size)
+    return _OCI_DESC_BLOCK_OCI(
+        {
+            'lead': 0x7A if wide else 0x5C,
+            'size': size & 0xFF,
+            'data_type': col.data_type,
+            'name_chars': len(col.name),
+            'name_length': len(col.name),
+            'name': col.name,
+            'precision': precision & 0xFF,
+            'scale': scale & 0xFF,
+            'nullable': 1 if col.null_ok else 0,
+            'charset': col.charset if is_char else 0,
+            'csfrm': col.csfrm if is_char else 0,
+            'mark': 0x04 if wide else 0x24,
+            'has_mark_zero': field_version >= FIELD_VERSION_11_2,
+            'oci_12c': wide,
+            'time': timestamp,
+            'more': 0 if last else 1,
+            'last': last,
+        }
+    )
 
 
 def encode_describe_reply_oci(
@@ -10538,33 +10545,31 @@ def encode_describe_reply_oci(
     # block; a caller may pin it (the byte-for-byte capture test does).
     if timestamp is None:
         timestamp = _oci_desc_timestamp()
-    out = bytearray(_oci_desc_hdr_pre(timestamp))
-    out += _oci_desc_dalc(schema) + _oci_desc_dalc(table)
-    header_post = bytearray(_oci_desc_hdr_post(timestamp))
-    header_post[_OCI_DESC_COLCOUNT_OFF] = (len(columns) + 1) & 0xFF
-    if _oci_desc_12c():
-        # After the third describe-time entry and the `02` behind it (#1282).
-        at = _oci_desc_hdr_third_entry_end(timestamp)
-        header_post[at:at] = bytes(_OCI_DESC_12C_HDR_GROWTH)
-    out += header_post
+    out = bytearray(
+        _OCI_DESC_HEAD_OCI(
+            {
+                'time': timestamp,
+                'schema_chars': len(schema),
+                'schema_length': len(schema),
+                'schema': schema,
+                'table_chars': len(table),
+                'table_length': len(table),
+                'table': table,
+                'data_object_id': _OCI_DESC_DATA_OBJECT_ID,
+                'object_id': _OCI_DESC_OBJECT_ID,
+                'column_count_plus_one': (len(columns) + 1) & 0xFF,
+                'oci_12c': _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1,
+            }
+        )
+    )
     for index, col in enumerate(columns):
         out += _oci_desc_block(col, last=index == len(columns) - 1, timestamp=timestamp)
-    if _oci_desc_12c():
-        out += _oci_desc_trailer(_oci_desc_trailer_frame_12c(len(columns)))
-        return bytes(out)
-    frame = _oci_desc_trailer_frame()
-    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_11_2:
-        # ...and its trailer frame one shorter: 120 bytes ahead of the OER, the
-        # last zero of 11.2's 121 dropped (#1764).
-        frame = frame[:-1]
-    trailer = bytearray(_oci_desc_trailer(frame))
-    trailer[_OCI_DESC_TR_COUNT] = len(columns) & 0xFF
-    trailer[_OCI_DESC_TR_OPAQUE] = (
+    opaque = (
         _OCI_DESC_TR_OPAQUE_BY_TYPE.get(columns[0].data_type, _OCI_DESC_TR_OPAQUE_MULTI)
         if len(columns) == 1
         else _OCI_DESC_TR_OPAQUE_MULTI
     )
-    out += trailer
+    out += _oci_desc_trailer(len(columns), opaque)
     return bytes(out)
 
 
@@ -10583,11 +10588,8 @@ def parse_describe_oci(body: bytes) -> str:
 
 def _oci_dcb_tail(numcols: int) -> bytes:
     # The describe's trailer (_DESCRIBE_TRAILER), then the row header the
-    # inline row follows: the DCB marker and the column count.
-    rxh = bytearray(_OCI_DCB_TAIL_LEN - _OCI_DCB_MARKER_OFF)
-    rxh[: len(_OCI_DCB_MARKER)] = _OCI_DCB_MARKER
-    rxh[_OCI_DCB_NUMCOLS_OFF - _OCI_DCB_MARKER_OFF] = numcols
-    return _describe_trailer(oci=True) + bytes(rxh)
+    # inline row follows (_OCI_RXH), carrying the column count.
+    return _describe_trailer(oci=True) + _oci_rxh_of(0x22, 0, numcols, 0)
 
 
 # The execute reply for a LOB SELECT is a describe with NO row inline — sqlplus
@@ -10634,17 +10636,8 @@ def _oci_row_status(sequence: int, *, more: bool = False, rowcount: int = 0) -> 
 # The row-header (TTI_RXH) that leads a fetch batch: a small fixed frame plus the
 # query SCN (zeroable). Reduced to its non-zero structure from a live fetch reply
 # (#265, #351).
-_OCI_RXH_LEN = 50
-
-
-_OCI_RXH_NONZERO = {0: 0x06, 1: 0x01, 2: 0x02, 4: 0x02, 10: 0x0F}
-
-
 def _oci_rxh() -> bytes:
-    rxh = bytearray(_OCI_RXH_LEN)
-    for off, value in _OCI_RXH_NONZERO.items():
-        rxh[off] = value
-    return bytes(rxh)
+    return _oci_rxh_of(0x02, 0, 0x02, 0x0F)
 
 
 def encode_fetch_batch_oci(
@@ -11696,14 +11689,8 @@ def _oci_lob_fetch_status(sequence: int) -> bytes:
 # The row header that leads a LOB locator fetch differs from the ordinary fetch
 # RXH — a live 11g LOB fetch carries this fixed frame (verified constant across
 # CLOB sizes). Using the ordinary RXH makes sqlplus break on the locator row.
-_OCI_LOB_RXH_NONZERO = {0: 0x06, 1: 0x01, 2: 0x22, 3: 0xFD, 4: 0x01, 10: 0x01}
-
-
 def _oci_lob_rxh() -> bytes:
-    rxh = bytearray(_OCI_RXH_LEN)
-    for off, value in _OCI_LOB_RXH_NONZERO.items():
-        rxh[off] = value
-    return bytes(rxh)
+    return _oci_rxh_of(0x22, 0xFD, 0x01, 0x01)
 
 
 def encode_lob_fetch_rows_oci(

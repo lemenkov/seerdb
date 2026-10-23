@@ -8376,7 +8376,7 @@ against 11g, 21c and 23ai, 2026-09-07):
 
 | Marker | Where | Finding |
 |--------|-------|---------|
-| `06 01 22` (`_OCI_DCB_MARKER`) | describe-column trailer, offset 33 | client draws ORA-03113 if zeroed; **version-independent** — byte-identical in the describe reply of all three servers |
+| `06 01 22` (the head of `_OCI_RXH`) | describe-column trailer, offset 33: the row header's token, flags and offset-2 byte | client draws ORA-03113 if zeroed; **version-independent** — byte-identical in the describe reply of all three servers |
 | `f6 31 0a` (`_OCI_FETCH_CONST`) | end-of-fetch OER; recurs as `20 f6 31 0a` at `_OCI_OER_ENVELOPE` offset 72 | a **fixed 11g OER-trailer constant** — identical across every 11g reply, absent from 21c/23ai (which replace the whole trailer) |
 | touched-row **rowid** (`_OCI_DML_ROWID`) | DML status OER, offsets 27..40, echoed byte-swapped in the trailer | real physical row identity; a synthetic value is unvalidated |
 
