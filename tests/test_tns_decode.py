@@ -6955,6 +6955,29 @@ class TestFv2LobOperations(unittest.TestCase):
         self.assertEqual(lob.raw, fetched)
 
 
+class TestFv2WarnFlags(unittest.TestCase):
+    # 9.2's status for `create or replace procedure p2248 is begin nosuch;
+    # end;`, captured (#2262): the call succeeds, and the last of the six
+    # single-byte fields after the error position is 0x21 -- bit 0x20 says
+    # the procedure compiled with errors.
+    CREATED_WITH_ERRORS = bytes.fromhex(
+        '080102040202ef40000400000000010100180000000021000000000000000000010100000000'
+    )
+
+    def test_the_status_says_the_object_compiled_with_errors(self):
+        from seerdb.common.tns import decode_fv2_warn_flags
+        from seerdb.common.tns_consts import TNS_OER_WARN_COMPILATION_ERROR
+
+        flags = decode_fv2_warn_flags(self.CREATED_WITH_ERRORS)
+        self.assertTrue(flags & TNS_OER_WARN_COMPILATION_ERROR)
+        # A plain insert's status sets none.
+        insert = bytes.fromhex(
+            '0801020402013cf700040101000000010100020000000000030278dc01010002b912'
+            '00000000000101'
+        )
+        self.assertEqual(decode_fv2_warn_flags(insert), 0)
+
+
 class TestFv2Bfile(unittest.TestCase):
     """Oracle 9i BFILE read (#102, PROTOCOL §19.8): FILE_OPEN -> GETLEN -> READ
     -> FILE_CLOSE over TTI_LOBOPS, where FILE_OPEN returns an open-flagged
