@@ -6569,6 +6569,8 @@ class TestFv2BindDirections(unittest.TestCase):
         record = reply[4][0]
         self.assertEqual(record['out_positions'], [0])
         self.assertEqual(len(record['out_values']), 1)
+        # What cursor.bind_directions reports: the prompt's masks (#2264).
+        self.assertEqual(record['directions'], [0x10, 0x20])
 
 
 class TestFv2RefCursor(unittest.TestCase):
