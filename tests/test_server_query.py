@@ -2962,31 +2962,70 @@ def test_a_lob_read_names_its_lob_by_the_slot_in_its_locator() -> None:
     assert row[starts[0] : starts[0] + 105] != row[starts[1] : starts[1] + 105]
 
 
-def test_parse_lobops_read_extracts_offset_and_amount() -> None:
-    # sqlplus's TTI_LOBOPS READ carries a 1-based source offset (ub8-LE @91) and an
-    # amount (ub8-LE @269); the Mirror serves exactly that slice so the read loop
-    # terminates (#405). A short/garbled request falls back to read-all.
-    from seerdb.common.tns import (
-        _OCI_LOBOPS_AMOUNT_OFF,
-        _OCI_LOBOPS_OFFSET_OFF,
-        parse_lobops_read,
-    )
+# sqlplus 11.2's TTI_LOBOPS READs, the wide form (#2251): its second read of a
+# CLOB (80 characters from 81) to a live 11g, a real locator in it, and its
+# first read of the first of a row's two LOBs through the Mirror, the locator
+# as the Mirror minted it, with the slot of column 0.
+_OCI_LOBOPS_READ_WIDE_11G = bytes.fromhex(
+    '036019feffffffffffffff6a000000000000000000000000000000000000000000000000'
+    '000000000000000000000000000000000000000000000000000000000000000200000000'
+    '0000000000000000000000000000000000000051000000000000000400000000000000fe'
+    'ffffffffffffff0000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000680001020c8800000200000001000000'
+    '6e875100060c3200060c3100020002036900020100016500000000000000000000000001'
+    '282a6d000000000000000000000000000000000000000000060c310100015d0000001405'
+    '00000000001f40000000000002010001655000000000000000'
+)
+_OCI_LOBOPS_READ_WIDE_MIRROR = bytes.fromhex(
+    '036006feffffffffffffff6a000000000000000000000000000000000000000000000000'
+    '000000000000000000000000000000000000000000000000000000000000000200000000'
+    '0000000000000000000000000000000000000001000000000000000400000000000000fe'
+    'ffffffffffffff0000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000680001020c8800000200000001000000'
+    '560000000100000001000000020002036900020000000000000000010000000000000000'
+    '000000000000000000000000000000000000000000000000010000000000000000001405'
+    '00000000001f40000000000002000000005000000000000000'
+)
 
-    body = bytearray(300)
-    body[_OCI_LOBOPS_OFFSET_OFF : _OCI_LOBOPS_OFFSET_OFF + 8] = (501).to_bytes(
-        8, 'little'
-    )
-    body[_OCI_LOBOPS_AMOUNT_OFF : _OCI_LOBOPS_AMOUNT_OFF + 8] = (500).to_bytes(
-        8, 'little'
-    )
-    assert parse_lobops_read(bytes(body)) == (501, 500)
-    # A zero offset normalises to 1 (1-based).
-    body[_OCI_LOBOPS_OFFSET_OFF : _OCI_LOBOPS_OFFSET_OFF + 8] = (0).to_bytes(
-        8, 'little'
-    )
-    assert parse_lobops_read(bytes(body))[0] == 1
+
+def test_parse_lobops_read_extracts_offset_and_amount() -> None:
+    # sqlplus's TTI_LOBOPS READ carries a 1-based source offset and an amount;
+    # the Mirror serves exactly that slice so the read loop terminates (#405). A
+    # short/garbled request falls back to read-all.
+    from seerdb.common.tns import parse_lobops_read
+
+    assert parse_lobops_read(_OCI_LOBOPS_READ_WIDE_11G) == (81, 80)
+    assert parse_lobops_read(_OCI_LOBOPS_READ_WIDE_MIRROR) == (1, 80)
     # Too short → read the whole LOB from the start.
     assert parse_lobops_read(b'\x03\x60\x01') == (1, 2**31)
+    assert parse_lobops_read(_OCI_LOBOPS_READ_WIDE_MIRROR[:200]) == (1, 2**31)
+
+
+def test_a_wide_lob_read_names_its_lob_by_its_slot() -> None:
+    # sqlplus 11.2 reads in the wide form, whose locator went unread: no read
+    # named its LOB, so a row's CLOB read past its first chunk continued the
+    # BLOB read in between and printed short (#2251). Its counts are the wide
+    # codec's: read in full, the locator and its slot come back, and the reply's
+    # locator, which sqlplus echoes on its next read, keeps the slot.
+    from seerdb.common.tns import (
+        encode_lob_read_response_oci,
+        parse_lobops_locator,
+        parse_lobops_slot,
+    )
+
+    assert parse_lobops_slot(_OCI_LOBOPS_READ_WIDE_MIRROR) == 0
+    locator = parse_lobops_locator(_OCI_LOBOPS_READ_WIDE_11G)
+    assert locator is not None and locator.startswith(bytes.fromhex('00680001020c88'))
+    from seerdb.common.tns import _LOBOPS_READ_FROM_OCI_WIDE
+
+    (read, rest) = _LOBOPS_READ_FROM_OCI_WIDE(_OCI_LOBOPS_READ_WIDE_11G)
+    assert (read['operation'], read['source_length'], rest) == (2, 106, b'')
+    loc = _OCI_LOBOPS_READ_WIDE_MIRROR.find(bytes.fromhex('680001020c88'))
+    reply = encode_lob_read_response_oci(b'\x00A', 1, 2, slot=1, sequence=17)
+    echoed = reply[reply.find(bytes.fromhex('680001020c88')) :][:105]
+    request = bytearray(_OCI_LOBOPS_READ_WIDE_MIRROR)
+    request[loc : loc + 105] = echoed
+    assert parse_lobops_slot(bytes(request)) == 1
 
 
 # sqlplus 23.26's third CLOB read of one LOB (#1287): the narrow request, whose
