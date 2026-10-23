@@ -2356,6 +2356,8 @@ def _answer_query_oci(
                 # reply reports as its direction (#1411).
                 types=[(t, toid) for (t, _cs, _size, toid) in request.bind_types]
                 or None,
+                # NCHAR / NVARCHAR2 text goes back as UTF-16BE (#2239).
+                forms=[form for (_t, form, _size, _toid) in request.bind_types] or None,
                 # A REFCURSOR comes in with a value, its zero cursor id, and a
                 # live server reports it IN OUT (#2014).
                 inputs=[
@@ -2963,6 +2965,7 @@ def _answer_exec_by_cursor_oci(
             ],
             sequence=seq.next(),
             types=[(t, toid) for (t, _cs, _size, toid) in request.bind_types],
+            forms=[form for (_t, form, _size, _toid) in request.bind_types],
         ),
     )
 

@@ -4391,6 +4391,24 @@ def test_encode_out_bind_response_oci_marshals_each_bind() -> None:
     assert text[51:].startswith(bytes.fromhex('0702686900'))  # 07 + 'hi' DALC
 
 
+def test_a_national_out_value_goes_back_as_utf16() -> None:
+    # A live 18c answers sqlplus 23.26's `EXEC :nch5 := 'kl'` for an NCHAR(5)
+    # and `EXEC :nvc9 := 'mno'` for an NVARCHAR2(9) with the values in UTF-16BE,
+    # each behind its define marker and before its return code. In the database
+    # character set, sqlplus held `?` (#2239).
+    from seerdb.common.tns import encode_out_bind_response_oci
+
+    for value, live in (
+        ('kl   ', '10070a006b006c0020002000200000'),
+        ('mno', '10070600' + '6d006e006f0000'),
+    ):
+        reply = encode_out_bind_response_oci([value], sequence=0, forms=[2])
+        assert reply[50:].startswith(bytes.fromhex(live))
+    # The database form keeps its own character set.
+    reply = encode_out_bind_response_oci(['mno'], sequence=0, forms=[1])
+    assert reply[50:].startswith(bytes.fromhex('1007036d6e6f0000'))
+
+
 # --- Server-side scrollable cursors (#181/#485) ---------------------------------
 
 

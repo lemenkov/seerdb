@@ -11260,6 +11260,7 @@ def encode_out_bind_response_oci(
     sequence: int,
     types: list[tuple[int, bytes]] | None = None,
     inputs: list[bool] | None = None,
+    forms: list[int] | None = None,
 ) -> bytes:
     """OCI reply returning a PL/SQL block's OUT bind values (``EXEC :v := ...``).
 
@@ -11272,6 +11273,7 @@ def encode_out_bind_response_oci(
     ``inputs`` says which binds came in with a value -- IN OUT, not pure OUT --
     which the marker before the values reports. A :class:`RefCursorOutBind`
     value is a cursor the block opened, its rows parked under its id (#2014).
+    ``forms`` is each bind's character set form, as its descriptor declared it.
     """
     types = types or [(0, b'')] * len(values)
     inputs = inputs or [False] * len(values)
@@ -11280,12 +11282,17 @@ def encode_out_bind_response_oci(
         _OCI_OUTBIND_IN_OUT_MARKER if given else _OCI_OUTBIND_DEFINE_MARKER
         for given in inputs
     )
-    rxd = _oci_outbind_rxd(values, types)
+    rxd = _oci_outbind_rxd(values, types, forms)
     return header + define_markers + rxd + _oci_outbind_tail(sequence)
 
 
-def _oci_outbind_rxd(values: list[object], types: list[tuple[int, bytes]]) -> bytes:
+def _oci_outbind_rxd(
+    values: list[object],
+    types: list[tuple[int, bytes]],
+    forms: list[int] | None = None,
+) -> bytes:
     # The OUT values as an RXD row, each in its own framing.
+    forms = forms or [_CSFRM_DB] * len(values)
     return bytes([TTI_RXD]) + b''.join(
         _oci_out_object_value(v, toid)
         if t == TNS_TYPE_ADT
@@ -11293,15 +11300,20 @@ def _oci_outbind_rxd(values: list[object], types: list[tuple[int, bytes]]) -> by
         if isinstance(v, RefCursorOutBind)
         else _oci_lob_out_value(v)
         if isinstance(v, LobOutBind)
-        else _oci_scalar_out_value(v) + _OCI_OUTBIND_RETCODE
-        for v, (t, toid) in zip(values, types)
+        else _oci_scalar_out_value(v, form) + _OCI_OUTBIND_RETCODE
+        for v, (t, toid), form in zip(values, types, forms)
     )
 
 
-def _oci_scalar_out_value(value: object) -> bytes:
+def _oci_scalar_out_value(value: object, form: int = _CSFRM_DB) -> bytes:
     # A scalar OUT value: text or bytes past 252 in OCI's own chunks
     # (_oci_value_bytes), not the thin form's -- a 300-character VARCHAR2
     # variable went out as `fe 01 40 ...` and sqlplus never read it (#2053).
+    # A national bind's text is UTF-16BE, as a live 18c sends `EXEC :n := 'kl'`
+    # for an NCHAR(5) (`0a 00 6b 00 6c 00 20 ...`): sent in the database
+    # character set, sqlplus could not map it and held `?` (#2239).
+    if form == _CSFRM_NCHAR and isinstance(value, str):
+        value = value.encode('utf-16-be')
     if isinstance(value, (str, bytes)):
         raw = value.encode('utf-8') if isinstance(value, str) else value
         if len(raw) > TNS_MAX_SHORT_LENGTH:
@@ -11335,13 +11347,17 @@ def parse_exec_by_cursor_oci(payload: bytes, types: list[int]) -> tuple[int, lis
 
 
 def encode_exec_by_cursor_reply_oci(
-    values: list[object], *, sequence: int, types: list[tuple[int, bytes]]
+    values: list[object],
+    *,
+    sequence: int,
+    types: list[tuple[int, bytes]],
+    forms: list[int] | None = None,
 ) -> bytes:
     """The reply to an OCI ``TTI_EXEC`` (#2041): the OUT values as the first
     execute's reply carries them, and its OER, with neither the OUT-bind header
     nor the status frame -- a live 18c, sqlplus 23.26 fetching SERVEROUTPUT's
     second and third batch."""
-    return _oci_outbind_rxd(values, types) + _oci_outbind_oer(sequence)
+    return _oci_outbind_rxd(values, types, forms) + _oci_outbind_oer(sequence)
 
 
 def encode_commit_status_oci(sequence: int) -> bytes:
