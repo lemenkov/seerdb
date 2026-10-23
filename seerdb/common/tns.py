@@ -1587,7 +1587,11 @@ _CLOSE_CURSORS: wire_schema.Schema = (
 # TTI_LOBOPS (96), the head every operation shares (#412, #2064): the source
 # and destination locators' pointers and lengths, the short offsets, three
 # pointer flags, the operation. OCI sends thin's fields with 8-byte pointers
-# and ub4 counts, measured against sqlplus 10.2, 11g and 23.26 READs.
+# and ub4 counts, measured against sqlplus 10.2, 11g and 23.26 READs; sqlplus
+# 11.2 writes the wide counts (wn4) as ub8, as it does in its OALL8 (#866,
+# #2251). Of the head's four, only the two lengths are wide by inference: the
+# captures carry zero in all but the source length, and the operation sits
+# eight bytes later than in the narrow form, not sixteen.
 _LOBOPS_HEAD: wire_schema.Schema = (
     ('const', bytes([TTI_FUN, TTI_LOBOPS])),
     ('u8', 'seq'),
@@ -1596,12 +1600,12 @@ _LOBOPS_HEAD: wire_schema.Schema = (
     ('wn4', 'source_length'),
     ('ptr', 'dest_present'),
     ('wn4', 'dest_length'),
-    ('wn4', 'short_source_offset'),
-    ('wn4', 'short_dest_offset'),
+    ('n4', 'short_source_offset'),
+    ('n4', 'short_dest_offset'),
     ('ptr', 'charset_present'),
     ('ptr', 'short_amount_present'),
     ('ptr', 'null_lob_present'),
-    ('n4', 'operation'),
+    ('wn4', 'operation'),
 )
 # A READ, after the head: the SCN array's pointer and length, the source and
 # destination offsets, the amount's pointer, three array-LOB slots, then the
@@ -1609,7 +1613,7 @@ _LOBOPS_HEAD: wire_schema.Schema = (
 _LOBOPS_READ: wire_schema.Schema = (
     *_LOBOPS_HEAD,
     ('ptr', 'scn_present'),
-    ('n4', 'scn_length'),
+    ('wn4', 'scn_length'),
     ('n8', 'source_offset'),
     ('n8', 'dest_offset'),
     ('ptr', 'amount_present'),
@@ -1756,6 +1760,7 @@ def decode_auth_oci(payload: bytes) -> dict[str, Any]:
 
 _LOBOPS_HEAD_FROM_THIN = wire_schema.compile_decoder(_LOBOPS_HEAD, _THIN)
 _LOBOPS_READ_FROM_OCI = wire_schema.compile_decoder(_LOBOPS_READ, _OCI)
+_LOBOPS_READ_FROM_OCI_WIDE = wire_schema.compile_decoder(_LOBOPS_READ, _OCI_WIDE)
 _LOB_READ_REPLY_THIN = wire_schema.compile_encoder(_LOB_READ_REPLY, _THIN)
 _LOB_READ_REPLY_OCI = wire_schema.compile_encoder(_LOB_READ_REPLY, _OCI)
 _CLOSE_CURSORS_THIN = wire_schema.compile_encoder(_CLOSE_CURSORS, _THIN)
@@ -2991,23 +2996,17 @@ def parse_options(options: int) -> tuple[bool, bool]:
 
 
 # A TTI_LOBOPS READ request carries the slice sqlplus wants: a 1-based source
-# offset and an amount, both counts (characters for a CLOB, bytes for a BLOB),
-# at these fixed ub8-LE offsets in the OCI request. sqlplus loops over them (in
-# SET LONGCHUNKSIZE-sized steps) until a read returns fewer than it asked for.
-_OCI_LOBOPS_OFFSET_OFF = 91
-
-
-_OCI_LOBOPS_AMOUNT_OFF = 269
-
-# A modern sqlplus (23.26) writes the request's scalar slots narrower, as it
-# does its OALL8 (#866), so the fields move (#1287). Measured against a live
-# 11g: a 135-byte header with the ub4 locator length at 11, the ub8 offset at 75
-# and a second pointer indicator at 91, then the locator, then the ub8 amount --
-# thin's fields (_LOBOPS_READ), as OCI packs them. An indicator at 91 marks the
-# narrow form: in the wide one that is where the offset sits, and no offset
-# reads as `fe ff ff ff ff ff ff ff`.
+# offset and an amount, both counts (characters for a CLOB, bytes for a BLOB).
+# sqlplus loops over them (in SET LONGCHUNKSIZE-sized steps) until a read
+# returns fewer than it asked for. It sends thin's fields (_LOBOPS_READ) in one
+# of two widths, as it does its OALL8 (#866): sqlplus 23.26 (and 10.2) the
+# narrow form, a 135-byte header before the locator (#1287), and sqlplus 11.2
+# the wide one, 163 bytes (#2251). An indicator at 91 marks the narrow form:
+# in the wide one that is where the offset sits, and no offset reads as
+# `fe ff ff ff ff ff ff ff`.
 _OCI_LOBOPS_NARROW_IND_OFF = 91
 _OCI_LOBOPS_NARROW_HEADER = 135
+_OCI_LOBOPS_WIDE_HEADER = 163
 
 
 _OCI_LOB_CHUNK = 0xFF  # content bytes per 11g LOB_DATA chunk (matches live 11g)
@@ -3490,45 +3489,41 @@ def _oci_lobops_narrow(body: bytes) -> bool:
 def parse_lobops_read(body: bytes) -> tuple[int, int]:
     """Extract ``(source_offset, amount)`` from an OCI TTI_LOBOPS READ (#405) —
     both 1-based counts (characters for a CLOB, bytes for a BLOB). A malformed /
-    short request falls back to reading the whole LOB from the start. The
-    narrow form is read by its schema (_LOBOPS_READ); the wide one, of which no
-    capture survives, by its offsets."""
-    if _oci_lobops_narrow(body):
-        read = _oci_lobops_read(body)
-        if read is None:
-            return 1, 2**31
-        return max(read['source_offset'], 1), read['amount']
-    amount_off = _OCI_LOBOPS_AMOUNT_OFF
-    if len(body) < amount_off + 8:
+    short request falls back to reading the whole LOB from the start."""
+    read = _oci_lobops_read(body)
+    if read is None:
         return 1, 2**31
-    offset_off = _OCI_LOBOPS_OFFSET_OFF
-    offset = int.from_bytes(body[offset_off : offset_off + 8], 'little')
-    amount = int.from_bytes(body[amount_off : amount_off + 8], 'little')
-    return max(offset, 1), amount
+    return max(read['source_offset'], 1), read['amount']
 
 
 def _oci_lobops_read(body: bytes) -> dict[str, Any] | None:
-    # A narrow OCI TTI_LOBOPS READ's fields (_LOBOPS_READ), or None for one too
-    # short to hold its locator and amount.
-    (read, _rest) = _LOBOPS_READ_FROM_OCI(body)
-    if len(body) < _OCI_LOBOPS_NARROW_HEADER + read['source_length'] + 8:
+    # An OCI TTI_LOBOPS READ's fields (_LOBOPS_READ) in whichever width it came,
+    # or None for one too short to hold its locator and amount.
+    if _oci_lobops_narrow(body):
+        (decode, header) = (_LOBOPS_READ_FROM_OCI, _OCI_LOBOPS_NARROW_HEADER)
+    else:
+        (decode, header) = (_LOBOPS_READ_FROM_OCI_WIDE, _OCI_LOBOPS_WIDE_HEADER)
+    if len(body) < header:
+        return None
+    (read, _rest) = decode(body)
+    if len(body) < header + read['source_length'] + 8:
         return None
     return read
 
 
 def parse_lobops_locator(body: bytes) -> bytes | None:
-    """The locator an OCI TTI_LOBOPS READ names, in the narrow form, or None for
-    a request in the wide form (#2123): sqlplus 10.2 reads a CLOB variable's
-    value this way, where later ones select it."""
-    if not _oci_lobops_narrow(body):
-        return None
-    return _LOBOPS_READ_FROM_OCI(body)[0]['locator']
+    """The locator an OCI TTI_LOBOPS READ names, in either width, or None for a
+    request too short to hold one: sqlplus 10.2 reads a CLOB variable's value
+    this way, where later ones select it (#2123), and a row's LOBs are told
+    apart by it (#1430, #2251)."""
+    read = _oci_lobops_read(body)
+    return None if read is None else read['locator']
 
 
 def parse_lobops_slot(body: bytes) -> int | None:
     """The row slot the locator of an OCI TTI_LOBOPS READ names (#1430), or None
-    for a request that carries none -- the wide form, whose locator this does not
-    locate, or a locator minted without a slot."""
+    for a request that carries none: one too short to hold a locator, or a
+    locator minted without a slot."""
     region = parse_lobops_locator(body)
     locator = None if region is None else _oci_lob_locator_from(region)
     if locator is None or not locator['slot']:
