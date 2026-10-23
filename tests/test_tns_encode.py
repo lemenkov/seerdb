@@ -6372,6 +6372,43 @@ class TestO3logonMessages(unittest.TestCase):
             '726f6c02c104',
         )
 
+    def test_9i_array_dml_is_one_call(self):
+        # A 9i executemany is the single-row parse with the rows' count in the
+        # tail (a ub4: `01 03`, `02 01 2c` for 300) and each row its own RXD
+        # after the binds' OACs, described once (#2245). The rows are ojdbc14's,
+        # byte for byte, from a 3-row executeBatch captured on 9.2.0.4; the OACs
+        # are seerdb's own (VARNUM for a number, as in a single-row DML).
+        import datetime
+
+        from seerdb.common.tns import encode_o7_parse
+
+        Sql = 'insert into t2245 (n, v, d) values (:1, :2, :3)'
+        D = datetime.datetime(2026, 10, 23, 12, 34, 56)
+        One = encode_o7_parse(0, Sql, [1, 'r1', D])
+        Three = encode_o7_parse(0, Sql, [1, 'r1', D], [[2, None, D], [3, 'r3', None]])
+        Tail = One.find(Sql.encode()) + len(Sql)
+        self.assertEqual(One[Tail : Tail + 9].hex(), '010101010000000000')
+        self.assertEqual(Three[Tail : Tail + 9].hex(), '010101030000000000')
+        Rows = bytes.fromhex(
+            '0702c10202723107787e0a170d2339'  # 1, 'r1', the date
+            '0702c1030007787e0a170d2339'  # 2, NULL, the date
+            '0702c10402723300'  # 3, 'r3', NULL
+        )
+        self.assertTrue(Three.endswith(Rows))
+        self.assertEqual(Three[:Tail], One[:Tail])
+        Many = encode_o7_parse(
+            0, Sql, [1, 'a', D], [[I, 'a', D] for I in range(2, 301)]
+        )
+        self.assertEqual(Many[Tail : Tail + 10].hex(), '01010201' + '2c0000000000')
+        # A column NULL in the first row takes its type from a later one, and a
+        # date column with fractional seconds anywhere is one TIMESTAMP for all.
+        Mixed = encode_o7_parse(
+            0, Sql, [1, None, D], [[2, 'x', D.replace(microsecond=5)]]
+        )
+        Plain = encode_o7_parse(0, Sql, [2, 'x', D.replace(microsecond=5)])
+        Oacs = slice(Tail + 9, Tail + 9 + 3 * 14)
+        self.assertEqual(Mixed[Oacs], Plain[Oacs])
+
     def test_9i_charset_aware_binds(self):
         # DB-charset-aware fv2 binds (#174). A plain str bind declares the
         # AL32UTF8 session charset (02 0369, csfrm 1) and its value rides as

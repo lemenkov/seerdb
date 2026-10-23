@@ -797,6 +797,29 @@ def _pre10_tier_name_for(Dialect) -> str:
     return '8i' if isinstance(Dialect, O8iDialect) else '9i'
 
 
+def refuse_pre10_batch(Dialect, Head: str, ReturnBinds, BatchErrors: bool) -> None:
+    """Refuse an executemany a pre-10g tier cannot run as array DML.
+
+    9i takes a plain INSERT / UPDATE / DELETE batch in one TTI_ALL7 call
+    (#2245); 8i takes none. Anything else would apply only the first row and
+    silently drop the rest (#168), so it is refused: batch errors (#2247), an
+    array RETURNING, and a batch of a query or a PL/SQL block.
+    """
+    from seerdb.client.dialect import CAP_ARRAY_DML
+
+    Tier = 'Oracle ' + _pre10_tier_name_for(Dialect)
+    if CAP_ARRAY_DML not in Dialect.capabilities():
+        raise NotSupportedError(f'executemany (array DML) is not supported on {Tier}')
+    if BatchErrors:
+        raise NotSupportedError(f'array DML batcherrors are not supported on {Tier}')
+    if ReturnBinds:
+        raise NotSupportedError(f'an array DML RETURNING is not supported on {Tier}')
+    if Head.startswith(('SELECT', 'BEGIN', 'DECLARE')):
+        raise NotSupportedError(
+            f'executemany of a query or PL/SQL block is not supported on {Tier}'
+        )
+
+
 def returning_block_request(Query: str, Bind: list) -> tuple[str, list]:
     """A pre-10g ``DML ... RETURNING ... INTO`` rewritten as a block request (#801).
 

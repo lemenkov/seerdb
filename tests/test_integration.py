@@ -54,7 +54,6 @@ from seerdb.common.tns_consts import (
 # #174 national charset).
 _FV2_UNSUPPORTED = (
     ('methods_on_a_missing_directory', 'fileexists() has no pre-10g LOBOPS form'),
-    ('mixed_batch', 'executemany (array DML) is a 10g+ path'),
     ('binary_double', 'BINARY_DOUBLE is a 10g+ type; Oracle 9i lacks it'),
     ('binary_float', 'BINARY_FLOAT is a 10g+ type; Oracle 9i lacks it'),
     ('kib', 'Oracle 9i has no streamed LOB/LONG bind path (#169)'),
@@ -74,7 +73,6 @@ _FV2_UNSUPPORTED = (
     # Behavioural features the fv2 path does not implement (#168): they now
     # raise a clean NotSupportedError or exercise a capability 9i lacks, rather
     # than silently misbehaving, so the tests skip on 9i.
-    ('executemany', 'array DML (executemany) is not supported on Oracle 9i'),
     ('batcherror', 'array DML batcherrors are not supported on Oracle 9i'),
     ('refcursor', 'REF CURSOR is not supported on Oracle 9i (fv2)'),
     ('ref_bind', 'REF / object types are not supported on Oracle 9i'),
@@ -91,7 +89,6 @@ _FV2_UNSUPPORTED = (
     ('reuses_cursor', 'the cursor cache is a fv4+ feature; 9i re-parses'),
     ('forgets_the_cached_cursor', 'the cursor cache is a fv4+ feature; 9i re-parses'),
     ('never_cached', 'the cursor cache is a fv4+ feature; 9i re-parses'),
-    ('pipeline', 'the pipeline test uses array DML, unsupported on Oracle 9i'),
     # The 9i test DB is WE8ISO8859P1 (Latin-1). #174 made representable VARCHAR2
     # text round-trip (see test_db_charset_varchar_roundtrip) and full Unicode
     # work through DB_TYPE_NVARCHAR / DB_TYPE_NCHAR (test_national_char_var_bind,
@@ -116,9 +113,10 @@ _FV2_UNSUPPORTED = (
     # 9i bug. Already skipped on 8i for the same reason.
     ('bit_vector_reuse', 'CONNECT BY LEVEL returns few rows on Oracle 9i'),
     # RETURNING itself now works on pre-10g through the PL/SQL block rewrite
-    # (#801, #802), but an *array* RETURNING still cannot: executemany is array
-    # DML, which these tiers do not have at all.
-    ('array_returning', 'executemany (array DML) is a 10g+ feature'),
+    # (#801, #802), but an *array* RETURNING still cannot: 9i's array DML
+    # (#2245) is a plain TTI_ALL7 batch, and the rewrite is one block a row.
+    ('array_returning', 'an array DML RETURNING is not supported before 10g'),
+    ('executemany_returning', 'an array DML RETURNING is not supported before 10g'),
     # The rewrite runs the statement as a PL/SQL block, and the server rejects
     # a quoted placeholder inside one (ORA-01006) even though plain pre-10g DML
     # accepts it. Measured on 9i; the driver refuses it with a clear message.
@@ -161,6 +159,10 @@ _8I_UNSUPPORTED = (
     ('fetchall_and_fetchmany', 'CONNECT BY LEVEL returns one row on Oracle 8i'),
     # The test's column is a TIMESTAMP; 8i honours the declared types it has.
     ('declared_type_governs', 'TIMESTAMP is a 9i+ type; Oracle 8i has only DATE'),
+    # 9i runs array DML over TTI_ALL7 (#2245); 8i's OALL8 dialect has none yet.
+    ('executemany', 'executemany (array DML) is not supported on Oracle 8i'),
+    ('mixed_batch', 'executemany (array DML) is not supported on Oracle 8i'),
+    ('pipeline', 'the pipeline test uses array DML, unsupported on Oracle 8i'),
 )
 
 
@@ -363,7 +365,7 @@ _NATIONAL_OUT_BIND = _Need(
 )
 _CHANGE_PASSWORD = _Need('changepassword is not supported on Oracle 9i', min_fv=_FV)
 _PARSE = _Need('cursor.parse() needs 10g+', min_fv=_FV)
-_ARRAY_DML = _Need('executemany (array DML) is a 10g+ path', min_fv=_FV)
+_ARRAY_DML = _Need('executemany (array DML) is not supported on Oracle 8i', not_8i=True)
 _FV2_EXECUTE_PATH = _Need('fv2 (9i) uses a separate execute path', min_fv=_FV)
 _PROXY_AUTH = _Need('proxy authentication needs a 10g+ server', min_fv=_FV)
 _SERVER_SCROLL = _Need(
@@ -3645,13 +3647,16 @@ class CursorIntegration(_IntegrationBase):
         self.assertEqual(self.cur.fetchall(), rows)
 
     def test_executemany_single_round_trip(self):
-        # The whole batch must go in one server round trip, not one per row.
+        # The whole batch must go in one server round trip, not one per row:
+        # as many sends as one row's execute takes -- one on 10g+, and on 9i
+        # the same cursor open, call and close a single DML makes (#2245).
         # Count only TNS_DATA sends: under XE's logon-storm throttle the server
         # can inject a break/marker mid-response, and the driver's marker ack is
         # an extra (non-data) send that would otherwise make this flake.
         from seerdb.common.tns_consts import TNS_DATA
 
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
+        self.conn.autocommit = False
         import seerdb.client.connection as _c
 
         orig = _c.OracleConnect.send
@@ -3661,12 +3666,16 @@ class CursorIntegration(_IntegrationBase):
             orig(s, T, D),
         )[1]
         try:
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1)', [100])
+            single = sends[0]
+            sends[0] = 0
             self.cur.executemany(
                 f'INSERT INTO {self.TABLE} VALUES (:1)', [(i,) for i in range(50)]
             )
         finally:
             _c.OracleConnect.send = orig
-        self.assertEqual(sends[0], 1)
+        self.assertEqual(sends[0], single)
+        self.assertLessEqual(single, 3)
         self.assertEqual(self.cur.rowcount, 50)
 
     def test_executemany_delete(self):

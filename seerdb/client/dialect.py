@@ -119,7 +119,7 @@ class Dialect(Protocol):
 
     def capabilities(self) -> frozenset[str]: ...
     def execute_query(self, sql: str, bind: list | None, fetch: int): ...
-    def execute_dml(self, sql: str, bind: list | None): ...
+    def execute_dml(self, sql: str, bind: list | None, batch: list | None): ...
     def execute_block(self, sql: str, bind: list | None): ...
     def txn_control(self, statement: str): ...  # only when CAP_OWN_TXN is set
     def bfile_read(self, locator: bytes): ...
@@ -143,10 +143,10 @@ class Fv2Dialect:
     ``AsyncOracleConnect._drive`` (async)."""
 
     def capabilities(self) -> frozenset[str]:
-        # 9i does query / DML / PL/SQL blocks / LOB, but NOT array DML
-        # (executemany) — that's a 10g+ feature. It uses the modern commit path,
-        # so it does NOT advertise CAP_OWN_TXN.
-        return frozenset({CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_LOB})
+        # 9i does query / DML / PL/SQL blocks / LOB, and array DML over
+        # TTI_ALL7 (#2245). It uses the modern commit path, so it does NOT
+        # advertise CAP_OWN_TXN.
+        return frozenset({CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_LOB, CAP_ARRAY_DML})
 
     def txn_control(self, statement: str):
         # 9i commits via the modern TTI_COMMIT path (CAP_OWN_TXN absent), so this
@@ -195,23 +195,30 @@ class Fv2Dialect:
         # call_status 0 + ora_code 0 => _drain_cursor won't issue TTI_FETCHes.
         return (0, 0, 0, (len(all_rows), columns), all_rows, None, None, [], None)
 
-    def execute_dml(self, sql: str, bind: list | None = None):
+    def execute_dml(
+        self, sql: str, bind: list | None = None, batch: list | None = None
+    ):
         # 9i DML over TTI_ALL7 (#101): OOPEN, then a single parse that also
         # executes (option 02 80 21) — no describe/fetch. The affected-row count
         # comes back in the response OER. (Autocommit is applied by the caller.)
+        # An executemany's further rows ride the same call (#2245), and the
+        # count is then the whole batch's.
         yield Send(encode_o7_open(0))
         yield RECV  # OOPEN RPA
-        yield Send(encode_o7_parse(0, sql, bind))
+        yield Send(encode_o7_parse(0, sql, bind, batch))
         resp = yield RECV
         if resp is False:
             raise Exception('Connection closed during 9i DML')
-        fv2_raise_for_error(resp[1])  # e.g. ORA-00942 / constraint
-        (row_count, err_code) = decode_fv2_dml_response(resp[1])
-        rowid = decode_fv2_dml_rowid(resp[1])  # the touched row (#1079)
+        # An error (ORA-00942, a constraint) comes back in the result, as on
+        # 10g+, so the cursor can report the rows applied before it: a batch
+        # that fails part-way applied the rows before the failing one, and the
+        # status counts them as a success counts its own (#998, #2245).
+        (err_code, message) = decode_fv2_oer_error(resp[1])
+        (row_count, _) = decode_fv2_dml_response(resp[1])
+        rowid = None if err_code else decode_fv2_dml_rowid(resp[1])  # #1079
         yield Send(encode_o7_close(0))
         yield RECV  # close STA
-        _raise_terminal(err_code)
-        return (0, 0, 0, (row_count, None), [], None, rowid, [], None)
+        return (0, err_code, 0, (row_count, None), [], message, rowid, [], None)
 
     def execute_block(self, sql: str, bind: list | None = None):
         # Anonymous PL/SQL block over the fv2 TTI_ALL7 block path (#102, PROTOCOL
@@ -489,10 +496,14 @@ class O8iDialect:
                     return ([], b'', last_row)
             buf += received[1]
 
-    def execute_dml(self, sql: str, bind: list | None = None):
+    def execute_dml(
+        self, sql: str, bind: list | None = None, batch: list | None = None
+    ):
         # 8i INSERT/UPDATE/DELETE and DDL (#360, §19.12): the same OALL8 as a
         # SELECT but with the statement-type option word and no fetch. The
         # affected-row count comes back in the response OER. (Autocommit: caller.)
+        # No array DML here: the caller refuses a batch (refuse_pre10_batch).
+        assert not batch
         stmt_type = o8i_stmt_type(sql.strip().upper())
         yield Send(
             encode_8i_oall8_dml(
