@@ -73,7 +73,6 @@ _FV2_UNSUPPORTED = (
     # Behavioural features the fv2 path does not implement (#168): they now
     # raise a clean NotSupportedError or exercise a capability 9i lacks, rather
     # than silently misbehaving, so the tests skip on 9i.
-    ('batcherror', 'array DML batcherrors are not supported on Oracle 9i'),
     ('ref_bind', 'REF / object types are not supported on Oracle 9i'),
     ('collection_of_objects', 'object types are not supported on Oracle 9i'),
     ('lob_attribute', 'object types are not supported on Oracle 9i'),
@@ -164,6 +163,7 @@ _8I_UNSUPPORTED = (
     ('pipeline', 'the pipeline test uses array DML, unsupported on Oracle 8i'),
     # 9i reads a REF CURSOR by its id over TTI_ALL7 (#2246); 8i's dialect does not.
     ('refcursor', 'REF CURSOR is not supported on Oracle 8i'),
+    ('batcherror', 'executemany (array DML) is not supported on Oracle 8i'),
 )
 
 

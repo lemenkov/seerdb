@@ -19,6 +19,7 @@ from seerdb.client._conn_logic import (
     _ConnectionLogic,
     _pre10_tier_name_for,
     _transaction_priority,
+    pre10_dml_applied,
     refuse_pre10_batch,
     returning_block_error,
     returning_block_request,
@@ -2057,10 +2058,10 @@ class OracleConnect(_ConnectionLogic):
                     raise returning_block_error(Exc) from None
                 Result = returning_block_result(Raw, len(Bind))
             else:  # DML (INSERT/UPDATE/DELETE)
-                Result = self._drive(self._dialect.execute_dml(Query, Bind, Batch))
-            # A DML's error comes back in the result for the cursor to raise:
-            # nothing to commit then.
-            if self.autocommit and not (isinstance(Result, tuple) and Result[1]):
+                Result = self._drive(
+                    self._dialect.execute_dml(Query, Bind, Batch, BatchErrors)
+                )
+            if self.autocommit and pre10_dml_applied(Result, BatchErrors):
                 self.commit()
             return Result
         if Head.startswith('SELECT'):
