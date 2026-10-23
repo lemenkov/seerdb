@@ -203,6 +203,13 @@ def compile_decoder(schema: Schema, codec: Codec) -> Decoder:
                 inner = compile_decoder(field[3], codec)
                 items = []
                 for _ in range(values[field[2]]):
+                    # Every item takes at least a byte, so a count past the
+                    # message's end fails here, not after billions of empty
+                    # items (#2272).
+                    if not data:
+                        raise IndexError(
+                            f'{field[1]}: count past the end of the message'
+                        )
                     (item, data) = inner(data)
                     items.append(item)
                 values[field[1]] = items

@@ -328,6 +328,39 @@ def test_an_oci_pair_count_is_a_ub4_whatever_follows_it() -> None:
     assert parse_auth_response_oci(unset) == parse_auth_response_oci(_OCI_AUTH_SEEDED)
 
 
+def test_an_oci_auth_that_declares_more_pairs_than_it_carries_is_refused() -> None:
+    # The pair count is the message's own word; a client that declares 2**32-1
+    # pairs and sends none kept a session thread decoding empty pairs for about
+    # 100 minutes, before the password was checked (#2272). It fails at once.
+    import time
+
+    from seerdb.common.tns import decode_auth_oci
+
+    head = _OCI_AUTH_SEEDED[:27] + (2**32 - 1).to_bytes(4, 'little') + bytes(4)
+    head += _OCI_AUTH_SEEDED[35:55]  # the pointers and the user, no pairs
+    started = time.monotonic()
+    with pytest.raises(IndexError):
+        decode_auth_oci(head)
+    assert time.monotonic() - started < 1
+
+
+def test_an_oci_fixed_width_read_past_the_end_raises() -> None:
+    # Read as 0 or "absent", an exhausted buffer let a count run (#2272).
+    from seerdb.common.tns import _OCI, _OCI_WIDE
+
+    for read, width in (
+        (_OCI.read_n2, 2),
+        (_OCI.read_n4, 4),
+        (_OCI.read_n8, 8),
+        (_OCI.read_ptr, 8),
+        (_OCI.read_scale, 1),
+        (_OCI_WIDE.read_wn4, 8),
+    ):
+        read(bytes(width))  # a whole field reads
+        with pytest.raises(IndexError):
+            read(bytes(width - 1))
+
+
 def test_server_proof_oci_is_the_48_byte_deadbeef_form() -> None:
     from seerdb.server.auth import server_proof_oci
 
