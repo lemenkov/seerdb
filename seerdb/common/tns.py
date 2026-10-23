@@ -12477,6 +12477,10 @@ def _o7_bind_oac(Value: object, Statement: bool = False) -> bytes:
         Vcsfrm = getattr(Value.dbtype, 'csfrm', 1)
         if VType == TNS_TYPE_NUMBER:
             Type, MaxSize, Csfrm = 0x06, 22, 1
+        elif VType == TNS_TYPE_REFCURSOR:
+            # A REF CURSOR is a one-byte cursor slot, as ojdbc14 declares it;
+            # the block hands back the cursor's id (#2246).
+            Type, MaxSize, Csfrm = TNS_TYPE_REFCURSOR, 1, 1
         elif VType == TNS_TYPE_RAW:
             Type, MaxSize, Csfrm = TNS_TYPE_RAW, Value.size, 0
         elif VType in (TNS_TYPE_RID, TNS_TYPE_UROWID):
@@ -12620,23 +12624,14 @@ def encode_o7_block(Seq: int, Sql: str, Binds: list | None = None) -> bytes:
     return Out
 
 
-def encode_o7_describe(Seq: int) -> bytes:
+def encode_o7_describe(Seq: int, Cursor: int = 1) -> bytes:
     # Call 2: fixed describe-columns request; response is the metadata RPA.
-    return bytes(
-        [
-            TTI_FUN,
-            TTI_DNY,  # describe columns (RPA carries the metadata)
-            Seq,
-            0x07,
-            0x01,
-            0x01,
-            0,
-            0,
-            0x01,
-            0x02,
-            0x01,
-            0x01,
-        ]
+    # `Cursor` is the server cursor's id, a ub4: the one OOPEN gave (1), or a
+    # REF CURSOR a block returned, which ojdbc14 describes the same way (#2246).
+    return (
+        bytes([TTI_FUN, TTI_DNY, Seq, 0x07])  # describe columns (RPA: metadata)
+        + encode_sb4(Cursor)
+        + bytes([0, 0, 0x01, 0x02, 0x01, 0x01])
     )
 
 
@@ -12676,31 +12671,14 @@ def _o7_define_entry(Col: dict) -> bytes:
     )
 
 
-def encode_o7_exec(Seq: int, Columns: list) -> bytes:
+def encode_o7_exec(Seq: int, Columns: list, Cursor: int = 1) -> bytes:
     # Call 3: TTI_ALL7 execute + fetch (option word 02 80 50), carrying a define
     # block (one entry per column) so the server returns the requested types.
-    Head = bytes(
-        [
-            TTI_FUN,
-            TTI_ALL7,
-            Seq,
-            0x02,
-            0x80,
-            0x50,
-            0x01,
-            0x01,
-            0,
-            0,
-            0,
-            0,
-            0x01,
-            0x01,
-            0x07,
-            0x01,
-            0x01,
-            0x02,
-            0,
-        ]
+    # `Cursor` as for encode_o7_describe (#2246).
+    Head = (
+        bytes([TTI_FUN, TTI_ALL7, Seq, 0x02, 0x80, 0x50])
+        + encode_sb4(Cursor)
+        + bytes([0, 0, 0, 0, 0x01, 0x01, 0x07, 0x01, 0x01, 0x02, 0])
     )
     Defines = bytes(
         [0x01, 0x01, len(Columns), 0, 0, 0x01, 0x01, 0x01, 0x0A, 0, 0, 0, 0, 0]
@@ -12708,9 +12686,9 @@ def encode_o7_exec(Seq: int, Columns: list) -> bytes:
     return Head + Defines
 
 
-def encode_o7_close(Seq: int) -> bytes:
-    # Call 4: close the cursor.
-    return bytes([TTI_FUN, _O7_CLOSE_FUNC, Seq, 0x01, 0x01])
+def encode_o7_close(Seq: int, Cursor: int = 1) -> bytes:
+    # Call 4: close the cursor (`Cursor` as for encode_o7_describe, #2246).
+    return bytes([TTI_FUN, _O7_CLOSE_FUNC, Seq]) + encode_sb4(Cursor)
 
 
 # ---------------------------------------------------------------------------

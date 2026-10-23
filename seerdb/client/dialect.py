@@ -50,6 +50,7 @@ from seerdb.common.tns import (
     decode_fv2_oer_error,
     decode_fv2_opened_locator,
     decode_o8i_bfile_getlen,
+    decode_ub4,
     encode_8i_lob_read,
     encode_8i_oall8_dml,
     encode_8i_oall8_fetch,
@@ -70,7 +71,13 @@ from seerdb.common.tns import (
     encode_tokens_rxd,
     o8i_stmt_type,
 )
-from seerdb.common.tns_consts import ORA_NO_DATA_FOUND, TNS_TYPE_BFILE, TTI_LOB, TTI_OER
+from seerdb.common.tns_consts import (
+    ORA_NO_DATA_FOUND,
+    TNS_TYPE_BFILE,
+    TNS_TYPE_REFCURSOR,
+    TTI_LOB,
+    TTI_OER,
+)
 
 # Oracle 8i LONG / LONG RAW type codes — a LONG changes the fetch shape (one row
 # per round trip, read the whole value) (#377).
@@ -137,6 +144,22 @@ CAP_ARRAY_DML = 'array_dml'
 CAP_OWN_TXN = 'own_txn'
 
 
+def _is_cursor_var(value: object) -> bool:
+    from seerdb.common.datatypes import Var
+
+    return isinstance(value, Var) and value.dbtype.tns_type == TNS_TYPE_REFCURSOR
+
+
+def _block_input(value: object) -> object:
+    # A block bind's IN value. A REF CURSOR's is an empty cursor slot, the one
+    # byte ojdbc14 sends (#2246); a NULL there is a bind the server cannot use.
+    from seerdb.common.datatypes import Var
+
+    if _is_cursor_var(value):
+        return b'\x00'
+    return value._value if isinstance(value, Var) else value
+
+
 class Fv2Dialect:
     """Oracle 9i (TTC field version 2) — the four-call TTI_ALL7 dialect (#102,
     PROTOCOL.md §19). Sans-io: driven by ``OracleConnect._drive`` (sync) or
@@ -165,7 +188,15 @@ class Fv2Dialect:
         resp = yield RECV  # parse RPA ack — or an OER
         if resp is not False:  # surface a parse error (e.g. ORA-00942)
             fv2_raise_for_error(resp[1])
-        yield Send(encode_o7_describe(0))
+        (columns, all_rows) = yield from self._drain(1)
+        # call_status 0 + ora_code 0 => _drain_cursor won't issue TTI_FETCHes.
+        return (0, 0, 0, (len(all_rows), columns), all_rows, None, None, [], None)
+
+    def _drain(self, cursor: int):
+        # Describe a parsed or opened server cursor, fetch every row, and close
+        # it: the query's own cursor, or a REF CURSOR a block returned (#2246),
+        # which ojdbc14 reads with the same three calls by its id.
+        yield Send(encode_o7_describe(0, cursor))
         resp = yield RECV
         if resp is False:
             raise Exception('Connection closed during 9i describe')
@@ -177,7 +208,7 @@ class Fv2Dialect:
         all_rows: list = []
         err_code = 0
         while True:
-            yield Send(encode_o7_exec(0, columns))
+            yield Send(encode_o7_exec(0, columns, cursor))
             resp = yield RECV
             if resp is False:
                 raise Exception('Connection closed during 9i fetch')
@@ -189,11 +220,10 @@ class Fv2Dialect:
         # decode_fv2_exec_response left LOB objects in the rows; replace each with
         # its content.
         yield from self.resolve_lobs(all_rows, columns)
-        yield Send(encode_o7_close(0))
+        yield Send(encode_o7_close(0, cursor))
         yield RECV  # close STA
         _raise_terminal(err_code)
-        # call_status 0 + ora_code 0 => _drain_cursor won't issue TTI_FETCHes.
-        return (0, 0, 0, (len(all_rows), columns), all_rows, None, None, [], None)
+        return (columns, all_rows)
 
     def execute_dml(
         self, sql: str, bind: list | None = None, batch: list | None = None
@@ -237,9 +267,7 @@ class Fv2Dialect:
         # one is an input, every Var an output. The server's bind prompt says
         # which each bind really is, and replaces this guess below.
         input_values = [
-            (b._value if isinstance(b, Var) else b)
-            for b in bind
-            if not isinstance(b, Var) or b.has_value
+            _block_input(b) for b in bind if not isinstance(b, Var) or b.has_value
         ]
         out_positions = [i for i, b in enumerate(bind) if isinstance(b, Var)]
         yield Send(encode_o7_open(0))
@@ -257,9 +285,7 @@ class Fv2Dialect:
         directions = decode_fv2_bind_directions(packet)
         if directions is not None and len(directions) == len(bind):
             input_values = [
-                (b._value if isinstance(b, Var) else b)
-                for b, d in zip(bind, directions)
-                if d & FV2_BIND_IN
+                _block_input(b) for b, d in zip(bind, directions) if d & FV2_BIND_IN
             ]
             out_positions = [i for i, d in enumerate(directions) if d & FV2_BIND_OUT]
         if input_values:
@@ -279,6 +305,18 @@ class Fv2Dialect:
         yield Send(encode_o7_close(0))
         yield RECV  # close STA
         _raise_terminal(err_code)
+        # A REF CURSOR comes back as its server cursor's id. Its rows are read
+        # here, by that id, and travel with the marker the cursor wraps (#2246).
+        for i, pos in enumerate(out_positions):
+            if _is_cursor_var(bind[pos]) and out_values[i]:
+                cursor_id = decode_ub4(out_values[i])[0]
+                (columns, rows) = yield from self._drain(cursor_id)
+                out_values[i] = {
+                    '_refcursor': True,
+                    'cursor_id': cursor_id,
+                    'row_format': columns,
+                    'rows': rows,
+                }
         if out_positions:
             record = {'out_positions': out_positions, 'out_values': out_values}
             return (0, 0, 0, (None, None), [record], None, None, [], None)

@@ -74,7 +74,6 @@ _FV2_UNSUPPORTED = (
     # raise a clean NotSupportedError or exercise a capability 9i lacks, rather
     # than silently misbehaving, so the tests skip on 9i.
     ('batcherror', 'array DML batcherrors are not supported on Oracle 9i'),
-    ('refcursor', 'REF CURSOR is not supported on Oracle 9i (fv2)'),
     ('ref_bind', 'REF / object types are not supported on Oracle 9i'),
     ('collection_of_objects', 'object types are not supported on Oracle 9i'),
     ('lob_attribute', 'object types are not supported on Oracle 9i'),
@@ -124,6 +123,17 @@ _FV2_UNSUPPORTED = (
         'quoted_bind_in_returning_into',
         'a quoted bind cannot ride the pre-10g block rewrite',
     ),
+    # A CURSOR(...) column, or a REF CURSOR whose rows hold one, fetches as its
+    # raw cell on fv2: the nested cursor is not read yet (#2254).
+    ('cursor_expression', 'a nested cursor column is not read on fv2 yet (#2254)'),
+    (
+        'refcursor_holding_a_cursor',
+        'a nested cursor column is not read on fv2 yet (#2254)',
+    ),
+    (
+        'nested_in_a_nested_cursor',
+        'a nested cursor column is not read on fv2 yet (#2254)',
+    ),
     # The pre-10 error reply carries the code and text but no position.
     ('error_offset', 'the 9i/8i error reply carries no offset (#719)'),
 )
@@ -163,6 +173,8 @@ _8I_UNSUPPORTED = (
     ('executemany', 'executemany (array DML) is not supported on Oracle 8i'),
     ('mixed_batch', 'executemany (array DML) is not supported on Oracle 8i'),
     ('pipeline', 'the pipeline test uses array DML, unsupported on Oracle 8i'),
+    # 9i reads a REF CURSOR by its id over TTI_ALL7 (#2246); 8i's dialect does not.
+    ('refcursor', 'REF CURSOR is not supported on Oracle 8i'),
 )
 
 

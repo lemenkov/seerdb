@@ -374,9 +374,12 @@ class Cursor(_CursorLogic):
         # objects the caller passed. REF CURSOR OUT binds are fetched here.
         self._bind_directions = _iov_directions(Result)
         for Variable, Marker in _assign_out_binds(Bind, Result, self._connection):
-            Rows = self._connection.fetch_all_rows(
-                Marker['cursor_id'], Marker['row_format']
-            )
+            # 9i's REF CURSOR arrives with its rows already read (#2246).
+            Rows = Marker.get('rows')
+            if Rows is None:
+                Rows = self._connection.fetch_all_rows(
+                    Marker['cursor_id'], Marker['row_format']
+                )
             Variable._value = _build_refcursor_cursor(self._connection, Rows, Marker)
         _resolve_out_bind_lobs(self._connection, Bind)
 

@@ -6571,6 +6571,94 @@ class TestFv2BindDirections(unittest.TestCase):
         self.assertEqual(len(record['out_values']), 1)
 
 
+class TestFv2RefCursor(unittest.TestCase):
+    """A 9i REF CURSOR OUT bind (#2246), from ojdbc14 on 9.2.0.4: `begin open
+    :1 for select n, v from t2246 order by n; end;`. The block hands back the
+    REF CURSOR's server cursor id (2), which is then described, fetched and
+    closed by that id, as ojdbc14 does. Replies are the captured ones."""
+
+    PROMPT = bytes.fromhex('0b0501010001010030')  # one bind, IN OUT
+    OUT = bytes.fromhex(
+        '0702010200080102040201bd1d000401010000000101002f'
+        '00000000000000000000000000000101'
+    )
+    DESCRIBE = bytes.fromhex(
+        '080102020000817f011600000000000001010101014e000001800000011400000000'
+        '011f0101010101015600000401010000000102000300000000000000000000000000'
+        '000101'
+    )
+    ROWS = bytes.fromhex(
+        '0602010200010a000702c1020005726f772031000702c1030005726f772032000702'
+        'c1040005726f772033000702c1050005726f772034000702c1060005726f77203500'
+        '04010502057b00000102000300000000000000000000000000000101194f52412d30'
+        '313430333a206e6f206461746120666f756e640a'
+    )
+
+    def test_the_encoders_name_the_cursor_they_act_on(self):
+        from seerdb.common.tns import (
+            encode_o7_close,
+            encode_o7_describe,
+            encode_o7_exec,
+        )
+
+        self.assertEqual(encode_o7_describe(0, 2).hex(), '036200070102000001020101')
+        self.assertEqual(encode_o7_close(0, 2).hex(), '0314000102')
+        self.assertEqual(
+            encode_o7_exec(0, [], 2)[:19].hex(),
+            '03470002805001020000000001010701010200',
+        )
+        # Cursor 1, what OOPEN gives, is what they always sent.
+        self.assertEqual(encode_o7_describe(0), encode_o7_describe(0, 1))
+        self.assertEqual(encode_o7_close(0).hex(), '0314000101')
+
+    def test_a_ref_cursor_bind_is_a_one_byte_slot(self):
+        import seerdb
+        from seerdb.client.dialect import _block_input
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import _o7_bind_oac, encode_tokens_rxd
+
+        rc = Var(seerdb.DB_TYPE_CURSOR)
+        self.assertEqual(_o7_bind_oac(rc).hex(), '66010000010100000000011f01')
+        self.assertEqual(encode_tokens_rxd([_block_input(rc)], b'').hex(), '070100')
+
+    def test_the_block_reads_the_ref_cursor_by_its_id(self):
+        import seerdb
+        from seerdb.client.dialect import RECV, Fv2Dialect, Send
+        from seerdb.common.datatypes import Var
+
+        rc = Var(seerdb.DB_TYPE_CURSOR)
+        gen = Fv2Dialect().execute_block(
+            'begin open :1 for select n, v from t2246 order by n; end;', [rc]
+        )
+        replies = iter(
+            [b'open', self.PROMPT, self.OUT, b'\x09', self.DESCRIBE, self.ROWS, b'\x09']
+        )
+        sent = []
+        try:
+            step = next(gen)
+            while True:
+                if isinstance(step, Send):
+                    sent.append(step.data)
+                    step = gen.send(None)
+                else:
+                    self.assertIs(step, RECV)
+                    step = gen.send((6, next(replies)))
+        except StopIteration as done:
+            reply = done.value
+        marker = reply[4][0]['out_values'][0]
+        self.assertIsInstance(marker, dict)  # not the cursor id's raw bytes
+        self.assertEqual(marker['cursor_id'], 2)
+        self.assertEqual([c['column_name'] for c in marker['row_format']], [b'N', b'V'])
+        self.assertEqual(
+            [list(r) for r in marker['rows']],
+            [[n, f'row {n}'] for n in range(1, 6)],
+        )
+        from seerdb.common.tns import encode_o7_close, encode_o7_describe
+
+        self.assertIn(encode_o7_describe(0, 2), sent)
+        self.assertEqual(sent[-1], encode_o7_close(0, 2))
+
+
 class TestFv2Bfile(unittest.TestCase):
     """Oracle 9i BFILE read (#102, PROTOCOL §19.8): FILE_OPEN -> GETLEN -> READ
     -> FILE_CLOSE over TTI_LOBOPS, where FILE_OPEN returns an open-flagged

@@ -307,9 +307,12 @@ class AsyncCursor(_CursorLogic):
         # binds are fetched (async) and wrapped in a nested AsyncCursor.
         self._bind_directions = _iov_directions(Result)
         for Variable, Marker in _assign_out_binds(Bind, Result, self._connection):
-            Rows = await self._connection.fetch_all_rows(
-                Marker['cursor_id'], Marker['row_format']
-            )
+            # 9i's REF CURSOR arrives with its rows already read (#2246).
+            Rows = Marker.get('rows')
+            if Rows is None:
+                Rows = await self._connection.fetch_all_rows(
+                    Marker['cursor_id'], Marker['row_format']
+                )
             Variable._value = await self._build_refcursor(Rows, Marker)
         # A LOB-class OUT bind's value (#978): the async half of the sync
         # _resolve_out_bind_lobs -- same rule, awaited read.
