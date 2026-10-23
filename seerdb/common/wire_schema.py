@@ -28,12 +28,18 @@ A schema is a tuple of fields:
   23ai (``None`` for none) and OCI never;
 - ``('ptr', name)``: whether a pointer is present, a flag byte in thin, an
   8-byte pointer in OCI;
+- ``('n1', name)``: a small count, TTC variable-width in thin, one byte in
+  OCI;
 - ``('n8', name)``: a 64-bit count, TTC variable-width in thin, a ub8
   little-endian in OCI;
 - ``('wn4', name)``: a count that a wide OCI preamble writes as a ub8, and is
   an ``n4`` otherwise;
 - ``('bytes', name, length)``: as many bytes as the integer ``length``
   says, as they are;
+- ``('pad', size)``: ``size`` bytes no field is known for, zero when written
+  and passed over when read;
+- ``('derive', name, function)``: no bytes; reading sets ``name`` to
+  ``function(values)`` of the fields read so far, for a ``when`` to test;
 - ``('raw', name)``: bytes already encoded, written as they are; a schema
   that has one encodes only;
 - ``('when', name, fields)``: ``fields`` only when the integer ``name`` is not
@@ -68,6 +74,7 @@ _PRIMITIVES = (
     'ptr',
     'wn4',
     'n8',
+    'n1',
 )
 Encoder = Callable[[dict[str, Any]], bytes]
 Decoder = Callable[..., tuple[dict[str, Any], bytes]]
@@ -87,6 +94,7 @@ class Codec(Protocol):
     def ptr(self, value: bool) -> bytes: ...
     def wn4(self, value: int) -> bytes: ...
     def n8(self, value: int) -> bytes: ...
+    def n1(self, value: int) -> bytes: ...
     def read_n4(self, data: bytes) -> tuple[int, bytes]: ...
     def read_n2(self, data: bytes) -> tuple[int, bytes]: ...
     def read_value(self, data: bytes) -> tuple[bytes, bytes]: ...
@@ -98,6 +106,7 @@ class Codec(Protocol):
     def read_ptr(self, data: bytes) -> tuple[bool, bytes]: ...
     def read_wn4(self, data: bytes) -> tuple[int, bytes]: ...
     def read_n8(self, data: bytes) -> tuple[int, bytes]: ...
+    def read_n1(self, data: bytes) -> tuple[int, bytes]: ...
 
 
 def _encode_part(field: tuple[Any, ...], codec: Codec) -> Callable[[dict], bytes]:
@@ -111,6 +120,11 @@ def _encode_part(field: tuple[Any, ...], codec: Codec) -> Callable[[dict], bytes
     if kind in ('raw', 'bytes'):
         name = field[1]
         return lambda values: values[name]
+    if kind == 'pad':
+        zeros = bytes(field[1])
+        return lambda values: zeros
+    if kind == 'derive':
+        return lambda values: b''
     if kind in _PRIMITIVES:
         (pack, name) = (getattr(codec, kind), field[1])
         return lambda values: pack(values[name])
@@ -156,6 +170,12 @@ def compile_decoder(schema: Schema, codec: Codec) -> Decoder:
                 (values[field[1]], data) = (data[0], data[1:])
             elif kind == 'raw':
                 raise ValueError('a raw field has no length to decode by')
+            elif kind == 'pad':
+                if len(data) < field[1]:
+                    raise IndexError('pad past the end of the message')
+                data = data[field[1] :]
+            elif kind == 'derive':
+                values[field[1]] = field[2](values)
             elif kind == 'bytes':
                 size = values[field[2]]
                 (values[field[1]], data) = (bytes(data[:size]), data[size:])

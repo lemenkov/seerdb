@@ -8586,7 +8586,7 @@ A pre-12c sqlplus (10.2, 11.2) writes the same call with three differences
   `02 c1 06`. No NUMBER ends in a zero byte (its digits are 1 to 100, a negative's
   terminator is `0x66`), so the padding is cut.
 
-The Mirror finds the id by its length pair and accepts either tail. Unread, the
+The Mirror reads the id from the descriptor (§43) and accepts either tail. Unread, the
 call was refused and `SET SERVEROUTPUT ON` printed nothing.
 
 The reply is the ordinary OCI OUT-bind reply (§36): the 50-byte header with the
@@ -8805,3 +8805,37 @@ TXN_PRIORITY` takes a bare value in upper case (`medium` is reported as
 HIGH, the empty string included, is `ORA-00096: invalid value URGENT for
 parameter txn_priority, must be from among LOW, MEDIUM, HIGH` (measured for
 #1779).
+
+## 43. OCI bind descriptors and the value row (sqlplus, #2064)
+
+An OCI `OALL8` (sqlplus) carries, behind the SQL and the `al8i4` array, one
+descriptor per bind and then the `07` (RXD) row of values, as the thin execute
+does (§5.1). The descriptor is the thin OAC's (§5.3) fields at fixed width — `ub1` type,
+flags and precision, a `ub1` scale, `ub4` max length, max array, continuation
+flags and TOID length, the TOID, a `ub2` version and charset, a `ub1` form, a `ub4`
+max characters — with OCI's own parts:
+
+- a lead byte, `01` for a scalar, `00` for an object (type `0x6d`);
+- from 12c, four zeros before the continuation flags and four before the
+  charset;
+- for a scalar, six zeros after the version, one after the form, and a `ub4`
+  column id after the max characters.
+
+So a scalar's descriptor is 41 bytes before 12c and 49 from it. The lengths are
+the client's buffer: three bytes a character for the database charset, two for
+NCHAR (a `VARCHAR2(4000)` is 12000, an `NCHAR(5)` 10, with 5 max characters).
+The form is `2` for `NCHAR`, `NVARCHAR2` and `NCLOB`, whose values ride as
+UTF-16; NUMBER carries `0`. Flag `0x80` marks a name that occurs again (#2034):
+its value is not in the row.
+
+**Values ride in descriptor order, except that a char or RAW bind whose buffer
+is wider than 4000 bytes rides last**, as a thin LONG-class bind does. sqlplus
+23.26 and 11.2 binding `VARCHAR2(7)`, `VARCHAR2(4000)`, `CHAR(13)`,
+`NCHAR(5)`, `NVARCHAR2(9)` and `NUMBER` to a Mirror sent `abc`, `ij`, the two
+NCHAR values, `42`, then `defgh`. To a live 18c, which advertises
+`BIG_CHUNK_CLR`, sqlplus 23.26 sent the same six in descriptor order and its
+NCHAR values chunked with `ub4` lengths; the Mirror does not advertise it
+(#2042) and is sent the order above, with `ub1`-length chunks.
+
+Read by a pattern search for each descriptor's lead, the Mirror took descriptor
+bytes for the first value, and PostgreSQL refused the NUL in them.
