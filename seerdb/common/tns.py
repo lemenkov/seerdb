@@ -1609,7 +1609,90 @@ _LOB_READ_REPLY: wire_schema.Schema = (
     ('n8', 'amount'),
     ('raw', 'status'),
 )
+# A login's OSESSKEY or AUTH request (TTI_SESS 118 / TTI_AUTH 115, #2064): a
+# pointer, the user's length, the mode, a pointer, the pair count, two
+# pointers, the user, then the key-value pairs. sqlplus 10.2 and 11.2 send
+# thin's fields with 8-byte pointers, ub4 lengths and a ub8 count, declaring
+# each length at three times the character count, a conversion buffer's worth;
+# the value behind it carries the real one (#265, #1764). Not on the wire, so
+# given to the decoder: whether a 23ai OAUTH carries its has-user pointer (thin
+# only, detected by its first byte), and whether the user is length-prefixed
+# (thin from 12.1, OCI always) or raw.
+_AUTH_PAIR: wire_schema.Schema = (
+    ('n4', 'key_length'),
+    ('when', 'key_length', (('value', 'key'),)),
+    ('n4', 'value_length'),
+    ('when', 'value_length', (('value', 'value'),)),
+    ('n4', 'flags'),
+)
+_AUTH_HEAD: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN])),
+    ('u8', 'subtype'),
+    ('u8', 'seq'),
+    ('only', 'thin', (('when', 'has_user_ptr', (('n4', 'has_user'),)),)),
+    ('ptr', 'pointer_1'),
+    ('n4', 'user_length'),
+    ('n4', 'mode'),
+    ('ptr', 'pointer_2'),
+    ('n8', 'pair_count'),
+    ('ptr', 'pointer_3'),
+    ('ptr', 'pointer_4'),
+    ('when', 'user_prefixed', (('value', 'user'),)),
+    ('when', 'user_raw', (('bytes', 'user', 'user_length'),)),
+)
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+_AUTH_HEAD_FROM_THIN = wire_schema.compile_decoder(_AUTH_HEAD, _THIN)
+_AUTH_HEAD_FROM_OCI = wire_schema.compile_decoder(_AUTH_HEAD, _OCI)
+_AUTH_PAIR_OCI = wire_schema.compile_encoder(_AUTH_PAIR, _OCI)
+_AUTH_FROM_OCI = wire_schema.compile_decoder(
+    (*_AUTH_HEAD, ('each', 'pairs', 'pair_count', _AUTH_PAIR)), _OCI
+)
+
+
+def decode_auth_head(
+    payload: bytes, field_version: int
+) -> tuple[dict[str, Any], bytes]:
+    """A thin OSESSKEY or AUTH's head (_AUTH_HEAD), and the pairs behind it."""
+    # At fv >= 23.1 EXT 1 the OAUTH (phase-two AUTH) header carries a `0`
+    # has-user pointer byte before the `0x01` marker (PROTOCOL.md §20.3), which
+    # the phase-one OSESSKEY does not -- so it is detected, not assumed by
+    # subtype: the byte after the sequence is not the marker.
+    prefixed = field_version >= FIELD_VERSION_12_1
+    return _AUTH_HEAD_FROM_THIN(
+        payload,
+        {
+            'has_user_ptr': field_version >= FIELD_VERSION_23_1_EXT_1
+            and payload[3:4] != b'\x01',
+            'user_prefixed': prefixed,
+            'user_raw': not prefixed,
+        },
+    )
+
+
+def encode_auth_pair_oci(key: bytes, value: bytes, flags: int = 0) -> bytes:
+    """One key-value pair as the OCI login's request and reply carry it
+    (_AUTH_PAIR), each length as long as its bytes."""
+    return _AUTH_PAIR_OCI(
+        {
+            'key_length': len(key),
+            'key': key,
+            'value_length': len(value),
+            'value': value,
+            'flags': flags,
+        }
+    )
+
+
+def decode_auth_oci_head(payload: bytes) -> dict[str, Any]:
+    """An OCI OSESSKEY or AUTH's head (_AUTH_HEAD), its pairs left unread."""
+    return _AUTH_HEAD_FROM_OCI(payload, {'user_prefixed': True, 'user_raw': False})[0]
+
+
+def decode_auth_oci(payload: bytes) -> dict[str, Any]:
+    """An OCI OSESSKEY or AUTH's fields and pairs (_AUTH_HEAD, _AUTH_PAIR)."""
+    return _AUTH_FROM_OCI(payload, {'user_prefixed': True, 'user_raw': False})[0]
+
+
 _LOBOPS_HEAD_FROM_THIN = wire_schema.compile_decoder(_LOBOPS_HEAD, _THIN)
 _LOBOPS_READ_FROM_OCI = wire_schema.compile_decoder(_LOBOPS_READ, _OCI)
 _LOB_READ_REPLY_THIN = wire_schema.compile_encoder(_LOB_READ_REPLY, _THIN)
