@@ -795,6 +795,24 @@ class TestPreTenReturningWrap(unittest.TestCase):
                 'INSERT INTO t (a) VALUES (:"desc") RETURNING id INTO :"out"',
             )
 
+    def test_a_pre10_batch_runs_only_as_plain_dml_on_9i(self):
+        # 9i runs a plain DML batch as array DML (#2245). What it cannot run --
+        # and any batch on 8i -- is refused, never sent as its first row (#168).
+        from seerdb.client._conn_logic import refuse_pre10_batch
+        from seerdb.client.dialect import Fv2Dialect, O8iDialect
+        from seerdb.common.exceptions import NotSupportedError
+
+        refuse_pre10_batch(Fv2Dialect(), 'INSERT', None, False)
+        for Dialect, Head, Returning, Errors, Says in (
+            (O8iDialect(lambda: 0), 'INSERT', None, False, 'Oracle 8i'),
+            (Fv2Dialect(), 'INSERT', None, True, 'batcherrors'),
+            (Fv2Dialect(), 'INSERT', frozenset({1}), False, 'RETURNING'),
+            (Fv2Dialect(), 'BEGIN', None, False, 'PL/SQL block'),
+            (Fv2Dialect(), 'SELECT', None, False, 'query'),
+        ):
+            with self.assertRaisesRegex(NotSupportedError, Says):
+                refuse_pre10_batch(Dialect, Head, Returning, Errors)
+
     def test_bulk_collect_is_refused_below_10g(self):
         import types
 

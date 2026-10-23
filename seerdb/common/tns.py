@@ -12508,7 +12508,7 @@ def _o7_bind_oac(Value: object, Statement: bool = False) -> bytes:
         # tz-aware -> TIMESTAMPTZ(13); sub-second -> TIMESTAMP(11); else DATE(7).
         if Value.tzinfo is not None:
             Type, MaxSize, Csfrm = TNS_TYPE_TIMESTAMPTZ, 13, 0
-        elif Value.microsecond > 0:
+        elif _is_wide_datetime(Value):  # or a batch widened its column (#1098)
             Type, MaxSize, Csfrm = TNS_TYPE_TIMESTAMP, 11, 0
         else:
             Type, MaxSize, Csfrm = TNS_TYPE_DATE, 7, 0
@@ -12532,9 +12532,15 @@ def _o7_bind_oac(Value: object, Statement: bool = False) -> bytes:
 # (#100 SELECT/DML, #102 PL/SQL block) — the block between the SQL-length and the
 # bind count, and the tail after the SQL. Both parse encoders share them verbatim.
 # The individual bytes are opaque 9i framing, carried as captured ground truth
-# (verified byte-for-byte against the 9i parse captures).
+# (verified byte-for-byte against the 9i parse captures). The tail's second
+# field is the iteration count, a ub4: ojdbc14's batches of 3 and 300 rows send
+# `01 03` and `02 01 2c` there (#2245).
 _O7_PARSE_MID = bytes([0, 0, 0x01, 0x01, 0x07, 0x01, 0x01, 0x02, 0, 0, 0])
 _O7_PARSE_TAIL = bytes([0x01, 0x01, 0x01, 0x01, 0, 0, 0, 0, 0])
+
+
+def _o7_parse_tail(Iterations: int) -> bytes:
+    return bytes([0x01, 0x01]) + encode_sb4(Iterations) + bytes(5)
 
 
 def _o7_bind_count(Binds: list) -> bytes:
@@ -12543,12 +12549,19 @@ def _o7_bind_count(Binds: list) -> bytes:
     return bytes([0x01, 0x01, len(Binds)]) if Binds else bytes([0, 0])
 
 
-def encode_o7_parse(Seq: int, Sql: str, Binds: list | None = None) -> bytes:
+def encode_o7_parse(
+    Seq: int, Sql: str, Binds: list | None = None, Batch: list | None = None
+) -> bytes:
     # Call 1: TTI_ALL7 parse. The SQL is carried inline, sb4-length-prefixed,
     # between two fixed option blocks. With input binds (#100) the option word
     # flips to 0x29, a bind-count field precedes the SQL, and each bind's OAC
     # plus the values (one RXD with all values) are appended after the SQL.
+    # `Batch` holds an array DML's further rows (#2245): the tail counts every
+    # row, the OACs describe the columns once, as the 10g+ path does, and each
+    # row follows as its own RXD -- ojdbc14's executeBatch, one call however
+    # many rows or packets.
     Binds = Binds or []
+    Rows = _widen_batch_datetimes([Binds, *Batch]) if Batch else [Binds]
     SqlBytes = Sql.encode('utf-8')
     Opt = 0x29 if Binds else 0x21
     Out = (
@@ -12557,10 +12570,10 @@ def encode_o7_parse(Seq: int, Sql: str, Binds: list | None = None) -> bytes:
         + _O7_PARSE_MID
         + _o7_bind_count(Binds)
         + SqlBytes
-        + _O7_PARSE_TAIL
+        + _o7_parse_tail(len(Rows))
     )
     if Binds:
-        Oacs = [_o7_bind_oac(V, Statement=True) for V in Binds]
+        Oacs = [_o7_bind_oac(V, Statement=True) for V in _oac_rep_row(Rows)]
         Out += b''.join(Oacs)
         # 9i applies the LONG-class rule too (docs/PROTOCOL.md 5.4, #723): a
         # bind declared wider than 4000 bytes has its value read after the
@@ -12568,11 +12581,12 @@ def encode_o7_parse(Seq: int, Sql: str, Binds: list | None = None) -> bytes:
         # plain string is declared 4000 there and stays in place. A PL/SQL
         # block (encode_o7_block) keeps every value in place.
         Long = [decode_ub4(Oac[4:])[0] > 4000 for Oac in Oacs]
-        Out += encode_tokens_rxd(
-            [V for V, L in zip(Binds, Long) if not L]
-            + [V for V, L in zip(Binds, Long) if L],
-            b'',
-        )
+        for Row in Rows:
+            Out += encode_tokens_rxd(
+                [V for V, L in zip(Row, Long) if not L]
+                + [V for V, L in zip(Row, Long) if L],
+                b'',
+            )
     return Out
 
 

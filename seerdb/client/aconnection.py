@@ -34,6 +34,7 @@ from seerdb.client._conn_logic import (
     _ConnectionLogic,
     _pre10_tier_name_for,
     _transaction_priority,
+    refuse_pre10_batch,
     returning_block_error,
     returning_block_request,
     returning_block_result,
@@ -58,7 +59,6 @@ from seerdb.client.connection import (
     _type_attr,
 )
 from seerdb.client.dialect import (
-    CAP_ARRAY_DML,
     CAP_OWN_TXN,
     Dialect,
     O8iDialect,
@@ -1257,13 +1257,8 @@ class AsyncOracleConnect(_ConnectionLogic):
                     + _pre10_tier_name_for(self._dialect)
                 )
             _check_fv2_bind_sizes(Bind, Batch)
-            if Batch and CAP_ARRAY_DML not in self._dialect.capabilities():
-                from seerdb.common.exceptions import NotSupportedError
-
-                raise NotSupportedError(
-                    'executemany (array DML) is not supported on Oracle '
-                    + _pre10_tier_name_for(self._dialect)
-                )
+            if Batch:
+                refuse_pre10_batch(self._dialect, Head, ReturnBinds, BatchErrors)
             if Head.startswith('SELECT'):
                 return await self._drain_cursor(
                     await self._drive(
@@ -1283,8 +1278,11 @@ class AsyncOracleConnect(_ConnectionLogic):
                     raise returning_block_error(Exc) from None
                 Result = returning_block_result(Raw, len(Bind))
             else:  # DML (INSERT/UPDATE/DELETE)
-                Result = await self._drive(self._dialect.execute_dml(Query, Bind))
-            if self.autocommit:
+                Result = await self._drive(
+                    self._dialect.execute_dml(Query, Bind, Batch)
+                )
+            # A DML's error comes back in the result: nothing to commit then.
+            if self.autocommit and not (isinstance(Result, tuple) and Result[1]):
                 await self.commit()
             return Result
         if Head.startswith('SELECT'):
