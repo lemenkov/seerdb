@@ -6409,6 +6409,18 @@ class TestO3logonMessages(unittest.TestCase):
         Oacs = slice(Tail + 9, Tail + 9 + 3 * 14)
         self.assertEqual(Mixed[Oacs], Plain[Oacs])
 
+    def test_9i_batch_errors_set_the_option_bit(self):
+        # The ALL7 option word is a ub4; batcherrors ORs in the 10g+ bit, which
+        # 9.2 honours (#2247): 0x8029 becomes 0x88029, `03 08 80 29`.
+        from seerdb.common.tns import encode_o7_parse
+
+        Sql = 'insert into t2247 values (:1)'
+        Plain = encode_o7_parse(0, Sql, [1], [[2]])
+        Errors = encode_o7_parse(0, Sql, [1], [[2]], BatchErrors=True)
+        self.assertEqual(Plain[3:6].hex(), '028029')
+        self.assertEqual(Errors[3:7].hex(), '03088029')
+        self.assertEqual(Errors[7:], Plain[6:])
+
     def test_9i_charset_aware_binds(self):
         # DB-charset-aware fv2 binds (#174). A plain str bind declares the
         # AL32UTF8 session charset (02 0369, csfrm 1) and its value rides as

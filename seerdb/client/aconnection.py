@@ -34,6 +34,7 @@ from seerdb.client._conn_logic import (
     _ConnectionLogic,
     _pre10_tier_name_for,
     _transaction_priority,
+    pre10_dml_applied,
     refuse_pre10_batch,
     returning_block_error,
     returning_block_request,
@@ -1279,10 +1280,9 @@ class AsyncOracleConnect(_ConnectionLogic):
                 Result = returning_block_result(Raw, len(Bind))
             else:  # DML (INSERT/UPDATE/DELETE)
                 Result = await self._drive(
-                    self._dialect.execute_dml(Query, Bind, Batch)
+                    self._dialect.execute_dml(Query, Bind, Batch, BatchErrors)
                 )
-            # A DML's error comes back in the result: nothing to commit then.
-            if self.autocommit and not (isinstance(Result, tuple) and Result[1]):
+            if self.autocommit and pre10_dml_applied(Result, BatchErrors):
                 await self.commit()
             return Result
         if Head.startswith('SELECT'):

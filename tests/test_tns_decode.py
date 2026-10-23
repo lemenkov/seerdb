@@ -6750,6 +6750,50 @@ class TestFv2NestedCursor(unittest.TestCase):
         self.assertEqual(sent[-2], encode_o7_close(0, 4))
 
 
+class TestFv2BatchErrors(unittest.TestCase):
+    # 9.2's reply to a batcherrors array DML (#2247), captured: rows 1, 2, 1,
+    # 4, 5 into a primary key. Four rows applied, ORA-24381, and the 10g+ OER's
+    # three arrays behind the short status: ORA-00001 at row index 2.
+    REPLY = bytes.fromhex(
+        '040104025f3d000001010002000000000000000000000000000000010500010102010101'
+        '010201020101160138384f52412d30303030313a20756e6971756520636f6e7374726169'
+        '6e74202850594f2e5359535f43303036383837292076696f6c617465640a0000214f5241'
+        '2d32343338313a206572726f7228732920696e20617272617920444d4c0a'
+    )
+
+    def test_the_failed_rows_are_read_from_the_status(self):
+        from seerdb.common.tns import (
+            decode_fv2_batch_errors,
+            decode_fv2_dml_response,
+            decode_fv2_dml_rowid,
+            decode_fv2_oer_error,
+        )
+
+        self.assertEqual(
+            decode_fv2_batch_errors(self.REPLY),
+            [
+                {
+                    'offset': 2,
+                    'code': 1,
+                    'message': 'ORA-00001: unique constraint (PYO.SYS_C006887) violated',
+                }
+            ],
+        )
+        self.assertEqual(decode_fv2_dml_response(self.REPLY), (4, 24381))
+        self.assertEqual(
+            decode_fv2_oer_error(self.REPLY),
+            (24381, 'ORA-24381: error(s) in array DML'),
+        )
+        self.assertIsNone(decode_fv2_dml_rowid(self.REPLY))  # an error carries none
+        # A plain DML's status has empty arrays.
+        Insert = bytes.fromhex(
+            '0801020402013cf700040101000000010100020000000000030278dc01010002b912'
+            '00000000000101'
+        )
+        self.assertEqual(decode_fv2_batch_errors(Insert), [])
+        self.assertIsNotNone(decode_fv2_dml_rowid(Insert))
+
+
 class TestFv2Bfile(unittest.TestCase):
     """Oracle 9i BFILE read (#102, PROTOCOL §19.8): FILE_OPEN -> GETLEN -> READ
     -> FILE_CLOSE over TTI_LOBOPS, where FILE_OPEN returns an open-flagged

@@ -50,6 +50,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_10_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_23_1,
+    ORA_ARRAY_DML_ERRORS,
     ORA_NO_DATA_FOUND,
     ORA_TOO_MANY_ROWS,
     RCAP_TTC,
@@ -797,21 +798,31 @@ def _pre10_tier_name_for(Dialect) -> str:
     return '8i' if isinstance(Dialect, O8iDialect) else '9i'
 
 
+def pre10_dml_applied(Result: object, BatchErrors: bool) -> bool:
+    """Whether a pre-10g DML's result is one autocommit commits.
+
+    Its error comes back in the result for the cursor to raise, and then there
+    is nothing to commit -- except in `batcherrors` mode, where ORA-24381 says
+    the good rows were applied and the failures are listed (#2247), and they
+    commit as on 10g+.
+    """
+    Code = Result[1] if isinstance(Result, tuple) else 0
+    return not Code or (BatchErrors and Code == ORA_ARRAY_DML_ERRORS)
+
+
 def refuse_pre10_batch(Dialect, Head: str, ReturnBinds, BatchErrors: bool) -> None:
     """Refuse an executemany a pre-10g tier cannot run as array DML.
 
     9i takes a plain INSERT / UPDATE / DELETE batch in one TTI_ALL7 call
-    (#2245); 8i takes none. Anything else would apply only the first row and
-    silently drop the rest (#168), so it is refused: batch errors (#2247), an
-    array RETURNING, and a batch of a query or a PL/SQL block.
+    (#2245), batch errors included (#2247); 8i takes none. Anything else would
+    apply only the first row and silently drop the rest (#168), so it is
+    refused: an array RETURNING, and a batch of a query or a PL/SQL block.
     """
     from seerdb.client.dialect import CAP_ARRAY_DML
 
     Tier = 'Oracle ' + _pre10_tier_name_for(Dialect)
     if CAP_ARRAY_DML not in Dialect.capabilities():
         raise NotSupportedError(f'executemany (array DML) is not supported on {Tier}')
-    if BatchErrors:
-        raise NotSupportedError(f'array DML batcherrors are not supported on {Tier}')
     if ReturnBinds:
         raise NotSupportedError(f'an array DML RETURNING is not supported on {Tier}')
     if Head.startswith(('SELECT', 'BEGIN', 'DECLARE')):

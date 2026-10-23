@@ -796,22 +796,37 @@ class TestPreTenReturningWrap(unittest.TestCase):
             )
 
     def test_a_pre10_batch_runs_only_as_plain_dml_on_9i(self):
-        # 9i runs a plain DML batch as array DML (#2245). What it cannot run --
-        # and any batch on 8i -- is refused, never sent as its first row (#168).
+        # 9i runs a plain DML batch as array DML (#2245), batch errors included
+        # (#2247). What it cannot run -- and any batch on 8i -- is refused, never
+        # sent as its first row (#168).
         from seerdb.client._conn_logic import refuse_pre10_batch
         from seerdb.client.dialect import Fv2Dialect, O8iDialect
         from seerdb.common.exceptions import NotSupportedError
 
         refuse_pre10_batch(Fv2Dialect(), 'INSERT', None, False)
+        refuse_pre10_batch(Fv2Dialect(), 'INSERT', None, True)
         for Dialect, Head, Returning, Errors, Says in (
             (O8iDialect(lambda: 0), 'INSERT', None, False, 'Oracle 8i'),
-            (Fv2Dialect(), 'INSERT', None, True, 'batcherrors'),
+            (O8iDialect(lambda: 0), 'INSERT', None, True, 'Oracle 8i'),
             (Fv2Dialect(), 'INSERT', frozenset({1}), False, 'RETURNING'),
             (Fv2Dialect(), 'BEGIN', None, False, 'PL/SQL block'),
             (Fv2Dialect(), 'SELECT', None, False, 'query'),
         ):
             with self.assertRaisesRegex(NotSupportedError, Says):
                 refuse_pre10_batch(Dialect, Head, Returning, Errors)
+
+    def test_a_pre10_batch_with_errors_commits_its_good_rows(self):
+        # Under autocommit a pre-10g DML's error means nothing to commit, but in
+        # batcherrors mode ORA-24381 says the good rows went in (#2247).
+        from seerdb.client._conn_logic import pre10_dml_applied
+
+        Result = (0, 0, 0, (3, None), [], None, None, [], None)
+        self.assertTrue(pre10_dml_applied(Result, False))
+        Partial = (0, 24381, 0, (4, None), [], 'ORA-24381', None, [{}], None)
+        self.assertTrue(pre10_dml_applied(Partial, True))
+        self.assertFalse(pre10_dml_applied(Partial, False))
+        Failed = (0, 1, 0, (2, None), [], 'ORA-00001', None, [], None)
+        self.assertFalse(pre10_dml_applied(Failed, True))
 
     def test_bulk_collect_is_refused_below_10g(self):
         import types

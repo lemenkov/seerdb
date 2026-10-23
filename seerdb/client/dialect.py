@@ -39,6 +39,7 @@ from seerdb.common.tns import (
     decode_8i_dml_response,
     decode_8i_dml_rowid,
     decode_8i_exec_response,
+    decode_fv2_batch_errors,
     decode_fv2_bind_directions,
     decode_fv2_block_out,
     decode_fv2_describe,
@@ -126,7 +127,9 @@ class Dialect(Protocol):
 
     def capabilities(self) -> frozenset[str]: ...
     def execute_query(self, sql: str, bind: list | None, fetch: int): ...
-    def execute_dml(self, sql: str, bind: list | None, batch: list | None): ...
+    def execute_dml(
+        self, sql: str, bind: list | None, batch: list | None, batcherrors: bool
+    ): ...
     def execute_block(self, sql: str, bind: list | None): ...
     def txn_control(self, statement: str): ...  # only when CAP_OWN_TXN is set
     def bfile_read(self, locator: bytes): ...
@@ -248,16 +251,21 @@ class Fv2Dialect:
         return (columns, all_rows)
 
     def execute_dml(
-        self, sql: str, bind: list | None = None, batch: list | None = None
+        self,
+        sql: str,
+        bind: list | None = None,
+        batch: list | None = None,
+        batcherrors: bool = False,
     ):
         # 9i DML over TTI_ALL7 (#101): OOPEN, then a single parse that also
         # executes (option 02 80 21) — no describe/fetch. The affected-row count
         # comes back in the response OER. (Autocommit is applied by the caller.)
         # An executemany's further rows ride the same call (#2245), and the
-        # count is then the whole batch's.
+        # count is then the whole batch's. In `batcherrors` mode the server
+        # applies the good rows and lists the failures (#2247).
         yield Send(encode_o7_open(0))
         yield RECV  # OOPEN RPA
-        yield Send(encode_o7_parse(0, sql, bind, batch))
+        yield Send(encode_o7_parse(0, sql, bind, batch, batcherrors))
         resp = yield RECV
         if resp is False:
             raise Exception('Connection closed during 9i DML')
@@ -268,9 +276,12 @@ class Fv2Dialect:
         (err_code, message) = decode_fv2_oer_error(resp[1])
         (row_count, _) = decode_fv2_dml_response(resp[1])
         rowid = None if err_code else decode_fv2_dml_rowid(resp[1])  # #1079
+        batch_errors = decode_fv2_batch_errors(resp[1]) if batcherrors else []
         yield Send(encode_o7_close(0))
         yield RECV  # close STA
-        return (0, err_code, 0, (row_count, None), [], message, rowid, [], None)
+        return (0, err_code, 0, (row_count, None), [], message, rowid, batch_errors) + (
+            None,
+        )
 
     def execute_block(self, sql: str, bind: list | None = None):
         # Anonymous PL/SQL block over the fv2 TTI_ALL7 block path (#102, PROTOCOL
@@ -552,7 +563,11 @@ class O8iDialect:
             buf += received[1]
 
     def execute_dml(
-        self, sql: str, bind: list | None = None, batch: list | None = None
+        self,
+        sql: str,
+        bind: list | None = None,
+        batch: list | None = None,
+        batcherrors: bool = False,
     ):
         # 8i INSERT/UPDATE/DELETE and DDL (#360, §19.12): the same OALL8 as a
         # SELECT but with the statement-type option word and no fetch. The
