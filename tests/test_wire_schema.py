@@ -408,3 +408,62 @@ def test_an_oci_login_request_is_thins_fields_at_fixed_width() -> None:
     keys = {pair.get('key'): pair for pair in fields['pairs']}
     assert keys[b'AUTH_SESSKEY']['key_length'] == 3 * len(b'AUTH_SESSKEY')
     assert len(keys[b'AUTH_SESSKEY']['value']) == 96  # 48 bytes as hex
+
+
+@pytest.mark.parametrize('codec', CODECS)
+def test_pad_derive_and_n1_decode_back(codec: wire_schema.Codec) -> None:
+    # Zeros the other side ignores, a flag worked out from a field read before
+    # it, and a byte that thin writes as a universal number.
+    schema: wire_schema.Schema = (
+        ('u8', 'kind'),
+        ('derive', 'big', lambda v: v['kind'] > 1),
+        ('when', 'big', (('pad', 3),)),
+        ('n1', 'scale'),
+    )
+    encode = wire_schema.compile_encoder(schema, codec)
+    decode = wire_schema.compile_decoder(schema, codec)
+    for kind, scale in ((1, 0), (2, 127)):
+        wire = encode({'kind': kind, 'big': kind > 1, 'scale': scale})
+        assert wire.count(b'\x00') >= (3 if kind > 1 else 0)
+        (fields, rest) = decode(wire + b'tail')
+        assert (fields['kind'], fields['big'], fields['scale'], rest) == (
+            kind,
+            kind > 1,
+            scale,
+            b'tail',
+        )
+    with pytest.raises(IndexError):
+        decode(bytes([2, 0]))
+
+
+@pytest.mark.parametrize(
+    ('name', 'version', 'size'), (('23_26', 11, 49), ('11_2', 6, 41))
+)
+def test_an_oci_bind_descriptor_is_thins_fields_at_fixed_width(
+    name: str, version: int, size: int
+) -> None:
+    # sqlplus 23.26 and 11.2 binding six variables: 41 bytes each before 12c,
+    # 49 from it; the declared length is the buffer, three bytes a character
+    # (two for NCHAR), and the form tells the national pair; NUMBER has none
+    # (#2064).
+    import sys
+
+    sys.path.insert(0, 'tests')
+    import test_server_query
+
+    request = getattr(test_server_query, f'_OCI_SIX_BINDS_{name}')
+    row = request.index(b'\x07\x03abc')
+    rest = request[row - 6 * size : row]
+    found = []
+    while rest:
+        (oac, rest) = tns._OAC_FROM_OCI(rest, {'oci_12c': version >= 7})
+        found.append((oac['data_type'], oac['max_length'], oac['csfrm']))
+        assert oac['lead'] == 1
+    assert found == [
+        (1, 21, 1),
+        (1, 12000, 1),
+        (96, 39, 1),
+        (96, 10, 2),
+        (1, 18, 2),
+        (2, 22, 0),
+    ]

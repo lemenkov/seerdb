@@ -1154,6 +1154,8 @@ class _ThinCodec:
     read_wn4 = read_n4
     n8 = n4
     read_n8 = read_n4
+    n1 = n4
+    read_n1 = read_n4
 
 
 class _OciCodec:
@@ -1288,6 +1290,16 @@ class _OciCodec:
     @staticmethod
     def read_n8(data: bytes) -> tuple[int, bytes]:
         return int.from_bytes(data[:8], 'little'), data[8:]
+
+    @staticmethod
+    def n1(value: int) -> bytes:
+        return bytes([value & 0xFF])
+
+    @staticmethod
+    def read_n1(data: bytes) -> tuple[int, bytes]:
+        if not data:
+            raise IndexError('n1 past the end of the message')
+        return data[0], data[1:]
 
 
 class _OciWideCodec(_OciCodec):
@@ -1640,7 +1652,41 @@ _AUTH_HEAD: wire_schema.Schema = (
     ('when', 'user_prefixed', (('value', 'user'),)),
     ('when', 'user_raw', (('bytes', 'user', 'user_length'),)),
 )
+# A bind's descriptor, its OAC (#116, #2064): thin's fields in thin's order.
+# OCI's -- measured against sqlplus 10.2, 11.2 and 23.26 binding VARCHAR2,
+# CHAR, NCHAR, NVARCHAR2, NUMBER, BINARY_FLOAT / DOUBLE, CLOB, NCLOB,
+# REFCURSOR and GET_LINES' object -- are a describe column's without the column's
+# own (_DCB_COLUMN): a lead byte (0x00 for a typed bind), the 12c band's two
+# inserted slots, and in a plain bind the zero runs a typed one lacks and the
+# oaccolid slot. 41 bytes for a plain bind before 12c, 49 from it; 47 and 55 for
+# an object. OCI declares a character bind's length at its client buffer's
+# size -- three bytes a character, two for NCHAR -- and its characters as max
+# characters. Thin's oaccolid, from 12.2, its callers read.
+_OAC: wire_schema.Schema = (
+    ('only', 'oci', (('u8', 'lead'),)),
+    ('u8', 'data_type'),
+    ('derive', 'oci_plain', lambda v: v['data_type'] != TNS_TYPE_ADT),
+    ('u8', 'flags'),
+    ('u8', 'precision'),
+    ('n1', 'scale'),
+    ('n4', 'max_length'),
+    ('n4', 'max_array'),
+    ('only', 'oci', (('when', 'oci_12c', (('pad', 4),)),)),
+    ('n4', 'cont_flags'),
+    ('n4', 'toid_length'),
+    ('when', 'toid_length', (('value', 'toid'),)),
+    ('n2', 'version'),
+    ('only', 'oci', (('when', 'oci_plain', (('pad', 6),)),)),
+    ('only', 'oci', (('when', 'oci_12c', (('pad', 4),)),)),
+    ('n2', 'charset'),
+    ('u8', 'csfrm'),
+    ('only', 'oci', (('when', 'oci_plain', (('pad', 1),)),)),
+    ('n4', 'max_chars'),
+    ('only', 'oci', (('when', 'oci_plain', (('n4', 'oaccolid'),)),)),
+)
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+_OAC_FROM_THIN = wire_schema.compile_decoder(_OAC, _THIN)
+_OAC_FROM_OCI = wire_schema.compile_decoder(_OAC, _OCI)
 _AUTH_HEAD_FROM_THIN = wire_schema.compile_decoder(_AUTH_HEAD, _THIN)
 _AUTH_HEAD_FROM_OCI = wire_schema.compile_decoder(_AUTH_HEAD, _OCI)
 _AUTH_PAIR_OCI = wire_schema.compile_encoder(_AUTH_PAIR, _OCI)
@@ -5910,55 +5956,32 @@ def decode_lobops_oer(Packet: bytes, FieldVersion: int) -> tuple[int, str | None
 
 
 def _decode_oac_walk(Data: bytes) -> tuple:
-    # Every OAC field in wire order, raw: (DataType, Flg, DataScale,
+    # Every OAC field in wire order, raw (_OAC): (DataType, Flg, DataScale,
     # MaxDataLength, Mal, Fl2, ToId, VSN, Charset, Csfrm, Mxlc, Rest). The
-    # public decoders pick what they need from it.
+    # public decoders pick what they need from it. The type OID is written with
+    # two lengths, a ub4 count then, only when non-empty, the length-prefixed
+    # bytes (#139). A message that ends inside it must say "read more", not
+    # raise: a big request spans several DATA packets, and the first parse runs
+    # off the end by design (#1000).
     if len(Data) < 3:
-        # Same reason as the csfrm byte below: a half-arrived message must say
-        # "read more", not raise (#1000).
         raise Truncated('OAC: header short')
-    (DataType, Flg, _Pre) = struct.unpack('>BBB', Data[:3])
-    (DataScale, R0) = decode_ub4(Data[3:])
-    (MaxDataLength, R1) = decode_ub4(R0)
-    (Mal, R2) = decode_ub4(R1)
-    (Fl2, R3) = decode_ub4(R2)
-    # The type OID is written with two lengths (write_bytes_with_two_lengths): a
-    # ub4 count then, only when non-empty, the length-prefixed bytes — not a
-    # plain DALC. An empty OID (every scalar bind) is a single 0x00 under either
-    # reading, but a real OID (object type 109 / REF type 111, #139) is 16 bytes
-    # behind the ub4 count, and reading it as a bare DALC desyncs the whole OAC.
-    (ToIdLen, R3a) = decode_ub4(R3)
-    if ToIdLen:
-        (ToIdRaw, R4) = decode_dalc(R3a)
-        ToId = bytes(ToIdRaw) if not isinstance(ToIdRaw, list) else b''
-    else:
-        ToId, R4 = b'', R3a
-    (VSN, R5) = decode_ub4(R4)
-    (Charset, R6) = decode_ub4(R5)
-    if not R6:
-        # A big request spans several DATA packets, and the continuations carry
-        # no MORE flag -- so the first parse runs off the end by design, and
-        # _complete_message grows the body until it does not. It tells "read
-        # more" from "done" by the Truncated every other primitive raises; a
-        # bare index raised IndexError instead, which nothing reads as "read
-        # more" and nothing catches, so the session died on a ~1400-bind PL/SQL
-        # block (#1000).
-        raise Truncated('OAC: no csfrm byte')
-    Csfrm = R6[0]
-    (Mxlc, R7) = decode_ub4(R6[1:])
+    try:
+        (f, rest) = _OAC_FROM_THIN(Data)
+    except IndexError:
+        raise Truncated('OAC: cut short') from None
     return (
-        DataType,
-        Flg,
-        DataScale,
-        MaxDataLength,
-        Mal,
-        Fl2,
-        ToId,
-        VSN,
-        Charset,
-        Csfrm,
-        Mxlc,
-        R7,
+        f['data_type'],
+        f['flags'],
+        f['scale'],
+        f['max_length'],
+        f['max_array'],
+        f['cont_flags'],
+        bytes(f.get('toid', b'')),
+        f['version'],
+        f['charset'],
+        f['csfrm'],
+        f['max_chars'],
+        rest,
     )
 
 
@@ -9674,11 +9697,13 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
     bind_types: list[tuple[int, int, int, bytes]] = []
     if bind_count:
         # After a long statement too: sqlplus's SHOW ERRORS query is one (#2028).
-        (binds, described) = _parse_oci_binds(payload, sql_end, bind_count, sql)
-        bind_meta = [(t, size) for (t, size, _toid) in described]
+        (binds, described) = _parse_oci_binds(
+            payload, sql_end, bind_count, sql, head['al8i4_length']
+        )
+        bind_meta = [(t, size) for (t, size, _toid, _csfrm) in described]
         # An object / collection bind's type id rides here, as on the thin path,
         # so the backend can register a variable of its type (#1411).
-        bind_types = [(t, _CSFRM_DB, size, toid) for (t, size, toid) in described]
+        bind_types = [(t, csfrm, size, toid) for (t, size, toid, csfrm) in described]
     if bind_count and not bind_meta:
         # Binds the section could not be read for -- a type this path does not
         # parse, such as a collection. Run without them, the statement did
@@ -9707,23 +9732,11 @@ def parse_exec_oci(payload: bytes) -> ExecRequest:
 # its own and is the same in both widths.
 
 
-# The flag byte behind the type is 03 for most binds; a pre-12c sqlplus
-# (10.2, 11.2) writes 01 for GET_LINES's IN OUT count (#1826), and sqlplus 23.26
-# 20 for SHOW ERRORS's object name, its value a plain DALC all the same (#2028).
-_OCI_OAC_MARKER = re.compile(rb'\x01(.)[\x01\x03\x20]\x00\x00')
-# An object or collection bind's descriptor (PROTOCOL.md §40.4): `00 6d 00 00
-# 00`, the ub4 buffer size, twelve zeros, a ub4 and a ub1 16, the type's 16-byte
-# id. Captured from sqlplus 23.26 binding DBMS_OUTPUT.GET_LINES's lines (#1411).
-_OCI_ADT_MARKER = b'\x00\x6d\x00\x00\x00'
 # A placeholder whose name came earlier in the statement (`select :n, :n`): a
 # descriptor of its own, flag 0x80 and size 0, but no value in the RXD row --
 # it takes its name's first value (#2034). Captured from sqlplus 23.26.
-_OCI_REPEAT_MARKER = b'\x01\x01\x80\x00\x00'
+_OCI_BIND_REPEAT_FLAG = 0x80
 _OCI_BIND_REPEAT = -1  # a repeat's place in the descriptor list
-# The id follows a ub4 16 and a ub1 16, after 12 zeros from 12c (sqlplus 23.26)
-# and 10 before (10.2, 11.2, #1826); found by that pair, not a fixed offset.
-_OCI_ADT_TOID_LEN_PAIR = b'\x10\x00\x00\x00\x10'
-_OCI_ADT_TOID_SEARCH = 30  # the pair lies within this many bytes of the marker
 # An object / collection IN value carrying nothing -- sqlplus's GET_LINES lines,
 # a pure OUT: the type's REF, then these 15 bytes.
 _OCI_ADT_EMPTY_TAIL = b'\x01' + bytes(12) + b'\x01\x00'
@@ -9808,43 +9821,32 @@ def _oci_read_lob_bind(data: bytes) -> tuple[bytes | None, bytes]:
     raise DataError('OCI LOB bind: chunks do not add up to its length')
 
 
-def _oci_bind_descriptors(tail: bytes, bind_count: int) -> list[tuple[int, int, bytes]]:
-    # Each bind's (tns_type, max_size, toid), in order: a scalar's OAC marker
-    # (``01 <type> 03 00 00``), an object / collection's (§40.4) or a repeated
-    # name's, whichever comes next; a repeat is ``_OCI_BIND_REPEAT``. Empty if
-    # they do not add up to ``bind_count``.
-    meta: list[tuple[int, int, bytes]] = []
-    at = 0
-    while len(meta) < bind_count:
-        scalar = _OCI_OAC_MARKER.search(tail, at)
-        adt = tail.find(_OCI_ADT_MARKER, at)
-        repeat = tail.find(_OCI_REPEAT_MARKER, at)
-        if repeat >= 0 and all(
-            nxt < 0 or repeat < nxt for nxt in (adt, scalar.start() if scalar else -1)
-        ):
-            meta.append((_OCI_BIND_REPEAT, 0, b''))
-            at = repeat + len(_OCI_REPEAT_MARKER)
-            continue
-        if adt >= 0 and (scalar is None or adt < scalar.start()):
-            end = adt + len(_OCI_ADT_MARKER)
-            max_size = int.from_bytes(tail[end : end + 4], 'little')
-            pair = tail.find(
-                _OCI_ADT_TOID_LEN_PAIR, end + 4, adt + _OCI_ADT_TOID_SEARCH
-            )
-            if pair < 0:
-                return []
-            toid_at = pair + len(_OCI_ADT_TOID_LEN_PAIR)
-            meta.append((TNS_TYPE_ADT, max_size, tail[toid_at : toid_at + 16]))
-            at = toid_at + 16
-            continue
-        if scalar is None:
-            return []
-        data_type = scalar.group(1)[0]
-        if data_type in _OCI_BIND_TYPES:
-            max_size = int.from_bytes(tail[scalar.end() : scalar.end() + 4], 'little')
-            meta.append((data_type, max_size, b''))
-        at = scalar.end()
-    return meta
+def _oci_bind_descriptors(
+    tail: bytes, bind_count: int
+) -> tuple[list[tuple[int, int, bytes, int]], int]:
+    # Each bind's (tns_type, max_size, toid, csfrm), in order, read from its
+    # descriptor (_OAC), and where the descriptors end. A repeated name's
+    # descriptor is ``_OCI_BIND_REPEAT`` (#2034). Empty for a bind of a type
+    # this path does not read, or descriptors that do not hold.
+    given = {'oci_12c': _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1}
+    meta: list[tuple[int, int, bytes, int]] = []
+    rest = tail
+    for _ in range(bind_count):
+        try:
+            (oac, rest) = _OAC_FROM_OCI(rest, given)
+        except (IndexError, DataError, Truncated):
+            return [], 0
+        csfrm = oac['csfrm'] or _CSFRM_DB
+        if oac['flags'] & _OCI_BIND_REPEAT_FLAG:
+            meta.append((_OCI_BIND_REPEAT, 0, b'', csfrm))
+        elif oac['data_type'] == TNS_TYPE_ADT:
+            toid = bytes(oac.get('toid', b''))
+            meta.append((TNS_TYPE_ADT, oac['max_length'], toid, csfrm))
+        elif oac['data_type'] in _OCI_BIND_TYPES:
+            meta.append((oac['data_type'], oac['max_length'], b'', csfrm))
+        else:
+            return [], 0
+    return meta, len(tail) - len(rest)
 
 
 def _oci_adt_in_value(rest: bytes) -> bytes:
@@ -9859,23 +9861,71 @@ def _oci_adt_in_value(rest: bytes) -> bytes:
     raise DataError('an object bind value of a form not read yet')
 
 
+def _oci_bind_rides_last(meta: tuple[int, int, bytes, int]) -> bool:
+    # A char or RAW bind whose buffer is wider than 4000 bytes goes as a LONG
+    # one, behind the others in the row.
+    return meta[0] in (TNS_TYPE_VARCHAR, TNS_TYPE_CHAR, TNS_TYPE_RAW) and meta[1] > 4000
+
+
+def _oci_bind_value(
+    meta: tuple[int, int, bytes, int], rest: bytes
+) -> tuple[object, bytes]:
+    # One bind's value from the RXD row, and what follows it.
+    (data_type, _size, _toid, csfrm) = meta
+    # An OUT bind (sqlplus `VARIABLE` / `EXEC :v := …`) has no input value:
+    # direction is not on the wire, so sqlplus sends the 2-byte placeholder
+    # `<escape> 01` in the value's slot (the escape char is the wire's
+    # absent-value sentinel). Decode it as None so the OUT bind is not fed a
+    # garbage input (its real value comes back from the block); an ordinary IN
+    # value is a normal DALC.
+    if len(rest) >= 2 and rest[0] == TNS_ESCAPE_CHAR:
+        return None, rest[2:]
+    if data_type == TNS_TYPE_ADT:
+        return None, _oci_adt_in_value(rest)
+    if data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
+        # A ub4 length, then the locator as a DALC: one the Mirror handed out,
+        # or sqlplus's own unset 4000-byte buffer while the variable holds no
+        # value (#2015). The session tells which.
+        locator, rest = _oci_read_lob_bind(rest)
+        if locator is None:
+            return None, rest
+        return TempLobRef(locator=locator, is_blob=data_type == TNS_TYPE_BLOB), rest
+    raw, rest = _oci_read_value(rest)
+    if data_type == TNS_TYPE_REFCURSOR:
+        # A ub4 LE cursor id, zero when the block opens the cursor: then it is
+        # an OUT bind like any other (#2014).
+        return int.from_bytes(raw or b'', 'little') or None, rest
+    if data_type == TNS_TYPE_NUMBER and isinstance(raw, bytes):
+        # A pre-12c sqlplus sends an IN OUT NUMBER as its whole 22-byte buffer,
+        # the number then zeros (#1826). No NUMBER ends in a zero byte -- its
+        # digits are 1 to 100 and a negative ends in 0x66 -- so the padding is
+        # cut.
+        raw = raw.rstrip(b'\x00') or raw
+    # The descriptor's form says which binds are national (UTF-16).
+    return _decode_bind_value(data_type, csfrm, raw), rest
+
+
 def _parse_oci_binds(
-    payload: bytes, sql_end: int, bind_count: int, sql: str
-) -> tuple[list, list[tuple[int, int, bytes]]]:
+    payload: bytes, sql_end: int, bind_count: int, sql: str, al8i4_length: int
+) -> tuple[list, list[tuple[int, int, bytes, int]]]:
     # Read the bind values AND their (tns_type, max_size) metadata from the OCI
-    # bind section. Each bind's OAC marker (``01 <type> 03 00 00``) carries the TNS
-    # type; the ub4 LE right after it is the bind's max buffer size (NUMBER 22,
-    # VARCHAR2(20) 60, …), which a PL/SQL OUT bind needs so its return buffer is
-    # sized correctly (#483). Returns ``(values, bind_meta)`` — bind_meta is the
-    # per-bind (type, max_size) list the OUT-bind path wraps as BindVars.
-    tail = payload[sql_end:]
-    meta = _oci_bind_descriptors(tail, bind_count)
+    # bind section: behind the SQL, the al8i4 array (ub4s), one descriptor per
+    # bind (_OAC), then the RXD row. A descriptor's max length is the bind's max
+    # buffer size (NUMBER 22, VARCHAR2(20) 60, ...), which a PL/SQL OUT bind
+    # needs so its return buffer is sized correctly (#483). Returns ``(values,
+    # bind_meta)`` -- bind_meta is the per-bind (type, max_size, toid, csfrm)
+    # list the OUT-bind path wraps as BindVars. A bind whose buffer is wider
+    # than 4000 bytes rides last in the row, as thin's LONG-class ones do: sqlplus
+    # 11.2 and 23.26 binding a VARCHAR2(4000) beside five others sent its value
+    # after theirs, where it was read first and every value came out wrong.
+    tail = payload[sql_end + 4 * al8i4_length :]
+    (meta, row_at) = _oci_bind_descriptors(tail, bind_count)
     if len(meta) != bind_count:
         return [], []
     # A repeated name has a descriptor but no value; it takes its name's first
     # occurrence, found by the statement's placeholders in order (#2034).
     first: list[int] = list(range(bind_count))
-    if any(t == _OCI_BIND_REPEAT for t, _s, _o in meta):
+    if any(t == _OCI_BIND_REPEAT for t, _s, _o, _c in meta):
         names = bind_placeholders(sql)
         if len(names) != bind_count:
             return [], []
@@ -9884,68 +9934,20 @@ def _parse_oci_binds(
             if (meta[i][0] == _OCI_BIND_REPEAT) != (first[i] != i):
                 return [], []
         meta = [meta[j] for j in first]
-    types = [t for i, (t, _s, _o) in enumerate(meta) if first[i] == i]
-    # The RXD row is the 0x07 token whose following DALCs decode cleanly into one
-    # value per bind — a position robust to 0x07 bytes appearing in the OAC area.
-    for i, byte in enumerate(tail):
-        if byte != TTI_RXD:
-            continue
-        rest = tail[i + 1 :]
-        values: list = []
-        try:
-            for data_type in types:
-                # An OUT bind (sqlplus `VARIABLE` / `EXEC :v := …`) has no input
-                # value: direction is not on the wire, so sqlplus sends the 2-byte
-                # placeholder `<escape> 01` in the value's slot (the escape char is
-                # the wire's absent-value sentinel). Decode it as None so the OUT
-                # bind is not fed a garbage input (its real value comes back from the
-                # block); an ordinary IN value is a normal DALC.
-                if len(rest) >= 2 and rest[0] == TNS_ESCAPE_CHAR:
-                    values.append(None)
-                    rest = rest[2:]
-                    continue
-                if data_type == TNS_TYPE_ADT:
-                    rest = _oci_adt_in_value(rest)
-                    values.append(None)
-                    continue
-                if data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
-                    # A ub4 length, then the locator as a DALC: one the Mirror
-                    # handed out, or sqlplus's own unset 4000-byte buffer while
-                    # the variable holds no value (#2015). The session tells
-                    # which.
-                    locator, rest = _oci_read_lob_bind(rest)
-                    values.append(
-                        None
-                        if locator is None
-                        else TempLobRef(
-                            locator=locator, is_blob=data_type == TNS_TYPE_BLOB
-                        )
-                    )
-                    continue
-                raw, rest = _oci_read_value(rest)
-                if data_type == TNS_TYPE_REFCURSOR:
-                    # A ub4 LE cursor id, zero when the block opens the cursor:
-                    # then it is an OUT bind like any other (#2014).
-                    cursor_id = int.from_bytes(raw or b'', 'little')
-                    values.append(cursor_id or None)
-                    continue
-                # The OCI (sqlplus) bind path doesn't carry a national char form;
-                # decode ordinary char (csfrm 1) — no test client binds NCHAR here.
-                if data_type == TNS_TYPE_NUMBER and isinstance(raw, bytes):
-                    # A pre-12c sqlplus sends an IN OUT NUMBER as its whole
-                    # 22-byte buffer, the number then zeros (#1826). No NUMBER
-                    # ends in a zero byte -- its digits are 1 to 100 and a
-                    # negative ends in 0x66 -- so the padding is cut.
-                    raw = raw.rstrip(b'\x00') or raw
-                values.append(_decode_bind_value(data_type, _CSFRM_DB, raw))
-        except (IndexError, DataError):
-            continue
-        if len(values) == len(types):
-            given = iter(values)
-            values = [next(given) if j == i else None for i, j in enumerate(first)]
-            values = [values[j] for j in first]
-            return values, meta
-    return [], []
+    carriers = [i for i in range(bind_count) if first[i] == i]
+    wide = [i for i in carriers if _oci_bind_rides_last(meta[i])]
+    order = [i for i in carriers if i not in wide] + wide
+    # The RXD row, right behind the descriptors.
+    if tail[row_at : row_at + 1] != bytes([TTI_RXD]):
+        return [], []
+    rest = tail[row_at + 1 :]
+    read: dict[int, object] = {}
+    try:
+        for at in order:
+            (read[at], rest) = _oci_bind_value(meta[at], rest)
+    except (IndexError, DataError):
+        return [], []
+    return [read[first[i]] for i in range(bind_count)], meta
 
 
 def _oci_ub4(n: int) -> bytes:
