@@ -6794,6 +6794,37 @@ class TestFv2BatchErrors(unittest.TestCase):
         self.assertIsNotNone(decode_fv2_dml_rowid(Insert))
 
 
+class TestFv2ErrorOffset(unittest.TestCase):
+    # 9.2's error status carries the error's offset in the statement, the ub4
+    # after the cursor id (#2263). Captured: `select 1 frm dual` (ORA-00923 at
+    # `dual`, 13) and `select nosuch from dual` (ORA-00904 at `nosuch`, 7).
+    E923 = bytes.fromhex(
+        '040002039b00000101010d000000000000000000000000000000000000000031'
+        '4f52412d30303932333a2046524f4d206b6579776f7264206e6f7420666f756e'
+        '642077686572652065787065637465640a'
+    )
+    E904 = bytes.fromhex(
+        '0400020388000001010107000000000000000000000000000000000000000028'
+        '4f52412d30303930343a20224e4f53554348223a20696e76616c696420696465'
+        '6e7469666965720a'
+    )
+
+    def test_the_status_says_where_the_error_is(self):
+        from seerdb.client.dialect import fv2_raise_for_error
+        from seerdb.common.exceptions import DatabaseError
+        from seerdb.common.tns import decode_fv2_error_position
+
+        self.assertEqual(decode_fv2_error_position(self.E923), 13)
+        self.assertEqual(decode_fv2_error_position(self.E904), 7)
+        with self.assertRaises(DatabaseError) as ctx:
+            fv2_raise_for_error(self.E904, with_offset=True)
+        self.assertEqual((ctx.exception.code, ctx.exception.offset), (904, 7))
+        # 8i's status does not say (#719), so the shared path leaves it 0.
+        with self.assertRaises(DatabaseError) as ctx:
+            fv2_raise_for_error(self.E904)
+        self.assertEqual(ctx.exception.offset, 0)
+
+
 class TestFv2Bfile(unittest.TestCase):
     """Oracle 9i BFILE read (#102, PROTOCOL §19.8): FILE_OPEN -> GETLEN -> READ
     -> FILE_CLOSE over TTI_LOBOPS, where FILE_OPEN returns an open-flagged

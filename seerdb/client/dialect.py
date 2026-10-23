@@ -45,6 +45,7 @@ from seerdb.common.tns import (
     decode_fv2_describe,
     decode_fv2_dml_response,
     decode_fv2_dml_rowid,
+    decode_fv2_error_position,
     decode_fv2_exec_response,
     decode_fv2_lob_chunks,
     decode_fv2_lob_getlen,
@@ -100,7 +101,9 @@ class Send:
 RECV = object()
 
 
-def fv2_raise_for_error(packet: bytes, *, end_of_fetch_ok: bool = True) -> None:
+def fv2_raise_for_error(
+    packet: bytes, *, end_of_fetch_ok: bool = True, with_offset: bool = False
+) -> None:
     """Raise the server's error if ``packet`` is a 9i OER carrying a real ORA
     code (not success / end-of-fetch), so a parse-time failure surfaces as its
     true code + message instead of a downstream desync (#102). Colorless — shared
@@ -117,7 +120,11 @@ def fv2_raise_for_error(packet: bytes, *, end_of_fetch_ok: bool = True) -> None:
     if err_code and err_code not in benign:
         from seerdb.common.exceptions import from_ora_code
 
-        raise from_ora_code(err_code)(message or f'ORA-{err_code:05d}', code=err_code)
+        exc = from_ora_code(err_code)(message or f'ORA-{err_code:05d}', code=err_code)
+        # 9i's status says where in the statement the error is, as 10g+ does;
+        # 8i's does not (#719), so only the 9i dialect asks (#2263).
+        exc.offset = decode_fv2_error_position(packet) if with_offset else 0
+        raise exc
 
 
 class Dialect(Protocol):
@@ -201,7 +208,7 @@ class Fv2Dialect:
         yield Send(encode_o7_parse(0, sql, bind))
         resp = yield RECV  # parse RPA ack — or an OER
         if resp is not False:  # surface a parse error (e.g. ORA-00942)
-            fv2_raise_for_error(resp[1])
+            fv2_raise_for_error(resp[1], with_offset=True)
         (columns, all_rows) = yield from self._drain(1)
         # call_status 0 + ora_code 0 => _drain_cursor won't issue TTI_FETCHes.
         return (0, 0, 0, (len(all_rows), columns), all_rows, None, None, [], None)
@@ -277,11 +284,11 @@ class Fv2Dialect:
         (row_count, _) = decode_fv2_dml_response(resp[1])
         rowid = None if err_code else decode_fv2_dml_rowid(resp[1])  # #1079
         batch_errors = decode_fv2_batch_errors(resp[1]) if batcherrors else []
+        offset = decode_fv2_error_position(resp[1]) if err_code else 0  # #2263
         yield Send(encode_o7_close(0))
         yield RECV  # close STA
-        return (0, err_code, 0, (row_count, None), [], message, rowid, batch_errors) + (
-            None,
-        )
+        status: tuple = (0, err_code, 0, (row_count, None), [], message, rowid)
+        return (*status, batch_errors, None, offset)
 
     def execute_block(self, sql: str, bind: list | None = None):
         # Anonymous PL/SQL block over the fv2 TTI_ALL7 block path (#102, PROTOCOL
@@ -324,14 +331,16 @@ class Fv2Dialect:
         if input_values:
             # `packet` is the bind prompt (or an OER on a compile error). Send the
             # input values; the reply carries OUT values + RPA + OER.
-            fv2_raise_for_error(packet, end_of_fetch_ok=False)
+            fv2_raise_for_error(packet, end_of_fetch_ok=False, with_offset=True)
             yield Send(encode_tokens_rxd(input_values, b''))
             resp = yield RECV
             if resp is False:
                 raise Exception('Connection closed during 9i PL/SQL bind send')
             packet = resp[1]
         # A block's ORA-01403 is a real error, not an end of fetch (#1039).
-        fv2_raise_for_error(packet, end_of_fetch_ok=False)  # ORA-06512, 01403 …
+        fv2_raise_for_error(  # ORA-06512, 01403 …
+            packet, end_of_fetch_ok=False, with_offset=True
+        )
         (out_values, row_count, err_code) = decode_fv2_block_out(
             packet, len(out_positions)
         )
