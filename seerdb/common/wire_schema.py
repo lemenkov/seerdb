@@ -36,6 +36,8 @@ A schema is a tuple of fields:
   an ``n4`` otherwise;
 - ``('bytes', name, length)``: as many bytes as the integer field
   ``length`` says, or ``length`` itself when it is a number, as they are;
+- ``('be2', name)`` / ``('be4', name)``: a big-endian ub2 / ub4 whatever
+  the dialect, as in a LOB locator;
 - ``('pad', size)``: ``size`` bytes no field is known for, zero when written
   and passed over when read;
 - ``('derive', name, function)``: no bytes; reading sets ``name`` to
@@ -76,6 +78,7 @@ _PRIMITIVES = (
     'n8',
     'n1',
 )
+_BIG_ENDIAN = {'be2': 2, 'be4': 4}
 Encoder = Callable[[dict[str, Any]], bytes]
 Decoder = Callable[..., tuple[dict[str, Any], bytes]]
 
@@ -120,6 +123,9 @@ def _encode_part(field: tuple[Any, ...], codec: Codec) -> Callable[[dict], bytes
     if kind in ('raw', 'bytes'):
         name = field[1]
         return lambda values: values[name]
+    if kind in _BIG_ENDIAN:
+        (width, name) = (_BIG_ENDIAN[kind], field[1])
+        return lambda values: values[name].to_bytes(width, 'big')
     if kind == 'pad':
         zeros = bytes(field[1])
         return lambda values: zeros
@@ -170,6 +176,14 @@ def compile_decoder(schema: Schema, codec: Codec) -> Decoder:
                 (values[field[1]], data) = (data[0], data[1:])
             elif kind == 'raw':
                 raise ValueError('a raw field has no length to decode by')
+            elif kind in _BIG_ENDIAN:
+                width = _BIG_ENDIAN[kind]
+                if len(data) < width:
+                    raise IndexError(f'{kind} past the end of the message')
+                (values[field[1]], data) = (
+                    int.from_bytes(data[:width], 'big'),
+                    data[width:],
+                )
             elif kind == 'pad':
                 if len(data) < field[1]:
                     raise IndexError('pad past the end of the message')
