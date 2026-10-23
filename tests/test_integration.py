@@ -355,9 +355,6 @@ _BINARY_FLOAT = _Need('BINARY_FLOAT / BINARY_DOUBLE are 10g+', min_fv=_FV)
 _BINARY_FLOAT_SERVER = _Need(
     'BINARY_FLOAT / BINARY_DOUBLE are Oracle 10g+', min_server=10
 )
-_LOB_READ_IN_TRANSACTION = _Need(
-    'LOB reads inside a transaction are not exercised on fv2', min_fv=_FV
-)
 _STREAMED_LOB_BIND = _Need(
     'Oracle 9i has no streamed LOB/LONG bind path (#169)', min_fv=_FV
 )
@@ -6250,7 +6247,6 @@ class LOBIntegration(_IntegrationBase):
         self._fetch_lobs = False
         super().setUp()
 
-    @_requires(_LOB_READ_IN_TRANSACTION)
     def test_lob_columns_are_readable_inside_an_open_transaction(self):
         # call_status reads 2 while a transaction is open; keyed on the value 1,
         # the drain never fetched the row the server had deferred (pre-12c) and
@@ -11427,7 +11423,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
-    @_requires(_LOB_READ_IN_TRANSACTION)
     async def test_lob_columns_are_readable_inside_an_open_transaction(self):
         # The async twin of LOBIntegration's test (#712).
         Table = 'PYO_ASYNC_LOB_TXN'
