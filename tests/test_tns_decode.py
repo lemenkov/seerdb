@@ -6659,6 +6659,97 @@ class TestFv2RefCursor(unittest.TestCase):
         self.assertEqual(sent[-1], encode_o7_close(0, 2))
 
 
+class TestFv2NestedCursor(unittest.TestCase):
+    """A 9i CURSOR(...) column (#2254), from ojdbc14 on 9.2.0.4: `select o.n,
+    cursor(select i.v from t2254 i where i.n <= o.n order by i.n) c from t2254 o
+    order by o.n`. Each row's cell is its nested cursor's id (2, 3, 4), read by
+    that id before the query's own cursor closes, as ojdbc14 does. The replies
+    are the captured ones, in seerdb's order: it frees a cursor with the close
+    alone, where ojdbc14 follows it with `03 08`."""
+
+    REPLIES = [
+        bytes.fromhex(
+            '08010204020217a9000400000000010101450300000000000000000000000000000101'
+        ),
+        bytes.fromhex(
+            '080102020000817f011600000000000001010101014e00006600000001050000'
+            '0000000001010101014300000400000000010100030000000000000000000000'
+            '0000000101'
+        ),
+        bytes.fromhex(
+            '0602010200010a000702c10200020102000702c10300020103000702c1040002'
+            '01040004010302057b0000010100030000000000000000000000000000010119'
+            '4f52412d30313430333a206e6f206461746120666f756e640a'
+        ),
+        bytes.fromhex(
+            '08010101800000011400000000011f0101010101015600000401030000000102'
+            '000300000000000000000000000000000101'
+        ),
+        bytes.fromhex(
+            '0602010100010a000705726f7720310004010102057b00000102000300000000'
+            '000000000000000000000101194f52412d30313430333a206e6f206461746120'
+            '666f756e640a'
+        ),
+        bytes.fromhex('09'),
+        bytes.fromhex(
+            '08010101800000011400000000011f0101010101015600000401010000000103'
+            '000300000000000000000000000000000101'
+        ),
+        bytes.fromhex(
+            '0602010100010a000705726f772031000705726f7720320004010202057b0000'
+            '0103000300000000000000000000000000000101194f52412d30313430333a20'
+            '6e6f206461746120666f756e640a'
+        ),
+        bytes.fromhex('09'),
+        bytes.fromhex(
+            '08010101800000011400000000011f0101010101015600000401020000000104'
+            '000300000000000000000000000000000101'
+        ),
+        bytes.fromhex(
+            '0602010100010a000705726f772031000705726f772032000705726f77203300'
+            '04010302057b00000104000300000000000000000000000000000101194f5241'
+            '2d30313430333a206e6f206461746120666f756e640a'
+        ),
+        bytes.fromhex('09'),
+        bytes.fromhex('09'),
+    ]
+
+    def test_each_row_carries_its_nested_cursor_read(self):
+        from seerdb.client.dialect import RECV, Fv2Dialect, Send
+
+        gen = Fv2Dialect().execute_query(
+            'select o.n, cursor(select i.v from t2254 i where i.n <= o.n'
+            ' order by i.n) c from t2254 o order by o.n'
+        )
+        replies = iter([b'open', *self.REPLIES])
+        sent = []
+        try:
+            step = next(gen)
+            while True:
+                if isinstance(step, Send):
+                    sent.append(step.data)
+                    step = gen.send(None)
+                else:
+                    self.assertIs(step, RECV)
+                    step = gen.send((6, next(replies)))
+        except StopIteration as done:
+            result = done.value
+        rows = result[4]
+        self.assertEqual([r[0] for r in rows], [1, 2, 3])
+        nested = [r[1] for r in rows]
+        self.assertTrue(all(isinstance(n, dict) for n in nested))  # not raw ids
+        self.assertEqual([n['cursor_id'] for n in nested], [2, 3, 4])
+        self.assertEqual(
+            [[list(r) for r in n['rows']] for n in nested],
+            [[['row 1']], [['row 1'], ['row 2']], [['row 1'], ['row 2'], ['row 3']]],
+        )
+        from seerdb.common.tns import encode_o7_close
+
+        # The nested cursors close before the query's own.
+        self.assertEqual(sent[-1], encode_o7_close(0, 1))
+        self.assertEqual(sent[-2], encode_o7_close(0, 4))
+
+
 class TestFv2Bfile(unittest.TestCase):
     """Oracle 9i BFILE read (#102, PROTOCOL §19.8): FILE_OPEN -> GETLEN -> READ
     -> FILE_CLOSE over TTI_LOBOPS, where FILE_OPEN returns an open-flagged
