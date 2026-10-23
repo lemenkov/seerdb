@@ -123,17 +123,6 @@ _FV2_UNSUPPORTED = (
         'quoted_bind_in_returning_into',
         'a quoted bind cannot ride the pre-10g block rewrite',
     ),
-    # A CURSOR(...) column, or a REF CURSOR whose rows hold one, fetches as its
-    # raw cell on fv2: the nested cursor is not read yet (#2254).
-    ('cursor_expression', 'a nested cursor column is not read on fv2 yet (#2254)'),
-    (
-        'refcursor_holding_a_cursor',
-        'a nested cursor column is not read on fv2 yet (#2254)',
-    ),
-    (
-        'nested_in_a_nested_cursor',
-        'a nested cursor column is not read on fv2 yet (#2254)',
-    ),
     # The pre-10 error reply carries the code and text but no position.
     ('error_offset', 'the 9i/8i error reply carries no offset (#719)'),
 )

@@ -398,11 +398,14 @@ class AsyncCursor(_CursorLogic):
                     # A nested cursor -- `select ..., CURSOR(select ...)` (#826).
                     # Same marker a REF CURSOR OUT bind leaves; fetch its rows and
                     # wrap them the way _build_refcursor does.
-                    NewRow[I] = await self._build_refcursor(
-                        await self._connection.fetch_all_rows(
+                    # 9i's arrives with its rows already read (#2254).
+                    Read = Val.get('rows')
+                    if Read is None:
+                        Read = await self._connection.fetch_all_rows(
                             Val['cursor_id'], Val['row_format']
                         )
-                        or [],
+                    NewRow[I] = await self._build_refcursor(
+                        Read or [],
                         Val,
                     )
                 elif isinstance(Val, LOB):

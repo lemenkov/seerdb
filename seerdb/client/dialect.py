@@ -150,6 +150,17 @@ def _is_cursor_var(value: object) -> bool:
     return isinstance(value, Var) and value.dbtype.tns_type == TNS_TYPE_REFCURSOR
 
 
+def _cursor_marker(cursor_id: int, columns: list, rows: list) -> dict:
+    # A cursor 9i already read, in the marker a 10g+ REF CURSOR leaves, with its
+    # rows, so the cursor wraps them where 10g+ fetches by id (#2246, #2254).
+    return {
+        '_refcursor': True,
+        'cursor_id': cursor_id,
+        'row_format': columns,
+        'rows': rows,
+    }
+
+
 def _block_input(value: object) -> object:
     # A block bind's IN value. A REF CURSOR's is an empty cursor slot, the one
     # byte ojdbc14 sends (#2246); a NULL there is a bind the server cannot use.
@@ -220,6 +231,17 @@ class Fv2Dialect:
         # decode_fv2_exec_response left LOB objects in the rows; replace each with
         # its content.
         yield from self.resolve_lobs(all_rows, columns)
+        # A CURSOR(...) column's cell is its nested cursor's id. Read each one
+        # now, while this cursor is open -- ojdbc14 closes the parent last --
+        # and the same way, so a cursor nested in it is read in turn (#2254).
+        for j, col in enumerate(columns):
+            if col.get('data_type') != TNS_TYPE_REFCURSOR:
+                continue
+            for row in all_rows:
+                if row[j]:
+                    nested = decode_ub4(row[j])[0]
+                    (nested_columns, nested_rows) = yield from self._drain(nested)
+                    row[j] = _cursor_marker(nested, nested_columns, nested_rows)
         yield Send(encode_o7_close(0, cursor))
         yield RECV  # close STA
         _raise_terminal(err_code)
@@ -311,12 +333,7 @@ class Fv2Dialect:
             if _is_cursor_var(bind[pos]) and out_values[i]:
                 cursor_id = decode_ub4(out_values[i])[0]
                 (columns, rows) = yield from self._drain(cursor_id)
-                out_values[i] = {
-                    '_refcursor': True,
-                    'cursor_id': cursor_id,
-                    'row_format': columns,
-                    'rows': rows,
-                }
+                out_values[i] = _cursor_marker(cursor_id, columns, rows)
         if out_positions:
             record = {'out_positions': out_positions, 'out_values': out_values}
             return (0, 0, 0, (None, None), [record], None, None, [], None)

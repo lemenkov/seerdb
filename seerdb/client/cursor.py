@@ -1168,7 +1168,10 @@ def _resolve_nested_cursors(Connection, Row: list) -> list:
     Out = list(Row)
     for I, Val in enumerate(Out):
         if isinstance(Val, dict) and Val.get('_refcursor'):
-            Rows = Connection.fetch_all_rows(Val['cursor_id'], Val['row_format'])
+            # 9i's arrives with its rows already read (#2254).
+            Rows = Val.get('rows')
+            if Rows is None:
+                Rows = Connection.fetch_all_rows(Val['cursor_id'], Val['row_format'])
             Out[I] = _build_refcursor_cursor(Connection, Rows or [], Val)
     return Out
 
