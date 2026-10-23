@@ -1457,7 +1457,18 @@ _LONG_CELL: wire_schema.Schema = (
 # Thin's own: the column position, which OCI doesn't carry, and 23ai's domain,
 # annotations and vector descriptor.
 _DCB_COLUMN: wire_schema.Schema = (
-    ('only', 'oci', (('u8', 'marker'), ('u8', 'lead'))),
+    (
+        'only',
+        'oci',
+        (
+            ('u8', 'marker'),
+            ('u8', 'lead'),
+            # A typed column (XMLTYPE) leads 00, and has neither OCI's padding
+            # nor the column id.
+            ('derive', 'oci_plain', lambda v: v['lead'] == 1),
+            ('derive', 'has_oaccolid', lambda v: v['lead'] == 1),
+        ),
+    ),
     ('u8', 'data_type'),
     ('u8', 'flags'),
     ('u8', 'precision'),
@@ -1754,6 +1765,7 @@ _ROWID_CELL_THIN = wire_schema.compile_encoder(_ROWID_CELL, _THIN)
 _ROWID_CELL_OCI = wire_schema.compile_encoder(_ROWID_CELL, _OCI)
 _DCB_COLUMN_THIN = wire_schema.compile_encoder(_DCB_COLUMN, _THIN)
 _DCB_COLUMN_OCI = wire_schema.compile_encoder(_DCB_COLUMN, _OCI)
+_DCB_COLUMN_FROM_OCI = wire_schema.compile_decoder(_DCB_COLUMN, _OCI)
 _LONG_CELL_THIN = wire_schema.compile_encoder(_LONG_CELL, _THIN)
 _LONG_CELL_OCI = wire_schema.compile_encoder(_LONG_CELL, _OCI)
 
@@ -9967,15 +9979,6 @@ def _oci_ub4(n: int) -> bytes:
 _OCI_DCB_PREAMBLE_LEN = 23  # cursor-uuid preamble (zeroed; the client skips it)
 
 
-# A column's length in an 11g describe ahead of its name, and behind it, as the
-# test-only reader (_decode_describe_oci) walks it; the encoder is _DCB_COLUMN.
-# sqlplus 10.2's is 4 bytes shorter behind it, without the uds flags: 11g's
-# column blocks to it are 61 bytes apart for a 3-character name, 65 to 11.2
-# (#1764).
-_OCI_DCB_COL_PRENAME = 48
-_OCI_DCB_COL_POSTNAME = 13
-
-
 # A char type carries a charset + form-of-use and sets the pre-name char flag.
 # LONG (#407) and CLOB (#405) are character types (charset + form-of-use, like
 # VARCHAR2); LONG RAW and BLOB are binary. LONG / LONG RAW stream inline, LOBs
@@ -11382,36 +11385,29 @@ def encode_logoff_status_thin() -> bytes:
 
 
 def _decode_describe_oci(payload: bytes) -> list[dict]:
-    # A minimal reader for encode_describe_oci's own output — the thin client
-    # can't parse the OCI describe, so this round-trips the meaningful fields to
-    # prove the field layout is self-consistent (offline; sqlplus is the wire
-    # conformance check).
-    assert payload[0] == TTI_DCB
-    plen = int.from_bytes(payload[1:5], 'little')
-    body = payload[5 + plen :]
-    numcols = int.from_bytes(body[4:8], 'little')
-    cols = []
-    off = 8
-    for _ in range(numcols):
-        pre = body[off : off + _OCI_DCB_COL_PRENAME]
-        namelen = pre[43]
-        name = body[
-            off + _OCI_DCB_COL_PRENAME + 1 : off + _OCI_DCB_COL_PRENAME + 1 + namelen
-        ]
-        cols.append(
-            {
-                'data_type': pre[2],
-                'precision': pre[4],
-                'scale': pre[5] - 256 if pre[5] > 127 else pre[5],
-                'data_length': int.from_bytes(pre[6:10], 'little'),
-                'charset': int.from_bytes(pre[30:32], 'little'),
-                'max_size': int.from_bytes(pre[34:38], 'little'),
-                'null_ok': pre[43],
-                'name': name,
-            }
-        )
-        off += _OCI_DCB_COL_PRENAME + 1 + namelen + _OCI_DCB_COL_POSTNAME
-    return cols
+    # The describe encode_describe_oci writes, read back by its own schema
+    # (_DCB_COLUMN) at the session's field version: the thin client cannot parse
+    # it, so the tests prove the layout holds together this way, and sqlplus is
+    # the wire conformance check (#265). sqlplus 10.2's preamble length is a
+    # ub1, and its columns carry no uds flags (#1764).
+    field_version = _DECODE_FIELD_VERSION.get()
+    if payload[:1] != bytes([TTI_DCB]):
+        raise DataError('not an OCI describe')
+    if field_version < FIELD_VERSION_11_2:
+        body = payload[2 + payload[1] :]
+    else:
+        body = payload[5 + int.from_bytes(payload[1:5], 'little') :]
+    count = int.from_bytes(body[4:8], 'little')
+    given = {
+        'oci_12c': field_version >= FIELD_VERSION_12_1,
+        'has_uds': field_version >= FIELD_VERSION_11_2,
+    }
+    rest = body[8:]
+    columns = []
+    for _ in range(count):
+        (column, rest) = _DCB_COLUMN_FROM_OCI(rest, given)
+        columns.append(column)
+    return columns
 
 
 # --- OCI LONG / LONG RAW row value (#407) ---
