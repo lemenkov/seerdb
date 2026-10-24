@@ -7101,6 +7101,31 @@ class TestFv2CursorCache(unittest.TestCase):
         self.assertEqual(sent[1], encode_o7_close(0, 5))
 
 
+class TestFv2WideDescribe(unittest.TestCase):
+    """A 9i describe of more than 255 columns (#2306): its column count is a
+    ub4, `02 01 2c` for 300, and was read as the byte after `08 01` -- one
+    column -- so the execute defined one and 9i refused it with ORA-03115.
+    The reply is the one ojdbc14 received from 9.2.0.4."""
+
+    def test_a_300_column_describe_has_300_columns(self):
+        import os
+        import sys
+
+        sys.path.insert(0, os.path.dirname(__file__))
+        from replay import load_capture
+
+        from seerdb.common.tns import decode_fv2_describe
+
+        columns = decode_fv2_describe(
+            load_capture('fv2_describe_300_columns_9i.hexdump')
+        )
+        self.assertEqual(len(columns), 300)
+        self.assertEqual(
+            [c['column_name'] for c in columns], [f'C{i}'.encode() for i in range(300)]
+        )
+        self.assertEqual({c['data_type'] for c in columns}, {2})
+
+
 class TestFv2ObjectColumn(unittest.TestCase):
     """A 9i object column (#2258), from 9.2.0.4: `select id, o from o2248
     order by id`, `o` a `ty2248(a NUMBER, b VARCHAR2(10))`, one row holding

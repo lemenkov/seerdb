@@ -2959,6 +2959,19 @@ class CursorIntegration(_IntegrationBase):
             self.cur.fetchone(), (self.conn.session_id, self.conn.serial_num)
         )
 
+    def test_a_query_of_300_columns(self):
+        # 9i read its describe's column count as one byte: past 255 columns it
+        # described one, and the fetch failed with ORA-03115 (#2306).
+        self.cur.execute(
+            'SELECT '
+            + ', '.join(f"{i} n{i}, 'v{i}' s{i}" for i in range(150))
+            + ' FROM dual'
+        )
+        self.assertEqual(len(self.cur.description), 300)
+        self.assertEqual(
+            self.cur.fetchone(), tuple(v for i in range(150) for v in (i, f'v{i}'))
+        )
+
     def test_a_statement_takes_more_than_255_binds(self):
         # 9i wrote the bind count before the SQL as one byte, and the client
         # raised on a 256th bind before sending anything (#2305). Ones, so the
