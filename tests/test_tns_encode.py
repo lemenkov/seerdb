@@ -6791,6 +6791,32 @@ class TestO8iQueryMessages(unittest.TestCase):
         self.assertEqual(int.from_bytes(Msg2[31:35], 'little'), 4000)
         self.assertEqual(int.from_bytes(Msg2[49:53], 'little'), 200)
 
+    # Captured on 8.1.7 at cursor 256 (#2285): the query's terminal, its id
+    # `00 01` at [11:13], and the fetch seerdb then sent, which the server
+    # answered with every row.
+    TERMINAL_256 = bytes.fromhex(
+        '0804005dc01d0000000000000100000000000000000000040100000000000000000000'
+        '0100000300400000000000000000000000000000000000000000000800000100000000'
+        '00000000000000000000000000'
+    )
+    FETCH_256 = bytes.fromhex(
+        '035e0940000000000100000000000000010c0000000001000000000000000064000000'
+        '0000000000000000000100000000640000000000000000000000000000000000000000'
+        '0000000100000000000000000000000000000000000000'
+    )
+
+    def test_the_cursor_id_is_little_endian(self):
+        # Read big-endian, 256 was 0 and the fetch stopped after one row, and
+        # 257 was 1, which fetched from another cursor (#2285).
+        from seerdb.common.tns import decode_8i_cursor_id, encode_8i_oall8_fetch
+
+        self.assertEqual(decode_8i_cursor_id(self.TERMINAL_256), 256)
+        self.assertEqual(encode_8i_oall8_fetch(9, 256, 100, 100), self.FETCH_256)
+        # The option word is the fetch's alone, whatever the cursor.
+        self.assertEqual(
+            encode_8i_oall8_fetch(9, 0x10203, 1)[3:11].hex(), '4000000003020100'
+        )
+
     def test_dcb_describe_columns(self):
         from seerdb.common.tns import decode_8i_dcb_describe
 

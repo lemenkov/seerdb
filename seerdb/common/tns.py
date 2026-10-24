@@ -13361,7 +13361,10 @@ def encode_8i_oall8_fetch(
     # (docs/PROTOCOL.md §19.10). 8i's execute returns only the first row batch;
     # the client fetches the rest until a batch comes back empty (ORA-01403).
     # Reverse-engineered from the 9.2-client trace; fixed apart from the TTI
-    # sequence byte, the cursor id, and two ub4 LITTLE-endian counts:
+    # sequence byte and three ub4 LITTLE-endian fields:
+    #   - offset 7: the cursor id, after the ub4 option word (0x40, fetch). It
+    #     was written big-endian at 4, which put a cursor below 256 on the same
+    #     byte and any other into the option word (#2285).
     #   - offset 31: the LONG fetch size — the maximum bytes of a LONG / LONG RAW
     #     column the server returns per row. 8i truncates the value to this size
     #     (it does NOT continue one LONG across fetch round trips), so the caller
@@ -13373,7 +13376,7 @@ def encode_8i_oall8_fetch(
     #     is present — 8i forces single-row fetches for LONGs).
     Msg = bytearray(93)
     Msg[0:4] = bytes([TTI_FUN, TTI_ALL8, Seq & 0xFF, 0x40])
-    Msg[4:8] = Cursor.to_bytes(4, 'big')
+    Msg[7:11] = Cursor.to_bytes(4, 'little')
     Msg[16:18] = bytes([0x01, 0x0C])
     Msg[22] = 0x01
     Msg[31:35] = min(LongSize, 0xFFFFFFFF).to_bytes(4, 'little')  # LONG fetch size
@@ -13388,11 +13391,15 @@ def decode_8i_cursor_id(Terminal: bytes) -> int:
     # at offset 11 of the response's post-row terminal — whether that terminal
     # opens with the 0x08 session-state piggyback (08 04 00 11 89 05 00 00 00 00
     # 00 <cid>) or goes straight to the 0x04 OER (04 01 00 00 00 00 00 00 00 00
-    # 00 <cid>); the cursor id is a ub2 at [10:12] in both. Returns 0 when the
-    # terminal is too short (an empty result set), which suppresses the fetch.
-    if len(Terminal) < 12:
+    # 00 <cid>); the cursor id is a LITTLE-endian ub2 at [11:13] in both, as
+    # 8i's other integers are. Read big-endian at [10:12] it agreed below 256
+    # and made 256 a 0, which ended the fetch after one row, and 257 a 1
+    # (#2285): captured on 8.1.7, cursor 256 is `00 01` and 300 `2c 01`.
+    # Returns 0 when the terminal is too short (an empty result set), which
+    # suppresses the fetch.
+    if len(Terminal) < 13:
         return 0
-    return int.from_bytes(Terminal[10:12], 'big')
+    return int.from_bytes(Terminal[11:13], 'little')
 
 
 def o8i_terminal_complete(Terminal: bytes) -> bool:

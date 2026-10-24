@@ -2958,6 +2958,20 @@ class CursorIntegration(_IntegrationBase):
             self.cur.fetchone(), (self.conn.session_id, self.conn.serial_num)
         )
 
+    def test_a_query_comes_back_whole_after_many_statements(self):
+        # 8i leaves every cursor open (#2286), so 260 statements in one session
+        # take its cursor ids past 255, where a big-endian read made the next
+        # query's id 0 or 1 and cut it to its first row (#2285).
+        for _ in range(260):
+            self.cur.execute('SELECT 1 FROM dual')
+            self.cur.fetchall()
+        for _ in range(2):
+            # 50 rows, more than one fetch: a ROWNUM filter alone, which the
+            # Mirror over PostgreSQL translates, and no CONNECT BY LEVEL, which
+            # gives one row on 8i.
+            self.cur.execute('SELECT object_id FROM all_objects WHERE rownum <= 50')
+            self.assertEqual(len(set(self.cur.fetchall())), 50)
+
     def test_the_version_is_the_release_the_banner_names(self):
         # Every tier reports its release, 8i and 9i too: 8i's login reply
         # carries it, and 9i is asked once after login, as ojdbc14 asks (#2278).
