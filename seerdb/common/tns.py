@@ -1029,7 +1029,9 @@ class _ThinCodec:
 
     @staticmethod
     def n4(value: int) -> bytes:
-        return encode_sb4(value)
+        # The inverse of decode_ub4, negatives included: a scale of -127 reads
+        # as `81 7f`, and encode_sb4 alone raised on it (#2299).
+        return _encode_signed_sb4(value)
 
     n2 = n4
 
