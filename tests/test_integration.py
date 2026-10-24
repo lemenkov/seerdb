@@ -444,6 +444,11 @@ _TIME_ZONE_SYNC = _Need(
 )
 _TEMP_LOB = _Need('a temporary LOB needs a 12c+ server (CREATE_TEMP)', min_fv=_FV)
 _END_TO_END = _Need('end-to-end tracing requires 12c+', min_fv=_FV)
+_IMPLICIT_RESULTS = _Need('DBMS_SQL.RETURN_RESULT is 12c+', min_server=12)
+_PASSTHROUGH_IMPLICIT_RESULTS = _Need(
+    'the passthrough Mirror relays no implicit result set (#2295)',
+    not_mirror=('passthrough',),
+)
 _PRE12_VECTOR_REFUSAL = _Need('a 12.1+ session binds a VECTOR', below_fv=_FV)
 _CURSOR_CACHE = _Need(
     'cursor cache is disabled on 12c+ (re-parse each execute)', below_fv=_FV
@@ -2987,15 +2992,27 @@ class CursorIntegration(_IntegrationBase):
 
     def test_a_refcursor_per_call_outlasts_open_cursors(self):
         # A block that returns a REF CURSOR, more times than open_cursors: 9i
-        # closed each one after reading it but never freed it, so every call
-        # left a cursor open (#2288). From 10g the client never closes one at
-        # all (#2291), so for now this runs on 9i alone.
-        if not (self.conn.version or '').startswith('9.'):
-            self.skipTest('a REF CURSOR is never closed from 10g on (#2291)')
+        # closed each one after reading it but never freed it (#2288), and from
+        # 10g the client never closed one at all (#2291), so every call left a
+        # cursor open and the session failed with ORA-01000.
         for n in range(320):
             rc = self.cur.var(seerdb.DB_TYPE_CURSOR)
             self.cur.execute('BEGIN OPEN :1 FOR SELECT :2 FROM dual; END;', [rc, n])
             self.assertEqual(rc.getvalue().fetchall(), [(n,)])
+
+    @_requires(_IMPLICIT_RESULTS, _PASSTHROUGH_IMPLICIT_RESULTS)
+    def test_implicit_results_outlast_open_cursors(self):
+        # More implicit result sets than open_cursors (300): each one read was
+        # left open on the server, and the session failed with ORA-01000
+        # (#2291).
+        for n in range(320):
+            self.cur.execute(
+                'DECLARE c SYS_REFCURSOR; BEGIN OPEN c FOR SELECT :1 FROM dual; '
+                'DBMS_SQL.RETURN_RESULT(c); END;',
+                [n],
+            )
+            self.assertTrue(self.cur.nextset())
+            self.assertEqual(self.cur.fetchall(), [(n,)])
 
     def test_the_version_is_the_release_the_banner_names(self):
         # Every tier reports its release, 8i and 9i too: 8i's login reply

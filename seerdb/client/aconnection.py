@@ -1689,6 +1689,10 @@ class AsyncOracleConnect(_ConnectionLogic):
                     break
         finally:
             set_decode_prev_row(None)
+        # Its rows are all read: close the server cursor with the next call
+        # (#2291). Left open, every REF CURSOR a session read held a cursor,
+        # and the session ran out at open_cursors (ORA-01000).
+        self._cursors_to_close.append(CursorId)
         return AllRows
 
     # ----- LOB read (async mirror of `OracleConnect.lob_read`) -----
