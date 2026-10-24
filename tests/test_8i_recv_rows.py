@@ -164,5 +164,90 @@ class TestReadOnUntilTheStatusIsWhole(unittest.TestCase):
         self.assertEqual(done.exception.value[0], [['X', 'Y', 'ab  ']])
 
 
+class TestAQueryEndsOnItsFetchStatus(unittest.TestCase):
+    """An 8i query reads each fetch's status (#2314). A fetch that fails brings
+    no rows and the error in its status; ending on the empty fetch alone
+    returned the rows before it as the whole result. A fetch ended with
+    ORA-01403 is the last: one more draws ORA-01002. Statuses captured on
+    8.1.7: `SELECT rownum FROM all_objects WHERE rownum <= 5` and a query whose
+    third row divides by zero."""
+
+    # The query's reply: one row, then the RPA and a status with no error.
+    FIRST = bytes.fromhex(
+        '08040098161f0000000000010000000000000000000000040100000000000000'
+        '0000010000000300400000000000000000000000000000000000000000000600'
+        '00010000000000000000000000000000000000'
+    )
+    # A fetch's last rows and ORA-01403 with its message.
+    ENDED = bytes.fromhex(
+        '04050000007b0500000000010000000300600000090000000000000000000000'
+        '00000000000000070000010000000000000000000000000000000000194f5241'
+        '2d30313430333a206e6f206461746120666f756e640a'
+    )
+    # A fetch that failed: no rows, ORA-01476 (`c4 05`) and its message.
+    FAILED = bytes.fromhex(
+        '0402000000c40500000000010008000300400000090000000000000000000000'
+        '00000000000000070000010000000000000000000000000000000000244f5241'
+        '2d30313437363a2064697669736f7220697320657175616c20746f207a65726f'
+        '0a'
+    )
+
+    def test_the_status_says_the_error(self):
+        from seerdb.common.tns import decode_8i_terminal_error
+
+        self.assertEqual(decode_8i_terminal_error(self.FIRST), (0, None))
+        self.assertEqual(
+            decode_8i_terminal_error(self.ENDED), (1403, 'ORA-01403: no data found')
+        )
+        self.assertEqual(
+            decode_8i_terminal_error(self.FAILED),
+            (1476, 'ORA-01476: divisor is equal to zero'),
+        )
+
+    def _query(self, replies):
+        # Run execute_query over `replies`, (rows, status) per reply, the
+        # describe stubbed; returns how many calls it sent and its result.
+        dialect = O8iDialect(next_seq=lambda: 1)
+        it = iter(replies)
+
+        def describe(packet):
+            return ([{'data_type': 2}], b'')
+            yield
+
+        def recv_rows(buf, columns, last_row):
+            (rows, status) = next(it)
+            return (rows, status, None)
+            yield
+
+        sent = 0
+        with (
+            mock.patch.object(dialect, '_recv_describe', describe),
+            mock.patch.object(dialect, 'recv_rows', recv_rows),
+        ):
+            gen = dialect.execute_query('SELECT ...')
+            reply = None
+            try:
+                while True:
+                    intent = gen.send(reply)
+                    reply = (6, b'\x10') if intent is RECV else None
+                    sent += intent is not RECV
+            except StopIteration as done:
+                return (sent, done.value)
+
+    def test_a_failed_fetch_raises_its_error(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        with self.assertRaises(DatabaseError) as raised:
+            self._query([([[1]], self.FIRST), ([], self.FAILED)])
+        self.assertEqual(str(raised.exception), 'ORA-01476: divisor is equal to zero')
+
+    def test_a_fetch_ended_with_01403_is_the_last(self):
+        (sent, result) = self._query(
+            [([[1]], self.FIRST), ([[2], [3], [4], [5]], self.ENDED)]
+        )
+        self.assertEqual(sent, 2)  # the query and one fetch
+        self.assertEqual(result[4], [[1], [2], [3], [4], [5]])
+
+
 if __name__ == '__main__':
     unittest.main()

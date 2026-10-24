@@ -2959,6 +2959,20 @@ class CursorIntegration(_IntegrationBase):
             self.cur.fetchone(), (self.conn.session_id, self.conn.serial_num)
         )
 
+    def test_an_error_after_the_first_rows_is_raised(self):
+        # The third row divides by zero. 8i ended the fetch on the failed
+        # fetch's empty reply and returned the first row as the result,
+        # raising nothing (#2314).
+        from seerdb.common.exceptions import DatabaseError
+
+        with self.assertRaisesRegex(DatabaseError, 'ORA-01476'):
+            self.cur.execute(
+                'SELECT 1 / (n - 3) FROM (SELECT 1 n FROM dual UNION ALL '
+                'SELECT 2 FROM dual UNION ALL SELECT 3 FROM dual UNION ALL '
+                'SELECT 4 FROM dual)'
+            )
+            self.cur.fetchall()
+
     def test_a_query_of_300_columns(self):
         # 9i read its describe's column count as one byte: past 255 columns it
         # described one, and the fetch failed with ORA-03115 (#2306).

@@ -13592,6 +13592,30 @@ def o8i_terminal_complete(Terminal: bytes) -> bool:
     return len(Terminal) >= End
 
 
+def decode_8i_terminal_error(Terminal: bytes) -> tuple[int, str | None]:
+    """The ORA code and message an 8i reply's post-row status carries, or
+    (0, None) for none (#2314).
+
+    The layout o8i_terminal_complete reads: the code is the ub2 five bytes
+    after the OER token, and the message, when it is set, a ub1 length and the
+    text after the rowid and 12 more bytes. Captured on 8.1.7, a fetch failing
+    with ORA-01476: code `c4 05`, message `24 ORA-01476: divisor is equal to
+    zero\\n`.
+    """
+    Off = 23 if Terminal[:1] == bytes([TTI_RPA]) else 0
+    if Terminal[Off : Off + 1] != bytes([TTI_OER]) or len(Terminal) < Off + 48:
+        return (0, None)
+    Code = int.from_bytes(Terminal[Off + 5 : Off + 7], 'little')
+    if not Code:
+        return (0, None)
+    RowidLength = int.from_bytes(Terminal[Off + 46 : Off + 48], 'little')
+    End = Off + 48 + (1 + RowidLength if RowidLength else 0) + 12
+    Message = (
+        Terminal[End + 1 : End + 1 + Terminal[End]] if End < len(Terminal) else b''
+    )
+    return (Code, Message.decode('latin-1', 'replace').rstrip() or None)
+
+
 def _decode_8i_rowid(DataType: int, Val: bytes) -> str | None:
     # Render an 8i ROWID / UROWID column value (#385). A physical ROWID (type 11)
     # is a fixed-width little-endian struct — data object (ub4), relative file
