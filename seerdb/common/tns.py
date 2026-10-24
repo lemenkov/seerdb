@@ -1764,9 +1764,16 @@ _OAC: wire_schema.Schema = (
     ('n4', 'max_chars'),
     ('only', 'oci', (('when', 'oci_plain', (('n4', 'oaccolid'),)),)),
 )
+# Oracle 9i's bind descriptor and define entry (#2284): thin's OAC through its
+# csfrm -- 9.2 has no max_chars -- at field version 2. The four fields between
+# the size and the charset are the array length, the continuation flags, the
+# type's OID and its version: zeros but for an object, which names its type
+# there as ojdbc14 does (#2258).
+_O7_OAC: wire_schema.Schema = _OAC[: _OAC.index(('n4', 'max_chars'))]
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
 _OAC_FROM_THIN = wire_schema.compile_decoder(_OAC, _THIN)
 _OAC_FROM_OCI = wire_schema.compile_decoder(_OAC, _OCI)
+_O7_OAC_THIN = wire_schema.compile_encoder(_O7_OAC, _THIN)
 _AUTH_HEAD_FROM_THIN = wire_schema.compile_decoder(_AUTH_HEAD, _THIN)
 _AUTH_HEAD_FROM_OCI = wire_schema.compile_decoder(_AUTH_HEAD, _OCI)
 _AUTH_PAIR_OCI = wire_schema.compile_encoder(_AUTH_PAIR, _OCI)
@@ -12521,6 +12528,34 @@ def encode_o7_open(Seq: int) -> bytes:
     return bytes([TTI_FUN, 0x02, Seq, 0x01, 0x00])
 
 
+def _o7_oac(
+    Type: int,
+    MaxSize: int,
+    Csfrm: int,
+    Charset: int,
+    Flags: int = 0x01,
+    Toid: bytes = b'',
+    Version: int = 0,
+) -> bytes:
+    # One 9i bind descriptor or define entry (_O7_OAC).
+    return _O7_OAC_THIN(
+        {
+            'data_type': Type,
+            'flags': Flags,
+            'precision': 0,
+            'scale': 0,
+            'max_length': MaxSize,
+            'max_array': 0,
+            'cont_flags': 0,
+            'toid_length': len(Toid),
+            'toid': Toid,
+            'version': Version,
+            'charset': Charset,
+            'csfrm': Csfrm,
+        }
+    )
+
+
 def _o7_bind_oac(Value: object, Statement: bool = False) -> bytes:
     # fv2 bind descriptor (same 13/14-byte shape as a define entry): the
     # client's declared type for an input bind. Number → VARNUM(6); str →
@@ -12553,13 +12588,7 @@ def _o7_bind_oac(Value: object, Statement: bool = False) -> bytes:
         else:
             Charset = 31  # ignored by the server for non-char types (NUMBER /
             # DATE / RAW / INTERVAL); keep the historical value
-        return (
-            bytes([Type, 0x01, 0, 0])
-            + encode_sb4(MaxSize)
-            + bytes([0, 0, 0, 0])
-            + encode_sb4(Charset)
-            + bytes([Csfrm])
-        )
+        return _o7_oac(Type, MaxSize, Csfrm, Charset)
 
     if isinstance(Value, Var):
         VType = Value.dbtype.tns_type
@@ -12787,23 +12816,11 @@ def _o7_define_entry(Col: dict) -> bytes:
         DefType, MaxSize = Type, Col.get('max_size') or 0
     Flag = 0x21 if Type == TNS_TYPE_CHAR else 0x01
     Charset = Col.get('charset') or 31
-    # The four fields between the size and the charset: the array length and
-    # flags, the type's OID and its version. Zeros for every column but an
-    # object, which names its type there as ojdbc14 does -- the open-ended
-    # size, the TOID (ub4 length + DALC), version 1 (#2258).
-    TypeBlock = bytes([0, 0, 0, 0])
+    # An object names its type in the descriptor as ojdbc14 does: the
+    # open-ended size, the TOID and version 1 (#2258).
     if Type == TNS_TYPE_ADT and Col.get('type_oid'):
-        MaxSize = 0x7FFFFFFF
-        Toid = Col['type_oid']
-        TypeBlock = bytes([0, 0]) + encode_sb4(len(Toid)) + _bytes_with_length(Toid)
-        TypeBlock += encode_sb4(1)
-    return (
-        bytes([DefType, Flag, 0, 0])
-        + encode_sb4(MaxSize)
-        + TypeBlock
-        + encode_sb4(Charset)
-        + bytes([Csfrm])
-    )
+        return _o7_oac(DefType, 0x7FFFFFFF, Csfrm, Charset, Flag, Col['type_oid'], 1)
+    return _o7_oac(DefType, MaxSize, Csfrm, Charset, Flag)
 
 
 def encode_o7_exec(Seq: int, Columns: list, Cursor: int = 1) -> bytes:
