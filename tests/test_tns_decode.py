@@ -6007,6 +6007,31 @@ class TestFv2ExecResponse(unittest.TestCase):
         self.assertEqual(rows[1][2], None)
         self.assertEqual(rows[2][1], 'carol')
 
+    def test_both_row_header_forms_read(self):
+        # 9.2.0.4 ends the row header with the bit vector's and the rowid's
+        # lengths for seerdb (NUM, `... 01 0a 00 00 00`), and without them for
+        # ojdbc14, whose capture the REF CURSOR's rows are: `... 01 0a 00` and
+        # the row's 07 straight after (#2284).
+        from seerdb.common.tns import decode_fv2_describe, decode_fv2_exec_response
+
+        self.assertEqual(
+            decode_fv2_exec_response(self.NUM, [{'data_type': 2}]), ([[42]], 1403)
+        )
+        cols = decode_fv2_describe(TestFv2RefCursor.DESCRIBE)
+        (rows, _) = decode_fv2_exec_response(TestFv2RefCursor.ROWS, cols)
+        self.assertEqual(rows[0], [1, 'row 1'])
+
+    def test_a_row_header_with_a_bit_vector_is_refused(self):
+        # The vector would say which columns repeat the row before and send
+        # nothing (#181); 9.2.0.4 sends none, and a row read without it would
+        # be misread from the first repeat on.
+        from seerdb.common.exceptions import DataError
+        from seerdb.common.tns import decode_fv2_exec_response
+
+        header = bytes.fromhex('0602010100010a0001010100')
+        with self.assertRaises(DataError):
+            decode_fv2_exec_response(header + self.NUM[10:], [{'data_type': 2}])
+
     def test_an_error_the_fetch_met_keeps_its_message(self):
         # `SELECT 1/0 FROM dual`: no rows, ORA-01476 and its text. Raised from
         # the code alone, it read `ORA-01476` (#2315). The end of a fetch,
