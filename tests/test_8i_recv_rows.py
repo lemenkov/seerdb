@@ -94,5 +94,75 @@ class TestReadOnOnlyForTruncation(unittest.TestCase):
             patch.stop()
 
 
+class TestReadOnUntilTheStatusIsWhole(unittest.TestCase):
+    """A reply cut a few bytes short of its status reads on (#2280).
+
+    8i splits a long reply into packets at no fixed point. Fetching a 50 000-byte
+    LONG RAW, it once sent all but the last 3 bytes, then those 3 (`00 00 00`)
+    in a packet of their own. The status ends in zero fields, so the short reply
+    decoded cleanly: the reader stopped, the 3 bytes answered the next fetch, and
+    that fetch's ORA-01403 answered the DROP after it. Replies captured on 8.1.7.
+    """
+
+    # SELECT CAST('X' AS VARCHAR2(1)), CAST(N'Y' AS NVARCHAR2(1)), ... : the
+    # describe, one row, then the RPA and the 60-byte status.
+    REPLY = bytes.fromhex(
+        '1019c3bff959d084a5050000787e0a180c320f395c020000000000060000000300000033'
+        '018000000100000000000000000000000000000000001f00010116160000001643415354'
+        '282758274153564152434841523228312929000000000000000001800000010000000000'
+        '0000000000000000000000001f00020118180000001843415354284e27592741534e5641'
+        '524348415232283129290000000000000000608000000400000000000000000000000000'
+        '000000001f0002010101000000014300000000000000000700000007787e0a180c321506'
+        '020300000001000000000000000000000007015800000000015900000000046162202000'
+        '0000000804002ca01d000000000001000000010000000000000004010000000000000000'
+        '000100000003004000000000000000000000000000000000000000000007000001000000'
+        '0000000000000000000000000000'
+    )
+    # An INSERT's status: its OER carries the row's 13-byte rowid.
+    INSERTED = bytes.fromhex(
+        '08040035a01d000000000003000000010000000000000004010000000000000000000300'
+        '0c00020000000000272d02000500001501000001000000000000090000010000000d000d'
+        '0100022d270005000001150001000000000000000000000000'
+    )
+    # The end of a fetch: ORA-01403 and its message, with no RPA before it.
+    NO_DATA = bytes.fromhex(
+        '04010000007b050000000001000000030040000000000000000000000000000000000000'
+        '000000080000010000000000000000000000000000000000194f52412d30313430333a20'
+        '6e6f206461746120666f756e640a'
+    )
+
+    def _rows(self):
+        from seerdb.common.tns import decode_8i_dcb_describe
+
+        return decode_8i_dcb_describe(self.REPLY)
+
+    def test_each_status_is_whole_and_not_a_byte_short(self):
+        from seerdb.common.tns import decode_8i_exec_response, o8i_terminal_complete
+
+        (columns, rows) = self._rows()
+        (_, terminal, _) = decode_8i_exec_response(rows, columns)
+        for status in (terminal, self.INSERTED, self.NO_DATA):
+            self.assertTrue(o8i_terminal_complete(status), status.hex())
+            for short in range(1, len(status)):
+                self.assertFalse(o8i_terminal_complete(status[:-short]), short)
+
+    def test_a_reply_three_bytes_short_waits_for_the_rest(self):
+        (columns, rows) = self._rows()
+        gen = O8iDialect(next_seq=lambda: 1).recv_rows(rows[:-3], columns, None)
+        # Before the fix the short reply returned here, three bytes unread.
+        self.assertIs(next(gen), RECV)
+        with self.assertRaises(StopIteration) as done:
+            gen.send((6, rows[-3:]))
+        (got, terminal, _) = done.exception.value
+        self.assertEqual(got, [['X', 'Y', 'ab  ']])
+        self.assertEqual(len(terminal), 83)
+
+    def test_a_whole_reply_reads_no_further(self):
+        (columns, rows) = self._rows()
+        with self.assertRaises(StopIteration) as done:
+            next(O8iDialect(next_seq=lambda: 1).recv_rows(rows, columns, None))
+        self.assertEqual(done.exception.value[0], [['X', 'Y', 'ab  ']])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -82,6 +82,7 @@ from seerdb.common.tns import (
     exec_oac_signature,
     has_long_class_bind,
     o8i_stmt_type,
+    o8i_terminal_complete,
 )
 from seerdb.common.tns_consts import (
     ORA_NO_DATA_FOUND,
@@ -718,7 +719,9 @@ class O8iDialect:
         while True:
             try:
                 (rows, terminal, last) = decode_8i_exec_response(buf, columns, last_row)
-                if terminal:
+                # The status, too, must be whole: a reply cut a few bytes short
+                # decodes, and its tail then answered the next call (#2280).
+                if terminal and o8i_terminal_complete(terminal):
                     return (rows, terminal, last)
             except (Truncated, IndexError):
                 pass

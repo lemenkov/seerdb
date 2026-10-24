@@ -13382,6 +13382,34 @@ def decode_8i_cursor_id(Terminal: bytes) -> int:
     return int.from_bytes(Terminal[10:12], 'big')
 
 
+def o8i_terminal_complete(Terminal: bytes) -> bool:
+    """Whether an 8i reply's post-row terminal has arrived whole (#2280).
+
+    8i splits a long reply into packets at no fixed point and marks none as the
+    last, and its status ends in zero fields, so a reply cut short a few bytes
+    before its end still decodes. The terminal is the fixed 23-byte RPA, then
+    the OER: 46 bytes of fixed fields, a ub2 rowid length (when it is not 0, a
+    ub1 repeat of it and the rowid follow), 12 more bytes, and, when its ORA
+    code is set, a ub1 message length and the message. Measured on 8.1.7 over
+    every status a suite run receives. A terminal of any other shape is taken
+    as whole, as before."""
+    Off = 23 if Terminal[:1] == bytes([TTI_RPA]) else 0
+    if Off and len(Terminal) <= Off:
+        return False
+    if Terminal[Off : Off + 1] != bytes([TTI_OER]):
+        return True
+    End = Off + 48
+    if len(Terminal) < End:
+        return False
+    RowidLength = int.from_bytes(Terminal[End - 2 : End], 'little')
+    End += (1 + RowidLength if RowidLength else 0) + 12
+    if int.from_bytes(Terminal[Off + 5 : Off + 7], 'little'):
+        if len(Terminal) <= End:
+            return False
+        End += 1 + Terminal[End]
+    return len(Terminal) >= End
+
+
 def _decode_8i_rowid(DataType: int, Val: bytes) -> str | None:
     # Render an 8i ROWID / UROWID column value (#385). A physical ROWID (type 11)
     # is a fixed-width little-endian struct — data object (ub4), relative file
