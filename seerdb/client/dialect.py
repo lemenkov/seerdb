@@ -34,6 +34,7 @@ from seerdb.common.tns import (
     FV2_BIND_OUT,
     O8I_STMT_TXN,
     _scan_ora_message,
+    decode_8i_block_cursor,
     decode_8i_block_out,
     decode_8i_cursor_id,
     decode_8i_dcb_describe,
@@ -58,6 +59,7 @@ from seerdb.common.tns import (
     decode_fv2_warn_flags,
     decode_o8i_bfile_getlen,
     decode_ub4,
+    encode_8i_close_cursors,
     encode_8i_lob_read,
     encode_8i_oall8_dml,
     encode_8i_oall8_fetch,
@@ -91,6 +93,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_REFCURSOR,
     TTI_LOB,
     TTI_OER,
+    TTI_RPA,
 )
 
 # Oracle 8i LONG / LONG RAW type codes — a LONG changes the fetch shape (one row
@@ -610,6 +613,26 @@ class O8iDialect:
 
     def __init__(self, next_seq: Callable[[], int]) -> None:
         self._next_seq = next_seq
+        # The cursors finished statements left open, closed in front of the
+        # next call (#2286): 8i parses every statement on a new cursor and
+        # keeps it until told, so a session ran out at open_cursors.
+        self._to_close: list[int] = []
+
+    def _closing(self) -> bytes:
+        # The close of every cursor waiting, piggybacked ahead of a call as
+        # python-oracledb does on 10g+; empty when none waits. It takes its
+        # sequence number first, so it must be built before the call it rides
+        # on: `self._closing() + encode_...(self._next_seq(), ...)`.
+        if not self._to_close:
+            return b''
+        (cursors, self._to_close) = (self._to_close, [])
+        return encode_8i_close_cursors(self._next_seq(), cursors)
+
+    def _finished(self, cursor: int) -> None:
+        # A statement is done with its cursor: close it with the next call. A
+        # statement the server refused at parse names cursor 0, having none.
+        if cursor:
+            self._to_close.append(cursor)
 
     # 8i reads every LOB's content at fetch time whatever fetch_lobs says: its
     # dialect serves no LOB object calls (#2259).
@@ -634,7 +657,8 @@ class O8iDialect:
         # (WE8ISO8859P1); the column charset drives decoding. Returns the same
         # 9-tuple as Fv2Dialect.execute_query so the cursor path is unchanged.
         yield Send(
-            encode_8i_oall8_query(self._next_seq(), encode_8i_sql_text(sql), bind)
+            self._closing()
+            + encode_8i_oall8_query(self._next_seq(), encode_8i_sql_text(sql), bind)
         )
         resp = yield RECV
         if resp is False:
@@ -644,6 +668,8 @@ class O8iDialect:
         # (0x10) describe — surface the mapped ORA error rather than overrunning
         # decode_8i_dcb_describe (#384).
         if packet[:1] == bytes([TTI_OER]):
+            # A SELECT refused at execute keeps its cursor (ORA-00942 does).
+            self._finished(decode_8i_cursor_id(packet))
             (err_code, message) = _scan_ora_message(packet)
             if err_code:
                 _raise_ora(err_code, message)
@@ -658,16 +684,21 @@ class O8iDialect:
         cursor = decode_8i_cursor_id(terminal)
         row_count = 1 if has_long else fetch
         long_size = 0x7FFFFFFF if has_long else fetch
-        while cursor:
-            yield Send(
-                encode_8i_oall8_fetch(self._next_seq(), cursor, row_count, long_size)
-            )
-            (more, _terminal, last_row) = yield from self.recv_rows(
-                b'', columns, last_row
-            )
-            if not more:
-                break
-            rows.extend(more)
+        try:
+            while cursor:
+                yield Send(
+                    encode_8i_oall8_fetch(
+                        self._next_seq(), cursor, row_count, long_size
+                    )
+                )
+                (more, _terminal, last_row) = yield from self.recv_rows(
+                    b'', columns, last_row
+                )
+                if not more:
+                    break
+                rows.extend(more)
+        finally:
+            self._finished(cursor)
         yield from self.resolve_lobs(rows, columns)
         return (0, 0, 0, (len(rows), columns), rows, None, None, [], None)
 
@@ -754,13 +785,15 @@ class O8iDialect:
         assert not batch
         stmt_type = o8i_stmt_type(sql.strip().upper())
         yield Send(
-            encode_8i_oall8_dml(
+            self._closing()
+            + encode_8i_oall8_dml(
                 self._next_seq(), encode_8i_sql_text(sql), stmt_type, bind
             )
         )
         received = yield RECV
         if received is False:
             raise Exception('Connection closed during 8i DML')
+        self._finished(decode_8i_cursor_id(received[1]))
         (row_count, err_code, message) = decode_8i_dml_response(received[1])
         _raise_ora(err_code, message)
         rowid = decode_8i_dml_rowid(received[1])  # the touched row (#1079)
@@ -778,7 +811,8 @@ class O8iDialect:
         out_positions = [i for i, b in enumerate(bind) if isinstance(b, Var)]
         stmt_type = o8i_stmt_type(sql.strip().upper())
         yield Send(
-            encode_8i_oall8_dml(
+            self._closing()
+            + encode_8i_oall8_dml(
                 self._next_seq(), encode_8i_sql_text(sql), stmt_type, bind
             )
         )
@@ -789,12 +823,16 @@ class O8iDialect:
         # The reply may open with a 0x0b bind prompt; decode_8i_dml_response
         # surfaces any ORA- error regardless (its rowcount is not meaningful here).
         (_row_count, err_code, message) = decode_8i_dml_response(packet)
+        if err_code and packet[:1] in (bytes([TTI_OER]), bytes([TTI_RPA])):
+            self._finished(decode_8i_cursor_id(packet))
         _raise_ora(err_code, message)
         # Values come back only for the binds the block writes; the prompt says
         # which, as on 9i (#1242), with 8i's bind count at offset 2.
         directions = decode_fv2_bind_directions(packet, CountAt=2)
         if directions is not None and len(directions) == len(bind):
             out_positions = [i for i, d in enumerate(directions) if d & FV2_BIND_OUT]
+        # Its cursor is in the status behind the prompt and the OUT values.
+        self._finished(decode_8i_block_cursor(packet, len(out_positions)))
         if out_positions:
             out_values = decode_8i_block_out(packet, len(out_positions))
             record = {'out_positions': out_positions, 'out_values': out_values}
@@ -805,13 +843,15 @@ class O8iDialect:
         # 8i has no modern TTI_COMMIT / TTI_ROLLBACK: commit and rollback ride the
         # OALL8 as ordinary statements (§19.12, statement type 0).
         yield Send(
-            encode_8i_oall8_dml(
+            self._closing()
+            + encode_8i_oall8_dml(
                 self._next_seq(), encode_8i_sql_text(statement), O8I_STMT_TXN
             )
         )
         received = yield RECV
         if received is False:
             raise Exception(f'Connection closed during 8i {statement}')
+        self._finished(decode_8i_cursor_id(received[1]))
         (_row_count, err_code, message) = decode_8i_dml_response(received[1])
         _raise_ora(err_code, message)
 

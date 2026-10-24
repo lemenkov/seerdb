@@ -6817,6 +6817,36 @@ class TestO8iQueryMessages(unittest.TestCase):
             encode_8i_oall8_fetch(9, 0x10203, 1)[3:11].hex(), '4000000003020100'
         )
 
+    # sqlplus 9.2 closing cursor 1 on 8.1.7, a call of its own (#2286), and an
+    # 8i block's reply with its OUT value: the bind prompt, the RXD, then the
+    # RPA and status, which name cursor 14.
+    SQLPLUS_CLOSE = bytes.fromhex('03690e010100000001000000')
+    BLOCK_OUT_REPLY = bytes.fromhex(
+        '0b0501000000010000000000000000000000100702c12b000008040040cf1d000000'
+        '00000e000000000000000000000004010000000000000000000e0000002f00400000'
+        '00dc30020005000013010000000000000000001d0000010000000000000000000000'
+        '000000000000'
+    )
+
+    def test_the_close_is_sqlplus_s_piggybacked(self):
+        # The same fields as sqlplus 9.2 sends 8i, ahead of the next call as a
+        # piggyback (0x11), as python-oracledb sends it on 10g+.
+        from seerdb.common.tns import encode_8i_close_cursors
+
+        self.assertEqual(
+            encode_8i_close_cursors(0x0E, [1]), b'\x11' + self.SQLPLUS_CLOSE[1:]
+        )
+        self.assertEqual(
+            encode_8i_close_cursors(5, [3, 300]).hex(),
+            '116905010200000003000000' + '2c010000',
+        )
+
+    def test_a_block_names_its_cursor_behind_its_out_values(self):
+        from seerdb.common.tns import decode_8i_block_cursor, decode_8i_block_out
+
+        self.assertEqual(decode_8i_block_out(self.BLOCK_OUT_REPLY, 1), [b'\xc1\x2b'])
+        self.assertEqual(decode_8i_block_cursor(self.BLOCK_OUT_REPLY, 1), 14)
+
     def test_dcb_describe_columns(self):
         from seerdb.common.tns import decode_8i_dcb_describe
 
