@@ -445,10 +445,6 @@ _TIME_ZONE_SYNC = _Need(
 _TEMP_LOB = _Need('a temporary LOB needs a 12c+ server (CREATE_TEMP)', min_fv=_FV)
 _END_TO_END = _Need('end-to-end tracing requires 12c+', min_fv=_FV)
 _IMPLICIT_RESULTS = _Need('DBMS_SQL.RETURN_RESULT is 12c+', min_server=12)
-_PASSTHROUGH_IMPLICIT_RESULTS = _Need(
-    'the passthrough Mirror relays no implicit result set (#2295)',
-    not_mirror=('passthrough',),
-)
 _PRE12_VECTOR_REFUSAL = _Need('a 12.1+ session binds a VECTOR', below_fv=_FV)
 _CURSOR_CACHE = _Need(
     'cursor cache is disabled on 12c+ (re-parse each execute)', below_fv=_FV
@@ -3000,7 +2996,7 @@ class CursorIntegration(_IntegrationBase):
             self.cur.execute('BEGIN OPEN :1 FOR SELECT :2 FROM dual; END;', [rc, n])
             self.assertEqual(rc.getvalue().fetchall(), [(n,)])
 
-    @_requires(_IMPLICIT_RESULTS, _PASSTHROUGH_IMPLICIT_RESULTS)
+    @_requires(_IMPLICIT_RESULTS)
     def test_implicit_results_outlast_open_cursors(self):
         # More implicit result sets than open_cursors (300): each one read was
         # left open on the server, and the session failed with ORA-01000
@@ -3013,6 +3009,22 @@ class CursorIntegration(_IntegrationBase):
             )
             self.assertTrue(self.cur.nextset())
             self.assertEqual(self.cur.fetchall(), [(n,)])
+
+    @_requires(_IMPLICIT_RESULTS)
+    def test_a_block_returns_out_binds_and_implicit_results(self):
+        # A block with binds and an implicit result set: through the passthrough
+        # Mirror the set was lost, and a Mirror sent either the OUT values or
+        # the set, never both. A server sends the values, then the set (#2295).
+        out = self.cur.var(int)
+        self.cur.execute(
+            'DECLARE c SYS_REFCURSOR; BEGIN :1 := :2 + 1; '
+            'OPEN c FOR SELECT :2 FROM dual; DBMS_SQL.RETURN_RESULT(c); END;',
+            [out, 7],
+        )
+        self.assertEqual(out.getvalue(), 8)
+        self.assertTrue(self.cur.nextset())
+        self.assertEqual(self.cur.fetchall(), [(7,)])
+        self.assertIsNone(self.cur.nextset())
 
     def test_the_version_is_the_release_the_banner_names(self):
         # Every tier reports its release, 8i and 9i too: 8i's login reply
