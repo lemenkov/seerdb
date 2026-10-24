@@ -42,7 +42,14 @@ CODECS = {
 FIELD_VERSIONS = (FIELD_VERSION_11_2, FIELD_VERSION_12_1, FIELD_VERSION_23_4)
 # Schemas holding a `raw` field: bytes already encoded, written as they are,
 # with no length to read them back by. Encode-only by design.
-ONE_WAY = {'_REFCURSOR_OUT', '_OBJECT_FRAME', '_LOB_READ_REPLY', '_DCB_COLUMN'}
+ONE_WAY = {
+    '_REFCURSOR_OUT',
+    '_OBJECT_FRAME',
+    '_LOB_READ_REPLY',
+    '_DCB_COLUMN',
+    # 9i's SQL length counts characters, not the bytes its text takes (#2275).
+    '_O7_ALL7',
+}
 SAMPLES = 12
 
 
