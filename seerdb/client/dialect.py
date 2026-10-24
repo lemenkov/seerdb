@@ -49,7 +49,7 @@ from seerdb.common.tns import (
     decode_fv2_dml_response,
     decode_fv2_dml_rowid,
     decode_fv2_error_position,
-    decode_fv2_exec_response,
+    decode_fv2_exec_status,
     decode_fv2_lob_chunks,
     decode_fv2_lob_getlen,
     decode_fv2_lob_value,
@@ -297,14 +297,15 @@ class Fv2Dialect:
         # can't spin forever.
         all_rows: list = []
         err_code = 0
+        message = None
         while True:
             yield Send(encode_o7_exec(0, columns, cursor))
             resp = yield RECV
             if resp is False:
                 raise Exception('Connection closed during 9i fetch')
-            (rows, err_code) = decode_fv2_exec_response(resp[1], columns)
+            (rows, err_code, message) = decode_fv2_exec_status(resp[1], columns)
             all_rows.extend(rows)
-            if err_code == ORA_NO_DATA_FOUND or not rows:
+            if err_code or not rows:
                 break
         # Resolve LOB cells while the cursor is still open (JDBC does the same):
         # decode_fv2_exec_response left LOB objects in the rows; replace each with
@@ -323,7 +324,10 @@ class Fv2Dialect:
                     row[j] = _cursor_marker(nested, nested_columns, nested_rows)
         yield Send(encode_o7_close(0, cursor))
         yield RECV  # close STA
-        _raise_terminal(err_code)
+        if err_code != ORA_NO_DATA_FOUND:
+            # With the status's text: from the code alone, an error the fetch
+            # met had none (#2315).
+            _raise_ora(err_code, message)
         return (columns, all_rows)
 
     def execute_dml(

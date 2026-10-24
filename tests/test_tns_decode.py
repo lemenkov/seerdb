@@ -6005,6 +6005,24 @@ class TestFv2ExecResponse(unittest.TestCase):
         self.assertEqual(rows[1][2], None)
         self.assertEqual(rows[2][1], 'carol')
 
+    def test_an_error_the_fetch_met_keeps_its_message(self):
+        # `SELECT 1/0 FROM dual`: no rows, ORA-01476 and its text. Raised from
+        # the code alone, it read `ORA-01476` (#2315). The end of a fetch,
+        # ORA-01403, needs no text.
+        from seerdb.common.tns import decode_fv2_exec_status
+
+        failed = bytes.fromhex(
+            '04000205c4000001010108030000000000000000000000000000010100000000'
+            '244f52412d30313437363a2064697669736f7220697320657175616c20746f20'
+            '7a65726f0a'
+        )
+        cols = [{'data_type': 2}]
+        self.assertEqual(
+            decode_fv2_exec_status(failed, cols),
+            ([], 1476, 'ORA-01476: divisor is equal to zero'),
+        )
+        self.assertEqual(decode_fv2_exec_status(self.NUM, cols), ([[42]], 1403, None))
+
 
 class TestFv2ZeroLengthColumn(unittest.TestCase):
     """A 9i column described with a zero data length sends only the NULL

@@ -2973,6 +2973,15 @@ class CursorIntegration(_IntegrationBase):
             )
             self.cur.fetchall()
 
+    def test_an_error_a_fetch_meets_has_its_message(self):
+        # 9i raised an error its fetch met from the code alone: `ORA-01476`
+        # with no text (#2315).
+        from seerdb.common.exceptions import DatabaseError
+
+        with self.assertRaisesRegex(DatabaseError, r'^ORA-01476: \w'):
+            self.cur.execute('SELECT 1 / 0 FROM dual')
+            self.cur.fetchall()
+
     def test_a_query_of_300_columns(self):
         # 9i read its describe's column count as one byte: past 255 columns it
         # described one, and the fetch failed with ORA-03115 (#2306).
