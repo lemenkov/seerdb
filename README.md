@@ -27,6 +27,8 @@ spells out what is and isn't supported.
 
 [`ROADMAP.md`](ROADMAP.md) covers what is being worked on next, what is parked
 and why, and the rule that decides when the next major release is reachable.
+[`docs/USE-CASES.md`](docs/USE-CASES.md) collects situations seerdb could fit,
+and where each stops being the right tool.
 
 The wire protocol is reverse-engineered and implemented incrementally as a
 clean-room effort — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the rules
