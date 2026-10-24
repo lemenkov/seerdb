@@ -13985,17 +13985,28 @@ def decode_fv2_oer_error(Packet: bytes) -> tuple[int, str | None]:
 
 
 def decode_fv2_exec_response(Data: bytes, Columns: list) -> tuple[list, int]:
+    # (rows, ora_code) of a 9i execute+fetch reply, as decode_fv2_exec_status
+    # reads it.
+    (Rows, ErrCode, _) = decode_fv2_exec_status(Data, Columns)
+    return (Rows, ErrCode)
+
+
+def decode_fv2_exec_status(Data: bytes, Columns: list) -> tuple[list, int, str | None]:
     # Walk the fv2 (9i) execute+fetch response stream: TTI_RXH (06) then one
     # TTI_RXD (07) per row, terminated by the short TTI_OER (04). The 9i row
     # framing differs from 10g+: the RXH has no trailing bit-vector / rowid, and
     # each column value is a DALC blob followed by a 1-byte indicator. Row
     # values themselves use the version-independent §11 decoders. Returns
-    # (rows, ora_code) where ora_code 1403 == end-of-fetch (PROTOCOL.md §19.2).
+    # (rows, ora_code, message) where ora_code 1403 == end-of-fetch (PROTOCOL.md
+    # §19.2), and message is the status's text for an error. Raised from the
+    # code alone, an error the fetch met -- ORA-01476 from `SELECT 1/0` -- had
+    # no text (#2315).
     from seerdb.common.lob import LOB
     from seerdb.common.types import decode_value
 
     Rows: list = []
     ErrCode = 0
+    Message = None
     Rest = Data
     while Rest:
         Token = Rest[0]
@@ -14085,11 +14096,13 @@ def decode_fv2_exec_response(Data: bytes, Columns: list) -> tuple[list, int]:
                     Row.append(decode_value(Col, Val))
             Rows.append(Row)
         elif Token == TTI_OER:
-            (_, ErrCode, Rest) = _decode_fv2_oer(Rest)
+            (_, ErrCode, _) = _decode_fv2_oer(Rest)
+            if ErrCode not in (0, ORA_NO_DATA_FOUND):
+                Message = decode_fv2_oer_error(Rest)[1]
             break
         else:
             break
-    return (Rows, ErrCode)
+    return (Rows, ErrCode, Message)
 
 
 def decode_fv2_dml_response(Data: bytes) -> tuple[int, int]:
