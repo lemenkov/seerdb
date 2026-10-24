@@ -5410,8 +5410,9 @@ Unlike 10g+, which returns a dedicated `TTI_DCB` (§6.4), 9i packs the column
 metadata **inside the `TTI_RPA` (08)** answering the `0x62` call:
 
 ```
-08 01 <numcols:1B> <column>*  <trailer>
-column = <OAC-fv2> <null_ok:1B> <namelen_bytes:1B> <ub4 namelen_chars> <DALC name> 00 00
+08 <ub4 numcols> <column>*  <status>
+column = <OAC-fv2> <null_ok:1B> <namelen_bytes:1B> <ub4 namelen_chars> <DALC name>
+         <ub4 type_schema_len> [<DALC type_schema>] <ub4 type_name_len> [<DALC type_name>]
 ```
 
 The per-column **`OAC-fv2`** is exactly the §5.3 OAC field order **minus the
@@ -5427,8 +5428,16 @@ same numbering as seerdb's `TNS_TYPE_*` constants (1=VARCHAR2, 2=NUMBER,
 12=DATE, 23=RAW, 96=CHAR, 181=TIMESTAMP) — so the fv2 path **reuses the existing
 type→value decoders**, no new numbering. The OAC is followed by a **`null_ok`
 byte** (`0x00` = NOT NULL, `0x01` = nullable), a **1-byte `namelen_bytes`**, a
-**`ub4 namelen_chars`**, then the **DALC-encoded UPPERCASE name** and a two-byte
-`00 00` inter-column separator.
+**`ub4 namelen_chars`**, then the **DALC-encoded UPPERCASE name**, and last the
+schema and name of the column's type, each a `ub4` length and the name when there
+is one. Only an object column names its type (`01 03 03 PYO`, `01 06 06 TY2248`,
+#2258); every other column sends the two zero lengths, `00 00`, which read like a
+separator between columns but end the last column too. The column count is a
+`ub4` (`01 <n>` up to 255, `02 01 2c` for 300, #2306), and `namelen_bytes` is one
+byte because the server cuts a name to 255 bytes: an expression's column, named
+by its text, comes back `ff 01 ff` and the name in 64-byte chunks. seerdb reads
+it all from one schema, `_O7_DESCRIBE` (#2284), and every column ends on the
+next one or on the call's status.
 
 > **Do not read the post-OAC fields as two `ub4` name-lengths.** The first byte
 > is `null_ok`, not a length. It only *looks* like a ub4 width byte for nullable
