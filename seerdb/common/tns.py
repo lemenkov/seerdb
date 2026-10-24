@@ -1328,9 +1328,37 @@ class _OciWideCodec(_OciCodec):
         return int.from_bytes(_oci_fixed(data, 8, 'wn4'), 'little'), data[8:]
 
 
+class _O8iCodec(_OciCodec):
+    """Oracle 8i's primitives (#2286): it reads a 9.2 OCI client's calls, with
+    OCI's little-endian ub4 / ub2 integers but a one-byte pointer flag, and
+    with ub4 where a 64-bit OCI client writes a ub8 count. Measured on 8.1.7
+    for the close-cursors piggyback, which sqlplus 9.2 sends 8i as `03 69 <seq>
+    01 <ub4 1> <ub4 cursor>`; the other primitives are OCI's until a message
+    measures them (#2284)."""
+
+    name = 'o8i'
+
+    @staticmethod
+    def ptr(value: bool) -> bytes:
+        return b'\x01' if value else b'\x00'
+
+    @staticmethod
+    def read_ptr(data: bytes) -> tuple[bool, bytes]:
+        return _oci_fixed(data, 1, 'ptr') != b'\x00', data[1:]
+
+    @staticmethod
+    def n8(value: int) -> bytes:
+        return value.to_bytes(4, 'little')
+
+    @staticmethod
+    def read_n8(data: bytes) -> tuple[int, bytes]:
+        return int.from_bytes(_oci_fixed(data, 4, 'n8'), 'little'), data[4:]
+
+
 _THIN = _ThinCodec()
 _OCI = _OciCodec()
 _OCI_WIDE = _OciWideCodec()
+_O8I = _O8iCodec()
 _bytes_with_length = _THIN.value
 _oci_value_bytes = _OCI.value
 
@@ -1779,6 +1807,7 @@ _LOB_READ_REPLY_OCI = wire_schema.compile_encoder(_LOB_READ_REPLY, _OCI)
 _CLOSE_CURSORS_THIN = wire_schema.compile_encoder(_CLOSE_CURSORS, _THIN)
 _CLOSE_CURSORS_FROM_THIN = wire_schema.compile_decoder(_CLOSE_CURSORS, _THIN)
 _CLOSE_CURSORS_FROM_OCI = wire_schema.compile_decoder(_CLOSE_CURSORS, _OCI)
+_CLOSE_CURSORS_O8I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O8I)
 _OBJECT_FRAME_THIN = wire_schema.compile_encoder(_OBJECT_FRAME, _THIN)
 _OBJECT_FRAME_OCI = wire_schema.compile_encoder(_OBJECT_FRAME, _OCI)
 _LOB_CELL_THIN = wire_schema.compile_encoder(_LOB_CELL, _THIN)
@@ -7355,6 +7384,22 @@ def encode_close_cursors_piggyback(Seq: int, FieldVersion: int, Cursors: list) -
         {
             'seq': Seq,
             'token_number': 0 if FieldVersion >= FIELD_VERSION_23_1_EXT_1 else None,
+            'cursors_present': True,
+            'count': len(Cursors),
+            'cursors': [{'cursor': c} for c in Cursors],
+        }
+    )
+
+
+def encode_8i_close_cursors(Seq: int, Cursors: list) -> bytes:
+    """The close of `Cursors` on 8i, piggybacked in front of the next call
+    (#2286). 8i keeps every statement's cursor open, a failed SELECT's too,
+    until the client closes it; left open, a session ran out at open_cursors
+    with ORA-01000. sqlplus 9.2 sends the same message as a call of its own."""
+    return _CLOSE_CURSORS_O8I(
+        {
+            'seq': Seq & 0xFF,
+            'token_number': None,
             'cursors_present': True,
             'count': len(Cursors),
             'cursors': [{'cursor': c} for c in Cursors],
@@ -13194,6 +13239,17 @@ def decode_8i_block_out(Data: bytes, NumOut: int) -> list:
     # single TTI_RXD (07) as `NumOut` × (DALC value + 2-byte trailer), in OUT-bind
     # position order. Returns the raw value bytes per OUT bind (None for empty /
     # NULL), decoded against each Var's declared type by the cursor.
+    return _decode_8i_block_values(Data, NumOut)[0]
+
+
+def decode_8i_block_cursor(Data: bytes, NumOut: int) -> int:
+    # The cursor an 8i PL/SQL block's reply names, from the status behind its
+    # bind prompt and OUT values (#2286).
+    return decode_8i_cursor_id(_decode_8i_block_values(Data, NumOut)[1])
+
+
+def _decode_8i_block_values(Data: bytes, NumOut: int) -> tuple[list, bytes]:
+    # The OUT values of an 8i block's reply and the status after them.
     Rest = strip_fv2_bind_prompt(Data)
     OutValues: list = []
     if NumOut > 0 and Rest[:1] == bytes([TTI_RXD]):
@@ -13204,12 +13260,13 @@ def decode_8i_block_out(Data: bytes, NumOut: int) -> list:
             OutValues.append(
                 bytes(Val) if isinstance(Val, (bytes, bytearray)) and Val else None
             )
-    return OutValues
+    return OutValues, Rest
 
 
 # 8i statement-type codes (the OCI OCI_STMT_* family), carried at trailer offset
 # +28 of the OALL8 and driving the whole option word. 0 = transaction control
-# (COMMIT / ROLLBACK), which has no cursor.
+# (COMMIT / ROLLBACK), which 8i parses on a cursor of its own like any other
+# statement (#2286).
 O8I_STMT_SELECT = 1
 O8I_STMT_UPDATE = 2
 O8I_STMT_DELETE = 3

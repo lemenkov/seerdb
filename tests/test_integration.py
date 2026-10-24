@@ -2958,13 +2958,27 @@ class CursorIntegration(_IntegrationBase):
             self.cur.fetchone(), (self.conn.session_id, self.conn.serial_num)
         )
 
-    def test_a_query_comes_back_whole_after_many_statements(self):
-        # 8i leaves every cursor open (#2286), so 260 statements in one session
-        # take its cursor ids past 255, where a big-endian read made the next
-        # query's id 0 or 1 and cut it to its first row (#2285).
-        for _ in range(260):
+    def test_a_session_outlasts_open_cursors(self):
+        # More statements than the beds' open_cursors (300), of each kind that
+        # takes a cursor on 8i: a query, a block with and without an OUT bind, a
+        # refused query, a COMMIT. 8i kept every one open and the session failed
+        # with ORA-01000 (#2286); before that, cursor ids past 255 cut the next
+        # query to its first row (#2285), whose byte order the offline test
+        # pins now that closed cursors keep the ids low.
+        from seerdb.common.exceptions import DatabaseError
+
+        if self.conn.version and self.conn.version.startswith('9.'):
+            self.skipTest('9i runs out of cursors when statements alternate (#2288)')
+        out = self.cur.var(int)
+        for n in range(80):
             self.cur.execute('SELECT 1 FROM dual')
             self.cur.fetchall()
+            self.cur.execute('BEGIN NULL; END;')
+            self.cur.execute('BEGIN :1 := :2; END;', [out, n])
+            self.assertEqual(out.getvalue(), n)
+            with self.assertRaises(DatabaseError):
+                self.cur.execute('SELECT * FROM no_such_table_2286')
+            self.conn.commit()
         for _ in range(2):
             # 50 rows, more than one fetch: a ROWNUM filter alone, which the
             # Mirror over PostgreSQL translates, and no CONNECT BY LEVEL, which
