@@ -169,9 +169,9 @@ class _Values:
             elif kind == 'ptr':
                 values[name] = self._pick([False, True])
             elif kind == 'token':
-                # Thin sends a function's token from 23ai and OCI never. The
-                # encoder writes whatever it is given and the decoder reads by
-                # the field version, so a caller gives None below 23ai.
+                # Thin sends a function's token from 23ai and OCI never, both
+                # directions by the field version: below 23ai a token given is
+                # not written, so it does not come back.
                 thin_token = (
                     self.codec_name == 'thin' and self.fv >= FIELD_VERSION_23_1_EXT_1
                 )
@@ -424,6 +424,49 @@ class TestTheMessagesTheDecodersReadRoundTrip(unittest.TestCase):
                 (again, values, values_again) = round_trip(record)
                 self.assertTrue(_same(values, values_again), 'its fields changed')
                 self.assertEqual(_unexplained(record, again), [])
+
+
+class TestThinTokenFollowsTheFieldVersion(unittest.TestCase):
+    """Thin's token is written as it is read: from 23ai, whatever the caller
+    gives, and not before. Its encoder wrote what it was given and its
+    decoder read by the field version, so a token given below 23ai made a
+    message its own decoder misread (#2290)."""
+
+    def _encode(self, fv: int, value: int | None) -> bytes:
+        token = tns._ENCODE_FIELD_VERSION.set(fv)
+        try:
+            return tns._THIN.token(value)
+        finally:
+            tns._ENCODE_FIELD_VERSION.reset(token)
+
+    def test_below_23ai_no_token_is_written(self):
+        for value in (None, 0, 7):
+            self.assertEqual(self._encode(FIELD_VERSION_12_1, value), b'')
+
+    def test_from_23ai_a_token_is_always_written(self):
+        self.assertEqual(self._encode(FIELD_VERSION_23_4, None), b'\x00')
+        self.assertEqual(self._encode(FIELD_VERSION_23_4, 0), b'\x00')
+        self.assertEqual(self._encode(FIELD_VERSION_23_4, 7), b'\x01\x07')
+
+    def test_a_piggyback_goes_by_the_connection_s_version(self):
+        # Whatever the context says, the close-cursors piggyback and the fetch
+        # take the field version they are given.
+        token = tns._ENCODE_FIELD_VERSION.set(FIELD_VERSION_23_4)
+        try:
+            old = tns.encode_close_cursors_piggyback(3, FIELD_VERSION_12_1, [1])
+            fetch = tns.encode_dictionary_fetch(
+                {
+                    'seq': 3,
+                    'cursor': 1,
+                    'fetch': 10,
+                    'field_version': FIELD_VERSION_12_1,
+                }
+            )
+        finally:
+            tns._ENCODE_FIELD_VERSION.reset(token)
+        new = tns.encode_close_cursors_piggyback(3, FIELD_VERSION_23_4, [1])
+        self.assertEqual(len(new) - len(old), 1)  # the token `00`
+        self.assertEqual(fetch[3:4], b'\x01')  # the cursor, no token before it
 
 
 if __name__ == '__main__':
