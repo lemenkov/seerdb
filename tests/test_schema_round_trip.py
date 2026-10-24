@@ -254,5 +254,31 @@ class TestEverySchemaRoundTrips(unittest.TestCase):
                         tns._DECODE_FIELD_VERSION.reset(dec)
 
 
+class TestThinIntegersAreSigned(unittest.TestCase):
+    """Thin's integer fields read TTC's sign-magnitude negatives, so they must
+    write them too (#2299): a NUMBER bind with FLOAT's scale of -127 decoded,
+    and re-encoding it raised."""
+
+    def test_a_negative_round_trips(self):
+        for kind in ('n1', 'n2', 'n4'):
+            encode = getattr(tns._THIN, kind)
+            decode = getattr(tns._THIN, 'read_' + kind)
+            for value in (-1, -127, -128, -256, -65536, -(1 << 31)):
+                with self.subTest(kind=kind, value=value):
+                    self.assertEqual(decode(encode(value) + b'\xee'), (value, b'\xee'))
+        self.assertEqual(tns._THIN.n4(-1), b'\x81\x01')
+        self.assertEqual(tns._THIN.n4(-127), b'\x81\x7f')
+        # The non-negative form is unchanged.
+        self.assertEqual(tns._THIN.n4(127), b'\x01\x7f')
+
+    def test_a_float_binds_descriptor_round_trips(self):
+        # A NUMBER bind's OAC with scale -127, as test_tns_decode's
+        # test_tns_decode_token_oac_01 holds it.
+        oac = bytes.fromhex('020000817f010200000000000000')
+        (values, rest) = wire_schema.compile_decoder(tns._OAC, tns._THIN)(oac)
+        self.assertEqual((values['scale'], rest), (-127, b''))
+        self.assertEqual(wire_schema.compile_encoder(tns._OAC, tns._THIN)(values), oac)
+
+
 if __name__ == '__main__':
     unittest.main()
