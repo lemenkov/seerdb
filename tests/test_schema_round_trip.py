@@ -18,6 +18,8 @@ listed, so that a new one shows up in review.
 """
 
 import itertools
+import json
+import os
 import unittest
 from typing import Any
 
@@ -278,6 +280,143 @@ class TestThinIntegersAreSigned(unittest.TestCase):
         (values, rest) = wire_schema.compile_decoder(tns._OAC, tns._THIN)(oac)
         self.assertEqual((values['scale'], rest), (-127, b''))
         self.assertEqual(wire_schema.compile_encoder(tns._OAC, tns._THIN)(values), oac)
+
+
+# --- The messages the decoders read, re-encoded (tests/schema_corpus.txt) ----
+
+CORPUS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'schema_corpus.txt')
+# Where a real message may differ from its re-encoding, by design: the field
+# reads it without keeping the bytes. Anything else must come back exactly.
+_KEEPS_NO_BYTES = {
+    # sqlplus sends the pointer's address; the schema keeps only whether one
+    # is there, and writes the indicator.
+    ('ptr', '_OCI'),
+    ('ptr', '_OCI_WIDE'),
+}
+_THIN_INTEGERS = ('n1', 'n2', 'n4', 'n8', 'wn4', 'token', 'scale')
+# A pad a peer fills, which the schema skips and writes as zeros, named.
+_FILLED_PADS = {
+    # sqlplus writes the auth pairs' count as a ub4 and leaves the next four
+    # bytes as they were (#2249).
+    ('_AUTH_HEAD', '_OCI'): ('only', 'oci'),
+}
+
+
+def _given(record: dict) -> dict:
+    return {
+        k: bytes.fromhex(v['hex']) if isinstance(v, dict) else v
+        for k, v in record['given'].items()
+    }
+
+
+def round_trip(record: dict) -> tuple[bytes, dict, dict]:
+    """A corpus record decoded, encoded again, and the new bytes decoded:
+    (bytes again, values, values again)."""
+    schema = getattr(tns, record['schema'])
+    codec = getattr(tns, record['codec'])
+    data = bytes.fromhex(record['consumed'])
+    given = _given(record)
+    enc = tns._ENCODE_FIELD_VERSION.set(record['fv'])
+    dec = tns._DECODE_FIELD_VERSION.set(record['fv'])
+    try:
+        decode = wire_schema.compile_decoder(schema, codec)
+        (values, _) = decode(data, given)
+        again = wire_schema.compile_encoder(schema, codec)(values)
+        (values_again, _) = decode(again, given)
+    finally:
+        tns._ENCODE_FIELD_VERSION.reset(enc)
+        tns._DECODE_FIELD_VERSION.reset(dec)
+    return again, values, values_again
+
+
+def _field_at(record: dict, offset: int) -> tuple:
+    # The top-level field whose bytes hold `offset` in the recorded message.
+    schema = getattr(tns, record['schema'])
+    codec = getattr(tns, record['codec'])
+    data = bytes.fromhex(record['consumed'])
+    dec = tns._DECODE_FIELD_VERSION.set(record['fv'])
+    try:
+        for i in range(1, len(schema) + 1):
+            (_, rest) = wire_schema.compile_decoder(schema[:i], codec)(
+                data, _given(record)
+            )
+            if len(data) - len(rest) > offset:
+                return schema[i - 1]
+    finally:
+        tns._DECODE_FIELD_VERSION.reset(dec)
+    return ('end',)
+
+
+def _unexplained(record: dict, again: bytes) -> list[str]:
+    # The differences between a message and its re-encoding that no field
+    # kind explains, by offset and field.
+    data = bytes.fromhex(record['consumed'])
+    if again == data:
+        return []
+    offsets = [i for i, (a, b) in enumerate(zip(again, data)) if a != b]
+    if len(again) != len(data):
+        # A variable-width integer written longer than it needs: what follows
+        # is shifted, so only the first difference says where it is.
+        offsets = offsets[:1] or [min(len(again), len(data))]
+    out = []
+    for offset in offsets:
+        field = _field_at(record, offset)
+        kind = field[0]
+        if (kind, record['codec']) in _KEEPS_NO_BYTES:
+            continue
+        if record['codec'] == '_THIN' and kind in _THIN_INTEGERS:
+            continue
+        if _FILLED_PADS.get((record['schema'], record['codec'])) == field[:2]:
+            continue
+        out.append(f'{offset}: {field[:2]}')
+    return sorted(set(out))
+
+
+def _corpus() -> list[dict]:
+    records = []
+    with open(CORPUS) as f:
+        for line in f:
+            if not line.strip() or line.startswith('#'):
+                continue
+            (schema, codec, fv, given, consumed, test) = line.rstrip('\n').split('\t')
+            records.append(
+                {
+                    'schema': schema,
+                    'codec': codec,
+                    'fv': int(fv),
+                    'given': json.loads(given),
+                    'consumed': consumed,
+                    'test': test,
+                }
+            )
+    return records
+
+
+class TestTheMessagesTheDecodersReadRoundTrip(unittest.TestCase):
+    """encode(decode(message)) == message, for the messages the decoders read
+    in the offline suite, the tests' captures among them (#2290). A message
+    may differ from its re-encoding only where a field keeps no bytes by
+    design; its fields must always come back the same."""
+
+    def test_the_corpus_covers_every_two_way_decoder(self):
+        records = _corpus()
+        self.assertGreater(len(records), 500)
+        covered = {r['schema'] for r in records}
+        decoded = {
+            name
+            for name in _schemas()
+            if name not in ONE_WAY and f'{name}_FROM_' in open(tns.__file__).read()
+        }
+        self.assertEqual(decoded - covered, set())
+
+    def test_each_message_comes_back(self):
+        for record in _corpus():
+            with self.subTest(
+                schema=record['schema'], codec=record['codec'], test=record['test']
+            ):
+                (again, values, values_again) = round_trip(record)
+                self.assertTrue(_same(values, values_again), 'its fields changed')
+                self.assertEqual(_unexplained(record, again), [])
 
 
 if __name__ == '__main__':
