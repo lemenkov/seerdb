@@ -6633,7 +6633,16 @@ class TestFv2RefCursor(unittest.TestCase):
             'begin open :1 for select n, v from t2246 order by n; end;', [rc]
         )
         replies = iter(
-            [b'open', self.PROMPT, self.OUT, b'\x09', self.DESCRIBE, self.ROWS, b'\x09']
+            [
+                bytes.fromhex('08010109'),  # OOPEN: 1
+                self.PROMPT,
+                self.OUT,
+                b'\x09',
+                self.DESCRIBE,
+                self.ROWS,
+                b'\x09',
+                b'\x09',
+            ]
         )
         sent = []
         try:
@@ -6655,10 +6664,15 @@ class TestFv2RefCursor(unittest.TestCase):
             [list(r) for r in marker['rows']],
             [[n, f'row {n}'] for n in range(1, 6)],
         )
-        from seerdb.common.tns import encode_o7_close, encode_o7_describe
+        from seerdb.common.tns import (
+            encode_o7_close,
+            encode_o7_describe,
+            encode_o7_free,
+        )
 
         self.assertIn(encode_o7_describe(0, 2), sent)
-        self.assertEqual(sent[-1], encode_o7_close(0, 2))
+        # Closed, then freed, as ojdbc14 does: only closed, it stayed open (#2288).
+        self.assertEqual(sent[-2:], [encode_o7_close(0, 2), encode_o7_free(0, 2)])
 
 
 class TestFv2NestedCursor(unittest.TestCase):
@@ -6723,7 +6737,7 @@ class TestFv2NestedCursor(unittest.TestCase):
             'select o.n, cursor(select i.v from t2254 i where i.n <= o.n'
             ' order by i.n) c from t2254 o order by o.n'
         )
-        replies = iter([b'open', *self.REPLIES])
+        replies = iter([bytes.fromhex('08010109'), *self.REPLIES])  # OOPEN: 1
         sent = []
         try:
             step = next(gen)
@@ -7036,30 +7050,55 @@ class TestFv2CursorCache(unittest.TestCase):
 
         sql = 'insert into t2248 (n, v) values (:1, :2)'
         cache: dict = {}
-        # First run: OOPEN gives 1, which uncached statements re-parse, so the
-        # dialect opens another (2) and parses into it.
+        dialect = Fv2Dialect()  # one per connection, as the connection keeps it
+        # First run: the statement to cache is parsed into the cursor its own
+        # OOPEN gave (2 here).
         (sent, result) = self._drive(
-            Fv2Dialect().execute_dml(sql, [100, 'cached 0'], cache=cache),
-            [self.OOPEN_1, self.OOPEN_2, self.INSERTED, b'\x09'],
+            dialect.execute_dml(sql, [100, 'cached 0'], cache=cache),
+            [self.OOPEN_2, self.INSERTED, b'\x09'],
         )
         self.assertEqual(result[3][0], 1)
         self.assertEqual(list(cache.values()), [2])
-        self.assertEqual(sent[2][3:9].hex(), '028029010201')  # parse into 2
+        self.assertEqual(sent[1][3:9].hex(), '028029010201')  # parse into 2
         # Second run: no OOPEN, no SQL, cursor 2.
         (sent, result) = self._drive(
-            Fv2Dialect().execute_dml(sql, [101, 'cached 1'], cache=cache),
+            dialect.execute_dml(sql, [101, 'cached 1'], cache=cache),
             [self.INSERTED, b'\x09'],
         )
         self.assertEqual(sent[0][3:8].hex(), '0280280102')
         self.assertNotIn(sql.encode(), sent[0])
         self.assertEqual(sent[1], encode_o7_close(0, 2))
-        # DDL flushes the cache and frees the cursor.
+        # DDL flushes the cache and frees the cursor, then runs on the shared
+        # cursor, which its OOPEN opens (1).
         (sent, _) = self._drive(
-            Fv2Dialect().execute_dml('drop table t2248', cache=cache),
+            dialect.execute_dml('drop table t2248', cache=cache),
             [b'\x09', self.OOPEN_1, self.INSERTED, b'\x09'],
         )
         self.assertEqual(sent[0], encode_o7_free(0, 2))
         self.assertEqual(cache, {})
+
+    def test_uncached_statements_share_one_cursor(self):
+        # Each statement sent an OOPEN and parsed on cursor 1 whatever it gave,
+        # so every OOPEN after the first left a cursor open, and a session that
+        # alternated statements ran out at open_cursors (#2288). The shared
+        # cursor is opened once, and is the one the OOPEN gave (5 here).
+        from seerdb.client.dialect import Fv2Dialect
+        from seerdb.common.tns import encode_o7_close
+
+        dialect = Fv2Dialect()
+        (sent, _) = self._drive(
+            dialect.execute_dml('drop table t2248'),
+            [bytes.fromhex('08010509'), self.INSERTED, b'\x09'],
+        )
+        self.assertEqual(sent[0][:2].hex(), '0302')  # OOPEN
+        self.assertEqual(sent[1][3:8].hex(), '0280210105')  # parsed on cursor 5
+        self.assertEqual(sent[2], encode_o7_close(0, 5))
+        (sent, _) = self._drive(
+            dialect.execute_block('begin null; end;'), [self.INSERTED, b'\x09']
+        )
+        self.assertNotIn(bytes.fromhex('0302'), [s[:2] for s in sent])  # no OOPEN
+        self.assertEqual(sent[0][3:7].hex(), '01210105')
+        self.assertEqual(sent[1], encode_o7_close(0, 5))
 
 
 class TestFv2ObjectColumn(unittest.TestCase):

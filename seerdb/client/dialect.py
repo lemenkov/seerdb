@@ -246,6 +246,21 @@ class Fv2Dialect:
     # while the cursor is open (#2259).
     keep_lobs = False
 
+    def __init__(self) -> None:
+        # The server cursor every uncached statement is parsed on, opened once
+        # (#2288). Each statement sent an OOPEN and parsed on cursor 1 whatever
+        # it gave, so every OOPEN after the first left a cursor open, and a
+        # session that alternated statements ran out at open_cursors.
+        self._shared = 0
+
+    def _shared_cursor(self):
+        # The shared cursor, opened by the first statement that needs it.
+        if not self._shared:
+            yield Send(encode_o7_open(0))
+            resp = yield RECV  # OOPEN RPA, the cursor's id
+            self._shared = decode_fv2_opened_cursor(resp[1]) if resp else 0
+        return self._shared
+
     def txn_control(self, statement: str):
         # 9i commits via the modern TTI_COMMIT path (CAP_OWN_TXN absent), so this
         # is never driven; present only to satisfy the Dialect protocol.
@@ -257,13 +272,12 @@ class Fv2Dialect:
         # fetch, close). `fetch` is ignored — the exec loop drains the cursor
         # itself. Returns the same tuple shape as a normal execute response so the
         # cursor / _drain_cursor machinery is unchanged.
-        yield Send(encode_o7_open(0))  # allocate a server cursor
-        yield RECV  # OOPEN RPA (cursor id)
-        yield Send(encode_o7_parse(0, sql, bind))
+        cursor = yield from self._shared_cursor()
+        yield Send(encode_o7_parse(0, sql, bind, Cursor=cursor))
         resp = yield RECV  # parse RPA ack — or an OER
         if resp is not False:  # surface a parse error (e.g. ORA-00942)
             fv2_raise_for_error(resp[1], with_offset=True)
-        (columns, all_rows) = yield from self._drain(1)
+        (columns, all_rows) = yield from self._drain(cursor)
         # call_status 0 + ora_code 0 => _drain_cursor won't issue TTI_FETCHes.
         return (0, 0, 0, (len(all_rows), columns), all_rows, None, None, [], None)
 
@@ -332,11 +346,14 @@ class Fv2Dialect:
         if cache is not None and not is_reusable_dml(sql):
             yield from self.flush_cursors(cache)
         cursor = cache.get(key, 0) if cache is not None and key is not None else 0
-        if not cursor:
+        if not cursor and key is not None:
+            # A statement to cache gets a cursor of its own; the server never
+            # hands out one that is open, so it is not the shared one.
             yield Send(encode_o7_open(0))
             resp = yield RECV  # OOPEN RPA, the cursor's id
-            if key is not None:
-                cursor = yield from self._own_cursor(resp)
+            cursor = decode_fv2_opened_cursor(resp[1]) if resp else 0
+        if not cursor:
+            cursor = yield from self._shared_cursor()
         reexecute = cache is not None and key is not None and key in cache
         yield Send(
             encode_o7_parse(
@@ -345,7 +362,7 @@ class Fv2Dialect:
                 bind,
                 batch,
                 batcherrors,
-                Cursor=cursor or 1,
+                Cursor=cursor,
                 Reexecute=reexecute,
             )
         )
@@ -361,7 +378,7 @@ class Fv2Dialect:
         rowid = None if err_code else decode_fv2_dml_rowid(resp[1])  # #1079
         batch_errors = decode_fv2_batch_errors(resp[1]) if batcherrors else []
         offset = decode_fv2_error_position(resp[1]) if err_code else 0  # #2263
-        yield Send(encode_o7_close(0, cursor or 1))  # still parsed, if cached
+        yield Send(encode_o7_close(0, cursor))  # still parsed, if cached
         yield RECV  # close STA
         status: tuple = (0, err_code, 0, (row_count, None), [], message, rowid)
         warnings = decode_fv2_warn_flags(resp[1])  # cursor.warning (#2262)
@@ -369,22 +386,12 @@ class Fv2Dialect:
             yield from self._keep(cache, key, cursor, failed=bool(err_code))
         return (*status, batch_errors, None, offset, warnings)
 
-    def _own_cursor(self, opened):
-        # A cursor for a statement to cache: the one OOPEN gave, unless that is
-        # 1, which every uncached statement re-parses -- then open another.
-        cursor = decode_fv2_opened_cursor(opened[1]) if opened else 0
-        if cursor == 1:
-            yield Send(encode_o7_open(0))
-            resp = yield RECV
-            cursor = decode_fv2_opened_cursor(resp[1]) if resp else 0
-        return cursor
-
     def _keep(self, cache: dict, key: tuple, cursor: int, failed: bool):
         # Remember a cached statement's cursor (LRU, the 10g+ cap), or forget it
         # if its execute failed: the server has dropped it (#709). An evicted
         # cursor is freed, so its slot comes back.
         cache.pop(key, None)
-        if failed or cursor <= 1:
+        if failed or not cursor or cursor == self._shared:
             return
         cache[key] = cursor
         while len(cache) > _FV2_CURSOR_CACHE_MAX:
@@ -429,9 +436,8 @@ class Fv2Dialect:
             _block_input(b) for b in bind if not isinstance(b, Var) or b.has_value
         ]
         out_positions = [i for i, b in enumerate(bind) if isinstance(b, Var)]
-        yield Send(encode_o7_open(0))
-        yield RECV  # OOPEN RPA
-        yield Send(encode_o7_block(0, sql, bind))
+        cursor = yield from self._shared_cursor()
+        yield Send(encode_o7_block(0, sql, bind, Cursor=cursor))
         resp = yield RECV
         if resp is False:
             raise Exception('Connection closed during 9i PL/SQL block')
@@ -465,15 +471,18 @@ class Fv2Dialect:
         (out_values, row_count, err_code) = decode_fv2_block_out(
             packet, len(out_positions)
         )
-        yield Send(encode_o7_close(0))
+        yield Send(encode_o7_close(0, cursor))
         yield RECV  # close STA
         _raise_terminal(err_code)
         # A REF CURSOR comes back as its server cursor's id. Its rows are read
         # here, by that id, and travel with the marker the cursor wraps (#2246).
+        # Then it is freed, as ojdbc14 frees it: only closed, every call that
+        # returned one left a cursor open (#2288).
         for i, pos in enumerate(out_positions):
             if _is_cursor_var(bind[pos]) and out_values[i]:
                 cursor_id = decode_ub4(out_values[i])[0]
                 (columns, rows) = yield from self._drain(cursor_id)
+                yield from self._free(cursor_id)
                 out_values[i] = _cursor_marker(cursor_id, columns, rows)
         # The prompt's masks are the 10g+ IOV's (OUT 0x10, IN 0x20), and they
         # are what cursor.bind_directions reports, for a block whose binds are

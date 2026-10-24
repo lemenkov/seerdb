@@ -2962,13 +2962,12 @@ class CursorIntegration(_IntegrationBase):
         # More statements than the beds' open_cursors (300), of each kind that
         # takes a cursor on 8i: a query, a block with and without an OUT bind, a
         # refused query, a COMMIT. 8i kept every one open and the session failed
-        # with ORA-01000 (#2286); before that, cursor ids past 255 cut the next
-        # query to its first row (#2285), whose byte order the offline test
-        # pins now that closed cursors keep the ids low.
+        # with ORA-01000 (#2286), and 9i did too when they alternated (#2288).
+        # Before that, cursor ids past 255 cut the next query to its first row
+        # (#2285), whose byte order the offline test pins now that closed
+        # cursors keep the ids low.
         from seerdb.common.exceptions import DatabaseError
 
-        if self.conn.version and self.conn.version.startswith('9.'):
-            self.skipTest('9i runs out of cursors when statements alternate (#2288)')
         out = self.cur.var(int)
         for n in range(80):
             self.cur.execute('SELECT 1 FROM dual')
@@ -2985,6 +2984,18 @@ class CursorIntegration(_IntegrationBase):
             # gives one row on 8i.
             self.cur.execute('SELECT object_id FROM all_objects WHERE rownum <= 50')
             self.assertEqual(len(set(self.cur.fetchall())), 50)
+
+    def test_a_refcursor_per_call_outlasts_open_cursors(self):
+        # A block that returns a REF CURSOR, more times than open_cursors: 9i
+        # closed each one after reading it but never freed it, so every call
+        # left a cursor open (#2288). From 10g the client never closes one at
+        # all (#2291), so for now this runs on 9i alone.
+        if not (self.conn.version or '').startswith('9.'):
+            self.skipTest('a REF CURSOR is never closed from 10g on (#2291)')
+        for n in range(320):
+            rc = self.cur.var(seerdb.DB_TYPE_CURSOR)
+            self.cur.execute('BEGIN OPEN :1 FOR SELECT :2 FROM dual; END;', [rc, n])
+            self.assertEqual(rc.getvalue().fetchall(), [(n,)])
 
     def test_the_version_is_the_release_the_banner_names(self):
         # Every tier reports its release, 8i and 9i too: 8i's login reply
@@ -3786,8 +3797,10 @@ class CursorIntegration(_IntegrationBase):
 
     def test_executemany_single_round_trip(self):
         # The whole batch must go in one server round trip, not one per row:
-        # as many sends as one row's execute takes -- one on 10g+, and on 9i
-        # the same cursor open, call and close a single DML makes (#2245).
+        # no more sends than one row's execute takes -- one on 10g+, and on 9i
+        # the call and close a single DML makes (#2245), and the OOPEN that
+        # gives a cacheable single row a cursor of its own, which the batch,
+        # not cached, does without (#2288).
         # Count only TNS_DATA sends: under XE's logon-storm throttle the server
         # can inject a break/marker mid-response, and the driver's marker ack is
         # an extra (non-data) send that would otherwise make this flake.
@@ -3812,7 +3825,7 @@ class CursorIntegration(_IntegrationBase):
             )
         finally:
             _c.OracleConnect.send = orig
-        self.assertEqual(sends[0], single)
+        self.assertLessEqual(sends[0], single)
         self.assertLessEqual(single, 3)
         self.assertEqual(self.cur.rowcount, 50)
 

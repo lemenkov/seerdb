@@ -12652,8 +12652,9 @@ def encode_o7_parse(
     if BatchErrors:
         Opt |= TNS_EXEC_OPTION_BATCH_ERRORS
     # `Cursor` is the server cursor the call names, the ub4 after the option
-    # word: 1 for every statement seerdb does not cache, which re-parses it,
-    # or the one OOPEN gave a cached statement (#2261). Re-executing that one
+    # word: the session's shared one for every statement seerdb does not cache,
+    # which re-parses it (#2288), or the one OOPEN gave a cached statement
+    # (#2261). Re-executing that one
     # clears the parse bit (0x8029 -> 0x8028) and sends no SQL, as ojdbc14's
     # statement cache does: the server keeps the parse and the defines.
     if Reexecute:
@@ -12687,7 +12688,9 @@ def encode_o7_parse(
     return Out
 
 
-def encode_o7_block(Seq: int, Sql: str, Binds: list | None = None) -> bytes:
+def encode_o7_block(
+    Seq: int, Sql: str, Binds: list | None = None, Cursor: int = 1
+) -> bytes:
     # Anonymous PL/SQL block parse-execute over TTI_ALL7 (#102, PROTOCOL §19.6).
     # Same framing as encode_o7_parse EXCEPT the option word: a block uses
     # `01 21` (no binds) / `02 04 29` (binds) where a SELECT/DML uses
@@ -12696,14 +12699,16 @@ def encode_o7_block(Seq: int, Sql: str, Binds: list | None = None) -> bytes:
     # bind OACs are sent here but the VALUES are NOT appended inline; the server
     # answers with a "send the binds" prompt and the caller then sends the
     # values as a standalone RXD (encode_tokens_rxd). Verified byte-for-byte
-    # against cap_9i_plsql_{noarg,inbind}.log.
+    # against cap_9i_plsql_{noarg,inbind}.log. `Cursor` is the server cursor,
+    # an sb4 after the option word, then the SQL's pointer, as in a parse.
     Binds = Binds or []
     SqlBytes = Sql.encode('utf-8')
-    OptBytes = bytes([0x02, 0x04, 0x29]) if Binds else bytes([0x01, 0x21])
+    Opt = 0x0429 if Binds else 0x21
     Out = (
         bytes([TTI_FUN, TTI_ALL7, Seq])
-        + OptBytes
-        + bytes([0x01, 0x01, 0x01])
+        + encode_sb4(Opt)
+        + encode_sb4(Cursor)
+        + bytes([0x01])  # the SQL's pointer
         + encode_sb4(_o7_sql_length(Sql))
         + _O7_PARSE_MID
         + _o7_bind_count(Binds)
