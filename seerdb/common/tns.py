@@ -13120,7 +13120,7 @@ def _fv2_name(Rest: bytes) -> tuple[str | None, bytes]:
 def decode_fv2_describe(Data: bytes) -> list[dict]:
     # Parse the TTI_RPA (0x08) answering the 0x62 describe-columns call into a
     # list of column dicts (docs/PROTOCOL.md §19.1). Layout:
-    #   08 01 <numcols> then per column:
+    #   08 <ub4 numcols> then per column:
     #     <OAC-fv2> null_ok(1B) namelen_bytes(1B) ub4(namelen_chars) DALC(name) 00 00
     #
     # The first byte after the OAC is null_ok (0x00 = NOT NULL, 0x01 = nullable),
@@ -13132,8 +13132,11 @@ def decode_fv2_describe(Data: bytes) -> list[dict]:
     # slipping the whole column stream and garbling the name (b'\x08USERNAM') — and
     # a multi-column NOT-NULL select then fails the fetch with ORA-03115. Read
     # null_ok + the 1-byte byte-length explicitly, then the genuine ub4 char-length.
-    NumCols = Data[2]
-    Rest = Data[3:]
+    # The column count is a ub4 after the RPA token: `01 <n>` up to 255, and
+    # `02 01 2c` for 300, as ojdbc14 reads it. Read as the byte after `08 01`,
+    # a 300-column query described one column, and its execute then defined
+    # one, which 9i refused with ORA-03115 (#2306).
+    (NumCols, Rest) = decode_ub4(Data[1:])
     Columns = []
     for _ in range(NumCols):
         (Col, Rest) = _decode_oac_fv2(Rest)
