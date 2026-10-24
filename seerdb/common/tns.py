@@ -1801,11 +1801,69 @@ _O7_DESCRIBE: wire_schema.Schema = (
     ('n4', 'count'),
     ('each', 'columns', 'count', _O7_DESCRIBE_COLUMN),
 )
+# Oracle 9i's short status (PROTOCOL.md §19.2, #2284): the 10g+ OER without its
+# call status and sequence number. The head runs to the rowid of the row a DML
+# touched (#1079): row count, ORA code, the two array-error fields, cursor id,
+# the error's offset in the SQL (#2263), then the SQL type, fatal flag, flags --
+# a ub2, `00` when zero, as at 10g and 11g (#1995) -- cursor options, UPI
+# parameter and warning flags, 0x20 for an object that compiled with errors
+# (#2262), and the rowid: data object, file, a reserved byte, block, slot.
+_O7_STATUS_HEAD: wire_schema.Schema = (
+    ('const', bytes([TTI_OER])),
+    ('n4', 'rows'),
+    ('n4', 'code'),
+    ('n4', 'array_error'),
+    ('n4', 'array_error_2'),
+    ('n4', 'cursor'),
+    ('n4', 'position'),
+    ('u8', 'sql_type'),
+    ('u8', 'fatal'),
+    ('n2', 'flags'),
+    ('u8', 'cursor_options'),
+    ('u8', 'upi_param'),
+    ('u8', 'warnings'),
+    ('n4', 'rowid_object'),
+    ('n4', 'rowid_file'),
+    ('pad', 1),
+    ('n4', 'rowid_block'),
+    ('n4', 'rowid_slot'),
+)
+# ... and the rest: OS error, statement and call numbers, padding, the
+# iterations, the oerrdd, the arrays a `batcherrors` call collects -- each code
+# and offset array a count and one value packing that many ub4s, the messages a
+# count, an indicator and each message's length, text and two bytes (#2247) --
+# and, when the code is set, the server's message, ORA-01403's too, which the
+# server writes in chunks of 64 bytes past 64, as it writes text. Read from
+# 57 live 9.2.0.4 statuses with nothing left over.
+_O7_STATUS_TAIL: wire_schema.Schema = (
+    ('n4', 'os_error'),
+    ('u8', 'statement'),
+    ('u8', 'call'),
+    ('n2', 'padding'),
+    ('n4', 'iterations'),
+    ('n4', 'oerrdd_length'),
+    ('when', 'oerrdd_length', (('value', 'oerrdd'),)),
+    ('n4', 'batch_code_count'),
+    ('when', 'batch_code_count', (('value', 'batch_codes'),)),
+    ('n4', 'batch_offset_count'),
+    ('when', 'batch_offset_count', (('value', 'batch_offsets'),)),
+    ('n4', 'batch_message_count'),
+    ('when', 'batch_message_count', (('u8', 'batch_message_indicator'),)),
+    (
+        'each',
+        'batch_messages',
+        'batch_message_count',
+        (('n4', 'length'), ('when', 'length', (('chr', 'text'),)), ('pad', 2)),
+    ),
+    ('when', 'code', (('chr', 'message'),)),
+)
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
 _OAC_FROM_THIN = wire_schema.compile_decoder(_OAC, _THIN)
 _OAC_FROM_OCI = wire_schema.compile_decoder(_OAC, _OCI)
 _O7_OAC_THIN = wire_schema.compile_encoder(_O7_OAC, _THIN)
 _O7_DESCRIBE_FROM_THIN = wire_schema.compile_decoder(_O7_DESCRIBE, _THIN)
+_O7_STATUS_HEAD_FROM_THIN = wire_schema.compile_decoder(_O7_STATUS_HEAD, _THIN)
+_O7_STATUS_TAIL_FROM_THIN = wire_schema.compile_decoder(_O7_STATUS_TAIL, _THIN)
 _AUTH_HEAD_FROM_THIN = wire_schema.compile_decoder(_AUTH_HEAD, _THIN)
 _AUTH_HEAD_FROM_OCI = wire_schema.compile_decoder(_AUTH_HEAD, _OCI)
 _AUTH_PAIR_OCI = wire_schema.compile_encoder(_AUTH_PAIR, _OCI)
@@ -13930,38 +13988,53 @@ def decode_8i_dcb_describe(Data: bytes) -> tuple[list[dict], bytes]:
     return (Columns, Data[Off:])
 
 
-def _decode_fv2_oer(Rest: bytes) -> tuple[int, int, bytes]:
-    # Minimal fv2 (9i) OER: the short pre-10g form. The exec+fetch terminates
-    # with `04 <ub4 rows-this-fetch> <ub4 ORA code> …`; ORA-01403 ("no data
-    # found") is the end-of-fetch marker, 0 is success (PROTOCOL.md §19.2). We
-    # only need the status + error code; the message DALC trailing the fixed
-    # middle is left to from_ora_code() in the caller.
-    Rest = Rest[1:]  # OER token
-    (RowsThisFetch, Rest) = decode_ub4(Rest)
-    (ErrCode, Rest) = decode_ub4(Rest)
-    return (RowsThisFetch, ErrCode, Rest)
+def _o7_status(Data: bytes) -> dict | None:
+    # The fields of a 9i reply's short status, from `_O7_STATUS_HEAD` and
+    # `_O7_STATUS_TAIL`, after any RPA before it, or None for a reply without one
+    # or too short to hold its head -- neither a rowid nor batch errors is worth
+    # failing a DML over. The tail counts only when it ends where the status
+    # does; otherwise the head stands alone, and only a batch-errors call and an
+    # error's message need what follows.
+    Rest = _skip_fv2_rpa(Data) if Data else b''
+    if not Rest or Rest[0] != TTI_OER:
+        return None
+    try:
+        (Status, Rest) = _O7_STATUS_HEAD_FROM_THIN(Rest)
+    except (IndexError, Truncated, DataError):
+        return None
+    try:
+        (Tail, Rest) = _O7_STATUS_TAIL_FROM_THIN(Rest, Status)
+    except (IndexError, Truncated, DataError):
+        return Status
+    if not Rest:
+        Status.update(Tail)
+    return Status
+
+
+def _fv2_message(Text: bytes) -> str | None:
+    return bytes(Text).decode('utf-8', errors='replace').rstrip('\x00').rstrip() or None
 
 
 def decode_fv2_oer_error(Packet: bytes) -> tuple[int, str | None]:
     # If `Packet` is a 9i OER token, return its (ora_code, message); otherwise
     # (0, None). Used to surface a parse/execute-time server error (e.g.
     # ORA-00942) with the server's own text instead of letting the caller march
-    # on into a desync (#102). The human-readable "ORA-NNNNN: ..." is the
-    # trailing length-prefixed string; the fixed middle fields between the error
-    # code and it are version-specific, so locate the message as the final DALC
-    # rather than walking every field.
+    # on into a desync (#102). The message is the status's last field, read with
+    # the rest of it (`_O7_STATUS_TAIL`); a long one comes in the 0xFE chunked
+    # form, whose chunk lengths are not text (#810).
     if not Packet or Packet[0] != TTI_OER:
         return (0, None)
-    (_Rows, ErrCode, Rest) = _decode_fv2_oer(Packet)
-    # The message is the final DALC, so find the offset whose DALC consumes
-    # exactly the rest of the packet. Reading the length byte directly instead
-    # would only ever find a message short enough to be one chunk: anything
-    # longer is written in the 0xFE chunked form (encode_chr's mirror), where
-    # the per-chunk length bytes are not part of the text. That is why a long
-    # server message used to come back with stray characters spliced into it
-    # (a chunk length of 64 read as '@'), truncated at the front, or -- when no
-    # single byte happened to fit -- lost entirely, leaving only "ORA-NNNNN"
-    # from the caller's fallback. PL/SQL errors are routinely that long (#810).
+    Status = _o7_status(Packet)
+    if Status is not None and 'message' in Status:
+        return (Status['code'], _fv2_message(Status['message']))
+    return _scan_fv2_message(Packet)
+
+
+def _scan_fv2_message(Packet: bytes) -> tuple[int, str | None]:
+    # A status the schema does not read whole: its code, and its message found
+    # as the final DALC, the offset whose DALC consumes exactly the rest of the
+    # packet -- the reading before #2284, kept for a reply that ends early.
+    (ErrCode, Rest) = decode_ub4(decode_ub4(Packet[1:])[1])
     Fallback = None
     for I in range(len(Rest)):
         if not Rest[I]:
@@ -14096,9 +14169,9 @@ def decode_fv2_exec_status(Data: bytes, Columns: list) -> tuple[list, int, str |
                     Row.append(decode_value(Col, Val))
             Rows.append(Row)
         elif Token == TTI_OER:
-            (_, ErrCode, _) = _decode_fv2_oer(Rest)
-            if ErrCode not in (0, ORA_NO_DATA_FOUND):
-                Message = decode_fv2_oer_error(Rest)[1]
+            (ErrCode, Message) = decode_fv2_oer_error(Rest)
+            if ErrCode in (0, ORA_NO_DATA_FOUND):
+                Message = None
             break
         else:
             break
@@ -14110,13 +14183,8 @@ def decode_fv2_dml_response(Data: bytes) -> tuple[int, int]:
     # statement; the response is an RPA piggyback followed by the short OER
     # whose first field is the affected-row count and second the ORA code
     # (0 = success). Returns (rowcount, ora_code). #101.
-    if not Data:
-        return (0, 0)
-    Rest = _skip_fv2_rpa(Data)
-    if Rest and Rest[0] == TTI_OER:
-        (RowCount, ErrCode, _) = _decode_fv2_oer(Rest)
-        return (RowCount, ErrCode)
-    return (0, 0)
+    Status = _o7_status(Data)
+    return (0, 0) if Status is None else (Status['rows'], Status['code'])
 
 
 def decode_fv2_dml_rowid(Data: bytes) -> str | None:
@@ -14175,48 +14243,49 @@ def decode_fv2_batch_errors(Data: bytes) -> list[dict]:
 
 
 def _fv2_status(Data: bytes) -> dict | None:
-    # The fields of a 9i reply's short status, or None for a reply without one
-    # or too short to hold them -- neither a rowid nor batch errors is worth
-    # failing a DML over. The 10g+ OER without its call status and sequence
-    # (PROTOCOL.md 19.2): row count, ORA code, the two array-error fields,
-    # cursor id and error position (ub4 each), six single bytes -- the SQL type
-    # first -- the physical rowid (object, file, a reserved byte, block, slot),
-    # OS error, statement and call numbers, padding, iterations, the oerrdd,
-    # then the batch-error arrays (#1079, #2247).
-    Rest = _skip_fv2_rpa(Data) if Data else b''
-    if not Rest or Rest[0] != TTI_OER:
+    # The status fields the 9i DML readers above report, from `_o7_status`.
+    Status = _o7_status(Data)
+    if Status is None:
         return None
-    try:
-        (_, ErrCode, Rest) = _decode_fv2_oer(Rest)
-        for _ in range(3):  # array elem error x2, cursor id
-            (_, Rest) = decode_ub4(Rest)
-        (Position, Rest) = decode_ub4(Rest)  # the error's offset in the SQL
-        # SQL type, fatal, flags, cursor opts, UPI param, then the warning
-        # flags: 0x20 says a CREATE made an object that compiled with errors,
-        # as on 10g+ (#993). Captured on 9.2.0.4: `18 00 00 00 00 21` (#2262).
-        Warnings = Rest[5] if len(Rest) > 5 else 0
-        Rest = Rest[6:]
-        (Obj, Rest) = decode_ub4(Rest)
-        (File, Rest) = decode_ub4(Rest)
-        Rest = Rest[1:]  # reserved byte
-        (Block, Rest) = decode_ub4(Rest)
-        (Slot, Rest) = decode_ub4(Rest)
-    except (IndexError, Truncated, DataError):
-        return None
-    Status: dict = {'code': ErrCode, 'object': Obj, 'file': File, 'block': Block}
-    Status.update(slot=Slot, position=Position, warnings=Warnings, batch_errors=[])
-    try:
-        (_, Rest) = decode_ub4(Rest)  # os error
-        Rest = Rest[2:]  # statement #, call #
-        (_, Rest) = decode_ub4(Rest)  # padding
-        (_, Rest) = decode_ub4(Rest)  # iterations
-        Rest = _skip_bytes_with_length(Rest)  # oerrdd
-        (Status['batch_errors'], _) = _read_batch_errors(Rest)
-    except (IndexError, Truncated, DataError):
-        # A status that ends early still has its rowid: older replies stop
-        # after it, and only a batch-errors call needs what follows.
-        pass
-    return Status
+    return {
+        'code': Status['code'],
+        'object': Status['rowid_object'],
+        'file': Status['rowid_file'],
+        'block': Status['rowid_block'],
+        'slot': Status['rowid_slot'],
+        'position': Status['position'],
+        'warnings': Status['warnings'],
+        'batch_errors': _o7_batch_errors(Status),
+    }
+
+
+def _o7_batch_errors(Status: dict) -> list[dict]:
+    # The per-row errors of a `batcherrors` call (#2247), from its status's
+    # three arrays: error i hit row offsets[i] with codes[i] and messages[i].
+    Codes = _o7_ub4s(Status.get('batch_codes', b''), Status.get('batch_code_count', 0))
+    Offsets = _o7_ub4s(
+        Status.get('batch_offsets', b''), Status.get('batch_offset_count', 0)
+    )
+    Messages = [
+        _fv2_message(M.get('text', b'')) for M in Status.get('batch_messages', [])
+    ]
+    return [
+        {
+            'offset': Offsets[I] if I < len(Offsets) else None,
+            'code': Codes[I] if I < len(Codes) else None,
+            'message': Messages[I] if I < len(Messages) else None,
+        }
+        for I in range(max(len(Offsets), len(Codes), len(Messages)))
+    ]
+
+
+def _o7_ub4s(Blob: bytes, Count: int) -> list[int]:
+    # The `Count` ub4s a batch-error array's value packs.
+    Values = []
+    for _ in range(Count):
+        (Value, Blob) = decode_ub4(Blob)
+        Values.append(Value)
+    return Values
 
 
 def _skip_fv2_rpa(Data: bytes) -> bytes:

@@ -136,7 +136,10 @@ class _Values:
                     self.fill(field[2], values)
                 continue
             if kind == 'each':
-                count = self._pick([0, 1, 2])
+                # The count chosen ahead, which a field read before the items
+                # may test: 9i's batch messages have an indicator byte before
+                # them only when there are any (#2284).
+                count = values.get(field[2], self._pick([0, 1, 2]))
                 values[field[2]] = count
                 items = []
                 for _ in range(count):
