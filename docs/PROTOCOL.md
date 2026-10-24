@@ -5673,8 +5673,10 @@ rowid's text, since declared as type 11 / 208 the server answers with a garbled
 error, #1399). The server infers each bind's direction from the
 block and signals it in the prompt; the round-trip then differs by direction:
 
-- **Bind prompt** `0b 05 01 <numbinds> 00 01 01 00` + a direction section — one
-  mask per bind, `0x20` = IN, `0x10` = OUT, `0x30` = IN OUT. Its length varies
+- **Bind prompt** `0b 05 <numbinds> 01 01 00` + a direction section — one
+  mask per bind, `0x20` = IN, `0x10` = OUT, `0x30` = IN OUT. `<numbinds>` is two
+  ub4s, the count's low byte and then its high byte: `01 02 00` for 2 binds,
+  `01 2c 01 01` for 300, `01 08 01 02` for 520 (#2311). Its length varies
   (the live server pads with a leading `00`), so the driver scans past the 8-byte
   fixed prefix to the first RXD/RPA token rather than computing it
   (`strip_fv2_bind_prompt`).
@@ -6036,8 +6038,9 @@ comes back in the reply's RXD, both in the same single round trip. Its prompt
 direction is `0x30`. No extra machinery — the inline value path and the OUT-value
 decode above already cover it.
 
-8i's prompt carries the same masks, but its bind count sits at offset **2**
-(`0b 05 <n> 00 00 00 01` then a longer zero pad), not 9i's offset 3: captured
+8i's prompt carries the same masks and the same two count fields, each a 2-byte
+little-endian value (`0b 05 <low> 00 <high> 00 01 00` then a longer zero pad;
+300 binds are `2c 00 01 00`, #2311): captured
 `0b0502000000010000…0010200702c147…` is OUT, IN, then the one OUT value. A `Var`
 the block only reads gets no value back here either, so the driver takes the OUT
 positions from the masks (#1242).

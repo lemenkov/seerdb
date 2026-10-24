@@ -2983,6 +2983,21 @@ class CursorIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.fetchall(), [(300,)])
 
+    def test_a_block_of_300_binds_follows_their_directions(self):
+        # A Var the block only reads is an IN bind. 9i and 8i read the bind
+        # prompt's count as its low byte, so past 255 binds the client guessed
+        # the directions, took that Var for an OUT one, and shifted the values
+        # back: 9i gave v 303 and r garbage, 8i a malformed NUMBER (#2311).
+        v = self.cur.var(int)
+        v.setvalue(0, 5)
+        r = self.cur.var(int)
+        ones = ' + '.join(f':{i}' for i in range(3, 301))
+        self.cur.execute(
+            f'BEGIN IF :1 IS NULL THEN NULL; END IF; :2 := :1 + {ones}; END;',
+            [v, r] + [1] * 298,
+        )
+        self.assertEqual((v.getvalue(), r.getvalue()), (5, 303))
+
     def test_a_session_outlasts_open_cursors(self):
         # More statements than the beds' open_cursors (300), of each kind that
         # takes a cursor on 8i: a query, a block with and without an OUT bind, a

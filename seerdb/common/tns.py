@@ -14236,7 +14236,7 @@ def _skip_fv2_rpa(Data: bytes) -> bytes:
 
 
 # Token that opens the 9i bind-values prompt the server sends after a PL/SQL
-# block parse-execute carrying binds: `0b 05 01 <numbinds> 00 01 01 00` then one
+# block parse-execute carrying binds: `0b 05 <numbinds> 01 01 00` then one
 # direction byte per bind (0x20 = IN, 0x10 = OUT, 0x30 = IN OUT). #102.
 _FV2_BIND_PROMPT = 0x0B
 
@@ -14246,7 +14246,7 @@ def strip_fv2_bind_prompt(Data: bytes) -> bytes:
     # (the OUT-value RXD + RPA + OER). A pure-OUT block's reply packs the prompt,
     # the return values and the call status together; an IN / IN OUT block sends
     # the prompt in its own packet (consumed before the values are sent), so this
-    # is a no-op there. The prompt is `0b 05 01 <numbinds> 00 01 01 00` then a
+    # is a no-op there. The prompt is `0b 05 <numbinds> 01 01 00` then a
     # direction section (bytes 0x00 / 0x10 / 0x20 / 0x30 — IN/OUT/IN OUT masks
     # and padding) whose exact length varies, so rather than computing it we scan
     # past the 8-byte fixed prefix to the first RXD (07) or RPA (08) token — the
@@ -14264,21 +14264,27 @@ FV2_BIND_OUT = 0x10
 FV2_BIND_IN = 0x20
 
 
-def decode_fv2_bind_directions(Data: bytes, CountAt: int = 3) -> list[int] | None:
+def decode_fv2_bind_directions(Data: bytes, O8i: bool = False) -> list[int] | None:
     """The direction of each bind, from a 9i or 8i bind prompt, or None if `Data`
     does not open with one (#1242).
 
-    The 9i prompt is `0b 05 01 <n> 00 01 01 00`, padding, then one mask per bind
-    in bind order: 0x10 OUT, 0x20 IN, 0x30 IN OUT (PROTOCOL §19.7). Captured:
-    `0b0501020001010000001020` is OUT, IN. 8i's is `0b 05 <n> 00 00 00 01` and
-    more padding before the same masks, so its count sits at offset 2
-    (`CountAt`). The masks are the last `n` bytes before the first RXD / RPA,
-    or the end of the prompt, since the padding is what varies; a mask is never
-    either token.
+    The 9i prompt is `0b 05`, the bind count, `01 01 00`, padding, then one mask
+    per bind in bind order: 0x10 OUT, 0x20 IN, 0x30 IN OUT (PROTOCOL §19.7).
+    Captured: `0b0501020001010000001020` is OUT, IN. The count is two fields,
+    its low byte and then its high byte, each a ub4 on 9i (`01 02`, `00`) and a
+    2-byte little-endian field on 8i (`02 00`, `00 00`, then `01 00` and more
+    padding). Read as the low byte alone, a block of 256 binds or more lost its
+    directions and fell back to guessing them (#2311). The masks are the last
+    `n` bytes before the first RXD / RPA, or the end of the prompt, since the
+    padding is what varies; a mask is never either token.
     """
     if len(Data) < 8 or Data[0] != _FV2_BIND_PROMPT:
         return None
-    Count = Data[CountAt]
+    if O8i:
+        Count = Data[2] | Data[4] << 8
+    else:
+        (Low, Rest) = decode_ub4(Data[2:])
+        Count = Low | decode_ub4(Rest)[0] << 8
     End = 8
     while End < len(Data) and Data[End] not in (TTI_RXD, TTI_RPA):
         End += 1
