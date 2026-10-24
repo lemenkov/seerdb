@@ -6641,6 +6641,26 @@ class TestO8iOsesskeyMessages(unittest.TestCase):
             ):
                 self.assertIn(field + bytes(4) + b'\x08', message)
 
+    def test_non_ascii_sql_text_is_sent_as_counted(self):
+        # The text rides as the Latin-1 bytes its length counts: re-encoded as
+        # UTF-8, 'caf\u00e9' went as 5 bytes under a count of 4 (#2276).
+        from seerdb.common.tns import encode_8i_oall8_query, encode_8i_sql_text
+
+        sql = encode_8i_sql_text("select 'caf\u00e9' from dual")
+        self.assertEqual(sql, b"select 'caf\xe9' from dual")
+        message = encode_8i_oall8_query(1, sql)
+        self.assertIn(b'\x01' + len(sql).to_bytes(4, 'little'), message)
+        self.assertIn(bytes([len(sql)]) + sql + b'\x01', message)
+
+    def test_a_character_latin1_cannot_hold_is_replaced(self):
+        # As the 9i server replaces it, not a UnicodeEncodeError (#2276).
+        from seerdb.common.tns import encode_8i_sql_text
+
+        self.assertEqual(
+            encode_8i_sql_text("select N'\u017e\u00e1ba' from dual"),
+            b"select N'\xbf\xe1ba' from dual",
+        )
+
     def test_parse_auth_sesskey(self):
         from binascii import hexlify
 

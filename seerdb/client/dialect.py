@@ -62,6 +62,7 @@ from seerdb.common.tns import (
     encode_8i_oall8_dml,
     encode_8i_oall8_fetch,
     encode_8i_oall8_query,
+    encode_8i_sql_text,
     encode_o7_bfile_close,
     encode_o7_bfile_open,
     encode_o7_block,
@@ -631,7 +632,9 @@ class O8iDialect:
         # describe then a 9i-style RXH/RXD row stream. Row values are latin-1
         # (WE8ISO8859P1); the column charset drives decoding. Returns the same
         # 9-tuple as Fv2Dialect.execute_query so the cursor path is unchanged.
-        yield Send(encode_8i_oall8_query(self._next_seq(), sql.encode('latin-1'), bind))
+        yield Send(
+            encode_8i_oall8_query(self._next_seq(), encode_8i_sql_text(sql), bind)
+        )
         resp = yield RECV
         if resp is False:
             raise Exception('Connection closed during 8i query response')
@@ -749,7 +752,7 @@ class O8iDialect:
         stmt_type = o8i_stmt_type(sql.strip().upper())
         yield Send(
             encode_8i_oall8_dml(
-                self._next_seq(), sql.encode('latin-1'), stmt_type, bind
+                self._next_seq(), encode_8i_sql_text(sql), stmt_type, bind
             )
         )
         received = yield RECV
@@ -773,7 +776,7 @@ class O8iDialect:
         stmt_type = o8i_stmt_type(sql.strip().upper())
         yield Send(
             encode_8i_oall8_dml(
-                self._next_seq(), sql.encode('latin-1'), stmt_type, bind
+                self._next_seq(), encode_8i_sql_text(sql), stmt_type, bind
             )
         )
         received = yield RECV
@@ -800,7 +803,7 @@ class O8iDialect:
         # OALL8 as ordinary statements (§19.12, statement type 0).
         yield Send(
             encode_8i_oall8_dml(
-                self._next_seq(), statement.encode('latin-1'), O8I_STMT_TXN
+                self._next_seq(), encode_8i_sql_text(statement), O8I_STMT_TXN
             )
         )
         received = yield RECV

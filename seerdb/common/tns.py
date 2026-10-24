@@ -13296,7 +13296,11 @@ def _encode_8i_oall8(Seq: int, Sql: bytes, StmtType: int, Binds: list) -> bytes:
             + bytes([0x01, 0x0C, 0, 0, 0, 0, 0x01, 0, 0, 0, 0, 0x01, 0, 0, 0, 0])
             + Al8
             + bytes([0x01])
-            + encode_chr(Sql.decode('latin-1'))  # SQL text (chunked if > 64 B)
+            # The SQL text (chunked past 64 bytes), as the bytes counted above:
+            # handed a str, encode_chr would re-encode it as UTF-8, and a Latin-1
+            # character's two bytes made the text one longer than its count
+            # (ORA-00942, #2276).
+            + encode_chr(Sql)
             + bytes([0x01, 0, 0, 0, ExecFlag])
             + bytes(23)
             + bytes([StmtType])  # trailer +28: statement type
@@ -13324,6 +13328,15 @@ def _encode_8i_oall8(Seq: int, Sql: bytes, StmtType: int, Binds: list) -> bytes:
         return Message
     finally:
         _ENCODE_FIELD_VERSION.reset(Token)
+
+
+def encode_8i_sql_text(Sql: str) -> bytes:
+    """A statement's text as 8i takes it: WE8ISO8859P1, the session's charset.
+
+    A character it cannot hold goes as the charset's replacement character,
+    the inverted question mark, as the 9i server puts one for it (`žába`
+    is `¿ába` there), rather than failing in the client (#2276)."""
+    return ''.join(C if ord(C) < 0x100 else '\u00bf' for C in Sql).encode('latin-1')
 
 
 def encode_8i_oall8_query(Seq: int, Sql: bytes, Binds: list | None = None) -> bytes:
