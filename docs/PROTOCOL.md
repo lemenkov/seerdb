@@ -5526,8 +5526,22 @@ same fields as 10g+: `ub4` data object, `ub4` relative file, one reserved byte,
 04 01 01 00 00 00 01 01 01 0c       OER: rows 1, ORA 0, 0, 0, cursor 1, errpos 12
 02 00 00 00 00 00                   command type INSERT + five flag bytes
 03 01 66 23 01 01 00 02 b9 12 01 02 rowid: object, file, reserved, block, slot
-…                                   (a fixed-width copy of the rowid follows)
+…                                   (the rest of the status, below)
 ```
+
+The third of the six single bytes is a `ub2` flags field (`00` when zero), as at
+10g and 11g (#1995); the sixth is the warning flags, `0x20` for an object that
+compiled with errors (#2262). After the rowid come the OS error (`ub4`), the
+statement and call numbers (a byte each), padding (`ub2`), the successful
+iterations (`ub4`), the oerrdd -- a `ub4` length and the value, the 13-byte
+fixed-width rowid after a DML -- then the arrays a `batcherrors` call collects
+(§ batch errors, #2247): the codes and the offsets, each a `ub4` count and one
+value packing that many `ub4`s, and the messages, a `ub4` count, an indicator
+byte when there are any, and per message a `ub4` length, the text and two bytes.
+Last, when the ORA code is set, the server's message, in 64-byte chunks past 64
+(the `0xFE` form), ORA-01403's included. seerdb reads it all from two schemas,
+`_O7_STATUS_HEAD` (to the rowid) and `_O7_STATUS_TAIL` (#2284); 57 live 9.2.0.4
+statuses read to their last byte.
 
 The server does **not** clear the field: a DDL, or a DML that touched no row,
 carries the previous statement's rowid. Its row count is 0, which is how the
