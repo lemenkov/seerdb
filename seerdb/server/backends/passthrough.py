@@ -1193,6 +1193,9 @@ class OraclePassthroughBackend:
             cursor.execute(sql, variables)
         except seerdb.DatabaseError as exc:
             raise _relay_error(exc) from exc
+        # The result sets the block returned through DBMS_SQL.RETURN_RESULT, as
+        # the bind-less path drains them: a block with binds lost them (#2295).
+        implicit = self._drain_implicit_results(cursor)
         # A Var yields its assigned value (a nested cursor for a REF CURSOR).
         # An object bound as a bare DbObject has no getvalue() -- the driver
         # writes an OUT value straight into it (#1029) -- so the object IS the
@@ -1212,6 +1215,7 @@ class OraclePassthroughBackend:
             # difference between telling the client the truth and marking every
             # bind OUT (#1064).
             bind_directions=tuple(getattr(cursor, 'bind_directions', None) or ()),
+            implicit_results=implicit,
         )
 
     def _get_lines_by_line(self, cursor, binds: Sequence) -> Result:

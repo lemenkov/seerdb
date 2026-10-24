@@ -5874,6 +5874,34 @@ def test_implicit_results_round_trip_through_the_client_decoder() -> None:
     assert [c['column_name'] for c in results[0]['row_format']] == [b'INTCOL']
 
 
+def test_a_block_s_out_binds_come_before_its_implicit_results() -> None:
+    # A block with OUT binds that also called DBMS_SQL.RETURN_RESULT: 23ai sends
+    # the IOV and the values' RXD, then the TTI_IRD, then the status (#2295). A
+    # Mirror sent one or the other, and the client lost the OUT values.
+    from seerdb.common.tns import (
+        ScalarOutBind,
+        encode_implicit_results,
+        encode_out_bind_response_thin,
+        encode_status,
+    )
+    from seerdb.common.tns_consts import TNS_BIND_DIR_OUTPUT, TNS_TYPE_VARCHAR
+
+    columns = [
+        ColumnMeta(
+            name=b'INTCOL', data_type=TNS_TYPE_NUMBER, data_length=22, max_size=0
+        )
+    ]
+    implicit = encode_implicit_results([(columns, 7)])
+    binds: list = [ScalarOutBind(value='out-value', tns_type=TNS_TYPE_VARCHAR, csfrm=1)]
+    both = encode_out_bind_response_thin(
+        binds, (TNS_BIND_DIR_OUTPUT,), cursor_id=3, implicit_results=implicit
+    )
+    alone = encode_out_bind_response_thin(binds, (TNS_BIND_DIR_OUTPUT,), cursor_id=3)
+    status = encode_status(0, cursor_id=3)
+    assert both == alone[: -len(status)] + implicit + status
+    assert both.index(b'out-value') < both.index(implicit)
+
+
 def test_no_implicit_results_is_an_empty_block_not_a_missing_one() -> None:
     # A block that returned none still decodes -- a zero count, not an absent
     # token -- so the caller can emit it unconditionally if it wants to.

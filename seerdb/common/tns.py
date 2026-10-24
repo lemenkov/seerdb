@@ -4137,9 +4137,14 @@ def encode_out_bind_response_thin(
     out_binds: list[ScalarOutBind | ArrayOutBind | RefCursorOutBind],
     directions: Sequence[int] = (),
     cursor_id: int = 0,
+    implicit_results: bytes = b'',
 ) -> bytes:
     """The thin reply returning a PL/SQL block's OUT bind values (#483): a
     TTI_IOV vector + a TTI_RXD row of the values + a success OER.
+
+    ``implicit_results`` is the TTI_IRD block of a block that also called
+    ``DBMS_SQL.RETURN_RESULT`` (encode_implicit_results), which goes between
+    the values and the status, as 23ai sends it (#2295).
 
     ``out_binds`` is one entry per bind, in bind order. ``cursor_id`` is the
     block's own server cursor, which a client needs before it will stop treating
@@ -4159,6 +4164,7 @@ def encode_out_bind_response_thin(
     return (
         _encode_iov_header(len(out_binds), directions, 1)
         + _encode_out_bind_row_thin(out_binds, directions)
+        + implicit_results
         + encode_status(0, cursor_id=cursor_id)
     )
 

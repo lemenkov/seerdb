@@ -4448,14 +4448,17 @@ def _answer_query(
         # back as a TTI_IRD block naming one server cursor per set, which the
         # client then fetches like a REF CURSOR (#121/#826). Park each set on a
         # cursor of its own first, so the fetches that follow find their rows.
+        # A block with OUT binds as well sends both, its values first (#2295).
+        implicit = b''
         if result.implicit_results:
             named = [
                 (columns, cursors.open(columns, list(rows)))
                 for columns, rows in result.implicit_results
             ]
-            response = encode_implicit_results(named) + encode_status(0)
-            stream.write_packet(TNS_DATA, response)
-            return lobs
+            implicit = encode_implicit_results(named)
+            if not result.out_binds:
+                stream.write_packet(TNS_DATA, implicit + encode_status(0))
+                return lobs
         # A PL/SQL block that assigned OUT binds returns them as an IOV vector
         # (the client keeps only its Var positions); this precedes the column /
         # status branches — a block carries neither rows nor a rowcount (#483).
@@ -4485,6 +4488,7 @@ def _answer_query(
                 ),
                 directions,
                 cursor_id=block_id,
+                implicit_results=implicit,
             )
         # A query carries result columns (even with zero rows); a DDL/DML
         # statement carries none and gets a bare success status instead of a
