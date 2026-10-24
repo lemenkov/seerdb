@@ -12709,10 +12709,20 @@ def _o7_define_entry(Col: dict) -> bytes:
         DefType, MaxSize = Type, Col.get('max_size') or 0
     Flag = 0x21 if Type == TNS_TYPE_CHAR else 0x01
     Charset = Col.get('charset') or 31
+    # The four fields between the size and the charset: the array length and
+    # flags, the type's OID and its version. Zeros for every column but an
+    # object, which names its type there as ojdbc14 does -- the open-ended
+    # size, the TOID (ub4 length + DALC), version 1 (#2258).
+    TypeBlock = bytes([0, 0, 0, 0])
+    if Type == TNS_TYPE_ADT and Col.get('type_oid'):
+        MaxSize = 0x7FFFFFFF
+        Toid = Col['type_oid']
+        TypeBlock = bytes([0, 0]) + encode_sb4(len(Toid)) + _bytes_with_length(Toid)
+        TypeBlock += encode_sb4(1)
     return (
         bytes([DefType, Flag, 0, 0])
         + encode_sb4(MaxSize)
-        + bytes([0, 0, 0, 0])
+        + TypeBlock
         + encode_sb4(Charset)
         + bytes([Csfrm])
     )
@@ -12933,7 +12943,13 @@ def _decode_oac_fv2(Rest: bytes) -> tuple[dict, bytes]:
     (MaxLen, Rest) = decode_ub4(Rest)
     (_Mal, Rest) = decode_ub4(Rest)
     (_Fl2, Rest) = decode_ub4(Rest)
-    (_ToId, Rest) = decode_dalc(Rest)
+    # The type's OID: a ub4 length, then the OID when there is one. Every
+    # column but an object's has none, a single 00 that reads as both (#2258).
+    (ToIdLength, Rest) = decode_ub4(Rest)
+    ToId = b''
+    if ToIdLength:
+        (Value, Rest) = decode_dalc(Rest)
+        ToId = bytes(Value) if isinstance(Value, (bytes, bytearray)) else b''
     (_Vsn, Rest) = decode_ub4(Rest)
     (Charset, Rest) = decode_ub4(Rest)
     Csfrm = Rest[0]
@@ -12950,7 +12966,19 @@ def _decode_oac_fv2(Rest: bytes) -> tuple[dict, bytes]:
         'domain_schema': None,
         'domain_name': None,
     }
+    if DataType in (TNS_TYPE_ADT, TNS_TYPE_REF):
+        Col['type_oid'] = ToId
     return (Col, Rest)
+
+
+def _fv2_name(Rest: bytes) -> tuple[str | None, bytes]:
+    # A ub4 length and a DALC: a 9i describe's type schema or name (#2258).
+    (Length, Rest) = decode_ub4(Rest)
+    if not Length:
+        return (None, Rest)
+    (Value, Rest) = decode_dalc(Rest)
+    Name = bytes(Value).decode('ascii', 'replace') if isinstance(Value, bytes) else ''
+    return (Name or None, Rest)
 
 
 def decode_fv2_describe(Data: bytes) -> list[dict]:
@@ -12978,6 +13006,12 @@ def decode_fv2_describe(Data: bytes) -> list[dict]:
         (_NlChars, Rest) = decode_ub4(Rest)  # name length in chars (ub4)
         (Name, Rest) = decode_dalc(Rest)
         Col['column_name'] = Name if isinstance(Name, bytes) else b''
+        if Col['data_type'] in (TNS_TYPE_ADT, TNS_TYPE_REF):
+            # An object column names its type: the schema, then the name, each
+            # a ub4 length and a DALC. Captured on 9.2.0.4 for `o ty2248`:
+            # `01 03 03 PYO`, `01 06 06 TY2248` (#2258).
+            (Col['type_schema'], Rest) = _fv2_name(Rest)
+            (Col['type_name'], Rest) = _fv2_name(Rest)
         Columns.append(Col)
         # two-byte inter-column separator
         if len(Rest) >= 2 and Rest[0] == 0 and Rest[1] == 0:
@@ -13752,6 +13786,22 @@ def decode_fv2_exec_response(Data: bytes, Columns: list) -> tuple[list, int]:
                             if Locator is not None
                             else None
                         )
+                    continue
+                if DataType == TNS_TYPE_ADT:
+                    # An object (#2258): the 10g+ cell's framing -- type block,
+                    # object OID, snapshot, version, image length, flags, the
+                    # pickled image -- then the indicator. 9i's first field is
+                    # a 36-byte type block, not the bare OID, so the OID is the
+                    # describe's. A NULL carries the same framing with no image
+                    # and ends with the `81 01` null indicator, not `00`
+                    # (captured on 9.2.0.4).
+                    from seerdb.common.dbobject import ObjectImage
+
+                    (Value, Rest) = _read_object_column(Rest, Col)
+                    if isinstance(Value, ObjectImage) and Col.get('type_oid'):
+                        Value.type_oid = Col['type_oid']
+                    Rest = Rest[2:] if Rest[:1] == b'\x81' else Rest[1:]
+                    Row.append(Value)
                     continue
                 if (
                     Col.get('data_length', None) == 0

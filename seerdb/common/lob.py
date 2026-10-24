@@ -380,7 +380,13 @@ class LOB:
 
     def _charset(self) -> dict:
         # A 9i LOB's column charset for the connection's read and write, which
-        # carry its text in it (#2259); nothing for any other LOB.
+        # carry its text in it (#2259); nothing for any other LOB. A national
+        # LOB's text is AL16UTF16 whatever the column says, and an NCLOB
+        # attribute of an object has no column at all to say it (#2258).
+        if self._csfrm == 2 and self.is_character:
+            from seerdb.common.tns_consts import AL16UTF16_CHARSET
+
+            return {'charset': AL16UTF16_CHARSET}
         return {} if self.charset is None else {'charset': self.charset}
 
     def _operation(self, operation: int, amount: int = 0) -> int | None:

@@ -7062,6 +7062,73 @@ class TestFv2CursorCache(unittest.TestCase):
         self.assertEqual(cache, {})
 
 
+class TestFv2ObjectColumn(unittest.TestCase):
+    """A 9i object column (#2258), from 9.2.0.4: `select id, o from o2248
+    order by id`, `o` a `ty2248(a NUMBER, b VARCHAR2(10))`, one row holding
+    `ty2248(7, 'seven')` and one NULL. Replies are the captured ones."""
+
+    DESCRIBE = bytes.fromhex(
+        '080102020000817f01160000000000000102010202494400006d0000000207d0'
+        '00000110105e89723d5c4f58d5e060007f01001cd60101000001010101014f01'
+        '030350594f010606545932323438040000000001010003000000000003028b73'
+        '01010002b962010100000000010100000000'
+    )
+    ROWS = bytes.fromhex(
+        '0602010200010a0000000702c10200012424002202085e89723d5c4f58d5e060'
+        '007f01001cd600000000000000000000000000010001000000010c01010c8401'
+        '0c02c10805736576656e000702c10300012424002202085e89723d5c4f58d5e0'
+        '60007f01001cd600000000000000000000000000010001000000000101810104'
+        '010202057b000001010003000000000003028b7301010002b962010100000000'
+        '010100000000194f52412d30313430333a206e6f206461746120666f756e640a'
+    )
+    TOID = bytes.fromhex('5e89723d5c4f58d5e060007f01001cd6')
+
+    def test_the_describe_names_the_type(self):
+        from seerdb.common.tns import decode_fv2_describe
+
+        (n, o) = decode_fv2_describe(self.DESCRIBE)
+        self.assertEqual((n['column_name'], o['column_name']), (b'ID', b'O'))
+        self.assertEqual(o['data_type'], 109)
+        self.assertEqual(o['type_oid'], self.TOID)
+        self.assertEqual((o['type_schema'], o['type_name']), ('PYO', 'TY2248'))
+
+    def test_the_define_names_the_type_as_ojdbc14_does(self):
+        from seerdb.common.tns import _o7_define_entry, decode_fv2_describe
+
+        (_, o) = decode_fv2_describe(self.DESCRIBE)
+        # ojdbc14's define for the same column, captured: the open-ended size,
+        # the TOID and version 1 where a plain column has four zeros.
+        self.assertEqual(
+            _o7_define_entry(o).hex(),
+            '6d010000047fffffff0000011010' + self.TOID.hex() + '0101011f00',
+        )
+
+    def test_the_rows_carry_an_object_and_a_null(self):
+        from seerdb.common.dbobject import ObjectImage
+        from seerdb.common.tns import decode_fv2_describe, decode_fv2_exec_response
+
+        columns = decode_fv2_describe(self.DESCRIBE)
+        (rows, err) = decode_fv2_exec_response(self.ROWS, columns)
+        self.assertEqual(err, 1403)  # the NULL's 81 01 read whole, the end seen
+        self.assertEqual([r[0] for r in rows], [1, 2])
+        image = rows[0][1]
+        self.assertIsInstance(image, ObjectImage)
+        self.assertEqual(image.type_oid, self.TOID)  # not the 36-byte type block
+        self.assertEqual(image.image.hex(), '84010c02c10805736576656e')  # 7, 'seven'
+        self.assertIsNone(rows[1][1])
+
+    def test_a_national_lob_reads_as_al16utf16(self):
+        # An NCLOB attribute's LOB has no column to name its charset (#2258).
+        from seerdb.common.lob import LOB
+        from seerdb.common.tns_consts import AL16UTF16_CHARSET
+
+        self.assertEqual(
+            LOB(112, b'x', csfrm=2)._charset(), {'charset': AL16UTF16_CHARSET}
+        )
+        self.assertEqual(LOB(112, b'x', charset=31)._charset(), {'charset': 31})
+        self.assertEqual(LOB(113, b'x')._charset(), {})
+
+
 class TestFv2Bfile(unittest.TestCase):
     """Oracle 9i BFILE read (#102, PROTOCOL §19.8): FILE_OPEN -> GETLEN -> READ
     -> FILE_CLOSE over TTI_LOBOPS, where FILE_OPEN returns an open-flagged
