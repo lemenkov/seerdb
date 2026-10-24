@@ -1,6 +1,28 @@
 Entries are sorted chronologically from oldest to youngest within each release,
 releases are sorted from youngest to oldest.
 
+version 3.3.0:
+- **Mirror (tech preview): over PostgreSQL, who may read and administer what**: a synonym's target name is quoted with its quotes doubled (#2219); the users' group reads no session's proxy record (#2220); system privileges and the DBA role decide who may administer (#1936); in per-user mode an administrator reads the DBA_ views (#2223); and the guide says per-user mode can't hide source text (#2221).
+- **Mirror (tech preview): one message schema for each wire message** (#2064): the Mirror's thin and OCI request decoders and reply encoders now compile from one description per message, with a codec per dialect, instead of offsets into captured bytes. No behaviour changes.
+- **Mirror (tech preview): sqlplus fixes**: an NCHAR OUT bind goes back to sqlplus in UTF-16 (#2239); sqlplus 11.2 and 10.2 logins no longer hang on the auth pairs' count (#2249); sqlplus 11.2's wide LOB read is read whole (#2251).
+- **Oracle 9i: much of what later releases have**, over its `TTI_ALL7` dialect:
+  - `executemany` as one call (#2245), with `batcherrors` (#2247);
+  - REF CURSOR OUT binds (#2246) and nested `CURSOR()` columns (#2254);
+  - LOB objects: read, write, trim, size, open and close (#2259);
+  - object types fetched as `DbObject`s (#2258);
+  - the cursor cache, re-executing a parsed statement by its cursor (#2261);
+  - `DatabaseError.offset` (#2263), `cursor.warning` (#2262) and `cursor.bind_directions` (#2264);
+  - a declared `DB_TYPE_LONG` / `DB_TYPE_LONG_RAW` bind takes a value past 4000 bytes, and an undeclared one is refused with the routes that work (#2260).
+- **Mirror (tech preview): an OCI message whose count runs past its end is refused**, where its decoder made up empty items (#2272).
+- **Fixes**:
+  - **On 9i, a statement with non-ASCII text hung the session**: the SQL's length is now sent in characters (#2275).
+  - **`connection.version` on 9i and 8i** gives the server's release; it was `None` (#2278).
+  - **On 8i, a long LONG RAW fetch** sometimes left the end of its reply unread, which then answered the next call (ORA-01403) (#2280).
+  - **On 8i, non-ASCII SQL text** failed with ORA-00942 or raised `UnicodeEncodeError`; a character the database can't hold now becomes `¿`, as on 9i (#2276).
+  - **On 8i, a query on cursor 256 or above returned only its first row**, with no error: the cursor id is little-endian (#2285).
+  - **A long-lived session ran out of cursors (ORA-01000)**: on 8i every statement left its cursor open (#2286); on 9i so did alternating statements and each REF CURSOR (#2288); and from 10g on every REF CURSOR and implicit result set (#2291).
+- **Mirror (tech preview): implicit result sets of a PL/SQL block with binds** reach the client through the passthrough Mirror, and a block with both OUT binds and implicit result sets gets both back through any Mirror (#2295).
+
 version 3.2.0:
 - **`dsn` is read as python-oracledb reads it**:
   - an Easy Connect string without a wallet, whose host, port and service win over the keyword arguments beside it, as a wallet DSN's now do too (#1974, #1978);

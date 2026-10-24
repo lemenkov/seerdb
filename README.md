@@ -245,10 +245,10 @@ reports the rows the statement touched.
 
 Two limits follow from running as a block. Multi-row `RETURNING` into scalar
 binds raises `ORA-01422`, exactly as on a current server, and there is no
-`BULK COLLECT` or `executemany()` support, because these tiers have no array
-DML. A *quoted* bind name (`:"my bind"`) is refused with `NotSupportedError`:
-the server rejects a quoted placeholder inside a PL/SQL block even though plain
-pre-10g DML accepts one. Use an unquoted name.
+`BULK COLLECT` or `executemany()` with `RETURNING`: 9i has array DML, but not
+for a block, and 8i has none. A *quoted* bind name (`:"my bind"`) is refused
+with `NotSupportedError`: the server rejects a quoted placeholder inside a
+PL/SQL block even though plain pre-10g DML accepts one. Use an unquoted name.
 
 **Oracle 8i.** The same rewrite serves `RETURNING ... INTO` here too. It also
 settles an older failure mode: sent in the native form, a *failing* RETURNING
@@ -256,8 +256,8 @@ left 8i mid-protocol and the next statement died with `ORA-00600`. Inside a
 block the same failure is an ordinary PL/SQL error — the statement raises
 `ORA-00001` and the session stays usable.
 
-`DatabaseError.offset` is `None` on both servers, whose error reply carries no
-position.
+`DatabaseError.offset` is `None` on 8i, whose error reply carries no position;
+9i reports it.
 
 The driver negotiates the wire dialect per connection, so a single build speaks
 to every supported server — from Oracle **8i (8.1.7) through 26ai**:
@@ -313,12 +313,18 @@ are inherently version-scoped: the **23ai types** need 23ai (`VECTOR` /
 
 **Oracle 9i** (the legacy field-version-2 / `TTI_ALL7` dialect) runs the common
 surface — DB-API, scalar and national-charset binds, DATE / TIMESTAMP / INTERVAL,
-RAW, small LONG, LOB reads, single-row DML, PL/SQL blocks with IN / OUT / IN OUT
-binds, transactions, and the full async API — but not the features later versions
-layer on top: `BINARY_FLOAT` / `BINARY_DOUBLE`, large streamed LOB / LONG binds,
-array DML, REF CURSOR, the cursor cache, and `changepassword`. Its DB charset
-also can't store text it doesn't cover, so use `DB_TYPE_NVARCHAR` / `NCHAR` for
-full Unicode there rather than a plain `str` bind.
+RAW, LONG / LONG RAW, LOB reads, DML, PL/SQL blocks with IN / OUT / IN OUT binds,
+transactions, and the full async API — and much of what later versions add:
+array DML (`executemany`, with `batcherrors`), REF CURSOR OUT binds and nested
+`CURSOR()` columns, LOB objects (read, write, trim, size, open / close), object
+types fetched as `DbObject`s, the cursor cache, `DatabaseError.offset`,
+`cursor.warning` and `cursor.bind_directions`. It lacks `BINARY_FLOAT` /
+`BINARY_DOUBLE`, a plain bind past 4000 bytes (declare a LONG / LONG RAW
+column's value `DB_TYPE_LONG` / `DB_TYPE_LONG_RAW`, and write a CLOB / BLOB
+through its locator), object and REF binds, array DML with `RETURNING`, and
+`changepassword`. Its DB charset also can't store text it doesn't cover, so use
+`DB_TYPE_NVARCHAR` / `NCHAR` for full Unicode there rather than a plain `str`
+bind.
 
 **Oracle 8i** (8.1.7, the 9.2-era `OALL8` dialect) is the oldest and most limited
 tier. It runs connect (`O3LOGON`), SELECT, single-row DML / DDL, PL/SQL blocks
