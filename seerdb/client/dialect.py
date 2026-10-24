@@ -836,8 +836,8 @@ class O8iDialect:
             self._finished(decode_8i_cursor_id(packet))
         _raise_ora(err_code, message)
         # Values come back only for the binds the block writes; the prompt says
-        # which, as on 9i (#1242), with 8i's bind count at offset 2.
-        directions = decode_fv2_bind_directions(packet, CountAt=2)
+        # which, as on 9i (#1242), with the count in 8i's encoding.
+        directions = decode_fv2_bind_directions(packet, O8i=True)
         if directions is not None and len(directions) == len(bind):
             out_positions = [i for i, d in enumerate(directions) if d & FV2_BIND_OUT]
         # Its cursor is in the status behind the prompt and the OUT values.

@@ -23,6 +23,18 @@ from seerdb.common.tns_consts import (
 )
 
 
+def _load_capture(name):
+    # tests/replay.py, which CI's unittest step, importing this module as
+    # tests.test_tns_decode, does not have on its path.
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(__file__))
+    from replay import load_capture
+
+    return load_capture(name)
+
+
 class TestDecodeUb4(unittest.TestCase):
     """Variable-length integer decode, incl. multi-byte negatives (#24)."""
 
@@ -6529,15 +6541,28 @@ class TestFv2BindDirections(unittest.TestCase):
             self.assertEqual(decode_fv2_bind_directions(prompt), [0x10])
         self.assertIsNone(decode_fv2_bind_directions(self.OUT_IN_VALUES))
 
-    def test_8i_keeps_its_bind_count_at_offset_2(self):
+    def test_8i_writes_its_bind_count_in_2_byte_fields(self):
         # Captured from 8.1.7: OUT, IN, then the one OUT value's RXD.
         from seerdb.common.tns import decode_8i_block_out, decode_fv2_bind_directions
 
         reply = bytes.fromhex(
             '0b050200000001000000000000000000000010200702c1470000080400f3340d'
         )
-        self.assertEqual(decode_fv2_bind_directions(reply, CountAt=2), [0x10, 0x20])
+        self.assertEqual(decode_fv2_bind_directions(reply, O8i=True), [0x10, 0x20])
         self.assertEqual(decode_8i_block_out(reply, 1), [bytes.fromhex('c147')])
+
+    def test_the_count_holds_past_255_binds(self):
+        # 9.2.0.4's and 8.1.7's prompts for a block of 300 binds: IN, OUT, then
+        # 298 IN. Read as its low byte alone, the count was 44, which matched
+        # no block, and the client guessed the directions (#2311).
+        from seerdb.common.tns import decode_8i_block_out, decode_fv2_bind_directions
+
+        want = [0x20, 0x10] + [0x20] * 298
+        prompt = _load_capture('fv2_bind_prompt_300_binds_9i.hexdump')
+        self.assertEqual(decode_fv2_bind_directions(prompt), want)
+        reply = _load_capture('o8i_bind_prompt_300_binds.hexdump')
+        self.assertEqual(decode_fv2_bind_directions(reply, O8i=True), want)
+        self.assertEqual(decode_8i_block_out(reply, 1), [bytes.fromhex('c20404')])
 
     def test_an_in_only_var_is_sent_as_input_and_not_read_back(self):
         # The prompt says OUT, IN: send only the IN Var's value, and read one
@@ -7108,16 +7133,10 @@ class TestFv2WideDescribe(unittest.TestCase):
     The reply is the one ojdbc14 received from 9.2.0.4."""
 
     def test_a_300_column_describe_has_300_columns(self):
-        import os
-        import sys
-
-        sys.path.insert(0, os.path.dirname(__file__))
-        from replay import load_capture
-
         from seerdb.common.tns import decode_fv2_describe
 
         columns = decode_fv2_describe(
-            load_capture('fv2_describe_300_columns_9i.hexdump')
+            _load_capture('fv2_describe_300_columns_9i.hexdump')
         )
         self.assertEqual(len(columns), 300)
         self.assertEqual(
