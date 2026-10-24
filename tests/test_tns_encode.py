@@ -6340,6 +6340,18 @@ class TestO3logonMessages(unittest.TestCase):
         self.assertEqual(Compile[17], 3)
         self.assertEqual(Runtime, bytes([2]))
 
+    def test_9i_declares_the_sql_length_in_characters(self):
+        # In an AL32UTF8 session 9i reads the length as characters; declared as
+        # the UTF-8 byte count, a statement with any non-ASCII character left
+        # the server waiting for more and the client hung (#2275).
+        from seerdb.common.tns import _O7_PARSE_MID, encode_o7_block, encode_o7_parse
+
+        Sql = "select 'caf\u00e9' from dual"  # 23 characters, 24 bytes
+        for Encoded in (encode_o7_parse(0, Sql), encode_o7_block(0, Sql)):
+            self.assertIn(bytes([0x01, 23]) + _O7_PARSE_MID, Encoded)
+            self.assertNotIn(bytes([0x01, 24]) + _O7_PARSE_MID, Encoded)
+            self.assertIn(Sql.encode('utf-8'), Encoded)  # the text stays UTF-8
+
     def test_9i_parse_no_binds(self):
         # fv2 TTI_ALL7 parse, no binds: option word 0x21, no bind section.
         # Exact bytes from a live 9.2.0.4 JDBC-thin capture.

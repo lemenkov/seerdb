@@ -140,6 +140,7 @@ def _fv2_skip_reason(test_method_name: str) -> str | None:
 #   * known 8i bugs tracked by a ticket — skipped with the issue number until
 #     fixed, so the 8i suite stays green *and* honest (milestone #25).
 _8I_UNSUPPORTED = (
+    ('sql_text_that_is_not_ascii', '8i mangles non-ASCII SQL text (#2276)'),
     # Genuine 8i limitations (8.1.7 predates the feature).
     ('timestamp', 'TIMESTAMP is a 9i+ type; Oracle 8i has only DATE'),
     ('interval', 'INTERVAL is a 9i+ type; Oracle 8i lacks it'),
@@ -1385,6 +1386,17 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1, :1)', [raw])
         self.cur.execute(f'SELECT r FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone()[0], bytes(range(256)) * 195)
+
+    def test_sql_text_that_is_not_ascii(self):
+        # Non-ASCII characters in the statement itself: 9i hung on any (#2275).
+        # A Latin-1 one round-trips on every tier the suite runs, the 9i bed's
+        # database included.
+        self.cur.execute("SELECT 'caf\u00e9' FROM dual")
+        self.assertEqual(self.cur.fetchone(), ('caf\u00e9',))
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (v VARCHAR2(20))')
+        self.cur.execute(f"BEGIN INSERT INTO {self.TABLE} VALUES ('na\u00efve'); END;")
+        self.cur.execute(f'SELECT v FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone(), ('na\u00efve',))
 
     def test_long_null(self):
         self.assertIsNone(self._round_trip('LONG', 'NULL'))
