@@ -41,6 +41,7 @@ from seerdb.common.tns import (
     decode_8i_dml_response,
     decode_8i_dml_rowid,
     decode_8i_exec_response,
+    decode_8i_terminal_error,
     decode_fv2_batch_errors,
     decode_fv2_bind_directions,
     decode_fv2_block_out,
@@ -606,6 +607,17 @@ def _raise_terminal(err_code: int) -> None:
         raise from_ora_code(err_code)(f'ORA-{err_code:05d}', code=err_code)
 
 
+def _8i_fetch_ended(terminal: bytes) -> bool:
+    # Whether an 8i query reply's status ends the fetch with ORA-01403; any
+    # other error it carries is raised. Fetching past the 01403 draws
+    # ORA-01002 (fetch out of sequence).
+    (err_code, message) = decode_8i_terminal_error(terminal)
+    if err_code == ORA_NO_DATA_FOUND:
+        return True
+    _raise_ora(err_code, message)
+    return False
+
+
 def _raise_ora(err_code: int, message: str | None) -> None:
     # Raise a mapped ORA error from a decoded (code, message) pair.
     if err_code:
@@ -694,15 +706,20 @@ class O8iDialect:
         row_count = 1 if has_long else fetch
         long_size = 0x7FFFFFFF if has_long else fetch
         try:
-            while cursor:
+            ended = _8i_fetch_ended(terminal)
+            while cursor and not ended:
                 yield Send(
                     encode_8i_oall8_fetch(
                         self._next_seq(), cursor, row_count, long_size
                     )
                 )
-                (more, _terminal, last_row) = yield from self.recv_rows(
+                (more, terminal, last_row) = yield from self.recv_rows(
                     b'', columns, last_row
                 )
+                # A fetch that fails brings no rows and the error in its
+                # status. Ending on the empty fetch alone returned the rows
+                # before it as the whole result (#2314).
+                ended = _8i_fetch_ended(terminal)
                 if not more:
                     break
                 rows.extend(more)
