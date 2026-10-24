@@ -77,14 +77,23 @@ _FV2_UNSUPPORTED = (
     # raise a clean NotSupportedError or exercise a capability 9i lacks, rather
     # than silently misbehaving, so the tests skip on 9i.
     ('ref_bind', 'REF / object types are not supported on Oracle 9i'),
-    ('collection_of_objects', 'object types are not supported on Oracle 9i'),
-    ('lob_attribute', 'object types are not supported on Oracle 9i'),
-    ('large_object_image', 'object types are not supported on Oracle 9i'),
-    ('nested_attribute', 'object types are not supported on Oracle 9i'),
-    ('collection_of_collections', 'object types are not supported on Oracle 9i'),
-    ('local_time_zone_attribute', 'object types are not supported on Oracle 9i'),
-    ('national_attribute', 'object types are not supported on Oracle 9i'),
-    ('collection_value', 'object types are not supported on Oracle 9i'),
+    # 9i fetches objects over TTI_ALL7 (#2258). These read national text the
+    # test writes as a SQL literal, which the 9i bed's WE8ISO8859P1 database
+    # cannot hold (#174), or the server's version, which 9i does not yet
+    # report (#2278).
+    ('national_attribute_is_listed', 'connection.version is None before 10g (#2278)'),
+    (
+        'national_attribute',
+        "the 9i bed's database cannot hold the national text (#174)",
+    ),
+    (
+        'lob_attribute_fetches_as_a_lob',
+        "the 9i bed's database cannot hold the national text (#174)",
+    ),
+    (
+        'lob_attributes_read_in_any_order',
+        "the 9i bed's database cannot hold the national text (#174)",
+    ),
     ('changepassword', 'changepassword is not supported on Oracle 9i'),
     # The 9i test DB is WE8ISO8859P1 (Latin-1). #174 made representable VARCHAR2
     # text round-trip (see test_db_charset_varchar_roundtrip) and full Unicode
@@ -164,6 +173,22 @@ _8I_UNSUPPORTED = (
     ('refcursor', 'REF CURSOR is not supported on Oracle 8i'),
     ('batcherror', 'executemany (array DML) is not supported on Oracle 8i'),
     ('error_offset', 'the 8i error reply carries no offset (#719)'),
+    (
+        'collection_of_objects',
+        'object types are not supported on Oracle 8i (9i: #2258)',
+    ),
+    ('lob_attribute', 'object types are not supported on Oracle 8i (9i: #2258)'),
+    ('large_object_image', 'object types are not supported on Oracle 8i (9i: #2258)'),
+    ('nested_attribute', 'object types are not supported on Oracle 8i (9i: #2258)'),
+    (
+        'collection_of_collections',
+        'object types are not supported on Oracle 8i (9i: #2258)',
+    ),
+    (
+        'local_time_zone_attribute',
+        'object types are not supported on Oracle 8i (9i: #2258)',
+    ),
+    ('collection_value', 'object types are not supported on Oracle 8i (9i: #2258)'),
     ('cache_evicts', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
     ('reuses_cursor', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
     ('forgets_the_cached_cursor', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
@@ -8568,7 +8593,8 @@ class LargeObjectImageIntegration(_IntegrationBase):
         )
         self.cur.execute(
             f"INSERT INTO {self.TABLE} VALUES ({self.TEXT_TYPE}(RPAD('x', 300, 'x')), "
-            f"{self.LOB_TYPE}('first', 'second', HEXTORAW('0A0B')))"
+            f"{self.LOB_TYPE}(TO_CLOB('first'), TO_CLOB('second'), "
+            f"TO_BLOB(HEXTORAW('0A0B'))))"
         )
 
     def tearDown(self):
@@ -8759,8 +8785,8 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
         from seerdb.common.lob import LOB
 
         self.cur.execute(
-            f"INSERT INTO {self.TABLE} VALUES (1, {self.TYPE}(1, 'some clob', "
-            f"HEXTORAW('0102FF')), {self.NTYPE}(1, TO_NCLOB('{self.TEXT}')))"
+            f"INSERT INTO {self.TABLE} VALUES (1, {self.TYPE}(1, TO_CLOB('some clob'), "
+            f"TO_BLOB(HEXTORAW('0102FF'))), {self.NTYPE}(1, TO_NCLOB('{self.TEXT}')))"
         )
         o = self._fetched(1)
         self.assertIsInstance(o.C, LOB)
@@ -8792,8 +8818,8 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
         # every attribute LOB shared one locator, served in fetch order, so
         # these read another object's content (#1262).
         self.cur.execute(
-            f"INSERT INTO {self.TABLE} VALUES (7, {self.TYPE}(7, 'seven', "
-            f"HEXTORAW('07')), {self.NTYPE}(7, TO_NCLOB('{self.TEXT}')))"
+            f"INSERT INTO {self.TABLE} VALUES (7, {self.TYPE}(7, TO_CLOB('seven'), "
+            f"TO_BLOB(HEXTORAW('07'))), {self.NTYPE}(7, TO_NCLOB('{self.TEXT}')))"
         )
         o = self._fetched(7)
         n = self._fetched(7, 'p')
@@ -8817,7 +8843,9 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
         self.cur.execute(
             f'CREATE TABLE {table} (l {self.LIST}) NESTED TABLE l STORE AS {table}_S'
         )
-        self.cur.execute(f"INSERT INTO {table} VALUES ({self.LIST}('a', 'bc'))")
+        self.cur.execute(
+            f"INSERT INTO {table} VALUES ({self.LIST}(TO_CLOB('a'), TO_CLOB('bc')))"
+        )
         self.cur.execute(f'SELECT l FROM {table}')
         (value,) = self.cur.fetchone()
         self.assertEqual([e.read() for e in value.aslist()], ['a', 'bc'])
@@ -10878,7 +10906,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     )
                     await Cur.execute(f'CREATE TABLE {Table} (o {Typ})')
                     await Cur.execute(
-                        f"INSERT INTO {Table} VALUES ({Typ}(RPAD('y', 300, 'y'), 'z'))"
+                        f"INSERT INTO {Table} VALUES ({Typ}(RPAD('y', 300, 'y'), TO_CLOB('z')))"
                     )
                     await Cur.execute(f'SELECT o FROM {Table}')
                     (Value,) = await Cur.fetchone()
@@ -11108,8 +11136,8 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     )
                     await Cur.execute(f'CREATE TABLE {Table} (k NUMBER, o {Typ})')
                     await Cur.execute(
-                        f"INSERT INTO {Table} VALUES (1, {Typ}(1, 'some clob', "
-                        "HEXTORAW('0102FF')))"
+                        f"INSERT INTO {Table} VALUES (1, {Typ}(1, TO_CLOB('some clob'), "
+                        "TO_BLOB(HEXTORAW('0102FF'))))"
                     )
                     await Cur.execute(f'SELECT o FROM {Table} WHERE k = 1')
                     (O,) = await Cur.fetchone()
