@@ -2959,6 +2959,17 @@ class CursorIntegration(_IntegrationBase):
             self.cur.fetchone(), (self.conn.session_id, self.conn.serial_num)
         )
 
+    def test_a_statement_takes_more_than_255_binds(self):
+        # 9i wrote the bind count before the SQL as one byte, and the client
+        # raised on a 256th bind before sending anything (#2305). Ones, so the
+        # sum stays in a smallint, which the Mirror over PostgreSQL adds
+        # small integer binds as (#2307).
+        self.cur.execute(
+            'SELECT ' + ' + '.join(f':{i + 1}' for i in range(300)) + ' FROM dual',
+            [1] * 300,
+        )
+        self.assertEqual(self.cur.fetchall(), [(300,)])
+
     def test_a_session_outlasts_open_cursors(self):
         # More statements than the beds' open_cursors (300), of each kind that
         # takes a cursor on 8i: a query, a block with and without an OUT bind, a

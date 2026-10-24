@@ -12650,19 +12650,74 @@ def _o7_bind_oac(Value: object, Statement: bool = False) -> bytes:
     return _oac(Type, MaxSize, Csfrm)
 
 
-# The two fixed option blocks that frame the inline SQL in a TTI_ALL7 parse call
-# (#100 SELECT/DML, #102 PL/SQL block) — the block between the SQL-length and the
-# bind count, and the tail after the SQL. Both parse encoders share them verbatim.
-# The individual bytes are opaque 9i framing, carried as captured ground truth
-# (verified byte-for-byte against the 9i parse captures). The tail's second
-# field is the iteration count, a ub4: ojdbc14's batches of 3 and 300 rows send
-# `01 03` and `02 01 2c` there (#2245).
-_O7_PARSE_MID = bytes([0, 0, 0x01, 0x01, 0x07, 0x01, 0x01, 0x02, 0, 0, 0])
-_O7_PARSE_TAIL = bytes([0x01, 0x01, 0x01, 0x01, 0, 0, 0, 0, 0])
+# Nine bytes every TTI_ALL7 call carries after the SQL's length, the same in a
+# parse, a block and an execute. Their fields are not known: they are carried
+# as captured ground truth, verified byte for byte against ojdbc14's 9i calls.
+_O7_ALL7_MID = bytes([0, 0, 0x01, 0x01, 0x07, 0x01, 0x01, 0x02, 0])
+# The TTI_ALL7 call head (#2284), one layout for a parse, a PL/SQL block and an
+# execute: the option word, the cursor, the SQL's pointer and length, the nine
+# bytes above, the defines' pointer and count (an execute's columns), the
+# binds' pointer and count, the SQL, then `01 01`, a count -- 1, an array
+# DML's rows (ojdbc14's batches of 3 and 300 send `01 03` and `02 01 2c`,
+# #2245), or an execute's 10 rows a fetch -- and five zero bytes. The binds'
+# descriptors and values, or an execute's defines, follow it. The SQL's length
+# counts characters (#2275), not the bytes the text takes, so the text has no
+# length to decode it by and the schema only encodes.
+_O7_ALL7: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN, TTI_ALL7])),
+    ('u8', 'seq'),
+    ('n4', 'options'),
+    ('n4', 'cursor'),
+    ('ptr', 'sql_present'),
+    ('n4', 'sql_length'),
+    ('const', _O7_ALL7_MID),
+    ('ptr', 'defines_present'),
+    ('n4', 'define_count'),
+    ('ptr', 'binds_present'),
+    ('n4', 'bind_count'),
+    ('raw', 'sql'),
+    ('const', b'\x01\x01'),
+    ('n4', 'rows'),
+    ('pad', 5),
+)
+# A call on a cursor by its id (#2284): the close (03 14) and the free (03 08).
+_O7_CURSOR_CALL: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN])),
+    ('u8', 'function'),
+    ('u8', 'seq'),
+    ('n4', 'cursor'),
+)
+_O7_ALL7_THIN = wire_schema.compile_encoder(_O7_ALL7, _THIN)
+_O7_CURSOR_CALL_THIN = wire_schema.compile_encoder(_O7_CURSOR_CALL, _THIN)
 
 
-def _o7_parse_tail(Iterations: int) -> bytes:
-    return bytes([0x01, 0x01]) + encode_sb4(Iterations) + bytes(5)
+def _o7_all7(
+    Seq: int,
+    Options: int,
+    Cursor: int,
+    Sql: str | None = None,
+    Binds: int = 0,
+    Defines: int | None = None,
+    Rows: int = 1,
+) -> bytes:
+    # A TTI_ALL7 call head (_O7_ALL7). `Sql` None sends none: an execute, or a
+    # re-execute by the cursor's id. `Defines` is an execute's column count,
+    # its pointer present even for none, and None for a parse.
+    return _O7_ALL7_THIN(
+        {
+            'seq': Seq,
+            'options': Options,
+            'cursor': Cursor,
+            'sql_present': Sql is not None,
+            'sql_length': _o7_sql_length(Sql) if Sql else 0,
+            'defines_present': Defines is not None,
+            'define_count': Defines or 0,
+            'binds_present': bool(Binds),
+            'bind_count': Binds,
+            'sql': (Sql or '').encode('utf-8'),
+            'rows': Rows,
+        }
+    )
 
 
 def _o7_sql_length(Sql: str) -> int:
@@ -12673,12 +12728,6 @@ def _o7_sql_length(Sql: str) -> int:
     # bed's database is single-byte, so the count could not be told apart from
     # bytes in a multibyte database charset there.
     return len(Sql)
-
-
-def _o7_bind_count(Binds: list) -> bytes:
-    # The bind-count field that precedes the inline SQL: `01 01 <count>` with
-    # binds, `00 00` without.
-    return bytes([0x01, 0x01, len(Binds)]) if Binds else bytes([0, 0])
 
 
 def encode_o7_parse(
@@ -12700,7 +12749,6 @@ def encode_o7_parse(
     # many rows or packets.
     Binds = Binds or []
     Rows = _widen_batch_datetimes([Binds, *Batch]) if Batch else [Binds]
-    SqlBytes = Sql.encode('utf-8')
     # The option word is a ub4: 0x8021, 0x8029 with binds, and with the 10g+
     # batch-errors bit, which 9.2 honours too: it applies the good rows and
     # answers ORA-24381 with the failures (#2247).
@@ -12714,17 +12762,9 @@ def encode_o7_parse(
     # clears the parse bit (0x8029 -> 0x8028) and sends no SQL, as ojdbc14's
     # statement cache does: the server keeps the parse and the defines.
     if Reexecute:
-        (Opt, SqlBytes) = (Opt & ~0x01, b'')
-    Out = (
-        bytes([TTI_FUN, TTI_ALL7, Seq])
-        + encode_sb4(Opt)
-        + encode_sb4(Cursor)
-        + bytes([0x00 if Reexecute else 0x01])  # the SQL's pointer
-        + encode_sb4(_o7_sql_length(Sql) if SqlBytes else 0)
-        + _O7_PARSE_MID
-        + _o7_bind_count(Binds)
-        + SqlBytes
-        + _o7_parse_tail(len(Rows))
+        Opt &= ~0x01
+    Out = _o7_all7(
+        Seq, Opt, Cursor, None if Reexecute else Sql, len(Binds), Rows=len(Rows)
     )
     if Binds:
         Oacs = [_o7_bind_oac(V, Statement=True) for V in _oac_rep_row(Rows)]
@@ -12758,19 +12798,7 @@ def encode_o7_block(
     # against cap_9i_plsql_{noarg,inbind}.log. `Cursor` is the server cursor,
     # an sb4 after the option word, then the SQL's pointer, as in a parse.
     Binds = Binds or []
-    SqlBytes = Sql.encode('utf-8')
-    Opt = 0x0429 if Binds else 0x21
-    Out = (
-        bytes([TTI_FUN, TTI_ALL7, Seq])
-        + encode_sb4(Opt)
-        + encode_sb4(Cursor)
-        + bytes([0x01])  # the SQL's pointer
-        + encode_sb4(_o7_sql_length(Sql))
-        + _O7_PARSE_MID
-        + _o7_bind_count(Binds)
-        + SqlBytes
-        + _O7_PARSE_TAIL
-    )
+    Out = _o7_all7(Seq, 0x0429 if Binds else 0x21, Cursor, Sql, len(Binds))
     if Binds:
         # Bind OACs only — the values follow in a separate RXD frame after the
         # server's bind prompt (the 0x8000-inline path is not used for blocks).
@@ -12827,27 +12855,25 @@ def encode_o7_exec(Seq: int, Columns: list, Cursor: int = 1) -> bytes:
     # Call 3: TTI_ALL7 execute + fetch (option word 02 80 50), carrying a define
     # block (one entry per column) so the server returns the requested types.
     # `Cursor` as for encode_o7_describe (#2246).
-    Head = (
-        bytes([TTI_FUN, TTI_ALL7, Seq, 0x02, 0x80, 0x50])
-        + encode_sb4(Cursor)
-        + bytes([0, 0, 0, 0, 0x01, 0x01, 0x07, 0x01, 0x01, 0x02, 0])
-    )
-    Defines = bytes(
-        [0x01, 0x01, len(Columns), 0, 0, 0x01, 0x01, 0x01, 0x0A, 0, 0, 0, 0, 0]
-    ) + b''.join(_o7_define_entry(C) for C in Columns)
-    return Head + Defines
+    # The rows each fetch asks for: 10, as ojdbc14 asks.
+    Head = _o7_all7(Seq, 0x8050, Cursor, Defines=len(Columns), Rows=10)
+    return Head + b''.join(_o7_define_entry(C) for C in Columns)
 
 
 def encode_o7_close(Seq: int, Cursor: int = 1) -> bytes:
     # Call 4: close the cursor (`Cursor` as for encode_o7_describe, #2246). It
     # stays parsed: a re-execute by its id still runs it (#2261).
-    return bytes([TTI_FUN, _O7_CLOSE_FUNC, Seq]) + encode_sb4(Cursor)
+    return _O7_CURSOR_CALL_THIN(
+        {'function': _O7_CLOSE_FUNC, 'seq': Seq, 'cursor': Cursor}
+    )
 
 
 def encode_o7_free(Seq: int, Cursor: int) -> bytes:
     # Free a server cursor (03 08): after it, a re-execute of its id answers
     # ORA-01001. What a cached cursor gets when it is evicted or flushed (#2261).
-    return bytes([TTI_FUN, _O7_FREE_FUNC, Seq]) + encode_sb4(Cursor)
+    return _O7_CURSOR_CALL_THIN(
+        {'function': _O7_FREE_FUNC, 'seq': Seq, 'cursor': Cursor}
+    )
 
 
 def encode_o7_version(Seq: int) -> bytes:
