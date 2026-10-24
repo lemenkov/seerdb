@@ -12563,6 +12563,16 @@ def _o7_parse_tail(Iterations: int) -> bytes:
     return bytes([0x01, 0x01]) + encode_sb4(Iterations) + bytes(5)
 
 
+def _o7_sql_length(Sql: str) -> int:
+    # The SQL's length as 9i reads it: in characters, not the UTF-8 bytes that
+    # carry it. Measured on 9.2.0.4 in seerdb's AL32UTF8 session (#2275): with
+    # the byte count, `select 'caf\u00e9' from dual` (16 bytes, 15 characters)
+    # left the server waiting for a 16th character, and the client hung. The
+    # bed's database is single-byte, so the count could not be told apart from
+    # bytes in a multibyte database charset there.
+    return len(Sql)
+
+
 def _o7_bind_count(Binds: list) -> bytes:
     # The bind-count field that precedes the inline SQL: `01 01 <count>` with
     # binds, `00 00` without.
@@ -12607,7 +12617,7 @@ def encode_o7_parse(
         + encode_sb4(Opt)
         + encode_sb4(Cursor)
         + bytes([0x00 if Reexecute else 0x01])  # the SQL's pointer
-        + encode_sb4(len(SqlBytes))
+        + encode_sb4(_o7_sql_length(Sql) if SqlBytes else 0)
         + _O7_PARSE_MID
         + _o7_bind_count(Binds)
         + SqlBytes
@@ -12648,7 +12658,7 @@ def encode_o7_block(Seq: int, Sql: str, Binds: list | None = None) -> bytes:
         bytes([TTI_FUN, TTI_ALL7, Seq])
         + OptBytes
         + bytes([0x01, 0x01, 0x01])
-        + encode_sb4(len(SqlBytes))
+        + encode_sb4(_o7_sql_length(Sql))
         + _O7_PARSE_MID
         + _o7_bind_count(Binds)
         + SqlBytes
