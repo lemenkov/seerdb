@@ -1769,15 +1769,43 @@ _OAC: wire_schema.Schema = (
     ('only', 'oci', (('when', 'oci_plain', (('n4', 'oaccolid'),)),)),
 )
 # Oracle 9i's bind descriptor and define entry (#2284): thin's OAC through its
-# csfrm -- 9.2 has no max_chars -- at field version 2. The four fields between
-# the size and the charset are the array length, the continuation flags, the
-# type's OID and its version: zeros but for an object, which names its type
-# there as ojdbc14 does (#2258).
-_O7_OAC: wire_schema.Schema = _OAC[: _OAC.index(('n4', 'max_chars'))]
+# csfrm -- 9.2 has no max_chars -- at field version 2, without the fields only
+# OCI writes. The four fields between the size and the charset are the array
+# length, the continuation flags, the type's OID and its version: zeros but for
+# an object, which names its type there as ojdbc14 does (#2258).
+_O7_OAC: wire_schema.Schema = tuple(
+    f for f in _OAC[: _OAC.index(('n4', 'max_chars'))] if f[0] not in ('only', 'derive')
+)
+# A 9i describe's column: the OAC above, then whether it takes NULLs (00 NOT
+# NULL, 01 nullable), its name -- one byte of its length in bytes, which the
+# server caps at 255, a ub4 of its length in characters, and the name -- and
+# the schema and name of its type, each a ub4 length and the name when there is
+# one. Only an object column has them, `01 03 03 PYO`, `01 06 06 TY2248` on
+# 9.2.0.4 (#2258); every other column sends `00 00` there.
+_O7_DESCRIBE_COLUMN: wire_schema.Schema = (
+    *_O7_OAC,
+    ('u8', 'null_ok'),
+    ('u8', 'name_bytes'),
+    ('n4', 'name_chars'),
+    ('chr', 'name'),
+    ('n4', 'type_schema_length'),
+    ('when', 'type_schema_length', (('chr', 'type_schema'),)),
+    ('n4', 'type_name_length'),
+    ('when', 'type_name_length', (('chr', 'type_name'),)),
+)
+# The RPA answering the 0x62 describe call: a ub4 column count, `01 <n>` up
+# to 255 and `02 01 2c` for 300 (#2306), then each column; the call's status
+# follows.
+_O7_DESCRIBE: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('n4', 'count'),
+    ('each', 'columns', 'count', _O7_DESCRIBE_COLUMN),
+)
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
 _OAC_FROM_THIN = wire_schema.compile_decoder(_OAC, _THIN)
 _OAC_FROM_OCI = wire_schema.compile_decoder(_OAC, _OCI)
 _O7_OAC_THIN = wire_schema.compile_encoder(_O7_OAC, _THIN)
+_O7_DESCRIBE_FROM_THIN = wire_schema.compile_decoder(_O7_DESCRIBE, _THIN)
 _AUTH_HEAD_FROM_THIN = wire_schema.compile_decoder(_AUTH_HEAD, _THIN)
 _AUTH_HEAD_FROM_OCI = wire_schema.compile_decoder(_AUTH_HEAD, _OCI)
 _AUTH_PAIR_OCI = wire_schema.compile_encoder(_AUTH_PAIR, _OCI)
@@ -13083,93 +13111,37 @@ def decode_fv2_lob_getlen(Packet: bytes) -> int:
     return Amount
 
 
-def _decode_oac_fv2(Rest: bytes) -> tuple[dict, bytes]:
-    # fv2 column descriptor = the modern decode_token_oac field order MINUS the
-    # trailing Mxlc ub4 (a later addition). The leading DataType byte is the
-    # standard Oracle type code (== TNS_TYPE_*), so existing value decoders are
-    # reused. Returns a column dict shaped like decode_token_dcb's output.
-    (DataType, Flag, Precision) = struct.unpack('>BBB', Rest[:3])
-    Rest = Rest[3:]
-    (DataScale, Rest) = decode_ub4(Rest)
-    (MaxLen, Rest) = decode_ub4(Rest)
-    (_Mal, Rest) = decode_ub4(Rest)
-    (_Fl2, Rest) = decode_ub4(Rest)
-    # The type's OID: a ub4 length, then the OID when there is one. Every
-    # column but an object's has none, a single 00 that reads as both (#2258).
-    (ToIdLength, Rest) = decode_ub4(Rest)
-    ToId = b''
-    if ToIdLength:
-        (Value, Rest) = decode_dalc(Rest)
-        ToId = bytes(Value) if isinstance(Value, (bytes, bytearray)) else b''
-    (_Vsn, Rest) = decode_ub4(Rest)
-    (Charset, Rest) = decode_ub4(Rest)
-    Csfrm = Rest[0]
-    Rest = Rest[1:]
-    Col = {
-        'data_type': DataType,
-        'data_length': MaxLen,
-        'data_scale': DataScale,
-        'precision': Precision,
-        'max_size': MaxLen,
-        'charset': Charset,
-        'csfrm': Csfrm,
-        'null_ok': 1,
-        'domain_schema': None,
-        'domain_name': None,
-    }
-    if DataType in (TNS_TYPE_ADT, TNS_TYPE_REF):
-        Col['type_oid'] = ToId
-    return (Col, Rest)
-
-
-def _fv2_name(Rest: bytes) -> tuple[str | None, bytes]:
-    # A ub4 length and a DALC: a 9i describe's type schema or name (#2258).
-    (Length, Rest) = decode_ub4(Rest)
-    if not Length:
-        return (None, Rest)
-    (Value, Rest) = decode_dalc(Rest)
-    Name = bytes(Value).decode('ascii', 'replace') if isinstance(Value, bytes) else ''
-    return (Name or None, Rest)
+def _fv2_type_name(Name: bytes | None) -> str | None:
+    return Name.decode('ascii', 'replace') if Name else None
 
 
 def decode_fv2_describe(Data: bytes) -> list[dict]:
-    # Parse the TTI_RPA (0x08) answering the 0x62 describe-columns call into a
-    # list of column dicts (docs/PROTOCOL.md §19.1). Layout:
-    #   08 <ub4 numcols> then per column:
-    #     <OAC-fv2> null_ok(1B) namelen_bytes(1B) ub4(namelen_chars) DALC(name) 00 00
-    #
-    # The first byte after the OAC is null_ok (0x00 = NOT NULL, 0x01 = nullable),
-    # NOT part of the name length. The historic "two ub4 name-lengths" reading
-    # only survived because every offline fixture was `SELECT <literal> AS name
-    # FROM dual` — a literal is always nullable, so null_ok=0x01 read as a width-1
-    # ub4 whose value happened to equal the name length. A real NOT-NULL column
-    # sends null_ok=0x00, which decode_ub4 misreads as width-0/value-0 (one byte),
-    # slipping the whole column stream and garbling the name (b'\x08USERNAM') — and
-    # a multi-column NOT-NULL select then fails the fetch with ORA-03115. Read
-    # null_ok + the 1-byte byte-length explicitly, then the genuine ub4 char-length.
-    # The column count is a ub4 after the RPA token: `01 <n>` up to 255, and
-    # `02 01 2c` for 300, as ojdbc14 reads it. Read as the byte after `08 01`,
-    # a 300-column query described one column, and its execute then defined
-    # one, which 9i refused with ORA-03115 (#2306).
-    (NumCols, Rest) = decode_ub4(Data[1:])
+    # The TTI_RPA (0x08) answering the 0x62 describe-columns call, as column
+    # dicts shaped like decode_token_dcb's (docs/PROTOCOL.md §19.1), from
+    # `_O7_DESCRIBE`. A reply without the RPA, a status refusing the call,
+    # describes no columns, and the execute then raises its error.
+    if not Data or Data[0] != TTI_RPA:
+        return []
     Columns = []
-    for _ in range(NumCols):
-        (Col, Rest) = _decode_oac_fv2(Rest)
-        Col['null_ok'] = 0 if Rest[0] == 0 else 1  # 0x00 NOT NULL, 0x01 nullable
-        Rest = Rest[2:]  # null_ok(1B) + namelen_bytes(1B)
-        (_NlChars, Rest) = decode_ub4(Rest)  # name length in chars (ub4)
-        (Name, Rest) = decode_dalc(Rest)
-        Col['column_name'] = Name if isinstance(Name, bytes) else b''
-        if Col['data_type'] in (TNS_TYPE_ADT, TNS_TYPE_REF):
-            # An object column names its type: the schema, then the name, each
-            # a ub4 length and a DALC. Captured on 9.2.0.4 for `o ty2248`:
-            # `01 03 03 PYO`, `01 06 06 TY2248` (#2258).
-            (Col['type_schema'], Rest) = _fv2_name(Rest)
-            (Col['type_name'], Rest) = _fv2_name(Rest)
+    for Oac in _O7_DESCRIBE_FROM_THIN(Data)[0]['columns']:
+        Col = {
+            'data_type': Oac['data_type'],
+            'data_length': Oac['max_length'],
+            'data_scale': Oac['scale'],
+            'precision': Oac['precision'],
+            'max_size': Oac['max_length'],
+            'charset': Oac['charset'],
+            'csfrm': Oac['csfrm'],
+            'null_ok': 0 if Oac['null_ok'] == 0 else 1,
+            'domain_schema': None,
+            'domain_name': None,
+            'column_name': Oac['name'],
+        }
+        if Oac['data_type'] in (TNS_TYPE_ADT, TNS_TYPE_REF):
+            Col['type_oid'] = Oac.get('toid', b'')
+            Col['type_schema'] = _fv2_type_name(Oac.get('type_schema'))
+            Col['type_name'] = _fv2_type_name(Oac.get('type_name'))
         Columns.append(Col)
-        # two-byte inter-column separator
-        if len(Rest) >= 2 and Rest[0] == 0 and Rest[1] == 0:
-            Rest = Rest[2:]
     return Columns
 
 

@@ -7144,6 +7144,24 @@ class TestFv2WideDescribe(unittest.TestCase):
         )
         self.assertEqual({c['data_type'] for c in columns}, {2})
 
+    def test_a_long_column_name_comes_in_chunks(self):
+        # An expression's column is named by its text, which 9.2.0.4 cuts to
+        # 255 characters and sends in chunks of 64 bytes (#2284).
+        from seerdb.common.tns import decode_fv2_describe
+
+        (column,) = decode_fv2_describe(
+            _load_capture('fv2_describe_long_name_9i.hexdump')
+        )
+        self.assertEqual(column['column_name'], b"'" + b'A' * 254)
+        self.assertEqual((column['data_type'], column['data_length']), (96, 300))
+
+    def test_a_status_describes_no_columns(self):
+        # A describe the server refuses answers with a status, not an RPA: no
+        # columns, and the execute that follows raises the error.
+        from seerdb.common.tns import decode_fv2_describe
+
+        self.assertEqual(decode_fv2_describe(bytes.fromhex('0400010000')), [])
+
 
 class TestFv2ObjectColumn(unittest.TestCase):
     """A 9i object column (#2258), from 9.2.0.4: `select id, o from o2248

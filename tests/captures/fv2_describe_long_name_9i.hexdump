@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# Oracle 9.2.0.4's reply to the 0x62 describe of `SELECT '<300 a>' FROM dual`,
+# as seerdb received it (#2284): one CHAR(300) column whose name is the
+# expression's text, which the server cuts to 255 characters. The name's one
+# byte of length in bytes is `ff`, its ub4 length in characters `01 ff`, and the
+# name comes in chunks of 64 bytes (`fe 40 ...`); then the type schema and name
+# lengths, `00 00`, and the call's status. Captured as `hexdump -C` output; the
+# offset column and the |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  08 01 01 60 80 00 00 02  01 2c 00 00 00 00 01 1f  |...`.....,......|
+00000010  01 01 ff 01 ff fe 40 27  41 41 41 41 41 41 41 41  |......@'AAAAAAAA|
+00000020  41 41 41 41 41 41 41 41  41 41 41 41 41 41 41 41  |AAAAAAAAAAAAAAAA|
+00000030  41 41 41 41 41 41 41 41  41 41 41 41 41 41 41 41  |AAAAAAAAAAAAAAAA|
+00000040  41 41 41 41 41 41 41 41  41 41 41 41 41 41 41 41  |AAAAAAAAAAAAAAAA|
+00000050  41 41 41 41 41 41 41 40  41 41 41 41 41 41 41 41  |AAAAAAA@AAAAAAAA|
+00000060  41 41 41 41 41 41 41 41  41 41 41 41 41 41 41 41  |AAAAAAAAAAAAAAAA|
+00000070  41 41 41 41 41 41 41 41  41 41 41 41 41 41 41 41  |AAAAAAAAAAAAAAAA|
+00000080  41 41 41 41 41 41 41 41  41 41 41 41 41 41 41 41  |AAAAAAAAAAAAAAAA|
+00000090  41 41 41 41 41 41 41 41  40 41 41 41 41 41 41 41  |AAAAAAAA@AAAAAAA|
+000000a0  41 41 41 41 41 41 41 41  41 41 41 41 41 41 41 41  |AAAAAAAAAAAAAAAA|
+000000b0  41 41 41 41 41 41 41 41  41 41 41 41 41 41 41 41  |AAAAAAAAAAAAAAAA|
+000000c0  41 41 41 41 41 41 41 41  41 41 41 41 41 41 41 41  |AAAAAAAAAAAAAAAA|
+000000d0  41 41 41 41 41 41 41 41  41 3f 41 41 41 41 41 41  |AAAAAAAAA?AAAAAA|
+000000e0  41 41 41 41 41 41 41 41  41 41 41 41 41 41 41 41  |AAAAAAAAAAAAAAAA|
+000000f0  41 41 41 41 41 41 41 41  41 41 41 41 41 41 41 41  |AAAAAAAAAAAAAAAA|
+00000100  41 41 41 41 41 41 41 41  41 41 41 41 41 41 41 41  |AAAAAAAAAAAAAAAA|
+00000110  41 41 41 41 41 41 41 41  41 00 00 00 04 00 00 00  |AAAAAAAAA.......|
+00000120  00 01 01 00 03 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000130  00 00 00 01 01 00 00 00  00                       |.........|
+00000139
