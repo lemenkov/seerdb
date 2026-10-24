@@ -79,11 +79,13 @@ _FV2_UNSUPPORTED = (
     ('ref_bind', 'REF / object types are not supported on Oracle 9i'),
     # 9i fetches objects over TTI_ALL7 (#2258). These read national text the
     # test writes as a SQL literal, which the 9i bed's WE8ISO8859P1 database
-    # cannot hold (#174), or the server's version, which 9i does not yet
-    # report (#2278).
-    ('national_attribute_is_listed', 'connection.version is None before 10g (#2278)'),
+    # cannot hold (#174).
     (
-        'national_attribute',
+        'national_attribute_fetches',
+        "the 9i bed's database cannot hold the national text (#174)",
+    ),
+    (
+        'national_attribute_collection',
         "the 9i bed's database cannot hold the national text (#174)",
     ),
     (
@@ -155,6 +157,7 @@ _8I_UNSUPPORTED = (
     ('interval', 'INTERVAL is a 9i+ type; Oracle 8i lacks it'),
     ('multilevel', 'a collection of collections is a 9i+ type; Oracle 8i lacks it'),
     ('national_char', 'Oracle 8i predates AL16UTF16 NCHAR (WE8ISO8859P1 only)'),
+    ('national_attribute', 'an Oracle 8i object type takes no NVARCHAR2 attribute'),
     (
         'attributes_metadata',
         'the type covers TIMESTAMP and AL16UTF16 NVARCHAR2, which Oracle 8i lacks',
@@ -900,6 +903,24 @@ class _IntegrationBase(_ThrottleRetry, unittest.TestCase):
             # ORA-00942: table or view does not exist — expected on first run.
             if e.code != 942:
                 raise
+
+
+def _release_of(banner: str, version: str | None) -> str | None:
+    # The release a v$version banner names, as connection.version should give
+    # it. From 18c the banner names the base release and the version the release
+    # update, so there the version stands if its major is the banner's (#2278).
+    match = re.search(r'Release (\d+(?:\.\d+)+)', banner)
+    assert match, banner
+    release = match.group(1)
+    if int(release.split('.')[0]) >= 18 and version:
+        return version if version.split('.')[0] == release.split('.')[0] else release
+    return release
+
+
+def _banner_release(cur, version: str | None) -> str | None:
+    cur.execute("SELECT banner FROM v$version WHERE banner LIKE 'Oracle%'")
+    (banner,) = cur.fetchone()
+    return _release_of(banner, version)
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
@@ -2921,6 +2942,15 @@ class CursorIntegration(_IntegrationBase):
         )
         self.assertEqual(
             self.cur.fetchone(), (self.conn.session_id, self.conn.serial_num)
+        )
+
+    def test_the_version_is_the_release_the_banner_names(self):
+        # Every tier reports its release, 8i and 9i too: 8i's login reply
+        # carries it, and 9i is asked once after login, as ojdbc14 asks (#2278).
+        # From 18c the banner names the base release (23.0.0.0.0) and the
+        # version the release update, so only the major is compared there.
+        self.assertEqual(
+            self.conn.version, _banner_release(self.cur, self.conn.version)
         )
 
     def test_transaction_priority(self):
@@ -9924,6 +9954,19 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 self.assertIsNone(Cur.lastrowid)
             finally:
                 await Cur.execute(f'DROP TABLE {Table}')
+        finally:
+            await Conn.close()
+
+    async def test_the_version_is_the_release_the_banner_names(self):
+        # Async twin of the sync test: its login reads the release too (#2278).
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            await Cur.execute(
+                "SELECT banner FROM v$version WHERE banner LIKE 'Oracle%'"
+            )
+            (banner,) = await Cur.fetchone()
+            self.assertEqual(Conn.version, _release_of(banner, Conn.version))
         finally:
             await Conn.close()
 

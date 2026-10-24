@@ -7129,6 +7129,53 @@ class TestFv2ObjectColumn(unittest.TestCase):
         self.assertEqual(LOB(113, b'x')._charset(), {})
 
 
+class TestPre10ServerVersion(unittest.TestCase):
+    """The release before 10g (#2278): 9i's login returns none, so it is asked
+    once after login with the version call, as ojdbc14 asks, and 8i's phase-two
+    login reply carries AUTH_VERSION_NO. Bytes from ojdbc14 on 9.2.0.4 and from
+    seerdb's login on 8.1.7."""
+
+    # ojdbc14's version call and the 9.2.0.4 reply: the banner, then 0x09200400.
+    CALL = bytes.fromhex('033b00010201000101')
+    REPLY = bytes.fromhex(
+        '0801a24f7261636c65396920456e74657270726973652045646974696f6e2052656c65'
+        '61736520392e322e302e342e30202d2036346269742050726f64756374696f6e0a5769'
+        '74682074686520506172746974696f6e696e672c204f4c415020616e64204f7261636c'
+        '652044617461204d696e696e67206f7074696f6e730a4a5365727665722052656c6561'
+        '736520392e322e302e342e30202d2050726f64756374696f6e040920040009'
+    )
+    # The 8.1.7 phase-two reply's head, as far as AUTH_VERSION_NO.
+    LOGIN_8I = (
+        bytes.fromhex('0816')
+        + b'\x13\x00\x00\x00\x13AUTH_VERSION_STRING\x0c\x00\x00\x00\x0c- Production'
+        + b'\x00\x00\x00\x00\x10\x00\x00\x00\x10AUTH_VERSION_SQL\x02\x00\x00\x00\x0214'
+        + b'\x00\x00\x00\x00\x0f\x00\x00\x00\x0fAUTH_VERSION_NO\t\x00\x00\x00\t135294976'
+        + b'\x00\x00\x00\x00'
+    )
+
+    def test_the_9i_version_call_is_ojdbc14s(self):
+        from seerdb.common.tns import encode_o7_version
+
+        self.assertEqual(encode_o7_version(0), self.CALL)
+
+    def test_the_9i_reply_gives_the_release(self):
+        from seerdb.client.connection import _format_version
+        from seerdb.common.tns import decode_fv2_version
+
+        self.assertEqual(decode_fv2_version(self.REPLY), 0x09200400)
+        self.assertEqual(_format_version(0x09200400), '9.2.0.4.0')
+        # An error in its place leaves the version unknown, not a wrong one.
+        self.assertEqual(decode_fv2_version(bytes.fromhex('0400')), 0)
+
+    def test_the_8i_login_reply_gives_the_release(self):
+        from seerdb.client.connection import _format_version
+        from seerdb.common.tns import decode_8i_server_version
+
+        self.assertEqual(decode_8i_server_version(self.LOGIN_8I), 135294976)
+        self.assertEqual(_format_version(135294976), '8.1.7.0.0')
+        self.assertEqual(decode_8i_server_version(self.LOGIN_8I[:40]), 0)
+
+
 class TestFv2Bfile(unittest.TestCase):
     """Oracle 9i BFILE read (#102, PROTOCOL §19.8): FILE_OPEN -> GETLEN -> READ
     -> FILE_CLOSE over TTI_LOBOPS, where FILE_OPEN returns an open-flagged

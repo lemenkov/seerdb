@@ -54,6 +54,7 @@ from seerdb.common.tns import (
     decode_fv2_oer_error,
     decode_fv2_opened_cursor,
     decode_fv2_opened_locator,
+    decode_fv2_version,
     decode_fv2_warn_flags,
     decode_o8i_bfile_getlen,
     decode_ub4,
@@ -73,6 +74,7 @@ from seerdb.common.tns import (
     encode_o7_lobop,
     encode_o7_open,
     encode_o7_parse,
+    encode_o7_version,
     encode_o8i_bfile_close,
     encode_o8i_bfile_getlen,
     encode_o8i_bfile_open,
@@ -395,6 +397,12 @@ class Fv2Dialect:
     def _free(self, cursor: int):
         yield Send(encode_o7_free(0, cursor))
         yield RECV
+
+    def server_version(self):
+        # The packed release, which the 9i login leaves out (#2278).
+        yield Send(encode_o7_version(0))
+        reply = yield RECV
+        return decode_fv2_version(reply[1]) if reply else 0
 
     def execute_block(self, sql: str, bind: list | None = None):
         # Anonymous PL/SQL block over the fv2 TTI_ALL7 block path (#102, PROTOCOL
