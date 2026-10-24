@@ -30,6 +30,7 @@ from seerdb.client._conn_logic import (
 from seerdb.client.dialect import (
     CAP_OWN_TXN,
     Dialect,
+    Fv2Dialect,
     O8iDialect,
 )
 from seerdb.client.dsn import ConnectArguments, resolve_dsn_arguments
@@ -54,6 +55,7 @@ from seerdb.common.sqltext import is_reusable_dml, statement_head
 from seerdb.common.tns import (
     _DTY_8I,
     assemble_packet,
+    decode_8i_server_version,
     decode_packet,
     decode_token_pro,
     decode_token_rpa,
@@ -1652,6 +1654,7 @@ class OracleConnect(_ConnectionLogic):
                                     self._send_8i_oauth_phase2(Packet)
                                     continue
                                 self.conn_state = CONN_STATE_AUTHENTICATED
+                                self.server_version = decode_8i_server_version(Packet)
                                 logger.debug('handle_login: authenticated (8i O3LOGON)')
                                 return 0
                             if getattr(self, '_o3_phase', 0) == 1:
@@ -1705,6 +1708,10 @@ class OracleConnect(_ConnectionLogic):
                                 # validate on the pre-10g path.
                                 self.conn_state = CONN_STATE_AUTHENTICATED
                                 logger.debug('handle_login: authenticated (O3LOGON)')
+                                assert isinstance(self._dialect, Fv2Dialect)
+                                self.server_version = cast(
+                                    int, self._drive(self._dialect.server_version())
+                                )
                                 return 0
                             raise DatabaseError('authentication failed')
                         case _:

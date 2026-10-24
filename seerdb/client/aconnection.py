@@ -64,6 +64,7 @@ from seerdb.client.connection import (
 from seerdb.client.dialect import (
     CAP_OWN_TXN,
     Dialect,
+    Fv2Dialect,
     O8iDialect,
 )
 from seerdb.client.dsn import ConnectArguments, resolve_dsn_arguments
@@ -90,6 +91,7 @@ from seerdb.common.tns import (
     FLUSH_OUT_BINDS,
     MAX_FLUSH_OUT_BINDS,
     assemble_packet,
+    decode_8i_server_version,
     decode_packet,
     decode_token_pro,
     decode_token_rpa,
@@ -877,6 +879,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                                     await self._send_8i_oauth_phase2(Packet)
                                     continue
                                 self.conn_state = CONN_STATE_AUTHENTICATED
+                                self.server_version = decode_8i_server_version(Packet)
                                 return 0
                             if getattr(self, '_o3_phase', 0) == 1:
                                 await self._send_o3logon_phase2(Packet)
@@ -914,6 +917,11 @@ class AsyncOracleConnect(_ConnectionLogic):
                                 )
                             if getattr(self, '_o3_phase', 0) == 2:
                                 self.conn_state = CONN_STATE_AUTHENTICATED
+                                assert isinstance(self._dialect, Fv2Dialect)
+                                self.server_version = cast(
+                                    int,
+                                    await self._drive(self._dialect.server_version()),
+                                )
                                 return 0
                             raise DatabaseError('authentication failed')
                         case _:

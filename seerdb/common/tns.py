@@ -333,6 +333,7 @@ from seerdb.common.tns_consts import (
     TTI_SVR_PIGGYBACK,
     TTI_TOKEN,
     TTI_UDS,
+    TTI_VERSION,
     TTI_WRN,
     VERSION_11_2_0_2,
     CharsetDict,
@@ -12755,6 +12756,21 @@ def encode_o7_free(Seq: int, Cursor: int) -> bytes:
     return bytes([TTI_FUN, _O7_FREE_FUNC, Seq]) + encode_sb4(Cursor)
 
 
+def encode_o7_version(Seq: int) -> bytes:
+    # The server's release (03 3b), which the 9i login does not return: ojdbc14
+    # asks for it once after login, with a 256-byte banner buffer (#2278).
+    return bytes([TTI_FUN, TTI_VERSION, Seq, 1]) + encode_sb4(256) + bytes([1, 1])
+
+
+def decode_fv2_version(Packet: bytes) -> int:
+    # Its reply, `08 <ub2 banner length> <banner> <ub4 packed release>` then the
+    # status; 0 for anything else, as a login that returned no version (#2278).
+    if not Packet or Packet[0] != TTI_RPA:
+        return 0
+    (Length, Rest) = decode_ub4(Packet[1:])
+    return decode_ub4(Rest[Length:])[0]
+
+
 def decode_fv2_opened_cursor(Packet: bytes) -> int:
     # The id an OOPEN reply hands out: `08 <ub4 id> 09` (#2261).
     if not Packet or Packet[0] != TTI_RPA:
@@ -14644,12 +14660,29 @@ def parse_8i_auth_sesskey(Packet: bytes) -> bytes:
 
     from seerdb.common.exceptions import InterfaceError
 
-    Idx = Packet.find(b'AUTH_SESSKEY')
-    if Idx < 0:
+    Value = parse_8i_auth_value(Packet, b'AUTH_SESSKEY')
+    if Value is None:
         raise InterfaceError('8i OSESSKEY response carried no AUTH_SESSKEY')
-    After = Packet[Idx + len(b'AUTH_SESSKEY') :]
+    return unhexlify(Value)
+
+
+def decode_8i_server_version(Packet: bytes) -> int:
+    # The packed release an 8i phase-two login reply carries as AUTH_VERSION_NO,
+    # or 0 when it does not (#2278).
+    return _auth_int(parse_8i_auth_value(Packet, b'AUTH_VERSION_NO')) or 0
+
+
+def parse_8i_auth_value(Packet: bytes, Key: bytes) -> bytes | None:
+    """One value of an 8i login reply, or None when the reply lacks it.
+
+    Its key and value each come as a ``ub1 len`` and a ``ub4be`` repeat of it,
+    then the bytes; the phase-two reply carries AUTH_VERSION_NO (#2278)."""
+    Idx = Packet.find(Key)
+    if Idx < 0:
+        return None
+    After = Packet[Idx + len(Key) :]
     ValLen = After[0]  # ub1 length; the ub4be repeat follows in After[1:5]
-    return unhexlify(After[5 : 5 + ValLen])
+    return After[5 : 5 + ValLen]
 
 
 def encode_dictionary_spfp(Dictionary: dict) -> bytes:
