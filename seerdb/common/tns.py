@@ -1133,9 +1133,13 @@ class _ThinCodec:
 
     @staticmethod
     def token(value: int | None) -> bytes:
-        # A function call's token number, from 23ai (_fun_header): the caller
-        # gives None below it, where there is none.
-        return b'' if value is None else encode_sb4(value)
+        # A function call's token number, which thin sends from 23ai
+        # (_fun_header) and not before, as read_token reads it: by the field
+        # version, not by what the caller gives. Given a token below 23ai the
+        # encoder wrote one, and its own decoder then misread the message.
+        if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_23_1_EXT_1:
+            return b''
+        return encode_sb4(value or 0)
 
     @staticmethod
     def read_token(data: bytes) -> tuple[int | None, bytes]:
@@ -7413,16 +7417,20 @@ def encode_close_cursors_piggyback(Seq: int, FieldVersion: int, Cursors: list) -
     message; the server closes the listed cursors before processing that call.
     Mirrors oracledb's _write_close_cursors_piggyback -- note the ub8 token at
     fv24, which the older encode_dictionary_pig path omitted (it was never
-    exercised on 12c+)."""
-    return _CLOSE_CURSORS_THIN(
-        {
-            'seq': Seq,
-            'token_number': 0 if FieldVersion >= FIELD_VERSION_23_1_EXT_1 else None,
-            'cursors_present': True,
-            'count': len(Cursors),
-            'cursors': [{'cursor': c} for c in Cursors],
-        }
-    )
+    exercised on 12c+). The token goes by `FieldVersion`, the connection's."""
+    Token = _ENCODE_FIELD_VERSION.set(FieldVersion)
+    try:
+        return _CLOSE_CURSORS_THIN(
+            {
+                'seq': Seq,
+                'token_number': 0,
+                'cursors_present': True,
+                'count': len(Cursors),
+                'cursors': [{'cursor': c} for c in Cursors],
+            }
+        )
+    finally:
+        _ENCODE_FIELD_VERSION.reset(Token)
 
 
 def encode_8i_close_cursors(Seq: int, Cursors: list) -> bytes:
@@ -12500,15 +12508,22 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
 
 
 def encode_dictionary_fetch(Dictionary: dict) -> bytes:
-    FieldVersion = Dictionary.get('field_version', FIELD_VERSION_11_2)
-    return _FETCH_THIN(
-        {
-            'seq': Dictionary['seq'],
-            'token_number': 0 if FieldVersion >= FIELD_VERSION_23_1_EXT_1 else None,
-            'cursor': Dictionary['cursor'],
-            'rows': Dictionary['fetch'],
-        }
+    # The token goes by the connection's field version, which the dictionary
+    # carries.
+    Token = _ENCODE_FIELD_VERSION.set(
+        Dictionary.get('field_version', FIELD_VERSION_11_2)
     )
+    try:
+        return _FETCH_THIN(
+            {
+                'seq': Dictionary['seq'],
+                'token_number': 0,
+                'cursor': Dictionary['cursor'],
+                'rows': Dictionary['fetch'],
+            }
+        )
+    finally:
+        _ENCODE_FIELD_VERSION.reset(Token)
 
 
 # ---------------------------------------------------------------------------
