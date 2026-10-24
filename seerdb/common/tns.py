@@ -1356,6 +1356,12 @@ class _O8iCodec(_OciCodec):
     def read_n8(data: bytes) -> tuple[int, bytes]:
         return int.from_bytes(_oci_fixed(data, 4, 'n8'), 'little'), data[4:]
 
+    # Text as thin frames it before 12.1, which the 8i request pins: a ub1
+    # length up to 64 bytes, then 64-byte chunks with ub1 lengths (#2284).
+    # OCI's own goes to 255-byte chunks past 252 bytes, which 8i does not read.
+    chr = staticmethod(_ThinCodec.chr)
+    read_chr = staticmethod(_ThinCodec.read_chr)
+
 
 _THIN = _ThinCodec()
 _OCI = _OciCodec()
@@ -1447,6 +1453,18 @@ _ALL8_HEAD: wire_schema.Schema = (
     ('ptr', 'al8kvl'),
     ('ptr', 'defines_present'),
     ('wn4', 'define_count'),
+)
+# Oracle 8i's OALL8 (#2284): the execute a 9.2 OCI client sends, as 8.1.7 reads
+# it. The OALL8 head above through al8kvl -- 9.2 has no defines -- then the SQL
+# text when there is one, then the al8i4 array of twelve ub4s. What the
+# 9.2-client capture and every 8i request seerdb sends carry in it: [0] 1 for
+# an execute and 0 for a fetch, [1] the execute flag for a statement (0 for a
+# query, whose execute waits for its fetch) or the rows a fetch asks for, and
+# [7] the statement type (O8I_STMT_*); the rest are 0.
+_O8I_ALL8: wire_schema.Schema = (
+    *_ALL8_HEAD[:-2],
+    ('when', 'sql_present', (('chr', 'sql'),)),
+    *(('n4', f'al8i4_{i}') for i in range(12)),
 )
 # The end of a describe (TTI_DCB), and of a REF CURSOR's inline one: the
 # describe time, four flags (dcbflag, dcbmdbz, dcbmnpr, dcbmxpr) and, from
@@ -1810,6 +1828,7 @@ _CLOSE_CURSORS_THIN = wire_schema.compile_encoder(_CLOSE_CURSORS, _THIN)
 _CLOSE_CURSORS_FROM_THIN = wire_schema.compile_decoder(_CLOSE_CURSORS, _THIN)
 _CLOSE_CURSORS_FROM_OCI = wire_schema.compile_decoder(_CLOSE_CURSORS, _OCI)
 _CLOSE_CURSORS_O8I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O8I)
+_O8I_ALL8_O8I = wire_schema.compile_encoder(_O8I_ALL8, _O8I)
 _OBJECT_FRAME_THIN = wire_schema.compile_encoder(_OBJECT_FRAME, _THIN)
 _OBJECT_FRAME_OCI = wire_schema.compile_encoder(_OBJECT_FRAME, _OCI)
 _LOB_CELL_THIN = wire_schema.compile_encoder(_LOB_CELL, _THIN)
@@ -13348,33 +13367,16 @@ def _encode_8i_oall8(Seq: int, Sql: bytes, StmtType: int, Binds: list) -> bytes:
         else:
             Byte4, Byte5 = (0x80 if StmtType != O8I_STMT_TXN else 0x00), 0x00
         ExecFlag = 0 if IsQuery else 1
-        Al8 = (
-            bytes([0, 0, 0, 1, NumBinds, 0, 0, 0, 0, 0, 0, 0])  # iters=1, nbinds
-            if NumBinds
-            else bytes(12)
-        )
-        Message = (
-            bytes([TTI_FUN, TTI_ALL8, Seq & 0xFF])
-            + bytes([Option, Byte4, Byte5, 0, 0, 0, 0, 0])
-            # SQL length: a 0x01 marker + a FIXED 4-byte LITTLE-endian count (8i
-            # is x86). The earlier `encode_sb4` wrote a variable-width big-endian
-            # field — byte-identical for a length <= 255 (`01 <len> 00 00 00`) but
-            # one byte longer at >= 256, which shifted the whole request and the
-            # server rejected it with ORA-01009 (#391).
-            + bytes([0x01])
-            + len(Sql).to_bytes(4, 'little')
-            + bytes([0x01, 0x0C, 0, 0, 0, 0, 0x01, 0, 0, 0, 0, 0x01, 0, 0, 0, 0])
-            + Al8
-            + bytes([0x01])
-            # The SQL text (chunked past 64 bytes), as the bytes counted above:
-            # handed a str, encode_chr would re-encode it as UTF-8, and a Latin-1
-            # character's two bytes made the text one longer than its count
-            # (ORA-00942, #2276).
-            + encode_chr(Sql)
-            + bytes([0x01, 0, 0, 0, ExecFlag])
-            + bytes(23)
-            + bytes([StmtType])  # trailer +28: statement type
-            + bytes(19)
+        Message = _o8i_all8(
+            Seq,
+            options=Option | Byte4 << 8 | Byte5 << 16,
+            # The SQL as the bytes its length counts: handed a str, the text
+            # would go as UTF-8, and a Latin-1 character's two bytes made it
+            # one longer than its count (ORA-00942, #2276).
+            sql=Sql,
+            prefetch_rows=1,
+            bind_count=NumBinds,
+            al8i4=(1, ExecFlag, StmtType),
         )
         if NumBinds:
             Oacs = [_encode_8i_bind_oac(Value) for Value in Binds]
@@ -13444,16 +13446,73 @@ def encode_8i_oall8_fetch(
     #     every LONG at `fetch` bytes.
     #   - offset 49: the number of rows to return this call (1 when a LONG column
     #     is present — 8i forces single-row fetches for LONGs).
-    Msg = bytearray(93)
-    Msg[0:4] = bytes([TTI_FUN, TTI_ALL8, Seq & 0xFF, 0x40])
-    Msg[7:11] = Cursor.to_bytes(4, 'little')
-    Msg[16:18] = bytes([0x01, 0x0C])
-    Msg[22] = 0x01
-    Msg[31:35] = min(LongSize, 0xFFFFFFFF).to_bytes(4, 'little')  # LONG fetch size
-    Msg[44] = 0x01
-    Msg[49:53] = Count.to_bytes(4, 'little')  # rows to fetch
-    Msg[73] = 0x01
-    return bytes(Msg)
+    # Those are the OALL8 head's cursor and max_long and al8i4[1] (_O8I_ALL8).
+    return _o8i_all8(
+        Seq,
+        options=TNS_EXEC_OPTION_FETCH,
+        cursor=Cursor,
+        max_long=min(LongSize, 0xFFFFFFFF),
+        al8i4=(0, Count, O8I_STMT_SELECT),
+    )
+
+
+# The _O8I_ALL8 fields every 8i request carries the same: the pointers a 9.2
+# client always sends -- al8i4 and its count of 12, al8o4l and al8kvl -- and
+# the zeros. _o8i_all8 copies them and sets the rest.
+_O8I_ALL8_FIXED: dict = {
+    **{f'al8i4_{i}': 0 for i in range(12)},
+    'token_number': None,
+    'al8i4_present': True,
+    'al8i4_length': 12,
+    'al8o4': False,
+    'al8o4l': True,
+    'prefetch_size': 0,
+    'al8app': False,
+    'al8txn': False,
+    'al8txl': False,
+    'al8kv': False,
+    'al8kvl': True,
+}
+
+
+def _o8i_all8(
+    Seq: int,
+    *,
+    options: int,
+    al8i4: tuple[int, int, int],
+    cursor: int = 0,
+    sql: bytes | None = None,
+    prefetch_rows: int = 0,
+    max_long: int = 0,
+    bind_count: int = 0,
+) -> bytes:
+    # An 8i OALL8 head (_O8I_ALL8): the fields a 9.2 client sets and the
+    # pointers it always sends -- al8i4 and its count of 12, al8o4l and al8kvl
+    # -- with al8i4's [0], [1] and [7] (`al8i4`). `sql` is an execute's text,
+    # present even when empty, and None for a fetch. The bind section, when
+    # there is one, follows it.
+    (first, second, statement) = al8i4
+    values = dict(_O8I_ALL8_FIXED)
+    values.update(
+        al8i4_0=first,
+        al8i4_1=second,
+        al8i4_7=statement,
+        seq=Seq & 0xFF,
+        options=options,
+        cursor=cursor,
+        sql_present=sql is not None,
+        sql_length=len(sql or b''),
+        sql=sql,
+        prefetch_rows=prefetch_rows,
+        max_long=max_long,
+        binds_present=bool(bind_count),
+        bind_count=bind_count,
+    )
+    Token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_9_2)
+    try:
+        return _O8I_ALL8_O8I(values)
+    finally:
+        _ENCODE_FIELD_VERSION.reset(Token)
 
 
 def decode_8i_cursor_id(Terminal: bytes) -> int:
