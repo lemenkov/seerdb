@@ -2044,19 +2044,21 @@ _O7_IOV: wire_schema.Schema = (
     ('n2', 'buffer_length'),
 )
 # A 9i TTI_LOBOPS request (#2284): the 10g+ head (`_LOBOPS_HEAD`) at field
-# version 2, then the SCN array's pointer and length, the amount's pointer,
-# the source locator -- a 9i locator is a ub2 length and its body, sent as a
-# value of the body -- and the short amount when its pointer says so: a
-# READ's or WRITE's count, TRIM's new length, OPEN's mode, FILE_OPEN's 0x0b,
-# 0 for the sizes the reply fills in. 9i has no long offsets and no array
-# slots. Matches ojdbc14's GET_LENGTH, READ, WRITE, TRIM, OPEN, IS_OPEN,
-# CLOSE and FILE_OPEN / FILE_CLOSE (#102, #2259).
+# version 2, then the SCN array's pointer and length, the source locator
+# whole -- a ub2 length and its body, the bytes `source_length` counts -- and
+# the short amount when its pointer says so: a READ's or WRITE's count, TRIM's
+# new length, OPEN's mode, FILE_OPEN's 0x0b, 0 for the sizes the reply fills
+# in. 9i has no long offsets, no array slots and no amount pointer. Matches
+# ojdbc14's GET_LENGTH, READ, WRITE, TRIM, OPEN, IS_OPEN, CLOSE and FILE_OPEN
+# / FILE_CLOSE (#102, #2259). Read as an amount pointer and a value of the
+# body, the locator's ub2 length looked the same up to a body of 252 bytes;
+# past it, a BFILE's with a long file name, the value went out in chunks,
+# and 9.2.0.4 refused the call with ORA-03120 (#2331).
 _O7_LOBOPS: wire_schema.Schema = (
     *_LOBOPS_HEAD,
     ('ptr', 'scn_present'),
     ('n4', 'scn_length'),
-    ('ptr', 'amount_present'),
-    ('value', 'locator'),
+    ('bytes', 'locator', 'source_length'),
     ('when', 'short_amount_present', (('n4', 'short_amount'),)),
 )
 # Its reply: the RPA, the locator as the server now has it (a ub2 length and
@@ -13340,8 +13342,7 @@ def _encode_o7_lobop(
         'operation': Operation,
         'scn_present': False,
         'scn_length': 0,
-        'amount_present': False,
-        'locator': Locator[2:],
+        'locator': Locator,
         'short_amount': Amount,
     }
     Values.update(_O7_LOBOP_FLAGS.get(Operation, {}))

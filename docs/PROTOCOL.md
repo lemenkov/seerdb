@@ -5653,8 +5653,13 @@ version 2): the source locator's pointer and length, the destination's, the
 short source and destination offsets, the charset, short-amount and null-LOB
 pointers, the **operation** (`TNS_LOB_OP_*` — GET_LENGTH `0x01`, READ `0x02`,
 FILE_OPEN `0x0100`, FILE_CLOSE `0x0200`, …). Then the SCN array's pointer and
-length, the amount's pointer, the locator, and the **short amount** when its
-pointer says so: what the "op middle" and "trailer" of the first reading are.
+length, the locator whole — its `ub2` length and body, the bytes the source
+length counts — and the **short amount** when its pointer says so: what the "op
+middle" and "trailer" of the first reading are. There is no amount pointer: read
+as one and a value of the body, the locator's `ub2` length looks the same while
+the body is 252 bytes or less, and past that the value goes out in chunks, which
+9.2.0.4 refuses with ORA-03120 — a BFILE's locator with a long file name
+(#2331).
 9i has neither the long offsets nor the array slots 10g added. The short amount
 is the READ's count, TRIM's new length, OPEN's mode, FILE_OPEN's `0x0b`, `0` for
 GETLEN, whose reply fills it in; CLOSE and FILE_CLOSE ask none, and IS_OPEN sets
