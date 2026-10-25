@@ -6144,7 +6144,11 @@ value and an `sb2` indicator, with no return code (`_O8I_OUT_CELL`: `02 c1 33 00
 00` = 50, `08 proc-out 00 00`, `03 c2 02 08 00 00` = 107; a NULL is an empty
 value and `ff ff`), then the RPA + OER. An OUT bind the block never assigned is
 `ff` where the value would be and the indicator 3105, `ff 21 0c`
-(`_O8I_OUT_UNASSIGNED`), as 9i marks one (§19.7, #801). `decode_8i_block_out` returns the raw value bytes per OUT bind; the
+(`_O8I_OUT_UNASSIGNED`), as 9i marks one (§19.7, #801). A reply carrying long
+OUT values spans packets — a 4000-character value's is 2009, 2009 and 105
+bytes — none marked last, so the reader reads on until the vector, every value
+the vector marks OUT and a whole status are there (`o8i_block_complete`, #2334);
+read from its first packet alone, it failed about one call in two. `decode_8i_block_out` returns the raw value bytes per OUT bind; the
 cursor's `_assign_out_binds` decodes each against its `Var`'s type. `callfunc`
 is the same shape with the return value as the first (`:1`) OUT bind.
 

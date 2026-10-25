@@ -322,5 +322,54 @@ class TestANullUrowid(unittest.TestCase):
         self.assertEqual(last, [3, '*BAFAAMcCwQT+'])
 
 
+class TestABlockReplyReadsOn(unittest.TestCase):
+    """An 8i block's reply comes in as many packets as its OUT values need,
+    none marked last (#2334). Read alone, the first packet of a 4000-character
+    OUT value ran off its end, and the rest answered the next call. The reply
+    is captured from seerdb's own session on 8.1.7, split where 8.1.7 split
+    it."""
+
+    def _run(self, packets):
+        # Drive execute_block over `packets`; how many it read, and its result.
+        from seerdb.common.datatypes import Var
+
+        dialect = O8iDialect(next_seq=lambda: 1)
+        gen = dialect.execute_block(
+            "BEGIN :1 := RPAD('o', 4000, 'p'); END;", [Var(str, 4000)]
+        )
+        intent = next(gen)
+        read = 0
+        try:
+            while True:
+                if intent is RECV:
+                    read += 1
+                    intent = gen.send((6, packets[read - 1]))
+                else:
+                    intent = gen.send(None)
+        except StopIteration as done:
+            return (read, done.value)
+
+    def test_a_long_out_value_is_read_from_every_packet(self):
+        reply = _load_capture('o8i_block_out_4000.hexdump')
+        packets = [reply[:2009], reply[2009:4018], reply[4018:]]
+        (read, result) = self._run(packets)
+        self.assertEqual(read, 3)
+        (record,) = result[4]
+        self.assertEqual(record['out_values'], [b'o' + b'p' * 3999])
+
+    def test_a_whole_reply_reads_no_further(self):
+        (read, result) = self._run([_load_capture('o8i_block_out_4000.hexdump')])
+        self.assertEqual(read, 1)
+        self.assertEqual(result[4][0]['out_values'], [b'o' + b'p' * 3999])
+
+    def test_the_reply_is_whole_only_at_its_end(self):
+        from seerdb.common.tns import o8i_block_complete
+
+        reply = _load_capture('o8i_block_out_4000.hexdump')
+        self.assertTrue(o8i_block_complete(reply))
+        for cut in (1, 18, 19, 21, 2009, 4018, len(reply) - 1):
+            self.assertFalse(o8i_block_complete(reply[:cut]), cut)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -84,6 +84,7 @@ from seerdb.common.tns import (
     encode_tokens_rxd,
     exec_oac_signature,
     has_long_class_bind,
+    o8i_block_complete,
     o8i_stmt_type,
     o8i_terminal_complete,
 )
@@ -849,6 +850,14 @@ class O8iDialect:
         if received is False:
             raise Exception('Connection closed during 8i PL/SQL block')
         packet = received[1]
+        # 8i marks no packet as a reply's last: read on until the reply is whole.
+        # Read alone, the first packet of a long OUT value's reply ran off its
+        # end, and the rest answered the next call (#2334).
+        while not o8i_block_complete(packet):
+            received = yield RECV
+            if received is False:
+                raise Exception('Connection closed during 8i PL/SQL block')
+            packet += received[1]
         # The reply may open with a 0x0b bind prompt; decode_8i_dml_response
         # surfaces any ORA- error regardless (its rowcount is not meaningful here).
         (_row_count, err_code, message) = decode_8i_dml_response(packet)
