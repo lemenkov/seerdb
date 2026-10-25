@@ -5709,13 +5709,15 @@ rowid's text, since declared as type 11 / 208 the server answers with a garbled
 error, #1399). The server infers each bind's direction from the
 block and signals it in the prompt; the round-trip then differs by direction:
 
-- **Bind prompt** `0b 05 <numbinds> 01 01 00` + a direction section — one
-  mask per bind, `0x20` = IN, `0x10` = OUT, `0x30` = IN OUT. `<numbinds>` is two
-  ub4s, the count's low byte and then its high byte: `01 02 00` for 2 binds,
-  `01 2c 01 01` for 300, `01 08 01 02` for 520 (#2311). Its length varies
-  (the live server pads with a leading `00`), so the driver scans past the 8-byte
-  fixed prefix to the first RXD/RPA token rather than computing it
-  (`strip_fv2_bind_prompt`).
+- **Bind prompt**: the `TTI_IOV` I/O vector of §6.5, the message 10g+ sends
+  too. Flags (`05`), the requests and the iterations, whose
+  `iterations * 256 + requests` is the number of binds -- `01 02 00` for 2 binds,
+  `01 2c 01 01` for 300, `01 08 01 02` for 520 (#2311) -- the iterations this
+  time (`01 01`), the buffer length, the bit vector's and rowid's lengths, then
+  one mask per bind, `0x20` = IN, `0x10` = OUT, `0x30` = IN OUT. 9.2.0.4 sends
+  seerdb both lengths (`00 00 00` before the masks) and ojdbc14 neither (`00`),
+  as in the row header (§19.2). seerdb reads it from `_O7_IOV` (#2284); a mask
+  is never how a `ub4` opens, which tells the two forms apart.
 - **Input values** (client → server): a `TTI_RXD` with the values of the **IN and
   IN OUT** binds, in position order, skipping pure-OUT binds. Sent only when at
   least one such bind exists.
@@ -5728,8 +5730,8 @@ directions from its own binds, counting every `Var` as an output. A `Var` the
 block only reads (set with `setvalue`, never assigned) is an IN bind, so no value
 comes back for it, and counting it shifted every value after it: `:1 := :2 * 10`
 with two `Var`s decoded the RPA as the second value. The driver now reads the
-masks (`decode_fv2_bind_directions`: the last `<numbinds>` bytes before the first
-RXD / RPA, since the padding varies), sends inputs for the binds marked IN and
+masks (`decode_fv2_bind_directions`, one per bind after the I/O vector's
+fields), sends inputs for the binds marked IN and
 expects values for those marked OUT. It falls back to the guess only when a reply
 carries no prompt. Captured: `0b0501020001010000001020` is OUT, IN, and
 `0b050103000101000000102030` is OUT, IN, IN OUT.
