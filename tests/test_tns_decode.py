@@ -6609,6 +6609,26 @@ class TestFv2BindDirections(unittest.TestCase):
         self.assertEqual(decode_fv2_bind_directions(reply, O8i=True), want)
         self.assertEqual(decode_8i_block_out(reply, 1), [bytes.fromhex('c20404')])
 
+    def test_8i_marks_an_out_bind_the_block_never_assigned(self):
+        # Captured from 8.1.7, `BEGIN IF 1 = 0 THEN :1 := 1; END IF; :2 := 5;
+        # END;`: two OUTs, the first never assigned, `ff` and the indicator
+        # 3105 (`ff 21 0c`), as 9i marks one (#801); then 5 and the status.
+        from seerdb.common.tns import (
+            decode_8i_block_cursor,
+            decode_8i_block_out,
+            decode_fv2_bind_directions,
+        )
+
+        reply = bytes.fromhex(
+            '0b0502000000010000000000000000000000101007ff210c02c1060000080400a8e91f'
+            '00000000000100000000000000000000000401000000000000000000010000002f00'
+            '40000000000000000000000000000000000000000000080000010000000000000000'
+            '000000000000000000'
+        )
+        self.assertEqual(decode_fv2_bind_directions(reply, O8i=True), [0x10, 0x10])
+        self.assertEqual(decode_8i_block_out(reply, 2), [None, bytes.fromhex('c106')])
+        self.assertEqual(decode_8i_block_cursor(reply, 2), 1)
+
     def test_an_in_only_var_is_sent_as_input_and_not_read_back(self):
         # The prompt says OUT, IN: send only the IN Var's value, and read one
         # OUT value, not two. Counting both Vars as outputs read the RPA as a

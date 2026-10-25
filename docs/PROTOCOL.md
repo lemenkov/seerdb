@@ -6120,9 +6120,9 @@ trip** — no separate bind-value exchange.
 
 The reply is the bind **prompt** (`0x0b`, informational — it echoes each bind's
 direction: `0x20` IN, `0x10` OUT, `0x30` IN OUT) followed by the RPA + OER, all
-in one packet; a no-bind block skips straight to the RPA + OER. An error (compile
-or runtime, e.g. ORA-06550 / PLS-00201) is surfaced from the trailing `ORA-`
-text. OUT / IN OUT binds — whose returned values ride an RXD inside that reply —
+in one packet; a no-bind block skips straight to the RPA + OER. A block that fails
+(compile or runtime, e.g. ORA-06550 / PLS-00201) gets its status alone, no prompt,
+and its error is the status's (§19.12). OUT / IN OUT binds — whose returned values ride an RXD inside that reply —
 are §19.14. Driver: `_execute_8i_block`.
 
 ### 19.14 Oracle 8i PL/SQL OUT binds — callproc / callfunc (#362)
@@ -6135,8 +6135,11 @@ with the value section `07 <5> fd 01 fd 01`.
 
 In the **reply**, after the `0x0b` prompt (whose direction bytes are `0x10` for
 each OUT), a single `07` RXD carries the returned values in OUT-bind order, each a
-**DALC + 2-byte trailer** (`c1 33` = 50, `08 proc-out`, `c2 02 08` = 107), then
-the RPA + OER. `decode_8i_block_out` returns the raw value bytes per OUT bind; the
+value and an `sb2` indicator, with no return code (`_O8I_OUT_CELL`: `02 c1 33 00
+00` = 50, `08 proc-out 00 00`, `03 c2 02 08 00 00` = 107; a NULL is an empty
+value and `ff ff`), then the RPA + OER. An OUT bind the block never assigned is
+`ff` where the value would be and the indicator 3105, `ff 21 0c`
+(`_O8I_OUT_UNASSIGNED`), as 9i marks one (§19.7, #801). `decode_8i_block_out` returns the raw value bytes per OUT bind; the
 cursor's `_assign_out_binds` decodes each against its `Var`'s type. `callfunc`
 is the same shape with the return value as the first (`:1`) OUT bind.
 
@@ -6146,10 +6149,14 @@ comes back in the reply's RXD, both in the same single round trip. Its prompt
 direction is `0x30`. No extra machinery — the inline value path and the OUT-value
 decode above already cover it.
 
-8i's prompt carries the same masks and the same two count fields, each a 2-byte
-little-endian value (`0b 05 <low> 00 <high> 00 01 00` then a longer zero pad;
-300 binds are `2c 00 01 00`, #2311): captured
-`0b0502000000010000…0010200702c147…` is OUT, IN, then the one OUT value. A `Var`
+8i's prompt is 9i's I/O vector (§19.7) at fixed little-endian widths
+(`_O8I_IOV`, #2284): `0b`, the flags (5), a `ub2` of requests and a `ub2` of
+iterations — the binds are `iterations * 256 + requests`, 300 coming as `2c 00
+01 00` (#2311) — a `ub4` of iterations this time (1), and eight bytes zero in
+every reply measured, where the buffer length and the two vector lengths go;
+then the masks. Captured `0b0502000000010000…0010200702c147…` is OUT, IN, then
+the one OUT value. Read from 20 live 8.1.7 block replies with nothing left
+over. A `Var`
 the block only reads gets no value back here either, so the driver takes the OUT
 positions from the masks (#1242).
 
