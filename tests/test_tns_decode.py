@@ -7034,6 +7034,18 @@ class TestFv2LobOperations(unittest.TestCase):
             built = encode_o7_lobop(request[2], self._locator(request), operation, **kw)
             self.assertEqual(built.hex(), request.hex(), hex(operation))
 
+    def test_a_locator_past_252_bytes_goes_whole(self):
+        # The locator follows the SCN length as the bytes `source_length`
+        # counts, its ub2 length and body, never in chunks: a BFILE's with a
+        # 240-character file name is 265 bytes, and in chunks 9.2.0.4 refused
+        # the call with ORA-03120 (#2331). The short amount, FILE_OPEN's 0x0b,
+        # follows it.
+        from seerdb.common.tns import encode_o7_bfile_open
+
+        locator = (263).to_bytes(2, 'big') + bytes(range(256)) + b'\x07' * 7
+        request = encode_o7_bfile_open(0, locator)
+        self.assertTrue(request.endswith(locator + b'\x01\x0b'), request[-8:].hex())
+
     def test_a_long_write_is_chunked_as_ojdbc14_chunks_it(self):
         # 3000 characters: the 0xFE marker, 252-byte chunks and a zero.
         from seerdb.common.tns import _o7_lob_value

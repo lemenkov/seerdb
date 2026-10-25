@@ -1348,6 +1348,22 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id FROM {self.TABLE} WHERE ROWID = :r', [rid])
         self.assertEqual(self.cur.fetchone(), (1,))
 
+    def test_a_long_bfile_locator_reaches_the_server_whole(self):
+        # A BFILE's locator holds its file name, and a long one passes 252
+        # bytes. Opening it is the server's to refuse -- the directory is not
+        # there -- and the session goes on. On 9i the locator went out in
+        # chunks, which 9.2.0.4 refused with ORA-03120 (#2331).
+        self.cur.execute(
+            'SELECT BFILENAME(:d, :f) FROM dual',
+            ['NO_SUCH_DIR_2331', 'f' * 240],
+        )
+        (lob,) = self.cur.fetchone()
+        with self.assertRaises(seerdb.DatabaseError) as raised:
+            lob.read()
+        self.assertNotEqual(getattr(raised.exception, 'code', None), 3120)
+        self.cur.execute('SELECT 42 FROM dual')
+        self.assertEqual(self.cur.fetchone(), (42,))
+
     def test_a_null_urowid_between_two_that_are_set(self):
         # Through a CASE, an index-organized table's ROWID can be NULL. On 8i
         # its cell left a byte unread, and the fetch failed with ORA-01002
