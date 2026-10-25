@@ -1859,7 +1859,7 @@ _O7_STATUS_TAIL: wire_schema.Schema = (
 )
 # 9i's row header (#2284): flags, the number of columns requested, the
 # iteration, the iterations the fetch asked for (10), the buffer length, then
-# (`_O7_RXH_VECTORS`) the column bit vector and the rowid, each a ub4 length
+# (`_O7_VECTORS`, shared with the I/O vector) the column bit vector and the rowid, each a ub4 length
 # and the bytes: the 10g+ RXH. 9.2.0.4 sends seerdb both lengths, zero in every
 # reply, repeated values or not; it sends ojdbc14 neither, the header ending
 # at the buffer length and the first row's 07 straight after it (captured).
@@ -1873,7 +1873,7 @@ _O7_RXH: wire_schema.Schema = (
     ('n2', 'iterations'),
     ('n2', 'buffer_length'),
 )
-_O7_RXH_VECTORS: wire_schema.Schema = (
+_O7_VECTORS: wire_schema.Schema = (
     ('n4', 'bit_vector_length'),
     ('when', 'bit_vector_length', (('value', 'bit_vector'),)),
     ('n4', 'rowid_length'),
@@ -1893,6 +1893,21 @@ _O7_LOB_CELL: wire_schema.Schema = (
 )
 _O7_LONG_CELL: wire_schema.Schema = (('long', 'value'), ('n4', 'indicator'))
 _O7_EMPTY_CELL: wire_schema.Schema = (('n4', 'indicator'),)
+# The I/O vector (TTI_IOV) a 9i PL/SQL block's reply opens with, its "bind
+# prompt" (#2284): python-oracledb's `_process_io_vector`, which 10g+ sends as
+# well (PROTOCOL.md 6.5). Flags (5), the requests and the iterations, whose sum
+# `iterations * 256 + requests` is the number of binds (#2311), the iterations
+# this time (1), the buffer length, then `_O7_VECTORS` -- the lengths 9.2.0.4
+# sends seerdb and not ojdbc14, as in the row header -- and one direction byte
+# per bind, 0x10 OUT, 0x20 IN, 0x30 IN OUT, which `_o7_iov` reads.
+_O7_IOV: wire_schema.Schema = (
+    ('const', bytes([TTI_IOV])),
+    ('u8', 'flags'),
+    ('n2', 'requests'),
+    ('n4', 'iterations'),
+    ('n4', 'iterations_this_time'),
+    ('n2', 'buffer_length'),
+)
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
 _OAC_FROM_THIN = wire_schema.compile_decoder(_OAC, _THIN)
 _OAC_FROM_OCI = wire_schema.compile_decoder(_OAC, _OCI)
@@ -1901,11 +1916,12 @@ _O7_DESCRIBE_FROM_THIN = wire_schema.compile_decoder(_O7_DESCRIBE, _THIN)
 _O7_STATUS_HEAD_FROM_THIN = wire_schema.compile_decoder(_O7_STATUS_HEAD, _THIN)
 _O7_STATUS_TAIL_FROM_THIN = wire_schema.compile_decoder(_O7_STATUS_TAIL, _THIN)
 _O7_RXH_FROM_THIN = wire_schema.compile_decoder(_O7_RXH, _THIN)
-_O7_RXH_VECTORS_FROM_THIN = wire_schema.compile_decoder(_O7_RXH_VECTORS, _THIN)
+_O7_VECTORS_FROM_THIN = wire_schema.compile_decoder(_O7_VECTORS, _THIN)
 _O7_CELL_FROM_THIN = wire_schema.compile_decoder(_O7_CELL, _THIN)
 _O7_LOB_CELL_FROM_THIN = wire_schema.compile_decoder(_O7_LOB_CELL, _THIN)
 _O7_EMPTY_CELL_FROM_THIN = wire_schema.compile_decoder(_O7_EMPTY_CELL, _THIN)
 _O7_LONG_CELL_FROM_THIN = wire_schema.compile_decoder(_O7_LONG_CELL, _THIN)
+_O7_IOV_FROM_THIN = wire_schema.compile_decoder(_O7_IOV, _THIN)
 _AUTH_HEAD_FROM_THIN = wire_schema.compile_decoder(_AUTH_HEAD, _THIN)
 _AUTH_HEAD_FROM_OCI = wire_schema.compile_decoder(_AUTH_HEAD, _OCI)
 _AUTH_PAIR_OCI = wire_schema.compile_encoder(_AUTH_PAIR, _OCI)
@@ -14127,7 +14143,7 @@ def decode_fv2_exec_status(Data: bytes, Columns: list) -> tuple[list, int, str |
         if Token == TTI_RXH:
             (Header, Rest) = _O7_RXH_FROM_THIN(Rest)
             if Rest[:1] not in (bytes([TTI_RXD]), bytes([TTI_OER])):
-                (Header, Rest) = _O7_RXH_VECTORS_FROM_THIN(Rest, Header)
+                (Header, Rest) = _O7_VECTORS_FROM_THIN(Rest, Header)
             if Header.get('bit_vector_length'):
                 # The column bit vector that compresses repeated values (#181).
                 # 9.2.0.4 has sent none, repeated values or not; reading the
@@ -14368,6 +14384,27 @@ def strip_fv2_bind_prompt(Data: bytes) -> bytes:
 # The direction masks in a 9i bind prompt: OUT, IN, and both (IN OUT).
 FV2_BIND_OUT = 0x10
 FV2_BIND_IN = 0x20
+_FV2_BIND_DIRECTIONS = (FV2_BIND_OUT, FV2_BIND_IN, FV2_BIND_OUT | FV2_BIND_IN)
+
+
+def _o7_iov(Data: bytes) -> tuple[dict, bytes] | None:
+    # A 9i reply's I/O vector, from `_O7_IOV`, its directions, and the bytes
+    # after it, or None when `Data` does not open with one, or is too short to
+    # hold the directions its count says.
+    if Data[:1] != bytes([TTI_IOV]):
+        return None
+    try:
+        (Iov, Rest) = _O7_IOV_FROM_THIN(Data)
+        # A direction is never how a ub4 opens: there, the short form.
+        if not Rest or Rest[0] not in _FV2_BIND_DIRECTIONS:
+            (Iov, Rest) = _O7_VECTORS_FROM_THIN(Rest, Iov)
+    except (IndexError, Truncated, DataError):
+        return None
+    Count = Iov['iterations'] * 256 + Iov['requests']
+    if len(Rest) < Count:
+        return None
+    Iov['directions'] = bytes(Rest[:Count])
+    return (Iov, Rest[Count:])
 
 
 def decode_fv2_bind_directions(Data: bytes, O8i: bool = False) -> list[int] | None:
@@ -14384,13 +14421,12 @@ def decode_fv2_bind_directions(Data: bytes, O8i: bool = False) -> list[int] | No
     `n` bytes before the first RXD / RPA, or the end of the prompt, since the
     padding is what varies; a mask is never either token.
     """
+    if not O8i:
+        Iov = _o7_iov(Data)
+        return None if Iov is None else list(Iov[0]['directions'])
     if len(Data) < 8 or Data[0] != _FV2_BIND_PROMPT:
         return None
-    if O8i:
-        Count = Data[2] | Data[4] << 8
-    else:
-        (Low, Rest) = decode_ub4(Data[2:])
-        Count = Low | decode_ub4(Rest)[0] << 8
+    Count = Data[2] | Data[4] << 8
     End = 8
     while End < len(Data) and Data[End] not in (TTI_RXD, TTI_RPA):
         End += 1
@@ -14414,7 +14450,8 @@ def decode_fv2_block_out(Data: bytes, NumOut: int) -> tuple[list, int, int]:
     # (out_values, rowcount, ora_code); out_values holds the raw value bytes per
     # OUT bind (None for a NULL OUT), to be decoded by the caller against each
     # Var's declared type.
-    Rest = strip_fv2_bind_prompt(Data)
+    Iov = _o7_iov(Data)
+    Rest = Data if Iov is None else Iov[1]
     OutValues: list = []
     if NumOut > 0 and Rest and Rest[0] == TTI_RXD:
         Rest = Rest[1:]
@@ -14429,16 +14466,11 @@ def decode_fv2_block_out(Data: bytes, NumOut: int) -> tuple[list, int, int]:
                 Rest = Rest[4:]
                 OutValues.append(None)
                 continue
-            (Val, Rest) = decode_dalc(Rest)
-            if Rest and Rest[0] == 0x81:  # 81 01 NULL indicator
-                Rest = Rest[2:]
-                OutValues.append(None)
-            else:
-                if Rest:
-                    Rest = Rest[1:]  # present indicator (00)
-                OutValues.append(
-                    bytes(Val) if isinstance(Val, (bytes, bytearray)) and Val else None
-                )
+            # A value and its indicator, as in a row (`_O7_CELL`): -1 for NULL.
+            (Cell, Rest) = _O7_CELL_FROM_THIN(Rest)
+            OutValues.append(
+                Cell['value'] if Cell['indicator'] != -1 and Cell['value'] else None
+            )
     (RowCount, ErrCode) = decode_fv2_dml_response(Rest)
     return (OutValues, RowCount, ErrCode)
 

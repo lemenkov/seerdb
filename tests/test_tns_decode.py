@@ -6028,7 +6028,9 @@ class TestFv2ExecResponse(unittest.TestCase):
         from seerdb.common.exceptions import DataError
         from seerdb.common.tns import decode_fv2_exec_response
 
-        header = bytes.fromhex('0602010100010a0001010100')
+        # NUM's header with a one-byte vector: its length, the vector as a
+        # value (`01 01`), and no rowid.
+        header = bytes.fromhex('0602010100010a00') + bytes.fromhex('01010101') + b'\x00'
         with self.assertRaises(DataError):
             decode_fv2_exec_response(header + self.NUM[10:], [{'data_type': 2}])
 
@@ -6418,6 +6420,11 @@ class TestFv2OutBinds(unittest.TestCase):
         '0b05010100010100100702c12b0008010203074790000401010000000101002f'
         '00000000000000000000000000000101'
     )
+    # The same block's reply as seerdb gets it, captured for #2284.
+    OUTNUM_LIVE = bytes.fromhex(
+        '0b050101000101000000100702c12b000801020402100f96000401010000000101'
+        '002f0000000000000000000000000000010100000000'
+    )
     # IN OUT string reply: return RXD '07 04 696e5f6f 00'(=in_o) + RPA + OER.
     INOUT_RESP = bytes.fromhex(
         '0704696e5f6f00080102030747e9000401010000000101002f00000000000000'
@@ -6541,19 +6548,15 @@ class TestFv2OutBinds(unittest.TestCase):
         out, _rc, err = decode_fv2_block_out(self.MIXED_RESP, 2)
         self.assertEqual(out, [b'BA', b'B'])
 
-    def test_strip_prompt_scans_to_rxd(self):
-        # The direction section length varies (JDBC sent 1 byte/bind here, the
-        # live server pads with a leading 00); the scan-based strip handles both.
-        from seerdb.common.tns import strip_fv2_bind_prompt
+    def test_both_io_vector_forms_read(self):
+        # 9.2.0.4 ends the I/O vector with the bit vector's and rowid's lengths
+        # for seerdb, `00 00 00` before the direction, and with the buffer
+        # length alone for ojdbc14, `00` (#2284), as it does the row header.
+        from seerdb.common.tns import decode_fv2_block_out
 
-        jdbc = self.OUTNUM_RESP  # 9-byte prompt
-        live = (
-            bytes.fromhex('0b0501010001010000')
-            + bytes.fromhex('10')
-            + self.OUTNUM_RESP[9:]
-        )  # extra 00 padding
-        self.assertEqual(strip_fv2_bind_prompt(jdbc)[0], 0x07)
-        self.assertEqual(strip_fv2_bind_prompt(live)[0], 0x07)
+        for reply in (self.OUTNUM_RESP, self.OUTNUM_LIVE):
+            (out, _rc, err) = decode_fv2_block_out(reply, 1)
+            self.assertEqual((out, err), ([bytes.fromhex('c12b')], 0))
 
 
 class TestFv2BindDirections(unittest.TestCase):
@@ -6574,16 +6577,12 @@ class TestFv2BindDirections(unittest.TestCase):
         self.assertEqual(decode_fv2_bind_directions(self.OUT_IN_PROMPT), [0x10, 0x20])
         three = bytes.fromhex('0b050103000101000000102030')
         self.assertEqual(decode_fv2_bind_directions(three), [0x10, 0x20, 0x30])
-        # A pure-OUT block's prompt runs straight into the values' RXD, with
-        # the JDBC-style unpadded section or the live server's padded one.
+        # A pure-OUT block's prompt runs straight into the values' RXD, in the
+        # I/O vector seerdb gets, with the bit vector's and rowid's lengths
+        # (#2284), or in ojdbc14's, without them.
         both_out = bytes.fromhex('0b05010200010100000010100702c1020002c103')
         self.assertEqual(decode_fv2_bind_directions(both_out), [0x10, 0x10])
-        for prompt in (
-            TestFv2OutBinds.OUTNUM_RESP,
-            bytes.fromhex('0b0501010001010000')
-            + bytes.fromhex('10')
-            + TestFv2OutBinds.OUTNUM_RESP[9:],
-        ):
+        for prompt in (TestFv2OutBinds.OUTNUM_RESP, TestFv2OutBinds.OUTNUM_LIVE):
             self.assertEqual(decode_fv2_bind_directions(prompt), [0x10])
         self.assertIsNone(decode_fv2_bind_directions(self.OUT_IN_VALUES))
 
