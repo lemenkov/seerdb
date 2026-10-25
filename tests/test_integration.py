@@ -1382,6 +1382,25 @@ class TypesIntegration(_IntegrationBase):
         self.assertIsNone(rows[1][1])
         self.assertTrue(rows[0][1].startswith('*') and rows[2][1].startswith('*'))
 
+    def test_a_long_urowid_comes_back_whole(self):
+        # An index-organized table's ROWID holds its key: a 900-character key
+        # makes a rowid of more than a thousand. On 9i it came back cut to 128
+        # characters, and the longest no longer bound back to its row (#2335).
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} '
+            f'(k VARCHAR2(1000) PRIMARY KEY, v NUMBER) ORGANIZATION INDEX'
+        )
+        for i, n in enumerate((100, 400, 900)):
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', ['k' * n, i])
+        self.cur.execute(f'SELECT ROWID, v FROM {self.TABLE} ORDER BY v')
+        rows = self.cur.fetchall()
+        if rows[2][0].startswith('*'):
+            # Oracle's logical rowid, its key in it; the Mirror gives its own.
+            self.assertGreater(len(rows[2][0]), 1000)
+        for rid, v in rows:
+            self.cur.execute(f'SELECT v FROM {self.TABLE} WHERE ROWID = :1', [rid])
+            self.assertEqual(self.cur.fetchone(), (v,))
+
     @_requires(_INTERVAL)
     def test_interval_columns_describe_their_precisions(self):
         # An INTERVAL column describes its leading-field precision and its

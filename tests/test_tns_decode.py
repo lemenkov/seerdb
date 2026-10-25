@@ -7304,6 +7304,16 @@ class TestFv2DescriptionSizes(unittest.TestCase):
         }
         self.assertEqual(sizes, {b'D': 7, b'N': 22, b'NC': 8, b'RI': 128, b'CL': 4000})
 
+    def test_a_urowid_is_defined_for_its_whole_text(self):
+        # A UROWID's text runs to 5267 characters; defined as VARCHAR(128) like
+        # a physical ROWID's, a longer one came back cut to 128 (#2335).
+        from seerdb.common import tns, wire_schema
+
+        read = wire_schema.compile_decoder(tns._O7_OAC, tns._THIN)
+        column = {'data_type': 208, 'data_length': 1, 'charset': 0, 'csfrm': 0}
+        define = read(tns._o7_define_entry(column))[0]
+        self.assertEqual((define['data_type'], define['max_length']), (1, 5267))
+
 
 class TestFv2ObjectColumn(unittest.TestCase):
     """A 9i object column (#2258), from 9.2.0.4: `select id, o from o2248

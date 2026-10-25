@@ -5604,7 +5604,10 @@ marching on into a desync.
 **ROWID** is requested in the define block as **VARCHAR(128)** (deftype `0x01`,
 not the native ROWID type 11) — exactly as JDBC does — so it returns as the
 familiar 18-char rowid string; the native ROWID return form desyncs the row
-stream (ORA-01002).
+stream (ORA-01002). A **UROWID**, an index-organized table's logical rowid,
+holds the table's key, and its text runs to 5267 characters: it is defined as
+VARCHAR(5267), the size the bind path uses. Defined at 128, a longer one came
+back cut to 128 characters with no error (#2335).
 
 **LONG / LONG RAW** are supported: requested in the define block with the 2 GiB
 max buffer, they stream back inline as a chunked DALC (the `0xfe` form — single
