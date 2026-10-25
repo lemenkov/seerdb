@@ -164,6 +164,25 @@ class _ConnectionLogic:
             return decode_8i_terminal_error(Packet)
         return decode_fv2_oer_error(Packet)
 
+    def _o7_logon_mode(self) -> int:
+        # The logon mode a 9i OSESSKEY carries (#2342), as 10g+'s: the role's
+        # and the preliminary connection's bits on the logon bit.
+        return ((self.role or 0) * 32) | ((self.prelim or 0) * 128) | 1
+
+    def _o7_session_pairs(self) -> list[tuple[bytes, bytes]]:
+        # The session pairs a 9i login sends (#2342), those of a 10g+ login below
+        # 12.1 and from the same settings: program, machine, pid and osuser
+        # (AUTH_SID, which servers report as v$session.osuser).
+        import os
+        import socket
+
+        return [
+            (b'AUTH_PROGRAM_NM', (self.program or self.app_name or 'seerdb').encode()),
+            (b'AUTH_MACHINE', (self.machine or socket.gethostname()).encode()),
+            (b'AUTH_PID', str(os.getpid()).encode()),
+            (b'AUTH_SID', (self.osuser or self.user).encode()),
+        ]
+
     # --- Temporary LOBs (#1066) ----------------------------------------------
 
     def _createlob_form(self, lob_type) -> tuple[int, int]:

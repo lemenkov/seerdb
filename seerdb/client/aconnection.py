@@ -850,15 +850,19 @@ class AsyncOracleConnect(_ConnectionLogic):
                                 self._o3_phase = 1
                                 await self._send_8i_osesskey()
                             elif self.field_version < FIELD_VERSION_10_2:
-                                # Pre-10g (9i): O3LOGON thin auth (#90). Async
-                                # port of OracleConnect's branch.
-                                from seerdb.common.tns import encode_o3logon_phase1
+                                # Pre-10g (9i): O3LOGON in the thin-coded
+                                # OSESSKEY (#90, #2342). Async port of
+                                # OracleConnect's branch.
+                                from seerdb.common.tns import encode_o7_osesskey
 
                                 self._o3_phase = 1
                                 await self.send(
                                     TNS_DATA,
-                                    encode_o3logon_phase1(
-                                        self._next_seq(), self.user.encode('utf-8')
+                                    encode_o7_osesskey(
+                                        self._next_seq(),
+                                        self.user.encode('utf-8'),
+                                        self._o7_logon_mode(),
+                                        self._o7_session_pairs(),
                                     ),
                                 )
                             elif self.access_token is not None:
@@ -884,6 +888,15 @@ class AsyncOracleConnect(_ConnectionLogic):
                             if getattr(self, '_o3_phase', 0) == 1:
                                 await self._send_o3logon_phase2(Packet)
                                 continue
+                            if getattr(self, '_o3_phase', 0) == 2:
+                                # 9i's OAUTH answered with its pairs (#2342).
+                                assert isinstance(self._dialect, Fv2Dialect)
+                                self.conn_state = CONN_STATE_AUTHENTICATED
+                                self.server_version = cast(
+                                    int,
+                                    await self._drive(self._dialect.server_version()),
+                                )
+                                return 0
                             return await self._handle_rpa(Packet[1:])
                         case p if p == TTI_WRN:
                             logger.debug('handle_login: recv WRN %s', Packet[1:])
@@ -1479,15 +1492,15 @@ class AsyncOracleConnect(_ConnectionLogic):
         return Drained
 
     async def _send_o3logon_phase2(self, Packet: bytes) -> None:
-        # Async port of OracleConnect._send_o3logon_phase2 (#90): decrypt the
-        # session key from the TTI_3LOGA RPA with the account DES verifier,
-        # DES-encrypt the zero-padded password, send TTI_3LOGON.
-        from binascii import hexlify, unhexlify
+        # Async port of OracleConnect._send_o3logon_phase2 (#90, #2342): decrypt
+        # the session key from the OSESSKEY reply's AUTH_SESSKEY with the account
+        # DES verifier, DES-encrypt the zero-padded password, send the OAUTH.
+        from binascii import hexlify
 
         from seerdb.common.crypto import des_verifier, o3logon
-        from seerdb.common.tns import decode_o7_session_key, encode_o3logon_phase2
+        from seerdb.common.tns import encode_o7_oauth, parse_8i_auth_sesskey
 
-        SessKey = unhexlify(decode_o7_session_key(Packet))
+        SessKey = parse_8i_auth_sesskey(Packet, O8i=False)
         UserB = self.user.encode('utf-8')
         PassB = self.password.encode('utf-8')
         Verifier = des_verifier(UserB, PassB)
@@ -1498,7 +1511,14 @@ class AsyncOracleConnect(_ConnectionLogic):
         )
         self._o3_phase = 2
         await self.send(
-            TNS_DATA, encode_o3logon_phase2(self._next_seq(), UserB, PwdField)
+            TNS_DATA,
+            encode_o7_oauth(
+                self._next_seq(),
+                UserB,
+                self._o7_logon_mode() | 0x100,
+                PwdField,
+                self._o7_session_pairs() + [(b'AUTH_ACL', b'8000')],
+            ),
         )
 
     def _auth_info_pairs(self) -> list:

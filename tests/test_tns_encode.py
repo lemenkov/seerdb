@@ -6304,44 +6304,54 @@ if __name__ == '__main__':
     unittest.main()
 
 
-from seerdb.common.tns import (
-    encode_o3logon_phase1,
-    encode_o3logon_phase2,
-)
-
-
 class TestO3logonMessages(unittest.TestCase):
-    # Pinned against the Oracle JDBC thin driver's 9i (#90) handshake: user
-    # "pyo", and the AUTH_PASSWORD field "F18CC9AF1CE5A7E82" (hex of the DES
-    # blocks + decimal pad count). seq 0 matches the capture.
-    def test_phase1_3loga(self):
-        self.assertEqual(
-            encode_o3logon_phase1(0, b'pyo').hex(),
-            '0352000101030000000000000101070101030101040210000000'
-            '010110000000000101100170796f756e6b6e6f776e6f3969726f'
-            '6f744a444243205468696e20436c69656e74',
-        )
+    # 9i's O3LOGON in the key-value OSESSKEY / OAUTH envelope, thin-coded
+    # (#2342): what seerdb's own session sends 9.2.0.4, which logs it in.
+    def test_the_osesskey_9i_takes(self):
+        # Captured live: user "pyo", mode 1, and the session pairs a 10g client
+        # below 12.1 sends -- program, machine, pid, osuser.
+        from seerdb.common.tns import encode_o7_osesskey
 
-    def test_phase2_3logon(self):
-        self.assertEqual(
-            encode_o3logon_phase2(0, b'pyo', b'F18CC9AF1CE5A7E82').hex(),
-            '035100010103010111000000000101070101030101040210000000'
-            '010110000000000001100070796f4631384343394146314345354137'
-            '453832756e6b6e6f776e6f3969726f6f744a444243205468696e2043'
-            '6c69656e74',
+        sent = bytes.fromhex(
+            '0376050101030101010104010170796f010f0f415554485f50524f4752414d5f4e4d01060673'
+            '656572646200010c0c415554485f4d414348494e4501070766697265666c7900010808415554'
+            '485f5049440107073237383433343600010808415554485f53494401030370796f00'
+            ''
         )
+        pairs = [
+            (b'AUTH_PROGRAM_NM', b'seerdb'),
+            (b'AUTH_MACHINE', b'firefly'),
+            (b'AUTH_PID', b'2784346'),
+            (b'AUTH_SID', b'pyo'),
+        ]
+        self.assertEqual(encode_o7_osesskey(5, b'pyo', 1, pairs), sent)
 
-    def test_the_3loga_reply_carries_the_session_key(self):
-        # 9.2.0.4's reply to 3LOGA in seerdb's own session (#2284): the RPA,
-        # the key's hex as a ub4 length (`01 10`) and 16 digits, then the
-        # status.
-        from seerdb.common.tns import decode_o7_session_key
+    def test_the_oauth_carries_the_proof_and_the_pairs(self):
+        # Phase two: mode 0x101, AUTH_PASSWORD first, the pairs after; the user
+        # raw, as below 12.1.
+        from seerdb.common.tns import encode_o7_oauth
+
+        sent = encode_o7_oauth(
+            6, b'pyo', 0x101, b'F18CC9AF1CE5A7E82', [(b'AUTH_ACL', b'8000')]
+        )
+        self.assertEqual(
+            sent[:13], bytes.fromhex('037306010103020101010102010170796f')[:13]
+        )
+        self.assertIn(b'\x0d\x0dAUTH_PASSWORD\x01\x11\x11F18CC9AF1CE5A7E82\x00', sent)
+        self.assertTrue(sent.endswith(b'\x08\x08AUTH_ACL\x01\x04\x048000\x00'))
+
+    def test_the_osesskey_reply_carries_the_session_key(self):
+        # 9.2.0.4's reply in seerdb's own session: the RPA, one pair,
+        # AUTH_SESSKEY and its 16 hex digits, then the status.
+        from seerdb.common.tns import parse_8i_auth_value
 
         reply = bytes.fromhex(
-            '08011044463543323637443443443336413845'
+            '080101010c0c415554485f534553534b45590110103432393842353734323735423633373500'
             '040000000000000000000000000000000000000005000000000000'
         )
-        self.assertEqual(decode_o7_session_key(reply), b'DF5C267D4CD36A8E')
+        self.assertEqual(
+            len(parse_8i_auth_value(reply, b'AUTH_SESSKEY', O8i=False)), 16
+        )
 
     def test_9i_capabilities_minimal(self):
         # Pre-10g caps must NOT advertise O5LOGON (LOGON_TYPES byte 0) or 9i

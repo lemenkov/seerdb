@@ -1120,19 +1120,23 @@ genuinely older **O3LOGON** (an 8-byte *DES* session key; Oracle 8i/9i; tokens
 carries (`crypto.o3logon`), verified live against 9.2.0.4 and, in the OSESSKEY
 envelope 8i wraps it in, 8.1.7 (§19.8).
 
-9i's two requests (`_O7_3LOGA`, `_O7_3LOGON`, #2284) are thin-coded: the function
-code and sequence number, the user's pointer and `ub4` length, in 3LOGON the
-password field's (the hex of the DES blocks and the pad count), a zero run, then an
-attribute block — terminal, machine and osuser, each a pointer and a `ub4`
-length; a block `02 10 00 00 00 01 01 10` and a phase tail carrying `10` again —
-then the user, the password, and the four strings, raw. 9.2.0.4 stores the
-terminal and machine whole (a 30-character terminal and a 64-character machine
-name tried). The `10` block is not understood (#2342): the code once filled it
-with the program string's length, and 9.2.0.4 takes the login only when those
-lengths are equal and at least 16, so it stays the constant JDBC's 16-character
-`JDBC Thin Client` gives it, and the session strings JDBC's. 3LOGA's reply is the
-RPA and the session key's hex, a `ub4` length and the digits (`_O7_SESSION_KEY`),
-then the status; a refusal at either phase is a status alone (§19.2, #2340).
+9i takes O3LOGON in the key-value **OSESSKEY / OAUTH** envelope, thin-coded
+(`encode_o7_osesskey`, `encode_o7_oauth`, #2342): the 10g login's head and pairs
+(`_AUTH_HEAD`, `_AUTH_PAIR`) with the user raw, as a 10g client below 12.1 sends
+them; mode 1 and then 0x101; the session pairs such a client sends, program,
+machine, pid and osuser (`AUTH_SID`), and at phase two `AUTH_PASSWORD` (the hex of
+the DES blocks and the pad count, as 8i's) and `AUTH_ACL`. Each reply is the RPA,
+a `ub2` pair count and the pairs (`_PRE10_AUTH_REPLY`): `AUTH_SESSKEY` alone, then
+23 pairs from `AUTH_VERSION_STRING` on; a refusal at either phase is a status alone
+(§19.2, #2340). 9.2.0.4 takes the machine sent as its `USERENV HOST`.
+
+The Oracle JDBC thin driver sends 9i the positional `TTI_3LOGA` (0x52) /
+`TTI_3LOGON` (0x51) instead, which seerdb sent until #2342: the user's pointer and
+length, an attribute block, the user, the password and four session strings.
+Part of that block, `02 10 00 00 00 01 01 10` and a phase tail carrying `10` again,
+is not understood: 9.2.0.4 took the login only when its two lengths were equal and
+at least 16, so it carried JDBC's own 16-character program name, and every 9i
+session called itself `JDBC Thin Client` on a host called `o9i`.
 
 ### 4.5 Authentication Response (TTI_FUN/TTI_AUTH)
 

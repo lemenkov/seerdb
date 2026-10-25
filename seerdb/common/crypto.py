@@ -9,9 +9,10 @@ from secrets import token_bytes
 from Crypto.Cipher import AES, DES
 
 
-# O3LOGON (DES): the pre-10g thin authenticator (TTI_3LOGA 0x52 -> TTI_3LOGON
-# 0x51). This is the path the Oracle JDBC thin driver uses against Oracle 9i —
-# and now seerdb, gated on the negotiated field version (#90). (10g+ thin
+# O3LOGON (DES): the pre-10g authenticator. The Oracle JDBC thin driver sends
+# it to Oracle 9i in the positional TTI_3LOGA 0x52 -> TTI_3LOGON 0x51; seerdb,
+# gated on the negotiated field version (#90), sends it in the key-value
+# OSESSKEY/OAUTH envelope 9i also takes, as it does to 8i (#2342). (10g+ thin
 # clients instead use OSESSKEY/0x76 with an AES session key over the same DES
 # verifier; that's the o5logon path below. OCI/sqlplus uses OSESSKEY even on
 # 9i, which is why the OCI capture first misled us — the *thin* 9i path is
