@@ -110,6 +110,30 @@ class TestAColumnOf256BytesOrMore(unittest.TestCase):
         _, rest = decode_8i_dcb_describe(_packet('wide_columns'))
         self.assertEqual(rest[:1], b'\x06')  # TTI_RXH
 
+    def test_each_column_reports_what_10g_does(self):
+        # cursor.description's sizes as python-oracledb reports them (#2326):
+        # the buffer stood in for the declared size, which the describe does
+        # not send, so a DATE and a ROWID reported 1 and a LOB 4000.
+        from seerdb.client.cursor import _column_description
+
+        columns = self._columns()
+        self.assertEqual(
+            {
+                n: _column_description(columns[n])[2:4]
+                for n in ('D', 'RI', 'CL', 'BL', 'BF', 'N62', 'NC', 'R')
+            },
+            {
+                'D': (23, None),
+                'RI': (None, None),
+                'CL': (None, None),
+                'BL': (None, None),
+                'BF': (None, None),
+                'N62': (10, None),
+                'NC': (4, 4),
+                'R': (16, 16),
+            },
+        )
+
 
 if __name__ == '__main__':
     unittest.main()
