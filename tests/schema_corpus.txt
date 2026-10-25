@@ -8,7 +8,7 @@
 # came from. Regenerate after a schema or a capture changes. A message
 # the Mirror builds as the test runs carries its time (an OCI describe
 # head's), so that line changes on each regeneration.
-# 868 messages; left out:
+# 869 messages; left out:
 #   7 random bytes from a fuzz or rubbish test
 _ALL8_HEAD	_THIN	6	{}	035e030204290001011501010d00000000027ff801010200000000000000	tests/test_server_query.py::test_parse_exec_exposes_bind_meta
 _ALL8_HEAD	_THIN	6	{}	035e030204290001011901010d000000010f027ff801010300000000000000	tests/test_server_query.py::test_parse_exec_reads_an_associative_array_bind[6]
@@ -628,6 +628,7 @@ _O7_LOBOPS_REPLY	_THIN	6	{"null_lob_present":false,"short_amount_present":false}
 _O7_LOBOPS_REPLY	_THIN	6	{"null_lob_present":false,"short_amount_present":true}	0800540001010c000000010000000100000008f5c200028b5700028b540003000300000000000000000000000000000000000000000203712b000000050004000097b70000000000000000000000028b540040b92a00000101	tests/test_tns_decode.py::TestFv2LobOperations::test_the_reply_gives_the_value_and_the_locator_to_keep
 _O7_LOBOPS_REPLY	_THIN	6	{"null_lob_present":false,"short_amount_present":true}	0800540001020c00000001000000010000000054f700007bdd00007bdc00020002001f000000000000000000000000000000000000000709df000000000000000000000000000000000000000000007bdc0040b89a00000112	tests/test_tns_decode.py::TestFv2LobRead::test_getlen_response_amount
 _O7_LOBOPS_REPLY	_THIN	6	{"null_lob_present":false,"short_amount_present":true}	0800540001020c000000010000000100000008f5c100028b5500028b5400020002001f0000000000000000000000000000000000000203712b000000050004000097b70000000000000000000000028b540040b92a0000021fc4	tests/test_tns_decode.py::TestFv2LobOperations::test_the_reply_gives_the_value_and_the_locator_to_keep
+_O7_LOBOPS_REPLY	_O8I	6	{"null_lob_present":false,"short_amount_present":true}	080023000108080000000100010000000000054244554d50000c4f52434c414c52542e4c4f47e4850000	tests/test_tns_decode.py::TestO8iBfile::test_opened_locator_then_getlen_read_close
 _O7_LOB_CELL	_THIN	6	{}	008101	tests/test_tns_decode.py::TestFv2LobRead::test_null_lob_row_decodes_to_none
 _O7_LOB_CELL	_THIN	6	{}	0122220020000108080000000100000000000000054246444952000968656c6c6f2e62696e00	tests/test_tns_decode.py::TestFv2Bfile::test_rxd_yields_bfile_lob
 _O7_LOB_CELL	_THIN	6	{}	01565600540001010c00000001000000010000000054f800007bdf00007bdc000300030000020200000000000000000000000000000000000709df000000000000000000000000000000000000000000007bdc0040b89a000000	tests/test_tns_decode.py::TestFv2LobRead::test_getlen_request_matches_capture

@@ -5666,8 +5666,8 @@ GETLEN, whose reply fills it in; CLOSE and FILE_CLOSE ask none, and IS_OPEN sets
 the null-LOB pointer instead. The reply is the RPA, the locator as the server now
 has it (a `ub2` length and the body: the `00` after `08` is its high byte), the
 short amount if asked for, and IS_OPEN's answer, then the status. seerdb writes
-and reads them from `_O7_LOBOPS` and `_O7_LOBOPS_REPLY` (#2284); the 8i form keeps
-fixed ub4-LE fields (`_o8i_lobop_mid`, §19.17).
+and reads them from `_O7_LOBOPS` and `_O7_LOBOPS_REPLY` (#2284), and 8i's from
+the same schemas at its fixed little-endian widths (§19.17).
 
 An **empty** LOB (`EMPTY_CLOB()` / `EMPTY_BLOB()`) has a valid locator but GETLEN
 returns amount 0, so no READ is issued and the value is `""` / `b""`. CLOB content
@@ -6187,9 +6187,9 @@ decoder keys on `num_bytes == 0` → `None`, else reads the locator. Reading an
 rather than waiting for a zero-length chunk that never comes.
 
 Unlike 9i's GETLEN + READ pair, 8i reads the whole value in **one** `TTI_LOBOPS`
-(`0x60`) READ: `03 60 <seq> 01` + `ub4`-LE locator length + a 25-byte op middle +
-the locator + `ub4`-LE amount (chars for a CLOB, bytes for a BLOB — pass a large
-value to read it all). The reply is the **shared `0e fe <chunks> 00`** content
+(`0x60`) READ from offset 1 (§19.17's request, `_O7_LOBOPS` at 8i's widths), its
+short amount the chars for a CLOB, bytes for a BLOB — pass a large value to read
+it all. The reply is the **shared `0e fe <chunks> 00`** content
 form (`decode_fv2_lob_chunks`), possibly spanning packets; CLOB text decodes with
 the column charset (WE8ISO8859P1), BLOB stays bytes (`decode_fv2_lob`). Encoder:
 `encode_8i_lob_read`; driver: `_lob_read_8i` / `_resolve_8i_lobs`. BFILE is a
@@ -6246,10 +6246,16 @@ name then file name — e.g. `… 05 "BDUMP" 0c "ORCLALRT.LOG"`), the same as th
 10g+ locator.
 
 Reading the bytes is a `TTI_LOBOPS` **FILE_OPEN → GETLEN → READ → FILE_CLOSE**
-sequence, natively — no `DBMS_LOB` helper. Every op rides the **8i LOBOPS
-envelope** (the same family as the CLOB/BLOB read §19.15): `03 60 <seq> 01` + a
-**ub4-LE locator length** + a **25-byte op middle** + the locator + an
-op-specific trailer. Reverse-engineered from a 9.2 OCI client → 8.1.7 capture
+sequence, natively — no `DBMS_LOB` helper. Every op is 9i's request
+(`_O7_LOBOPS`, §19.5) at 8i's fixed little-endian widths (#2284): `03 60 <seq>`,
+the source locator's pointer `01` and `ub4` length, the destination's pointer and
+length, the short source and destination offsets (`ub4`), the charset,
+short-amount and null-LOB pointers, the `ub4` operation, the SCN pointer and
+`ub4` length — the "25-byte op middle" of the first reading — then the locator
+whole, its `ub2` length and body, and the `ub4` short amount when its pointer is
+set — the "trailer". Every request a live 8.1.7 session sends is built that way
+byte for byte, and a locator past 252 bytes goes whole, as 8.1.7 reads it
+(#2331). Reverse-engineered first from a 9.2 OCI client → 8.1.7 capture
 (`OCILobFileOpen/GetLength/Read/FileClose`; `sqlplus` alone shows only the
 locator, so the capture came from a linked OCI program):
 
@@ -6263,21 +6269,21 @@ locator, so the capture came from a linked OCI program):
 **FILE_OPEN returns an updated locator** with the open flag set (the byte at
 locator offset 11 flips `00 → 01`); GETLEN / READ / FILE_CLOSE must use *that*
 locator, exactly like the 9i path — so the same `decode_fv2_opened_locator`
-extracts it. GETLEN's reply carries the file length as a `ub4-LE` right after the
-echoed locator (`decode_o8i_bfile_getlen`). READ's content is the shared
+extracts it. The replies are 9i's (`_O7_LOBOPS_REPLY`) at 8i's widths: GETLEN's
+carries the file length in the `ub4` short amount after the echoed locator
+(`decode_o8i_bfile_getlen`). READ's content is the shared
 `0e fe <chunks> 00` form (`decode_fv2_lob_chunks`), so a large file streams across
 packets and terminates on the zero-length chunk. A missing file surfaces the
-server's `ORA-22285` at FILE_OPEN, in 8i's own OER: the error is the trailing
-`ORA-` text, as in a DML reply (§19.12), and a 9i OER reader finds nothing there
-(#1103).
+server's `ORA-22285` at FILE_OPEN, as 8i's status alone (§19.12); a 9i OER
+reader finds nothing there (#1103).
 
 The fetch does not read the file: the row hands back the `LOB`, and its
 `read()` / `aread()` runs this sequence, as on 9i (§19.8) and 10g+. Reading at
 fetch time made a BFILE naming a missing directory fail the SELECT (#1103).
 
 Encoders: `encode_o8i_bfile_open` / `encode_o8i_bfile_getlen` /
-`encode_o8i_bfile_close` (+ `encode_8i_lob_read` for the READ), all built on the
-shared `_encode_o8i_lobop` envelope. Driver: `O8iDialect.bfile_read`, reached
+`encode_o8i_bfile_close` (+ `encode_8i_lob_read` for the READ), all built by 9i's
+`_encode_o7_lobop` with the 8i codec. Driver: `O8iDialect.bfile_read`, reached
 from `bfile_read_native` (sync + async). This replaced an earlier `DBMS_LOB`
 temp-BLOB helper, removing its `CREATE PROCEDURE` requirement and the stored
 function it left in the user's schema — the same win #46 brought to 10g+/21c.
