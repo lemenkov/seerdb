@@ -13687,6 +13687,36 @@ def _decode_8i_block_values(Data: bytes, NumOut: int) -> tuple[list, bytes]:
     return OutValues, Rest
 
 
+def o8i_block_complete(Data: bytes) -> bool:
+    """Whether an 8i PL/SQL block's reply has arrived whole (#2334).
+
+    8i caps each data packet at the SDU and marks none as a message's last, so
+    a reply carrying long OUT values -- 4000 characters is three packets --
+    arrives in pieces. It is whole once its I/O vector, the value of every bind
+    the vector marks OUT, and a whole status (`o8i_terminal_complete`) are
+    there; a block that failed sends the status alone. A reply that does not
+    decode is taken as whole, for its readers to raise on."""
+    Rest = Data
+    if Rest[:1] == bytes([TTI_IOV]):
+        try:
+            (Iov, Rest) = _O8I_IOV_FROM_O8I(Rest)
+        except IndexError:
+            return False
+        except (ValueError, DataError):
+            return True
+        Count = Iov['iterations'] * 256 + Iov['requests']
+        if len(Rest) < Count:
+            return False
+        NumOut = sum(1 for Mask in Rest[:Count] if Mask & FV2_BIND_OUT)
+        try:
+            Rest = _decode_8i_block_values(Data, NumOut)[1]
+        except (IndexError, Truncated):
+            return False
+        except (ValueError, DataError):
+            return True
+    return bool(Rest) and o8i_terminal_complete(Rest)
+
+
 # 8i statement-type codes (the OCI OCI_STMT_* family), carried at trailer offset
 # +28 of the OALL8 and driving the whole option word. 0 = transaction control
 # (COMMIT / ROLLBACK), which 8i parses on a cursor of its own like any other

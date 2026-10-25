@@ -3082,6 +3082,19 @@ class CursorIntegration(_IntegrationBase):
             self.cur.execute('SELECT object_id FROM all_objects WHERE rownum <= 50')
             self.assertEqual(len(set(self.cur.fetchall())), 50)
 
+    def test_a_long_out_value_reads_from_every_packet(self):
+        # A 4000-character OUT value's reply is three packets on 8i, none
+        # marked last. Read from its first alone, the block failed whenever the
+        # rest had not arrived yet -- about one call in two -- and the rest
+        # answered the next call (#2334). Ten calls, each followed by another.
+        out = self.cur.var(str, 4000)
+        value = 'o' + 'p' * 3999
+        for _ in range(10):
+            self.cur.execute('BEGIN :1 := :2; END;', [out, value])
+            self.assertEqual(out.getvalue(), value)
+            self.cur.execute('SELECT 42 FROM dual')
+            self.assertEqual(self.cur.fetchone(), (42,))
+
     def test_a_refcursor_per_call_outlasts_open_cursors(self):
         # A block that returns a REF CURSOR, more times than open_cursors: 9i
         # closed each one after reading it but never freed it (#2288), and from
