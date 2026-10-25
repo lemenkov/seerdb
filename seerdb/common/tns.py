@@ -1380,6 +1380,14 @@ class _O8iCodec(_OciCodec):
         return _O8iCodec._read_whole(data, False)
 
     @staticmethod
+    def read_long(data: bytes) -> tuple[bytes | None, bytes]:
+        # A LONG / LONG RAW cell's value: chunked however short, `fe 0a`, the
+        # ten bytes, `00`, and a bare zero for NULL (#2284).
+        if _oci_fixed(data, 1, 'long')[0] == 0:
+            return None, data[1:]
+        return _O8iCodec._read_whole(data, False)
+
+    @staticmethod
     def _read_whole(data: bytes, wide: bool) -> tuple[bytes, bytes]:
         # A ub1 length and the bytes, or 0xFE and chunks to a zero length, ub4
         # lengths if `wide` else ub1. A reply ends in a field read so -- a
@@ -1855,6 +1863,56 @@ _O8I_DESCRIBE: wire_schema.Schema = (
     ('n4', 'date_length'),
     ('when', 'date_length', (('value', 'date'),)),
 )
+# 8i's rows (#2284, PROTOCOL.md §19.10) are 9i's row header (`_O7_RXH` and
+# `_O7_VECTORS`) at the 8i codec's widths -- the bit vector a ub4 length and
+# a value, set in a fetch whose row repeats columns -- and then each cell: the
+# value and a 4-byte trailer, an sb2 indicator (-1 NULL) and a ub2 return
+# code. A NULL is the trailer alone, `ff ff 00 00`; a value's length byte is
+# never 0xff, longer text coming in chunks. A LONG or LONG RAW comes chunked
+# however short, and a NULL one as a bare zero with return code 1405. A LOB is
+# a ub4 length and the locator, 0 and no locator for NULL; a ROWID a byte,
+# 0x0e (0 for NULL), and the rowid at fixed widths, as in the status; a
+# UROWID a ub2 length and the logical rowid. Read from 47 row streams of a
+# live 8.1.7.
+_O8I_CELL: wire_schema.Schema = (
+    ('chr', 'value'),
+    ('n2', 'indicator'),
+    ('n2', 'return_code'),
+)
+_O8I_NULL_CELL: wire_schema.Schema = (('n2', 'indicator'), ('n2', 'return_code'))
+_O8I_LONG_CELL: wire_schema.Schema = (
+    ('long', 'value'),
+    ('n2', 'indicator'),
+    ('n2', 'return_code'),
+)
+_O8I_LOB_CELL: wire_schema.Schema = (
+    ('n4', 'length'),
+    ('when', 'length', (('value', 'locator'),)),
+    ('n2', 'indicator'),
+    ('n2', 'return_code'),
+)
+_O8I_ROWID_CELL: wire_schema.Schema = (
+    ('u8', 'size'),
+    (
+        'when',
+        'size',
+        (
+            ('n4', 'rowid_object'),
+            ('n2', 'rowid_file'),
+            ('pad', 1),
+            ('n4', 'rowid_block'),
+            ('n2', 'rowid_slot'),
+        ),
+    ),
+    ('n2', 'indicator'),
+    ('n2', 'return_code'),
+)
+_O8I_UROWID_CELL: wire_schema.Schema = (
+    ('n2', 'length'),
+    ('when', 'length', (('value', 'urowid'),)),
+    ('n2', 'indicator'),
+    ('n2', 'return_code'),
+)
 # Oracle 9i's short status (PROTOCOL.md §19.2, #2284): the 10g+ OER without its
 # call status and sequence number. The head runs to the rowid of the row a DML
 # touched (#1079): row count, ORA code, the two array-error fields, cursor id,
@@ -2062,6 +2120,14 @@ _O7_LOBOPS_REPLY_FROM_THIN = wire_schema.compile_decoder(_O7_LOBOPS_REPLY, _THIN
 _O8I_RPA_FROM_O8I = wire_schema.compile_decoder(_O8I_RPA, _O8I)
 _O8I_STATUS_FROM_O8I = wire_schema.compile_decoder(_O8I_STATUS, _O8I)
 _O8I_DESCRIBE_FROM_O8I = wire_schema.compile_decoder(_O8I_DESCRIBE, _O8I)
+_O7_RXH_FROM_O8I = wire_schema.compile_decoder(_O7_RXH, _O8I)
+_O7_VECTORS_FROM_O8I = wire_schema.compile_decoder(_O7_VECTORS, _O8I)
+_O8I_CELL_FROM_O8I = wire_schema.compile_decoder(_O8I_CELL, _O8I)
+_O8I_NULL_CELL_FROM_O8I = wire_schema.compile_decoder(_O8I_NULL_CELL, _O8I)
+_O8I_LONG_CELL_FROM_O8I = wire_schema.compile_decoder(_O8I_LONG_CELL, _O8I)
+_O8I_LOB_CELL_FROM_O8I = wire_schema.compile_decoder(_O8I_LOB_CELL, _O8I)
+_O8I_ROWID_CELL_FROM_O8I = wire_schema.compile_decoder(_O8I_ROWID_CELL, _O8I)
+_O8I_UROWID_CELL_FROM_O8I = wire_schema.compile_decoder(_O8I_UROWID_CELL, _O8I)
 _AUTH_HEAD_FROM_THIN = wire_schema.compile_decoder(_AUTH_HEAD, _THIN)
 _AUTH_HEAD_FROM_OCI = wire_schema.compile_decoder(_AUTH_HEAD, _OCI)
 _AUTH_PAIR_OCI = wire_schema.compile_encoder(_AUTH_PAIR, _OCI)
@@ -13915,47 +13981,58 @@ def decode_8i_terminal_error(Terminal: bytes) -> tuple[int, str | None]:
     return (Status['code'], Message or None)
 
 
-def _decode_8i_rowid(DataType: int, Val: bytes) -> str | None:
-    # Render an 8i ROWID / UROWID column value (#385). A physical ROWID (type 11)
-    # is a fixed-width little-endian struct — data object (ub4), relative file
-    # (ub2), an unused byte, block (ub4), slot (ub2) — rendered as the extended
-    # base64 form (matches ROWIDTOCHAR). A UROWID (type 208, e.g. an
-    # index-organized table's logical rowid) renders as the "*"-prefixed base64
-    # form (urowid_to_string), the same as the 10g+ path.
+# The 8i cells that are not a value and the trailer (`_o8i_located_cell`).
+_O8I_LOCATED_CELLS = frozenset(
+    (TNS_TYPE_CLOB, TNS_TYPE_BLOB, TNS_TYPE_BFILE, TNS_TYPE_RID, TNS_TYPE_UROWID)
+)
+
+
+def _o8i_located_cell(Type: int, Data: bytes) -> tuple[object, bytes]:
+    # A LOB, ROWID or UROWID cell of an 8i row and the bytes after it: a LOB
+    # the connection resolves after the fetch (_resolve_8i_lobs), an
+    # EMPTY_CLOB reading back as ''; a ROWID the extended base64 form
+    # ROWIDTOCHAR gives (#385); a UROWID the "*"-prefixed form of the 10g+
+    # path. A NULL UROWID is a zero length, which a one-byte reading left a
+    # byte behind, and the fetch then failed with ORA-01002 (#2328).
+    from seerdb.common.lob import LOB
     from seerdb.common.types import rowid_to_string, urowid_to_string
 
-    if not Val:
-        return None
-    if DataType == 208:
-        return urowid_to_string(Val)
-    Obj = int.from_bytes(Val[0:4], 'little')
-    File = int.from_bytes(Val[4:6], 'little')
-    Block = int.from_bytes(Val[7:11], 'little')
-    Slot = int.from_bytes(Val[11:13], 'little')
-    return rowid_to_string(Obj, File, Block, Slot)
+    if Type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB, TNS_TYPE_BFILE):
+        (Cell, Data) = _O8I_LOB_CELL_FROM_O8I(Data)
+        return (LOB(Type, bytes(Cell['locator'])) if Cell['length'] else None, Data)
+    if Type == TNS_TYPE_RID:
+        (Cell, Data) = _O8I_ROWID_CELL_FROM_O8I(Data)
+        if not Cell['size']:
+            return (None, Data)
+        Rowid = rowid_to_string(
+            Cell['rowid_object'],
+            Cell['rowid_file'],
+            Cell['rowid_block'],
+            Cell['rowid_slot'],
+        )
+        return (Rowid, Data)
+    (Cell, Data) = _O8I_UROWID_CELL_FROM_O8I(Data)
+    Body = Cell.get('urowid')
+    return (urowid_to_string(bytes(Body)) if Body else None, Data)
 
 
 def decode_8i_exec_response(
     Data: bytes, Columns: list, PrevRow: list | None = None
 ) -> tuple[list, bytes, list | None]:
-    # Decode an 8i execute/fetch row stream: repeated TTI_RXH (06) + TTI_RXD (07)
-    # pairs, one row per RXD, terminated by the 0x08 piggyback / 0x04 OER
-    # (docs/PROTOCOL.md §19.10). Unlike the 9i fv2 rows (decode_fv2_exec_response,
-    # a 1-byte indicator), each 8i column value is a DALC followed by a FIXED
-    # 4-byte trailer — an sb2 indicator + ub2 return code, both zero when the
-    # value is present. A NULL column carries no value DALC at all: it is the
-    # 4-byte `ff ff 00 00` (indicator -1) on its own. Values are WE8ISO8859P1
+    # Decode an 8i execute/fetch row stream (docs/PROTOCOL.md §19.10): row
+    # headers (`_O7_RXH`, `_O7_VECTORS`) and rows (TTI_RXD), each a cell per
+    # column (`_O8I_CELL` and the rest), up to the status. Values are WE8ISO8859P1
     # (latin-1); decode_value uses the column charset.
     #
-    # 8i compresses duplicate columns: the RXH carries a column bit vector
-    # (`ub1 length` then the vector, at offset 14) whose UNSET bits mark columns
-    # that REPEAT the previous row and so carry no bytes in the following RXD
-    # (LSB = column 0; an empty vector means every column is present). Since 8i
-    # fetches one batch per round trip, a row can repeat a column from the last
-    # row of the PREVIOUS batch, so the caller threads `PrevRow` in and the last
-    # decoded row back out. Returns (rows, terminal, last_row) where `terminal`
-    # is the bytes from the first post-row token (for the cursor id / EOF check).
-    from seerdb.common.lob import LOB
+    # 8i compresses duplicate columns: a row header's bit vector has a bit per
+    # column, LSB first, and a column whose bit is clear REPEATS the previous
+    # row and carries no cell in the row after it; a header with no vector
+    # means every column is there. Since 8i fetches one batch per round trip,
+    # a row can repeat a column from the last row of the PREVIOUS batch, so
+    # the caller threads `PrevRow` in and the last decoded row back out.
+    # Returns (rows, terminal, last_row) where `terminal` is the bytes from the
+    # first token after the rows (for the cursor id / EOF check). A stream that
+    # ends inside a header or a row raises Truncated, for the reader to read on.
     from seerdb.common.types import decode_value, reset_decode_8i, set_decode_8i
 
     # All 8i char data is WE8ISO8859P1 (latin-1); flag the decode so
@@ -13965,100 +14042,43 @@ def decode_8i_exec_response(
     Rows: list = []
     Rest = Data
     Last = PrevRow
-    BitVec = b''
+    Vector = b''
     try:
         while Rest:
-            Token = Rest[0]
-            if Token == TTI_RXH:
-                # The bit vector is `ub1 len` + `len` bytes at offset 14; the RXD
-                # (0x07) follows after a short trailer (skip up to it). An empty
-                # vector (len 0) means all columns are present.
-                VecLen = Rest[14] if len(Rest) > 14 else 0
-                BitVec = bytes(Rest[15 : 15 + VecLen])
-                Idx = 15 + VecLen
-                while Idx < len(Rest) and Rest[Idx] not in (
-                    TTI_RXD,
-                    TTI_OER,
-                    TTI_RPA,
-                ):
-                    Idx += 1
-                Rest = Rest[Idx:]
-            elif Token == TTI_RXD:
+            if Rest[0] == TTI_RXH:
+                (Header, Rest) = _O7_RXH_FROM_O8I(Rest)
+                (Header, Rest) = _O7_VECTORS_FROM_O8I(Rest, Header)
+                Vector = bytes(Header.get('bit_vector', b''))
+            elif Rest[0] == TTI_RXD:
                 Rest = Rest[1:]
                 Row: list = []
                 for ColIdx, Col in enumerate(Columns):
-                    Present = not BitVec or bool(
-                        (BitVec[ColIdx >> 3] >> (ColIdx & 7)) & 1
-                    )
-                    if not Present:
+                    if Vector and not (Vector[ColIdx >> 3] >> (ColIdx & 7)) & 1:
                         # Repeated column: reuse the previous row's value.
                         Row.append(
                             Last[ColIdx] if Last and ColIdx < len(Last) else None
                         )
-                    elif Rest and Rest[0] == 0xFF:
-                        # NULL column: sb2 indicator 0xFFFF + ub2 return code
-                        # 0x0000, with no value DALC.
-                        Rest = Rest[4:]
-                        Row.append(None)
-                    elif Col.get('data_type') in (112, 113, 114):
-                        # LOB column (CLOB/BLOB/BFILE). A NULL LOB is ub4-LE
-                        # num_bytes == 0 followed *directly* by the 4-byte trailer
-                        # (sb2 indicator -1 + ub2 rc), with NO locator. A non-NULL
-                        # cell — including an EMPTY_CLOB/EMPTY_BLOB — carries
-                        # num_bytes == the locator length, then the DALC locator,
-                        # then the trailer; it becomes a LOB the connection
-                        # resolves after the fetch (_resolve_8i_lobs), an empty one
-                        # reading back as ''/b''. Calling decode_dalc on a NULL
-                        # cell (which has no locator) ate the indicator's first
-                        # byte and desynced every later row (#387).
-                        NumBytes = int.from_bytes(Rest[0:4], 'little')
-                        Rest = Rest[4:]
-                        if NumBytes == 0:
-                            Rest = Rest[4:]  # sb2 indicator (-1) + ub2 rc
-                            Row.append(None)
-                        else:
-                            (Locator, Rest) = decode_dalc(Rest)
-                            Rest = Rest[4:]  # sb2 indicator + ub2 rc
-                            Row.append(
-                                LOB(Col['data_type'], bytes(Locator))
-                                if not isinstance(Locator, list)
-                                else None
-                            )
-                    elif Col.get('data_type') == 11:
-                        # Physical ROWID (#385): a 1-byte reserved-size indicator
-                        # (0 = NULL), then the FIXED 13-byte rowid struct (it is
-                        # NOT a length-prefixed DALC), then the 4-byte trailer.
-                        Indicator = Rest[0]
-                        Rest = Rest[1:]
-                        if Indicator == 0:
-                            Rest = Rest[4:]  # trailer
-                            Row.append(None)
-                        else:
-                            Struct = bytes(Rest[:13])
-                            Rest = Rest[13 + 4 :]  # struct + trailer
-                            Row.append(_decode_8i_rowid(11, Struct))
-                    elif Col.get('data_type') == 208:
-                        # UROWID (#385): a 1-byte indicator (0 = NULL), a reserved
-                        # byte, a 1-byte body length, the logical-rowid body, then
-                        # the 4-byte trailer.
-                        Indicator = Rest[0]
-                        if Indicator == 0:
-                            Rest = Rest[1 + 4 :]
-                            Row.append(None)
-                        else:
-                            BodyLen = Rest[2]
-                            Body = bytes(Rest[3 : 3 + BodyLen])
-                            Rest = Rest[3 + BodyLen + 4 :]  # header + body + trailer
-                            Row.append(_decode_8i_rowid(208, Body))
+                        continue
+                    Type = Col.get('data_type')
+                    if Type in _O8I_LOCATED_CELLS:
+                        (Value, Rest) = _o8i_located_cell(Type, Rest)
+                    elif Rest[:1] == b'\xff':
+                        # NULL: the trailer alone.
+                        (Value, Rest) = (None, _O8I_NULL_CELL_FROM_O8I(Rest)[1])
                     else:
-                        (Val, Rest) = decode_dalc(Rest)
-                        Rest = Rest[4:]  # sb2 indicator (0) + ub2 return code (0)
-                        Row.append(decode_value(Col, Val))
+                        if Type in (TNS_TYPE_LONG, TNS_TYPE_LONGRAW):
+                            (Cell, Rest) = _O8I_LONG_CELL_FROM_O8I(Rest)
+                        else:
+                            (Cell, Rest) = _O8I_CELL_FROM_O8I(Rest)
+                        Value = decode_value(Col, Cell['value'])
+                    Row.append(Value)
                 Rows.append(Row)
                 Last = Row
-                BitVec = b''
+                Vector = b''
             else:
                 break
+    except IndexError as Exc:
+        raise Truncated(f'8i rows: {Exc}') from Exc
     finally:
         reset_decode_8i(_FlagToken)
     return (Rows, Rest, Last)

@@ -299,5 +299,28 @@ class TestALongMessageArrivesWhole(unittest.TestCase):
         self.assertTrue(message.endswith('ORA-06512: at line 1'), message[-24:])
 
 
+class TestANullUrowid(unittest.TestCase):
+    """An 8i UROWID cell is a ub2 length and the logical rowid, then the
+    trailer every cell has; a NULL one is a zero length (#2328). Read as one
+    byte, its second byte was taken for the status, the row after it was
+    lost, and the next fetch failed with ORA-01002. The fetch is captured from
+    seerdb's own session on 8.1.7."""
+
+    COLUMNS = [
+        {'data_type': 2, 'charset': 0, 'csfrm': 0, 'column_name': b'K'},
+        {'data_type': 208, 'charset': 0, 'csfrm': 0, 'column_name': b'R'},
+    ]
+
+    def test_the_rows_around_it_are_read(self):
+        from seerdb.common.tns import decode_8i_exec_response, decode_8i_terminal_error
+
+        (rows, status, last) = decode_8i_exec_response(
+            _load_capture('o8i_rows_null_urowid.hexdump'), self.COLUMNS, [1, None]
+        )
+        self.assertEqual(rows, [[2, None], [3, '*BAFAAMcCwQT+']])
+        self.assertEqual(decode_8i_terminal_error(status)[0], 1403)
+        self.assertEqual(last, [3, '*BAFAAMcCwQT+'])
+
+
 if __name__ == '__main__':
     unittest.main()

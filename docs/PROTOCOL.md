@@ -5924,14 +5924,31 @@ flags, precision and scale bytes and the first byte of `max_length` made one
 "size field", so a column of 256 bytes or more was described by its low byte:
 a VARCHAR2(4000) as 160 (#2324).
 
-The **rows** follow as repeated `TTI_RXH` (`06`) + `TTI_RXD` (`07`) pairs. Unlike
-the 9i 1-byte indicator (§19.2), each 8i column value is a DALC **followed by a
-fixed 4-byte trailer** (`sb2` indicator + `ub2` return code, both zero when
-present). A **NULL** column carries no value DALC at all — it is the bare 4-byte
-`ff ff 00 00` (indicator −1). Values are **WE8ISO8859P1** (latin-1). The
-rows end in the call's status (§19.12), with or without the RPA in front of it;
-its **cursor id** drives the fetch loop. Decoders: `decode_8i_exec_response` /
-`decode_8i_cursor_id`.
+The **rows** follow as row headers (`TTI_RXH`, `06`) and rows (`TTI_RXD`, `07`).
+The row header is 9i's (§19.2, `_O7_RXH` and `_O7_VECTORS`) at 8i's fixed
+widths, 18 bytes when it has no vector: flags, `ub2` columns sent, `ub2`
+iteration, `ub2` iterations (100 in a fetch), `ub2` buffer length, then the
+bit vector and the rowid, each a `ub4` length and a value. Each cell is a value
+and a **fixed 4-byte trailer**, an `sb2` indicator and a `ub2` return code
+(`_O8I_CELL`):
+
+```
+value cell        <value> 00 00 00 00      a ub1 length, or past 252 bytes fe,
+                                           chunks with ub1 lengths, 00
+NULL              ff ff 00 00              the trailer alone; a length is never ff
+LONG, LONG RAW    fe 0a <10 bytes> 00 ...  chunked however short;
+                  00 ff ff 7d 05           NULL: a bare zero, return code 1405
+CLOB, BLOB, BFILE ub4 length, the locator as a value, the trailer;
+                  00 00 00 00 ff ff 00 00  NULL
+ROWID             0e, the rowid, the trailer; NULL 00 and the trailer
+UROWID            ub2 length, the logical rowid as a value, the trailer;
+                  00 00 ff ff 00 00        NULL
+```
+
+Read from 47 row streams of a live 8.1.7. Values are **WE8ISO8859P1**
+(latin-1). The rows end in the call's status (§19.12), with or without the RPA
+in front of it; its **cursor id** drives the fetch loop. Decoders:
+`decode_8i_exec_response` / `decode_8i_cursor_id`.
 
 **Rejected SELECT (#384).** When the server rejects the statement (bad table, bad
 column, …) the execute reply is a **`TTI_OER` (`0x04`)** error status, *not* the
@@ -5964,28 +5981,31 @@ read timeout.
 
 **Duplicate-column compression.** Like the modern `TTI_BVC`, 8i omits a column
 from the RXD when it repeats the previous row's value — but 8i carries the
-**column bit vector inside the RXH** (a `ub1` length + the vector, at offset 14)
-rather than as a separate token. LSB = column 0; an **unset** bit means "repeat
-the previous row", so the RXD only carries the set-bit columns (e.g. a 3-column
-row whose middle value repeats sends bit vector `05` = `0b101`). Because 8i
-fetches one batch per round trip, a row can repeat a column from the **previous
-batch's** last row, so `decode_8i_exec_response` threads the last decoded row
-across calls. Missing this desyncs the RXD as soon as two consecutive rows share
-a column value.
+**column bit vector inside the RXH**, its `ub4` length and the vector, rather
+than as a separate token. LSB = column 0; an **unset** bit means "repeat the
+previous row", so the RXD only carries the set-bit columns (e.g. a 12-column
+row with 8 columns sent has the vector `02 87 0f`, and the header's column
+count is 8). The vector applies to the one row after its header. Because 8i
+fetches one batch per round trip, a row can repeat a column from the
+**previous batch's** last row, so `decode_8i_exec_response` threads the last
+decoded row across calls. Missing this desyncs the RXD as soon as two
+consecutive rows share a column value.
 
 **ROWID / UROWID (#385).** These are **not** length-prefixed DALCs. A physical
-**ROWID** (type 11) is a 1-byte reserved-size indicator (`0e`; 0 = NULL), a
-**fixed 13-byte struct** — data object (ub4 LE), relative file (ub2 LE), an
-unused byte, block (ub4 LE), slot (ub2 LE) — then the 4-byte trailer; it renders
-to the extended base64 string (matches `ROWIDTOCHAR`), e.g. struct
+**ROWID** (type 11) is a byte (`0e`; 0 = NULL), the rowid at fixed widths as in
+the status (§19.12) — data object (ub4 LE), relative file (ub2 LE), an unused
+byte, block (ub4 LE), slot (ub2 LE) — then the trailer (`_O8I_ROWID_CELL`); it
+renders to the extended base64 string (matches `ROWIDTOCHAR`), e.g.
 `33 68 00 00 05 00 00 bb 00 00 00 00 00` → `AAAGgzAAFAAAAC7AAA`. A **UROWID**
-(type 208, e.g. an index-organized table's logical rowid) is the indicator, a
-reserved byte, a 1-byte body length, the body, then the trailer; it renders as
-the `*`-prefixed base64 form (`urowid_to_string`). Both are usable as binds
-(a ROWID/UROWID string binds straight back into `WHERE ROWID = :r`). Reading a
-ROWID as a DALC over-consumes one byte and desyncs the next column. Decoder:
-`_decode_8i_rowid`. Note: `ROWIDTOCHAR(ROWID)` on an IOT raises ORA-01410 on 8i,
-so the UROWID reference comes from the raw value, not that function.
+(type 208, e.g. an index-organized table's logical rowid) is a `ub2` length,
+the logical rowid as a value (a `ub1` length and the bytes), then the trailer
+(`_O8I_UROWID_CELL`); it renders as the `*`-prefixed base64 form
+(`urowid_to_string`). Read as an indicator byte, a reserved byte and a `ub1`
+length, a set UROWID decoded right and a NULL one, `00 00`, left a byte unread,
+and the fetch then failed with ORA-01002 (#2328). Both are usable as binds (a
+ROWID/UROWID string binds straight back into `WHERE ROWID = :r`). Note:
+`ROWIDTOCHAR(ROWID)` on an IOT raises ORA-01410 on 8i, so the UROWID reference
+comes from the raw value, not that function.
 
 ### 19.11 Oracle 8i IN binds — the 9.2-era bind section (#359)
 
