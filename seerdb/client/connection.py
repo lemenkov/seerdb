@@ -1621,15 +1621,19 @@ class OracleConnect(_ConnectionLogic):
                                 self._o3_phase = 1
                                 self._send_8i_osesskey()
                             elif self.field_version < FIELD_VERSION_10_2:
-                                # Pre-10g (9i, field version 2): O3LOGON thin
-                                # auth — TTI_3LOGA fetches the session key (#90).
-                                from seerdb.common.tns import encode_o3logon_phase1
+                                # Pre-10g (9i, field version 2): O3LOGON in the
+                                # thin-coded OSESSKEY, which fetches the session
+                                # key (#90, #2342).
+                                from seerdb.common.tns import encode_o7_osesskey
 
                                 self._o3_phase = 1
                                 self.send(
                                     TNS_DATA,
-                                    encode_o3logon_phase1(
-                                        self._next_seq(), self.user.encode('utf-8')
+                                    encode_o7_osesskey(
+                                        self._next_seq(),
+                                        self.user.encode('utf-8'),
+                                        self._o7_logon_mode(),
+                                        self._o7_session_pairs(),
                                     ),
                                 )
                             elif self.access_token is not None:
@@ -1660,6 +1664,17 @@ class OracleConnect(_ConnectionLogic):
                             if getattr(self, '_o3_phase', 0) == 1:
                                 self._send_o3logon_phase2(Packet)
                                 continue
+                            if getattr(self, '_o3_phase', 0) == 2:
+                                # 9i's OAUTH answered with its pairs (#2342):
+                                # authenticated, no server proof to check on the
+                                # pre-10g path.
+                                assert isinstance(self._dialect, Fv2Dialect)
+                                self.conn_state = CONN_STATE_AUTHENTICATED
+                                logger.debug('handle_login: authenticated (O3LOGON)')
+                                self.server_version = cast(
+                                    int, self._drive(self._dialect.server_version())
+                                )
+                                return 0
                             return self._handle_rpa(Packet[1:])
                         case p if p == TTI_WRN:
                             logger.debug('handle_login: recv WRN %s', Packet[1:])
@@ -1815,9 +1830,9 @@ class OracleConnect(_ConnectionLogic):
                 self.field_version = min(self.field_version, ServerFv)
             # Oracle 8i (8.1.x) carries no caps in its PRO, so the field version
             # can't be negotiated down from the client default — pin it to 2 (as
-            # 9i) so the O3LOGON path runs, not the 23ai fast-auth path. 8i also
-            # speaks the OSESSKEY-envelope O3LOGON (not 9i's TTI_3LOGA), so flag
-            # it for the login state machine.
+            # 9i) so the O3LOGON path runs, not the 23ai fast-auth path. 8i reads
+            # its OSESSKEY-envelope O3LOGON at fixed widths, where 9i reads it
+            # thin-coded, so flag it for the login state machine.
             Banner = Pro.get('banner') or b''
             VerMatch = _re.search(rb'(\d+)\.\d+\.\d+', Banner)
             # 8i (banner "8.x") pins the field version to 2 (as 9i) so the O3LOGON
@@ -1927,18 +1942,17 @@ class OracleConnect(_ConnectionLogic):
             return 1
 
     def _send_o3logon_phase2(self, Packet: bytes) -> None:
-        # O3LOGON phase two (#90): the TTI_3LOGA response RPA carries the
-        # session key as an ASCII-hex string (decode_o7_session_key, the RPA,
-        # a ub4 length and the hex). Decrypt it with the account's
-        # DES verifier to recover the plaintext session key, DES-encrypt the
-        # zero-padded password under it, and send TTI_3LOGON with AUTH_PASSWORD
-        # = upper-hex(cipher) + decimal(pad count).
-        from binascii import hexlify, unhexlify
+        # 9i's O3LOGON phase two (#90, #2342): the OSESSKEY reply's AUTH_SESSKEY
+        # is the session key's ASCII hex. Decrypt it with the account's DES
+        # verifier to recover the plaintext session key, DES-encrypt the
+        # zero-padded password under it, and send the thin-coded OAUTH with
+        # AUTH_PASSWORD = upper-hex(cipher) + decimal(pad count).
+        from binascii import hexlify
 
         from seerdb.common.crypto import des_verifier, o3logon
-        from seerdb.common.tns import decode_o7_session_key, encode_o3logon_phase2
+        from seerdb.common.tns import encode_o7_oauth, parse_8i_auth_sesskey
 
-        SessKey = unhexlify(decode_o7_session_key(Packet))
+        SessKey = parse_8i_auth_sesskey(Packet, O8i=False)
         UserB = self.user.encode('utf-8')
         PassB = self.password.encode('utf-8')
         Verifier = des_verifier(UserB, PassB)
@@ -1948,7 +1962,16 @@ class OracleConnect(_ConnectionLogic):
             'ascii'
         )
         self._o3_phase = 2
-        self.send(TNS_DATA, encode_o3logon_phase2(self._next_seq(), UserB, PwdField))
+        self.send(
+            TNS_DATA,
+            encode_o7_oauth(
+                self._next_seq(),
+                UserB,
+                self._o7_logon_mode() | 0x100,
+                PwdField,
+                self._o7_session_pairs() + [(b'AUTH_ACL', b'8000')],
+            ),
+        )
 
     def _auth_info_pairs(self) -> list:
         # Informational AUTH_ pairs the OSESSKEY/OAUTH calls carry — session

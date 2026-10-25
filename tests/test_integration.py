@@ -7905,6 +7905,27 @@ class EmptyAppNameIntegration(_ThrottleRetry, unittest.TestCase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class SessionIdentityIntegration(_ThrottleRetry, unittest.TestCase):
+    """A session tells the server the client's host, as its machine. 9i's
+    login once sent the strings of the JDBC capture it was built from, so a 9i
+    server saw every session come from a host called o9i (#2342)."""
+
+    def test_the_server_sees_the_clients_host(self):
+        import socket
+
+        if os.environ.get('SEERDB_TEST_MIRROR') == 'postgres':
+            self.skipTest('the Mirror over PostgreSQL reports no USERENV HOST (#2346)')
+        conn = _connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT SYS_CONTEXT('USERENV', 'HOST') FROM dual")
+            (host,) = cur.fetchone()
+            self.assertEqual(host, socket.gethostname())
+        finally:
+            conn.close()
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class ChangePasswordIntegration(_ThrottleRetry, unittest.TestCase):
     """Connection.changepassword over the wire (#21). Each test changes the
     test user's password and always restores it (on the original, still-

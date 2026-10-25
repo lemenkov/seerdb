@@ -296,8 +296,6 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_UROWID,
     TNS_TYPE_VARCHAR,
     TNS_TYPE_VECTOR,
-    TTI_3LOGA,
-    TTI_3LOGON,
     TTI_ALL7,
     TTI_ALL8,
     TTI_AUTH,
@@ -1757,7 +1755,8 @@ _LOB_READ_REPLY: wire_schema.Schema = (
 # there and 11.2 whatever its buffer held, so they are skipped, never read as
 # part of the count (#2249). Oracle 8i's OSESSKEY and OAUTH (#2284) are this
 # head at the 8i codec's widths, the count a ub4 alone, and their pairs these;
-# the replies an RPA, a ub2 pair count and the pairs (`_O8I_AUTH_REPLY`). Not
+# the replies an RPA, a ub2 pair count and the pairs (`_PRE10_AUTH_REPLY`).
+# 9i's are this head thin-coded, the user raw (#2342). Not
 # on the wire, so
 # given to the decoder: whether a 23ai OAUTH carries its has-user pointer (thin
 # only, detected by its first byte), and whether the user is length-prefixed
@@ -2175,15 +2174,21 @@ _AUTH_FROM_OCI = wire_schema.compile_decoder(
 _AUTH_O8I = wire_schema.compile_encoder(
     (*_AUTH_HEAD, ('each', 'pairs', 'pair_count', _AUTH_PAIR)), _O8I
 )
-# An 8i login reply (#2284): the RPA, a ub2 pair count -- AUTH_SESSKEY alone at
-# phase one, 22 at phase two -- and the pairs; an empty value is a zero length
-# and no value, as AUTH_CAPABILITY_TABLE's. The status follows.
-_O8I_AUTH_REPLY: wire_schema.Schema = (
+_AUTH_THIN = wire_schema.compile_encoder(
+    (*_AUTH_HEAD, ('each', 'pairs', 'pair_count', _AUTH_PAIR)), _THIN
+)
+# A pre-10g login reply (#2284, #2342): the RPA, a ub2 pair count --
+# AUTH_SESSKEY alone at phase one, 22 pairs (8.1.7) or 23 (9.2.0.4) at phase
+# two -- and the pairs; an empty value is a zero length and no value, as
+# AUTH_CAPABILITY_TABLE's. The status follows. 8i's at the 8i codec's widths,
+# 9i's thin-coded.
+_PRE10_AUTH_REPLY: wire_schema.Schema = (
     ('const', bytes([TTI_RPA])),
     ('n2', 'pair_count'),
     ('each', 'pairs', 'pair_count', _AUTH_PAIR),
 )
-_O8I_AUTH_REPLY_FROM_O8I = wire_schema.compile_decoder(_O8I_AUTH_REPLY, _O8I)
+_PRE10_AUTH_REPLY_FROM_O8I = wire_schema.compile_decoder(_PRE10_AUTH_REPLY, _O8I)
+_PRE10_AUTH_REPLY_FROM_THIN = wire_schema.compile_decoder(_PRE10_AUTH_REPLY, _THIN)
 
 
 def decode_auth_head(
@@ -15037,140 +15042,6 @@ def _encode_dictionary_sess(Dictionary: dict) -> bytes:
     )
 
 
-# Pre-10g (9i) thin authentication uses O3LOGON: TTI_3LOGA (0x52) to fetch the
-# session key, then TTI_3LOGON (0x51) to send the password (#90). The OSESSKEY
-# path above (TTI_SESS) is what 10g+ thin clients and OCI use; 9i's field
-# version 2 expects this older positional message instead. The two encoders
-# below reproduce the Oracle JDBC thin driver's 9i messages byte-for-byte
-# (verified — see tests/test_tns_encode.py). The terminal/machine/osuser/program
-# strings are session metadata the server does not authenticate on, so we send
-# the same values JDBC does; only the username and (phase two) the password vary.
-# The session-metadata strings JDBC sends: terminal / machine / osuser / program.
-_O3_TERMINAL, _O3_MACHINE, _O3_OSUSER, _O3_PROGRAM = (
-    b'unknown',
-    b'o9i',
-    b'root',
-    b'JDBC Thin Client',
-)
-# 9i's O3LOGON requests from schemas (#2284). After the user's pointer and
-# length -- and in 3LOGON the password field's -- comes an attribute block:
-# terminal, machine and osuser, each a pointer and a length, which 9.2.0.4
-# stores whole (a 30-character terminal and a 64-character machine name were
-# tried); then a block that is not understood (#2342). The code once filled its
-# `02 <n> 00 00 00 01 01 <n>`, and the n in the phase's tail, with the program
-# string's length, 16 for JDBC's. Measured, 9.2.0.4 takes the login only when
-# the two n are equal and at least 16: equal but shorter draws ORA-01017, and
-# unequal ones a refusal or a closed connection. So the block is the
-# constant JDBC sends, and the program string its 16 bytes, until it is
-# understood. The strings follow the user, raw, at the lengths given.
-_O7_LOGON_ATTRS: wire_schema.Schema = (
-    ('ptr', 'terminal_present'),
-    ('n4', 'terminal_length'),
-    ('ptr', 'machine_present'),
-    ('n4', 'machine_length'),
-    ('ptr', 'osuser_present'),
-    ('n4', 'osuser_length'),
-    ('const', bytes([2, 16, 0, 0, 0, 1, 1, 16])),
-)
-_O7_LOGON_STRINGS: wire_schema.Schema = (
-    ('bytes', 'terminal', 'terminal_length'),
-    ('bytes', 'machine', 'machine_length'),
-    ('bytes', 'osuser', 'osuser_length'),
-    ('bytes', 'program', 16),
-)
-# TTI_3LOGA (0x52), asking for the session key.
-_O7_3LOGA: wire_schema.Schema = (
-    ('const', bytes([TTI_FUN, TTI_3LOGA])),
-    ('u8', 'seq'),
-    ('ptr', 'user_present'),
-    ('n4', 'user_length'),
-    ('const', bytes(6)),
-    *_O7_LOGON_ATTRS,
-    ('const', bytes([0, 0, 0, 0, 1, 1, 16, 1])),
-    ('bytes', 'user', 'user_length'),
-    *_O7_LOGON_STRINGS,
-)
-# TTI_3LOGON (0x51), sending AUTH_PASSWORD: the hex of the DES blocks and the
-# pad count.
-_O7_3LOGON: wire_schema.Schema = (
-    ('const', bytes([TTI_FUN, TTI_3LOGON])),
-    ('u8', 'seq'),
-    ('ptr', 'user_present'),
-    ('n4', 'user_length'),
-    ('ptr', 'password_present'),
-    ('n4', 'password_length'),
-    ('const', bytes(4)),
-    *_O7_LOGON_ATTRS,
-    ('const', bytes([0, 0, 0, 0, 0, 1, 16, 0])),
-    ('bytes', 'user', 'user_length'),
-    ('bytes', 'password', 'password_length'),
-    *_O7_LOGON_STRINGS,
-)
-# 3LOGA's reply: the RPA and the session key, its ASCII hex, a ub4 length and
-# the bytes (`08 01 10` and 16 hex digits); the status follows. Read before as
-# its third byte for the length, which agrees with this while the key is
-# shorter than 256.
-_O7_SESSION_KEY: wire_schema.Schema = (
-    ('const', bytes([TTI_RPA])),
-    ('n4', 'key_length'),
-    ('bytes', 'session_key', 'key_length'),
-)
-_O7_3LOGA_THIN = wire_schema.compile_encoder(_O7_3LOGA, _THIN)
-_O7_3LOGON_THIN = wire_schema.compile_encoder(_O7_3LOGON, _THIN)
-_O7_SESSION_KEY_FROM_THIN = wire_schema.compile_decoder(_O7_SESSION_KEY, _THIN)
-
-
-def _o7_logon_strings() -> dict:
-    # The session strings and their lengths, as JDBC sends them.
-    return {
-        'terminal_present': True,
-        'terminal_length': len(_O3_TERMINAL),
-        'terminal': _O3_TERMINAL,
-        'machine_present': True,
-        'machine_length': len(_O3_MACHINE),
-        'machine': _O3_MACHINE,
-        'osuser_present': True,
-        'osuser_length': len(_O3_OSUSER),
-        'osuser': _O3_OSUSER,
-        'program': _O3_PROGRAM,
-    }
-
-
-def encode_o3logon_phase1(Seq: int, User: bytes) -> bytes:
-    # TTI_3LOGA: request the session key. No password field.
-    return _O7_3LOGA_THIN(
-        {
-            'seq': Seq,
-            'user_present': True,
-            'user_length': len(User),
-            'user': User,
-            **_o7_logon_strings(),
-        }
-    )
-
-
-def encode_o3logon_phase2(Seq: int, User: bytes, PwdField: bytes) -> bytes:
-    # TTI_3LOGON: send the AUTH_PASSWORD (hex(DES blocks) + decimal pad count).
-    return _O7_3LOGON_THIN(
-        {
-            'seq': Seq,
-            'user_present': True,
-            'user_length': len(User),
-            'user': User,
-            'password_present': True,
-            'password_length': len(PwdField),
-            'password': PwdField,
-            **_o7_logon_strings(),
-        }
-    )
-
-
-def decode_o7_session_key(Packet: bytes) -> bytes:
-    """The session key a 9i TTI_3LOGA reply carries, as the bytes of its ASCII
-    hex (`_O7_SESSION_KEY`), for O3LOGON's phase two to decrypt."""
-    return bytes(_O7_SESSION_KEY_FROM_THIN(Packet)[0]['session_key'])
-
-
 # --- Oracle 8i (8.1.7) O3LOGON via the OSESSKEY/OAUTH envelope ---------------
 # 8i uses the same DES O3LOGON *crypto* as 9i, but wraps it in the OSESSKEY
 # (0x76) / OAUTH (0x73) function envelope with key-value AUTH_ pairs -- NOT 9i's
@@ -15201,14 +15072,20 @@ def _o8i_info_pairs(Pairs: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes
     ]
 
 
-def _o8i_login(
-    Subtype: int, Seq: int, User: bytes, Mode: int, Pairs: list[tuple[bytes, bytes]]
+def _pre10_login(
+    Subtype: int,
+    Seq: int,
+    User: bytes,
+    Mode: int,
+    Pairs: list[tuple[bytes, bytes]],
+    O8i: bool = True,
 ) -> bytes:
-    # An 8i OSESSKEY or OAUTH call (`_AUTH_HEAD` and `_AUTH_PAIR` at the 8i
-    # codec's widths). An empty value is a zero length and no value, as 8.1.7
-    # writes one; written as one zero byte, the pair came out three bytes short
-    # and the login failed (#2344).
-    return _AUTH_O8I(
+    # A pre-10g OSESSKEY or OAUTH call (`_AUTH_HEAD` and `_AUTH_PAIR`): 8i's at
+    # the 8i codec's widths, the user as a value; 9i's thin-coded, the user raw,
+    # as a 10g client below 12.1 sends it (#2342). An empty value is a zero
+    # length and no value, as 8.1.7 writes one; written as one zero byte, the
+    # pair came out three bytes short and the login failed (#2344).
+    return (_AUTH_O8I if O8i else _AUTH_THIN)(
         {
             'subtype': Subtype,
             'seq': Seq,
@@ -15219,8 +15096,9 @@ def _o8i_login(
             'pair_count': len(Pairs),
             'pointer_3': True,
             'pointer_4': True,
-            'user_prefixed': True,
-            'user_raw': False,
+            'has_user_ptr': False,
+            'user_prefixed': O8i,
+            'user_raw': not O8i,
             'user': User,
             'pairs': [
                 {
@@ -15242,7 +15120,7 @@ def encode_o3logon_osesskey_phase1(
     # TTI_FUN + OSESSKEY (0x76), mode 1: request the session key. Carries the
     # username and informational AUTH_ pairs (program/machine/pid -- session
     # metadata the server does not authenticate on).
-    return _o8i_login(TTI_SESS, Seq, User, 1, _o8i_info_pairs(Pairs))
+    return _pre10_login(TTI_SESS, Seq, User, 1, _o8i_info_pairs(Pairs))
 
 
 def encode_o3logon_oauth_phase2(
@@ -15252,7 +15130,7 @@ def encode_o3logon_oauth_phase2(
     # decimal pad count) plus the informational pairs. The count follows the
     # pairs; written as part of the mode, `00 00 01 05`, it held only while
     # they were five.
-    return _o8i_login(
+    return _pre10_login(
         TTI_AUTH,
         Seq,
         User,
@@ -15261,17 +15139,40 @@ def encode_o3logon_oauth_phase2(
     )
 
 
-def parse_8i_auth_sesskey(Packet: bytes) -> bytes:
-    """Extract the 8-byte session key from an 8i OSESSKEY response RPA.
+def encode_o7_osesskey(
+    Seq: int, User: bytes, Mode: int, Pairs: list[tuple[bytes, bytes]]
+) -> bytes:
+    # Oracle 9i's O3LOGON phase one (#2342): OSESSKEY (0x76) thin-coded, the
+    # user raw, and the session pairs a 10g client below 12.1 sends -- program,
+    # machine, pid, osuser -- which 9.2.0.4 takes: its USERENV HOST is the
+    # machine sent. JDBC thin's positional 3LOGA carried the strings of the
+    # capture it was taken from behind a block not understood, so every 9i
+    # session called itself `JDBC Thin Client` on `o9i`.
+    return _pre10_login(TTI_SESS, Seq, User, Mode, Pairs, O8i=False)
 
-    The AUTH_SESSKEY value is its ASCII hex (`_O8I_AUTH_REPLY`)."""
+
+def encode_o7_oauth(
+    Seq: int, User: bytes, Mode: int, PwdField: bytes, Pairs: list[tuple[bytes, bytes]]
+) -> bytes:
+    # 9i's phase two: OAUTH (0x73) thin-coded, AUTH_PASSWORD -- O3LOGON's DES
+    # proof as 8i sends it, hex(DES blocks) + decimal pad count -- and the pairs.
+    return _pre10_login(
+        TTI_AUTH, Seq, User, Mode, [(b'AUTH_PASSWORD', PwdField), *Pairs], O8i=False
+    )
+
+
+def parse_8i_auth_sesskey(Packet: bytes, O8i: bool = True) -> bytes:
+    """Extract the 8-byte session key from an 8i -- or, with `O8i` False, a 9i
+    -- OSESSKEY response RPA.
+
+    The AUTH_SESSKEY value is its ASCII hex (`_PRE10_AUTH_REPLY`)."""
     from binascii import unhexlify
 
     from seerdb.common.exceptions import InterfaceError
 
-    Value = parse_8i_auth_value(Packet, b'AUTH_SESSKEY')
+    Value = parse_8i_auth_value(Packet, b'AUTH_SESSKEY', O8i)
     if Value is None:
-        raise InterfaceError('8i OSESSKEY response carried no AUTH_SESSKEY')
+        raise InterfaceError('pre-10g OSESSKEY response carried no AUTH_SESSKEY')
     return unhexlify(Value)
 
 
@@ -15281,14 +15182,15 @@ def decode_8i_server_version(Packet: bytes) -> int:
     return _auth_int(parse_8i_auth_value(Packet, b'AUTH_VERSION_NO')) or 0
 
 
-def parse_8i_auth_value(Packet: bytes, Key: bytes) -> bytes | None:
-    """One value of an 8i login reply (`_O8I_AUTH_REPLY`), b'' for an empty
-    one, or None when the reply lacks it or is not an RPA of pairs. The
-    phase-two reply carries AUTH_VERSION_NO (#2278). Read before by searching
-    for the key's name, a key sent with its NUL terminator, as the AUTH_NLS_
-    ones are, read as empty."""
+def parse_8i_auth_value(Packet: bytes, Key: bytes, O8i: bool = True) -> bytes | None:
+    """One value of an 8i login reply (`_PRE10_AUTH_REPLY`), or with `O8i`
+    False a 9i one, b'' for an empty one, or None when the reply lacks it or is
+    not an RPA of pairs. The phase-two reply carries AUTH_VERSION_NO (#2278).
+    Read before by searching for the key's name, a key sent with its NUL
+    terminator, as the AUTH_NLS_ ones are, read as empty."""
+    Decode = _PRE10_AUTH_REPLY_FROM_O8I if O8i else _PRE10_AUTH_REPLY_FROM_THIN
     try:
-        Reply = _O8I_AUTH_REPLY_FROM_O8I(Packet)[0]
+        Reply = Decode(Packet)[0]
     except (IndexError, ValueError, DataError):
         return None
     for Pair in Reply['pairs']:
