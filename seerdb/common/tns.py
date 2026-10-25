@@ -1913,6 +1913,29 @@ _O8I_UROWID_CELL: wire_schema.Schema = (
     ('n2', 'indicator'),
     ('n2', 'return_code'),
 )
+# 8i's I/O vector, the "bind prompt" a PL/SQL block's reply opens with (#2284,
+# PROTOCOL.md §19.14): 9i's (`_O7_IOV`) at the 8i codec's widths, but with its
+# iterations a ub2 -- the binds are `iterations * 256 + requests`, 300 coming
+# as `2c 00 01 00` (#2311) -- then the iterations this time, 1, and eight
+# bytes zero in every reply measured, where the buffer length and the two
+# vector lengths go; then one direction byte per bind, as on 9i. The values
+# of the binds the block writes follow in a TTI_RXD, each a value and an sb2
+# indicator (-1 for NULL), with no return code; an OUT bind the block never
+# assigned is `ff` and the indicator 3105 (`ff 21 0c`), as 9i's is (#801).
+# Read from 20 live 8.1.7 block replies with nothing left over.
+_O8I_IOV: wire_schema.Schema = (
+    ('const', bytes([TTI_IOV])),
+    ('u8', 'flags'),
+    ('n2', 'requests'),
+    ('n2', 'iterations'),
+    ('n4', 'iterations_this_time'),
+    ('const', bytes(8)),
+)
+_O8I_OUT_CELL: wire_schema.Schema = (('chr', 'value'), ('n2', 'indicator'))
+_O8I_OUT_UNASSIGNED: wire_schema.Schema = (
+    ('const', b'\xff'),
+    ('n2', 'indicator'),
+)
 # Oracle 9i's short status (PROTOCOL.md §19.2, #2284): the 10g+ OER without its
 # call status and sequence number. The head runs to the rowid of the row a DML
 # touched (#1079): row count, ORA code, the two array-error fields, cursor id,
@@ -2128,6 +2151,9 @@ _O8I_LONG_CELL_FROM_O8I = wire_schema.compile_decoder(_O8I_LONG_CELL, _O8I)
 _O8I_LOB_CELL_FROM_O8I = wire_schema.compile_decoder(_O8I_LOB_CELL, _O8I)
 _O8I_ROWID_CELL_FROM_O8I = wire_schema.compile_decoder(_O8I_ROWID_CELL, _O8I)
 _O8I_UROWID_CELL_FROM_O8I = wire_schema.compile_decoder(_O8I_UROWID_CELL, _O8I)
+_O8I_IOV_FROM_O8I = wire_schema.compile_decoder(_O8I_IOV, _O8I)
+_O8I_OUT_CELL_FROM_O8I = wire_schema.compile_decoder(_O8I_OUT_CELL, _O8I)
+_O8I_OUT_UNASSIGNED_FROM_O8I = wire_schema.compile_decoder(_O8I_OUT_UNASSIGNED, _O8I)
 _AUTH_HEAD_FROM_THIN = wire_schema.compile_decoder(_AUTH_HEAD, _THIN)
 _AUTH_HEAD_FROM_OCI = wire_schema.compile_decoder(_AUTH_HEAD, _OCI)
 _AUTH_PAIR_OCI = wire_schema.compile_encoder(_AUTH_PAIR, _OCI)
@@ -13658,10 +13684,11 @@ def decode_o8i_bfile_getlen(Packet: bytes) -> int:
 
 def decode_8i_block_out(Data: bytes, NumOut: int) -> list:
     # Decode the OUT / IN OUT return values from an 8i PL/SQL block reply
-    # (docs/PROTOCOL.md §19.14). After the bind prompt (0x0b), the values ride a
-    # single TTI_RXD (07) as `NumOut` × (DALC value + 2-byte trailer), in OUT-bind
+    # (docs/PROTOCOL.md §19.14). After the I/O vector (`_O8I_IOV`), the values
+    # ride a single TTI_RXD (07), `NumOut` cells (`_O8I_OUT_CELL`) in OUT-bind
     # position order. Returns the raw value bytes per OUT bind (None for empty /
-    # NULL), decoded against each Var's declared type by the cursor.
+    # NULL, and for one the block never assigned), decoded against each Var's
+    # declared type by the cursor.
     return _decode_8i_block_values(Data, NumOut)[0]
 
 
@@ -13672,17 +13699,21 @@ def decode_8i_block_cursor(Data: bytes, NumOut: int) -> int:
 
 
 def _decode_8i_block_values(Data: bytes, NumOut: int) -> tuple[list, bytes]:
-    # The OUT values of an 8i block's reply and the status after them.
-    Rest = strip_fv2_bind_prompt(Data)
+    # The OUT values of an 8i block's reply and the status after them; a reply
+    # without the I/O vector -- the status alone of a block that failed -- has
+    # none.
+    Iov = _o8i_iov(Data)
+    Rest = Data if Iov is None else Iov[1]
     OutValues: list = []
     if NumOut > 0 and Rest[:1] == bytes([TTI_RXD]):
         Rest = Rest[1:]
         for _ in range(NumOut):
-            (Val, Rest) = decode_dalc(Rest)
-            Rest = Rest[2:]  # sb2 indicator / return code
-            OutValues.append(
-                bytes(Val) if isinstance(Val, (bytes, bytearray)) and Val else None
-            )
+            if Rest[:1] == b'\xff':
+                Rest = _O8I_OUT_UNASSIGNED_FROM_O8I(Rest)[1]
+                OutValues.append(None)
+                continue
+            (Cell, Rest) = _O8I_OUT_CELL_FROM_O8I(Rest)
+            OutValues.append(bytes(Cell['value']) or None)
     return OutValues, Rest
 
 
@@ -14467,30 +14498,6 @@ def _skip_fv2_rpa(Data: bytes) -> bytes:
     return Rest
 
 
-# Token that opens the 9i bind-values prompt the server sends after a PL/SQL
-# block parse-execute carrying binds: `0b 05 <numbinds> 01 01 00` then one
-# direction byte per bind (0x20 = IN, 0x10 = OUT, 0x30 = IN OUT). #102.
-_FV2_BIND_PROMPT = 0x0B
-
-
-def strip_fv2_bind_prompt(Data: bytes) -> bytes:
-    # Drop a leading bind prompt, if present, returning the bytes that follow
-    # (the OUT-value RXD + RPA + OER). A pure-OUT block's reply packs the prompt,
-    # the return values and the call status together; an IN / IN OUT block sends
-    # the prompt in its own packet (consumed before the values are sent), so this
-    # is a no-op there. The prompt is `0b 05 <numbinds> 01 01 00` then a
-    # direction section (bytes 0x00 / 0x10 / 0x20 / 0x30 — IN/OUT/IN OUT masks
-    # and padding) whose exact length varies, so rather than computing it we scan
-    # past the 8-byte fixed prefix to the first RXD (07) or RPA (08) token — the
-    # prompt itself never contains either. (#102, PROTOCOL §19.7)
-    if len(Data) >= 8 and Data[0] == _FV2_BIND_PROMPT:
-        Pos = 8
-        while Pos < len(Data) and Data[Pos] not in (TTI_RXD, TTI_RPA):
-            Pos += 1
-        return Data[Pos:]
-    return Data
-
-
 # The direction masks in a 9i bind prompt: OUT, IN, and both (IN OUT).
 FV2_BIND_OUT = 0x10
 FV2_BIND_IN = 0x20
@@ -14517,32 +14524,38 @@ def _o7_iov(Data: bytes) -> tuple[dict, bytes] | None:
     return (Iov, Rest[Count:])
 
 
+def _o8i_iov(Data: bytes) -> tuple[dict, bytes] | None:
+    # An 8i reply's I/O vector (`_O8I_IOV`), its directions, and the bytes after
+    # it, or None when `Data` does not open with one, or is too short to hold
+    # the directions its count says.
+    if Data[:1] != bytes([TTI_IOV]):
+        return None
+    try:
+        (Iov, Rest) = _O8I_IOV_FROM_O8I(Data)
+    except (IndexError, ValueError, DataError):
+        # ValueError: the eight bytes are not zero, a vector not measured.
+        return None
+    Count = Iov['iterations'] * 256 + Iov['requests']
+    if len(Rest) < Count:
+        return None
+    Iov['directions'] = bytes(Rest[:Count])
+    return (Iov, Rest[Count:])
+
+
 def decode_fv2_bind_directions(Data: bytes, O8i: bool = False) -> list[int] | None:
     """The direction of each bind, from a 9i or 8i bind prompt, or None if `Data`
     does not open with one (#1242).
 
-    The 9i prompt is `0b 05`, the bind count, `01 01 00`, padding, then one mask
-    per bind in bind order: 0x10 OUT, 0x20 IN, 0x30 IN OUT (PROTOCOL §19.7).
-    Captured: `0b0501020001010000001020` is OUT, IN. The count is two fields,
-    its low byte and then its high byte, each a ub4 on 9i (`01 02`, `00`) and a
-    2-byte little-endian field on 8i (`02 00`, `00 00`, then `01 00` and more
-    padding). Read as the low byte alone, a block of 256 binds or more lost its
-    directions and fell back to guessing them (#2311). The masks are the last
-    `n` bytes before the first RXD / RPA, or the end of the prompt, since the
-    padding is what varies; a mask is never either token.
+    The prompt is the I/O vector, 9i's `_O7_IOV` and 8i's `_O8I_IOV`, then one
+    mask per bind in bind order: 0x10 OUT, 0x20 IN, 0x30 IN OUT (PROTOCOL
+    §19.7). Captured on 9i: `0b0501020001010000001020` is OUT, IN. The count is
+    two fields, the requests and then the iterations, `iterations * 256 +
+    requests`, a ub4 each on 9i (`01 02`, `00`) and a ub2 each on 8i (`02 00`,
+    `00 00`). Read as the low byte alone, a block of 256 binds or more lost its
+    directions and fell back to guessing them (#2311).
     """
-    if not O8i:
-        Iov = _o7_iov(Data)
-        return None if Iov is None else list(Iov[0]['directions'])
-    if len(Data) < 8 or Data[0] != _FV2_BIND_PROMPT:
-        return None
-    Count = Data[2] | Data[4] << 8
-    End = 8
-    while End < len(Data) and Data[End] not in (TTI_RXD, TTI_RPA):
-        End += 1
-    if End - 8 < Count:
-        return None
-    return list(Data[End - Count : End])
+    Iov = _o8i_iov(Data) if O8i else _o7_iov(Data)
+    return None if Iov is None else list(Iov[0]['directions'])
 
 
 # A 9i PL/SQL block reply marks an OUT bind the block never assigned with these
