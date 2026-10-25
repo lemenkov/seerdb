@@ -33,7 +33,6 @@ from seerdb.common.tns import (
     FV2_BIND_IN,
     FV2_BIND_OUT,
     O8I_STMT_TXN,
-    _scan_ora_message,
     decode_8i_block_cursor,
     decode_8i_block_out,
     decode_8i_cursor_id,
@@ -695,7 +694,7 @@ class O8iDialect:
         if packet[:1] == bytes([TTI_OER]):
             # A SELECT refused at execute keeps its cursor (ORA-00942 does).
             self._finished(decode_8i_cursor_id(packet))
-            (err_code, message) = _scan_ora_message(packet)
+            (err_code, message) = decode_8i_terminal_error(packet)
             if err_code:
                 _raise_ora(err_code, message)
             from seerdb.common.exceptions import DatabaseError
@@ -756,7 +755,7 @@ class O8iDialect:
                     raise Exception('Connection closed during 8i describe') from None
                 more = received[1]
                 if more[:1] == bytes([TTI_OER]):
-                    (err_code, message) = _scan_ora_message(more)
+                    (err_code, message) = decode_8i_terminal_error(more)
                     if err_code and message:
                         _raise_ora(err_code, message)
                 buf += more
@@ -932,10 +931,12 @@ class O8iDialect:
         resp = yield RECV
         if resp is False:
             raise Exception('Connection closed during 8i BFILE FILE_OPEN')
-        # 8i's OER is not 9i's: its error is the trailing ORA- text. The 9i
-        # reader missed it, unseen while a fetch read the BFILE (#1103).
-        (_row_count, err_code, message) = decode_8i_dml_response(resp[1])
-        _raise_ora(err_code, message)  # e.g. ORA-22285 (no such directory)
+        # A file that does not open is answered with an 8i status alone; one
+        # that does, with the LOBOPS RPA. The 9i reader missed the error,
+        # unseen while a fetch read the BFILE (#1103).
+        if resp[1][:1] == bytes([TTI_OER]):
+            # e.g. ORA-22285 (no such directory)
+            _raise_ora(*decode_8i_terminal_error(resp[1]))
         opened = decode_fv2_opened_locator(resp[1])
         if opened is None:
             raise Exception('Unexpected 8i BFILE FILE_OPEN reply', resp[1][:8].hex())

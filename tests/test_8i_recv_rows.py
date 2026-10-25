@@ -249,5 +249,55 @@ class TestAQueryEndsOnItsFetchStatus(unittest.TestCase):
         self.assertEqual(result[4], [[1], [2], [3], [4], [5]])
 
 
+def _load_capture(name):
+    # tests/replay.py, which CI's unittest step, importing this module as
+    # tests.test_8i_recv_rows, does not have on its path.
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(__file__))
+    from replay import load_capture
+
+    return load_capture(name)
+
+
+class TestALongMessageArrivesWhole(unittest.TestCase):
+    """8.1.7 writes an error message past 252 bytes in chunks, `fe`, each with
+    a ub1 length, `00` (#2322). Read as one ub1 length, a fetch's error was its
+    first 254 bytes behind a stray `ÿ`, and its status counted as whole well
+    before its end; a block's kept the second chunk's length, a `²`, in its
+    text. Both replies captured from seerdb's own session on 8.1.7."""
+
+    FETCH = 'o8i_fetch_error_long_message.hexdump'
+    BLOCK = 'o8i_block_error_long_message.hexdump'
+
+    def test_a_failed_fetch_has_its_whole_message(self):
+        from seerdb.common.tns import decode_8i_terminal_error
+
+        (code, message) = decode_8i_terminal_error(_load_capture(self.FETCH))
+        self.assertEqual(code, 20003)
+        self.assertEqual(len(message), 475)
+        self.assertTrue(message.startswith('ORA-20003: mxxx'), message[:16])
+        self.assertTrue(message.isascii())
+        self.assertTrue(message.endswith('ORA-06512: at line 1'), message[-24:])
+
+    def test_its_status_is_whole_only_at_its_end(self):
+        from seerdb.common.tns import o8i_terminal_complete
+
+        status = _load_capture(self.FETCH)
+        self.assertTrue(o8i_terminal_complete(status))
+        for short in range(1, len(status)):
+            self.assertFalse(o8i_terminal_complete(status[:-short]), short)
+
+    def test_a_failed_block_has_its_whole_message(self):
+        from seerdb.common.tns import decode_8i_dml_response
+
+        (rows, code, message) = decode_8i_dml_response(_load_capture(self.BLOCK))
+        self.assertEqual((rows, code), (0, 20001))
+        self.assertEqual(len(message), 432)
+        self.assertTrue(message.isascii())
+        self.assertTrue(message.endswith('ORA-06512: at line 1'), message[-24:])
+
+
 if __name__ == '__main__':
     unittest.main()

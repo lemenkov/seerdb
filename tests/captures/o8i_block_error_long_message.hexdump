@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# Oracle 8.1.7's reply to `BEGIN RAISE_APPLICATION_ERROR(-20001, RPAD('m', 400,
+# 'x')); END;`, #2322: the status alone, and its 433-byte message in chunks,
+# `fe ff`, 255 bytes, `b2`, 178 bytes, `00`. Captured from seerdb's own session
+# as `hexdump -C` output; the offset column and the |ascii| gutter are ignored
+# by tests.replay.parse_hexdump.
+00000000  04 00 00 00 00 21 4e 01  00 00 00 00 00 00 00 2f  |.....!N......../|
+00000010  00 00 00 00 41 ff ff ff  ff 00 00 00 00 00 00 00  |....A...........|
+00000020  00 00 00 00 00 00 00 24  00 00 00 00 00 00 00 00  |.......$........|
+00000030  00 00 00 00 00 00 00 00  00 00 00 00 fe ff 4f 52  |..............OR|
+00000040  41 2d 32 30 30 30 31 3a  20 6d 78 78 78 78 78 78  |A-20001: mxxxxxx|
+00000050  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+00000060  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+00000070  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+00000080  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+00000090  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+000000a0  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+000000b0  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+000000c0  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+000000d0  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+000000e0  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+000000f0  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+00000100  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+00000110  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+00000120  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+00000130  78 78 78 78 78 78 78 78  78 78 78 78 78 b2 78 78  |xxxxxxxxxxxxx.xx|
+00000140  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+00000150  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+00000160  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+00000170  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+00000180  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+00000190  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+000001a0  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+000001b0  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+000001c0  78 78 78 78 78 78 78 78  78 78 78 78 78 78 78 78  |xxxxxxxxxxxxxxxx|
+000001d0  78 78 78 78 78 78 78 78  78 78 0a 4f 52 41 2d 30  |xxxxxxxxxx.ORA-0|
+000001e0  36 35 31 32 3a 20 61 74  20 6c 69 6e 65 20 31 0a  |6512: at line 1.|
+000001f0  00                                                |.|
+000001f1
