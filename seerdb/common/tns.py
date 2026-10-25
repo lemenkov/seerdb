@@ -15036,48 +15036,123 @@ _O3_TERMINAL, _O3_MACHINE, _O3_OSUSER, _O3_PROGRAM = (
     b'root',
     b'JDBC Thin Client',
 )
-_O3_ENV = _O3_TERMINAL + _O3_MACHINE + _O3_OSUSER + _O3_PROGRAM
+# 9i's O3LOGON requests from schemas (#2284). After the user's pointer and
+# length -- and in 3LOGON the password field's -- comes an attribute block:
+# terminal, machine and osuser, each a pointer and a length, which 9.2.0.4
+# stores whole (a 30-character terminal and a 64-character machine name were
+# tried); then a block that is not understood (#2342). The code once filled its
+# `02 <n> 00 00 00 01 01 <n>`, and the n in the phase's tail, with the program
+# string's length, 16 for JDBC's. Measured, 9.2.0.4 takes the login only when
+# the two n are equal and at least 16: equal but shorter draws ORA-01017, and
+# unequal ones a refusal or a closed connection. So the block is the
+# constant JDBC sends, and the program string its 16 bytes, until it is
+# understood. The strings follow the user, raw, at the lengths given.
+_O7_LOGON_ATTRS: wire_schema.Schema = (
+    ('ptr', 'terminal_present'),
+    ('n4', 'terminal_length'),
+    ('ptr', 'machine_present'),
+    ('n4', 'machine_length'),
+    ('ptr', 'osuser_present'),
+    ('n4', 'osuser_length'),
+    ('const', bytes([2, 16, 0, 0, 0, 1, 1, 16])),
+)
+_O7_LOGON_STRINGS: wire_schema.Schema = (
+    ('bytes', 'terminal', 'terminal_length'),
+    ('bytes', 'machine', 'machine_length'),
+    ('bytes', 'osuser', 'osuser_length'),
+    ('bytes', 'program', 16),
+)
+# TTI_3LOGA (0x52), asking for the session key.
+_O7_3LOGA: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN, TTI_3LOGA])),
+    ('u8', 'seq'),
+    ('ptr', 'user_present'),
+    ('n4', 'user_length'),
+    ('const', bytes(6)),
+    *_O7_LOGON_ATTRS,
+    ('const', bytes([0, 0, 0, 0, 1, 1, 16, 1])),
+    ('bytes', 'user', 'user_length'),
+    *_O7_LOGON_STRINGS,
+)
+# TTI_3LOGON (0x51), sending AUTH_PASSWORD: the hex of the DES blocks and the
+# pad count.
+_O7_3LOGON: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN, TTI_3LOGON])),
+    ('u8', 'seq'),
+    ('ptr', 'user_present'),
+    ('n4', 'user_length'),
+    ('ptr', 'password_present'),
+    ('n4', 'password_length'),
+    ('const', bytes(4)),
+    *_O7_LOGON_ATTRS,
+    ('const', bytes([0, 0, 0, 0, 0, 1, 16, 0])),
+    ('bytes', 'user', 'user_length'),
+    ('bytes', 'password', 'password_length'),
+    *_O7_LOGON_STRINGS,
+)
+# 3LOGA's reply: the RPA and the session key, its ASCII hex, a ub4 length and
+# the bytes (`08 01 10` and 16 hex digits); the status follows. Read before as
+# its third byte for the length, which agrees with this while the key is
+# shorter than 256.
+_O7_SESSION_KEY: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('n4', 'key_length'),
+    ('bytes', 'session_key', 'key_length'),
+)
+_O7_3LOGA_THIN = wire_schema.compile_encoder(_O7_3LOGA, _THIN)
+_O7_3LOGON_THIN = wire_schema.compile_encoder(_O7_3LOGON, _THIN)
+_O7_SESSION_KEY_FROM_THIN = wire_schema.compile_decoder(_O7_SESSION_KEY, _THIN)
 
 
-# The header skeleton between the length fields and the string blob (captured from
-# JDBC) bakes in those four string lengths, so generate it from them rather than
-# from a blob — a `01 01 <len>` attribute for terminal/machine/osuser, `02 <len>`
-# for program, then the program length once more, framed by phase-specific
-# padding (the two encoders below differ only in that framing).
-def _o3_mid(head_pad: int, tail: bytes) -> bytes:
-    T, M, U = len(_O3_TERMINAL), len(_O3_MACHINE), len(_O3_OSUSER)
-    P = len(_O3_PROGRAM)
-    attrs = bytes([1, 1, T, 1, 1, M, 1, 1, U, 2, P, 0, 0, 0, 1, 1, P])
-    return bytes(head_pad) + attrs + tail
-
-
-_O3_MID1 = _o3_mid(6, bytes([0, 0, 0, 0, 1, 1, len(_O3_PROGRAM), 1]))  # TTI_3LOGA
-_O3_MID2 = _o3_mid(4, bytes([0, 0, 0, 0, 0, 1, len(_O3_PROGRAM), 0]))  # TTI_3LOGON
+def _o7_logon_strings() -> dict:
+    # The session strings and their lengths, as JDBC sends them.
+    return {
+        'terminal_present': True,
+        'terminal_length': len(_O3_TERMINAL),
+        'terminal': _O3_TERMINAL,
+        'machine_present': True,
+        'machine_length': len(_O3_MACHINE),
+        'machine': _O3_MACHINE,
+        'osuser_present': True,
+        'osuser_length': len(_O3_OSUSER),
+        'osuser': _O3_OSUSER,
+        'program': _O3_PROGRAM,
+    }
 
 
 def encode_o3logon_phase1(Seq: int, User: bytes) -> bytes:
     # TTI_3LOGA: request the session key. No password field.
-    return (
-        bytes([TTI_FUN, TTI_3LOGA, Seq, 1])
-        + encode_sb4(len(User))
-        + _O3_MID1
-        + User
-        + _O3_ENV
+    return _O7_3LOGA_THIN(
+        {
+            'seq': Seq,
+            'user_present': True,
+            'user_length': len(User),
+            'user': User,
+            **_o7_logon_strings(),
+        }
     )
 
 
 def encode_o3logon_phase2(Seq: int, User: bytes, PwdField: bytes) -> bytes:
     # TTI_3LOGON: send the AUTH_PASSWORD (hex(DES blocks) + decimal pad count).
-    return (
-        bytes([TTI_FUN, TTI_3LOGON, Seq, 1])
-        + encode_sb4(len(User))
-        + bytes([1])
-        + encode_sb4(len(PwdField))
-        + _O3_MID2
-        + User
-        + PwdField
-        + _O3_ENV
+    return _O7_3LOGON_THIN(
+        {
+            'seq': Seq,
+            'user_present': True,
+            'user_length': len(User),
+            'user': User,
+            'password_present': True,
+            'password_length': len(PwdField),
+            'password': PwdField,
+            **_o7_logon_strings(),
+        }
     )
+
+
+def decode_o7_session_key(Packet: bytes) -> bytes:
+    """The session key a 9i TTI_3LOGA reply carries, as the bytes of its ASCII
+    hex (`_O7_SESSION_KEY`), for O3LOGON's phase two to decrypt."""
+    return bytes(_O7_SESSION_KEY_FROM_THIN(Packet)[0]['session_key'])
 
 
 # --- Oracle 8i (8.1.7) O3LOGON via the OSESSKEY/OAUTH envelope ---------------

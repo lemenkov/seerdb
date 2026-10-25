@@ -1928,18 +1928,17 @@ class OracleConnect(_ConnectionLogic):
 
     def _send_o3logon_phase2(self, Packet: bytes) -> None:
         # O3LOGON phase two (#90): the TTI_3LOGA response RPA carries the
-        # session key as a positional length-prefixed ASCII-hex string
-        # (TTI_RPA, ub1 count, ub1 length, <hex>). Decrypt it with the account's
+        # session key as an ASCII-hex string (decode_o7_session_key, the RPA,
+        # a ub4 length and the hex). Decrypt it with the account's
         # DES verifier to recover the plaintext session key, DES-encrypt the
         # zero-padded password under it, and send TTI_3LOGON with AUTH_PASSWORD
         # = upper-hex(cipher) + decimal(pad count).
         from binascii import hexlify, unhexlify
 
         from seerdb.common.crypto import des_verifier, o3logon
-        from seerdb.common.tns import encode_o3logon_phase2
+        from seerdb.common.tns import decode_o7_session_key, encode_o3logon_phase2
 
-        Length = Packet[2]
-        SessKey = unhexlify(Packet[3 : 3 + Length])
+        SessKey = unhexlify(decode_o7_session_key(Packet))
         UserB = self.user.encode('utf-8')
         PassB = self.password.encode('utf-8')
         Verifier = des_verifier(UserB, PassB)

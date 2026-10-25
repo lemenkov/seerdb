@@ -6331,6 +6331,18 @@ class TestO3logonMessages(unittest.TestCase):
             '6c69656e74',
         )
 
+    def test_the_3loga_reply_carries_the_session_key(self):
+        # 9.2.0.4's reply to 3LOGA in seerdb's own session (#2284): the RPA,
+        # the key's hex as a ub4 length (`01 10`) and 16 digits, then the
+        # status.
+        from seerdb.common.tns import decode_o7_session_key
+
+        reply = bytes.fromhex(
+            '08011044463543323637443443443336413845'
+            '040000000000000000000000000000000000000005000000000000'
+        )
+        self.assertEqual(decode_o7_session_key(reply), b'DF5C267D4CD36A8E')
+
     def test_9i_capabilities_minimal(self):
         # Pre-10g caps must NOT advertise O5LOGON (LOGON_TYPES byte 0) or 9i
         # rejects the login with ORA-01017.

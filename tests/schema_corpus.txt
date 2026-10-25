@@ -8,7 +8,7 @@
 # came from. Regenerate after a schema or a capture changes. A message
 # the Mirror builds as the test runs carries its time (an OCI describe
 # head's), so that line changes on each regeneration.
-# 869 messages; left out:
+# 870 messages; left out:
 #   7 random bytes from a fuzz or rubbish test
 _ALL8_HEAD	_THIN	6	{}	035e030204290001011501010d00000000027ff801010200000000000000	tests/test_server_query.py::test_parse_exec_exposes_bind_meta
 _ALL8_HEAD	_THIN	6	{}	035e030204290001011901010d000000010f027ff801010300000000000000	tests/test_server_query.py::test_parse_exec_reads_an_associative_array_bind[6]
@@ -646,6 +646,7 @@ _O7_RXH	_O8I	2	{}	06020200000001000000	tests/test_tns_encode.py::TestO8iQueryMes
 _O7_RXH	_O8I	6	{}	06020200000064000000	tests/test_8i_recv_rows.py::TestANullUrowid::test_the_rows_around_it_are_read
 _O7_RXH	_O8I	6	{}	06020200010064000000	tests/test_8i_recv_rows.py::TestANullUrowid::test_the_rows_around_it_are_read
 _O7_RXH	_O8I	6	{}	06020300000001000000	tests/test_8i_recv_rows.py::TestReadOnUntilTheStatusIsWhole::test_a_reply_three_bytes_short_waits_for_the_rest
+_O7_SESSION_KEY	_THIN	6	{}	08011044463543323637443443443336413845	tests/test_tns_encode.py::TestO3logonMessages::test_the_3loga_reply_carries_the_session_key
 _O7_STATUS_HEAD	_THIN	6	{}	04000000000101000100000000000000000000	tests/test_fv2_status.py::TestNineiStatusWithAWideCounter::test_a_successful_create
 _O7_STATUS_HEAD	_THIN	6	{}	04000000000101001800000000210000000000	tests/test_tns_decode.py::TestFv2WarnFlags::test_the_status_says_the_object_compiled_with_errors
 _O7_STATUS_HEAD	_THIN	6	{}	04000000000101010b0c00000000000000000000	tests/test_fv2_status.py::TestNineiStatusWithAWideCounter::test_a_successful_drop
