@@ -5912,15 +5912,15 @@ the 9i 1-byte indicator (§19.2), each 8i column value is a DALC **followed by a
 fixed 4-byte trailer** (`sb2` indicator + `ub2` return code, both zero when
 present). A **NULL** column carries no value DALC at all — it is the bare 4-byte
 `ff ff 00 00` (indicator −1). Values are **WE8ISO8859P1** (latin-1). The
-**cursor id** for the fetch loop sits at offset 11 of the post-row terminal —
-whether that opens with the `0x08` session-state piggyback or the `0x04` OER.
-Decoders: `decode_8i_exec_response` / `decode_8i_cursor_id`.
+rows end in the call's status (§19.12), with or without the RPA in front of it;
+its **cursor id** drives the fetch loop. Decoders: `decode_8i_exec_response` /
+`decode_8i_cursor_id`.
 
 **Rejected SELECT (#384).** When the server rejects the statement (bad table, bad
 column, …) the execute reply is a **`TTI_OER` (`0x04`)** error status, *not* the
-`TTI_DCB` (`0x10`) describe — the human-readable `ORA-NNNNN: …` text sits inline
-(`_scan_ora_message`). `_execute_8i_select` checks the first byte and raises the
-mapped ORA error; feeding an OER to `decode_8i_dcb_describe` (which assumes a
+`TTI_DCB` (`0x10`) describe: the status (§19.12) alone, its message the server's
+`ORA-NNNNN: …` text (`decode_8i_terminal_error`). `execute_query` checks the first
+byte and raises the mapped ORA error; feeding an OER to `decode_8i_dcb_describe` (which assumes a
 describe header) overruns and raises a meaningless `IndexError`.
 
 **A describe wider than a packet (#1226).** 8i caps each DATA packet at the SDU
@@ -6025,21 +6025,47 @@ at trailer offset +28 (`1` SELECT, `2` UPDATE, `3` DELETE, `4` INSERT, `5` CREAT
 - **trailer exec flag** (offset +4) is `0` for a query (execute deferred to the
   fetch) and `1` otherwise.
 
-There is no describe or fetch. The response is a `0x08` RPA session-state
-piggyback (a fixed 23 bytes) then the OER, whose first field after the token is
-the **affected-row count as a little-endian `ub4`** — 8i is x86/Windows, so the
-count rides native-endian (300 = `2c 01 00 00`). A server error is surfaced from
-the trailing `ORA-NNNNN: ...` text (the binary OER layout differs from 9i's).
+There is no describe or fetch. The response is an RPA, then the status. The RPA
+(`_O8I_RPA`, 23 bytes) is `08`, a `ub2` count (4), that many `ub4`s, the third the
+statement's cursor, and four zero bytes, where 10g sends two `ub2` lengths. An
+error, and a fetch that ends with ORA-01403, sends the status alone.
 
-The rest of that OER holds **the same fields as 9i's short status, at fixed
-widths and little-endian**: row count `ub4`, then a `ub2` each for the ORA code,
-the two array-error fields, cursor id, error position and SQL command type, four
-single bytes, and the touched row's rowid 21 bytes after the token — `ub4` data
-object, `ub2` file, one reserved byte, `ub4` block, `ub2` slot (#1079). Captured
-on 8.1.7 (object 73009, file 5, block 207, slot 2):
+The status (`_O8I_STATUS`, #2284) holds **the same fields as 9i's short status
+(§19.2), at fixed widths and little-endian** — 8i is x86/Windows, so they ride
+native-endian:
+
+```
+04                    TTI_OER
+ub4 rows              the affected-row count (300 = 2c 01 00 00)
+ub2 code              the ORA code (ORA-01403 = 7b 05)
+ub2 array_error, ub2 array_error_2
+ub2 cursor            the statement's cursor (256 = 00 01, #2285)
+ub2 position          the error's offset in the SQL text
+ub1 sql_type          the command code: 2 INSERT, 3 SELECT, 6 UPDATE, 7 DELETE,
+                      12 DROP TABLE, 44 COMMIT, 45 ROLLBACK, 47 a PL/SQL block
+ub1 fatal, ub1 flags, ub1 cursor_options, ub1 upi_param
+ub1 warnings          0x10 an UPDATE / DELETE without WHERE, 0x20 a compile
+                      error; 0x01 with any
+rowid                 ub4 data object, ub2 file, a reserved byte, ub4 block,
+                      ub2 slot: the row a DML touched (#1079)
+ub4 os_error, ub1 statement, ub1 call (it counts up), ub2 padding
+ub4 iterations
+ub2 oerrdd length     13 after a DML, then a ub1 13 and the rowid in its
+                      extended form: 01, the object, file, block and slot
+                      big-endian
+ub4 x 3               the counts of the batch-error arrays; 8i has no array DML
+message               when the code is set: a ub1 length and the text, or past
+                      252 bytes `fe`, chunks with ub1 lengths, `00` (#2322)
+```
+
+Read from 311 statuses of a live 8.1.7 with nothing left over. Captured on
+8.1.7 for an INSERT (object 73009, file 5, block 207, slot 2):
 `… 04 01 00 00 00 … 02 00 00 00 00 00 31 1d 01 00 05 00 00 cf 00 00 00 02 00 …`.
 As on 9i, a statement that touched no row leaves the previous rowid in place,
-and the zero row count drops it.
+and the zero row count drops it. A failed statement is an error with no row
+count. 8i marks no packet as a reply's last, so the reader of a fetch counts a
+status as whole only once every field has its bytes, the message too
+(`o8i_terminal_complete`, #2280).
 
 **COMMIT / ROLLBACK** have no modern `TTI_COMMIT` / `TTI_ROLLBACK` on 8i; they
 ride the OALL8 as ordinary statements (type `0`). Encoder: `encode_8i_oall8_dml`

@@ -1364,7 +1364,33 @@ class _O8iCodec(_OciCodec):
     # length up to 64 bytes, then 64-byte chunks with ub1 lengths (#2284).
     # OCI's own goes to 255-byte chunks past 252 bytes, which 8i does not read.
     chr = staticmethod(_ThinCodec.chr)
-    read_chr = staticmethod(_ThinCodec.read_chr)
+
+    @staticmethod
+    def read_chr(data: bytes) -> tuple[bytes, bytes]:
+        # Text as thin reads it, which 8.1.7 writes as before 12.1: a ub1
+        # length, or 0xFE and chunks with ub1 lengths, to a zero one; a
+        # 433-byte message comes as `fe ff`, 255 bytes, `b2`, 178 bytes, `00`
+        # (#2284). A status ends in it, so text cut short raises: 8i marks no
+        # packet as a reply's last (#2280).
+        def take(data: bytes, length: int) -> bytes:
+            if len(data) < length:
+                raise IndexError('chr past the end of the message')
+            return data[:length]
+
+        if take(data, 1)[0] != TNS_LONG_LENGTH_INDICATOR:
+            return take(data[1:], data[0]), data[1 + data[0] :]
+        wide = _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+        data = data[1:]
+        out = bytearray()
+        while True:
+            if wide:
+                (length, data) = decode_ub4(data)
+            else:
+                (length, data) = (take(data, 1)[0], data[1:])
+            if not length:
+                return bytes(out), data
+            out += take(data, length)
+            data = data[length:]
 
 
 _THIN = _ThinCodec()
@@ -1936,6 +1962,59 @@ _O7_LOBOPS_REPLY: wire_schema.Schema = (
     ('when', 'short_amount_present', (('n4', 'short_amount'),)),
     ('when', 'null_lob_present', (('n4', 'flag'),)),
 )
+# The RPA in front of an 8i call's status (#2284): a ub2 count, four, and that
+# many ub4s, the third the statement's cursor, as its status has it; then
+# four bytes zero in every reply measured, the two ub2 lengths 10g sends
+# there. 23 bytes on 8.1.7.
+_O8I_RPA: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('n2', 'count'),
+    ('each', 'parameters', 'count', (('n4', 'value'),)),
+    ('pad', 4),
+)
+# Oracle 8i's status (PROTOCOL.md §19.12, #2284): the fields of 9i's short
+# status (`_O7_STATUS_HEAD`, `_O7_STATUS_TAIL`) at fixed widths, as 8.1.7
+# writes them, little-endian. A ub4 row count, the ORA code and the other
+# ub2s, then single bytes: the SQL type, which is the command code (2 an
+# INSERT, 47 a PL/SQL block), the fatal flag, flags, cursor options, UPI
+# parameter and warnings -- 0x10 an UPDATE or DELETE with no WHERE, 0x20 a
+# compile error, with 0x01 when any is set. The rowid follows (#1079), then
+# the OS error, statement, call number, padding and iterations; the oerrdd, a
+# ub2 length and the 13-byte rowid again after a DML; the counts of the three
+# batch-error arrays, which 8i never fills (it has no array DML); and, when
+# the code is set, the message. Read from 311 statuses of a live 8.1.7 with
+# nothing left over.
+_O8I_STATUS: wire_schema.Schema = (
+    ('const', bytes([TTI_OER])),
+    ('n4', 'rows'),
+    ('n2', 'code'),
+    ('n2', 'array_error'),
+    ('n2', 'array_error_2'),
+    ('n2', 'cursor'),
+    ('n2', 'position'),
+    ('u8', 'sql_type'),
+    ('u8', 'fatal'),
+    ('u8', 'flags'),
+    ('u8', 'cursor_options'),
+    ('u8', 'upi_param'),
+    ('u8', 'warnings'),
+    ('n4', 'rowid_object'),
+    ('n2', 'rowid_file'),
+    ('pad', 1),
+    ('n4', 'rowid_block'),
+    ('n2', 'rowid_slot'),
+    ('n4', 'os_error'),
+    ('u8', 'statement'),
+    ('u8', 'call'),
+    ('n2', 'padding'),
+    ('n4', 'iterations'),
+    ('n2', 'oerrdd_length'),
+    ('when', 'oerrdd_length', (('value', 'oerrdd'),)),
+    ('n4', 'batch_code_count'),
+    ('n4', 'batch_offset_count'),
+    ('n4', 'batch_message_count'),
+    ('when', 'code', (('chr', 'message'),)),
+)
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
 _OAC_FROM_THIN = wire_schema.compile_decoder(_OAC, _THIN)
 _OAC_FROM_OCI = wire_schema.compile_decoder(_OAC, _OCI)
@@ -1952,6 +2031,8 @@ _O7_LONG_CELL_FROM_THIN = wire_schema.compile_decoder(_O7_LONG_CELL, _THIN)
 _O7_IOV_FROM_THIN = wire_schema.compile_decoder(_O7_IOV, _THIN)
 _O7_LOBOPS_THIN = wire_schema.compile_encoder(_O7_LOBOPS, _THIN)
 _O7_LOBOPS_REPLY_FROM_THIN = wire_schema.compile_decoder(_O7_LOBOPS_REPLY, _THIN)
+_O8I_RPA_FROM_O8I = wire_schema.compile_decoder(_O8I_RPA, _O8I)
+_O8I_STATUS_FROM_O8I = wire_schema.compile_decoder(_O8I_STATUS, _O8I)
 _AUTH_HEAD_FROM_THIN = wire_schema.compile_decoder(_AUTH_HEAD, _THIN)
 _AUTH_HEAD_FROM_OCI = wire_schema.compile_decoder(_AUTH_HEAD, _OCI)
 _AUTH_PAIR_OCI = wire_schema.compile_encoder(_AUTH_PAIR, _OCI)
@@ -13715,20 +13796,49 @@ def _o8i_all8(
         _ENCODE_FIELD_VERSION.reset(Token)
 
 
+def _o8i_status(Data: bytes) -> dict | None:
+    # The fields of an 8i reply's status (`_O8I_STATUS`), after the RPA in
+    # front of it (`_O8I_RPA`), or None when the reply opens with neither. A
+    # reply cut short of its status raises IndexError or Truncated.
+    Rest = Data
+    if Rest[:1] == bytes([TTI_RPA]):
+        (_, Rest) = _O8I_RPA_FROM_O8I(Rest)
+        if not Rest:
+            raise Truncated('8i status: the RPA alone')
+    if Rest[:1] != bytes([TTI_OER]):
+        return None
+    return _O8I_STATUS_FROM_O8I(Rest)[0]
+
+
+def _o8i_status_or_none(Data: bytes) -> dict | None:
+    # The status, or None for a reply without a whole one.
+    try:
+        return _o8i_status(Data)
+    except (IndexError, DataError):
+        return None
+
+
+def _o8i_status_strict(Data: bytes) -> dict | None:
+    # The status, or None for a reply that opens with neither an RPA nor a
+    # status. One that does and does not decode raises: the old scan for
+    # "ORA-" found an error in any bytes, and a reader that took such a reply
+    # for "no error" would report a failed statement as done.
+    try:
+        return _o8i_status(Data)
+    except IndexError as Exc:
+        raise Truncated('8i status cut short') from Exc
+
+
 def decode_8i_cursor_id(Terminal: bytes) -> int:
-    # The server-assigned cursor id, needed to drive the 8i fetch loop. It sits
-    # at offset 11 of the response's post-row terminal — whether that terminal
-    # opens with the 0x08 session-state piggyback (08 04 00 11 89 05 00 00 00 00
-    # 00 <cid>) or goes straight to the 0x04 OER (04 01 00 00 00 00 00 00 00 00
-    # 00 <cid>); the cursor id is a LITTLE-endian ub2 at [11:13] in both, as
-    # 8i's other integers are. Read big-endian at [10:12] it agreed below 256
-    # and made 256 a 0, which ended the fetch after one row, and 257 a 1
-    # (#2285): captured on 8.1.7, cursor 256 is `00 01` and 300 `2c 01`.
-    # Returns 0 when the terminal is too short (an empty result set), which
-    # suppresses the fetch.
-    if len(Terminal) < 13:
-        return 0
-    return int.from_bytes(Terminal[11:13], 'little')
+    # The server-assigned cursor id, which drives the 8i fetch loop and is
+    # closed when its statement is done (#2286): the status's cursor, a
+    # little-endian ub2, as its RPA's third parameter has it too. Read
+    # big-endian it agreed below 256 and made 256 a 0, which ended the fetch
+    # after one row (#2285): captured on 8.1.7, cursor 256 is `00 01`. 0 for a
+    # reply with no whole status (an empty result set), which suppresses the
+    # fetch, and for a statement refused at parse, which has none.
+    Status = _o8i_status_or_none(Terminal)
+    return Status['cursor'] if Status else 0
 
 
 def o8i_terminal_complete(Terminal: bytes) -> bool:
@@ -13736,51 +13846,29 @@ def o8i_terminal_complete(Terminal: bytes) -> bool:
 
     8i splits a long reply into packets at no fixed point and marks none as the
     last, and its status ends in zero fields, so a reply cut short a few bytes
-    before its end still decodes. The terminal is the fixed 23-byte RPA, then
-    the OER: 46 bytes of fixed fields, a ub2 rowid length (when it is not 0, a
-    ub1 repeat of it and the rowid follow), 12 more bytes, and, when its ORA
-    code is set, a ub1 message length and the message. Measured on 8.1.7 over
-    every status a suite run receives. A terminal of any other shape is taken
-    as whole, as before."""
-    Off = 23 if Terminal[:1] == bytes([TTI_RPA]) else 0
-    if Off and len(Terminal) <= Off:
+    before its end would still decode by offsets. Its status (`_O8I_STATUS`)
+    is whole when every field, the message too, has its bytes. A terminal that
+    is not a status is taken as whole, as before."""
+    try:
+        _o8i_status(Terminal)
+    except (IndexError, Truncated):
         return False
-    if Terminal[Off : Off + 1] != bytes([TTI_OER]):
-        return True
-    End = Off + 48
-    if len(Terminal) < End:
-        return False
-    RowidLength = int.from_bytes(Terminal[End - 2 : End], 'little')
-    End += (1 + RowidLength if RowidLength else 0) + 12
-    if int.from_bytes(Terminal[Off + 5 : Off + 7], 'little'):
-        if len(Terminal) <= End:
-            return False
-        End += 1 + Terminal[End]
-    return len(Terminal) >= End
+    except DataError:
+        pass
+    return True
 
 
 def decode_8i_terminal_error(Terminal: bytes) -> tuple[int, str | None]:
-    """The ORA code and message an 8i reply's post-row status carries, or
-    (0, None) for none (#2314).
-
-    The layout o8i_terminal_complete reads: the code is the ub2 five bytes
-    after the OER token, and the message, when it is set, a ub1 length and the
-    text after the rowid and 12 more bytes. Captured on 8.1.7, a fetch failing
-    with ORA-01476: code `c4 05`, message `24 ORA-01476: divisor is equal to
-    zero\\n`.
-    """
-    Off = 23 if Terminal[:1] == bytes([TTI_RPA]) else 0
-    if Terminal[Off : Off + 1] != bytes([TTI_OER]) or len(Terminal) < Off + 48:
+    """The ORA code and message an 8i reply's status carries, or (0, None)
+    for none (#2314): its code and, when that is set, the message that ends
+    it. Captured on 8.1.7, a fetch failing with ORA-01476: code `c4 05`,
+    message `24 ORA-01476: divisor is equal to zero\\n`. Text is latin-1
+    (WE8ISO8859P1), as 8i's every value."""
+    Status = _o8i_status_strict(Terminal)
+    if not Status or not Status['code']:
         return (0, None)
-    Code = int.from_bytes(Terminal[Off + 5 : Off + 7], 'little')
-    if not Code:
-        return (0, None)
-    RowidLength = int.from_bytes(Terminal[Off + 46 : Off + 48], 'little')
-    End = Off + 48 + (1 + RowidLength if RowidLength else 0) + 12
-    Message = (
-        Terminal[End + 1 : End + 1 + Terminal[End]] if End < len(Terminal) else b''
-    )
-    return (Code, Message.decode('latin-1', 'replace').rstrip() or None)
+    Message = bytes(Status['message']).decode('latin-1', 'replace').rstrip()
+    return (Status['code'], Message or None)
 
 
 def _decode_8i_rowid(DataType: int, Val: bytes) -> str | None:
@@ -13932,67 +14020,40 @@ def decode_8i_exec_response(
     return (Rows, Rest, Last)
 
 
-def _scan_ora_message(Data: bytes) -> tuple[int, str | None]:
-    # Locate a server "ORA-NNNNN: ..." error in a response and return
-    # (code, message), or (0, None) if there is none. Used for 8i non-query
-    # responses, whose binary OER layout differs from 9i's — scanning the
-    # human-readable text is layout-independent.
-    Idx = Data.find(b'ORA-')
-    if Idx < 0:
-        return (0, None)
-    Digits = Data[Idx + 4 : Idx + 9]
-    if not Digits.isdigit():
-        return (0, None)
-    End = Data.find(b'\x00', Idx)
-    Message = (
-        Data[Idx : End if End >= 0 else len(Data)].decode('latin-1', 'replace').rstrip()
-    )
-    return (int(Digits), Message)
-
-
 def decode_8i_dml_response(Data: bytes) -> tuple[int, int, str | None]:
     # Decode an 8i non-query (DML / DDL / transaction-control) response
-    # (docs/PROTOCOL.md §19.12): a 0x08 RPA session-state piggyback (a fixed 23
-    # bytes on 8i) then the OER, whose first field after the token is the
-    # affected-row count as a LITTLE-endian ub4 (8i is x86 / Windows, so the
-    # count rides native-endian — e.g. 300 = `2c 01 00 00`). Returns (rowcount,
-    # ora_code, message); a server error is surfaced from the trailing
-    # "ORA-NNNNN: ..." text so a failed statement raises instead of reporting a
-    # bogus count.
-    (ErrCode, Message) = _scan_ora_message(Data)
-    Rest = Data[23:] if Data[:1] == bytes([TTI_RPA]) else Data
-    RowCount = 0
-    if not ErrCode and Rest[:1] == bytes([TTI_OER]):
-        RowCount = int.from_bytes(Rest[1:5], 'little')
-    return (RowCount, ErrCode, Message)
+    # (docs/PROTOCOL.md §19.12): the RPA, then the status (`_O8I_STATUS`), whose
+    # row count is the rows affected -- a LITTLE-endian ub4, as 8i's integers
+    # are (300 = `2c 01 00 00`). Returns (rowcount, ora_code, message); a failed
+    # statement reports no count, and its error is raised instead. A reply that
+    # opens with neither, such as a PL/SQL block's prompt, reports none: 8i
+    # answers a failed block with its status alone.
+    Status = _o8i_status_strict(Data)
+    if not Status:
+        return (0, 0, None)
+    (Code, Message) = decode_8i_terminal_error(Data)
+    return (0 if Code else Status['rows'], Code, Message)
 
 
 def decode_8i_dml_rowid(Data: bytes) -> str | None:
     """The rowid of the row an 8i DML touched, from its status, or None.
 
-    The same fields as the 9i short status (decode_fv2_dml_rowid), at fixed
-    widths and little-endian like the row count: ub4 row count, ub2 each for
-    the ORA code, the two array-error fields, cursor id, error position and
-    SQL type, four single bytes, then the rowid -- ub4 data object, ub2 file,
-    one reserved byte, ub4 block, ub2 slot -- 21 bytes after the OER token
-    (#1079). Captured on 8.1.7: `31 1d 01 00 05 00 00 cf 00 00 00 02 00` for
-    object 73009, file 5, block 207, slot 2. As on 9i, the server leaves the
-    previous statement's rowid in place when nothing was touched.
+    The status's rowid (`_O8I_STATUS`), as on 9i (decode_fv2_dml_rowid): data
+    object, file, a reserved byte, block, slot (#1079). Captured on 8.1.7:
+    `31 1d 01 00 05 00 00 cf 00 00 00 02 00` for object 73009, file 5, block
+    207, slot 2. As on 9i, the server leaves the previous statement's rowid in
+    place when nothing was touched.
     """
-    (ErrCode, _) = _scan_ora_message(Data)
-    Rest = Data[23:] if Data[:1] == bytes([TTI_RPA]) else Data
-    if ErrCode or Rest[:1] != bytes([TTI_OER]) or len(Rest) < 34:
-        return None
-    Block = int.from_bytes(Rest[28:32], 'little')
-    if not Block:
+    Status = _o8i_status_or_none(Data)
+    if not Status or Status['code'] or not Status['rowid_block']:
         return None
     from seerdb.common.types import rowid_to_string
 
     return rowid_to_string(
-        int.from_bytes(Rest[21:25], 'little'),
-        int.from_bytes(Rest[25:27], 'little'),
-        Block,
-        int.from_bytes(Rest[32:34], 'little'),
+        Status['rowid_object'],
+        Status['rowid_file'],
+        Status['rowid_block'],
+        Status['rowid_slot'],
     )
 
 
