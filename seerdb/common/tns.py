@@ -1370,16 +1370,28 @@ class _O8iCodec(_OciCodec):
         # Text as thin reads it, which 8.1.7 writes as before 12.1: a ub1
         # length, or 0xFE and chunks with ub1 lengths, to a zero one; a
         # 433-byte message comes as `fe ff`, 255 bytes, `b2`, 178 bytes, `00`
-        # (#2284). A status ends in it, so text cut short raises: 8i marks no
-        # packet as a reply's last (#2280).
+        # (#2284).
+        wide = _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+        return _O8iCodec._read_whole(data, wide)
+
+    @staticmethod
+    def read_value(data: bytes) -> tuple[bytes, bytes]:
+        # A value as OCI frames it, ub1 chunk lengths whatever the field version.
+        return _O8iCodec._read_whole(data, False)
+
+    @staticmethod
+    def _read_whole(data: bytes, wide: bool) -> tuple[bytes, bytes]:
+        # A ub1 length and the bytes, or 0xFE and chunks to a zero length, ub4
+        # lengths if `wide` else ub1. A reply ends in a field read so -- a
+        # status in its message, a describe in its date -- and 8i marks no
+        # packet as a reply's last (#2280), so a field cut short raises.
         def take(data: bytes, length: int) -> bytes:
             if len(data) < length:
-                raise IndexError('chr past the end of the message')
+                raise IndexError('value past the end of the message')
             return data[:length]
 
         if take(data, 1)[0] != TNS_LONG_LENGTH_INDICATOR:
             return take(data[1:], data[0]), data[1 + data[0] :]
-        wide = _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
         data = data[1:]
         out = bytearray()
         while True:
@@ -1827,6 +1839,22 @@ _O7_DESCRIBE: wire_schema.Schema = (
     ('n4', 'count'),
     ('each', 'columns', 'count', _O7_DESCRIBE_COLUMN),
 )
+# Oracle 8i's describe (#2284, PROTOCOL.md §19.10): the TTI_DCB 8.1.7 sends
+# ahead of a query's rows. The head of 10g's (decode_token_dcb) -- the
+# describe-info preamble, the max row size, the column count and, when there
+# are columns, a byte (0x33) -- then 9i's columns at OCI's fixed widths, and
+# the describe time, a ub4 length and the date; 10g's flags and query key
+# are not there. Read from 14 describes of a live 8.1.7 with the rows next.
+_O8I_DESCRIBE: wire_schema.Schema = (
+    ('const', bytes([TTI_DCB])),
+    ('value', 'preamble'),
+    ('n4', 'max_row_size'),
+    ('n4', 'count'),
+    ('when', 'count', (('u8', 'reserved'),)),
+    ('each', 'columns', 'count', _O7_DESCRIBE_COLUMN),
+    ('n4', 'date_length'),
+    ('when', 'date_length', (('value', 'date'),)),
+)
 # Oracle 9i's short status (PROTOCOL.md §19.2, #2284): the 10g+ OER without its
 # call status and sequence number. The head runs to the rowid of the row a DML
 # touched (#1079): row count, ORA code, the two array-error fields, cursor id,
@@ -2033,6 +2061,7 @@ _O7_LOBOPS_THIN = wire_schema.compile_encoder(_O7_LOBOPS, _THIN)
 _O7_LOBOPS_REPLY_FROM_THIN = wire_schema.compile_decoder(_O7_LOBOPS_REPLY, _THIN)
 _O8I_RPA_FROM_O8I = wire_schema.compile_decoder(_O8I_RPA, _O8I)
 _O8I_STATUS_FROM_O8I = wire_schema.compile_decoder(_O8I_STATUS, _O8I)
+_O8I_DESCRIBE_FROM_O8I = wire_schema.compile_decoder(_O8I_DESCRIBE, _O8I)
 _AUTH_HEAD_FROM_THIN = wire_schema.compile_decoder(_AUTH_HEAD, _THIN)
 _AUTH_HEAD_FROM_OCI = wire_schema.compile_decoder(_AUTH_HEAD, _OCI)
 _AUTH_PAIR_OCI = wire_schema.compile_encoder(_AUTH_PAIR, _OCI)
@@ -14058,104 +14087,38 @@ def decode_8i_dml_rowid(Data: bytes) -> str | None:
 
 
 def decode_8i_dcb_describe(Data: bytes) -> tuple[list[dict], bytes]:
-    # Oracle 8i answers the modern OALL8 (0x5e) execute with a TTI_DCB (0x10)
-    # describe block whose header and per-column descriptors use FIXED-width
-    # big-endian fields — NOT the ub1-length-prefixed ub4s the 10g+ DCB
-    # (decode_token_dcb) expects. The modern decoder therefore reads num_columns
-    # as 0 and desyncs, so 8i needs this dedicated parser. Reverse-engineered
-    # from a live 9.2-client -> 8.1.7 SQL*Net trace (docs/PROTOCOL.md §19.9).
-    # Returns (columns, rest) where `rest` begins at the fv2 row stream
-    # (TTI_RXH / TTI_RXD / TTI_OER), which decode_fv2_exec_response consumes.
-    #
-    # Layout (offsets into the TTC payload):
-    #   0        TTI_DCB (0x10)
-    #   1        ub1 preamble length (0x19 = 25) — SCN + 7-byte date, skipped
-    #   2..      preamble bytes
-    #   header:  ub1 row width (sum of column widths, skipped)
-    #            ub4be num_columns
-    #            ub4be constant 0x33 (skipped)
-    #   per column (num_columns times):
-    #     +0      ub1  data type (1=VARCHAR2, 2=NUMBER, 96=CHAR, …)
-    #     +1..+4  ub4be size field. For a NUMBER: `00 <precision> <scale sb1>
-    #             <internal size 22>` (#386). For other types: bit31 = character
-    #             flag, low 31 bits = max_size.
-    #     +5..+18 14 reserved bytes (always 0 in captures)
-    #     +19..22 ub4be character set id (31 = WE8ISO8859P1; 0 for NUMBER)
-    #     +23     reserved (0)
-    #     +24     ub1 csform (1 = character type, 0 = number)
-    #     +25     ub1 null_ok (0 = NOT NULL, 1 = nullable)
-    #     +26,+27 ub1 name length (twice)
-    #     +28..31 ub4be name length
-    #     +32..   name bytes (name length)
-    #     +…      8-byte inter-column trailer (type-OID slot; 0 for scalar types)
-    #   trailer  8i bytes-with-length current date: ub1 len, ub4be len, len bytes
-    PreLen = Data[1]
-    Off = 2 + PreLen  # skip the SCN/date preamble
-    # Header: max row width, then num_columns — both LITTLE-endian ub4 (8i is
-    # x86, so these ride native-endian; a wide row like a CLOB's 4000-byte width
-    # is `a0 0f 00 00`). Then the constant 0x33 byte.
-    Off += 4  # max row width (ub4 LE)
-    NumCols = int.from_bytes(Data[Off : Off + 4], 'little')
-    Off += 4
-    Off += 1  # constant 0x33
+    # Oracle 8i answers a query's OALL8 with a TTI_DCB (0x10) describe
+    # (`_O8I_DESCRIBE`, docs/PROTOCOL.md §19.10), as column dicts shaped like
+    # decode_token_dcb's, and the bytes after it: the row stream (TTI_RXH /
+    # TTI_RXD) or the status, which decode_8i_exec_response consumes. A
+    # NUMBER's size is its buffer, with max_size 0 as the modern describe has
+    # it; another column's is its buffer as well, a ub4 -- read as one byte, a
+    # VARCHAR2(4000) described as 160 (#2324). A describe wider than 8i's SDU
+    # continues in the next packet with nothing saying so, and one that runs
+    # off the end raises Truncated for the reader to read on (#1226).
+    try:
+        (Describe, Rest) = _O8I_DESCRIBE_FROM_O8I(Data)
+    except IndexError as Exc:
+        raise Truncated(f'8i describe: {Exc}') from Exc
     Columns: list[dict] = []
-    for _ in range(NumCols):
-        if Off + 32 > len(Data):
-            # The describe continues in the next packet (#1226).
-            raise Truncated(f'8i describe: column {len(Columns)} of {NumCols}')
-        DataType = Data[Off]
-        SizeField = int.from_bytes(Data[Off + 1 : Off + 5], 'big')
-        if DataType == 2:
-            # NUMBER family: the 4-byte size field packs `00 <precision>
-            # <scale sb1> <internal size (22)>` — NOT a plain max_size (#386).
-            # e.g. NUMBER(6,2) = `00 06 02 16`, NUMBER(38) = `00 26 00 16`.
-            # Match the modern describe: max_size 0 (a NUMBER's display size is
-            # derived from precision/scale), data_length = the 22-byte buffer.
-            Precision = (SizeField >> 16) & 0xFF
-            Scale = (SizeField >> 8) & 0xFF
-            if Scale > 127:
-                Scale -= 256  # scale is signed (e.g. NUMBER(5, -2))
-            DataLength = SizeField & 0xFF
-            MaxSize = 0
-        else:
-            Precision = 0
-            Scale = 0
-            MaxSize = SizeField & 0x7FFFFFFF  # bit31 is the character-type flag
-            DataLength = MaxSize
-        Charset = int.from_bytes(Data[Off + 19 : Off + 23], 'big')
-        Csform = Data[Off + 24]
-        NullOk = 0 if Data[Off + 25] == 0 else 1
-        NameLen = int.from_bytes(Data[Off + 28 : Off + 32], 'big')
-        Name = bytes(Data[Off + 32 : Off + 32 + NameLen])
-        if Off + 32 + NameLen + 8 > len(Data):
-            # A wide describe outgrows 8i's SDU and continues in the next
-            # packet; a slice past the end reads short rather than failing, so
-            # say so instead of returning a half-read column (#1226).
-            raise Truncated(f'8i describe: column {len(Columns)} of {NumCols}')
+    for Oac in Describe['columns']:
+        Scale = Oac['scale'] - 256 if Oac['scale'] > 127 else Oac['scale']
         Columns.append(
             {
-                'data_type': DataType,
-                'data_length': DataLength,
+                'data_type': Oac['data_type'],
+                'data_length': Oac['max_length'],
                 'data_scale': Scale,
-                'precision': Precision,
-                'max_size': MaxSize,
-                'charset': Charset,
-                'csfrm': Csform,
-                'null_ok': NullOk,
+                'precision': Oac['precision'],
+                'max_size': 0 if Oac['data_type'] == 2 else Oac['max_length'],
+                'charset': Oac['charset'],
+                'csfrm': Oac['csfrm'],
+                'null_ok': 0 if Oac['null_ok'] == 0 else 1,
                 'domain_schema': None,
                 'domain_name': None,
-                'column_name': Name,
+                'column_name': Oac['name'],
             }
         )
-        Off += 32 + NameLen + 8  # descriptor + name + type-OID trailer
-    # Describe trailer: the current date as an 8i bytes-with-length value
-    # (ub1 len, ub4be len, data) — the same pre-10g coding the OSESSKEY login
-    # uses. Skip it to land on the first row token (TTI_RXH / TTI_RXD).
-    TLen = int.from_bytes(Data[Off + 1 : Off + 5], 'big')
-    Off += 1 + 4 + TLen
-    if Off > len(Data):
-        raise Truncated('8i describe: trailer')
-    return (Columns, Data[Off:])
+    return (Columns, Rest)
 
 
 def _o7_status(Data: bytes) -> dict | None:

@@ -5887,25 +5887,35 @@ session would use; without it non-ASCII `VARCHAR2` mojibakes and `NVARCHAR2` /
 ### 19.10 Oracle 8i response — the fixed-field DCB describe and 4-byte RXD (#244)
 
 The reply is fv2-style but its own shape. The **describe** is a `TTI_DCB` (`0x10`)
-block whose header and per-column descriptors use **fixed-width big-endian**
-fields — not the `ub1`-length-prefixed `ub4`s the 10g+ DCB (§4.2's
-`decode_token_dcb`) reads, so the modern decoder sees `num_columns = 0` and
-desyncs. `decode_8i_dcb_describe`:
+block whose fields are **fixed-width and little-endian**, as OCI's are — not the
+variable-width integers the 10g+ DCB (§4.2's `decode_token_dcb`) reads, so the
+modern decoder sees `num_columns = 0` and desyncs. It is 10g's describe head,
+then 9i's columns (§19.1, `_O7_DESCRIBE_COLUMN`) at those widths, then the
+describe time (`_O8I_DESCRIBE`, #2284; `decode_8i_dcb_describe`):
 
 ```
-10  <ub1 preamble-len> <preamble: SCN + 7-byte date>
-<ub1 row-width>  <ub4be num_columns>  <ub4be 0x33 (const)>
-per column:
-  ub1  data type (1=VARCHAR2, 2=NUMBER, 96=CHAR, …)
-  ub4be  size field — NUMBER: `00 <precision> <scale sb1> <internal size 22>`;
-         else bit31 = character flag | low 31 bits = max_size
-  14 bytes  reserved (always 0 in captures)
-  ub4be  character set (31 = WE8ISO8859P1; 0 for NUMBER)
-  ub1 reserved(0)  ub1 csform  ub1 null_ok(0=NOT NULL,1=nullable)
-  ub1 namelen  ub1 namelen  ub4be namelen  <name bytes>
-  8-byte inter-column trailer (type-OID slot; 0 for scalar types)
-describe trailer: current date as 8i bytes-with-length (ub1 len, ub4be len, data)
+10                    TTI_DCB
+ub1 25, 25 bytes      the describe-info preamble (a cursor uuid and a time)
+ub4 max_row_size      the select list's widest row
+ub4 count             the columns
+ub1 0x33              when there are columns
+per column, the OAC at OCI's widths and the name:
+  ub1 data_type       1 VARCHAR2, 2 NUMBER, 96 CHAR, 112 CLOB, …
+  ub1 flags           0x80 for VARCHAR2 and CHAR
+  ub1 precision, ub1 scale (signed: FLOAT is 126, -127)
+  ub4 max_length      the buffer: 22 for a NUMBER, 4000 for a VARCHAR2(4000)
+  ub4 max_array, ub4 cont_flags, ub4 toid_length (and the toid when set)
+  ub2 version, ub2 charset (31 = WE8ISO8859P1; 0 for NUMBER), ub1 csfrm
+  ub1 null_ok         0 NOT NULL, 1 nullable
+  ub1 name_bytes, ub4 name_chars, then the name: a ub1 length and the text
+  ub4 type_schema_length, ub4 type_name_length (and the names when set)
+ub4 7, ub1 7, 7 bytes the describe time, a DATE
 ```
+
+Read from 14 describes of a live 8.1.7. Read before as big-endian words, the
+flags, precision and scale bytes and the first byte of `max_length` made one
+"size field", so a column of 256 bytes or more was described by its low byte:
+a VARCHAR2(4000) as 160 (#2324).
 
 The **rows** follow as repeated `TTI_RXH` (`06`) + `TTI_RXD` (`07`) pairs. Unlike
 the 9i 1-byte indicator (§19.2), each 8i column value is a DALC **followed by a
