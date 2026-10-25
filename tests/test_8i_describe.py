@@ -73,5 +73,43 @@ class TestADescribeCutShortByAnError(unittest.TestCase):
             gen.send(False)
 
 
+class TestAColumnOf256BytesOrMore(unittest.TestCase):
+    """A column's size is a ub4, little-endian; read as one byte, a
+    VARCHAR2(4000) described as 160 (#2324). Captured from seerdb's own
+    session on 8.1.7: `SELECT *` of a table of every 8i column type, its
+    describe, rows and status (`o8i_describe_wide_columns`)."""
+
+    def _columns(self) -> dict:
+        columns, _ = decode_8i_dcb_describe(_packet('wide_columns'))
+        return {c['column_name'].decode(): c for c in columns}
+
+    def test_each_size_is_whole(self):
+        columns = self._columns()
+        for name, size in (('V4000', 4000), ('CL', 4000), ('BL', 4000), ('BF', 530)):
+            self.assertEqual(columns[name]['data_length'], size, name)
+        self.assertEqual(columns['V']['data_length'], 10)
+
+    def test_the_description_says_it(self):
+        from seerdb.client.cursor import _column_description
+
+        description = _column_description(self._columns()['V4000'])
+        self.assertEqual(description[2:4], (4000, 4000))
+
+    def test_a_number_keeps_its_precision_and_scale(self):
+        columns = self._columns()
+        self.assertEqual(
+            [
+                (columns[n]['precision'], columns[n]['data_scale'])
+                for n in ('N62', 'NNEG', 'F')
+            ],
+            [(6, 2), (5, -2), (126, -127)],
+        )
+        self.assertEqual(columns['N62']['null_ok'], 0)
+
+    def test_the_rows_follow_it(self):
+        _, rest = decode_8i_dcb_describe(_packet('wide_columns'))
+        self.assertEqual(rest[:1], b'\x06')  # TTI_RXH
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -311,6 +311,12 @@ _FILLED_PADS = {
     # bytes as they were (#2249).
     ('_AUTH_HEAD', '_OCI'): ('only', 'oci'),
 }
+# Text a peer chunks otherwise than the codec writes it, named: 8.1.7 sends a
+# long message in chunks of 255 bytes, and the 8i codec writes text in thin's
+# chunks of 64, the form 8i reads in a request (#2322).
+_RECHUNKED_TEXT = {
+    ('_O8I_STATUS', '_O8I'): ('when', 'code'),
+}
 
 
 def _given(record: dict) -> dict:
@@ -378,6 +384,8 @@ def _unexplained(record: dict, again: bytes) -> list[str]:
         if record['codec'] == '_THIN' and kind in _THIN_INTEGERS:
             continue
         if _FILLED_PADS.get((record['schema'], record['codec'])) == field[:2]:
+            continue
+        if _RECHUNKED_TEXT.get((record['schema'], record['codec'])) == field[:2]:
             continue
         out.append(f'{offset}: {field[:2]}')
     return sorted(set(out))
