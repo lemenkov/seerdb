@@ -7397,14 +7397,6 @@ class TestPre10ServerVersion(unittest.TestCase):
         '652044617461204d696e696e67206f7074696f6e730a4a5365727665722052656c6561'
         '736520392e322e302e342e30202d2050726f64756374696f6e040920040009'
     )
-    # The 8.1.7 phase-two reply's head, as far as AUTH_VERSION_NO.
-    LOGIN_8I = (
-        bytes.fromhex('0816')
-        + b'\x13\x00\x00\x00\x13AUTH_VERSION_STRING\x0c\x00\x00\x00\x0c- Production'
-        + b'\x00\x00\x00\x00\x10\x00\x00\x00\x10AUTH_VERSION_SQL\x02\x00\x00\x00\x0214'
-        + b'\x00\x00\x00\x00\x0f\x00\x00\x00\x0fAUTH_VERSION_NO\t\x00\x00\x00\t135294976'
-        + b'\x00\x00\x00\x00'
-    )
 
     def test_the_9i_version_call_is_ojdbc14s(self):
         from seerdb.common.tns import encode_o7_version
@@ -7424,9 +7416,24 @@ class TestPre10ServerVersion(unittest.TestCase):
         from seerdb.client.connection import _format_version
         from seerdb.common.tns import decode_8i_server_version
 
-        self.assertEqual(decode_8i_server_version(self.LOGIN_8I), 135294976)
+        # The whole 8.1.7 phase-two reply, captured from seerdb's own session.
+        reply = _load_capture('o8i_login_phase2_reply.hexdump')
+        self.assertEqual(decode_8i_server_version(reply), 135294976)
         self.assertEqual(_format_version(135294976), '8.1.7.0.0')
-        self.assertEqual(decode_8i_server_version(self.LOGIN_8I[:40]), 0)
+        self.assertEqual(decode_8i_server_version(reply[:40]), 0)
+
+    def test_the_8i_login_reply_reads_by_its_pairs(self):
+        # Its pairs, not a search for a key's name: an AUTH_NLS_ key comes with
+        # its NUL terminator counted, and an empty value as a zero length.
+        from seerdb.common.tns import parse_8i_auth_value
+
+        reply = _load_capture('o8i_login_phase2_reply.hexdump')
+        self.assertEqual(parse_8i_auth_value(reply, b'AUTH_NLS_LXLAN'), b'AMERICAN')
+        self.assertEqual(
+            parse_8i_auth_value(reply, b'AUTH_NLS_LXCDATEFM'), b'DD-MON-RR'
+        )
+        self.assertEqual(parse_8i_auth_value(reply, b'AUTH_CAPABILITY_TABLE'), b'')
+        self.assertIsNone(parse_8i_auth_value(reply, b'AUTH_NO_SUCH_KEY'))
 
 
 class TestFv2Bfile(unittest.TestCase):

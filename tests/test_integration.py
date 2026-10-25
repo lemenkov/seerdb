@@ -7883,6 +7883,28 @@ class RefusedLoginIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class EmptyAppNameIntegration(_ThrottleRetry, unittest.TestCase):
+    """A login whose app_name is empty: its program pair goes out with an
+    empty value. On 8i that value was one zero byte where the server reads a
+    zero length, the pair came out three bytes short, and the login failed with
+    an IndexError (#2344)."""
+
+    def test_an_empty_app_name_logs_in(self):
+        with seerdb.connect(
+            host=_HOST,
+            port=_PORT,
+            user=_USER,
+            password=_PASSWORD,
+            service_name=_SERVICE,
+            app_name='',
+            **_FV_KW,
+        ) as conn:
+            cur = conn.cursor()
+            cur.execute('SELECT 42 FROM dual')
+            self.assertEqual(cur.fetchone(), (42,))
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class ChangePasswordIntegration(_ThrottleRetry, unittest.TestCase):
     """Connection.changepassword over the wire (#21). Each test changes the
     test user's password and always restores it (on the original, still-
