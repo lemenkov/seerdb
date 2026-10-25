@@ -7841,6 +7841,48 @@ class SqlDomainIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class RefusedLoginIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
+    """A login the server refuses raises its ORA-01017, sync and async, for a
+    wrong password and an unknown user alike. On 8i and 9i the refusal was
+    read in the 10g+ order and its code missed: a wrong password raised
+    ORA-01012 on 9i and an AssertionError on 8i, an unknown user a bare
+    "authentication failed" (#2340). One wrong password a run: a successful
+    login resets the account's count of failed ones."""
+
+    def _kwargs(self, user, password):
+        return dict(
+            host=_HOST,
+            port=_PORT,
+            user=user,
+            password=password,
+            service_name=_SERVICE,
+            **_FV_KW,
+        )
+
+    CASES = (
+        ('wrong password', _USER, 'not the password 2340'),
+        ('unknown user', 'no_such_user_2340', 'x'),
+    )
+
+    def test_a_refused_login_raises_ora_01017(self):
+        for label, user, password in self.CASES:
+            with self.subTest(label):
+                with self.assertRaises(seerdb.DatabaseError) as caught:
+                    seerdb.connect(**self._kwargs(user, password)).close()
+                self.assertEqual(caught.exception.code, 1017, str(caught.exception))
+        with seerdb.connect(**self._kwargs(_USER, _PASSWORD)):
+            pass  # the account still logs in
+
+    async def test_a_refused_async_login_raises_ora_01017(self):
+        for label, user, password in self.CASES:
+            with self.subTest(label):
+                with self.assertRaises(seerdb.DatabaseError) as caught:
+                    conn = await seerdb.connect_async(**self._kwargs(user, password))
+                    await conn.close()
+                self.assertEqual(caught.exception.code, 1017, str(caught.exception))
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class ChangePasswordIntegration(_ThrottleRetry, unittest.TestCase):
     """Connection.changepassword over the wire (#21). Each test changes the
     test user's password and always restores it (on the original, still-

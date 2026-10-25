@@ -151,6 +151,19 @@ class _ConnectionLogic:
             Msg = Result[5] if isinstance(Result, tuple) and len(Result) > 5 else None
             raise from_ora_code(Code)(Msg or f'ORA-{Code:05d}', code=Code)
 
+    def _pre10_login_error(self, Packet: bytes) -> tuple[int, str | None]:
+        """The ORA code and message of the status refusing an 8i or 9i login,
+        at either phase, read as that tier's status is (#2340): 8i's
+        (`decode_8i_terminal_error`) or 9i's short one (`decode_fv2_oer_error`).
+        Read in the 10g+ order -- call status, sequence, row count, code -- the
+        code fell in a skipped field, a wrong password read as authenticated,
+        and the next call drew ORA-01012 (9i) or an AssertionError (8i)."""
+        from seerdb.common.tns import decode_8i_terminal_error, decode_fv2_oer_error
+
+        if isinstance(self._dialect, O8iDialect):
+            return decode_8i_terminal_error(Packet)
+        return decode_fv2_oer_error(Packet)
+
     # --- Temporary LOBs (#1066) ----------------------------------------------
 
     def _createlob_form(self, lob_type) -> tuple[int, int]:

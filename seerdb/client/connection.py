@@ -1674,18 +1674,12 @@ class OracleConnect(_ConnectionLogic):
                                 DatabaseError,
                                 from_ora_code,
                             )
-                            from seerdb.common.tns import decode_packet, decode_ub4
+                            from seerdb.common.tns import decode_packet
 
-                            if getattr(self, '_o3_phase', 0) == 2:
-                                # 9i's OER is shorter than the 11g+ form
-                                # decode_token_oer expects (no batch-error
-                                # arrays), so decode just the leading fields:
-                                # call_status, seq, rowcount, then the ORA code.
-                                Rest = Packet[1:]
-                                for _ in range(3):
-                                    (_, Rest) = decode_ub4(Rest)
-                                (ErrCode, _) = decode_ub4(Rest)
-                                Message = None
+                            if getattr(self, '_o3_phase', 0):
+                                # An 8i or 9i login, refused at either phase: its
+                                # tier's status, not the 10g+ one (#2340).
+                                (ErrCode, Message) = self._pre10_login_error(Packet)
                             else:
                                 # Via decode_packet so the negotiated field
                                 # version is published for the version-gated
@@ -1702,13 +1696,15 @@ class OracleConnect(_ConnectionLogic):
                                 raise from_ora_code(ErrCode)(
                                     Message or f'ORA-{ErrCode:05d}', code=ErrCode
                                 )
-                            if getattr(self, '_o3_phase', 0) == 2:
-                                # O3LOGON phase two answered with a clean OER =
-                                # authenticated (#90). No AUTH_SVR_RESPONSE to
-                                # validate on the pre-10g path.
+                            if getattr(self, '_o3_phase', 0) == 2 and isinstance(
+                                self._dialect, Fv2Dialect
+                            ):
+                                # 9i's O3LOGON phase two answered with a clean OER
+                                # = authenticated (#90). No AUTH_SVR_RESPONSE to
+                                # validate on the pre-10g path; 8i's answer is an
+                                # RPA, so a clean OER there is no login.
                                 self.conn_state = CONN_STATE_AUTHENTICATED
                                 logger.debug('handle_login: authenticated (O3LOGON)')
-                                assert isinstance(self._dialect, Fv2Dialect)
                                 self.server_version = cast(
                                     int, self._drive(self._dialect.server_version())
                                 )
