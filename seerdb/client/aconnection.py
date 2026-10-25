@@ -892,16 +892,12 @@ class AsyncOracleConnect(_ConnectionLogic):
                                 DatabaseError,
                                 from_ora_code,
                             )
-                            from seerdb.common.tns import decode_packet, decode_ub4
+                            from seerdb.common.tns import decode_packet
 
-                            if getattr(self, '_o3_phase', 0) == 2:
-                                # 9i's OER is the short pre-10g form: skip
-                                # call_status, seq, rowcount, then the ORA code.
-                                Rest = Packet[1:]
-                                for _ in range(3):
-                                    (_, Rest) = decode_ub4(Rest)
-                                (ErrCode, _) = decode_ub4(Rest)
-                                Message = None
+                            if getattr(self, '_o3_phase', 0):
+                                # An 8i or 9i login, refused at either phase: its
+                                # tier's status, not the 10g+ one (#2340).
+                                (ErrCode, Message) = self._pre10_login_error(Packet)
                             else:
                                 Result = cast(
                                     tuple,
@@ -915,9 +911,11 @@ class AsyncOracleConnect(_ConnectionLogic):
                                 raise from_ora_code(ErrCode)(
                                     Message or f'ORA-{ErrCode:05d}', code=ErrCode
                                 )
-                            if getattr(self, '_o3_phase', 0) == 2:
+                            if getattr(self, '_o3_phase', 0) == 2 and isinstance(
+                                self._dialect, Fv2Dialect
+                            ):
+                                # 9i's answer; 8i's is an RPA (#2340).
                                 self.conn_state = CONN_STATE_AUTHENTICATED
-                                assert isinstance(self._dialect, Fv2Dialect)
                                 self.server_version = cast(
                                     int,
                                     await self._drive(self._dialect.server_version()),
