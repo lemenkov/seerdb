@@ -1755,7 +1755,10 @@ _LOB_READ_REPLY: wire_schema.Schema = (
 # behind it carries the real one (#265, #1764). Their count is a ub4 in a ub8's
 # slot, and its upper four bytes are left unset: 10.2 writes address bytes
 # there and 11.2 whatever its buffer held, so they are skipped, never read as
-# part of the count (#2249). Not on the wire, so
+# part of the count (#2249). Oracle 8i's OSESSKEY and OAUTH (#2284) are this
+# head at the 8i codec's widths, the count a ub4 alone, and their pairs these;
+# the replies an RPA, a ub2 pair count and the pairs (`_O8I_AUTH_REPLY`). Not
+# on the wire, so
 # given to the decoder: whether a 23ai OAUTH carries its has-user pointer (thin
 # only, detected by its first byte), and whether the user is length-prefixed
 # (thin from 12.1, OCI always) or raw.
@@ -1777,6 +1780,7 @@ _AUTH_HEAD: wire_schema.Schema = (
     ('ptr', 'pointer_2'),
     ('only', 'thin', (('n8', 'pair_count'),)),
     ('only', 'oci', (('n4', 'pair_count'), ('pad', 4))),
+    ('only', 'o8i', (('n4', 'pair_count'),)),
     ('ptr', 'pointer_3'),
     ('ptr', 'pointer_4'),
     ('when', 'user_prefixed', (('value', 'user'),)),
@@ -2168,6 +2172,18 @@ _AUTH_PAIR_OCI = wire_schema.compile_encoder(_AUTH_PAIR, _OCI)
 _AUTH_FROM_OCI = wire_schema.compile_decoder(
     (*_AUTH_HEAD, ('each', 'pairs', 'pair_count', _AUTH_PAIR)), _OCI
 )
+_AUTH_O8I = wire_schema.compile_encoder(
+    (*_AUTH_HEAD, ('each', 'pairs', 'pair_count', _AUTH_PAIR)), _O8I
+)
+# An 8i login reply (#2284): the RPA, a ub2 pair count -- AUTH_SESSKEY alone at
+# phase one, 22 at phase two -- and the pairs; an empty value is a zero length
+# and no value, as AUTH_CAPABILITY_TABLE's. The status follows.
+_O8I_AUTH_REPLY: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('n2', 'pair_count'),
+    ('each', 'pairs', 'pair_count', _AUTH_PAIR),
+)
+_O8I_AUTH_REPLY_FROM_O8I = wire_schema.compile_decoder(_O8I_AUTH_REPLY, _O8I)
 
 
 def decode_auth_head(
@@ -15157,23 +15173,13 @@ def decode_o7_session_key(Packet: bytes) -> bytes:
 
 # --- Oracle 8i (8.1.7) O3LOGON via the OSESSKEY/OAUTH envelope ---------------
 # 8i uses the same DES O3LOGON *crypto* as 9i, but wraps it in the OSESSKEY
-# (0x76) / OAUTH (0x73) function envelope with key-value AUTH_ pairs — NOT 9i's
+# (0x76) / OAUTH (0x73) function envelope with key-value AUTH_ pairs -- NOT 9i's
 # positional TTI_3LOGA/TTI_3LOGON. Sending 3LOGA to 8i draws a TTI_OER. The
-# pre-10g key-value length coding is `ub1(len) ub4be(len) data`, then a ub4be
-# padding word — distinct from the modern variable-length encode_sb4 form.
-# Byte-for-byte reproduced from a live 9.2-client -> 8.1.7 capture
-# (docs/PROTOCOL.md; ~/o8i/captures/cli8i_9.2_to_8i.trc).
-
-
-def _kv8i(Key: bytes, Val: bytes) -> bytes:
-    def field(Data: bytes) -> bytes:
-        return (
-            bytes([len(Data)]) + struct.pack('>I', len(Data)) + Data
-            if Data
-            else bytes([0])
-        )
-
-    return field(Key) + field(Val) + struct.pack('>I', 0)
+# envelope is the 10g login's head and pairs (`_AUTH_HEAD`, `_AUTH_PAIR`) at the
+# 8i codec's fixed little-endian widths (#2284): what read before as a ub1
+# length and a big-endian ub4 repeat of it is a ub4 length and a value, a ub1
+# length and the bytes. Reproduced byte for byte from a live 9.2-client -> 8.1.7
+# capture (docs/PROTOCOL.md §19.8).
 
 
 # The longest value an 8i key-value field can carry: its ub1 length stops at
@@ -15195,51 +15201,70 @@ def _o8i_info_pairs(Pairs: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes
     ]
 
 
+def _o8i_login(
+    Subtype: int, Seq: int, User: bytes, Mode: int, Pairs: list[tuple[bytes, bytes]]
+) -> bytes:
+    # An 8i OSESSKEY or OAUTH call (`_AUTH_HEAD` and `_AUTH_PAIR` at the 8i
+    # codec's widths). An empty value is a zero length and no value, as 8.1.7
+    # writes one; written as one zero byte, the pair came out three bytes short
+    # and the login failed (#2344).
+    return _AUTH_O8I(
+        {
+            'subtype': Subtype,
+            'seq': Seq,
+            'pointer_1': True,
+            'user_length': len(User),
+            'mode': Mode,
+            'pointer_2': True,
+            'pair_count': len(Pairs),
+            'pointer_3': True,
+            'pointer_4': True,
+            'user_prefixed': True,
+            'user_raw': False,
+            'user': User,
+            'pairs': [
+                {
+                    'key_length': len(Key),
+                    'key': Key,
+                    'value_length': len(Val),
+                    'value': Val,
+                    'flags': 0,
+                }
+                for Key, Val in Pairs
+            ],
+        }
+    )
+
+
 def encode_o3logon_osesskey_phase1(
     Seq: int, User: bytes, Pairs: list[tuple[bytes, bytes]]
 ) -> bytes:
-    # TTI_FUN + OSESSKEY (0x76): request the session key. Carries the username
-    # and informational AUTH_ pairs (program/machine/pid — session metadata the
-    # server does not authenticate on). The pair count is a ub1 at offset 13.
-    return (
-        bytes([TTI_FUN, TTI_SESS, Seq, 1])
-        + bytes([len(User)])
-        + struct.pack('>I', 1)  # logon mode
-        + struct.pack('>I', 1)
-        + bytes([len(Pairs)])  # number of key-value pairs
-        + struct.pack('>I', 1)
-        + bytes([1])  # has-username
-        + bytes([len(User)])
-        + User
-        + b''.join(_kv8i(k, v) for k, v in _o8i_info_pairs(Pairs))
-    )
+    # TTI_FUN + OSESSKEY (0x76), mode 1: request the session key. Carries the
+    # username and informational AUTH_ pairs (program/machine/pid -- session
+    # metadata the server does not authenticate on).
+    return _o8i_login(TTI_SESS, Seq, User, 1, _o8i_info_pairs(Pairs))
 
 
 def encode_o3logon_oauth_phase2(
     Seq: int, User: bytes, PwdField: bytes, Pairs: list[tuple[bytes, bytes]]
 ) -> bytes:
-    # TTI_FUN + OAUTH (0x73): send AUTH_PASSWORD (hex(DES blocks) + decimal pad
-    # count) plus the informational pairs. Logon mode 0x105 marks phase two.
-    return (
-        bytes([TTI_FUN, TTI_AUTH, Seq, 1])
-        + bytes([len(User)])
-        + struct.pack('>I', 1)
-        + bytes([1])
-        + struct.pack('>I', 0x105)  # phase-two logon mode
-        + struct.pack('>I', 1)
-        + bytes([1])  # has-username
-        + bytes([len(User)])
-        + User
-        + _kv8i(b'AUTH_PASSWORD', PwdField)
-        + b''.join(_kv8i(k, v) for k, v in _o8i_info_pairs(Pairs))
+    # TTI_FUN + OAUTH (0x73), mode 0x101: send AUTH_PASSWORD (hex(DES blocks) +
+    # decimal pad count) plus the informational pairs. The count follows the
+    # pairs; written as part of the mode, `00 00 01 05`, it held only while
+    # they were five.
+    return _o8i_login(
+        TTI_AUTH,
+        Seq,
+        User,
+        0x101,
+        [(b'AUTH_PASSWORD', PwdField), *_o8i_info_pairs(Pairs)],
     )
 
 
 def parse_8i_auth_sesskey(Packet: bytes) -> bytes:
     """Extract the 8-byte session key from an 8i OSESSKEY response RPA.
 
-    The AUTH_SESSKEY value is a length-prefixed ASCII-hex string in the pre-10g
-    key-value coding (``ub1 len``, ``ub4be len``, then the hex)."""
+    The AUTH_SESSKEY value is its ASCII hex (`_O8I_AUTH_REPLY`)."""
     from binascii import unhexlify
 
     from seerdb.common.exceptions import InterfaceError
@@ -15257,16 +15282,20 @@ def decode_8i_server_version(Packet: bytes) -> int:
 
 
 def parse_8i_auth_value(Packet: bytes, Key: bytes) -> bytes | None:
-    """One value of an 8i login reply, or None when the reply lacks it.
-
-    Its key and value each come as a ``ub1 len`` and a ``ub4be`` repeat of it,
-    then the bytes; the phase-two reply carries AUTH_VERSION_NO (#2278)."""
-    Idx = Packet.find(Key)
-    if Idx < 0:
+    """One value of an 8i login reply (`_O8I_AUTH_REPLY`), b'' for an empty
+    one, or None when the reply lacks it or is not an RPA of pairs. The
+    phase-two reply carries AUTH_VERSION_NO (#2278). Read before by searching
+    for the key's name, a key sent with its NUL terminator, as the AUTH_NLS_
+    ones are, read as empty."""
+    try:
+        Reply = _O8I_AUTH_REPLY_FROM_O8I(Packet)[0]
+    except (IndexError, ValueError, DataError):
         return None
-    After = Packet[Idx + len(Key) :]
-    ValLen = After[0]  # ub1 length; the ub4be repeat follows in After[1:5]
-    return After[5 : 5 + ValLen]
+    for Pair in Reply['pairs']:
+        # 8.1.7 counts an AUTH_NLS_ key's NUL terminator in its length.
+        if bytes(Pair.get('key', b'')).rstrip(b'\x00') == Key:
+            return bytes(Pair.get('value', b''))
+    return None
 
 
 def encode_dictionary_spfp(Dictionary: dict) -> bytes:

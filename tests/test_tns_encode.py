@@ -6594,7 +6594,8 @@ class TestO8iOsesskeyMessages(unittest.TestCase):
     # Pinned against a live 9.2-client -> 8.1.7 handshake
     # (~/o8i/captures/cli8i_9.2_to_8i.trc, #244). 8i wraps the same DES O3LOGON
     # crypto as 9i in the OSESSKEY (0x76) / OAUTH (0x73) envelope with key-value
-    # AUTH_ pairs, coded ub1(len) ub4be(len) data ub4be(pad).
+    # AUTH_ pairs: the 10g login's head and pairs at the 8i codec's widths
+    # (#2284), each length a little-endian ub4 and each string a value.
     _INFO = [
         (b'AUTH_PROGRAM_NM', b'sqlplus@o9i (TNS V1-V3)'),
         (b'AUTH_MACHINE', b'o9i'),
@@ -6629,6 +6630,25 @@ class TestO8iOsesskeyMessages(unittest.TestCase):
             '485f5049440500000005313331343800000000080000000841555448'
             '5f41434c04000000043830303000000000',
         )
+
+    def test_an_empty_value_is_a_zero_length(self):
+        # As 8.1.7 writes one (its AUTH_CAPABILITY_TABLE): a zero ub4 length and
+        # no value. Written as one zero byte, the pair was three bytes short and
+        # an empty app_name failed the login (#2344).
+        from seerdb.common.tns import encode_o3logon_osesskey_phase1
+
+        message = encode_o3logon_osesskey_phase1(
+            2, b'system', [(b'AUTH_PROGRAM_NM', b''), (b'AUTH_PID', b'1')]
+        )
+        empty = bytes.fromhex('0f0000000f') + b'AUTH_PROGRAM_NM' + bytes(4) + bytes(4)
+        self.assertIn(empty, message)
+
+    def test_the_oauth_pair_count_follows_its_pairs(self):
+        # Phase two declared five pairs whatever it sent; the count follows them.
+        from seerdb.common.tns import encode_o3logon_oauth_phase2
+
+        message = encode_o3logon_oauth_phase2(3, b'system', b'F' * 17, self._INFO)
+        self.assertEqual(message[12:17], bytes.fromhex('0104000000'))  # ptr, 4 pairs
 
     def test_a_long_program_name_is_cut_to_what_the_field_holds(self):
         # The ub1 length stops at 252: 253-255 are TTC markers, and a longer

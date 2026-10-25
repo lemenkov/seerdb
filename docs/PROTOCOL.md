@@ -5823,9 +5823,20 @@ seerdb detects 8i from the PRO banner (major version 8) and pins field version 2
 (8i's PRO carries no caps to negotiate it down, else the client stays at its
 default and wrongly takes the fv24 fast-auth path).
 
-**Pre-10g key-value coding.** Each `AUTH_` pair is `ub1(len) ub4be(len) <data>`
-for the key, the same for the value, then a `ub4be` padding word — distinct from
-the modern variable-length `encode_sb4` form.
+**The envelope is 10g's at fixed widths.** Both calls are the 10g login's head
+and pairs (`_AUTH_HEAD`, `_AUTH_PAIR`, #2284) at the 8i codec's little-endian
+widths: a pointer, the user's `ub4` length, the `ub4` mode (1 for OSESSKEY, 0x101
+for OAUTH), a pointer, the `ub4` pair count, two pointers and the user as a value
+(a `ub1` length and the bytes); then each pair, a `ub4` key length, the key as a
+value, a `ub4` value length, the value as a value, and a `ub4` flags word (0).
+Read first as `ub1(len) ub4be(len) <data>` and a big-endian padding word, the
+bytes are the same for a non-empty value; but an empty one is a zero length and
+no value, as 8.1.7 writes one (its `AUTH_CAPABILITY_TABLE`), and written as one
+zero byte it failed the login (#2344). The "phase-two logon mode `0x105`" of the
+first reading was the mode 0x101 and the pair count, five. The replies are the
+RPA, a `ub2` pair count and the pairs (`_O8I_AUTH_REPLY`): `AUTH_SESSKEY` alone at
+phase one, 22 at phase two, whose `AUTH_NLS_` keys count their NUL terminators in
+their lengths.
 
 The `ub1` caps a value at **252 bytes**, because 253, 254 and 255 are the TTC
 escape, long-form and NULL markers. Measured on 8.1.7 with `AUTH_PROGRAM_NM`:
