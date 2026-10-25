@@ -6911,7 +6911,10 @@ class TestO8iQueryMessages(unittest.TestCase):
 
         payload = b'ABCDEFGHIJ' * 60  # 600 bytes
         c1, c2, c3 = payload[:255], payload[255:510], payload[510:600]
-        rxh = bytes([0x06]) + bytes(14)  # byte 14 = bit-vector length 0
+        # The row header 8.1.7 sends for a two-column query's first row, as
+        # captured (#2284): flags 02, two columns, iteration 0, one iteration,
+        # buffer length 0, and no bit vector or rowid.
+        rxh = bytes.fromhex('060202000000010000000000000000000000')
         long_val = (
             bytes([0xFE, len(c1)])
             + c1

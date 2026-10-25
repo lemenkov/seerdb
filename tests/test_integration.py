@@ -1348,6 +1348,24 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id FROM {self.TABLE} WHERE ROWID = :r', [rid])
         self.assertEqual(self.cur.fetchone(), (1,))
 
+    def test_a_null_urowid_between_two_that_are_set(self):
+        # Through a CASE, an index-organized table's ROWID can be NULL. On 8i
+        # its cell left a byte unread, and the fetch failed with ORA-01002
+        # (#2328).
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} '
+            f'(id NUMBER PRIMARY KEY, v VARCHAR2(20)) ORGANIZATION INDEX'
+        )
+        for i in (1, 2, 3):
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', [i, 'v'])
+        self.cur.execute(
+            f'SELECT id, CASE WHEN id <> 2 THEN ROWID END FROM {self.TABLE} ORDER BY id'
+        )
+        rows = self.cur.fetchall()
+        self.assertEqual([r[0] for r in rows], [1, 2, 3])
+        self.assertIsNone(rows[1][1])
+        self.assertTrue(rows[0][1].startswith('*') and rows[2][1].startswith('*'))
+
     @_requires(_INTERVAL)
     def test_interval_columns_describe_their_precisions(self):
         # An INTERVAL column describes its leading-field precision and its
