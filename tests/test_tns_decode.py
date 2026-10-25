@@ -7024,13 +7024,37 @@ class TestFv2LobOperations(unittest.TestCase):
         self.assertEqual(len(value), 1 + 11 * 253 + 1 + 228 + 1)
         self.assertEqual(_o7_lob_value(b'\x09\x09').hex(), '020909')
 
+    def test_close_asks_for_no_value_and_gets_none(self):
+        # CLOSE's request asks no reply value, and 9.2.0.4's reply is the RPA
+        # and the locator, then the status. Read as if it carried an amount,
+        # the status's first bytes came back as one: 16842752 (#2284).
+        # Captured from seerdb on 9.2.0.4.
+        from seerdb.common.tns import decode_fv2_lob_value
+        from seerdb.common.tns_consts import TNS_LOB_OP_CLOSE
+
+        reply = bytes.fromhex(
+            '0800540001020c00000001000000010000000b91eb0002f5c60002f5c500020002'
+            '001f0000008fb300481760962a00000000003a0302109d5e00000009000f00009a'
+            'b40080017f03be010000000002f5c50040b8d2000004010100000000000000000000'
+            '000302f5c501010002b8d20000000000010100000000'
+        )
+        (value, body) = decode_fv2_lob_value(reply, TNS_LOB_OP_CLOSE)
+        self.assertEqual((value, len(body or b'')), (0, 84))
+
     def test_the_reply_gives_the_value_and_the_locator_to_keep(self):
         from seerdb.common.lob import LOB
         from seerdb.common.tns import decode_fv2_lob_value
+        from seerdb.common.tns_consts import (
+            TNS_LOB_OP_GET_CHUNK_SIZE,
+            TNS_LOB_OP_IS_OPEN,
+        )
 
-        (chunk, body) = decode_fv2_lob_value(self.CHUNK_REP)
+        (chunk, body) = decode_fv2_lob_value(self.CHUNK_REP, TNS_LOB_OP_GET_CHUNK_SIZE)
         self.assertEqual(chunk, 8132)
-        self.assertEqual(decode_fv2_lob_value(self.ISOPEN_REP)[0], 1)
+        # IS_OPEN's answer rides the null-LOB field its request set (#2284).
+        self.assertEqual(
+            decode_fv2_lob_value(self.ISOPEN_REP, TNS_LOB_OP_IS_OPEN)[0], 1
+        )
         # Kept, the locator is the fetched form again, so the next call works:
         # prefixed twice, it answered ORA-22275.
         fetched = self._locator(self.CHUNK_REQ)

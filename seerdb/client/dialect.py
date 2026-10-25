@@ -558,7 +558,7 @@ class Fv2Dialect:
         if resp is False:
             raise Exception('Connection closed during 9i LOB call')
         fv2_raise_for_error(resp[1])
-        return decode_fv2_lob_value(resp[1])
+        return decode_fv2_lob_value(resp[1], operation)
 
     def bfile_read(self, locator: bytes):
         # 9i BFILE read: FILE_OPEN → GETLEN → READ → FILE_CLOSE over TTI_LOBOPS

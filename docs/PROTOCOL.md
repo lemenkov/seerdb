@@ -5641,14 +5641,21 @@ READ returns empty on 9i):
    is the only reliable stop signal (`decode_fv2_lob_chunks`). Content may span
    packets.
 
-The **op middle** is a flag block (go-ora's LOB request layout, sb4-encoded on
-fv2): has-dest, dest length, source offset, dest offset, charset-present, a reply
-flag (`1` except for FILE_CLOSE), null-o2u, the **operation** (`TNS_LOB_OP_*` —
-GET_LENGTH `0x01`, READ `0x02`, FILE_OPEN `0x0100`, FILE_CLOSE `0x0200`), has-scn,
-scn length. Across the four ops only the operation, the READ's source offset (`1`)
-and the reply flag change, so `_o7_lobop_mid(operation, …)` generates all four
-(and `_o8i_lobop_mid` the 8i form — the same block with fixed ub4-LE fields,
-§19.17).
+The request is the 10g+ TTI_LOBOPS head (§14's `_LOBOPS_HEAD`, at field
+version 2): the source locator's pointer and length, the destination's, the
+short source and destination offsets, the charset, short-amount and null-LOB
+pointers, the **operation** (`TNS_LOB_OP_*` — GET_LENGTH `0x01`, READ `0x02`,
+FILE_OPEN `0x0100`, FILE_CLOSE `0x0200`, …). Then the SCN array's pointer and
+length, the amount's pointer, the locator, and the **short amount** when its
+pointer says so: what the "op middle" and "trailer" of the first reading are.
+9i has neither the long offsets nor the array slots 10g added. The short amount
+is the READ's count, TRIM's new length, OPEN's mode, FILE_OPEN's `0x0b`, `0` for
+GETLEN, whose reply fills it in; CLOSE and FILE_CLOSE ask none, and IS_OPEN sets
+the null-LOB pointer instead. The reply is the RPA, the locator as the server now
+has it (a `ub2` length and the body: the `00` after `08` is its high byte), the
+short amount if asked for, and IS_OPEN's answer, then the status. seerdb writes
+and reads them from `_O7_LOBOPS` and `_O7_LOBOPS_REPLY` (#2284); the 8i form keeps
+fixed ub4-LE fields (`_o8i_lobop_mid`, §19.17).
 
 An **empty** LOB (`EMPTY_CLOB()` / `EMPTY_BLOB()`) has a valid locator but GETLEN
 returns amount 0, so no READ is issued and the value is `""` / `b""`. CLOB content
