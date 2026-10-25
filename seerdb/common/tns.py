@@ -2053,7 +2053,10 @@ _O7_IOV: wire_schema.Schema = (
 # / FILE_CLOSE (#102, #2259). Read as an amount pointer and a value of the
 # body, the locator's ub2 length looked the same up to a body of 252 bytes;
 # past it, a BFILE's with a long file name, the value went out in chunks,
-# and 9.2.0.4 refused the call with ORA-03120 (#2331).
+# and 9.2.0.4 refused the call with ORA-03120 (#2331). 8i's request is the
+# same at the 8i codec's widths, byte for byte for every READ, FILE_OPEN,
+# GET_LENGTH and FILE_CLOSE a live 8.1.7 session sends (#2284); in chunks, a
+# long BFILE locator closed its session.
 _O7_LOBOPS: wire_schema.Schema = (
     *_LOBOPS_HEAD,
     ('ptr', 'scn_present'),
@@ -2061,7 +2064,8 @@ _O7_LOBOPS: wire_schema.Schema = (
     ('bytes', 'locator', 'source_length'),
     ('when', 'short_amount_present', (('n4', 'short_amount'),)),
 )
-# Its reply: the RPA, the locator as the server now has it (a ub2 length and
+# Its reply, on 8i at the 8i codec's widths: the RPA, the locator as the
+# server now has it (a ub2 length and
 # the body; FILE_OPEN's has its open flag set, a WRITE's is updated), then the
 # short amount if the request asked for one -- a GET_LENGTH's length, OPEN's
 # mode -- and IS_OPEN's answer, 1 or 0, in the null-LOB field it set. CLOSE
@@ -2142,6 +2146,8 @@ _O7_LONG_CELL_FROM_THIN = wire_schema.compile_decoder(_O7_LONG_CELL, _THIN)
 _O7_IOV_FROM_THIN = wire_schema.compile_decoder(_O7_IOV, _THIN)
 _O7_LOBOPS_THIN = wire_schema.compile_encoder(_O7_LOBOPS, _THIN)
 _O7_LOBOPS_REPLY_FROM_THIN = wire_schema.compile_decoder(_O7_LOBOPS_REPLY, _THIN)
+_O7_LOBOPS_O8I = wire_schema.compile_encoder(_O7_LOBOPS, _O8I)
+_O7_LOBOPS_REPLY_FROM_O8I = wire_schema.compile_decoder(_O7_LOBOPS_REPLY, _O8I)
 _O8I_RPA_FROM_O8I = wire_schema.compile_decoder(_O8I_RPA, _O8I)
 _O8I_STATUS_FROM_O8I = wire_schema.compile_decoder(_O8I_STATUS, _O8I)
 _O8I_DESCRIBE_FROM_O8I = wire_schema.compile_decoder(_O8I_DESCRIBE, _O8I)
@@ -13321,12 +13327,17 @@ _O7_LOBOP_FLAGS = {
 
 
 def _encode_o7_lobop(
-    Seq: int, Locator: bytes, Operation: int, Offset: int = 0, Amount: int = 0
+    Seq: int,
+    Locator: bytes,
+    Operation: int,
+    Offset: int = 0,
+    Amount: int = 0,
+    O8i: bool = False,
 ) -> bytes:
-    # A 9i TTI_LOBOPS request from `_O7_LOBOPS`. The locator is as fetched, a
-    # ub2 length and the body (`_read_lob_column`), and its length counts both;
-    # CLOB/BLOB locators are 86 bytes, BFILE locators vary with the directory
-    # and file name.
+    # A 9i or 8i TTI_LOBOPS request from `_O7_LOBOPS`. The locator is as
+    # fetched, a ub2 length and the body (`_read_lob_column`), and its length
+    # counts both; CLOB/BLOB locators are 86 bytes, BFILE locators vary with
+    # the directory and file name.
     Values = {
         'seq': Seq,
         'token_number': None,
@@ -13346,7 +13357,7 @@ def _encode_o7_lobop(
         'short_amount': Amount,
     }
     Values.update(_O7_LOBOP_FLAGS.get(Operation, {}))
-    return _O7_LOBOPS_THIN(Values)
+    return (_O7_LOBOPS_O8I if O8i else _O7_LOBOPS_THIN)(Values)
 
 
 def encode_o7_lob_getlen(Seq: int, Locator: bytes) -> bytes:
@@ -13392,10 +13403,12 @@ def _o7_lob_value(Data: bytes) -> bytes:
     return bytes(Out + b'\x00')
 
 
-def _o7_lobops_reply(Packet: bytes, Operation: int | None) -> dict | None:
-    # A 9i LOB operation's reply, from `_O7_LOBOPS_REPLY` by what `Operation`'s
-    # request asked for -- or, for None, its locator alone -- or None for one
-    # that is not an RPA (an error's status) or too short.
+def _o7_lobops_reply(
+    Packet: bytes, Operation: int | None, O8i: bool = False
+) -> dict | None:
+    # A 9i or 8i LOB operation's reply, from `_O7_LOBOPS_REPLY` by what
+    # `Operation`'s request asked for -- or, for None, its locator alone -- or
+    # None for one that is not an RPA (an error's status) or too short.
     if not Packet or Packet[0] != TTI_RPA:
         return None
     if Operation is None:
@@ -13404,7 +13417,8 @@ def _o7_lobops_reply(Packet: bytes, Operation: int | None) -> dict | None:
         Given = {'short_amount_present': True, 'null_lob_present': False}
         Given.update(_O7_LOBOP_FLAGS.get(Operation, {}))
     try:
-        return _O7_LOBOPS_REPLY_FROM_THIN(Packet, Given)[0]
+        Decode = _O7_LOBOPS_REPLY_FROM_O8I if O8i else _O7_LOBOPS_REPLY_FROM_THIN
+        return Decode(Packet, Given)[0]
     except (IndexError, Truncated, DataError):
         return None
 
@@ -13441,8 +13455,8 @@ def encode_o7_bfile_close(Seq: int, Locator: bytes) -> bytes:
 def decode_fv2_opened_locator(Packet: bytes) -> bytes | None:
     # The opened BFILE locator a FILE_OPEN reply carries, whole -- its ub2
     # length and body -- so it feeds straight back into the LOBOPS encoders.
-    # 8i's reply opens the same way, its mode after it at a fixed width, so
-    # only the locator is read.
+    # 8i's reply opens the same way, its mode after it at the 8i codec's
+    # width, so only the locator is read.
     Reply = _o7_lobops_reply(Packet, None)
     if Reply is None:
         return None
@@ -13602,85 +13616,40 @@ def _encode_8i_bind_value(Value: object) -> bytes:
     return encode_token_rxd(Value)
 
 
-# The op-specific middles (25 bytes) of the 8i TTI_LOBOPS requests, captured
-# verbatim from a 9.2-client -> 8.1.7 session (docs/PROTOCOL.md §19.15 / §19.17):
-# the CLOB/BLOB READ, and the BFILE FILE_OPEN / GETLEN / FILE_CLOSE (#401). The
-# op family shares one envelope; only the middle and trailer vary.
-def _o8i_lobop_mid(
-    operation: int, *, source_offset: int = 0, has_reply: int = 1
-) -> bytes:
-    """The 8i TTI_LOBOPS request middle — the same flag block as the fv2 one
-    (:func:`_o7_lobop_mid`) but with the numeric fields as fixed ub4 LE rather
-    than sb4: source offset at byte 5, the reply flag at 14, and the
-    ``TNS_LOB_OP_*`` operation (ub4 LE) at 16."""
-    mid = bytearray(25)
-    struct.pack_into('<I', mid, 5, source_offset)
-    mid[14] = has_reply
-    struct.pack_into('<I', mid, 16, operation)
-    return bytes(mid)
-
-
-_O8I_LOBOP_READ_MID = _o8i_lobop_mid(TNS_LOB_OP_READ, source_offset=1)
-_O8I_LOBOP_FOPEN_MID = _o8i_lobop_mid(TNS_LOB_OP_FILE_OPEN)
-_O8I_LOBOP_GETLEN_MID = _o8i_lobop_mid(TNS_LOB_OP_GET_LENGTH)
-_O8I_LOBOP_FCLOSE_MID = _o8i_lobop_mid(TNS_LOB_OP_FILE_CLOSE, has_reply=0)
-
-
-def _encode_o8i_lobop(Seq: int, Locator: bytes, Middle: bytes, Trailer: bytes) -> bytes:
-    # An 8i TTI_LOBOPS (0x60) request: `03 60 seq 01` + ub4-LE locator length +
-    # the 25-byte op middle + the locator + an op-specific trailer. Lengths ride
-    # LITTLE-endian (8i is x86). The whole envelope is captured ground truth.
-    return (
-        bytes([TTI_FUN, TTI_LOBOPS, Seq & 0xFF, 0x01])
-        + len(Locator).to_bytes(4, 'little')
-        + Middle
-        + Locator
-        + Trailer
-    )
-
-
 def encode_8i_lob_read(Seq: int, Locator: bytes, Amount: int) -> bytes:
-    # 8i CLOB/BLOB/BFILE READ: unlike 9i's GETLEN + READ pair, 8i reads the value
-    # in one call whose reply is the shared `0e fe <chunks> 00` LOB content
+    # 8i CLOB/BLOB/BFILE READ (`_O7_LOBOPS` at the 8i codec's widths, #2284):
+    # unlike 9i's GETLEN + READ pair, 8i reads the value in one call from offset
+    # 1, whose reply is the shared `0e fe <chunks> 00` LOB content
     # (decode_fv2_lob_chunks). `Amount` is chars for a CLOB, bytes for a BLOB /
-    # BFILE; the trailer is the ub4-LE read amount.
-    return _encode_o8i_lobop(
-        Seq, Locator, _O8I_LOBOP_READ_MID, Amount.to_bytes(4, 'little')
-    )
+    # BFILE.
+    return _encode_o7_lobop(Seq, Locator, TNS_LOB_OP_READ, 1, Amount, O8i=True)
 
 
 def encode_o8i_bfile_open(Seq: int, Locator: bytes) -> bytes:
-    # 8i BFILE FILE_OPEN (#401): open the external file read-only. The trailer is
-    # the ub4-LE open mode 0x0b (read-only). The reply's RPA carries an *updated*
-    # locator with the open flag set — GETLEN / READ / CLOSE must use that one
+    # 8i BFILE FILE_OPEN (#401): open the external file read-only, mode 0x0b in
+    # the short amount. The reply's RPA carries an *updated* locator with the
+    # open flag set -- GETLEN / READ / CLOSE must use that one
     # (decode_fv2_opened_locator, shared with the 9i path). §19.17.
-    return _encode_o8i_lobop(
-        Seq, Locator, _O8I_LOBOP_FOPEN_MID, (0x0B).to_bytes(4, 'little')
-    )
+    return _encode_o7_lobop(Seq, Locator, TNS_LOB_OP_FILE_OPEN, 0, 0x0B, O8i=True)
 
 
 def encode_o8i_bfile_getlen(Seq: int, Locator: bytes) -> bytes:
-    # 8i BFILE GETLEN (#401): ask for the file length. Trailer is a ub4-LE 0. The
-    # reply carries the length as a ub4-LE after the locator (decode_o8i_bfile_getlen).
-    return _encode_o8i_lobop(
-        Seq, Locator, _O8I_LOBOP_GETLEN_MID, (0).to_bytes(4, 'little')
-    )
+    # 8i BFILE GETLEN (#401): ask for the file length, which the reply carries in
+    # the short amount (decode_o8i_bfile_getlen).
+    return _encode_o7_lobop(Seq, Locator, TNS_LOB_OP_GET_LENGTH, O8i=True)
 
 
 def encode_o8i_bfile_close(Seq: int, Locator: bytes) -> bytes:
-    # 8i BFILE FILE_CLOSE (#401): close the opened file. No trailer.
-    return _encode_o8i_lobop(Seq, Locator, _O8I_LOBOP_FCLOSE_MID, b'')
+    # 8i BFILE FILE_CLOSE (#401): close the opened file; it asks for no amount.
+    return _encode_o7_lobop(Seq, Locator, TNS_LOB_OP_FILE_CLOSE, O8i=True)
 
 
 def decode_o8i_bfile_getlen(Packet: bytes) -> int:
-    # Pull the file length out of an 8i BFILE GETLEN reply (#401): TTI_RPA (08),
-    # then the echoed `<ub1 len><body>` locator, then the ub4-LE length. The
-    # locator's inner ub1 length sits at Packet[2], so the length starts at
-    # 3 + that (the RPA byte + the leading 0 + the ub1-length-led body).
-    if not Packet or Packet[0] != TTI_RPA or len(Packet) < 3:
-        return 0
-    off = 3 + Packet[2]
-    return int.from_bytes(Packet[off : off + 4], 'little')
+    # The file length an 8i BFILE GETLEN reply carries (#401), its short amount
+    # (`_O7_LOBOPS_REPLY` at the 8i codec's widths), or 0 for a reply of another
+    # shape.
+    Reply = _o7_lobops_reply(Packet, TNS_LOB_OP_GET_LENGTH, O8i=True)
+    return Reply.get('short_amount', 0) if Reply else 0
 
 
 def decode_8i_block_out(Data: bytes, NumOut: int) -> list:
