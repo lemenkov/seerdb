@@ -13120,7 +13120,7 @@ def _o7_define_entry(Col: dict) -> bytes:
     # One 13/14-byte define entry: the client's requested return type for a
     # column (built from the describe). deftype = VARNUM(6) for NUMBER, else the
     # column type; CHAR carries flag 0x21; NUMBER/DATE/TIMESTAMP use a fixed
-    # buffer size, everything else the described max. charset defaults to 31
+    # buffer size, everything else the described buffer. charset defaults to 31
     # (the server DB charset JDBC requests) unless the column is national.
     Type = Col['data_type']
     Csfrm = Col.get('csfrm') or 0
@@ -13140,7 +13140,9 @@ def _o7_define_entry(Col: dict) -> bytes:
         # (as JDBC does); the value streams back in the chunked DALC form.
         DefType, MaxSize = Type, 0x7FFFFFFF
     else:
-        DefType, MaxSize = Type, Col.get('max_size') or 0
+        # The described buffer, in bytes: max_size is the declared size, an
+        # NCHAR's in characters and a LOB's 0, as 10g's describe has it (#2326).
+        DefType, MaxSize = Type, Col.get('data_length') or 0
     Flag = 0x21 if Type == TNS_TYPE_CHAR else 0x01
     Charset = Col.get('charset') or 31
     # An object names its type in the descriptor as ojdbc14 does: the
@@ -13392,6 +13394,19 @@ def _fv2_type_name(Name: bytes | None) -> str | None:
     return Name.decode('ascii', 'replace') if Name else None
 
 
+def _o7_max_size(Oac: dict) -> int:
+    # A pre-10g column's declared size, as 10g's describe sends it (the OAC's
+    # max_chars, which 8i and 9i do not): a VARCHAR2's or CHAR's characters,
+    # its buffer over two in AL16UTF16, and 0 for any other column. Its buffer
+    # instead gave a DATE and a ROWID a size of 1, a LOB 4000 and a 9i NUMBER
+    # 22, which cursor.description reported (#2326).
+    if Oac['data_type'] not in (TNS_TYPE_VARCHAR, TNS_TYPE_CHAR):
+        return 0
+    if Oac['charset'] == AL16UTF16_CHARSET:
+        return Oac['max_length'] // 2
+    return Oac['max_length']
+
+
 def decode_fv2_describe(Data: bytes) -> list[dict]:
     # The TTI_RPA (0x08) answering the 0x62 describe-columns call, as column
     # dicts shaped like decode_token_dcb's (docs/PROTOCOL.md §19.1), from
@@ -13406,7 +13421,7 @@ def decode_fv2_describe(Data: bytes) -> list[dict]:
             'data_length': Oac['max_length'],
             'data_scale': Oac['scale'],
             'precision': Oac['precision'],
-            'max_size': Oac['max_length'],
+            'max_size': _o7_max_size(Oac),
             'charset': Oac['charset'],
             'csfrm': Oac['csfrm'],
             'null_ok': 0 if Oac['null_ok'] == 0 else 1,
@@ -14091,9 +14106,9 @@ def decode_8i_dcb_describe(Data: bytes) -> tuple[list[dict], bytes]:
     # (`_O8I_DESCRIBE`, docs/PROTOCOL.md §19.10), as column dicts shaped like
     # decode_token_dcb's, and the bytes after it: the row stream (TTI_RXH /
     # TTI_RXD) or the status, which decode_8i_exec_response consumes. A
-    # NUMBER's size is its buffer, with max_size 0 as the modern describe has
-    # it; another column's is its buffer as well, a ub4 -- read as one byte, a
-    # VARCHAR2(4000) described as 160 (#2324). A describe wider than 8i's SDU
+    # column's data_length is its buffer, a ub4 -- read as one byte, a
+    # VARCHAR2(4000) described as 160 (#2324) -- and its max_size the declared
+    # size `_o7_max_size` gives, as on 9i. A describe wider than 8i's SDU
     # continues in the next packet with nothing saying so, and one that runs
     # off the end raises Truncated for the reader to read on (#1226).
     try:
@@ -14109,7 +14124,7 @@ def decode_8i_dcb_describe(Data: bytes) -> tuple[list[dict], bytes]:
                 'data_length': Oac['max_length'],
                 'data_scale': Scale,
                 'precision': Oac['precision'],
-                'max_size': 0 if Oac['data_type'] == 2 else Oac['max_length'],
+                'max_size': _o7_max_size(Oac),
                 'charset': Oac['charset'],
                 'csfrm': Oac['csfrm'],
                 'null_ok': 0 if Oac['null_ok'] == 0 else 1,

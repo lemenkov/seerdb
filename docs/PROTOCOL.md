@@ -5457,6 +5457,13 @@ next one or on the call's status.
 > **last** column's OAC runs straight into the describe trailer, so only interior
 > columns segment cleanly by eye.
 
+**The declared size (#2326).** Neither 9i's describe nor 8i's (§19.10) has the
+OAC's `max_chars`, the declared size 10g's sends, which `cursor.description`
+reports. The decoders give it as 10g's describe has it: a VARCHAR2's or CHAR's
+buffer, halved in AL16UTF16 (an NCHAR(4) describes 8 bytes), and 0 for every
+other column. The buffer stood in before, and a DATE and a ROWID, which
+describe a buffer of 1, reported a size of 1, a LOB 4000 and a 9i NUMBER 22.
+
 ### 19.2 fv2 row data
 
 The execute+fetch (`0x47`, call 3) carries a per-column **define block** telling

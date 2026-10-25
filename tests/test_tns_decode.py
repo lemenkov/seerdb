@@ -7232,6 +7232,47 @@ class TestFv2WideDescribe(unittest.TestCase):
         self.assertEqual(decode_fv2_describe(bytes.fromhex('0400010000')), [])
 
 
+class TestFv2DescriptionSizes(unittest.TestCase):
+    """cursor.description's sizes on 9i are 10g's, as python-oracledb reports
+    them (#2326). The describe has no declared size, and its buffer stood in:
+    a DATE and a ROWID reported 1, a NUMBER 22, a CLOB 4000, an NCHAR(4) its
+    8 bytes. Captured from seerdb's own session on 9.2.0.4."""
+
+    def test_each_column_reports_what_10g_does(self):
+        from seerdb.client.cursor import _column_description
+        from seerdb.common.tns import decode_fv2_describe
+
+        columns = decode_fv2_describe(
+            _load_capture('fv2_describe_column_types_9i.hexdump')
+        )
+        self.assertEqual(
+            {c['column_name']: _column_description(c)[2:4] for c in columns},
+            {
+                b'D': (23, None),
+                b'N': (10, None),
+                b'NC': (4, 8),
+                b'RI': (None, None),
+                b'CL': (None, None),
+            },
+        )
+
+    def test_each_define_asks_for_the_described_buffer(self):
+        # The execute defines each column with its buffer, in bytes, not the
+        # declared size: an NCHAR(4) 8 bytes, a CLOB 4000. Defined with 0, a
+        # CLOB answered ORA-01002 on its fetch.
+        from seerdb.common import tns, wire_schema
+
+        columns = tns.decode_fv2_describe(
+            _load_capture('fv2_describe_column_types_9i.hexdump')
+        )
+        read = wire_schema.compile_decoder(tns._O7_OAC, tns._THIN)
+        sizes = {
+            c['column_name']: read(tns._o7_define_entry(c))[0]['max_length']
+            for c in columns
+        }
+        self.assertEqual(sizes, {b'D': 7, b'N': 22, b'NC': 8, b'RI': 128, b'CL': 4000})
+
+
 class TestFv2ObjectColumn(unittest.TestCase):
     """A 9i object column (#2258), from 9.2.0.4: `select id, o from o2248
     order by id`, `o` a `ty2248(a NUMBER, b VARCHAR2(10))`, one row holding
