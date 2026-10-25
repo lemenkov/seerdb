@@ -5479,11 +5479,24 @@ The define block follows a fixed prefix (`01 01 <numcols> 00 00 01 01 01 0a
 NUMBER→`0x06` (VARNUM, MaxSize 22), VARCHAR2→`0x01` (MaxSize = described max),
 CHAR→`0x60` (flag `0x21`), DATE→`0x0c` (MaxSize 7).
 
-In the returned `TTI_RXD`, each column is a DALC value followed by an indicator:
-a present value is followed by a single `0x00`; a **NULL** column is an empty
-value (`0x00`) followed by the two-byte marker **`0x81 0x01`**. Missing the
-wider NULL indicator silently truncates the row stream (consumes one byte too
-few and desyncs the following rows).
+The `TTI_RXH` is the 10g+ one: flags, then as `ub2`s the number of columns
+requested, the iteration, the iterations the fetch asked for (`0a`) and the
+buffer length, then the column bit vector's and the rowid's lengths (`ub4`s)
+and their bytes. 9.2.0.4 sends seerdb both lengths, zero in every reply, rows
+repeating each other or not, so no value is ever left out of a row (§6.1's bit
+vector, #181). It sends **ojdbc14** neither: that client's header ends at the
+buffer length, `06 02 01 01 00 01 0a 00`, and the row's `07` follows. Its short
+status (§19.3) likewise stops at the iterations, the message straight after.
+The server shapes both by what the client negotiated (#2284).
+
+In the returned `TTI_RXD`, each column is a DALC value followed by an indicator,
+a signed `ub4`: `0x00` (0) for a value; for a **NULL** column an empty value
+(`0x00`) and **`0x81 0x01`**, -1, the indicator OCI gives a NULL. Reading the
+indicator as one byte silently truncates the row stream (consumes one byte too
+few and desyncs the following rows). A LOB's value is a `ub4` length and, unless
+it is zero, the locator; a LONG's comes chunked (`0xFE`) however short. seerdb
+reads the header and each cell from a schema (`_O7_RXH`, `_O7_CELL`,
+`_O7_LOB_CELL`, `_O7_LONG_CELL`, `_O7_EMPTY_CELL`).
 
 A column the describe gives a **zero data length** (§19.1's MaxLen) -- an untyped
 `SELECT NULL`, or anything Oracle folds to one at parse, such as

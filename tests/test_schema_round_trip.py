@@ -20,6 +20,7 @@ listed, so that a new one shows up in review.
 import itertools
 import json
 import os
+import re
 import unittest
 from typing import Any
 
@@ -412,10 +413,13 @@ class TestTheMessagesTheDecodersReadRoundTrip(unittest.TestCase):
         records = _corpus()
         self.assertGreater(len(records), 500)
         covered = {r['schema'] for r in records}
+        with open(tns.__file__) as f:
+            source = f.read()
+        # A whole name: `_LOB_CELL_FROM_` is inside `_O7_LOB_CELL_FROM_THIN`.
         decoded = {
             name
             for name in _schemas()
-            if name not in ONE_WAY and f'{name}_FROM_' in open(tns.__file__).read()
+            if name not in ONE_WAY and re.search(rf'(?<!\w){name}_FROM_', source)
         }
         self.assertEqual(decoded - covered, set())
 

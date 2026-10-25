@@ -1857,6 +1857,42 @@ _O7_STATUS_TAIL: wire_schema.Schema = (
     ),
     ('when', 'code', (('chr', 'message'),)),
 )
+# 9i's row header (#2284): flags, the number of columns requested, the
+# iteration, the iterations the fetch asked for (10), the buffer length, then
+# (`_O7_RXH_VECTORS`) the column bit vector and the rowid, each a ub4 length
+# and the bytes: the 10g+ RXH. 9.2.0.4 sends seerdb both lengths, zero in every
+# reply, repeated values or not; it sends ojdbc14 neither, the header ending
+# at the buffer length and the first row's 07 straight after it (captured).
+# A ub4 never opens with 07, and a 04 would be a bit vector of 2**24 bytes,
+# so a row or the status there says the short form.
+_O7_RXH: wire_schema.Schema = (
+    ('const', bytes([TTI_RXH])),
+    ('u8', 'flags'),
+    ('n2', 'requests'),
+    ('n2', 'iteration'),
+    ('n2', 'iterations'),
+    ('n2', 'buffer_length'),
+)
+_O7_RXH_VECTORS: wire_schema.Schema = (
+    ('n4', 'bit_vector_length'),
+    ('when', 'bit_vector_length', (('value', 'bit_vector'),)),
+    ('n4', 'rowid_length'),
+    ('when', 'rowid_length', (('value', 'rowid'),)),
+)
+# A 9i row's cell: the value, then its indicator, a signed ub4 -- 0 for a value,
+# -1 (`81 01`) for NULL, which comes with an empty value; a long one comes in
+# chunks of 64 bytes, as the server writes text. A LONG or LONG RAW comes
+# chunked however short, and a NULL one is a bare zero (#102). A LOB's value is a
+# ub4 length and, when it is not zero, the locator; a column described with no
+# length sends the indicator alone (#1185).
+_O7_CELL: wire_schema.Schema = (('chr', 'value'), ('n4', 'indicator'))
+_O7_LOB_CELL: wire_schema.Schema = (
+    ('n4', 'length'),
+    ('when', 'length', (('value', 'locator'),)),
+    ('n4', 'indicator'),
+)
+_O7_LONG_CELL: wire_schema.Schema = (('long', 'value'), ('n4', 'indicator'))
+_O7_EMPTY_CELL: wire_schema.Schema = (('n4', 'indicator'),)
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
 _OAC_FROM_THIN = wire_schema.compile_decoder(_OAC, _THIN)
 _OAC_FROM_OCI = wire_schema.compile_decoder(_OAC, _OCI)
@@ -1864,6 +1900,12 @@ _O7_OAC_THIN = wire_schema.compile_encoder(_O7_OAC, _THIN)
 _O7_DESCRIBE_FROM_THIN = wire_schema.compile_decoder(_O7_DESCRIBE, _THIN)
 _O7_STATUS_HEAD_FROM_THIN = wire_schema.compile_decoder(_O7_STATUS_HEAD, _THIN)
 _O7_STATUS_TAIL_FROM_THIN = wire_schema.compile_decoder(_O7_STATUS_TAIL, _THIN)
+_O7_RXH_FROM_THIN = wire_schema.compile_decoder(_O7_RXH, _THIN)
+_O7_RXH_VECTORS_FROM_THIN = wire_schema.compile_decoder(_O7_RXH_VECTORS, _THIN)
+_O7_CELL_FROM_THIN = wire_schema.compile_decoder(_O7_CELL, _THIN)
+_O7_LOB_CELL_FROM_THIN = wire_schema.compile_decoder(_O7_LOB_CELL, _THIN)
+_O7_EMPTY_CELL_FROM_THIN = wire_schema.compile_decoder(_O7_EMPTY_CELL, _THIN)
+_O7_LONG_CELL_FROM_THIN = wire_schema.compile_decoder(_O7_LONG_CELL, _THIN)
 _AUTH_HEAD_FROM_THIN = wire_schema.compile_decoder(_AUTH_HEAD, _THIN)
 _AUTH_HEAD_FROM_OCI = wire_schema.compile_decoder(_AUTH_HEAD, _OCI)
 _AUTH_PAIR_OCI = wire_schema.compile_encoder(_AUTH_PAIR, _OCI)
@@ -14066,14 +14108,13 @@ def decode_fv2_exec_response(Data: bytes, Columns: list) -> tuple[list, int]:
 
 def decode_fv2_exec_status(Data: bytes, Columns: list) -> tuple[list, int, str | None]:
     # Walk the fv2 (9i) execute+fetch response stream: TTI_RXH (06) then one
-    # TTI_RXD (07) per row, terminated by the short TTI_OER (04). The 9i row
-    # framing differs from 10g+: the RXH has no trailing bit-vector / rowid, and
-    # each column value is a DALC blob followed by a 1-byte indicator. Row
-    # values themselves use the version-independent §11 decoders. Returns
-    # (rows, ora_code, message) where ora_code 1403 == end-of-fetch (PROTOCOL.md
-    # §19.2), and message is the status's text for an error. Raised from the
-    # code alone, an error the fetch met -- ORA-01476 from `SELECT 1/0` -- had
-    # no text (#2315).
+    # TTI_RXD (07) per row, terminated by the short TTI_OER (04), each read from
+    # its schema (#2284): `_O7_RXH`, then per column `_O7_CELL`, `_O7_LOB_CELL`
+    # or `_O7_EMPTY_CELL`. Row values themselves use the version-independent
+    # §11 decoders. Returns (rows, ora_code, message) where ora_code 1403 ==
+    # end-of-fetch (PROTOCOL.md §19.2), and message is the status's text for an
+    # error. Raised from the code alone, an error the fetch met -- ORA-01476 from
+    # `SELECT 1/0` -- had no text (#2315).
     from seerdb.common.lob import LOB
     from seerdb.common.types import decode_value
 
@@ -14084,42 +14125,32 @@ def decode_fv2_exec_status(Data: bytes, Columns: list) -> tuple[list, int, str |
     while Rest:
         Token = Rest[0]
         if Token == TTI_RXH:
-            # token + 1B flags, then a run of small ub4 counts (numreq, iter,
-            # numiters, buffer length, …). The count of trailing fields varies,
-            # so consume ub4s until the next token appears. Safe because every
-            # RXH field is a small value (width byte 0x00/0x01), never a token
-            # byte (RXD 0x07 / OER 0x04 / RXH 0x06).
-            Rest = Rest[2:]
-            while Rest and Rest[0] not in (TTI_RXD, TTI_OER, TTI_RXH):
-                (_, Rest) = decode_ub4(Rest)
+            (Header, Rest) = _O7_RXH_FROM_THIN(Rest)
+            if Rest[:1] not in (bytes([TTI_RXD]), bytes([TTI_OER])):
+                (Header, Rest) = _O7_RXH_VECTORS_FROM_THIN(Rest, Header)
+            if Header.get('bit_vector_length'):
+                # The column bit vector that compresses repeated values (#181).
+                # 9.2.0.4 has sent none, repeated values or not; reading the
+                # row without it would misread every value after the first
+                # repeat, so a reply carrying one is refused.
+                raise DataError('a 9i row header with a column bit vector')
         elif Token == TTI_RXD:
             Rest = Rest[1:]
             Row: list = []
             for Col in Columns:
                 DataType = Col.get('data_type')
                 if DataType in (112, 113, 114):
-                    # CLOB / BLOB / BFILE. A present cell is a LOB locator (ub4
-                    # num_bytes + DALC locator) followed by a 1-byte 0x00
-                    # indicator; _read_lob_column extracts the locator and the
-                    # connection round-trips it via TTI_LOBOPS (the fv2 dialect lob_read for
-                    # CLOB/BLOB; bfile_read — FILE_OPEN/READ/CLOSE — for
-                    # BFILE). A NULL LOB uses the scalar empty-value form instead
-                    # — `00 81 01` (an empty DALC then the `81 01` null
-                    # indicator). A present locator's num_bytes is always >= its
-                    # minimum (first byte 0x01), so a leading 0x00 means NULL.
-                    if Rest[:1] == b'\x00':
-                        Rest = Rest[1:]  # empty DALC
-                        if Rest[:1] == b'\x81':
-                            Rest = Rest[2:]  # 81 01 null indicator
-                        Row.append(None)
-                    else:
-                        (Locator, Rest) = _read_lob_column(Rest)
-                        Rest = Rest[1:]  # present indicator (0x00)
-                        Row.append(
-                            LOB(DataType, Locator, charset=Col.get('charset'))
-                            if Locator is not None
-                            else None
-                        )
+                    # CLOB / BLOB / BFILE: the locator's length, the locator,
+                    # which the connection round-trips via TTI_LOBOPS (the fv2
+                    # dialect's lob_read for CLOB/BLOB; bfile_read --
+                    # FILE_OPEN/READ/CLOSE -- for BFILE), and the indicator. A
+                    # NULL LOB is a zero length and the -1 indicator, `00 81 01`.
+                    (Cell, Rest) = _O7_LOB_CELL_FROM_THIN(Rest)
+                    Row.append(
+                        LOB(DataType, Cell['locator'], charset=Col.get('charset'))
+                        if Cell['length']
+                        else None
+                    )
                     continue
                 if DataType == TNS_TYPE_ADT:
                     # An object (#2258): the 10g+ cell's framing -- type block,
@@ -14127,14 +14158,13 @@ def decode_fv2_exec_status(Data: bytes, Columns: list) -> tuple[list, int, str |
                     # pickled image -- then the indicator. 9i's first field is
                     # a 36-byte type block, not the bare OID, so the OID is the
                     # describe's. A NULL carries the same framing with no image
-                    # and ends with the `81 01` null indicator, not `00`
-                    # (captured on 9.2.0.4).
+                    # and the -1 indicator, `81 01` (captured on 9.2.0.4).
                     from seerdb.common.dbobject import ObjectImage
 
                     (Value, Rest) = _read_object_column(Rest, Col)
                     if isinstance(Value, ObjectImage) and Col.get('type_oid'):
                         Value.type_oid = Col['type_oid']
-                    Rest = Rest[2:] if Rest[:1] == b'\x81' else Rest[1:]
+                    (_, Rest) = _O7_EMPTY_CELL_FROM_THIN(Rest)
                     Row.append(Value)
                     continue
                 if (
@@ -14143,29 +14173,27 @@ def decode_fv2_exec_status(Data: bytes, Columns: list) -> tuple[list, int, str |
                 ):
                     # A column described with a zero data length -- `SELECT NULL`
                     # -- is always NULL and sends no value at all, only the
-                    # `81 01` NULL indicator (#1185). The 9i form of #682. A LONG
-                    # is described with a zero length too, and does carry data.
-                    if Rest[:1] == b'\x81':
-                        Rest = Rest[2:]
+                    # indicator (#1185). The 9i form of #682. A LONG is
+                    # described with a zero length too, and does carry data.
+                    (_, Rest) = _O7_EMPTY_CELL_FROM_THIN(Rest)
                     Row.append(None)
                     continue
-                # The value is a DALC; decode_dalc handles the 0xfe chunked form
-                # that LONG / LONG RAW stream in (in batch fetch they arrive
-                # inline as a plain chunked value, no trailing descriptor).
-                (Val, Rest) = decode_dalc(Rest)
-                # Per-column indicator: 0x00 = value present (one byte); 0x81 =
-                # NULL, a two-byte (81 01) marker following an empty value.
-                if Rest and Rest[0] == 0x81:
-                    Rest = Rest[2:]
+                # The value, then the indicator. A LONG / LONG RAW streams in
+                # the 0xfe chunked form (in batch fetch inline, no trailing
+                # descriptor).
+                if DataType in _LONG_DATA_TYPES:
+                    (Cell, Rest) = _O7_LONG_CELL_FROM_THIN(Rest)
+                else:
+                    (Cell, Rest) = _O7_CELL_FROM_THIN(Rest)
+                Val = Cell['value']
+                if Cell['indicator'] == -1 or Val is None:
                     Row.append(None)
                 elif DataType in (TNS_TYPE_RID, TNS_TYPE_ROWID, TNS_TYPE_UROWID):
                     # Defined as VARCHAR (see _o7_define_entry), so the value is
                     # already the rowid text — decode it directly, not via the
                     # native ROWID decoder.
-                    Rest = Rest[1:]
-                    Row.append(bytes(Val).decode('ascii', 'replace') if Val else None)
+                    Row.append(Val.decode('ascii', 'replace') if Val else None)
                 else:
-                    Rest = Rest[1:]
                     Row.append(decode_value(Col, Val))
             Rows.append(Row)
         elif Token == TTI_OER:
