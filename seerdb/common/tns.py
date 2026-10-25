@@ -13233,8 +13233,12 @@ def _o7_define_entry(Col: dict) -> bytes:
     elif Type in (TNS_TYPE_RID, TNS_TYPE_ROWID, TNS_TYPE_UROWID):
         # Request ROWID as VARCHAR so the server returns its text form (what
         # JDBC does); the native ROWID return form desyncs the fv2 row stream
-        # (ORA-01002). The value arrives as the familiar 18-char rowid string.
-        DefType, MaxSize, Csfrm = TNS_TYPE_VARCHAR, 128, 0
+        # (ORA-01002). The value arrives as the familiar 18-char rowid string;
+        # a UROWID's text, an index-organized table's logical rowid, runs to
+        # _MAX_UROWID_LENGTH, as the bind path has it. Defined at 128, a longer
+        # one came back cut to 128 characters with no error (#2335).
+        MaxSize = _MAX_UROWID_LENGTH if Type == TNS_TYPE_UROWID else 128
+        DefType, Csfrm = TNS_TYPE_VARCHAR, 0
     elif Type in (TNS_TYPE_LONG, TNS_TYPE_LONGRAW):
         # LONG / LONG RAW: request the native type with the 2 GiB max buffer
         # (as JDBC does); the value streams back in the chunked DALC form.
