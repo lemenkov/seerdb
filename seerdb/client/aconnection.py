@@ -1485,10 +1485,9 @@ class AsyncOracleConnect(_ConnectionLogic):
         from binascii import hexlify, unhexlify
 
         from seerdb.common.crypto import des_verifier, o3logon
-        from seerdb.common.tns import encode_o3logon_phase2
+        from seerdb.common.tns import decode_o7_session_key, encode_o3logon_phase2
 
-        Length = Packet[2]
-        SessKey = unhexlify(Packet[3 : 3 + Length])
+        SessKey = unhexlify(decode_o7_session_key(Packet))
         UserB = self.user.encode('utf-8')
         PassB = self.password.encode('utf-8')
         Verifier = des_verifier(UserB, PassB)

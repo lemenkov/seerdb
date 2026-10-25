@@ -1117,8 +1117,22 @@ AES session key: **O5LOGON debuted in 10g** — 11g only *added* the salted SHA-
 verifier (the 192-bit variant), and 12c the PBKDF2 verifier (256-bit). The
 genuinely older **O3LOGON** (an 8-byte *DES* session key; Oracle 8i/9i; tokens
 `TTI_3LOGON` / `TTI_3LOGA`, §3.2) is a different, pre-10g handshake that seerdb
-carries (`crypto.o3logon`) but cannot test for lack of a 9i/8i server, so 10g is
-the oldest auth seerdb is verified against.
+carries (`crypto.o3logon`), verified live against 9.2.0.4 and, in the OSESSKEY
+envelope 8i wraps it in, 8.1.7 (§19.8).
+
+9i's two requests (`_O7_3LOGA`, `_O7_3LOGON`, #2284) are thin-coded: the function
+code and sequence number, the user's pointer and `ub4` length, in 3LOGON the
+password field's (the hex of the DES blocks and the pad count), a zero run, then an
+attribute block — terminal, machine and osuser, each a pointer and a `ub4`
+length; a block `02 10 00 00 00 01 01 10` and a phase tail carrying `10` again —
+then the user, the password, and the four strings, raw. 9.2.0.4 stores the
+terminal and machine whole (a 30-character terminal and a 64-character machine
+name tried). The `10` block is not understood (#2342): the code once filled it
+with the program string's length, and 9.2.0.4 takes the login only when those
+lengths are equal and at least 16, so it stays the constant JDBC's 16-character
+`JDBC Thin Client` gives it, and the session strings JDBC's. 3LOGA's reply is the
+RPA and the session key's hex, a `ub4` length and the digits (`_O7_SESSION_KEY`),
+then the status; a refusal at either phase is a status alone (§19.2, #2340).
 
 ### 4.5 Authentication Response (TTI_FUN/TTI_AUTH)
 
