@@ -7913,10 +7913,9 @@ class SessionIdentityIntegration(_ThrottleRetry, unittest.TestCase):
     def test_the_server_sees_the_clients_host(self):
         import socket
 
-        # A leg that names no backend ('1', the CI job) takes the conservative
-        # skip, as the PG backend reports no USERENV HOST (#2346).
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest('the Mirror over PostgreSQL reports no USERENV HOST (#2346)')
+        # Oracle, and the Mirror over PostgreSQL since #2346, return the client's
+        # machine -- the AUTH_MACHINE the login sent, which seerdb fills with the
+        # client's hostname.
         conn = _connect()
         try:
             cur = conn.cursor()

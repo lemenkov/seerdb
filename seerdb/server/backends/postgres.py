@@ -1770,6 +1770,14 @@ _ORACLE_DICTIONARY_DDL = (
     'SELECT x.proxy FROM sys.ora_session_proxies x JOIN pg_stat_activity a '
     'ON a.pid = x.pid AND a.backend_start = x.started '
     'WHERE x.pid = pg_backend_pid() $$;'
+    # The session's client machine, the login's AUTH_MACHINE (#2346): what
+    # SYS_CONTEXT('USERENV', 'HOST') and V$SESSION.MACHINE report. Read through a
+    # definer function for the same reason as the proxy above -- SYS_CONTEXT's
+    # plan names every table a branch of it reads, so a role that may not read
+    # sys.ora_sessions would otherwise have every SYS_CONTEXT call fail.
+    'CREATE OR REPLACE FUNCTION sys.ora_session_machine() RETURNS text '
+    'LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ '
+    'SELECT machine FROM sys.ora_sessions WHERE pid = pg_backend_pid() $$;'
     'CREATE OR REPLACE FUNCTION sys.sys_context(text, text) RETURNS text '
     # A namespace other than USERENV is an application context: what the
     # client declared at login (`connect(appcontext=...)`), kept in a session
@@ -1813,7 +1821,7 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN 'db_unique_name' THEN upper(current_database()) "
     "WHEN 'instance_name' THEN upper(current_database()) "
     "WHEN 'server_host' THEN NULL "
-    "WHEN 'host' THEN NULL "
+    "WHEN 'host' THEN sys.ora_session_machine() "
     "WHEN 'ip_address' THEN NULL "
     "WHEN 'lang' THEN 'US' "
     "WHEN 'language' THEN 'AMERICAN_AMERICA.AL32UTF8' "
