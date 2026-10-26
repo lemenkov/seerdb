@@ -2196,6 +2196,7 @@ _O8I_IOV_FROM_O8I = wire_schema.compile_decoder(_O8I_IOV, _O8I)
 _O8I_OUT_CELL_FROM_O8I = wire_schema.compile_decoder(_O8I_OUT_CELL, _O8I)
 _O8I_OUT_UNASSIGNED_FROM_O8I = wire_schema.compile_decoder(_O8I_OUT_UNASSIGNED, _O8I)
 _AUTH_HEAD_FROM_THIN = wire_schema.compile_decoder(_AUTH_HEAD, _THIN)
+_AUTH_HEAD_THIN = wire_schema.compile_encoder(_AUTH_HEAD, _THIN)
 _AUTH_HEAD_FROM_OCI = wire_schema.compile_decoder(_AUTH_HEAD, _OCI)
 _AUTH_PAIR_OCI = wire_schema.compile_encoder(_AUTH_PAIR, _OCI)
 _AUTH_FROM_OCI = wire_schema.compile_decoder(
@@ -7398,7 +7399,6 @@ def encode_dictionary_auth(Dictionary: dict) -> tuple[bytes, bytes]:
     Role = Dictionary['env'].get('role', 0)
     Prelim = Dictionary['env'].get('prelim', 0)
 
-    LogonMode = encode_sb4((Role * 32) | (Prelim * 128) | 1 | 256)
     (AuthPass, AuthSess, SpeedyKey, SpeedyKeyInd, ConnKey) = o5logon(
         Sess, Salt, DerivedSalt, User, Pass, VgenCount, SderCount, VerifierType
     )
@@ -7461,26 +7461,25 @@ def encode_dictionary_auth(Dictionary: dict) -> tuple[bytes, bytes]:
     # as ORA-03120 (two-task conversion: integer overflow). RE'd from an
     # oracledb-thin fv24 capture (docs/PROTOCOL.md §20).
     if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
-        # Header replicates python-oracledb's fv24 phase two byte-for-byte: the
-        # has-user pointer byte is 0 followed by an extra 0x01, the logon mode
-        # gains 0x20000, and the username is still sent length-prefixed. RE'd from
-        # an oracledb-thin fv24 capture (docs/PROTOCOL.md §20).
-        Header = bytes([TTI_FUN, TTI_AUTH, Tseq, 0, 1])
-        Mode = encode_sb4((Role * 32) | (Prelim * 128) | 1 | 256 | 0x20000)
-        UserField = bytes([len(User)]) + User
+        # Phase two replicates python-oracledb's fv24 byte-for-byte: the has-user
+        # field is present and 0 (`_AUTH_HEAD` has_user_ptr) followed by the usual
+        # pointer, the logon mode gains 0x20000, the username is length-prefixed,
+        # and the OAUTH carries the session-context pairs. RE'd from an
+        # oracledb-thin fv24 capture (docs/PROTOCOL.md §20).
+        HasUserPtr = True
+        ModeInt = (Role * 32) | (Prelim * 128) | 1 | 256 | 0x20000
+        UserPrefixed = True
         SessionKvs = _auth_session_kvs(Dictionary)
         NumPairs = (
             2 + SpeedyKeyInd + _auth_session_kv_count(Dictionary) + ProxyInd + DrcpInd
         )
     else:
         # 12c+ length-prefixes the username (write_bytes_with_length); 11g sends
-        # it raw (read via the UserLen field). Sending the raw form to 21c makes
-        # it read the first username byte as a length and desync (ORA-03120).
-        Header = bytes([TTI_FUN, TTI_AUTH, Tseq, 1])
-        Mode = LogonMode
-        UserField = (
-            bytes([len(User)]) + User if FieldVersion >= FIELD_VERSION_12_1 else User
-        )
+        # it raw (read via the user-length field). Sending the raw form to 21c
+        # makes it read the first username byte as a length and desync (ORA-03120).
+        HasUserPtr = False
+        ModeInt = (Role * 32) | (Prelim * 128) | 1 | 256
+        UserPrefixed = FieldVersion >= FIELD_VERSION_12_1
         # Sync the session time zone to the client's UTC offset, the way oracledb
         # / OCI / sqlplus do (AUTH_ALTER_SESSION). Without it the session runs at
         # the server default, so CURRENT_TIMESTAMP / LOCALTIMESTAMP /
@@ -7499,21 +7498,29 @@ def encode_dictionary_auth(Dictionary: dict) -> tuple[bytes, bytes]:
             SessionKvs = b''
             NumPairs = 2 + SpeedyKeyInd + ProxyInd + DrcpInd
 
-    Data = (
-        Header
-        + encode_sb4(len(User))
-        + Mode
-        + bytes([1])
-        + encode_sb4(NumPairs)
-        + bytes([1, 1])
-        + UserField
-        + AuthPass
-        + PBKDF2
-        + AuthSess
-        + SessionKvs
-        + ProxyKv
-        + DrcpKv
+    # The AUTH head (_AUTH_HEAD): the subtype and sequence, the has-user field
+    # (fast-auth only) and four pointers, the user length and logon mode, the
+    # pair count, and the username (length-prefixed from 12c, raw on 11g). The
+    # already-serialised key/value pairs follow it.
+    Head = _AUTH_HEAD_THIN(
+        {
+            'subtype': TTI_AUTH,
+            'seq': Tseq,
+            'has_user_ptr': HasUserPtr,
+            'has_user': 0,
+            'pointer_1': True,
+            'user_length': len(User),
+            'mode': ModeInt,
+            'pointer_2': True,
+            'pair_count': NumPairs,
+            'pointer_3': True,
+            'pointer_4': True,
+            'user_prefixed': UserPrefixed,
+            'user_raw': not UserPrefixed,
+            'user': User,
+        }
     )
+    Data = Head + AuthPass + PBKDF2 + AuthSess + SessionKvs + ProxyKv + DrcpKv
 
     return (Data, ConnKey)
 
