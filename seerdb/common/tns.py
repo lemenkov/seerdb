@@ -2266,6 +2266,7 @@ def decode_auth_oci(payload: bytes) -> dict[str, Any]:
 
 
 _LOBOPS_HEAD_FROM_THIN = wire_schema.compile_decoder(_LOBOPS_HEAD, _THIN)
+_LOBOPS_HEAD_THIN = wire_schema.compile_encoder(_LOBOPS_HEAD, _THIN)
 _LOBOPS_READ_FROM_OCI = wire_schema.compile_decoder(_LOBOPS_READ, _OCI)
 _LOBOPS_READ_FROM_OCI_WIDE = wire_schema.compile_decoder(_LOBOPS_READ, _OCI_WIDE)
 _LOB_READ_REPLY_THIN = wire_schema.compile_encoder(_LOB_READ_REPLY, _THIN)
@@ -14620,12 +14621,38 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
     # same shape by varying `operation` and the pointer flags.
     Tseq = Dictionary['seq']
     FieldVersion = Dictionary.get('field_version', FIELD_VERSION_11_2)
-    LobHead = _fun_header(TTI_LOBOPS, Tseq, FieldVersion)
+    _ENCODE_FIELD_VERSION.set(FieldVersion)
+    # LOB ops carry no request-pipelining token today, as the hand-built header
+    # did (its token was always 0); the 23ai `token` field stays the zero byte.
+    TokenNum = 0
+
+    def _head(source_length: int, operation: int, *, null_lob: bool = False) -> bytes:
+        # The request head every operation shares (_LOBOPS_HEAD): the source
+        # locator (its length here, the bytes in the tail), no destination, no
+        # charset and no short amount, then the operation. FILE_EXISTS alone sets
+        # the null-lob pointer -- the field the server answers "is it null" into.
+        return _LOBOPS_HEAD_THIN(
+            {
+                'seq': Tseq,
+                'token_number': TokenNum,
+                'source_present': True,
+                'source_length': source_length,
+                'dest_present': False,
+                'dest_length': 0,
+                'short_source_offset': 0,
+                'short_dest_offset': 0,
+                'charset_present': False,
+                'short_amount_present': False,
+                'null_lob_present': null_lob,
+                'operation': operation,
+            }
+        )
+
     if Dictionary.get('create_temp'):
         # CREATE_TEMP (op 0x0110, #91): allocate a session-duration temporary
         # LOB; the server returns the new locator in the response RPA. 12c+ only;
-        # 11g rejects CREATE_TEMP. See _create_temp_body for the field layout.
-        return LobHead + _create_temp_body(
+        # 11g rejects CREATE_TEMP. Its body is its own shape, not the shared head.
+        return _fun_header(TTI_LOBOPS, Tseq, FieldVersion) + _create_temp_body(
             bool(Dictionary.get('is_blob')), Dictionary.get('csfrm', _CSFRM_DB)
         )
     if Dictionary.get('operation') == TNS_LOB_OP_WRITE:
@@ -14649,17 +14676,7 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
         # exactly the split READ already makes. Sending a column locator in the
         # temp form is answered ORA-22275 "invalid LOB locator specified" (#964).
         Prefixed = Dictionary.get('locator_prefixed', True)
-        Out = LobHead
-        Out += bytes([1])  # source pointer present
-        Out += encode_sb4(len(Locator) + 2 if Prefixed else len(Locator))
-        Out += bytes([0])  # dest pointer absent
-        Out += encode_sb4(0)  # dest_length
-        Out += encode_sb4(0)  # short source offset
-        Out += encode_sb4(0)  # short dest offset
-        Out += bytes([0])  # charset pointer absent
-        Out += bytes([0])  # short amount absent
-        Out += bytes([0])  # null lob pointer absent
-        Out += encode_sb4(TNS_LOB_OP_WRITE)  # operation code
+        Out = _head(len(Locator) + 2 if Prefixed else len(Locator), TNS_LOB_OP_WRITE)
         Out += bytes([0])  # scn array pointer absent
         Out += bytes([0])  # scn array length
         Out += encode_sb4(SourceOffset)  # source offset (ub8)
@@ -14709,17 +14726,7 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
         # from having to know (#1109).
         if len(Locator) >= 2 and ((Locator[0] << 8) | Locator[1]) == len(Locator) - 2:
             Locator = Locator[2:]
-        Out = LobHead
-        Out += bytes([1])  # source pointer present
-        Out += encode_sb4(len(Locator) + 2)  # source locator length (+ub2)
-        Out += bytes([0])  # dest pointer absent
-        Out += encode_sb4(0)  # dest_length
-        Out += encode_sb4(0)  # short source offset
-        Out += encode_sb4(0)  # short dest offset
-        Out += bytes([0])  # charset pointer absent
-        Out += bytes([0])  # short amount absent
-        Out += bytes([1 if Exists else 0])  # null lob pointer
-        Out += encode_sb4(Operation)  # operation code
+        Out = _head(len(Locator) + 2, Operation, null_lob=Exists)
         Out += bytes([0])  # scn array pointer absent
         Out += bytes([0])  # scn array length
         Out += encode_sb4(0)  # source offset (ub8)
@@ -14743,9 +14750,6 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
     Operation = Dictionary.get('operation', TNS_LOB_OP_READ)
     SourceOffset = Dictionary.get('source_offset', 1)  # 1-based: start
     LocatorLen = len(Locator)
-
-    Out = LobHead
-    Out += bytes([1])  # source pointer present
     # Persistent-LOB locators read back correctly with the bare length + raw
     # locator. Temporary LOBs (#91) instead need the locator sent as a
     # ub2-length-prefixed field with the declared length counting that prefix
@@ -14753,15 +14757,7 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
     # read returns empty content. Switching persistent reads to the prefixed
     # form regresses them on 11g + 21c, so the prefix is opt-in per call.
     Prefixed = Dictionary.get('locator_prefixed', False)
-    Out += encode_sb4(LocatorLen + 2 if Prefixed else LocatorLen)  # src loc len
-    Out += bytes([0])  # dest pointer absent
-    Out += encode_sb4(0)  # dest_length
-    Out += encode_sb4(0)  # short source offset
-    Out += encode_sb4(0)  # short dest offset
-    Out += bytes([0])  # charset pointer absent
-    Out += bytes([0])  # short amount absent
-    Out += bytes([0])  # null lob pointer absent
-    Out += encode_sb4(Operation)  # operation code
+    Out = _head(LocatorLen + 2 if Prefixed else LocatorLen, Operation)
     Out += bytes([0])  # scn array pointer absent
     Out += bytes([0])  # scn array length
     Out += encode_sb4(SourceOffset)  # source offset (ub8; small fits sb4)
