@@ -13446,6 +13446,18 @@ class CallprocIntegration(_IntegrationBase):
         self.cur.execute("BEGIN :v := HEXTORAW('0A0B'); END;", [raw])
         self.assertEqual(raw.getvalue(), b'\n\x0b')
 
+    def test_a_bare_pad_call_out_bind(self):
+        # `:v := RPAD(s, n, p)` as the whole right-hand side (#2337): a bare
+        # function-call assignment, which the Mirror over PostgreSQL routed to a
+        # direct SELECT that dropped the literal arguments, building a wrong-arity
+        # call PostgreSQL refused and the error mapped to PLS-00306. Oracle runs
+        # it from 8i up; RPAD / LPAD here are PL/SQL's.
+        v = self.cur.var(str, 4000)
+        self.cur.execute("BEGIN :v := RPAD('o', 4000, 'p'); END;", [v])
+        self.assertEqual(v.getvalue(), 'o' + 'p' * 3999)
+        self.cur.execute("BEGIN :v := LPAD('o', 5, '.'); END;", [v])
+        self.assertEqual(v.getvalue(), '....o')
+
     def test_callproc_body_with_a_parenthesised_alias(self):
         # A body selecting `count(*) AS cnt`: the Mirror over PostgreSQL took that
         # `) AS` for the end of the parameter list and split the routine (#1467).
