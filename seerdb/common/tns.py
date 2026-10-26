@@ -2140,6 +2140,36 @@ _O7_OAC_THIN = wire_schema.compile_encoder(_O7_OAC, _THIN)
 _O7_DESCRIBE_FROM_THIN = wire_schema.compile_decoder(_O7_DESCRIBE, _THIN)
 _O7_STATUS_HEAD_FROM_THIN = wire_schema.compile_decoder(_O7_STATUS_HEAD, _THIN)
 _O7_STATUS_TAIL_FROM_THIN = wire_schema.compile_decoder(_O7_STATUS_TAIL, _THIN)
+# The 10g+ OER (TTI_OER return-status token, decode_token_oer): 9i's short
+# status (`_O7_STATUS_HEAD`, `_O7_STATUS_TAIL`) with its two missing leading
+# fields -- the call status and the end-to-end sequence number -- and the
+# version conditionals 9i never meets. `flags` is a ub2 at 10g and 11g (#1995)
+# and one byte from 12.1; the tail gains the extended ub4 error number and ub8
+# rowcount 12c+ adds, and the ub4 sql type + ub4 server checksum 20.1+ adds,
+# both read by the SERVER's release, not the negotiated one (#1145). The caller
+# passes `flags_ub2` / `flags_u8` and `ext_12c` / `ext_20_1` in `given`. The
+# message DALC stays out of the schema: it is read best-effort (an imprecise
+# walk of a terminator's padding may leave it short, #849), so the schema reads
+# only the frame and decode_token_oer reads the message from what is left.
+_OER_HEAD: wire_schema.Schema = (
+    _O7_STATUS_HEAD[0],
+    ('n4', 'call_status'),
+    ('n4', 'sequence'),
+    *_O7_STATUS_HEAD[1:9],
+    # `flags`, consumed but unread: a ub2 at 10g and 11g (`01 20` for a warning,
+    # two bytes), one byte from 12.1 -- distinct names so each width round-trips
+    # on its own (the warning bit is read later, as `warnings`).
+    ('when', 'flags_ub2', (('n2', 'flags_wide'),)),
+    ('when', 'flags_u8', (('u8', 'flags_narrow'),)),
+    *_O7_STATUS_HEAD[10:],
+)
+_OER_TAIL: wire_schema.Schema = (
+    *_O7_STATUS_TAIL[:-1],
+    ('when', 'ext_12c', (('n4', 'ext_error_code'), ('n8', 'ext_rowcount'))),
+    ('when', 'ext_20_1', (('n4', 'ext_sql_type'), ('n4', 'ext_checksum'))),
+)
+_OER_HEAD_FROM_THIN = wire_schema.compile_decoder(_OER_HEAD, _THIN)
+_OER_TAIL_FROM_THIN = wire_schema.compile_decoder(_OER_TAIL, _THIN)
 _O7_RXH_FROM_THIN = wire_schema.compile_decoder(_O7_RXH, _THIN)
 _O7_VECTORS_FROM_THIN = wire_schema.compile_decoder(_O7_VECTORS, _THIN)
 _O7_CELL_FROM_THIN = wire_schema.compile_decoder(_O7_CELL, _THIN)
@@ -6206,27 +6236,36 @@ def decode_token_net(Data: bytes, Acc: tuple) -> None:
     pass
 
 
-def _read_batch_errors(Rest: bytes) -> tuple[list[dict], bytes]:
-    """An OER's batch error code / offset / message arrays (array-DML
-    `batcherrors` mode, #18), and the bytes after them. For plain statements
-    all three counts are zero. Layout (reverse-engineered against a 21c
-    capture, and the same in 9.2's short status, #2247): each of the code and
-    offset arrays is `ub4 count | DALC blob`, where the blob packs the count
-    ub4 values (the DALC is the 0xFE chunked form once it grows). The message
-    array is `ub4 count | ub1 indicator | count × (ub4-prefixed string + 2-byte
-    trailer)`. Error i hit row offsets[i] with ORA-codes[i] and text
-    messages[i]."""
-    (Codes, Rest) = _read_batch_ub4_array(Rest)
-    (Offsets, Rest) = _read_batch_ub4_array(Rest)
-    Messages: list = []
-    (NumMessages, Rest) = decode_ub4(Rest)
-    if NumMessages > 0:
-        Rest = Rest[1:]  # indicator byte
-        for _ in range(NumMessages):
-            (MsgBytes, Rest) = _read_str_with_length(Rest)
-            Rest = Rest[2:]  # 2-byte trailer
-            Messages.append(bytes(MsgBytes).decode('utf-8', errors='replace').rstrip())
-    Errors = [
+def _unpack_oer_ub4s(Blob: bytes, Count: int) -> list[int]:
+    # The `Count` ub4 values a batch-error code or offset array packs
+    # back-to-back in its DALC blob (the `_OER_TAIL` schema reads the blob whole
+    # as a value; this reads the integers out of it).
+    Buf = bytes(Blob)
+    Values = []
+    for _ in range(Count):
+        (Value, Buf) = decode_ub4(Buf)
+        Values.append(Value)
+    return Values
+
+
+def _oer_batch_errors(Tail: dict) -> list[dict]:
+    # The {offset, code, message} list of an OER's batch-error arrays (array-DML
+    # `batcherrors`, #18), from the `_OER_TAIL` schema's fields: error i hit row
+    # offsets[i] with ORA-code codes[i] and text messages[i]. For a plain
+    # statement all three counts are zero and the list is empty.
+    Codes = _unpack_oer_ub4s(
+        Tail.get('batch_codes', b''), Tail.get('batch_code_count', 0)
+    )
+    Offsets = _unpack_oer_ub4s(
+        Tail.get('batch_offsets', b''), Tail.get('batch_offset_count', 0)
+    )
+    Messages = [
+        bytes(M['text']).decode('utf-8', errors='replace').rstrip()
+        if 'text' in M
+        else ''
+        for M in Tail.get('batch_messages', [])
+    ]
+    return [
         {
             'offset': Offsets[I] if I < len(Offsets) else None,
             'code': Codes[I] if I < len(Codes) else None,
@@ -6234,110 +6273,61 @@ def _read_batch_errors(Rest: bytes) -> tuple[list[dict], bytes]:
         }
         for I in range(max(len(Offsets), len(Codes), len(Messages)))
     ]
-    return (Errors, Rest)
-
-
-def _read_batch_ub4_array(Rest: bytes) -> tuple[list, bytes]:
-    # An array-DML batch field (#18): a ub4 count, then a DALC blob packing
-    # that many ub4 values back-to-back. Returns the values and the remaining
-    # bytes. Used for the batch-error code and row-offset arrays.
-    (Count, Rest) = decode_ub4(Rest)
-    if Count <= 0:
-        return ([], Rest)
-    (Blob, Rest) = decode_dalc(Rest)
-    Buf = bytes(Blob) if not isinstance(Blob, list) else b''
-    Values = []
-    for _ in range(Count):
-        (Value, Buf) = decode_ub4(Buf)
-        Values.append(Value)
-    return (Values, Rest)
 
 
 def decode_token_oer(Data: bytes, Acc: tuple) -> tuple:
     # OER ("Oracle Error" return-status TTC token; emitted at the end of every
-    # server response — success or failure). Unified layout: every field is
-    # always present and we walk through them sequentially rather than
-    # branching on success-vs-error. The trailing length-prefixed bytes are
-    # the human-readable message ("ORA-NNNNN: ...") which the server
-    # populates when the error number is non-zero.
-    #
-    # Field order cross-referenced with python-oracledb's _process_error_info,
-    # adjusted for Oracle 11g: the extended ub4 error number + ub8 rowcount
-    # that 12c+ adds are not present, so the message DALC comes directly
-    # after the batch-error-messages count.
+    # server response — success or failure). It is 9i's short status
+    # (`_O7_STATUS_HEAD`, `_O7_STATUS_TAIL`) with the call status and sequence
+    # number it leads with and the version conditionals it meets, read as the
+    # `_OER_HEAD` and `_OER_TAIL` schemas; the trailing length-prefixed message
+    # ("ORA-NNNNN: ...") the server sets when the error number is non-zero is
+    # read best-effort below, from what the frame leaves. Field order
+    # cross-referenced with python-oracledb's _process_error_info.
     (Cursor, RowFormat, Rows) = Acc[:3]
     # Array-DML row counts threaded in by decode_token_rpa_piggyback (the RPA
     # carrying them precedes this OER); None for a normal execute (#18).
     RowCounts = Acc[4] if len(Acc) > 4 else None
-    Rest = Data[1:]  # consume the OER token
-    (CallStatus, Rest) = decode_ub4(Rest)
-    (_, Rest) = decode_ub4(Rest)  # end-to-end seq#
-    # In 11g the "current row number" field doubles as the DML affected-row
-    # count: UPDATE/DELETE/INSERT set it to the number of rows touched by
-    # the call. 12c+ moved the rowcount to a separate ub8 at the end of the
-    # OER, but we don't have that here.
-    (RowCount, Rest) = decode_ub4(Rest)
-    (ErrCode, Rest) = decode_ub4(Rest)  # ORA-NNNN error number
-    (_, Rest) = decode_ub4(Rest)  # array elem error #1
-    (_, Rest) = decode_ub4(Rest)  # array elem error #2
-    (CursorId, Rest) = decode_ub4(Rest)  # current cursor id
-    (ErrorPos, Rest) = decode_ub4(Rest)  # error position (parse offset into the SQL)
-    # Six fields: sql_type, fatal, flags, user_cursor_opts, upi_param,
-    # warn_flags, each a single byte -- except that below 12.1 `flags` is a
-    # variable-length ub2: `00` when zero, `01 20` when a warning sets it, as
-    # an aggregate that skipped NULLs does. Read as one byte, 10g's and 11g's
-    # reply ended one byte early and everything after it was misread (#1995).
-    # The LAST field is read: bit 0x20 says the statement created a PL/SQL
-    # object that compiled with errors -- the object exists, the call
-    # succeeded, and only this bit says anything is wrong (#993). Measured by
-    # diffing a live 23ai's reply to the same CREATE compiled clean and broken:
-    # the two are identical but for the sequence fields and this byte, 0x21
-    # against 0x00.
-    Rest = Rest[2:]  # sql_type, fatal
-    if _DECODE_FIELD_VERSION.get() < FIELD_VERSION_12_1:
-        (_, Rest) = decode_ub4(Rest)  # flags, a ub2 before 12.1
-    else:
-        Rest = Rest[1:]  # flags
-    WarnFlags = Rest[2] if len(Rest) > 2 else 0
-    Rest = Rest[3:]  # user_cursor_opts, upi_param, warn_flags
-    # rowid of the (last) row the statement touched — same physical-rowid
-    # layout as a ROWID column (see _read_rowid_column): data object number,
-    # relative file number, an unused byte, block number, slot number.
-    (RowidObj, Rest) = decode_ub4(Rest)  # data object number
-    (RowidFile, Rest) = decode_ub4(Rest)  # relative file number
-    Rest = Rest[1:]  # rowid reserved byte
-    (RowidBlock, Rest) = decode_ub4(Rest)  # block number
-    (RowidSlot, Rest) = decode_ub4(Rest)  # slot number
-    (_, Rest) = decode_ub4(Rest)  # os error
-    Rest = Rest[2:]  # statement #, call #
-    (_, Rest) = decode_ub4(Rest)  # padding (ub2)
-    (_, Rest) = decode_ub4(Rest)  # successful iterations
-    #   (always 1 for a
-    #   single non-array
-    #   execute on 11g — the
-    #   real DML rowcount is
-    #   the "current row
-    #   number" field above)
-    Rest = _skip_bytes_with_length(Rest)  # oerrdd (logical rowid)
-    (BatchErrors, Rest) = _read_batch_errors(Rest)
-    # On 11g the trailing message DALC comes right here. 12c+ inserts the
-    # extended-precision error number (ub4) and rowcount (ub8) ahead of it, and
-    # 20.1+ adds a ub4 sql type + ub4 server checksum (oracledb
-    # _process_error_info). Skip them so the message DALC stays aligned. The
-    # last two follow the SERVER's release, not the negotiated version: 21c
-    # and 23ai send them to a session that negotiated 12.1 as well, and reading
-    # past them by the negotiated version lost every error message (#1145).
     FieldVersion = _DECODE_FIELD_VERSION.get()
     # A server never advertises less than the session negotiated, so the higher
     # of the two is its release; that also keeps a value left over from an
-    # earlier session in this context from lowering it.
+    # earlier session in this context from lowering it. The one-byte (not ub2)
+    # `flags` and the extended trailing fields both follow the server's release:
+    # `flags` was a ub2 at 10g and 11g (`00` when zero, `01 20` when a warning
+    # set it), one byte from 12.1, and reading it as one byte left 10g and 11g a
+    # byte short (#1995); 12c+ adds the extended ub4 error number and ub8
+    # rowcount, 20.1+ the ub4 sql type + ub4 server checksum, which a 21c/23ai
+    # server sends a 12.1 session too, so reading past them by the negotiated
+    # version lost every error message (#1145).
     ServerFieldVersion = max(_DECODE_SERVER_FIELD_VERSION.get() or 0, FieldVersion)
-    if FieldVersion >= FIELD_VERSION_12_1:
-        (_, Rest) = decode_ub4(Rest)  # extended error number
-        (_, Rest) = decode_ub4(Rest)  # extended rowcount (ub8)
-        if ServerFieldVersion >= FIELD_VERSION_20_1:
-            (_, Rest) = decode_ub4(Rest)  # sql type
-            (_, Rest) = decode_ub4(Rest)  # server checksum
+    Wide = FieldVersion >= FIELD_VERSION_12_1
+    Given = {
+        'flags_ub2': not Wide,
+        'flags_u8': Wide,
+        'ext_12c': Wide,
+        'ext_20_1': Wide and ServerFieldVersion >= FIELD_VERSION_20_1,
+    }
+    (Head, Rest) = _OER_HEAD_FROM_THIN(Data, Given)
+    (Tail, Rest) = _OER_TAIL_FROM_THIN(Rest, {**Given, **Head})
+    # The "current row number" (`rows`) doubles as a DML's affected-row count on
+    # 11g; 12c+ repeats it in the extended ub8 the tail skips. `position` is the
+    # error's parse offset into the SQL, and `warnings` bit 0x20 marks a PL/SQL
+    # object that compiled with errors -- the object exists and the call
+    # succeeded, only this bit says anything is wrong (#993, #2262). The rowid is
+    # the row a DML touched, in the physical-rowid layout a ROWID column uses.
+    CallStatus = Head['call_status']
+    RowCount = Head['rows']
+    ErrCode = Head['code']
+    CursorId = Head['cursor']
+    ErrorPos = Head['position']
+    WarnFlags = Head['warnings']
+    (RowidObj, RowidFile, RowidBlock, RowidSlot) = (
+        Head['rowid_object'],
+        Head['rowid_file'],
+        Head['rowid_block'],
+        Head['rowid_slot'],
+    )
+    BatchErrors = _oer_batch_errors(Tail)
     Message = None
     if ErrCode != 0 and Rest:
         try:
