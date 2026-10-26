@@ -2302,6 +2302,7 @@ def _describe_trailer(*, oci: bool, mdbz: int = 0) -> bytes:
     )
 
 
+_ALL8_HEAD_THIN = wire_schema.compile_encoder(_ALL8_HEAD, _THIN)
 _ALL8_HEAD_FROM_THIN = wire_schema.compile_decoder(_ALL8_HEAD, _THIN)
 _ALL8_HEAD_FROM_OCI = wire_schema.compile_decoder(_ALL8_HEAD, _OCI)
 _ALL8_HEAD_FROM_OCI_WIDE = wire_schema.compile_decoder(_ALL8_HEAD, _OCI_WIDE)
@@ -12858,23 +12859,36 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
     else:
         raise Exception('Unhandled tokens combination', Bind, Batch, Def, Query)
 
-    Head = (
-        _fun_header(TTI_ALL8, Tseq, FieldVersion, TokenNum)
-        + encode_sb4(Opt)
-        + encode_sb4(Cursor)
-        + bytes([QueryFlag])
-        + encode_sb4(QueryLen)
-        + bytes([All8Flag])
-        + encode_sb4(All8Len)
-        + bytes([0, 0])
-        + encode_sb4(LMax)
-        + encode_sb4(Fetch)
-        + encode_sb4(Max)
-        + bytes([BindFlag])
-        + encode_sb4(BindLen)
-        + bytes([0, 0, 0, 0, 0])
-        + bytes([DefFlag])
-        + encode_sb4(DefLen)
+    # The OALL8 head from the _ALL8_HEAD schema (#2293). The al8o4 / al8app /
+    # al8txn / al8txl / al8kv / al8kvl pointers are null, and al8o4l too; the
+    # five flag fields are the 0/1 the ptr primitive writes as 00/01. Every
+    # value is computed above exactly as before; only the layout moves to the
+    # schema the Mirror already decodes this message with.
+    Head = _ALL8_HEAD_THIN(
+        {
+            'seq': Tseq,
+            'token_number': TokenNum,
+            'options': Opt,
+            'cursor': Cursor,
+            'sql_present': QueryFlag,
+            'sql_length': QueryLen,
+            'al8i4_present': All8Flag,
+            'al8i4_length': All8Len,
+            'al8o4': False,
+            'al8o4l': False,
+            'prefetch_size': LMax,
+            'prefetch_rows': Fetch,
+            'max_long': Max,
+            'binds_present': BindFlag,
+            'bind_count': BindLen,
+            'al8app': False,
+            'al8txn': False,
+            'al8txl': False,
+            'al8kv': False,
+            'al8kvl': False,
+            'defines_present': DefFlag,
+            'define_count': DefLen,
+        }
     )
 
     if FieldVersion >= FIELD_VERSION_12_1:
