@@ -2281,12 +2281,14 @@ _LOB_CELL_THIN = wire_schema.compile_encoder(_LOB_CELL, _THIN)
 _LOB_CELL_OCI = wire_schema.compile_encoder(_LOB_CELL, _OCI)
 _ROWID_CELL_THIN = wire_schema.compile_encoder(_ROWID_CELL, _THIN)
 _ROWID_CELL_OCI = wire_schema.compile_encoder(_ROWID_CELL, _OCI)
+_ROWID_CELL_FROM_THIN = wire_schema.compile_decoder(_ROWID_CELL, _THIN)
 _DCB_COLUMN_THIN = wire_schema.compile_encoder(_DCB_COLUMN, _THIN)
 _DCB_COLUMN_OCI = wire_schema.compile_encoder(_DCB_COLUMN, _OCI)
 _DCB_COLUMN_FROM_OCI = wire_schema.compile_decoder(_DCB_COLUMN, _OCI)
 _DCB_COLUMN_FROM_THIN = wire_schema.compile_decoder(_DCB_COLUMN, _THIN)
 _LONG_CELL_THIN = wire_schema.compile_encoder(_LONG_CELL, _THIN)
 _LONG_CELL_OCI = wire_schema.compile_encoder(_LONG_CELL, _OCI)
+_LONG_CELL_FROM_THIN = wire_schema.compile_decoder(_LONG_CELL, _THIN)
 
 
 def _long_content(value: object) -> bytes | None:
@@ -7087,16 +7089,14 @@ def _read_rowid_column(Rest: bytes) -> tuple[str | None, bytes]:
 
     if not Rest:
         return (None, Rest)
-    Indicator = Rest[0]
-    Rest = Rest[1:]
-    if Indicator in (0, 0xFF):
-        return (None, Rest)
-    (Obj, Rest) = decode_ub4(Rest)
-    (File, Rest) = decode_ub4(Rest)
-    (_, Rest) = decode_ub4(Rest)  # unused ub1
-    (Block, Rest) = decode_ub4(Rest)
-    (Slot, Rest) = decode_ub4(Rest)
-    return (rowid_to_string(Obj, File, Block, Slot), Rest)
+    if Rest[0] in (0, 0xFF):
+        # NULL: the one present/reserved-size byte, no body behind it.
+        return (None, Rest[1:])
+    (Cell, Rest) = _ROWID_CELL_FROM_THIN(Rest)  # lead + object/file/unused/block/row
+    return (
+        rowid_to_string(Cell['object'], Cell['file'], Cell['block'], Cell['row']),
+        Rest,
+    )
 
 
 def _read_urowid_column(Rest: bytes) -> tuple[str | None, bytes]:
@@ -7142,48 +7142,17 @@ def _read_urowid_column(Rest: bytes) -> tuple[str | None, bytes]:
 
 
 def _read_long_column(Rest: bytes) -> tuple[bytes | None, bytes]:
-    # LONG / LONG RAW in RXD: a value followed by two trailing ub4 indicators
-    # (the actual/return lengths; 0 / 0 for an ordinary value). The value is
-    #   0x00            -> NULL, no body
-    #   0xfe            -> chunked: repeated [ub1 len][bytes] until a 0 length
-    #   else            -> ub1 length + that many bytes
-    # The two ub4 reads after the value keep the stream aligned regardless of
-    # NULL. Structure cross-referenced with python-oracledb's column read;
-    # verified against live XE captures (NULL, single-chunk, 700-byte multi-
-    # chunk, and LONG-not-last rows).
+    # LONG / LONG RAW in RXD (_LONG_CELL): the value -- NULL (a bare 0x00), a
+    # short 1-byte-length body, or the 0xFE chunked form (a ub1 length per chunk
+    # on 11g, a ub4 from 12.1, both ending on a zero length) -- then two trailing
+    # ub4 indicators (the actual/return lengths; 0/0 for an ordinary value), read
+    # whatever the value so the stream stays aligned. The `long` codec reads the
+    # value; verified against live XE captures (NULL, single-chunk, 700-byte
+    # multi-chunk, and LONG-not-last rows).
     if not Rest:
         return (None, Rest)
-    Marker = Rest[0]
-    if Marker == 0x00:
-        Val = None
-        Rest = Rest[1:]
-    elif Marker == TNS_LONG_LENGTH_INDICATOR:
-        Rest = Rest[1:]
-        Chunks = b''
-        if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
-            # 12c+ prefixes each chunk with a ub4 length (zero-length terminator)
-            # rather than 11g's single length byte.
-            while Rest:
-                (ChunkLen, Rest) = decode_ub4(Rest)
-                if ChunkLen == 0:
-                    break
-                Chunks += bytes(Rest[:ChunkLen])
-                Rest = Rest[ChunkLen:]
-        else:
-            while Rest:
-                ChunkLen = Rest[0]
-                Rest = Rest[1:]
-                if ChunkLen == 0:
-                    break
-                Chunks += bytes(Rest[:ChunkLen])
-                Rest = Rest[ChunkLen:]
-        Val = Chunks
-    else:
-        Val = bytes(Rest[1 : 1 + Marker])
-        Rest = Rest[1 + Marker :]
-    (_, Rest) = decode_ub4(Rest)
-    (_, Rest) = decode_ub4(Rest)
-    return (Val, Rest)
+    (Cell, Rest) = _LONG_CELL_FROM_THIN(Rest)
+    return (Cell['content'], Rest)
 
 
 def _read_object_column(Rest: bytes, Col: dict) -> tuple[object, bytes]:

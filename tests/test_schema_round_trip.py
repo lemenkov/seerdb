@@ -319,6 +319,10 @@ _RECHUNKED_TEXT = {
     ('_O8I_STATUS', '_O8I'): ('when', 'code'),
     ('_O8I_LONG_CELL', '_O8I'): ('long', 'value'),
     ('_O8I_OUT_CELL', '_O8I'): ('chr', 'value'),
+    # A server sends a multi-chunk LONG column in its own chunk sizes; the thin
+    # codec rewrites the value in 252-byte chunks, so the bytes differ while the
+    # value is the same (#2293).
+    ('_LONG_CELL', '_THIN'): ('long', 'content'),
 }
 
 
