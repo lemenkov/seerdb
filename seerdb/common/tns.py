@@ -2284,6 +2284,7 @@ _ROWID_CELL_OCI = wire_schema.compile_encoder(_ROWID_CELL, _OCI)
 _DCB_COLUMN_THIN = wire_schema.compile_encoder(_DCB_COLUMN, _THIN)
 _DCB_COLUMN_OCI = wire_schema.compile_encoder(_DCB_COLUMN, _OCI)
 _DCB_COLUMN_FROM_OCI = wire_schema.compile_decoder(_DCB_COLUMN, _OCI)
+_DCB_COLUMN_FROM_THIN = wire_schema.compile_decoder(_DCB_COLUMN, _THIN)
 _LONG_CELL_THIN = wire_schema.compile_encoder(_LONG_CELL, _THIN)
 _LONG_CELL_OCI = wire_schema.compile_encoder(_LONG_CELL, _OCI)
 
@@ -2459,67 +2460,44 @@ def _decode_describe_body(Rest: bytes) -> tuple[list, bytes]:
 
 
 def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
-    # Per-column metadata. 12c+ (field version >= 12.2) differs from 11g in two
-    # ways (oracledb base.pyx _process_metadata): scale is a raw signed byte
-    # (sb1), and an extra ub4 `oaccolid` follows max_size. 11g keeps an
-    # sb4-style variable scale (so NUMBER's -127 default arrives as 0x81 0x7f)
-    # and has no oaccolid. precision is sb1 in both.
-    Is12c = _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
-    HasOacColId = _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_2
-    DataType = Rest[0]
-    Precision = Rest[2]  # sb1
-    Rest = Rest[3:]
-    if Is12c:
-        DataScale = Rest[0] - 256 if Rest[0] > 127 else Rest[0]  # sb1
-        Rest = Rest[1:]
-    else:
-        (DataScale, Rest) = decode_ub4(Rest)
-    (BufferSize, Rest) = decode_ub4(Rest)
-    (_, Rest) = decode_ub4(Rest)  # max_array_elems
-    (_, Rest) = decode_ub4(Rest)  # cont_flags (ub8 on 12c; small)
-    (OidLen, Rest) = decode_ub4(Rest)
-    TypeOid = b''
-    if OidLen > 0:
-        # For an object (ADT, type 109) / collection column this is the type's
-        # 16-byte OID; capturing it (rather than skipping) lets the row decoder
-        # tie the value back to its type for the attribute-layout lookup (#115).
-        (TypeOid, Rest) = _read_chunked_bytes(Rest)
-    (_, Rest) = decode_ub4(Rest)  # version
-    (Charset, Rest) = decode_ub4(Rest)  # charset id
-    Csfrm = Rest[0]  # charset form (1 DB / 2 national)
-    Rest = Rest[1:]
-    (MaxSize, Rest) = decode_ub4(Rest)
-    if HasOacColId:
-        (_, Rest) = decode_ub4(Rest)  # oaccolid (12.2+)
-    NullOk = Rest[0]
-    Rest = Rest[2:]  # skip nulls_allowed-byte AND v7 name length
-    (ColName, Rest) = _read_str_with_length(Rest)
-    (TypeSchema, Rest) = _read_str_with_length(Rest)  # owner of the type (ADT)
-    (TypeName, Rest) = _read_str_with_length(Rest)  # the type's name (ADT)
-    (_, Rest) = decode_ub4(Rest)  # column position
-    UdsFlags = 0
-    if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2:
-        # `uds flags` is an 11g addition; a 10g (field version 4) describe ends
-        # the per-column metadata at column position. Reading a phantom ub4 here
-        # eats the next column's first bytes (or the DCB trailer's date length),
-        # desyncing the whole row decode (#84). Verified against a live 10.2.0.5
-        # server across 1/2/6-column, mixed-type and 0-row describes. Its bits
-        # mark a JSON / OSON column, which the describe has to carry (#826).
-        (UdsFlags, Rest) = decode_ub4(Rest)  # uds flags
-    DomainSchema = DomainName = b''
-    if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_23_1:
-        # 23c (field version 17) appends the column's SQL-domain schema and
-        # name, each a ub4-counted DALC string (the same codec as the column
-        # name above) — empty (a single 0x00) for a column with no domain.
-        # Earlier code read them as plain ub4s, which only survives the empty
-        # case; a real domain (e.g. `01 03 03 'PYO' 01 07 07 'PYO_DOM'`) then
-        # desynced the row (#53). Reverse-engineered by diffing a domain column
-        # vs a plain one on 23ai, cross-checked against python-oracledb's
-        # domain_schema/domain_name. Column annotations are carried elsewhere in
-        # the describe (a plain column and an annotated one have identical
-        # trailing fields here), so they neither appear nor desync here.
-        (DomainSchema, Rest) = _read_str_with_length(Rest)
-        (DomainName, Rest) = _read_str_with_length(Rest)
+    # Per-column metadata (_DCB_COLUMN), read with the thin decoder up to the
+    # 23ai annotation map and vector descriptor, which stay here because the
+    # annotations are a count sent twice around pointers (not a schema shape) and
+    # the schema marks their slot with a raw field. The schema's version
+    # conditionals ride in `given`: `oaccolid` follows max_size from 12.2, the
+    # sb1 (not variable) scale and `oaccolid` are what 12c+ changed from 11g
+    # (oracledb base.pyx _process_metadata); `uds flags` is an 11g addition a 10g
+    # describe omits -- reading a phantom ub4 there desynced the row (#84, #826);
+    # the SQL-domain schema and name are a 23c addition, each a DALC string, `00`
+    # for no domain, not the plain ub4s that only survived the empty case (#53).
+    FieldVersion = _DECODE_FIELD_VERSION.get()
+    Given = {
+        'has_oaccolid': FieldVersion >= FIELD_VERSION_12_2,
+        'has_uds': FieldVersion >= FIELD_VERSION_11_2,
+        'has_domain': FieldVersion >= FIELD_VERSION_23_1,
+        # The annotation map and vector descriptor are read below, not by the
+        # schema (its `annotations` is a raw slot), so its vector branch is off.
+        'has_vector': False,
+    }
+    (Field, Rest) = _DCB_COLUMN_FROM_THIN(Rest, Given)
+    DataType = Field['data_type']
+    Precision = Field['precision']
+    DataScale = Field['scale']
+    BufferSize = Field['buffer_size']
+    # An object (ADT, type 109) / collection column's 16-byte type OID, kept (not
+    # skipped) so the row decoder can tie the value to its attribute layout (#115).
+    TypeOid = Field.get('toid', b'')
+    Charset = Field['charset']
+    Csfrm = Field['csfrm']
+    MaxSize = Field['max_size']
+    NullOk = Field['null_ok']
+    ColName = Field.get('name', b'')
+    TypeSchema = Field.get('type_schema', b'')  # owner of the type (ADT)
+    TypeName = Field.get('type_name', b'')  # the type's name (ADT)
+    # `uds flags` bits mark a JSON / OSON column (#826); absent before 11g.
+    UdsFlags = Field.get('uds_flags', 0)
+    DomainSchema = Field.get('domain_schema', b'')
+    DomainName = Field.get('domain_name', b'')
     Annotations = {}
     VecDims: int | None
     VecFormat: int | None
