@@ -1693,6 +1693,18 @@ _CLOSE_CURSORS: wire_schema.Schema = (
     ('n8', 'count'),
     ('each', 'cursors', 'count', (('n4', 'cursor'),)),
 )
+# The head every piggyback message shares: the piggyback marker, the function
+# code, the sequence, and -- from 23ai (fv >= 23.1 EXT 1) -- the ub8 request
+# token (`_fun_header`'s, for piggybacks). The token is 0 for an ordinary
+# piggyback and the call's own number in a pipelined burst (#132). The bespoke
+# body of each piggyback follows; CLOSE_CURSORS bakes its own function into the
+# const above and carries its cursor list, so it keeps its own schema.
+_PIGGYBACK_HEAD: wire_schema.Schema = (
+    ('const', bytes([TTI_MSG_TYPE_PIGGYBACK])),
+    ('u8', 'func'),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+)
 # TTI_LOBOPS (96), the head every operation shares (#412, #2064): the source
 # and destination locators' pointers and lengths, the short offsets, three
 # pointer flags, the operation. OCI sends thin's fields with 8-byte pointers
@@ -2274,6 +2286,7 @@ _LOB_READ_REPLY_THIN = wire_schema.compile_encoder(_LOB_READ_REPLY, _THIN)
 _LOB_READ_REPLY_OCI = wire_schema.compile_encoder(_LOB_READ_REPLY, _OCI)
 _CLOSE_CURSORS_THIN = wire_schema.compile_encoder(_CLOSE_CURSORS, _THIN)
 _CLOSE_CURSORS_FROM_THIN = wire_schema.compile_decoder(_CLOSE_CURSORS, _THIN)
+_PIGGYBACK_HEAD_THIN = wire_schema.compile_encoder(_PIGGYBACK_HEAD, _THIN)
 _CLOSE_CURSORS_FROM_OCI = wire_schema.compile_decoder(_CLOSE_CURSORS, _OCI)
 _CLOSE_CURSORS_O8I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O8I)
 _O8I_ALL8_O8I = wire_schema.compile_encoder(_O8I_ALL8, _O8I)
@@ -7742,9 +7755,7 @@ def encode_pipeline_begin(
     # message (the caller sets the BEGIN_PIPELINE data flag on that packet) and
     # shares that message's token. Mirrors oracledb
     # _write_begin_pipeline_piggyback; byte-validated against a 23ai capture.
-    Out = bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_PIPELINE_BEGIN, Seq])
-    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
-        Out += encode_sb4(TokenNum)
+    Out = _piggyback_head(TNS_FUNC_PIPELINE_BEGIN, Seq, FieldVersion, TokenNum)
     return Out + encode_sb4(0) + bytes([0]) + bytes([Mode])
 
 
@@ -7760,6 +7771,18 @@ def _e2e_header(Modified: bool, Value: bytes | None) -> bytes:
     if Modified:
         return bytes([1]) + encode_sb4(len(Value) if Value else 0)
     return bytes([0]) + encode_sb4(0)
+
+
+def _piggyback_head(func: int, seq: int, field_version: int, token: int = 0) -> bytes:
+    # The shared piggyback head (_PIGGYBACK_HEAD): marker, function, sequence,
+    # and the 23ai request token (0 for an ordinary piggyback, the call's own
+    # number in a pipelined burst). The token primitive reads the field version
+    # from the context, so set it the way _fun_header takes it as a parameter.
+    saved = _ENCODE_FIELD_VERSION.set(field_version)
+    try:
+        return _PIGGYBACK_HEAD_THIN({'func': func, 'seq': seq, 'token_number': token})
+    finally:
+        _ENCODE_FIELD_VERSION.reset(saved)
 
 
 def encode_close_cursors_piggyback(Seq: int, FieldVersion: int, Cursors: list) -> bytes:
@@ -7834,9 +7857,7 @@ def encode_end_to_end_piggyback(Seq: int, FieldVersion: int, Attrs: dict) -> byt
     if Mod['dbop']:
         Flags |= TNS_END_TO_END_DBOP
 
-    Out = bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_SET_END_TO_END_ATTR, Seq])
-    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
-        Out += encode_sb4(0)  # ub8 token (0)
+    Out = _piggyback_head(TNS_FUNC_SET_END_TO_END_ATTR, Seq, FieldVersion)
     Out += bytes([0, 0]) + encode_sb4(Flags)  # cidnam, cidser pointers; flags
     Out += _e2e_header(Mod['client_identifier'], Val['client_identifier'])
     Out += _e2e_header(Mod['module'], Val['module'])
@@ -7872,9 +7893,7 @@ def encode_end_user_sec_piggyback(
     oracledb's _write_end_user_sec_piggyback / _write_piggybacks). Byte layout
     reconstructed from the reference thin client (docs/PROTOCOL.md §34); the
     feature is tcps-only so it cannot be captured on a cleartext transport."""
-    Out = bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_END_USER_SECURITY_CTX, Seq])
-    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
-        Out += encode_sb4(0)  # ub8 token (0)
+    Out = _piggyback_head(TNS_FUNC_END_USER_SECURITY_CTX, Seq, FieldVersion)
     Out += encode_sb4(TNS_SECURITY_CONTEXT_ATTACH_FLAG)  # ub4 attach flag = 1
     Out += bytes([1])  # pointer(kpdkve) non-null
     Out += encode_sb4(1)  # number of key-value pairs = 1
@@ -7896,9 +7915,7 @@ def encode_app_context_piggyback(
     docs/PROTOCOL.md; the zero byte before the namespace exists from field
     version 12.1, and a server reading at 11.2 or below (10g and 11g, or 23ai
     held there) rejects a piggyback that has it (ORA-03120)."""
-    Out = bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_APP_CONTEXT, Seq])
-    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
-        Out += encode_sb4(0)  # ub8 token (0)
+    Out = _piggyback_head(TNS_FUNC_APP_CONTEXT, Seq, FieldVersion)
     Out += bytes([1]) + encode_sb4(len(Namespace))  # pointer, namespace length
     Out += bytes([1 if Entries else 0]) + encode_sb4(len(Entries))  # pointer, count
     Flags = TNS_APP_CONTEXT_FLAG_SET if Entries else TNS_APP_CONTEXT_FLAG_CLEAR
@@ -7918,9 +7935,7 @@ def encode_alter_session_piggyback(Seq: int, FieldVersion: int, Priority: str) -
     the default. It rides in front of the next call's message once. A server
     refuses it unless the client declared TNS_DATA_TYPE_ALTSESS. Layout in
     docs/PROTOCOL.md."""
-    Out = bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_ALTER_SESSION, Seq])
-    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
-        Out += encode_sb4(0)  # ub8 token (0)
+    Out = _piggyback_head(TNS_FUNC_ALTER_SESSION, Seq, FieldVersion)
     Out += encode_sb4(0)  # flags
     Out += bytes([1]) + encode_sb4(1)  # pointer, one key-value pair
     Out += _obj_two_lengths(b'TXN_PRIORITY') + _obj_two_lengths(Priority.encode())
@@ -7935,9 +7950,7 @@ def encode_session_state_piggyback(Seq: int, FieldVersion: int, State: int) -> b
     one-shot (the caller clears the desired state after emitting it). Mirrors
     oracledb's _write_session_state_piggyback; byte layout in docs/PROTOCOL.md
     §35. Gated on the negotiated request-boundaries capability."""
-    Out = bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_SESSION_STATE, Seq])
-    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
-        Out += encode_sb4(0)  # ub8 token (0)
+    Out = _piggyback_head(TNS_FUNC_SESSION_STATE, Seq, FieldVersion)
     # ub8 (state | explicit-boundary); small values encode like ub4.
     Out += encode_sb4(State | TNS_SESSION_STATE_EXPLICIT_BOUNDARY)
     return Out
@@ -7952,9 +7965,7 @@ def encode_free_temp_lobs_piggyback(
     the ub2-length-prefixed form CREATE_TEMP handed out (40 bytes for a real
     server's 38). Mirrors oracledb's _write_close_temp_lobs_piggyback; byte
     layout in docs/PROTOCOL.md §14.5."""
-    Out = bytes([TTI_MSG_TYPE_PIGGYBACK, TTI_LOBOPS, Seq])
-    if FieldVersion >= FIELD_VERSION_23_1_EXT_1:
-        Out += encode_sb4(0)  # ub8 token (0)
+    Out = _piggyback_head(TTI_LOBOPS, Seq, FieldVersion)
     Wire = b''.join(struct.pack('>H', len(L)) + L for L in Locators)
     Out += bytes([1]) + encode_sb4(len(Wire))  # pointer + total locator bytes
     Out += bytes([0]) + encode_sb4(0)  # dest locator pointer + length
