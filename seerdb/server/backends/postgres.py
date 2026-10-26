@@ -3935,6 +3935,35 @@ class _TypedNullDumper(psycopg.adapt.Dumper):
         return None
 
 
+class _OraNumber(int):
+    """A client's integer NUMBER bind (#2307). It behaves as an int everywhere in
+    the backend, but PostgreSQL sees it as numeric, not the smallest integer type
+    psycopg would pick by magnitude -- so arithmetic between two such binds keeps
+    Oracle's NUMBER width. A plain int (the backend's own oids, attnums, ...) is
+    unaffected, so an internal `oid = ANY($1)` still binds oids, not numeric."""
+
+
+class _IntNumericDumper(psycopg.adapt.Dumper):
+    # An _OraNumber goes out as numeric: a value that fits a smallint bound as one
+    # made arithmetic between two such binds overflow at 32767 (`:1 + :2` of 30000
+    # each -> ORA-01426), where Oracle, whose numbers are all NUMBER, gives 60000.
+    oid = psycopg.postgres.types['numeric'].oid
+
+    def dump(self, obj: object) -> bytes:
+        return str(obj).encode('ascii')
+
+
+def _as_ora_number(value: Any) -> Any:
+    # A client bind's integer, or the integers inside an array / collection bind,
+    # wrapped so they go out as numeric (#2307). bool is an int subclass but its
+    # own type, left alone; anything else is unchanged.
+    if type(value) is int:
+        return _OraNumber(value)
+    if type(value) in (list, tuple):
+        return type(value)(_as_ora_number(item) for item in value)
+    return value
+
+
 @dataclass(frozen=True)
 class _CollectionBind:
     """A VARRAY / nested-table bind: the array its domain is over, and the
@@ -3955,7 +3984,11 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
     single dict/list of values both land correctly). A literal ``%`` in the text
     (a LIKE pattern, a column name) is doubled: psycopg treats the bound query as
     a format string, so a bare ``%`` would be read as a broken placeholder."""
-    values = list(binds)
+    # A client's integer bind is Oracle NUMBER, so it goes out as numeric, not
+    # the smallest integer psycopg would pick -- otherwise `:1 + :2` of two
+    # smallint-sized values overflowed at 32767 (ORA-01426, #2307). bool keeps
+    # its own type; a list/tuple bind (an array / collection of NUMBER) is walked.
+    values = [_as_ora_number(v) for v in binds]
     names: list[str] = []  # distinct bind names, in first-appearance order
     out: list[str] = []
     tstz_keys: set[str] = set()  # bind keys whose value is an aware datetime
@@ -14659,6 +14692,7 @@ class PostgresBackend:
         self._conn.adapters.register_dumper(_PortalName, _PortalNameDumper)
         self._conn.adapters.register_dumper(JSON, _JsonDumper)
         self._conn.adapters.register_dumper(_TypedNull, _TypedNullDumper)
+        self._conn.adapters.register_dumper(_OraNumber, _IntNumericDumper)
         # The portals opened for cursors bound IN, numbered (#1609).
         self._portals_opened = 0
         # Lean on the `orafce` extension for Oracle-compatible SQL functions —

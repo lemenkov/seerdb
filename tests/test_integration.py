@@ -4447,6 +4447,17 @@ class CursorIntegration(_IntegrationBase):
 class BindIntegration(_IntegrationBase):
     """Verify Cursor.execute parameter binding."""
 
+    def test_arithmetic_on_two_small_integer_binds(self):
+        # Two binds that each fit a smallint: Oracle does the arithmetic in
+        # NUMBER and never overflows. The Mirror over PostgreSQL bound each as a
+        # smallint, so `:1 + :2` of 30000 and `:1 * :2` of 300 overflowed past
+        # 32767 (ORA-01426, #2307), where every Oracle (8i up) gives the full
+        # value.
+        self.cur.execute('SELECT :1 + :2 FROM dual', [30000, 30000])
+        self.assertEqual(self.cur.fetchone()[0], 60000)
+        self.cur.execute('SELECT :1 * :2 FROM dual', [300, 300])
+        self.assertEqual(self.cur.fetchone()[0], 90000)
+
     def test_repeated_ddl_actually_runs_every_time(self):
         # The DML cursor cache reuses a server handle to save a parse, which is
         # right for DML and wrong for DDL: a CREATE or DROP does its work when
