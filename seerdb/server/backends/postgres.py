@@ -21027,7 +21027,15 @@ class PostgresBackend:
             if inner is not None and _several_statements(statement):
                 return self._run_block(sql, binds)
             func = _FUNC_CALL.match(statement)
-            if func is not None:
+            # Only a call whose arguments are all binds goes the direct-SELECT
+            # route: it threads each bind value onto a %s by position. A literal
+            # or expression argument (`:r := RPAD('o', 4000, 'p')`, #2337) has no
+            # placeholder, so that route dropped it -- building a zero- or
+            # wrong-arity call, which PostgreSQL's overloaded resolution refused
+            # and the error mapped to PLS-00306. Such a call falls through to the
+            # out-assignment path, which evaluates the whole right-hand side (its
+            # literals kept, its Oracle idioms translated) in one SELECT.
+            if func is not None and _call_arguments(func.group(3)) is not None:
                 return self._call_function(func, values, sql)
             proc = _PROC_CALL.match(statement)
             if proc is not None:
