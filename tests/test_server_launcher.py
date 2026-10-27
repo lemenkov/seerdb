@@ -335,3 +335,44 @@ def test_failed_login_attempts_default_to_oracles(tmp_path: Path) -> None:
         build(
             ['--failed-login-attempts', '-1', 'postgres', 'dbname=mirror'], env=_USERS
         )
+
+
+def test_the_ws_listener_is_off_by_default() -> None:
+    launch = build(['postgres', 'dbname=mirror'], env=_USERS)
+    assert launch.ws_port is None
+    assert launch.ws_origins is None
+
+
+def test_ws_options_on_the_command_line() -> None:
+    launch = build(
+        [
+            '--ws-port',
+            '1522',
+            '--ws-origin',
+            'https://a.example',
+            '--ws-origin',
+            'https://b.example',
+            'postgres',
+            'dbname=mirror',
+        ],
+        env=_USERS,
+    )
+    assert launch.ws_port == 1522
+    assert launch.ws_origins == ['https://a.example', 'https://b.example']
+
+
+def test_ws_options_from_the_config_file(tmp_path: Path) -> None:
+    config = _ini(
+        tmp_path,
+        '[server]\nws_port = 1522\nws_origins = https://a.example, https://b.example\n'
+        '[clients]\nScott = tiger\n'
+        '[backend]\ntype = postgres\nconninfo = dbname=mirror\n',
+    )
+    launch = build(['--config', config], env={})
+    assert launch.ws_port == 1522
+    assert launch.ws_origins == ['https://a.example', 'https://b.example']
+
+
+def test_a_bad_ws_port_is_refused() -> None:
+    with pytest.raises(SystemExit):
+        build(['--ws-port', '99999', 'postgres', 'dbname=mirror'], env=_USERS)

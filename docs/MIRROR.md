@@ -276,6 +276,29 @@ by default; sqlplus and other OCI clients offer it when their `sqlnet.ora`
 asks for it. ANO's key exchange does not authenticate the server, so it does
 not protect against a man in the middle; use TLS for that.
 
+### The WebSocket listener (a seerdb extension)
+
+`--ws-port PORT` serves the **seerdb WebSocket transport** (a seerdb extension,
+not Oracle) beside the TCP/TCPS listener: seerdb clients connect with a
+`ws://host:PORT/service` DSN (`wss://` when `--tls-cert` is given), carrying TNS
+in WebSocket binary messages. With the passthrough backend this makes the Mirror
+an **auditing gateway** for browser clients — their traffic reaches a real
+Oracle through code that understands it, so logging and policy apply, unlike a
+protocol-blind bridge. No Oracle client speaks it; it needs the `ws` extra
+(`pip install "seerdb[ws]"`).
+
+`--ws-origin ORIGIN` (repeatable; or `ws_origins` in the config) is the browser
+`Origin` allow-list, enforced at the WebSocket handshake. With none given, any
+origin may connect — not recommended.
+
+> **A browser-facing endpoint is outside the Mirror's stated threat model**
+> (behind a firewall or VPN). This listener enforces the origin allow-list,
+> authenticates before any backend work, and honours `--max-sessions`, but the
+> full security review (the
+> [mirror-security-hardening](https://github.com/seerdb/seerdb/milestone/52)
+> milestone) is still owed: treat it as a technology preview, and put it behind
+> an allow-list and TLS.
+
 ## Mirror over PostgreSQL
 
 ### Choosing a mode
