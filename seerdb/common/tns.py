@@ -1493,6 +1493,29 @@ _IMPLICIT_RESULTS: wire_schema.Schema = (
         ),
     ),
 )
+# The return-parameters block that reports a session-state change (a new
+# CURRENT_SCHEMA, #973) back to the client: the al8o4l count and its six words
+# (the SCN, the sequence, and four fixed), an eight-byte prefix tail, the single
+# state entry (its count, key and type byte), and the new value as a ub4 length,
+# a ub1 length and the name. The trailing entries (which differ for an edition
+# change) follow separately.
+_SESSION_STATE_RESPONSE: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('n4', 'al8o4l'),
+    ('n4', 'scn'),
+    ('n4', 'word_1'),
+    ('n4', 'sequence'),
+    ('n4', 'word_2'),
+    ('n4', 'word_3'),
+    ('n4', 'word_4'),
+    ('bytes', 'prefix_tail', 8),
+    ('u8', 'entry_count'),
+    ('u8', 'key'),
+    ('u8', 'entry_type'),
+    ('n4', 'name_length'),
+    ('u8', 'name_byte_length'),
+    ('bytes', 'name', 'name_byte_length'),
+)
 # TTI_FETCH: the cursor and the rows the client has room for.
 _FETCH: wire_schema.Schema = (
     ('const', bytes([TTI_FUN, TTI_FETCH])),
@@ -2412,6 +2435,9 @@ _SYNC_OCI = wire_schema.compile_encoder(_SYNC, _OCI)
 _ROWCOUNTS_BLOCK_THIN = wire_schema.compile_encoder(_ROWCOUNTS_BLOCK, _THIN)
 _CREATE_TEMP_RESPONSE_THIN = wire_schema.compile_encoder(_CREATE_TEMP_RESPONSE, _THIN)
 _IMPLICIT_RESULTS_THIN = wire_schema.compile_encoder(_IMPLICIT_RESULTS, _THIN)
+_SESSION_STATE_RESPONSE_THIN = wire_schema.compile_encoder(
+    _SESSION_STATE_RESPONSE, _THIN
+)
 _SYNC_PAIR_OCI = wire_schema.compile_encoder(_SYNC_PAIR, _OCI)
 
 
@@ -4906,19 +4932,30 @@ def encode_session_state_response(
     direction (§20.5).
     """
     name = schema.strip('"').upper().encode('utf-8')
-    out = bytearray([TTI_RPA])
-    out += encode_sb4(_STATE_AL8O4L_FIELDS)
-    for value in (scn, 0, seq, 2, 0, 0):
-        out += encode_sb4(value)
-    out += _STATE_PREFIX_TAIL
-    out += bytes([1, key, _STATE_ENTRY_TYPE])
-    out += encode_sb4(len(name)) + bytes([len(name)]) + name
-    out += (
+    body = _SESSION_STATE_RESPONSE_THIN(
+        {
+            'al8o4l': _STATE_AL8O4L_FIELDS,
+            'scn': scn,
+            'word_1': 0,
+            'sequence': seq,
+            'word_2': 2,
+            'word_3': 0,
+            'word_4': 0,
+            'prefix_tail': _STATE_PREFIX_TAIL,
+            'entry_count': 1,
+            'key': key,
+            'entry_type': _STATE_ENTRY_TYPE,
+            'name_length': len(name),
+            'name_byte_length': len(name),
+            'name': name,
+        }
+    )
+    trailing = (
         _STATE_TRAILING_ENTRIES_EDITION
         if key == _STATE_KEY_EDITION
         else _STATE_TRAILING_ENTRIES
     )
-    return bytes(out)
+    return body + trailing
 
 
 def encode_returning_response(
