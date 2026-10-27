@@ -1474,6 +1474,25 @@ _CREATE_TEMP_RESPONSE: wire_schema.Schema = (
     ('n4', 'charset'),
     ('u8', 'flags'),
 )
+# The TTI_IRD block a PL/SQL DBMS_SQL.RETURN_RESULT answers with (#121/#826): a
+# count, then per result a preamble the client skips, the column describe body,
+# and the server cursor id. The describe body is pre-encoded
+# (`_encode_describe_body`), so it rides as a `raw` field and the schema encodes
+# only.
+_IMPLICIT_RESULTS: wire_schema.Schema = (
+    ('const', bytes([TTI_IRD])),
+    ('n4', 'count'),
+    (
+        'each',
+        'results',
+        'count',
+        (
+            ('value', 'preamble'),
+            ('raw', 'describe'),
+            ('n4', 'cursor_id'),
+        ),
+    ),
+)
 # TTI_FETCH: the cursor and the rows the client has room for.
 _FETCH: wire_schema.Schema = (
     ('const', bytes([TTI_FUN, TTI_FETCH])),
@@ -2392,6 +2411,7 @@ _SYNC_FROM_THIN = wire_schema.compile_decoder(_SYNC, _THIN)
 _SYNC_OCI = wire_schema.compile_encoder(_SYNC, _OCI)
 _ROWCOUNTS_BLOCK_THIN = wire_schema.compile_encoder(_ROWCOUNTS_BLOCK, _THIN)
 _CREATE_TEMP_RESPONSE_THIN = wire_schema.compile_encoder(_CREATE_TEMP_RESPONSE, _THIN)
+_IMPLICIT_RESULTS_THIN = wire_schema.compile_encoder(_IMPLICIT_RESULTS, _THIN)
 _SYNC_PAIR_OCI = wire_schema.compile_encoder(_SYNC_PAIR, _OCI)
 
 
@@ -2970,13 +2990,19 @@ def encode_implicit_results(results: list[tuple[list[ColumnMeta], int]]) -> byte
     Each result is a server cursor the client fetches on demand, exactly like a
     REF CURSOR, so the caller must have parked its rows under that id first.
     """
-    out = bytearray([TTI_IRD])
-    out += encode_sb4(len(results))
-    for columns, cursor_id in results:
-        out += _bytes_with_length(b'')  # the skipped preamble
-        out += _encode_describe_body(columns)
-        out += encode_sb4(cursor_id)
-    return bytes(out)
+    return _IMPLICIT_RESULTS_THIN(
+        {
+            'count': len(results),
+            'results': [
+                {
+                    'preamble': b'',  # the length-prefixed preamble the client skips
+                    'describe': _encode_describe_body(columns),
+                    'cursor_id': cursor_id,
+                }
+                for columns, cursor_id in results
+            ],
+        }
+    )
 
 
 # --- Mirror thin reply/response encoders (§6) ---
