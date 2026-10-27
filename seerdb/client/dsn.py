@@ -82,6 +82,10 @@ class ConnectArguments:
     route: Route | None
     https_proxy: str | None
     https_proxy_port: int
+    # The transport the dsn named: 'tcp', 'tcps', or the seerdb WebSocket
+    # extension 'ws' / 'wss' (#1988). Trailing with a default so a plain
+    # ConnectArguments(...) positional build need not pass it.
+    protocol: str = 'tcp'
 
     def as_tuple(self) -> tuple:
         # In field order, for a constructor to unpack into its own arguments.
@@ -141,8 +145,14 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
     scheme, separator, after = text.partition('://')
     if separator:
         protocol = scheme.lower()
-        if protocol not in ('tcp', 'tcps'):
-            raise ProgrammingError(f'dsn {dsn!r}: {scheme!r} is not tcp or tcps')
+        # ws / wss are the seerdb WebSocket transport extension (#1988). The
+        # /segment after host:port stays the Oracle service name (Easy Connect),
+        # so wss://host:port/FREEPDB1 names the same service tcps:// would; the
+        # WebSocket resource path is '/'. See PROTOCOL.md 'Transports'.
+        if protocol not in ('tcp', 'tcps', 'ws', 'wss'):
+            raise ProgrammingError(
+                f'dsn {dsn!r}: {scheme!r} is not tcp, tcps, ws or wss'
+            )
         text = after
     (text, question, query) = text.partition('?')
     parameters = _parse_parameters(dsn, query) if question else {}
@@ -267,10 +277,15 @@ def _apply_parameters(
             raise ProgrammingError(
                 f'dsn {dsn!r}: retry_count={count!r}, retry_delay={delay!r}'
             )
+        # ws / wss (#1988) keep their own protocol; otherwise ssl picks TCPS.
+        if args.protocol in ('ws', 'wss'):
+            address_protocol = args.protocol
+        else:
+            address_protocol = 'tcps' if args.ssl else 'tcp'
         address = Address(
             args.host,
             args.port,
-            'tcps' if args.ssl else 'tcp',
+            address_protocol,
             args.service_name,
             args.sid,
             args.server_type,
@@ -293,13 +308,17 @@ def resolve_dsn_arguments(
     does, and keeps an ``ssl=`` configuration passed beside it. Its ``?``
     parameters set ``sdu``, ``cclass``, ``purity`` and ``timeout``."""
     info = parse_dsn(dsn, config_dir)
-    args = replace(args, host=info.host, port=info.port, route=info.route)
+    args = replace(
+        args, host=info.host, port=info.port, route=info.route, protocol=info.protocol
+    )
     if info.https_proxy:
         args = replace(
             args, https_proxy=info.https_proxy, https_proxy_port=info.https_proxy_port
         )
     if info.protocol == 'tcps' and not args.ssl:
         args = replace(args, ssl=True)
+    # ws / wss (#1988) do TLS at the WebSocket layer, not the TNS layer, so they
+    # leave args.ssl as given -- _open_transport branches on the protocol.
     if info.server_type is not None:
         args = replace(args, server_type=info.server_type)
     if info.service_name:

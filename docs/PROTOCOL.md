@@ -284,6 +284,32 @@ same one-per-episode rule the receive side follows: echoing every marker
 ping-pongs the two ends into the same storm described above. Observed against
 sqlplus 23.26 through a logging proxy.
 
+### 1.5 Transports (TCP, TCPS, and the `ws://` / `wss://` seerdb extension)
+
+Oracle carries TNS over TCP (`PROTOCOL=TCP`) or TLS (`PROTOCOL=TCPS`). seerdb
+adds a **WebSocket transport, a seerdb extension** (not Oracle; #1988):
+`ws://host:port/service` and `wss://host:port/service`, as an Easy Connect
+string or a descriptor with `PROTOCOL=WS` / `WSS`. No Oracle client or server
+speaks it — python-oracledb 26.0.1 refuses `ws://`/`wss://` with DPY-4021 — so
+it reaches only a WebSocket bridge or a seerdb Mirror that speaks it (#1989).
+
+The framing is a **byte pipe**: TNS packets ride WebSocket **binary** messages,
+and the packet framer (§1.1, §1.3) reassembles them exactly as over TCP. The
+TNS and TTC layers are unchanged. seerdb writes one whole packet per send, so
+in practice each binary message carries one TNS packet, which gives a
+protocol-aware gateway natural message boundaries — but a receiver must not
+rely on it and reassembles from the packet length as always. A WebSocket close
+frame is read as a socket EOF. A WebSocket has no out-of-band data, so break
+never uses the OOB urgent byte over this transport; it always sends the in-band
+`TNS_MARKER_TYPE_INTERRUPT` packet (§1.4).
+
+TLS: `wss://` is WebSocket-over-TLS, terminated by the WebSocket layer, not a
+second TNS-level TLS; `ws://` is unencrypted and for local testing. The DSN
+`/segment` after `host:port` stays the Oracle **service name** (as for
+`tcps://`), and the WebSocket resource path is `/`. A browser-facing endpoint
+is outside the Mirror's stated threat model and is gated on the security
+milestone (#52).
+
 ## 2. Connection Phase
 
 ### 2.1 TNS_CONNECT (Client -> Server)

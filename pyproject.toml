@@ -45,6 +45,12 @@ token = ["cryptography>=3.3"]
 # renders SQL literals without a connection, which 3.1 cannot). Only that
 # backend imports it, so `import seerdb` works without it.
 mirror = ["psycopg[binary]>=3.2"]
+# The ws:// / wss:// transport (#1988), a seerdb extension: TNS framing carried
+# in WebSocket binary messages, to a bridge or a Mirror that speaks it. The
+# `websockets` package provides the sync and async clients (recv(timeout=)
+# needs 13+). Imported lazily by seerdb.client._ws, only when a ws/wss dsn is
+# used, so `import seerdb` works without it.
+ws = ["websockets>=13"]
 
 [project.scripts]
 seerdb-mirror = "seerdb.server.launcher:main"

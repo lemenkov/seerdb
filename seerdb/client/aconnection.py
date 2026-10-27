@@ -239,6 +239,9 @@ class AsyncOracleConnect(_ConnectionLogic):
         # port name. The ssl given is kept apart, so an address's own protocol
         # can turn TLS on for it alone.
         route: Route | None = None
+        # The transport the dsn named (#1988): 'tcp'/'tcps' or the WebSocket
+        # extension 'ws'/'wss'. Only a dsn can select it.
+        protocol = 'tcp'
         self._ssl_given = ssl
         if dsn is not None and not use_wallet:
             given = ConnectArguments(
@@ -274,7 +277,10 @@ class AsyncOracleConnect(_ConnectionLogic):
                 route,
                 https_proxy,
                 https_proxy_port,
+                protocol,
             ) = resolve_dsn_arguments(dsn, given, config_dir).as_tuple()
+        # The transport in force (#1988); a route address can repoint it.
+        self.protocol = protocol
         # Negotiation cache (#438): opt-in reconnect optimization, sharing the
         # process-level cache with the sync connection.
         self.negotiation_cache = negotiation_cache
@@ -477,6 +483,12 @@ class AsyncOracleConnect(_ConnectionLogic):
     async def _open_transport(self) -> None:
         # Open the TCP (optionally TLS) socket to the current host/port and send
         # the initial CONNECT. Shared by connect() and the TNS_REDIRECT handler.
+        # The seerdb WebSocket transport (#1988): ws / wss open a byte pipe that
+        # presents as the asyncio reader/writer pair, and the CONNECT rides it.
+        if self.protocol in ('ws', 'wss'):
+            await self._open_ws_transport()
+            await self._send_connect()
+            return
         SslArg = self._ssl_kwarg()
         Loop = asyncio.get_running_loop()
         # Following a redirect (self._redirects > 0), retry a refused connect —
@@ -525,6 +537,23 @@ class AsyncOracleConnect(_ConnectionLogic):
                 self._writer.close()
                 raise
         await self._send_connect()
+
+    async def _open_ws_transport(self) -> None:
+        # The seerdb WebSocket byte pipe (#1988), presented as the asyncio
+        # reader/writer pair the rest of the connection holds. wss does TLS
+        # inside websockets; ws is for local testing. The WebSocket resource
+        # path is '/' (the service is named in the TNS descriptor).
+        from seerdb.client._ws import connect_ws_async, ssl_context_for
+
+        Context = ssl_context_for(self.ssl) if self.protocol == 'wss' else None
+        OpenTimeout = self.timeout / 1000 if self.timeout else None
+        (Reader, Writer) = await connect_ws_async(
+            self.protocol, self.host, self.port, '/', Context, OpenTimeout
+        )
+        # WsStreamReader / WsStreamWriter present the StreamReader / StreamWriter
+        # surface the connection uses; they stand in for the asyncio pair.
+        self._reader = cast(asyncio.StreamReader, Reader)
+        self._writer = cast(asyncio.StreamWriter, Writer)
 
     async def _send_connect(self) -> None:
         # The CONNECT, then -- past 230 bytes -- the descriptor in a DATA packet
@@ -592,6 +621,9 @@ class AsyncOracleConnect(_ConnectionLogic):
                 address.https_proxy,
                 address.https_proxy_port,
             )
+        # ws / wss (#1988) do TLS at the WebSocket layer; they leave self.ssl as
+        # given and carry the transport on self.protocol for _open_transport.
+        self.protocol = address.protocol
         if address.protocol == 'tcps':
             self.ssl = self._ssl_given or True
         else:
