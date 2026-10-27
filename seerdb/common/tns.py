@@ -1450,6 +1450,20 @@ _SYNC: wire_schema.Schema = (
     ('each', 'pairs', 'pair_count', _SYNC_PAIR),
     ('n4', 'flags'),
 )
+# The per-iteration affected-row counts an array DML answers when the client
+# asked for arraydmlrowcounts (#18/#859): the execute's return-parameters block
+# (TTI_RPA), its four ordinary words (al8o4l, al8txl, key/value pairs,
+# registration -- all empty here), then the count and one ub4 per iteration. A
+# prefix: the OER that ends the response follows separately.
+_ROWCOUNTS_BLOCK: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('n4', 'al8o4l'),
+    ('n4', 'al8txl'),
+    ('n4', 'key_value_pairs'),
+    ('n4', 'registration'),
+    ('n4', 'count'),
+    ('each', 'counts', 'count', (('n4', 'value'),)),
+)
 # TTI_FETCH: the cursor and the rows the client has room for.
 _FETCH: wire_schema.Schema = (
     ('const', bytes([TTI_FUN, TTI_FETCH])),
@@ -2366,6 +2380,7 @@ _LOB_DATA_OCI = wire_schema.compile_encoder(_LOB_DATA, _OCI)
 _SYNC_THIN = wire_schema.compile_encoder(_SYNC, _THIN)
 _SYNC_FROM_THIN = wire_schema.compile_decoder(_SYNC, _THIN)
 _SYNC_OCI = wire_schema.compile_encoder(_SYNC, _OCI)
+_ROWCOUNTS_BLOCK_THIN = wire_schema.compile_encoder(_ROWCOUNTS_BLOCK, _THIN)
 _SYNC_PAIR_OCI = wire_schema.compile_encoder(_SYNC_PAIR, _OCI)
 
 
@@ -3349,9 +3364,16 @@ def encode_rowcounts_block(counts: list[int]) -> bytes:
     batch. A client that asked for arraydmlrowcounts is owed the counts in all
     three: the rows that applied applied, whatever happened after them (#1031).
     """
-    fields = encode_sb4(0) * 4  # al8o4l, al8txl, key/value pairs, registration
-    rows = encode_sb4(len(counts)) + b''.join(encode_sb4(c) for c in counts)
-    return bytes([TTI_RPA]) + fields + rows
+    return _ROWCOUNTS_BLOCK_THIN(
+        {
+            'al8o4l': 0,
+            'al8txl': 0,
+            'key_value_pairs': 0,
+            'registration': 0,
+            'count': len(counts),
+            'counts': [{'value': c} for c in counts],
+        }
+    )
 
 
 def encode_batch_errors_status(
