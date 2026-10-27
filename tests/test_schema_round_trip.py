@@ -91,7 +91,7 @@ def _width(codec_name: str, kind: str) -> int:
     # The largest integer a kind holds in a codec, in bytes.
     if kind in ('u8', 'n1'):
         return 1
-    if kind in ('n2', 'be2'):
+    if kind in ('n2', 'be2', 'le2'):
         return 2
     if kind == 'n8' and codec_name in ('oci', 'oci-wide'):
         return 8
@@ -168,8 +168,11 @@ class _Values:
                     range(size % 256)
                 )
                 values[name] = values[name][:size]
-            elif kind in ('u8', 'n1', 'n2', 'n4', 'n8', 'wn4', 'be2', 'be4'):
+            elif kind in ('u8', 'n1', 'n2', 'n4', 'n8', 'wn4', 'be2', 'be4', 'le2'):
                 values[name] = self.integer(kind)
+            elif kind == 'cstr':
+                # A NUL-terminated string: its bytes cannot themselves hold a NUL.
+                values[name] = self._pick([b'', b'x', b'banner text'])
             elif kind == 'scale':
                 values[name] = self._pick([0, 1, 127, -1, -127])
             elif kind == 'ptr':

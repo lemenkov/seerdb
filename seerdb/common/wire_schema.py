@@ -38,6 +38,10 @@ A schema is a tuple of fields:
   ``length`` says, or ``length`` itself when it is a number, as they are;
 - ``('be2', name)`` / ``('be4', name)``: a big-endian ub2 / ub4 whatever
   the dialect, as in a LOB locator;
+- ``('le2', name)``: a little-endian ub2 whatever the dialect, as in a
+  TTI_PRO charset id;
+- ``('cstr', name)``: a NUL-terminated byte string -- its bytes then a
+  ``00`` -- as in a TTI_PRO banner; the bytes must not contain a ``00``;
 - ``('pad', size)``: ``size`` bytes no field is known for, zero when written
   and passed over when read;
 - ``('derive', name, function)``: no bytes; reading sets ``name`` to
@@ -79,6 +83,7 @@ _PRIMITIVES = (
     'n1',
 )
 _BIG_ENDIAN = {'be2': 2, 'be4': 4}
+_LITTLE_ENDIAN = {'le2': 2}
 Encoder = Callable[[dict[str, Any]], bytes]
 Decoder = Callable[..., tuple[dict[str, Any], bytes]]
 
@@ -126,6 +131,12 @@ def _encode_part(field: tuple[Any, ...], codec: Codec) -> Callable[[dict], bytes
     if kind in _BIG_ENDIAN:
         (width, name) = (_BIG_ENDIAN[kind], field[1])
         return lambda values: values[name].to_bytes(width, 'big')
+    if kind in _LITTLE_ENDIAN:
+        (width, name) = (_LITTLE_ENDIAN[kind], field[1])
+        return lambda values: values[name].to_bytes(width, 'little')
+    if kind == 'cstr':
+        name = field[1]
+        return lambda values: values[name] + b'\x00'
     if kind == 'pad':
         zeros = bytes(field[1])
         return lambda values: zeros
@@ -184,6 +195,19 @@ def compile_decoder(schema: Schema, codec: Codec) -> Decoder:
                     int.from_bytes(data[:width], 'big'),
                     data[width:],
                 )
+            elif kind in _LITTLE_ENDIAN:
+                width = _LITTLE_ENDIAN[kind]
+                if len(data) < width:
+                    raise IndexError(f'{kind} past the end of the message')
+                (values[field[1]], data) = (
+                    int.from_bytes(data[:width], 'little'),
+                    data[width:],
+                )
+            elif kind == 'cstr':
+                end = data.find(0)
+                if end < 0:
+                    raise IndexError('cstr: no terminating NUL')
+                (values[field[1]], data) = (bytes(data[:end]), data[end + 1 :])
             elif kind == 'pad':
                 if len(data) < field[1]:
                     raise IndexError('pad past the end of the message')
