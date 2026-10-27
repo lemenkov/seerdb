@@ -48,6 +48,8 @@ ONE_WAY = {
     '_OBJECT_FRAME',
     '_LOB_READ_REPLY',
     '_DCB_COLUMN',
+    # The describe body it carries per result is pre-encoded, a raw field.
+    '_IMPLICIT_RESULTS',
     # 9i's SQL length counts characters, not the bytes its text takes (#2275).
     '_O7_ALL7',
 }
