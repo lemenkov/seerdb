@@ -7221,30 +7221,25 @@ def _bvc_bit_set(BitVec: bytes, Idx: int) -> bool:
 
 
 def decode_token_rxh(Data: bytes, Acc: tuple) -> tuple:
-    # Row Transfer Header. Fields use Oracle's variable ub1/ub2/ub4 encoding
-    # (1-byte length prefix + value bytes), not the fixed 2-byte big-endian
-    # layout the older version of this decoder assumed. See python-oracledb's
-    # _process_row_header.
+    # Row Transfer Header. The 10g+ form is the 9i row header read at thin's
+    # variable-width integers: the head (`_O7_RXH` -- a flags byte and four
+    # counts) and then the vectors (`_O7_VECTORS` -- the column bit vector and
+    # the rowid, each a ub4 length and its bytes), the schemas the 9i and 8i
+    # fetch paths already decode. Fields use Oracle's variable ub1/ub2/ub4
+    # encoding (1-byte length prefix + value bytes), not the fixed 2-byte
+    # big-endian layout an older version of this decoder assumed; see
+    # python-oracledb's _process_row_header.
     (Cursor, RowFormat, Rows) = Acc[:3]
-    Rest = Data[2:]  # skip token + 1B flags
-    (_, Rest) = decode_ub4(Rest)  # num requests
-    (_, Rest) = decode_ub4(Rest)  # iteration number
-    (_, Rest) = decode_ub4(Rest)  # num iters
-    (_, Rest) = decode_ub4(Rest)  # buffer length
-    (NumBytes, Rest) = decode_ub4(Rest)  # bit vector length
-    BitVec = None
-    if NumBytes > 0:
-        # The row header can carry a column bit vector (oracledb's
-        # _get_bit_vector): an unset bit means the column repeats the previous
-        # row's value and carries no bytes in the following RXD. It must be
-        # passed to the RXD decoder, not skipped — skipping it makes the RXD read
-        # the next token as a column value and desync (a scroll re-execute that
-        # repositions onto a row whose value equals the last one returned uses
-        # this compression, e.g. LAST after fetching to EOF). #181.
-        Rest = Rest[1:]  # skip repeated length
-        BitVec = bytes(Rest[:NumBytes])
-        Rest = Rest[NumBytes:]
-    Rest = _skip_bytes_with_length(Rest)  # rxhrid
+    (_, Rest) = _O7_RXH_FROM_THIN(Data)
+    (Vectors, Rest) = _O7_VECTORS_FROM_THIN(Rest)
+    # The row header can carry a column bit vector (oracledb's _get_bit_vector):
+    # an unset bit means the column repeats the previous row's value and carries
+    # no bytes in the following RXD. It must be passed to the RXD decoder, not
+    # dropped — dropping it makes the RXD read the next token as a column value
+    # and desync (a scroll re-execute that repositions onto a row whose value
+    # equals the last one returned uses this compression, e.g. LAST after
+    # fetching to EOF). #181.
+    BitVec = Vectors.get('bit_vector')
     Acc = (
         (Cursor, RowFormat, Rows)
         if BitVec is None
