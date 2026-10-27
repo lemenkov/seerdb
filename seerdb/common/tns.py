@@ -1464,6 +1464,16 @@ _ROWCOUNTS_BLOCK: wire_schema.Schema = (
     ('n4', 'count'),
     ('each', 'counts', 'count', (('n4', 'value'),)),
 )
+# The CREATE_TEMP reply (#412/#846): the minted locator (a ub2 length then its
+# bytes), the character set and a flags byte. A prefix -- the status OER that
+# ends the response follows separately.
+_CREATE_TEMP_RESPONSE: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('be2', 'locator_length'),
+    ('bytes', 'locator', 'locator_length'),
+    ('n4', 'charset'),
+    ('u8', 'flags'),
+)
 # TTI_FETCH: the cursor and the rows the client has room for.
 _FETCH: wire_schema.Schema = (
     ('const', bytes([TTI_FUN, TTI_FETCH])),
@@ -2381,6 +2391,7 @@ _SYNC_THIN = wire_schema.compile_encoder(_SYNC, _THIN)
 _SYNC_FROM_THIN = wire_schema.compile_decoder(_SYNC, _THIN)
 _SYNC_OCI = wire_schema.compile_encoder(_SYNC, _OCI)
 _ROWCOUNTS_BLOCK_THIN = wire_schema.compile_encoder(_ROWCOUNTS_BLOCK, _THIN)
+_CREATE_TEMP_RESPONSE_THIN = wire_schema.compile_encoder(_CREATE_TEMP_RESPONSE, _THIN)
 _SYNC_PAIR_OCI = wire_schema.compile_encoder(_SYNC_PAIR, _OCI)
 
 
@@ -4437,14 +4448,14 @@ def encode_create_temp_response(locator: bytes) -> bytes:
     one (#846). Same defect as the auth challenge that had no terminating OER
     (#830).
     """
-    return (
-        bytes([TTI_RPA])
-        + struct.pack('>H', len(locator))
-        + locator
-        + encode_sb4(AL32UTF8_CHARSET)
-        + bytes([_CREATE_TEMP_FLAGS])
-        + _encode_oer(1, 0, 0, b'')
-    )
+    return _CREATE_TEMP_RESPONSE_THIN(
+        {
+            'locator_length': len(locator),
+            'locator': locator,
+            'charset': AL32UTF8_CHARSET,
+            'flags': _CREATE_TEMP_FLAGS,
+        }
+    ) + _encode_oer(1, 0, 0, b'')
 
 
 def encode_lobops_ack(locator: bytes) -> bytes:
