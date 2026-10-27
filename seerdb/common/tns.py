@@ -2182,7 +2182,9 @@ _OER_TAIL: wire_schema.Schema = (
 _OER_HEAD_FROM_THIN = wire_schema.compile_decoder(_OER_HEAD, _THIN)
 _OER_TAIL_FROM_THIN = wire_schema.compile_decoder(_OER_TAIL, _THIN)
 _O7_RXH_FROM_THIN = wire_schema.compile_decoder(_O7_RXH, _THIN)
+_O7_RXH_THIN = wire_schema.compile_encoder(_O7_RXH, _THIN)
 _O7_VECTORS_FROM_THIN = wire_schema.compile_decoder(_O7_VECTORS, _THIN)
+_O7_VECTORS_THIN = wire_schema.compile_encoder(_O7_VECTORS, _THIN)
 _O7_CELL_FROM_THIN = wire_schema.compile_decoder(_O7_CELL, _THIN)
 _O7_LOB_CELL_FROM_THIN = wire_schema.compile_decoder(_O7_LOB_CELL, _THIN)
 _O7_EMPTY_CELL_FROM_THIN = wire_schema.compile_decoder(_O7_EMPTY_CELL, _THIN)
@@ -3120,15 +3122,19 @@ def encode_rows(
     """
     from seerdb.common.exceptions import InterfaceError
 
-    header = (
-        bytes([TTI_RXH, 0])  # token + (skipped) flags
-        + encode_sb4(1)  # num requests
-        + encode_sb4(0)  # iteration number
-        + encode_sb4(fetch)  # num iterations
-        + encode_sb4(0)  # buffer length
-        + encode_sb4(0)  # bit-vector length (no column compression)
-        + _bytes_with_length(b'')  # rxhrid
-    )
+    # The row header is the 9i/10g+ row header the client reads back through the
+    # `_O7_RXH` head and the `_O7_VECTORS` tail (#2361): one request, this fetch's
+    # iteration count, no buffer, and -- the vectors -- no column-compression bit
+    # vector and no rowid.
+    header = _O7_RXH_THIN(
+        {
+            'flags': 0,
+            'requests': 1,
+            'iteration': 0,
+            'iterations': fetch,
+            'buffer_length': 0,
+        }
+    ) + _O7_VECTORS_THIN({'bit_vector_length': 0, 'rowid_length': 0})
     # A bytearray, not a `bytes` accumulator: `bytes += ` reallocates and copies
     # the whole buffer each row (O(n^2) for a large single batch — a fetch-all, a
     # scrollable open, or a pipelined prefetch); a bytearray extends in place
