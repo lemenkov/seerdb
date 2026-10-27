@@ -1533,3 +1533,6 @@ _PRE10_AUTH_REPLY	_THIN	6	{}	080101010c0c415554485f534553534b4559011010343239384
 _ROWID_CELL	_THIN	6	{}	0a01740101000203a100	tests/test_server_query.py::test_encode_rowid_value_roundtrips_via_client_reader
 _ROWID_CELL	_THIN	6	{}	0a02ae8901040002218f00	tests/test_server_query.py::test_encode_rowid_value_roundtrips_via_client_reader
 _ROWID_CELL	_THIN	6	{}	0e02ae8901040002218f00	tests/test_tns_types.py::TestRowid::test_read_rowid_column
+_SYNC	_THIN	6	{}	170501011001011600010202830101c900	tests/test_sessionless.py::TestSyncPiggybackDecode::test_consumes_and_continues
+_SYNC	_THIN	6	{}	17050101100101160103036c6f770001cc00	tests/test_transaction_priority.py::test_a_reported_priority_is_recorded
+_SYNC	_THIN	6	{}	1705010110010116010404484947480001cc00	tests/test_server_session.py::test_the_login_reply_reports_the_priority

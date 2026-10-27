@@ -685,27 +685,26 @@ def recording_session_keywords(Sink: dict[int, str | None]) -> Iterator[None]:
 
 
 def _decode_sync_pairs(Rest: bytes) -> bytes:
-    # A SYNC piggyback's body after its opcode: DTYs, then keyword-value pairs
-    # (ub2 text length + dalc / ub2 binary length + dalc / ub2 keyword), then
-    # the overall flags. Each pair's text is recorded for the connection.
-    (_, Rest) = decode_ub4(Rest)  # number of DTYs (ub2)
-    Rest = Rest[1:]  # length of DTYs (ub1)
-    (NumElements, Rest) = decode_ub4(Rest)  # number of pairs (ub2)
-    Rest = Rest[1:]  # length (ub1)
+    # A SYNC piggyback's body after its opcode, read by the `_SYNC` schema -- the
+    # same one encode_sync_piggyback writes: the DTYs, then the keyword-value
+    # pairs (a text value and a binary value, either of them empty, then the
+    # keyword) and the overall flags. Each pair's text is recorded for the
+    # connection, keyword -> text (None when the pair carried none). A pair's
+    # value rides as a length-prefixed `value`, which under thin reads the same
+    # bytes as decode_dalc for every form the server sends here; the empty and
+    # null DALC markers (0x00 / 0xFF / 0xFD) fall under the `when length` guard,
+    # which never reads the value when the length is zero. The schema wants the
+    # `17 05` opcode the caller stripped, so it is put back.
+    (Fields, Rest) = _SYNC_FROM_THIN(
+        bytes((TTI_SVR_PIGGYBACK, TNS_SERVER_PIGGYBACK_SYNC)) + Rest
+    )
     Sink = _DECODE_SESSION_KEYWORDS.get()
-    for _ in range(NumElements):
-        Text = None
-        (TextLen, Rest) = decode_ub4(Rest)  # text value len (ub2)
-        if TextLen > 0:
-            (Value, Rest) = decode_dalc(Rest)
-            Text = bytes(Value).decode('utf-8', 'replace')
-        (BinLen, Rest) = decode_ub4(Rest)  # binary value len (ub2)
-        if BinLen > 0:
-            (_, Rest) = decode_dalc(Rest)
-        (Keyword, Rest) = decode_ub4(Rest)  # keyword num (ub2)
-        if Sink is not None:
-            Sink[Keyword] = Text
-    (_, Rest) = decode_ub4(Rest)  # overall flags (ub4)
+    if Sink is not None:
+        for Pair in Fields['pairs']:
+            Text = Pair.get('text')
+            Sink[Pair['keyword']] = (
+                None if Text is None else bytes(Text).decode('utf-8', 'replace')
+            )
     return Rest
 
 
@@ -2363,6 +2362,7 @@ _LOGOFF_REPLY_THIN = wire_schema.compile_encoder(_LOGOFF_REPLY, _THIN)
 _LOB_DATA_THIN = wire_schema.compile_encoder(_LOB_DATA, _THIN)
 _LOB_DATA_OCI = wire_schema.compile_encoder(_LOB_DATA, _OCI)
 _SYNC_THIN = wire_schema.compile_encoder(_SYNC, _THIN)
+_SYNC_FROM_THIN = wire_schema.compile_decoder(_SYNC, _THIN)
 _SYNC_OCI = wire_schema.compile_encoder(_SYNC, _OCI)
 _SYNC_PAIR_OCI = wire_schema.compile_encoder(_SYNC_PAIR, _OCI)
 
