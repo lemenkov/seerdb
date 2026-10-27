@@ -1516,6 +1516,28 @@ _SESSION_STATE_RESPONSE: wire_schema.Schema = (
     ('u8', 'name_byte_length'),
     ('bytes', 'name', 'name_byte_length'),
 )
+# The TTI_PRO protocol-negotiation reply (PROTOCOL.md 4.1): the server's TTC
+# version byte and a trailing zero, the NUL-terminated banner, the charset id
+# and a flags byte, the charset-element array (a count then five bytes each),
+# the FDO blob (a big-endian length then its bytes), and the two length-prefixed
+# capability arrays. Its integers are fixed-width, not the codec's variable
+# form, so every field is dialect-independent.
+_PRO: wire_schema.Schema = (
+    ('const', bytes([TTI_PRO])),
+    ('u8', 'server_version'),
+    ('pad', 1),
+    ('cstr', 'banner'),
+    ('le2', 'charset_id'),
+    ('u8', 'server_flags'),
+    ('le2', 'charset_count'),
+    ('each', 'charset_elements', 'charset_count', (('bytes', 'element', 5),)),
+    ('be2', 'fdo_length'),
+    ('bytes', 'fdo', 'fdo_length'),
+    ('u8', 'compile_caps_length'),
+    ('bytes', 'compile_caps', 'compile_caps_length'),
+    ('u8', 'runtime_caps_length'),
+    ('bytes', 'runtime_caps', 'runtime_caps_length'),
+)
 # TTI_FETCH: the cursor and the rows the client has room for.
 _FETCH: wire_schema.Schema = (
     ('const', bytes([TTI_FUN, TTI_FETCH])),
@@ -2438,6 +2460,7 @@ _IMPLICIT_RESULTS_THIN = wire_schema.compile_encoder(_IMPLICIT_RESULTS, _THIN)
 _SESSION_STATE_RESPONSE_THIN = wire_schema.compile_encoder(
     _SESSION_STATE_RESPONSE, _THIN
 )
+_PRO_FROM_THIN = wire_schema.compile_decoder(_PRO, _THIN)
 _SYNC_PAIR_OCI = wire_schema.compile_encoder(_SYNC_PAIR, _OCI)
 
 
@@ -6689,30 +6712,12 @@ def decode_token_pro(Data: bytes) -> dict:
     field version the server advertises is `compile_caps[CCAP_FIELD_VERSION]`;
     the connection negotiates the effective version as min(client, server).
     Layout mirrors python-oracledb's protocol.pyx (docs/PROTOCOL.md §4.1)."""
-    Off = 1  # skip the message-type byte
-    ServerVersion = Data[Off]
-    Off += 2  # version byte + a trailing zero
-    End = Data.index(0, Off)  # NUL-terminated banner
-    Banner = Data[Off:End]
-    Off = End + 1
-    Off += 2  # charset_id (ub2 LE)
-    Off += 1  # server flags
-    NumElem = int.from_bytes(Data[Off : Off + 2], 'little')
-    Off += 2 + NumElem * 5  # skip the charset-element array
-    FdoLen = int.from_bytes(Data[Off : Off + 2], 'big')
-    Off += 2 + FdoLen  # skip the FDO blob
-    CcLen = Data[Off]
-    Off += 1
-    CompileCaps = Data[Off : Off + CcLen]
-    Off += CcLen
-    RcLen = Data[Off]
-    Off += 1
-    RuntimeCaps = Data[Off : Off + RcLen]
+    (Fields, _) = _PRO_FROM_THIN(Data)
     return {
-        'server_version': ServerVersion,
-        'banner': Banner,
-        'compile_caps': CompileCaps,
-        'runtime_caps': RuntimeCaps,
+        'server_version': Fields['server_version'],
+        'banner': Fields['banner'],
+        'compile_caps': Fields['compile_caps'],
+        'runtime_caps': Fields['runtime_caps'],
     }
 
 

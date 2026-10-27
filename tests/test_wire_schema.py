@@ -528,3 +528,19 @@ def test_an_oci_oer_decodes_back_at_each_width(version: int) -> None:
     assert fields['marker'] == bytes.fromhex('20f6310a')
     if wide:
         assert (fields['ext_error_code'], fields['rowcount']) == (942, 9)
+
+
+def test_cstr_and_le2_round_trip_in_both_dialects() -> None:
+    # The two codec-independent kinds the TTI_PRO reply needs (_PRO): a
+    # NUL-terminated string and a little-endian ub2, both the same bytes
+    # whatever the dialect.
+    schema: wire_schema.Schema = (('cstr', 'banner'), ('le2', 'charset'))
+    for codec in CODECS:
+        encode = wire_schema.compile_encoder(schema, codec)
+        decode = wire_schema.compile_decoder(schema, codec)
+        wire = encode({'banner': b'x86_64/Linux', 'charset': 873})
+        assert wire == b'x86_64/Linux\x00\x69\x03'  # 873 == 0x0369, little-endian
+        assert decode(wire + b'rest') == (
+            {'banner': b'x86_64/Linux', 'charset': 873},
+            b'rest',
+        )
