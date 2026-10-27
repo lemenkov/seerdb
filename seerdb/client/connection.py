@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 
 import logging
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -1014,6 +1015,9 @@ class OracleConnect(_ConnectionLogic):
         # port name. The ssl given is kept apart, so an address's own protocol
         # can turn TLS on for it alone.
         route: Route | None = None
+        # The transport the dsn named (#1988): 'tcp'/'tcps', or the WebSocket
+        # extension 'ws'/'wss'. Only a dsn can select it.
+        protocol = 'tcp'
         self._ssl_given = ssl
         if dsn is not None and not use_wallet:
             given = ConnectArguments(
@@ -1049,11 +1053,14 @@ class OracleConnect(_ConnectionLogic):
                 route,
                 https_proxy,
                 https_proxy_port,
+                protocol,
             ) = resolve_dsn_arguments(dsn, given, config_dir).as_tuple()
         # field_version is the highest TTC field version seerdb advertises;
         # the server negotiates it down (min(client, server)). The default is the
         # 23ai max (24), reached via fast-auth (#89) — older servers settle at
         # their own version and take the legacy handshake unchanged.
+        # The transport in force (#1988); a route address can repoint it.
+        self.protocol = protocol
         self.host = host
         self.port = port
         # Proxy authentication (#126): a `proxy_user[schema]` user name means
@@ -1315,6 +1322,13 @@ class OracleConnect(_ConnectionLogic):
         # send the initial CONNECT. Shared by connect() and the TNS_REDIRECT
         # handler, which re-points host/port and re-opens against the address
         # the server handed back.
+        # The seerdb WebSocket transport (#1988): ws / wss open a byte pipe that
+        # presents as self.sock, and the TNS CONNECT rides it unchanged. TLS,
+        # when wss, is the WebSocket layer's -- not the TNS layer's.
+        if self.protocol in ('ws', 'wss'):
+            self._open_ws_transport()
+            self._send_connect()
+            return
         # Following a redirect (self._redirects > 0), retry a refused connect —
         # the dispatcher / dedicated server may still be binding its port (#399).
         Attempts = _REDIRECT_CONNECT_ATTEMPTS if getattr(self, '_redirects', 0) else 1
@@ -1362,6 +1376,29 @@ class OracleConnect(_ConnectionLogic):
                     self.sock = None
                 raise
         self._send_connect()
+
+    def _open_ws_transport(self) -> None:
+        # Open the WebSocket byte pipe (#1988) and hand it to the rest of the
+        # connection as self.sock. wss does TLS inside websockets; ws is for
+        # local testing only. The WebSocket resource path is '/' (the service
+        # is named in the TNS descriptor, as over TCP).
+        from seerdb.client._ws import connect_ws
+
+        Context = self._ws_ssl_context() if self.protocol == 'wss' else None
+        OpenTimeout = self.timeout / 1000 if self.timeout else None
+        WsSock = connect_ws(
+            self.protocol, self.host, self.port, '/', Context, OpenTimeout
+        )
+        # WsSocket presents exactly the socket surface the connection uses
+        # (send / sendall / recv / settimeout / shutdown / close); it stands in
+        # for the socket.socket the rest of the code holds.
+        self.sock = cast(socket.socket, WsSock)
+        self._apply_socket_timeout()
+
+    def _ws_ssl_context(self) -> ssl.SSLContext | None:
+        from seerdb.client._ws import ssl_context_for
+
+        return ssl_context_for(self.ssl)
 
     def _send_connect(self) -> None:
         # The CONNECT, then -- past 230 bytes -- the descriptor in a DATA packet
@@ -1429,6 +1466,9 @@ class OracleConnect(_ConnectionLogic):
                 address.https_proxy,
                 address.https_proxy_port,
             )
+        # ws / wss (#1988) do TLS at the WebSocket layer, so they leave self.ssl
+        # as given and carry the transport on self.protocol for _open_transport.
+        self.protocol = address.protocol
         if address.protocol == 'tcps':
             self.ssl = self._ssl_given or True
         else:

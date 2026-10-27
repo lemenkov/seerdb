@@ -347,8 +347,10 @@ def _address(node: Node, data: Address) -> Address:
     _refuse_unread(address, _ADDRESS_KEYS, 'ADDRESS parameter')
     found_protocol = _find_first(address, 'protocol')
     protocol = found_protocol.lower() if isinstance(found_protocol, str) else 'tcp'
-    if protocol not in ('tcp', 'tcps'):
-        raise NetConfigError(f'PROTOCOL={found_protocol} is not TCP or TCPS')
+    # ws / wss are the seerdb WebSocket transport extension (#1988), carried
+    # beside TCP / TCPS so a descriptor can name them too.
+    if protocol not in ('tcp', 'tcps', 'ws', 'wss'):
+        raise NetConfigError(f'PROTOCOL={found_protocol} is not TCP, TCPS, WS or WSS')
     host = _find_first(address, 'host')
     if not isinstance(host, str) or not host:
         raise NetConfigError('the connect descriptor names no HOST')
