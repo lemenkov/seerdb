@@ -4752,13 +4752,16 @@ _DDL_COMPRESSION = re.compile(
 # round-trips through a `WHERE ROWID = :bind` because the same expression stands
 # on both sides. It is not Oracle's key encoding, just its shape. The primary key
 # is read from an inline `col type PRIMARY KEY` or a `PRIMARY KEY (cols)`
-# constraint; a column whose type carries parentheses (NUMBER(10,2)) is not
-# matched inline, and a table with no recognised key keeps the heap ctid form.
+# constraint; the inline form allows a type whose parameters carry parentheses
+# (VARCHAR2(1000), NUMBER(10,2)) but still stops at the column's own comma, and a
+# table with no recognised key keeps the heap ctid form.
 _CREATE_TABLE_NAME = re.compile(
     r'\s*CREATE\s+(?:GLOBAL\s+TEMPORARY\s+)?TABLE\s+([\w.]+)', re.IGNORECASE
 )
 _PK_CONSTRAINT = re.compile(r'\bPRIMARY\s+KEY\s*\(([^)]+)\)', re.IGNORECASE)
-_PK_INLINE = re.compile(r'[(,]\s*(\w+)\s+[^,()]*?\bPRIMARY\s+KEY\b', re.IGNORECASE)
+_PK_INLINE = re.compile(
+    r'[(,]\s*(\w+)\s+(?:[^,()]|\([^)]*\))*?\bPRIMARY\s+KEY\b', re.IGNORECASE
+)
 _DROP_TABLE_NAME = re.compile(r'\s*DROP\s+TABLE\s+([\w.]+)', re.IGNORECASE)
 # DROP TABLE ... PURGE drops without keeping the table in the recycle bin
 # (#1207). PostgreSQL has none, so its DROP TABLE already is that.

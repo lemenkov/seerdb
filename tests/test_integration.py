@@ -1394,9 +1394,12 @@ class TypesIntegration(_IntegrationBase):
             self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', ['k' * n, i])
         self.cur.execute(f'SELECT ROWID, v FROM {self.TABLE} ORDER BY v')
         rows = self.cur.fetchall()
-        if rows[2][0].startswith('*'):
-            # Oracle's logical rowid, its key in it; the Mirror gives its own.
-            self.assertGreater(len(rows[2][0]), 1000)
+        # An index-organized table's rowid is logical: '*'-prefixed, its key in
+        # it, so a 900-character key makes a rowid past a thousand. The Mirror
+        # over PostgreSQL gave a VARCHAR2-keyed IOT a physical-style rowid, where
+        # a NUMBER-keyed one got the '*' form (#2339).
+        self.assertTrue(rows[2][0].startswith('*'))
+        self.assertGreater(len(rows[2][0]), 1000)
         for rid, v in rows:
             self.cur.execute(f'SELECT v FROM {self.TABLE} WHERE ROWID = :1', [rid])
             self.assertEqual(self.cur.fetchone(), (v,))
