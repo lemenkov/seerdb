@@ -14808,6 +14808,49 @@ def test_translate_connect_by_passes_through_unsupported_shapes() -> None:
         assert _translate_connect_by(sql) == sql
 
 
+def test_the_parsed_connect_by_rule_matches_the_regex_oracle() -> None:
+    # The shadow-compare (#1865): the live CONNECT BY rule is now the parsed
+    # transpiler (sqlparser.rewrite_connect_by via _translate_connect_by); the
+    # regex form it replaces (_translate_connect_by_regex) is kept as the oracle
+    # it is proven equivalent to. Over a corpus of realistic statements the two
+    # produce an identical WITH RECURSIVE CTE, or both pass the statement through
+    # unchanged.
+    from seerdb.server.backends.postgres import _translate_connect_by_regex
+
+    corpus = [
+        # translated
+        "SELECT id, LEVEL, SYS_CONNECT_BY_PATH(name, '/'), CONNECT_BY_ROOT name "
+        'FROM emp START WITH mgr IS NULL CONNECT BY PRIOR id = mgr',
+        'SELECT id FROM emp START WITH mgr IS NULL CONNECT BY PRIOR id = mgr',
+        'SELECT id FROM emp CONNECT BY PRIOR id = mgr',
+        'SELECT id FROM emp CONNECT BY PRIOR id = mgr START WITH mgr IS NULL',
+        'SELECT id, LEVEL FROM emp e START WITH e.mgr IS NULL '
+        'CONNECT BY PRIOR e.id = e.mgr ORDER BY LEVEL',
+        'SELECT id FROM emp CONNECT BY mgr = PRIOR id',
+        'SELECT id FROM emp WHERE sal > 100 START WITH mgr IS NULL '
+        'CONNECT BY PRIOR id = mgr',
+        'SELECT id FROM emp CONNECT BY NOCYCLE PRIOR id = mgr',
+        "SELECT SYS_CONNECT_BY_PATH(name, '->') p FROM emp "
+        'START WITH mgr IS NULL CONNECT BY PRIOR id = mgr',
+        'SELECT id FROM emp START WITH id = 1 CONNECT BY PRIOR id = mgr;',
+        # passed through unchanged
+        'SELECT id FROM emp WHERE mgr IS NULL',
+        'SELECT * FROM emp CONNECT BY PRIOR id = mgr',
+        'SELECT a.id FROM emp a, emp b CONNECT BY PRIOR a.id = a.mgr',
+        'SELECT id FROM emp CONNECT BY PRIOR id = mgr AND id > 0',
+        'SELECT id FROM emp CONNECT BY PRIOR id = mgr ORDER SIBLINGS BY id',
+        'SELECT id FROM emp CONNECT BY id = mgr',
+        'SELECT id FROM emp CONNECT BY PRIOR id = PRIOR mgr',
+        'SELECT id FROM emp CONNECT BY PRIOR id > mgr',
+        'SELECT id FROM (SELECT * FROM emp) CONNECT BY PRIOR id = mgr',
+        'SELECT id FROM s.emp CONNECT BY PRIOR id = mgr',
+        'SELECT id FROM emp CONNECT BY PRIOR id = mgr UNION SELECT id FROM dept',
+        'SELECT id FROM emp CONNECT BY PRIOR func(id) = mgr',
+    ]
+    for sql in corpus:
+        assert _translate_connect_by(sql) == _translate_connect_by_regex(sql), sql
+
+
 def test_connect_by_hierarchical_query_runs() -> None:
     # End to end through the backend: a real employee/manager tree returns its rows
     # with LEVEL, the root-to-node path, and the root value (#760).

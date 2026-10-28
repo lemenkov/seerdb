@@ -409,6 +409,7 @@ from seerdb.server.accounts import (
 from seerdb.server.backend import BlobValue, ClobValue, SessionInfo, TypeDescription
 from seerdb.server.backends.sqlparser import (
     Unsupported,
+    rewrite_connect_by,
     rewrite_outer_joins,
     rewrite_rownum,
 )
@@ -7752,7 +7753,27 @@ def _hier_colname(ref: str) -> str:
 
 def _translate_connect_by(sql: str) -> str:
     """Rewrite an Oracle CONNECT BY hierarchical query to a PostgreSQL WITH
-    RECURSIVE CTE, or return it unchanged when it is not a shape we translate."""
+    RECURSIVE CTE (#760), or return it unchanged when it is not a shape we
+    translate.
+
+    Served by the parsed transpiler (`sqlparser.rewrite_connect_by`) since
+    #1865; the regex form below (`_translate_connect_by_regex`) is retained as
+    the shadow-compare oracle (`tests/test_postgres_backend.py`). The parser
+    returns None for any shape it does not translate, in which case the
+    statement is kept unchanged -- CONNECT BY has no other translation, so a
+    decline errors on PostgreSQL exactly as before, never a regression.
+    """
+    rewritten = rewrite_connect_by(sql)
+    return sql if rewritten is None else rewritten
+
+
+def _translate_connect_by_regex(sql: str) -> str:
+    """The regex form of `_translate_connect_by`, kept as the shadow oracle.
+
+    Correct-or-passthrough: either a faithful WITH RECURSIVE for a shape it
+    fully recognises, or the query untouched. Retired once the parser owns the
+    construct outright.
+    """
     if _HAS_CONNECT_BY.search(sql) is None:
         return sql
     match = _HIER_QUERY.match(sql)

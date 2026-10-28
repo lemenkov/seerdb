@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: 2019 Peter Lemenkov <lemenkov@gmail.com>
 # SPDX-License-Identifier: MIT
 
-"""The hand-rolled SQL parser (#1865): ``(+)`` outer joins and ``ROWNUM``.
+"""The hand-rolled SQL parser (#1865): ``(+)``, ``ROWNUM`` and ``CONNECT BY``.
 
 Pure text-in / text-out, so these run in the offline suite with no database.
-The semantic proof -- that the lowered ANSI joins return the rows Oracle's
-``(+)`` would -- is a live Mirror-over-PG test in ``test_postgres_backend.py``,
-which also shadow-compares the ``ROWNUM`` rule against the regex form it
-replaces.
+The semantic proof -- that the lowered ANSI joins / CTEs return the rows Oracle
+would -- is in live Mirror-over-PG tests in ``test_postgres_backend.py``, which
+also shadow-compares the ``ROWNUM`` and ``CONNECT BY`` rules against the regex
+forms they replace.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import pytest
 
 from seerdb.server.backends.sqlparser import (
     Unsupported,
+    rewrite_connect_by,
     rewrite_outer_joins,
     rewrite_rownum,
 )
@@ -237,3 +238,88 @@ def test_rownum_leaves_a_statement_with_nothing_to_do(sql: str) -> None:
 def test_rownum_without_a_faithful_limit_is_unsupported(sql: str) -> None:
     with pytest.raises(Unsupported):
         rewrite_rownum(sql)
+
+
+# --- CONNECT BY -> WITH RECURSIVE ---------------------------------------------
+
+
+def test_a_bare_connect_by_becomes_a_recursive_cte() -> None:
+    # START WITH is the anchor filter (none here), CONNECT BY PRIOR the recursive
+    # join; the alias defaults to the table name. The table's own columns come
+    # through `alias.*` and __level is the depth.
+    assert rewrite_connect_by('SELECT id FROM emp CONNECT BY PRIOR id = mgr') == (
+        'WITH RECURSIVE __hcte AS ('
+        'SELECT emp.*, 1 AS __level FROM emp emp'
+        ' UNION ALL '
+        'SELECT emp.*, __p.__level + 1 FROM emp emp JOIN __hcte __p ON __p.id = emp.mgr'
+        ') SELECT id FROM __hcte emp'
+    )
+
+
+def test_start_with_level_and_order_lower_together() -> None:
+    # START WITH -> the anchor WHERE, LEVEL -> __level in both the projection and
+    # the ORDER BY, and the alias is carried through.
+    assert rewrite_connect_by(
+        'SELECT id, LEVEL FROM emp e START WITH e.mgr IS NULL '
+        'CONNECT BY PRIOR e.id = e.mgr ORDER BY LEVEL'
+    ) == (
+        'WITH RECURSIVE __hcte AS ('
+        'SELECT e.*, 1 AS __level FROM emp e WHERE e.mgr IS NULL'
+        ' UNION ALL '
+        'SELECT e.*, __p.__level + 1 FROM emp e JOIN __hcte __p ON __p.id = e.mgr'
+        ') SELECT id, __level FROM __hcte e ORDER BY __level'
+    )
+
+
+def test_path_and_root_become_computed_columns() -> None:
+    out = rewrite_connect_by(
+        "SELECT id, SYS_CONNECT_BY_PATH(name, '/'), CONNECT_BY_ROOT name "
+        'FROM emp START WITH mgr IS NULL CONNECT BY PRIOR id = mgr'
+    )
+    assert out is not None and out.startswith('WITH RECURSIVE __hcte AS (')
+    assert "'/' || emp.name AS __path" in out  # anchor path
+    assert "__p.__path || '/' || emp.name" in out  # recursive step
+    assert 'emp.name AS __root' in out and '__p.__root' in out
+    assert 'SELECT id, __path, __root FROM __hcte' in out  # projection rewritten
+
+
+def test_connect_by_with_prior_on_the_right_still_lowers() -> None:
+    out = rewrite_connect_by('SELECT id FROM emp CONNECT BY mgr = PRIOR id')
+    assert out is not None and '__p.id = emp.mgr' in out
+
+
+@pytest.mark.parametrize(
+    'sql',
+    [
+        'SELECT id FROM emp WHERE mgr IS NULL',  # no CONNECT BY
+        'SELECT * FROM emp CONNECT BY PRIOR id = mgr',  # SELECT *
+        'SELECT a.id FROM emp a, emp b CONNECT BY PRIOR a.id = a.mgr',  # multi-table
+        'SELECT id FROM emp CONNECT BY PRIOR id = mgr AND id > 0',  # compound
+        'SELECT id FROM emp CONNECT BY PRIOR id = mgr ORDER SIBLINGS BY id',  # siblings
+        'SELECT id FROM emp CONNECT BY id = mgr',  # no PRIOR
+        'SELECT id FROM emp CONNECT BY PRIOR id = PRIOR mgr',  # PRIOR both sides
+        'SELECT id FROM emp CONNECT BY PRIOR id > mgr',  # non-equality
+        'SELECT id FROM emp CONNECT BY PRIOR func(id) = mgr',  # non-column operand
+        'SELECT id FROM (SELECT * FROM emp) CONNECT BY PRIOR id = mgr',  # sub-query FROM
+        'SELECT id FROM s.emp CONNECT BY PRIOR id = mgr',  # schema-qualified table
+        'SELECT id FROM emp GROUP BY id CONNECT BY PRIOR id = mgr',  # GROUP BY
+        'SELECT id FROM emp CONNECT BY PRIOR id = mgr UNION SELECT 1 FROM dual',  # set op
+    ],
+)
+def test_connect_by_declines_outside_the_supported_subset(sql: str) -> None:
+    assert rewrite_connect_by(sql) is None
+
+
+@pytest.mark.parametrize(
+    'sql',
+    [
+        # A clause keyword inside a string literal: the non-greedy mega-regex the
+        # parser replaces matched the ` CONNECT BY ` / ` FROM ` inside the string
+        # and either misparsed or passed through; the tokeniser sees one string.
+        "SELECT id FROM emp START WITH name = ' CONNECT BY ' CONNECT BY PRIOR id = mgr",
+        "SELECT ' FROM x ' AS c, id FROM emp CONNECT BY PRIOR id = mgr",
+    ],
+)
+def test_a_clause_keyword_inside_a_string_does_not_fool_the_parser(sql: str) -> None:
+    out = rewrite_connect_by(sql)
+    assert out is not None and out.startswith('WITH RECURSIVE __hcte AS (')

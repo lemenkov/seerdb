@@ -16,7 +16,7 @@ It is a front end (a recursive-descent parse over the shared
 :func:`seerdb.common.sqltext` tokenizer), an Oracle-leaning tree, and a
 PostgreSQL emitter — a classic transpiler shape, so each new construct is a
 node and a lowering rather than another text pass that must coexist with all
-the others. Two constructs live here so far:
+the others. Three constructs live here so far:
 
 * :func:`rewrite_outer_joins` — the ``(+)`` outer-join operator, lowered to
   ANSI ``LEFT JOIN``. ``(+)`` has no regex translation (a legacy-outer-join
@@ -25,8 +25,12 @@ the others. Two constructs live here so far:
   This one *replaces* a mature regex rule (``_rewrite_rownum`` in
   ``postgres.py``), and the design's shadow-compare proves the two agree before
   the parsed rule goes live.
+* :func:`rewrite_connect_by` — an Oracle ``CONNECT BY`` hierarchical query,
+  lowered to a ``WITH RECURSIVE`` CTE. Also replaces a regex rule
+  (``_translate_connect_by``), proven by the same shadow-compare; the tokeniser
+  replaces a non-greedy mega-regex that could not see parenthesis depth.
 
-Both are deliberately conservative. A statement outside the supported subset is
+They are deliberately conservative. A statement outside the supported subset is
 *cleanly declined* (``None``), so the caller keeps it unchanged. ``ROWNUM``
 additionally has shapes the parser recognises but cannot lower to a single
 faithful ``LIMIT`` (Oracle numbers rows before a sort, grouping or aggregate);
@@ -648,3 +652,219 @@ def rewrite_rownum(sql: str) -> str | None:
     head = sql[: toks[where_at].start].rstrip()
     body = f'{head} WHERE {" AND ".join(rest)}' if rest else head
     return f'{body} LIMIT {limit}'
+
+
+# --- CONNECT BY -> WITH RECURSIVE (#760) --------------------------------------
+#
+# Oracle's hierarchical query, the third construct and the one a tokeniser most
+# improves. The regex rule it replaces parses the whole statement with a single
+# non-greedy pattern that has no parenthesis-depth awareness, so a sub-query or a
+# string literal holding a clause keyword (FROM, WHERE, ORDER BY, ...) throws it
+# off. Here the clause boundaries, the single table and the PRIOR equality are
+# found over the tokeniser at depth zero; the projection / WHERE / ORDER text and
+# the LEVEL / SYS_CONNECT_BY_PATH / CONNECT_BY_ROOT rewrites are reused verbatim,
+# so the emitted CTE is byte-for-byte the regex form's for every shape both
+# accept. The leaf regexes and the emit are a transitional copy of the backend's
+# `_translate_connect_by_regex`, the shadow-compare oracle; they retire with it.
+
+_HAS_CONNECT_BY = re.compile(r'\bCONNECT\s+BY\b', re.IGNORECASE)
+_HIER_CB_COND = re.compile(
+    r'^\s*(?:NOCYCLE\s+)?(?P<l>.+?)\s*=\s*(?P<r>.+?)\s*$', re.IGNORECASE
+)
+_HIER_PRIOR = re.compile(r'^\s*PRIOR\s+(?P<col>.+?)\s*$', re.IGNORECASE)
+_HIER_SIMPLE_COL = re.compile(r'^[A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)?$')
+_HIER_STAR = re.compile(r'(^|,)\s*(\w+\s*\.\s*)?\*\s*(,|$)')
+_HIER_LEVEL = re.compile(r'\bLEVEL\b', re.IGNORECASE)
+_HIER_PATH = re.compile(
+    r"\bSYS_CONNECT_BY_PATH\s*\(\s*(?P<col>[\w.]+)\s*,\s*'(?P<sep>[^']*)'\s*\)",
+    re.IGNORECASE,
+)
+_HIER_ROOT = re.compile(r'\bCONNECT_BY_ROOT\s+(?P<col>[\w.]+)', re.IGNORECASE)
+_HIER_COMPOUND = re.compile(r'\b(AND|OR)\b', re.IGNORECASE)
+# Depth-zero clauses that put the statement outside the hierarchical shape the
+# regex rule matched; their presence declines (the statement is kept unchanged).
+_HIER_DECLINE = frozenset(
+    {'GROUP', 'HAVING', 'UNION', 'INTERSECT', 'MINUS', 'EXCEPT', 'FOR', 'MODEL',
+     'FETCH', 'OFFSET'}
+)  # fmt: skip
+# The depth-zero clause keyword orders the regex rule accepts: FROM, an optional
+# WHERE, then CONNECT BY with an optional START WITH on either side, then an
+# optional ORDER BY. SELECT always leads (checked separately).
+_HIER_ORDERS = frozenset(
+    ('FROM',) + (('WHERE',) if w else ()) + h + (('ORDER',) if o else ())
+    for h in (('CONNECT',), ('START', 'CONNECT'), ('CONNECT', 'START'))
+    for w in (False, True)
+    for o in (False, True)
+)
+
+
+def _hier_colname(ref: str) -> str:
+    return ref.split('.')[-1].strip()
+
+
+def rewrite_connect_by(sql: str) -> str | None:
+    """Lower an Oracle ``CONNECT BY`` hierarchical query to a PostgreSQL
+    ``WITH RECURSIVE`` CTE (#760), or return ``None`` for any shape outside the
+    supported subset. ``CONNECT BY`` has no other translation, so a decline
+    keeps the statement, which then errors on PostgreSQL exactly as before --
+    never a wrong-but-successful result.
+
+    Supported: a single top-level ``SELECT`` over one table, with ``START WITH``
+    (the anchor filter), ``CONNECT BY PRIOR <col> = <col>`` (the recursive join,
+    ``PRIOR`` on exactly one side, ``NOCYCLE`` tolerated), and ``LEVEL`` / one
+    distinct ``SYS_CONNECT_BY_PATH(col,'sep')`` / one distinct
+    ``CONNECT_BY_ROOT col`` as the CTE's computed columns. Declined: multiple
+    tables, ``SELECT *``, a compound or non-equality ``CONNECT BY``,
+    ``ORDER SIBLINGS BY``, more than one distinct path/root, or any other
+    top-level clause.
+    """
+    if _HAS_CONNECT_BY.search(sql) is None:
+        return None
+    toks = _tokenize(sql)
+    if not toks or toks[0].word != 'SELECT':
+        return None
+    end = len(toks) - 1 if toks[-1].text == ';' else len(toks)
+    from_at = where_at = start_at = cb_at = order_at = -1
+    siblings = False
+    depth = 0
+    for i in range(end):
+        t = toks[i]
+        if t.text == '(':
+            depth += 1
+        elif t.text == ')':
+            depth -= 1
+        elif depth == 0 and t.kind == 'word':
+            w = t.word
+            nxt = toks[i + 1].word if i + 1 < end else ''
+            if w == 'FROM':
+                if from_at >= 0:
+                    return None  # a second FROM: a set operation or sub-select
+                from_at = i
+            elif w == 'WHERE':
+                if where_at >= 0:
+                    return None
+                where_at = i
+            elif w == 'START':
+                if nxt != 'WITH' or start_at >= 0:
+                    return None
+                start_at = i
+            elif w == 'CONNECT':
+                if nxt != 'BY' or cb_at >= 0:
+                    return None
+                cb_at = i
+            elif w == 'ORDER':
+                if order_at >= 0 or nxt not in ('BY', 'SIBLINGS'):
+                    return None
+                order_at = i
+                siblings = nxt == 'SIBLINGS'
+            elif w in _HIER_DECLINE:
+                return None
+    if siblings:
+        return None
+    present = sorted(
+        (p, name)
+        for p, name in (
+            (from_at, 'FROM'),
+            (where_at, 'WHERE'),
+            (start_at, 'START'),
+            (cb_at, 'CONNECT'),
+            (order_at, 'ORDER'),
+        )
+        if p >= 0
+    )
+    if tuple(name for _, name in present) not in _HIER_ORDERS:
+        return None
+    bounds = [p for p, _ in present]
+
+    def value_span(kw_start: int, kw_len: int) -> tuple[int, int]:
+        start = kw_start + kw_len
+        stop = end
+        for b in bounds:
+            if b > kw_start:
+                stop = b
+                break
+        return start, stop
+
+    def clause(kw_start: int, kw_len: int) -> str:
+        start, stop = value_span(kw_start, kw_len)
+        return (
+            sql[toks[start].start : toks[stop - 1].end].strip() if start < stop else ''
+        )
+
+    # The single table, bare identifiers only (the regex's `_HIER_SINGLE_TABLE`):
+    # no schema qualifier, quoting, join or sub-query.
+    fvs, fve = value_span(from_at, 1)
+    from_toks = toks[fvs:fve]
+    if not 1 <= len(from_toks) <= 2 or any(ft.kind != 'word' for ft in from_toks):
+        return None
+    table = from_toks[0].text
+    alias = from_toks[1].text if len(from_toks) == 2 else table
+
+    proj = clause(0, 1)
+    connect_by = clause(cb_at, 2)
+    where = clause(where_at, 1) if where_at >= 0 else ''
+    start_with = clause(start_at, 2) if start_at >= 0 else ''
+    order = clause(order_at, 2) if order_at >= 0 else ''
+
+    if _HIER_COMPOUND.search(connect_by):  # a compound CONNECT BY is not modelled
+        return None
+    cond = _HIER_CB_COND.match(connect_by)
+    if cond is None:
+        return None
+    left, right = cond.group('l').strip(), cond.group('r').strip()
+    left_prior, right_prior = _HIER_PRIOR.match(left), _HIER_PRIOR.match(right)
+    if left_prior is not None and right_prior is None:  # PRIOR on exactly one side
+        prior_side, child_side = left_prior.group('col'), right
+    elif right_prior is not None and left_prior is None:
+        prior_side, child_side = right_prior.group('col'), left
+    else:
+        return None
+    if not (_HIER_SIMPLE_COL.match(prior_side) and _HIER_SIMPLE_COL.match(child_side)):
+        return None  # both operands must be plain column references
+    parent_col, child_col = _hier_colname(prior_side), _hier_colname(child_side)
+
+    if _HIER_STAR.search(proj):  # SELECT * would leak the CTE's computed columns
+        return None
+
+    scan = ' '.join(part for part in (proj, where, order) if part)
+    paths = {(col.lower(), sep) for col, sep in _HIER_PATH.findall(scan)}
+    roots = {col.lower() for col in _HIER_ROOT.findall(scan)}
+    if len(paths) > 1 or len(roots) > 1:  # one distinct path / root handled
+        return None
+
+    def rewrite(text: str) -> str:
+        text = _HIER_LEVEL.sub('__level', text)
+        text = _HIER_PATH.sub('__path', text)
+        return _HIER_ROOT.sub('__root', text)
+
+    anchor_cols = ['1 AS __level']
+    rec_cols = ['__p.__level + 1']
+    if paths:
+        path_match = _HIER_PATH.search(scan)
+        assert path_match is not None
+        pcol, sep = _hier_colname(path_match.group('col')), path_match.group('sep')
+        anchor_cols.append(f"'{sep}' || {alias}.{pcol} AS __path")
+        rec_cols.append(f"__p.__path || '{sep}' || {alias}.{pcol}")
+    if roots:
+        root_match = _HIER_ROOT.search(scan)
+        assert root_match is not None
+        anchor_cols.append(
+            f'{alias}.{_hier_colname(root_match.group("col"))} AS __root'
+        )
+        rec_cols.append('__p.__root')
+
+    anchor_where = f' WHERE {start_with.strip()}' if start_with else ''
+    join = f'__p.{parent_col} = {alias}.{child_col}'
+    outer_where = f' WHERE {rewrite(where).strip()}' if where else ''
+    outer_order = f' ORDER BY {rewrite(order).strip()}' if order else ''
+    return (
+        'WITH RECURSIVE __hcte AS ('
+        f'SELECT {alias}.*, '
+        + ', '.join(anchor_cols)
+        + f' FROM {table} {alias}{anchor_where}'
+        ' UNION ALL '
+        f'SELECT {alias}.*, '
+        + ', '.join(rec_cols)
+        + f' FROM {table} {alias} JOIN __hcte __p ON {join}'
+        f') SELECT {rewrite(proj)} FROM __hcte {alias}{outer_where}{outer_order}'
+    )
