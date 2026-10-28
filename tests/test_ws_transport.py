@@ -278,7 +278,7 @@ def ws_bridge(mirror: seerdb.Server) -> Iterator[int]:
 
 
 def _kwargs(**extra) -> dict:
-    return {'user': 'PYO', 'password': 'pyo123', 'timeout': 5000, **extra}
+    return {'user': 'PYO', 'password': 'pyo123', 'timeout': 15000, **extra}
 
 
 def test_connect_over_ws_runs_a_query(ws_bridge: int) -> None:

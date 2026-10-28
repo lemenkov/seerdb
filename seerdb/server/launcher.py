@@ -20,6 +20,8 @@ the defaults; the command line wins. The config file is INI::
     ; tls_cert = server.pem     ; TCPS: the server's certificate chain
     ; tls_key = server.key      ;       and its private key
     ; tls_ca = clients-ca.pem   ;       require client certificates from this CA
+    ; ws_port = 1522            ; also serve the seerdb WebSocket transport here
+    ; ws_origins = https://app.example  ; browser Origins it admits (comma list)
     ; profile = profile.json    ; record per-statement statistics (SIGUSR1 writes)
 
     [clients]                   ; the Oracle logins the Mirror accepts
@@ -50,6 +52,7 @@ import os
 import signal
 import ssl
 import sys
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, cast
@@ -149,6 +152,10 @@ class Launch:
     # How many connections are served at once (GHSA-5827-wqfh-x2v3), None
     # for no limit.
     max_sessions: int | None = None
+    # The seerdb WebSocket listener (#1988/#1989): a port beside the TCP one,
+    # None for none, and the browser Origin allow-list (None admits any).
+    ws_port: int | None = None
+    ws_origins: list[str] | None = None
     # Failed logins in a row that lock a name (GHSA-742q-fjfr-w5x3); 0 never.
     failed_login_attempts: int = 10
     # A deprecated option or key the command line or the config file gave
@@ -200,6 +207,21 @@ def _parser() -> argparse.ArgumentParser:
         '--max-sessions',
         type=int,
         help='serve at most this many connections at once (default: no limit)',
+    )
+    parser.add_argument(
+        '--ws-port',
+        type=int,
+        help='also serve the seerdb WebSocket transport (#1988) on this port, '
+        'beside the TCP/TCPS listener; wss when --tls-cert is given, else ws '
+        '(a seerdb extension; no Oracle client speaks it)',
+    )
+    parser.add_argument(
+        '--ws-origin',
+        action='append',
+        metavar='ORIGIN',
+        help='a browser Origin the WebSocket listener admits (repeatable); '
+        'without any, every origin may connect (not recommended -- a '
+        'browser-facing endpoint still needs the security review, milestone 52)',
     )
     parser.add_argument(
         '--failed-login-attempts',
@@ -362,6 +384,17 @@ def build(
     )
     if attempts < 0:
         raise SystemExit('failed_login_attempts must be 0 or more')
+    # The WebSocket listener (#1988/#1989): a port beside the TCP one, and a
+    # browser Origin allow-list (--ws-origin, or a comma-separated ws_origins).
+    ws = option(args.ws_port, server, 'ws_port', '')
+    ws_port = int(ws) if ws else None
+    if ws_port is not None and not 0 <= ws_port <= 65535:
+        raise SystemExit('ws_port must be a port number')
+    if args.ws_origin:
+        ws_origins: list[str] | None = list(args.ws_origin)
+    else:
+        raw = option(None, server, 'ws_origins', '')
+        ws_origins = [o.strip() for o in raw.split(',') if o.strip()] or None
 
     kind = args.command or str(backend.get('type', '')).strip().lower()
     if kind == 'observe':
@@ -434,6 +467,8 @@ def build(
             ssl_context=ssl_context,
             profile=profile,
             max_sessions=max_sessions,
+            ws_port=ws_port,
+            ws_origins=ws_origins,
             failed_login_attempts=attempts,
             warnings=warnings,
         )
@@ -491,6 +526,8 @@ def build(
         ssl_context=ssl_context,
         profile=profile,
         max_sessions=max_sessions,
+        ws_port=ws_port,
+        ws_origins=ws_origins,
         failed_login_attempts=attempts,
         warnings=warnings,
     )
@@ -546,6 +583,22 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile = None
     if launch.profile is not None:
         backend_factory, profile = _profiled(launch, backend_factory)
+    # The seerdb WebSocket listener (#1989) runs beside the TCP/TCPS one, on its
+    # own thread, sharing the backend, TLS (wss when a cert is set) and limits.
+    ws_server = None
+    if launch.ws_port is not None:
+        from seerdb.server.ws_service import WsServer
+
+        ws_server = WsServer(
+            launch.host,
+            launch.ws_port,
+            backend_factory=backend_factory,
+            encryption=launch.encryption,
+            ssl_context=launch.ssl_context,
+            max_sessions=launch.max_sessions,
+            allowed_origins=launch.ws_origins,
+        )
+        threading.Thread(target=ws_server.serve_forever, daemon=True).start()
     try:
         serve(
             launch.host,
@@ -556,6 +609,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_sessions=launch.max_sessions,
         )
     finally:
+        if ws_server is not None:
+            ws_server.close()
         if profile is not None:
             profile.dump()
 

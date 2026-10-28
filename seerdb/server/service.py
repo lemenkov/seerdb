@@ -32,6 +32,43 @@ BackendFactory = Callable[[], Backend]
 
 _BACKLOG = 16
 
+
+def _serve_session_on(
+    client: socket.socket,
+    addr: tuple,
+    *,
+    backend_factory: BackendFactory,
+    encryption: str,
+    field_version: int,
+    tns_version: int | None,
+) -> None:
+    """Open a backend, run one framed TNS session on ``client``, and clean up.
+
+    Shared by the TCP/TCPS listener (:class:`Server`) and the WebSocket listener
+    (:class:`seerdb.server.ws_service.WsServer`); ``client`` is a connected
+    stream socket, or anything with the same send/recv surface (a WsSocket)."""
+    backend = None
+    try:
+        backend = backend_factory()
+        user = serve_session(
+            PacketStream(client),
+            backend,
+            encryption=encryption,
+            field_version=field_version,
+            tns_version=tns_version,
+        )
+        logger.info('%s:%s session ended (%s)', addr[0], addr[1], user)
+    except Exception:
+        logger.exception('session error from %s:%s', addr[0], addr[1])
+    finally:
+        if backend is not None:
+            try:
+                backend.close()
+            except Exception:
+                logger.debug('backend close failed', exc_info=True)
+        client.close()
+
+
 # How long a client has to finish the TLS handshake (#1834). The handshake runs
 # on the session's thread, so a peer that connects and says nothing holds only
 # that thread, and only this long.
@@ -136,26 +173,14 @@ class Server:
                 )
                 client.close()
                 return
-        backend = None
-        try:
-            backend = self._backend_factory()
-            user = serve_session(
-                PacketStream(client),
-                backend,
-                encryption=self._encryption,
-                field_version=self._field_version,
-                tns_version=self._tns_version,
-            )
-            logger.info('%s:%d session ended (%s)', addr[0], addr[1], user)
-        except Exception:
-            logger.exception('session error from %s:%d', addr[0], addr[1])
-        finally:
-            if backend is not None:
-                try:
-                    backend.close()
-                except Exception:
-                    logger.debug('backend close failed', exc_info=True)
-            client.close()
+        _serve_session_on(
+            client,
+            addr,
+            backend_factory=self._backend_factory,
+            encryption=self._encryption,
+            field_version=self._field_version,
+            tns_version=self._tns_version,
+        )
 
     def close(self) -> None:
         """Stop accepting and release the listening socket."""
