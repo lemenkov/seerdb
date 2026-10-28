@@ -73,6 +73,7 @@ from seerdb.server.handshake import (
 from seerdb.server.listener import Listener
 from seerdb.server.service import BackendFactory, Server, serve
 from seerdb.server.session import handle_login, serve_session
+from seerdb.server.ws_query import serve_query_session
 from seerdb.server.ws_service import WsServer, serve_ws
 
 __all__ = [
@@ -117,5 +118,6 @@ __all__ = [
     'parse_fetch',
     'serve',
     'serve_session',
+    'serve_query_session',
     'serve_ws',
 ]
