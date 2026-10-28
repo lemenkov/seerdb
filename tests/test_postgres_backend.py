@@ -12774,6 +12774,69 @@ def test_rownum_becomes_limit_only_where_it_means_limit() -> None:
             _rewrite_rownum(sql)
 
 
+def test_the_parsed_rownum_rule_matches_the_regex_oracle() -> None:
+    # The shadow-compare (#1865): the live ROWNUM rule is now the parsed
+    # transpiler (sqlparser.rewrite_rownum via _rewrite_rownum); the regex form
+    # it replaces (_rewrite_rownum_regex) is kept as the oracle it is proven
+    # equivalent to. Over a corpus of realistic statements the two agree -- same
+    # translation or the same by-name refusal -- modulo whitespace: where ROWNUM
+    # sits between two other conjuncts the regex leaves a double space the parser
+    # tidies, which PostgreSQL ignores.
+    from seerdb.server.backends.postgres import (
+        UnsupportedFeature,
+        _rewrite_rownum,
+        _rewrite_rownum_regex,
+    )
+
+    def outcome(rule: Callable[[str], str], sql: str) -> tuple[str, ...]:
+        try:
+            return ('ok', ' '.join(rule(sql).split()))
+        except UnsupportedFeature:
+            return ('refuse',)
+
+    corpus = [
+        # translated
+        'SELECT id FROM t WHERE rownum <= 1',
+        'SELECT id FROM t WHERE rownum < 3 AND a = 1',
+        'select c from t where c is not null and rownum <= 1',
+        'SELECT id FROM t WHERE rownum = 1',
+        'SELECT id FROM t WHERE rownum = 2',
+        'SELECT id FROM t WHERE rownum <= :1',
+        'SELECT id FROM t WHERE rownum < :n',
+        'SELECT id FROM t WHERE rownum = :n',
+        'SELECT * FROM (SELECT id FROM t ORDER BY id) WHERE rownum <= 3',
+        'SELECT id FROM t WHERE x BETWEEN 1 AND 5 AND rownum <= 3',
+        'SELECT id FROM t WHERE a = 1 AND rownum <= 2 AND b = 2',
+        'SELECT a, b FROM t WHERE a = 1 AND b = 2 AND rownum < 10',
+        'SELECT * FROM emp e, dept d WHERE e.deptno = d.deptno AND rownum <= 5',
+        "SELECT x FROM t WHERE name = 'a and b' AND rownum <= 1",
+        'SELECT x FROM t WHERE rownum<=1',
+        # left unchanged
+        "SELECT 'rownum' FROM dual",
+        'SELECT id FROM t WHERE a = 1',
+        'SELECT sysdate FROM dual',
+        # refused by name
+        'SELECT id FROM t WHERE rownum <= 1 ORDER BY id',
+        'SELECT count(*) FROM t WHERE rownum <= 5',
+        'SELECT DISTINCT a FROM t WHERE rownum <= 5',
+        'SELECT id FROM t WHERE a = 1 OR rownum <= 1',
+        'SELECT id FROM t WHERE rownum <= 1 FOR UPDATE',
+        'SELECT id, rownum FROM t',
+        'SELECT id FROM t WHERE rownum > 1',
+        'SELECT id FROM t WHERE rownum <= 1 AND rownum <= 2',
+        'SELECT * FROM (SELECT id FROM t WHERE rownum <= 3) x',
+        'SELECT * FROM (SELECT id FROM t WHERE rownum <= 3) x WHERE y > 1',
+        'SELECT id FROM t WHERE rownum BETWEEN 1 AND 5',
+        'SELECT id FROM t GROUP BY id HAVING rownum <= 1',
+        'SELECT id FROM t WHERE rownum <= 1 UNION SELECT id FROM u',
+        'SELECT max(x) OVER () FROM t WHERE rownum <= 1',
+        'SELECT id FROM t WHERE rownum <= f(x)',
+        'UPDATE t SET x = 1 WHERE rownum <= 1',
+    ]
+    for sql in corpus:
+        assert outcome(_rewrite_rownum, sql) == outcome(_rewrite_rownum_regex, sql), sql
+
+
 def test_a_collection_column_fetches_as_a_collection() -> None:
     # PostgreSQL describes a domain column by its base type; traced back to its
     # table, an array-domain column is the collection type, and its value a

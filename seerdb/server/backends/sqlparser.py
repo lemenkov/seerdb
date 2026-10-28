@@ -12,18 +12,26 @@ grow a real parser beside the regex passes and migrate construct by construct,
 each gated by the conformance suite; a library (``sqlglot``) was evaluated and
 rejected because it silently corrupts exactly these constructs.
 
-This module is the first proof of that shape, end to end for one construct: the
-``(+)`` outer-join operator, lowered to ANSI ``LEFT JOIN``. It is a front end
-(a recursive-descent parse over the shared :func:`seerdb.common.sqltext`
-tokenizer), an Oracle-leaning tree, and a PostgreSQL emitter — a classic
-transpiler shape, so the next construct is a node and a lowering rather than
-another text pass that must coexist with all the others.
+It is a front end (a recursive-descent parse over the shared
+:func:`seerdb.common.sqltext` tokenizer), an Oracle-leaning tree, and a
+PostgreSQL emitter — a classic transpiler shape, so each new construct is a
+node and a lowering rather than another text pass that must coexist with all
+the others. Two constructs live here so far:
 
-It is deliberately conservative: it handles the common, well-formed ``(+)``
-shapes and *cleanly declines* everything else (returning ``None``), so the
-caller falls back to the existing path. ``(+)`` has no regex translation today —
-a legacy-outer-join query reaches PostgreSQL verbatim and errors — so declining
-is never a regression, and a successful rewrite is new capability.
+* :func:`rewrite_outer_joins` — the ``(+)`` outer-join operator, lowered to
+  ANSI ``LEFT JOIN``. ``(+)`` has no regex translation (a legacy-outer-join
+  query reaches PostgreSQL verbatim and errors), so this was net-new capability.
+* :func:`rewrite_rownum` — a top-level ``ROWNUM`` filter, lowered to ``LIMIT``.
+  This one *replaces* a mature regex rule (``_rewrite_rownum`` in
+  ``postgres.py``), and the design's shadow-compare proves the two agree before
+  the parsed rule goes live.
+
+Both are deliberately conservative. A statement outside the supported subset is
+*cleanly declined* (``None``), so the caller keeps it unchanged. ``ROWNUM``
+additionally has shapes the parser recognises but cannot lower to a single
+faithful ``LIMIT`` (Oracle numbers rows before a sort, grouping or aggregate);
+those raise :class:`Unsupported`, which the backend turns into a by-name refusal
+rather than letting an untranslatable ``ROWNUM`` reach PostgreSQL.
 """
 
 from __future__ import annotations
@@ -477,3 +485,166 @@ def rewrite_outer_joins(sql: str) -> str | None:
         return _emit(parsed)
     except _Decline:
         return None
+
+
+# --- ROWNUM as a top-level LIMIT filter (#1271) -------------------------------
+#
+# The second construct. Unlike `(+)`, a top-level `ROWNUM <= n` filter already
+# has a faithful regex translation in the backend; this is the parsed form the
+# design's shadow-compare proves equivalent to it before it goes live.
+
+
+class Unsupported(Exception):
+    """A statement the parser owns but cannot faithfully lower.
+
+    Distinct from :class:`_Decline` (outside the subset → return ``None``, keep
+    the statement): this is a ``ROWNUM`` with no single ``LIMIT`` that keeps the
+    same rows. The backend turns it into an ``UnsupportedFeature`` so the
+    statement is refused by name rather than reaching PostgreSQL with a ``ROWNUM``
+    column PostgreSQL does not have.
+    """
+
+
+# A fast pre-check and the word scan both need ROWNUM as a whole word.
+_ROWNUM_WORD = re.compile(r'\bROWNUM\b', re.IGNORECASE)
+# The one leaf predicate ROWNUM lowers: `ROWNUM <op> n`, n an integer literal or
+# a bind. Matched against a whole WHERE conjunct (hence `fullmatch`), so a
+# conjunct that is anything more -- `ROWNUM > 1`, `ROWNUM <= f(x)`, `ROWNUM
+# BETWEEN ...` -- does not match and the statement is refused.
+_ROWNUM_PREDICATE = re.compile(r'ROWNUM\s*(<=|<|=)\s*(\d+|:\w+)', re.IGNORECASE)
+# Top-level clauses under which Oracle's ROWNUM (assigned before the clause runs)
+# and SQL's LIMIT (applied after) part ways, plus OR (which could bind the filter
+# to one branch). Any of these at depth zero refuses the LIMIT rewrite.
+_ROWNUM_BLOCKERS = frozenset(
+    {'ORDER', 'GROUP', 'HAVING', 'UNION', 'INTERSECT', 'MINUS', 'EXCEPT',
+     'CONNECT', 'START', 'FOR', 'OR', 'FETCH', 'OFFSET', 'LIMIT', 'MODEL'}
+)  # fmt: skip
+# Aggregate and analytic functions: ROWNUM numbers the detail rows before they
+# are aggregated, so a LIMIT applied to the aggregate keeps a different set.
+_ROWNUM_AGGREGATES = frozenset(
+    {'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'LISTAGG', 'STDDEV', 'VARIANCE',
+     'MEDIAN', 'COLLECT', 'XMLAGG', 'JSON_ARRAYAGG', 'JSON_OBJECTAGG',
+     'ARRAY_AGG', 'STRING_AGG', 'CORR', 'COVAR_POP', 'COVAR_SAMP',
+     'RANK', 'DENSE_RANK', 'CUME_DIST', 'PERCENT_RANK'}
+)  # fmt: skip
+_ROWNUM_AGGREGATE_PREFIXES = ('REGR_', 'PERCENTILE_')
+
+
+def _rownum_limit(op: str, bound: str) -> str:
+    # The LIMIT keeping the same rows as `ROWNUM <op> bound`. `<= n` is n rows;
+    # `< n` is n - 1, never below zero; `= 1` is one row and `= k` for k > 1 is
+    # none (Oracle assigns ROWNUM = 1 to the first row it would return, so no row
+    # ever has ROWNUM = 2 without a row before it). A bound that is a bind keeps
+    # the arithmetic in SQL.
+    if bound.isdigit():
+        count = int(bound)
+        if op == '<=':
+            return str(count)
+        if op == '<':
+            return str(max(count - 1, 0))
+        return str(int(count == 1))
+    if op == '<=':
+        return bound
+    if op == '<':
+        return f'greatest({bound} - 1, 0)'
+    return f'CASE WHEN {bound} = 1 THEN 1 ELSE 0 END'
+
+
+def _is_rownum_aggregate(name: str) -> bool:
+    upper = name.upper()
+    return upper in _ROWNUM_AGGREGATES or upper.startswith(_ROWNUM_AGGREGATE_PREFIXES)
+
+
+def rewrite_rownum(sql: str) -> str | None:
+    """Lower a top-level ``ROWNUM`` filter to ``LIMIT`` (#1271).
+
+    Returns the rewritten statement, ``None`` when the statement has no
+    ``ROWNUM`` outside a string or comment (the caller keeps it unchanged), or
+    raises :class:`Unsupported` for a ``ROWNUM`` the parser owns but cannot lower
+    to one faithful ``LIMIT``.
+
+    The supported shape is a single top-level
+    ``SELECT ... FROM ... WHERE <conjunction>`` exactly one conjunct of which is
+    ``ROWNUM <op> n`` (``op`` one of ``<=``, ``<``, ``=``; ``n`` an integer or a
+    bind). The ``ROWNUM`` conjunct becomes the ``LIMIT`` and every other conjunct
+    stays in ``WHERE``. Every other ``ROWNUM`` raises :class:`Unsupported` —
+    under an ``ORDER BY``, ``GROUP BY``, ``DISTINCT``, aggregate, set operator,
+    ``OR`` or ``FOR UPDATE``; more than one ``ROWNUM``; or a ``ROWNUM`` in the
+    select list or nested in a sub-query — because none has a single-``LIMIT``
+    equivalent (#33). This mirrors the regex rule it replaces, which also refuses
+    a nested ``ROWNUM`` rather than rewriting inside the sub-query.
+    """
+    if not _ROWNUM_WORD.search(sql):
+        return None
+    toks = _tokenize(sql)
+    depth = 0
+    depth0: list[tuple[int, str]] = []  # (index, word) of each depth-zero word
+    rownum_at: list[int] = []  # index of every ROWNUM word, at any depth
+    from_at = where_at = -1
+    for i, t in enumerate(toks):
+        if t.text == '(':
+            depth += 1
+        elif t.text == ')':
+            depth -= 1
+        elif t.kind == 'word':
+            if depth == 0:
+                depth0.append((i, t.word))
+                if t.word == 'FROM' and from_at < 0:
+                    from_at = i
+                elif t.word == 'WHERE' and where_at < 0:
+                    where_at = i
+            if t.word == 'ROWNUM':
+                rownum_at.append(i)
+    if not rownum_at:
+        return None  # ROWNUM matched only inside a string or a comment
+    refusal = Unsupported('ROWNUM is not a plain top-level LIMIT filter')
+    names = [w for _, w in depth0]
+    if (
+        len(rownum_at) != 1
+        or not names
+        or names[0] != 'SELECT'
+        or from_at < 0
+        or where_at < 0
+        or _ROWNUM_BLOCKERS & set(names)
+    ):
+        raise refusal
+    # The one ROWNUM must be a depth-zero word that falls inside the WHERE clause
+    # -- not nested in a sub-query, and not in the select list or FROM.
+    rownum = rownum_at[0]
+    where_end = _clause_end(toks, where_at + 1)
+    if rownum not in {i for i, _ in depth0} or not where_at < rownum < where_end:
+        raise refusal
+    # No DISTINCT / UNIQUE / aggregate / analytic in the select list: Oracle
+    # numbers rows before any of those collapse or reorder them.
+    select = toks[1:from_at]
+    first_word = next((t.word for t in select if t.kind == 'word'), '')
+    if first_word in ('DISTINCT', 'UNIQUE'):
+        raise refusal
+    for j in range(1, from_at):
+        t = toks[j]
+        call = j + 1 < from_at and toks[j + 1].text == '('
+        if t.kind == 'word' and (
+            t.word == 'OVER' or (call and _is_rownum_aggregate(t.text))
+        ):
+            raise refusal
+    # Split the WHERE into AND conjuncts: exactly the ROWNUM one becomes LIMIT,
+    # and the rest are re-joined with AND. (Splitting then re-joining restores a
+    # conjunct that itself spans an AND, e.g. `x BETWEEN 1 AND 5`.)
+    rest: list[str] = []
+    limit: str | None = None
+    for s, e in _split_top_level(toks, where_at + 1, where_end, 'AND'):
+        if s >= e:
+            raise refusal  # a dangling AND
+        text = sql[toks[s].start : toks[e - 1].end].strip()
+        if s <= rownum < e:
+            match = _ROWNUM_PREDICATE.fullmatch(text)
+            if match is None:
+                raise refusal
+            limit = _rownum_limit(match.group(1), match.group(2))
+        else:
+            rest.append(text)
+    if limit is None:  # ROWNUM sat on an AND boundary, not within a conjunct
+        raise refusal
+    head = sql[: toks[where_at].start].rstrip()
+    body = f'{head} WHERE {" AND ".join(rest)}' if rest else head
+    return f'{body} LIMIT {limit}'
