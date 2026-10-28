@@ -1,18 +1,24 @@
 # SPDX-FileCopyrightText: 2019 Peter Lemenkov <lemenkov@gmail.com>
 # SPDX-License-Identifier: MIT
 
-"""The hand-rolled SQL parser (#1865), first construct: ``(+)`` outer joins.
+"""The hand-rolled SQL parser (#1865): ``(+)`` outer joins and ``ROWNUM``.
 
 Pure text-in / text-out, so these run in the offline suite with no database.
 The semantic proof -- that the lowered ANSI joins return the rows Oracle's
-``(+)`` would -- is a live Mirror-over-PG test in ``test_postgres_backend.py``.
+``(+)`` would -- is a live Mirror-over-PG test in ``test_postgres_backend.py``,
+which also shadow-compares the ``ROWNUM`` rule against the regex form it
+replaces.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from seerdb.server.backends.sqlparser import rewrite_outer_joins
+from seerdb.server.backends.sqlparser import (
+    Unsupported,
+    rewrite_outer_joins,
+    rewrite_rownum,
+)
 
 
 def test_a_right_hand_plus_is_a_left_join_keeping_the_other_table() -> None:
@@ -138,3 +144,96 @@ def test_a_trailing_semicolon_is_kept() -> None:
 )
 def test_declines_outside_the_supported_subset(sql: str) -> None:
     assert rewrite_outer_joins(sql) is None
+
+
+# --- ROWNUM as a top-level LIMIT filter ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    ('sql', 'expected'),
+    [
+        # `<= n` is n rows, `< n` is n - 1, `= 1` is one row, `= k>1` is none.
+        ('SELECT id FROM t WHERE rownum <= 1', 'SELECT id FROM t LIMIT 1'),
+        ('SELECT id FROM t WHERE rownum < 3', 'SELECT id FROM t LIMIT 2'),
+        ('SELECT id FROM t WHERE rownum = 1', 'SELECT id FROM t LIMIT 1'),
+        ('SELECT id FROM t WHERE rownum = 2', 'SELECT id FROM t LIMIT 0'),
+        # A bind keeps the arithmetic in SQL.
+        ('SELECT id FROM t WHERE rownum <= :1', 'SELECT id FROM t LIMIT :1'),
+        (
+            'SELECT id FROM t WHERE rownum < :n',
+            'SELECT id FROM t LIMIT greatest(:n - 1, 0)',
+        ),
+        (
+            'SELECT id FROM t WHERE rownum = :n',
+            'SELECT id FROM t LIMIT CASE WHEN :n = 1 THEN 1 ELSE 0 END',
+        ),
+        # The ROWNUM conjunct drops out; the other conjuncts stay in WHERE.
+        (
+            'SELECT id FROM t WHERE rownum < 3 AND a = 1',
+            'SELECT id FROM t WHERE a = 1 LIMIT 2',
+        ),
+        (
+            'SELECT id FROM t WHERE a = 1 AND rownum <= 2 AND b = 2',
+            'SELECT id FROM t WHERE a = 1 AND b = 2 LIMIT 2',
+        ),
+        # Splitting then re-joining on AND restores a conjunct that spans one.
+        (
+            'SELECT id FROM t WHERE x BETWEEN 1 AND 5 AND rownum <= 3',
+            'SELECT id FROM t WHERE x BETWEEN 1 AND 5 LIMIT 3',
+        ),
+        # An ORDER BY *inside a sub-query* is not a top-level blocker.
+        (
+            'SELECT * FROM (SELECT id FROM t ORDER BY id) WHERE rownum <= 3',
+            'SELECT * FROM (SELECT id FROM t ORDER BY id) LIMIT 3',
+        ),
+    ],
+)
+def test_a_top_level_rownum_filter_becomes_limit(sql: str, expected: str) -> None:
+    assert rewrite_rownum(sql) == expected
+
+
+@pytest.mark.parametrize(
+    'sql',
+    [
+        # no ROWNUM: nothing to do
+        'SELECT id FROM t WHERE a = 1',
+        # ROWNUM only inside a string literal is not the pseudo-column
+        "SELECT 'rownum' FROM dual",
+    ],
+)
+def test_rownum_leaves_a_statement_with_nothing_to_do(sql: str) -> None:
+    # None means "keep the statement unchanged", as the backend wrapper does.
+    assert rewrite_rownum(sql) is None
+
+
+@pytest.mark.parametrize(
+    'sql',
+    [
+        # Oracle numbers rows before ORDER BY / GROUP BY / DISTINCT / aggregates
+        # / set operators, so a LIMIT applied after keeps a different set.
+        'SELECT id FROM t WHERE rownum <= 1 ORDER BY id',
+        'SELECT count(*) FROM t WHERE rownum <= 5',
+        'SELECT DISTINCT a FROM t WHERE rownum <= 5',
+        'SELECT max(x) OVER () FROM t WHERE rownum <= 1',
+        'SELECT id FROM t WHERE rownum <= 1 UNION SELECT id FROM u',
+        'SELECT id FROM t GROUP BY id HAVING rownum <= 1',
+        # OR could bind the filter to one branch; FOR UPDATE locks first.
+        'SELECT id FROM t WHERE a = 1 OR rownum <= 1',
+        'SELECT id FROM t WHERE rownum <= 1 FOR UPDATE',
+        # not a `<op> n` comparison the LIMIT models
+        'SELECT id FROM t WHERE rownum > 1',
+        'SELECT id FROM t WHERE rownum BETWEEN 1 AND 5',
+        'SELECT id FROM t WHERE rownum <= f(x)',
+        # ROWNUM in the select list, or more than one ROWNUM
+        'SELECT id, rownum FROM t',
+        'SELECT id FROM t WHERE rownum <= 1 AND rownum <= 2',
+        # a nested ROWNUM is refused, not rewritten inside the sub-query
+        'SELECT * FROM (SELECT id FROM t WHERE rownum <= 3) x',
+        'SELECT * FROM (SELECT id FROM t WHERE rownum <= 3) x WHERE y > 1',
+        # not a top-level SELECT
+        'UPDATE t SET x = 1 WHERE rownum <= 1',
+    ],
+)
+def test_rownum_without_a_faithful_limit_is_unsupported(sql: str) -> None:
+    with pytest.raises(Unsupported):
+        rewrite_rownum(sql)

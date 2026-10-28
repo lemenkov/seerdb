@@ -407,7 +407,11 @@ from seerdb.server.accounts import (
     _user_name,
 )
 from seerdb.server.backend import BlobValue, ClobValue, SessionInfo, TypeDescription
-from seerdb.server.backends.sqlparser import rewrite_outer_joins
+from seerdb.server.backends.sqlparser import (
+    Unsupported,
+    rewrite_outer_joins,
+    rewrite_rownum,
+)
 from seerdb.server.identity import IDENTITY_12_1, IDENTITY_23, ServerIdentity
 from seerdb.server.redact import redact_passwords
 
@@ -9825,26 +9829,47 @@ def _translate_row_generator(sql: str) -> str:
     return _unmask_quoted(_ROWNUM_WORD.sub('level', masked), contents)
 
 
+_ROWNUM_REFUSAL = (
+    'ROWNUM is translated only as a top-level `AND ROWNUM <= n` filter of a '
+    'query with no ORDER BY, GROUP BY, DISTINCT, aggregate or set operator'
+)
+
+
 def _rewrite_rownum(sql: str) -> str:
     """Translate `... WHERE a AND ROWNUM <= n` to `... WHERE a LIMIT n` (#1271).
 
-    Only where the two mean the same: a top-level SELECT whose WHERE is a chain
-    of ANDs with one `ROWNUM <= n`, `< n` or `= n` in it (n a number or a bind),
-    and nothing that Oracle applies after numbering the rows -- no ORDER BY,
-    GROUP BY, DISTINCT, aggregate or analytic function, set operator,
+    Served by the parsed transpiler (`sqlparser.rewrite_rownum`) since #1865;
+    the regex form below (`_rewrite_rownum_regex`) is retained as the shadow
+    oracle the parser is proven equivalent to (`tests/test_sqlparser.py`). The
+    parser returns None when there is no top-level ROWNUM to touch, and raises
+    `Unsupported` for a ROWNUM with no faithful LIMIT, which is refused by name
+    here exactly as the regex rule did.
+    """
+    try:
+        rewritten = rewrite_rownum(sql)
+    except Unsupported:
+        raise UnsupportedFeature(_ROWNUM_REFUSAL) from None
+    return sql if rewritten is None else rewritten
+
+
+def _rewrite_rownum_regex(sql: str) -> str:
+    """The regex form of `_rewrite_rownum`, kept as the shadow-compare oracle.
+
+    Only where ROWNUM and LIMIT mean the same: a top-level SELECT whose WHERE is
+    a chain of ANDs with one `ROWNUM <= n`, `< n` or `= n` in it (n a number or
+    a bind), and nothing that Oracle applies after numbering the rows -- no ORDER
+    BY, GROUP BY, DISTINCT, aggregate or analytic function, set operator,
     hierarchical query, FOR UPDATE or OR. Nested-ROWNUM pagination has no
     faithful rewrite (#33); every ROWNUM this leaves is refused by name, rather
-    than reaching PostgreSQL as an unknown column.
+    than reaching PostgreSQL as an unknown column. Retired once the parser owns
+    the construct outright.
     """
     if not _ROWNUM_WORD.search(sql):
         return sql
     words, rownums = _top_level_words(sql)
     if not rownums:
         return sql  # only in a string or a comment
-    refusal = UnsupportedFeature(
-        'ROWNUM is translated only as a top-level `AND ROWNUM <= n` filter of a '
-        'query with no ORDER BY, GROUP BY, DISTINCT, aggregate or set operator'
-    )
+    refusal = UnsupportedFeature(_ROWNUM_REFUSAL)
     names = [w for _, w in words]
     if (
         len(rownums) != 1
