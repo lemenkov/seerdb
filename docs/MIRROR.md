@@ -299,6 +299,31 @@ origin may connect — not recommended.
 > milestone) is still owed: treat it as a technology preview, and put it behind
 > an allow-list and TLS.
 
+#### The JSON query endpoint
+
+`--query-ws-port PORT` serves a thin **JSON-over-WebSocket query endpoint**
+beside the listeners above (a seerdb extension, MVP). Instead of raw TNS, a
+browser or Node tool exchanges JSON **text** frames — no TNS codec needed — and
+the Mirror drives the same backend one layer above TNS:
+
+```jsonc
+-> {"type":"login","user":"PYO","password":"pyo123"}   <- {"type":"login_ok"}
+-> {"type":"query","id":1,"sql":"select id,name from t where id > :1","binds":[100]}
+<- {"type":"result","id":1,
+    "columns":[{"name":"ID","type":"NUMBER"},{"name":"NAME","type":"VARCHAR2"}],
+    "rows":[[101,"ada"]],"rowcount":1}
+-> {"type":"commit"} | {"type":"rollback"}             <- {"type":"ok"}
+<- {"type":"error","id":1,"code":"UNSUPPORTED","message":"..."}
+```
+
+One statement in flight at a time; binds are a positional JSON list of scalars.
+`NUMBER` is serialized as a string (to keep precision), dates as ISO-8601, and
+`RAW`/`BLOB` as base64. It is `wss` when `--tls-cert` is set (else `ws`), and
+shares `--ws-origin` and `--max-sessions` with the raw-TNS listener. Auth takes
+the account password in the login frame, so it relies on the `wss` TLS — the
+same operator-controlled threat model and milestone-52 caveat above apply.
+Richer typing, LOBs, named binds and streaming are deliberately out of this MVP.
+
 ## Mirror over PostgreSQL
 
 ### Choosing a mode

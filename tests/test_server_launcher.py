@@ -376,3 +376,20 @@ def test_ws_options_from_the_config_file(tmp_path: Path) -> None:
 def test_a_bad_ws_port_is_refused() -> None:
     with pytest.raises(SystemExit):
         build(['--ws-port', '99999', 'postgres', 'dbname=mirror'], env=_USERS)
+
+
+def test_query_ws_port_option() -> None:
+    launch = build(['--query-ws-port', '1523', 'postgres', 'dbname=mirror'], env=_USERS)
+    assert launch.query_ws_port == 1523
+    assert launch.ws_port is None
+
+
+def test_query_ws_port_from_the_config_file(tmp_path: Path) -> None:
+    config = _ini(
+        tmp_path,
+        '[server]\nquery_ws_port = 1523\n'
+        '[clients]\nScott = tiger\n'
+        '[backend]\ntype = postgres\nconninfo = dbname=mirror\n',
+    )
+    launch = build(['--config', config], env={})
+    assert launch.query_ws_port == 1523

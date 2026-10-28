@@ -21,6 +21,7 @@ the defaults; the command line wins. The config file is INI::
     ; tls_key = server.key      ;       and its private key
     ; tls_ca = clients-ca.pem   ;       require client certificates from this CA
     ; ws_port = 1522            ; also serve the seerdb WebSocket transport here
+    ; query_ws_port = 1523      ; also serve the JSON-over-WebSocket query endpoint
     ; ws_origins = https://app.example  ; browser Origins it admits (comma list)
     ; profile = profile.json    ; record per-statement statistics (SIGUSR1 writes)
 
@@ -156,6 +157,9 @@ class Launch:
     # None for none, and the browser Origin allow-list (None admits any).
     ws_port: int | None = None
     ws_origins: list[str] | None = None
+    # The JSON-over-WebSocket query endpoint (#2371), None for none; shares
+    # ws_origins, TLS and max_sessions with the raw-TNS WebSocket listener.
+    query_ws_port: int | None = None
     # Failed logins in a row that lock a name (GHSA-742q-fjfr-w5x3); 0 never.
     failed_login_attempts: int = 10
     # A deprecated option or key the command line or the config file gave
@@ -221,7 +225,14 @@ def _parser() -> argparse.ArgumentParser:
         metavar='ORIGIN',
         help='a browser Origin the WebSocket listener admits (repeatable); '
         'without any, every origin may connect (not recommended -- a '
-        'browser-facing endpoint still needs the security review, milestone 52)',
+        'browser-facing endpoint still needs the security review, milestone 52). '
+        'Applies to both --ws-port and --query-ws-port',
+    )
+    parser.add_argument(
+        '--query-ws-port',
+        type=int,
+        help='also serve the thin JSON-over-WebSocket query endpoint (#2371) on '
+        'this port; wss when --tls-cert is given, else ws (a seerdb extension)',
     )
     parser.add_argument(
         '--failed-login-attempts',
@@ -395,6 +406,11 @@ def build(
     else:
         raw = option(None, server, 'ws_origins', '')
         ws_origins = [o.strip() for o in raw.split(',') if o.strip()] or None
+    # The JSON-over-WebSocket query endpoint (#2371).
+    qws = option(args.query_ws_port, server, 'query_ws_port', '')
+    query_ws_port = int(qws) if qws else None
+    if query_ws_port is not None and not 0 <= query_ws_port <= 65535:
+        raise SystemExit('query_ws_port must be a port number')
 
     kind = args.command or str(backend.get('type', '')).strip().lower()
     if kind == 'observe':
@@ -469,6 +485,7 @@ def build(
             max_sessions=max_sessions,
             ws_port=ws_port,
             ws_origins=ws_origins,
+            query_ws_port=query_ws_port,
             failed_login_attempts=attempts,
             warnings=warnings,
         )
@@ -528,6 +545,7 @@ def build(
         max_sessions=max_sessions,
         ws_port=ws_port,
         ws_origins=ws_origins,
+        query_ws_port=query_ws_port,
         failed_login_attempts=attempts,
         warnings=warnings,
     )
@@ -583,22 +601,29 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile = None
     if launch.profile is not None:
         backend_factory, profile = _profiled(launch, backend_factory)
-    # The seerdb WebSocket listener (#1989) runs beside the TCP/TCPS one, on its
-    # own thread, sharing the backend, TLS (wss when a cert is set) and limits.
-    ws_server = None
-    if launch.ws_port is not None:
+    # The seerdb WebSocket listeners (#1989 raw TNS, #2371 JSON query) run beside
+    # the TCP/TCPS one, each on its own thread, sharing the backend, TLS (wss
+    # when a cert is set), the origin allow-list and the session limit.
+    ws_servers = []
+    ws_ports = [(launch.ws_port, 'tns'), (launch.query_ws_port, 'query')]
+    if any(port is not None for port, _ in ws_ports):
         from seerdb.server.ws_service import WsServer
 
-        ws_server = WsServer(
-            launch.host,
-            launch.ws_port,
-            backend_factory=backend_factory,
-            encryption=launch.encryption,
-            ssl_context=launch.ssl_context,
-            max_sessions=launch.max_sessions,
-            allowed_origins=launch.ws_origins,
-        )
-        threading.Thread(target=ws_server.serve_forever, daemon=True).start()
+        for port, ws_protocol in ws_ports:
+            if port is None:
+                continue
+            server = WsServer(
+                launch.host,
+                port,
+                backend_factory=backend_factory,
+                encryption=launch.encryption,
+                ssl_context=launch.ssl_context,
+                max_sessions=launch.max_sessions,
+                allowed_origins=launch.ws_origins,
+                protocol=ws_protocol,
+            )
+            ws_servers.append(server)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         serve(
             launch.host,
@@ -609,8 +634,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_sessions=launch.max_sessions,
         )
     finally:
-        if ws_server is not None:
-            ws_server.close()
+        for server in ws_servers:
+            server.close()
         if profile is not None:
             profile.dump()
 
