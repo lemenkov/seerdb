@@ -407,6 +407,7 @@ from seerdb.server.accounts import (
     _user_name,
 )
 from seerdb.server.backend import BlobValue, ClobValue, SessionInfo, TypeDescription
+from seerdb.server.backends.sqlparser import rewrite_outer_joins
 from seerdb.server.identity import IDENTITY_12_1, IDENTITY_23, ServerIdentity
 from seerdb.server.redact import redact_passwords
 
@@ -9897,6 +9898,22 @@ def _rewrite_rownum(sql: str) -> str:
     return f'{body} LIMIT {limit}'
 
 
+def _rewrite_outer_join(sql: str) -> str:
+    """Lower Oracle's ``(+)`` outer-join operator to ANSI ``LEFT JOIN`` (#1865).
+
+    This is the first construct served by the parsed transpiler
+    (:mod:`seerdb.server.backends.sqlparser`) rather than a text pass: a `(+)`
+    join needs alias and scope tracking a regex cannot do, and `sqlglot`
+    silently rewrites it to an *inner* join. The parser handles the common
+    well-formed shapes and declines the rest, returning None, in which case the
+    statement is left unchanged -- `(+)` has no other translation, so a decline
+    is the same behaviour as before this rule (the query reaches PostgreSQL
+    verbatim and errors), never a regression.
+    """
+    rewritten = rewrite_outer_joins(sql)
+    return sql if rewritten is None else rewritten
+
+
 # Not after a `.`: the generated `sys.deref(` is already the translation.
 _DEREF_NAMES = frozenset({'DEREF'})
 
@@ -10437,6 +10454,7 @@ def _rewritten_idioms(sql: str) -> str:
     sql = _ruled('row-generator', _translate_row_generator(sql), sql)
     sql = _ruled('plsql-pads', _plsql_pads(sql), sql)
     sql = _ruled('rownum', _rewrite_rownum(sql), sql)
+    sql = _ruled('outer-join', _rewrite_outer_join(sql), sql)
     sql = _ruled('deref', _translate_deref(sql), sql)
     sql = _ruled('attribute-access', _translate_attribute_access(sql), sql)
     sql = _ruled('connect-by', _translate_connect_by(sql), sql)
