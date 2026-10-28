@@ -51,6 +51,7 @@ from seerdb.server.backends.postgres import (  # noqa: E402
     _column_annotations,
     _computed_column_types,
     _declared_columns,
+    _idioms_and_rules,
     _interval_leaf,
     _iot_primary_key,
     _object_column_meta,
@@ -130,6 +131,54 @@ def test_a_query_cast_to_an_oracle_type_is_translated() -> None:
     assert _translate_idioms('SELECT d AS binary_double FROM t') == (
         'SELECT d AS binary_double FROM t'
     )
+
+
+def test_an_outer_join_operator_is_lowered_and_noted() -> None:
+    # The parsed transpiler (#1865) lowers Oracle's (+) to an ANSI LEFT JOIN
+    # through the idiom pipeline, and notes the rule for the translation report
+    # (#1557) exactly as the regex rules do.
+    translated, rules = _idioms_and_rules(
+        'SELECT e.ename, d.dname FROM emp e, dept d WHERE e.deptno = d.deptno(+)'
+    )
+    assert translated == (
+        'SELECT e.ename, d.dname FROM emp e LEFT JOIN dept d ON e.deptno = d.deptno'
+    )
+    assert 'outer-join' in rules
+    # A statement with no (+) is untouched and notes nothing.
+    assert (
+        _idioms_and_rules('SELECT * FROM emp e, dept d WHERE e.deptno = d.deptno')[1]
+        == ()
+    )
+
+
+def test_an_outer_join_returns_the_rows_oracle_would() -> None:
+    # The semantic proof of the (+) lowering (#1865): a left outer join keeps
+    # every row of the preserved table, null-extending the optional side where
+    # it has no match -- so the unmatched parent row comes back with NULLs, and
+    # an inner join's absence of it would be wrong.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE emp1865 (ename VARCHAR2(10), deptno NUMBER)')
+        backend.execute('CREATE TABLE dept1865 (deptno NUMBER, dname VARCHAR2(10))')
+        try:
+            backend.execute("INSERT INTO dept1865 VALUES (10, 'SALES')")
+            backend.execute("INSERT INTO emp1865 VALUES ('ALICE', 10)")
+            backend.execute("INSERT INTO emp1865 VALUES ('BOB', 20)")  # no dept
+            rows = backend.execute(
+                'SELECT e.ename, d.dname FROM emp1865 e, dept1865 d '
+                'WHERE e.deptno = d.deptno(+) ORDER BY e.ename'
+            ).rows
+            # BOB's department does not exist, so (+) null-extends it; an inner
+            # join would drop BOB entirely.
+            assert rows == [('ALICE', 'SALES'), ('BOB', None)]
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE emp1865')
+            backend.execute('DROP TABLE dept1865')
+    finally:
+        backend.close()
 
 
 def test_backend_error_uses_oracle_canonical_text_for_mapped_code() -> None:
