@@ -4032,6 +4032,37 @@ KeyLength(SB4) | KeyLen(UB1) | KeyData | ValueLength(SB4) | ValueLen(UB1) | Valu
 
 Zero-length keys or values are encoded as a single `0x00` byte.
 
+### 12.4 Byte order of fixed-width integers (pre-10g is server-native-endian)
+
+The variable-length integers of §12.1 are byte-order independent. A handful of
+**fixed-width** integer fields in the **pre-10g (8i / 9i-era)** codec are not:
+they are written in the **server's native byte order**, not a fixed
+little-endian. 10g and later normalise these on the wire, so the question only
+arises for the 8i/9i dialects. Known native-endian sites:
+
+- the bind OAC `max_size` (2-byte; §5.3);
+- the DCB describe header `rowwidth` / `numcols` (ub4; §6.4);
+- the LOB `num_bytes` in an 8i LOB read (ub4; §14);
+- the DML row count in the 8i OER status (ub4; §6.7);
+- and, latently, the `charset_id` and charset-element count read from the
+  TTI_PRO response (ub2; §4.1).
+
+There is **no dedicated endianness byte or capability flag** in the handshake.
+The only signal is the **platform banner** in the TTI_PRO response (§4.1), e.g.
+`IBMPC/WIN_NT-8.1.0` — `IBMPC` denotes x86, i.e. little-endian. A big-endian
+server (8i/9i on SPARC/Solaris, HP-UX/PA-RISC, AIX/POWER, IRIX/MIPS) would carry
+a different platform string and send these fields big-endian.
+
+> **Little-endian is assumed, and big-endian is unsupported by design.** Every
+> platform that still runs a pre-10g Oracle *and* is big-endian is effectively a
+> museum piece: live big-endian Oracle (AIX on POWER) runs 10g+, whose wire is
+> normalised, so it never exercises this path. seerdb has no big-endian testbed,
+> and the exact big-endian banner strings are unknown without one to capture
+> from — so a byte-order-detecting branch cannot even be written and verified.
+> seerdb therefore decodes these fields as little-endian and does **not** claim
+> big-endian support; a real big-endian pre-10g capture would be needed before
+> any such branch is added. (Tracked and closed as a known limitation, #380.)
+
 ## 13. Character Set Support
 
 The library supports a wide range of Oracle character sets, identified by Oracle character set IDs:
