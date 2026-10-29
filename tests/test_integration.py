@@ -13312,14 +13312,22 @@ class SSLIntegration(_ThrottleRetry, unittest.TestCase):
             raise unittest.SkipTest(
                 'Oracle 8i dedicated-server redirect escapes the TLS-proxy fixture'
             )
-        cls.proxy = TLSProxy(_HOST, _PORT)
-        cls.proxy.start()
 
-    @classmethod
-    def tearDownClass(cls):
-        if getattr(cls, 'proxy', None) is not None:
-            cls.proxy.stop()
-            cls.proxy = None
+    def setUp(self):
+        # A fresh proxy per test (#2228). Several tests here fail the TLS
+        # handshake on purpose (no-CA, hostname mismatch); a single proxy shared
+        # across the class via setUpClass meant a failed handshake's server-side
+        # teardown — and the shared TLS context's session state — could race the
+        # next test's connection, which showed up as an intermittent client
+        # `UNEXPECTED_MESSAGE` in CI. A proxy per test gives each one its own
+        # socket and SSLContext, so no state crosses from one test to the next.
+        self.proxy = TLSProxy(_HOST, _PORT)
+        self.proxy.start()
+
+    def tearDown(self):
+        if getattr(self, 'proxy', None) is not None:
+            self.proxy.stop()
+            self.proxy = None
 
     def _connect_via_tls(self, **overrides):
         Kwargs = dict(
