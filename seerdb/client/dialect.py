@@ -1029,25 +1029,25 @@ class O8iDialect(Oall8Dialect):
 
 class Fv2Oall8Dialect(Oall8Dialect):
     """Oracle 9i over the native 64-bit OALL8 (0x5e), opt-in and experimental
-    (#716/#790). This increment establishes the native login only: the server
-    completes the OCI PRO/DTY negotiation and the OSESSKEY/OAUTH handshake, and
-    the session authenticates as an ordinary 9i client (it is not an O8iDialect).
+    (#716/#790). The session authenticates as an ordinary 9i client (it is not an
+    O8iDialect) and then speaks the native thick (OCI) wire.
 
-    Served: SELECT (incl. scalar binds) and INSERT/UPDATE/DELETE/DDL with
-    commit/rollback, all over the native 64-bit OALL8 reply decode
-    (decode_9i_oall8_*). PL/SQL blocks, LONG columns, LOB objects and array DML
-    are follow-ups — each raises a clear error rather than desyncing the
-    connection."""
+    Served: SELECT (with scalar binds, positional and named), INSERT/UPDATE/DELETE
+    and DDL (with scalar binds) under its own commit/rollback, and PL/SQL blocks
+    with IN binds -- all over the native 64-bit OALL8 reply decode
+    (decode_9i_oall8_*). PL/SQL OUT / IN OUT binds (#794), LONG columns, LOB
+    objects (#795/#796), DML...RETURNING (#791) and array DML are follow-ups; each
+    raises a clear error rather than desyncing the connection."""
 
     def capabilities(self) -> frozenset[str]:
-        # SELECT, DML / DDL and own commit/rollback over the native 64-bit OALL8
-        # (#792/#716): the request is the 64-bit execute (byte-verified), the reply
-        # the OCI fixed-width DCB / RXH / RXD / OER stream (decode_9i_oall8_*),
-        # decoded by the overrides below. Commit/rollback ride the OALL8 as
-        # ordinary statements (CAP_OWN_TXN), as 8i does -- the 8i and thin-9i close
-        # frames both break an OALL8 session, and so does the modern TTI_COMMIT, so
-        # this session drives its own transaction. No-bind PL/SQL blocks run too
-        # (CAP_BLOCK); bound blocks, LOB objects and array DML are follow-ups.
+        # SELECT, DML / DDL, PL/SQL blocks and own commit/rollback over the native
+        # 64-bit OALL8 (#792/#716/#793): the request is the 64-bit execute
+        # (byte-verified), the reply the OCI fixed-width DCB / RXH / RXD / OER stream
+        # (decode_9i_oall8_*), decoded by the overrides below. Commit/rollback ride
+        # the OALL8 as ordinary statements (CAP_OWN_TXN), as 8i does -- the 8i and
+        # thin-9i close frames both break an OALL8 session, and so does the modern
+        # TTI_COMMIT, so this session drives its own transaction. OUT / IN OUT binds,
+        # LOB objects and array DML are follow-ups.
         return frozenset({CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_OWN_TXN})
 
     def _encode_query(self, sql_text: bytes, bind: list | None) -> bytes:
@@ -1170,13 +1170,6 @@ class Fv2Oall8Dialect(Oall8Dialect):
         # No array DML yet (the caller refuses a batch), no cursor cache, and the
         # rowid is not surfaced yet. (Autocommit is applied by the caller.)
         assert not batch
-        if bind:
-            # A bound non-query draws no reply from the 9.2 server (it inserts the
-            # row but then waits), unlike a bound SELECT; the two-phase bind for
-            # DML is not worked out yet. Raise rather than hang (#716).
-            raise NotSupportedError(
-                'the experimental 9i OALL8 dialect does not serve bound DML yet (#716)'
-            )
         stmt_type = o8i_stmt_type(sql.strip().upper())
         yield Send(
             self._closing() + self._encode_dml(encode_8i_sql_text(sql), stmt_type, bind)
@@ -1212,19 +1205,24 @@ class Fv2Oall8Dialect(Oall8Dialect):
                 return buf
 
     def execute_block(self, sql: str, bind: list | None = None):
-        # 9i native OALL8 anonymous PL/SQL block (#793). A NO-BIND block replies
-        # exactly like a DML (an RPA piggyback then the OER), so it decodes through
-        # the same path. A BOUND block draws a 0x0b bind prompt and then waits for a
-        # two-phase input send whose layout differs from the thin fv2 block's; that
-        # round trip is not worked out yet, so a bound block raises rather than hang.
-        if bind:
+        # 9i native OALL8 anonymous PL/SQL block (#793). The reply opens with a
+        # TTI_IOV (0x0b) bind prompt when there are binds, then the RPA and OER, all
+        # in one packet -- the block runs with the IN values carried inline in the
+        # request, so there is no two-phase round trip. decode_9i_oall8_dml_response
+        # skips the IOV / RPA to the OER. IN binds (plain values) ride the request;
+        # OUT / IN OUT binds (Var) need the OUT values read back from the IOV reply,
+        # which is a follow-up (#794), so a block with a Var bind raises for now.
+        from seerdb.common.datatypes import Var
+
+        bind = bind or []
+        if any(isinstance(b, Var) for b in bind):
             raise NotSupportedError(
-                'the experimental 9i OALL8 dialect does not serve bound PL/SQL '
-                'blocks yet (the 0x0b bind-prompt round trip, #793/#794)'
+                'the experimental 9i OALL8 dialect does not serve PL/SQL OUT / '
+                'IN OUT binds yet (#794)'
             )
         stmt_type = o8i_stmt_type(sql.strip().upper())
         yield Send(
-            self._closing() + self._encode_dml(encode_8i_sql_text(sql), stmt_type)
+            self._closing() + self._encode_dml(encode_8i_sql_text(sql), stmt_type, bind)
         )
         buf = yield from self._recv_dml_terminal('PL/SQL block')
         (_row_count, err_code, message) = decode_9i_oall8_dml_response(buf)

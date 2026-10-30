@@ -14428,15 +14428,20 @@ def decode_9i_oall8_exec_response(
 
 
 def _o9i_oall8_oer(Terminal: bytes) -> bytes:
-    # The OER (04) in a 9i OALL8 reply's terminal, past any TTI_RPA (08)
-    # session-state piggyback. Empty if none is there yet.
-    Rest = Terminal
-    while Rest and Rest[0] == TTI_RPA:
-        Next = Rest.find(bytes([TTI_OER]), 1)
-        if Next < 0:
-            return b''
-        Rest = Rest[Next:]
-    return Rest if Rest[:1] == bytes([TTI_OER]) else b''
+    # The status OER (0x04) in a 9i OALL8 reply's terminal. A reply may open with a
+    # TTI_IOV (0x0b, a bound statement's bind prompt) and/or a TTI_RPA (0x08, the
+    # session-state piggyback), and a first-parse reply's RPA carries a value byte
+    # that collides with the OER token -- so scan for the first 0x04 that begins a
+    # REAL OER rather than the first 0x04 outright. The OER's first field is the
+    # call type / count (a small number: SELECT 1, DML 5, 0 on a first parse), so
+    # its three high bytes are zero; a 0x04 inside the RPA fails that and is
+    # skipped. Empty if no whole OER is there yet.
+    At = Terminal.find(bytes([TTI_OER]))
+    while At >= 0:
+        if At + 5 <= len(Terminal) and not any(Terminal[At + 2 : At + 5]):
+            return Terminal[At:]
+        At = Terminal.find(bytes([TTI_OER]), At + 1)
+    return b''
 
 
 def decode_9i_oall8_cursor_id(Terminal: bytes) -> int:

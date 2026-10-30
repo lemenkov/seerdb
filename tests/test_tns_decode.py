@@ -7659,6 +7659,29 @@ class TestNative9iOall8Select(unittest.TestCase):
         self.assertEqual(decode_9i_oall8_dml_response(self.DML_INSERT), (1, 0, None))
         self.assertEqual(decode_9i_oall8_dml_response(self.DML_UPDATE), (2, 0, None))
 
+    # A bound statement's first-parse reply opens with a TTI_IOV (0x0b) bind
+    # prompt and the session-state RPA carries a byte (0x04) that collides with the
+    # OER token -- the status reader must skip past it to the real OER. Real 9.2
+    # frame for the first execute of `insert ... values (:1)` (one row).
+    DML_FIRST_PARSE = bytes.fromhex(
+        '0b01056601000000010000000000000000008a020000000000000000ca5e0000'
+        '0000000000000100000000000000000000002008050093042c02000000000200'
+        '0000020000000000000000000000040500000001010000000000000000000200'
+        '0c000200000000008c44030001000000d2b80000000000000000000000080000'
+        '010000003601000000000000000000000000000080d0d403000000000d000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00000000000000000000000000000000000000000d000d010003448c00010000'
+        'b8d20000'
+    )
+
+    def test_bound_first_parse_reply_skips_the_iov_to_the_real_oer(self):
+        from seerdb.common.tns import decode_9i_oall8_dml_response
+
+        # The row count sits in the real OER, not the 0x04 inside the RPA.
+        self.assertEqual(
+            decode_9i_oall8_dml_response(self.DML_FIRST_PARSE), (1, 0, None)
+        )
+
 
 class TestO8iBfile(unittest.TestCase):
     """Oracle 8i native BFILE read (#401, PROTOCOL §19.17): FILE_OPEN -> GETLEN
