@@ -6381,16 +6381,28 @@ from `bfile_read_native` (sync + async). This replaced an earlier `DBMS_LOB`
 temp-BLOB helper, removing its `CREATE PROCEDURE` requirement and the stored
 function it left in the user's schema — the same win #46 brought to 10g+/21c.
 
-### 19.14 Oracle 9i native OALL8 — the 64-bit thick request form (#716)
+### 19.18 Oracle 9i native OALL8 — the 64-bit thick request form (#716, #790)
 
 9i can speak the same OALL8 (`0x5e`) as 8i, but a native 9.2 OCI client marshals
 it in a **64-bit** form. seerdb's ordinary 9i path uses the compact minimal-caps
 request (the JDBC-thin form, §19.1–19.8); this native form is an opt-in
-(`oall8=True`) that a live capture shows the server accepts once two login bytes
-are negotiated — `compile_caps[CCAP_FIELD_VERSION]` (index 7) = 2 and a two-byte
-`runtime_caps` `02 01` (the added `01` is the word-size cap). Without the
-word-size cap the server reads the 64-bit fields as 32-bit and raises
-`ORA-03120` ("two-task conversion routine: integer overflow") on every statement.
+(`oall8=True`).
+
+Reaching it needs the **whole native OCI login handshake**, not a pair of
+capability bytes. An earlier hypothesis — that `compile_caps[CCAP_FIELD_VERSION]`
+= 2 plus a two-byte `runtime_caps` `02 01` (a word-size cap) unlock the 64-bit
+form on an otherwise thin login — was **disproven in #790**: on a thin login the
+server rejects OALL8 with `ORA-03120` ("two-task conversion routine: integer
+overflow") in all four combinations of {cap[7] = 0 or 2} × {32-bit, 64-bit}
+encoders, and advertising the word-size cap makes 9.2.0.4 close the connection
+after the thin data-type table (see §19.3). The native form is reached only by
+the full OCI login: the OCI-form TTI_PRO banner (`<machine>/<os> 2.4.xx`, which
+the 9.2 server parses to identify the platform), the compact native data-type
+negotiation, and the OCI `OSESSKEY`/`OAUTH` login envelope — with
+`CCAP_LOGON_TYPES` forced to 0 so the server issues the 8-byte DES O3LOGON key
+seerdb authenticates (the native sqlplus 16-byte key's proof is a separate,
+deferred variant). Once that session is up, the 64-bit data form below is what it
+speaks.
 
 The request is the **same token stream** as the other tiers — same opcode, same
 SQL text, same bind values — differing only in two field widths. Measured across
