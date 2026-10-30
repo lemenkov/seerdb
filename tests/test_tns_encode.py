@@ -7550,6 +7550,53 @@ class TestO9iOall8Messages(unittest.TestCase):
         self.assertEqual(closed[67:75], (0x200).to_bytes(8, 'little'))
         self.assertEqual(closed[91:], locator)
 
+    def test_9i_oall8_temporal_binds_declare_their_wire_type(self):
+        # Each descriptor declares the form the value goes in, as the thin 9i path
+        # does (#797). A sub-second datetime declared a DATE drew ORA-01483 and a
+        # timedelta read as text ORA-01867 (both live on 9.2).
+        import datetime
+
+        from seerdb.common.datatypes import IntervalYM
+        from seerdb.common.tns import _encode_9i_bind_oac
+
+        def type_size(value):
+            oac = _encode_9i_bind_oac(value)
+            return (oac[1], int.from_bytes(oac[5:13], 'little'))
+
+        self.assertEqual(type_size(datetime.date(2001, 2, 3)), (12, 7))
+        self.assertEqual(type_size(datetime.datetime(2001, 2, 3, 4, 5, 6)), (12, 7))
+        self.assertEqual(
+            type_size(datetime.datetime(2001, 2, 3, 4, 5, 6, 123456)), (180, 11)
+        )
+        tz = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+        self.assertEqual(
+            type_size(datetime.datetime(2001, 2, 3, 4, 5, 6, tzinfo=tz)), (181, 13)
+        )
+        self.assertEqual(type_size(datetime.timedelta(days=2, seconds=5)), (183, 11))
+        self.assertEqual(type_size(IntervalYM(2, 3)), (182, 5))
+
+    def test_9i_oall8_text_rides_in_utf8(self):
+        # The native OALL8 session negotiates the Unicode DTY, so text -- the SQL
+        # and string binds -- goes as UTF-8: latin-1 'é' reached a WE8ISO8859P1
+        # database as NULL when bound and broke a literal's quoting (ORA-01756).
+        from seerdb.common.tns import (
+            _encode_9i_bind_oac,
+            _encode_9i_bind_value,
+            encode_9i_oall8_query,
+            encode_9i_sql_text,
+        )
+
+        self.assertEqual(
+            encode_9i_sql_text("select 'é' from dual"), "select 'é' from dual".encode()
+        )
+        self.assertEqual(_encode_9i_bind_value('é'), bytes.fromhex('02c3a9'))
+        oac = _encode_9i_bind_oac('é')
+        self.assertEqual((oac[1], int.from_bytes(oac[5:13], 'little')), (1, 2))
+        # A character outside latin-1 encodes at all (it raised before).
+        self.assertIn(
+            '€'.encode(), encode_9i_oall8_query(1, b'select :1 from dual', ['€'])
+        )
+
 
 class TestShortLengthBoundary(unittest.TestCase):
     """A single length byte announces at most 252 bytes (#707).

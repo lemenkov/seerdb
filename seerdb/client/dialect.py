@@ -76,6 +76,7 @@ from seerdb.common.tns import (
     encode_9i_oall8_lob_read,
     encode_9i_oall8_lobop,
     encode_9i_oall8_query,
+    encode_9i_sql_text,
     encode_o7_bfile_close,
     encode_o7_bfile_open,
     encode_o7_block,
@@ -1074,7 +1075,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
         # thin form, so the describe / row / terminal decoders are overridden
         # below. Returns the same 9-tuple as Fv2Dialect.execute_query so the cursor
         # path is unchanged. (No binds / LONG / LOB yet — scalar SELECT only.)
-        yield Send(self._closing() + self._encode_query(encode_8i_sql_text(sql), bind))
+        yield Send(self._closing() + self._encode_query(encode_9i_sql_text(sql), bind))
         resp = yield RECV
         if resp is False:
             raise Exception('Connection closed during 9i OALL8 query response')
@@ -1251,7 +1252,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
         assert not batch
         stmt_type = o8i_stmt_type(sql.strip().upper())
         yield Send(
-            self._closing() + self._encode_dml(encode_8i_sql_text(sql), stmt_type, bind)
+            self._closing() + self._encode_dml(encode_9i_sql_text(sql), stmt_type, bind)
         )
         buf = yield from self._recv_dml_terminal('DML')
         (row_count, err_code, message) = decode_9i_oall8_dml_response(buf)
@@ -1264,7 +1265,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
         # CAP_OWN_TXN is set.
         yield Send(
             self._closing()
-            + self._encode_dml(encode_8i_sql_text(statement), O8I_STMT_TXN)
+            + self._encode_dml(encode_9i_sql_text(statement), O8I_STMT_TXN)
         )
         buf = yield from self._recv_dml_terminal(statement)
         (_row_count, err_code, message) = decode_9i_oall8_dml_response(buf)
@@ -1297,7 +1298,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
         out_positions = [i for i, b in enumerate(bind) if isinstance(b, Var)]
         stmt_type = o8i_stmt_type(sql.strip().upper())
         yield Send(
-            self._closing() + self._encode_dml(encode_8i_sql_text(sql), stmt_type, bind)
+            self._closing() + self._encode_dml(encode_9i_sql_text(sql), stmt_type, bind)
         )
         buf = yield from self._recv_dml_terminal('PL/SQL block')
         if out_positions:

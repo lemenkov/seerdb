@@ -14215,7 +14215,7 @@ def _encode_9i_oall8(Seq: int, Sql: bytes, StmtType: int, Binds: list) -> bytes:
             Message += b''.join(_encode_9i_bind_oac(V) for V in Binds)
             Message += bytes([0x07])
             for Value in Binds:
-                Message += _encode_8i_bind_value(Value)
+                Message += _encode_9i_bind_value(Value)
     finally:
         _ENCODE_FIELD_VERSION.reset(Token)
     return Message
@@ -14223,22 +14223,65 @@ def _encode_9i_oall8(Seq: int, Sql: bytes, StmtType: int, Binds: list) -> bytes:
 
 def _encode_9i_bind_oac(Value: object) -> bytes:
     # The 64-bit OALL8 bind descriptor: ``01 <TNS type> <flag> 00 00``, an 8-byte
-    # little-endian max size, then 28 reserved bytes (41 bytes). The type and
-    # size mirror the 8i 32-bit descriptor (:func:`_encode_8i_bind_oac`); the
-    # flag is 0x05 for an OUT-capable Var, 0x01 otherwise.
+    # little-endian max size, then 28 reserved bytes (41 bytes); the flag is 0x05
+    # for an OUT-capable Var, 0x01 otherwise. The type and size must declare the
+    # form the value goes in (_encode_9i_bind_value), as the thin 9i path's do
+    # (#797): a sub-second datetime is a TIMESTAMP (11 bytes) and a tz-aware one a
+    # TIMESTAMP WITH TIME ZONE (13) -- declared a DATE (7), the server refused it
+    # with ORA-01483 -- a timedelta an INTERVAL DAY TO SECOND (11; read as text it
+    # failed with ORA-01867) and an IntervalYM an INTERVAL YEAR TO MONTH (5). Text
+    # rides in the session's UTF-8, so its size counts the UTF-8 bytes.
     from seerdb.common.datatypes import Var
 
+    Flag = 0x01
     if isinstance(Value, Var):
         DType, Size, Flag = Value.dbtype.tns_type, max(Value.size or 22, 1), 0x05
     elif isinstance(Value, (bool, int, float, Decimal)):
-        DType, Size, Flag = 2, 22, 0x01
+        DType, Size = 2, 22
     elif isinstance(Value, (bytes, bytearray)):
-        DType, Size, Flag = 23, max(len(Value), 1), 0x01
-    elif isinstance(Value, (datetime.datetime, datetime.date)):
-        DType, Size, Flag = 12, 7, 0x01
+        DType, Size = TNS_TYPE_RAW, max(len(Value), 1)
+    elif isinstance(Value, datetime.datetime):
+        if Value.tzinfo is not None:
+            DType, Size = TNS_TYPE_TIMESTAMPTZ, 13
+        elif _is_wide_datetime(Value):
+            DType, Size = TNS_TYPE_TIMESTAMP, 11
+        else:
+            DType, Size = TNS_TYPE_DATE, 7
+    elif isinstance(Value, datetime.date):
+        DType, Size = TNS_TYPE_DATE, 7
+    elif isinstance(Value, datetime.timedelta):
+        DType, Size = TNS_TYPE_INTERVALDS, 11
+    elif isinstance(Value, IntervalYM):
+        DType, Size = TNS_TYPE_INTERVALYM, 5
     else:
-        DType, Size, Flag = 1, max(len(str(Value).encode('latin-1')), 1), 0x01
+        DType, Size = TNS_TYPE_VARCHAR, max(len(str(Value).encode('utf-8')), 1)
     return bytes([1, DType, Flag, 0, 0]) + Size.to_bytes(8, 'little') + bytes(28)
+
+
+def _encode_9i_bind_value(Value: object) -> bytes:
+    # A 9i OALL8 bind value: the 8i form (_encode_8i_bind_value) except that text
+    # goes in the session's charset, UTF-8 -- the native OALL8 session negotiates
+    # the ordinary Unicode DTY, so latin-1 bytes reached a WE8ISO8859P1 database
+    # as invalid UTF-8 and a bound 'é' arrived as NULL (#797).
+    from seerdb.common.datatypes import Var
+
+    if isinstance(Value, Var):
+        return (
+            _encode_9i_bind_value(Value._value)
+            if Value.has_value
+            else _O8I_OUT_PLACEHOLDER
+        )
+    if isinstance(Value, str):
+        return encode_token_rxd(Value.encode('utf-8'))
+    return encode_token_rxd(Value)
+
+
+def encode_9i_sql_text(Sql: str) -> bytes:
+    """A statement's text as a native 9i OALL8 session takes it: UTF-8, the
+    session's negotiated charset (#797). The 8i form (encode_8i_sql_text) is
+    latin-1, and a literal 'é' sent that way swallowed its closing quote as a
+    UTF-8 lead byte (ORA-01756)."""
+    return Sql.encode('utf-8')
 
 
 def encode_9i_oall8_dml(
