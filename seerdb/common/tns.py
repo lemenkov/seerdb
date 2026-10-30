@@ -14427,20 +14427,34 @@ def decode_9i_oall8_exec_response(
     return (Rows, Rest, Last)
 
 
+# The session-state piggyback (TTI_RPA, 0x08) that precedes a 9i OALL8 status is a
+# fixed 27 bytes -- measured constant across SELECT terminals, DML/DDL/txn replies
+# and bound block / OUT-bind replies on 9.2. The OER follows it.
+_O9I_OALL8_RPA_LEN = 27
+
+
 def _o9i_oall8_oer(Terminal: bytes) -> bytes:
-    # The status OER (0x04) in a 9i OALL8 reply's terminal. A reply may open with a
-    # TTI_IOV (0x0b, a bound statement's bind prompt) and/or a TTI_RPA (0x08, the
-    # session-state piggyback), and a first-parse reply's RPA carries a value byte
-    # that collides with the OER token -- so scan for the first 0x04 that begins a
-    # REAL OER rather than the first 0x04 outright. The OER's first field is the
-    # call type / count (a small number: SELECT 1, DML 5, 0 on a first parse), so
-    # its three high bytes are zero; a 0x04 inside the RPA fails that and is
-    # skipped. Empty if no whole OER is there yet.
-    At = Terminal.find(bytes([TTI_OER]))
+    # The status OER (0x04) in a 9i OALL8 reply's terminal, past a leading TTI_RPA
+    # (0x08) session-state piggyback. The RPA is a fixed 27 bytes, so skip it by its
+    # length and take the OER straight after -- a first-parse RPA carries value bytes
+    # that collide with the OER token, so scanning for a 0x04 could land inside it.
+    # `Terminal` is the bytes from the RPA (a SELECT reply's post-row tail) or from
+    # the OER itself; a caller with a leading TTI_IOV / TTI_RXD strips those first.
+    Rest = Terminal
+    if (
+        Rest[:1] == bytes([TTI_RPA])
+        and len(Rest) >= _O9I_OALL8_RPA_LEN + 5
+        and Rest[_O9I_OALL8_RPA_LEN] == TTI_OER
+        and not any(Rest[_O9I_OALL8_RPA_LEN + 2 : _O9I_OALL8_RPA_LEN + 5])
+    ):
+        return Rest[_O9I_OALL8_RPA_LEN:]
+    # No (or an unexpected) RPA: scan for the first 0x04 that begins a real OER head
+    # (its leading call-type field is small, so the three bytes after it are zero).
+    At = Rest.find(bytes([TTI_OER]))
     while At >= 0:
-        if At + 5 <= len(Terminal) and not any(Terminal[At + 2 : At + 5]):
-            return Terminal[At:]
-        At = Terminal.find(bytes([TTI_OER]), At + 1)
+        if At + 5 <= len(Rest) and not any(Rest[At + 2 : At + 5]):
+            return Rest[At:]
+        At = Rest.find(bytes([TTI_OER]), At + 1)
     return b''
 
 
@@ -14503,7 +14517,11 @@ def decode_9i_oall8_block_out(
             Value = bytes(Rest[1 : 1 + Length]) if Length else None
             Rest = Rest[1 + Length + 4 :]  # value + ub4 indicator
             OutValues.append(Value)
-    (RowCount, Code, Message) = decode_9i_oall8_dml_response(Data)
+    # `Rest` now sits on the RPA + OER, so read the status from there rather than
+    # rescanning `Data` from the start -- the IOV and the OUT RXD hold value bytes
+    # that collide with the OER token, which a from-the-start scan can land on
+    # (a RETURNING run inside a statement sequence read a bogus code otherwise).
+    (RowCount, Code, Message) = decode_9i_oall8_dml_response(Rest)
     return (OutValues, RowCount, Code, Message)
 
 
