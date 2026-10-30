@@ -7526,6 +7526,114 @@ class TestFv2Bfile(unittest.TestCase):
         self.assertEqual(content, b'BFILE-9i-content' + bytes.fromhex('cafebabe'))
 
 
+class TestNative9iOall8Select(unittest.TestCase):
+    """Oracle 9i native OALL8 (0x5e) SELECT reply decode (#792): the OCI
+    fixed-width DCB describe / RXH / RXD / OER stream. Fixtures are real frames
+    captured from a 9.2 server answering ``select rownum from all_objects where
+    rownum <= 5`` with sqlplus ``arraysize 2`` (native_9i_fetch_arraysize2.pcap):
+    the execute reply (describe + row 1), then two fetch replies (rows 2-3 and
+    4-5), the second ending ORA-01403."""
+
+    EXEC = bytes.fromhex(
+        '101df3e432ba608ba95d000000000000787e0a1e142306ce0500000000000016'
+        '000000010000004b010200000016000000000000000000000000000000000000'
+        '000000000000000000000000000000000001060600000006524f574e554d0000'
+        '0000000000000700000007787e0a1e142306060102fc0100000001000000a95d'
+        '00000000000000000000000000001a5c00000000000000000000000000000502'
+        '0000ff7f0702c1020805002ab42b020000000001000000000000000000000000'
+        '0000000401000000010100000000000000000001001300030000000000000000'
+        '0000000000000000000000000000000000001d00000100000036010000000000'
+        '00000000000000000080d0d40300000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000000000000000000'
+    )
+    FETCH1 = bytes.fromhex(
+        '060002fc0100000002000000a95d0000000038bfd6030000000001001a5c0000'
+        '00000000000000000000000005020000ff7f010702c103150100010702c10408'
+        '0500000000000000000001000000000000000000000000000000040100000001'
+        '0300000000000000000001000000030020000000000000000000000000000000'
+        '0000000000000000001e00000100000036010000000000000000000000000000'
+        '80d0d40300000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+    )
+    FETCH2 = bytes.fromhex(
+        '060102e601000000020000005c9601000000000000000000000000001f020000'
+        '0000000000000000000000000000010000000702c1050702c106040100000001'
+        '0500000000000000000001000000030000000000000000000000000000000000'
+        '0000000000000000001f00000100000036010000000000000000000000000000'
+        '80d0d40300000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+    )
+
+    def _decode(self, data, columns, prev=None):
+        from seerdb.common.tns import (
+            _DECODE_FIELD_VERSION,
+            FIELD_VERSION_9_2,
+            decode_9i_oall8_exec_response,
+        )
+
+        token = _DECODE_FIELD_VERSION.set(FIELD_VERSION_9_2)
+        try:
+            return decode_9i_oall8_exec_response(data, columns, prev)
+        finally:
+            _DECODE_FIELD_VERSION.reset(token)
+
+    def test_describe_reads_the_rownum_column(self):
+        from seerdb.common.tns import decode_9i_oall8_describe
+
+        (columns, rest) = decode_9i_oall8_describe(self.EXEC)
+        self.assertEqual(len(columns), 1)
+        self.assertEqual(columns[0]['column_name'], 'ROWNUM')
+        self.assertEqual(columns[0]['data_type'], 2)  # NUMBER
+        # The trailer lands exactly on the first row header.
+        self.assertEqual(rest[0], 0x06)
+
+    def test_exec_reply_is_the_first_row_then_more(self):
+        from seerdb.common.tns import (
+            decode_9i_oall8_cursor_id,
+            decode_9i_oall8_describe,
+            decode_9i_oall8_status,
+        )
+
+        (columns, rest) = decode_9i_oall8_describe(self.EXEC)
+        (rows, terminal, _) = self._decode(rest, columns)
+        self.assertEqual(rows, [[1]])
+        self.assertEqual(decode_9i_oall8_status(terminal)['code'], 0)
+        self.assertEqual(decode_9i_oall8_cursor_id(terminal), 1)
+
+    # A standalone end-of-fetch status (ORA-01403), from the same session.
+    STATUS_1403 = bytes.fromhex(
+        '040200000001000000007b050000000001000000030000000000000000000000'
+        '0000000000000000000000000000001600000100000036010000000000000000'
+        '00000000000080d0d40300000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000000000000194f52412d30313430333a206e6f206461746120666f756e640a'
+    )
+
+    def test_fetch_replies_carry_the_remaining_rows(self):
+        from seerdb.common.tns import (
+            decode_9i_oall8_describe,
+            decode_9i_oall8_status,
+        )
+
+        (columns, _) = decode_9i_oall8_describe(self.EXEC)
+        (rows1, term1, last) = self._decode(self.FETCH1, columns)
+        self.assertEqual(rows1, [[2], [3]])
+        self.assertEqual(decode_9i_oall8_status(term1)['code'], 0)
+        # arraysize 2: rows 4-5 come back with "more rows" (code 0); the
+        # ORA-01403 end arrives on the next (empty) fetch.
+        (rows2, term2, _) = self._decode(self.FETCH2, columns, last)
+        self.assertEqual(rows2, [[4], [5]])
+        self.assertEqual(decode_9i_oall8_status(term2)['code'], 0)
+
+    def test_end_of_fetch_status_is_ora_01403(self):
+        from seerdb.common.tns import decode_9i_oall8_terminal_error
+
+        (code, message) = decode_9i_oall8_terminal_error(self.STATUS_1403)
+        self.assertEqual(code, 1403)
+        self.assertEqual(message, 'ORA-01403: no data found')
+
+
 class TestO8iBfile(unittest.TestCase):
     """Oracle 8i native BFILE read (#401, PROTOCOL §19.17): FILE_OPEN -> GETLEN
     -> READ -> FILE_CLOSE over TTI_LOBOPS in the 8i envelope (ub4-LE lengths +

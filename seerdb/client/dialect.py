@@ -42,6 +42,10 @@ from seerdb.common.tns import (
     decode_8i_dml_rowid,
     decode_8i_exec_response,
     decode_8i_terminal_error,
+    decode_9i_oall8_cursor_id,
+    decode_9i_oall8_describe,
+    decode_9i_oall8_exec_response,
+    decode_9i_oall8_terminal_error,
     decode_fv2_batch_errors,
     decode_fv2_bind_directions,
     decode_fv2_block_out,
@@ -66,6 +70,8 @@ from seerdb.common.tns import (
     encode_8i_oall8_fetch,
     encode_8i_oall8_query,
     encode_8i_sql_text,
+    encode_9i_oall8_fetch,
+    encode_9i_oall8_query,
     encode_o7_bfile_close,
     encode_o7_bfile_open,
     encode_o7_block,
@@ -88,6 +94,7 @@ from seerdb.common.tns import (
     o8i_block_complete,
     o8i_stmt_type,
     o8i_terminal_complete,
+    o9i_oall8_terminal_complete,
 )
 from seerdb.common.tns_consts import (
     ISO_LATIN_1_CHARSET,
@@ -627,6 +634,16 @@ def _8i_fetch_ended(terminal: bytes) -> bool:
     return False
 
 
+def _9i_oall8_fetch_ended(terminal: bytes) -> bool:
+    # Whether a 9i OALL8 query reply's status ends the fetch with ORA-01403; any
+    # other error it carries is raised (#792), as the 8i path does.
+    (err_code, message) = decode_9i_oall8_terminal_error(terminal)
+    if err_code == ORA_NO_DATA_FOUND:
+        return True
+    _raise_ora(err_code, message)
+    return False
+
+
 def _raise_ora(err_code: int, message: str | None) -> None:
     # Raise a mapped ORA error from a decoded (code, message) pair.
     if err_code:
@@ -689,15 +706,21 @@ class Oall8Dialect:
         # (no modern TTI_COMMIT); no array DML.
         return frozenset({CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_LOB, CAP_OWN_TXN})
 
+    def _encode_query(self, sql_text: bytes, bind: list | None) -> bytes:
+        # The OALL8 SELECT execute. 8i sends the 32-bit form; the 9i OALL8 dialect
+        # overrides this to send the native 64-bit form (#792).
+        return encode_8i_oall8_query(self._next_seq(), sql_text, bind)
+
+    def _encode_fetch(self, cursor: int, count: int, long_size: int) -> bytes:
+        # The OALL8 array fetch. 8i 32-bit; the 9i OALL8 dialect overrides it.
+        return encode_8i_oall8_fetch(self._next_seq(), cursor, count, long_size)
+
     def execute_query(self, sql: str, bind: list | None = None, fetch: int = 15):
         # 8i SELECT: the 9.2-era OALL8 query (§19.9-10). The reply is an 8i TTI_DCB
         # describe then a 9i-style RXH/RXD row stream. Row values are latin-1
         # (WE8ISO8859P1); the column charset drives decoding. Returns the same
         # 9-tuple as Fv2Dialect.execute_query so the cursor path is unchanged.
-        yield Send(
-            self._closing()
-            + encode_8i_oall8_query(self._next_seq(), encode_8i_sql_text(sql), bind)
-        )
+        yield Send(self._closing() + self._encode_query(encode_8i_sql_text(sql), bind))
         resp = yield RECV
         if resp is False:
             raise Exception('Connection closed during 8i query response')
@@ -725,11 +748,7 @@ class Oall8Dialect:
         try:
             ended = _8i_fetch_ended(terminal)
             while cursor and not ended:
-                yield Send(
-                    encode_8i_oall8_fetch(
-                        self._next_seq(), cursor, row_count, long_size
-                    )
-                )
+                yield Send(self._encode_fetch(cursor, row_count, long_size))
                 (more, terminal, last_row) = yield from self.recv_rows(
                     b'', columns, last_row
                 )
@@ -1019,15 +1038,111 @@ class Fv2Oall8Dialect(Oall8Dialect):
     ordinary 9i path (no own_txn), exactly as the default 9i dialect does."""
 
     def capabilities(self) -> frozenset[str]:
-        # Login works; no data operations are served yet, so advertise none.
-        return frozenset()
+        # SELECT is served over the native 64-bit OALL8 (#792): the request is the
+        # 64-bit execute + array fetch (byte-verified), and the reply is the OCI
+        # fixed-width DCB / RXH / RXD / OER stream (decode_9i_oall8_*), decoded by
+        # the overrides below. DML/DDL, PL/SQL blocks and LOB objects remain
+        # follow-ups. Commit/rollback fall to the ordinary 9i path (no own_txn).
+        return frozenset({CAP_QUERY})
+
+    def _encode_query(self, sql_text: bytes, bind: list | None) -> bytes:
+        # Native 64-bit OALL8 SELECT execute (FETCH option, byte-verified #792).
+        return encode_9i_oall8_query(self._next_seq(), sql_text, bind)
+
+    def _encode_fetch(self, cursor: int, count: int, long_size: int) -> bytes:
+        # Native 64-bit OALL8 array fetch (byte-verified #792). `long_size` caps a
+        # column's bytes per row; a huge value makes the 9.2 server return nothing,
+        # so the caller passes the widest column's buffer (+1), not 0x7FFFFFFF.
+        return encode_9i_oall8_fetch(self._next_seq(), cursor, count, long_size)
 
     def execute_query(self, sql: str, bind: list | None = None, fetch: int = 15):
-        raise NotSupportedError(
-            'the experimental 9i OALL8 dialect does not serve SELECT yet '
-            '(use the default 9i path for queries) (#716)'
+        # 9i native OALL8 SELECT (#792): the 64-bit execute with the FETCH option
+        # returns the describe + the first row batch; encode_9i_oall8_fetch pulls
+        # the rest. The reply is OCI fixed-width (decode_9i_oall8_*), not the 8i or
+        # thin form, so the describe / row / terminal decoders are overridden
+        # below. Returns the same 9-tuple as Fv2Dialect.execute_query so the cursor
+        # path is unchanged. (No binds / LONG / LOB yet — scalar SELECT only.)
+        yield Send(self._closing() + self._encode_query(encode_8i_sql_text(sql), bind))
+        resp = yield RECV
+        if resp is False:
+            raise Exception('Connection closed during 9i OALL8 query response')
+        packet = resp[1]
+        # A query refused at execute (e.g. ORA-00942) comes back as a TTI_OER, not
+        # the TTI_DCB describe — surface the mapped error rather than overrunning.
+        if packet[:1] == bytes([TTI_OER]):
+            (err_code, message) = decode_9i_oall8_terminal_error(packet)
+            if err_code:
+                _raise_ora(err_code, message)
+            from seerdb.common.exceptions import DatabaseError
+
+            raise DatabaseError('Oracle 9i OALL8 rejected the query (no ORA code)')
+        (columns, rest) = yield from self._recv_describe(packet)
+        has_long = any(col.get('data_type') in _O8I_LONG_TYPES for col in columns)
+        # The fetch's per-row column-buffer cap: the widest column's buffer + 1, as
+        # the native client sends. A LONG reads the whole value, one row per fetch.
+        long_size = (
+            0x7FFFFFFF
+            if has_long
+            else max((col.get('data_length') or 0) for col in columns) + 1
         )
-        yield  # pragma: no cover - keeps this a generator like the base method
+        row_count = 1 if has_long else (fetch or 15)
+        (rows, terminal, last_row) = yield from self.recv_rows(rest, columns, None)
+        # The server opens a fresh cursor per statement (its id increments), so the
+        # fetch loop reads it by the id the exec reply's OER carries. (The server
+        # closes it when the session ends; a per-statement close is a follow-up —
+        # the 8i close frame breaks a 9i OALL8 session, #792.)
+        cursor = decode_9i_oall8_cursor_id(terminal)
+        ended = _9i_oall8_fetch_ended(terminal)
+        while cursor and not ended:
+            yield Send(self._encode_fetch(cursor, row_count, long_size))
+            (more, terminal, last_row) = yield from self.recv_rows(
+                b'', columns, last_row
+            )
+            ended = _9i_oall8_fetch_ended(terminal)
+            if not more:
+                break
+            rows.extend(more)
+        return (0, 0, 0, (len(rows), columns), rows, None, None, [], None)
+
+    def _recv_describe(self, packet: bytes):
+        # The 9i OALL8 describe, read on across packets (a wide select list spans
+        # the SDU with no end-of-message flag, as on 8i #1226).
+        from seerdb.common.exceptions import Truncated
+
+        buf = bytes(packet)
+        while True:
+            try:
+                return decode_9i_oall8_describe(buf)
+            except (Truncated, IndexError):
+                received = yield RECV
+                if received is False:
+                    raise Exception(
+                        'Connection closed during 9i OALL8 describe'
+                    ) from None
+                buf += received[1]
+
+    def recv_rows(self, buf: bytes, columns: list, last_row: list | None):
+        # One 9i OALL8 execute / fetch row stream, accumulated across packets until
+        # it decodes cleanly AND leaves a whole terminal (the OCI-fixed analogue of
+        # the base 8i recv_rows). "Read more" is only a field off the end.
+        from seerdb.common.exceptions import Truncated
+
+        while True:
+            try:
+                (rows, terminal, last) = decode_9i_oall8_exec_response(
+                    buf, columns, last_row
+                )
+                if terminal and o9i_oall8_terminal_complete(terminal):
+                    return (rows, terminal, last)
+            except (Truncated, IndexError):
+                pass
+            received = yield RECV
+            if received is False:
+                try:
+                    return decode_9i_oall8_exec_response(buf, columns, last_row)
+                except (Truncated, IndexError):
+                    return ([], b'', last_row)
+            buf += received[1]
 
     def execute_dml(
         self,
