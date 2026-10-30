@@ -997,6 +997,7 @@ class OracleConnect(_ConnectionLogic):
         config_dir: str | None = None,
         dsn: str | None = None,
         negotiation_cache: bool = False,
+        oall8: bool = False,
         access_token: object = None,
         shardingkey: object = None,
         supershardingkey: object = None,
@@ -1209,6 +1210,8 @@ class OracleConnect(_ConnectionLogic):
         # records whether the current login took the cached (bare-PRO-skipping)
         # path, so connect() knows to invalidate + retry on a stale-cache failure.
         self.negotiation_cache = negotiation_cache
+        # Experimental 9i OALL8 opt-in (#716); ignored on non-9i tiers.
+        self._oall8 = oall8
         self._used_nego_cache = False
         self._skip_nego_cache = False  # forced true on the invalidate-and-retry
         self.server_version = 0
@@ -1517,6 +1520,7 @@ class OracleConnect(_ConnectionLogic):
         self._ano = None
         self.conn_key = None
         self._o3_phase = 0
+        self._o3_oall8 = False
         self._open_transport()
         self.handle_login()
 
@@ -1661,21 +1665,29 @@ class OracleConnect(_ConnectionLogic):
                                 self._o3_phase = 1
                                 self._send_8i_osesskey()
                             elif self.field_version < FIELD_VERSION_10_2:
-                                # Pre-10g (9i, field version 2): O3LOGON in the
-                                # thin-coded OSESSKEY, which fetches the session
-                                # key (#90, #2342).
-                                from seerdb.common.tns import encode_o7_osesskey
-
                                 self._o3_phase = 1
-                                self.send(
-                                    TNS_DATA,
-                                    encode_o7_osesskey(
-                                        self._next_seq(),
-                                        self.user.encode('utf-8'),
-                                        self._o7_logon_mode(),
-                                        self._o7_session_pairs(),
-                                    ),
-                                )
+                                if self._oall8:
+                                    # Native OALL8 (#790): once the native data-
+                                    # type negotiation has run, the 9.2 server
+                                    # expects the OCI OSESSKEY call frame; it drives
+                                    # the 8-byte O3LOGON proof (CCAP_LOGON_TYPES 0).
+                                    self._o3_oall8 = True
+                                    self._send_oall8_osesskey()
+                                else:
+                                    # Pre-10g (9i, field version 2): O3LOGON in the
+                                    # thin-coded OSESSKEY, which fetches the session
+                                    # key (#90, #2342).
+                                    from seerdb.common.tns import encode_o7_osesskey
+
+                                    self.send(
+                                        TNS_DATA,
+                                        encode_o7_osesskey(
+                                            self._next_seq(),
+                                            self.user.encode('utf-8'),
+                                            self._o7_logon_mode(),
+                                            self._o7_session_pairs(),
+                                        ),
+                                    )
                             elif self.access_token is not None:
                                 # Token auth (#125): skip OSESSKEY entirely and
                                 # send the single token AUTH message; the reply is
@@ -1702,8 +1714,26 @@ class OracleConnect(_ConnectionLogic):
                                 logger.debug('handle_login: authenticated (8i O3LOGON)')
                                 return 0
                             if getattr(self, '_o3_phase', 0) == 1:
-                                self._send_o3logon_phase2(Packet)
+                                if getattr(self, '_o3_oall8', False):
+                                    self._send_oall8_oauth_phase2(Packet)
+                                else:
+                                    self._send_o3logon_phase2(Packet)
                                 continue
+                            if getattr(self, '_o3_oall8', False) and (
+                                getattr(self, '_o3_phase', 0) == 2
+                            ):
+                                # Native OALL8 O3LOGON completion (#790): the 9.2
+                                # server accepts the OAUTH proof and answers with
+                                # an RPA carrying the AUTH_ success params (version
+                                # string, session id, ...), exactly as the 8i
+                                # O3LOGON path does. There is no O5LOGON server
+                                # proof to validate on the pre-10g path, so this
+                                # RPA means authenticated.
+                                self.conn_state = CONN_STATE_AUTHENTICATED
+                                logger.debug(
+                                    'handle_login: authenticated (9i OALL8 O3LOGON)'
+                                )
+                                return 0
                             if getattr(self, '_o3_phase', 0) == 2:
                                 # 9i's OAUTH answered with its pairs (#2342):
                                 # authenticated, no server proof to check on the
@@ -1731,7 +1761,30 @@ class OracleConnect(_ConnectionLogic):
                             )
                             from seerdb.common.tns import decode_packet
 
-                            if getattr(self, '_o3_phase', 0):
+                            if getattr(self, '_o3_oall8', False) and (
+                                getattr(self, '_o3_phase', 0) == 2
+                            ):
+                                # The native OALL8 OER (9.2 OCI path) uses neither
+                                # the 9i-short nor the 11g+ layout decode_packet
+                                # knows. Its ORA message travels verbatim in the
+                                # packet, so recover the code from the embedded
+                                # "ORA-NNNNN" text (e.g. a bad password surfaces
+                                # ORA-01017); an OER with no such text is a clean,
+                                # authenticated completion.
+                                Marker = Packet.find(b'ORA-')
+                                if Marker < 0:
+                                    ErrCode = 0
+                                else:
+                                    Digits = Packet[Marker + 4 : Marker + 9]
+                                    ErrCode = int(Digits.decode('ascii', 'ignore') or 0)
+                                Message = (
+                                    Packet[Marker:]
+                                    .split(b'\n')[0]
+                                    .decode('ascii', 'ignore')
+                                    if Marker >= 0
+                                    else None
+                                )
+                            elif getattr(self, '_o3_phase', 0):
                                 # An 8i or 9i login, refused at either phase: its
                                 # tier's status, not the 10g+ one (#2340).
                                 (ErrCode, Message) = self._pre10_login_error(Packet)
@@ -2062,6 +2115,55 @@ class OracleConnect(_ConnectionLogic):
         self.send(
             TNS_DATA,
             encode_o3logon_oauth_phase2(
+                self._next_seq(),
+                UserB,
+                PwdField,
+                self._auth_info_pairs() + [(b'AUTH_ACL', b'8000')],
+            ),
+        )
+
+    def _send_oall8_osesskey(self) -> None:
+        # Native 9i OALL8 O3LOGON phase one: OSESSKEY (0x76) in the OCI envelope
+        # (#790); the server replies with an AUTH_SESSKEY RPA in the native DALC
+        # coding.
+        from seerdb.common.tns import encode_oall8_osesskey_phase1
+
+        self.send(
+            TNS_DATA,
+            encode_oall8_osesskey_phase1(
+                self._next_seq(), self.user.encode('utf-8'), self._auth_info_pairs()
+            ),
+        )
+
+    def _send_oall8_oauth_phase2(self, Packet: bytes) -> None:
+        # Native 9i OALL8 O3LOGON phase two: recover the session key, DES-encrypt
+        # the password under it (the same crypto as the thin 9i / 8i paths), and
+        # send it as AUTH_PASSWORD in the OAUTH (0x73) call.
+        from binascii import hexlify
+
+        from seerdb.common.crypto import des_verifier, o3logon
+        from seerdb.common.tns import (
+            encode_oall8_oauth_phase2,
+            parse_oall8_auth_sesskey,
+        )
+
+        SessKey = parse_oall8_auth_sesskey(Packet)
+        UserB = self.user.encode('utf-8')
+        PassB = self.password.encode('utf-8')
+        Verifier = des_verifier(UserB, PassB)
+        (AuthPass, _, _) = o3logon(SessKey, Verifier, PassB)
+        # With CCAP_LOGON_TYPES forced to 0 (see _O3_OALL8_COMPILE_CAPS) the 9.2
+        # server issues an 8-byte DES O3LOGON session key, so AUTH_PASSWORD is the
+        # same proof the thin TTI_3LOGON / 8i paths send: upper-hex(DES cipher)
+        # followed by the decimal pad count. (#790)
+        PadCount = (8 - len(PassB) % 8) % 8
+        PwdField = (hexlify(AuthPass).decode('ascii').upper() + str(PadCount)).encode(
+            'ascii'
+        )
+        self._o3_phase = 2
+        self.send(
+            TNS_DATA,
+            encode_oall8_oauth_phase2(
                 self._next_seq(),
                 UserB,
                 PwdField,

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from typing import Callable, Protocol
 
+from seerdb.common.exceptions import NotSupportedError
 from seerdb.common.sqltext import is_reusable_dml
 from seerdb.common.tns import (
     FV2_BIND_IN,
@@ -630,11 +631,19 @@ def _raise_ora(err_code: int, message: str | None) -> None:
         raise from_ora_code(err_code)(message or f'ORA-{err_code:05d}', code=err_code)
 
 
-class O8iDialect:
-    """Oracle 8i (8.1.7) — the 9.2-era OALL8 (0x5e) dialect (#244, PROTOCOL.md
-    §19.9-19.17). Sans-io: driven by ``_drive``. Unlike 9i it numbers each call
-    from the connection's sequence, so it takes the connection's ``next_seq``
-    callable (colorless — a pure counter)."""
+class Oall8Dialect:
+    """The native OALL8 (0x5e) wire dialect (#244, PROTOCOL.md §19.9-19.17),
+    shared by Oracle 8i and the opt-in 9i OALL8 path (#716). Sans-io: driven by
+    ``_drive``. It numbers each call from the connection's sequence, so it takes
+    the connection's ``next_seq`` callable (colorless — a pure counter).
+
+    The tiers subclass this: :class:`O8iDialect` for 8i and
+    :class:`Fv2Oall8Dialect` for 9i. They share every wire method here and differ
+    only in the DML request width (``_encode_dml`` — 8i is 32-bit, 9i 64-bit) and
+    in which statement kinds they serve. The login path (short DTY + O3LOGON
+    OSESSKEY for 8i) is selected in connection.py by ``isinstance(O8iDialect)``,
+    so the 9i subclass — not being an O8iDialect — logs in as an ordinary 9i
+    client."""
 
     def __init__(self, next_seq: Callable[[], int]) -> None:
         self._next_seq = next_seq
@@ -800,6 +809,14 @@ class O8iDialect:
                     return ([], b'', last_row)
             buf += received[1]
 
+    def _encode_dml(
+        self, sql_text: bytes, stmt_type: int, bind: list | None = None
+    ) -> bytes:
+        # The OALL8 DML / DDL / txn request body (SQL already encoded via
+        # encode_8i_sql_text). 8i sends the 32-bit OALL8 form; the 9i OALL8
+        # dialect overrides this to send the native 64-bit form (#716/#790).
+        return encode_8i_oall8_dml(self._next_seq(), sql_text, stmt_type, bind)
+
     def execute_dml(
         self,
         sql: str,
@@ -815,10 +832,7 @@ class O8iDialect:
         assert not batch
         stmt_type = o8i_stmt_type(sql.strip().upper())
         yield Send(
-            self._closing()
-            + encode_8i_oall8_dml(
-                self._next_seq(), encode_8i_sql_text(sql), stmt_type, bind
-            )
+            self._closing() + self._encode_dml(encode_8i_sql_text(sql), stmt_type, bind)
         )
         received = yield RECV
         if received is False:
@@ -841,10 +855,7 @@ class O8iDialect:
         out_positions = [i for i, b in enumerate(bind) if isinstance(b, Var)]
         stmt_type = o8i_stmt_type(sql.strip().upper())
         yield Send(
-            self._closing()
-            + encode_8i_oall8_dml(
-                self._next_seq(), encode_8i_sql_text(sql), stmt_type, bind
-            )
+            self._closing() + self._encode_dml(encode_8i_sql_text(sql), stmt_type, bind)
         )
         received = yield RECV
         if received is False:
@@ -882,9 +893,7 @@ class O8iDialect:
         # OALL8 as ordinary statements (§19.12, statement type 0).
         yield Send(
             self._closing()
-            + encode_8i_oall8_dml(
-                self._next_seq(), encode_8i_sql_text(statement), O8I_STMT_TXN
-            )
+            + self._encode_dml(encode_8i_sql_text(statement), O8I_STMT_TXN)
         )
         received = yield RECV
         if received is False:
@@ -976,3 +985,54 @@ class O8iDialect:
             (content, complete) = decode_fv2_lob_chunks(data)
             if complete:
                 return content
+
+
+class O8iDialect(Oall8Dialect):
+    """Oracle 8i (8.1.7): the OALL8 wire dialect with the 8i login path (the
+    short _DTY_8I capability block and the O3LOGON OSESSKEY envelope, selected in
+    connection.py by ``isinstance(O8iDialect)``). It adds nothing to the shared
+    base — 8i uses the 32-bit ``_encode_dml`` the base provides — but is its own
+    type so the login tier stays detectable and the 9i OALL8 dialect distinct."""
+
+
+class Fv2Oall8Dialect(Oall8Dialect):
+    """Oracle 9i over the native 64-bit OALL8 (0x5e), opt-in and experimental
+    (#716/#790). This increment establishes the native login only: the server
+    completes the OCI PRO/DTY negotiation and the OSESSKEY/OAUTH handshake, and
+    the session authenticates as an ordinary 9i client (it is not an O8iDialect).
+
+    No data operations are served yet — SELECT, DML/DDL, PL/SQL blocks and
+    RETURNING are follow-ups — so each raises a clear error rather than desyncing
+    the connection. The native 64-bit request encoder (encode_9i_oall8_dml) lives
+    in common/tns.py, ready for those follow-ups. Commit/rollback fall to the
+    ordinary 9i path (no own_txn), exactly as the default 9i dialect does."""
+
+    def capabilities(self) -> frozenset[str]:
+        # Login works; no data operations are served yet, so advertise none.
+        return frozenset()
+
+    def execute_query(self, sql: str, bind: list | None = None, fetch: int = 15):
+        raise NotSupportedError(
+            'the experimental 9i OALL8 dialect does not serve SELECT yet '
+            '(use the default 9i path for queries) (#716)'
+        )
+        yield  # pragma: no cover - keeps this a generator like the base method
+
+    def execute_dml(
+        self,
+        sql: str,
+        bind: list | None = None,
+        batch: list | None = None,
+        batcherrors: bool = False,
+        cache: dict | None = None,
+    ):
+        raise NotSupportedError(
+            'the experimental 9i OALL8 dialect does not serve DML/DDL yet (#716)'
+        )
+        yield  # pragma: no cover
+
+    def execute_block(self, sql: str, bind: list | None = None):
+        raise NotSupportedError(
+            'the experimental 9i OALL8 dialect does not serve PL/SQL blocks yet (#716)'
+        )
+        yield  # pragma: no cover
