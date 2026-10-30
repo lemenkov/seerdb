@@ -74,6 +74,7 @@ from seerdb.common.tns import (
     encode_9i_oall8_dml,
     encode_9i_oall8_fetch,
     encode_9i_oall8_lob_read,
+    encode_9i_oall8_lobop,
     encode_9i_oall8_query,
     encode_o7_bfile_close,
     encode_o7_bfile_open,
@@ -102,6 +103,9 @@ from seerdb.common.tns import (
 from seerdb.common.tns_consts import (
     ISO_LATIN_1_CHARSET,
     ORA_NO_DATA_FOUND,
+    TNS_LOB_OP_FILE_CLOSE,
+    TNS_LOB_OP_FILE_OPEN,
+    TNS_LOB_OP_GET_LENGTH,
     TNS_TYPE_BFILE,
     TNS_TYPE_REFCURSOR,
     TTI_LOB,
@@ -1141,6 +1145,48 @@ class Fv2Oall8Dialect(Oall8Dialect):
             (content, complete) = decode_fv2_lob_chunks(data)
             if complete:
                 return content
+
+    def bfile_read(self, locator: bytes):
+        # BFILE read over a native 9i OALL8 session (#796): FILE_OPEN -> GET_LENGTH
+        # -> READ -> FILE_CLOSE, as on 8i, each a 64-bit TTI_LOBOPS
+        # (encode_9i_oall8_lobop). FILE_OPEN (read-only, mode 0x0b) answers with
+        # the open-flagged locator the rest must use (decode_fv2_opened_locator);
+        # GET_LENGTH's reply has the length where 8i's has it
+        # (decode_o8i_bfile_getlen). A file or directory that cannot open is
+        # answered with a status alone. FILE_CLOSE runs in a finally so an opened
+        # file is always closed.
+        yield Send(
+            encode_9i_oall8_lobop(
+                self._next_seq(), locator, TNS_LOB_OP_FILE_OPEN, 0, 0x0B
+            )
+        )
+        resp = yield RECV
+        if resp is False:
+            raise Exception('Connection closed during 9i OALL8 BFILE FILE_OPEN')
+        if resp[1][:1] == bytes([TTI_OER]):
+            # e.g. ORA-22285 (no such directory)
+            _raise_ora(*decode_9i_oall8_terminal_error(resp[1]))
+        opened = decode_fv2_opened_locator(resp[1])
+        if opened is None:
+            raise Exception(
+                'Unexpected 9i OALL8 BFILE FILE_OPEN reply', resp[1][:8].hex()
+            )
+        try:
+            yield Send(
+                encode_9i_oall8_lobop(self._next_seq(), opened, TNS_LOB_OP_GET_LENGTH)
+            )
+            resp = yield RECV
+            if resp is False:
+                raise Exception('Connection closed during 9i OALL8 BFILE GETLEN')
+            amount = decode_o8i_bfile_getlen(resp[1])
+            if amount <= 0:
+                return b''
+            return (yield from self.lob_read(opened, 1, amount))
+        finally:
+            yield Send(
+                encode_9i_oall8_lobop(self._next_seq(), opened, TNS_LOB_OP_FILE_CLOSE)
+            )
+            yield RECV  # drain FILE_CLOSE RPA + OER
 
     def _recv_describe(self, packet: bytes):
         # The 9i OALL8 describe, read on across packets (a wide select list spans

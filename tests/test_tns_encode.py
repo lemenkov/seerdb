@@ -7520,6 +7520,36 @@ class TestO9iOall8Messages(unittest.TestCase):
         self.assertEqual(len(locator), 86)
         self.assertEqual(encode_9i_oall8_lob_read(0x1F, locator, 0x50), bytes(native))
 
+    def test_9i_oall8_bfile_calls_share_the_read_head(self):
+        # FILE_OPEN / GET_LENGTH / FILE_CLOSE ride the READ's head with their own
+        # operation (live-verified on 9.2 end to end). OPEN carries the read-only
+        # mode 0x0b as its amount; CLOSE carries no amount, so neither its amount
+        # pointer nor the trailing ub4 is there.
+        from seerdb.common import oci
+        from seerdb.common.tns import (
+            TNS_LOB_OP_FILE_CLOSE,
+            TNS_LOB_OP_FILE_OPEN,
+            TNS_LOB_OP_GET_LENGTH,
+            encode_9i_oall8_lobop,
+        )
+
+        locator = bytes.fromhex(
+            '0020000108080000000100000000000000054246444952000968656c6c6f2e62696e'
+        )
+        opened = encode_9i_oall8_lobop(3, locator, TNS_LOB_OP_FILE_OPEN, 0, 0x0B)
+        self.assertEqual(len(opened), 91 + len(locator) + 4)
+        self.assertEqual(opened[67:75], (0x100).to_bytes(8, 'little'))
+        self.assertEqual(opened[51:59], oci.OCI_INDICATOR)
+        self.assertEqual(opened[-4:], (0x0B).to_bytes(4, 'little'))
+        length = encode_9i_oall8_lobop(4, locator, TNS_LOB_OP_GET_LENGTH)
+        self.assertEqual(length[67:75], (1).to_bytes(8, 'little'))
+        self.assertEqual(length[-4:], bytes(4))
+        closed = encode_9i_oall8_lobop(5, locator, TNS_LOB_OP_FILE_CLOSE)
+        self.assertEqual(len(closed), 91 + len(locator))
+        self.assertEqual(closed[51:59], bytes(8))
+        self.assertEqual(closed[67:75], (0x200).to_bytes(8, 'little'))
+        self.assertEqual(closed[91:], locator)
+
 
 class TestShortLengthBoundary(unittest.TestCase):
     """A single length byte announces at most 252 bytes (#707).

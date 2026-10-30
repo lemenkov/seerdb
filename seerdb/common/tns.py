@@ -14290,29 +14290,45 @@ def encode_9i_oall8_fetch(
     return bytes(Frame)
 
 
-def encode_9i_oall8_lob_read(
-    Seq: int, Locator: bytes, Amount: int, Offset: int = 1
+def encode_9i_oall8_lobop(
+    Seq: int, Locator: bytes, Operation: int, Offset: int = 0, Amount: int = 0
 ) -> bytes:
-    # A CLOB / BLOB READ on a native 9i OALL8 session (#795): TTI_LOBOPS (0x60) in
-    # the 64-bit form -- the 8i (32-bit) and thin-9i LOBOPS envelopes both draw no
-    # reply here. Byte-reproduced from a native 9.2 sqlplus CLOB read
-    # (native_9i_clob_read.pcap): a 91-byte head, then the locator as fetched (a
-    # ub2 length and the body, 86 bytes for a CLOB / BLOB) and the ub4 amount. In
-    # the head, the source pointer sits at 3 and the amount pointer at 51 (the
-    # native client's heap addresses, which the server ignores, so the non-null
-    # oci.OCI_INDICATOR stands in), the locator's length at 11 (8 bytes), the
-    # 1-based offset at 31 and the operation (READ) at 67; the rest is zero.
-    # Like 8i, one call with a large `Amount` reads the whole value (chars for a
-    # CLOB, bytes for a BLOB); the reply is the shared `0e fe <chunks> 00`
-    # (decode_fv2_lob_chunks).
+    # A TTI_LOBOPS (0x60) call on a native 9i OALL8 session (#795/#796), in the
+    # 64-bit form -- the 8i (32-bit) and thin-9i LOBOPS envelopes both draw no
+    # reply here. A 91-byte head, then the locator as fetched (a ub2 length and
+    # the body: 86 bytes for a CLOB / BLOB, more for a BFILE) and, when the
+    # operation carries one, the ub4 short amount. In the head the source pointer
+    # sits at 3, the locator's length at 11 (8 bytes), the 1-based offset at 31,
+    # the amount pointer at 51, the null-LOB pointer at 59 and the operation at 67
+    # (8 bytes); the rest is zero. The pointers are the native client's heap
+    # addresses, which the server ignores, so the non-null oci.OCI_INDICATOR
+    # stands in. Byte-reproduced from a native 9.2 sqlplus CLOB READ
+    # (native_9i_clob_read.pcap); FILE_OPEN, GET_LENGTH and FILE_CLOSE use the same
+    # head and are live-verified on 9.2 (a BFILE read end to end).
+    Flags = _O7_LOBOP_FLAGS.get(Operation, {})
+    AmountPresent = Flags.get('short_amount_present', True)
     Frame = bytearray(91)
     Frame[0:3] = bytes([TTI_FUN, TTI_LOBOPS, Seq & 0xFF])
     Frame[3:11] = oci.OCI_INDICATOR
     Frame[11:19] = len(Locator).to_bytes(8, 'little')
     Frame[31:35] = Offset.to_bytes(4, 'little')
-    Frame[51:59] = oci.OCI_INDICATOR
-    Frame[67:75] = TNS_LOB_OP_READ.to_bytes(8, 'little')
-    return bytes(Frame) + Locator + (Amount & 0xFFFFFFFF).to_bytes(4, 'little')
+    if AmountPresent:
+        Frame[51:59] = oci.OCI_INDICATOR
+    if Flags.get('null_lob_present', False):
+        Frame[59:67] = oci.OCI_INDICATOR
+    Frame[67:75] = Operation.to_bytes(8, 'little')
+    Tail = (Amount & 0xFFFFFFFF).to_bytes(4, 'little') if AmountPresent else b''
+    return bytes(Frame) + Locator + Tail
+
+
+def encode_9i_oall8_lob_read(
+    Seq: int, Locator: bytes, Amount: int, Offset: int = 1
+) -> bytes:
+    # A CLOB / BLOB / BFILE READ on a native 9i OALL8 session (#795): like 8i, one
+    # call with a large `Amount` reads the whole value (chars for a CLOB, bytes for
+    # a BLOB / BFILE); the reply is the shared `0e fe <chunks> 00`
+    # (decode_fv2_lob_chunks).
+    return encode_9i_oall8_lobop(Seq, Locator, TNS_LOB_OP_READ, Offset, Amount)
 
 
 # --- 9i native OALL8 SELECT reply decode (#792) ---

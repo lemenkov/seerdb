@@ -7752,6 +7752,44 @@ class TestNative9iOall8Select(unittest.TestCase):
         self.assertEqual(rows[1][1].raw[:2], bytes.fromhex('0054'))
         self.assertEqual(decode_9i_oall8_status(term)['code'], 1403)
 
+    # BFILENAME('BFDIR', 'hello.bin') on 9.2 over the OALL8 session: the fetched
+    # locator, and the replies to its FILE_OPEN and GET_LENGTH (64-bit LOBOPS).
+    BFILE_LOCATOR = bytes.fromhex(
+        '0020000108080000000100000000000000054246444952000968656c6c6f2e62696e'
+    )
+    BFILE_OPEN_REPLY = bytes.fromhex(
+        '080020000108080000000100010000000000054246444952000968656c6c6f2e'
+        '62696e0b00000004010000000101000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000008000001000000360100'
+        '0000000000000000000000000080d0d403000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00000000000000000000000000'
+    )
+    BFILE_GETLEN_REPLY = bytes.fromhex(
+        '080020000108080000000100010000000000054246444952000968656c6c6f2e'
+        '62696e1400000004010000000101000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000009000001000000360100'
+        '0000000000000000000000000080d0d403000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00000000000000000000000000'
+    )
+
+    def test_bfile_open_and_length_replies(self):
+        # FILE_OPEN hands back the locator with its open flag (byte 11) set, which
+        # the later calls must use; GET_LENGTH's reply carries the 20-byte length
+        # where 8i's does, so the 8i reader parses it (the thin one reads 0).
+        from seerdb.common.tns import (
+            decode_fv2_opened_locator,
+            decode_o8i_bfile_getlen,
+        )
+
+        opened = decode_fv2_opened_locator(self.BFILE_OPEN_REPLY)
+        self.assertEqual(len(opened), len(self.BFILE_LOCATOR))
+        self.assertEqual(self.BFILE_LOCATOR[11], 0)
+        self.assertEqual(opened[11], 1)
+        self.assertEqual(opened[:11], self.BFILE_LOCATOR[:11])
+        self.assertEqual(decode_o8i_bfile_getlen(self.BFILE_GETLEN_REPLY), 20)
+
 
 class TestO8iBfile(unittest.TestCase):
     """Oracle 8i native BFILE read (#401, PROTOCOL §19.17): FILE_OPEN -> GETLEN
