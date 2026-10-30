@@ -7633,6 +7633,32 @@ class TestNative9iOall8Select(unittest.TestCase):
         self.assertEqual(code, 1403)
         self.assertEqual(message, 'ORA-01403: no data found')
 
+    # Non-query replies (an RPA piggyback then the OER): the affected-row count is
+    # a ub4 at the OER's offset 6. Real 9.2 frames for `insert ... values (1)` (one
+    # row) and `update ... set id=id+5` (two rows).
+    DML_INSERT = bytes.fromhex(
+        '080500b5dd2b0200000000020000000100000000000000000000000402000000'
+        '010100000000000000000002000c000200000000008644030001000000d2b800'
+        '0000000000000000000008000001000000360100000000000000000000000000'
+        '0080d0d403000000000d00000000000000000000000000000000000000000000'
+        '000000000000000000000000000000000000000000000000000000000000000d'
+        '000d010003448600010000b8d20000'
+    )
+    DML_UPDATE = bytes.fromhex(
+        '080500b6dd2b0200000000050000000100000000000000000000000402000000'
+        '0102000000000000000000050007000600000000118644030001000000d2b800'
+        '000100000000000000000a000001000000360100000000000000000000000000'
+        '0080d0d403000000000d00000000000000000000000000000000000000000000'
+        '000000000000000000000000000000000000000000000000000000000000000d'
+        '000d010003448600010000b8d20001'
+    )
+
+    def test_dml_reply_reports_the_affected_row_count(self):
+        from seerdb.common.tns import decode_9i_oall8_dml_response
+
+        self.assertEqual(decode_9i_oall8_dml_response(self.DML_INSERT), (1, 0, None))
+        self.assertEqual(decode_9i_oall8_dml_response(self.DML_UPDATE), (2, 0, None))
+
 
 class TestO8iBfile(unittest.TestCase):
     """Oracle 8i native BFILE read (#401, PROTOCOL §19.17): FILE_OPEN -> GETLEN

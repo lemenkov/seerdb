@@ -14161,21 +14161,21 @@ def _encode_9i_oall8(Seq: int, Sql: bytes, StmtType: int, Binds: list) -> bytes:
     IsQuery = StmtType == O8I_STMT_SELECT
     # A SELECT adds the FETCH option so the execute reply carries the describe and
     # the first row batch (#792); the continuation fetches use the FETCH-only form
-    # (encode_9i_oall8_fetch). Byte4 is 0x80 for a no-bind query vs 0x81 for a
-    # no-bind DML -- the only numeric difference from the DML form, byte-verified
-    # against a native 9.2 SELECT capture (native_9i_select.pcap, #792).
+    # (encode_9i_oall8_fetch). Byte4 is 0x80 for a no-bind cursor statement --
+    # SELECT and DML alike: its low bit is commit-on-success, so 0x81 made every
+    # DML autocommit (another session saw an uncommitted row, and rollback was a
+    # no-op). 0x80 is transactional, byte-verified against native 9.2 SELECT and
+    # INSERT captures; the caller commits (#716/#792).
     Option = (
         TNS_EXEC_OPTION_PARSE
         | TNS_EXEC_OPTION_EXECUTE
         | (TNS_EXEC_OPTION_BIND if NumBinds else 0)
         | (TNS_EXEC_OPTION_FETCH if IsQuery else 0)
     )
-    if IsQuery:
-        Byte4 = 0x05 if NumBinds else 0x80
-    elif IsBlock:
+    if IsBlock:
         Byte4 = 0x05 if NumBinds else 0x00
     else:
-        Byte4 = 0x05 if NumBinds else 0x81
+        Byte4 = 0x05 if NumBinds else 0x80
     Byte5 = 0x04 if (NumBinds and not IsBlock) or IsBlock else 0x00
     Head = bytes([TTI_FUN, TTI_ALL8, Seq & 0xFF, Option, Byte4, Byte5, 0, 0, 0, 0, 0])
     Mid = (
@@ -14458,6 +14458,24 @@ def decode_9i_oall8_cursor_id(Terminal: bytes) -> int:
     if len(Oer) < 17:
         return 0
     return Oer[16]
+
+
+def decode_9i_oall8_dml_response(Terminal: bytes) -> tuple[int, int, str | None]:
+    # The affected-row count, ORA code and message a 9i OALL8 non-query (DML / DDL
+    # / transaction-control) reply carries (#716). The count is a ub4 at OER offset
+    # 6 -- the "rows processed" field, where a SELECT reply reports its batch size
+    # (UPDATE of 2 rows -> 2, INSERT / DELETE -> 1, DDL / COMMIT -> 0; read live on
+    # 9.2) -- and the code / message come from decode_9i_oall8_status. A failed
+    # statement reports no count; its error is raised instead. Returns
+    # (rowcount, code, message); raises Truncated if the OER is cut short, for the
+    # reader to read on.
+    Status = decode_9i_oall8_status(Terminal)
+    if Status is None:
+        return (0, 0, None)
+    Oer = _o9i_oall8_oer(Terminal)
+    Rows = int.from_bytes(Oer[6:10], 'little') if len(Oer) >= 10 else 0
+    Code = Status['code']
+    return (0 if Code else Rows, Code, Status['message'])
 
 
 def decode_9i_oall8_status(Terminal: bytes) -> dict | None:

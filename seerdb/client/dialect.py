@@ -44,6 +44,7 @@ from seerdb.common.tns import (
     decode_8i_terminal_error,
     decode_9i_oall8_cursor_id,
     decode_9i_oall8_describe,
+    decode_9i_oall8_dml_response,
     decode_9i_oall8_exec_response,
     decode_9i_oall8_terminal_error,
     decode_fv2_batch_errors,
@@ -70,6 +71,7 @@ from seerdb.common.tns import (
     encode_8i_oall8_fetch,
     encode_8i_oall8_query,
     encode_8i_sql_text,
+    encode_9i_oall8_dml,
     encode_9i_oall8_fetch,
     encode_9i_oall8_query,
     encode_o7_bfile_close,
@@ -1031,19 +1033,22 @@ class Fv2Oall8Dialect(Oall8Dialect):
     completes the OCI PRO/DTY negotiation and the OSESSKEY/OAUTH handshake, and
     the session authenticates as an ordinary 9i client (it is not an O8iDialect).
 
-    No data operations are served yet — SELECT, DML/DDL, PL/SQL blocks and
-    RETURNING are follow-ups — so each raises a clear error rather than desyncing
-    the connection. The native 64-bit request encoder (encode_9i_oall8_dml) lives
-    in common/tns.py, ready for those follow-ups. Commit/rollback fall to the
-    ordinary 9i path (no own_txn), exactly as the default 9i dialect does."""
+    Served: SELECT (incl. scalar binds) and INSERT/UPDATE/DELETE/DDL with
+    commit/rollback, all over the native 64-bit OALL8 reply decode
+    (decode_9i_oall8_*). PL/SQL blocks, LONG columns, LOB objects and array DML
+    are follow-ups — each raises a clear error rather than desyncing the
+    connection."""
 
     def capabilities(self) -> frozenset[str]:
-        # SELECT is served over the native 64-bit OALL8 (#792): the request is the
-        # 64-bit execute + array fetch (byte-verified), and the reply is the OCI
-        # fixed-width DCB / RXH / RXD / OER stream (decode_9i_oall8_*), decoded by
-        # the overrides below. DML/DDL, PL/SQL blocks and LOB objects remain
-        # follow-ups. Commit/rollback fall to the ordinary 9i path (no own_txn).
-        return frozenset({CAP_QUERY})
+        # SELECT, DML / DDL and own commit/rollback over the native 64-bit OALL8
+        # (#792/#716): the request is the 64-bit execute (byte-verified), the reply
+        # the OCI fixed-width DCB / RXH / RXD / OER stream (decode_9i_oall8_*),
+        # decoded by the overrides below. Commit/rollback ride the OALL8 as
+        # ordinary statements (CAP_OWN_TXN), as 8i does -- the 8i and thin-9i close
+        # frames both break an OALL8 session, and so does the modern TTI_COMMIT, so
+        # this session drives its own transaction. PL/SQL blocks, LOB objects and
+        # array DML are follow-ups.
+        return frozenset({CAP_QUERY, CAP_DML, CAP_OWN_TXN})
 
     def _encode_query(self, sql_text: bytes, bind: list | None) -> bytes:
         # Native 64-bit OALL8 SELECT execute (FETCH option, byte-verified #792).
@@ -1144,6 +1149,12 @@ class Fv2Oall8Dialect(Oall8Dialect):
                     return ([], b'', last_row)
             buf += received[1]
 
+    def _encode_dml(
+        self, sql_text: bytes, stmt_type: int, bind: list | None = None
+    ) -> bytes:
+        # Native 64-bit OALL8 DML / DDL / txn request (byte-verified #716).
+        return encode_9i_oall8_dml(self._next_seq(), sql_text, stmt_type, bind)
+
     def execute_dml(
         self,
         sql: str,
@@ -1152,10 +1163,53 @@ class Fv2Oall8Dialect(Oall8Dialect):
         batcherrors: bool = False,
         cache: dict | None = None,
     ):
-        raise NotSupportedError(
-            'the experimental 9i OALL8 dialect does not serve DML/DDL yet (#716)'
+        # 9i native OALL8 INSERT / UPDATE / DELETE and DDL (#716): the 64-bit
+        # execute with the statement-type option and no fetch; the affected-row
+        # count comes back in the reply OER (decode_9i_oall8_dml_response, the row
+        # count a ub4 at offset 6). Scalar binds ride the request (byte-verified).
+        # No array DML yet (the caller refuses a batch), no cursor cache, and the
+        # rowid is not surfaced yet. (Autocommit is applied by the caller.)
+        assert not batch
+        if bind:
+            # A bound non-query draws no reply from the 9.2 server (it inserts the
+            # row but then waits), unlike a bound SELECT; the two-phase bind for
+            # DML is not worked out yet. Raise rather than hang (#716).
+            raise NotSupportedError(
+                'the experimental 9i OALL8 dialect does not serve bound DML yet (#716)'
+            )
+        stmt_type = o8i_stmt_type(sql.strip().upper())
+        yield Send(
+            self._closing() + self._encode_dml(encode_8i_sql_text(sql), stmt_type, bind)
         )
-        yield  # pragma: no cover
+        buf = yield from self._recv_dml_terminal('DML')
+        (row_count, err_code, message) = decode_9i_oall8_dml_response(buf)
+        _raise_ora(err_code, message)
+        return (0, 0, 0, (row_count, None), [], None, None, [], None)
+
+    def txn_control(self, statement: str):
+        # Commit / rollback as an ordinary OALL8 statement (no modern TTI_COMMIT on
+        # a thick 9i session, #716), as 8i does. Driven by the connection when
+        # CAP_OWN_TXN is set.
+        yield Send(
+            self._closing()
+            + self._encode_dml(encode_8i_sql_text(statement), O8I_STMT_TXN)
+        )
+        buf = yield from self._recv_dml_terminal(statement)
+        (_row_count, err_code, message) = decode_9i_oall8_dml_response(buf)
+        _raise_ora(err_code, message)
+
+    def _recv_dml_terminal(self, what: str):
+        # Accumulate a non-query reply across packets until its OER status is whole
+        # (a short reply arrives in one packet; this guards a split one, as the row
+        # reader does).
+        buf = b''
+        while True:
+            received = yield RECV
+            if received is False:
+                raise Exception(f'Connection closed during 9i OALL8 {what}')
+            buf += received[1]
+            if o9i_oall8_terminal_complete(buf):
+                return buf
 
     def execute_block(self, sql: str, bind: list | None = None):
         raise NotSupportedError(
