@@ -14483,6 +14483,30 @@ def decode_9i_oall8_dml_response(Terminal: bytes) -> tuple[int, int, str | None]
     return (0 if Code else Rows, Code, Status['message'])
 
 
+def decode_9i_oall8_block_out(
+    Data: bytes, NumBinds: int, NumOut: int
+) -> tuple[list, int, int, str | None]:
+    # The OUT / IN OUT values a 9i OALL8 PL/SQL block returns (#794). The reply is
+    # the IOV bind prompt, then (when the block writes binds) a TTI_RXD carrying one
+    # value-only cell per OUT bind -- each a ub1 length, that many value bytes, and
+    # a ub4 indicator; a NULL OUT is a zero length. Then the RPA + OER status. The
+    # IOV is a fixed 50-byte head plus one direction byte per bind, so the token
+    # after it sits at offset 50 + NumBinds (live-verified for 1 and 3 binds).
+    # Returns (out_values, rowcount, code, message); out_values holds the raw value
+    # bytes per OUT bind (None for a NULL), for the caller to decode per Var type.
+    Rest = Data[50 + NumBinds :]
+    OutValues: list = []
+    if NumOut > 0 and Rest[:1] == bytes([TTI_RXD]):
+        Rest = Rest[1:]
+        for _ in range(NumOut):
+            Length = Rest[0]
+            Value = bytes(Rest[1 : 1 + Length]) if Length else None
+            Rest = Rest[1 + Length + 4 :]  # value + ub4 indicator
+            OutValues.append(Value)
+    (RowCount, Code, Message) = decode_9i_oall8_dml_response(Data)
+    return (OutValues, RowCount, Code, Message)
+
+
 def decode_9i_oall8_status(Terminal: bytes) -> dict | None:
     # The ORA code (and best-effort message) a 9i OALL8 reply's status carries, or
     # None for a terminal with no whole OER yet. The code is a ub4 at offset 10 of

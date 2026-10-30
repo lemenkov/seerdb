@@ -7682,6 +7682,30 @@ class TestNative9iOall8Select(unittest.TestCase):
             decode_9i_oall8_dml_response(self.DML_FIRST_PARSE), (1, 0, None)
         )
 
+    # A PL/SQL block's OUT value: the reply is the IOV (50 + nbinds bytes), then a
+    # TTI_RXD of one value-only cell per OUT bind (each a ub1 length, the value, a
+    # ub4 indicator), then the status. Real 9.2 frame for `begin :1 := 42; end;`
+    # with one OUT bind -- the value is NUMBER 42 (c1 2b), to decode per the Var.
+    BLOCK_OUT_42 = bytes.fromhex(
+        '0b01050001000000010000000000000000000000000000000000000000000000'
+        '000000000000000000000000000000000000100702c12b00000000080500d508'
+        '2c02000000000100000002000000000000000000000004050000000101000000'
+        '000000000000010000002f000000000000000000000000000000000000000000'
+        '0000000000070000010000003601000000000000000000000000000080d0d403'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00000000000000000000000000000000000000000000000000000000'
+    )
+
+    def test_block_out_value_is_read_per_out_bind(self):
+        from seerdb.common.tns import decode_9i_oall8_block_out
+
+        # one bind, one OUT: raw NUMBER 42 (c1 2b), rowcount/code 0.
+        (out_values, _rows, code, _msg) = decode_9i_oall8_block_out(
+            self.BLOCK_OUT_42, 1, 1
+        )
+        self.assertEqual(out_values, [bytes.fromhex('c12b')])
+        self.assertEqual(code, 0)
+
 
 class TestO8iBfile(unittest.TestCase):
     """Oracle 8i native BFILE read (#401, PROTOCOL §19.17): FILE_OPEN -> GETLEN

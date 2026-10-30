@@ -28,7 +28,6 @@ from __future__ import annotations
 
 from typing import Callable, Protocol
 
-from seerdb.common.exceptions import NotSupportedError
 from seerdb.common.sqltext import is_reusable_dml
 from seerdb.common.tns import (
     FV2_BIND_IN,
@@ -42,6 +41,7 @@ from seerdb.common.tns import (
     decode_8i_dml_rowid,
     decode_8i_exec_response,
     decode_8i_terminal_error,
+    decode_9i_oall8_block_out,
     decode_9i_oall8_cursor_id,
     decode_9i_oall8_describe,
     decode_9i_oall8_dml_response,
@@ -1205,26 +1205,33 @@ class Fv2Oall8Dialect(Oall8Dialect):
                 return buf
 
     def execute_block(self, sql: str, bind: list | None = None):
-        # 9i native OALL8 anonymous PL/SQL block (#793). The reply opens with a
-        # TTI_IOV (0x0b) bind prompt when there are binds, then the RPA and OER, all
-        # in one packet -- the block runs with the IN values carried inline in the
-        # request, so there is no two-phase round trip. decode_9i_oall8_dml_response
-        # skips the IOV / RPA to the OER. IN binds (plain values) ride the request;
-        # OUT / IN OUT binds (Var) need the OUT values read back from the IOV reply,
-        # which is a follow-up (#794), so a block with a Var bind raises for now.
+        # 9i native OALL8 anonymous PL/SQL block (#793/#794). The reply opens with a
+        # TTI_IOV (0x0b) bind prompt when there are binds, then (when the block
+        # writes OUT / IN OUT binds) a TTI_RXD of their values, then the RPA and OER
+        # -- all in one packet, as the IN values ride inline in the request, so there
+        # is no two-phase round trip. OUT values are read back by their bind position
+        # and travel as an {out_positions, out_values} record the cursor turns into
+        # the Vars' values; a block with no OUT bind returns the status alone.
         from seerdb.common.datatypes import Var
 
         bind = bind or []
-        if any(isinstance(b, Var) for b in bind):
-            raise NotSupportedError(
-                'the experimental 9i OALL8 dialect does not serve PL/SQL OUT / '
-                'IN OUT binds yet (#794)'
-            )
+        out_positions = [i for i, b in enumerate(bind) if isinstance(b, Var)]
         stmt_type = o8i_stmt_type(sql.strip().upper())
         yield Send(
             self._closing() + self._encode_dml(encode_8i_sql_text(sql), stmt_type, bind)
         )
         buf = yield from self._recv_dml_terminal('PL/SQL block')
+        if out_positions:
+            (out_values, _row_count, err_code, message) = decode_9i_oall8_block_out(
+                buf, len(bind), len(out_positions)
+            )
+            _raise_ora(err_code, message)
+            record = {
+                'out_positions': out_positions,
+                'out_values': out_values,
+                'directions': None,
+            }
+            return (0, 0, 0, (None, None), [record], None, None, [], None)
         (_row_count, err_code, message) = decode_9i_oall8_dml_response(buf)
         _raise_ora(err_code, message)
         return (0, 0, 0, (None, None), [], None, None, [], None)
