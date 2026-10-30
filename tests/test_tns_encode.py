@@ -7449,12 +7449,15 @@ class TestO9iOall8Messages(unittest.TestCase):
         )
 
     def test_9i_oall8_ddl_no_binds_byte_exact(self):
-        # A no-bind DDL: bind option clear, byte4 0x81, no OAC / value section.
+        # A no-bind DDL: bind option clear, byte4 0x80, no OAC / value section.
+        # Byte4's low bit is commit-on-success; a native 9.2 sqlplus sends 0x80
+        # for this very `CREATE TABLE t9 (id NUMBER)` (and for DELETE / DROP), so
+        # 0x81 -- what this encoder once wrote -- made every DML autocommit.
         from seerdb.common.tns import O8I_STMT_CREATE, encode_9i_oall8_dml
 
         sql = b'CREATE TABLE t9 (id NUMBER)'
         expected = bytes.fromhex(
-            '035e052181000000000000feffffffffffffff1b00000000000000feffffffff'
+            '035e052180000000000000feffffffffffffff1b00000000000000feffffffff'
             'ffffff0c000000000000000000000000000000feffffffffffffff0000000001'
             '0000000000000000000000000000000000000000000000000000000000000000'
             '000000000000000000000000000000000000000000000000000000feffffffff'
@@ -7463,6 +7466,59 @@ class TestO9iOall8Messages(unittest.TestCase):
             '00000000000000000000000500000000000000000000000000000000000000'
         )
         self.assertEqual(encode_9i_oall8_dml(0x05, sql, O8I_STMT_CREATE, []), expected)
+
+    # A native 9.2 sqlplus query of 161 bytes (its text NUL-terminated), and how
+    # the client framed it: 0xFE, 64-byte chunks (64, 64, 33) and a zero length.
+    NATIVE_LONG_SQL = (
+        b'SELECT ATTRIBUTE,SCOPE,NUMERIC_VALUE,CHAR_VALUE,DATE_VALUE FROM '
+        b"SYSTEM.PRODUCT_PRIVS WHERE (UPPER('SQL*Plus') LIKE UPPER(PRODUCT)) "
+        b'AND (UPPER(USER) LIKE USERID)\x00'
+    )
+    NATIVE_LONG_SQL_FRAMED = bytes.fromhex(
+        'fe4053454c454354204154545249425554452c53434f50452c4e554d45524943'
+        '5f56414c55452c434841525f56414c55452c444154455f56414c55452046524f'
+        '4d204053595354454d2e50524f445543545f5052495653205748455245202855'
+        '50504552282753514c2a506c75732729204c494b452055505045522850524f44'
+        '55435421292920414e4420285550504552285553455229204c494b4520555345'
+        '524944290000'
+    )
+
+    def test_9i_oall8_long_sql_is_chunked_as_native(self):
+        # Past 64 bytes the SQL text is the pre-10g chunked form; a single length
+        # byte, as once written, could not even hold a statement past 255 bytes.
+        from seerdb.common.tns import encode_9i_oall8_query
+
+        self.assertEqual(len(self.NATIVE_LONG_SQL), 161)
+        msg = encode_9i_oall8_query(0x10, self.NATIVE_LONG_SQL)
+        self.assertIn(self.NATIVE_LONG_SQL_FRAMED, msg)
+        # A 400-byte statement encodes at all (it raised before).
+        self.assertTrue(
+            encode_9i_oall8_query(0x11, b'SELECT 1 FROM dual ' + b' ' * 400)
+        )
+
+    # A native 9.2 sqlplus CLOB read (native_9i_clob_read.pcap): TTI_LOBOPS READ
+    # of 0x50 chars from offset 1 of an 86-byte locator, in the 64-bit form.
+    NATIVE_LOB_READ = bytes.fromhex(
+        '03601f58795d0000000000560000000000000000000000000000000000000001'
+        '000000000000000000000000000000000000008cb3ffbf7f0000000000000000'
+        '0000000200000000000000000000000000000000000000000000000054000102'
+        '0c00000001000000010000000d7e4d000344b9000344b800020002001f000000'
+        '000000000000000000000000000000022c35ac00000000000000000000000000'
+        '00000000000000000344b80040b8d2000050000000'
+    )
+
+    def test_9i_oall8_lob_read_matches_native(self):
+        from seerdb.common import oci
+        from seerdb.common.tns import encode_9i_oall8_lob_read
+
+        native = bytearray(self.NATIVE_LOB_READ)
+        # The client's heap addresses, which the server ignores, stand in as the
+        # non-null indicator.
+        native[3:11] = oci.OCI_INDICATOR
+        native[51:59] = oci.OCI_INDICATOR
+        locator = bytes(native[91:177])
+        self.assertEqual(len(locator), 86)
+        self.assertEqual(encode_9i_oall8_lob_read(0x1F, locator, 0x50), bytes(native))
 
 
 class TestShortLengthBoundary(unittest.TestCase):

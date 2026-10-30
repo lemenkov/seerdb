@@ -14204,16 +14204,20 @@ def _encode_9i_oall8(Seq: int, Sql: bytes, StmtType: int, Binds: list) -> bytes:
         + bytes([StmtType])
         + bytes(19)
     )
-    Message = Head + Mid + bytes([len(Sql)]) + Sql + Tail
-    if NumBinds:
-        Token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_9_2)
-        try:
+    # The SQL text is a pre-10g chunked string (encode_chr at field version 2): a
+    # plain length byte up to 64 bytes, else 0xFE, 64-byte chunks and a zero --
+    # byte-verified against a native 9.2 161-byte query (chunks 64, 64, 33). A
+    # single length byte, as written before, failed outright past 255 bytes.
+    Token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_9_2)
+    try:
+        Message = Head + Mid + encode_chr(Sql) + Tail
+        if NumBinds:
             Message += b''.join(_encode_9i_bind_oac(V) for V in Binds)
             Message += bytes([0x07])
             for Value in Binds:
                 Message += _encode_8i_bind_value(Value)
-        finally:
-            _ENCODE_FIELD_VERSION.reset(Token)
+    finally:
+        _ENCODE_FIELD_VERSION.reset(Token)
     return Message
 
 
@@ -14284,6 +14288,31 @@ def encode_9i_oall8_fetch(
     Frame[67:71] = min(LongSize, 0xFFFFFFFF).to_bytes(4, 'little')
     Frame[151:155] = (Count & 0xFFFFFFFF).to_bytes(4, 'little')
     return bytes(Frame)
+
+
+def encode_9i_oall8_lob_read(
+    Seq: int, Locator: bytes, Amount: int, Offset: int = 1
+) -> bytes:
+    # A CLOB / BLOB READ on a native 9i OALL8 session (#795): TTI_LOBOPS (0x60) in
+    # the 64-bit form -- the 8i (32-bit) and thin-9i LOBOPS envelopes both draw no
+    # reply here. Byte-reproduced from a native 9.2 sqlplus CLOB read
+    # (native_9i_clob_read.pcap): a 91-byte head, then the locator as fetched (a
+    # ub2 length and the body, 86 bytes for a CLOB / BLOB) and the ub4 amount. In
+    # the head, the source pointer sits at 3 and the amount pointer at 51 (the
+    # native client's heap addresses, which the server ignores, so the non-null
+    # oci.OCI_INDICATOR stands in), the locator's length at 11 (8 bytes), the
+    # 1-based offset at 31 and the operation (READ) at 67; the rest is zero.
+    # Like 8i, one call with a large `Amount` reads the whole value (chars for a
+    # CLOB, bytes for a BLOB); the reply is the shared `0e fe <chunks> 00`
+    # (decode_fv2_lob_chunks).
+    Frame = bytearray(91)
+    Frame[0:3] = bytes([TTI_FUN, TTI_LOBOPS, Seq & 0xFF])
+    Frame[3:11] = oci.OCI_INDICATOR
+    Frame[11:19] = len(Locator).to_bytes(8, 'little')
+    Frame[31:35] = Offset.to_bytes(4, 'little')
+    Frame[51:59] = oci.OCI_INDICATOR
+    Frame[67:75] = TNS_LOB_OP_READ.to_bytes(8, 'little')
+    return bytes(Frame) + Locator + (Amount & 0xFFFFFFFF).to_bytes(4, 'little')
 
 
 # --- 9i native OALL8 SELECT reply decode (#792) ---
@@ -14367,6 +14396,28 @@ def _o9i_oall8_cell(Data: bytes) -> tuple[bytes | None, bytes]:
     return _OCI.read_value(Data)
 
 
+# The LOB columns whose 9i OALL8 row cell is a locator, not an inline value.
+_O9I_OALL8_LOB_TYPES = frozenset((TNS_TYPE_CLOB, TNS_TYPE_BLOB, TNS_TYPE_BFILE))
+
+
+def _o9i_oall8_lob_cell(Type: int, Data: bytes) -> tuple[object, bytes]:
+    # A LOB column's cell in a 9i OALL8 row (#795): a ub4 locator size, then --
+    # when it is not zero -- the locator again as a ub1-length value (a ub2 length
+    # and the body, 86 bytes for a CLOB / BLOB); no trailing indicator. A NULL LOB
+    # is the zero size ALONE (reading a length byte after it took the next row's
+    # token as one and desynced the stream); EMPTY_CLOB / EMPTY_BLOB carry a real
+    # locator that reads back empty. Returns a LOB carrying the locator, for the
+    # dialect to read (resolve_lobs) or hand back.
+    from seerdb.common.lob import LOB
+
+    Size = int.from_bytes(Data[:4], 'little')
+    Data = Data[4:]
+    if not Size:
+        return (None, Data)
+    Length = Data[0]
+    return (LOB(Type, bytes(Data[1 : 1 + Length])), Data[1 + Length :])
+
+
 def decode_9i_oall8_exec_response(
     Data: bytes, Columns: list, PrevRow: list | None = None
 ) -> tuple[list, bytes, list | None]:
@@ -14414,6 +14465,10 @@ def decode_9i_oall8_exec_response(
                         Row.append(
                             Last[ColIdx] if Last and ColIdx < len(Last) else None
                         )
+                        continue
+                    if Col.get('data_type') in _O9I_OALL8_LOB_TYPES:
+                        (Lob, Rest) = _o9i_oall8_lob_cell(Col['data_type'], Rest)
+                        Row.append(Lob)
                         continue
                     (Raw, Rest) = _o9i_oall8_cell(Rest)
                     Row.append(None if Raw is None else decode_value(Col, Raw))

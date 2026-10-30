@@ -7706,6 +7706,52 @@ class TestNative9iOall8Select(unittest.TestCase):
         self.assertEqual(out_values, [bytes.fromhex('c12b')])
         self.assertEqual(code, 0)
 
+    # `select id, b from t order by id` over a BLOB column, rows (2, NULL) and
+    # (3, EMPTY_BLOB()). A LOB query's execute is describe-only; the fetch brings
+    # the rows, each LOB cell a ub4 size and then (when not zero) the locator as a
+    # ub1-length value -- a NULL LOB is the zero size alone. Real 9.2 frames.
+    LOB_EXEC = bytes.fromhex(
+        '101d5a0517cc20e7b55e000000000000787e0a1e17392dc50600000000000000'
+        '000000020000004b010200008116000000000000000000000000000000000000'
+        '0000000000000000000000000000000000010206000000024944000000000000'
+        '00000171000000a00f0000000000000000000000000000000000000000000000'
+        '0000000000000000000000010103000000014200000000000000000700000007'
+        '787e0a1e17392d080500698d2c02000000000900000000000000000000000000'
+        '00000401000000010000000000000000000009001200030000000000f0440300'
+        '01000000d2b800000100000000000000000c0000010000003601000000000000'
+        '000000000000000080d0d4030000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '0000000000000000'
+    )
+    LOB_FETCH = bytes.fromhex(
+        '0601022a020000000f00000000000000000000000000000000000000d4030000'
+        '0000000000000000000000002002000000000702c10300000000150200030702'
+        'c104560000005600540001010c00000001000000010000000d8041000344f100'
+        '0344f0000200020000000000000000000000000000000000000000022c8d6900'
+        '00000000000000000000000000000000000000000344f00040b8d20001040100'
+        '000001020000007b050000000009000000030020000000f044030001000000d2'
+        'b800000100000000000000000d00000100000036010000000000000000000000'
+        '00000080d0d40300000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000000194f52412d30313430333a206e6f206461746120666f756e640a'
+    )
+
+    def test_lob_cells_carry_a_locator_or_null(self):
+        from seerdb.common.lob import LOB
+        from seerdb.common.tns import decode_9i_oall8_describe, decode_9i_oall8_status
+
+        (columns, rest) = decode_9i_oall8_describe(self.LOB_EXEC)
+        self.assertEqual([c['data_type'] for c in columns], [2, 113])  # NUMBER, BLOB
+        (rows, _term, _) = self._decode(rest, columns)
+        self.assertEqual(rows, [])  # describe-only execute
+        (rows, term, _) = self._decode(self.LOB_FETCH, columns)
+        self.assertEqual([r[0] for r in rows], [2, 3])
+        self.assertIsNone(rows[0][1])  # NULL BLOB: the zero size alone
+        self.assertIsInstance(rows[1][1], LOB)  # EMPTY_BLOB: a real locator
+        self.assertEqual(len(rows[1][1].raw), 86)
+        self.assertEqual(rows[1][1].raw[:2], bytes.fromhex('0054'))
+        self.assertEqual(decode_9i_oall8_status(term)['code'], 1403)
+
 
 class TestO8iBfile(unittest.TestCase):
     """Oracle 8i native BFILE read (#401, PROTOCOL §19.17): FILE_OPEN -> GETLEN

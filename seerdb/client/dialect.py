@@ -73,6 +73,7 @@ from seerdb.common.tns import (
     encode_8i_sql_text,
     encode_9i_oall8_dml,
     encode_9i_oall8_fetch,
+    encode_9i_oall8_lob_read,
     encode_9i_oall8_query,
     encode_o7_bfile_close,
     encode_o7_bfile_open,
@@ -1032,12 +1033,13 @@ class Fv2Oall8Dialect(Oall8Dialect):
     (#716/#790). The session authenticates as an ordinary 9i client (it is not an
     O8iDialect) and then speaks the native thick (OCI) wire.
 
-    Served: SELECT (with scalar binds, positional and named), INSERT/UPDATE/DELETE
-    and DDL (with scalar binds) under its own commit/rollback, and PL/SQL blocks
-    with IN binds -- all over the native 64-bit OALL8 reply decode
-    (decode_9i_oall8_*). PL/SQL OUT / IN OUT binds (#794), LONG columns, LOB
-    objects (#795/#796), DML...RETURNING (#791) and array DML are follow-ups; each
-    raises a clear error rather than desyncing the connection."""
+    Served: SELECT (with scalar binds, positional and named) including LONG and
+    CLOB / BLOB columns, INSERT/UPDATE/DELETE and DDL (with scalar binds) under its
+    own commit/rollback, PL/SQL blocks with IN, OUT and IN OUT binds, and
+    DML...RETURNING (through its PL/SQL wrap) -- all over the native 64-bit OALL8
+    reply decode (decode_9i_oall8_*). BFILE reads (#796), LOB objects kept open
+    (fetch_lobs=False), TIMESTAMP / INTERVAL binds (#797) and array DML are
+    follow-ups."""
 
     def capabilities(self) -> frozenset[str]:
         # SELECT, DML / DDL, PL/SQL blocks and own commit/rollback over the native
@@ -1046,9 +1048,10 @@ class Fv2Oall8Dialect(Oall8Dialect):
         # (decode_9i_oall8_*), decoded by the overrides below. Commit/rollback ride
         # the OALL8 as ordinary statements (CAP_OWN_TXN), as 8i does -- the 8i and
         # thin-9i close frames both break an OALL8 session, and so does the modern
-        # TTI_COMMIT, so this session drives its own transaction. OUT / IN OUT binds,
-        # LOB objects and array DML are follow-ups.
-        return frozenset({CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_OWN_TXN})
+        # TTI_COMMIT, so this session drives its own transaction. CLOB / BLOB
+        # content is read at fetch time (CAP_LOB); BFILE, kept-open LOB objects and
+        # array DML are follow-ups.
+        return frozenset({CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_LOB, CAP_OWN_TXN})
 
     def _encode_query(self, sql_text: bytes, bind: list | None) -> bytes:
         # Native 64-bit OALL8 SELECT execute (FETCH option, byte-verified #792).
@@ -1107,7 +1110,37 @@ class Fv2Oall8Dialect(Oall8Dialect):
             if not more:
                 break
             rows.extend(more)
+        # CLOB / BLOB cells came back as locators: read their content while the
+        # cursor is still open, as the 8i path does (#795). A BFILE stays a
+        # locator, read on demand.
+        yield from self.resolve_lobs(rows, columns)
         return (0, 0, 0, (len(rows), columns), rows, None, None, [], None)
+
+    def lob_read(self, locator: bytes, offset: int = 1, amount: int | None = None):
+        # CLOB / BLOB content over a native 9i OALL8 session (#795): one 64-bit
+        # TTI_LOBOPS READ (encode_9i_oall8_lob_read) from `offset` -- a large amount
+        # reads the whole value in one call, as on 8i. The reply is the shared
+        # `0e fe <chunks> 00` form, which may span packets; an empty LOB has no
+        # TTI_LOB block (a bare piggyback), so it reads as empty.
+        yield Send(
+            encode_9i_oall8_lob_read(
+                self._next_seq(),
+                locator,
+                (1 << 30) if amount is None else amount,
+                offset,
+            )
+        )
+        data = b''
+        while True:
+            received = yield RECV
+            if received is False:
+                raise Exception('Connection closed during 9i OALL8 LOB read')
+            data += received[1]
+            if data[0] != TTI_LOB:
+                return b''
+            (content, complete) = decode_fv2_lob_chunks(data)
+            if complete:
+                return content
 
     def _recv_describe(self, packet: bytes):
         # The 9i OALL8 describe, read on across packets (a wide select list spans
