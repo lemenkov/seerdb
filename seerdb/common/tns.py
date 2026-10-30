@@ -8453,7 +8453,9 @@ def _render_caps(spec: tuple[int, dict]) -> bytes:
     return bytes(caps)
 
 
-def capability_arrays(field_version: int = FIELD_VERSION_11_2) -> tuple[bytes, bytes]:
+def capability_arrays(
+    field_version: int = FIELD_VERSION_11_2, oall8: bool = False
+) -> tuple[bytes, bytes]:
     """Return (compile_caps, runtime_caps) for a target TTC field version.
 
     Two base vectors are modelled: the 11.2 vector for pre-12c field versions
@@ -8472,6 +8474,9 @@ def capability_arrays(field_version: int = FIELD_VERSION_11_2) -> tuple[bytes, b
         # verifier the account lacks and reject the login (ORA-01017); with the
         # minimal caps 9i falls back to the O3LOGON path. CCAP_FIELD_VERSION
         # stays 0 (9i negotiates the field version via TTI_PRO, not the caps).
+        # The OALL8 opt-in advertises the two extra bytes instead (#716).
+        if oall8:
+            return _O3_OALL8_COMPILE_CAPS, _O3_OALL8_RUNTIME_CAPS
         return _O3_COMPILE_CAPS, _O3_RUNTIME_CAPS
     Base = (
         FIELD_VERSION_21_1
@@ -8488,6 +8493,57 @@ def capability_arrays(field_version: int = FIELD_VERSION_11_2) -> tuple[bytes, b
 # (no O5LOGON), runtime caps = a single 0x02 byte.
 _O3_COMPILE_CAPS = bytes(17) + bytes([3]) + bytes(3)
 _O3_RUNTIME_CAPS = bytes([2])
+
+# The 9i OALL8 opt-in (#716, experimental): the capability vectors a native 9.2
+# OCI client (sqlplus) sends, captured from the wire (tcpdump on the 9i bed,
+# #790). The compile caps are NOT the minimal JDBC-thin vector the default 9i
+# path uses -- the native client sends a *populated* vector, with the field
+# version at CCAP_FIELD_VERSION (idx 7 = 2 = 9.2). The runtime caps carry the
+# second byte that makes the server treat OALL8 as 64-bit (without it the server
+# reads the 64-bit fields as 32-bit and raises ORA-03120). The earlier minimal
+# vector logged in for a while but the server closes on it on the current bed;
+# the captured native vector is what the 9.2 server actually negotiates.
+#
+# ONE deliberate deviation from the capture (#790): CCAP_LOGON_TYPES (idx 4) is
+# forced to 0, not the native client's 0x05. 0x05 makes the 9.2 server issue a
+# 16-byte session key whose OCI OAUTH proof is a non-standard DES variant we have
+# not cracked (ruled out exhaustively against two live captures). With LOGON_TYPES
+# = 0 the server falls back to the plain 8-byte DES O3LOGON key -- exactly what
+# the thin 9i / 8i paths use -- so the existing crypto.o3logon authenticates. The
+# 16-byte "thick" proof is a documented, accepted limitation, deferred as a
+# someday-maybe; the rest of the OALL8 session (64-bit data dialect) is unchanged.
+_O3_OALL8_COMPILE_CAPS = bytes(
+    [
+        0x06,
+        0x01,
+        0x01,
+        0x01,
+        0x00,  # CCAP_LOGON_TYPES: 0, not the native 0x05 -> 8-byte O3LOGON (#790)
+        0x01,
+        0x01,
+        0x02,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x7F,
+        0x0F,
+        0x03,
+        0x06,
+        0x03,
+        0x00,
+    ]
+)
+_O3_OALL8_RUNTIME_CAPS = bytes([2, 1])
+# A native 9.2 OCI client's TTI_DTY is *compact*: it sends no 980-byte identity
+# type table (the server sends its table back instead), just this trailer after
+# the capability arrays (captured, #790). The default path sends the full table.
+_O3_OALL8_DTY_TRAILER = bytes(
+    [0x80, 0x00, 0x00, 0x00, 0x3C, 0x3C, 0x3C, 0x80, 0x00, 0x00, 0x00]
+)
 
 
 # 12c+ datatype table. Where the 11g table (built inline in encode_dictionary_dty
@@ -12336,7 +12392,9 @@ def encode_dictionary_dty(Dictionary: dict) -> bytes:
     # Compile-time + runtime capability arrays, each emitted as a length byte
     # followed by the array (write_bytes_with_length in oracledb terms).
     FieldVersion = Dictionary.get('field_version', FIELD_VERSION_11_2)
-    CompileCaps, RuntimeCaps = capability_arrays(FieldVersion)
+    CompileCaps, RuntimeCaps = capability_arrays(
+        FieldVersion, oall8=Dictionary.get('oall8', False)
+    )
     # End-of-response opt-in (#155/#132): when the server advertised EOR support
     # in its accept, set CCAP_TTC4's 0x20 bit so the server delimits every
     # response with the EOR (29) marker — the prerequisite for pipelining. Only
@@ -12348,6 +12406,22 @@ def encode_dictionary_dty(Dictionary: dict) -> bytes:
         CompileCaps = bytes(Caps)
     CapabilityHeader = bytes([len(CompileCaps)]) + CompileCaps
     TableHeader = bytes([len(RuntimeCaps)]) + RuntimeCaps
+
+    # Native 9i OALL8 (#790): a native 9.2 OCI client sends a *compact* DTY --
+    # the populated capability arrays followed by a short trailer and NO
+    # 980-byte identity/override table (the server returns its own table in
+    # reply). Sending the full thin-style table alongside the native caps is
+    # what the 9.2 server closes the connection on. Flag 2 matches the capture.
+    if Dictionary.get('oall8') and FieldVersion < FIELD_VERSION_10_2:
+        return (
+            bytes([TTI_DTY])
+            + Charset
+            + Charset
+            + bytes([2])
+            + CapabilityHeader
+            + TableHeader
+            + _O3_OALL8_DTY_TRAILER
+        )
 
     # Identity map: for type id N in 1..245, emit (N, N, 1, 0) — "I know
     # type N and want it on the wire as type N with format flag 1". This
@@ -14067,6 +14141,93 @@ def _o8i_status_strict(Data: bytes) -> dict | None:
         raise Truncated('8i status cut short') from Exc
 
 
+def _encode_9i_oall8(Seq: int, Sql: bytes, StmtType: int, Binds: list) -> bytes:
+    # The native 9i (9.2) OALL8 (TTI_ALL8, 0x5e) execute — the 64-bit form the
+    # server accepts once the OALL8 opt-in caps are negotiated (#716). It is the
+    # 8i request (`_encode_8i_oall8`) with every pointer / length field widened
+    # from 4 to 8 bytes and a present-pointer indicator (``oci.OCI_INDICATOR``)
+    # where the 8i form writes zeros; the SQL text and bind values are identical.
+    # Reverse-engineered from a live 9.2-client trace and verified byte-for-byte
+    # against it apart from the heap-pointer fields the server ignores. Scope so
+    # far: DML / DDL and transaction control with scalar binds; SELECT, PL/SQL
+    # blocks and RETURNING are separate increments.
+    P = oci.OCI_INDICATOR
+
+    def u8(n: int) -> bytes:
+        return n.to_bytes(8, 'little')
+
+    NumBinds = len(Binds)
+    IsBlock = StmtType in (O8I_STMT_BEGIN, O8I_STMT_DECLARE)
+    Option = (
+        TNS_EXEC_OPTION_PARSE
+        | TNS_EXEC_OPTION_EXECUTE
+        | (TNS_EXEC_OPTION_BIND if NumBinds else 0)
+    )
+    Byte4 = (
+        (0x05 if NumBinds else 0x81) if not IsBlock else (0x05 if NumBinds else 0x00)
+    )
+    Byte5 = 0x04 if (NumBinds and not IsBlock) or IsBlock else 0x00
+    Head = bytes([TTI_FUN, TTI_ALL8, Seq & 0xFF, Option, Byte4, Byte5, 0, 0, 0, 0, 0])
+    Mid = (
+        P
+        + u8(len(Sql))
+        + P
+        + u8(12)
+        + bytes(8)
+        + P
+        + bytes(4)
+        + (1).to_bytes(4, 'little')
+        + u8(0)
+        + (P if NumBinds else bytes(8))
+        + u8(NumBinds)
+        + bytes(8) * 4
+        + P
+        + P
+        + u8(0)
+    )
+    Tail = bytes([1, 0, 0, 0, 1]) + bytes(23) + bytes([StmtType]) + bytes(19)
+    Message = Head + Mid + bytes([len(Sql)]) + Sql + Tail
+    if NumBinds:
+        Token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_9_2)
+        try:
+            Message += b''.join(_encode_9i_bind_oac(V) for V in Binds)
+            Message += bytes([0x07])
+            for Value in Binds:
+                Message += _encode_8i_bind_value(Value)
+        finally:
+            _ENCODE_FIELD_VERSION.reset(Token)
+    return Message
+
+
+def _encode_9i_bind_oac(Value: object) -> bytes:
+    # The 64-bit OALL8 bind descriptor: ``01 <TNS type> <flag> 00 00``, an 8-byte
+    # little-endian max size, then 28 reserved bytes (41 bytes). The type and
+    # size mirror the 8i 32-bit descriptor (:func:`_encode_8i_bind_oac`); the
+    # flag is 0x05 for an OUT-capable Var, 0x01 otherwise.
+    from seerdb.common.datatypes import Var
+
+    if isinstance(Value, Var):
+        DType, Size, Flag = Value.dbtype.tns_type, max(Value.size or 22, 1), 0x05
+    elif isinstance(Value, (bool, int, float, Decimal)):
+        DType, Size, Flag = 2, 22, 0x01
+    elif isinstance(Value, (bytes, bytearray)):
+        DType, Size, Flag = 23, max(len(Value), 1), 0x01
+    elif isinstance(Value, (datetime.datetime, datetime.date)):
+        DType, Size, Flag = 12, 7, 0x01
+    else:
+        DType, Size, Flag = 1, max(len(str(Value).encode('latin-1')), 1), 0x01
+    return bytes([1, DType, Flag, 0, 0]) + Size.to_bytes(8, 'little') + bytes(28)
+
+
+def encode_9i_oall8_dml(
+    Seq: int, Sql: bytes, StmtType: int, Binds: list | None = None
+) -> bytes:
+    # 9i INSERT/UPDATE/DELETE/DDL and COMMIT/ROLLBACK over the native 64-bit
+    # OALL8 (#716); the affected-row count comes back in the response OER
+    # (decode_8i_dml_response, shared with 8i).
+    return _encode_9i_oall8(Seq, Sql, StmtType, Binds or [])
+
+
 def decode_8i_cursor_id(Terminal: bytes) -> int:
     # The server-assigned cursor id, which drives the 8i fetch loop and is
     # closed when its statement is done (#2286): the status's cursor, a
@@ -14980,10 +15141,30 @@ def encode_dictionary_pro(Dictionary: dict) -> bytes:
     # platform here (e.g. "x86_64/Linux"); we prefix a driver tag so the value is
     # informative and identifies seerdb, instead of the bare "python" we sent
     # before (#381). ASCII with a safe fallback — the field is a plain byte
-    # string, and the server accepts an arbitrary length (verified 9i–23ai).
-    Banner = f'seerdb {platform.machine()}/{platform.system()}'.encode(
-        'ascii', 'replace'
-    )
+    # string, and the server accepts an arbitrary length on the thin TTI_ALL7
+    # path (verified 9i–23ai).
+    #
+    # The native 9i OALL8 ("thick") path is the exception (#790): the 9.2 server
+    # PARSES this banner to identify the client platform before it will complete
+    # the data-type (TTI_DTY) negotiation. It expects an OCI-style banner —
+    # "<machine>/<os> <version>", a recognised platform as the first token and a
+    # short version token after a space. A banner it cannot parse (our "seerdb "
+    # prefix pushes the platform to the second token; or no version token at all)
+    # makes it silently stall after the DTY; an over-long version token makes it
+    # drop the connection. Captured from a real 9.2 sqlplus login, the banner is
+    # "x86_64/Linux 2.4.xx" — the "2.4.xx" is a fixed token Oracle's own client
+    # reports, not the live kernel release, so we send that literal token and
+    # keep the live machine/os. Measured gate: this is the SOLE reason native
+    # OALL8 login stalled; connect-packet shape, ANO content and DTY charset were
+    # each proven not to matter.
+    if Dictionary.get('oall8'):
+        Banner = f'{platform.machine()}/{platform.system()} 2.4.xx'.encode(
+            'ascii', 'replace'
+        )
+    else:
+        Banner = f'seerdb {platform.machine()}/{platform.system()}'.encode(
+            'ascii', 'replace'
+        )
     return bytes([TTI_PRO, 6, 5, 4, 3, 2, 1, 0]) + Banner + bytes([0])
 
 
@@ -15265,6 +15446,100 @@ def parse_8i_auth_value(Packet: bytes, Key: bytes, O8i: bool = True) -> bytes | 
         if bytes(Pair.get('key', b'')).rstrip(b'\x00') == Key:
             return bytes(Pair.get('value', b''))
     return None
+
+
+# --- 9i native OALL8 O3LOGON via the OSESSKEY/OAUTH envelope (#790) ----------
+# The native 9.2 OALL8 ("thick") client marshals OSESSKEY (0x76) / OAUTH (0x73)
+# as a 64-bit OCI call frame, NOT 9i's positional TTI_3LOGA (that is the thin
+# path, which the 9.2 server stops accepting once the native data-type
+# negotiation has run). The frame is: TTI_FUN, the function byte, a seq and a
+# 0x40 "pointers present" opt, a fixed preamble, then ub4le scalar args
+# interleaved with 8-byte host-pointer PLACEHOLDERS the server reads positionally
+# but ignores (they are the native client's own stack addresses). Strings use the
+# DALC coding ub4le(len) ub1(len) data, same as pre-10g key-value values.
+#
+# Byte-reproduced from a live 9.2 sqlplus -> 9.2 capture. The crypto is the SAME
+# DES O3LOGON as the thin 9i / 8i paths (des_verifier + o3logon). The unexplained
+# fixed words -- the 0x5e73-led preamble and the structural 3 / 0x2a -- are
+# carried verbatim: the server validates the frame SHAPE, not these values (the
+# ignored pointers prove values do not matter), so only seq, username, password
+# and the AUTH_ pairs vary. See also [[oall8-pro-banner-gate]].
+_OALL8_AUTH_PREAMBLE = bytes.fromhex('735e0000000000')
+# Fixed host-pointer placeholder. The server ignores the ADDRESS but the pointer
+# must be NON-NULL: a null pointer marks the OCI argument as absent, so a zeroed
+# slot makes the server reject the frame and drop the connection. Any non-null
+# 8-byte value works; this is a plausible stack address from the capture.
+_OALL8_PTR = bytes.fromhex('d096ffbf7f000000')
+
+
+def _oall8_dalc(Value: bytes) -> bytes:
+    # ub4le total length, ub1 chunk length, data (values stay <= 252 bytes, so
+    # the single chunk equals the total -- enforced by _o8i_info_pairs upstream).
+    return struct.pack('<I', len(Value)) + bytes([len(Value)]) + Value
+
+
+def _oall8_kv(Key: bytes, Val: bytes, Flags: int = 0) -> bytes:
+    return _oall8_dalc(Key) + _oall8_dalc(Val) + struct.pack('<I', Flags)
+
+
+def encode_oall8_osesskey_phase1(
+    Seq: int, User: bytes, Pairs: list[tuple[bytes, bytes]]
+) -> bytes:
+    # OSESSKEY (0x76) phase one: request the session key. Logon mode 1.
+    return (
+        bytes([TTI_FUN, TTI_SESS, Seq, 0x40])
+        + _OALL8_AUTH_PREAMBLE
+        + struct.pack('<I', 3)  # structural constant (unexplained; from capture)
+        + struct.pack('<I', 1)  # logon mode (phase one)
+        + _OALL8_PTR
+        + struct.pack('<I', len(Pairs))  # key-value pair count
+        + struct.pack('<I', 0x2A)  # unexplained constant (from capture)
+        + _OALL8_PTR
+        + _OALL8_PTR
+        + bytes([len(User)])
+        + User
+        + b''.join(_oall8_kv(k, v) for k, v in _o8i_info_pairs(Pairs))
+    )
+
+
+def encode_oall8_oauth_phase2(
+    Seq: int, User: bytes, PwdField: bytes, Pairs: list[tuple[bytes, bytes]]
+) -> bytes:
+    # OAUTH (0x73) phase two: send AUTH_PASSWORD (hex(DES blocks) + decimal pad
+    # count) plus the informational pairs. Logon mode 0x101 marks phase two.
+    AllPairs = [(b'AUTH_PASSWORD', PwdField), *_o8i_info_pairs(Pairs)]
+    return (
+        bytes([TTI_FUN, TTI_AUTH, Seq, 0x40])
+        + _OALL8_AUTH_PREAMBLE
+        + struct.pack('<I', 3)
+        + struct.pack('<I', 0x101)  # logon mode (phase two)
+        + _OALL8_PTR
+        + struct.pack('<I', len(AllPairs))
+        + struct.pack('<I', 0)  # unexplained constant (0 in phase two)
+        + _OALL8_PTR
+        + _OALL8_PTR
+        + bytes([len(User)])
+        + User
+        + b''.join(_oall8_kv(k, v) for k, v in AllPairs)
+    )
+
+
+def parse_oall8_auth_sesskey(Packet: bytes) -> bytes:
+    """Extract the session key from a native 9.2 OSESSKEY response.
+
+    The AUTH_SESSKEY value is a length-prefixed ASCII-hex string in the native
+    DALC coding (``ub4le len``, ``ub1 len``, then the hex) -- the reverse field
+    order of the 8i server's reply (see ``parse_8i_auth_sesskey``)."""
+    from binascii import unhexlify
+
+    from seerdb.common.exceptions import InterfaceError
+
+    Idx = Packet.find(b'AUTH_SESSKEY')
+    if Idx < 0:
+        raise InterfaceError('9i OSESSKEY response carried no AUTH_SESSKEY')
+    After = Packet[Idx + len(b'AUTH_SESSKEY') :]
+    ValLen = After[4]  # ub1 chunk length; the ub4le repeat precedes it in [0:4]
+    return unhexlify(After[5 : 5 + ValLen])
 
 
 def encode_dictionary_spfp(Dictionary: dict) -> bytes:

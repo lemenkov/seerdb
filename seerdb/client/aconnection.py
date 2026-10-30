@@ -219,6 +219,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         config_dir: str | None = None,
         dsn: str | None = None,
         negotiation_cache: bool = False,
+        oall8: bool = False,
         access_token: object = None,
         shardingkey: object = None,
         supershardingkey: object = None,
@@ -284,6 +285,15 @@ class AsyncOracleConnect(_ConnectionLogic):
         # Negotiation cache (#438): opt-in reconnect optimization, sharing the
         # process-level cache with the sync connection.
         self.negotiation_cache = negotiation_cache
+        # Experimental 9i OALL8 opt-in (#716). The async login path does not yet
+        # carry the native OSESSKEY/OAUTH handshake (#790), so reject it here
+        # rather than select the OALL8 dialect and stall at the DTY. Sync-only.
+        if oall8:
+            raise NotSupportedError(
+                'the experimental 9i OALL8 opt-in (oall8=True) is synchronous-only '
+                'for now; use seerdb.connect() (#716/#790)'
+            )
+        self._oall8 = oall8
         self._used_nego_cache = False
         self._skip_nego_cache = False
         self.host = host
