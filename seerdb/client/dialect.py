@@ -1046,9 +1046,9 @@ class Fv2Oall8Dialect(Oall8Dialect):
         # decoded by the overrides below. Commit/rollback ride the OALL8 as
         # ordinary statements (CAP_OWN_TXN), as 8i does -- the 8i and thin-9i close
         # frames both break an OALL8 session, and so does the modern TTI_COMMIT, so
-        # this session drives its own transaction. PL/SQL blocks, LOB objects and
-        # array DML are follow-ups.
-        return frozenset({CAP_QUERY, CAP_DML, CAP_OWN_TXN})
+        # this session drives its own transaction. No-bind PL/SQL blocks run too
+        # (CAP_BLOCK); bound blocks, LOB objects and array DML are follow-ups.
+        return frozenset({CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_OWN_TXN})
 
     def _encode_query(self, sql_text: bytes, bind: list | None) -> bytes:
         # Native 64-bit OALL8 SELECT execute (FETCH option, byte-verified #792).
@@ -1212,7 +1212,21 @@ class Fv2Oall8Dialect(Oall8Dialect):
                 return buf
 
     def execute_block(self, sql: str, bind: list | None = None):
-        raise NotSupportedError(
-            'the experimental 9i OALL8 dialect does not serve PL/SQL blocks yet (#716)'
+        # 9i native OALL8 anonymous PL/SQL block (#793). A NO-BIND block replies
+        # exactly like a DML (an RPA piggyback then the OER), so it decodes through
+        # the same path. A BOUND block draws a 0x0b bind prompt and then waits for a
+        # two-phase input send whose layout differs from the thin fv2 block's; that
+        # round trip is not worked out yet, so a bound block raises rather than hang.
+        if bind:
+            raise NotSupportedError(
+                'the experimental 9i OALL8 dialect does not serve bound PL/SQL '
+                'blocks yet (the 0x0b bind-prompt round trip, #793/#794)'
+            )
+        stmt_type = o8i_stmt_type(sql.strip().upper())
+        yield Send(
+            self._closing() + self._encode_dml(encode_8i_sql_text(sql), stmt_type)
         )
-        yield  # pragma: no cover
+        buf = yield from self._recv_dml_terminal('PL/SQL block')
+        (_row_count, err_code, message) = decode_9i_oall8_dml_response(buf)
+        _raise_ora(err_code, message)
+        return (0, 0, 0, (None, None), [], None, None, [], None)
