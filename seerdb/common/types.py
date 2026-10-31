@@ -426,11 +426,22 @@ def decode_string(Data: bytes, Charset: int = AL32UTF8_CHARSET) -> str | None:
     return Data.decode(Encoding, errors='replace')
 
 
+def fv2_lob_charset(charset: int | None, csfrm: int | None = None) -> int:
+    """The charset a 9i LOB call carries a CLOB's text in (#2383): the session's
+    AL32UTF8, which the server converts the content to and from whatever the
+    database charset -- the column's charset is the database's, and reading by
+    it garbled `é` into `Ã©` on a WE8ISO8859P1 database -- or AL16UTF16 for an
+    NCLOB (csfrm 2), which keeps its national form."""
+    if csfrm == 2 or charset == AL16UTF16_CHARSET:
+        return AL16UTF16_CHARSET
+    return AL32UTF8_CHARSET
+
+
 def decode_fv2_lob(data_type: int, content: bytes, charset: int) -> str | bytes:
-    # Turn raw 9i LOB content (fetched via TTI_LOBOPS GETLEN + READ) into a
-    # Python value. CLOB / NCLOB (112) is sent in the column's DB charset — a
-    # single-byte run, NOT the UTF-16BE the modern path uses — so decode it with
-    # the column charset (same codec as a VARCHAR2). BLOB (113) stays bytes.
+    # Turn raw 9i / 8i LOB content (fetched via TTI_LOBOPS) into a Python value.
+    # CLOB / NCLOB (112) is text in `charset` -- NOT the UTF-16BE the modern path
+    # uses: on 9i the session's (fv2_lob_charset), on 8i the single-byte
+    # database charset the whole 8i session speaks. BLOB (113) stays bytes.
     # Empty content yields "" / b"". (#102)
     if data_type == 112:
         if not content:

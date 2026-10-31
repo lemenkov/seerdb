@@ -853,16 +853,18 @@ def fv2_lob_payload(
     Data: str | bytes, is_blob: bool, charset: int | None
 ) -> tuple[bytes, int]:
     """A 9i LOB write's bytes and its amount (#2259): a BLOB's bytes, or a
-    CLOB's text in its column's database charset, which 9i carries -- not the
-    10g+ UTF-16 -- counted in characters."""
+    CLOB's text in the session's charset (fv2_lob_charset) -- not the 10g+
+    UTF-16 -- counted in characters. Sent in the column's database charset, a
+    non-ASCII character was invalid UTF-8 to the server, which then found fewer
+    characters than the amount (ORA-22993, #2383)."""
     from typing import cast
 
-    from seerdb.common.types import _CHARSET_PYTHON_NAME
+    from seerdb.common.types import _CHARSET_PYTHON_NAME, fv2_lob_charset
 
     if is_blob:
         return (cast(bytes, Data), len(Data))
     Text = cast(str, Data)
-    return (Text.encode(_CHARSET_PYTHON_NAME.get(charset or 0, 'utf-8')), len(Text))
+    return (Text.encode(_CHARSET_PYTHON_NAME[fv2_lob_charset(charset)]), len(Text))
 
 
 def pre10_dml_applied(Result: object, BatchErrors: bool) -> bool:

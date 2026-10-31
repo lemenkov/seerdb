@@ -90,6 +90,7 @@ from seerdb.common.tns import (
     o8i_terminal_complete,
 )
 from seerdb.common.tns_consts import (
+    ISO_LATIN_1_CHARSET,
     ORA_NO_DATA_FOUND,
     TNS_TYPE_BFILE,
     TNS_TYPE_REFCURSOR,
@@ -508,7 +509,7 @@ class Fv2Dialect:
         # is still open. A BFILE stays a locator, read when its read() is called:
         # reading it opens the file, so a missing one failed the fetch (#1103).
         from seerdb.common.lob import LOB
-        from seerdb.common.types import decode_fv2_lob
+        from seerdb.common.types import decode_fv2_lob, fv2_lob_charset
 
         if self.keep_lobs:
             return  # LOB objects, read through their own calls (#2259)
@@ -516,10 +517,13 @@ class Fv2Dialect:
             for i, val in enumerate(row):
                 if isinstance(val, LOB) and val.data_type != TNS_TYPE_BFILE:
                     content = yield from self.lob_read(val.raw)
+                    # In the session's charset, not the column's (#2383).
                     row[i] = decode_fv2_lob(
                         columns[i].get('data_type'),
                         content,
-                        columns[i].get('charset') or 0,
+                        fv2_lob_charset(
+                            columns[i].get('charset'), columns[i].get('csfrm')
+                        ),
                     )
 
     def lob_read(self, locator: bytes, offset: int = 1, amount: int | None = None):
@@ -917,8 +921,15 @@ class Oall8Dialect:
                     row[i] = decode_fv2_lob(
                         columns[i].get('data_type'),
                         content,
-                        columns[i].get('charset') or 0,
+                        self._clob_charset(columns[i]),
                     )
+
+    def _clob_charset(self, column: dict) -> int:
+        # The charset a CLOB's text comes in: the session's (#2383). 8i's whole
+        # session is the single-byte database charset, national data too (#366).
+        # Its describe gives a CLOB column charset 0, which decoded as UTF-8 and
+        # turned 'é' into U+FFFD.
+        return ISO_LATIN_1_CHARSET
 
     def lob_read(self, locator: bytes):
         # 8i CLOB/BLOB content read (#364, §19.15): a single TTI_LOBOPS READ (8i
