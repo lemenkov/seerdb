@@ -7611,6 +7611,48 @@ class TestO9iOall8Messages(unittest.TestCase):
         self.assertEqual((two[2], two[25]), (0x06, 0x07))
         self.assertEqual(int.from_bytes(two[42:46], 'little'), 300)
 
+    # A native 9.2 sqlplus fetch (arraysize 2) of cursor 1, from
+    # native_9i_fetch_arraysize2.pcap.
+    NATIVE_9I_FETCH = bytes.fromhex(
+        '035e1e4000000001000000000000000000000000000000000000001c5e5d0000'
+        '0000000c0000000000000000000000000000004c5e5d00000000000000000000'
+        '0000001700000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000004e5e5d0000'
+        '000000586a5e0000000000000000000000000000000000020000000000000000'
+        '0000000000000000000000000000000100000000000000000000000000000000'
+        '000000'
+    )
+
+    def test_9i_oall8_fetch_is_the_execute_schema_without_sql(self):
+        # 8i's execute schema at a 9.2 client's widths reads the native fetch
+        # whole (#798): the fetch option, the cursor, the LONG cap (23, the widest
+        # buffer + 1) in max_long as on 8i, two rows in al8i4 [1], the statement
+        # type in [7]. Our fetch reads back the same.
+        from seerdb.common import tns, wire_schema
+        from seerdb.common.tns import TNS_EXEC_OPTION_FETCH, encode_9i_oall8_fetch
+
+        decode = wire_schema.compile_decoder(tns._O8I_ALL8, tns._O9I)
+        (native, rest) = decode(self.NATIVE_9I_FETCH)
+        self.assertEqual(rest, b'')
+        self.assertEqual(native['options'] & 0xFF, TNS_EXEC_OPTION_FETCH)
+        self.assertEqual(
+            (native['cursor'], native['al8i4_1'], native['al8i4_7']), (1, 2, 1)
+        )
+        self.assertEqual((native['prefetch_rows'], native['max_long']), (0, 23))
+        (ours, rest) = decode(encode_9i_oall8_fetch(0x1E, 1, 2, 23))
+        self.assertEqual(rest, b'')
+        for field in (
+            'seq',
+            'options',
+            'cursor',
+            'prefetch_rows',
+            'max_long',
+            'al8i4_0',
+            'al8i4_1',
+            'al8i4_7',
+        ):
+            self.assertEqual(ours[field], native[field], field)
+
     def test_9i_oall8_lob_write_matches_native_client(self):
         # The 64-bit TTI_LOBOPS head with the offset at 31, then the locator, the
         # ub4 amount, and the data as TTI_LOB content (#798). The source and amount

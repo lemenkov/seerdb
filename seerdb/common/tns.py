@@ -1578,7 +1578,10 @@ _EXEC_BY_CURSOR: wire_schema.Schema = (
 # both dialects, as python-oracledb writes them, measured against sqlplus 10.2,
 # 11g, 18c and 23.26 captures. What follows the define count differs by form.
 # In a wide OCI preamble one of prefetch_rows and max_long is the ub8; every
-# capture has 1 and 0 there, which can't tell which, and nothing reads them.
+# sqlplus capture has 1 and 0 there, which can't tell which, and nothing reads
+# them. A native 9.2 client's fetch tells (#798): its LONG cap, 23, is the ub8
+# after a zero prefetch_rows, so max_long is the ub8, as the cap is 8i's
+# max_long; the execute's 1 and 0 read the same either way.
 _ALL8_HEAD: wire_schema.Schema = (
     ('const', bytes([TTI_FUN, TTI_ALL8])),
     ('u8', 'seq'),
@@ -1592,8 +1595,8 @@ _ALL8_HEAD: wire_schema.Schema = (
     ('ptr', 'al8o4'),
     ('ptr', 'al8o4l'),
     ('n4', 'prefetch_size'),
-    ('wn4', 'prefetch_rows'),
-    ('n4', 'max_long'),
+    ('n4', 'prefetch_rows'),
+    ('wn4', 'max_long'),
     ('ptr', 'binds_present'),
     ('wn4', 'bind_count'),
     ('ptr', 'al8app'),
@@ -14403,28 +14406,36 @@ def encode_9i_oall8_query(Seq: int, Sql: bytes, Binds: list | None = None) -> by
 # (ub4le @67) and the rows-this-call count (ub4le @151). The 8-byte pointer slots
 # carry the native client's heap addresses, which the server ignores, so the
 # skeleton holds the non-null ``oci.OCI_INDICATOR`` sentinel instead.
-_OALL8_FETCH_SKEL = bytes.fromhex(
-    '035e00400000000000000000000000000000000000000000000000fffffffffffffffe0c000000000000000000000000000000fffffffffffffffe00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000fffffffffffffffefffffffffffffffe0000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000'
-)
-
-
 def encode_9i_oall8_fetch(
     Seq: int, Cursor: int, Count: int, LongSize: int = 0x7FFFFFFF
 ) -> bytes:
-    # Pull up to `Count` more rows from the open cursor (#792). `LongSize` caps a
-    # LONG / LONG RAW column's bytes per row (the server does not continue a LONG
-    # across fetches), so the caller passes a large value to read the whole one
-    # and forces Count=1, as 8i does (#377).
-    assert len(_OALL8_FETCH_SKEL) == 195
-    Frame = bytearray(_OALL8_FETCH_SKEL)
-    Frame[2] = Seq & 0xFF
-    # Byte 5 is 0x04 on a single-row fetch (the LONG case, which forces Count=1)
-    # and 0x00 otherwise -- byte-verified against both fetches in the capture.
-    Frame[5] = 0x04 if Count == 1 else 0x00
-    Frame[7:11] = (Cursor & 0xFFFFFFFF).to_bytes(4, 'little')
-    Frame[67:71] = min(LongSize, 0xFFFFFFFF).to_bytes(4, 'little')
-    Frame[151:155] = (Count & 0xFFFFFFFF).to_bytes(4, 'little')
-    return bytes(Frame)
+    # Pull up to `Count` more rows from the open cursor (#792): 8i's fetch, the
+    # execute's schema (_O8I_ALL8) with the fetch option and no SQL, at a 9.2
+    # client's widths (#798) -- the cursor, the LONG cap in max_long, al8i4 [1]
+    # the rows. `LongSize` caps a LONG / LONG RAW column's bytes per row (the
+    # server does not continue a LONG across fetches), so the caller passes a
+    # large value to read the whole one and forces Count=1, as 8i does (#377).
+    # Option byte 5 is 0x04 on a single-row fetch (the LONG case) and 0x00
+    # otherwise -- byte-verified against both fetches of native_9i_fetch_
+    # arraysize2.pcap, as the 195-byte skeleton this replaces was.
+    Values = dict(_O8I_ALL8_FIXED)
+    Values.update(
+        seq=Seq & 0xFF,
+        options=TNS_EXEC_OPTION_FETCH | ((0x04 << 16) if Count == 1 else 0),
+        cursor=Cursor,
+        sql_present=False,
+        sql_length=0,
+        prefetch_rows=0,
+        max_long=min(LongSize, 0xFFFFFFFF),
+        binds_present=False,
+        bind_count=0,
+        defines_present=True,
+        define_count=0,
+        al8i4_0=0,
+        al8i4_1=Count,
+        al8i4_7=O8I_STMT_SELECT,
+    )
+    return _O8I_ALL8_O9I(Values)
 
 
 def encode_9i_oall8_lobop(
