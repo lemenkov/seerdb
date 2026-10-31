@@ -49,6 +49,7 @@ from seerdb.common.tns import (
     decode_9i_oall8_dml_response,
     decode_9i_oall8_dml_rowid,
     decode_9i_oall8_exec_response,
+    decode_9i_oall8_lob_value,
     decode_9i_oall8_terminal_error,
     decode_fv2_batch_errors,
     decode_fv2_bind_directions,
@@ -1046,8 +1047,8 @@ class Fv2Oall8Dialect(Oall8Dialect):
     columns, INSERT/UPDATE/DELETE and DDL under its own commit/rollback, PL/SQL
     blocks with IN, OUT, IN OUT and REF CURSOR binds, and DML...RETURNING
     (through its PL/SQL wrap) -- all over the native 64-bit OALL8 reply decode
-    (decode_9i_oall8_*), and array DML. Synchronous only. Not yet: LOB objects
-    kept open (fetch_lobs=False), nested cursors, object types, and a session past
+    (decode_9i_oall8_*), array DML and LOB objects (fetch_lobs=False).
+    Synchronous only. Not yet: nested cursors, object types, and a session past
     255 statements (the cursor id is read as one byte)."""
 
     def capabilities(self) -> frozenset[str]:
@@ -1061,7 +1062,15 @@ class Fv2Oall8Dialect(Oall8Dialect):
         # content is read at fetch time (CAP_LOB); BFILE, kept-open LOB objects and
         # array DML are follow-ups.
         return frozenset(
-            {CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_LOB, CAP_OWN_TXN, CAP_ARRAY_DML}
+            {
+                CAP_QUERY,
+                CAP_DML,
+                CAP_BLOCK,
+                CAP_LOB,
+                CAP_OWN_TXN,
+                CAP_ARRAY_DML,
+                CAP_LOB_OBJECT,
+            }
         )
 
     def _encode_query(self, sql_text: bytes, bind: list | None) -> bytes:
@@ -1168,6 +1177,42 @@ class Fv2Oall8Dialect(Oall8Dialect):
             (content, complete) = decode_fv2_lob_chunks(data)
             if complete:
                 return content
+
+    def resolve_lobs(self, rows: list, columns: list):
+        # CLOB / BLOB content in place of the locators, as on 8i -- unless the
+        # connection keeps LOB objects (fetch_lobs=False), which read through
+        # their own calls (lob_read / lob_operation, #798), as on the compact
+        # 9i path (#2259).
+        if self.keep_lobs:
+            return
+        yield from super().resolve_lobs(rows, columns)
+
+    def lob_operation(
+        self,
+        locator: bytes,
+        operation: int,
+        amount: int = 0,
+        offset: int = 0,
+        data: bytes | None = None,
+    ):
+        # One LOB object call over a native 9i OALL8 session (#798), in the 64-bit
+        # TTI_LOBOPS form (encode_9i_oall8_lobop): its reply value -- a size, the
+        # amount a write wrote, OPEN's mode, IS_OPEN's 1 or 0 -- and the locator as
+        # the server now sees it. An error (ORA-22920 for an unlocked row) is a bare
+        # status, raised.
+        yield Send(
+            encode_9i_oall8_lobop(
+                self._next_seq(), locator, operation, offset, amount, data
+            )
+        )
+        resp = yield RECV
+        if resp is False:
+            raise Exception('Connection closed during 9i OALL8 LOB call')
+        (value, updated) = decode_9i_oall8_lob_value(resp[1], operation)
+        if not updated:
+            (err_code, message) = decode_9i_oall8_terminal_error(resp[1])
+            _raise_ora(err_code, message)
+        return (value, updated or None)
 
     def bfile_read(self, locator: bytes):
         # BFILE read over a native 9i OALL8 session (#796): FILE_OPEN -> GET_LENGTH

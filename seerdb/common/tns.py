@@ -14394,7 +14394,12 @@ def encode_9i_oall8_fetch(
 
 
 def encode_9i_oall8_lobop(
-    Seq: int, Locator: bytes, Operation: int, Offset: int = 0, Amount: int = 0
+    Seq: int,
+    Locator: bytes,
+    Operation: int,
+    Offset: int = 0,
+    Amount: int = 0,
+    Data: bytes | None = None,
 ) -> bytes:
     # A TTI_LOBOPS (0x60) call on a native 9i OALL8 session (#795/#796), in the
     # 64-bit form -- the 8i (32-bit) and thin-9i LOBOPS envelopes both draw no
@@ -14407,7 +14412,11 @@ def encode_9i_oall8_lobop(
     # addresses, which the server ignores, so the non-null oci.OCI_INDICATOR
     # stands in. Byte-reproduced from a native 9.2 sqlplus CLOB READ
     # (native_9i_clob_read.pcap); FILE_OPEN, GET_LENGTH and FILE_CLOSE use the same
-    # head and are live-verified on 9.2 (a BFILE read end to end).
+    # head and are live-verified on 9.2 (a BFILE read end to end). The LOB object's
+    # calls (#798) match a native OCI client's (native_9i_lob_ops.pcap): the
+    # amount is GET_LENGTH's / GET_CHUNK_SIZE's 0, OPEN's mode, TRIM's new length,
+    # a WRITE's count; IS_OPEN and CLOSE carry none. A WRITE's `Data` follows as
+    # TTI_LOB content, framed as the compact path frames it (`0e 03 58 59 5a`).
     Flags = _O7_LOBOP_FLAGS.get(Operation, {})
     AmountPresent = Flags.get('short_amount_present', True)
     Frame = bytearray(91)
@@ -14421,7 +14430,34 @@ def encode_9i_oall8_lobop(
         Frame[59:67] = oci.OCI_INDICATOR
     Frame[67:75] = Operation.to_bytes(8, 'little')
     Tail = (Amount & 0xFFFFFFFF).to_bytes(4, 'little') if AmountPresent else b''
+    if Data is not None:
+        Tail += bytes([TTI_LOB]) + _o7_lob_value(Data)
     return bytes(Frame) + Locator + Tail
+
+
+def decode_9i_oall8_lob_value(Data: bytes, Operation: int) -> tuple[int | None, bytes]:
+    # A 9i OALL8 LOB call's reply (#798): a TTI_RPA carrying the locator as the
+    # server now sees it (a ub2 big-endian length and the body: a WRITE updates
+    # it), then the call's value -- a ub4 (GET_LENGTH's and GET_CHUNK_SIZE's size,
+    # OPEN's mode, TRIM's new length, the amount a WRITE wrote), IS_OPEN's single
+    # byte, CLOSE's nothing -- then the status. Read from a native 9.2 OCI client
+    # (native_9i_lob_ops.pcap). Returns (value, locator); a reply that is a bare
+    # status (an error) gives (None, b''), for the caller to raise.
+    #
+    # The locator comes back as its body, without the ub2 length a fetched one
+    # opens with (`00 54`, then 84 bytes for a CLOB / BLOB): the reply's `00 54`
+    # is its length here. The LOB object puts the prefix back (LOB._refresh, the
+    # 10g+ reply's form too).
+    if Data[:1] != bytes([TTI_RPA]):
+        return (None, b'')
+    Length = int.from_bytes(Data[1:3], 'big')
+    Locator = bytes(Data[3 : 3 + Length])
+    Rest = Data[3 + Length :]
+    if Operation in (TNS_LOB_OP_CLOSE, TNS_LOB_OP_FILE_CLOSE):
+        return (None, Locator)
+    if Operation == TNS_LOB_OP_IS_OPEN:
+        return (Rest[0], Locator)
+    return (int.from_bytes(Rest[:4], 'little'), Locator)
 
 
 def encode_9i_oall8_lob_read(
@@ -14602,14 +14638,16 @@ def decode_9i_oall8_exec_response(
                 if len(Rest) < _O9I_OALL8_RXH_LEN:
                     raise IndexError('row header')
                 VecLen = int.from_bytes(Rest[26:28], 'little')
+                # A ub2 at 42 is the length of the row's rowid, which follows the
+                # vector: a SELECT ... FOR UPDATE sends the 13-byte physical rowid
+                # of the row it locks (read live on 9.2); skipped, as the column
+                # values carry the row.
+                RowidLen = int.from_bytes(Rest[42:44], 'little')
                 Rest = Rest[_O9I_OALL8_RXH_LEN:]
-                if VecLen:
-                    if len(Rest) < VecLen:
-                        raise IndexError('row header vector')
-                    Vector = bytes(Rest[:VecLen])
-                    Rest = Rest[VecLen:]
-                else:
-                    Vector = None
+                if len(Rest) < VecLen + RowidLen:
+                    raise IndexError('row header vector / rowid')
+                Vector = bytes(Rest[:VecLen]) if VecLen else None
+                Rest = Rest[VecLen + RowidLen :]
             elif Token == TTI_BVC:
                 # A bit vector for the NEXT row: token + ub2 count + the vector.
                 Rest = Rest[1:]

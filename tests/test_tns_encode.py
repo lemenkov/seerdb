@@ -7524,6 +7524,37 @@ class TestO9iOall8Messages(unittest.TestCase):
         )
         self.assertEqual(msg[:6], self.NATIVE_BATCH_ERRORS_HEAD)
 
+    # A native 9.2 OCI client's OCILobWrite of 'XYZ' at offset 3 into a CLOB
+    # (native_9i_lob_ops.pcap).
+    LOB_WRITE_REQUEST = bytes.fromhex(
+        '03600e50c8510000000000560000000000000000000000000000000000000003'
+        '0000000000000000000000000000000000000078faffbf7f0000000000000000'
+        '0000004000000000000000000000000000000000000000000000000054000102'
+        '0c00000001000000010000000dca79000352f4000352f300010001001f000000'
+        '00000049000000008fb30000005d96022e6e350000000800180000a2d1008014'
+        '9c03ec02000000000352f30040b8d20000030000000e0358595a'
+    )
+
+    def test_9i_oall8_lob_write_matches_native_client(self):
+        # The 64-bit TTI_LOBOPS head with the offset at 31, then the locator, the
+        # ub4 amount, and the data as TTI_LOB content (#798). The source and amount
+        # pointers are the client's heap addresses; the encoder writes the
+        # indicator there.
+        from seerdb.common.tns import encode_9i_oall8_lobop
+        from seerdb.common.tns_consts import TNS_LOB_OP_WRITE
+
+        native = self.LOB_WRITE_REQUEST
+        locator = native[91 : 91 + int.from_bytes(native[11:19], 'little')]
+        ours = encode_9i_oall8_lobop(native[2], locator, TNS_LOB_OP_WRITE, 3, 3, b'XYZ')
+
+        def mask(buf):
+            b = bytearray(buf)
+            for off in (3, 51):
+                b[off : off + 8] = bytes(8)
+            return bytes(b)
+
+        self.assertEqual(mask(ours), mask(native))
+
     # A native 9.2 sqlplus query of 161 bytes (its text NUL-terminated), and how
     # the client framed it: 0xFE, 64-byte chunks (64, 64, 33) and a zero length.
     NATIVE_LONG_SQL = (
