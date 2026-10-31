@@ -2024,6 +2024,24 @@ _O8I_LOB_CELL: wire_schema.Schema = (
     ('n2', 'indicator'),
     ('n2', 'return_code'),
 )
+# An object or collection column's cell in a 9.2 OALL8 row (#798): thin's object
+# framing (_read_object_column) at fixed widths -- the type reference (36 bytes),
+# the object OID and the snapshot, each a ub4 length and its bytes; a ub2
+# version; a ub4 image length, zero for a NULL value; ub2 flags; then the packed
+# image. Read from native_9i_objects.pcap: `24000000 24 <ref> 00000000 00000000
+# 0000 0a000000 0100 0a 84010a02c102036f6e65` for PYO_O798_PT(1, 'one').
+_O9I_OBJECT_CELL: wire_schema.Schema = (
+    ('n4', 'toid_length'),
+    ('when', 'toid_length', (('value', 'toid'),)),
+    ('n4', 'oid_length'),
+    ('when', 'oid_length', (('value', 'oid'),)),
+    ('n4', 'snapshot_length'),
+    ('when', 'snapshot_length', (('value', 'snapshot'),)),
+    ('n2', 'version'),
+    ('n4', 'image_length'),
+    ('n2', 'flags'),
+    ('when', 'image_length', (('value', 'image'),)),
+)
 # A rowid at fixed widths, as an 8i status and ROWID cell carry it (#1079): the
 # data object, the file, a reserved byte, the block, the slot. A 9.2 server
 # writes it to a 9.2 client aligned, the file and the slot each padded to four
@@ -2281,22 +2299,33 @@ _O8I_STATUS: wire_schema.Schema = (
 )
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
 # The experimental 9i OALL8 describe (#792, #798): the OCI describe column
-# (_DCB_COLUMN) with the type name's length a ub2, the one 9i difference, behind
-# the maximum row size and the column count; then the start of the OCI trailer
-# (_DESCRIBE_TRAILER), a lead byte, a ub4 length (7) and the describe time,
-# landing on the first row header or the status. A query's TTI_DCB carries it
-# after a preamble; a REF CURSOR OUT bind carries it behind a lead byte (0x2c),
-# with the cursor id, a ub2 indicator and a ub2 return code after it. Read from
-# every live 9.2 describe the decode tests hold, and native_9i_select.pcap's.
+# (_DCB_COLUMN) without the byte 10g+ OCI has before each column and the one
+# after it, behind the maximum row size, the column count and one byte (0x4b);
+# then the start of the OCI trailer (_DESCRIBE_TRAILER) without its lead byte, a
+# ub4 length (7) and the describe time, landing on the first row header or the
+# status. A query's TTI_DCB carries it after a preamble; a REF CURSOR OUT bind
+# carries it behind a lead byte (0x2c), with the cursor id, a ub2 indicator and a
+# ub2 return code after it. Read from every live 9.2 describe the decode tests
+# hold, and from native_9i_objects.pcap's typed columns: an object column's type
+# name `0b 00 00 00 0b PYO_O798_PT` has a ub4 length, as on 10g, and the describe
+# time follows it at once. Untyped columns alone also read as the type name's
+# length a ub2 behind a reserved byte, which an object column disproved (#798).
 _DCB_COLUMN_9I: wire_schema.Schema = tuple(
-    ('n2', 'type_name_length') if _F[:2] == ('n4', 'type_name_length') else _F
+    (
+        ('only', 'oci', tuple(_G for _G in _F[2] if _G != ('u8', 'marker')))
+        if _F[:2] == ('only', 'oci') and ('u8', 'marker') in _F[2]
+        else _F
+    )
     for _F in _DCB_COLUMN
+    if _F != ('only', 'oci', (('u8', 'reserved'),))
 )
 _O9I_DESCRIBE_BODY: wire_schema.Schema = (
     ('n4', 'max_row_size'),
     ('n4', 'count'),
+    ('u8', 'columns_lead'),
     ('each', 'columns', 'count', _DCB_COLUMN_9I),
-    *_DESCRIBE_TRAILER[:2],
+    ('n4', 'date_length'),
+    ('value', 'date'),
 )
 _O9I_DESCRIBE: wire_schema.Schema = (
     ('const', bytes([TTI_DCB])),
@@ -2304,10 +2333,16 @@ _O9I_DESCRIBE: wire_schema.Schema = (
     ('bytes', 'preamble', 'preamble_length'),
     *_O9I_DESCRIBE_BODY,
 )
-_O9I_REFCURSOR_OUT: wire_schema.Schema = (
+# A CURSOR(...) column's row cell is the same without the indicator and return
+# code: `2c`, the describe, the cursor id, then the next cell or the RPA
+# (native_9i_objects.pcap, #798).
+_O9I_CURSOR_CELL: wire_schema.Schema = (
     ('u8', 'lead'),
     *_O9I_DESCRIBE_BODY,
     ('n4', 'cursor'),
+)
+_O9I_REFCURSOR_OUT: wire_schema.Schema = (
+    *_O9I_CURSOR_CELL,
     ('n2', 'indicator'),
     ('n2', 'return_code'),
 )
@@ -2564,10 +2599,12 @@ _O9I_IOV_FROM_O9I = wire_schema.compile_decoder(_O9I_IOV, _O9I)
 _O9I_RXH_FROM_O9I = wire_schema.compile_decoder(_O9I_RXH, _O9I)
 _O9I_ROWID_CELL_FROM_O9I = wire_schema.compile_decoder(_O9I_ROWID_CELL, _O9I)
 _O9I_LOB_CELL_FROM_O9I = wire_schema.compile_decoder(_O9I_LOB_CELL, _O9I)
+_O9I_OBJECT_CELL_FROM_O9I = wire_schema.compile_decoder(_O9I_OBJECT_CELL, _O9I)
 _O9I_UROWID_CELL_FROM_O9I = wire_schema.compile_decoder(_O9I_UROWID_CELL, _O9I)
 # The describe's columns are the OCI dialect's own fields, read with its codec.
 _O9I_DESCRIBE_FROM_OCI = wire_schema.compile_decoder(_O9I_DESCRIBE, _OCI)
 _O9I_REFCURSOR_OUT_FROM_OCI = wire_schema.compile_decoder(_O9I_REFCURSOR_OUT, _OCI)
+_O9I_CURSOR_CELL_FROM_OCI = wire_schema.compile_decoder(_O9I_CURSOR_CELL, _OCI)
 _OAC_OCI = wire_schema.compile_encoder(_OAC, _OCI)
 _O7_LOBOPS_O9I = wire_schema.compile_encoder(_O7_LOBOPS, _O9I)
 _CLOSE_CURSORS_O9I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O9I)
@@ -14738,12 +14775,22 @@ def encode_9i_oall8_lob_read(
 _DESCRIBE_GIVEN = {'oci_12c': False, 'has_uds': False}
 
 
+# The type codes a 9.2 OALL8 describe gives a typed column: the dictionary's
+# (col$.type#) -- 58 an opaque type (XMLTYPE), 121 an object, 122 a nested table,
+# 123 a VARRAY -- where thin describes each as TNS_TYPE_ADT, its type named beside
+# it (native_9i_objects.pcap; XMLTYPE read live).
+_O9I_OALL8_TYPED = frozenset((58, 121, 122, 123))
+
+
 def _o9i_oall8_columns(Columns: list) -> list[dict]:
     # The describe's columns, shaped like decode_8i_dcb_describe's, so the shared
-    # row and cursor machinery is unchanged.
-    return [
-        {
-            'data_type': Col['data_type'],
+    # row and cursor machinery is unchanged. A typed column takes thin's type and
+    # carries its type's identity, for the cursor to describe the type with.
+    Out = []
+    for Col in Columns:
+        Typed = Col['data_type'] in _O9I_OALL8_TYPED
+        Shaped = {
+            'data_type': TNS_TYPE_ADT if Typed else Col['data_type'],
             'data_length': Col['buffer_size'],
             'data_scale': Col['scale'],
             'precision': Col['precision'],
@@ -14755,8 +14802,12 @@ def _o9i_oall8_columns(Columns: list) -> list[dict]:
             'domain_name': None,
             'column_name': bytes(Col.get('name') or b'').decode('latin-1'),
         }
-        for Col in Columns
-    ]
+        if Typed:
+            Shaped['type_oid'] = bytes(Col.get('toid') or b'')
+            Shaped['type_schema'] = _fv2_type_name(Col.get('type_schema'))
+            Shaped['type_name'] = _fv2_type_name(Col.get('type_name'))
+        Out.append(Shaped)
+    return Out
 
 
 def decode_9i_oall8_describe(Data: bytes) -> tuple[list[dict], bytes]:
@@ -14779,6 +14830,27 @@ def _o9i_oall8_cell(Data: bytes) -> tuple[bytes | None, bytes]:
     if Data[0] == 0xFF:
         return (None, Data[1:])
     return _OCI.read_value(Data)
+
+
+def _o9i_oall8_object_cell(Col: dict, Data: bytes) -> tuple[object, bytes]:
+    # An object or collection column's cell in a 9i OALL8 row (_O9I_OBJECT_CELL):
+    # None for a NULL value (no image), else an ObjectImage the cursor turns into
+    # a DbObject once it has described the type, as thin's (_read_object_column).
+    from seerdb.common.dbobject import ObjectImage
+
+    (Cell, Rest) = _O9I_OBJECT_CELL_FROM_O9I(Data)
+    if not Cell['image_length']:
+        return (None, Rest)
+    return (
+        ObjectImage(
+            Col.get('type_oid', b''),
+            Col.get('type_schema'),
+            Col.get('type_name'),
+            Col.get('charset'),
+            bytes(Cell['image']),
+        ),
+        Rest,
+    )
 
 
 # The LOB columns whose 9i OALL8 row cell is a locator, not an inline value.
@@ -14909,6 +14981,20 @@ def decode_9i_oall8_exec_response(
                         # is described with a zero length too, and does carry
                         # data.
                         Row.append(None)
+                        continue
+                    if Col.get('data_type') == TNS_TYPE_ADT:
+                        (Value, Rest) = _o9i_oall8_object_cell(Col, Rest)
+                        Row.append(Value)
+                        continue
+                    if Col.get('data_type') == TNS_TYPE_REFCURSOR:
+                        # A CURSOR(...) column (_O9I_CURSOR_CELL): the nested
+                        # cursor comes opened and described, as a REF CURSOR OUT
+                        # bind's does -- (cursor id, columns), its rows for the
+                        # dialect to fetch by that id.
+                        (Cell, Rest) = _O9I_CURSOR_CELL_FROM_OCI(Rest, _DESCRIBE_GIVEN)
+                        Row.append(
+                            (Cell['cursor'], _o9i_oall8_columns(Cell['columns']))
+                        )
                         continue
                     if Col.get('data_type') == TNS_TYPE_UROWID:
                         (Text, Rest) = _o9i_oall8_urowid_cell(Rest)

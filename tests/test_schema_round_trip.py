@@ -53,6 +53,7 @@ ONE_WAY = {
     '_DCB_COLUMN_9I',
     '_O9I_DESCRIBE_BODY',
     '_O9I_DESCRIBE',
+    '_O9I_CURSOR_CELL',
     '_O9I_REFCURSOR_OUT',
     # The describe body it carries per result is pre-encoded, a raw field.
     '_IMPLICIT_RESULTS',

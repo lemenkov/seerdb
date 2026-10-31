@@ -796,12 +796,39 @@ class Oall8Dialect:
                 rows.extend(
                     (yield from self._fetch_rest(cursor, columns, last_row, fetch))
                 )
+            yield from self._read_nested(rows, columns)
         finally:
             self._finished(cursor)
         # CLOB / BLOB cells came back as locators: read their content while the
         # cursor is still open. A BFILE stays a locator, read on demand.
         yield from self.resolve_lobs(rows, columns)
         return (0, 0, 0, (len(rows), columns), rows, None, None, [], None)
+
+    def _read_cursor(self, cursor: int, columns: list):
+        # Every row of a cursor the server opened and described for us -- a REF
+        # CURSOR OUT bind's, a CURSOR(...) column's -- fetched by its id, with the
+        # cursors nested in its own rows, then closed with the next call (#798).
+        try:
+            rows = yield from self._fetch_rest(cursor, columns, None)
+            yield from self._read_nested(rows, columns)
+        finally:
+            self._finished(cursor)
+        yield from self.resolve_lobs(rows, columns)
+        return rows
+
+    def _read_nested(self, rows: list, columns: list):
+        # A CURSOR(...) column's cell came back as its cursor's (id, columns), the
+        # dialect's _decode_rows reading it so (9.2's; 8i's has none). Read each
+        # while the parent is open -- ojdbc14 closes the parent last -- into the
+        # marker the cursor wraps, as the compact path does (#2254).
+        for j, col in enumerate(columns):
+            if col.get('data_type') != TNS_TYPE_REFCURSOR:
+                continue
+            for row in rows:
+                if isinstance(row[j], tuple):
+                    (nested, nested_columns) = row[j]
+                    nested_rows = yield from self._read_cursor(nested, nested_columns)
+                    row[j] = _cursor_marker(nested, nested_columns, nested_rows)
 
     def _fetch_rest(
         self, cursor: int, columns: list, last_row: list | None, fetch: int = 15
@@ -1418,9 +1445,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
             for i in cursors:
                 if isinstance(out_values[i], tuple):
                     (cursor_id, columns) = out_values[i]
-                    rows = yield from self._fetch_rest(cursor_id, columns, None)
-                    self._finished(cursor_id)  # read: close it with the next call
-                    yield from self.resolve_lobs(rows, columns)
+                    rows = yield from self._read_cursor(cursor_id, columns)
                     out_values[i] = _cursor_marker(cursor_id, columns, rows)
             record = {
                 'out_positions': out_positions,

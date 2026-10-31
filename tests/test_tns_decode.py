@@ -8463,6 +8463,151 @@ class TestNative9iOall8Select(unittest.TestCase):
         self.assertEqual((values, code), ([b'a' + b'b' * 299], 0))
 
 
+class TestNative9iOall8Typed(unittest.TestCase):
+    # Typed columns over the native 9i OALL8 path (#798), from sqlplus 9.2's
+    # native_9i_objects.pcap: an object column (`SELECT id, p` of PYO_O798_PT),
+    # its NULL in the next fetch, a VARRAY column and a CURSOR(...) column.
+    OBJECT_EXEC = bytes.fromhex(
+        '101d0dd77d57b0dcbd62000000000000787e0a1f051234963200000100000056'
+        '000000020000004b010200008116000000000000000000000000000000000000'
+        '0000000000000000000000000000000000010202000000024944000000000000'
+        '00000079000000d0070000000000000000000010000000105f1c3237d9a9537f'
+        'e060007f0100130e010000000000000000010101000000015003000000035059'
+        '4f0b0000000b50594f5f4f3739385f50540700000007787e0a1f051234060102'
+        '2a0200000001000000ffbf7f00000000000000000000000000ffbf7f00000000'
+        '000000000000000000bb62000000000702c1022400000024002202085f1c3237'
+        'd9a9537fe060007f0100130e0000000000000000000000000001000100000000'
+        '0000000000000a00000001000a84010a02c102036f6e65080500e59531020000'
+        '0000010000000000000000000000000000000401000000010100000000000000'
+        '0000010012000300000000005b73030001000000d2b800000100000000000000'
+        '002b0000010000003601000000000000000000000000000080d0d40300000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000000000000000000000000000000000000000000000000'
+    )
+    OBJECT_FETCH = bytes.fromhex(
+        '060002000200000002000000d4030000000048bfd60300000000010016030000'
+        '000000000000000000000000d40300000000030702c103240000002400220208'
+        '5f1c3237d9a9537fe060007f0100130e00000000000000000000000000010001'
+        '00000000000000000000000000000100040100000001020000007b0500000000'
+        '010000000300200000005b73030001000000d2b8000001000000000000000033'
+        '0000010000003601000000000000000000000000000080d0d403000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00000000000000000000000000000000000000000000194f52412d3031343033'
+        '3a206e6f206461746120666f756e640a'
+    )
+    VARRAY_EXEC = bytes.fromhex(
+        '101dda4da24b3864bc62000000000000787e0a1f0512349832000001000000ae'
+        '000000020000004b010200008116000000000000000000000000000000000000'
+        '0000000000000000000000000000000000010202000000024944000000000000'
+        '0000007b000000d0070000000000000000000010000000105f1c3237d9ae537f'
+        'e060007f0100130e010000000000000000010101000000014e03000000035059'
+        '4f0d0000000d50594f5f4f3739385f4e554d530700000007787e0a1f05123406'
+        '01022a0200000001000000ffbf7f00000000000000000000000000ffbf7f0000'
+        '0000000000000000000000bb62000000000702c1022400000024002202085f1c'
+        '3237d9ae537fe060007f0100130e000000000000000000000000000100010000'
+        '0000000000000000100000000100108801100101000302c10202c10302c10408'
+        '0500e59531020000000001000000000000000000000000000000040100000001'
+        '01000000000000000000010012000300000000005b73030001000000d2b80000'
+        '0100000000000000003700000100000036010000000000000000000000000000'
+        '80d0d40300000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+    )
+    CURSOR_EXEC = bytes.fromhex(
+        '101d4e92f50cc8c4ba62000000000000787e0a1f051234ae3800000000000016'
+        '000000010000004b016600000005000000000000000000000000000000000000'
+        '0000000000000000000000000000000000010101000000014300000000000000'
+        '000700000007787e0a1f0512340601021e010000000100000061962a00000000'
+        '0000000000000000000000000000000000000000000000000000000000000007'
+        '2c00000000010000004b01020000001600000000000000000000000000000000'
+        '00000000000000000000000000000000000000010505000000054c4556454c00'
+        '000000000000000700000007787e0a1f05123403000000080500e59531020000'
+        '0000010000000000000000000000000000000401000000010100000000000000'
+        '0000010039000300000000005b73030001000000d2b800000100000000000000'
+        '004a0000010000003601000000000000000000000000000080d0d40300000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000000000000000000000000000000000000000000000000'
+    )
+
+    def _decode(self, data, columns, prev=None):
+        from seerdb.common.tns import (
+            _DECODE_FIELD_VERSION,
+            FIELD_VERSION_9_2,
+            decode_9i_oall8_exec_response,
+        )
+
+        token = _DECODE_FIELD_VERSION.set(FIELD_VERSION_9_2)
+        try:
+            return decode_9i_oall8_exec_response(data, columns, prev)
+        finally:
+            _DECODE_FIELD_VERSION.reset(token)
+
+    def test_an_object_column_describes_as_thins_adt_with_its_type(self):
+        # 9.2 describes the column with its dictionary type (121) and names the
+        # type with a ub4 length; the describe ends on the first row header.
+        from seerdb.common.tns import TNS_TYPE_ADT, decode_9i_oall8_describe
+
+        (columns, rest) = decode_9i_oall8_describe(self.OBJECT_EXEC)
+        self.assertEqual([c['column_name'] for c in columns], ['ID', 'P'])
+        self.assertEqual(columns[1]['data_type'], TNS_TYPE_ADT)
+        self.assertEqual(columns[1]['type_schema'], 'PYO')
+        self.assertEqual(columns[1]['type_name'], 'PYO_O798_PT')
+        self.assertEqual(
+            columns[1]['type_oid'], bytes.fromhex('5f1c3237d9a9537fe060007f0100130e')
+        )
+        self.assertEqual(rest[0], 0x06)
+
+    def test_an_object_cell_carries_its_image(self):
+        from seerdb.common.dbobject import ObjectImage
+        from seerdb.common.tns import decode_9i_oall8_describe
+
+        (columns, rest) = decode_9i_oall8_describe(self.OBJECT_EXEC)
+        (rows, terminal, _) = self._decode(rest, columns)
+        self.assertEqual(len(rows), 1)
+        (ident, value) = rows[0]
+        self.assertEqual(ident, 1)
+        self.assertIsInstance(value, ObjectImage)
+        self.assertEqual(value.type_name, 'PYO_O798_PT')
+        # PYO_O798_PT(1, 'one'): the pickled image, NUMBER 1 and 'one'.
+        self.assertEqual(value.image, bytes.fromhex('84010a02c102036f6e65'))
+        self.assertEqual(terminal[0], 0x08)  # the RPA, then the status
+
+    def test_a_null_object_has_no_image(self):
+        from seerdb.common.tns import decode_9i_oall8_describe
+
+        (columns, _) = decode_9i_oall8_describe(self.OBJECT_EXEC)
+        (rows, terminal, _) = self._decode(self.OBJECT_FETCH, columns)
+        self.assertEqual(rows, [[2, None]])
+        self.assertEqual(terminal[0], 0x04)
+
+    def test_a_varray_column_reads_as_an_object_image(self):
+        from seerdb.common.dbobject import ObjectImage
+        from seerdb.common.tns import TNS_TYPE_ADT, decode_9i_oall8_describe
+
+        (columns, rest) = decode_9i_oall8_describe(self.VARRAY_EXEC)
+        self.assertEqual(columns[1]['data_type'], TNS_TYPE_ADT)
+        self.assertEqual(columns[1]['type_name'], 'PYO_O798_NUMS')
+        (rows, terminal, _) = self._decode(rest, columns)
+        (ident, value) = rows[0]
+        self.assertEqual(ident, 1)
+        self.assertIsInstance(value, ObjectImage)
+        # PYO_O798_NUMS(1, 2, 3): the collection image and its three NUMBERs.
+        self.assertTrue(value.image.endswith(bytes.fromhex('02c10202c10302c104')))
+        self.assertEqual(terminal[0], 0x08)
+
+    def test_a_cursor_column_comes_opened_and_described(self):
+        # The cell is a REF CURSOR OUT bind's without its indicator and return
+        # code: the nested cursor's id and columns, the RPA right behind.
+        from seerdb.common.tns import TNS_TYPE_REFCURSOR, decode_9i_oall8_describe
+
+        (columns, rest) = decode_9i_oall8_describe(self.CURSOR_EXEC)
+        self.assertEqual(columns[0]['data_type'], TNS_TYPE_REFCURSOR)
+        (rows, terminal, _) = self._decode(rest, columns)
+        ((cursor, nested),) = rows[0]
+        self.assertEqual(cursor, 3)
+        self.assertEqual([c['column_name'] for c in nested], ['LEVEL'])
+        self.assertEqual(terminal[0], 0x08)
+
+
 class TestO8iBfile(unittest.TestCase):
     """Oracle 8i native BFILE read (#401, PROTOCOL §19.17): FILE_OPEN -> GETLEN
     -> READ -> FILE_CLOSE over TTI_LOBOPS in the 8i envelope (ub4-LE lengths +
