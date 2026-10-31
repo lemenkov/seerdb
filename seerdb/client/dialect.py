@@ -1039,13 +1039,14 @@ class Fv2Oall8Dialect(Oall8Dialect):
     (#716/#790). The session authenticates as an ordinary 9i client (it is not an
     O8iDialect) and then speaks the native thick (OCI) wire.
 
-    Served: SELECT (with scalar binds, positional and named) including LONG and
-    CLOB / BLOB columns, INSERT/UPDATE/DELETE and DDL (with scalar binds) under its
-    own commit/rollback, PL/SQL blocks with IN, OUT and IN OUT binds, and
-    DML...RETURNING (through its PL/SQL wrap) -- all over the native 64-bit OALL8
-    reply decode (decode_9i_oall8_*). BFILE reads (#796), LOB objects kept open
-    (fetch_lobs=False), TIMESTAMP / INTERVAL binds (#797) and array DML are
-    follow-ups."""
+    Served: SELECT (with scalar binds, positional and named, temporal and
+    interval ones too) including LONG, ROWID / UROWID, CLOB / BLOB and BFILE
+    columns, INSERT/UPDATE/DELETE and DDL under its own commit/rollback, PL/SQL
+    blocks with IN, OUT, IN OUT and REF CURSOR binds, and DML...RETURNING
+    (through its PL/SQL wrap) -- all over the native 64-bit OALL8 reply decode
+    (decode_9i_oall8_*). Synchronous only. Not yet: array DML, LOB objects kept
+    open (fetch_lobs=False), nested cursors, object types, lastrowid, and a
+    session past 255 statements (the cursor id is read as one byte)."""
 
     def capabilities(self) -> frozenset[str]:
         # SELECT, DML / DDL, PL/SQL blocks and own commit/rollback over the native
@@ -1091,6 +1092,31 @@ class Fv2Oall8Dialect(Oall8Dialect):
 
             raise DatabaseError('Oracle 9i OALL8 rejected the query (no ORA code)')
         (columns, rest) = yield from self._recv_describe(packet)
+        (rows, terminal, last_row) = yield from self.recv_rows(rest, columns, None)
+        # The server opens a fresh cursor per statement (its id increments), so the
+        # fetch loop reads it by the id the exec reply's OER carries. (The server
+        # closes it when the session ends; a per-statement close is a follow-up —
+        # the 8i close frame breaks a 9i OALL8 session, #792.)
+        if not _9i_oall8_fetch_ended(terminal):
+            rows.extend(
+                (
+                    yield from self._fetch_rest(
+                        decode_9i_oall8_cursor_id(terminal), columns, last_row, fetch
+                    )
+                )
+            )
+        # CLOB / BLOB cells came back as locators: read their content while the
+        # cursor is still open, as the 8i path does (#795). A BFILE stays a
+        # locator, read on demand.
+        yield from self.resolve_lobs(rows, columns)
+        return (0, 0, 0, (len(rows), columns), rows, None, None, [], None)
+
+    def _fetch_rest(
+        self, cursor: int, columns: list, last_row: list | None, fetch: int = 15
+    ):
+        # Fetch an open cursor's remaining rows by its id, to the end of fetch: a
+        # query's after its execute reply, or every row of a REF CURSOR a block
+        # opened (#798).
         has_long = any(col.get('data_type') in _O8I_LONG_TYPES for col in columns)
         # The fetch's per-row column-buffer cap: the widest column's buffer + 1, as
         # the native client sends. A LONG reads the whole value, one row per fetch.
@@ -1100,13 +1126,8 @@ class Fv2Oall8Dialect(Oall8Dialect):
             else max((col.get('data_length') or 0) for col in columns) + 1
         )
         row_count = 1 if has_long else (fetch or 15)
-        (rows, terminal, last_row) = yield from self.recv_rows(rest, columns, None)
-        # The server opens a fresh cursor per statement (its id increments), so the
-        # fetch loop reads it by the id the exec reply's OER carries. (The server
-        # closes it when the session ends; a per-statement close is a follow-up —
-        # the 8i close frame breaks a 9i OALL8 session, #792.)
-        cursor = decode_9i_oall8_cursor_id(terminal)
-        ended = _9i_oall8_fetch_ended(terminal)
+        rows: list = []
+        ended = False
         while cursor and not ended:
             yield Send(self._encode_fetch(cursor, row_count, long_size))
             (more, terminal, last_row) = yield from self.recv_rows(
@@ -1116,11 +1137,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
             if not more:
                 break
             rows.extend(more)
-        # CLOB / BLOB cells came back as locators: read their content while the
-        # cursor is still open, as the 8i path does (#795). A BFILE stays a
-        # locator, read on demand.
-        yield from self.resolve_lobs(rows, columns)
-        return (0, 0, 0, (len(rows), columns), rows, None, None, [], None)
+        return rows
 
     def lob_read(self, locator: bytes, offset: int = 1, amount: int | None = None):
         # CLOB / BLOB content over a native 9i OALL8 session (#795): one 64-bit
@@ -1309,10 +1326,22 @@ class Fv2Oall8Dialect(Oall8Dialect):
         if directions is not None:
             out_positions = [i for i, d in enumerate(directions) if d & FV2_BIND_OUT]
         if out_positions:
+            cursors = frozenset(
+                i for (i, pos) in enumerate(out_positions) if _is_cursor_var(bind[pos])
+            )
             (out_values, _row_count, err_code, message) = decode_9i_oall8_block_out(
-                buf, len(bind), len(out_positions)
+                buf, len(bind), len(out_positions), cursors
             )
             _raise_ora(err_code, message)
+            # A REF CURSOR comes back opened and described, its rows unread: fetch
+            # them by its id now, into the marker the cursor wraps, as the compact
+            # path does (#2246).
+            for i in cursors:
+                if isinstance(out_values[i], tuple):
+                    (cursor_id, columns) = out_values[i]
+                    rows = yield from self._fetch_rest(cursor_id, columns, None)
+                    yield from self.resolve_lobs(rows, columns)
+                    out_values[i] = _cursor_marker(cursor_id, columns, rows)
             record = {
                 'out_positions': out_positions,
                 'out_values': out_values,

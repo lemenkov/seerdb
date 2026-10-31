@@ -14411,8 +14411,14 @@ def decode_9i_oall8_describe(Data: bytes) -> tuple[list[dict], bytes]:
     # a packet raises Truncated for the reader to read on, as 8i's does (#1226).
     if Data[:1] != bytes([TTI_DCB]):
         raise DataError('not a 9i OALL8 describe')
+    # skip the chunked describe preamble (fv<11.2)
+    return _o9i_oall8_describe_body(Data[2 + Data[1] :])
+
+
+def _o9i_oall8_describe_body(Body: bytes) -> tuple[list[dict], bytes]:
+    # The describe after its preamble -- the columns and the current-date trailer --
+    # as both a query's TTI_DCB and a REF CURSOR OUT bind carry it.
     try:
-        Body = Data[2 + Data[1] :]  # skip the chunked describe preamble (fv<11.2)
         Count = int.from_bytes(Body[4:8], 'little')  # [0:4] is max_row_size
         Rest = Body[8:]
         Columns: list[dict] = []
@@ -14682,8 +14688,20 @@ def decode_9i_oall8_bind_directions(Data: bytes, NumBinds: int) -> list[int] | N
     return list(Data[50 : 50 + NumBinds])
 
 
+def _o9i_oall8_refcursor_cell(Data: bytes) -> tuple[tuple[int, list], bytes]:
+    # A REF CURSOR OUT bind's cell in a 9i OALL8 block reply: a lead byte (0x2c),
+    # then the opened cursor's describe -- the same body a query's TTI_DCB carries,
+    # columns and current-date trailer -- then the cursor id (a ub4) and four zero
+    # bytes (the indicator and return code). Read live on 9.2 for `OPEN :1 FOR`
+    # two- and one-column queries (cursor 2, then 4). Returns ((cursor id, columns),
+    # rest); the caller fetches the rows by that id.
+    (Columns, Rest) = _o9i_oall8_describe_body(Data[1:])
+    Cursor = int.from_bytes(Rest[:4], 'little')
+    return ((Cursor, Columns), Rest[8:])
+
+
 def decode_9i_oall8_block_out(
-    Data: bytes, NumBinds: int, NumOut: int
+    Data: bytes, NumBinds: int, NumOut: int, Cursors: frozenset[int] = frozenset()
 ) -> tuple[list, int, int, str | None]:
     # The OUT / IN OUT values a 9i OALL8 PL/SQL block returns (#794). The reply is
     # the IOV bind prompt, then (when the block writes binds) a TTI_RXD carrying one
@@ -14700,8 +14718,13 @@ def decode_9i_oall8_block_out(
     OutValues: list = []
     if NumOut > 0 and Rest[:1] == bytes([TTI_RXD]):
         Rest = Rest[1:]
-        for _ in range(NumOut):
+        for Index in range(NumOut):
             Length = Rest[0]
+            if Index in Cursors and Length not in (0, 0xFF):
+                # A REF CURSOR: (cursor id, columns), its rows still to fetch.
+                (Opened, Rest) = _o9i_oall8_refcursor_cell(Rest)
+                OutValues.append(Opened)
+                continue
             if Length == 0xFF:
                 # An OUT bind the block never assigned (a RETURNING ... INTO that
                 # matched no row): 0xFF and a ub2 return code (3105), no value or
@@ -14710,10 +14733,13 @@ def decode_9i_oall8_block_out(
                 Rest = Rest[3:]
                 OutValues.append(None)
                 continue
-            Value = bytes(Rest[1 : 1 + Length]) if Length else None
-            # value + a ub2 indicator (-1 for NULL) + a ub2 return code (1405)
-            Rest = Rest[1 + Length + 4 :]
-            OutValues.append(Value)
+            # The value as an ordinary one -- a ub1 length, or 0xFE and 64-byte
+            # chunks past 252 bytes (read as one length, a long OUT value kept its
+            # chunk lengths) -- then a ub2 indicator (-1 for NULL) and a ub2 return
+            # code (1405).
+            (Raw, Rest) = _OCI.read_value(Rest)
+            Rest = Rest[4:]
+            OutValues.append(bytes(Raw) if Raw else None)
     # `Rest` now sits on the RPA + OER, so read the status from there rather than
     # rescanning `Data` from the start -- the IOV and the OUT RXD hold value bytes
     # that collide with the OER token, which a from-the-start scan can land on
