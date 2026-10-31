@@ -32,7 +32,7 @@ import ssl
 import tempfile
 import unittest
 from decimal import Decimal
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import seerdb
 from seerdb.common.tns_consts import (
@@ -503,7 +503,15 @@ _SERVICE = os.environ.get('SEERDB_TEST_SERVICE', 'XE')
 # a 12c+ server; unset/0 keeps the 11g default. Lets the same suite cover both
 # testbeds (issue #27).
 _FIELD_VERSION = int(os.environ.get('SEERDB_TEST_FIELD_VERSION', '0'))
-_FV_KW = {'field_version': _FIELD_VERSION} if _FIELD_VERSION else {}
+_FV_KW: dict[str, Any] = {'field_version': _FIELD_VERSION} if _FIELD_VERSION else {}
+# Run the suite over the experimental native 9i OALL8 dialect (#798); a 9.2 bed
+# only, every other server ignores the option.
+if os.environ.get('SEERDB_TEST_OALL8', '') not in ('', '0'):
+    _FV_KW['oall8'] = True
+# ...which is synchronous-only: connect_async refuses it.
+_SKIP_ASYNC_OVER_OALL8 = unittest.skipIf(
+    bool(_FV_KW.get('oall8')), 'the 9i OALL8 opt-in is synchronous-only'
+)
 
 _SKIP_REASON = (
     'integration tests require a real DB connection; '
@@ -7910,6 +7918,7 @@ class RefusedLoginIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
         with seerdb.connect(**self._kwargs(_USER, _PASSWORD)):
             pass  # the account still logs in
 
+    @_SKIP_ASYNC_OVER_OALL8
     async def test_a_refused_async_login_raises_ora_01017(self):
         for label, user, password in self.CASES:
             with self.subTest(label):
@@ -10146,6 +10155,7 @@ _BFILE_TEST_FILE = 'pyoracle_bfile_test.txt'
 _BFILE_TEST_CONTENT = b'hello bfile from disk'
 
 
+@_SKIP_ASYNC_OVER_OALL8
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
     """Verify the async surface: connect_async, AsyncCursor, fetch
@@ -13159,6 +13169,7 @@ class BFILEIntegration(_ThrottleRetry, unittest.TestCase):
             Conn.close()
 
 
+@_SKIP_ASYNC_OVER_OALL8
 @unittest.skipUnless(
     _USER and os.environ.get('SEERDB_TEST_BFILE_DIR'),
     'Async BFILE tests share the same fixture requirements as the '
@@ -13210,6 +13221,7 @@ class AsyncBFILEIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
                 self.assertIs(await Lob.afileexists(), False)
 
 
+@_SKIP_ASYNC_OVER_OALL8
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class AsyncPoolIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
     """AsyncPool: pre-warm, acquire / release, capacity, timeout,
