@@ -4049,6 +4049,33 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute('SELECT 1 FROM dual')
         self.assertEqual(self.cur.fetchone(), (1,))
 
+    def test_a_bound_dml_waits_for_the_commit(self):
+        # A bound INSERT is part of the transaction like any other: another
+        # session does not see it, and rollback undoes it and what came before.
+        # Over the 9i OALL8 opt-in a bound DML carried commit-on-success and
+        # committed the whole transaction (#798).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
+        conn = seerdb.connect(
+            host=_HOST,
+            port=_PORT,
+            user=_USER,
+            password=_PASSWORD,
+            service_name=_SERVICE,
+            autocommit=False,
+            **_FV_KW,
+        )
+        try:
+            cur = conn.cursor()
+            cur.execute(f'INSERT INTO {self.TABLE} VALUES (1)')
+            cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1)', [2])
+            self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
+            self.assertEqual(self.cur.fetchone(), (0,))
+            conn.rollback()
+            cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
+            self.assertEqual(cur.fetchone(), (0,))
+        finally:
+            conn.close()
+
     def test_a_query_that_matches_nothing_still_raises_nothing(self):
         # The other half, and the reason the mask exists: a SELECT that matches
         # no row ends on the same ORA-01403 and must stay silent. A fix that

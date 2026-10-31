@@ -14172,11 +14172,17 @@ def _encode_9i_oall8(Seq: int, Sql: bytes, StmtType: int, Binds: list) -> bytes:
         | (TNS_EXEC_OPTION_BIND if NumBinds else 0)
         | (TNS_EXEC_OPTION_FETCH if IsQuery else 0)
     )
+    # Bytes 4-5 continue the option word (little-endian): 0x80 here is 0x8000,
+    # "not PL/SQL", and a block's 0x05 / 0x04 carry 0x0100 -- commit on success --
+    # and the PL/SQL bind bits. A bound DML sent the block form and so committed
+    # the whole transaction, earlier statements too, where rollback should have
+    # undone it; a native 9.2 OCI client sends bound and array DML as 0x80 / 0x00
+    # (native_9i_array_dml.pcap), the same as an unbound one (#798).
     if IsBlock:
         Byte4 = 0x05 if NumBinds else 0x00
     else:
-        Byte4 = 0x05 if NumBinds else 0x80
-    Byte5 = 0x04 if (NumBinds and not IsBlock) or IsBlock else 0x00
+        Byte4 = 0x80
+    Byte5 = 0x04 if IsBlock else 0x00
     Head = bytes([TTI_FUN, TTI_ALL8, Seq & 0xFF, Option, Byte4, Byte5, 0, 0, 0, 0, 0])
     Mid = (
         P

@@ -7409,8 +7409,15 @@ class TestO9iOall8Messages(unittest.TestCase):
         sql = b'INSERT INTO ret716 (id) VALUES (:1) RETURNING id INTO :2'
         msg = encode_9i_oall8_dml(0x07, sql, O8I_STMT_INSERT, [42])
         head_mid = msg[: msg.find(sql)]
-        self.assertEqual(len(head_mid), len(self.NATIVE_RET9I_HEADMID))
-        self.assertEqual(self._mask(head_mid), self._mask(self.NATIVE_RET9I_HEADMID))
+        # That client executed with OCI_COMMIT_ON_SUCCESS, which is its option
+        # bytes 4-5 (`05 04`, 0x0100 commit among them). The driver commits only
+        # when asked, so it sends the bytes a native client executing with
+        # OCI_DEFAULT does -- `80 00`, from native_9i_array_dml.pcap. Copied, they
+        # committed every bound DML and the transaction before it (#798).
+        native = bytearray(self.NATIVE_RET9I_HEADMID)
+        native[4:6] = b'\x80\x00'
+        self.assertEqual(len(head_mid), len(native))
+        self.assertEqual(self._mask(head_mid), self._mask(bytes(native)))
 
     def test_9i_oall8_widths_are_ub8(self):
         # The SQL length and the fixed `12` field ride as 8-byte little-endian
@@ -7430,11 +7437,12 @@ class TestO9iOall8Messages(unittest.TestCase):
         # A full byte-exact pin of a plain 1-bind INSERT (NUMBER 42): head+mid in
         # the 64-bit layout, the SQL text, the trailer, then the ub8 bind OAC and
         # the shared 8i bind value (`07 02 c1 2b`). Guards the whole write path.
+        # Option bytes 4-5 are `80 00`, no commit-on-success (#798).
         from seerdb.common.tns import O8I_STMT_INSERT, encode_9i_oall8_dml
 
         sql = b'INSERT INTO t9 (id) VALUES (:1)'
         expected = bytes.fromhex(
-            '035e062905040000000000feffffffffffffff1f00000000000000feffffffff'
+            '035e062980000000000000feffffffffffffff1f00000000000000feffffffff'
             'ffffff0c000000000000000000000000000000feffffffffffffff0000000001'
             '0000000000000000000000feffffffffffffff01000000000000000000000000'
             '000000000000000000000000000000000000000000000000000000feffffffff'
