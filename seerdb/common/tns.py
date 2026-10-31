@@ -14676,6 +14676,21 @@ def decode_9i_oall8_dml_response(Terminal: bytes) -> tuple[int, int, str | None]
     return (0 if Code else Rows, Code, Status['message'])
 
 
+def decode_9i_oall8_dml_rowid(Terminal: bytes) -> str | None:
+    # The rowid of the row a 9i OALL8 DML touched (#1079), or None: the status
+    # carries it at offset 26 in the structure a ROWID cell has (_o9i_oall8_rowid).
+    # Read from native 9.2 INSERT and UPDATE replies (slot 0, then 1, of object
+    # 0x34486); the reply's tail repeats it as a physical UROWID. A status with no
+    # block (DDL, a failure) has none; one that touched nothing keeps the previous
+    # statement's, which the cursor sorts out by the row count, as on 8i / 9i.
+    Oer = _o9i_oall8_oer(Terminal)
+    if len(Oer) < 42 or int.from_bytes(Oer[10:14], 'little'):
+        return None
+    if not int.from_bytes(Oer[34:38], 'little'):
+        return None
+    return _o9i_oall8_rowid(bytes(Oer[26:42]))
+
+
 def decode_9i_oall8_bind_directions(Data: bytes, NumBinds: int) -> list[int] | None:
     # The direction of each bind, from a 9i OALL8 block reply's IOV bind prompt,
     # or None when the reply opens with none (a block that failed answers with the

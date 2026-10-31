@@ -7659,6 +7659,20 @@ class TestNative9iOall8Select(unittest.TestCase):
         self.assertEqual(decode_9i_oall8_dml_response(self.DML_INSERT), (1, 0, None))
         self.assertEqual(decode_9i_oall8_dml_response(self.DML_UPDATE), (2, 0, None))
 
+    def test_dml_reply_names_the_row_it_touched(self):
+        # The status carries the rowid at offset 26 (#1079); the reply's tail
+        # repeats it as a physical UROWID, big-endian, which checks the read.
+        from seerdb.common.tns import decode_9i_oall8_dml_rowid
+        from seerdb.common.types import urowid_to_string
+
+        for reply in (self.DML_INSERT, self.DML_UPDATE, self.DML_FIRST_PARSE):
+            with self.subTest(reply=reply[:4].hex()):
+                self.assertEqual(
+                    decode_9i_oall8_dml_rowid(reply), urowid_to_string(reply[-13:])
+                )
+        # A failed statement names no row.
+        self.assertIsNone(decode_9i_oall8_dml_rowid(self.STATUS_1403))
+
     # A bound statement's first-parse reply opens with a TTI_IOV (0x0b) bind
     # prompt and the session-state RPA carries a byte (0x04) that collides with the
     # OER token -- the status reader must skip past it to the real OER. Real 9.2

@@ -46,6 +46,7 @@ from seerdb.common.tns import (
     decode_9i_oall8_cursor_id,
     decode_9i_oall8_describe,
     decode_9i_oall8_dml_response,
+    decode_9i_oall8_dml_rowid,
     decode_9i_oall8_exec_response,
     decode_9i_oall8_terminal_error,
     decode_fv2_batch_errors,
@@ -1045,8 +1046,8 @@ class Fv2Oall8Dialect(Oall8Dialect):
     blocks with IN, OUT, IN OUT and REF CURSOR binds, and DML...RETURNING
     (through its PL/SQL wrap) -- all over the native 64-bit OALL8 reply decode
     (decode_9i_oall8_*). Synchronous only. Not yet: array DML, LOB objects kept
-    open (fetch_lobs=False), nested cursors, object types, lastrowid, and a
-    session past 255 statements (the cursor id is read as one byte)."""
+    open (fetch_lobs=False), nested cursors, object types, and a session past
+    255 statements (the cursor id is read as one byte)."""
 
     def capabilities(self) -> frozenset[str]:
         # SELECT, DML / DDL, PL/SQL blocks and own commit/rollback over the native
@@ -1275,7 +1276,8 @@ class Fv2Oall8Dialect(Oall8Dialect):
         buf = yield from self._recv_dml_terminal('DML')
         (row_count, err_code, message) = decode_9i_oall8_dml_response(buf)
         _raise_ora(err_code, message)
-        return (0, 0, 0, (row_count, None), [], None, None, [], None)
+        rowid = decode_9i_oall8_dml_rowid(buf)  # the touched row (#1079)
+        return (0, 0, 0, (row_count, None), [], None, rowid, [], None)
 
     def txn_control(self, statement: str):
         # Commit / rollback as an ordinary OALL8 statement (no modern TTI_COMMIT on
