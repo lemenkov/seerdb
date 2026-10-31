@@ -2197,13 +2197,22 @@ _O7_LOBOPS: wire_schema.Schema = (
 # the body; FILE_OPEN's has its open flag set, a WRITE's is updated), then the
 # short amount if the request asked for one -- a GET_LENGTH's length, OPEN's
 # mode -- and IS_OPEN's answer, 1 or 0, in the null-LOB field it set. CLOSE
-# asks for neither and gets neither. The status follows.
+# asks for neither and gets neither. The status follows. A 9.2 server answers a
+# 9.2 client the same, but IS_OPEN in a single byte (#798, native_9i_lob_ops.pcap).
 _O7_LOBOPS_REPLY: wire_schema.Schema = (
     ('const', bytes([TTI_RPA])),
     ('be2', 'locator_length'),
     ('bytes', 'locator', 'locator_length'),
     ('when', 'short_amount_present', (('n4', 'short_amount'),)),
-    ('when', 'null_lob_present', (('n4', 'flag'),)),
+    (
+        'when',
+        'null_lob_present',
+        (
+            ('only', 'thin', (('n4', 'flag'),)),
+            ('only', 'o8i', (('n4', 'flag'),)),
+            ('only', 'o9i', (('u8', 'flag'),)),
+        ),
+    ),
 )
 # The RPA in front of an 8i call's status (#2284): a ub2 count, four, and that
 # many ub4s, the third the statement's cursor, as its status has it; then
@@ -2470,6 +2479,7 @@ _O9I_STATUS_HEAD_FROM_O9I = wire_schema.compile_decoder(_O9I_STATUS_HEAD, _O9I)
 _O8I_CELL_FROM_O9I = wire_schema.compile_decoder(_O8I_CELL, _O9I)
 _O8I_OUT_UNASSIGNED_FROM_O9I = wire_schema.compile_decoder(_O8I_OUT_UNASSIGNED, _O9I)
 _O8I_LONG_CELL_FROM_O9I = wire_schema.compile_decoder(_O8I_LONG_CELL, _O9I)
+_O7_LOBOPS_REPLY_FROM_O9I = wire_schema.compile_decoder(_O7_LOBOPS_REPLY, _O9I)
 _OAC_OCI = wire_schema.compile_encoder(_OAC, _OCI)
 _O7_LOBOPS_O9I = wire_schema.compile_encoder(_O7_LOBOPS, _O9I)
 _CLOSE_CURSORS_O9I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O9I)
@@ -14575,28 +14585,23 @@ def encode_9i_oall8_lobop(
 
 
 def decode_9i_oall8_lob_value(Data: bytes, Operation: int) -> tuple[int | None, bytes]:
-    # A 9i OALL8 LOB call's reply (#798): a TTI_RPA carrying the locator as the
-    # server now sees it (a ub2 big-endian length and the body: a WRITE updates
-    # it), then the call's value -- a ub4 (GET_LENGTH's and GET_CHUNK_SIZE's size,
-    # OPEN's mode, TRIM's new length, the amount a WRITE wrote), IS_OPEN's single
-    # byte, CLOSE's nothing -- then the status. Read from a native 9.2 OCI client
+    # A 9i OALL8 LOB call's reply (#798), 8i's (_O7_LOBOPS_REPLY) at a 9.2
+    # client's widths: an RPA with the locator as the server now sees it (a ub2
+    # big-endian length and the body, without the ub2 a fetched locator opens
+    # with -- the LOB object puts it back, LOB._refresh; a WRITE updates it), then
+    # the call's value -- a ub4 (GET_LENGTH's and GET_CHUNK_SIZE's size, OPEN's
+    # mode, TRIM's new length, the amount a WRITE wrote), IS_OPEN's single byte,
+    # CLOSE's nothing -- then the status. Read from a native 9.2 OCI client
     # (native_9i_lob_ops.pcap). Returns (value, locator); a reply that is a bare
     # status (an error) gives (None, b''), for the caller to raise.
-    #
-    # The locator comes back as its body, without the ub2 length a fetched one
-    # opens with (`00 54`, then 84 bytes for a CLOB / BLOB): the reply's `00 54`
-    # is its length here. The LOB object puts the prefix back (LOB._refresh, the
-    # 10g+ reply's form too).
     if Data[:1] != bytes([TTI_RPA]):
         return (None, b'')
-    Length = int.from_bytes(Data[1:3], 'big')
-    Locator = bytes(Data[3 : 3 + Length])
-    Rest = Data[3 + Length :]
-    if Operation in (TNS_LOB_OP_CLOSE, TNS_LOB_OP_FILE_CLOSE):
-        return (None, Locator)
+    Flags = {'short_amount_present': True, 'null_lob_present': False}
+    Flags.update(_O7_LOBOP_FLAGS.get(Operation, {}))
+    (Reply, _) = _O7_LOBOPS_REPLY_FROM_O9I(Data, Flags)
     if Operation == TNS_LOB_OP_IS_OPEN:
-        return (Rest[0], Locator)
-    return (int.from_bytes(Rest[:4], 'little'), Locator)
+        return (Reply['flag'], bytes(Reply['locator']))
+    return (Reply.get('short_amount'), bytes(Reply['locator']))
 
 
 def encode_9i_oall8_close_cursors(Seq: int, Cursors: list[int]) -> bytes:
