@@ -2653,12 +2653,14 @@ class OracleConnect(_ConnectionLogic):
         # CLOB / NCLOB content is sent as UTF-16BE on the wire; BLOB / BFILE
         # is raw bytes. We decode CLOB to `str` and surface BLOB as `bytes`.
         if dialect_lob_objects(self._dialect):
-            # 9i reads through its own LOBOPS form, CLOB text in the column's
-            # database charset (#2259).
-            from seerdb.common.types import decode_fv2_lob
+            # 9i reads through its own LOBOPS form (#2259), CLOB text in the
+            # session's charset (#2383).
+            from seerdb.common.types import decode_fv2_lob, fv2_lob_charset
 
             Content = self._drive(self._dialect.lob_read(Locator, offset, amount))
-            return decode_fv2_lob(DataType, cast(bytes, Content), charset or 0)
+            return decode_fv2_lob(
+                DataType, cast(bytes, Content), fv2_lob_charset(charset)
+            )
         from seerdb.common.tns_consts import TNS_TYPE_CLOB
 
         Extra: dict = {'source_offset': offset}

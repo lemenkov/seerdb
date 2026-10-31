@@ -6625,6 +6625,13 @@ class LOBIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT c FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), ('hello clob',))
 
+    def test_non_ascii_clob_content_reads_as_itself(self):
+        # 'é' read back as 'Ã©' from a 9i WE8ISO8859P1 database (#2383).
+        self._setup()
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1, :1, NULL)', ['café'])
+        self.cur.execute(f'SELECT c FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone(), ('café',))
+
     def test_blob_content_round_trip(self):
         self._setup()
         self.cur.execute(
@@ -7012,6 +7019,22 @@ class LOBObjectIntegration(_IntegrationBase):
         lob.write('WORLD', 7)
         self.assertEqual(lob.read(), 'hello WORLD')
         self.assertEqual(lob.size(), 11)
+
+    @_requires(_LOB_MODIFY, _mirror_lacks('serving LOB writes on a column locator'))
+    def test_non_ascii_text_reads_and_writes_as_itself(self):
+        # The text is the session's, whatever the database charset: on a 9i
+        # WE8ISO8859P1 database 'é' read back as 'Ã©', and writing it failed with
+        # ORA-22993 (#2383).
+        self.cur.execute(f'UPDATE {self.TABLE} SET c = :1', ['café x'])
+        lob = self._fetch_lob()
+        self.assertEqual(lob.read(), 'café x')
+        lob.write('éa', 6)
+        self.assertEqual(lob.read(), 'café éa')
+        self.assertEqual(lob.size(), 7)
+        self.cur.execute(
+            f'SELECT COUNT(*) FROM {self.TABLE} WHERE c LIKE :1', ['café éa']
+        )
+        self.assertEqual(self.cur.fetchone(), (1,))
 
     @_requires(_LOB_MODIFY, _mirror_lacks('serving LOB writes on a column locator'))
     def test_write_past_the_end_extends_the_lob(self):
