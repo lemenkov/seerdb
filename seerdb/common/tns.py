@@ -14276,6 +14276,14 @@ def _encode_9i_bind_oac(Value: object) -> bytes:
         # buffer: the value goes out in that form (_declared_value_bytes, #701).
         DType = Value.dbtype.tns_type
         (Size, Flag) = (_DECLARED_WIDTHS[DType], 0x05)
+    elif isinstance(Value, Var) and Value.dbtype.tns_type in (
+        TNS_TYPE_RID,
+        TNS_TYPE_UROWID,
+    ):
+        # A ROWID / UROWID Var binds as the rowid's text, wide enough for a
+        # logical one, as on the compact path (#1397); declared as itself, the
+        # text bound back in drew ORA-01460 (#798).
+        DType, Size, Flag = TNS_TYPE_VARCHAR, _MAX_UROWID_LENGTH, 0x05
     elif isinstance(Value, Var):
         DType, Size, Flag = Value.dbtype.tns_type, max(Value.size or 22, 1), 0x05
     elif isinstance(Value, (bool, int, float, Decimal)):

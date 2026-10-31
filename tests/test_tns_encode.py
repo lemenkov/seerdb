@@ -7575,6 +7575,23 @@ class TestO9iOall8Messages(unittest.TestCase):
         self.assertEqual(oac[31], 2)
         self.assertTrue(msg.endswith(bytes([0x07, 2]) + 'Ω'.encode('utf-16-be')))
 
+    def test_9i_oall8_rowid_var_binds_as_text(self):
+        # A ROWID / UROWID Var declares VARCHAR, wide enough for a logical rowid,
+        # as on the compact path (#1397); declared as itself, the text bound back
+        # in drew ORA-01460 over OALL8 (#798).
+        import seerdb
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import TNS_TYPE_VARCHAR, encode_9i_oall8_query
+
+        for typ in (seerdb.ROWID, seerdb.DB_TYPE_UROWID):
+            var = Var(typ)
+            var.setvalue(0, 'AAA0tXAABAAALjSAAA')
+            sql = b'SELECT n FROM t WHERE rowid = :r'
+            msg = encode_9i_oall8_query(1, sql, [var])
+            oac = msg[msg.find(sql) + len(sql) + 48 :][:41]
+            self.assertEqual(oac[1], TNS_TYPE_VARCHAR)
+            self.assertEqual(int.from_bytes(oac[5:13], 'little'), 5267)
+
     def test_9i_oall8_lob_write_matches_native_client(self):
         # The 64-bit TTI_LOBOPS head with the offset at 31, then the locator, the
         # ub4 amount, and the data as TTI_LOB content (#798). The source and amount
