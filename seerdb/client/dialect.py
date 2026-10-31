@@ -689,16 +689,6 @@ class Oall8Dialect:
         # keeps it until told, so a session ran out at open_cursors.
         self._to_close: list[int] = []
 
-    def _closing(self) -> bytes:
-        # The close of every cursor waiting, piggybacked ahead of a call as
-        # python-oracledb does on 10g+; empty when none waits. It takes its
-        # sequence number first, so it must be built before the call it rides
-        # on: `self._closing() + encode_...(self._next_seq(), ...)`.
-        if not self._to_close:
-            return b''
-        (cursors, self._to_close) = (self._to_close, [])
-        return encode_8i_close_cursors(self._next_seq(), cursors)
-
     def _finished(self, cursor: int) -> None:
         # A statement is done with its cursor: close it with the next call. A
         # statement the server refused at parse names cursor 0, having none.
@@ -717,6 +707,218 @@ class Oall8Dialect:
         return
         yield  # unreachable -- makes this a generator, as the protocol has it
 
+    # --- the per-version hooks (#798): 8i's here, 9.2's in Fv2Oall8Dialect. The
+    # call sequences below are shared; only what goes on the wire differs.
+    _wire = '8i'
+
+    def _sql_text(self, sql: str) -> bytes:
+        # The statement's text in the session's charset: 8i's is the database's.
+        return encode_8i_sql_text(sql)
+
+    def _close_frames(self, cursors: list[int]) -> bytes:
+        # The close of finished cursors, one piggyback (#2286).
+        return encode_8i_close_cursors(self._next_seq(), cursors)
+
+    def _cursor_id(self, reply: bytes) -> int:
+        return decode_8i_cursor_id(reply)
+
+    def _terminal_error(self, reply: bytes) -> tuple[int, str | None]:
+        return decode_8i_terminal_error(reply)
+
+    def _error_offset(self, reply: bytes) -> int:
+        # Where in the statement an error is: 8i's status carries none (#719).
+        return 0
+
+    def _fetch_ended(self, terminal: bytes) -> bool:
+        return _8i_fetch_ended(terminal)
+
+    def _terminal_complete(self, terminal: bytes) -> bool:
+        return o8i_terminal_complete(terminal)
+
+    def _dml_response(self, reply: bytes) -> tuple[int, int, str | None]:
+        return decode_8i_dml_response(reply)
+
+    def _decode_describe(self, buf: bytes) -> tuple[list, bytes]:
+        return decode_8i_dcb_describe(buf)
+
+    def _decode_rows(self, buf: bytes, columns: list, last_row: list | None) -> tuple:
+        return decode_8i_exec_response(buf, columns, last_row)
+
+    def _long_size(self, columns: list, fetch: int) -> int:
+        # The fetch's LONG cap for a query with no LONG column: on 8i a prefetch
+        # hint, the rows asked for.
+        return fetch
+
+    # --- the shared call sequences
+
+    def _closing(self) -> bytes:
+        # The close of every cursor waiting, piggybacked ahead of a call as
+        # python-oracledb does on 10g+; empty when none waits. It takes its
+        # sequence number first, so it must be built before the call it rides
+        # on: `self._closing() + encode_...(self._next_seq(), ...)`.
+        if not self._to_close:
+            return b''
+        (cursors, self._to_close) = (self._to_close, [])
+        return self._close_frames(cursors)
+
+    def execute_query(self, sql: str, bind: list | None = None, fetch: int = 15):
+        # A SELECT: the OALL8 query (§19.9-10, #792). The reply is a TTI_DCB
+        # describe and the first row batch; fetches by the cursor's id pull the
+        # rest. Returns the same 9-tuple as Fv2Dialect.execute_query so the cursor
+        # path is unchanged.
+        yield Send(self._closing() + self._encode_query(self._sql_text(sql), bind))
+        resp = yield RECV
+        if resp is False:
+            raise Exception(f'Connection closed during {self._wire} query response')
+        packet = resp[1]
+        # A rejected SELECT comes back as a TTI_OER (0x04) error, not the TTI_DCB
+        # (0x10) describe -- surface the mapped ORA error rather than overrunning
+        # the describe (#384). Refused at execute, it keeps its cursor: close it.
+        if packet[:1] == bytes([TTI_OER]):
+            self._finished(self._cursor_id(packet))
+            (err_code, message) = self._terminal_error(packet)
+            if err_code:
+                from seerdb.common.exceptions import from_ora_code
+
+                exc = from_ora_code(err_code)(
+                    message or f'ORA-{err_code:05d}', code=err_code
+                )
+                exc.offset = self._error_offset(packet)  # #2263
+                raise exc
+            from seerdb.common.exceptions import DatabaseError
+
+            raise DatabaseError(f'Oracle {self._wire} rejected the query (no ORA code)')
+        (columns, rest) = yield from self._recv_describe(packet)
+        (rows, terminal, last_row) = yield from self.recv_rows(rest, columns, None)
+        cursor = self._cursor_id(terminal)
+        try:
+            if not self._fetch_ended(terminal):
+                rows.extend(
+                    (yield from self._fetch_rest(cursor, columns, last_row, fetch))
+                )
+        finally:
+            self._finished(cursor)
+        # CLOB / BLOB cells came back as locators: read their content while the
+        # cursor is still open. A BFILE stays a locator, read on demand.
+        yield from self.resolve_lobs(rows, columns)
+        return (0, 0, 0, (len(rows), columns), rows, None, None, [], None)
+
+    def _fetch_rest(
+        self, cursor: int, columns: list, last_row: list | None, fetch: int = 15
+    ):
+        # Fetch an open cursor's remaining rows by its id, to the end of fetch: a
+        # query's after its execute reply, or every row of a REF CURSOR a block
+        # opened (#798). A LONG / LONG RAW column caps the value at the fetch's
+        # long-size field and returns one row per fetch, so ask for the whole
+        # value (#377).
+        has_long = any(col.get('data_type') in _O8I_LONG_TYPES for col in columns)
+        long_size = 0x7FFFFFFF if has_long else self._long_size(columns, fetch)
+        row_count = 1 if has_long else (fetch or 15)
+        rows: list = []
+        ended = False
+        while cursor and not ended:
+            yield Send(self._encode_fetch(cursor, row_count, long_size))
+            (more, terminal, last_row) = yield from self.recv_rows(
+                b'', columns, last_row
+            )
+            # A fetch that fails brings no rows and the error in its status.
+            # Ending on the empty fetch alone returned the rows before it as the
+            # whole result (#2314).
+            ended = self._fetch_ended(terminal)
+            if not more:
+                break
+            rows.extend(more)
+        return rows
+
+    def _recv_describe(self, packet: bytes):
+        # The describe, read on across packets: the server caps each DATA packet
+        # at the SDU with no end-of-message flag, and a wide select list -- the 45
+        # columns of V$SESSION -- does not fit in one. Decoding the first packet
+        # alone ran off its end with an IndexError (#1226). Read on only while a
+        # field runs off the end (Truncated, or IndexError from an older
+        # primitive), as recv_rows does for the row stream.
+        #
+        # A statement that fails as it executes can stop the describe partway:
+        # 8i sends what fitted in the first packet, then the error as a TTI_OER
+        # of its own and nothing more. That error is the answer, not more of
+        # the describe.
+        from seerdb.common.exceptions import Truncated
+
+        buf = bytes(packet)
+        while True:
+            try:
+                return self._decode_describe(buf)
+            except (Truncated, IndexError):
+                received = yield RECV
+                if received is False:
+                    raise Exception(
+                        f'Connection closed during {self._wire} describe'
+                    ) from None
+                more = received[1]
+                if more[:1] == bytes([TTI_OER]):
+                    (err_code, message) = self._terminal_error(more)
+                    if err_code and message:
+                        _raise_ora(err_code, message)
+                buf += more
+
+    def recv_rows(self, buf: bytes, columns: list, last_row: list | None):
+        # Read one logical execute/fetch response and decode its row stream. The
+        # server caps each DATA packet at the SDU with no end-of-message flag, so
+        # a LONG value (or wide batch) larger than the SDU spans several packets
+        # with no framing signal (#377). Accumulate until the stream decodes
+        # cleanly AND leaves a whole status -- a reply cut a few bytes short
+        # decodes, and its tail then answered the next call (#2280).
+        #
+        # "Read more" is ONLY a field that ran off the end -- Truncated, the codec's
+        # explicit signal for it (#849), or an IndexError from an older primitive.
+        # Any OTHER DataError came from a message that is complete and holds a value
+        # that genuinely does not decode, and must propagate: a BC date -- valid
+        # Oracle data a Python datetime cannot hold -- hung for the full read
+        # timeout instead of raising (#1061).
+        from seerdb.common.exceptions import Truncated
+
+        while True:
+            try:
+                (rows, terminal, last) = self._decode_rows(buf, columns, last_row)
+                if terminal and self._terminal_complete(terminal):
+                    return (rows, terminal, last)
+            except (Truncated, IndexError):
+                pass
+            received = yield RECV
+            if received is False:
+                try:
+                    return self._decode_rows(buf, columns, last_row)
+                except (Truncated, IndexError):
+                    # The connection closed on a genuinely incomplete message:
+                    # nothing more is coming, so there are no rows to return. A
+                    # value that is complete but bad still raises, as above.
+                    return ([], b'', last_row)
+            buf += received[1]
+
+    def _recv_terminal(self, what: str):
+        # A non-query reply, read on across packets until its status is whole (a
+        # short reply arrives in one packet; this guards a split one, as the row
+        # reader does, #2280).
+        buf = b''
+        while True:
+            received = yield RECV
+            if received is False:
+                raise Exception(f'Connection closed during {self._wire} {what}')
+            buf += received[1]
+            if self._terminal_complete(buf):
+                return buf
+
+    def txn_control(self, statement: str):
+        # Commit / rollback as an ordinary OALL8 statement: no modern TTI_COMMIT on
+        # these sessions (#716). Driven by the connection when CAP_OWN_TXN is set.
+        yield Send(
+            self._closing() + self._encode_dml(self._sql_text(statement), O8I_STMT_TXN)
+        )
+        buf = yield from self._recv_terminal(statement)
+        self._finished(self._cursor_id(buf))
+        (_row_count, err_code, message) = self._dml_response(buf)
+        _raise_ora(err_code, message)
+
     def capabilities(self) -> frozenset[str]:
         # 8i does query / DML / PL/SQL / LOB and drives its own COMMIT / ROLLBACK
         # (no modern TTI_COMMIT); no array DML.
@@ -730,123 +932,6 @@ class Oall8Dialect:
     def _encode_fetch(self, cursor: int, count: int, long_size: int) -> bytes:
         # The OALL8 array fetch. 8i 32-bit; the 9i OALL8 dialect overrides it.
         return encode_8i_oall8_fetch(self._next_seq(), cursor, count, long_size)
-
-    def execute_query(self, sql: str, bind: list | None = None, fetch: int = 15):
-        # 8i SELECT: the 9.2-era OALL8 query (§19.9-10). The reply is an 8i TTI_DCB
-        # describe then a 9i-style RXH/RXD row stream. Row values are latin-1
-        # (WE8ISO8859P1); the column charset drives decoding. Returns the same
-        # 9-tuple as Fv2Dialect.execute_query so the cursor path is unchanged.
-        yield Send(self._closing() + self._encode_query(encode_8i_sql_text(sql), bind))
-        resp = yield RECV
-        if resp is False:
-            raise Exception('Connection closed during 8i query response')
-        packet = resp[1]
-        # A rejected SELECT comes back as a TTI_OER (0x04) error, not the TTI_DCB
-        # (0x10) describe — surface the mapped ORA error rather than overrunning
-        # decode_8i_dcb_describe (#384).
-        if packet[:1] == bytes([TTI_OER]):
-            # A SELECT refused at execute keeps its cursor (ORA-00942 does).
-            self._finished(decode_8i_cursor_id(packet))
-            (err_code, message) = decode_8i_terminal_error(packet)
-            if err_code:
-                _raise_ora(err_code, message)
-            from seerdb.common.exceptions import DatabaseError
-
-            raise DatabaseError('Oracle 8i rejected the query (no ORA code)')
-        (columns, rest) = yield from self._recv_describe(packet)
-        # A LONG / LONG RAW column caps the value at the fetch long-size field and
-        # returns one row per fetch, so ask for the whole value (#377).
-        has_long = any(col.get('data_type') in _O8I_LONG_TYPES for col in columns)
-        (rows, terminal, last_row) = yield from self.recv_rows(rest, columns, None)
-        cursor = decode_8i_cursor_id(terminal)
-        row_count = 1 if has_long else fetch
-        long_size = 0x7FFFFFFF if has_long else fetch
-        try:
-            ended = _8i_fetch_ended(terminal)
-            while cursor and not ended:
-                yield Send(self._encode_fetch(cursor, row_count, long_size))
-                (more, terminal, last_row) = yield from self.recv_rows(
-                    b'', columns, last_row
-                )
-                # A fetch that fails brings no rows and the error in its
-                # status. Ending on the empty fetch alone returned the rows
-                # before it as the whole result (#2314).
-                ended = _8i_fetch_ended(terminal)
-                if not more:
-                    break
-                rows.extend(more)
-        finally:
-            self._finished(cursor)
-        yield from self.resolve_lobs(rows, columns)
-        return (0, 0, 0, (len(rows), columns), rows, None, None, [], None)
-
-    def _recv_describe(self, packet: bytes):
-        # The 8i describe, read on across packets: 8i caps each DATA packet at
-        # the SDU with no end-of-message flag, and a wide select list -- the 45
-        # columns of V$SESSION -- does not fit in one. Decoding the first packet
-        # alone ran off its end with an IndexError (#1226). Read on only while
-        # a field runs off the end (Truncated, or IndexError from an older
-        # primitive), as recv_rows does for the row stream.
-        #
-        # A statement that fails as it executes can stop the describe partway:
-        # 8i sends what fitted in the first packet, then the error as a TTI_OER
-        # of its own and nothing more. That error is the answer, not more of
-        # the describe.
-        from seerdb.common.exceptions import Truncated
-
-        buf = bytes(packet)
-        while True:
-            try:
-                return decode_8i_dcb_describe(buf)
-            except (Truncated, IndexError):
-                received = yield RECV
-                if received is False:
-                    raise Exception('Connection closed during 8i describe') from None
-                more = received[1]
-                if more[:1] == bytes([TTI_OER]):
-                    (err_code, message) = decode_8i_terminal_error(more)
-                    if err_code and message:
-                        _raise_ora(err_code, message)
-                buf += more
-
-    def recv_rows(self, buf: bytes, columns: list, last_row: list | None):
-        # Read one logical 8i execute/fetch response and decode its RXH/RXD row
-        # stream. 8i caps each DATA packet at the SDU with no end-of-message flag,
-        # so a LONG value (or wide batch) larger than the SDU spans several packets
-        # with no framing signal (#377). Accumulate until the stream decodes
-        # cleanly AND leaves a non-empty terminal (a value split mid-boundary makes
-        # the decoder raise DataError/IndexError; a clean split at a row boundary
-        # leaves nothing after the rows — both mean "read more").
-        #
-        # "Read more" is ONLY a field that ran off the end -- Truncated, the codec's
-        # explicit signal for it (#849), or an IndexError from an older primitive.
-        # Any OTHER DataError came from a message that is complete and holds a value
-        # that genuinely does not decode, and must propagate. Catching the whole
-        # DataError family treated that as "incomplete" too: the loop read on for a
-        # packet that was never coming, and a BC date -- valid Oracle data a Python
-        # datetime cannot hold -- hung for the full read timeout instead of raising
-        # (#1061). Same distinction the Mirror draws in _complete_message (#1000).
-        from seerdb.common.exceptions import Truncated
-
-        while True:
-            try:
-                (rows, terminal, last) = decode_8i_exec_response(buf, columns, last_row)
-                # The status, too, must be whole: a reply cut a few bytes short
-                # decodes, and its tail then answered the next call (#2280).
-                if terminal and o8i_terminal_complete(terminal):
-                    return (rows, terminal, last)
-            except (Truncated, IndexError):
-                pass
-            received = yield RECV
-            if received is False:
-                try:
-                    return decode_8i_exec_response(buf, columns, last_row)
-                except (Truncated, IndexError):
-                    # The connection closed on a genuinely incomplete message:
-                    # nothing more is coming, so there are no rows to return. A
-                    # value that is complete but bad still raises, as above.
-                    return ([], b'', last_row)
-            buf += received[1]
 
     def _encode_dml(
         self, sql_text: bytes, stmt_type: int, bind: list | None = None
@@ -926,20 +1011,6 @@ class Oall8Dialect:
             record = {'out_positions': out_positions, 'out_values': out_values}
             return (0, 0, 0, (None, None), [record], None, None, [], None)
         return (0, 0, 0, (0, None), [], None, None, [], None)
-
-    def txn_control(self, statement: str):
-        # 8i has no modern TTI_COMMIT / TTI_ROLLBACK: commit and rollback ride the
-        # OALL8 as ordinary statements (§19.12, statement type 0).
-        yield Send(
-            self._closing()
-            + self._encode_dml(encode_8i_sql_text(statement), O8I_STMT_TXN)
-        )
-        received = yield RECV
-        if received is False:
-            raise Exception(f'Connection closed during 8i {statement}')
-        self._finished(decode_8i_cursor_id(received[1]))
-        (_row_count, err_code, message) = decode_8i_dml_response(received[1])
-        _raise_ora(err_code, message)
 
     def resolve_lobs(self, rows: list, columns: list):
         # Replace each LOB locator left by decode_8i_exec_response with its content:
@@ -1062,18 +1133,49 @@ class Fv2Oall8Dialect(Oall8Dialect):
 
         return fv2_lob_charset(column.get('charset'), column.get('csfrm'))
 
-    def _closing(self) -> bytes:
-        # The close of every finished cursor, piggybacked ahead of the next call
-        # in the 64-bit form a native 9.2 OCI client sends (#798); the 8i form
-        # broke the session. One piggyback a cursor, each taking a sequence
-        # number, so built before the call it rides on, as the base's is.
-        if not self._to_close:
-            return b''
-        (cursors, self._to_close) = (self._to_close, [])
+    # --- the 9.2 hooks for the shared call sequences in Oall8Dialect (#798)
+    _wire = '9i OALL8'
+
+    def _sql_text(self, sql: str) -> bytes:
+        # UTF-8, the session's negotiated charset (#797).
+        return encode_9i_sql_text(sql)
+
+    def _close_frames(self, cursors: list[int]) -> bytes:
+        # The 64-bit close a native 9.2 OCI client sends, one piggyback a cursor,
+        # each taking a sequence number (#798); the 8i form broke the session.
         return b''.join(
             encode_9i_oall8_close_cursors(self._next_seq(), [cursor])
             for cursor in cursors
         )
+
+    def _cursor_id(self, reply: bytes) -> int:
+        return decode_9i_oall8_cursor_id(reply)
+
+    def _terminal_error(self, reply: bytes) -> tuple[int, str | None]:
+        return decode_9i_oall8_terminal_error(reply)
+
+    def _error_offset(self, reply: bytes) -> int:
+        return decode_9i_oall8_error_position(reply)  # #2263
+
+    def _fetch_ended(self, terminal: bytes) -> bool:
+        return _9i_oall8_fetch_ended(terminal)
+
+    def _terminal_complete(self, terminal: bytes) -> bool:
+        return o9i_oall8_terminal_complete(terminal)
+
+    def _dml_response(self, reply: bytes) -> tuple[int, int, str | None]:
+        return decode_9i_oall8_dml_response(reply)
+
+    def _decode_describe(self, buf: bytes) -> tuple[list, bytes]:
+        return decode_9i_oall8_describe(buf)
+
+    def _decode_rows(self, buf: bytes, columns: list, last_row: list | None) -> tuple:
+        return decode_9i_oall8_exec_response(buf, columns, last_row)
+
+    def _long_size(self, columns: list, fetch: int) -> int:
+        # The widest column's buffer + 1, as the native 9.2 client sends: a huge
+        # value made the server return nothing at more than one row (#792).
+        return max((col.get('data_length') or 0) for col in columns) + 1
 
     def capabilities(self) -> frozenset[str]:
         # SELECT, DML / DDL, PL/SQL blocks and own commit/rollback over the native
@@ -1106,79 +1208,6 @@ class Fv2Oall8Dialect(Oall8Dialect):
         # column's bytes per row; a huge value makes the 9.2 server return nothing,
         # so the caller passes the widest column's buffer (+1), not 0x7FFFFFFF.
         return encode_9i_oall8_fetch(self._next_seq(), cursor, count, long_size)
-
-    def execute_query(self, sql: str, bind: list | None = None, fetch: int = 15):
-        # 9i native OALL8 SELECT (#792): the 64-bit execute with the FETCH option
-        # returns the describe + the first row batch; encode_9i_oall8_fetch pulls
-        # the rest. The reply is OCI fixed-width (decode_9i_oall8_*), not the 8i or
-        # thin form, so the describe / row / terminal decoders are overridden
-        # below. Returns the same 9-tuple as Fv2Dialect.execute_query so the cursor
-        # path is unchanged. (No binds / LONG / LOB yet — scalar SELECT only.)
-        yield Send(self._closing() + self._encode_query(encode_9i_sql_text(sql), bind))
-        resp = yield RECV
-        if resp is False:
-            raise Exception('Connection closed during 9i OALL8 query response')
-        packet = resp[1]
-        # A query refused at execute (e.g. ORA-00942) comes back as a TTI_OER, not
-        # the TTI_DCB describe — surface the mapped error rather than overrunning.
-        if packet[:1] == bytes([TTI_OER]):
-            (err_code, message) = decode_9i_oall8_terminal_error(packet)
-            # Refused at parse, the statement still holds a cursor: close it.
-            self._finished(decode_9i_oall8_cursor_id(packet))
-            if err_code:
-                from seerdb.common.exceptions import from_ora_code
-
-                exc = from_ora_code(err_code)(
-                    message or f'ORA-{err_code:05d}', code=err_code
-                )
-                # Where in the statement the error is (#2263).
-                exc.offset = decode_9i_oall8_error_position(packet)
-                raise exc
-            from seerdb.common.exceptions import DatabaseError
-
-            raise DatabaseError('Oracle 9i OALL8 rejected the query (no ORA code)')
-        (columns, rest) = yield from self._recv_describe(packet)
-        (rows, terminal, last_row) = yield from self.recv_rows(rest, columns, None)
-        # The server opens a fresh cursor per statement (its id increments), so the
-        # fetch loop reads it by the id the exec reply's OER carries, and the next
-        # call closes it (#798).
-        cursor = decode_9i_oall8_cursor_id(terminal)
-        if not _9i_oall8_fetch_ended(terminal):
-            rows.extend((yield from self._fetch_rest(cursor, columns, last_row, fetch)))
-        self._finished(cursor)
-        # CLOB / BLOB cells came back as locators: read their content while the
-        # cursor is still open, as the 8i path does (#795). A BFILE stays a
-        # locator, read on demand.
-        yield from self.resolve_lobs(rows, columns)
-        return (0, 0, 0, (len(rows), columns), rows, None, None, [], None)
-
-    def _fetch_rest(
-        self, cursor: int, columns: list, last_row: list | None, fetch: int = 15
-    ):
-        # Fetch an open cursor's remaining rows by its id, to the end of fetch: a
-        # query's after its execute reply, or every row of a REF CURSOR a block
-        # opened (#798).
-        has_long = any(col.get('data_type') in _O8I_LONG_TYPES for col in columns)
-        # The fetch's per-row column-buffer cap: the widest column's buffer + 1, as
-        # the native client sends. A LONG reads the whole value, one row per fetch.
-        long_size = (
-            0x7FFFFFFF
-            if has_long
-            else max((col.get('data_length') or 0) for col in columns) + 1
-        )
-        row_count = 1 if has_long else (fetch or 15)
-        rows: list = []
-        ended = False
-        while cursor and not ended:
-            yield Send(self._encode_fetch(cursor, row_count, long_size))
-            (more, terminal, last_row) = yield from self.recv_rows(
-                b'', columns, last_row
-            )
-            ended = _9i_oall8_fetch_ended(terminal)
-            if not more:
-                break
-            rows.extend(more)
-        return rows
 
     def lob_read(self, locator: bytes, offset: int = 1, amount: int | None = None):
         # CLOB / BLOB content over a native 9i OALL8 session (#795): one 64-bit
@@ -1284,46 +1313,6 @@ class Fv2Oall8Dialect(Oall8Dialect):
             )
             yield RECV  # drain FILE_CLOSE RPA + OER
 
-    def _recv_describe(self, packet: bytes):
-        # The 9i OALL8 describe, read on across packets (a wide select list spans
-        # the SDU with no end-of-message flag, as on 8i #1226).
-        from seerdb.common.exceptions import Truncated
-
-        buf = bytes(packet)
-        while True:
-            try:
-                return decode_9i_oall8_describe(buf)
-            except (Truncated, IndexError):
-                received = yield RECV
-                if received is False:
-                    raise Exception(
-                        'Connection closed during 9i OALL8 describe'
-                    ) from None
-                buf += received[1]
-
-    def recv_rows(self, buf: bytes, columns: list, last_row: list | None):
-        # One 9i OALL8 execute / fetch row stream, accumulated across packets until
-        # it decodes cleanly AND leaves a whole terminal (the OCI-fixed analogue of
-        # the base 8i recv_rows). "Read more" is only a field off the end.
-        from seerdb.common.exceptions import Truncated
-
-        while True:
-            try:
-                (rows, terminal, last) = decode_9i_oall8_exec_response(
-                    buf, columns, last_row
-                )
-                if terminal and o9i_oall8_terminal_complete(terminal):
-                    return (rows, terminal, last)
-            except (Truncated, IndexError):
-                pass
-            received = yield RECV
-            if received is False:
-                try:
-                    return decode_9i_oall8_exec_response(buf, columns, last_row)
-                except (Truncated, IndexError):
-                    return ([], b'', last_row)
-            buf += received[1]
-
     def _encode_dml(
         self, sql_text: bytes, stmt_type: int, bind: list | None = None
     ) -> bytes:
@@ -1358,7 +1347,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
                 batcherrors,
             )
         )
-        buf = yield from self._recv_dml_terminal('DML')
+        buf = yield from self._recv_terminal('DML')
         self._finished(decode_9i_oall8_cursor_id(buf))  # closed with the next call
         # The error comes back in the result, as on the compact path, so the
         # cursor reports what the call managed: the rows a batch applied before a
@@ -1387,32 +1376,6 @@ class Fv2Oall8Dialect(Oall8Dialect):
             decode_9i_oall8_warn_flags(buf),
         )
 
-    def txn_control(self, statement: str):
-        # Commit / rollback as an ordinary OALL8 statement (no modern TTI_COMMIT on
-        # a thick 9i session, #716), as 8i does. Driven by the connection when
-        # CAP_OWN_TXN is set.
-        yield Send(
-            self._closing()
-            + self._encode_dml(encode_9i_sql_text(statement), O8I_STMT_TXN)
-        )
-        buf = yield from self._recv_dml_terminal(statement)
-        self._finished(decode_9i_oall8_cursor_id(buf))  # closed with the next call
-        (_row_count, err_code, message) = decode_9i_oall8_dml_response(buf)
-        _raise_ora(err_code, message)
-
-    def _recv_dml_terminal(self, what: str):
-        # Accumulate a non-query reply across packets until its OER status is whole
-        # (a short reply arrives in one packet; this guards a split one, as the row
-        # reader does).
-        buf = b''
-        while True:
-            received = yield RECV
-            if received is False:
-                raise Exception(f'Connection closed during 9i OALL8 {what}')
-            buf += received[1]
-            if o9i_oall8_terminal_complete(buf):
-                return buf
-
     def execute_block(self, sql: str, bind: list | None = None):
         # 9i native OALL8 anonymous PL/SQL block (#793/#794). The reply opens with a
         # TTI_IOV (0x0b) bind prompt when there are binds, then (when the block
@@ -1429,7 +1392,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
         yield Send(
             self._closing() + self._encode_dml(encode_9i_sql_text(sql), stmt_type, bind)
         )
-        buf = yield from self._recv_dml_terminal('PL/SQL block')
+        buf = yield from self._recv_terminal('PL/SQL block')
         # The prompt says which binds the block writes; only those come back. A
         # Var read only as input beside an OUT one was taken for OUT and shifted
         # the values (#1242). The masks are also cursor.bind_directions (#1064).
