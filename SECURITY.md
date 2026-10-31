@@ -15,7 +15,13 @@ the seerdb version, and how to reproduce it.
 
 ## How a report is handled
 
-Until the Mirror's general availability, while the user base is small:
+There are two stages. The stricter one starts at the Mirror's general
+availability, or as soon as the maintainer learns of a deployment outside the
+project's own, whichever comes first. The ChangeLog records the switch.
+
+### Before general availability (now)
+
+While the user base is small:
 
 - **The fix** is an ordinary public pull request, which names the advisory.
   There is no embargo: once the fix is public, keeping the advisory private
@@ -29,10 +35,25 @@ Until the Mirror's general availability, while the user base is small:
 - **A CVE** is requested through GitHub for a flaw that affected a release.
 - **The ChangeLog** names the advisory in the fix's entry.
 
-From the Mirror's general availability on, or once deployments are known, fixes
-are developed in the advisory's private fork and published together with the
-advisory, under an embargo with response times. The details are being settled
-in [#1959](https://github.com/seerdb/seerdb/issues/1959).
+### From general availability, or the first known deployment
+
+Once users depend on it, a public fix would announce the flaw before they can
+upgrade. So:
+
+- **The fix** is developed in the advisory's private fork, and merged when its
+  release is cut.
+- **Embargo:** the fix, the release and the advisory become public together. A
+  reporter is asked to keep the flaw private until then, at most 90 days from
+  the report.
+- **Response times:**
+  - every report is acknowledged within 7 days;
+  - a fix is targeted within 30 days for a high or critical severity, and for
+    the next release otherwise.
+- **The advisory** names the release that ships the fix as the patched version.
+- **A fix for a released version** gets a release of its own promptly. It does
+  not wait for unrelated work.
+- **A CVE** is requested through GitHub for a flaw that affected a release.
+- **The ChangeLog** names the advisory in the fix's entry.
 
 ## Supported versions
 
