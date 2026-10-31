@@ -1819,9 +1819,12 @@ _PIGGYBACK_HEAD: wire_schema.Schema = (
 # pointer flags, the operation. OCI sends thin's fields with 8-byte pointers
 # and ub4 counts, measured against sqlplus 10.2, 11g and 23.26 READs; sqlplus
 # 11.2 writes the wide counts (wn4) as ub8, as it does in its OALL8 (#866,
-# #2251). Of the head's four, only the two lengths are wide by inference: the
-# captures carry zero in all but the source length, and the operation sits
-# eight bytes later than in the narrow form, not sixteen.
+# #2251). Two of the head's four are wide: the operation sits eight bytes later
+# than in the narrow form, not sixteen. The source length is one, the only one
+# those captures carry a value in. The other was taken for the destination
+# length until a native 9.2 client's WRITE at offset 3 (#798) put the source
+# offset straight after a ub4 destination length; so it is the destination
+# offset, the one field left -- the earlier captures carry zero in both.
 _LOBOPS_HEAD: wire_schema.Schema = (
     ('const', bytes([TTI_FUN, TTI_LOBOPS])),
     ('u8', 'seq'),
@@ -1829,9 +1832,9 @@ _LOBOPS_HEAD: wire_schema.Schema = (
     ('ptr', 'source_present'),
     ('wn4', 'source_length'),
     ('ptr', 'dest_present'),
-    ('wn4', 'dest_length'),
+    ('n4', 'dest_length'),
     ('n4', 'short_source_offset'),
-    ('n4', 'short_dest_offset'),
+    ('wn4', 'short_dest_offset'),
     ('ptr', 'charset_present'),
     ('ptr', 'short_amount_present'),
     ('ptr', 'null_lob_present'),
@@ -2184,7 +2187,8 @@ _O7_IOV: wire_schema.Schema = (
 _O7_LOBOPS: wire_schema.Schema = (
     *_LOBOPS_HEAD,
     ('ptr', 'scn_present'),
-    ('n4', 'scn_length'),
+    # A wide count, as in _LOBOPS_READ: a ub8 from a 64-bit 9.2 client (#798).
+    ('wn4', 'scn_length'),
     ('bytes', 'locator', 'source_length'),
     ('when', 'short_amount_present', (('n4', 'short_amount'),)),
 )
@@ -2402,6 +2406,8 @@ _CLOSE_CURSORS_FROM_OCI = wire_schema.compile_decoder(_CLOSE_CURSORS, _OCI)
 _CLOSE_CURSORS_O8I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O8I)
 _O8I_ALL8_O8I = wire_schema.compile_encoder(_O8I_ALL8, _O8I)
 _O8I_ALL8_O9I = wire_schema.compile_encoder(_O8I_ALL8, _O9I)
+_O7_LOBOPS_O9I = wire_schema.compile_encoder(_O7_LOBOPS, _O9I)
+_CLOSE_CURSORS_O9I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O9I)
 _OBJECT_FRAME_THIN = wire_schema.compile_encoder(_OBJECT_FRAME, _THIN)
 _OBJECT_FRAME_OCI = wire_schema.compile_encoder(_OBJECT_FRAME, _OCI)
 _LOB_CELL_THIN = wire_schema.compile_encoder(_LOB_CELL, _THIN)
@@ -14446,38 +14452,45 @@ def encode_9i_oall8_lobop(
     Amount: int = 0,
     Data: bytes | None = None,
 ) -> bytes:
-    # A TTI_LOBOPS (0x60) call on a native 9i OALL8 session (#795/#796), in the
-    # 64-bit form -- the 8i (32-bit) and thin-9i LOBOPS envelopes both draw no
-    # reply here. A 91-byte head, then the locator as fetched (a ub2 length and
-    # the body: 86 bytes for a CLOB / BLOB, more for a BFILE) and, when the
-    # operation carries one, the ub4 short amount. In the head the source pointer
-    # sits at 3, the locator's length at 11 (8 bytes), the 1-based offset at 31,
-    # the amount pointer at 51, the null-LOB pointer at 59 and the operation at 67
-    # (8 bytes); the rest is zero. The pointers are the native client's heap
-    # addresses, which the server ignores, so the non-null oci.OCI_INDICATOR
-    # stands in. Byte-reproduced from a native 9.2 sqlplus CLOB READ
-    # (native_9i_clob_read.pcap); FILE_OPEN, GET_LENGTH and FILE_CLOSE use the same
-    # head and are live-verified on 9.2 (a BFILE read end to end). The LOB object's
+    # A TTI_LOBOPS (0x60) call on a native 9i OALL8 session (#795/#796): 8i's
+    # _O7_LOBOPS at a 9.2 client's widths (#798) -- the 8i (32-bit) and thin-9i
+    # envelopes both draw no reply here. Its head is 91 bytes: the source
+    # pointer, the locator's length (a ub8), the 1-based offset, the amount and
+    # null-LOB pointers, the operation (a ub8) and the SCN array's; then the
+    # locator as fetched (a ub2 length and the body: 86 bytes for a CLOB / BLOB,
+    # more for a BFILE) and, when the operation carries one, the ub4 short
+    # amount. The pointers are the native client's heap addresses, which the
+    # server ignores, so the non-null oci.OCI_INDICATOR stands in. Matches a
+    # native 9.2 sqlplus CLOB READ (native_9i_clob_read.pcap) byte for byte, as
+    # the hand-built head it replaces did; FILE_OPEN, GET_LENGTH and FILE_CLOSE
+    # are live-verified on 9.2 (a BFILE read end to end). The LOB object's
     # calls (#798) match a native OCI client's (native_9i_lob_ops.pcap): the
     # amount is GET_LENGTH's / GET_CHUNK_SIZE's 0, OPEN's mode, TRIM's new length,
     # a WRITE's count; IS_OPEN and CLOSE carry none. A WRITE's `Data` follows as
     # TTI_LOB content, framed as the compact path frames it (`0e 03 58 59 5a`).
-    Flags = _O7_LOBOP_FLAGS.get(Operation, {})
-    AmountPresent = Flags.get('short_amount_present', True)
-    Frame = bytearray(91)
-    Frame[0:3] = bytes([TTI_FUN, TTI_LOBOPS, Seq & 0xFF])
-    Frame[3:11] = oci.OCI_INDICATOR
-    Frame[11:19] = len(Locator).to_bytes(8, 'little')
-    Frame[31:35] = Offset.to_bytes(4, 'little')
-    if AmountPresent:
-        Frame[51:59] = oci.OCI_INDICATOR
-    if Flags.get('null_lob_present', False):
-        Frame[59:67] = oci.OCI_INDICATOR
-    Frame[67:75] = Operation.to_bytes(8, 'little')
-    Tail = (Amount & 0xFFFFFFFF).to_bytes(4, 'little') if AmountPresent else b''
+    Values = {
+        'seq': Seq & 0xFF,
+        'token_number': None,
+        'source_present': True,
+        'source_length': len(Locator),
+        'dest_present': False,
+        'dest_length': 0,
+        'short_source_offset': Offset,
+        'short_dest_offset': 0,
+        'charset_present': False,
+        'short_amount_present': True,
+        'null_lob_present': False,
+        'operation': Operation,
+        'scn_present': False,
+        'scn_length': 0,
+        'locator': Locator,
+        'short_amount': Amount & 0xFFFFFFFF,
+    }
+    Values.update(_O7_LOBOP_FLAGS.get(Operation, {}))
+    Out = _O7_LOBOPS_O9I(Values)
     if Data is not None:
-        Tail += bytes([TTI_LOB]) + _o7_lob_value(Data)
-    return bytes(Frame) + Locator + Tail
+        Out += bytes([TTI_LOB]) + _o7_lob_value(Data)
+    return Out
 
 
 def decode_9i_oall8_lob_value(Data: bytes, Operation: int) -> tuple[int | None, bytes]:
@@ -14508,20 +14521,24 @@ def decode_9i_oall8_lob_value(Data: bytes, Operation: int) -> tuple[int | None, 
 def encode_9i_oall8_close_cursors(Seq: int, Cursors: list[int]) -> bytes:
     # The close of a finished cursor on a native 9i OALL8 session (#798),
     # piggybacked ahead of the next call as a native 9.2 OCI client sends it
-    # (native_9i_array_dml.pcap): `11 69`, a seq, the array's pointer, the count
-    # as a ub8 and the cursor id as a ub4. Without it every statement's cursor
-    # stayed open and a session failed at open_cursors (ORA-01000 under ORA-00604
-    # at the 299th statement). The native client only ever closes one at a time,
-    # so each cursor gets a piggyback of its own, each taking a seq (Seq on).
-    Out = b''
-    for Offset, Cursor in enumerate(Cursors):
-        Out += (
-            bytes([TTI_PFN, TTI_OCCA, (Seq + Offset) & 0xFF])
-            + oci.OCI_INDICATOR
-            + (1).to_bytes(8, 'little')
-            + (Cursor & 0xFFFFFFFF).to_bytes(4, 'little')
+    # (native_9i_array_dml.pcap): the shared CLOSE_CURSORS at a 9.2 client's
+    # widths -- `11 69`, a seq, the array's pointer, the count as a ub8 and the
+    # cursor id as a ub4. Without it every statement's cursor stayed open and a
+    # session failed at open_cursors (ORA-01000 under ORA-00604 at the 299th
+    # statement). The native client only ever closes one at a time, so each
+    # cursor gets a piggyback of its own, each taking a seq (Seq on).
+    return b''.join(
+        _CLOSE_CURSORS_O9I(
+            {
+                'seq': (Seq + Offset) & 0xFF,
+                'token_number': None,
+                'cursors_present': True,
+                'count': 1,
+                'cursors': [{'cursor': Cursor & 0xFFFFFFFF}],
+            }
         )
-    return Out
+        for (Offset, Cursor) in enumerate(Cursors)
+    )
 
 
 def encode_9i_oall8_lob_read(
