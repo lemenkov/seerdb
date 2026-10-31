@@ -4050,10 +4050,10 @@ class CursorIntegration(_IntegrationBase):
         self.assertEqual(self.cur.fetchone(), (1,))
 
     def test_a_bound_dml_waits_for_the_commit(self):
-        # A bound INSERT is part of the transaction like any other: another
-        # session does not see it, and rollback undoes it and what came before.
-        # Over the 9i OALL8 opt-in a bound DML carried commit-on-success and
-        # committed the whole transaction (#798).
+        # A bound INSERT, and a bound block, are part of the transaction like
+        # any other statement: another session does not see them, and rollback
+        # undoes them and what came before. Over the 9i OALL8 opt-in both
+        # carried commit-on-success and committed the whole transaction (#798).
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
         conn = seerdb.connect(
             host=_HOST,
@@ -4068,6 +4068,7 @@ class CursorIntegration(_IntegrationBase):
             cur = conn.cursor()
             cur.execute(f'INSERT INTO {self.TABLE} VALUES (1)')
             cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1)', [2])
+            cur.execute(f'BEGIN INSERT INTO {self.TABLE} VALUES (:1); END;', [3])
             self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
             self.assertEqual(self.cur.fetchone(), (0,))
             conn.rollback()

@@ -14179,7 +14179,7 @@ def _encode_9i_oall8(Seq: int, Sql: bytes, StmtType: int, Binds: list) -> bytes:
     # undone it; a native 9.2 OCI client sends bound and array DML as 0x80 / 0x00
     # (native_9i_array_dml.pcap), the same as an unbound one (#798).
     if IsBlock:
-        Byte4 = 0x05 if NumBinds else 0x00
+        Byte4 = 0x04 if NumBinds else 0x00
     else:
         Byte4 = 0x80
     Byte5 = 0x04 if IsBlock else 0x00
