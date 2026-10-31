@@ -98,6 +98,16 @@ class WsServer:
         self._tns_version = tns_version
         self._protocol = protocol
         self._secure = ssl_context is not None
+        if ssl_context is not None:
+            # No TLS 1.3 session tickets (#2385). The server sends them after the
+            # handshake, and websockets' sync client reads them in its receive
+            # thread while its main thread writes the opening request on the same
+            # SSL object; OpenSSL does not take the two at once, and now and then
+            # the request was lost and the server closed the connection at its
+            # 10 s open timeout (about 1 in 20 connects locally, 0 in 200 without
+            # tickets). A ticket only speeds up resuming a TLS session, which a
+            # long-lived WebSocket hardly does.
+            ssl_context.num_tickets = 0
         # One session slot per connection (GHSA-5827-wqfh-x2v3); one more is
         # closed as it arrives. None serves any number.
         self._slots: threading.BoundedSemaphore | None = (

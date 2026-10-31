@@ -268,6 +268,29 @@ def wss_query_mirror() -> Iterator[WsServer]:
     yield from _serve(ssl_context=_tls_context(_CERT, _KEY, ''))
 
 
+def test_the_wss_listener_issues_no_session_tickets(
+    wss_query_mirror: WsServer,
+) -> None:
+    # A TLS 1.3 session ticket raced websockets' sync client's request (#2385).
+    sock = wss_query_mirror._server.socket
+    assert isinstance(sock, ssl_mod.SSLSocket)
+    assert sock.context.num_tickets == 0
+
+
+def test_wss_connects_every_time(wss_query_mirror: WsServer) -> None:
+    # Sixty connects in a row, each opening and logging in. With session tickets
+    # about one in twenty lost its request and waited out the server's 10 s open
+    # timeout (#2385); sixty in a row passed about one run in twenty.
+    ctx = ssl_mod.create_default_context(cafile=_CA)
+    ctx.check_hostname = False  # fixture cert carries no 127.0.0.1 name
+    for _ in range(60):
+        ws = _connect(wss_query_mirror.port, ssl=ctx)
+        try:
+            assert _login(ws)['type'] == 'login_ok'
+        finally:
+            ws.close()
+
+
 def test_query_over_wss(wss_query_mirror: WsServer) -> None:
     ctx = ssl_mod.create_default_context(cafile=_CA)
     ctx.check_hostname = False  # fixture cert carries no 127.0.0.1 name
