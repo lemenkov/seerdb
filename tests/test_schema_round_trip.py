@@ -37,6 +37,7 @@ CODECS = {
     'oci': tns._OCI,
     'oci-wide': tns._OCI_WIDE,
     'o8i': tns._O8I,
+    'o9i': tns._O9I,
 }
 # The field versions at which a codec's framing changes: thin chunks long
 # values with one-byte lengths before 12.1 and ub4 ones from it.
@@ -93,9 +94,9 @@ def _width(codec_name: str, kind: str) -> int:
         return 1
     if kind in ('n2', 'be2', 'le2'):
         return 2
-    if kind == 'n8' and codec_name in ('oci', 'oci-wide'):
+    if kind == 'n8' and codec_name in ('oci', 'oci-wide', 'o9i'):
         return 8
-    if kind == 'wn4' and codec_name == 'oci-wide':
+    if kind == 'wn4' and codec_name in ('oci-wide', 'o9i'):
         return 8
     return 4
 
@@ -127,7 +128,7 @@ class _Values:
                 continue
             if kind == 'only':
                 if field[1] == self.codec_name.split('-')[0] or (
-                    field[1] == 'oci' and self.codec_name == 'o8i'
+                    field[1] == 'oci' and self.codec_name in ('o8i', 'o9i')
                 ):
                     self.fill(field[2], values)
                 continue

@@ -1410,10 +1410,25 @@ class _O8iCodec(_OciCodec):
             data = data[length:]
 
 
+class _O9iCodec(_OciWideCodec):
+    """A native 9.2 OCI client's primitives, as the experimental 9i OALL8 opt-in
+    sends them (#798): OCI's, with the ub8 counts of a 64-bit client's OALL8
+    preamble (_OciWideCodec), and text framed as thin frames it before 12.1 --
+    the pre-10g 64-byte chunks 8i takes too, which a native 9.2 query of 161
+    bytes carries (64, 64, 33). Proved byte for byte against the execute
+    seerdb had built by hand from the 9.2 captures; the same schemas then serve
+    8i (_O8iCodec) and 9.2, apart from their fields marked for one codec."""
+
+    name = 'o9i'
+    chr = staticmethod(_ThinCodec.chr)
+    read_chr = staticmethod(_O8iCodec.read_chr)
+
+
 _THIN = _ThinCodec()
 _OCI = _OciCodec()
 _OCI_WIDE = _OciWideCodec()
 _O8I = _O8iCodec()
+_O9I = _O9iCodec()
 _bytes_with_length = _THIN.value
 _oci_value_bytes = _OCI.value
 
@@ -1596,8 +1611,12 @@ _ALL8_HEAD: wire_schema.Schema = (
 # an execute and 0 for a fetch, [1] the execute flag for a statement (0 for a
 # query, whose execute waits for its fetch) or the rows a fetch asks for, and
 # [7] the statement type (O8I_STMT_*); the rest are 0.
+#
+# The same execute at a 9.2 server's 64-bit widths (_O9I, #798) carries the
+# defines' pointer and count, which an 8.1.7 server does not read.
 _O8I_ALL8: wire_schema.Schema = (
     *_ALL8_HEAD[:-2],
+    ('only', 'o9i', _ALL8_HEAD[-2:]),
     ('when', 'sql_present', (('chr', 'sql'),)),
     *(('n4', f'al8i4_{i}') for i in range(12)),
 )
@@ -2379,6 +2398,7 @@ _PIGGYBACK_HEAD_THIN = wire_schema.compile_encoder(_PIGGYBACK_HEAD, _THIN)
 _CLOSE_CURSORS_FROM_OCI = wire_schema.compile_decoder(_CLOSE_CURSORS, _OCI)
 _CLOSE_CURSORS_O8I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O8I)
 _O8I_ALL8_O8I = wire_schema.compile_encoder(_O8I_ALL8, _O8I)
+_O8I_ALL8_O9I = wire_schema.compile_encoder(_O8I_ALL8, _O9I)
 _OBJECT_FRAME_THIN = wire_schema.compile_encoder(_OBJECT_FRAME, _THIN)
 _OBJECT_FRAME_OCI = wire_schema.compile_encoder(_OBJECT_FRAME, _OCI)
 _LOB_CELL_THIN = wire_schema.compile_encoder(_LOB_CELL, _THIN)
@@ -14150,14 +14170,13 @@ def _encode_9i_oall8(
     BatchErrors: bool = False,
 ) -> bytes:
     # The native 9i (9.2) OALL8 (TTI_ALL8, 0x5e) execute — the 64-bit form the
-    # server accepts once the OALL8 opt-in caps are negotiated (#716). It is the
-    # 8i request (`_encode_8i_oall8`) with every pointer / length field widened
-    # from 4 to 8 bytes and a present-pointer indicator (``oci.OCI_INDICATOR``)
-    # where the 8i form writes zeros; the SQL text and bind values are identical.
-    # Reverse-engineered from a live 9.2-client trace and verified byte-for-byte
-    # against it apart from the heap-pointer fields the server ignores. Scope so
-    # far: DML / DDL and transaction control with scalar binds; SELECT, PL/SQL
-    # blocks and RETURNING are separate increments.
+    # server accepts once the OALL8 opt-in caps are negotiated (#716). It is 8i's
+    # execute (_O8I_ALL8) at a 9.2 client's widths (_O9I): 8-byte pointers and
+    # counts, and the defines' pointer and count that 8i does not read (#798).
+    # Proved byte for byte against the execute built here by hand from the native
+    # 9.2 captures before (SELECT, DML, DDL, blocks, a chunked 150-byte text and
+    # an array DML), and those captures against it apart from the heap-pointer
+    # fields the server ignores.
     #
     # `Batch` holds an array DML's further rows (#798): the tail's iteration count
     # counts every row, the bind descriptors describe each column once (a value
@@ -14166,11 +14185,6 @@ def _encode_9i_oall8(
     # (native_9i_array_dml.pcap). `BatchErrors` sets the batch-errors bit
     # (0x80000, option byte 5's 0x08): the server applies the good rows and
     # answers ORA-24381 with the failures.
-    P = oci.OCI_INDICATOR
-
-    def u8(n: int) -> bytes:
-        return n.to_bytes(8, 'little')
-
     Rows = _widen_batch_datetimes([Binds, *Batch]) if Batch else [Binds]
     NumBinds = len(Binds)
     IsBlock = StmtType in (O8I_STMT_BEGIN, O8I_STMT_DECLARE)
@@ -14199,34 +14213,27 @@ def _encode_9i_oall8(
     else:
         Byte4 = 0x80
     Byte5 = 0x04 if IsBlock else (0x08 if BatchErrors else 0x00)
-    Head = bytes([TTI_FUN, TTI_ALL8, Seq & 0xFF, Option, Byte4, Byte5, 0, 0, 0, 0, 0])
-    Mid = (
-        P
-        + u8(len(Sql))
-        + P
-        + u8(12)
-        + bytes(8)
-        + P
-        + bytes(4)
-        + (1).to_bytes(4, 'little')
-        + u8(0)
-        + (P if NumBinds else bytes(8))
-        + u8(NumBinds)
-        + bytes(8) * 4
-        + P
-        + P
-        + u8(0)
-    )
-    # Tail[4:8] is the iteration count, a ub4: 0 for a SELECT (the fetch rides the
-    # FETCH option), else the rows the execute runs -- 1, or an array DML's
-    # count. Byte-verified against the native 9.2 SELECT (native_9i_select.pcap),
-    # DML (#716) and array DML (native_9i_array_dml.pcap, 3) captures.
-    Tail = (
-        bytes([1, 0, 0, 0])
-        + (0 if IsQuery else len(Rows)).to_bytes(4, 'little')
-        + bytes(20)
-        + bytes([StmtType])
-        + bytes(19)
+    # al8i4 [1] is the iteration count: 0 for a SELECT (the fetch rides the FETCH
+    # option), else the rows the execute runs -- 1, or an array DML's count.
+    # Byte-verified against the native 9.2 SELECT (native_9i_select.pcap), DML
+    # (#716) and array DML (native_9i_array_dml.pcap, 3) captures.
+    Values = dict(_O8I_ALL8_FIXED)
+    Values.update(
+        seq=Seq & 0xFF,
+        options=Option | Byte4 << 8 | Byte5 << 16,
+        cursor=0,
+        sql_present=True,
+        sql_length=len(Sql),
+        sql=Sql,
+        prefetch_rows=1,
+        max_long=0,
+        binds_present=bool(NumBinds),
+        bind_count=NumBinds,
+        defines_present=True,
+        define_count=0,
+        al8i4_0=1,
+        al8i4_1=0 if IsQuery else len(Rows),
+        al8i4_7=StmtType,
     )
     # The SQL text is a pre-10g chunked string (encode_chr at field version 2): a
     # plain length byte up to 64 bytes, else 0xFE, 64-byte chunks and a zero --
@@ -14234,7 +14241,7 @@ def _encode_9i_oall8(
     # single length byte, as written before, failed outright past 255 bytes.
     Token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_9_2)
     try:
-        Message = Head + Mid + encode_chr(Sql) + Tail
+        Message = _O8I_ALL8_O9I(Values)
         if NumBinds:
             Oacs = [_encode_9i_bind_oac(V) for V in _oac_rep_row(Rows)]
             Message += b''.join(Oacs)
