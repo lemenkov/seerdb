@@ -102,11 +102,16 @@ when these milestones close:
   the security review before the public release.
 - [mirror-interface-stability](https://github.com/seerdb/seerdb/milestone/54):
   the user guide.
-- [mirror-pg-performance](https://github.com/seerdb/seerdb/milestone/44): a
-  measured baseline and no known pathologies. It is open with no issues while
-  further optimisations are measured.
 - [mirror-pg-multi-user](https://github.com/seerdb/seerdb/milestone/53):
   closed.
+
+It also needs **a measured performance baseline with no known pathologies**.
+Every open Mirror-over-PostgreSQL performance issue is fixed, or explicitly
+accepted, before general availability. Today that is
+[#2392](https://github.com/seerdb/seerdb/issues/2392): some INSERTs send twice
+the usual number of PostgreSQL statements. The round-trip work that preceded it
+is done ([mirror-pg-performance](https://github.com/seerdb/seerdb/milestone/44),
+closed).
 
 **Security**, beyond the Mirror: a disclosure and embargo policy
 ([#1959](https://github.com/seerdb/seerdb/issues/1959)).
@@ -120,9 +125,9 @@ features.
 **Thin breadth across versions.** The client speaks each server version's
 protocol through the form that version's own thin drivers use:
 
-- [9i features over the thin ALL7 path](https://github.com/seerdb/seerdb/milestone/60):
-  what the client still lacks on 9i, delivered over the protocol it already
-  speaks there, with no native login.
+- 9i over the thin ALL7 path is delivered
+  ([milestone 60](https://github.com/seerdb/seerdb/milestone/60), closed).
+  Further 9i gaps are filed as ordinary issues as they turn up.
 - [legacy-reach](https://github.com/seerdb/seerdb/milestone/45): older Oracle
   generations at both ends.
 - [post-23ai protocol](https://github.com/seerdb/seerdb/milestone/29): wire
