@@ -115,6 +115,7 @@ def test_the_mirror_says_it_is_provisional(caplog) -> None:
         server.serve_forever()  # returns at once: the socket is closed
     notices = [r for r in caplog.records if 'technology preview' in r.getMessage()]
     assert [r.levelno for r in notices] == [logging.WARNING]
+    assert 'an initial implementation' in notices[0].getMessage()
 
 
 def test_a_mirror_serves_at_most_max_sessions() -> None:
