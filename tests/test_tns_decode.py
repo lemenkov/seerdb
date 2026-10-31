@@ -7634,23 +7634,26 @@ class TestNative9iOall8Select(unittest.TestCase):
         self.assertEqual(message, 'ORA-01403: no data found')
 
     # Non-query replies (an RPA piggyback then the OER): the affected-row count is
-    # a ub4 at the OER's offset 6. Real 9.2 frames for `insert ... values (1)` (one
-    # row) and `update ... set id=id+5` (two rows).
+    # the status's rows. Live 9.2 replies to `insert ... values (1)` (one row) and
+    # `update ... set id=id+5` (two rows). The frames recorded here at first were
+    # two bytes shorter where the status carries its oerrdd, a form no request
+    # reproduces -- committed or not, bound or not, INSERT or UPDATE, every live
+    # reply is 150 bytes with it at 134 -- so they were taken again (#798).
     DML_INSERT = bytes.fromhex(
-        '080500b5dd2b0200000000020000000100000000000000000000000402000000'
-        '010100000000000000000002000c000200000000008644030001000000d2b800'
-        '0000000000000000000008000001000000360100000000000000000000000000'
+        '080500a35d300200000000010000000100000000000000000000000402000000'
+        '010100000000000000000001000c00020000000000b266030001000000d2b800'
+        '000100000000000000000d000001000000360100000000000000000000000000'
         '0080d0d403000000000d00000000000000000000000000000000000000000000'
-        '000000000000000000000000000000000000000000000000000000000000000d'
-        '000d010003448600010000b8d20000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000d000d01000366b200010000b8d20001'
     )
     DML_UPDATE = bytes.fromhex(
-        '080500b6dd2b0200000000050000000100000000000000000000000402000000'
-        '0102000000000000000000050007000600000000118644030001000000d2b800'
-        '000100000000000000000a000001000000360100000000000000000000000000'
+        '080500a45d300200000000010000000100000000000000000000000402000000'
+        '010200000000000000000001000700060000000011b266030001000000d2b800'
+        '000100000000000000000f000001000000360100000000000000000000000000'
         '0080d0d403000000000d00000000000000000000000000000000000000000000'
-        '000000000000000000000000000000000000000000000000000000000000000d'
-        '000d010003448600010000b8d20001'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000d000d01000366b200010000b8d20001'
     )
 
     def test_dml_reply_reports_the_affected_row_count(self):
@@ -7965,14 +7968,29 @@ class TestNative9iOall8Select(unittest.TestCase):
         (rows, _, _) = self._decode(self.LONG_FIRST_NULL_ROW, columns)
         self.assertEqual(rows, [[None, 6, 'yy']])
 
+    def test_a_status_whose_tail_does_not_read_still_gives_its_head(self):
+        # A status the full schema cannot read -- here a live one cut after its
+        # head -- still gives its code and cursor from the head (_O9I_STATUS_HEAD),
+        # as every status did before the schema (#798).
+        from seerdb.common.tns import (
+            decode_9i_oall8_cursor_id,
+            decode_9i_oall8_status,
+        )
+
+        head = self.STATUS_1403[:60]
+        self.assertEqual(decode_9i_oall8_status(head)['code'], 1403)
+        self.assertEqual(decode_9i_oall8_cursor_id(head), 1)
+
     def test_the_cursor_id_is_a_ub2(self):
         # The status's cursor id is a ub2 at 16: a session's 256th statement reads
         # `00 01` (this status head, live on 9.2). Read as one byte it was 0, and
         # the fetch failed with ORA-01002 (#798).
         from seerdb.common.tns import decode_9i_oall8_cursor_id
 
-        head = bytes.fromhex('040100000001010000000000000000000001120003000000')
-        self.assertEqual(decode_9i_oall8_cursor_id(head), 256)
+        # The live status head above, on the rest of a live status (EXEC's).
+        status = bytearray(self.EXEC[self.EXEC.rfind(b'\x04\x01\x00\x00\x00') :])
+        status[:24] = bytes.fromhex('040100000001010000000000000000000001120003000000')
+        self.assertEqual(decode_9i_oall8_cursor_id(bytes(status)), 256)
 
     # A 300-bind block's reply (an IN Var, an OUT Var, 298 IN numbers), live on
     # 9.2: the IOV is 50 + 300 bytes.
@@ -7997,15 +8015,12 @@ class TestNative9iOall8Select(unittest.TestCase):
     )
 
     def test_a_blocks_cursor_is_read_past_its_bind_prompt(self):
-        # A scan from the start lands on a `04` in the bind prompt and reads 256;
-        # closing that cursor drew ORA-00600 [12209] and lost the session (#798).
-        from seerdb.common.tns import (
-            decode_9i_oall8_block_cursor,
-            decode_9i_oall8_cursor_id,
-        )
+        # A scan from the reply's start lands on a `04` inside the bind prompt and
+        # reads 256; closing that cursor drew ORA-00600 [12209] and lost the
+        # session (#798). Read past the prompt and the OUT values, it is 1.
+        from seerdb.common.tns import decode_9i_oall8_block_cursor
 
         self.assertEqual(decode_9i_oall8_block_cursor(self.BLOCK_300_BINDS, 300, 1), 1)
-        self.assertNotEqual(decode_9i_oall8_cursor_id(self.BLOCK_300_BINDS), 1)
 
     def test_a_for_update_row_header_carries_the_rowid(self):
         # The row header names a 13-byte rowid (a ub2 at 42) between it and the

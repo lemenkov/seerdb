@@ -37,6 +37,7 @@ CODECS = {
     'oci': tns._OCI,
     'oci-wide': tns._OCI_WIDE,
     'o8i': tns._O8I,
+    'o9i': tns._O9I,
 }
 # The field versions at which a codec's framing changes: thin chunks long
 # values with one-byte lengths before 12.1 and ub4 ones from it.
@@ -48,6 +49,11 @@ ONE_WAY = {
     '_OBJECT_FRAME',
     '_LOB_READ_REPLY',
     '_DCB_COLUMN',
+    # 9i OALL8's describe and the schemas around it carry _DCB_COLUMN (#798).
+    '_DCB_COLUMN_9I',
+    '_O9I_DESCRIBE_BODY',
+    '_O9I_DESCRIBE',
+    '_O9I_REFCURSOR_OUT',
     # The describe body it carries per result is pre-encoded, a raw field.
     '_IMPLICIT_RESULTS',
     # 9i's SQL length counts characters, not the bytes its text takes (#2275).
@@ -63,8 +69,17 @@ def _auth_head(values: dict) -> None:
     values['user_length'] = len(values.get('user', b''))
 
 
+def _o9i_iov(values: dict) -> None:
+    # A 9.2 bind prompt counts its binds as `iterations * 256 + requests`, and the
+    # directions are that many bytes (#798, #2311).
+    binds = len(values.get('directions', b''))
+    values['requests'] = binds % 256
+    values['iterations'] = binds // 256
+    values['binds'] = binds
+
+
 # What a caller keeps to that the schema does not say, per schema.
-CONTRACTS = {'_AUTH_HEAD': _auth_head}
+CONTRACTS = {'_AUTH_HEAD': _auth_head, '_O9I_IOV': _o9i_iov}
 
 
 def _schemas() -> dict[str, wire_schema.Schema]:
@@ -93,9 +108,9 @@ def _width(codec_name: str, kind: str) -> int:
         return 1
     if kind in ('n2', 'be2', 'le2'):
         return 2
-    if kind == 'n8' and codec_name in ('oci', 'oci-wide'):
+    if kind == 'n8' and codec_name in ('oci', 'oci-wide', 'o9i'):
         return 8
-    if kind == 'wn4' and codec_name == 'oci-wide':
+    if kind == 'wn4' and codec_name in ('oci-wide', 'o9i'):
         return 8
     return 4
 
@@ -127,7 +142,7 @@ class _Values:
                 continue
             if kind == 'only':
                 if field[1] == self.codec_name.split('-')[0] or (
-                    field[1] == 'oci' and self.codec_name == 'o8i'
+                    field[1] == 'oci' and self.codec_name in ('o8i', 'o9i')
                 ):
                     self.fill(field[2], values)
                 continue
@@ -308,6 +323,8 @@ _KEEPS_NO_BYTES = {
     # is there, and writes the indicator.
     ('ptr', '_OCI'),
     ('ptr', '_OCI_WIDE'),
+    # A native 9.2 server's status does the same (#798).
+    ('ptr', '_O9I'),
 }
 _THIN_INTEGERS = ('n1', 'n2', 'n4', 'n8', 'wn4', 'token', 'scale')
 # A pad a peer fills, which the schema skips and writes as zeros, named.
@@ -322,6 +339,7 @@ _FILLED_PADS = {
 # (#2322), and a LONG in OCI's of 252.
 _RECHUNKED_TEXT = {
     ('_O8I_STATUS', '_O8I'): ('when', 'code'),
+    ('_O9I_STATUS', '_O9I'): ('when', 'code'),
     ('_O8I_LONG_CELL', '_O8I'): ('long', 'value'),
     ('_O8I_OUT_CELL', '_O8I'): ('chr', 'value'),
     # A server sends a multi-chunk LONG column in its own chunk sizes; the thin

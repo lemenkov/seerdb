@@ -1410,10 +1410,25 @@ class _O8iCodec(_OciCodec):
             data = data[length:]
 
 
+class _O9iCodec(_OciWideCodec):
+    """A native 9.2 OCI client's primitives, as the experimental 9i OALL8 opt-in
+    sends them (#798): OCI's, with the ub8 counts of a 64-bit client's OALL8
+    preamble (_OciWideCodec), and text framed as thin frames it before 12.1 --
+    the pre-10g 64-byte chunks 8i takes too, which a native 9.2 query of 161
+    bytes carries (64, 64, 33). Proved byte for byte against the execute
+    seerdb had built by hand from the 9.2 captures; the same schemas then serve
+    8i (_O8iCodec) and 9.2, apart from their fields marked for one codec."""
+
+    name = 'o9i'
+    chr = staticmethod(_ThinCodec.chr)
+    read_chr = staticmethod(_O8iCodec.read_chr)
+
+
 _THIN = _ThinCodec()
 _OCI = _OciCodec()
 _OCI_WIDE = _OciWideCodec()
 _O8I = _O8iCodec()
+_O9I = _O9iCodec()
 _bytes_with_length = _THIN.value
 _oci_value_bytes = _OCI.value
 
@@ -1563,7 +1578,10 @@ _EXEC_BY_CURSOR: wire_schema.Schema = (
 # both dialects, as python-oracledb writes them, measured against sqlplus 10.2,
 # 11g, 18c and 23.26 captures. What follows the define count differs by form.
 # In a wide OCI preamble one of prefetch_rows and max_long is the ub8; every
-# capture has 1 and 0 there, which can't tell which, and nothing reads them.
+# sqlplus capture has 1 and 0 there, which can't tell which, and nothing reads
+# them. A native 9.2 client's fetch tells (#798): its LONG cap, 23, is the ub8
+# after a zero prefetch_rows, so max_long is the ub8, as the cap is 8i's
+# max_long; the execute's 1 and 0 read the same either way.
 _ALL8_HEAD: wire_schema.Schema = (
     ('const', bytes([TTI_FUN, TTI_ALL8])),
     ('u8', 'seq'),
@@ -1577,8 +1595,8 @@ _ALL8_HEAD: wire_schema.Schema = (
     ('ptr', 'al8o4'),
     ('ptr', 'al8o4l'),
     ('n4', 'prefetch_size'),
-    ('wn4', 'prefetch_rows'),
-    ('n4', 'max_long'),
+    ('n4', 'prefetch_rows'),
+    ('wn4', 'max_long'),
     ('ptr', 'binds_present'),
     ('wn4', 'bind_count'),
     ('ptr', 'al8app'),
@@ -1596,8 +1614,12 @@ _ALL8_HEAD: wire_schema.Schema = (
 # an execute and 0 for a fetch, [1] the execute flag for a statement (0 for a
 # query, whose execute waits for its fetch) or the rows a fetch asks for, and
 # [7] the statement type (O8I_STMT_*); the rest are 0.
+#
+# The same execute at a 9.2 server's 64-bit widths (_O9I, #798) carries the
+# defines' pointer and count, which an 8.1.7 server does not read.
 _O8I_ALL8: wire_schema.Schema = (
     *_ALL8_HEAD[:-2],
+    ('only', 'o9i', _ALL8_HEAD[-2:]),
     ('when', 'sql_present', (('chr', 'sql'),)),
     *(('n4', f'al8i4_{i}') for i in range(12)),
 )
@@ -1797,9 +1819,12 @@ _PIGGYBACK_HEAD: wire_schema.Schema = (
 # pointer flags, the operation. OCI sends thin's fields with 8-byte pointers
 # and ub4 counts, measured against sqlplus 10.2, 11g and 23.26 READs; sqlplus
 # 11.2 writes the wide counts (wn4) as ub8, as it does in its OALL8 (#866,
-# #2251). Of the head's four, only the two lengths are wide by inference: the
-# captures carry zero in all but the source length, and the operation sits
-# eight bytes later than in the narrow form, not sixteen.
+# #2251). Two of the head's four are wide: the operation sits eight bytes later
+# than in the narrow form, not sixteen. The source length is one, the only one
+# those captures carry a value in. The other was taken for the destination
+# length until a native 9.2 client's WRITE at offset 3 (#798) put the source
+# offset straight after a ub4 destination length; so it is the destination
+# offset, the one field left -- the earlier captures carry zero in both.
 _LOBOPS_HEAD: wire_schema.Schema = (
     ('const', bytes([TTI_FUN, TTI_LOBOPS])),
     ('u8', 'seq'),
@@ -1807,9 +1832,9 @@ _LOBOPS_HEAD: wire_schema.Schema = (
     ('ptr', 'source_present'),
     ('wn4', 'source_length'),
     ('ptr', 'dest_present'),
-    ('wn4', 'dest_length'),
+    ('n4', 'dest_length'),
     ('n4', 'short_source_offset'),
-    ('n4', 'short_dest_offset'),
+    ('wn4', 'short_dest_offset'),
     ('ptr', 'charset_present'),
     ('ptr', 'short_amount_present'),
     ('ptr', 'null_lob_present'),
@@ -1987,31 +2012,47 @@ _O8I_LONG_CELL: wire_schema.Schema = (
     ('n2', 'indicator'),
     ('n2', 'return_code'),
 )
-_O8I_LOB_CELL: wire_schema.Schema = (
+# A 9.2 server sends a 9.2 client 8i's LOB, UROWID and ROWID cells without their
+# indicator and return code (#798): a LOB's ub4 length and, when it is not zero,
+# the locator; a UROWID's ub2 length and the rowid. Read live on 9.2.
+_O9I_LOB_CELL: wire_schema.Schema = (
     ('n4', 'length'),
     ('when', 'length', (('value', 'locator'),)),
+)
+_O8I_LOB_CELL: wire_schema.Schema = (
+    *_O9I_LOB_CELL,
     ('n2', 'indicator'),
     ('n2', 'return_code'),
+)
+# A rowid at fixed widths, as an 8i status and ROWID cell carry it (#1079): the
+# data object, the file, a reserved byte, the block, the slot. A 9.2 server
+# writes it to a 9.2 client aligned, the file and the slot each padded to four
+# bytes (#798): a ROWID cell's 16 bytes, read live against ROWIDTOCHAR, and the
+# status's.
+_O8I_ROWID_FIELDS: wire_schema.Schema = (
+    ('n4', 'rowid_object'),
+    ('n2', 'rowid_file'),
+    ('only', 'o8i', (('pad', 1),)),
+    ('only', 'o9i', (('pad', 2),)),
+    ('n4', 'rowid_block'),
+    ('n2', 'rowid_slot'),
+    ('only', 'o9i', (('pad', 2),)),
+)
+_O9I_ROWID_CELL: wire_schema.Schema = (
+    ('u8', 'size'),
+    ('when', 'size', _O8I_ROWID_FIELDS),
 )
 _O8I_ROWID_CELL: wire_schema.Schema = (
-    ('u8', 'size'),
-    (
-        'when',
-        'size',
-        (
-            ('n4', 'rowid_object'),
-            ('n2', 'rowid_file'),
-            ('pad', 1),
-            ('n4', 'rowid_block'),
-            ('n2', 'rowid_slot'),
-        ),
-    ),
+    *_O9I_ROWID_CELL,
     ('n2', 'indicator'),
     ('n2', 'return_code'),
 )
-_O8I_UROWID_CELL: wire_schema.Schema = (
+_O9I_UROWID_CELL: wire_schema.Schema = (
     ('n2', 'length'),
     ('when', 'length', (('value', 'urowid'),)),
+)
+_O8I_UROWID_CELL: wire_schema.Schema = (
+    *_O9I_UROWID_CELL,
     ('n2', 'indicator'),
     ('n2', 'return_code'),
 )
@@ -2162,7 +2203,8 @@ _O7_IOV: wire_schema.Schema = (
 _O7_LOBOPS: wire_schema.Schema = (
     *_LOBOPS_HEAD,
     ('ptr', 'scn_present'),
-    ('n4', 'scn_length'),
+    # A wide count, as in _LOBOPS_READ: a ub8 from a 64-bit 9.2 client (#798).
+    ('wn4', 'scn_length'),
     ('bytes', 'locator', 'source_length'),
     ('when', 'short_amount_present', (('n4', 'short_amount'),)),
 )
@@ -2171,13 +2213,22 @@ _O7_LOBOPS: wire_schema.Schema = (
 # the body; FILE_OPEN's has its open flag set, a WRITE's is updated), then the
 # short amount if the request asked for one -- a GET_LENGTH's length, OPEN's
 # mode -- and IS_OPEN's answer, 1 or 0, in the null-LOB field it set. CLOSE
-# asks for neither and gets neither. The status follows.
+# asks for neither and gets neither. The status follows. A 9.2 server answers a
+# 9.2 client the same, but IS_OPEN in a single byte (#798, native_9i_lob_ops.pcap).
 _O7_LOBOPS_REPLY: wire_schema.Schema = (
     ('const', bytes([TTI_RPA])),
     ('be2', 'locator_length'),
     ('bytes', 'locator', 'locator_length'),
     ('when', 'short_amount_present', (('n4', 'short_amount'),)),
-    ('when', 'null_lob_present', (('n4', 'flag'),)),
+    (
+        'when',
+        'null_lob_present',
+        (
+            ('only', 'thin', (('n4', 'flag'),)),
+            ('only', 'o8i', (('n4', 'flag'),)),
+            ('only', 'o9i', (('u8', 'flag'),)),
+        ),
+    ),
 )
 # The RPA in front of an 8i call's status (#2284): a ub2 count, four, and that
 # many ub4s, the third the statement's cursor, as its status has it; then
@@ -2215,11 +2266,7 @@ _O8I_STATUS: wire_schema.Schema = (
     ('u8', 'cursor_options'),
     ('u8', 'upi_param'),
     ('u8', 'warnings'),
-    ('n4', 'rowid_object'),
-    ('n2', 'rowid_file'),
-    ('pad', 1),
-    ('n4', 'rowid_block'),
-    ('n2', 'rowid_slot'),
+    *_O8I_ROWID_FIELDS,
     ('n4', 'os_error'),
     ('u8', 'statement'),
     ('u8', 'call'),
@@ -2233,6 +2280,128 @@ _O8I_STATUS: wire_schema.Schema = (
     ('when', 'code', (('chr', 'message'),)),
 )
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+# The experimental 9i OALL8 describe (#792, #798): the OCI describe column
+# (_DCB_COLUMN) with the type name's length a ub2, the one 9i difference, behind
+# the maximum row size and the column count; then the start of the OCI trailer
+# (_DESCRIBE_TRAILER), a lead byte, a ub4 length (7) and the describe time,
+# landing on the first row header or the status. A query's TTI_DCB carries it
+# after a preamble; a REF CURSOR OUT bind carries it behind a lead byte (0x2c),
+# with the cursor id, a ub2 indicator and a ub2 return code after it. Read from
+# every live 9.2 describe the decode tests hold, and native_9i_select.pcap's.
+_DCB_COLUMN_9I: wire_schema.Schema = tuple(
+    ('n2', 'type_name_length') if _F[:2] == ('n4', 'type_name_length') else _F
+    for _F in _DCB_COLUMN
+)
+_O9I_DESCRIBE_BODY: wire_schema.Schema = (
+    ('n4', 'max_row_size'),
+    ('n4', 'count'),
+    ('each', 'columns', 'count', _DCB_COLUMN_9I),
+    *_DESCRIBE_TRAILER[:2],
+)
+_O9I_DESCRIBE: wire_schema.Schema = (
+    ('const', bytes([TTI_DCB])),
+    ('u8', 'preamble_length'),
+    ('bytes', 'preamble', 'preamble_length'),
+    *_O9I_DESCRIBE_BODY,
+)
+_O9I_REFCURSOR_OUT: wire_schema.Schema = (
+    ('u8', 'lead'),
+    *_O9I_DESCRIBE_BODY,
+    ('n4', 'cursor'),
+    ('n2', 'indicator'),
+    ('n2', 'return_code'),
+)
+# The experimental 9i OALL8 bind prompt (#798): 8i's (_O8I_IOV) -- flags, the
+# binds as a ub2 requests and a ub2 iterations (`iterations * 256 + requests`,
+# 300 coming as `2c 00 01 00`, #2311), the iterations this time -- with a byte
+# 8i lacks after the flags (5 for a block) and another, and 38 bytes where 8i
+# has 8 (zero in a block's, not in a bound DML's), then one direction mask per
+# bind. Read from every live 9.2 block reply the decode tests hold.
+_O9I_IOV: wire_schema.Schema = (
+    ('const', bytes([TTI_IOV])),
+    ('u8', 'flags'),
+    ('u8', 'kind'),
+    ('bytes', 'opaque_3', 1),
+    ('n2', 'requests'),
+    ('n2', 'iterations'),
+    ('n4', 'iterations_this_time'),
+    ('bytes', 'opaque_12', 38),
+    ('derive', 'binds', lambda v: v['iterations'] * 256 + v['requests']),
+    ('bytes', 'directions', 'binds'),
+)
+# The experimental 9i OALL8 row header (#798), 50 bytes and two tails: the flags,
+# the columns, the rows the call asked for, the length of the column bit vector
+# that follows (a ub2 at 26 -- telling it from the byte after the header is not
+# possible, three columns all sent being a vector of 0x07, the TTI_RXD token) and
+# of the rowid after it (a ub2 at 42: SELECT ... FOR UPDATE sends the 13-byte
+# rowid of the row it locks). Its other bytes are kept as they come: pointers and
+# fields no capture has explained. Read from every live 9.2 row stream the decode
+# tests hold.
+_O9I_RXH: wire_schema.Schema = (
+    ('const', bytes([TTI_RXH])),
+    ('u8', 'flags'),
+    ('bytes', 'opaque_2', 2),
+    ('n4', 'columns'),
+    ('n4', 'rows_asked'),
+    ('bytes', 'opaque_12', 14),
+    ('n2', 'vector_length'),
+    ('bytes', 'opaque_28', 14),
+    ('n2', 'rowid_length'),
+    ('bytes', 'opaque_44', 6),
+    ('bytes', 'vector', 'vector_length'),
+    ('bytes', 'rowid', 'rowid_length'),
+)
+# The experimental 9i OALL8 status (#798): 8i's (_O8I_STATUS) from its row count
+# through its warnings, behind the call status (a ub4: 2 a DML, 4 a describe-only
+# execute, 5 a bound one's first parse) and a one-byte sequence the 10g+ OER
+# carries there too, the rowid at a 9.2 client's alignment (_O8I_ROWID_FIELDS).
+# Then OCI's own tail: the OS error, statement and
+# call numbers, padding and iterations as on 8i, a fixed 310 (the constant 11g's
+# OCI status carries at 56), the oerrdd's pointer and ub4 length, and the three
+# batch-error arrays' pointers and counts; after them the oerrdd itself (a ub2
+# size and the 13-byte rowid, as a DML leaves it), the arrays' values -- codes as
+# ub2s, row offsets as ub4s, messages each a ub4 length, the text and six bytes
+# -- and, when the code is set, the message. Read whole, nothing left, from every
+# live 9.2 status the decode tests hold and every status in the native captures;
+# a DML's, committed or not, bound or not, is 150 bytes with the oerrdd at 134.
+_O9I_STATUS_HEAD: wire_schema.Schema = (
+    _O8I_STATUS[0],
+    ('n4', 'call_status'),
+    ('u8', 'sequence'),
+    *_O8I_STATUS[1 : _O8I_STATUS.index(('n4', 'os_error'))],
+)
+_O9I_STATUS: wire_schema.Schema = (
+    *_O9I_STATUS_HEAD,
+    ('n4', 'os_error'),
+    ('u8', 'statement'),
+    ('u8', 'call'),
+    ('n2', 'padding'),
+    ('n4', 'iterations'),
+    ('n4', 'constant_310'),
+    ('pad', 12),
+    ('ptr', 'oerrdd_present'),
+    ('n4', 'oerrdd_length'),
+    ('pad', 4),
+    ('ptr', 'batch_codes_present'),
+    ('n4', 'batch_code_count'),
+    ('pad', 4),
+    ('ptr', 'batch_offsets_present'),
+    ('n4', 'batch_offset_count'),
+    ('pad', 4),
+    ('ptr', 'batch_messages_present'),
+    ('n4', 'batch_message_count'),
+    ('pad', 4),
+    ('when', 'oerrdd_length', (('n2', 'oerrdd_size'), ('value', 'oerrdd'))),
+    ('each', 'batch_codes', 'batch_code_count', (('n2', 'code'),)),
+    ('each', 'batch_offsets', 'batch_offset_count', (('n4', 'offset'),)),
+    (
+        'each',
+        'batch_messages',
+        'batch_message_count',
+        (('n4', 'length'), ('chr', 'text'), ('pad', 6)),
+    ),
+    ('when', 'code', (('chr', 'message'),)),
+)
 _OAC_FROM_THIN = wire_schema.compile_decoder(_OAC, _THIN)
 _OAC_FROM_OCI = wire_schema.compile_decoder(_OAC, _OCI)
 _O7_OAC_THIN = wire_schema.compile_encoder(_O7_OAC, _THIN)
@@ -2379,6 +2548,29 @@ _PIGGYBACK_HEAD_THIN = wire_schema.compile_encoder(_PIGGYBACK_HEAD, _THIN)
 _CLOSE_CURSORS_FROM_OCI = wire_schema.compile_decoder(_CLOSE_CURSORS, _OCI)
 _CLOSE_CURSORS_O8I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O8I)
 _O8I_ALL8_O8I = wire_schema.compile_encoder(_O8I_ALL8, _O8I)
+_O8I_ALL8_O9I = wire_schema.compile_encoder(_O8I_ALL8, _O9I)
+_O9I_STATUS_FROM_O9I = wire_schema.compile_decoder(_O9I_STATUS, _O9I)
+_O9I_STATUS_HEAD_FROM_O9I = wire_schema.compile_decoder(_O9I_STATUS_HEAD, _O9I)
+# A 9.2 OUT bind's cell is 8i's row cell, its never-assigned one 8i's, and its
+# LONG cell 8i's, at a 9.2 client's widths (#798).
+_O8I_CELL_FROM_O9I = wire_schema.compile_decoder(_O8I_CELL, _O9I)
+_O8I_OUT_UNASSIGNED_FROM_O9I = wire_schema.compile_decoder(_O8I_OUT_UNASSIGNED, _O9I)
+_O8I_LONG_CELL_FROM_O9I = wire_schema.compile_decoder(_O8I_LONG_CELL, _O9I)
+_O7_LOBOPS_REPLY_FROM_O9I = wire_schema.compile_decoder(_O7_LOBOPS_REPLY, _O9I)
+# The session-state RPA ahead of a 9.2 status is 8i's (_O8I_RPA): five ub4s, the
+# third the statement's cursor, and four bytes -- 27 (#798).
+_O8I_RPA_FROM_O9I = wire_schema.compile_decoder(_O8I_RPA, _O9I)
+_O9I_IOV_FROM_O9I = wire_schema.compile_decoder(_O9I_IOV, _O9I)
+_O9I_RXH_FROM_O9I = wire_schema.compile_decoder(_O9I_RXH, _O9I)
+_O9I_ROWID_CELL_FROM_O9I = wire_schema.compile_decoder(_O9I_ROWID_CELL, _O9I)
+_O9I_LOB_CELL_FROM_O9I = wire_schema.compile_decoder(_O9I_LOB_CELL, _O9I)
+_O9I_UROWID_CELL_FROM_O9I = wire_schema.compile_decoder(_O9I_UROWID_CELL, _O9I)
+# The describe's columns are the OCI dialect's own fields, read with its codec.
+_O9I_DESCRIBE_FROM_OCI = wire_schema.compile_decoder(_O9I_DESCRIBE, _OCI)
+_O9I_REFCURSOR_OUT_FROM_OCI = wire_schema.compile_decoder(_O9I_REFCURSOR_OUT, _OCI)
+_OAC_OCI = wire_schema.compile_encoder(_OAC, _OCI)
+_O7_LOBOPS_O9I = wire_schema.compile_encoder(_O7_LOBOPS, _O9I)
+_CLOSE_CURSORS_O9I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O9I)
 _OBJECT_FRAME_THIN = wire_schema.compile_encoder(_OBJECT_FRAME, _THIN)
 _OBJECT_FRAME_OCI = wire_schema.compile_encoder(_OBJECT_FRAME, _OCI)
 _LOB_CELL_THIN = wire_schema.compile_encoder(_LOB_CELL, _THIN)
@@ -14150,14 +14342,13 @@ def _encode_9i_oall8(
     BatchErrors: bool = False,
 ) -> bytes:
     # The native 9i (9.2) OALL8 (TTI_ALL8, 0x5e) execute — the 64-bit form the
-    # server accepts once the OALL8 opt-in caps are negotiated (#716). It is the
-    # 8i request (`_encode_8i_oall8`) with every pointer / length field widened
-    # from 4 to 8 bytes and a present-pointer indicator (``oci.OCI_INDICATOR``)
-    # where the 8i form writes zeros; the SQL text and bind values are identical.
-    # Reverse-engineered from a live 9.2-client trace and verified byte-for-byte
-    # against it apart from the heap-pointer fields the server ignores. Scope so
-    # far: DML / DDL and transaction control with scalar binds; SELECT, PL/SQL
-    # blocks and RETURNING are separate increments.
+    # server accepts once the OALL8 opt-in caps are negotiated (#716). It is 8i's
+    # execute (_O8I_ALL8) at a 9.2 client's widths (_O9I): 8-byte pointers and
+    # counts, and the defines' pointer and count that 8i does not read (#798).
+    # Proved byte for byte against the execute built here by hand from the native
+    # 9.2 captures before (SELECT, DML, DDL, blocks, a chunked 150-byte text and
+    # an array DML), and those captures against it apart from the heap-pointer
+    # fields the server ignores.
     #
     # `Batch` holds an array DML's further rows (#798): the tail's iteration count
     # counts every row, the bind descriptors describe each column once (a value
@@ -14166,11 +14357,6 @@ def _encode_9i_oall8(
     # (native_9i_array_dml.pcap). `BatchErrors` sets the batch-errors bit
     # (0x80000, option byte 5's 0x08): the server applies the good rows and
     # answers ORA-24381 with the failures.
-    P = oci.OCI_INDICATOR
-
-    def u8(n: int) -> bytes:
-        return n.to_bytes(8, 'little')
-
     Rows = _widen_batch_datetimes([Binds, *Batch]) if Batch else [Binds]
     NumBinds = len(Binds)
     IsBlock = StmtType in (O8I_STMT_BEGIN, O8I_STMT_DECLARE)
@@ -14199,34 +14385,27 @@ def _encode_9i_oall8(
     else:
         Byte4 = 0x80
     Byte5 = 0x04 if IsBlock else (0x08 if BatchErrors else 0x00)
-    Head = bytes([TTI_FUN, TTI_ALL8, Seq & 0xFF, Option, Byte4, Byte5, 0, 0, 0, 0, 0])
-    Mid = (
-        P
-        + u8(len(Sql))
-        + P
-        + u8(12)
-        + bytes(8)
-        + P
-        + bytes(4)
-        + (1).to_bytes(4, 'little')
-        + u8(0)
-        + (P if NumBinds else bytes(8))
-        + u8(NumBinds)
-        + bytes(8) * 4
-        + P
-        + P
-        + u8(0)
-    )
-    # Tail[4:8] is the iteration count, a ub4: 0 for a SELECT (the fetch rides the
-    # FETCH option), else the rows the execute runs -- 1, or an array DML's
-    # count. Byte-verified against the native 9.2 SELECT (native_9i_select.pcap),
-    # DML (#716) and array DML (native_9i_array_dml.pcap, 3) captures.
-    Tail = (
-        bytes([1, 0, 0, 0])
-        + (0 if IsQuery else len(Rows)).to_bytes(4, 'little')
-        + bytes(20)
-        + bytes([StmtType])
-        + bytes(19)
+    # al8i4 [1] is the iteration count: 0 for a SELECT (the fetch rides the FETCH
+    # option), else the rows the execute runs -- 1, or an array DML's count.
+    # Byte-verified against the native 9.2 SELECT (native_9i_select.pcap), DML
+    # (#716) and array DML (native_9i_array_dml.pcap, 3) captures.
+    Values = dict(_O8I_ALL8_FIXED)
+    Values.update(
+        seq=Seq & 0xFF,
+        options=Option | Byte4 << 8 | Byte5 << 16,
+        cursor=0,
+        sql_present=True,
+        sql_length=len(Sql),
+        sql=Sql,
+        prefetch_rows=1,
+        max_long=0,
+        binds_present=bool(NumBinds),
+        bind_count=NumBinds,
+        defines_present=True,
+        define_count=0,
+        al8i4_0=1,
+        al8i4_1=0 if IsQuery else len(Rows),
+        al8i4_7=StmtType,
     )
     # The SQL text is a pre-10g chunked string (encode_chr at field version 2): a
     # plain length byte up to 64 bytes, else 0xFE, 64-byte chunks and a zero --
@@ -14234,17 +14413,17 @@ def _encode_9i_oall8(
     # single length byte, as written before, failed outright past 255 bytes.
     Token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_9_2)
     try:
-        Message = Head + Mid + encode_chr(Sql) + Tail
+        Message = _O8I_ALL8_O9I(Values)
         if NumBinds:
             Oacs = [_encode_9i_bind_oac(V) for V in _oac_rep_row(Rows)]
             Message += b''.join(Oacs)
             # The 9i LONG-class rule holds here too (#723): a statement's bind
             # declared wider than 4000 bytes has its value read after the row's
             # others -- a declared VARCHAR Var landed in the next column. The
-            # declared size is the descriptor's ub8 at +5. A PL/SQL block keeps
-            # every value in place, as on the compact path.
+            # declared size is the descriptor's max_length, a ub4 at +5. A PL/SQL
+            # block keeps every value in place, as on the compact path.
             Long = [
-                not IsBlock and int.from_bytes(Oac[5:13], 'little') > 4000
+                not IsBlock and int.from_bytes(Oac[5:9], 'little') > 4000
                 for Oac in Oacs
             ]
             for Row in Rows:
@@ -14259,9 +14438,10 @@ def _encode_9i_oall8(
 
 
 def _encode_9i_bind_oac(Value: object) -> bytes:
-    # The 64-bit OALL8 bind descriptor: ``01 <TNS type> <flag> 00 00``, an 8-byte
-    # little-endian max size, then 28 reserved bytes (41 bytes); the flag is 0x05
-    # for an OUT-capable Var, 0x01 otherwise. The type and size must declare the
+    # The 9i OALL8 bind descriptor, 41 bytes: OCI's (_OAC), as a native 9.2
+    # client writes it (#798) -- a lead byte, the TNS type, the flag (0x05 for an
+    # OUT-capable Var, 0x01 otherwise), the max size (a ub4, then a zero max
+    # array), the charset and form, the plain column's padding. The type and size must declare the
     # form the value goes in (_encode_9i_bind_value), as the thin 9i path's do
     # (#797): a sub-second datetime is a TIMESTAMP (11 bytes) and a tz-aware one a
     # TIMESTAMP WITH TIME ZONE (13) -- declared a DATE (7), the server refused it
@@ -14305,16 +14485,31 @@ def _encode_9i_bind_oac(Value: object) -> bytes:
         DType, Size = TNS_TYPE_INTERVALYM, 5
     else:
         DType, Size = TNS_TYPE_VARCHAR, max(len(str(Value).encode('utf-8')), 1)
-    Oac = bytearray([1, DType, Flag, 0, 0]) + Size.to_bytes(8, 'little') + bytes(28)
-    if _is_national_var(Value):
-        # A national bind declares AL16UTF16 and charset form 2 in the
-        # descriptor's charset (ub2 at 29) and form (31) -- where a native
-        # client's VARCHAR bind carries 31 / 1 (native_9i_array_dml.pcap) -- and
-        # its value rides as UTF-16BE (#798; through the database charset it lost
-        # every character Latin-1 lacks, as on the compact path, #174).
-        Oac[29:31] = AL16UTF16_CHARSET.to_bytes(2, 'little')
-        Oac[31] = 2
-    return bytes(Oac)
+    # A national bind declares AL16UTF16 and charset form 2 -- where a native
+    # client's VARCHAR bind carries 31 / 1 (native_9i_array_dml.pcap) -- and its
+    # value rides as UTF-16BE (#798; through the database charset it lost every
+    # character Latin-1 lacks, as on the compact path, #174).
+    National = _is_national_var(Value)
+    return _OAC_OCI(
+        {
+            'lead': 1,
+            'data_type': DType,
+            'oci_plain': DType != TNS_TYPE_ADT,
+            'flags': Flag,
+            'precision': 0,
+            'scale': 0,
+            'max_length': Size,
+            'max_array': 0,
+            'oci_12c': False,
+            'cont_flags': 0,
+            'toid_length': 0,
+            'version': 0,
+            'charset': AL16UTF16_CHARSET if National else 0,
+            'csfrm': 2 if National else 0,
+            'max_chars': 0,
+            'oaccolid': 0,
+        }
+    )
 
 
 def _is_national_var(Value: object) -> bool:
@@ -14396,28 +14591,36 @@ def encode_9i_oall8_query(Seq: int, Sql: bytes, Binds: list | None = None) -> by
 # (ub4le @67) and the rows-this-call count (ub4le @151). The 8-byte pointer slots
 # carry the native client's heap addresses, which the server ignores, so the
 # skeleton holds the non-null ``oci.OCI_INDICATOR`` sentinel instead.
-_OALL8_FETCH_SKEL = bytes.fromhex(
-    '035e00400000000000000000000000000000000000000000000000fffffffffffffffe0c000000000000000000000000000000fffffffffffffffe00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000fffffffffffffffefffffffffffffffe0000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000'
-)
-
-
 def encode_9i_oall8_fetch(
     Seq: int, Cursor: int, Count: int, LongSize: int = 0x7FFFFFFF
 ) -> bytes:
-    # Pull up to `Count` more rows from the open cursor (#792). `LongSize` caps a
-    # LONG / LONG RAW column's bytes per row (the server does not continue a LONG
-    # across fetches), so the caller passes a large value to read the whole one
-    # and forces Count=1, as 8i does (#377).
-    assert len(_OALL8_FETCH_SKEL) == 195
-    Frame = bytearray(_OALL8_FETCH_SKEL)
-    Frame[2] = Seq & 0xFF
-    # Byte 5 is 0x04 on a single-row fetch (the LONG case, which forces Count=1)
-    # and 0x00 otherwise -- byte-verified against both fetches in the capture.
-    Frame[5] = 0x04 if Count == 1 else 0x00
-    Frame[7:11] = (Cursor & 0xFFFFFFFF).to_bytes(4, 'little')
-    Frame[67:71] = min(LongSize, 0xFFFFFFFF).to_bytes(4, 'little')
-    Frame[151:155] = (Count & 0xFFFFFFFF).to_bytes(4, 'little')
-    return bytes(Frame)
+    # Pull up to `Count` more rows from the open cursor (#792): 8i's fetch, the
+    # execute's schema (_O8I_ALL8) with the fetch option and no SQL, at a 9.2
+    # client's widths (#798) -- the cursor, the LONG cap in max_long, al8i4 [1]
+    # the rows. `LongSize` caps a LONG / LONG RAW column's bytes per row (the
+    # server does not continue a LONG across fetches), so the caller passes a
+    # large value to read the whole one and forces Count=1, as 8i does (#377).
+    # Option byte 5 is 0x04 on a single-row fetch (the LONG case) and 0x00
+    # otherwise -- byte-verified against both fetches of native_9i_fetch_
+    # arraysize2.pcap, as the 195-byte skeleton this replaces was.
+    Values = dict(_O8I_ALL8_FIXED)
+    Values.update(
+        seq=Seq & 0xFF,
+        options=TNS_EXEC_OPTION_FETCH | ((0x04 << 16) if Count == 1 else 0),
+        cursor=Cursor,
+        sql_present=False,
+        sql_length=0,
+        prefetch_rows=0,
+        max_long=min(LongSize, 0xFFFFFFFF),
+        binds_present=False,
+        bind_count=0,
+        defines_present=True,
+        define_count=0,
+        al8i4_0=0,
+        al8i4_1=Count,
+        al8i4_7=O8I_STMT_SELECT,
+    )
+    return _O8I_ALL8_O9I(Values)
 
 
 def encode_9i_oall8_lobop(
@@ -14428,82 +14631,88 @@ def encode_9i_oall8_lobop(
     Amount: int = 0,
     Data: bytes | None = None,
 ) -> bytes:
-    # A TTI_LOBOPS (0x60) call on a native 9i OALL8 session (#795/#796), in the
-    # 64-bit form -- the 8i (32-bit) and thin-9i LOBOPS envelopes both draw no
-    # reply here. A 91-byte head, then the locator as fetched (a ub2 length and
-    # the body: 86 bytes for a CLOB / BLOB, more for a BFILE) and, when the
-    # operation carries one, the ub4 short amount. In the head the source pointer
-    # sits at 3, the locator's length at 11 (8 bytes), the 1-based offset at 31,
-    # the amount pointer at 51, the null-LOB pointer at 59 and the operation at 67
-    # (8 bytes); the rest is zero. The pointers are the native client's heap
-    # addresses, which the server ignores, so the non-null oci.OCI_INDICATOR
-    # stands in. Byte-reproduced from a native 9.2 sqlplus CLOB READ
-    # (native_9i_clob_read.pcap); FILE_OPEN, GET_LENGTH and FILE_CLOSE use the same
-    # head and are live-verified on 9.2 (a BFILE read end to end). The LOB object's
+    # A TTI_LOBOPS (0x60) call on a native 9i OALL8 session (#795/#796): 8i's
+    # _O7_LOBOPS at a 9.2 client's widths (#798) -- the 8i (32-bit) and thin-9i
+    # envelopes both draw no reply here. Its head is 91 bytes: the source
+    # pointer, the locator's length (a ub8), the 1-based offset, the amount and
+    # null-LOB pointers, the operation (a ub8) and the SCN array's; then the
+    # locator as fetched (a ub2 length and the body: 86 bytes for a CLOB / BLOB,
+    # more for a BFILE) and, when the operation carries one, the ub4 short
+    # amount. The pointers are the native client's heap addresses, which the
+    # server ignores, so the non-null oci.OCI_INDICATOR stands in. Matches a
+    # native 9.2 sqlplus CLOB READ (native_9i_clob_read.pcap) byte for byte, as
+    # the hand-built head it replaces did; FILE_OPEN, GET_LENGTH and FILE_CLOSE
+    # are live-verified on 9.2 (a BFILE read end to end). The LOB object's
     # calls (#798) match a native OCI client's (native_9i_lob_ops.pcap): the
     # amount is GET_LENGTH's / GET_CHUNK_SIZE's 0, OPEN's mode, TRIM's new length,
     # a WRITE's count; IS_OPEN and CLOSE carry none. A WRITE's `Data` follows as
     # TTI_LOB content, framed as the compact path frames it (`0e 03 58 59 5a`).
-    Flags = _O7_LOBOP_FLAGS.get(Operation, {})
-    AmountPresent = Flags.get('short_amount_present', True)
-    Frame = bytearray(91)
-    Frame[0:3] = bytes([TTI_FUN, TTI_LOBOPS, Seq & 0xFF])
-    Frame[3:11] = oci.OCI_INDICATOR
-    Frame[11:19] = len(Locator).to_bytes(8, 'little')
-    Frame[31:35] = Offset.to_bytes(4, 'little')
-    if AmountPresent:
-        Frame[51:59] = oci.OCI_INDICATOR
-    if Flags.get('null_lob_present', False):
-        Frame[59:67] = oci.OCI_INDICATOR
-    Frame[67:75] = Operation.to_bytes(8, 'little')
-    Tail = (Amount & 0xFFFFFFFF).to_bytes(4, 'little') if AmountPresent else b''
+    Values = {
+        'seq': Seq & 0xFF,
+        'token_number': None,
+        'source_present': True,
+        'source_length': len(Locator),
+        'dest_present': False,
+        'dest_length': 0,
+        'short_source_offset': Offset,
+        'short_dest_offset': 0,
+        'charset_present': False,
+        'short_amount_present': True,
+        'null_lob_present': False,
+        'operation': Operation,
+        'scn_present': False,
+        'scn_length': 0,
+        'locator': Locator,
+        'short_amount': Amount & 0xFFFFFFFF,
+    }
+    Values.update(_O7_LOBOP_FLAGS.get(Operation, {}))
+    Out = _O7_LOBOPS_O9I(Values)
     if Data is not None:
-        Tail += bytes([TTI_LOB]) + _o7_lob_value(Data)
-    return bytes(Frame) + Locator + Tail
+        Out += bytes([TTI_LOB]) + _o7_lob_value(Data)
+    return Out
 
 
 def decode_9i_oall8_lob_value(Data: bytes, Operation: int) -> tuple[int | None, bytes]:
-    # A 9i OALL8 LOB call's reply (#798): a TTI_RPA carrying the locator as the
-    # server now sees it (a ub2 big-endian length and the body: a WRITE updates
-    # it), then the call's value -- a ub4 (GET_LENGTH's and GET_CHUNK_SIZE's size,
-    # OPEN's mode, TRIM's new length, the amount a WRITE wrote), IS_OPEN's single
-    # byte, CLOSE's nothing -- then the status. Read from a native 9.2 OCI client
+    # A 9i OALL8 LOB call's reply (#798), 8i's (_O7_LOBOPS_REPLY) at a 9.2
+    # client's widths: an RPA with the locator as the server now sees it (a ub2
+    # big-endian length and the body, without the ub2 a fetched locator opens
+    # with -- the LOB object puts it back, LOB._refresh; a WRITE updates it), then
+    # the call's value -- a ub4 (GET_LENGTH's and GET_CHUNK_SIZE's size, OPEN's
+    # mode, TRIM's new length, the amount a WRITE wrote), IS_OPEN's single byte,
+    # CLOSE's nothing -- then the status. Read from a native 9.2 OCI client
     # (native_9i_lob_ops.pcap). Returns (value, locator); a reply that is a bare
     # status (an error) gives (None, b''), for the caller to raise.
-    #
-    # The locator comes back as its body, without the ub2 length a fetched one
-    # opens with (`00 54`, then 84 bytes for a CLOB / BLOB): the reply's `00 54`
-    # is its length here. The LOB object puts the prefix back (LOB._refresh, the
-    # 10g+ reply's form too).
     if Data[:1] != bytes([TTI_RPA]):
         return (None, b'')
-    Length = int.from_bytes(Data[1:3], 'big')
-    Locator = bytes(Data[3 : 3 + Length])
-    Rest = Data[3 + Length :]
-    if Operation in (TNS_LOB_OP_CLOSE, TNS_LOB_OP_FILE_CLOSE):
-        return (None, Locator)
+    Flags = {'short_amount_present': True, 'null_lob_present': False}
+    Flags.update(_O7_LOBOP_FLAGS.get(Operation, {}))
+    (Reply, _) = _O7_LOBOPS_REPLY_FROM_O9I(Data, Flags)
     if Operation == TNS_LOB_OP_IS_OPEN:
-        return (Rest[0], Locator)
-    return (int.from_bytes(Rest[:4], 'little'), Locator)
+        return (Reply['flag'], bytes(Reply['locator']))
+    return (Reply.get('short_amount'), bytes(Reply['locator']))
 
 
 def encode_9i_oall8_close_cursors(Seq: int, Cursors: list[int]) -> bytes:
     # The close of a finished cursor on a native 9i OALL8 session (#798),
     # piggybacked ahead of the next call as a native 9.2 OCI client sends it
-    # (native_9i_array_dml.pcap): `11 69`, a seq, the array's pointer, the count
-    # as a ub8 and the cursor id as a ub4. Without it every statement's cursor
-    # stayed open and a session failed at open_cursors (ORA-01000 under ORA-00604
-    # at the 299th statement). The native client only ever closes one at a time,
-    # so each cursor gets a piggyback of its own, each taking a seq (Seq on).
-    Out = b''
-    for Offset, Cursor in enumerate(Cursors):
-        Out += (
-            bytes([TTI_PFN, TTI_OCCA, (Seq + Offset) & 0xFF])
-            + oci.OCI_INDICATOR
-            + (1).to_bytes(8, 'little')
-            + (Cursor & 0xFFFFFFFF).to_bytes(4, 'little')
+    # (native_9i_array_dml.pcap): the shared CLOSE_CURSORS at a 9.2 client's
+    # widths -- `11 69`, a seq, the array's pointer, the count as a ub8 and the
+    # cursor id as a ub4. Without it every statement's cursor stayed open and a
+    # session failed at open_cursors (ORA-01000 under ORA-00604 at the 299th
+    # statement). The native client only ever closes one at a time, so each
+    # cursor gets a piggyback of its own, each taking a seq (Seq on).
+    return b''.join(
+        _CLOSE_CURSORS_O9I(
+            {
+                'seq': (Seq + Offset) & 0xFF,
+                'token_number': None,
+                'cursors_present': True,
+                'count': 1,
+                'cursors': [{'cursor': Cursor & 0xFFFFFFFF}],
+            }
         )
-    return Out
+        for (Offset, Cursor) in enumerate(Cursors)
+    )
 
 
 def encode_9i_oall8_lob_read(
@@ -14517,81 +14726,50 @@ def encode_9i_oall8_lob_read(
 
 
 # --- 9i native OALL8 SELECT reply decode (#792) ---
-# The 9i OALL8 (0x5e) SELECT reply is OCI FIXED-WIDTH framing -- not the thin
-# variable-width form decode_packet reads, nor 8i's _O8I row stream. RE'd and
-# live-verified against native_9i_select.pcap / native_9i_fetch_arraysize2.pcap:
-#   TTI_DCB   describe: the OCI _DCB_COLUMN at field version 2 (type_name_length
-#             an n2, the single 9i difference), then a short current-date trailer;
-#   TTI_RXH   a fixed 50-byte header, then an optional column bit vector;
-#   TTI_RXD   rows of value-only cells (a ub1 length + bytes, 0xFE-chunked past
-#             252, 0xFF for NULL -- no per-cell indicator/return-code trailer);
-#   TTI_BVC   a bit vector between rows (token + ub2 count + ceil(ncols/8) bytes),
-#             a clear bit meaning the column repeats the previous row (no cell);
-#   TTI_OER   the status (the ORA code a ub4 at offset 10; 0 = more rows,
-#             1403 = end of fetch), after any TTI_RPA session-state piggyback.
-# The describe-reply RXH is the degenerate zero-vector (50-byte) case.
-_DCB_COLUMN_9I_FROM_OCI = wire_schema.compile_decoder(
-    tuple(
-        ('n2', 'type_name_length') if _F[:2] == ('n4', 'type_name_length') else _F
-        for _F in _DCB_COLUMN
-    ),
-    _OCI,
-)
-# What may follow the RXH's fixed 50 bytes; anything else there is the optional
-# trailing column bit vector (ceil(ncols/8) bytes).
-_O9I_OALL8_ROW_TOKENS = frozenset(
-    {TTI_RXD, TTI_RXH, TTI_BVC, TTI_OER, TTI_RPA, TTI_DCB, TTI_STA}
-)
-# The fixed 50-byte OCI row header (_OCI_RXH length).
-_O9I_OALL8_RXH_LEN = 50
+# The 9i OALL8 (0x5e) SELECT reply is OCI fixed-width framing -- not the thin
+# variable-width form decode_packet reads -- in schemas shared with 8i where 8i
+# has them (#798): the describe (_O9I_DESCRIBE), each row batch's header
+# (_O9I_RXH), rows of value-only cells (a ub1 length + bytes, 0xFE-chunked past
+# 252, 0xFF for NULL; 8i's LOB / UROWID / ROWID / LONG cells for those columns),
+# a bit vector between rows (TTI_BVC: token + ub2 count + ceil(ncols/8) bytes, a
+# clear bit meaning the column repeats the previous row), and the status
+# (_O9I_STATUS) after the session-state RPA (_O8I_RPA). RE'd and live-verified
+# against native_9i_select.pcap / native_9i_fetch_arraysize2.pcap.
+_DESCRIBE_GIVEN = {'oci_12c': False, 'has_uds': False}
+
+
+def _o9i_oall8_columns(Columns: list) -> list[dict]:
+    # The describe's columns, shaped like decode_8i_dcb_describe's, so the shared
+    # row and cursor machinery is unchanged.
+    return [
+        {
+            'data_type': Col['data_type'],
+            'data_length': Col['buffer_size'],
+            'data_scale': Col['scale'],
+            'precision': Col['precision'],
+            'max_size': Col['max_size'],
+            'charset': Col['charset'],
+            'csfrm': Col['csfrm'],
+            'null_ok': 0 if Col['null_ok'] == 0 else 1,
+            'domain_schema': None,
+            'domain_name': None,
+            'column_name': bytes(Col.get('name') or b'').decode('latin-1'),
+        }
+        for Col in Columns
+    ]
 
 
 def decode_9i_oall8_describe(Data: bytes) -> tuple[list[dict], bytes]:
-    # The 9i OALL8 TTI_DCB describe and the bytes after it (the row stream / the
-    # status). Column dicts shaped like decode_8i_dcb_describe's, so the shared
-    # row and cursor machinery is unchanged. A describe that runs off the end of
-    # a packet raises Truncated for the reader to read on, as 8i's does (#1226).
+    # The 9i OALL8 TTI_DCB describe (_O9I_DESCRIBE) and the bytes after it (the
+    # row stream / the status). A describe that runs off the end of a packet
+    # raises Truncated for the reader to read on, as 8i's does (#1226).
     if Data[:1] != bytes([TTI_DCB]):
         raise DataError('not a 9i OALL8 describe')
-    # skip the chunked describe preamble (fv<11.2)
-    return _o9i_oall8_describe_body(Data[2 + Data[1] :])
-
-
-def _o9i_oall8_describe_body(Body: bytes) -> tuple[list[dict], bytes]:
-    # The describe after its preamble -- the columns and the current-date trailer --
-    # as both a query's TTI_DCB and a REF CURSOR OUT bind carry it.
     try:
-        Count = int.from_bytes(Body[4:8], 'little')  # [0:4] is max_row_size
-        Rest = Body[8:]
-        Columns: list[dict] = []
-        for _ in range(Count):
-            (Col, Rest) = _DCB_COLUMN_9I_FROM_OCI(
-                Rest, {'oci_12c': False, 'has_uds': False}
-            )
-            Columns.append(
-                {
-                    'data_type': Col['data_type'],
-                    'data_length': Col['buffer_size'],
-                    'data_scale': Col['scale'],
-                    'precision': Col['precision'],
-                    'max_size': Col['max_size'],
-                    'charset': Col['charset'],
-                    'csfrm': Col['csfrm'],
-                    'null_ok': 0 if Col['null_ok'] == 0 else 1,
-                    'domain_schema': None,
-                    'domain_name': None,
-                    'column_name': bytes(Col.get('name') or b'').decode('latin-1'),
-                }
-            )
-        # The current-date trailer: a lead byte, a fixed 4-byte length (=7), then
-        # the date as a ub1-length value (= 13 bytes), landing exactly on the first
-        # row header / the status. Verified live on 9.2 (a plain fixed LE word, not
-        # the variable-width decode_ub4).
-        Rest = Rest[1 + 4 :]  # lead byte + the fixed 4-byte length word
-        Rest = Rest[1 + Rest[0] :]  # the date value (ub1 length + bytes)
+        (Describe, Rest) = _O9I_DESCRIBE_FROM_OCI(Data, _DESCRIBE_GIVEN)
     except IndexError as Exc:
         raise Truncated(f'9i OALL8 describe: {Exc}') from Exc
-    return (Columns, Rest)
+    return (_o9i_oall8_columns(Describe['columns']), Rest)
 
 
 def _o9i_oall8_cell(Data: bytes) -> tuple[bytes | None, bytes]:
@@ -14608,54 +14786,55 @@ _O9I_OALL8_LOB_TYPES = frozenset((TNS_TYPE_CLOB, TNS_TYPE_BLOB, TNS_TYPE_BFILE))
 
 
 def _o9i_oall8_lob_cell(Type: int, Data: bytes) -> tuple[object, bytes]:
-    # A LOB column's cell in a 9i OALL8 row (#795): a ub4 locator size, then --
-    # when it is not zero -- the locator again as a ub1-length value (a ub2 length
-    # and the body, 86 bytes for a CLOB / BLOB); no trailing indicator. A NULL LOB
-    # is the zero size ALONE (reading a length byte after it took the next row's
-    # token as one and desynced the stream); EMPTY_CLOB / EMPTY_BLOB carry a real
-    # locator that reads back empty. Returns a LOB carrying the locator, for the
-    # dialect to read (resolve_lobs) or hand back.
+    # A LOB column's cell in a 9i OALL8 row (#795): 8i's without its trailer
+    # (_O9I_LOB_CELL) -- a ub4 locator size, then, when it is not zero, the
+    # locator as a ub1-length value (a ub2 length and the body, 86 bytes for a
+    # CLOB / BLOB). A NULL LOB is the zero size alone (reading a length byte after
+    # it took the next row's token as one and desynced the stream); EMPTY_CLOB /
+    # EMPTY_BLOB carry a real locator that reads back empty. Returns a LOB carrying
+    # the locator, for the dialect to read (resolve_lobs) or hand back.
     from seerdb.common.lob import LOB
 
-    Size = int.from_bytes(Data[:4], 'little')
-    Data = Data[4:]
-    if not Size:
-        return (None, Data)
-    Length = Data[0]
-    return (LOB(Type, bytes(Data[1 : 1 + Length])), Data[1 + Length :])
+    (Cell, Rest) = _O9I_LOB_CELL_FROM_O9I(Data)
+    if not Cell['length']:
+        return (None, Rest)
+    return (LOB(Type, bytes(Cell['locator'])), Rest)
 
 
-def _o9i_oall8_rowid(Raw: bytes) -> str:
-    # A 9i OALL8 ROWID cell's value: the OCI rowid structure, little-endian with
-    # each field padded to four bytes -- data object (ub4), relative file (ub2),
-    # block (ub4), slot (ub2) -- rendered as the extended rowid text. Read live
-    # on 9.2 against ROWIDTOCHAR and DBMS_ROWID's object / file / block / row.
+def _o9i_oall8_rowid_cell(Data: bytes) -> tuple[str, bytes]:
+    # A 9i OALL8 ROWID cell: 8i's without its trailer (_O9I_ROWID_CELL), a size
+    # and the rowid at a 9.2 client's alignment (_O8I_ROWID_FIELDS: data object,
+    # file, block, slot) -- 16 bytes, read live on 9.2 against ROWIDTOCHAR and
+    # DBMS_ROWID's object / file / block / row -- rendered as the extended rowid
+    # text. A NULL one is the 0xFF every NULL cell is, which the caller reads
+    # first.
     from seerdb.common.types import rowid_to_string
 
-    return rowid_to_string(
-        int.from_bytes(Raw[0:4], 'little'),
-        int.from_bytes(Raw[4:6], 'little'),
-        int.from_bytes(Raw[8:12], 'little'),
-        int.from_bytes(Raw[12:14], 'little'),
+    (Cell, Rest) = _O9I_ROWID_CELL_FROM_O9I(Data)
+    return (
+        rowid_to_string(
+            Cell['rowid_object'],
+            Cell['rowid_file'],
+            Cell['rowid_block'],
+            Cell['rowid_slot'],
+        ),
+        Rest,
     )
 
 
 def _o9i_oall8_urowid_cell(Data: bytes) -> tuple[str | None, bytes]:
-    # A 9i OALL8 UROWID cell: a ub2 size (little-endian), then -- when it is not
-    # zero -- the rowid bytes (a type tag, then the body) as an ordinary value, a
-    # ub1 length or 0xFE chunks past 252 bytes. The shape of a LOB cell, with a
-    # ub2 size; a NULL is the zero size alone. Read live on 9.2 for a physical
-    # rowid (`0d00 0d 01...`) and an index-organized table's logical ones
-    # (`6c00 6c 02...`, and a 409-byte one, `9901 fe ff... 9a... 00`).
+    # A 9i OALL8 UROWID cell: 8i's without its trailer (_O9I_UROWID_CELL) -- a
+    # ub2 size and, when it is not zero, the rowid bytes (a type tag, then the
+    # body) as an ordinary value, a ub1 length or 0xFE chunks past 252 bytes; a
+    # NULL is the zero size alone. Read live on 9.2 for a physical rowid
+    # (`0d00 0d 01...`) and an index-organized table's logical ones (`6c00 6c
+    # 02...`, and a 409-byte one, `9901 fe ff... 9a... 00`).
     from seerdb.common.types import urowid_to_string
 
-    Size = int.from_bytes(Data[:2], 'little')
-    if len(Data) < 3:
-        raise IndexError('urowid cell')
-    if not Size:
-        return (None, Data[2:])
-    (Raw, Rest) = _OCI.read_value(Data[2:])
-    return (urowid_to_string(bytes(Raw or b'')), Rest)
+    (Cell, Rest) = _O9I_UROWID_CELL_FROM_O9I(Data)
+    if not Cell['length']:
+        return (None, Rest)
+    return (urowid_to_string(bytes(Cell['urowid'])), Rest)
 
 
 def decode_9i_oall8_exec_response(
@@ -14677,23 +14856,11 @@ def decode_9i_oall8_exec_response(
         while Rest:
             Token = Rest[0]
             if Token == TTI_RXH:
-                # The header names the length of the column bit vector that may
-                # follow it, a ub2 at offset 26 (0: none). Telling it from the
-                # byte after the header is not possible: three columns all sent
-                # is a vector of 0x07, the TTI_RXD token.
-                if len(Rest) < _O9I_OALL8_RXH_LEN:
-                    raise IndexError('row header')
-                VecLen = int.from_bytes(Rest[26:28], 'little')
-                # A ub2 at 42 is the length of the row's rowid, which follows the
-                # vector: a SELECT ... FOR UPDATE sends the 13-byte physical rowid
-                # of the row it locks (read live on 9.2); skipped, as the column
-                # values carry the row.
-                RowidLen = int.from_bytes(Rest[42:44], 'little')
-                Rest = Rest[_O9I_OALL8_RXH_LEN:]
-                if len(Rest) < VecLen + RowidLen:
-                    raise IndexError('row header vector / rowid')
-                Vector = bytes(Rest[:VecLen]) if VecLen else None
-                Rest = Rest[VecLen + RowidLen :]
+                # The row header (_O9I_RXH): its column bit vector, when it names
+                # one, says which columns the first row sends; a FOR UPDATE's
+                # rowid behind it is skipped, the columns carrying the row.
+                (Header, Rest) = _O9I_RXH_FROM_O9I(Rest)
+                Vector = bytes(Header['vector']) if Header['vector'] else None
             elif Token == TTI_BVC:
                 # A bit vector for the NEXT row: token + ub2 count + the vector.
                 Rest = Rest[1:]
@@ -14719,19 +14886,17 @@ def decode_9i_oall8_exec_response(
                         Row.append(Lob)
                         continue
                     if Col.get('data_type') in _LONG_DATA_TYPES:
-                        # A LONG / LONG RAW cell is the value -- a ub1 length or
-                        # 0xFE chunks -- then a ub2 indicator (-1 for NULL) and a
-                        # ub2 return code, the form of an OUT bind's cell: `fe 02
-                        # 6869 00 0000 0000` for 'hi', `00 ffff 7d05` for NULL,
-                        # read live on 9.2. Unread, the four bytes shifted every
-                        # column after the LONG (#798).
-                        (LongValue, Rest) = _OCI.read_value(Rest)
-                        Indicator = int.from_bytes(Rest[:2], 'little', signed=True)
-                        Rest = Rest[4:]
+                        # A LONG / LONG RAW cell is 8i's (_O8I_LONG_CELL): the
+                        # value -- 0xFE chunks, or a bare zero for NULL -- then a
+                        # ub2 indicator and a ub2 return code: `fe 02 6869 00 0000
+                        # 0000` for 'hi', `00 ffff 7d05` for NULL, read live on
+                        # 9.2. Unread, the four bytes shifted every column after
+                        # the LONG (#798).
+                        (Cell, Rest) = _O8I_LONG_CELL_FROM_O9I(Rest)
                         Row.append(
                             None
-                            if Indicator == -1 or LongValue is None
-                            else decode_value(Col, LongValue)
+                            if Cell['value'] is None
+                            else decode_value(Col, bytes(Cell['value']))
                         )
                         continue
                     if (
@@ -14749,13 +14914,14 @@ def decode_9i_oall8_exec_response(
                         (Text, Rest) = _o9i_oall8_urowid_cell(Rest)
                         Row.append(Text)
                         continue
+                    if Col.get('data_type') in (TNS_TYPE_RID, TNS_TYPE_ROWID) and (
+                        Rest[0] != 0xFF
+                    ):
+                        (Text, Rest) = _o9i_oall8_rowid_cell(Rest)
+                        Row.append(Text)
+                        continue
                     (Raw, Rest) = _o9i_oall8_cell(Rest)
-                    if Raw is None:
-                        Row.append(None)
-                    elif Col.get('data_type') in (TNS_TYPE_RID, TNS_TYPE_ROWID):
-                        Row.append(_o9i_oall8_rowid(Raw))
-                    else:
-                        Row.append(decode_value(Col, Raw))
+                    Row.append(None if Raw is None else decode_value(Col, Raw))
                 Rows.append(Row)
                 Last = Row
                 Vector = None
@@ -14766,27 +14932,22 @@ def decode_9i_oall8_exec_response(
     return (Rows, Rest, Last)
 
 
-# The session-state piggyback (TTI_RPA, 0x08) that precedes a 9i OALL8 status is a
-# fixed 27 bytes -- measured constant across SELECT terminals, DML/DDL/txn replies
-# and bound block / OUT-bind replies on 9.2. The OER follows it.
-_O9I_OALL8_RPA_LEN = 27
-
-
 def _o9i_oall8_oer(Terminal: bytes) -> bytes:
     # The status OER (0x04) in a 9i OALL8 reply's terminal, past a leading TTI_RPA
-    # (0x08) session-state piggyback. The RPA is a fixed 27 bytes, so skip it by its
-    # length and take the OER straight after -- a first-parse RPA carries value bytes
-    # that collide with the OER token, so scanning for a 0x04 could land inside it.
-    # `Terminal` is the bytes from the RPA (a SELECT reply's post-row tail) or from
-    # the OER itself; a caller with a leading TTI_IOV / TTI_RXD strips those first.
+    # (0x08) session-state piggyback, which is 8i's (_O8I_RPA, 27 bytes): read
+    # through, so the OER is taken straight after it -- a first-parse RPA carries
+    # value bytes that collide with the OER token, so scanning for a 0x04 could
+    # land inside it. `Terminal` is the bytes from the RPA (a SELECT reply's
+    # post-row tail) or from the OER itself; a caller with a leading TTI_IOV /
+    # TTI_RXD strips those first.
     Rest = Terminal
-    if (
-        Rest[:1] == bytes([TTI_RPA])
-        and len(Rest) >= _O9I_OALL8_RPA_LEN + 5
-        and Rest[_O9I_OALL8_RPA_LEN] == TTI_OER
-        and not any(Rest[_O9I_OALL8_RPA_LEN + 2 : _O9I_OALL8_RPA_LEN + 5])
-    ):
-        return Rest[_O9I_OALL8_RPA_LEN:]
+    if Rest[:1] == bytes([TTI_RPA]):
+        try:
+            (_, After) = _O8I_RPA_FROM_O9I(Rest)
+        except (IndexError, DataError):
+            After = b''
+        if After[:1] == bytes([TTI_OER]) and len(After) >= 5 and not any(After[2:5]):
+            return After
     # No (or an unexpected) RPA: scan for the first 0x04 that begins a real OER head
     # (its leading call-type field is small, so the three bytes after it are zero).
     At = Rest.find(bytes([TTI_OER]))
@@ -14798,129 +14959,119 @@ def _o9i_oall8_oer(Terminal: bytes) -> bytes:
 
 
 def decode_9i_oall8_cursor_id(Terminal: bytes) -> int:
-    # The server cursor the fetch loop pulls more rows from, read from the exec
-    # reply's OER: a ub2 at offset 16 (past the OER head and the ORA code). It is
-    # a session-monotonic counter that rises per statement, so each open statement
-    # is fetched by its own id -- a fixed id drew ORA-01002 on the second query. 0
-    # when the terminal holds no whole OER (an error / empty result -- no fetch).
-    #
-    # Read as one byte it was right for a session's first 255 statements: the
-    # 256th is `00 01` and fetched cursor 0 (ORA-01002, #798; read live on 9.2
-    # past 300 statements). An earlier reading of a ub2 here took cursor 4 for
-    # 260 on a repeated statement's reply; that was before the status reader
-    # skipped the session-state RPA by its length (7a4e533), and twenty repeats
-    # of one statement now read byte 17 as 0 throughout.
-    Oer = _o9i_oall8_oer(Terminal)
-    if len(Oer) < 18:
-        return 0
-    return int.from_bytes(Oer[16:18], 'little')
+    # The server cursor the fetch loop pulls more rows from, and the next call
+    # closes: the status's cursor (_O9I_STATUS, a ub2). It rises per statement
+    # until closed, so each open statement is fetched by its own id -- a fixed id
+    # drew ORA-01002 on the second query. 0 when the terminal holds no whole
+    # status (an error / empty result -- no fetch). Read as one byte it was right
+    # for a session's first 255 statements: the 256th is `00 01` (#798).
+    Status = _o9i_oall8_status_or_none(Terminal)
+    return Status['cursor'] if Status else 0
 
 
 def decode_9i_oall8_dml_response(
     Terminal: bytes, Applied: bool = False
 ) -> tuple[int, int, str | None]:
     # The affected-row count, ORA code and message a 9i OALL8 non-query (DML / DDL
-    # / transaction-control) reply carries (#716). The count is a ub4 at OER offset
-    # 6 -- the "rows processed" field, where a SELECT reply reports its batch size
-    # (UPDATE of 2 rows -> 2, INSERT / DELETE -> 1, DDL / COMMIT -> 0; read live on
-    # 9.2) -- and the code / message come from decode_9i_oall8_status. A failed
+    # / transaction-control) reply carries (#716): the status's rows -- where a
+    # SELECT reply reports its batch size (UPDATE of 2 rows -> 2, INSERT / DELETE
+    # -> 1, DDL / COMMIT -> 0; read live on 9.2) -- code and message. A failed
     # statement reports no count, unless `Applied`: an array DML that fails at a
     # row has applied the rows before it, and the status counts them (#798; 1 of
     # rows 4, 1-duplicate, 5 in native_9i_array_dml.pcap). Returns (rowcount, code,
-    # message); raises Truncated if the OER is cut short, for the reader to read
+    # message); raises Truncated if the status is cut short, for the reader to read
     # on.
     Status = decode_9i_oall8_status(Terminal)
     if Status is None:
         return (0, 0, None)
-    Oer = _o9i_oall8_oer(Terminal)
-    Rows = int.from_bytes(Oer[6:10], 'little') if len(Oer) >= 10 else 0
     Code = Status['code']
-    return (0 if Code and not Applied else Rows, Code, Status['message'])
+    return (0 if Code and not Applied else Status['rows'], Code, Status['message'])
 
 
 def decode_9i_oall8_batch_errors(Terminal: bytes) -> list[dict]:
     # The per-row errors of a 9i OALL8 array DML in batch-errors mode (#798), as
     # {offset, code, message}, or [] for a status with none. The server applies
-    # the good rows and answers ORA-24381; its status holds three (pointer, ub4
-    # count, 4 pad) entries at offsets 86, 102 and 118 -- the codes', the row
-    # offsets' and the messages' -- and then the arrays: the codes as ub2s, the
-    # offsets as ub4s, and each message a ub4 length, the text as a ub1-length
-    # value and six bytes after it. Read from native 9.2 statuses with one and
-    # with two failed rows (native_9i_array_dml.pcap).
-    Oer = _o9i_oall8_oer(Terminal)
-    if len(Oer) < 134 or int.from_bytes(Oer[10:14], 'little') != 24381:
+    # the good rows and answers ORA-24381 with the status's three arrays
+    # (_O9I_STATUS): error i hit row offsets[i] with codes[i] and messages[i].
+    # Read from native 9.2 statuses with one and with two failed rows
+    # (native_9i_array_dml.pcap).
+    Status = _o9i_oall8_status_or_none(Terminal)
+    if not Status or Status['code'] != 24381 or 'batch_codes' not in Status:
         return []
-    Count = int.from_bytes(Oer[94:98], 'little')
-    Rest = Oer[134:]
-    Codes = [int.from_bytes(Rest[2 * I : 2 * I + 2], 'little') for I in range(Count)]
-    Rest = Rest[2 * Count :]
-    Offsets = [int.from_bytes(Rest[4 * I : 4 * I + 4], 'little') for I in range(Count)]
-    Rest = Rest[4 * Count :]
-    Messages = []
-    for _ in range(Count):
-        Length = Rest[4]
-        Messages.append(bytes(Rest[5 : 5 + Length]).decode('utf-8', 'replace').rstrip())
-        Rest = Rest[5 + Length + 6 :]
     return [
-        {'offset': Offsets[I], 'code': Codes[I], 'message': Messages[I]}
-        for I in range(Count)
+        {
+            'offset': Offset['offset'],
+            'code': Code['code'],
+            'message': bytes(Message['text']).decode('utf-8', 'replace').rstrip(),
+        }
+        for (Code, Offset, Message) in zip(
+            Status['batch_codes'], Status['batch_offsets'], Status['batch_messages']
+        )
     ]
 
 
 def decode_9i_oall8_error_position(Terminal: bytes) -> int:
-    # Where in the statement a 9i OALL8 status's error is (#798): a ub2 at offset
-    # 18, the 0-based character the server points at (#2263's field) -- 7 for
-    # `SELECT nosuchcol FROM dual`, read live on 9.2. 0 with no whole status.
-    Oer = _o9i_oall8_oer(Terminal)
-    return int.from_bytes(Oer[18:20], 'little') if len(Oer) >= 20 else 0
+    # Where in the statement a 9i OALL8 status's error is (#798), the 0-based
+    # character the server points at (#2263's field): the status's position -- 7
+    # for `SELECT nosuchcol FROM dual`, read live on 9.2. 0 with no whole status.
+    Status = _o9i_oall8_status_or_none(Terminal)
+    return Status['position'] if Status else 0
 
 
 def decode_9i_oall8_warn_flags(Terminal: bytes) -> int:
-    # A 9i OALL8 status's warning flags (#798), the byte at offset 25: bit 0x20 is
-    # a CREATE whose object compiled with errors (0x21 live on 9.2 for a broken
-    # procedure, 0 for the same one compiled clean), which the call otherwise
-    # reports as a success -- cursor.warning (#2262).
-    Oer = _o9i_oall8_oer(Terminal)
-    return Oer[25] if len(Oer) >= 26 else 0
+    # A 9i OALL8 status's warning flags (#798): bit 0x20 is a CREATE whose object
+    # compiled with errors (0x21 live on 9.2 for a broken procedure, 0 for the same
+    # one compiled clean), which the call otherwise reports as a success --
+    # cursor.warning (#2262).
+    Status = _o9i_oall8_status_or_none(Terminal)
+    return Status['warnings'] if Status else 0
 
 
 def decode_9i_oall8_dml_rowid(Terminal: bytes) -> str | None:
-    # The rowid of the row a 9i OALL8 DML touched (#1079), or None: the status
-    # carries it at offset 26 in the structure a ROWID cell has (_o9i_oall8_rowid).
-    # Read from native 9.2 INSERT and UPDATE replies (slot 0, then 1, of object
-    # 0x34486); the reply's tail repeats it as a physical UROWID. A status with no
-    # block (DDL, a failure) has none; one that touched nothing keeps the previous
-    # statement's, which the cursor sorts out by the row count, as on 8i / 9i.
-    Oer = _o9i_oall8_oer(Terminal)
-    if len(Oer) < 42 or int.from_bytes(Oer[10:14], 'little'):
+    # The rowid of the row a 9i OALL8 DML touched (#1079), or None: the status's
+    # (_O9I_STATUS), read from native 9.2 INSERT and UPDATE replies, whose tail
+    # repeats it as a physical UROWID. A status with no block (DDL, a failure) has
+    # none; one that touched nothing keeps the previous statement's, which the
+    # cursor sorts out by the row count, as on 8i / 9i.
+    from seerdb.common.types import rowid_to_string
+
+    Status = _o9i_oall8_status_or_none(Terminal)
+    if not Status or Status['code'] or not Status['rowid_block']:
         return None
-    if not int.from_bytes(Oer[34:38], 'little'):
-        return None
-    return _o9i_oall8_rowid(bytes(Oer[26:42]))
+    return rowid_to_string(
+        Status['rowid_object'],
+        Status['rowid_file'],
+        Status['rowid_block'],
+        Status['rowid_slot'],
+    )
 
 
 def decode_9i_oall8_bind_directions(Data: bytes, NumBinds: int) -> list[int] | None:
-    # The direction of each bind, from a 9i OALL8 block reply's IOV bind prompt,
-    # or None when the reply opens with none (a block that failed answers with the
-    # bare status). The prompt is a fixed 50-byte head and then one mask per bind
-    # in bind order, the masks the compact path reads (0x10 OUT, 0x20 IN, 0x30 IN
-    # OUT; decode_fv2_bind_directions): `10 10 20` live on 9.2 for
-    # `SELECT n, s INTO :n, :s ... WHERE n = :k`.
-    if Data[:1] != bytes([TTI_IOV]) or len(Data) < 50 + NumBinds:
+    # The direction of each bind, from a 9i OALL8 block reply's IOV bind prompt
+    # (_O9I_IOV), or None when the reply opens with none (a block that failed
+    # answers with the bare status). One mask per bind in bind order, the masks
+    # the compact path reads (0x10 OUT, 0x20 IN, 0x30 IN OUT;
+    # decode_fv2_bind_directions): `10 10 20` live on 9.2 for `SELECT n, s INTO :n,
+    # :s ... WHERE n = :k`. The prompt counts its binds itself; a count that is not
+    # the call's is a prompt this reader does not know, and gives None.
+    if Data[:1] != bytes([TTI_IOV]):
         return None
-    return list(Data[50 : 50 + NumBinds])
+    try:
+        (Iov, _) = _O9I_IOV_FROM_O9I(Data)
+    except (IndexError, DataError):
+        return None
+    return list(Iov['directions']) if Iov['binds'] == NumBinds else None
 
 
 def _o9i_oall8_refcursor_cell(Data: bytes) -> tuple[tuple[int, list], bytes]:
-    # A REF CURSOR OUT bind's cell in a 9i OALL8 block reply: a lead byte (0x2c),
-    # then the opened cursor's describe -- the same body a query's TTI_DCB carries,
-    # columns and current-date trailer -- then the cursor id (a ub4) and four zero
-    # bytes (the indicator and return code). Read live on 9.2 for `OPEN :1 FOR`
-    # two- and one-column queries (cursor 2, then 4). Returns ((cursor id, columns),
-    # rest); the caller fetches the rows by that id.
-    (Columns, Rest) = _o9i_oall8_describe_body(Data[1:])
-    Cursor = int.from_bytes(Rest[:4], 'little')
-    return ((Cursor, Columns), Rest[8:])
+    # A REF CURSOR OUT bind's cell in a 9i OALL8 block reply (_O9I_REFCURSOR_OUT):
+    # a lead byte (0x2c), the opened cursor's describe -- the body a query's
+    # TTI_DCB carries -- its cursor id, and the indicator and return code. Read
+    # live on 9.2 for `OPEN :1 FOR` two- and one-column queries (cursor 2, then
+    # 4). Returns ((cursor id, columns), rest); the caller fetches the rows by
+    # that id.
+    (Cell, Rest) = _O9I_REFCURSOR_OUT_FROM_OCI(Data, _DESCRIBE_GIVEN)
+    return ((Cell['cursor'], _o9i_oall8_columns(Cell['columns'])), Rest)
 
 
 def decode_9i_oall8_block_out(
@@ -14964,7 +15115,9 @@ def _o9i_oall8_block_parts(
 ) -> tuple[list, bytes]:
     # A 9i OALL8 block reply's OUT values, and the bytes after them -- the RPA and
     # the status (decode_9i_oall8_block_out).
-    Rest = Data[50 + NumBinds :] if Data[:1] == bytes([TTI_IOV]) else Data
+    Rest = Data
+    if Data[:1] == bytes([TTI_IOV]):
+        (_, Rest) = _O9I_IOV_FROM_O9I(Data)  # the bind prompt (_O9I_IOV)
     OutValues: list = []
     if NumOut > 0 and Rest[:1] == bytes([TTI_RXD]):
         Rest = Rest[1:]
@@ -14977,37 +15130,75 @@ def _o9i_oall8_block_parts(
                 continue
             if Length == 0xFF:
                 # An OUT bind the block never assigned (a RETURNING ... INTO that
-                # matched no row): 0xFF and a ub2 return code (3105), no value or
-                # indicator -- `ff 210c`, the compact path's `ff 02 0c 21` (#801).
-                # Reading a length and four bytes after it ran into the status.
-                Rest = Rest[3:]
+                # matched no row): 8i's form (_O8I_OUT_UNASSIGNED), 0xFF and the
+                # indicator 3105 -- `ff 210c`, the compact path's `ff 02 0c 21`
+                # (#801). Reading a length and four bytes after it ran into the
+                # status.
+                (_, Rest) = _O8I_OUT_UNASSIGNED_FROM_O9I(Rest)
                 OutValues.append(None)
                 continue
-            # The value as an ordinary one -- a ub1 length, or 0xFE and 64-byte
+            # 8i's row cell (_O8I_CELL): the value -- a ub1 length, or 0xFE and
             # chunks past 252 bytes (read as one length, a long OUT value kept its
-            # chunk lengths) -- then a ub2 indicator (-1 for NULL) and a ub2 return
-            # code (1405).
-            (Raw, Rest) = _OCI.read_value(Rest)
-            Rest = Rest[4:]
-            OutValues.append(bytes(Raw) if Raw else None)
+            # chunk lengths) -- a ub2 indicator (-1 for NULL) and a ub2 return code
+            # (1405).
+            (Cell, Rest) = _O8I_CELL_FROM_O9I(Rest)
+            OutValues.append(bytes(Cell['value']) if Cell['value'] else None)
     return (OutValues, Rest)
 
 
 def decode_9i_oall8_status(Terminal: bytes) -> dict | None:
-    # The ORA code (and best-effort message) a 9i OALL8 reply's status carries, or
-    # None for a terminal with no whole OER yet. The code is a ub4 at offset 10 of
-    # the OER token (04 + ub4 + u8 + ub4 + code-ub4); the message, when the code is
-    # set, is a trailing "ORA-..." string. Raises Truncated if the OER head is cut
-    # short, for the reader to read on.
+    # The ORA code and message a 9i OALL8 reply's status carries, with its rows,
+    # or None for a terminal with no status. Raises Truncated if the status's
+    # head is cut short, for the reader to read on.
+    Status = _o9i_oall8_status_fields(Terminal)
+    if Status is None:
+        return None
+    return {
+        'code': Status['code'],
+        'message': Status['message_text'],
+        'rows': Status['rows'],
+    }
+
+
+def _o9i_oall8_status_or_none(Terminal: bytes) -> dict | None:
+    # The status's fields, or None for one that is not there or cut short: the
+    # field readers answer their default then, as they did reading offsets.
+    try:
+        return _o9i_oall8_status_fields(Terminal)
+    except Truncated:
+        return None
+
+
+def _o9i_oall8_status_fields(Terminal: bytes) -> dict | None:
+    # The fields of a 9i OALL8 reply's status (_O9I_STATUS), past any RPA ahead of
+    # it, or None when the terminal holds none. A status whose tail does not read
+    # -- a form no capture has shown yet -- gives its head's fields and its
+    # message found by its text, as every status did before the schema, rather
+    # than failing a reply the code could still be read from. `message_text` is
+    # the message as str (or None). Raises Truncated if the head is cut short.
     Oer = _o9i_oall8_oer(Terminal)
     if not Oer:
         return None
-    if len(Oer) < 14:
-        raise Truncated('9i OALL8 status cut short')
-    Code = int.from_bytes(Oer[10:14], 'little')
+    try:
+        (Status, _) = _O9I_STATUS_FROM_O9I(Oer)
+        Message = Status.get('message')
+        Status['message_text'] = (
+            bytes(Message).split(b'\x00')[0].rstrip(b'\n').decode('latin-1', 'replace')
+            or None
+            if Message
+            else None
+        )
+        return Status
+    except (IndexError, DataError):
+        pass
+    try:
+        (Status, _) = _O9I_STATUS_HEAD_FROM_O9I(Oer)
+    except (IndexError, DataError) as Exc:
+        raise Truncated('9i OALL8 status cut short') from Exc
+    Code = Status['code']
     Message = None
     # The message naming the code: a batch-errors status (ORA-24381) lists the
-    # rows' own messages ahead of its own (decode_9i_oall8_batch_errors).
+    # rows' own messages ahead of its own.
     At = Oer.find(f'ORA-{Code:05d}'.encode()) if Code else -1
     if At < 0:
         At = Oer.find(b'ORA-')
@@ -15016,7 +15207,8 @@ def decode_9i_oall8_status(Terminal: bytes) -> dict | None:
             bytes(Oer[At:]).split(b'\x00')[0].rstrip(b'\n').decode('latin-1', 'replace')
             or None
         )
-    return {'code': Code, 'message': Message}
+    Status['message_text'] = Message
+    return Status
 
 
 def o9i_oall8_terminal_complete(Terminal: bytes) -> bool:
@@ -16259,61 +16451,61 @@ def parse_8i_auth_value(Packet: bytes, Key: bytes, O8i: bool = True) -> bytes | 
 
 # --- 9i native OALL8 O3LOGON via the OSESSKEY/OAUTH envelope (#790) ----------
 # The native 9.2 OALL8 ("thick") client marshals OSESSKEY (0x76) / OAUTH (0x73)
-# as a 64-bit OCI call frame, NOT 9i's positional TTI_3LOGA (that is the thin
-# path, which the 9.2 server stops accepting once the native data-type
-# negotiation has run). The frame is: TTI_FUN, the function byte, a seq and a
-# 0x40 "pointers present" opt, a fixed preamble, then ub4le scalar args
-# interleaved with 8-byte host-pointer PLACEHOLDERS the server reads positionally
-# but ignores (they are the native client's own stack addresses). Strings use the
-# DALC coding ub4le(len) ub1(len) data, same as pre-10g key-value values.
-#
-# Byte-reproduced from a live 9.2 sqlplus -> 9.2 capture. The crypto is the SAME
-# DES O3LOGON as the thin 9i / 8i paths (des_verifier + o3logon). The unexplained
-# fixed words -- the 0x5e73-led preamble and the structural 3 / 0x2a -- are
-# carried verbatim: the server validates the frame SHAPE, not these values (the
-# ignored pointers prove values do not matter), so only seq, username, password
-# and the AUTH_ pairs vary. See also [[oall8-pro-banner-gate]].
-_OALL8_AUTH_PREAMBLE = bytes.fromhex('735e0000000000')
-# Fixed host-pointer placeholder. The server ignores the ADDRESS but the pointer
-# must be NON-NULL: a null pointer marks the OCI argument as absent, so a zeroed
-# slot makes the server reject the frame and drop the connection. Any non-null
-# 8-byte value works; this is a plausible stack address from the capture.
-_OALL8_PTR = bytes.fromhex('d096ffbf7f000000')
+# as the OCI login call -- the shared _AUTH_HEAD and _AUTH_PAIR at OCI's widths
+# (#798), as 8i's are at 8i's -- NOT 9i's positional thin-coded form (that is
+# the compact path, which the 9.2 server stops accepting once the native
+# data-type negotiation has run). What the hand-built frame called "a fixed
+# preamble" is the first pointer slot, its "structural constant 3" the user's
+# length, and the 0x2a of phase one the four bytes after the pair count that a
+# native client leaves unset (#2249) -- the server reads them positionally and
+# ignores them, as it ignores the pointers' values so long as they are non-null.
+# The crypto is the SAME DES O3LOGON as the thin 9i / 8i paths (des_verifier +
+# o3logon). Byte-reproduced from a live 9.2 sqlplus -> 9.2 capture apart from
+# those. See also [[oall8-pro-banner-gate]].
+_AUTH_OCI = wire_schema.compile_encoder(
+    (*_AUTH_HEAD, ('each', 'pairs', 'pair_count', _AUTH_PAIR)), _OCI
+)
 
 
-def _oall8_dalc(Value: bytes) -> bytes:
-    # ub4le total length, ub1 chunk length, data (values stay <= 252 bytes, so
-    # the single chunk equals the total -- enforced by _o8i_info_pairs upstream).
-    # An empty value is the zero length alone, as on 8i (#2344): with a zero
-    # chunk byte after it, the server dropped the connection at an empty
-    # program name (#798).
-    if not Value:
-        return struct.pack('<I', 0)
-    return struct.pack('<I', len(Value)) + bytes([len(Value)]) + Value
-
-
-def _oall8_kv(Key: bytes, Val: bytes, Flags: int = 0) -> bytes:
-    return _oall8_dalc(Key) + _oall8_dalc(Val) + struct.pack('<I', Flags)
+def _oall8_auth(
+    Subtype: int, Seq: int, User: bytes, Mode: int, Pairs: list[tuple[bytes, bytes]]
+) -> bytes:
+    # An OCI OSESSKEY or OAUTH call (_AUTH_HEAD and its pairs at OCI's widths). An
+    # empty value is a zero length and no value, as on 8i (#2344): a zero chunk
+    # byte after it made the 9.2 server drop the login (#798).
+    return _AUTH_OCI(
+        {
+            'subtype': Subtype,
+            'seq': Seq,
+            'pointer_1': True,
+            'user_length': len(User),
+            'mode': Mode,
+            'pointer_2': True,
+            'pair_count': len(Pairs),
+            'pointer_3': True,
+            'pointer_4': True,
+            'user_prefixed': True,
+            'user_raw': False,
+            'user': User,
+            'pairs': [
+                {
+                    'key_length': len(Key),
+                    'key': Key,
+                    'value_length': len(Value),
+                    'value': Value,
+                    'flags': 0,
+                }
+                for (Key, Value) in Pairs
+            ],
+        }
+    )
 
 
 def encode_oall8_osesskey_phase1(
     Seq: int, User: bytes, Pairs: list[tuple[bytes, bytes]]
 ) -> bytes:
     # OSESSKEY (0x76) phase one: request the session key. Logon mode 1.
-    return (
-        bytes([TTI_FUN, TTI_SESS, Seq, 0x40])
-        + _OALL8_AUTH_PREAMBLE
-        + struct.pack('<I', 3)  # structural constant (unexplained; from capture)
-        + struct.pack('<I', 1)  # logon mode (phase one)
-        + _OALL8_PTR
-        + struct.pack('<I', len(Pairs))  # key-value pair count
-        + struct.pack('<I', 0x2A)  # unexplained constant (from capture)
-        + _OALL8_PTR
-        + _OALL8_PTR
-        + bytes([len(User)])
-        + User
-        + b''.join(_oall8_kv(k, v) for k, v in _o8i_info_pairs(Pairs))
-    )
+    return _oall8_auth(TTI_SESS, Seq, User, 1, _o8i_info_pairs(Pairs))
 
 
 def encode_oall8_oauth_phase2(
@@ -16321,20 +16513,12 @@ def encode_oall8_oauth_phase2(
 ) -> bytes:
     # OAUTH (0x73) phase two: send AUTH_PASSWORD (hex(DES blocks) + decimal pad
     # count) plus the informational pairs. Logon mode 0x101 marks phase two.
-    AllPairs = [(b'AUTH_PASSWORD', PwdField), *_o8i_info_pairs(Pairs)]
-    return (
-        bytes([TTI_FUN, TTI_AUTH, Seq, 0x40])
-        + _OALL8_AUTH_PREAMBLE
-        + struct.pack('<I', 3)
-        + struct.pack('<I', 0x101)  # logon mode (phase two)
-        + _OALL8_PTR
-        + struct.pack('<I', len(AllPairs))
-        + struct.pack('<I', 0)  # unexplained constant (0 in phase two)
-        + _OALL8_PTR
-        + _OALL8_PTR
-        + bytes([len(User)])
-        + User
-        + b''.join(_oall8_kv(k, v) for k, v in AllPairs)
+    return _oall8_auth(
+        TTI_AUTH,
+        Seq,
+        User,
+        0x101,
+        [(b'AUTH_PASSWORD', PwdField), *_o8i_info_pairs(Pairs)],
     )
 
 
