@@ -3,9 +3,8 @@
 
 # The Mirror
 
-> **A technology preview until general availability.** The Mirror is an
-> early-stage product, close to production grade, but it is not yet for
-> production.
+> **An initial implementation, a technology preview until general
+> availability.** It is not yet for production.
 > - **No compatibility promise yet.** It is outside the semantic-versioning
 >   promise the client (DB-API 2.0) keeps. Its Python API, its command line and
 >   its behaviour may change in any release, a minor or patch one included. Pin

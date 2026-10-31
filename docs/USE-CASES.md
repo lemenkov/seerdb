@@ -7,8 +7,9 @@ Where seerdb could fit, where it doesn't, and why. This page collects
 situations we know of, or can describe honestly. It is not a list of
 deployments: the project has no customers yet, and nothing here claims anyone
 runs seerdb. Each case says what it would rely on and where it stops being the
-right tool. The client (the DB-API 2.0 driver) is the product. The Mirror is a
-technology preview ([MIRROR.md](MIRROR.md)), and the cases that use it say so.
+right tool. The client (the DB-API 2.0 driver) is the product. The Mirror is an
+initial implementation, a technology preview until general availability
+([MIRROR.md](MIRROR.md)), and the cases that use it say so.
 
 ## A Python program that talks to an older Oracle server
 
@@ -71,8 +72,8 @@ run with a PostgreSQL one.
 **Where it stops.** It fits when the logic lives in the application and its
 SQL. A database whose logic is large stored PL/SQL, or one that generates its
 application's pages from stored procedures, is past what the Mirror's PL/SQL
-translation covers. The Mirror is a technology preview:
-not for production, and outside the version promise the client keeps.
+translation covers. The Mirror is an initial implementation, a technology preview until general
+availability: not yet for production, and outside the version promise the client keeps.
 
 ## Testing or capturing a client against a real server (Mirror, passthrough)
 

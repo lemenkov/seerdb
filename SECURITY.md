@@ -62,8 +62,8 @@ Fixes go into the latest release. There are no backport branches.
 ## Scope
 
 - **The client** (`seerdb`, the DB-API 2.0 driver): any vulnerability.
-- **The Mirror** (`seerdb.server`, the `mirror` extra): a technology preview
-  until its general availability. Its intended deployment is behind a firewall
+- **The Mirror** (`seerdb.server`, the `mirror` extra): an initial
+  implementation, a technology preview until its general availability. Its intended deployment is behind a firewall
   or VPN, as an Oracle database's is, for clients that may log in but are not
   trusted otherwise. Exposure to the open internet is out of scope. See the
   *Security* section of [docs/MIRROR.md](docs/MIRROR.md) for how to run it.

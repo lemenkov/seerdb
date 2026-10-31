@@ -90,9 +90,8 @@ The backend really has the feature, and only its form changes.
 
 ## Now: the Mirror towards general availability
 
-The Mirror is an **early-stage product**, close to production grade. Until
-general availability it remains a technology preview, outside semantic
-versioning ([docs/MIRROR.md](docs/MIRROR.md)).
+The Mirror is an **initial implementation**, a technology preview until
+general availability, and outside semantic versioning until then ([docs/MIRROR.md](docs/MIRROR.md)).
 
 It reaches general availability at the gate
 [mirror-pg-general-availability](https://github.com/seerdb/seerdb/milestone/51),
