@@ -48,9 +48,11 @@ from seerdb.common.tns import (
     decode_9i_oall8_describe,
     decode_9i_oall8_dml_response,
     decode_9i_oall8_dml_rowid,
+    decode_9i_oall8_error_position,
     decode_9i_oall8_exec_response,
     decode_9i_oall8_lob_value,
     decode_9i_oall8_terminal_error,
+    decode_9i_oall8_warn_flags,
     decode_fv2_batch_errors,
     decode_fv2_bind_directions,
     decode_fv2_block_out,
@@ -1100,7 +1102,14 @@ class Fv2Oall8Dialect(Oall8Dialect):
         if packet[:1] == bytes([TTI_OER]):
             (err_code, message) = decode_9i_oall8_terminal_error(packet)
             if err_code:
-                _raise_ora(err_code, message)
+                from seerdb.common.exceptions import from_ora_code
+
+                exc = from_ora_code(err_code)(
+                    message or f'ORA-{err_code:05d}', code=err_code
+                )
+                # Where in the statement the error is (#2263).
+                exc.offset = decode_9i_oall8_error_position(packet)
+                raise exc
             from seerdb.common.exceptions import DatabaseError
 
             raise DatabaseError('Oracle 9i OALL8 rejected the query (no ORA code)')
@@ -1341,6 +1350,9 @@ class Fv2Oall8Dialect(Oall8Dialect):
         )
         rowid = None if err_code else decode_9i_oall8_dml_rowid(buf)  # #1079
         batch_errors = decode_9i_oall8_batch_errors(buf) if batcherrors else []
+        # Where the error is (#2263), and the warning a CREATE that compiled with
+        # errors carries (cursor.warning, #2262), as the compact path reports them.
+        offset = decode_9i_oall8_error_position(buf) if err_code else 0
         return (
             0,
             err_code,
@@ -1351,6 +1363,8 @@ class Fv2Oall8Dialect(Oall8Dialect):
             rowid,
             batch_errors,
             None,
+            offset,
+            decode_9i_oall8_warn_flags(buf),
         )
 
     def txn_control(self, statement: str):

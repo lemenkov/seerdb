@@ -14807,6 +14807,23 @@ def decode_9i_oall8_batch_errors(Terminal: bytes) -> list[dict]:
     ]
 
 
+def decode_9i_oall8_error_position(Terminal: bytes) -> int:
+    # Where in the statement a 9i OALL8 status's error is (#798): a ub2 at offset
+    # 18, the 0-based character the server points at (#2263's field) -- 7 for
+    # `SELECT nosuchcol FROM dual`, read live on 9.2. 0 with no whole status.
+    Oer = _o9i_oall8_oer(Terminal)
+    return int.from_bytes(Oer[18:20], 'little') if len(Oer) >= 20 else 0
+
+
+def decode_9i_oall8_warn_flags(Terminal: bytes) -> int:
+    # A 9i OALL8 status's warning flags (#798), the byte at offset 25: bit 0x20 is
+    # a CREATE whose object compiled with errors (0x21 live on 9.2 for a broken
+    # procedure, 0 for the same one compiled clean), which the call otherwise
+    # reports as a success -- cursor.warning (#2262).
+    Oer = _o9i_oall8_oer(Terminal)
+    return Oer[25] if len(Oer) >= 26 else 0
+
+
 def decode_9i_oall8_dml_rowid(Terminal: bytes) -> str | None:
     # The rowid of the row a 9i OALL8 DML touched (#1079), or None: the status
     # carries it at offset 26 in the structure a ROWID cell has (_o9i_oall8_rowid).

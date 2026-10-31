@@ -7886,6 +7886,50 @@ class TestNative9iOall8Select(unittest.TestCase):
 
         self.assertEqual(decode_8i_server_version(self.OALL8_LOGIN_REPLY), 0x09200400)
 
+    # 9.2 statuses (live): `CREATE OR REPLACE PROCEDURE ... BEGIN NULL; END;`,
+    # the same with an undefined name in its body, and the refused
+    # `SELECT nosuchcol FROM dual`.
+    CREATE_CLEAN = bytes.fromhex(
+        '080500c1e52e0200000000010000000000000000000000000000000401000000'
+        '0100000000000000000000010000001800000000000000000000000000000000'
+        '0000000000000000000007000001000000360100000000000000000000000000'
+        '0080d0d403000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00'
+    )
+    CREATE_WITH_ERRORS = bytes.fromhex(
+        '080500cce52e0200000000020000000000000000000000000000000401000000'
+        '0100000000000000000000020000001800000000210000000000000000000000'
+        '0000000000000000000008000001000000360100000000000000000000000000'
+        '0080d0d403000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00'
+    )
+    QUERY_ERROR_AT_7 = bytes.fromhex(
+        '0401000000010000000088030000000005000700000000000000000000000000'
+        '0000000000000000000000000000000b00000100000036010000000000000000'
+        '00000000000080d0d40300000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '0000000000002b4f52412d30303930343a20224e4f53554348434f4c223a2069'
+        '6e76616c6964206964656e7469666965720a'
+    )
+
+    def test_a_status_carries_the_warning_and_the_error_position(self):
+        # Bit 0x20 of the byte at 25 says the object compiled with errors
+        # (#2262); the ub2 at 18 is where in the statement an error is (#2263).
+        from seerdb.common.tns import (
+            decode_9i_oall8_error_position,
+            decode_9i_oall8_status,
+            decode_9i_oall8_warn_flags,
+        )
+
+        self.assertEqual(decode_9i_oall8_warn_flags(self.CREATE_CLEAN) & 0x20, 0)
+        self.assertEqual(
+            decode_9i_oall8_warn_flags(self.CREATE_WITH_ERRORS) & 0x20, 0x20
+        )
+        self.assertEqual(decode_9i_oall8_status(self.QUERY_ERROR_AT_7)['code'], 904)
+        self.assertEqual(decode_9i_oall8_error_position(self.QUERY_ERROR_AT_7), 7)
+
     def test_a_for_update_row_header_carries_the_rowid(self):
         # The row header names a 13-byte rowid (a ub2 at 42) between it and the
         # row: SELECT ... FOR UPDATE sends the row it locks. Unskipped, the row
