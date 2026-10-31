@@ -3,15 +3,20 @@
 
 # The Mirror
 
-> **A highly experimental technology preview.** The Mirror ships with seerdb so
-> you can try it, not to run production on. It is outside the
-> semantic-versioning promise the client (DB-API 2.0) keeps: its Python API,
-> its command line and its behaviour may change or break in any release, a
-> minor or patch one included. Pin an exact seerdb version if you depend on it.
-> What it will promise from general availability is under *Stability* below.
+> **A technology preview until general availability.** The Mirror is an
+> early-stage product, close to production grade, but it is not yet for
+> production.
+> - **No compatibility promise yet.** It is outside the semantic-versioning
+>   promise the client (DB-API 2.0) keeps. Its Python API, its command line and
+>   its behaviour may change in any release, a minor or patch one included. Pin
+>   an exact seerdb version if you depend on it.
+> - **What general availability will promise** is under *Stability* below.
+> - **When:** general availability comes when the gating milestones close (the
+>   [gate](https://github.com/seerdb/seerdb/milestone/51)).
 
-> **Not hardened for untrusted networks.** Run it on localhost or a network you
-> trust, for clients you trust. See *Security* below for why.
+> **For trusted networks.** Run it on localhost, or behind a firewall or VPN,
+> for clients you trust, until the security review closes. *Security* below
+> says what is in place and what is still owed.
 
 The Mirror is a server that speaks Oracle's wire protocol. Oracle clients
 (python-oracledb, seerdb itself, sqlplus, SeerODBC, anything built on Oracle's
@@ -74,6 +79,99 @@ first. Decided in [#1861](https://github.com/seerdb/seerdb/issues/1861).
 - **Oracle compatibility itself.** It grows release by release. A feature this
   guide lists as supported that stops working is a bug, not a broken promise.
 
+## What is supported
+
+### Clients
+
+The Mirror serves any client that speaks Oracle's thin protocol at the field
+version of Oracle 10.2 or later, and sqlplus (OCI) from 10.2. Oracle 8i and 9i
+clients are not served. What is checked, and how (measured 2026-10-31):
+
+| client | checked by | result |
+|---|---|---|
+| python-oracledb (thin) | its own test suite (v26.1.0), `tools/run_oracledb_suite.py` | over PostgreSQL: 2468 passed; through a passthrough: 2472 passed |
+| seerdb | seerdb's integration suite, in CI on every change | over PostgreSQL: 615 passed when presenting 23ai, 570 when presenting 12.1 |
+| sqlplus 10.2 and 23.26 | `tools/sqlplus_survey.py`, compared with sqlplus against Oracle directly | the subset sqlplus uses for real database work |
+
+- **Excluded from python-oracledb's run:** some feature areas aren't served at
+  all (*Not served* below), so their test files are left out. Over PostgreSQL,
+  a few tests are also deselected because PostgreSQL itself can't do what they
+  check (*Known limits*).
+- **Skips in seerdb's suite:** tests for features the presented release lacks,
+  and for features only a real Oracle has, are skipped. That's why the 12.1 run
+  passes fewer.
+
+### Releases it presents
+
+- **Over PostgreSQL:** the Mirror presents Oracle 23ai, or 12.1 with
+  `--presents 12.1`. Clients see that release's version banner, error codes and
+  dictionary.
+- **As a passthrough:** it presents what its upstream speaks.
+
+### Protocol features
+
+- **Login:** O5LOGON with the accounts the Mirror holds. It supports password
+  changes at login and with `ALTER USER`, proxy logins (`CONNECT THROUGH`), and
+  lockout after repeated failures (*Accounts*).
+- **Encryption:** TLS 1.2 and later (TCPS), with client certificates if you
+  require them, and native network encryption (ANO) with AES and SHA-2
+  checksums (*Encryption*).
+- **Calls:**
+  - queries, DML, DDL and PL/SQL, with binds of every scalar type;
+  - array DML with batch errors;
+  - LOBs, read and written;
+  - REF CURSORs and implicit results (`DBMS_SQL.RETURN_RESULT`);
+  - scrollable cursors;
+  - `DBMS_OUTPUT`;
+  - object and collection binds and fetches.
+- **Transactions:** commit and rollback, savepoints, sessionless transactions
+  (within one Mirror process), and transaction priority as session state.
+- **Two seerdb extensions:** a WebSocket listener for browser clients, and a
+  JSON query endpoint (*The WebSocket listener*).
+
+### SQL and PL/SQL over PostgreSQL
+
+Oracle SQL and PL/SQL are translated as they arrive, with
+[orafce](https://github.com/orafce/orafce) supplying Oracle's built-in
+functions. This covers:
+
+- **Tables, views, sequences, indexes and constraints,** with Oracle's DDL,
+  and the dictionary views clients read (`USER_*`, `ALL_*`, `DBA_*`, `V$` views
+  that clients query).
+- **Data types:**
+  - `NUMBER`, the character types, `DATE`, `TIMESTAMP` with and without time
+    zone, `INTERVAL`, `RAW`;
+  - `CLOB`, `BLOB`, `BFILE`;
+  - 23ai's `BOOLEAN`, JSON, and `VECTOR` (with pgvector);
+  - `XMLTYPE`;
+  - SQL domains and column annotations.
+- **PL/SQL:** anonymous blocks, procedures, functions, packages and triggers,
+  with definer's and invoker's rights (`AUTHID`).
+- **Object types:** objects, VARRAYs, nested tables, and object tables with
+  `REF` and `DEREF`.
+- **Other features:**
+  - `ROWID`, and `UROWID` for index-organized tables;
+  - invisible columns;
+  - editions, by name;
+  - DIRECTORY objects.
+- **Users and privileges:** `CREATE` / `ALTER` / `DROP USER`, and object and
+  column grants. PostgreSQL enforces them when each user runs as a role of its
+  own (*Per-user roles*).
+- **Native PostgreSQL:** as an operator opt-in, a statement can bypass
+  translation and run as PostgreSQL (*Native PostgreSQL*).
+
+Each area has limits, listed under *Known limits*.
+
+### Not served
+
+These are out of the Mirror's scope, by design:
+- Advanced Queuing and SODA;
+- Continuous Query Notification;
+- two-phase commit (XA);
+- external (OS) authentication;
+- direct path load;
+- Oracle 8i and 9i clients.
+
 ## Installing
 
 ```sh
@@ -120,6 +218,9 @@ Any service name is accepted.
 | `--profile FILE` | | record per-statement statistics to FILE (see *Migration profile*) |
 | `--max-sessions` | no limit | serve at most this many connections at once; one more is closed as it arrives (see *Resource limits*) |
 | `--failed-login-attempts` | `10` | lock a user name after this many failed logins in a row; `0` never locks (see *Accounts*) |
+| `--ws-port` | | also serve the seerdb WebSocket transport on this port (see *The WebSocket listener*) |
+| `--ws-origin` | | a browser origin the WebSocket listeners admit; repeatable |
+| `--query-ws-port` | | also serve the JSON query endpoint on this port (see *The JSON query endpoint*) |
 | `--config FILE` | | an INI file with the same options (below) |
 
 For `postgres`:
@@ -163,6 +264,9 @@ log_level = INFO
 ; profile = /var/lib/mirror/profile.json
 ; max_sessions = 200
 ; failed_login_attempts = 10
+; ws_port = 1531
+; ws_origins = https://app.example.com, https://admin.example.com
+; query_ws_port = 1532
 
 [clients]
 SCOTT = tiger
@@ -684,16 +788,47 @@ Uses:
 
 ## Security
 
-General availability waits on a security review (#1687), and the fixes it
-brings, each filed as an issue of the milestone
+This section states the position as it stands. General availability waits on
+a security review ([#1687](https://github.com/seerdb/seerdb/issues/1687)) and
+the fixes it brings, each filed in the milestone
 [mirror-security-hardening](https://github.com/seerdb/seerdb/milestone/52).
-Until it closes, run the Mirror as follows:
+This section is revised when the review closes.
 
-- **Who can reach it.** A client can tie the Mirror up before logging in: hold
-  connections open, or send packets it handles badly. Nothing in the Mirror
-  bounds that yet (*Resource limits*). Keep the default listen address
-  (`127.0.0.1`), or put the Mirror behind a firewall that admits only your own
-  hosts.
+**The threat model.** The Mirror is built for a network its operator controls:
+localhost, or behind a firewall or VPN that admits only your own hosts. Its
+clients are applications you run. Exposing it to the internet is outside that
+model until the review closes.
+
+**What is in place:**
+- **Before login,** a client is bounded (*Resource limits*):
+  - packets no longer than the negotiated SDU;
+  - messages of at most 1 MiB;
+  - 60 seconds to log in;
+  - 30 seconds for a TLS handshake;
+  - `--max-sessions` connections at once.
+- **Logins** are O5LOGON, mutual as Oracle's is. Failed logins are delayed and
+  locked out per user name, and the answers don't tell which accounts exist
+  (*Accounts*).
+- **Passwords:**
+  - The Mirror holds each one as it is, because O5LOGON needs it. Keep the
+    config file readable by the Mirror's account only, and keep the auth table
+    behind its own role (*Accounts*).
+  - The log, the migration profile and the translation report never record a
+    password a statement carries (`IDENTIFIED BY`, `REPLACE`).
+- **The wire:**
+  - TLS authenticates the server, and with `--tls-ca` the client.
+  - ANO encrypts, but doesn't authenticate the server.
+  - Beyond localhost, use TLS.
+- **Users:** per-user roles let PostgreSQL itself keep users apart
+  (*Per-user roles*).
+- **Browser endpoints:** the WebSocket listeners check an origin allow-list,
+  authenticate before any backend work and count against `--max-sessions`.
+
+**How to run it until the review closes:**
+
+- **Who can reach it.** Keep the default listen address (`127.0.0.1`), or put
+  the Mirror behind a firewall that admits only your own hosts. The bounds above
+  limit what an unauthenticated client can do, but they are not the review.
 - **Who logs in.**
   - In single-role mode, every account can do more than an Oracle user of the
     same name could: manage the other accounts, including their passwords, and
@@ -707,8 +842,63 @@ Until it closes, run the Mirror as follows:
   server-program privileges unless you need them.
 - **The wire.** Use TLS (`--tls-cert`) beyond localhost. ANO alone doesn't
   authenticate the server.
+- **The browser endpoints.** Give `--ws-origin`, and serve them as `wss://`
+  only.
 
-This section is revised when the review closes.
+**Reporting a vulnerability:** privately, as [SECURITY.md](../SECURITY.md)
+describes, never in a public issue.
+
+## Running it
+
+**Under a service manager.** The Mirror runs in the foreground and logs to
+standard error, so a service manager can supervise it. A systemd unit, for
+example:
+
+```ini
+[Unit]
+Description=seerdb Mirror
+After=network-online.target
+
+[Service]
+User=mirror
+ExecStart=/opt/mirror/venv/bin/seerdb-mirror --config /etc/seerdb-mirror/mirror.ini
+Restart=on-failure
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target
+```
+
+- **Stopping:** SIGTERM stops it as an interrupt does, and writes the migration
+  profile if one is being recorded.
+- **The profile:** SIGUSR1 writes it without stopping.
+- **Configuration changes:** there is no reload. Restart the Mirror to apply
+  them.
+
+**Containers.** There is no official Mirror image. Install `seerdb[mirror]` into
+a Python image, run `seerdb-mirror` as its command, and give it `--host 0.0.0.0`
+so the container's port is reachable. The database side has its own recipe:
+[`examples/mirror-pg.Dockerfile`](../examples/mirror-pg.Dockerfile) builds
+PostgreSQL 16 with the extensions the Mirror uses.
+
+**The log** (`--log-level`):
+- **WARNING:** what an operator must see, such as the start-up notice and a
+  deprecated option.
+- **INFO, the default,** adds each login and each session's end, with the
+  client's address and user, and password changes.
+- **DEBUG** adds every statement the Mirror dispatches, with how it decoded the
+  call. That is the application's SQL. It is redacted of passwords, but treat a
+  DEBUG log as holding application data.
+
+**Health checks.** The Mirror has no health endpoint. A TCP connect checks that
+it listens. A login with a monitoring account and `SELECT 1 FROM dual` checks
+the whole path, the backend included. Give that account nothing else.
+
+**Backups.** Over PostgreSQL, everything the Mirror keeps is in the database:
+the dictionary, the accounts if you use `--auth-conninfo`, and the records
+(*Upgrades*). Back up the database as you would any PostgreSQL database. The
+config file holds the remaining state: the listener, the backend and the
+configured accounts.
 
 ## Migration profile
 
@@ -837,10 +1027,15 @@ Read them as follows:
   `executemany` and LOB writes.
 - **Over PostgreSQL, a small call now costs about what Oracle's does.** On
   2026-10-14, on the same hosts, a one-row query took 4.4x and a connect 7.1x,
-  because each Oracle call cost several PostgreSQL round trips. The work of
-  milestone mirror-pg-performance brought that to about one (#1331, #1939).
+  because each Oracle call cost several PostgreSQL round trips. The round-trip
+  work (milestone mirror-pg-performance, now closed; #1331, #1939) brought that
+  to about one.
   `executemany` is still 5x, and bulk fetches and LOB reads are faster than
   Oracle's.
+- **Known open cost:** some plain INSERTs send PostgreSQL about twice the usual
+  number of statements per call
+  ([#2392](https://github.com/seerdb/seerdb/issues/2392)). General
+  availability needs every such issue fixed or accepted.
 - **Encryption** costs most at connect (the key exchange), and little per call.
 
 ## Known limits
@@ -880,5 +1075,83 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
 The full list, with the reasons, is in the backend module's docstring
 (`seerdb/server/backends/postgres.py`).
 
-One limit applies to the Mirror itself: it serves thin clients from 10.2 on,
-and sqlplus / OCI from 10.2 on. Oracle 8i and 9i clients are not served.
+Two limits apply to the Mirror itself, whatever the backend:
+- **The clients it serves:** thin clients from 10.2 on, and sqlplus / OCI from
+  10.2 on. Oracle 8i and 9i clients are not served.
+- **Newer types reach older clients unadapted.** A column of a type newer than
+  the client's protocol, such as 23ai's `BOOLEAN` or `VECTOR` sent to a client
+  that negotiated an 11g-era version, goes out with its own type code. Real
+  Oracle sends those clients a form they know. Carrying such features to older
+  clients in a form they can read is planned:
+  [#2394](https://github.com/seerdb/seerdb/issues/2394) measures it, and
+  [#2395](https://github.com/seerdb/seerdb/issues/2395) is the design.
+
+## Troubleshooting
+
+**The Mirror won't start.** It says why and exits. The common ones:
+- `no accounts to serve`: list accounts under `[clients]` or in
+  `MIRROR_USERS`, or keep them in a database with `--auth-conninfo`.
+- `--per-user-roles needs --auth-conninfo`: per-user mode keeps each user's
+  role password with the account.
+- `cannot load the TLS certificate or key`: check the PEM files and that the
+  Mirror's account can read them.
+- For a passthrough, `give --field-version, or an account ... to probe the
+  upstream with`: the Mirror logs in upstream once at start-up to learn the
+  version to present.
+
+**A client can't log in.**
+- **ORA-01017:** the user name or password is wrong, or the account isn't one
+  the Mirror serves. Names fold to upper case.
+- **ORA-28000:** the name is locked after repeated failures. An administrator
+  runs `ALTER USER name ACCOUNT UNLOCK`, or the Mirror restarts.
+- **The client is refused before the password:** check what it negotiated.
+  The log names a client below the version the Mirror serves (`client
+  negotiated TTC field version ..., below the ... this Mirror serves`).
+- **TLS fails:** recent clients, python-oracledb's thin mode among them, refuse
+  a certificate without the standard extensions, such as an Authority Key
+  Identifier. Issue it from a proper CA (*Encryption*). A client that requires
+  ANO is refused by a Mirror run with `--encryption accepted`.
+
+**Ordinary Oracle SQL fails.**
+- **Built-in functions are missing** (`NVL`, `DECODE`, `TO_CHAR`,
+  `ADD_MONTHS`, ...): orafce isn't installed in the database. The Mirror tries
+  `CREATE EXTENSION orafce` when it connects. If its role may not, have an
+  administrator create it (*What the database needs*).
+- **A `VECTOR` column is refused:** pgvector isn't installed.
+- **A statement is refused by name**, such as `ROWNUM` with `ORDER BY` at the
+  same level: it is one of the *Known limits*, and the message says which.
+
+**After an upgrade, sessions are refused.** Another Mirror serving the same
+database is still on an older release. Upgrade every Mirror serving a database
+together (*Upgrades*). A database a preview release set up is refused with *set
+it up afresh*.
+
+**It is slower than expected.** Record a migration profile and compare it with
+one recorded through a passthrough in front of Oracle (*Migration profile*).
+The report says whether the time is the Mirror's own or the statement's in
+PostgreSQL.
+
+## Writing a backend
+
+The `Backend` protocol is promised from general availability (*Stability*), so
+a backend of your own is supported.
+
+- **Where it is defined:** in `seerdb/server/backend.py`, with the types it
+  takes and returns.
+- **What a backend implements:**
+  - `capabilities`, the features it supports;
+  - `authenticate(username)`, returning that user's password, which O5LOGON
+    needs, or `None` to refuse. `credential_lookup` covers a plain map of
+    accounts;
+  - `execute(sql, binds)`;
+  - `commit()`, `rollback()` and `close()`.
+  
+  Optional methods add features. A feature a backend doesn't have is refused
+  with a clean ORA error, never mis-encoded.
+- **Serving it:** `seerdb.serve(host, port, backend_factory=...)` serves it,
+  with one backend per session.
+
+[`examples/sqlite_backend.py`](../examples/sqlite_backend.py) is a small
+complete one, over SQLite. [`examples/mirror_over_sqlite.py`](../examples/mirror_over_sqlite.py)
+runs it. SQLite runs no PL/SQL, so it serves thin clients only: sqlplus's login
+needs a backend that runs PL/SQL.
