@@ -64,8 +64,17 @@ def _auth_head(values: dict) -> None:
     values['user_length'] = len(values.get('user', b''))
 
 
+def _o9i_iov(values: dict) -> None:
+    # A 9.2 bind prompt counts its binds as `iterations * 256 + requests`, and the
+    # directions are that many bytes (#798, #2311).
+    binds = len(values.get('directions', b''))
+    values['requests'] = binds % 256
+    values['iterations'] = binds // 256
+    values['binds'] = binds
+
+
 # What a caller keeps to that the schema does not say, per schema.
-CONTRACTS = {'_AUTH_HEAD': _auth_head}
+CONTRACTS = {'_AUTH_HEAD': _auth_head, '_O9I_IOV': _o9i_iov}
 
 
 def _schemas() -> dict[str, wire_schema.Schema]:

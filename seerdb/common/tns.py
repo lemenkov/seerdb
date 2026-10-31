@@ -2268,6 +2268,46 @@ _O8I_STATUS: wire_schema.Schema = (
     ('when', 'code', (('chr', 'message'),)),
 )
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+# The experimental 9i OALL8 bind prompt (#798): 8i's (_O8I_IOV) -- flags, the
+# binds as a ub2 requests and a ub2 iterations (`iterations * 256 + requests`,
+# 300 coming as `2c 00 01 00`, #2311), the iterations this time -- with a byte
+# 8i lacks after the flags (5 for a block) and another, and 38 bytes where 8i
+# has 8 (zero in a block's, not in a bound DML's), then one direction mask per
+# bind. Read from every live 9.2 block reply the decode tests hold.
+_O9I_IOV: wire_schema.Schema = (
+    ('const', bytes([TTI_IOV])),
+    ('u8', 'flags'),
+    ('u8', 'kind'),
+    ('bytes', 'opaque_3', 1),
+    ('n2', 'requests'),
+    ('n2', 'iterations'),
+    ('n4', 'iterations_this_time'),
+    ('bytes', 'opaque_12', 38),
+    ('derive', 'binds', lambda v: v['iterations'] * 256 + v['requests']),
+    ('bytes', 'directions', 'binds'),
+)
+# The experimental 9i OALL8 row header (#798), 50 bytes and two tails: the flags,
+# the columns, the rows the call asked for, the length of the column bit vector
+# that follows (a ub2 at 26 -- telling it from the byte after the header is not
+# possible, three columns all sent being a vector of 0x07, the TTI_RXD token) and
+# of the rowid after it (a ub2 at 42: SELECT ... FOR UPDATE sends the 13-byte
+# rowid of the row it locks). Its other bytes are kept as they come: pointers and
+# fields no capture has explained. Read from every live 9.2 row stream the decode
+# tests hold.
+_O9I_RXH: wire_schema.Schema = (
+    ('const', bytes([TTI_RXH])),
+    ('u8', 'flags'),
+    ('bytes', 'opaque_2', 2),
+    ('n4', 'columns'),
+    ('n4', 'rows_asked'),
+    ('bytes', 'opaque_12', 14),
+    ('n2', 'vector_length'),
+    ('bytes', 'opaque_28', 14),
+    ('n2', 'rowid_length'),
+    ('bytes', 'opaque_44', 6),
+    ('bytes', 'vector', 'vector_length'),
+    ('bytes', 'rowid', 'rowid_length'),
+)
 # The experimental 9i OALL8 status (#798): 8i's (_O8I_STATUS) from its row count
 # through its warnings, behind the call status (a ub4: 2 a DML, 4 a describe-only
 # execute, 5 a bound one's first parse) and a one-byte sequence the 10g+ OER
@@ -2480,6 +2520,11 @@ _O8I_CELL_FROM_O9I = wire_schema.compile_decoder(_O8I_CELL, _O9I)
 _O8I_OUT_UNASSIGNED_FROM_O9I = wire_schema.compile_decoder(_O8I_OUT_UNASSIGNED, _O9I)
 _O8I_LONG_CELL_FROM_O9I = wire_schema.compile_decoder(_O8I_LONG_CELL, _O9I)
 _O7_LOBOPS_REPLY_FROM_O9I = wire_schema.compile_decoder(_O7_LOBOPS_REPLY, _O9I)
+# The session-state RPA ahead of a 9.2 status is 8i's (_O8I_RPA): five ub4s, the
+# third the statement's cursor, and four bytes -- 27 (#798).
+_O8I_RPA_FROM_O9I = wire_schema.compile_decoder(_O8I_RPA, _O9I)
+_O9I_IOV_FROM_O9I = wire_schema.compile_decoder(_O9I_IOV, _O9I)
+_O9I_RXH_FROM_O9I = wire_schema.compile_decoder(_O9I_RXH, _O9I)
 _OAC_OCI = wire_schema.compile_encoder(_OAC, _OCI)
 _O7_LOBOPS_O9I = wire_schema.compile_encoder(_O7_LOBOPS, _O9I)
 _CLOSE_CURSORS_O9I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O9I)
@@ -14658,13 +14703,6 @@ _DCB_COLUMN_9I_FROM_OCI = wire_schema.compile_decoder(
     ),
     _OCI,
 )
-# What may follow the RXH's fixed 50 bytes; anything else there is the optional
-# trailing column bit vector (ceil(ncols/8) bytes).
-_O9I_OALL8_ROW_TOKENS = frozenset(
-    {TTI_RXD, TTI_RXH, TTI_BVC, TTI_OER, TTI_RPA, TTI_DCB, TTI_STA}
-)
-# The fixed 50-byte OCI row header (_OCI_RXH length).
-_O9I_OALL8_RXH_LEN = 50
 
 
 def decode_9i_oall8_describe(Data: bytes) -> tuple[list[dict], bytes]:
@@ -14798,23 +14836,11 @@ def decode_9i_oall8_exec_response(
         while Rest:
             Token = Rest[0]
             if Token == TTI_RXH:
-                # The header names the length of the column bit vector that may
-                # follow it, a ub2 at offset 26 (0: none). Telling it from the
-                # byte after the header is not possible: three columns all sent
-                # is a vector of 0x07, the TTI_RXD token.
-                if len(Rest) < _O9I_OALL8_RXH_LEN:
-                    raise IndexError('row header')
-                VecLen = int.from_bytes(Rest[26:28], 'little')
-                # A ub2 at 42 is the length of the row's rowid, which follows the
-                # vector: a SELECT ... FOR UPDATE sends the 13-byte physical rowid
-                # of the row it locks (read live on 9.2); skipped, as the column
-                # values carry the row.
-                RowidLen = int.from_bytes(Rest[42:44], 'little')
-                Rest = Rest[_O9I_OALL8_RXH_LEN:]
-                if len(Rest) < VecLen + RowidLen:
-                    raise IndexError('row header vector / rowid')
-                Vector = bytes(Rest[:VecLen]) if VecLen else None
-                Rest = Rest[VecLen + RowidLen :]
+                # The row header (_O9I_RXH): its column bit vector, when it names
+                # one, says which columns the first row sends; a FOR UPDATE's
+                # rowid behind it is skipped, the columns carrying the row.
+                (Header, Rest) = _O9I_RXH_FROM_O9I(Rest)
+                Vector = bytes(Header['vector']) if Header['vector'] else None
             elif Token == TTI_BVC:
                 # A bit vector for the NEXT row: token + ub2 count + the vector.
                 Rest = Rest[1:]
@@ -14885,27 +14911,22 @@ def decode_9i_oall8_exec_response(
     return (Rows, Rest, Last)
 
 
-# The session-state piggyback (TTI_RPA, 0x08) that precedes a 9i OALL8 status is a
-# fixed 27 bytes -- measured constant across SELECT terminals, DML/DDL/txn replies
-# and bound block / OUT-bind replies on 9.2. The OER follows it.
-_O9I_OALL8_RPA_LEN = 27
-
-
 def _o9i_oall8_oer(Terminal: bytes) -> bytes:
     # The status OER (0x04) in a 9i OALL8 reply's terminal, past a leading TTI_RPA
-    # (0x08) session-state piggyback. The RPA is a fixed 27 bytes, so skip it by its
-    # length and take the OER straight after -- a first-parse RPA carries value bytes
-    # that collide with the OER token, so scanning for a 0x04 could land inside it.
-    # `Terminal` is the bytes from the RPA (a SELECT reply's post-row tail) or from
-    # the OER itself; a caller with a leading TTI_IOV / TTI_RXD strips those first.
+    # (0x08) session-state piggyback, which is 8i's (_O8I_RPA, 27 bytes): read
+    # through, so the OER is taken straight after it -- a first-parse RPA carries
+    # value bytes that collide with the OER token, so scanning for a 0x04 could
+    # land inside it. `Terminal` is the bytes from the RPA (a SELECT reply's
+    # post-row tail) or from the OER itself; a caller with a leading TTI_IOV /
+    # TTI_RXD strips those first.
     Rest = Terminal
-    if (
-        Rest[:1] == bytes([TTI_RPA])
-        and len(Rest) >= _O9I_OALL8_RPA_LEN + 5
-        and Rest[_O9I_OALL8_RPA_LEN] == TTI_OER
-        and not any(Rest[_O9I_OALL8_RPA_LEN + 2 : _O9I_OALL8_RPA_LEN + 5])
-    ):
-        return Rest[_O9I_OALL8_RPA_LEN:]
+    if Rest[:1] == bytes([TTI_RPA]):
+        try:
+            (_, After) = _O8I_RPA_FROM_O9I(Rest)
+        except (IndexError, DataError):
+            After = b''
+        if After[:1] == bytes([TTI_OER]) and len(After) >= 5 and not any(After[2:5]):
+            return After
     # No (or an unexpected) RPA: scan for the first 0x04 that begins a real OER head
     # (its leading call-type field is small, so the three bytes after it are zero).
     At = Rest.find(bytes([TTI_OER]))
@@ -15005,15 +15026,20 @@ def decode_9i_oall8_dml_rowid(Terminal: bytes) -> str | None:
 
 
 def decode_9i_oall8_bind_directions(Data: bytes, NumBinds: int) -> list[int] | None:
-    # The direction of each bind, from a 9i OALL8 block reply's IOV bind prompt,
-    # or None when the reply opens with none (a block that failed answers with the
-    # bare status). The prompt is a fixed 50-byte head and then one mask per bind
-    # in bind order, the masks the compact path reads (0x10 OUT, 0x20 IN, 0x30 IN
-    # OUT; decode_fv2_bind_directions): `10 10 20` live on 9.2 for
-    # `SELECT n, s INTO :n, :s ... WHERE n = :k`.
-    if Data[:1] != bytes([TTI_IOV]) or len(Data) < 50 + NumBinds:
+    # The direction of each bind, from a 9i OALL8 block reply's IOV bind prompt
+    # (_O9I_IOV), or None when the reply opens with none (a block that failed
+    # answers with the bare status). One mask per bind in bind order, the masks
+    # the compact path reads (0x10 OUT, 0x20 IN, 0x30 IN OUT;
+    # decode_fv2_bind_directions): `10 10 20` live on 9.2 for `SELECT n, s INTO :n,
+    # :s ... WHERE n = :k`. The prompt counts its binds itself; a count that is not
+    # the call's is a prompt this reader does not know, and gives None.
+    if Data[:1] != bytes([TTI_IOV]):
         return None
-    return list(Data[50 : 50 + NumBinds])
+    try:
+        (Iov, _) = _O9I_IOV_FROM_O9I(Data)
+    except (IndexError, DataError):
+        return None
+    return list(Iov['directions']) if Iov['binds'] == NumBinds else None
 
 
 def _o9i_oall8_refcursor_cell(Data: bytes) -> tuple[tuple[int, list], bytes]:
@@ -15069,7 +15095,9 @@ def _o9i_oall8_block_parts(
 ) -> tuple[list, bytes]:
     # A 9i OALL8 block reply's OUT values, and the bytes after them -- the RPA and
     # the status (decode_9i_oall8_block_out).
-    Rest = Data[50 + NumBinds :] if Data[:1] == bytes([TTI_IOV]) else Data
+    Rest = Data
+    if Data[:1] == bytes([TTI_IOV]):
+        (_, Rest) = _O9I_IOV_FROM_O9I(Data)  # the bind prompt (_O9I_IOV)
     OutValues: list = []
     if NumOut > 0 and Rest[:1] == bytes([TTI_RXD]):
         Rest = Rest[1:]
