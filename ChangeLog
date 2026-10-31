@@ -1,8 +1,34 @@
 Entries are sorted chronologically from oldest to youngest within each release,
 releases are sorted from youngest to oldest.
 
+version 3.4.0:
+- **One wire schema per message, for the client too** (#2293): every message the client reads or writes, on 8i, 9i and 10g+, now compiles from one description shared with the Mirror. Each schema round-trips: what a decoder reads re-encodes as it came (#2290). No behaviour change, except that **8i fetches are 10-15% slower**, because each cell is decoded through the schema layer (#2329).
+- **Fixes on 9i and 8i**:
+  - **On 9i, a query of more than 255 columns** failed with ORA-03115 (#2306).
+  - **A PL/SQL block with 256 or more binds** lost its bind directions, on 9i and 8i (#2311).
+  - **On 8i, an error after a query's first row** was dropped, and the rows before it returned as if complete (#2314). **On 9i, an error a fetch met** lost its message (#2315).
+  - **`cursor.description` sizes on 8i and 9i** for DATE, ROWID and NUMBER are now 10g's (#2326).
+  - **On 8i, a PL/SQL block's reply longer than one packet** was read from its first packet only (#2334).
+  - **On 9i, a UROWID longer than 128 characters** was cut to 128 (#2335).
+  - **A refused login on 8i or 9i** raised `AssertionError` or ORA-01012. It now raises the server's ORA-01017 (#2340).
+  - **Every 9i session identified itself** as program "JDBC Thin Client" on machine "o9i". It now logs in as 10g does, and reports the program, machine and OS user from the connection's settings (#2342).
+- **Mirror (tech preview): over PostgreSQL**:
+  - `SYS_CONTEXT('USERENV', 'HOST')` returns the client's machine (#2346);
+  - `RPAD` / `LPAD` with three arguments works in a PL/SQL block (#2337);
+  - arithmetic on two small integer binds no longer overflows at `smallint` (#2307);
+  - a VARCHAR2-keyed index-organized table gets a logical rowid (#2360).
+- **A ws:// / wss:// transport**, a seerdb extension (`pip install "seerdb[ws]"`): a `ws://` or `wss://` DSN carries the Oracle protocol over a WebSocket, to a Mirror's WebSocket listener (#1988).
+- **Mirror (tech preview): WebSocket listeners**, both seerdb extensions:
+  - `--ws-port` serves the WebSocket transport, as an auditing gateway for browser clients, with an origin allow-list (#1989);
+  - `--query-ws-port` serves a JSON-over-WebSocket query endpoint (MVP) (#2371).
+- **Mirror (tech preview): a parsed SQL translator, first constructs** (#1865): `(+)` outer joins, `ROWNUM` as `LIMIT`, and `CONNECT BY` as `WITH RECURSIVE`. Each was proven against the regex rule it replaces.
+- **On 9i and 8i, non-ASCII CLOB text** read back garbled and failed to write. It now travels in the session's character set, not the column's (#2383).
+- **Experimental: the native 9i dialect**, `connect(..., oall8=True)`, sync and async (#790, #798). It talks to 9i as a native 9.2 OCI client does: the native login, queries, DML, PL/SQL with IN and OUT binds, LOBs, array DML, REF CURSORs, and object, collection and `CURSOR()` columns. On 9.2 it passes the integration suite except the cursor-cache tests, since it keeps no cursor cache. It stays an opt-in, because the client has to choose it before the server identifies itself (#799). The default 9i path is unchanged.
+- **Mirror (tech preview): the user guide for general availability** (#1864). It covers what is supported, how to run it, troubleshooting and writing a backend. The Mirror now calls itself an initial implementation, a technology preview until general availability, in its start-up warning and in the docs.
+- **SECURITY.md: the policy from general availability on** (#1959). Fixes are developed privately under an embargo of at most 90 days; reports are acknowledged within 7 days; high and critical fixes are targeted within 30 days.
+
 version 3.3.0:
-- **Mirror (tech preview): over PostgreSQL, who may read and administer what**: a synonym's target name is quoted with its quotes doubled (#2219); the users' group reads no session's proxy record (#2220); system privileges and the DBA role decide who may administer (#1936); in per-user mode an administrator reads the DBA_ views (#2223); and the guide says per-user mode can't hide source text (#2221).
+- **Mirror (tech preview): over PostgreSQL, who may read and administer what**: a synonym's target name is quoted with its quotes doubled (#2219); the users' group reads no session's proxy record (#2220, GHSA-6qw5-v992-69fx); system privileges and the DBA role decide who may administer (#1936); in per-user mode an administrator reads the DBA_ views (#2223); and the guide says per-user mode can't hide source text (#2221).
 - **Mirror (tech preview): one message schema for each wire message** (#2064): the Mirror's thin and OCI request decoders and reply encoders now compile from one description per message, with a codec per dialect, instead of offsets into captured bytes. No behaviour changes.
 - **Mirror (tech preview): sqlplus fixes**: an NCHAR OUT bind goes back to sqlplus in UTF-16 (#2239); sqlplus 11.2 and 10.2 logins no longer hang on the auth pairs' count (#2249); sqlplus 11.2's wide LOB read is read whole (#2251).
 - **Oracle 9i: much of what later releases have**, over its `TTI_ALL7` dialect:

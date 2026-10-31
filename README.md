@@ -25,8 +25,8 @@ scrollable cursors, 23ai types (JSON / `BOOLEAN` / `VECTOR`), and the SODA
 document store. It is usable for the features listed below; the feature matrix
 spells out what is and isn't supported.
 
-[`ROADMAP.md`](ROADMAP.md) covers what is being worked on next, what is parked
-and why, and the rule that decides when the next major release is reachable.
+[`ROADMAP.md`](ROADMAP.md) covers what is being worked on now, what comes
+next, and the principle behind it.
 [`docs/USE-CASES.md`](docs/USE-CASES.md) collects situations seerdb could fit,
 and where each stops being the right tool.
 
@@ -272,7 +272,7 @@ to every supported server — from Oracle **8i (8.1.7) through 26ai**:
 | 19c · 18c · 12c | ✅ supported | same 12c+ wire protocol as 21c |
 | 11g (11.2) | ✅ supported | primary reference tier |
 | 10g (10.2) | ✅ supported | |
-| 9i (9.2) | ✅ common surface | the legacy field-version-2 (`TTI_ALL7`) dialect — see the matrix note |
+| 9i (9.2) | ✅ common surface | the legacy field-version-2 (`TTI_ALL7`) dialect — see the matrix note; the native `OALL8` dialect is an experimental opt-in (`oall8=True`) |
 | 8i (8.1.7) | ✅ common surface | the 9.2-era `OALL8` dialect; the oldest and most limited tier — see the matrix note. 8.1.7 is the floor (Oracle 8.0 is unsupported) |
 
 CI runs the offline suite on Python 3.10–3.14 and the integration suite against
@@ -298,7 +298,7 @@ exercise.
 | **Statement validation** — `cursor.parse()` parses a statement on the server without running it (10g+) | ✅ |
 | **Arrow / DataFrame fetch** — `cursor.fetch_df_all` / `fetch_df_batches` (pyarrow `Table` / record batches) | ✅ |
 | **SODA** — document store over `DBMS_SODA`: collections, documents, query-by-example (with streaming), insert / read / upsert / update / delete / bulk, indexing + data guide (18c+) | ✅ |
-| **Connection** — pool (warm sessions + idle health-check), statement cache, `changepassword`, TLS, wallet mTLS, DRCP (`server_type='pooled'`, with `cclass` / `purity`; a DRCP pool generates its own class, as in python-oracledb), proxy auth, an opt-in negotiation cache that skips a round trip on fast-auth reconnects; `dsn` as an Easy Connect string, a connect descriptor (with address failover) or a `tnsnames.ora` alias, IPv6, TCPS through an HTTPS proxy | ✅ |
+| **Connection** — pool (warm sessions + idle health-check), statement cache, `changepassword`, TLS, wallet mTLS, DRCP (`server_type='pooled'`, with `cclass` / `purity`; a DRCP pool generates its own class, as in python-oracledb), proxy auth, an opt-in negotiation cache that skips a round trip on fast-auth reconnects; `dsn` as an Easy Connect string, a connect descriptor (with address failover) or a `tnsnames.ora` alias, IPv6, TCPS through an HTTPS proxy; `ws://` / `wss://` to a Mirror's WebSocket listener (a seerdb extension, the `ws` extra) | ✅ |
 | **Authentication** — O3LOGON (8i / 9i) and O5LOGON (10g+, 128 / 192 / 256-bit); token-based auth — OAuth2 (bare JWT) and OCI IAM (signed) for Autonomous Database | ✅ |
 | **Native network encryption** — Advanced Networking (ANO): AES-CBC encryption + SHA-2 data-integrity negotiated at connect, for a server with `SQLNET.ENCRYPTION_SERVER` / `CRYPTO_CHECKSUM_SERVER` set | ✅ |
 | **Advanced Queuing (AQ)** — enqueue / dequeue over `DBMS_AQ`, including JSON payloads | ✅ |
