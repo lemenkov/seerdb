@@ -6426,15 +6426,29 @@ So the 9i encoder is the 8i encoder (§19.9, §19.11–19.12) with every pointer
 length field widened to 8 bytes and the `0xFE` present-pointer sentinel where the
 8i form writes a `01` flag; the SQL text and the bind values (`_encode_8i_bind_value`,
 e.g. `07 02 c1 2b` for NUMBER 42) are shared verbatim. Encoders:
-`_encode_9i_oall8` / `encode_9i_oall8_dml` / `_encode_9i_bind_oac`. These encoders
-cover DML / DDL and transaction control with scalar binds, byte-verified against a
-native 9.2 client (`test_tns_encode.TestO9iOall8Messages`); SELECT, PL/SQL blocks
-and the DML ... RETURNING reply are later increments. The client, however, wires
-the `oall8` dialect for the native **login only** so far (#790): it completes the
-OCI PRO/DTY negotiation and the 8-byte O3LOGON OSESSKEY/OAUTH handshake, and every
-data operation over the dialect raises a clear `NotSupportedError` until the
-increments above land. All of this is behind the `oall8` opt-in, so the default 9i
-path is byte-identical.
+`_encode_9i_oall8` / `encode_9i_oall8_dml` / `_encode_9i_bind_oac`. The encoders are byte-verified against a native 9.2 client
+(`test_tns_encode.TestO9iOall8Messages`).
+
+**The client's `oall8` dialect (#798).**
+- It runs on 8i's OALL8 call sequence, with per-version hooks where 9.2 differs.
+- Each 9.2 frame is 8i's wire schema at the 64-bit widths, or the shared OCI
+  schema.
+- It covers what the default 9i path covers, sync and async: SELECT, DML / DDL,
+  PL/SQL with IN / OUT binds, array DML, LOBs, BFILE and LONG, and REF CURSOR OUT
+  binds.
+- It also covers object, collection, XMLTYPE and `CURSOR()` columns. For these,
+  the 9.2 describe has a ub4 type-name length, one `0x4b` byte before the first
+  column, and a trailer with no lead byte. It carries the dictionary type codes
+  58 / 121 / 122 / 123, which map to `TNS_TYPE_ADT`.
+- Over the 9.2 bed it passes the integration suite except the cursor-cache
+  tests: the dialect keeps no cursor cache.
+- One server difference: a bare `CONNECT BY LEVEL` on `dual` returns one row over
+  the native form, as it does to sqlplus 9.2, but every row through a subquery.
+
+**It stays an opt-in (#799).** The client must choose the dialect before the
+server identifies itself: the OCI-form banner is in its first TTI_PRO, and
+nothing earlier tells an 8i server from a 9i one. The default 9i path is
+byte-identical with or without this code.
 
 ## 20. Oracle 23ai field version 24 — fast-auth + the fv24 framing (#89)
 

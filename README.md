@@ -328,6 +328,22 @@ through its locator), object and REF binds, array DML with `RETURNING`, and
 `DB_TYPE_NVARCHAR` / `NCHAR` for full Unicode there rather than a plain `str`
 bind.
 
+**Experimental: the native 9i dialect** (`connect(..., oall8=True)`, also on
+`connect_async`). Instead of the compact form, seerdb logs in and talks to 9i as
+a native 9.2 OCI client does: the 64-bit `OALL8` form, on the same call sequence
+as 8i. Over the 9.2 bed it passes the integration suite like the default path
+does, with these differences:
+- **No cursor cache**, as on 8i, so a repeated statement is parsed again.
+- **Only the 8-byte O3LOGON key.** The 16-byte variant native sqlplus gets is not
+  supported.
+- **9.2's own answers can differ.** A bare `CONNECT BY LEVEL` on `dual` returns
+  one row, as it does to sqlplus 9.2. Wrap it in `SELECT * FROM (...)` to get
+  every row.
+- **Validated on 9.2.0.4 only.**
+
+It stays an opt-in: the client has to choose the dialect before the server
+identifies its version (#799). The flag is ignored on other tiers.
+
 **Oracle 8i** (8.1.7, the 9.2-era `OALL8` dialect) is the oldest and most limited
 tier. It runs connect (`O3LOGON`), SELECT, single-row DML / DDL, PL/SQL blocks
 with IN / OUT binds, CLOB / BLOB and native BFILE reads, LONG / LONG RAW, ROWID /
