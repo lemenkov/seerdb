@@ -8,11 +8,12 @@ subpackage is the inverse — it *answers* that protocol for real Oracle clients
 (sqlplus, python-oracledb, SeerODBC), so a non-Oracle backend (e.g. SQLite or
 PostgreSQL) can sit behind it.
 
-**A highly experimental technology preview.** The Mirror ships with seerdb
-(``pip install "seerdb[mirror]"``) to be tried, not run in production,
-but stays outside the semantic-versioning promise the client (DB-API 2.0)
-surface keeps: its API, its command line and its behaviour may change or break
-in any release, a minor or patch one included. ``__provisional__`` says so to
+**An initial implementation, a technology preview until general
+availability.** The Mirror ships with seerdb (``pip install "seerdb[mirror]"``)
+to be tried, not yet run in production. Until general availability it stays
+outside the semantic-versioning promise the client (DB-API 2.0) surface keeps:
+its API, its command line and its behaviour may change in any release, a minor
+or patch one included. ``__provisional__`` says so to
 code, and a Mirror logs it when it starts serving. Treat
 :func:`~seerdb.server.service.serve` / :class:`~seerdb.server.service.Server`
 and everything under ``seerdb.server`` accordingly.
