@@ -14670,6 +14670,18 @@ def decode_9i_oall8_dml_response(Terminal: bytes) -> tuple[int, int, str | None]
     return (0 if Code else Rows, Code, Status['message'])
 
 
+def decode_9i_oall8_bind_directions(Data: bytes, NumBinds: int) -> list[int] | None:
+    # The direction of each bind, from a 9i OALL8 block reply's IOV bind prompt,
+    # or None when the reply opens with none (a block that failed answers with the
+    # bare status). The prompt is a fixed 50-byte head and then one mask per bind
+    # in bind order, the masks the compact path reads (0x10 OUT, 0x20 IN, 0x30 IN
+    # OUT; decode_fv2_bind_directions): `10 10 20` live on 9.2 for
+    # `SELECT n, s INTO :n, :s ... WHERE n = :k`.
+    if Data[:1] != bytes([TTI_IOV]) or len(Data) < 50 + NumBinds:
+        return None
+    return list(Data[50 : 50 + NumBinds])
+
+
 def decode_9i_oall8_block_out(
     Data: bytes, NumBinds: int, NumOut: int
 ) -> tuple[list, int, int, str | None]:
@@ -14681,14 +14693,26 @@ def decode_9i_oall8_block_out(
     # after it sits at offset 50 + NumBinds (live-verified for 1 and 3 binds).
     # Returns (out_values, rowcount, code, message); out_values holds the raw value
     # bytes per OUT bind (None for a NULL), for the caller to decode per Var type.
-    Rest = Data[50 + NumBinds :]
+    # A block that fails at run time (a SELECT ... INTO matching nothing) answers
+    # with the bare status, no IOV: skipping the IOV's length there landed past the
+    # status and read the error as success.
+    Rest = Data[50 + NumBinds :] if Data[:1] == bytes([TTI_IOV]) else Data
     OutValues: list = []
     if NumOut > 0 and Rest[:1] == bytes([TTI_RXD]):
         Rest = Rest[1:]
         for _ in range(NumOut):
             Length = Rest[0]
+            if Length == 0xFF:
+                # An OUT bind the block never assigned (a RETURNING ... INTO that
+                # matched no row): 0xFF and a ub2 return code (3105), no value or
+                # indicator -- `ff 210c`, the compact path's `ff 02 0c 21` (#801).
+                # Reading a length and four bytes after it ran into the status.
+                Rest = Rest[3:]
+                OutValues.append(None)
+                continue
             Value = bytes(Rest[1 : 1 + Length]) if Length else None
-            Rest = Rest[1 + Length + 4 :]  # value + ub4 indicator
+            # value + a ub2 indicator (-1 for NULL) + a ub2 return code (1405)
+            Rest = Rest[1 + Length + 4 :]
             OutValues.append(Value)
     # `Rest` now sits on the RPA + OER, so read the status from there rather than
     # rescanning `Data` from the start -- the IOV and the OUT RXD hold value bytes

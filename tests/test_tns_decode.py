@@ -7919,6 +7919,74 @@ class TestNative9iOall8Select(unittest.TestCase):
         self.assertEqual(len(rows[1][0]), 545)
         self.assertTrue(rows[1][0].startswith('*BABAuWqBkGtra2tra2t'))
 
+    # PL/SQL block replies from a live 9.2 server: two OUT binds a RETURNING ...
+    # INTO that matched no row never assigned; `:result := 'got ' || :given`
+    # (OUT, IN); and a SELECT ... INTO matching nothing, which fails at run time.
+    BLOCK_TWO_UNASSIGNED = bytes.fromhex(
+        '0b01050002000000010000000000000000000000000000000000000000000000'
+        '000000000000000000000000000000000000101007ff210cff210c080500929f'
+        '2d02000000000700000002000000000000000000000004050000000101000000'
+        '000000000000070000002f000000000000000000000000000000000000000000'
+        '00000000000a0000010000003601000000000000000000000000000080d0d403'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00000000000000000000000000000000000000000000000000000000'
+    )
+    BLOCK_OUT_THEN_IN = bytes.fromhex(
+        '0b01050002000000010000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000001020070b676f7420612076616c75'
+        '6500000000080500929f2d02000000000a000000020000000000000000000000'
+        '040500000001010000000000000000000a0000002f0000000000000000000000'
+        '0000000000000000000000000000000c00000100000036010000000000000000'
+        '00000000000080d0d40300000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000000000000'
+    )
+    BLOCK_NO_ROWS = bytes.fromhex(
+        '040100000001000000007b05000000000c0000002f0000000000000000000000'
+        '0000000000000000000000000000000e00000000000036010000000000000000'
+        '00000000000080d0d40300000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '0000000000002e4f52412d30313430333a206e6f206461746120666f756e640a'
+        '4f52412d30363531323a206174206c696e6520310a'
+    )
+
+    def test_an_unassigned_out_bind_is_a_null(self):
+        # 0xFF and a ub2 return code, nothing more (#801's OALL8 form). Read as a
+        # length, the first one ran into the second and the status.
+        from seerdb.common.tns import decode_9i_oall8_block_out
+
+        (values, _, code, _) = decode_9i_oall8_block_out(
+            self.BLOCK_TWO_UNASSIGNED, 2, 2
+        )
+        self.assertEqual((values, code), ([None, None], 0))
+
+    def test_the_bind_prompt_names_each_binds_direction(self):
+        # One mask per bind after the prompt's 50-byte head: OUT, then IN. Only the
+        # OUT one comes back (#1242).
+        from seerdb.common.tns import (
+            decode_9i_oall8_bind_directions,
+            decode_9i_oall8_block_out,
+        )
+
+        self.assertEqual(
+            decode_9i_oall8_bind_directions(self.BLOCK_OUT_THEN_IN, 2), [16, 32]
+        )
+        (values, _, code, _) = decode_9i_oall8_block_out(self.BLOCK_OUT_THEN_IN, 2, 1)
+        self.assertEqual((values, code), ([b'got a value'], 0))
+
+    def test_a_block_that_fails_answers_with_the_bare_status(self):
+        # No prompt: the reply is the status, ORA-01403. Skipping a prompt's length
+        # first landed past it and read the failure as success (#1039).
+        from seerdb.common.tns import (
+            decode_9i_oall8_bind_directions,
+            decode_9i_oall8_block_out,
+        )
+
+        self.assertIsNone(decode_9i_oall8_bind_directions(self.BLOCK_NO_ROWS, 1))
+        (values, _, code, message) = decode_9i_oall8_block_out(self.BLOCK_NO_ROWS, 1, 1)
+        self.assertEqual((values, code), ([], 1403))
+        self.assertTrue(message.startswith('ORA-01403'))
+
 
 class TestO8iBfile(unittest.TestCase):
     """Oracle 8i native BFILE read (#401, PROTOCOL §19.17): FILE_OPEN -> GETLEN

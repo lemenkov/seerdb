@@ -41,6 +41,7 @@ from seerdb.common.tns import (
     decode_8i_dml_rowid,
     decode_8i_exec_response,
     decode_8i_terminal_error,
+    decode_9i_oall8_bind_directions,
     decode_9i_oall8_block_out,
     decode_9i_oall8_cursor_id,
     decode_9i_oall8_describe,
@@ -1301,6 +1302,12 @@ class Fv2Oall8Dialect(Oall8Dialect):
             self._closing() + self._encode_dml(encode_9i_sql_text(sql), stmt_type, bind)
         )
         buf = yield from self._recv_dml_terminal('PL/SQL block')
+        # The prompt says which binds the block writes; only those come back. A
+        # Var read only as input beside an OUT one was taken for OUT and shifted
+        # the values (#1242). The masks are also cursor.bind_directions (#1064).
+        directions = decode_9i_oall8_bind_directions(buf, len(bind))
+        if directions is not None:
+            out_positions = [i for i, d in enumerate(directions) if d & FV2_BIND_OUT]
         if out_positions:
             (out_values, _row_count, err_code, message) = decode_9i_oall8_block_out(
                 buf, len(bind), len(out_positions)
@@ -1309,9 +1316,14 @@ class Fv2Oall8Dialect(Oall8Dialect):
             record = {
                 'out_positions': out_positions,
                 'out_values': out_values,
-                'directions': None,
+                'directions': directions,
             }
             return (0, 0, 0, (None, None), [record], None, None, [], None)
-        (_row_count, err_code, message) = decode_9i_oall8_dml_response(buf)
+        (_row_count, err_code, message) = decode_9i_oall8_dml_response(
+            buf[50 + len(bind) :] if directions is not None else buf
+        )
         _raise_ora(err_code, message)
+        if directions:
+            record = {'out_positions': [], 'out_values': [], 'directions': directions}
+            return (0, 0, 0, (None, None), [record], None, None, [], None)
         return (0, 0, 0, (None, None), [], None, None, [], None)
