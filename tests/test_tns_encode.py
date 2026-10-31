@@ -7653,6 +7653,65 @@ class TestO9iOall8Messages(unittest.TestCase):
         ):
             self.assertEqual(ours[field], native[field], field)
 
+    # A native 9.2 sqlplus's OSESSKEY and OAUTH (native_9i_login_2.pcap).
+    NATIVE_9I_OSESSKEY = bytes.fromhex(
+        '03760240735e00000000000300000001000000b096ffbf7f000000030000002a'
+        '0000009093ffbf7f0000008e91ffbf7f0000000370796f0f0000000f41555448'
+        '5f50524f4752414d5f4e4d170000001773716c706c7573406f39692028544e53'
+        '2056312d563329000000000c0000000c415554485f4d414348494e4503000000'
+        '036f3969000000000800000008415554485f5049440500000005313639383700'
+        '000000'
+    )
+    NATIVE_9I_OAUTH = bytes.fromhex(
+        '03730340735e0000000000030000000101000050daffbf7f0000000600000000'
+        '00000030d7ffbf7f000000b09affbf7f0000000370796f0d0000000d41555448'
+        '5f50415353574f52442000000020323743363631433131463139314536414545'
+        '3341424446374439333836333031000000000f0000000f415554485f50524f47'
+        '52414d5f4e4d170000001773716c706c7573406f39692028544e532056312d56'
+        '3329000000000c0000000c415554485f4d414348494e4503000000036f396900'
+        '0000000800000008415554485f50494405000000053136393837000000000800'
+        '000008415554485f41434c040000000438303030000000001200000012415554'
+        '485f414c5445525f53455353494f4e2500000025414c5445522053455353494f'
+        '4e205345542054494d455f5a4f4e453d272b30303a3030270001000000'
+    )
+
+    def test_9i_oall8_login_is_the_oci_auth_call(self):
+        # The shared _AUTH_HEAD and its pairs at OCI's widths read the native
+        # login calls whole, and ours the same way: what the hand-built frames
+        # called a preamble and constants are its pointer slot, the user's length
+        # and the unset bytes after the pair count (#798).
+        from seerdb.common.tns import (
+            _AUTH_FROM_OCI,
+            TTI_AUTH,
+            TTI_SESS,
+            encode_oall8_oauth_phase2,
+            encode_oall8_osesskey_phase1,
+        )
+
+        given = {'user_prefixed': True, 'user_raw': False}
+        pairs = [(b'AUTH_PROGRAM_NM', b'sqlplus'), (b'AUTH_MACHINE', b'o9i')]
+        for native, ours, subtype, mode in (
+            (
+                self.NATIVE_9I_OSESSKEY,
+                encode_oall8_osesskey_phase1(2, b'pyo', pairs),
+                TTI_SESS,
+                1,
+            ),
+            (
+                self.NATIVE_9I_OAUTH,
+                encode_oall8_oauth_phase2(3, b'pyo', b'0123ABCD8', pairs),
+                TTI_AUTH,
+                0x101,
+            ),
+        ):
+            with self.subTest(subtype=subtype):
+                for message in (native, ours):
+                    (call, rest) = _AUTH_FROM_OCI(message, given)
+                    self.assertEqual(rest, b'')
+                    self.assertEqual((call['subtype'], call['user']), (subtype, b'pyo'))
+                    self.assertEqual(call['mode'], mode)
+                    self.assertEqual(call['user_length'], 3)
+
     def test_9i_oall8_lob_write_matches_native_client(self):
         # The 64-bit TTI_LOBOPS head with the offset at 31, then the locator, the
         # ub4 amount, and the data as TTI_LOB content (#798). The source and amount

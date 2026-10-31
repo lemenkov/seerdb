@@ -16451,61 +16451,61 @@ def parse_8i_auth_value(Packet: bytes, Key: bytes, O8i: bool = True) -> bytes | 
 
 # --- 9i native OALL8 O3LOGON via the OSESSKEY/OAUTH envelope (#790) ----------
 # The native 9.2 OALL8 ("thick") client marshals OSESSKEY (0x76) / OAUTH (0x73)
-# as a 64-bit OCI call frame, NOT 9i's positional TTI_3LOGA (that is the thin
-# path, which the 9.2 server stops accepting once the native data-type
-# negotiation has run). The frame is: TTI_FUN, the function byte, a seq and a
-# 0x40 "pointers present" opt, a fixed preamble, then ub4le scalar args
-# interleaved with 8-byte host-pointer PLACEHOLDERS the server reads positionally
-# but ignores (they are the native client's own stack addresses). Strings use the
-# DALC coding ub4le(len) ub1(len) data, same as pre-10g key-value values.
-#
-# Byte-reproduced from a live 9.2 sqlplus -> 9.2 capture. The crypto is the SAME
-# DES O3LOGON as the thin 9i / 8i paths (des_verifier + o3logon). The unexplained
-# fixed words -- the 0x5e73-led preamble and the structural 3 / 0x2a -- are
-# carried verbatim: the server validates the frame SHAPE, not these values (the
-# ignored pointers prove values do not matter), so only seq, username, password
-# and the AUTH_ pairs vary. See also [[oall8-pro-banner-gate]].
-_OALL8_AUTH_PREAMBLE = bytes.fromhex('735e0000000000')
-# Fixed host-pointer placeholder. The server ignores the ADDRESS but the pointer
-# must be NON-NULL: a null pointer marks the OCI argument as absent, so a zeroed
-# slot makes the server reject the frame and drop the connection. Any non-null
-# 8-byte value works; this is a plausible stack address from the capture.
-_OALL8_PTR = bytes.fromhex('d096ffbf7f000000')
+# as the OCI login call -- the shared _AUTH_HEAD and _AUTH_PAIR at OCI's widths
+# (#798), as 8i's are at 8i's -- NOT 9i's positional thin-coded form (that is
+# the compact path, which the 9.2 server stops accepting once the native
+# data-type negotiation has run). What the hand-built frame called "a fixed
+# preamble" is the first pointer slot, its "structural constant 3" the user's
+# length, and the 0x2a of phase one the four bytes after the pair count that a
+# native client leaves unset (#2249) -- the server reads them positionally and
+# ignores them, as it ignores the pointers' values so long as they are non-null.
+# The crypto is the SAME DES O3LOGON as the thin 9i / 8i paths (des_verifier +
+# o3logon). Byte-reproduced from a live 9.2 sqlplus -> 9.2 capture apart from
+# those. See also [[oall8-pro-banner-gate]].
+_AUTH_OCI = wire_schema.compile_encoder(
+    (*_AUTH_HEAD, ('each', 'pairs', 'pair_count', _AUTH_PAIR)), _OCI
+)
 
 
-def _oall8_dalc(Value: bytes) -> bytes:
-    # ub4le total length, ub1 chunk length, data (values stay <= 252 bytes, so
-    # the single chunk equals the total -- enforced by _o8i_info_pairs upstream).
-    # An empty value is the zero length alone, as on 8i (#2344): with a zero
-    # chunk byte after it, the server dropped the connection at an empty
-    # program name (#798).
-    if not Value:
-        return struct.pack('<I', 0)
-    return struct.pack('<I', len(Value)) + bytes([len(Value)]) + Value
-
-
-def _oall8_kv(Key: bytes, Val: bytes, Flags: int = 0) -> bytes:
-    return _oall8_dalc(Key) + _oall8_dalc(Val) + struct.pack('<I', Flags)
+def _oall8_auth(
+    Subtype: int, Seq: int, User: bytes, Mode: int, Pairs: list[tuple[bytes, bytes]]
+) -> bytes:
+    # An OCI OSESSKEY or OAUTH call (_AUTH_HEAD and its pairs at OCI's widths). An
+    # empty value is a zero length and no value, as on 8i (#2344): a zero chunk
+    # byte after it made the 9.2 server drop the login (#798).
+    return _AUTH_OCI(
+        {
+            'subtype': Subtype,
+            'seq': Seq,
+            'pointer_1': True,
+            'user_length': len(User),
+            'mode': Mode,
+            'pointer_2': True,
+            'pair_count': len(Pairs),
+            'pointer_3': True,
+            'pointer_4': True,
+            'user_prefixed': True,
+            'user_raw': False,
+            'user': User,
+            'pairs': [
+                {
+                    'key_length': len(Key),
+                    'key': Key,
+                    'value_length': len(Value),
+                    'value': Value,
+                    'flags': 0,
+                }
+                for (Key, Value) in Pairs
+            ],
+        }
+    )
 
 
 def encode_oall8_osesskey_phase1(
     Seq: int, User: bytes, Pairs: list[tuple[bytes, bytes]]
 ) -> bytes:
     # OSESSKEY (0x76) phase one: request the session key. Logon mode 1.
-    return (
-        bytes([TTI_FUN, TTI_SESS, Seq, 0x40])
-        + _OALL8_AUTH_PREAMBLE
-        + struct.pack('<I', 3)  # structural constant (unexplained; from capture)
-        + struct.pack('<I', 1)  # logon mode (phase one)
-        + _OALL8_PTR
-        + struct.pack('<I', len(Pairs))  # key-value pair count
-        + struct.pack('<I', 0x2A)  # unexplained constant (from capture)
-        + _OALL8_PTR
-        + _OALL8_PTR
-        + bytes([len(User)])
-        + User
-        + b''.join(_oall8_kv(k, v) for k, v in _o8i_info_pairs(Pairs))
-    )
+    return _oall8_auth(TTI_SESS, Seq, User, 1, _o8i_info_pairs(Pairs))
 
 
 def encode_oall8_oauth_phase2(
@@ -16513,20 +16513,12 @@ def encode_oall8_oauth_phase2(
 ) -> bytes:
     # OAUTH (0x73) phase two: send AUTH_PASSWORD (hex(DES blocks) + decimal pad
     # count) plus the informational pairs. Logon mode 0x101 marks phase two.
-    AllPairs = [(b'AUTH_PASSWORD', PwdField), *_o8i_info_pairs(Pairs)]
-    return (
-        bytes([TTI_FUN, TTI_AUTH, Seq, 0x40])
-        + _OALL8_AUTH_PREAMBLE
-        + struct.pack('<I', 3)
-        + struct.pack('<I', 0x101)  # logon mode (phase two)
-        + _OALL8_PTR
-        + struct.pack('<I', len(AllPairs))
-        + struct.pack('<I', 0)  # unexplained constant (0 in phase two)
-        + _OALL8_PTR
-        + _OALL8_PTR
-        + bytes([len(User)])
-        + User
-        + b''.join(_oall8_kv(k, v) for k, v in AllPairs)
+    return _oall8_auth(
+        TTI_AUTH,
+        Seq,
+        User,
+        0x101,
+        [(b'AUTH_PASSWORD', PwdField), *_o8i_info_pairs(Pairs)],
     )
 
 
