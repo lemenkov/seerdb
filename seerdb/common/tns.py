@@ -14487,6 +14487,25 @@ def decode_9i_oall8_lob_value(Data: bytes, Operation: int) -> tuple[int | None, 
     return (int.from_bytes(Rest[:4], 'little'), Locator)
 
 
+def encode_9i_oall8_close_cursors(Seq: int, Cursors: list[int]) -> bytes:
+    # The close of a finished cursor on a native 9i OALL8 session (#798),
+    # piggybacked ahead of the next call as a native 9.2 OCI client sends it
+    # (native_9i_array_dml.pcap): `11 69`, a seq, the array's pointer, the count
+    # as a ub8 and the cursor id as a ub4. Without it every statement's cursor
+    # stayed open and a session failed at open_cursors (ORA-01000 under ORA-00604
+    # at the 299th statement). The native client only ever closes one at a time,
+    # so each cursor gets a piggyback of its own, each taking a seq (Seq on).
+    Out = b''
+    for Offset, Cursor in enumerate(Cursors):
+        Out += (
+            bytes([TTI_PFN, TTI_OCCA, (Seq + Offset) & 0xFF])
+            + oci.OCI_INDICATOR
+            + (1).to_bytes(8, 'little')
+            + (Cursor & 0xFFFFFFFF).to_bytes(4, 'little')
+        )
+    return Out
+
+
 def encode_9i_oall8_lob_read(
     Seq: int, Locator: bytes, Amount: int, Offset: int = 1
 ) -> bytes:
@@ -14780,23 +14799,21 @@ def _o9i_oall8_oer(Terminal: bytes) -> bytes:
 
 def decode_9i_oall8_cursor_id(Terminal: bytes) -> int:
     # The server cursor the fetch loop pulls more rows from, read from the exec
-    # reply's OER: the byte at offset 16 (past the OER head and the ORA code). It is
+    # reply's OER: a ub2 at offset 16 (past the OER head and the ORA code). It is
     # a session-monotonic counter that rises per statement, so each open statement
     # is fetched by its own id -- a fixed id drew ORA-01002 on the second query. 0
     # when the terminal holds no whole OER (an error / empty result -- no fetch).
     #
-    # LIMIT: read as a single byte, so correct for the first 255 statements of a
-    # session. The id keeps climbing (the slot is freed at end of fetch, so a long
-    # session does not exhaust open_cursors, but the counter is not reused), and the
-    # wider read is not a plain ub2: the server's soft-parse / cursor-cache reply (a
-    # repeated statement's 4th parse) has a different OER layout whose offset 17 is
-    # not the cursor's high byte (a ub2 there read cursor 4 as 260). Reading the full
-    # id across both layouts -- so a session can run past 255 statements -- is a
-    # follow-up (#792).
+    # Read as one byte it was right for a session's first 255 statements: the
+    # 256th is `00 01` and fetched cursor 0 (ORA-01002, #798; read live on 9.2
+    # past 300 statements). An earlier reading of a ub2 here took cursor 4 for
+    # 260 on a repeated statement's reply; that was before the status reader
+    # skipped the session-state RPA by its length (7a4e533), and twenty repeats
+    # of one statement now read byte 17 as 0 throughout.
     Oer = _o9i_oall8_oer(Terminal)
-    if len(Oer) < 17:
+    if len(Oer) < 18:
         return 0
-    return Oer[16]
+    return int.from_bytes(Oer[16:18], 'little')
 
 
 def decode_9i_oall8_dml_response(
@@ -14920,6 +14937,33 @@ def decode_9i_oall8_block_out(
     # A block that fails at run time (a SELECT ... INTO matching nothing) answers
     # with the bare status, no IOV: skipping the IOV's length there landed past the
     # status and read the error as success.
+    (OutValues, Rest) = _o9i_oall8_block_parts(Data, NumBinds, NumOut, Cursors)
+    # `Rest` now sits on the RPA + OER, so read the status from there rather than
+    # rescanning `Data` from the start -- the IOV and the OUT RXD hold value bytes
+    # that collide with the OER token, which a from-the-start scan can land on
+    # (a RETURNING run inside a statement sequence read a bogus code otherwise).
+    (RowCount, Code, Message) = decode_9i_oall8_dml_response(Rest)
+    return (OutValues, RowCount, Code, Message)
+
+
+def decode_9i_oall8_block_cursor(
+    Data: bytes, NumBinds: int, NumOut: int = 0, Cursors: frozenset[int] = frozenset()
+) -> int:
+    # The cursor a 9i OALL8 block reply's status names, for the close that follows
+    # (#798), read past the IOV and the OUT values as decode_9i_oall8_block_out
+    # reads the status: a scan from the start landed on a `04` inside a 300-bind
+    # IOV, and closing that bogus cursor (256) drew ORA-00600 [12209] and lost the
+    # session.
+    return decode_9i_oall8_cursor_id(
+        _o9i_oall8_block_parts(Data, NumBinds, NumOut, Cursors)[1]
+    )
+
+
+def _o9i_oall8_block_parts(
+    Data: bytes, NumBinds: int, NumOut: int, Cursors: frozenset[int]
+) -> tuple[list, bytes]:
+    # A 9i OALL8 block reply's OUT values, and the bytes after them -- the RPA and
+    # the status (decode_9i_oall8_block_out).
     Rest = Data[50 + NumBinds :] if Data[:1] == bytes([TTI_IOV]) else Data
     OutValues: list = []
     if NumOut > 0 and Rest[:1] == bytes([TTI_RXD]):
@@ -14946,12 +14990,7 @@ def decode_9i_oall8_block_out(
             (Raw, Rest) = _OCI.read_value(Rest)
             Rest = Rest[4:]
             OutValues.append(bytes(Raw) if Raw else None)
-    # `Rest` now sits on the RPA + OER, so read the status from there rather than
-    # rescanning `Data` from the start -- the IOV and the OUT RXD hold value bytes
-    # that collide with the OER token, which a from-the-start scan can land on
-    # (a RETURNING run inside a statement sequence read a bogus code otherwise).
-    (RowCount, Code, Message) = decode_9i_oall8_dml_response(Rest)
-    return (OutValues, RowCount, Code, Message)
+    return (OutValues, Rest)
 
 
 def decode_9i_oall8_status(Terminal: bytes) -> dict | None:

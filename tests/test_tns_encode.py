@@ -7592,6 +7592,25 @@ class TestO9iOall8Messages(unittest.TestCase):
             self.assertEqual(oac[1], TNS_TYPE_VARCHAR)
             self.assertEqual(int.from_bytes(oac[5:13], 'little'), 5267)
 
+    def test_9i_oall8_close_cursors_matches_native_client(self):
+        # The close a native 9.2 OCI client piggybacks ahead of its next call
+        # (native_9i_array_dml.pcap): `11 69`, seq, the array pointer (its heap
+        # address, masked), a ub8 count and the ub4 cursor id (#798). Several
+        # cursors go one piggyback each, each with the next seq.
+        from seerdb.common.tns import encode_9i_oall8_close_cursors
+
+        native = bytes.fromhex('116906e0c2510000000000010000000000000001000000')
+        ours = encode_9i_oall8_close_cursors(0x06, [1])
+
+        def mask(buf):
+            return buf[:3] + bytes(8) + buf[11:]
+
+        self.assertEqual(mask(ours), mask(native))
+        two = encode_9i_oall8_close_cursors(0x06, [1, 300])
+        self.assertEqual(len(two), 2 * len(native))
+        self.assertEqual((two[2], two[25]), (0x06, 0x07))
+        self.assertEqual(int.from_bytes(two[42:46], 'little'), 300)
+
     def test_9i_oall8_lob_write_matches_native_client(self):
         # The 64-bit TTI_LOBOPS head with the offset at 31, then the locator, the
         # ub4 amount, and the data as TTI_LOB content (#798). The source and amount

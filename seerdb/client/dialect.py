@@ -43,6 +43,7 @@ from seerdb.common.tns import (
     decode_8i_terminal_error,
     decode_9i_oall8_batch_errors,
     decode_9i_oall8_bind_directions,
+    decode_9i_oall8_block_cursor,
     decode_9i_oall8_block_out,
     decode_9i_oall8_cursor_id,
     decode_9i_oall8_describe,
@@ -77,6 +78,7 @@ from seerdb.common.tns import (
     encode_8i_oall8_fetch,
     encode_8i_oall8_query,
     encode_8i_sql_text,
+    encode_9i_oall8_close_cursors,
     encode_9i_oall8_dml,
     encode_9i_oall8_fetch,
     encode_9i_oall8_lob_read,
@@ -1050,8 +1052,21 @@ class Fv2Oall8Dialect(Oall8Dialect):
     blocks with IN, OUT, IN OUT and REF CURSOR binds, and DML...RETURNING
     (through its PL/SQL wrap) -- all over the native 64-bit OALL8 reply decode
     (decode_9i_oall8_*), array DML and LOB objects (fetch_lobs=False).
-    Synchronous only. Not yet: nested cursors, object types, and a session past
-    255 statements (the cursor id is read as one byte)."""
+    Synchronous only, and no cursor cache. Not yet: nested cursors (CURSOR()
+    columns) and object / collection types."""
+
+    def _closing(self) -> bytes:
+        # The close of every finished cursor, piggybacked ahead of the next call
+        # in the 64-bit form a native 9.2 OCI client sends (#798); the 8i form
+        # broke the session. One piggyback a cursor, each taking a sequence
+        # number, so built before the call it rides on, as the base's is.
+        if not self._to_close:
+            return b''
+        (cursors, self._to_close) = (self._to_close, [])
+        return b''.join(
+            encode_9i_oall8_close_cursors(self._next_seq(), [cursor])
+            for cursor in cursors
+        )
 
     def capabilities(self) -> frozenset[str]:
         # SELECT, DML / DDL, PL/SQL blocks and own commit/rollback over the native
@@ -1101,6 +1116,8 @@ class Fv2Oall8Dialect(Oall8Dialect):
         # the TTI_DCB describe — surface the mapped error rather than overrunning.
         if packet[:1] == bytes([TTI_OER]):
             (err_code, message) = decode_9i_oall8_terminal_error(packet)
+            # Refused at parse, the statement still holds a cursor: close it.
+            self._finished(decode_9i_oall8_cursor_id(packet))
             if err_code:
                 from seerdb.common.exceptions import from_ora_code
 
@@ -1116,17 +1133,12 @@ class Fv2Oall8Dialect(Oall8Dialect):
         (columns, rest) = yield from self._recv_describe(packet)
         (rows, terminal, last_row) = yield from self.recv_rows(rest, columns, None)
         # The server opens a fresh cursor per statement (its id increments), so the
-        # fetch loop reads it by the id the exec reply's OER carries. (The server
-        # closes it when the session ends; a per-statement close is a follow-up —
-        # the 8i close frame breaks a 9i OALL8 session, #792.)
+        # fetch loop reads it by the id the exec reply's OER carries, and the next
+        # call closes it (#798).
+        cursor = decode_9i_oall8_cursor_id(terminal)
         if not _9i_oall8_fetch_ended(terminal):
-            rows.extend(
-                (
-                    yield from self._fetch_rest(
-                        decode_9i_oall8_cursor_id(terminal), columns, last_row, fetch
-                    )
-                )
-            )
+            rows.extend((yield from self._fetch_rest(cursor, columns, last_row, fetch)))
+        self._finished(cursor)
         # CLOB / BLOB cells came back as locators: read their content while the
         # cursor is still open, as the 8i path does (#795). A BFILE stays a
         # locator, read on demand.
@@ -1340,6 +1352,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
             )
         )
         buf = yield from self._recv_dml_terminal('DML')
+        self._finished(decode_9i_oall8_cursor_id(buf))  # closed with the next call
         # The error comes back in the result, as on the compact path, so the
         # cursor reports what the call managed: the rows a batch applied before a
         # failing one, and none for a statement that failed outright -- raised
@@ -1376,6 +1389,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
             + self._encode_dml(encode_9i_sql_text(statement), O8I_STMT_TXN)
         )
         buf = yield from self._recv_dml_terminal(statement)
+        self._finished(decode_9i_oall8_cursor_id(buf))  # closed with the next call
         (_row_count, err_code, message) = decode_9i_oall8_dml_response(buf)
         _raise_ora(err_code, message)
 
@@ -1415,10 +1429,15 @@ class Fv2Oall8Dialect(Oall8Dialect):
         directions = decode_9i_oall8_bind_directions(buf, len(bind))
         if directions is not None:
             out_positions = [i for i, d in enumerate(directions) if d & FV2_BIND_OUT]
+        cursors = frozenset(
+            i for (i, pos) in enumerate(out_positions) if _is_cursor_var(bind[pos])
+        )
+        # The block's own cursor, closed with the next call, read from its status
+        # past the IOV and the OUT values (#798).
+        self._finished(
+            decode_9i_oall8_block_cursor(buf, len(bind), len(out_positions), cursors)
+        )
         if out_positions:
-            cursors = frozenset(
-                i for (i, pos) in enumerate(out_positions) if _is_cursor_var(bind[pos])
-            )
             (out_values, _row_count, err_code, message) = decode_9i_oall8_block_out(
                 buf, len(bind), len(out_positions), cursors
             )
@@ -1430,6 +1449,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
                 if isinstance(out_values[i], tuple):
                     (cursor_id, columns) = out_values[i]
                     rows = yield from self._fetch_rest(cursor_id, columns, None)
+                    self._finished(cursor_id)  # read: close it with the next call
                     yield from self.resolve_lobs(rows, columns)
                     out_values[i] = _cursor_marker(cursor_id, columns, rows)
             record = {

@@ -7965,6 +7965,48 @@ class TestNative9iOall8Select(unittest.TestCase):
         (rows, _, _) = self._decode(self.LONG_FIRST_NULL_ROW, columns)
         self.assertEqual(rows, [[None, 6, 'yy']])
 
+    def test_the_cursor_id_is_a_ub2(self):
+        # The status's cursor id is a ub2 at 16: a session's 256th statement reads
+        # `00 01` (this status head, live on 9.2). Read as one byte it was 0, and
+        # the fetch failed with ORA-01002 (#798).
+        from seerdb.common.tns import decode_9i_oall8_cursor_id
+
+        head = bytes.fromhex('040100000001010000000000000000000001120003000000')
+        self.assertEqual(decode_9i_oall8_cursor_id(head), 256)
+
+    # A 300-bind block's reply (an IN Var, an OUT Var, 298 IN numbers), live on
+    # 9.2: the IOV is 50 + 300 bytes.
+    BLOCK_300_BINDS = bytes.fromhex(
+        '0b0105002c000100010000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000002010202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020200703'
+        'c2040400000000080500195a2f02000000000100000000000000000000000000'
+        '000004010000000101000000000000000000010000002f000000000000000000'
+        '00000000000000000000000000000000000a0000010000003601000000000000'
+        '000000000000000080d0d4030000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '0000000000000000'
+    )
+
+    def test_a_blocks_cursor_is_read_past_its_bind_prompt(self):
+        # A scan from the start lands on a `04` in the bind prompt and reads 256;
+        # closing that cursor drew ORA-00600 [12209] and lost the session (#798).
+        from seerdb.common.tns import (
+            decode_9i_oall8_block_cursor,
+            decode_9i_oall8_cursor_id,
+        )
+
+        self.assertEqual(decode_9i_oall8_block_cursor(self.BLOCK_300_BINDS, 300, 1), 1)
+        self.assertNotEqual(decode_9i_oall8_cursor_id(self.BLOCK_300_BINDS), 1)
+
     def test_a_for_update_row_header_carries_the_rowid(self):
         # The row header names a 13-byte rowid (a ub2 at 42) between it and the
         # row: SELECT ... FOR UPDATE sends the row it locks. Unskipped, the row
