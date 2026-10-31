@@ -51,7 +51,8 @@ A schema is a tuple of fields:
 - ``('when', name, fields)``: ``fields`` only when the integer ``name`` is not
   zero;
 - ``('each', name, count, fields)``: ``fields`` once per item of the list
-  ``name``, whose length the integer ``count`` gives;
+  ``name``, whose length the integer ``count`` gives; each item is read with
+  the caller's ``given``;
 - ``('only', dialect, fields)``: ``fields`` in that dialect alone.
 
 A codec has a ``name`` (``'thin'`` or ``'oci'``) and the primitives ``n4``,
@@ -234,7 +235,9 @@ def compile_decoder(schema: Schema, codec: Codec) -> Decoder:
                         raise IndexError(
                             f'{field[1]}: count past the end of the message'
                         )
-                    (item, data) = inner(data)
+                    # Each item sees what the caller gave (a session flag a
+                    # `when` in it tests), not the other fields read so far.
+                    (item, data) = inner(data, given)
                     items.append(item)
                 values[field[1]] = items
             elif kind == 'only':

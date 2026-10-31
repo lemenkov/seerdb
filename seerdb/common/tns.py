@@ -2280,6 +2280,37 @@ _O8I_STATUS: wire_schema.Schema = (
     ('when', 'code', (('chr', 'message'),)),
 )
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+# The experimental 9i OALL8 describe (#792, #798): the OCI describe column
+# (_DCB_COLUMN) with the type name's length a ub2, the one 9i difference, behind
+# the maximum row size and the column count; then the start of the OCI trailer
+# (_DESCRIBE_TRAILER), a lead byte, a ub4 length (7) and the describe time,
+# landing on the first row header or the status. A query's TTI_DCB carries it
+# after a preamble; a REF CURSOR OUT bind carries it behind a lead byte (0x2c),
+# with the cursor id, a ub2 indicator and a ub2 return code after it. Read from
+# every live 9.2 describe the decode tests hold, and native_9i_select.pcap's.
+_DCB_COLUMN_9I: wire_schema.Schema = tuple(
+    ('n2', 'type_name_length') if _F[:2] == ('n4', 'type_name_length') else _F
+    for _F in _DCB_COLUMN
+)
+_O9I_DESCRIBE_BODY: wire_schema.Schema = (
+    ('n4', 'max_row_size'),
+    ('n4', 'count'),
+    ('each', 'columns', 'count', _DCB_COLUMN_9I),
+    *_DESCRIBE_TRAILER[:2],
+)
+_O9I_DESCRIBE: wire_schema.Schema = (
+    ('const', bytes([TTI_DCB])),
+    ('u8', 'preamble_length'),
+    ('bytes', 'preamble', 'preamble_length'),
+    *_O9I_DESCRIBE_BODY,
+)
+_O9I_REFCURSOR_OUT: wire_schema.Schema = (
+    ('u8', 'lead'),
+    *_O9I_DESCRIBE_BODY,
+    ('n4', 'cursor'),
+    ('n2', 'indicator'),
+    ('n2', 'return_code'),
+)
 # The experimental 9i OALL8 bind prompt (#798): 8i's (_O8I_IOV) -- flags, the
 # binds as a ub2 requests and a ub2 iterations (`iterations * 256 + requests`,
 # 300 coming as `2c 00 01 00`, #2311), the iterations this time -- with a byte
@@ -2534,6 +2565,9 @@ _O9I_RXH_FROM_O9I = wire_schema.compile_decoder(_O9I_RXH, _O9I)
 _O9I_ROWID_CELL_FROM_O9I = wire_schema.compile_decoder(_O9I_ROWID_CELL, _O9I)
 _O9I_LOB_CELL_FROM_O9I = wire_schema.compile_decoder(_O9I_LOB_CELL, _O9I)
 _O9I_UROWID_CELL_FROM_O9I = wire_schema.compile_decoder(_O9I_UROWID_CELL, _O9I)
+# The describe's columns are the OCI dialect's own fields, read with its codec.
+_O9I_DESCRIBE_FROM_OCI = wire_schema.compile_decoder(_O9I_DESCRIBE, _OCI)
+_O9I_REFCURSOR_OUT_FROM_OCI = wire_schema.compile_decoder(_O9I_REFCURSOR_OUT, _OCI)
 _OAC_OCI = wire_schema.compile_encoder(_OAC, _OCI)
 _O7_LOBOPS_O9I = wire_schema.compile_encoder(_O7_LOBOPS, _O9I)
 _CLOSE_CURSORS_O9I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O9I)
@@ -14692,74 +14726,50 @@ def encode_9i_oall8_lob_read(
 
 
 # --- 9i native OALL8 SELECT reply decode (#792) ---
-# The 9i OALL8 (0x5e) SELECT reply is OCI FIXED-WIDTH framing -- not the thin
-# variable-width form decode_packet reads, nor 8i's _O8I row stream. RE'd and
-# live-verified against native_9i_select.pcap / native_9i_fetch_arraysize2.pcap:
-#   TTI_DCB   describe: the OCI _DCB_COLUMN at field version 2 (type_name_length
-#             an n2, the single 9i difference), then a short current-date trailer;
-#   TTI_RXH   a fixed 50-byte header, then an optional column bit vector;
-#   TTI_RXD   rows of value-only cells (a ub1 length + bytes, 0xFE-chunked past
-#             252, 0xFF for NULL -- no per-cell indicator/return-code trailer);
-#   TTI_BVC   a bit vector between rows (token + ub2 count + ceil(ncols/8) bytes),
-#             a clear bit meaning the column repeats the previous row (no cell);
-#   TTI_OER   the status (the ORA code a ub4 at offset 10; 0 = more rows,
-#             1403 = end of fetch), after any TTI_RPA session-state piggyback.
-# The describe-reply RXH is the degenerate zero-vector (50-byte) case.
-_DCB_COLUMN_9I_FROM_OCI = wire_schema.compile_decoder(
-    tuple(
-        ('n2', 'type_name_length') if _F[:2] == ('n4', 'type_name_length') else _F
-        for _F in _DCB_COLUMN
-    ),
-    _OCI,
-)
+# The 9i OALL8 (0x5e) SELECT reply is OCI fixed-width framing -- not the thin
+# variable-width form decode_packet reads -- in schemas shared with 8i where 8i
+# has them (#798): the describe (_O9I_DESCRIBE), each row batch's header
+# (_O9I_RXH), rows of value-only cells (a ub1 length + bytes, 0xFE-chunked past
+# 252, 0xFF for NULL; 8i's LOB / UROWID / ROWID / LONG cells for those columns),
+# a bit vector between rows (TTI_BVC: token + ub2 count + ceil(ncols/8) bytes, a
+# clear bit meaning the column repeats the previous row), and the status
+# (_O9I_STATUS) after the session-state RPA (_O8I_RPA). RE'd and live-verified
+# against native_9i_select.pcap / native_9i_fetch_arraysize2.pcap.
+_DESCRIBE_GIVEN = {'oci_12c': False, 'has_uds': False}
+
+
+def _o9i_oall8_columns(Columns: list) -> list[dict]:
+    # The describe's columns, shaped like decode_8i_dcb_describe's, so the shared
+    # row and cursor machinery is unchanged.
+    return [
+        {
+            'data_type': Col['data_type'],
+            'data_length': Col['buffer_size'],
+            'data_scale': Col['scale'],
+            'precision': Col['precision'],
+            'max_size': Col['max_size'],
+            'charset': Col['charset'],
+            'csfrm': Col['csfrm'],
+            'null_ok': 0 if Col['null_ok'] == 0 else 1,
+            'domain_schema': None,
+            'domain_name': None,
+            'column_name': bytes(Col.get('name') or b'').decode('latin-1'),
+        }
+        for Col in Columns
+    ]
 
 
 def decode_9i_oall8_describe(Data: bytes) -> tuple[list[dict], bytes]:
-    # The 9i OALL8 TTI_DCB describe and the bytes after it (the row stream / the
-    # status). Column dicts shaped like decode_8i_dcb_describe's, so the shared
-    # row and cursor machinery is unchanged. A describe that runs off the end of
-    # a packet raises Truncated for the reader to read on, as 8i's does (#1226).
+    # The 9i OALL8 TTI_DCB describe (_O9I_DESCRIBE) and the bytes after it (the
+    # row stream / the status). A describe that runs off the end of a packet
+    # raises Truncated for the reader to read on, as 8i's does (#1226).
     if Data[:1] != bytes([TTI_DCB]):
         raise DataError('not a 9i OALL8 describe')
-    # skip the chunked describe preamble (fv<11.2)
-    return _o9i_oall8_describe_body(Data[2 + Data[1] :])
-
-
-def _o9i_oall8_describe_body(Body: bytes) -> tuple[list[dict], bytes]:
-    # The describe after its preamble -- the columns and the current-date trailer --
-    # as both a query's TTI_DCB and a REF CURSOR OUT bind carry it.
     try:
-        Count = int.from_bytes(Body[4:8], 'little')  # [0:4] is max_row_size
-        Rest = Body[8:]
-        Columns: list[dict] = []
-        for _ in range(Count):
-            (Col, Rest) = _DCB_COLUMN_9I_FROM_OCI(
-                Rest, {'oci_12c': False, 'has_uds': False}
-            )
-            Columns.append(
-                {
-                    'data_type': Col['data_type'],
-                    'data_length': Col['buffer_size'],
-                    'data_scale': Col['scale'],
-                    'precision': Col['precision'],
-                    'max_size': Col['max_size'],
-                    'charset': Col['charset'],
-                    'csfrm': Col['csfrm'],
-                    'null_ok': 0 if Col['null_ok'] == 0 else 1,
-                    'domain_schema': None,
-                    'domain_name': None,
-                    'column_name': bytes(Col.get('name') or b'').decode('latin-1'),
-                }
-            )
-        # The current-date trailer: a lead byte, a fixed 4-byte length (=7), then
-        # the date as a ub1-length value (= 13 bytes), landing exactly on the first
-        # row header / the status. Verified live on 9.2 (a plain fixed LE word, not
-        # the variable-width decode_ub4).
-        Rest = Rest[1 + 4 :]  # lead byte + the fixed 4-byte length word
-        Rest = Rest[1 + Rest[0] :]  # the date value (ub1 length + bytes)
+        (Describe, Rest) = _O9I_DESCRIBE_FROM_OCI(Data, _DESCRIBE_GIVEN)
     except IndexError as Exc:
         raise Truncated(f'9i OALL8 describe: {Exc}') from Exc
-    return (Columns, Rest)
+    return (_o9i_oall8_columns(Describe['columns']), Rest)
 
 
 def _o9i_oall8_cell(Data: bytes) -> tuple[bytes | None, bytes]:
@@ -15054,15 +15064,14 @@ def decode_9i_oall8_bind_directions(Data: bytes, NumBinds: int) -> list[int] | N
 
 
 def _o9i_oall8_refcursor_cell(Data: bytes) -> tuple[tuple[int, list], bytes]:
-    # A REF CURSOR OUT bind's cell in a 9i OALL8 block reply: a lead byte (0x2c),
-    # then the opened cursor's describe -- the same body a query's TTI_DCB carries,
-    # columns and current-date trailer -- then the cursor id (a ub4) and four zero
-    # bytes (the indicator and return code). Read live on 9.2 for `OPEN :1 FOR`
-    # two- and one-column queries (cursor 2, then 4). Returns ((cursor id, columns),
-    # rest); the caller fetches the rows by that id.
-    (Columns, Rest) = _o9i_oall8_describe_body(Data[1:])
-    Cursor = int.from_bytes(Rest[:4], 'little')
-    return ((Cursor, Columns), Rest[8:])
+    # A REF CURSOR OUT bind's cell in a 9i OALL8 block reply (_O9I_REFCURSOR_OUT):
+    # a lead byte (0x2c), the opened cursor's describe -- the body a query's
+    # TTI_DCB carries -- its cursor id, and the indicator and return code. Read
+    # live on 9.2 for `OPEN :1 FOR` two- and one-column queries (cursor 2, then
+    # 4). Returns ((cursor id, columns), rest); the caller fetches the rows by
+    # that id.
+    (Cell, Rest) = _O9I_REFCURSOR_OUT_FROM_OCI(Data, _DESCRIBE_GIVEN)
+    return ((Cell['cursor'], _o9i_oall8_columns(Cell['columns'])), Rest)
 
 
 def decode_9i_oall8_block_out(
