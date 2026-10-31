@@ -163,8 +163,9 @@ _8I_UNSUPPORTED = (
     ),
     ('bit_vector_reuse', 'CONNECT BY LEVEL returns one row on Oracle 8i'),
     # Async-only / connectivity tests (AsyncConnectionIntegration, Redirect).
-    ('async_iteration', 'CONNECT BY LEVEL returns one row on Oracle 8i'),
-    ('fetchall_and_fetchmany', 'CONNECT BY LEVEL returns one row on Oracle 8i'),
+    # In the subquery those tests use, 8.1.7 refuses it (ORA-01436).
+    ('async_iteration', 'Oracle 8i has no CONNECT BY LEVEL row generator'),
+    ('fetchall_and_fetchmany', 'Oracle 8i has no CONNECT BY LEVEL row generator'),
     # The test's column is a TIMESTAMP; 8i honours the declared types it has.
     ('declared_type_governs', 'TIMESTAMP is a 9i+ type; Oracle 8i has only DATE'),
     # 9i runs array DML over TTI_ALL7 (#2245); 8i's OALL8 dialect has none yet.
@@ -521,10 +522,6 @@ _FV_KW: dict[str, Any] = {'field_version': _FIELD_VERSION} if _FIELD_VERSION els
 # only, every other server ignores the option.
 if os.environ.get('SEERDB_TEST_OALL8', '') not in ('', '0'):
     _FV_KW['oall8'] = True
-# ...which is synchronous-only: connect_async refuses it.
-_SKIP_ASYNC_OVER_OALL8 = unittest.skipIf(
-    bool(_FV_KW.get('oall8')), 'the 9i OALL8 opt-in is synchronous-only'
-)
 
 _SKIP_REASON = (
     'integration tests require a real DB connection; '
@@ -7963,7 +7960,6 @@ class RefusedLoginIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
         with seerdb.connect(**self._kwargs(_USER, _PASSWORD)):
             pass  # the account still logs in
 
-    @_SKIP_ASYNC_OVER_OALL8
     async def test_a_refused_async_login_raises_ora_01017(self):
         for label, user, password in self.CASES:
             with self.subTest(label):
@@ -10200,7 +10196,6 @@ _BFILE_TEST_FILE = 'pyoracle_bfile_test.txt'
 _BFILE_TEST_CONTENT = b'hello bfile from disk'
 
 
-@_SKIP_ASYNC_OVER_OALL8
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
     """Verify the async surface: connect_async, AsyncCursor, fetch
@@ -12044,14 +12039,20 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
     async def test_async_iteration_yields_all_rows(self):
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
             async with Conn.cursor() as Cur:
-                await Cur.execute('SELECT LEVEL FROM dual CONNECT BY LEVEL <= 5')
+                # In a subquery: a bare CONNECT BY LEVEL against dual returns
+                # 9.2's native OCI client one row -- sqlplus 9.2 too (#798).
+                await Cur.execute(
+                    'SELECT * FROM (SELECT LEVEL FROM dual CONNECT BY LEVEL <= 5)'
+                )
                 Rows = [row async for row in Cur]
                 self.assertEqual(Rows, [(1,), (2,), (3,), (4,), (5,)])
 
     async def test_fetchall_and_fetchmany(self):
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
             async with Conn.cursor() as Cur:
-                await Cur.execute('SELECT LEVEL FROM dual CONNECT BY LEVEL <= 4')
+                await Cur.execute(
+                    'SELECT * FROM (SELECT LEVEL FROM dual CONNECT BY LEVEL <= 4)'
+                )
                 # fetchmany(2) → first batch
                 First = await Cur.fetchmany(2)
                 self.assertEqual(First, [(1,), (2,)])
@@ -13214,7 +13215,6 @@ class BFILEIntegration(_ThrottleRetry, unittest.TestCase):
             Conn.close()
 
 
-@_SKIP_ASYNC_OVER_OALL8
 @unittest.skipUnless(
     _USER and os.environ.get('SEERDB_TEST_BFILE_DIR'),
     'Async BFILE tests share the same fixture requirements as the '
@@ -13266,7 +13266,6 @@ class AsyncBFILEIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
                 self.assertIs(await Lob.afileexists(), False)
 
 
-@_SKIP_ASYNC_OVER_OALL8
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class AsyncPoolIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
     """AsyncPool: pre-warm, acquire / release, capacity, timeout,

@@ -127,6 +127,8 @@ class _ConnectionLogic:
 
         def _next_seq(self) -> int: ...
 
+        def _auth_info_pairs(self) -> list: ...
+
         def _send_break(self) -> None: ...
 
         def _arm_break_deadline(self) -> None: ...
@@ -160,9 +162,72 @@ class _ConnectionLogic:
         and the next call drew ORA-01012 (9i) or an AssertionError (8i)."""
         from seerdb.common.tns import decode_8i_terminal_error, decode_fv2_oer_error
 
+        if getattr(self, '_o3_oall8', False):
+            return self._oall8_login_error(Packet)
         if isinstance(self._dialect, O8iDialect):
             return decode_8i_terminal_error(Packet)
         return decode_fv2_oer_error(Packet)
+
+    @staticmethod
+    def _oall8_login_error(Packet: bytes) -> tuple[int, str | None]:
+        # The native 9i OALL8 login's OER (9.2 OCI path) uses neither the 9i-short
+        # nor the 11g+ layout decode_packet knows, at either phase: an unknown
+        # user is refused at the OSESSKEY, a wrong password at the OAUTH (#798;
+        # the first read "authentication failed" with no code). Its ORA message
+        # travels verbatim in the packet, so recover the code from the embedded
+        # "ORA-NNNNN" text (a bad password surfaces ORA-01017); an OER with no
+        # such text is a clean completion.
+        Marker = Packet.find(b'ORA-')
+        if Marker < 0:
+            return (0, None)
+        Digits = Packet[Marker + 4 : Marker + 9]
+        ErrCode = int(Digits.decode('ascii', 'ignore') or 0)
+        return (ErrCode, Packet[Marker:].split(b'\n')[0].decode('ascii', 'ignore'))
+
+    def _oall8_osesskey(self) -> bytes:
+        # Native 9i OALL8 O3LOGON phase one (#790): once the native data-type
+        # negotiation has run, the 9.2 server expects the OCI OSESSKEY (0x76)
+        # call frame; it answers with an AUTH_SESSKEY RPA in the native DALC
+        # coding and drives the 8-byte O3LOGON proof (CCAP_LOGON_TYPES 0).
+        # Shared by the sync and async logins.
+        from seerdb.common.tns import encode_oall8_osesskey_phase1
+
+        self._o3_oall8 = True
+        self._o3_phase = 1
+        return encode_oall8_osesskey_phase1(
+            self._next_seq(), self.user.encode('utf-8'), self._auth_info_pairs()
+        )
+
+    def _oall8_oauth(self, Packet: bytes) -> bytes:
+        # Native 9i OALL8 O3LOGON phase two: recover the session key, DES-encrypt
+        # the password under it (the same crypto as the thin 9i / 8i paths), and
+        # send it as AUTH_PASSWORD in the OAUTH (0x73) call. With CCAP_LOGON_TYPES
+        # forced to 0 (_O3_OALL8_COMPILE_CAPS) the 9.2 server issues an 8-byte DES
+        # session key, so AUTH_PASSWORD is the proof the thin TTI_3LOGON / 8i
+        # paths send: upper-hex(DES cipher), then the decimal pad count (#790).
+        from binascii import hexlify
+
+        from seerdb.common.crypto import des_verifier, o3logon
+        from seerdb.common.tns import (
+            encode_oall8_oauth_phase2,
+            parse_oall8_auth_sesskey,
+        )
+
+        SessKey = parse_oall8_auth_sesskey(Packet)
+        UserB = self.user.encode('utf-8')
+        PassB = self.password.encode('utf-8')
+        (AuthPass, _, _) = o3logon(SessKey, des_verifier(UserB, PassB), PassB)
+        PadCount = (8 - len(PassB) % 8) % 8
+        PwdField = (hexlify(AuthPass).decode('ascii').upper() + str(PadCount)).encode(
+            'ascii'
+        )
+        self._o3_phase = 2
+        return encode_oall8_oauth_phase2(
+            self._next_seq(),
+            UserB,
+            PwdField,
+            self._auth_info_pairs() + [(b'AUTH_ACL', b'8000')],
+        )
 
     def _o7_logon_mode(self) -> int:
         # The logon mode a 9i OSESSKEY carries (#2342), as 10g+'s: the role's
