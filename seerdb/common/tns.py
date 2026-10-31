@@ -14691,6 +14691,22 @@ def decode_9i_oall8_exec_response(
                         (Lob, Rest) = _o9i_oall8_lob_cell(Col['data_type'], Rest)
                         Row.append(Lob)
                         continue
+                    if Col.get('data_type') in _LONG_DATA_TYPES:
+                        # A LONG / LONG RAW cell is the value -- a ub1 length or
+                        # 0xFE chunks -- then a ub2 indicator (-1 for NULL) and a
+                        # ub2 return code, the form of an OUT bind's cell: `fe 02
+                        # 6869 00 0000 0000` for 'hi', `00 ffff 7d05` for NULL,
+                        # read live on 9.2. Unread, the four bytes shifted every
+                        # column after the LONG (#798).
+                        (LongValue, Rest) = _OCI.read_value(Rest)
+                        Indicator = int.from_bytes(Rest[:2], 'little', signed=True)
+                        Rest = Rest[4:]
+                        Row.append(
+                            None
+                            if Indicator == -1 or LongValue is None
+                            else decode_value(Col, LongValue)
+                        )
+                        continue
                     if (
                         Col.get('data_length', None) == 0
                         and Col.get('data_type') not in _LONG_DATA_TYPES

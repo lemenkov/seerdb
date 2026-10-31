@@ -7930,6 +7930,41 @@ class TestNative9iOall8Select(unittest.TestCase):
         self.assertEqual(decode_9i_oall8_status(self.QUERY_ERROR_AT_7)['code'], 904)
         self.assertEqual(decode_9i_oall8_error_position(self.QUERY_ERROR_AT_7), 7)
 
+    # `SELECT txt, id, s` over a LONG first: the rows ('hi', 5, 'zz') and (NULL, 6,
+    # 'yy'), each its own fetch (a LONG fetches one row at a time), live on 9.2.
+    LONG_FIRST_ROW = bytes.fromhex(
+        '0601022a030000000100000000000000000000000000000000000000d4030000'
+        '00000000000000000000000020020000000007fe026869000000000002c10602'
+        '7a7a080500000000000000000009000000010000000000000000000000040200'
+        '0000010100000000000000000009000000030000000000b857030001000000d2'
+        'b800000200000000000000000d00000100000036010000000000000000000000'
+        '00000080d0d40300000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000000'
+    )
+    LONG_FIRST_NULL_ROW = bytes.fromhex(
+        '060102e10300000001000000ffbf7f0000000000000000000000000060962a00'
+        '00000000000000000000000060962a0000000700ffff7d0502c1070279790805'
+        '0000000000000000000900000001000000000000000000000004020000000102'
+        '00000000000000000009000000030000000000b857030001000000d2b8000002'
+        '00000000000000000e0000010000003601000000000000000000000000000080'
+        'd0d4030000000000000000000000000000000000000000000000000000000000'
+        '00000000000000000000000000000000000000000000000000000000000000'
+    )
+
+    def test_a_long_cell_ends_with_an_indicator_and_a_return_code(self):
+        # The value, then a ub2 indicator and a ub2 return code, as an OUT bind's
+        # cell; unread, the four bytes shifted the columns after the LONG (#798).
+        columns = [
+            {'data_type': 8, 'data_length': 0, 'charset': 31, 'csfrm': 1},
+            {'data_type': 2, 'data_length': 22, 'charset': 0, 'csfrm': 0},
+            {'data_type': 1, 'data_length': 5, 'charset': 31, 'csfrm': 1},
+        ]
+        (rows, _, _) = self._decode(self.LONG_FIRST_ROW, columns)
+        self.assertEqual(rows, [['hi', 5, 'zz']])
+        (rows, _, _) = self._decode(self.LONG_FIRST_NULL_ROW, columns)
+        self.assertEqual(rows, [[None, 6, 'yy']])
+
     def test_a_for_update_row_header_carries_the_rowid(self):
         # The row header names a 13-byte rowid (a ub2 at 42) between it and the
         # row: SELECT ... FOR UPDATE sends the row it locks. Unskipped, the row
