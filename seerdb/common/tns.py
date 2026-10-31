@@ -16185,6 +16185,11 @@ _OALL8_PTR = bytes.fromhex('d096ffbf7f000000')
 def _oall8_dalc(Value: bytes) -> bytes:
     # ub4le total length, ub1 chunk length, data (values stay <= 252 bytes, so
     # the single chunk equals the total -- enforced by _o8i_info_pairs upstream).
+    # An empty value is the zero length alone, as on 8i (#2344): with a zero
+    # chunk byte after it, the server dropped the connection at an empty
+    # program name (#798).
+    if not Value:
+        return struct.pack('<I', 0)
     return struct.pack('<I', len(Value)) + bytes([len(Value)]) + Value
 
 

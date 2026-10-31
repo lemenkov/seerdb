@@ -7535,6 +7535,26 @@ class TestO9iOall8Messages(unittest.TestCase):
         '9c03ec02000000000352f30040b8d20000030000000e0358595a'
     )
 
+    def test_9i_oall8_login_sends_an_empty_value_as_its_length_alone(self):
+        # An empty program name is a zero ub4 length and nothing more, as on 8i
+        # (#2344); with a zero chunk byte after it the 9.2 server dropped the
+        # OALL8 login (#798).
+        import struct
+
+        from seerdb.common.tns import encode_oall8_osesskey_phase1
+
+        msg = encode_oall8_osesskey_phase1(1, b'PYO', [(b'AUTH_PROGRAM_NM', b'')])
+        key = b'AUTH_PROGRAM_NM'
+        self.assertTrue(
+            msg.endswith(
+                struct.pack('<I', len(key))
+                + bytes([len(key)])
+                + key
+                + bytes(4)
+                + bytes(4)
+            )
+        )
+
     def test_9i_oall8_lob_write_matches_native_client(self):
         # The 64-bit TTI_LOBOPS head with the offset at 31, then the locator, the
         # ub4 amount, and the data as TTI_LOB content (#798). The source and amount

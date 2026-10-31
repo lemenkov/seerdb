@@ -1728,8 +1728,11 @@ class OracleConnect(_ConnectionLogic):
                                 # string, session id, ...), exactly as the 8i
                                 # O3LOGON path does. There is no O5LOGON server
                                 # proof to validate on the pre-10g path, so this
-                                # RPA means authenticated.
+                                # RPA means authenticated. Its AUTH_VERSION_NO is
+                                # the release, in the 8i reply form (#798; 9.2.0.4
+                                # sends 153093120).
                                 self.conn_state = CONN_STATE_AUTHENTICATED
+                                self.server_version = decode_8i_server_version(Packet)
                                 logger.debug(
                                     'handle_login: authenticated (9i OALL8 O3LOGON)'
                                 )
@@ -1762,11 +1765,14 @@ class OracleConnect(_ConnectionLogic):
                             from seerdb.common.tns import decode_packet
 
                             if getattr(self, '_o3_oall8', False) and (
-                                getattr(self, '_o3_phase', 0) == 2
+                                getattr(self, '_o3_phase', 0) in (1, 2)
                             ):
                                 # The native OALL8 OER (9.2 OCI path) uses neither
                                 # the 9i-short nor the 11g+ layout decode_packet
-                                # knows. Its ORA message travels verbatim in the
+                                # knows, at either phase: an unknown user is
+                                # refused at the OSESSKEY, a wrong password at the
+                                # OAUTH (#798; the first read "authentication
+                                # failed" with no code). Its ORA message travels verbatim in the
                                 # packet, so recover the code from the embedded
                                 # "ORA-NNNNN" text (e.g. a bad password surfaces
                                 # ORA-01017); an OER with no such text is a clean,
