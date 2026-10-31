@@ -309,6 +309,8 @@ _KEEPS_NO_BYTES = {
     # is there, and writes the indicator.
     ('ptr', '_OCI'),
     ('ptr', '_OCI_WIDE'),
+    # A native 9.2 server's status does the same (#798).
+    ('ptr', '_O9I'),
 }
 _THIN_INTEGERS = ('n1', 'n2', 'n4', 'n8', 'wn4', 'token', 'scale')
 # A pad a peer fills, which the schema skips and writes as zeros, named.
@@ -323,6 +325,7 @@ _FILLED_PADS = {
 # (#2322), and a LONG in OCI's of 252.
 _RECHUNKED_TEXT = {
     ('_O8I_STATUS', '_O8I'): ('when', 'code'),
+    ('_O9I_STATUS', '_O9I'): ('when', 'code'),
     ('_O8I_LONG_CELL', '_O8I'): ('long', 'value'),
     ('_O8I_OUT_CELL', '_O8I'): ('chr', 'value'),
     # A server sends a multi-chunk LONG column in its own chunk sizes; the thin

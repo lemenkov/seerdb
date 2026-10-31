@@ -2259,6 +2259,63 @@ _O8I_STATUS: wire_schema.Schema = (
     ('when', 'code', (('chr', 'message'),)),
 )
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+# The experimental 9i OALL8 status (#798): 8i's (_O8I_STATUS) from its row count
+# through its warnings, behind the call status (a ub4: 2 a DML, 4 a describe-only
+# execute, 5 a bound one's first parse) and a one-byte sequence the 10g+ OER
+# carries there too, and at a 9.2 client's alignment -- the rowid's file and slot
+# each padded to four bytes. Then OCI's own tail: the OS error, statement and
+# call numbers, padding and iterations as on 8i, a fixed 310 (the constant 11g's
+# OCI status carries at 56), the oerrdd's pointer and ub4 length, and the three
+# batch-error arrays' pointers and counts; after them the oerrdd itself (a ub2
+# size and the 13-byte rowid, as a DML leaves it), the arrays' values -- codes as
+# ub2s, row offsets as ub4s, messages each a ub4 length, the text and six bytes
+# -- and, when the code is set, the message. Read whole, nothing left, from every
+# live 9.2 status the decode tests hold and every status in the native captures;
+# a DML's, committed or not, bound or not, is 150 bytes with the oerrdd at 134.
+_O9I_STATUS_HEAD: wire_schema.Schema = (
+    _O8I_STATUS[0],
+    ('n4', 'call_status'),
+    ('u8', 'sequence'),
+    *_O8I_STATUS[1 : _O8I_STATUS.index(('n4', 'rowid_object'))],
+    ('n4', 'rowid_object'),
+    ('n2', 'rowid_file'),
+    ('pad', 2),
+    ('n4', 'rowid_block'),
+    ('n2', 'rowid_slot'),
+    ('pad', 2),
+)
+_O9I_STATUS: wire_schema.Schema = (
+    *_O9I_STATUS_HEAD,
+    ('n4', 'os_error'),
+    ('u8', 'statement'),
+    ('u8', 'call'),
+    ('n2', 'padding'),
+    ('n4', 'iterations'),
+    ('n4', 'constant_310'),
+    ('pad', 12),
+    ('ptr', 'oerrdd_present'),
+    ('n4', 'oerrdd_length'),
+    ('pad', 4),
+    ('ptr', 'batch_codes_present'),
+    ('n4', 'batch_code_count'),
+    ('pad', 4),
+    ('ptr', 'batch_offsets_present'),
+    ('n4', 'batch_offset_count'),
+    ('pad', 4),
+    ('ptr', 'batch_messages_present'),
+    ('n4', 'batch_message_count'),
+    ('pad', 4),
+    ('when', 'oerrdd_length', (('n2', 'oerrdd_size'), ('value', 'oerrdd'))),
+    ('each', 'batch_codes', 'batch_code_count', (('n2', 'code'),)),
+    ('each', 'batch_offsets', 'batch_offset_count', (('n4', 'offset'),)),
+    (
+        'each',
+        'batch_messages',
+        'batch_message_count',
+        (('n4', 'length'), ('chr', 'text'), ('pad', 6)),
+    ),
+    ('when', 'code', (('chr', 'message'),)),
+)
 _OAC_FROM_THIN = wire_schema.compile_decoder(_OAC, _THIN)
 _OAC_FROM_OCI = wire_schema.compile_decoder(_OAC, _OCI)
 _O7_OAC_THIN = wire_schema.compile_encoder(_O7_OAC, _THIN)
@@ -2406,6 +2463,8 @@ _CLOSE_CURSORS_FROM_OCI = wire_schema.compile_decoder(_CLOSE_CURSORS, _OCI)
 _CLOSE_CURSORS_O8I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O8I)
 _O8I_ALL8_O8I = wire_schema.compile_encoder(_O8I_ALL8, _O8I)
 _O8I_ALL8_O9I = wire_schema.compile_encoder(_O8I_ALL8, _O9I)
+_O9I_STATUS_FROM_O9I = wire_schema.compile_decoder(_O9I_STATUS, _O9I)
+_O9I_STATUS_HEAD_FROM_O9I = wire_schema.compile_decoder(_O9I_STATUS_HEAD, _O9I)
 _OAC_OCI = wire_schema.compile_encoder(_OAC, _OCI)
 _O7_LOBOPS_O9I = wire_schema.compile_encoder(_O7_LOBOPS, _O9I)
 _CLOSE_CURSORS_O9I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O9I)
@@ -14850,105 +14909,91 @@ def _o9i_oall8_oer(Terminal: bytes) -> bytes:
 
 
 def decode_9i_oall8_cursor_id(Terminal: bytes) -> int:
-    # The server cursor the fetch loop pulls more rows from, read from the exec
-    # reply's OER: a ub2 at offset 16 (past the OER head and the ORA code). It is
-    # a session-monotonic counter that rises per statement, so each open statement
-    # is fetched by its own id -- a fixed id drew ORA-01002 on the second query. 0
-    # when the terminal holds no whole OER (an error / empty result -- no fetch).
-    #
-    # Read as one byte it was right for a session's first 255 statements: the
-    # 256th is `00 01` and fetched cursor 0 (ORA-01002, #798; read live on 9.2
-    # past 300 statements). An earlier reading of a ub2 here took cursor 4 for
-    # 260 on a repeated statement's reply; that was before the status reader
-    # skipped the session-state RPA by its length (7a4e533), and twenty repeats
-    # of one statement now read byte 17 as 0 throughout.
-    Oer = _o9i_oall8_oer(Terminal)
-    if len(Oer) < 18:
-        return 0
-    return int.from_bytes(Oer[16:18], 'little')
+    # The server cursor the fetch loop pulls more rows from, and the next call
+    # closes: the status's cursor (_O9I_STATUS, a ub2). It rises per statement
+    # until closed, so each open statement is fetched by its own id -- a fixed id
+    # drew ORA-01002 on the second query. 0 when the terminal holds no whole
+    # status (an error / empty result -- no fetch). Read as one byte it was right
+    # for a session's first 255 statements: the 256th is `00 01` (#798).
+    Status = _o9i_oall8_status_or_none(Terminal)
+    return Status['cursor'] if Status else 0
 
 
 def decode_9i_oall8_dml_response(
     Terminal: bytes, Applied: bool = False
 ) -> tuple[int, int, str | None]:
     # The affected-row count, ORA code and message a 9i OALL8 non-query (DML / DDL
-    # / transaction-control) reply carries (#716). The count is a ub4 at OER offset
-    # 6 -- the "rows processed" field, where a SELECT reply reports its batch size
-    # (UPDATE of 2 rows -> 2, INSERT / DELETE -> 1, DDL / COMMIT -> 0; read live on
-    # 9.2) -- and the code / message come from decode_9i_oall8_status. A failed
+    # / transaction-control) reply carries (#716): the status's rows -- where a
+    # SELECT reply reports its batch size (UPDATE of 2 rows -> 2, INSERT / DELETE
+    # -> 1, DDL / COMMIT -> 0; read live on 9.2) -- code and message. A failed
     # statement reports no count, unless `Applied`: an array DML that fails at a
     # row has applied the rows before it, and the status counts them (#798; 1 of
     # rows 4, 1-duplicate, 5 in native_9i_array_dml.pcap). Returns (rowcount, code,
-    # message); raises Truncated if the OER is cut short, for the reader to read
+    # message); raises Truncated if the status is cut short, for the reader to read
     # on.
     Status = decode_9i_oall8_status(Terminal)
     if Status is None:
         return (0, 0, None)
-    Oer = _o9i_oall8_oer(Terminal)
-    Rows = int.from_bytes(Oer[6:10], 'little') if len(Oer) >= 10 else 0
     Code = Status['code']
-    return (0 if Code and not Applied else Rows, Code, Status['message'])
+    return (0 if Code and not Applied else Status['rows'], Code, Status['message'])
 
 
 def decode_9i_oall8_batch_errors(Terminal: bytes) -> list[dict]:
     # The per-row errors of a 9i OALL8 array DML in batch-errors mode (#798), as
     # {offset, code, message}, or [] for a status with none. The server applies
-    # the good rows and answers ORA-24381; its status holds three (pointer, ub4
-    # count, 4 pad) entries at offsets 86, 102 and 118 -- the codes', the row
-    # offsets' and the messages' -- and then the arrays: the codes as ub2s, the
-    # offsets as ub4s, and each message a ub4 length, the text as a ub1-length
-    # value and six bytes after it. Read from native 9.2 statuses with one and
-    # with two failed rows (native_9i_array_dml.pcap).
-    Oer = _o9i_oall8_oer(Terminal)
-    if len(Oer) < 134 or int.from_bytes(Oer[10:14], 'little') != 24381:
+    # the good rows and answers ORA-24381 with the status's three arrays
+    # (_O9I_STATUS): error i hit row offsets[i] with codes[i] and messages[i].
+    # Read from native 9.2 statuses with one and with two failed rows
+    # (native_9i_array_dml.pcap).
+    Status = _o9i_oall8_status_or_none(Terminal)
+    if not Status or Status['code'] != 24381 or 'batch_codes' not in Status:
         return []
-    Count = int.from_bytes(Oer[94:98], 'little')
-    Rest = Oer[134:]
-    Codes = [int.from_bytes(Rest[2 * I : 2 * I + 2], 'little') for I in range(Count)]
-    Rest = Rest[2 * Count :]
-    Offsets = [int.from_bytes(Rest[4 * I : 4 * I + 4], 'little') for I in range(Count)]
-    Rest = Rest[4 * Count :]
-    Messages = []
-    for _ in range(Count):
-        Length = Rest[4]
-        Messages.append(bytes(Rest[5 : 5 + Length]).decode('utf-8', 'replace').rstrip())
-        Rest = Rest[5 + Length + 6 :]
     return [
-        {'offset': Offsets[I], 'code': Codes[I], 'message': Messages[I]}
-        for I in range(Count)
+        {
+            'offset': Offset['offset'],
+            'code': Code['code'],
+            'message': bytes(Message['text']).decode('utf-8', 'replace').rstrip(),
+        }
+        for (Code, Offset, Message) in zip(
+            Status['batch_codes'], Status['batch_offsets'], Status['batch_messages']
+        )
     ]
 
 
 def decode_9i_oall8_error_position(Terminal: bytes) -> int:
-    # Where in the statement a 9i OALL8 status's error is (#798): a ub2 at offset
-    # 18, the 0-based character the server points at (#2263's field) -- 7 for
-    # `SELECT nosuchcol FROM dual`, read live on 9.2. 0 with no whole status.
-    Oer = _o9i_oall8_oer(Terminal)
-    return int.from_bytes(Oer[18:20], 'little') if len(Oer) >= 20 else 0
+    # Where in the statement a 9i OALL8 status's error is (#798), the 0-based
+    # character the server points at (#2263's field): the status's position -- 7
+    # for `SELECT nosuchcol FROM dual`, read live on 9.2. 0 with no whole status.
+    Status = _o9i_oall8_status_or_none(Terminal)
+    return Status['position'] if Status else 0
 
 
 def decode_9i_oall8_warn_flags(Terminal: bytes) -> int:
-    # A 9i OALL8 status's warning flags (#798), the byte at offset 25: bit 0x20 is
-    # a CREATE whose object compiled with errors (0x21 live on 9.2 for a broken
-    # procedure, 0 for the same one compiled clean), which the call otherwise
-    # reports as a success -- cursor.warning (#2262).
-    Oer = _o9i_oall8_oer(Terminal)
-    return Oer[25] if len(Oer) >= 26 else 0
+    # A 9i OALL8 status's warning flags (#798): bit 0x20 is a CREATE whose object
+    # compiled with errors (0x21 live on 9.2 for a broken procedure, 0 for the same
+    # one compiled clean), which the call otherwise reports as a success --
+    # cursor.warning (#2262).
+    Status = _o9i_oall8_status_or_none(Terminal)
+    return Status['warnings'] if Status else 0
 
 
 def decode_9i_oall8_dml_rowid(Terminal: bytes) -> str | None:
-    # The rowid of the row a 9i OALL8 DML touched (#1079), or None: the status
-    # carries it at offset 26 in the structure a ROWID cell has (_o9i_oall8_rowid).
-    # Read from native 9.2 INSERT and UPDATE replies (slot 0, then 1, of object
-    # 0x34486); the reply's tail repeats it as a physical UROWID. A status with no
-    # block (DDL, a failure) has none; one that touched nothing keeps the previous
-    # statement's, which the cursor sorts out by the row count, as on 8i / 9i.
-    Oer = _o9i_oall8_oer(Terminal)
-    if len(Oer) < 42 or int.from_bytes(Oer[10:14], 'little'):
+    # The rowid of the row a 9i OALL8 DML touched (#1079), or None: the status's
+    # (_O9I_STATUS), read from native 9.2 INSERT and UPDATE replies, whose tail
+    # repeats it as a physical UROWID. A status with no block (DDL, a failure) has
+    # none; one that touched nothing keeps the previous statement's, which the
+    # cursor sorts out by the row count, as on 8i / 9i.
+    from seerdb.common.types import rowid_to_string
+
+    Status = _o9i_oall8_status_or_none(Terminal)
+    if not Status or Status['code'] or not Status['rowid_block']:
         return None
-    if not int.from_bytes(Oer[34:38], 'little'):
-        return None
-    return _o9i_oall8_rowid(bytes(Oer[26:42]))
+    return rowid_to_string(
+        Status['rowid_object'],
+        Status['rowid_file'],
+        Status['rowid_block'],
+        Status['rowid_slot'],
+    )
 
 
 def decode_9i_oall8_bind_directions(Data: bytes, NumBinds: int) -> list[int] | None:
@@ -15046,20 +15091,58 @@ def _o9i_oall8_block_parts(
 
 
 def decode_9i_oall8_status(Terminal: bytes) -> dict | None:
-    # The ORA code (and best-effort message) a 9i OALL8 reply's status carries, or
-    # None for a terminal with no whole OER yet. The code is a ub4 at offset 10 of
-    # the OER token (04 + ub4 + u8 + ub4 + code-ub4); the message, when the code is
-    # set, is a trailing "ORA-..." string. Raises Truncated if the OER head is cut
-    # short, for the reader to read on.
+    # The ORA code and message a 9i OALL8 reply's status carries, with its rows,
+    # or None for a terminal with no status. Raises Truncated if the status's
+    # head is cut short, for the reader to read on.
+    Status = _o9i_oall8_status_fields(Terminal)
+    if Status is None:
+        return None
+    return {
+        'code': Status['code'],
+        'message': Status['message_text'],
+        'rows': Status['rows'],
+    }
+
+
+def _o9i_oall8_status_or_none(Terminal: bytes) -> dict | None:
+    # The status's fields, or None for one that is not there or cut short: the
+    # field readers answer their default then, as they did reading offsets.
+    try:
+        return _o9i_oall8_status_fields(Terminal)
+    except Truncated:
+        return None
+
+
+def _o9i_oall8_status_fields(Terminal: bytes) -> dict | None:
+    # The fields of a 9i OALL8 reply's status (_O9I_STATUS), past any RPA ahead of
+    # it, or None when the terminal holds none. A status whose tail does not read
+    # -- a form no capture has shown yet -- gives its head's fields and its
+    # message found by its text, as every status did before the schema, rather
+    # than failing a reply the code could still be read from. `message_text` is
+    # the message as str (or None). Raises Truncated if the head is cut short.
     Oer = _o9i_oall8_oer(Terminal)
     if not Oer:
         return None
-    if len(Oer) < 14:
-        raise Truncated('9i OALL8 status cut short')
-    Code = int.from_bytes(Oer[10:14], 'little')
+    try:
+        (Status, _) = _O9I_STATUS_FROM_O9I(Oer)
+        Message = Status.get('message')
+        Status['message_text'] = (
+            bytes(Message).split(b'\x00')[0].rstrip(b'\n').decode('latin-1', 'replace')
+            or None
+            if Message
+            else None
+        )
+        return Status
+    except (IndexError, DataError):
+        pass
+    try:
+        (Status, _) = _O9I_STATUS_HEAD_FROM_O9I(Oer)
+    except (IndexError, DataError) as Exc:
+        raise Truncated('9i OALL8 status cut short') from Exc
+    Code = Status['code']
     Message = None
     # The message naming the code: a batch-errors status (ORA-24381) lists the
-    # rows' own messages ahead of its own (decode_9i_oall8_batch_errors).
+    # rows' own messages ahead of its own.
     At = Oer.find(f'ORA-{Code:05d}'.encode()) if Code else -1
     if At < 0:
         At = Oer.find(b'ORA-')
@@ -15068,7 +15151,8 @@ def decode_9i_oall8_status(Terminal: bytes) -> dict | None:
             bytes(Oer[At:]).split(b'\x00')[0].rstrip(b'\n').decode('latin-1', 'replace')
             or None
         )
-    return {'code': Code, 'message': Message}
+    Status['message_text'] = Message
+    return Status
 
 
 def o9i_oall8_terminal_complete(Terminal: bytes) -> bool:
