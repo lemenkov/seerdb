@@ -232,8 +232,8 @@ the stable public API. Additive, backward-compatible features are a **minor**
 bump; bug fixes are a **patch**. A breaking change to the client API (e.g.
 the `oracle` → `seerdb` package rename in 2.0.0) is a **major** bump.
 
-The server-side "Mirror" (`seerdb.server`, the `mirror` extra) is a **highly
-experimental technology preview** until its general availability: it ships with
+The server-side "Mirror" (`seerdb.server`, the `mirror` extra) is an **initial
+implementation**, a technology preview until its general availability: it ships with
 the package but is *not* covered by semver, and its API, command line and
 behaviour may change in any release. From GA on, semver covers the list in
 docs/MIRROR.md *Stability* (#1861):
