@@ -7409,8 +7409,15 @@ class TestO9iOall8Messages(unittest.TestCase):
         sql = b'INSERT INTO ret716 (id) VALUES (:1) RETURNING id INTO :2'
         msg = encode_9i_oall8_dml(0x07, sql, O8I_STMT_INSERT, [42])
         head_mid = msg[: msg.find(sql)]
-        self.assertEqual(len(head_mid), len(self.NATIVE_RET9I_HEADMID))
-        self.assertEqual(self._mask(head_mid), self._mask(self.NATIVE_RET9I_HEADMID))
+        # That client executed with OCI_COMMIT_ON_SUCCESS, which is its option
+        # bytes 4-5 (`05 04`, 0x0100 commit among them). The driver commits only
+        # when asked, so it sends the bytes a native client executing with
+        # OCI_DEFAULT does -- `80 00`, from native_9i_array_dml.pcap. Copied, they
+        # committed every bound DML and the transaction before it (#798).
+        native = bytearray(self.NATIVE_RET9I_HEADMID)
+        native[4:6] = b'\x80\x00'
+        self.assertEqual(len(head_mid), len(native))
+        self.assertEqual(self._mask(head_mid), self._mask(bytes(native)))
 
     def test_9i_oall8_widths_are_ub8(self):
         # The SQL length and the fixed `12` field ride as 8-byte little-endian
@@ -7430,11 +7437,12 @@ class TestO9iOall8Messages(unittest.TestCase):
         # A full byte-exact pin of a plain 1-bind INSERT (NUMBER 42): head+mid in
         # the 64-bit layout, the SQL text, the trailer, then the ub8 bind OAC and
         # the shared 8i bind value (`07 02 c1 2b`). Guards the whole write path.
+        # Option bytes 4-5 are `80 00`, no commit-on-success (#798).
         from seerdb.common.tns import O8I_STMT_INSERT, encode_9i_oall8_dml
 
         sql = b'INSERT INTO t9 (id) VALUES (:1)'
         expected = bytes.fromhex(
-            '035e062905040000000000feffffffffffffff1f00000000000000feffffffff'
+            '035e062980000000000000feffffffffffffff1f00000000000000feffffffff'
             'ffffff0c000000000000000000000000000000feffffffffffffff0000000001'
             '0000000000000000000000feffffffffffffff01000000000000000000000000'
             '000000000000000000000000000000000000000000000000000000feffffffff'
@@ -7449,12 +7457,15 @@ class TestO9iOall8Messages(unittest.TestCase):
         )
 
     def test_9i_oall8_ddl_no_binds_byte_exact(self):
-        # A no-bind DDL: bind option clear, byte4 0x81, no OAC / value section.
+        # A no-bind DDL: bind option clear, byte4 0x80, no OAC / value section.
+        # Byte4's low bit is commit-on-success; a native 9.2 sqlplus sends 0x80
+        # for this very `CREATE TABLE t9 (id NUMBER)` (and for DELETE / DROP), so
+        # 0x81 -- what this encoder once wrote -- made every DML autocommit.
         from seerdb.common.tns import O8I_STMT_CREATE, encode_9i_oall8_dml
 
         sql = b'CREATE TABLE t9 (id NUMBER)'
         expected = bytes.fromhex(
-            '035e052181000000000000feffffffffffffff1b00000000000000feffffffff'
+            '035e052180000000000000feffffffffffffff1b00000000000000feffffffff'
             'ffffff0c000000000000000000000000000000feffffffffffffff0000000001'
             '0000000000000000000000000000000000000000000000000000000000000000'
             '000000000000000000000000000000000000000000000000000000feffffffff'
@@ -7463,6 +7474,292 @@ class TestO9iOall8Messages(unittest.TestCase):
             '00000000000000000000000500000000000000000000000000000000000000'
         )
         self.assertEqual(encode_9i_oall8_dml(0x05, sql, O8I_STMT_CREATE, []), expected)
+
+    # A native 9.2 OCI client's array INSERT (OCIStmtExecute, 3 iterations) of
+    # (1, 'row1'), (2, NULL), (3, 'row3'): the bytes after the SQL text
+    # (native_9i_array_dml.pcap). And the head of the same batch with
+    # OCI_BATCH_ERRORS.
+    NATIVE_ARRAY_INSERT_AFTER_SQL = bytes.fromhex(
+        '0100000003000000000000000000000000000000000000000000000004000000'
+        '0000000000000000000000000000000001020000001600000000000000000000'
+        '0000000000000000000000000000000000000000000000000001010300001400'
+        '000000000000000000000000000000000000000000001f000100000000000000'
+        '00000702c10204726f77310702c103fd010702c10404726f7733'
+    )
+    NATIVE_BATCH_ERRORS_HEAD = bytes.fromhex('035e0b298008')
+
+    def test_9i_oall8_array_dml_matches_native_client(self):
+        # The iteration count (the tail's ub4 at +4) counts every row, and each row
+        # follows as its own TTI_RXD (#798). The descriptors differ from OCI's in
+        # flags and charset only, as a single row's do; a NULL goes out as the
+        # empty value this encoder always sends (`00`, read back NULL live) where
+        # OCI writes `fd 01`.
+        from seerdb.common.tns import O8I_STMT_INSERT, encode_9i_oall8_dml
+
+        sql = b'INSERT INTO arr798 VALUES (:1, :2)'
+        msg = encode_9i_oall8_dml(
+            0x07, sql, O8I_STMT_INSERT, [1, 'row1'], [[2, None], [3, 'row3']]
+        )
+        after = msg[msg.find(sql) + len(sql) :]
+        native = self.NATIVE_ARRAY_INSERT_AFTER_SQL
+        self.assertEqual(after[:8], native[:8])  # 1, then 3 iterations
+        rows = native[native.find(bytes.fromhex('0702c102')) :]
+        self.assertEqual(
+            after[after.find(bytes.fromhex('0702c102')) :],
+            rows.replace(bytes.fromhex('fd01'), b'\x00'),
+        )
+        self.assertEqual(msg[:6], bytes.fromhex('035e07298000'))
+
+    def test_9i_oall8_batch_errors_sets_its_option_bit(self):
+        # OCI_BATCH_ERRORS is 0x80000 in the option word: byte 5's 0x08.
+        from seerdb.common.tns import O8I_STMT_INSERT, encode_9i_oall8_dml
+
+        msg = encode_9i_oall8_dml(
+            0x0B,
+            b'INSERT INTO arr798 VALUES (:1, :2)',
+            O8I_STMT_INSERT,
+            [6, 'dup0'],
+            [[2, 'dup1'], [7, 'dup2']],
+            BatchErrors=True,
+        )
+        self.assertEqual(msg[:6], self.NATIVE_BATCH_ERRORS_HEAD)
+
+    # A native 9.2 OCI client's OCILobWrite of 'XYZ' at offset 3 into a CLOB
+    # (native_9i_lob_ops.pcap).
+    LOB_WRITE_REQUEST = bytes.fromhex(
+        '03600e50c8510000000000560000000000000000000000000000000000000003'
+        '0000000000000000000000000000000000000078faffbf7f0000000000000000'
+        '0000004000000000000000000000000000000000000000000000000054000102'
+        '0c00000001000000010000000dca79000352f4000352f300010001001f000000'
+        '00000049000000008fb30000005d96022e6e350000000800180000a2d1008014'
+        '9c03ec02000000000352f30040b8d20000030000000e0358595a'
+    )
+
+    def test_9i_oall8_login_sends_an_empty_value_as_its_length_alone(self):
+        # An empty program name is a zero ub4 length and nothing more, as on 8i
+        # (#2344); with a zero chunk byte after it the 9.2 server dropped the
+        # OALL8 login (#798).
+        import struct
+
+        from seerdb.common.tns import encode_oall8_osesskey_phase1
+
+        msg = encode_oall8_osesskey_phase1(1, b'PYO', [(b'AUTH_PROGRAM_NM', b'')])
+        key = b'AUTH_PROGRAM_NM'
+        self.assertTrue(
+            msg.endswith(
+                struct.pack('<I', len(key))
+                + bytes([len(key)])
+                + key
+                + bytes(4)
+                + bytes(4)
+            )
+        )
+
+    def test_9i_oall8_national_bind_declares_al16utf16(self):
+        # The descriptor's charset (ub2 at 29) and form (31): AL16UTF16 / 2 for a
+        # national Var, and its value in UTF-16BE (#798). Through the database
+        # charset an NVARCHAR2 lost every character Latin-1 lacks.
+        import seerdb
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import (
+            O8I_STMT_INSERT,
+            encode_9i_oall8_dml,
+        )
+
+        var = Var(seerdb.DB_TYPE_NVARCHAR)
+        var.setvalue(0, 'Ω')
+        sql = b'INSERT INTO t VALUES (:1)'
+        msg = encode_9i_oall8_dml(1, sql, O8I_STMT_INSERT, [var])
+        oac = msg[msg.find(sql) + len(sql) + 48 :][:41]
+        self.assertEqual(int.from_bytes(oac[29:31], 'little'), 2000)
+        self.assertEqual(oac[31], 2)
+        self.assertTrue(msg.endswith(bytes([0x07, 2]) + 'Ω'.encode('utf-16-be')))
+
+    def test_9i_oall8_rowid_var_binds_as_text(self):
+        # A ROWID / UROWID Var declares VARCHAR, wide enough for a logical rowid,
+        # as on the compact path (#1397); declared as itself, the text bound back
+        # in drew ORA-01460 over OALL8 (#798).
+        import seerdb
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import TNS_TYPE_VARCHAR, encode_9i_oall8_query
+
+        for typ in (seerdb.ROWID, seerdb.DB_TYPE_UROWID):
+            var = Var(typ)
+            var.setvalue(0, 'AAA0tXAABAAALjSAAA')
+            sql = b'SELECT n FROM t WHERE rowid = :r'
+            msg = encode_9i_oall8_query(1, sql, [var])
+            oac = msg[msg.find(sql) + len(sql) + 48 :][:41]
+            self.assertEqual(oac[1], TNS_TYPE_VARCHAR)
+            self.assertEqual(int.from_bytes(oac[5:13], 'little'), 5267)
+
+    def test_9i_oall8_close_cursors_matches_native_client(self):
+        # The close a native 9.2 OCI client piggybacks ahead of its next call
+        # (native_9i_array_dml.pcap): `11 69`, seq, the array pointer (its heap
+        # address, masked), a ub8 count and the ub4 cursor id (#798). Several
+        # cursors go one piggyback each, each with the next seq.
+        from seerdb.common.tns import encode_9i_oall8_close_cursors
+
+        native = bytes.fromhex('116906e0c2510000000000010000000000000001000000')
+        ours = encode_9i_oall8_close_cursors(0x06, [1])
+
+        def mask(buf):
+            return buf[:3] + bytes(8) + buf[11:]
+
+        self.assertEqual(mask(ours), mask(native))
+        two = encode_9i_oall8_close_cursors(0x06, [1, 300])
+        self.assertEqual(len(two), 2 * len(native))
+        self.assertEqual((two[2], two[25]), (0x06, 0x07))
+        self.assertEqual(int.from_bytes(two[42:46], 'little'), 300)
+
+    def test_9i_oall8_lob_write_matches_native_client(self):
+        # The 64-bit TTI_LOBOPS head with the offset at 31, then the locator, the
+        # ub4 amount, and the data as TTI_LOB content (#798). The source and amount
+        # pointers are the client's heap addresses; the encoder writes the
+        # indicator there.
+        from seerdb.common.tns import encode_9i_oall8_lobop
+        from seerdb.common.tns_consts import TNS_LOB_OP_WRITE
+
+        native = self.LOB_WRITE_REQUEST
+        locator = native[91 : 91 + int.from_bytes(native[11:19], 'little')]
+        ours = encode_9i_oall8_lobop(native[2], locator, TNS_LOB_OP_WRITE, 3, 3, b'XYZ')
+
+        def mask(buf):
+            b = bytearray(buf)
+            for off in (3, 51):
+                b[off : off + 8] = bytes(8)
+            return bytes(b)
+
+        self.assertEqual(mask(ours), mask(native))
+
+    # A native 9.2 sqlplus query of 161 bytes (its text NUL-terminated), and how
+    # the client framed it: 0xFE, 64-byte chunks (64, 64, 33) and a zero length.
+    NATIVE_LONG_SQL = (
+        b'SELECT ATTRIBUTE,SCOPE,NUMERIC_VALUE,CHAR_VALUE,DATE_VALUE FROM '
+        b"SYSTEM.PRODUCT_PRIVS WHERE (UPPER('SQL*Plus') LIKE UPPER(PRODUCT)) "
+        b'AND (UPPER(USER) LIKE USERID)\x00'
+    )
+    NATIVE_LONG_SQL_FRAMED = bytes.fromhex(
+        'fe4053454c454354204154545249425554452c53434f50452c4e554d45524943'
+        '5f56414c55452c434841525f56414c55452c444154455f56414c55452046524f'
+        '4d204053595354454d2e50524f445543545f5052495653205748455245202855'
+        '50504552282753514c2a506c75732729204c494b452055505045522850524f44'
+        '55435421292920414e4420285550504552285553455229204c494b4520555345'
+        '524944290000'
+    )
+
+    def test_9i_oall8_long_sql_is_chunked_as_native(self):
+        # Past 64 bytes the SQL text is the pre-10g chunked form; a single length
+        # byte, as once written, could not even hold a statement past 255 bytes.
+        from seerdb.common.tns import encode_9i_oall8_query
+
+        self.assertEqual(len(self.NATIVE_LONG_SQL), 161)
+        msg = encode_9i_oall8_query(0x10, self.NATIVE_LONG_SQL)
+        self.assertIn(self.NATIVE_LONG_SQL_FRAMED, msg)
+        # A 400-byte statement encodes at all (it raised before).
+        self.assertTrue(
+            encode_9i_oall8_query(0x11, b'SELECT 1 FROM dual ' + b' ' * 400)
+        )
+
+    # A native 9.2 sqlplus CLOB read (native_9i_clob_read.pcap): TTI_LOBOPS READ
+    # of 0x50 chars from offset 1 of an 86-byte locator, in the 64-bit form.
+    NATIVE_LOB_READ = bytes.fromhex(
+        '03601f58795d0000000000560000000000000000000000000000000000000001'
+        '000000000000000000000000000000000000008cb3ffbf7f0000000000000000'
+        '0000000200000000000000000000000000000000000000000000000054000102'
+        '0c00000001000000010000000d7e4d000344b9000344b800020002001f000000'
+        '000000000000000000000000000000022c35ac00000000000000000000000000'
+        '00000000000000000344b80040b8d2000050000000'
+    )
+
+    def test_9i_oall8_lob_read_matches_native(self):
+        from seerdb.common import oci
+        from seerdb.common.tns import encode_9i_oall8_lob_read
+
+        native = bytearray(self.NATIVE_LOB_READ)
+        # The client's heap addresses, which the server ignores, stand in as the
+        # non-null indicator.
+        native[3:11] = oci.OCI_INDICATOR
+        native[51:59] = oci.OCI_INDICATOR
+        locator = bytes(native[91:177])
+        self.assertEqual(len(locator), 86)
+        self.assertEqual(encode_9i_oall8_lob_read(0x1F, locator, 0x50), bytes(native))
+
+    def test_9i_oall8_bfile_calls_share_the_read_head(self):
+        # FILE_OPEN / GET_LENGTH / FILE_CLOSE ride the READ's head with their own
+        # operation (live-verified on 9.2 end to end). OPEN carries the read-only
+        # mode 0x0b as its amount; CLOSE carries no amount, so neither its amount
+        # pointer nor the trailing ub4 is there.
+        from seerdb.common import oci
+        from seerdb.common.tns import (
+            TNS_LOB_OP_FILE_CLOSE,
+            TNS_LOB_OP_FILE_OPEN,
+            TNS_LOB_OP_GET_LENGTH,
+            encode_9i_oall8_lobop,
+        )
+
+        locator = bytes.fromhex(
+            '0020000108080000000100000000000000054246444952000968656c6c6f2e62696e'
+        )
+        opened = encode_9i_oall8_lobop(3, locator, TNS_LOB_OP_FILE_OPEN, 0, 0x0B)
+        self.assertEqual(len(opened), 91 + len(locator) + 4)
+        self.assertEqual(opened[67:75], (0x100).to_bytes(8, 'little'))
+        self.assertEqual(opened[51:59], oci.OCI_INDICATOR)
+        self.assertEqual(opened[-4:], (0x0B).to_bytes(4, 'little'))
+        length = encode_9i_oall8_lobop(4, locator, TNS_LOB_OP_GET_LENGTH)
+        self.assertEqual(length[67:75], (1).to_bytes(8, 'little'))
+        self.assertEqual(length[-4:], bytes(4))
+        closed = encode_9i_oall8_lobop(5, locator, TNS_LOB_OP_FILE_CLOSE)
+        self.assertEqual(len(closed), 91 + len(locator))
+        self.assertEqual(closed[51:59], bytes(8))
+        self.assertEqual(closed[67:75], (0x200).to_bytes(8, 'little'))
+        self.assertEqual(closed[91:], locator)
+
+    def test_9i_oall8_temporal_binds_declare_their_wire_type(self):
+        # Each descriptor declares the form the value goes in, as the thin 9i path
+        # does (#797). A sub-second datetime declared a DATE drew ORA-01483 and a
+        # timedelta read as text ORA-01867 (both live on 9.2).
+        import datetime
+
+        from seerdb.common.datatypes import IntervalYM
+        from seerdb.common.tns import _encode_9i_bind_oac
+
+        def type_size(value):
+            oac = _encode_9i_bind_oac(value)
+            return (oac[1], int.from_bytes(oac[5:13], 'little'))
+
+        self.assertEqual(type_size(datetime.date(2001, 2, 3)), (12, 7))
+        self.assertEqual(type_size(datetime.datetime(2001, 2, 3, 4, 5, 6)), (12, 7))
+        self.assertEqual(
+            type_size(datetime.datetime(2001, 2, 3, 4, 5, 6, 123456)), (180, 11)
+        )
+        tz = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+        self.assertEqual(
+            type_size(datetime.datetime(2001, 2, 3, 4, 5, 6, tzinfo=tz)), (181, 13)
+        )
+        self.assertEqual(type_size(datetime.timedelta(days=2, seconds=5)), (183, 11))
+        self.assertEqual(type_size(IntervalYM(2, 3)), (182, 5))
+
+    def test_9i_oall8_text_rides_in_utf8(self):
+        # The native OALL8 session negotiates the Unicode DTY, so text -- the SQL
+        # and string binds -- goes as UTF-8: latin-1 'é' reached a WE8ISO8859P1
+        # database as NULL when bound and broke a literal's quoting (ORA-01756).
+        from seerdb.common.tns import (
+            _encode_9i_bind_oac,
+            _encode_9i_bind_value,
+            encode_9i_oall8_query,
+            encode_9i_sql_text,
+        )
+
+        self.assertEqual(
+            encode_9i_sql_text("select 'é' from dual"), "select 'é' from dual".encode()
+        )
+        self.assertEqual(_encode_9i_bind_value('é'), bytes.fromhex('02c3a9'))
+        oac = _encode_9i_bind_oac('é')
+        self.assertEqual((oac[1], int.from_bytes(oac[5:13], 'little')), (1, 2))
+        # A character outside latin-1 encodes at all (it raised before).
+        self.assertIn(
+            '€'.encode(), encode_9i_oall8_query(1, b'select :1 from dual', ['€'])
+        )
 
 
 class TestShortLengthBoundary(unittest.TestCase):

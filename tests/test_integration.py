@@ -32,7 +32,7 @@ import ssl
 import tempfile
 import unittest
 from decimal import Decimal
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import seerdb
 from seerdb.common.tns_consts import (
@@ -195,6 +195,19 @@ _8I_UNSUPPORTED = (
     ('reuses_cursor', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
     ('forgets_the_cached_cursor', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
     ('never_cached', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
+)
+
+
+# What the experimental 9i OALL8 opt-in (SEERDB_TEST_OALL8, #798) lacks by design,
+# as 8i does: a cursor cache. Its open gaps are left to fail.
+_OALL8_UNSUPPORTED = tuple(
+    (Pattern, 'the 9i OALL8 opt-in keeps no cursor cache, as 8i (#2261)')
+    for Pattern in (
+        'cache_evicts',
+        'reuses_cursor',
+        'forgets_the_cached',
+        'never_cached',
+    )
 )
 
 
@@ -503,7 +516,15 @@ _SERVICE = os.environ.get('SEERDB_TEST_SERVICE', 'XE')
 # a 12c+ server; unset/0 keeps the 11g default. Lets the same suite cover both
 # testbeds (issue #27).
 _FIELD_VERSION = int(os.environ.get('SEERDB_TEST_FIELD_VERSION', '0'))
-_FV_KW = {'field_version': _FIELD_VERSION} if _FIELD_VERSION else {}
+_FV_KW: dict[str, Any] = {'field_version': _FIELD_VERSION} if _FIELD_VERSION else {}
+# Run the suite over the experimental native 9i OALL8 dialect (#798); a 9.2 bed
+# only, every other server ignores the option.
+if os.environ.get('SEERDB_TEST_OALL8', '') not in ('', '0'):
+    _FV_KW['oall8'] = True
+# ...which is synchronous-only: connect_async refuses it.
+_SKIP_ASYNC_OVER_OALL8 = unittest.skipIf(
+    bool(_FV_KW.get('oall8')), 'the 9i OALL8 opt-in is synchronous-only'
+)
 
 _SKIP_REASON = (
     'integration tests require a real DB connection; '
@@ -877,6 +898,10 @@ class _IntegrationBase(_ThrottleRetry, unittest.TestCase):
         if Reason is None and _conn_is_8i(self.conn):
             # 8i is fv2 too but lacks more than 9i; layer its extra skips on top.
             Reason = _8i_skip_reason(self._testMethodName)
+        if Reason is None and _FV_KW.get('oall8'):
+            Reason = next(
+                (R for (P, R) in _OALL8_UNSUPPORTED if P in self._testMethodName), None
+            )
         if Reason is not None:
             self.conn.close()
             self.skipTest(Reason)
@@ -4040,6 +4065,34 @@ class CursorIntegration(_IntegrationBase):
         # The session is still usable: this is an ordinary error, not a desync.
         self.cur.execute('SELECT 1 FROM dual')
         self.assertEqual(self.cur.fetchone(), (1,))
+
+    def test_a_bound_dml_waits_for_the_commit(self):
+        # A bound INSERT, and a bound block, are part of the transaction like
+        # any other statement: another session does not see them, and rollback
+        # undoes them and what came before. Over the 9i OALL8 opt-in both
+        # carried commit-on-success and committed the whole transaction (#798).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER)')
+        conn = seerdb.connect(
+            host=_HOST,
+            port=_PORT,
+            user=_USER,
+            password=_PASSWORD,
+            service_name=_SERVICE,
+            autocommit=False,
+            **_FV_KW,
+        )
+        try:
+            cur = conn.cursor()
+            cur.execute(f'INSERT INTO {self.TABLE} VALUES (1)')
+            cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1)', [2])
+            cur.execute(f'BEGIN INSERT INTO {self.TABLE} VALUES (:1); END;', [3])
+            self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
+            self.assertEqual(self.cur.fetchone(), (0,))
+            conn.rollback()
+            cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
+            self.assertEqual(cur.fetchone(), (0,))
+        finally:
+            conn.close()
 
     def test_a_query_that_matches_nothing_still_raises_nothing(self):
         # The other half, and the reason the mask exists: a SELECT that matches
@@ -7910,6 +7963,7 @@ class RefusedLoginIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
         with seerdb.connect(**self._kwargs(_USER, _PASSWORD)):
             pass  # the account still logs in
 
+    @_SKIP_ASYNC_OVER_OALL8
     async def test_a_refused_async_login_raises_ora_01017(self):
         for label, user, password in self.CASES:
             with self.subTest(label):
@@ -10146,6 +10200,7 @@ _BFILE_TEST_FILE = 'pyoracle_bfile_test.txt'
 _BFILE_TEST_CONTENT = b'hello bfile from disk'
 
 
+@_SKIP_ASYNC_OVER_OALL8
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
     """Verify the async surface: connect_async, AsyncCursor, fetch
@@ -13159,6 +13214,7 @@ class BFILEIntegration(_ThrottleRetry, unittest.TestCase):
             Conn.close()
 
 
+@_SKIP_ASYNC_OVER_OALL8
 @unittest.skipUnless(
     _USER and os.environ.get('SEERDB_TEST_BFILE_DIR'),
     'Async BFILE tests share the same fixture requirements as the '
@@ -13210,6 +13266,7 @@ class AsyncBFILEIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
                 self.assertIs(await Lob.afileexists(), False)
 
 
+@_SKIP_ASYNC_OVER_OALL8
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class AsyncPoolIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
     """AsyncPool: pre-warm, acquire / release, capacity, timeout,

@@ -7526,6 +7526,928 @@ class TestFv2Bfile(unittest.TestCase):
         self.assertEqual(content, b'BFILE-9i-content' + bytes.fromhex('cafebabe'))
 
 
+class TestNative9iOall8Select(unittest.TestCase):
+    """Oracle 9i native OALL8 (0x5e) SELECT reply decode (#792): the OCI
+    fixed-width DCB describe / RXH / RXD / OER stream. Fixtures are real frames
+    captured from a 9.2 server answering ``select rownum from all_objects where
+    rownum <= 5`` with sqlplus ``arraysize 2`` (native_9i_fetch_arraysize2.pcap):
+    the execute reply (describe + row 1), then two fetch replies (rows 2-3 and
+    4-5), the second ending ORA-01403."""
+
+    EXEC = bytes.fromhex(
+        '101df3e432ba608ba95d000000000000787e0a1e142306ce0500000000000016'
+        '000000010000004b010200000016000000000000000000000000000000000000'
+        '000000000000000000000000000000000001060600000006524f574e554d0000'
+        '0000000000000700000007787e0a1e142306060102fc0100000001000000a95d'
+        '00000000000000000000000000001a5c00000000000000000000000000000502'
+        '0000ff7f0702c1020805002ab42b020000000001000000000000000000000000'
+        '0000000401000000010100000000000000000001001300030000000000000000'
+        '0000000000000000000000000000000000001d00000100000036010000000000'
+        '00000000000000000080d0d40300000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000000000000000000'
+    )
+    FETCH1 = bytes.fromhex(
+        '060002fc0100000002000000a95d0000000038bfd6030000000001001a5c0000'
+        '00000000000000000000000005020000ff7f010702c103150100010702c10408'
+        '0500000000000000000001000000000000000000000000000000040100000001'
+        '0300000000000000000001000000030020000000000000000000000000000000'
+        '0000000000000000001e00000100000036010000000000000000000000000000'
+        '80d0d40300000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+    )
+    FETCH2 = bytes.fromhex(
+        '060102e601000000020000005c9601000000000000000000000000001f020000'
+        '0000000000000000000000000000010000000702c1050702c106040100000001'
+        '0500000000000000000001000000030000000000000000000000000000000000'
+        '0000000000000000001f00000100000036010000000000000000000000000000'
+        '80d0d40300000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+    )
+
+    def _decode(self, data, columns, prev=None):
+        from seerdb.common.tns import (
+            _DECODE_FIELD_VERSION,
+            FIELD_VERSION_9_2,
+            decode_9i_oall8_exec_response,
+        )
+
+        token = _DECODE_FIELD_VERSION.set(FIELD_VERSION_9_2)
+        try:
+            return decode_9i_oall8_exec_response(data, columns, prev)
+        finally:
+            _DECODE_FIELD_VERSION.reset(token)
+
+    def test_describe_reads_the_rownum_column(self):
+        from seerdb.common.tns import decode_9i_oall8_describe
+
+        (columns, rest) = decode_9i_oall8_describe(self.EXEC)
+        self.assertEqual(len(columns), 1)
+        self.assertEqual(columns[0]['column_name'], 'ROWNUM')
+        self.assertEqual(columns[0]['data_type'], 2)  # NUMBER
+        # The trailer lands exactly on the first row header.
+        self.assertEqual(rest[0], 0x06)
+
+    def test_exec_reply_is_the_first_row_then_more(self):
+        from seerdb.common.tns import (
+            decode_9i_oall8_cursor_id,
+            decode_9i_oall8_describe,
+            decode_9i_oall8_status,
+        )
+
+        (columns, rest) = decode_9i_oall8_describe(self.EXEC)
+        (rows, terminal, _) = self._decode(rest, columns)
+        self.assertEqual(rows, [[1]])
+        self.assertEqual(decode_9i_oall8_status(terminal)['code'], 0)
+        self.assertEqual(decode_9i_oall8_cursor_id(terminal), 1)
+
+    # A standalone end-of-fetch status (ORA-01403), from the same session.
+    STATUS_1403 = bytes.fromhex(
+        '040200000001000000007b050000000001000000030000000000000000000000'
+        '0000000000000000000000000000001600000100000036010000000000000000'
+        '00000000000080d0d40300000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000000000000194f52412d30313430333a206e6f206461746120666f756e640a'
+    )
+
+    def test_fetch_replies_carry_the_remaining_rows(self):
+        from seerdb.common.tns import (
+            decode_9i_oall8_describe,
+            decode_9i_oall8_status,
+        )
+
+        (columns, _) = decode_9i_oall8_describe(self.EXEC)
+        (rows1, term1, last) = self._decode(self.FETCH1, columns)
+        self.assertEqual(rows1, [[2], [3]])
+        self.assertEqual(decode_9i_oall8_status(term1)['code'], 0)
+        # arraysize 2: rows 4-5 come back with "more rows" (code 0); the
+        # ORA-01403 end arrives on the next (empty) fetch.
+        (rows2, term2, _) = self._decode(self.FETCH2, columns, last)
+        self.assertEqual(rows2, [[4], [5]])
+        self.assertEqual(decode_9i_oall8_status(term2)['code'], 0)
+
+    def test_end_of_fetch_status_is_ora_01403(self):
+        from seerdb.common.tns import decode_9i_oall8_terminal_error
+
+        (code, message) = decode_9i_oall8_terminal_error(self.STATUS_1403)
+        self.assertEqual(code, 1403)
+        self.assertEqual(message, 'ORA-01403: no data found')
+
+    # Non-query replies (an RPA piggyback then the OER): the affected-row count is
+    # a ub4 at the OER's offset 6. Real 9.2 frames for `insert ... values (1)` (one
+    # row) and `update ... set id=id+5` (two rows).
+    DML_INSERT = bytes.fromhex(
+        '080500b5dd2b0200000000020000000100000000000000000000000402000000'
+        '010100000000000000000002000c000200000000008644030001000000d2b800'
+        '0000000000000000000008000001000000360100000000000000000000000000'
+        '0080d0d403000000000d00000000000000000000000000000000000000000000'
+        '000000000000000000000000000000000000000000000000000000000000000d'
+        '000d010003448600010000b8d20000'
+    )
+    DML_UPDATE = bytes.fromhex(
+        '080500b6dd2b0200000000050000000100000000000000000000000402000000'
+        '0102000000000000000000050007000600000000118644030001000000d2b800'
+        '000100000000000000000a000001000000360100000000000000000000000000'
+        '0080d0d403000000000d00000000000000000000000000000000000000000000'
+        '000000000000000000000000000000000000000000000000000000000000000d'
+        '000d010003448600010000b8d20001'
+    )
+
+    def test_dml_reply_reports_the_affected_row_count(self):
+        from seerdb.common.tns import decode_9i_oall8_dml_response
+
+        self.assertEqual(decode_9i_oall8_dml_response(self.DML_INSERT), (1, 0, None))
+        self.assertEqual(decode_9i_oall8_dml_response(self.DML_UPDATE), (2, 0, None))
+
+    def test_dml_reply_names_the_row_it_touched(self):
+        # The status carries the rowid at offset 26 (#1079); the reply's tail
+        # repeats it as a physical UROWID, big-endian, which checks the read.
+        from seerdb.common.tns import decode_9i_oall8_dml_rowid
+        from seerdb.common.types import urowid_to_string
+
+        for reply in (self.DML_INSERT, self.DML_UPDATE, self.DML_FIRST_PARSE):
+            with self.subTest(reply=reply[:4].hex()):
+                self.assertEqual(
+                    decode_9i_oall8_dml_rowid(reply), urowid_to_string(reply[-13:])
+                )
+        # A failed statement names no row.
+        self.assertIsNone(decode_9i_oall8_dml_rowid(self.STATUS_1403))
+
+    # Statuses of native 9.2 array INSERTs (native_9i_array_dml.pcap): rows 4, 1, 5
+    # where 1 is a duplicate key; then OCI_BATCH_ERRORS batches with one failed row
+    # (6, 2-duplicate, 7) and with two (2-duplicate, 8, 3-duplicate).
+    ARRAY_DML_FAILED = bytes.fromhex(
+        '04020000000101000000010000000000010000000200000000006a4e03000100'
+        '0000d2b800000300000000000000000900000300000036010000000000000000'
+        '00000000000080d0d403000000000d0000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '0000000000000d000d0100034e6a00010000b8d20003384f52412d3030303031'
+        '3a20756e6971756520636f6e73747261696e74202850594f2e5359535f433030'
+        '39343933292076696f6c617465640a'
+    )
+    ARRAY_DML_ONE_BATCH_ERROR = bytes.fromhex(
+        '040200000000020000003d5f0000000001000000020000000000000000000000'
+        '0000000000000000000000000000000b00000300000036010000000000000000'
+        '00000000000080d0d403000000000000000000000000a07dd603000000000100'
+        '000000000000a87dd603000000000100000000000000b87dd603000000000100'
+        '00000000000001000100000038000000384f52412d30303030313a20756e6971'
+        '756520636f6e73747261696e74202850594f2e5359535f433030393439332920'
+        '76696f6c617465640a000000000000214f52412d32343338313a206572726f72'
+        '28732920696e20617272617920444d4c0a'
+    )
+    ARRAY_DML_TWO_BATCH_ERRORS = bytes.fromhex(
+        '040200000000010000003d5f0000000001000000020000000000000000000000'
+        '0000000000000000000000000000000d00000300000036010000000000000000'
+        '00000000000080d0d403000000000000000000000000a07dd603000000000200'
+        '000000000000a87dd603000000000200000000000000b87dd603000000000200'
+        '00000000000001000100000000000200000038000000384f52412d3030303031'
+        '3a20756e6971756520636f6e73747261696e74202850594f2e5359535f433030'
+        '39343933292076696f6c617465640a00000000000038000000384f52412d3030'
+        '3030313a20756e6971756520636f6e73747261696e74202850594f2e5359535f'
+        '43303039343933292076696f6c617465640a000000000000214f52412d323433'
+        '38313a206572726f7228732920696e20617272617920444d4c0a'
+    )
+
+    def test_a_failed_array_dml_counts_the_rows_it_applied(self):
+        # The row before the duplicate went in, and the status counts it -- read
+        # when asked for (Applied), as a single failed statement reports none.
+        from seerdb.common.tns import decode_9i_oall8_dml_response
+
+        (rows, code, message) = decode_9i_oall8_dml_response(
+            self.ARRAY_DML_FAILED, Applied=True
+        )
+        self.assertEqual((rows, code), (1, 1))
+        self.assertTrue(message.startswith('ORA-00001'))
+        self.assertEqual(decode_9i_oall8_dml_response(self.ARRAY_DML_FAILED)[0], 0)
+
+    def test_batch_errors_list_each_failed_row(self):
+        from seerdb.common.tns import (
+            decode_9i_oall8_batch_errors,
+            decode_9i_oall8_dml_response,
+        )
+
+        (rows, code, message) = decode_9i_oall8_dml_response(
+            self.ARRAY_DML_ONE_BATCH_ERROR, Applied=True
+        )
+        # The summary's own message, not the first row's listed ahead of it.
+        self.assertEqual((rows, code), (2, 24381))
+        self.assertTrue(message.startswith('ORA-24381'))
+        errors = decode_9i_oall8_batch_errors(self.ARRAY_DML_ONE_BATCH_ERROR)
+        self.assertEqual([(e['offset'], e['code']) for e in errors], [(1, 1)])
+        self.assertTrue(errors[0]['message'].startswith('ORA-00001'))
+        errors = decode_9i_oall8_batch_errors(self.ARRAY_DML_TWO_BATCH_ERRORS)
+        self.assertEqual([(e['offset'], e['code']) for e in errors], [(0, 1), (2, 1)])
+        self.assertTrue(all(e['message'].startswith('ORA-00001') for e in errors))
+        self.assertEqual(decode_9i_oall8_batch_errors(self.ARRAY_DML_FAILED), [])
+
+    # A native 9.2 OCI client's LOB calls on a CLOB selected FOR UPDATE
+    # (native_9i_lob_ops.pcap): the select's reply, then each call's reply.
+    LOB_GETLEN_REPLY = bytes.fromhex(
+        '0800540001020c00000001000000010000000dca79000352f4000352f3000100'
+        '01001f00000000000049000000008fb30000005d96022e6e3500000008001800'
+        '00a2d10080149c03ec02000000000352f30040b8d200000b0000000402000000'
+        '010100000000000000000000000000000000000000f352030001000000d2b800'
+        '000000000000000000000a000001000000360100000000000000000000000000'
+        '0080d0d403000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00'
+    )
+    LOB_CHUNK_REPLY = bytes.fromhex(
+        '0800540001020c00000001000000010000000dca79000352f4000352f3000100'
+        '01001f00000000000049000000008fb30000005d96022e6e3500000008001800'
+        '00a2d10080149c03ec02000000000352f30040b8d20000c41f00000402000000'
+        '010100000000000000000000000000000000000000f352030001000000d2b800'
+        '000000000000000000000b000001000000360100000000000000000000000000'
+        '0080d0d403000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00'
+    )
+    LOB_OPEN_REPLY = bytes.fromhex(
+        '0800540001020c00000001000000010000000dca79000352f4000352f3000100'
+        '01001f00000000000049000000008fb30000005d96022e6e3500000008001800'
+        '00a2d10080149c03ec02000000000352f30040b8d20000020000000402000000'
+        '010100000000000000000000000000000000000000f352030001000000d2b800'
+        '000000000000000000000c000001000000360100000000000000000000000000'
+        '0080d0d403000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00'
+    )
+    LOB_ISOPEN_REPLY = bytes.fromhex(
+        '0800540001020c00000001000000010000000dca79000352f4000352f3000100'
+        '01001f00000000000049000000008fb30000005d96022e6e3500000008001800'
+        '00a2d10080149c03ec02000000000352f30040b8d20000010402000000010100'
+        '000000000000000000000000000000000000f352030001000000d2b800000000'
+        '000000000000000d0000010000003601000000000000000000000000000080d0'
+        'd403000000000000000000000000000000000000000000000000000000000000'
+        '000000000000000000000000000000000000000000000000000000000000'
+    )
+    LOB_WRITE_REPLY = bytes.fromhex(
+        '0800540001020c00000001000000010000000dca79000352f4000352f3000100'
+        '01001f00000000000049000000008fb30000005d96022e6e3600000008001800'
+        '00a2d10080149c03ec03000000000352f30040b8d20000030000000402000000'
+        '010100000000000000000000000000000000000000f352030001000000d2b800'
+        '000000000000000000000e000001000000360100000000000000000000000000'
+        '0080d0d403000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00'
+    )
+    LOB_TRIM_REPLY = bytes.fromhex(
+        '0800540001020c00000001000000010000000dca79000352f4000352f3000100'
+        '01001f00000000000049000000008fb30000005d96022e6e3600000008001800'
+        '00a2d10080149c03ec04000000000352f30040b8d20000050000000402000000'
+        '010100000000000000000000000000000000000000f352030001000000d2b800'
+        '0000000000000000000010000001000000360100000000000000000000000000'
+        '0080d0d403000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00'
+    )
+    LOB_CLOSE_REPLY = bytes.fromhex(
+        '0800540001020c00000001000000010000000dca79000352f4000352f3000100'
+        '01001f00000000000049000000008fb30000005d96022e6e3600000008001800'
+        '00a2d10080149c03ec04000000000352f30040b8d20000040200000001010000'
+        '0000000000000000000000000000000000f352030001000000d2b80000000000'
+        '000000000000110000010000003601000000000000000000000000000080d0d4'
+        '0300000000000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000'
+    )
+    LOB_ISOPEN2_REPLY = bytes.fromhex(
+        '0800540001020c00000001000000010000000dca79000352f4000352f3000100'
+        '01001f00000000000049000000008fb30000005d96022e6e3600000008001800'
+        '00a2d10080149c03ec04000000000352f30040b8d20000000402000000010100'
+        '000000000000000000000000000000000000f352030001000000d2b800000000'
+        '00000000000000120000010000003601000000000000000000000000000080d0'
+        'd403000000000000000000000000000000000000000000000000000000000000'
+        '000000000000000000000000000000000000000000000000000000000000'
+    )
+    FOR_UPDATE_REPLY = bytes.fromhex(
+        '101d607e960670164c5e000000000000787e0a1f022218a31700000000000000'
+        '000000020000004b0170800000a00f0000000000000000000000000000000000'
+        '00000000001f0001000000000000000000010101000000014300000000000000'
+        '000171000000a00f000000000000000000000000000000000000000000000000'
+        '0000000000000000000001010100000001420000000000000000070000000778'
+        '7e0a1f022218060002bb02000000010000005d962a0000000000000000000000'
+        '00004c5e0000000080d0d403000000000d00a25e0000000001000352f3000100'
+        '00b8d2000007560000005600540001020c00000001000000010000000dca7900'
+        '0352f4000352f300010001001f00000000000049000000008fb30000005d9602'
+        '2e6e350000000800180000a2d10080149c03ec02000000000352f30040b8d200'
+        '00560000005600540001010c00000001000000010000000dca7a000352f60003'
+        '52f3000200020000000000000000000000000000000000000000022e6e350000'
+        '000800180000a2d10080149c03ec02000000000352f30040b8d2000008050036'
+        '6e2e020000000001000000010000000000000000000000040200000001010000'
+        '0000000000000001001100030000000000f352030001000000d2b80000000000'
+        '000000000000090000010000003601000000000000000000000000000080d0d4'
+        '0300000000000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000'
+    )
+
+    # A native 9.2 OCI client's OAUTH reply (native_9i_lob_ops.pcap): the RPA of
+    # AUTH_ pairs that completes an OALL8 login.
+    OALL8_LOGIN_REPLY = bytes.fromhex(
+        '0817001300000013415554485f56455253494f4e5f535452494e471200000012'
+        '2d2036346269742050726f64756374696f6e000000001000000010415554485f'
+        '56455253494f4e5f53514c02000000023138000000001300000013415554485f'
+        '58414354494f4e5f545241495453010000000133000000000f0000000f415554'
+        '485f56455253494f4e5f4e4f0900000009313533303933313230000000001300'
+        '000013415554485f56455253494f4e5f53544154555301000000013000000000'
+        '1500000015415554485f4341504142494c4954595f5441424c45000000000000'
+        '00000f0000000f415554485f53455353494f4e5f494402000000023130000000'
+        '000f0000000f415554485f53455249414c5f4e554d0500000005323031333100'
+        '0000001000000010415554485f494e5354414e43455f4e4f0100000001310000'
+        '00000f0000000f415554485f4e4c535f4c584c414e000800000008414d455249'
+        '43414e000000001600000016415554485f4e4c535f4c58435445525249544f52'
+        '59000700000007414d4552494341000000001500000015415554485f4e4c535f'
+        '4c584343555252454e435900010000000124000000001400000014415554485f'
+        '4e4c535f4c584349534f43555252000700000007414d45524943410000000015'
+        '00000015415554485f4e4c535f4c58434e554d45524943530002000000022e2c'
+        '000000001300000013415554485f4e4c535f4c584344415445464d0009000000'
+        '0944442d4d4f4e2d5252000000001500000015415554485f4e4c535f4c584344'
+        '4154454c414e47000800000008414d45524943414e0000000011000000114155'
+        '54485f4e4c535f4c5843534f525400060000000642494e415259000000001500'
+        '000015415554485f4e4c535f4c584343414c454e444152000900000009475245'
+        '474f5249414e000000001500000015415554485f4e4c535f4c5843554e494f4e'
+        '43555200010000000124000000001300000013415554485f4e4c535f4c584354'
+        '494d45464d000e0000000e48482e4d492e535358464620414d00000000130000'
+        '0013415554485f4e4c535f4c584353544d50464d00180000001844442d4d4f4e'
+        '2d52522048482e4d492e535358464620414d000000001300000013415554485f'
+        '4e4c535f4c584354545a4e464d00120000001248482e4d492e53535846462041'
+        '4d20545a52000000001300000013415554485f4e4c535f4c584353545a4e464d'
+        '001c0000001c44442d4d4f4e2d52522048482e4d492e535358464620414d2054'
+        '5a52000000000401000000010000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000300000000000036010000'
+        '00000000000000000000000080d0d40300000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000000000000000000000000'
+    )
+
+    def test_the_oall8_login_reply_names_the_release(self):
+        # AUTH_VERSION_NO, in the 8i reply form: 0x09200400 is 9.2.0.4. The OALL8
+        # login set no release, so connection.version was None (#798).
+        from seerdb.common.tns import decode_8i_server_version
+
+        self.assertEqual(decode_8i_server_version(self.OALL8_LOGIN_REPLY), 0x09200400)
+
+    # 9.2 statuses (live): `CREATE OR REPLACE PROCEDURE ... BEGIN NULL; END;`,
+    # the same with an undefined name in its body, and the refused
+    # `SELECT nosuchcol FROM dual`.
+    CREATE_CLEAN = bytes.fromhex(
+        '080500c1e52e0200000000010000000000000000000000000000000401000000'
+        '0100000000000000000000010000001800000000000000000000000000000000'
+        '0000000000000000000007000001000000360100000000000000000000000000'
+        '0080d0d403000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00'
+    )
+    CREATE_WITH_ERRORS = bytes.fromhex(
+        '080500cce52e0200000000020000000000000000000000000000000401000000'
+        '0100000000000000000000020000001800000000210000000000000000000000'
+        '0000000000000000000008000001000000360100000000000000000000000000'
+        '0080d0d403000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00'
+    )
+    QUERY_ERROR_AT_7 = bytes.fromhex(
+        '0401000000010000000088030000000005000700000000000000000000000000'
+        '0000000000000000000000000000000b00000100000036010000000000000000'
+        '00000000000080d0d40300000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '0000000000002b4f52412d30303930343a20224e4f53554348434f4c223a2069'
+        '6e76616c6964206964656e7469666965720a'
+    )
+
+    def test_a_status_carries_the_warning_and_the_error_position(self):
+        # Bit 0x20 of the byte at 25 says the object compiled with errors
+        # (#2262); the ub2 at 18 is where in the statement an error is (#2263).
+        from seerdb.common.tns import (
+            decode_9i_oall8_error_position,
+            decode_9i_oall8_status,
+            decode_9i_oall8_warn_flags,
+        )
+
+        self.assertEqual(decode_9i_oall8_warn_flags(self.CREATE_CLEAN) & 0x20, 0)
+        self.assertEqual(
+            decode_9i_oall8_warn_flags(self.CREATE_WITH_ERRORS) & 0x20, 0x20
+        )
+        self.assertEqual(decode_9i_oall8_status(self.QUERY_ERROR_AT_7)['code'], 904)
+        self.assertEqual(decode_9i_oall8_error_position(self.QUERY_ERROR_AT_7), 7)
+
+    # `SELECT txt, id, s` over a LONG first: the rows ('hi', 5, 'zz') and (NULL, 6,
+    # 'yy'), each its own fetch (a LONG fetches one row at a time), live on 9.2.
+    LONG_FIRST_ROW = bytes.fromhex(
+        '0601022a030000000100000000000000000000000000000000000000d4030000'
+        '00000000000000000000000020020000000007fe026869000000000002c10602'
+        '7a7a080500000000000000000009000000010000000000000000000000040200'
+        '0000010100000000000000000009000000030000000000b857030001000000d2'
+        'b800000200000000000000000d00000100000036010000000000000000000000'
+        '00000080d0d40300000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000000'
+    )
+    LONG_FIRST_NULL_ROW = bytes.fromhex(
+        '060102e10300000001000000ffbf7f0000000000000000000000000060962a00'
+        '00000000000000000000000060962a0000000700ffff7d0502c1070279790805'
+        '0000000000000000000900000001000000000000000000000004020000000102'
+        '00000000000000000009000000030000000000b857030001000000d2b8000002'
+        '00000000000000000e0000010000003601000000000000000000000000000080'
+        'd0d4030000000000000000000000000000000000000000000000000000000000'
+        '00000000000000000000000000000000000000000000000000000000000000'
+    )
+
+    def test_a_long_cell_ends_with_an_indicator_and_a_return_code(self):
+        # The value, then a ub2 indicator and a ub2 return code, as an OUT bind's
+        # cell; unread, the four bytes shifted the columns after the LONG (#798).
+        columns = [
+            {'data_type': 8, 'data_length': 0, 'charset': 31, 'csfrm': 1},
+            {'data_type': 2, 'data_length': 22, 'charset': 0, 'csfrm': 0},
+            {'data_type': 1, 'data_length': 5, 'charset': 31, 'csfrm': 1},
+        ]
+        (rows, _, _) = self._decode(self.LONG_FIRST_ROW, columns)
+        self.assertEqual(rows, [['hi', 5, 'zz']])
+        (rows, _, _) = self._decode(self.LONG_FIRST_NULL_ROW, columns)
+        self.assertEqual(rows, [[None, 6, 'yy']])
+
+    def test_the_cursor_id_is_a_ub2(self):
+        # The status's cursor id is a ub2 at 16: a session's 256th statement reads
+        # `00 01` (this status head, live on 9.2). Read as one byte it was 0, and
+        # the fetch failed with ORA-01002 (#798).
+        from seerdb.common.tns import decode_9i_oall8_cursor_id
+
+        head = bytes.fromhex('040100000001010000000000000000000001120003000000')
+        self.assertEqual(decode_9i_oall8_cursor_id(head), 256)
+
+    # A 300-bind block's reply (an IN Var, an OUT Var, 298 IN numbers), live on
+    # 9.2: the IOV is 50 + 300 bytes.
+    BLOCK_300_BINDS = bytes.fromhex(
+        '0b0105002c000100010000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000002010202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020202020'
+        '2020202020202020202020202020202020202020202020202020202020200703'
+        'c2040400000000080500195a2f02000000000100000000000000000000000000'
+        '000004010000000101000000000000000000010000002f000000000000000000'
+        '00000000000000000000000000000000000a0000010000003601000000000000'
+        '000000000000000080d0d4030000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '0000000000000000'
+    )
+
+    def test_a_blocks_cursor_is_read_past_its_bind_prompt(self):
+        # A scan from the start lands on a `04` in the bind prompt and reads 256;
+        # closing that cursor drew ORA-00600 [12209] and lost the session (#798).
+        from seerdb.common.tns import (
+            decode_9i_oall8_block_cursor,
+            decode_9i_oall8_cursor_id,
+        )
+
+        self.assertEqual(decode_9i_oall8_block_cursor(self.BLOCK_300_BINDS, 300, 1), 1)
+        self.assertNotEqual(decode_9i_oall8_cursor_id(self.BLOCK_300_BINDS), 1)
+
+    def test_a_for_update_row_header_carries_the_rowid(self):
+        # The row header names a 13-byte rowid (a ub2 at 42) between it and the
+        # row: SELECT ... FOR UPDATE sends the row it locks. Unskipped, the row
+        # was lost and the query came back empty (#798).
+        from seerdb.common.tns import decode_9i_oall8_describe
+
+        (columns, rest) = decode_9i_oall8_describe(self.FOR_UPDATE_REPLY)
+        (rows, terminal, _) = self._decode(rest, columns)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual([len(lob.raw) for lob in rows[0]], [86, 86])
+        self.assertEqual([lob.data_type for lob in rows[0]], [112, 113])
+
+    def test_lob_call_replies_carry_their_value_and_the_locator(self):
+        # Each reply is an RPA with the locator's body (no ub2 prefix, as the LOB
+        # object expects; it puts the prefix back) and the call's value.
+        from seerdb.common.tns import (
+            decode_9i_oall8_describe,
+            decode_9i_oall8_lob_value,
+        )
+        from seerdb.common.tns_consts import (
+            TNS_LOB_OP_CLOSE,
+            TNS_LOB_OP_GET_CHUNK_SIZE,
+            TNS_LOB_OP_GET_LENGTH,
+            TNS_LOB_OP_IS_OPEN,
+            TNS_LOB_OP_OPEN,
+            TNS_LOB_OP_TRIM,
+            TNS_LOB_OP_WRITE,
+        )
+
+        (columns, rest) = decode_9i_oall8_describe(self.FOR_UPDATE_REPLY)
+        clob = self._decode(rest, columns)[0][0][0].raw
+        for reply, op, value in (
+            (self.LOB_GETLEN_REPLY, TNS_LOB_OP_GET_LENGTH, 11),
+            (self.LOB_CHUNK_REPLY, TNS_LOB_OP_GET_CHUNK_SIZE, 8132),
+            (self.LOB_OPEN_REPLY, TNS_LOB_OP_OPEN, 2),
+            (self.LOB_ISOPEN_REPLY, TNS_LOB_OP_IS_OPEN, 1),
+            (self.LOB_WRITE_REPLY, TNS_LOB_OP_WRITE, 3),
+            (self.LOB_TRIM_REPLY, TNS_LOB_OP_TRIM, 5),
+            (self.LOB_CLOSE_REPLY, TNS_LOB_OP_CLOSE, None),
+            (self.LOB_ISOPEN2_REPLY, TNS_LOB_OP_IS_OPEN, 0),
+        ):
+            with self.subTest(op=hex(op)):
+                (got, locator) = decode_9i_oall8_lob_value(reply, op)
+                self.assertEqual(got, value)
+                self.assertEqual(len(locator), len(clob) - 2)
+        # A write changes the locator; the reply says so.
+        self.assertEqual(
+            decode_9i_oall8_lob_value(self.LOB_GETLEN_REPLY, TNS_LOB_OP_GET_LENGTH)[1],
+            clob[2:],
+        )
+        self.assertNotEqual(
+            decode_9i_oall8_lob_value(self.LOB_WRITE_REPLY, TNS_LOB_OP_WRITE)[1],
+            clob[2:],
+        )
+
+    # A bound statement's first-parse reply opens with a TTI_IOV (0x0b) bind
+    # prompt and the session-state RPA carries a byte (0x04) that collides with the
+    # OER token -- the status reader must skip past it to the real OER. Real 9.2
+    # frame for the first execute of `insert ... values (:1)` (one row).
+    DML_FIRST_PARSE = bytes.fromhex(
+        '0b01056601000000010000000000000000008a020000000000000000ca5e0000'
+        '0000000000000100000000000000000000002008050093042c02000000000200'
+        '0000020000000000000000000000040500000001010000000000000000000200'
+        '0c000200000000008c44030001000000d2b80000000000000000000000080000'
+        '010000003601000000000000000000000000000080d0d403000000000d000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00000000000000000000000000000000000000000d000d010003448c00010000'
+        'b8d20000'
+    )
+
+    def test_bound_first_parse_reply_skips_the_iov_to_the_real_oer(self):
+        from seerdb.common.tns import decode_9i_oall8_dml_response
+
+        # The row count sits in the real OER, not the 0x04 inside the RPA.
+        self.assertEqual(
+            decode_9i_oall8_dml_response(self.DML_FIRST_PARSE), (1, 0, None)
+        )
+
+    # A PL/SQL block's OUT value: the reply is the IOV (50 + nbinds bytes), then a
+    # TTI_RXD of one value-only cell per OUT bind (each a ub1 length, the value, a
+    # ub4 indicator), then the status. Real 9.2 frame for `begin :1 := 42; end;`
+    # with one OUT bind -- the value is NUMBER 42 (c1 2b), to decode per the Var.
+    BLOCK_OUT_42 = bytes.fromhex(
+        '0b01050001000000010000000000000000000000000000000000000000000000'
+        '000000000000000000000000000000000000100702c12b00000000080500d508'
+        '2c02000000000100000002000000000000000000000004050000000101000000'
+        '000000000000010000002f000000000000000000000000000000000000000000'
+        '0000000000070000010000003601000000000000000000000000000080d0d403'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00000000000000000000000000000000000000000000000000000000'
+    )
+
+    def test_block_out_value_is_read_per_out_bind(self):
+        from seerdb.common.tns import decode_9i_oall8_block_out
+
+        # one bind, one OUT: raw NUMBER 42 (c1 2b), rowcount/code 0.
+        (out_values, _rows, code, _msg) = decode_9i_oall8_block_out(
+            self.BLOCK_OUT_42, 1, 1
+        )
+        self.assertEqual(out_values, [bytes.fromhex('c12b')])
+        self.assertEqual(code, 0)
+
+    # `select id, b from t order by id` over a BLOB column, rows (2, NULL) and
+    # (3, EMPTY_BLOB()). A LOB query's execute is describe-only; the fetch brings
+    # the rows, each LOB cell a ub4 size and then (when not zero) the locator as a
+    # ub1-length value -- a NULL LOB is the zero size alone. Real 9.2 frames.
+    LOB_EXEC = bytes.fromhex(
+        '101d5a0517cc20e7b55e000000000000787e0a1e17392dc50600000000000000'
+        '000000020000004b010200008116000000000000000000000000000000000000'
+        '0000000000000000000000000000000000010206000000024944000000000000'
+        '00000171000000a00f0000000000000000000000000000000000000000000000'
+        '0000000000000000000000010103000000014200000000000000000700000007'
+        '787e0a1e17392d080500698d2c02000000000900000000000000000000000000'
+        '00000401000000010000000000000000000009001200030000000000f0440300'
+        '01000000d2b800000100000000000000000c0000010000003601000000000000'
+        '000000000000000080d0d4030000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '0000000000000000'
+    )
+    LOB_FETCH = bytes.fromhex(
+        '0601022a020000000f00000000000000000000000000000000000000d4030000'
+        '0000000000000000000000002002000000000702c10300000000150200030702'
+        'c104560000005600540001010c00000001000000010000000d8041000344f100'
+        '0344f0000200020000000000000000000000000000000000000000022c8d6900'
+        '00000000000000000000000000000000000000000344f00040b8d20001040100'
+        '000001020000007b050000000009000000030020000000f044030001000000d2'
+        'b800000100000000000000000d00000100000036010000000000000000000000'
+        '00000080d0d40300000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000000194f52412d30313430333a206e6f206461746120666f756e640a'
+    )
+
+    def test_lob_cells_carry_a_locator_or_null(self):
+        from seerdb.common.lob import LOB
+        from seerdb.common.tns import decode_9i_oall8_describe, decode_9i_oall8_status
+
+        (columns, rest) = decode_9i_oall8_describe(self.LOB_EXEC)
+        self.assertEqual([c['data_type'] for c in columns], [2, 113])  # NUMBER, BLOB
+        (rows, _term, _) = self._decode(rest, columns)
+        self.assertEqual(rows, [])  # describe-only execute
+        (rows, term, _) = self._decode(self.LOB_FETCH, columns)
+        self.assertEqual([r[0] for r in rows], [2, 3])
+        self.assertIsNone(rows[0][1])  # NULL BLOB: the zero size alone
+        self.assertIsInstance(rows[1][1], LOB)  # EMPTY_BLOB: a real locator
+        self.assertEqual(len(rows[1][1].raw), 86)
+        self.assertEqual(rows[1][1].raw[:2], bytes.fromhex('0054'))
+        self.assertEqual(decode_9i_oall8_status(term)['code'], 1403)
+
+    # BFILENAME('BFDIR', 'hello.bin') on 9.2 over the OALL8 session: the fetched
+    # locator, and the replies to its FILE_OPEN and GET_LENGTH (64-bit LOBOPS).
+    BFILE_LOCATOR = bytes.fromhex(
+        '0020000108080000000100000000000000054246444952000968656c6c6f2e62696e'
+    )
+    BFILE_OPEN_REPLY = bytes.fromhex(
+        '080020000108080000000100010000000000054246444952000968656c6c6f2e'
+        '62696e0b00000004010000000101000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000008000001000000360100'
+        '0000000000000000000000000080d0d403000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00000000000000000000000000'
+    )
+    BFILE_GETLEN_REPLY = bytes.fromhex(
+        '080020000108080000000100010000000000054246444952000968656c6c6f2e'
+        '62696e1400000004010000000101000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000009000001000000360100'
+        '0000000000000000000000000080d0d403000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00000000000000000000000000'
+    )
+
+    def test_bfile_open_and_length_replies(self):
+        # FILE_OPEN hands back the locator with its open flag (byte 11) set, which
+        # the later calls must use; GET_LENGTH's reply carries the 20-byte length
+        # where 8i's does, so the 8i reader parses it (the thin one reads 0).
+        from seerdb.common.tns import (
+            decode_fv2_opened_locator,
+            decode_o8i_bfile_getlen,
+        )
+
+        opened = decode_fv2_opened_locator(self.BFILE_OPEN_REPLY)
+        self.assertEqual(len(opened), len(self.BFILE_LOCATOR))
+        self.assertEqual(self.BFILE_LOCATOR[11], 0)
+        self.assertEqual(opened[11], 1)
+        self.assertEqual(opened[:11], self.BFILE_LOCATOR[:11])
+        self.assertEqual(decode_o8i_bfile_getlen(self.BFILE_GETLEN_REPLY), 20)
+
+    # A fetch of `SELECT id, name, score` (rows 2-5 of five; row 5 NULL in both
+    # text columns) from a live 9.2 server: each row header announces a one-byte
+    # column vector, 0x07 for three columns all sent -- the TTI_RXD token.
+    FETCH_THREE_COLUMNS = bytes.fromhex(
+        '060002e10300000064000000ffbf7f00000058bfd60300000000010060962a00'
+        '000000000000000000000000200200000000070702c103046265746103c10a64'
+        '150300070702c1040567616d6d6104c2020133150300070702c1050564656c74'
+        '61043e644c66150300070702c1060000040100000001050000007b0500000000'
+        '110000000300200000007449030001000000d2b8000004000000000000000015'
+        '0000010000003601000000000000000000000000000080d0d403000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00000000000000000000000000000000000000000000194f52412d3031343033'
+        '3a206e6f206461746120666f756e640a'
+    )
+    # The execute reply's row stream for `SELECT NULL AS a, 5 AS b FROM dual`.
+    UNTYPED_NULL_ROW = bytes.fromhex(
+        '060102b402000000010000005d962a0000000000000000000000000000000000'
+        '0000000000000000000000000000000000000702c1060805002b5f2d02000000'
+        '0001000000000000000000000000000000040100000001010000000000000000'
+        '0001001e00030000000000000000000000000000000000000000000000000000'
+        '070000010000003601000000000000000000000000000080d0d4030000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000'
+    )
+
+    def test_a_row_header_names_its_column_vector(self):
+        # The vector's length is a ub2 at the header's offset 26. Guessing it
+        # from the byte after the header took a 0x07 vector for a row token and
+        # misread every row after it as a NUMBER.
+        from decimal import Decimal
+
+        columns = [
+            {'data_type': 2, 'data_length': 22, 'charset': 0, 'csfrm': 0},
+            {'data_type': 1, 'data_length': 40, 'charset': 31, 'csfrm': 1},
+            {'data_type': 2, 'data_length': 22, 'charset': 0, 'csfrm': 0},
+        ]
+        (rows, _, _) = self._decode(self.FETCH_THREE_COLUMNS, columns)
+        self.assertEqual(
+            rows,
+            [
+                [2, 'beta', Decimal('9.99')],
+                [3, 'gamma', Decimal('100.5')],
+                [4, 'delta', Decimal('-1.25')],
+                [5, None, None],
+            ],
+        )
+
+    def test_an_untyped_null_column_sends_no_cell(self):
+        # `SELECT NULL` describes with a zero data length and sends nothing for
+        # the column, not even the 0xFF NULL (#682 / #1185 at OALL8).
+        columns = [
+            {'data_type': 1, 'data_length': 0, 'charset': 31, 'csfrm': 1},
+            {'data_type': 2, 'data_length': 2, 'charset': 0, 'csfrm': 0},
+        ]
+        (rows, _, _) = self._decode(self.UNTYPED_NULL_ROW, columns)
+        self.assertEqual(rows, [[None, 5]])
+
+    # `SELECT rowid, k` of a one-row table: the ROWID cell is the 16-byte OCI rowid
+    # structure, little-endian.
+    ROWID_ROW = bytes.fromhex(
+        '060102b202000000010000005d962a0000000000000000000000000000000000'
+        '00000000000000000000000000000000000007106b4b030001000000d2b80000'
+        '0000000002c102080500cf952d02000000000100000000000000000000000000'
+        '0000040100000001010000000000000000000100150003000000000000000000'
+        '0000000000000000000000000000000000070000010000003601000000000000'
+        '000000000000000080d0d4030000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '0000000000000000'
+    )
+    # `SELECT u, k` over a UROWID column: a physical rowid (the execute reply),
+    # then a NULL and an index-organized table's 409-byte logical rowid, chunked
+    # (the fetch reply).
+    UROWID_EXEC = bytes.fromhex(
+        '0601022a020000000100000000000000000000000000000000000000d4030000'
+        '000000000000000000000000200200000000070d000d0100034b6b00010000b8'
+        'd2000002c102080500cf952d0200000000020000000000000000000000000000'
+        '0004010000000101000000000000000000020011000300000000000000000000'
+        '0000000000000000000000000000000009000001000000360100000000000000'
+        '0000000000000080d0d403000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00000000000000'
+    )
+    UROWID_FETCH = bytes.fromhex(
+        '0600022a020000006400000000000000000048bfd603000000000100d4030000'
+        '0000000000000000000000002002000000000307000002c10315020003079901'
+        'feff02040040b96a81906b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b9a6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6bfe0002c104'
+        '040100000001030000007b050000000002000000030020000000000000000000'
+        '0000000000000000000000000000000a00000100000036010000000000000000'
+        '00000000000080d0d40300000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000000000000194f52412d30313430333a206e6f206461746120666f756e640a'
+    )
+
+    def test_a_rowid_cell_reads_as_its_text(self):
+        columns = [
+            {'data_type': 11, 'data_length': 16, 'charset': 0, 'csfrm': 0},
+            {'data_type': 2, 'data_length': 22, 'charset': 0, 'csfrm': 0},
+        ]
+        (rows, _, _) = self._decode(self.ROWID_ROW, columns)
+        self.assertEqual(rows, [['AAA0trAABAAALjSAAA', 1]])
+
+    def test_a_urowid_cell_is_sized_then_framed_as_a_value(self):
+        # A ub2 size, then the rowid as an ordinary (possibly chunked) value; a
+        # NULL is the zero size alone. Reading it as a plain value misread every
+        # column after it.
+        columns = [
+            {'data_type': 208, 'data_length': 4000, 'charset': 0, 'csfrm': 0},
+            {'data_type': 2, 'data_length': 22, 'charset': 0, 'csfrm': 0},
+        ]
+        (rows, _, last) = self._decode(self.UROWID_EXEC, columns)
+        self.assertEqual(rows, [['AAA0trAABAAALjSAAA', 1]])
+        (rows, _, _) = self._decode(self.UROWID_FETCH, columns, last)
+        self.assertEqual(rows[0], [None, 2])
+        self.assertEqual(rows[1][1], 3)
+        self.assertEqual(len(rows[1][0]), 545)
+        self.assertTrue(rows[1][0].startswith('*BABAuWqBkGtra2tra2t'))
+
+    # PL/SQL block replies from a live 9.2 server: two OUT binds a RETURNING ...
+    # INTO that matched no row never assigned; `:result := 'got ' || :given`
+    # (OUT, IN); and a SELECT ... INTO matching nothing, which fails at run time.
+    BLOCK_TWO_UNASSIGNED = bytes.fromhex(
+        '0b01050002000000010000000000000000000000000000000000000000000000'
+        '000000000000000000000000000000000000101007ff210cff210c080500929f'
+        '2d02000000000700000002000000000000000000000004050000000101000000'
+        '000000000000070000002f000000000000000000000000000000000000000000'
+        '00000000000a0000010000003601000000000000000000000000000080d0d403'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00000000000000000000000000000000000000000000000000000000'
+    )
+    BLOCK_OUT_THEN_IN = bytes.fromhex(
+        '0b01050002000000010000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000001020070b676f7420612076616c75'
+        '6500000000080500929f2d02000000000a000000020000000000000000000000'
+        '040500000001010000000000000000000a0000002f0000000000000000000000'
+        '0000000000000000000000000000000c00000100000036010000000000000000'
+        '00000000000080d0d40300000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000000000000'
+    )
+    BLOCK_NO_ROWS = bytes.fromhex(
+        '040100000001000000007b05000000000c0000002f0000000000000000000000'
+        '0000000000000000000000000000000e00000000000036010000000000000000'
+        '00000000000080d0d40300000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '0000000000002e4f52412d30313430333a206e6f206461746120666f756e640a'
+        '4f52412d30363531323a206174206c696e6520310a'
+    )
+
+    def test_an_unassigned_out_bind_is_a_null(self):
+        # 0xFF and a ub2 return code, nothing more (#801's OALL8 form). Read as a
+        # length, the first one ran into the second and the status.
+        from seerdb.common.tns import decode_9i_oall8_block_out
+
+        (values, _, code, _) = decode_9i_oall8_block_out(
+            self.BLOCK_TWO_UNASSIGNED, 2, 2
+        )
+        self.assertEqual((values, code), ([None, None], 0))
+
+    def test_the_bind_prompt_names_each_binds_direction(self):
+        # One mask per bind after the prompt's 50-byte head: OUT, then IN. Only the
+        # OUT one comes back (#1242).
+        from seerdb.common.tns import (
+            decode_9i_oall8_bind_directions,
+            decode_9i_oall8_block_out,
+        )
+
+        self.assertEqual(
+            decode_9i_oall8_bind_directions(self.BLOCK_OUT_THEN_IN, 2), [16, 32]
+        )
+        (values, _, code, _) = decode_9i_oall8_block_out(self.BLOCK_OUT_THEN_IN, 2, 1)
+        self.assertEqual((values, code), ([b'got a value'], 0))
+
+    def test_a_block_that_fails_answers_with_the_bare_status(self):
+        # No prompt: the reply is the status, ORA-01403. Skipping a prompt's length
+        # first landed past it and read the failure as success (#1039).
+        from seerdb.common.tns import (
+            decode_9i_oall8_bind_directions,
+            decode_9i_oall8_block_out,
+        )
+
+        self.assertIsNone(decode_9i_oall8_bind_directions(self.BLOCK_NO_ROWS, 1))
+        (values, _, code, message) = decode_9i_oall8_block_out(self.BLOCK_NO_ROWS, 1, 1)
+        self.assertEqual((values, code), ([], 1403))
+        self.assertTrue(message.startswith('ORA-01403'))
+
+    # `BEGIN OPEN :1 FOR SELECT 1 a, 'x' b FROM dual; END;` and
+    # `BEGIN :1 := RPAD('a', 300, 'b'); END;` from a live 9.2 server.
+    BLOCK_REFCURSOR = bytes.fromhex(
+        '0b01050001000000010000000000000000000000000000000000000000000000'
+        '00000000000000000000000000000000000030072c00000000020000004b0102'
+        '0000000200000000000000000000000000000000000000000000000000000000'
+        '0000000000000001010300000001410000000000000000016080000001000000'
+        '00000000000000000000000000000000000000001f0001000100000000000000'
+        '010103000000014200000000000000000700000007787e0a1f012b0502000000'
+        '00000000080500aba62d02000000000100000002000000000000000000000004'
+        '050000000101000000000000000000010000002f000000000000000000000000'
+        '0000000000000000000000000000070000010000003601000000000000000000'
+        '000000000080d0d4030000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '0000000000'
+    )
+    BLOCK_LONG_OUT = bytes.fromhex(
+        '0b01050001000000010000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000001007fe4061626262626262626262'
+        '6262626262626262626262626262626262626262626262626262626262626262'
+        '6262626262626262626262626262626262626262626240626262626262626262'
+        '6262626262626262626262626262626262626262626262626262626262626262'
+        '6262626262626262626262626262626262626262626262406262626262626262'
+        '6262626262626262626262626262626262626262626262626262626262626262'
+        '6262626262626262626262626262626262626262626262624062626262626262'
+        '6262626262626262626262626262626262626262626262626262626262626262'
+        '626262626262626262626262626262626262626262626262622c626262626262'
+        '6262626262626262626262626262626262626262626262626262626262626262'
+        '6262626262620000000000080500aba62d020000000003000000020000000000'
+        '00000000000004050000000101000000000000000000030000002f0000000000'
+        '0000000000000000000000000000000000000000000900000100000036010000'
+        '00000000000000000000000080d0d40300000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000000000000000000000000'
+    )
+
+    def test_a_refcursor_out_bind_carries_its_describe_and_id(self):
+        # The cell is a lead byte, the opened cursor's describe and its id; the
+        # rows are fetched by that id. It came back as the raw cell bytes.
+        from seerdb.common.tns import decode_9i_oall8_block_out
+
+        (values, _, code, _) = decode_9i_oall8_block_out(
+            self.BLOCK_REFCURSOR, 1, 1, frozenset({0})
+        )
+        self.assertEqual(code, 0)
+        (cursor, columns) = values[0]
+        self.assertGreater(cursor, 0)
+        self.assertEqual([c['column_name'] for c in columns], ['A', 'B'])
+
+    def test_a_long_out_value_is_chunked(self):
+        # Past 252 bytes the value comes 0xFE-chunked; read as one length it kept
+        # the 64-byte chunk lengths in the text.
+        from seerdb.common.tns import decode_9i_oall8_block_out
+
+        (values, _, code, _) = decode_9i_oall8_block_out(self.BLOCK_LONG_OUT, 1, 1)
+        self.assertEqual((values, code), ([b'a' + b'b' * 299], 0))
+
+
 class TestO8iBfile(unittest.TestCase):
     """Oracle 8i native BFILE read (#401, PROTOCOL §19.17): FILE_OPEN -> GETLEN
     -> READ -> FILE_CLOSE over TTI_LOBOPS in the 8i envelope (ub4-LE lengths +
