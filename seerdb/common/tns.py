@@ -2012,31 +2012,47 @@ _O8I_LONG_CELL: wire_schema.Schema = (
     ('n2', 'indicator'),
     ('n2', 'return_code'),
 )
-_O8I_LOB_CELL: wire_schema.Schema = (
+# A 9.2 server sends a 9.2 client 8i's LOB, UROWID and ROWID cells without their
+# indicator and return code (#798): a LOB's ub4 length and, when it is not zero,
+# the locator; a UROWID's ub2 length and the rowid. Read live on 9.2.
+_O9I_LOB_CELL: wire_schema.Schema = (
     ('n4', 'length'),
     ('when', 'length', (('value', 'locator'),)),
+)
+_O8I_LOB_CELL: wire_schema.Schema = (
+    *_O9I_LOB_CELL,
     ('n2', 'indicator'),
     ('n2', 'return_code'),
+)
+# A rowid at fixed widths, as an 8i status and ROWID cell carry it (#1079): the
+# data object, the file, a reserved byte, the block, the slot. A 9.2 server
+# writes it to a 9.2 client aligned, the file and the slot each padded to four
+# bytes (#798): a ROWID cell's 16 bytes, read live against ROWIDTOCHAR, and the
+# status's.
+_O8I_ROWID_FIELDS: wire_schema.Schema = (
+    ('n4', 'rowid_object'),
+    ('n2', 'rowid_file'),
+    ('only', 'o8i', (('pad', 1),)),
+    ('only', 'o9i', (('pad', 2),)),
+    ('n4', 'rowid_block'),
+    ('n2', 'rowid_slot'),
+    ('only', 'o9i', (('pad', 2),)),
+)
+_O9I_ROWID_CELL: wire_schema.Schema = (
+    ('u8', 'size'),
+    ('when', 'size', _O8I_ROWID_FIELDS),
 )
 _O8I_ROWID_CELL: wire_schema.Schema = (
-    ('u8', 'size'),
-    (
-        'when',
-        'size',
-        (
-            ('n4', 'rowid_object'),
-            ('n2', 'rowid_file'),
-            ('pad', 1),
-            ('n4', 'rowid_block'),
-            ('n2', 'rowid_slot'),
-        ),
-    ),
+    *_O9I_ROWID_CELL,
     ('n2', 'indicator'),
     ('n2', 'return_code'),
 )
-_O8I_UROWID_CELL: wire_schema.Schema = (
+_O9I_UROWID_CELL: wire_schema.Schema = (
     ('n2', 'length'),
     ('when', 'length', (('value', 'urowid'),)),
+)
+_O8I_UROWID_CELL: wire_schema.Schema = (
+    *_O9I_UROWID_CELL,
     ('n2', 'indicator'),
     ('n2', 'return_code'),
 )
@@ -2250,11 +2266,7 @@ _O8I_STATUS: wire_schema.Schema = (
     ('u8', 'cursor_options'),
     ('u8', 'upi_param'),
     ('u8', 'warnings'),
-    ('n4', 'rowid_object'),
-    ('n2', 'rowid_file'),
-    ('pad', 1),
-    ('n4', 'rowid_block'),
-    ('n2', 'rowid_slot'),
+    *_O8I_ROWID_FIELDS,
     ('n4', 'os_error'),
     ('u8', 'statement'),
     ('u8', 'call'),
@@ -2311,8 +2323,8 @@ _O9I_RXH: wire_schema.Schema = (
 # The experimental 9i OALL8 status (#798): 8i's (_O8I_STATUS) from its row count
 # through its warnings, behind the call status (a ub4: 2 a DML, 4 a describe-only
 # execute, 5 a bound one's first parse) and a one-byte sequence the 10g+ OER
-# carries there too, and at a 9.2 client's alignment -- the rowid's file and slot
-# each padded to four bytes. Then OCI's own tail: the OS error, statement and
+# carries there too, the rowid at a 9.2 client's alignment (_O8I_ROWID_FIELDS).
+# Then OCI's own tail: the OS error, statement and
 # call numbers, padding and iterations as on 8i, a fixed 310 (the constant 11g's
 # OCI status carries at 56), the oerrdd's pointer and ub4 length, and the three
 # batch-error arrays' pointers and counts; after them the oerrdd itself (a ub2
@@ -2325,13 +2337,7 @@ _O9I_STATUS_HEAD: wire_schema.Schema = (
     _O8I_STATUS[0],
     ('n4', 'call_status'),
     ('u8', 'sequence'),
-    *_O8I_STATUS[1 : _O8I_STATUS.index(('n4', 'rowid_object'))],
-    ('n4', 'rowid_object'),
-    ('n2', 'rowid_file'),
-    ('pad', 2),
-    ('n4', 'rowid_block'),
-    ('n2', 'rowid_slot'),
-    ('pad', 2),
+    *_O8I_STATUS[1 : _O8I_STATUS.index(('n4', 'os_error'))],
 )
 _O9I_STATUS: wire_schema.Schema = (
     *_O9I_STATUS_HEAD,
@@ -2525,6 +2531,9 @@ _O7_LOBOPS_REPLY_FROM_O9I = wire_schema.compile_decoder(_O7_LOBOPS_REPLY, _O9I)
 _O8I_RPA_FROM_O9I = wire_schema.compile_decoder(_O8I_RPA, _O9I)
 _O9I_IOV_FROM_O9I = wire_schema.compile_decoder(_O9I_IOV, _O9I)
 _O9I_RXH_FROM_O9I = wire_schema.compile_decoder(_O9I_RXH, _O9I)
+_O9I_ROWID_CELL_FROM_O9I = wire_schema.compile_decoder(_O9I_ROWID_CELL, _O9I)
+_O9I_LOB_CELL_FROM_O9I = wire_schema.compile_decoder(_O9I_LOB_CELL, _O9I)
+_O9I_UROWID_CELL_FROM_O9I = wire_schema.compile_decoder(_O9I_UROWID_CELL, _O9I)
 _OAC_OCI = wire_schema.compile_encoder(_OAC, _OCI)
 _O7_LOBOPS_O9I = wire_schema.compile_encoder(_O7_LOBOPS, _O9I)
 _CLOSE_CURSORS_O9I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O9I)
@@ -14767,54 +14776,55 @@ _O9I_OALL8_LOB_TYPES = frozenset((TNS_TYPE_CLOB, TNS_TYPE_BLOB, TNS_TYPE_BFILE))
 
 
 def _o9i_oall8_lob_cell(Type: int, Data: bytes) -> tuple[object, bytes]:
-    # A LOB column's cell in a 9i OALL8 row (#795): a ub4 locator size, then --
-    # when it is not zero -- the locator again as a ub1-length value (a ub2 length
-    # and the body, 86 bytes for a CLOB / BLOB); no trailing indicator. A NULL LOB
-    # is the zero size ALONE (reading a length byte after it took the next row's
-    # token as one and desynced the stream); EMPTY_CLOB / EMPTY_BLOB carry a real
-    # locator that reads back empty. Returns a LOB carrying the locator, for the
-    # dialect to read (resolve_lobs) or hand back.
+    # A LOB column's cell in a 9i OALL8 row (#795): 8i's without its trailer
+    # (_O9I_LOB_CELL) -- a ub4 locator size, then, when it is not zero, the
+    # locator as a ub1-length value (a ub2 length and the body, 86 bytes for a
+    # CLOB / BLOB). A NULL LOB is the zero size alone (reading a length byte after
+    # it took the next row's token as one and desynced the stream); EMPTY_CLOB /
+    # EMPTY_BLOB carry a real locator that reads back empty. Returns a LOB carrying
+    # the locator, for the dialect to read (resolve_lobs) or hand back.
     from seerdb.common.lob import LOB
 
-    Size = int.from_bytes(Data[:4], 'little')
-    Data = Data[4:]
-    if not Size:
-        return (None, Data)
-    Length = Data[0]
-    return (LOB(Type, bytes(Data[1 : 1 + Length])), Data[1 + Length :])
+    (Cell, Rest) = _O9I_LOB_CELL_FROM_O9I(Data)
+    if not Cell['length']:
+        return (None, Rest)
+    return (LOB(Type, bytes(Cell['locator'])), Rest)
 
 
-def _o9i_oall8_rowid(Raw: bytes) -> str:
-    # A 9i OALL8 ROWID cell's value: the OCI rowid structure, little-endian with
-    # each field padded to four bytes -- data object (ub4), relative file (ub2),
-    # block (ub4), slot (ub2) -- rendered as the extended rowid text. Read live
-    # on 9.2 against ROWIDTOCHAR and DBMS_ROWID's object / file / block / row.
+def _o9i_oall8_rowid_cell(Data: bytes) -> tuple[str, bytes]:
+    # A 9i OALL8 ROWID cell: 8i's without its trailer (_O9I_ROWID_CELL), a size
+    # and the rowid at a 9.2 client's alignment (_O8I_ROWID_FIELDS: data object,
+    # file, block, slot) -- 16 bytes, read live on 9.2 against ROWIDTOCHAR and
+    # DBMS_ROWID's object / file / block / row -- rendered as the extended rowid
+    # text. A NULL one is the 0xFF every NULL cell is, which the caller reads
+    # first.
     from seerdb.common.types import rowid_to_string
 
-    return rowid_to_string(
-        int.from_bytes(Raw[0:4], 'little'),
-        int.from_bytes(Raw[4:6], 'little'),
-        int.from_bytes(Raw[8:12], 'little'),
-        int.from_bytes(Raw[12:14], 'little'),
+    (Cell, Rest) = _O9I_ROWID_CELL_FROM_O9I(Data)
+    return (
+        rowid_to_string(
+            Cell['rowid_object'],
+            Cell['rowid_file'],
+            Cell['rowid_block'],
+            Cell['rowid_slot'],
+        ),
+        Rest,
     )
 
 
 def _o9i_oall8_urowid_cell(Data: bytes) -> tuple[str | None, bytes]:
-    # A 9i OALL8 UROWID cell: a ub2 size (little-endian), then -- when it is not
-    # zero -- the rowid bytes (a type tag, then the body) as an ordinary value, a
-    # ub1 length or 0xFE chunks past 252 bytes. The shape of a LOB cell, with a
-    # ub2 size; a NULL is the zero size alone. Read live on 9.2 for a physical
-    # rowid (`0d00 0d 01...`) and an index-organized table's logical ones
-    # (`6c00 6c 02...`, and a 409-byte one, `9901 fe ff... 9a... 00`).
+    # A 9i OALL8 UROWID cell: 8i's without its trailer (_O9I_UROWID_CELL) -- a
+    # ub2 size and, when it is not zero, the rowid bytes (a type tag, then the
+    # body) as an ordinary value, a ub1 length or 0xFE chunks past 252 bytes; a
+    # NULL is the zero size alone. Read live on 9.2 for a physical rowid
+    # (`0d00 0d 01...`) and an index-organized table's logical ones (`6c00 6c
+    # 02...`, and a 409-byte one, `9901 fe ff... 9a... 00`).
     from seerdb.common.types import urowid_to_string
 
-    Size = int.from_bytes(Data[:2], 'little')
-    if len(Data) < 3:
-        raise IndexError('urowid cell')
-    if not Size:
-        return (None, Data[2:])
-    (Raw, Rest) = _OCI.read_value(Data[2:])
-    return (urowid_to_string(bytes(Raw or b'')), Rest)
+    (Cell, Rest) = _O9I_UROWID_CELL_FROM_O9I(Data)
+    if not Cell['length']:
+        return (None, Rest)
+    return (urowid_to_string(bytes(Cell['urowid'])), Rest)
 
 
 def decode_9i_oall8_exec_response(
@@ -14894,13 +14904,14 @@ def decode_9i_oall8_exec_response(
                         (Text, Rest) = _o9i_oall8_urowid_cell(Rest)
                         Row.append(Text)
                         continue
+                    if Col.get('data_type') in (TNS_TYPE_RID, TNS_TYPE_ROWID) and (
+                        Rest[0] != 0xFF
+                    ):
+                        (Text, Rest) = _o9i_oall8_rowid_cell(Rest)
+                        Row.append(Text)
+                        continue
                     (Raw, Rest) = _o9i_oall8_cell(Rest)
-                    if Raw is None:
-                        Row.append(None)
-                    elif Col.get('data_type') in (TNS_TYPE_RID, TNS_TYPE_ROWID):
-                        Row.append(_o9i_oall8_rowid(Raw))
-                    else:
-                        Row.append(decode_value(Col, Raw))
+                    Row.append(None if Raw is None else decode_value(Col, Raw))
                 Rows.append(Row)
                 Last = Row
                 Vector = None
