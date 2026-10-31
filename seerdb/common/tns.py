@@ -2406,6 +2406,7 @@ _CLOSE_CURSORS_FROM_OCI = wire_schema.compile_decoder(_CLOSE_CURSORS, _OCI)
 _CLOSE_CURSORS_O8I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O8I)
 _O8I_ALL8_O8I = wire_schema.compile_encoder(_O8I_ALL8, _O8I)
 _O8I_ALL8_O9I = wire_schema.compile_encoder(_O8I_ALL8, _O9I)
+_OAC_OCI = wire_schema.compile_encoder(_OAC, _OCI)
 _O7_LOBOPS_O9I = wire_schema.compile_encoder(_O7_LOBOPS, _O9I)
 _CLOSE_CURSORS_O9I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O9I)
 _OBJECT_FRAME_THIN = wire_schema.compile_encoder(_OBJECT_FRAME, _THIN)
@@ -14257,10 +14258,10 @@ def _encode_9i_oall8(
             # The 9i LONG-class rule holds here too (#723): a statement's bind
             # declared wider than 4000 bytes has its value read after the row's
             # others -- a declared VARCHAR Var landed in the next column. The
-            # declared size is the descriptor's ub8 at +5. A PL/SQL block keeps
-            # every value in place, as on the compact path.
+            # declared size is the descriptor's max_length, a ub4 at +5. A PL/SQL
+            # block keeps every value in place, as on the compact path.
             Long = [
-                not IsBlock and int.from_bytes(Oac[5:13], 'little') > 4000
+                not IsBlock and int.from_bytes(Oac[5:9], 'little') > 4000
                 for Oac in Oacs
             ]
             for Row in Rows:
@@ -14275,9 +14276,10 @@ def _encode_9i_oall8(
 
 
 def _encode_9i_bind_oac(Value: object) -> bytes:
-    # The 64-bit OALL8 bind descriptor: ``01 <TNS type> <flag> 00 00``, an 8-byte
-    # little-endian max size, then 28 reserved bytes (41 bytes); the flag is 0x05
-    # for an OUT-capable Var, 0x01 otherwise. The type and size must declare the
+    # The 9i OALL8 bind descriptor, 41 bytes: OCI's (_OAC), as a native 9.2
+    # client writes it (#798) -- a lead byte, the TNS type, the flag (0x05 for an
+    # OUT-capable Var, 0x01 otherwise), the max size (a ub4, then a zero max
+    # array), the charset and form, the plain column's padding. The type and size must declare the
     # form the value goes in (_encode_9i_bind_value), as the thin 9i path's do
     # (#797): a sub-second datetime is a TIMESTAMP (11 bytes) and a tz-aware one a
     # TIMESTAMP WITH TIME ZONE (13) -- declared a DATE (7), the server refused it
@@ -14321,16 +14323,31 @@ def _encode_9i_bind_oac(Value: object) -> bytes:
         DType, Size = TNS_TYPE_INTERVALYM, 5
     else:
         DType, Size = TNS_TYPE_VARCHAR, max(len(str(Value).encode('utf-8')), 1)
-    Oac = bytearray([1, DType, Flag, 0, 0]) + Size.to_bytes(8, 'little') + bytes(28)
-    if _is_national_var(Value):
-        # A national bind declares AL16UTF16 and charset form 2 in the
-        # descriptor's charset (ub2 at 29) and form (31) -- where a native
-        # client's VARCHAR bind carries 31 / 1 (native_9i_array_dml.pcap) -- and
-        # its value rides as UTF-16BE (#798; through the database charset it lost
-        # every character Latin-1 lacks, as on the compact path, #174).
-        Oac[29:31] = AL16UTF16_CHARSET.to_bytes(2, 'little')
-        Oac[31] = 2
-    return bytes(Oac)
+    # A national bind declares AL16UTF16 and charset form 2 -- where a native
+    # client's VARCHAR bind carries 31 / 1 (native_9i_array_dml.pcap) -- and its
+    # value rides as UTF-16BE (#798; through the database charset it lost every
+    # character Latin-1 lacks, as on the compact path, #174).
+    National = _is_national_var(Value)
+    return _OAC_OCI(
+        {
+            'lead': 1,
+            'data_type': DType,
+            'oci_plain': DType != TNS_TYPE_ADT,
+            'flags': Flag,
+            'precision': 0,
+            'scale': 0,
+            'max_length': Size,
+            'max_array': 0,
+            'oci_12c': False,
+            'cont_flags': 0,
+            'toid_length': 0,
+            'version': 0,
+            'charset': AL16UTF16_CHARSET if National else 0,
+            'csfrm': 2 if National else 0,
+            'max_chars': 0,
+            'oaccolid': 0,
+        }
+    )
 
 
 def _is_national_var(Value: object) -> bool:
