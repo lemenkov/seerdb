@@ -7790,6 +7790,63 @@ class TestNative9iOall8Select(unittest.TestCase):
         self.assertEqual(opened[:11], self.BFILE_LOCATOR[:11])
         self.assertEqual(decode_o8i_bfile_getlen(self.BFILE_GETLEN_REPLY), 20)
 
+    # A fetch of `SELECT id, name, score` (rows 2-5 of five; row 5 NULL in both
+    # text columns) from a live 9.2 server: each row header announces a one-byte
+    # column vector, 0x07 for three columns all sent -- the TTI_RXD token.
+    FETCH_THREE_COLUMNS = bytes.fromhex(
+        '060002e10300000064000000ffbf7f00000058bfd60300000000010060962a00'
+        '000000000000000000000000200200000000070702c103046265746103c10a64'
+        '150300070702c1040567616d6d6104c2020133150300070702c1050564656c74'
+        '61043e644c66150300070702c1060000040100000001050000007b0500000000'
+        '110000000300200000007449030001000000d2b8000004000000000000000015'
+        '0000010000003601000000000000000000000000000080d0d403000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00000000000000000000000000000000000000000000194f52412d3031343033'
+        '3a206e6f206461746120666f756e640a'
+    )
+    # The execute reply's row stream for `SELECT NULL AS a, 5 AS b FROM dual`.
+    UNTYPED_NULL_ROW = bytes.fromhex(
+        '060102b402000000010000005d962a0000000000000000000000000000000000'
+        '0000000000000000000000000000000000000702c1060805002b5f2d02000000'
+        '0001000000000000000000000000000000040100000001010000000000000000'
+        '0001001e00030000000000000000000000000000000000000000000000000000'
+        '070000010000003601000000000000000000000000000080d0d4030000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000'
+    )
+
+    def test_a_row_header_names_its_column_vector(self):
+        # The vector's length is a ub2 at the header's offset 26. Guessing it
+        # from the byte after the header took a 0x07 vector for a row token and
+        # misread every row after it as a NUMBER.
+        from decimal import Decimal
+
+        columns = [
+            {'data_type': 2, 'data_length': 22, 'charset': 0, 'csfrm': 0},
+            {'data_type': 1, 'data_length': 40, 'charset': 31, 'csfrm': 1},
+            {'data_type': 2, 'data_length': 22, 'charset': 0, 'csfrm': 0},
+        ]
+        (rows, _, _) = self._decode(self.FETCH_THREE_COLUMNS, columns)
+        self.assertEqual(
+            rows,
+            [
+                [2, 'beta', Decimal('9.99')],
+                [3, 'gamma', Decimal('100.5')],
+                [4, 'delta', Decimal('-1.25')],
+                [5, None, None],
+            ],
+        )
+
+    def test_an_untyped_null_column_sends_no_cell(self):
+        # `SELECT NULL` describes with a zero data length and sends nothing for
+        # the column, not even the 0xFF NULL (#682 / #1185 at OALL8).
+        columns = [
+            {'data_type': 1, 'data_length': 0, 'charset': 31, 'csfrm': 1},
+            {'data_type': 2, 'data_length': 2, 'charset': 0, 'csfrm': 0},
+        ]
+        (rows, _, _) = self._decode(self.UNTYPED_NULL_ROW, columns)
+        self.assertEqual(rows, [[None, 5]])
+
 
 class TestO8iBfile(unittest.TestCase):
     """Oracle 8i native BFILE read (#401, PROTOCOL §19.17): FILE_OPEN -> GETLEN

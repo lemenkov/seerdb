@@ -14496,11 +14496,17 @@ def decode_9i_oall8_exec_response(
         while Rest:
             Token = Rest[0]
             if Token == TTI_RXH:
+                # The header names the length of the column bit vector that may
+                # follow it, a ub2 at offset 26 (0: none). Telling it from the
+                # byte after the header is not possible: three columns all sent
+                # is a vector of 0x07, the TTI_RXD token.
+                if len(Rest) < _O9I_OALL8_RXH_LEN:
+                    raise IndexError('row header')
+                VecLen = int.from_bytes(Rest[26:28], 'little')
                 Rest = Rest[_O9I_OALL8_RXH_LEN:]
-                # An optional column bit vector follows the fixed header when the
-                # next byte is not itself a token.
-                if Rest and Rest[0] not in _O9I_OALL8_ROW_TOKENS:
-                    VecLen = (len(Columns) + 7) // 8
+                if VecLen:
+                    if len(Rest) < VecLen:
+                        raise IndexError('row header vector')
                     Vector = bytes(Rest[:VecLen])
                     Rest = Rest[VecLen:]
                 else:
@@ -14528,6 +14534,17 @@ def decode_9i_oall8_exec_response(
                     if Col.get('data_type') in _O9I_OALL8_LOB_TYPES:
                         (Lob, Rest) = _o9i_oall8_lob_cell(Col['data_type'], Rest)
                         Row.append(Lob)
+                        continue
+                    if (
+                        Col.get('data_length', None) == 0
+                        and Col.get('data_type') not in _LONG_DATA_TYPES
+                    ):
+                        # A column described with a zero data length -- `SELECT
+                        # NULL` -- is always NULL and sends no cell at all, not
+                        # even the 0xFF (the OALL8 form of #682 / #1185). A LONG
+                        # is described with a zero length too, and does carry
+                        # data.
+                        Row.append(None)
                         continue
                     (Raw, Rest) = _o9i_oall8_cell(Rest)
                     Row.append(None if Raw is None else decode_value(Col, Raw))
