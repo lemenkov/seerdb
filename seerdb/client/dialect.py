@@ -1055,6 +1055,13 @@ class Fv2Oall8Dialect(Oall8Dialect):
     Synchronous only, and no cursor cache. Not yet: nested cursors (CURSOR()
     columns) and object / collection types."""
 
+    def _clob_charset(self, column: dict) -> int:
+        # The native OALL8 session is AL32UTF8 like the compact 9i one, so its
+        # CLOB text is too (#2383), not the 8i base's Latin-1.
+        from seerdb.common.types import fv2_lob_charset
+
+        return fv2_lob_charset(column.get('charset'), column.get('csfrm'))
+
     def _closing(self) -> bytes:
         # The close of every finished cursor, piggybacked ahead of the next call
         # in the 64-bit form a native 9.2 OCI client sends (#798); the 8i form
