@@ -39,7 +39,7 @@ version 3.3.0:
   - the cursor cache, re-executing a parsed statement by its cursor (#2261);
   - `DatabaseError.offset` (#2263), `cursor.warning` (#2262) and `cursor.bind_directions` (#2264);
   - a declared `DB_TYPE_LONG` / `DB_TYPE_LONG_RAW` bind takes a value past 4000 bytes, and an undeclared one is refused with the routes that work (#2260).
-- **Mirror (tech preview): an OCI message whose count runs past its end is refused**, where its decoder made up empty items (#2272).
+- **Mirror (tech preview): an OCI message whose count runs past its end is refused**, where its decoder made up empty items (#2272, GHSA-v22r-894c-vg7x; the flaw was never in a release).
 - **Fixes**:
   - **On 9i, a statement with non-ASCII text hung the session**: the SQL's length is now sent in characters (#2275).
   - **`connection.version` on 9i and 8i** gives the server's release; it was `None` (#2278).
