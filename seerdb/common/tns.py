@@ -14141,7 +14141,14 @@ def _o8i_status_strict(Data: bytes) -> dict | None:
         raise Truncated('8i status cut short') from Exc
 
 
-def _encode_9i_oall8(Seq: int, Sql: bytes, StmtType: int, Binds: list) -> bytes:
+def _encode_9i_oall8(
+    Seq: int,
+    Sql: bytes,
+    StmtType: int,
+    Binds: list,
+    Batch: list | None = None,
+    BatchErrors: bool = False,
+) -> bytes:
     # The native 9i (9.2) OALL8 (TTI_ALL8, 0x5e) execute — the 64-bit form the
     # server accepts once the OALL8 opt-in caps are negotiated (#716). It is the
     # 8i request (`_encode_8i_oall8`) with every pointer / length field widened
@@ -14151,11 +14158,20 @@ def _encode_9i_oall8(Seq: int, Sql: bytes, StmtType: int, Binds: list) -> bytes:
     # against it apart from the heap-pointer fields the server ignores. Scope so
     # far: DML / DDL and transaction control with scalar binds; SELECT, PL/SQL
     # blocks and RETURNING are separate increments.
+    #
+    # `Batch` holds an array DML's further rows (#798): the tail's iteration count
+    # counts every row, the bind descriptors describe each column once (a value
+    # wide enough for every row, _oac_rep_row), and each row follows as its own
+    # TTI_RXD -- one call, as a native 9.2 OCI client's array execute sends it
+    # (native_9i_array_dml.pcap). `BatchErrors` sets the batch-errors bit
+    # (0x80000, option byte 5's 0x08): the server applies the good rows and
+    # answers ORA-24381 with the failures.
     P = oci.OCI_INDICATOR
 
     def u8(n: int) -> bytes:
         return n.to_bytes(8, 'little')
 
+    Rows = _widen_batch_datetimes([Binds, *Batch]) if Batch else [Binds]
     NumBinds = len(Binds)
     IsBlock = StmtType in (O8I_STMT_BEGIN, O8I_STMT_DECLARE)
     IsQuery = StmtType == O8I_STMT_SELECT
@@ -14182,7 +14198,7 @@ def _encode_9i_oall8(Seq: int, Sql: bytes, StmtType: int, Binds: list) -> bytes:
         Byte4 = 0x04 if NumBinds else 0x00
     else:
         Byte4 = 0x80
-    Byte5 = 0x04 if IsBlock else 0x00
+    Byte5 = 0x04 if IsBlock else (0x08 if BatchErrors else 0x00)
     Head = bytes([TTI_FUN, TTI_ALL8, Seq & 0xFF, Option, Byte4, Byte5, 0, 0, 0, 0, 0])
     Mid = (
         P
@@ -14201,12 +14217,14 @@ def _encode_9i_oall8(Seq: int, Sql: bytes, StmtType: int, Binds: list) -> bytes:
         + P
         + u8(0)
     )
-    # Tail[4] is a fetch flag: 0 for a SELECT (the fetch rides the FETCH option),
-    # 1 for a DML / DDL / block execute. Byte-verified against the native 9.2
-    # SELECT (native_9i_select.pcap) and DML (#716) captures.
+    # Tail[4:8] is the iteration count, a ub4: 0 for a SELECT (the fetch rides the
+    # FETCH option), else the rows the execute runs -- 1, or an array DML's
+    # count. Byte-verified against the native 9.2 SELECT (native_9i_select.pcap),
+    # DML (#716) and array DML (native_9i_array_dml.pcap, 3) captures.
     Tail = (
-        bytes([1, 0, 0, 0, 0 if IsQuery else 1])
-        + bytes(23)
+        bytes([1, 0, 0, 0])
+        + (0 if IsQuery else len(Rows)).to_bytes(4, 'little')
+        + bytes(20)
         + bytes([StmtType])
         + bytes(19)
     )
@@ -14218,10 +14236,23 @@ def _encode_9i_oall8(Seq: int, Sql: bytes, StmtType: int, Binds: list) -> bytes:
     try:
         Message = Head + Mid + encode_chr(Sql) + Tail
         if NumBinds:
-            Message += b''.join(_encode_9i_bind_oac(V) for V in Binds)
-            Message += bytes([0x07])
-            for Value in Binds:
-                Message += _encode_9i_bind_value(Value)
+            Oacs = [_encode_9i_bind_oac(V) for V in _oac_rep_row(Rows)]
+            Message += b''.join(Oacs)
+            # The 9i LONG-class rule holds here too (#723): a statement's bind
+            # declared wider than 4000 bytes has its value read after the row's
+            # others -- a declared VARCHAR Var landed in the next column. The
+            # declared size is the descriptor's ub8 at +5. A PL/SQL block keeps
+            # every value in place, as on the compact path.
+            Long = [
+                not IsBlock and int.from_bytes(Oac[5:13], 'little') > 4000
+                for Oac in Oacs
+            ]
+            for Row in Rows:
+                Message += bytes([0x07])
+                for Value in [V for V, L in zip(Row, Long) if not L] + [
+                    V for V, L in zip(Row, Long) if L
+                ]:
+                    Message += _encode_9i_bind_value(Value)
     finally:
         _ENCODE_FIELD_VERSION.reset(Token)
     return Message
@@ -14240,7 +14271,12 @@ def _encode_9i_bind_oac(Value: object) -> bytes:
     from seerdb.common.datatypes import Var
 
     Flag = 0x01
-    if isinstance(Value, Var):
+    if isinstance(Value, Var) and Value.dbtype.tns_type in _DECLARED_WIDTHS:
+        # A declared date / time type has its type's width, whatever the Var's
+        # buffer: the value goes out in that form (_declared_value_bytes, #701).
+        DType = Value.dbtype.tns_type
+        (Size, Flag) = (_DECLARED_WIDTHS[DType], 0x05)
+    elif isinstance(Value, Var):
         DType, Size, Flag = Value.dbtype.tns_type, max(Value.size or 22, 1), 0x05
     elif isinstance(Value, (bool, int, float, Decimal)):
         DType, Size = 2, 22
@@ -14264,6 +14300,15 @@ def _encode_9i_bind_oac(Value: object) -> bytes:
     return bytes([1, DType, Flag, 0, 0]) + Size.to_bytes(8, 'little') + bytes(28)
 
 
+# The wire width of each declared date / time bind type (_encode_9i_bind_oac).
+_DECLARED_WIDTHS = {
+    TNS_TYPE_DATE: 7,
+    TNS_TYPE_TIMESTAMP: 11,
+    TNS_TYPE_TIMESTAMPTZ: 13,
+    TNS_TYPE_TIMESTAMPLTZ: 11,
+}
+
+
 def _encode_9i_bind_value(Value: object) -> bytes:
     # A 9i OALL8 bind value: the 8i form (_encode_8i_bind_value) except that text
     # goes in the session's charset, UTF-8 -- the native OALL8 session negotiates
@@ -14272,11 +14317,14 @@ def _encode_9i_bind_value(Value: object) -> bytes:
     from seerdb.common.datatypes import Var
 
     if isinstance(Value, Var):
-        return (
-            _encode_9i_bind_value(Value._value)
-            if Value.has_value
-            else _O8I_OUT_PLACEHOLDER
-        )
+        if not Value.has_value:
+            return _O8I_OUT_PLACEHOLDER
+        # A declared type the value must be sent as -- a microsecond datetime
+        # declared DATE goes out as a DATE (#701).
+        Declared = _declared_value_bytes(Value._value, Value.dbtype.tns_type)
+        if Declared is not None:
+            return Declared
+        return _encode_9i_bind_value(Value._value)
     if isinstance(Value, str):
         return encode_token_rxd(Value.encode('utf-8'))
     return encode_token_rxd(Value)
@@ -14291,12 +14339,18 @@ def encode_9i_sql_text(Sql: str) -> bytes:
 
 
 def encode_9i_oall8_dml(
-    Seq: int, Sql: bytes, StmtType: int, Binds: list | None = None
+    Seq: int,
+    Sql: bytes,
+    StmtType: int,
+    Binds: list | None = None,
+    Batch: list | None = None,
+    BatchErrors: bool = False,
 ) -> bytes:
     # 9i INSERT/UPDATE/DELETE/DDL and COMMIT/ROLLBACK over the native 64-bit
     # OALL8 (#716); the affected-row count comes back in the response OER
-    # (decode_8i_dml_response, shared with 8i).
-    return _encode_9i_oall8(Seq, Sql, StmtType, Binds or [])
+    # (decode_9i_oall8_dml_response). `Batch` holds an array DML's further rows
+    # (#798).
+    return _encode_9i_oall8(Seq, Sql, StmtType, Binds or [], Batch, BatchErrors)
 
 
 def encode_9i_oall8_query(Seq: int, Sql: bytes, Binds: list | None = None) -> bytes:
@@ -14664,22 +14718,55 @@ def decode_9i_oall8_cursor_id(Terminal: bytes) -> int:
     return Oer[16]
 
 
-def decode_9i_oall8_dml_response(Terminal: bytes) -> tuple[int, int, str | None]:
+def decode_9i_oall8_dml_response(
+    Terminal: bytes, Applied: bool = False
+) -> tuple[int, int, str | None]:
     # The affected-row count, ORA code and message a 9i OALL8 non-query (DML / DDL
     # / transaction-control) reply carries (#716). The count is a ub4 at OER offset
     # 6 -- the "rows processed" field, where a SELECT reply reports its batch size
     # (UPDATE of 2 rows -> 2, INSERT / DELETE -> 1, DDL / COMMIT -> 0; read live on
     # 9.2) -- and the code / message come from decode_9i_oall8_status. A failed
-    # statement reports no count; its error is raised instead. Returns
-    # (rowcount, code, message); raises Truncated if the OER is cut short, for the
-    # reader to read on.
+    # statement reports no count, unless `Applied`: an array DML that fails at a
+    # row has applied the rows before it, and the status counts them (#798; 1 of
+    # rows 4, 1-duplicate, 5 in native_9i_array_dml.pcap). Returns (rowcount, code,
+    # message); raises Truncated if the OER is cut short, for the reader to read
+    # on.
     Status = decode_9i_oall8_status(Terminal)
     if Status is None:
         return (0, 0, None)
     Oer = _o9i_oall8_oer(Terminal)
     Rows = int.from_bytes(Oer[6:10], 'little') if len(Oer) >= 10 else 0
     Code = Status['code']
-    return (0 if Code else Rows, Code, Status['message'])
+    return (0 if Code and not Applied else Rows, Code, Status['message'])
+
+
+def decode_9i_oall8_batch_errors(Terminal: bytes) -> list[dict]:
+    # The per-row errors of a 9i OALL8 array DML in batch-errors mode (#798), as
+    # {offset, code, message}, or [] for a status with none. The server applies
+    # the good rows and answers ORA-24381; its status holds three (pointer, ub4
+    # count, 4 pad) entries at offsets 86, 102 and 118 -- the codes', the row
+    # offsets' and the messages' -- and then the arrays: the codes as ub2s, the
+    # offsets as ub4s, and each message a ub4 length, the text as a ub1-length
+    # value and six bytes after it. Read from native 9.2 statuses with one and
+    # with two failed rows (native_9i_array_dml.pcap).
+    Oer = _o9i_oall8_oer(Terminal)
+    if len(Oer) < 134 or int.from_bytes(Oer[10:14], 'little') != 24381:
+        return []
+    Count = int.from_bytes(Oer[94:98], 'little')
+    Rest = Oer[134:]
+    Codes = [int.from_bytes(Rest[2 * I : 2 * I + 2], 'little') for I in range(Count)]
+    Rest = Rest[2 * Count :]
+    Offsets = [int.from_bytes(Rest[4 * I : 4 * I + 4], 'little') for I in range(Count)]
+    Rest = Rest[4 * Count :]
+    Messages = []
+    for _ in range(Count):
+        Length = Rest[4]
+        Messages.append(bytes(Rest[5 : 5 + Length]).decode('utf-8', 'replace').rstrip())
+        Rest = Rest[5 + Length + 6 :]
+    return [
+        {'offset': Offsets[I], 'code': Codes[I], 'message': Messages[I]}
+        for I in range(Count)
+    ]
 
 
 def decode_9i_oall8_dml_rowid(Terminal: bytes) -> str | None:
@@ -14782,7 +14869,11 @@ def decode_9i_oall8_status(Terminal: bytes) -> dict | None:
         raise Truncated('9i OALL8 status cut short')
     Code = int.from_bytes(Oer[10:14], 'little')
     Message = None
-    At = Oer.find(b'ORA-')
+    # The message naming the code: a batch-errors status (ORA-24381) lists the
+    # rows' own messages ahead of its own (decode_9i_oall8_batch_errors).
+    At = Oer.find(f'ORA-{Code:05d}'.encode()) if Code else -1
+    if At < 0:
+        At = Oer.find(b'ORA-')
     if At > 0:
         Message = (
             bytes(Oer[At:]).split(b'\x00')[0].rstrip(b'\n').decode('latin-1', 'replace')

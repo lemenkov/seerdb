@@ -7475,6 +7475,55 @@ class TestO9iOall8Messages(unittest.TestCase):
         )
         self.assertEqual(encode_9i_oall8_dml(0x05, sql, O8I_STMT_CREATE, []), expected)
 
+    # A native 9.2 OCI client's array INSERT (OCIStmtExecute, 3 iterations) of
+    # (1, 'row1'), (2, NULL), (3, 'row3'): the bytes after the SQL text
+    # (native_9i_array_dml.pcap). And the head of the same batch with
+    # OCI_BATCH_ERRORS.
+    NATIVE_ARRAY_INSERT_AFTER_SQL = bytes.fromhex(
+        '0100000003000000000000000000000000000000000000000000000004000000'
+        '0000000000000000000000000000000001020000001600000000000000000000'
+        '0000000000000000000000000000000000000000000000000001010300001400'
+        '000000000000000000000000000000000000000000001f000100000000000000'
+        '00000702c10204726f77310702c103fd010702c10404726f7733'
+    )
+    NATIVE_BATCH_ERRORS_HEAD = bytes.fromhex('035e0b298008')
+
+    def test_9i_oall8_array_dml_matches_native_client(self):
+        # The iteration count (the tail's ub4 at +4) counts every row, and each row
+        # follows as its own TTI_RXD (#798). The descriptors differ from OCI's in
+        # flags and charset only, as a single row's do; a NULL goes out as the
+        # empty value this encoder always sends (`00`, read back NULL live) where
+        # OCI writes `fd 01`.
+        from seerdb.common.tns import O8I_STMT_INSERT, encode_9i_oall8_dml
+
+        sql = b'INSERT INTO arr798 VALUES (:1, :2)'
+        msg = encode_9i_oall8_dml(
+            0x07, sql, O8I_STMT_INSERT, [1, 'row1'], [[2, None], [3, 'row3']]
+        )
+        after = msg[msg.find(sql) + len(sql) :]
+        native = self.NATIVE_ARRAY_INSERT_AFTER_SQL
+        self.assertEqual(after[:8], native[:8])  # 1, then 3 iterations
+        rows = native[native.find(bytes.fromhex('0702c102')) :]
+        self.assertEqual(
+            after[after.find(bytes.fromhex('0702c102')) :],
+            rows.replace(bytes.fromhex('fd01'), b'\x00'),
+        )
+        self.assertEqual(msg[:6], bytes.fromhex('035e07298000'))
+
+    def test_9i_oall8_batch_errors_sets_its_option_bit(self):
+        # OCI_BATCH_ERRORS is 0x80000 in the option word: byte 5's 0x08.
+        from seerdb.common.tns import O8I_STMT_INSERT, encode_9i_oall8_dml
+
+        msg = encode_9i_oall8_dml(
+            0x0B,
+            b'INSERT INTO arr798 VALUES (:1, :2)',
+            O8I_STMT_INSERT,
+            [6, 'dup0'],
+            [[2, 'dup1'], [7, 'dup2']],
+            BatchErrors=True,
+        )
+        self.assertEqual(msg[:6], self.NATIVE_BATCH_ERRORS_HEAD)
+
     # A native 9.2 sqlplus query of 161 bytes (its text NUL-terminated), and how
     # the client framed it: 0xFE, 64-byte chunks (64, 64, 33) and a zero length.
     NATIVE_LONG_SQL = (

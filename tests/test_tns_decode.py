@@ -7673,6 +7673,73 @@ class TestNative9iOall8Select(unittest.TestCase):
         # A failed statement names no row.
         self.assertIsNone(decode_9i_oall8_dml_rowid(self.STATUS_1403))
 
+    # Statuses of native 9.2 array INSERTs (native_9i_array_dml.pcap): rows 4, 1, 5
+    # where 1 is a duplicate key; then OCI_BATCH_ERRORS batches with one failed row
+    # (6, 2-duplicate, 7) and with two (2-duplicate, 8, 3-duplicate).
+    ARRAY_DML_FAILED = bytes.fromhex(
+        '04020000000101000000010000000000010000000200000000006a4e03000100'
+        '0000d2b800000300000000000000000900000300000036010000000000000000'
+        '00000000000080d0d403000000000d0000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '0000000000000d000d0100034e6a00010000b8d20003384f52412d3030303031'
+        '3a20756e6971756520636f6e73747261696e74202850594f2e5359535f433030'
+        '39343933292076696f6c617465640a'
+    )
+    ARRAY_DML_ONE_BATCH_ERROR = bytes.fromhex(
+        '040200000000020000003d5f0000000001000000020000000000000000000000'
+        '0000000000000000000000000000000b00000300000036010000000000000000'
+        '00000000000080d0d403000000000000000000000000a07dd603000000000100'
+        '000000000000a87dd603000000000100000000000000b87dd603000000000100'
+        '00000000000001000100000038000000384f52412d30303030313a20756e6971'
+        '756520636f6e73747261696e74202850594f2e5359535f433030393439332920'
+        '76696f6c617465640a000000000000214f52412d32343338313a206572726f72'
+        '28732920696e20617272617920444d4c0a'
+    )
+    ARRAY_DML_TWO_BATCH_ERRORS = bytes.fromhex(
+        '040200000000010000003d5f0000000001000000020000000000000000000000'
+        '0000000000000000000000000000000d00000300000036010000000000000000'
+        '00000000000080d0d403000000000000000000000000a07dd603000000000200'
+        '000000000000a87dd603000000000200000000000000b87dd603000000000200'
+        '00000000000001000100000000000200000038000000384f52412d3030303031'
+        '3a20756e6971756520636f6e73747261696e74202850594f2e5359535f433030'
+        '39343933292076696f6c617465640a00000000000038000000384f52412d3030'
+        '3030313a20756e6971756520636f6e73747261696e74202850594f2e5359535f'
+        '43303039343933292076696f6c617465640a000000000000214f52412d323433'
+        '38313a206572726f7228732920696e20617272617920444d4c0a'
+    )
+
+    def test_a_failed_array_dml_counts_the_rows_it_applied(self):
+        # The row before the duplicate went in, and the status counts it -- read
+        # when asked for (Applied), as a single failed statement reports none.
+        from seerdb.common.tns import decode_9i_oall8_dml_response
+
+        (rows, code, message) = decode_9i_oall8_dml_response(
+            self.ARRAY_DML_FAILED, Applied=True
+        )
+        self.assertEqual((rows, code), (1, 1))
+        self.assertTrue(message.startswith('ORA-00001'))
+        self.assertEqual(decode_9i_oall8_dml_response(self.ARRAY_DML_FAILED)[0], 0)
+
+    def test_batch_errors_list_each_failed_row(self):
+        from seerdb.common.tns import (
+            decode_9i_oall8_batch_errors,
+            decode_9i_oall8_dml_response,
+        )
+
+        (rows, code, message) = decode_9i_oall8_dml_response(
+            self.ARRAY_DML_ONE_BATCH_ERROR, Applied=True
+        )
+        # The summary's own message, not the first row's listed ahead of it.
+        self.assertEqual((rows, code), (2, 24381))
+        self.assertTrue(message.startswith('ORA-24381'))
+        errors = decode_9i_oall8_batch_errors(self.ARRAY_DML_ONE_BATCH_ERROR)
+        self.assertEqual([(e['offset'], e['code']) for e in errors], [(1, 1)])
+        self.assertTrue(errors[0]['message'].startswith('ORA-00001'))
+        errors = decode_9i_oall8_batch_errors(self.ARRAY_DML_TWO_BATCH_ERRORS)
+        self.assertEqual([(e['offset'], e['code']) for e in errors], [(0, 1), (2, 1)])
+        self.assertTrue(all(e['message'].startswith('ORA-00001') for e in errors))
+        self.assertEqual(decode_9i_oall8_batch_errors(self.ARRAY_DML_FAILED), [])
+
     # A bound statement's first-parse reply opens with a TTI_IOV (0x0b) bind
     # prompt and the session-state RPA carries a byte (0x04) that collides with the
     # OER token -- the status reader must skip past it to the real OER. Real 9.2

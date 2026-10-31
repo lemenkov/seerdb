@@ -41,6 +41,7 @@ from seerdb.common.tns import (
     decode_8i_dml_rowid,
     decode_8i_exec_response,
     decode_8i_terminal_error,
+    decode_9i_oall8_batch_errors,
     decode_9i_oall8_bind_directions,
     decode_9i_oall8_block_out,
     decode_9i_oall8_cursor_id,
@@ -1045,8 +1046,8 @@ class Fv2Oall8Dialect(Oall8Dialect):
     columns, INSERT/UPDATE/DELETE and DDL under its own commit/rollback, PL/SQL
     blocks with IN, OUT, IN OUT and REF CURSOR binds, and DML...RETURNING
     (through its PL/SQL wrap) -- all over the native 64-bit OALL8 reply decode
-    (decode_9i_oall8_*). Synchronous only. Not yet: array DML, LOB objects kept
-    open (fetch_lobs=False), nested cursors, object types, and a session past
+    (decode_9i_oall8_*), and array DML. Synchronous only. Not yet: LOB objects
+    kept open (fetch_lobs=False), nested cursors, object types, and a session past
     255 statements (the cursor id is read as one byte)."""
 
     def capabilities(self) -> frozenset[str]:
@@ -1059,7 +1060,9 @@ class Fv2Oall8Dialect(Oall8Dialect):
         # TTI_COMMIT, so this session drives its own transaction. CLOB / BLOB
         # content is read at fetch time (CAP_LOB); BFILE, kept-open LOB objects and
         # array DML are follow-ups.
-        return frozenset({CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_LOB, CAP_OWN_TXN})
+        return frozenset(
+            {CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_LOB, CAP_OWN_TXN, CAP_ARRAY_DML}
+        )
 
     def _encode_query(self, sql_text: bytes, bind: list | None) -> bytes:
         # Native 64-bit OALL8 SELECT execute (FETCH option, byte-verified #792).
@@ -1266,18 +1269,44 @@ class Fv2Oall8Dialect(Oall8Dialect):
         # execute with the statement-type option and no fetch; the affected-row
         # count comes back in the reply OER (decode_9i_oall8_dml_response, the row
         # count a ub4 at offset 6). Scalar binds ride the request (byte-verified).
-        # No array DML yet (the caller refuses a batch), no cursor cache, and the
-        # rowid is not surfaced yet. (Autocommit is applied by the caller.)
-        assert not batch
+        # An executemany's further rows ride the same call (#798), and the count
+        # is then the whole batch's; in `batcherrors` mode the server applies the
+        # good rows and lists the failures. No cursor cache. (Autocommit is applied
+        # by the caller.)
         stmt_type = o8i_stmt_type(sql.strip().upper())
         yield Send(
-            self._closing() + self._encode_dml(encode_9i_sql_text(sql), stmt_type, bind)
+            self._closing()
+            + encode_9i_oall8_dml(
+                self._next_seq(),
+                encode_9i_sql_text(sql),
+                stmt_type,
+                bind,
+                batch,
+                batcherrors,
+            )
         )
         buf = yield from self._recv_dml_terminal('DML')
-        (row_count, err_code, message) = decode_9i_oall8_dml_response(buf)
-        _raise_ora(err_code, message)
-        rowid = decode_9i_oall8_dml_rowid(buf)  # the touched row (#1079)
-        return (0, 0, 0, (row_count, None), [], None, rowid, [], None)
+        # The error comes back in the result, as on the compact path, so the
+        # cursor reports what the call managed: the rows a batch applied before a
+        # failing one, and none for a statement that failed outright -- raised
+        # here, it kept the count of the statement before (#998). The status
+        # counts a batch's applied rows even when it fails (Applied).
+        (row_count, err_code, message) = decode_9i_oall8_dml_response(
+            buf, Applied=bool(batch)
+        )
+        rowid = None if err_code else decode_9i_oall8_dml_rowid(buf)  # #1079
+        batch_errors = decode_9i_oall8_batch_errors(buf) if batcherrors else []
+        return (
+            0,
+            err_code,
+            0,
+            (row_count, None),
+            [],
+            message,
+            rowid,
+            batch_errors,
+            None,
+        )
 
     def txn_control(self, statement: str):
         # Commit / rollback as an ordinary OALL8 statement (no modern TTI_COMMIT on
