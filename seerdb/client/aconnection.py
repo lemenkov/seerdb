@@ -285,15 +285,9 @@ class AsyncOracleConnect(_ConnectionLogic):
         # Negotiation cache (#438): opt-in reconnect optimization, sharing the
         # process-level cache with the sync connection.
         self.negotiation_cache = negotiation_cache
-        # Experimental 9i OALL8 opt-in (#716). The async login path does not yet
-        # carry the native OSESSKEY/OAUTH handshake (#790), so reject it here
-        # rather than select the OALL8 dialect and stall at the DTY. Sync-only.
-        if oall8:
-            raise NotSupportedError(
-                'the experimental 9i OALL8 opt-in (oall8=True) is synchronous-only '
-                'for now; use seerdb.connect() (#716/#790)'
-            )
+        # Experimental 9i OALL8 opt-in (#716, #798).
         self._oall8 = oall8
+        self._o3_oall8 = False
         self._used_nego_cache = False
         self._skip_nego_cache = False
         self.host = host
@@ -675,6 +669,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         self._ano = None
         self.conn_key = None
         self._o3_phase = 0
+        self._o3_oall8 = False
         await self._open_transport()
         await self.handle_login()
 
@@ -891,6 +886,11 @@ class AsyncOracleConnect(_ConnectionLogic):
                                 # Oracle 8i: O3LOGON via the OSESSKEY envelope.
                                 self._o3_phase = 1
                                 await self._send_8i_osesskey()
+                            elif (
+                                self.field_version < FIELD_VERSION_10_2 and self._oall8
+                            ):
+                                # Native OALL8 (#790): the OCI OSESSKEY.
+                                await self.send(TNS_DATA, self._oall8_osesskey())
                             elif self.field_version < FIELD_VERSION_10_2:
                                 # Pre-10g (9i): O3LOGON in the thin-coded
                                 # OSESSKEY (#90, #2342). Async port of
@@ -928,8 +928,18 @@ class AsyncOracleConnect(_ConnectionLogic):
                                 self.server_version = decode_8i_server_version(Packet)
                                 return 0
                             if getattr(self, '_o3_phase', 0) == 1:
-                                await self._send_o3logon_phase2(Packet)
+                                if self._o3_oall8:
+                                    await self.send(TNS_DATA, self._oall8_oauth(Packet))
+                                else:
+                                    await self._send_o3logon_phase2(Packet)
                                 continue
+                            if self._o3_oall8 and self._o3_phase == 2:
+                                # Native OALL8 O3LOGON completion (#790): the
+                                # AUTH_ success pairs, as 8i's; its
+                                # AUTH_VERSION_NO in the 8i reply form (#798).
+                                self.conn_state = CONN_STATE_AUTHENTICATED
+                                self.server_version = decode_8i_server_version(Packet)
+                                return 0
                             if getattr(self, '_o3_phase', 0) == 2:
                                 # 9i's OAUTH answered with its pairs (#2342).
                                 assert isinstance(self._dialect, Fv2Dialect)
