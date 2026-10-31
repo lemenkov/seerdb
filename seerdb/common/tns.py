@@ -2465,6 +2465,11 @@ _O8I_ALL8_O8I = wire_schema.compile_encoder(_O8I_ALL8, _O8I)
 _O8I_ALL8_O9I = wire_schema.compile_encoder(_O8I_ALL8, _O9I)
 _O9I_STATUS_FROM_O9I = wire_schema.compile_decoder(_O9I_STATUS, _O9I)
 _O9I_STATUS_HEAD_FROM_O9I = wire_schema.compile_decoder(_O9I_STATUS_HEAD, _O9I)
+# A 9.2 OUT bind's cell is 8i's row cell, its never-assigned one 8i's, and its
+# LONG cell 8i's, at a 9.2 client's widths (#798).
+_O8I_CELL_FROM_O9I = wire_schema.compile_decoder(_O8I_CELL, _O9I)
+_O8I_OUT_UNASSIGNED_FROM_O9I = wire_schema.compile_decoder(_O8I_OUT_UNASSIGNED, _O9I)
+_O8I_LONG_CELL_FROM_O9I = wire_schema.compile_decoder(_O8I_LONG_CELL, _O9I)
 _OAC_OCI = wire_schema.compile_encoder(_OAC, _OCI)
 _O7_LOBOPS_O9I = wire_schema.compile_encoder(_O7_LOBOPS, _O9I)
 _CLOSE_CURSORS_O9I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O9I)
@@ -14830,19 +14835,17 @@ def decode_9i_oall8_exec_response(
                         Row.append(Lob)
                         continue
                     if Col.get('data_type') in _LONG_DATA_TYPES:
-                        # A LONG / LONG RAW cell is the value -- a ub1 length or
-                        # 0xFE chunks -- then a ub2 indicator (-1 for NULL) and a
-                        # ub2 return code, the form of an OUT bind's cell: `fe 02
-                        # 6869 00 0000 0000` for 'hi', `00 ffff 7d05` for NULL,
-                        # read live on 9.2. Unread, the four bytes shifted every
-                        # column after the LONG (#798).
-                        (LongValue, Rest) = _OCI.read_value(Rest)
-                        Indicator = int.from_bytes(Rest[:2], 'little', signed=True)
-                        Rest = Rest[4:]
+                        # A LONG / LONG RAW cell is 8i's (_O8I_LONG_CELL): the
+                        # value -- 0xFE chunks, or a bare zero for NULL -- then a
+                        # ub2 indicator and a ub2 return code: `fe 02 6869 00 0000
+                        # 0000` for 'hi', `00 ffff 7d05` for NULL, read live on
+                        # 9.2. Unread, the four bytes shifted every column after
+                        # the LONG (#798).
+                        (Cell, Rest) = _O8I_LONG_CELL_FROM_O9I(Rest)
                         Row.append(
                             None
-                            if Indicator == -1 or LongValue is None
-                            else decode_value(Col, LongValue)
+                            if Cell['value'] is None
+                            else decode_value(Col, bytes(Cell['value']))
                         )
                         continue
                     if (
@@ -15074,19 +15077,19 @@ def _o9i_oall8_block_parts(
                 continue
             if Length == 0xFF:
                 # An OUT bind the block never assigned (a RETURNING ... INTO that
-                # matched no row): 0xFF and a ub2 return code (3105), no value or
-                # indicator -- `ff 210c`, the compact path's `ff 02 0c 21` (#801).
-                # Reading a length and four bytes after it ran into the status.
-                Rest = Rest[3:]
+                # matched no row): 8i's form (_O8I_OUT_UNASSIGNED), 0xFF and the
+                # indicator 3105 -- `ff 210c`, the compact path's `ff 02 0c 21`
+                # (#801). Reading a length and four bytes after it ran into the
+                # status.
+                (_, Rest) = _O8I_OUT_UNASSIGNED_FROM_O9I(Rest)
                 OutValues.append(None)
                 continue
-            # The value as an ordinary one -- a ub1 length, or 0xFE and 64-byte
+            # 8i's row cell (_O8I_CELL): the value -- a ub1 length, or 0xFE and
             # chunks past 252 bytes (read as one length, a long OUT value kept its
-            # chunk lengths) -- then a ub2 indicator (-1 for NULL) and a ub2 return
-            # code (1405).
-            (Raw, Rest) = _OCI.read_value(Rest)
-            Rest = Rest[4:]
-            OutValues.append(bytes(Raw) if Raw else None)
+            # chunk lengths) -- a ub2 indicator (-1 for NULL) and a ub2 return code
+            # (1405).
+            (Cell, Rest) = _O8I_CELL_FROM_O9I(Rest)
+            OutValues.append(bytes(Cell['value']) if Cell['value'] else None)
     return (OutValues, Rest)
 
 
