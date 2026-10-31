@@ -14297,7 +14297,23 @@ def _encode_9i_bind_oac(Value: object) -> bytes:
         DType, Size = TNS_TYPE_INTERVALYM, 5
     else:
         DType, Size = TNS_TYPE_VARCHAR, max(len(str(Value).encode('utf-8')), 1)
-    return bytes([1, DType, Flag, 0, 0]) + Size.to_bytes(8, 'little') + bytes(28)
+    Oac = bytearray([1, DType, Flag, 0, 0]) + Size.to_bytes(8, 'little') + bytes(28)
+    if _is_national_var(Value):
+        # A national bind declares AL16UTF16 and charset form 2 in the
+        # descriptor's charset (ub2 at 29) and form (31) -- where a native
+        # client's VARCHAR bind carries 31 / 1 (native_9i_array_dml.pcap) -- and
+        # its value rides as UTF-16BE (#798; through the database charset it lost
+        # every character Latin-1 lacks, as on the compact path, #174).
+        Oac[29:31] = AL16UTF16_CHARSET.to_bytes(2, 'little')
+        Oac[31] = 2
+    return bytes(Oac)
+
+
+def _is_national_var(Value: object) -> bool:
+    # A Var declared national (DB_TYPE_NVARCHAR / NCHAR / NCLOB): csfrm 2.
+    from seerdb.common.datatypes import Var
+
+    return isinstance(Value, Var) and getattr(Value.dbtype, 'csfrm', 1) == 2
 
 
 # The wire width of each declared date / time bind type (_encode_9i_bind_oac).
@@ -14319,6 +14335,9 @@ def _encode_9i_bind_value(Value: object) -> bytes:
     if isinstance(Value, Var):
         if not Value.has_value:
             return _O8I_OUT_PLACEHOLDER
+        if _is_national_var(Value) and isinstance(Value._value, str):
+            # AL16UTF16, as its descriptor says (#798).
+            return encode_token_rxd(Value._value.encode('utf-16-be'))
         # A declared type the value must be sent as -- a microsecond datetime
         # declared DATE goes out as a DATE (#701).
         Declared = _declared_value_bytes(Value._value, Value.dbtype.tns_type)

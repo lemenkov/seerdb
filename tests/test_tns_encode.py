@@ -7555,6 +7555,26 @@ class TestO9iOall8Messages(unittest.TestCase):
             )
         )
 
+    def test_9i_oall8_national_bind_declares_al16utf16(self):
+        # The descriptor's charset (ub2 at 29) and form (31): AL16UTF16 / 2 for a
+        # national Var, and its value in UTF-16BE (#798). Through the database
+        # charset an NVARCHAR2 lost every character Latin-1 lacks.
+        import seerdb
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import (
+            O8I_STMT_INSERT,
+            encode_9i_oall8_dml,
+        )
+
+        var = Var(seerdb.DB_TYPE_NVARCHAR)
+        var.setvalue(0, 'Ω')
+        sql = b'INSERT INTO t VALUES (:1)'
+        msg = encode_9i_oall8_dml(1, sql, O8I_STMT_INSERT, [var])
+        oac = msg[msg.find(sql) + len(sql) + 48 :][:41]
+        self.assertEqual(int.from_bytes(oac[29:31], 'little'), 2000)
+        self.assertEqual(oac[31], 2)
+        self.assertTrue(msg.endswith(bytes([0x07, 2]) + 'Ω'.encode('utf-16-be')))
+
     def test_9i_oall8_lob_write_matches_native_client(self):
         # The 64-bit TTI_LOBOPS head with the offset at 31, then the locator, the
         # ub4 amount, and the data as TTI_LOB content (#798). The source and amount
