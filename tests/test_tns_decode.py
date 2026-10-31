@@ -7847,6 +7847,78 @@ class TestNative9iOall8Select(unittest.TestCase):
         (rows, _, _) = self._decode(self.UNTYPED_NULL_ROW, columns)
         self.assertEqual(rows, [[None, 5]])
 
+    # `SELECT rowid, k` of a one-row table: the ROWID cell is the 16-byte OCI rowid
+    # structure, little-endian.
+    ROWID_ROW = bytes.fromhex(
+        '060102b202000000010000005d962a0000000000000000000000000000000000'
+        '00000000000000000000000000000000000007106b4b030001000000d2b80000'
+        '0000000002c102080500cf952d02000000000100000000000000000000000000'
+        '0000040100000001010000000000000000000100150003000000000000000000'
+        '0000000000000000000000000000000000070000010000003601000000000000'
+        '000000000000000080d0d4030000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '0000000000000000'
+    )
+    # `SELECT u, k` over a UROWID column: a physical rowid (the execute reply),
+    # then a NULL and an index-organized table's 409-byte logical rowid, chunked
+    # (the fetch reply).
+    UROWID_EXEC = bytes.fromhex(
+        '0601022a020000000100000000000000000000000000000000000000d4030000'
+        '000000000000000000000000200200000000070d000d0100034b6b00010000b8'
+        'd2000002c102080500cf952d0200000000020000000000000000000000000000'
+        '0004010000000101000000000000000000020011000300000000000000000000'
+        '0000000000000000000000000000000009000001000000360100000000000000'
+        '0000000000000080d0d403000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '00000000000000'
+    )
+    UROWID_FETCH = bytes.fromhex(
+        '0600022a020000006400000000000000000048bfd603000000000100d4030000'
+        '0000000000000000000000002002000000000307000002c10315020003079901'
+        'feff02040040b96a81906b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b9a6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b'
+        '6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6bfe0002c104'
+        '040100000001030000007b050000000002000000030020000000000000000000'
+        '0000000000000000000000000000000a00000100000036010000000000000000'
+        '00000000000080d0d40300000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000000000'
+        '000000000000194f52412d30313430333a206e6f206461746120666f756e640a'
+    )
+
+    def test_a_rowid_cell_reads_as_its_text(self):
+        columns = [
+            {'data_type': 11, 'data_length': 16, 'charset': 0, 'csfrm': 0},
+            {'data_type': 2, 'data_length': 22, 'charset': 0, 'csfrm': 0},
+        ]
+        (rows, _, _) = self._decode(self.ROWID_ROW, columns)
+        self.assertEqual(rows, [['AAA0trAABAAALjSAAA', 1]])
+
+    def test_a_urowid_cell_is_sized_then_framed_as_a_value(self):
+        # A ub2 size, then the rowid as an ordinary (possibly chunked) value; a
+        # NULL is the zero size alone. Reading it as a plain value misread every
+        # column after it.
+        columns = [
+            {'data_type': 208, 'data_length': 4000, 'charset': 0, 'csfrm': 0},
+            {'data_type': 2, 'data_length': 22, 'charset': 0, 'csfrm': 0},
+        ]
+        (rows, _, last) = self._decode(self.UROWID_EXEC, columns)
+        self.assertEqual(rows, [['AAA0trAABAAALjSAAA', 1]])
+        (rows, _, _) = self._decode(self.UROWID_FETCH, columns, last)
+        self.assertEqual(rows[0], [None, 2])
+        self.assertEqual(rows[1][1], 3)
+        self.assertEqual(len(rows[1][0]), 545)
+        self.assertTrue(rows[1][0].startswith('*BABAuWqBkGtra2tra2t'))
+
 
 class TestO8iBfile(unittest.TestCase):
     """Oracle 8i native BFILE read (#401, PROTOCOL §19.17): FILE_OPEN -> GETLEN

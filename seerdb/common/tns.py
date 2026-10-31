@@ -14477,6 +14477,39 @@ def _o9i_oall8_lob_cell(Type: int, Data: bytes) -> tuple[object, bytes]:
     return (LOB(Type, bytes(Data[1 : 1 + Length])), Data[1 + Length :])
 
 
+def _o9i_oall8_rowid(Raw: bytes) -> str:
+    # A 9i OALL8 ROWID cell's value: the OCI rowid structure, little-endian with
+    # each field padded to four bytes -- data object (ub4), relative file (ub2),
+    # block (ub4), slot (ub2) -- rendered as the extended rowid text. Read live
+    # on 9.2 against ROWIDTOCHAR and DBMS_ROWID's object / file / block / row.
+    from seerdb.common.types import rowid_to_string
+
+    return rowid_to_string(
+        int.from_bytes(Raw[0:4], 'little'),
+        int.from_bytes(Raw[4:6], 'little'),
+        int.from_bytes(Raw[8:12], 'little'),
+        int.from_bytes(Raw[12:14], 'little'),
+    )
+
+
+def _o9i_oall8_urowid_cell(Data: bytes) -> tuple[str | None, bytes]:
+    # A 9i OALL8 UROWID cell: a ub2 size (little-endian), then -- when it is not
+    # zero -- the rowid bytes (a type tag, then the body) as an ordinary value, a
+    # ub1 length or 0xFE chunks past 252 bytes. The shape of a LOB cell, with a
+    # ub2 size; a NULL is the zero size alone. Read live on 9.2 for a physical
+    # rowid (`0d00 0d 01...`) and an index-organized table's logical ones
+    # (`6c00 6c 02...`, and a 409-byte one, `9901 fe ff... 9a... 00`).
+    from seerdb.common.types import urowid_to_string
+
+    Size = int.from_bytes(Data[:2], 'little')
+    if len(Data) < 3:
+        raise IndexError('urowid cell')
+    if not Size:
+        return (None, Data[2:])
+    (Raw, Rest) = _OCI.read_value(Data[2:])
+    return (urowid_to_string(bytes(Raw or b'')), Rest)
+
+
 def decode_9i_oall8_exec_response(
     Data: bytes, Columns: list, PrevRow: list | None = None
 ) -> tuple[list, bytes, list | None]:
@@ -14546,8 +14579,17 @@ def decode_9i_oall8_exec_response(
                         # data.
                         Row.append(None)
                         continue
+                    if Col.get('data_type') == TNS_TYPE_UROWID:
+                        (Text, Rest) = _o9i_oall8_urowid_cell(Rest)
+                        Row.append(Text)
+                        continue
                     (Raw, Rest) = _o9i_oall8_cell(Rest)
-                    Row.append(None if Raw is None else decode_value(Col, Raw))
+                    if Raw is None:
+                        Row.append(None)
+                    elif Col.get('data_type') in (TNS_TYPE_RID, TNS_TYPE_ROWID):
+                        Row.append(_o9i_oall8_rowid(Raw))
+                    else:
+                        Row.append(decode_value(Col, Raw))
                 Rows.append(Row)
                 Last = Row
                 Vector = None
